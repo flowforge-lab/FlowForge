@@ -70,7 +70,7 @@ flowforge/
 ├── crates/
 │   ├── ff-core/                # domain types (Message, Turn, Session, Skill, Profile)
 │   ├── ff-agent/               # agent loop + tool dispatch
-│   ├── ff-llm/                 # provider trait (Ollama first, then Bedrock)
+│   ├── ff-llm/                 # provider trait (OpenAI-compat candle-vllm + Ollama-native, then Bedrock)
 │   ├── ff-mcp/                 # MCP client + supervisor
 │   ├── ff-memory/              # SQLite + embeddings
 │   ├── ff-signals/             # intention/outcome event bus
@@ -236,8 +236,8 @@ Definition of done for a backend change: `fmt` clean, `clippy` zero warnings,
 - [ ] Workspace compiles: `cargo build --workspace`
 - [ ] Tauri crate renamed to `flowforge-desktop`, depends on `ff-*`
 - [ ] `ff-core` defines `Message`, `Session`, `Role` with `ts-rs` export
-- [ ] `ff-llm` has a `Provider` trait + working Ollama impl (no creds needed)
-- [ ] `send_message` command streams `turn:token` events end-to-end against Ollama
+- [ ] `ff-llm` has a `Provider` trait + OpenAI-compatible (candle-vllm) and Ollama-native impls (no creds needed)
+- [ ] `send_message` command streams `turn:token` events end-to-end against candle-vllm
 - [ ] TS bindings generated into `apps/desktop/src/bindings/`
 - [ ] Mock IPC layer in place so Abid can run `VITE_FF_MOCK=1 pnpm dev` standalone
 - [ ] `cargo clippy -D warnings` and `cargo test` green

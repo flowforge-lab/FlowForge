@@ -1,13 +1,17 @@
-//! LLM provider abstraction. M1 ships an Ollama implementation (zero credentials).
-//! Bedrock and Anthropic providers land in later milestones behind the same trait.
+//! LLM provider abstraction. M1 ships two providers behind a single trait:
+//! [`OpenAiProvider`] (OpenAI-compatible SSE — candle-vllm, vLLM, LM Studio, OpenAI)
+//! and [`OllamaProvider`] (Ollama-native NDJSON `/api/chat`). Bedrock and Anthropic
+//! land in later milestones behind the same trait.
 
 mod ollama;
+mod openai;
 
 use async_trait::async_trait;
 use futures_util::stream::BoxStream;
 use serde::{Deserialize, Serialize};
 
 pub use ollama::OllamaProvider;
+pub use openai::OpenAiProvider;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
