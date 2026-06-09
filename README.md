@@ -17,9 +17,9 @@ FlowForge is the **open UI layer** of the NeuroForge ecosystem — keyboard-nati
 
 ## 🛠️ Tech Stack
 - **Runtime:** Tauri 2 (Rust backend + OS Webview)
-- **Frontend:** React 18 + TypeScript + Vite
+- **Frontend:** React 19 + TypeScript + Vite
 - **State & Storage:** Zustand + `tauri-plugin-sql` (SQLite)
-- **AI Layer:** Vercel AI SDK (streaming SSE) + Amazon Bedrock (backend route)
+- **AI Layer:** candle-vllm (local Rust inference, OpenAI-compatible) + Amazon Bedrock (cloud route)
 - **Styling:** Tailwind CSS + shadcn/ui
 
 ## 🧠 NeuroForge Integration
@@ -70,7 +70,7 @@ FlowForge is fully functional without NeuroForge. The integration unlocks a clos
 │  │  ┌───────────┐  ┌───────────┐  ┌──────────────────┐  │  │
 │  │  │ ff-agent  │  │  ff-llm   │  │    ff-memory     │  │  │
 │  │  │ (loop &   │  │ (Bedrock, │  │ (SQLite + vector │  │  │
-│  │  │  tools)   │  │  Ollama)  │  │  embeddings)     │  │  │
+│  │  │  tools)   │  │  candle)  │  │  embeddings)     │  │  │
 │  │  └───────────┘  └───────────┘  └──────────────────┘  │  │
 │  │                                                       │  │
 │  │  ┌───────────┐  ┌───────────┐  ┌──────────────────┐  │  │
@@ -92,7 +92,7 @@ FlowForge is fully functional without NeuroForge. The integration unlocks a clos
 ┌─────────────────┐  ┌────────────────┐  ┌────────────────────┐
 │  LLM Providers  │  │  MCP Servers   │  │    NeuroForge      │
 │  (Bedrock,      │  │  (stdio/SSE,   │  │  (plugin system,   │
-│   Ollama,       │  │   external     │  │   RPE engine,      │
+│   candle,       │  │   external     │  │   RPE engine,      │
 │   Anthropic)    │  │   tools)       │  │   flow scoring)    │
 └─────────────────┘  └────────────────┘  └────────────────────┘
 ```
@@ -103,7 +103,7 @@ FlowForge is fully functional without NeuroForge. The integration unlocks a clos
 |-------|------|
 | `ff-core` | Domain types — Message, Turn, Skill, Profile, Session |
 | `ff-agent` | Agent loop (research → plan → implement → verify), tool dispatch |
-| `ff-llm` | Provider trait + implementations (Bedrock, Anthropic, Ollama) |
+| `ff-llm` | Provider trait + implementations (candle-vllm, Bedrock, Anthropic) |
 | `ff-mcp` | MCP client & supervisor — health monitoring, auto-restart, env isolation |
 | `ff-memory` | SQLite persistence + vector embeddings (fastembed-rs) for semantic recall |
 | `ff-signals` | Intention/outcome event emitter — lightweight signal bus for NeuroForge integration |
@@ -139,7 +139,7 @@ cargo tauri build
 ## 🗺️ Roadmap
 
 - [x] Repository bootstrap & architecture definition
-- [ ] **M1** — Tauri 2 shell + React chat UI + first LLM call (Ollama)
+- [ ] **M1** — Tauri 2 shell + React chat UI + first LLM call (candle-vllm)
 - [ ] **M2** — Tool calling (bash, view, edit) + streaming render
 - [ ] **M3** — Skills + profiles + command palette
 - [ ] **M4** — MCP supervisor with health UI

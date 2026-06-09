@@ -1,49 +1,117 @@
-import { useState } from "react";
-import reactLogo from "./assets/react.svg";
-import { invoke } from "@tauri-apps/api/core";
+import { useEffect, useRef, useState } from "react";
+import { ipc } from "./lib/ipc";
+import type { Message, Session } from "./bindings";
 import "./App.css";
 
+// Minimal chat shell proving the IPC contract end-to-end. Abid owns the real UI
+// (command palette, theming, flow canvas) — this is just a working seam to build on.
 function App() {
-  const [greetMsg, setGreetMsg] = useState("");
-  const [name, setName] = useState("");
+  const [session, setSession] = useState<Session | null>(null);
+  const [messages, setMessages] = useState<Message[]>([]);
+  const [input, setInput] = useState("");
+  const [streaming, setStreaming] = useState(false);
+  const streamId = useRef<string | null>(null);
 
-  async function greet() {
-    // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
-    setGreetMsg(await invoke("greet", { name }));
+  useEffect(() => {
+    ipc.createSession().then((s) => setSession(s));
+  }, []);
+
+  useEffect(() => {
+    const unlisteners: Promise<() => void>[] = [];
+
+    unlisteners.push(
+      ipc.onToken((e) => {
+        setMessages((prev) => {
+          const next = [...prev];
+          const idx = next.findIndex((m) => m.id === e.messageId);
+          if (idx >= 0) {
+            next[idx] = { ...next[idx], content: next[idx].content + e.delta };
+          } else {
+            next.push({
+              id: e.messageId,
+              sessionId: e.sessionId,
+              role: "assistant",
+              content: e.delta,
+              createdAt: Date.now(),
+            });
+          }
+          return next;
+        });
+      }),
+    );
+
+    unlisteners.push(
+      ipc.onTurnDone(() => {
+        setStreaming(false);
+        streamId.current = null;
+      }),
+    );
+
+    unlisteners.push(
+      ipc.onTurnError((e) => {
+        setStreaming(false);
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: crypto.randomUUID(),
+            sessionId: e.sessionId,
+            role: "system",
+            content: `Error: ${e.message}`,
+            createdAt: Date.now(),
+          },
+        ]);
+      }),
+    );
+
+    return () => {
+      unlisteners.forEach((p) => p.then((un) => un()));
+    };
+  }, []);
+
+  async function send() {
+    if (!session || !input.trim() || streaming) return;
+    const content = input.trim();
+    setInput("");
+    setMessages((prev) => [
+      ...prev,
+      {
+        id: crypto.randomUUID(),
+        sessionId: session.id,
+        role: "user",
+        content,
+        createdAt: Date.now(),
+      },
+    ]);
+    setStreaming(true);
+    await ipc.sendMessage(session.id, content);
   }
 
   return (
     <main className="container">
-      <h1>Welcome to Tauri + React</h1>
-
-      <div className="row">
-        <a href="https://vite.dev" target="_blank">
-          <img src="/vite.svg" className="logo vite" alt="Vite logo" />
-        </a>
-        <a href="https://tauri.app" target="_blank">
-          <img src="/tauri.svg" className="logo tauri" alt="Tauri logo" />
-        </a>
-        <a href="https://react.dev" target="_blank">
-          <img src={reactLogo} className="logo react" alt="React logo" />
-        </a>
+      <h1>FlowForge</h1>
+      <div className="messages">
+        {messages.map((m) => (
+          <div key={m.id} className={`msg msg-${m.role}`}>
+            <strong>{m.role}:</strong> {m.content}
+          </div>
+        ))}
       </div>
-      <p>Click on the Tauri, Vite, and React logos to learn more.</p>
-
       <form
         className="row"
         onSubmit={(e) => {
           e.preventDefault();
-          greet();
+          send();
         }}
       >
         <input
-          id="greet-input"
-          onChange={(e) => setName(e.currentTarget.value)}
-          placeholder="Enter a name (Tauri, Vite, or React)..."
+          value={input}
+          onChange={(e) => setInput(e.currentTarget.value)}
+          placeholder="Message FlowForge..."
         />
-        <button type="submit">Greet</button>
+        <button type="submit" disabled={streaming}>
+          {streaming ? "..." : "Send"}
+        </button>
       </form>
-      <p>{greetMsg}</p>
     </main>
   );
 }
