@@ -47,7 +47,9 @@ export class MockIpc implements FfIpc {
   }
 
   async listSessions(): Promise<Session[]> {
-    return [...this.sessions.values()].sort((a, b) => b.updatedAt - a.updatedAt);
+    return [...this.sessions.values()].sort(
+      (a, b) => b.updatedAt - a.updatedAt,
+    );
   }
 
   async getMessages(sessionId: string): Promise<Message[]> {
@@ -79,8 +81,18 @@ export class MockIpc implements FfIpc {
 
   // --- internals ---
 
-  private append(sessionId: string, role: Message["role"], content: string): Message {
-    const msg: Message = { id: uid(), sessionId, role, content, createdAt: now() };
+  private append(
+    sessionId: string,
+    role: Message["role"],
+    content: string,
+  ): Message {
+    const msg: Message = {
+      id: uid(),
+      sessionId,
+      role,
+      content,
+      createdAt: now(),
+    };
     this.messages.get(sessionId)?.push(msg);
     const s = this.sessions.get(sessionId);
     if (s) s.updatedAt = msg.createdAt;
@@ -100,11 +112,18 @@ export class MockIpc implements FfIpc {
       const delta = (i === 0 ? "" : " ") + words[i];
       assistant.content += delta;
       i += 1;
-      this.emit(this.tokenListeners, { sessionId, messageId: assistant.id, delta });
+      this.emit(this.tokenListeners, {
+        sessionId,
+        messageId: assistant.id,
+        delta,
+      });
     }, 40);
   }
 
-  private subscribe<T>(set: Set<Listener<T>>, cb: Listener<T>): Promise<Unlisten> {
+  private subscribe<T>(
+    set: Set<Listener<T>>,
+    cb: Listener<T>,
+  ): Promise<Unlisten> {
     set.add(cb);
     return Promise.resolve(() => set.delete(cb));
   }

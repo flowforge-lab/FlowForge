@@ -34,25 +34,36 @@ export interface FfIpc {
 const USE_MOCK = import.meta.env.VITE_FF_MOCK === "1";
 
 class TauriIpc implements FfIpc {
-  private invoke = async <T>(cmd: string, args?: Record<string, unknown>): Promise<T> => {
+  private invoke = async <T>(
+    cmd: string,
+    args?: Record<string, unknown>,
+  ): Promise<T> => {
     const { invoke } = await import("@tauri-apps/api/core");
     return invoke<T>(cmd, args);
   };
 
-  private listen = async <T>(event: string, cb: (e: T) => void): Promise<Unlisten> => {
+  private listen = async <T>(
+    event: string,
+    cb: (e: T) => void,
+  ): Promise<Unlisten> => {
     const { listen } = await import("@tauri-apps/api/event");
     return listen<T>(event, (ev) => cb(ev.payload));
   };
 
-  createSession = (goal?: string) => this.invoke<Session>("create_session", { goal });
+  createSession = (goal?: string) =>
+    this.invoke<Session>("create_session", { goal });
   listSessions = () => this.invoke<Session[]>("list_sessions");
-  getMessages = (sessionId: string) => this.invoke<Message[]>("get_messages", { sessionId });
+  getMessages = (sessionId: string) =>
+    this.invoke<Message[]>("get_messages", { sessionId });
   sendMessage = (sessionId: string, content: string) =>
     this.invoke<string>("send_message", { sessionId, content });
-  cancelTurn = (sessionId: string) => this.invoke<void>("cancel_turn", { sessionId });
+  cancelTurn = (sessionId: string) =>
+    this.invoke<void>("cancel_turn", { sessionId });
 
-  onToken = (cb: (e: TokenEvent) => void) => this.listen<TokenEvent>("turn:token", cb);
-  onTurnDone = (cb: (e: TurnDoneEvent) => void) => this.listen<TurnDoneEvent>("turn:done", cb);
+  onToken = (cb: (e: TokenEvent) => void) =>
+    this.listen<TokenEvent>("turn:token", cb);
+  onTurnDone = (cb: (e: TurnDoneEvent) => void) =>
+    this.listen<TurnDoneEvent>("turn:done", cb);
   onTurnError = (cb: (e: TurnErrorEvent) => void) =>
     this.listen<TurnErrorEvent>("turn:error", cb);
   onIntention = (cb: (e: IntentionSignal) => void) =>

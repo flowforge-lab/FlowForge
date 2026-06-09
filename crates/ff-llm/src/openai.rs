@@ -86,7 +86,10 @@ fn parse_sse_line(line: &[u8]) -> Option<Result<Chunk, LlmError>> {
         Ok(parsed) => {
             let choice = parsed.choices.into_iter().next();
             let (delta, done) = match choice {
-                Some(c) => (c.delta.content.unwrap_or_default(), c.finish_reason.is_some()),
+                Some(c) => (
+                    c.delta.content.unwrap_or_default(),
+                    c.finish_reason.is_some(),
+                ),
                 None => (String::new(), false),
             };
             Some(Ok(Chunk { delta, done }))

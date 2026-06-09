@@ -23,7 +23,11 @@ its four pillars:
    - `cargo fmt --check` and `cargo clippy --all-targets -- -D warnings`
    - `cargo test --workspace`
    - `pnpm typecheck && pnpm lint && pnpm test`
-5. **Open a PR** with a clear *why* in the description. If you can't explain the
+5. **Squash to a single commit** before opening (or updating) a PR. Every PR
+   must contain exactly **one** well-described commit — squash with
+   `git rebase -i main` or `git reset --soft main && git commit`. This keeps
+   `main` linear and each change atomically revertable (Pillar 3).
+6. **Open a PR** with a clear *why* in the description. If you can't explain the
    implementation in a few sentences, reconsider the design (Pillar 4).
 
 ## Quick Start

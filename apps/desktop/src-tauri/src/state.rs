@@ -17,8 +17,10 @@ pub enum ProviderKind {
     #[default]
     CandleVllm,
     /// Local Ollama, native NDJSON `/api/chat` on `:11434`.
+    #[allow(dead_code)] // constructed by M3 provider settings
     OllamaNative,
     /// Hosted OpenAI API (reads `OPENAI_API_KEY`).
+    #[allow(dead_code)] // constructed by M3 provider settings
     OpenAi,
 }
 
