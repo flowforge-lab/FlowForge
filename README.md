@@ -5,6 +5,8 @@ FlowForge is the **open UI layer** of the NeuroForge ecosystem — keyboard-nati
 
 > 🚀 Not another agent wrapper. A personal interface tuned to the biology of focus.
 
+> 📜 All contributions follow our [Engineering Principles](./PRINCIPLES.md) — read the charter before you build.
+
 ## ⚡ Core Principles
 | Principle | Implementation |
 |-----------|----------------|
