@@ -1,28 +1,67 @@
-//! The agent turn loop. M1 is a straight chat turn: build history -> stream from the
-//! provider -> emit token events -> persist the assistant message. Tool dispatch
-//! (M2) and the full research/plan/implement/verify loop layer on top of this.
+//! The agent turn loop.
+//!
+//! A turn is now multi-step: build history (advertising the tool schemas) -> stream
+//! from the provider -> if the assistant only produced text, finish; if it requested
+//! tool calls, execute each (subject to an approval policy), append the results, and
+//! loop. The loop is capped by [`ToolContext::max_iterations`] so a misbehaving model
+//! cannot spin forever.
 
+use std::collections::BTreeMap;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use ff_core::{Message, Role};
-use ff_llm::{ChatMessage, ChatRequest, Provider};
+use ff_llm::{ChatMessage, ChatRequest, FunctionCall, Provider, ToolCall as LlmToolCall};
 use ff_memory::MemoryStore;
+use ff_tools::{Safety, ToolRegistry};
 use futures_util::StreamExt;
 
 /// Events the agent emits during a turn. The host (Tauri shell or a test) decides
 /// how to surface them — over IPC, to a channel, or into assertions.
 #[derive(Debug, Clone)]
 pub enum AgentEvent {
-    Token { message_id: String, delta: String },
-    Done { message_id: String },
-    Error { message: String },
+    Token {
+        message_id: String,
+        delta: String,
+    },
+    ToolCallStarted {
+        message_id: String,
+        call_id: String,
+        name: String,
+        args: serde_json::Value,
+    },
+    ToolCallFinished {
+        message_id: String,
+        call_id: String,
+        success: bool,
+        result: String,
+    },
+    Done {
+        message_id: String,
+    },
+    Error {
+        message: String,
+    },
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum AgentError {
     #[error(transparent)]
     Llm(#[from] ff_llm::LlmError),
+}
+
+/// Decides whether a non-read-only tool call may run. The host supplies this; the
+/// desktop shell routes it to a UI confirmation. Read-only calls bypass it.
+pub type ApprovalFn = dyn Fn(&str, Safety, &serde_json::Value) -> bool + Send + Sync;
+
+/// Everything the loop needs to dispatch tools.
+pub struct ToolContext<'a> {
+    pub registry: &'a ToolRegistry,
+    /// Per-session workspace root. File tools are jailed to it; `bash` runs in it.
+    pub root: &'a Path,
+    pub approve: &'a ApprovalFn,
+    pub max_iterations: usize,
 }
 
 /// Cooperative cancellation flag, shared between a running turn and `cancel`.
@@ -41,123 +80,318 @@ impl CancelToken {
     }
 }
 
+fn role_str(role: Role) -> &'static str {
+    match role {
+        Role::User => "user",
+        Role::Assistant => "assistant",
+        Role::System => "system",
+        Role::Tool => "tool",
+    }
+}
+
 fn to_chat(messages: &[Message]) -> Vec<ChatMessage> {
     messages
         .iter()
-        .map(|m| ChatMessage {
-            role: match m.role {
-                Role::User => "user",
-                Role::Assistant => "assistant",
-                Role::System => "system",
-                Role::Tool => "tool",
+        .map(|m| {
+            let tool_calls = m.tool_calls.as_ref().map(|calls| {
+                calls
+                    .iter()
+                    .map(|tc| LlmToolCall {
+                        id: tc.id.clone(),
+                        kind: "function".to_string(),
+                        function: FunctionCall {
+                            name: tc.name.clone(),
+                            arguments: tc.arguments.clone(),
+                        },
+                    })
+                    .collect()
+            });
+            // An assistant message that only carries tool calls sends `content: null`.
+            let content = if m.content.is_empty() && tool_calls.is_some() {
+                None
+            } else {
+                Some(m.content.clone())
+            };
+            ChatMessage {
+                role: role_str(m.role).to_string(),
+                content,
+                tool_calls,
+                tool_call_id: m.tool_call_id.clone(),
+                name: None,
             }
-            .to_string(),
-            content: m.content.clone(),
         })
         .collect()
 }
 
-/// Runs one assistant turn for `session_id`. `on_event` is called synchronously
-/// between streamed chunks. The completed assistant message is persisted to `store`
-/// and returned.
+/// Accumulates streamed tool-call fragments keyed by `index`.
+#[derive(Default)]
+struct CallBuf {
+    id: String,
+    name: String,
+    arguments: String,
+}
+
+/// Runs one assistant turn for `session_id`, executing any tool calls the model
+/// requests until it produces a plain text answer (or the iteration cap is hit).
+/// `on_event` is called synchronously as the turn progresses. The final assistant
+/// message is persisted and returned.
 pub async fn run_turn(
     provider: &dyn Provider,
     store: &MemoryStore,
+    tools: &ToolContext<'_>,
     session_id: &str,
     model: &str,
     cancel: CancelToken,
     mut on_event: impl FnMut(AgentEvent),
 ) -> Result<Message, AgentError> {
-    let history = store.get_messages(session_id);
-    let req = ChatRequest {
-        model: model.to_string(),
-        messages: to_chat(&history),
-    };
+    let tool_schemas = tools.registry.openai_tools();
+    let mut last: Option<Message> = None;
 
-    // Reserve the assistant message id up front so the frontend can route tokens.
-    let assistant = store.add_message(session_id, Role::Assistant, String::new());
-    let message_id = assistant.id.clone();
-
-    let mut stream = match provider.chat_stream(req).await {
-        Ok(s) => s,
-        Err(e) => {
-            on_event(AgentEvent::Error {
-                message: e.to_string(),
-            });
-            return Err(e.into());
-        }
-    };
-
-    let mut acc = String::new();
-    while let Some(item) = stream.next().await {
+    for _ in 0..tools.max_iterations.max(1) {
         if cancel.is_cancelled() {
             break;
         }
-        match item {
-            Ok(chunk) => {
-                if !chunk.delta.is_empty() {
-                    acc.push_str(&chunk.delta);
-                    on_event(AgentEvent::Token {
-                        message_id: message_id.clone(),
-                        delta: chunk.delta,
-                    });
-                }
-                if chunk.done {
-                    break;
-                }
-            }
+
+        let history = store.get_messages(session_id);
+        let req = ChatRequest {
+            model: model.to_string(),
+            messages: to_chat(&history),
+            tools: tool_schemas.clone(),
+        };
+
+        // Reserve the assistant message id up front so the frontend can route tokens.
+        let message_id = store
+            .add_message(session_id, Role::Assistant, String::new())
+            .id;
+
+        let mut stream = match provider.chat_stream(req).await {
+            Ok(s) => s,
             Err(e) => {
                 on_event(AgentEvent::Error {
                     message: e.to_string(),
                 });
                 return Err(e.into());
             }
+        };
+
+        let mut acc = String::new();
+        let mut calls: BTreeMap<u32, CallBuf> = BTreeMap::new();
+        while let Some(item) = stream.next().await {
+            if cancel.is_cancelled() {
+                break;
+            }
+            match item {
+                Ok(chunk) => {
+                    if !chunk.delta.is_empty() {
+                        acc.push_str(&chunk.delta);
+                        on_event(AgentEvent::Token {
+                            message_id: message_id.clone(),
+                            delta: chunk.delta,
+                        });
+                    }
+                    for frag in chunk.tool_calls {
+                        let buf = calls.entry(frag.index).or_default();
+                        if let Some(id) = frag.id {
+                            buf.id = id;
+                        }
+                        if let Some(name) = frag.name {
+                            buf.name = name;
+                        }
+                        buf.arguments.push_str(&frag.arguments);
+                    }
+                    if chunk.done {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    on_event(AgentEvent::Error {
+                        message: e.to_string(),
+                    });
+                    return Err(e.into());
+                }
+            }
         }
+
+        let finalized = store.set_message_content(&message_id, session_id, acc);
+
+        // No tool calls -> this is the final text answer.
+        if calls.is_empty() {
+            on_event(AgentEvent::Done {
+                message_id: message_id.clone(),
+            });
+            return Ok(finalized);
+        }
+
+        // Persist the tool calls on the assistant message, then execute each.
+        let core_calls: Vec<ff_core::ToolCall> = calls
+            .values()
+            .map(|c| ff_core::ToolCall {
+                id: c.id.clone(),
+                name: c.name.clone(),
+                arguments: c.arguments.clone(),
+            })
+            .collect();
+        store.attach_tool_calls(&message_id, session_id, core_calls);
+
+        let mut executed: Vec<String> = Vec::new();
+        for call in calls.values() {
+            if cancel.is_cancelled() {
+                break;
+            }
+            let args: serde_json::Value =
+                serde_json::from_str(&call.arguments).unwrap_or(serde_json::Value::Null);
+
+            on_event(AgentEvent::ToolCallStarted {
+                message_id: message_id.clone(),
+                call_id: call.id.clone(),
+                name: call.name.clone(),
+                args: args.clone(),
+            });
+
+            let safety = tools.registry.safety(&call.name, &args);
+            let approved = safety == Safety::ReadOnly || (tools.approve)(&call.name, safety, &args);
+
+            let outcome = if approved {
+                tools.registry.run(&call.name, args, tools.root).await
+            } else {
+                ff_tools::ToolOutcome::error(format!("call to `{}` was not approved", call.name))
+            };
+
+            store.add_tool_result_message(session_id, call.id.clone(), outcome.content.clone());
+            executed.push(call.id.clone());
+            on_event(AgentEvent::ToolCallFinished {
+                message_id: message_id.clone(),
+                call_id: call.id.clone(),
+                success: outcome.success,
+                result: outcome.content,
+            });
+        }
+
+        // If we were cancelled mid-loop, every requested call still needs a matching
+        // tool result, or the next request's history is malformed (an assistant
+        // `tool_calls` message with no tool replies -> provider rejects it with 400).
+        for call in calls.values() {
+            if !executed.contains(&call.id) {
+                store.add_tool_result_message(
+                    session_id,
+                    call.id.clone(),
+                    "[cancelled]".to_string(),
+                );
+            }
+        }
+
+        last = Some(finalized);
     }
 
-    let final_msg = store.set_message_content(&message_id, session_id, acc);
+    // Hit the iteration cap (or was cancelled) without a plain text answer.
+    let mut msg =
+        last.unwrap_or_else(|| store.add_message(session_id, Role::Assistant, String::new()));
+    if msg.content.is_empty() {
+        // The final assistant message only carried tool calls, so it would render as
+        // an empty bubble. Replace it with a notice explaining why the turn stopped.
+        let notice = if cancel.is_cancelled() {
+            "[stopped]"
+        } else {
+            "[stopped: reached tool-call limit]"
+        };
+        msg = store.set_message_content(&msg.id, session_id, notice.to_string());
+    }
     on_event(AgentEvent::Done {
-        message_id: message_id.clone(),
+        message_id: msg.id.clone(),
     });
-    Ok(final_msg)
+    Ok(msg)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use ff_llm::{ChunkStream, LlmError};
+    use ff_llm::{Chunk, ChunkStream, LlmError, ToolCallDelta};
+    use std::sync::atomic::AtomicUsize;
 
-    struct MockProvider;
+    fn approve_all() -> Box<ApprovalFn> {
+        Box::new(|_: &str, _: Safety, _: &serde_json::Value| true)
+    }
+
+    fn ctx<'a>(
+        registry: &'a ToolRegistry,
+        root: &'a Path,
+        approve: &'a ApprovalFn,
+    ) -> ToolContext<'a> {
+        ToolContext {
+            registry,
+            root,
+            approve,
+            max_iterations: 8,
+        }
+    }
+
+    struct TextProvider;
 
     #[async_trait]
-    impl Provider for MockProvider {
+    impl Provider for TextProvider {
         async fn chat_stream(&self, _req: ChatRequest) -> Result<ChunkStream, LlmError> {
             let chunks = vec![
-                Ok(ff_llm::Chunk {
+                Ok(Chunk {
                     delta: "Hel".into(),
-                    done: false,
+                    ..Chunk::default()
                 }),
-                Ok(ff_llm::Chunk {
+                Ok(Chunk {
                     delta: "lo".into(),
                     done: true,
+                    ..Chunk::default()
                 }),
             ];
             Ok(futures_util::stream::iter(chunks).boxed())
         }
     }
 
+    /// First call requests a `bash` tool call; second call returns plain text.
+    struct ToolThenText {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl Provider for ToolThenText {
+        async fn chat_stream(&self, _req: ChatRequest) -> Result<ChunkStream, LlmError> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            let chunks = if n == 0 {
+                vec![Ok(Chunk {
+                    tool_calls: vec![ToolCallDelta {
+                        index: 0,
+                        id: Some("call_1".into()),
+                        name: Some("bash".into()),
+                        arguments: r#"{"command":"echo wired"}"#.into(),
+                    }],
+                    done: true,
+                    ..Chunk::default()
+                })]
+            } else {
+                vec![Ok(Chunk {
+                    delta: "done: wired".into(),
+                    done: true,
+                    ..Chunk::default()
+                })]
+            };
+            Ok(futures_util::stream::iter(chunks).boxed())
+        }
+    }
+
     #[tokio::test]
-    async fn streams_and_persists() {
+    async fn streams_and_persists_text_turn() {
         let store = MemoryStore::new();
         let s = store.create_session(None);
         store.add_message(&s.id, Role::User, "hi".into());
+        let registry = ToolRegistry::new();
+        let root = std::env::current_dir().unwrap();
+        let approve = approve_all();
 
         let mut tokens = String::new();
         let mut done = false;
         let msg = run_turn(
-            &MockProvider,
+            &TextProvider,
             &store,
+            &ctx(&registry, &root, approve.as_ref()),
             &s.id,
             "mock",
             CancelToken::new(),
@@ -165,6 +399,7 @@ mod tests {
                 AgentEvent::Token { delta, .. } => tokens.push_str(&delta),
                 AgentEvent::Done { .. } => done = true,
                 AgentEvent::Error { .. } => panic!("unexpected error"),
+                _ => {}
             },
         )
         .await
@@ -173,6 +408,221 @@ mod tests {
         assert_eq!(tokens, "Hello");
         assert!(done);
         assert_eq!(msg.content, "Hello");
-        assert_eq!(store.get_messages(&s.id).last().unwrap().content, "Hello");
+    }
+
+    #[tokio::test]
+    async fn executes_tool_then_finishes() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemoryStore::new();
+        let s = store.create_session(None);
+        store.add_message(&s.id, Role::User, "run echo".into());
+        let registry = ToolRegistry::with_defaults();
+        let approve = approve_all();
+        let provider = ToolThenText {
+            calls: AtomicUsize::new(0),
+        };
+
+        let mut started = 0;
+        let mut finished_ok = false;
+        let mut final_text = String::new();
+        let msg = run_turn(
+            &provider,
+            &store,
+            &ctx(&registry, dir.path(), approve.as_ref()),
+            &s.id,
+            "mock",
+            CancelToken::new(),
+            |ev| match ev {
+                AgentEvent::ToolCallStarted { name, .. } => {
+                    assert_eq!(name, "bash");
+                    started += 1;
+                }
+                AgentEvent::ToolCallFinished {
+                    success, result, ..
+                } => {
+                    finished_ok = success;
+                    assert!(result.contains("wired"));
+                }
+                AgentEvent::Token { delta, .. } => final_text.push_str(&delta),
+                AgentEvent::Error { message } => panic!("error: {message}"),
+                AgentEvent::Done { .. } => {}
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(started, 1);
+        assert!(finished_ok);
+        assert_eq!(final_text, "done: wired");
+        assert_eq!(msg.content, "done: wired");
+
+        // History should be: user, assistant(tool_calls), tool(result), assistant(final).
+        let history = store.get_messages(&s.id);
+        assert_eq!(history.len(), 4);
+        assert_eq!(history[1].role, Role::Assistant);
+        assert!(history[1].tool_calls.is_some());
+        assert_eq!(history[2].role, Role::Tool);
+        assert_eq!(history[2].tool_call_id.as_deref(), Some("call_1"));
+    }
+
+    /// Cancelling mid-execution must still leave a matching tool result for every
+    /// requested call, so the next turn's history stays well-formed.
+    #[tokio::test]
+    async fn cancel_mid_loop_backfills_tool_results() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemoryStore::new();
+        let s = store.create_session(None);
+        store.add_message(&s.id, Role::User, "do two things".into());
+        let registry = ToolRegistry::with_defaults();
+
+        struct TwoCalls;
+        #[async_trait]
+        impl Provider for TwoCalls {
+            async fn chat_stream(&self, _req: ChatRequest) -> Result<ChunkStream, LlmError> {
+                let chunks = vec![Ok(Chunk {
+                    tool_calls: vec![
+                        ToolCallDelta {
+                            index: 0,
+                            id: Some("call_a".into()),
+                            name: Some("bash".into()),
+                            arguments: r#"{"command":"touch a"}"#.into(),
+                        },
+                        ToolCallDelta {
+                            index: 1,
+                            id: Some("call_b".into()),
+                            name: Some("bash".into()),
+                            arguments: r#"{"command":"touch b"}"#.into(),
+                        },
+                    ],
+                    done: true,
+                    ..Chunk::default()
+                })];
+                Ok(futures_util::stream::iter(chunks).boxed())
+            }
+        }
+
+        // Approving the first (write) call cancels the turn, so the second is skipped.
+        let cancel = CancelToken::new();
+        let c2 = cancel.clone();
+        let approve: Box<ApprovalFn> =
+            Box::new(move |_: &str, _: Safety, _: &serde_json::Value| {
+                c2.cancel();
+                true
+            });
+
+        let msg = run_turn(
+            &TwoCalls,
+            &store,
+            &ctx(&registry, dir.path(), approve.as_ref()),
+            &s.id,
+            "mock",
+            cancel,
+            |_| {},
+        )
+        .await
+        .unwrap();
+
+        // Every requested tool call must have a matching Role::Tool reply.
+        let history = store.get_messages(&s.id);
+        let assistant = history
+            .iter()
+            .find(|m| m.tool_calls.is_some())
+            .expect("assistant tool-call message");
+        let requested: Vec<&str> = assistant
+            .tool_calls
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|c| c.id.as_str())
+            .collect();
+        let replied: Vec<String> = history
+            .iter()
+            .filter(|m| m.role == Role::Tool)
+            .filter_map(|m| m.tool_call_id.clone())
+            .collect();
+        for id in &requested {
+            assert!(
+                replied.iter().any(|r| r == id),
+                "missing tool result for {id}"
+            );
+        }
+        // The skipped call is recorded as cancelled.
+        assert!(history
+            .iter()
+            .any(|m| m.role == Role::Tool && m.content == "[cancelled]"));
+        // The final bubble is never empty.
+        assert!(!msg.content.is_empty());
+    }
+
+    #[tokio::test]
+    async fn denied_write_tool_reports_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("f.txt"), "old\n").unwrap();
+        let store = MemoryStore::new();
+        let s = store.create_session(None);
+        store.add_message(&s.id, Role::User, "edit it".into());
+        let registry = ToolRegistry::with_defaults();
+        // Deny everything that needs approval.
+        let deny: Box<ApprovalFn> = Box::new(|_: &str, _: Safety, _: &serde_json::Value| false);
+
+        struct EditProvider {
+            calls: AtomicUsize,
+        }
+        #[async_trait]
+        impl Provider for EditProvider {
+            async fn chat_stream(&self, _req: ChatRequest) -> Result<ChunkStream, LlmError> {
+                let n = self.calls.fetch_add(1, Ordering::SeqCst);
+                let chunks = if n == 0 {
+                    vec![Ok(Chunk {
+                        tool_calls: vec![ToolCallDelta {
+                            index: 0,
+                            id: Some("call_e".into()),
+                            name: Some("edit".into()),
+                            arguments: r#"{"path":"f.txt","old_str":"old","new_str":"new"}"#.into(),
+                        }],
+                        done: true,
+                        ..Chunk::default()
+                    })]
+                } else {
+                    vec![Ok(Chunk {
+                        delta: "ok".into(),
+                        done: true,
+                        ..Chunk::default()
+                    })]
+                };
+                Ok(futures_util::stream::iter(chunks).boxed())
+            }
+        }
+
+        let mut denied_reported = false;
+        run_turn(
+            &EditProvider {
+                calls: AtomicUsize::new(0),
+            },
+            &store,
+            &ctx(&registry, dir.path(), deny.as_ref()),
+            &s.id,
+            "mock",
+            CancelToken::new(),
+            |ev| {
+                if let AgentEvent::ToolCallFinished {
+                    success, result, ..
+                } = ev
+                {
+                    if !success && result.contains("not approved") {
+                        denied_reported = true;
+                    }
+                }
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(denied_reported);
+        // The file must be untouched because the edit was denied.
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("f.txt")).unwrap(),
+            "old\n"
+        );
     }
 }

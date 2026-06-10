@@ -25,3 +25,5 @@ ff-agent = { workspace = true }
 ff-llm = { workspace = true }
 ff-memory = { workspace = true }
 ff-signals = { workspace = true }
+ff-tools = { workspace = true }
+dirs = "5"

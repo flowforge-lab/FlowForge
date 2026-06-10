@@ -19,6 +19,10 @@ pub struct TokenEvent {
 #[ts(export, export_to = "../../../apps/desktop/src/bindings/")]
 pub struct ToolCallEvent {
     pub session_id: String,
+    /// Assistant message the call belongs to.
+    pub message_id: String,
+    /// Correlates the call with its [`ToolResultEvent`].
+    pub call_id: String,
     pub tool: String,
     #[ts(type = "unknown")]
     pub args: serde_json::Value,
@@ -29,9 +33,10 @@ pub struct ToolCallEvent {
 #[ts(export, export_to = "../../../apps/desktop/src/bindings/")]
 pub struct ToolResultEvent {
     pub session_id: String,
-    pub tool: String,
-    #[ts(type = "unknown")]
-    pub result: serde_json::Value,
+    pub message_id: String,
+    pub call_id: String,
+    pub success: bool,
+    pub result: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]

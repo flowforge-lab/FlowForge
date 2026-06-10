@@ -75,6 +75,7 @@ impl Provider for OllamaProvider {
                             Ok(c) => chunks.push(Ok(Chunk {
                                 delta: c.message.content,
                                 done: c.done,
+                                ..Chunk::default()
                             })),
                             Err(e) => chunks.push(Err(LlmError::Decode(e.to_string()))),
                         }

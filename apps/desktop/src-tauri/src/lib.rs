@@ -4,8 +4,10 @@
 
 mod state;
 
-use ff_agent::{run_turn, AgentEvent, CancelToken};
-use ff_core::events::{IntentionSignal, TokenEvent, TurnDoneEvent, TurnErrorEvent};
+use ff_agent::{run_turn, AgentEvent, ApprovalFn, CancelToken, ToolContext};
+use ff_core::events::{
+    IntentionSignal, TokenEvent, ToolCallEvent, ToolResultEvent, TurnDoneEvent, TurnErrorEvent,
+};
 use ff_core::{Message, Role, Session};
 use state::AppState;
 use std::sync::Arc;
@@ -68,9 +70,20 @@ fn send_message(
     let model = state.model.clone();
     tauri::async_runtime::spawn(async move {
         let sid = session_id.clone();
+        // TODO(M2 PR-B): route Write/Dangerous calls to a UI confirmation. Until the
+        // approval surface lands, the shell auto-approves; read-only calls bypass
+        // this regardless. The agent loop already enforces the gate.
+        let approve: Box<ApprovalFn> = Box::new(|_name, _safety, _args| true);
+        let tool_ctx = ToolContext {
+            registry: &state.tools,
+            root: &state.workspace_root,
+            approve: approve.as_ref(),
+            max_iterations: 8,
+        };
         let result = run_turn(
             state.provider.as_ref(),
             &state.store,
+            &tool_ctx,
             &sid,
             &model,
             cancel,
@@ -82,6 +95,40 @@ fn send_message(
                             session_id: sid.clone(),
                             message_id,
                             delta,
+                        },
+                    );
+                }
+                AgentEvent::ToolCallStarted {
+                    message_id,
+                    call_id,
+                    name,
+                    args,
+                } => {
+                    let _ = app.emit(
+                        "tool:call",
+                        ToolCallEvent {
+                            session_id: sid.clone(),
+                            message_id,
+                            call_id,
+                            tool: name,
+                            args,
+                        },
+                    );
+                }
+                AgentEvent::ToolCallFinished {
+                    message_id,
+                    call_id,
+                    success,
+                    result,
+                } => {
+                    let _ = app.emit(
+                        "tool:result",
+                        ToolResultEvent {
+                            session_id: sid.clone(),
+                            message_id,
+                            call_id,
+                            success,
+                            result,
                         },
                     );
                 }

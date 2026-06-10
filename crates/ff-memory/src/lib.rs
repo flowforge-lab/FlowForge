@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use ff_core::{Message, Role, Session, SessionStatus};
+use ff_core::{Message, Role, Session, SessionStatus, ToolCall};
 
 fn now_ms() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -64,20 +64,44 @@ impl MemoryStore {
     }
 
     pub fn add_message(&self, session_id: &str, role: Role, content: String) -> Message {
-        let msg = Message {
+        self.push_message(Message {
             id: new_id(),
             session_id: session_id.to_string(),
             role,
             content,
+            tool_calls: None,
+            tool_call_id: None,
             created_at: now_ms(),
-        };
+        })
+    }
+
+    /// Persist the result of a tool call, bound to its request id.
+    pub fn add_tool_result_message(
+        &self,
+        session_id: &str,
+        tool_call_id: String,
+        content: String,
+    ) -> Message {
+        self.push_message(Message {
+            id: new_id(),
+            session_id: session_id.to_string(),
+            role: Role::Tool,
+            content,
+            tool_calls: None,
+            tool_call_id: Some(tool_call_id),
+            created_at: now_ms(),
+        })
+    }
+
+    fn push_message(&self, msg: Message) -> Message {
+        let session_id = msg.session_id.clone();
         let mut inner = self.inner.lock().unwrap();
         inner
             .messages
-            .entry(session_id.to_string())
+            .entry(session_id.clone())
             .or_default()
             .push(msg.clone());
-        if let Some(s) = inner.sessions.get_mut(session_id) {
+        if let Some(s) = inner.sessions.get_mut(&session_id) {
             s.updated_at = msg.created_at;
         }
         msg
@@ -103,7 +127,20 @@ impl MemoryStore {
             session_id: session_id.to_string(),
             role: Role::Assistant,
             content,
+            tool_calls: None,
+            tool_call_id: None,
             created_at: ts,
+        }
+    }
+
+    /// Attach tool calls to an already-reserved assistant message (the one whose
+    /// id was handed out for token routing).
+    pub fn attach_tool_calls(&self, message_id: &str, session_id: &str, tool_calls: Vec<ToolCall>) {
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(msgs) = inner.messages.get_mut(session_id) {
+            if let Some(m) = msgs.iter_mut().find(|m| m.id == message_id) {
+                m.tool_calls = Some(tool_calls);
+            }
         }
     }
 

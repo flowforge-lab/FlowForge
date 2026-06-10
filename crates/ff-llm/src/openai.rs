@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use futures_util::StreamExt;
 use serde::Deserialize;
 
-use crate::{ChatRequest, Chunk, ChunkStream, LlmError, Provider};
+use crate::{ChatRequest, Chunk, ChunkStream, LlmError, Provider, ToolCallDelta};
 
 /// Talks to any OpenAI-compatible `/v1/chat/completions` server over Server-Sent
 /// Events. candle-vllm, vLLM, LM Studio, Ollama's `/v1` shim, and OpenAI itself all
@@ -62,6 +62,24 @@ struct StreamChoice {
 struct Delta {
     #[serde(default)]
     content: Option<String>,
+    #[serde(default)]
+    tool_calls: Vec<StreamToolCall>,
+}
+
+#[derive(Deserialize, Default)]
+struct StreamToolCall {
+    #[serde(default)]
+    index: u32,
+    id: Option<String>,
+    #[serde(default)]
+    function: StreamFunction,
+}
+
+#[derive(Deserialize, Default)]
+struct StreamFunction {
+    name: Option<String>,
+    #[serde(default)]
+    arguments: String,
 }
 
 /// Parse one raw SSE line into an optional chunk.
@@ -77,22 +95,32 @@ fn parse_sse_line(line: &[u8]) -> Option<Result<Chunk, LlmError>> {
     }
     if payload == "[DONE]" {
         return Some(Ok(Chunk {
-            delta: String::new(),
             done: true,
+            ..Chunk::default()
         }));
     }
 
     match serde_json::from_str::<StreamChunk>(payload) {
         Ok(parsed) => {
-            let choice = parsed.choices.into_iter().next();
-            let (delta, done) = match choice {
-                Some(c) => (
-                    c.delta.content.unwrap_or_default(),
-                    c.finish_reason.is_some(),
-                ),
-                None => (String::new(), false),
+            let chunk = match parsed.choices.into_iter().next() {
+                Some(c) => Chunk {
+                    delta: c.delta.content.unwrap_or_default(),
+                    tool_calls: c
+                        .delta
+                        .tool_calls
+                        .into_iter()
+                        .map(|tc| ToolCallDelta {
+                            index: tc.index,
+                            id: tc.id,
+                            name: tc.function.name,
+                            arguments: tc.function.arguments,
+                        })
+                        .collect(),
+                    done: c.finish_reason.is_some(),
+                },
+                None => Chunk::default(),
             };
-            Some(Ok(Chunk { delta, done }))
+            Some(Ok(chunk))
         }
         Err(e) => Some(Err(LlmError::Decode(e.to_string()))),
     }
@@ -101,11 +129,15 @@ fn parse_sse_line(line: &[u8]) -> Option<Result<Chunk, LlmError>> {
 #[async_trait]
 impl Provider for OpenAiProvider {
     async fn chat_stream(&self, req: ChatRequest) -> Result<ChunkStream, LlmError> {
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "model": req.model,
             "messages": req.messages,
             "stream": true,
         });
+        if !req.tools.is_empty() {
+            body["tools"] = serde_json::Value::Array(req.tools.clone());
+            body["tool_choice"] = serde_json::json!("auto");
+        }
 
         let mut builder = self
             .client
@@ -179,5 +211,25 @@ mod tests {
         assert!(parse_sse_line(b"").is_none());
         assert!(parse_sse_line(b": keep-alive comment").is_none());
         assert!(parse_sse_line(b"event: message").is_none());
+    }
+
+    #[test]
+    fn parses_tool_call_delta() {
+        let line = br#"data: {"choices":[{"delta":{"content":null,"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"bash","arguments":"{\"command\":\"ls\"}"}}]},"finish_reason":null}]}"#;
+        let chunk = parse_sse_line(line).unwrap().unwrap();
+        assert_eq!(chunk.tool_calls.len(), 1);
+        let tc = &chunk.tool_calls[0];
+        assert_eq!(tc.index, 0);
+        assert_eq!(tc.id.as_deref(), Some("call_1"));
+        assert_eq!(tc.name.as_deref(), Some("bash"));
+        assert!(tc.arguments.contains("\"command\""));
+    }
+
+    #[test]
+    fn tool_calls_finish_reason_marks_done() {
+        let line =
+            br#"data: {"choices":[{"delta":{"content":null},"finish_reason":"tool_calls"}]}"#;
+        let chunk = parse_sse_line(line).unwrap().unwrap();
+        assert!(chunk.done);
     }
 }
