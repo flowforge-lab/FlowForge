@@ -11,6 +11,8 @@ import type {
   TurnDoneEvent,
   TurnErrorEvent,
   IntentionSignal,
+  ToolCallEvent,
+  ToolResultEvent,
 } from "../bindings";
 import type { FfIpc, Unlisten } from "./ipc";
 
@@ -27,9 +29,16 @@ const MOCK_REPLY =
   "built without a running backend.";
 
 interface ActiveTurn {
-  timer: ReturnType<typeof setInterval>;
+  // All pending interval/timeout handles for this turn, cleared on cancel.
+  timers: ReturnType<typeof setInterval>[];
   messageId: string;
+  // callIds emitted but not yet resolved. On cancel these are backfilled with a
+  // "[cancelled]" result, mirroring the real backend's tool-result backfill so a
+  // cancelled step never spins forever in the UI.
+  pendingToolCalls: string[];
 }
+
+const uidShort = () => crypto.randomUUID().slice(0, 8);
 
 export class MockIpc implements FfIpc {
   private sessions = new Map<string, Session>();
@@ -41,6 +50,8 @@ export class MockIpc implements FfIpc {
   private doneListeners = new Set<Listener<TurnDoneEvent>>();
   private errorListeners = new Set<Listener<TurnErrorEvent>>();
   private intentionListeners = new Set<Listener<IntentionSignal>>();
+  private toolCallListeners = new Set<Listener<ToolCallEvent>>();
+  private toolResultListeners = new Set<Listener<ToolResultEvent>>();
 
   async createSession(goal?: string): Promise<Session> {
     const ts = now();
@@ -78,8 +89,19 @@ export class MockIpc implements FfIpc {
   async cancelTurn(sessionId: string): Promise<void> {
     const active = this.activeTimers.get(sessionId);
     if (!active) return;
-    clearInterval(active.timer);
+    active.timers.forEach((t) => clearInterval(t));
     this.activeTimers.delete(sessionId);
+    // Any tool call still in flight needs a matching result, or its step would
+    // spin forever — the real backend backfills "[cancelled]" the same way.
+    for (const callId of active.pendingToolCalls) {
+      this.emit(this.toolResultListeners, {
+        sessionId,
+        messageId: active.messageId,
+        callId,
+        success: false,
+        result: "[cancelled]",
+      });
+    }
     // Emit done with whatever partial content was accumulated — mirrors what
     // the real backend does when a CancellationToken fires.
     this.emit(this.doneListeners, { sessionId, messageId: active.messageId });
@@ -96,6 +118,12 @@ export class MockIpc implements FfIpc {
   }
   onIntention(cb: Listener<IntentionSignal>): Promise<Unlisten> {
     return this.subscribe(this.intentionListeners, cb);
+  }
+  onToolCall(cb: Listener<ToolCallEvent>): Promise<Unlisten> {
+    return this.subscribe(this.toolCallListeners, cb);
+  }
+  onToolResult(cb: Listener<ToolResultEvent>): Promise<Unlisten> {
+    return this.subscribe(this.toolResultListeners, cb);
   }
 
   // --- internals ---
@@ -120,25 +148,69 @@ export class MockIpc implements FfIpc {
 
   private streamAssistant(sessionId: string): void {
     const assistant = this.append(sessionId, "assistant", "");
+    const turn: ActiveTurn = {
+      timers: [],
+      messageId: assistant.id,
+      pendingToolCalls: [],
+    };
+    this.activeTimers.set(sessionId, turn);
+
+    // Simulate one read-only tool call before the text reply so the UIs tool
+    // step rendering (running -> done) is exercised under VITE_FF_MOCK=1.
+    const callId = uidShort();
+    turn.pendingToolCalls.push(callId);
+    this.emit(this.toolCallListeners, {
+      sessionId,
+      messageId: assistant.id,
+      callId,
+      tool: "view",
+      args: { path: "README.md" },
+    });
+
+    const resultTimer = setInterval(() => {
+      clearInterval(resultTimer);
+      turn.pendingToolCalls = turn.pendingToolCalls.filter(
+        (id) => id !== callId,
+      );
+      this.emit(this.toolResultListeners, {
+        sessionId,
+        messageId: assistant.id,
+        callId,
+        success: true,
+        result:
+          "# FlowForge\n\n(mocked file contents returned by the view tool)",
+      });
+      this.streamWords(sessionId, turn);
+    }, TOKEN_INTERVAL_MS * 4);
+    turn.timers.push(resultTimer);
+  }
+
+  private streamWords(sessionId: string, turn: ActiveTurn): void {
+    const stored = this.messages
+      .get(sessionId)
+      ?.find((m) => m.id === turn.messageId);
     const words = MOCK_REPLY.split(" ");
     let i = 0;
     const timer = setInterval(() => {
       if (i >= words.length) {
         clearInterval(timer);
         this.activeTimers.delete(sessionId);
-        this.emit(this.doneListeners, { sessionId, messageId: assistant.id });
+        this.emit(this.doneListeners, {
+          sessionId,
+          messageId: turn.messageId,
+        });
         return;
       }
       const delta = (i === 0 ? "" : " ") + words[i];
-      assistant.content += delta;
       i += 1;
+      if (stored) stored.content += delta;
       this.emit(this.tokenListeners, {
         sessionId,
-        messageId: assistant.id,
+        messageId: turn.messageId,
         delta,
       });
     }, TOKEN_INTERVAL_MS);
-    this.activeTimers.set(sessionId, { timer, messageId: assistant.id });
+    turn.timers.push(timer);
   }
 
   private subscribe<T>(

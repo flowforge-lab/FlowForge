@@ -11,6 +11,8 @@ import type {
   TurnDoneEvent,
   TurnErrorEvent,
   IntentionSignal,
+  ToolCallEvent,
+  ToolResultEvent,
 } from "../bindings";
 
 export type Unlisten = () => void;
@@ -29,6 +31,8 @@ export interface FfIpc {
   onTurnDone(cb: (e: TurnDoneEvent) => void): Promise<Unlisten>;
   onTurnError(cb: (e: TurnErrorEvent) => void): Promise<Unlisten>;
   onIntention(cb: (e: IntentionSignal) => void): Promise<Unlisten>;
+  onToolCall(cb: (e: ToolCallEvent) => void): Promise<Unlisten>;
+  onToolResult(cb: (e: ToolResultEvent) => void): Promise<Unlisten>;
 }
 
 // Explicit mock flag OR auto-fallback when not inside a Tauri window.
@@ -80,6 +84,10 @@ class TauriIpc implements FfIpc {
     this.listen<TurnErrorEvent>("turn:error", cb);
   onIntention = (cb: (e: IntentionSignal) => void) =>
     this.listen<IntentionSignal>("signal:intention", cb);
+  onToolCall = (cb: (e: ToolCallEvent) => void) =>
+    this.listen<ToolCallEvent>("tool:call", cb);
+  onToolResult = (cb: (e: ToolResultEvent) => void) =>
+    this.listen<ToolResultEvent>("tool:result", cb);
 }
 
 // Mock is referenced only when VITE_FF_MOCK=1; production builds const-fold the

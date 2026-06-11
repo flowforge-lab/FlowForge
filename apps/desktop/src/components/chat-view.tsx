@@ -1,14 +1,18 @@
 import { useEffect, useRef } from "react";
 import { cn } from "@/lib/utils";
 import { useChatStore } from "@/store/chat";
+import type { ToolStep } from "@/store/chat";
+import { ToolStepBlock } from "@/components/tool-step";
 import type { Message } from "@/bindings";
 
 function MessageRow({
   message,
   streaming,
+  toolSteps,
 }: {
   message: Message;
   streaming: boolean;
+  toolSteps: ToolStep[];
 }) {
   if (message.role === "user") {
     return (
@@ -35,16 +39,25 @@ function MessageRow({
   }
 
   return (
-    <div className="flex justify-start">
-      <div
-        data-selectable
-        className={cn(
-          "max-w-[80%] whitespace-pre-wrap px-0.5 py-1 text-[13px] leading-relaxed text-foreground",
-          streaming && "ff-streaming-caret",
-        )}
-      >
-        {message.content}
-      </div>
+    <div className="flex flex-col items-start gap-1.5">
+      {toolSteps.length > 0 && (
+        <div className="flex w-full max-w-[80%] flex-col gap-1.5">
+          {toolSteps.map((step) => (
+            <ToolStepBlock key={step.callId} step={step} />
+          ))}
+        </div>
+      )}
+      {message.content && (
+        <div
+          data-selectable
+          className={cn(
+            "max-w-[80%] whitespace-pre-wrap px-0.5 py-1 text-[13px] leading-relaxed text-foreground",
+            streaming && "ff-streaming-caret",
+          )}
+        >
+          {message.content}
+        </div>
+      )}
     </div>
   );
 }
@@ -57,6 +70,7 @@ export function ChatView() {
   const streamingId = useChatStore((s) =>
     s.activeSessionId ? s.streamingBySession[s.activeSessionId] : undefined,
   );
+  const toolStepsByMessage = useChatStore((s) => s.toolStepsByMessage);
 
   const scrollRef = useRef<HTMLDivElement>(null);
   const pinnedToBottom = useRef(true);
@@ -67,7 +81,7 @@ export function ChatView() {
     if (el && pinnedToBottom.current) {
       el.scrollTop = el.scrollHeight;
     }
-  }, [messages]);
+  }, [messages, toolStepsByMessage]);
 
   useEffect(() => {
     pinnedToBottom.current = true;
@@ -103,7 +117,12 @@ export function ChatView() {
     >
       <div className="mx-auto flex max-w-3xl flex-col gap-3 px-4 py-4">
         {messages.map((m) => (
-          <MessageRow key={m.id} message={m} streaming={m.id === streamingId} />
+          <MessageRow
+            key={m.id}
+            message={m}
+            streaming={m.id === streamingId}
+            toolSteps={toolStepsByMessage[m.id] ?? []}
+          />
         ))}
       </div>
     </div>

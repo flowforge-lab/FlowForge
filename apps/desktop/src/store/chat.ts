@@ -10,7 +10,20 @@ import type {
   TokenEvent,
   TurnDoneEvent,
   TurnErrorEvent,
+  ToolCallEvent,
+  ToolResultEvent,
 } from "@/bindings";
+
+// A single tool invocation within an assistant turn, tracked by the UI.
+// `args` is the raw decoded JSON value from the backend; `result` is the tools
+// textual output once it finishes.
+export interface ToolStep {
+  callId: string;
+  tool: string;
+  args: unknown;
+  status: "running" | "done" | "error";
+  result?: string;
+}
 
 // ── Title helpers ────────────────────────────────────────────────────────────
 
@@ -128,6 +141,8 @@ interface ChatState {
   messagesBySession: Record<string, Message[]>;
   /** sessionId -> assistant messageId currently streaming in that session. */
   streamingBySession: Record<string, string>;
+  /** assistant messageId -> tool steps emitted during that turn (in order). */
+  toolStepsByMessage: Record<string, ToolStep[]>;
   /** Frontend-only custom titles (Session has no title field in the contract). */
   sessionTitles: Record<string, string>;
   /** Set when bootstrap() fails so the UI can show a clear error instead of a
@@ -145,6 +160,8 @@ interface ChatState {
   applyToken: (e: TokenEvent) => void;
   finishTurn: (e: TurnDoneEvent) => void;
   failTurn: (e: TurnErrorEvent) => void;
+  applyToolCall: (e: ToolCallEvent) => void;
+  applyToolResult: (e: ToolResultEvent) => void;
 }
 
 const systemMessage = (sessionId: string, content: string): Message => ({
@@ -160,6 +177,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   activeSessionId: null,
   messagesBySession: {},
   streamingBySession: {},
+  toolStepsByMessage: {},
   sessionTitles: loadTitles(),
   bootstrapError: null,
 
@@ -197,9 +215,21 @@ export const useChatStore = create<ChatState>((set, get) => ({
           ? partial
           : m;
       });
-      return {
-        messagesBySession: { ...s.messagesBySession, [sessionId]: merged },
+      const messagesBySession = {
+        ...s.messagesBySession,
+        [sessionId]: merged,
       };
+      // Garbage-collect tool steps for messages that no longer exist in any
+      // loaded session (e.g. ids replaced on history re-pull), keeping the
+      // actively streaming turns. Without this the map only ever grows.
+      const liveIds = new Set<string>(Object.values(s.streamingBySession));
+      for (const msgs of Object.values(messagesBySession)) {
+        for (const m of msgs) liveIds.add(m.id);
+      }
+      const toolStepsByMessage = Object.fromEntries(
+        Object.entries(s.toolStepsByMessage).filter(([id]) => liveIds.has(id)),
+      );
+      return { messagesBySession, toolStepsByMessage };
     });
   },
 
@@ -341,6 +371,59 @@ export const useChatStore = create<ChatState>((set, get) => ({
             ...(s.messagesBySession[e.sessionId] ?? []),
             systemMessage(e.sessionId, e.message),
           ],
+        },
+      };
+    });
+  },
+
+  applyToolCall: (e) => {
+    set((s) => {
+      const steps = s.toolStepsByMessage[e.messageId] ?? [];
+      // Idempotent: ignore a duplicate call event for the same callId.
+      if (steps.some((step) => step.callId === e.callId)) return s;
+      const step: ToolStep = {
+        callId: e.callId,
+        tool: e.tool,
+        args: e.args,
+        status: "running",
+      };
+      return {
+        toolStepsByMessage: {
+          ...s.toolStepsByMessage,
+          [e.messageId]: [...steps, step],
+        },
+      };
+    });
+  },
+
+  applyToolResult: (e) => {
+    set((s) => {
+      const steps = s.toolStepsByMessage[e.messageId] ?? [];
+      const status: ToolStep["status"] = e.success ? "done" : "error";
+      const known = steps.some((step) => step.callId === e.callId);
+      // A result should always follow its call, but if it ever arrives first
+      // (or after the call was lost) materialize a step so the outcome is never
+      // silently dropped — the tool name/args just aren't known here.
+      const nextSteps = known
+        ? steps.map((step) =>
+            step.callId === e.callId
+              ? { ...step, status, result: e.result }
+              : step,
+          )
+        : [
+            ...steps,
+            {
+              callId: e.callId,
+              tool: "tool",
+              args: undefined,
+              status,
+              result: e.result,
+            },
+          ];
+      return {
+        toolStepsByMessage: {
+          ...s.toolStepsByMessage,
+          [e.messageId]: nextSteps,
         },
       };
     });

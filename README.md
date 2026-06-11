@@ -129,8 +129,12 @@ cd flowforge
 # Install frontend deps
 pnpm install
 
-# Run in development (Tauri hot-reload)
+# Run in development (Tauri hot-reload, real Rust backend + local LLM)
 cargo tauri dev
+
+# UI-only: run the frontend against the in-browser mock backend
+# (no Rust build, no LLM required — great for pure UI/styling work)
+pnpm --dir apps/desktop dev:mock
 
 # Build for production
 cargo tauri build
