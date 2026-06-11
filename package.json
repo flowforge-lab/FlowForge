@@ -1,4 +1,7 @@
 {
+	"scripts": {
+		"dev:mock": "pnpm -C apps/desktop run dev:mock"
+	},
 	"devDependencies": {
 		"@tauri-apps/cli": "^2.11.2"
 	}

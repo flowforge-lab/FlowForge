@@ -31,10 +31,22 @@ export interface FfIpc {
   onIntention(cb: (e: IntentionSignal) => void): Promise<Unlisten>;
 }
 
-const USE_MOCK = import.meta.env.VITE_FF_MOCK === "1";
+// Explicit mock flag OR auto-fallback when not inside a Tauri window.
+// This lets `pnpm dev` work in a plain browser without the flag; Tauri desktop
+// (`pnpm tauri dev`) still uses the real IPC.
+const IN_TAURI =
+  globalThis.window !== undefined && "__TAURI_INTERNALS__" in globalThis.window;
+const USE_MOCK = import.meta.env.VITE_FF_MOCK === "1" || !IN_TAURI;
+
+if (!IN_TAURI && import.meta.env.VITE_FF_MOCK !== "1") {
+  console.warn(
+    "[FlowForge] Not running inside Tauri — falling back to MockIpc.\n" +
+      "Set VITE_FF_MOCK=1 to silence this, or use `pnpm tauri dev` for the real backend.",
+  );
+}
 
 class TauriIpc implements FfIpc {
-  private invoke = async <T>(
+  private readonly invoke = async <T>(
     cmd: string,
     args?: Record<string, unknown>,
   ): Promise<T> => {
