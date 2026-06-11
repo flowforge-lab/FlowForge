@@ -139,7 +139,7 @@ cargo tauri build
 ## 🗺️ Roadmap
 
 - [x] Repository bootstrap & architecture definition
-- [ ] **M1** — Tauri 2 shell + React chat UI + first LLM call (candle-vllm)
+- [x] **M1** — Tauri 2 shell + React chat UI + first LLM call (candle-vllm)
 - [ ] **M2** — Tool calling (bash, view, edit) + streaming render
 - [ ] **M3** — Skills + profiles + command palette
 - [ ] **M4** — MCP supervisor with health UI

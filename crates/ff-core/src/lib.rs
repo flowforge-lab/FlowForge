@@ -7,5 +7,5 @@ pub mod events;
 mod message;
 mod session;
 
-pub use message::{Message, Role};
+pub use message::{Message, Role, ToolCall};
 pub use session::{Session, SessionStatus};
