@@ -1,5 +1,8 @@
 // In-browser mock backend. Fulfils the FfIpc contract with canned data and a faked
 // token stream, so the frontend runs standalone via `VITE_FF_MOCK=1 pnpm dev`.
+//
+// Set `VITE_FF_MOCK_SLOW=1` to stream at 300 ms/word instead of 40 ms/word —
+// gives you enough time to hit Stop and verify the cancelTurn path.
 
 import type {
   Message,
@@ -16,13 +19,23 @@ type Listener<T> = (e: T) => void;
 const uid = () => crypto.randomUUID();
 const now = () => Date.now();
 
+// 300 ms/word in slow mode — long enough to see the Stop button and click it.
+const TOKEN_INTERVAL_MS = import.meta.env.VITE_FF_MOCK_SLOW === "1" ? 300 : 40;
+
 const MOCK_REPLY =
   "This is a mocked assistant reply streamed token by token so the UI can be " +
   "built without a running backend.";
 
+interface ActiveTurn {
+  timer: ReturnType<typeof setInterval>;
+  messageId: string;
+}
+
 export class MockIpc implements FfIpc {
   private sessions = new Map<string, Session>();
   private messages = new Map<string, Message[]>();
+  // One active timer per session so cancelTurn can stop it.
+  private activeTimers = new Map<string, ActiveTurn>();
 
   private tokenListeners = new Set<Listener<TokenEvent>>();
   private doneListeners = new Set<Listener<TurnDoneEvent>>();
@@ -62,8 +75,14 @@ export class MockIpc implements FfIpc {
     return user.id;
   }
 
-  async cancelTurn(_sessionId: string): Promise<void> {
-    // Mock turns are short; nothing to cancel.
+  async cancelTurn(sessionId: string): Promise<void> {
+    const active = this.activeTimers.get(sessionId);
+    if (!active) return;
+    clearInterval(active.timer);
+    this.activeTimers.delete(sessionId);
+    // Emit done with whatever partial content was accumulated — mirrors what
+    // the real backend does when a CancellationToken fires.
+    this.emit(this.doneListeners, { sessionId, messageId: active.messageId });
   }
 
   onToken(cb: Listener<TokenEvent>): Promise<Unlisten> {
@@ -106,6 +125,7 @@ export class MockIpc implements FfIpc {
     const timer = setInterval(() => {
       if (i >= words.length) {
         clearInterval(timer);
+        this.activeTimers.delete(sessionId);
         this.emit(this.doneListeners, { sessionId, messageId: assistant.id });
         return;
       }
@@ -117,7 +137,8 @@ export class MockIpc implements FfIpc {
         messageId: assistant.id,
         delta,
       });
-    }, 40);
+    }, TOKEN_INTERVAL_MS);
+    this.activeTimers.set(sessionId, { timer, messageId: assistant.id });
   }
 
   private subscribe<T>(
