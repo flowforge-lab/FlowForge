@@ -1,7 +1,8 @@
 import { useState } from "react";
-import { Check, ChevronRight, Loader2, X } from "lucide-react";
+import { Check, ChevronRight, Loader2, PanelRight, X } from "lucide-react";
 import { cn } from "@/lib/utils";
 import type { ToolStep } from "@/store/chat";
+import { useSplitStore } from "@/store/split";
 
 function formatArgs(args: unknown): string {
   try {
@@ -23,6 +24,7 @@ function StatusIcon({ status }: { status: ToolStep["status"] }) {
 
 export function ToolStepBlock({ step }: { step: ToolStep }) {
   const [open, setOpen] = useState(false);
+  const openInSplit = useSplitStore((s) => s.openInSplit);
   const args = formatArgs(step.args);
 
   return (
@@ -56,8 +58,25 @@ export function ToolStepBlock({ step }: { step: ToolStep }) {
           </div>
           {step.result !== undefined && (
             <div>
-              <div className="mb-0.5 text-[10px] uppercase tracking-wide text-muted-foreground/60">
-                output
+              <div className="mb-0.5 flex items-center justify-between">
+                <span className="text-[10px] uppercase tracking-wide text-muted-foreground/60">
+                  output
+                </span>
+                <button
+                  type="button"
+                  onClick={() =>
+                    openInSplit({
+                      kind: "text",
+                      text: step.result ?? "",
+                      title: step.tool,
+                    })
+                  }
+                  title="Open in split"
+                  className="flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] text-muted-foreground/80 transition-colors hover:bg-foreground/10 hover:text-foreground"
+                >
+                  <PanelRight className="size-3" />
+                  Split
+                </button>
               </div>
               <pre
                 className={cn(
