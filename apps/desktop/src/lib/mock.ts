@@ -11,6 +11,7 @@ import type {
   TurnDoneEvent,
   TurnErrorEvent,
   IntentionSignal,
+  ToolApprovalRequestEvent,
   ToolCallEvent,
   ToolResultEvent,
 } from "../bindings";
@@ -72,6 +73,15 @@ export class MockIpc implements FfIpc {
   private intentionListeners = new Set<Listener<IntentionSignal>>();
   private toolCallListeners = new Set<Listener<ToolCallEvent>>();
   private toolResultListeners = new Set<Listener<ToolResultEvent>>();
+  private approvalRequestListeners = new Set<
+    Listener<ToolApprovalRequestEvent>
+  >();
+  /** callId -> resume callback. Set when a write tool emits an approval
+   *  request; the matching `respondApproval` resolves it. */
+  private pendingApprovals = new Map<
+    string,
+    { sessionId: string; resume: (approved: boolean) => void }
+  >();
 
   async createSession(goal?: string): Promise<Session> {
     const ts = now();
@@ -121,6 +131,8 @@ export class MockIpc implements FfIpc {
         success: false,
         result: "[cancelled]",
       });
+      // Drop any awaiting-approval entry — its tool:result was just emitted.
+      this.pendingApprovals.delete(callId);
     }
     // Emit done with whatever partial content was accumulated — mirrors what
     // the real backend does when a CancellationToken fires.
@@ -144,6 +156,16 @@ export class MockIpc implements FfIpc {
   }
   onToolResult(cb: Listener<ToolResultEvent>): Promise<Unlisten> {
     return this.subscribe(this.toolResultListeners, cb);
+  }
+  onApprovalRequest(cb: Listener<ToolApprovalRequestEvent>): Promise<Unlisten> {
+    return this.subscribe(this.approvalRequestListeners, cb);
+  }
+
+  async respondApproval(callId: string, approved: boolean): Promise<void> {
+    const pending = this.pendingApprovals.get(callId);
+    if (!pending) return;
+    this.pendingApprovals.delete(callId);
+    pending.resume(approved);
   }
 
   // --- internals ---
@@ -175,34 +197,44 @@ export class MockIpc implements FfIpc {
     };
     this.activeTimers.set(sessionId, turn);
 
-    // Simulate one read-only tool call before the text reply so the UIs tool
-    // step rendering (running -> done) is exercised under VITE_FF_MOCK=1.
+    // Simulate one write tool call that requires approval, exercising the
+    // tool:call -> tool:approval-request -> respondApproval -> tool:result path
+    // under VITE_FF_MOCK=1.
     const callId = uidShort();
     turn.pendingToolCalls.push(callId);
     this.emit(this.toolCallListeners, {
       sessionId,
       messageId: assistant.id,
       callId,
-      tool: "view",
-      args: { path: "README.md" },
+      tool: "edit",
+      args: { path: "README.md", old_str: "FlowForge", new_str: "FlowForge!" },
     });
-
-    const resultTimer = setInterval(() => {
-      clearInterval(resultTimer);
-      turn.pendingToolCalls = turn.pendingToolCalls.filter(
-        (id) => id !== callId,
-      );
-      this.emit(this.toolResultListeners, {
-        sessionId,
-        messageId: assistant.id,
-        callId,
-        success: true,
-        result:
-          "# FlowForge\n\n(mocked file contents returned by the view tool)",
-      });
-      this.streamWords(sessionId, turn);
-    }, TOKEN_INTERVAL_MS * 4);
-    turn.timers.push(resultTimer);
+    this.emit(this.approvalRequestListeners, {
+      sessionId,
+      messageId: assistant.id,
+      callId,
+      tool: "edit",
+      args: { path: "README.md", old_str: "FlowForge", new_str: "FlowForge!" },
+      safety: "write",
+    });
+    this.pendingApprovals.set(callId, {
+      sessionId,
+      resume: (approved) => {
+        turn.pendingToolCalls = turn.pendingToolCalls.filter(
+          (id) => id !== callId,
+        );
+        this.emit(this.toolResultListeners, {
+          sessionId,
+          messageId: assistant.id,
+          callId,
+          success: approved,
+          result: approved
+            ? "(mocked) edited README.md"
+            : "call to `edit` was not approved",
+        });
+        this.streamWords(sessionId, turn);
+      },
+    });
   }
 
   private streamWords(sessionId: string, turn: ActiveTurn): void {

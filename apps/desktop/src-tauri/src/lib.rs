@@ -4,14 +4,59 @@
 
 mod state;
 
-use ff_agent::{run_turn, AgentEvent, ApprovalFn, CancelToken, ToolContext};
+use async_trait::async_trait;
+use ff_agent::{run_turn, AgentEvent, Approver, CancelToken, ToolContext};
 use ff_core::events::{
-    IntentionSignal, TokenEvent, ToolCallEvent, ToolResultEvent, TurnDoneEvent, TurnErrorEvent,
+    IntentionSignal, TokenEvent, ToolApprovalRequestEvent, ToolCallEvent, ToolResultEvent,
+    TurnDoneEvent, TurnErrorEvent,
 };
 use ff_core::{Message, Role, Session};
+use ff_tools::Safety;
 use state::AppState;
 use std::sync::Arc;
 use tauri::{Emitter, State};
+
+/// Routes write/dangerous tool calls through a UI confirmation. Read-only calls
+/// never reach this approver — the agent loop short-circuits them.
+struct UiApprover {
+    app: tauri::AppHandle,
+    state: Arc<AppState>,
+    session_id: String,
+}
+
+#[async_trait]
+impl Approver for UiApprover {
+    async fn approve(
+        &self,
+        message_id: &str,
+        call_id: &str,
+        name: &str,
+        safety: Safety,
+        args: &serde_json::Value,
+    ) -> bool {
+        let safety_str = match safety {
+            // Unreachable in practice: the agent loop short-circuits ReadOnly
+            // before calling the approver. Kept for the exhaustive match.
+            Safety::ReadOnly => "readOnly",
+            Safety::Write => "write",
+            Safety::Dangerous => "dangerous",
+        };
+        let rx = self.state.register_approval(call_id, &self.session_id);
+        let _ = self.app.emit(
+            "tool:approval-request",
+            ToolApprovalRequestEvent {
+                session_id: self.session_id.clone(),
+                message_id: message_id.to_string(),
+                call_id: call_id.to_string(),
+                tool: name.to_string(),
+                args: args.clone(),
+                safety: safety_str.to_string(),
+            },
+        );
+        // Sender dropped (cancel) -> RecvError -> deny.
+        rx.await.unwrap_or(false)
+    }
+}
 
 type CmdResult<T> = Result<T, String>;
 
@@ -49,6 +94,14 @@ fn cancel_turn(state: State<'_, Arc<AppState>>, session_id: String) {
     if let Some(token) = state.take_cancel(&session_id) {
         token.cancel();
     }
+    // Pending approvals for this session would block the turn forever otherwise.
+    state.cancel_pending_approvals(&session_id);
+}
+
+/// Frontend response to a [`ToolApprovalRequestEvent`]. Wakes the awaiting approver.
+#[tauri::command]
+fn respond_approval(state: State<'_, Arc<AppState>>, call_id: String, approved: bool) {
+    state.resolve_approval(&call_id, approved);
 }
 
 /// Persists the user message, then spawns the assistant turn. Tokens stream back
@@ -70,14 +123,15 @@ fn send_message(
     let model = state.model.clone();
     tauri::async_runtime::spawn(async move {
         let sid = session_id.clone();
-        // TODO(M2 PR-B): route Write/Dangerous calls to a UI confirmation. Until the
-        // approval surface lands, the shell auto-approves; read-only calls bypass
-        // this regardless. The agent loop already enforces the gate.
-        let approve: Box<ApprovalFn> = Box::new(|_name, _safety, _args| true);
+        let approver = UiApprover {
+            app: app.clone(),
+            state: state.clone(),
+            session_id: sid.clone(),
+        };
         let tool_ctx = ToolContext {
             registry: &state.tools,
             root: &state.workspace_root,
-            approve: approve.as_ref(),
+            approve: &approver,
             max_iterations: 8,
         };
         let result = run_turn(
@@ -180,6 +234,7 @@ pub fn run() {
             get_messages,
             send_message,
             cancel_turn,
+            respond_approval,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

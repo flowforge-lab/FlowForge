@@ -11,6 +11,7 @@ import type {
   TurnDoneEvent,
   TurnErrorEvent,
   IntentionSignal,
+  ToolApprovalRequestEvent,
   ToolCallEvent,
   ToolResultEvent,
 } from "../bindings";
@@ -25,6 +26,8 @@ export interface FfIpc {
   /** Persists the user message and starts the assistant turn. Returns the user message id. */
   sendMessage(sessionId: string, content: string): Promise<string>;
   cancelTurn(sessionId: string): Promise<void>;
+  /** Frontend's reply to a [`ToolApprovalRequestEvent`]. */
+  respondApproval(callId: string, approved: boolean): Promise<void>;
 
   // Events (backend -> frontend)
   onToken(cb: (e: TokenEvent) => void): Promise<Unlisten>;
@@ -33,6 +36,9 @@ export interface FfIpc {
   onIntention(cb: (e: IntentionSignal) => void): Promise<Unlisten>;
   onToolCall(cb: (e: ToolCallEvent) => void): Promise<Unlisten>;
   onToolResult(cb: (e: ToolResultEvent) => void): Promise<Unlisten>;
+  onApprovalRequest(
+    cb: (e: ToolApprovalRequestEvent) => void,
+  ): Promise<Unlisten>;
 }
 
 // Explicit mock flag OR auto-fallback when not inside a Tauri window.
@@ -82,6 +88,8 @@ class TauriIpc implements FfIpc {
     this.invoke<string>("send_message", { sessionId, content });
   cancelTurn = (sessionId: string) =>
     this.invoke<void>("cancel_turn", { sessionId });
+  respondApproval = (callId: string, approved: boolean) =>
+    this.invoke<void>("respond_approval", { callId, approved });
 
   onToken = (cb: (e: TokenEvent) => void) =>
     this.listen<TokenEvent>("turn:token", cb);
@@ -95,6 +103,8 @@ class TauriIpc implements FfIpc {
     this.listen<ToolCallEvent>("tool:call", cb);
   onToolResult = (cb: (e: ToolResultEvent) => void) =>
     this.listen<ToolResultEvent>("tool:result", cb);
+  onApprovalRequest = (cb: (e: ToolApprovalRequestEvent) => void) =>
+    this.listen<ToolApprovalRequestEvent>("tool:approval-request", cb);
 }
 
 // `MockIpc` is pulled in with a dynamic import so the bundler gives it its own

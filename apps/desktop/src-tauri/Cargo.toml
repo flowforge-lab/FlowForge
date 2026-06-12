@@ -27,3 +27,5 @@ ff-memory = { workspace = true }
 ff-signals = { workspace = true }
 ff-tools = { workspace = true }
 dirs = "5"
+tokio = { workspace = true }
+async-trait = { workspace = true }

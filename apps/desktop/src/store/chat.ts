@@ -10,6 +10,7 @@ import type {
   TokenEvent,
   TurnDoneEvent,
   TurnErrorEvent,
+  ToolApprovalRequestEvent,
   ToolCallEvent,
   ToolResultEvent,
 } from "@/bindings";
@@ -21,7 +22,9 @@ export interface ToolStep {
   callId: string;
   tool: string;
   args: unknown;
-  status: "running" | "done" | "error";
+  status: "running" | "awaiting-approval" | "done" | "error";
+  /** Set when status is "awaiting-approval" — `"write"` or `"dangerous"`. */
+  safety?: string;
   result?: string;
 }
 
@@ -162,6 +165,12 @@ interface ChatState {
   failTurn: (e: TurnErrorEvent) => void;
   applyToolCall: (e: ToolCallEvent) => void;
   applyToolResult: (e: ToolResultEvent) => void;
+  applyApprovalRequest: (e: ToolApprovalRequestEvent) => void;
+  respondApproval: (
+    messageId: string,
+    callId: string,
+    approved: boolean,
+  ) => Promise<void>;
 }
 
 const systemMessage = (sessionId: string, content: string): Message => ({
@@ -387,7 +396,32 @@ export const useChatStore = create<ChatState>((set, get) => ({
         args: e.args,
         status: "running",
       };
+      // A tool call can precede any streamed token (the backend emits no token
+      // for empty deltas), so applyToken may never create the anchoring assistant
+      // message. Upsert it here and mark the session streaming, so the step
+      // renders and Stop/cancel works even on a tool-first turn.
+      const messages = s.messagesBySession[e.sessionId] ?? [];
+      const nextMessages = messages.some((m) => m.id === e.messageId)
+        ? messages
+        : [
+            ...messages,
+            {
+              id: e.messageId,
+              sessionId: e.sessionId,
+              role: "assistant" as const,
+              content: "",
+              createdAt: Date.now(),
+            },
+          ];
       return {
+        messagesBySession: {
+          ...s.messagesBySession,
+          [e.sessionId]: nextMessages,
+        },
+        streamingBySession: {
+          ...s.streamingBySession,
+          [e.sessionId]: e.messageId,
+        },
         toolStepsByMessage: {
           ...s.toolStepsByMessage,
           [e.messageId]: [...steps, step],
@@ -427,5 +461,53 @@ export const useChatStore = create<ChatState>((set, get) => ({
         },
       };
     });
+  },
+
+  applyApprovalRequest: (e) => {
+    set((s) => {
+      const steps = s.toolStepsByMessage[e.messageId];
+      if (!steps) return s;
+      return {
+        toolStepsByMessage: {
+          ...s.toolStepsByMessage,
+          [e.messageId]: steps.map((step) =>
+            step.callId === e.callId
+              ? { ...step, status: "awaiting-approval", safety: e.safety }
+              : step,
+          ),
+        },
+      };
+    });
+  },
+
+  respondApproval: async (messageId, callId, approved) => {
+    const setStatus = (status: ToolStep["status"]) =>
+      set((s) => {
+        const steps = s.toolStepsByMessage[messageId];
+        if (!steps) return s;
+        return {
+          toolStepsByMessage: {
+            ...s.toolStepsByMessage,
+            [messageId]: steps.map((step) =>
+              step.callId === callId ? { ...step, status } : step,
+            ),
+          },
+        };
+      });
+
+    // Optimistic only on approve: flip to running so the UI doesn't sit on the
+    // buttons while the round-trip + tool execution complete. On deny the tool is
+    // not executed; the backend still emits a tool:result (error), which settles
+    // the step — so don't flash a spinner for a call that never runs.
+    if (approved) setStatus("running");
+    try {
+      await ipc.respondApproval(callId, approved);
+    } catch (err) {
+      // IPC failed — the backend never received the response. Revert to the
+      // approval gate so the user can retry. Only status changed, so the safety
+      // field (and thus the buttons) re-render correctly.
+      console.error("respondApproval IPC failed:", err);
+      setStatus("awaiting-approval");
+    }
   },
 }));

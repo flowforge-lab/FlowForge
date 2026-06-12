@@ -10,10 +10,12 @@ function MessageRow({
   message,
   streaming,
   toolSteps,
+  onRespond,
 }: {
   message: Message;
   streaming: boolean;
   toolSteps: ToolStep[];
+  onRespond: (callId: string, approved: boolean) => void;
 }) {
   if (message.role === "user") {
     return (
@@ -44,7 +46,11 @@ function MessageRow({
       {toolSteps.length > 0 && (
         <div className="flex w-full max-w-[80%] flex-col gap-1.5">
           {toolSteps.map((step) => (
-            <ToolStepBlock key={step.callId} step={step} />
+            <ToolStepBlock
+              key={step.callId}
+              step={step}
+              onRespond={onRespond}
+            />
           ))}
         </div>
       )}
@@ -72,6 +78,7 @@ export function ChatView() {
     s.activeSessionId ? s.streamingBySession[s.activeSessionId] : undefined,
   );
   const toolStepsByMessage = useChatStore((s) => s.toolStepsByMessage);
+  const respondApproval = useChatStore((s) => s.respondApproval);
 
   const scrollRef = useRef<HTMLDivElement>(null);
   const pinnedToBottom = useRef(true);
@@ -123,6 +130,9 @@ export function ChatView() {
             message={m}
             streaming={m.id === streamingId}
             toolSteps={toolStepsByMessage[m.id] ?? []}
+            onRespond={(callId, approved) =>
+              void respondApproval(m.id, callId, approved)
+            }
           />
         ))}
       </div>
