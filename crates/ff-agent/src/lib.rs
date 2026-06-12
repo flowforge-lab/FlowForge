@@ -52,15 +52,27 @@ pub enum AgentError {
 }
 
 /// Decides whether a non-read-only tool call may run. The host supplies this; the
-/// desktop shell routes it to a UI confirmation. Read-only calls bypass it.
-pub type ApprovalFn = dyn Fn(&str, Safety, &serde_json::Value) -> bool + Send + Sync;
+/// desktop shell routes it to a UI confirmation (an async round-trip), so the call
+/// is `async`. Read-only calls bypass it entirely. `message_id` + `call_id` let the
+/// host correlate the request with the exact tool step it is rendering.
+#[async_trait::async_trait]
+pub trait Approver: Send + Sync {
+    async fn approve(
+        &self,
+        message_id: &str,
+        call_id: &str,
+        name: &str,
+        safety: Safety,
+        args: &serde_json::Value,
+    ) -> bool;
+}
 
 /// Everything the loop needs to dispatch tools.
 pub struct ToolContext<'a> {
     pub registry: &'a ToolRegistry,
     /// Per-session workspace root. File tools are jailed to it; `bash` runs in it.
     pub root: &'a Path,
-    pub approve: &'a ApprovalFn,
+    pub approve: &'a dyn Approver,
     pub max_iterations: usize,
 }
 
@@ -249,7 +261,11 @@ pub async fn run_turn(
             });
 
             let safety = tools.registry.safety(&call.name, &args);
-            let approved = safety == Safety::ReadOnly || (tools.approve)(&call.name, safety, &args);
+            let approved = safety == Safety::ReadOnly
+                || tools
+                    .approve
+                    .approve(&message_id, &call.id, &call.name, safety, &args)
+                    .await;
 
             let outcome = if approved {
                 tools.registry.run(&call.name, args, tools.root).await
@@ -309,14 +325,74 @@ mod tests {
     use ff_llm::{Chunk, ChunkStream, LlmError, ToolCallDelta};
     use std::sync::atomic::AtomicUsize;
 
-    fn approve_all() -> Box<ApprovalFn> {
-        Box::new(|_: &str, _: Safety, _: &serde_json::Value| true)
+    struct AlwaysApprove;
+    #[async_trait]
+    impl Approver for AlwaysApprove {
+        async fn approve(
+            &self,
+            _message_id: &str,
+            _call_id: &str,
+            _name: &str,
+            _safety: Safety,
+            _args: &serde_json::Value,
+        ) -> bool {
+            true
+        }
+    }
+
+    struct AlwaysDeny;
+    #[async_trait]
+    impl Approver for AlwaysDeny {
+        async fn approve(
+            &self,
+            _message_id: &str,
+            _call_id: &str,
+            _name: &str,
+            _safety: Safety,
+            _args: &serde_json::Value,
+        ) -> bool {
+            false
+        }
+    }
+
+    /// Approves, but cancels the turn first — to exercise the cancel-mid-loop path.
+    struct CancelOnApprove(CancelToken);
+    #[async_trait]
+    impl Approver for CancelOnApprove {
+        async fn approve(
+            &self,
+            _message_id: &str,
+            _call_id: &str,
+            _name: &str,
+            _safety: Safety,
+            _args: &serde_json::Value,
+        ) -> bool {
+            self.0.cancel();
+            true
+        }
+    }
+
+    /// Yields once before approving, proving the loop actually awaits the decision.
+    struct YieldThenApprove;
+    #[async_trait]
+    impl Approver for YieldThenApprove {
+        async fn approve(
+            &self,
+            _message_id: &str,
+            _call_id: &str,
+            _name: &str,
+            _safety: Safety,
+            _args: &serde_json::Value,
+        ) -> bool {
+            tokio::task::yield_now().await;
+            true
+        }
     }
 
     fn ctx<'a>(
         registry: &'a ToolRegistry,
         root: &'a Path,
-        approve: &'a ApprovalFn,
+        approve: &'a dyn Approver,
     ) -> ToolContext<'a> {
         ToolContext {
             registry,
@@ -384,14 +460,14 @@ mod tests {
         store.add_message(&s.id, Role::User, "hi".into());
         let registry = ToolRegistry::new();
         let root = std::env::current_dir().unwrap();
-        let approve = approve_all();
+        let approve = AlwaysApprove;
 
         let mut tokens = String::new();
         let mut done = false;
         let msg = run_turn(
             &TextProvider,
             &store,
-            &ctx(&registry, &root, approve.as_ref()),
+            &ctx(&registry, &root, &approve),
             &s.id,
             "mock",
             CancelToken::new(),
@@ -417,7 +493,7 @@ mod tests {
         let s = store.create_session(None);
         store.add_message(&s.id, Role::User, "run echo".into());
         let registry = ToolRegistry::with_defaults();
-        let approve = approve_all();
+        let approve = AlwaysApprove;
         let provider = ToolThenText {
             calls: AtomicUsize::new(0),
         };
@@ -428,7 +504,7 @@ mod tests {
         let msg = run_turn(
             &provider,
             &store,
-            &ctx(&registry, dir.path(), approve.as_ref()),
+            &ctx(&registry, dir.path(), &approve),
             &s.id,
             "mock",
             CancelToken::new(),
@@ -503,17 +579,12 @@ mod tests {
 
         // Approving the first (write) call cancels the turn, so the second is skipped.
         let cancel = CancelToken::new();
-        let c2 = cancel.clone();
-        let approve: Box<ApprovalFn> =
-            Box::new(move |_: &str, _: Safety, _: &serde_json::Value| {
-                c2.cancel();
-                true
-            });
+        let approve = CancelOnApprove(cancel.clone());
 
         let msg = run_turn(
             &TwoCalls,
             &store,
-            &ctx(&registry, dir.path(), approve.as_ref()),
+            &ctx(&registry, dir.path(), &approve),
             &s.id,
             "mock",
             cancel,
@@ -563,7 +634,7 @@ mod tests {
         store.add_message(&s.id, Role::User, "edit it".into());
         let registry = ToolRegistry::with_defaults();
         // Deny everything that needs approval.
-        let deny: Box<ApprovalFn> = Box::new(|_: &str, _: Safety, _: &serde_json::Value| false);
+        let deny = AlwaysDeny;
 
         struct EditProvider {
             calls: AtomicUsize,
@@ -600,7 +671,7 @@ mod tests {
                 calls: AtomicUsize::new(0),
             },
             &store,
-            &ctx(&registry, dir.path(), deny.as_ref()),
+            &ctx(&registry, dir.path(), &deny),
             &s.id,
             "mock",
             CancelToken::new(),
@@ -624,5 +695,38 @@ mod tests {
             std::fs::read_to_string(dir.path().join("f.txt")).unwrap(),
             "old\n"
         );
+    }
+
+    /// The loop must await an async approval decision before running the tool.
+    #[tokio::test]
+    async fn awaits_async_approval() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemoryStore::new();
+        let s = store.create_session(None);
+        store.add_message(&s.id, Role::User, "run echo".into());
+        let registry = ToolRegistry::with_defaults();
+        let approve = YieldThenApprove;
+        let provider = ToolThenText {
+            calls: AtomicUsize::new(0),
+        };
+
+        let mut finished_ok = false;
+        run_turn(
+            &provider,
+            &store,
+            &ctx(&registry, dir.path(), &approve),
+            &s.id,
+            "mock",
+            CancelToken::new(),
+            |ev| {
+                if let AgentEvent::ToolCallFinished { success, .. } = ev {
+                    finished_ok = success;
+                }
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(finished_ok, "tool should run after async approval resolves");
     }
 }

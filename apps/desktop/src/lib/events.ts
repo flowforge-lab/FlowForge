@@ -20,6 +20,7 @@ export function startIpcEvents(): void {
   void ipc.onTurnError(store.failTurn);
   void ipc.onToolCall(store.applyToolCall);
   void ipc.onToolResult(store.applyToolResult);
+  void ipc.onApprovalRequest(store.applyApprovalRequest);
   // No UI for intention signals yet (NeuroForge, M8) — observe only.
   void ipc.onIntention((e) => {
     console.debug("[signal:intention]", e.sessionId, e.goal);

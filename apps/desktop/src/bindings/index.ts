@@ -5,6 +5,7 @@ export type { Role } from "./Role";
 export type { Session } from "./Session";
 export type { SessionStatus } from "./SessionStatus";
 export type { TokenEvent } from "./TokenEvent";
+export type { ToolApprovalRequestEvent } from "./ToolApprovalRequestEvent";
 export type { ToolCallEvent } from "./ToolCallEvent";
 export type { ToolResultEvent } from "./ToolResultEvent";
 export type { TurnDoneEvent } from "./TurnDoneEvent";

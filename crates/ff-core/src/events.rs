@@ -31,6 +31,22 @@ pub struct ToolCallEvent {
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export, export_to = "../../../apps/desktop/src/bindings/")]
+pub struct ToolApprovalRequestEvent {
+    pub session_id: String,
+    /// Assistant message the call belongs to.
+    pub message_id: String,
+    /// Correlates with the [`ToolCallEvent`] / [`ToolResultEvent`] for this call.
+    pub call_id: String,
+    pub tool: String,
+    #[ts(type = "unknown")]
+    pub args: serde_json::Value,
+    /// `"write"` or `"dangerous"` — read-only calls never require approval.
+    pub safety: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "../../../apps/desktop/src/bindings/")]
 pub struct ToolResultEvent {
     pub session_id: String,
     pub message_id: String,

@@ -139,14 +139,16 @@ M1–M2 contract (minimum to unblock Abid):
 | `create_session` | `{ goal?: string }` | `Session` | ff-memory |
 | `get_messages` | `{ sessionId }` | `Message[]` | ff-memory |
 | `cancel_turn` | `{ sessionId }` | `void` | ff-agent |
+| `respond_approval` | `{ callId, approved }` | `void` | ff-agent (wakes the awaiting approver) |
 
 ### 3.2 Events (backend → frontend, streaming)
 Emitted via `app_handle.emit()`. The chat streams over events, not command return values.
 | Event | Payload | When |
 |-------|---------|------|
-| `turn:token` | `{ sessionId, messageId, delta }` | each streamed LLM token |
-| `turn:tool_call` | `{ sessionId, tool, args }` | agent invokes a tool |
-| `turn:tool_result` | `{ sessionId, tool, result }` | tool completes |
+| `turn:token` | `{ sessionId, messageId, delta }` | each streamed LLM token (non-empty deltas only) |
+| `tool:call` | `{ sessionId, messageId, callId, tool, args }` | agent invokes a tool |
+| `tool:approval-request` | `{ sessionId, messageId, callId, tool, args, safety }` | a write/dangerous tool needs user approval; backend awaits `respond_approval` |
+| `tool:result` | `{ sessionId, messageId, callId, success, result }` | tool completes (or was denied/cancelled) |
 | `turn:done` | `{ sessionId, messageId }` | turn complete |
 | `turn:error` | `{ sessionId, message }` | failure |
 | `signal:intention` | `{ sessionId, goal }` | session goal set (NeuroForge) |
