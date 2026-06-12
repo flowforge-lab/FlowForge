@@ -192,3 +192,234 @@ body {
   color: var(--muted-foreground);
   animation: ff-caret-blink 1s steps(1) infinite;
 }
+
+/* --- Assistant Markdown prose (components/markdown.tsx) --- */
+
+.ff-prose {
+  font-size: 13px;
+  line-height: 1.6;
+}
+/* Collapse outer margins so a bubble doesn't gain stray top/bottom space. */
+.ff-prose > :first-child {
+  margin-top: 0;
+}
+.ff-prose > :last-child {
+  margin-bottom: 0;
+}
+.ff-prose p {
+  margin: 0.5em 0;
+}
+.ff-prose h1,
+.ff-prose h2,
+.ff-prose h3,
+.ff-prose h4 {
+  margin: 1em 0 0.5em;
+  font-weight: 600;
+  line-height: 1.3;
+}
+.ff-prose h1 {
+  font-size: 1.3em;
+}
+.ff-prose h2 {
+  font-size: 1.18em;
+}
+.ff-prose h3 {
+  font-size: 1.06em;
+}
+.ff-prose h4 {
+  font-size: 1em;
+}
+.ff-prose ul,
+.ff-prose ol {
+  margin: 0.5em 0;
+  padding-left: 1.4em;
+}
+.ff-prose ul {
+  list-style: disc;
+}
+.ff-prose ol {
+  list-style: decimal;
+}
+.ff-prose li {
+  margin: 0.2em 0;
+}
+.ff-prose li::marker {
+  color: var(--muted-foreground);
+}
+.ff-prose a {
+  color: var(--primary);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.ff-prose a:hover {
+  opacity: 0.85;
+}
+.ff-prose strong {
+  font-weight: 600;
+}
+.ff-prose em {
+  font-style: italic;
+}
+.ff-prose blockquote {
+  margin: 0.6em 0;
+  border-left: 2px solid var(--border);
+  padding-left: 0.8em;
+  color: var(--muted-foreground);
+}
+.ff-prose hr {
+  margin: 1em 0;
+  border: 0;
+  border-top: 1px solid var(--border);
+}
+/* GFM tables */
+.ff-prose table {
+  display: block;
+  overflow-x: auto;
+  border-collapse: collapse;
+  margin: 0.6em 0;
+  font-size: 0.95em;
+}
+.ff-prose th,
+.ff-prose td {
+  border: 1px solid var(--border);
+  padding: 0.3em 0.6em;
+  text-align: left;
+}
+.ff-prose th {
+  background: color-mix(in oklab, var(--foreground) 6%, transparent);
+  font-weight: 600;
+}
+
+/* Inline code */
+.ff-inline-code {
+  font-family:
+    ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  font-size: 0.86em;
+  background: color-mix(in oklab, var(--foreground) 10%, transparent);
+  padding: 0.1em 0.34em;
+  border-radius: 4px;
+}
+
+/* Fenced code blocks — surface follows the active theme, chrome is low-key. */
+.ff-code {
+  background: var(--card);
+  border-color: var(--border);
+}
+.ff-code__bar {
+  border-bottom: 1px solid var(--border);
+  background: color-mix(in oklab, var(--foreground) 4%, transparent);
+}
+.ff-code pre {
+  margin: 0;
+}
+.ff-code .hljs {
+  display: block;
+  font-family:
+    ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  color: var(--foreground);
+  background: transparent;
+}
+
+/* highlight.js token palette — teal-leaning to match the FlowForge accent.
+   Light values are the default; dark surfaces lift them for contrast. */
+.hljs-comment,
+.hljs-quote {
+  color: oklch(0.55 0.02 200);
+  font-style: italic;
+}
+.hljs-keyword,
+.hljs-selector-tag,
+.hljs-literal,
+.hljs-section,
+.hljs-link {
+  color: oklch(0.48 0.13 250);
+}
+.hljs-string,
+.hljs-regexp,
+.hljs-addition,
+.hljs-attribute {
+  color: oklch(0.5 0.12 150);
+}
+.hljs-number,
+.hljs-built_in,
+.hljs-type,
+.hljs-class .hljs-title,
+.hljs-params {
+  color: oklch(0.52 0.12 50);
+}
+.hljs-title,
+.hljs-name,
+.hljs-selector-id,
+.hljs-selector-class {
+  color: oklch(0.5 0.14 200);
+}
+.hljs-attr,
+.hljs-variable,
+.hljs-template-variable {
+  color: oklch(0.48 0.06 215);
+}
+.hljs-tag {
+  color: oklch(0.5 0.13 200);
+}
+.hljs-symbol,
+.hljs-bullet {
+  color: oklch(0.52 0.12 330);
+}
+.hljs-meta {
+  color: oklch(0.55 0.02 200);
+}
+.hljs-deletion {
+  color: var(--destructive);
+}
+.hljs-emphasis {
+  font-style: italic;
+}
+.hljs-strong {
+  font-weight: 600;
+}
+
+.dark .hljs-comment,
+.dark .hljs-quote {
+  color: oklch(0.62 0.02 200);
+}
+.dark .hljs-keyword,
+.dark .hljs-selector-tag,
+.dark .hljs-literal,
+.dark .hljs-section,
+.dark .hljs-link {
+  color: oklch(0.78 0.1 255);
+}
+.dark .hljs-string,
+.dark .hljs-regexp,
+.dark .hljs-addition,
+.dark .hljs-attribute {
+  color: oklch(0.8 0.12 150);
+}
+.dark .hljs-number,
+.dark .hljs-built_in,
+.dark .hljs-type,
+.dark .hljs-class .hljs-title,
+.dark .hljs-params {
+  color: oklch(0.83 0.1 65);
+}
+.dark .hljs-title,
+.dark .hljs-name,
+.dark .hljs-selector-id,
+.dark .hljs-selector-class {
+  color: oklch(0.82 0.11 195);
+}
+.dark .hljs-attr,
+.dark .hljs-variable,
+.dark .hljs-template-variable {
+  color: oklch(0.84 0.05 200);
+}
+.dark .hljs-tag {
+  color: oklch(0.8 0.11 195);
+}
+.dark .hljs-symbol,
+.dark .hljs-bullet {
+  color: oklch(0.78 0.1 330);
+}
+.dark .hljs-meta {
+  color: oklch(0.62 0.02 200);
+}
