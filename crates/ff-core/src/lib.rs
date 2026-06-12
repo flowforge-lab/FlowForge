@@ -6,6 +6,8 @@
 pub mod events;
 mod message;
 mod session;
+mod skill;
 
 pub use message::{Message, Role, ToolCall};
 pub use session::{Session, SessionStatus};
+pub use skill::{Phenotype, Skill, SkillManifest};
