@@ -3,8 +3,9 @@ import { isValidElement } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import rehypeHighlight from "rehype-highlight";
-import { Check, Copy } from "lucide-react";
+import { Check, Copy, PanelRight } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { useSplitStore } from "@/store/split";
 
 // Flatten React children (including the nested <span> tree rehype-highlight
 // produces) back into plain text — used as the source for the copy button.
@@ -52,6 +53,28 @@ function CopyButton({ value }: { value: string }) {
   );
 }
 
+// Pops the block into the right-hand split panel (Issue #11).
+function OpenInSplitButton({
+  language,
+  raw,
+}: {
+  language: string;
+  raw: string;
+}) {
+  const openInSplit = useSplitStore((s) => s.openInSplit);
+  return (
+    <button
+      type="button"
+      onClick={() => openInSplit({ kind: "code", lang: language, text: raw })}
+      title="Open in split"
+      className="flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px] text-muted-foreground/80 transition-colors hover:bg-foreground/10 hover:text-foreground"
+    >
+      <PanelRight className="size-3" />
+      Split
+    </button>
+  );
+}
+
 // A fenced code block: language label + copy button over the highlighted code.
 // `children` is the already-highlighted <code> subtree; `raw` is its plain text.
 function CodeBlock({
@@ -69,7 +92,10 @@ function CodeBlock({
         <span className="font-mono text-[11px] uppercase tracking-wide text-muted-foreground/70">
           {language}
         </span>
-        <CopyButton value={raw} />
+        <div className="flex items-center gap-1">
+          <OpenInSplitButton language={language} raw={raw} />
+          <CopyButton value={raw} />
+        </div>
       </div>
       <pre className="overflow-x-auto px-3 py-2.5 text-[12.5px] leading-relaxed">
         {children}
@@ -139,3 +165,47 @@ function MarkdownImpl({ content }: { content: string }) {
 }
 
 export const Markdown = memo(MarkdownImpl);
+
+// Smallest backtick fence that can safely wrap `text` — longer than any run of
+// backticks inside it, so code containing ``` won't break out of the block.
+function safeFence(text: string): string {
+  const longest = (text.match(/`+/g) ?? []).reduce(
+    (m, run) => Math.max(m, run.length),
+    0,
+  );
+  return "`".repeat(Math.max(3, longest + 1));
+}
+
+const HIGHLIGHT_COMPONENTS = {
+  // Flattened: the caller supplies its own <pre>, so we emit just the <code>.
+  pre: ({ children }: { children?: ReactNode }) => <>{children}</>,
+  code: ({
+    className,
+    children,
+    ...props
+  }: {
+    className?: string;
+    children?: ReactNode;
+  }) => (
+    <code className={cn("hljs", className)} {...props}>
+      {children}
+    </code>
+  ),
+};
+
+// Syntax-highlights a raw code string, reusing #7's rehype-highlight pipeline
+// and the shared `.hljs` theme in index.css. Returns the bare highlighted
+// <code> (no <pre>) so callers control wrapping/scroll. Used by the split panel.
+function HighlightedCodeImpl({ lang, text }: { lang: string; text: string }) {
+  const fence = safeFence(text);
+  return (
+    <ReactMarkdown
+      rehypePlugins={[rehypeHighlight]}
+      components={HIGHLIGHT_COMPONENTS}
+    >
+      {`${fence}${lang}\n${text}\n${fence}`}
+    </ReactMarkdown>
+  );
+}
+
+export const HighlightedCode = memo(HighlightedCodeImpl);
