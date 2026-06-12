@@ -24,9 +24,29 @@ const now = () => Date.now();
 // 300 ms/word in slow mode — long enough to see the Stop button and click it.
 const TOKEN_INTERVAL_MS = import.meta.env.VITE_FF_MOCK_SLOW === "1" ? 300 : 40;
 
-const MOCK_REPLY =
-  "This is a mocked assistant reply streamed token by token so the UI can be " +
-  "built without a running backend.";
+// A small Markdown document so the renderer's features (headings, lists,
+// emphasis, inline code, a fenced + highlighted code block, a table, a link)
+// are all exercised under `VITE_FF_MOCK=1`. Uses single spaces between words so
+// the word-by-word fake stream reconstructs it faithfully.
+const MOCK_REPLY = `### Mocked assistant reply
+
+This is a **mocked assistant reply** streamed token by token so the UI can be built without a running backend. It now renders _Markdown_ — including inline \`code\` and the block below.
+
+- First a short list
+- Then some \`inline code\`
+- And a [link](https://tauri.app)
+
+\`\`\`ts
+// fenced code block with syntax highlighting
+export function greet(name: string): string {
+  return \`hello, \${name}\`;
+}
+\`\`\`
+
+| Feature | Status |
+| --- | --- |
+| Headings | done |
+| Code blocks | done |`;
 
 interface ActiveTurn {
   // All pending interval/timeout handles for this turn, cleared on cancel.

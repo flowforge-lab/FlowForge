@@ -3,6 +3,7 @@ import { cn } from "@/lib/utils";
 import { useChatStore } from "@/store/chat";
 import type { ToolStep } from "@/store/chat";
 import { ToolStepBlock } from "@/components/tool-step";
+import { Markdown } from "@/components/markdown";
 import type { Message } from "@/bindings";
 
 function MessageRow({
@@ -51,11 +52,11 @@ function MessageRow({
         <div
           data-selectable
           className={cn(
-            "max-w-[80%] whitespace-pre-wrap px-0.5 py-1 text-[13px] leading-relaxed text-foreground",
+            "max-w-[80%] px-0.5 py-1 text-[13px] leading-relaxed text-foreground",
             streaming && "ff-streaming-caret",
           )}
         >
-          {message.content}
+          <Markdown content={message.content} />
         </div>
       )}
     </div>
