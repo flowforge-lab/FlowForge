@@ -36,13 +36,20 @@ export interface FfIpc {
 }
 
 // Explicit mock flag OR auto-fallback when not inside a Tauri window.
-// This lets `pnpm dev` work in a plain browser without the flag; Tauri desktop
-// (`pnpm tauri dev`) still uses the real IPC.
+//
+// The `!IN_TAURI` auto-fallback is gated behind `import.meta.env.DEV` on purpose:
+// it only matters when running `pnpm dev` in a plain browser. A *production*
+// build always runs inside Tauri, so `DEV` is statically `false` there and the
+// whole `USE_MOCK` expression const-folds to `false` (when VITE_FF_MOCK isn't
+// set) — letting Rollup dead-code-eliminate the `await import("./mock")` branch
+// below, so `mock.ts` never ships in a desktop binary. (A dynamic import alone
+// isn't enough: a runtime-dependent `USE_MOCK` keeps the chunk on disk.)
 const IN_TAURI =
   globalThis.window !== undefined && "__TAURI_INTERNALS__" in globalThis.window;
-const USE_MOCK = import.meta.env.VITE_FF_MOCK === "1" || !IN_TAURI;
+const USE_MOCK =
+  import.meta.env.VITE_FF_MOCK === "1" || (import.meta.env.DEV && !IN_TAURI);
 
-if (!IN_TAURI && import.meta.env.VITE_FF_MOCK !== "1") {
+if (import.meta.env.DEV && !IN_TAURI && import.meta.env.VITE_FF_MOCK !== "1") {
   console.warn(
     "[FlowForge] Not running inside Tauri — falling back to MockIpc.\n" +
       "Set VITE_FF_MOCK=1 to silence this, or use `pnpm tauri dev` for the real backend.",
@@ -90,8 +97,21 @@ class TauriIpc implements FfIpc {
     this.listen<ToolResultEvent>("tool:result", cb);
 }
 
-// Mock is referenced only when VITE_FF_MOCK=1; production builds const-fold the
-// flag and bundlers drop the unused branch.
-import { MockIpc } from "./mock";
+// `MockIpc` is pulled in with a dynamic import so the bundler gives it its own
+// chunk and leaves it out of production builds. A static import could NOT be
+// tree-shaken here: `USE_MOCK` depends on the runtime `!IN_TAURI` check, so the
+// branch isn't statically constant-foldable and `MockIpc` (plus its transitive
+// imports) would ship in every desktop binary as dead weight.
+//
+// Top-level await keeps `ipc` a resolved `FfIpc` value (not a Promise), so the
+// store and event wiring keep reading it synchronously — they only run after
+// module init, which the await covers.
+async function createIpc(): Promise<FfIpc> {
+  if (USE_MOCK) {
+    const { MockIpc } = await import("./mock");
+    return new MockIpc();
+  }
+  return new TauriIpc();
+}
 
-export const ipc: FfIpc = USE_MOCK ? new MockIpc() : new TauriIpc();
+export const ipc: FfIpc = await createIpc();
