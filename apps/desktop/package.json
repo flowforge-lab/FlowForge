@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "//dev:mock": "UI-only dev against the in-browser mock backend (no Rust/LLM). `pnpm tauri dev` uses the real backend; open in the Tauri window, not a browser tab.",
     "dev:mock": "VITE_FF_MOCK=1 vite",
     "build": "tsc && vite build",
     "preview": "vite preview",

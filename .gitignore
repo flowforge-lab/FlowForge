@@ -30,3 +30,7 @@ dist
 # CodeGraph index — entirely local, never commit
 .codegraph/
 .idea/
+
+# Aki agent scratch — local-only, never commit
+.followups/
+design/
