@@ -1,13 +1,17 @@
 //! Filesystem hot-reload for the skills directory.
 //!
 //! [`SkillWatcher`] watches `~/.flowforge/skills/` and rebuilds the shared
-//! [`SkillRegistry`] on change, debounced to coalesce editor save-storms. The
+//! [`SkillRegistry`] on change. A trailing debounce coalesces editor save-storms:
+//! the registry reloads `DEBOUNCE` after the *last* filesystem event, so the
+//! settled on-disk state is what lands (not an intermediate read mid-burst). The
 //! agent reads the registry through the returned [`SharedRegistry`]; it snapshots
 //! the active set at turn start so a mid-turn reload never races (M3.1b).
 
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, RwLock};
-use std::time::{Duration, Instant};
+use std::thread;
+use std::time::Duration;
 
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 
@@ -19,7 +23,8 @@ pub type SharedRegistry = Arc<RwLock<SkillRegistry>>;
 
 const DEBOUNCE: Duration = Duration::from_millis(200);
 
-/// Owns the OS watcher. Dropping it stops watching.
+/// Owns the OS watcher. Dropping it stops watching: the watcher's event sender
+/// disconnects, and the debounce worker thread observes the disconnect and exits.
 pub struct SkillWatcher {
     _watcher: RecommendedWatcher,
 }
@@ -32,23 +37,34 @@ impl SkillWatcher {
         let (initial, errors) = SkillRegistry::load_dir(&root);
         let shared: SharedRegistry = Arc::new(RwLock::new(initial));
 
+        // notify callback (watcher thread) -> debounce worker thread.
+        let (tx, rx) = mpsc::channel::<()>();
+
         let reload_target = Arc::clone(&shared);
         let reload_root = root.clone();
-        let mut last = Instant::now()
-            .checked_sub(DEBOUNCE)
-            .unwrap_or_else(Instant::now);
+        thread::spawn(move || {
+            // Block for the first event, then coalesce every event arriving within
+            // DEBOUNCE of the previous one — reload only once the dir falls quiet.
+            while rx.recv().is_ok() {
+                loop {
+                    match rx.recv_timeout(DEBOUNCE) {
+                        Ok(()) => continue,
+                        Err(RecvTimeoutError::Timeout) => break,
+                        Err(RecvTimeoutError::Disconnected) => return,
+                    }
+                }
+                reload(&reload_root, &reload_target);
+            }
+        });
 
         let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
-            if res.is_err() {
-                return;
+            match res {
+                Ok(_) => {
+                    // Worker only gone during teardown; a dropped send is harmless.
+                    let _ = tx.send(());
+                }
+                Err(e) => tracing::warn!(error = %e, "skill watcher event error"),
             }
-            // Debounce: ignore events arriving within the window of the last reload.
-            let now = Instant::now();
-            if now.duration_since(last) < DEBOUNCE {
-                return;
-            }
-            last = now;
-            reload(&reload_root, &reload_target);
         })
         .map_err(|e| notify_io(&root, e))?;
 
@@ -60,9 +76,9 @@ impl SkillWatcher {
     }
 }
 
-/// Re-scan `root` and swap the shared registry's contents. Exposed for
-/// deterministic testing (the notify callback calls the same path).
-pub fn reload(root: &Path, target: &SharedRegistry) {
+/// Re-scan `root` and swap the shared registry's contents. The notify path and
+/// the tests share this so a test reload exercises the same code.
+fn reload(root: &Path, target: &SharedRegistry) {
     let (next, errors) = SkillRegistry::load_dir(root);
     for e in &errors {
         tracing::warn!(error = %e, "skill reload");
@@ -119,10 +135,11 @@ mod tests {
         assert!(errs.is_empty());
         assert_eq!(shared.read().unwrap().len(), 1);
 
-        // Smoke: add a skill and give the watcher a chance to fire. Tolerant of
-        // platform event latency — fall back to an explicit reload so CI is stable.
+        // Smoke: add a skill and give the watcher (plus the debounce window) a
+        // chance to fire. Tolerant of platform event latency — fall back to an
+        // explicit reload so CI is stable.
         write_skill(&root, "b", "beta");
-        for _ in 0..20 {
+        for _ in 0..40 {
             if shared.read().unwrap().len() == 2 {
                 break;
             }

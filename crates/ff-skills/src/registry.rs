@@ -106,6 +106,11 @@ pub fn first_executable(dir: &Path) -> Option<String> {
             continue;
         }
         let name = entry.file_name().to_string_lossy().to_string();
+        // SKILL.md is the manifest, not a payload — an exec bit on it (some
+        // checkouts/fileshares) must not flag the whole skill.
+        if name == "SKILL.md" {
+            continue;
+        }
         if is_executable(&path, &name) {
             return Some(name);
         }
@@ -188,6 +193,22 @@ mod tests {
         assert!(reg.get("danger").is_none());
         assert_eq!(errs.len(), 1);
         assert!(matches!(errs[0], SkillError::ExecutablePresent { .. }));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn executable_bit_on_skill_md_is_not_flagged() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempdir().unwrap();
+        write_skill(tmp.path(), "ok", "ok");
+        let md = tmp.path().join("ok").join("SKILL.md");
+        let mut perms = fs::metadata(&md).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&md, perms).unwrap();
+
+        let (reg, errs) = SkillRegistry::load_dir(tmp.path());
+        assert!(errs.is_empty());
+        assert!(reg.get("ok").is_some());
     }
 
     #[test]
