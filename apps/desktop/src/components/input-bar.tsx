@@ -38,6 +38,7 @@ export function InputBar() {
       <div className="mx-auto flex max-w-3xl items-end gap-1.5 rounded-xl border bg-card p-1.5 shadow-sm transition-all focus-within:border-ring focus-within:shadow-md focus-within:ring-2 focus-within:ring-ring/25">
         <textarea
           ref={textareaRef}
+          data-composer
           value={value}
           rows={1}
           placeholder="Message FlowForge…"

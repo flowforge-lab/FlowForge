@@ -243,7 +243,7 @@ export function SessionSidebar() {
 
       <Separator />
       <div className="px-3 py-2 text-[11px] text-muted-foreground/60">
-        ⌘N new · ⌘1–9 jump · Esc stop · pencil to rename
+        ⌘K palette · ⌘N new · ⌘1–9 jump · Esc stop
       </div>
     </aside>
   );
