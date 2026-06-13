@@ -82,6 +82,17 @@ struct StreamFunction {
     arguments: String,
 }
 
+#[derive(Deserialize)]
+struct ModelList {
+    #[serde(default)]
+    data: Vec<ModelEntry>,
+}
+
+#[derive(Deserialize)]
+struct ModelEntry {
+    id: String,
+}
+
 /// Parse one raw SSE line into an optional chunk.
 ///
 /// Returns `None` for lines that carry no payload (blank lines, comments, non-`data:`
@@ -176,6 +187,25 @@ impl Provider for OpenAiProvider {
         });
 
         Ok(stream.flatten().boxed())
+    }
+
+    /// `GET {base_url}/models` -> `{ "data": [ { "id": ... } ] }`.
+    async fn list_models(&self) -> Result<Vec<String>, LlmError> {
+        let mut builder = self.client.get(format!("{}/models", self.base_url));
+        if let Some(key) = &self.api_key {
+            builder = builder.bearer_auth(key);
+        }
+        let resp = builder
+            .send()
+            .await
+            .map_err(|e| LlmError::Transport(e.to_string()))?
+            .error_for_status()
+            .map_err(|e| LlmError::Transport(e.to_string()))?;
+        let list: ModelList = resp
+            .json()
+            .await
+            .map_err(|e| LlmError::Decode(e.to_string()))?;
+        Ok(list.data.into_iter().map(|m| m.id).collect())
     }
 }
 

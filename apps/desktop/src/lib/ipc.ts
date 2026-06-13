@@ -6,6 +6,8 @@
 
 import type {
   Message,
+  ProviderConfig,
+  ProviderKind,
   Session,
   TokenEvent,
   TurnDoneEvent,
@@ -28,6 +30,18 @@ export interface FfIpc {
   cancelTurn(sessionId: string): Promise<void>;
   /** Frontend's reply to a [`ToolApprovalRequestEvent`]. */
   respondApproval(callId: string, approved: boolean): Promise<void>;
+
+  // Provider settings (Issue #8). Phase 1: local candle-vllm + Ollama, no secrets.
+  /** Current persisted LLM provider settings. */
+  getProviderConfig(): Promise<ProviderConfig>;
+  /** Persist provider settings; resolves with the stored config (e.g. `hasKey`). */
+  setProviderConfig(
+    kind: ProviderKind,
+    baseUrl: string | undefined,
+    model: string,
+  ): Promise<ProviderConfig>;
+  /** Best-effort model ids for the configured endpoint; `[]` when unreachable. */
+  listModels(): Promise<string[]>;
 
   // Events (backend -> frontend)
   onToken(cb: (e: TokenEvent) => void): Promise<Unlisten>;
@@ -90,6 +104,19 @@ class TauriIpc implements FfIpc {
     this.invoke<void>("cancel_turn", { sessionId });
   respondApproval = (callId: string, approved: boolean) =>
     this.invoke<void>("respond_approval", { callId, approved });
+
+  getProviderConfig = () => this.invoke<ProviderConfig>("get_provider_config");
+  setProviderConfig = (
+    kind: ProviderKind,
+    baseUrl: string | undefined,
+    model: string,
+  ) =>
+    this.invoke<ProviderConfig>("set_provider_config", {
+      kind,
+      baseUrl,
+      model,
+    });
+  listModels = () => this.invoke<string[]>("list_models");
 
   onToken = (cb: (e: TokenEvent) => void) =>
     this.listen<TokenEvent>("turn:token", cb);

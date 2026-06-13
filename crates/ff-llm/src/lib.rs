@@ -98,4 +98,12 @@ pub type ChunkStream = BoxStream<'static, Result<Chunk, LlmError>>;
 #[async_trait]
 pub trait Provider: Send + Sync {
     async fn chat_stream(&self, req: ChatRequest) -> Result<ChunkStream, LlmError>;
+
+    /// Best-effort list of model ids the server currently has loaded. Used by the
+    /// provider settings panel to populate the model picker; callers treat any
+    /// error (server down, endpoint unsupported) as "no suggestions". Providers
+    /// without a discovery endpoint keep the default (no suggestions).
+    async fn list_models(&self) -> Result<Vec<String>, LlmError> {
+        Ok(Vec::new())
+    }
 }

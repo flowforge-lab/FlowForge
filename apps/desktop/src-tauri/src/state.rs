@@ -1,12 +1,14 @@
 use std::collections::HashMap;
+use std::fs;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
 
 use ff_agent::CancelToken;
+use ff_core::{ProviderConfig, ProviderKind};
 use ff_llm::{OllamaProvider, OpenAiProvider, Provider};
 use ff_memory::MemoryStore;
 use ff_skills::{SharedRegistry, SkillRegistry, SkillWatcher};
 use ff_tools::ToolRegistry;
-use std::path::PathBuf;
 use tokio::sync::oneshot;
 
 /// One outstanding tool-approval prompt. The shell awaits `tx.send(approved)` (sent
@@ -16,42 +18,51 @@ struct PendingApproval {
     tx: oneshot::Sender<bool>,
 }
 
-/// Default local model served by candle-vllm. Swappable once provider settings
-/// land (M3+). Matches the `id` candle-vllm reports at `/v1/models`.
-const DEFAULT_MODEL: &str = "Qwen3-4B-Instruct-2507";
-
-/// Selects which LLM backend `AppState` talks to. M1 hard-defaults to
-/// [`ProviderKind::CandleVllm`]; the enum exists so M3 settings can switch at runtime.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum ProviderKind {
-    /// Local candle-vllm, OpenAI-compatible SSE on `:8000/v1`.
-    #[default]
-    CandleVllm,
-    /// Local Ollama, native NDJSON `/api/chat` on `:11434`.
-    #[allow(dead_code)] // constructed by M3 provider settings
-    OllamaNative,
-    /// Hosted OpenAI API (reads `OPENAI_API_KEY`).
-    #[allow(dead_code)] // constructed by M3 provider settings
-    OpenAi,
+/// Builds a fresh [`Provider`] from a [`ProviderConfig`]. Called once per turn so a
+/// runtime provider switch takes effect on the next message — there is no shared,
+/// mutable provider to swap, only the persisted config.
+fn build_provider(config: &ProviderConfig) -> Box<dyn Provider> {
+    let base_url = config.resolved_base_url().to_string();
+    match config.kind {
+        ProviderKind::CandleVllm => Box::new(OpenAiProvider::new(base_url, None)),
+        ProviderKind::Ollama => Box::new(OllamaProvider::new(base_url)),
+    }
 }
 
-impl ProviderKind {
-    fn build(self) -> Box<dyn Provider> {
-        match self {
-            ProviderKind::CandleVllm => Box::new(OpenAiProvider::candle_vllm()),
-            ProviderKind::OllamaNative => Box::new(OllamaProvider::default()),
-            ProviderKind::OpenAi => {
-                let key = std::env::var("OPENAI_API_KEY").unwrap_or_default();
-                Box::new(OpenAiProvider::openai(key))
-            }
-        }
+/// `~/.config/flowforge/provider.json` (platform config dir). `None` only when the
+/// OS exposes no config dir, in which case settings stay in-memory for the session.
+fn config_path() -> Option<PathBuf> {
+    dirs::config_dir().map(|d| d.join("flowforge").join("provider.json"))
+}
+
+/// Loads persisted provider settings, falling back to the default (local
+/// candle-vllm) when the file is missing or unparseable.
+fn load_config() -> ProviderConfig {
+    config_path()
+        .and_then(|p| fs::read_to_string(p).ok())
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+/// Persists provider settings. Best-effort: a write failure leaves the in-memory
+/// config authoritative for this session rather than failing the command.
+fn save_config(config: &ProviderConfig) {
+    let Some(path) = config_path() else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    if let Ok(json) = serde_json::to_string_pretty(config) {
+        let _ = fs::write(path, json);
     }
 }
 
 pub struct AppState {
     pub store: MemoryStore,
-    pub provider: Box<dyn Provider>,
-    pub model: String,
+    /// Persisted, non-secret LLM provider settings. Swapped wholesale by
+    /// `set_provider_config`; snapshotted (never held across an await) per turn.
+    config: Mutex<ProviderConfig>,
     pub tools: ToolRegistry,
     /// Per-session workspace roots are an M3 concern (folder picker). For M2 every
     /// session shares one default root; the field is threaded so the picker is
@@ -72,15 +83,14 @@ pub struct AppState {
 
 impl AppState {
     pub fn new() -> Self {
-        Self::with_provider(ProviderKind::default())
+        Self::with_config(load_config())
     }
 
-    pub fn with_provider(kind: ProviderKind) -> Self {
+    pub fn with_config(config: ProviderConfig) -> Self {
         let (watcher, skills) = load_skills();
         Self {
             store: MemoryStore::new(),
-            provider: kind.build(),
-            model: DEFAULT_MODEL.to_string(),
+            config: Mutex::new(config),
             tools: ToolRegistry::with_defaults(),
             workspace_root: default_workspace_root(),
             skills,
@@ -88,6 +98,24 @@ impl AppState {
             cancels: Mutex::new(HashMap::new()),
             pending: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Current provider settings (clone — callers never hold the lock).
+    pub fn provider_config(&self) -> ProviderConfig {
+        self.config.lock().unwrap().clone()
+    }
+
+    /// Replace and persist provider settings. Takes effect on the next turn.
+    pub fn set_provider_config(&self, config: ProviderConfig) {
+        save_config(&config);
+        *self.config.lock().unwrap() = config;
+    }
+
+    /// Build a provider + model snapshot from the current config for one turn.
+    pub fn build_provider(&self) -> (Box<dyn Provider>, String) {
+        let config = self.provider_config();
+        let provider = build_provider(&config);
+        (provider, config.model)
     }
 
     pub fn register_cancel(&self, session_id: &str, token: CancelToken) {
