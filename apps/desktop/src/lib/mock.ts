@@ -197,6 +197,24 @@ export class MockIpc implements FfIpc {
     };
     this.activeTimers.set(sessionId, turn);
 
+    // A couple of auto-resolving read steps before the approval-gated write, so
+    // a turn is genuinely multi-step and exercises the StepGroup fold (#17): the
+    // "N steps" header, live count while streaming, and collapse on turn:done.
+    this.emitAutoStep(
+      sessionId,
+      assistant.id,
+      "view",
+      { path: "README.md" },
+      "(mocked) read 42 lines from README.md",
+    );
+    this.emitAutoStep(
+      sessionId,
+      assistant.id,
+      "grep",
+      { pattern: "FlowForge", path: "." },
+      "(mocked) 7 matches across 3 files",
+    );
+
     // Simulate one write tool call that requires approval, exercising the
     // tool:call -> tool:approval-request -> respondApproval -> tool:result path
     // under VITE_FF_MOCK=1.
@@ -234,6 +252,32 @@ export class MockIpc implements FfIpc {
         });
         this.streamWords(sessionId, turn);
       },
+    });
+  }
+
+  // Emit a read-only tool step that resolves immediately (no approval gate).
+  // Used to pad a turn to multiple steps so the StepGroup fold is exercised.
+  private emitAutoStep(
+    sessionId: string,
+    messageId: string,
+    tool: string,
+    args: unknown,
+    result: string,
+  ): void {
+    const callId = uidShort();
+    this.emit(this.toolCallListeners, {
+      sessionId,
+      messageId,
+      callId,
+      tool,
+      args,
+    });
+    this.emit(this.toolResultListeners, {
+      sessionId,
+      messageId,
+      callId,
+      success: true,
+      result,
     });
   }
 
