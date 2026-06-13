@@ -17,6 +17,9 @@ use ff_memory::MemoryStore;
 use ff_tools::{Safety, ToolRegistry};
 use futures_util::StreamExt;
 
+mod system_prompt;
+pub use system_prompt::{build_system_prompt, UserContext};
+
 /// Events the agent emits during a turn. The host (Tauri shell or a test) decides
 /// how to surface them — over IPC, to a channel, or into assertions.
 #[derive(Debug, Clone)]
@@ -147,12 +150,16 @@ struct CallBuf {
 /// requests until it produces a plain text answer (or the iteration cap is hit).
 /// `on_event` is called synchronously as the turn progresses. The final assistant
 /// message is persisted and returned.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_turn(
     provider: &dyn Provider,
     store: &MemoryStore,
     tools: &ToolContext<'_>,
     session_id: &str,
     model: &str,
+    // Optional system prompt prepended to every request this turn (skills + persona
+    // + ambient context). Built by the host via `build_system_prompt`.
+    system_prompt: Option<&str>,
     cancel: CancelToken,
     mut on_event: impl FnMut(AgentEvent),
 ) -> Result<Message, AgentError> {
@@ -165,9 +172,22 @@ pub async fn run_turn(
         }
 
         let history = store.get_messages(session_id);
+        let mut messages = Vec::new();
+        if let Some(system) = system_prompt {
+            // Transient: the system prompt is injected into the request only, never
+            // persisted to the store, so message history stays user/assistant/tool.
+            messages.push(ChatMessage {
+                role: "system".to_string(),
+                content: Some(system.to_string()),
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+            });
+        }
+        messages.extend(to_chat(&history));
         let req = ChatRequest {
             model: model.to_string(),
-            messages: to_chat(&history),
+            messages,
             tools: tool_schemas.clone(),
         };
 
@@ -470,6 +490,7 @@ mod tests {
             &ctx(&registry, &root, &approve),
             &s.id,
             "mock",
+            None,
             CancelToken::new(),
             |ev| match ev {
                 AgentEvent::Token { delta, .. } => tokens.push_str(&delta),
@@ -507,6 +528,7 @@ mod tests {
             &ctx(&registry, dir.path(), &approve),
             &s.id,
             "mock",
+            None,
             CancelToken::new(),
             |ev| match ev {
                 AgentEvent::ToolCallStarted { name, .. } => {
@@ -587,6 +609,7 @@ mod tests {
             &ctx(&registry, dir.path(), &approve),
             &s.id,
             "mock",
+            None,
             cancel,
             |_| {},
         )
@@ -674,6 +697,7 @@ mod tests {
             &ctx(&registry, dir.path(), &deny),
             &s.id,
             "mock",
+            None,
             CancelToken::new(),
             |ev| {
                 if let AgentEvent::ToolCallFinished {
@@ -717,6 +741,7 @@ mod tests {
             &ctx(&registry, dir.path(), &approve),
             &s.id,
             "mock",
+            None,
             CancelToken::new(),
             |ev| {
                 if let AgentEvent::ToolCallFinished { success, .. } = ev {
@@ -728,5 +753,84 @@ mod tests {
         .unwrap();
 
         assert!(finished_ok, "tool should run after async approval resolves");
+    }
+
+    /// Captures the `ChatRequest` it receives so a test can assert what reached the
+    /// provider (the system prompt is transient — never stored in history).
+    struct RecordingProvider {
+        seen: Arc<std::sync::Mutex<Vec<ChatMessage>>>,
+    }
+
+    #[async_trait]
+    impl Provider for RecordingProvider {
+        async fn chat_stream(&self, req: ChatRequest) -> Result<ChunkStream, LlmError> {
+            *self.seen.lock().unwrap() = req.messages;
+            Ok(futures_util::stream::iter(vec![Ok(Chunk {
+                delta: "ok".into(),
+                done: true,
+                ..Chunk::default()
+            })])
+            .boxed())
+        }
+    }
+
+    #[tokio::test]
+    async fn system_prompt_is_injected_into_request_not_history() {
+        use ff_skills::SkillRegistry;
+
+        let dir = tempfile::tempdir().unwrap();
+        let skill_dir = dir.path().join("rust-debug");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: rust-debug\ndescription: Systematic Rust debugging\nversion: 0.1.0\n---\nBisect with bash.\n",
+        )
+        .unwrap();
+        let (skills, errs) = SkillRegistry::load_dir(dir.path());
+        assert!(errs.is_empty());
+
+        let user = UserContext {
+            local_datetime: "2026-06-13 09:00".into(),
+            timezone: "America/Chicago".into(),
+        };
+        let system = build_system_prompt(None, &skills, &[], &user);
+
+        let store = MemoryStore::new();
+        let s = store.create_session(None);
+        store.add_message(&s.id, Role::User, "hi".into());
+        let registry = ToolRegistry::new();
+        let root = std::env::current_dir().unwrap();
+        let approve = AlwaysApprove;
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = RecordingProvider { seen: seen.clone() };
+
+        run_turn(
+            &provider,
+            &store,
+            &ctx(&registry, &root, &approve),
+            &s.id,
+            "mock",
+            Some(&system),
+            CancelToken::new(),
+            |_| {},
+        )
+        .await
+        .unwrap();
+
+        let msgs = seen.lock().unwrap();
+        assert_eq!(msgs[0].role, "system");
+        let sys = msgs[0].content.as_deref().unwrap();
+        assert!(
+            sys.contains("- rust-debug: Systematic Rust debugging"),
+            "{sys}"
+        );
+        assert!(sys.contains("Current date and time: 2026-06-13 09:00 (America/Chicago)."));
+        assert_eq!(msgs[1].role, "user");
+
+        // The system prompt must not be persisted: history is just [user, assistant].
+        let history = store.get_messages(&s.id);
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].role, Role::User);
+        assert_eq!(history[1].role, Role::Assistant);
     }
 }

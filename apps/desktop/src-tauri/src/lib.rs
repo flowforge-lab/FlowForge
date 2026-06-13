@@ -134,12 +134,20 @@ fn send_message(
             approve: &approver,
             max_iterations: 8,
         };
+        // Skills + ambient context for this turn (RFC 0001 §4, RFC 0002 phase 1).
+        // Phenotype selection (persona + active skill bodies) lands in M3.4; for now
+        // we inject installed-skill descriptions and the current local time only.
+        let skills = state.skills_snapshot();
+        let user_ctx = ff_agent::UserContext::now();
+        let system_prompt = ff_agent::build_system_prompt(None, &skills, &[], &user_ctx);
+
         let result = run_turn(
             state.provider.as_ref(),
             &state.store,
             &tool_ctx,
             &sid,
             &model,
+            Some(system_prompt.as_str()),
             cancel,
             |event| match event {
                 AgentEvent::Token { message_id, delta } => {

@@ -1,9 +1,10 @@
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, RwLock};
 
 use ff_agent::CancelToken;
 use ff_llm::{OllamaProvider, OpenAiProvider, Provider};
 use ff_memory::MemoryStore;
+use ff_skills::{SharedRegistry, SkillRegistry, SkillWatcher};
 use ff_tools::ToolRegistry;
 use std::path::PathBuf;
 use tokio::sync::oneshot;
@@ -56,6 +57,13 @@ pub struct AppState {
     /// session shares one default root; the field is threaded so the picker is
     /// purely additive later.
     pub workspace_root: PathBuf,
+    /// Installed skills, kept current by `_skill_watcher`. Snapshotted per turn
+    /// (`skills_snapshot`) so a mid-turn reload never races (RFC 0001 §9).
+    skills: SharedRegistry,
+    /// Owns the filesystem watcher; dropping it stops hot-reload. `Mutex` keeps
+    /// `AppState` `Sync` (the `notify` watcher is `Send` but not `Sync`). `Option`
+    /// covers the fallback when the watcher cannot start.
+    _skill_watcher: Mutex<Option<SkillWatcher>>,
     cancels: Mutex<HashMap<String, CancelToken>>,
     /// call_id -> pending UI approval. Removed when the user responds, or dropped
     /// (denying the call) when the turn is cancelled.
@@ -68,12 +76,15 @@ impl AppState {
     }
 
     pub fn with_provider(kind: ProviderKind) -> Self {
+        let (watcher, skills) = load_skills();
         Self {
             store: MemoryStore::new(),
             provider: kind.build(),
             model: DEFAULT_MODEL.to_string(),
             tools: ToolRegistry::with_defaults(),
             workspace_root: default_workspace_root(),
+            skills,
+            _skill_watcher: Mutex::new(watcher),
             cancels: Mutex::new(HashMap::new()),
             pending: Mutex::new(HashMap::new()),
         }
@@ -88,6 +99,11 @@ impl AppState {
 
     pub fn take_cancel(&self, session_id: &str) -> Option<CancelToken> {
         self.cancels.lock().unwrap().remove(session_id)
+    }
+
+    /// A cheap clone of the current skill set, taken at turn start.
+    pub fn skills_snapshot(&self) -> SkillRegistry {
+        self.skills.read().unwrap().clone()
     }
 }
 
@@ -127,6 +143,33 @@ impl AppState {
 
 /// The default workspace root for M2: the user's home directory, falling back to the
 /// process CWD. Replaced by a per-session, user-chosen folder in M3.
+/// `~/.flowforge/skills`, the directory the skill watcher loads and watches.
+fn skills_root() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".flowforge")
+        .join("skills")
+}
+
+/// Start the skill watcher, falling back to a one-shot load (no hot-reload) if the
+/// OS watcher cannot start (e.g. the skills dir does not exist yet).
+fn load_skills() -> (Option<SkillWatcher>, SharedRegistry) {
+    let root = skills_root();
+    match SkillWatcher::spawn(root.clone()) {
+        Ok((watcher, shared, errors)) => {
+            for e in &errors {
+                tracing::warn!(error = %e, "skill load");
+            }
+            (Some(watcher), shared)
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "skill watcher unavailable; loading once");
+            let (reg, _) = SkillRegistry::load_dir(&root);
+            (None, Arc::new(RwLock::new(reg)))
+        }
+    }
+}
+
 fn default_workspace_root() -> PathBuf {
     dirs::home_dir()
         .or_else(|| std::env::current_dir().ok())

@@ -18,6 +18,8 @@ ts-rs = "10"
 async-trait = "0.1"
 futures-util = "0.3"
 uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+iana-time-zone = "0.1"
 
 ff-core = { path = "crates/ff-core" }
 ff-agent = { path = "crates/ff-agent" }
