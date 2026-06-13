@@ -13,4 +13,4 @@ mod watch;
 pub use error::SkillError;
 pub use parse::parse_skill;
 pub use registry::{first_executable, SkillRegistry};
-pub use watch::{reload, SharedRegistry, SkillWatcher};
+pub use watch::{SharedRegistry, SkillWatcher};
