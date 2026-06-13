@@ -8,17 +8,10 @@ import {
   X,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { formatArgs } from "@/lib/tool-args";
 import { Button } from "@/components/ui/button";
 import type { ToolStep } from "@/store/chat";
 import { useSplitStore } from "@/store/split";
-
-function formatArgs(args: unknown): string {
-  try {
-    return JSON.stringify(args, null, 2);
-  } catch {
-    return String(args);
-  }
-}
 
 function StatusIcon({ status }: { status: ToolStep["status"] }) {
   if (status === "running") {
