@@ -1,4 +1,4 @@
-//! Skill and profile domain types (RFC 0001).
+//! Skill and phenotype domain types (RFC 0001).
 //!
 //! A [`Skill`] is Markdown instructions plus declared tool/MCP references, loaded
 //! from `~/.flowforge/skills/<name>/SKILL.md` at runtime. A [`Phenotype`] selects the
@@ -65,7 +65,7 @@ pub struct Phenotype {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub model: Option<String>,
-    /// Extra system-prompt preamble for this profile.
+    /// Extra system-prompt preamble for this phenotype.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub persona: Option<String>,
