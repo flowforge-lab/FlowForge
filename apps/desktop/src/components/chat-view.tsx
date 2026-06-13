@@ -3,6 +3,7 @@ import { cn } from "@/lib/utils";
 import { useChatStore } from "@/store/chat";
 import type { ToolStep } from "@/store/chat";
 import { ToolStepBlock } from "@/components/tool-step";
+import { StepGroup } from "@/components/step-group";
 import { Markdown } from "@/components/markdown";
 import type { Message } from "@/bindings";
 
@@ -45,13 +46,18 @@ function MessageRow({
     <div className="flex flex-col items-start gap-1.5">
       {toolSteps.length > 0 && (
         <div className="flex w-full max-w-[80%] flex-col gap-1.5">
-          {toolSteps.map((step) => (
-            <ToolStepBlock
-              key={step.callId}
-              step={step}
+          {/* A single step renders bare (unchanged) — grouping exists to tame a
+              multi-step flood, and one step isn't a flood. 2+ steps fold into a
+              collapsible "N steps" group. */}
+          {toolSteps.length === 1 ? (
+            <ToolStepBlock step={toolSteps[0]} onRespond={onRespond} />
+          ) : (
+            <StepGroup
+              steps={toolSteps}
+              streaming={streaming}
               onRespond={onRespond}
             />
-          ))}
+          )}
         </div>
       )}
       {message.content && (

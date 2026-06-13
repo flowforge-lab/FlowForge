@@ -26,6 +26,12 @@ export interface ToolStep {
   /** Set when status is "awaiting-approval" — `"write"` or `"dangerous"`. */
   safety?: string;
   result?: string;
+  /** Wall-clock epoch ms when the tool:call arrived. Frontend-set — the backend
+   *  contract carries no timing (Issue #17); used only to derive a turn's total
+   *  duration for the StepGroup header. */
+  startedAt?: number;
+  /** Wall-clock epoch ms when the tool:result arrived. */
+  finishedAt?: number;
 }
 
 // ── Title helpers ────────────────────────────────────────────────────────────
@@ -395,6 +401,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
         tool: e.tool,
         args: e.args,
         status: "running",
+        startedAt: Date.now(),
       };
       // A tool call can precede any streamed token (the backend emits no token
       // for empty deltas), so applyToken may never create the anchoring assistant
@@ -435,13 +442,14 @@ export const useChatStore = create<ChatState>((set, get) => ({
       const steps = s.toolStepsByMessage[e.messageId] ?? [];
       const status: ToolStep["status"] = e.success ? "done" : "error";
       const known = steps.some((step) => step.callId === e.callId);
+      const now = Date.now();
       // A result should always follow its call, but if it ever arrives first
       // (or after the call was lost) materialize a step so the outcome is never
       // silently dropped — the tool name/args just aren't known here.
       const nextSteps = known
         ? steps.map((step) =>
             step.callId === e.callId
-              ? { ...step, status, result: e.result }
+              ? { ...step, status, result: e.result, finishedAt: now }
               : step,
           )
         : [
@@ -452,6 +460,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
               args: undefined,
               status,
               result: e.result,
+              startedAt: now,
+              finishedAt: now,
             },
           ];
       return {
