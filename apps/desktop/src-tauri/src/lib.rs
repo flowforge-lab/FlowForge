@@ -10,7 +10,7 @@ use ff_core::events::{
     IntentionSignal, TokenEvent, ToolApprovalRequestEvent, ToolCallEvent, ToolResultEvent,
     TurnDoneEvent, TurnErrorEvent,
 };
-use ff_core::{Message, Role, Session};
+use ff_core::{Message, ProviderConfig, ProviderKind, Role, Session};
 use ff_tools::Safety;
 use state::AppState;
 use std::sync::Arc;
@@ -120,7 +120,9 @@ fn send_message(
     state.register_cancel(&session_id, cancel.clone());
 
     let state = state.inner().clone();
-    let model = state.model.clone();
+    // Snapshot the provider from the current config for this turn; a settings
+    // change between turns is picked up on the next `send_message`.
+    let (provider, model) = state.build_provider();
     tauri::async_runtime::spawn(async move {
         let sid = session_id.clone();
         let approver = UiApprover {
@@ -142,7 +144,7 @@ fn send_message(
         let system_prompt = ff_agent::build_system_prompt(None, &skills, &[], &user_ctx);
 
         let result = run_turn(
-            state.provider.as_ref(),
+            provider.as_ref(),
             &state.store,
             &tool_ctx,
             &sid,
@@ -231,6 +233,43 @@ fn send_message(
     Ok(user_msg.id)
 }
 
+/// Current LLM provider settings for the settings panel.
+#[tauri::command]
+fn get_provider_config(state: State<'_, Arc<AppState>>) -> ProviderConfig {
+    state.provider_config()
+}
+
+/// Persist new provider settings. Returns the stored config so the UI can confirm
+/// the applied state (e.g. `has_key`, which the frontend never sets itself).
+#[tauri::command]
+fn set_provider_config(
+    state: State<'_, Arc<AppState>>,
+    kind: ProviderKind,
+    base_url: Option<String>,
+    model: String,
+) -> ProviderConfig {
+    let current = state.provider_config();
+    let config = ProviderConfig {
+        kind,
+        // Treat an empty string from the UI the same as "use the default endpoint".
+        base_url: base_url.filter(|u| !u.trim().is_empty()),
+        model,
+        // Secrets are a later phase; preserve whatever the backend already knows.
+        has_key: current.has_key,
+    };
+    state.set_provider_config(config.clone());
+    config
+}
+
+/// Best-effort model list for the configured provider's endpoint. Returns an empty
+/// list (never an error) when the server is unreachable so the picker degrades to
+/// free-text entry.
+#[tauri::command]
+async fn list_models(state: State<'_, Arc<AppState>>) -> CmdResult<Vec<String>> {
+    let (provider, _model) = state.build_provider();
+    Ok(provider.list_models().await.unwrap_or_default())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -243,6 +282,9 @@ pub fn run() {
             send_message,
             cancel_turn,
             respond_approval,
+            get_provider_config,
+            set_provider_config,
+            list_models,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

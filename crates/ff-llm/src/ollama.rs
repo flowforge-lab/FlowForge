@@ -39,6 +39,17 @@ struct OllamaMessage {
     content: String,
 }
 
+#[derive(Deserialize)]
+struct TagList {
+    #[serde(default)]
+    models: Vec<TagEntry>,
+}
+
+#[derive(Deserialize)]
+struct TagEntry {
+    name: String,
+}
+
 #[async_trait]
 impl Provider for OllamaProvider {
     async fn chat_stream(&self, req: ChatRequest) -> Result<ChunkStream, LlmError> {
@@ -88,5 +99,22 @@ impl Provider for OllamaProvider {
         });
 
         Ok(stream.flatten().boxed())
+    }
+
+    /// `GET {base_url}/api/tags` -> `{ "models": [ { "name": ... } ] }`.
+    async fn list_models(&self) -> Result<Vec<String>, LlmError> {
+        let resp = self
+            .client
+            .get(format!("{}/api/tags", self.base_url))
+            .send()
+            .await
+            .map_err(|e| LlmError::Transport(e.to_string()))?
+            .error_for_status()
+            .map_err(|e| LlmError::Transport(e.to_string()))?;
+        let list: TagList = resp
+            .json()
+            .await
+            .map_err(|e| LlmError::Decode(e.to_string()))?;
+        Ok(list.models.into_iter().map(|m| m.name).collect())
     }
 }

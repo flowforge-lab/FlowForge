@@ -5,6 +5,8 @@ export type { Role } from "./Role";
 export type { Session } from "./Session";
 export type { Phenotype } from "./Phenotype";
 export type { SkillManifest } from "./SkillManifest";
+export type { ProviderConfig } from "./ProviderConfig";
+export type { ProviderKind } from "./ProviderKind";
 export type { SessionStatus } from "./SessionStatus";
 export type { TokenEvent } from "./TokenEvent";
 export type { ToolApprovalRequestEvent } from "./ToolApprovalRequestEvent";

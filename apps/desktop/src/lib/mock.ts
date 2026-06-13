@@ -6,6 +6,8 @@
 
 import type {
   Message,
+  ProviderConfig,
+  ProviderKind,
   Session,
   TokenEvent,
   TurnDoneEvent,
@@ -66,6 +68,14 @@ export class MockIpc implements FfIpc {
   private messages = new Map<string, Message[]>();
   // One active timer per session so cancelTurn can stop it.
   private activeTimers = new Map<string, ActiveTurn>();
+
+  // Provider settings (Issue #8). Defaults mirror the backend's out-of-the-box
+  // local candle-vllm config; persistence is in-memory for the mock session.
+  private providerConfig: ProviderConfig = {
+    kind: "candleVllm",
+    model: "Qwen3-4B-Instruct-2507",
+    hasKey: false,
+  };
 
   private tokenListeners = new Set<Listener<TokenEvent>>();
   private doneListeners = new Set<Listener<TurnDoneEvent>>();
@@ -166,6 +176,33 @@ export class MockIpc implements FfIpc {
     if (!pending) return;
     this.pendingApprovals.delete(callId);
     pending.resume(approved);
+  }
+
+  async getProviderConfig(): Promise<ProviderConfig> {
+    return { ...this.providerConfig };
+  }
+
+  async setProviderConfig(
+    kind: ProviderKind,
+    baseUrl: string | undefined,
+    model: string,
+  ): Promise<ProviderConfig> {
+    const trimmed = baseUrl?.trim();
+    this.providerConfig = {
+      kind,
+      baseUrl: trimmed ? trimmed : undefined,
+      model,
+      // Secrets are a later phase; the mock never has a key.
+      hasKey: false,
+    };
+    return { ...this.providerConfig };
+  }
+
+  async listModels(): Promise<string[]> {
+    // Canned per-provider suggestions so the picker is exercisable offline.
+    return this.providerConfig.kind === "ollama"
+      ? ["llama3.2", "qwen2.5", "mistral"]
+      : ["Qwen3-4B-Instruct-2507", "Qwen3-8B-Instruct"];
   }
 
   // --- internals ---
