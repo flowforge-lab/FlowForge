@@ -1,11 +1,17 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef } from "react";
 import { ArrowUp, Square } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { useChatStore } from "@/store/chat";
+import { useComposerStore } from "@/store/composer";
 
 export function InputBar() {
-  const [value, setValue] = useState("");
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+
+  // Composer text lives in a shared store so "edit & resend" (Issue #18) can
+  // prefill it from a message row without prop-drilling.
+  const value = useComposerStore((s) => s.text);
+  const setText = useComposerStore((s) => s.setText);
+  const focusNonce = useComposerStore((s) => s.focusNonce);
 
   const activeSessionId = useChatStore((s) => s.activeSessionId);
   const streaming = useChatStore((s) =>
@@ -16,21 +22,33 @@ export function InputBar() {
   const send = useChatStore((s) => s.send);
   const cancelActiveTurn = useChatStore((s) => s.cancelActiveTurn);
 
+  const autoGrow = useCallback((el: HTMLTextAreaElement) => {
+    el.style.height = "auto";
+    el.style.height = `${Math.min(el.scrollHeight, 160)}px`;
+  }, []);
+
   // Keyboard-native: focus follows the active session.
   useEffect(() => {
     textareaRef.current?.focus();
   }, [activeSessionId]);
 
+  // Edit & resend prefills the text and bumps focusNonce; focus, grow, and drop
+  // the caret at the end here — all DOM, no state set in the effect.
+  useEffect(() => {
+    const el = textareaRef.current;
+    if (!el) return;
+    el.focus();
+    autoGrow(el);
+    el.setSelectionRange(el.value.length, el.value.length);
+  }, [focusNonce, autoGrow]);
+
   function submit() {
     const content = value.trim();
     if (!content || streaming || !activeSessionId) return;
-    setValue("");
+    setText("");
+    // Collapse the box back to one line (it may have grown for a resend draft).
+    if (textareaRef.current) textareaRef.current.style.height = "auto";
     void send(content);
-  }
-
-  function autoGrow(el: HTMLTextAreaElement) {
-    el.style.height = "auto";
-    el.style.height = `${Math.min(el.scrollHeight, 160)}px`;
   }
 
   return (
@@ -44,7 +62,7 @@ export function InputBar() {
           placeholder="Message FlowForge…"
           className="max-h-40 min-h-8 flex-1 resize-none bg-transparent px-2 py-1.5 text-[13px] leading-relaxed placeholder:text-muted-foreground/50 focus-visible:outline-none"
           onChange={(e) => {
-            setValue(e.currentTarget.value);
+            setText(e.currentTarget.value);
             autoGrow(e.currentTarget);
           }}
           onKeyDown={(e) => {
