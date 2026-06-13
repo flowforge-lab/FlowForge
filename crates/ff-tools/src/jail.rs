@@ -50,6 +50,72 @@ pub fn resolve_in_root(root: &Path, candidate: &str) -> Result<PathBuf, String> 
     }
 }
 
+/// Like [`resolve_in_root`] but for paths whose intermediate directories may not
+/// exist yet (e.g. creating `src/main.rs` in a fresh workspace). Containment is
+/// anchored on the *deepest existing ancestor*, which is canonicalized so a
+/// symlinked ancestor cannot escape `root`; the trailing not-yet-created segments
+/// must be plain names (no `.` / `..`).
+pub fn resolve_for_create(root: &Path, candidate: &str) -> Result<PathBuf, String> {
+    use std::path::Component;
+
+    let root = root
+        .canonicalize()
+        .map_err(|e| format!("workspace root {} is unreadable: {e}", root.display()))?;
+
+    let joined = {
+        let c = Path::new(candidate);
+        if c.is_absolute() {
+            c.to_path_buf()
+        } else {
+            root.join(c)
+        }
+    };
+
+    // Find the deepest existing ancestor and canonicalize it, then re-attach the
+    // trailing components that do not exist yet.
+    let mut existing = joined.as_path();
+    let mut trailing: Vec<&std::ffi::OsStr> = Vec::new();
+    let anchor = loop {
+        match existing.canonicalize() {
+            Ok(p) => break p,
+            Err(_) => {
+                // A missing component without a plain file name (a `..`/`.`
+                // segment) is a traversal attempt, not a real path to create.
+                let name = existing.file_name().ok_or_else(|| {
+                    format!("access denied: {candidate} contains a non-literal path segment")
+                })?;
+                trailing.push(name);
+                existing = existing
+                    .parent()
+                    .ok_or_else(|| format!("invalid path: {candidate}"))?;
+            }
+        }
+    };
+
+    let mut resolved = anchor;
+    for name in trailing.into_iter().rev() {
+        // The not-yet-created tail must be ordinary names; `.`/`..` here could
+        // walk back out of the anchored, already-validated prefix.
+        match Path::new(name).components().next() {
+            Some(Component::Normal(_)) => resolved.push(name),
+            _ => {
+                return Err(format!(
+                    "access denied: {candidate} contains a non-literal path segment"
+                ))
+            }
+        }
+    }
+
+    if resolved.starts_with(&root) {
+        Ok(resolved)
+    } else {
+        Err(format!(
+            "access denied: {candidate} resolves outside the workspace root {}",
+            root.display()
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -82,5 +148,34 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let err = resolve_in_root(dir.path(), "/etc/hosts").unwrap_err();
         assert!(err.contains("access denied"), "{err}");
+    }
+
+    #[test]
+    fn create_allows_nested_missing_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let got = resolve_for_create(dir.path(), "a/b/c.txt").unwrap();
+        assert!(got.ends_with("a/b/c.txt"));
+        assert!(got.starts_with(dir.path().canonicalize().unwrap()));
+    }
+
+    #[test]
+    fn create_rejects_parent_traversal_in_missing_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = resolve_for_create(dir.path(), "a/../../escape.txt").unwrap_err();
+        assert!(err.contains("access denied"), "{err}");
+    }
+
+    #[test]
+    fn create_rejects_symlinked_ancestor_escape() {
+        let outside = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        // `root/link` -> outside; creating `root/link/x.txt` must be rejected.
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(outside.path(), root.path().join("link")).unwrap();
+        #[cfg(unix)]
+        {
+            let err = resolve_for_create(root.path(), "link/x.txt").unwrap_err();
+            assert!(err.contains("access denied"), "{err}");
+        }
     }
 }

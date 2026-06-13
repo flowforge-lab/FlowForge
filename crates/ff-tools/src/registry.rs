@@ -77,6 +77,7 @@ impl ToolRegistry {
         r.register(Box::new(crate::bash::BashTool));
         r.register(Box::new(crate::view::ViewTool));
         r.register(Box::new(crate::edit::EditTool));
+        r.register(Box::new(crate::write::WriteTool));
         r
     }
 
@@ -144,7 +145,7 @@ mod tests {
     fn advertises_default_schemas() {
         let reg = ToolRegistry::with_defaults();
         let tools = reg.openai_tools();
-        assert_eq!(tools.len(), 3);
+        assert_eq!(tools.len(), 4);
         let names: Vec<_> = tools
             .iter()
             .map(|t| t["function"]["name"].as_str().unwrap())
@@ -152,6 +153,7 @@ mod tests {
         assert!(names.contains(&"bash"));
         assert!(names.contains(&"view"));
         assert!(names.contains(&"edit"));
+        assert!(names.contains(&"write"));
     }
 
     #[test]
