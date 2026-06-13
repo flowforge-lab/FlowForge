@@ -1,14 +1,14 @@
-# 0001 — Skills, Profiles & Skill Evolution
+# 0001 — Skills, Phenotypes & Skill Evolution
 
 - **Status:** Proposed
 - **Milestone:** M3
 - **Author:** tonytan4ever
 - **Supersedes:** —
-- **Tracking issue:** _M3: Skills, Profiles & Skill Evolution_
+- **Tracking issue:** _M3: Skills, Phenotypes & Skill Evolution_
 
 ## 1. Summary & Goals
 
-M3 gives FlowForge a runtime **Skill** system, **Profiles** that bind a working
+M3 gives FlowForge a runtime **Skill** system, **Phenotypes** that bind a working
 set of skills together, and a first-class **Skill Evolution** capability. The
 guiding goal is that **discovering, installing, and improving skills is
 effortless** — the friction Aki-style ecosystems usually push onto the user is
@@ -24,6 +24,15 @@ Three high-level capabilities anchor the milestone (the original proposal):
    count, success rate), generate a streamlined, cheaper, better version of it,
    reviewed and approved by the user before it replaces the original.
 
+### A note on terminology
+
+The container for a working set is a **Phenotype** (user-facing short form:
+`pheno`). The name is deliberate: installed skills are the latent "genes"; a
+Phenotype is the *expressed* set of skills + model + persona active in a given
+context. **Skill Evolution** (§8) is then exactly what the metaphor implies —
+improving the genes from how they express in practice. We avoid "Profile"
+(overloaded / Aki-flavored) and infra-flavored terms like "Loadout".
+
 Non-goals for M3 are listed in §11.
 
 ## 2. The Four-Layer Model
@@ -36,9 +45,9 @@ main design risk, so the boundary is stated up front and enforced.
 | **Tool** | A compiled Rust callable the model invokes | `ff-tools` | compile-time |
 | **MCP server** | An external process exposing tools | `ff-mcp` | runtime spawn (M4) |
 | **Skill** | Markdown instructions + declared tool/MCP references + read-only resources | `ff-skills` | runtime load / hot-reload |
-| **Profile** | The active set of `{skills, tools, model, persona}` for a session | `ff-core` + config | per-session switch |
+| **Phenotype** | The active set of `{skills, tools, model, persona}` for a session | `ff-core` + config | per-session switch |
 
-A Skill never *contains* a Tool; it *references* tools by name. A Profile never
+A Skill never *contains* a Tool; it *references* tools by name. A Phenotype never
 *contains* a Skill body; it *selects* skills by name.
 
 ## 3. Skill Data Model & `SKILL.md` Schema
@@ -68,7 +77,7 @@ When the user reports a Rust failure:
 - **`description`** is short and is *always* injected into the system prompt
   (cheap — roughly one line per installed skill).
 - The **body** (everything after the frontmatter) is injected only when the
-  skill is **active** in the current profile.
+  skill is **active** in the current phenotype.
 - `resources/*.md` are optional reference files the body may point at; they are
   read-only and never executed.
 
@@ -91,7 +100,7 @@ pub struct Skill {
     pub path: PathBuf,
 }
 
-pub struct Profile {
+pub struct Phenotype {
     pub name: String,
     pub skills: Vec<String>,     // active skill names
     pub model: Option<String>,   // overrides DEFAULT_MODEL
@@ -117,7 +126,7 @@ Today `ff-skills` is a stub. M3 makes it real:
 `run_turn` currently sends `to_chat(&history)` with no system message. M3 adds a
 single, well-tested insertion point that prepends a system message built from:
 
-1. the active profile's `persona` (if any),
+1. the active phenotype's `persona` (if any),
 2. the `description` of every installed skill (always),
 3. the full `body` of every **active** skill.
 
@@ -135,7 +144,7 @@ problem of installing the first skill.
   Approve/Deny UX as a dangerous tool call) → on approval, move into
   `~/.flowforge/skills/`.
 - `uninstall_skill(name)` removes the directory and updates any referencing
-  profiles.
+  phenotypes.
 
 ## 6. Discovery — `search_skills` + ⌘K backend
 
@@ -148,13 +157,15 @@ delivers the **backend** so that FE wires onto a stable contract:
   stable DTOs.
 - Events documented in the M3.3 PR so the palette can bind without churn.
 
-## 7. Profiles
+## 7. Phenotypes
 
-- Stored as `~/.flowforge/profiles/<name>.toml`.
-- A profile selects active skills, an optional model override, and an optional
+- Stored as `~/.flowforge/phenotypes/<name>.toml`.
+- A phenotype selects active skills, an optional model override, and an optional
   persona preamble.
-- A `switch_profile(name)` command changes the active set and persists it across
-  restarts. A default profile ships with the built-in tools and no skills.
+- A `switch_phenotype(name)` command changes the active set and persists it across
+  restarts. A default phenotype ships with the built-in tools and no skills.
+- User-facing surfaces (palette, CLI) use the short form **`pheno`** (e.g.
+  `pheno switch rust`) to keep the spelling friction low.
 
 ## 8. Skill Evolution
 
@@ -214,7 +225,7 @@ Installing skills means ingesting third-party content, so:
 2. **Git install** — shallow clone to temp, validate + reject executables before
    moving into place, then approval gate.
 3. **System-prompt bloat** — inject descriptions always, bodies only for active
-   skills; cap active-skill count per profile.
+   skills; cap active-skill count per phenotype.
 4. **Palette coordination** — M3.3 exposes stable DTOs + events, documented so
    Abid's ⌘K FE binds without churn.
 
@@ -226,12 +237,12 @@ green before merge. One squashed commit per PR (CONTRIBUTING).
 
 | PR | Scope | Acceptance |
 |----|-------|-----------|
-| **M3.0** | `ff-core` `SkillManifest` / `Skill` / `Profile` + bindings | types compile, bindings export, serde round-trip tests |
+| **M3.0** | `ff-core` `SkillManifest` / `Skill` / `Phenotype` + bindings | types compile, bindings export, serde round-trip tests |
 | **M3.1** | `ff-skills` parser + dir loader + `SkillRegistry` + `notify` hot-reload | parses valid/invalid manifests, rejects executables, hot-reload test |
 | **M3.1b** | skill-description injection into `ff-agent` system prompt | system msg carries active descriptions; existing turn tests stay green |
 | **M3.2** | `install_skill(source)` (git/path/MD) + validation + M2 approval gate + `uninstall_skill` | install from path + git; approval event fires; bad bundle rejected |
 | **M3.3** | `search_skills` tool + `list/activate/deactivate_skill` commands + events (Abid wires ⌘K FE) | search ranks by keyword/description; commands return DTOs |
-| **M3.4** | Profiles: config model, `~/.flowforge/profiles/*.toml`, switch + persist | switch changes active skills; persists across restart |
+| **M3.4** | Phenotypes: config model, `~/.flowforge/phenotypes/*.toml`, switch + persist | switch changes active skills; persists across restart |
 | **M3.5** | Skill Evolution: `ff-signals` telemetry + aggregates + manual optimize (propose → diff → approve → version + rollback) | signals recorded per skill; optimize proposes a rewrite gated by approval |
 
 ## 11. Open Questions & Non-Goals
@@ -243,6 +254,6 @@ green before merge. One squashed commit per PR (CONTRIBUTING).
 - **MCP** enforcement — `mcp:` is parsed and declared in M3, enforced in M4.
 
 **Open questions:**
-- Cap on active skills per profile (proposed: soft cap + warning).
+- Cap on active skills per phenotype (proposed: soft cap + warning).
 - Whether evolution telemetry persists in `ff-memory`'s store or a dedicated
   signals store.
