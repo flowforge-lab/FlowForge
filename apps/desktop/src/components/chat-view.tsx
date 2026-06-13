@@ -5,6 +5,7 @@ import type { ToolStep } from "@/store/chat";
 import { ToolStepBlock } from "@/components/tool-step";
 import { StepGroup } from "@/components/step-group";
 import { Markdown } from "@/components/markdown";
+import { MessageActions } from "@/components/message-actions";
 import type { Message } from "@/bindings";
 
 function MessageRow({
@@ -21,11 +22,14 @@ function MessageRow({
   if (message.role === "user") {
     return (
       <div className="flex justify-end">
-        <div
-          data-selectable
-          className="max-w-[80%] whitespace-pre-wrap rounded-2xl rounded-br-md bg-primary px-3.5 py-2 text-[13px] leading-relaxed text-primary-foreground shadow-sm"
-        >
-          {message.content}
+        <div className="group relative max-w-[80%]">
+          <div
+            data-selectable
+            className="whitespace-pre-wrap rounded-2xl rounded-br-md bg-primary px-3.5 py-2 text-[13px] leading-relaxed text-primary-foreground shadow-sm"
+          >
+            {message.content}
+          </div>
+          <MessageActions message={message} side="left" />
         </div>
       </div>
     );
@@ -61,14 +65,17 @@ function MessageRow({
         </div>
       )}
       {message.content && (
-        <div
-          data-selectable
-          className={cn(
-            "max-w-[80%] px-0.5 py-1 text-[13px] leading-relaxed text-foreground",
-            streaming && "ff-streaming-caret",
-          )}
-        >
-          <Markdown content={message.content} />
+        <div className="group relative max-w-[80%]">
+          <div
+            data-selectable
+            className={cn(
+              "px-0.5 py-1 text-[13px] leading-relaxed text-foreground",
+              streaming && "ff-streaming-caret",
+            )}
+          >
+            <Markdown content={message.content} />
+          </div>
+          <MessageActions message={message} side="right" />
         </div>
       )}
     </div>
