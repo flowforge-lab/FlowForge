@@ -3,18 +3,20 @@
 //! calls into a crate, and returns. Streaming responses go out as Tauri events.
 
 mod state;
+mod tools;
 
 use async_trait::async_trait;
 use ff_agent::{run_turn, AgentEvent, Approver, CancelToken, ToolContext};
 use ff_core::events::{
-    IntentionSignal, TokenEvent, ToolApprovalRequestEvent, ToolCallEvent, ToolResultEvent,
-    TurnDoneEvent, TurnErrorEvent,
+    IntentionSignal, SkillInstallApprovalRequestEvent, TokenEvent, ToolApprovalRequestEvent,
+    ToolCallEvent, ToolResultEvent, TurnDoneEvent, TurnErrorEvent,
 };
-use ff_core::{Message, ProviderConfig, ProviderKind, Role, Session};
+use ff_core::{Message, ProviderConfig, ProviderKind, Role, Session, SkillManifest};
 use ff_tools::Safety;
 use state::AppState;
 use std::sync::Arc;
 use tauri::{Emitter, State};
+use uuid::Uuid;
 
 /// Routes write/dangerous tool calls through a UI confirmation. Read-only calls
 /// never reach this approver — the agent loop short-circuits them.
@@ -288,6 +290,60 @@ async fn warmup(state: State<'_, Arc<AppState>>) -> CmdResult<()> {
     Ok(())
 }
 
+/// Install a skill from a path / git URL / raw-Markdown URL. The bundle is fetched
+/// and validated first (a bad bundle returns an error and never prompts), then the
+/// user approves the real declared manifest via the shared approval gate, and only
+/// on approval is it moved into `~/.flowforge/skills/`. Returns the installed
+/// manifest. Errors (validation, denial, IO) come back as `Err(String)`.
+#[tauri::command]
+async fn install_skill(
+    state: State<'_, Arc<AppState>>,
+    app: tauri::AppHandle,
+    source: String,
+) -> CmdResult<SkillManifest> {
+    // Fetch + validate off the async runtime; a bad bundle fails here, pre-approval.
+    let prep_source = source.clone();
+    let staged = tokio::task::spawn_blocking(move || ff_skills::prepare_install(&prep_source))
+        .await
+        .map_err(|e| format!("install task failed: {e}"))?
+        .map_err(|e| e.to_string())?;
+
+    let manifest = staged.manifest().clone();
+    let request_id = Uuid::new_v4().to_string();
+
+    // Present the validated manifest for approval, reusing the dangerous-tool gate.
+    let rx = state.register_approval(&request_id, "");
+    let _ = app.emit(
+        "skill:install-approval-request",
+        SkillInstallApprovalRequestEvent {
+            request_id: request_id.clone(),
+            source,
+            manifest: manifest.clone(),
+            warnings: Vec::new(),
+        },
+    );
+    if !rx.await.unwrap_or(false) {
+        return Err("install was not approved".to_string());
+    }
+
+    let skills_root = state.skills_root();
+    tokio::task::spawn_blocking(move || ff_skills::commit_install(staged, &skills_root))
+        .await
+        .map_err(|e| format!("install task failed: {e}"))?
+        .map_err(|e| e.to_string())?;
+
+    state.reload_skills();
+    Ok(manifest)
+}
+
+/// Uninstall a skill by manifest name. Local and reversible, so it is not gated.
+#[tauri::command]
+fn uninstall_skill(state: State<'_, Arc<AppState>>, name: String) -> CmdResult<()> {
+    ff_skills::uninstall(&name, &state.skills_root()).map_err(|e| e.to_string())?;
+    state.reload_skills();
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -305,6 +361,8 @@ pub fn run() {
             set_provider_config,
             list_models,
             warmup,
+            install_skill,
+            uninstall_skill,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

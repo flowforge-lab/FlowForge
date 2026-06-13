@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 
 use ff_agent::CancelToken;
@@ -88,16 +88,38 @@ impl AppState {
 
     pub fn with_config(config: ProviderConfig) -> Self {
         let (watcher, skills) = load_skills();
+        // The installer tools are agent-callable, so they own the skills root and a
+        // handle to the shared registry to refresh it on a successful install.
+        let mut tools = ToolRegistry::with_defaults();
+        tools.register(Box::new(crate::tools::InstallSkillTool::new(
+            skills_root(),
+            skills.clone(),
+        )));
+        tools.register(Box::new(crate::tools::UninstallSkillTool::new(
+            skills_root(),
+            skills.clone(),
+        )));
         Self {
             store: MemoryStore::new(),
             config: Mutex::new(config),
-            tools: ToolRegistry::with_defaults(),
+            tools,
             workspace_root: default_workspace_root(),
             skills,
             _skill_watcher: Mutex::new(watcher),
             cancels: Mutex::new(HashMap::new()),
             pending: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// The directory installed skills live in.
+    pub fn skills_root(&self) -> PathBuf {
+        skills_root()
+    }
+
+    /// Re-scan the skills directory into the shared registry. Called after an
+    /// install/uninstall so the change is visible without waiting on the watcher.
+    pub fn reload_skills(&self) {
+        reload_registry(&skills_root(), &self.skills);
     }
 
     /// Current provider settings (clone — callers never hold the lock).
@@ -202,6 +224,19 @@ fn default_workspace_root() -> PathBuf {
     dirs::home_dir()
         .or_else(|| std::env::current_dir().ok())
         .unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// Re-scan root and swap the shared registry's contents. Shared by the installer
+/// tools and the install/uninstall commands so a change is visible immediately,
+/// independent of the filesystem watcher.
+pub fn reload_registry(root: &Path, registry: &SharedRegistry) {
+    let (next, errors) = SkillRegistry::load_dir(root);
+    for e in &errors {
+        tracing::warn!(error = %e, "skill reload after install");
+    }
+    if let Ok(mut guard) = registry.write() {
+        *guard = next;
+    }
 }
 
 #[cfg(test)]
