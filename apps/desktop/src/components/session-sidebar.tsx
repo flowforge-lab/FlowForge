@@ -1,23 +1,13 @@
 import { useRef, useState } from "react";
-import { Moon, Pencil, Plus, Sun } from "lucide-react";
+import { Moon, Pencil, Plus, Search, Sun, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Separator } from "@/components/ui/separator";
 import { cn } from "@/lib/utils";
 import { useTheme } from "@/lib/theme";
 import { useChatStore } from "@/store/chat";
+import { filterSessions, resolveLabel } from "@/lib/sessions";
 import type { Session } from "@/bindings";
-
-// ── Per-session label ────────────────────────────────────────────────────────
-
-function resolveLabel(
-  session: Session,
-  customTitle: string | undefined,
-): string {
-  if (customTitle) return customTitle;
-  if (session.goal) return session.goal;
-  return "New session";
-}
 
 // ── Inline-rename session item ───────────────────────────────────────────────
 
@@ -144,9 +134,19 @@ export function SessionSidebar() {
   const sessions = useChatStore((s) => s.sessions);
   const activeSessionId = useChatStore((s) => s.activeSessionId);
   const streamingBySession = useChatStore((s) => s.streamingBySession);
+  const sessionTitles = useChatStore((s) => s.sessionTitles);
   const newSession = useChatStore((s) => s.newSession);
   const theme = useTheme((s) => s.theme);
   const toggleTheme = useTheme((s) => s.toggleTheme);
+
+  const [filter, setFilter] = useState("");
+  const filterRef = useRef<HTMLInputElement>(null);
+
+  const filtered = filterSessions(sessions, filter, sessionTitles);
+  // Each session's index in the *full* list — keeps the ⌘1–9 hint accurate when
+  // the visible list is filtered (the global shortcut indexes the full list).
+  const indexById = new Map(sessions.map((s, i) => [s.id, i]));
+  const filtering = filter.trim().length > 0;
 
   return (
     <aside className="flex h-full w-60 shrink-0 flex-col border-r bg-sidebar text-sidebar-foreground">
@@ -184,17 +184,60 @@ export function SessionSidebar() {
 
       <Separator />
 
+      {/* Filter box — narrows the list by resolved label, keyboard-first (#19). */}
+      <div className="px-2 py-2">
+        <div className="flex items-center gap-1.5 rounded-md border bg-background/40 px-2 transition-colors focus-within:border-ring focus-within:ring-2 focus-within:ring-ring/25">
+          <Search className="size-3.5 shrink-0 text-muted-foreground/60" />
+          <input
+            ref={filterRef}
+            value={filter}
+            onChange={(e) => setFilter(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Escape") {
+                e.preventDefault();
+                e.stopPropagation(); // don't also cancel the active turn
+                setFilter("");
+                filterRef.current?.blur();
+              }
+            }}
+            placeholder="Filter sessions…"
+            aria-label="Filter sessions"
+            spellCheck={false}
+            className="h-7 min-w-0 flex-1 bg-transparent text-[13px] text-foreground outline-none placeholder:text-muted-foreground/50"
+          />
+          {filtering && (
+            <button
+              type="button"
+              title="Clear filter (Esc)"
+              onClick={() => {
+                setFilter("");
+                filterRef.current?.focus();
+              }}
+              className="flex size-4 shrink-0 items-center justify-center rounded text-muted-foreground/60 hover:text-foreground"
+            >
+              <X className="size-3" />
+            </button>
+          )}
+        </div>
+      </div>
+
       <ScrollArea className="flex-1">
         <nav className="flex flex-col gap-px p-1.5">
-          {sessions.map((session, i) => (
-            <SessionItem
-              key={session.id}
-              session={session}
-              index={i}
-              active={session.id === activeSessionId}
-              streaming={Boolean(streamingBySession[session.id])}
-            />
-          ))}
+          {filtered.length === 0
+            ? filtering && (
+                <p className="px-2 py-6 text-center text-[12px] text-muted-foreground/60">
+                  No sessions match “{filter.trim()}”
+                </p>
+              )
+            : filtered.map((session) => (
+                <SessionItem
+                  key={session.id}
+                  session={session}
+                  index={indexById.get(session.id) ?? 0}
+                  active={session.id === activeSessionId}
+                  streaming={Boolean(streamingBySession[session.id])}
+                />
+              ))}
         </nav>
       </ScrollArea>
 
