@@ -1,3 +1,16 @@
-//! Skill discovery, manifest parsing, hot-reload (M3)
+//! Skill discovery, manifest parsing, and filesystem hot-reload (M3).
 //!
-//! Placeholder crate — implemented in a later milestone.
+//! Loads skills from `~/.flowforge/skills/<name>/SKILL.md` into a [`SkillRegistry`]
+//! and keeps it current via a [`SkillWatcher`]. Depends only on `ff-core` — tool
+//! resolution against the `ToolRegistry` happens at the agent/installer boundary,
+//! not here.
+
+mod error;
+mod parse;
+mod registry;
+mod watch;
+
+pub use error::SkillError;
+pub use parse::parse_skill;
+pub use registry::{first_executable, SkillRegistry};
+pub use watch::{reload, SharedRegistry, SkillWatcher};

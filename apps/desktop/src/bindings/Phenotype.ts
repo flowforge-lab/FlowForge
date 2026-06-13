@@ -18,6 +18,6 @@ skills: Array<string>,
  */
 model?: string, 
 /**
- * Extra system-prompt preamble for this profile.
+ * Extra system-prompt preamble for this phenotype.
  */
 persona?: string, };
