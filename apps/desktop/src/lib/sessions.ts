@@ -5,13 +5,16 @@
 import type { Session } from "@/bindings";
 
 /**
- * The label a user sees for a session: custom title > goal > fallback.
- * `customTitle` is the frontend-only rename from `sessionTitles`.
+ * The label a user sees for a session: persisted title > legacy localStorage
+ * title > goal > fallback. `session.title` is server-truth (auto-derived or
+ * renamed); `customTitle` is the legacy `sessionTitles` map, kept as a
+ * read-through fallback until every client has migrated (see store `bootstrap`).
  */
 export function resolveLabel(
   session: Session,
   customTitle: string | undefined,
 ): string {
+  if (session.title) return session.title;
   if (customTitle) return customTitle;
   if (session.goal) return session.goal;
   return "New session";

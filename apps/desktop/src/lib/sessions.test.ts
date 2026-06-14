@@ -5,6 +5,8 @@ import type { Session } from "@/bindings";
 function session(partial: Partial<Session> & { id: string }): Session {
   return {
     goal: null,
+    title: null,
+    summary: null,
     status: "active",
     createdAt: 0,
     updatedAt: 0,
@@ -13,6 +15,21 @@ function session(partial: Partial<Session> & { id: string }): Session {
 }
 
 describe("resolveLabel", () => {
+  it("prefers the persisted server title over everything", () => {
+    expect(
+      resolveLabel(
+        session({ id: "1", title: "Server title", goal: "the goal" }),
+        "Legacy local",
+      ),
+    ).toBe("Server title");
+  });
+
+  it("falls back to the legacy localStorage title when the server has none", () => {
+    expect(resolveLabel(session({ id: "1", goal: "the goal" }), "Legacy")).toBe(
+      "Legacy",
+    );
+  });
+
   it("prefers a custom title over the goal", () => {
     expect(resolveLabel(session({ id: "1", goal: "the goal" }), "Custom")).toBe(
       "Custom",

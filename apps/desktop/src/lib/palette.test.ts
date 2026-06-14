@@ -5,6 +5,8 @@ import type { Session } from "@/bindings";
 function session(partial: Partial<Session> & { id: string }): Session {
   return {
     goal: null,
+    title: null,
+    summary: null,
     status: "active",
     createdAt: 0,
     updatedAt: 0,

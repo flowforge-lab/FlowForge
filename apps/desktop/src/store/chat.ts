@@ -4,6 +4,7 @@
 
 import { create } from "zustand";
 import { ipc } from "@/lib/ipc";
+import { autoTitle } from "@/lib/auto-title";
 import type {
   Message,
   Session,
@@ -46,99 +47,6 @@ function loadTitles(): Record<string, string> {
   } catch {
     return {};
   }
-}
-
-function persistTitles(titles: Record<string, string>): void {
-  localStorage.setItem(TITLE_STORAGE_KEY, JSON.stringify(titles));
-}
-
-// Words we always skip at the start of a prompt before extracting the title.
-// Includes pronouns, articles, modals, common question stems, and proxy verbs
-// that precede the actual subject ("understand how X" → skip to X).
-const STOP = new Set([
-  "a",
-  "an",
-  "the",
-  "is",
-  "are",
-  "was",
-  "were",
-  "i",
-  "you",
-  "we",
-  "they",
-  "it",
-  "he",
-  "she",
-  "my",
-  "your",
-  "our",
-  "their",
-  "in",
-  "on",
-  "at",
-  "to",
-  "for",
-  "of",
-  "and",
-  "or",
-  "but",
-  "how",
-  "what",
-  "when",
-  "where",
-  "why",
-  "who",
-  "do",
-  "does",
-  "did",
-  "can",
-  "could",
-  "would",
-  "should",
-  "will",
-  "please",
-  "help",
-  "me",
-  "us",
-  // proxy verbs that prefix the real topic
-  "understand",
-  "explain",
-  "tell",
-  "show",
-  "describe",
-  "clarify",
-  "give",
-]);
-
-/**
- * Derive a short, readable title from the user's first prompt.
- * All leading stop-words are skipped to land on the first meaningful word,
- * then word count scales with input length (2 → 5 words).
- */
-export function autoTitle(content: string): string {
-  const words = content.trim().split(/\s+/).filter(Boolean);
-  if (words.length === 0) return "New session";
-
-  // Advance past ALL leading stop-words, but always keep at least 1 word.
-  let start = 0;
-  while (
-    start < words.length - 1 &&
-    STOP.has(words[start].toLowerCase().replace(/[^a-z]/g, ""))
-  ) {
-    start++;
-  }
-  const meaningful = words.slice(start);
-
-  // Scale word count on input length.
-  const len = content.length;
-  const count = Math.min(
-    meaningful.length,
-    len <= 25 ? 2 : len <= 50 ? 3 : len <= 100 ? 4 : 5,
-  );
-
-  const title = meaningful.slice(0, count).join(" ");
-  return title.charAt(0).toUpperCase() + title.slice(1);
 }
 
 // ── Store types ──────────────────────────────────────────────────────────────
@@ -204,6 +112,24 @@ export const useChatStore = create<ChatState>((set, get) => ({
         sessions = await ipc.listSessions();
       }
       set({ sessions, bootstrapError: null });
+
+      // One-time migration: lift legacy localStorage titles to the backend for
+      // any session the server hasn't titled, so labels become server-truth.
+      const legacy = get().sessionTitles;
+      const toMigrate = sessions.filter((s) => !s.title && legacy[s.id]);
+      if (toMigrate.length > 0) {
+        await Promise.all(
+          toMigrate.map((s) =>
+            ipc.renameSession(s.id, legacy[s.id]).catch(() => {}),
+          ),
+        );
+        set((st) => ({
+          sessions: st.sessions.map((s) =>
+            !s.title && legacy[s.id] ? { ...s, title: legacy[s.id] } : s,
+          ),
+        }));
+      }
+
       const first = sessions[0];
       if (first) await get().selectSession(first.id);
     } catch (err) {
@@ -261,15 +187,20 @@ export const useChatStore = create<ChatState>((set, get) => ({
     const sessionId = get().activeSessionId;
     if (!sessionId || get().streamingBySession[sessionId]) return;
 
-    // Auto-title: generate from the first user message if no custom title set.
+    // Auto-title: the backend seeds the title from the first user message; mirror
+    // it optimistically here so the sidebar updates without waiting for a refetch.
     const priorMessages = get().messagesBySession[sessionId] ?? [];
     const hasUserMessage = priorMessages.some((m) => m.role === "user");
-    const hasCustomTitle = Boolean(get().sessionTitles[sessionId]);
-    if (!hasUserMessage && !hasCustomTitle) {
+    const existing = get().sessions.find((x) => x.id === sessionId);
+    const hasTitle =
+      Boolean(existing?.title) || Boolean(get().sessionTitles[sessionId]);
+    if (!hasUserMessage && !hasTitle) {
       const title = autoTitle(content);
-      const next = { ...get().sessionTitles, [sessionId]: title };
-      persistTitles(next);
-      set({ sessionTitles: next });
+      set((s) => ({
+        sessions: s.sessions.map((sess) =>
+          sess.id === sessionId ? { ...sess, title } : sess,
+        ),
+      }));
     }
 
     // Optimistic user message; reconciled with the real id from the backend.
@@ -317,11 +248,15 @@ export const useChatStore = create<ChatState>((set, get) => ({
   },
 
   setSessionTitle: (sessionId, title) => {
-    set((s) => {
-      const next = { ...s.sessionTitles, [sessionId]: title };
-      persistTitles(next);
-      return { sessionTitles: next };
+    // Server-truth now: persist via ipc, optimistically reflect on the session.
+    void ipc.renameSession(sessionId, title).catch((err) => {
+      console.error("[FlowForge] rename_session failed:", err);
     });
+    set((s) => ({
+      sessions: s.sessions.map((sess) =>
+        sess.id === sessionId ? { ...sess, title } : sess,
+      ),
+    }));
   },
 
   cancelActiveTurn: async () => {

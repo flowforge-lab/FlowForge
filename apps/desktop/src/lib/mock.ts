@@ -18,6 +18,7 @@ import type {
   ToolResultEvent,
 } from "../bindings";
 import type { FfIpc, Unlisten } from "./ipc";
+import { autoTitle } from "./auto-title";
 
 type Listener<T> = (e: T) => void;
 
@@ -98,6 +99,8 @@ export class MockIpc implements FfIpc {
     const session: Session = {
       id: uid(),
       goal: goal ?? null,
+      title: null,
+      summary: null,
       status: "active",
       createdAt: ts,
       updatedAt: ts,
@@ -114,6 +117,14 @@ export class MockIpc implements FfIpc {
     return [...this.sessions.values()].sort(
       (a, b) => b.updatedAt - a.updatedAt,
     );
+  }
+
+  async renameSession(sessionId: string, title: string): Promise<void> {
+    const s = this.sessions.get(sessionId);
+    if (s) {
+      s.title = title;
+      s.updatedAt = now();
+    }
   }
 
   async getMessages(sessionId: string): Promise<Message[]> {
@@ -219,9 +230,16 @@ export class MockIpc implements FfIpc {
       content,
       createdAt: now(),
     };
-    this.messages.get(sessionId)?.push(msg);
+    const list = this.messages.get(sessionId);
+    const isFirstUserMsg =
+      role === "user" && !(list ?? []).some((m) => m.role === "user");
+    list?.push(msg);
     const s = this.sessions.get(sessionId);
-    if (s) s.updatedAt = msg.createdAt;
+    if (s) {
+      s.updatedAt = msg.createdAt;
+      // Mirror the backend: first user message seeds an untitled session's title.
+      if (isFirstUserMsg && !s.title) s.title = autoTitle(content);
+    }
     return msg;
   }
 
