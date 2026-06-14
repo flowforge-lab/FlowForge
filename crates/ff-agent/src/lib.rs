@@ -790,7 +790,7 @@ mod tests {
         assert!(errs.is_empty());
 
         let user = UserContext {
-            local_datetime: "2026-06-13 09:00".into(),
+            local_date: "2026-06-13".into(),
             timezone: "America/Chicago".into(),
         };
         let system = build_system_prompt(None, &skills, &[], &user);
@@ -824,7 +824,7 @@ mod tests {
             sys.contains("- rust-debug: Systematic Rust debugging"),
             "{sys}"
         );
-        assert!(sys.contains("Current date and time: 2026-06-13 09:00 (America/Chicago)."));
+        assert!(sys.contains("Current date: 2026-06-13 (America/Chicago)."));
         assert_eq!(msgs[1].role, "user");
 
         // The system prompt must not be persisted: history is just [user, assistant].
