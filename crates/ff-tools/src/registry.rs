@@ -78,6 +78,9 @@ impl ToolRegistry {
         r.register(Box::new(crate::view::ViewTool));
         r.register(Box::new(crate::edit::EditTool));
         r.register(Box::new(crate::write::WriteTool));
+        r.register(Box::new(crate::grep::GrepTool));
+        r.register(Box::new(crate::glob::GlobTool));
+        r.register(Box::new(crate::todo::TodoTool));
         r
     }
 
@@ -145,15 +148,26 @@ mod tests {
     fn advertises_default_schemas() {
         let reg = ToolRegistry::with_defaults();
         let tools = reg.openai_tools();
-        assert_eq!(tools.len(), 4);
+        assert_eq!(tools.len(), 7);
         let names: Vec<_> = tools
             .iter()
             .map(|t| t["function"]["name"].as_str().unwrap())
             .collect();
-        assert!(names.contains(&"bash"));
-        assert!(names.contains(&"view"));
-        assert!(names.contains(&"edit"));
-        assert!(names.contains(&"write"));
+        for expected in ["bash", "view", "edit", "write", "grep", "glob", "todo"] {
+            assert!(names.contains(&expected), "missing tool: {expected}");
+        }
+    }
+
+    #[test]
+    fn search_and_plan_tools_are_read_only() {
+        let reg = ToolRegistry::with_defaults();
+        for name in ["grep", "glob", "todo"] {
+            assert_eq!(
+                reg.safety(name, &serde_json::json!({})),
+                Safety::ReadOnly,
+                "{name} should be read-only"
+            );
+        }
     }
 
     #[test]
