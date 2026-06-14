@@ -86,3 +86,18 @@ pub struct OutcomeSignal {
     pub session_id: String,
     pub status: SessionStatus,
 }
+
+/// Backend -> frontend request to approve installing a skill (M3.2). Emitted after
+/// the bundle is fetched and validated, so the user approves with the real declared
+/// `manifest` (name, version, tools/permissions) in hand. The frontend replies via
+/// the shared `respond_approval(request_id, approved)` command — the same gate used
+/// for dangerous tool calls. `warnings` carries non-fatal validation notes.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "../../../apps/desktop/src/bindings/")]
+pub struct SkillInstallApprovalRequestEvent {
+    pub request_id: String,
+    pub source: String,
+    pub manifest: crate::SkillManifest,
+    pub warnings: Vec<String>,
+}

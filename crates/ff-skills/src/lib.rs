@@ -6,11 +6,15 @@
 //! not here.
 
 mod error;
+mod install;
 mod parse;
 mod registry;
 mod watch;
 
 pub use error::SkillError;
+pub use install::{
+    commit_install, install, prepare_install, uninstall, InstallError, StagedInstall,
+};
 pub use parse::parse_skill;
-pub use registry::{first_executable, SkillRegistry};
+pub use registry::{first_executable, first_executable_recursive, SkillRegistry};
 pub use watch::{SharedRegistry, SkillWatcher};

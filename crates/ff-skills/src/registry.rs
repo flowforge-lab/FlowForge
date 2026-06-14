@@ -118,9 +118,54 @@ pub fn first_executable(dir: &Path) -> Option<String> {
     None
 }
 
+/// Recursively scan a fetched bundle for executables before install, skipping the
+/// .git metadata dir and the SKILL.md manifest. Returns the offending file's path
+/// relative to dir. The installer (M3.2) hard-rejects on a match.
+pub fn first_executable_recursive(dir: &Path) -> Option<String> {
+    fn walk(dir: &Path, base: &Path) -> Option<String> {
+        for entry in std::fs::read_dir(dir).ok()?.filter_map(Result::ok) {
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().to_string();
+            if path.is_dir() {
+                if name == ".git" {
+                    continue;
+                }
+                if let Some(found) = walk(&path, base) {
+                    return Some(found);
+                }
+            } else if path.is_file() && name != "SKILL.md" && is_executable(&path, &name) {
+                return Some(
+                    path.strip_prefix(base)
+                        .unwrap_or(&path)
+                        .to_string_lossy()
+                        .to_string(),
+                );
+            }
+        }
+        None
+    }
+    walk(dir, dir)
+}
+
 fn is_executable(path: &Path, name: &str) -> bool {
     if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-        if matches!(ext, "sh" | "py" | "rb" | "js" | "bash" | "exe" | "bin") {
+        if matches!(
+            ext,
+            "sh" | "bash"
+                | "py"
+                | "rb"
+                | "pl"
+                | "php"
+                | "js"
+                | "exe"
+                | "bin"
+                | "bat"
+                | "cmd"
+                | "com"
+                | "command"
+                | "ps1"
+                | "desktop"
+        ) {
             return true;
         }
     }
