@@ -124,7 +124,8 @@ export function ChatView() {
           What are you working on?
         </p>
         <p className="text-[13px] text-muted-foreground/70">
-          Enter to send · Shift+Enter for a new line · Esc to stop
+          Enter to send · Shift+Enter for a new line · Esc to stop ·{" "}
+          <kbd className="font-mono">?</kbd> for shortcuts
         </p>
       </div>
     );

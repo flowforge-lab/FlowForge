@@ -5,27 +5,64 @@ import { ChatView } from "@/components/chat-view";
 import { InputBar } from "@/components/input-bar";
 import { SplitPanel } from "@/components/split-panel";
 import { CommandPalette } from "@/components/palette";
+import { ShortcutsOverlay } from "@/components/shortcuts-overlay";
 import { useChatStore } from "@/store/chat";
 import { useSplitStore } from "@/store/split";
 import { usePaletteStore } from "@/store/palette";
+import { useShortcutsStore } from "@/store/shortcuts";
 
-// Global, keyboard-native shortcuts: ⌘/Ctrl+K command palette, ⌘/Ctrl+N new
-// session, ⌘/Ctrl+1..9 jump to session, Esc cancels the active turn.
+// True when focus is in a text-entry element, so a bare "?" types instead of
+// opening the shortcuts overlay.
+function isTextEntry(target: EventTarget | null): boolean {
+  const el = target as HTMLElement | null;
+  if (!el) return false;
+  return (
+    el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.isContentEditable
+  );
+}
+
+// Global, keyboard-native shortcuts: ⌘/Ctrl+K command palette, ? / ⌘/Ctrl+/
+// shortcuts help, ⌘/Ctrl+N new session, ⌘/Ctrl+1..9 jump to session, Esc
+// cancels the active turn.
 function useGlobalShortcuts() {
   useEffect(() => {
     function onKeyDown(e: KeyboardEvent) {
       const palette = usePaletteStore.getState();
+      const shortcuts = useShortcutsStore.getState();
       const mod = e.metaKey || e.ctrlKey;
 
-      // ⌘/Ctrl+K is home: toggle the palette from anywhere.
+      // ⌘/Ctrl+K is home: toggle the palette from anywhere. Close the help
+      // overlay first so the two never stack (both are z-50).
       if (mod && e.key.toLowerCase() === "k") {
         e.preventDefault();
+        shortcuts.closeShortcuts();
         palette.togglePalette();
         return;
       }
       // While the palette owns the keyboard, don't fire shell shortcuts behind
       // it — it handles its own arrows/Enter/Esc.
       if (palette.open) return;
+
+      // Shortcuts help: ⌘/Ctrl+/ anywhere, or "?" when not typing in a field.
+      if (mod && e.key === "/") {
+        e.preventDefault();
+        shortcuts.toggleShortcuts();
+        return;
+      }
+      if (!mod && e.key === "?" && !isTextEntry(e.target)) {
+        e.preventDefault();
+        shortcuts.openShortcuts();
+        return;
+      }
+      // While the help overlay is open it owns the keyboard; Esc closes it and
+      // shell shortcuts stand down behind it.
+      if (shortcuts.open) {
+        if (e.key === "Escape") {
+          e.preventDefault();
+          shortcuts.closeShortcuts();
+        }
+        return;
+      }
 
       const store = useChatStore.getState();
 
@@ -91,6 +128,7 @@ export function AppShell() {
         <SplitPanel />
       </main>
       <CommandPalette />
+      <ShortcutsOverlay />
     </div>
   );
 }
