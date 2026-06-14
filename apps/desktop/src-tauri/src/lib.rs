@@ -89,6 +89,13 @@ fn get_messages(state: State<'_, Arc<AppState>>, session_id: String) -> Vec<Mess
     state.store.get_messages(&session_id)
 }
 
+/// Set a session's display title (server-truth). Used by the sidebar rename and
+/// to lift legacy localStorage titles to the backend.
+#[tauri::command]
+fn rename_session(state: State<'_, Arc<AppState>>, session_id: String, title: String) {
+    state.store.set_title(&session_id, title);
+}
+
 #[tauri::command]
 fn cancel_turn(state: State<'_, Arc<AppState>>, session_id: String) {
     if let Some(token) = state.take_cancel(&session_id) {
@@ -279,6 +286,7 @@ pub fn run() {
             create_session,
             list_sessions,
             get_messages,
+            rename_session,
             send_message,
             cancel_turn,
             respond_approval,

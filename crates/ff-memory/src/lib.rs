@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use ff_core::{Message, Role, Session, SessionStatus, ToolCall};
+use ff_core::{auto_title, Message, Role, Session, SessionStatus, ToolCall};
 
 fn now_ms() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -41,6 +41,8 @@ impl MemoryStore {
         let session = Session {
             id: new_id(),
             goal,
+            title: None,
+            summary: None,
             status: SessionStatus::Active,
             created_at: ts,
             updated_at: ts,
@@ -96,15 +98,29 @@ impl MemoryStore {
     fn push_message(&self, msg: Message) -> Message {
         let session_id = msg.session_id.clone();
         let mut inner = self.inner.lock().unwrap();
-        inner
-            .messages
-            .entry(session_id.clone())
-            .or_default()
-            .push(msg.clone());
+        let msgs = inner.messages.entry(session_id.clone()).or_default();
+        // First user message in an untitled session seeds the auto-title, so a
+        // title exists without a manual rename (covers background sessions too).
+        let is_first_user_msg =
+            msg.role == Role::User && !msgs.iter().any(|m| m.role == Role::User);
+        msgs.push(msg.clone());
         if let Some(s) = inner.sessions.get_mut(&session_id) {
             s.updated_at = msg.created_at;
+            if is_first_user_msg && s.title.is_none() {
+                s.title = Some(auto_title(&msg.content));
+            }
         }
         msg
+    }
+
+    /// Set a session's display title (the `rename_session` ipc). A manual title
+    /// always wins over the auto-derived one. No-op for an unknown session.
+    pub fn set_title(&self, session_id: &str, title: String) {
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(s) = inner.sessions.get_mut(session_id) {
+            s.title = Some(title);
+            s.updated_at = now_ms();
+        }
     }
 
     pub fn set_message_content(
@@ -156,6 +172,53 @@ impl MemoryStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn first_user_message_auto_titles_untitled_session() {
+        let store = MemoryStore::new();
+        let s = store.create_session(None);
+        assert!(s.title.is_none());
+
+        store.add_message(&s.id, Role::User, "fix the parser bug".into());
+        let titled = store.list_sessions().into_iter().next().unwrap();
+        assert_eq!(titled.title.as_deref(), Some("Fix the"));
+    }
+
+    #[test]
+    fn second_user_message_does_not_retitle() {
+        let store = MemoryStore::new();
+        let s = store.create_session(None);
+        store.add_message(&s.id, Role::User, "fix the parser bug".into());
+        store.add_message(&s.id, Role::User, "now ship it".into());
+        let titled = store.list_sessions().into_iter().next().unwrap();
+        assert_eq!(titled.title.as_deref(), Some("Fix the"));
+    }
+
+    #[test]
+    fn assistant_first_message_does_not_title() {
+        let store = MemoryStore::new();
+        let s = store.create_session(None);
+        store.add_message(&s.id, Role::Assistant, "hi there".into());
+        let after = store.list_sessions().into_iter().next().unwrap();
+        assert!(after.title.is_none());
+    }
+
+    #[test]
+    fn set_title_overrides_and_persists() {
+        let store = MemoryStore::new();
+        let s = store.create_session(None);
+        store.add_message(&s.id, Role::User, "fix the parser bug".into());
+        store.set_title(&s.id, "Custom name".into());
+        let titled = store.list_sessions().into_iter().next().unwrap();
+        assert_eq!(titled.title.as_deref(), Some("Custom name"));
+    }
+
+    #[test]
+    fn set_title_unknown_session_is_noop() {
+        let store = MemoryStore::new();
+        store.set_title("nope", "x".into());
+        assert!(store.list_sessions().is_empty());
+    }
 
     #[test]
     fn session_and_message_roundtrip() {

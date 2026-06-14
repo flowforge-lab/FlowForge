@@ -5,7 +5,17 @@ export type Session = { id: string,
 /**
  * The stated intention for this session (Intention-Aware Sessions principle).
  */
-goal: string | null, status: SessionStatus, 
+goal: string | null, 
+/**
+ * Human-facing display label, server-truth. Auto-derived from the first user
+ * message (see [`auto_title`]) and overridable via the `rename_session` ipc.
+ */
+title: string | null, 
+/**
+ * Reserved for a future LLM-generated session summary. Unwired today; the
+ * field exists so adding summaries later is not another contract migration.
+ */
+summary: string | null, status: SessionStatus, 
 /**
  * Unix epoch milliseconds.
  */

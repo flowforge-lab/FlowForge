@@ -25,6 +25,8 @@ export interface FfIpc {
   createSession(goal?: string): Promise<Session>;
   listSessions(): Promise<Session[]>;
   getMessages(sessionId: string): Promise<Message[]>;
+  /** Sets a session's persisted display title (server-truth). */
+  renameSession(sessionId: string, title: string): Promise<void>;
   /** Persists the user message and starts the assistant turn. Returns the user message id. */
   sendMessage(sessionId: string, content: string): Promise<string>;
   cancelTurn(sessionId: string): Promise<void>;
@@ -98,6 +100,8 @@ class TauriIpc implements FfIpc {
   listSessions = () => this.invoke<Session[]>("list_sessions");
   getMessages = (sessionId: string) =>
     this.invoke<Message[]>("get_messages", { sessionId });
+  renameSession = (sessionId: string, title: string) =>
+    this.invoke<void>("rename_session", { sessionId, title });
   sendMessage = (sessionId: string, content: string) =>
     this.invoke<string>("send_message", { sessionId, content });
   cancelTurn = (sessionId: string) =>
