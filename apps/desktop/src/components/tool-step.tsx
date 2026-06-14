@@ -26,7 +26,7 @@ function StatusIcon({ status }: { status: ToolStep["status"] }) {
   return <Check className="size-3.5 text-emerald-500" />;
 }
 
-function SafetyBadge({ safety }: { safety: string }) {
+function SafetyBadge({ safety }: { safety: NonNullable<ToolStep["safety"]> }) {
   const dangerous = safety === "dangerous";
   return (
     <span

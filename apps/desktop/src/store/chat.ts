@@ -6,6 +6,7 @@ import { create } from "zustand";
 import { ipc } from "@/lib/ipc";
 import { autoTitle } from "@/lib/auto-title";
 import type {
+  ApprovalSafety,
   Message,
   Session,
   TokenEvent,
@@ -24,8 +25,8 @@ export interface ToolStep {
   tool: string;
   args: unknown;
   status: "running" | "awaiting-approval" | "done" | "error";
-  /** Set when status is "awaiting-approval" — `"write"` or `"dangerous"`. */
-  safety?: string;
+  /** Set when status is "awaiting-approval" — the call's trust level. */
+  safety?: ApprovalSafety;
   result?: string;
   /** Wall-clock epoch ms when the tool:call arrived. Frontend-set — the backend
    *  contract carries no timing (Issue #17); used only to derive a turn's total
@@ -81,6 +82,7 @@ interface ChatState {
   applyToolResult: (e: ToolResultEvent) => void;
   applyApprovalRequest: (e: ToolApprovalRequestEvent) => void;
   respondApproval: (
+    sessionId: string,
     messageId: string,
     callId: string,
     approved: boolean,
@@ -425,7 +427,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
     });
   },
 
-  respondApproval: async (messageId, callId, approved) => {
+  respondApproval: async (sessionId, messageId, callId, approved) => {
     const setStatus = (status: ToolStep["status"]) =>
       set((s) => {
         const steps = s.toolStepsByMessage[messageId];
@@ -446,7 +448,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
     // the step — so don't flash a spinner for a call that never runs.
     if (approved) setStatus("running");
     try {
-      await ipc.respondApproval(callId, approved);
+      await ipc.respondApproval(sessionId, callId, approved);
     } catch (err) {
       // IPC failed — the backend never received the response. Revert to the
       // approval gate so the user can retry. Only status changed, so the safety

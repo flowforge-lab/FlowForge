@@ -28,6 +28,17 @@ pub struct ToolCallEvent {
     pub args: serde_json::Value,
 }
 
+/// Trust level of a tool call that requires user approval. Read-only calls never
+/// reach approval, so this enum carries only the two gated levels — it is the typed
+/// contract for [`ToolApprovalRequestEvent::safety`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "../../../apps/desktop/src/bindings/")]
+pub enum ApprovalSafety {
+    Write,
+    Dangerous,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export, export_to = "../../../apps/desktop/src/bindings/")]
@@ -40,8 +51,8 @@ pub struct ToolApprovalRequestEvent {
     pub tool: String,
     #[ts(type = "unknown")]
     pub args: serde_json::Value,
-    /// `"write"` or `"dangerous"` — read-only calls never require approval.
-    pub safety: String,
+    /// Trust level — read-only calls never require approval.
+    pub safety: ApprovalSafety,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
@@ -90,8 +101,10 @@ pub struct OutcomeSignal {
 /// Backend -> frontend request to approve installing a skill (M3.2). Emitted after
 /// the bundle is fetched and validated, so the user approves with the real declared
 /// `manifest` (name, version, tools/permissions) in hand. The frontend replies via
-/// the shared `respond_approval(request_id, approved)` command — the same gate used
-/// for dangerous tool calls. `warnings` carries non-fatal validation notes.
+/// the shared `respond_approval(session_id, call_id, approved)` command — the same
+/// gate as dangerous tool calls. An install has no turn, so the backend keys it by
+/// `request_id`: reply with `request_id` for BOTH `session_id` and `call_id`.
+/// `warnings` carries non-fatal validation notes.
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export, export_to = "../../../apps/desktop/src/bindings/")]

@@ -5,7 +5,9 @@ import type { SkillManifest } from "./SkillManifest";
  * Backend -> frontend request to approve installing a skill (M3.2). Emitted after
  * the bundle is fetched and validated, so the user approves with the real declared
  * `manifest` (name, version, tools/permissions) in hand. The frontend replies via
- * the shared `respond_approval(request_id, approved)` command — the same gate used
- * for dangerous tool calls. `warnings` carries non-fatal validation notes.
+ * the shared `respond_approval(session_id, call_id, approved)` command — the same
+ * gate as dangerous tool calls. An install has no turn, so the backend keys it by
+ * `request_id`: reply with `request_id` for BOTH `session_id` and `call_id`.
+ * `warnings` carries non-fatal validation notes.
  */
 export type SkillInstallApprovalRequestEvent = { requestId: string, source: string, manifest: SkillManifest, warnings: Array<string>, };

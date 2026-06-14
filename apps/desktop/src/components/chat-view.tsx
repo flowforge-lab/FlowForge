@@ -144,7 +144,7 @@ export function ChatView() {
             streaming={m.id === streamingId}
             toolSteps={toolStepsByMessage[m.id] ?? []}
             onRespond={(callId, approved) =>
-              void respondApproval(m.id, callId, approved)
+              void respondApproval(m.sessionId, m.id, callId, approved)
             }
           />
         ))}

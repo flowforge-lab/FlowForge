@@ -10,6 +10,7 @@ export type { ProviderKind } from "./ProviderKind";
 export type { SessionStatus } from "./SessionStatus";
 export type { TokenEvent } from "./TokenEvent";
 export type { ToolApprovalRequestEvent } from "./ToolApprovalRequestEvent";
+export type { ApprovalSafety } from "./ApprovalSafety";
 export type { ToolCallEvent } from "./ToolCallEvent";
 export type { ToolResultEvent } from "./ToolResultEvent";
 export type { TurnDoneEvent } from "./TurnDoneEvent";
