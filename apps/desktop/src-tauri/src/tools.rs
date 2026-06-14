@@ -131,6 +131,66 @@ impl Tool for UninstallSkillTool {
     }
 }
 
+/// Ranks installed skills for a query so the agent can discover capabilities to
+/// activate (RFC 0001 §6). Read-only — never gated. Shares `ff_skills::search_skills`
+/// with the palette-facing `search_skills` Tauri command, so ranking is identical.
+pub struct SearchSkillsTool {
+    registry: SharedRegistry,
+}
+
+impl SearchSkillsTool {
+    pub fn new(registry: SharedRegistry) -> Self {
+        Self { registry }
+    }
+}
+
+#[async_trait]
+impl Tool for SearchSkillsTool {
+    fn name(&self) -> &str {
+        "search_skills"
+    }
+
+    fn description(&self) -> &str {
+        "Search installed skills by keyword. Ranks by exact keyword, then name, then          description. An empty query lists every installed skill. Returns each match          as `name (version): description`."
+    }
+
+    fn parameters(&self) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Search terms. Empty lists all installed skills."
+                }
+            }
+        })
+    }
+
+    fn safety(&self, _args: &Value) -> Safety {
+        Safety::ReadOnly
+    }
+
+    async fn run(&self, args: Value, _root: &std::path::Path) -> ToolOutcome {
+        let query = args.get("query").and_then(Value::as_str).unwrap_or("");
+        let reg = self.registry.read().unwrap();
+        let hits = ff_skills::search_skills(&reg, query);
+        if hits.is_empty() {
+            return ToolOutcome::ok("no matching skills".to_string());
+        }
+        let listing = hits
+            .iter()
+            .map(|h| {
+                format!(
+                    "- {} (v{}): {}",
+                    h.manifest.name, h.manifest.version, h.manifest.description
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        ToolOutcome::ok(listing)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -185,6 +245,56 @@ mod tests {
         assert!(!out.success);
         assert!(out.content.contains("install failed"));
         assert!(!skills.exists());
+    }
+
+    #[tokio::test]
+    async fn search_tool_lists_all_then_ranks() {
+        let tmp = tempdir().unwrap();
+        let skills = tmp.path().join("skills");
+        for (dir, name, desc, ver) in [
+            ("rusty", "rusty", "rust debugging", "0.1.0"),
+            ("other", "other", "misc helper", "0.2.0"),
+        ] {
+            let d = skills.join(dir);
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(
+                d.join("SKILL.md"),
+                format!("---\nname: {name}\ndescription: {desc}\nversion: {ver}\n---\nbody\n"),
+            )
+            .unwrap();
+        }
+        let reg = shared();
+        state::reload_registry(&skills, &reg);
+
+        let tool = SearchSkillsTool::new(reg.clone());
+        assert_eq!(tool.safety(&serde_json::json!({})), Safety::ReadOnly);
+
+        // Empty query lists every installed skill.
+        let out = tool.run(serde_json::json!({}), tmp.path()).await;
+        assert!(out.success, "{}", out.content);
+        assert!(out.content.contains("rusty"));
+        assert!(out.content.contains("other"));
+
+        // A query filters and ranks: "rust" matches rusty (name prefix), not other.
+        let out = tool
+            .run(serde_json::json!({ "query": "rust" }), tmp.path())
+            .await;
+        assert!(out.success);
+        assert!(out.content.contains("rusty (v0.1.0): rust debugging"));
+        assert!(!out.content.contains("other"));
+    }
+
+    #[tokio::test]
+    async fn search_tool_reports_no_matches() {
+        let tool = SearchSkillsTool::new(shared());
+        let out = tool
+            .run(
+                serde_json::json!({ "query": "nothing" }),
+                std::path::Path::new("."),
+            )
+            .await;
+        assert!(out.success);
+        assert_eq!(out.content, "no matching skills");
     }
 
     #[tokio::test]

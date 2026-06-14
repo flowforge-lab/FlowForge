@@ -8,10 +8,13 @@ mod tools;
 use async_trait::async_trait;
 use ff_agent::{run_turn, AgentEvent, Approver, CancelToken, ToolContext};
 use ff_core::events::{
-    ApprovalSafety, IntentionSignal, SkillInstallApprovalRequestEvent, TokenEvent,
-    ToolApprovalRequestEvent, ToolCallEvent, ToolResultEvent, TurnDoneEvent, TurnErrorEvent,
+    ApprovalSafety, IntentionSignal, SkillInstallApprovalRequestEvent, SkillsChangedEvent,
+    TokenEvent, ToolApprovalRequestEvent, ToolCallEvent, ToolResultEvent, TurnDoneEvent,
+    TurnErrorEvent,
 };
-use ff_core::{Message, ProviderConfig, ProviderKind, Role, Session, SkillManifest};
+use ff_core::{
+    Message, ProviderConfig, ProviderKind, Role, Session, Skill, SkillInfo, SkillManifest,
+};
 use ff_tools::Safety;
 use state::AppState;
 use std::sync::Arc;
@@ -157,7 +160,8 @@ fn send_message(
         // we inject installed-skill descriptions and the current local time only.
         let skills = state.skills_snapshot();
         let user_ctx = ff_agent::UserContext::now();
-        let system_prompt = ff_agent::build_system_prompt(None, &skills, &[], &user_ctx);
+        let active = state.active_skills();
+        let system_prompt = ff_agent::build_system_prompt(None, &skills, &active, &user_ctx);
 
         let result = run_turn(
             provider.as_ref(),
@@ -347,14 +351,99 @@ async fn install_skill(
         .map_err(|e| e.to_string())?;
 
     state.reload_skills();
+    emit_skills_changed(&app, &state);
     Ok(manifest)
+}
+
+/// Build a frontend [`SkillInfo`] from a loaded skill, folding in active state and
+/// a search score (`0` for the unranked list).
+fn to_skill_info(skill: &Skill, active: &[String], score: u32) -> SkillInfo {
+    SkillInfo {
+        name: skill.manifest.name.clone(),
+        description: skill.manifest.description.clone(),
+        version: skill.manifest.version.clone(),
+        keywords: skill.manifest.keywords.clone(),
+        active: active.contains(&skill.manifest.name),
+        score,
+    }
+}
+
+/// Emit the current active set so the frontend can reconcile its state.
+fn emit_skills_changed(app: &tauri::AppHandle, state: &AppState) {
+    let _ = app.emit(
+        "skills:changed",
+        SkillsChangedEvent {
+            active: state.active_skills(),
+        },
+    );
+}
+
+/// All installed skills, name-sorted, each flagged with its active state. `score`
+/// is always `0` here — ranking is `search_skills`' job. Backs the command palette
+/// skill source (#11/#16).
+#[tauri::command]
+fn list_skills(state: State<'_, Arc<AppState>>) -> Vec<SkillInfo> {
+    let active = state.active_skills();
+    let reg = state.skills_snapshot();
+    let mut skills: Vec<&Skill> = reg.list().collect();
+    skills.sort_by(|a, b| a.manifest.name.cmp(&b.manifest.name));
+    skills
+        .into_iter()
+        .map(|s| to_skill_info(s, &active, 0))
+        .collect()
+}
+
+/// Rank installed skills for `query`, sharing `ff_skills::search_skills` with the
+/// agent tool of the same name. An empty query lists all skills (name-sorted).
+#[tauri::command]
+fn search_skills(state: State<'_, Arc<AppState>>, query: String) -> Vec<SkillInfo> {
+    let active = state.active_skills();
+    let reg = state.skills_snapshot();
+    ff_skills::search_skills(&reg, &query)
+        .into_iter()
+        .map(|hit| SkillInfo {
+            name: hit.manifest.name.clone(),
+            description: hit.manifest.description.clone(),
+            version: hit.manifest.version.clone(),
+            keywords: hit.manifest.keywords.clone(),
+            active: active.contains(&hit.manifest.name),
+            score: hit.score,
+        })
+        .collect()
+}
+
+/// Add a skill to the global active set (its body is injected next turn). Errors on
+/// an unknown name. Emits `skills:changed`.
+#[tauri::command]
+fn activate_skill(
+    state: State<'_, Arc<AppState>>,
+    app: tauri::AppHandle,
+    name: String,
+) -> CmdResult<()> {
+    state.activate_skill(&name)?;
+    emit_skills_changed(&app, &state);
+    Ok(())
+}
+
+/// Remove a skill from the active set (idempotent). Emits `skills:changed`.
+#[tauri::command]
+fn deactivate_skill(state: State<'_, Arc<AppState>>, app: tauri::AppHandle, name: String) {
+    state.deactivate_skill(&name);
+    emit_skills_changed(&app, &state);
 }
 
 /// Uninstall a skill by manifest name. Local and reversible, so it is not gated.
 #[tauri::command]
-fn uninstall_skill(state: State<'_, Arc<AppState>>, name: String) -> CmdResult<()> {
+fn uninstall_skill(
+    state: State<'_, Arc<AppState>>,
+    app: tauri::AppHandle,
+    name: String,
+) -> CmdResult<()> {
     ff_skills::uninstall(&name, &state.skills_root()).map_err(|e| e.to_string())?;
     state.reload_skills();
+    // An uninstalled skill must not linger in the active set.
+    state.prune_active_skills();
+    emit_skills_changed(&app, &state);
     Ok(())
 }
 
@@ -377,6 +466,10 @@ pub fn run() {
             warmup,
             install_skill,
             uninstall_skill,
+            list_skills,
+            search_skills,
+            activate_skill,
+            deactivate_skill,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

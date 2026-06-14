@@ -114,3 +114,14 @@ pub struct SkillInstallApprovalRequestEvent {
     pub manifest: crate::SkillManifest,
     pub warnings: Vec<String>,
 }
+
+/// Backend -> frontend notice that the active skill set changed (an
+/// activate/deactivate, or an install/uninstall reload that pruned a missing
+/// skill). Carries the full active set so the frontend replaces its state rather
+/// than diffing. The installed-skill list itself is re-fetched via `list_skills`.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "../../../apps/desktop/src/bindings/")]
+pub struct SkillsChangedEvent {
+    pub active: Vec<String>,
+}
