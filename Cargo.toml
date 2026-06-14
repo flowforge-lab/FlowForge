@@ -20,6 +20,10 @@ futures-util = "0.3"
 uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 iana-time-zone = "0.1"
+grep-regex = "0.1"
+grep-searcher = "0.1"
+ignore = "0.4"
+globset = "0.4"
 
 ff-core = { path = "crates/ff-core" }
 ff-agent = { path = "crates/ff-agent" }
