@@ -216,6 +216,10 @@ export class MockIpc implements FfIpc {
       : ["Qwen3-4B-Instruct-2507", "Qwen3-8B-Instruct"];
   }
 
+  async warmup(): Promise<void> {
+    // No-op: there is no real server behind the mock.
+  }
+
   // --- internals ---
 
   private append(

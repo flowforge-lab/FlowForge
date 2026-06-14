@@ -44,6 +44,8 @@ export interface FfIpc {
   ): Promise<ProviderConfig>;
   /** Best-effort model ids for the configured endpoint; `[]` when unreachable. */
   listModels(): Promise<string[]>;
+  /** Best-effort nudge to wake the model server before the first turn. Never throws meaningfully. */
+  warmup(): Promise<void>;
 
   // Events (backend -> frontend)
   onToken(cb: (e: TokenEvent) => void): Promise<Unlisten>;
@@ -121,6 +123,7 @@ class TauriIpc implements FfIpc {
       model,
     });
   listModels = () => this.invoke<string[]>("list_models");
+  warmup = () => this.invoke<void>("warmup");
 
   onToken = (cb: (e: TokenEvent) => void) =>
     this.listen<TokenEvent>("turn:token", cb);

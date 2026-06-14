@@ -8,6 +8,7 @@ mod openai;
 
 use async_trait::async_trait;
 use futures_util::stream::BoxStream;
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 
 pub use ollama::OllamaProvider;
@@ -105,5 +106,82 @@ pub trait Provider: Send + Sync {
     /// without a discovery endpoint keep the default (no suggestions).
     async fn list_models(&self) -> Result<Vec<String>, LlmError> {
         Ok(Vec::new())
+    }
+
+    /// Best-effort nudge to wake the server before the first real turn. Fires a
+    /// tiny request and drains a few decode steps, then drops the stream (which
+    /// aborts the request). On a local GPU backend this spins the device up out
+    /// of its idle power state and JIT-compiles the decode kernels, so the
+    /// user's first message does not pay the cold-start ramp. Callers ignore the
+    /// result: warmup must never block a turn or surface an error to the UI.
+    ///
+    /// The default works for any streaming provider; `model` is the id the
+    /// server expects (local backends generally ignore it).
+    async fn warmup(&self, model: &str) -> Result<(), LlmError> {
+        let req = ChatRequest {
+            model: model.to_string(),
+            messages: vec![ChatMessage::text("user", "ok")],
+            tools: Vec::new(),
+        };
+        let mut stream = self.chat_stream(req).await?;
+        // Draining ~32 decode steps is what it empirically takes for an idle
+        // Apple-Silicon GPU to reach its full clock; fewer leaves it half-ramped
+        // and the next real turn still stalls. Dropping the stream at end of
+        // scope aborts the request so the server stops generating early.
+        for _ in 0..32u8 {
+            match stream.next().await {
+                Some(Ok(chunk)) if !chunk.done => continue,
+                _ => break,
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    struct EndlessProvider {
+        polled: Arc<AtomicUsize>,
+        first_role: Mutex<Option<String>>,
+    }
+
+    #[async_trait]
+    impl Provider for EndlessProvider {
+        async fn chat_stream(&self, req: ChatRequest) -> Result<ChunkStream, LlmError> {
+            *self.first_role.lock().unwrap() = req.messages.first().map(|m| m.role.clone());
+            let polled = self.polled.clone();
+            let stream = futures_util::stream::unfold(0usize, move |i| {
+                let polled = polled.clone();
+                async move {
+                    polled.fetch_add(1, Ordering::SeqCst);
+                    let chunk = Chunk {
+                        delta: "x".into(),
+                        tool_calls: vec![],
+                        done: false,
+                    };
+                    Some((Ok(chunk), i + 1))
+                }
+            });
+            Ok(stream.boxed())
+        }
+    }
+
+    #[tokio::test]
+    async fn warmup_sends_one_user_turn_and_stops_early() {
+        let provider = EndlessProvider {
+            polled: Arc::new(AtomicUsize::new(0)),
+            first_role: Mutex::new(None),
+        };
+        provider.warmup("test-model").await.unwrap();
+        assert_eq!(provider.first_role.lock().unwrap().as_deref(), Some("user"));
+        // Bounded: warmup never drains the endless stream.
+        assert!(
+            provider.polled.load(Ordering::SeqCst) <= 32,
+            "warmup drained too many chunks"
+        );
     }
 }

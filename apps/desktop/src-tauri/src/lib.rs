@@ -277,6 +277,17 @@ async fn list_models(state: State<'_, Arc<AppState>>) -> CmdResult<Vec<String>> 
     Ok(provider.list_models().await.unwrap_or_default())
 }
 
+/// Wake the configured model server so its GPU/compute pipelines are hot before
+/// the user's first message. The composer fires this (debounced) when it gains
+/// focus. Fully best-effort: any failure (server down, busy) is swallowed so
+/// warmup never blocks the UI or surfaces an error.
+#[tauri::command]
+async fn warmup(state: State<'_, Arc<AppState>>) -> CmdResult<()> {
+    let (provider, model) = state.build_provider();
+    let _ = provider.warmup(&model).await;
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -293,6 +304,7 @@ pub fn run() {
             get_provider_config,
             set_provider_config,
             list_models,
+            warmup,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

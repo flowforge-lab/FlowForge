@@ -13,3 +13,6 @@ async-trait = { workspace = true }
 futures-util = { workspace = true }
 thiserror = { workspace = true }
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream"] }
+
+[dev-dependencies]
+tokio = { workspace = true }

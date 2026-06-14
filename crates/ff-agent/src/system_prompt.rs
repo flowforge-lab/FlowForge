@@ -4,6 +4,14 @@
 //! here from the active phenotype persona, the installed skills, and an ambient
 //! [`UserContext`]. The host computes the inputs; this module is pure string
 //! assembly so the result is deterministic and testable.
+//!
+//! Section order is chosen to maximize server-side prefix-cache reuse: the
+//! stable parts (persona, skill listings, active instructions) come first, and
+//! the ambient [`UserContext`] — the only part that changes day to day — comes
+//! last. The clock is also coarsened to date granularity so the entire prompt
+//! is byte-stable across a session, letting the inference server reuse the KV
+//! cache for the system prompt (and the tools block that follows it) on every
+//! turn after the first.
 
 use ff_skills::SkillRegistry;
 
@@ -11,22 +19,27 @@ use ff_skills::SkillRegistry;
 /// training-cutoff date. M3.1b scope is **time only** (RFC 0002 phase 1); location
 /// is a separate post-M3 track. The fields are preformatted strings so the prompt
 /// builder stays pure — [`UserContext::now`] does the clock/timezone lookup.
+///
+/// The clock is captured at **date** granularity (not minutes) on purpose: a
+/// finer timestamp would change every turn and bust the inference server's
+/// prefix cache for the whole system prompt. Date is enough for the model to
+/// reason about "today".
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UserContext {
-    /// Local date and time, e.g. `2026-06-13 14:05`.
-    pub local_datetime: String,
+    /// Local date, e.g. `2026-06-13`.
+    pub local_date: String,
     /// IANA timezone name, e.g. `America/Chicago`.
     pub timezone: String,
 }
 
 impl UserContext {
-    /// Capture the current local time and IANA timezone from the host clock.
+    /// Capture the current local date and IANA timezone from the host clock.
     pub fn now() -> Self {
-        let local_datetime = chrono::Local::now().format("%Y-%m-%d %H:%M").to_string();
+        let local_date = chrono::Local::now().format("%Y-%m-%d").to_string();
         let timezone =
             iana_time_zone::get_timezone().unwrap_or_else(|_| "unknown timezone".to_string());
         Self {
-            local_datetime,
+            local_date,
             timezone,
         }
     }
@@ -34,10 +47,12 @@ impl UserContext {
 
 /// Build the system prompt prepended to every turn's request.
 ///
-/// Sections, in order: optional `persona`, the ambient [`UserContext`], the
-/// `description` of every installed skill (for discovery), and the full `body` of
-/// each skill named in `active` (resolved against `skills`). Skill listings are
-/// sorted by name so the output is deterministic.
+/// Sections, in order: optional `persona`, the `description` of every installed
+/// skill (for discovery), the full `body` of each skill named in `active`
+/// (resolved against `skills`), and finally the ambient [`UserContext`]. Skill
+/// listings are sorted by name so the output is deterministic. The ambient
+/// context is placed last so the stable prefix stays byte-identical across a
+/// session for prefix-cache reuse (see module docs).
 pub fn build_system_prompt(
     persona: Option<&str>,
     skills: &SkillRegistry,
@@ -54,22 +69,17 @@ pub fn build_system_prompt(
         }
     }
 
-    out.push_str("## User context\n");
-    out.push_str(&format!(
-        "Current date and time: {} ({}).\n",
-        user.local_datetime, user.timezone
-    ));
-
     let mut installed: Vec<_> = skills.list().collect();
     installed.sort_by(|a, b| a.manifest.name.cmp(&b.manifest.name));
     if !installed.is_empty() {
-        out.push_str("\n## Available skills\n");
+        out.push_str("## Available skills\n");
         for skill in &installed {
             out.push_str(&format!(
                 "- {}: {}\n",
                 skill.manifest.name, skill.manifest.description
             ));
         }
+        out.push('\n');
     }
 
     let mut active_sorted: Vec<&String> = active.iter().collect();
@@ -81,9 +91,16 @@ pub fn build_system_prompt(
         }
     }
     if !active_section.is_empty() {
-        out.push_str("\n## Active skill instructions");
+        out.push_str("## Active skill instructions");
         out.push_str(&active_section);
+        out.push('\n');
     }
+
+    out.push_str("## User context\n");
+    out.push_str(&format!(
+        "Current date: {} ({}).\n",
+        user.local_date, user.timezone
+    ));
 
     out
 }
@@ -96,7 +113,7 @@ mod tests {
 
     fn ctx() -> UserContext {
         UserContext {
-            local_datetime: "2026-06-13 14:05".into(),
+            local_date: "2026-06-13".into(),
             timezone: "America/Chicago".into(),
         }
     }
@@ -142,8 +159,22 @@ mod tests {
         let out = build_system_prompt(None, &reg, &[], &ctx());
         assert!(out.contains("## User context"));
         assert!(
-            out.contains("Current date and time: 2026-06-13 14:05 (America/Chicago)."),
+            out.contains("Current date: 2026-06-13 (America/Chicago)."),
             "{out}"
+        );
+    }
+
+    #[test]
+    fn user_context_is_placed_last() {
+        let reg = registry(vec![skill("alpha", "A things", "abody")]);
+        let out = build_system_prompt(Some("You are Akisa."), &reg, &["alpha".into()], &ctx());
+        let persona = out.find("You are Akisa.").unwrap();
+        let available = out.find("## Available skills").unwrap();
+        let active = out.find("## Active skill instructions").unwrap();
+        let user = out.find("## User context").unwrap();
+        assert!(
+            persona < available && available < active && active < user,
+            "user context must come last for cache stability: {out}"
         );
     }
 
