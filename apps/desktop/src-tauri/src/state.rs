@@ -11,11 +11,19 @@ use ff_skills::{SharedRegistry, SkillRegistry, SkillWatcher};
 use ff_tools::ToolRegistry;
 use tokio::sync::oneshot;
 
-/// One outstanding tool-approval prompt. The shell awaits `tx.send(approved)` (sent
-/// by `respond_approval`) or drops the sender on cancel (which denies the call).
-struct PendingApproval {
-    session_id: String,
-    tx: oneshot::Sender<bool>,
+/// Registry of in-flight turn cancellation tokens and tool-approval prompts, kept
+/// behind a single lock so a cancel and an approval registration can never race
+/// (TOCTOU): `register_approval` checks for a live cancel token and inserts the
+/// pending slot under the same guard.
+#[derive(Default)]
+struct ApprovalRegistry {
+    /// session_id -> live turn cancellation token. Present only while a turn runs.
+    cancels: HashMap<String, CancelToken>,
+    /// (session_id, call_id) -> pending UI approval. Keyed by both so colliding
+    /// LLM-supplied `call_id`s across concurrent sessions never overwrite each
+    /// other. Removed when the user responds, or dropped (denying the call) when
+    /// the turn is cancelled. The sender wakes the awaiting approver.
+    pending: HashMap<(String, String), oneshot::Sender<bool>>,
 }
 
 /// Builds a fresh [`Provider`] from a [`ProviderConfig`]. Called once per turn so a
@@ -75,10 +83,9 @@ pub struct AppState {
     /// `AppState` `Sync` (the `notify` watcher is `Send` but not `Sync`). `Option`
     /// covers the fallback when the watcher cannot start.
     _skill_watcher: Mutex<Option<SkillWatcher>>,
-    cancels: Mutex<HashMap<String, CancelToken>>,
-    /// call_id -> pending UI approval. Removed when the user responds, or dropped
-    /// (denying the call) when the turn is cancelled.
-    pending: Mutex<HashMap<String, PendingApproval>>,
+    /// Turn cancellation tokens + pending approvals under one lock (see
+    /// [`ApprovalRegistry`]).
+    approvals: Mutex<ApprovalRegistry>,
 }
 
 impl AppState {
@@ -106,8 +113,7 @@ impl AppState {
             workspace_root: default_workspace_root(),
             skills,
             _skill_watcher: Mutex::new(watcher),
-            cancels: Mutex::new(HashMap::new()),
-            pending: Mutex::new(HashMap::new()),
+            approvals: Mutex::new(ApprovalRegistry::default()),
         }
     }
 
@@ -141,14 +147,15 @@ impl AppState {
     }
 
     pub fn register_cancel(&self, session_id: &str, token: CancelToken) {
-        self.cancels
+        self.approvals
             .lock()
             .unwrap()
+            .cancels
             .insert(session_id.to_string(), token);
     }
 
     pub fn take_cancel(&self, session_id: &str) -> Option<CancelToken> {
-        self.cancels.lock().unwrap().remove(session_id)
+        self.approvals.lock().unwrap().cancels.remove(session_id)
     }
 
     /// A cheap clone of the current skill set, taken at turn start.
@@ -158,36 +165,45 @@ impl AppState {
 }
 
 impl AppState {
-    /// Reserve a slot for a UI approval prompt. The caller awaits the returned receiver;
-    /// the matching `resolve_approval` (or `cancel_pending_approvals` on cancel) wakes it.
-    pub fn register_approval(&self, call_id: &str, session_id: &str) -> oneshot::Receiver<bool> {
+    /// Reserve a slot for a UI approval prompt. The caller awaits the returned
+    /// receiver; the matching `resolve_approval` (or `cancel_pending_approvals` on
+    /// cancel) wakes it.
+    ///
+    /// If the session has no live cancel token — the turn was already cancelled, or
+    /// is being torn down — the prompt is refused: the sender is dropped before
+    /// returning, so `rx.await` yields `Err`, which the approver treats as a deny.
+    /// This closes the TOCTOU where a cancel lands between the agent loop's
+    /// cancellation check and this registration, which would otherwise orphan the
+    /// sender and hang the awaiting approver.
+    pub fn register_approval(&self, session_id: &str, call_id: &str) -> oneshot::Receiver<bool> {
         let (tx, rx) = oneshot::channel();
-        self.pending.lock().unwrap().insert(
-            call_id.to_string(),
-            PendingApproval {
-                session_id: session_id.to_string(),
-                tx,
-            },
-        );
+        let mut reg = self.approvals.lock().unwrap();
+        if reg.cancels.contains_key(session_id) {
+            reg.pending
+                .insert((session_id.to_string(), call_id.to_string()), tx);
+        }
+        // else: `tx` drops here -> `rx` resolves to `Err` -> deny.
         rx
     }
 
-    /// Deliver the user's decision. Unknown `call_id` is a no-op (race: cancel raced
-    /// the click).
-    pub fn resolve_approval(&self, call_id: &str, approved: bool) {
-        if let Some(p) = self.pending.lock().unwrap().remove(call_id) {
+    /// Deliver the user's decision. An unknown `(session_id, call_id)` is a no-op
+    /// (race: cancel raced the click).
+    pub fn resolve_approval(&self, session_id: &str, call_id: &str, approved: bool) {
+        let key = (session_id.to_string(), call_id.to_string());
+        if let Some(tx) = self.approvals.lock().unwrap().pending.remove(&key) {
             // Receiver may have been dropped (cancel raced); ignore the send error.
-            let _ = p.tx.send(approved);
+            let _ = tx.send(approved);
         }
     }
 
     /// Drop every pending approval for this session — dropping the sender resolves
     /// the awaiting receiver with `Err`, which the approver translates to a deny.
     pub fn cancel_pending_approvals(&self, session_id: &str) {
-        self.pending
+        self.approvals
             .lock()
             .unwrap()
-            .retain(|_, p| p.session_id != session_id);
+            .pending
+            .retain(|(sid, _), _| sid != session_id);
     }
 }
 
@@ -243,20 +259,29 @@ pub fn reload_registry(root: &Path, registry: &SharedRegistry) {
 mod tests {
     use super::*;
 
+    // Approvals are only registered while a turn is live, so a cancel token must
+    // exist for the session first — mirrors `send_message` registering the token
+    // before the turn (and thus any approval) starts.
+    fn arm(state: &AppState, session_id: &str) {
+        state.register_cancel(session_id, CancelToken::new());
+    }
+
     #[tokio::test]
     async fn resolve_approval_delivers_decision() {
         let state = AppState::new();
-        let rx = state.register_approval("call-1", "sess");
-        state.resolve_approval("call-1", true);
+        arm(&state, "sess");
+        let rx = state.register_approval("sess", "call-1");
+        state.resolve_approval("sess", "call-1", true);
         assert!(rx.await.unwrap());
         // Slot is freed after resolve.
-        assert!(state.pending.lock().unwrap().is_empty());
+        assert!(state.approvals.lock().unwrap().pending.is_empty());
     }
 
     #[tokio::test]
     async fn cancel_pending_denies_via_drop() {
         let state = AppState::new();
-        let rx = state.register_approval("call-2", "sess-x");
+        arm(&state, "sess-x");
+        let rx = state.register_approval("sess-x", "call-2");
         state.cancel_pending_approvals("sess-x");
         // Sender was dropped -> RecvError -> caller treats as deny.
         assert!(rx.await.is_err());
@@ -265,11 +290,13 @@ mod tests {
     #[tokio::test]
     async fn cancel_pending_only_affects_matching_session() {
         let state = AppState::new();
-        let rx_a = state.register_approval("a", "sess-a");
-        let rx_b = state.register_approval("b", "sess-b");
+        arm(&state, "sess-a");
+        arm(&state, "sess-b");
+        let rx_a = state.register_approval("sess-a", "a");
+        let rx_b = state.register_approval("sess-b", "b");
         state.cancel_pending_approvals("sess-a");
         // sess-b survives.
-        state.resolve_approval("b", true);
+        state.resolve_approval("sess-b", "b", true);
         assert!(rx_a.await.is_err());
         assert!(rx_b.await.unwrap());
     }
@@ -278,6 +305,45 @@ mod tests {
     async fn resolve_unknown_call_is_noop() {
         let state = AppState::new();
         // Must not panic.
-        state.resolve_approval("nope", true);
+        state.resolve_approval("nope", "nope", true);
+    }
+
+    #[tokio::test]
+    async fn register_without_live_cancel_denies_immediately() {
+        let state = AppState::new();
+        // No `register_cancel` -> the turn is gone (or never started). The TOCTOU
+        // guard refuses the prompt: the receiver resolves to Err -> deny, and no
+        // orphaned sender is left behind to hang the approver.
+        let rx = state.register_approval("ghost", "call-x");
+        assert!(rx.await.is_err());
+        assert!(state.approvals.lock().unwrap().pending.is_empty());
+    }
+
+    #[tokio::test]
+    async fn standalone_op_with_liveness_token_can_be_approved() {
+        // Mirrors the install_skill flow: a non-turn op registers a liveness token
+        // under its request_id so the TOCTOU guard admits it, keyed (id, id).
+        let state = AppState::new();
+        state.register_cancel("op", CancelToken::new());
+        let rx = state.register_approval("op", "op");
+        state.resolve_approval("op", "op", true);
+        assert!(rx.await.unwrap());
+        // The flow releases the liveness token afterward.
+        assert!(state.take_cancel("op").is_some());
+    }
+
+    #[tokio::test]
+    async fn colliding_call_ids_across_sessions_are_isolated() {
+        let state = AppState::new();
+        arm(&state, "sess-1");
+        arm(&state, "sess-2");
+        // Same LLM-supplied call_id in two concurrent sessions must not collide.
+        let rx1 = state.register_approval("sess-1", "dup");
+        let rx2 = state.register_approval("sess-2", "dup");
+        // Resolving one leaves the other intact.
+        state.resolve_approval("sess-1", "dup", true);
+        state.resolve_approval("sess-2", "dup", false);
+        assert!(rx1.await.unwrap());
+        assert!(!rx2.await.unwrap());
     }
 }

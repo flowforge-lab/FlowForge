@@ -30,8 +30,13 @@ export interface FfIpc {
   /** Persists the user message and starts the assistant turn. Returns the user message id. */
   sendMessage(sessionId: string, content: string): Promise<string>;
   cancelTurn(sessionId: string): Promise<void>;
-  /** Frontend's reply to a [`ToolApprovalRequestEvent`]. */
-  respondApproval(callId: string, approved: boolean): Promise<void>;
+  /** Frontend's reply to a [`ToolApprovalRequestEvent`]. Keyed by `(sessionId,
+   *  callId)` so it never resolves a colliding call in another session. */
+  respondApproval(
+    sessionId: string,
+    callId: string,
+    approved: boolean,
+  ): Promise<void>;
 
   // Provider settings (Issue #8). Phase 1: local candle-vllm + Ollama, no secrets.
   /** Current persisted LLM provider settings. */
@@ -108,8 +113,8 @@ class TauriIpc implements FfIpc {
     this.invoke<string>("send_message", { sessionId, content });
   cancelTurn = (sessionId: string) =>
     this.invoke<void>("cancel_turn", { sessionId });
-  respondApproval = (callId: string, approved: boolean) =>
-    this.invoke<void>("respond_approval", { callId, approved });
+  respondApproval = (sessionId: string, callId: string, approved: boolean) =>
+    this.invoke<void>("respond_approval", { sessionId, callId, approved });
 
   getProviderConfig = () => this.invoke<ProviderConfig>("get_provider_config");
   setProviderConfig = (

@@ -8,8 +8,8 @@ mod tools;
 use async_trait::async_trait;
 use ff_agent::{run_turn, AgentEvent, Approver, CancelToken, ToolContext};
 use ff_core::events::{
-    IntentionSignal, SkillInstallApprovalRequestEvent, TokenEvent, ToolApprovalRequestEvent,
-    ToolCallEvent, ToolResultEvent, TurnDoneEvent, TurnErrorEvent,
+    ApprovalSafety, IntentionSignal, SkillInstallApprovalRequestEvent, TokenEvent,
+    ToolApprovalRequestEvent, ToolCallEvent, ToolResultEvent, TurnDoneEvent, TurnErrorEvent,
 };
 use ff_core::{Message, ProviderConfig, ProviderKind, Role, Session, SkillManifest};
 use ff_tools::Safety;
@@ -36,14 +36,16 @@ impl Approver for UiApprover {
         safety: Safety,
         args: &serde_json::Value,
     ) -> bool {
-        let safety_str = match safety {
-            // Unreachable in practice: the agent loop short-circuits ReadOnly
-            // before calling the approver. Kept for the exhaustive match.
-            Safety::ReadOnly => "readOnly",
-            Safety::Write => "write",
-            Safety::Dangerous => "dangerous",
+        let safety = match safety {
+            Safety::Write => ApprovalSafety::Write,
+            Safety::Dangerous => ApprovalSafety::Dangerous,
+            // The agent loop short-circuits ReadOnly before calling the approver,
+            // so it never reaches the approval contract.
+            // The agent loop short-circuits ReadOnly before approval; deny
+            // defensively rather than panic if a future caller violates that.
+            Safety::ReadOnly => return false,
         };
-        let rx = self.state.register_approval(call_id, &self.session_id);
+        let rx = self.state.register_approval(&self.session_id, call_id);
         let _ = self.app.emit(
             "tool:approval-request",
             ToolApprovalRequestEvent {
@@ -52,7 +54,7 @@ impl Approver for UiApprover {
                 call_id: call_id.to_string(),
                 tool: name.to_string(),
                 args: args.clone(),
-                safety: safety_str.to_string(),
+                safety,
             },
         );
         // Sender dropped (cancel) -> RecvError -> deny.
@@ -109,8 +111,13 @@ fn cancel_turn(state: State<'_, Arc<AppState>>, session_id: String) {
 
 /// Frontend response to a [`ToolApprovalRequestEvent`]. Wakes the awaiting approver.
 #[tauri::command]
-fn respond_approval(state: State<'_, Arc<AppState>>, call_id: String, approved: bool) {
-    state.resolve_approval(&call_id, approved);
+fn respond_approval(
+    state: State<'_, Arc<AppState>>,
+    session_id: String,
+    call_id: String,
+    approved: bool,
+) {
+    state.resolve_approval(&session_id, &call_id, approved);
 }
 
 /// Persists the user message, then spawns the assistant turn. Tokens stream back
@@ -312,7 +319,12 @@ async fn install_skill(
     let request_id = Uuid::new_v4().to_string();
 
     // Present the validated manifest for approval, reusing the dangerous-tool gate.
-    let rx = state.register_approval(&request_id, "");
+    // An install is a live, standalone approval (no turn), so register a liveness
+    // token under `request_id` to satisfy `register_approval`'s TOCTOU guard, and
+    // key the prompt (request_id, request_id). The token is released after the
+    // await — and lets a shutdown/`cancel_pending_approvals` deny a stuck install.
+    state.register_cancel(&request_id, CancelToken::new());
+    let rx = state.register_approval(&request_id, &request_id);
     let _ = app.emit(
         "skill:install-approval-request",
         SkillInstallApprovalRequestEvent {
@@ -322,7 +334,9 @@ async fn install_skill(
             warnings: Vec::new(),
         },
     );
-    if !rx.await.unwrap_or(false) {
+    let approved = rx.await.unwrap_or(false);
+    state.take_cancel(&request_id);
+    if !approved {
         return Err("install was not approved".to_string());
     }
 

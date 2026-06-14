@@ -64,6 +64,10 @@ interface ActiveTurn {
 
 const uidShort = () => crypto.randomUUID().slice(0, 8);
 
+// Composite key mirroring the backend's `(session_id, call_id)` pending key.
+const approvalKey = (sessionId: string, callId: string) =>
+  `${sessionId}\u0000${callId}`;
+
 export class MockIpc implements FfIpc {
   private sessions = new Map<string, Session>();
   private messages = new Map<string, Message[]>();
@@ -87,12 +91,10 @@ export class MockIpc implements FfIpc {
   private approvalRequestListeners = new Set<
     Listener<ToolApprovalRequestEvent>
   >();
-  /** callId -> resume callback. Set when a write tool emits an approval
-   *  request; the matching `respondApproval` resolves it. */
-  private pendingApprovals = new Map<
-    string,
-    { sessionId: string; resume: (approved: boolean) => void }
-  >();
+  /** `(sessionId, callId)` -> resume callback. Set when a write tool emits an
+   *  approval request; the matching `respondApproval` resolves it. Keyed by both
+   *  so colliding call ids across sessions stay isolated (mirrors the backend). */
+  private pendingApprovals = new Map<string, (approved: boolean) => void>();
 
   async createSession(goal?: string): Promise<Session> {
     const ts = now();
@@ -153,7 +155,7 @@ export class MockIpc implements FfIpc {
         result: "[cancelled]",
       });
       // Drop any awaiting-approval entry — its tool:result was just emitted.
-      this.pendingApprovals.delete(callId);
+      this.pendingApprovals.delete(approvalKey(sessionId, callId));
     }
     // Emit done with whatever partial content was accumulated — mirrors what
     // the real backend does when a CancellationToken fires.
@@ -182,11 +184,16 @@ export class MockIpc implements FfIpc {
     return this.subscribe(this.approvalRequestListeners, cb);
   }
 
-  async respondApproval(callId: string, approved: boolean): Promise<void> {
-    const pending = this.pendingApprovals.get(callId);
-    if (!pending) return;
-    this.pendingApprovals.delete(callId);
-    pending.resume(approved);
+  async respondApproval(
+    sessionId: string,
+    callId: string,
+    approved: boolean,
+  ): Promise<void> {
+    const key = approvalKey(sessionId, callId);
+    const resume = this.pendingApprovals.get(key);
+    if (!resume) return;
+    this.pendingApprovals.delete(key);
+    resume(approved);
   }
 
   async getProviderConfig(): Promise<ProviderConfig> {
@@ -294,23 +301,20 @@ export class MockIpc implements FfIpc {
       args: { path: "README.md", old_str: "FlowForge", new_str: "FlowForge!" },
       safety: "write",
     });
-    this.pendingApprovals.set(callId, {
-      sessionId,
-      resume: (approved) => {
-        turn.pendingToolCalls = turn.pendingToolCalls.filter(
-          (id) => id !== callId,
-        );
-        this.emit(this.toolResultListeners, {
-          sessionId,
-          messageId: assistant.id,
-          callId,
-          success: approved,
-          result: approved
-            ? "(mocked) edited README.md"
-            : "call to `edit` was not approved",
-        });
-        this.streamWords(sessionId, turn);
-      },
+    this.pendingApprovals.set(approvalKey(sessionId, callId), (approved) => {
+      turn.pendingToolCalls = turn.pendingToolCalls.filter(
+        (id) => id !== callId,
+      );
+      this.emit(this.toolResultListeners, {
+        sessionId,
+        messageId: assistant.id,
+        callId,
+        success: approved,
+        result: approved
+          ? "(mocked) edited README.md"
+          : "call to `edit` was not approved",
+      });
+      this.streamWords(sessionId, turn);
     });
   }
 
