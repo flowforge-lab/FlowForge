@@ -82,6 +82,7 @@ impl ToolRegistry {
         r.register(Box::new(crate::glob::GlobTool));
         r.register(Box::new(crate::tree::TreeTool));
         r.register(Box::new(crate::todo::TodoTool));
+        r.register(Box::new(crate::web_fetch::WebFetchTool::new()));
         r
     }
 
@@ -149,13 +150,21 @@ mod tests {
     fn advertises_default_schemas() {
         let reg = ToolRegistry::with_defaults();
         let tools = reg.openai_tools();
-        assert_eq!(tools.len(), 8);
+        assert_eq!(tools.len(), 9);
         let names: Vec<_> = tools
             .iter()
             .map(|t| t["function"]["name"].as_str().unwrap())
             .collect();
         for expected in [
-            "bash", "view", "edit", "write", "grep", "glob", "tree", "todo",
+            "bash",
+            "view",
+            "edit",
+            "write",
+            "grep",
+            "glob",
+            "tree",
+            "todo",
+            "web_fetch",
         ] {
             assert!(names.contains(&expected), "missing tool: {expected}");
         }

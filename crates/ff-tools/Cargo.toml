@@ -15,6 +15,10 @@ grep-regex = { workspace = true }
 grep-searcher = { workspace = true }
 ignore = { workspace = true }
 globset = { workspace = true }
+reqwest = { workspace = true, features = ["rustls-tls"] }
+url = { workspace = true }
+fast_html2md = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
+wiremock = { workspace = true }
