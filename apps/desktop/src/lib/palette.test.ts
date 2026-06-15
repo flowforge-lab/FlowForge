@@ -1,6 +1,13 @@
 import { describe, it, expect } from "vitest";
-import { buildCommands, fuzzyScore, filterCommands } from "@/lib/palette";
-import type { Session } from "@/bindings";
+import {
+  buildCommands,
+  buildPhenotypeCommands,
+  buildSkillCommands,
+  fuzzyScore,
+  filterCommands,
+  mergePaletteResults,
+} from "@/lib/palette";
+import type { Phenotype, Session, SkillInfo } from "@/bindings";
 
 function session(partial: Partial<Session> & { id: string }): Session {
   return {
@@ -104,5 +111,81 @@ describe("filterCommands", () => {
     const results = filterCommands(commands, "wrap", []);
     expect(results.map((c) => c.id)).toContain("action:toggle-wrap");
     expect(results.map((c) => c.id)).not.toContain("action:new-session");
+  });
+});
+
+describe("buildSkillCommands", () => {
+  const inactive: SkillInfo = {
+    name: "rust-debugging",
+    description: "Systematic Rust debugging",
+    version: "0.1.0",
+    keywords: ["rust", "debug"],
+    active: false,
+    score: 4,
+  };
+  const active: SkillInfo = { ...inactive, active: true, score: 0 };
+
+  it("maps inactive skills to activate rows", () => {
+    const [cmd] = buildSkillCommands([inactive]);
+    expect(cmd.kind).toBe("activate-skill");
+    expect(cmd.id).toBe("skill:activate:rust-debugging");
+    expect(cmd.title).toBe("Activate rust-debugging");
+    expect(cmd.hint).toBe("Activate");
+  });
+
+  it("maps active skills to deactivate rows", () => {
+    const [cmd] = buildSkillCommands([active]);
+    expect(cmd.kind).toBe("deactivate-skill");
+    expect(cmd.id).toBe("skill:deactivate:rust-debugging");
+    expect(cmd.hint).toBe("Active");
+  });
+});
+
+describe("buildPhenotypeCommands", () => {
+  const phenotypes: Phenotype[] = [
+    { name: "default", skills: [] },
+    { name: "rust", skills: ["rust-debugging"] },
+  ];
+
+  it("lists switch rows for non-active phenotypes", () => {
+    const cmds = buildPhenotypeCommands({
+      phenotypes,
+      activePhenotype: phenotypes[0],
+    });
+    expect(cmds.map((c) => c.id)).toEqual(["pheno:rust"]);
+    expect(cmds[0].kind).toBe("switch-phenotype");
+  });
+});
+
+describe("mergePaletteResults", () => {
+  const staticCmds = buildCommands({
+    sessions: [],
+    activeSessionId: null,
+    sessionTitles: {},
+  });
+  const skillCmds = buildSkillCommands([
+    {
+      name: "create-pr",
+      description: "Open a PR",
+      version: "0.1.0",
+      keywords: ["git"],
+      active: false,
+      score: 3,
+    },
+  ]);
+
+  it("puts ranked skill hits first when the query is non-empty", () => {
+    const merged = mergePaletteResults(staticCmds, skillCmds, "git", []);
+    expect(merged[0].id).toBe("skill:activate:create-pr");
+  });
+
+  it("still fuzzy-filters static commands in the merge", () => {
+    const merged = mergePaletteResults(staticCmds, skillCmds, "split", []);
+    expect(merged.some((c) => c.id === "action:toggle-split")).toBe(true);
+  });
+
+  it("includes all skills on an empty query", () => {
+    const merged = mergePaletteResults(staticCmds, skillCmds, "", []);
+    expect(merged.some((c) => c.id === "skill:activate:create-pr")).toBe(true);
   });
 });

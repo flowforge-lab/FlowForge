@@ -4,7 +4,7 @@
 // store/palette.ts touches localStorage at module load. Mirrors lib/steps.ts and
 // lib/sessions.ts.
 
-import type { Session } from "@/bindings";
+import type { Phenotype, Session, SkillInfo } from "@/bindings";
 import type { PaletteCommand } from "@/store/palette";
 import { resolveLabel } from "@/lib/sessions";
 
@@ -65,6 +65,47 @@ export function buildCommands(args: {
   return [...actions, ...sessionCmds];
 }
 
+/** One palette row per installed skill — activate or deactivate based on `active`. */
+export function buildSkillCommands(skills: SkillInfo[]): PaletteCommand[] {
+  return skills.map((skill) =>
+    skill.active
+      ? {
+          kind: "deactivate-skill",
+          name: skill.name,
+          id: `skill:deactivate:${skill.name}`,
+          title: `Deactivate ${skill.name}`,
+          keywords: `${skill.description} ${skill.keywords.join(" ")} skill active`,
+          hint: "Active",
+        }
+      : {
+          kind: "activate-skill",
+          name: skill.name,
+          id: `skill:activate:${skill.name}`,
+          title: `Activate ${skill.name}`,
+          keywords: `${skill.description} ${skill.keywords.join(" ")} skill`,
+          hint: "Activate",
+        },
+  );
+}
+
+/** Phenotype switch rows — omits the currently active phenotype (RFC 0001 §7). */
+export function buildPhenotypeCommands(args: {
+  phenotypes: Phenotype[];
+  activePhenotype: Phenotype | null;
+}): PaletteCommand[] {
+  const active = args.activePhenotype?.name;
+  return args.phenotypes
+    .filter((p) => p.name !== active)
+    .map((p) => ({
+      kind: "switch-phenotype" as const,
+      name: p.name,
+      id: `pheno:${p.name}`,
+      title: `Phenotype: ${p.name}`,
+      keywords: `pheno phenotype profile switch ${p.skills.join(" ")}`,
+      hint: "Switch",
+    }));
+}
+
 // ── Fuzzy filter ──────────────────────────────────────────────────────────────
 
 // Subsequence match with bonuses for contiguous runs and word-boundary starts.
@@ -115,4 +156,28 @@ export function filterCommands(
     )
     .sort((a, b) => b.score - a.score)
     .map((x) => x.cmd);
+}
+
+/** Merge static palette rows with backend-ranked skill hits. */
+export function mergePaletteResults(
+  staticCommands: PaletteCommand[],
+  skillCommands: PaletteCommand[],
+  query: string,
+  recent: string[],
+): PaletteCommand[] {
+  const trimmed = query.trim();
+  const staticFiltered = filterCommands(staticCommands, query, recent);
+
+  if (!trimmed) {
+    const rank = new Map(recent.map((id, i) => [id, i]));
+    return [...staticFiltered, ...skillCommands].sort((a, b) => {
+      const ra = rank.get(a.id) ?? Infinity;
+      const rb = rank.get(b.id) ?? Infinity;
+      return ra === rb ? 0 : ra - rb;
+    });
+  }
+
+  // Typed query: skill hits are already ranked by `search_skills`; fuzzy static
+  // matches follow so actions/sessions/phenotypes still surface.
+  return [...skillCommands, ...staticFiltered];
 }

@@ -1,8 +1,8 @@
-// ⌘K command palette state. Pure frontend (Issue #16) — no IPC. The palette is
-// the keyboard-native command surface ("Cmd/Ctrl+K is home", PRINCIPLES.md): a
-// fuzzy-searchable registry of quick actions and sessions that runs entirely off
-// the existing frontend stores. Mirrors store/split.ts: a discriminated union of
-// what the palette can do, plus a small zustand store for open/recents.
+// ⌘K command palette state. The palette is the keyboard-native command surface
+// ("Cmd/Ctrl+K is home", PRINCIPLES.md): a fuzzy-searchable registry of quick
+// actions, sessions, skills, and phenotypes. Mirrors store/split.ts: a
+// discriminated union of what the palette can do, plus a small zustand store for
+// open/recents.
 
 import { create } from "zustand";
 
@@ -34,6 +34,9 @@ export type PaletteCommand = CommandBase &
     | { kind: "toggle-split" }
     | { kind: "toggle-wrap" }
     | { kind: "focus-composer" }
+    | { kind: "activate-skill"; name: string }
+    | { kind: "deactivate-skill"; name: string }
+    | { kind: "switch-phenotype"; name: string }
   );
 
 /** The set of command kinds — handy for building exhaustive icon/handler maps. */
