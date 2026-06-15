@@ -28,3 +28,7 @@ export type { SkillCompleted } from "./SkillCompleted";
 export type { SkillAggregate } from "./SkillAggregate";
 export type { EvolveCostEstimate } from "./EvolveCostEstimate";
 export type { SkillEvolveApprovalRequestEvent } from "./SkillEvolveApprovalRequestEvent";
+export type { McpServerConfig } from "./McpServerConfig";
+export type { McpServerState } from "./McpServerState";
+export type { McpServerStatus } from "./McpServerStatus";
+export type { McpToolInfo } from "./McpToolInfo";
