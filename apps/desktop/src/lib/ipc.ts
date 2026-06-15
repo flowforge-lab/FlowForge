@@ -22,6 +22,7 @@ import type {
   SkillInfo,
   SkillAggregate,
   SkillsChangedEvent,
+  SkillEvolveApprovalRequestEvent,
   Phenotype,
 } from "../bindings";
 
@@ -84,6 +85,16 @@ export interface FfIpc {
   /** Per-skill telemetry aggregate (RFC 0001 §8), or null if none recorded yet. */
   getSkillTelemetry(skill: string): Promise<SkillAggregate | null>;
 
+  // Skill evolution (Issue #29, M3.5). Manual optimize proposes a streamlined
+  // rewrite gated by user approval; versions are archived for rollback.
+  /** Propose an LLM rewrite of a skill, gated by a [`SkillEvolveApprovalRequestEvent`].
+   *  Resolves with the new version string on approval; rejects if declined or on error. */
+  optimizeSkill(sessionId: string, skill: string): Promise<string>;
+  /** Restore a previously archived skill version (archives the current one first). */
+  rollbackSkill(skill: string, version: string): Promise<void>;
+  /** Archived version strings for a skill, newest-first; `[]` when none. */
+  listSkillVersions(skill: string): Promise<string[]>;
+
   // Phenotypes (Issue #28). Named, switchable working sets (RFC 0001 §7).
   /** All selectable phenotypes (built-in `default` + `~/.flowforge/phenotypes/`), name-sorted. */
   listPhenotypes(): Promise<Phenotype[]>;
@@ -105,6 +116,11 @@ export interface FfIpc {
   ): Promise<Unlisten>;
   /** Active skill set changed (activate/deactivate, or an install/uninstall reload). */
   onSkillsChanged(cb: (e: SkillsChangedEvent) => void): Promise<Unlisten>;
+  /** An `optimizeSkill` proposal is awaiting approval; render a diff and reply via
+   *  `respondApproval` (keyed by `requestId` as both session and call id). */
+  onEvolveApprovalRequest(
+    cb: (e: SkillEvolveApprovalRequestEvent) => void,
+  ): Promise<Unlisten>;
   /** The agent asked the user a clarifying question (#44, `ask_user`); render a
    *  prompt and reply via `respondAsk`. */
   onAskRequest(cb: (e: ToolAskRequestEvent) => void): Promise<Unlisten>;
@@ -191,6 +207,12 @@ class TauriIpc implements FfIpc {
     this.invoke<void>("deactivate_skill", { name });
   getSkillTelemetry = (skill: string) =>
     this.invoke<SkillAggregate | null>("get_skill_telemetry", { skill });
+  optimizeSkill = (sessionId: string, skill: string) =>
+    this.invoke<string>("optimize_skill", { sessionId, skill });
+  rollbackSkill = (skill: string, version: string) =>
+    this.invoke<void>("rollback_skill", { skill, version });
+  listSkillVersions = (skill: string) =>
+    this.invoke<string[]>("list_skill_versions", { skill });
 
   listPhenotypes = () => this.invoke<Phenotype[]>("list_phenotypes");
   getPhenotype = () => this.invoke<Phenotype>("get_phenotype");
@@ -215,6 +237,13 @@ class TauriIpc implements FfIpc {
     this.listen<ToolAskRequestEvent>("tool:ask-request", cb);
   onSkillsChanged = (cb: (e: SkillsChangedEvent) => void) =>
     this.listen<SkillsChangedEvent>("skills:changed", cb);
+  onEvolveApprovalRequest = (
+    cb: (e: SkillEvolveApprovalRequestEvent) => void,
+  ) =>
+    this.listen<SkillEvolveApprovalRequestEvent>(
+      "skill:evolve-approval-request",
+      cb,
+    );
 }
 
 // `MockIpc` is pulled in with a dynamic import so the bundler gives it its own

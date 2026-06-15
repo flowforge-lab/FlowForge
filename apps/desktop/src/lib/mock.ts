@@ -22,6 +22,7 @@ import type {
   SkillInfo,
   SkillAggregate,
   SkillsChangedEvent,
+  SkillEvolveApprovalRequestEvent,
   Phenotype,
 } from "../bindings";
 import type { FfIpc, Unlisten } from "./ipc";
@@ -133,6 +134,19 @@ const uidShort = () => crypto.randomUUID().slice(0, 8);
 const approvalKey = (sessionId: string, callId: string) =>
   `${sessionId}\u0000${callId}`;
 
+// Mirrors `ff_skills::bump_patch`: increments the trailing numeric segment, or
+// appends `.1` when it isn't a plain integer.
+const bumpPatch = (version: string): string => {
+  const idx = version.lastIndexOf(".");
+  const head = idx === -1 ? "" : version.slice(0, idx);
+  const last = idx === -1 ? version : version.slice(idx + 1);
+  if (/^\d+$/.test(last)) {
+    const next = Number(last) + 1;
+    return head === "" ? String(next) : `${head}.${next}`;
+  }
+  return `${version}.1`;
+};
+
 export class MockIpc implements FfIpc {
   private sessions = new Map<string, Session>();
   private messages = new Map<string, Message[]>();
@@ -172,6 +186,14 @@ export class MockIpc implements FfIpc {
    *  `respondAsk` resolves it; cancel deletes it (mirrors backend cancel-via-drop). */
   private pendingAsks = new Map<string, (answer: string) => void>();
   private skillsChangedListeners = new Set<Listener<SkillsChangedEvent>>();
+  private evolveApprovalListeners = new Set<
+    Listener<SkillEvolveApprovalRequestEvent>
+  >();
+  /** Per-skill current-version overrides applied by `optimizeSkill`/`rollbackSkill`;
+   *  falls back to the static `MOCK_SKILLS` version when absent. */
+  private skillVersions = new Map<string, string>();
+  /** Per-skill archived versions, newest-first (mirrors the backend history tree). */
+  private archivedVersions = new Map<string, string[]>();
   private activeSkills = new Set<string>();
   private activePhenotype: Phenotype = DEFAULT_PHENOTYPE;
 
@@ -267,6 +289,11 @@ export class MockIpc implements FfIpc {
   }
   onSkillsChanged(cb: Listener<SkillsChangedEvent>): Promise<Unlisten> {
     return this.subscribe(this.skillsChangedListeners, cb);
+  }
+  onEvolveApprovalRequest(
+    cb: Listener<SkillEvolveApprovalRequestEvent>,
+  ): Promise<Unlisten> {
+    return this.subscribe(this.evolveApprovalListeners, cb);
   }
   onAskRequest(cb: Listener<ToolAskRequestEvent>): Promise<Unlisten> {
     return this.subscribe(this.askRequestListeners, cb);
@@ -401,6 +428,61 @@ export class MockIpc implements FfIpc {
       meanLatencyMs: seed * 250,
       successRate: successes / completions,
     };
+  }
+
+  // Skill evolution (Issue #29, M3.5). `optimizeSkill` emits a canned proposal and
+  // blocks on approval via the *same* `pendingApprovals` map the backend reuses
+  // (keyed by `requestId` as both session and call id). Approval bumps the patch
+  // version and archives the prior one; decline rejects.
+  async optimizeSkill(_sessionId: string, skill: string): Promise<string> {
+    const info = MOCK_SKILLS.find((s) => s.name === skill);
+    if (!info) throw new Error(`unknown skill: ${skill}`);
+    const currentVersion = this.skillVersions.get(skill) ?? info.version;
+    const newVersion = bumpPatch(currentVersion);
+    const requestId = uid();
+    const beforeBody = `# ${skill}\n\n${info.description}\n\nVerbose original body with redundant guidance.`;
+    const afterBody = `# ${skill}\n\n${info.description}\n\nStreamlined body.`;
+    const approved = await new Promise<boolean>((resolve) => {
+      this.pendingApprovals.set(approvalKey(requestId, requestId), resolve);
+      this.emit(this.evolveApprovalListeners, {
+        requestId,
+        skill,
+        currentVersion,
+        newVersion,
+        beforeBody,
+        afterBody,
+        costEstimate: {
+          currentMeanTokens: beforeBody.length / 4,
+          estimatedMeanTokens: afterBody.length / 4,
+        },
+      });
+    });
+    if (!approved) throw new Error("optimize declined");
+    const archived = this.archivedVersions.get(skill) ?? [];
+    this.archivedVersions.set(skill, [currentVersion, ...archived]);
+    this.skillVersions.set(skill, newVersion);
+    this.emitSkillsChanged();
+    return newVersion;
+  }
+
+  async rollbackSkill(skill: string, version: string): Promise<void> {
+    const info = MOCK_SKILLS.find((s) => s.name === skill);
+    if (!info) throw new Error(`unknown skill: ${skill}`);
+    const archived = this.archivedVersions.get(skill) ?? [];
+    if (!archived.includes(version)) {
+      throw new Error(`version not found: ${version}`);
+    }
+    const current = this.skillVersions.get(skill) ?? info.version;
+    this.archivedVersions.set(skill, [
+      current,
+      ...archived.filter((v) => v !== version),
+    ]);
+    this.skillVersions.set(skill, version);
+    this.emitSkillsChanged();
+  }
+
+  async listSkillVersions(skill: string): Promise<string[]> {
+    return [...(this.archivedVersions.get(skill) ?? [])];
   }
 
   async listPhenotypes(): Promise<Phenotype[]> {

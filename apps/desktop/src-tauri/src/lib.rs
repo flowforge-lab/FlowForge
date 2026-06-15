@@ -2,6 +2,7 @@
 //! all business logic lives in the `ff-*` crates. Each handler deserializes,
 //! calls into a crate, and returns. Streaming responses go out as Tauri events.
 
+mod optimize;
 mod state;
 mod tools;
 mod web_search;
@@ -9,9 +10,10 @@ mod web_search;
 use async_trait::async_trait;
 use ff_agent::{run_turn, AgentEvent, Approver, CancelToken, ToolContext};
 use ff_core::events::{
-    ApprovalSafety, IntentionSignal, SkillActivated, SkillCompleted,
-    SkillInstallApprovalRequestEvent, SkillsChangedEvent, TokenEvent, ToolApprovalRequestEvent,
-    ToolAskRequestEvent, ToolCallEvent, ToolResultEvent, TurnDoneEvent, TurnErrorEvent,
+    ApprovalSafety, EvolveCostEstimate, IntentionSignal, SkillActivated, SkillCompleted,
+    SkillEvolveApprovalRequestEvent, SkillInstallApprovalRequestEvent, SkillsChangedEvent,
+    TokenEvent, ToolApprovalRequestEvent, ToolAskRequestEvent, ToolCallEvent, ToolResultEvent,
+    TurnDoneEvent, TurnErrorEvent,
 };
 use ff_core::{
     Message, Phenotype, ProviderConfig, ProviderKind, Role, SearchConfig, Session, Skill,
@@ -365,6 +367,8 @@ fn send_message(
             state.record_skill_completed(&ev);
             let _ = app.emit("skill:completed", ev);
         }
+        // Persist the turn's telemetry once, lock-free (addresses #77 nit 1).
+        state.persist_signals();
 
         state.take_cancel(&session_id);
     });
@@ -565,6 +569,141 @@ fn get_skill_telemetry(state: State<'_, Arc<AppState>>, skill: String) -> Option
     state.skill_telemetry(&skill)
 }
 
+/// A compact recent-transcript sample for an optimize prompt: the last `n` messages
+/// of the session, each as `role: content` with the body truncated. Current-session
+/// only for M3 (durable cross-session transcripts are deferred to M5).
+fn recent_transcript(state: &AppState, session_id: &str, n: usize) -> Vec<String> {
+    let messages = state.store.get_messages(session_id);
+    let start = messages.len().saturating_sub(n);
+    messages[start..]
+        .iter()
+        .map(|m| {
+            let role = match m.role {
+                Role::User => "user",
+                Role::Assistant => "assistant",
+                Role::System => "system",
+                Role::Tool => "tool",
+            };
+            let mut body = m.content.replace('\n', " ");
+            if body.chars().count() > 200 {
+                body = body.chars().take(200).collect::<String>() + "…";
+            }
+            format!("{role}: {body}")
+        })
+        .collect()
+}
+
+/// Manual skill optimize/evolve (M3.5, RFC 0001 §8). Gathers the skill body, its
+/// telemetry aggregate, and a recent-transcript sample; asks the model for a
+/// streamlined rewrite; then presents a before->after proposal with a cost estimate
+/// for approval. On approval the skill is version-bumped (previous version retained
+/// for rollback); on rejection nothing changes. Reuses the standalone-approval gate
+/// (keyed by `request_id`, answered via `respond_approval`), exactly like install.
+#[tauri::command]
+async fn optimize_skill(
+    state: State<'_, Arc<AppState>>,
+    app: tauri::AppHandle,
+    session_id: String,
+    skill: String,
+) -> CmdResult<String> {
+    // Snapshot the current body + version (reject an unknown skill before any model
+    // call), plus telemetry and a short transcript sample for context.
+    let (before_body, current_version) = {
+        let reg = state.skills_snapshot();
+        let s = reg
+            .get(&skill)
+            .ok_or_else(|| format!("unknown skill: {skill}"))?;
+        (s.body.clone(), s.manifest.version.clone())
+    };
+    let aggregate = state.skill_telemetry(&skill);
+    let transcript = recent_transcript(&state, &session_id, 6);
+
+    let (provider, default_model) = state.build_provider();
+    let model = state.active_model_override().unwrap_or(default_model);
+    let after_body = optimize::propose_rewrite(
+        provider.as_ref(),
+        &model,
+        &skill,
+        &before_body,
+        aggregate.as_ref(),
+        &transcript,
+    )
+    .await?;
+
+    let new_version = ff_skills::bump_patch(&current_version);
+    let (current_mean_tokens, estimated_mean_tokens) =
+        optimize::estimate_cost(aggregate.as_ref(), &before_body, &after_body);
+
+    // Standalone approval, same pattern as install_skill.
+    let request_id = Uuid::new_v4().to_string();
+    state.register_cancel(&request_id, CancelToken::new());
+    let rx = state.register_approval(&request_id, &request_id);
+    let _ = app.emit(
+        "skill:evolve-approval-request",
+        SkillEvolveApprovalRequestEvent {
+            request_id: request_id.clone(),
+            skill: skill.clone(),
+            current_version,
+            new_version,
+            before_body,
+            after_body: after_body.clone(),
+            cost_estimate: EvolveCostEstimate {
+                current_mean_tokens,
+                estimated_mean_tokens,
+            },
+        },
+    );
+    let approved = rx.await.unwrap_or(false);
+    state.take_cancel(&request_id);
+    if !approved {
+        return Err("optimize was not approved".to_string());
+    }
+
+    let skills_root = state.skills_root();
+    let history_root = state.skill_history_root();
+    let skill_name = skill.clone();
+    let applied = tokio::task::spawn_blocking(move || {
+        ff_skills::bump_skill(&skills_root, &history_root, &skill_name, &after_body)
+    })
+    .await
+    .map_err(|e| format!("optimize task failed: {e}"))?
+    .map_err(|e| e.to_string())?;
+
+    state.reload_skills();
+    emit_skills_changed(&app, &state);
+    Ok(applied)
+}
+
+/// Restore a retained previous version of a skill as the live version (RFC 0001 §8).
+/// The current live version is archived first, so a rollback is itself reversible.
+/// Emits `skills:changed`.
+#[tauri::command]
+async fn rollback_skill(
+    state: State<'_, Arc<AppState>>,
+    app: tauri::AppHandle,
+    skill: String,
+    version: String,
+) -> CmdResult<()> {
+    let skills_root = state.skills_root();
+    let history_root = state.skill_history_root();
+    tokio::task::spawn_blocking(move || {
+        ff_skills::rollback_skill(&skills_root, &history_root, &skill, &version)
+    })
+    .await
+    .map_err(|e| format!("rollback task failed: {e}"))?
+    .map_err(|e| e.to_string())?;
+    state.reload_skills();
+    emit_skills_changed(&app, &state);
+    Ok(())
+}
+
+/// Retained version names for a skill, newest-looking first. Empty when the skill
+/// has never been optimized (RFC 0001 §8). Backs the rollback picker.
+#[tauri::command]
+fn list_skill_versions(state: State<'_, Arc<AppState>>, skill: String) -> CmdResult<Vec<String>> {
+    ff_skills::list_skill_versions(&state.skill_history_root(), &skill).map_err(|e| e.to_string())
+}
+
 /// Add a skill to the global active set (its body is injected next turn). Errors on
 /// an unknown name. Emits `skills:changed`.
 #[tauri::command]
@@ -653,6 +792,9 @@ pub fn run() {
             list_skills,
             search_skills,
             get_skill_telemetry,
+            optimize_skill,
+            rollback_skill,
+            list_skill_versions,
             activate_skill,
             deactivate_skill,
             list_phenotypes,

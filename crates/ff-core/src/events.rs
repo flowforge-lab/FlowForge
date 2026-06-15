@@ -171,3 +171,37 @@ pub struct SkillCompleted {
     pub turns: u32,
     pub success: bool,
 }
+
+/// Rough cost projection shown alongside an optimize proposal (RFC 0001 §8). Both
+/// values use the same coarse token proxy as the telemetry substrate, so they are
+/// comparable to each other but approximate in absolute terms (real provider usage
+/// lands in M4). `estimatedMeanTokens` scales the current rolling mean by the body's
+/// size change; `0.0` when the skill has no telemetry yet.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "../../../apps/desktop/src/bindings/")]
+pub struct EvolveCostEstimate {
+    pub current_mean_tokens: f64,
+    pub estimated_mean_tokens: f64,
+}
+
+/// Backend -> frontend request to approve an optimize/evolve rewrite of a skill
+/// (M3.5, RFC 0001 §8). The model has proposed `after_body`; the frontend shows the
+/// before→after diff (it has both bodies) plus the cost estimate, and the user
+/// approves or rejects. Like a skill install, this is a standalone approval with no
+/// turn, so it is keyed by `request_id` and answered via the shared
+/// `respond_approval(request_id, request_id, approved)` command. On approval the
+/// skill is version-bumped to `new_version`, retaining the previous version for
+/// rollback — it is never silently overwritten.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "../../../apps/desktop/src/bindings/")]
+pub struct SkillEvolveApprovalRequestEvent {
+    pub request_id: String,
+    pub skill: String,
+    pub current_version: String,
+    pub new_version: String,
+    pub before_body: String,
+    pub after_body: String,
+    pub cost_estimate: EvolveCostEstimate,
+}

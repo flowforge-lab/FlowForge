@@ -26,3 +26,5 @@ export type { OutcomeSignal } from "./OutcomeSignal";
 export type { SkillActivated } from "./SkillActivated";
 export type { SkillCompleted } from "./SkillCompleted";
 export type { SkillAggregate } from "./SkillAggregate";
+export type { EvolveCostEstimate } from "./EvolveCostEstimate";
+export type { SkillEvolveApprovalRequestEvent } from "./SkillEvolveApprovalRequestEvent";
