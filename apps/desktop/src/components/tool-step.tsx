@@ -9,6 +9,8 @@ import {
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { formatArgs } from "@/lib/tool-args";
+import { parseTodo, todoSummary } from "@/lib/todo";
+import { TodoList } from "@/components/todo-list";
 import { Button } from "@/components/ui/button";
 import type { ToolStep } from "@/store/chat";
 import { useSplitStore } from "@/store/split";
@@ -51,10 +53,15 @@ export function ToolStepBlock({
 }) {
   const awaiting = step.status === "awaiting-approval";
   const [userToggled, setUserToggled] = useState(false);
+  // The `todo` tool renders its checklist from the call args (Issue #42). null =
+  // not a todo step → fall back to the generic args/result render.
+  const todoItems = step.tool === "todo" ? parseTodo(step.args) : null;
+  const summary = todoItems ? todoSummary(todoItems) : null;
   // Force-open whenever the user must act (covers both the mock's same-tick
   // call+approval and the real backend, where the step mounts as "running" and
-  // flips to awaiting later). Otherwise honor the user's manual toggle.
-  const open = awaiting || userToggled;
+  // flips to awaiting later). A todo plan is meant to be seen, so it defaults to
+  // open; other tools default to collapsed. Otherwise honor the manual toggle.
+  const open = awaiting || (todoItems !== null ? !userToggled : userToggled);
   const openInSplit = useSplitStore((s) => s.openInSplit);
   const args = formatArgs(step.args);
 
@@ -79,11 +86,23 @@ export function ToolStepBlock({
         <StatusIcon status={step.status} />
         <span className="font-medium text-foreground">{step.tool}</span>
         {awaiting && step.safety && <SafetyBadge safety={step.safety} />}
-        {!open && args !== "{}" && (
-          <span className="truncate text-muted-foreground/70">{args}</span>
-        )}
+        {!open &&
+          (summary ? (
+            <span className="text-muted-foreground/70">
+              {summary.completed}/{summary.total}
+            </span>
+          ) : (
+            args !== "{}" && (
+              <span className="truncate text-muted-foreground/70">{args}</span>
+            )
+          ))}
       </button>
-      {open && (
+      {open && todoItems !== null && (
+        <div className="border-t px-2.5 py-2">
+          <TodoList items={todoItems} />
+        </div>
+      )}
+      {open && todoItems === null && (
         <div className="space-y-2 border-t px-2.5 py-2">
           <div>
             <div className="mb-0.5 text-[10px] uppercase tracking-wide text-muted-foreground/60">
