@@ -1,0 +1,26 @@
+[package]
+name = "ff-cli"
+version = "0.1.0"
+description = "FlowForge headless CLI"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "flowforge"
+path = "src/main.rs"
+
+[dependencies]
+ff-core = { workspace = true }
+ff-agent = { workspace = true }
+ff-llm = { workspace = true }
+ff-memory = { workspace = true }
+ff-skills = { workspace = true }
+ff-tools = { workspace = true }
+
+clap = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+serde_json = { workspace = true }
+dirs = { workspace = true }

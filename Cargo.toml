@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/*", "apps/desktop/src-tauri"]
+members = ["crates/*", "apps/desktop/src-tauri", "apps/cli"]
 
 [workspace.package]
 edition = "2021"
@@ -30,6 +30,8 @@ fast_html2md = "0.0.62"
 tempfile = "3"
 toml = "0.8"
 wiremock = "0.6"
+clap = { version = "4", features = ["derive"] }
+dirs = "5"
 
 ff-core = { path = "crates/ff-core" }
 ff-agent = { path = "crates/ff-agent" }
