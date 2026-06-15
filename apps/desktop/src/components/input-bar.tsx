@@ -18,12 +18,14 @@ const WARMUP_THROTTLE_MS = 5_000;
 
 export function InputBar() {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const boxRef = useRef<HTMLDivElement>(null);
 
   // Composer text lives in a shared store so "edit & resend" (Issue #18) can
   // prefill it from a message row without prop-drilling.
   const value = useComposerStore((s) => s.text);
   const setText = useComposerStore((s) => s.setText);
   const focusNonce = useComposerStore((s) => s.focusNonce);
+  const rejectNonce = useComposerStore((s) => s.rejectNonce);
 
   const activeSessionId = useChatStore((s) => s.activeSessionId);
   const streaming = useChatStore((s) =>
@@ -63,6 +65,24 @@ export function InputBar() {
     el.setSelectionRange(el.value.length, el.value.length);
   }, [focusNonce, autoGrow]);
 
+  // A refused prefill (#48) kept an in-progress draft instead of clobbering it —
+  // shake the composer and refocus so the action isn't silently ignored. DOM
+  // only, no state set in the effect. (rejectNonce starts at 0; skip that.)
+  useEffect(() => {
+    if (rejectNonce === 0) return;
+    boxRef.current?.animate(
+      [
+        { transform: "translateX(0)" },
+        { transform: "translateX(-4px)" },
+        { transform: "translateX(4px)" },
+        { transform: "translateX(-3px)" },
+        { transform: "translateX(0)" },
+      ],
+      { duration: 350, easing: "ease-in-out" },
+    );
+    textareaRef.current?.focus();
+  }, [rejectNonce]);
+
   function submit() {
     const content = value.trim();
     if (!content || streaming || !activeSessionId) return;
@@ -74,7 +94,10 @@ export function InputBar() {
 
   return (
     <div className="px-4 pb-4 pt-2">
-      <div className="mx-auto flex max-w-3xl items-end gap-1.5 rounded-xl border bg-card p-1.5 shadow-sm transition-all focus-within:border-ring focus-within:shadow-md focus-within:ring-2 focus-within:ring-ring/25">
+      <div
+        ref={boxRef}
+        className="mx-auto flex max-w-3xl items-end gap-1.5 rounded-xl border bg-card p-1.5 shadow-sm transition-all focus-within:border-ring focus-within:shadow-md focus-within:ring-2 focus-within:ring-ring/25"
+      >
         <textarea
           ref={textareaRef}
           data-composer
