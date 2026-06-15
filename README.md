@@ -145,8 +145,8 @@ cargo tauri build
 - [x] Repository bootstrap & architecture definition
 - [x] **M1** — Tauri 2 shell + React chat UI + first LLM call (candle-vllm)
 - [x] **M2** — Tool calling (bash, view, edit) + streaming render + interactive approval
-- [ ] **M3** — Skills + phenotypes + command palette
-- [ ] **M4** — MCP supervisor with health UI
+- [x] **M3** — Skills + phenotypes + command palette
+- [ ] **M4** — MCP host & supervisor — external tool servers (stdio/SSE), lifecycle + server-status UI
 - [ ] **M5** — Memory system (SQLite + vector recall)
 - [ ] **M6** — Cold-start optimization (<200ms)
 - [ ] **M7** — Workflow canvas (visual multi-agent DAGs)
