@@ -1,5 +1,5 @@
 //! Built-in tools the agent can call: `bash`, `view`, `edit`, `write`, `grep`,
-//! `glob`, `tree`, `todo`.
+//! `glob`, `tree`, `todo`, `web_fetch`.
 //!
 //! File tools ([`view`], [`edit`], [`write`]) are hard-jailed to a per-session workspace root
 //! via [`jail::resolve_in_root`]. `bash` runs in that root as its working directory
@@ -8,16 +8,23 @@
 //!
 //! Search/discovery tools ([`grep`], [`glob`], [`tree`]) are read-only and jailed
 //! to the same root; [`todo`] is a stateless planning checklist (full-replace).
+//!
+//! [`web_fetch`] reaches the network: it is `Safety::Write` (approval-gated) and
+//! guarded against SSRF (internal/loopback/cloud-metadata targets) by
+//! [`url_safety::SsrfPolicy`].
 
 mod bash;
 mod edit;
 mod glob;
 mod grep;
+mod html_text;
 mod jail;
 mod registry;
 mod todo;
 mod tree;
+mod url_safety;
 mod view;
+mod web_fetch;
 mod write;
 
 pub use registry::{Safety, Tool, ToolOutcome, ToolRegistry};

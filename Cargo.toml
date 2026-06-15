@@ -25,8 +25,11 @@ grep-searcher = "0.1"
 ignore = "0.4"
 globset = "0.4"
 reqwest = { version = "0.12", default-features = false }
+url = "2"
+fast_html2md = "0.0.62"
 tempfile = "3"
 toml = "0.8"
+wiremock = "0.6"
 
 ff-core = { path = "crates/ff-core" }
 ff-agent = { path = "crates/ff-agent" }
