@@ -1242,6 +1242,7 @@ dependencies = [
  "ff-signals",
  "ff-skills",
  "ff-tools",
+ "reqwest 0.12.28",
  "serde",
  "serde_json",
  "tauri",
@@ -1250,7 +1251,9 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+ "url",
  "uuid",
+ "wiremock",
 ]
 
 [[package]]

@@ -8,6 +8,8 @@ import type {
   Message,
   ProviderConfig,
   ProviderKind,
+  SearchConfig,
+  SearchBackend,
   Session,
   TokenEvent,
   TurnDoneEvent,
@@ -56,6 +58,16 @@ export interface FfIpc {
   ): Promise<ProviderConfig>;
   /** Best-effort model ids for the configured endpoint; `[]` when unreachable. */
   listModels(): Promise<string[]>;
+
+  // Web search (Issue #43). SearXNG is wired keyless; hosted backends are gated
+  // until key storage (#8). Secrets are never part of this contract.
+  /** Current persisted web-search settings. */
+  getSearchConfig(): Promise<SearchConfig>;
+  /** Persist web-search settings; resolves with the stored config (e.g. `hasKey`). */
+  setSearchConfig(
+    backend: SearchBackend,
+    baseUrl: string | undefined,
+  ): Promise<SearchConfig>;
   /** Best-effort nudge to wake the model server before the first turn. Never throws meaningfully. */
   warmup(): Promise<void>;
 
@@ -161,6 +173,10 @@ class TauriIpc implements FfIpc {
       model,
     });
   listModels = () => this.invoke<string[]>("list_models");
+
+  getSearchConfig = () => this.invoke<SearchConfig>("get_search_config");
+  setSearchConfig = (backend: SearchBackend, baseUrl: string | undefined) =>
+    this.invoke<SearchConfig>("set_search_config", { backend, baseUrl });
   warmup = () => this.invoke<void>("warmup");
 
   listSkills = () => this.invoke<SkillInfo[]>("list_skills");
