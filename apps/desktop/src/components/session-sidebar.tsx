@@ -1,10 +1,12 @@
 import { useRef, useState } from "react";
-import { Moon, Pencil, Plus, Search, Sun, X } from "lucide-react";
+import { Moon, Pencil, Plus, Search, Settings, Sun, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Separator } from "@/components/ui/separator";
 import { cn } from "@/lib/utils";
-import { useTheme } from "@/lib/theme";
+import { resolveEffectiveTheme } from "@/lib/theme";
+import { useTheme } from "@/store/prefs";
+import { useSettingsStore } from "@/store/settings";
 import { useChatStore } from "@/store/chat";
 import { filterSessions, resolveLabel } from "@/lib/sessions";
 import type { Session } from "@/bindings";
@@ -138,6 +140,8 @@ export function SessionSidebar() {
   const newSession = useChatStore((s) => s.newSession);
   const theme = useTheme((s) => s.theme);
   const toggleTheme = useTheme((s) => s.toggleTheme);
+  const openSettings = useSettingsStore((s) => s.openSettings);
+  const effectiveTheme = resolveEffectiveTheme(theme);
 
   const [filter, setFilter] = useState("");
   const filterRef = useRef<HTMLInputElement>(null);
@@ -159,16 +163,25 @@ export function SessionSidebar() {
             className="size-7 text-muted-foreground hover:text-foreground"
             onClick={toggleTheme}
             title={
-              theme === "light"
+              effectiveTheme === "light"
                 ? "Switch to dark theme"
                 : "Switch to light theme"
             }
           >
-            {theme === "light" ? (
+            {effectiveTheme === "light" ? (
               <Moon className="size-4" />
             ) : (
               <Sun className="size-4" />
             )}
+          </Button>
+          <Button
+            variant="ghost"
+            size="icon"
+            className="size-7 text-muted-foreground hover:text-foreground"
+            onClick={openSettings}
+            title="Settings"
+          >
+            <Settings className="size-4" />
           </Button>
           <Button
             variant="ghost"
