@@ -8,6 +8,7 @@
 mod error;
 mod install;
 mod parse;
+mod phenotype;
 mod registry;
 mod search;
 mod watch;
@@ -17,6 +18,7 @@ pub use install::{
     commit_install, install, prepare_install, uninstall, InstallError, StagedInstall,
 };
 pub use parse::parse_skill;
+pub use phenotype::{default_phenotype, load_phenotypes, PhenotypeError, DEFAULT_PHENOTYPE};
 pub use registry::{first_executable, first_executable_recursive, SkillRegistry};
 pub use search::{search_skills, SkillHit};
 pub use watch::{SharedRegistry, SkillWatcher};

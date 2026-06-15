@@ -18,6 +18,7 @@ import type {
   ToolResultEvent,
   SkillInfo,
   SkillsChangedEvent,
+  Phenotype,
 } from "../bindings";
 import type { FfIpc, Unlisten } from "./ipc";
 import { autoTitle } from "./auto-title";
@@ -95,6 +96,23 @@ function scoreSkill(skill: SkillInfo, q: string): number {
   return 0;
 }
 
+// The built-in phenotype: no skills, no overrides (RFC 0001 §7). Always present.
+const DEFAULT_PHENOTYPE: Phenotype = { name: "default", skills: [] };
+
+// Canned phenotypes so the `pheno` palette (#28) is exercisable offline. `default`
+// is prepended by `listPhenotypes`, matching the backend.
+const MOCK_PHENOTYPES: Phenotype[] = [
+  {
+    name: "rust",
+    skills: ["rust-debugging", "write-tests"],
+    persona: "You are a meticulous Rust engineer.",
+  },
+  {
+    name: "reviewer",
+    skills: ["create-pr"],
+  },
+];
+
 interface ActiveTurn {
   // All pending interval/timeout handles for this turn, cleared on cancel.
   timers: ReturnType<typeof setInterval>[];
@@ -140,6 +158,7 @@ export class MockIpc implements FfIpc {
   private pendingApprovals = new Map<string, (approved: boolean) => void>();
   private skillsChangedListeners = new Set<Listener<SkillsChangedEvent>>();
   private activeSkills = new Set<string>();
+  private activePhenotype: Phenotype = DEFAULT_PHENOTYPE;
 
   async createSession(goal?: string): Promise<Session> {
     const ts = now();
@@ -311,6 +330,30 @@ export class MockIpc implements FfIpc {
   async deactivateSkill(name: string): Promise<void> {
     this.activeSkills.delete(name);
     this.emitSkillsChanged();
+  }
+
+  async listPhenotypes(): Promise<Phenotype[]> {
+    return [DEFAULT_PHENOTYPE, ...MOCK_PHENOTYPES];
+  }
+
+  async getPhenotype(): Promise<Phenotype> {
+    return this.activePhenotype;
+  }
+
+  async switchPhenotype(name: string): Promise<Phenotype> {
+    const pheno =
+      name === DEFAULT_PHENOTYPE.name
+        ? DEFAULT_PHENOTYPE
+        : MOCK_PHENOTYPES.find((p) => p.name === name);
+    if (!pheno) throw new Error(`unknown phenotype: ${name}`);
+    // Replace the active set with the phenotype's installed skills (dropping any
+    // that aren't installed), mirroring the backend.
+    this.activeSkills = new Set(
+      pheno.skills.filter((n) => MOCK_SKILLS.some((s) => s.name === n)),
+    );
+    this.activePhenotype = pheno;
+    this.emitSkillsChanged();
+    return pheno;
   }
 
   // --- internals ---

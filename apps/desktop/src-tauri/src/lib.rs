@@ -13,7 +13,8 @@ use ff_core::events::{
     TurnErrorEvent,
 };
 use ff_core::{
-    Message, ProviderConfig, ProviderKind, Role, Session, Skill, SkillInfo, SkillManifest,
+    Message, Phenotype, ProviderConfig, ProviderKind, Role, Session, Skill, SkillInfo,
+    SkillManifest,
 };
 use ff_tools::Safety;
 use state::AppState;
@@ -141,7 +142,10 @@ fn send_message(
     let state = state.inner().clone();
     // Snapshot the provider from the current config for this turn; a settings
     // change between turns is picked up on the next `send_message`.
-    let (provider, model) = state.build_provider();
+    let (provider, default_model) = state.build_provider();
+    // The active phenotype may override the model and prepend a persona (RFC 0001 §7).
+    let model = state.active_model_override().unwrap_or(default_model);
+    let persona = state.active_persona();
     tauri::async_runtime::spawn(async move {
         let sid = session_id.clone();
         let approver = UiApprover {
@@ -155,13 +159,14 @@ fn send_message(
             approve: &approver,
             max_iterations: 8,
         };
-        // Skills + ambient context for this turn (RFC 0001 §4, RFC 0002 phase 1).
-        // Phenotype selection (persona + active skill bodies) lands in M3.4; for now
-        // we inject installed-skill descriptions and the current local time only.
+        // Skills + ambient context for this turn (RFC 0001 §4, RFC 0002 phase 1):
+        // the active phenotype's persona, installed-skill descriptions, the bodies of
+        // active skills, and the current local time.
         let skills = state.skills_snapshot();
         let user_ctx = ff_agent::UserContext::now();
         let active = state.active_skills();
-        let system_prompt = ff_agent::build_system_prompt(None, &skills, &active, &user_ctx);
+        let system_prompt =
+            ff_agent::build_system_prompt(persona.as_deref(), &skills, &active, &user_ctx);
 
         let result = run_turn(
             provider.as_ref(),
@@ -447,6 +452,34 @@ fn uninstall_skill(
     Ok(())
 }
 
+/// All selectable phenotypes (built-in `default` + `~/.flowforge/phenotypes/`),
+/// name-sorted. Backs the `pheno` command palette.
+#[tauri::command]
+fn list_phenotypes(state: State<'_, Arc<AppState>>) -> Vec<Phenotype> {
+    state.list_phenotypes()
+}
+
+/// The active phenotype.
+#[tauri::command]
+fn get_phenotype(state: State<'_, Arc<AppState>>) -> Phenotype {
+    state.active_phenotype()
+}
+
+/// Switch the active phenotype: replaces the active-skill set with the phenotype's
+/// skills and persists the choice across restarts (RFC 0001 §7). Errors on an unknown
+/// name. Emits `skills:changed` so the FE active set updates. Returns the phenotype now
+/// active.
+#[tauri::command]
+fn switch_phenotype(
+    state: State<'_, Arc<AppState>>,
+    app: tauri::AppHandle,
+    name: String,
+) -> CmdResult<Phenotype> {
+    let pheno = state.switch_phenotype(&name)?;
+    emit_skills_changed(&app, &state);
+    Ok(pheno)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -470,6 +503,9 @@ pub fn run() {
             search_skills,
             activate_skill,
             deactivate_skill,
+            list_phenotypes,
+            get_phenotype,
+            switch_phenotype,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
