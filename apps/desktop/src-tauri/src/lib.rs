@@ -8,19 +8,41 @@ mod tools;
 use async_trait::async_trait;
 use ff_agent::{run_turn, AgentEvent, Approver, CancelToken, ToolContext};
 use ff_core::events::{
-    ApprovalSafety, IntentionSignal, SkillInstallApprovalRequestEvent, SkillsChangedEvent,
-    TokenEvent, ToolApprovalRequestEvent, ToolAskRequestEvent, ToolCallEvent, ToolResultEvent,
-    TurnDoneEvent, TurnErrorEvent,
+    ApprovalSafety, IntentionSignal, SkillActivated, SkillCompleted,
+    SkillInstallApprovalRequestEvent, SkillsChangedEvent, TokenEvent, ToolApprovalRequestEvent,
+    ToolAskRequestEvent, ToolCallEvent, ToolResultEvent, TurnDoneEvent, TurnErrorEvent,
 };
 use ff_core::{
     Message, Phenotype, ProviderConfig, ProviderKind, Role, Session, Skill, SkillInfo,
     SkillManifest,
 };
+use ff_signals::SkillAggregate;
 use ff_tools::Safety;
 use state::AppState;
 use std::sync::Arc;
 use tauri::{Emitter, State};
 use uuid::Uuid;
+
+/// Per-turn telemetry accumulator (RFC 0001 §8), filled by the agent-event closure
+/// and folded into per-skill aggregates when the turn ends. `message_ids` counts
+/// distinct assistant messages — one per agent loop iteration, i.e. the turn count;
+/// `chars` is the total streamed assistant text used as a coarse token-cost proxy.
+#[derive(Default)]
+struct TurnMetrics {
+    chars: usize,
+    message_ids: std::collections::HashSet<String>,
+}
+
+impl TurnMetrics {
+    fn note_turn(&mut self, message_id: &str) {
+        self.message_ids.insert(message_id.to_string());
+    }
+
+    /// `(streamed assistant chars, distinct turn count)`.
+    fn snapshot(&self) -> (usize, usize) {
+        (self.chars, self.message_ids.len())
+    }
+}
 
 /// Routes write/dangerous tool calls through a UI confirmation. Read-only calls
 /// never reach this approver — the agent loop short-circuits them.
@@ -176,6 +198,9 @@ fn send_message(
 
     let cancel = CancelToken::new();
     state.register_cancel(&session_id, cancel.clone());
+    // A clone kept by the host so the post-turn telemetry can tell a clean finish
+    // from a user cancel (the original is moved into `run_turn`).
+    let cancel_probe = cancel.clone();
 
     let state = state.inner().clone();
     // Snapshot the provider from the current config for this turn; a settings
@@ -206,6 +231,24 @@ fn send_message(
         let system_prompt =
             ff_agent::build_system_prompt(persona.as_deref(), &skills, &active, &user_ctx);
 
+        // Telemetry (RFC 0001 §8): one SkillActivated per active skill, plus a
+        // wall-clock start and a per-turn metrics accumulator the event closure
+        // folds into. `turns` = distinct assistant message ids (one per loop
+        // iteration); `tokens` = a coarse char/4 proxy over streamed assistant text.
+        for skill in &active {
+            state.record_skill_activated(skill);
+            let _ = app.emit(
+                "skill:activated",
+                SkillActivated {
+                    skill: skill.clone(),
+                    session_id: sid.clone(),
+                },
+            );
+        }
+        let turn_start = std::time::Instant::now();
+        let metrics = std::sync::Arc::new(std::sync::Mutex::new(TurnMetrics::default()));
+        let metrics_for_events = metrics.clone();
+
         let result = run_turn(
             provider.as_ref(),
             &state.store,
@@ -216,6 +259,10 @@ fn send_message(
             cancel,
             |event| match event {
                 AgentEvent::Token { message_id, delta } => {
+                    if let Ok(mut m) = metrics_for_events.lock() {
+                        m.note_turn(&message_id);
+                        m.chars += delta.chars().count();
+                    }
                     let _ = app.emit(
                         "turn:token",
                         TokenEvent {
@@ -231,6 +278,9 @@ fn send_message(
                     name,
                     args,
                 } => {
+                    if let Ok(mut m) = metrics_for_events.lock() {
+                        m.note_turn(&message_id);
+                    }
                     let _ = app.emit(
                         "tool:call",
                         ToolCallEvent {
@@ -260,6 +310,9 @@ fn send_message(
                     );
                 }
                 AgentEvent::Done { message_id } => {
+                    if let Ok(mut m) = metrics_for_events.lock() {
+                        m.note_turn(&message_id);
+                    }
                     let _ = app.emit(
                         "turn:done",
                         TurnDoneEvent {
@@ -281,7 +334,7 @@ fn send_message(
         )
         .await;
 
-        if let Err(e) = result {
+        if let Err(ref e) = result {
             let _ = app.emit(
                 "turn:error",
                 TurnErrorEvent {
@@ -290,6 +343,28 @@ fn send_message(
                 },
             );
         }
+
+        // Telemetry (RFC 0001 §8): fold this turn's metrics into each active skill's
+        // aggregate and emit a SkillCompleted per skill. Success = a clean finish
+        // (run_turn returned Ok and the turn was not cancelled).
+        let m = metrics.lock().map(|m| m.snapshot()).unwrap_or_default();
+        let success = result.is_ok() && !cancel_probe.is_cancelled();
+        let latency_ms = u32::try_from(turn_start.elapsed().as_millis()).unwrap_or(u32::MAX);
+        let tokens = u32::try_from(m.0 / 4).unwrap_or(u32::MAX);
+        let turns = u32::try_from(m.1).unwrap_or(u32::MAX);
+        for skill in &active {
+            let ev = SkillCompleted {
+                skill: skill.clone(),
+                session_id: sid.clone(),
+                tokens,
+                latency_ms,
+                turns,
+                success,
+            };
+            state.record_skill_completed(&ev);
+            let _ = app.emit("skill:completed", ev);
+        }
+
         state.take_cancel(&session_id);
     });
 
@@ -455,6 +530,14 @@ fn search_skills(state: State<'_, Arc<AppState>>, query: String) -> Vec<SkillInf
         .collect()
 }
 
+/// Per-skill telemetry aggregate (RFC 0001 §8): activation/completion counts, mean
+/// token cost, mean turns, mean latency, and success rate. `None` when the skill has
+/// no recorded signals yet. Backs the optimize flow's before/after cost estimate.
+#[tauri::command]
+fn get_skill_telemetry(state: State<'_, Arc<AppState>>, skill: String) -> Option<SkillAggregate> {
+    state.skill_telemetry(&skill)
+}
+
 /// Add a skill to the global active set (its body is injected next turn). Errors on
 /// an unknown name. Emits `skills:changed`.
 #[tauri::command]
@@ -540,6 +623,7 @@ pub fn run() {
             uninstall_skill,
             list_skills,
             search_skills,
+            get_skill_telemetry,
             activate_skill,
             deactivate_skill,
             list_phenotypes,

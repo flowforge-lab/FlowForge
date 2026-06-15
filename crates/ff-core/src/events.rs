@@ -140,3 +140,34 @@ pub struct SkillInstallApprovalRequestEvent {
 pub struct SkillsChangedEvent {
     pub active: Vec<String>,
 }
+
+/// Backend -> frontend telemetry: a skill became active for a turn (M3.5, RFC 0001
+/// §8). Emitted once per active skill at the start of each agent turn. `ff-signals`
+/// folds these into per-skill aggregates (activation counts); the frontend may also
+/// surface live activity. Pairs with [`SkillCompleted`] at turn end.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "../../../apps/desktop/src/bindings/")]
+pub struct SkillActivated {
+    pub skill: String,
+    pub session_id: String,
+}
+
+/// Backend -> frontend telemetry: a turn that had `skill` active finished (M3.5, RFC
+/// 0001 §8). Emitted once per active skill when the turn ends. `tokens` is a coarse
+/// cost proxy (streamed assistant characters / 4) until real provider usage is wired
+/// (deferred with the M4 autonomous trigger); `turns` counts agent loop iterations;
+/// `latency_ms` is wall-clock turn duration; `success` is true when the turn ended
+/// cleanly (not error/cancel). `ff-signals` folds these into rolling per-skill
+/// aggregates (mean tokens/turns, success rate).
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "../../../apps/desktop/src/bindings/")]
+pub struct SkillCompleted {
+    pub skill: String,
+    pub session_id: String,
+    pub tokens: u32,
+    pub latency_ms: u32,
+    pub turns: u32,
+    pub success: bool,
+}

@@ -18,6 +18,7 @@ import type {
   ToolCallEvent,
   ToolResultEvent,
   SkillInfo,
+  SkillAggregate,
   SkillsChangedEvent,
   Phenotype,
 } from "../bindings";
@@ -353,6 +354,26 @@ export class MockIpc implements FfIpc {
   async deactivateSkill(name: string): Promise<void> {
     this.activeSkills.delete(name);
     this.emitSkillsChanged();
+  }
+
+  // Telemetry (RFC 0001 §8). The mock returns a deterministic canned aggregate for
+  // any installed skill (derived from the name so it's stable across calls) and null
+  // for an unknown skill — mirroring the backend's `Option<SkillAggregate>`.
+  async getSkillTelemetry(skill: string): Promise<SkillAggregate | null> {
+    if (!MOCK_SKILLS.some((s) => s.name === skill)) return null;
+    const seed = skill.length;
+    const completions = seed;
+    const successes = Math.max(1, seed - 1);
+    return {
+      skill,
+      activations: seed + 1,
+      completions,
+      successes,
+      meanTokens: seed * 100,
+      meanTurns: 2,
+      meanLatencyMs: seed * 250,
+      successRate: successes / completions,
+    };
   }
 
   async listPhenotypes(): Promise<Phenotype[]> {

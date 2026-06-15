@@ -18,6 +18,7 @@ import type {
   ToolCallEvent,
   ToolResultEvent,
   SkillInfo,
+  SkillAggregate,
   SkillsChangedEvent,
   Phenotype,
 } from "../bindings";
@@ -68,6 +69,8 @@ export interface FfIpc {
   activateSkill(name: string): Promise<void>;
   /** Remove a skill from the active set. Idempotent. */
   deactivateSkill(name: string): Promise<void>;
+  /** Per-skill telemetry aggregate (RFC 0001 §8), or null if none recorded yet. */
+  getSkillTelemetry(skill: string): Promise<SkillAggregate | null>;
 
   // Phenotypes (Issue #28). Named, switchable working sets (RFC 0001 §7).
   /** All selectable phenotypes (built-in `default` + `~/.flowforge/phenotypes/`), name-sorted. */
@@ -170,6 +173,8 @@ class TauriIpc implements FfIpc {
     this.invoke<void>("activate_skill", { name });
   deactivateSkill = (name: string) =>
     this.invoke<void>("deactivate_skill", { name });
+  getSkillTelemetry = (skill: string) =>
+    this.invoke<SkillAggregate | null>("get_skill_telemetry", { skill });
 
   listPhenotypes = () => this.invoke<Phenotype[]>("list_phenotypes");
   getPhenotype = () => this.invoke<Phenotype>("get_phenotype");

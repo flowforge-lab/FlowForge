@@ -7,6 +7,7 @@ use ff_agent::CancelToken;
 use ff_core::{Phenotype, ProviderConfig, ProviderKind};
 use ff_llm::{OllamaProvider, OpenAiProvider, Provider};
 use ff_memory::MemoryStore;
+use ff_signals::{SignalStore, SkillAggregate, SkillCompleted};
 use ff_skills::{
     default_phenotype, load_phenotypes, SharedRegistry, SkillRegistry, SkillWatcher,
     DEFAULT_PHENOTYPE,
@@ -160,6 +161,10 @@ pub struct AppState {
     /// The active phenotype, resolved at startup from the persisted pointer (RFC
     /// 0001 §7). Supplies the model and persona overrides for each turn.
     active_phenotype: Mutex<Phenotype>,
+    /// Per-skill telemetry aggregates (RFC 0001 §8), persisted to
+    /// `~/.flowforge/skill_signals.json`. Updated at each turn's start/end; read by
+    /// the manual optimize flow's cost estimates.
+    signals: Mutex<SignalStore>,
 }
 
 impl AppState {
@@ -193,6 +198,7 @@ impl AppState {
             approvals: Mutex::new(ApprovalRegistry::default()),
             active_skills: Mutex::new(BTreeSet::new()),
             active_phenotype: Mutex::new(default_phenotype()),
+            signals: Mutex::new(load_signals()),
         };
         // Restore the persisted phenotype so its active skills survive a restart.
         // An unknown/missing pointer falls back to the built-in default.
@@ -278,6 +284,21 @@ impl AppState {
     /// The active skill names, name-sorted (BTreeSet order).
     pub fn active_skills(&self) -> Vec<String> {
         self.active_skills.lock().unwrap().iter().cloned().collect()
+    }
+
+    /// Record that `skill` was active at the start of a turn (RFC 0001 §8).
+    pub fn record_skill_activated(&self, skill: &str) {
+        self.signals.lock().unwrap().record_activated(skill);
+    }
+
+    /// Fold a finished turn's metrics into `skill`'s aggregate (RFC 0001 §8).
+    pub fn record_skill_completed(&self, ev: &SkillCompleted) {
+        self.signals.lock().unwrap().record_completed(ev);
+    }
+
+    /// The telemetry aggregate for one skill, if any signals have been recorded.
+    pub fn skill_telemetry(&self, skill: &str) -> Option<SkillAggregate> {
+        self.signals.lock().unwrap().aggregate(skill)
     }
 
     /// Add a skill to the active set. Errors if no installed skill has this name
@@ -429,6 +450,22 @@ fn skills_root() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".flowforge")
         .join("skills")
+}
+
+/// `~/.flowforge/skill_signals.json`, the per-skill telemetry aggregate store (RFC
+/// 0001 §8). Lives under `~/.flowforge/` with the skills it describes, not the
+/// platform config dir (that's for user *settings* like the provider/phenotype).
+fn signals_path() -> Option<PathBuf> {
+    dirs::home_dir().map(|d| d.join(".flowforge").join("skill_signals.json"))
+}
+
+/// Load the persisted telemetry aggregates, or an in-memory-only store when there is
+/// no home dir. Best-effort: a missing/corrupt file starts empty.
+fn load_signals() -> SignalStore {
+    match signals_path() {
+        Some(path) => SignalStore::load(path),
+        None => SignalStore::new(),
+    }
 }
 
 /// Start the skill watcher, falling back to a one-shot load (no hot-reload) if the

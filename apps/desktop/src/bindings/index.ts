@@ -21,3 +21,6 @@ export type { IntentionSignal } from "./IntentionSignal";
 export type { SkillInstallApprovalRequestEvent } from "./SkillInstallApprovalRequestEvent";
 export type { SkillsChangedEvent } from "./SkillsChangedEvent";
 export type { OutcomeSignal } from "./OutcomeSignal";
+export type { SkillActivated } from "./SkillActivated";
+export type { SkillCompleted } from "./SkillCompleted";
+export type { SkillAggregate } from "./SkillAggregate";
