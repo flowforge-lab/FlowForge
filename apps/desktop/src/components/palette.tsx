@@ -6,23 +6,34 @@ import {
   type ComponentType,
 } from "react";
 import {
+  CircleOff,
   CornerDownLeft,
+  Layers,
   MessageSquare,
   PanelRight,
   Plus,
   Search,
+  Sparkles,
   TextCursorInput,
   WrapText,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { ipc } from "@/lib/ipc";
+import type { SkillInfo } from "@/bindings";
 import { useChatStore } from "@/store/chat";
 import { useSplitStore } from "@/store/split";
+import { useSkillsStore } from "@/store/skills";
 import {
   usePaletteStore,
   type PaletteCommand,
   type PaletteCommandKind,
 } from "@/store/palette";
-import { buildCommands, filterCommands } from "@/lib/palette";
+import {
+  buildCommands,
+  buildPhenotypeCommands,
+  buildSkillCommands,
+  mergePaletteResults,
+} from "@/lib/palette";
 
 // ── Icons ─────────────────────────────────────────────────────────────────────
 // Kept out of store/palette.ts (which stays pure data). Exhaustive by type: a new
@@ -36,12 +47,15 @@ const ICONS: Record<
   "toggle-split": PanelRight,
   "toggle-wrap": WrapText,
   "focus-composer": TextCursorInput,
+  "activate-skill": Sparkles,
+  "deactivate-skill": CircleOff,
+  "switch-phenotype": Layers,
 };
 
 // ── Command execution ─────────────────────────────────────────────────────────
 // The exhaustive switch the issue calls for: adding a PaletteCommand kind without
 // a matching arm is a compile error (the never-guard finds you). Each arm reuses
-// an existing store action — the palette owns no state of its own beyond open.
+// an existing store action — skill/phenotype arms call ipc (#27 / #28).
 
 function focusComposer(): void {
   // Defer a frame so the overlay has unmounted before focus moves to the textarea.
@@ -66,6 +80,16 @@ function runCommand(cmd: PaletteCommand): void {
       return;
     case "focus-composer":
       focusComposer();
+      return;
+    case "activate-skill":
+      void ipc.activateSkill(cmd.name);
+      return;
+    case "deactivate-skill":
+      void ipc.deactivateSkill(cmd.name);
+      return;
+    case "switch-phenotype":
+      // skills:changed from the backend triggers refresh via events.ts.
+      void ipc.switchPhenotype(cmd.name);
       return;
     default: {
       // Exhaustiveness guard: a new PaletteCommand kind without a case above
@@ -95,18 +119,49 @@ function PaletteBody() {
   const activeSessionId = useChatStore((s) => s.activeSessionId);
   const sessionTitles = useChatStore((s) => s.sessionTitles);
 
+  const phenotypes = useSkillsStore((s) => s.phenotypes);
+  const activePhenotype = useSkillsStore((s) => s.activePhenotype);
+  const refreshSkills = useSkillsStore((s) => s.refresh);
+  const searchSkills = useSkillsStore((s) => s.search);
+
   const [query, setQuery] = useState("");
   const [selected, setSelected] = useState(0);
+  const [skillHits, setSkillHits] = useState<SkillInfo[]>([]);
   const inputRef = useRef<HTMLInputElement>(null);
   const listRef = useRef<HTMLDivElement>(null);
 
-  const commands = useMemo(
-    () => buildCommands({ sessions, activeSessionId, sessionTitles }),
-    [sessions, activeSessionId, sessionTitles],
+  // Refresh installed skills + phenotypes each time the palette opens.
+  useEffect(() => {
+    void refreshSkills();
+  }, [refreshSkills]);
+
+  // Rank skill hits via the backend search contract (#27).
+  useEffect(() => {
+    let cancelled = false;
+    void searchSkills(query.trim()).then((hits) => {
+      if (!cancelled) setSkillHits(hits);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [query, searchSkills]);
+
+  const staticCommands = useMemo(
+    () => [
+      ...buildCommands({ sessions, activeSessionId, sessionTitles }),
+      ...buildPhenotypeCommands({ phenotypes, activePhenotype }),
+    ],
+    [sessions, activeSessionId, sessionTitles, phenotypes, activePhenotype],
   );
+
+  const skillCommands = useMemo(
+    () => buildSkillCommands(skillHits),
+    [skillHits],
+  );
+
   const results = useMemo(
-    () => filterCommands(commands, query, recent),
-    [commands, query, recent],
+    () => mergePaletteResults(staticCommands, skillCommands, query, recent),
+    [staticCommands, skillCommands, query, recent],
   );
 
   // Clamp at read time rather than storing — results can shrink under a stale
@@ -182,7 +237,7 @@ function PaletteBody() {
               setSelected(0); // typing always re-highlights the top result
             }}
             onKeyDown={onKeyDown}
-            placeholder="Search commands and sessions…"
+            placeholder="Search commands, sessions, skills…"
             spellCheck={false}
             autoComplete="off"
             className="h-11 flex-1 bg-transparent text-[13px] text-foreground outline-none placeholder:text-muted-foreground/50"

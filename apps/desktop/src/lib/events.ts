@@ -4,6 +4,7 @@
 
 import { ipc } from "./ipc";
 import { useChatStore } from "@/store/chat";
+import { useSkillsStore } from "@/store/skills";
 
 let started = false;
 
@@ -22,6 +23,9 @@ export function startIpcEvents(): void {
   void ipc.onToolResult(store.applyToolResult);
   void ipc.onApprovalRequest(store.applyApprovalRequest);
   void ipc.onAskRequest(store.applyAskRequest);
+  void ipc.onSkillsChanged(() => {
+    void useSkillsStore.getState().refresh();
+  });
   // No UI for intention signals yet (NeuroForge, M8) — observe only.
   void ipc.onIntention((e) => {
     console.debug("[signal:intention]", e.sessionId, e.goal);
