@@ -18,6 +18,7 @@ import type {
   ToolResultEvent,
   SkillInfo,
   SkillsChangedEvent,
+  Phenotype,
 } from "../bindings";
 
 export type Unlisten = () => void;
@@ -63,6 +64,15 @@ export interface FfIpc {
   activateSkill(name: string): Promise<void>;
   /** Remove a skill from the active set. Idempotent. */
   deactivateSkill(name: string): Promise<void>;
+
+  // Phenotypes (Issue #28). Named, switchable working sets (RFC 0001 §7).
+  /** All selectable phenotypes (built-in `default` + `~/.flowforge/phenotypes/`), name-sorted. */
+  listPhenotypes(): Promise<Phenotype[]>;
+  /** The active phenotype. */
+  getPhenotype(): Promise<Phenotype>;
+  /** Switch the active phenotype: replaces the active-skill set and persists the
+   *  choice across restarts. Rejects an unknown name. Resolves with the phenotype now active. */
+  switchPhenotype(name: string): Promise<Phenotype>;
 
   // Events (backend -> frontend)
   onToken(cb: (e: TokenEvent) => void): Promise<Unlisten>;
@@ -151,6 +161,11 @@ class TauriIpc implements FfIpc {
     this.invoke<void>("activate_skill", { name });
   deactivateSkill = (name: string) =>
     this.invoke<void>("deactivate_skill", { name });
+
+  listPhenotypes = () => this.invoke<Phenotype[]>("list_phenotypes");
+  getPhenotype = () => this.invoke<Phenotype>("get_phenotype");
+  switchPhenotype = (name: string) =>
+    this.invoke<Phenotype>("switch_phenotype", { name });
 
   onToken = (cb: (e: TokenEvent) => void) =>
     this.listen<TokenEvent>("turn:token", cb);

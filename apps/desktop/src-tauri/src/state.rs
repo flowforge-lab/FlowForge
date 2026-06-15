@@ -4,10 +4,13 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 
 use ff_agent::CancelToken;
-use ff_core::{ProviderConfig, ProviderKind};
+use ff_core::{Phenotype, ProviderConfig, ProviderKind};
 use ff_llm::{OllamaProvider, OpenAiProvider, Provider};
 use ff_memory::MemoryStore;
-use ff_skills::{SharedRegistry, SkillRegistry, SkillWatcher};
+use ff_skills::{
+    default_phenotype, load_phenotypes, SharedRegistry, SkillRegistry, SkillWatcher,
+    DEFAULT_PHENOTYPE,
+};
 use ff_tools::ToolRegistry;
 use tokio::sync::oneshot;
 
@@ -66,6 +69,65 @@ fn save_config(config: &ProviderConfig) {
     }
 }
 
+/// `~/.config/flowforge/phenotype.json` — the name of the active phenotype, persisted
+/// so a switch survives a restart (RFC 0001 §7). Separate from the phenotype
+/// *definitions* in `~/.flowforge/phenotypes/`; this only records which one is active.
+fn active_phenotype_path() -> Option<PathBuf> {
+    dirs::config_dir().map(|d| d.join("flowforge").join("phenotype.json"))
+}
+
+/// The persisted active phenotype name, or `None` if never set / unreadable. Falls
+/// back to the built-in default at the call site.
+fn load_active_phenotype_name() -> Option<String> {
+    let raw = active_phenotype_path().and_then(|p| fs::read_to_string(p).ok())?;
+    serde_json::from_str::<ActivePhenotypeFile>(&raw)
+        .ok()
+        .map(|f| f.active)
+}
+
+/// Persist the active phenotype name. Best-effort, like `save_config`.
+fn save_active_phenotype_name(name: &str) {
+    let Some(path) = active_phenotype_path() else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let file = ActivePhenotypeFile {
+        active: name.to_string(),
+    };
+    if let Ok(json) = serde_json::to_string_pretty(&file) {
+        let _ = fs::write(path, json);
+    }
+}
+
+/// On-disk shape of `phenotype.json`.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ActivePhenotypeFile {
+    active: String,
+}
+
+/// `~/.flowforge/phenotypes`, where phenotype definition TOML files live.
+fn phenotypes_root() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".flowforge")
+        .join("phenotypes")
+}
+
+/// Resolve a phenotype by name: the built-in `default`, otherwise a definition from
+/// `~/.flowforge/phenotypes/`. Returns `None` for an unknown name.
+fn resolve_phenotype(name: &str) -> Option<Phenotype> {
+    if name == DEFAULT_PHENOTYPE {
+        return Some(default_phenotype());
+    }
+    let (mut map, errors) = load_phenotypes(&phenotypes_root());
+    for e in &errors {
+        tracing::warn!(error = %e, "phenotype load");
+    }
+    map.remove(name)
+}
+
 pub struct AppState {
     pub store: MemoryStore,
     /// Persisted, non-secret LLM provider settings. Swapped wholesale by
@@ -87,9 +149,13 @@ pub struct AppState {
     /// [`ApprovalRegistry`]).
     approvals: Mutex<ApprovalRegistry>,
     /// Globally active skills, whose bodies are injected into the system prompt
-    /// (RFC 0001 §4). Global and in-memory for M3.3; per-phenotype persistence is
-    /// M3.4. A `BTreeSet` keeps the set deduplicated and name-sorted.
+    /// (RFC 0001 §4). A `BTreeSet` keeps the set deduplicated and name-sorted.
+    /// Replaced wholesale by `switch_phenotype`; tweaked individually by
+    /// `activate_skill`/`deactivate_skill`.
     active_skills: Mutex<BTreeSet<String>>,
+    /// The active phenotype, resolved at startup from the persisted pointer (RFC
+    /// 0001 §7). Supplies the model and persona overrides for each turn.
+    active_phenotype: Mutex<Phenotype>,
 }
 
 impl AppState {
@@ -113,7 +179,7 @@ impl AppState {
         tools.register(Box::new(crate::tools::SearchSkillsTool::new(
             skills.clone(),
         )));
-        Self {
+        let state = Self {
             store: MemoryStore::new(),
             config: Mutex::new(config),
             tools,
@@ -122,7 +188,41 @@ impl AppState {
             _skill_watcher: Mutex::new(watcher),
             approvals: Mutex::new(ApprovalRegistry::default()),
             active_skills: Mutex::new(BTreeSet::new()),
+            active_phenotype: Mutex::new(default_phenotype()),
+        };
+        // Restore the persisted phenotype so its active skills survive a restart.
+        // An unknown/missing pointer falls back to the built-in default.
+        let initial = state
+            .persisted_phenotype_name()
+            .and_then(|n| resolve_phenotype(n.as_str()))
+            .unwrap_or_else(default_phenotype);
+        state.apply_phenotype(initial);
+        state
+    }
+
+    /// The persisted active phenotype name, if any. Indirection so tests can observe
+    /// the load path.
+    fn persisted_phenotype_name(&self) -> Option<String> {
+        load_active_phenotype_name()
+    }
+
+    /// Make `pheno` the active phenotype: replace the active-skill set with its
+    /// (registry-validated) skills, recording the resolved phenotype for model and
+    /// persona overrides. Unknown skill names are dropped with a warning rather than
+    /// failing — the installed set can drift from a phenotype definition.
+    fn apply_phenotype(&self, pheno: Phenotype) {
+        let known = self.skills.read().unwrap();
+        let mut next = BTreeSet::new();
+        for name in &pheno.skills {
+            if known.get(name).is_some() {
+                next.insert(name.clone());
+            } else {
+                tracing::warn!(skill = %name, phenotype = %pheno.name, "phenotype names unknown skill; skipping");
+            }
         }
+        drop(known);
+        *self.active_skills.lock().unwrap() = next;
+        *self.active_phenotype.lock().unwrap() = pheno;
     }
 
     /// The directory installed skills live in.
@@ -208,6 +308,45 @@ impl AppState {
             .lock()
             .unwrap()
             .retain(|n| known.contains(n));
+    }
+
+    /// All selectable phenotypes: the built-in `default` plus every definition in
+    /// `~/.flowforge/phenotypes/`, name-sorted. Re-scanned per call (few files).
+    pub fn list_phenotypes(&self) -> Vec<Phenotype> {
+        let (map, errors) = load_phenotypes(&phenotypes_root());
+        for e in &errors {
+            tracing::warn!(error = %e, "phenotype load");
+        }
+        let mut out = vec![default_phenotype()];
+        out.extend(map.into_values().filter(|p| p.name != DEFAULT_PHENOTYPE));
+        out
+    }
+
+    /// The active phenotype (clone — never hold the lock).
+    pub fn active_phenotype(&self) -> Phenotype {
+        self.active_phenotype.lock().unwrap().clone()
+    }
+
+    /// Switch to `name`: applies its skills and overrides, then persists the choice.
+    /// Errors on an unknown phenotype. Returns the resolved phenotype so the caller
+    /// can report what is now active.
+    pub fn switch_phenotype(&self, name: &str) -> Result<Phenotype, String> {
+        let pheno = resolve_phenotype(name).ok_or_else(|| format!("unknown phenotype: {name}"))?;
+        self.apply_phenotype(pheno.clone());
+        save_active_phenotype_name(&pheno.name);
+        Ok(pheno)
+    }
+
+    /// The active phenotype's persona preamble, if any (prepended to the system
+    /// prompt for each turn).
+    pub fn active_persona(&self) -> Option<String> {
+        self.active_phenotype.lock().unwrap().persona.clone()
+    }
+
+    /// The active phenotype's model override, if any (replaces the provider config's
+    /// model for the turn).
+    pub fn active_model_override(&self) -> Option<String> {
+        self.active_phenotype.lock().unwrap().model.clone()
     }
 }
 
@@ -421,5 +560,64 @@ mod tests {
         // Deactivating an absent skill is a no-op.
         state.deactivate_skill("nope");
         assert_eq!(state.active_skills(), vec!["zeta"]);
+    }
+
+    #[test]
+    fn switch_to_unknown_phenotype_errors() {
+        let state = AppState::new();
+        let err = state
+            .switch_phenotype("definitely-not-a-phenotype-xyz")
+            .unwrap_err();
+        assert!(err.contains("unknown phenotype"), "{err}");
+    }
+
+    #[test]
+    fn default_phenotype_is_always_listed() {
+        let state = AppState::new();
+        let names: Vec<String> = state
+            .list_phenotypes()
+            .into_iter()
+            .map(|p| p.name)
+            .collect();
+        assert!(names.contains(&DEFAULT_PHENOTYPE.to_string()), "{names:?}");
+    }
+
+    #[test]
+    fn apply_phenotype_records_overrides_and_drops_unknown_skills() {
+        let state = AppState::new();
+        // No skills are installed in the test environment, so every named skill is
+        // unknown and must be dropped — never activated as a phantom.
+        let pheno = Phenotype {
+            name: "rust".into(),
+            skills: vec!["not-installed".into()],
+            model: Some("qwen3-coder".into()),
+            persona: Some("You are a Rust expert.".into()),
+        };
+        state.apply_phenotype(pheno);
+        assert!(state.active_skills().is_empty());
+        assert_eq!(
+            state.active_model_override().as_deref(),
+            Some("qwen3-coder")
+        );
+        assert_eq!(
+            state.active_persona().as_deref(),
+            Some("You are a Rust expert.")
+        );
+        assert_eq!(state.active_phenotype().name, "rust");
+    }
+
+    #[test]
+    fn apply_default_clears_overrides() {
+        let state = AppState::new();
+        state.apply_phenotype(Phenotype {
+            name: "rust".into(),
+            skills: vec![],
+            model: Some("m".into()),
+            persona: Some("p".into()),
+        });
+        state.apply_phenotype(default_phenotype());
+        assert!(state.active_model_override().is_none());
+        assert!(state.active_persona().is_none());
+        assert!(state.active_skills().is_empty());
     }
 }
