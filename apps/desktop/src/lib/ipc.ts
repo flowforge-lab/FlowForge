@@ -16,6 +16,8 @@ import type {
   ToolApprovalRequestEvent,
   ToolCallEvent,
   ToolResultEvent,
+  SkillInfo,
+  SkillsChangedEvent,
 } from "../bindings";
 
 export type Unlisten = () => void;
@@ -52,6 +54,16 @@ export interface FfIpc {
   /** Best-effort nudge to wake the model server before the first turn. Never throws meaningfully. */
   warmup(): Promise<void>;
 
+  // Skills (Issue #27). Discovery + the global active set; backs the command palette.
+  /** All installed skills, name-sorted, each flagged active; `score` is always 0. */
+  listSkills(): Promise<SkillInfo[]>;
+  /** Ranked skill search (shares the agent tool's ranking). Empty query lists all. */
+  searchSkills(query: string): Promise<SkillInfo[]>;
+  /** Add a skill to the global active set; its body is injected next turn. Rejects an unknown name. */
+  activateSkill(name: string): Promise<void>;
+  /** Remove a skill from the active set. Idempotent. */
+  deactivateSkill(name: string): Promise<void>;
+
   // Events (backend -> frontend)
   onToken(cb: (e: TokenEvent) => void): Promise<Unlisten>;
   onTurnDone(cb: (e: TurnDoneEvent) => void): Promise<Unlisten>;
@@ -62,6 +74,8 @@ export interface FfIpc {
   onApprovalRequest(
     cb: (e: ToolApprovalRequestEvent) => void,
   ): Promise<Unlisten>;
+  /** Active skill set changed (activate/deactivate, or an install/uninstall reload). */
+  onSkillsChanged(cb: (e: SkillsChangedEvent) => void): Promise<Unlisten>;
 }
 
 // Explicit mock flag OR auto-fallback when not inside a Tauri window.
@@ -130,6 +144,14 @@ class TauriIpc implements FfIpc {
   listModels = () => this.invoke<string[]>("list_models");
   warmup = () => this.invoke<void>("warmup");
 
+  listSkills = () => this.invoke<SkillInfo[]>("list_skills");
+  searchSkills = (query: string) =>
+    this.invoke<SkillInfo[]>("search_skills", { query });
+  activateSkill = (name: string) =>
+    this.invoke<void>("activate_skill", { name });
+  deactivateSkill = (name: string) =>
+    this.invoke<void>("deactivate_skill", { name });
+
   onToken = (cb: (e: TokenEvent) => void) =>
     this.listen<TokenEvent>("turn:token", cb);
   onTurnDone = (cb: (e: TurnDoneEvent) => void) =>
@@ -144,6 +166,8 @@ class TauriIpc implements FfIpc {
     this.listen<ToolResultEvent>("tool:result", cb);
   onApprovalRequest = (cb: (e: ToolApprovalRequestEvent) => void) =>
     this.listen<ToolApprovalRequestEvent>("tool:approval-request", cb);
+  onSkillsChanged = (cb: (e: SkillsChangedEvent) => void) =>
+    this.listen<SkillsChangedEvent>("skills:changed", cb);
 }
 
 // `MockIpc` is pulled in with a dynamic import so the bundler gives it its own

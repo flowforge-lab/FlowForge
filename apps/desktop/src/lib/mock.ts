@@ -16,6 +16,8 @@ import type {
   ToolApprovalRequestEvent,
   ToolCallEvent,
   ToolResultEvent,
+  SkillInfo,
+  SkillsChangedEvent,
 } from "../bindings";
 import type { FfIpc, Unlisten } from "./ipc";
 import { autoTitle } from "./auto-title";
@@ -51,6 +53,47 @@ export function greet(name: string): string {
 | --- | --- |
 | Headings | done |
 | Code blocks | done |`;
+
+// Canned installed skills so the command palette skill source (#11/#16) is
+// exercisable offline. `active`/`score` are placeholders — the methods below
+// overlay live active state and search scores.
+const MOCK_SKILLS: SkillInfo[] = [
+  {
+    name: "rust-debugging",
+    description: "Systematic Rust debugging with bash, view, and edit.",
+    version: "0.1.0",
+    keywords: ["rust", "debug"],
+    active: false,
+    score: 0,
+  },
+  {
+    name: "create-pr",
+    description: "Open a GitHub pull request following CONTRIBUTING.",
+    version: "0.2.0",
+    keywords: ["git", "github", "pr"],
+    active: false,
+    score: 0,
+  },
+  {
+    name: "write-tests",
+    description: "Generate unit tests with coverage analysis.",
+    version: "0.1.0",
+    keywords: ["test", "coverage"],
+    active: false,
+    score: 0,
+  },
+];
+
+// Mirrors `ff_skills::search_skills` scoring so the mock ranks like the backend:
+// exact keyword (4) > name prefix (3) > name substring (2) > description (1).
+function scoreSkill(skill: SkillInfo, q: string): number {
+  const name = skill.name.toLowerCase();
+  if (skill.keywords.some((k) => k.toLowerCase() === q)) return 4;
+  if (name.startsWith(q)) return 3;
+  if (name.includes(q)) return 2;
+  if (skill.description.toLowerCase().includes(q)) return 1;
+  return 0;
+}
 
 interface ActiveTurn {
   // All pending interval/timeout handles for this turn, cleared on cancel.
@@ -95,6 +138,8 @@ export class MockIpc implements FfIpc {
    *  approval request; the matching `respondApproval` resolves it. Keyed by both
    *  so colliding call ids across sessions stay isolated (mirrors the backend). */
   private pendingApprovals = new Map<string, (approved: boolean) => void>();
+  private skillsChangedListeners = new Set<Listener<SkillsChangedEvent>>();
+  private activeSkills = new Set<string>();
 
   async createSession(goal?: string): Promise<Session> {
     const ts = now();
@@ -183,6 +228,9 @@ export class MockIpc implements FfIpc {
   onApprovalRequest(cb: Listener<ToolApprovalRequestEvent>): Promise<Unlisten> {
     return this.subscribe(this.approvalRequestListeners, cb);
   }
+  onSkillsChanged(cb: Listener<SkillsChangedEvent>): Promise<Unlisten> {
+    return this.subscribe(this.skillsChangedListeners, cb);
+  }
 
   async respondApproval(
     sessionId: string,
@@ -225,6 +273,44 @@ export class MockIpc implements FfIpc {
 
   async warmup(): Promise<void> {
     // No-op: there is no real server behind the mock.
+  }
+
+  async listSkills(): Promise<SkillInfo[]> {
+    return [...MOCK_SKILLS]
+      .sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0))
+      .map((s) => ({ ...s, active: this.activeSkills.has(s.name), score: 0 }));
+  }
+
+  async searchSkills(query: string): Promise<SkillInfo[]> {
+    const q = query.trim().toLowerCase();
+    return MOCK_SKILLS.map((s) => ({
+      s,
+      score: q === "" ? 0 : scoreSkill(s, q),
+    }))
+      .filter(({ score }) => q === "" || score > 0)
+      .sort(
+        (a, b) =>
+          b.score - a.score ||
+          (a.s.name < b.s.name ? -1 : a.s.name > b.s.name ? 1 : 0),
+      )
+      .map(({ s, score }) => ({
+        ...s,
+        active: this.activeSkills.has(s.name),
+        score,
+      }));
+  }
+
+  async activateSkill(name: string): Promise<void> {
+    if (!MOCK_SKILLS.some((s) => s.name === name)) {
+      throw new Error(`unknown skill: ${name}`);
+    }
+    this.activeSkills.add(name);
+    this.emitSkillsChanged();
+  }
+
+  async deactivateSkill(name: string): Promise<void> {
+    this.activeSkills.delete(name);
+    this.emitSkillsChanged();
   }
 
   // --- internals ---
@@ -378,6 +464,12 @@ export class MockIpc implements FfIpc {
   ): Promise<Unlisten> {
     set.add(cb);
     return Promise.resolve(() => set.delete(cb));
+  }
+
+  private emitSkillsChanged(): void {
+    this.emit(this.skillsChangedListeners, {
+      active: [...this.activeSkills].sort(),
+    });
   }
 
   private emit<T>(set: Set<Listener<T>>, payload: T): void {

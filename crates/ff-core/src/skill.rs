@@ -36,6 +36,26 @@ pub struct SkillManifest {
     pub keywords: Vec<String>,
 }
 
+/// A skill as presented to the frontend: discovery metadata plus whether it is
+/// currently active. One DTO backs both `list_skills` (unranked, `score` = 0) and
+/// `search_skills` (ranked). Distinct from [`SkillManifest`] (frontmatter only) —
+/// it folds in runtime `active` state and a search `score`, and omits the
+/// FE-irrelevant `tools`/`mcp`/`author` fields.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "../../../apps/desktop/src/bindings/")]
+pub struct SkillInfo {
+    pub name: String,
+    pub description: String,
+    pub version: String,
+    pub keywords: Vec<String>,
+    /// Whether the skill is in the global active set (its body is injected into
+    /// the system prompt for the next turn).
+    pub active: bool,
+    /// Lexical relevance from `search_skills`; `0` for the unranked `list_skills`.
+    pub score: u32,
+}
+
 /// A loaded skill: its manifest, the instruction body, and where it lives on disk.
 /// Backend-only — not exported to TypeScript (see module docs).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

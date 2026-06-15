@@ -78,6 +78,13 @@ impl SkillRegistry {
     pub fn is_empty(&self) -> bool {
         self.skills.is_empty()
     }
+
+    /// Test-only: insert a pre-built skill without touching the filesystem, so
+    /// ranking/query tests don't need a tempdir of `SKILL.md` files.
+    #[cfg(test)]
+    pub(crate) fn insert_for_test(&mut self, skill: Skill) {
+        self.skills.insert(skill.manifest.name.clone(), skill);
+    }
 }
 
 fn load_one(dir: &Path) -> Result<Skill, SkillError> {

@@ -9,6 +9,7 @@ mod error;
 mod install;
 mod parse;
 mod registry;
+mod search;
 mod watch;
 
 pub use error::SkillError;
@@ -17,4 +18,5 @@ pub use install::{
 };
 pub use parse::parse_skill;
 pub use registry::{first_executable, first_executable_recursive, SkillRegistry};
+pub use search::{search_skills, SkillHit};
 pub use watch::{SharedRegistry, SkillWatcher};

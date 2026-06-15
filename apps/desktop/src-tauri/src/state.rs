@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
@@ -86,6 +86,10 @@ pub struct AppState {
     /// Turn cancellation tokens + pending approvals under one lock (see
     /// [`ApprovalRegistry`]).
     approvals: Mutex<ApprovalRegistry>,
+    /// Globally active skills, whose bodies are injected into the system prompt
+    /// (RFC 0001 §4). Global and in-memory for M3.3; per-phenotype persistence is
+    /// M3.4. A `BTreeSet` keeps the set deduplicated and name-sorted.
+    active_skills: Mutex<BTreeSet<String>>,
 }
 
 impl AppState {
@@ -106,6 +110,9 @@ impl AppState {
             skills_root(),
             skills.clone(),
         )));
+        tools.register(Box::new(crate::tools::SearchSkillsTool::new(
+            skills.clone(),
+        )));
         Self {
             store: MemoryStore::new(),
             config: Mutex::new(config),
@@ -114,6 +121,7 @@ impl AppState {
             skills,
             _skill_watcher: Mutex::new(watcher),
             approvals: Mutex::new(ApprovalRegistry::default()),
+            active_skills: Mutex::new(BTreeSet::new()),
         }
     }
 
@@ -161,6 +169,45 @@ impl AppState {
     /// A cheap clone of the current skill set, taken at turn start.
     pub fn skills_snapshot(&self) -> SkillRegistry {
         self.skills.read().unwrap().clone()
+    }
+
+    /// The active skill names, name-sorted (BTreeSet order).
+    pub fn active_skills(&self) -> Vec<String> {
+        self.active_skills.lock().unwrap().iter().cloned().collect()
+    }
+
+    /// Add a skill to the active set. Errors if no installed skill has this name
+    /// so the UI/agent can't activate a phantom. Idempotent for an already-active
+    /// skill.
+    pub fn activate_skill(&self, name: &str) -> Result<(), String> {
+        if self.skills.read().unwrap().get(name).is_none() {
+            return Err(format!("unknown skill: {name}"));
+        }
+        self.active_skills.lock().unwrap().insert(name.to_string());
+        Ok(())
+    }
+
+    /// Remove a skill from the active set. Idempotent — deactivating a skill that
+    /// isn't active is a no-op.
+    pub fn deactivate_skill(&self, name: &str) {
+        self.active_skills.lock().unwrap().remove(name);
+    }
+
+    /// Drop active entries that are no longer installed (e.g. after an uninstall),
+    /// so the active set never names a missing skill. Called after a reload.
+    pub fn prune_active_skills(&self) {
+        let known: BTreeSet<String> = self
+            .skills
+            .read()
+            .unwrap()
+            .names()
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        self.active_skills
+            .lock()
+            .unwrap()
+            .retain(|n| known.contains(n));
     }
 }
 
@@ -345,5 +392,34 @@ mod tests {
         state.resolve_approval("sess-2", "dup", false);
         assert!(rx1.await.unwrap());
         assert!(!rx2.await.unwrap());
+    }
+
+    #[test]
+    fn activate_unknown_skill_errors() {
+        let state = AppState::new();
+        let err = state
+            .activate_skill("definitely-not-installed-skill-xyz")
+            .unwrap_err();
+        assert!(err.contains("unknown skill"), "{err}");
+        assert!(state.active_skills().is_empty());
+    }
+
+    #[test]
+    fn active_skills_is_sorted_and_deduped() {
+        let state = AppState::new();
+        {
+            // Bypass the install-check guard: this test exercises the accessor and
+            // deactivate, not the registry lookup (covered elsewhere).
+            let mut guard = state.active_skills.lock().unwrap();
+            guard.insert("zeta".into());
+            guard.insert("alpha".into());
+            guard.insert("alpha".into());
+        }
+        assert_eq!(state.active_skills(), vec!["alpha", "zeta"]);
+        state.deactivate_skill("alpha");
+        assert_eq!(state.active_skills(), vec!["zeta"]);
+        // Deactivating an absent skill is a no-op.
+        state.deactivate_skill("nope");
+        assert_eq!(state.active_skills(), vec!["zeta"]);
     }
 }

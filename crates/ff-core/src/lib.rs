@@ -12,4 +12,4 @@ mod skill;
 pub use message::{Message, Role, ToolCall};
 pub use provider::{ProviderConfig, ProviderKind};
 pub use session::{auto_title, Session, SessionStatus};
-pub use skill::{Phenotype, Skill, SkillManifest};
+pub use skill::{Phenotype, Skill, SkillInfo, SkillManifest};
