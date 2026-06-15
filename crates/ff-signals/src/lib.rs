@@ -120,7 +120,6 @@ impl SignalStore {
             .entry(skill.to_string())
             .or_insert_with(|| SkillAggregate::new(skill))
             .activations += 1;
-        self.save();
     }
 
     /// A turn with `ev.skill` active finished; fold its metrics into the aggregate.
@@ -129,7 +128,6 @@ impl SignalStore {
             .entry(ev.skill.clone())
             .or_insert_with(|| SkillAggregate::new(&ev.skill))
             .record_completed(ev);
-        self.save();
     }
 
     /// The aggregate for one skill, if it has any recorded signals.
@@ -144,18 +142,35 @@ impl SignalStore {
         out
     }
 
-    fn save(&self) {
-        let Some(path) = &self.path else { return };
+    /// Capture the persistable state as `(path, json)` for a later write, or `None`
+    /// when there is no path (in-memory store) or serialization fails. The caller
+    /// runs this under whatever lock guards the store, then drops the lock and hands
+    /// the payload to [`SignalStore::persist_payload`] — so the synchronous file
+    /// write never happens while the lock is held (addresses #77 review nit 1: the
+    /// old per-record auto-save did `2 × active-skills` locked writes per turn; the
+    /// host now records in memory and persists once at turn end, lock-free).
+    pub fn snapshot_payload(&self) -> Option<(PathBuf, String)> {
+        let path = self.path.clone()?;
+        match serde_json::to_string_pretty(&self.aggregates) {
+            Ok(json) => Some((path, json)),
+            Err(e) => {
+                eprintln!("ff-signals: failed to serialize aggregates: {e}");
+                None
+            }
+        }
+    }
+
+    /// Best-effort write of a [`snapshot_payload`](Self::snapshot_payload) result,
+    /// meant to run *after* the store's lock is dropped. A `None` payload (no path /
+    /// serialize error) is a no-op; an I/O failure is logged and ignored — telemetry
+    /// must never break a turn.
+    pub fn persist_payload(payload: Option<(PathBuf, String)>) {
+        let Some((path, json)) = payload else { return };
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        match serde_json::to_string_pretty(&self.aggregates) {
-            Ok(json) => {
-                if let Err(e) = std::fs::write(path, json) {
-                    eprintln!("ff-signals: failed to persist aggregates: {e}");
-                }
-            }
-            Err(e) => eprintln!("ff-signals: failed to serialize aggregates: {e}"),
+        if let Err(e) = std::fs::write(&path, json) {
+            eprintln!("ff-signals: failed to persist aggregates: {e}");
         }
     }
 }
@@ -235,6 +250,9 @@ mod tests {
             let mut store = SignalStore::load(path.clone());
             store.record_activated("alpha");
             store.record_completed(&completed("alpha", 100, 2, 1000, true));
+            // Explicit persist (records are now memory-only; the host persists once
+            // per turn, lock-free — see snapshot_payload/persist_payload).
+            SignalStore::persist_payload(store.snapshot_payload());
         }
         let reloaded = SignalStore::load(path);
         let agg = reloaded.aggregate("alpha").unwrap();

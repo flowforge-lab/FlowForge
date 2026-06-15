@@ -279,6 +279,12 @@ impl AppState {
         skills_root()
     }
 
+    /// The retained-version history tree for skill evolution (RFC 0001 §8). Kept
+    /// outside `skills_root` so the registry never sees version copies as skills.
+    pub fn skill_history_root(&self) -> PathBuf {
+        skill_history_root()
+    }
+
     /// Re-scan the skills directory into the shared registry. Called after an
     /// install/uninstall so the change is visible without waiting on the watcher.
     pub fn reload_skills(&self) {
@@ -350,6 +356,15 @@ impl AppState {
     /// The telemetry aggregate for one skill, if any signals have been recorded.
     pub fn skill_telemetry(&self, skill: &str) -> Option<SkillAggregate> {
         self.signals.lock().unwrap().aggregate(skill)
+    }
+
+    /// Persist the telemetry aggregates once, at turn end. Snapshots the serialized
+    /// payload under the lock, then drops the lock before the synchronous file write
+    /// so `get_skill_telemetry` and concurrent turns never block on I/O (addresses
+    /// #77 review nit 1). Best-effort: a write failure is logged and ignored.
+    pub fn persist_signals(&self) {
+        let payload = self.signals.lock().unwrap().snapshot_payload();
+        SignalStore::persist_payload(payload);
     }
 
     /// Add a skill to the active set. Errors if no installed skill has this name
@@ -501,6 +516,16 @@ fn skills_root() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".flowforge")
         .join("skills")
+}
+
+/// `~/.flowforge/skill_history`, the retained-version tree for skill evolution (RFC
+/// 0001 §8). Deliberately a sibling of `skills/`, not a child: the registry scans
+/// every top-level dir under `skills/`, so version copies must live elsewhere.
+fn skill_history_root() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".flowforge")
+        .join("skill_history")
 }
 
 /// `~/.flowforge/skill_signals.json`, the per-skill telemetry aggregate store (RFC

@@ -30,6 +30,7 @@ ff-tools = { workspace = true }
 dirs = "5"
 tokio = { workspace = true }
 async-trait = { workspace = true }
+futures-util = { workspace = true }
 reqwest = { workspace = true, features = ["rustls-tls"] }
 url = { workspace = true }
 tracing = { workspace = true }
