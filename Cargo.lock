@@ -1179,6 +1179,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "fast_html2md",
+ "futures-util",
  "globset",
  "grep-regex",
  "grep-searcher",

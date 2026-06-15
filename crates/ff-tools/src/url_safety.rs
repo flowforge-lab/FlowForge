@@ -3,10 +3,15 @@
 //! any connection — and the fetch loop re-applies it on every redirect hop, which
 //! is the classic SSRF-via-redirect bypass.
 //!
-//! Known limitation (documented, acceptable for v1): DNS rebinding. We resolve and
-//! check, but `reqwest` re-resolves when it connects, so a name that flips from a
-//! public to a private answer between our check and the connect is not caught.
-//! Pinning the connection to the checked IP is a follow-up.
+//! Known limitations (documented, acceptable for v1):
+//!
+//! - **DNS rebinding.** We resolve and check, but `reqwest` re-resolves when it
+//!   connects, so a name that flips from a public to a private answer between our
+//!   check and the connect is not caught. Pinning the connection to the checked IP
+//!   is a follow-up.
+//! - **IPv6 encodings of IPv4.** [`to_ipv4_mapped`] covers `::ffff:0:0/96` only, not
+//!   deprecated IPv4-compatible (`::a.b.c.d`) or NAT64 (`64:ff9b::/96`) forms of
+//!   internal v4. Low practical risk.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
