@@ -55,6 +55,21 @@ pub struct ToolApprovalRequestEvent {
     pub safety: ApprovalSafety,
 }
 
+/// Backend -> frontend request to put a clarifying question to the user (the
+/// `ask_user` tool, #44). The turn pauses until the frontend replies via the
+/// `respond_ask(session_id, call_id, answer)` command. Dismissing it (turn cancel)
+/// resolves the question as "[no answer: question dismissed]" — never a hang. `call_id` correlates with
+/// the [`ToolCallEvent`] / [`ToolResultEvent`] for the same step.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "../../../apps/desktop/src/bindings/")]
+pub struct ToolAskRequestEvent {
+    pub session_id: String,
+    pub message_id: String,
+    pub call_id: String,
+    pub question: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export, export_to = "../../../apps/desktop/src/bindings/")]

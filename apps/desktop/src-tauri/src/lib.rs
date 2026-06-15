@@ -9,8 +9,8 @@ use async_trait::async_trait;
 use ff_agent::{run_turn, AgentEvent, Approver, CancelToken, ToolContext};
 use ff_core::events::{
     ApprovalSafety, IntentionSignal, SkillInstallApprovalRequestEvent, SkillsChangedEvent,
-    TokenEvent, ToolApprovalRequestEvent, ToolCallEvent, ToolResultEvent, TurnDoneEvent,
-    TurnErrorEvent,
+    TokenEvent, ToolApprovalRequestEvent, ToolAskRequestEvent, ToolCallEvent, ToolResultEvent,
+    TurnDoneEvent, TurnErrorEvent,
 };
 use ff_core::{
     Message, Phenotype, ProviderConfig, ProviderKind, Role, Session, Skill, SkillInfo,
@@ -63,6 +63,32 @@ impl Approver for UiApprover {
         );
         // Sender dropped (cancel) -> RecvError -> deny.
         rx.await.unwrap_or(false)
+    }
+
+    async fn ask(
+        &self,
+        message_id: &str,
+        call_id: &str,
+        args: &serde_json::Value,
+    ) -> Option<String> {
+        // The loop forwards the tool args; the host reads the `question` field.
+        let question = args
+            .get("question")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let rx = self.state.register_ask(&self.session_id, call_id);
+        let _ = self.app.emit(
+            "tool:ask-request",
+            ToolAskRequestEvent {
+                session_id: self.session_id.clone(),
+                message_id: message_id.to_string(),
+                call_id: call_id.to_string(),
+                question,
+            },
+        );
+        // Sender dropped (cancel/teardown) -> RecvError -> dismissed (None).
+        rx.await.ok()
     }
 }
 
@@ -122,6 +148,18 @@ fn respond_approval(
     approved: bool,
 ) {
     state.resolve_approval(&session_id, &call_id, approved);
+}
+
+/// Frontend response to a [`ToolAskRequestEvent`] (#44): the user's answer to an
+/// `ask_user` question. Wakes the awaiting tool call, which resumes the turn.
+#[tauri::command]
+fn respond_ask(
+    state: State<'_, Arc<AppState>>,
+    session_id: String,
+    call_id: String,
+    answer: String,
+) {
+    state.resolve_ask(&session_id, &call_id, answer);
 }
 
 /// Persists the user message, then spawns the assistant turn. Tokens stream back
@@ -493,6 +531,7 @@ pub fn run() {
             send_message,
             cancel_turn,
             respond_approval,
+            respond_ask,
             get_provider_config,
             set_provider_config,
             list_models,

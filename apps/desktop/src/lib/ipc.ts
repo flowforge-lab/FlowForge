@@ -14,6 +14,7 @@ import type {
   TurnErrorEvent,
   IntentionSignal,
   ToolApprovalRequestEvent,
+  ToolAskRequestEvent,
   ToolCallEvent,
   ToolResultEvent,
   SkillInfo,
@@ -40,6 +41,9 @@ export interface FfIpc {
     callId: string,
     approved: boolean,
   ): Promise<void>;
+  /** Frontend's answer to a [`ToolAskRequestEvent`] (#44, `ask_user`). Resumes the
+   *  paused turn with the user's reply. Keyed by `(sessionId, callId)`. */
+  respondAsk(sessionId: string, callId: string, answer: string): Promise<void>;
 
   // Provider settings (Issue #8). Phase 1: local candle-vllm + Ollama, no secrets.
   /** Current persisted LLM provider settings. */
@@ -86,6 +90,9 @@ export interface FfIpc {
   ): Promise<Unlisten>;
   /** Active skill set changed (activate/deactivate, or an install/uninstall reload). */
   onSkillsChanged(cb: (e: SkillsChangedEvent) => void): Promise<Unlisten>;
+  /** The agent asked the user a clarifying question (#44, `ask_user`); render a
+   *  prompt and reply via `respondAsk`. */
+  onAskRequest(cb: (e: ToolAskRequestEvent) => void): Promise<Unlisten>;
 }
 
 // Explicit mock flag OR auto-fallback when not inside a Tauri window.
@@ -139,6 +146,8 @@ class TauriIpc implements FfIpc {
     this.invoke<void>("cancel_turn", { sessionId });
   respondApproval = (sessionId: string, callId: string, approved: boolean) =>
     this.invoke<void>("respond_approval", { sessionId, callId, approved });
+  respondAsk = (sessionId: string, callId: string, answer: string) =>
+    this.invoke<void>("respond_ask", { sessionId, callId, answer });
 
   getProviderConfig = () => this.invoke<ProviderConfig>("get_provider_config");
   setProviderConfig = (
@@ -181,6 +190,8 @@ class TauriIpc implements FfIpc {
     this.listen<ToolResultEvent>("tool:result", cb);
   onApprovalRequest = (cb: (e: ToolApprovalRequestEvent) => void) =>
     this.listen<ToolApprovalRequestEvent>("tool:approval-request", cb);
+  onAskRequest = (cb: (e: ToolAskRequestEvent) => void) =>
+    this.listen<ToolAskRequestEvent>("tool:ask-request", cb);
   onSkillsChanged = (cb: (e: SkillsChangedEvent) => void) =>
     this.listen<SkillsChangedEvent>("skills:changed", cb);
 }

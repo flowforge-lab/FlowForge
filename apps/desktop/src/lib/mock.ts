@@ -14,6 +14,7 @@ import type {
   TurnErrorEvent,
   IntentionSignal,
   ToolApprovalRequestEvent,
+  ToolAskRequestEvent,
   ToolCallEvent,
   ToolResultEvent,
   SkillInfo,
@@ -156,6 +157,10 @@ export class MockIpc implements FfIpc {
    *  approval request; the matching `respondApproval` resolves it. Keyed by both
    *  so colliding call ids across sessions stay isolated (mirrors the backend). */
   private pendingApprovals = new Map<string, (approved: boolean) => void>();
+  private askRequestListeners = new Set<Listener<ToolAskRequestEvent>>();
+  /** `(sessionId, callId)` -> resume callback for an `ask_user` (#44). The matching
+   *  `respondAsk` resolves it; cancel deletes it (mirrors backend cancel-via-drop). */
+  private pendingAsks = new Map<string, (answer: string) => void>();
   private skillsChangedListeners = new Set<Listener<SkillsChangedEvent>>();
   private activeSkills = new Set<string>();
   private activePhenotype: Phenotype = DEFAULT_PHENOTYPE;
@@ -220,6 +225,9 @@ export class MockIpc implements FfIpc {
       });
       // Drop any awaiting-approval entry — its tool:result was just emitted.
       this.pendingApprovals.delete(approvalKey(sessionId, callId));
+      // Drop any pending ask_user resume too, or a later respondAsk would fire
+      // the surviving callback and emit a duplicate tool:result for a dead turn.
+      this.pendingAsks.delete(approvalKey(sessionId, callId));
     }
     // Emit done with whatever partial content was accumulated — mirrors what
     // the real backend does when a CancellationToken fires.
@@ -250,6 +258,9 @@ export class MockIpc implements FfIpc {
   onSkillsChanged(cb: Listener<SkillsChangedEvent>): Promise<Unlisten> {
     return this.subscribe(this.skillsChangedListeners, cb);
   }
+  onAskRequest(cb: Listener<ToolAskRequestEvent>): Promise<Unlisten> {
+    return this.subscribe(this.askRequestListeners, cb);
+  }
 
   async respondApproval(
     sessionId: string,
@@ -261,6 +272,18 @@ export class MockIpc implements FfIpc {
     if (!resume) return;
     this.pendingApprovals.delete(key);
     resume(approved);
+  }
+
+  async respondAsk(
+    sessionId: string,
+    callId: string,
+    answer: string,
+  ): Promise<void> {
+    const key = approvalKey(sessionId, callId);
+    const resume = this.pendingAsks.get(key);
+    if (!resume) return;
+    this.pendingAsks.delete(key);
+    resume(answer);
   }
 
   async getProviderConfig(): Promise<ProviderConfig> {
@@ -424,21 +447,75 @@ export class MockIpc implements FfIpc {
       "(mocked) 7 matches across 3 files",
     );
 
-    // Simulate one write tool call that requires approval, exercising the
-    // tool:call -> tool:approval-request -> respondApproval -> tool:result path
-    // under VITE_FF_MOCK=1.
+    // First an interactive `ask_user` step (#44) — exercises the tool:call ->
+    // tool:ask-request -> respondAsk -> tool:result path under VITE_FF_MOCK=1.
+    // Once the user answers, we fall through to the approval-gated write so the
+    // mock turn covers both the ask and the approve round-trips.
+    this.emitAskStep(sessionId, assistant.id, turn, () => {
+      this.emitApprovalStep(sessionId, assistant.id, turn);
+    });
+  }
+
+  /** Emit a `tool:call` + `tool:ask-request` and register a `respondAsk` resume
+   *  that emits the matching `tool:result` (the answer) and runs `next`. A turn
+   *  cancel drops the resume via `cancelTurn`, which fires the standard
+   *  cancellation backfill. */
+  private emitAskStep(
+    sessionId: string,
+    messageId: string,
+    turn: ActiveTurn,
+    next: () => void,
+  ): void {
+    const callId = uidShort();
+    turn.pendingToolCalls.push(callId);
+    const args = { question: "Which file should I update?" };
+    this.emit(this.toolCallListeners, {
+      sessionId,
+      messageId,
+      callId,
+      tool: "ask_user",
+      args,
+    });
+    this.emit(this.askRequestListeners, {
+      sessionId,
+      messageId,
+      callId,
+      question: args.question,
+    });
+    this.pendingAsks.set(approvalKey(sessionId, callId), (answer) => {
+      turn.pendingToolCalls = turn.pendingToolCalls.filter(
+        (id) => id !== callId,
+      );
+      this.emit(this.toolResultListeners, {
+        sessionId,
+        messageId,
+        callId,
+        success: true,
+        result: answer,
+      });
+      next();
+    });
+  }
+
+  /** The original write-with-approval demo step. Extracted so other steps (the
+   *  `ask_user` step above) can chain into it. */
+  private emitApprovalStep(
+    sessionId: string,
+    messageId: string,
+    turn: ActiveTurn,
+  ): void {
     const callId = uidShort();
     turn.pendingToolCalls.push(callId);
     this.emit(this.toolCallListeners, {
       sessionId,
-      messageId: assistant.id,
+      messageId,
       callId,
       tool: "edit",
       args: { path: "README.md", old_str: "FlowForge", new_str: "FlowForge!" },
     });
     this.emit(this.approvalRequestListeners, {
       sessionId,
-      messageId: assistant.id,
+      messageId,
       callId,
       tool: "edit",
       args: { path: "README.md", old_str: "FlowForge", new_str: "FlowForge!" },
@@ -450,7 +527,7 @@ export class MockIpc implements FfIpc {
       );
       this.emit(this.toolResultListeners, {
         sessionId,
-        messageId: assistant.id,
+        messageId,
         callId,
         success: approved,
         result: approved

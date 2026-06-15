@@ -68,6 +68,23 @@ pub trait Approver: Send + Sync {
         safety: Safety,
         args: &serde_json::Value,
     ) -> bool;
+
+    /// Pause the turn and put a question to the user (the `ask_user` tool, #44),
+    /// resuming with their answer. `args` carries the tool call's arguments (the
+    /// `question` field); `message_id`/`call_id` correlate the request with the tool
+    /// step the host is rendering. Returns the answer, or `None` if it was dismissed
+    /// or cancelled — the loop turns `None` into a tool result, never a hang.
+    ///
+    /// Defaults to `None`: a host with no interactive surface simply dismisses the
+    /// question rather than blocking the turn.
+    async fn ask(
+        &self,
+        _message_id: &str,
+        _call_id: &str,
+        _args: &serde_json::Value,
+    ) -> Option<String> {
+        None
+    }
 }
 
 /// Everything the loop needs to dispatch tools.
@@ -280,17 +297,31 @@ pub async fn run_turn(
                 args: args.clone(),
             });
 
-            let safety = tools.registry.safety(&call.name, &args);
-            let approved = safety == Safety::ReadOnly
-                || tools
-                    .approve
-                    .approve(&message_id, &call.id, &call.name, safety, &args)
-                    .await;
-
-            let outcome = if approved {
-                tools.registry.run(&call.name, args, tools.root).await
+            // Interactive tools (`ask_user`, #44) don't execute against the workspace:
+            // pause the turn, put the question to the host, and use the answer as the
+            // tool result. A dismissed/cancelled question yields a result too, so the
+            // assistant `tool_calls` message always has a matching reply (no malformed
+            // history). Asking is read-only, so it never reaches the approval gate.
+            let outcome = if tools.registry.is_interactive(&call.name) {
+                match tools.approve.ask(&message_id, &call.id, &args).await {
+                    Some(answer) => ff_tools::ToolOutcome::ok(answer),
+                    None => ff_tools::ToolOutcome::error("[no answer: question dismissed]"),
+                }
             } else {
-                ff_tools::ToolOutcome::error(format!("call to `{}` was not approved", call.name))
+                let safety = tools.registry.safety(&call.name, &args);
+                let approved = safety == Safety::ReadOnly
+                    || tools
+                        .approve
+                        .approve(&message_id, &call.id, &call.name, safety, &args)
+                        .await;
+                if approved {
+                    tools.registry.run(&call.name, args, tools.root).await
+                } else {
+                    ff_tools::ToolOutcome::error(format!(
+                        "call to `{}` was not approved",
+                        call.name
+                    ))
+                }
             };
 
             store.add_tool_result_message(session_id, call.id.clone(), outcome.content.clone());
@@ -473,6 +504,64 @@ mod tests {
         }
     }
 
+    /// First call requests an `ask_user` tool call; second call returns plain text.
+    struct AskThenText {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl Provider for AskThenText {
+        async fn chat_stream(&self, _req: ChatRequest) -> Result<ChunkStream, LlmError> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            let chunks = if n == 0 {
+                vec![Ok(Chunk {
+                    tool_calls: vec![ToolCallDelta {
+                        index: 0,
+                        id: Some("ask_1".into()),
+                        name: Some("ask_user".into()),
+                        arguments: r#"{"question":"Which file?"}"#.into(),
+                    }],
+                    done: true,
+                    ..Chunk::default()
+                })]
+            } else {
+                vec![Ok(Chunk {
+                    delta: "using main.rs".into(),
+                    done: true,
+                    ..Chunk::default()
+                })]
+            };
+            Ok(futures_util::stream::iter(chunks).boxed())
+        }
+    }
+
+    /// Answers an interactive `ask`; denies everything that needs approval (it should
+    /// never be asked to approve an interactive tool).
+    struct CannedAnswer(&'static str);
+    #[async_trait]
+    impl Approver for CannedAnswer {
+        async fn approve(
+            &self,
+            _message_id: &str,
+            _call_id: &str,
+            _name: &str,
+            _safety: Safety,
+            _args: &serde_json::Value,
+        ) -> bool {
+            false
+        }
+        async fn ask(
+            &self,
+            _message_id: &str,
+            _call_id: &str,
+            args: &serde_json::Value,
+        ) -> Option<String> {
+            // The host receives the tool args and reads the `question` field.
+            assert_eq!(args["question"], "Which file?");
+            Some(self.0.to_string())
+        }
+    }
+
     #[tokio::test]
     async fn streams_and_persists_text_turn() {
         let store = MemoryStore::new();
@@ -561,6 +650,103 @@ mod tests {
         assert!(history[1].tool_calls.is_some());
         assert_eq!(history[2].role, Role::Tool);
         assert_eq!(history[2].tool_call_id.as_deref(), Some("call_1"));
+    }
+
+    /// #44: an `ask_user` call routes to `Approver::ask`; the answer becomes the tool
+    /// result and the turn resumes, with well-formed history.
+    #[tokio::test]
+    async fn ask_user_round_trips_answer_as_tool_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemoryStore::new();
+        let s = store.create_session(None);
+        store.add_message(&s.id, Role::User, "edit the file".into());
+        let registry = ToolRegistry::with_defaults();
+        let approve = CannedAnswer("main.rs");
+        let provider = AskThenText {
+            calls: AtomicUsize::new(0),
+        };
+
+        let mut started_name = String::new();
+        let mut result = String::new();
+        let mut ok = false;
+        let mut final_text = String::new();
+        let msg = run_turn(
+            &provider,
+            &store,
+            &ctx(&registry, dir.path(), &approve),
+            &s.id,
+            "mock",
+            None,
+            CancelToken::new(),
+            |ev| match ev {
+                AgentEvent::ToolCallStarted { name, .. } => started_name = name,
+                AgentEvent::ToolCallFinished {
+                    success, result: r, ..
+                } => {
+                    ok = success;
+                    result = r;
+                }
+                AgentEvent::Token { delta, .. } => final_text.push_str(&delta),
+                AgentEvent::Error { message } => panic!("error: {message}"),
+                AgentEvent::Done { .. } => {}
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(started_name, "ask_user");
+        assert!(ok, "an answered question is a successful tool result");
+        assert_eq!(result, "main.rs");
+        assert_eq!(final_text, "using main.rs");
+        assert_eq!(msg.content, "using main.rs");
+
+        // History: user, assistant(tool_calls), tool(answer), assistant(final).
+        let history = store.get_messages(&s.id);
+        assert_eq!(history.len(), 4);
+        assert_eq!(history[2].role, Role::Tool);
+        assert_eq!(history[2].tool_call_id.as_deref(), Some("ask_1"));
+        assert_eq!(history[2].content, "main.rs");
+    }
+
+    /// #44: a dismissed question (the default `ask` returns `None`) still emits a
+    /// matching tool result, so history never goes malformed.
+    #[tokio::test]
+    async fn dismissed_ask_emits_tool_result_not_hang() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = MemoryStore::new();
+        let s = store.create_session(None);
+        store.add_message(&s.id, Role::User, "edit the file".into());
+        let registry = ToolRegistry::with_defaults();
+        // AlwaysDeny uses the default `ask` (returns None) -> dismissed.
+        let approve = AlwaysDeny;
+        let provider = AskThenText {
+            calls: AtomicUsize::new(0),
+        };
+
+        let mut result = String::new();
+        let msg = run_turn(
+            &provider,
+            &store,
+            &ctx(&registry, dir.path(), &approve),
+            &s.id,
+            "mock",
+            None,
+            CancelToken::new(),
+            |ev| {
+                if let AgentEvent::ToolCallFinished { result: r, .. } = ev {
+                    result = r;
+                }
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(result.contains("no answer"));
+        let history = store.get_messages(&s.id);
+        assert_eq!(history[2].role, Role::Tool);
+        assert_eq!(history[2].tool_call_id.as_deref(), Some("ask_1"));
+        // Turn still completed with the follow-up assistant text.
+        assert_eq!(msg.content, "using main.rs");
     }
 
     /// Cancelling mid-execution must still leave a matching tool result for every

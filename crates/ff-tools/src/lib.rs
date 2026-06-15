@@ -1,5 +1,5 @@
 //! Built-in tools the agent can call: `bash`, `view`, `edit`, `write`, `grep`,
-//! `glob`, `tree`, `todo`, `web_fetch`.
+//! `glob`, `tree`, `todo`, `web_fetch`, `ask_user`.
 //!
 //! File tools ([`view`], [`edit`], [`write`]) are hard-jailed to a per-session workspace root
 //! via [`jail::resolve_in_root`]. `bash` runs in that root as its working directory
@@ -12,7 +12,11 @@
 //! [`web_fetch`] reaches the network: it is `Safety::Write` (approval-gated) and
 //! guarded against SSRF (internal/loopback/cloud-metadata targets) by
 //! [`url_safety::SsrfPolicy`].
+//!
+//! [`ask_user`] is interactive: it pauses the turn for user input (#44) rather than
+//! executing, so the agent loop routes it through the host's `Approver::ask`.
 
+mod ask_user;
 mod bash;
 mod edit;
 mod glob;
