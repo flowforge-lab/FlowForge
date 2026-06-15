@@ -131,6 +131,55 @@ impl Tool for UninstallSkillTool {
     }
 }
 
+/// Lists every installed skill with name, version and description. No arguments —
+/// simply reads the live registry so the model can see what capabilities exist on this
+/// machine without restarting.
+pub struct SkillsTool {
+    registry: SharedRegistry,
+}
+
+impl SkillsTool {
+    pub fn new(registry: SharedRegistry) -> Self {
+        Self { registry }
+    }
+}
+
+#[async_trait]
+impl Tool for SkillsTool {
+    fn name(&self) -> &str {
+        "skills"
+    }
+
+    fn description(&self) -> &str {
+        "List every installed skill (name, version, description). Read-only — no parameters."
+    }
+
+    fn parameters(&self) -> Value {
+        serde_json::json!({})
+    }
+
+    fn safety(&self, _args: &Value) -> Safety {
+        Safety::ReadOnly
+    }
+
+    async fn run(&self, _args: Value, _root: &std::path::Path) -> ToolOutcome {
+        let reg = self.registry.read().unwrap();
+        if reg.is_empty() {
+            return ToolOutcome::ok("(no skills installed)".to_string());
+        }
+        let listing: Vec<_> = reg
+            .list()
+            .map(|s| {
+                format!(
+                    "- {} v{} — {}",
+                    s.manifest.name, s.manifest.version, s.manifest.description
+                )
+            })
+            .collect();
+        ToolOutcome::ok(listing.join("\n"))
+    }
+}
+
 /// Ranks installed skills for a query so the agent can discover capabilities to
 /// activate (RFC 0001 §6). Read-only — never gated. Shares `ff_skills::search_skills`
 /// with the palette-facing `search_skills` Tauri command, so ranking is identical.
@@ -316,5 +365,46 @@ mod tests {
 
         assert!(out.success, "{}", out.content);
         assert!(reg.read().unwrap().get("demo").is_none());
+    }
+
+    #[tokio::test]
+    async fn skills_tool_lists_empty_registry() {
+        let tool = SkillsTool::new(shared());
+        assert_eq!(tool.safety(&serde_json::json!({})), Safety::ReadOnly);
+        let out = tool
+            .run(serde_json::json!({}), std::path::Path::new("."))
+            .await;
+        assert!(out.success, "{}", out.content);
+        assert_eq!(out.content, "(no skills installed)");
+    }
+
+    #[tokio::test]
+    async fn skills_tool_lists_populated_registry() {
+        let tmp = tempdir().unwrap();
+        let skills = tmp.path().join("skills");
+        for (dir, name, desc, ver) in [
+            ("alpha", "alpha", "alpha skill", "1.0.0"),
+            ("zulu", "zulu", "zulu helper", "2.3.1"),
+        ] {
+            let d = skills.join(dir);
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(
+                d.join("SKILL.md"),
+                format!("---\nname: {name}\ndescription: {desc}\nversion: {ver}\n---\nbody\n"),
+            )
+            .unwrap();
+        }
+        let reg = shared();
+        state::reload_registry(&skills, &reg);
+
+        let tool = SkillsTool::new(reg.clone());
+        let out = tool.run(serde_json::json!({}), tmp.path()).await;
+        assert!(out.success, "{}", out.content);
+        assert!(out.content.contains("alpha"));
+        assert!(out.content.contains("v1.0.0"));
+        assert!(out.content.contains("alpha skill"));
+        assert!(out.content.contains("zulu"));
+        assert!(out.content.contains("v2.3.1"));
+        assert!(out.content.contains("zulu helper"));
     }
 }

@@ -226,6 +226,7 @@ impl AppState {
         tools.register(Box::new(crate::tools::SearchSkillsTool::new(
             skills.clone(),
         )));
+        tools.register(Box::new(crate::tools::SkillsTool::new(skills.clone())));
         let state = Self {
             store: MemoryStore::new(),
             config: Mutex::new(config),
