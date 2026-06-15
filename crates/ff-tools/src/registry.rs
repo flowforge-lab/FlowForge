@@ -56,6 +56,16 @@ pub trait Tool: Send + Sync {
     fn safety(&self, _args: &Value) -> Safety {
         Safety::Write
     }
+    /// Interactive tools don't execute against the workspace — they pause the turn to
+    /// ask the user something and resume with the answer (e.g. `ask_user`, #44). The
+    /// agent loop routes them through [`Approver::ask`] instead of [`Tool::run`].
+    ///
+    /// Invariant: interactive tools MUST be side-effect-free ([`Safety::ReadOnly`]).
+    /// The agent loop resolves them *before* the approval gate, so an interactive
+    /// tool that performed `Write` work would bypass approval entirely.
+    fn interactive(&self) -> bool {
+        false
+    }
     async fn run(&self, args: Value, root: &Path) -> ToolOutcome;
 }
 
@@ -83,6 +93,7 @@ impl ToolRegistry {
         r.register(Box::new(crate::tree::TreeTool));
         r.register(Box::new(crate::todo::TodoTool));
         r.register(Box::new(crate::web_fetch::WebFetchTool::new()));
+        r.register(Box::new(crate::ask_user::AskUserTool));
         r
     }
 
@@ -132,6 +143,12 @@ impl ToolRegistry {
             None => Safety::Dangerous,
         }
     }
+
+    /// Whether a tool pauses the turn for user input rather than executing (#44).
+    /// Unknown tools are never interactive.
+    pub fn is_interactive(&self, name: &str) -> bool {
+        self.get(name).is_some_and(Tool::interactive)
+    }
 }
 
 #[cfg(test)]
@@ -150,7 +167,7 @@ mod tests {
     fn advertises_default_schemas() {
         let reg = ToolRegistry::with_defaults();
         let tools = reg.openai_tools();
-        assert_eq!(tools.len(), 9);
+        assert_eq!(tools.len(), 10);
         let names: Vec<_> = tools
             .iter()
             .map(|t| t["function"]["name"].as_str().unwrap())
@@ -165,6 +182,7 @@ mod tests {
             "tree",
             "todo",
             "web_fetch",
+            "ask_user",
         ] {
             assert!(names.contains(&expected), "missing tool: {expected}");
         }

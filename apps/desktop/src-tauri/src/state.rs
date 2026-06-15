@@ -27,6 +27,10 @@ struct ApprovalRegistry {
     /// other. Removed when the user responds, or dropped (denying the call) when
     /// the turn is cancelled. The sender wakes the awaiting approver.
     pending: HashMap<(String, String), oneshot::Sender<bool>>,
+    /// (session_id, call_id) -> pending `ask_user` question (#44). Same keying,
+    /// liveness, and cancel-via-drop semantics as `pending`, but carries the typed
+    /// answer string instead of an approve/deny bool.
+    pending_asks: HashMap<(String, String), oneshot::Sender<String>>,
 }
 
 /// Builds a fresh [`Provider`] from a [`ProviderConfig`]. Called once per turn so a
@@ -382,14 +386,38 @@ impl AppState {
         }
     }
 
-    /// Drop every pending approval for this session — dropping the sender resolves
-    /// the awaiting receiver with `Err`, which the approver translates to a deny.
+    /// Drop every pending approval AND pending question for this session — dropping
+    /// the sender resolves the awaiting future with `Err`, which the approver
+    /// translates to a deny / a dismissed question. Called on turn cancel so neither
+    /// an open approval nor an open `ask_user` can hang the turn.
     pub fn cancel_pending_approvals(&self, session_id: &str) {
-        self.approvals
-            .lock()
-            .unwrap()
-            .pending
-            .retain(|(sid, _), _| sid != session_id);
+        let mut reg = self.approvals.lock().unwrap();
+        reg.pending.retain(|(sid, _), _| sid != session_id);
+        reg.pending_asks.retain(|(sid, _), _| sid != session_id);
+    }
+
+    /// Reserve a slot for an `ask_user` question (#44). Mirrors `register_approval`:
+    /// the same TOCTOU liveness guard refuses (drops the sender -> `Err` -> `None`
+    /// dismissed) when the session has no live turn, so a cancel racing registration
+    /// can never orphan the sender.
+    pub fn register_ask(&self, session_id: &str, call_id: &str) -> oneshot::Receiver<String> {
+        let (tx, rx) = oneshot::channel();
+        let mut reg = self.approvals.lock().unwrap();
+        if reg.cancels.contains_key(session_id) {
+            reg.pending_asks
+                .insert((session_id.to_string(), call_id.to_string()), tx);
+        }
+        // else: `tx` drops here -> `rx` resolves to `Err` -> the question is dismissed.
+        rx
+    }
+
+    /// Deliver the user's answer to an awaiting `ask_user`. An unknown
+    /// `(session_id, call_id)` is a no-op (race: cancel raced the submit).
+    pub fn resolve_ask(&self, session_id: &str, call_id: &str, answer: String) {
+        let key = (session_id.to_string(), call_id.to_string());
+        if let Some(tx) = self.approvals.lock().unwrap().pending_asks.remove(&key) {
+            let _ = tx.send(answer);
+        }
     }
 }
 
@@ -531,6 +559,52 @@ mod tests {
         state.resolve_approval("sess-2", "dup", false);
         assert!(rx1.await.unwrap());
         assert!(!rx2.await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn ask_delivers_answer() {
+        let state = AppState::new();
+        arm(&state, "sess");
+        let rx = state.register_ask("sess", "ask-1");
+        state.resolve_ask("sess", "ask-1", "main.rs".to_string());
+        assert_eq!(rx.await.unwrap(), "main.rs");
+    }
+
+    #[tokio::test]
+    async fn cancel_dismisses_pending_ask_via_drop() {
+        let state = AppState::new();
+        arm(&state, "sess-x");
+        let rx = state.register_ask("sess-x", "ask-2");
+        state.cancel_pending_approvals("sess-x");
+        // Sender dropped -> RecvError -> caller treats as a dismissed question.
+        assert!(rx.await.is_err());
+    }
+
+    #[tokio::test]
+    async fn register_ask_without_live_turn_dismisses_immediately() {
+        let state = AppState::new();
+        // No `arm` -> no live cancel token -> the TOCTOU guard refuses the slot.
+        let rx = state.register_ask("ghost", "ask-3");
+        assert!(rx.await.is_err());
+    }
+
+    #[tokio::test]
+    async fn cancel_dismisses_ask_only_for_matching_session() {
+        let state = AppState::new();
+        arm(&state, "sess-a");
+        arm(&state, "sess-b");
+        let rx_a = state.register_ask("sess-a", "a");
+        let rx_b = state.register_ask("sess-b", "b");
+        state.cancel_pending_approvals("sess-a");
+        state.resolve_ask("sess-b", "b", "kept".to_string());
+        assert!(rx_a.await.is_err());
+        assert_eq!(rx_b.await.unwrap(), "kept");
+    }
+
+    #[tokio::test]
+    async fn resolve_unknown_ask_is_noop() {
+        let state = AppState::new();
+        state.resolve_ask("nope", "nope", "x".to_string());
     }
 
     #[test]
