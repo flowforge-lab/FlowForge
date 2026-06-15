@@ -1151,6 +1151,10 @@ name = "ff-signals"
 version = "0.1.0"
 dependencies = [
  "ff-core",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "ts-rs",
 ]
 
 [[package]]
