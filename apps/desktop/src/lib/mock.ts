@@ -349,9 +349,23 @@ export class MockIpc implements FfIpc {
     };
     this.activeTimers.set(sessionId, turn);
 
-    // A couple of auto-resolving read steps before the approval-gated write, so
-    // a turn is genuinely multi-step and exercises the StepGroup fold (#17): the
+    // A planning checklist first (exercises the todo render — Issue #42), then a
+    // couple of auto-resolving read steps before the approval-gated write, so a
+    // turn is genuinely multi-step and exercises the StepGroup fold (#17): the
     // "N steps" header, live count while streaming, and collapse on turn:done.
+    this.emitAutoStep(
+      sessionId,
+      assistant.id,
+      "todo",
+      {
+        items: [
+          { content: "Read the README", status: "completed" },
+          { content: "Find the FlowForge references", status: "in_progress" },
+          { content: "Update the title", status: "pending" },
+        ],
+      },
+      "[x] Read the README\n[~] Find the FlowForge references\n[ ] Update the title",
+    );
     this.emitAutoStep(
       sessionId,
       assistant.id,
