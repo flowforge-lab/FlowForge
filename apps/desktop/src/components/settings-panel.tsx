@@ -2,9 +2,10 @@ import { useEffect, useRef } from "react";
 import { Settings, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { ThemeSettings } from "@/components/theme-settings";
+import { SearchSettings } from "@/components/search-settings";
 import { useSettingsStore } from "@/store/settings";
 
-/** Slide-over settings shell — theme/font today, provider settings (#8) later. */
+/** Slide-over settings shell — theme, web search, provider settings (#8) later. */
 export function SettingsPanel() {
   const open = useSettingsStore((s) => s.open);
   if (!open) return null;
@@ -55,6 +56,7 @@ function SettingsBody() {
 
         <div className="flex-1 overflow-y-auto px-4 py-4">
           <ThemeSettings />
+          <SearchSettings />
 
           <section className="mt-8 border-t pt-5">
             <h3 className="mb-1 text-[13px] font-medium text-foreground">
