@@ -8,6 +8,8 @@ export type { SkillInfo } from "./SkillInfo";
 export type { SkillManifest } from "./SkillManifest";
 export type { ProviderConfig } from "./ProviderConfig";
 export type { ProviderKind } from "./ProviderKind";
+export type { SearchConfig } from "./SearchConfig";
+export type { SearchBackend } from "./SearchBackend";
 export type { SessionStatus } from "./SessionStatus";
 export type { TokenEvent } from "./TokenEvent";
 export type { ToolApprovalRequestEvent } from "./ToolApprovalRequestEvent";

@@ -8,6 +8,8 @@ import type {
   Message,
   ProviderConfig,
   ProviderKind,
+  SearchConfig,
+  SearchBackend,
   Session,
   TokenEvent,
   TurnDoneEvent,
@@ -141,6 +143,13 @@ export class MockIpc implements FfIpc {
   private providerConfig: ProviderConfig = {
     kind: "candleVllm",
     model: "Qwen3-4B-Instruct-2507",
+    hasKey: false,
+  };
+
+  // Web-search settings (Issue #43). Defaults mirror the backend: SearXNG with no
+  // endpoint configured. Persistence is in-memory for the mock session.
+  private searchConfig: SearchConfig = {
+    backend: "searxNg",
     hasKey: false,
   };
 
@@ -311,6 +320,24 @@ export class MockIpc implements FfIpc {
     return this.providerConfig.kind === "ollama"
       ? ["llama3.2", "qwen2.5", "mistral"]
       : ["Qwen3-4B-Instruct-2507", "Qwen3-8B-Instruct"];
+  }
+
+  async getSearchConfig(): Promise<SearchConfig> {
+    return { ...this.searchConfig };
+  }
+
+  async setSearchConfig(
+    backend: SearchBackend,
+    baseUrl: string | undefined,
+  ): Promise<SearchConfig> {
+    const trimmed = baseUrl?.trim();
+    this.searchConfig = {
+      backend,
+      baseUrl: trimmed ? trimmed : undefined,
+      // Secrets are a later phase; the mock never has a key.
+      hasKey: false,
+    };
+    return { ...this.searchConfig };
   }
 
   async warmup(): Promise<void> {

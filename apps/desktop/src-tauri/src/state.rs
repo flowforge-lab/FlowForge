@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 
 use ff_agent::CancelToken;
-use ff_core::{Phenotype, ProviderConfig, ProviderKind};
+use ff_core::{Phenotype, ProviderConfig, ProviderKind, SearchConfig};
 use ff_llm::{OllamaProvider, OpenAiProvider, Provider};
 use ff_memory::MemoryStore;
 use ff_skills::{
@@ -63,6 +63,34 @@ fn load_config() -> ProviderConfig {
 /// config authoritative for this session rather than failing the command.
 fn save_config(config: &ProviderConfig) {
     let Some(path) = config_path() else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    if let Ok(json) = serde_json::to_string_pretty(config) {
+        let _ = fs::write(path, json);
+    }
+}
+
+/// `~/.config/flowforge/search.json` — persisted, non-secret web-search settings.
+/// `None` only when the OS exposes no config dir (settings stay in-memory then).
+fn search_config_path() -> Option<PathBuf> {
+    dirs::config_dir().map(|d| d.join("flowforge").join("search.json"))
+}
+
+/// Loads persisted web-search settings, falling back to the default (SearXNG, no
+/// endpoint) when the file is missing or unparseable.
+fn load_search_config() -> SearchConfig {
+    search_config_path()
+        .and_then(|p| fs::read_to_string(p).ok())
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+/// Persists web-search settings. Best-effort, like [`save_config`].
+fn save_search_config(config: &SearchConfig) {
+    let Some(path) = search_config_path() else {
         return;
     };
     if let Some(parent) = path.parent() {
@@ -137,6 +165,10 @@ pub struct AppState {
     /// Persisted, non-secret LLM provider settings. Swapped wholesale by
     /// `set_provider_config`; snapshotted (never held across an await) per turn.
     config: Mutex<ProviderConfig>,
+    /// Persisted, non-secret web-search settings, shared (via `Arc`) with the
+    /// registered `web_search` tool so a runtime backend switch is visible without
+    /// rebuilding the registry.
+    search_config: Arc<Mutex<SearchConfig>>,
     pub tools: ToolRegistry,
     /// Per-session workspace roots are an M3 concern (folder picker). For M2 every
     /// session shares one default root; the field is threaded so the picker is
@@ -171,7 +203,13 @@ impl AppState {
         let (watcher, skills) = load_skills();
         // The installer tools are agent-callable, so they own the skills root and a
         // handle to the shared registry to refresh it on a successful install.
+        // Shared so the registered `web_search` tool and `set_search_config` see the
+        // same cell; a settings change takes effect on the next call.
+        let search_config = Arc::new(Mutex::new(load_search_config()));
         let mut tools = ToolRegistry::with_defaults();
+        tools.register(Box::new(crate::web_search::WebSearchTool::new(
+            search_config.clone(),
+        )));
         tools.register(Box::new(crate::tools::InstallSkillTool::new(
             skills_root(),
             skills.clone(),
@@ -186,6 +224,7 @@ impl AppState {
         let state = Self {
             store: MemoryStore::new(),
             config: Mutex::new(config),
+            search_config,
             tools,
             workspace_root: default_workspace_root(),
             skills,
@@ -249,6 +288,18 @@ impl AppState {
     pub fn set_provider_config(&self, config: ProviderConfig) {
         save_config(&config);
         *self.config.lock().unwrap() = config;
+    }
+
+    /// Current web-search settings (clone — callers never hold the lock).
+    pub fn search_config(&self) -> SearchConfig {
+        self.search_config.lock().unwrap().clone()
+    }
+
+    /// Replace and persist web-search settings. Visible to the `web_search` tool on
+    /// its next call (they share the `Arc`).
+    pub fn set_search_config(&self, config: SearchConfig) {
+        save_search_config(&config);
+        *self.search_config.lock().unwrap() = config;
     }
 
     /// Build a provider + model snapshot from the current config for one turn.

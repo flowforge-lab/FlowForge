@@ -1,5 +1,6 @@
 //! Built-in tools the agent can call: `bash`, `view`, `edit`, `write`, `grep`,
-//! `glob`, `tree`, `todo`, `web_fetch`, `ask_user`.
+//! `glob`, `tree`, `todo`, `web_fetch`, `ask_user`. The `web_search` tool lives
+//! in the desktop crate (it reads user-configured search settings).
 //!
 //! File tools ([`view`], [`edit`], [`write`]) are hard-jailed to a per-session workspace root
 //! via [`jail::resolve_in_root`]. `bash` runs in that root as its working directory
@@ -26,9 +27,10 @@ mod jail;
 mod registry;
 mod todo;
 mod tree;
-mod url_safety;
+pub mod url_safety;
 mod view;
 mod web_fetch;
 mod write;
 
 pub use registry::{Safety, Tool, ToolOutcome, ToolRegistry};
+pub use url_safety::SsrfPolicy;

@@ -4,6 +4,7 @@
 
 mod state;
 mod tools;
+mod web_search;
 
 use async_trait::async_trait;
 use ff_agent::{run_turn, AgentEvent, Approver, CancelToken, ToolContext};
@@ -13,8 +14,8 @@ use ff_core::events::{
     TurnDoneEvent, TurnErrorEvent,
 };
 use ff_core::{
-    Message, Phenotype, ProviderConfig, ProviderKind, Role, Session, Skill, SkillInfo,
-    SkillManifest,
+    Message, Phenotype, ProviderConfig, ProviderKind, Role, SearchConfig, Session, Skill,
+    SkillInfo, SkillManifest,
 };
 use ff_tools::Safety;
 use state::AppState;
@@ -324,6 +325,32 @@ fn set_provider_config(
     config
 }
 
+/// Current persisted web-search settings.
+#[tauri::command]
+fn get_search_config(state: State<'_, Arc<AppState>>) -> SearchConfig {
+    state.search_config()
+}
+
+/// Persist new web-search settings. Returns the stored config so the UI can confirm
+/// the applied state (e.g. `hasKey`, which the frontend never sets itself).
+#[tauri::command]
+fn set_search_config(
+    state: State<'_, Arc<AppState>>,
+    backend: ff_core::SearchBackend,
+    base_url: Option<String>,
+) -> SearchConfig {
+    let current = state.search_config();
+    let config = SearchConfig {
+        backend,
+        // Treat an empty string from the UI the same as "no endpoint configured".
+        base_url: base_url.filter(|u| !u.trim().is_empty()),
+        // Secrets are a later phase; preserve whatever the backend already knows.
+        has_key: current.has_key,
+    };
+    state.set_search_config(config.clone());
+    config
+}
+
 /// Best-effort model list for the configured provider's endpoint. Returns an empty
 /// list (never an error) when the server is unreachable so the picker degrades to
 /// free-text entry.
@@ -534,6 +561,8 @@ pub fn run() {
             respond_ask,
             get_provider_config,
             set_provider_config,
+            get_search_config,
+            set_search_config,
             list_models,
             warmup,
             install_skill,

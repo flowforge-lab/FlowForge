@@ -6,10 +6,12 @@
 pub mod events;
 mod message;
 mod provider;
+mod search;
 mod session;
 mod skill;
 
 pub use message::{Message, Role, ToolCall};
 pub use provider::{ProviderConfig, ProviderKind};
+pub use search::{SearchBackend, SearchConfig};
 pub use session::{auto_title, Session, SessionStatus};
 pub use skill::{Phenotype, Skill, SkillInfo, SkillManifest};
