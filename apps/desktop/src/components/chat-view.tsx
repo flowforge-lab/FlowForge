@@ -13,11 +13,13 @@ function MessageRow({
   streaming,
   toolSteps,
   onRespond,
+  onAnswer,
 }: {
   message: Message;
   streaming: boolean;
   toolSteps: ToolStep[];
   onRespond: (callId: string, approved: boolean) => void;
+  onAnswer: (callId: string, answer: string) => void;
 }) {
   if (message.role === "user") {
     return (
@@ -54,12 +56,17 @@ function MessageRow({
               multi-step flood, and one step isn't a flood. 2+ steps fold into a
               collapsible "N steps" group. */}
           {toolSteps.length === 1 ? (
-            <ToolStepBlock step={toolSteps[0]} onRespond={onRespond} />
+            <ToolStepBlock
+              step={toolSteps[0]}
+              onRespond={onRespond}
+              onAnswer={onAnswer}
+            />
           ) : (
             <StepGroup
               steps={toolSteps}
               streaming={streaming}
               onRespond={onRespond}
+              onAnswer={onAnswer}
             />
           )}
         </div>
@@ -92,6 +99,7 @@ export function ChatView() {
   );
   const toolStepsByMessage = useChatStore((s) => s.toolStepsByMessage);
   const respondApproval = useChatStore((s) => s.respondApproval);
+  const respondAsk = useChatStore((s) => s.respondAsk);
 
   const scrollRef = useRef<HTMLDivElement>(null);
   const pinnedToBottom = useRef(true);
@@ -146,6 +154,9 @@ export function ChatView() {
             toolSteps={toolStepsByMessage[m.id] ?? []}
             onRespond={(callId, approved) =>
               void respondApproval(m.sessionId, m.id, callId, approved)
+            }
+            onAnswer={(callId, answer) =>
+              void respondAsk(m.sessionId, m.id, callId, answer)
             }
           />
         ))}

@@ -13,6 +13,7 @@ import type {
   TurnDoneEvent,
   TurnErrorEvent,
   ToolApprovalRequestEvent,
+  ToolAskRequestEvent,
   ToolCallEvent,
   ToolResultEvent,
 } from "@/bindings";
@@ -24,9 +25,16 @@ export interface ToolStep {
   callId: string;
   tool: string;
   args: unknown;
-  status: "running" | "awaiting-approval" | "done" | "error";
+  status:
+    | "running"
+    | "awaiting-approval"
+    | "awaiting-answer"
+    | "done"
+    | "error";
   /** Set when status is "awaiting-approval" — the call's trust level. */
   safety?: ApprovalSafety;
+  /** Set when status is "awaiting-answer" — the `ask_user` question (#44). */
+  question?: string;
   result?: string;
   /** Wall-clock epoch ms when the tool:call arrived. Frontend-set — the backend
    *  contract carries no timing (Issue #17); used only to derive a turn's total
@@ -86,6 +94,13 @@ interface ChatState {
     messageId: string,
     callId: string,
     approved: boolean,
+  ) => Promise<void>;
+  applyAskRequest: (e: ToolAskRequestEvent) => void;
+  respondAsk: (
+    sessionId: string,
+    messageId: string,
+    callId: string,
+    answer: string,
   ) => Promise<void>;
 }
 
@@ -455,6 +470,53 @@ export const useChatStore = create<ChatState>((set, get) => ({
       // field (and thus the buttons) re-render correctly.
       console.error("respondApproval IPC failed:", err);
       setStatus("awaiting-approval");
+    }
+  },
+
+  applyAskRequest: (e) => {
+    set((s) => {
+      const steps = s.toolStepsByMessage[e.messageId];
+      if (!steps) return s;
+      return {
+        toolStepsByMessage: {
+          ...s.toolStepsByMessage,
+          [e.messageId]: steps.map((step) =>
+            step.callId === e.callId
+              ? { ...step, status: "awaiting-answer", question: e.question }
+              : step,
+          ),
+        },
+      };
+    });
+  },
+
+  respondAsk: async (sessionId, messageId, callId, answer) => {
+    const setStatus = (status: ToolStep["status"]) =>
+      set((s) => {
+        const steps = s.toolStepsByMessage[messageId];
+        if (!steps) return s;
+        return {
+          toolStepsByMessage: {
+            ...s.toolStepsByMessage,
+            [messageId]: steps.map((step) =>
+              step.callId === callId ? { ...step, status } : step,
+            ),
+          },
+        };
+      });
+
+    // Optimistically flip to running: the answer becomes the tool result and the
+    // turn resumes, so the prompt should clear immediately rather than sit on the
+    // submit button while the round-trip completes. The backend then emits a
+    // tool:result that settles the step.
+    setStatus("running");
+    try {
+      await ipc.respondAsk(sessionId, callId, answer);
+    } catch (err) {
+      // IPC failed — the backend never received the answer. Revert to the prompt
+      // so the user can retry; `question` is untouched, so it re-renders intact.
+      console.error("respondAsk IPC failed:", err);
+      setStatus("awaiting-answer");
     }
   },
 }));

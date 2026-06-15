@@ -14,12 +14,16 @@ export function StepGroup({
   steps,
   streaming,
   onRespond,
+  onAnswer,
 }: {
   steps: ToolStep[];
   streaming: boolean;
   onRespond: (callId: string, approved: boolean) => void;
+  onAnswer?: (callId: string, answer: string) => void;
 }) {
-  const awaiting = steps.some((s) => s.status === "awaiting-approval");
+  const awaiting = steps.some(
+    (s) => s.status === "awaiting-approval" || s.status === "awaiting-answer",
+  );
   // null = untouched (follow the turn); true/false = an explicit user choice.
   const [userOpen, setUserOpen] = useState<boolean | null>(null);
   const open = resolveGroupOpen({ awaiting, userOpen, streaming });
@@ -60,6 +64,7 @@ export function StepGroup({
               key={step.callId}
               step={step}
               onRespond={onRespond}
+              onAnswer={onAnswer}
             />
           ))}
         </div>
