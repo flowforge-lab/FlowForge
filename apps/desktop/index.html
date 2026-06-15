@@ -5,6 +5,41 @@
     <link rel="icon" type="image/svg+xml" href="/vite.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>FlowForge</title>
+    <script>
+      (function () {
+        try {
+          var fonts = {
+            geist: '"Geist Variable", sans-serif',
+            inter: '"Inter Variable", sans-serif',
+          };
+          var theme = "system";
+          var font = "geist";
+          var raw = localStorage.getItem("ff-prefs");
+          if (raw) {
+            var parsed = JSON.parse(raw);
+            var state = parsed.state || parsed;
+            if (state.theme) theme = state.theme;
+            if (state.font) font = state.font;
+          } else {
+            var legacy = localStorage.getItem("ff-theme");
+            if (legacy === "light" || legacy === "dark") theme = legacy;
+          }
+          var dark =
+            theme === "dark" ||
+            (theme === "system" &&
+              window.matchMedia("(prefers-color-scheme: dark)").matches);
+          document.documentElement.classList.toggle("dark", dark);
+          if (fonts[font]) {
+            document.documentElement.style.setProperty(
+              "--font-sans",
+              fonts[font],
+            );
+          }
+        } catch (e) {
+          /* localStorage blocked — fall through to CSS defaults */
+        }
+      })();
+    </script>
   </head>
 
   <body>

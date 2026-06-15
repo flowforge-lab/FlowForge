@@ -6,9 +6,11 @@ import { InputBar } from "@/components/input-bar";
 import { SplitPanel } from "@/components/split-panel";
 import { CommandPalette } from "@/components/palette";
 import { ShortcutsOverlay } from "@/components/shortcuts-overlay";
+import { SettingsPanel } from "@/components/settings-panel";
 import { useChatStore } from "@/store/chat";
 import { useSplitStore } from "@/store/split";
 import { usePaletteStore } from "@/store/palette";
+import { useSettingsStore } from "@/store/settings";
 import { useShortcutsStore } from "@/store/shortcuts";
 
 // True when focus is in a text-entry element, so a bare "?" types instead of
@@ -29,13 +31,15 @@ function useGlobalShortcuts() {
     function onKeyDown(e: KeyboardEvent) {
       const palette = usePaletteStore.getState();
       const shortcuts = useShortcutsStore.getState();
+      const settings = useSettingsStore.getState();
       const mod = e.metaKey || e.ctrlKey;
 
-      // ⌘/Ctrl+K is home: toggle the palette from anywhere. Close the help
-      // overlay first so the two never stack (both are z-50).
+      // ⌘/Ctrl+K is home: toggle the palette from anywhere. Close overlays
+      // first so they never stack (all are z-50).
       if (mod && e.key.toLowerCase() === "k") {
         e.preventDefault();
         shortcuts.closeShortcuts();
+        settings.closeSettings();
         palette.togglePalette();
         return;
       }
@@ -60,6 +64,15 @@ function useGlobalShortcuts() {
         if (e.key === "Escape") {
           e.preventDefault();
           shortcuts.closeShortcuts();
+        }
+        return;
+      }
+      // Settings panel owns the keyboard the same way — Esc must not fall
+      // through to split-close / cancel-turn (PR #78 review).
+      if (settings.open) {
+        if (e.key === "Escape") {
+          e.preventDefault();
+          settings.closeSettings();
         }
         return;
       }
@@ -129,6 +142,7 @@ export function AppShell() {
       </main>
       <CommandPalette />
       <ShortcutsOverlay />
+      <SettingsPanel />
     </div>
   );
 }
