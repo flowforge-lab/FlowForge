@@ -24,6 +24,9 @@ import type {
   SkillsChangedEvent,
   SkillEvolveApprovalRequestEvent,
   Phenotype,
+  McpServerStatus,
+  McpServerConfig,
+  McpStatusChangedEvent,
 } from "../bindings";
 
 export type Unlisten = () => void;
@@ -104,6 +107,19 @@ export interface FfIpc {
    *  choice across restarts. Rejects an unknown name. Resolves with the phenotype now active. */
   switchPhenotype(name: string): Promise<Phenotype>;
 
+  // MCP servers (M4.4, RFC 0003). Enable/disable/add/remove write `mcp.json`; the
+  // config watcher reconciles the supervisor, which then emits `mcp:status-changed`.
+  /** Current status snapshot of every configured MCP server. */
+  listMcpServers(): Promise<McpServerStatus[]>;
+  /** Drive an immediate restart of one server (bypasses backoff). No-op if unknown. */
+  restartMcpServer(id: string): Promise<void>;
+  /** Enable or disable one server: flips `disabled` in `mcp.json` and reconciles. */
+  setMcpServerEnabled(id: string, enabled: boolean): Promise<void>;
+  /** Add (or replace) a server definition in `mcp.json` and reconcile. */
+  addMcpServer(def: McpServerConfig): Promise<void>;
+  /** Remove a server definition from `mcp.json` and reconcile. No-op if absent. */
+  removeMcpServer(id: string): Promise<void>;
+
   // Events (backend -> frontend)
   onToken(cb: (e: TokenEvent) => void): Promise<Unlisten>;
   onTurnDone(cb: (e: TurnDoneEvent) => void): Promise<Unlisten>;
@@ -124,6 +140,10 @@ export interface FfIpc {
   /** The agent asked the user a clarifying question (#44, `ask_user`); render a
    *  prompt and reply via `respondAsk`. */
   onAskRequest(cb: (e: ToolAskRequestEvent) => void): Promise<Unlisten>;
+  /** One or more MCP servers changed status (start/stop/restart/connect failure, or
+   *  an enable/disable/add/remove reload). Carries the full snapshot; re-fetch
+   *  definitions via `listMcpServers`. */
+  onMcpStatusChanged(cb: (e: McpStatusChangedEvent) => void): Promise<Unlisten>;
 }
 
 // Explicit mock flag OR auto-fallback when not inside a Tauri window.
@@ -219,6 +239,16 @@ class TauriIpc implements FfIpc {
   switchPhenotype = (name: string) =>
     this.invoke<Phenotype>("switch_phenotype", { name });
 
+  listMcpServers = () => this.invoke<McpServerStatus[]>("list_mcp_servers");
+  restartMcpServer = (id: string) =>
+    this.invoke<void>("restart_mcp_server", { id });
+  setMcpServerEnabled = (id: string, enabled: boolean) =>
+    this.invoke<void>("set_mcp_server_enabled", { id, enabled });
+  addMcpServer = (def: McpServerConfig) =>
+    this.invoke<void>("add_mcp_server", { def });
+  removeMcpServer = (id: string) =>
+    this.invoke<void>("remove_mcp_server", { id });
+
   onToken = (cb: (e: TokenEvent) => void) =>
     this.listen<TokenEvent>("turn:token", cb);
   onTurnDone = (cb: (e: TurnDoneEvent) => void) =>
@@ -244,6 +274,8 @@ class TauriIpc implements FfIpc {
       "skill:evolve-approval-request",
       cb,
     );
+  onMcpStatusChanged = (cb: (e: McpStatusChangedEvent) => void) =>
+    this.listen<McpStatusChangedEvent>("mcp:status-changed", cb);
 }
 
 // `MockIpc` is pulled in with a dynamic import so the bundler gives it its own

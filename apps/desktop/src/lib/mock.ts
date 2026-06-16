@@ -24,6 +24,9 @@ import type {
   SkillsChangedEvent,
   SkillEvolveApprovalRequestEvent,
   Phenotype,
+  McpServerStatus,
+  McpServerConfig,
+  McpStatusChangedEvent,
 } from "../bindings";
 import type { FfIpc, Unlisten } from "./ipc";
 import { autoTitle } from "./auto-title";
@@ -118,6 +121,20 @@ const MOCK_PHENOTYPES: Phenotype[] = [
   },
 ];
 
+// Canned MCP server statuses so the servers panel (#91) is exercisable offline.
+// One running with tools, one that restarted once, one failed-to-spawn.
+const MOCK_MCP: McpServerStatus[] = [
+  { id: "github", state: "running", toolCount: 8, restarts: 0, pid: 4242 },
+  { id: "filesystem", state: "running", toolCount: 3, restarts: 1, pid: 4243 },
+  {
+    id: "playwright",
+    state: "failed",
+    toolCount: 0,
+    lastError: "spawn npx ENOENT",
+    restarts: 5,
+  },
+];
+
 interface ActiveTurn {
   // All pending interval/timeout handles for this turn, cleared on cancel.
   timers: ReturnType<typeof setInterval>[];
@@ -196,6 +213,12 @@ export class MockIpc implements FfIpc {
   private archivedVersions = new Map<string, string[]>();
   private activeSkills = new Set<string>();
   private activePhenotype: Phenotype = DEFAULT_PHENOTYPE;
+
+  // MCP server statuses, keyed by id (mutated by enable/disable/restart/add/remove).
+  private mcpServers = new Map<string, McpServerStatus>(
+    MOCK_MCP.map((s) => [s.id, { ...s }]),
+  );
+  private mcpStatusListeners = new Set<Listener<McpStatusChangedEvent>>();
 
   async createSession(goal?: string): Promise<Session> {
     const ts = now();
@@ -297,6 +320,46 @@ export class MockIpc implements FfIpc {
   }
   onAskRequest(cb: Listener<ToolAskRequestEvent>): Promise<Unlisten> {
     return this.subscribe(this.askRequestListeners, cb);
+  }
+  onMcpStatusChanged(cb: Listener<McpStatusChangedEvent>): Promise<Unlisten> {
+    return this.subscribe(this.mcpStatusListeners, cb);
+  }
+
+  async listMcpServers(): Promise<McpServerStatus[]> {
+    return [...this.mcpServers.values()]
+      .sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))
+      .map((s) => ({ ...s }));
+  }
+
+  async restartMcpServer(id: string): Promise<void> {
+    const s = this.mcpServers.get(id);
+    if (!s) return;
+    s.restarts += 1;
+    s.state = "running";
+    s.lastError = undefined;
+    this.emitMcpStatusChanged();
+  }
+
+  async setMcpServerEnabled(id: string, enabled: boolean): Promise<void> {
+    const s = this.mcpServers.get(id);
+    if (!s) return;
+    s.state = enabled ? "running" : "disabled";
+    if (enabled) s.lastError = undefined;
+    this.emitMcpStatusChanged();
+  }
+
+  async addMcpServer(def: McpServerConfig): Promise<void> {
+    this.mcpServers.set(def.id, {
+      id: def.id,
+      state: def.disabled ? "disabled" : "running",
+      toolCount: 0,
+      restarts: 0,
+    });
+    this.emitMcpStatusChanged();
+  }
+
+  async removeMcpServer(id: string): Promise<void> {
+    if (this.mcpServers.delete(id)) this.emitMcpStatusChanged();
   }
 
   async respondApproval(
@@ -733,6 +796,14 @@ export class MockIpc implements FfIpc {
   private emitSkillsChanged(): void {
     this.emit(this.skillsChangedListeners, {
       active: [...this.activeSkills].sort(),
+    });
+  }
+
+  private emitMcpStatusChanged(): void {
+    this.emit(this.mcpStatusListeners, {
+      servers: [...this.mcpServers.values()]
+        .sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))
+        .map((s) => ({ ...s })),
     });
   }
 
