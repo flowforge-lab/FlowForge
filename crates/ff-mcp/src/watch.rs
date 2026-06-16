@@ -11,9 +11,11 @@
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, RecvTimeoutError};
+
 use std::sync::{Arc, RwLock};
 use std::thread;
 use std::time::Duration;
+use tokio::sync::mpsc as tokio_mpsc;
 
 use ff_core::McpServerConfig;
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
@@ -34,21 +36,27 @@ pub struct McpConfigWatcher {
 }
 
 impl McpConfigWatcher {
-    /// Load `path` once and start watching it. Returns the watcher (keep it alive) and
-    /// the shared config it keeps current. The initial parse error (if any) is returned
-    /// so the caller can surface it; later reload errors are logged and leave the last
-    /// good config in place.
+    /// Load `path` once and start watching it. Returns the watcher (keep it alive), the
+    /// shared config it keeps current, and a change receiver that yields once after each
+    /// successful reload so the supervisor (M4.2) can re-`reconcile`. The initial parse
+    /// error (if any) is returned so the caller can surface it; later reload errors are
+    /// logged and leave the last good config in place.
     ///
     /// The parent directory is watched rather than the file itself: editors commonly
     /// save via rename/replace, which drops a watch pinned to the original inode. Events
     /// are then filtered to the config file's own name ([`event_touches`]) so unrelated
     /// sibling writes under `~/.flowforge/` — e.g. `skill_signals.json`, rewritten every
     /// turn — don't trigger a per-turn no-op reload.
-    pub fn spawn(path: PathBuf) -> Result<(Self, SharedConfig), McpError> {
+    pub fn spawn(
+        path: PathBuf,
+    ) -> Result<(Self, SharedConfig, tokio_mpsc::UnboundedReceiver<()>), McpError> {
         let initial = config::load(&path)?;
         let shared: SharedConfig = Arc::new(RwLock::new(initial));
 
         let (tx, rx) = mpsc::channel::<()>();
+        // Fires once per applied reload; the supervisor awaits this to reconcile. An
+        // unbounded sender keeps the sync debounce worker non-blocking.
+        let (change_tx, change_rx) = tokio_mpsc::unbounded_channel::<()>();
 
         let reload_target = Arc::clone(&shared);
         let reload_path = path.clone();
@@ -62,6 +70,8 @@ impl McpConfigWatcher {
                     }
                 }
                 reload(&reload_path, &reload_target);
+                // Notify the supervisor; a closed receiver (app shutting down) is fine.
+                let _ = change_tx.send(());
             }
         });
 
@@ -88,7 +98,7 @@ impl McpConfigWatcher {
             .watch(&watch_dir, RecursiveMode::NonRecursive)
             .map_err(|e| notify_err(&path, e))?;
 
-        Ok((Self { _watcher: watcher }, shared))
+        Ok((Self { _watcher: watcher }, shared, change_rx))
     }
 }
 
@@ -200,7 +210,7 @@ mod tests {
     fn spawn_missing_file_starts_empty() {
         let tmp = tempdir().unwrap();
         let path = tmp.path().join("mcp.json");
-        let (_w, shared) = McpConfigWatcher::spawn(path).unwrap();
+        let (_w, shared, _rx) = McpConfigWatcher::spawn(path).unwrap();
         assert!(shared.read().unwrap().is_empty());
     }
 
@@ -210,7 +220,7 @@ mod tests {
         let path = tmp.path().join("mcp.json");
         fs::write(&path, ONE).unwrap();
 
-        let (_w, shared) = McpConfigWatcher::spawn(path.clone()).unwrap();
+        let (_w, shared, _rx) = McpConfigWatcher::spawn(path.clone()).unwrap();
         assert_eq!(shared.read().unwrap().len(), 1);
 
         // Smoke: edit and give the watcher + debounce window time to fire. Tolerant of

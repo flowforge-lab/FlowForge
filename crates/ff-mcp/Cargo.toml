@@ -25,3 +25,4 @@ dirs = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+libc = "0.2"

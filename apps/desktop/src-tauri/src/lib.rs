@@ -23,7 +23,7 @@ use ff_signals::SkillAggregate;
 use ff_tools::Safety;
 use state::AppState;
 use std::sync::Arc;
-use tauri::{Emitter, State};
+use tauri::{Emitter, Manager, State};
 use uuid::Uuid;
 
 /// Per-turn telemetry accumulator (RFC 0001 §8), filled by the agent-event closure
@@ -769,9 +769,16 @@ fn switch_phenotype(
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let state = Arc::new(AppState::new());
+    let app = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
-        .manage(Arc::new(AppState::new()))
+        .manage(state.clone())
+        .setup(move |_app| {
+            // The supervisor's actor is `tokio::spawn`'d; defer to here so a runtime
+            // is alive (Tauri 2 runs `setup` inside its async runtime).
+            state.init_mcp();
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             create_session,
             list_sessions,
@@ -801,6 +808,18 @@ pub fn run() {
             get_phenotype,
             switch_phenotype,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application");
+    app.run(|app, event| {
+        if let tauri::RunEvent::ExitRequested { .. } = event {
+            // Stop every MCP child cleanly while the runtime is still alive — drop
+            // alone reaps the child via `process_wrap`, but its background task needs
+            // a live Tokio runtime, which exits with the app (RFC 0003 §5).
+            if let Some(state) = app.try_state::<Arc<AppState>>() {
+                if let Some(handle) = state.mcp_handle() {
+                    tauri::async_runtime::block_on(handle.stop_all());
+                }
+            }
+        }
+    });
 }
