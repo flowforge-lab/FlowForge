@@ -17,4 +17,11 @@ pub enum McpError {
     /// A tool was called with arguments that are not a JSON object.
     #[error("tool arguments must be a JSON object")]
     BadArguments,
+    /// `mcp.json` could not be read, parsed, or watched (M4.1).
+    #[error("MCP config error: {0}")]
+    Config(String),
+    /// A `${env:VAR}` reference in `mcp.json` had no matching process-environment
+    /// variable. We fail closed rather than spawn with a missing secret (M4.1).
+    #[error("server '{server}': environment variable '{var}' referenced in mcp.json is not set")]
+    MissingEnvVar { server: String, var: String },
 }
