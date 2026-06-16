@@ -1,9 +1,15 @@
-// Unified display preferences — theme + font. Persisted to localStorage under
-// `"ff-prefs"` via zustand/middleware; `subscribe` applies side-effects on change.
+// Unified display preferences — theme, font, font scale, display name,
+// notifications, open-thread budget. Persisted to localStorage under `"ff-prefs"`
+// via zustand/middleware; `subscribe` applies side-effects on change.
 
 import { create } from "zustand";
 import { persist } from "zustand/middleware";
-import { applyFont, type Font } from "@/lib/fonts";
+import {
+  applyFont,
+  applyFontScale,
+  clampFontScale,
+  type Font,
+} from "@/lib/fonts";
 import {
   applyTheme,
   resolveEffectiveTheme,
@@ -14,13 +20,69 @@ import {
 const STORAGE_KEY = "ff-prefs";
 const LEGACY_THEME_KEY = "ff-theme";
 
+/** FE-only notification flags (SET.2). No OS notifications fired yet. */
+export interface NotificationPrefs {
+  enabled: boolean;
+  messageComplete: boolean;
+  approvalRequests: boolean;
+  sound: boolean;
+}
+
+/** Bounds for the open-thread budget (max sessions kept loaded, LRU). */
+export const OPEN_THREADS_MIN = 3;
+export const OPEN_THREADS_MAX = 20;
+
 export interface PrefsState {
   theme: Theme;
   font: Font;
+  /** Root font scale, percent (see FONT_SCALE_MIN/MAX). */
+  fontScale: number;
+  /** Overrides the author name on sent messages; blank = system alias. */
+  displayName: string;
+  notifications: NotificationPrefs;
+  /** Max threads kept loaded (LRU); FE flag until the backend consumes it. */
+  openThreads: number;
   setTheme: (theme: Theme) => void;
   setFont: (font: Font) => void;
+  setFontScale: (scale: number) => void;
+  setDisplayName: (name: string) => void;
+  setNotifications: (partial: Partial<NotificationPrefs>) => void;
+  setOpenThreads: (count: number) => void;
   /** Quick light/dark flip — leaves `"system"` by picking the opposite effective mode. */
   toggleTheme: () => void;
+  /** Reset only the Appearance-owned prefs to their defaults (SET.2 footer reset). */
+  resetAppearance: () => void;
+}
+
+/** Default values for the Appearance-owned prefs. Shared by initial state and
+ *  `resetAppearance` so the footer reset and first-run agree. */
+const APPEARANCE_DEFAULTS: Pick<
+  PrefsState,
+  | "theme"
+  | "font"
+  | "fontScale"
+  | "displayName"
+  | "notifications"
+  | "openThreads"
+> = {
+  theme: "system",
+  font: "geist",
+  fontScale: 100,
+  displayName: "",
+  notifications: {
+    enabled: true,
+    messageComplete: true,
+    approvalRequests: true,
+    sound: false,
+  },
+  openThreads: 10,
+};
+
+function clampOpenThreads(count: number): number {
+  return Math.min(
+    OPEN_THREADS_MAX,
+    Math.max(OPEN_THREADS_MIN, Math.round(count)),
+  );
 }
 
 /** Lift a pre-#62 `ff-theme` value into prefs on first rehydrate. Exported for tests. */
@@ -40,18 +102,25 @@ export function migrateLegacyTheme(): Partial<Pick<PrefsState, "theme">> {
 export const usePrefsStore = create<PrefsState>()(
   persist(
     (set, get) => ({
-      theme: "system",
-      font: "geist",
+      ...APPEARANCE_DEFAULTS,
       setTheme: (theme) => set({ theme }),
       setFont: (font) => set({ font }),
+      setFontScale: (scale) => set({ fontScale: clampFontScale(scale) }),
+      setDisplayName: (displayName) => set({ displayName }),
+      setNotifications: (partial) =>
+        set((s) => ({ notifications: { ...s.notifications, ...partial } })),
+      setOpenThreads: (count) => set({ openThreads: clampOpenThreads(count) }),
       toggleTheme: () => {
         const { theme } = get();
         const effective = resolveEffectiveTheme(theme);
         set({ theme: effective === "light" ? "dark" : "light" });
       },
+      resetAppearance: () => set({ ...APPEARANCE_DEFAULTS }),
     }),
     {
       name: STORAGE_KEY,
+      // `current` (defaults) first so blobs persisted before SET.2 — which lack
+      // the new keys — hydrate with sensible defaults rather than `undefined`.
       merge: (persisted, current) => ({
         ...current,
         ...(persisted as Partial<PrefsState>),
@@ -61,6 +130,7 @@ export const usePrefsStore = create<PrefsState>()(
         if (state) {
           applyTheme(state.theme);
           applyFont(state.font);
+          applyFontScale(state.fontScale);
         }
       },
     },
@@ -74,14 +144,16 @@ export function initPrefs(): void {
   if (initialized) return;
   initialized = true;
 
-  const { theme, font } = usePrefsStore.getState();
+  const { theme, font, fontScale } = usePrefsStore.getState();
   applyTheme(theme);
   applyFont(font);
+  applyFontScale(fontScale);
   setupSystemThemeListener(() => usePrefsStore.getState().theme);
 
   usePrefsStore.subscribe((state) => {
     applyTheme(state.theme);
     applyFont(state.font);
+    applyFontScale(state.fontScale);
   });
 }
 

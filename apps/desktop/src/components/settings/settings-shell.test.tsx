@@ -24,10 +24,14 @@ describe("SettingsShell", () => {
     expect(html).toContain("disabled");
   });
 
-  it("shows the migrated theme + web-search UI in the default Appearance section", () => {
+  it("shows the Appearance sub-tabs with the Theme tab active by default", () => {
     const html = renderToStaticMarkup(<SettingsShell />);
+    // Theme tab content…
+    expect(html).toContain("Mode");
     expect(html).toContain("Font");
-    expect(html).toContain("Web search");
+    // …plus the Notifications / Advanced sub-tabs in the bar.
+    expect(html).toContain("Notifications");
+    expect(html).toContain("Advanced");
     expect(html).not.toContain("Coming soon.");
   });
 });
@@ -47,16 +51,17 @@ describe("section switching", () => {
     expect(useSettingsStore.getState().resetHandler).toBeNull();
   });
 
-  it("routes appearance to the migrated UI and unbuilt sections to ComingSoon", () => {
+  it("routes appearance to its sub-tabs and unbuilt sections to ComingSoon", () => {
     const appearance = renderToStaticMarkup(
       <SettingsSectionContent id="appearance" />,
     );
-    expect(appearance).toContain("Web search");
+    expect(appearance).toContain("Mode");
+    expect(appearance).toContain("Font");
     expect(appearance).not.toContain("Coming soon.");
 
     const model = renderToStaticMarkup(<SettingsSectionContent id="model" />);
     expect(model).toContain("Coming soon.");
     expect(model).toContain("Model");
-    expect(model).not.toContain("Web search");
+    expect(model).not.toContain("Display name");
   });
 });

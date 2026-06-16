@@ -2,7 +2,15 @@
 
 import { afterEach, describe, expect, it } from "vitest";
 
-import { FONTS, applyFont, fontCssValue } from "./fonts";
+import {
+  FONTS,
+  FONT_SCALE_MAX,
+  FONT_SCALE_MIN,
+  applyFont,
+  applyFontScale,
+  clampFontScale,
+  fontCssValue,
+} from "./fonts";
 
 describe("font registry", () => {
   it("lists geist and inter with css values", () => {
@@ -30,5 +38,27 @@ describe("applyFont", () => {
     expect(document.documentElement.style.getPropertyValue("--font-sans")).toBe(
       '"Geist Variable", sans-serif',
     );
+  });
+});
+
+describe("font scale", () => {
+  afterEach(() => {
+    document.documentElement.style.removeProperty("font-size");
+  });
+
+  it("clamps to the supported range", () => {
+    expect(clampFontScale(40)).toBe(FONT_SCALE_MIN);
+    expect(clampFontScale(999)).toBe(FONT_SCALE_MAX);
+    expect(clampFontScale(112.4)).toBe(112);
+  });
+
+  it("applies the scale as a root font-size percentage", () => {
+    applyFontScale(120);
+    expect(document.documentElement.style.fontSize).toBe("120%");
+  });
+
+  it("clamps out-of-range scales before applying", () => {
+    applyFontScale(1000);
+    expect(document.documentElement.style.fontSize).toBe(`${FONT_SCALE_MAX}%`);
   });
 });
