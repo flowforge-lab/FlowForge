@@ -154,6 +154,14 @@ impl SupervisorHandle {
         })
     }
 
+    /// Drive an immediate restart of one server, bypassing the backoff schedule.
+    /// Unlike auto-recovery this also revives a server parked in `Failed`, so it backs
+    /// a UI "Restart" button. Fire-and-forget: the new status arrives via the shared
+    /// snapshot. Unknown ids are a no-op.
+    pub async fn restart(&self, id: &str) {
+        let _ = self.cmd_tx.send(Cmd::Restart { id: id.to_string() }).await;
+    }
+
     /// Stop every server and exit the actor. Returns once all graceful-close calls
     /// have completed (or timed out) so the caller can let the Tokio runtime wind
     /// down with no children still waiting to be reaped.
@@ -168,6 +176,9 @@ impl SupervisorHandle {
 
 enum Cmd {
     Reconcile,
+    Restart {
+        id: String,
+    },
     StopAll(oneshot::Sender<()>),
     CallTool {
         server: String,
@@ -284,6 +295,7 @@ impl Supervisor {
                 Some(()) = self.change_rx.recv() => self.reconcile().await,
                 Some(cmd) = self.cmd_rx.recv() => match cmd {
                     Cmd::Reconcile => self.reconcile().await,
+                    Cmd::Restart { id } => self.restart(&id).await,
                     Cmd::StopAll(ack) => {
                         self.stop_all().await;
                         let _ = ack.send(());
@@ -319,6 +331,29 @@ impl Supervisor {
                 ReconcileAction::Start(cfg) => self.start(cfg).await,
             }
         }
+        self.publish();
+    }
+
+    /// Manual restart of a single server (from [`SupervisorHandle::restart`]). Resolves
+    /// the definition from the live handle, falling back to the desired config, so even
+    /// a server parked in `Failed` (auto-retry exhausted) can be revived. Stops the
+    /// current client, then starts fresh — bypassing the backoff timer. A fresh handle
+    /// resets the auto-`restarts` counter, which is correct: that counter tracks
+    /// automatic recoveries since the last clean start. Unknown ids are a no-op.
+    async fn restart(&mut self, id: &str) {
+        let cfg = match self.handles.get(id) {
+            Some(h) => Some(h.config.clone()),
+            None => self
+                .shared_config
+                .read()
+                .ok()
+                .and_then(|g| g.iter().find(|c| c.id == id).cloned()),
+        };
+        let Some(cfg) = cfg else {
+            return;
+        };
+        self.stop(id).await;
+        self.start(cfg).await;
         self.publish();
     }
 

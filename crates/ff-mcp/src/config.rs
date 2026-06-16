@@ -18,12 +18,12 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use ff_core::McpServerConfig;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::error::McpError;
 
 /// Top-level `mcp.json` document.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize, Serialize)]
 struct RawConfig {
     #[serde(default, rename = "mcpServers")]
     mcp_servers: BTreeMap<String, RawServerEntry>,
@@ -31,16 +31,24 @@ struct RawConfig {
 
 /// One server entry as written under `mcpServers` — the id is the surrounding map key,
 /// so it is absent here and folded in by [`load`].
-#[derive(Debug, Deserialize)]
+///
+/// On write-back the optional fields are omitted when empty/false so a managed
+/// rewrite stays close to the hand-authored Claude/Cursor shape.
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct RawServerEntry {
     command: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     args: Vec<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     env: BTreeMap<String, String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_false")]
     disabled: bool,
+}
+
+/// `skip_serializing_if` predicate: omit `disabled` when it is the default `false`.
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 /// Parse and validate `mcp.json` at `path`, returning the server set sorted by id.
@@ -54,6 +62,81 @@ pub fn load(path: &Path) -> Result<Vec<McpServerConfig>, McpError> {
         Err(e) => return Err(McpError::Config(format!("reading {}: {e}", path.display()))),
     };
     parse(&text, &resolve_from_process_env)
+}
+
+/// Enable or disable one server by id, leaving every other entry — and the targeted
+/// entry's `${env:...}` templates — byte-for-byte intact.
+///
+/// Errors if the id is not present, so a stale UI cannot silently no-op.
+pub fn set_disabled(path: &Path, id: &str, disabled: bool) -> Result<(), McpError> {
+    let mut raw = read_raw(path)?;
+    match raw.mcp_servers.get_mut(id) {
+        Some(entry) => entry.disabled = disabled,
+        None => {
+            return Err(McpError::Config(format!(
+                "no MCP server '{id}' in {}",
+                path.display()
+            )))
+        }
+    }
+    write_raw(path, &raw)
+}
+
+/// Add a new server definition or replace an existing one with the same id.
+///
+/// The entry is written verbatim from `def` — the caller (UI add-form) supplies the
+/// literal `command`/`args`/`env` it wants on disk. `${env:...}` strings are stored
+/// as-is and resolved later by [`load`]; no secret injection happens here.
+pub fn upsert(path: &Path, def: &McpServerConfig) -> Result<(), McpError> {
+    let mut raw = read_raw(path)?;
+    raw.mcp_servers.insert(
+        def.id.clone(),
+        RawServerEntry {
+            command: def.command.clone(),
+            args: def.args.clone(),
+            env: def.env.clone(),
+            disabled: def.disabled,
+        },
+    );
+    write_raw(path, &raw)
+}
+
+/// Remove a server definition by id. A no-op (still `Ok`) if the id is absent, so a
+/// double-remove from the UI is harmless.
+pub fn remove(path: &Path, id: &str) -> Result<(), McpError> {
+    let mut raw = read_raw(path)?;
+    if raw.mcp_servers.remove(id).is_some() {
+        write_raw(path, &raw)?;
+    }
+    Ok(())
+}
+
+/// Read the document **without** resolving `${env:...}` references, so write-back
+/// round-trips the raw templates instead of baking resolved secrets back into the
+/// file. A missing file is an empty document (the file is created on first write).
+fn read_raw(path: &Path) -> Result<RawConfig, McpError> {
+    match std::fs::read_to_string(path) {
+        Ok(t) => {
+            serde_json::from_str(&t).map_err(|e| McpError::Config(format!("invalid mcp.json: {e}")))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(RawConfig::default()),
+        Err(e) => Err(McpError::Config(format!("reading {}: {e}", path.display()))),
+    }
+}
+
+/// Serialize the raw document back to `path` (pretty, trailing newline), creating the
+/// parent directory if needed. Matches the plain-`fs::write` persistence convention
+/// used for the other `~/.flowforge` config files.
+fn write_raw(path: &Path, raw: &RawConfig) -> Result<(), McpError> {
+    let mut text = serde_json::to_string_pretty(raw)
+        .map_err(|e| McpError::Config(format!("serializing mcp.json: {e}")))?;
+    text.push('\n');
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| McpError::Config(format!("creating {}: {e}", parent.display())))?;
+    }
+    std::fs::write(path, text)
+        .map_err(|e| McpError::Config(format!("writing {}: {e}", path.display())))
 }
 
 /// Resolve a `${env:VAR}` reference from the real process environment.
@@ -235,5 +318,103 @@ mod tests {
         let env = map_env(&[("A", "1"), ("B", "2")]);
         let servers = parse(text, &env).unwrap();
         assert_eq!(servers[0].env["U"], "1-2");
+    }
+
+    use tempfile::tempdir;
+
+    const WITH_SECRET: &str = r#"{
+        "mcpServers": {
+            "github": {
+                "command": "github-mcp-server",
+                "env": { "GITHUB_TOKEN": "${env:GITHUB_TOKEN}" }
+            }
+        }
+    }"#;
+
+    #[test]
+    fn set_disabled_preserves_env_templates() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("mcp.json");
+        std::fs::write(&path, WITH_SECRET).unwrap();
+
+        set_disabled(&path, "github", true).unwrap();
+
+        // The raw file must still hold the un-resolved template, never the secret.
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(written.contains("${env:GITHUB_TOKEN}"));
+        let raw: RawConfig = serde_json::from_str(&written).unwrap();
+        assert!(raw.mcp_servers["github"].disabled);
+        assert_eq!(
+            raw.mcp_servers["github"].env["GITHUB_TOKEN"],
+            "${env:GITHUB_TOKEN}"
+        );
+    }
+
+    #[test]
+    fn set_disabled_unknown_id_errors() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("mcp.json");
+        std::fs::write(&path, WITH_SECRET).unwrap();
+        assert!(matches!(
+            set_disabled(&path, "nope", true),
+            Err(McpError::Config(_))
+        ));
+    }
+
+    #[test]
+    fn upsert_adds_then_replaces() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("mcp.json");
+
+        let mut def = McpServerConfig {
+            id: "fs".into(),
+            command: "npx".into(),
+            args: vec!["-y".into(), "server-filesystem".into()],
+            env: BTreeMap::new(),
+            disabled: false,
+        };
+        upsert(&path, &def).unwrap();
+        let loaded = load(&path).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].command, "npx");
+
+        def.command = "node".into();
+        def.disabled = true;
+        upsert(&path, &def).unwrap();
+        let loaded = load(&path).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].command, "node");
+        assert!(loaded[0].disabled);
+    }
+
+    #[test]
+    fn upsert_on_missing_file_creates_it() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("nested").join("mcp.json");
+        let def = McpServerConfig {
+            id: "x".into(),
+            command: "c".into(),
+            args: Vec::new(),
+            env: BTreeMap::new(),
+            disabled: false,
+        };
+        upsert(&path, &def).unwrap();
+        assert!(path.exists());
+        assert_eq!(load(&path).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn remove_deletes_and_is_idempotent() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("mcp.json");
+        std::fs::write(&path, WITH_SECRET).unwrap();
+
+        remove(&path, "github").unwrap();
+        assert!(load(&path).unwrap().is_empty());
+
+        // Second remove of an absent id leaves the file byte-identical.
+        let before = std::fs::read_to_string(&path).unwrap();
+        remove(&path, "github").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
     }
 }
