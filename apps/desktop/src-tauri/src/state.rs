@@ -304,16 +304,29 @@ impl AppState {
     /// lifecycle supervisor. Idempotent — a second call is a no-op so a re-`setup`
     /// can't double-spawn. Best-effort: a missing config dir or watcher failure is
     /// logged and leaves MCP disabled rather than failing app start (RFC 0003 §3,5).
-    /// Must be called from a context with a live Tokio runtime (the supervisor's
-    /// actor task is `tokio::spawn`'d), e.g. Tauri's `setup` closure.
+    /// Safe to call from any thread: it enters the shared Tokio runtime itself, so
+    /// callers (e.g. Tauri's `setup`, which runs outside an entered reactor on
+    /// macOS) need not establish a runtime context.
     pub fn init_mcp(&self) {
-        if self.mcp.lock().unwrap().is_some() {
-            return;
-        }
         let Some(path) = ff_mcp::config_path() else {
             tracing::warn!("no home dir; mcp host disabled");
             return;
         };
+        self.init_mcp_at(path);
+    }
+
+    /// Path-injectable core of [`init_mcp`](Self::init_mcp). Owns the runtime-enter
+    /// so the supervisor's `tokio::spawn` always has a live reactor regardless of
+    /// the calling thread (see issue #117). Separated so tests can drive it with a
+    /// tempdir config path from a non-runtime thread.
+    fn init_mcp_at(&self, path: PathBuf) {
+        if self.mcp.lock().unwrap().is_some() {
+            return;
+        }
+        // The supervisor actor is `tokio::spawn`'d; guarantee an entered reactor
+        // regardless of the calling thread's context.
+        let rt = tauri::async_runtime::handle();
+        let _guard = rt.inner().enter();
         let (watcher, shared, change_rx) = match McpConfigWatcher::spawn(path) {
             Ok(t) => t,
             Err(e) => {
@@ -848,5 +861,22 @@ mod tests {
         assert!(state.active_model_override().is_none());
         assert!(state.active_persona().is_none());
         assert!(state.active_skills().is_empty());
+    }
+
+    // Regression guard for issue #117: the supervisor actor is `tokio::spawn`'d, so
+    // `init_mcp` must establish a reactor context itself. This is intentionally a
+    // plain `#[test]` (no `#[tokio::test]`) to mirror Tauri's `setup`, which runs
+    // off-runtime on macOS — pre-fix this panicked with "there is no reactor running".
+    #[test]
+    fn init_mcp_spawns_supervisor_without_an_entered_runtime() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = AppState::new();
+        // Parent dir exists (tempdir); mcp.json is absent => empty config, but the
+        // supervisor still spawns. Exercises the exact path that aborted at boot.
+        state.init_mcp_at(tmp.path().join("mcp.json"));
+        assert!(
+            state.mcp_handle().is_some(),
+            "supervisor must spawn (and not panic) when init runs off-runtime"
+        );
     }
 }
