@@ -9,6 +9,7 @@
 //! - **M4.3** — the `ToolRegistry` bridge.
 
 mod backoff;
+mod bridge;
 mod client;
 mod config;
 mod error;
@@ -19,11 +20,14 @@ mod watch;
 use std::path::PathBuf;
 
 pub use backoff::Backoff;
+pub use bridge::{build_bridged_tools, McpBridgedTool};
 pub use client::McpClient;
 pub use config::load;
 pub use error::McpError;
 pub use reconcile::{reconcile, ReconcileAction};
-pub use supervisor::{spawn as spawn_supervisor, SharedStatus, SupervisorConfig, SupervisorHandle};
+pub use supervisor::{
+    spawn as spawn_supervisor, SharedStatus, SharedTools, SupervisorConfig, SupervisorHandle,
+};
 pub use watch::{McpConfigWatcher, SharedConfig};
 
 /// Path to the MCP host config, `~/.flowforge/mcp.json`. `None` if the home directory

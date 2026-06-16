@@ -32,7 +32,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
-use ff_core::{McpServerConfig, McpServerState, McpServerStatus};
+use ff_core::{McpServerConfig, McpServerState, McpServerStatus, McpToolInfo};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::backoff::Backoff;
@@ -44,10 +44,21 @@ use crate::watch::SharedConfig;
 /// rebuilt vec on every state change; readers never block on the actor.
 pub type SharedStatus = Arc<RwLock<Vec<McpServerStatus>>>;
 
-/// How long a single graceful close may take before we give up and drop the
+/// The flat list of every `Running` server's tools, shared with the desktop shell so
+/// it can compose a per-turn [`ToolRegistry`](ff_tools::ToolRegistry) (M4.3 bridge).
+/// Rebuilt by the actor whenever the running tool set changes; readers never block.
+pub type SharedTools = Arc<RwLock<Vec<McpToolInfo>>>;
+
+/// How long a single graceful `shutdown` may take before we give up and drop the
 /// client, letting `process_wrap`'s kill-on-drop reap the child. Bounds app-exit
 /// latency so one wedged server can't stall the whole quit.
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Upper bound on one bridged tool call. A call is routed through the actor (which
+/// owns the client), so an unbounded call would also stall supervision and app exit;
+/// the timeout caps both. Generous because legitimate MCP tools (network, subprocess)
+/// can be slow, but finite so a wedged server can't hang the actor forever.
+const CALL_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Supervisor tunables. [`Default`] picks production-friendly values; integration tests
 /// override with shorter timings.
@@ -97,6 +108,8 @@ pub struct SupervisorHandle {
     cmd_tx: mpsc::Sender<Cmd>,
     /// The latest status snapshot, kept up to date by the actor.
     pub status: SharedStatus,
+    /// The flat tool list across all `Running` servers, kept current by the actor.
+    pub tools: SharedTools,
 }
 
 impl SupervisorHandle {
@@ -107,9 +120,43 @@ impl SupervisorHandle {
         let _ = self.cmd_tx.send(Cmd::Reconcile).await;
     }
 
-    /// Stop every server and exit the actor. Returns once all `shutdown` calls have
-    /// completed (or timed out) so the caller can let the Tokio runtime wind down with
-    /// no children still waiting to be reaped.
+    /// A snapshot of the currently advertised tools across all `Running` servers.
+    /// Cheap read (clone of the shared vec under a read lock).
+    pub fn tools_snapshot(&self) -> Vec<McpToolInfo> {
+        self.tools.read().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
+    /// Route a tool call through the supervisor actor to the specified server.
+    /// Returns the text content the model sees, or an error if the server is not
+    /// running / the call failed / timed out.
+    pub async fn call_tool(
+        &self,
+        server: &str,
+        tool: &str,
+        args: serde_json::Value,
+    ) -> Result<String, crate::McpError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let cmd = Cmd::CallTool {
+            server: server.to_string(),
+            tool: tool.to_string(),
+            args,
+            reply: reply_tx,
+        };
+        if self.cmd_tx.send(cmd).await.is_err() {
+            return Err(crate::McpError::Protocol(
+                "supervisor actor has exited".into(),
+            ));
+        }
+        reply_rx.await.unwrap_or_else(|_| {
+            Err(crate::McpError::Protocol(
+                "supervisor dropped the reply channel".into(),
+            ))
+        })
+    }
+
+    /// Stop every server and exit the actor. Returns once all graceful-close calls
+    /// have completed (or timed out) so the caller can let the Tokio runtime wind
+    /// down with no children still waiting to be reaped.
     pub async fn stop_all(&self) {
         let (ack_tx, ack_rx) = oneshot::channel();
         if self.cmd_tx.send(Cmd::StopAll(ack_tx)).await.is_err() {
@@ -122,6 +169,12 @@ impl SupervisorHandle {
 enum Cmd {
     Reconcile,
     StopAll(oneshot::Sender<()>),
+    CallTool {
+        server: String,
+        tool: String,
+        args: serde_json::Value,
+        reply: oneshot::Sender<Result<String, crate::McpError>>,
+    },
 }
 
 struct ServerHandle {
@@ -130,7 +183,9 @@ struct ServerHandle {
     config: McpServerConfig,
     client: Option<McpClient>,
     state: McpServerState,
-    tool_count: usize,
+    /// Full tool list from the last successful `list_tools` call. Empty while the
+    /// server is not Running.
+    tools: Vec<McpToolInfo>,
     pid: Option<u32>,
     last_error: Option<String>,
     restarts: u32,
@@ -153,7 +208,7 @@ impl ServerHandle {
             } else {
                 McpServerState::Starting
             },
-            tool_count: 0,
+            tools: Vec::new(),
             pid: None,
             last_error: None,
             restarts: 0,
@@ -168,7 +223,7 @@ impl ServerHandle {
         McpServerStatus {
             id: self.config.id.clone(),
             state: self.state,
-            tool_count: self.tool_count,
+            tool_count: self.tools.len(),
             last_error: self.last_error.clone(),
             restarts: self.restarts,
             pid: self.pid,
@@ -184,17 +239,23 @@ pub fn spawn(
     config: SupervisorConfig,
 ) -> SupervisorHandle {
     let status: SharedStatus = Arc::new(RwLock::new(Vec::new()));
+    let tools: SharedTools = Arc::new(RwLock::new(Vec::new()));
     let (cmd_tx, cmd_rx) = mpsc::channel::<Cmd>(16);
     let actor = Supervisor {
         config,
         handles: BTreeMap::new(),
         shared_config,
         status: Arc::clone(&status),
+        tools: Arc::clone(&tools),
         cmd_rx,
         change_rx,
     };
     tokio::spawn(actor.run());
-    SupervisorHandle { cmd_tx, status }
+    SupervisorHandle {
+        cmd_tx,
+        status,
+        tools,
+    }
 }
 
 struct Supervisor {
@@ -202,6 +263,7 @@ struct Supervisor {
     handles: BTreeMap<String, ServerHandle>,
     shared_config: SharedConfig,
     status: SharedStatus,
+    tools: SharedTools,
     cmd_rx: mpsc::Receiver<Cmd>,
     change_rx: mpsc::UnboundedReceiver<()>,
 }
@@ -226,6 +288,10 @@ impl Supervisor {
                         self.stop_all().await;
                         let _ = ack.send(());
                         return;
+                    }
+                    Cmd::CallTool { server, tool, args, reply } => {
+                        let result = self.do_call_tool(&server, &tool, args).await;
+                        let _ = reply.send(result);
                     }
                 },
                 else => return,
@@ -317,7 +383,7 @@ impl Supervisor {
         let connect_result = McpClient::connect(&cfg, &allow_refs).await;
         let outcome = match connect_result {
             Ok(client) => match client.list_tools().await {
-                Ok(tools) => Ok((client, tools.len())),
+                Ok(tools) => Ok((client, tools)),
                 Err(e) => {
                     let _ = client.shutdown().await;
                     Err(e.to_string())
@@ -331,11 +397,11 @@ impl Supervisor {
             return;
         };
         match outcome {
-            Ok((client, tool_count)) => {
+            Ok((client, tools)) => {
                 let was_restart = h.restarts > 0 || h.failures > 0;
                 h.pid = client.pid();
                 h.client = Some(client);
-                h.tool_count = tool_count;
+                h.tools = tools;
                 h.state = McpServerState::Running;
                 h.last_error = None;
                 h.failures = 0;
@@ -349,7 +415,7 @@ impl Supervisor {
             Err(msg) => {
                 h.client = None;
                 h.pid = None;
-                h.tool_count = 0;
+                h.tools.clear();
                 h.last_error = Some(msg);
                 h.failures = h.failures.saturating_add(1);
                 if h.failures >= max_failures {
@@ -418,18 +484,18 @@ impl Supervisor {
         };
         match result {
             Ok(tools) => {
-                h.tool_count = tools.len();
+                h.tools = tools;
                 h.last_health_check = Some(Instant::now());
                 h.client = Some(client);
-                // Publish so a tool-set change on a healthy server reaches the UI
-                // (M4.4) promptly instead of waiting for the next state transition.
+                // Publish so a tool-set change on a healthy server reaches both the
+                // UI (M4.4) and the bridge (M4.3) promptly.
                 self.publish();
             }
             Err(e) => {
                 // The connection looks dead — drop it and schedule a retry.
                 drop(client);
                 h.pid = None;
-                h.tool_count = 0;
+                h.tools.clear();
                 h.last_error = Some(e.to_string());
                 h.failures = h.failures.saturating_add(1);
                 if h.failures >= max_failures {
@@ -447,8 +513,63 @@ impl Supervisor {
     fn publish(&self) {
         let mut snap: Vec<McpServerStatus> = self.handles.values().map(|h| h.snapshot()).collect();
         snap.sort_by(|a, b| a.id.cmp(&b.id));
-        if let Ok(mut g) = self.status.write() {
-            *g = snap;
+        // Recover from a poisoned lock rather than skipping: we fully overwrite the
+        // Vec, so a previous writer's panic can't leave bad data behind, and skipping
+        // would otherwise freeze the published status permanently. Matches the
+        // poison-tolerant read in `tools_snapshot`.
+        *self.status.write().unwrap_or_else(|p| p.into_inner()) = snap;
+        // Rebuild the flat tool list for the bridge (M4.3). Only Running servers
+        // contribute; Restarting/Failed ones have empty tool vecs anyway.
+        let all_tools: Vec<McpToolInfo> = self
+            .handles
+            .values()
+            .filter(|h| h.state == McpServerState::Running)
+            .flat_map(|h| h.tools.iter().cloned())
+            .collect();
+        *self.tools.write().unwrap_or_else(|p| p.into_inner()) = all_tools;
+    }
+
+    /// Execute a tool call against the named server's live client. Called inline
+    /// from the actor's select loop — blocks supervision for the call's duration
+    /// (bounded by `CALL_TIMEOUT`). This keeps single-ownership of clients intact,
+    /// preserving clean reaping and graceful close (see design note in RFC 0003 §6).
+    async fn do_call_tool(
+        &mut self,
+        server: &str,
+        tool: &str,
+        args: serde_json::Value,
+    ) -> Result<String, crate::McpError> {
+        let client = self
+            .handles
+            .get_mut(server)
+            .and_then(|h| {
+                if h.state == McpServerState::Running {
+                    h.client.take()
+                } else {
+                    None
+                }
+            })
+            .ok_or_else(|| {
+                crate::McpError::Protocol(format!("server '{server}' is not running"))
+            })?;
+
+        let result = tokio::time::timeout(CALL_TIMEOUT, client.call_tool(tool, args)).await;
+
+        // Restore the client regardless of outcome (we didn't kill it). On timeout
+        // the in-flight request is intentionally left to resolve-and-drop: rmcp
+        // multiplexes by request id, so a late response to the abandoned call won't
+        // be mismatched against the next call on the reused client.
+        if let Some(h) = self.handles.get_mut(server) {
+            h.client = Some(client);
+        }
+
+        match result {
+            Ok(Ok(text)) => Ok(text),
+            Ok(Err(e)) => Err(e),
+            Err(_elapsed) => Err(crate::McpError::Protocol(format!(
+                "tool call '{tool}' on server '{server}' timed out after {}s",
+                CALL_TIMEOUT.as_secs()
+            ))),
         }
     }
 }

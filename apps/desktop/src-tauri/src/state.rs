@@ -171,7 +171,6 @@ pub struct AppState {
     /// registered `web_search` tool so a runtime backend switch is visible without
     /// rebuilding the registry.
     search_config: Arc<Mutex<SearchConfig>>,
-    pub tools: ToolRegistry,
     /// Per-session workspace roots are an M3 concern (folder picker). For M2 every
     /// session shares one default root; the field is threaded so the picker is
     /// purely additive later.
@@ -217,27 +216,10 @@ impl AppState {
         // Shared so the registered `web_search` tool and `set_search_config` see the
         // same cell; a settings change takes effect on the next call.
         let search_config = Arc::new(Mutex::new(load_search_config()));
-        let mut tools = ToolRegistry::with_defaults();
-        tools.register(Box::new(crate::web_search::WebSearchTool::new(
-            search_config.clone(),
-        )));
-        tools.register(Box::new(crate::tools::InstallSkillTool::new(
-            skills_root(),
-            skills.clone(),
-        )));
-        tools.register(Box::new(crate::tools::UninstallSkillTool::new(
-            skills_root(),
-            skills.clone(),
-        )));
-        tools.register(Box::new(crate::tools::SearchSkillsTool::new(
-            skills.clone(),
-        )));
-        tools.register(Box::new(crate::tools::SkillsTool::new(skills.clone())));
         let state = Self {
             store: MemoryStore::new(),
             config: Mutex::new(config),
             search_config,
-            tools,
             workspace_root: default_workspace_root(),
             skills,
             _skill_watcher: Mutex::new(watcher),
@@ -298,6 +280,35 @@ impl AppState {
     /// install/uninstall so the change is visible without waiting on the watcher.
     pub fn reload_skills(&self) {
         reload_registry(&skills_root(), &self.skills);
+    }
+
+    /// Build the per-turn tool registry: built-in tools + MCP-bridged tools from
+    /// running servers (RFC 0003 §6). Snapshotted per turn so a hot-reload mid-turn
+    /// never races an in-flight tool call — same discipline as skill snapshots.
+    pub fn build_tool_registry(&self) -> ToolRegistry {
+        let mut reg = ToolRegistry::with_defaults();
+        reg.register(Box::new(crate::web_search::WebSearchTool::new(
+            self.search_config.clone(),
+        )));
+        reg.register(Box::new(crate::tools::InstallSkillTool::new(
+            skills_root(),
+            self.skills.clone(),
+        )));
+        reg.register(Box::new(crate::tools::UninstallSkillTool::new(
+            skills_root(),
+            self.skills.clone(),
+        )));
+        reg.register(Box::new(crate::tools::SearchSkillsTool::new(
+            self.skills.clone(),
+        )));
+        reg.register(Box::new(crate::tools::SkillsTool::new(self.skills.clone())));
+        // Bridge MCP tools from currently-running servers (M4.3).
+        if let Some(handle) = self.mcp_handle() {
+            for tool in ff_mcp::build_bridged_tools(&handle) {
+                reg.register(tool);
+            }
+        }
+        reg
     }
 
     /// Start the MCP host: begin watching `~/.flowforge/mcp.json` and spawn the
