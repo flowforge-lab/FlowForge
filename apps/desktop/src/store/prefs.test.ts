@@ -69,3 +69,101 @@ describe("usePrefsStore toggleTheme", () => {
     expect(usePrefsStore.getState().theme).toBe("light");
   });
 });
+
+describe("appearance prefs (SET.2)", () => {
+  beforeEach(() => {
+    usePrefsStore.getState().resetAppearance();
+  });
+
+  it("defaults the new fields", () => {
+    const s = usePrefsStore.getState();
+    expect(s.fontScale).toBe(100);
+    expect(s.displayName).toBe("");
+    expect(s.openThreads).toBe(10);
+    expect(s.notifications).toEqual({
+      enabled: true,
+      messageComplete: true,
+      approvalRequests: true,
+      sound: false,
+    });
+  });
+
+  it("clamps fontScale and openThreads in their setters", () => {
+    usePrefsStore.getState().setFontScale(9999);
+    expect(usePrefsStore.getState().fontScale).toBe(140);
+    usePrefsStore.getState().setFontScale(10);
+    expect(usePrefsStore.getState().fontScale).toBe(80);
+
+    usePrefsStore.getState().setOpenThreads(99);
+    expect(usePrefsStore.getState().openThreads).toBe(20);
+    usePrefsStore.getState().setOpenThreads(1);
+    expect(usePrefsStore.getState().openThreads).toBe(3);
+  });
+
+  it("merges notification flags without dropping the others", () => {
+    usePrefsStore.getState().setNotifications({ sound: true });
+    expect(usePrefsStore.getState().notifications).toEqual({
+      enabled: true,
+      messageComplete: true,
+      approvalRequests: true,
+      sound: true,
+    });
+  });
+
+  it("resetAppearance restores every appearance default", () => {
+    usePrefsStore.setState({
+      theme: "dark",
+      font: "inter",
+      fontScale: 130,
+      displayName: "Ada",
+      openThreads: 18,
+      notifications: {
+        enabled: false,
+        messageComplete: false,
+        approvalRequests: false,
+        sound: true,
+      },
+    });
+    usePrefsStore.getState().resetAppearance();
+    const s = usePrefsStore.getState();
+    expect(s).toMatchObject({
+      theme: "system",
+      font: "geist",
+      fontScale: 100,
+      displayName: "",
+      openThreads: 10,
+      notifications: {
+        enabled: true,
+        messageComplete: true,
+        approvalRequests: true,
+        sound: false,
+      },
+    });
+  });
+});
+
+describe("ff-prefs hydration of pre-SET.2 blobs", () => {
+  afterEach(() => {
+    localStorage.clear();
+    vi.resetModules();
+  });
+
+  it("fills new keys with defaults when the persisted blob predates them", async () => {
+    // A blob written before SET.2 — only theme/font present.
+    localStorage.setItem(
+      "ff-prefs",
+      JSON.stringify({ state: { theme: "dark", font: "inter" }, version: 0 }),
+    );
+    vi.resetModules();
+    const { usePrefsStore: freshStore } = await import("@/store/prefs");
+    const s = freshStore.getState();
+    // Preserved from the old blob…
+    expect(s.theme).toBe("dark");
+    expect(s.font).toBe("inter");
+    // …and the new keys hydrate to defaults rather than undefined.
+    expect(s.fontScale).toBe(100);
+    expect(s.displayName).toBe("");
+    expect(s.openThreads).toBe(10);
+    expect(s.notifications.enabled).toBe(true);
+  });
+});

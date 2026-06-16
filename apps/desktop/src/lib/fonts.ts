@@ -43,3 +43,18 @@ export function applyFont(font: Font): void {
 export function fontCssValue(font: Font): string | undefined {
   return FONTS.find((f) => f.id === font)?.cssValue;
 }
+
+/** Bounds for the user-facing font scale (percent of root size). */
+export const FONT_SCALE_MIN = 80;
+export const FONT_SCALE_MAX = 140;
+
+/** Clamp an arbitrary scale into the supported range. */
+export function clampFontScale(scale: number): number {
+  return Math.min(FONT_SCALE_MAX, Math.max(FONT_SCALE_MIN, Math.round(scale)));
+}
+
+/** Apply the font scale as the root font-size (percent) on `<html>`, so
+ *  rem-based text scales app-wide. Mirrors how `applyFont` sets `--font-sans`. */
+export function applyFontScale(scale: number): void {
+  document.documentElement.style.fontSize = `${clampFontScale(scale)}%`;
+}
