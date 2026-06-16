@@ -8,8 +8,10 @@
 use std::path::Path;
 
 use async_trait::async_trait;
+use futures_util::StreamExt;
 use reqwest::header::{CONTENT_TYPE, LOCATION, USER_AGENT};
 use reqwest::redirect::Policy;
+use reqwest::Response;
 use serde_json::Value;
 use url::Url;
 
@@ -21,6 +23,9 @@ use crate::url_safety::SsrfPolicy;
 const MAX_REDIRECTS: usize = 5;
 /// Per-request timeout.
 const TIMEOUT_SECS: u64 = 15;
+/// Hard ceiling on raw bytes read from the network (defense in depth). Output is
+/// capped separately by [`MAX_BYTES`] / [`TRUNCATE_BYTES`].
+const MAX_DOWNLOAD_BYTES: u64 = 524_288; // 512 KiB
 const UA: &str = "FlowForge/0.1 (+web_fetch)";
 
 /// How much of a fetched document to return.
@@ -169,16 +174,45 @@ impl WebFetchTool {
                 .unwrap_or("")
                 .to_ascii_lowercase();
 
-            let body = resp
-                .text()
-                .await
-                .map_err(|e| format!("failed to read response body: {e}"))?;
+            let body = read_body_capped(resp).await?;
 
             return Ok(render(&content_type, &body, mode));
         }
 
         Err(format!("too many redirects (>{MAX_REDIRECTS})"))
     }
+}
+
+/// Read the response body with a hard byte ceiling. Rejects up front when
+/// `Content-Length` exceeds the limit; otherwise accumulates streamed chunks until
+/// the cap is reached.
+async fn read_body_capped(resp: Response) -> Result<String, String> {
+    if let Some(len) = resp.content_length() {
+        if len > MAX_DOWNLOAD_BYTES {
+            return Err(format!(
+                "response too large ({len} bytes exceeds {MAX_DOWNLOAD_BYTES} byte download limit)"
+            ));
+        }
+    }
+
+    let mut stream = resp.bytes_stream();
+    let mut buf = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| format!("failed to read response body: {e}"))?;
+        let new_len = buf.len().saturating_add(chunk.len());
+        if new_len as u64 > MAX_DOWNLOAD_BYTES {
+            return Err(format!(
+                "response exceeded {MAX_DOWNLOAD_BYTES} byte download limit"
+            ));
+        }
+        buf.extend_from_slice(&chunk);
+    }
+
+    // Lossy decode: a page declaring iso-8859-1 / windows-1252 / UTF-16, or
+    // carrying a stray invalid byte, degrades to U+FFFD instead of failing the
+    // whole fetch — restoring the graceful behavior of reqwest's old `.text()`
+    // (which an LLM-facing tool wants). The byte ceiling above still holds.
+    Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
 /// Resolve a (possibly relative) `Location` against the current URL.
@@ -193,8 +227,8 @@ fn render(content_type: &str, body: &str, mode: FetchMode) -> String {
     let is_html = content_type.contains("text/html") || content_type.contains("application/xhtml");
     let text = if is_html {
         html_text::html_to_markdown(body)
-    } else if content_type.is_empty() || content_type.starts_with("text/") {
-        // Unknown or plain text: return as-is (still capped below).
+    } else if is_text_passthrough(content_type) {
+        // Plain text, JSON, XML: return as-is (still capped below).
         body.trim().to_string()
     } else {
         return format!(
@@ -213,6 +247,23 @@ fn render(content_type: &str, body: &str, mode: FetchMode) -> String {
     } else {
         capped
     }
+}
+
+/// MIME types returned as plain text (not converted to markdown).
+fn is_text_passthrough(content_type: &str) -> bool {
+    if content_type.is_empty() {
+        return true;
+    }
+    let base = content_type
+        .split(';')
+        .next()
+        .unwrap_or(content_type)
+        .trim();
+    base.starts_with("text/")
+        || base == "application/json"
+        || base.ends_with("+json")
+        || base == "application/xml"
+        || base.ends_with("+xml")
 }
 
 #[cfg(test)]
@@ -255,6 +306,78 @@ mod tests {
         let modes: Vec<_> = modes.iter().map(|v| v.as_str().unwrap()).collect();
         assert_eq!(modes, vec!["full", "truncated"]);
         assert!(!modes.contains(&"distilled"));
+    }
+
+    #[test]
+    fn render_json_and_xml_passthrough() {
+        assert_eq!(
+            render("application/json", r#"{"ok":true}"#, FetchMode::Full),
+            r#"{"ok":true}"#
+        );
+        assert_eq!(
+            render(
+                "application/ld+json",
+                r#"{"@type":"Thing"}"#,
+                FetchMode::Full
+            ),
+            r#"{"@type":"Thing"}"#
+        );
+        assert_eq!(
+            render("application/xml", "<root/>", FetchMode::Full),
+            "<root/>"
+        );
+        assert_eq!(
+            render("application/atom+xml", "<feed/>", FetchMode::Full),
+            "<feed/>"
+        );
+    }
+
+    #[test]
+    fn render_still_rejects_binary_types() {
+        let out = render("application/octet-stream", "data", FetchMode::Full);
+        assert!(out.contains("unsupported content type"));
+    }
+
+    #[tokio::test]
+    async fn fetches_json_api_response() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/json")
+                    .set_body_string(r#"{"status":"ok"}"#),
+            )
+            .mount(&server)
+            .await;
+
+        let url = format!("{}/api", server.uri());
+        let out = loopback_tool()
+            .run(serde_json::json!({ "url": url }), Path::new("."))
+            .await;
+        assert!(out.success, "{}", out.content);
+        assert!(out.content.contains(r#""status":"ok""#), "{}", out.content);
+    }
+
+    #[tokio::test]
+    async fn rejects_oversized_body() {
+        let server = MockServer::start().await;
+        let big = "x".repeat(MAX_DOWNLOAD_BYTES as usize + 1);
+        Mock::given(method("GET"))
+            .and(path("/"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/plain")
+                    .set_body_string(big),
+            )
+            .mount(&server)
+            .await;
+
+        let out = loopback_tool()
+            .run(serde_json::json!({ "url": server.uri() }), Path::new("."))
+            .await;
+        assert!(!out.success, "{}", out.content);
+        assert!(out.content.contains("download limit"), "{}", out.content);
     }
 
     #[tokio::test]
