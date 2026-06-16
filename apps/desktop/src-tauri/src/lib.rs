@@ -312,7 +312,7 @@ fn send_message(
                         },
                     );
                 }
-                AgentEvent::Done { message_id } => {
+                AgentEvent::Done { message_id, .. } => {
                     if let Ok(mut m) = metrics_for_events.lock() {
                         m.note_turn(&message_id);
                     }
