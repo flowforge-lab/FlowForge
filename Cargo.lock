@@ -1253,10 +1253,13 @@ name = "ff-mcp"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "dirs 5.0.1",
  "ff-core",
+ "notify",
  "rmcp",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
