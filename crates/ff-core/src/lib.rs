@@ -4,12 +4,14 @@
 //! regenerate bindings (`cargo test`) and update the mock in the same PR.
 
 pub mod events;
+mod mcp;
 mod message;
 mod provider;
 mod search;
 mod session;
 mod skill;
 
+pub use mcp::{McpServerConfig, McpServerState, McpServerStatus, McpToolInfo};
 pub use message::{Message, Role, ToolCall};
 pub use provider::{ProviderConfig, ProviderKind};
 pub use search::{SearchBackend, SearchConfig};
