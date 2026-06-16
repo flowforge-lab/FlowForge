@@ -1,10 +1,13 @@
 import path from "node:path";
+import react from "@vitejs/plugin-react";
 import { defineConfig } from "vitest/config";
 
-// Unit tests only — the helpers under test are pure, so the default `node`
-// environment is enough (no jsdom / testing-library). The `@` alias mirrors
+// Mostly pure helpers, so the default `node` environment is enough. A few `.tsx`
+// tests render components to static markup (react-dom/server) — no jsdom needed,
+// but the React plugin transforms their JSX. The `@` alias mirrors
 // vite.config.ts and tsconfig's paths.
 export default defineConfig({
+  plugins: [react()],
   resolve: {
     alias: {
       "@": path.resolve(__dirname, "./src"),
@@ -12,6 +15,6 @@ export default defineConfig({
   },
   test: {
     environment: "node",
-    include: ["src/**/*.test.ts"],
+    include: ["src/**/*.test.{ts,tsx}"],
   },
 });
