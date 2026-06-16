@@ -774,8 +774,9 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .manage(state.clone())
         .setup(move |_app| {
-            // The supervisor's actor is `tokio::spawn`'d; defer to here so a runtime
-            // is alive (Tauri 2 runs `setup` inside its async runtime).
+            // `init_mcp` enters the shared Tokio runtime itself, so it's safe to
+            // call here even though Tauri's `setup` runs on the main thread outside
+            // an entered reactor on macOS (issue #117).
             state.init_mcp();
             Ok(())
         })
