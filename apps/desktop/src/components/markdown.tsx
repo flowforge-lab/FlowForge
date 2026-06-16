@@ -148,14 +148,25 @@ const COMPONENTS = {
 
 // Renders assistant Markdown. `react-markdown` escapes raw HTML by default (no
 // rehype-raw here) and sanitizes URLs, so model output can't inject markup.
-// Memoized on `content` so unrelated re-renders don't re-parse; during streaming
-// `content` changes every token, which re-parses — acceptable and smooth for M2.
-function MarkdownImpl({ content }: { content: string }) {
+//
+// `rehype-highlight` (highlight.js) is the heaviest part of the pipeline and runs
+// over the whole document on every render. While `streaming`, `content` grows by a
+// token each render, so highlighting there is O(n^2) and stalls the UI thread on
+// long replies (#104). We drop the highlight pass during streaming — markdown
+// structure still renders live — and run the full pipeline once when the turn
+// finishes (`streaming` flips to false), which highlights the final text.
+function MarkdownImpl({
+  content,
+  streaming = false,
+}: {
+  content: string;
+  streaming?: boolean;
+}) {
   return (
     <div className="ff-prose">
       <ReactMarkdown
         remarkPlugins={[remarkGfm]}
-        rehypePlugins={[rehypeHighlight]}
+        rehypePlugins={streaming ? [] : [rehypeHighlight]}
         components={COMPONENTS}
       >
         {content}
