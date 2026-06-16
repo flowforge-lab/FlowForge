@@ -219,8 +219,10 @@ fn send_message(
             state: state.clone(),
             session_id: sid.clone(),
         };
+        // Snapshot built-in + MCP-bridged tools for this turn (RFC 0003 §6).
+        let registry = state.build_tool_registry();
         let tool_ctx = ToolContext {
-            registry: &state.tools,
+            registry: &registry,
             root: &state.workspace_root,
             approve: &approver,
             max_iterations: 8,

@@ -1310,8 +1310,10 @@ name = "ff-mcp"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "dirs 5.0.1",
  "ff-core",
+ "ff-tools",
  "libc",
  "notify",
  "rmcp",
