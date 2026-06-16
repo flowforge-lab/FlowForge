@@ -19,6 +19,7 @@ reqwest = { workspace = true, features = ["rustls-tls", "stream"] }
 futures-util = { workspace = true }
 url = { workspace = true }
 fast_html2md = { workspace = true }
+dom_smoothie = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

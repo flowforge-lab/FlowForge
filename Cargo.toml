@@ -27,6 +27,7 @@ globset = "0.4"
 reqwest = { version = "0.12", default-features = false }
 url = "2"
 fast_html2md = "0.0.62"
+dom_smoothie = "0.18"
 tempfile = "3"
 toml = "0.8"
 wiremock = "0.6"
