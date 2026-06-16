@@ -33,13 +33,12 @@ const UA: &str = "FlowForge/0.1 (+web_fetch)";
 pub enum FetchMode {
     /// First [`TRUNCATE_BYTES`] of the markdown — a cheap preview.
     Truncated,
-    /// Readability main-content extraction. NOT yet implemented and NOT advertised
-    /// in the tool schema (Option A) — reserved for the `dom_smoothie` follow-up
-    /// (TODO #70). If a caller forces it, `run` returns a clear error.
-    #[allow(dead_code)] // reserved; constructed once #70 lands
-    Distilled,
-    /// Full document as markdown, capped only by [`MAX_BYTES`]. Default mode.
+    /// Readability main-content extraction: strips nav / header / footer / ads and
+    /// returns just the article body as markdown, falling back to `full` when no main
+    /// content is detected. The default — the biggest context-economy win for the model.
     #[default]
+    Distilled,
+    /// Full document as markdown, capped only by [`MAX_BYTES`].
     Full,
 }
 
@@ -48,13 +47,9 @@ impl FetchMode {
         match s {
             "truncated" => Ok(Self::Truncated),
             "full" => Ok(Self::Full),
-            // Reserved but unadvertised (TODO #70).
-            "distilled" => Err(
-                "mode `distilled` is not available yet (tracked in #70); use `full` or `truncated`"
-                    .to_string(),
-            ),
+            "distilled" => Ok(Self::Distilled),
             other => Err(format!(
-                "invalid mode `{other}` (expected `truncated` or `full`)"
+                "invalid mode `{other}` (expected `distilled`, `full`, or `truncated`)"
             )),
         }
     }
@@ -88,20 +83,20 @@ impl Tool for WebFetchTool {
     fn description(&self) -> &str {
         "Fetch a URL over HTTP(S) and return its readable content as Markdown. Does \
          not run JavaScript. Internal, loopback, and cloud-metadata addresses are \
-         refused. `mode`: `full` (default, whole page) or `truncated` (first ~8 KB \
-         preview). Requires approval (network access)."
+         refused. `mode`: `distilled` (default — main article content, boilerplate \
+         stripped), `full` (whole page), or `truncated` (first ~8 KB preview). Requires \
+         approval (network access)."
     }
 
     fn parameters(&self) -> Value {
-        // `distilled` is intentionally absent from this enum until #70 implements it.
         serde_json::json!({
             "type": "object",
             "properties": {
                 "url": { "type": "string", "description": "The http(s) URL to fetch." },
                 "mode": {
                     "type": "string",
-                    "enum": ["full", "truncated"],
-                    "description": "How much to return: `full` (default) or `truncated` (~8 KB preview)."
+                    "enum": ["distilled", "full", "truncated"],
+                    "description": "How much to return: `distilled` (default — main article content, boilerplate stripped), `full` (whole page), or `truncated` (~8 KB preview)."
                 }
             },
             "required": ["url"]
@@ -176,7 +171,7 @@ impl WebFetchTool {
 
             let body = read_body_capped(resp).await?;
 
-            return Ok(render(&content_type, &body, mode));
+            return Ok(render(&content_type, &body, mode, Some(current.as_str())));
         }
 
         Err(format!("too many redirects (>{MAX_REDIRECTS})"))
@@ -223,10 +218,17 @@ fn resolve_redirect(base: &Url, location: &str) -> Result<Url, String> {
 
 /// Turn a response body into the tool's output string, honoring the content type
 /// and the requested mode.
-fn render(content_type: &str, body: &str, mode: FetchMode) -> String {
+fn render(content_type: &str, body: &str, mode: FetchMode, url: Option<&str>) -> String {
     let is_html = content_type.contains("text/html") || content_type.contains("application/xhtml");
     let text = if is_html {
-        html_text::html_to_markdown(body)
+        // `distilled` extracts the main article body, falling back to whole-page
+        // conversion when no main content is found. Other modes convert the full page.
+        match mode {
+            FetchMode::Distilled => {
+                html_text::distill(body, url).unwrap_or_else(|| html_text::html_to_markdown(body))
+            }
+            FetchMode::Full | FetchMode::Truncated => html_text::html_to_markdown(body),
+        }
     } else if is_text_passthrough(content_type) {
         // Plain text, JSON, XML: return as-is (still capped below).
         body.trim().to_string()
@@ -238,8 +240,7 @@ fn render(content_type: &str, body: &str, mode: FetchMode) -> String {
 
     let limit = match mode {
         FetchMode::Truncated => TRUNCATE_BYTES,
-        // `Distilled` is rejected before reaching here; treat as Full defensively.
-        FetchMode::Full | FetchMode::Distilled => MAX_BYTES,
+        FetchMode::Distilled | FetchMode::Full => MAX_BYTES,
     };
     let (capped, truncated) = html_text::cap(&text, limit);
     if truncated {
@@ -293,48 +294,104 @@ mod tests {
     }
 
     #[test]
-    fn distilled_mode_is_rejected_until_70() {
-        assert!(FetchMode::parse("distilled").is_err());
+    fn all_three_modes_parse_and_distilled_is_default() {
+        assert_eq!(FetchMode::parse("distilled").unwrap(), FetchMode::Distilled);
         assert_eq!(FetchMode::parse("full").unwrap(), FetchMode::Full);
         assert_eq!(FetchMode::parse("truncated").unwrap(), FetchMode::Truncated);
+        assert!(FetchMode::parse("bogus").is_err());
+        assert_eq!(FetchMode::default(), FetchMode::Distilled);
     }
 
     #[test]
-    fn schema_advertises_only_full_and_truncated() {
+    fn schema_advertises_all_three_modes() {
         let params = WebFetchTool::new().parameters();
         let modes = params["properties"]["mode"]["enum"].as_array().unwrap();
         let modes: Vec<_> = modes.iter().map(|v| v.as_str().unwrap()).collect();
-        assert_eq!(modes, vec!["full", "truncated"]);
-        assert!(!modes.contains(&"distilled"));
+        assert_eq!(modes, vec!["distilled", "full", "truncated"]);
+    }
+
+    // A page with nav/header/footer boilerplate around a real article body.
+    const BOILERPLATE_PAGE: &str = r#"<html><head><title>News</title></head><body>
+        <nav><a href="/">Home</a><a href="/about">About</a><a href="/login">Sign in</a></nav>
+        <header><h1>SiteName</h1><p>Subscribe to our newsletter for daily updates!</p></header>
+        <article>
+            <h1>Rustaceans Rejoice</h1>
+            <p>This is the substantive article body that the model actually wants to read,
+            with several sentences of real content so the extractor has enough signal to
+            identify it as the main content region of the document.</p>
+            <p>A second meaningful paragraph continues the article with more prose so the
+            scoring heuristics clearly prefer this region over the surrounding chrome.</p>
+        </article>
+        <footer><a href="/privacy">Privacy</a><a href="/terms">Terms</a>
+        <p>Copyright 2026 SiteName Inc. All rights reserved.</p></footer>
+        </body></html>"#;
+
+    #[test]
+    fn distilled_strips_boilerplate_vs_full() {
+        let full = render("text/html", BOILERPLATE_PAGE, FetchMode::Full, None);
+        let distilled = render("text/html", BOILERPLATE_PAGE, FetchMode::Distilled, None);
+
+        // The article body survives both.
+        assert!(distilled.contains("Rustaceans Rejoice"), "{distilled}");
+        assert!(
+            distilled.contains("substantive article body"),
+            "{distilled}"
+        );
+
+        // Header chrome that survives the full HTML->markdown pass is what Readability
+        // additionally strips (the markdown converter already drops <nav>/<footer>).
+        assert!(
+            full.contains("Subscribe to our newsletter") && full.contains("SiteName"),
+            "full should keep header chrome: {full}"
+        );
+        assert!(
+            !distilled.contains("Subscribe to our newsletter") && !distilled.contains("SiteName"),
+            "distilled must strip header chrome: {distilled}"
+        );
+        assert!(
+            distilled.len() < full.len(),
+            "distilled ({}) should be shorter than full ({})",
+            distilled.len(),
+            full.len()
+        );
+    }
+
+    #[test]
+    fn distilled_falls_back_to_full_when_no_main_content() {
+        // A fragment with no extractable article: distilled must not lose the content.
+        let html = "<html><body><p>lone snippet</p></body></html>";
+        let distilled = render("text/html", html, FetchMode::Distilled, None);
+        assert!(distilled.contains("lone snippet"), "{distilled}");
     }
 
     #[test]
     fn render_json_and_xml_passthrough() {
         assert_eq!(
-            render("application/json", r#"{"ok":true}"#, FetchMode::Full),
+            render("application/json", r#"{"ok":true}"#, FetchMode::Full, None),
             r#"{"ok":true}"#
         );
         assert_eq!(
             render(
                 "application/ld+json",
                 r#"{"@type":"Thing"}"#,
-                FetchMode::Full
+                FetchMode::Full,
+                None
             ),
             r#"{"@type":"Thing"}"#
         );
         assert_eq!(
-            render("application/xml", "<root/>", FetchMode::Full),
+            render("application/xml", "<root/>", FetchMode::Full, None),
             "<root/>"
         );
         assert_eq!(
-            render("application/atom+xml", "<feed/>", FetchMode::Full),
+            render("application/atom+xml", "<feed/>", FetchMode::Full, None),
             "<feed/>"
         );
     }
 
     #[test]
     fn render_still_rejects_binary_types() {
-        let out = render("application/octet-stream", "data", FetchMode::Full);
+        let out = render("application/octet-stream", "data", FetchMode::Full, None);
         assert!(out.contains("unsupported content type"));
     }
 

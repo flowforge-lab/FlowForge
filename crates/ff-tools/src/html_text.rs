@@ -2,10 +2,10 @@
 //! rewriter: among the fastest Rust converters with a tiny, input-independent
 //! memory footprint and no html5ever DOM tree to babysit.
 //!
-//! The `distilled` (Readability main-content) extraction mode is intentionally NOT
-//! here yet — see `web_fetch::FetchMode::Distilled`. It is reserved for a follow-up
-//! using `dom_smoothie` (the one Rust Readability port that reliably finds the main
-//! article body) so the small model can ask for boilerplate-free content.
+//! The `distilled` mode ([`distill`]) runs Readability-style main-content extraction
+//! via `dom_smoothie` first — stripping nav / header / footer / ads — then converts the
+//! extracted article HTML through the same markdown pass, so the small model gets only
+//! the body. It falls back to whole-page conversion when no main content is found.
 
 /// Hard safety ceiling on returned bytes, independent of mode, so a huge page can
 /// never flood the model context.
@@ -19,6 +19,38 @@ pub const TRUNCATE_BYTES: usize = 8_000;
 pub fn html_to_markdown(html: &str) -> String {
     let md = md::rewrite_html(html, false);
     collapse_blank_lines(md.trim())
+}
+
+/// Readability main-content extraction (`distilled` mode). Runs `dom_smoothie` to find
+/// the article body, drops surrounding boilerplate, then converts the extracted HTML
+/// with the same [`html_to_markdown`] pass for consistent output. `url`, when known,
+/// lets relative links resolve to absolute.
+///
+/// Returns `None` when no main content is detected (unparseable, or an empty
+/// extraction) so the caller can fall back to a full-page conversion.
+///
+/// `distilled` is the default mode and runs over untrusted, model-fetched HTML, so a
+/// panic inside the parser on adversarial markup is isolated with [`catch_unwind`]:
+/// it degrades to `None` (→ full-page fallback) rather than unwinding out and aborting
+/// the turn. Inputs are plain `&str`, so there is no broken invariant to leak across
+/// the boundary.
+///
+/// [`catch_unwind`]: std::panic::catch_unwind
+pub fn distill(html: &str, url: Option<&str>) -> Option<String> {
+    std::panic::catch_unwind(|| distill_inner(html, url))
+        .ok()
+        .flatten()
+}
+
+fn distill_inner(html: &str, url: Option<&str>) -> Option<String> {
+    let mut readability = Readability::new(html, url, None).ok()?;
+    let article = readability.parse().ok()?;
+    let markdown = html_to_markdown(&article.content);
+    if markdown.trim().is_empty() {
+        None
+    } else {
+        Some(markdown)
+    }
 }
 
 /// Cap `text` to at most `limit` bytes, never splitting a UTF-8 char. Returns the
@@ -53,6 +85,7 @@ fn collapse_blank_lines(s: &str) -> String {
 }
 
 // `fast_html2md`'s lib name is `html2md`.
+use dom_smoothie::Readability;
 use html2md as md;
 
 #[cfg(test)]
@@ -102,6 +135,36 @@ mod tests {
         let (out, truncated) = cap("0123456789", 4);
         assert_eq!(out, "0123");
         assert!(truncated);
+    }
+
+    #[test]
+    fn distill_extracts_article_and_drops_chrome() {
+        let html = r#"<html><head><title>T</title></head><body>
+            <nav><a href="/login">Sign in</a></nav>
+            <article>
+                <h1>Main Headline</h1>
+                <p>The real article body has enough substantive prose for the readability
+                heuristics to score it as the document's main content region rather than
+                the surrounding navigation and footer chrome.</p>
+                <p>A second paragraph of genuine content reinforces that this block is the
+                article so the extractor confidently selects it.</p>
+            </article>
+            <footer><p>Copyright 2026 — All rights reserved</p></footer>
+            </body></html>"#;
+        let md = distill(html, None).expect("article should be extracted");
+        assert!(md.contains("Main Headline"), "{md}");
+        assert!(md.contains("real article body"), "{md}");
+        assert!(!md.contains("Sign in"), "nav must be stripped: {md}");
+        assert!(
+            !md.contains("All rights reserved"),
+            "footer must be stripped: {md}"
+        );
+    }
+
+    #[test]
+    fn distill_returns_none_on_content_free_html() {
+        // No extractable main content -> None so the caller falls back to full.
+        assert!(distill("<html><body></body></html>", None).is_none());
     }
 
     #[test]
