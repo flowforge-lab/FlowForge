@@ -21,7 +21,7 @@ fn echo_config() -> McpServerConfig {
 
 #[tokio::test]
 async fn handshake_lists_and_calls_a_tool_over_stdio() {
-    let client = McpClient::connect(&echo_config())
+    let client = McpClient::connect(&echo_config(), &[])
         .await
         .expect("connect + initialize");
 
@@ -48,7 +48,7 @@ async fn handshake_lists_and_calls_a_tool_over_stdio() {
 
 #[tokio::test]
 async fn bad_arguments_are_rejected_before_dispatch() {
-    let client = McpClient::connect(&echo_config())
+    let client = McpClient::connect(&echo_config(), &[])
         .await
         .expect("connect + initialize");
     let err = client

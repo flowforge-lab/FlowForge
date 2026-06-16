@@ -30,26 +30,41 @@ pub struct McpClient {
     server_id: String,
     service: RunningService<RoleClient, ListChangedFlag>,
     tools_changed: Arc<AtomicBool>,
+    pid: Option<u32>,
 }
 
 impl McpClient {
     /// Spawn the server described by `config` and complete the `initialize` handshake.
     ///
-    /// Env isolation (RFC 0003 §9.2): the child starts from an **empty** environment
-    /// with only the declared `env` keys applied, so a third-party server can't
-    /// harvest unrelated host secrets. The system-var allowlist (PATH/HOME, needed to
-    /// resolve a bare `command`) is layered in by the supervisor (M4.2); until then a
-    /// server is reachable by absolute path or via its own declared `env`.
-    pub async fn connect(config: &McpServerConfig) -> Result<Self, McpError> {
+    /// Env isolation (RFC 0003 §9.2): the child starts from an **empty** environment.
+    /// `env_allowlist` names host variables (e.g. `PATH`, `HOME`) that are passed
+    /// through when present so a bare `command` resolves; the config's declared `env`
+    /// is applied *after* and wins on collision. Nothing outside the allowlist or the
+    /// declared keys reaches the child, so a third-party server can't harvest unrelated
+    /// host secrets. The supervisor (M4.2) supplies the allowlist; pass `&[]` for a
+    /// fully sealed environment (a server then needs an absolute `command` + declared
+    /// `env`).
+    pub async fn connect(
+        config: &McpServerConfig,
+        env_allowlist: &[&str],
+    ) -> Result<Self, McpError> {
         let mut cmd = Command::new(&config.command);
         cmd.args(&config.args);
         cmd.env_clear();
+        for key in env_allowlist {
+            if let Ok(value) = std::env::var(key) {
+                cmd.env(key, value);
+            }
+        }
         for (key, value) in &config.env {
             cmd.env(key, value);
         }
 
         let transport = TokioChildProcess::new(cmd)
             .map_err(|e| McpError::Spawn(config.id.clone(), e.to_string()))?;
+        // The transport is consumed by `serve`, so capture the child PID first — it
+        // surfaces in `McpServerStatus` and lets the supervisor verify reaping.
+        let pid = transport.id();
         let handler = ListChangedFlag::default();
         let tools_changed = handler.0.clone();
         let service = handler
@@ -61,7 +76,14 @@ impl McpClient {
             server_id: config.id.clone(),
             service,
             tools_changed,
+            pid,
         })
+    }
+
+    /// The OS process id of the server's child, if known. `None` if the platform did
+    /// not report one or the child has already been reaped.
+    pub fn pid(&self) -> Option<u32> {
+        self.pid
     }
 
     /// The id of the server this client is connected to.

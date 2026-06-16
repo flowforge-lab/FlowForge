@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use ff_agent::CancelToken;
 use ff_core::{Phenotype, ProviderConfig, ProviderKind, SearchConfig};
 use ff_llm::{OllamaProvider, OpenAiProvider, Provider};
+use ff_mcp::{McpConfigWatcher, SupervisorHandle};
 use ff_memory::MemoryStore;
 use ff_signals::{SignalStore, SkillAggregate, SkillCompleted};
 use ff_skills::{
@@ -197,6 +198,11 @@ pub struct AppState {
     /// `~/.flowforge/skill_signals.json`. Updated at each turn's start/end; read by
     /// the manual optimize flow's cost estimates.
     signals: Mutex<SignalStore>,
+    /// MCP host plumbing (RFC 0003). Populated lazily from Tauri's `setup` closure
+    /// (the supervisor needs a live Tokio runtime to spawn its actor) and `None`
+    /// when no `mcp.json` is present or the watcher cannot start.
+    _mcp_watcher: Mutex<Option<McpConfigWatcher>>,
+    mcp: Mutex<Option<SupervisorHandle>>,
 }
 
 impl AppState {
@@ -239,6 +245,8 @@ impl AppState {
             active_skills: Mutex::new(BTreeSet::new()),
             active_phenotype: Mutex::new(default_phenotype()),
             signals: Mutex::new(load_signals()),
+            _mcp_watcher: Mutex::new(None),
+            mcp: Mutex::new(None),
         };
         // Restore the persisted phenotype so its active skills survive a restart.
         // An unknown/missing pointer falls back to the built-in default.
@@ -290,6 +298,39 @@ impl AppState {
     /// install/uninstall so the change is visible without waiting on the watcher.
     pub fn reload_skills(&self) {
         reload_registry(&skills_root(), &self.skills);
+    }
+
+    /// Start the MCP host: begin watching `~/.flowforge/mcp.json` and spawn the
+    /// lifecycle supervisor. Idempotent — a second call is a no-op so a re-`setup`
+    /// can't double-spawn. Best-effort: a missing config dir or watcher failure is
+    /// logged and leaves MCP disabled rather than failing app start (RFC 0003 §3,5).
+    /// Must be called from a context with a live Tokio runtime (the supervisor's
+    /// actor task is `tokio::spawn`'d), e.g. Tauri's `setup` closure.
+    pub fn init_mcp(&self) {
+        if self.mcp.lock().unwrap().is_some() {
+            return;
+        }
+        let Some(path) = ff_mcp::config_path() else {
+            tracing::warn!("no home dir; mcp host disabled");
+            return;
+        };
+        let (watcher, shared, change_rx) = match McpConfigWatcher::spawn(path) {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!(error = %e, "mcp config watcher unavailable");
+                return;
+            }
+        };
+        let handle =
+            ff_mcp::spawn_supervisor(shared, change_rx, ff_mcp::SupervisorConfig::default());
+        *self._mcp_watcher.lock().unwrap() = Some(watcher);
+        *self.mcp.lock().unwrap() = Some(handle);
+    }
+
+    /// A clone of the supervisor handle if MCP was successfully initialized; `None`
+    /// when [`init_mcp`](Self::init_mcp) hasn't run or the watcher couldn't start.
+    pub fn mcp_handle(&self) -> Option<SupervisorHandle> {
+        self.mcp.lock().unwrap().clone()
     }
 
     /// Current provider settings (clone — callers never hold the lock).
