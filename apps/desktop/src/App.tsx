@@ -1,6 +1,7 @@
 import { useEffect } from "react";
 import { AppShell } from "@/components/app-shell";
 import { startIpcEvents } from "@/lib/events";
+import { startWarmupOnFocus } from "@/lib/warmup";
 import { initPrefs } from "@/store/prefs";
 import { useChatStore } from "@/store/chat";
 
@@ -12,6 +13,7 @@ function App() {
   useEffect(() => {
     initPrefs();
     startIpcEvents();
+    startWarmupOnFocus();
     if (!booted) {
       booted = true;
       void useChatStore.getState().bootstrap();

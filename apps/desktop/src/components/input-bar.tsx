@@ -1,20 +1,9 @@
 import { useCallback, useEffect, useRef } from "react";
 import { ArrowUp, Square } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import { ipc } from "@/lib/ipc";
 import { useChatStore } from "@/store/chat";
 import { useComposerStore } from "@/store/composer";
-
-// A local model server (candle-vllm, Ollama, …) clocks its GPU down when idle,
-// so the first token after a pause crawls while the device ramps back up. We
-// nudge it (`ipc.warmup`) while the user interacts with the composer — on focus
-// and as they type — so the device is at full clock by the time they hit send
-// and the first real token streams immediately.
-//
-// Measured on Apple Silicon: warmth decays ~7-10s after activity, so the
-// throttle sits just under that window. When already warm a nudge is ~0.4s of
-// GPU; cold, it absorbs the ramp the real turn would otherwise pay.
-const WARMUP_THROTTLE_MS = 5_000;
+import { warmupTrigger } from "@/lib/warmup";
 
 export function InputBar() {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -39,15 +28,6 @@ export function InputBar() {
   const autoGrow = useCallback((el: HTMLTextAreaElement) => {
     el.style.height = "auto";
     el.style.height = `${Math.min(el.scrollHeight, 160)}px`;
-  }, []);
-
-  // Throttled, fire-and-forget server warmup (see note at top of file).
-  const lastWarmupRef = useRef(0);
-  const warmup = useCallback(() => {
-    const now = Date.now();
-    if (now - lastWarmupRef.current < WARMUP_THROTTLE_MS) return;
-    lastWarmupRef.current = now;
-    void ipc.warmup().catch(() => {});
   }, []);
 
   // Keyboard-native: focus follows the active session.
@@ -105,9 +85,9 @@ export function InputBar() {
           rows={1}
           placeholder="Message FlowForge…"
           className="max-h-40 min-h-8 flex-1 resize-none bg-transparent px-2 py-1.5 text-[13px] leading-relaxed placeholder:text-muted-foreground/50 focus-visible:outline-none"
-          onFocus={warmup}
+          onFocus={() => warmupTrigger.fire()}
           onChange={(e) => {
-            warmup();
+            warmupTrigger.fire();
             setText(e.currentTarget.value);
             autoGrow(e.currentTarget);
           }}
