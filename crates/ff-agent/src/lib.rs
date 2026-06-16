@@ -16,13 +16,14 @@ use ff_llm::{ChatMessage, ChatRequest, FunctionCall, Provider, ToolCall as LlmTo
 use ff_memory::MemoryStore;
 use ff_tools::{Safety, ToolRegistry};
 use futures_util::StreamExt;
+use serde::Serialize;
 
 mod system_prompt;
 pub use system_prompt::{build_system_prompt, UserContext};
 
 /// Events the agent emits during a turn. The host (Tauri shell or a test) decides
 /// how to surface them — over IPC, to a channel, or into assertions.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub enum AgentEvent {
     Token {
         message_id: String,
@@ -42,6 +43,12 @@ pub enum AgentEvent {
     },
     Done {
         message_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        final_message: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        turns: Option<u32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        token_count: Option<u32>,
     },
     Error {
         message: String,
@@ -183,7 +190,9 @@ pub async fn run_turn(
     let tool_schemas = tools.registry.openai_tools();
     let mut last: Option<Message> = None;
 
+    let mut turn_count: u32 = 0;
     for _ in 0..tools.max_iterations.max(1) {
+        turn_count += 1;
         if cancel.is_cancelled() {
             break;
         }
@@ -261,12 +270,16 @@ pub async fn run_turn(
             }
         }
 
+        let final_text = acc.clone();
         let finalized = store.set_message_content(&message_id, session_id, acc);
 
         // No tool calls -> this is the final text answer.
         if calls.is_empty() {
             on_event(AgentEvent::Done {
                 message_id: message_id.clone(),
+                final_message: Some(final_text),
+                turns: Some(turn_count),
+                token_count: None,
             });
             return Ok(finalized);
         }
@@ -365,6 +378,9 @@ pub async fn run_turn(
     }
     on_event(AgentEvent::Done {
         message_id: msg.id.clone(),
+        final_message: Some(msg.content.clone()),
+        turns: Some(turn_count),
+        token_count: None,
     });
     Ok(msg)
 }
