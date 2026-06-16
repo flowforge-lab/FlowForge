@@ -32,3 +32,4 @@ export type { McpServerConfig } from "./McpServerConfig";
 export type { McpServerState } from "./McpServerState";
 export type { McpServerStatus } from "./McpServerStatus";
 export type { McpToolInfo } from "./McpToolInfo";
+export type { McpStatusChangedEvent } from "./McpStatusChangedEvent";

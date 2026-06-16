@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
-use crate::SessionStatus;
+use crate::{McpServerStatus, SessionStatus};
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
@@ -139,6 +139,18 @@ pub struct SkillInstallApprovalRequestEvent {
 #[ts(export, export_to = "../../../apps/desktop/src/bindings/")]
 pub struct SkillsChangedEvent {
     pub active: Vec<String>,
+}
+
+/// Backend -> frontend notice that one or more MCP servers changed status (a
+/// start/stop/restart, a connect failure, or an enable/disable/add/remove reload).
+/// Carries the full status snapshot so the frontend replaces its state rather than
+/// diffing, mirroring [`SkillsChangedEvent`]. The server definitions themselves are
+/// re-fetched via `list_mcp_servers`.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "../../../apps/desktop/src/bindings/")]
+pub struct McpStatusChangedEvent {
+    pub servers: Vec<McpServerStatus>,
 }
 
 /// Backend -> frontend telemetry: a skill became active for a turn (M3.5, RFC 0001
