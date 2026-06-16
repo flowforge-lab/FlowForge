@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { memo, useEffect, useRef } from "react";
 import { cn } from "@/lib/utils";
 import { useChatStore } from "@/store/chat";
 import type { ToolStep } from "@/store/chat";
@@ -8,19 +8,35 @@ import { Markdown } from "@/components/markdown";
 import { MessageActions } from "@/components/message-actions";
 import type { Message } from "@/bindings";
 
-function MessageRow({
+const NO_STEPS: ToolStep[] = [];
+
+function MessageRowImpl({
   message,
   streaming,
   toolSteps,
-  onRespond,
-  onAnswer,
+  respondApproval,
+  respondAsk,
 }: {
   message: Message;
   streaming: boolean;
   toolSteps: ToolStep[];
-  onRespond: (callId: string, approved: boolean) => void;
-  onAnswer: (callId: string, answer: string) => void;
+  respondApproval: (
+    sessionId: string,
+    messageId: string,
+    callId: string,
+    approved: boolean,
+  ) => Promise<void>;
+  respondAsk: (
+    sessionId: string,
+    messageId: string,
+    callId: string,
+    answer: string,
+  ) => Promise<void>;
 }) {
+  const onRespond = (callId: string, approved: boolean) =>
+    void respondApproval(message.sessionId, message.id, callId, approved);
+  const onAnswer = (callId: string, answer: string) =>
+    void respondAsk(message.sessionId, message.id, callId, answer);
   if (message.role === "user") {
     return (
       <div className="flex justify-end">
@@ -80,7 +96,7 @@ function MessageRow({
               streaming && "ff-streaming-caret",
             )}
           >
-            <Markdown content={message.content} />
+            <Markdown content={message.content} streaming={streaming} />
           </div>
           <MessageActions message={message} side="right" />
         </div>
@@ -88,6 +104,11 @@ function MessageRow({
     </div>
   );
 }
+
+// Memoized so a per-token state commit on the streaming message does not re-render
+// every other row. Props are referentially stable (the store actions are stable;
+// `NO_STEPS` avoids a fresh `[]` per render), so only the changed row re-renders.
+const MessageRow = memo(MessageRowImpl);
 
 export function ChatView() {
   const activeSessionId = useChatStore((s) => s.activeSessionId);
@@ -151,13 +172,9 @@ export function ChatView() {
             key={m.id}
             message={m}
             streaming={m.id === streamingId}
-            toolSteps={toolStepsByMessage[m.id] ?? []}
-            onRespond={(callId, approved) =>
-              void respondApproval(m.sessionId, m.id, callId, approved)
-            }
-            onAnswer={(callId, answer) =>
-              void respondAsk(m.sessionId, m.id, callId, answer)
-            }
+            toolSteps={toolStepsByMessage[m.id] ?? NO_STEPS}
+            respondApproval={respondApproval}
+            respondAsk={respondAsk}
           />
         ))}
       </div>
