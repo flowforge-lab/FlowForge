@@ -7,6 +7,8 @@
 import type {
   Message,
   ProviderConfig,
+  ProviderConnection,
+  ProviderRegistry,
   ProviderKind,
   SearchConfig,
   SearchBackend,
@@ -61,8 +63,20 @@ export interface FfIpc {
     baseUrl: string | undefined,
     model: string,
   ): Promise<ProviderConfig>;
-  /** Best-effort model ids for the configured endpoint; `[]` when unreachable. */
-  listModels(): Promise<string[]>;
+  // Provider connection registry (Issue #138, RFC 0005 Phase A). Lets the user
+  // keep several backends configured and switch the active one non-destructively.
+  /** All configured connections plus the active pointer. */
+  getProviderRegistry(): Promise<ProviderRegistry>;
+  /** Select the active connection by id; rejects if the id is unknown. */
+  setActiveConnection(id: string): Promise<void>;
+  /** Add or update a connection (keyed by `id`); resolves with the stored value
+   *  (e.g. a server-derived `id` for a freshly added connection). */
+  upsertConnection(conn: ProviderConnection): Promise<ProviderConnection>;
+  /** Remove a connection by id; rejects when removing the last one. */
+  removeConnection(id: string): Promise<void>;
+  /** Best-effort model ids for a connection (defaults to the active one); `[]`
+   *  when the endpoint is unreachable. */
+  listModels(id?: string): Promise<string[]>;
 
   // Web search (Issue #43). SearXNG is wired keyless; hosted backends are gated
   // until key storage (#8). Secrets are never part of this contract.
@@ -211,7 +225,15 @@ class TauriIpc implements FfIpc {
       baseUrl,
       model,
     });
-  listModels = () => this.invoke<string[]>("list_models");
+  getProviderRegistry = () =>
+    this.invoke<ProviderRegistry>("get_provider_registry");
+  setActiveConnection = (id: string) =>
+    this.invoke<void>("set_active_connection", { id });
+  upsertConnection = (conn: ProviderConnection) =>
+    this.invoke<ProviderConnection>("upsert_connection", { conn });
+  removeConnection = (id: string) =>
+    this.invoke<void>("remove_connection", { id });
+  listModels = (id?: string) => this.invoke<string[]>("list_models", { id });
 
   getSearchConfig = () => this.invoke<SearchConfig>("get_search_config");
   setSearchConfig = (backend: SearchBackend, baseUrl: string | undefined) =>
