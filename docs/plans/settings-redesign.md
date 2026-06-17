@@ -82,12 +82,16 @@ elsewhere. Consumers import `SettingsSectionId` from the registry.
 type SettingsSectionId =
   | "model" | "skills" | "control"            // PROFILE group
   | "appearance" | "profiles" | "memory"      // GLOBAL group
-  | "scheduled" | "keyboard" | "experimental" | "about";
+  | "mcp" | "scheduled" | "keyboard" | "experimental" | "about";
 ```
 
 > Note the GLOBAL item is `"keyboard"` (label "Keyboard"), **not** "Shortcuts" — the Skills section
 > has a "Shortcuts" sub-tab for `/name` message shortcuts, a completely different concept. Keeping the
 > nav label distinct avoids two unrelated "Shortcuts" one click apart.
+
+> **Reconciled with #143 / #91:** MCP server **configuration + live status** ship as a dedicated
+> top-level `"mcp"` GLOBAL section (label "MCP servers"), delivered by #143, **not** a Skills sub-tab.
+> This makes the union **11 sections**. SET.5 is correspondingly reduced (see below).
 
 `store/settings.ts` gains `activeSection: SettingsSectionId` (default `"appearance"`) plus
 `setSection(id)`. Sections not yet built render `<ComingSoon>` so the nav is fully populated day one.
@@ -264,42 +268,33 @@ type SettingsSectionId =
 
 ---
 
-### SET.5 — Skills section (Installed / Marketplace / MCP Servers / Shortcuts sub-tabs)
+### SET.5 — Skills section (Installed / Marketplace / Shortcuts sub-tabs)
 
-- **Branch:** `feat/set-5-skills` · **Labels:** `frontend`, `design` · **Depends on:** `SET.1a`,
-  **and a resolved boundary with #91** (see below) · uses `SET.1b` `sub-tabs`
-- **Why:** Skills are managed only via the ⌘K palette (#64/#83). A settings home for install/browse,
-  MCP servers, and `/name` message shortcuts is missing.
-- **#91 boundary (resolve before coding):** #91 (M4.4) is Abid's own "FE server-status panel."
-  **Decision to confirm with Abid at kickoff, default position:** the Skills → **MCP Servers** sub-tab
-  owns *configuration* (add server: command/URL + `stdio` transport + Advanced + Import JSON, and the
-  list of configured servers), and **embeds the #91 status panel component** for *live status*
-  (health, restart state) rather than re-implementing it. #91 ships the `<McpServerStatus>` panel as a
-  reusable component; SET.5 imports it. If #91 hasn't landed, SET.5 renders a status placeholder behind
-  the same props so the swap is a one-line import. Record the agreed split in both issue bodies before
-  either starts to avoid a merge collision.
-- **Build:** `sub-tabs` **Installed / Marketplace / MCP Servers / Shortcuts**.
+> **Reconciled with #143 / #91:** MCP server configuration + live status ship as the dedicated
+> top-level **MCP servers** GLOBAL section (#143), **not** a Skills sub-tab. SET.5 no longer owns MCP
+> and is reduced to three sub-tabs: **Installed / Marketplace / Shortcuts**.
+
+- **Branch:** `feat/set-5-skills` · **Labels:** `frontend`, `design` · **Depends on:** `SET.1a` ·
+  uses `SET.1b` `sub-tabs`
+- **Why:** Skills are managed only via the ⌘K palette (#64/#83). A settings home for install/browse and
+  `/name` message shortcuts is missing.
+- **Build:** `sub-tabs` **Installed / Marketplace / Shortcuts**.
   - **Installed:** "Install local skill…"; a **Bundled** read-only group with a count badge,
     expandable. Source from `store/skills.ts` (`listSkills`) + `SkillInfo`.
   - **Marketplace:** search input + result cards (skeleton while loading). Mock catalog in `mock.ts`.
-  - **MCP Servers:** configuration form + configured-server list (per the #91 boundary above), using
-    `McpServerConfig`/`McpServerState`/`McpServerStatus` bindings.
   - **Shortcuts:** "Create a Shortcut" — `Name` + `Message` → Create; lists existing `/name` message
     shortcuts (send a message on `/name`; **not** system-prompt injection; **not** the GLOBAL
     "Keyboard" section).
-- **Files:** create `settings/skills/installed-tab.tsx`, `marketplace-tab.tsx`, `mcp-tab.tsx`,
+- **Files:** create `settings/skills/installed-tab.tsx`, `marketplace-tab.tsx`,
   `shortcuts-tab.tsx` + `settings/skills-section.tsx`; `store/command-shortcuts.ts`; modify
-  `ipc.ts`/`mock.ts`. Reuse `store/skills.ts` as-is; import #91's status component.
+  `ipc.ts`/`mock.ts`. Reuse `store/skills.ts` as-is.
 - **State & types:** `store/command-shortcuts.ts`: `{ shortcuts: { id; name; message }[] }` with
-  add/remove, persisted (`ff-command-shortcuts`). MCP list via existing bindings/IPC (mock if absent).
-- **IPC:** reuse skill IPC; add mock `listMcpServers`/`addMcpServer` if absent; add mock
-  `searchSkillMarketplace(query)`.
+  add/remove, persisted (`ff-command-shortcuts`).
+- **IPC:** reuse skill IPC; add mock `searchSkillMarketplace(query)`.
 - **Acceptance criteria:** Installed shows bundled skills + count; Marketplace search returns mock
-  results; MCP add-form validates + lists a server; `/name` shortcut create persists; live MCP status
-  comes from #91's component (or its placeholder). Reset wired.
-- **Tests:** `store/command-shortcuts.test.ts`; `mock.skills.test.ts` extension for marketplace/MCP.
-- **Out of scope:** real MCP supervisor lifecycle (M4.2 #89); real marketplace backend; re-building
-  #91's status UI.
+  results; `/name` shortcut create persists. Reset wired.
+- **Tests:** `store/command-shortcuts.test.ts`; `mock.skills.test.ts` extension for marketplace.
+- **Out of scope:** real marketplace backend; MCP servers (now the standalone MCP section, #143).
 
 ---
 
