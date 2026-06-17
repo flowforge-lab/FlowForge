@@ -16,8 +16,8 @@ use ff_core::events::{
     ToolResultEvent, TurnDoneEvent, TurnErrorEvent,
 };
 use ff_core::{
-    McpServerConfig, McpServerStatus, Message, Phenotype, ProviderConfig, ProviderKind, Role,
-    SearchConfig, Session, Skill, SkillInfo, SkillManifest,
+    McpServerConfig, McpServerStatus, Message, Phenotype, ProviderConfig, ProviderConnection,
+    ProviderKind, ProviderRegistry, Role, SearchConfig, Session, Skill, SkillInfo, SkillManifest,
 };
 use ff_signals::SkillAggregate;
 use ff_tools::Safety;
@@ -406,6 +406,34 @@ fn set_provider_config(
     config
 }
 
+/// The full provider connection registry for the settings panel (RFC 0005 Phase A).
+#[tauri::command]
+fn get_provider_registry(state: State<'_, Arc<AppState>>) -> ProviderRegistry {
+    state.provider_registry()
+}
+
+/// Select the active connection by id. Errors on an unknown id.
+#[tauri::command]
+fn set_active_connection(state: State<'_, Arc<AppState>>, id: String) -> CmdResult<()> {
+    state.set_active_connection(&id)
+}
+
+/// Add or update a connection (keyed by `id`, derived from vendor/name when blank).
+/// Returns the stored connection so the UI sees the resolved id.
+#[tauri::command]
+fn upsert_connection(
+    state: State<'_, Arc<AppState>>,
+    conn: ProviderConnection,
+) -> CmdResult<ProviderConnection> {
+    Ok(state.upsert_connection(conn))
+}
+
+/// Remove a connection by id. Errors when removing the last one.
+#[tauri::command]
+fn remove_connection(state: State<'_, Arc<AppState>>, id: String) -> CmdResult<()> {
+    state.remove_connection(&id)
+}
+
 /// Current persisted web-search settings.
 #[tauri::command]
 fn get_search_config(state: State<'_, Arc<AppState>>) -> SearchConfig {
@@ -432,12 +460,15 @@ fn set_search_config(
     config
 }
 
-/// Best-effort model list for the configured provider's endpoint. Returns an empty
-/// list (never an error) when the server is unreachable so the picker degrades to
-/// free-text entry.
+/// Best-effort model list for a connection's endpoint (`id` defaults to the active
+/// connection). Returns an empty list (never an error) when the server is
+/// unreachable so the picker degrades to free-text entry.
 #[tauri::command]
-async fn list_models(state: State<'_, Arc<AppState>>) -> CmdResult<Vec<String>> {
-    let (provider, _model) = state.build_provider();
+async fn list_models(
+    state: State<'_, Arc<AppState>>,
+    id: Option<String>,
+) -> CmdResult<Vec<String>> {
+    let (provider, _model) = state.build_provider_for(id.as_deref());
     Ok(provider.list_models().await.unwrap_or_default())
 }
 
@@ -879,6 +910,10 @@ pub fn run() {
             respond_ask,
             get_provider_config,
             set_provider_config,
+            get_provider_registry,
+            set_active_connection,
+            upsert_connection,
+            remove_connection,
             get_search_config,
             set_search_config,
             list_models,

@@ -4,7 +4,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 
 use ff_agent::CancelToken;
-use ff_core::{Phenotype, ProviderConfig, ProviderKind, SearchConfig};
+use ff_core::{
+    Phenotype, ProviderConfig, ProviderConnection, ProviderKind, ProviderRegistry, SearchConfig,
+};
 use ff_llm::{OllamaProvider, OpenAiProvider, Provider};
 use ff_mcp::{McpConfigWatcher, SupervisorHandle};
 use ff_memory::MemoryStore;
@@ -35,42 +37,138 @@ struct ApprovalRegistry {
     pending_asks: HashMap<(String, String), oneshot::Sender<String>>,
 }
 
-/// Builds a fresh [`Provider`] from a [`ProviderConfig`]. Called once per turn so a
-/// runtime provider switch takes effect on the next message — there is no shared,
-/// mutable provider to swap, only the persisted config.
-fn build_provider(config: &ProviderConfig) -> Box<dyn Provider> {
-    let base_url = config.resolved_base_url().to_string();
-    match config.kind {
+/// Builds a fresh [`Provider`] from a [`ProviderConnection`]. Called once per turn
+/// so a runtime provider switch takes effect on the next message — there is no
+/// shared, mutable provider to swap, only the persisted registry.
+fn build_provider(conn: &ProviderConnection) -> Box<dyn Provider> {
+    let base_url = conn.resolved_base_url().to_string();
+    match conn.kind {
         ProviderKind::CandleVllm => Box::new(OpenAiProvider::new(base_url, None)),
         ProviderKind::Ollama => Box::new(OllamaProvider::new(base_url)),
     }
 }
 
-/// `~/.config/flowforge/provider.json` (platform config dir). `None` only when the
-/// OS exposes no config dir, in which case settings stay in-memory for the session.
+/// The active connection, or the built-in default when the `active` pointer dangles
+/// (registry invariants forbid this, but turns must still resolve a provider).
+fn active_connection_or_default(registry: &ProviderRegistry) -> ProviderConnection {
+    registry.active_connection().cloned().unwrap_or_else(|| {
+        ProviderRegistry::default()
+            .connections
+            .into_iter()
+            .next()
+            .expect("default registry is non-empty")
+    })
+}
+
+/// Human-facing label for a bare local kind, used when wrapping a legacy
+/// [`ProviderConfig`] as a connection (migration / `with_config`).
+fn display_name_for(kind: ProviderKind) -> String {
+    match kind {
+        ProviderKind::CandleVllm => "candle-vLLM",
+        ProviderKind::Ollama => "Ollama",
+    }
+    .to_string()
+}
+
+/// Wrap a legacy single [`ProviderConfig`] as a [`ProviderConnection`]. The id is
+/// the kind slug so it is stable across migrations.
+fn config_to_connection(config: ProviderConfig) -> ProviderConnection {
+    ProviderConnection {
+        id: config.kind.slug().to_string(),
+        kind: config.kind,
+        display_name: display_name_for(config.kind),
+        vendor: None,
+        base_url: config.base_url,
+        model: config.model,
+        has_key: config.has_key,
+    }
+}
+
+/// Project a connection back to the legacy [`ProviderConfig`] shape for the
+/// `get/set_provider_config` shims kept during the frontend cutover (#126).
+fn connection_to_config(conn: &ProviderConnection) -> ProviderConfig {
+    ProviderConfig {
+        kind: conn.kind,
+        base_url: conn.base_url.clone(),
+        model: conn.model.clone(),
+        has_key: conn.has_key,
+    }
+}
+
+/// `~/.config/flowforge/provider.json` — the legacy single-provider file. Still
+/// read for one-time migration into the registry, and left in place afterward as a
+/// backup. `None` only when the OS exposes no config dir.
 fn config_path() -> Option<PathBuf> {
     dirs::config_dir().map(|d| d.join("flowforge").join("provider.json"))
 }
 
-/// Loads persisted provider settings, falling back to the default (local
-/// candle-vllm) when the file is missing or unparseable.
-fn load_config() -> ProviderConfig {
-    config_path()
-        .and_then(|p| fs::read_to_string(p).ok())
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
+/// `~/.config/flowforge/provider-registry.json` — the persisted connection registry
+/// (replaces `provider.json`). `None` only when the OS exposes no config dir, in
+/// which case settings stay in-memory for the session.
+fn registry_path() -> Option<PathBuf> {
+    dirs::config_dir().map(|d| d.join("flowforge").join("provider-registry.json"))
 }
 
-/// Persists provider settings. Best-effort: a write failure leaves the in-memory
-/// config authoritative for this session rather than failing the command.
-fn save_config(config: &ProviderConfig) {
-    let Some(path) = config_path() else {
+/// Build the registry to start from: the saved registry if present, else a one-time
+/// migration of a legacy `provider.json` (the saved provider becomes the *active*
+/// connection, with the other local vendor seeded keyless + inactive), else the
+/// built-in default. Pure and idempotent — persistence happens lazily on the first
+/// mutation, so construction (including in tests) never writes to the config dir.
+fn load_or_migrate_registry() -> ProviderRegistry {
+    load_or_migrate_registry_at(registry_path(), config_path())
+}
+
+/// Path-injectable core of [`load_or_migrate_registry`] so tests can drive it with
+/// tempdir paths instead of the real config dir.
+fn load_or_migrate_registry_at(
+    reg_path: Option<PathBuf>,
+    cfg_path: Option<PathBuf>,
+) -> ProviderRegistry {
+    if let Some(registry) = reg_path
+        .as_ref()
+        .and_then(|p| fs::read_to_string(p).ok())
+        .and_then(|s| serde_json::from_str::<ProviderRegistry>(&s).ok())
+    {
+        return registry;
+    }
+    if let Some(config) = cfg_path
+        .as_ref()
+        .and_then(|p| fs::read_to_string(p).ok())
+        .and_then(|s| serde_json::from_str::<ProviderConfig>(&s).ok())
+    {
+        return build_migrated_registry(config);
+    }
+    ProviderRegistry::default()
+}
+
+/// Migrate a legacy single [`ProviderConfig`] into a registry: it becomes the
+/// active connection, and the *other* built-in local vendor is added keyless and
+/// inactive so the user can still switch (#139 review nit 2).
+fn build_migrated_registry(config: ProviderConfig) -> ProviderRegistry {
+    let active = config_to_connection(config);
+    let mut connections = vec![active.clone()];
+    for seed in ProviderRegistry::default().connections {
+        if seed.kind != active.kind {
+            connections.push(seed);
+        }
+    }
+    ProviderRegistry {
+        active: active.id,
+        connections,
+    }
+}
+
+/// Persists the connection registry. Best-effort: a write failure leaves the
+/// in-memory registry authoritative for this session rather than failing the
+/// command (mirrors the search-config write path).
+fn save_registry(registry: &ProviderRegistry) {
+    let Some(path) = registry_path() else {
         return;
     };
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
     }
-    if let Ok(json) = serde_json::to_string_pretty(config) {
+    if let Ok(json) = serde_json::to_string_pretty(registry) {
         let _ = fs::write(path, json);
     }
 }
@@ -90,7 +188,7 @@ fn load_search_config() -> SearchConfig {
         .unwrap_or_default()
 }
 
-/// Persists web-search settings. Best-effort, like [`save_config`].
+/// Persists web-search settings. Best-effort, like [`save_registry`].
 fn save_search_config(config: &SearchConfig) {
     let Some(path) = search_config_path() else {
         return;
@@ -119,7 +217,7 @@ fn load_active_phenotype_name() -> Option<String> {
         .map(|f| f.active)
 }
 
-/// Persist the active phenotype name. Best-effort, like `save_config`.
+/// Persist the active phenotype name. Best-effort, like `save_registry`.
 fn save_active_phenotype_name(name: &str) {
     let Some(path) = active_phenotype_path() else {
         return;
@@ -164,9 +262,11 @@ fn resolve_phenotype(name: &str) -> Option<Phenotype> {
 
 pub struct AppState {
     pub store: MemoryStore,
-    /// Persisted, non-secret LLM provider settings. Swapped wholesale by
-    /// `set_provider_config`; snapshotted (never held across an await) per turn.
-    config: Mutex<ProviderConfig>,
+    /// Persisted, non-secret LLM provider connection registry (RFC 0005 Phase A).
+    /// The active connection drives each turn; snapshotted (never held across an
+    /// await) per turn. Mutated by the connection commands and the legacy
+    /// `set_provider_config` shim.
+    registry: Mutex<ProviderRegistry>,
     /// Persisted, non-secret web-search settings, shared (via `Arc`) with the
     /// registered `web_search` tool so a runtime backend switch is visible without
     /// rebuilding the registry.
@@ -210,10 +310,10 @@ pub struct AppState {
 
 impl AppState {
     pub fn new() -> Self {
-        Self::with_config(load_config())
+        Self::with_registry(load_or_migrate_registry())
     }
 
-    pub fn with_config(config: ProviderConfig) -> Self {
+    pub fn with_registry(registry: ProviderRegistry) -> Self {
         let (watcher, skills) = load_skills();
         // The installer tools are agent-callable, so they own the skills root and a
         // handle to the shared registry to refresh it on a successful install.
@@ -222,7 +322,7 @@ impl AppState {
         let search_config = Arc::new(Mutex::new(load_search_config()));
         let state = Self {
             store: MemoryStore::new(),
-            config: Mutex::new(config),
+            registry: Mutex::new(registry),
             search_config,
             workspace_root: default_workspace_root(),
             skills,
@@ -370,15 +470,67 @@ impl AppState {
         self.mcp.lock().unwrap().clone()
     }
 
-    /// Current provider settings (clone — callers never hold the lock).
-    pub fn provider_config(&self) -> ProviderConfig {
-        self.config.lock().unwrap().clone()
+    /// The full connection registry (clone — callers never hold the lock).
+    pub fn provider_registry(&self) -> ProviderRegistry {
+        self.registry.lock().unwrap().clone()
     }
 
-    /// Replace and persist provider settings. Takes effect on the next turn.
+    /// Select the active connection by id; persists. `Err` on an unknown id.
+    pub fn set_active_connection(&self, id: &str) -> Result<(), String> {
+        let snapshot = {
+            let mut reg = self.registry.lock().unwrap();
+            reg.set_active(id)?;
+            reg.clone()
+        };
+        save_registry(&snapshot);
+        Ok(())
+    }
+
+    /// Add or update a connection (keyed by id, deriving one when blank); persists.
+    /// Returns the stored connection so the caller sees the resolved id.
+    pub fn upsert_connection(&self, conn: ProviderConnection) -> ProviderConnection {
+        let (stored, snapshot) = {
+            let mut reg = self.registry.lock().unwrap();
+            let stored = reg.upsert(conn);
+            (stored, reg.clone())
+        };
+        save_registry(&snapshot);
+        stored
+    }
+
+    /// Remove a connection by id; persists. `Err` when removing the last one.
+    pub fn remove_connection(&self, id: &str) -> Result<(), String> {
+        let snapshot = {
+            let mut reg = self.registry.lock().unwrap();
+            reg.remove(id)?;
+            reg.clone()
+        };
+        save_registry(&snapshot);
+        Ok(())
+    }
+
+    /// Current provider settings projected from the active connection (clone —
+    /// callers never hold the lock). Legacy shim kept during the FE cutover (#126).
+    pub fn provider_config(&self) -> ProviderConfig {
+        let reg = self.registry.lock().unwrap();
+        connection_to_config(&active_connection_or_default(&reg))
+    }
+
+    /// Apply legacy provider settings onto the active connection in place, then
+    /// persist. Legacy shim kept during the FE cutover (#126).
     pub fn set_provider_config(&self, config: ProviderConfig) {
-        save_config(&config);
-        *self.config.lock().unwrap() = config;
+        let snapshot = {
+            let mut reg = self.registry.lock().unwrap();
+            let active_id = reg.active.clone();
+            if let Some(conn) = reg.connections.iter_mut().find(|c| c.id == active_id) {
+                conn.kind = config.kind;
+                conn.base_url = config.base_url;
+                conn.model = config.model;
+                conn.has_key = config.has_key;
+            }
+            reg.clone()
+        };
+        save_registry(&snapshot);
     }
 
     /// Current web-search settings (clone — callers never hold the lock).
@@ -393,11 +545,24 @@ impl AppState {
         *self.search_config.lock().unwrap() = config;
     }
 
-    /// Build a provider + model snapshot from the current config for one turn.
+    /// Build a provider + model snapshot from the active connection for one turn.
     pub fn build_provider(&self) -> (Box<dyn Provider>, String) {
-        let config = self.provider_config();
-        let provider = build_provider(&config);
-        (provider, config.model)
+        self.build_provider_for(None)
+    }
+
+    /// Build a provider + model snapshot for a specific connection (`None` = the
+    /// active one). Used by `list_models(id?)` to probe a connection the user is
+    /// editing without switching the active one.
+    pub fn build_provider_for(&self, id: Option<&str>) -> (Box<dyn Provider>, String) {
+        let conn = {
+            let reg = self.registry.lock().unwrap();
+            match id {
+                Some(id) => reg.connections.iter().find(|c| c.id == id).cloned(),
+                None => reg.active_connection().cloned(),
+            }
+            .unwrap_or_else(|| active_connection_or_default(&reg))
+        };
+        (build_provider(&conn), conn.model)
     }
 
     pub fn register_cancel(&self, session_id: &str, token: CancelToken) {
@@ -891,6 +1056,169 @@ mod tests {
     // `init_mcp` must establish a reactor context itself. This is intentionally a
     // plain `#[test]` (no `#[tokio::test]`) to mirror Tauri's `setup`, which runs
     // off-runtime on macOS — pre-fix this panicked with "there is no reactor running".
+    #[test]
+    fn migration_makes_saved_candle_provider_active_and_seeds_ollama_inactive() {
+        let config = ProviderConfig {
+            kind: ProviderKind::CandleVllm,
+            base_url: Some("http://localhost:9001/v1".into()),
+            model: "my-candle-model".into(),
+            has_key: false,
+        };
+        let reg = build_migrated_registry(config);
+        assert_eq!(reg.active, "candle-vllm");
+        let active = reg.active_connection().unwrap();
+        assert_eq!(active.kind, ProviderKind::CandleVllm);
+        assert_eq!(active.model, "my-candle-model");
+        assert_eq!(active.base_url.as_deref(), Some("http://localhost:9001/v1"));
+        // The other local vendor is seeded, keyless, and NOT active.
+        let ollama = reg
+            .connections
+            .iter()
+            .find(|c| c.kind == ProviderKind::Ollama)
+            .unwrap();
+        assert_ne!(reg.active, ollama.id);
+        assert!(!ollama.has_key);
+        assert_eq!(reg.connections.len(), 2);
+    }
+
+    #[test]
+    fn migration_makes_saved_ollama_provider_active_and_seeds_candle_inactive() {
+        let config = ProviderConfig {
+            kind: ProviderKind::Ollama,
+            base_url: None,
+            model: "qwen2.5".into(),
+            has_key: false,
+        };
+        let reg = build_migrated_registry(config);
+        assert_eq!(reg.active, "ollama");
+        assert_eq!(reg.active_connection().unwrap().model, "qwen2.5");
+        assert!(reg
+            .connections
+            .iter()
+            .any(|c| c.kind == ProviderKind::CandleVllm));
+        assert_eq!(reg.connections.len(), 2);
+    }
+
+    #[test]
+    fn load_uses_existing_registry_file_over_legacy_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let reg_path = tmp.path().join("provider-registry.json");
+        let cfg_path = tmp.path().join("provider.json");
+        // A registry file with a single ollama connection.
+        let existing = ProviderRegistry {
+            active: "ollama".into(),
+            connections: vec![ProviderConnection {
+                id: "ollama".into(),
+                kind: ProviderKind::Ollama,
+                display_name: "Ollama".into(),
+                vendor: None,
+                base_url: None,
+                model: "saved".into(),
+                has_key: false,
+            }],
+        };
+        fs::write(&reg_path, serde_json::to_string(&existing).unwrap()).unwrap();
+        // A legacy config that must be ignored when the registry file exists.
+        fs::write(
+            &cfg_path,
+            serde_json::to_string(&ProviderConfig::default()).unwrap(),
+        )
+        .unwrap();
+        let loaded = load_or_migrate_registry_at(Some(reg_path), Some(cfg_path));
+        assert_eq!(loaded, existing);
+    }
+
+    #[test]
+    fn load_migrates_when_only_legacy_config_present() {
+        let tmp = tempfile::tempdir().unwrap();
+        let reg_path = tmp.path().join("provider-registry.json");
+        let cfg_path = tmp.path().join("provider.json");
+        let config = ProviderConfig {
+            kind: ProviderKind::Ollama,
+            base_url: None,
+            model: "legacy".into(),
+            has_key: false,
+        };
+        fs::write(&cfg_path, serde_json::to_string(&config).unwrap()).unwrap();
+        let loaded = load_or_migrate_registry_at(Some(reg_path.clone()), Some(cfg_path));
+        assert_eq!(loaded.active, "ollama");
+        assert_eq!(loaded.active_connection().unwrap().model, "legacy");
+        // Pure load: migration does not write the registry file (lazy persist).
+        assert!(!reg_path.exists());
+    }
+
+    #[test]
+    fn load_falls_back_to_default_when_no_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let loaded = load_or_migrate_registry_at(
+            Some(tmp.path().join("provider-registry.json")),
+            Some(tmp.path().join("provider.json")),
+        );
+        assert_eq!(loaded, ProviderRegistry::default());
+    }
+
+    #[test]
+    fn config_to_connection_uses_kind_slug_and_label() {
+        let conn = config_to_connection(ProviderConfig {
+            kind: ProviderKind::Ollama,
+            base_url: None,
+            model: "solo".into(),
+            has_key: false,
+        });
+        assert_eq!(conn.id, "ollama");
+        assert_eq!(conn.display_name, "Ollama");
+        assert_eq!(conn.model, "solo");
+        // Legacy shim projects it back to a ProviderConfig faithfully.
+        let cfg = connection_to_config(&conn);
+        assert_eq!(cfg.kind, ProviderKind::Ollama);
+        assert_eq!(cfg.model, "solo");
+    }
+
+    #[test]
+    fn set_provider_config_shim_mutates_active_connection_in_place() {
+        let state = AppState::with_registry(ProviderRegistry::default());
+        state.set_provider_config(ProviderConfig {
+            kind: ProviderKind::CandleVllm,
+            base_url: Some("http://localhost:9100/v1".into()),
+            model: "edited".into(),
+            has_key: false,
+        });
+        let reg = state.provider_registry();
+        // No new connection; the active one is edited in place.
+        assert_eq!(reg.connections.len(), 2);
+        let active = reg.active_connection().unwrap();
+        assert_eq!(active.id, "candle-vllm");
+        assert_eq!(active.model, "edited");
+        assert_eq!(active.base_url.as_deref(), Some("http://localhost:9100/v1"));
+    }
+
+    #[test]
+    fn set_active_connection_rejects_unknown_id() {
+        let state = AppState::with_registry(ProviderRegistry::default());
+        assert!(state.set_active_connection("ghost").is_err());
+        assert_eq!(state.provider_registry().active, "candle-vllm");
+        state.set_active_connection("ollama").unwrap();
+        assert_eq!(state.provider_registry().active, "ollama");
+    }
+
+    #[test]
+    fn upsert_and_remove_connection_round_trip() {
+        let state = AppState::with_registry(ProviderRegistry::default());
+        let stored = state.upsert_connection(ProviderConnection {
+            id: String::new(),
+            kind: ProviderKind::CandleVllm,
+            display_name: "OpenRouter".into(),
+            vendor: Some("openrouter".into()),
+            base_url: Some("https://openrouter.ai/api/v1".into()),
+            model: "x".into(),
+            has_key: false,
+        });
+        assert_eq!(stored.id, "openrouter");
+        assert_eq!(state.provider_registry().connections.len(), 3);
+        state.remove_connection("openrouter").unwrap();
+        assert_eq!(state.provider_registry().connections.len(), 2);
+    }
+
     #[test]
     fn init_mcp_spawns_supervisor_without_an_entered_runtime() {
         let tmp = tempfile::tempdir().unwrap();
