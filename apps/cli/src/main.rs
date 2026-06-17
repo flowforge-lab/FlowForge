@@ -16,7 +16,7 @@ use clap::{Parser, Subcommand};
 use ff_agent::{run_turn, AgentEvent, CancelToken, ToolContext, UserContext};
 use ff_core::Role;
 
-use crate::approver::CliApprover;
+use crate::approver::{ApprovalMode, CliApprover};
 
 /// FlowForge on the command line: run an agent turn, inspect skills, no GUI.
 #[derive(Parser)]
@@ -35,6 +35,12 @@ enum Command {
         /// Emit each event as one JSON line to stdout; no human-only text is printed.
         #[arg(long)]
         json: bool,
+        /// Auto-approve write and dangerous tool calls without prompting.
+        #[arg(long, conflicts_with = "deny")]
+        yes: bool,
+        /// Auto-deny write and dangerous tool calls without prompting.
+        #[arg(long, conflicts_with = "yes")]
+        deny: bool,
     },
     /// Inspect installed skills (shared with the desktop app).
     Skills {
@@ -53,7 +59,12 @@ enum SkillsCommand {
 async fn main() -> ExitCode {
     let cli = Cli::parse();
     match cli.command {
-        Command::Run { prompt, json } => run(prompt, json).await,
+        Command::Run {
+            prompt,
+            json,
+            yes,
+            deny,
+        } => run(prompt, json, approval_mode(yes, deny)).await,
         Command::Skills { command } => match command {
             SkillsCommand::List => skills_list(),
         },
@@ -79,13 +90,21 @@ fn skills_list() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-async fn run(prompt: String, json: bool) -> ExitCode {
+fn approval_mode(yes: bool, deny: bool) -> ApprovalMode {
+    match (yes, deny) {
+        (true, false) => ApprovalMode::Yes,
+        (false, true) => ApprovalMode::Deny,
+        _ => ApprovalMode::Prompt,
+    }
+}
+
+async fn run(prompt: String, json: bool, approval_mode: ApprovalMode) -> ExitCode {
     let (provider, model) = host::load_provider();
     let skills = host::load_skills();
     let workspace = host::workspace_root();
     let store = ff_memory::MemoryStore::new();
     let registry = ff_tools::ToolRegistry::with_defaults();
-    let approver = CliApprover;
+    let approver = CliApprover::new(approval_mode);
 
     let session = store.create_session(None);
     store.add_message(&session.id, Role::User, prompt);
@@ -178,9 +197,11 @@ fn render_event_text(event: AgentEvent) {
 #[cfg(test)]
 mod tests {
     use super::json_events;
-    use super::Cli;
+    use super::{approval_mode, Cli};
+    use crate::approver::ApprovalMode;
     use async_trait::async_trait;
     use clap::CommandFactory;
+    use clap::Parser;
     use ff_agent::{run_turn, AgentEvent, Approver, CancelToken, ToolContext};
     use ff_core::Role;
     use ff_llm::{ChatRequest, Chunk, ChunkStream, LlmError, Provider};
@@ -192,6 +213,22 @@ mod tests {
     #[test]
     fn cli_definition_is_valid() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn run_approval_flags_map_to_modes() {
+        assert_eq!(approval_mode(false, false), ApprovalMode::Prompt);
+        assert_eq!(approval_mode(true, false), ApprovalMode::Yes);
+        assert_eq!(approval_mode(false, true), ApprovalMode::Deny);
+    }
+
+    #[test]
+    fn yes_and_deny_flags_conflict() {
+        let err = match Cli::try_parse_from(["flowforge", "run", "hi", "--yes", "--deny"]) {
+            Ok(_) => panic!("--yes and --deny must be mutually exclusive"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
     }
 
     /// Golden-line snapshot: each AgentEvent serialises to one JSON object on stdout;
