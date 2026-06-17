@@ -207,3 +207,33 @@ no embedding service required." That is the differentiator.
    injection budget), or manual-only for v1?
 4. **Embedding chunking.** Heading-based chunks (§4) vs fixed-size windows — settle
    when M5.3 is scoped.
+
+## 12. Future Work
+
+M5 ships durable memory and local recall. Three follow-on capabilities build on
+that base; each is its own RFC and milestone so 0006 stays the stable contract for
+the storage model, ambient injection, and recall tools they all extend.
+
+- **M6 — Memory Hygiene (RFC 0007).** Usage-driven decay and dormancy. Chunks gain
+  access statistics; recall and ambient hits reinforce them, idle time decays them,
+  and below-threshold chunks become *dormant* — excluded from ambient injection to
+  protect the token budget, but still returned by `memory_search` (tagged with their
+  age). This makes the §7.3 consolidation pass data-driven rather than heuristic.
+  Decay state lives in a durable side table so the FTS5 index stays rebuildable (§4).
+- **M7 — Cognitive Consistency (RFC 0008).** Temporal fact tracking. When a curated
+  fact is superseded, the old assertion is time-bounded rather than silently
+  overwritten, so memory has history. A first slice does supersession only; a full
+  subject/predicate/object relation graph and a `memory_evolution` recall tool are a
+  later phase. The relation layer is **derived and advisory** — Markdown remains the
+  canonical source of truth (§2).
+- **M8 — Desktop-Native Episodic Memory (RFC 0009).** Context anchors. Captures
+  low-sensitivity desktop context (working directory, active window/app) as chunk
+  metadata at write time, enabling a `context_filter` on `memory_search`. Opt-in and
+  surfaced in Settings; clipboard and network are explicitly out of the first slice
+  to honour the §10 "no inferred surveillance" non-goal. This is recall a cloud chat
+  tool structurally cannot offer.
+
+Sequencing rationale: M6 is the smallest and lowest-risk (a side table plus a decay
+pass over the existing index); M7 adds an extraction step and is scoped down to
+supersession first; M8 depends on desktop signal capture and a consent surface, so it
+lands last.
