@@ -46,6 +46,16 @@ fn exit_cfg() -> McpServerConfig {
     }
 }
 
+fn slow_cfg() -> McpServerConfig {
+    McpServerConfig {
+        id: "slow".into(),
+        command: env!("CARGO_BIN_EXE_mcp_slow").to_string(),
+        args: vec![],
+        env: BTreeMap::new(),
+        disabled: false,
+    }
+}
+
 /// Poll up to `timeout` for `pred(snapshot)` to return `Some(value)`.
 async fn wait_for<F, T>(handle: &SupervisorHandle, timeout: Duration, mut pred: F) -> Option<T>
 where
@@ -216,4 +226,51 @@ async fn manual_restart_unknown_id_is_noop() {
     );
 
     sup.stop_all().await;
+}
+
+/// Quitting mid-call must not stall up to `CALL_TIMEOUT` (#119). `stop_all` flips a
+/// latch that `do_call_tool` races, so an in-flight 60s tool call is abandoned and the
+/// stop completes within the graceful-close budget rather than waiting for the call.
+#[tokio::test]
+async fn stop_all_preempts_in_flight_tool_call() {
+    let shared: SharedConfig = Arc::new(RwLock::new(vec![slow_cfg()]));
+    let (_change_tx, change_rx) = mpsc::unbounded_channel::<()>();
+    let sup = spawn_supervisor(shared, change_rx, fast_config());
+
+    wait_for(&sup, Duration::from_secs(5), |snap| {
+        snap.iter()
+            .find(|s| s.id == "slow" && s.state == McpServerState::Running)
+            .map(|_| ())
+    })
+    .await
+    .expect("slow server reaches Running");
+
+    // Fire a tool call that would block the actor for 60s without preemption.
+    let caller = sup.clone();
+    let call = tokio::spawn(async move {
+        caller
+            .call_tool("slow", "sleep", serde_json::json!({ "ms": 60_000 }))
+            .await
+    });
+
+    // Give the call time to reach the actor and start awaiting on the client.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let started = Instant::now();
+    sup.stop_all().await;
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "stop_all should preempt the in-flight call, not wait for it; took {elapsed:?}"
+    );
+
+    // The abandoned call resolves with an error rather than hanging.
+    let result = tokio::time::timeout(Duration::from_secs(2), call)
+        .await
+        .expect("call task should resolve, not hang")
+        .expect("call task should not panic");
+    assert!(
+        result.is_err(),
+        "preempted call should return an error, got {result:?}"
+    );
 }
