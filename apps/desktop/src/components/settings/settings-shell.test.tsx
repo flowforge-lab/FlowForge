@@ -51,7 +51,7 @@ describe("section switching", () => {
     expect(useSettingsStore.getState().resetHandler).toBeNull();
   });
 
-  it("routes appearance to its sub-tabs and unbuilt sections to ComingSoon", () => {
+  it("routes appearance to its sub-tabs; about and unbuilt sections differ", () => {
     const appearance = renderToStaticMarkup(
       <SettingsSectionContent id="appearance" />,
     );
@@ -59,9 +59,15 @@ describe("section switching", () => {
     expect(appearance).toContain("Font");
     expect(appearance).not.toContain("Coming soon.");
 
-    const memory = renderToStaticMarkup(<SettingsSectionContent id="memory" />);
-    expect(memory).toContain("Coming soon.");
-    expect(memory).toContain("Memory");
-    expect(memory).not.toContain("Display name");
+    const about = renderToStaticMarkup(<SettingsSectionContent id="about" />);
+    expect(about).toContain("Check for updates");
+    expect(about).toContain("View all keyboard shortcuts");
+    expect(about).not.toContain("Coming soon.");
+
+    const scheduled = renderToStaticMarkup(
+      <SettingsSectionContent id="scheduled" />,
+    );
+    expect(scheduled).toContain("Coming soon.");
+    expect(scheduled).toContain("Scheduled");
   });
 });

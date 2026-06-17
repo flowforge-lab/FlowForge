@@ -162,6 +162,15 @@ export interface FfIpc {
   /** Remove a server definition from `mcp.json` and reconcile. No-op if absent. */
   removeMcpServer(id: string): Promise<void>;
 
+  // About section (SET.11). Mock no-ops until updater + backup backend lands.
+  // Each resolves with a user-facing confirmation string for toasts.
+  /** Check for app updates; mock always reports up to date. */
+  checkForUpdates(): Promise<string>;
+  /** Export a local backup; mock no-op. */
+  exportBackup(): Promise<string>;
+  /** Restore from a backup; mock no-op. */
+  restoreBackup(): Promise<string>;
+
   // Events (backend -> frontend)
   onToken(cb: (e: TokenEvent) => void): Promise<Unlisten>;
   onTurnDone(cb: (e: TurnDoneEvent) => void): Promise<Unlisten>;
@@ -306,6 +315,10 @@ class TauriIpc implements FfIpc {
     this.invoke<void>("add_mcp_server", { def });
   removeMcpServer = (id: string) =>
     this.invoke<void>("remove_mcp_server", { id });
+
+  checkForUpdates = () => this.invoke<string>("check_for_updates");
+  exportBackup = () => this.invoke<string>("export_backup");
+  restoreBackup = () => this.invoke<string>("restore_backup");
 
   onToken = (cb: (e: TokenEvent) => void) =>
     this.listen<TokenEvent>("turn:token", cb);
