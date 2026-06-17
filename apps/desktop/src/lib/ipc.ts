@@ -4,6 +4,7 @@
 // `bindings` types. Set `VITE_FF_MOCK=1` to run the frontend against an in-browser
 // mock that fulfils this exact contract, so UI work never blocks on the Rust side.
 
+import type { UpdateStatus, BackupResult } from "@/lib/about";
 import type { ControlConfig } from "@/lib/control";
 import type { MarketplaceSkill } from "@/lib/marketplace";
 import type { MarketplaceProfile } from "@/lib/profile-marketplace";
@@ -162,14 +163,17 @@ export interface FfIpc {
   /** Remove a server definition from `mcp.json` and reconcile. No-op if absent. */
   removeMcpServer(id: string): Promise<void>;
 
-  // About section (SET.11). Mock no-ops until updater + backup backend lands.
-  // Each resolves with a user-facing confirmation string for toasts.
-  /** Check for app updates; mock always reports up to date. */
-  checkForUpdates(): Promise<string>;
-  /** Export a local backup; mock no-op. */
-  exportBackup(): Promise<string>;
-  /** Restore from a backup; mock no-op. */
-  restoreBackup(): Promise<string>;
+  // CONTRACT NOTE (SET.11): FE-owned result types — no backend/ts-rs bindings
+  // exist yet (mock-only). `UpdateStatus` / `BackupResult` live in lib/about.ts
+  // (mirroring the SET.5/7 marketplace contracts). The FE owns the user-facing
+  // copy; these report only the structured outcome. Replace with generated
+  // bindings + a real updater/backup backend when they land (#159).
+  /** Check for app updates. */
+  checkForUpdates(): Promise<UpdateStatus>;
+  /** Export a local backup. */
+  exportBackup(): Promise<BackupResult>;
+  /** Restore from a backup. */
+  restoreBackup(): Promise<BackupResult>;
 
   // Events (backend -> frontend)
   onToken(cb: (e: TokenEvent) => void): Promise<Unlisten>;
@@ -316,9 +320,9 @@ class TauriIpc implements FfIpc {
   removeMcpServer = (id: string) =>
     this.invoke<void>("remove_mcp_server", { id });
 
-  checkForUpdates = () => this.invoke<string>("check_for_updates");
-  exportBackup = () => this.invoke<string>("export_backup");
-  restoreBackup = () => this.invoke<string>("restore_backup");
+  checkForUpdates = () => this.invoke<UpdateStatus>("check_for_updates");
+  exportBackup = () => this.invoke<BackupResult>("export_backup");
+  restoreBackup = () => this.invoke<BackupResult>("restore_backup");
 
   onToken = (cb: (e: TokenEvent) => void) =>
     this.listen<TokenEvent>("turn:token", cb);

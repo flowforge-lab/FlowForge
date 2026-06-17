@@ -34,6 +34,11 @@ import type { FfIpc, Unlisten } from "./ipc";
 import type { MarketplaceSkill } from "./marketplace";
 import type { MarketplaceProfile } from "./profile-marketplace";
 import { CONTROL_DEFAULTS, type ControlConfig } from "./control";
+import {
+  APP_VERSION_FALLBACK,
+  type UpdateStatus,
+  type BackupResult,
+} from "./about";
 import { autoTitle } from "./auto-title";
 
 type Listener<T> = (e: T) => void;
@@ -815,17 +820,17 @@ export class MockIpc implements FfIpc {
       .map(({ p }) => ({ ...p }));
   }
 
-  // About section (SET.11). No-op stubs — real updater/backup lands later.
-  async checkForUpdates(): Promise<string> {
-    return "You're on the latest version.";
+  // About section (SET.11). Structured stubs — real updater/backup lands later.
+  async checkForUpdates(): Promise<UpdateStatus> {
+    return { kind: "upToDate", version: APP_VERSION_FALLBACK };
   }
 
-  async exportBackup(): Promise<string> {
-    return "Backup exported.";
+  async exportBackup(): Promise<BackupResult> {
+    return { path: "~/Downloads/flowforge-backup.json" };
   }
 
-  async restoreBackup(): Promise<string> {
-    return "Backup restored.";
+  async restoreBackup(): Promise<BackupResult> {
+    return { path: "~/Downloads/flowforge-backup.json" };
   }
 
   // --- internals ---

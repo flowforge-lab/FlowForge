@@ -1,10 +1,31 @@
-// About section constants + helpers (SET.11). FE-only — no backend types.
+// About section constants, FE-owned contract types, and helpers (SET.11).
+// The result types below have no ts-rs bindings yet (mock-only) — see the
+// CONTRACT NOTE in lib/ipc.ts and #159.
 
 /** Shown after the version in Settings → About. */
 export const APP_TAGLINE = "flow-state AI interface";
 
 /** Fallback when Tauri metadata is unavailable (mock dev in a browser). */
 export const APP_VERSION_FALLBACK = "0.1.0";
+
+/** Result of an update check. The FE owns the user-facing copy (see
+ *  `formatUpdateStatus`); the backend reports only the structured outcome. */
+export type UpdateStatus =
+  | { kind: "upToDate"; version: string }
+  | { kind: "available"; version: string; notes: string | null };
+
+/** Result of an export/restore backup action. */
+export interface BackupResult {
+  /** Path the backup was written to (export) or read from (restore). */
+  path: string;
+}
+
+/** FE-owned toast copy for an update-check result. */
+export function formatUpdateStatus(status: UpdateStatus): string {
+  return status.kind === "available"
+    ? `Version ${status.version} is available.`
+    : "You're on the latest version.";
+}
 
 export const ABOUT_BUG_REPORT_URL =
   "https://github.com/flowforge-lab/FlowForge/issues/new";
