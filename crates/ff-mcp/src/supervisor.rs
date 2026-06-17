@@ -114,6 +114,10 @@ pub struct SupervisorHandle {
     /// forward a `mcp:status-changed` event without polling. Carries no data — readers
     /// re-snapshot via [`status_snapshot`](Self::status_snapshot).
     status_rx: watch::Receiver<()>,
+    /// Sticky `true`-latch flipped by [`stop_all`](Self::stop_all) before it queues
+    /// the `StopAll` command, so an in-flight `do_call_tool` await is preempted and the
+    /// actor reaches the stop quickly instead of stalling up to `CALL_TIMEOUT` (#119).
+    cancel_tx: Arc<watch::Sender<bool>>,
 }
 
 impl SupervisorHandle {
@@ -187,6 +191,10 @@ impl SupervisorHandle {
     /// have completed (or timed out) so the caller can let the Tokio runtime wind
     /// down with no children still waiting to be reaped.
     pub async fn stop_all(&self) {
+        // Preempt any in-flight tool call before queuing StopAll: `do_call_tool`
+        // races this latch, so the actor abandons the call and reaches the stop in
+        // ~SHUTDOWN_TIMEOUT instead of stalling up to CALL_TIMEOUT (#119).
+        let _ = self.cancel_tx.send(true);
         let (ack_tx, ack_rx) = oneshot::channel();
         if self.cmd_tx.send(Cmd::StopAll(ack_tx)).await.is_err() {
             return;
@@ -274,6 +282,7 @@ pub fn spawn(
     let tools: SharedTools = Arc::new(RwLock::new(Vec::new()));
     let (cmd_tx, cmd_rx) = mpsc::channel::<Cmd>(16);
     let (status_tx, status_rx) = watch::channel(());
+    let (cancel_tx, cancel_rx) = watch::channel(false);
     let actor = Supervisor {
         config,
         handles: BTreeMap::new(),
@@ -283,6 +292,7 @@ pub fn spawn(
         status_tx,
         cmd_rx,
         change_rx,
+        cancel_rx,
     };
     tokio::spawn(actor.run());
     SupervisorHandle {
@@ -290,6 +300,7 @@ pub fn spawn(
         status,
         tools,
         status_rx,
+        cancel_tx: Arc::new(cancel_tx),
     }
 }
 
@@ -304,6 +315,9 @@ struct Supervisor {
     status_tx: watch::Sender<()>,
     cmd_rx: mpsc::Receiver<Cmd>,
     change_rx: mpsc::UnboundedReceiver<()>,
+    /// Receiver side of the quit latch. `do_call_tool` races this so an in-flight
+    /// call is abandoned the moment `stop_all` flips it (#119).
+    cancel_rx: watch::Receiver<bool>,
 }
 
 impl Supervisor {
@@ -597,8 +611,9 @@ impl Supervisor {
 
     /// Execute a tool call against the named server's live client. Called inline
     /// from the actor's select loop — blocks supervision for the call's duration
-    /// (bounded by `CALL_TIMEOUT`). This keeps single-ownership of clients intact,
-    /// preserving clean reaping and graceful close (see design note in RFC 0003 §6).
+    /// (bounded by `CALL_TIMEOUT`, but preempted early when `stop_all` flips the quit
+    /// latch so app exit isn't stalled — #119). This keeps single-ownership of clients
+    /// intact, preserving clean reaping and graceful close (see RFC 0003 §6).
     async fn do_call_tool(
         &mut self,
         server: &str,
@@ -619,22 +634,39 @@ impl Supervisor {
                 crate::McpError::Protocol(format!("server '{server}' is not running"))
             })?;
 
-        let result = tokio::time::timeout(CALL_TIMEOUT, client.call_tool(tool, args)).await;
+        // Race the call against the quit latch so app exit can preempt a slow tool
+        // instead of stalling up to CALL_TIMEOUT (#119). The inner block owns the call
+        // future so it is dropped (releasing its borrow of `client`) before we restore
+        // the client below. `biased` checks the latch first, so a StopAll queued ahead
+        // of this call short-circuits without even starting to poll the call.
+        let outcome = {
+            let mut cancel = self.cancel_rx.clone();
+            let call = tokio::time::timeout(CALL_TIMEOUT, client.call_tool(tool, args));
+            tokio::pin!(call);
+            tokio::select! {
+                biased;
+                _ = cancel.wait_for(|stopping| *stopping) => None,
+                r = &mut call => Some(r),
+            }
+        };
 
-        // Restore the client regardless of outcome (we didn't kill it). On timeout
-        // the in-flight request is intentionally left to resolve-and-drop: rmcp
-        // multiplexes by request id, so a late response to the abandoned call won't
-        // be mismatched against the next call on the reused client.
+        // Restore the client regardless of outcome (we didn't kill it). On timeout or
+        // preemption the in-flight request is intentionally left to resolve-and-drop:
+        // rmcp multiplexes by request id, so a late response to the abandoned call
+        // won't be mismatched against the next call on the reused client.
         if let Some(h) = self.handles.get_mut(server) {
             h.client = Some(client);
         }
 
-        match result {
-            Ok(Ok(text)) => Ok(text),
-            Ok(Err(e)) => Err(e),
-            Err(_elapsed) => Err(crate::McpError::Protocol(format!(
+        match outcome {
+            Some(Ok(Ok(text))) => Ok(text),
+            Some(Ok(Err(e))) => Err(e),
+            Some(Err(_elapsed)) => Err(crate::McpError::Protocol(format!(
                 "tool call '{tool}' on server '{server}' timed out after {}s",
                 CALL_TIMEOUT.as_secs()
+            ))),
+            None => Err(crate::McpError::Protocol(format!(
+                "tool call '{tool}' on server '{server}' aborted: supervisor stopping"
             ))),
         }
     }
