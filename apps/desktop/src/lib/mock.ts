@@ -31,6 +31,7 @@ import type {
   McpStatusChangedEvent,
 } from "../bindings";
 import type { FfIpc, Unlisten } from "./ipc";
+import { CONTROL_DEFAULTS, type ControlConfig } from "./control";
 import { autoTitle } from "./auto-title";
 
 type Listener<T> = (e: T) => void;
@@ -207,6 +208,10 @@ export class MockIpc implements FfIpc {
     backend: "searxNg",
     hasKey: false,
   };
+
+  // Control settings (Issue #127). In-memory for the mock session; structurally
+  // cloned on read/write so callers can't mutate the stored copy.
+  private controlConfig: ControlConfig = structuredClone(CONTROL_DEFAULTS);
 
   private tokenListeners = new Set<Listener<TokenEvent>>();
   private doneListeners = new Set<Listener<TurnDoneEvent>>();
@@ -528,6 +533,15 @@ export class MockIpc implements FfIpc {
       hasKey: false,
     };
     return { ...this.searchConfig };
+  }
+
+  async getControlConfig(): Promise<ControlConfig> {
+    return structuredClone(this.controlConfig);
+  }
+
+  async setControlConfig(config: ControlConfig): Promise<ControlConfig> {
+    this.controlConfig = structuredClone(config);
+    return structuredClone(this.controlConfig);
   }
 
   async warmup(): Promise<void> {

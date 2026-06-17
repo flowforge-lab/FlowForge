@@ -1,4 +1,5 @@
 import { AppearanceSection } from "@/components/settings/appearance-section";
+import { ControlSection } from "@/components/settings/control-section";
 import { McpSection } from "@/components/settings/mcp/mcp-section";
 import { ModelSection } from "@/components/settings/model-section";
 import { ComingSoon } from "@/components/settings/coming-soon";
@@ -17,6 +18,8 @@ export function SettingsSectionContent({ id }: { id: SettingsSectionId }) {
       return <AppearanceSection />;
     case "model":
       return <ModelSection />;
+    case "control":
+      return <ControlSection />;
     case "mcp":
       return <McpSection />;
     default:
