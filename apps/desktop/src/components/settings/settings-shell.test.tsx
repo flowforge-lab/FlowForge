@@ -59,9 +59,11 @@ describe("section switching", () => {
     expect(appearance).toContain("Font");
     expect(appearance).not.toContain("Coming soon.");
 
-    const model = renderToStaticMarkup(<SettingsSectionContent id="model" />);
-    expect(model).toContain("Coming soon.");
-    expect(model).toContain("Model");
-    expect(model).not.toContain("Display name");
+    const profiles = renderToStaticMarkup(
+      <SettingsSectionContent id="profiles" />,
+    );
+    expect(profiles).toContain("Coming soon.");
+    expect(profiles).toContain("Profiles");
+    expect(profiles).not.toContain("Display name");
   });
 });
