@@ -4,6 +4,7 @@
 // `bindings` types. Set `VITE_FF_MOCK=1` to run the frontend against an in-browser
 // mock that fulfils this exact contract, so UI work never blocks on the Rust side.
 
+import type { ControlConfig } from "@/lib/control";
 import type {
   Message,
   ProviderConfig,
@@ -89,6 +90,18 @@ export interface FfIpc {
   ): Promise<SearchConfig>;
   /** Best-effort nudge to wake the model server before the first turn. Never throws meaningfully. */
   warmup(): Promise<void>;
+
+  // Control settings (Issue #127). `ControlConfig` is a FE-owned shape (lib/control.ts):
+  // there is no backend/ts-rs type yet, and the permission matrix does NOT map to
+  // `ApprovalSafety` ("write"|"dangerous"). For now this round-trips presentation
+  // state + mock storage only; it does not drive runtime approval.
+  // TODO(#127 follow-up): once `ApprovalSafety` is extended to cover the
+  // 4-row × 3-column matrix, replace `ControlConfig` with a generated `bindings`
+  // type and wire `defaultMode`/`permissionPolicy` into runtime approval.
+  /** Current persisted control settings (permissions presentation + prompts). */
+  getControlConfig(): Promise<ControlConfig>;
+  /** Persist control settings; resolves with the stored config. */
+  setControlConfig(config: ControlConfig): Promise<ControlConfig>;
 
   // Skills (Issue #27). Discovery + the global active set; backs the command palette.
   /** All installed skills, name-sorted, each flagged active; `score` is always 0. */
@@ -238,6 +251,10 @@ class TauriIpc implements FfIpc {
   getSearchConfig = () => this.invoke<SearchConfig>("get_search_config");
   setSearchConfig = (backend: SearchBackend, baseUrl: string | undefined) =>
     this.invoke<SearchConfig>("set_search_config", { backend, baseUrl });
+
+  getControlConfig = () => this.invoke<ControlConfig>("get_control_config");
+  setControlConfig = (config: ControlConfig) =>
+    this.invoke<ControlConfig>("set_control_config", { config });
   warmup = () => this.invoke<void>("warmup");
 
   listSkills = () => this.invoke<SkillInfo[]>("list_skills");
