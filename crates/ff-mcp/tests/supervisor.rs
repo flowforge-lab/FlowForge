@@ -152,3 +152,68 @@ async fn no_orphan_processes_after_stop_all() {
         "child pid {pid} still alive after stop_all"
     );
 }
+
+#[tokio::test]
+async fn manual_restart_reconnects_running_server() {
+    let shared: SharedConfig = Arc::new(RwLock::new(vec![echo_cfg()]));
+    let (_change_tx, change_rx) = mpsc::unbounded_channel::<()>();
+    let sup = spawn_supervisor(shared, change_rx, fast_config());
+
+    let first_pid = wait_for(&sup, Duration::from_secs(5), |snap| {
+        snap.iter()
+            .find(|s| s.id == "echo" && s.state == McpServerState::Running)
+            .and_then(|s| s.pid)
+    })
+    .await
+    .expect("server reaches Running");
+
+    // Manual restart spawns a fresh child, so the pid must change.
+    sup.restart("echo").await;
+
+    let second_pid = wait_for(&sup, Duration::from_secs(5), |snap| {
+        snap.iter()
+            .find(|s| {
+                s.id == "echo"
+                    && s.state == McpServerState::Running
+                    && s.pid.is_some()
+                    && s.pid != Some(first_pid)
+            })
+            .and_then(|s| s.pid)
+    })
+    .await
+    .expect("server reconnects after manual restart");
+    assert_ne!(first_pid, second_pid, "restart should spawn a new child");
+
+    sup.stop_all().await;
+}
+
+#[tokio::test]
+async fn manual_restart_unknown_id_is_noop() {
+    let shared: SharedConfig = Arc::new(RwLock::new(vec![echo_cfg()]));
+    let (_change_tx, change_rx) = mpsc::unbounded_channel::<()>();
+    let sup = spawn_supervisor(shared, change_rx, fast_config());
+
+    wait_for(&sup, Duration::from_secs(5), |snap| {
+        snap.iter()
+            .find(|s| s.id == "echo" && s.state == McpServerState::Running)
+            .map(|_| ())
+    })
+    .await
+    .expect("server reaches Running");
+
+    // Restarting a server that was never configured must not panic or disturb others.
+    sup.restart("does-not-exist").await;
+
+    let still_running = wait_for(&sup, Duration::from_secs(2), |snap| {
+        snap.iter()
+            .find(|s| s.id == "echo" && s.state == McpServerState::Running)
+            .map(|_| ())
+    })
+    .await;
+    assert!(
+        still_running.is_some(),
+        "unknown-id restart left echo running"
+    );
+
+    sup.stop_all().await;
+}
