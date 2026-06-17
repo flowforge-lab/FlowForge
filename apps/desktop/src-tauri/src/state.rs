@@ -9,7 +9,7 @@ use ff_core::{
 };
 use ff_llm::{OllamaProvider, OpenAiProvider, Provider};
 use ff_mcp::{McpConfigWatcher, SupervisorHandle};
-use ff_memory::MemoryStore;
+use ff_session::SessionStore;
 use ff_signals::{SignalStore, SkillAggregate, SkillCompleted};
 use ff_skills::{
     default_phenotype, load_phenotypes, SharedRegistry, SkillRegistry, SkillWatcher,
@@ -261,7 +261,7 @@ fn resolve_phenotype(name: &str) -> Option<Phenotype> {
 }
 
 pub struct AppState {
-    pub store: MemoryStore,
+    pub store: SessionStore,
     /// Persisted, non-secret LLM provider connection registry (RFC 0005 Phase A).
     /// The active connection drives each turn; snapshotted (never held across an
     /// await) per turn. Mutated by the connection commands and the legacy
@@ -321,7 +321,7 @@ impl AppState {
         // same cell; a settings change takes effect on the next call.
         let search_config = Arc::new(Mutex::new(load_search_config()));
         let state = Self {
-            store: MemoryStore::new(),
+            store: SessionStore::new(),
             registry: Mutex::new(registry),
             search_config,
             workspace_root: default_workspace_root(),

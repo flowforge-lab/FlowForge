@@ -1253,7 +1253,7 @@ dependencies = [
  "chrono",
  "ff-core",
  "ff-llm",
- "ff-memory",
+ "ff-session",
  "ff-skills",
  "ff-tools",
  "futures-util",
@@ -1277,6 +1277,7 @@ dependencies = [
  "ff-core",
  "ff-llm",
  "ff-memory",
+ "ff-session",
  "ff-skills",
  "ff-tools",
  "futures-util",
@@ -1329,6 +1330,16 @@ dependencies = [
 
 [[package]]
 name = "ff-memory"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "dirs 5.0.1",
+ "serde",
+ "tempfile",
+]
+
+[[package]]
+name = "ff-session"
 version = "0.1.0"
 dependencies = [
  "ff-core",
@@ -1441,6 +1452,7 @@ dependencies = [
  "ff-llm",
  "ff-mcp",
  "ff-memory",
+ "ff-session",
  "ff-signals",
  "ff-skills",
  "ff-tools",
