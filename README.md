@@ -146,8 +146,8 @@ cargo tauri build
 - [x] **M1** — Tauri 2 shell + React chat UI + first LLM call (candle-vllm)
 - [x] **M2** — Tool calling (bash, view, edit) + streaming render + interactive approval
 - [x] **M3** — Skills + phenotypes + command palette
-- [ ] **M4** — MCP host & supervisor — external tool servers (stdio/SSE), lifecycle + server-status UI
-- [ ] **M5** — Memory system (SQLite + vector recall)
+- [x] **M4** — MCP host & supervisor — external tool servers (stdio/SSE), lifecycle + server-status UI
+- [ ] **M5** — Memory system — Markdown source-of-truth + local SQLite FTS5 recall (optional embeddings) ([RFC 0006](docs/rfcs/0006-memory.md))
 - [ ] **M6** — Cold-start optimization (<200ms)
 - [ ] **M7** — Workflow canvas (visual multi-agent DAGs)
 - [ ] **M8** — NeuroForge integration (intention signals + inline feedback)
