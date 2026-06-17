@@ -142,6 +142,29 @@ describe("appearance prefs (SET.2)", () => {
   });
 });
 
+describe("keyboard prefs (SET.6)", () => {
+  beforeEach(() => {
+    usePrefsStore.getState().resetKeyboard();
+  });
+
+  it("defaults sendMessageKey to enter", () => {
+    expect(usePrefsStore.getState().sendMessageKey).toBe("enter");
+  });
+
+  it("setSendMessageKey persists the binding", () => {
+    usePrefsStore.getState().setSendMessageKey("ctrlEnter");
+    expect(usePrefsStore.getState().sendMessageKey).toBe("ctrlEnter");
+  });
+
+  it("resetKeyboard restores enter without touching appearance prefs", () => {
+    usePrefsStore.setState({ sendMessageKey: "ctrlEnter", theme: "dark" });
+    usePrefsStore.getState().resetKeyboard();
+    expect(usePrefsStore.getState().sendMessageKey).toBe("enter");
+    // Appearance prefs are owned by resetAppearance, not resetKeyboard.
+    expect(usePrefsStore.getState().theme).toBe("dark");
+  });
+});
+
 describe("ff-prefs hydration of pre-SET.2 blobs", () => {
   afterEach(() => {
     localStorage.clear();
