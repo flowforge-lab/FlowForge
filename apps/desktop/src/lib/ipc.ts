@@ -5,6 +5,7 @@
 // mock that fulfils this exact contract, so UI work never blocks on the Rust side.
 
 import type { ControlConfig } from "@/lib/control";
+import type { MarketplaceSkill } from "@/lib/marketplace";
 import type {
   Message,
   ProviderConfig,
@@ -108,6 +109,12 @@ export interface FfIpc {
   listSkills(): Promise<SkillInfo[]>;
   /** Ranked skill search (shares the agent tool's ranking). Empty query lists all. */
   searchSkills(query: string): Promise<SkillInfo[]>;
+  // CONTRACT NOTE (SET.5): FE-owned mock command — no backend/ts-rs binding for a
+  // remote catalog exists yet. `MarketplaceSkill` lives in `lib/marketplace.ts`
+  // (mirroring SET.4's `ControlConfig`); `bindings/` is untouched. Replace with a
+  // generated binding + real command when the marketplace backend lands.
+  /** Search the (mock) skill marketplace. Empty query lists the full catalog. */
+  searchSkillMarketplace(query: string): Promise<MarketplaceSkill[]>;
   /** Add a skill to the global active set; its body is injected next turn. Rejects an unknown name. */
   activateSkill(name: string): Promise<void>;
   /** Remove a skill from the active set. Idempotent. */
@@ -260,6 +267,8 @@ class TauriIpc implements FfIpc {
   listSkills = () => this.invoke<SkillInfo[]>("list_skills");
   searchSkills = (query: string) =>
     this.invoke<SkillInfo[]>("search_skills", { query });
+  searchSkillMarketplace = (query: string) =>
+    this.invoke<MarketplaceSkill[]>("search_skill_marketplace", { query });
   activateSkill = (name: string) =>
     this.invoke<void>("activate_skill", { name });
   deactivateSkill = (name: string) =>

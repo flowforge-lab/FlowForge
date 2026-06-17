@@ -2,6 +2,7 @@ import { AppearanceSection } from "@/components/settings/appearance-section";
 import { ControlSection } from "@/components/settings/control-section";
 import { McpSection } from "@/components/settings/mcp/mcp-section";
 import { ModelSection } from "@/components/settings/model-section";
+import { SkillsSection } from "@/components/settings/skills-section";
 import { ComingSoon } from "@/components/settings/coming-soon";
 import {
   getSectionMeta,
@@ -18,6 +19,8 @@ export function SettingsSectionContent({ id }: { id: SettingsSectionId }) {
       return <AppearanceSection />;
     case "model":
       return <ModelSection />;
+    case "skills":
+      return <SkillsSection />;
     case "control":
       return <ControlSection />;
     case "mcp":
