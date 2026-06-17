@@ -22,7 +22,7 @@ use std::path::PathBuf;
 pub use backoff::Backoff;
 pub use bridge::{build_bridged_tools, McpBridgedTool};
 pub use client::McpClient;
-pub use config::{load, remove, set_disabled, upsert};
+pub use config::{load, remove, set_disabled, upsert, McpServerInput};
 pub use error::McpError;
 pub use reconcile::{reconcile, ReconcileAction};
 pub use supervisor::{

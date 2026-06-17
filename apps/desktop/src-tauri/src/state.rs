@@ -202,6 +202,10 @@ pub struct AppState {
     /// when no `mcp.json` is present or the watcher cannot start.
     _mcp_watcher: Mutex<Option<McpConfigWatcher>>,
     mcp: Mutex<Option<SupervisorHandle>>,
+    /// Path to the watched `mcp.json`, captured when [`init_mcp_at`](Self::init_mcp_at)
+    /// runs. The MCP control commands write back to this exact file so their edits flow
+    /// through the same watcher that drives reconcile. `None` until MCP is initialized.
+    mcp_config_path: Mutex<Option<PathBuf>>,
 }
 
 impl AppState {
@@ -229,6 +233,7 @@ impl AppState {
             signals: Mutex::new(load_signals()),
             _mcp_watcher: Mutex::new(None),
             mcp: Mutex::new(None),
+            mcp_config_path: Mutex::new(None),
         };
         // Restore the persisted phenotype so its active skills survive a restart.
         // An unknown/missing pointer falls back to the built-in default.
@@ -338,7 +343,7 @@ impl AppState {
         // regardless of the calling thread's context.
         let rt = tauri::async_runtime::handle();
         let _guard = rt.inner().enter();
-        let (watcher, shared, change_rx) = match McpConfigWatcher::spawn(path) {
+        let (watcher, shared, change_rx) = match McpConfigWatcher::spawn(path.clone()) {
             Ok(t) => t,
             Err(e) => {
                 tracing::warn!(error = %e, "mcp config watcher unavailable");
@@ -349,6 +354,14 @@ impl AppState {
             ff_mcp::spawn_supervisor(shared, change_rx, ff_mcp::SupervisorConfig::default());
         *self._mcp_watcher.lock().unwrap() = Some(watcher);
         *self.mcp.lock().unwrap() = Some(handle);
+        *self.mcp_config_path.lock().unwrap() = Some(path);
+    }
+
+    /// Path to the watched `mcp.json`, or `None` before [`init_mcp`](Self::init_mcp)
+    /// has run. The MCP control commands write back to this file (its edits then ride
+    /// the existing config watcher into a reconcile).
+    pub fn mcp_config_path(&self) -> Option<PathBuf> {
+        self.mcp_config_path.lock().unwrap().clone()
     }
 
     /// A clone of the supervisor handle if MCP was successfully initialized; `None`
@@ -888,6 +901,23 @@ mod tests {
         assert!(
             state.mcp_handle().is_some(),
             "supervisor must spawn (and not panic) when init runs off-runtime"
+        );
+    }
+
+    #[test]
+    fn init_mcp_captures_config_path_for_write_back() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("mcp.json");
+        let state = AppState::new();
+        assert!(
+            state.mcp_config_path().is_none(),
+            "path is None before init"
+        );
+        state.init_mcp_at(path.clone());
+        assert_eq!(
+            state.mcp_config_path(),
+            Some(path),
+            "control commands must write back to the watched file"
         );
     }
 }
