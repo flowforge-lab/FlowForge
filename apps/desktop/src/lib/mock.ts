@@ -31,6 +31,7 @@ import type {
   McpStatusChangedEvent,
 } from "../bindings";
 import type { FfIpc, Unlisten } from "./ipc";
+import type { MarketplaceSkill } from "./marketplace";
 import { CONTROL_DEFAULTS, type ControlConfig } from "./control";
 import { autoTitle } from "./auto-title";
 
@@ -99,6 +100,54 @@ const MOCK_SKILLS: SkillInfo[] = [
 // Mirrors `ff_skills::search_skills` scoring so the mock ranks like the backend:
 // exact keyword (4) > name prefix (3) > name substring (2) > description (1).
 function scoreSkill(skill: SkillInfo, q: string): number {
+  const name = skill.name.toLowerCase();
+  if (skill.keywords.some((k) => k.toLowerCase() === q)) return 4;
+  if (name.startsWith(q)) return 3;
+  if (name.includes(q)) return 2;
+  if (skill.description.toLowerCase().includes(q)) return 1;
+  return 0;
+}
+
+// Canned marketplace catalog so the Skills → Marketplace search (SET.5) is
+// exercisable offline. FE-only (`MarketplaceSkill`); no backend catalog yet.
+const MOCK_MARKETPLACE: MarketplaceSkill[] = [
+  {
+    name: "docx-author",
+    description: "Create and edit Word documents with headings and tables.",
+    version: "1.4.0",
+    author: "flowforge-labs",
+    keywords: ["docx", "word", "document"],
+    installs: 12400,
+  },
+  {
+    name: "pdf-toolkit",
+    description: "Merge, split, and extract text from PDF files.",
+    version: "2.0.1",
+    author: "flowforge-labs",
+    keywords: ["pdf", "merge", "ocr"],
+    installs: 9800,
+  },
+  {
+    name: "sql-explain",
+    description: "Explain and optimize SQL queries against a schema.",
+    version: "0.6.2",
+    author: "community",
+    keywords: ["sql", "database", "query"],
+    installs: 4300,
+  },
+  {
+    name: "k8s-debug",
+    description: "Diagnose Kubernetes pods, events, and rollout failures.",
+    version: "0.3.0",
+    author: "community",
+    keywords: ["kubernetes", "k8s", "debug"],
+    installs: 2100,
+  },
+];
+
+// Ranks a marketplace skill like `scoreSkill` (keyword > name prefix > name
+// substring > description), so the mock search orders results sensibly.
+function scoreMarketplace(skill: MarketplaceSkill, q: string): number {
   const name = skill.name.toLowerCase();
   if (skill.keywords.some((k) => k.toLowerCase() === q)) return 4;
   if (name.startsWith(q)) return 3;
@@ -571,6 +620,19 @@ export class MockIpc implements FfIpc {
         active: this.activeSkills.has(s.name),
         score,
       }));
+  }
+
+  // Marketplace search (SET.5). Empty query lists the full catalog, install-count
+  // descending; a query ranks by relevance and drops non-matches.
+  async searchSkillMarketplace(query: string): Promise<MarketplaceSkill[]> {
+    const q = query.trim().toLowerCase();
+    if (q === "") {
+      return [...MOCK_MARKETPLACE].sort((a, b) => b.installs - a.installs);
+    }
+    return MOCK_MARKETPLACE.map((s) => ({ s, score: scoreMarketplace(s, q) }))
+      .filter(({ score }) => score > 0)
+      .sort((a, b) => b.score - a.score || b.s.installs - a.s.installs)
+      .map(({ s }) => ({ ...s }));
   }
 
   async activateSkill(name: string): Promise<void> {

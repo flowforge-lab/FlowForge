@@ -44,3 +44,22 @@ describe("MockIpc skill discovery", () => {
     await expect(ipc.activateSkill("ghost")).rejects.toThrow("unknown skill");
   });
 });
+
+describe("MockIpc skill marketplace (SET.5)", () => {
+  it("lists the full catalog by install count for an empty query", async () => {
+    const ipc = new MockIpc();
+    const results = await ipc.searchSkillMarketplace("");
+    expect(results.length).toBeGreaterThan(1);
+    const installs = results.map((r) => r.installs);
+    expect(installs).toEqual([...installs].sort((a, b) => b - a));
+  });
+
+  it("ranks matches and drops non-matches for a query", async () => {
+    const ipc = new MockIpc();
+    const hits = await ipc.searchSkillMarketplace("pdf");
+    expect(hits[0].name).toBe("pdf-toolkit");
+    expect(hits.every((h) => h.name === "pdf-toolkit")).toBe(true);
+
+    expect(await ipc.searchSkillMarketplace("nomatch-xyz")).toEqual([]);
+  });
+});
