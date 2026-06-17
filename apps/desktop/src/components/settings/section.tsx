@@ -5,6 +5,7 @@ import { ModelSection } from "@/components/settings/model-section";
 import { SkillsSection } from "@/components/settings/skills-section";
 import { ProfilesSection } from "@/components/settings/profiles-section";
 import { KeyboardSection } from "@/components/settings/keyboard-section";
+import { MemorySection } from "@/components/settings/memory-section";
 import { ComingSoon } from "@/components/settings/coming-soon";
 import {
   getSectionMeta,
@@ -31,6 +32,8 @@ export function SettingsSectionContent({ id }: { id: SettingsSectionId }) {
       return <McpSection />;
     case "keyboard":
       return <KeyboardSection />;
+    case "memory":
+      return <MemorySection />;
     default:
       return <ComingSoon label={getSectionMeta(id).label} />;
   }

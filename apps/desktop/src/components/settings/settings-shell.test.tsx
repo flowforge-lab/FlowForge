@@ -51,7 +51,7 @@ describe("section switching", () => {
     expect(useSettingsStore.getState().resetHandler).toBeNull();
   });
 
-  it("routes appearance to its sub-tabs and unbuilt sections to ComingSoon", () => {
+  it("routes appearance to its sub-tabs and memory to the memory browser", () => {
     const appearance = renderToStaticMarkup(
       <SettingsSectionContent id="appearance" />,
     );
@@ -60,8 +60,9 @@ describe("section switching", () => {
     expect(appearance).not.toContain("Coming soon.");
 
     const memory = renderToStaticMarkup(<SettingsSectionContent id="memory" />);
-    expect(memory).toContain("Coming soon.");
-    expect(memory).toContain("Memory");
+    expect(memory).toContain("Search memory");
+    expect(memory).toContain("provisional");
+    expect(memory).not.toContain("Coming soon.");
     expect(memory).not.toContain("Display name");
   });
 });

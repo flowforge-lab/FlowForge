@@ -35,6 +35,7 @@ import type { MarketplaceSkill } from "./marketplace";
 import type { MarketplaceProfile } from "./profile-marketplace";
 import { CONTROL_DEFAULTS, type ControlConfig } from "./control";
 import { autoTitle } from "./auto-title";
+import { filterMemory, type MemorySnapshot } from "./memory";
 
 type Listener<T> = (e: T) => void;
 
@@ -222,6 +223,55 @@ function scoreProfile(profile: MarketplaceProfile, q: string): number {
   if (profile.description.toLowerCase().includes(q)) return 1;
   return 0;
 }
+
+// Canned memory snapshot so Settings → Memory (SET.8) is exercisable offline.
+// PROVISIONAL — see `lib/memory.ts`; expect revision when `ff-memory` lands.
+const MOCK_MEMORY: MemorySnapshot = {
+  categories: {
+    who: {
+      subtitle: "Role & preferences",
+      items: [
+        "Senior frontend engineer on FlowForge",
+        "Prefers TypeScript and concise answers",
+        "Desktop-first; uses mock IPC for UI work",
+      ],
+    },
+    how: {
+      subtitle: "Patterns & conventions",
+      items: [
+        "Conventional Commits; one commit per PR",
+        "Reuse shadcn/ui + Zustand; no parallel patterns",
+        "Verify with typecheck, lint, format:check, build",
+      ],
+    },
+    what: {
+      subtitle: "Current priorities",
+      items: [
+        "Settings redesign (SET epic)",
+        "Memory browser against mock IPC",
+        "RFC 0002 ambient context exploration",
+      ],
+    },
+  },
+  journal: [
+    {
+      id: "j1",
+      date: "2026-06-15",
+      content: "Reviewed RFC 0002 ambient memory shapes with the team.",
+    },
+    {
+      id: "j2",
+      date: "2026-06-14",
+      content: "Shipped SET.7 Profiles section; started SET.8 Memory browser.",
+    },
+  ],
+  files: [
+    { name: "user_instructions.md", sizeBytes: 2048 },
+    { name: "memory/who.md", sizeBytes: 512 },
+    { name: "memory/how.md", sizeBytes: 768 },
+    { name: "memory/what.md", sizeBytes: 640 },
+  ],
+};
 
 // Canned MCP server statuses so the servers panel (#91) is exercisable offline.
 // One running with tools, one that restarted once, one failed-to-spawn.
@@ -813,6 +863,16 @@ export class MockIpc implements FfIpc {
       .filter(({ score }) => score > 0)
       .sort((a, b) => b.score - a.score || b.p.installs - a.p.installs)
       .map(({ p }) => ({ ...p }));
+  }
+
+  // Memory browser (SET.8). Returns a cloned snapshot; search applies the same
+  // client-side filter the store uses (`filterMemory`).
+  async getMemory(): Promise<MemorySnapshot> {
+    return structuredClone(MOCK_MEMORY);
+  }
+
+  async searchMemory(query: string): Promise<MemorySnapshot> {
+    return filterMemory(await this.getMemory(), query);
   }
 
   // --- internals ---

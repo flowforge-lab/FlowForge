@@ -5,6 +5,7 @@
 // mock that fulfils this exact contract, so UI work never blocks on the Rust side.
 
 import type { ControlConfig } from "@/lib/control";
+import type { MemorySnapshot } from "@/lib/memory";
 import type { MarketplaceSkill } from "@/lib/marketplace";
 import type { MarketplaceProfile } from "@/lib/profile-marketplace";
 import type {
@@ -148,6 +149,15 @@ export interface FfIpc {
   // when the profile marketplace backend lands.
   /** Search the (mock) profile marketplace. Empty query lists the full catalog. */
   searchProfileMarketplace(query: string): Promise<MarketplaceProfile[]>;
+
+  // Memory browser (SET.8, RFC 0002). FE-owned provisional types in `lib/memory.ts`
+  // — no backend/ts-rs binding yet. `getMemory` loads the snapshot; `searchMemory`
+  // filters it in the mock (client-side in the store for UI). Replace with generated
+  // bindings + real commands when `ff-memory` lands.
+  /** Full memory snapshot for the Settings → Memory browser. */
+  getMemory(): Promise<MemorySnapshot>;
+  /** Filtered snapshot for the given query (mock applies client-side filter). */
+  searchMemory(query: string): Promise<MemorySnapshot>;
 
   // MCP servers (M4.4, RFC 0003). Enable/disable/add/remove write `mcp.json`; the
   // config watcher reconciles the supervisor, which then emits `mcp:status-changed`.
@@ -296,6 +306,10 @@ class TauriIpc implements FfIpc {
     this.invoke<Phenotype>("switch_phenotype", { name });
   searchProfileMarketplace = (query: string) =>
     this.invoke<MarketplaceProfile[]>("search_profile_marketplace", { query });
+
+  getMemory = () => this.invoke<MemorySnapshot>("get_memory");
+  searchMemory = (query: string) =>
+    this.invoke<MemorySnapshot>("search_memory", { query });
 
   listMcpServers = () => this.invoke<McpServerStatus[]>("list_mcp_servers");
   restartMcpServer = (id: string) =>
