@@ -6,6 +6,7 @@
 
 import type { ControlConfig } from "@/lib/control";
 import type { MarketplaceSkill } from "@/lib/marketplace";
+import type { MarketplaceProfile } from "@/lib/profile-marketplace";
 import type {
   Message,
   ProviderConfig,
@@ -140,6 +141,13 @@ export interface FfIpc {
   /** Switch the active phenotype: replaces the active-skill set and persists the
    *  choice across restarts. Rejects an unknown name. Resolves with the phenotype now active. */
   switchPhenotype(name: string): Promise<Phenotype>;
+  // CONTRACT NOTE (SET.7): FE-owned mock command — no backend/ts-rs binding for a
+  // remote profile catalog exists yet. `MarketplaceProfile` lives in
+  // `lib/profile-marketplace.ts` (mirroring SET.5's `MarketplaceSkill`);
+  // `bindings/` is untouched. Replace with a generated binding + real command
+  // when the profile marketplace backend lands.
+  /** Search the (mock) profile marketplace. Empty query lists the full catalog. */
+  searchProfileMarketplace(query: string): Promise<MarketplaceProfile[]>;
 
   // MCP servers (M4.4, RFC 0003). Enable/disable/add/remove write `mcp.json`; the
   // config watcher reconciles the supervisor, which then emits `mcp:status-changed`.
@@ -286,6 +294,8 @@ class TauriIpc implements FfIpc {
   getPhenotype = () => this.invoke<Phenotype>("get_phenotype");
   switchPhenotype = (name: string) =>
     this.invoke<Phenotype>("switch_phenotype", { name });
+  searchProfileMarketplace = (query: string) =>
+    this.invoke<MarketplaceProfile[]>("search_profile_marketplace", { query });
 
   listMcpServers = () => this.invoke<McpServerStatus[]>("list_mcp_servers");
   restartMcpServer = (id: string) =>
