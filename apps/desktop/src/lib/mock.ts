@@ -32,6 +32,7 @@ import type {
 } from "../bindings";
 import type { FfIpc, Unlisten } from "./ipc";
 import type { MarketplaceSkill } from "./marketplace";
+import type { MarketplaceProfile } from "./profile-marketplace";
 import { CONTROL_DEFAULTS, type ControlConfig } from "./control";
 import { autoTitle } from "./auto-title";
 
@@ -172,6 +173,55 @@ const MOCK_PHENOTYPES: Phenotype[] = [
     skills: ["create-pr"],
   },
 ];
+
+// Canned profile catalog so the Profiles → Marketplace search (SET.7) is
+// exercisable offline. FE-only (`MarketplaceProfile`); no backend catalog yet.
+const MOCK_PROFILE_MARKETPLACE: MarketplaceProfile[] = [
+  {
+    id: "data-science",
+    name: "Data Science",
+    description: "Notebooks, dataframes, and plotting helpers.",
+    skillCount: 6,
+    author: "flowforge-labs",
+    installs: 8200,
+  },
+  {
+    id: "web-frontend",
+    name: "Web Frontend",
+    description: "React, TypeScript, and CSS-focused working set.",
+    skillCount: 5,
+    author: "flowforge-labs",
+    installs: 7100,
+  },
+  {
+    id: "devops",
+    name: "DevOps",
+    description: "Terraform, Kubernetes, and CI pipeline skills.",
+    skillCount: 4,
+    author: "community",
+    installs: 3400,
+  },
+  {
+    id: "technical-writer",
+    name: "Technical Writer",
+    description: "Docs, changelogs, and API reference authoring.",
+    skillCount: 3,
+    author: "community",
+    installs: 1900,
+  },
+];
+
+// Ranks a marketplace profile by name/description match, mirroring the skill
+// marketplace scorer so results order sensibly.
+function scoreProfile(profile: MarketplaceProfile, q: string): number {
+  const name = profile.name.toLowerCase();
+  const id = profile.id.toLowerCase();
+  if (id === q || name === q) return 4;
+  if (id.startsWith(q) || name.startsWith(q)) return 3;
+  if (id.includes(q) || name.includes(q)) return 2;
+  if (profile.description.toLowerCase().includes(q)) return 1;
+  return 0;
+}
 
 // Canned MCP server statuses so the servers panel (#91) is exercisable offline.
 // One running with tools, one that restarted once, one failed-to-spawn.
@@ -745,6 +795,24 @@ export class MockIpc implements FfIpc {
     this.activePhenotype = pheno;
     this.emitSkillsChanged();
     return pheno;
+  }
+
+  // Profile marketplace search (SET.7). Empty query lists the full catalog,
+  // install-count descending; a query ranks by relevance and drops non-matches.
+  async searchProfileMarketplace(query: string): Promise<MarketplaceProfile[]> {
+    const q = query.trim().toLowerCase();
+    if (q === "") {
+      return [...MOCK_PROFILE_MARKETPLACE].sort(
+        (a, b) => b.installs - a.installs,
+      );
+    }
+    return MOCK_PROFILE_MARKETPLACE.map((p) => ({
+      p,
+      score: scoreProfile(p, q),
+    }))
+      .filter(({ score }) => score > 0)
+      .sort((a, b) => b.score - a.score || b.p.installs - a.p.installs)
+      .map(({ p }) => ({ ...p }));
   }
 
   // --- internals ---
