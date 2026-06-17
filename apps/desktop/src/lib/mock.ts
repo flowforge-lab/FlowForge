@@ -815,6 +815,19 @@ export class MockIpc implements FfIpc {
       .map(({ p }) => ({ ...p }));
   }
 
+  // About section (SET.11). No-op stubs — real updater/backup lands later.
+  async checkForUpdates(): Promise<string> {
+    return "You're on the latest version.";
+  }
+
+  async exportBackup(): Promise<string> {
+    return "Backup exported.";
+  }
+
+  async restoreBackup(): Promise<string> {
+    return "Backup restored.";
+  }
+
   // --- internals ---
 
   private append(
