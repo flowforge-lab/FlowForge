@@ -32,6 +32,11 @@ export interface NotificationPrefs {
 export const OPEN_THREADS_MIN = 3;
 export const OPEN_THREADS_MAX = 20;
 
+/** Composer send binding (SET.6). `"enter"`: Enter sends, Shift+Enter = new line.
+ *  `"ctrlEnter"`: Ctrl/⌘+Enter sends, plain Enter = new line. */
+export type SendMessageKey = "enter" | "ctrlEnter";
+const SEND_MESSAGE_KEY_DEFAULT: SendMessageKey = "enter";
+
 export interface PrefsState {
   theme: Theme;
   font: Font;
@@ -42,16 +47,21 @@ export interface PrefsState {
   notifications: NotificationPrefs;
   /** Max threads kept loaded (LRU); FE flag until the backend consumes it. */
   openThreads: number;
+  /** Composer send binding (Keyboard section, SET.6). */
+  sendMessageKey: SendMessageKey;
   setTheme: (theme: Theme) => void;
   setFont: (font: Font) => void;
   setFontScale: (scale: number) => void;
   setDisplayName: (name: string) => void;
   setNotifications: (partial: Partial<NotificationPrefs>) => void;
   setOpenThreads: (count: number) => void;
+  setSendMessageKey: (key: SendMessageKey) => void;
   /** Quick light/dark flip — leaves `"system"` by picking the opposite effective mode. */
   toggleTheme: () => void;
   /** Reset only the Appearance-owned prefs to their defaults (SET.2 footer reset). */
   resetAppearance: () => void;
+  /** Reset only the Keyboard-owned prefs to their defaults (SET.6 footer reset). */
+  resetKeyboard: () => void;
 }
 
 /** Default values for the Appearance-owned prefs. Shared by initial state and
@@ -103,6 +113,9 @@ export const usePrefsStore = create<PrefsState>()(
   persist(
     (set, get) => ({
       ...APPEARANCE_DEFAULTS,
+      // Keyboard-owned (SET.6) — kept out of APPEARANCE_DEFAULTS so the Appearance
+      // reset doesn't touch it; `resetKeyboard` owns its reset.
+      sendMessageKey: SEND_MESSAGE_KEY_DEFAULT,
       setTheme: (theme) => set({ theme }),
       setFont: (font) => set({ font }),
       setFontScale: (scale) => set({ fontScale: clampFontScale(scale) }),
@@ -110,12 +123,14 @@ export const usePrefsStore = create<PrefsState>()(
       setNotifications: (partial) =>
         set((s) => ({ notifications: { ...s.notifications, ...partial } })),
       setOpenThreads: (count) => set({ openThreads: clampOpenThreads(count) }),
+      setSendMessageKey: (sendMessageKey) => set({ sendMessageKey }),
       toggleTheme: () => {
         const { theme } = get();
         const effective = resolveEffectiveTheme(theme);
         set({ theme: effective === "light" ? "dark" : "light" });
       },
       resetAppearance: () => set({ ...APPEARANCE_DEFAULTS }),
+      resetKeyboard: () => set({ sendMessageKey: SEND_MESSAGE_KEY_DEFAULT }),
     }),
     {
       name: STORAGE_KEY,

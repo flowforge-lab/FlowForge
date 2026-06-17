@@ -4,6 +4,7 @@ import { Button } from "@/components/ui/button";
 import { ipc } from "@/lib/ipc";
 import { useChatStore } from "@/store/chat";
 import { useComposerStore } from "@/store/composer";
+import { usePrefsStore } from "@/store/prefs";
 
 // A local model server (candle-vllm, Ollama, …) clocks its GPU down when idle,
 // so the first token after a pause crawls while the device ramps back up. We
@@ -35,6 +36,7 @@ export function InputBar() {
   );
   const send = useChatStore((s) => s.send);
   const cancelActiveTurn = useChatStore((s) => s.cancelActiveTurn);
+  const sendMessageKey = usePrefsStore((s) => s.sendMessageKey);
 
   const autoGrow = useCallback((el: HTMLTextAreaElement) => {
     el.style.height = "auto";
@@ -112,7 +114,14 @@ export function InputBar() {
             autoGrow(e.currentTarget);
           }}
           onKeyDown={(e) => {
-            if (e.key === "Enter" && !e.shiftKey) {
+            if (e.key !== "Enter") return;
+            // Enter mode: plain Enter sends (Shift+Enter = new line, unchanged).
+            // Ctrl+Enter mode: Ctrl/⌘+Enter sends; any other Enter is a new line.
+            const sends =
+              sendMessageKey === "ctrlEnter"
+                ? e.metaKey || e.ctrlKey
+                : !e.shiftKey;
+            if (sends) {
               e.preventDefault();
               submit();
             }
@@ -134,7 +143,11 @@ export function InputBar() {
             className="size-8 shrink-0 rounded-lg"
             disabled={!value.trim() || !activeSessionId}
             onClick={submit}
-            title="Send (Enter)"
+            title={
+              sendMessageKey === "ctrlEnter"
+                ? "Send (⌘/Ctrl+Enter)"
+                : "Send (Enter)"
+            }
           >
             <ArrowUp className="size-4" />
           </Button>
