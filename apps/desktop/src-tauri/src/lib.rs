@@ -10,14 +10,14 @@ mod web_search;
 use async_trait::async_trait;
 use ff_agent::{run_turn, AgentEvent, Approver, CancelToken, ToolContext};
 use ff_core::events::{
-    ApprovalSafety, EvolveCostEstimate, IntentionSignal, SkillActivated, SkillCompleted,
-    SkillEvolveApprovalRequestEvent, SkillInstallApprovalRequestEvent, SkillsChangedEvent,
-    TokenEvent, ToolApprovalRequestEvent, ToolAskRequestEvent, ToolCallEvent, ToolResultEvent,
-    TurnDoneEvent, TurnErrorEvent,
+    ApprovalSafety, EvolveCostEstimate, IntentionSignal, McpStatusChangedEvent, SkillActivated,
+    SkillCompleted, SkillEvolveApprovalRequestEvent, SkillInstallApprovalRequestEvent,
+    SkillsChangedEvent, TokenEvent, ToolApprovalRequestEvent, ToolAskRequestEvent, ToolCallEvent,
+    ToolResultEvent, TurnDoneEvent, TurnErrorEvent,
 };
 use ff_core::{
-    Message, Phenotype, ProviderConfig, ProviderKind, Role, SearchConfig, Session, Skill,
-    SkillInfo, SkillManifest,
+    McpServerConfig, McpServerStatus, Message, Phenotype, ProviderConfig, ProviderKind, Role,
+    SearchConfig, Session, Skill, SkillInfo, SkillManifest,
 };
 use ff_signals::SkillAggregate;
 use ff_tools::Safety;
@@ -769,17 +769,103 @@ fn switch_phenotype(
     Ok(pheno)
 }
 
+// ---- MCP server control (M4.4, RFC 0003 §3,5) ----
+//
+// Enable/disable/add/remove write `mcp.json` via `ff_mcp::config`; the existing config
+// watcher then reloads and reconciles the supervisor, so these commands deliberately
+// do NOT touch the supervisor directly. Only `restart_mcp_server` drives the actor (an
+// immediate restart has no config delta for the watcher to observe). Status changes are
+// pushed to the FE via the `mcp:status-changed` forwarder wired in `run`.
+
+/// Current status snapshot of every configured MCP server. Empty (not an error) when
+/// the MCP host never started (no `mcp.json`, no home dir).
+#[tauri::command]
+fn list_mcp_servers(state: State<'_, Arc<AppState>>) -> CmdResult<Vec<McpServerStatus>> {
+    Ok(state
+        .mcp_handle()
+        .map(|h| h.status_snapshot())
+        .unwrap_or_default())
+}
+
+/// Drive an immediate restart of one server, bypassing backoff and reviving a `Failed`
+/// server. Unknown ids are a no-op inside the supervisor.
+#[tauri::command]
+async fn restart_mcp_server(state: State<'_, Arc<AppState>>, id: String) -> CmdResult<()> {
+    let handle = state
+        .mcp_handle()
+        .ok_or_else(|| "mcp host is not running".to_string())?;
+    handle.restart(&id).await;
+    Ok(())
+}
+
+/// Enable or disable one server by flipping `disabled` in `mcp.json`. The config watcher
+/// reconciles the supervisor; the resulting status change arrives via `mcp:status-changed`.
+#[tauri::command]
+fn set_mcp_server_enabled(
+    state: State<'_, Arc<AppState>>,
+    id: String,
+    enabled: bool,
+) -> CmdResult<()> {
+    let path = state
+        .mcp_config_path()
+        .ok_or_else(|| "mcp host is not running".to_string())?;
+    ff_mcp::set_disabled(&path, &id, !enabled).map_err(|e| e.to_string())
+}
+
+/// Add (or replace) a server definition in `mcp.json`. `def` is **raw user input** from
+/// the add form, never a `load()`-resolved config, so its `env` holds literal strings or
+/// `${env:}` templates — mapping it to the un-resolved `McpServerInput` keeps a resolved
+/// secret from ever being written back (enforced by the distinct type).
+#[tauri::command]
+fn add_mcp_server(state: State<'_, Arc<AppState>>, def: McpServerConfig) -> CmdResult<()> {
+    let path = state
+        .mcp_config_path()
+        .ok_or_else(|| "mcp host is not running".to_string())?;
+    let input = ff_mcp::McpServerInput {
+        id: def.id,
+        command: def.command,
+        args: def.args,
+        env: def.env,
+        disabled: def.disabled,
+    };
+    ff_mcp::upsert(&path, &input).map_err(|e| e.to_string())
+}
+
+/// Remove a server definition from `mcp.json`. Idempotent: absent id is a no-op.
+#[tauri::command]
+fn remove_mcp_server(state: State<'_, Arc<AppState>>, id: String) -> CmdResult<()> {
+    let path = state
+        .mcp_config_path()
+        .ok_or_else(|| "mcp host is not running".to_string())?;
+    ff_mcp::remove(&path, &id).map_err(|e| e.to_string())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let state = Arc::new(AppState::new());
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .manage(state.clone())
-        .setup(move |_app| {
+        .setup(move |app| {
             // `init_mcp` enters the shared Tokio runtime itself, so it's safe to
             // call here even though Tauri's `setup` runs on the main thread outside
             // an entered reactor on macOS (issue #117).
             state.init_mcp();
+            // Forward supervisor status changes to the FE as `mcp:status-changed`, so
+            // the servers panel reflects start/stop/restart/health without polling. The
+            // watch tick coalesces; we re-snapshot on each wake. Runs on Tauri's managed
+            // runtime, so it needs no entered reactor here.
+            if let Some(handle) = state.mcp_handle() {
+                let app_handle = app.handle().clone();
+                let mut rx = handle.status_changed_rx();
+                tauri::async_runtime::spawn(async move {
+                    while rx.changed().await.is_ok() {
+                        let servers = handle.status_snapshot();
+                        let _ = app_handle
+                            .emit("mcp:status-changed", McpStatusChangedEvent { servers });
+                    }
+                });
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -810,6 +896,11 @@ pub fn run() {
             list_phenotypes,
             get_phenotype,
             switch_phenotype,
+            list_mcp_servers,
+            restart_mcp_server,
+            set_mcp_server_enabled,
+            add_mcp_server,
+            remove_mcp_server,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");

@@ -51,6 +51,23 @@ fn is_false(b: &bool) -> bool {
     !*b
 }
 
+/// A raw, **un-resolved** server definition supplied by the user (the add/edit form).
+///
+/// Deliberately distinct from [`McpServerConfig`], which [`load`] fills with `${env:}`
+/// references already **resolved** to real secrets. Write-back ([`upsert`]) accepts only
+/// this type, so a resolved config can never be passed in and baked back into
+/// `mcp.json` by accident — the leak is rejected at compile time, not caught by review.
+/// `env` values are stored verbatim (literal strings or hand-written `${env:}`
+/// templates); no resolution happens here.
+#[derive(Debug, Clone)]
+pub struct McpServerInput {
+    pub id: String,
+    pub command: String,
+    pub args: Vec<String>,
+    pub env: BTreeMap<String, String>,
+    pub disabled: bool,
+}
+
 /// Parse and validate `mcp.json` at `path`, returning the server set sorted by id.
 ///
 /// A missing file is treated as an empty config (no servers) rather than an error, so
@@ -87,7 +104,7 @@ pub fn set_disabled(path: &Path, id: &str, disabled: bool) -> Result<(), McpErro
 /// The entry is written verbatim from `def` — the caller (UI add-form) supplies the
 /// literal `command`/`args`/`env` it wants on disk. `${env:...}` strings are stored
 /// as-is and resolved later by [`load`]; no secret injection happens here.
-pub fn upsert(path: &Path, def: &McpServerConfig) -> Result<(), McpError> {
+pub fn upsert(path: &Path, def: &McpServerInput) -> Result<(), McpError> {
     let mut raw = read_raw(path)?;
     raw.mcp_servers.insert(
         def.id.clone(),
@@ -366,7 +383,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("mcp.json");
 
-        let mut def = McpServerConfig {
+        let mut def = McpServerInput {
             id: "fs".into(),
             command: "npx".into(),
             args: vec!["-y".into(), "server-filesystem".into()],
@@ -391,7 +408,7 @@ mod tests {
     fn upsert_on_missing_file_creates_it() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("nested").join("mcp.json");
-        let def = McpServerConfig {
+        let def = McpServerInput {
             id: "x".into(),
             command: "c".into(),
             args: Vec::new(),
@@ -401,6 +418,34 @@ mod tests {
         upsert(&path, &def).unwrap();
         assert!(path.exists());
         assert_eq!(load(&path).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn upsert_stores_env_template_verbatim() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("mcp.json");
+        let mut env = BTreeMap::new();
+        env.insert(
+            "GITHUB_TOKEN".to_string(),
+            "${env:GITHUB_TOKEN}".to_string(),
+        );
+        upsert(
+            &path,
+            &McpServerInput {
+                id: "github".into(),
+                command: "github-mcp-server".into(),
+                args: Vec::new(),
+                env,
+                disabled: false,
+            },
+        )
+        .unwrap();
+
+        // The literal template lands on disk un-resolved; load() resolves it.
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("${env:GITHUB_TOKEN}"));
+        let resolved = parse(&raw, &map_env(&[("GITHUB_TOKEN", "secret")])).unwrap();
+        assert_eq!(resolved[0].env["GITHUB_TOKEN"], "secret");
     }
 
     #[test]

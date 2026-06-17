@@ -33,7 +33,7 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use ff_core::{McpServerConfig, McpServerState, McpServerStatus, McpToolInfo};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::backoff::Backoff;
 use crate::client::McpClient;
@@ -110,6 +110,10 @@ pub struct SupervisorHandle {
     pub status: SharedStatus,
     /// The flat tool list across all `Running` servers, kept current by the actor.
     pub tools: SharedTools,
+    /// Ticked (coalescing) by the actor on every `publish`, so the desktop shell can
+    /// forward a `mcp:status-changed` event without polling. Carries no data — readers
+    /// re-snapshot via [`status_snapshot`](Self::status_snapshot).
+    status_rx: watch::Receiver<()>,
 }
 
 impl SupervisorHandle {
@@ -124,6 +128,23 @@ impl SupervisorHandle {
     /// Cheap read (clone of the shared vec under a read lock).
     pub fn tools_snapshot(&self) -> Vec<McpToolInfo> {
         self.tools.read().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
+    /// A snapshot of every server's status, id-sorted. Cheap read (clone of the shared
+    /// vec under a read lock); poison-tolerant like [`tools_snapshot`](Self::tools_snapshot).
+    pub fn status_snapshot(&self) -> Vec<McpServerStatus> {
+        self.status
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
+
+    /// A receiver that fires whenever the supervisor republishes status (start/stop/
+    /// restart/health change, or a reconcile). Coalescing: a burst of changes may wake
+    /// the receiver once — re-read via [`status_snapshot`](Self::status_snapshot). The
+    /// desktop shell drives a `mcp:status-changed` event off this.
+    pub fn status_changed_rx(&self) -> watch::Receiver<()> {
+        self.status_rx.clone()
     }
 
     /// Route a tool call through the supervisor actor to the specified server.
@@ -252,12 +273,14 @@ pub fn spawn(
     let status: SharedStatus = Arc::new(RwLock::new(Vec::new()));
     let tools: SharedTools = Arc::new(RwLock::new(Vec::new()));
     let (cmd_tx, cmd_rx) = mpsc::channel::<Cmd>(16);
+    let (status_tx, status_rx) = watch::channel(());
     let actor = Supervisor {
         config,
         handles: BTreeMap::new(),
         shared_config,
         status: Arc::clone(&status),
         tools: Arc::clone(&tools),
+        status_tx,
         cmd_rx,
         change_rx,
     };
@@ -266,6 +289,7 @@ pub fn spawn(
         cmd_tx,
         status,
         tools,
+        status_rx,
     }
 }
 
@@ -275,6 +299,9 @@ struct Supervisor {
     shared_config: SharedConfig,
     status: SharedStatus,
     tools: SharedTools,
+    /// Coalescing change tick: sent on every `publish` so the desktop shell can forward
+    /// a `mcp:status-changed` event without polling.
+    status_tx: watch::Sender<()>,
     cmd_rx: mpsc::Receiver<Cmd>,
     change_rx: mpsc::UnboundedReceiver<()>,
 }
@@ -562,6 +589,10 @@ impl Supervisor {
             .flat_map(|h| h.tools.iter().cloned())
             .collect();
         *self.tools.write().unwrap_or_else(|p| p.into_inner()) = all_tools;
+        // Wake any status subscriber (the desktop shell's event forwarder). Coalescing
+        // and lossless of intent: subscribers re-snapshot, so a missed intermediate
+        // tick never matters. Ignore send errors (no subscribers is fine).
+        let _ = self.status_tx.send(());
     }
 
     /// Execute a tool call against the named server's live client. Called inline
