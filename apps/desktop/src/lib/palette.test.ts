@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import {
   buildCommands,
+  buildMcpServerCommands,
   buildPhenotypeCommands,
   buildSkillCommands,
   fuzzyScore,
@@ -8,6 +9,7 @@ import {
   mergePaletteResults,
 } from "@/lib/palette";
 import type { Phenotype, Session, SkillInfo } from "@/bindings";
+import type { McpServerStatus } from "@/bindings/McpServerStatus";
 
 function session(partial: Partial<Session> & { id: string }): Session {
   return {
@@ -154,6 +156,31 @@ describe("buildPhenotypeCommands", () => {
     });
     expect(cmds.map((c) => c.id)).toEqual(["pheno:rust"]);
     expect(cmds[0].kind).toBe("switch-phenotype");
+  });
+});
+
+describe("buildMcpServerCommands", () => {
+  const servers: McpServerStatus[] = [
+    { id: "github", state: "running", toolCount: 8, restarts: 0 },
+    { id: "playwright", state: "failed", toolCount: 0, restarts: 5 },
+  ];
+
+  it("builds one open-mcp-server row per server with the state as hint", () => {
+    const cmds = buildMcpServerCommands(servers);
+    expect(cmds.map((c) => c.id)).toEqual(["mcp:github", "mcp:playwright"]);
+    expect(cmds[0]).toMatchObject({
+      kind: "open-mcp-server",
+      serverId: "github",
+      title: "MCP: github",
+      hint: "Running",
+    });
+    expect(cmds[1].hint).toBe("Failed");
+  });
+
+  it("fuzzy-matches servers by id via keywords", () => {
+    const cmds = buildMcpServerCommands(servers);
+    const hit = filterCommands(cmds, "github", []);
+    expect(hit.map((c) => c.id)).toContain("mcp:github");
   });
 });
 

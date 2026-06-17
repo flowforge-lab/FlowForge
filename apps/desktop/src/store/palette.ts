@@ -37,6 +37,7 @@ export type PaletteCommand = CommandBase &
     | { kind: "activate-skill"; name: string }
     | { kind: "deactivate-skill"; name: string }
     | { kind: "switch-phenotype"; name: string }
+    | { kind: "open-mcp-server"; serverId: string }
   );
 
 /** The set of command kinds — handy for building exhaustive icon/handler maps. */

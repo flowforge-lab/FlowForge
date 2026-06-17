@@ -5,8 +5,10 @@
 // lib/sessions.ts.
 
 import type { Phenotype, Session, SkillInfo } from "@/bindings";
+import type { McpServerStatus } from "@/bindings/McpServerStatus";
 import type { PaletteCommand } from "@/store/palette";
 import { resolveLabel } from "@/lib/sessions";
+import { mcpStateMeta } from "@/lib/mcp";
 
 // ── Registry ──────────────────────────────────────────────────────────────────
 
@@ -86,6 +88,21 @@ export function buildSkillCommands(skills: SkillInfo[]): PaletteCommand[] {
           hint: "Activate",
         },
   );
+}
+
+/** One palette row per MCP server — opens the MCP settings section to manage it.
+ *  The state label rides along as the hint so status shows at a glance (#91). */
+export function buildMcpServerCommands(
+  servers: McpServerStatus[],
+): PaletteCommand[] {
+  return servers.map((server) => ({
+    kind: "open-mcp-server" as const,
+    id: `mcp:${server.id}`,
+    serverId: server.id,
+    title: `MCP: ${server.id}`,
+    keywords: `mcp server tool external ${server.id} ${server.state}`,
+    hint: mcpStateMeta(server.state).label,
+  }));
 }
 
 /** Phenotype switch rows — omits the currently active phenotype (RFC 0001 §7). */

@@ -13,6 +13,7 @@ import {
   PanelRight,
   Plus,
   Search,
+  Server,
   Sparkles,
   TextCursorInput,
   WrapText,
@@ -23,6 +24,8 @@ import type { SkillInfo } from "@/bindings";
 import { useChatStore } from "@/store/chat";
 import { useSplitStore } from "@/store/split";
 import { useSkillsStore } from "@/store/skills";
+import { useMcpStore } from "@/store/mcp";
+import { useSettingsStore } from "@/store/settings";
 import {
   usePaletteStore,
   type PaletteCommand,
@@ -30,6 +33,7 @@ import {
 } from "@/store/palette";
 import {
   buildCommands,
+  buildMcpServerCommands,
   buildPhenotypeCommands,
   buildSkillCommands,
   mergePaletteResults,
@@ -50,6 +54,7 @@ const ICONS: Record<
   "activate-skill": Sparkles,
   "deactivate-skill": CircleOff,
   "switch-phenotype": Layers,
+  "open-mcp-server": Server,
 };
 
 // ── Command execution ─────────────────────────────────────────────────────────
@@ -91,6 +96,12 @@ function runCommand(cmd: PaletteCommand): void {
       // skills:changed from the backend triggers refresh via events.ts.
       void ipc.switchPhenotype(cmd.name);
       return;
+    case "open-mcp-server":
+      // Open the MCP settings section to manage servers. (Per-server focus from
+      // the chosen `serverId` is a follow-up; the section lists all servers.)
+      useSettingsStore.getState().setSection("mcp");
+      useSettingsStore.getState().openSettings();
+      return;
     default: {
       // Exhaustiveness guard: a new PaletteCommand kind without a case above
       // becomes a compile error here. See store/palette.ts.
@@ -124,16 +135,20 @@ function PaletteBody() {
   const refreshSkills = useSkillsStore((s) => s.refresh);
   const searchSkills = useSkillsStore((s) => s.search);
 
+  const mcpServers = useMcpStore((s) => s.servers);
+  const loadMcp = useMcpStore((s) => s.load);
+
   const [query, setQuery] = useState("");
   const [selected, setSelected] = useState(0);
   const [skillHits, setSkillHits] = useState<SkillInfo[]>([]);
   const inputRef = useRef<HTMLInputElement>(null);
   const listRef = useRef<HTMLDivElement>(null);
 
-  // Refresh installed skills + phenotypes each time the palette opens.
+  // Refresh installed skills + phenotypes + MCP servers each time the palette opens.
   useEffect(() => {
     void refreshSkills();
-  }, [refreshSkills]);
+    void loadMcp();
+  }, [refreshSkills, loadMcp]);
 
   // Rank skill hits via the backend search contract (#27).
   useEffect(() => {
@@ -150,8 +165,16 @@ function PaletteBody() {
     () => [
       ...buildCommands({ sessions, activeSessionId, sessionTitles }),
       ...buildPhenotypeCommands({ phenotypes, activePhenotype }),
+      ...buildMcpServerCommands(mcpServers),
     ],
-    [sessions, activeSessionId, sessionTitles, phenotypes, activePhenotype],
+    [
+      sessions,
+      activeSessionId,
+      sessionTitles,
+      phenotypes,
+      activePhenotype,
+      mcpServers,
+    ],
   );
 
   const skillCommands = useMemo(

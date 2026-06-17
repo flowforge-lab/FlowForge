@@ -1,4 +1,5 @@
 import { AppearanceSection } from "@/components/settings/appearance-section";
+import { McpSection } from "@/components/settings/mcp/mcp-section";
 import { ComingSoon } from "@/components/settings/coming-soon";
 import {
   getSectionMeta,
@@ -13,6 +14,8 @@ export function SettingsSectionContent({ id }: { id: SettingsSectionId }) {
   switch (id) {
     case "appearance":
       return <AppearanceSection />;
+    case "mcp":
+      return <McpSection />;
     default:
       return <ComingSoon label={getSectionMeta(id).label} />;
   }

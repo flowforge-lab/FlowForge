@@ -12,6 +12,7 @@ const ALL_IDS: SettingsSectionId[] = [
   "appearance",
   "profiles",
   "memory",
+  "mcp",
   "scheduled",
   "keyboard",
   "experimental",
@@ -23,12 +24,12 @@ describe("settings registry", () => {
     expect(SETTINGS_NAV.map((g) => g.group)).toEqual(["PROFILE", "GLOBAL"]);
   });
 
-  it("lists all 10 section ids in canonical order across the two groups", () => {
+  it("lists all 11 section ids in canonical order across the two groups", () => {
     const flat = SETTINGS_NAV.flatMap((g) => g.items.map((i) => i.id));
     expect(flat).toEqual(ALL_IDS);
   });
 
-  it("splits 3 PROFILE / 7 GLOBAL items", () => {
+  it("splits 3 PROFILE / 8 GLOBAL items", () => {
     const [profile, global] = SETTINGS_NAV;
     expect(profile.items.map((i) => i.id)).toEqual([
       "model",
@@ -39,6 +40,7 @@ describe("settings registry", () => {
       "appearance",
       "profiles",
       "memory",
+      "mcp",
       "scheduled",
       "keyboard",
       "experimental",
@@ -48,6 +50,10 @@ describe("settings registry", () => {
 
   it('labels the GLOBAL keyboard item "Keyboard" (not "Shortcuts")', () => {
     expect(getSectionMeta("keyboard").label).toBe("Keyboard");
+  });
+
+  it('labels the MCP section "MCP servers"', () => {
+    expect(getSectionMeta("mcp").label).toBe("MCP servers");
   });
 
   it("resolves a label + icon for every id", () => {
