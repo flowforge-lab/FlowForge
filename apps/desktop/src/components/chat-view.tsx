@@ -110,13 +110,17 @@ function MessageRowImpl({
 // `NO_STEPS` avoids a fresh `[]` per render), so only the changed row re-renders.
 const MessageRow = memo(MessageRowImpl);
 
-export function ChatView() {
+// `sessionId` scopes the view to one session so split panes (#148) each render
+// an independent transcript. Defaults to the active session for the single-pane
+// layout.
+export function ChatView({ sessionId }: { sessionId?: string } = {}) {
   const activeSessionId = useChatStore((s) => s.activeSessionId);
+  const targetSessionId = sessionId ?? activeSessionId ?? undefined;
   const messages = useChatStore((s) =>
-    s.activeSessionId ? s.messagesBySession[s.activeSessionId] : undefined,
+    targetSessionId ? s.messagesBySession[targetSessionId] : undefined,
   );
   const streamingId = useChatStore((s) =>
-    s.activeSessionId ? s.streamingBySession[s.activeSessionId] : undefined,
+    targetSessionId ? s.streamingBySession[targetSessionId] : undefined,
   );
   const toolStepsByMessage = useChatStore((s) => s.toolStepsByMessage);
   const respondApproval = useChatStore((s) => s.respondApproval);
@@ -137,7 +141,7 @@ export function ChatView() {
     pinnedToBottom.current = true;
     const el = scrollRef.current;
     if (el) el.scrollTop = el.scrollHeight;
-  }, [activeSessionId]);
+  }, [targetSessionId]);
 
   function handleScroll() {
     const el = scrollRef.current;

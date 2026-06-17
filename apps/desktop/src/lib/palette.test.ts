@@ -84,6 +84,24 @@ describe("buildCommands", () => {
     expect(byId.get("session:c")?.hint).toBe("⌘3"); // full-list index 2
   });
 
+  it("includes the split-pane actions when canSplit (default)", () => {
+    const ids = built.map((c) => c.id);
+    expect(ids).toContain("action:split-pane-right");
+    expect(ids).toContain("action:split-pane-down");
+  });
+
+  it("omits the split-pane actions at the pane cap", () => {
+    const capped = buildCommands({
+      sessions,
+      activeSessionId: "a",
+      sessionTitles: {},
+      canSplit: false,
+    });
+    const ids = capped.map((c) => c.id);
+    expect(ids).not.toContain("action:split-pane-right");
+    expect(ids).not.toContain("action:split-pane-down");
+  });
+
   it("shows ⌘9 for the 9th session and drops the hint past it", () => {
     const many = Array.from({ length: 11 }, (_, i) => session({ id: `s${i}` }));
     const builtMany = buildCommands({

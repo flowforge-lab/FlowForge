@@ -77,8 +77,19 @@ interface ChatState {
 
   bootstrap: () => Promise<void>;
   selectSession: (sessionId: string) => Promise<void>;
+  /** Pull a session's history into messagesBySession WITHOUT changing the active
+   *  session. Used by split panes, which each show an independent session while
+   *  only one is the global "active" (sidebar highlight, keyboard targets). */
+  loadSession: (sessionId: string) => Promise<void>;
+  /** Pure setter for the globally-active session (sidebar highlight + shortcuts).
+   *  Does not pull history — pair with loadSession when opening a fresh session. */
+  setActiveSession: (sessionId: string) => void;
   newSession: (goal?: string) => Promise<void>;
-  send: (content: string) => Promise<void>;
+  /** Send into `sessionId`, defaulting to the active session. Panes pass their own
+   *  session so a background pane can send/stream independently. */
+  send: (content: string, sessionId?: string) => Promise<void>;
+  /** Cancel the streaming turn in `sessionId` (session-scoped). */
+  cancelTurn: (sessionId: string) => Promise<void>;
   cancelActiveTurn: () => Promise<void>;
   setSessionTitle: (sessionId: string, title: string) => void;
 
@@ -158,6 +169,14 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
   selectSession: async (sessionId) => {
     set({ activeSessionId: sessionId });
+    await get().loadSession(sessionId);
+  },
+
+  setActiveSession: (sessionId) => {
+    set({ activeSessionId: sessionId });
+  },
+
+  loadSession: async (sessionId) => {
     // Always re-pull history so a switch shows the backend's truth, including
     // turns that streamed while the session was in the background.
     const messages = await ipc.getMessages(sessionId);
@@ -200,8 +219,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
     await get().selectSession(session.id);
   },
 
-  send: async (content) => {
-    const sessionId = get().activeSessionId;
+  send: async (content, sessionId = get().activeSessionId ?? undefined) => {
     if (!sessionId || get().streamingBySession[sessionId]) return;
 
     // Auto-title: the backend seeds the title from the first user message; mirror
@@ -276,14 +294,18 @@ export const useChatStore = create<ChatState>((set, get) => ({
     }));
   },
 
-  cancelActiveTurn: async () => {
-    const sessionId = get().activeSessionId;
+  cancelTurn: async (sessionId) => {
     if (!sessionId || !get().streamingBySession[sessionId]) return;
     await ipc.cancelTurn(sessionId);
     set((s) => {
       const { [sessionId]: _, ...rest } = s.streamingBySession;
       return { streamingBySession: rest };
     });
+  },
+
+  cancelActiveTurn: async () => {
+    const sessionId = get().activeSessionId;
+    if (sessionId) await get().cancelTurn(sessionId);
   },
 
   applyToken: (e) => {

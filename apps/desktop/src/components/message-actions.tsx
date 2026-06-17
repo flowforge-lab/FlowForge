@@ -73,7 +73,7 @@ export function MessageActions({
       {message.role === "user" && (
         <ActionButton
           title="Edit & resend"
-          onClick={() => prefill(message.content)}
+          onClick={() => prefill(message.sessionId, message.content)}
         >
           <PencilLine className="size-3" />
         </ActionButton>

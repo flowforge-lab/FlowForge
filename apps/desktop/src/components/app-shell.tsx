@@ -1,13 +1,13 @@
 import { useEffect } from "react";
 import { AlertTriangle } from "lucide-react";
 import { SessionSidebar } from "@/components/session-sidebar";
-import { ChatView } from "@/components/chat-view";
-import { InputBar } from "@/components/input-bar";
+import { PaneTree } from "@/components/pane-tree";
 import { SplitPanel } from "@/components/split-panel";
 import { CommandPalette } from "@/components/palette";
 import { ShortcutsOverlay } from "@/components/shortcuts-overlay";
 import { SettingsPanel } from "@/components/settings-panel";
 import { useChatStore } from "@/store/chat";
+import { usePanesStore } from "@/store/panes";
 import { useSplitStore } from "@/store/split";
 import { usePaletteStore } from "@/store/palette";
 import { useSettingsStore } from "@/store/settings";
@@ -79,16 +79,33 @@ function useGlobalShortcuts() {
 
       const store = useChatStore.getState();
 
+      const panes = usePanesStore.getState();
+
       if (mod && e.key.toLowerCase() === "n") {
         e.preventDefault();
-        void store.newSession();
+        // New session lands in the focused pane (keeps the layout; the pane just
+        // swaps to a fresh session). Falls back to a plain new session if panes
+        // aren't initialized yet.
+        void store.newSession().then(() => {
+          const id = useChatStore.getState().activeSessionId;
+          const focused = usePanesStore.getState().focusedPaneId;
+          if (id && focused)
+            usePanesStore.getState().setPaneSession(focused, id);
+        });
         return;
       }
       if (mod && e.key >= "1" && e.key <= "9") {
         const target = store.sessions[Number(e.key) - 1];
         if (target) {
           e.preventDefault();
-          void store.selectSession(target.id);
+          // Jump loads the session into the focused pane (not a global switch),
+          // so the chosen session shows where the user is looking.
+          if (panes.focusedPaneId) {
+            panes.setPaneSession(panes.focusedPaneId, target.id);
+            void store.loadSession(target.id);
+          } else {
+            void store.selectSession(target.id);
+          }
         }
         return;
       }
@@ -108,8 +125,25 @@ function useGlobalShortcuts() {
   }, []);
 }
 
+// Build the initial pane layout once sessions are loaded (after bootstrap), or
+// rebuild it from persisted state — dropping any panes whose session is gone.
+function usePaneInit() {
+  const sessions = useChatStore((s) => s.sessions);
+  const activeSessionId = useChatStore((s) => s.activeSessionId);
+  const root = usePanesStore((s) => s.root);
+  useEffect(() => {
+    if (!root && sessions.length > 0) {
+      usePanesStore.getState().init(
+        sessions.map((x) => x.id),
+        activeSessionId,
+      );
+    }
+  }, [root, sessions, activeSessionId]);
+}
+
 export function AppShell() {
   useGlobalShortcuts();
+  usePaneInit();
   const bootstrapError = useChatStore((s) => s.bootstrapError);
 
   return (
@@ -135,8 +169,7 @@ export function AppShell() {
               </span>
             </div>
           )}
-          <ChatView />
-          <InputBar />
+          <PaneTree />
         </div>
         <SplitPanel />
       </main>

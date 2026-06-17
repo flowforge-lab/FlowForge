@@ -1,5 +1,15 @@
 import { useRef, useState } from "react";
-import { Moon, Pencil, Plus, Search, Settings, Sun, X } from "lucide-react";
+import {
+  Moon,
+  Pencil,
+  Plus,
+  Search,
+  Settings,
+  SplitSquareHorizontal,
+  SplitSquareVertical,
+  Sun,
+  X,
+} from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Separator } from "@/components/ui/separator";
@@ -8,6 +18,17 @@ import { resolveEffectiveTheme } from "@/lib/theme";
 import { useTheme } from "@/store/prefs";
 import { useSettingsStore } from "@/store/settings";
 import { useChatStore } from "@/store/chat";
+import { usePanesStore, MAX_PANES } from "@/store/panes";
+import {
+  ContextMenu,
+  ContextMenuTrigger,
+  ContextMenuContent,
+  ContextMenuItem,
+  ContextMenuSub,
+  ContextMenuSubTrigger,
+  ContextMenuSubContent,
+  ContextMenuSeparator,
+} from "@/components/ui/context-menu";
 import { filterSessions, resolveLabel } from "@/lib/sessions";
 import type { Session } from "@/bindings";
 
@@ -30,9 +51,34 @@ function SessionItem({
 
   const sessionTitles = useChatStore((s) => s.sessionTitles);
   const selectSession = useChatStore((s) => s.selectSession);
+  const loadSession = useChatStore((s) => s.loadSession);
   const setSessionTitle = useChatStore((s) => s.setSessionTitle);
+  const atCap = usePanesStore((s) => s.leafCount() >= MAX_PANES);
 
   const currentLabel = resolveLabel(session, sessionTitles[session.id]);
+
+  // Click loads the session into the focused pane (#148) so it appears where the
+  // user is looking; falls back to a global switch if panes aren't initialized.
+  function open() {
+    const focused = usePanesStore.getState().focusedPaneId;
+    if (focused) {
+      usePanesStore.getState().setPaneSession(focused, session.id);
+      void loadSession(session.id);
+    } else {
+      void selectSession(session.id);
+    }
+  }
+
+  // "Open in Split" splits the focused pane and drops this session into the new
+  // (focused) pane. No-op (and hidden) at the pane cap.
+  function openInSplit(dir: "vertical" | "horizontal") {
+    const focused = usePanesStore.getState().focusedPaneId;
+    if (!focused) return;
+    if (dir === "vertical")
+      usePanesStore.getState().splitRight(focused, session.id);
+    else usePanesStore.getState().splitDown(focused, session.id);
+    void loadSession(session.id);
+  }
 
   function startEditing(e: React.MouseEvent) {
     e.stopPropagation(); // don't also trigger session select
@@ -55,78 +101,104 @@ function SessionItem({
   }
 
   return (
-    <div
-      role="button"
-      tabIndex={0}
-      onClick={() => !editing && void selectSession(session.id)}
-      onKeyDown={(e) => {
-        if (!editing && (e.key === "Enter" || e.key === " ")) {
-          e.preventDefault();
-          void selectSession(session.id);
-        }
-      }}
-      className={cn(
-        "group relative flex items-center gap-1.5 rounded-md px-2 py-1.5 text-left text-[13px] transition-colors cursor-pointer select-none",
-        active
-          ? "bg-sidebar-accent text-sidebar-accent-foreground"
-          : "text-muted-foreground hover:bg-sidebar-accent/50 hover:text-foreground",
-      )}
-    >
-      {editing ? (
-        /* ── Rename input ── */
-        <input
-          ref={inputRef}
-          autoFocus
-          value={draft}
-          onChange={(e) => setDraft(e.target.value)}
-          onBlur={commitRename}
+    <ContextMenu>
+      <ContextMenuTrigger asChild>
+        <div
+          role="button"
+          tabIndex={0}
+          onClick={() => !editing && open()}
           onKeyDown={(e) => {
-            if (e.key === "Enter") {
+            if (!editing && (e.key === "Enter" || e.key === " ")) {
               e.preventDefault();
-              commitRename();
-            } else if (e.key === "Escape") {
-              e.preventDefault();
-              cancelRename();
+              open();
             }
-            e.stopPropagation();
           }}
-          onClick={(e) => e.stopPropagation()}
-          placeholder="Session name…"
-          className="min-w-0 flex-1 truncate bg-transparent text-[13px] text-foreground outline-none placeholder:text-muted-foreground/50"
-        />
-      ) : (
-        /* ── Normal label ── */
-        <>
-          <span className="min-w-0 flex-1 truncate">{currentLabel}</span>
+          className={cn(
+            "group relative flex items-center gap-1.5 rounded-md px-2 py-1.5 text-left text-[13px] transition-colors cursor-pointer select-none",
+            active
+              ? "bg-sidebar-accent text-sidebar-accent-foreground"
+              : "text-muted-foreground hover:bg-sidebar-accent/50 hover:text-foreground",
+          )}
+        >
+          {editing ? (
+            /* ── Rename input ── */
+            <input
+              ref={inputRef}
+              autoFocus
+              value={draft}
+              onChange={(e) => setDraft(e.target.value)}
+              onBlur={commitRename}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  e.preventDefault();
+                  commitRename();
+                } else if (e.key === "Escape") {
+                  e.preventDefault();
+                  cancelRename();
+                }
+                e.stopPropagation();
+              }}
+              onClick={(e) => e.stopPropagation()}
+              placeholder="Session name…"
+              className="min-w-0 flex-1 truncate bg-transparent text-[13px] text-foreground outline-none placeholder:text-muted-foreground/50"
+            />
+          ) : (
+            /* ── Normal label ── */
+            <>
+              <span className="min-w-0 flex-1 truncate">{currentLabel}</span>
 
-          {/* Right-side slot: streaming dot > pencil (hover) > kbd hint (idle) */}
-          <span className="flex shrink-0 items-center">
-            {streaming ? (
-              <span className="size-1.5 animate-pulse rounded-full bg-primary" />
-            ) : (
-              <>
-                {/* Pencil shown on hover; kbd hint shown when idle */}
-                <button
-                  title="Rename session"
-                  onClick={startEditing}
-                  className={cn(
-                    "hidden size-5 items-center justify-center rounded group-hover:flex",
-                    "text-muted-foreground/70 hover:text-foreground hover:bg-sidebar-accent",
-                  )}
-                >
-                  <Pencil className="size-3" />
-                </button>
-                {index < 9 && (
-                  <kbd className="font-mono text-[10px] text-muted-foreground/50 group-hover:hidden">
-                    ⌘{index + 1}
-                  </kbd>
+              {/* Right-side slot: streaming dot > pencil (hover) > kbd hint (idle) */}
+              <span className="flex shrink-0 items-center">
+                {streaming ? (
+                  <span className="size-1.5 animate-pulse rounded-full bg-primary" />
+                ) : (
+                  <>
+                    {/* Pencil shown on hover; kbd hint shown when idle */}
+                    <button
+                      title="Rename session"
+                      onClick={startEditing}
+                      className={cn(
+                        "hidden size-5 items-center justify-center rounded group-hover:flex",
+                        "text-muted-foreground/70 hover:text-foreground hover:bg-sidebar-accent",
+                      )}
+                    >
+                      <Pencil className="size-3" />
+                    </button>
+                    {index < 9 && (
+                      <kbd className="font-mono text-[10px] text-muted-foreground/50 group-hover:hidden">
+                        ⌘{index + 1}
+                      </kbd>
+                    )}
+                  </>
                 )}
-              </>
-            )}
-          </span>
-        </>
-      )}
-    </div>
+              </span>
+            </>
+          )}
+        </div>
+      </ContextMenuTrigger>
+      <ContextMenuContent>
+        <ContextMenuItem onSelect={open}>Open</ContextMenuItem>
+        <ContextMenuSub>
+          <ContextMenuSubTrigger disabled={atCap}>
+            Open in split
+          </ContextMenuSubTrigger>
+          <ContextMenuSubContent>
+            <ContextMenuItem onSelect={() => openInSplit("vertical")}>
+              <SplitSquareHorizontal />
+              Right
+            </ContextMenuItem>
+            <ContextMenuItem onSelect={() => openInSplit("horizontal")}>
+              <SplitSquareVertical />
+              Down
+            </ContextMenuItem>
+          </ContextMenuSubContent>
+        </ContextMenuSub>
+        <ContextMenuSeparator />
+        <ContextMenuItem onSelect={() => setEditing(true)}>
+          Rename
+        </ContextMenuItem>
+      </ContextMenuContent>
+    </ContextMenu>
   );
 }
 
@@ -138,6 +210,17 @@ export function SessionSidebar() {
   const streamingBySession = useChatStore((s) => s.streamingBySession);
   const sessionTitles = useChatStore((s) => s.sessionTitles);
   const newSession = useChatStore((s) => s.newSession);
+
+  // New session lands in the focused pane (#148) so the layout is preserved —
+  // matches app-shell's Cmd+N and the palette. Falls back to a plain new session
+  // when panes aren't initialized yet.
+  function newSessionInFocusedPane() {
+    void newSession().then(() => {
+      const id = useChatStore.getState().activeSessionId;
+      const focused = usePanesStore.getState().focusedPaneId;
+      if (id && focused) usePanesStore.getState().setPaneSession(focused, id);
+    });
+  }
   const theme = useTheme((s) => s.theme);
   const toggleTheme = useTheme((s) => s.toggleTheme);
   const openSettings = useSettingsStore((s) => s.openSettings);
@@ -187,7 +270,7 @@ export function SessionSidebar() {
             variant="ghost"
             size="icon"
             className="size-7 text-muted-foreground hover:text-foreground"
-            onClick={() => void newSession()}
+            onClick={newSessionInFocusedPane}
             title="New session (⌘N)"
           >
             <Plus className="size-4" />

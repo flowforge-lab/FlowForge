@@ -15,6 +15,8 @@ import {
   Search,
   Server,
   Sparkles,
+  SplitSquareHorizontal,
+  SplitSquareVertical,
   TextCursorInput,
   WrapText,
 } from "lucide-react";
@@ -22,6 +24,7 @@ import { cn } from "@/lib/utils";
 import { ipc } from "@/lib/ipc";
 import type { SkillInfo } from "@/bindings";
 import { useChatStore } from "@/store/chat";
+import { usePanesStore, MAX_PANES } from "@/store/panes";
 import { useSplitStore } from "@/store/split";
 import { useSkillsStore } from "@/store/skills";
 import { useMcpStore } from "@/store/mcp";
@@ -47,6 +50,8 @@ const ICONS: Record<
   ComponentType<{ className?: string }>
 > = {
   "new-session": Plus,
+  "split-pane-right": SplitSquareHorizontal,
+  "split-pane-down": SplitSquareVertical,
   "switch-session": MessageSquare,
   "toggle-split": PanelRight,
   "toggle-wrap": WrapText,
@@ -64,19 +69,53 @@ const ICONS: Record<
 
 function focusComposer(): void {
   // Defer a frame so the overlay has unmounted before focus moves to the textarea.
+  // Target the focused pane's composer (#148), falling back to any composer.
   requestAnimationFrame(() => {
-    document.querySelector<HTMLTextAreaElement>("[data-composer]")?.focus();
+    const focused = document.querySelector<HTMLTextAreaElement>(
+      "[data-composer][data-pane-focused]",
+    );
+    (
+      focused ?? document.querySelector<HTMLTextAreaElement>("[data-composer]")
+    )?.focus();
   });
 }
 
 function runCommand(cmd: PaletteCommand): void {
   switch (cmd.kind) {
     case "new-session":
-      void useChatStore.getState().newSession();
+      void useChatStore
+        .getState()
+        .newSession()
+        .then(() => {
+          const id = useChatStore.getState().activeSessionId;
+          const focused = usePanesStore.getState().focusedPaneId;
+          if (id && focused)
+            usePanesStore.getState().setPaneSession(focused, id);
+        });
       return;
-    case "switch-session":
-      void useChatStore.getState().selectSession(cmd.sessionId);
+    case "split-pane-right": {
+      const focused = usePanesStore.getState().focusedPaneId;
+      if (focused) void usePanesStore.getState().splitNew(focused, "vertical");
       return;
+    }
+    case "split-pane-down": {
+      const focused = usePanesStore.getState().focusedPaneId;
+      if (focused)
+        void usePanesStore.getState().splitNew(focused, "horizontal");
+      return;
+    }
+    case "switch-session": {
+      // Load the chosen session into the focused pane (panes #148), not a global
+      // switch — so it appears where the user is looking.
+      const focused = usePanesStore.getState().focusedPaneId;
+      if (focused) {
+        usePanesStore.getState().setPaneSession(focused, cmd.sessionId);
+        void useChatStore.getState().loadSession(cmd.sessionId);
+      } else {
+        void useChatStore.getState().selectSession(cmd.sessionId);
+      }
+      return;
+    }
     case "toggle-split":
       useSplitStore.getState().toggleSplit();
       return;
@@ -129,6 +168,7 @@ function PaletteBody() {
   const sessions = useChatStore((s) => s.sessions);
   const activeSessionId = useChatStore((s) => s.activeSessionId);
   const sessionTitles = useChatStore((s) => s.sessionTitles);
+  const leafCount = usePanesStore((s) => s.leafCount());
 
   const phenotypes = useSkillsStore((s) => s.phenotypes);
   const activePhenotype = useSkillsStore((s) => s.activePhenotype);
@@ -163,7 +203,12 @@ function PaletteBody() {
 
   const staticCommands = useMemo(
     () => [
-      ...buildCommands({ sessions, activeSessionId, sessionTitles }),
+      ...buildCommands({
+        sessions,
+        activeSessionId,
+        sessionTitles,
+        canSplit: leafCount < MAX_PANES,
+      }),
       ...buildPhenotypeCommands({ phenotypes, activePhenotype }),
       ...buildMcpServerCommands(mcpServers),
     ],
@@ -171,6 +216,7 @@ function PaletteBody() {
       sessions,
       activeSessionId,
       sessionTitles,
+      leafCount,
       phenotypes,
       activePhenotype,
       mcpServers,

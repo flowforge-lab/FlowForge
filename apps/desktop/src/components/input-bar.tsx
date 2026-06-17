@@ -17,25 +17,54 @@ import { usePrefsStore } from "@/store/prefs";
 // GPU; cold, it absorbs the ramp the real turn would otherwise pay.
 const WARMUP_THROTTLE_MS = 5_000;
 
-export function InputBar() {
+// `sessionId` scopes the composer to one session so split panes (#148) each keep
+// an independent draft and Stop/send target their own session. Defaults to the
+// active session for the single-pane layout.
+export function InputBar({
+  sessionId,
+  focused = true,
+}: { sessionId?: string; focused?: boolean } = {}) {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const boxRef = useRef<HTMLDivElement>(null);
 
-  // Composer text lives in a shared store so "edit & resend" (Issue #18) can
-  // prefill it from a message row without prop-drilling.
-  const value = useComposerStore((s) => s.text);
-  const setText = useComposerStore((s) => s.setText);
-  const focusNonce = useComposerStore((s) => s.focusNonce);
-  const rejectNonce = useComposerStore((s) => s.rejectNonce);
+  // Read inside the focus effects without making them depend on `focused`: only
+  // the focused pane (#148) should grab the composer, but merely focusing a pane
+  // (e.g. selecting transcript text) must not yank the caret into its textarea.
+  // Synced in an effect (not during render) so the focus effects below — which
+  // run later in declaration order — always see the current value.
+  const focusedRef = useRef(focused);
+  useEffect(() => {
+    focusedRef.current = focused;
+  });
 
   const activeSessionId = useChatStore((s) => s.activeSessionId);
+  const targetSessionId = sessionId ?? activeSessionId ?? undefined;
+
+  // Composer text lives in a per-session store so "edit & resend" (Issue #18) can
+  // prefill it from a message row without prop-drilling, and each pane (#148)
+  // keeps its own draft.
+  const value = useComposerStore((s) =>
+    targetSessionId ? (s.textBySession[targetSessionId] ?? "") : "",
+  );
+  const setTextFor = useComposerStore((s) => s.setText);
+  const focusNonce = useComposerStore((s) =>
+    targetSessionId ? (s.focusNonceBySession[targetSessionId] ?? 0) : 0,
+  );
+  const rejectNonce = useComposerStore((s) =>
+    targetSessionId ? (s.rejectNonceBySession[targetSessionId] ?? 0) : 0,
+  );
+  const setText = useCallback(
+    (text: string) => {
+      if (targetSessionId) setTextFor(targetSessionId, text);
+    },
+    [targetSessionId, setTextFor],
+  );
+
   const streaming = useChatStore((s) =>
-    s.activeSessionId
-      ? Boolean(s.streamingBySession[s.activeSessionId])
-      : false,
+    targetSessionId ? Boolean(s.streamingBySession[targetSessionId]) : false,
   );
   const send = useChatStore((s) => s.send);
-  const cancelActiveTurn = useChatStore((s) => s.cancelActiveTurn);
+  const cancelTurn = useChatStore((s) => s.cancelTurn);
   const sendMessageKey = usePrefsStore((s) => s.sendMessageKey);
 
   const autoGrow = useCallback((el: HTMLTextAreaElement) => {
@@ -52,16 +81,17 @@ export function InputBar() {
     void ipc.warmup().catch(() => {});
   }, []);
 
-  // Keyboard-native: focus follows the active session.
+  // Keyboard-native: focus follows the (pane's) session — but only for the
+  // focused pane, so background panes don't steal focus on mount.
   useEffect(() => {
-    textareaRef.current?.focus();
-  }, [activeSessionId]);
+    if (focusedRef.current) textareaRef.current?.focus();
+  }, [targetSessionId]);
 
   // Edit & resend prefills the text and bumps focusNonce; focus, grow, and drop
   // the caret at the end here — all DOM, no state set in the effect.
   useEffect(() => {
     const el = textareaRef.current;
-    if (!el) return;
+    if (!el || !focusedRef.current) return;
     el.focus();
     autoGrow(el);
     el.setSelectionRange(el.value.length, el.value.length);
@@ -71,7 +101,7 @@ export function InputBar() {
   // shake the composer and refocus so the action isn't silently ignored. DOM
   // only, no state set in the effect. (rejectNonce starts at 0; skip that.)
   useEffect(() => {
-    if (rejectNonce === 0) return;
+    if (rejectNonce === 0 || !focusedRef.current) return;
     boxRef.current?.animate(
       [
         { transform: "translateX(0)" },
@@ -87,11 +117,11 @@ export function InputBar() {
 
   function submit() {
     const content = value.trim();
-    if (!content || streaming || !activeSessionId) return;
+    if (!content || streaming || !targetSessionId) return;
     setText("");
     // Collapse the box back to one line (it may have grown for a resend draft).
     if (textareaRef.current) textareaRef.current.style.height = "auto";
-    void send(content);
+    void send(content, targetSessionId);
   }
 
   return (
@@ -103,6 +133,7 @@ export function InputBar() {
         <textarea
           ref={textareaRef}
           data-composer
+          data-pane-focused={focused ? "" : undefined}
           value={value}
           rows={1}
           placeholder="Message FlowForge…"
@@ -132,7 +163,7 @@ export function InputBar() {
             variant="outline"
             size="icon"
             className="size-8 shrink-0 rounded-lg"
-            onClick={() => void cancelActiveTurn()}
+            onClick={() => targetSessionId && void cancelTurn(targetSessionId)}
             title="Stop (Esc)"
           >
             <Square className="size-3.5" />
@@ -141,7 +172,7 @@ export function InputBar() {
           <Button
             size="icon"
             className="size-8 shrink-0 rounded-lg"
-            disabled={!value.trim() || !activeSessionId}
+            disabled={!value.trim() || !targetSessionId}
             onClick={submit}
             title={
               sendMessageKey === "ctrlEnter"
