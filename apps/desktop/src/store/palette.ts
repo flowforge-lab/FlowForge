@@ -30,6 +30,8 @@ interface CommandBase {
 export type PaletteCommand = CommandBase &
   (
     | { kind: "new-session" }
+    | { kind: "split-pane-right" }
+    | { kind: "split-pane-down" }
     | { kind: "switch-session"; sessionId: string }
     | { kind: "toggle-split" }
     | { kind: "toggle-wrap" }

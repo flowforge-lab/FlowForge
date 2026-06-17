@@ -1,44 +1,68 @@
 import { describe, it, expect, beforeEach } from "vitest";
 import { useComposerStore } from "@/store/composer";
 
-describe("composer store", () => {
+const A = "session-a";
+const B = "session-b";
+
+describe("composer store (per-session, #148)", () => {
   beforeEach(() => {
-    useComposerStore.setState({ text: "", focusNonce: 0, rejectNonce: 0 });
+    useComposerStore.setState({
+      textBySession: {},
+      focusNonceBySession: {},
+      rejectNonceBySession: {},
+    });
   });
 
-  it("setText updates the text without bumping the focus nonce", () => {
-    useComposerStore.getState().setText("hello");
-    expect(useComposerStore.getState().text).toBe("hello");
-    expect(useComposerStore.getState().focusNonce).toBe(0);
+  it("setText updates one session's text without bumping the focus nonce", () => {
+    useComposerStore.getState().setText(A, "hello");
+    expect(useComposerStore.getState().textBySession[A]).toBe("hello");
+    expect(useComposerStore.getState().focusNonceBySession[A] ?? 0).toBe(0);
+  });
+
+  it("keeps drafts isolated per session", () => {
+    useComposerStore.getState().setText(A, "draft a");
+    useComposerStore.getState().setText(B, "draft b");
+    expect(useComposerStore.getState().textBySession[A]).toBe("draft a");
+    expect(useComposerStore.getState().textBySession[B]).toBe("draft b");
   });
 
   it("prefill loads the text and bumps the focus nonce into an empty composer", () => {
-    useComposerStore.getState().prefill("edit me");
-    expect(useComposerStore.getState().text).toBe("edit me");
-    expect(useComposerStore.getState().focusNonce).toBe(1);
+    useComposerStore.getState().prefill(A, "edit me");
+    expect(useComposerStore.getState().textBySession[A]).toBe("edit me");
+    expect(useComposerStore.getState().focusNonceBySession[A]).toBe(1);
   });
 
-  it("bumps the focus nonce on each prefill into an empty composer, even for identical text, so a refocus always fires", () => {
-    useComposerStore.getState().prefill("same");
-    const first = useComposerStore.getState().focusNonce;
-    useComposerStore.setState({ text: "" }); // composer cleared (e.g. sent) between
-    useComposerStore.getState().prefill("same");
-    expect(useComposerStore.getState().focusNonce).toBe(first + 1);
+  it("bumps the focus nonce on each prefill into an empty composer, even for identical text", () => {
+    useComposerStore.getState().prefill(A, "same");
+    const first = useComposerStore.getState().focusNonceBySession[A];
+    useComposerStore.getState().setText(A, ""); // composer cleared (e.g. sent)
+    useComposerStore.getState().prefill(A, "same");
+    expect(useComposerStore.getState().focusNonceBySession[A]).toBe(first + 1);
   });
 
   it("prefill overwrites a whitespace-only composer (treated as empty)", () => {
-    useComposerStore.setState({ text: "   \n " });
-    useComposerStore.getState().prefill("edit me");
-    expect(useComposerStore.getState().text).toBe("edit me");
-    expect(useComposerStore.getState().focusNonce).toBe(1);
-    expect(useComposerStore.getState().rejectNonce).toBe(0);
+    useComposerStore.getState().setText(A, "   \n ");
+    useComposerStore.getState().prefill(A, "edit me");
+    expect(useComposerStore.getState().textBySession[A]).toBe("edit me");
+    expect(useComposerStore.getState().focusNonceBySession[A]).toBe(1);
+    expect(useComposerStore.getState().rejectNonceBySession[A] ?? 0).toBe(0);
   });
 
   it("prefill refuses to clobber an in-progress draft, preserving it and bumping rejectNonce", () => {
-    useComposerStore.setState({ text: "half-typed draft" });
-    useComposerStore.getState().prefill("edit me");
-    expect(useComposerStore.getState().text).toBe("half-typed draft"); // preserved
-    expect(useComposerStore.getState().rejectNonce).toBe(1);
-    expect(useComposerStore.getState().focusNonce).toBe(0); // not a prefill
+    useComposerStore.getState().setText(A, "half-typed draft");
+    useComposerStore.getState().prefill(A, "edit me");
+    expect(useComposerStore.getState().textBySession[A]).toBe(
+      "half-typed draft",
+    );
+    expect(useComposerStore.getState().rejectNonceBySession[A]).toBe(1);
+    expect(useComposerStore.getState().focusNonceBySession[A] ?? 0).toBe(0);
+  });
+
+  it("a draft in one session does not block a prefill into another", () => {
+    useComposerStore.getState().setText(A, "busy draft");
+    useComposerStore.getState().prefill(B, "edit me");
+    expect(useComposerStore.getState().textBySession[B]).toBe("edit me");
+    expect(useComposerStore.getState().focusNonceBySession[B]).toBe(1);
+    expect(useComposerStore.getState().rejectNonceBySession[B] ?? 0).toBe(0);
   });
 });

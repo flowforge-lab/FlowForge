@@ -16,8 +16,10 @@ export function buildCommands(args: {
   sessions: Session[];
   activeSessionId: string | null;
   sessionTitles: Record<string, string>;
+  /** False when the pane cap is reached, so split actions are hidden (#148). */
+  canSplit?: boolean;
 }): PaletteCommand[] {
-  const { sessions, activeSessionId, sessionTitles } = args;
+  const { sessions, activeSessionId, sessionTitles, canSplit = true } = args;
 
   const actions: PaletteCommand[] = [
     {
@@ -45,6 +47,22 @@ export function buildCommands(args: {
       title: "Focus composer",
       keywords: "message input write type reply prompt",
     },
+    ...(canSplit
+      ? ([
+          {
+            kind: "split-pane-right",
+            id: "action:split-pane-right",
+            title: "Split pane right",
+            keywords: "pane tile new session side by side vertical iterm",
+          },
+          {
+            kind: "split-pane-down",
+            id: "action:split-pane-down",
+            title: "Split pane down",
+            keywords: "pane tile new session stacked horizontal iterm",
+          },
+        ] satisfies PaletteCommand[])
+      : []),
   ];
 
   // Switching to the active session is a no-op, so it's left out. The ⌘1–9 hint
