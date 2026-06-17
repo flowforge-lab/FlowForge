@@ -7,6 +7,8 @@ export type { Phenotype } from "./Phenotype";
 export type { SkillInfo } from "./SkillInfo";
 export type { SkillManifest } from "./SkillManifest";
 export type { ProviderConfig } from "./ProviderConfig";
+export type { ProviderConnection } from "./ProviderConnection";
+export type { ProviderRegistry } from "./ProviderRegistry";
 export type { ProviderKind } from "./ProviderKind";
 export type { SearchConfig } from "./SearchConfig";
 export type { SearchBackend } from "./SearchBackend";

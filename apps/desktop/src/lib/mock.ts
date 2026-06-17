@@ -7,6 +7,8 @@
 import type {
   Message,
   ProviderConfig,
+  ProviderConnection,
+  ProviderRegistry,
   ProviderKind,
   SearchConfig,
   SearchBackend,
@@ -170,12 +172,33 @@ export class MockIpc implements FfIpc {
   // One active timer per session so cancelTurn can stop it.
   private activeTimers = new Map<string, ActiveTurn>();
 
-  // Provider settings (Issue #8). Defaults mirror the backend's out-of-the-box
-  // local candle-vllm config; persistence is in-memory for the mock session.
-  private providerConfig: ProviderConfig = {
-    kind: "candleVllm",
-    model: "Qwen3-4B-Instruct-2507",
-    hasKey: false,
+  // Provider connection registry (Issue #138, RFC 0005 Phase A). Mirrors the
+  // backend default: local candle-vLLM (active) plus a ready keyless Ollama.
+  // Persistence is in-memory for the mock session.
+  private registry: ProviderRegistry = {
+    active: "candle-vllm",
+    connections: [
+      {
+        id: "candle-vllm",
+        kind: "candleVllm",
+        displayName: "candle-vLLM",
+        model: "Qwen3-4B-Instruct-2507",
+        hasKey: false,
+      },
+      {
+        id: "ollama",
+        kind: "ollama",
+        displayName: "Ollama",
+        model: "llama3.2",
+        hasKey: false,
+      },
+    ],
+  };
+
+  // Canned per-connection model lists so the picker is exercisable offline.
+  private modelsByConnection: Record<string, string[]> = {
+    "candle-vllm": ["Qwen3-4B-Instruct-2507", "Qwen3-8B-Instruct"],
+    ollama: ["llama3.2", "qwen2.5", "mistral"],
   };
 
   // Web-search settings (Issue #43). Defaults mirror the backend: SearXNG with no
@@ -386,8 +409,48 @@ export class MockIpc implements FfIpc {
     resume(answer);
   }
 
+  private activeConnection(): ProviderConnection {
+    const active = this.registry.connections.find(
+      (c) => c.id === this.registry.active,
+    );
+    // Registry invariants guarantee the active pointer resolves.
+    if (!active)
+      throw new Error(`active connection missing: ${this.registry.active}`);
+    return active;
+  }
+
+  /** Slug derived from vendor/displayName/kind, deduped with a `-N` suffix. */
+  private deriveConnectionId(conn: ProviderConnection): string {
+    const base =
+      (conn.vendor || conn.displayName || conn.kind)
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, "-")
+        .replace(/^-+|-+$/g, "") || "connection";
+    let id = base;
+    let n = 2;
+    while (this.registry.connections.some((c) => c.id === id)) {
+      id = `${base}-${n++}`;
+    }
+    return id;
+  }
+
+  private cloneRegistry(): ProviderRegistry {
+    return {
+      active: this.registry.active,
+      connections: this.registry.connections.map((c) => ({ ...c })),
+    };
+  }
+
+  // getProviderConfig/setProviderConfig stay as active-connection shims during
+  // the frontend cutover to the registry (Issue #126).
   async getProviderConfig(): Promise<ProviderConfig> {
-    return { ...this.providerConfig };
+    const c = this.activeConnection();
+    return {
+      kind: c.kind,
+      baseUrl: c.baseUrl,
+      model: c.model,
+      hasKey: c.hasKey,
+    };
   }
 
   async setProviderConfig(
@@ -396,21 +459,57 @@ export class MockIpc implements FfIpc {
     model: string,
   ): Promise<ProviderConfig> {
     const trimmed = baseUrl?.trim();
-    this.providerConfig = {
-      kind,
-      baseUrl: trimmed ? trimmed : undefined,
-      model,
-      // Secrets are a later phase; the mock never has a key.
-      hasKey: false,
+    const c = this.activeConnection();
+    c.kind = kind;
+    c.baseUrl = trimmed ? trimmed : undefined;
+    c.model = model;
+    // Secrets are a later phase; the mock never has a key.
+    c.hasKey = false;
+    return {
+      kind: c.kind,
+      baseUrl: c.baseUrl,
+      model: c.model,
+      hasKey: c.hasKey,
     };
-    return { ...this.providerConfig };
   }
 
-  async listModels(): Promise<string[]> {
-    // Canned per-provider suggestions so the picker is exercisable offline.
-    return this.providerConfig.kind === "ollama"
-      ? ["llama3.2", "qwen2.5", "mistral"]
-      : ["Qwen3-4B-Instruct-2507", "Qwen3-8B-Instruct"];
+  async getProviderRegistry(): Promise<ProviderRegistry> {
+    return this.cloneRegistry();
+  }
+
+  async setActiveConnection(id: string): Promise<void> {
+    if (!this.registry.connections.some((c) => c.id === id)) {
+      throw new Error(`unknown connection: ${id}`);
+    }
+    this.registry.active = id;
+  }
+
+  async upsertConnection(
+    conn: ProviderConnection,
+  ): Promise<ProviderConnection> {
+    const id = conn.id?.trim() ? conn.id.trim() : this.deriveConnectionId(conn);
+    const stored: ProviderConnection = { ...conn, id };
+    const idx = this.registry.connections.findIndex((c) => c.id === id);
+    if (idx >= 0) this.registry.connections[idx] = stored;
+    else this.registry.connections.push(stored);
+    return { ...stored };
+  }
+
+  async removeConnection(id: string): Promise<void> {
+    if (this.registry.connections.length <= 1) {
+      throw new Error("cannot remove the last connection");
+    }
+    const idx = this.registry.connections.findIndex((c) => c.id === id);
+    if (idx < 0) return;
+    this.registry.connections.splice(idx, 1);
+    if (this.registry.active === id) {
+      this.registry.active = this.registry.connections[0].id;
+    }
+  }
+
+  async listModels(id?: string): Promise<string[]> {
+    const target = id ?? this.registry.active;
+    return this.modelsByConnection[target] ?? [];
   }
 
   async getSearchConfig(): Promise<SearchConfig> {

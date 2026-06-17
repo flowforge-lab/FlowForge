@@ -13,7 +13,9 @@ mod skill;
 
 pub use mcp::{McpServerConfig, McpServerState, McpServerStatus, McpToolInfo};
 pub use message::{Message, Role, ToolCall};
-pub use provider::{ProviderConfig, ProviderKind};
+pub use provider::{
+    ConnectionId, ProviderConfig, ProviderConnection, ProviderKind, ProviderRegistry,
+};
 pub use search::{SearchBackend, SearchConfig};
 pub use session::{auto_title, Session, SessionStatus};
 pub use skill::{Phenotype, Skill, SkillInfo, SkillManifest};
