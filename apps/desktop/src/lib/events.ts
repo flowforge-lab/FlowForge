@@ -6,6 +6,7 @@ import { ipc } from "./ipc";
 import { TokenBatcher } from "./token-batcher";
 import { useChatStore } from "@/store/chat";
 import { useSkillsStore } from "@/store/skills";
+import { useMcpStore } from "@/store/mcp";
 
 let started = false;
 
@@ -42,6 +43,10 @@ export function startIpcEvents(): void {
   void ipc.onAskRequest(store.applyAskRequest);
   void ipc.onSkillsChanged(() => {
     void useSkillsStore.getState().refresh();
+  });
+  // MCP status snapshots replace the store wholesale (#91); mirrors skills:changed.
+  void ipc.onMcpStatusChanged((e) => {
+    useMcpStore.getState().setServers(e.servers);
   });
   // No UI for intention signals yet (NeuroForge, M8) — observe only.
   void ipc.onIntention((e) => {

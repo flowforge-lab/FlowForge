@@ -12,6 +12,7 @@ import {
   Info,
   Keyboard,
   Palette,
+  Server,
   SlidersHorizontal,
   Users,
   type LucideIcon,
@@ -24,6 +25,7 @@ export type SettingsSectionId =
   | "appearance" // GLOBAL
   | "profiles"
   | "memory"
+  | "mcp"
   | "scheduled"
   | "keyboard"
   | "experimental"
@@ -60,6 +62,7 @@ export const SETTINGS_NAV: readonly SettingsNavGroup[] = [
       { id: "appearance", label: "Appearance", icon: Palette },
       { id: "profiles", label: "Profiles", icon: Users },
       { id: "memory", label: "Memory", icon: Brain },
+      { id: "mcp", label: "MCP servers", icon: Server },
       { id: "scheduled", label: "Scheduled", icon: CalendarClock },
       { id: "keyboard", label: "Keyboard", icon: Keyboard },
       { id: "experimental", label: "Experimental", icon: FlaskConical },

@@ -11,6 +11,7 @@ import {
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { formatArgs } from "@/lib/tool-args";
+import { parseMcpToolName } from "@/lib/mcp";
 import { parseTodo, todoSummary } from "@/lib/todo";
 import { TodoList } from "@/components/todo-list";
 import { Button } from "@/components/ui/button";
@@ -106,6 +107,23 @@ function SafetyBadge({ safety }: { safety: NonNullable<ToolStep["safety"]> }) {
   );
 }
 
+/** Tool name label. Bridged MCP tools (`mcp__<server>__<tool>`) render as a
+ *  server badge + bare tool name instead of the raw namespaced id (#91). */
+function ToolLabel({ tool }: { tool: string }) {
+  const mcp = parseMcpToolName(tool);
+  if (!mcp) {
+    return <span className="font-medium text-foreground">{tool}</span>;
+  }
+  return (
+    <span className="flex items-center gap-1.5">
+      <span className="rounded bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground">
+        {mcp.server}
+      </span>
+      <span className="font-medium text-foreground">{mcp.tool}</span>
+    </span>
+  );
+}
+
 export function ToolStepBlock({
   step,
   onRespond,
@@ -159,7 +177,7 @@ export function ToolStepBlock({
           )}
         />
         <StatusIcon status={step.status} />
-        <span className="font-medium text-foreground">{step.tool}</span>
+        <ToolLabel tool={step.tool} />
         {awaiting && step.safety && <SafetyBadge safety={step.safety} />}
         {asking && (
           <span className="rounded bg-sky-500/15 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-sky-700 dark:text-sky-400">
