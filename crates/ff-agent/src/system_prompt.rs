@@ -58,6 +58,7 @@ pub fn build_system_prompt(
     skills: &SkillRegistry,
     active: &[String],
     user: &UserContext,
+    memory: Option<&str>,
 ) -> String {
     let mut out = String::new();
 
@@ -101,6 +102,18 @@ pub fn build_system_prompt(
         "Current date: {} ({}).\n",
         user.local_date, user.timezone
     ));
+
+    // Durable memory (RFC 0006) sits in the volatile tail beside the user
+    // context: like the date, it changes between sessions, so keeping it after
+    // the stable persona/skill prefix preserves prefix-cache reuse for the rest.
+    if let Some(memory) = memory {
+        let memory = memory.trim();
+        if !memory.is_empty() {
+            out.push('\n');
+            out.push_str(memory);
+            out.push('\n');
+        }
+    }
 
     out
 }
@@ -156,7 +169,7 @@ mod tests {
     #[test]
     fn includes_user_context_from_supplied_clock() {
         let reg = SkillRegistry::new();
-        let out = build_system_prompt(None, &reg, &[], &ctx());
+        let out = build_system_prompt(None, &reg, &[], &ctx(), None);
         assert!(out.contains("## User context"));
         assert!(
             out.contains("Current date: 2026-06-13 (America/Chicago)."),
@@ -167,7 +180,13 @@ mod tests {
     #[test]
     fn user_context_is_placed_last() {
         let reg = registry(vec![skill("alpha", "A things", "abody")]);
-        let out = build_system_prompt(Some("You are Akisa."), &reg, &["alpha".into()], &ctx());
+        let out = build_system_prompt(
+            Some("You are Akisa."),
+            &reg,
+            &["alpha".into()],
+            &ctx(),
+            None,
+        );
         let persona = out.find("You are Akisa.").unwrap();
         let available = out.find("## Available skills").unwrap();
         let active = out.find("## Active skill instructions").unwrap();
@@ -181,16 +200,16 @@ mod tests {
     #[test]
     fn persona_is_prepended_when_set_and_absent_when_none() {
         let reg = SkillRegistry::new();
-        let with = build_system_prompt(Some("You are Akisa."), &reg, &[], &ctx());
+        let with = build_system_prompt(Some("You are Akisa."), &reg, &[], &ctx(), None);
         assert!(with.starts_with("You are Akisa.\n\n"));
-        let without = build_system_prompt(None, &reg, &[], &ctx());
+        let without = build_system_prompt(None, &reg, &[], &ctx(), None);
         assert!(without.starts_with("## User context"));
     }
 
     #[test]
     fn blank_persona_is_ignored() {
         let reg = SkillRegistry::new();
-        let out = build_system_prompt(Some("   \n  "), &reg, &[], &ctx());
+        let out = build_system_prompt(Some("   \n  "), &reg, &[], &ctx(), None);
         assert!(out.starts_with("## User context"), "{out}");
     }
 
@@ -200,7 +219,7 @@ mod tests {
             skill("zeta", "Z things", "zbody"),
             skill("alpha", "A things", "abody"),
         ]);
-        let out = build_system_prompt(None, &reg, &[], &ctx());
+        let out = build_system_prompt(None, &reg, &[], &ctx(), None);
         assert!(out.contains("## Available skills"));
         let a = out.find("- alpha: A things").unwrap();
         let z = out.find("- zeta: Z things").unwrap();
@@ -213,7 +232,7 @@ mod tests {
             skill("rust-debug", "Debug Rust", "Use bash and view to bisect."),
             skill("idle", "Unused", "SHOULD_NOT_APPEAR"),
         ]);
-        let out = build_system_prompt(None, &reg, &["rust-debug".into()], &ctx());
+        let out = build_system_prompt(None, &reg, &["rust-debug".into()], &ctx(), None);
         assert!(out.contains("## Active skill instructions"));
         assert!(out.contains("### rust-debug"));
         assert!(out.contains("Use bash and view to bisect."));
@@ -228,14 +247,34 @@ mod tests {
     #[test]
     fn no_active_section_when_none_active() {
         let reg = registry(vec![skill("a", "desc", "body")]);
-        let out = build_system_prompt(None, &reg, &[], &ctx());
+        let out = build_system_prompt(None, &reg, &[], &ctx(), None);
         assert!(!out.contains("## Active skill instructions"), "{out}");
     }
 
     #[test]
     fn unknown_active_name_is_skipped() {
         let reg = registry(vec![skill("a", "desc", "body")]);
-        let out = build_system_prompt(None, &reg, &["ghost".into()], &ctx());
+        let out = build_system_prompt(None, &reg, &["ghost".into()], &ctx(), None);
         assert!(!out.contains("## Active skill instructions"), "{out}");
+    }
+
+    #[test]
+    fn memory_block_is_appended_after_user_context() {
+        let reg = SkillRegistry::new();
+        let mem = "## Memory\n\nUser prefers Rust.";
+        let out = build_system_prompt(None, &reg, &[], &ctx(), Some(mem));
+        let user = out.find("## User context").unwrap();
+        let memory = out.find("## Memory").unwrap();
+        assert!(user < memory, "memory must follow user context: {out}");
+        assert!(out.contains("User prefers Rust."));
+    }
+
+    #[test]
+    fn none_or_blank_memory_adds_nothing() {
+        let reg = SkillRegistry::new();
+        let without = build_system_prompt(None, &reg, &[], &ctx(), None);
+        assert!(!without.contains("## Memory"));
+        let blank = build_system_prompt(None, &reg, &[], &ctx(), Some("   \n  "));
+        assert!(!blank.contains("## Memory"));
     }
 }

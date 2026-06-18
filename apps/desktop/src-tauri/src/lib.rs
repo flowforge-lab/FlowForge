@@ -233,8 +233,15 @@ fn send_message(
         let skills = state.skills_snapshot();
         let user_ctx = ff_agent::UserContext::now();
         let active = state.active_skills();
-        let system_prompt =
-            ff_agent::build_system_prompt(persona.as_deref(), &skills, &active, &user_ctx);
+        let memory = ff_memory::Memory::with_default_root(ff_memory::MemoryConfig::default())
+            .ambient_block();
+        let system_prompt = ff_agent::build_system_prompt(
+            persona.as_deref(),
+            &skills,
+            &active,
+            &user_ctx,
+            memory.as_deref(),
+        );
 
         // Telemetry (RFC 0001 §8): one SkillActivated per active skill, plus a
         // wall-clock start and a per-turn metrics accumulator the event closure

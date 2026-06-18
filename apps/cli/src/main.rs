@@ -102,7 +102,7 @@ async fn run(prompt: String, json: bool, approval_mode: ApprovalMode) -> ExitCod
     let (provider, model) = host::load_provider();
     let skills = host::load_skills();
     let workspace = host::workspace_root();
-    let store = ff_memory::MemoryStore::new();
+    let store = ff_session::SessionStore::new();
     let registry = ff_tools::ToolRegistry::with_defaults();
     let approver = CliApprover::new(approval_mode);
 
@@ -110,7 +110,10 @@ async fn run(prompt: String, json: bool, approval_mode: ApprovalMode) -> ExitCod
     store.add_message(&session.id, Role::User, prompt);
 
     let user_ctx = UserContext::now();
-    let system_prompt = ff_agent::build_system_prompt(None, &skills, &[], &user_ctx);
+    let memory =
+        ff_memory::Memory::with_default_root(ff_memory::MemoryConfig::default()).ambient_block();
+    let system_prompt =
+        ff_agent::build_system_prompt(None, &skills, &[], &user_ctx, memory.as_deref());
 
     let tool_ctx = ToolContext {
         registry: &registry,
@@ -205,7 +208,7 @@ mod tests {
     use ff_agent::{run_turn, AgentEvent, Approver, CancelToken, ToolContext};
     use ff_core::Role;
     use ff_llm::{ChatRequest, Chunk, ChunkStream, LlmError, Provider};
-    use ff_memory::MemoryStore;
+    use ff_session::SessionStore;
     use ff_tools::{Safety, ToolRegistry};
     use futures_util::StreamExt;
 
@@ -313,7 +316,7 @@ mod tests {
 
     #[tokio::test]
     async fn json_run_output_ends_with_single_discriminated_done() {
-        let store = MemoryStore::new();
+        let store = SessionStore::new();
         let session = store.create_session(None);
         store.add_message(&session.id, Role::User, "say json".into());
         let registry = ToolRegistry::new();

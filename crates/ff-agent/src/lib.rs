@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use ff_core::{Message, Role};
 use ff_llm::{ChatMessage, ChatRequest, FunctionCall, Provider, ToolCall as LlmToolCall};
-use ff_memory::MemoryStore;
+use ff_session::SessionStore;
 use ff_tools::{Safety, ToolRegistry};
 use futures_util::StreamExt;
 use serde::Serialize;
@@ -177,7 +177,7 @@ struct CallBuf {
 #[allow(clippy::too_many_arguments)]
 pub async fn run_turn(
     provider: &dyn Provider,
-    store: &MemoryStore,
+    store: &SessionStore,
     tools: &ToolContext<'_>,
     session_id: &str,
     model: &str,
@@ -580,7 +580,7 @@ mod tests {
 
     #[tokio::test]
     async fn streams_and_persists_text_turn() {
-        let store = MemoryStore::new();
+        let store = SessionStore::new();
         let s = store.create_session(None);
         store.add_message(&s.id, Role::User, "hi".into());
         let registry = ToolRegistry::new();
@@ -615,7 +615,7 @@ mod tests {
     #[tokio::test]
     async fn executes_tool_then_finishes() {
         let dir = tempfile::tempdir().unwrap();
-        let store = MemoryStore::new();
+        let store = SessionStore::new();
         let s = store.create_session(None);
         store.add_message(&s.id, Role::User, "run echo".into());
         let registry = ToolRegistry::with_defaults();
@@ -673,7 +673,7 @@ mod tests {
     #[tokio::test]
     async fn ask_user_round_trips_answer_as_tool_result() {
         let dir = tempfile::tempdir().unwrap();
-        let store = MemoryStore::new();
+        let store = SessionStore::new();
         let s = store.create_session(None);
         store.add_message(&s.id, Role::User, "edit the file".into());
         let registry = ToolRegistry::with_defaults();
@@ -729,7 +729,7 @@ mod tests {
     #[tokio::test]
     async fn dismissed_ask_emits_tool_result_not_hang() {
         let dir = tempfile::tempdir().unwrap();
-        let store = MemoryStore::new();
+        let store = SessionStore::new();
         let s = store.create_session(None);
         store.add_message(&s.id, Role::User, "edit the file".into());
         let registry = ToolRegistry::with_defaults();
@@ -770,7 +770,7 @@ mod tests {
     #[tokio::test]
     async fn cancel_mid_loop_backfills_tool_results() {
         let dir = tempfile::tempdir().unwrap();
-        let store = MemoryStore::new();
+        let store = SessionStore::new();
         let s = store.create_session(None);
         store.add_message(&s.id, Role::User, "do two things".into());
         let registry = ToolRegistry::with_defaults();
@@ -854,7 +854,7 @@ mod tests {
     async fn denied_write_tool_reports_failure() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("f.txt"), "old\n").unwrap();
-        let store = MemoryStore::new();
+        let store = SessionStore::new();
         let s = store.create_session(None);
         store.add_message(&s.id, Role::User, "edit it".into());
         let registry = ToolRegistry::with_defaults();
@@ -927,7 +927,7 @@ mod tests {
     #[tokio::test]
     async fn awaits_async_approval() {
         let dir = tempfile::tempdir().unwrap();
-        let store = MemoryStore::new();
+        let store = SessionStore::new();
         let s = store.create_session(None);
         store.add_message(&s.id, Role::User, "run echo".into());
         let registry = ToolRegistry::with_defaults();
@@ -995,9 +995,9 @@ mod tests {
             local_date: "2026-06-13".into(),
             timezone: "America/Chicago".into(),
         };
-        let system = build_system_prompt(None, &skills, &[], &user);
+        let system = build_system_prompt(None, &skills, &[], &user, None);
 
-        let store = MemoryStore::new();
+        let store = SessionStore::new();
         let s = store.create_session(None);
         store.add_message(&s.id, Role::User, "hi".into());
         let registry = ToolRegistry::new();

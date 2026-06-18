@@ -24,6 +24,7 @@ ff-core = { workspace = true }
 ff-agent = { workspace = true }
 ff-llm = { workspace = true }
 ff-memory = { workspace = true }
+ff-session = { workspace = true }
 ff-skills = { workspace = true }
 ff-signals = { workspace = true }
 ff-tools = { workspace = true }
