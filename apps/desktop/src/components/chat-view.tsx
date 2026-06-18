@@ -7,6 +7,7 @@ import { StepGroup } from "@/components/step-group";
 import { ThinkingBlock } from "@/components/thinking-block";
 import { Markdown } from "@/components/markdown";
 import { MessageActions } from "@/components/message-actions";
+import { ThinkingIndicator } from "@/components/thinking-indicator";
 import type { Message } from "@/bindings";
 
 const NO_STEPS: ToolStep[] = [];
@@ -132,6 +133,14 @@ export function ChatView({ sessionId }: { sessionId?: string } = {}) {
   const streamingId = useChatStore((s) =>
     targetSessionId ? s.streamingBySession[targetSessionId] : undefined,
   );
+  // Pending = the turn is in flight but nothing has streamed yet; show a
+  // "thinking" indicator until the first token/tool-call materializes a row.
+  const pending = useChatStore((s) =>
+    targetSessionId
+      ? Boolean(s.turnStartBySession[targetSessionId]) &&
+        !s.streamingBySession[targetSessionId]
+      : false,
+  );
   const toolStepsByMessage = useChatStore((s) => s.toolStepsByMessage);
   const turnStartByMessage = useChatStore((s) => s.turnStartByMessage);
   const turnStartBySession = useChatStore((s) => s.turnStartBySession);
@@ -148,7 +157,7 @@ export function ChatView({ sessionId }: { sessionId?: string } = {}) {
     if (el && pinnedToBottom.current) {
       el.scrollTop = el.scrollHeight;
     }
-  }, [messages, toolStepsByMessage, reasoningByMessage]);
+  }, [messages, toolStepsByMessage, reasoningByMessage, pending]);
 
   useEffect(() => {
     pinnedToBottom.current = true;
@@ -198,6 +207,7 @@ export function ChatView({ sessionId }: { sessionId?: string } = {}) {
             respondAsk={respondAsk}
           />
         ))}
+        {pending && <ThinkingIndicator />}
       </div>
     </div>
   );

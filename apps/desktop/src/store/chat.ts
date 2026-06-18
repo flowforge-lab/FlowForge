@@ -424,7 +424,18 @@ export const useChatStore = create<ChatState>((set, get) => ({
   },
 
   cancelTurn: async (sessionId) => {
-    if (!sessionId || !get().streamingBySession[sessionId]) return;
+    // Cancellable as soon as the turn is in flight, not only once it streams:
+    // the backend registers the cancel token at send_message time, so a turn
+    // stuck in the pending window (a cold model ramping up before its first
+    // token) can still be stopped. turnStartBySession marks that window.
+    if (!sessionId) return;
+    const s0 = get();
+    if (
+      !s0.streamingBySession[sessionId] &&
+      !s0.turnStartBySession[sessionId]
+    ) {
+      return;
+    }
     await ipc.cancelTurn(sessionId);
     set((s) => clearSessionTurnTiming(s, sessionId));
   },
