@@ -1,8 +1,15 @@
+import type { ComponentType, ReactNode } from "react";
 import { useRef, useState } from "react";
 import {
+  Eye,
+  EyeOff,
+  MoreHorizontal,
   Moon,
   Pencil,
+  Pin,
+  PinOff,
   Plus,
+  RotateCcw,
   Search,
   Settings,
   SplitSquareHorizontal,
@@ -18,6 +25,7 @@ import { resolveEffectiveTheme } from "@/lib/theme";
 import { useTheme } from "@/store/prefs";
 import { useSettingsStore } from "@/store/settings";
 import { useChatStore } from "@/store/chat";
+import { useSessionPrefsStore } from "@/store/session-prefs";
 import { usePanesStore, MAX_PANES } from "@/store/panes";
 import {
   ContextMenu,
@@ -29,21 +37,125 @@ import {
   ContextMenuSubContent,
   ContextMenuSeparator,
 } from "@/components/ui/context-menu";
-import { filterSessions, resolveLabel } from "@/lib/sessions";
+import {
+  DropdownMenu,
+  DropdownMenuTrigger,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSub,
+  DropdownMenuSubTrigger,
+  DropdownMenuSubContent,
+  DropdownMenuSeparator,
+} from "@/components/ui/dropdown-menu";
+import { arrangeSessions, filterSessions, resolveLabel } from "@/lib/sessions";
 import type { Session } from "@/bindings";
+
+// ── Shared menu body ─────────────────────────────────────────────────────────
+// The right-click ContextMenu and the ⋯ DropdownMenu render the identical item
+// list, so it lives once here and is parameterized by the menu primitive's parts
+// (radix ContextMenu/DropdownMenu expose the same item/sub/separator shapes).
+
+interface MenuParts {
+  Item: ComponentType<{
+    onSelect?: (event: Event) => void;
+    disabled?: boolean;
+    children?: ReactNode;
+  }>;
+  Sub: ComponentType<{ children?: ReactNode }>;
+  SubTrigger: ComponentType<{ disabled?: boolean; children?: ReactNode }>;
+  SubContent: ComponentType<{ children?: ReactNode }>;
+  Separator: ComponentType;
+}
+
+const CONTEXT_PARTS: MenuParts = {
+  Item: ContextMenuItem,
+  Sub: ContextMenuSub,
+  SubTrigger: ContextMenuSubTrigger,
+  SubContent: ContextMenuSubContent,
+  Separator: ContextMenuSeparator,
+};
+
+const DROPDOWN_PARTS: MenuParts = {
+  Item: DropdownMenuItem,
+  Sub: DropdownMenuSub,
+  SubTrigger: DropdownMenuSubTrigger,
+  SubContent: DropdownMenuSubContent,
+  Separator: DropdownMenuSeparator,
+};
+
+interface SessionMenuItemsProps {
+  parts: MenuParts;
+  atCap: boolean;
+  pinned: boolean;
+  dismissed: boolean;
+  onOpen: () => void;
+  onOpenSplit: (dir: "vertical" | "horizontal") => void;
+  onTogglePin: () => void;
+  onDismissToggle: () => void;
+  onRename: () => void;
+}
+
+function SessionMenuItems({
+  parts: P,
+  atCap,
+  pinned,
+  dismissed,
+  onOpen,
+  onOpenSplit,
+  onTogglePin,
+  onDismissToggle,
+  onRename,
+}: SessionMenuItemsProps) {
+  return (
+    <>
+      <P.Item onSelect={onOpen}>Open</P.Item>
+      <P.Sub>
+        <P.SubTrigger disabled={atCap}>Open in split</P.SubTrigger>
+        <P.SubContent>
+          <P.Item onSelect={() => onOpenSplit("vertical")}>
+            <SplitSquareHorizontal />
+            Right
+          </P.Item>
+          <P.Item onSelect={() => onOpenSplit("horizontal")}>
+            <SplitSquareVertical />
+            Down
+          </P.Item>
+        </P.SubContent>
+      </P.Sub>
+      <P.Separator />
+      <P.Item onSelect={onTogglePin}>
+        {pinned ? <PinOff /> : <Pin />}
+        {pinned ? "Unpin" : "Pin"}
+      </P.Item>
+      <P.Item onSelect={onDismissToggle}>
+        {dismissed ? <RotateCcw /> : <EyeOff />}
+        {dismissed ? "Restore" : "Dismiss"}
+      </P.Item>
+      <P.Separator />
+      <P.Item onSelect={onRename}>
+        <Pencil />
+        Rename
+      </P.Item>
+    </>
+  );
+}
 
 // ── Inline-rename session item ───────────────────────────────────────────────
 
-function SessionItem({
+export function SessionItem({
   session,
   index,
   active,
   streaming,
+  pinned,
+  dismissed,
 }: {
   session: Session;
   index: number;
   active: boolean;
   streaming: boolean;
+  pinned: boolean;
+  dismissed: boolean;
 }) {
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState("");
@@ -54,6 +166,15 @@ function SessionItem({
   const loadSession = useChatStore((s) => s.loadSession);
   const setSessionTitle = useChatStore((s) => s.setSessionTitle);
   const atCap = usePanesStore((s) => s.leafCount() >= MAX_PANES);
+  const togglePin = useSessionPrefsStore((s) => s.togglePin);
+  const dismiss = useSessionPrefsStore((s) => s.dismiss);
+  const restore = useSessionPrefsStore((s) => s.restore);
+
+  // Shared by both menus and the inline pencil.
+  const onTogglePin = () => togglePin(session.id);
+  const onDismissToggle = () =>
+    dismissed ? restore(session.id) : dismiss(session.id);
+  const onRename = () => setEditing(true);
 
   const currentLabel = resolveLabel(session, sessionTitles[session.id]);
 
@@ -118,6 +239,7 @@ function SessionItem({
             active
               ? "bg-sidebar-accent text-sidebar-accent-foreground"
               : "text-muted-foreground hover:bg-sidebar-accent/50 hover:text-foreground",
+            dismissed && "opacity-60",
           )}
         >
           {editing ? (
@@ -147,13 +269,20 @@ function SessionItem({
             <>
               <span className="min-w-0 flex-1 truncate">{currentLabel}</span>
 
-              {/* Right-side slot: streaming dot > pencil (hover) > kbd hint (idle) */}
-              <span className="flex shrink-0 items-center">
+              {/* Right slot: pin glyph (when pinned) + streaming dot, or the
+                  hover actions (pencil, ⋯) / kbd hint when idle. */}
+              <span className="flex shrink-0 items-center gap-0.5">
+                {pinned && !streaming && (
+                  <Pin
+                    className="size-3 shrink-0 text-muted-foreground/70"
+                    aria-label="Pinned"
+                  />
+                )}
                 {streaming ? (
                   <span className="size-1.5 animate-pulse rounded-full bg-primary" />
                 ) : (
                   <>
-                    {/* Pencil shown on hover; kbd hint shown when idle */}
+                    {/* Pencil + ⋯ shown on hover; kbd hint shown when idle. */}
                     <button
                       title="Rename session"
                       onClick={startEditing}
@@ -164,6 +293,35 @@ function SessionItem({
                     >
                       <Pencil className="size-3" />
                     </button>
+                    <DropdownMenu>
+                      <DropdownMenuTrigger asChild>
+                        <button
+                          title="Session actions"
+                          aria-label="Session actions"
+                          onClick={(e) => e.stopPropagation()}
+                          onKeyDown={(e) => e.stopPropagation()}
+                          className={cn(
+                            "hidden size-5 items-center justify-center rounded group-hover:flex data-[state=open]:flex",
+                            "text-muted-foreground/70 hover:text-foreground hover:bg-sidebar-accent",
+                          )}
+                        >
+                          <MoreHorizontal className="size-3" />
+                        </button>
+                      </DropdownMenuTrigger>
+                      <DropdownMenuContent align="end">
+                        <SessionMenuItems
+                          parts={DROPDOWN_PARTS}
+                          atCap={atCap}
+                          pinned={pinned}
+                          dismissed={dismissed}
+                          onOpen={open}
+                          onOpenSplit={openInSplit}
+                          onTogglePin={onTogglePin}
+                          onDismissToggle={onDismissToggle}
+                          onRename={onRename}
+                        />
+                      </DropdownMenuContent>
+                    </DropdownMenu>
                     {index < 9 && (
                       <kbd className="font-mono text-[10px] text-muted-foreground/50 group-hover:hidden">
                         ⌘{index + 1}
@@ -177,26 +335,17 @@ function SessionItem({
         </div>
       </ContextMenuTrigger>
       <ContextMenuContent>
-        <ContextMenuItem onSelect={open}>Open</ContextMenuItem>
-        <ContextMenuSub>
-          <ContextMenuSubTrigger disabled={atCap}>
-            Open in split
-          </ContextMenuSubTrigger>
-          <ContextMenuSubContent>
-            <ContextMenuItem onSelect={() => openInSplit("vertical")}>
-              <SplitSquareHorizontal />
-              Right
-            </ContextMenuItem>
-            <ContextMenuItem onSelect={() => openInSplit("horizontal")}>
-              <SplitSquareVertical />
-              Down
-            </ContextMenuItem>
-          </ContextMenuSubContent>
-        </ContextMenuSub>
-        <ContextMenuSeparator />
-        <ContextMenuItem onSelect={() => setEditing(true)}>
-          Rename
-        </ContextMenuItem>
+        <SessionMenuItems
+          parts={CONTEXT_PARTS}
+          atCap={atCap}
+          pinned={pinned}
+          dismissed={dismissed}
+          onOpen={open}
+          onOpenSplit={openInSplit}
+          onTogglePin={onTogglePin}
+          onDismissToggle={onDismissToggle}
+          onRename={onRename}
+        />
       </ContextMenuContent>
     </ContextMenu>
   );
@@ -226,14 +375,33 @@ export function SessionSidebar() {
   const openSettings = useSettingsStore((s) => s.openSettings);
   const effectiveTheme = resolveEffectiveTheme(theme);
 
+  const pinnedIds = useSessionPrefsStore((s) => s.pinned);
+  const dismissedIds = useSessionPrefsStore((s) => s.dismissed);
+
   const [filter, setFilter] = useState("");
+  const [showDismissed, setShowDismissed] = useState(false);
   const filterRef = useRef<HTMLInputElement>(null);
+
+  const pinnedSet = new Set(pinnedIds);
+  const dismissedSet = new Set(dismissedIds);
+  const dismissedCount = sessions.reduce(
+    (n, s) => n + (dismissedSet.has(s.id) ? 1 : 0),
+    0,
+  );
 
   const filtered = filterSessions(sessions, filter, sessionTitles);
   // Each session's index in the *full* list — keeps the ⌘1–9 hint accurate when
   // the visible list is filtered (the global shortcut indexes the full list).
   const indexById = new Map(sessions.map((s, i) => [s.id, i]));
   const filtering = filter.trim().length > 0;
+
+  // Hide dismissed sessions (unless revealed), then float pinned to the top.
+  const visible = arrangeSessions(
+    filtered,
+    pinnedSet,
+    dismissedSet,
+    showDismissed,
+  );
 
   return (
     <aside className="flex h-full w-60 shrink-0 flex-col border-r bg-sidebar text-sidebar-foreground">
@@ -319,23 +487,42 @@ export function SessionSidebar() {
 
       <ScrollArea className="flex-1">
         <nav className="flex flex-col gap-px p-1.5">
-          {filtered.length === 0
+          {visible.length === 0
             ? filtering && (
                 <p className="px-2 py-6 text-center text-[12px] text-muted-foreground/60">
                   No sessions match “{filter.trim()}”
                 </p>
               )
-            : filtered.map((session) => (
+            : visible.map((session) => (
                 <SessionItem
                   key={session.id}
                   session={session}
                   index={indexById.get(session.id) ?? 0}
                   active={session.id === activeSessionId}
                   streaming={Boolean(streamingBySession[session.id])}
+                  pinned={pinnedSet.has(session.id)}
+                  dismissed={dismissedSet.has(session.id)}
                 />
               ))}
         </nav>
       </ScrollArea>
+
+      {dismissedCount > 0 && (
+        <button
+          type="button"
+          onClick={() => setShowDismissed((v) => !v)}
+          className="mx-1.5 mb-1 flex items-center gap-1.5 rounded-md px-2 py-1 text-left text-[11px] text-muted-foreground/70 transition-colors hover:bg-sidebar-accent/50 hover:text-foreground"
+        >
+          {showDismissed ? (
+            <Eye className="size-3 shrink-0" />
+          ) : (
+            <EyeOff className="size-3 shrink-0" />
+          )}
+          {showDismissed
+            ? "Hide dismissed"
+            : `Show dismissed (${dismissedCount})`}
+        </button>
+      )}
 
       <Separator />
       <div className="px-3 py-2 text-[11px] text-muted-foreground/60">

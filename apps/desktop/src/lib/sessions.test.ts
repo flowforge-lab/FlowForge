@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { resolveLabel, filterSessions } from "@/lib/sessions";
+import { resolveLabel, filterSessions, arrangeSessions } from "@/lib/sessions";
 import type { Session } from "@/bindings";
 
 function session(partial: Partial<Session> & { id: string }): Session {
@@ -91,5 +91,42 @@ describe("filterSessions", () => {
       "b", // Write the docs
       "c", // New session
     ]);
+  });
+});
+
+describe("arrangeSessions", () => {
+  const sessions = [
+    session({ id: "a" }),
+    session({ id: "b" }),
+    session({ id: "c" }),
+  ];
+  const empty = new Set<string>();
+
+  it("floats pinned sessions to the top, stable within each group", () => {
+    const out = arrangeSessions(sessions, new Set(["c"]), empty, false);
+    expect(out.map((s) => s.id)).toEqual(["c", "a", "b"]);
+  });
+
+  it("keeps the original order when nothing is pinned", () => {
+    expect(
+      arrangeSessions(sessions, empty, empty, false).map((s) => s.id),
+    ).toEqual(["a", "b", "c"]);
+  });
+
+  it("hides dismissed sessions, and reveals them when showDismissed is set", () => {
+    const dismissed = new Set(["b"]);
+    expect(
+      arrangeSessions(sessions, empty, dismissed, false).map((s) => s.id),
+    ).toEqual(["a", "c"]);
+    // Restorable: with showDismissed the dismissed session is back in the list.
+    expect(
+      arrangeSessions(sessions, empty, dismissed, true).map((s) => s.id),
+    ).toEqual(["a", "b", "c"]);
+  });
+
+  it("does not mutate the input array", () => {
+    const input = [...sessions];
+    arrangeSessions(input, new Set(["c"]), empty, false);
+    expect(input.map((s) => s.id)).toEqual(["a", "b", "c"]);
   });
 });

@@ -36,3 +36,20 @@ export function filterSessions(
     resolveLabel(session, sessionTitles[session.id]).toLowerCase().includes(q),
   );
 }
+
+/**
+ * Apply the sidebar's view preferences (#169): hide dismissed sessions (unless
+ * `showDismissed` reveals them) and float pinned sessions to the top. Order within
+ * each group is preserved (stable), so this composes after `filterSessions`. Pure
+ * — does not mutate its input.
+ */
+export function arrangeSessions(
+  sessions: Session[],
+  pinned: ReadonlySet<string>,
+  dismissed: ReadonlySet<string>,
+  showDismissed: boolean,
+): Session[] {
+  return sessions
+    .filter((s) => showDismissed || !dismissed.has(s.id))
+    .sort((a, b) => Number(pinned.has(b.id)) - Number(pinned.has(a.id)));
+}
