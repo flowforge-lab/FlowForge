@@ -82,18 +82,27 @@ export const useModelConfigStore = create<ModelConfigState>()(
         }
       },
 
+      // Switching kind selects the seeded connection of that kind as active —
+      // it does NOT push the current connection's baseUrl/model into the new
+      // kind. Mutating in place leaked the prior provider's model name across
+      // kinds (e.g. candle-vLLM's "Qwen3-4B-Instruct-2507" showing under
+      // Ollama); flipping the active connection keeps each one's own config.
       setKind: async (kind) => {
         const { provider } = get();
         if (!provider || provider.kind === kind) return;
         set({ saving: true, error: null });
         try {
-          const stored = await ipc.setProviderConfig(
-            kind,
-            provider.baseUrl,
-            provider.model,
-          );
-          // The active connection's model list can differ per kind.
-          const models = await ipc.listModels();
+          const registry = await ipc.getProviderRegistry();
+          const target = registry.connections.find((c) => c.kind === kind);
+          if (!target) {
+            throw new Error(`No ${kind} connection is configured.`);
+          }
+          await ipc.setActiveConnection(target.id);
+          // Pull the now-active connection's own config + model list.
+          const [stored, models] = await Promise.all([
+            ipc.getProviderConfig(),
+            ipc.listModels(),
+          ]);
           set({ provider: stored, models, saving: false });
         } catch (err) {
           set({

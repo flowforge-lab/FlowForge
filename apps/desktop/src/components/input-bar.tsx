@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef } from "react";
-import { ArrowUp, Square } from "lucide-react";
+import { ArrowUp, Loader2, Square } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { ipc } from "@/lib/ipc";
 import { useChatStore } from "@/store/chat";
@@ -63,6 +63,16 @@ export function InputBar({
   const streaming = useChatStore((s) =>
     targetSessionId ? Boolean(s.streamingBySession[targetSessionId]) : false,
   );
+  // The gap between hitting send and the first streamed token: the turn is
+  // in flight on the backend but nothing renders yet. Derive it from the
+  // existing timing/streaming maps (turn started, no tokens) so the send
+  // button can show a spinner instead of looking idle.
+  const pending = useChatStore((s) =>
+    targetSessionId
+      ? Boolean(s.turnStartBySession[targetSessionId]) &&
+        !s.streamingBySession[targetSessionId]
+      : false,
+  );
   const send = useChatStore((s) => s.send);
   const cancelTurn = useChatStore((s) => s.cancelTurn);
   const sendMessageKey = usePrefsStore((s) => s.sendMessageKey);
@@ -117,7 +127,7 @@ export function InputBar({
 
   function submit() {
     const content = value.trim();
-    if (!content || streaming || !targetSessionId) return;
+    if (!content || streaming || pending || !targetSessionId) return;
     setText("");
     // Collapse the box back to one line (it may have grown for a resend draft).
     if (textareaRef.current) textareaRef.current.style.height = "auto";
@@ -167,6 +177,16 @@ export function InputBar({
             title="Stop (Esc)"
           >
             <Square className="size-3.5" />
+          </Button>
+        ) : pending ? (
+          <Button
+            size="icon"
+            className="size-8 shrink-0 rounded-lg"
+            disabled
+            title="Sending…"
+            aria-label="Sending"
+          >
+            <Loader2 className="size-4 animate-spin" />
           </Button>
         ) : (
           <Button

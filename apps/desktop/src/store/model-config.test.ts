@@ -72,4 +72,24 @@ describe("model-config provider load (mock IPC)", () => {
     await useModelConfigStore.getState().setKind("ollama");
     expect(useModelConfigStore.getState().provider?.kind).toBe("ollama");
   });
+
+  it("switching kind keeps each connection's own model (no spillover)", async () => {
+    const { load, setKind } = useModelConfigStore.getState();
+    await load();
+    // Normalize to candle-vLLM regardless of prior test order.
+    if (useModelConfigStore.getState().provider?.kind !== "candleVllm") {
+      await setKind("candleVllm");
+    }
+    expect(useModelConfigStore.getState().provider?.model).toBe(
+      "Qwen3-4B-Instruct-2507",
+    );
+
+    await setKind("ollama");
+    const s = useModelConfigStore.getState();
+    expect(s.provider?.kind).toBe("ollama");
+    // The Ollama connection's own model — not the candle model carried over.
+    expect(s.provider?.model).toBe("llama3.2");
+    expect(s.provider?.model).not.toBe("Qwen3-4B-Instruct-2507");
+    expect(s.models).toContain("llama3.2");
+  });
 });
