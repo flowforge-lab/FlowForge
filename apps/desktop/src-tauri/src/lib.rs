@@ -10,10 +10,10 @@ mod web_search;
 use async_trait::async_trait;
 use ff_agent::{run_turn, AgentEvent, Approver, CancelToken, ToolContext};
 use ff_core::events::{
-    ApprovalSafety, EvolveCostEstimate, IntentionSignal, McpStatusChangedEvent, SkillActivated,
-    SkillCompleted, SkillEvolveApprovalRequestEvent, SkillInstallApprovalRequestEvent,
-    SkillsChangedEvent, TokenEvent, ToolApprovalRequestEvent, ToolAskRequestEvent, ToolCallEvent,
-    ToolResultEvent, TurnDoneEvent, TurnErrorEvent,
+    ApprovalSafety, EvolveCostEstimate, IntentionSignal, McpStatusChangedEvent, ReasoningEvent,
+    SkillActivated, SkillCompleted, SkillEvolveApprovalRequestEvent,
+    SkillInstallApprovalRequestEvent, SkillsChangedEvent, TokenEvent, ToolApprovalRequestEvent,
+    ToolAskRequestEvent, ToolCallEvent, ToolResultEvent, TurnDoneEvent, TurnErrorEvent,
 };
 use ff_core::{
     McpServerConfig, McpServerStatus, MemoryFileInfo, MemoryFileKind, MemoryOverview, Message,
@@ -333,6 +333,7 @@ fn send_message(
         let metrics = std::sync::Arc::new(std::sync::Mutex::new(TurnMetrics::default()));
         let metrics_for_events = metrics.clone();
 
+        let thinking = state.provider_config().thinking;
         let result = run_turn(
             provider.as_ref(),
             &state.store,
@@ -340,6 +341,7 @@ fn send_message(
             &sid,
             &model,
             Some(system_prompt.as_str()),
+            thinking,
             cancel,
             |event| match event {
                 AgentEvent::Token { message_id, delta } => {
@@ -350,6 +352,19 @@ fn send_message(
                     let _ = app.emit(
                         "turn:token",
                         TokenEvent {
+                            session_id: sid.clone(),
+                            message_id,
+                            delta,
+                        },
+                    );
+                }
+                AgentEvent::Reasoning { message_id, delta } => {
+                    if let Ok(mut m) = metrics_for_events.lock() {
+                        m.note_turn(&message_id);
+                    }
+                    let _ = app.emit(
+                        "turn:reasoning",
+                        ReasoningEvent {
                             session_id: sid.clone(),
                             message_id,
                             delta,
@@ -487,6 +502,7 @@ fn set_provider_config(
     kind: ProviderKind,
     base_url: Option<String>,
     model: String,
+    thinking: bool,
 ) -> ProviderConfig {
     let current = state.provider_config();
     let config = ProviderConfig {
@@ -496,6 +512,7 @@ fn set_provider_config(
         model,
         // Secrets are a later phase; preserve whatever the backend already knows.
         has_key: current.has_key,
+        thinking,
     };
     state.set_provider_config(config.clone());
     config

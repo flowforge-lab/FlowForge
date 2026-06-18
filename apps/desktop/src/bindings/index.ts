@@ -14,6 +14,7 @@ export type { SearchConfig } from "./SearchConfig";
 export type { SearchBackend } from "./SearchBackend";
 export type { SessionStatus } from "./SessionStatus";
 export type { TokenEvent } from "./TokenEvent";
+export type { ReasoningEvent } from "./ReasoningEvent";
 export type { ToolApprovalRequestEvent } from "./ToolApprovalRequestEvent";
 export type { ToolAskRequestEvent } from "./ToolAskRequestEvent";
 export type { ApprovalSafety } from "./ApprovalSafety";

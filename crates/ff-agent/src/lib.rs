@@ -35,6 +35,10 @@ pub enum AgentEvent {
         message_id: String,
         delta: String,
     },
+    Reasoning {
+        message_id: String,
+        delta: String,
+    },
     ToolCallStarted {
         message_id: String,
         call_id: String,
@@ -180,6 +184,9 @@ struct CallBuf {
 /// requests until it produces a plain text answer (or the iteration cap is hit).
 /// `on_event` is called synchronously as the turn progresses. The final assistant
 /// message is persisted and returned.
+///
+/// When `enable_reasoning` is true, provider reasoning streams are requested and
+/// emitted as [`AgentEvent::Reasoning`] (not persisted in message content).
 #[allow(clippy::too_many_arguments)]
 pub async fn run_turn(
     provider: &dyn Provider,
@@ -190,6 +197,7 @@ pub async fn run_turn(
     // Optional system prompt prepended to every request this turn (skills + persona
     // + ambient context). Built by the host via `build_system_prompt`.
     system_prompt: Option<&str>,
+    enable_reasoning: bool,
     cancel: CancelToken,
     mut on_event: impl FnMut(AgentEvent),
 ) -> Result<Message, AgentError> {
@@ -221,6 +229,7 @@ pub async fn run_turn(
             model: model.to_string(),
             messages,
             tools: tool_schemas.clone(),
+            thinking: enable_reasoning,
         };
 
         // Reserve the assistant message id up front so the frontend can route tokens.
@@ -246,6 +255,12 @@ pub async fn run_turn(
             }
             match item {
                 Ok(chunk) => {
+                    if enable_reasoning && !chunk.reasoning_delta.is_empty() {
+                        on_event(AgentEvent::Reasoning {
+                            message_id: message_id.clone(),
+                            delta: chunk.reasoning_delta,
+                        });
+                    }
                     if !chunk.delta.is_empty() {
                         acc.push_str(&chunk.delta);
                         on_event(AgentEvent::Token {
@@ -602,6 +617,7 @@ mod tests {
             &s.id,
             "mock",
             None,
+            false,
             CancelToken::new(),
             |ev| match ev {
                 AgentEvent::Token { delta, .. } => tokens.push_str(&delta),
@@ -640,6 +656,7 @@ mod tests {
             &s.id,
             "mock",
             None,
+            false,
             CancelToken::new(),
             |ev| match ev {
                 AgentEvent::ToolCallStarted { name, .. } => {
@@ -653,6 +670,7 @@ mod tests {
                     assert!(result.contains("wired"));
                 }
                 AgentEvent::Token { delta, .. } => final_text.push_str(&delta),
+                AgentEvent::Reasoning { .. } => {}
                 AgentEvent::Error { message } => panic!("error: {message}"),
                 AgentEvent::Done { .. } => {}
             },
@@ -699,6 +717,7 @@ mod tests {
             &s.id,
             "mock",
             None,
+            false,
             CancelToken::new(),
             |ev| match ev {
                 AgentEvent::ToolCallStarted { name, .. } => started_name = name,
@@ -709,6 +728,7 @@ mod tests {
                     result = r;
                 }
                 AgentEvent::Token { delta, .. } => final_text.push_str(&delta),
+                AgentEvent::Reasoning { .. } => {}
                 AgentEvent::Error { message } => panic!("error: {message}"),
                 AgentEvent::Done { .. } => {}
             },
@@ -753,6 +773,7 @@ mod tests {
             &s.id,
             "mock",
             None,
+            false,
             CancelToken::new(),
             |ev| {
                 if let AgentEvent::ToolCallFinished { result: r, .. } = ev {
@@ -818,6 +839,7 @@ mod tests {
             &s.id,
             "mock",
             None,
+            false,
             cancel,
             |_| {},
         )
@@ -906,6 +928,7 @@ mod tests {
             &s.id,
             "mock",
             None,
+            false,
             CancelToken::new(),
             |ev| {
                 if let AgentEvent::ToolCallFinished {
@@ -950,6 +973,7 @@ mod tests {
             &s.id,
             "mock",
             None,
+            false,
             CancelToken::new(),
             |ev| {
                 if let AgentEvent::ToolCallFinished { success, .. } = ev {
@@ -1019,6 +1043,7 @@ mod tests {
             &s.id,
             "mock",
             Some(&system),
+            false,
             CancelToken::new(),
             |_| {},
         )

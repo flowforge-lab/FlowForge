@@ -63,6 +63,10 @@ struct Delta {
     #[serde(default)]
     content: Option<String>,
     #[serde(default)]
+    reasoning_content: Option<String>,
+    #[serde(default)]
+    reasoning: Option<String>,
+    #[serde(default)]
     tool_calls: Vec<StreamToolCall>,
 }
 
@@ -116,6 +120,11 @@ fn parse_sse_line(line: &[u8]) -> Option<Result<Chunk, LlmError>> {
             let chunk = match parsed.choices.into_iter().next() {
                 Some(c) => Chunk {
                     delta: c.delta.content.unwrap_or_default(),
+                    reasoning_delta: c
+                        .delta
+                        .reasoning_content
+                        .or(c.delta.reasoning)
+                        .unwrap_or_default(),
                     tool_calls: c
                         .delta
                         .tool_calls

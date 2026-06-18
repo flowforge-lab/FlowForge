@@ -14,6 +14,7 @@ import type {
   SearchBackend,
   Session,
   TokenEvent,
+  ReasoningEvent,
   TurnDoneEvent,
   TurnErrorEvent,
   IntentionSignal,
@@ -75,6 +76,9 @@ export function greet(name: string): string {
 | --- | --- |
 | Headings | done |
 | Code blocks | done |`;
+
+const MOCK_REASONING =
+  "Let me scan the README for FlowForge references before suggesting an edit.";
 
 // Canned installed skills so the command palette skill source (#11/#16) is
 // exercisable offline. `active`/`score` are placeholders — the methods below
@@ -323,6 +327,7 @@ export class MockIpc implements FfIpc {
         displayName: "candle-vLLM",
         model: "Qwen3-4B-Instruct-2507",
         hasKey: false,
+        thinking: true,
       },
       {
         id: "ollama",
@@ -330,6 +335,7 @@ export class MockIpc implements FfIpc {
         displayName: "Ollama",
         model: "llama3.2",
         hasKey: false,
+        thinking: true,
       },
     ],
   };
@@ -356,6 +362,7 @@ export class MockIpc implements FfIpc {
   private scheduledTasks: ScheduledTask[] = initialScheduledTasks();
 
   private tokenListeners = new Set<Listener<TokenEvent>>();
+  private reasoningListeners = new Set<Listener<ReasoningEvent>>();
   private doneListeners = new Set<Listener<TurnDoneEvent>>();
   private errorListeners = new Set<Listener<TurnErrorEvent>>();
   private intentionListeners = new Set<Listener<IntentionSignal>>();
@@ -492,6 +499,9 @@ export class MockIpc implements FfIpc {
   onToken(cb: Listener<TokenEvent>): Promise<Unlisten> {
     return this.subscribe(this.tokenListeners, cb);
   }
+  onReasoning(cb: Listener<ReasoningEvent>): Promise<Unlisten> {
+    return this.subscribe(this.reasoningListeners, cb);
+  }
   onTurnDone(cb: Listener<TurnDoneEvent>): Promise<Unlisten> {
     return this.subscribe(this.doneListeners, cb);
   }
@@ -627,6 +637,7 @@ export class MockIpc implements FfIpc {
       baseUrl: c.baseUrl,
       model: c.model,
       hasKey: c.hasKey,
+      thinking: c.thinking,
     };
   }
 
@@ -634,12 +645,14 @@ export class MockIpc implements FfIpc {
     kind: ProviderKind,
     baseUrl: string | undefined,
     model: string,
+    thinking: boolean,
   ): Promise<ProviderConfig> {
     const trimmed = baseUrl?.trim();
     const c = this.activeConnection();
     c.kind = kind;
     c.baseUrl = trimmed ? trimmed : undefined;
     c.model = model;
+    c.thinking = thinking;
     // Secrets are a later phase; the mock never has a key.
     c.hasKey = false;
     return {
@@ -647,6 +660,7 @@ export class MockIpc implements FfIpc {
       baseUrl: c.baseUrl,
       model: c.model,
       hasKey: c.hasKey,
+      thinking: c.thinking,
     };
   }
 
@@ -1165,6 +1179,41 @@ export class MockIpc implements FfIpc {
   }
 
   private streamWords(sessionId: string, turn: ActiveTurn): void {
+    const thinking = this.activeConnection().thinking;
+    if (thinking) {
+      this.streamReasoning(sessionId, turn, () =>
+        this.streamAnswer(sessionId, turn),
+      );
+    } else {
+      this.streamAnswer(sessionId, turn);
+    }
+  }
+
+  private streamReasoning(
+    sessionId: string,
+    turn: ActiveTurn,
+    next: () => void,
+  ): void {
+    const words = MOCK_REASONING.split(" ");
+    let i = 0;
+    const timer = setInterval(() => {
+      if (i >= words.length) {
+        clearInterval(timer);
+        next();
+        return;
+      }
+      const delta = (i === 0 ? "" : " ") + words[i];
+      i += 1;
+      this.emit(this.reasoningListeners, {
+        sessionId,
+        messageId: turn.messageId,
+        delta,
+      });
+    }, TOKEN_INTERVAL_MS);
+    turn.timers.push(timer);
+  }
+
+  private streamAnswer(sessionId: string, turn: ActiveTurn): void {
     const stored = this.messages
       .get(sessionId)
       ?.find((m) => m.id === turn.messageId);

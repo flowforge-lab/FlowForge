@@ -4,6 +4,7 @@ import { useChatStore } from "@/store/chat";
 import type { ToolStep } from "@/store/chat";
 import { ToolStepBlock } from "@/components/tool-step";
 import { StepGroup } from "@/components/step-group";
+import { ThinkingBlock } from "@/components/thinking-block";
 import { Markdown } from "@/components/markdown";
 import { MessageActions } from "@/components/message-actions";
 import type { Message } from "@/bindings";
@@ -15,6 +16,7 @@ function MessageRowImpl({
   streaming,
   toolSteps,
   turnStartMs,
+  reasoning,
   respondApproval,
   respondAsk,
 }: {
@@ -22,6 +24,7 @@ function MessageRowImpl({
   streaming: boolean;
   toolSteps: ToolStep[];
   turnStartMs?: number | null;
+  reasoning: string;
   respondApproval: (
     sessionId: string,
     messageId: string,
@@ -89,6 +92,11 @@ function MessageRowImpl({
           )}
         </div>
       )}
+      <ThinkingBlock
+        reasoning={reasoning}
+        streaming={streaming}
+        hasAnswer={message.content.length > 0}
+      />
       {message.content && (
         <div className="group relative max-w-[80%]">
           <div
@@ -127,6 +135,7 @@ export function ChatView({ sessionId }: { sessionId?: string } = {}) {
   const toolStepsByMessage = useChatStore((s) => s.toolStepsByMessage);
   const turnStartByMessage = useChatStore((s) => s.turnStartByMessage);
   const turnStartBySession = useChatStore((s) => s.turnStartBySession);
+  const reasoningByMessage = useChatStore((s) => s.reasoningByMessage);
   const respondApproval = useChatStore((s) => s.respondApproval);
   const respondAsk = useChatStore((s) => s.respondAsk);
 
@@ -139,7 +148,7 @@ export function ChatView({ sessionId }: { sessionId?: string } = {}) {
     if (el && pinnedToBottom.current) {
       el.scrollTop = el.scrollHeight;
     }
-  }, [messages, toolStepsByMessage]);
+  }, [messages, toolStepsByMessage, reasoningByMessage]);
 
   useEffect(() => {
     pinnedToBottom.current = true;
@@ -184,6 +193,7 @@ export function ChatView({ sessionId }: { sessionId?: string } = {}) {
             turnStartMs={
               turnStartByMessage[m.id] ?? turnStartBySession[m.sessionId]
             }
+            reasoning={reasoningByMessage[m.id] ?? ""}
             respondApproval={respondApproval}
             respondAsk={respondAsk}
           />

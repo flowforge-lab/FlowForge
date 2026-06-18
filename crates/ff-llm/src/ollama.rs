@@ -37,6 +37,8 @@ struct OllamaChunk {
 struct OllamaMessage {
     #[serde(default)]
     content: String,
+    #[serde(default)]
+    thinking: String,
 }
 
 #[derive(Deserialize)]
@@ -57,6 +59,7 @@ impl Provider for OllamaProvider {
             "model": req.model,
             "messages": req.messages,
             "stream": true,
+            "think": req.thinking,
         });
 
         let resp = self
@@ -85,6 +88,7 @@ impl Provider for OllamaProvider {
                         match serde_json::from_slice::<OllamaChunk>(line) {
                             Ok(c) => chunks.push(Ok(Chunk {
                                 delta: c.message.content,
+                                reasoning_delta: c.message.thinking,
                                 done: c.done,
                                 ..Chunk::default()
                             })),

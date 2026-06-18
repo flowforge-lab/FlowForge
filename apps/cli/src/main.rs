@@ -162,6 +162,7 @@ async fn run(prompt: String, json: bool, approval_mode: ApprovalMode) -> ExitCod
             &session.id,
             &model,
             Some(system_prompt.as_str()),
+            true,
             cancel,
             |event| {
                 json_events::emit_line(&event);
@@ -176,6 +177,7 @@ async fn run(prompt: String, json: bool, approval_mode: ApprovalMode) -> ExitCod
             &session.id,
             &model,
             Some(system_prompt.as_str()),
+            true,
             cancel,
             render_event_text,
         )
@@ -212,6 +214,7 @@ fn render_event_text(event: AgentEvent) {
             }
         }
         AgentEvent::Done { .. } => {}
+        AgentEvent::Reasoning { .. } => {}
         AgentEvent::Error { message } => {
             eprintln!("\n[error] {message}");
         }
@@ -358,6 +361,7 @@ mod tests {
             &session.id,
             "mock",
             None,
+            false,
             CancelToken::new(),
             |event| {
                 json_events::emit_line_to(&event, &mut stdout).expect("write JSON event");

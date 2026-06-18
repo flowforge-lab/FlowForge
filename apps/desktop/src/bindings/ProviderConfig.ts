@@ -19,4 +19,8 @@ model: string,
  * `false` in Phase 1 — the field keeps the contract stable for when hosted
  * providers and secrets land.
  */
-hasKey: boolean, };
+hasKey: boolean, 
+/**
+ * When true, request and surface model reasoning/thinking streams (#181).
+ */
+thinking: boolean, };

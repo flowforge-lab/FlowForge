@@ -30,4 +30,8 @@ baseUrl?: string, model: string,
 /**
  * Whether an API key is stored for this connection (OS keychain).
  */
-hasKey: boolean, };
+hasKey: boolean, 
+/**
+ * When true, request and surface model reasoning/thinking streams (#181).
+ */
+thinking: boolean, };

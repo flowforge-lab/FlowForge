@@ -10,6 +10,7 @@ import type {
   Message,
   Session,
   TokenEvent,
+  ReasoningEvent,
   TurnDoneEvent,
   TurnErrorEvent,
   ToolApprovalRequestEvent,
@@ -73,6 +74,8 @@ interface ChatState {
   turnStartByMessage: Record<string, number>;
   /** assistant messageId -> tool steps emitted during that turn (in order). */
   toolStepsByMessage: Record<string, ToolStep[]>;
+  /** assistant messageId -> accumulated reasoning text (not persisted on Message). */
+  reasoningByMessage: Record<string, string>;
   /** Frontend-only custom titles (Session has no title field in the contract). */
   sessionTitles: Record<string, string>;
   /** Set when bootstrap() fails so the UI can show a clear error instead of a
@@ -110,6 +113,7 @@ interface ChatState {
 
   // Driven by backend events (wired once in lib/events.ts).
   applyToken: (e: TokenEvent) => void;
+  applyReasoning: (e: ReasoningEvent) => void;
   finishTurn: (e: TurnDoneEvent) => void;
   failTurn: (e: TurnErrorEvent) => void;
   applyToolCall: (e: ToolCallEvent) => void;
@@ -174,6 +178,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   turnStartBySession: {},
   turnStartByMessage: {},
   toolStepsByMessage: {},
+  reasoningByMessage: {},
   sessionTitles: loadTitles(),
   bootstrapError: null,
 
@@ -451,6 +456,39 @@ export const useChatStore = create<ChatState>((set, get) => ({
       return {
         messagesBySession: { ...s.messagesBySession, [e.sessionId]: next },
         ...streamingPatch(s, e.sessionId, e.messageId),
+      };
+    });
+  },
+
+  applyReasoning: (e) => {
+    set((s) => {
+      const prev = s.reasoningByMessage[e.messageId] ?? "";
+      const messages = s.messagesBySession[e.sessionId] ?? [];
+      const nextMessages = messages.some((m) => m.id === e.messageId)
+        ? messages
+        : [
+            ...messages,
+            {
+              id: e.messageId,
+              sessionId: e.sessionId,
+              role: "assistant" as const,
+              content: "",
+              createdAt: Date.now(),
+            },
+          ];
+      return {
+        messagesBySession: {
+          ...s.messagesBySession,
+          [e.sessionId]: nextMessages,
+        },
+        streamingBySession: {
+          ...s.streamingBySession,
+          [e.sessionId]: e.messageId,
+        },
+        reasoningByMessage: {
+          ...s.reasoningByMessage,
+          [e.messageId]: prev + e.delta,
+        },
       };
     });
   },

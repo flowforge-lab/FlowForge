@@ -66,6 +66,8 @@ pub struct ChatRequest {
     pub messages: Vec<ChatMessage>,
     /// OpenAI `tools` entries. Empty = a plain chat turn.
     pub tools: Vec<serde_json::Value>,
+    /// When true, request provider reasoning/thinking streams when supported (#181).
+    pub thinking: bool,
 }
 
 /// One incremental tool-call fragment within a stream. Servers may split a single
@@ -82,6 +84,7 @@ pub struct ToolCallDelta {
 #[derive(Debug, Clone, Default)]
 pub struct Chunk {
     pub delta: String,
+    pub reasoning_delta: String,
     pub tool_calls: Vec<ToolCallDelta>,
     pub done: bool,
 }
@@ -122,6 +125,7 @@ pub trait Provider: Send + Sync {
             model: model.to_string(),
             messages: vec![ChatMessage::text("user", "ok")],
             tools: Vec::new(),
+            thinking: false,
         };
         let mut stream = self.chat_stream(req).await?;
         // Draining ~32 decode steps is what it empirically takes for an idle
@@ -160,6 +164,7 @@ mod tests {
                     polled.fetch_add(1, Ordering::SeqCst);
                     let chunk = Chunk {
                         delta: "x".into(),
+                        reasoning_delta: String::new(),
                         tool_calls: vec![],
                         done: false,
                     };

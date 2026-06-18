@@ -16,17 +16,14 @@ describe("model-config reasoning controls", () => {
     localStorage.clear();
   });
 
-  it("defaults thinking on, medium effort, 150k threshold", () => {
+  it("defaults medium effort and 150k threshold", () => {
     const s = useModelConfigStore.getState();
-    expect(s.thinking).toBe(true);
     expect(s.effort).toBe("medium");
     expect(s.summarizationThreshold).toBe(150_000);
   });
 
-  it("updates the reasoning controls", () => {
-    useModelConfigStore.getState().setThinking(false);
+  it("updates the local reasoning controls", () => {
     useModelConfigStore.getState().setEffort("high");
-    expect(useModelConfigStore.getState().thinking).toBe(false);
     expect(useModelConfigStore.getState().effort).toBe("high");
   });
 
@@ -41,20 +38,24 @@ describe("model-config reasoning controls", () => {
     );
   });
 
-  it("resetModel restores reasoning defaults without touching provider", () => {
+  it("resetModel restores local defaults without touching provider", () => {
     useModelConfigStore.setState({
-      thinking: false,
       effort: "low",
       summarizationThreshold: 300_000,
-      provider: { kind: "ollama", model: "llama3.2", hasKey: false },
+      provider: {
+        kind: "ollama",
+        model: "llama3.2",
+        hasKey: false,
+        thinking: false,
+      },
     });
     useModelConfigStore.getState().resetModel();
     const s = useModelConfigStore.getState();
-    expect(s.thinking).toBe(true);
     expect(s.effort).toBe("medium");
     expect(s.summarizationThreshold).toBe(150_000);
     // Provider is backend-owned — reset leaves it alone.
     expect(s.provider?.kind).toBe("ollama");
+    expect(s.provider?.thinking).toBe(false);
   });
 });
 
@@ -64,6 +65,7 @@ describe("model-config provider load (mock IPC)", () => {
     const s = useModelConfigStore.getState();
     expect(s.provider?.kind).toBe("candleVllm");
     expect(s.provider?.model).toBeTruthy();
+    expect(s.provider?.thinking).toBe(true);
     expect(s.models.length).toBeGreaterThan(0);
   });
 
@@ -91,5 +93,13 @@ describe("model-config provider load (mock IPC)", () => {
     expect(s.provider?.model).toBe("llama3.2");
     expect(s.provider?.model).not.toBe("Qwen3-4B-Instruct-2507");
     expect(s.models).toContain("llama3.2");
+  });
+
+  it("persists the thinking toggle through IPC", async () => {
+    await useModelConfigStore.getState().load();
+    await useModelConfigStore.getState().setThinking(false);
+    expect(useModelConfigStore.getState().provider?.thinking).toBe(false);
+    await useModelConfigStore.getState().setThinking(true);
+    expect(useModelConfigStore.getState().provider?.thinking).toBe(true);
   });
 });

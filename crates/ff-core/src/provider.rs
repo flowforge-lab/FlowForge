@@ -9,6 +9,10 @@
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
+fn default_thinking() -> bool {
+    true
+}
+
 /// Which LLM backend FlowForge talks to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
@@ -57,6 +61,9 @@ pub struct ProviderConfig {
     /// `false` in Phase 1 — the field keeps the contract stable for when hosted
     /// providers and secrets land.
     pub has_key: bool,
+    /// When true, request and surface model reasoning/thinking streams (#181).
+    #[serde(default = "default_thinking")]
+    pub thinking: bool,
 }
 
 /// FlowForge's out-of-the-box default: local candle-vllm serving Qwen3-4B.
@@ -67,6 +74,7 @@ impl Default for ProviderConfig {
             base_url: None,
             model: "Qwen3-4B-Instruct-2507".to_string(),
             has_key: false,
+            thinking: true,
         }
     }
 }
@@ -112,6 +120,9 @@ pub struct ProviderConnection {
     pub model: String,
     /// Whether an API key is stored for this connection (OS keychain).
     pub has_key: bool,
+    /// When true, request and surface model reasoning/thinking streams (#181).
+    #[serde(default = "default_thinking")]
+    pub thinking: bool,
 }
 
 impl ProviderConnection {
@@ -244,6 +255,7 @@ impl Default for ProviderRegistry {
             base_url: None,
             model: "Qwen3-4B-Instruct-2507".to_string(),
             has_key: false,
+            thinking: true,
         };
         let ollama = ProviderConnection {
             id: "ollama".to_string(),
@@ -253,6 +265,7 @@ impl Default for ProviderRegistry {
             base_url: None,
             model: "llama3.2".to_string(),
             has_key: false,
+            thinking: true,
         };
         Self {
             active: candle.id.clone(),
@@ -324,6 +337,7 @@ mod tests {
             base_url: None,
             model: "m".to_string(),
             has_key: false,
+            thinking: true,
         }
     }
 
@@ -431,6 +445,7 @@ mod tests {
             base_url: None,
             model: "llama3.2".into(),
             has_key: false,
+            thinking: true,
         };
         assert_eq!(conn.resolved_base_url(), "http://localhost:11434");
         let overridden = ProviderConnection {
