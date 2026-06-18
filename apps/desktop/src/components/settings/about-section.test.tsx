@@ -50,4 +50,18 @@ describe("AboutSection", () => {
     click(link ?? null);
     expect(useSettingsStore.getState().activeSection).toBe("keyboard");
   });
+
+  it("Check for updates toasts FE-owned copy from the structured result", async () => {
+    render(<AboutSection />);
+    const btn = [...container.querySelectorAll("button")].find((el) =>
+      el.textContent?.includes("Check for updates"),
+    );
+    expect(btn).toBeDefined();
+    await act(async () => {
+      btn?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    expect(container.querySelector('[role="status"]')?.textContent).toContain(
+      "You're on the latest version.",
+    );
+  });
 });

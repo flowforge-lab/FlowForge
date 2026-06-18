@@ -5,6 +5,7 @@ import {
   ABOUT_BUG_REPORT_URL,
   ABOUT_SLACK_URL,
   APP_TAGLINE,
+  formatUpdateStatus,
   getAppVersion,
   openExternalUrl,
 } from "@/lib/about";
@@ -39,10 +40,11 @@ export function AboutSection() {
 
   const showToast = useCallback((message: string) => setToast(message), []);
 
+  // Runs an IPC action and toasts FE-owned copy built from its structured result.
   const runIpcAction = useCallback(
-    async (action: () => Promise<string>) => {
+    async <T,>(action: () => Promise<T>, format: (result: T) => string) => {
       try {
-        showToast(await action());
+        showToast(format(await action()));
       } catch (err) {
         showToast(err instanceof Error ? err.message : String(err));
       }
@@ -65,7 +67,9 @@ export function AboutSection() {
       <AboutGroup>
         <AboutRow
           label="Check for updates"
-          onClick={() => void runIpcAction(() => ipc.checkForUpdates())}
+          onClick={() =>
+            void runIpcAction(() => ipc.checkForUpdates(), formatUpdateStatus)
+          }
         />
         <AboutRow
           label="What's New"
@@ -84,11 +88,21 @@ export function AboutSection() {
       <AboutGroup title="Data">
         <AboutRow
           label="Export backup"
-          onClick={() => void runIpcAction(() => ipc.exportBackup())}
+          onClick={() =>
+            void runIpcAction(
+              () => ipc.exportBackup(),
+              (r) => `Backup exported to ${r.path}.`,
+            )
+          }
         />
         <AboutRow
           label="Restore from backup"
-          onClick={() => void runIpcAction(() => ipc.restoreBackup())}
+          onClick={() =>
+            void runIpcAction(
+              () => ipc.restoreBackup(),
+              (r) => `Backup restored from ${r.path}.`,
+            )
+          }
         />
       </AboutGroup>
 
