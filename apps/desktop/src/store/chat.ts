@@ -67,6 +67,10 @@ interface ChatState {
   messagesBySession: Record<string, Message[]>;
   /** sessionId -> assistant messageId currently streaming in that session. */
   streamingBySession: Record<string, string>;
+  /** sessionId -> wall-clock ms when the user sent the in-flight turn (#180). */
+  turnStartBySession: Record<string, number>;
+  /** assistant messageId -> wall-clock turn start (from send or first stream). */
+  turnStartByMessage: Record<string, number>;
   /** assistant messageId -> tool steps emitted during that turn (in order). */
   toolStepsByMessage: Record<string, ToolStep[]>;
   /** Frontend-only custom titles (Session has no title field in the contract). */
@@ -126,6 +130,34 @@ interface ChatState {
   ) => Promise<void>;
 }
 
+/** Wall-clock turn start when streaming begins (#180). */
+function streamingPatch(
+  s: Pick<
+    ChatState,
+    "streamingBySession" | "turnStartBySession" | "turnStartByMessage"
+  >,
+  sessionId: string,
+  messageId: string,
+) {
+  const wall = s.turnStartBySession[sessionId] ?? Date.now();
+  return {
+    streamingBySession: { ...s.streamingBySession, [sessionId]: messageId },
+    turnStartByMessage: {
+      ...s.turnStartByMessage,
+      [messageId]: s.turnStartByMessage[messageId] ?? wall,
+    },
+  };
+}
+
+function clearSessionTurnTiming(
+  s: Pick<ChatState, "streamingBySession" | "turnStartBySession">,
+  sessionId: string,
+) {
+  const { [sessionId]: _stream, ...streamingBySession } = s.streamingBySession;
+  const { [sessionId]: _start, ...turnStartBySession } = s.turnStartBySession;
+  return { streamingBySession, turnStartBySession };
+}
+
 const systemMessage = (sessionId: string, content: string): Message => ({
   id: crypto.randomUUID(),
   sessionId,
@@ -139,6 +171,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
   activeSessionId: null,
   messagesBySession: {},
   streamingBySession: {},
+  turnStartBySession: {},
+  turnStartByMessage: {},
   toolStepsByMessage: {},
   sessionTitles: loadTitles(),
   bootstrapError: null,
@@ -337,6 +371,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
         ...s.messagesBySession,
         [sessionId]: [...(s.messagesBySession[sessionId] ?? []), optimistic],
       },
+      turnStartBySession: { ...s.turnStartBySession, [sessionId]: Date.now() },
     }));
 
     try {
@@ -353,17 +388,21 @@ export const useChatStore = create<ChatState>((set, get) => ({
         ),
       }));
     } catch (err) {
-      set((s) => ({
-        messagesBySession: {
-          ...s.messagesBySession,
-          [sessionId]: [
-            ...(s.messagesBySession[sessionId] ?? []).filter(
-              (m) => m.id !== tempId,
-            ),
-            systemMessage(sessionId, `Failed to send: ${String(err)}`),
-          ],
-        },
-      }));
+      set((s) => {
+        const { [sessionId]: _, ...turnStartBySession } = s.turnStartBySession;
+        return {
+          turnStartBySession,
+          messagesBySession: {
+            ...s.messagesBySession,
+            [sessionId]: [
+              ...(s.messagesBySession[sessionId] ?? []).filter(
+                (m) => m.id !== tempId,
+              ),
+              systemMessage(sessionId, `Failed to send: ${String(err)}`),
+            ],
+          },
+        };
+      });
     }
   },
 
@@ -382,10 +421,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   cancelTurn: async (sessionId) => {
     if (!sessionId || !get().streamingBySession[sessionId]) return;
     await ipc.cancelTurn(sessionId);
-    set((s) => {
-      const { [sessionId]: _, ...rest } = s.streamingBySession;
-      return { streamingBySession: rest };
-    });
+    set((s) => clearSessionTurnTiming(s, sessionId));
   },
 
   cancelActiveTurn: async () => {
@@ -414,40 +450,31 @@ export const useChatStore = create<ChatState>((set, get) => ({
             ];
       return {
         messagesBySession: { ...s.messagesBySession, [e.sessionId]: next },
-        streamingBySession: {
-          ...s.streamingBySession,
-          [e.sessionId]: e.messageId,
-        },
+        ...streamingPatch(s, e.sessionId, e.messageId),
       };
     });
   },
 
   finishTurn: (e) => {
-    set((s) => {
-      const { [e.sessionId]: _, ...rest } = s.streamingBySession;
-      return {
-        streamingBySession: rest,
-        sessions: s.sessions.map((sess) =>
-          sess.id === e.sessionId ? { ...sess, updatedAt: Date.now() } : sess,
-        ),
-      };
-    });
+    set((s) => ({
+      ...clearSessionTurnTiming(s, e.sessionId),
+      sessions: s.sessions.map((sess) =>
+        sess.id === e.sessionId ? { ...sess, updatedAt: Date.now() } : sess,
+      ),
+    }));
   },
 
   failTurn: (e) => {
-    set((s) => {
-      const { [e.sessionId]: _, ...rest } = s.streamingBySession;
-      return {
-        streamingBySession: rest,
-        messagesBySession: {
-          ...s.messagesBySession,
-          [e.sessionId]: [
-            ...(s.messagesBySession[e.sessionId] ?? []),
-            systemMessage(e.sessionId, e.message),
-          ],
-        },
-      };
-    });
+    set((s) => ({
+      ...clearSessionTurnTiming(s, e.sessionId),
+      messagesBySession: {
+        ...s.messagesBySession,
+        [e.sessionId]: [
+          ...(s.messagesBySession[e.sessionId] ?? []),
+          systemMessage(e.sessionId, e.message),
+        ],
+      },
+    }));
   },
 
   applyToolCall: (e) => {
@@ -484,10 +511,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
           ...s.messagesBySession,
           [e.sessionId]: nextMessages,
         },
-        streamingBySession: {
-          ...s.streamingBySession,
-          [e.sessionId]: e.messageId,
-        },
+        ...streamingPatch(s, e.sessionId, e.messageId),
         toolStepsByMessage: {
           ...s.toolStepsByMessage,
           [e.messageId]: [...steps, step],

@@ -1,9 +1,16 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { ChevronRight, Loader2 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import type { ToolStep } from "@/store/chat";
 import { ToolStepBlock } from "@/components/tool-step";
-import { formatDuration, groupDurationMs, resolveGroupOpen } from "@/lib/steps";
+import {
+  formatDuration,
+  groupDurationMs,
+  liveElapsedMs,
+  resolveGroupOpen,
+  selectStepWindow,
+  STEP_WINDOW,
+} from "@/lib/steps";
 
 // Folds a turn's tool steps behind one "▸ N steps" header (Issue #17). Composes
 // ToolStepBlock unchanged — this only adds the turn-level fold + duration. The
@@ -13,11 +20,14 @@ import { formatDuration, groupDurationMs, resolveGroupOpen } from "@/lib/steps";
 export function StepGroup({
   steps,
   streaming,
+  turnStartMs,
   onRespond,
   onAnswer,
 }: {
   steps: ToolStep[];
   streaming: boolean;
+  /** Wall-clock turn start from send / first stream (#180). */
+  turnStartMs?: number | null;
   onRespond: (callId: string, approved: boolean) => void;
   onAnswer?: (callId: string, answer: string) => void;
 }) {
@@ -26,10 +36,29 @@ export function StepGroup({
   );
   // null = untouched (follow the turn); true/false = an explicit user choice.
   const [userOpen, setUserOpen] = useState<boolean | null>(null);
+  const [peekExpanded, setPeekExpanded] = useState(false);
+  const [now, setNow] = useState(() => Date.now());
   const open = resolveGroupOpen({ awaiting, userOpen, streaming });
+  const effectivePeekExpanded = streaming && peekExpanded;
 
-  const durationMs = groupDurationMs(steps);
-  const showDuration = !streaming && durationMs !== null;
+  useEffect(() => {
+    if (!streaming) return;
+    const id = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(id);
+  }, [streaming]);
+
+  const durationMs = streaming
+    ? liveElapsedMs(steps, now, turnStartMs)
+    : groupDurationMs(steps);
+  const showDuration = durationMs !== null;
+
+  const earlierCount = Math.max(0, steps.length - STEP_WINDOW);
+
+  const { visible } = selectStepWindow(steps, {
+    streaming,
+    awaiting,
+    peekExpanded: effectivePeekExpanded,
+  });
 
   return (
     <div className="w-full font-mono text-xs">
@@ -48,18 +77,30 @@ export function StepGroup({
         {streaming && (
           <Loader2 className="size-3.5 shrink-0 animate-spin text-muted-foreground" />
         )}
-        <span className="font-medium text-foreground">
+        <span className="min-w-0 flex-1 font-medium text-foreground">
           {steps.length} {steps.length === 1 ? "step" : "steps"}
+          {showDuration && (
+            <span className="font-normal text-muted-foreground/60">
+              {" · "}
+              {formatDuration(durationMs)}
+            </span>
+          )}
         </span>
-        {showDuration && (
-          <span className="ml-auto tabular-nums text-muted-foreground/60">
-            {formatDuration(durationMs)}
-          </span>
-        )}
       </button>
       {open && (
         <div className="mt-1.5 flex flex-col gap-1.5 border-l border-border/60 pl-2.5">
-          {steps.map((step) => (
+          {earlierCount > 0 && streaming && !awaiting && (
+            <button
+              type="button"
+              onClick={() => setPeekExpanded((v) => !v)}
+              className="rounded-md px-2.5 py-1 text-left text-muted-foreground/70 transition-colors hover:text-foreground"
+            >
+              {effectivePeekExpanded
+                ? `Show last ${STEP_WINDOW} steps`
+                : `+${earlierCount} earlier ${earlierCount === 1 ? "step" : "steps"}`}
+            </button>
+          )}
+          {visible.map((step) => (
             <ToolStepBlock
               key={step.callId}
               step={step}

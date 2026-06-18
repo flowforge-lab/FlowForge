@@ -1,5 +1,12 @@
 import { describe, it, expect } from "vitest";
-import { formatDuration, groupDurationMs, resolveGroupOpen } from "@/lib/steps";
+import {
+  formatDuration,
+  groupDurationMs,
+  liveElapsedMs,
+  resolveGroupOpen,
+  selectStepWindow,
+  turnStartMs,
+} from "@/lib/steps";
 import type { ToolStep } from "@/store/chat";
 
 function step(partial: Partial<ToolStep>): ToolStep {
@@ -40,6 +47,81 @@ describe("formatDuration", () => {
     expect(formatDuration(63000)).toBe("1m 3s"));
   it("drops the seconds on a whole minute", () =>
     expect(formatDuration(120000)).toBe("2m"));
+});
+
+describe("turnStartMs / liveElapsedMs", () => {
+  it("turnStartMs is the earliest startedAt", () => {
+    expect(turnStartMs([])).toBeNull();
+    expect(
+      turnStartMs([step({ startedAt: 2000 }), step({ startedAt: 1000 })]),
+    ).toBe(1000);
+  });
+
+  it("liveElapsedMs ticks from the first start to now", () => {
+    expect(liveElapsedMs([step({ startedAt: 1000 })], 4500)).toBe(3500);
+  });
+
+  it("liveElapsedMs uses wall-clock send time before the first tool:call", () => {
+    expect(liveElapsedMs([], 5000, 1000)).toBe(4000);
+  });
+
+  it("liveElapsedMs uses the earliest of wall-clock and step start", () => {
+    expect(liveElapsedMs([step({ startedAt: 3000 })], 5000, 1000)).toBe(4000);
+    expect(liveElapsedMs([step({ startedAt: 1500 })], 5000, 2000)).toBe(3500);
+  });
+});
+
+describe("selectStepWindow", () => {
+  const many = Array.from({ length: 5 }, (_, i) =>
+    step({ callId: `c${i}`, startedAt: i * 100 }),
+  );
+
+  it("shows only the last 3 while streaming", () => {
+    const { visible, hiddenCount } = selectStepWindow(many, {
+      streaming: true,
+      awaiting: false,
+      peekExpanded: false,
+    });
+    expect(visible.map((s) => s.callId)).toEqual(["c2", "c3", "c4"]);
+    expect(hiddenCount).toBe(2);
+  });
+
+  it("shows all steps when peek-expanded, settled, or ≤ window", () => {
+    expect(
+      selectStepWindow(many, {
+        streaming: true,
+        awaiting: false,
+        peekExpanded: true,
+      }).hiddenCount,
+    ).toBe(0);
+    expect(
+      selectStepWindow(many, {
+        streaming: false,
+        awaiting: false,
+        peekExpanded: false,
+      }).visible.length,
+    ).toBe(5);
+    expect(
+      selectStepWindow(many.slice(0, 2), {
+        streaming: true,
+        awaiting: false,
+        peekExpanded: false,
+      }).hiddenCount,
+    ).toBe(0);
+  });
+
+  it("shows all steps while awaiting approval or answer", () => {
+    const awaiting = many.map((s, i) =>
+      i === 4 ? { ...s, status: "awaiting-approval" as const } : s,
+    );
+    const { visible, hiddenCount } = selectStepWindow(awaiting, {
+      streaming: true,
+      awaiting: true,
+      peekExpanded: false,
+    });
+    expect(visible.length).toBe(5);
+    expect(hiddenCount).toBe(0);
+  });
 });
 
 describe("resolveGroupOpen", () => {
