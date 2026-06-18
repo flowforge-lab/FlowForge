@@ -9,7 +9,7 @@ mod approver;
 mod host;
 mod json_events;
 
-use std::io::Write;
+use std::io::{BufRead, Write};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
@@ -19,11 +19,12 @@ use ff_core::Role;
 use crate::approver::{ApprovalMode, CliApprover};
 
 /// FlowForge on the command line: run an agent turn, inspect skills, no GUI.
+/// With no subcommand, opens an interactive REPL (multi-turn chat).
 #[derive(Parser)]
 #[command(name = "flowforge", version, about)]
 struct Cli {
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand)]
@@ -32,6 +33,19 @@ enum Command {
     Run {
         /// The instruction for the agent (quote multi-word prompts).
         prompt: String,
+        /// Emit each event as one JSON line to stdout; no human-only text is printed.
+        #[arg(long)]
+        json: bool,
+        /// Auto-approve write and dangerous tool calls without prompting.
+        #[arg(long, conflicts_with = "deny")]
+        yes: bool,
+        /// Auto-deny write and dangerous tool calls without prompting.
+        #[arg(long, conflicts_with = "yes")]
+        deny: bool,
+    },
+    /// Open an interactive REPL (multi-turn, in-process session). Default when
+    /// no subcommand is given. Type `exit` or press Ctrl-D to quit.
+    Chat {
         /// Emit each event as one JSON line to stdout; no human-only text is printed.
         #[arg(long)]
         json: bool,
@@ -58,13 +72,18 @@ enum SkillsCommand {
 #[tokio::main]
 async fn main() -> ExitCode {
     let cli = Cli::parse();
-    match cli.command {
+    match cli.command.unwrap_or(Command::Chat {
+        json: false,
+        yes: false,
+        deny: false,
+    }) {
         Command::Run {
             prompt,
             json,
             yes,
             deny,
         } => run(prompt, json, approval_mode(yes, deny)).await,
+        Command::Chat { json, yes, deny } => chat(json, approval_mode(yes, deny)).await,
         Command::Skills { command } => match command {
             SkillsCommand::List => skills_list(),
         },
@@ -98,16 +117,11 @@ fn approval_mode(yes: bool, deny: bool) -> ApprovalMode {
     }
 }
 
-async fn run(prompt: String, json: bool, approval_mode: ApprovalMode) -> ExitCode {
-    let (provider, model) = host::load_provider();
-    let skills = host::load_skills();
-    let workspace = host::workspace_root();
-    let store = ff_session::SessionStore::new();
+/// Shared durable-memory setup (RFC 0006). Builds the store + FTS5 index, does a
+/// full reindex from disk, and registers the three memory tools. Best-effort: an
+/// index failure leaves the ambient block working but skips the recall tools.
+fn build_registry_with_memory() -> (ff_tools::ToolRegistry, std::sync::Arc<ff_memory::Memory>) {
     let mut registry = ff_tools::ToolRegistry::with_defaults();
-    // Durable-memory recall (RFC 0006). One-shot process: build the store + index,
-    // do a full reindex from disk, and register the tools. No watcher (nothing
-    // long-lived to keep current). Best-effort: an index failure leaves the
-    // ambient block working but skips the recall tools.
     let memory_store = std::sync::Arc::new(ff_memory::Memory::with_default_root(
         ff_memory::MemoryConfig::default(),
     ));
@@ -126,6 +140,15 @@ async fn run(prompt: String, json: bool, approval_mode: ApprovalMode) -> ExitCod
             index.clone(),
         )));
     }
+    (registry, memory_store)
+}
+
+async fn run(prompt: String, json: bool, approval_mode: ApprovalMode) -> ExitCode {
+    let (provider, model) = host::load_provider();
+    let skills = host::load_skills();
+    let workspace = host::workspace_root();
+    let store = ff_session::SessionStore::new();
+    let (registry, memory_store) = build_registry_with_memory();
     let approver = CliApprover::new(approval_mode);
 
     let session = store.create_session(None);
@@ -193,6 +216,151 @@ async fn run(prompt: String, json: bool, approval_mode: ApprovalMode) -> ExitCod
     }
 }
 
+/// Interactive REPL (multi-turn, one in-process session). Keeps a single
+/// [`ff_session::SessionStore`] alive for the life of the process so each turn
+/// sees the full accumulated history. Loops until EOF, `exit`, or `quit`.
+async fn chat(json: bool, approval_mode: ApprovalMode) -> ExitCode {
+    let (provider, model) = host::load_provider();
+    let skills = host::load_skills();
+    let workspace = host::workspace_root();
+    let store = ff_session::SessionStore::new();
+    let (registry, memory_store) = build_registry_with_memory();
+    let approver = CliApprover::new(approval_mode);
+    let session = store.create_session(None);
+
+    let tool_ctx = ToolContext {
+        registry: &registry,
+        root: &workspace,
+        approve: &approver,
+        max_iterations: 8,
+    };
+
+    let stdin = std::io::stdin();
+    chat_repl(
+        provider.as_ref(),
+        &model,
+        &skills,
+        &store,
+        &memory_store,
+        &tool_ctx,
+        &session.id,
+        json,
+        stdin.lock(),
+    )
+    .await
+}
+
+/// Core REPL loop with injectable input for testability. Reads lines from `input`,
+/// dispatches each to [`run_turn`], and loops until EOF, `exit`, or `quit`.
+#[allow(clippy::too_many_arguments)]
+async fn chat_repl(
+    provider: &dyn ff_llm::Provider,
+    model: &str,
+    skills: &ff_skills::SkillRegistry,
+    store: &ff_session::SessionStore,
+    memory_store: &std::sync::Arc<ff_memory::Memory>,
+    tool_ctx: &ToolContext<'_>,
+    session_id: &str,
+    json: bool,
+    mut input: impl BufRead,
+) -> ExitCode {
+    if !json {
+        eprintln!("FlowForge REPL.  Type `exit` or Ctrl-D to quit.\n");
+    }
+
+    loop {
+        // Prompt on stderr so stdout stays clean (both plain-text and JSON mode).
+        if !json {
+            eprint!("> ");
+            let _ = std::io::stderr().flush();
+        }
+
+        let mut line = String::new();
+        match input.read_line(&mut line) {
+            Ok(0) => {
+                // EOF (Ctrl-D)
+                if !json {
+                    eprintln!();
+                }
+                break;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!("read error: {e}");
+                break;
+            }
+        }
+
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if trimmed == "exit" || trimmed == "quit" {
+            break;
+        }
+
+        store.add_message(session_id, Role::User, trimmed.to_string());
+
+        let user_ctx = UserContext::now();
+        let memory = memory_store.ambient_block();
+        let system_prompt =
+            ff_agent::build_system_prompt(None, skills, &[], &user_ctx, memory.as_deref());
+
+        let cancel = CancelToken::new();
+        let cancel_signal = cancel.clone();
+        let ctrlc_handle = tokio::spawn(async move {
+            if tokio::signal::ctrl_c().await.is_ok() {
+                cancel_signal.cancel();
+            }
+        });
+
+        let result = if json {
+            run_turn(
+                provider,
+                store,
+                tool_ctx,
+                session_id,
+                model,
+                Some(system_prompt.as_str()),
+                true,
+                cancel,
+                |event| json_events::emit_line(&event),
+            )
+            .await
+        } else {
+            run_turn(
+                provider,
+                store,
+                tool_ctx,
+                session_id,
+                model,
+                Some(system_prompt.as_str()),
+                true,
+                cancel,
+                render_event_text,
+            )
+            .await
+        };
+
+        // Cancel the ctrl-c listener now that the turn is done so a stray signal
+        // from a previous turn cannot fire during the next prompt.
+        ctrlc_handle.abort();
+
+        match result {
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!("\n[error] {e}");
+            }
+        }
+
+        if !json {
+            eprintln!();
+        }
+    }
+
+    ExitCode::SUCCESS
+}
+
 /// Plain-text renderer: assistant tokens stream to stdout; tool steps are annotated
 /// on stderr so piping stdout yields just the model's text.
 fn render_event_text(event: AgentEvent) {
@@ -223,6 +391,8 @@ fn render_event_text(event: AgentEvent) {
 
 #[cfg(test)]
 mod tests {
+    use std::process::ExitCode;
+
     use super::json_events;
     use super::{approval_mode, Cli};
     use crate::approver::ApprovalMode;
@@ -232,7 +402,9 @@ mod tests {
     use ff_agent::{run_turn, AgentEvent, Approver, CancelToken, ToolContext};
     use ff_core::Role;
     use ff_llm::{ChatRequest, Chunk, ChunkStream, LlmError, Provider};
+    use ff_memory::{Memory, MemoryConfig};
     use ff_session::SessionStore;
+    use ff_skills::SkillRegistry;
     use ff_tools::{Safety, ToolRegistry};
     use futures_util::StreamExt;
 
@@ -397,5 +569,180 @@ mod tests {
             terminal.get("tool_count").is_none(),
             "terminal record uses the discriminated AgentEvent schema only"
         );
+    }
+
+    /// Captures the `ChatRequest` messages from each turn so a test can assert what
+    /// the provider received (proving multi-turn context). The most recent request
+    /// wins; a test asserts against the last value.
+    struct RecordingProvider {
+        seen: std::sync::Arc<std::sync::Mutex<Vec<ff_llm::ChatMessage>>>,
+    }
+
+    #[async_trait]
+    impl Provider for RecordingProvider {
+        async fn chat_stream(&self, req: ChatRequest) -> Result<ChunkStream, LlmError> {
+            *self.seen.lock().unwrap() = req.messages;
+            Ok(futures_util::stream::iter(vec![Ok(Chunk {
+                delta: "ok".into(),
+                done: true,
+                ..Chunk::default()
+            })])
+            .boxed())
+        }
+    }
+
+    /// Feed two prompts through the REPL and assert the second turn's provider
+    /// request includes the first turn's messages — proving multi-turn context.
+    #[tokio::test]
+    async fn chat_multi_turn_context_persists() {
+        use std::io::Cursor;
+        use std::sync::{Arc, Mutex};
+
+        let store = SessionStore::new();
+        let session = store.create_session(None);
+        let registry = ToolRegistry::new();
+        let root = std::env::current_dir().unwrap();
+        let approver = TestApprover;
+        let tool_ctx = ToolContext {
+            registry: &registry,
+            root: &root,
+            approve: &approver,
+            max_iterations: 8,
+        };
+
+        let memory_store = Arc::new(Memory::with_default_root(MemoryConfig::default()));
+        let skills = SkillRegistry::new();
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let provider = RecordingProvider { seen: seen.clone() };
+
+        // Feed two lines: two separate questions, then exit.
+        let input = Cursor::new(b"first question\nsecond question\nexit\n");
+        let code = super::chat_repl(
+            &provider,
+            "mock",
+            &skills,
+            &store,
+            &memory_store,
+            &tool_ctx,
+            &session.id,
+            false,
+            input,
+        )
+        .await;
+
+        assert_eq!(code, ExitCode::SUCCESS);
+
+        let msgs = seen.lock().unwrap();
+        // The last (second) turn's request must contain:
+        // system, user("first question"), assistant("ok"), user("second question")
+        assert!(
+            msgs.len() >= 4,
+            "second turn request should include both turns' messages, got {msgs:?}"
+        );
+
+        let contents: Vec<Option<&str>> = msgs.iter().map(|m| m.content.as_deref()).collect();
+        assert!(
+            contents.contains(&Some("first question")),
+            "first turn's user message not in second turn's request: {contents:?}"
+        );
+        assert!(
+            contents.contains(&Some("second question")),
+            "second turn's user message not in request: {contents:?}"
+        );
+
+        // Also verify via the session store directly.
+        let history = store.get_messages(&session.id);
+        assert_eq!(
+            history.len(),
+            4,
+            "history should have 4 messages: user1, asst1, user2, asst2"
+        );
+        assert_eq!(history[0].role, Role::User);
+        assert_eq!(history[0].content, "first question");
+        assert_eq!(history[2].role, Role::User);
+        assert_eq!(history[2].content, "second question");
+    }
+
+    /// Feeding EOF immediately exits cleanly without calling the provider.
+    #[tokio::test]
+    async fn chat_exits_cleanly_on_eof() {
+        use std::io::Cursor;
+        use std::sync::Arc;
+
+        let store = SessionStore::new();
+        let session = store.create_session(None);
+        let registry = ToolRegistry::new();
+        let root = std::env::current_dir().unwrap();
+        let approver = TestApprover;
+        let tool_ctx = ToolContext {
+            registry: &registry,
+            root: &root,
+            approve: &approver,
+            max_iterations: 8,
+        };
+
+        let memory_store = Arc::new(Memory::with_default_root(MemoryConfig::default()));
+        let skills = SkillRegistry::new();
+
+        let code = super::chat_repl(
+            &JsonTextProvider,
+            "mock",
+            &skills,
+            &store,
+            &memory_store,
+            &tool_ctx,
+            &session.id,
+            false,
+            Cursor::new(b""),
+        )
+        .await;
+
+        assert_eq!(code, ExitCode::SUCCESS);
+        // No messages were produced: the loop never entered a turn.
+        assert!(store.get_messages(&session.id).is_empty());
+    }
+
+    /// The `exit` and `quit` commands break the loop cleanly.
+    #[tokio::test]
+    async fn chat_exits_cleanly_on_exit_command() {
+        use std::io::Cursor;
+        use std::sync::Arc;
+
+        let store = SessionStore::new();
+        let session = store.create_session(None);
+        let registry = ToolRegistry::new();
+        let root = std::env::current_dir().unwrap();
+        let approver = TestApprover;
+        let tool_ctx = ToolContext {
+            registry: &registry,
+            root: &root,
+            approve: &approver,
+            max_iterations: 8,
+        };
+
+        let memory_store = Arc::new(Memory::with_default_root(MemoryConfig::default()));
+        let skills = SkillRegistry::new();
+
+        for cmd in ["exit\n", "quit\n"] {
+            let code = super::chat_repl(
+                &JsonTextProvider,
+                "mock",
+                &skills,
+                &store,
+                &memory_store,
+                &tool_ctx,
+                &session.id,
+                false,
+                Cursor::new(cmd.as_bytes()),
+            )
+            .await;
+
+            assert_eq!(
+                code,
+                ExitCode::SUCCESS,
+                "command {cmd:?} should exit cleanly"
+            );
+        }
     }
 }
