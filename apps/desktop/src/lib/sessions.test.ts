@@ -1,5 +1,11 @@
 import { describe, it, expect } from "vitest";
-import { resolveLabel, filterSessions, arrangeSessions } from "@/lib/sessions";
+import {
+  resolveLabel,
+  filterSessions,
+  arrangeSessions,
+  selectSessionOverflow,
+  UNPINNED_SESSION_CAP,
+} from "@/lib/sessions";
 import type { Session } from "@/bindings";
 
 function session(partial: Partial<Session> & { id: string }): Session {
@@ -103,30 +109,103 @@ describe("arrangeSessions", () => {
   const empty = new Set<string>();
 
   it("floats pinned sessions to the top, stable within each group", () => {
-    const out = arrangeSessions(sessions, new Set(["c"]), empty, false);
+    const out = arrangeSessions(sessions, new Set(["c"]), empty, "all");
     expect(out.map((s) => s.id)).toEqual(["c", "a", "b"]);
   });
 
   it("keeps the original order when nothing is pinned", () => {
     expect(
-      arrangeSessions(sessions, empty, empty, false).map((s) => s.id),
+      arrangeSessions(sessions, empty, empty, "all").map((s) => s.id),
     ).toEqual(["a", "b", "c"]);
   });
 
-  it("hides dismissed sessions, and reveals them when showDismissed is set", () => {
+  it("hides dismissed sessions on the All tab", () => {
     const dismissed = new Set(["b"]);
     expect(
-      arrangeSessions(sessions, empty, dismissed, false).map((s) => s.id),
+      arrangeSessions(sessions, empty, dismissed, "all").map((s) => s.id),
     ).toEqual(["a", "c"]);
-    // Restorable: with showDismissed the dismissed session is back in the list.
+  });
+
+  it("shows only dismissed sessions on the Dismissed tab", () => {
+    const dismissed = new Set(["b"]);
     expect(
-      arrangeSessions(sessions, empty, dismissed, true).map((s) => s.id),
-    ).toEqual(["a", "b", "c"]);
+      arrangeSessions(sessions, empty, dismissed, "dismissed").map((s) => s.id),
+    ).toEqual(["b"]);
   });
 
   it("does not mutate the input array", () => {
     const input = [...sessions];
-    arrangeSessions(input, new Set(["c"]), empty, false);
+    arrangeSessions(input, new Set(["c"]), empty, "all");
     expect(input.map((s) => s.id)).toEqual(["a", "b", "c"]);
+  });
+});
+
+describe("selectSessionOverflow", () => {
+  const mk = (n: number) =>
+    Array.from({ length: n }, (_, i) =>
+      session({ id: `s${i}`, goal: `Session ${i}` }),
+    );
+
+  it("shows every session when unpinned count is within the cap", () => {
+    const sessions = mk(10);
+    const { visible, hiddenCount } = selectSessionOverflow(
+      sessions,
+      new Set(),
+      null,
+      false,
+    );
+    expect(visible).toHaveLength(10);
+    expect(hiddenCount).toBe(0);
+  });
+
+  it("caps unpinned sessions at 15 and reports the overflow count", () => {
+    const sessions = mk(20);
+    const { visible, hiddenCount } = selectSessionOverflow(
+      sessions,
+      new Set(),
+      null,
+      false,
+    );
+    expect(visible.map((s) => s.id)).toEqual(
+      sessions.slice(0, UNPINNED_SESSION_CAP).map((s) => s.id),
+    );
+    expect(hiddenCount).toBe(5);
+  });
+
+  it("always renders pinned sessions regardless of cap", () => {
+    const sessions = mk(20);
+    const pinned = new Set(["s19", "s18"]);
+    const { visible, hiddenCount } = selectSessionOverflow(
+      sessions,
+      pinned,
+      null,
+      false,
+    );
+    expect(visible.some((s) => s.id === "s19")).toBe(true);
+    expect(visible.some((s) => s.id === "s18")).toBe(true);
+    expect(hiddenCount).toBe(3);
+  });
+
+  it("always renders the active session even when it would fall past the cap", () => {
+    const sessions = mk(20);
+    const { visible } = selectSessionOverflow(
+      sessions,
+      new Set(),
+      "s19",
+      false,
+    );
+    expect(visible.some((s) => s.id === "s19")).toBe(true);
+  });
+
+  it("revealAll bypasses the cap", () => {
+    const sessions = mk(20);
+    const { visible, hiddenCount } = selectSessionOverflow(
+      sessions,
+      new Set(),
+      null,
+      true,
+    );
+    expect(visible).toHaveLength(20);
+    expect(hiddenCount).toBe(0);
   });
 });
