@@ -8,9 +8,12 @@ import { ipc } from "@/lib/ipc";
 import {
   CONTROL_DEFAULTS,
   policyForMode,
+  slugify,
   type ControlConfig,
   type ControlOverrides,
+  type ControlUi,
   type DefaultMode,
+  type Teammate,
 } from "@/lib/control";
 
 /** The string-list override buckets. */
@@ -30,6 +33,11 @@ interface ControlConfigState {
   setUserInstructions: (text: string) => Promise<void>;
   addPromptFile: (path: string) => Promise<void>;
   removePromptFile: (path: string) => Promise<void>;
+  /** Add a teammate (SET.12). Server assigns the id; no-op on a blank name. */
+  addTeammate: (input: Omit<Teammate, "id">) => Promise<void>;
+  removeTeammate: (id: string) => Promise<void>;
+  /** Patch one or more UI-customization fields (SET.12). */
+  setUi: (patch: Partial<ControlUi>) => Promise<void>;
   resetControl: () => Promise<void>;
 }
 
@@ -106,6 +114,34 @@ export const useControlConfigStore = create<ControlConfigState>((set, get) => ({
       ...c,
       promptFiles: c.promptFiles.filter((p) => p !== path),
     })),
+
+  addTeammate: (input) => {
+    const name = input.name.trim();
+    if (name === "") return Promise.resolve();
+    const slug = slugify(input.slug);
+    const teammate: Teammate = {
+      id: crypto.randomUUID(),
+      name,
+      slug,
+      description: input.description.trim(),
+    };
+    return persist(set, get, (c) =>
+      // Dedupe on a non-empty handle (mirrors addOverride/addPromptFile); an empty
+      // slug is optional and allowed to repeat.
+      slug !== "" && c.teammates.some((t) => t.slug === slug)
+        ? c
+        : { ...c, teammates: [...c.teammates, teammate] },
+    );
+  },
+
+  removeTeammate: (id) =>
+    persist(set, get, (c) => ({
+      ...c,
+      teammates: c.teammates.filter((t) => t.id !== id),
+    })),
+
+  setUi: (patch) =>
+    persist(set, get, (c) => ({ ...c, ui: { ...c.ui, ...patch } })),
 
   resetControl: () =>
     persist(set, get, () => structuredClone(CONTROL_DEFAULTS)),

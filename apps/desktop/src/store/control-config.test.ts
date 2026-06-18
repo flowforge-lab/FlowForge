@@ -66,4 +66,78 @@ describe("control-config store", () => {
     expect(cfg().defaultMode).toBe("auto");
     expect(cfg().overrides.allowed).toEqual([]);
   });
+
+  // ── SET.12: Team + UI ──────────────────────────────────────────────────────
+
+  it("seeds default teammates and adds/removes (ignoring blank names)", async () => {
+    const seeded = cfg().teammates.length;
+    expect(seeded).toBeGreaterThan(0);
+
+    await useControlConfigStore
+      .getState()
+      .addTeammate({ name: "  ", slug: "x", description: "" }); // blank → no-op
+    expect(cfg().teammates).toHaveLength(seeded);
+
+    await useControlConfigStore.getState().addTeammate({
+      name: "Quinn QA",
+      slug: "qa",
+      description: "Runs tests.",
+    });
+    const added = cfg().teammates[cfg().teammates.length - 1];
+    expect(added.name).toBe("Quinn QA");
+    expect(added.id).toBeTruthy();
+
+    await useControlConfigStore.getState().removeTeammate(added.id);
+    expect(cfg().teammates).toHaveLength(seeded);
+  });
+
+  it("slugifies the handle and dedupes on a non-empty slug", async () => {
+    const seeded = cfg().teammates.length;
+
+    await useControlConfigStore.getState().addTeammate({
+      name: "Quinn QA",
+      slug: "Quinn QA!",
+      description: "",
+    });
+    expect(cfg().teammates[cfg().teammates.length - 1].slug).toBe("quinn-qa");
+
+    // Same handle (case/space-insensitive) → no-op; a different name doesn't matter.
+    await useControlConfigStore.getState().addTeammate({
+      name: "Quentin",
+      slug: "quinn-qa",
+      description: "",
+    });
+    expect(cfg().teammates).toHaveLength(seeded + 1);
+
+    // An empty slug stays optional and may repeat.
+    await useControlConfigStore
+      .getState()
+      .addTeammate({ name: "No Handle", slug: "  ", description: "" });
+    await useControlConfigStore
+      .getState()
+      .addTeammate({ name: "Also None", slug: "", description: "" });
+    expect(cfg().teammates).toHaveLength(seeded + 3);
+  });
+
+  it("patches UI fields without clobbering the others", async () => {
+    await useControlConfigStore.getState().setUi({ accentColor: "#10b981" });
+    await useControlConfigStore.getState().setUi({ logoPath: "/tmp/logo.png" });
+    expect(cfg().ui.accentColor).toBe("#10b981");
+    expect(cfg().ui.logoPath).toBe("/tmp/logo.png");
+    expect(cfg().ui.contextualGreeting).toBe(true); // untouched default
+  });
+
+  it("resetControl also resets Team + UI", async () => {
+    await useControlConfigStore
+      .getState()
+      .addTeammate({ name: "Temp", slug: "temp", description: "" });
+    await useControlConfigStore
+      .getState()
+      .setUi({ accentColor: "#ef4444", contextualGreeting: false });
+
+    await useControlConfigStore.getState().resetControl();
+    expect(cfg().ui.accentColor).toBe("#6366f1");
+    expect(cfg().ui.contextualGreeting).toBe(true);
+    expect(cfg().teammates.some((t) => t.name === "Temp")).toBe(false);
+  });
 });
