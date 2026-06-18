@@ -13,7 +13,9 @@ use ff_core::{
 use ff_llm::{OllamaProvider, OpenAiProvider, Provider};
 use ff_mcp::{McpConfigWatcher, SupervisorHandle};
 use ff_memory::watch::MemoryWatcher;
-use ff_memory::{FlushLedger, Fts5Index, Memory, MemoryConfig, MemoryIndex};
+use ff_memory::{
+    FlushLedger, Fts5Index, HybridIndex, Memory, MemoryConfig, MemoryIndex, NoopEmbedder,
+};
 use ff_session::SessionStore;
 use ff_signals::{SignalStore, SkillAggregate, SkillCompleted};
 use ff_skills::{
@@ -940,11 +942,11 @@ fn now_ms() -> i64 {
 fn build_memory() -> (Arc<Memory>, Arc<dyn MemoryIndex>, Option<MemoryWatcher>) {
     let memory = Arc::new(Memory::with_default_root(MemoryConfig::default()));
     let index: Arc<dyn MemoryIndex> = match Fts5Index::open(memory.index_path()) {
-        Ok(i) => Arc::new(i),
+        Ok(i) => Arc::new(HybridIndex::new(i, NoopEmbedder)),
         Err(e) => {
             tracing::warn!(error = %e, "memory index unavailable on disk; using in-memory");
             match Fts5Index::open_in_memory() {
-                Ok(i) => Arc::new(i),
+                Ok(i) => Arc::new(HybridIndex::new(i, NoopEmbedder)),
                 Err(e) => {
                     tracing::warn!(error = %e, "memory index unavailable; recall disabled");
                     return (memory, Arc::new(NullIndex), None);

@@ -8,11 +8,14 @@
 //! `chunks_fts` virtual table indexes only `text`, kept in sync by triggers.
 //! Search joins the BM25 hit back to its row.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use chrono::NaiveDate;
 use rusqlite::{params, Connection};
+
+use crate::embed::Embedder;
 
 use crate::error::Result;
 use crate::{MemoryChunk, MemorySource};
@@ -98,8 +101,8 @@ impl Fts5Index {
 
     fn insert_chunks(conn: &Connection, chunks: &[MemoryChunk]) -> Result<()> {
         let mut stmt = conn.prepare(
-            "INSERT INTO chunks (source, path, heading, text, line_start, line_end)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO chunks (source, path, heading, text, line_start, line_end, embedding)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         )?;
         for c in chunks {
             stmt.execute(params![
@@ -109,9 +112,30 @@ impl Fts5Index {
                 c.text,
                 c.line_start,
                 c.line_end,
+                c.embedding.as_deref().map(vec_to_blob),
             ])?;
         }
         Ok(())
+    }
+
+    /// Stored embeddings for the given chunk ids (NULL/absent entries omitted).
+    /// Used by [`HybridIndex`] to fuse vector similarity over a BM25 candidate
+    /// set; with the default [`NoopEmbedder`](crate::embed::NoopEmbedder) the
+    /// `embedding` column is always NULL so this returns empty.
+    fn embeddings_for(&self, ids: &[i64]) -> Result<HashMap<i64, Vec<f32>>> {
+        let mut out = HashMap::new();
+        if ids.is_empty() {
+            return Ok(out);
+        }
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT embedding FROM chunks WHERE id = ?1")?;
+        for &id in ids {
+            let blob: Option<Vec<u8>> = stmt.query_row(params![id], |row| row.get(0))?;
+            if let Some(bytes) = blob {
+                out.insert(id, blob_to_vec(&bytes));
+            }
+        }
+        Ok(out)
     }
 }
 
@@ -204,6 +228,157 @@ fn source_from_str(s: &str) -> MemorySource {
     }
 }
 
+/// Hybrid recall (RFC 0006 §6): FTS5/BM25 fused with vector similarity from an
+/// [`Embedder`]. The fusion only engages when the embedder yields a query vector;
+/// otherwise `search` returns the inner [`Fts5Index`] result verbatim, so with
+/// the default [`NoopEmbedder`](crate::embed::NoopEmbedder) it is byte-identical
+/// to a bare FTS5 index — the "never a hard failure" floor.
+///
+/// Fusion is Reciprocal Rank Fusion (RRF) over the BM25 candidate pool: a chunk's
+/// final score sums `1/(C + rank)` from its BM25 rank and its cosine-similarity
+/// rank. RRF is scale-independent, so exact ID/symbol hits (BM25's strength) and
+/// semantic neighbours (vectors' strength) both surface. M5.3.1 supplies a real
+/// local embedder; M5.3.0 only opens this seam.
+pub struct HybridIndex<E: Embedder> {
+    inner: Fts5Index,
+    embedder: E,
+}
+
+/// RRF damping constant (the standard default). Larger = flatter rank weighting.
+const RRF_C: f32 = 60.0;
+/// How many BM25 candidates to over-fetch (relative to `k`) before fusing, so
+/// vector re-ranking has room to promote a semantically-close low-BM25 hit.
+const FUSION_POOL_FACTOR: usize = 4;
+
+impl<E: Embedder> HybridIndex<E> {
+    /// Wrap an [`Fts5Index`] with an [`Embedder`]. The index keeps full BM25
+    /// behaviour; the embedder adds optional vector fusion.
+    pub fn new(inner: Fts5Index, embedder: E) -> Self {
+        Self { inner, embedder }
+    }
+
+    /// Attach a chunk embedding (when the embedder produces one) before indexing,
+    /// leaving any pre-set embedding untouched. With [`NoopEmbedder`] this is a
+    /// clone with every embedding left `None`.
+    fn with_embeddings(&self, chunks: &[MemoryChunk]) -> Result<Vec<MemoryChunk>> {
+        let mut out = Vec::with_capacity(chunks.len());
+        for c in chunks {
+            let mut c = c.clone();
+            if c.embedding.is_none() {
+                c.embedding = self.embedder.embed_chunk(&c.text)?;
+            }
+            out.push(c);
+        }
+        Ok(out)
+    }
+}
+
+impl<E: Embedder> MemoryIndex for HybridIndex<E> {
+    fn reindex(&self, chunks: &[MemoryChunk]) -> Result<()> {
+        self.inner.reindex(&self.with_embeddings(chunks)?)
+    }
+
+    fn reindex_path(&self, path: &Path, chunks: &[MemoryChunk]) -> Result<()> {
+        self.inner
+            .reindex_path(path, &self.with_embeddings(chunks)?)
+    }
+
+    fn remove_path(&self, path: &Path) -> Result<()> {
+        self.inner.remove_path(path)
+    }
+
+    fn search(&self, query: &str, k: usize) -> Result<Vec<ScoredChunk>> {
+        // No query vector (embeddings off / unavailable) -> pure BM25, identical
+        // to Fts5Index. This is the fallback guarantee and the common path.
+        let Some(qvec) = self.embedder.embed_query(query)? else {
+            return self.inner.search(query, k);
+        };
+
+        // Over-fetch BM25, then fuse. The pool is the recall set; vectors only
+        // re-rank within it (full vector recall is a later slice).
+        let pool_k = k.saturating_mul(FUSION_POOL_FACTOR).max(k);
+        let bm25 = self.inner.search(query, pool_k)?;
+        if bm25.is_empty() {
+            return Ok(bm25);
+        }
+
+        let ids: Vec<i64> = bm25.iter().map(|s| s.chunk.id).collect();
+        let embs = self.inner.embeddings_for(&ids)?;
+
+        // Vector rank: candidates with a stored embedding and a positive cosine,
+        // ordered by cosine desc. Orthogonal/negative chunks earn no vector
+        // credit just for being in the BM25 pool, so a true semantic neighbour
+        // is not diluted into a tie with an unrelated high-BM25 hit.
+        let mut by_cosine: Vec<(usize, f32)> = bm25
+            .iter()
+            .enumerate()
+            .filter_map(|(i, s)| embs.get(&s.chunk.id).map(|e| (i, cosine(&qvec, e))))
+            .filter(|(_, c)| *c > 0.0)
+            .collect();
+        by_cosine.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        let mut vec_rank = vec![usize::MAX; bm25.len()];
+        for (rank, (cand_idx, _)) in by_cosine.iter().enumerate() {
+            vec_rank[*cand_idx] = rank;
+        }
+
+        // RRF: BM25 rank is the candidate's position (already best-first); the
+        // vector term is omitted for candidates with no embedding.
+        let mut fused: Vec<(usize, f32)> = (0..bm25.len())
+            .map(|i| {
+                let bm = 1.0 / (RRF_C + (i as f32 + 1.0));
+                let vc = if vec_rank[i] == usize::MAX {
+                    0.0
+                } else {
+                    1.0 / (RRF_C + (vec_rank[i] as f32 + 1.0))
+                };
+                (i, bm + vc)
+            })
+            .collect();
+        fused.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        Ok(fused
+            .into_iter()
+            .take(k)
+            .map(|(i, score)| ScoredChunk {
+                chunk: bm25[i].chunk.clone(),
+                score,
+            })
+            .collect())
+    }
+}
+
+/// Cosine similarity in `[-1, 1]`; `0.0` for mismatched-length or zero vectors.
+fn cosine(a: &[f32], b: &[f32]) -> f32 {
+    if a.len() != b.len() || a.is_empty() {
+        return 0.0;
+    }
+    let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+    let na = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let nb = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if na == 0.0 || nb == 0.0 {
+        0.0
+    } else {
+        dot / (na * nb)
+    }
+}
+
+/// Serialize an embedding to a little-endian `f32` BLOB.
+fn vec_to_blob(v: &[f32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(v.len() * 4);
+    for f in v {
+        out.extend_from_slice(&f.to_le_bytes());
+    }
+    out
+}
+
+/// Inverse of [`vec_to_blob`]; trailing partial bytes (never produced by us) are
+/// ignored.
+fn blob_to_vec(b: &[u8]) -> Vec<f32> {
+    b.chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
+}
+
 /// Turn arbitrary user text into a safe FTS5 MATCH expression: each whitespace
 /// token becomes a quoted string (so `:`/`-`/`*` etc. can't trigger a syntax
 /// error or an unintended operator), joined by implicit AND. `None` if empty.
@@ -227,7 +402,33 @@ fn fts_query(raw: &str) -> Option<String> {
 mod tests {
     use super::*;
     use crate::chunk_markdown;
+    use crate::embed::{Embedder, NoopEmbedder};
     use std::path::Path;
+
+    /// 3-axis [rust, python, sqlite] keyword vector — deterministic stand-in for
+    /// a real embedder so fusion is unit-testable without a model.
+    fn vectorize(text: &str) -> Vec<f32> {
+        let l = text.to_lowercase();
+        vec![
+            f32::from(l.contains("rust")),
+            f32::from(l.contains("python")),
+            f32::from(l.contains("sqlite")),
+        ]
+    }
+
+    /// Embeds chunks by keyword and returns a fixed query vector, so a test can
+    /// aim the query at a chosen chunk regardless of the BM25 ordering.
+    struct FakeEmbedder {
+        query: Vec<f32>,
+    }
+    impl Embedder for FakeEmbedder {
+        fn embed_query(&self, _query: &str) -> Result<Option<Vec<f32>>> {
+            Ok(Some(self.query.clone()))
+        }
+        fn embed_chunk(&self, text: &str) -> Result<Option<Vec<f32>>> {
+            Ok(Some(vectorize(text)))
+        }
+    }
 
     fn chunks(md: &str, path: &str) -> Vec<MemoryChunk> {
         chunk_markdown(md, MemorySource::Curated, Path::new(path))
@@ -324,5 +525,86 @@ mod tests {
         }
         let idx = Fts5Index::open(&db).unwrap();
         assert_eq!(idx.search("persistent", 10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn blob_round_trips_an_embedding() {
+        let v = vec![0.5_f32, -1.25, 3.0, 0.0];
+        assert_eq!(blob_to_vec(&vec_to_blob(&v)), v);
+    }
+
+    #[test]
+    fn cosine_is_one_for_parallel_zero_for_orthogonal() {
+        assert!((cosine(&[1.0, 0.0], &[2.0, 0.0]) - 1.0).abs() < 1e-6);
+        assert!(cosine(&[1.0, 0.0], &[0.0, 1.0]).abs() < 1e-6);
+        assert_eq!(cosine(&[0.0, 0.0], &[1.0, 1.0]), 0.0);
+        assert_eq!(cosine(&[1.0], &[1.0, 1.0]), 0.0);
+    }
+
+    #[test]
+    fn hybrid_with_noop_is_byte_identical_to_fts5() {
+        let md = "## Prefs\nuser prefers rust over python\n\n## Tools\nuse sqlite for storage";
+        let bare = Fts5Index::open_in_memory().unwrap();
+        bare.reindex(&chunks(md, "MEMORY.md")).unwrap();
+
+        let hybrid = HybridIndex::new(Fts5Index::open_in_memory().unwrap(), NoopEmbedder);
+        hybrid.reindex(&chunks(md, "MEMORY.md")).unwrap();
+
+        for q in ["rust", "sqlite", "python prefers", "storage", "   "] {
+            assert_eq!(
+                hybrid.search(q, 10).unwrap(),
+                bare.search(q, 10).unwrap(),
+                "hybrid+noop must match bare BM25 for query {q:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn fusion_promotes_the_semantic_match_over_bm25_order() {
+        // Three chunks share the term "topic" so a "topic" query returns all
+        // three with (near-)tied BM25 — order falls to insert/id order, putting
+        // the python chunk first.
+        let md = "## P\npython topic\n\n## R\nrust topic\n\n## S\nsqlite topic";
+
+        let bm25_only = Fts5Index::open_in_memory().unwrap();
+        bm25_only.reindex(&chunks(md, "MEMORY.md")).unwrap();
+        let baseline = bm25_only.search("topic", 10).unwrap();
+        assert!(baseline.len() >= 3);
+        assert!(
+            baseline[0].chunk.text.contains("python"),
+            "baseline BM25 should lead with the python chunk, got {:?}",
+            baseline[0].chunk.text
+        );
+
+        // Aim the query vector at the rust axis: fusion must promote the rust
+        // chunk to the top even though BM25 alone ranks it lower.
+        let hybrid = HybridIndex::new(
+            Fts5Index::open_in_memory().unwrap(),
+            FakeEmbedder {
+                query: vec![1.0, 0.0, 0.0],
+            },
+        );
+        hybrid.reindex(&chunks(md, "MEMORY.md")).unwrap();
+        let fused = hybrid.search("topic", 10).unwrap();
+        assert!(
+            fused[0].chunk.text.contains("rust"),
+            "fusion should surface the rust chunk first, got {:?}",
+            fused[0].chunk.text
+        );
+    }
+
+    #[test]
+    fn fusion_falls_back_to_bm25_when_query_vector_is_absent() {
+        // FakeEmbedder always yields a vector; NoopEmbedder yields none. With no
+        // query vector the hybrid path must be identical to BM25.
+        let md = "## A\nrust topic\n\n## B\npython topic";
+        let hybrid = HybridIndex::new(Fts5Index::open_in_memory().unwrap(), NoopEmbedder);
+        hybrid.reindex(&chunks(md, "MEMORY.md")).unwrap();
+        let bare = Fts5Index::open_in_memory().unwrap();
+        bare.reindex(&chunks(md, "MEMORY.md")).unwrap();
+        assert_eq!(
+            hybrid.search("topic", 10).unwrap(),
+            bare.search("topic", 10).unwrap()
+        );
     }
 }
