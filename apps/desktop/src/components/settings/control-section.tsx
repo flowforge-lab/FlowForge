@@ -2,19 +2,24 @@ import { useEffect, useState } from "react";
 import { SubTabs } from "@/components/settings/sub-tabs";
 import { PermissionsTab } from "@/components/settings/control/permissions-tab";
 import { PromptsTab } from "@/components/settings/control/prompts-tab";
+import { TeamTab } from "@/components/settings/control/team-tab";
+import { UiTab } from "@/components/settings/control/ui-tab";
 import { useSettingsStore } from "@/store/settings";
 import { useControlConfigStore } from "@/store/control-config";
 
-type ControlTab = "permissions" | "prompts";
+type ControlTab = "permissions" | "prompts" | "team" | "ui";
 
 const TABS: ReadonlyArray<{ value: ControlTab; label: string }> = [
   { value: "permissions", label: "Permissions" },
   { value: "prompts", label: "Prompts" },
+  { value: "team", label: "Team" },
+  { value: "ui", label: "UI" },
 ];
 
 /**
- * Control section (#127): Permissions / Prompts sub-tabs. Loads the control config
- * on mount and wires the footer "Reset to defaults" to `resetControl`.
+ * Control section (#127, +SET.12): Permissions / Prompts / Team / UI sub-tabs.
+ * Loads the control config on mount and wires the footer "Reset to defaults" to
+ * `resetControl`.
  */
 export function ControlSection() {
   const [tab, setTab] = useState<ControlTab>("permissions");
@@ -51,6 +56,8 @@ export function ControlSection() {
         >
           {tab === "permissions" && <PermissionsTab />}
           {tab === "prompts" && <PromptsTab />}
+          {tab === "team" && <TeamTab />}
+          {tab === "ui" && <UiTab />}
         </SubTabs>
       )}
     </div>

@@ -12,6 +12,33 @@ describe("MockIpc control config", () => {
     expect(cfg.promptFiles).toEqual([]);
   });
 
+  it("seeds Team + UI defaults (SET.12)", async () => {
+    const ipc = new MockIpc();
+    const cfg = await ipc.getControlConfig();
+    expect(cfg.teammates.length).toBeGreaterThan(0);
+    expect(cfg.ui.accentColor).toBe("#6366f1");
+    expect(cfg.ui.contextualGreeting).toBe(true);
+  });
+
+  it("round-trips Team + UI changes (SET.12)", async () => {
+    const ipc = new MockIpc();
+    const base = await ipc.getControlConfig();
+    await ipc.setControlConfig({
+      ...base,
+      teammates: [
+        { id: "x", name: "Quinn", slug: "qa", description: "Tests." },
+      ],
+      ui: { ...base.ui, accentColor: "#10b981", logoPath: "/tmp/logo.png" },
+    });
+
+    const reread = await ipc.getControlConfig();
+    expect(reread.teammates).toEqual([
+      { id: "x", name: "Quinn", slug: "qa", description: "Tests." },
+    ]);
+    expect(reread.ui.accentColor).toBe("#10b981");
+    expect(reread.ui.logoPath).toBe("/tmp/logo.png");
+  });
+
   it("persists a written config and echoes it back on reopen", async () => {
     const ipc = new MockIpc();
     const next = {

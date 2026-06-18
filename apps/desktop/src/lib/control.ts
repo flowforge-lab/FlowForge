@@ -22,6 +22,26 @@ export interface ControlOverrides {
   allowed: string[];
 }
 
+/** A teammate profile (SET.12). FE-only mock until real teammate spawning lands. */
+export interface Teammate {
+  id: string;
+  name: string;
+  /** Short handle, e.g. `reviewer`. */
+  slug: string;
+  description: string;
+}
+
+/** Per-profile UI customization (SET.12). All FE-only presentation for now. */
+export interface ControlUi {
+  /** Accent color as a hex string; `""` means use the theme default. */
+  accentColor: string;
+  /** Stub paths until real file dialogs land (logo / favicon). */
+  logoPath: string;
+  faviconPath: string;
+  /** Show a contextual greeting on the empty session screen. */
+  contextualGreeting: boolean;
+}
+
 /** The full control config, round-tripped via `getControlConfig`/`setControlConfig`. */
 export interface ControlConfig {
   defaultMode: DefaultMode;
@@ -31,6 +51,10 @@ export interface ControlConfig {
   /** Backed by `user_instructions.md` once the backend lands. */
   userInstructions: string;
   promptFiles: string[];
+  /** Teammate profiles (SET.12). */
+  teammates: Teammate[];
+  /** Per-profile UI customization (SET.12). */
+  ui: ControlUi;
 }
 
 /** How a cell renders in the matrix. */
@@ -108,6 +132,16 @@ export function policyForMode(
   };
 }
 
+/** Normalize a free-text slug into a handle: lowercased, alphanumerics kept, every
+ *  other run collapsed to a single dash, no leading/trailing dashes. Returns "" when
+ *  the input has no usable characters (the slug is optional / display-only for now). */
+export function slugify(raw: string): string {
+  return raw
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+}
+
 /** First-run defaults — shared by the store's initial load fallback and `resetControl`. */
 export const CONTROL_DEFAULTS: ControlConfig = {
   defaultMode: "auto",
@@ -116,4 +150,25 @@ export const CONTROL_DEFAULTS: ControlConfig = {
   injectMemory: true,
   userInstructions: "",
   promptFiles: [],
+  // Seed teammates so the Team tab is demoable offline (SET.12); reset restores them.
+  teammates: [
+    {
+      id: "reviewer",
+      name: "Riley Reviewer",
+      slug: "reviewer",
+      description: "Scans diffs and flags risky changes before they land.",
+    },
+    {
+      id: "scribe",
+      name: "Sam Scribe",
+      slug: "scribe",
+      description: "Drafts docs and changelogs from the session.",
+    },
+  ],
+  ui: {
+    accentColor: "#6366f1",
+    logoPath: "",
+    faviconPath: "",
+    contextualGreeting: true,
+  },
 };
