@@ -15,6 +15,7 @@ import {
   SplitSquareHorizontal,
   SplitSquareVertical,
   Sun,
+  Trash2,
   X,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -47,6 +48,16 @@ import {
   DropdownMenuSubContent,
   DropdownMenuSeparator,
 } from "@/components/ui/dropdown-menu";
+import {
+  AlertDialog,
+  AlertDialogContent,
+  AlertDialogHeader,
+  AlertDialogFooter,
+  AlertDialogTitle,
+  AlertDialogDescription,
+  AlertDialogAction,
+  AlertDialogCancel,
+} from "@/components/ui/alert-dialog";
 import { arrangeSessions, filterSessions, resolveLabel } from "@/lib/sessions";
 import type { Session } from "@/bindings";
 
@@ -59,6 +70,7 @@ interface MenuParts {
   Item: ComponentType<{
     onSelect?: (event: Event) => void;
     disabled?: boolean;
+    className?: string;
     children?: ReactNode;
   }>;
   Sub: ComponentType<{ children?: ReactNode }>;
@@ -93,9 +105,10 @@ interface SessionMenuItemsProps {
   onTogglePin: () => void;
   onDismissToggle: () => void;
   onRename: () => void;
+  onDelete: () => void;
 }
 
-function SessionMenuItems({
+export function SessionMenuItems({
   parts: P,
   atCap,
   pinned,
@@ -105,6 +118,7 @@ function SessionMenuItems({
   onTogglePin,
   onDismissToggle,
   onRename,
+  onDelete,
 }: SessionMenuItemsProps) {
   return (
     <>
@@ -136,6 +150,14 @@ function SessionMenuItems({
         <Pencil />
         Rename
       </P.Item>
+      <P.Separator />
+      <P.Item
+        onSelect={onDelete}
+        className="text-destructive focus:text-destructive"
+      >
+        <Trash2 />
+        Delete
+      </P.Item>
     </>
   );
 }
@@ -159,12 +181,14 @@ export function SessionItem({
 }) {
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState("");
+  const [confirmingDelete, setConfirmingDelete] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
 
   const sessionTitles = useChatStore((s) => s.sessionTitles);
   const selectSession = useChatStore((s) => s.selectSession);
   const loadSession = useChatStore((s) => s.loadSession);
   const setSessionTitle = useChatStore((s) => s.setSessionTitle);
+  const deleteSession = useChatStore((s) => s.deleteSession);
   const atCap = usePanesStore((s) => s.leafCount() >= MAX_PANES);
   const togglePin = useSessionPrefsStore((s) => s.togglePin);
   const dismiss = useSessionPrefsStore((s) => s.dismiss);
@@ -175,6 +199,9 @@ export function SessionItem({
   const onDismissToggle = () =>
     dismissed ? restore(session.id) : dismiss(session.id);
   const onRename = () => setEditing(true);
+  // A menu item closes its menu on select, so defer the confirm to the next tick
+  // to avoid the dialog and the closing menu fighting over focus.
+  const onDelete = () => setConfirmingDelete(true);
 
   const currentLabel = resolveLabel(session, sessionTitles[session.id]);
 
@@ -319,6 +346,7 @@ export function SessionItem({
                           onTogglePin={onTogglePin}
                           onDismissToggle={onDismissToggle}
                           onRename={onRename}
+                          onDelete={onDelete}
                         />
                       </DropdownMenuContent>
                     </DropdownMenu>
@@ -345,8 +373,28 @@ export function SessionItem({
           onTogglePin={onTogglePin}
           onDismissToggle={onDismissToggle}
           onRename={onRename}
+          onDelete={onDelete}
         />
       </ContextMenuContent>
+
+      <AlertDialog open={confirmingDelete} onOpenChange={setConfirmingDelete}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Delete session?</AlertDialogTitle>
+            <AlertDialogDescription>
+              This permanently removes &ldquo;{currentLabel}&rdquo; and its
+              transcript. This can&rsquo;t be undone. (To hide a session without
+              losing it, use Dismiss.)
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>Cancel</AlertDialogCancel>
+            <AlertDialogAction onClick={() => void deleteSession(session.id)}>
+              Delete
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </ContextMenu>
   );
 }

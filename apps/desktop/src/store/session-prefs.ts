@@ -20,6 +20,9 @@ export interface SessionPrefsState {
   dismiss: (id: string) => void;
   /** Un-hide a previously dismissed session. */
   restore: (id: string) => void;
+  /** Drop all prefs for a session that no longer exists (e.g. after delete #168),
+   *  so no orphaned pin/dismiss entry lingers. */
+  purge: (id: string) => void;
   isPinned: (id: string) => boolean;
   isDismissed: (id: string) => boolean;
 }
@@ -48,6 +51,12 @@ export const useSessionPrefsStore = create<SessionPrefsState>()(
 
       restore: (id) =>
         set((s) => ({ dismissed: s.dismissed.filter((x) => x !== id) })),
+
+      purge: (id) =>
+        set((s) => ({
+          pinned: s.pinned.filter((x) => x !== id),
+          dismissed: s.dismissed.filter((x) => x !== id),
+        })),
 
       isPinned: (id) => get().pinned.includes(id),
       isDismissed: (id) => get().dismissed.includes(id),

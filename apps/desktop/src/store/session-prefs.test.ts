@@ -40,6 +40,17 @@ describe("useSessionPrefsStore", () => {
     expect(useSessionPrefsStore.getState().dismissed).toEqual(["a"]);
   });
 
+  it("purge drops a session id from both pinned and dismissed", () => {
+    const s = useSessionPrefsStore.getState();
+    s.togglePin("a");
+    s.dismiss("b");
+    s.togglePin("c");
+    useSessionPrefsStore.getState().purge("a");
+    useSessionPrefsStore.getState().purge("b");
+    expect(useSessionPrefsStore.getState().pinned).toEqual(["c"]);
+    expect(useSessionPrefsStore.getState().dismissed).toEqual([]);
+  });
+
   it("persists to localStorage under ff-session-prefs", () => {
     useSessionPrefsStore.getState().togglePin("a");
     useSessionPrefsStore.getState().dismiss("b");
