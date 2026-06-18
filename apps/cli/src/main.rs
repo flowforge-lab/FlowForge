@@ -103,15 +103,36 @@ async fn run(prompt: String, json: bool, approval_mode: ApprovalMode) -> ExitCod
     let skills = host::load_skills();
     let workspace = host::workspace_root();
     let store = ff_session::SessionStore::new();
-    let registry = ff_tools::ToolRegistry::with_defaults();
+    let mut registry = ff_tools::ToolRegistry::with_defaults();
+    // Durable-memory recall (RFC 0006). One-shot process: build the store + index,
+    // do a full reindex from disk, and register the tools. No watcher (nothing
+    // long-lived to keep current). Best-effort: an index failure leaves the
+    // ambient block working but skips the recall tools.
+    let memory_store = std::sync::Arc::new(ff_memory::Memory::with_default_root(
+        ff_memory::MemoryConfig::default(),
+    ));
+    if let Ok(index) = ff_memory::Fts5Index::open(memory_store.index_path()) {
+        let index: std::sync::Arc<dyn ff_memory::MemoryIndex> = std::sync::Arc::new(index);
+        let _ = ff_memory::MemoryIndex::reindex(index.as_ref(), &memory_store.all_chunks());
+        registry.register(Box::new(ff_tools::memory::MemorySearchTool::new(
+            memory_store.clone(),
+            index.clone(),
+        )));
+        registry.register(Box::new(ff_tools::memory::MemoryGetTool::new(
+            memory_store.clone(),
+        )));
+        registry.register(Box::new(ff_tools::memory::MemoryWriteTool::new(
+            memory_store.clone(),
+            index.clone(),
+        )));
+    }
     let approver = CliApprover::new(approval_mode);
 
     let session = store.create_session(None);
     store.add_message(&session.id, Role::User, prompt);
 
     let user_ctx = UserContext::now();
-    let memory =
-        ff_memory::Memory::with_default_root(ff_memory::MemoryConfig::default()).ambient_block();
+    let memory = memory_store.ambient_block();
     let system_prompt =
         ff_agent::build_system_prompt(None, &skills, &[], &user_ctx, memory.as_deref());
 

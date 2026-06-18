@@ -9,12 +9,15 @@ use ff_core::{
 };
 use ff_llm::{OllamaProvider, OpenAiProvider, Provider};
 use ff_mcp::{McpConfigWatcher, SupervisorHandle};
+use ff_memory::watch::MemoryWatcher;
+use ff_memory::{Fts5Index, Memory, MemoryConfig, MemoryIndex};
 use ff_session::SessionStore;
 use ff_signals::{SignalStore, SkillAggregate, SkillCompleted};
 use ff_skills::{
     default_phenotype, load_phenotypes, SharedRegistry, SkillRegistry, SkillWatcher,
     DEFAULT_PHENOTYPE,
 };
+use ff_tools::memory::{MemoryGetTool, MemorySearchTool, MemoryWriteTool};
 use ff_tools::ToolRegistry;
 use tokio::sync::oneshot;
 
@@ -306,6 +309,14 @@ pub struct AppState {
     /// runs. The MCP control commands write back to this exact file so their edits flow
     /// through the same watcher that drives reconcile. `None` until MCP is initialized.
     mcp_config_path: Mutex<Option<PathBuf>>,
+    /// Durable agent memory (RFC 0006): the Markdown store at `~/.flowforge/memory`
+    /// and its FTS5 recall index, shared (via `Arc`) with the registered
+    /// `memory_*` tools. The index is a derived cache rebuilt from the Markdown on
+    /// startup and kept current by `_memory_watcher`.
+    memory: Arc<Memory>,
+    memory_index: Arc<dyn MemoryIndex>,
+    /// Owns the memory filesystem watcher; dropping it stops debounced reindex.
+    _memory_watcher: Mutex<Option<MemoryWatcher>>,
 }
 
 impl AppState {
@@ -320,6 +331,7 @@ impl AppState {
         // Shared so the registered `web_search` tool and `set_search_config` see the
         // same cell; a settings change takes effect on the next call.
         let search_config = Arc::new(Mutex::new(load_search_config()));
+        let (memory, memory_index, memory_watcher) = build_memory();
         let state = Self {
             store: SessionStore::new(),
             registry: Mutex::new(registry),
@@ -334,6 +346,9 @@ impl AppState {
             _mcp_watcher: Mutex::new(None),
             mcp: Mutex::new(None),
             mcp_config_path: Mutex::new(None),
+            memory,
+            memory_index,
+            _memory_watcher: Mutex::new(memory_watcher),
         };
         // Restore the persisted phenotype so its active skills survive a restart.
         // An unknown/missing pointer falls back to the built-in default.
@@ -368,6 +383,12 @@ impl AppState {
         drop(known);
         *self.active_skills.lock().unwrap() = next;
         *self.active_phenotype.lock().unwrap() = pheno;
+    }
+
+    /// The shared durable-memory store (RFC 0006), used for per-turn ambient
+    /// injection and shared with the registered `memory_*` tools.
+    pub fn memory(&self) -> Arc<Memory> {
+        self.memory.clone()
     }
 
     /// The directory installed skills live in.
@@ -407,6 +428,17 @@ impl AppState {
             self.skills.clone(),
         )));
         reg.register(Box::new(crate::tools::SkillsTool::new(self.skills.clone())));
+        // Durable-memory recall tools (RFC 0006 §6-7). Share the long-lived store
+        // and index so a `memory_write` is searchable within the same turn.
+        reg.register(Box::new(MemorySearchTool::new(
+            self.memory.clone(),
+            self.memory_index.clone(),
+        )));
+        reg.register(Box::new(MemoryGetTool::new(self.memory.clone())));
+        reg.register(Box::new(MemoryWriteTool::new(
+            self.memory.clone(),
+            self.memory_index.clone(),
+        )));
         // Bridge MCP tools from currently-running servers (M4.3).
         if let Some(handle) = self.mcp_handle() {
             for tool in ff_mcp::build_bridged_tools(&handle) {
@@ -804,6 +836,58 @@ fn load_skills() -> (Option<SkillWatcher>, SharedRegistry) {
             let (reg, _) = SkillRegistry::load_dir(&root);
             (None, Arc::new(RwLock::new(reg)))
         }
+    }
+}
+
+/// Build the durable-memory store, its recall index, and a debounced reindex
+/// watcher (RFC 0006). Best-effort: the index is a derived cache, so if it can't
+/// open on disk we fall back to an in-memory index, and if even that fails the
+/// `memory_*` tools degrade to no-ops rather than failing app start. The initial
+/// full reindex happens here (not in the watcher) so a build error is logged once.
+fn build_memory() -> (Arc<Memory>, Arc<dyn MemoryIndex>, Option<MemoryWatcher>) {
+    let memory = Arc::new(Memory::with_default_root(MemoryConfig::default()));
+    let index: Arc<dyn MemoryIndex> = match Fts5Index::open(memory.index_path()) {
+        Ok(i) => Arc::new(i),
+        Err(e) => {
+            tracing::warn!(error = %e, "memory index unavailable on disk; using in-memory");
+            match Fts5Index::open_in_memory() {
+                Ok(i) => Arc::new(i),
+                Err(e) => {
+                    tracing::warn!(error = %e, "memory index unavailable; recall disabled");
+                    return (memory, Arc::new(NullIndex), None);
+                }
+            }
+        }
+    };
+    if let Err(e) = index.reindex(&memory.all_chunks()) {
+        tracing::warn!(error = %e, "initial memory reindex failed");
+    }
+    let watcher = MemoryWatcher::spawn(memory.clone(), index.clone())
+        .map_err(|e| tracing::warn!(error = %e, "memory watcher unavailable"))
+        .ok();
+    (memory, index, watcher)
+}
+
+/// A do-nothing recall index used only when SQLite is entirely unavailable, so the
+/// `memory_*` tools return empty results instead of erroring the turn.
+struct NullIndex;
+
+impl MemoryIndex for NullIndex {
+    fn reindex(&self, _chunks: &[ff_memory::MemoryChunk]) -> ff_memory::Result<()> {
+        Ok(())
+    }
+    fn reindex_path(
+        &self,
+        _path: &Path,
+        _chunks: &[ff_memory::MemoryChunk],
+    ) -> ff_memory::Result<()> {
+        Ok(())
+    }
+    fn remove_path(&self, _path: &Path) -> ff_memory::Result<()> {
+        Ok(())
+    }
+    fn search(&self, _query: &str, _k: usize) -> ff_memory::Result<Vec<ff_memory::ScoredChunk>> {
+        Ok(Vec::new())
     }
 }
 
