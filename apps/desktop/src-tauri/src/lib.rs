@@ -451,6 +451,21 @@ fn send_message(
         // Persist the turn's telemetry once, lock-free (addresses #77 nit 1).
         state.persist_signals();
 
+        // Pre-compaction memory flush (RFC 0006 §7.2): once the visible turn has
+        // finished cleanly, persist any durable facts before context pressure forces
+        // a summarization that would drop them. Silent — never adds to the transcript.
+        if success {
+            state
+                .maybe_flush_memory(
+                    provider.as_ref(),
+                    &registry,
+                    &sid,
+                    &model,
+                    cancel_probe.clone(),
+                )
+                .await;
+        }
+
         state.take_cancel(&session_id);
     });
 

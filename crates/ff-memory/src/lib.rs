@@ -19,10 +19,12 @@
 //! an error, so callers never need a try/catch around a fresh install.
 
 mod error;
+pub mod flush;
 pub mod index;
 pub mod watch;
 
 pub use error::{MemoryError, Result};
+pub use flush::{FlushLedger, FlushRecord};
 pub use index::{Fts5Index, MemoryIndex, ScoredChunk};
 
 use std::path::{Path, PathBuf};

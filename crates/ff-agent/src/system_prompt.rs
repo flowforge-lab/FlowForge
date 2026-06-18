@@ -118,6 +118,22 @@ pub fn build_system_prompt(
     out
 }
 
+/// The system prompt for a pre-compaction memory-flush turn (RFC 0006 §7.2).
+///
+/// Steers the model to persist only durable, non-obvious facts, and to favor the
+/// daily log over `MEMORY.md` so the always-injected curated file stays small and
+/// high-signal (RFC 0006 §7.1). `NO_REPLY` is the explicit "nothing worth keeping"
+/// escape hatch — the flush turn never surfaces text to the user, so a `NO_REPLY`
+/// simply writes nothing.
+pub fn build_flush_prompt() -> String {
+    "This conversation is about to be summarized and older detail will be lost. Before that happens, persist anything durable using the `memory_write` tool.
+
+Save only facts that should outlive this conversation: stable user preferences, decisions made, identity or project details, and concrete commitments. Write each fact to the daily log (the default `memory_write` target). Reserve `MEMORY.md` for clearly enduring preferences the user asked you to remember — when unsure, use the daily log.
+
+Do NOT save transient chatter, restate the obvious, or duplicate facts already in memory (use `memory_search` first if unsure). If nothing is worth keeping, reply with exactly `NO_REPLY` and write nothing."
+        .to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

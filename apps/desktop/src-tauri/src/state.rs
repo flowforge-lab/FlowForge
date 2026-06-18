@@ -3,14 +3,17 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 
-use ff_agent::CancelToken;
+use ff_agent::{
+    flush_due, CancelToken, CompactionContext, CompactionStrategy, ContextPressureEstimator,
+    MemoryFlush, ProxyTokenEstimator, DEFAULT_FLUSH_AT_FRACTION,
+};
 use ff_core::{
     Phenotype, ProviderConfig, ProviderConnection, ProviderKind, ProviderRegistry, SearchConfig,
 };
 use ff_llm::{OllamaProvider, OpenAiProvider, Provider};
 use ff_mcp::{McpConfigWatcher, SupervisorHandle};
 use ff_memory::watch::MemoryWatcher;
-use ff_memory::{Fts5Index, Memory, MemoryConfig, MemoryIndex};
+use ff_memory::{FlushLedger, Fts5Index, Memory, MemoryConfig, MemoryIndex};
 use ff_session::SessionStore;
 use ff_signals::{SignalStore, SkillAggregate, SkillCompleted};
 use ff_skills::{
@@ -315,6 +318,9 @@ pub struct AppState {
     /// startup and kept current by `_memory_watcher`.
     memory: Arc<Memory>,
     memory_index: Arc<dyn MemoryIndex>,
+    /// Durable per-session flush ledger (RFC 0006 §7.2). `None` if its sidecar db
+    /// could not be opened — the flush then degrades to off rather than failing.
+    flush_ledger: Option<Arc<FlushLedger>>,
     /// Owns the memory filesystem watcher; dropping it stops debounced reindex.
     _memory_watcher: Mutex<Option<MemoryWatcher>>,
 }
@@ -332,6 +338,12 @@ impl AppState {
         // same cell; a settings change takes effect on the next call.
         let search_config = Arc::new(Mutex::new(load_search_config()));
         let (memory, memory_index, memory_watcher) = build_memory();
+        let flush_ledger = FlushLedger::open(memory.root().join("flush.db"))
+            .map(Arc::new)
+            .map_err(
+                |e| tracing::warn!(error = %e, "flush ledger unavailable; memory flush disabled"),
+            )
+            .ok();
         let state = Self {
             store: SessionStore::new(),
             registry: Mutex::new(registry),
@@ -348,6 +360,7 @@ impl AppState {
             mcp_config_path: Mutex::new(None),
             memory,
             memory_index,
+            flush_ledger,
             _memory_watcher: Mutex::new(memory_watcher),
         };
         // Restore the persisted phenotype so its active skills survive a restart.
@@ -383,6 +396,73 @@ impl AppState {
         drop(known);
         *self.active_skills.lock().unwrap() = next;
         *self.active_phenotype.lock().unwrap() = pheno;
+    }
+
+    /// Run a pre-compaction memory flush if the session is now under context
+    /// pressure (RFC 0006 §7.2). Best-effort and silent: it persists durable facts
+    /// to memory before older detail is summarized away, and never touches the
+    /// visible transcript. No-op when memory is disabled or the flush ledger is
+    /// unavailable.
+    ///
+    /// Cycle policy (v1): flush the first time a session crosses the budget, then at
+    /// most once per [`REFLUSH_INTERVAL_MESSAGES`] of further growth while still over
+    /// budget. A real auto-compaction trigger (its own work) will later advance the
+    /// cycle marker; the estimator/strategy seams in `ff-agent` already accommodate
+    /// per-model windows and richer strategies.
+    pub async fn maybe_flush_memory(
+        &self,
+        provider: &dyn Provider,
+        registry: &ToolRegistry,
+        session_id: &str,
+        model: &str,
+        cancel: CancelToken,
+    ) {
+        let Some(ledger) = self.flush_ledger.as_ref() else {
+            return;
+        };
+        if !self.memory.is_enabled() {
+            return;
+        }
+        let history = self.store.get_messages(session_id);
+        let pressure = ProxyTokenEstimator::default().assess(&history, model);
+        let message_count = history.len() as u64;
+        let last_flush_count = match ledger.last_flush(session_id) {
+            Ok(rec) => rec.map(|r| r.message_count),
+            Err(e) => {
+                tracing::warn!(error = %e, "flush ledger read failed; skipping flush");
+                return;
+            }
+        };
+        if !flush_due(
+            pressure,
+            message_count,
+            last_flush_count,
+            DEFAULT_FLUSH_AT_FRACTION,
+            REFLUSH_INTERVAL_MESSAGES,
+        ) {
+            return;
+        }
+
+        let outcome = MemoryFlush
+            .compact(CompactionContext {
+                provider,
+                store: &self.store,
+                registry,
+                root: &self.workspace_root,
+                session_id,
+                model,
+                cancel,
+            })
+            .await;
+        match outcome {
+            Ok(o) => {
+                tracing::info!(?o, session = %session_id, "pre-compaction memory flush");
+                if let Err(e) = ledger.record_flush(session_id, message_count, now_ms()) {
+                    tracing::warn!(error = %e, "flush ledger write failed");
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "memory flush failed"),
+        }
     }
 
     /// The shared durable-memory store (RFC 0006), used for per-turn ambient
@@ -837,6 +917,19 @@ fn load_skills() -> (Option<SkillWatcher>, SharedRegistry) {
             (None, Arc::new(RwLock::new(reg)))
         }
     }
+}
+
+/// How much the transcript must grow (in messages) before a session that is still
+/// over budget is flushed again. Keeps a long over-budget session from flushing
+/// every turn while still capturing durable facts stated much later (RFC 0006 §7.2).
+const REFLUSH_INTERVAL_MESSAGES: u64 = 40;
+
+/// Current wall-clock time as Unix epoch milliseconds.
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 /// Build the durable-memory store, its recall index, and a debounced reindex
