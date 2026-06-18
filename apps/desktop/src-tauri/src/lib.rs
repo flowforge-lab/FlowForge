@@ -166,6 +166,16 @@ fn delete_session(state: State<'_, Arc<AppState>>, session_id: String) {
     state.store.delete_session(&session_id);
 }
 
+/// Clone a session and its transcript into a fresh session (server-truth).
+/// Backs the sidebar/split Duplicate action.
+#[tauri::command]
+fn fork_session(state: State<'_, Arc<AppState>>, session_id: String) -> Result<Session, String> {
+    state
+        .store
+        .fork_session(&session_id)
+        .ok_or_else(|| format!("unknown session: {session_id}"))
+}
+
 #[tauri::command]
 fn cancel_turn(state: State<'_, Arc<AppState>>, session_id: String) {
     if let Some(token) = state.take_cancel(&session_id) {
@@ -922,6 +932,7 @@ pub fn run() {
             get_messages,
             rename_session,
             delete_session,
+            fork_session,
             send_message,
             cancel_turn,
             respond_approval,
