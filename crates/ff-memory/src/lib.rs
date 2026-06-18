@@ -48,6 +48,30 @@ pub enum WriteTarget {
     Curated,
 }
 
+/// Which memory file a [`MemoryFile`] is. Mirrors [`MemorySource`] but is a plain,
+/// flat enum for the read-only Settings browse surface (M5.1e).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoryFileKind {
+    /// The curated `MEMORY.md`.
+    Curated,
+    /// A dated daily log under `daily/`.
+    Daily,
+}
+
+/// A memory file as the Settings pane sees it (RFC 0006 §8, #131): name, root-
+/// relative path, kind, size, and mtime. Read-only; no contents.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryFile {
+    /// File name, e.g. `MEMORY.md` or `2026-06-18.md`.
+    pub name: String,
+    /// Path relative to the memory root, e.g. `MEMORY.md` or `daily/2026-06-18.md`.
+    pub rel_path: String,
+    pub kind: MemoryFileKind,
+    pub size_bytes: u64,
+    /// Last-modified time in epoch milliseconds, or 0 if unavailable.
+    pub modified_ms: i64,
+}
+
 /// One indexed unit of memory, chunked from a Markdown file (RFC 0006 §4).
 ///
 /// M5.0 defines the shape but only chunks for tests; the FTS5 index (M5.1)
@@ -238,6 +262,75 @@ impl Memory {
             }
         }
         out
+    }
+
+    /// List every memory file for the read-only Settings browse surface (M5.1e,
+    /// #131): the curated `MEMORY.md` first, then daily logs newest-first. Skips
+    /// the derived `index.db` and any non-Markdown entry. Missing files/dirs yield
+    /// an empty list (never an error).
+    pub fn list_files(&self) -> Vec<MemoryFile> {
+        let mut out = Vec::new();
+        let curated = self.curated_path();
+        if curated.is_file() {
+            if let Some(f) = self.describe_file(&curated, MemoryFileKind::Curated) {
+                out.push(f);
+            }
+        }
+        if let Ok(entries) = std::fs::read_dir(self.root.join("daily")) {
+            let mut daily: Vec<PathBuf> = entries
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| p.is_file() && p.extension().and_then(|e| e.to_str()) == Some("md"))
+                .collect();
+            // Newest-first: file names are `YYYY-MM-DD.md`, so a reverse lexical
+            // sort is chronological.
+            daily.sort();
+            daily.reverse();
+            for path in daily {
+                if let Some(f) = self.describe_file(&path, MemoryFileKind::Daily) {
+                    out.push(f);
+                }
+            }
+        }
+        out
+    }
+
+    /// Read a memory file by its root-relative path (as handed out by
+    /// [`list_files`](Self::list_files)). Returns `None` when the path escapes the
+    /// root (reuses the hardened [`within_root`](Self::within_root) from #176);
+    /// a missing file within the root reads as `Some(String::new())`.
+    pub fn read_file(&self, rel_path: &str) -> Option<String> {
+        let path = self.root.join(rel_path);
+        if !self.within_root(&path) {
+            return None;
+        }
+        Some(read_lenient(&path))
+    }
+
+    /// Build a [`MemoryFile`] from a path on disk; `None` if metadata is
+    /// unreadable. `rel_path` strips the root prefix for display.
+    fn describe_file(&self, path: &Path, kind: MemoryFileKind) -> Option<MemoryFile> {
+        let meta = std::fs::metadata(path).ok()?;
+        let modified_ms = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        // Forward slashes so the wire contract is platform-stable; `read_file`
+        // joins it back onto the root regardless of OS separator.
+        let rel_path = path
+            .strip_prefix(&self.root)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        Some(MemoryFile {
+            name: path.file_name()?.to_string_lossy().into_owned(),
+            rel_path,
+            kind,
+            size_bytes: meta.len(),
+            modified_ms,
+        })
     }
 
     /// Containment check. Paths may not exist yet (so no `canonicalize`); reject
@@ -450,6 +543,59 @@ mod tests {
         assert_eq!(m.get(&root.join("../secret.txt"), None, None), "");
         // An absolute path outside the root is likewise rejected.
         assert_eq!(m.get(&secret, None, None), "");
+    }
+
+    #[test]
+    fn list_files_orders_curated_then_daily_newest_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("MEMORY.md"), "# curated\nhello").unwrap();
+        std::fs::create_dir_all(root.join("daily")).unwrap();
+        std::fs::write(root.join("daily/2026-06-16.md"), "older").unwrap();
+        std::fs::write(root.join("daily/2026-06-18.md"), "newer").unwrap();
+        // A non-Markdown sibling and the derived index must be ignored.
+        std::fs::write(root.join("index.db"), "binary").unwrap();
+        std::fs::write(root.join("daily/notes.txt"), "x").unwrap();
+
+        let files = mem(root).list_files();
+        let names: Vec<&str> = files.iter().map(|f| f.rel_path.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["MEMORY.md", "daily/2026-06-18.md", "daily/2026-06-16.md"]
+        );
+        assert_eq!(files[0].kind, MemoryFileKind::Curated);
+        assert_eq!(files[1].kind, MemoryFileKind::Daily);
+        assert!(files[0].size_bytes > 0);
+        assert!(files.iter().all(|f| f.modified_ms >= 0));
+    }
+
+    #[test]
+    fn list_files_empty_when_nothing_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(mem(dir.path()).list_files().is_empty());
+    }
+
+    #[test]
+    fn read_file_round_trips_and_rejects_traversal() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("memory");
+        std::fs::create_dir_all(root.join("daily")).unwrap();
+        std::fs::write(root.join("MEMORY.md"), "curated body").unwrap();
+        std::fs::write(root.join("daily/2026-06-18.md"), "daily body").unwrap();
+        let secret = dir.path().join("secret.txt");
+        std::fs::write(&secret, "TOP-SECRET").unwrap();
+        let m = mem(&root);
+
+        assert_eq!(m.read_file("MEMORY.md").as_deref(), Some("curated body"));
+        assert_eq!(
+            m.read_file("daily/2026-06-18.md").as_deref(),
+            Some("daily body")
+        );
+        // Missing-but-in-root reads as empty, never an error.
+        assert_eq!(m.read_file("daily/2099-01-01.md").as_deref(), Some(""));
+        // Traversal escapes are rejected outright.
+        assert_eq!(m.read_file("../secret.txt"), None);
+        assert_eq!(m.read_file("daily/../../secret.txt"), None);
     }
 
     fn write(path: &Path, body: &str) {
