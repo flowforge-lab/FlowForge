@@ -451,7 +451,23 @@ fn send_message(
         // Persist the turn's telemetry once, lock-free (addresses #77 nit 1).
         state.persist_signals();
 
+        // Drop the session's cancel token *before* the flush. The token is keyed
+        // by session_id alone, so leaving it registered across the (potentially
+        // multi-second, multi-round-trip) silent flush lets the next turn's
+        // register_cancel overwrite it — then this task's take_cancel would remove
+        // the *new* turn's token, silently disabling its Stop button and
+        // auto-denying all of its tool approvals. The flush runs on cancel_probe,
+        // the task-local clone it already owns, so it stays bounded and silent.
         state.take_cancel(&session_id);
+
+        // Pre-compaction memory flush (RFC 0006 §7.2): once the visible turn has
+        // finished cleanly, persist any durable facts before context pressure forces
+        // a summarization that would drop them. Silent — never adds to the transcript.
+        if success {
+            state
+                .maybe_flush_memory(provider.as_ref(), &registry, &sid, &model, cancel_probe)
+                .await;
+        }
     });
 
     Ok(user_msg.id)

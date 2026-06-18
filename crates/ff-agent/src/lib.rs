@@ -18,8 +18,14 @@ use ff_tools::{Safety, ToolRegistry};
 use futures_util::StreamExt;
 use serde::Serialize;
 
+mod compaction;
 mod system_prompt;
-pub use system_prompt::{build_system_prompt, UserContext};
+pub use compaction::{
+    flush_due, CompactionContext, CompactionOutcome, CompactionStrategy, ContextPressure,
+    ContextPressureEstimator, MemoryFlush, ProxyTokenEstimator, DEFAULT_CONTEXT_BUDGET_TOKENS,
+    DEFAULT_FLUSH_AT_FRACTION,
+};
+pub use system_prompt::{build_flush_prompt, build_system_prompt, UserContext};
 
 /// Events the agent emits during a turn. The host (Tauri shell or a test) decides
 /// how to surface them — over IPC, to a channel, or into assertions.
@@ -128,7 +134,7 @@ fn role_str(role: Role) -> &'static str {
     }
 }
 
-fn to_chat(messages: &[Message]) -> Vec<ChatMessage> {
+pub(crate) fn to_chat(messages: &[Message]) -> Vec<ChatMessage> {
     messages
         .iter()
         .map(|m| {
