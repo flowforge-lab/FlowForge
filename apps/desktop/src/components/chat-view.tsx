@@ -14,12 +14,14 @@ function MessageRowImpl({
   message,
   streaming,
   toolSteps,
+  turnStartMs,
   respondApproval,
   respondAsk,
 }: {
   message: Message;
   streaming: boolean;
   toolSteps: ToolStep[];
+  turnStartMs?: number | null;
   respondApproval: (
     sessionId: string,
     messageId: string,
@@ -68,10 +70,9 @@ function MessageRowImpl({
     <div className="flex flex-col items-start gap-1.5">
       {toolSteps.length > 0 && (
         <div className="flex w-full max-w-[80%] flex-col gap-1.5">
-          {/* A single step renders bare (unchanged) — grouping exists to tame a
-              multi-step flood, and one step isn't a flood. 2+ steps fold into a
-              collapsible "N steps" group. */}
-          {toolSteps.length === 1 ? (
+          {/* Single settled step stays bare; streaming (any count) or 2+ steps use
+              StepGroup so the live timer and peek window apply (#180). */}
+          {toolSteps.length === 1 && !streaming ? (
             <ToolStepBlock
               step={toolSteps[0]}
               onRespond={onRespond}
@@ -81,6 +82,7 @@ function MessageRowImpl({
             <StepGroup
               steps={toolSteps}
               streaming={streaming}
+              turnStartMs={turnStartMs}
               onRespond={onRespond}
               onAnswer={onAnswer}
             />
@@ -123,6 +125,8 @@ export function ChatView({ sessionId }: { sessionId?: string } = {}) {
     targetSessionId ? s.streamingBySession[targetSessionId] : undefined,
   );
   const toolStepsByMessage = useChatStore((s) => s.toolStepsByMessage);
+  const turnStartByMessage = useChatStore((s) => s.turnStartByMessage);
+  const turnStartBySession = useChatStore((s) => s.turnStartBySession);
   const respondApproval = useChatStore((s) => s.respondApproval);
   const respondAsk = useChatStore((s) => s.respondAsk);
 
@@ -177,6 +181,9 @@ export function ChatView({ sessionId }: { sessionId?: string } = {}) {
             message={m}
             streaming={m.id === streamingId}
             toolSteps={toolStepsByMessage[m.id] ?? NO_STEPS}
+            turnStartMs={
+              turnStartByMessage[m.id] ?? turnStartBySession[m.sessionId]
+            }
             respondApproval={respondApproval}
             respondAsk={respondAsk}
           />

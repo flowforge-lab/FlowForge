@@ -12,7 +12,8 @@ import {
 import { cn } from "@/lib/utils";
 import { formatArgs } from "@/lib/tool-args";
 import { parseMcpToolName } from "@/lib/mcp";
-import { parseTodo, todoSummary } from "@/lib/todo";
+import { describeStep } from "@/lib/step-describe";
+import { parseTodo } from "@/lib/todo";
 import { TodoList } from "@/components/todo-list";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
@@ -107,8 +108,7 @@ function SafetyBadge({ safety }: { safety: NonNullable<ToolStep["safety"]> }) {
   );
 }
 
-/** Tool name label. Bridged MCP tools (`mcp__<server>__<tool>`) render as a
- *  server badge + bare tool name instead of the raw namespaced id (#91). */
+/** MCP tools render as a server badge + bare tool name (#91). */
 function ToolLabel({ tool }: { tool: string }) {
   const mcp = parseMcpToolName(tool);
   if (!mcp) {
@@ -139,7 +139,6 @@ export function ToolStepBlock({
   // The `todo` tool renders its checklist from the call args (Issue #42). null =
   // not a todo step → fall back to the generic args/result render.
   const todoItems = step.tool === "todo" ? parseTodo(step.args) : null;
-  const summary = todoItems ? todoSummary(todoItems) : null;
   // Force-open whenever the user must act (an approval gate or an `ask_user`
   // prompt — covers both the mock's same-tick call+request and the real backend,
   // where the step mounts as "running" and flips later). A todo plan is meant to
@@ -149,6 +148,8 @@ export function ToolStepBlock({
     awaiting || asking || (todoItems !== null ? !userToggled : userToggled);
   const openInSplit = useSplitStore((s) => s.openInSplit);
   const args = formatArgs(step.args);
+  const mcp = parseMcpToolName(step.tool);
+  const description = describeStep(step);
   // The question travels on the step (set by applyAskRequest); fall back to the
   // call args so the prompt still renders if the event lost the text.
   const question =
@@ -177,23 +178,15 @@ export function ToolStepBlock({
           )}
         />
         <StatusIcon status={step.status} />
-        <ToolLabel tool={step.tool} />
+        <span className="min-w-0 truncate font-medium text-foreground">
+          {mcp ? <ToolLabel tool={step.tool} /> : description}
+        </span>
         {awaiting && step.safety && <SafetyBadge safety={step.safety} />}
         {asking && (
           <span className="rounded bg-sky-500/15 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-sky-700 dark:text-sky-400">
             needs answer
           </span>
         )}
-        {!open &&
-          (summary ? (
-            <span className="text-muted-foreground/70">
-              {summary.completed}/{summary.total}
-            </span>
-          ) : (
-            args !== "{}" && (
-              <span className="truncate text-muted-foreground/70">{args}</span>
-            )
-          ))}
       </button>
       {open && asking && (
         <AskPrompt
