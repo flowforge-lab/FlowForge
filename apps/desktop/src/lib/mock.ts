@@ -371,6 +371,29 @@ export class MockIpc implements FfIpc {
     return session;
   }
 
+  // Fork (#149): clone a session's transcript into a fresh session. The new
+  // session carries the source's goal + a `" (copy)"`-suffixed title, and a deep
+  // copy of its messages re-keyed to the new session id. Mirrors what the real
+  // backend command must do server-side.
+  async forkSession(sessionId: string): Promise<Session> {
+    const source = this.sessions.get(sessionId);
+    if (!source) throw new Error(`unknown session: ${sessionId}`);
+    const ts = now();
+    const forked: Session = {
+      ...source,
+      id: uid(),
+      title: source.title ? `${source.title} (copy)` : null,
+      createdAt: ts,
+      updatedAt: ts,
+    };
+    const clonedMessages: Message[] = (this.messages.get(sessionId) ?? []).map(
+      (m) => ({ ...m, id: uid(), sessionId: forked.id }),
+    );
+    this.sessions.set(forked.id, forked);
+    this.messages.set(forked.id, clonedMessages);
+    return { ...forked };
+  }
+
   async listSessions(): Promise<Session[]> {
     return [...this.sessions.values()].sort(
       (a, b) => b.updatedAt - a.updatedAt,

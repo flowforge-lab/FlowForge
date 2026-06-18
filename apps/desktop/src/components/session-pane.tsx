@@ -1,4 +1,10 @@
-import { SplitSquareHorizontal, SplitSquareVertical, X } from "lucide-react";
+import {
+  Columns2,
+  Rows2,
+  SplitSquareHorizontal,
+  SplitSquareVertical,
+  X,
+} from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { ChatView } from "@/components/chat-view";
@@ -24,6 +30,7 @@ export function SessionPane({
 }) {
   const focusPane = usePanesStore((s) => s.focusPane);
   const splitNew = usePanesStore((s) => s.splitNew);
+  const splitFork = usePanesStore((s) => s.splitFork);
   const closePane = usePanesStore((s) => s.closePane);
   const atCap = usePanesStore((s) => s.leafCount() >= MAX_PANES);
 
@@ -51,7 +58,7 @@ export function SessionPane({
             variant="ghost"
             size="icon-xs"
             disabled={atCap}
-            title="Split right"
+            title="Split right (new session)"
             onClick={() => void splitNew(paneId, "vertical")}
           >
             <SplitSquareHorizontal className="size-3.5" />
@@ -60,11 +67,33 @@ export function SessionPane({
             variant="ghost"
             size="icon-xs"
             disabled={atCap}
-            title="Split down"
+            title="Split down (new session)"
             onClick={() => void splitNew(paneId, "horizontal")}
           >
             <SplitSquareVertical className="size-3.5" />
           </Button>
+
+          {/* Fork: duplicate this pane's session into the new pane (#149). */}
+          <span className="mx-0.5 h-4 w-px shrink-0 bg-border" aria-hidden />
+          <Button
+            variant="ghost"
+            size="icon-xs"
+            disabled={atCap}
+            title="Duplicate right (fork session)"
+            onClick={() => void splitFork(paneId, "vertical")}
+          >
+            <Columns2 className="size-3.5" />
+          </Button>
+          <Button
+            variant="ghost"
+            size="icon-xs"
+            disabled={atCap}
+            title="Duplicate down (fork session)"
+            onClick={() => void splitFork(paneId, "horizontal")}
+          >
+            <Rows2 className="size-3.5" />
+          </Button>
+
           <Button
             variant="ghost"
             size="icon-xs"
