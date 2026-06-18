@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef } from "react";
-import { ArrowUp, Loader2, Square } from "lucide-react";
+import { ArrowUp, Square } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { ipc } from "@/lib/ipc";
 import { useChatStore } from "@/store/chat";
@@ -64,9 +64,10 @@ export function InputBar({
     targetSessionId ? Boolean(s.streamingBySession[targetSessionId]) : false,
   );
   // The gap between hitting send and the first streamed token: the turn is
-  // in flight on the backend but nothing renders yet. Derive it from the
+  // in flight on the backend but nothing renders yet. Derived from the
   // existing timing/streaming maps (turn started, no tokens) so the send
-  // button can show a spinner instead of looking idle.
+  // button offers Stop (the turn is cancellable here) while the transcript
+  // shows a "thinking" indicator.
   const pending = useChatStore((s) =>
     targetSessionId
       ? Boolean(s.turnStartBySession[targetSessionId]) &&
@@ -168,7 +169,7 @@ export function InputBar({
             }
           }}
         />
-        {streaming ? (
+        {streaming || pending ? (
           <Button
             variant="outline"
             size="icon"
@@ -177,16 +178,6 @@ export function InputBar({
             title="Stop (Esc)"
           >
             <Square className="size-3.5" />
-          </Button>
-        ) : pending ? (
-          <Button
-            size="icon"
-            className="size-8 shrink-0 rounded-lg"
-            disabled
-            title="Sending…"
-            aria-label="Sending"
-          >
-            <Loader2 className="size-4 animate-spin" />
           </Button>
         ) : (
           <Button

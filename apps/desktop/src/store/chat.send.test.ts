@@ -13,6 +13,8 @@ describe("chat store — session-scoped send/cancel (#148)", () => {
       activeSessionId: ACTIVE,
       messagesBySession: {},
       streamingBySession: {},
+      turnStartBySession: {},
+      turnStartByMessage: {},
       toolStepsByMessage: {},
       sessionTitles: {},
       bootstrapError: null,
@@ -65,6 +67,23 @@ describe("chat store — session-scoped send/cancel (#148)", () => {
     expect(useChatStore.getState().streamingBySession).toEqual({
       [ACTIVE]: "ma",
     });
+  });
+
+  it("cancelTurn cancels a turn still in the pending window (pre-first-token)", async () => {
+    // No streaming yet, only turn timing — the gap a Stop press lands in for a
+    // cold model. The backend registered the token at send time, so cancel must
+    // still fire and clear the timing.
+    useChatStore.setState({ turnStartBySession: { [BG]: 123 } });
+    const spy = vi.spyOn(ipc, "cancelTurn").mockResolvedValue();
+    await useChatStore.getState().cancelTurn(BG);
+    expect(spy).toHaveBeenCalledWith(BG);
+    expect(useChatStore.getState().turnStartBySession).toEqual({});
+  });
+
+  it("cancelTurn is a no-op for an idle session (no turn in flight)", async () => {
+    const spy = vi.spyOn(ipc, "cancelTurn").mockResolvedValue();
+    await useChatStore.getState().cancelTurn(BG);
+    expect(spy).not.toHaveBeenCalled();
   });
 
   it("cancelActiveTurn delegates to the active session", async () => {
