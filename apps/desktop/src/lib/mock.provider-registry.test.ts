@@ -9,6 +9,7 @@ const conn = (over: Partial<ProviderConnection> = {}): ProviderConnection => ({
   displayName: "New Connection",
   model: "some-model",
   hasKey: false,
+  thinking: true,
   ...over,
 });
 
@@ -101,7 +102,12 @@ describe("MockIpc provider connection registry", () => {
 
   it("getProviderConfig/setProviderConfig shim the active connection", async () => {
     const ipc = new MockIpc();
-    await ipc.setProviderConfig("candleVllm", "http://localhost:9000/v1", "m");
+    await ipc.setProviderConfig(
+      "candleVllm",
+      "http://localhost:9000/v1",
+      "m",
+      true,
+    );
     const cfg = await ipc.getProviderConfig();
     expect(cfg.baseUrl).toBe("http://localhost:9000/v1");
     expect(cfg.model).toBe("m");

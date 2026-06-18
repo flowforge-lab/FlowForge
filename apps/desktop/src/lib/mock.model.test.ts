@@ -9,11 +9,17 @@ describe("MockIpc provider config", () => {
     expect(cfg.kind).toBe("candleVllm");
     expect(cfg.model).toBeTruthy();
     expect(cfg.hasKey).toBe(false);
+    expect(cfg.thinking).toBe(true);
   });
 
   it("persists a provider/model change and echoes it back on reopen", async () => {
     const ipc = new MockIpc();
-    const stored = await ipc.setProviderConfig("ollama", undefined, "llama3.2");
+    const stored = await ipc.setProviderConfig(
+      "ollama",
+      undefined,
+      "llama3.2",
+      true,
+    );
     expect(stored.kind).toBe("ollama");
     expect(stored.model).toBe("llama3.2");
 
@@ -24,7 +30,12 @@ describe("MockIpc provider config", () => {
 
   it("treats a blank base url as unset", async () => {
     const ipc = new MockIpc();
-    const stored = await ipc.setProviderConfig("candleVllm", "   ", "Qwen3-4B");
+    const stored = await ipc.setProviderConfig(
+      "candleVllm",
+      "   ",
+      "Qwen3-4B",
+      true,
+    );
     expect(stored.baseUrl).toBeUndefined();
   });
 
@@ -37,7 +48,27 @@ describe("MockIpc provider config", () => {
 
   it("never reports a key (secrets are a later phase)", async () => {
     const ipc = new MockIpc();
-    const stored = await ipc.setProviderConfig("candleVllm", undefined, "m");
+    const stored = await ipc.setProviderConfig(
+      "candleVllm",
+      undefined,
+      "m",
+      false,
+    );
     expect(stored.hasKey).toBe(false);
+    expect(stored.thinking).toBe(false);
+  });
+
+  it("round-trips the thinking toggle", async () => {
+    const ipc = new MockIpc();
+    const off = await ipc.setProviderConfig(
+      "candleVllm",
+      undefined,
+      "m",
+      false,
+    );
+    expect(off.thinking).toBe(false);
+    expect((await ipc.getProviderConfig()).thinking).toBe(false);
+    const on = await ipc.setProviderConfig("candleVllm", undefined, "m", true);
+    expect(on.thinking).toBe(true);
   });
 });

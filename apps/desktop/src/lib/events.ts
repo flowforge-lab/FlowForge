@@ -24,18 +24,25 @@ export function startIpcEvents(): void {
   const tokens = new TokenBatcher(store.applyToken, (cb) =>
     requestAnimationFrame(cb),
   );
+  const reasoning = new TokenBatcher(store.applyReasoning, (cb) =>
+    requestAnimationFrame(cb),
+  );
 
   void ipc.onToken((e) => tokens.push(e));
+  void ipc.onReasoning((e) => reasoning.push(e));
   void ipc.onTurnDone((e) => {
     tokens.drain();
+    reasoning.drain();
     store.finishTurn(e);
   });
   void ipc.onTurnError((e) => {
     tokens.drain();
+    reasoning.drain();
     store.failTurn(e);
   });
   void ipc.onToolCall((e) => {
     tokens.drain();
+    reasoning.drain();
     store.applyToolCall(e);
   });
   void ipc.onToolResult(store.applyToolResult);

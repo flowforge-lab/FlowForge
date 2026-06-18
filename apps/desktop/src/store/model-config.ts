@@ -1,8 +1,8 @@
-// Model section state (#126). The provider (kind + model) is durable backend
-// config — loaded from / persisted via IPC, mirroring store/search-config.ts. The
-// reasoning controls (thinking / effort / summarization threshold) have no backend
-// field yet, so they persist locally under `ff-model` until one lands; `partialize`
-// keeps the IPC-backed cache out of localStorage.
+// Model section state (#126). The provider (kind + model + thinking) is durable
+// backend config — loaded from / persisted via IPC, mirroring store/search-config.ts.
+// Effort / summarization threshold have no backend field yet, so they persist
+// locally under `ff-model` until one lands; `partialize` keeps the IPC-backed
+// cache out of localStorage.
 
 import { create } from "zustand";
 import { persist } from "zustand/middleware";
@@ -16,20 +16,18 @@ export type Effort = "low" | "medium" | "high";
 export const SUMMARY_THRESHOLD_MIN = 50_000;
 export const SUMMARY_THRESHOLD_MAX = 300_000;
 
-/** Locally-persisted reasoning controls and their first-run defaults. */
-interface ReasoningPrefs {
-  thinking: boolean;
+/** Locally-persisted reasoning controls without a backend field yet. */
+interface LocalReasoningPrefs {
   effort: Effort;
   summarizationThreshold: number;
 }
 
-const REASONING_DEFAULTS: ReasoningPrefs = {
-  thinking: true,
+const LOCAL_REASONING_DEFAULTS: LocalReasoningPrefs = {
   effort: "medium",
   summarizationThreshold: 150_000,
 };
 
-interface ModelConfigState extends ReasoningPrefs {
+interface ModelConfigState extends LocalReasoningPrefs {
   /** Durable provider config (IPC-backed); `null` until first load. */
   provider: ProviderConfig | null;
   /** Best-effort model ids for the active connection. */
@@ -41,7 +39,7 @@ interface ModelConfigState extends ReasoningPrefs {
   load: () => Promise<void>;
   setKind: (kind: ProviderKind) => Promise<void>;
   setModel: (model: string) => Promise<void>;
-  setThinking: (thinking: boolean) => void;
+  setThinking: (thinking: boolean) => Promise<void>;
   setEffort: (effort: Effort) => void;
   setSummarizationThreshold: (tokens: number) => void;
   /** Reset the local reasoning controls to defaults (footer reset). The durable
@@ -59,7 +57,7 @@ function clampThreshold(tokens: number): number {
 export const useModelConfigStore = create<ModelConfigState>()(
   persist(
     (set, get) => ({
-      ...REASONING_DEFAULTS,
+      ...LOCAL_REASONING_DEFAULTS,
       provider: null,
       models: [],
       loading: false,
@@ -98,7 +96,8 @@ export const useModelConfigStore = create<ModelConfigState>()(
             throw new Error(`No ${kind} connection is configured.`);
           }
           await ipc.setActiveConnection(target.id);
-          // Pull the now-active connection's own config + model list.
+          // Pull the now-active connection's own config + model list (the stored
+          // config carries each connection's own `thinking` flag).
           const [stored, models] = await Promise.all([
             ipc.getProviderConfig(),
             ipc.listModels(),
@@ -121,6 +120,7 @@ export const useModelConfigStore = create<ModelConfigState>()(
             provider.kind,
             provider.baseUrl,
             model,
+            provider.thinking,
           );
           set({ provider: stored, saving: false });
         } catch (err) {
@@ -131,19 +131,36 @@ export const useModelConfigStore = create<ModelConfigState>()(
         }
       },
 
-      setThinking: (thinking) => set({ thinking }),
+      setThinking: async (thinking) => {
+        const { provider } = get();
+        if (!provider || provider.thinking === thinking) return;
+        set({ saving: true, error: null });
+        try {
+          const stored = await ipc.setProviderConfig(
+            provider.kind,
+            provider.baseUrl,
+            provider.model,
+            thinking,
+          );
+          set({ provider: stored, saving: false });
+        } catch (err) {
+          set({
+            saving: false,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
+      },
+
       setEffort: (effort) => set({ effort }),
       setSummarizationThreshold: (tokens) =>
         set({ summarizationThreshold: clampThreshold(tokens) }),
 
-      resetModel: () => set({ ...REASONING_DEFAULTS }),
+      resetModel: () => set({ ...LOCAL_REASONING_DEFAULTS }),
     }),
     {
       name: "ff-model",
-      // Only the reasoning controls persist; the provider/model cache is owned by
-      // the backend and re-fetched on load.
+      // Only effort/threshold persist locally; provider/thinking are backend-owned.
       partialize: (s) => ({
-        thinking: s.thinking,
         effort: s.effort,
         summarizationThreshold: s.summarizationThreshold,
       }),

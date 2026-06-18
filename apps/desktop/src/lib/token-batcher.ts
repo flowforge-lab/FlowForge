@@ -1,27 +1,33 @@
 import type { TokenEvent } from "@/bindings";
 
+/** Token and reasoning events share the same delta shape. */
+export type StreamDeltaEvent = Pick<
+  TokenEvent,
+  "sessionId" | "messageId" | "delta"
+>;
+
 /**
- * Coalesces high-frequency token events so the chat store commits at most once per
- * scheduled tick instead of once per token. At 40-50 tok/s a per-token commit
- * re-renders (and re-parses markdown for) the streaming message tens of times a
- * second; batching to animation-frame cadence cuts that to ~60/s while preserving
- * order and content (#104).
+ * Coalesces high-frequency stream delta events so the chat store commits at most
+ * once per scheduled tick instead of once per delta. At 40-50 tok/s a per-delta
+ * commit re-renders (and re-parses markdown for) the streaming message tens of
+ * times a second; batching to animation-frame cadence cuts that to ~60/s while
+ * preserving order and content (#104).
  *
- * Deltas are accumulated per message, so a flush applies one concatenated delta per
- * message. The scheduler is injected (production passes `requestAnimationFrame`) so
- * the batching logic stays deterministic under test.
+ * Deltas are accumulated per message, so a flush applies one concatenated delta
+ * per message. The scheduler is injected (production passes `requestAnimationFrame`)
+ * so the batching logic stays deterministic under test.
  */
 export class TokenBatcher {
-  private readonly pending = new Map<string, TokenEvent>();
+  private readonly pending = new Map<string, StreamDeltaEvent>();
   private scheduled = false;
 
   constructor(
-    private readonly flush: (e: TokenEvent) => void,
+    private readonly flush: (e: StreamDeltaEvent) => void,
     private readonly schedule: (cb: () => void) => void,
   ) {}
 
-  /** Queue a token; schedules a drain on the first token of each tick. */
-  push(e: TokenEvent): void {
+  /** Queue a delta; schedules a drain on the first delta of each tick. */
+  push(e: StreamDeltaEvent): void {
     const prev = this.pending.get(e.messageId);
     this.pending.set(
       e.messageId,

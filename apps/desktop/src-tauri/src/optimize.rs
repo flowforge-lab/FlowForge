@@ -81,6 +81,7 @@ pub async fn propose_rewrite(
         model: model.to_string(),
         messages: build_messages(skill, body, aggregate, transcript),
         tools: Vec::new(),
+        thinking: false,
     };
     let mut stream = provider.chat_stream(req).await.map_err(|e| e.to_string())?;
     let mut acc = String::new();

@@ -87,6 +87,7 @@ fn config_to_connection(config: ProviderConfig) -> ProviderConnection {
         base_url: config.base_url,
         model: config.model,
         has_key: config.has_key,
+        thinking: config.thinking,
     }
 }
 
@@ -98,6 +99,7 @@ fn connection_to_config(conn: &ProviderConnection) -> ProviderConfig {
         base_url: conn.base_url.clone(),
         model: conn.model.clone(),
         has_key: conn.has_key,
+        thinking: conn.thinking,
     }
 }
 
@@ -639,6 +641,7 @@ impl AppState {
                 conn.base_url = config.base_url;
                 conn.model = config.model;
                 conn.has_key = config.has_key;
+                conn.thinking = config.thinking;
             }
             reg.clone()
         };
@@ -1240,6 +1243,7 @@ mod tests {
             base_url: Some("http://localhost:9001/v1".into()),
             model: "my-candle-model".into(),
             has_key: false,
+            ..Default::default()
         };
         let reg = build_migrated_registry(config);
         assert_eq!(reg.active, "candle-vllm");
@@ -1265,6 +1269,7 @@ mod tests {
             base_url: None,
             model: "qwen2.5".into(),
             has_key: false,
+            ..Default::default()
         };
         let reg = build_migrated_registry(config);
         assert_eq!(reg.active, "ollama");
@@ -1292,6 +1297,7 @@ mod tests {
                 base_url: None,
                 model: "saved".into(),
                 has_key: false,
+                thinking: true,
             }],
         };
         fs::write(&reg_path, serde_json::to_string(&existing).unwrap()).unwrap();
@@ -1315,6 +1321,7 @@ mod tests {
             base_url: None,
             model: "legacy".into(),
             has_key: false,
+            ..Default::default()
         };
         fs::write(&cfg_path, serde_json::to_string(&config).unwrap()).unwrap();
         let loaded = load_or_migrate_registry_at(Some(reg_path.clone()), Some(cfg_path));
@@ -1341,6 +1348,7 @@ mod tests {
             base_url: None,
             model: "solo".into(),
             has_key: false,
+            thinking: true,
         });
         assert_eq!(conn.id, "ollama");
         assert_eq!(conn.display_name, "Ollama");
@@ -1359,6 +1367,7 @@ mod tests {
             base_url: Some("http://localhost:9100/v1".into()),
             model: "edited".into(),
             has_key: false,
+            thinking: true,
         });
         let reg = state.provider_registry();
         // No new connection; the active one is edited in place.
@@ -1389,6 +1398,7 @@ mod tests {
             base_url: Some("https://openrouter.ai/api/v1".into()),
             model: "x".into(),
             has_key: false,
+            thinking: true,
         });
         assert_eq!(stored.id, "openrouter");
         assert_eq!(state.provider_registry().connections.len(), 3);

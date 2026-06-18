@@ -19,6 +19,7 @@ import type {
   SearchBackend,
   Session,
   TokenEvent,
+  ReasoningEvent,
   TurnDoneEvent,
   TurnErrorEvent,
   IntentionSignal,
@@ -78,6 +79,7 @@ export interface FfIpc {
     kind: ProviderKind,
     baseUrl: string | undefined,
     model: string,
+    thinking: boolean,
   ): Promise<ProviderConfig>;
   // Provider connection registry (Issue #138, RFC 0005 Phase A). Lets the user
   // keep several backends configured and switch the active one non-destructively.
@@ -216,6 +218,7 @@ export interface FfIpc {
 
   // Events (backend -> frontend)
   onToken(cb: (e: TokenEvent) => void): Promise<Unlisten>;
+  onReasoning(cb: (e: ReasoningEvent) => void): Promise<Unlisten>;
   onTurnDone(cb: (e: TurnDoneEvent) => void): Promise<Unlisten>;
   onTurnError(cb: (e: TurnErrorEvent) => void): Promise<Unlisten>;
   onIntention(cb: (e: IntentionSignal) => void): Promise<Unlisten>;
@@ -307,11 +310,13 @@ class TauriIpc implements FfIpc {
     kind: ProviderKind,
     baseUrl: string | undefined,
     model: string,
+    thinking: boolean,
   ) =>
     this.invoke<ProviderConfig>("set_provider_config", {
       kind,
       baseUrl,
       model,
+      thinking,
     });
   getProviderRegistry = () =>
     this.invoke<ProviderRegistry>("get_provider_registry");
@@ -379,6 +384,8 @@ class TauriIpc implements FfIpc {
 
   onToken = (cb: (e: TokenEvent) => void) =>
     this.listen<TokenEvent>("turn:token", cb);
+  onReasoning = (cb: (e: ReasoningEvent) => void) =>
+    this.listen<ReasoningEvent>("turn:reasoning", cb);
   onTurnDone = (cb: (e: TurnDoneEvent) => void) =>
     this.listen<TurnDoneEvent>("turn:done", cb);
   onTurnError = (cb: (e: TurnErrorEvent) => void) =>

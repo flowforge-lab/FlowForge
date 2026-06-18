@@ -31,7 +31,7 @@ function formatThreshold(tokens: number): string {
 
 /**
  * Model section (#126): provider + model picker (durable, via IPC) plus reasoning
- * controls (thinking / effort / summarization threshold, persisted locally).
+ * controls (thinking via IPC; effort / summarization threshold persisted locally).
  * Registers `resetModel` for the footer "Reset to defaults".
  */
 export function ModelSection() {
@@ -44,7 +44,7 @@ export function ModelSection() {
   const setKind = useModelConfigStore((s) => s.setKind);
   const setModel = useModelConfigStore((s) => s.setModel);
 
-  const thinking = useModelConfigStore((s) => s.thinking);
+  const thinking = provider?.thinking ?? true;
   const effort = useModelConfigStore((s) => s.effort);
   const summarizationThreshold = useModelConfigStore(
     (s) => s.summarizationThreshold,
@@ -152,7 +152,7 @@ export function ModelSection() {
           label="Thinking"
           description="Let the model reason before answering."
           checked={thinking}
-          onCheckedChange={setThinking}
+          onCheckedChange={(v) => void setThinking(v)}
         />
 
         <div className="space-y-2">

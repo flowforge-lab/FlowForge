@@ -14,6 +14,18 @@ pub struct TokenEvent {
     pub delta: String,
 }
 
+/// Reasoning/thinking stream delta for an in-flight assistant message (#181).
+/// Emitted only when the provider sends reasoning content; never persisted on
+/// [`crate::Message`] — the frontend accumulates it separately from `content`.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "../../../apps/desktop/src/bindings/")]
+pub struct ReasoningEvent {
+    pub session_id: String,
+    pub message_id: String,
+    pub delta: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export, export_to = "../../../apps/desktop/src/bindings/")]

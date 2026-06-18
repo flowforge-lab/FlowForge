@@ -175,6 +175,8 @@ impl CompactionStrategy for MemoryFlush {
                 model: ctx.model.to_string(),
                 messages: messages.clone(),
                 tools: tools.clone(),
+                // Internal summarization turn — never stream reasoning here.
+                thinking: false,
             };
             let calls = collect_tool_calls(ctx.provider, req).await?;
 
