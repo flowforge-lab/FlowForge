@@ -49,6 +49,8 @@ export interface PrefsState {
   openThreads: number;
   /** Composer send binding (Keyboard section, SET.6). */
   sendMessageKey: SendMessageKey;
+  /** Session sidebar collapsed to width 0 (#185). */
+  sidebarCollapsed: boolean;
   setTheme: (theme: Theme) => void;
   setFont: (font: Font) => void;
   setFontScale: (scale: number) => void;
@@ -56,6 +58,7 @@ export interface PrefsState {
   setNotifications: (partial: Partial<NotificationPrefs>) => void;
   setOpenThreads: (count: number) => void;
   setSendMessageKey: (key: SendMessageKey) => void;
+  setSidebarCollapsed: (collapsed: boolean) => void;
   /** Quick light/dark flip — leaves `"system"` by picking the opposite effective mode. */
   toggleTheme: () => void;
   /** Reset only the Appearance-owned prefs to their defaults (SET.2 footer reset). */
@@ -116,6 +119,7 @@ export const usePrefsStore = create<PrefsState>()(
       // Keyboard-owned (SET.6) — kept out of APPEARANCE_DEFAULTS so the Appearance
       // reset doesn't touch it; `resetKeyboard` owns its reset.
       sendMessageKey: SEND_MESSAGE_KEY_DEFAULT,
+      sidebarCollapsed: false,
       setTheme: (theme) => set({ theme }),
       setFont: (font) => set({ font }),
       setFontScale: (scale) => set({ fontScale: clampFontScale(scale) }),
@@ -124,6 +128,7 @@ export const usePrefsStore = create<PrefsState>()(
         set((s) => ({ notifications: { ...s.notifications, ...partial } })),
       setOpenThreads: (count) => set({ openThreads: clampOpenThreads(count) }),
       setSendMessageKey: (sendMessageKey) => set({ sendMessageKey }),
+      setSidebarCollapsed: (sidebarCollapsed) => set({ sidebarCollapsed }),
       toggleTheme: () => {
         const { theme } = get();
         const effective = resolveEffectiveTheme(theme);

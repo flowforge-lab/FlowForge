@@ -37,19 +37,58 @@ export function filterSessions(
   );
 }
 
+/** Max unpinned sessions shown before the overflow affordance (#185). */
+export const UNPINNED_SESSION_CAP = 15;
+
+export type SessionListTab = "all" | "dismissed";
+
 /**
- * Apply the sidebar's view preferences (#169): hide dismissed sessions (unless
- * `showDismissed` reveals them) and float pinned sessions to the top. Order within
- * each group is preserved (stable), so this composes after `filterSessions`. Pure
- * — does not mutate its input.
+ * Apply the sidebar's view preferences (#169, #185): All tab hides dismissed;
+ * Dismissed tab shows only dismissed. Pinned sessions float to the top. Order
+ * within each group is preserved (stable).
  */
 export function arrangeSessions(
   sessions: Session[],
   pinned: ReadonlySet<string>,
   dismissed: ReadonlySet<string>,
-  showDismissed: boolean,
+  tab: SessionListTab,
 ): Session[] {
   return sessions
-    .filter((s) => showDismissed || !dismissed.has(s.id))
+    .filter((s) => (tab === "all" ? !dismissed.has(s.id) : dismissed.has(s.id)))
     .sort((a, b) => Number(pinned.has(b.id)) - Number(pinned.has(a.id)));
+}
+
+/**
+ * Cap unpinned sessions at {@link UNPINNED_SESSION_CAP} while always showing
+ * every pinned session and the active session (#185). Pure view-state helper.
+ */
+export function selectSessionOverflow(
+  sessions: Session[],
+  pinned: ReadonlySet<string>,
+  activeSessionId: string | null,
+  revealAll: boolean,
+  cap: number = UNPINNED_SESSION_CAP,
+): { visible: Session[]; hiddenCount: number } {
+  if (revealAll) return { visible: sessions, hiddenCount: 0 };
+
+  const visible: Session[] = [];
+  let unpinnedShown = 0;
+  let unpinnedHidden = 0;
+
+  for (const s of sessions) {
+    const isPinned = pinned.has(s.id);
+    const isActive = s.id === activeSessionId;
+    if (isPinned || isActive) {
+      visible.push(s);
+      continue;
+    }
+    if (unpinnedShown < cap) {
+      visible.push(s);
+      unpinnedShown += 1;
+    } else {
+      unpinnedHidden += 1;
+    }
+  }
+
+  return { visible, hiddenCount: unpinnedHidden };
 }

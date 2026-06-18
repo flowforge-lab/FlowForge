@@ -188,5 +188,20 @@ describe("ff-prefs hydration of pre-SET.2 blobs", () => {
     expect(s.displayName).toBe("");
     expect(s.openThreads).toBe(10);
     expect(s.notifications.enabled).toBe(true);
+    expect(s.sidebarCollapsed).toBe(false);
+  });
+});
+
+describe("sidebar collapse preference (#185)", () => {
+  afterEach(() => {
+    localStorage.clear();
+  });
+
+  it("persists sidebarCollapsed in ff-prefs", () => {
+    usePrefsStore.getState().setSidebarCollapsed(true);
+    expect(
+      JSON.parse(localStorage.getItem("ff-prefs") ?? "{}").state
+        .sidebarCollapsed,
+    ).toBe(true);
   });
 });

@@ -1,10 +1,11 @@
 import type { ComponentType, ReactNode } from "react";
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
-  Eye,
   EyeOff,
+  Folder,
   MoreHorizontal,
   Moon,
+  PanelLeft,
   Pencil,
   Pin,
   PinOff,
@@ -23,7 +24,7 @@ import { ScrollArea } from "@/components/ui/scroll-area";
 import { Separator } from "@/components/ui/separator";
 import { cn } from "@/lib/utils";
 import { resolveEffectiveTheme } from "@/lib/theme";
-import { useTheme } from "@/store/prefs";
+import { useTheme, usePrefsStore } from "@/store/prefs";
 import { useSettingsStore } from "@/store/settings";
 import { useChatStore } from "@/store/chat";
 import { useSessionPrefsStore } from "@/store/session-prefs";
@@ -58,7 +59,14 @@ import {
   AlertDialogAction,
   AlertDialogCancel,
 } from "@/components/ui/alert-dialog";
-import { arrangeSessions, filterSessions, resolveLabel } from "@/lib/sessions";
+import {
+  arrangeSessions,
+  filterSessions,
+  resolveLabel,
+  selectSessionOverflow,
+} from "@/lib/sessions";
+import type { SessionListTab } from "@/lib/sessions";
+import { SegmentedControl } from "@/components/settings/segmented-control";
 import type { Session } from "@/bindings";
 
 // ── Shared menu body ─────────────────────────────────────────────────────────
@@ -408,6 +416,9 @@ export function SessionSidebar() {
   const sessionTitles = useChatStore((s) => s.sessionTitles);
   const newSession = useChatStore((s) => s.newSession);
 
+  const sidebarCollapsed = usePrefsStore((s) => s.sidebarCollapsed);
+  const setSidebarCollapsed = usePrefsStore((s) => s.setSidebarCollapsed);
+
   // New session lands in the focused pane (#148) so the layout is preserved —
   // matches app-shell's Cmd+N and the palette. Falls back to a plain new session
   // when panes aren't initialized yet.
@@ -427,8 +438,26 @@ export function SessionSidebar() {
   const dismissedIds = useSessionPrefsStore((s) => s.dismissed);
 
   const [filter, setFilter] = useState("");
-  const [showDismissed, setShowDismissed] = useState(false);
+  const [listTab, setListTab] = useState<SessionListTab>("all");
+  const [showFilter, setShowFilter] = useState(false);
+  const [overflowExpanded, setOverflowExpanded] = useState(false);
   const filterRef = useRef<HTMLInputElement>(null);
+
+  function revealFilter() {
+    setShowFilter(true);
+  }
+
+  // Focus the filter after it renders (idiomatic — no setState here, so the
+  // set-state-in-effect rule doesn't apply).
+  useEffect(() => {
+    if (showFilter) filterRef.current?.focus();
+  }, [showFilter]);
+
+  function hideFilter() {
+    setShowFilter(false);
+    setFilter("");
+    filterRef.current?.blur();
+  }
 
   const pinnedSet = new Set(pinnedIds);
   const dismissedSet = new Set(dismissedIds);
@@ -437,25 +466,103 @@ export function SessionSidebar() {
     0,
   );
 
+  // Restoring the last dismissed session disables the Dismissed tab; fall back to
+  // All so a disabled tab is never left selected (stranding "No dismissed sessions").
+  const effectiveTab: SessionListTab =
+    listTab === "dismissed" && dismissedCount === 0 ? "all" : listTab;
+
+  // Switching tab or editing the filter resets the overflow expansion so a stale
+  // "expanded" state can't carry across lists. Done in the handlers (not an effect)
+  // to keep clear of the set-state-in-effect rule.
+  const switchTab = (next: SessionListTab) => {
+    setListTab(next);
+    setOverflowExpanded(false);
+  };
+  const changeFilter = (next: string) => {
+    setFilter(next);
+    setOverflowExpanded(false);
+  };
+
   const filtered = filterSessions(sessions, filter, sessionTitles);
   // Each session's index in the *full* list — keeps the ⌘1–9 hint accurate when
   // the visible list is filtered (the global shortcut indexes the full list).
   const indexById = new Map(sessions.map((s, i) => [s.id, i]));
   const filtering = filter.trim().length > 0;
 
-  // Hide dismissed sessions (unless revealed), then float pinned to the top.
-  const visible = arrangeSessions(
+  const arranged = arrangeSessions(
     filtered,
     pinnedSet,
     dismissedSet,
-    showDismissed,
+    effectiveTab,
   );
+  const { visible, hiddenCount } = selectSessionOverflow(
+    arranged,
+    pinnedSet,
+    activeSessionId,
+    overflowExpanded,
+  );
+  // Whether overflow exists at all (independent of the current expansion), so the
+  // toggle can offer "show less" once expanded.
+  const hasOverflow =
+    selectSessionOverflow(arranged, pinnedSet, activeSessionId, false)
+      .hiddenCount > 0;
 
   return (
-    <aside className="flex h-full w-60 shrink-0 flex-col border-r bg-sidebar text-sidebar-foreground">
+    <aside
+      className={cn(
+        "flex h-full shrink-0 flex-col border-r bg-sidebar text-sidebar-foreground transition-[width,border] duration-200",
+        sidebarCollapsed
+          ? "w-0 overflow-hidden border-r-0"
+          : "w-60 overflow-hidden",
+      )}
+      aria-hidden={sidebarCollapsed}
+      // `aria-hidden` alone leaves descendants focusable; `inert` also pulls the
+      // collapsed sidebar's buttons/input out of the tab order (axe aria-hidden-focus).
+      inert={sidebarCollapsed || undefined}
+    >
       <div className="flex h-12 items-center justify-between px-3">
         <span className="text-sm font-semibold tracking-tight">FlowForge</span>
         <div className="flex items-center gap-0.5">
+          <Button
+            variant="ghost"
+            size="icon"
+            className="size-7 text-muted-foreground hover:text-foreground"
+            onClick={() => setSidebarCollapsed(true)}
+            title="Collapse sidebar"
+          >
+            <PanelLeft className="size-4" />
+          </Button>
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <Button
+                variant="ghost"
+                size="icon"
+                className="size-7 text-muted-foreground hover:text-foreground"
+                title="Sidebar options"
+                aria-label="Sidebar options"
+              >
+                <MoreHorizontal className="size-4" />
+              </Button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="end">
+              <DropdownMenuItem onSelect={revealFilter}>
+                <Search />
+                Search
+              </DropdownMenuItem>
+              <DropdownMenuItem disabled title="Coming soon">
+                <Folder />
+                Folder view
+              </DropdownMenuItem>
+              <DropdownMenuSub>
+                <DropdownMenuSubTrigger disabled title="Coming soon">
+                  Filter by source
+                </DropdownMenuSubTrigger>
+                <DropdownMenuSubContent>
+                  <DropdownMenuItem disabled>Coming soon</DropdownMenuItem>
+                </DropdownMenuSubContent>
+              </DropdownMenuSub>
+            </DropdownMenuContent>
+          </DropdownMenu>
           <Button
             variant="ghost"
             size="icon"
@@ -473,21 +580,14 @@ export function SessionSidebar() {
               <Sun className="size-4" />
             )}
           </Button>
+          {/* Primary action — accent-filled so "new session" reads as the
+              prominent control (reference design). */}
           <Button
-            variant="ghost"
             size="icon"
-            className="size-7 text-muted-foreground hover:text-foreground"
-            onClick={openSettings}
-            title="Settings"
-          >
-            <Settings className="size-4" />
-          </Button>
-          <Button
-            variant="ghost"
-            size="icon"
-            className="size-7 text-muted-foreground hover:text-foreground"
+            className="size-7 bg-emerald-600 text-white hover:bg-emerald-600/90"
             onClick={newSessionInFocusedPane}
             title="New session (⌘N)"
+            aria-label="New session"
           >
             <Plus className="size-4" />
           </Button>
@@ -496,86 +596,103 @@ export function SessionSidebar() {
 
       <Separator />
 
-      {/* Filter box — narrows the list by resolved label, keyboard-first (#19). */}
-      <div className="px-2 py-2">
-        <div className="flex items-center gap-1.5 rounded-md border bg-background/40 px-2 transition-colors focus-within:border-ring focus-within:ring-2 focus-within:ring-ring/25">
-          <Search className="size-3.5 shrink-0 text-muted-foreground/60" />
-          <input
-            ref={filterRef}
-            value={filter}
-            onChange={(e) => setFilter(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === "Escape") {
-                e.preventDefault();
-                e.stopPropagation(); // don't also cancel the active turn
-                setFilter("");
-                filterRef.current?.blur();
-              }
-            }}
-            placeholder="Filter sessions…"
-            aria-label="Filter sessions"
-            spellCheck={false}
-            className="h-7 min-w-0 flex-1 bg-transparent text-[13px] text-foreground outline-none placeholder:text-muted-foreground/50"
-          />
-          {filtering && (
-            <button
-              type="button"
-              title="Clear filter (Esc)"
-              onClick={() => {
-                setFilter("");
-                filterRef.current?.focus();
-              }}
-              className="flex size-4 shrink-0 items-center justify-center rounded text-muted-foreground/60 hover:text-foreground"
-            >
-              <X className="size-3" />
-            </button>
-          )}
-        </div>
+      <div className="flex justify-end px-2 py-2">
+        <SegmentedControl
+          label="Session list"
+          value={effectiveTab}
+          onValueChange={(v) => switchTab(v as SessionListTab)}
+          options={[
+            { value: "all", label: "All" },
+            {
+              value: "dismissed",
+              label: `Dismissed (${dismissedCount})`,
+              disabled: dismissedCount === 0,
+            },
+          ]}
+        />
       </div>
+
+      {showFilter && (
+        <div className="px-2 pb-2">
+          <div className="flex items-center gap-1.5 rounded-md border bg-background/40 px-2 transition-colors focus-within:border-ring focus-within:ring-2 focus-within:ring-ring/25">
+            <Search className="size-3.5 shrink-0 text-muted-foreground/60" />
+            <input
+              ref={filterRef}
+              value={filter}
+              onChange={(e) => changeFilter(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Escape") {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  hideFilter();
+                }
+              }}
+              placeholder="Filter sessions…"
+              aria-label="Filter sessions"
+              spellCheck={false}
+              className="h-7 min-w-0 flex-1 bg-transparent text-[13px] text-foreground outline-none placeholder:text-muted-foreground/50"
+            />
+            {filtering && (
+              <button
+                type="button"
+                title="Clear filter (Esc)"
+                onClick={() => hideFilter()}
+                className="flex size-4 shrink-0 items-center justify-center rounded text-muted-foreground/60 hover:text-foreground"
+              >
+                <X className="size-3" />
+              </button>
+            )}
+          </div>
+        </div>
+      )}
 
       <ScrollArea className="flex-1">
         <nav className="flex flex-col gap-px p-1.5">
-          {visible.length === 0
-            ? filtering && (
-                <p className="px-2 py-6 text-center text-[12px] text-muted-foreground/60">
-                  No sessions match “{filter.trim()}”
-                </p>
-              )
-            : visible.map((session) => (
-                <SessionItem
-                  key={session.id}
-                  session={session}
-                  index={indexById.get(session.id) ?? 0}
-                  active={session.id === activeSessionId}
-                  streaming={Boolean(streamingBySession[session.id])}
-                  pinned={pinnedSet.has(session.id)}
-                  dismissed={dismissedSet.has(session.id)}
-                />
-              ))}
+          {visible.length === 0 ? (
+            filtering && effectiveTab === "all" ? (
+              <p className="px-2 py-6 text-center text-[12px] text-muted-foreground/60">
+                No sessions match “{filter.trim()}”
+              </p>
+            ) : effectiveTab === "dismissed" ? (
+              <p className="px-2 py-6 text-center text-[12px] text-muted-foreground/60">
+                No dismissed sessions
+              </p>
+            ) : null
+          ) : (
+            visible.map((session) => (
+              <SessionItem
+                key={session.id}
+                session={session}
+                index={indexById.get(session.id) ?? 0}
+                active={session.id === activeSessionId}
+                streaming={Boolean(streamingBySession[session.id])}
+                pinned={pinnedSet.has(session.id)}
+                dismissed={dismissedSet.has(session.id)}
+              />
+            ))
+          )}
+          {hasOverflow && (
+            <button
+              type="button"
+              onClick={() => setOverflowExpanded((v) => !v)}
+              className="mx-0.5 rounded-md px-2 py-1.5 text-left text-[12px] text-muted-foreground/70 transition-colors hover:bg-sidebar-accent/50 hover:text-foreground"
+            >
+              {overflowExpanded ? "‹ Show less" : `› ${hiddenCount} more`}
+            </button>
+          )}
         </nav>
       </ScrollArea>
 
-      {dismissedCount > 0 && (
-        <button
-          type="button"
-          onClick={() => setShowDismissed((v) => !v)}
-          className="mx-1.5 mb-1 flex items-center gap-1.5 rounded-md px-2 py-1 text-left text-[11px] text-muted-foreground/70 transition-colors hover:bg-sidebar-accent/50 hover:text-foreground"
-        >
-          {showDismissed ? (
-            <Eye className="size-3 shrink-0" />
-          ) : (
-            <EyeOff className="size-3 shrink-0" />
-          )}
-          {showDismissed
-            ? "Hide dismissed"
-            : `Show dismissed (${dismissedCount})`}
-        </button>
-      )}
-
       <Separator />
-      <div className="px-3 py-2 text-[11px] text-muted-foreground/60">
-        ⌘K palette · ⌘N new · ⌘1–9 jump · Esc stop
-      </div>
+      <button
+        type="button"
+        onClick={openSettings}
+        title="Settings"
+        className="flex items-center gap-2 px-3 py-2.5 text-left text-[12px] text-muted-foreground transition-colors hover:bg-sidebar-accent/50 hover:text-foreground"
+      >
+        <Settings className="size-4 shrink-0" />
+        Settings
+      </button>
     </aside>
   );
 }
