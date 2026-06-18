@@ -8,6 +8,7 @@ import type { UpdateStatus, BackupResult } from "@/lib/about";
 import type { ControlConfig } from "@/lib/control";
 import type { MarketplaceSkill } from "@/lib/marketplace";
 import type { MarketplaceProfile } from "@/lib/profile-marketplace";
+import type { ScheduledTask, CreateScheduledTaskInput } from "@/lib/scheduled";
 import type {
   Message,
   ProviderConfig,
@@ -177,6 +178,17 @@ export interface FfIpc {
   /** Search the (mock) profile marketplace. Empty query lists the full catalog. */
   searchProfileMarketplace(query: string): Promise<MarketplaceProfile[]>;
 
+  // Scheduled tasks (#132, SET.9). CONTRACT NOTE: FE-owned mock commands — there is
+  // no backend/ts-rs type or cron runner yet. `ScheduledTask` lives in
+  // `lib/scheduled.ts` (mirroring SET.5/7); `bindings/` is untouched. Replace with
+  // a generated binding + real commands when the scheduler backend lands — Refs #188.
+  /** All scheduled tasks (built-in + user-created). */
+  listScheduledTasks(): Promise<ScheduledTask[]>;
+  /** Pause/resume a task; resolves with the updated task. Rejects an unknown id. */
+  toggleScheduledTask(id: string): Promise<ScheduledTask>;
+  /** Create a user task; resolves with the stored task (server-assigned id). */
+  createScheduledTask(input: CreateScheduledTaskInput): Promise<ScheduledTask>;
+
   // MCP servers (M4.4, RFC 0003). Enable/disable/add/remove write `mcp.json`; the
   // config watcher reconciles the supervisor, which then emits `mcp:status-changed`.
   /** Current status snapshot of every configured MCP server. */
@@ -344,6 +356,12 @@ class TauriIpc implements FfIpc {
     this.invoke<Phenotype>("switch_phenotype", { name });
   searchProfileMarketplace = (query: string) =>
     this.invoke<MarketplaceProfile[]>("search_profile_marketplace", { query });
+  listScheduledTasks = () =>
+    this.invoke<ScheduledTask[]>("list_scheduled_tasks");
+  toggleScheduledTask = (id: string) =>
+    this.invoke<ScheduledTask>("toggle_scheduled_task", { id });
+  createScheduledTask = (input: CreateScheduledTaskInput) =>
+    this.invoke<ScheduledTask>("create_scheduled_task", { input });
 
   listMcpServers = () => this.invoke<McpServerStatus[]>("list_mcp_servers");
   restartMcpServer = (id: string) =>

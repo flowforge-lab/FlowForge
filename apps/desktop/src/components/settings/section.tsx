@@ -5,6 +5,7 @@ import { ModelSection } from "@/components/settings/model-section";
 import { SkillsSection } from "@/components/settings/skills-section";
 import { ProfilesSection } from "@/components/settings/profiles-section";
 import { KeyboardSection } from "@/components/settings/keyboard-section";
+import { ScheduledSection } from "@/components/settings/scheduled-section";
 import { AboutSection } from "@/components/settings/about-section";
 import { ComingSoon } from "@/components/settings/coming-soon";
 import {
@@ -32,6 +33,8 @@ export function SettingsSectionContent({ id }: { id: SettingsSectionId }) {
       return <McpSection />;
     case "keyboard":
       return <KeyboardSection />;
+    case "scheduled":
+      return <ScheduledSection />;
     case "about":
       return <AboutSection />;
     default:

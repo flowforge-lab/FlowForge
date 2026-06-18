@@ -64,10 +64,8 @@ describe("section switching", () => {
     expect(about).toContain("View all keyboard shortcuts");
     expect(about).not.toContain("Coming soon.");
 
-    const scheduled = renderToStaticMarkup(
-      <SettingsSectionContent id="scheduled" />,
-    );
-    expect(scheduled).toContain("Coming soon.");
-    expect(scheduled).toContain("Scheduled");
+    const memory = renderToStaticMarkup(<SettingsSectionContent id="memory" />);
+    expect(memory).toContain("Coming soon.");
+    expect(memory).toContain("Memory");
   });
 });

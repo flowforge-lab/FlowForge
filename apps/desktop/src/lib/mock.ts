@@ -35,6 +35,7 @@ import type {
 import type { FfIpc, Unlisten } from "./ipc";
 import type { MarketplaceSkill } from "./marketplace";
 import type { MarketplaceProfile } from "./profile-marketplace";
+import type { ScheduledTask, CreateScheduledTaskInput } from "./scheduled";
 import { CONTROL_DEFAULTS, type ControlConfig } from "./control";
 import {
   APP_VERSION_FALLBACK,
@@ -230,6 +231,37 @@ function scoreProfile(profile: MarketplaceProfile, q: string): number {
   return 0;
 }
 
+const HOUR_MS = 60 * 60 * 1000;
+
+// Seed scheduled tasks (SET.9) with times relative to load so "Next/Last" read
+// sensibly offline. One built-in "Memory Organizer" (RFC 0006 consolidation) that
+// runs daily, plus a weekly digest, so the list shows running + paused states.
+function initialScheduledTasks(): ScheduledTask[] {
+  const now = Date.now();
+  return [
+    {
+      id: "memory-organizer",
+      name: "Memory Organizer",
+      builtin: true,
+      cron: "0 17 * * *",
+      cadenceLabel: "Daily at 5:00 PM",
+      nextRun: now + 6 * HOUR_MS,
+      lastRun: now - 18 * HOUR_MS,
+      paused: false,
+    },
+    {
+      id: "weekly-digest",
+      name: "Weekly Digest",
+      builtin: false,
+      cron: "0 9 * * 1",
+      cadenceLabel: "Mondays at 9:00 AM",
+      nextRun: null, // paused → no scheduled run (matches toggle behavior)
+      lastRun: now - 4 * 24 * HOUR_MS,
+      paused: true,
+    },
+  ];
+}
+
 // Canned MCP server statuses so the servers panel (#91) is exercisable offline.
 // One running with tools, one that restarted once, one failed-to-spawn.
 const MOCK_MCP: McpServerStatus[] = [
@@ -318,6 +350,10 @@ export class MockIpc implements FfIpc {
   // Control settings (Issue #127). In-memory for the mock session; structurally
   // cloned on read/write so callers can't mutate the stored copy.
   private controlConfig: ControlConfig = structuredClone(CONTROL_DEFAULTS);
+
+  // Scheduled tasks (SET.9). In-memory for the mock session — created tasks survive
+  // a section reopen but reset on app reload (no real scheduler).
+  private scheduledTasks: ScheduledTask[] = initialScheduledTasks();
 
   private tokenListeners = new Set<Listener<TokenEvent>>();
   private doneListeners = new Set<Listener<TurnDoneEvent>>();
@@ -678,6 +714,36 @@ export class MockIpc implements FfIpc {
   async setControlConfig(config: ControlConfig): Promise<ControlConfig> {
     this.controlConfig = structuredClone(config);
     return structuredClone(this.controlConfig);
+  }
+
+  async listScheduledTasks(): Promise<ScheduledTask[]> {
+    return this.scheduledTasks.map((t) => ({ ...t }));
+  }
+
+  async toggleScheduledTask(id: string): Promise<ScheduledTask> {
+    const task = this.scheduledTasks.find((t) => t.id === id);
+    if (!task) throw new Error(`unknown scheduled task: ${id}`);
+    task.paused = !task.paused;
+    // A paused task has no next run; resuming schedules it ~a day out.
+    task.nextRun = task.paused ? null : Date.now() + 24 * HOUR_MS;
+    return { ...task };
+  }
+
+  async createScheduledTask(
+    input: CreateScheduledTaskInput,
+  ): Promise<ScheduledTask> {
+    const task: ScheduledTask = {
+      id: uid(),
+      name: input.name,
+      builtin: false,
+      cron: input.cron,
+      cadenceLabel: input.cadenceLabel,
+      nextRun: Date.now() + 24 * HOUR_MS,
+      lastRun: null,
+      paused: false,
+    };
+    this.scheduledTasks.push(task);
+    return { ...task };
   }
 
   async warmup(): Promise<void> {
