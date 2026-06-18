@@ -177,6 +177,39 @@ impl SessionStore {
         inner.messages.remove(session_id);
         inner.sessions.remove(session_id).is_some()
     }
+
+    /// Clone a session and its full transcript into a new session. The copy gets
+    /// fresh ids and timestamps; messages are re-keyed to the new session id and
+    /// a titled source becomes "<title> (copy)". Returns `None` for an unknown id.
+    pub fn fork_session(&self, session_id: &str) -> Option<Session> {
+        let ts = now_ms();
+        let mut inner = self.inner.lock().unwrap();
+        let source = inner.sessions.get(session_id)?.clone();
+        let forked = Session {
+            id: new_id(),
+            goal: source.goal.clone(),
+            title: source.title.as_ref().map(|t| format!("{t} (copy)")),
+            summary: source.summary.clone(),
+            status: source.status,
+            created_at: ts,
+            updated_at: ts,
+        };
+        let cloned: Vec<Message> = inner
+            .messages
+            .get(session_id)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|m| Message {
+                id: new_id(),
+                session_id: forked.id.clone(),
+                ..m
+            })
+            .collect();
+        inner.sessions.insert(forked.id.clone(), forked.clone());
+        inner.messages.insert(forked.id.clone(), cloned);
+        Some(forked)
+    }
 }
 
 #[cfg(test)]
@@ -263,5 +296,61 @@ mod tests {
         assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[0].role, Role::User);
         assert_eq!(msgs[1].content, "hi");
+    }
+
+    #[test]
+    fn fork_session_clones_messages_with_fresh_ids() {
+        let store = SessionStore::new();
+        let s = store.create_session(Some("fix bug".into()));
+        store.add_message(&s.id, Role::User, "hello".into());
+        store.add_message(&s.id, Role::Assistant, "hi".into());
+
+        let forked = store.fork_session(&s.id).unwrap();
+        assert_ne!(forked.id, s.id);
+
+        let src_msgs = store.get_messages(&s.id);
+        let fork_msgs = store.get_messages(&forked.id);
+        assert_eq!(fork_msgs.len(), src_msgs.len());
+        for (orig, copy) in src_msgs.iter().zip(&fork_msgs) {
+            assert_ne!(copy.id, orig.id);
+            assert_eq!(copy.session_id, forked.id);
+            assert_eq!(copy.role, orig.role);
+            assert_eq!(copy.content, orig.content);
+        }
+    }
+
+    #[test]
+    fn fork_session_titled_gets_copy_suffix() {
+        let store = SessionStore::new();
+        let titled = store.create_session(None);
+        store.set_title(&titled.id, "Fix bug".into());
+        let forked = store.fork_session(&titled.id).unwrap();
+        assert_eq!(forked.title.as_deref(), Some("Fix bug (copy)"));
+
+        let untitled = store.create_session(None);
+        let forked_untitled = store.fork_session(&untitled.id).unwrap();
+        assert!(forked_untitled.title.is_none());
+    }
+
+    #[test]
+    fn fork_session_unknown_returns_none() {
+        let store = SessionStore::new();
+        assert!(store.fork_session("nope").is_none());
+    }
+
+    #[test]
+    fn fork_session_leaves_source_untouched() {
+        let store = SessionStore::new();
+        let s = store.create_session(Some("keep me".into()));
+        store.add_message(&s.id, Role::User, "original".into());
+        let before = store.get_messages(&s.id);
+
+        store.fork_session(&s.id).unwrap();
+
+        let after = store.get_messages(&s.id);
+        assert_eq!(after.len(), before.len());
+        assert_eq!(after[0].id, before[0].id);
+        assert_eq!(after[0].session_id, s.id);
+        assert_eq!(store.list_sessions().len(), 2);
     }
 }
