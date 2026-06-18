@@ -408,6 +408,13 @@ export class MockIpc implements FfIpc {
     }
   }
 
+  // Delete (#168): permanently drop a session and its transcript. Idempotent —
+  // deleting an unknown id is a no-op. Mirrors the real backend command.
+  async deleteSession(sessionId: string): Promise<void> {
+    this.sessions.delete(sessionId);
+    this.messages.delete(sessionId);
+  }
+
   async getMessages(sessionId: string): Promise<Message[]> {
     return [...(this.messages.get(sessionId) ?? [])];
   }

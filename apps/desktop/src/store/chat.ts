@@ -90,6 +90,12 @@ interface ChatState {
    *  caller (a split pane) decides where it lands. Resolves with the new id, or
    *  null on failure. */
   forkSession: (sourceId: string) => Promise<string | null>;
+  /** Permanently delete `sessionId` (backend + store). Optimistic: removes it and
+   *  reassigns the active session immediately, rolling back if the backend rejects.
+   *  Purges its sidebar prefs and reconciles split panes. If it was the last
+   *  session, a fresh blank one is created so the app is never session-less.
+   *  Resolves true on success, false on failure / unknown id. */
+  deleteSession: (sessionId: string) => Promise<boolean>;
   /** Send into `sessionId`, defaulting to the active session. Panes pass their own
    *  session so a background pane can send/stream independently. */
   send: (content: string, sessionId?: string) => Promise<void>;
@@ -237,6 +243,65 @@ export const useChatStore = create<ChatState>((set, get) => ({
     } catch {
       return null;
     }
+  },
+
+  deleteSession: async (sessionId) => {
+    const prev = get();
+    if (!prev.sessions.some((s) => s.id === sessionId)) return false;
+
+    const remaining = prev.sessions.filter((s) => s.id !== sessionId);
+    const wasActive = prev.activeSessionId === sessionId;
+    const nextActive = wasActive
+      ? (remaining[0]?.id ?? null)
+      : prev.activeSessionId;
+
+    // Optimistic removal from the store.
+    set((s) => {
+      const { [sessionId]: _msgs, ...messagesBySession } = s.messagesBySession;
+      const { [sessionId]: _stream, ...streamingBySession } =
+        s.streamingBySession;
+      return {
+        sessions: remaining,
+        messagesBySession,
+        streamingBySession,
+        activeSessionId: nextActive,
+      };
+    });
+
+    try {
+      await ipc.deleteSession(sessionId);
+    } catch {
+      // Backend rejected -> restore the pre-delete snapshot.
+      set({
+        sessions: prev.sessions,
+        messagesBySession: prev.messagesBySession,
+        streamingBySession: prev.streamingBySession,
+        activeSessionId: prev.activeSessionId,
+      });
+      return false;
+    }
+
+    // Drop any lingering sidebar prefs (pin / dismiss) for the gone session.
+    const { useSessionPrefsStore } = await import("@/store/session-prefs");
+    useSessionPrefsStore.getState().purge(sessionId);
+
+    // Never leave the app session-less: recreate + select a fresh blank session.
+    if (remaining.length === 0) {
+      await get().newSession();
+    } else if (wasActive && nextActive) {
+      await get().selectSession(nextActive);
+    }
+
+    // Reconcile split panes against the final live list (drops any leaf showing
+    // the deleted session, preserving the rest of the layout).
+    const live = get().sessions;
+    const { usePanesStore } = await import("@/store/panes");
+    usePanesStore.getState().init(
+      live.map((s) => s.id),
+      get().activeSessionId,
+    );
+
+    return true;
   },
 
   send: async (content, sessionId = get().activeSessionId ?? undefined) => {

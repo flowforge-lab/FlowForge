@@ -2,7 +2,7 @@
 
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
-import { SessionItem } from "@/components/session-sidebar";
+import { SessionItem, SessionMenuItems } from "@/components/session-sidebar";
 import type { Session } from "@/bindings";
 
 // SessionItem takes its row state (session/pinned/dismissed) as props, so static
@@ -49,5 +49,49 @@ describe("SessionItem", () => {
 
   it("dims a dismissed row", () => {
     expect(render({ dismissed: true })).toContain("opacity-60");
+  });
+});
+
+// The shared menu body (used by BOTH the right-click ContextMenu and the
+// dropdown) is parameterized over the menu primitive's parts, so we render it
+// with plain-HTML stand-ins to assert the item set without a portaled menu.
+type Parts = Parameters<typeof SessionMenuItems>[0]["parts"];
+const PLAIN_PARTS: Parts = {
+  Item: ({ className, children }) => (
+    <button className={className}>{children}</button>
+  ),
+  Sub: ({ children }) => <div>{children}</div>,
+  SubTrigger: ({ children }) => <div>{children}</div>,
+  SubContent: ({ children }) => <div>{children}</div>,
+  Separator: () => <hr />,
+};
+
+describe("SessionMenuItems", () => {
+  function menu(over: Partial<Parameters<typeof SessionMenuItems>[0]> = {}) {
+    return renderToStaticMarkup(
+      <SessionMenuItems
+        parts={PLAIN_PARTS}
+        atCap={false}
+        pinned={false}
+        dismissed={false}
+        onOpen={() => {}}
+        onOpenSplit={() => {}}
+        onTogglePin={() => {}}
+        onDismissToggle={() => {}}
+        onRename={() => {}}
+        onDelete={() => {}}
+        {...over}
+      />,
+    );
+  }
+
+  it("includes a destructive Delete item alongside the lifecycle actions", () => {
+    const html = menu();
+    expect(html).toContain("Delete");
+    expect(html).toContain("text-destructive");
+    // Delete sits with the existing actions, not replacing them.
+    expect(html).toContain("Pin");
+    expect(html).toContain("Dismiss");
+    expect(html).toContain("Rename");
   });
 });

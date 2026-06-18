@@ -50,6 +50,9 @@ export interface FfIpc {
   getMessages(sessionId: string): Promise<Message[]>;
   /** Sets a session's persisted display title (server-truth). */
   renameSession(sessionId: string, title: string): Promise<void>;
+  /** Permanently remove a session and its transcript. Destructive; pairs with the
+   *  sidebar Delete action. Distinct from the FE-only reversible dismiss (#170). */
+  deleteSession(sessionId: string): Promise<void>;
   /** Persists the user message and starts the assistant turn. Returns the user message id. */
   sendMessage(sessionId: string, content: string): Promise<string>;
   cancelTurn(sessionId: string): Promise<void>;
@@ -254,6 +257,8 @@ class TauriIpc implements FfIpc {
     this.invoke<Message[]>("get_messages", { sessionId });
   renameSession = (sessionId: string, title: string) =>
     this.invoke<void>("rename_session", { sessionId, title });
+  deleteSession = (sessionId: string) =>
+    this.invoke<void>("delete_session", { sessionId });
   sendMessage = (sessionId: string, content: string) =>
     this.invoke<string>("send_message", { sessionId, content });
   cancelTurn = (sessionId: string) =>

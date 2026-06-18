@@ -155,6 +155,17 @@ fn rename_session(state: State<'_, Arc<AppState>>, session_id: String, title: St
     state.store.set_title(&session_id, title);
 }
 
+/// Permanently remove a session and its transcript. Cancels any in-flight turn and
+/// pending approvals first, so a stream cannot write back to a deleted session.
+#[tauri::command]
+fn delete_session(state: State<'_, Arc<AppState>>, session_id: String) {
+    if let Some(token) = state.take_cancel(&session_id) {
+        token.cancel();
+    }
+    state.cancel_pending_approvals(&session_id);
+    state.store.delete_session(&session_id);
+}
+
 #[tauri::command]
 fn cancel_turn(state: State<'_, Arc<AppState>>, session_id: String) {
     if let Some(token) = state.take_cancel(&session_id) {
@@ -911,6 +922,7 @@ pub fn run() {
             list_sessions,
             get_messages,
             rename_session,
+            delete_session,
             send_message,
             cancel_turn,
             respond_approval,

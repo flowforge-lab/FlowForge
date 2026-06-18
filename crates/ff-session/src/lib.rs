@@ -169,6 +169,14 @@ impl SessionStore {
             s.updated_at = now_ms();
         }
     }
+
+    /// Permanently remove a session and its transcript. Returns whether the
+    /// session existed. Idempotent: deleting an unknown id is a no-op.
+    pub fn delete_session(&self, session_id: &str) -> bool {
+        let mut inner = self.inner.lock().unwrap();
+        inner.messages.remove(session_id);
+        inner.sessions.remove(session_id).is_some()
+    }
 }
 
 #[cfg(test)]
@@ -220,6 +228,26 @@ mod tests {
         let store = SessionStore::new();
         store.set_title("nope", "x".into());
         assert!(store.list_sessions().is_empty());
+    }
+
+    #[test]
+    fn delete_session_removes_session_and_messages() {
+        let store = SessionStore::new();
+        let s = store.create_session(None);
+        store.add_message(&s.id, Role::User, "hello".into());
+        assert_eq!(store.list_sessions().len(), 1);
+
+        assert!(store.delete_session(&s.id));
+        assert!(store.list_sessions().is_empty());
+        assert!(store.get_messages(&s.id).is_empty());
+    }
+
+    #[test]
+    fn delete_session_unknown_is_noop() {
+        let store = SessionStore::new();
+        store.create_session(None);
+        assert!(!store.delete_session("nope"));
+        assert_eq!(store.list_sessions().len(), 1);
     }
 
     #[test]
