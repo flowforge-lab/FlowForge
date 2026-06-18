@@ -40,6 +40,12 @@ export type Unlisten = () => void;
 export interface FfIpc {
   // Commands (frontend -> backend)
   createSession(goal?: string): Promise<Session>;
+  // CONTRACT CHANGE (#149, fork into split pane): NEW command needing a real Rust
+  // implementation (mocked here for now) — please review @backend-owner. Clones a
+  // session's transcript/context into a fresh session server-side and returns it.
+  /** Fork a session: create a new session seeded with a copy of `sessionId`'s
+   *  messages/context. Rejects an unknown id. */
+  forkSession(sessionId: string): Promise<Session>;
   listSessions(): Promise<Session[]>;
   getMessages(sessionId: string): Promise<Message[]>;
   /** Sets a session's persisted display title (server-truth). */
@@ -241,6 +247,8 @@ class TauriIpc implements FfIpc {
 
   createSession = (goal?: string) =>
     this.invoke<Session>("create_session", { goal });
+  forkSession = (sessionId: string) =>
+    this.invoke<Session>("fork_session", { sessionId });
   listSessions = () => this.invoke<Session[]>("list_sessions");
   getMessages = (sessionId: string) =>
     this.invoke<Message[]>("get_messages", { sessionId });

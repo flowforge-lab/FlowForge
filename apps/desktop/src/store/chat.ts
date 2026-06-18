@@ -85,6 +85,11 @@ interface ChatState {
    *  Does not pull history — pair with loadSession when opening a fresh session. */
   setActiveSession: (sessionId: string) => void;
   newSession: (goal?: string) => Promise<void>;
+  /** Fork `sourceId` into a new session (clones its transcript via IPC) and pull
+   *  the cloned history into the store WITHOUT changing the active session — the
+   *  caller (a split pane) decides where it lands. Resolves with the new id, or
+   *  null on failure. */
+  forkSession: (sourceId: string) => Promise<string | null>;
   /** Send into `sessionId`, defaulting to the active session. Panes pass their own
    *  session so a background pane can send/stream independently. */
   send: (content: string, sessionId?: string) => Promise<void>;
@@ -217,6 +222,21 @@ export const useChatStore = create<ChatState>((set, get) => ({
       messagesBySession: { ...s.messagesBySession, [session.id]: [] },
     }));
     await get().selectSession(session.id);
+  },
+
+  forkSession: async (sourceId) => {
+    try {
+      const session = await ipc.forkSession(sourceId);
+      set((s) => ({
+        sessions: [session, ...s.sessions],
+        messagesBySession: { ...s.messagesBySession, [session.id]: [] },
+      }));
+      // Pull the cloned transcript without stealing focus from the source pane.
+      await get().loadSession(session.id);
+      return session.id;
+    } catch {
+      return null;
+    }
   },
 
   send: async (content, sessionId = get().activeSessionId ?? undefined) => {

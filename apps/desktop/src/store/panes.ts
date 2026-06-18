@@ -206,6 +206,9 @@ interface PanesState {
   splitDown: (paneId: string, sessionId: string) => void;
   /** Create a blank session and split `paneId` in `dir`, focusing the new pane. */
   splitNew: (paneId: string, dir: SplitDir) => Promise<void>;
+  /** Fork `paneId`'s session (clone its transcript) and split in `dir`, focusing
+   *  the new (forked) pane. No-op at the pane cap or if the pane is unknown. */
+  splitFork: (paneId: string, dir: SplitDir) => Promise<void>;
   /** Remove a pane; no-op on the last one. Refocuses a surviving leaf. */
   closePane: (paneId: string) => void;
   setRatio: (splitId: string, ratio: number) => void;
@@ -300,6 +303,18 @@ export const usePanesStore = create<PanesState>((set, get) => {
       const sessionId = useChatStore.getState().activeSessionId;
       if (!sessionId) return;
       split(paneId, sessionId, dir);
+    },
+
+    splitFork: async (paneId, dir) => {
+      const { root } = get();
+      if (!root || leafCountOf(root) >= MAX_PANES) return;
+      const leaf = findLeaf(root, paneId);
+      if (!leaf) return;
+      const forkedId = await useChatStore
+        .getState()
+        .forkSession(leaf.sessionId);
+      if (!forkedId) return;
+      split(paneId, forkedId, dir);
     },
 
     closePane: (paneId) => {
