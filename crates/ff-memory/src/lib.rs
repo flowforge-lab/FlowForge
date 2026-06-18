@@ -5,15 +5,25 @@
 //! append-only `daily/YYYY-MM-DD.md` working log. This crate owns those files,
 //! the (later) index, and recall.
 //!
-//! **M5.0 scope is ambient injection only.** [`Memory::ambient_block`] renders a
-//! compact, budget-bounded block — curated memory plus today + yesterday's daily
-//! log — that the host prepends to the system prompt through the RFC 0001 §4 hook
-//! (the same seam RFC 0002 uses for ambient context). There is no index or recall
-//! tool yet; those are M5.1. The [`MemoryChunk`] / [`MemorySource`] types are
-//! defined here now (RFC 0006 §4) so the index can consume them without churn.
+//! **Ambient injection** ([`Memory::ambient_block`]) renders a compact,
+//! budget-bounded block — curated memory plus today + yesterday's daily log —
+//! that the host prepends to the system prompt through the RFC 0001 §4 hook (the
+//! same seam RFC 0002 uses for ambient context).
+//!
+//! **Recall** (M5.1) reaches past the ambient window: an [`Fts5Index`] (SQLite
+//! FTS5/BM25, a deletable/rebuildable derived artifact) backs [`Memory::get`] and
+//! the search/write helpers the `memory_search` / `memory_get` / `memory_write`
+//! tools expose. A debounced [`watch`] reindexes on edit.
 //!
 //! Reads are **lenient**: a missing file is "nothing recorded yet" (empty), never
 //! an error, so callers never need a try/catch around a fresh install.
+
+mod error;
+pub mod index;
+pub mod watch;
+
+pub use error::{MemoryError, Result};
+pub use index::{Fts5Index, MemoryIndex, ScoredChunk};
 
 use std::path::{Path, PathBuf};
 
@@ -27,6 +37,15 @@ pub enum MemorySource {
     Curated,
     /// A dated daily log.
     Daily { date: NaiveDate },
+}
+
+/// Where a `memory_write` lands (RFC 0006 §7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteTarget {
+    /// Append to today's daily log — the agent's free, frequent write.
+    Daily,
+    /// Append to the curated `MEMORY.md` — conservative; only durable facts.
+    Curated,
 }
 
 /// One indexed unit of memory, chunked from a Markdown file (RFC 0006 §4).
@@ -112,6 +131,127 @@ impl Memory {
             .join(format!("{}.md", date.format("%Y-%m-%d")))
     }
 
+    /// The derived FTS5 index database, `~/.flowforge/memory/index.db`.
+    pub fn index_path(&self) -> PathBuf {
+        self.root.join("index.db")
+    }
+
+    /// The memory root directory.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// Whether memory is enabled (RFC 0006 §8). Recall tools no-op when `false`.
+    pub fn is_enabled(&self) -> bool {
+        self.config.enabled
+    }
+
+    /// Read a memory file, optionally sliced to a 1-based inclusive line range.
+    /// Backs `memory_get`: a missing file is empty (never an error), and a `path`
+    /// outside the memory root is rejected as empty so the tool can't read
+    /// arbitrary files.
+    pub fn get(&self, path: &Path, line_start: Option<u32>, line_end: Option<u32>) -> String {
+        if !self.within_root(path) {
+            return String::new();
+        }
+        let raw = read_lenient(path);
+        match (line_start, line_end) {
+            (None, None) => raw,
+            _ => {
+                let start = line_start.unwrap_or(1).max(1) as usize;
+                let end = line_end.unwrap_or(u32::MAX) as usize;
+                raw.lines()
+                    .enumerate()
+                    .filter(|(i, _)| {
+                        let n = i + 1;
+                        n >= start && n <= end
+                    })
+                    .map(|(_, l)| l)
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            }
+        }
+    }
+
+    /// Append `text` to the chosen target, creating the file/dirs if needed.
+    /// Returns the file written so the caller can reindex just that path.
+    pub fn write(&self, text: &str, target: WriteTarget) -> Result<PathBuf> {
+        let path = match target {
+            WriteTarget::Daily => self.daily_path(Local::now().date_naive()),
+            WriteTarget::Curated => self.curated_path(),
+        };
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|source| MemoryError::Io {
+                path: parent.to_path_buf(),
+                source,
+            })?;
+        }
+        let existing = read_lenient(&path);
+        let mut body = String::new();
+        if !existing.is_empty() && !existing.ends_with('\n') {
+            body.push('\n');
+        }
+        body.push_str(text.trim_end());
+        body.push('\n');
+        use std::io::Write as _;
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .map_err(|source| MemoryError::Io {
+                path: path.clone(),
+                source,
+            })?;
+        file.write_all(body.as_bytes())
+            .map_err(|source| MemoryError::Io {
+                path: path.clone(),
+                source,
+            })?;
+        Ok(path)
+    }
+
+    /// Chunk every memory file (curated + all daily logs) — the input to a full
+    /// [`MemoryIndex::reindex`].
+    pub fn all_chunks(&self) -> Vec<MemoryChunk> {
+        let mut out = Vec::new();
+        let curated = self.curated_path();
+        out.extend(chunk_markdown(
+            &read_lenient(&curated),
+            MemorySource::Curated,
+            &curated,
+        ));
+        if let Ok(entries) = std::fs::read_dir(self.root.join("daily")) {
+            let mut files: Vec<PathBuf> = entries
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("md"))
+                .collect();
+            files.sort();
+            for path in files {
+                let source = path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .and_then(|s| NaiveDate::parse_from_str(s, "%Y-%m-%d").ok())
+                    .map(|date| MemorySource::Daily { date })
+                    .unwrap_or(MemorySource::Curated);
+                out.extend(chunk_markdown(&read_lenient(&path), source, &path));
+            }
+        }
+        out
+    }
+
+    /// Containment check. Paths may not exist yet (so no `canonicalize`); reject
+    /// any `..` component outright — legit memory paths are flat (MEMORY.md,
+    /// daily/YYYY-MM-DD.md) — so `<root>/../../etc/passwd` can't slip past the
+    /// component-wise `starts_with`.
+    fn within_root(&self, path: &Path) -> bool {
+        use std::path::Component;
+        if path.components().any(|c| c == Component::ParentDir) {
+            return false;
+        }
+        path.starts_with(&self.root)
+    }
+
     /// The ambient block to prepend to the system prompt, or `None` when memory
     /// is disabled or nothing has been recorded yet. Curated memory comes first
     /// (budget-bounded), then today + yesterday's daily log.
@@ -171,13 +311,13 @@ impl Memory {
             let raw = read_lenient(&self.daily_path(date));
             let log = raw.trim();
             if !log.is_empty() {
-                recent.push_str(&format!("\n### {label} ({date})\n{log}\n"));
+                recent.push_str(&format!("\n#### {label} ({date})\n{log}\n"));
             }
         }
         if recent.is_empty() {
             None
         } else {
-            Some(format!("\n#### Recent daily log\n{recent}"))
+            Some(format!("\n### Recent daily log\n{recent}"))
         }
     }
 }
@@ -255,9 +395,16 @@ pub fn chunk_markdown(text: &str, source: MemorySource, path: &Path) -> Vec<Memo
     };
 
     let total = text.lines().count() as u32;
+    // A `#` line inside a fenced code block (``` or ~~~) is code, not a heading —
+    // a shell/python comment pasted into a daily log must not split a chunk.
+    let mut in_fence = false;
     for (i, raw) in text.lines().enumerate() {
         let lineno = (i + 1) as u32;
-        if raw.trim_start().starts_with('#') {
+        let trimmed = raw.trim_start();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            in_fence = !in_fence;
+            body.push(raw);
+        } else if !in_fence && trimmed.starts_with('#') {
             flush(
                 &mut chunks,
                 &heading,
@@ -265,7 +412,7 @@ pub fn chunk_markdown(text: &str, source: MemorySource, path: &Path) -> Vec<Memo
                 lineno.saturating_sub(1),
                 &body,
             );
-            heading = Some(raw.trim_start().trim_start_matches('#').trim().to_string());
+            heading = Some(trimmed.trim_start_matches('#').trim().to_string());
             start_line = lineno;
             body = vec![raw];
         } else {
@@ -288,6 +435,21 @@ mod tests {
 
     fn mem(root: &Path) -> Memory {
         Memory::new(root, MemoryConfig::default())
+    }
+
+    #[test]
+    fn get_rejects_path_traversal_and_absolute_escape() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("memory");
+        std::fs::create_dir_all(&root).unwrap();
+        // A secret sibling outside the memory root.
+        let secret = dir.path().join("secret.txt");
+        std::fs::write(&secret, "TOP-SECRET").unwrap();
+        let m = mem(&root);
+        // Relative traversal out of the root must not read the sibling.
+        assert_eq!(m.get(&root.join("../secret.txt"), None, None), "");
+        // An absolute path outside the root is likewise rejected.
+        assert_eq!(m.get(&secret, None, None), "");
     }
 
     fn write(path: &Path, body: &str) {

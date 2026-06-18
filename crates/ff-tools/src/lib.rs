@@ -24,6 +24,7 @@ mod glob;
 mod grep;
 mod html_text;
 mod jail;
+pub mod memory;
 mod registry;
 mod todo;
 mod tree;
