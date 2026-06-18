@@ -5,6 +5,7 @@
 
 pub mod events;
 mod mcp;
+mod memory;
 mod message;
 mod provider;
 mod search;
@@ -12,6 +13,7 @@ mod session;
 mod skill;
 
 pub use mcp::{McpServerConfig, McpServerState, McpServerStatus, McpToolInfo};
+pub use memory::{MemoryFileInfo, MemoryFileKind, MemoryOverview};
 pub use message::{Message, Role, ToolCall};
 pub use provider::{
     ConnectionId, ProviderConfig, ProviderConnection, ProviderKind, ProviderRegistry,

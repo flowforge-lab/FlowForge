@@ -16,8 +16,9 @@ use ff_core::events::{
     ToolResultEvent, TurnDoneEvent, TurnErrorEvent,
 };
 use ff_core::{
-    McpServerConfig, McpServerStatus, Message, Phenotype, ProviderConfig, ProviderConnection,
-    ProviderKind, ProviderRegistry, Role, SearchConfig, Session, Skill, SkillInfo, SkillManifest,
+    McpServerConfig, McpServerStatus, MemoryFileInfo, MemoryFileKind, MemoryOverview, Message,
+    Phenotype, ProviderConfig, ProviderConnection, ProviderKind, ProviderRegistry, Role,
+    SearchConfig, Session, Skill, SkillInfo, SkillManifest,
 };
 use ff_signals::SkillAggregate;
 use ff_tools::Safety;
@@ -174,6 +175,57 @@ fn fork_session(state: State<'_, Arc<AppState>>, session_id: String) -> Result<S
         .store
         .fork_session(&session_id)
         .ok_or_else(|| format!("unknown session: {session_id}"))
+}
+
+/// Map an internal [`ff_memory::MemoryFile`] to the IPC [`MemoryFileInfo`] contract.
+fn to_file_info(f: ff_memory::MemoryFile) -> MemoryFileInfo {
+    MemoryFileInfo {
+        name: f.name,
+        rel_path: f.rel_path,
+        kind: match f.kind {
+            ff_memory::MemoryFileKind::Curated => MemoryFileKind::Curated,
+            ff_memory::MemoryFileKind::Daily => MemoryFileKind::Daily,
+        },
+        size_bytes: f.size_bytes as i64,
+        modified_ms: f.modified_ms,
+    }
+}
+
+/// List the curated + daily memory files for the Settings memory pane (Issue #131).
+/// Read-only: curated first, then daily newest-first.
+#[tauri::command]
+fn list_memory_files(state: State<'_, Arc<AppState>>) -> Vec<MemoryFileInfo> {
+    state
+        .memory()
+        .list_files()
+        .into_iter()
+        .map(to_file_info)
+        .collect()
+}
+
+/// Read one memory file's body by its root-relative path (from `list_memory_files`).
+/// Errors if the path escapes the memory root.
+#[tauri::command]
+fn read_memory_file(state: State<'_, Arc<AppState>>, rel_path: String) -> Result<String, String> {
+    state
+        .memory()
+        .read_file(&rel_path)
+        .ok_or_else(|| "invalid memory path".to_string())
+}
+
+/// Summarize the memory store (file/byte counts, root, enabled flag) for the
+/// Settings pane header. Read-only — the enable toggle lands with Issue #166.
+#[tauri::command]
+fn memory_overview(state: State<'_, Arc<AppState>>) -> MemoryOverview {
+    let mem = state.memory();
+    let files = mem.list_files();
+    let total_bytes: i64 = files.iter().map(|f| f.size_bytes as i64).sum();
+    MemoryOverview {
+        enabled: mem.is_enabled(),
+        file_count: files.len() as i64,
+        total_bytes,
+        root_path: mem.root().display().to_string(),
+    }
 }
 
 #[tauri::command]
@@ -933,6 +985,9 @@ pub fn run() {
             rename_session,
             delete_session,
             fork_session,
+            list_memory_files,
+            read_memory_file,
+            memory_overview,
             send_message,
             cancel_turn,
             respond_approval,

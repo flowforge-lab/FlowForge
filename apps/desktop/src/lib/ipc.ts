@@ -33,6 +33,8 @@ import type {
   McpServerStatus,
   McpServerConfig,
   McpStatusChangedEvent,
+  MemoryFileInfo,
+  MemoryOverview,
 } from "../bindings";
 
 export type Unlisten = () => void;
@@ -102,6 +104,22 @@ export interface FfIpc {
   ): Promise<SearchConfig>;
   /** Best-effort nudge to wake the model server before the first turn. Never throws meaningfully. */
   warmup(): Promise<void>;
+
+  // Memory (RFC 0006, M5.1e — frozen read-only surface for the Settings memory
+  // pane, Issue #131). These three commands have real Rust impls + ts-rs bindings.
+  // Writes, the enable/disable toggle, and embeddings are deliberately out of scope.
+  //
+  // CONTRACT NOTE: there is intentionally NO `searchMemory` here. Host-side memory
+  // search is deferred to the HybridIndex work (#166) so we don't freeze a
+  // result/score DTO right before that PR changes ranking. The Settings pane reads
+  // whole files; recall ranking stays an agent-tool concern until #166 lands.
+  /** Curated + daily memory files, curated first then daily newest-first. */
+  listMemoryFiles(): Promise<MemoryFileInfo[]>;
+  /** Read one memory file's body by its root-relative path (from `listMemoryFiles`).
+   *  Rejects a path that escapes the memory root. */
+  readMemoryFile(relPath: string): Promise<string>;
+  /** Store summary (file/byte counts, root, enabled flag) for the pane header. */
+  memoryOverview(): Promise<MemoryOverview>;
 
   // Control settings (Issue #127). `ControlConfig` is a FE-owned shape (lib/control.ts):
   // there is no backend/ts-rs type yet, and the permission matrix does NOT map to
@@ -252,6 +270,10 @@ class TauriIpc implements FfIpc {
     this.invoke<Session>("create_session", { goal });
   forkSession = (sessionId: string) =>
     this.invoke<Session>("fork_session", { sessionId });
+  listMemoryFiles = () => this.invoke<MemoryFileInfo[]>("list_memory_files");
+  readMemoryFile = (relPath: string) =>
+    this.invoke<string>("read_memory_file", { relPath });
+  memoryOverview = () => this.invoke<MemoryOverview>("memory_overview");
   listSessions = () => this.invoke<Session[]>("list_sessions");
   getMessages = (sessionId: string) =>
     this.invoke<Message[]>("get_messages", { sessionId });

@@ -29,6 +29,8 @@ import type {
   McpServerStatus,
   McpServerConfig,
   McpStatusChangedEvent,
+  MemoryFileInfo,
+  MemoryOverview,
 } from "../bindings";
 import type { FfIpc, Unlisten } from "./ipc";
 import type { MarketplaceSkill } from "./marketplace";
@@ -680,6 +682,54 @@ export class MockIpc implements FfIpc {
 
   async warmup(): Promise<void> {
     // No-op: there is no real server behind the mock.
+  }
+
+  // Memory (RFC 0006, M5.1e) — canned read-only store mirroring the Rust layout:
+  // a curated MEMORY.md plus daily/<date>.md files, daily newest-first.
+  private memoryFiles: Array<MemoryFileInfo & { body: string }> = [
+    {
+      name: "MEMORY.md",
+      relPath: "MEMORY.md",
+      kind: "curated",
+      sizeBytes: 64,
+      modifiedMs: 1_718_000_000_000,
+      body: "# Memory\n\nUser prefers concise answers and dark mode.\n",
+    },
+    {
+      name: "2026-06-18.md",
+      relPath: "daily/2026-06-18.md",
+      kind: "daily",
+      sizeBytes: 41,
+      modifiedMs: 1_718_700_000_000,
+      body: "- Shipped the memory IPC contract today.\n",
+    },
+    {
+      name: "2026-06-17.md",
+      relPath: "daily/2026-06-17.md",
+      kind: "daily",
+      sizeBytes: 33,
+      modifiedMs: 1_718_600_000_000,
+      body: "- Reviewed RFC 0006 memory.\n",
+    },
+  ];
+
+  async listMemoryFiles(): Promise<MemoryFileInfo[]> {
+    return this.memoryFiles.map(({ body: _body, ...info }) => ({ ...info }));
+  }
+
+  async readMemoryFile(relPath: string): Promise<string> {
+    const f = this.memoryFiles.find((m) => m.relPath === relPath);
+    if (!f) throw new Error("invalid memory path");
+    return f.body;
+  }
+
+  async memoryOverview(): Promise<MemoryOverview> {
+    return {
+      enabled: true,
+      fileCount: this.memoryFiles.length,
+      totalBytes: this.memoryFiles.reduce((sum, f) => sum + f.sizeBytes, 0),
+      rootPath: "/mock/memory",
+    };
   }
 
   async listSkills(): Promise<SkillInfo[]> {
