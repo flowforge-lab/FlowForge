@@ -29,6 +29,16 @@ describe("chat store — session-scoped send/cancel (#148)", () => {
     expect(spy).toHaveBeenCalledWith(ACTIVE, "hi");
   });
 
+  it("send marks the turn pending (started, not yet streaming) - the send-button spinner window", async () => {
+    vi.spyOn(ipc, "sendMessage").mockResolvedValue("m1");
+    await useChatStore.getState().send("hi");
+    const s = useChatStore.getState();
+    // Turn timing is set the moment we send; streaming only flips on the first
+    // token. The input bar shows a spinner precisely in this window.
+    expect(s.turnStartBySession[ACTIVE]).toBeTypeOf("number");
+    expect(s.streamingBySession[ACTIVE]).toBeUndefined();
+  });
+
   it("send targets an explicit background session without touching the active one", async () => {
     const spy = vi.spyOn(ipc, "sendMessage").mockResolvedValue("m2");
     await useChatStore.getState().send("bg work", BG);

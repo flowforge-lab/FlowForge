@@ -67,6 +67,15 @@ export function ModelSection() {
     return () => registerResetHandler(null);
   }, [registerResetHandler, resetModel]);
 
+  // If the persisted model isn't one the active provider offers (e.g. right
+  // after a kind switch), fall back to the first available so the dropdown
+  // never selects a model the provider can't serve.
+  useEffect(() => {
+    if (provider && models.length > 0 && !models.includes(provider.model)) {
+      void setModel(models[0]);
+    }
+  }, [provider, models, setModel]);
+
   // Always include the current model so the select can show it even if it's not
   // in the (best-effort) list yet.
   const modelOptions =
@@ -107,7 +116,7 @@ export function ModelSection() {
           <select
             id="model-select"
             value={provider.model}
-            disabled={saving || modelOptions.length === 0}
+            disabled={saving || loading || modelOptions.length === 0}
             onChange={(e) => void setModel(e.target.value)}
             className={cn(
               "h-8 w-full rounded-lg border border-input bg-transparent px-2.5 text-[13px] text-foreground outline-none transition-colors",
@@ -121,10 +130,20 @@ export function ModelSection() {
               </option>
             ))}
           </select>
-          <p className="text-[11px] leading-relaxed text-muted-foreground">
-            Sent on each chat request. API keys and hosted providers arrive
-            later (#8).
-          </p>
+          {!loading && provider && models.length === 0 ? (
+            <p className="text-[11px] leading-relaxed text-muted-foreground">
+              No models installed for this provider. Pull one (e.g.{" "}
+              <code className="rounded bg-muted px-1 py-0.5">
+                ollama pull {provider.model}
+              </code>
+              ), then reopen settings.
+            </p>
+          ) : (
+            <p className="text-[11px] leading-relaxed text-muted-foreground">
+              Sent on each chat request. API keys and hosted providers arrive
+              later (#8).
+            </p>
+          )}
         </section>
       ) : null}
 
