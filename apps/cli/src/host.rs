@@ -46,6 +46,36 @@ pub fn skills_root() -> PathBuf {
         .join("skills")
 }
 
+/// `~/.flowforge/phenotypes` — the phenotype definitions shared with the desktop
+/// app (RFC 0001 §7). Loaded read-only here; editing stays desktop-side.
+pub fn phenotypes_root() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".flowforge")
+        .join("phenotypes")
+}
+
+/// Resolve a phenotype by name: the built-in `default`, otherwise a definition
+/// from `~/.flowforge/phenotypes/<name>.toml`. Returns `None` for an unknown
+/// name. Mirrors the desktop's `resolve_phenotype` so a headless turn sees the
+/// same definition the GUI would apply.
+pub fn resolve_phenotype(name: &str) -> Option<ff_core::Phenotype> {
+    resolve_phenotype_in(name, &phenotypes_root())
+}
+
+fn resolve_phenotype_in(name: &str, root: &std::path::Path) -> Option<ff_core::Phenotype> {
+    use ff_skills::{default_phenotype, load_phenotypes, DEFAULT_PHENOTYPE};
+
+    if name == DEFAULT_PHENOTYPE {
+        return Some(default_phenotype());
+    }
+    let (mut map, errors) = load_phenotypes(root);
+    for e in &errors {
+        eprintln!("warning: phenotype load: {e}");
+    }
+    map.remove(name)
+}
+
 /// Load the installed skill set for system-prompt injection. A parse error is
 /// reported but never fatal — one bad skill must not block a turn.
 pub fn load_skills() -> SkillRegistry {
@@ -60,4 +90,49 @@ pub fn load_skills() -> SkillRegistry {
 /// current working directory — you run `flowforge` where you want it to act.
 pub fn workspace_root() -> PathBuf {
     std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_phenotype_in;
+    use ff_skills::DEFAULT_PHENOTYPE;
+    use std::fs;
+
+    #[test]
+    fn default_phenotype_resolves_without_any_files() {
+        // The built-in "default" short-circuits the filesystem: it resolves even
+        // against an empty (or nonexistent) phenotypes root, like the desktop does.
+        let tmp = tempfile::tempdir().unwrap();
+        let p = resolve_phenotype_in(DEFAULT_PHENOTYPE, tmp.path()).unwrap();
+        assert_eq!(p.name, "default");
+        assert!(p.skills.is_empty());
+        assert!(p.model.is_none());
+        assert!(p.persona.is_none());
+    }
+
+    #[test]
+    fn resolves_named_phenotype_from_toml_by_stem() {
+        // A `--pheno rust` turn reads `<root>/rust.toml`; the name comes from the
+        // file stem, not a field inside the TOML (mirrors the desktop).
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(
+            tmp.path().join("rust.toml"),
+            "skills = [\"cargo-check\", \"clippy\"]\n\
+             model = \"qwen3-coder\"\n\
+             persona = \"You are a Rust expert.\"\n",
+        )
+        .unwrap();
+
+        let p = resolve_phenotype_in("rust", tmp.path()).unwrap();
+        assert_eq!(p.name, "rust");
+        assert_eq!(p.skills, vec!["cargo-check", "clippy"]);
+        assert_eq!(p.model.as_deref(), Some("qwen3-coder"));
+        assert_eq!(p.persona.as_deref(), Some("You are a Rust expert."));
+    }
+
+    #[test]
+    fn unknown_name_returns_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(resolve_phenotype_in("nope", tmp.path()).is_none());
+    }
 }

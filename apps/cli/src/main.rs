@@ -42,6 +42,15 @@ enum Command {
         /// Auto-deny write and dangerous tool calls without prompting.
         #[arg(long, conflicts_with = "yes")]
         deny: bool,
+        /// Override the provider's default model for this turn.
+        #[arg(long, value_name = "ID")]
+        model: Option<String>,
+        /// Activate a skill's body for the turn (repeatable). Unknown names error.
+        #[arg(long, value_name = "NAME")]
+        skill: Vec<String>,
+        /// Load a phenotype's active skills, model, and persona (see `~/.flowforge/phenotypes`).
+        #[arg(long, value_name = "NAME")]
+        pheno: Option<String>,
     },
     /// Open an interactive REPL (multi-turn, in-process session). Default when
     /// no subcommand is given. Type `exit` or press Ctrl-D to quit.
@@ -82,7 +91,10 @@ async fn main() -> ExitCode {
             json,
             yes,
             deny,
-        } => run(prompt, json, approval_mode(yes, deny)).await,
+            model,
+            skill,
+            pheno,
+        } => run(prompt, json, approval_mode(yes, deny), model, skill, pheno).await,
         Command::Chat { json, yes, deny } => chat(json, approval_mode(yes, deny)).await,
         Command::Skills { command } => match command {
             SkillsCommand::List => skills_list(),
@@ -117,6 +129,75 @@ fn approval_mode(yes: bool, deny: bool) -> ApprovalMode {
     }
 }
 
+/// Resolved per-turn inputs derived from the `run` flags. Mirrors what the
+/// desktop's `AppState` computes each turn: an active-skill set (registry
+/// validated), a model (flag → phenotype → provider default), and an optional
+/// persona. Built once before the turn so `run` stays a flat call.
+#[derive(Debug)]
+struct TurnInputs {
+    model: String,
+    persona: Option<String>,
+    active: Vec<String>,
+}
+
+/// Resolve the `--model`/`--skill`/`--pheno` flags to per-turn inputs, mirroring
+/// the desktop's `send_message` assembly. `pheno` is already resolved (or `None`)
+/// by the caller — the desktop resolves its active phenotype from the persisted
+/// pointer; the CLI resolves it from `--pheno`.
+///
+/// Precedence mirrors the desktop: a phenotype seeds the active skills, persona,
+/// and a model candidate; `--model` is the most specific override (wins over the
+/// phenotype's model, which wins over the provider default). `--skill` names must
+/// resolve in the registry (unknown → `Err`). A phenotype's own skills are
+/// validated the same way the desktop validates them: unknown names are dropped
+/// with a warning, not an error (the installed set can drift from a definition).
+fn resolve_turn_inputs(
+    default_model: &str,
+    skills: &ff_skills::SkillRegistry,
+    model_flag: Option<&str>,
+    skill_flags: &[String],
+    pheno: Option<&ff_core::Phenotype>,
+) -> Result<TurnInputs, String> {
+    use std::collections::BTreeSet;
+
+    let (mut active, persona, pheno_model) = match pheno {
+        Some(p) => {
+            let mut validated = BTreeSet::new();
+            for name in &p.skills {
+                if skills.get(name).is_some() {
+                    validated.insert(name.clone());
+                } else {
+                    eprintln!(
+                        "warning: phenotype \"{}\" names unknown skill \"{}\"; skipping",
+                        p.name, name
+                    );
+                }
+            }
+            (validated, p.persona.clone(), p.model.clone())
+        }
+        None => (BTreeSet::new(), None, None),
+    };
+
+    for name in skill_flags {
+        if skills.get(name).is_some() {
+            active.insert(name.clone());
+        } else {
+            return Err(format!("unknown skill: {name}"));
+        }
+    }
+
+    let model = model_flag
+        .map(str::to_string)
+        .or(pheno_model)
+        .unwrap_or_else(|| default_model.to_string());
+
+    Ok(TurnInputs {
+        model,
+        persona,
+        active: active.into_iter().collect(),
+    })
+}
+
 /// Shared durable-memory setup (RFC 0006). Builds the store + FTS5 index, does a
 /// full reindex from disk, and registers the three memory tools. Best-effort: an
 /// index failure leaves the ambient block working but skips the recall tools.
@@ -143,8 +224,15 @@ fn build_registry_with_memory() -> (ff_tools::ToolRegistry, std::sync::Arc<ff_me
     (registry, memory_store)
 }
 
-async fn run(prompt: String, json: bool, approval_mode: ApprovalMode) -> ExitCode {
-    let (provider, model) = host::load_provider();
+async fn run(
+    prompt: String,
+    json: bool,
+    approval_mode: ApprovalMode,
+    model: Option<String>,
+    skill: Vec<String>,
+    pheno: Option<String>,
+) -> ExitCode {
+    let (provider, default_model) = host::load_provider();
     let skills = host::load_skills();
     let workspace = host::workspace_root();
     let store = ff_session::SessionStore::new();
@@ -154,10 +242,43 @@ async fn run(prompt: String, json: bool, approval_mode: ApprovalMode) -> ExitCod
     let session = store.create_session(None);
     store.add_message(&session.id, Role::User, prompt);
 
+    // Resolve the --model/--skill/--pheno flags the same way the desktop resolves
+    // its active phenotype each turn: a phenotype seeds the active skills, persona,
+    // and a model candidate; `--model` is the most specific override; `--skill`
+    // adds validated skills on top. Unknown --pheno/--skill names fail cleanly.
+    let active_pheno = match pheno.as_deref() {
+        Some(name) => match host::resolve_phenotype(name) {
+            Some(p) => Some(p),
+            None => {
+                eprintln!("error: unknown phenotype: {name}");
+                return ExitCode::FAILURE;
+            }
+        },
+        None => None,
+    };
+    let inputs = match resolve_turn_inputs(
+        &default_model,
+        &skills,
+        model.as_deref(),
+        &skill,
+        active_pheno.as_ref(),
+    ) {
+        Ok(inputs) => inputs,
+        Err(msg) => {
+            eprintln!("error: {msg}");
+            return ExitCode::FAILURE;
+        }
+    };
+
     let user_ctx = UserContext::now();
     let memory = memory_store.ambient_block();
-    let system_prompt =
-        ff_agent::build_system_prompt(None, &skills, &[], &user_ctx, memory.as_deref());
+    let system_prompt = ff_agent::build_system_prompt(
+        inputs.persona.as_deref(),
+        &skills,
+        &inputs.active,
+        &user_ctx,
+        memory.as_deref(),
+    );
 
     let tool_ctx = ToolContext {
         registry: &registry,
@@ -183,7 +304,7 @@ async fn run(prompt: String, json: bool, approval_mode: ApprovalMode) -> ExitCod
             &store,
             &tool_ctx,
             &session.id,
-            &model,
+            &inputs.model,
             Some(system_prompt.as_str()),
             true,
             cancel,
@@ -198,7 +319,7 @@ async fn run(prompt: String, json: bool, approval_mode: ApprovalMode) -> ExitCod
             &store,
             &tool_ctx,
             &session.id,
-            &model,
+            &inputs.model,
             Some(system_prompt.as_str()),
             true,
             cancel,
@@ -394,13 +515,13 @@ mod tests {
     use std::process::ExitCode;
 
     use super::json_events;
-    use super::{approval_mode, Cli};
+    use super::{approval_mode, resolve_turn_inputs, Cli};
     use crate::approver::ApprovalMode;
     use async_trait::async_trait;
     use clap::CommandFactory;
     use clap::Parser;
     use ff_agent::{run_turn, AgentEvent, Approver, CancelToken, ToolContext};
-    use ff_core::Role;
+    use ff_core::{Phenotype, Role};
     use ff_llm::{ChatRequest, Chunk, ChunkStream, LlmError, Provider};
     use ff_memory::{Memory, MemoryConfig};
     use ff_session::SessionStore;
@@ -744,5 +865,146 @@ mod tests {
                 "command {cmd:?} should exit cleanly"
             );
         }
+    }
+
+    // -- resolve_turn_inputs tests -------------------------------------------
+
+    /// Build a Phenotype for tests. Mirrors `ff_skills::default_phenotype` in
+    /// shape but lets each test set fields independently.
+    fn test_phenotype(
+        name: &str,
+        skills: &[&str],
+        model: Option<&str>,
+        persona: Option<&str>,
+    ) -> Phenotype {
+        Phenotype {
+            name: name.to_string(),
+            skills: skills.iter().map(|s| s.to_string()).collect(),
+            model: model.map(str::to_string),
+            persona: persona.map(str::to_string),
+        }
+    }
+
+    /// Build a SkillRegistry populated with named skills by writing minimal
+    /// SKILL.md files to a temp dir and loading it — the same path `host::load_skills`
+    /// uses in production. Each skill's frontmatter has just name/version/description.
+    fn registry_with_skills(names: &[&str]) -> SkillRegistry {
+        let tmp = tempfile::tempdir().unwrap();
+        for name in names {
+            let dir = tmp.path().join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("SKILL.md"),
+                format!("---\nname: {name}\ndescription: d\nversion: 0.1.0\n---\nbody\n"),
+            )
+            .unwrap();
+        }
+        let (reg, _errors) = SkillRegistry::load_dir(tmp.path());
+        reg
+    }
+
+    #[test]
+    fn model_flag_overrides_default() {
+        let reg = SkillRegistry::new();
+        let inputs =
+            resolve_turn_inputs("default-model", &reg, Some("flag-model"), &[], None).unwrap();
+        assert_eq!(inputs.model, "flag-model");
+    }
+
+    #[test]
+    fn pheno_model_used_when_no_flag() {
+        let reg = SkillRegistry::new();
+        let p = test_phenotype("rust", &[], Some("pheno-model"), None);
+        let inputs = resolve_turn_inputs("default-model", &reg, None, &[], Some(&p)).unwrap();
+        assert_eq!(inputs.model, "pheno-model");
+    }
+
+    #[test]
+    fn model_flag_wins_over_pheno_model() {
+        let reg = SkillRegistry::new();
+        let p = test_phenotype("rust", &[], Some("pheno-model"), None);
+        let inputs =
+            resolve_turn_inputs("default-model", &reg, Some("flag-model"), &[], Some(&p)).unwrap();
+        assert_eq!(inputs.model, "flag-model");
+    }
+
+    #[test]
+    fn default_model_when_nothing_set() {
+        let reg = SkillRegistry::new();
+        let inputs = resolve_turn_inputs("default-model", &reg, None, &[], None).unwrap();
+        assert_eq!(inputs.model, "default-model");
+    }
+
+    #[test]
+    fn skill_flag_adds_active_skill() {
+        let reg = registry_with_skills(&["alpha"]);
+        let inputs = resolve_turn_inputs("d", &reg, None, &["alpha".to_string()], None).unwrap();
+        assert_eq!(inputs.active, vec!["alpha"]);
+    }
+
+    #[test]
+    fn unknown_skill_flag_errors() {
+        let reg = SkillRegistry::new();
+        let err = resolve_turn_inputs("d", &reg, None, &["bogus".to_string()], None).unwrap_err();
+        assert!(err.contains("unknown skill"), "{err}");
+        assert!(err.contains("bogus"), "{err}");
+    }
+
+    #[test]
+    fn pheno_unknown_skill_dropped_not_errored() {
+        // A phenotype can name skills that aren't installed; the desktop drops
+        // them with a warning. The turn must still proceed (Ok), just without
+        // that skill.
+        let reg = SkillRegistry::new();
+        let p = test_phenotype("rust", &["missing"], None, None);
+        let inputs = resolve_turn_inputs("d", &reg, None, &[], Some(&p)).unwrap();
+        assert!(inputs.active.is_empty());
+    }
+
+    #[test]
+    fn pheno_known_skill_kept() {
+        let reg = registry_with_skills(&["clippy"]);
+        let p = test_phenotype("rust", &["clippy"], None, None);
+        let inputs = resolve_turn_inputs("d", &reg, None, &[], Some(&p)).unwrap();
+        assert_eq!(inputs.active, vec!["clippy"]);
+    }
+
+    #[test]
+    fn pheno_persona_flows_through() {
+        let reg = SkillRegistry::new();
+        let p = test_phenotype("rust", &[], None, Some("You are a Rust expert."));
+        let inputs = resolve_turn_inputs("d", &reg, None, &[], Some(&p)).unwrap();
+        assert_eq!(inputs.persona.as_deref(), Some("You are a Rust expert."));
+    }
+
+    #[test]
+    fn pheno_rust_full_acceptance() {
+        // --pheno rust with skills + model + persona, plus an extra --skill and
+        // --model override. Verifies the full acceptance scenario: model flag
+        // wins, persona flows, pheno skills + flag skills both active.
+        let reg = registry_with_skills(&["cargo-check", "clippy", "extra"]);
+        let p = test_phenotype(
+            "rust",
+            &["cargo-check", "clippy"],
+            Some("qwen3-coder"),
+            Some("Rust expert"),
+        );
+        let inputs = resolve_turn_inputs(
+            "default-model",
+            &reg,
+            Some("override-model"),
+            &["extra".to_string()],
+            Some(&p),
+        )
+        .unwrap();
+
+        // --model wins over pheno model.
+        assert_eq!(inputs.model, "override-model");
+        // Persona from pheno.
+        assert_eq!(inputs.persona.as_deref(), Some("Rust expert"));
+        // Active = pheno's known skills + the --skill flag, sorted (BTreeSet).
+        let mut active = inputs.active.clone();
+        active.sort();
+        assert_eq!(active, vec!["cargo-check", "clippy", "extra"]);
     }
 }
