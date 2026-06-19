@@ -33,6 +33,43 @@ describe("describeStep", () => {
     expect(describeStep({ tool: "python", args: {} })).toBe("Run Python");
   });
 
+  it("process_manager: labels by action", () => {
+    expect(
+      describeStep({
+        tool: "process_manager",
+        args: { action: "start", command: "npm run dev" },
+      }),
+    ).toBe("Start `npm run dev`");
+    const long = "x".repeat(BASH_CMD_TRUNCATE + 10);
+    expect(
+      describeStep({
+        tool: "process_manager",
+        args: { action: "start", command: long },
+      }),
+    ).toBe(`Start \`${"x".repeat(BASH_CMD_TRUNCATE)}…\``);
+    expect(
+      describeStep({
+        tool: "process_manager",
+        args: { action: "poll", process_id: 7 },
+      }),
+    ).toBe("Poll process #7");
+    expect(
+      describeStep({
+        tool: "process_manager",
+        args: { action: "stop", process_id: "7" },
+      }),
+    ).toBe("Stop process #7");
+    expect(
+      describeStep({ tool: "process_manager", args: { action: "list" } }),
+    ).toBe("List processes");
+    expect(describeStep({ tool: "process_manager", args: {} })).toBe(
+      "Manage processes",
+    );
+    expect(
+      describeStep({ tool: "process_manager", args: { action: "start" } }),
+    ).toBe("Start process");
+  });
+
   it("view / write / edit use path args", () => {
     expect(describeStep({ tool: "view", args: { path: "src/foo.ts" } })).toBe(
       "Read src/foo.ts",

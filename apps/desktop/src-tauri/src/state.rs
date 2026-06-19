@@ -24,6 +24,7 @@ use ff_skills::{
     DEFAULT_PHENOTYPE,
 };
 use ff_tools::memory::{MemoryGetTool, MemorySearchTool, MemoryWriteTool};
+use ff_tools::process::{ProcessManagerTool, ProcessSupervisor};
 use ff_tools::ToolRegistry;
 use tokio::sync::oneshot;
 
@@ -334,6 +335,11 @@ pub struct AppState {
     flush_ledger: Option<Arc<FlushLedger>>,
     /// Owns the memory filesystem watcher; dropping it stops debounced reindex.
     _memory_watcher: Mutex<Option<MemoryWatcher>>,
+    /// App-global table of agent-started background processes (#218), shared (via
+    /// `Arc`) with the registered `process_manager` tool so a process started in
+    /// one turn can be polled or stopped in a later one. Children are killed when
+    /// the last `Arc` drops at app exit.
+    process_supervisor: Arc<ProcessSupervisor>,
 }
 
 impl AppState {
@@ -374,6 +380,7 @@ impl AppState {
             memory_index,
             flush_ledger,
             _memory_watcher: Mutex::new(memory_watcher),
+            process_supervisor: Arc::new(ProcessSupervisor::new()),
         };
         // Restore the persisted phenotype so its active skills survive a restart.
         // An unknown/missing pointer falls back to the built-in default.
@@ -552,6 +559,11 @@ impl AppState {
         reg.register(Box::new(MemoryWriteTool::new(
             self.memory.clone(),
             self.memory_index.clone(),
+        )));
+        // Background-process control (#218). App-global supervisor injected here so
+        // a process started in one turn survives into later turns.
+        reg.register(Box::new(ProcessManagerTool::new(
+            self.process_supervisor.clone(),
         )));
         // Bridge MCP tools from currently-running servers (M4.3).
         if let Some(handle) = self.mcp_handle() {

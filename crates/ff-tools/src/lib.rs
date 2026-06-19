@@ -25,6 +25,7 @@ mod grep;
 mod html_text;
 mod jail;
 pub mod memory;
+pub mod process;
 mod python;
 mod registry;
 mod todo;

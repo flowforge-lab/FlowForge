@@ -14,6 +14,14 @@ function strArg(args: unknown, key: string): string | null {
   return typeof v === "string" && v.trim() ? v.trim() : null;
 }
 
+/** A `process_id` arg, accepted as a number or numeric string. */
+function procId(args: unknown): string | null {
+  if (!args || typeof args !== "object") return null;
+  const v = (args as Record<string, unknown>).process_id;
+  if (typeof v === "number") return String(v);
+  return typeof v === "string" && v.trim() ? v.trim() : null;
+}
+
 /** One-line description for a tool step header (Issue #180). */
 export function describeStep(step: Pick<ToolStep, "tool" | "args">): string {
   const { tool, args } = step;
@@ -38,6 +46,30 @@ export function describeStep(step: Pick<ToolStep, "tool" | "args">): string {
           ? `${firstLine.slice(0, BASH_CMD_TRUNCATE)}…`
           : firstLine;
       return `Run Python \`${truncated}\``;
+    }
+    case "process_manager": {
+      const action = strArg(args, "action");
+      const pid = procId(args);
+      switch (action) {
+        case "start": {
+          const command = strArg(args, "command");
+          if (!command) return "Start process";
+          const firstLine = command.split("\n")[0]?.trim() ?? command;
+          const truncated =
+            firstLine.length > BASH_CMD_TRUNCATE
+              ? `${firstLine.slice(0, BASH_CMD_TRUNCATE)}…`
+              : firstLine;
+          return `Start \`${truncated}\``;
+        }
+        case "poll":
+          return pid ? `Poll process #${pid}` : "Poll process";
+        case "stop":
+          return pid ? `Stop process #${pid}` : "Stop process";
+        case "list":
+          return "List processes";
+        default:
+          return "Manage processes";
+      }
     }
     case "view": {
       const path = strArg(args, "path");
