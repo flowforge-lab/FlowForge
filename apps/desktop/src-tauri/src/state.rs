@@ -283,6 +283,12 @@ pub struct AppState {
     /// session shares one default root; the field is threaded so the picker is
     /// purely additive later.
     pub workspace_root: PathBuf,
+    /// Per-session working directories (slice 3a, issue #200). Absent until a
+    /// session's cwd is set away from the default; [`session_root`](Self::session_root)
+    /// falls back to [`workspace_root`](Self::workspace_root). Host-internal and
+    /// in-memory (no contract change) -- the future `set_workspace` command/tool
+    /// (slice 3b) is the writer.
+    session_cwd: Mutex<HashMap<String, PathBuf>>,
     /// Installed skills, kept current by `_skill_watcher`. Snapshotted per turn
     /// (`skills_snapshot`) so a mid-turn reload never races (RFC 0001 §9).
     skills: SharedRegistry,
@@ -351,6 +357,7 @@ impl AppState {
             registry: Mutex::new(registry),
             search_config,
             workspace_root: default_workspace_root(),
+            session_cwd: Mutex::new(HashMap::new()),
             skills,
             _skill_watcher: Mutex::new(watcher),
             approvals: Mutex::new(ApprovalRegistry::default()),
@@ -445,12 +452,13 @@ impl AppState {
             return;
         }
 
+        let session_root = self.session_root(session_id);
         let outcome = MemoryFlush
             .compact(CompactionContext {
                 provider,
                 store: &self.store,
                 registry,
-                root: &self.workspace_root,
+                root: &session_root,
                 session_id,
                 model,
                 cancel,
@@ -465,6 +473,29 @@ impl AppState {
             }
             Err(e) => tracing::warn!(error = %e, "memory flush failed"),
         }
+    }
+
+    /// The working directory for `session_id`'s tools this turn. Returns the
+    /// session's cwd if one has been set (slice 3b), otherwise the default
+    /// [`workspace_root`](Self::workspace_root).
+    pub fn session_root(&self, session_id: &str) -> PathBuf {
+        self.session_cwd
+            .lock()
+            .unwrap()
+            .get(session_id)
+            .cloned()
+            .unwrap_or_else(|| self.workspace_root.clone())
+    }
+
+    /// Set `session_id`'s working directory. The future `set_workspace`
+    /// command (slice 3b, issue #200) is the production caller; until then this
+    /// is exercised only by tests.
+    #[allow(dead_code)]
+    pub fn set_session_cwd(&self, session_id: &str, dir: PathBuf) {
+        self.session_cwd
+            .lock()
+            .unwrap()
+            .insert(session_id.to_string(), dir);
     }
 
     /// The shared durable-memory store (RFC 0006), used for per-turn ambient
@@ -1376,6 +1407,30 @@ mod tests {
         assert_eq!(active.id, "candle-vllm");
         assert_eq!(active.model, "edited");
         assert_eq!(active.base_url.as_deref(), Some("http://localhost:9100/v1"));
+    }
+
+    #[test]
+    fn session_root_defaults_to_workspace_root_when_unset() {
+        let state = AppState::new();
+        assert_eq!(state.session_root("sess-unset"), state.workspace_root);
+    }
+
+    #[test]
+    fn session_root_returns_set_cwd() {
+        let state = AppState::new();
+        let dir = std::path::PathBuf::from("/tmp/ff-session-cwd-test");
+        state.set_session_cwd("sess-a", dir.clone());
+        assert_eq!(state.session_root("sess-a"), dir);
+    }
+
+    #[test]
+    fn session_cwd_is_isolated_per_session() {
+        let state = AppState::new();
+        let a = std::path::PathBuf::from("/tmp/ff-a");
+        state.set_session_cwd("sess-a", a.clone());
+        assert_eq!(state.session_root("sess-a"), a);
+        // A different session is unaffected and still falls back to the default.
+        assert_eq!(state.session_root("sess-b"), state.workspace_root);
     }
 
     #[test]
