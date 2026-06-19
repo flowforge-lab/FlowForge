@@ -19,6 +19,20 @@ describe("describeStep", () => {
     );
   });
 
+  it("python: first line, truncated, prefixed", () => {
+    const long = "x".repeat(BASH_CMD_TRUNCATE + 10);
+    expect(describeStep({ tool: "python", args: { code: "print(1)" } })).toBe(
+      "Run Python `print(1)`",
+    );
+    expect(
+      describeStep({ tool: "python", args: { code: "import os\nprint(os)" } }),
+    ).toBe("Run Python `import os`");
+    expect(describeStep({ tool: "python", args: { code: long } })).toBe(
+      `Run Python \`${"x".repeat(BASH_CMD_TRUNCATE)}…\``,
+    );
+    expect(describeStep({ tool: "python", args: {} })).toBe("Run Python");
+  });
+
   it("view / write / edit use path args", () => {
     expect(describeStep({ tool: "view", args: { path: "src/foo.ts" } })).toBe(
       "Read src/foo.ts",

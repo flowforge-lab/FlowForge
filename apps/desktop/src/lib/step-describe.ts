@@ -29,6 +29,16 @@ export function describeStep(step: Pick<ToolStep, "tool" | "args">): string {
           : firstLine;
       return `Run \`${truncated}\``;
     }
+    case "python": {
+      const code = strArg(args, "code");
+      if (!code) return "Run Python";
+      const firstLine = code.split("\n")[0]?.trim() ?? code;
+      const truncated =
+        firstLine.length > BASH_CMD_TRUNCATE
+          ? `${firstLine.slice(0, BASH_CMD_TRUNCATE)}…`
+          : firstLine;
+      return `Run Python \`${truncated}\``;
+    }
     case "view": {
       const path = strArg(args, "path");
       return path ? `Read ${path}` : "Read file";

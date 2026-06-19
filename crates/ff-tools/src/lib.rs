@@ -1,5 +1,5 @@
-//! Built-in tools the agent can call: `bash`, `view`, `edit`, `write`, `grep`,
-//! `glob`, `tree`, `todo`, `web_fetch`, `ask_user`. The `web_search` tool lives
+//! Built-in tools the agent can call: `bash`, `python`, `view`, `edit`, `write`,
+//! `grep`, `glob`, `tree`, `todo`, `web_fetch`, `ask_user`. The `web_search` tool lives
 //! in the desktop crate (it reads user-configured search settings).
 //!
 //! File tools ([`view`], [`edit`], [`write`]) are hard-jailed to a per-session workspace root
@@ -25,6 +25,7 @@ mod grep;
 mod html_text;
 mod jail;
 pub mod memory;
+mod python;
 mod registry;
 mod todo;
 mod tree;

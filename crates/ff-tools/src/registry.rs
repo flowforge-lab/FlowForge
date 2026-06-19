@@ -85,6 +85,7 @@ impl ToolRegistry {
     pub fn with_defaults() -> Self {
         let mut r = Self::new();
         r.register(Box::new(crate::bash::BashTool));
+        r.register(Box::new(crate::python::PythonTool));
         r.register(Box::new(crate::view::ViewTool));
         r.register(Box::new(crate::edit::EditTool));
         r.register(Box::new(crate::write::WriteTool));
@@ -167,13 +168,14 @@ mod tests {
     fn advertises_default_schemas() {
         let reg = ToolRegistry::with_defaults();
         let tools = reg.openai_tools();
-        assert_eq!(tools.len(), 10);
+        assert_eq!(tools.len(), 11);
         let names: Vec<_> = tools
             .iter()
             .map(|t| t["function"]["name"].as_str().unwrap())
             .collect();
         for expected in [
             "bash",
+            "python",
             "view",
             "edit",
             "write",
