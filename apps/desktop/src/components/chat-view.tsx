@@ -1,4 +1,5 @@
-import { memo, useEffect, useRef } from "react";
+import { memo, useEffect, useRef, useState } from "react";
+import { ChevronDown } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useChatStore } from "@/store/chat";
 import type { ToolStep } from "@/store/chat";
@@ -150,6 +151,9 @@ export function ChatView({ sessionId }: { sessionId?: string } = {}) {
 
   const scrollRef = useRef<HTMLDivElement>(null);
   const pinnedToBottom = useRef(true);
+  // Render-state mirror of `pinnedToBottom` so the floating "Jump to latest" button
+  // (#206) shows only while scrolled up. Toggles at the same 40px threshold.
+  const [atBottom, setAtBottom] = useState(true);
 
   // Stay pinned to the bottom while streaming, but respect manual scroll-up.
   useEffect(() => {
@@ -165,11 +169,31 @@ export function ChatView({ sessionId }: { sessionId?: string } = {}) {
     if (el) el.scrollTop = el.scrollHeight;
   }, [targetSessionId]);
 
+  // Reset the scroll affordance when the pane switches sessions. setState during
+  // render is React's recommended reset-on-prop-change pattern — no effect, no
+  // flash of the button before a scroll event would otherwise clear it. (The
+  // `pinnedToBottom` ref is re-armed by the session-switch effect above.)
+  const [renderedSession, setRenderedSession] = useState(targetSessionId);
+  if (renderedSession !== targetSessionId) {
+    setRenderedSession(targetSessionId);
+    setAtBottom(true);
+  }
+
   function handleScroll() {
     const el = scrollRef.current;
     if (!el) return;
-    pinnedToBottom.current =
-      el.scrollHeight - el.scrollTop - el.clientHeight < 40;
+    const pinned = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
+    pinnedToBottom.current = pinned;
+    setAtBottom(pinned);
+  }
+
+  // Smooth-scroll to the newest content and re-arm sticky autoscroll (#206).
+  function jumpToLatest() {
+    const el = scrollRef.current;
+    if (!el) return;
+    el.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
+    pinnedToBottom.current = true;
+    setAtBottom(true);
   }
 
   if (!messages || messages.length === 0) {
@@ -187,28 +211,47 @@ export function ChatView({ sessionId }: { sessionId?: string } = {}) {
   }
 
   return (
-    <div
-      ref={scrollRef}
-      onScroll={handleScroll}
-      className="flex-1 overflow-y-auto"
-    >
-      <div className="mx-auto flex max-w-3xl flex-col gap-3 px-4 py-4">
-        {messages.map((m) => (
-          <MessageRow
-            key={m.id}
-            message={m}
-            streaming={m.id === streamingId}
-            toolSteps={toolStepsByMessage[m.id] ?? NO_STEPS}
-            turnStartMs={
-              turnStartByMessage[m.id] ?? turnStartBySession[m.sessionId]
-            }
-            reasoning={reasoningByMessage[m.id] ?? ""}
-            respondApproval={respondApproval}
-            respondAsk={respondAsk}
-          />
-        ))}
-        {pending && <ThinkingIndicator />}
+    <div className="relative flex min-h-0 flex-1 flex-col">
+      <div
+        ref={scrollRef}
+        onScroll={handleScroll}
+        className="min-h-0 flex-1 overflow-y-auto"
+      >
+        <div className="mx-auto flex max-w-3xl flex-col gap-3 px-4 py-4">
+          {messages.map((m) => (
+            <MessageRow
+              key={m.id}
+              message={m}
+              streaming={m.id === streamingId}
+              toolSteps={toolStepsByMessage[m.id] ?? NO_STEPS}
+              turnStartMs={
+                turnStartByMessage[m.id] ?? turnStartBySession[m.sessionId]
+              }
+              reasoning={reasoningByMessage[m.id] ?? ""}
+              respondApproval={respondApproval}
+              respondAsk={respondAsk}
+            />
+          ))}
+          {pending && <ThinkingIndicator />}
+        </div>
       </div>
+
+      {/* Floating "Jump to latest" — only while scrolled up (#206). A primary dot
+          flags new content arriving below during an active stream. */}
+      {!atBottom && (
+        <button
+          type="button"
+          onClick={jumpToLatest}
+          aria-label="Jump to latest"
+          title="Jump to latest"
+          className="absolute bottom-3 left-1/2 z-10 flex size-8 -translate-x-1/2 items-center justify-center rounded-full border bg-background/95 text-muted-foreground shadow-md backdrop-blur transition-colors hover:text-foreground"
+        >
+          <ChevronDown className="size-4" />
+          {streamingId && (
+            <span className="absolute -right-0.5 -top-0.5 size-2 rounded-full bg-primary ring-2 ring-background" />
+          )}
+        </button>
+      )}
     </div>
   );
 }
