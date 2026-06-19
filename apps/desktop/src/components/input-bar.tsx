@@ -141,8 +141,7 @@ export function InputBar({
   return (
     <div className="px-4 pb-4 pt-2">
       <div className="mx-auto flex max-w-3xl flex-col gap-2">
-        {/* Input box: textarea only. The send/stop control moved into its own
-            row below (#200), per the composer layout. */}
+        {/* Unified composer: textarea + workspace chip + send/stop in one card. */}
         <div
           ref={boxRef}
           className="rounded-xl border bg-card p-1.5 shadow-sm transition-all focus-within:border-ring focus-within:shadow-md focus-within:ring-2 focus-within:ring-ring/25"
@@ -175,45 +174,44 @@ export function InputBar({
               }
             }}
           />
-        </div>
 
-        {/* Send / Stop row: a separate element below the input box, above the
-            workspace selector (#200). */}
-        <div className="flex justify-end">
-          {streaming || pending ? (
-            <Button
-              variant="outline"
-              size="icon"
-              className="size-8 shrink-0 rounded-lg"
-              onClick={() =>
-                targetSessionId && void cancelTurn(targetSessionId)
-              }
-              title="Stop (Esc)"
-            >
-              <Square className="size-3.5" />
-            </Button>
-          ) : (
-            <Button
-              size="icon"
-              className="size-8 shrink-0 rounded-lg"
-              disabled={!value.trim() || !targetSessionId}
-              onClick={submit}
-              title={
-                sendMessageKey === "ctrlEnter"
-                  ? "Send (⌘/Ctrl+Enter)"
-                  : "Send (Enter)"
-              }
-            >
-              <ArrowUp className="size-4" />
-            </Button>
-          )}
+          {/* Bottom toolbar inside the composer: working-directory chip (left)
+              and Send/Stop (right), so the controls read as one input box. */}
+          <div className="flex min-w-0 items-center gap-2 border-t border-border/40 px-1.5 pb-1 pt-1.5">
+            <div className="min-w-0 flex-1">
+              {targetSessionId ? (
+                <WorkspaceSelector sessionId={targetSessionId} />
+              ) : null}
+            </div>
+            {streaming || pending ? (
+              <Button
+                variant="outline"
+                size="icon"
+                className="size-8 shrink-0 rounded-lg"
+                onClick={() =>
+                  targetSessionId && void cancelTurn(targetSessionId)
+                }
+                title="Stop (Esc)"
+              >
+                <Square className="size-3.5" />
+              </Button>
+            ) : (
+              <Button
+                size="icon"
+                className="size-8 shrink-0 rounded-lg"
+                disabled={!value.trim() || !targetSessionId}
+                onClick={submit}
+                title={
+                  sendMessageKey === "ctrlEnter"
+                    ? "Send (⌘/Ctrl+Enter)"
+                    : "Send (Enter)"
+                }
+              >
+                <ArrowUp className="size-4" />
+              </Button>
+            )}
+          </div>
         </div>
-
-        {/* Working-directory selector: a narrower element under the input box
-            (#200, slice 3b/3d). Browse opens the native OS folder dialog. */}
-        {targetSessionId ? (
-          <WorkspaceSelector sessionId={targetSessionId} />
-        ) : null}
       </div>
     </div>
   );
@@ -284,106 +282,104 @@ function WorkspaceSelector({ sessionId }: { sessionId: string }) {
     : recents;
 
   return (
-    <div className="mx-auto flex w-full max-w-2xl">
-      <PopoverPrimitive.Root
-        open={open}
-        onOpenChange={(next) => {
-          setOpen(next);
-          if (!next) setFilter("");
-        }}
-      >
-        <PopoverPrimitive.Trigger asChild>
+    <PopoverPrimitive.Root
+      open={open}
+      onOpenChange={(next) => {
+        setOpen(next);
+        if (!next) setFilter("");
+      }}
+    >
+      <PopoverPrimitive.Trigger asChild>
+        <button
+          type="button"
+          className="flex w-full min-w-0 items-center gap-1.5 rounded-md border border-border bg-muted/40 px-2 py-1.5 text-xs text-muted-foreground transition-colors hover:bg-muted/60 hover:text-foreground data-[state=open]:bg-muted/70 data-[state=open]:text-foreground"
+        >
+          <Folder className="size-3.5 shrink-0" />
+          <span className="min-w-0 shrink truncate" title={path ?? undefined}>
+            {path ? basename(path) : "Loading…"}
+          </span>
+          {branch ? (
+            <span className="min-w-0 truncate text-muted-foreground/60">
+              {branch}
+            </span>
+          ) : null}
+          <ChevronsUpDown className="ml-auto size-3 shrink-0 opacity-60" />
+        </button>
+      </PopoverPrimitive.Trigger>
+      <PopoverPrimitive.Portal>
+        <PopoverPrimitive.Content
+          side="top"
+          align="start"
+          sideOffset={6}
+          className="z-50 w-72 overflow-hidden rounded-xl border bg-popover text-popover-foreground shadow-lg outline-none data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:animate-in data-[state=open]:fade-in-0 data-[state=open]:zoom-in-95"
+        >
+          {/* Filter */}
+          <div className="flex items-center gap-2 border-b px-2.5 py-2">
+            <Search className="size-3.5 shrink-0 text-muted-foreground" />
+            <input
+              autoFocus
+              value={filter}
+              onChange={(e) => setFilter(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && filtered[0]) {
+                  e.preventDefault();
+                  void choose(filtered[0]);
+                }
+              }}
+              placeholder="Filter…"
+              className="w-full bg-transparent text-xs text-foreground outline-none placeholder:text-muted-foreground"
+              aria-label="Filter workspaces"
+            />
+          </div>
+
+          {/* Recent workspaces */}
+          <div className="max-h-64 overflow-y-auto p-1">
+            {filtered.length === 0 ? (
+              <p className="px-2 py-6 text-center text-xs text-muted-foreground">
+                {recents.length === 0 ? "No workspaces yet" : "No matches"}
+              </p>
+            ) : (
+              filtered.map((p) => {
+                const active = p === path;
+                return (
+                  <button
+                    key={p}
+                    type="button"
+                    onClick={() => void choose(p)}
+                    aria-current={active}
+                    className={cn(
+                      "flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left transition-colors",
+                      active
+                        ? "bg-accent text-accent-foreground"
+                        : "text-foreground hover:bg-accent/60",
+                    )}
+                  >
+                    <Folder className="size-3.5 shrink-0 text-muted-foreground" />
+                    <span className="min-w-0 flex-1" title={p}>
+                      <span className="block truncate text-[13px] font-medium">
+                        {basename(p)}
+                      </span>
+                      <span className="block truncate text-[11px] text-muted-foreground">
+                        {p}
+                      </span>
+                    </span>
+                  </button>
+                );
+              })
+            )}
+          </div>
+
+          {/* Browse — docked footer */}
           <button
             type="button"
-            className="inline-flex max-w-[70%] items-center gap-1.5 rounded-md border border-border bg-muted/40 px-2 py-1 text-xs text-muted-foreground transition-colors hover:bg-muted/60 hover:text-foreground data-[state=open]:bg-muted/70 data-[state=open]:text-foreground"
+            onClick={() => void browse()}
+            className="flex w-full items-center gap-2 border-t px-2.5 py-2 text-left text-xs text-muted-foreground transition-colors hover:bg-accent/60 hover:text-foreground"
           >
             <Folder className="size-3.5 shrink-0" />
-            <span className="truncate" title={path ?? undefined}>
-              {path ? basename(path) : "Loading…"}
-            </span>
-            {branch ? (
-              <span className="truncate text-muted-foreground/60">
-                {branch}
-              </span>
-            ) : null}
-            <ChevronsUpDown className="size-3 shrink-0 opacity-60" />
+            Browse…
           </button>
-        </PopoverPrimitive.Trigger>
-        <PopoverPrimitive.Portal>
-          <PopoverPrimitive.Content
-            side="top"
-            align="start"
-            sideOffset={6}
-            className="z-50 w-72 overflow-hidden rounded-xl border bg-popover text-popover-foreground shadow-lg outline-none data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:animate-in data-[state=open]:fade-in-0 data-[state=open]:zoom-in-95"
-          >
-            {/* Filter */}
-            <div className="flex items-center gap-2 border-b px-2.5 py-2">
-              <Search className="size-3.5 shrink-0 text-muted-foreground" />
-              <input
-                autoFocus
-                value={filter}
-                onChange={(e) => setFilter(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter" && filtered[0]) {
-                    e.preventDefault();
-                    void choose(filtered[0]);
-                  }
-                }}
-                placeholder="Filter…"
-                className="w-full bg-transparent text-xs text-foreground outline-none placeholder:text-muted-foreground"
-                aria-label="Filter workspaces"
-              />
-            </div>
-
-            {/* Recent workspaces */}
-            <div className="max-h-64 overflow-y-auto p-1">
-              {filtered.length === 0 ? (
-                <p className="px-2 py-6 text-center text-xs text-muted-foreground">
-                  {recents.length === 0 ? "No workspaces yet" : "No matches"}
-                </p>
-              ) : (
-                filtered.map((p) => {
-                  const active = p === path;
-                  return (
-                    <button
-                      key={p}
-                      type="button"
-                      onClick={() => void choose(p)}
-                      aria-current={active}
-                      className={cn(
-                        "flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left transition-colors",
-                        active
-                          ? "bg-accent text-accent-foreground"
-                          : "text-foreground hover:bg-accent/60",
-                      )}
-                    >
-                      <Folder className="size-3.5 shrink-0 text-muted-foreground" />
-                      <span className="min-w-0 flex-1" title={p}>
-                        <span className="block truncate text-[13px] font-medium">
-                          {basename(p)}
-                        </span>
-                        <span className="block truncate text-[11px] text-muted-foreground">
-                          {p}
-                        </span>
-                      </span>
-                    </button>
-                  );
-                })
-              )}
-            </div>
-
-            {/* Browse — docked footer */}
-            <button
-              type="button"
-              onClick={() => void browse()}
-              className="flex w-full items-center gap-2 border-t px-2.5 py-2 text-left text-xs text-muted-foreground transition-colors hover:bg-accent/60 hover:text-foreground"
-            >
-              <Folder className="size-3.5 shrink-0" />
-              Browse…
-            </button>
-          </PopoverPrimitive.Content>
-        </PopoverPrimitive.Portal>
-      </PopoverPrimitive.Root>
-    </div>
+        </PopoverPrimitive.Content>
+      </PopoverPrimitive.Portal>
+    </PopoverPrimitive.Root>
   );
 }
