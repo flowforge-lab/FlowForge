@@ -7,7 +7,7 @@ import { useSessionWorkspaceStore } from "@/store/session-workspace";
 // it never resolves a git branch (no real filesystem), so `gitBranch` is null.
 describe("useSessionWorkspaceStore (#200, #211)", () => {
   beforeEach(() => {
-    useSessionWorkspaceStore.setState({ bySession: {} });
+    useSessionWorkspaceStore.setState({ bySession: {}, recents: [] });
   });
 
   it("load caches the backend's workspace for a session", async () => {
@@ -31,6 +31,17 @@ describe("useSessionWorkspaceStore (#200, #211)", () => {
     expect(
       useSessionWorkspaceStore.getState().get("sess-empty"),
     ).toBeUndefined();
+  });
+
+  it("tracks distinct recents, most-recent-first, de-duped (#210)", async () => {
+    const store = useSessionWorkspaceStore.getState();
+    await store.set("sess-r", "/tmp/one");
+    await store.set("sess-r", "/tmp/two");
+    await store.set("sess-r", "/tmp/one"); // re-select moves it back to front
+    expect(useSessionWorkspaceStore.getState().recents).toEqual([
+      "/tmp/one",
+      "/tmp/two",
+    ]);
   });
 
   it("keeps cache entries isolated per session", async () => {
