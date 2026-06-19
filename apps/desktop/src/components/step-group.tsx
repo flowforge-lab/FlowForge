@@ -3,6 +3,7 @@ import { ChevronRight, Loader2 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import type { ToolStep } from "@/store/chat";
 import { ToolStepBlock } from "@/components/tool-step";
+import { ThinkingBlock } from "@/components/thinking-block";
 import {
   formatDuration,
   groupDurationMs,
@@ -21,6 +22,8 @@ export function StepGroup({
   steps,
   streaming,
   turnStartMs,
+  reasoning,
+  hasAnswer,
   onRespond,
   onAnswer,
 }: {
@@ -28,6 +31,9 @@ export function StepGroup({
   streaming: boolean;
   /** Wall-clock turn start from send / first stream (#180). */
   turnStartMs?: number | null;
+  /** Model reasoning for this turn (#205); folds under this group, above the steps. */
+  reasoning?: string;
+  hasAnswer?: boolean;
   onRespond: (callId: string, approved: boolean) => void;
   onAnswer?: (callId: string, answer: string) => void;
 }) {
@@ -89,6 +95,13 @@ export function StepGroup({
       </button>
       {open && (
         <div className="mt-1.5 flex flex-col gap-1.5 border-l border-border/60 pl-2.5">
+          {reasoning ? (
+            <ThinkingBlock
+              reasoning={reasoning}
+              streaming={streaming}
+              hasAnswer={hasAnswer ?? false}
+            />
+          ) : null}
           {earlierCount > 0 && streaming && !awaiting && (
             <button
               type="button"

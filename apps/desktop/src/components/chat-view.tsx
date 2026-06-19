@@ -72,11 +72,12 @@ function MessageRowImpl({
 
   return (
     <div className="flex flex-col items-start gap-1.5">
-      {toolSteps.length > 0 && (
+      {toolSteps.length > 0 ? (
         <div className="flex w-full max-w-[80%] flex-col gap-1.5">
-          {/* Single settled step stays bare; streaming (any count) or 2+ steps use
-              StepGroup so the live timer and peek window apply (#180). */}
-          {toolSteps.length === 1 && !streaming ? (
+          {/* Single settled step stays bare; streaming (any count), 2+ steps, or any
+              reasoning to fold in (#205) use StepGroup so the live timer, peek window
+              (#180), and grouped Thinking block apply. */}
+          {toolSteps.length === 1 && !streaming && !reasoning ? (
             <ToolStepBlock
               step={toolSteps[0]}
               onRespond={onRespond}
@@ -87,17 +88,26 @@ function MessageRowImpl({
               steps={toolSteps}
               streaming={streaming}
               turnStartMs={turnStartMs}
+              reasoning={reasoning}
+              hasAnswer={message.content.length > 0}
               onRespond={onRespond}
               onAnswer={onAnswer}
             />
           )}
         </div>
+      ) : (
+        // No tool steps this turn: the Thinking block stands alone, but folded by
+        // default (#205) so it stays compact.
+        reasoning && (
+          <div className="w-full max-w-[80%]">
+            <ThinkingBlock
+              reasoning={reasoning}
+              streaming={streaming}
+              hasAnswer={message.content.length > 0}
+            />
+          </div>
+        )
       )}
-      <ThinkingBlock
-        reasoning={reasoning}
-        streaming={streaming}
-        hasAnswer={message.content.length > 0}
-      />
       {message.content && (
         <div className="group relative max-w-[80%]">
           <div
