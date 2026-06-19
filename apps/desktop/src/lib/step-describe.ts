@@ -83,6 +83,15 @@ export function describeStep(step: Pick<ToolStep, "tool" | "args">): string {
       const path = strArg(args, "path");
       return path ? `Edit ${path}` : "Edit file";
     }
+    case "apply_patch": {
+      const patch = strArg(args, "patch");
+      if (!patch) return "Apply patch";
+      const files = (
+        patch.match(/^\*\*\* (?:Add|Update|Delete) File: /gm) ?? []
+      ).length;
+      if (files === 0) return "Apply patch";
+      return `Patch ${files} file${files === 1 ? "" : "s"}`;
+    }
     case "grep": {
       const pattern = strArg(args, "pattern");
       return pattern ? `Search ${pattern}` : "Search";

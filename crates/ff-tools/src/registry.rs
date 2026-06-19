@@ -89,6 +89,7 @@ impl ToolRegistry {
         r.register(Box::new(crate::view::ViewTool));
         r.register(Box::new(crate::edit::EditTool));
         r.register(Box::new(crate::write::WriteTool));
+        r.register(Box::new(crate::apply_patch::ApplyPatchTool));
         r.register(Box::new(crate::grep::GrepTool));
         r.register(Box::new(crate::glob::GlobTool));
         r.register(Box::new(crate::tree::TreeTool));
@@ -168,7 +169,7 @@ mod tests {
     fn advertises_default_schemas() {
         let reg = ToolRegistry::with_defaults();
         let tools = reg.openai_tools();
-        assert_eq!(tools.len(), 11);
+        assert_eq!(tools.len(), 12);
         let names: Vec<_> = tools
             .iter()
             .map(|t| t["function"]["name"].as_str().unwrap())
@@ -179,6 +180,7 @@ mod tests {
             "view",
             "edit",
             "write",
+            "apply_patch",
             "grep",
             "glob",
             "tree",

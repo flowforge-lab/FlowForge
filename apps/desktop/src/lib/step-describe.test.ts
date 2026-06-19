@@ -82,6 +82,31 @@ describe("describeStep", () => {
     );
   });
 
+  it("apply_patch: counts file sections", () => {
+    const patch = [
+      "*** Begin Patch",
+      "*** Add File: a.txt",
+      "+hi",
+      "*** Update File: b.txt",
+      "@@",
+      "-x",
+      "+y",
+      "*** End Patch",
+    ].join("\n");
+    expect(describeStep({ tool: "apply_patch", args: { patch } })).toBe(
+      "Patch 2 files",
+    );
+    const single = [
+      "*** Begin Patch",
+      "*** Delete File: gone.txt",
+      "*** End Patch",
+    ].join("\n");
+    expect(describeStep({ tool: "apply_patch", args: { patch: single } })).toBe(
+      "Patch 1 file",
+    );
+    expect(describeStep({ tool: "apply_patch", args: {} })).toBe("Apply patch");
+  });
+
   it("grep / glob / tree use pattern or path", () => {
     expect(describeStep({ tool: "grep", args: { pattern: "FlowForge" } })).toBe(
       "Search FlowForge",
