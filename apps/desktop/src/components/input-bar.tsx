@@ -177,12 +177,12 @@ export function InputBar({
 
           {/* Bottom toolbar inside the composer: working-directory chip (left)
               and Send/Stop (right), so the controls read as one input box. */}
-          <div className="flex min-w-0 items-center gap-2 border-t border-border/40 px-1.5 pb-1 pt-1.5">
-            <div className="min-w-0 flex-1">
-              {targetSessionId ? (
-                <WorkspaceSelector sessionId={targetSessionId} />
-              ) : null}
-            </div>
+          <div className="flex items-center justify-between gap-2 border-t border-border/40 px-1.5 pb-1 pt-1.5">
+            {targetSessionId ? (
+              <WorkspaceSelector sessionId={targetSessionId} />
+            ) : (
+              <span />
+            )}
             {streaming || pending ? (
               <Button
                 variant="outline"
@@ -292,18 +292,16 @@ function WorkspaceSelector({ sessionId }: { sessionId: string }) {
       <PopoverPrimitive.Trigger asChild>
         <button
           type="button"
-          className="flex w-full min-w-0 items-center gap-1.5 rounded-md border border-border bg-muted/40 px-2 py-1.5 text-xs text-muted-foreground transition-colors hover:bg-muted/60 hover:text-foreground data-[state=open]:bg-muted/70 data-[state=open]:text-foreground"
+          className="inline-flex w-max max-w-[calc(100%-2.5rem)] items-center gap-1.5 rounded-md border border-border bg-muted/40 px-2 py-1.5 text-xs text-muted-foreground transition-colors hover:bg-muted/60 hover:text-foreground data-[state=open]:bg-muted/70 data-[state=open]:text-foreground"
         >
           <Folder className="size-3.5 shrink-0" />
-          <span className="min-w-0 shrink truncate" title={path ?? undefined}>
+          <span className="truncate" title={path ?? undefined}>
             {path ? basename(path) : "Loading…"}
           </span>
           {branch ? (
-            <span className="min-w-0 truncate text-muted-foreground/60">
-              {branch}
-            </span>
+            <span className="truncate text-muted-foreground/60">{branch}</span>
           ) : null}
-          <ChevronsUpDown className="ml-auto size-3 shrink-0 opacity-60" />
+          <ChevronsUpDown className="size-3 shrink-0 opacity-60" />
         </button>
       </PopoverPrimitive.Trigger>
       <PopoverPrimitive.Portal>
