@@ -83,7 +83,9 @@ describe("SessionSidebar integration (#185)", () => {
     const { cleanup } = render(<AppShell />);
 
     const aside = document.querySelector("aside");
-    expect(aside?.className).toContain("w-60");
+    // Expanded width now comes from the persisted inline style (#204), default 240px.
+    expect((aside as HTMLElement | null)?.style.width).toBe("240px");
+    expect(aside?.className).not.toContain("w-0");
     expect(document.querySelector('[aria-label="Show sidebar"]')).toBeNull();
 
     click(document.querySelector('[title="Collapse sidebar"]'));
@@ -115,7 +117,10 @@ describe("SessionSidebar integration (#185)", () => {
     expect(reopen).not.toBeNull();
     click(reopen);
     expect(usePrefsStore.getState().sidebarCollapsed).toBe(false);
-    expect(document.querySelector("aside")?.className).toContain("w-60");
+    expect(
+      (document.querySelector("aside") as HTMLElement | null)?.style.width,
+    ).toBe("240px");
+    expect(document.querySelector("aside")?.className).not.toContain("w-0");
   });
 
   it("reveals the filter via ⋯ → Search and hides it on Esc", async () => {

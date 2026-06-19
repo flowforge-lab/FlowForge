@@ -2,7 +2,14 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { migrateLegacyTheme, usePrefsStore } from "@/store/prefs";
+import {
+  clampSidebarWidth,
+  migrateLegacyTheme,
+  usePrefsStore,
+  SIDEBAR_WIDTH_DEFAULT,
+  SIDEBAR_WIDTH_MIN,
+  SIDEBAR_WIDTH_MAX,
+} from "@/store/prefs";
 
 describe("migrateLegacyTheme", () => {
   afterEach(() => {
@@ -203,5 +210,30 @@ describe("sidebar collapse preference (#185)", () => {
       JSON.parse(localStorage.getItem("ff-prefs") ?? "{}").state
         .sidebarCollapsed,
     ).toBe(true);
+  });
+});
+
+describe("sidebar width preference (#204)", () => {
+  afterEach(() => {
+    localStorage.clear();
+    usePrefsStore.getState().setSidebarWidth(SIDEBAR_WIDTH_DEFAULT);
+  });
+
+  it("defaults to SIDEBAR_WIDTH_DEFAULT", () => {
+    expect(usePrefsStore.getState().sidebarWidth).toBe(SIDEBAR_WIDTH_DEFAULT);
+  });
+
+  it("clamps to the usable bounds and rounds", () => {
+    expect(clampSidebarWidth(10)).toBe(SIDEBAR_WIDTH_MIN);
+    expect(clampSidebarWidth(9999)).toBe(SIDEBAR_WIDTH_MAX);
+    expect(clampSidebarWidth(300.6)).toBe(301);
+  });
+
+  it("setSidebarWidth clamps and persists in ff-prefs", () => {
+    usePrefsStore.getState().setSidebarWidth(10_000);
+    expect(usePrefsStore.getState().sidebarWidth).toBe(SIDEBAR_WIDTH_MAX);
+    expect(
+      JSON.parse(localStorage.getItem("ff-prefs") ?? "{}").state.sidebarWidth,
+    ).toBe(SIDEBAR_WIDTH_MAX);
   });
 });

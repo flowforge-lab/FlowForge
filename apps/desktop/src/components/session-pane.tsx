@@ -1,10 +1,4 @@
-import {
-  Columns2,
-  Rows2,
-  SplitSquareHorizontal,
-  SplitSquareVertical,
-  X,
-} from "lucide-react";
+import { Columns2, Rows2, X } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { ChatView } from "@/components/chat-view";
@@ -13,10 +7,11 @@ import { useChatStore } from "@/store/chat";
 import { usePanesStore, MAX_PANES } from "@/store/panes";
 
 // A single tiling pane (#148): one independent session rendered as a full chat
-// column with its own header controls. The header carries split / close actions;
-// the whole pane is click-to-focus and shows a focus ring when it's the active
-// pane. Splitting/closing routes through the panes store; the session content is
-// just <ChatView sessionId> + <InputBar sessionId>, both already session-scoped.
+// column with its own header controls. The header carries fork (duplicate) / close
+// actions (#204 dropped the redundant Split buttons); the whole pane is
+// click-to-focus and shows a focus ring when it's the active pane. Forking/closing
+// routes through the panes store; the session content is just <ChatView sessionId>
+// + <InputBar sessionId>, both already session-scoped.
 export function SessionPane({
   paneId,
   sessionId,
@@ -29,7 +24,6 @@ export function SessionPane({
   canClose: boolean;
 }) {
   const focusPane = usePanesStore((s) => s.focusPane);
-  const splitNew = usePanesStore((s) => s.splitNew);
   const splitFork = usePanesStore((s) => s.splitFork);
   const closePane = usePanesStore((s) => s.closePane);
   const atCap = usePanesStore((s) => s.leafCount() >= MAX_PANES);
@@ -54,27 +48,7 @@ export function SessionPane({
           {title}
         </span>
         <div className="flex shrink-0 items-center gap-0.5">
-          <Button
-            variant="ghost"
-            size="icon-xs"
-            disabled={atCap}
-            title="Split right (new session)"
-            onClick={() => void splitNew(paneId, "vertical")}
-          >
-            <SplitSquareHorizontal className="size-3.5" />
-          </Button>
-          <Button
-            variant="ghost"
-            size="icon-xs"
-            disabled={atCap}
-            title="Split down (new session)"
-            onClick={() => void splitNew(paneId, "horizontal")}
-          >
-            <SplitSquareVertical className="size-3.5" />
-          </Button>
-
           {/* Fork: duplicate this pane's session into the new pane (#149). */}
-          <span className="mx-0.5 h-4 w-px shrink-0 bg-border" aria-hidden />
           <Button
             variant="ghost"
             size="icon-xs"
