@@ -271,4 +271,35 @@ mod tests {
         let chunk = parse_sse_line(line).unwrap().unwrap();
         assert!(chunk.done);
     }
+
+    /// Guard: the OpenAI wire protocol requires `tool_calls[].function.arguments`
+    /// to be a JSON-encoded **string**. The Ollama-native provider converts this
+    /// to an object at its own boundary; this provider must NOT -- an object here
+    /// is a 400 (`cannot unmarshal object into ... of type string`). This test
+    /// fails loudly if anyone "unifies" the two and breaks OpenAI-compatible
+    /// servers (OpenAI, candle-vLLM, LM Studio, Ollama's /v1 shim).
+    #[test]
+    fn tool_call_arguments_serialize_as_a_string() {
+        use crate::{ChatMessage, FunctionCall, ToolCall};
+        let msg = ChatMessage {
+            role: "assistant".into(),
+            content: None,
+            tool_calls: Some(vec![ToolCall {
+                id: "call_0".into(),
+                kind: "function".into(),
+                function: FunctionCall {
+                    name: "write_file".into(),
+                    arguments: r#"{"path":"a.txt"}"#.into(),
+                },
+            }]),
+            tool_call_id: None,
+            name: None,
+        };
+        let v = serde_json::to_value([msg]).unwrap();
+        let args = &v[0]["tool_calls"][0]["function"]["arguments"];
+        assert!(
+            args.is_string(),
+            "OpenAI arguments must stay a string, got {args}"
+        );
+    }
 }
