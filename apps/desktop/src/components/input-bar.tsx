@@ -1,13 +1,7 @@
-import { useCallback, useEffect, useRef } from "react";
-import { ArrowUp, Check, ChevronsUpDown, Folder, Square } from "lucide-react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { ArrowUp, ChevronsUpDown, Folder, Search, Square } from "lucide-react";
+import { Popover as PopoverPrimitive } from "radix-ui";
 import { Button } from "@/components/ui/button";
-import {
-  DropdownMenu,
-  DropdownMenuTrigger,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuSeparator,
-} from "@/components/ui/dropdown-menu";
 import { cn } from "@/lib/utils";
 import { ipc } from "@/lib/ipc";
 import { useChatStore } from "@/store/chat";
@@ -147,8 +141,7 @@ export function InputBar({
   return (
     <div className="px-4 pb-4 pt-2">
       <div className="mx-auto flex max-w-3xl flex-col gap-2">
-        {/* Input box: textarea only. The send/stop control moved into its own
-            row below (#200), per the composer layout. */}
+        {/* Unified composer: textarea + workspace chip + send/stop in one card. */}
         <div
           ref={boxRef}
           className="rounded-xl border bg-card p-1.5 shadow-sm transition-all focus-within:border-ring focus-within:shadow-md focus-within:ring-2 focus-within:ring-ring/25"
@@ -181,45 +174,44 @@ export function InputBar({
               }
             }}
           />
-        </div>
 
-        {/* Send / Stop row: a separate element below the input box, above the
-            workspace selector (#200). */}
-        <div className="flex justify-end">
-          {streaming || pending ? (
-            <Button
-              variant="outline"
-              size="icon"
-              className="size-8 shrink-0 rounded-lg"
-              onClick={() =>
-                targetSessionId && void cancelTurn(targetSessionId)
-              }
-              title="Stop (Esc)"
-            >
-              <Square className="size-3.5" />
-            </Button>
-          ) : (
-            <Button
-              size="icon"
-              className="size-8 shrink-0 rounded-lg"
-              disabled={!value.trim() || !targetSessionId}
-              onClick={submit}
-              title={
-                sendMessageKey === "ctrlEnter"
-                  ? "Send (⌘/Ctrl+Enter)"
-                  : "Send (Enter)"
-              }
-            >
-              <ArrowUp className="size-4" />
-            </Button>
-          )}
+          {/* Bottom toolbar inside the composer: working-directory chip (left)
+              and Send/Stop (right), so the controls read as one input box. */}
+          <div className="flex items-center justify-between gap-2 border-t border-border/40 px-1.5 pb-1 pt-1.5">
+            {targetSessionId ? (
+              <WorkspaceSelector sessionId={targetSessionId} />
+            ) : (
+              <span />
+            )}
+            {streaming || pending ? (
+              <Button
+                variant="outline"
+                size="icon"
+                className="size-8 shrink-0 rounded-lg"
+                onClick={() =>
+                  targetSessionId && void cancelTurn(targetSessionId)
+                }
+                title="Stop (Esc)"
+              >
+                <Square className="size-3.5" />
+              </Button>
+            ) : (
+              <Button
+                size="icon"
+                className="size-8 shrink-0 rounded-lg"
+                disabled={!value.trim() || !targetSessionId}
+                onClick={submit}
+                title={
+                  sendMessageKey === "ctrlEnter"
+                    ? "Send (⌘/Ctrl+Enter)"
+                    : "Send (Enter)"
+                }
+              >
+                <ArrowUp className="size-4" />
+              </Button>
+            )}
+          </div>
         </div>
-
-        {/* Working-directory selector: a narrower element under the input box
-            (#200, slice 3b/3d). Browse opens the native OS folder dialog. */}
-        {targetSessionId ? (
-          <WorkspaceSelector sessionId={targetSessionId} />
-        ) : null}
       </div>
     </div>
   );
@@ -234,11 +226,11 @@ function basename(path: string): string {
   return parts[parts.length - 1] || path;
 }
 
-// The working directory a session's tools run in (#200). A dropdown (#210): the
-// chip opens a menu of recent workspaces (current one checked) with Browse docked
-// as a persistent footer that opens the native OS folder picker. Outside Tauri
-// (mock / `pnpm dev` in a browser) Browse falls back to a prompt so the UI stays
-// exercisable.
+// The working directory a session's tools run in (#200). A filterable combobox
+// (#210): a compact chip opens a popover with a Filter box, the recent workspaces
+// (the active one highlighted), and Browse docked as a footer that opens the
+// native OS folder picker. Outside Tauri (mock / `pnpm dev` in a browser) Browse
+// falls back to a prompt so the UI stays exercisable.
 function WorkspaceSelector({ sessionId }: { sessionId: string }) {
   const workspace = useSessionWorkspaceStore((s) => s.bySession[sessionId]);
   const recents = useSessionWorkspaceStore((s) => s.recents);
@@ -247,12 +239,16 @@ function WorkspaceSelector({ sessionId }: { sessionId: string }) {
   const path = workspace?.path;
   const branch = workspace?.gitBranch ?? null;
 
+  const [open, setOpen] = useState(false);
+  const [filter, setFilter] = useState("");
+
   useEffect(() => {
     void load(sessionId);
   }, [sessionId, load]);
 
   const choose = useCallback(
     async (next: string) => {
+      setOpen(false);
       if (next === path) return;
       try {
         await setWorkspace(sessionId, next);
@@ -264,10 +260,11 @@ function WorkspaceSelector({ sessionId }: { sessionId: string }) {
   );
 
   const browse = useCallback(async () => {
+    setOpen(false);
     let chosen: string | null | undefined;
     if (IN_TAURI) {
-      const { open } = await import("@tauri-apps/plugin-dialog");
-      const result = await open({
+      const { open: openDialog } = await import("@tauri-apps/plugin-dialog");
+      const result = await openDialog({
         directory: true,
         multiple: false,
         defaultPath: path,
@@ -279,64 +276,108 @@ function WorkspaceSelector({ sessionId }: { sessionId: string }) {
     if (chosen) await choose(chosen);
   }, [path, choose]);
 
+  const query = filter.trim().toLowerCase();
+  const filtered = query
+    ? recents.filter((p) => p.toLowerCase().includes(query))
+    : recents;
+
   return (
-    <div className="mx-auto w-full max-w-2xl">
-      <DropdownMenu>
-        <DropdownMenuTrigger asChild>
+    <PopoverPrimitive.Root
+      open={open}
+      onOpenChange={(next) => {
+        setOpen(next);
+        if (!next) setFilter("");
+      }}
+    >
+      <PopoverPrimitive.Trigger asChild>
+        <button
+          type="button"
+          className="inline-flex w-max max-w-[calc(100%-2.5rem)] items-center gap-1.5 rounded-md border border-border bg-muted/40 px-2 py-1.5 text-xs text-muted-foreground transition-colors hover:bg-muted/60 hover:text-foreground data-[state=open]:bg-muted/70 data-[state=open]:text-foreground"
+        >
+          <Folder className="size-3.5 shrink-0" />
+          <span className="truncate" title={path ?? undefined}>
+            {path ? basename(path) : "Loading…"}
+          </span>
+          {branch ? (
+            <span className="truncate text-muted-foreground/60">{branch}</span>
+          ) : null}
+          <ChevronsUpDown className="size-3 shrink-0 opacity-60" />
+        </button>
+      </PopoverPrimitive.Trigger>
+      <PopoverPrimitive.Portal>
+        <PopoverPrimitive.Content
+          side="top"
+          align="start"
+          sideOffset={6}
+          className="z-50 w-72 overflow-hidden rounded-xl border bg-popover text-popover-foreground shadow-lg outline-none data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:animate-in data-[state=open]:fade-in-0 data-[state=open]:zoom-in-95"
+        >
+          {/* Filter */}
+          <div className="flex items-center gap-2 border-b px-2.5 py-2">
+            <Search className="size-3.5 shrink-0 text-muted-foreground" />
+            <input
+              autoFocus
+              value={filter}
+              onChange={(e) => setFilter(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && filtered[0]) {
+                  e.preventDefault();
+                  void choose(filtered[0]);
+                }
+              }}
+              placeholder="Filter…"
+              className="w-full bg-transparent text-xs text-foreground outline-none placeholder:text-muted-foreground"
+              aria-label="Filter workspaces"
+            />
+          </div>
+
+          {/* Recent workspaces */}
+          <div className="max-h-64 overflow-y-auto p-1">
+            {filtered.length === 0 ? (
+              <p className="px-2 py-6 text-center text-xs text-muted-foreground">
+                {recents.length === 0 ? "No workspaces yet" : "No matches"}
+              </p>
+            ) : (
+              filtered.map((p) => {
+                const active = p === path;
+                return (
+                  <button
+                    key={p}
+                    type="button"
+                    onClick={() => void choose(p)}
+                    aria-current={active}
+                    className={cn(
+                      "flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left transition-colors",
+                      active
+                        ? "bg-accent text-accent-foreground"
+                        : "text-foreground hover:bg-accent/60",
+                    )}
+                  >
+                    <Folder className="size-3.5 shrink-0 text-muted-foreground" />
+                    <span className="min-w-0 flex-1" title={p}>
+                      <span className="block truncate text-[13px] font-medium">
+                        {basename(p)}
+                      </span>
+                      <span className="block truncate text-[11px] text-muted-foreground">
+                        {p}
+                      </span>
+                    </span>
+                  </button>
+                );
+              })
+            )}
+          </div>
+
+          {/* Browse — docked footer */}
           <button
             type="button"
-            className="flex w-full items-center gap-2 rounded-lg border border-border bg-muted/40 px-2.5 py-1.5 text-xs text-muted-foreground transition-colors hover:bg-muted/60 hover:text-foreground"
+            onClick={() => void browse()}
+            className="flex w-full items-center gap-2 border-t px-2.5 py-2 text-left text-xs text-muted-foreground transition-colors hover:bg-accent/60 hover:text-foreground"
           >
             <Folder className="size-3.5 shrink-0" />
-            <span
-              className="min-w-0 flex-1 truncate text-left"
-              title={path ?? undefined}
-            >
-              {path ? basename(path) : "Loading…"}
-              {branch ? (
-                <span className="text-muted-foreground/70"> - {branch}</span>
-              ) : null}
-            </span>
-            <ChevronsUpDown className="size-3.5 shrink-0 opacity-60" />
-          </button>
-        </DropdownMenuTrigger>
-        <DropdownMenuContent
-          align="start"
-          className="w-[var(--radix-dropdown-menu-trigger-width)] min-w-56"
-        >
-          {/* Recent workspaces — scrolls; Browse stays docked below. */}
-          <div className="max-h-64 overflow-y-auto">
-            {recents.map((p) => (
-              <DropdownMenuItem
-                key={p}
-                onSelect={() => void choose(p)}
-                aria-current={p === path}
-                className="gap-2"
-              >
-                <Folder className="size-3.5 shrink-0 text-muted-foreground" />
-                <span className="min-w-0 flex-1" title={p}>
-                  <span className="block truncate">{basename(p)}</span>
-                  <span className="block truncate text-[10px] text-muted-foreground/60">
-                    {p}
-                  </span>
-                </span>
-                <Check
-                  aria-hidden={p !== path}
-                  className={cn(
-                    "size-3.5 shrink-0",
-                    p === path ? "opacity-100" : "opacity-0",
-                  )}
-                />
-              </DropdownMenuItem>
-            ))}
-          </div>
-          <DropdownMenuSeparator />
-          <DropdownMenuItem onSelect={() => void browse()} className="gap-2">
-            <Folder className="size-3.5 shrink-0" />
             Browse…
-          </DropdownMenuItem>
-        </DropdownMenuContent>
-      </DropdownMenu>
-    </div>
+          </button>
+        </PopoverPrimitive.Content>
+      </PopoverPrimitive.Portal>
+    </PopoverPrimitive.Root>
   );
 }
