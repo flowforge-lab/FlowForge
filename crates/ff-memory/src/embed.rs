@@ -83,7 +83,12 @@ impl OpenAiEmbedder {
         let client = reqwest::blocking::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
             .build()
-            .unwrap_or_default();
+            .unwrap_or_else(|e| {
+                // A misbuilt client (e.g. a broken TLS stack) falls back to the
+                // default so memory still works via BM25; warn so it is debuggable.
+                tracing::warn!(error = %e, "failed to build embedder HTTP client; using default");
+                reqwest::blocking::Client::default()
+            });
         Self {
             client,
             endpoint,
