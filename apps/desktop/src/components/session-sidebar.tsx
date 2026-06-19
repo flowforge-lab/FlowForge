@@ -24,7 +24,7 @@ import { ScrollArea } from "@/components/ui/scroll-area";
 import { Separator } from "@/components/ui/separator";
 import { cn } from "@/lib/utils";
 import { resolveEffectiveTheme } from "@/lib/theme";
-import { useTheme, usePrefsStore } from "@/store/prefs";
+import { useTheme, usePrefsStore, clampSidebarWidth } from "@/store/prefs";
 import { useSettingsStore } from "@/store/settings";
 import { useChatStore } from "@/store/chat";
 import { useSessionPrefsStore } from "@/store/session-prefs";
@@ -418,6 +418,37 @@ export function SessionSidebar() {
 
   const sidebarCollapsed = usePrefsStore((s) => s.sidebarCollapsed);
   const setSidebarCollapsed = usePrefsStore((s) => s.setSidebarCollapsed);
+  const sidebarWidth = usePrefsStore((s) => s.sidebarWidth);
+  const setSidebarWidth = usePrefsStore((s) => s.setSidebarWidth);
+  const asideRef = useRef<HTMLElement>(null);
+
+  // Drag-to-resize the sidebar↔chat boundary (#204). The sidebar is flush to the
+  // window's left edge, so its width is just the cursor's distance from that edge.
+  // Mirrors split-panel.tsx: width is applied imperatively during the drag (no React
+  // render / no localStorage write per mousemove) and committed to prefs once on
+  // mouseup. The width transition is suspended mid-drag so it tracks the cursor.
+  function startResize(e: React.MouseEvent) {
+    e.preventDefault();
+    const aside = asideRef.current;
+    let latest = sidebarWidth;
+    if (aside) aside.style.transition = "none";
+    const onMove = (ev: MouseEvent) => {
+      latest = clampSidebarWidth(ev.clientX);
+      if (aside) aside.style.width = `${latest}px`;
+    };
+    const onUp = () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+      document.body.style.userSelect = "";
+      document.body.style.cursor = "";
+      if (aside) aside.style.transition = "";
+      setSidebarWidth(latest);
+    };
+    document.body.style.userSelect = "none";
+    document.body.style.cursor = "col-resize";
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+  }
 
   // New session lands in the focused pane (#148) so the layout is preserved —
   // matches app-shell's Cmd+N and the palette. Falls back to a plain new session
@@ -509,17 +540,28 @@ export function SessionSidebar() {
 
   return (
     <aside
+      ref={asideRef}
+      // Collapsed → width:0 via class; expanded → persisted px width via inline
+      // style (inline wins, so the width class is dropped when expanded).
+      style={sidebarCollapsed ? undefined : { width: sidebarWidth }}
       className={cn(
-        "flex h-full shrink-0 flex-col border-r bg-sidebar text-sidebar-foreground transition-[width,border] duration-200",
-        sidebarCollapsed
-          ? "w-0 overflow-hidden border-r-0"
-          : "w-60 overflow-hidden",
+        "relative flex h-full shrink-0 flex-col border-r bg-sidebar text-sidebar-foreground transition-[width,border] duration-200",
+        sidebarCollapsed ? "w-0 overflow-hidden border-r-0" : "overflow-hidden",
       )}
       aria-hidden={sidebarCollapsed}
       // `aria-hidden` alone leaves descendants focusable; `inert` also pulls the
       // collapsed sidebar's buttons/input out of the tab order (axe aria-hidden-focus).
       inert={sidebarCollapsed || undefined}
     >
+      {/* Drag handle on the right edge (#204). Hidden while collapsed. */}
+      {!sidebarCollapsed && (
+        <div
+          onMouseDown={startResize}
+          title="Drag to resize"
+          aria-hidden
+          className="absolute right-0 top-0 z-20 h-full w-1.5 cursor-col-resize hover:bg-primary/30"
+        />
+      )}
       <div className="flex h-12 items-center justify-between px-3">
         <span className="text-sm font-semibold tracking-tight">FlowForge</span>
         <div className="flex items-center gap-0.5">

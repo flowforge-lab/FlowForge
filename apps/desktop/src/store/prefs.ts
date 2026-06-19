@@ -32,6 +32,12 @@ export interface NotificationPrefs {
 export const OPEN_THREADS_MIN = 3;
 export const OPEN_THREADS_MAX = 20;
 
+/** Bounds + default for the drag-resizable session sidebar width, px (#204).
+ *  Default matches the previous fixed `w-60` (15rem). */
+export const SIDEBAR_WIDTH_MIN = 200;
+export const SIDEBAR_WIDTH_MAX = 480;
+export const SIDEBAR_WIDTH_DEFAULT = 240;
+
 /** Composer send binding (SET.6). `"enter"`: Enter sends, Shift+Enter = new line.
  *  `"ctrlEnter"`: Ctrl/⌘+Enter sends, plain Enter = new line. */
 export type SendMessageKey = "enter" | "ctrlEnter";
@@ -51,6 +57,8 @@ export interface PrefsState {
   sendMessageKey: SendMessageKey;
   /** Session sidebar collapsed to width 0 (#185). */
   sidebarCollapsed: boolean;
+  /** Session sidebar width in px when expanded (#204); clamped to SIDEBAR_WIDTH_MIN/MAX. */
+  sidebarWidth: number;
   setTheme: (theme: Theme) => void;
   setFont: (font: Font) => void;
   setFontScale: (scale: number) => void;
@@ -59,6 +67,7 @@ export interface PrefsState {
   setOpenThreads: (count: number) => void;
   setSendMessageKey: (key: SendMessageKey) => void;
   setSidebarCollapsed: (collapsed: boolean) => void;
+  setSidebarWidth: (px: number) => void;
   /** Quick light/dark flip — leaves `"system"` by picking the opposite effective mode. */
   toggleTheme: () => void;
   /** Reset only the Appearance-owned prefs to their defaults (SET.2 footer reset). */
@@ -98,6 +107,14 @@ function clampOpenThreads(count: number): number {
   );
 }
 
+/** Clamp a sidebar width to its usable bounds. Exported for tests. */
+export function clampSidebarWidth(px: number): number {
+  return Math.min(
+    SIDEBAR_WIDTH_MAX,
+    Math.max(SIDEBAR_WIDTH_MIN, Math.round(px)),
+  );
+}
+
 /** Lift a pre-#62 `ff-theme` value into prefs on first rehydrate. Exported for tests. */
 export function migrateLegacyTheme(): Partial<Pick<PrefsState, "theme">> {
   try {
@@ -120,6 +137,7 @@ export const usePrefsStore = create<PrefsState>()(
       // reset doesn't touch it; `resetKeyboard` owns its reset.
       sendMessageKey: SEND_MESSAGE_KEY_DEFAULT,
       sidebarCollapsed: false,
+      sidebarWidth: SIDEBAR_WIDTH_DEFAULT,
       setTheme: (theme) => set({ theme }),
       setFont: (font) => set({ font }),
       setFontScale: (scale) => set({ fontScale: clampFontScale(scale) }),
@@ -129,6 +147,7 @@ export const usePrefsStore = create<PrefsState>()(
       setOpenThreads: (count) => set({ openThreads: clampOpenThreads(count) }),
       setSendMessageKey: (sendMessageKey) => set({ sendMessageKey }),
       setSidebarCollapsed: (sidebarCollapsed) => set({ sidebarCollapsed }),
+      setSidebarWidth: (px) => set({ sidebarWidth: clampSidebarWidth(px) }),
       toggleTheme: () => {
         const { theme } = get();
         const effective = resolveEffectiveTheme(theme);
