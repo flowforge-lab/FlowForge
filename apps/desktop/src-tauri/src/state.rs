@@ -23,7 +23,7 @@ use ff_skills::{
     default_phenotype, load_phenotypes, SharedRegistry, SkillRegistry, SkillWatcher,
     DEFAULT_PHENOTYPE,
 };
-use ff_tools::memory::{MemoryGetTool, MemorySearchTool, MemoryWriteTool};
+use ff_tools::memory::{MemoryConsolidateTool, MemoryGetTool, MemorySearchTool, MemoryWriteTool};
 use ff_tools::process::{ProcessManagerTool, ProcessSupervisor};
 use ff_tools::ToolRegistry;
 use tokio::sync::oneshot;
@@ -564,6 +564,10 @@ impl AppState {
         // a process started in one turn survives into later turns.
         reg.register(Box::new(ProcessManagerTool::new(
             self.process_supervisor.clone(),
+        )));
+        reg.register(Box::new(MemoryConsolidateTool::new(
+            self.memory.clone(),
+            self.memory_index.clone(),
         )));
         // Bridge MCP tools from currently-running servers (M4.3).
         if let Some(handle) = self.mcp_handle() {

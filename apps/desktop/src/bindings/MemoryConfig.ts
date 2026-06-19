@@ -21,4 +21,13 @@ injectionBudgetBytes: number,
  * Hybrid (semantic) recall settings (M5.3). Off by default: recall stays
  * pure FTS5/BM25 until a user opts in and an embedder is wired.
  */
-embeddings: EmbeddingsConfig, };
+embeddings: EmbeddingsConfig, 
+/**
+ * Whether the consolidation pass may hard-evict (demote) the lowest-salience
+ * curated facts back to the daily log when merge + promote alone cannot bring
+ * the curated file under `injection_budget_bytes` (RFC 0007 sec 6). Demotion
+ * never deletes: the entry is appended to today's daily log (still FTS-indexed,
+ * still found by `memory_search`) and removed from curated. Default on now;
+ * M6.1 flips this off once decay/dormancy governs injection instead.
+ */
+evictToBudget: boolean, };

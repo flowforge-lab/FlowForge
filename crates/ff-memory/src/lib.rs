@@ -25,7 +25,7 @@ pub mod flush;
 pub mod index;
 pub mod watch;
 
-pub use consolidate::{chunk_key, RecencyFrequencySalience, Salience};
+pub use consolidate::{chunk_key, ConsolidationReport, RecencyFrequencySalience, Salience};
 pub use embed::{Embedder, NoopEmbedder, OpenAiEmbedder};
 pub use error::{MemoryError, Result};
 pub use flush::{FlushLedger, FlushRecord};
@@ -123,6 +123,14 @@ pub struct MemoryConfig {
     /// pure FTS5/BM25 until a user opts in and an embedder is wired.
     #[serde(default)]
     pub embeddings: EmbeddingsConfig,
+    /// Whether the consolidation pass may hard-evict (demote) the lowest-salience
+    /// curated facts back to the daily log when merge + promote alone cannot bring
+    /// the curated file under `injection_budget_bytes` (RFC 0007 sec 6). Demotion
+    /// never deletes: the entry is appended to today's daily log (still FTS-indexed,
+    /// still found by `memory_search`) and removed from curated. Default on now;
+    /// M6.1 flips this off once decay/dormancy governs injection instead.
+    #[serde(default = "default_evict_to_budget")]
+    pub evict_to_budget: bool,
 }
 
 /// Hybrid recall configuration (RFC 0006, M5.3). When `enabled = false`
@@ -156,6 +164,9 @@ fn default_enabled() -> bool {
 fn default_budget() -> usize {
     4096
 }
+fn default_evict_to_budget() -> bool {
+    true
+}
 
 impl Default for MemoryConfig {
     fn default() -> Self {
@@ -163,6 +174,7 @@ impl Default for MemoryConfig {
             enabled: default_enabled(),
             injection_budget_bytes: default_budget(),
             embeddings: EmbeddingsConfig::default(),
+            evict_to_budget: default_evict_to_budget(),
         }
     }
 }
