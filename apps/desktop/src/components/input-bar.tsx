@@ -1,10 +1,11 @@
 import { useCallback, useEffect, useRef } from "react";
-import { ArrowUp, Square } from "lucide-react";
+import { ArrowUp, Folder, Square } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { ipc } from "@/lib/ipc";
 import { useChatStore } from "@/store/chat";
 import { useComposerStore } from "@/store/composer";
 import { usePrefsStore } from "@/store/prefs";
+import { useSessionWorkspaceStore } from "@/store/session-workspace";
 
 // A local model server (candle-vllm, Ollama, …) clocks its GPU down when idle,
 // so the first token after a pause crawls while the device ramps back up. We
@@ -137,64 +138,143 @@ export function InputBar({
 
   return (
     <div className="px-4 pb-4 pt-2">
-      <div
-        ref={boxRef}
-        className="mx-auto flex max-w-3xl items-end gap-1.5 rounded-xl border bg-card p-1.5 shadow-sm transition-all focus-within:border-ring focus-within:shadow-md focus-within:ring-2 focus-within:ring-ring/25"
-      >
-        <textarea
-          ref={textareaRef}
-          data-composer
-          data-pane-focused={focused ? "" : undefined}
-          value={value}
-          rows={1}
-          placeholder="Message FlowForge…"
-          className="max-h-40 min-h-8 flex-1 resize-none bg-transparent px-2 py-1.5 text-[13px] leading-relaxed placeholder:text-muted-foreground/50 focus-visible:outline-none"
-          onFocus={warmup}
-          onChange={(e) => {
-            warmup();
-            setText(e.currentTarget.value);
-            autoGrow(e.currentTarget);
-          }}
-          onKeyDown={(e) => {
-            if (e.key !== "Enter") return;
-            // Enter mode: plain Enter sends (Shift+Enter = new line, unchanged).
-            // Ctrl+Enter mode: Ctrl/⌘+Enter sends; any other Enter is a new line.
-            const sends =
-              sendMessageKey === "ctrlEnter"
-                ? e.metaKey || e.ctrlKey
-                : !e.shiftKey;
-            if (sends) {
-              e.preventDefault();
-              submit();
-            }
-          }}
-        />
-        {streaming || pending ? (
-          <Button
-            variant="outline"
-            size="icon"
-            className="size-8 shrink-0 rounded-lg"
-            onClick={() => targetSessionId && void cancelTurn(targetSessionId)}
-            title="Stop (Esc)"
-          >
-            <Square className="size-3.5" />
-          </Button>
-        ) : (
-          <Button
-            size="icon"
-            className="size-8 shrink-0 rounded-lg"
-            disabled={!value.trim() || !targetSessionId}
-            onClick={submit}
-            title={
-              sendMessageKey === "ctrlEnter"
-                ? "Send (⌘/Ctrl+Enter)"
-                : "Send (Enter)"
-            }
-          >
-            <ArrowUp className="size-4" />
-          </Button>
-        )}
+      <div className="mx-auto flex max-w-3xl flex-col gap-2">
+        {/* Input box: textarea only. The send/stop control moved into its own
+            row below (#200), per the composer layout. */}
+        <div
+          ref={boxRef}
+          className="rounded-xl border bg-card p-1.5 shadow-sm transition-all focus-within:border-ring focus-within:shadow-md focus-within:ring-2 focus-within:ring-ring/25"
+        >
+          <textarea
+            ref={textareaRef}
+            data-composer
+            data-pane-focused={focused ? "" : undefined}
+            value={value}
+            rows={1}
+            placeholder="Message FlowForge…"
+            className="max-h-40 min-h-8 w-full resize-none bg-transparent px-2 py-1.5 text-[13px] leading-relaxed placeholder:text-muted-foreground/50 focus-visible:outline-none"
+            onFocus={warmup}
+            onChange={(e) => {
+              warmup();
+              setText(e.currentTarget.value);
+              autoGrow(e.currentTarget);
+            }}
+            onKeyDown={(e) => {
+              if (e.key !== "Enter") return;
+              // Enter mode: plain Enter sends (Shift+Enter = new line, unchanged).
+              // Ctrl+Enter mode: Ctrl/⌘+Enter sends; any other Enter is a new line.
+              const sends =
+                sendMessageKey === "ctrlEnter"
+                  ? e.metaKey || e.ctrlKey
+                  : !e.shiftKey;
+              if (sends) {
+                e.preventDefault();
+                submit();
+              }
+            }}
+          />
+        </div>
+
+        {/* Send / Stop row: a separate element below the input box, above the
+            workspace selector (#200). */}
+        <div className="flex justify-end">
+          {streaming || pending ? (
+            <Button
+              variant="outline"
+              size="icon"
+              className="size-8 shrink-0 rounded-lg"
+              onClick={() =>
+                targetSessionId && void cancelTurn(targetSessionId)
+              }
+              title="Stop (Esc)"
+            >
+              <Square className="size-3.5" />
+            </Button>
+          ) : (
+            <Button
+              size="icon"
+              className="size-8 shrink-0 rounded-lg"
+              disabled={!value.trim() || !targetSessionId}
+              onClick={submit}
+              title={
+                sendMessageKey === "ctrlEnter"
+                  ? "Send (⌘/Ctrl+Enter)"
+                  : "Send (Enter)"
+              }
+            >
+              <ArrowUp className="size-4" />
+            </Button>
+          )}
+        </div>
+
+        {/* Working-directory selector: a narrower element under the input box
+            (#200, slice 3b/3d). Browse opens the native OS folder dialog. */}
+        {targetSessionId ? (
+          <WorkspaceSelector sessionId={targetSessionId} />
+        ) : null}
       </div>
+    </div>
+  );
+}
+
+const IN_TAURI =
+  globalThis.window !== undefined && "__TAURI_INTERNALS__" in globalThis.window;
+
+/** Last path segment, for a compact label (full path shown on hover). */
+function basename(path: string): string {
+  const parts = path.replace(/[/\\]+$/, "").split(/[/\\]/);
+  return parts[parts.length - 1] || path;
+}
+
+// The working directory a session's tools run in. Shows the current path with a
+// Browse button that opens the native OS folder picker (#200). Outside Tauri
+// (mock / `pnpm dev` in a browser) it falls back to a prompt so the UI stays
+// exercisable. Restyle into a dropdown is tracked in #210.
+function WorkspaceSelector({ sessionId }: { sessionId: string }) {
+  const path = useSessionWorkspaceStore((s) => s.pathBySession[sessionId]);
+  const load = useSessionWorkspaceStore((s) => s.load);
+  const setWorkspace = useSessionWorkspaceStore((s) => s.set);
+
+  useEffect(() => {
+    void load(sessionId);
+  }, [sessionId, load]);
+
+  const browse = useCallback(async () => {
+    let chosen: string | null | undefined;
+    if (IN_TAURI) {
+      const { open } = await import("@tauri-apps/plugin-dialog");
+      const result = await open({
+        directory: true,
+        multiple: false,
+        defaultPath: path,
+      });
+      chosen = typeof result === "string" ? result : null;
+    } else {
+      chosen = globalThis.prompt?.("Working directory", path ?? "");
+    }
+    if (!chosen) return;
+    try {
+      await setWorkspace(sessionId, chosen);
+    } catch {
+      // Backend rejected the path (not a directory). Leave the cache unchanged;
+      // richer error surfacing is part of the dropdown work (#210).
+    }
+  }, [sessionId, path, setWorkspace]);
+
+  return (
+    <div className="mx-auto flex w-full max-w-2xl items-center gap-2 rounded-lg border border-border bg-muted/40 px-2.5 py-1.5 text-xs text-muted-foreground">
+      <Folder className="size-3.5 shrink-0" />
+      <span className="min-w-0 flex-1 truncate" title={path ?? undefined}>
+        {path ? basename(path) : "Loading…"}
+      </span>
+      <Button
+        variant="ghost"
+        size="sm"
+        className="h-6 shrink-0 px-2 text-xs"
+        onClick={() => void browse()}
+      >
+        Browse
+      </Button>
     </div>
   );
 }
