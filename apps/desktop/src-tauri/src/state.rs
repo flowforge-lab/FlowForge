@@ -487,10 +487,8 @@ impl AppState {
             .unwrap_or_else(|| self.workspace_root.clone())
     }
 
-    /// Set `session_id`'s working directory. The future `set_workspace`
-    /// command (slice 3b, issue #200) is the production caller; until then this
-    /// is exercised only by tests.
-    #[allow(dead_code)]
+    /// Set `session_id`'s working directory. Called by the `set_session_workspace`
+    /// command (slice 3b, issue #200) and exercised by tests.
     pub fn set_session_cwd(&self, session_id: &str, dir: PathBuf) {
         self.session_cwd
             .lock()

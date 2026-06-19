@@ -177,6 +177,43 @@ fn fork_session(state: State<'_, Arc<AppState>>, session_id: String) -> Result<S
         .ok_or_else(|| format!("unknown session: {session_id}"))
 }
 
+/// The working directory a session's tools run in (slice 3b, issue #200).
+/// Returns the session's chosen workspace, or the global default when unset.
+#[tauri::command]
+fn get_session_workspace(state: State<'_, Arc<AppState>>, session_id: String) -> String {
+    state.session_root(&session_id).display().to_string()
+}
+
+/// Set a session's working directory. Validates that `path` exists and is a
+/// directory (canonicalized so the stored root is absolute and symlink-resolved),
+/// then returns the canonical path the UI should display. The chosen directory
+/// becomes the `root` for that session's tools -- file tools are jailed to it and
+/// `bash` runs in it.
+#[tauri::command]
+fn set_session_workspace(
+    state: State<'_, Arc<AppState>>,
+    session_id: String,
+    path: String,
+) -> Result<String, String> {
+    let canonical = resolve_workspace_dir(&path)?;
+    let display = canonical.display().to_string();
+    state.set_session_cwd(&session_id, canonical);
+    Ok(display)
+}
+
+/// Canonicalize `path` and confirm it is an existing directory. Returns the
+/// absolute, symlink-resolved path on success. Extracted from
+/// [`set_session_workspace`] so the validation is unit-testable without a
+/// Tauri `State`.
+fn resolve_workspace_dir(path: &str) -> Result<std::path::PathBuf, String> {
+    let canonical =
+        std::fs::canonicalize(path).map_err(|e| format!("cannot resolve directory: {e}"))?;
+    if !canonical.is_dir() {
+        return Err(format!("not a directory: {}", canonical.display()));
+    }
+    Ok(canonical)
+}
+
 /// Map an internal [`ff_memory::MemoryFile`] to the IPC [`MemoryFileInfo`] contract.
 fn to_file_info(f: ff_memory::MemoryFile) -> MemoryFileInfo {
     MemoryFileInfo {
@@ -989,6 +1026,7 @@ pub fn run() {
     let state = Arc::new(AppState::new());
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
         .manage(state.clone())
         .setup(move |app| {
             // `init_mcp` enters the shared Tokio runtime itself, so it's safe to
@@ -1019,6 +1057,8 @@ pub fn run() {
             rename_session,
             delete_session,
             fork_session,
+            get_session_workspace,
+            set_session_workspace,
             list_memory_files,
             read_memory_file,
             memory_overview,
@@ -1069,4 +1109,35 @@ pub fn run() {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_workspace_dir;
+
+    #[test]
+    fn resolve_workspace_dir_accepts_existing_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let resolved = resolve_workspace_dir(dir.path().to_str().unwrap()).unwrap();
+        assert!(resolved.is_dir());
+        // Canonicalized: absolute and symlink-resolved.
+        assert_eq!(resolved, std::fs::canonicalize(dir.path()).unwrap());
+    }
+
+    #[test]
+    fn resolve_workspace_dir_rejects_missing_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("does-not-exist");
+        let err = resolve_workspace_dir(missing.to_str().unwrap()).unwrap_err();
+        assert!(err.contains("cannot resolve directory"));
+    }
+
+    #[test]
+    fn resolve_workspace_dir_rejects_a_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a-file.txt");
+        std::fs::write(&file, "x").unwrap();
+        let err = resolve_workspace_dir(file.to_str().unwrap()).unwrap_err();
+        assert!(err.contains("not a directory"));
+    }
 }

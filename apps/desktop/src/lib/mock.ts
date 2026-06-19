@@ -312,6 +312,10 @@ const bumpPatch = (version: string): string => {
 export class MockIpc implements FfIpc {
   private sessions = new Map<string, Session>();
   private messages = new Map<string, Message[]>();
+  // Per-session working directory (slice 3b, #200). Mirrors the backend's
+  // in-memory session_cwd map; unset sessions report the default root.
+  private workspaces = new Map<string, string>();
+  private readonly defaultWorkspace = "/Users/you/projects/flowforge";
   // One active timer per session so cancelTurn can stop it.
   private activeTimers = new Map<string, ActiveTurn>();
 
@@ -437,6 +441,17 @@ export class MockIpc implements FfIpc {
     this.sessions.set(forked.id, forked);
     this.messages.set(forked.id, clonedMessages);
     return { ...forked };
+  }
+
+  async getSessionWorkspace(sessionId: string): Promise<string> {
+    return this.workspaces.get(sessionId) ?? this.defaultWorkspace;
+  }
+
+  async setSessionWorkspace(sessionId: string, path: string): Promise<string> {
+    const trimmed = path.trim();
+    if (!trimmed) throw new Error("cannot resolve directory: empty path");
+    this.workspaces.set(sessionId, trimmed);
+    return trimmed;
   }
 
   async listSessions(): Promise<Session[]> {
