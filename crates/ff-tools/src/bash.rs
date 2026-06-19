@@ -6,7 +6,7 @@
 //! [`Tool::safety`] classification + the host's approval gate for write/dangerous
 //! commands. OS-level sandboxing (sandbox-exec / Landlock) is a tracked follow-up.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -50,6 +50,24 @@ impl BashTool {
         args.get("command").and_then(Value::as_str)
     }
 
+    /// Resolve the effective working directory. `working_dir` is optional: absent
+    /// uses `root`; a relative path is joined onto `root`; an absolute path is
+    /// honored as-is. Like the shell command itself, this is intentionally not
+    /// path-jailed (see module docs) -- it only sets `cwd`.
+    fn resolve_dir(args: &Value, root: &Path) -> PathBuf {
+        match args.get("working_dir").and_then(Value::as_str) {
+            Some(dir) if !dir.is_empty() => {
+                let p = Path::new(dir);
+                if p.is_absolute() {
+                    p.to_path_buf()
+                } else {
+                    root.join(p)
+                }
+            }
+            _ => root.to_path_buf(),
+        }
+    }
+
     fn classify(command: &str) -> Safety {
         let lower = command.to_lowercase();
         if DANGEROUS_PATTERNS.iter().any(|p| lower.contains(p)) {
@@ -90,7 +108,8 @@ impl Tool for BashTool {
 
     fn description(&self) -> &str {
         "Execute a shell command in the workspace directory and return its stdout, \
-         stderr, and exit status. Use for builds, tests, git, and file inspection."
+         stderr, and exit status. Use for builds, tests, git, and file inspection. \
+         Pass `working_dir` to run in a subdirectory of the workspace."
     }
 
     fn parameters(&self) -> Value {
@@ -100,6 +119,11 @@ impl Tool for BashTool {
                 "command": {
                     "type": "string",
                     "description": "The shell command to run."
+                },
+                "working_dir": {
+                    "type": "string",
+                    "description": "Directory to run the command in, relative to the \
+                                    workspace root or absolute. Defaults to the workspace root."
                 }
             },
             "required": ["command"]
@@ -118,11 +142,19 @@ impl Tool for BashTool {
             return ToolOutcome::error("missing required argument: command");
         };
 
+        let dir = Self::resolve_dir(&args, root);
+        if !dir.is_dir() {
+            return ToolOutcome::error(format!(
+                "working_dir does not exist or is not a directory: {}",
+                dir.display()
+            ));
+        }
+
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
         let child = Command::new(&shell)
             .arg("-c")
             .arg(command)
-            .current_dir(root)
+            .current_dir(&dir)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true)
@@ -217,5 +249,61 @@ mod tests {
         let out = BashTool.run(serde_json::json!({}), dir.path()).await;
         assert!(!out.success);
         assert!(out.content.contains("missing required argument"));
+    }
+
+    #[tokio::test]
+    async fn working_dir_relative_runs_in_subdir() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        let out = BashTool
+            .run(
+                serde_json::json!({"command": "pwd", "working_dir": "sub"}),
+                dir.path(),
+            )
+            .await;
+        assert!(out.success, "{}", out.content);
+        // The canonical path ends with the subdir we asked for.
+        assert!(out.content.contains("sub"));
+    }
+
+    #[tokio::test]
+    async fn working_dir_absolute_is_honored() {
+        let root = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        std::fs::write(other.path().join("marker.txt"), "x").unwrap();
+        let out = BashTool
+            .run(
+                serde_json::json!({
+                    "command": "ls",
+                    "working_dir": other.path().to_str().unwrap(),
+                }),
+                root.path(),
+            )
+            .await;
+        assert!(out.success, "{}", out.content);
+        assert!(out.content.contains("marker.txt"));
+    }
+
+    #[tokio::test]
+    async fn missing_working_dir_runs_in_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = BashTool
+            .run(serde_json::json!({"command": "echo hi"}), dir.path())
+            .await;
+        assert!(out.success, "{}", out.content);
+        assert!(out.content.contains("hi"));
+    }
+
+    #[tokio::test]
+    async fn nonexistent_working_dir_is_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = BashTool
+            .run(
+                serde_json::json!({"command": "pwd", "working_dir": "does-not-exist"}),
+                dir.path(),
+            )
+            .await;
+        assert!(!out.success);
+        assert!(out.content.contains("working_dir does not exist"));
     }
 }
