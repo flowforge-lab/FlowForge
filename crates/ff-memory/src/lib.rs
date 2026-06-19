@@ -100,6 +100,11 @@ pub struct MemoryChunk {
 
 /// Memory behaviour knobs. Defaults make memory on with a small ambient budget;
 /// `enabled = false` is the full disable path (RFC 0006 §8).
+///
+/// Note (M5.3.x persistence): `rename_all = "camelCase"` is safe today because
+/// this is only ever built via `Default` and never deserialized from disk. When
+/// on-disk persistence lands, keep the file camelCase too (or add an explicit
+/// migration) so a snake_case settings file isn't silently reintroduced.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export, export_to = "../../../apps/desktop/src/bindings/")]

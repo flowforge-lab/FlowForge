@@ -94,9 +94,30 @@ impl Fts5Index {
                  INSERT INTO chunks_fts(rowid, text) VALUES (new.id, new.text);
              END;",
         )?;
+        Self::ensure_embedding_column(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
+    }
+
+    /// Back-fill the `embedding` column on indexes created before M5.3.0 (#196).
+    /// The M5.1 schema (#176) had no `embedding` column, and the `CREATE TABLE IF
+    /// NOT EXISTS` above is a no-op against that pre-existing table — so an old
+    /// on-disk `index.db` would lack the column and every `reindex` insert would
+    /// fail, silently freezing recall. The index is a derived cache, but adding
+    /// the column in place is cheaper than a full rebuild and keeps the FTS data.
+    /// FTS5 only indexes `text`, so the new column is invisible to `chunks_fts`.
+    fn ensure_embedding_column(conn: &Connection) -> Result<()> {
+        let has_embedding = conn
+            .prepare("PRAGMA table_info(chunks)")?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<std::result::Result<Vec<String>, _>>()?
+            .iter()
+            .any(|name| name == "embedding");
+        if !has_embedding {
+            conn.execute("ALTER TABLE chunks ADD COLUMN embedding BLOB", [])?;
+        }
+        Ok(())
     }
 
     fn insert_chunks(conn: &Connection, chunks: &[MemoryChunk]) -> Result<()> {
@@ -606,5 +627,36 @@ mod tests {
             hybrid.search("topic", 10).unwrap(),
             bare.search("topic", 10).unwrap()
         );
+    }
+
+    #[test]
+    fn open_migrates_pre_m530_schema_missing_embedding_column() {
+        // Simulate an M5.1 (#176) on-disk index whose `chunks` table predates the
+        // `embedding` column. `from_conn`'s `CREATE TABLE IF NOT EXISTS` is a
+        // no-op against it, so the migration must back-fill the column or every
+        // reindex insert fails (the bug the #196 review caught — unit tests missed
+        // it because they all start from a fresh `open_in_memory`).
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE chunks (
+                 id         INTEGER PRIMARY KEY,
+                 source     TEXT NOT NULL,
+                 path       TEXT NOT NULL,
+                 heading    TEXT,
+                 text       TEXT NOT NULL,
+                 line_start INTEGER NOT NULL,
+                 line_end   INTEGER NOT NULL
+             );
+             CREATE VIRTUAL TABLE chunks_fts
+                 USING fts5(text, content='chunks', content_rowid='id');",
+        )
+        .unwrap();
+
+        let idx = Fts5Index::from_conn(conn).unwrap();
+        idx.reindex(&chunks("## Prefs\nuser prefers rust", "MEMORY.md"))
+            .unwrap();
+        let hits = idx.search("rust", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].chunk.text.contains("rust"));
     }
 }
