@@ -63,14 +63,18 @@ impl PythonTool {
         Duration::from_secs(secs)
     }
 
-    /// Pick the interpreter: prefer a project virtualenv under the working dir
-    /// (`.venv/bin/python`, then `venv/bin/python`) so the agent runs with the
-    /// project's dependencies, otherwise fall back to `python3` on PATH.
+    /// Pick the interpreter: prefer the nearest project virtualenv
+    /// (`.venv/bin/python`, then `venv/bin/python`) found by walking up from the
+    /// working dir, so the agent runs with the project's dependencies even when it
+    /// is invoked from a subdir of a monorepo whose `.venv` lives at the root.
+    /// Falls back to `python3` on PATH when no virtualenv is found.
     fn interpreter(dir: &Path) -> PathBuf {
-        for venv in [".venv/bin/python", "venv/bin/python"] {
-            let candidate = dir.join(venv);
-            if candidate.is_file() {
-                return candidate;
+        for ancestor in dir.ancestors() {
+            for venv in [".venv/bin/python", "venv/bin/python"] {
+                let candidate = ancestor.join(venv);
+                if candidate.is_file() {
+                    return candidate;
+                }
             }
         }
         PathBuf::from("python3")
@@ -333,6 +337,40 @@ mod tests {
         assert_eq!(
             PythonTool.safety(&serde_json::json!({"code": "print(1)"})),
             Safety::Write
+        );
+    }
+
+    #[test]
+    fn interpreter_finds_venv_in_an_ancestor_of_the_working_dir() {
+        // .venv at the project root must be found when running in a nested subdir.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join(".venv/bin")).unwrap();
+        std::fs::write(root.join(".venv/bin/python"), "").unwrap();
+        let sub = root.join("packages/app/src");
+        std::fs::create_dir_all(&sub).unwrap();
+        assert_eq!(PythonTool::interpreter(&sub), root.join(".venv/bin/python"));
+    }
+
+    #[test]
+    fn interpreter_prefers_the_nearest_venv_when_several_ancestors_have_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join(".venv/bin")).unwrap();
+        std::fs::write(root.join(".venv/bin/python"), "").unwrap();
+        let sub = root.join("pkg");
+        std::fs::create_dir_all(sub.join(".venv/bin")).unwrap();
+        std::fs::write(sub.join(".venv/bin/python"), "").unwrap();
+        // The subdir's own venv wins over the root's.
+        assert_eq!(PythonTool::interpreter(&sub), sub.join(".venv/bin/python"));
+    }
+
+    #[test]
+    fn interpreter_falls_back_to_path_python3_without_any_venv() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            PythonTool::interpreter(dir.path()),
+            PathBuf::from("python3")
         );
     }
 }
