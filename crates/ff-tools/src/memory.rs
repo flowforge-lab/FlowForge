@@ -11,10 +11,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use ff_memory::{chunk_markdown, Memory, MemoryIndex, MemorySource, ScoredChunk, WriteTarget};
-// Used by MemoryConsolidateTool (P2 merge/promote logic will consume these).
-#[allow(unused_imports)]
-use ff_memory::{chunk_key, Salience};
+use ff_memory::{
+    chunk_markdown, Memory, MemoryIndex, MemorySource, RecencyFrequencySalience, ScoredChunk,
+    WriteTarget,
+};
 use serde_json::Value;
 
 use crate::registry::{Safety, Tool, ToolOutcome};
@@ -313,25 +313,20 @@ impl Tool for MemoryWriteTool {
 }
 
 // ---------------------------------------------------------------------------
-// memory_consolidate — trigger the consolidation pass (P1 skeleton, #223)
+// memory_consolidate — trigger the consolidation pass (#223)
 // ---------------------------------------------------------------------------
 
-/// `memory_consolidate` — manually trigger the consolidation pass.
+/// `memory_consolidate` — manually trigger the consolidation pass (issue #223).
 ///
-/// P1 skeleton: verifies the trigger condition, calls `rewrite_curated` if
-/// needed. The actual merge/promote logic is a P2 follow-up; this tool just
-/// wires the entry point so it compiles and is callable from Settings/CLI.
+/// Verifies the trigger condition (or `force`), runs [`Memory::consolidate`]
+/// (merge / promote / demote), then rebuilds the recall index off the rewritten
+/// files. Idempotent: a re-run with nothing to change reports a no-op.
 ///
-/// **NOT YET REGISTERED** — wired into the CLI/desktop tool registries in P2
-/// once merge/promote/demote logic lands. Kept here (with unit tests) as the
-/// P1 seam.
-///
-/// **Invariant**: consolidation is the sole writer of curated Markdown;
-/// decay/dormancy (M6) never edits Markdown.
+/// **Invariant**: consolidation is the sole full-file writer of curated
+/// Markdown; decay/dormancy (M6) never edits Markdown.
 pub struct MemoryConsolidateTool {
     memory: Arc<Memory>,
-    /// Used by P2 merge/promote to reindex after atomic rewrite.
-    #[allow(dead_code)]
+    /// Reindexed after the atomic curated rewrite so recall sees the new shape.
     index: Arc<dyn MemoryIndex>,
 }
 
@@ -377,21 +372,32 @@ impl Tool for MemoryConsolidateTool {
             return ToolOutcome::ok("Consolidation not needed: curated file is within budget.");
         }
 
-        // P2 TODO: implement merge/promote/demote logic here.
-        // For now, this is a no-op skeleton that confirms the infrastructure works.
-        // The actual pass will:
-        //   1. Chunk curated + daily logs
-        //   2. Compute chunk_keys for dedup
-        //   3. Score chunks via Salience trait
-        //   4. Merge near-identical curated facts
-        //   5. Promote top-ranked daily facts
-        //   6. Demote lowest-ranked curated facts (if evict_to_budget enabled)
-        //   7. Atomic rewrite via rewrite_curated()
-        //   8. Reindex
+        let report = match self
+            .memory
+            .consolidate(&RecencyFrequencySalience::default())
+        {
+            Ok(r) => r,
+            Err(e) => return ToolOutcome::error(format!("consolidation failed: {e}")),
+        };
 
-        ToolOutcome::ok(
-            "Consolidation pass triggered (P2: merge/promote logic pending). Infrastructure verified: atomic rewrite + chunk_key + Salience seam ready.",
-        )
+        if !report.ran {
+            return ToolOutcome::ok("Consolidation ran: nothing to change (already consolidated).");
+        }
+
+        // Rebuild the recall index off the rewritten files. The hybrid index may
+        // make a blocking embedding HTTP call, so run it off the async worker
+        // (mirrors `memory_write`); it degrades to BM25 internally on failure.
+        let index = self.index.clone();
+        let chunks = self.memory.all_chunks();
+        let summary = format!(
+            "Consolidated: merged {}, promoted {}, demoted {} ({} -> {} bytes).",
+            report.merged, report.promoted, report.demoted, report.bytes_before, report.bytes_after
+        );
+        match tokio::task::spawn_blocking(move || index.reindex(&chunks)).await {
+            Ok(Ok(())) => ToolOutcome::ok(summary),
+            Ok(Err(e)) => ToolOutcome::ok(format!("{summary} (warning: reindex failed: {e})")),
+            Err(e) => ToolOutcome::ok(format!("{summary} (warning: reindex task failed: {e})")),
+        }
     }
 }
 
@@ -675,7 +681,8 @@ mod tests {
             .run(serde_json::json!({ "force": true }), Path::new("."))
             .await;
         assert!(out.success);
-        assert!(out.content.contains("triggered"), "{}", out.content);
+        // Empty memory: the forced pass runs but has nothing to change.
+        assert!(out.content.contains("nothing to change"), "{}", out.content);
     }
 
     #[tokio::test]
