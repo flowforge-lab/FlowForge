@@ -116,10 +116,16 @@ impl Tool for MemorySearchTool {
             .map(|n| (n as usize).clamp(1, MAX_SEARCH_LIMIT))
             .unwrap_or(DEFAULT_SEARCH_LIMIT);
 
-        match self.index.search(query, limit) {
-            Ok(hits) if hits.is_empty() => ToolOutcome::ok("No matching memory."),
-            Ok(hits) => ToolOutcome::ok(format_hits(&self.memory, &hits)),
-            Err(e) => ToolOutcome::error(format!("memory search failed: {e}")),
+        // The hybrid index may make a blocking embedding HTTP call inside `search`;
+        // run it off the async worker so a slow/unreachable embedder never parks a
+        // runtime thread (it still degrades to BM25 internally on failure).
+        let index = self.index.clone();
+        let query = query.to_string();
+        match tokio::task::spawn_blocking(move || index.search(&query, limit)).await {
+            Ok(Ok(hits)) if hits.is_empty() => ToolOutcome::ok("No matching memory."),
+            Ok(Ok(hits)) => ToolOutcome::ok(format_hits(&self.memory, &hits)),
+            Ok(Err(e)) => ToolOutcome::error(format!("memory search failed: {e}")),
+            Err(e) => ToolOutcome::error(format!("memory search task failed: {e}")),
         }
     }
 }

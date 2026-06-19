@@ -43,3 +43,188 @@ impl Embedder for NoopEmbedder {
         Ok(None)
     }
 }
+
+/// A local-first [`Embedder`] backed by an OpenAI-compatible `/v1/embeddings`
+/// HTTP endpoint (RFC 0006 §6). This is the M5.3.1 "local model server" path:
+/// point it at a candle-vLLM / vLLM / LM Studio / Ollama server running an
+/// **embedding-capable model** and recall fuses vector similarity with BM25.
+///
+/// It holds firmly to the [`Embedder`] contract: **any** failure — connection
+/// refused, non-2xx (e.g. a chat-only server with no embeddings route),
+/// malformed body, or a zero/empty vector — degrades to `Ok(None)` so the
+/// [`HybridIndex`](crate::index::HybridIndex) falls back to pure BM25. The user
+/// is never blocked because their embedding server is down or misconfigured.
+///
+/// The same client serves the M5.3.2 cloud path: pass an `api_key` and an
+/// `https` base URL. Embeddings remain opt-in and off by default (RFC 0006 §8).
+#[derive(Debug)]
+pub struct OpenAiEmbedder {
+    client: reqwest::blocking::Client,
+    endpoint: String,
+    model: String,
+    api_key: Option<String>,
+}
+
+impl OpenAiEmbedder {
+    /// Build an embedder targeting `{base_url}/embeddings` with `model`. A
+    /// trailing slash on `base_url` is tolerated. `api_key` is sent as a bearer
+    /// token when present (cloud); local servers leave it `None`.
+    ///
+    /// The blocking HTTP client owns its own runtime thread, so this is safe to
+    /// call from sync code (the watcher, `build_memory`) — and callers in an
+    /// async context should invoke `search`/`reindex` via `spawn_blocking` so a
+    /// worker thread is never parked on the network round-trip.
+    pub fn new(
+        base_url: impl AsRef<str>,
+        model: impl Into<String>,
+        api_key: Option<String>,
+    ) -> Self {
+        let endpoint = format!("{}/embeddings", base_url.as_ref().trim_end_matches('/'));
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .unwrap_or_default();
+        Self {
+            client,
+            endpoint,
+            model: model.into(),
+            api_key,
+        }
+    }
+
+    /// POST one input and return its vector, or `None` on any failure (the
+    /// BM25-fallback guarantee). Empty input never hits the network.
+    fn embed(&self, input: &str) -> Option<Vec<f32>> {
+        if input.trim().is_empty() {
+            return None;
+        }
+        let mut req = self.client.post(&self.endpoint).json(&EmbeddingRequest {
+            model: &self.model,
+            input,
+        });
+        if let Some(key) = &self.api_key {
+            req = req.bearer_auth(key);
+        }
+        let resp = req.send().ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        let body: EmbeddingResponse = resp.json().ok()?;
+        let vector = body.data.into_iter().next()?.embedding;
+        if vector.is_empty() || vector.iter().all(|x| *x == 0.0) {
+            None
+        } else {
+            Some(vector)
+        }
+    }
+}
+
+impl Embedder for OpenAiEmbedder {
+    fn embed_query(&self, query: &str) -> Result<Option<Vec<f32>>> {
+        Ok(self.embed(query))
+    }
+    fn embed_chunk(&self, text: &str) -> Result<Option<Vec<f32>>> {
+        Ok(self.embed(text))
+    }
+}
+
+#[derive(serde::Serialize)]
+struct EmbeddingRequest<'a> {
+    model: &'a str,
+    input: &'a str,
+}
+
+#[derive(serde::Deserialize)]
+struct EmbeddingResponse {
+    data: Vec<EmbeddingData>,
+}
+
+#[derive(serde::Deserialize)]
+struct EmbeddingData {
+    embedding: Vec<f32>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// Run a blocking embed call off any tokio worker: `reqwest::blocking` must
+    /// not be invoked from a runtime thread.
+    fn off_runtime<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+        std::thread::spawn(f).join().unwrap()
+    }
+
+    #[tokio::test]
+    async fn embeds_text_from_an_openai_compatible_endpoint() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/embeddings"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [{ "embedding": [0.1f32, 0.2, 0.3] }]
+            })))
+            .mount(&server)
+            .await;
+        let base = format!("{}/v1", server.uri());
+        let got = off_runtime(move || {
+            OpenAiEmbedder::new(base, "test-embed", None)
+                .embed_query("hello")
+                .unwrap()
+        });
+        assert_eq!(got, Some(vec![0.1, 0.2, 0.3]));
+    }
+
+    #[tokio::test]
+    async fn non_2xx_falls_back_to_none() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/embeddings"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        let base = format!("{}/v1", server.uri());
+        let got = off_runtime(move || {
+            OpenAiEmbedder::new(base, "test-embed", None)
+                .embed_chunk("hello")
+                .unwrap()
+        });
+        assert_eq!(got, None);
+    }
+
+    #[tokio::test]
+    async fn zero_vector_is_treated_as_no_vector() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/embeddings"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [{ "embedding": [0.0f32, 0.0, 0.0] }]
+            })))
+            .mount(&server)
+            .await;
+        let base = format!("{}/v1", server.uri());
+        let got = off_runtime(move || {
+            OpenAiEmbedder::new(base, "test-embed", None)
+                .embed_query("hello")
+                .unwrap()
+        });
+        assert_eq!(got, None);
+    }
+
+    #[test]
+    fn unreachable_endpoint_is_none_not_error() {
+        let got = OpenAiEmbedder::new("http://127.0.0.1:1", "m", None)
+            .embed_query("hello")
+            .unwrap();
+        assert_eq!(got, None);
+    }
+
+    #[test]
+    fn empty_input_never_hits_the_network() {
+        // No server: a network call would error; empty input short-circuits.
+        let got = OpenAiEmbedder::new("http://127.0.0.1:1", "m", None)
+            .embed_query("   ")
+            .unwrap();
+        assert_eq!(got, None);
+    }
+}

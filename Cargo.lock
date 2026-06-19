@@ -1360,12 +1360,16 @@ dependencies = [
  "chrono",
  "dirs 5.0.1",
  "notify",
+ "reqwest 0.12.28",
  "rusqlite",
  "serde",
+ "serde_json",
  "tempfile",
  "thiserror 2.0.18",
+ "tokio",
  "tracing",
  "ts-rs",
+ "wiremock",
 ]
 
 [[package]]

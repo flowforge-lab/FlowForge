@@ -24,7 +24,7 @@ pub mod flush;
 pub mod index;
 pub mod watch;
 
-pub use embed::{Embedder, NoopEmbedder};
+pub use embed::{Embedder, NoopEmbedder, OpenAiEmbedder};
 pub use error::{MemoryError, Result};
 pub use flush::{FlushLedger, FlushRecord};
 pub use index::{Fts5Index, HybridIndex, MemoryIndex, ScoredChunk};
@@ -498,6 +498,54 @@ fn head_within(text: &str, budget: usize) -> &str {
     }
 }
 
+/// Target byte size for a memory chunk, and the overlap carried between windows
+/// when a section must be split (RFC 0006 §11.4). Heading-anchored sections are
+/// the primary boundary; only a section whose joined text exceeds the target is
+/// broken into overlapping line-windows, so today's small memory files stay a
+/// single chunk (byte-identical BM25 behaviour) and only genuinely large sections
+/// get windowed for focused embeddings. ~2 KB approximates 512 tokens; ~15%
+/// overlap preserves context across a split.
+const CHUNK_TARGET_BYTES: usize = 2048;
+const CHUNK_OVERLAP_BYTES: usize = 307;
+
+/// Greedy line-windows over `lines`: each window's joined byte length stays within
+/// `target` where it can (a single oversized line still forms its own window), and
+/// successive windows overlap by about `overlap` bytes. Returns half-open
+/// `[start, end)` index ranges that cover every line and always advance, so a
+/// pathological section can never loop. Splitting on line boundaries keeps every
+/// chunk's reported line span exact for `memory_get`.
+fn window_line_ranges(lines: &[&str], target: usize, overlap: usize) -> Vec<(usize, usize)> {
+    if lines.is_empty() {
+        return Vec::new();
+    }
+    // +1 approximates the `\n` join separator that sits between two lines.
+    let len_of = |i: usize| lines[i].len() + 1;
+    let mut ranges = Vec::new();
+    let mut start = 0;
+    while start < lines.len() {
+        let mut end = start;
+        let mut acc = 0;
+        while end < lines.len() && (end == start || acc + len_of(end) <= target) {
+            acc += len_of(end);
+            end += 1;
+        }
+        ranges.push((start, end));
+        if end >= lines.len() {
+            break;
+        }
+        // Carry ~`overlap` bytes into the next window, but never step back to or
+        // past `start`, so the loop always makes forward progress.
+        let mut back = end;
+        let mut carried = 0;
+        while back > start + 1 && carried < overlap {
+            back -= 1;
+            carried += len_of(back);
+        }
+        start = back;
+    }
+    ranges
+}
+
 /// Split Markdown into heading-anchored chunks (RFC 0006 §4). Each chunk runs from
 /// a heading line to just before the next heading; content before the first
 /// heading becomes a preamble chunk. Empty chunks are dropped. Used by the M5.1
@@ -513,21 +561,44 @@ pub fn chunk_markdown(text: &str, source: MemorySource, path: &Path) -> Vec<Memo
                  start: u32,
                  end: u32,
                  body: &[&str]| {
-        let text = body.join("\n");
-        if text.trim().is_empty() {
+        let joined = body.join("\n");
+        if joined.trim().is_empty() {
             return;
         }
-        let id = chunks.len() as i64;
-        chunks.push(MemoryChunk {
-            id,
-            source: source.clone(),
-            path: path.to_path_buf(),
-            heading: heading.clone(),
-            text,
-            line_start: start,
-            line_end: end,
-            embedding: None,
-        });
+        // Small sections (the common case) stay a single chunk -> byte-identical
+        // BM25 behaviour. Only a section past the target is split into overlapping
+        // line-windows so its embeddings stay focused (RFC 0006 sec 11.4).
+        if joined.len() <= CHUNK_TARGET_BYTES {
+            let id = chunks.len() as i64;
+            chunks.push(MemoryChunk {
+                id,
+                source: source.clone(),
+                path: path.to_path_buf(),
+                heading: heading.clone(),
+                text: joined,
+                line_start: start,
+                line_end: end,
+                embedding: None,
+            });
+            return;
+        }
+        for (s, e) in window_line_ranges(body, CHUNK_TARGET_BYTES, CHUNK_OVERLAP_BYTES) {
+            let text = body[s..e].join("\n");
+            if text.trim().is_empty() {
+                continue;
+            }
+            let id = chunks.len() as i64;
+            chunks.push(MemoryChunk {
+                id,
+                source: source.clone(),
+                path: path.to_path_buf(),
+                heading: heading.clone(),
+                text,
+                line_start: start + s as u32,
+                line_end: start + e as u32 - 1,
+                embedding: None,
+            });
+        }
     };
 
     let total = text.lines().count() as u32;
@@ -766,6 +837,66 @@ mod tests {
     fn chunk_markdown_empty_input_yields_no_chunks() {
         assert!(chunk_markdown("", MemorySource::Curated, Path::new("x.md")).is_empty());
         assert!(chunk_markdown("   \n  \n", MemorySource::Curated, Path::new("x.md")).is_empty());
+    }
+
+    #[test]
+    fn small_section_is_a_single_chunk_unchanged() {
+        // A section well under the target stays one chunk with the heading-anchored
+        // line span -> byte-identical to the pre-windowing behaviour.
+        let md = "# h\nshort body line one\nshort body line two";
+        let chunks = chunk_markdown(md, MemorySource::Curated, Path::new("x.md"));
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].line_start, 1);
+        assert_eq!(chunks[0].line_end, 3);
+        assert_eq!(chunks[0].text, md);
+    }
+
+    #[test]
+    fn oversized_section_splits_into_overlapping_windows_with_exact_line_spans() {
+        // Build one heading section far larger than CHUNK_TARGET_BYTES.
+        let mut md = String::from("# big\n");
+        for i in 0..200 {
+            md.push_str(&format!(
+                "line {i:03} with enough text to add real bytes here\n"
+            ));
+        }
+        let chunks = chunk_markdown(&md, MemorySource::Curated, Path::new("x.md"));
+        assert!(chunks.len() > 1, "oversized section should window");
+        // Every sub-chunk inherits the heading and stays within the target (each
+        // window is allowed to overshoot only by its first line).
+        for c in &chunks {
+            assert_eq!(c.heading.as_deref(), Some("big"));
+            assert!(c.line_start >= 1 && c.line_end >= c.line_start);
+        }
+        // Windows are contiguous-with-overlap: each starts at or before the
+        // previous window's end (the carried-over context), and the last window
+        // reaches the final line of the section.
+        let total_lines = md.lines().count() as u32;
+        for pair in chunks.windows(2) {
+            assert!(pair[1].line_start <= pair[0].line_end + 1);
+            assert!(pair[1].line_start > pair[0].line_start);
+        }
+        assert_eq!(chunks.last().unwrap().line_end, total_lines);
+        // Sub-chunk text matches its reported line span exactly.
+        let lines: Vec<&str> = md.lines().collect();
+        for c in &chunks {
+            let expected =
+                lines[(c.line_start - 1) as usize..=(c.line_end - 1) as usize].join("\n");
+            assert_eq!(c.text, expected);
+        }
+    }
+
+    #[test]
+    fn window_line_ranges_covers_all_lines_and_advances() {
+        let lines: Vec<&str> = vec!["aaaa"; 50];
+        let ranges = window_line_ranges(&lines, 20, 6);
+        assert!(ranges.len() > 1);
+        assert_eq!(ranges.first().unwrap().0, 0);
+        assert_eq!(ranges.last().unwrap().1, lines.len());
+        for pair in ranges.windows(2) {
+            assert!(pair[1].0 > pair[0].0, "must advance");
+            assert!(pair[1].0 < pair[0].1, "must overlap");
+        }
     }
 
     #[test]
