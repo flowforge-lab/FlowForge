@@ -1018,10 +1018,24 @@ impl MemoryIndex for NullIndex {
     }
 }
 
+/// The default working directory for a session whose cwd is unset: `~/.flowforge/
+/// workspaces/`, created on first use. Falls back to the home directory if the
+/// directory cannot be created, and to the process CWD when there is no home dir.
+/// A user-chosen folder (the per-session picker, #200) overrides this.
 fn default_workspace_root() -> PathBuf {
-    dirs::home_dir()
-        .or_else(|| std::env::current_dir().ok())
-        .unwrap_or_else(|| PathBuf::from("."))
+    default_workspace_root_in(dirs::home_dir())
+}
+
+/// Testable core of [`default_workspace_root`] with the home dir injected.
+fn default_workspace_root_in(home: Option<PathBuf>) -> PathBuf {
+    if let Some(home) = home {
+        let workspaces = home.join(".flowforge").join("workspaces");
+        if fs::create_dir_all(&workspaces).is_ok() {
+            return workspaces;
+        }
+        return home;
+    }
+    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
 }
 
 /// Re-scan root and swap the shared registry's contents. Shared by the installer
@@ -1421,6 +1435,20 @@ mod tests {
         let dir = std::path::PathBuf::from("/tmp/ff-session-cwd-test");
         state.set_session_cwd("sess-a", dir.clone());
         assert_eq!(state.session_root("sess-a"), dir);
+    }
+
+    #[test]
+    fn default_workspace_root_creates_flowforge_workspaces() {
+        let home = tempfile::tempdir().unwrap();
+        let root = default_workspace_root_in(Some(home.path().to_path_buf()));
+        assert_eq!(root, home.path().join(".flowforge").join("workspaces"));
+        assert!(root.is_dir());
+    }
+
+    #[test]
+    fn default_workspace_root_falls_back_to_cwd_without_home() {
+        let root = default_workspace_root_in(None);
+        assert_eq!(root, std::env::current_dir().unwrap());
     }
 
     #[test]

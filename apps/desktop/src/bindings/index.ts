@@ -3,6 +3,7 @@
 export type { Message } from "./Message";
 export type { Role } from "./Role";
 export type { Session } from "./Session";
+export type { SessionWorkspace } from "./SessionWorkspace";
 export type { Phenotype } from "./Phenotype";
 export type { SkillInfo } from "./SkillInfo";
 export type { SkillManifest } from "./SkillManifest";

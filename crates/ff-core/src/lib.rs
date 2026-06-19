@@ -19,5 +19,5 @@ pub use provider::{
     ConnectionId, ProviderConfig, ProviderConnection, ProviderKind, ProviderRegistry,
 };
 pub use search::{SearchBackend, SearchConfig};
-pub use session::{auto_title, Session, SessionStatus};
+pub use session::{auto_title, Session, SessionStatus, SessionWorkspace};
 pub use skill::{Phenotype, Skill, SkillInfo, SkillManifest};

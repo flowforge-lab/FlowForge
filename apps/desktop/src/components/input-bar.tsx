@@ -231,9 +231,11 @@ function basename(path: string): string {
 // (mock / `pnpm dev` in a browser) it falls back to a prompt so the UI stays
 // exercisable. Restyle into a dropdown is tracked in #210.
 function WorkspaceSelector({ sessionId }: { sessionId: string }) {
-  const path = useSessionWorkspaceStore((s) => s.pathBySession[sessionId]);
+  const workspace = useSessionWorkspaceStore((s) => s.bySession[sessionId]);
   const load = useSessionWorkspaceStore((s) => s.load);
   const setWorkspace = useSessionWorkspaceStore((s) => s.set);
+  const path = workspace?.path;
+  const branch = workspace?.gitBranch ?? null;
 
   useEffect(() => {
     void load(sessionId);
@@ -266,6 +268,9 @@ function WorkspaceSelector({ sessionId }: { sessionId: string }) {
       <Folder className="size-3.5 shrink-0" />
       <span className="min-w-0 flex-1 truncate" title={path ?? undefined}>
         {path ? basename(path) : "Loading…"}
+        {branch ? (
+          <span className="text-muted-foreground/70"> - {branch}</span>
+        ) : null}
       </span>
       <Button
         variant="ghost"

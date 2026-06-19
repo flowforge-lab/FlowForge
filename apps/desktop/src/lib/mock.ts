@@ -13,6 +13,7 @@ import type {
   SearchConfig,
   SearchBackend,
   Session,
+  SessionWorkspace,
   TokenEvent,
   ReasoningEvent,
   TurnDoneEvent,
@@ -443,8 +444,12 @@ export class MockIpc implements FfIpc {
     return { ...forked };
   }
 
-  async getSessionWorkspace(sessionId: string): Promise<string> {
-    return this.workspaces.get(sessionId) ?? this.defaultWorkspace;
+  async getSessionWorkspace(sessionId: string): Promise<SessionWorkspace> {
+    // The mock has no real filesystem, so it never resolves a git branch.
+    return {
+      path: this.workspaces.get(sessionId) ?? this.defaultWorkspace,
+      gitBranch: null,
+    };
   }
 
   async setSessionWorkspace(sessionId: string, path: string): Promise<string> {

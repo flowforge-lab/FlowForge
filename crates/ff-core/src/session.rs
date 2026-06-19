@@ -32,6 +32,18 @@ pub struct Session {
     pub updated_at: i64,
 }
 
+/// A session's working directory as surfaced to the frontend selector (#200,
+/// #211). `path` is the absolute, symlink-resolved cwd; `git_branch` is the
+/// repo's current branch when the cwd is a git working tree (`None` otherwise,
+/// e.g. not a repo or detached HEAD), so the selector can render `repo - branch`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "../../../apps/desktop/src/bindings/")]
+pub struct SessionWorkspace {
+    pub path: String,
+    pub git_branch: Option<String>,
+}
+
 /// Words skipped at the start of a prompt before extracting a title: pronouns,
 /// articles, modals, question stems, and proxy verbs that precede the real
 /// subject ("understand how X" -> skip to X). Kept in sync with the frontend's
