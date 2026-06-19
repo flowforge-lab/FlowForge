@@ -16,8 +16,9 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 notify = "7"
 ts-rs = { workspace = true }
 reqwest = { workspace = true, features = ["blocking", "json", "rustls-tls"] }
+sha2 = "0.10"
+tempfile = { workspace = true }
 
 [dev-dependencies]
-tempfile = { workspace = true }
 wiremock = { workspace = true }
 tokio = { workspace = true }

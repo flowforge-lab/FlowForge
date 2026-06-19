@@ -18,12 +18,14 @@
 //! Reads are **lenient**: a missing file is "nothing recorded yet" (empty), never
 //! an error, so callers never need a try/catch around a fresh install.
 
+pub mod consolidate;
 mod embed;
 mod error;
 pub mod flush;
 pub mod index;
 pub mod watch;
 
+pub use consolidate::{chunk_key, RecencyFrequencySalience, Salience};
 pub use embed::{Embedder, NoopEmbedder, OpenAiEmbedder};
 pub use error::{MemoryError, Result};
 pub use flush::{FlushLedger, FlushRecord};
@@ -275,6 +277,66 @@ impl Memory {
                 source,
             })?;
         Ok(path)
+    }
+
+    /// The memory config.
+    pub fn config(&self) -> &MemoryConfig {
+        &self.config
+    }
+
+    /// Atomically rewrite the curated `MEMORY.md` with new content.
+    ///
+    /// **Invariant**: this is the sole *full-file rewrite* path for curated
+    /// Markdown. Only the consolidation pass calls this. The normal capture
+    /// path (`Memory::write` with `WriteTarget::Curated`) still appends — that
+    /// is expected. Decay/dormancy (M6) never touches Markdown (RFC 0007 §7).
+    ///
+    /// Uses write-to-temp + atomic rename so a crash mid-write never corrupts
+    /// the curated file. The temp file is created in the same directory as
+    /// `MEMORY.md` to guarantee same-filesystem rename semantics.
+    pub fn rewrite_curated(&self, content: &str) -> Result<()> {
+        use std::io::Write as _;
+        let curated = self.curated_path();
+        if let Some(parent) = curated.parent() {
+            std::fs::create_dir_all(parent).map_err(|source| MemoryError::Io {
+                path: parent.to_path_buf(),
+                source,
+            })?;
+        }
+        // Temp file in the same dir — same filesystem guarantees atomic rename.
+        let dir = curated
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."));
+        let mut tmp = tempfile::NamedTempFile::new_in(dir).map_err(|source| MemoryError::Io {
+            path: dir.to_path_buf(),
+            source,
+        })?;
+        tmp.write_all(content.as_bytes())
+            .map_err(|source| MemoryError::Io {
+                path: tmp.path().to_path_buf(),
+                source,
+            })?;
+        tmp.flush().map_err(|source| MemoryError::Io {
+            path: tmp.path().to_path_buf(),
+            source,
+        })?;
+        // persist() does an atomic rename on Unix; on Windows it falls back to
+        // a non-atomic overwrite, which is acceptable for a desktop app.
+        tmp.persist(&curated).map_err(|e| MemoryError::Io {
+            path: curated.clone(),
+            source: e.error,
+        })?;
+        Ok(())
+    }
+
+    /// Whether the curated file exceeds the injection budget, indicating that
+    /// consolidation should run. Includes a 10% hysteresis band to avoid
+    /// flip-flopping right at the boundary.
+    pub fn needs_consolidation(&self) -> bool {
+        let curated = self.curated_path();
+        let size = std::fs::metadata(&curated).map(|m| m.len()).unwrap_or(0) as usize;
+        // Trigger at 110% of budget (hysteresis)
+        size > self.config.injection_budget_bytes + self.config.injection_budget_bytes / 10
     }
 
     /// Chunk every memory file (curated + all daily logs) — the input to a full
@@ -906,5 +968,80 @@ mod tests {
         assert_eq!(cfg.injection_budget_bytes, 4096);
         assert!(!cfg.embeddings.enabled);
         assert_eq!(cfg.embeddings.provider, EmbeddingProvider::Local);
+    }
+
+    // --- rewrite_curated tests (P1, #223) ---
+
+    #[test]
+    fn rewrite_curated_creates_file_from_scratch() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = mem(dir.path());
+        m.rewrite_curated("# Fresh\nNew curated content\n").unwrap();
+        let content = std::fs::read_to_string(m.curated_path()).unwrap();
+        assert_eq!(content, "# Fresh\nNew curated content\n");
+    }
+
+    #[test]
+    fn rewrite_curated_replaces_existing_content_atomically() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = mem(dir.path());
+        // Write initial content via append path
+        m.write("old fact", WriteTarget::Curated).unwrap();
+        assert!(std::fs::read_to_string(m.curated_path())
+            .unwrap()
+            .contains("old fact"));
+        // Atomic rewrite replaces entirely
+        m.rewrite_curated("# Consolidated\nnew fact only\n")
+            .unwrap();
+        let content = std::fs::read_to_string(m.curated_path()).unwrap();
+        assert!(!content.contains("old fact"));
+        assert!(content.contains("new fact only"));
+    }
+
+    #[test]
+    fn rewrite_curated_no_partial_write_on_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = mem(dir.path());
+        m.rewrite_curated("").unwrap();
+        let content = std::fs::read_to_string(m.curated_path()).unwrap();
+        assert_eq!(content, "");
+    }
+
+    #[test]
+    fn needs_consolidation_false_when_under_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = Memory::new(
+            dir.path(),
+            MemoryConfig {
+                injection_budget_bytes: 1000,
+                ..Default::default()
+            },
+        );
+        // No file -> no consolidation needed
+        assert!(!m.needs_consolidation());
+        // Small file -> still no
+        m.rewrite_curated("small").unwrap();
+        assert!(!m.needs_consolidation());
+    }
+
+    #[test]
+    fn needs_consolidation_true_when_over_budget_with_hysteresis() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = Memory::new(
+            dir.path(),
+            MemoryConfig {
+                injection_budget_bytes: 100,
+                ..Default::default()
+            },
+        );
+        // Exactly at budget (100 bytes) -> no (hysteresis = 110%)
+        m.rewrite_curated(&"x".repeat(100)).unwrap();
+        assert!(!m.needs_consolidation());
+        // At 110 bytes -> no (need to exceed 110)
+        m.rewrite_curated(&"x".repeat(110)).unwrap();
+        assert!(!m.needs_consolidation());
+        // At 111 bytes -> yes
+        m.rewrite_curated(&"x".repeat(111)).unwrap();
+        assert!(m.needs_consolidation());
     }
 }
