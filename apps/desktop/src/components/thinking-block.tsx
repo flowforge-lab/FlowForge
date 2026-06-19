@@ -2,20 +2,10 @@ import { useState } from "react";
 import { ChevronRight, Loader2 } from "lucide-react";
 import { cn } from "@/lib/utils";
 
-/** Default fold: open while reasoning-only is streaming; collapsed once answer text
- *  appears or the turn settles. A manual toggle wins until the turn ends. */
-export function resolveThinkingOpen({
-  userOpen,
-  streaming,
-  hasAnswer,
-}: {
-  userOpen: boolean | null;
-  streaming: boolean;
-  hasAnswer: boolean;
-}): boolean {
-  if (userOpen !== null) return userOpen;
-  if (streaming && !hasAnswer) return true;
-  return false;
+/** Fold state for the Thinking block (#205): collapsed by default — even mid-stream —
+ *  so a turn stays compact. A manual toggle (`userOpen`) wins for the rest of the turn. */
+export function resolveThinkingOpen(userOpen: boolean | null): boolean {
+  return userOpen ?? false;
 }
 
 /** Collapsible reasoning/thinking stream above the assistant answer (#181). */
@@ -29,12 +19,12 @@ export function ThinkingBlock({
   hasAnswer: boolean;
 }) {
   const [userOpen, setUserOpen] = useState<boolean | null>(null);
-  const open = resolveThinkingOpen({ userOpen, streaming, hasAnswer });
+  const open = resolveThinkingOpen(userOpen);
 
   if (!reasoning) return null;
 
   return (
-    <div className="w-full max-w-[80%] font-mono text-xs">
+    <div className="w-full font-mono text-xs">
       <button
         type="button"
         aria-expanded={open}
