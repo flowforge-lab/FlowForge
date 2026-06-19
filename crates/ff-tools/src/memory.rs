@@ -116,10 +116,16 @@ impl Tool for MemorySearchTool {
             .map(|n| (n as usize).clamp(1, MAX_SEARCH_LIMIT))
             .unwrap_or(DEFAULT_SEARCH_LIMIT);
 
-        match self.index.search(query, limit) {
-            Ok(hits) if hits.is_empty() => ToolOutcome::ok("No matching memory."),
-            Ok(hits) => ToolOutcome::ok(format_hits(&self.memory, &hits)),
-            Err(e) => ToolOutcome::error(format!("memory search failed: {e}")),
+        // The hybrid index may make a blocking embedding HTTP call inside `search`;
+        // run it off the async worker so a slow/unreachable embedder never parks a
+        // runtime thread (it still degrades to BM25 internally on failure).
+        let index = self.index.clone();
+        let query = query.to_string();
+        match tokio::task::spawn_blocking(move || index.search(&query, limit)).await {
+            Ok(Ok(hits)) if hits.is_empty() => ToolOutcome::ok("No matching memory."),
+            Ok(Ok(hits)) => ToolOutcome::ok(format_hits(&self.memory, &hits)),
+            Ok(Err(e)) => ToolOutcome::error(format!("memory search failed: {e}")),
+            Err(e) => ToolOutcome::error(format!("memory search task failed: {e}")),
         }
     }
 }
@@ -281,22 +287,36 @@ impl Tool for MemoryWriteTool {
         };
         let full = self.memory.get(&path, None, None);
         let chunks = chunk_markdown(&full, source, &path);
-        if let Err(e) = self.index.reindex_path(&path, &chunks) {
-            return ToolOutcome::ok(format!(
+
+        // The hybrid index may make a blocking embedding HTTP call inside
+        // `reindex_path`; run it off the async worker (mirrors `memory_search`)
+        // so `reqwest::blocking` never drops its runtime in async context, which
+        // would panic the turn task. It still degrades to BM25 internally on
+        // embed failure.
+        let index = self.index.clone();
+        let path2 = path.clone();
+        match tokio::task::spawn_blocking(move || index.reindex_path(&path2, &chunks)).await {
+            Ok(Ok(())) => ToolOutcome::ok(format!("Wrote to {}", rel_path(&self.memory, &path))),
+            Ok(Err(e)) => ToolOutcome::ok(format!(
                 "Wrote to {} (warning: reindex failed: {e})",
                 rel_path(&self.memory, &path)
-            ));
+            )),
+            Err(e) => ToolOutcome::ok(format!(
+                "Wrote to {} (warning: reindex task failed: {e})",
+                rel_path(&self.memory, &path)
+            )),
         }
-        ToolOutcome::ok(format!("Wrote to {}", rel_path(&self.memory, &path)))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ff_memory::{Fts5Index, MemoryConfig};
+    use ff_memory::{Fts5Index, HybridIndex, MemoryConfig, OpenAiEmbedder};
     use std::sync::Arc;
     use tempfile::TempDir;
+    use wiremock::matchers::{method, path as wm_path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn setup() -> (TempDir, Arc<Memory>, Arc<dyn MemoryIndex>) {
         let dir = TempDir::new().unwrap();
@@ -481,5 +501,74 @@ mod tests {
         assert_eq!(search.safety(&empty), Safety::ReadOnly);
         assert_eq!(get.safety(&empty), Safety::ReadOnly);
         assert_eq!(write.safety(&empty), Safety::Write);
+    }
+
+    // Regression for the M5.3.1 review (#215): `MemoryWriteTool::run` is async and
+    // must run the (blocking) hybrid reindex off the async worker. With embeddings
+    // enabled, `reindex_path` -> `embed_chunk` -> `reqwest::blocking`; invoking that
+    // directly on a tokio worker drops reqwest's internal runtime in async context
+    // and panics the turn. Driving the real async call site here (embed runs ON a
+    // tokio worker, not via an off-runtime thread) would panic before the fix and
+    // succeeds after it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn write_with_hybrid_embedder_does_not_panic_on_async_worker() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(wm_path("/v1/embeddings"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [{ "embedding": [0.1f32, 0.2, 0.3] }]
+            })))
+            .mount(&server)
+            .await;
+
+        let dir = TempDir::new().unwrap();
+        let memory = Arc::new(Memory::new(
+            dir.path().to_path_buf(),
+            MemoryConfig::default(),
+        ));
+        // Build the embedder off the async worker, exactly like production
+        // (`build_memory` runs before Tauri enters its runtime): `reqwest::blocking`
+        // spins up and drops a temporary runtime during construction, which itself
+        // panics inside an async context.
+        let uri = server.uri();
+        let index: Arc<dyn MemoryIndex> = tokio::task::spawn_blocking(move || {
+            let embedder = OpenAiEmbedder::new(format!("{uri}/v1"), "test-embed", None);
+            Arc::new(HybridIndex::new(
+                Fts5Index::open_in_memory().unwrap(),
+                embedder,
+            )) as Arc<dyn MemoryIndex>
+        })
+        .await
+        .unwrap();
+
+        let write = MemoryWriteTool::new(memory.clone(), index.clone());
+        let out = write
+            .run(
+                serde_json::json!({
+                    "text": "## Embeddings\nlocal vector recall is on for this write.",
+                    "target": "curated"
+                }),
+                Path::new("."),
+            )
+            .await;
+
+        assert!(out.success, "{}", out.content);
+        assert!(out.content.contains("MEMORY.md"), "{}", out.content);
+        assert!(
+            !out.content.contains("reindex task failed"),
+            "{}",
+            out.content
+        );
+
+        // The embedded chunk is searchable (also off the worker), proving the
+        // hybrid path ran end-to-end without panicking.
+        let search = MemorySearchTool::new(memory.clone(), index.clone());
+        let hit = search
+            .run(
+                serde_json::json!({"query": "vector recall"}),
+                Path::new("."),
+            )
+            .await;
+        assert!(hit.success, "{}", hit.content);
     }
 }

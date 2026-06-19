@@ -14,7 +14,8 @@ use ff_llm::{OllamaProvider, OpenAiProvider, Provider};
 use ff_mcp::{McpConfigWatcher, SupervisorHandle};
 use ff_memory::watch::MemoryWatcher;
 use ff_memory::{
-    FlushLedger, Fts5Index, HybridIndex, Memory, MemoryConfig, MemoryIndex, NoopEmbedder,
+    EmbeddingProvider, FlushLedger, Fts5Index, HybridIndex, Memory, MemoryConfig, MemoryIndex,
+    NoopEmbedder, OpenAiEmbedder,
 };
 use ff_session::SessionStore;
 use ff_signals::{SignalStore, SkillAggregate, SkillCompleted};
@@ -969,16 +970,79 @@ fn now_ms() -> i64 {
 /// Build the durable-memory store, its recall index, and a debounced reindex
 /// watcher (RFC 0006). Best-effort: the index is a derived cache, so if it can't
 /// open on disk we fall back to an in-memory index, and if even that fails the
+/// Memory config sourced from the environment. Persisted Settings (the Memory
+/// pane, issue #131) is not wired yet, so until it lands semantic recall is opt-in
+/// via `FF_MEMORY_EMBEDDINGS=1` (truthy). Everything else keeps `MemoryConfig`
+/// defaults: memory on, embeddings off -> pure FTS5/BM25.
+fn memory_config_from_env() -> MemoryConfig {
+    let mut config = MemoryConfig::default();
+    if env_flag("FF_MEMORY_EMBEDDINGS") {
+        config.embeddings.enabled = true;
+        config.embeddings.provider = EmbeddingProvider::Local;
+    }
+    config
+}
+
+/// The `(base_url, model, api_key)` for a local embedder, or `None` to stay on the
+/// BM25 floor. Returns `Some` only when embeddings are enabled, the provider is
+/// `Local`, and a model is configured (`FF_MEMORY_EMBEDDINGS_MODEL`) -- an
+/// embedding endpoint needs a real embedding model, so without one we log once and
+/// fall back rather than spamming a chat-only server. Base URL defaults to the
+/// local candle-vLLM endpoint; the API key is reserved for the M5.3.2 cloud path.
+fn local_embedder_from_env(config: &MemoryConfig) -> Option<(String, String, Option<String>)> {
+    if !config.embeddings.enabled || config.embeddings.provider != EmbeddingProvider::Local {
+        return None;
+    }
+    let model = std::env::var("FF_MEMORY_EMBEDDINGS_MODEL")
+        .ok()
+        .filter(|m| !m.trim().is_empty());
+    let Some(model) = model else {
+        tracing::warn!(
+            "memory embeddings enabled but FF_MEMORY_EMBEDDINGS_MODEL is unset; staying on BM25"
+        );
+        return None;
+    };
+    let base = std::env::var("FF_MEMORY_EMBEDDINGS_BASE_URL")
+        .ok()
+        .filter(|u| !u.trim().is_empty())
+        .unwrap_or_else(|| "http://localhost:8000/v1".to_string());
+    let key = std::env::var("FF_MEMORY_EMBEDDINGS_API_KEY")
+        .ok()
+        .filter(|k| !k.trim().is_empty());
+    tracing::info!(base_url = %base, model = %model, "memory semantic recall enabled (local embedder)");
+    Some((base, model, key))
+}
+
+fn env_flag(name: &str) -> bool {
+    std::env::var(name)
+        .map(|v| {
+            let v = v.trim();
+            v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes")
+        })
+        .unwrap_or(false)
+}
+
 /// `memory_*` tools degrade to no-ops rather than failing app start. The initial
 /// full reindex happens here (not in the watcher) so a build error is logged once.
 fn build_memory() -> (Arc<Memory>, Arc<dyn MemoryIndex>, Option<MemoryWatcher>) {
-    let memory = Arc::new(Memory::with_default_root(MemoryConfig::default()));
+    let config = memory_config_from_env();
+    let embedder = local_embedder_from_env(&config);
+    let memory = Arc::new(Memory::with_default_root(config));
+    let wrap = |i: Fts5Index| -> Arc<dyn MemoryIndex> {
+        match &embedder {
+            Some((base, model, key)) => Arc::new(HybridIndex::new(
+                i,
+                OpenAiEmbedder::new(base, model.clone(), key.clone()),
+            )),
+            None => Arc::new(HybridIndex::new(i, NoopEmbedder)),
+        }
+    };
     let index: Arc<dyn MemoryIndex> = match Fts5Index::open(memory.index_path()) {
-        Ok(i) => Arc::new(HybridIndex::new(i, NoopEmbedder)),
+        Ok(i) => wrap(i),
         Err(e) => {
             tracing::warn!(error = %e, "memory index unavailable on disk; using in-memory");
             match Fts5Index::open_in_memory() {
-                Ok(i) => Arc::new(HybridIndex::new(i, NoopEmbedder)),
+                Ok(i) => wrap(i),
                 Err(e) => {
                     tracing::warn!(error = %e, "memory index unavailable; recall disabled");
                     return (memory, Arc::new(NullIndex), None);
