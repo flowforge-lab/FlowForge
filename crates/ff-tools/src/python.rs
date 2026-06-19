@@ -63,12 +63,32 @@ impl PythonTool {
         Duration::from_secs(secs)
     }
 
-    /// Pick the interpreter: prefer the nearest project virtualenv
-    /// (`.venv/bin/python`, then `venv/bin/python`) found by walking up from the
-    /// working dir, so the agent runs with the project's dependencies even when it
-    /// is invoked from a subdir of a monorepo whose `.venv` lives at the root.
-    /// Falls back to `python3` on PATH when no virtualenv is found.
+    /// Pick the interpreter, in order of signal strength:
+    /// 1. an **activated** virtualenv (`$VIRTUAL_ENV/bin/python`) -- the explicit
+    ///    intent of the launching shell (typically the CLI), which a working-dir
+    ///    walk would never find;
+    /// 2. the **nearest project** virtualenv (`.venv/bin/python`, then
+    ///    `venv/bin/python`) walking up from the working dir, so the agent runs
+    ///    with the project's deps even when invoked from a subdir of a monorepo
+    ///    whose `.venv` lives at the root (the GUI case, where no env is inherited);
+    /// 3. `python3` on PATH.
+    ///
+    /// Central-cache layouts (poetry/pipenv defaults, conda named envs) are not
+    /// probed -- discovering those means invoking the tool, which is out of scope
+    /// for a stateless snippet runner; they resolve via `python3`/PATH instead.
     fn interpreter(dir: &Path) -> PathBuf {
+        Self::interpreter_with(std::env::var("VIRTUAL_ENV").ok(), dir)
+    }
+
+    /// Interpreter selection with `$VIRTUAL_ENV` injected, so the precedence is
+    /// testable without mutating process-global environment state.
+    fn interpreter_with(virtual_env: Option<String>, dir: &Path) -> PathBuf {
+        if let Some(ve) = virtual_env.filter(|v| !v.trim().is_empty()) {
+            let candidate = Path::new(&ve).join("bin").join("python");
+            if candidate.is_file() {
+                return candidate;
+            }
+        }
         for ancestor in dir.ancestors() {
             for venv in [".venv/bin/python", "venv/bin/python"] {
                 let candidate = ancestor.join(venv);
@@ -349,7 +369,10 @@ mod tests {
         std::fs::write(root.join(".venv/bin/python"), "").unwrap();
         let sub = root.join("packages/app/src");
         std::fs::create_dir_all(&sub).unwrap();
-        assert_eq!(PythonTool::interpreter(&sub), root.join(".venv/bin/python"));
+        assert_eq!(
+            PythonTool::interpreter_with(None, &sub),
+            root.join(".venv/bin/python")
+        );
     }
 
     #[test]
@@ -362,15 +385,53 @@ mod tests {
         std::fs::create_dir_all(sub.join(".venv/bin")).unwrap();
         std::fs::write(sub.join(".venv/bin/python"), "").unwrap();
         // The subdir's own venv wins over the root's.
-        assert_eq!(PythonTool::interpreter(&sub), sub.join(".venv/bin/python"));
+        assert_eq!(
+            PythonTool::interpreter_with(None, &sub),
+            sub.join(".venv/bin/python")
+        );
     }
 
     #[test]
     fn interpreter_falls_back_to_path_python3_without_any_venv() {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(
-            PythonTool::interpreter(dir.path()),
+            PythonTool::interpreter_with(None, dir.path()),
             PathBuf::from("python3")
         );
+    }
+
+    #[test]
+    fn interpreter_prefers_an_activated_virtual_env_over_a_project_venv() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        // A project .venv in the working dir...
+        std::fs::create_dir_all(root.join(".venv/bin")).unwrap();
+        std::fs::write(root.join(".venv/bin/python"), "").unwrap();
+        // ...is still beaten by an activated $VIRTUAL_ENV elsewhere.
+        let active = root.join("active-env");
+        std::fs::create_dir_all(active.join("bin")).unwrap();
+        std::fs::write(active.join("bin/python"), "").unwrap();
+        assert_eq!(
+            PythonTool::interpreter_with(Some(active.to_string_lossy().into_owned()), root),
+            active.join("bin/python")
+        );
+    }
+
+    #[test]
+    fn interpreter_ignores_a_stale_or_empty_virtual_env_and_walks_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join(".venv/bin")).unwrap();
+        std::fs::write(root.join(".venv/bin/python"), "").unwrap();
+        // $VIRTUAL_ENV set but empty or pointing nowhere real -> ignored, walk-up wins.
+        for stale in [
+            String::new(),
+            root.join("gone").to_string_lossy().into_owned(),
+        ] {
+            assert_eq!(
+                PythonTool::interpreter_with(Some(stale), root),
+                root.join(".venv/bin/python")
+            );
+        }
     }
 }
