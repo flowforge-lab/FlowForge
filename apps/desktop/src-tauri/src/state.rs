@@ -1050,7 +1050,19 @@ fn build_memory() -> (Arc<Memory>, Arc<dyn MemoryIndex>, Option<MemoryWatcher>) 
             }
         }
     };
-    if let Err(e) = index.reindex(&memory.all_chunks()) {
+    let chunks = memory.all_chunks();
+    if embedder.is_some() {
+        // With embeddings on, the full reindex is a serial blocking-HTTP loop
+        // (one embed call per chunk), so doing it inline would stall app launch
+        // on the embedding server. Run it off the startup path: recall stays
+        // available from the persisted on-disk FTS index and embeddings backfill
+        // shortly after (PR #215 review, nit 1).
+        let bg = index.clone();
+        std::thread::spawn(move || match bg.reindex(&chunks) {
+            Ok(()) => tracing::info!("memory embeddings reindex complete"),
+            Err(e) => tracing::warn!(error = %e, "background memory reindex failed"),
+        });
+    } else if let Err(e) = index.reindex(&chunks) {
         tracing::warn!(error = %e, "initial memory reindex failed");
     }
     let watcher = MemoryWatcher::spawn(memory.clone(), index.clone())
