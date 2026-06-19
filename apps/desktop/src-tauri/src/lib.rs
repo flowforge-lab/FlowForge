@@ -18,7 +18,7 @@ use ff_core::events::{
 use ff_core::{
     McpServerConfig, McpServerStatus, MemoryFileInfo, MemoryFileKind, MemoryOverview, Message,
     Phenotype, ProviderConfig, ProviderConnection, ProviderKind, ProviderRegistry, Role,
-    SearchConfig, Session, Skill, SkillInfo, SkillManifest,
+    SearchConfig, Session, SessionWorkspace, Skill, SkillInfo, SkillManifest,
 };
 use ff_signals::SkillAggregate;
 use ff_tools::Safety;
@@ -178,10 +178,27 @@ fn fork_session(state: State<'_, Arc<AppState>>, session_id: String) -> Result<S
 }
 
 /// The working directory a session's tools run in (slice 3b, issue #200).
-/// Returns the session's chosen workspace, or the global default when unset.
+/// Returns the session's chosen workspace (or the global default when unset)
+/// together with its current git branch when the cwd is a repo (#211).
 #[tauri::command]
-fn get_session_workspace(state: State<'_, Arc<AppState>>, session_id: String) -> String {
-    state.session_root(&session_id).display().to_string()
+fn get_session_workspace(state: State<'_, Arc<AppState>>, session_id: String) -> SessionWorkspace {
+    let root = state.session_root(&session_id);
+    SessionWorkspace {
+        git_branch: git_branch(&root),
+        path: root.display().to_string(),
+    }
+}
+
+/// The current git branch of `dir`, or `None` when it is not a git working tree
+/// (no `.git/HEAD`) or is in detached HEAD. Reads `.git/HEAD` directly -- cheaper
+/// than spawning `git` and dependency-free; `ref: refs/heads/<name>` yields the
+/// branch, a bare commit SHA (detached) yields `None`. Extracted as a free fn so
+/// it is unit-testable without a Tauri `State`.
+fn git_branch(dir: &std::path::Path) -> Option<String> {
+    let head = std::fs::read_to_string(dir.join(".git").join("HEAD")).ok()?;
+    head.trim()
+        .strip_prefix("ref: refs/heads/")
+        .map(str::to_string)
 }
 
 /// Set a session's working directory. Validates that `path` exists and is a
@@ -1113,7 +1130,7 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_workspace_dir;
+    use super::{git_branch, resolve_workspace_dir};
 
     #[test]
     fn resolve_workspace_dir_accepts_existing_directory() {
@@ -1139,5 +1156,32 @@ mod tests {
         std::fs::write(&file, "x").unwrap();
         let err = resolve_workspace_dir(file.to_str().unwrap()).unwrap_err();
         assert!(err.contains("not a directory"));
+    }
+
+    #[test]
+    fn git_branch_reads_symbolic_ref() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        std::fs::write(dir.path().join(".git/HEAD"), "ref: refs/heads/feature/x\n").unwrap();
+        assert_eq!(git_branch(dir.path()), Some("feature/x".to_string()));
+    }
+
+    #[test]
+    fn git_branch_is_none_for_detached_head() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        // Detached HEAD stores a bare commit SHA, not a `ref:` line.
+        std::fs::write(
+            dir.path().join(".git/HEAD"),
+            "0123456789abcdef0123456789abcdef01234567\n",
+        )
+        .unwrap();
+        assert_eq!(git_branch(dir.path()), None);
+    }
+
+    #[test]
+    fn git_branch_is_none_when_not_a_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(git_branch(dir.path()), None);
     }
 }

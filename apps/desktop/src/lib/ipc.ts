@@ -18,6 +18,7 @@ import type {
   SearchConfig,
   SearchBackend,
   Session,
+  SessionWorkspace,
   TokenEvent,
   ReasoningEvent,
   TurnDoneEvent,
@@ -57,9 +58,10 @@ export interface FfIpc {
   /** Permanently remove a session and its transcript. Destructive; pairs with the
    *  sidebar Delete action. Distinct from the FE-only reversible dismiss (#170). */
   deleteSession(sessionId: string): Promise<void>;
-  /** The working directory a session's tools run in (slice 3b, #200). Returns the
-   *  session's chosen workspace, or the global default when unset. */
-  getSessionWorkspace(sessionId: string): Promise<string>;
+  /** The working directory a session's tools run in (slice 3b, #200) with its
+   *  git branch when the cwd is a repo (#211). Returns the session's chosen
+   *  workspace, or the global default when unset. */
+  getSessionWorkspace(sessionId: string): Promise<SessionWorkspace>;
   /** Set a session's working directory. Backend validates the path is an existing
    *  directory and returns the canonical path to display; rejects otherwise. */
   setSessionWorkspace(sessionId: string, path: string): Promise<string>;
@@ -303,7 +305,7 @@ class TauriIpc implements FfIpc {
   deleteSession = (sessionId: string) =>
     this.invoke<void>("delete_session", { sessionId });
   getSessionWorkspace = (sessionId: string) =>
-    this.invoke<string>("get_session_workspace", { sessionId });
+    this.invoke<SessionWorkspace>("get_session_workspace", { sessionId });
   setSessionWorkspace = (sessionId: string, path: string) =>
     this.invoke<string>("set_session_workspace", { sessionId, path });
   sendMessage = (sessionId: string, content: string) =>
