@@ -18,19 +18,22 @@
 //! Reads are **lenient**: a missing file is "nothing recorded yet" (empty), never
 //! an error, so callers never need a try/catch around a fresh install.
 
+mod embed;
 mod error;
 pub mod flush;
 pub mod index;
 pub mod watch;
 
+pub use embed::{Embedder, NoopEmbedder};
 pub use error::{MemoryError, Result};
 pub use flush::{FlushLedger, FlushRecord};
-pub use index::{Fts5Index, MemoryIndex, ScoredChunk};
+pub use index::{Fts5Index, HybridIndex, MemoryIndex, ScoredChunk};
 
 use std::path::{Path, PathBuf};
 
 use chrono::{Local, NaiveDate};
 use serde::{Deserialize, Serialize};
+use ts_rs::TS;
 
 /// Where a chunk came from (RFC 0006 §4).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -97,7 +100,14 @@ pub struct MemoryChunk {
 
 /// Memory behaviour knobs. Defaults make memory on with a small ambient budget;
 /// `enabled = false` is the full disable path (RFC 0006 §8).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+///
+/// Note (M5.3.x persistence): `rename_all = "camelCase"` is safe today because
+/// this is only ever built via `Default` and never deserialized from disk. When
+/// on-disk persistence lands, keep the file camelCase too (or add an explicit
+/// migration) so a snake_case settings file isn't silently reintroduced.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "../../../apps/desktop/src/bindings/")]
 pub struct MemoryConfig {
     #[serde(default = "default_enabled")]
     pub enabled: bool,
@@ -105,7 +115,37 @@ pub struct MemoryConfig {
     /// stand-in for a token budget). The curated file is truncated to a
     /// line-boundary head past this, with a pointer to `memory_search`.
     #[serde(default = "default_budget")]
+    #[ts(type = "number")]
     pub injection_budget_bytes: usize,
+    /// Hybrid (semantic) recall settings (M5.3). Off by default: recall stays
+    /// pure FTS5/BM25 until a user opts in and an embedder is wired.
+    #[serde(default)]
+    pub embeddings: EmbeddingsConfig,
+}
+
+/// Hybrid recall configuration (RFC 0006, M5.3). When `enabled = false`
+/// (the default) recall is byte-identical to the FTS5/BM25 path.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "../../../apps/desktop/src/bindings/")]
+pub struct EmbeddingsConfig {
+    /// Opt in to semantic recall. Off keeps the FTS-only behaviour.
+    pub enabled: bool,
+    /// Which embedder backs semantic recall when `enabled`.
+    pub provider: EmbeddingProvider,
+}
+
+/// Where chunk embeddings come from (M5.3). `Local` is the default on-device
+/// path; `Cloud` is reserved for the M5.3.2 hosted embedder.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "../../../apps/desktop/src/bindings/")]
+pub enum EmbeddingProvider {
+    /// On-device embedder (default).
+    #[default]
+    Local,
+    /// Hosted embedder (reserved for M5.3.2).
+    Cloud,
 }
 
 fn default_enabled() -> bool {
@@ -120,6 +160,7 @@ impl Default for MemoryConfig {
         Self {
             enabled: default_enabled(),
             injection_budget_bytes: default_budget(),
+            embeddings: EmbeddingsConfig::default(),
         }
     }
 }
@@ -666,6 +707,7 @@ mod tests {
             MemoryConfig {
                 enabled: true,
                 injection_budget_bytes: 40,
+                ..Default::default()
             },
         );
         let body = (0..20)
@@ -724,5 +766,14 @@ mod tests {
     fn chunk_markdown_empty_input_yields_no_chunks() {
         assert!(chunk_markdown("", MemorySource::Curated, Path::new("x.md")).is_empty());
         assert!(chunk_markdown("   \n  \n", MemorySource::Curated, Path::new("x.md")).is_empty());
+    }
+
+    #[test]
+    fn memory_config_default_keeps_embeddings_off() {
+        let cfg = MemoryConfig::default();
+        assert!(cfg.enabled);
+        assert_eq!(cfg.injection_budget_bytes, 4096);
+        assert!(!cfg.embeddings.enabled);
+        assert_eq!(cfg.embeddings.provider, EmbeddingProvider::Local);
     }
 }

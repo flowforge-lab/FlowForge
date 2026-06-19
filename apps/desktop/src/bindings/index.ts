@@ -39,3 +39,6 @@ export type { McpStatusChangedEvent } from "./McpStatusChangedEvent";
 export type { MemoryFileInfo } from "./MemoryFileInfo";
 export type { MemoryFileKind } from "./MemoryFileKind";
 export type { MemoryOverview } from "./MemoryOverview";
+export type { MemoryConfig } from "./MemoryConfig";
+export type { EmbeddingsConfig } from "./EmbeddingsConfig";
+export type { EmbeddingProvider } from "./EmbeddingProvider";
