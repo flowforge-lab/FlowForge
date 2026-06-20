@@ -89,6 +89,12 @@ pub struct Phenotype {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub persona: Option<String>,
+    /// Overrides the agent loop's tool-call iteration cap when set (#244 R3).
+    /// A coding phenotype that runs long edit/build/test/fix cycles raises this
+    /// above the default; unset falls back to [`ff_agent`'s default cap].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub max_iterations: Option<usize>,
 }
 
 #[cfg(test)]
@@ -162,6 +168,7 @@ mod tests {
             skills: vec!["rust-debugging".into()],
             model: Some("Qwen3-4B-Instruct-2507".into()),
             persona: None,
+            max_iterations: None,
         };
         let json = serde_json::to_string(&p).unwrap();
         assert_eq!(p, serde_json::from_str(&json).unwrap());

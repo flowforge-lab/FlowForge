@@ -41,6 +41,7 @@ pub fn default_phenotype() -> Phenotype {
         skills: Vec::new(),
         model: None,
         persona: None,
+        max_iterations: None,
     }
 }
 
@@ -56,6 +57,8 @@ struct PhenotypeFile {
     model: Option<String>,
     #[serde(default)]
     persona: Option<String>,
+    #[serde(default)]
+    max_iterations: Option<usize>,
 }
 
 impl PhenotypeFile {
@@ -65,6 +68,7 @@ impl PhenotypeFile {
             skills: self.skills,
             model: self.model,
             persona: self.persona,
+            max_iterations: self.max_iterations,
         }
     }
 }
@@ -149,6 +153,28 @@ mod tests {
         assert_eq!(p.skills, vec!["cargo-help", "clippy"]);
         assert_eq!(p.model.as_deref(), Some("qwen3-coder"));
         assert_eq!(p.persona.as_deref(), Some("You are a Rust expert."));
+    }
+
+    #[test]
+    fn loads_max_iterations_override() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "codon.toml",
+            "skills = []
+max_iterations = 40
+",
+        );
+        write(
+            dir.path(),
+            "plain.toml",
+            "skills = []
+",
+        );
+        let (map, errs) = load_phenotypes(dir.path());
+        assert!(errs.is_empty(), "{errs:?}");
+        assert_eq!(map["codon"].max_iterations, Some(40));
+        assert_eq!(map["plain"].max_iterations, None);
     }
 
     #[test]

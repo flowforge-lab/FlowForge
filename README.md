@@ -83,7 +83,7 @@ FlowForge is fully functional without NeuroForge. The integration unlocks a clos
 │                    Local Storage Layer                        │
 │  ┌──────────────┐  ┌──────────────┐  ┌──────────────────┐  │
 │  │   SQLite DB  │  │  ~/.flowforge│  │  Skills (MD +    │  │
-│  │ (sessions,   │  │  /memories/  │  │  YAML manifests) │  │
+│  │ (sessions,   │  │  /memory/    │  │  YAML manifests) │  │
 │  │  signals)    │  │  (flat files)│  │                  │  │
 │  └──────────────┘  └──────────────┘  └──────────────────┘  │
 └─────────────────────────────────────────────────────────────┘
@@ -105,7 +105,7 @@ FlowForge is fully functional without NeuroForge. The integration unlocks a clos
 | `ff-agent` | Agent loop (research → plan → implement → verify), tool dispatch |
 | `ff-llm` | Provider trait + implementations (candle-vllm, Bedrock, Anthropic) |
 | `ff-mcp` | MCP client & supervisor — health monitoring, auto-restart, env isolation |
-| `ff-memory` | SQLite persistence + vector embeddings (fastembed-rs) for semantic recall |
+| `ff-memory` | Markdown-owned durable memory (`MEMORY.md` + daily logs) + SQLite FTS5 recall; optional local embeddings + BM25 fusion ([RFC 0006](docs/rfcs/0006-memory.md)) |
 | `ff-signals` | Intention/outcome event emitter — lightweight signal bus for NeuroForge integration |
 | `ff-skills` | Skill discovery, YAML manifest parsing, hot-reload via filesystem watcher |
 | `ff-tools` | Built-in tools: bash, edit, view, web_fetch, glob, rg |
@@ -147,7 +147,7 @@ cargo tauri build
 - [x] **M2** — Tool calling (bash, view, edit) + streaming render + interactive approval
 - [x] **M3** — Skills + phenotypes + command palette
 - [x] **M4** — MCP host & supervisor — external tool servers (stdio/SSE), lifecycle + server-status UI
-- [ ] **M5** — Memory system — Markdown source-of-truth + local SQLite FTS5 recall (optional embeddings) ([RFC 0006](docs/rfcs/0006-memory.md))
+- [x] **M5** — Memory system — Markdown source-of-truth + local SQLite FTS5 recall (optional embeddings) ([RFC 0006](docs/rfcs/0006-memory.md))
 - [ ] **M6** — Cold-start optimization (<200ms)
 - [ ] **M7** — Workflow canvas (visual multi-agent DAGs)
 - [ ] **M8** — NeuroForge integration (intention signals + inline feedback)

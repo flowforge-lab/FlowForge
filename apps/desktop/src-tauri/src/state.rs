@@ -936,8 +936,8 @@ impl AppState {
     /// binding (set via [`set_session_phenotype`](Self::set_session_phenotype)) gets
     /// that phenotype; an unbound session — or one whose bound name no longer exists
     /// — inherits the global active phenotype. This is the single source of truth a
-    /// turn uses to derive persona / skills / model (and, once #244-R3 lands,
-    /// `max_iterations`), so two panes can run different Phenos simultaneously.
+    /// turn uses to derive persona / skills / model / `max_iterations`, so two
+    /// panes can run different Phenos simultaneously.
     pub fn session_phenotype(&self, session_id: &str) -> Phenotype {
         match self.store.session_phenotype(session_id) {
             Some(name) => resolve_phenotype(&name).unwrap_or_else(|| {
@@ -1557,6 +1557,7 @@ mod tests {
             skills: vec!["not-installed".into()],
             model: Some("qwen3-coder".into()),
             persona: Some("You are a Rust expert.".into()),
+            max_iterations: None,
         };
         state.apply_phenotype(pheno);
         assert!(state.active_skills().is_empty());
@@ -1579,6 +1580,7 @@ mod tests {
             skills: vec![],
             model: Some("m".into()),
             persona: Some("p".into()),
+            max_iterations: None,
         });
         state.apply_phenotype(default_phenotype());
         assert!(state.active_model_override().is_none());
@@ -1595,12 +1597,16 @@ mod tests {
             skills: vec![],
             model: Some("qwen3-coder".into()),
             persona: Some("You are a Rust expert.".into()),
+            max_iterations: Some(40),
         });
         let s = state.store.create_session(None);
         let resolved = state.session_phenotype(&s.id);
         assert_eq!(resolved.name, "rust");
         assert_eq!(resolved.model.as_deref(), Some("qwen3-coder"));
         assert_eq!(resolved.persona.as_deref(), Some("You are a Rust expert."));
+        // The per-session resolver carries the loop cap (#244-R3 x #246), so a bound
+        // pane can run a different iteration budget than the global default.
+        assert_eq!(resolved.max_iterations, Some(40));
     }
 
     #[test]
@@ -1625,6 +1631,7 @@ mod tests {
             skills: vec![],
             model: None,
             persona: None,
+            max_iterations: None,
         });
         let s = state.store.create_session(None);
         // Inject a dangling binding directly through the store (the validated

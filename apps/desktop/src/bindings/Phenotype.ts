@@ -20,4 +20,10 @@ model?: string,
 /**
  * Extra system-prompt preamble for this phenotype.
  */
-persona?: string, };
+persona?: string, 
+/**
+ * Overrides the agent loop's tool-call iteration cap when set (#244 R3).
+ * A coding phenotype that runs long edit/build/test/fix cycles raises this
+ * above the default; unset falls back to [`ff_agent`'s default cap].
+ */
+maxIterations?: number, };
