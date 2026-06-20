@@ -4,7 +4,7 @@
 - **Milestone:** _M3 (UX hardening)_
 - **Author:** tonytan4ever
 - **Depends on:** RFC 0001 (system-prompt §4 hook), #229 (approval gate), #240 (tool scoping / `allowed` filter), #244 (inner loop)
-- **Tracking issue:** _TBD (epic)_
+- **Tracking issue:** #268 (epic)
 
 ## 1. Summary & Goals
 
