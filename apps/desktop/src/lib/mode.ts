@@ -4,6 +4,15 @@
 
 import type { Mode } from "@/bindings";
 
+// Direct mode hotkeys (#267): ⌘P → Plan, ⌘T → Act, ⌘O → Auto. Kept here (React-free)
+// so the mapping is unit-testable and shared with the app-shell handler + registry.
+const MODE_HOTKEYS: Record<string, Mode> = { p: "plan", t: "act", o: "auto" };
+
+/** The mode a bare key (without the modifier) selects, or undefined for other keys. */
+export function modeForHotkey(key: string): Mode | undefined {
+  return MODE_HOTKEYS[key.toLowerCase()];
+}
+
 export interface ModeMeta {
   label: string;
   /** One-liner shown on hover / under the Settings control. */
