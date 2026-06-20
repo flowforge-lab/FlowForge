@@ -1,6 +1,7 @@
 import { AppearanceSection } from "@/components/settings/appearance-section";
 import { ControlSection } from "@/components/settings/control-section";
 import { McpSection } from "@/components/settings/mcp/mcp-section";
+import { MemorySection } from "@/components/settings/memory-section";
 import { ModelSection } from "@/components/settings/model-section";
 import { SkillsSection } from "@/components/settings/skills-section";
 import { ProfilesSection } from "@/components/settings/profiles-section";
@@ -32,6 +33,8 @@ export function SettingsSectionContent({ id }: { id: SettingsSectionId }) {
       return <ControlSection />;
     case "mcp":
       return <McpSection />;
+    case "memory":
+      return <MemorySection />;
     case "keyboard":
       return <KeyboardSection />;
     case "scheduled":

@@ -823,9 +823,21 @@ export class MockIpc implements FfIpc {
       name: "MEMORY.md",
       relPath: "MEMORY.md",
       kind: "curated",
-      sizeBytes: 64,
+      sizeBytes: 332,
       modifiedMs: 1_718_000_000_000,
-      body: "# Memory\n\nUser prefers concise answers and dark mode.\n",
+      // Canonical RFC 0008 headings (## Identity / ## Patterns / ## Focus) so the
+      // SET.8 category cards render meaningful demo content under VITE_FF_MOCK=1.
+      body: `# Memory
+
+## Identity
+Abid owns the React frontend; Tony owns the Rust backend. Prefers concise answers and dark mode.
+
+## Patterns
+One PR per issue, verified under the in-browser mock before pushing. Reuses existing Tailwind/shadcn primitives.
+
+## Focus
+Shipping the Settings redesign — currently the Memory browser (SET.8).
+`,
     },
     {
       name: "2026-06-18.md",

@@ -64,8 +64,11 @@ describe("section switching", () => {
     expect(about).toContain("View all keyboard shortcuts");
     expect(about).not.toContain("Coming soon.");
 
+    // Memory is built now (SET.8): renders its category cards, not <ComingSoon>.
     const memory = renderToStaticMarkup(<SettingsSectionContent id="memory" />);
-    expect(memory).toContain("Coming soon.");
-    expect(memory).toContain("Memory");
+    expect(memory).not.toContain("Coming soon.");
+    expect(memory).toContain("Identity");
+    expect(memory).toContain("Patterns");
+    expect(memory).toContain("Focus");
   });
 });
