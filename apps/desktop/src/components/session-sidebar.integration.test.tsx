@@ -3,12 +3,14 @@
 import { act } from "react";
 import type { ReactElement } from "react";
 import { createRoot, type Root } from "react-dom/client";
-import { render as rtlRender, screen } from "@testing-library/react";
+import { render as rtlRender, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { AppShell } from "@/components/app-shell";
 import { SessionSidebar } from "@/components/session-sidebar";
 import { useChatStore } from "@/store/chat";
+import { usePanesStore, leaves, MAX_PANES } from "@/store/panes";
+import type { SplitNode } from "@/store/panes";
 import { usePrefsStore } from "@/store/prefs";
 import { useSessionPrefsStore } from "@/store/session-prefs";
 import type { Session } from "@/bindings";
@@ -138,6 +140,45 @@ describe("SessionSidebar integration (#185)", () => {
     await user.keyboard("{Escape}");
 
     expect(screen.queryByLabelText("Filter sessions")).toBeNull();
+  });
+
+  it("the + button splits a new blank session into a right pane (#245 2a)", async () => {
+    usePanesStore.setState({ root: null, focusedPaneId: null });
+    usePanesStore.getState().init(["s1", "s2"], "s1");
+    expect(usePanesStore.getState().leafCount()).toBe(1);
+
+    const user = userEvent.setup();
+    rtlRender(<SessionSidebar />);
+    await user.click(screen.getByLabelText("New session"));
+
+    await waitFor(() => expect(usePanesStore.getState().leafCount()).toBe(2));
+    const root = usePanesStore.getState().root as SplitNode;
+    expect(root.type).toBe("split");
+    expect(root.dir).toBe("vertical");
+  });
+
+  it("the + button falls back to an in-pane swap at MAX_PANES (#245 2a)", async () => {
+    usePanesStore.setState({ root: null, focusedPaneId: null });
+    usePanesStore.getState().init(["s1"], "s1");
+    for (let i = 2; i <= MAX_PANES; i++) {
+      const target = usePanesStore.getState().focusedPaneId as string;
+      usePanesStore.getState().splitRight(target, `s${i}`);
+    }
+    expect(usePanesStore.getState().leafCount()).toBe(MAX_PANES);
+
+    const sessionId = (id: string) =>
+      leaves(usePanesStore.getState().root!).find((l) => l.id === id)
+        ?.sessionId;
+    const focusedPane = usePanesStore.getState().focusedPaneId as string;
+    const before = sessionId(focusedPane);
+
+    const user = userEvent.setup();
+    rtlRender(<SessionSidebar />);
+    await user.click(screen.getByLabelText("New session"));
+
+    // At the cap: no new pane — the focused pane swaps to the fresh session.
+    await waitFor(() => expect(sessionId(focusedPane)).not.toBe(before));
+    expect(usePanesStore.getState().leafCount()).toBe(MAX_PANES);
   });
 
   it("switches between All and Dismissed tabs", () => {

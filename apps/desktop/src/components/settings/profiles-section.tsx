@@ -34,7 +34,7 @@ export function ProfilesSection() {
 
   return (
     <SubTabs
-      label="Profiles sections"
+      label="Phenos sections"
       tabs={TABS}
       value={tab}
       onValueChange={setTab}

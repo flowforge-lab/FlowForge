@@ -3,6 +3,7 @@ import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { ChatView } from "@/components/chat-view";
 import { InputBar } from "@/components/input-bar";
+import { PhenoSelector } from "@/components/pheno-selector";
 import { useChatStore } from "@/store/chat";
 import { usePanesStore, MAX_PANES } from "@/store/panes";
 
@@ -44,9 +45,14 @@ export function SessionPane({
       )}
     >
       <div className="flex h-8 shrink-0 items-center justify-between gap-2 border-b bg-card/50 px-2">
-        <span className="min-w-0 truncate text-xs font-medium text-muted-foreground">
-          {title}
-        </span>
+        <div className="flex min-w-0 flex-1 items-center gap-1.5">
+          {/* Phenotype selector (#245 2b) — picks the working set this session
+              runs as. v1 switches the global active phenotype; see PhenoSelector. */}
+          <PhenoSelector />
+          <span className="min-w-0 truncate text-xs font-medium text-muted-foreground">
+            {title}
+          </span>
+        </div>
         <div className="flex shrink-0 items-center gap-0.5">
           {/* Fork: duplicate this pane's session into the new pane (#149). */}
           <Button

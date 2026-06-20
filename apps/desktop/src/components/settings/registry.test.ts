@@ -56,6 +56,11 @@ describe("settings registry", () => {
     expect(getSectionMeta("mcp").label).toBe("MCP servers");
   });
 
+  it('labels the phenotypes section "Phenos" while keeping the id "profiles" (#245 2c)', () => {
+    expect(getSectionMeta("profiles").label).toBe("Phenos");
+    expect(getSectionMeta("profiles").id).toBe("profiles");
+  });
+
   it("resolves a label + icon for every id", () => {
     for (const id of ALL_IDS) {
       const meta = getSectionMeta(id);

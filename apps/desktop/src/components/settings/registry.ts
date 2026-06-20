@@ -60,7 +60,9 @@ export const SETTINGS_NAV: readonly SettingsNavGroup[] = [
     group: "GLOBAL",
     items: [
       { id: "appearance", label: "Appearance", icon: Palette },
-      { id: "profiles", label: "Profiles", icon: Users },
+      // Label-only rename to match the backend `Phenotype` model (#245 2c); the
+      // id / union value / store / files stay "profiles" to keep the blast radius small.
+      { id: "profiles", label: "Phenos", icon: Users },
       { id: "memory", label: "Memory", icon: Brain },
       { id: "mcp", label: "MCP servers", icon: Server },
       { id: "scheduled", label: "Scheduled", icon: CalendarClock },
