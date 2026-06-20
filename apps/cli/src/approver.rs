@@ -41,11 +41,13 @@ impl CliApprover {
         Self { policy, agent_mode }
     }
 
-    /// Resolve an approval decision. `agent_mode` is the active Plan/Act/Auto mode
-    /// and takes precedence for the one carve-out it owns: in `Auto`, `Write` calls
-    /// auto-approve. `Dangerous` calls never auto-approve from the mode alone -- they
-    /// always fall through to the explicit `--yes/--deny`/prompt policy, preserving
-    /// the invariant that dangerous work needs a deliberate yes.
+    /// Resolve an approval decision. The explicit `--yes/--deny` policy always wins:
+    /// `--deny` is absolute (no mode carve-out can defeat it) and `--yes` allows
+    /// everything. Only when the policy would otherwise *prompt* does `agent_mode`
+    /// apply its single carve-out: in `Auto`, a `Write` call auto-approves. A
+    /// `Dangerous` call never auto-approves from the mode -- it still prompts (TTY)
+    /// or is denied (piped), preserving the invariant that dangerous work needs a
+    /// deliberate yes.
     pub(crate) fn decide(
         agent_mode: Mode,
         policy: ApprovalMode,
@@ -56,17 +58,19 @@ impl CliApprover {
             return ApprovalDecision::Allow;
         }
 
-        if agent_mode == Mode::Auto && safety == Safety::Write {
-            return ApprovalDecision::Allow;
-        }
-
         match policy {
             ApprovalMode::Yes => ApprovalDecision::Allow,
             ApprovalMode::Deny => ApprovalDecision::Deny,
-            ApprovalMode::Prompt => match input {
-                InputMode::Tty => ApprovalDecision::Prompt,
-                InputMode::Piped => ApprovalDecision::Deny,
-            },
+            ApprovalMode::Prompt => {
+                if agent_mode == Mode::Auto && safety == Safety::Write {
+                    ApprovalDecision::Allow
+                } else {
+                    match input {
+                        InputMode::Tty => ApprovalDecision::Prompt,
+                        InputMode::Piped => ApprovalDecision::Deny,
+                    }
+                }
+            }
         }
     }
 
@@ -236,6 +240,28 @@ mod tests {
                 Safety::Dangerous
             ),
             ApprovalDecision::Deny
+        );
+    }
+
+    // The explicit --yes/--deny policy always wins over Auto's Write carve-out:
+    // --deny stays absolute (no silent write), --yes still allows. Regression guard
+    // for the ordering bug where Auto+Write short-circuited before the policy match.
+    #[test]
+    fn explicit_policy_wins_over_auto_write_carve_out() {
+        use InputMode::{Piped, Tty};
+        // --deny: Write is denied even in Auto, on both TTY and piped input.
+        assert_eq!(
+            CliApprover::decide(Mode::Auto, ApprovalMode::Deny, Tty, Safety::Write),
+            ApprovalDecision::Deny
+        );
+        assert_eq!(
+            CliApprover::decide(Mode::Auto, ApprovalMode::Deny, Piped, Safety::Write),
+            ApprovalDecision::Deny
+        );
+        // --yes: Write is allowed (as before), Auto or not.
+        assert_eq!(
+            CliApprover::decide(Mode::Auto, ApprovalMode::Yes, Piped, Safety::Write),
+            ApprovalDecision::Allow
         );
     }
 
