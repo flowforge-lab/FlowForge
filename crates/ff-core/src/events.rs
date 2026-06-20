@@ -99,6 +99,10 @@ pub struct ToolResultEvent {
 pub struct TurnDoneEvent {
     pub session_id: String,
     pub message_id: String,
+    /// Estimated token count of the session context at turn end, for a
+    /// frontend context-usage indicator. `None` when not assessed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_count: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]

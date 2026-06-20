@@ -524,7 +524,16 @@ export class MockIpc implements FfIpc {
     }
     // Emit done with whatever partial content was accumulated — mirrors what
     // the real backend does when a CancellationToken fires.
-    this.emit(this.doneListeners, { sessionId, messageId: active.messageId });
+    const cancelledContent =
+      this.messages.get(sessionId)?.find((m) => m.id === active.messageId)
+        ?.content ?? "";
+    this.emit(this.doneListeners, {
+      sessionId,
+      messageId: active.messageId,
+      // Rough estimate (~4 chars/token) — mirrors the real backend supplying a
+      // context-usage token count on Done.
+      tokenCount: Math.ceil(cancelledContent.length / 4),
+    });
   }
 
   onToken(cb: Listener<TokenEvent>): Promise<Unlisten> {
@@ -1339,6 +1348,9 @@ Shipping the Settings redesign — currently the Memory browser (SET.8).
         this.emit(this.doneListeners, {
           sessionId,
           messageId: turn.messageId,
+          // Rough estimate (~4 chars/token) — mirrors the real backend supplying
+          // a context-usage token count on Done.
+          tokenCount: Math.ceil((stored?.content.length ?? 0) / 4),
         });
         return;
       }
