@@ -1,4 +1,6 @@
 use serde::{Deserialize, Serialize};
+
+use crate::Mode;
 use ts_rs::TS;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
@@ -38,6 +40,12 @@ pub struct Session {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub phenotype: Option<String>,
+    /// The agent autonomy mode this session runs as (RFC 0011 P2, #265). `None`
+    /// means "inherit the global `defaultMode` preference" — so a new session tracks
+    /// the user's default while a pane can override it independently (#148).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub mode: Option<Mode>,
 }
 
 /// A session's working directory as surfaced to the frontend selector (#200,

@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use ff_core::{auto_title, Message, Role, Session, SessionStatus, ToolCall};
+use ff_core::{auto_title, Message, Mode, Role, Session, SessionStatus, ToolCall};
 
 fn now_ms() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -49,6 +49,7 @@ impl SessionStore {
             created_at: ts,
             updated_at: ts,
             phenotype: None,
+            mode: None,
         };
         let mut inner = self.inner.lock().unwrap();
         inner.sessions.insert(session.id.clone(), session.clone());
@@ -150,6 +151,27 @@ impl SessionStore {
             .and_then(|s| s.phenotype.clone())
     }
 
+    /// Bind (or clear, with `None`) this session's autonomy mode (#265). Mirrors
+    /// [`set_session_phenotype`](Self::set_session_phenotype).
+    pub fn set_session_mode(&self, session_id: &str, mode: Option<Mode>) {
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(s) = inner.sessions.get_mut(session_id) {
+            s.mode = mode;
+            s.updated_at = now_ms();
+        }
+    }
+
+    /// The session's bound mode, or `None` if it inherits the global `defaultMode`
+    /// preference (or the session is unknown).
+    pub fn session_mode(&self, session_id: &str) -> Option<Mode> {
+        self.inner
+            .lock()
+            .unwrap()
+            .sessions
+            .get(session_id)
+            .and_then(|s| s.mode)
+    }
+
     pub fn set_message_content(
         &self,
         message_id: &str,
@@ -221,6 +243,8 @@ impl SessionStore {
             // A fork keeps the parent's phenotype binding so the copy runs as the
             // same Pheno (#246).
             phenotype: source.phenotype.clone(),
+            // ...and its mode binding, so the copy runs at the same autonomy (#265).
+            mode: source.mode,
         };
         let cloned: Vec<Message> = inner
             .messages
@@ -420,5 +444,45 @@ mod tests {
         // Changing the fork's binding does not touch the source.
         store.set_session_phenotype(&forked.id, Some("default".into()));
         assert_eq!(store.session_phenotype(&s.id).as_deref(), Some("codon"));
+    }
+
+    #[test]
+    fn new_session_has_no_mode_binding() {
+        let store = SessionStore::new();
+        let s = store.create_session(None);
+        assert!(s.mode.is_none());
+        assert!(store.session_mode(&s.id).is_none());
+    }
+
+    #[test]
+    fn set_and_clear_session_mode() {
+        let store = SessionStore::new();
+        let s = store.create_session(None);
+
+        store.set_session_mode(&s.id, Some(Mode::Plan));
+        assert_eq!(store.session_mode(&s.id), Some(Mode::Plan));
+
+        store.set_session_mode(&s.id, None);
+        assert!(store.session_mode(&s.id).is_none());
+    }
+
+    #[test]
+    fn set_session_mode_unknown_session_is_noop() {
+        let store = SessionStore::new();
+        store.set_session_mode("nope", Some(Mode::Act));
+        assert!(store.session_mode("nope").is_none());
+    }
+
+    #[test]
+    fn fork_session_copies_mode_binding() {
+        let store = SessionStore::new();
+        let s = store.create_session(None);
+        store.set_session_mode(&s.id, Some(Mode::Act));
+
+        let forked = store.fork_session(&s.id).unwrap();
+        assert_eq!(forked.mode, Some(Mode::Act));
+        // Changing the fork's binding does not touch the source.
+        store.set_session_mode(&forked.id, Some(Mode::Auto));
+        assert_eq!(store.session_mode(&s.id), Some(Mode::Act));
     }
 }
