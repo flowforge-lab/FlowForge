@@ -14,6 +14,8 @@ import { useSplitStore } from "@/store/split";
 import { usePaletteStore } from "@/store/palette";
 import { useSettingsStore } from "@/store/settings";
 import { useShortcutsStore } from "@/store/shortcuts";
+import { useSessionModeStore } from "@/store/session-mode";
+import { modeForHotkey } from "@/lib/mode";
 
 // True when focus is in a text-entry element, so a bare "?" types instead of
 // opening the shortcuts overlay.
@@ -94,6 +96,31 @@ function useGlobalShortcuts() {
           if (id && focused)
             usePanesStore.getState().setPaneSession(focused, id);
         });
+        return;
+      }
+      // Cycle the focused pane's agent mode (#266): Plan → Act → Auto. The active
+      // session mirrors the focused pane, so cycling it targets where the user is.
+      if (mod && e.key === ".") {
+        const sid = store.activeSessionId;
+        if (sid) {
+          e.preventDefault();
+          useSessionModeStore
+            .getState()
+            .cycleMode(sid, usePrefsStore.getState().defaultMode);
+        }
+        return;
+      }
+      // Direct mode hotkeys (#267): ⌘P → Plan, ⌘T → Act, ⌘O → Auto on the focused
+      // pane's session. (In a browser these would print / new-tab / open; in the
+      // Tauri app they're free, and preventDefault keeps the mock exercisable.)
+      const directMode =
+        mod && !e.shiftKey && !e.altKey ? modeForHotkey(e.key) : undefined;
+      if (directMode) {
+        const sid = store.activeSessionId;
+        if (sid) {
+          e.preventDefault();
+          useSessionModeStore.getState().setMode(sid, directMode);
+        }
         return;
       }
       if (mod && e.key >= "1" && e.key <= "9") {
