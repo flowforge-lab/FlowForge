@@ -264,6 +264,50 @@ fn render_curated(chunks: &[MemoryChunk]) -> String {
     out
 }
 
+/// Re-join the overlapping line-windows that [`chunk_markdown`] emits for a
+/// section larger than `CHUNK_TARGET_BYTES` back into one whole-section chunk.
+///
+/// Windowing is an index/embedding concern (focused vectors); the rewrite path
+/// must see each section's *whole* body. Otherwise [`render_curated`] re-joins
+/// the windows' bodies and re-emits their ~15% overlap as duplicated lines, and
+/// re-chunking the larger output never reaches a fixpoint (#254).
+///
+/// Windows of one section arrive consecutively, share `(source, path, heading)`,
+/// and have overlapping or adjacent line spans -- exactly the run folded here.
+/// Distinct same-heading sections are separated by other chunks, so they stay
+/// apart (and `render_curated` collapses them by heading, as intended).
+fn coalesce_windows(chunks: Vec<MemoryChunk>) -> Vec<MemoryChunk> {
+    let mut out: Vec<MemoryChunk> = Vec::with_capacity(chunks.len());
+    for c in chunks {
+        if let Some(last) = out.last_mut() {
+            // A true window genuinely *overlaps* the previous chunk's line span
+            // (chunk_markdown carries ~15% of bytes into the next window). Two
+            // distinct same-heading sections are only adjacent (blank line
+            // between them), never overlapping -- so require strict overlap to
+            // avoid folding separate sections that `render_curated` should keep
+            // apart and collapse by heading.
+            let is_window_of_last = last.source == c.source
+                && last.path == c.path
+                && last.heading == c.heading
+                && c.line_start <= last.line_end;
+            if is_window_of_last {
+                // Drop the leading lines of `c` already covered by `last`, then
+                // append only the new tail so the overlapping lines appear once.
+                let skip = (last.line_end + 1).saturating_sub(c.line_start) as usize;
+                let tail: Vec<&str> = c.text.lines().skip(skip).collect();
+                if !tail.is_empty() {
+                    last.text.push('\n');
+                    last.text.push_str(&tail.join("\n"));
+                }
+                last.line_end = last.line_end.max(c.line_end);
+                continue;
+            }
+        }
+        out.push(c);
+    }
+    out
+}
+
 impl crate::Memory {
     /// Run the consolidation pass (issue #223 P2; RFC 0006 sec 7.3 / RFC 0007 sec 6).
     ///
@@ -295,10 +339,11 @@ impl crate::Memory {
             return Ok(report);
         }
 
-        // Gather and split curated vs daily.
+        // Gather and split curated vs daily. Coalesce windowed sections back to
+        // whole bodies first so the rewrite path never re-emits window overlap.
         let mut curated: Vec<MemoryChunk> = Vec::new();
         let mut daily: Vec<MemoryChunk> = Vec::new();
-        for c in self.all_chunks() {
+        for c in coalesce_windows(self.all_chunks()) {
             match c.source {
                 MemorySource::Curated => curated.push(c),
                 MemorySource::Daily { .. } => daily.push(c),
@@ -744,5 +789,59 @@ mod tests {
 
         assert!(!report.ran);
         assert_eq!(std::fs::read_to_string(m.curated_path()).unwrap(), before);
+    }
+
+    #[test]
+    fn consolidate_coalesces_windowed_section_without_duplication() {
+        // A single canonical section larger than CHUNK_TARGET_BYTES is windowed
+        // by chunk_markdown into overlapping chunks. Consolidation must rebuild
+        // the whole section once -- not re-emit the ~15% overlap -- and reach a
+        // fixpoint even though the section stays under the injection budget.
+        let dir = tempfile::tempdir().unwrap();
+        let m = mem_with(dir.path(), 8192, false);
+
+        let mut body = String::from("## Patterns\n");
+        for i in 0..120 {
+            body.push_str(&format!(
+                "- fact number {i:03} with enough descriptive text to grow the section\n"
+            ));
+        }
+        assert!(
+            body.len() > 2048 && body.len() < 8192,
+            "section must be windowed (>2KB) yet under budget, got {}",
+            body.len()
+        );
+        m.rewrite_curated(&body).unwrap();
+
+        // Already canonical and whole: the windowed read must not be mistaken
+        // for a regroup, and nothing may be duplicated.
+        let report = m.consolidate(&RecencyFrequencySalience::default()).unwrap();
+        assert!(
+            !report.ran,
+            "a whole, already-grouped section must be a no-op even when windowed"
+        );
+
+        let curated = std::fs::read_to_string(m.curated_path()).unwrap();
+        assert_eq!(
+            curated, body,
+            "file must be byte-identical (no overlap re-emitted)"
+        );
+        let max_dup = {
+            let mut counts: std::collections::HashMap<&str, usize> =
+                std::collections::HashMap::new();
+            for line in curated.lines().filter(|l| l.starts_with("- fact")) {
+                *counts.entry(line).or_default() += 1;
+            }
+            counts.values().copied().max().unwrap_or(0)
+        };
+        assert_eq!(max_dup, 1, "no fact line may appear more than once");
+
+        // Re-run is a fixpoint.
+        let second = m.consolidate(&RecencyFrequencySalience::default()).unwrap();
+        assert!(
+            !second.ran,
+            "re-run on the windowed section must stay a no-op"
+        );
+        assert_eq!(std::fs::read_to_string(m.curated_path()).unwrap(), curated);
     }
 }
