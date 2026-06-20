@@ -7,6 +7,7 @@ import { TokenBatcher } from "./token-batcher";
 import { useChatStore } from "@/store/chat";
 import { useSkillsStore } from "@/store/skills";
 import { useMcpStore } from "@/store/mcp";
+import { useMemoryStore } from "@/store/memory";
 
 let started = false;
 
@@ -54,6 +55,11 @@ export function startIpcEvents(): void {
   // MCP status snapshots replace the store wholesale (#91); mirrors skills:changed.
   void ipc.onMcpStatusChanged((e) => {
     useMcpStore.getState().setServers(e.servers);
+  });
+  // A silent context-pressure flush curated memory mid-turn (#283) — record it so
+  // the memory browser surfaces provenance and reloads.
+  void ipc.onMemoryFlushed((e) => {
+    useMemoryStore.getState().noteFlush(e.writes);
   });
   // No UI for intention signals yet (NeuroForge, M8) — observe only.
   void ipc.onIntention((e) => {

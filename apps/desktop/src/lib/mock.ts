@@ -34,6 +34,7 @@ import type {
   McpStatusChangedEvent,
   MemoryFileInfo,
   MemoryOverview,
+  MemoryFlushedEvent,
 } from "../bindings";
 import type { FfIpc, Unlisten } from "./ipc";
 import type { MarketplaceSkill } from "./marketplace";
@@ -409,6 +410,11 @@ export class MockIpc implements FfIpc {
     MOCK_MCP.map((s) => [s.id, { ...s }]),
   );
   private mcpStatusListeners = new Set<Listener<McpStatusChangedEvent>>();
+  private memoryFlushedListeners = new Set<Listener<MemoryFlushedEvent>>();
+  // Sessions that have already simulated a context-pressure flush (#283). The
+  // real flush only fires once a session crosses the budget; the mock stands in
+  // by flushing once per session so the provenance surface is exercisable.
+  private flushedSessions = new Set<string>();
 
   async createSession(goal?: string): Promise<Session> {
     const ts = now();
@@ -573,6 +579,10 @@ export class MockIpc implements FfIpc {
   }
   onMcpStatusChanged(cb: Listener<McpStatusChangedEvent>): Promise<Unlisten> {
     return this.subscribe(this.mcpStatusListeners, cb);
+  }
+
+  onMemoryFlushed(cb: Listener<MemoryFlushedEvent>): Promise<Unlisten> {
+    return this.subscribe(this.memoryFlushedListeners, cb);
   }
 
   async listMcpServers(): Promise<McpServerStatus[]> {
@@ -1345,6 +1355,16 @@ Shipping the Settings redesign — currently the Memory browser (SET.8).
       if (i >= words.length) {
         clearInterval(timer);
         this.activeTimers.delete(sessionId);
+        // Simulate a one-time context-pressure memory flush (#283) so the memory
+        // browser's provenance surface is exercisable under the mock.
+        if (!this.flushedSessions.has(sessionId)) {
+          this.flushedSessions.add(sessionId);
+          this.emit(this.memoryFlushedListeners, {
+            sessionId,
+            messageId: turn.messageId,
+            writes: 2,
+          });
+        }
         this.emit(this.doneListeners, {
           sessionId,
           messageId: turn.messageId,

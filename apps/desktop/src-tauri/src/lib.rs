@@ -10,8 +10,8 @@ mod tools;
 use async_trait::async_trait;
 use ff_agent::{run_turn, AgentEvent, Approver, CancelToken, ToolContext};
 use ff_core::events::{
-    ApprovalSafety, EvolveCostEstimate, IntentionSignal, McpStatusChangedEvent, ReasoningEvent,
-    SkillActivated, SkillCompleted, SkillEvolveApprovalRequestEvent,
+    ApprovalSafety, EvolveCostEstimate, IntentionSignal, McpStatusChangedEvent, MemoryFlushedEvent,
+    ReasoningEvent, SkillActivated, SkillCompleted, SkillEvolveApprovalRequestEvent,
     SkillInstallApprovalRequestEvent, SkillsChangedEvent, TokenEvent, ToolApprovalRequestEvent,
     ToolAskRequestEvent, ToolCallEvent, ToolResultEvent, TurnDoneEvent, TurnErrorEvent,
 };
@@ -542,6 +542,16 @@ fn send_message(
                             session_id: sid.clone(),
                             message_id,
                             token_count,
+                        },
+                    );
+                }
+                AgentEvent::MemoryFlushed { message_id, writes } => {
+                    let _ = app.emit(
+                        "memory:flushed",
+                        MemoryFlushedEvent {
+                            session_id: sid.clone(),
+                            message_id,
+                            writes,
                         },
                     );
                 }

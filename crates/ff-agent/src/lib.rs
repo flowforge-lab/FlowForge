@@ -115,6 +115,15 @@ pub enum AgentEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         token_count: Option<u32>,
     },
+    /// A silent context-pressure memory flush (#244 R5) wrote `writes` durable
+    /// facts to the user's on-disk memory this turn (#283). Emitted only when
+    /// `writes > 0`, so the frontend can surface provenance ("memory
+    /// auto-updated"). `message_id` is the assistant message of the iteration
+    /// that triggered the flush.
+    MemoryFlushed {
+        message_id: String,
+        writes: u32,
+    },
     Error {
         message: String,
     },
@@ -379,6 +388,9 @@ pub async fn run_turn(
         // failure must not abort the user's turn.
         let message_count = history.len() as u64;
         let pressure = ProxyTokenEstimator::default().assess(&history, model);
+        // Carries the flush's write count to the `MemoryFlushed` event below, once
+        // this iteration's assistant message id exists to correlate it with.
+        let mut flushed_writes: Option<u32> = None;
         if !cancel.is_cancelled()
             && flush_due(
                 pressure,
@@ -388,7 +400,10 @@ pub async fn run_turn(
                 DEFAULT_REFLUSH_INTERVAL_MESSAGES,
             )
         {
-            let _ = MemoryFlush
+            // Surface provenance (#283) when the flush actually wrote durable facts;
+            // a no-op / NoReply / failure stays silent (best-effort — never aborts
+            // the user's turn).
+            if let Ok(CompactionOutcome::Wrote { writes }) = MemoryFlush
                 .compact(CompactionContext {
                     provider,
                     store,
@@ -398,7 +413,14 @@ pub async fn run_turn(
                     model,
                     cancel: cancel.clone(),
                 })
-                .await;
+                .await
+            {
+                if writes > 0 {
+                    // Explicit narrowing across the usize -> u32 contract boundary;
+                    // an implausible overflow degrades to "no event" rather than wrapping.
+                    flushed_writes = u32::try_from(writes).ok();
+                }
+            }
             // Record the attempt regardless of outcome so a no-op or failing flush
             // does not re-fire every iteration.
             last_flush_count = Some(message_count);
@@ -458,6 +480,15 @@ pub async fn run_turn(
         let message_id = store
             .add_message(session_id, Role::Assistant, String::new())
             .id;
+
+        // Provenance for a flush that ran at the top of this iteration (#283): now
+        // that the turn's assistant message id exists, correlate the event with it.
+        if let Some(writes) = flushed_writes {
+            on_event(AgentEvent::MemoryFlushed {
+                message_id: message_id.clone(),
+                writes,
+            });
+        }
 
         // Bounded retry for transient provider failures (#244 R1). A setup error
         // (request never started) is always safe to retry. A mid-stream error is
@@ -1314,6 +1345,7 @@ mod tests {
                 AgentEvent::Reasoning { .. } => {}
                 AgentEvent::Error { message } => panic!("error: {message}"),
                 AgentEvent::Done { .. } => {}
+                AgentEvent::MemoryFlushed { .. } => {}
             },
         )
         .await
@@ -1372,6 +1404,7 @@ mod tests {
                 AgentEvent::Reasoning { .. } => {}
                 AgentEvent::Error { message } => panic!("error: {message}"),
                 AgentEvent::Done { .. } => {}
+                AgentEvent::MemoryFlushed { .. } => {}
             },
         )
         .await
@@ -2722,6 +2755,8 @@ mod tests {
             "test precondition: transcript must exceed the flush threshold"
         );
 
+        // A NoReply flush writes nothing, so no provenance event must fire (#283).
+        let mut flush_events = 0usize;
         run_turn(
             &CountingText {
                 calls: calls.clone(),
@@ -2733,7 +2768,11 @@ mod tests {
             None,
             false,
             CancelToken::new(),
-            |_| {},
+            |ev| {
+                if matches!(ev, AgentEvent::MemoryFlushed { .. }) {
+                    flush_events += 1;
+                }
+            },
         )
         .await
         .unwrap();
@@ -2745,10 +2784,121 @@ mod tests {
             2,
             "over-budget turn must run exactly one flush before the main turn"
         );
+        assert_eq!(
+            flush_events, 0,
+            "a flush that writes nothing (NoReply) must not emit MemoryFlushed"
+        );
         // The flush is silent: it must not add any message to the visible transcript
         // (memory writes go to disk, not the session). Still just the one user msg
         // plus the single assistant reply from the main turn.
         let history = store.get_messages(&s.id);
         assert_eq!(history.len(), 2, "flush must not mutate the transcript");
+    }
+
+    /// A `memory_write` tool that records how many times it ran, so an over-budget
+    /// flush can actually persist a durable fact during the test (#283).
+    struct CountingMemoryWrite {
+        writes: Arc<AtomicUsize>,
+    }
+    #[async_trait]
+    impl ff_tools::Tool for CountingMemoryWrite {
+        fn name(&self) -> &str {
+            "memory_write"
+        }
+        fn description(&self) -> &str {
+            "persists a durable fact"
+        }
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": { "text": { "type": "string" } }
+            })
+        }
+        fn safety(&self, _args: &serde_json::Value) -> Safety {
+            Safety::Write
+        }
+        async fn run(&self, _args: serde_json::Value, _root: &Path) -> ff_tools::ToolOutcome {
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            ff_tools::ToolOutcome::ok("saved")
+        }
+    }
+
+    /// Calls `memory_write` once (the flush's first request), then answers with
+    /// plain text — which both terminates the flush loop and finishes the main turn.
+    struct FlushWriteThenText {
+        calls: Arc<AtomicUsize>,
+    }
+    #[async_trait]
+    impl Provider for FlushWriteThenText {
+        async fn chat_stream(&self, _req: ChatRequest) -> Result<ChunkStream, LlmError> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            let chunks = if n == 0 {
+                vec![Ok(Chunk {
+                    tool_calls: vec![ToolCallDelta {
+                        index: 0,
+                        id: Some("w1".into()),
+                        name: Some("memory_write".into()),
+                        arguments: r#"{"text":"user prefers dark mode"}"#.into(),
+                    }],
+                    done: true,
+                    ..Chunk::default()
+                })]
+            } else {
+                vec![Ok(Chunk {
+                    delta: "ok".into(),
+                    done: true,
+                    ..Chunk::default()
+                })]
+            };
+            Ok(futures_util::stream::iter(chunks).boxed())
+        }
+    }
+
+    #[tokio::test]
+    async fn over_budget_flush_that_writes_emits_memory_flushed_event() {
+        let store = SessionStore::new();
+        let s = store.create_session(None);
+        store.add_message(&s.id, Role::User, "x".repeat(100_000));
+        let writes = Arc::new(AtomicUsize::new(0));
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(CountingMemoryWrite {
+            writes: writes.clone(),
+        }));
+        let root = std::env::current_dir().unwrap();
+        let approve = AlwaysApprove;
+
+        let mut flushed: Vec<u32> = Vec::new();
+        run_turn(
+            &FlushWriteThenText {
+                calls: Arc::new(AtomicUsize::new(0)),
+            },
+            &store,
+            &ctx(&registry, &root, &approve),
+            &s.id,
+            "mock",
+            None,
+            false,
+            CancelToken::new(),
+            |ev| {
+                if let AgentEvent::MemoryFlushed { writes, .. } = ev {
+                    flushed.push(writes);
+                }
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            flushed,
+            vec![1],
+            "a flush that wrote one fact emits one MemoryFlushed carrying writes=1"
+        );
+        assert_eq!(
+            writes.load(Ordering::SeqCst),
+            1,
+            "the flush ran memory_write exactly once"
+        );
+        // Provenance, not mutation: the visible transcript stays user + assistant.
+        assert_eq!(store.get_messages(&s.id).len(), 2);
     }
 }
