@@ -390,13 +390,14 @@ fn send_message(
         // will then be per-pane with no further plumbing (#246).
         let tool_ctx = ToolContext::new(&registry, &session_root, &approver, 8);
         // Skills + ambient context for this turn (RFC 0001 §4, RFC 0002 phase 1):
-        // the session phenotype's persona, installed-skill descriptions, the bodies
-        // of its active skills, and the current local time. Skills come from THIS
-        // session's resolved phenotype (#246), not the global active set, so a
-        // per-pane Pheno expresses its own skills.
+        // the resolved persona, installed-skill descriptions, the bodies of the
+        // active skills, and the current local time.
         let skills = state.skills_snapshot();
         let user_ctx = ff_agent::UserContext::now();
-        let active: Vec<String> = state.resolve_skills(&pheno).into_iter().collect();
+        // Active-skill source (#246): an explicit per-pane binding uses the
+        // phenotype's declared skills; an unbound session keeps the global active
+        // set so the command palette still affects turns. See `turn_active_skills`.
+        let active: Vec<String> = state.turn_active_skills(&sid);
         let memory = state.memory().ambient_block();
         let system_prompt = ff_agent::build_system_prompt(
             persona.as_deref(),

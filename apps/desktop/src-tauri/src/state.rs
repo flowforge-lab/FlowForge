@@ -952,6 +952,23 @@ impl AppState {
         }
     }
 
+    /// Active skills for a *turn* (#246). Resolution differs from the persona/model
+    /// path: only a session with an **explicit** phenotype binding uses that
+    /// phenotype's declared skills. An unbound session keeps the global active set
+    /// (`active_skills`) so the command palette (`activate_skill` /
+    /// `deactivate_skill`) still takes effect on the next turn — otherwise a manual
+    /// activation would silently stop reaching the agent while the palette still
+    /// showed the skill active.
+    pub fn turn_active_skills(&self, session_id: &str) -> Vec<String> {
+        if self.store.session_phenotype(session_id).is_some() {
+            self.resolve_skills(&self.session_phenotype(session_id))
+                .into_iter()
+                .collect()
+        } else {
+            self.active_skills()
+        }
+    }
+
     /// Bind `session_id` to a phenotype by name, or clear it (`None`) so the session
     /// inherits the global active one again (#246). Validates the name against the
     /// phenotype registry up front so a stale UI cannot bind a phantom — unknown
@@ -1634,6 +1651,44 @@ mod tests {
         assert!(state.store.session_phenotype(&s.id).is_none());
         // Clearing always succeeds.
         state.set_session_phenotype(&s.id, None).unwrap();
+    }
+
+    // Regression guard for the #246 review blocker: per-session phenotype binding
+    // must not silently disconnect the manual skill-activation palette. An UNBOUND
+    // session keeps the global active set (so palette toggles reach the turn); only
+    // an EXPLICITLY bound session swaps in its phenotype's declared skills.
+    #[test]
+    fn turn_active_skills_unbound_uses_palette_bound_uses_phenotype() {
+        let state = AppState::new();
+        // Simulate a command-palette activation: a skill toggled into the global
+        // active set (bypassing the install-check guard, as the dedup test does).
+        state
+            .active_skills
+            .lock()
+            .unwrap()
+            .insert("palette-skill".into());
+
+        let s = state.store.create_session(None);
+
+        // Unbound: the turn must still see the palette activation.
+        assert!(
+            state
+                .turn_active_skills(&s.id)
+                .contains(&"palette-skill".to_string()),
+            "an unbound session must inherit the global palette-activated skills"
+        );
+
+        // Explicitly bound: the phenotype's declared skills govern the turn, so the
+        // manually-activated palette skill drops out (no installed skills in tests).
+        state
+            .set_session_phenotype(&s.id, Some(DEFAULT_PHENOTYPE.into()))
+            .unwrap();
+        assert!(
+            !state
+                .turn_active_skills(&s.id)
+                .contains(&"palette-skill".to_string()),
+            "an explicitly bound session uses its phenotype's declared skills, not the palette"
+        );
     }
 
     // Regression guard for issue #117: the supervisor actor is `tokio::spawn`'d, so
