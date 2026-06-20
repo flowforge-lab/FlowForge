@@ -190,7 +190,7 @@ export interface FfIpc {
   listSkillVersions(skill: string): Promise<string[]>;
 
   // Phenotypes (Issue #28). Named, switchable working sets (RFC 0001 §7).
-  /** All selectable phenotypes (built-in `default` + `~/.flowforge/phenotypes/`), name-sorted. */
+  /** All selectable phenotypes (built-in `default` + `~/.flowforge/phenos/`), name-sorted. */
   listPhenotypes(): Promise<Phenotype[]>;
   /** The active phenotype. */
   getPhenotype(): Promise<Phenotype>;

@@ -1,4 +1,4 @@
-//! Loading phenotype definitions from `~/.flowforge/phenotypes/<name>.toml` (RFC 0001 §7).
+//! Loading phenotype definitions from `~/.flowforge/phenos/<name>.toml` (RFC 0001 §7).
 //!
 //! A [`Phenotype`](ff_core::Phenotype) is a named, switchable working set: which skills
 //! are active plus optional model and persona overrides. Definitions are user-authored

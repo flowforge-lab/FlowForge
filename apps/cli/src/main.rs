@@ -69,7 +69,7 @@ enum Command {
         /// Activate a skill's body for the turn (repeatable). Unknown names error.
         #[arg(long, value_name = "NAME")]
         skill: Vec<String>,
-        /// Load a phenotype's active skills, model, and persona (see `~/.flowforge/phenotypes`).
+        /// Load a phenotype's active skills, model, and persona (see `~/.flowforge/phenos`).
         #[arg(long, value_name = "NAME")]
         pheno: Option<String>,
         /// Approval mode: `auto` auto-approves writes, `act` prompts every write,

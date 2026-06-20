@@ -1032,7 +1032,7 @@ fn uninstall_skill(
     Ok(())
 }
 
-/// All selectable phenotypes (built-in `default` + `~/.flowforge/phenotypes/`),
+/// All selectable phenotypes (built-in `default` + `~/.flowforge/phenos/`),
 /// name-sorted. Backs the `pheno` command palette.
 #[tauri::command]
 fn list_phenotypes(state: State<'_, Arc<AppState>>) -> Vec<Phenotype> {

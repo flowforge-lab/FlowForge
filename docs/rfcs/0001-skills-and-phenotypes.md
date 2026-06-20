@@ -159,7 +159,7 @@ delivers the **backend** so that FE wires onto a stable contract:
 
 ## 7. Phenotypes
 
-- Stored as `~/.flowforge/phenotypes/<name>.toml`.
+- Stored as `~/.flowforge/phenos/<name>.toml`.
 - A phenotype selects active skills, an optional model override, and an optional
   persona preamble.
 - A `switch_phenotype(name)` command changes the active set and persists it across
@@ -242,7 +242,7 @@ green before merge. One squashed commit per PR (CONTRIBUTING).
 | **M3.1b** | skill-description injection into `ff-agent` system prompt | system msg carries active descriptions; existing turn tests stay green |
 | **M3.2** | `install_skill(source)` (git/path/MD) + validation + M2 approval gate + `uninstall_skill` | install from path + git; approval event fires; bad bundle rejected |
 | **M3.3** | `search_skills` tool + `list/activate/deactivate_skill` commands + events (Abid wires ⌘K FE) | search ranks by keyword/description; commands return DTOs |
-| **M3.4** | Phenotypes: config model, `~/.flowforge/phenotypes/*.toml`, switch + persist | switch changes active skills; persists across restart |
+| **M3.4** | Phenotypes: config model, `~/.flowforge/phenos/*.toml`, switch + persist | switch changes active skills; persists across restart |
 | **M3.5** | Skill Evolution: `ff-signals` telemetry + aggregates + manual optimize (propose → diff → approve → version + rollback) | signals recorded per skill; optimize proposes a rewrite gated by approval |
 
 ## 11. Open Questions & Non-Goals

@@ -49,17 +49,17 @@ pub fn skills_root() -> PathBuf {
         .join("skills")
 }
 
-/// `~/.flowforge/phenotypes` — the phenotype definitions shared with the desktop
+/// `~/.flowforge/phenos` — the phenotype definitions shared with the desktop
 /// app (RFC 0001 §7). Loaded read-only here; editing stays desktop-side.
 pub fn phenotypes_root() -> PathBuf {
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".flowforge")
-        .join("phenotypes")
+        .join("phenos")
 }
 
 /// Resolve a phenotype by name: the built-in `default`, otherwise a definition
-/// from `~/.flowforge/phenotypes/<name>.toml`. Returns `None` for an unknown
+/// from `~/.flowforge/phenos/<name>.toml`. Returns `None` for an unknown
 /// name. Mirrors the desktop's `resolve_phenotype` so a headless turn sees the
 /// same definition the GUI would apply.
 pub fn resolve_phenotype(name: &str) -> Option<ff_core::Phenotype> {
@@ -104,7 +104,7 @@ mod tests {
     #[test]
     fn default_phenotype_resolves_without_any_files() {
         // The built-in "default" short-circuits the filesystem: it resolves even
-        // against an empty (or nonexistent) phenotypes root, like the desktop does.
+        // against an empty (or nonexistent) phenos root, like the desktop does.
         let tmp = tempfile::tempdir().unwrap();
         let p = resolve_phenotype_in(DEFAULT_PHENOTYPE, tmp.path()).unwrap();
         assert_eq!(p.name, "default");
