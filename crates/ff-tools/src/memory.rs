@@ -13,7 +13,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use ff_memory::{
     chunk_markdown, Memory, MemoryIndex, MemorySource, RecencyFrequencySalience, ScoredChunk,
-    WriteTarget,
+    Stratum, WriteTarget,
 };
 use serde_json::Value;
 
@@ -232,7 +232,10 @@ impl Tool for MemoryWriteTool {
         "Append a note to your durable memory so you remember it in future sessions. \
          `target` is `daily` (today's log — for time-stamped observations, the default) \
          or `curated` (the long-lived MEMORY.md — for stable facts about the user and \
-         their projects). Write Markdown; a `## Heading` makes the note easier to recall."
+         their projects). For curated facts, set `stratum` to file the note under the \
+         right section: `identity` (who they are), `patterns` (how they work), or \
+         `focus` (what they are working on). Write Markdown; a `## Heading` makes the \
+         note easier to recall."
     }
 
     fn parameters(&self) -> Value {
@@ -247,6 +250,11 @@ impl Tool for MemoryWriteTool {
                     "type": "string",
                     "enum": ["daily", "curated"],
                     "description": "Where to write (default `daily`)."
+                },
+                "stratum": {
+                    "type": "string",
+                    "enum": ["identity", "patterns", "focus"],
+                    "description": "Curated section to file the note under (implies `curated`)."
                 }
             },
             "required": ["text"]
@@ -267,7 +275,26 @@ impl Tool for MemoryWriteTool {
         if text.trim().is_empty() {
             return ToolOutcome::error("nothing to write: text is empty");
         }
-        let target = match args.get("target").and_then(Value::as_str) {
+        let stratum = match args.get("stratum").and_then(Value::as_str) {
+            None => None,
+            Some(s) => match Stratum::parse(s) {
+                Some(st) => Some(st),
+                None => {
+                    return ToolOutcome::error(format!(
+                        "invalid stratum `{s}` (expected `identity`, `patterns`, or `focus`)"
+                    ));
+                }
+            },
+        };
+
+        let target_arg = args.get("target").and_then(Value::as_str);
+        if stratum.is_some() && target_arg == Some("daily") {
+            return ToolOutcome::error(
+                "stratum applies only to curated memory; got target `daily`",
+            );
+        }
+        let target = match target_arg {
+            None if stratum.is_some() => WriteTarget::Curated,
             None | Some("daily") => WriteTarget::Daily,
             Some("curated") => WriteTarget::Curated,
             Some(other) => {
@@ -277,7 +304,11 @@ impl Tool for MemoryWriteTool {
             }
         };
 
-        let path = match self.memory.write(text, target) {
+        let write_result = match stratum {
+            Some(st) => self.memory.write_curated_stratum(text, st),
+            None => self.memory.write(text, target),
+        };
+        let path = match write_result {
             Ok(p) => p,
             Err(e) => return ToolOutcome::error(format!("memory write failed: {e}")),
         };
@@ -557,6 +588,55 @@ mod tests {
             .await;
         assert!(!out.success);
         assert!(out.content.contains("invalid target"));
+    }
+
+    #[tokio::test]
+    async fn write_with_stratum_files_under_heading_and_is_searchable() {
+        let (_dir, memory, index) = setup();
+        let write = MemoryWriteTool::new(memory.clone(), index.clone());
+        let out = write
+            .run(
+                serde_json::json!({ "text": "L5 SDE on Maps", "stratum": "identity" }),
+                Path::new("."),
+            )
+            .await;
+        assert!(out.success, "{}", out.content);
+        // Stratum implies curated: the note lands under `## Identity` in MEMORY.md.
+        let curated = memory.get(&memory.curated_path(), None, None);
+        assert!(curated.contains("## Identity"), "{curated}");
+        assert!(curated.contains("L5 SDE on Maps"), "{curated}");
+    }
+
+    #[tokio::test]
+    async fn write_stratum_with_daily_target_is_error() {
+        let (_dir, memory, index) = setup();
+        let write = MemoryWriteTool::new(memory, index);
+        let out = write
+            .run(
+                serde_json::json!({ "text": "x", "stratum": "identity", "target": "daily" }),
+                Path::new("."),
+            )
+            .await;
+        assert!(!out.success);
+        assert!(
+            out.content.contains("stratum applies only to curated"),
+            "{}",
+            out.content
+        );
+    }
+
+    #[tokio::test]
+    async fn write_invalid_stratum_is_error() {
+        let (_dir, memory, index) = setup();
+        let write = MemoryWriteTool::new(memory, index);
+        let out = write
+            .run(
+                serde_json::json!({ "text": "x", "stratum": "vibes" }),
+                Path::new("."),
+            )
+            .await;
+        assert!(!out.success);
+        assert!(out.content.contains("invalid stratum"), "{}", out.content);
     }
 
     #[tokio::test]
