@@ -11,7 +11,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use ff_core::{Message, Role};
+use ff_core::{Message, Mode, Role};
 use ff_llm::{ChatMessage, ChatRequest, FunctionCall, LlmError, Provider, ToolCall as LlmToolCall};
 use ff_session::SessionStore;
 use ff_tools::{Safety, ToolRegistry};
@@ -165,6 +165,9 @@ pub struct ToolContext<'a> {
     /// When `Some`, the only tool names this (sub-)agent may call or be advertised.
     /// `None` = the full registry. Used to scope a delegated subtask.
     pub allowed: Option<std::collections::HashSet<String>>,
+    /// Agent autonomy mode (RFC 0011). In [`Mode::Plan`] only ReadOnly tools are
+    /// advertised, so the model cannot see or call anything that mutates.
+    pub mode: Mode,
 }
 
 impl<'a> ToolContext<'a> {
@@ -183,6 +186,7 @@ impl<'a> ToolContext<'a> {
             depth: 0,
             max_depth: DEFAULT_MAX_DELEGATION_DEPTH,
             allowed: None,
+            mode: Mode::default(),
         }
     }
 }
@@ -254,6 +258,27 @@ struct CallBuf {
     arguments: String,
 }
 
+/// The set of tool names to advertise to the model this turn.
+///
+/// In [`Mode::Plan`] (RFC 0011) only the registry's ReadOnly tools are advertised so
+/// the model cannot see — let alone call — anything that mutates; this is intersected
+/// with any sub-agent allowlist (fail safe). In Act/Auto the allowlist passes through
+/// unchanged (`None` = full registry).
+fn advertised_tools(
+    mode: Mode,
+    allowed: Option<&std::collections::HashSet<String>>,
+    registry: &ToolRegistry,
+) -> Option<std::collections::HashSet<String>> {
+    if !mode.is_plan() {
+        return allowed.cloned();
+    }
+    let readonly = registry.readonly_tool_names();
+    Some(match allowed {
+        Some(set) => set.intersection(&readonly).cloned().collect(),
+        None => readonly,
+    })
+}
+
 /// Runs one assistant turn for `session_id`, executing any tool calls the model
 /// requests until it produces a plain text answer (or the iteration cap is hit).
 /// `on_event` is called synchronously as the turn progresses. The final assistant
@@ -276,9 +301,10 @@ pub async fn run_turn(
     mut on_event: impl FnMut(AgentEvent),
 ) -> Result<Message, AgentError> {
     let allow_subagent = tools.depth < tools.max_depth;
+    let advertised = advertised_tools(tools.mode, tools.allowed.as_ref(), tools.registry);
     let tool_schemas = tools
         .registry
-        .openai_tools_for(tools.allowed.as_ref(), allow_subagent);
+        .openai_tools_for(advertised.as_ref(), allow_subagent);
     let mut last: Option<Message> = None;
 
     let max_iter = tools.max_iterations.max(1);
@@ -499,8 +525,13 @@ pub async fn run_turn(
             // tool result. A dismissed/cancelled question yields a result too, so the
             // assistant `tool_calls` message always has a matching reply (no malformed
             // history). Asking is read-only, so it never reaches the approval gate.
-            let permitted = tools
-                .allowed
+            // Gate dispatch on the same advertised set that gated the schema (#264).
+            // `advertised` already folds together the Plan-mode read-only restriction
+            // *and* any sub-agent allowlist, so a Plan-mode model that names a hidden
+            // mutating tool (e.g. via prompt injection) is hard-blocked here -- before
+            // the approval gate -- rather than relying on schema-hiding plus the
+            // approver as the only backstop. `None` = unrestricted (Act/Auto top level).
+            let permitted = advertised
                 .as_ref()
                 .is_none_or(|set| set.contains(&call.name));
             let outcome = match parsed_args {
@@ -516,10 +547,16 @@ pub async fn run_turn(
                             None => ff_tools::ToolOutcome::error("[no answer: question dismissed]"),
                         }
                     } else if !permitted {
-                        ff_tools::ToolOutcome::error(format!(
-                            "tool `{}` is not permitted for this sub-agent",
-                            call.name
-                        ))
+                        // Distinguish the two reasons a tool can be hidden so the model
+                        // gets an actionable result instead of a silent failure.
+                        ff_tools::ToolOutcome::error(if tools.mode.is_plan() {
+                            format!(
+                                "tool `{}` is not available in Plan mode (read-only tools only)",
+                                call.name
+                            )
+                        } else {
+                            format!("tool `{}` is not permitted for this sub-agent", call.name)
+                        })
                     } else if ff_tools::is_subagent(&call.name) {
                         // Delegation (#234): drive a child turn in a fresh ephemeral session and
                         // return only its summary. The child reuses the same provider/approver,
@@ -681,6 +718,7 @@ async fn run_subagent(
         depth: parent.depth + 1,
         max_depth: parent.max_depth,
         allowed,
+        mode: parent.mode,
     };
 
     // Child events are swallowed: the parent receives only the summary, never the
@@ -712,7 +750,139 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use ff_llm::{Chunk, ChunkStream, LlmError, ToolCallDelta};
-    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
+
+    #[test]
+    fn plan_mode_advertises_only_readonly_tools() {
+        let reg = ToolRegistry::with_defaults();
+        let advertised = advertised_tools(Mode::Plan, None, &reg).expect("Plan restricts");
+        for name in ["view", "grep", "glob", "tree", "todo", "ask_user"] {
+            assert!(advertised.contains(name), "Plan should advertise {name}");
+        }
+        for name in [
+            "bash",
+            "python",
+            "edit",
+            "write",
+            "apply_patch",
+            "web_fetch",
+            "agent",
+        ] {
+            assert!(!advertised.contains(name), "Plan must hide {name}");
+        }
+    }
+
+    #[test]
+    fn plan_mode_intersects_with_subagent_allowlist() {
+        let reg = ToolRegistry::with_defaults();
+        // A sub-agent scoped to {view, edit}: Plan further drops the mutating `edit`.
+        let allowed: std::collections::HashSet<String> =
+            ["view", "edit"].iter().map(|s| s.to_string()).collect();
+        let advertised = advertised_tools(Mode::Plan, Some(&allowed), &reg).unwrap();
+        assert_eq!(advertised, ["view".to_string()].into_iter().collect());
+    }
+
+    #[test]
+    fn act_and_auto_pass_the_allowlist_through_unchanged() {
+        let reg = ToolRegistry::with_defaults();
+        assert_eq!(advertised_tools(Mode::Act, None, &reg), None);
+        assert_eq!(advertised_tools(Mode::Auto, None, &reg), None);
+        let allowed: std::collections::HashSet<String> =
+            ["view", "edit"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(
+            advertised_tools(Mode::Auto, Some(&allowed), &reg),
+            Some(allowed)
+        );
+    }
+
+    /// Records whether its approval gate was ever consulted. A Plan-mode hard block
+    /// must reject before this is reached (#264 review).
+    struct RecordingApprover {
+        consulted: Arc<AtomicBool>,
+    }
+    #[async_trait]
+    impl Approver for RecordingApprover {
+        async fn approve(
+            &self,
+            _message_id: &str,
+            _call_id: &str,
+            _name: &str,
+            _safety: Safety,
+            _args: &serde_json::Value,
+        ) -> bool {
+            self.consulted.store(true, Ordering::SeqCst);
+            true
+        }
+    }
+
+    #[tokio::test]
+    async fn plan_mode_hard_blocks_dispatch_of_a_hidden_tool() {
+        // A Plan-mode model that names a hidden mutating tool (`bash`) -- e.g. via
+        // prompt injection -- must be hard-blocked at dispatch, *before* the approval
+        // gate, not merely hidden from the schema (#264 review blocker).
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::new();
+        let s = store.create_session(None);
+        store.add_message(&s.id, Role::User, "do it".into());
+        let registry = ToolRegistry::with_defaults();
+        let root = dir.path().to_path_buf();
+        let consulted = Arc::new(AtomicBool::new(false));
+        let approve = RecordingApprover {
+            consulted: consulted.clone(),
+        };
+        let provider = ToolThenText {
+            calls: AtomicUsize::new(0),
+        };
+
+        let plan = ToolContext {
+            registry: &registry,
+            root: &root,
+            approve: &approve,
+            max_iterations: 8,
+            depth: 0,
+            max_depth: 1,
+            allowed: None,
+            mode: Mode::Plan,
+        };
+
+        run_turn(
+            &provider,
+            &store,
+            &plan,
+            &s.id,
+            "mock",
+            None,
+            false,
+            CancelToken::new(),
+            |_| {},
+        )
+        .await
+        .unwrap();
+
+        // The approver was never consulted -- the block is structural, independent of
+        // model or approver behaviour.
+        assert!(
+            !consulted.load(Ordering::SeqCst),
+            "Plan-mode dispatch must hard-block before the approval gate"
+        );
+
+        // The tool never ran; the model gets a clear, actionable Plan-mode error.
+        let history = store.get_messages(&s.id);
+        let tool_result = history
+            .iter()
+            .find(|m| m.role == Role::Tool)
+            .expect("the blocked call still produces a tool result");
+        assert!(
+            tool_result.content.contains("not available in Plan mode"),
+            "{}",
+            tool_result.content
+        );
+        assert!(
+            !tool_result.content.contains("wired"),
+            "bash must not have executed: {}",
+            tool_result.content
+        );
+    }
 
     struct AlwaysApprove;
     #[async_trait]
@@ -1359,7 +1529,7 @@ mod tests {
             timezone: "America/Chicago".into(),
             time_of_day: TimeOfDay::Morning,
         };
-        let system = build_system_prompt(None, &skills, &[], &user, None);
+        let system = build_system_prompt(None, &skills, &[], &user, None, Mode::default());
 
         let store = SessionStore::new();
         let s = store.create_session(None);
@@ -1465,6 +1635,7 @@ mod tests {
             depth: 1,
             max_depth: 1,
             allowed: None,
+            mode: Mode::default(),
         };
 
         run_turn(
@@ -1517,6 +1688,7 @@ mod tests {
             depth: 1,
             max_depth: 1,
             allowed: Some(["view".to_string()].into_iter().collect()),
+            mode: Mode::default(),
         };
 
         run_turn(

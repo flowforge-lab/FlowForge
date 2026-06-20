@@ -44,6 +44,10 @@ impl Tool for AskUserTool {
         Safety::ReadOnly
     }
 
+    fn max_safety(&self) -> Safety {
+        Safety::ReadOnly
+    }
+
     fn interactive(&self) -> bool {
         true
     }

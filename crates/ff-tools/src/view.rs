@@ -40,6 +40,10 @@ impl Tool for ViewTool {
         Safety::ReadOnly
     }
 
+    fn max_safety(&self) -> Safety {
+        Safety::ReadOnly
+    }
+
     async fn run(&self, args: Value, root: &Path) -> ToolOutcome {
         let Some(path) = args.get("path").and_then(Value::as_str) else {
             return ToolOutcome::error("missing required argument: path");

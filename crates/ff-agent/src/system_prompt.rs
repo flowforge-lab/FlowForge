@@ -13,6 +13,7 @@
 //! cache for the system prompt (and the tools block that follows it) on every
 //! turn after the first.
 
+use ff_core::Mode;
 use ff_skills::SkillRegistry;
 
 /// Coarse time-of-day band for the ambient context (RFC 0008 §6). A *band*, not a
@@ -102,6 +103,7 @@ pub fn build_system_prompt(
     active: &[String],
     user: &UserContext,
     memory: Option<&str>,
+    mode: Mode,
 ) -> String {
     let mut out = String::new();
 
@@ -160,7 +162,28 @@ pub fn build_system_prompt(
         }
     }
 
+    if let Some(steer) = mode_steer(mode) {
+        out.push('\n');
+        out.push_str(steer);
+        out.push('\n');
+    }
+
     out
+}
+
+/// Per-mode behavioural steer appended to the prompt (RFC 0011). Only Plan adds
+/// text; Act and Auto rely on the default behaviour, so their prompt is unchanged.
+fn mode_steer(mode: Mode) -> Option<&'static str> {
+    match mode {
+        Mode::Plan => Some(
+            "## Mode: Plan\n\nYou are in Plan mode. Only read-only tools are \
+             available to you; you cannot edit files, run commands, or otherwise \
+             change the world. Investigate the request and produce a clear, concrete \
+             plan the user can review. End your turn with that plan. Do not attempt \
+             to make changes -- the user will switch you to Act or Auto to execute.",
+        ),
+        Mode::Act | Mode::Auto => None,
+    }
 }
 
 /// The system prompt for a pre-compaction memory-flush turn (RFC 0006 §7.2).
@@ -229,9 +252,29 @@ mod tests {
     }
 
     #[test]
+    fn plan_mode_appends_a_plan_steer() {
+        let reg = SkillRegistry::new();
+        let out = build_system_prompt(None, &reg, &[], &ctx(), None, Mode::Plan);
+        assert!(out.contains("## Mode: Plan"), "{out}");
+        assert!(out.contains("Only read-only tools"), "{out}");
+    }
+
+    #[test]
+    fn act_and_auto_modes_add_no_steer() {
+        let reg = SkillRegistry::new();
+        for mode in [Mode::Act, Mode::Auto] {
+            let out = build_system_prompt(None, &reg, &[], &ctx(), None, mode);
+            assert!(
+                !out.contains("## Mode:"),
+                "{mode:?} should add no mode steer: {out}"
+            );
+        }
+    }
+
+    #[test]
     fn includes_user_context_from_supplied_clock() {
         let reg = SkillRegistry::new();
-        let out = build_system_prompt(None, &reg, &[], &ctx(), None);
+        let out = build_system_prompt(None, &reg, &[], &ctx(), None, Mode::default());
         assert!(out.contains("## User context"));
         assert!(
             out.contains("Current: 2026-06-13, evening (America/Chicago)."),
@@ -267,7 +310,7 @@ mod tests {
         let reg = SkillRegistry::new();
         let mut user = ctx();
         user.time_of_day = TimeOfDay::Morning;
-        let out = build_system_prompt(None, &reg, &[], &user, None);
+        let out = build_system_prompt(None, &reg, &[], &user, None, Mode::default());
         assert!(
             out.contains("Current: 2026-06-13, morning (America/Chicago)."),
             "{out}"
@@ -292,6 +335,7 @@ mod tests {
             &["alpha".into()],
             &ctx(),
             None,
+            Mode::default(),
         );
         let persona = out.find("You are Akisa.").unwrap();
         let available = out.find("## Available skills").unwrap();
@@ -306,16 +350,23 @@ mod tests {
     #[test]
     fn persona_is_prepended_when_set_and_absent_when_none() {
         let reg = SkillRegistry::new();
-        let with = build_system_prompt(Some("You are Akisa."), &reg, &[], &ctx(), None);
+        let with = build_system_prompt(
+            Some("You are Akisa."),
+            &reg,
+            &[],
+            &ctx(),
+            None,
+            Mode::default(),
+        );
         assert!(with.starts_with("You are Akisa.\n\n"));
-        let without = build_system_prompt(None, &reg, &[], &ctx(), None);
+        let without = build_system_prompt(None, &reg, &[], &ctx(), None, Mode::default());
         assert!(without.starts_with("## User context"));
     }
 
     #[test]
     fn blank_persona_is_ignored() {
         let reg = SkillRegistry::new();
-        let out = build_system_prompt(Some("   \n  "), &reg, &[], &ctx(), None);
+        let out = build_system_prompt(Some("   \n  "), &reg, &[], &ctx(), None, Mode::default());
         assert!(out.starts_with("## User context"), "{out}");
     }
 
@@ -325,7 +376,7 @@ mod tests {
             skill("zeta", "Z things", "zbody"),
             skill("alpha", "A things", "abody"),
         ]);
-        let out = build_system_prompt(None, &reg, &[], &ctx(), None);
+        let out = build_system_prompt(None, &reg, &[], &ctx(), None, Mode::default());
         assert!(out.contains("## Available skills"));
         let a = out.find("- alpha: A things").unwrap();
         let z = out.find("- zeta: Z things").unwrap();
@@ -338,7 +389,14 @@ mod tests {
             skill("rust-debug", "Debug Rust", "Use bash and view to bisect."),
             skill("idle", "Unused", "SHOULD_NOT_APPEAR"),
         ]);
-        let out = build_system_prompt(None, &reg, &["rust-debug".into()], &ctx(), None);
+        let out = build_system_prompt(
+            None,
+            &reg,
+            &["rust-debug".into()],
+            &ctx(),
+            None,
+            Mode::default(),
+        );
         assert!(out.contains("## Active skill instructions"));
         assert!(out.contains("### rust-debug"));
         assert!(out.contains("Use bash and view to bisect."));
@@ -353,14 +411,14 @@ mod tests {
     #[test]
     fn no_active_section_when_none_active() {
         let reg = registry(vec![skill("a", "desc", "body")]);
-        let out = build_system_prompt(None, &reg, &[], &ctx(), None);
+        let out = build_system_prompt(None, &reg, &[], &ctx(), None, Mode::default());
         assert!(!out.contains("## Active skill instructions"), "{out}");
     }
 
     #[test]
     fn unknown_active_name_is_skipped() {
         let reg = registry(vec![skill("a", "desc", "body")]);
-        let out = build_system_prompt(None, &reg, &["ghost".into()], &ctx(), None);
+        let out = build_system_prompt(None, &reg, &["ghost".into()], &ctx(), None, Mode::default());
         assert!(!out.contains("## Active skill instructions"), "{out}");
     }
 
@@ -368,7 +426,7 @@ mod tests {
     fn memory_block_is_appended_after_user_context() {
         let reg = SkillRegistry::new();
         let mem = "## Memory\n\nUser prefers Rust.";
-        let out = build_system_prompt(None, &reg, &[], &ctx(), Some(mem));
+        let out = build_system_prompt(None, &reg, &[], &ctx(), Some(mem), Mode::default());
         let user = out.find("## User context").unwrap();
         let memory = out.find("## Memory").unwrap();
         assert!(user < memory, "memory must follow user context: {out}");
@@ -378,9 +436,9 @@ mod tests {
     #[test]
     fn none_or_blank_memory_adds_nothing() {
         let reg = SkillRegistry::new();
-        let without = build_system_prompt(None, &reg, &[], &ctx(), None);
+        let without = build_system_prompt(None, &reg, &[], &ctx(), None, Mode::default());
         assert!(!without.contains("## Memory"));
-        let blank = build_system_prompt(None, &reg, &[], &ctx(), Some("   \n  "));
+        let blank = build_system_prompt(None, &reg, &[], &ctx(), Some("   \n  "), Mode::default());
         assert!(!blank.contains("## Memory"));
     }
 }

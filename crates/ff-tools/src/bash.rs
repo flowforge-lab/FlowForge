@@ -137,6 +137,10 @@ impl Tool for BashTool {
         }
     }
 
+    fn max_safety(&self) -> Safety {
+        Safety::Dangerous
+    }
+
     async fn run(&self, args: Value, root: &Path) -> ToolOutcome {
         let Some(command) = Self::command_arg(&args) else {
             return ToolOutcome::error("missing required argument: command");
