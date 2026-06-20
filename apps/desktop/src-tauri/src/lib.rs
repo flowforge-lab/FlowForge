@@ -349,12 +349,7 @@ fn send_message(
         // Snapshot built-in + MCP-bridged tools for this turn (RFC 0003 §6).
         let registry = state.build_tool_registry();
         let session_root = state.session_root(&sid);
-        let tool_ctx = ToolContext {
-            registry: &registry,
-            root: &session_root,
-            approve: &approver,
-            max_iterations: 8,
-        };
+        let tool_ctx = ToolContext::new(&registry, &session_root, &approver, 8);
         // Skills + ambient context for this turn (RFC 0001 §4, RFC 0002 phase 1):
         // the active phenotype's persona, installed-skill descriptions, the bodies of
         // active skills, and the current local time.

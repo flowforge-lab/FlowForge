@@ -17,6 +17,7 @@
 //! [`ask_user`] is interactive: it pauses the turn for user input (#44) rather than
 //! executing, so the agent loop routes it through the host's `Approver::ask`.
 
+mod agent_tool;
 mod apply_patch;
 mod ask_user;
 mod bash;
@@ -36,5 +37,6 @@ mod view;
 mod web_fetch;
 mod write;
 
-pub use registry::{Safety, Tool, ToolOutcome, ToolRegistry};
+pub use agent_tool::{AgentTool, AGENT_TOOL_NAME};
+pub use registry::{is_subagent, Safety, Tool, ToolOutcome, ToolRegistry};
 pub use url_safety::SsrfPolicy;

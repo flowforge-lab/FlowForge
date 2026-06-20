@@ -116,6 +116,16 @@ export function describeStep(step: Pick<ToolStep, "tool" | "args">): string {
     }
     case "ask_user":
       return "Ask a question";
+    case "agent": {
+      const task = strArg(args, "task");
+      if (!task) return "Delegate to sub-agent";
+      const firstLine = task.split("\n")[0]?.trim() ?? task;
+      const truncated =
+        firstLine.length > BASH_CMD_TRUNCATE
+          ? `${firstLine.slice(0, BASH_CMD_TRUNCATE)}…`
+          : firstLine;
+      return `Delegate: ${truncated}`;
+    }
     default: {
       const mcp = parseMcpToolName(tool);
       if (mcp) return `${mcp.server}: ${mcp.tool}`;

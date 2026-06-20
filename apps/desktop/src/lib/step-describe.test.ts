@@ -126,6 +126,18 @@ describe("describeStep", () => {
     ).toBe("Ask a question");
   });
 
+  it("agent: delegation label", () => {
+    expect(
+      describeStep({ tool: "agent", args: { task: "audit the foo module" } }),
+    ).toBe("Delegate: audit the foo module");
+    expect(
+      describeStep({ tool: "agent", args: { task: "line one\nline two" } }),
+    ).toBe("Delegate: line one");
+    expect(describeStep({ tool: "agent", args: {} })).toBe(
+      "Delegate to sub-agent",
+    );
+  });
+
   it("todo: done/total counts", () => {
     expect(
       describeStep({
