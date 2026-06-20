@@ -534,7 +534,7 @@ impl AppState {
     /// never races an in-flight tool call — same discipline as skill snapshots.
     pub fn build_tool_registry(&self) -> ToolRegistry {
         let mut reg = ToolRegistry::with_defaults();
-        reg.register(Box::new(crate::web_search::WebSearchTool::new(
+        reg.register(Box::new(ff_tools::WebSearchTool::new(
             self.search_config.clone(),
         )));
         reg.register(Box::new(crate::tools::InstallSkillTool::new(

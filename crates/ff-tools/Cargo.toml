@@ -20,6 +20,7 @@ futures-util = { workspace = true }
 url = { workspace = true }
 fast_html2md = { workspace = true }
 dom_smoothie = { workspace = true }
+ff-core = { workspace = true }
 ff-memory = { workspace = true }
 chrono = { workspace = true }
 

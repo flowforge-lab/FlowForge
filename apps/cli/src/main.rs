@@ -198,11 +198,27 @@ fn resolve_turn_inputs(
     })
 }
 
+/// Loads persisted web-search settings from `~/.config/flowforge/search.json` (the
+/// same file the desktop Settings pane writes). Falls back to the default
+/// (SearXNG, no endpoint) when the file is missing or unparseable; with no
+/// endpoint configured the tool returns a clear "not configured" error rather
+/// than failing the registry build.
+fn load_search_config() -> ff_core::SearchConfig {
+    dirs::config_dir()
+        .map(|d| d.join("flowforge").join("search.json"))
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
 /// Shared durable-memory setup (RFC 0006). Builds the store + FTS5 index, does a
 /// full reindex from disk, and registers the three memory tools. Best-effort: an
 /// index failure leaves the ambient block working but skips the recall tools.
 fn build_registry_with_memory() -> (ff_tools::ToolRegistry, std::sync::Arc<ff_memory::Memory>) {
     let mut registry = ff_tools::ToolRegistry::with_defaults();
+    registry.register(Box::new(ff_tools::WebSearchTool::new(std::sync::Arc::new(
+        std::sync::Mutex::new(load_search_config()),
+    ))));
     let memory_store = std::sync::Arc::new(ff_memory::Memory::with_default_root(
         ff_memory::MemoryConfig::default(),
     ));
@@ -515,7 +531,7 @@ mod tests {
     use std::process::ExitCode;
 
     use super::json_events;
-    use super::{approval_mode, resolve_turn_inputs, Cli};
+    use super::{approval_mode, build_registry_with_memory, resolve_turn_inputs, Cli};
     use crate::approver::ApprovalMode;
     use async_trait::async_trait;
     use clap::CommandFactory;
@@ -1006,5 +1022,14 @@ mod tests {
         let mut active = inputs.active.clone();
         active.sort();
         assert_eq!(active, vec!["cargo-check", "clippy", "extra"]);
+    }
+
+    #[test]
+    fn cli_registry_includes_web_search() {
+        let (registry, _memory) = build_registry_with_memory();
+        assert!(
+            registry.get("web_search").is_some(),
+            "web_search must be registered in the CLI tool registry (#241)"
+        );
     }
 }

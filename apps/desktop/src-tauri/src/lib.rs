@@ -5,7 +5,6 @@
 mod optimize;
 mod state;
 mod tools;
-mod web_search;
 
 use async_trait::async_trait;
 use ff_agent::{run_turn, AgentEvent, Approver, CancelToken, ToolContext};
