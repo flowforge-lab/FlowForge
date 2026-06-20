@@ -450,14 +450,21 @@ export function SessionSidebar() {
     window.addEventListener("mouseup", onUp);
   }
 
-  // New session lands in the focused pane (#148) so the layout is preserved —
-  // matches app-shell's Cmd+N and the palette. Falls back to a plain new session
-  // when panes aren't initialized yet.
+  // The + button spins off a new blank session in a right split, focusing it
+  // (#245 2a) — splitting is the useful default over swapping the focused pane.
+  // At the pane cap (or before panes initialize) it falls back to the old in-pane
+  // swap so the button never dead-ends. (⌘N stays an in-pane quick-swap.)
   function newSessionInFocusedPane() {
+    const panes = usePanesStore.getState();
+    const focused = panes.focusedPaneId;
+    if (focused && panes.leafCount() < MAX_PANES) {
+      void panes.splitNew(focused, "vertical");
+      return;
+    }
     void newSession().then(() => {
       const id = useChatStore.getState().activeSessionId;
-      const focused = usePanesStore.getState().focusedPaneId;
-      if (id && focused) usePanesStore.getState().setPaneSession(focused, id);
+      const f = usePanesStore.getState().focusedPaneId;
+      if (id && f) usePanesStore.getState().setPaneSession(f, id);
     });
   }
   const theme = useTheme((s) => s.theme);
@@ -628,7 +635,7 @@ export function SessionSidebar() {
             size="icon"
             className="size-7 bg-emerald-600 text-white hover:bg-emerald-600/90"
             onClick={newSessionInFocusedPane}
-            title="New session (⌘N)"
+            title="New session in split"
             aria-label="New session"
           >
             <Plus className="size-4" />

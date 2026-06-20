@@ -101,6 +101,22 @@ describe("panes store (#148)", () => {
     expect(usePanesStore.getState().leafCount()).toBe(1);
   });
 
+  it("splitNew opens a fresh blank session in a focused right split (#245 2a)", async () => {
+    const src = await ipc.createSession();
+    usePanesStore.getState().init([src.id], src.id);
+    const leafId = leaves(root())[0].id;
+
+    await usePanesStore.getState().splitNew(leafId, "vertical");
+
+    const all = leaves(root());
+    expect(all).toHaveLength(2);
+    const newLeaf = all.find((l) => l.id !== leafId)!;
+    // A brand-new session (not the source) lands in the new, focused pane.
+    expect(newLeaf.sessionId).not.toBe(src.id);
+    expect(focused()).toBe(newLeaf.id);
+    expect((root() as SplitNode).dir).toBe("vertical");
+  });
+
   it("does not split beyond MAX_PANES", () => {
     usePanesStore.getState().init(["s1"], "s1");
     for (let i = 2; i <= MAX_PANES; i++) {
