@@ -9,7 +9,8 @@ use ff_agent::{
     MemoryFlush, ProxyTokenEstimator, DEFAULT_FLUSH_AT_FRACTION,
 };
 use ff_core::{
-    Phenotype, ProviderConfig, ProviderConnection, ProviderKind, ProviderRegistry, SearchConfig,
+    Mode, Phenotype, ProviderConfig, ProviderConnection, ProviderKind, ProviderRegistry,
+    SearchConfig,
 };
 use ff_llm::{OllamaProvider, OpenAiProvider, Provider};
 use ff_mcp::{McpConfigWatcher, SupervisorHandle};
@@ -326,6 +327,41 @@ struct ActivePhenotypeFile {
     active: String,
 }
 
+/// `~/.config/flowforge/mode.json` — the default agent autonomy mode (RFC 0011 P2,
+/// #265), persisted so the user's choice survives a restart. New sessions with no
+/// explicit binding inherit this; the factory value is [`Mode::Auto`].
+fn default_mode_path() -> Option<PathBuf> {
+    dirs::config_dir().map(|d| d.join("flowforge").join("mode.json"))
+}
+
+/// On-disk shape of `mode.json`.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct DefaultModeFile {
+    default: Mode,
+}
+
+/// The persisted default mode, or [`Mode::Auto`] if never set / unreadable.
+fn load_default_mode() -> Mode {
+    default_mode_path()
+        .and_then(|p| fs::read_to_string(p).ok())
+        .and_then(|raw| serde_json::from_str::<DefaultModeFile>(&raw).ok())
+        .map(|f| f.default)
+        .unwrap_or(Mode::Auto)
+}
+
+/// Persist the default mode. Best-effort, like `save_active_phenotype_name`.
+fn save_default_mode(mode: Mode) {
+    let Some(path) = default_mode_path() else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    if let Ok(json) = serde_json::to_string_pretty(&DefaultModeFile { default: mode }) {
+        let _ = fs::write(path, json);
+    }
+}
+
 /// `~/.flowforge/phenotypes`, where phenotype definition TOML files live.
 fn phenotypes_root() -> PathBuf {
     dirs::home_dir()
@@ -386,6 +422,9 @@ pub struct AppState {
     /// The active phenotype, resolved at startup from the persisted pointer (RFC
     /// 0001 §7). Supplies the model and persona overrides for each turn.
     active_phenotype: Mutex<Phenotype>,
+    /// The default agent autonomy mode (RFC 0011 P2, #265), loaded at startup from
+    /// `mode.json`. A session with no explicit mode binding inherits this.
+    default_mode: Mutex<Mode>,
     /// Per-skill telemetry aggregates (RFC 0001 §8), persisted to
     /// `~/.flowforge/skill_signals.json`. Updated at each turn's start/end; read by
     /// the manual optimize flow's cost estimates.
@@ -453,6 +492,7 @@ impl AppState {
             }),
             active_skills: Mutex::new(BTreeSet::new()),
             active_phenotype: Mutex::new(default_phenotype()),
+            default_mode: Mutex::new(load_default_mode()),
             signals: Mutex::new(load_signals()),
             _mcp_watcher: Mutex::new(None),
             mcp: Mutex::new(None),
@@ -986,6 +1026,32 @@ impl AppState {
         }
         self.store.set_session_phenotype(session_id, name);
         Ok(())
+    }
+
+    /// The global default mode (#265). Factory value [`Mode::Auto`].
+    pub fn default_mode(&self) -> Mode {
+        *self.default_mode.lock().unwrap()
+    }
+
+    /// Set and persist the global default mode (#265).
+    pub fn set_default_mode(&self, mode: Mode) {
+        *self.default_mode.lock().unwrap() = mode;
+        save_default_mode(mode);
+    }
+
+    /// Resolve the mode a turn for `session_id` runs as (#265): an explicit per-pane
+    /// binding, else the global [`default_mode`](Self::default_mode). Mirrors
+    /// [`session_phenotype`](Self::session_phenotype).
+    pub fn session_mode(&self, session_id: &str) -> Mode {
+        self.store
+            .session_mode(session_id)
+            .unwrap_or_else(|| self.default_mode())
+    }
+
+    /// Bind `session_id` to a mode, or clear it (`None`) so the session inherits the
+    /// global default again (#265).
+    pub fn set_session_mode(&self, session_id: &str, mode: Option<Mode>) {
+        self.store.set_session_mode(session_id, mode);
     }
 }
 
@@ -1658,6 +1724,33 @@ mod tests {
         assert!(state.store.session_phenotype(&s.id).is_none());
         // Clearing always succeeds.
         state.set_session_phenotype(&s.id, None).unwrap();
+    }
+
+    // An unbound session runs as the global default mode (#265). We compare against
+    // the live `default_mode()` rather than a literal so the test stays hermetic
+    // regardless of any persisted `mode.json` in the dev environment.
+    #[test]
+    fn unbound_session_inherits_default_mode() {
+        let state = AppState::new();
+        let s = state.store.create_session(None);
+        assert_eq!(state.session_mode(&s.id), state.default_mode());
+    }
+
+    #[test]
+    fn bound_session_resolves_to_its_own_mode() {
+        let state = AppState::new();
+        let s = state.store.create_session(None);
+        state.set_session_mode(&s.id, Some(Mode::Plan));
+        assert_eq!(state.session_mode(&s.id), Mode::Plan);
+        // Clearing the binding inherits the global default again.
+        state.set_session_mode(&s.id, None);
+        assert_eq!(state.session_mode(&s.id), state.default_mode());
+    }
+
+    #[test]
+    fn unknown_session_resolves_to_default_mode() {
+        let state = AppState::new();
+        assert_eq!(state.session_mode("ghost-session"), state.default_mode());
     }
 
     // Regression guard for the #246 review blocker: per-session phenotype binding

@@ -16,7 +16,7 @@ use ff_core::events::{
 };
 use ff_core::{
     McpServerConfig, McpServerStatus, MemoryFileInfo, MemoryFileKind, MemoryOverview, Message,
-    Phenotype, ProviderConfig, ProviderConnection, ProviderKind, ProviderRegistry, Role,
+    Mode, Phenotype, ProviderConfig, ProviderConnection, ProviderKind, ProviderRegistry, Role,
     SearchConfig, Session, SessionWorkspace, Skill, SkillInfo, SkillManifest,
 };
 use ff_signals::SkillAggregate;
@@ -49,10 +49,21 @@ impl TurnMetrics {
 
 /// Routes write/dangerous tool calls through a UI confirmation. Read-only calls
 /// never reach this approver — the agent loop short-circuits them.
+/// Whether the active autonomy mode auto-approves a call of this safety without a
+/// prompt. Only `Auto` + `Write` qualifies; `Dangerous` always prompts regardless
+/// of mode, preserving the #232 invariant that arbitrary code (python, `rm`) needs
+/// a deliberate yes. ReadOnly never reaches the approver.
+fn mode_auto_approves(mode: Mode, safety: Safety) -> bool {
+    mode == Mode::Auto && safety == Safety::Write
+}
+
 struct UiApprover {
     app: tauri::AppHandle,
     state: Arc<AppState>,
     session_id: String,
+    /// The session's resolved autonomy mode for this turn (#265). In [`Mode::Auto`]
+    /// a `Write` call is auto-approved; `Dangerous` always prompts regardless of mode.
+    mode: Mode,
 }
 
 #[async_trait]
@@ -68,6 +79,13 @@ impl Approver for UiApprover {
         // Short-circuit on the #229 allowlist (never covers Dangerous — see
         // `AppState::allowlist_covers`).
         if self.state.allowlist_covers(&self.session_id, name, safety) {
+            return true;
+        }
+
+        // Auto mode (#265) auto-approves Write without a prompt; Dangerous always
+        // falls through to the prompt below, so arbitrary code (python, `rm`) is
+        // never silently run. ReadOnly never reaches here (the loop short-circuits).
+        if mode_auto_approves(self.mode, safety) {
             return true;
         }
 
@@ -380,17 +398,23 @@ fn send_message(
     let max_iterations = pheno
         .max_iterations
         .unwrap_or(ff_agent::DEFAULT_MAX_ITERATIONS);
+    // Resolve THIS session's autonomy mode (#265): an explicit per-pane binding, else
+    // the global default. Governs tool capability (Plan), the prompt steer, and the
+    // approval policy for the turn.
+    let mode = state.session_mode(&session_id);
     tauri::async_runtime::spawn(async move {
         let sid = session_id.clone();
         let approver = UiApprover {
             app: app.clone(),
             state: state.clone(),
             session_id: sid.clone(),
+            mode,
         };
         // Snapshot built-in + MCP-bridged tools for this turn (RFC 0003 §6).
         let registry = state.build_tool_registry();
         let session_root = state.session_root(&sid);
-        let tool_ctx = ToolContext::new(&registry, &session_root, &approver, max_iterations);
+        let mut tool_ctx = ToolContext::new(&registry, &session_root, &approver, max_iterations);
+        tool_ctx.mode = mode;
         // Skills + ambient context for this turn (RFC 0001 §4, RFC 0002 phase 1):
         // the resolved persona, installed-skill descriptions, the bodies of the
         // active skills, and the current local time.
@@ -407,7 +431,7 @@ fn send_message(
             &active,
             &user_ctx,
             memory.as_deref(),
-            ff_core::Mode::default(),
+            mode,
         );
 
         // Telemetry (RFC 0001 §8): one SkillActivated per active skill, plus a
@@ -1021,6 +1045,26 @@ fn set_session_phenotype(
     state.set_session_phenotype(&session_id, name)
 }
 
+/// Bind a single session's autonomy mode, or clear it (`mode: None`) so it inherits
+/// the global default (#265). Per-pane, like `set_session_phenotype`.
+#[tauri::command]
+fn set_session_mode(state: State<'_, Arc<AppState>>, session_id: String, mode: Option<Mode>) {
+    state.set_session_mode(&session_id, mode);
+}
+
+/// The global default autonomy mode (#265), inherited by sessions with no explicit
+/// binding. Factory value `Auto`.
+#[tauri::command]
+fn get_default_mode(state: State<'_, Arc<AppState>>) -> Mode {
+    state.default_mode()
+}
+
+/// Set and persist the global default autonomy mode (#265).
+#[tauri::command]
+fn set_default_mode(state: State<'_, Arc<AppState>>, mode: Mode) {
+    state.set_default_mode(mode);
+}
+
 // ---- MCP server control (M4.4, RFC 0003 §3,5) ----
 //
 // Enable/disable/add/remove write `mcp.json` via `ff_mcp::config`; the existing config
@@ -1165,6 +1209,9 @@ pub fn run() {
             get_phenotype,
             switch_phenotype,
             set_session_phenotype,
+            set_session_mode,
+            get_default_mode,
+            set_default_mode,
             list_mcp_servers,
             restart_mcp_server,
             set_mcp_server_enabled,
@@ -1189,7 +1236,26 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    use super::{git_branch, resolve_workspace_dir};
+    use super::{git_branch, mode_auto_approves, resolve_workspace_dir};
+    use ff_core::Mode;
+    use ff_tools::Safety;
+
+    // The one mode-driven auto-approve carve-out (#265): only Auto+Write is silent.
+    // Dangerous always prompts (any mode), and the other modes prompt every write.
+    #[test]
+    fn mode_auto_approves_only_auto_write() {
+        assert!(mode_auto_approves(Mode::Auto, Safety::Write));
+        // Dangerous is never auto-approved by mode -- this is the #232 invariant
+        // that keeps python / `rm` behind a deliberate yes.
+        assert!(!mode_auto_approves(Mode::Auto, Safety::Dangerous));
+        // Act and Plan prompt for writes too.
+        assert!(!mode_auto_approves(Mode::Act, Safety::Write));
+        assert!(!mode_auto_approves(Mode::Plan, Safety::Write));
+        assert!(!mode_auto_approves(Mode::Act, Safety::Dangerous));
+        assert!(!mode_auto_approves(Mode::Plan, Safety::Dangerous));
+        // ReadOnly never reaches the approver, but the helper is conservative.
+        assert!(!mode_auto_approves(Mode::Auto, Safety::ReadOnly));
+    }
 
     #[test]
     fn resolve_workspace_dir_accepts_existing_directory() {

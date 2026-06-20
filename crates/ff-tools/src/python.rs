@@ -7,7 +7,8 @@
 //!
 //! Honesty note: like [`crate::bash`], Python is **not** sandboxed -- a snippet can
 //! reach any path the user can, open sockets, or spawn subprocesses. It is always
-//! classified [`Safety::Write`] so the host's approval gate covers it. OS-level
+//! classified [`Safety::Dangerous`] so it always reaches the approval prompt and is
+//! never auto-approved (#265). OS-level
 //! sandboxing (sandbox-exec / Landlock) is the same tracked follow-up that covers
 //! `bash`.
 //!
@@ -140,9 +141,14 @@ impl Tool for PythonTool {
     }
 
     fn safety(&self, _args: &Value) -> Safety {
-        // Python can touch the filesystem, network, and subprocesses; proving a
-        // snippet is read-only is infeasible, so always defer to the approval gate.
-        Safety::Write
+        // Python runs arbitrary code (os.system, sockets, subprocesses) with no
+        // detectable safe subset, so it is always Dangerous: it must always reach the
+        // approval prompt and can never be auto-approved by Auto mode (#265).
+        Safety::Dangerous
+    }
+
+    fn max_safety(&self) -> Safety {
+        Safety::Dangerous
     }
 
     async fn run(&self, args: Value, root: &Path) -> ToolOutcome {
@@ -353,11 +359,12 @@ mod tests {
     }
 
     #[test]
-    fn always_write_safety() {
+    fn always_dangerous_safety() {
         assert_eq!(
             PythonTool.safety(&serde_json::json!({"code": "print(1)"})),
-            Safety::Write
+            Safety::Dangerous
         );
+        assert_eq!(PythonTool.max_safety(), Safety::Dangerous);
     }
 
     #[test]

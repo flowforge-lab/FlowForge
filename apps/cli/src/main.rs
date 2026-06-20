@@ -14,7 +14,7 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use ff_agent::{run_turn, AgentEvent, CancelToken, ToolContext, UserContext};
-use ff_core::Role;
+use ff_core::{Mode, Role};
 
 use crate::approver::{ApprovalMode, CliApprover};
 
@@ -25,6 +25,27 @@ use crate::approver::{ApprovalMode, CliApprover};
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
+}
+
+/// CLI surface for the agent's Plan/Act/Auto mode. Maps to [`ff_core::Mode`].
+/// `auto` (the default) auto-approves writes; `act` prompts for every write and
+/// dangerous call; `plan` additionally hides write/dangerous tools from the model.
+/// Dangerous calls always still prompt regardless of mode.
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+enum ModeArg {
+    Plan,
+    Act,
+    Auto,
+}
+
+impl From<ModeArg> for Mode {
+    fn from(arg: ModeArg) -> Self {
+        match arg {
+            ModeArg::Plan => Mode::Plan,
+            ModeArg::Act => Mode::Act,
+            ModeArg::Auto => Mode::Auto,
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -51,6 +72,10 @@ enum Command {
         /// Load a phenotype's active skills, model, and persona (see `~/.flowforge/phenotypes`).
         #[arg(long, value_name = "NAME")]
         pheno: Option<String>,
+        /// Approval mode: `auto` auto-approves writes, `act` prompts every write,
+        /// `plan` also hides write/dangerous tools. Dangerous calls always prompt.
+        #[arg(long, value_enum, default_value = "auto")]
+        mode: ModeArg,
     },
     /// Open an interactive REPL (multi-turn, in-process session). Default when
     /// no subcommand is given. Type `exit` or press Ctrl-D to quit.
@@ -64,6 +89,10 @@ enum Command {
         /// Auto-deny write and dangerous tool calls without prompting.
         #[arg(long, conflicts_with = "yes")]
         deny: bool,
+        /// Approval mode: `auto` auto-approves writes, `act` prompts every write,
+        /// `plan` also hides write/dangerous tools. Dangerous calls always prompt.
+        #[arg(long, value_enum, default_value = "auto")]
+        mode: ModeArg,
     },
     /// Inspect installed skills (shared with the desktop app).
     Skills {
@@ -85,6 +114,7 @@ async fn main() -> ExitCode {
         json: false,
         yes: false,
         deny: false,
+        mode: ModeArg::Auto,
     }) {
         Command::Run {
             prompt,
@@ -94,8 +124,25 @@ async fn main() -> ExitCode {
             model,
             skill,
             pheno,
-        } => run(prompt, json, approval_mode(yes, deny), model, skill, pheno).await,
-        Command::Chat { json, yes, deny } => chat(json, approval_mode(yes, deny)).await,
+            mode,
+        } => {
+            run(
+                prompt,
+                json,
+                approval_mode(yes, deny),
+                mode.into(),
+                model,
+                skill,
+                pheno,
+            )
+            .await
+        }
+        Command::Chat {
+            json,
+            yes,
+            deny,
+            mode,
+        } => chat(json, approval_mode(yes, deny), mode.into()).await,
         Command::Skills { command } => match command {
             SkillsCommand::List => skills_list(),
         },
@@ -251,6 +298,7 @@ async fn run(
     prompt: String,
     json: bool,
     approval_mode: ApprovalMode,
+    mode: Mode,
     model: Option<String>,
     skill: Vec<String>,
     pheno: Option<String>,
@@ -260,7 +308,7 @@ async fn run(
     let workspace = host::workspace_root();
     let store = ff_session::SessionStore::new();
     let (registry, memory_store) = build_registry_with_memory();
-    let approver = CliApprover::new(approval_mode);
+    let approver = CliApprover::new(approval_mode, mode);
 
     let session = store.create_session(None);
     store.add_message(&session.id, Role::User, prompt);
@@ -301,10 +349,11 @@ async fn run(
         &inputs.active,
         &user_ctx,
         memory.as_deref(),
-        ff_core::Mode::default(),
+        mode,
     );
 
-    let tool_ctx = ToolContext::new(&registry, &workspace, &approver, inputs.max_iterations);
+    let mut tool_ctx = ToolContext::new(&registry, &workspace, &approver, inputs.max_iterations);
+    tool_ctx.mode = mode;
 
     let cancel = CancelToken::new();
     // Ctrl-C cancels the turn cooperatively. `ctrl_c()` is portable across Unix and
@@ -359,21 +408,22 @@ async fn run(
 /// Interactive REPL (multi-turn, one in-process session). Keeps a single
 /// [`ff_session::SessionStore`] alive for the life of the process so each turn
 /// sees the full accumulated history. Loops until EOF, `exit`, or `quit`.
-async fn chat(json: bool, approval_mode: ApprovalMode) -> ExitCode {
+async fn chat(json: bool, approval_mode: ApprovalMode, mode: Mode) -> ExitCode {
     let (provider, model) = host::load_provider();
     let skills = host::load_skills();
     let workspace = host::workspace_root();
     let store = ff_session::SessionStore::new();
     let (registry, memory_store) = build_registry_with_memory();
-    let approver = CliApprover::new(approval_mode);
+    let approver = CliApprover::new(approval_mode, mode);
     let session = store.create_session(None);
 
-    let tool_ctx = ToolContext::new(
+    let mut tool_ctx = ToolContext::new(
         &registry,
         &workspace,
         &approver,
         ff_agent::DEFAULT_MAX_ITERATIONS,
     );
+    tool_ctx.mode = mode;
 
     let stdin = std::io::stdin();
     chat_repl(
@@ -385,6 +435,7 @@ async fn chat(json: bool, approval_mode: ApprovalMode) -> ExitCode {
         &tool_ctx,
         &session.id,
         json,
+        mode,
         stdin.lock(),
     )
     .await
@@ -402,6 +453,7 @@ async fn chat_repl(
     tool_ctx: &ToolContext<'_>,
     session_id: &str,
     json: bool,
+    mode: Mode,
     mut input: impl BufRead,
 ) -> ExitCode {
     if !json {
@@ -443,14 +495,8 @@ async fn chat_repl(
 
         let user_ctx = UserContext::now();
         let memory = memory_store.ambient_block();
-        let system_prompt = ff_agent::build_system_prompt(
-            None,
-            skills,
-            &[],
-            &user_ctx,
-            memory.as_deref(),
-            ff_core::Mode::default(),
-        );
+        let system_prompt =
+            ff_agent::build_system_prompt(None, skills, &[], &user_ctx, memory.as_deref(), mode);
 
         let cancel = CancelToken::new();
         let cancel_signal = cancel.clone();
@@ -763,6 +809,7 @@ mod tests {
             &tool_ctx,
             &session.id,
             false,
+            ff_core::Mode::Auto,
             input,
         )
         .await;
@@ -825,6 +872,7 @@ mod tests {
             &tool_ctx,
             &session.id,
             false,
+            ff_core::Mode::Auto,
             Cursor::new(b""),
         )
         .await;
@@ -860,6 +908,7 @@ mod tests {
                 &tool_ctx,
                 &session.id,
                 false,
+                ff_core::Mode::Auto,
                 Cursor::new(cmd.as_bytes()),
             )
             .await;
