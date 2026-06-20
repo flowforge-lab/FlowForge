@@ -6,7 +6,7 @@
 //! loop. The loop is capped by [`ToolContext::max_iterations`] so a misbehaving model
 //! cannot spin forever.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -59,6 +59,15 @@ async fn cancellable_backoff(cancel: &CancelToken, ms: u64) {
         elapsed += step;
     }
 }
+
+/// After a model emits the identical `(tool, arguments)` call this many times in a
+/// turn, inject a corrective nudge -- a context-rot stall where the model repeats a
+/// call without using its result (#244 R2).
+const REPEAT_NUDGE_AT: usize = 3;
+
+/// If the identical call persists to this many repeats despite the nudge, break the
+/// turn with a clear notice rather than spinning to the iteration cap.
+const REPEAT_BREAK_AT: usize = 5;
 
 /// Events the agent emits during a turn. The host (Tauri shell or a test) decides
 /// how to surface them — over IPC, to a channel, or into assertions.
@@ -274,6 +283,13 @@ pub async fn run_turn(
 
     let max_iter = tools.max_iterations.max(1);
     let mut turn_count: u32 = 0;
+    // Repeated-call / no-progress guard (#244 R2): count identical `(tool, arguments)`
+    // calls across the turn; `repeat_nudge` carries a tool name to warn about on the
+    // next request; `stop_reason` ends the turn with a clear notice when a stall
+    // persists past the nudge.
+    let mut call_counts: HashMap<(String, String), usize> = HashMap::new();
+    let mut repeat_nudge: Option<String> = None;
+    let mut stop_reason: Option<String> = None;
     for iter in 0..max_iter {
         turn_count += 1;
         if cancel.is_cancelled() {
@@ -313,6 +329,24 @@ pub async fn run_turn(
                 name: None,
             });
         }
+
+        // Corrective nudge for a detected repeated-call stall (#244 R2). Request-only,
+        // like the wrap-up nudge above.
+        if let Some(tool) = repeat_nudge.take() {
+            messages.push(ChatMessage {
+                role: "system".to_string(),
+                content: Some(format!(
+                    "You have called `{tool}` with identical arguments {REPEAT_NUDGE_AT} times \
+                     without making progress. Do not repeat that call -- read the result you \
+                     already have, try a different approach or different arguments, or give \
+                     your final answer now."
+                )),
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+            });
+        }
+
         // Reserve the assistant message id up front so the frontend can route tokens.
         let message_id = store
             .add_message(session_id, Role::Assistant, String::new())
@@ -527,6 +561,21 @@ pub async fn run_turn(
                 success: outcome.success,
                 result: outcome.content,
             });
+
+            // Count identical calls to catch a no-progress stall (#244 R2).
+            let count = call_counts
+                .entry((call.name.clone(), call.arguments.clone()))
+                .or_insert(0);
+            *count += 1;
+            if *count >= REPEAT_BREAK_AT {
+                stop_reason = Some(format!(
+                    "[stopped: repeated the identical `{}` tool call {REPEAT_BREAK_AT} times \
+                     without making progress]",
+                    call.name
+                ));
+            } else if *count == REPEAT_NUDGE_AT {
+                repeat_nudge = Some(call.name.clone());
+            }
         }
 
         // If we were cancelled mid-loop, every requested call still needs a matching
@@ -543,6 +592,12 @@ pub async fn run_turn(
         }
 
         last = Some(finalized);
+
+        // A persistent repeated-call stall ends the turn here, before burning the
+        // remaining iterations (#244 R2).
+        if stop_reason.is_some() {
+            break;
+        }
     }
 
     // Hit the iteration cap (or was cancelled) without a plain text answer.
@@ -552,11 +607,13 @@ pub async fn run_turn(
         // The final assistant message only carried tool calls, so it would render as
         // an empty bubble. Replace it with a notice explaining why the turn stopped.
         let notice = if cancel.is_cancelled() {
-            "[stopped]"
+            "[stopped]".to_string()
+        } else if let Some(reason) = stop_reason {
+            reason
         } else {
-            "[stopped: reached tool-call limit]"
+            "[stopped: reached tool-call limit]".to_string()
         };
-        msg = store.set_message_content(&msg.id, session_id, notice.to_string());
+        msg = store.set_message_content(&msg.id, session_id, notice);
     }
     on_event(AgentEvent::Done {
         message_id: msg.id.clone(),
@@ -1829,6 +1886,84 @@ mod tests {
             calls.load(Ordering::SeqCst),
             1,
             "no retry once tokens reached the UI"
+        );
+    }
+
+    // ----- #244 R2: repeated-call / no-progress guard -----
+
+    /// Always emits the identical `bash` tool call, recording per-request whether the
+    /// repeat-nudge system message was present -- a model stuck in a no-progress loop.
+    struct RepeatProvider {
+        calls: Arc<AtomicUsize>,
+        saw_nudge: Arc<std::sync::Mutex<Vec<bool>>>,
+    }
+    #[async_trait]
+    impl Provider for RepeatProvider {
+        async fn chat_stream(&self, req: ChatRequest) -> Result<ChunkStream, LlmError> {
+            let saw = req.messages.iter().any(|m| {
+                m.role == "system"
+                    && m.content
+                        .as_deref()
+                        .is_some_and(|c| c.contains("without making progress"))
+            });
+            self.saw_nudge.lock().unwrap().push(saw);
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            let chunks = vec![Ok(Chunk {
+                tool_calls: vec![ToolCallDelta {
+                    index: 0,
+                    id: Some(format!("call_{n}")),
+                    name: Some("bash".into()),
+                    arguments: r#"{"command":"echo loop"}"#.into(),
+                }],
+                done: true,
+                ..Chunk::default()
+            })];
+            Ok(futures_util::stream::iter(chunks).boxed())
+        }
+    }
+
+    #[tokio::test]
+    async fn repeated_identical_calls_nudge_then_break() {
+        let store = SessionStore::new();
+        let s = store.create_session(None);
+        store.add_message(&s.id, Role::User, "go".into());
+        let registry = ToolRegistry::new();
+        let root = std::env::current_dir().unwrap();
+        let approve = AlwaysApprove;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let saw_nudge = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        // A generous cap so the *guard* (not the cap) is what stops the turn.
+        let tools = ToolContext::new(&registry, &root, &approve, 20);
+        let msg = run_turn(
+            &RepeatProvider {
+                calls: calls.clone(),
+                saw_nudge: saw_nudge.clone(),
+            },
+            &store,
+            &tools,
+            &s.id,
+            "mock",
+            None,
+            false,
+            CancelToken::new(),
+            |_| {},
+        )
+        .await
+        .unwrap();
+
+        // Broke at REPEAT_BREAK_AT (5), well before the cap of 20.
+        assert_eq!(calls.load(Ordering::SeqCst), REPEAT_BREAK_AT);
+        // The corrective nudge was injected at least once before the break.
+        assert!(
+            saw_nudge.lock().unwrap().iter().any(|&b| b),
+            "the repeat nudge should have been sent"
+        );
+        // The turn ends with a clear repeated-call notice, not the generic cap notice.
+        assert!(
+            msg.content.contains("repeated the identical"),
+            "got: {}",
+            msg.content
         );
     }
 }
