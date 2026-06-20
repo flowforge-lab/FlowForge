@@ -532,10 +532,11 @@ impl AppState {
     /// (registry-validated) skills, recording the resolved phenotype for model and
     /// persona overrides. Unknown skill names are dropped with a warning rather than
     /// failing — the installed set can drift from a phenotype definition.
-    fn apply_phenotype(&self, pheno: Phenotype) {
+    fn apply_phenotype(&self, pheno: Phenotype) -> BTreeSet<String> {
         let next = self.resolve_skills(&pheno);
-        *self.active_skills.lock().unwrap() = next.into_iter().collect();
+        *self.active_skills.lock().unwrap() = next.clone();
         *self.active_phenotype.lock().unwrap() = pheno;
+        next
     }
 
     /// Resolve a phenotype's declared skills against the installed registry,
@@ -555,6 +556,51 @@ impl AppState {
             }
         }
         next
+    }
+
+    /// MCP server ids declared by `skills` (via their manifests) that are NOT
+    /// present in the running supervisor — i.e. not defined in `~/.flowforge/mcp.json`.
+    ///
+    /// A phenotype carries its MCP servers as "DNA" (#235): a skill declares the
+    /// servers it needs, and a phenotype that lists the skill expects those servers
+    /// available. The first cut *requires* the server to already exist in `mcp.json`
+    /// and reports the missing ones; it never injects a server definition on
+    /// activation (that would mutate the `mcp.json` source-of-truth — a follow-up).
+    ///
+    /// Name-sorted and deduplicated. Empty when every required server is present, no
+    /// listed skill requires one, or MCP has not been initialized.
+    fn missing_skill_mcp_servers(&self, skills: &BTreeSet<String>) -> Vec<String> {
+        let required: BTreeSet<String> = {
+            let registry = self.skills.read().unwrap();
+            skills
+                .iter()
+                .filter_map(|name| registry.get(name))
+                .flat_map(|skill| skill.manifest.mcp.iter().cloned())
+                .collect()
+        };
+        if required.is_empty() {
+            return Vec::new();
+        }
+        let present: BTreeSet<String> = self
+            .mcp_handle()
+            .map(|handle| handle.status_snapshot().into_iter().map(|s| s.id).collect())
+            .unwrap_or_default();
+        required.difference(&present).cloned().collect()
+    }
+
+    /// Warn (once per server) when an activated phenotype lists skills whose declared
+    /// MCP servers are absent from `mcp.json` (#235). Best-effort and non-fatal: a
+    /// missing server must not block activation — the skill's grep/glob fallbacks
+    /// still work; only the bridged MCP tools are unavailable until the user adds the
+    /// server. No server is injected.
+    fn warn_missing_skill_mcp(&self, phenotype: &str, skills: &BTreeSet<String>) {
+        for server in self.missing_skill_mcp_servers(skills) {
+            tracing::warn!(
+                phenotype = %phenotype,
+                server = %server,
+                "phenotype skill requires an MCP server not present in mcp.json;                   its tools are unavailable until you add it (no server is injected)"
+            );
+        }
     }
 
     /// Run a pre-compaction memory flush if the session is now under context
@@ -1016,7 +1062,8 @@ impl AppState {
     /// can report what is now active.
     pub fn switch_phenotype(&self, name: &str) -> Result<Phenotype, String> {
         let pheno = resolve_phenotype(name).ok_or_else(|| format!("unknown phenotype: {name}"))?;
-        self.apply_phenotype(pheno.clone());
+        let skills = self.apply_phenotype(pheno.clone());
+        self.warn_missing_skill_mcp(&pheno.name, &skills);
         save_active_phenotype_name(&pheno.name);
         Ok(pheno)
     }
@@ -1075,9 +1122,9 @@ impl AppState {
         name: Option<String>,
     ) -> Result<(), String> {
         if let Some(ref n) = name {
-            if resolve_phenotype(n).is_none() {
-                return Err(format!("unknown phenotype: {n}"));
-            }
+            let pheno = resolve_phenotype(n).ok_or_else(|| format!("unknown phenotype: {n}"))?;
+            let skills = self.resolve_skills(&pheno);
+            self.warn_missing_skill_mcp(&pheno.name, &skills);
         }
         self.store.set_session_phenotype(session_id, name);
         Ok(())
@@ -1691,6 +1738,94 @@ mod tests {
             Some("You are a Rust expert.")
         );
         assert_eq!(state.active_phenotype().name, "rust");
+    }
+
+    /// Build a `SkillRegistry` from a tempdir of `SKILL.md` fixtures and install it
+    /// on `state`. Each spec is `(skill_name, declared_mcp_servers)`. The returned
+    /// `TempDir` is only kept to satisfy ownership; `load_dir` reads eagerly.
+    fn install_skills(state: &AppState, specs: &[(&str, &[&str])]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, mcp) in specs {
+            let skill_dir = dir.path().join(name);
+            std::fs::create_dir_all(&skill_dir).unwrap();
+            let mut fm = format!("---\nname: {name}\ndescription: test\nversion: 0.1.0\n");
+            if !mcp.is_empty() {
+                fm.push_str("mcp:\n");
+                for s in *mcp {
+                    fm.push_str(&format!("  - {s}\n"));
+                }
+            }
+            fm.push_str("---\nbody\n");
+            std::fs::write(skill_dir.join("SKILL.md"), fm).unwrap();
+        }
+        let (reg, errs) = SkillRegistry::load_dir(dir.path());
+        assert!(errs.is_empty(), "skill fixtures failed to load: {errs:?}");
+        *state.skills.write().unwrap() = reg;
+        dir
+    }
+
+    #[test]
+    fn skill_declared_mcp_servers_are_required() {
+        let state = AppState::new();
+        let _dir = install_skills(&state, &[("codegraph", &["codegraph"]), ("plain", &[])]);
+        let skills: BTreeSet<String> = ["codegraph".into(), "plain".into()].into();
+        // No MCP supervisor is initialized in tests, so a required server is always
+        // reported missing — exactly the "server not in mcp.json" warn path.
+        assert_eq!(
+            state.missing_skill_mcp_servers(&skills),
+            vec!["codegraph".to_string()]
+        );
+    }
+
+    #[test]
+    fn skill_without_mcp_requires_no_server() {
+        let state = AppState::new();
+        let _dir = install_skills(&state, &[("plain", &[])]);
+        let skills: BTreeSet<String> = ["plain".into()].into();
+        assert!(state.missing_skill_mcp_servers(&skills).is_empty());
+    }
+
+    #[test]
+    fn unknown_active_skill_contributes_no_mcp_requirement() {
+        let state = AppState::new();
+        let skills: BTreeSet<String> = ["not-installed".into()].into();
+        assert!(state.missing_skill_mcp_servers(&skills).is_empty());
+    }
+
+    #[test]
+    fn missing_mcp_servers_are_deduped_and_sorted() {
+        let state = AppState::new();
+        let _dir = install_skills(
+            &state,
+            &[("a", &["zeta", "codegraph"]), ("b", &["codegraph"])],
+        );
+        let skills: BTreeSet<String> = ["a".into(), "b".into()].into();
+        assert_eq!(
+            state.missing_skill_mcp_servers(&skills),
+            vec!["codegraph".to_string(), "zeta".to_string()]
+        );
+    }
+
+    #[test]
+    fn apply_phenotype_returns_resolved_active_skills() {
+        let state = AppState::new();
+        let _dir = install_skills(&state, &[("codegraph", &["codegraph"])]);
+        let resolved = state.apply_phenotype(Phenotype {
+            name: "codon".into(),
+            skills: vec!["codegraph".into(), "not-installed".into()],
+            model: None,
+            persona: None,
+            max_iterations: None,
+        });
+        // Unknown skills are dropped; the returned set mirrors the active set so the
+        // caller can warn about MCP requirements without re-resolving.
+        assert_eq!(
+            resolved,
+            ["codegraph".to_string()]
+                .into_iter()
+                .collect::<BTreeSet<_>>()
+        );
+        assert_eq!(state.active_skills(), vec!["codegraph"]);
     }
 
     #[test]
