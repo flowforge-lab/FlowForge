@@ -1,14 +1,20 @@
 //! Session and message persistence.
 //!
-//! M1 uses an in-process store so the contract works end-to-end without a DB.
-//! A later milestone swaps the backing store for SQLite behind this same API.
+//! Backed by SQLite (mirroring the `FlushLedger` pattern in `ff-memory`).
+//! [`SessionStore::new`] opens an in-memory database, so the ephemeral CLI and
+//! every test keep working with zero behaviour change; [`SessionStore::open`]
+//! backs the store with a file on disk so conversations survive a restart
+//! (RFC 0012). The public API is unchanged — callers see the same infallible
+//! methods regardless of backend.
+//!
 //! (Durable user memory -- facts, daily logs, recall -- is a separate concern,
 //! owned by the `ff-memory` crate per RFC 0006.)
 
-use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Mutex;
 
 use ff_core::{auto_title, Message, Mode, Role, Session, SessionStatus, ToolCall};
+use rusqlite::{params, Connection, OptionalExtension};
 
 fn now_ms() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -22,20 +28,58 @@ fn new_id() -> String {
     uuid::Uuid::new_v4().to_string()
 }
 
-#[derive(Default)]
-struct Inner {
-    sessions: HashMap<String, Session>,
-    messages: HashMap<String, Vec<Message>>,
+/// Serialize a small `rename_all` enum (Role/SessionStatus/Mode) to its string
+/// form for storage, so the on-disk text always tracks the serde representation.
+fn enum_to_text<T: serde::Serialize>(value: &T) -> String {
+    serde_json::to_value(value)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_owned))
+        .unwrap_or_default()
 }
 
-#[derive(Default)]
+/// Inverse of [`enum_to_text`]; `None` if `text` is not a known variant.
+fn text_to_enum<T: serde::de::DeserializeOwned>(text: &str) -> Option<T> {
+    serde_json::from_value(serde_json::Value::String(text.to_owned())).ok()
+}
+
 pub struct SessionStore {
-    inner: Mutex<Inner>,
+    conn: Mutex<Connection>,
+}
+
+impl Default for SessionStore {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl SessionStore {
+    /// An in-memory store. Infallible — `:memory:` cannot fail to open — so the
+    /// ephemeral CLI and tests keep the same construction they always had.
     pub fn new() -> Self {
-        Self::default()
+        Self::open_in_memory().expect("in-memory sqlite session store")
+    }
+
+    /// A file-backed store at `path` (created if absent), durable across restarts.
+    pub fn open(path: impl AsRef<Path>) -> rusqlite::Result<Self> {
+        if let Some(parent) = path.as_ref().parent() {
+            // Best-effort: if the dir cannot be created, the open below surfaces it.
+            let _ = std::fs::create_dir_all(parent);
+        }
+        Self::from_conn(Connection::open(path)?)
+    }
+
+    /// An ephemeral in-memory store (tests, and the backing for [`new`](Self::new)).
+    pub fn open_in_memory() -> rusqlite::Result<Self> {
+        Self::from_conn(Connection::open_in_memory()?)
+    }
+
+    fn from_conn(conn: Connection) -> rusqlite::Result<Self> {
+        // Per-connection: foreign keys are off by default in SQLite.
+        conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+        migrate(&conn)?;
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
     }
 
     pub fn create_session(&self, goal: Option<String>) -> Session {
@@ -51,22 +95,56 @@ impl SessionStore {
             phenotype: None,
             mode: None,
         };
-        let mut inner = self.inner.lock().unwrap();
-        inner.sessions.insert(session.id.clone(), session.clone());
-        inner.messages.insert(session.id.clone(), Vec::new());
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO sessions
+                 (id, goal, title, summary, status, created_at, updated_at, phenotype, mode)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                session.id,
+                session.goal,
+                session.title,
+                session.summary,
+                enum_to_text(&session.status),
+                session.created_at,
+                session.updated_at,
+                session.phenotype,
+                session.mode.as_ref().map(enum_to_text),
+            ],
+        )
+        .expect("insert session");
         session
     }
 
     pub fn list_sessions(&self) -> Vec<Session> {
-        let inner = self.inner.lock().unwrap();
-        let mut sessions: Vec<Session> = inner.sessions.values().cloned().collect();
-        sessions.sort_by_key(|s| std::cmp::Reverse(s.updated_at));
-        sessions
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, goal, title, summary, status, created_at, updated_at, phenotype, mode
+                 FROM sessions
+                 ORDER BY updated_at DESC",
+            )
+            .expect("prepare list_sessions");
+        let rows = stmt
+            .query_map([], row_to_session)
+            .expect("query list_sessions");
+        rows.filter_map(Result::ok).collect()
     }
 
     pub fn get_messages(&self, session_id: &str) -> Vec<Message> {
-        let inner = self.inner.lock().unwrap();
-        inner.messages.get(session_id).cloned().unwrap_or_default()
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, session_id, role, content, tool_calls, tool_call_id, created_at
+                 FROM messages
+                 WHERE session_id = ?1
+                 ORDER BY seq",
+            )
+            .expect("prepare get_messages");
+        let rows = stmt
+            .query_map(params![session_id], row_to_message)
+            .expect("query get_messages");
+        rows.filter_map(Result::ok).collect()
     }
 
     pub fn add_message(&self, session_id: &str, role: Role, content: String) -> Message {
@@ -100,19 +178,55 @@ impl SessionStore {
     }
 
     fn push_message(&self, msg: Message) -> Message {
-        let session_id = msg.session_id.clone();
-        let mut inner = self.inner.lock().unwrap();
-        let msgs = inner.messages.entry(session_id.clone()).or_default();
+        let conn = self.conn.lock().unwrap();
+        let seq: i64 = conn
+            .query_row(
+                "SELECT COALESCE(MAX(seq), -1) + 1 FROM messages WHERE session_id = ?1",
+                params![msg.session_id],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
         // First user message in an untitled session seeds the auto-title, so a
         // title exists without a manual rename (covers background sessions too).
-        let is_first_user_msg =
-            msg.role == Role::User && !msgs.iter().any(|m| m.role == Role::User);
-        msgs.push(msg.clone());
-        if let Some(s) = inner.sessions.get_mut(&session_id) {
-            s.updated_at = msg.created_at;
-            if is_first_user_msg && s.title.is_none() {
-                s.title = Some(auto_title(&msg.content));
-            }
+        let is_first_user_msg = msg.role == Role::User
+            && !conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM messages WHERE session_id = ?1 AND role = 'user')",
+                    params![msg.session_id],
+                    |row| row.get::<_, bool>(0),
+                )
+                .unwrap_or(false);
+        let tool_calls = msg
+            .tool_calls
+            .as_ref()
+            .map(|c| serde_json::to_string(c).expect("serialize tool_calls"));
+        conn.execute(
+            "INSERT INTO messages
+                 (id, session_id, seq, role, content, tool_calls, tool_call_id, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                msg.id,
+                msg.session_id,
+                seq,
+                enum_to_text(&msg.role),
+                msg.content,
+                tool_calls,
+                msg.tool_call_id,
+                msg.created_at,
+            ],
+        )
+        .expect("insert message");
+        conn.execute(
+            "UPDATE sessions SET updated_at = ?1 WHERE id = ?2",
+            params![msg.created_at, msg.session_id],
+        )
+        .ok();
+        if is_first_user_msg {
+            conn.execute(
+                "UPDATE sessions SET title = ?1 WHERE id = ?2 AND title IS NULL",
+                params![auto_title(&msg.content), msg.session_id],
+            )
+            .ok();
         }
         msg
     }
@@ -120,11 +234,12 @@ impl SessionStore {
     /// Set a session's display title (the `rename_session` ipc). A manual title
     /// always wins over the auto-derived one. No-op for an unknown session.
     pub fn set_title(&self, session_id: &str, title: String) {
-        let mut inner = self.inner.lock().unwrap();
-        if let Some(s) = inner.sessions.get_mut(session_id) {
-            s.title = Some(title);
-            s.updated_at = now_ms();
-        }
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE sessions SET title = ?1, updated_at = ?2 WHERE id = ?3",
+            params![title, now_ms(), session_id],
+        )
+        .ok();
     }
 
     /// Bind this session to a phenotype by name, or clear the binding with `None`
@@ -133,43 +248,55 @@ impl SessionStore {
     /// persistence; the app layer validates against the phenotype registry before
     /// calling, and resolution falls back to global on an unknown name anyway.
     pub fn set_session_phenotype(&self, session_id: &str, phenotype: Option<String>) {
-        let mut inner = self.inner.lock().unwrap();
-        if let Some(s) = inner.sessions.get_mut(session_id) {
-            s.phenotype = phenotype;
-            s.updated_at = now_ms();
-        }
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE sessions SET phenotype = ?1, updated_at = ?2 WHERE id = ?3",
+            params![phenotype, now_ms(), session_id],
+        )
+        .ok();
     }
 
     /// The session's bound phenotype name, or `None` if it inherits the global
     /// active one (or the session is unknown).
     pub fn session_phenotype(&self, session_id: &str) -> Option<String> {
-        self.inner
-            .lock()
-            .unwrap()
-            .sessions
-            .get(session_id)
-            .and_then(|s| s.phenotype.clone())
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT phenotype FROM sessions WHERE id = ?1",
+            params![session_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()
+        .ok()
+        .flatten()
+        .flatten()
     }
 
     /// Bind (or clear, with `None`) this session's autonomy mode (#265). Mirrors
     /// [`set_session_phenotype`](Self::set_session_phenotype).
     pub fn set_session_mode(&self, session_id: &str, mode: Option<Mode>) {
-        let mut inner = self.inner.lock().unwrap();
-        if let Some(s) = inner.sessions.get_mut(session_id) {
-            s.mode = mode;
-            s.updated_at = now_ms();
-        }
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE sessions SET mode = ?1, updated_at = ?2 WHERE id = ?3",
+            params![mode.as_ref().map(enum_to_text), now_ms(), session_id],
+        )
+        .ok();
     }
 
     /// The session's bound mode, or `None` if it inherits the global `defaultMode`
     /// preference (or the session is unknown).
     pub fn session_mode(&self, session_id: &str) -> Option<Mode> {
-        self.inner
-            .lock()
-            .unwrap()
-            .sessions
-            .get(session_id)
-            .and_then(|s| s.mode)
+        let conn = self.conn.lock().unwrap();
+        let text: Option<String> = conn
+            .query_row(
+                "SELECT mode FROM sessions WHERE id = ?1",
+                params![session_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .ok()
+            .flatten()
+            .flatten();
+        text.as_deref().and_then(text_to_enum)
     }
 
     pub fn set_message_content(
@@ -178,13 +305,28 @@ impl SessionStore {
         session_id: &str,
         content: String,
     ) -> Message {
-        let mut inner = self.inner.lock().unwrap();
         let ts = now_ms();
-        if let Some(msgs) = inner.messages.get_mut(session_id) {
-            if let Some(m) = msgs.iter_mut().find(|m| m.id == message_id) {
-                m.content = content;
-                m.created_at = ts;
-                return m.clone();
+        let conn = self.conn.lock().unwrap();
+        let updated = conn
+            .execute(
+                "UPDATE messages SET content = ?1, created_at = ?2
+                 WHERE id = ?3 AND session_id = ?4",
+                params![content, ts, message_id, session_id],
+            )
+            .unwrap_or(0);
+        if updated > 0 {
+            if let Some(msg) = conn
+                .query_row(
+                    "SELECT id, session_id, role, content, tool_calls, tool_call_id, created_at
+                     FROM messages WHERE id = ?1",
+                    params![message_id],
+                    row_to_message,
+                )
+                .optional()
+                .ok()
+                .flatten()
+            {
+                return msg;
             }
         }
         Message {
@@ -201,28 +343,33 @@ impl SessionStore {
     /// Attach tool calls to an already-reserved assistant message (the one whose
     /// id was handed out for token routing).
     pub fn attach_tool_calls(&self, message_id: &str, session_id: &str, tool_calls: Vec<ToolCall>) {
-        let mut inner = self.inner.lock().unwrap();
-        if let Some(msgs) = inner.messages.get_mut(session_id) {
-            if let Some(m) = msgs.iter_mut().find(|m| m.id == message_id) {
-                m.tool_calls = Some(tool_calls);
-            }
-        }
+        let json = serde_json::to_string(&tool_calls).expect("serialize tool_calls");
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE messages SET tool_calls = ?1 WHERE id = ?2 AND session_id = ?3",
+            params![json, message_id, session_id],
+        )
+        .ok();
     }
 
     pub fn set_status(&self, session_id: &str, status: SessionStatus) {
-        let mut inner = self.inner.lock().unwrap();
-        if let Some(s) = inner.sessions.get_mut(session_id) {
-            s.status = status;
-            s.updated_at = now_ms();
-        }
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE sessions SET status = ?1, updated_at = ?2 WHERE id = ?3",
+            params![enum_to_text(&status), now_ms(), session_id],
+        )
+        .ok();
     }
 
     /// Permanently remove a session and its transcript. Returns whether the
-    /// session existed. Idempotent: deleting an unknown id is a no-op.
+    /// session existed. Idempotent: deleting an unknown id is a no-op. Messages
+    /// are removed by the `ON DELETE CASCADE` foreign key.
     pub fn delete_session(&self, session_id: &str) -> bool {
-        let mut inner = self.inner.lock().unwrap();
-        inner.messages.remove(session_id);
-        inner.sessions.remove(session_id).is_some()
+        let conn = self.conn.lock().unwrap();
+        let removed = conn
+            .execute("DELETE FROM sessions WHERE id = ?1", params![session_id])
+            .unwrap_or(0);
+        removed > 0
     }
 
     /// Clone a session and its full transcript into a new session. The copy gets
@@ -230,8 +377,17 @@ impl SessionStore {
     /// a titled source becomes "<title> (copy)". Returns `None` for an unknown id.
     pub fn fork_session(&self, session_id: &str) -> Option<Session> {
         let ts = now_ms();
-        let mut inner = self.inner.lock().unwrap();
-        let source = inner.sessions.get(session_id)?.clone();
+        let conn = self.conn.lock().unwrap();
+        let source = conn
+            .query_row(
+                "SELECT id, goal, title, summary, status, created_at, updated_at, phenotype, mode
+                 FROM sessions WHERE id = ?1",
+                params![session_id],
+                row_to_session,
+            )
+            .optional()
+            .ok()
+            .flatten()?;
         let forked = Session {
             id: new_id(),
             goal: source.goal.clone(),
@@ -246,22 +402,100 @@ impl SessionStore {
             // ...and its mode binding, so the copy runs at the same autonomy (#265).
             mode: source.mode,
         };
-        let cloned: Vec<Message> = inner
-            .messages
-            .get(session_id)
-            .cloned()
-            .unwrap_or_default()
-            .into_iter()
-            .map(|m| Message {
-                id: new_id(),
-                session_id: forked.id.clone(),
-                ..m
-            })
-            .collect();
-        inner.sessions.insert(forked.id.clone(), forked.clone());
-        inner.messages.insert(forked.id.clone(), cloned);
+        conn.execute(
+            "INSERT INTO sessions
+                 (id, goal, title, summary, status, created_at, updated_at, phenotype, mode)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                forked.id,
+                forked.goal,
+                forked.title,
+                forked.summary,
+                enum_to_text(&forked.status),
+                forked.created_at,
+                forked.updated_at,
+                forked.phenotype,
+                forked.mode.as_ref().map(enum_to_text),
+            ],
+        )
+        .expect("insert forked session");
+        // Re-key the transcript to the new session, preserving `seq` order.
+        conn.execute(
+            "INSERT INTO messages
+                 (id, session_id, seq, role, content, tool_calls, tool_call_id, created_at)
+             SELECT lower(hex(randomblob(16))), ?1, seq, role, content, tool_calls,
+                    tool_call_id, created_at
+             FROM messages WHERE session_id = ?2",
+            params![forked.id, session_id],
+        )
+        .expect("clone forked messages");
         Some(forked)
     }
+}
+
+/// Version-gated migration runner. Bumps `PRAGMA user_version` as the schema
+/// evolves; v1 is the initial sessions + messages schema (RFC 0012).
+fn migrate(conn: &Connection) -> rusqlite::Result<()> {
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version < 1 {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS sessions (
+                 id          TEXT PRIMARY KEY,
+                 goal        TEXT,
+                 title       TEXT,
+                 summary     TEXT,
+                 status      TEXT NOT NULL,
+                 created_at  INTEGER NOT NULL,
+                 updated_at  INTEGER NOT NULL,
+                 phenotype   TEXT,
+                 mode        TEXT
+             );
+             CREATE TABLE IF NOT EXISTS messages (
+                 id           TEXT PRIMARY KEY,
+                 session_id   TEXT NOT NULL,
+                 seq          INTEGER NOT NULL,
+                 role         TEXT NOT NULL,
+                 content      TEXT NOT NULL,
+                 tool_calls   TEXT,
+                 tool_call_id TEXT,
+                 created_at   INTEGER NOT NULL,
+                 FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
+             );
+             CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, seq);",
+        )?;
+        conn.pragma_update(None, "user_version", 1)?;
+    }
+    Ok(())
+}
+
+fn row_to_session(row: &rusqlite::Row) -> rusqlite::Result<Session> {
+    let status: String = row.get("status")?;
+    let mode: Option<String> = row.get("mode")?;
+    Ok(Session {
+        id: row.get("id")?,
+        goal: row.get("goal")?,
+        title: row.get("title")?,
+        summary: row.get("summary")?,
+        status: text_to_enum(&status).unwrap_or(SessionStatus::Active),
+        created_at: row.get("created_at")?,
+        updated_at: row.get("updated_at")?,
+        phenotype: row.get("phenotype")?,
+        mode: mode.as_deref().and_then(text_to_enum),
+    })
+}
+
+fn row_to_message(row: &rusqlite::Row) -> rusqlite::Result<Message> {
+    let role: String = row.get("role")?;
+    let tool_calls: Option<String> = row.get("tool_calls")?;
+    Ok(Message {
+        id: row.get("id")?,
+        session_id: row.get("session_id")?,
+        role: text_to_enum(&role).unwrap_or(Role::User),
+        content: row.get("content")?,
+        tool_calls: tool_calls.and_then(|s| serde_json::from_str(&s).ok()),
+        tool_call_id: row.get("tool_call_id")?,
+        created_at: row.get("created_at")?,
+    })
 }
 
 #[cfg(test)]
@@ -484,5 +718,116 @@ mod tests {
         // Changing the fork's binding does not touch the source.
         store.set_session_mode(&forked.id, Some(Mode::Auto));
         assert_eq!(store.session_mode(&s.id), Some(Mode::Act));
+    }
+
+    // --- SQLite-backed persistence (RFC 0012 / #276) ---
+
+    #[test]
+    fn disk_store_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sessions.db");
+
+        let sid;
+        let mid;
+        {
+            let store = SessionStore::open(&path).unwrap();
+            let s = store.create_session(Some("durable goal".into()));
+            sid = s.id.clone();
+            store.set_title(&s.id, "Durable".into());
+            store.set_session_phenotype(&s.id, Some("codon".into()));
+            store.set_session_mode(&s.id, Some(Mode::Act));
+            let m = store.add_message(&s.id, Role::User, "remember me".into());
+            mid = m.id.clone();
+            store.add_message(&s.id, Role::Assistant, "noted".into());
+        }
+
+        // Reopen over the same path: state is still there.
+        let store = SessionStore::open(&path).unwrap();
+        let sessions = store.list_sessions();
+        assert_eq!(sessions.len(), 1);
+        let reopened = &sessions[0];
+        assert_eq!(reopened.id, sid);
+        assert_eq!(reopened.title.as_deref(), Some("Durable"));
+        assert_eq!(reopened.goal.as_deref(), Some("durable goal"));
+        assert_eq!(store.session_phenotype(&sid).as_deref(), Some("codon"));
+        assert_eq!(store.session_mode(&sid), Some(Mode::Act));
+
+        let msgs = store.get_messages(&sid);
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0].id, mid);
+        assert_eq!(msgs[0].content, "remember me");
+        assert_eq!(msgs[1].role, Role::Assistant);
+    }
+
+    #[test]
+    fn tool_calls_round_trip_through_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sessions.db");
+        let calls = vec![ToolCall {
+            id: "call_1".into(),
+            name: "bash".into(),
+            arguments: r#"{"command":"ls"}"#.into(),
+        }];
+        let sid;
+        let mid;
+        {
+            let store = SessionStore::open(&path).unwrap();
+            let s = store.create_session(None);
+            sid = s.id.clone();
+            let m = store.add_message(&s.id, Role::Assistant, String::new());
+            mid = m.id.clone();
+            store.attach_tool_calls(&mid, &sid, calls.clone());
+        }
+        let store = SessionStore::open(&path).unwrap();
+        let msgs = store.get_messages(&sid);
+        assert_eq!(msgs[0].tool_calls.as_deref(), Some(calls.as_slice()));
+    }
+
+    #[test]
+    fn cascade_delete_removes_messages_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sessions.db");
+        let store = SessionStore::open(&path).unwrap();
+        let s = store.create_session(None);
+        store.add_message(&s.id, Role::User, "a".into());
+        store.add_message(&s.id, Role::Assistant, "b".into());
+
+        assert!(store.delete_session(&s.id));
+
+        // The FK cascade must have removed the orphaned messages too.
+        let count: i64 = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn messages_keep_insertion_order_via_seq() {
+        let store = SessionStore::new();
+        let s = store.create_session(None);
+        for i in 0..5 {
+            store.add_message(&s.id, Role::User, format!("msg {i}"));
+        }
+        let msgs = store.get_messages(&s.id);
+        let contents: Vec<&str> = msgs.iter().map(|m| m.content.as_str()).collect();
+        assert_eq!(contents, ["msg 0", "msg 1", "msg 2", "msg 3", "msg 4"]);
+    }
+
+    #[test]
+    fn migration_is_idempotent_across_reopens() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sessions.db");
+        SessionStore::open(&path).unwrap();
+        let store = SessionStore::open(&path).unwrap();
+        let version: i64 = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 1);
     }
 }
