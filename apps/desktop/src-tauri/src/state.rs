@@ -427,6 +427,96 @@ fn phenotypes_root() -> PathBuf {
         .join("phenos")
 }
 
+/// The Codon phenotype, bundled verbatim from the committed `docs/examples/codon/`
+/// tree (the single source of truth) so the shipped binary and the documented
+/// example can never drift.
+const CODON_PHENOTYPE_TOML: &str =
+    include_str!("../../../../docs/examples/codon/phenos/codon.toml");
+/// The codegraph skill Codon depends on, bundled from the same example tree.
+const CODEGRAPH_SKILL_MD: &str =
+    include_str!("../../../../docs/examples/codon/skills/codegraph/SKILL.md");
+
+/// Seed the built-in content (the Codon phenotype and the codegraph skill it
+/// requires) into the real `~/.flowforge/` tree. Runs once at startup, before the
+/// skill watcher spawns and the persisted phenotype resolves, so a user who has
+/// selected Codon finds its skill already present.
+#[cfg(not(test))]
+fn seed_builtin_content() {
+    seed_builtin_content_at(
+        &phenotypes_root(),
+        &skills_root(),
+        ff_mcp::config_path().as_deref(),
+    );
+}
+
+/// Path-injectable core of [`seed_builtin_content`] so tests can drive it against
+/// a tempdir instead of the real home. Each built-in is written only when absent,
+/// leaving a user-edited copy untouched; the codegraph skill body is written at
+/// `skills/codegraph/SKILL.md` (the layout [`SkillRegistry`] scans). When an
+/// `mcp.json` path is known, a **disabled** codegraph server entry is also seeded
+/// so the wiring exists out of the box (the user enables it after installing the
+/// codegraph binary); `None` skips it (no home dir).
+fn seed_builtin_content_at(phenotypes_root: &Path, skills_root: &Path, mcp_path: Option<&Path>) {
+    seed_if_absent(&phenotypes_root.join("codon.toml"), CODON_PHENOTYPE_TOML);
+    seed_if_absent(
+        &skills_root.join("codegraph").join("SKILL.md"),
+        CODEGRAPH_SKILL_MD,
+    );
+    if let Some(mcp_path) = mcp_path {
+        seed_codegraph_mcp_entry_if_absent(mcp_path);
+    }
+}
+
+/// Seed a **disabled** `codegraph` server into `mcp.json` if no entry with that id
+/// already exists, so Codon's DNA is wired without a manual edit. Written disabled
+/// because the codegraph binary is a third-party install that may be absent — an
+/// enabled entry would make the supervisor spawn a missing command and churn on
+/// backoff. The user enables it (Settings -> MCP) after `codegraph install`; the
+/// #296 activation warn points there.
+///
+/// Write-if-absent (an existing `codegraph` entry, user- or seed-written, is never
+/// overwritten) and best-effort: a parse or write failure is logged and skipped so
+/// a hand-managed or read-only `mcp.json` is never clobbered or blocks startup.
+fn seed_codegraph_mcp_entry_if_absent(mcp_path: &Path) {
+    match ff_mcp::load(mcp_path) {
+        Ok(servers) if servers.iter().any(|s| s.id == "codegraph") => return,
+        Ok(_) => {}
+        Err(e) => {
+            tracing::warn!(error = %e, "seed codegraph mcp entry: read existing mcp.json");
+            return;
+        }
+    }
+    let def = ff_mcp::McpServerInput {
+        id: "codegraph".to_string(),
+        command: "codegraph".to_string(),
+        args: vec!["serve".to_string(), "--mcp".to_string()],
+        env: std::collections::BTreeMap::new(),
+        disabled: true,
+    };
+    if let Err(e) = ff_mcp::upsert(mcp_path, &def) {
+        tracing::warn!(error = %e, "seed codegraph mcp entry: write");
+    }
+}
+
+/// Write `contents` to `path` only if it does not already exist. Best-effort: a
+/// failure (read-only home, racing process) is logged and skipped so startup is
+/// never blocked -- the affected built-in simply will not appear until a later
+/// successful launch.
+fn seed_if_absent(path: &Path, contents: &str) {
+    if path.exists() {
+        return;
+    }
+    if let Some(parent) = path.parent() {
+        if let Err(e) = fs::create_dir_all(parent) {
+            tracing::warn!(path = %path.display(), error = %e, "seed built-in: create dir");
+            return;
+        }
+    }
+    if let Err(e) = fs::write(path, contents) {
+        tracing::warn!(path = %path.display(), error = %e, "seed built-in: write");
+    }
+}
+
 /// Resolve a phenotype by name: the built-in `default`, otherwise a definition from
 /// `~/.flowforge/phenos/`. Returns `None` for an unknown name.
 fn resolve_phenotype(name: &str) -> Option<Phenotype> {
@@ -519,6 +609,12 @@ impl AppState {
     }
 
     pub fn with_registry(registry: ProviderRegistry) -> Self {
+        // Seed the bundled built-ins (Codon + codegraph) before the watcher loads
+        // the skills dir, so the codegraph skill is present when a persisted Codon
+        // phenotype resolves below. Gated out of tests, which must not write to the
+        // real `~/.flowforge/`; the seed core is exercised directly via tempdirs.
+        #[cfg(not(test))]
+        seed_builtin_content();
         let (watcher, skills) = load_skills();
         // The installer tools are agent-callable, so they own the skills root and a
         // handle to the shared registry to refresh it on a successful install.
@@ -2505,5 +2601,126 @@ mod tests {
         let path = tmp.path().join("nonexistent.json");
         let loaded = ApprovalRegistry::load_always_approved(&path);
         assert!(loaded.is_empty());
+    }
+
+    #[test]
+    fn seed_builtin_content_writes_codon_and_codegraph_when_absent() {
+        let phenos = tempfile::tempdir().unwrap();
+        let skills = tempfile::tempdir().unwrap();
+        seed_builtin_content_at(phenos.path(), skills.path(), None);
+
+        // The Codon phenotype landed and parses through the real loader.
+        let codon = phenos.path().join("codon.toml");
+        assert!(codon.exists(), "codon.toml must be seeded");
+        let (map, errors) = load_phenotypes(phenos.path());
+        assert!(
+            errors.is_empty(),
+            "seeded codon.toml must parse: {errors:?}"
+        );
+        let pheno = map.get("codon").expect("codon phenotype present");
+        assert!(
+            pheno.skills.iter().any(|s| s == "codegraph"),
+            "codon must declare the codegraph skill"
+        );
+
+        // The codegraph skill body landed in the layout the registry scans and parses.
+        let skill_md = skills.path().join("codegraph").join("SKILL.md");
+        assert!(skill_md.exists(), "codegraph SKILL.md must be seeded");
+        let (registry, errors) = SkillRegistry::load_dir(skills.path());
+        assert!(errors.is_empty(), "seeded SKILL.md must parse: {errors:?}");
+        assert!(
+            registry.get("codegraph").is_some(),
+            "codegraph skill must be loadable so resolve_skills keeps it"
+        );
+    }
+
+    #[test]
+    fn seed_builtin_content_does_not_clobber_user_edits() {
+        let phenos = tempfile::tempdir().unwrap();
+        let skills = tempfile::tempdir().unwrap();
+        let codon = phenos.path().join("codon.toml");
+        fs::write(&codon, "# user-edited\nskills = []\n").unwrap();
+
+        seed_builtin_content_at(phenos.path(), skills.path(), None);
+
+        assert_eq!(
+            fs::read_to_string(&codon).unwrap(),
+            "# user-edited\nskills = []\n",
+            "an existing phenotype must never be overwritten"
+        );
+        // The absent codegraph skill is still seeded alongside the kept edit.
+        assert!(skills.path().join("codegraph").join("SKILL.md").exists());
+    }
+
+    #[test]
+    fn seed_builtin_content_is_idempotent() {
+        let phenos = tempfile::tempdir().unwrap();
+        let skills = tempfile::tempdir().unwrap();
+        seed_builtin_content_at(phenos.path(), skills.path(), None);
+        let first = fs::read_to_string(phenos.path().join("codon.toml")).unwrap();
+
+        seed_builtin_content_at(phenos.path(), skills.path(), None);
+        let second = fs::read_to_string(phenos.path().join("codon.toml")).unwrap();
+
+        assert_eq!(first, second, "a second seed run must be a no-op");
+    }
+
+    #[test]
+    fn seed_writes_disabled_codegraph_mcp_entry_when_absent() {
+        let mcp = tempfile::tempdir().unwrap();
+        let path = mcp.path().join("mcp.json");
+        seed_codegraph_mcp_entry_if_absent(&path);
+
+        let servers = ff_mcp::load(&path).expect("seeded mcp.json must parse");
+        let codegraph = servers
+            .iter()
+            .find(|s| s.id == "codegraph")
+            .expect("codegraph server seeded");
+        assert!(
+            codegraph.disabled,
+            "the seeded entry must be disabled until the binary is installed"
+        );
+        assert_eq!(codegraph.command, "codegraph");
+        assert_eq!(
+            codegraph.args,
+            vec!["serve".to_string(), "--mcp".to_string()]
+        );
+    }
+
+    #[test]
+    fn seed_does_not_clobber_an_existing_codegraph_mcp_entry() {
+        let mcp = tempfile::tempdir().unwrap();
+        let path = mcp.path().join("mcp.json");
+        // A user who already wired codegraph their own way (enabled, custom args).
+        let user =
+            r#"{"mcpServers":{"codegraph":{"command":"my-codegraph","args":["--port","9000"]}}}"#;
+        fs::write(&path, user).unwrap();
+
+        seed_codegraph_mcp_entry_if_absent(&path);
+
+        let servers = ff_mcp::load(&path).unwrap();
+        let codegraph = servers.iter().find(|s| s.id == "codegraph").unwrap();
+        assert_eq!(codegraph.command, "my-codegraph", "user entry must survive");
+        assert_eq!(
+            codegraph.args,
+            vec!["--port".to_string(), "9000".to_string()]
+        );
+        assert!(
+            !codegraph.disabled,
+            "user's enabled state must be untouched"
+        );
+    }
+
+    #[test]
+    fn seed_codegraph_mcp_entry_is_idempotent() {
+        let mcp = tempfile::tempdir().unwrap();
+        let path = mcp.path().join("mcp.json");
+        seed_codegraph_mcp_entry_if_absent(&path);
+        let first = fs::read_to_string(&path).unwrap();
+
+        seed_codegraph_mcp_entry_if_absent(&path);
+        let second = fs::read_to_string(&path).unwrap();
+
+        assert_eq!(first, second, "a second seed run must be a no-op");
     }
 }
