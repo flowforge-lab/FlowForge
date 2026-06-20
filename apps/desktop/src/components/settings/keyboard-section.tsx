@@ -3,6 +3,8 @@ import { SegmentedControl } from "@/components/settings/segmented-control";
 import { useSettingsStore } from "@/store/settings";
 import { usePrefsStore, type SendMessageKey } from "@/store/prefs";
 import { keyboardReferenceGroups } from "@/lib/keyboard-reference";
+import { MODE_META } from "@/lib/mode";
+import type { Mode } from "@/bindings";
 
 // "Mod" renders as the platform's primary modifier. Kept here (browser-only) so
 // lib/shortcuts.ts stays platform-pure and node-testable — mirrors the same
@@ -20,6 +22,10 @@ const SEND_OPTIONS: ReadonlyArray<{ value: SendMessageKey; label: string }> = [
   { value: "ctrlEnter", label: "Ctrl/⌘+Enter" },
 ];
 
+const MODE_OPTIONS: ReadonlyArray<{ value: Mode; label: string }> = (
+  ["plan", "act", "auto"] as const
+).map((m) => ({ value: m, label: MODE_META[m].label }));
+
 /**
  * Keyboard section (#129, SET.6): a read-only shortcut reference plus the editable
  * **Send message** binding. Data comes from the single `lib/shortcuts.ts` registry
@@ -30,6 +36,8 @@ export function KeyboardSection() {
   const resetKeyboard = usePrefsStore((s) => s.resetKeyboard);
   const sendMessageKey = usePrefsStore((s) => s.sendMessageKey);
   const setSendMessageKey = usePrefsStore((s) => s.setSendMessageKey);
+  const defaultMode = usePrefsStore((s) => s.defaultMode);
+  const setDefaultMode = usePrefsStore((s) => s.setDefaultMode);
 
   useEffect(() => {
     registerResetHandler(resetKeyboard);
@@ -58,6 +66,21 @@ export function KeyboardSection() {
             options={SEND_OPTIONS}
             value={sendMessageKey}
             onValueChange={setSendMessageKey}
+          />
+        </div>
+
+        <div className="flex items-center justify-between gap-4">
+          <div className="min-w-0">
+            <p className="text-[13px] text-foreground">Default mode</p>
+            <p className="text-[11px] text-muted-foreground">
+              {MODE_META[defaultMode].description} New sessions start here.
+            </p>
+          </div>
+          <SegmentedControl
+            label="Default agent mode"
+            options={MODE_OPTIONS}
+            value={defaultMode}
+            onValueChange={setDefaultMode}
           />
         </div>
       </section>

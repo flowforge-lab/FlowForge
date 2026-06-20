@@ -8,6 +8,15 @@ import { useChatStore } from "@/store/chat";
 import { useComposerStore } from "@/store/composer";
 import { usePrefsStore } from "@/store/prefs";
 import { useSessionWorkspaceStore } from "@/store/session-workspace";
+import { useSessionModeStore, nextMode } from "@/store/session-mode";
+import { MODE_META, MODE_NOT_ENFORCED_NOTE } from "@/lib/mode";
+
+// Platform modifier glyph for tooltips (mirrors keyboard-section.tsx / the overlay).
+const MOD_GLYPH =
+  typeof navigator !== "undefined" &&
+  /mac/i.test(navigator.platform || navigator.userAgent || "")
+    ? "⌘"
+    : "Ctrl";
 
 // A local model server (candle-vllm, Ollama, …) clocks its GPU down when idle,
 // so the first token after a pause crawls while the device ramps back up. We
@@ -178,11 +187,16 @@ export function InputBar({
           {/* Bottom toolbar inside the composer: working-directory chip (left)
               and Send/Stop (right), so the controls read as one input box. */}
           <div className="flex items-center justify-between gap-2 border-t border-border/40 px-1.5 pb-1 pt-1.5">
-            {targetSessionId ? (
-              <WorkspaceSelector sessionId={targetSessionId} />
-            ) : (
-              <span />
-            )}
+            <div className="flex min-w-0 items-center gap-1.5">
+              {targetSessionId ? (
+                <>
+                  <ModePill sessionId={targetSessionId} />
+                  <WorkspaceSelector sessionId={targetSessionId} />
+                </>
+              ) : (
+                <span />
+              )}
+            </div>
             {streaming || pending ? (
               <Button
                 variant="outline"
@@ -214,6 +228,32 @@ export function InputBar({
         </div>
       </div>
     </div>
+  );
+}
+
+// Agent-mode pill (#266, RFC 0011). Per-session (and so per split pane) + persisted,
+// colour-coded. Click cycles Plan → Act → Auto; ⌘. cycles the focused pane too
+// (app-shell). A session with no explicit mode shows the `defaultMode` preference.
+export function ModePill({ sessionId }: { sessionId: string }) {
+  const defaultMode = usePrefsStore((s) => s.defaultMode);
+  const explicit = useSessionModeStore((s) => s.modeBySession[sessionId]);
+  const cycleMode = useSessionModeStore((s) => s.cycleMode);
+  const mode = explicit ?? defaultMode;
+  const meta = MODE_META[mode];
+  return (
+    <button
+      type="button"
+      onClick={() => cycleMode(sessionId, defaultMode)}
+      title={`Mode: ${meta.label} — ${meta.description}\nClick (or ${MOD_GLYPH}.) to switch to ${MODE_META[nextMode(mode)].label}.\n${MODE_NOT_ENFORCED_NOTE}`}
+      aria-label={`Agent mode: ${meta.label} (display-only). Click to cycle.`}
+      className={cn(
+        "inline-flex shrink-0 items-center gap-1.5 rounded-md border px-2 py-1.5 text-xs font-medium transition-colors",
+        meta.pillClass,
+      )}
+    >
+      <span className={cn("size-1.5 shrink-0 rounded-full", meta.dotClass)} />
+      {meta.label}
+    </button>
   );
 }
 

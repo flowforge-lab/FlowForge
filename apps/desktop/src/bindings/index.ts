@@ -43,3 +43,4 @@ export type { MemoryOverview } from "./MemoryOverview";
 export type { MemoryConfig } from "./MemoryConfig";
 export type { EmbeddingsConfig } from "./EmbeddingsConfig";
 export type { EmbeddingProvider } from "./EmbeddingProvider";
+export type { Mode } from "./Mode";

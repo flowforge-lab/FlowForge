@@ -16,6 +16,7 @@ import {
   setupSystemThemeListener,
   type Theme,
 } from "@/lib/theme";
+import type { Mode } from "@/bindings";
 
 const STORAGE_KEY = "ff-prefs";
 const LEGACY_THEME_KEY = "ff-theme";
@@ -43,6 +44,9 @@ export const SIDEBAR_WIDTH_DEFAULT = 240;
 export type SendMessageKey = "enter" | "ctrlEnter";
 const SEND_MESSAGE_KEY_DEFAULT: SendMessageKey = "enter";
 
+/** Factory default agent mode new sessions inherit (RFC 0011 §4, #266). Auto. */
+const DEFAULT_MODE_DEFAULT: Mode = "auto";
+
 export interface PrefsState {
   theme: Theme;
   font: Font;
@@ -55,6 +59,8 @@ export interface PrefsState {
   openThreads: number;
   /** Composer send binding (Keyboard section, SET.6). */
   sendMessageKey: SendMessageKey;
+  /** Agent mode new sessions inherit when no explicit mode is set (#266, RFC 0011). */
+  defaultMode: Mode;
   /** Session sidebar collapsed to width 0 (#185). */
   sidebarCollapsed: boolean;
   /** Session sidebar width in px when expanded (#204); clamped to SIDEBAR_WIDTH_MIN/MAX. */
@@ -66,6 +72,7 @@ export interface PrefsState {
   setNotifications: (partial: Partial<NotificationPrefs>) => void;
   setOpenThreads: (count: number) => void;
   setSendMessageKey: (key: SendMessageKey) => void;
+  setDefaultMode: (mode: Mode) => void;
   setSidebarCollapsed: (collapsed: boolean) => void;
   setSidebarWidth: (px: number) => void;
   /** Quick light/dark flip — leaves `"system"` by picking the opposite effective mode. */
@@ -136,6 +143,7 @@ export const usePrefsStore = create<PrefsState>()(
       // Keyboard-owned (SET.6) — kept out of APPEARANCE_DEFAULTS so the Appearance
       // reset doesn't touch it; `resetKeyboard` owns its reset.
       sendMessageKey: SEND_MESSAGE_KEY_DEFAULT,
+      defaultMode: DEFAULT_MODE_DEFAULT,
       sidebarCollapsed: false,
       sidebarWidth: SIDEBAR_WIDTH_DEFAULT,
       setTheme: (theme) => set({ theme }),
@@ -146,6 +154,7 @@ export const usePrefsStore = create<PrefsState>()(
         set((s) => ({ notifications: { ...s.notifications, ...partial } })),
       setOpenThreads: (count) => set({ openThreads: clampOpenThreads(count) }),
       setSendMessageKey: (sendMessageKey) => set({ sendMessageKey }),
+      setDefaultMode: (defaultMode) => set({ defaultMode }),
       setSidebarCollapsed: (sidebarCollapsed) => set({ sidebarCollapsed }),
       setSidebarWidth: (px) => set({ sidebarWidth: clampSidebarWidth(px) }),
       toggleTheme: () => {
@@ -154,10 +163,20 @@ export const usePrefsStore = create<PrefsState>()(
         set({ theme: effective === "light" ? "dark" : "light" });
       },
       resetAppearance: () => set({ ...APPEARANCE_DEFAULTS }),
-      resetKeyboard: () => set({ sendMessageKey: SEND_MESSAGE_KEY_DEFAULT }),
+      resetKeyboard: () =>
+        set({
+          sendMessageKey: SEND_MESSAGE_KEY_DEFAULT,
+          defaultMode: DEFAULT_MODE_DEFAULT,
+        }),
     }),
     {
       name: STORAGE_KEY,
+      // `defaultMode` is deliberately NOT persisted (#287 review): P2 made the
+      // backend `mode.json` the source of truth (`get_default_mode`). Persisting it
+      // here too would let the stale localStorage value win on rehydration once the
+      // IPC seam lands. It stays transient (Auto each launch) until that seam reads
+      // it. Everything else persists as before.
+      partialize: ({ defaultMode: _drop, ...rest }) => rest,
       // `current` (defaults) first so blobs persisted before SET.2 — which lack
       // the new keys — hydrate with sensible defaults rather than `undefined`.
       merge: (persisted, current) => ({
