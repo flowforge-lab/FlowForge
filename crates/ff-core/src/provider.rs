@@ -23,6 +23,9 @@ pub enum ProviderKind {
     CandleVllm,
     /// Local Ollama, native NDJSON `/api/chat`.
     Ollama,
+    /// AWS Bedrock. Hosted; credentials resolved backend-side (AWS profile, IAM
+    /// keys, or a bearer API key) and the endpoint derived from the region.
+    Bedrock,
 }
 
 impl ProviderKind {
@@ -31,6 +34,10 @@ impl ProviderKind {
         match self {
             ProviderKind::CandleVllm => "http://localhost:8000/v1",
             ProviderKind::Ollama => "http://localhost:11434",
+            // Bedrock has no fixed endpoint — the provider derives
+            // `bedrock-runtime.<region>.amazonaws.com` from the connection region.
+            // This default is only a placeholder for the rare base_url-less probe.
+            ProviderKind::Bedrock => "https://bedrock-runtime.us-east-1.amazonaws.com",
         }
     }
 
@@ -40,6 +47,56 @@ impl ProviderKind {
         match self {
             ProviderKind::CandleVllm => "candle-vllm",
             ProviderKind::Ollama => "ollama",
+            ProviderKind::Bedrock => "bedrock",
+        }
+    }
+}
+
+/// How a Bedrock connection authenticates. All three resolve credentials
+/// backend-side; secret material (secret access key, session token, bearer API
+/// key) lives in the OS keychain and never on this contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "../../../apps/desktop/src/bindings/")]
+pub enum BedrockAuth {
+    /// A named AWS profile from `~/.aws/config` (cred chain).
+    Profile,
+    /// Static IAM keys: access key id (non-secret, on the connection) plus a
+    /// secret access key and optional session token (both in the keychain).
+    IamKeys,
+    /// A Bedrock bearer API key (in the keychain); skips SigV4.
+    ApiKey,
+}
+
+/// A piece of secret material stored in the OS keychain for a connection. Used as
+/// the discriminator on the write-only `set_provider_secret` / `clear_provider_secret`
+/// commands; the value itself is never part of any contract or command response.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "../../../apps/desktop/src/bindings/")]
+pub enum SecretKind {
+    /// OpenAI / Bedrock bearer API key.
+    ApiKey,
+    /// AWS IAM secret access key.
+    SecretAccessKey,
+    /// AWS session token (temporary credentials).
+    SessionToken,
+}
+
+impl SecretKind {
+    /// Every secret kind, for recomputing a connection's `has_key` flag.
+    pub const ALL: [SecretKind; 3] = [
+        SecretKind::ApiKey,
+        SecretKind::SecretAccessKey,
+        SecretKind::SessionToken,
+    ];
+
+    /// Stable slug used in the keychain account name (`<connectionId>:<slug>`).
+    pub fn slug(self) -> &'static str {
+        match self {
+            SecretKind::ApiKey => "apiKey",
+            SecretKind::SecretAccessKey => "secretAccessKey",
+            SecretKind::SessionToken => "sessionToken",
         }
     }
 }
@@ -123,6 +180,25 @@ pub struct ProviderConnection {
     /// When true, request and surface model reasoning/thinking streams (#181).
     #[serde(default = "default_thinking")]
     pub thinking: bool,
+    /// AWS region for a Bedrock connection (e.g. `"us-east-1"`); the provider
+    /// derives `bedrock-runtime.<region>.amazonaws.com` from it. `None` for
+    /// non-Bedrock kinds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub region: Option<String>,
+    /// Bedrock credential mode. `None` for non-Bedrock kinds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub auth_mode: Option<BedrockAuth>,
+    /// AWS named profile for [`BedrockAuth::Profile`] (reads `~/.aws/config`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub aws_profile: Option<String>,
+    /// AWS access key id for [`BedrockAuth::IamKeys`]. A non-secret identifier; the
+    /// paired secret access key and session token live in the keychain, never here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub access_key_id: Option<String>,
 }
 
 impl ProviderConnection {
@@ -256,6 +332,10 @@ impl Default for ProviderRegistry {
             model: "Qwen3-4B-Instruct-2507".to_string(),
             has_key: false,
             thinking: true,
+            region: None,
+            auth_mode: None,
+            aws_profile: None,
+            access_key_id: None,
         };
         let ollama = ProviderConnection {
             id: "ollama".to_string(),
@@ -266,6 +346,10 @@ impl Default for ProviderRegistry {
             model: "llama3.2".to_string(),
             has_key: false,
             thinking: true,
+            region: None,
+            auth_mode: None,
+            aws_profile: None,
+            access_key_id: None,
         };
         Self {
             active: candle.id.clone(),
@@ -338,6 +422,10 @@ mod tests {
             model: "m".to_string(),
             has_key: false,
             thinking: true,
+            region: None,
+            auth_mode: None,
+            aws_profile: None,
+            access_key_id: None,
         }
     }
 
@@ -446,6 +534,10 @@ mod tests {
             model: "llama3.2".into(),
             has_key: false,
             thinking: true,
+            region: None,
+            auth_mode: None,
+            aws_profile: None,
+            access_key_id: None,
         };
         assert_eq!(conn.resolved_base_url(), "http://localhost:11434");
         let overridden = ProviderConnection {
@@ -471,5 +563,69 @@ mod tests {
         assert_eq!(k, ProviderKind::Ollama);
         let k: ProviderKind = serde_json::from_str("\"candleVllm\"").unwrap();
         assert_eq!(k, ProviderKind::CandleVllm);
+    }
+
+    #[test]
+    fn bedrock_kind_slug_and_base_url() {
+        assert_eq!(ProviderKind::Bedrock.slug(), "bedrock");
+        assert_eq!(
+            ProviderKind::Bedrock.default_base_url(),
+            "https://bedrock-runtime.us-east-1.amazonaws.com"
+        );
+        let k: ProviderKind = serde_json::from_str("\"bedrock\"").unwrap();
+        assert_eq!(k, ProviderKind::Bedrock);
+    }
+
+    #[test]
+    fn bedrock_auth_serializes_camel_case() {
+        for (variant, wire) in [
+            (BedrockAuth::Profile, "\"profile\""),
+            (BedrockAuth::IamKeys, "\"iamKeys\""),
+            (BedrockAuth::ApiKey, "\"apiKey\""),
+        ] {
+            assert_eq!(serde_json::to_string(&variant).unwrap(), wire);
+            assert_eq!(serde_json::from_str::<BedrockAuth>(wire).unwrap(), variant);
+        }
+    }
+
+    #[test]
+    fn secret_kind_slug_all_and_serde() {
+        assert_eq!(SecretKind::ALL.len(), 3);
+        assert_eq!(SecretKind::ApiKey.slug(), "apiKey");
+        assert_eq!(SecretKind::SecretAccessKey.slug(), "secretAccessKey");
+        assert_eq!(SecretKind::SessionToken.slug(), "sessionToken");
+        for kind in SecretKind::ALL {
+            let wire = serde_json::to_string(&kind).unwrap();
+            assert_eq!(wire, format!("\"{}\"", kind.slug()));
+            assert_eq!(serde_json::from_str::<SecretKind>(&wire).unwrap(), kind);
+        }
+    }
+
+    #[test]
+    fn connection_skips_none_bedrock_fields_and_round_trips() {
+        let conn = blank_conn("Local", None, ProviderKind::Ollama);
+        let json = serde_json::to_string(&conn).unwrap();
+        assert!(!json.contains("region"), "None region is skipped");
+        assert!(!json.contains("authMode"), "None auth_mode is skipped");
+        assert!(!json.contains("awsProfile"));
+        assert!(!json.contains("accessKeyId"));
+        let back: ProviderConnection = serde_json::from_str(&json).unwrap();
+        assert_eq!(conn, back);
+    }
+
+    #[test]
+    fn connection_with_bedrock_fields_round_trips() {
+        let conn = ProviderConnection {
+            region: Some("us-west-2".into()),
+            auth_mode: Some(BedrockAuth::IamKeys),
+            access_key_id: Some("AKIAEXAMPLE".into()),
+            ..blank_conn("Bedrock", Some("aws"), ProviderKind::Bedrock)
+        };
+        let json = serde_json::to_string(&conn).unwrap();
+        assert!(json.contains("\"region\":\"us-west-2\""));
+        assert!(json.contains("\"authMode\":\"iamKeys\""));
+        assert!(json.contains("\"accessKeyId\":\"AKIAEXAMPLE\""));
+        let back: ProviderConnection = serde_json::from_str(&json).unwrap();
+        assert_eq!(conn, back);
     }
 }

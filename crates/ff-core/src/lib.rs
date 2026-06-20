@@ -18,7 +18,8 @@ pub use memory::{MemoryFileInfo, MemoryFileKind, MemoryOverview};
 pub use message::{Message, Role, ToolCall};
 pub use mode::Mode;
 pub use provider::{
-    ConnectionId, ProviderConfig, ProviderConnection, ProviderKind, ProviderRegistry,
+    BedrockAuth, ConnectionId, ProviderConfig, ProviderConnection, ProviderKind, ProviderRegistry,
+    SecretKind,
 };
 pub use search::{SearchBackend, SearchConfig};
 pub use session::{auto_title, Session, SessionStatus, SessionWorkspace};

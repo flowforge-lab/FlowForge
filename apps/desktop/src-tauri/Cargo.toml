@@ -38,6 +38,7 @@ reqwest = { workspace = true, features = ["rustls-tls"] }
 url = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
+keyring = { version = "3", features = ["apple-native", "windows-native"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }
