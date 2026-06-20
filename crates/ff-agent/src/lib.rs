@@ -525,8 +525,13 @@ pub async fn run_turn(
             // tool result. A dismissed/cancelled question yields a result too, so the
             // assistant `tool_calls` message always has a matching reply (no malformed
             // history). Asking is read-only, so it never reaches the approval gate.
-            let permitted = tools
-                .allowed
+            // Gate dispatch on the same advertised set that gated the schema (#264).
+            // `advertised` already folds together the Plan-mode read-only restriction
+            // *and* any sub-agent allowlist, so a Plan-mode model that names a hidden
+            // mutating tool (e.g. via prompt injection) is hard-blocked here -- before
+            // the approval gate -- rather than relying on schema-hiding plus the
+            // approver as the only backstop. `None` = unrestricted (Act/Auto top level).
+            let permitted = advertised
                 .as_ref()
                 .is_none_or(|set| set.contains(&call.name));
             let outcome = match parsed_args {
@@ -542,10 +547,16 @@ pub async fn run_turn(
                             None => ff_tools::ToolOutcome::error("[no answer: question dismissed]"),
                         }
                     } else if !permitted {
-                        ff_tools::ToolOutcome::error(format!(
-                            "tool `{}` is not permitted for this sub-agent",
-                            call.name
-                        ))
+                        // Distinguish the two reasons a tool can be hidden so the model
+                        // gets an actionable result instead of a silent failure.
+                        ff_tools::ToolOutcome::error(if tools.mode.is_plan() {
+                            format!(
+                                "tool `{}` is not available in Plan mode (read-only tools only)",
+                                call.name
+                            )
+                        } else {
+                            format!("tool `{}` is not permitted for this sub-agent", call.name)
+                        })
                     } else if ff_tools::is_subagent(&call.name) {
                         // Delegation (#234): drive a child turn in a fresh ephemeral session and
                         // return only its summary. The child reuses the same provider/approver,
@@ -739,7 +750,7 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use ff_llm::{Chunk, ChunkStream, LlmError, ToolCallDelta};
-    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
 
     #[test]
     fn plan_mode_advertises_only_readonly_tools() {
@@ -781,6 +792,95 @@ mod tests {
         assert_eq!(
             advertised_tools(Mode::Auto, Some(&allowed), &reg),
             Some(allowed)
+        );
+    }
+
+    /// Records whether its approval gate was ever consulted. A Plan-mode hard block
+    /// must reject before this is reached (#264 review).
+    struct RecordingApprover {
+        consulted: Arc<AtomicBool>,
+    }
+    #[async_trait]
+    impl Approver for RecordingApprover {
+        async fn approve(
+            &self,
+            _message_id: &str,
+            _call_id: &str,
+            _name: &str,
+            _safety: Safety,
+            _args: &serde_json::Value,
+        ) -> bool {
+            self.consulted.store(true, Ordering::SeqCst);
+            true
+        }
+    }
+
+    #[tokio::test]
+    async fn plan_mode_hard_blocks_dispatch_of_a_hidden_tool() {
+        // A Plan-mode model that names a hidden mutating tool (`bash`) -- e.g. via
+        // prompt injection -- must be hard-blocked at dispatch, *before* the approval
+        // gate, not merely hidden from the schema (#264 review blocker).
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::new();
+        let s = store.create_session(None);
+        store.add_message(&s.id, Role::User, "do it".into());
+        let registry = ToolRegistry::with_defaults();
+        let root = dir.path().to_path_buf();
+        let consulted = Arc::new(AtomicBool::new(false));
+        let approve = RecordingApprover {
+            consulted: consulted.clone(),
+        };
+        let provider = ToolThenText {
+            calls: AtomicUsize::new(0),
+        };
+
+        let plan = ToolContext {
+            registry: &registry,
+            root: &root,
+            approve: &approve,
+            max_iterations: 8,
+            depth: 0,
+            max_depth: 1,
+            allowed: None,
+            mode: Mode::Plan,
+        };
+
+        run_turn(
+            &provider,
+            &store,
+            &plan,
+            &s.id,
+            "mock",
+            None,
+            false,
+            CancelToken::new(),
+            |_| {},
+        )
+        .await
+        .unwrap();
+
+        // The approver was never consulted -- the block is structural, independent of
+        // model or approver behaviour.
+        assert!(
+            !consulted.load(Ordering::SeqCst),
+            "Plan-mode dispatch must hard-block before the approval gate"
+        );
+
+        // The tool never ran; the model gets a clear, actionable Plan-mode error.
+        let history = store.get_messages(&s.id);
+        let tool_result = history
+            .iter()
+            .find(|m| m.role == Role::Tool)
+            .expect("the blocked call still produces a tool result");
+        assert!(
+            tool_result.content.contains("not available in Plan mode"),
+            "{}",
+            tool_result.content
+        );
+        assert!(
+            !tool_result.content.contains("wired"),
+            "bash must not have executed: {}",
+            tool_result.content
         );
     }
 
