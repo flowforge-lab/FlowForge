@@ -27,6 +27,17 @@ pub use compaction::{
 };
 pub use system_prompt::{build_flush_prompt, build_system_prompt, UserContext};
 
+/// Default tool-call iteration cap for a turn when a phenotype does not override
+/// it (#244 R3). A turn runs at most this many model<->tool round-trips before
+/// it is forced to stop. Coding phenotypes raise this via `max_iterations` in
+/// their phenotype TOML.
+pub const DEFAULT_MAX_ITERATIONS: usize = 8;
+
+/// When this many iterations (including the current one) remain before the cap,
+/// the loop injects a transient "wrap up" nudge so the model produces a final
+/// answer instead of being cut mid-tool-call (#244 R3).
+const WRAP_UP_AT_REMAINING: usize = 1;
+
 /// Events the agent emits during a turn. The host (Tauri shell or a test) decides
 /// how to surface them — over IPC, to a channel, or into assertions.
 #[derive(Debug, Clone, Serialize)]
@@ -239,8 +250,9 @@ pub async fn run_turn(
         .openai_tools_for(tools.allowed.as_ref(), allow_subagent);
     let mut last: Option<Message> = None;
 
+    let max_iter = tools.max_iterations.max(1);
     let mut turn_count: u32 = 0;
-    for _ in 0..tools.max_iterations.max(1) {
+    for iter in 0..max_iter {
         turn_count += 1;
         if cancel.is_cancelled() {
             break;
@@ -260,6 +272,25 @@ pub async fn run_turn(
             });
         }
         messages.extend(to_chat(&history));
+
+        // Near the iteration cap, nudge the model to stop calling tools and answer,
+        // so a long turn ends with a real reply instead of "[stopped: reached
+        // tool-call limit]" cut mid-tool (#244 R3). Transient: request-only.
+        let remaining = max_iter - iter; // iterations left, including this one
+        if remaining <= WRAP_UP_AT_REMAINING && max_iter > 1 {
+            messages.push(ChatMessage {
+                role: "system".to_string(),
+                content: Some(
+                    "This is your final step before the tool-call limit. Do not call any \
+                     more tools; summarize what you have done and give your final answer \
+                     to the user now."
+                        .to_string(),
+                ),
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+            });
+        }
         let req = ChatRequest {
             model: model.to_string(),
             messages,
@@ -1382,5 +1413,104 @@ mod tests {
             "{}",
             tool_result.content
         );
+    }
+
+    /// Always requests a tool call (never finishes on its own), and records, per
+    /// request, whether the wrap-up nudge system message was present. Lets a test
+    /// drive the loop to its iteration cap and assert when the nudge fires.
+    struct RecordingToolLooper {
+        nudge_seen: Arc<std::sync::Mutex<Vec<bool>>>,
+    }
+
+    #[async_trait]
+    impl Provider for RecordingToolLooper {
+        async fn chat_stream(&self, req: ChatRequest) -> Result<ChunkStream, LlmError> {
+            let saw = req.messages.iter().any(|m| {
+                m.role == "system"
+                    && m.content
+                        .as_deref()
+                        .is_some_and(|c| c.contains("final step before the tool-call limit"))
+            });
+            self.nudge_seen.lock().unwrap().push(saw);
+            Ok(futures_util::stream::iter(vec![Ok(Chunk {
+                tool_calls: vec![ToolCallDelta {
+                    index: 0,
+                    id: Some("call_1".into()),
+                    name: Some("bash".into()),
+                    arguments: r#"{"command":"echo wired"}"#.into(),
+                }],
+                done: true,
+                ..Chunk::default()
+            })])
+            .boxed())
+        }
+    }
+
+    #[tokio::test]
+    async fn wrap_up_nudge_fires_only_on_final_iteration() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::new();
+        let s = store.create_session(None);
+        store.add_message(&s.id, Role::User, "keep going".into());
+        let registry = ToolRegistry::with_defaults();
+        let approve = AlwaysApprove;
+        let nudge_seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = RecordingToolLooper {
+            nudge_seen: nudge_seen.clone(),
+        };
+        let tools = ToolContext::new(&registry, dir.path(), &approve, 3);
+
+        run_turn(
+            &provider,
+            &store,
+            &tools,
+            &s.id,
+            "mock",
+            None,
+            false,
+            CancelToken::new(),
+            |_| {},
+        )
+        .await
+        .unwrap();
+
+        let seen = nudge_seen.lock().unwrap();
+        // The provider is hit once per iteration, up to the cap.
+        assert_eq!(seen.len(), 3, "loop should run to the iteration cap");
+        // The nudge is injected only on the final iteration (remaining == 1).
+        assert_eq!(seen.as_slice(), &[false, false, true]);
+    }
+
+    #[tokio::test]
+    async fn no_wrap_up_nudge_when_cap_is_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::new();
+        let s = store.create_session(None);
+        store.add_message(&s.id, Role::User, "keep going".into());
+        let registry = ToolRegistry::with_defaults();
+        let approve = AlwaysApprove;
+        let nudge_seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = RecordingToolLooper {
+            nudge_seen: nudge_seen.clone(),
+        };
+        let tools = ToolContext::new(&registry, dir.path(), &approve, 1);
+
+        run_turn(
+            &provider,
+            &store,
+            &tools,
+            &s.id,
+            "mock",
+            None,
+            false,
+            CancelToken::new(),
+            |_| {},
+        )
+        .await
+        .unwrap();
+
+        let seen = nudge_seen.lock().unwrap();
+        // With a single-iteration cap there is no "next step" to wrap up toward.
+        assert_eq!(seen.as_slice(), &[false]);
     }
 }

@@ -372,6 +372,7 @@ fn send_message(
     // The active phenotype may override the model and prepend a persona (RFC 0001 §7).
     let model = state.active_model_override().unwrap_or(default_model);
     let persona = state.active_persona();
+    let max_iterations = state.active_max_iterations();
     tauri::async_runtime::spawn(async move {
         let sid = session_id.clone();
         let approver = UiApprover {
@@ -382,7 +383,7 @@ fn send_message(
         // Snapshot built-in + MCP-bridged tools for this turn (RFC 0003 §6).
         let registry = state.build_tool_registry();
         let session_root = state.session_root(&sid);
-        let tool_ctx = ToolContext::new(&registry, &session_root, &approver, 8);
+        let tool_ctx = ToolContext::new(&registry, &session_root, &approver, max_iterations);
         // Skills + ambient context for this turn (RFC 0001 §4, RFC 0002 phase 1):
         // the active phenotype's persona, installed-skill descriptions, the bodies of
         // active skills, and the current local time.
