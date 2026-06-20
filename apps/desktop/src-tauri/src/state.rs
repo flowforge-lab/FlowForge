@@ -9,8 +9,8 @@ use ff_agent::{
     MemoryFlush, ProxyTokenEstimator, DEFAULT_FLUSH_AT_FRACTION,
 };
 use ff_core::{
-    Mode, Phenotype, ProviderConfig, ProviderConnection, ProviderKind, ProviderRegistry,
-    SearchConfig, SecretKind,
+    McpServerState, McpServerStatus, Mode, Phenotype, ProviderConfig, ProviderConnection,
+    ProviderKind, ProviderRegistry, SearchConfig, SecretKind,
 };
 use ff_llm::{OllamaProvider, OpenAiProvider, Provider};
 use ff_mcp::{McpConfigWatcher, SupervisorHandle};
@@ -558,17 +558,20 @@ impl AppState {
         next
     }
 
-    /// MCP server ids declared by `skills` (via their manifests) that are NOT
-    /// present in the running supervisor — i.e. not defined in `~/.flowforge/mcp.json`.
+    /// MCP server ids declared by `skills` (via their manifests) whose tools are NOT
+    /// currently available — the server is either absent from `~/.flowforge/mcp.json`
+    /// or present but not `Running` (a `Failed`/`Disabled`/`Restarting`/`Starting`
+    /// server advertises no tools).
     ///
     /// A phenotype carries its MCP servers as "DNA" (#235): a skill declares the
     /// servers it needs, and a phenotype that lists the skill expects those servers
     /// available. The first cut *requires* the server to already exist in `mcp.json`
-    /// and reports the missing ones; it never injects a server definition on
+    /// and reports the unavailable ones; it never injects a server definition on
     /// activation (that would mutate the `mcp.json` source-of-truth — a follow-up).
     ///
-    /// Name-sorted and deduplicated. Empty when every required server is present, no
-    /// listed skill requires one, or MCP has not been initialized.
+    /// Name-sorted and deduplicated. Empty only when every required server is present
+    /// AND running, or no listed skill requires one. When MCP is uninitialized every
+    /// required server is reported (none can be running).
     fn missing_skill_mcp_servers(&self, skills: &BTreeSet<String>) -> Vec<String> {
         let required: BTreeSet<String> = {
             let registry = self.skills.read().unwrap();
@@ -581,24 +584,43 @@ impl AppState {
         if required.is_empty() {
             return Vec::new();
         }
-        let present: BTreeSet<String> = self
+        let snapshot = self
             .mcp_handle()
-            .map(|handle| handle.status_snapshot().into_iter().map(|s| s.id).collect())
+            .map(|handle| handle.status_snapshot())
             .unwrap_or_default();
-        required.difference(&present).cloned().collect()
+        Self::unavailable_required_servers(&required, &snapshot)
+    }
+
+    /// Pure diff of `required` server ids against a supervisor `snapshot`: an id is
+    /// unavailable unless a server with that id is present and in the `Running` state.
+    /// Name-sorted and deduplicated (`required` is a `BTreeSet`).
+    fn unavailable_required_servers(
+        required: &BTreeSet<String>,
+        snapshot: &[McpServerStatus],
+    ) -> Vec<String> {
+        let running: BTreeSet<&str> = snapshot
+            .iter()
+            .filter(|s| s.state == McpServerState::Running)
+            .map(|s| s.id.as_str())
+            .collect();
+        required
+            .iter()
+            .filter(|id| !running.contains(id.as_str()))
+            .cloned()
+            .collect()
     }
 
     /// Warn (once per server) when an activated phenotype lists skills whose declared
-    /// MCP servers are absent from `mcp.json` (#235). Best-effort and non-fatal: a
-    /// missing server must not block activation — the skill's grep/glob fallbacks
-    /// still work; only the bridged MCP tools are unavailable until the user adds the
-    /// server. No server is injected.
+    /// MCP servers are unavailable — absent from `mcp.json` or present but not running
+    /// (#235). Best-effort and non-fatal: this must not block activation — the skill's
+    /// grep/glob fallbacks still work; only the bridged MCP tools are unavailable until
+    /// the user adds/repairs the server. No server is injected.
     fn warn_missing_skill_mcp(&self, phenotype: &str, skills: &BTreeSet<String>) {
         for server in self.missing_skill_mcp_servers(skills) {
             tracing::warn!(
                 phenotype = %phenotype,
                 server = %server,
-                "phenotype skill requires an MCP server not present in mcp.json;                   its tools are unavailable until you add it (no server is injected)"
+                "phenotype skill requires an MCP server whose tools are unavailable (not present in mcp.json, or present but not running); add or repair it to enable them (no server is injected)"
             );
         }
     }
@@ -1803,6 +1825,31 @@ mod tests {
         assert_eq!(
             state.missing_skill_mcp_servers(&skills),
             vec!["codegraph".to_string(), "zeta".to_string()]
+        );
+    }
+
+    #[test]
+    fn present_but_not_running_server_is_reported_unavailable() {
+        let status = |id: &str, state: McpServerState| McpServerStatus {
+            id: id.into(),
+            state,
+            tool_count: 0,
+            last_error: None,
+            restarts: 0,
+            pid: None,
+        };
+        let required: BTreeSet<String> =
+            ["running".into(), "failed".into(), "disabled".into()].into();
+        let snapshot = [
+            status("running", McpServerState::Running),
+            status("failed", McpServerState::Failed),
+            status("disabled", McpServerState::Disabled),
+        ];
+        // Only the Running server provides tools; Failed/Disabled are present in the
+        // snapshot yet still reported, since their tools are unavailable.
+        assert_eq!(
+            AppState::unavailable_required_servers(&required, &snapshot),
+            vec!["disabled".to_string(), "failed".to_string()]
         );
     }
 
