@@ -66,6 +66,12 @@ impl Approver for UiApprover {
         safety: Safety,
         args: &serde_json::Value,
     ) -> bool {
+        // Short-circuit on the #229 allowlist (never covers Dangerous — see
+        // `AppState::allowlist_covers`).
+        if self.state.allowlist_covers(&self.session_id, name, safety) {
+            return true;
+        }
+
         let safety = match safety {
             Safety::Write => ApprovalSafety::Write,
             Safety::Dangerous => ApprovalSafety::Dangerous,
@@ -164,6 +170,7 @@ fn delete_session(state: State<'_, Arc<AppState>>, session_id: String) {
         token.cancel();
     }
     state.cancel_pending_approvals(&session_id);
+    state.clear_session_approvals(&session_id);
     state.store.delete_session(&session_id);
 }
 
@@ -312,6 +319,32 @@ fn respond_ask(
     answer: String,
 ) {
     state.resolve_ask(&session_id, &call_id, answer);
+}
+
+// --- Four-option tool approval commands (#229) ---
+
+/// Approve a tool for this session only (in-memory).
+#[tauri::command]
+fn set_session_approve(state: State<'_, Arc<AppState>>, session_id: String, tool: String) {
+    state.set_session_approve(&session_id, &tool);
+}
+
+/// Add a tool to the persistent always-approved set.
+#[tauri::command]
+fn set_always_approve(state: State<'_, Arc<AppState>>, tool: String) {
+    state.set_always_approve(&tool);
+}
+
+/// Remove a tool from the persistent always-approved set.
+#[tauri::command]
+fn remove_always_approve(state: State<'_, Arc<AppState>>, tool: String) {
+    state.remove_always_approve(&tool);
+}
+
+/// List all persistently always-approved tools (sorted).
+#[tauri::command]
+fn list_always_approved(state: State<'_, Arc<AppState>>) -> Vec<String> {
+    state.list_always_approved()
 }
 
 /// Persists the user message, then spawns the assistant turn. Tokens stream back
@@ -1083,6 +1116,10 @@ pub fn run() {
             cancel_turn,
             respond_approval,
             respond_ask,
+            set_session_approve,
+            set_always_approve,
+            remove_always_approve,
+            list_always_approved,
             get_provider_config,
             set_provider_config,
             get_provider_registry,

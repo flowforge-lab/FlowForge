@@ -1,5 +1,6 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -25,7 +26,7 @@ use ff_skills::{
 };
 use ff_tools::memory::{MemoryConsolidateTool, MemoryGetTool, MemorySearchTool, MemoryWriteTool};
 use ff_tools::process::{ProcessManagerTool, ProcessSupervisor};
-use ff_tools::ToolRegistry;
+use ff_tools::{Safety, ToolRegistry};
 use tokio::sync::oneshot;
 
 /// Registry of in-flight turn cancellation tokens and tool-approval prompts, kept
@@ -45,6 +46,74 @@ struct ApprovalRegistry {
     /// liveness, and cancel-via-drop semantics as `pending`, but carries the typed
     /// answer string instead of an approve/deny bool.
     pending_asks: HashMap<(String, String), oneshot::Sender<String>>,
+    /// session_id -> set of tool names approved for this session only (#229).
+    session_approved: HashMap<String, HashSet<String>>,
+    /// Tools approved globally across all sessions (persisted to tool_permissions.json).
+    always_approved: HashSet<String>,
+}
+
+/// On-disk shape of `tool_permissions.json` (#229).
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ToolPermissions {
+    always_approved: Vec<String>,
+}
+
+impl ApprovalRegistry {
+    fn set_session_approve(&mut self, session_id: &str, tool: &str) {
+        self.session_approved
+            .entry(session_id.to_string())
+            .or_default()
+            .insert(tool.to_string());
+    }
+
+    fn is_session_approved(&self, session_id: &str, tool: &str) -> bool {
+        self.session_approved
+            .get(session_id)
+            .is_some_and(|s| s.contains(tool))
+    }
+
+    fn set_always_approve(&mut self, tool: &str) {
+        self.always_approved.insert(tool.to_string());
+    }
+
+    fn remove_always_approve(&mut self, tool: &str) {
+        self.always_approved.remove(tool);
+    }
+
+    fn is_always_approved(&self, tool: &str) -> bool {
+        self.always_approved.contains(tool)
+    }
+
+    fn list_always_approved(&self) -> Vec<String> {
+        let mut v: Vec<String> = self.always_approved.iter().cloned().collect();
+        v.sort();
+        v
+    }
+
+    fn load_always_approved(path: &Path) -> HashSet<String> {
+        fs::read_to_string(path)
+            .ok()
+            .and_then(|s| serde_json::from_str::<ToolPermissions>(&s).ok())
+            .map(|tp| tp.always_approved.into_iter().collect())
+            .unwrap_or_default()
+    }
+
+    fn save_always_approved(path: &Path, set: &HashSet<String>) -> io::Result<()> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let mut sorted: Vec<String> = set.iter().cloned().collect();
+        sorted.sort();
+        let perms = ToolPermissions {
+            always_approved: sorted,
+        };
+        let json = serde_json::to_string_pretty(&perms).map_err(io::Error::other)?;
+        // Atomic write: temp file + rename
+        let tmp = path.with_extension("json.tmp");
+        fs::write(&tmp, &json)?;
+        fs::rename(&tmp, path)?;
+        Ok(())
+    }
 }
 
 /// Builds a fresh [`Provider`] from a [`ProviderConnection`]. Called once per turn
@@ -213,6 +282,12 @@ fn save_search_config(config: &SearchConfig) {
     }
 }
 
+/// `~/.config/flowforge/tool_permissions.json` — the persistent tool allowlist (#229).
+/// `None` only when the OS exposes no config dir.
+fn tool_permissions_path() -> Option<PathBuf> {
+    dirs::config_dir().map(|d| d.join("flowforge").join("tool_permissions.json"))
+}
+
 /// `~/.config/flowforge/phenotype.json` — the name of the active phenotype, persisted
 /// so a switch survives a restart (RFC 0001 §7). Separate from the phenotype
 /// *definitions* in `~/.flowforge/phenotypes/`; this only records which one is active.
@@ -369,7 +444,13 @@ impl AppState {
             session_cwd: Mutex::new(HashMap::new()),
             skills,
             _skill_watcher: Mutex::new(watcher),
-            approvals: Mutex::new(ApprovalRegistry::default()),
+            approvals: Mutex::new({
+                let mut reg = ApprovalRegistry::default();
+                if let Some(path) = tool_permissions_path() {
+                    reg.always_approved = ApprovalRegistry::load_always_approved(&path);
+                }
+                reg
+            }),
             active_skills: Mutex::new(BTreeSet::new()),
             active_phenotype: Mutex::new(default_phenotype()),
             signals: Mutex::new(load_signals()),
@@ -890,6 +971,17 @@ impl AppState {
         reg.pending_asks.retain(|(sid, _), _| sid != session_id);
     }
 
+    /// Clear a session's "Allow this session" allowlist (#229). Called ONLY on
+    /// session delete -- never on turn cancel, which would silently revoke a
+    /// grant the user expects to last until the session ends.
+    pub fn clear_session_approvals(&self, session_id: &str) {
+        self.approvals
+            .lock()
+            .unwrap()
+            .session_approved
+            .remove(session_id);
+    }
+
     /// Reserve a slot for an `ask_user` question (#44). Mirrors `register_approval`:
     /// the same TOCTOU liveness guard refuses (drops the sender -> `Err` -> `None`
     /// dismissed) when the session has no live turn, so a cancel racing registration
@@ -912,6 +1004,71 @@ impl AppState {
         if let Some(tx) = self.approvals.lock().unwrap().pending_asks.remove(&key) {
             let _ = tx.send(answer);
         }
+    }
+
+    // --- Four-option approval (#229) ---
+
+    /// Check if a tool is always-approved (global persistent allowlist).
+    pub fn is_always_approved(&self, tool: &str) -> bool {
+        self.approvals.lock().unwrap().is_always_approved(tool)
+    }
+
+    /// Check if a tool is session-approved for the given session.
+    pub fn is_session_approved(&self, session_id: &str, tool: &str) -> bool {
+        self.approvals
+            .lock()
+            .unwrap()
+            .is_session_approved(session_id, tool)
+    }
+
+    /// Mark a tool as approved for this session only.
+    pub fn set_session_approve(&self, session_id: &str, tool: &str) {
+        self.approvals
+            .lock()
+            .unwrap()
+            .set_session_approve(session_id, tool);
+    }
+
+    /// Add a tool to the global always-approved set and persist.
+    pub fn set_always_approve(&self, tool: &str) {
+        let set = {
+            let mut reg = self.approvals.lock().unwrap();
+            reg.set_always_approve(tool);
+            reg.always_approved.clone()
+        };
+        if let Some(path) = tool_permissions_path() {
+            if let Err(e) = ApprovalRegistry::save_always_approved(&path, &set) {
+                tracing::warn!(error = %e, "failed to persist tool_permissions.json");
+            }
+        }
+    }
+
+    /// Remove a tool from the global always-approved set and persist.
+    pub fn remove_always_approve(&self, tool: &str) {
+        let set = {
+            let mut reg = self.approvals.lock().unwrap();
+            reg.remove_always_approve(tool);
+            reg.always_approved.clone()
+        };
+        if let Some(path) = tool_permissions_path() {
+            if let Err(e) = ApprovalRegistry::save_always_approved(&path, &set) {
+                tracing::warn!(error = %e, "failed to persist tool_permissions.json");
+            }
+        }
+    }
+
+    /// List all globally always-approved tools, sorted.
+    pub fn list_always_approved(&self) -> Vec<String> {
+        self.approvals.lock().unwrap().list_always_approved()
+    }
+
+    /// Whether the #229 allowlist pre-approves this call without a prompt. The
+    /// allowlist is keyed by tool name only, so it never covers `Dangerous`
+    /// invocations -- those always re-prompt regardless of any "Always Allow" or
+    /// "Allow this session" grant on the tool.
+    pub fn allowlist_covers(&self, session_id: &str, tool: &str, safety: Safety) -> bool {
+        safety != Safety::Dangerous
+            && (self.is_always_approved(tool) || self.is_session_approved(session_id, tool))
     }
 }
 
@@ -1609,5 +1766,87 @@ mod tests {
             Some(path),
             "control commands must write back to the watched file"
         );
+    }
+
+    // --- Four-option approval tests (#229) ---
+
+    #[test]
+    fn session_approved_scoped_by_session_and_tool() {
+        let mut reg = ApprovalRegistry::default();
+        reg.set_session_approve("s1", "t1");
+        assert!(reg.is_session_approved("s1", "t1"));
+        assert!(!reg.is_session_approved("s2", "t1"));
+        assert!(!reg.is_session_approved("s1", "t2"));
+    }
+
+    #[test]
+    fn turn_cancel_keeps_session_approved_but_delete_clears_it() {
+        let state = AppState::new();
+        arm(&state, "s1");
+        arm(&state, "s2");
+        state.set_session_approve("s1", "bash");
+        state.set_session_approve("s2", "bash");
+
+        // Turn cancel (Stop button) must NOT revoke "Allow this session" (#229).
+        state.cancel_pending_approvals("s1");
+        assert!(state.is_session_approved("s1", "bash"));
+        assert!(state.is_session_approved("s2", "bash"));
+
+        // Session delete is the only thing that clears the session allowlist,
+        // and only for the targeted session.
+        state.clear_session_approvals("s1");
+        assert!(!state.is_session_approved("s1", "bash"));
+        assert!(state.is_session_approved("s2", "bash"));
+    }
+
+    #[test]
+    fn allowlist_never_covers_dangerous() {
+        let state = AppState::new();
+        arm(&state, "s1");
+        // Session grant (in-memory only; avoids touching the real persisted file).
+        state.set_session_approve("s1", "bash");
+
+        // Write / ReadOnly: the grant pre-approves.
+        assert!(state.allowlist_covers("s1", "bash", Safety::Write));
+        assert!(state.allowlist_covers("s1", "bash", Safety::ReadOnly));
+
+        // Dangerous: always re-prompts despite the grant.
+        assert!(!state.allowlist_covers("s1", "bash", Safety::Dangerous));
+
+        // An ungranted tool is never covered regardless of safety.
+        assert!(!state.allowlist_covers("s1", "ungranted_tool_xyz", Safety::Write));
+    }
+
+    #[test]
+    fn always_approved_set_remove_list() {
+        let mut reg = ApprovalRegistry::default();
+        reg.set_always_approve("read_file");
+        reg.set_always_approve("write_file");
+        assert!(reg.is_always_approved("read_file"));
+        assert!(!reg.is_always_approved("exec"));
+        assert_eq!(reg.list_always_approved(), vec!["read_file", "write_file"]);
+        reg.remove_always_approve("read_file");
+        assert!(!reg.is_always_approved("read_file"));
+        assert_eq!(reg.list_always_approved(), vec!["write_file"]);
+    }
+
+    #[test]
+    fn always_approved_save_load_roundtrip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("tool_permissions.json");
+        let mut set = HashSet::new();
+        set.insert("bash".to_string());
+        set.insert("read_file".to_string());
+        ApprovalRegistry::save_always_approved(&path, &set).unwrap();
+        let loaded = ApprovalRegistry::load_always_approved(&path);
+        assert_eq!(loaded, set);
+    }
+
+    #[test]
+    fn load_always_approved_missing_file_returns_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("nonexistent.json");
+        let loaded = ApprovalRegistry::load_always_approved(&path);
+        assert!(loaded.is_empty());
     }
 }
