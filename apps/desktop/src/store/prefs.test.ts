@@ -170,6 +170,29 @@ describe("keyboard prefs (SET.6)", () => {
     // Appearance prefs are owned by resetAppearance, not resetKeyboard.
     expect(usePrefsStore.getState().theme).toBe("dark");
   });
+
+  it("defaults defaultMode to auto and setDefaultMode updates it (#266)", () => {
+    expect(usePrefsStore.getState().defaultMode).toBe("auto");
+    usePrefsStore.getState().setDefaultMode("plan");
+    expect(usePrefsStore.getState().defaultMode).toBe("plan");
+  });
+
+  it("does NOT persist defaultMode to ff-prefs (#287 — backend is the source of truth)", () => {
+    usePrefsStore.getState().setDefaultMode("plan");
+    const blob = JSON.parse(localStorage.getItem("ff-prefs") ?? "{}");
+    expect(blob.state?.defaultMode).toBeUndefined();
+    // A persisted pref (sendMessageKey) still round-trips, proving persistence runs.
+    usePrefsStore.getState().setSendMessageKey("ctrlEnter");
+    expect(
+      JSON.parse(localStorage.getItem("ff-prefs") ?? "{}").state.sendMessageKey,
+    ).toBe("ctrlEnter");
+  });
+
+  it("resetKeyboard restores defaultMode to auto (#266)", () => {
+    usePrefsStore.setState({ defaultMode: "plan" });
+    usePrefsStore.getState().resetKeyboard();
+    expect(usePrefsStore.getState().defaultMode).toBe("auto");
+  });
 });
 
 describe("ff-prefs hydration of pre-SET.2 blobs", () => {
