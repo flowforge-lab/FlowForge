@@ -927,6 +927,16 @@ impl AppState {
     pub fn active_model_override(&self) -> Option<String> {
         self.active_phenotype.lock().unwrap().model.clone()
     }
+
+    /// The active phenotype's tool-call iteration cap, falling back to the default
+    /// when unset (#244 R3).
+    pub fn active_max_iterations(&self) -> usize {
+        self.active_phenotype
+            .lock()
+            .unwrap()
+            .max_iterations
+            .unwrap_or(ff_agent::DEFAULT_MAX_ITERATIONS)
+    }
 }
 
 impl AppState {
@@ -1497,6 +1507,7 @@ mod tests {
             skills: vec!["not-installed".into()],
             model: Some("qwen3-coder".into()),
             persona: Some("You are a Rust expert.".into()),
+            max_iterations: None,
         };
         state.apply_phenotype(pheno);
         assert!(state.active_skills().is_empty());
@@ -1519,6 +1530,7 @@ mod tests {
             skills: vec![],
             model: Some("m".into()),
             persona: Some("p".into()),
+            max_iterations: None,
         });
         state.apply_phenotype(default_phenotype());
         assert!(state.active_model_override().is_none());

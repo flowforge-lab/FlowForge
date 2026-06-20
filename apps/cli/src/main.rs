@@ -138,6 +138,7 @@ struct TurnInputs {
     model: String,
     persona: Option<String>,
     active: Vec<String>,
+    max_iterations: usize,
 }
 
 /// Resolve the `--model`/`--skill`/`--pheno` flags to per-turn inputs, mirroring
@@ -160,7 +161,7 @@ fn resolve_turn_inputs(
 ) -> Result<TurnInputs, String> {
     use std::collections::BTreeSet;
 
-    let (mut active, persona, pheno_model) = match pheno {
+    let (mut active, persona, pheno_model, pheno_max_iter) = match pheno {
         Some(p) => {
             let mut validated = BTreeSet::new();
             for name in &p.skills {
@@ -173,9 +174,14 @@ fn resolve_turn_inputs(
                     );
                 }
             }
-            (validated, p.persona.clone(), p.model.clone())
+            (
+                validated,
+                p.persona.clone(),
+                p.model.clone(),
+                p.max_iterations,
+            )
         }
-        None => (BTreeSet::new(), None, None),
+        None => (BTreeSet::new(), None, None, None),
     };
 
     for name in skill_flags {
@@ -195,6 +201,7 @@ fn resolve_turn_inputs(
         model,
         persona,
         active: active.into_iter().collect(),
+        max_iterations: pheno_max_iter.unwrap_or(ff_agent::DEFAULT_MAX_ITERATIONS),
     })
 }
 
@@ -296,7 +303,7 @@ async fn run(
         memory.as_deref(),
     );
 
-    let tool_ctx = ToolContext::new(&registry, &workspace, &approver, 8);
+    let tool_ctx = ToolContext::new(&registry, &workspace, &approver, inputs.max_iterations);
 
     let cancel = CancelToken::new();
     // Ctrl-C cancels the turn cooperatively. `ctrl_c()` is portable across Unix and
@@ -360,7 +367,12 @@ async fn chat(json: bool, approval_mode: ApprovalMode) -> ExitCode {
     let approver = CliApprover::new(approval_mode);
     let session = store.create_session(None);
 
-    let tool_ctx = ToolContext::new(&registry, &workspace, &approver, 8);
+    let tool_ctx = ToolContext::new(
+        &registry,
+        &workspace,
+        &approver,
+        ff_agent::DEFAULT_MAX_ITERATIONS,
+    );
 
     let stdin = std::io::stdin();
     chat_repl(
@@ -868,6 +880,7 @@ mod tests {
             skills: skills.iter().map(|s| s.to_string()).collect(),
             model: model.map(str::to_string),
             persona: persona.map(str::to_string),
+            max_iterations: None,
         }
     }
 
