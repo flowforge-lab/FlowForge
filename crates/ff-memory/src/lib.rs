@@ -55,6 +55,40 @@ pub enum WriteTarget {
     Curated,
 }
 
+/// A durable-memory stratum — a curated `MEMORY.md` section in the Biosphere
+/// who/how/what convention (RFC 0008 §3/§4). The headings are a soft-contract:
+/// where structured facts go, not a schema the file must obey.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stratum {
+    /// WHO: role, stable traits, hard preferences.
+    Identity,
+    /// HOW: conventions, working style, recurring decisions.
+    Patterns,
+    /// WHAT: current priorities and active work.
+    Focus,
+}
+
+impl Stratum {
+    /// The canonical Markdown heading line for this stratum.
+    pub fn heading(self) -> &'static str {
+        match self {
+            Stratum::Identity => "## Identity",
+            Stratum::Patterns => "## Patterns",
+            Stratum::Focus => "## Focus",
+        }
+    }
+
+    /// Parse the lowercase tool-facing name (`identity` / `patterns` / `focus`).
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "identity" => Some(Stratum::Identity),
+            "patterns" => Some(Stratum::Patterns),
+            "focus" => Some(Stratum::Focus),
+            _ => None,
+        }
+    }
+}
+
 /// Which memory file a [`MemoryFile`] is. Mirrors [`MemorySource`] but is a plain,
 /// flat enum for the read-only Settings browse surface (M5.1e).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -289,6 +323,18 @@ impl Memory {
                 source,
             })?;
         Ok(path)
+    }
+
+    /// Append a durable fact to the curated `MEMORY.md` under a Biosphere
+    /// stratum heading (RFC 0008 §4): the text lands at the end of the matching
+    /// `## Identity` / `## Patterns` / `## Focus` section, creating that section
+    /// if it does not exist yet. Goes through [`rewrite_curated`] because placing
+    /// text under a heading is a structured edit, not a blind append.
+    pub fn write_curated_stratum(&self, text: &str, stratum: Stratum) -> Result<PathBuf> {
+        let existing = read_lenient(&self.curated_path());
+        let updated = insert_under_heading(&existing, stratum.heading(), text);
+        self.rewrite_curated(&updated)?;
+        Ok(self.curated_path())
     }
 
     /// The memory config.
@@ -710,12 +756,108 @@ pub fn chunk_markdown(text: &str, source: MemorySource, path: &Path) -> Vec<Memo
     chunks
 }
 
+/// Insert `text` at the end of the `heading` section of a Markdown document,
+/// creating the section at the end of the file if the heading is absent. A
+/// "section" runs from its heading line to the next sibling `## ` heading (or
+/// EOF). Pure and lenient — used by [`Memory::write_curated_stratum`] (RFC 0008).
+fn insert_under_heading(content: &str, heading: &str, text: &str) -> String {
+    let text = text.trim_end();
+    let lines: Vec<&str> = content.lines().collect();
+    let head_idx = lines.iter().position(|l| l.trim_end() == heading);
+
+    match head_idx {
+        None => {
+            // Append a fresh section at the end of the file.
+            let mut out = content.trim_end().to_string();
+            if !out.is_empty() {
+                out.push_str("\n\n");
+            }
+            out.push_str(heading);
+            out.push('\n');
+            out.push_str(text);
+            out.push('\n');
+            out
+        }
+        Some(h) => {
+            // The section ends at the next top-level `## ` heading, or EOF.
+            let end = lines[h + 1..]
+                .iter()
+                .position(|l| l.starts_with("## "))
+                .map(|rel| h + 1 + rel)
+                .unwrap_or(lines.len());
+
+            // Drop trailing blank lines inside the section so the new text joins
+            // cleanly, then re-emit the section body + the appended text.
+            let mut body_end = end;
+            while body_end > h + 1 && lines[body_end - 1].trim().is_empty() {
+                body_end -= 1;
+            }
+
+            let mut out: Vec<String> = lines[..body_end].iter().map(|l| l.to_string()).collect();
+            out.push(text.to_string());
+            if end < lines.len() {
+                // Blank line before the next sibling heading.
+                out.push(String::new());
+                out.extend(lines[end..].iter().map(|l| l.to_string()));
+            }
+            let mut joined = out.join("\n");
+            joined.push('\n');
+            joined
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn mem(root: &Path) -> Memory {
         Memory::new(root, MemoryConfig::default())
+    }
+
+    #[test]
+    fn insert_under_heading_creates_section_when_absent() {
+        assert_eq!(
+            insert_under_heading("", "## Identity", "L5 SDE"),
+            "## Identity\nL5 SDE\n"
+        );
+        assert_eq!(
+            insert_under_heading("## Patterns\nuses Python\n", "## Identity", "L5 SDE"),
+            "## Patterns\nuses Python\n\n## Identity\nL5 SDE\n"
+        );
+    }
+
+    #[test]
+    fn insert_under_heading_appends_to_existing_section() {
+        let out = insert_under_heading("## Identity\nL5 SDE\n", "## Identity", "based in Austin");
+        assert_eq!(out, "## Identity\nL5 SDE\nbased in Austin\n");
+    }
+
+    #[test]
+    fn insert_under_heading_inserts_before_next_sibling() {
+        let content = "## Identity\nL5 SDE\n\n## Focus\nmaps work\n";
+        let out = insert_under_heading(content, "## Identity", "based in Austin");
+        assert_eq!(
+            out,
+            "## Identity\nL5 SDE\nbased in Austin\n\n## Focus\nmaps work\n"
+        );
+    }
+
+    #[test]
+    fn write_curated_stratum_routes_to_heading() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = mem(dir.path());
+        m.write_curated_stratum("L5 SDE on Maps", Stratum::Identity)
+            .unwrap();
+        m.write_curated_stratum("prefers Python", Stratum::Patterns)
+            .unwrap();
+        m.write_curated_stratum("based in Austin", Stratum::Identity)
+            .unwrap();
+        let curated = read_lenient(&m.curated_path());
+        assert_eq!(
+            curated,
+            "## Identity\nL5 SDE on Maps\nbased in Austin\n\n## Patterns\nprefers Python\n"
+        );
     }
 
     #[test]
