@@ -25,7 +25,7 @@ pub use compaction::{
     ContextPressureEstimator, MemoryFlush, ProxyTokenEstimator, DEFAULT_CONTEXT_BUDGET_TOKENS,
     DEFAULT_FLUSH_AT_FRACTION,
 };
-pub use system_prompt::{build_flush_prompt, build_system_prompt, UserContext};
+pub use system_prompt::{build_flush_prompt, build_system_prompt, TimeOfDay, UserContext};
 
 /// Events the agent emits during a turn. The host (Tauri shell or a test) decides
 /// how to surface them — over IPC, to a channel, or into assertions.
@@ -1197,6 +1197,7 @@ mod tests {
         let user = UserContext {
             local_date: "2026-06-13".into(),
             timezone: "America/Chicago".into(),
+            time_of_day: TimeOfDay::Morning,
         };
         let system = build_system_prompt(None, &skills, &[], &user, None);
 
@@ -1230,7 +1231,7 @@ mod tests {
             sys.contains("- rust-debug: Systematic Rust debugging"),
             "{sys}"
         );
-        assert!(sys.contains("Current date: 2026-06-13 (America/Chicago)."));
+        assert!(sys.contains("Current: 2026-06-13, morning (America/Chicago)."));
         assert_eq!(msgs[1].role, "user");
 
         // The system prompt must not be persisted: history is just [user, assistant].
