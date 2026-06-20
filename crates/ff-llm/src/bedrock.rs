@@ -18,7 +18,7 @@ use crate::{ChatMessage, ChatRequest, Chunk, ChunkStream, LlmError, Provider, To
 
 /// Which credential source the provider uses to sign requests. Built by the
 /// desktop host from a `ProviderConnection` plus any keychain secrets.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum BedrockCreds {
     /// A named profile from `~/.aws/{config,credentials}`.
     Profile { name: String },
@@ -30,6 +30,36 @@ pub enum BedrockCreds {
     },
     /// A Bedrock bearer API key.
     ApiKey { token: String },
+}
+
+// Manual Debug that never prints secret material (secret access key, session
+// token, bearer token), guarding against an accidental future `tracing::debug!(?creds)`
+// leaking credentials. The access key id is a non-secret identifier, so it is kept.
+impl std::fmt::Debug for BedrockCreds {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BedrockCreds::Profile { name } => {
+                f.debug_struct("Profile").field("name", name).finish()
+            }
+            BedrockCreds::IamKeys {
+                access_key_id,
+                session_token,
+                ..
+            } => f
+                .debug_struct("IamKeys")
+                .field("access_key_id", access_key_id)
+                .field("secret_access_key", &"<redacted>")
+                .field(
+                    "session_token",
+                    &session_token.as_ref().map(|_| "<redacted>"),
+                )
+                .finish(),
+            BedrockCreds::ApiKey { .. } => f
+                .debug_struct("ApiKey")
+                .field("token", &"<redacted>")
+                .finish(),
+        }
+    }
 }
 
 pub struct BedrockProvider {
@@ -96,6 +126,60 @@ impl BedrockProvider {
             }
         }
     }
+
+    /// Build a Bedrock *control-plane* client, used only by `list_models`
+    /// (ListInferenceProfiles). Mirrors [`Self::client`] per credential mode; the
+    /// control-plane SDK crate has its own config `Builder` type, so the match
+    /// cannot be shared generically with the runtime client.
+    async fn control_client(&self) -> aws_sdk_bedrock::Client {
+        use aws_sdk_bedrock::config::{BehaviorVersion, Credentials, Region, Token};
+
+        let http = aws_smithy_http_client::Builder::new()
+            .tls_provider(aws_smithy_http_client::tls::Provider::Rustls(
+                aws_smithy_http_client::tls::rustls_provider::CryptoMode::Ring,
+            ))
+            .build_https();
+        let region = Region::new(self.region.clone());
+
+        match &self.creds {
+            BedrockCreds::Profile { name } => {
+                let shared = aws_config::defaults(BehaviorVersion::latest())
+                    .region(region)
+                    .profile_name(name)
+                    .http_client(http)
+                    .load()
+                    .await;
+                aws_sdk_bedrock::Client::new(&shared)
+            }
+            BedrockCreds::IamKeys {
+                access_key_id,
+                secret_access_key,
+                session_token,
+            } => {
+                let creds = Credentials::from_keys(
+                    access_key_id.clone(),
+                    secret_access_key.clone(),
+                    session_token.clone(),
+                );
+                let conf = aws_sdk_bedrock::config::Builder::new()
+                    .behavior_version(BehaviorVersion::latest())
+                    .region(region)
+                    .http_client(http)
+                    .credentials_provider(creds)
+                    .build();
+                aws_sdk_bedrock::Client::from_conf(conf)
+            }
+            BedrockCreds::ApiKey { token } => {
+                let conf = aws_sdk_bedrock::config::Builder::new()
+                    .behavior_version(BehaviorVersion::latest())
+                    .region(region)
+                    .http_client(http)
+                    .bearer_token(Token::new(token.clone(), None))
+                    .build();
+                aws_sdk_bedrock::Client::from_conf(conf)
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -135,6 +219,41 @@ impl Provider for BedrockProvider {
         .boxed();
 
         Ok(stream)
+    }
+
+    async fn list_models(&self) -> Result<Vec<String>, LlmError> {
+        let client = self.control_client().await;
+        let out = client
+            .list_inference_profiles()
+            .send()
+            .await
+            .map_err(map_sdk_err)?;
+        Ok(out
+            .inference_profile_summaries()
+            .iter()
+            .filter(|p| *p.status() == aws_sdk_bedrock::types::InferenceProfileStatus::Active)
+            .map(|p| p.inference_profile_id().to_string())
+            .collect())
+    }
+
+    async fn test_connection(&self, model: &str) -> Result<(), LlmError> {
+        // Converse-probe: fire a minimal turn against the configured model and
+        // pull the first event. This exercises the exact send path the app uses,
+        // and the active auth mode, for all three credential modes — a list-based
+        // probe can pass for an ApiKey token that lacks bedrock:ListInferenceProfiles
+        // yet can converse. Auth/construction errors surface from `chat_stream`;
+        // per-stream errors (e.g. access-denied) surface on the first event.
+        let req = ChatRequest {
+            model: model.to_string(),
+            messages: vec![ChatMessage::text("user", "ping")],
+            tools: Vec::new(),
+            thinking: false,
+        };
+        let mut stream = self.chat_stream(req).await?;
+        match stream.next().await {
+            Some(Err(e)) => Err(e),
+            _ => Ok(()),
+        }
     }
 }
 
@@ -349,6 +468,8 @@ where
         SdkError::ServiceError(ctx) => {
             let inner = ctx.err();
             // Throttling and server-side faults are retryable; validation is not.
+            // Fixed code list: a new 5xx-class exception AWS adds later that is not
+            // one of these would fall through to fatal — revisit if that bites.
             let transient = matches!(
                 inner.code(),
                 Some("ThrottlingException")
@@ -572,6 +693,50 @@ mod tests {
         });
         let doc = json_to_doc(&value);
         assert_eq!(doc_to_json(&doc), value);
+    }
+
+    #[test]
+    fn creds_debug_redacts_secrets() {
+        let iam = BedrockCreds::IamKeys {
+            access_key_id: "AKIAEXAMPLE".into(),
+            secret_access_key: "super-secret-key".into(),
+            session_token: Some("super-secret-token".into()),
+        };
+        let s = format!("{iam:?}");
+        assert!(
+            !s.contains("super-secret-key"),
+            "secret access key leaked: {s}"
+        );
+        assert!(
+            !s.contains("super-secret-token"),
+            "session token leaked: {s}"
+        );
+        // The access key id is a non-secret identifier and stays visible.
+        assert!(
+            s.contains("AKIAEXAMPLE"),
+            "access key id should be shown: {s}"
+        );
+
+        let api = BedrockCreds::ApiKey {
+            token: "br-super-secret-bearer".into(),
+        };
+        let s = format!("{api:?}");
+        assert!(
+            !s.contains("br-super-secret-bearer"),
+            "bearer token leaked: {s}"
+        );
+
+        // A None session token must not render the redaction placeholder as present.
+        let iam_none = BedrockCreds::IamKeys {
+            access_key_id: "AKIA2".into(),
+            secret_access_key: "k".into(),
+            session_token: None,
+        };
+        let s = format!("{iam_none:?}");
+        assert!(
+            s.contains("None"),
+            "absent session token should read None: {s}"
+        );
     }
 
     #[test]

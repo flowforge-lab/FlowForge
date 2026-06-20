@@ -160,6 +160,15 @@ pub trait Provider: Send + Sync {
         }
         Ok(())
     }
+
+    /// Probe that the endpoint is reachable and the active credentials work,
+    /// backing the settings "Test Connection" button. The default is a no-op
+    /// `Ok` (local backends need no auth); hosted providers override with a real
+    /// round-trip. `model` is the connection's configured model, for providers
+    /// whose probe needs one (e.g. a Bedrock converse-probe).
+    async fn test_connection(&self, _model: &str) -> Result<(), LlmError> {
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -193,6 +202,15 @@ mod tests {
             });
             Ok(stream.boxed())
         }
+    }
+
+    #[tokio::test]
+    async fn test_connection_default_is_ok() {
+        let provider = EndlessProvider {
+            polled: Arc::new(AtomicUsize::new(0)),
+            first_role: Mutex::new(None),
+        };
+        provider.test_connection("test-model").await.unwrap();
     }
 
     #[tokio::test]
