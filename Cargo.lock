@@ -1842,6 +1842,10 @@ name = "ff-session"
 version = "0.1.0"
 dependencies = [
  "ff-core",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
  "uuid",
 ]
 
