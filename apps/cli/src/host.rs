@@ -6,7 +6,7 @@
 use std::path::PathBuf;
 
 use ff_core::{ProviderConfig, ProviderKind};
-use ff_llm::{OllamaProvider, OpenAiProvider, Provider};
+use ff_llm::{BedrockCreds, BedrockProvider, OllamaProvider, OpenAiProvider, Provider};
 use ff_skills::SkillRegistry;
 
 /// The provider + default model, honoring the same `~/.config/flowforge/provider.json`
@@ -34,9 +34,21 @@ fn build_provider(config: &ProviderConfig) -> Box<dyn Provider> {
     match config.kind {
         ProviderKind::CandleVllm => Box::new(OpenAiProvider::new(base_url, None)),
         ProviderKind::Ollama => Box::new(OllamaProvider::new(base_url)),
-        // The Bedrock provider lands in #202 PR-2; PR-1 ships only the contract.
-        // The CLI cannot select Bedrock until then, so this arm is unreachable.
-        ProviderKind::Bedrock => unimplemented!("Bedrock provider lands in #202 PR-2"),
+        // The CLI has no keychain or connection registry, so Bedrock here uses the
+        // standard AWS credential chain: a bearer token from AWS_BEARER_TOKEN_BEDROCK
+        // when set, otherwise a named profile (AWS_PROFILE, default "default").
+        ProviderKind::Bedrock => {
+            let region = std::env::var("AWS_REGION")
+                .or_else(|_| std::env::var("AWS_DEFAULT_REGION"))
+                .unwrap_or_else(|_| "us-east-1".to_string());
+            let creds = match std::env::var("AWS_BEARER_TOKEN_BEDROCK") {
+                Ok(token) if !token.is_empty() => BedrockCreds::ApiKey { token },
+                _ => BedrockCreds::Profile {
+                    name: std::env::var("AWS_PROFILE").unwrap_or_else(|_| "default".to_string()),
+                },
+            };
+            Box::new(BedrockProvider::new(region, creds))
+        }
     }
 }
 

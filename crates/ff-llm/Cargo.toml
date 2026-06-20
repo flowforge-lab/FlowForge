@@ -14,5 +14,13 @@ futures-util = { workspace = true }
 thiserror = { workspace = true }
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream"] }
 
+# Bedrock provider (#202). default-features=false + an explicit rustls-ring HTTP
+# client keeps us off aws-lc-rs, which needs cmake/nasm on CI runners.
+aws-config = { version = "1", default-features = false, features = ["behavior-version-latest", "rt-tokio"] }
+aws-sdk-bedrockruntime = { version = "1", default-features = false, features = ["behavior-version-latest", "rt-tokio"] }
+aws-smithy-http-client = { version = "1", default-features = false, features = ["rustls-ring"] }
+aws-smithy-types = "1"
+aws-credential-types = { version = "1", features = ["hardcoded-credentials"] }
+
 [dev-dependencies]
 tokio = { workspace = true }
