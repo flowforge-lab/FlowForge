@@ -172,7 +172,10 @@ impl Provider for OpenAiProvider {
             .await
             .map_err(|e| LlmError::Transport(e.to_string()))?
             .error_for_status()
-            .map_err(|e| LlmError::Transport(e.to_string()))?;
+            .map_err(|e| LlmError::Api {
+                status: e.status().map(|s| s.as_u16()).unwrap_or(0),
+                message: e.to_string(),
+            })?;
 
         // SSE frames are newline-delimited; reassemble lines across byte-chunk
         // boundaries, then decode each `data:` line into a Chunk.
@@ -209,7 +212,10 @@ impl Provider for OpenAiProvider {
             .await
             .map_err(|e| LlmError::Transport(e.to_string()))?
             .error_for_status()
-            .map_err(|e| LlmError::Transport(e.to_string()))?;
+            .map_err(|e| LlmError::Api {
+                status: e.status().map(|s| s.as_u16()).unwrap_or(0),
+                message: e.to_string(),
+            })?;
         let list: ModelList = resp
             .json()
             .await
