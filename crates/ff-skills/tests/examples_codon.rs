@@ -36,9 +36,10 @@ fn codon_phenotype_loads_and_declares_codegraph() {
             .is_some_and(|p| !p.trim().is_empty()),
         "codon must carry a non-empty persona"
     );
-    assert!(
-        codon.max_iterations.is_some(),
-        "codon raises the iteration cap for long verify loops"
+    assert_eq!(
+        codon.max_iterations,
+        Some(50),
+        "codon raises the iteration cap to 50 for long verify loops"
     );
 }
 
