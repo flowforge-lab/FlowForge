@@ -31,22 +31,28 @@ codegraph init
 ```
 
 `codegraph install` auto-configures known agents (Claude Code, Cursor, …) but not
-FlowForge — wire it up manually in step 2.
+FlowForge — FlowForge wires the MCP server for you (step 2).
 
-### 2. Add the codegraph MCP server to `~/.flowforge/mcp.json`
+### 2. Enable the seeded codegraph MCP server
+
+On first run FlowForge seeds a **disabled** `codegraph` entry into
+`~/.flowforge/mcp.json`:
 
 ```json
 {
   "mcpServers": {
     "codegraph": {
       "command": "codegraph",
-      "args": ["serve", "--mcp"]
+      "args": ["serve", "--mcp"],
+      "disabled": true
     }
   }
 }
 ```
 
-The server id `codegraph` must match the `mcp` entry in the skill's frontmatter.
+It ships disabled because the binary (step 1) may not be installed yet. Once it is,
+**enable it in Settings → MCP** (or flip `"disabled": false`). The seed never
+overwrites a `codegraph` entry you wrote yourself.
 
 ### 3. Select it
 
@@ -74,9 +80,10 @@ permanent removal is part of the Phase 2 follow-up below.
 
 - `model` is intentionally unset in `codon.toml`; pin a capable model once your
   provider connection is configured.
-- FlowForge currently *requires* the codegraph server to be present (require +
-  warn); it does not inject it into `mcp.json` on activation. Auto-injection
-  ("zero-step DNA") is a tracked follow-up.
+- FlowForge seeds the codegraph `mcp.json` entry **disabled** on first run, then
+  *requires* the server at activation (require + warn). Injecting a full server
+  definition from any skill's DNA on activation (the general "zero-step DNA" case,
+  beyond Codon's seeded entry) is tracked in #306.
 - **Bundling.** Phase 1 (seeded on first run, write-if-absent) ships today. Phase 2
   — compiling Codon in as a true built-in that survives deletion or a read-only
   home, like the `default` phenotype — is tracked in
