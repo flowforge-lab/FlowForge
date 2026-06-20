@@ -20,6 +20,8 @@ function MessageRowImpl({
   turnStartMs,
   reasoning,
   respondApproval,
+  approveSession,
+  approveAlways,
   respondAsk,
 }: {
   message: Message;
@@ -33,6 +35,18 @@ function MessageRowImpl({
     callId: string,
     approved: boolean,
   ) => Promise<void>;
+  approveSession: (
+    sessionId: string,
+    messageId: string,
+    callId: string,
+    tool: string,
+  ) => Promise<void>;
+  approveAlways: (
+    sessionId: string,
+    messageId: string,
+    callId: string,
+    tool: string,
+  ) => Promise<void>;
   respondAsk: (
     sessionId: string,
     messageId: string,
@@ -42,6 +56,10 @@ function MessageRowImpl({
 }) {
   const onRespond = (callId: string, approved: boolean) =>
     void respondApproval(message.sessionId, message.id, callId, approved);
+  const onApproveSession = (callId: string, tool: string) =>
+    void approveSession(message.sessionId, message.id, callId, tool);
+  const onApproveAlways = (callId: string, tool: string) =>
+    void approveAlways(message.sessionId, message.id, callId, tool);
   const onAnswer = (callId: string, answer: string) =>
     void respondAsk(message.sessionId, message.id, callId, answer);
   if (message.role === "user") {
@@ -82,6 +100,8 @@ function MessageRowImpl({
             <ToolStepBlock
               step={toolSteps[0]}
               onRespond={onRespond}
+              onApproveSession={onApproveSession}
+              onApproveAlways={onApproveAlways}
               onAnswer={onAnswer}
             />
           ) : (
@@ -92,6 +112,8 @@ function MessageRowImpl({
               reasoning={reasoning}
               hasAnswer={message.content.length > 0}
               onRespond={onRespond}
+              onApproveSession={onApproveSession}
+              onApproveAlways={onApproveAlways}
               onAnswer={onAnswer}
             />
           )}
@@ -157,6 +179,8 @@ export function ChatView({ sessionId }: { sessionId?: string } = {}) {
   const turnStartBySession = useChatStore((s) => s.turnStartBySession);
   const reasoningByMessage = useChatStore((s) => s.reasoningByMessage);
   const respondApproval = useChatStore((s) => s.respondApproval);
+  const approveSession = useChatStore((s) => s.approveSession);
+  const approveAlways = useChatStore((s) => s.approveAlways);
   const respondAsk = useChatStore((s) => s.respondAsk);
 
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -239,6 +263,8 @@ export function ChatView({ sessionId }: { sessionId?: string } = {}) {
               }
               reasoning={reasoningByMessage[m.id] ?? ""}
               respondApproval={respondApproval}
+              approveSession={approveSession}
+              approveAlways={approveAlways}
               respondAsk={respondAsk}
             />
           ))}

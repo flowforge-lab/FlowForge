@@ -79,6 +79,23 @@ export interface FfIpc {
    *  paused turn with the user's reply. Keyed by `(sessionId, callId)`. */
   respondAsk(sessionId: string, callId: string, answer: string): Promise<void>;
 
+  // Four-option tool approval (#229). "Allow once"/"Deny" stay on `respondApproval`;
+  // these add the two persistent tiers. The backend owns both approval sets and
+  // short-circuits the gate before emitting an event (no UI flicker), so these
+  // only ever *write* the set — pair each with `respondApproval(callId, true)` to
+  // also release the in-flight call. `bindings/` is untouched: plain string
+  // commands, no shared DTO.
+  /** Approve `tool` for the rest of `sessionId` (in-memory; cleared on session
+   *  delete). Future calls of the same tool skip the prompt. */
+  setSessionApprove(sessionId: string, tool: string): Promise<void>;
+  /** Approve `tool` for all future sessions (persisted to `tool_permissions.json`).
+   *  Revocable via `removeAlwaysApprove`. */
+  setAlwaysApprove(tool: string): Promise<void>;
+  /** Drop `tool` from the always-approved set (Settings → revoke). Idempotent. */
+  removeAlwaysApprove(tool: string): Promise<void>;
+  /** The always-approved tool names, sorted. Backs the Settings revocation list. */
+  listAlwaysApproved(): Promise<string[]>;
+
   // Provider settings (Issue #8). Phase 1: local candle-vllm + Ollama, no secrets.
   /** Current persisted LLM provider settings. */
   getProviderConfig(): Promise<ProviderConfig>;
@@ -316,6 +333,13 @@ class TauriIpc implements FfIpc {
     this.invoke<void>("respond_approval", { sessionId, callId, approved });
   respondAsk = (sessionId: string, callId: string, answer: string) =>
     this.invoke<void>("respond_ask", { sessionId, callId, answer });
+  setSessionApprove = (sessionId: string, tool: string) =>
+    this.invoke<void>("set_session_approve", { sessionId, tool });
+  setAlwaysApprove = (tool: string) =>
+    this.invoke<void>("set_always_approve", { tool });
+  removeAlwaysApprove = (tool: string) =>
+    this.invoke<void>("remove_always_approve", { tool });
+  listAlwaysApproved = () => this.invoke<string[]>("list_always_approved");
 
   getProviderConfig = () => this.invoke<ProviderConfig>("get_provider_config");
   setProviderConfig = (

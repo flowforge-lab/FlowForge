@@ -11,6 +11,7 @@ import type {
   ProviderRegistry,
   ProviderKind,
   SearchConfig,
+  ApprovalSafety,
   SearchBackend,
   Session,
   SessionWorkspace,
@@ -380,6 +381,13 @@ export class MockIpc implements FfIpc {
    *  approval request; the matching `respondApproval` resolves it. Keyed by both
    *  so colliding call ids across sessions stay isolated (mirrors the backend). */
   private pendingApprovals = new Map<string, (approved: boolean) => void>();
+  // Four-option approval (#229). Real in-memory sets so the mock reproduces the
+  // backend's short-circuit: a tool approved "this session" / "always" skips the
+  // approval-request entirely on the next call. `sessionApproved` is cleared on
+  // session delete (mirrors `clear_session_approvals`); `alwaysApproved` persists
+  // for the mock's lifetime (mirrors `tool_permissions.json`).
+  private sessionApproved = new Map<string, Set<string>>();
+  private alwaysApproved = new Set<string>();
   private askRequestListeners = new Set<Listener<ToolAskRequestEvent>>();
   /** `(sessionId, callId)` -> resume callback for an `ask_user` (#44). The matching
    *  `respondAsk` resolves it; cancel deletes it (mirrors backend cancel-via-drop). */
@@ -478,6 +486,9 @@ export class MockIpc implements FfIpc {
   async deleteSession(sessionId: string): Promise<void> {
     this.sessions.delete(sessionId);
     this.messages.delete(sessionId);
+    // Session-scoped approvals expire with the session (backend clears them in
+    // `clear_session_approvals` on delete).
+    this.sessionApproved.delete(sessionId);
   }
 
   async getMessages(sessionId: string): Promise<Message[]> {
@@ -614,6 +625,27 @@ export class MockIpc implements FfIpc {
     if (!resume) return;
     this.pendingAsks.delete(key);
     resume(answer);
+  }
+
+  async setSessionApprove(sessionId: string, tool: string): Promise<void> {
+    let set = this.sessionApproved.get(sessionId);
+    if (!set) {
+      set = new Set<string>();
+      this.sessionApproved.set(sessionId, set);
+    }
+    set.add(tool);
+  }
+
+  async setAlwaysApprove(tool: string): Promise<void> {
+    this.alwaysApproved.add(tool);
+  }
+
+  async removeAlwaysApprove(tool: string): Promise<void> {
+    this.alwaysApproved.delete(tool);
+  }
+
+  async listAlwaysApproved(): Promise<string[]> {
+    return [...this.alwaysApproved].sort();
   }
 
   private activeConnection(): ProviderConnection {
@@ -1139,6 +1171,11 @@ export class MockIpc implements FfIpc {
     turn: ActiveTurn,
   ): void {
     const callId = uidShort();
+    // The demo write step's trust level; gates the short-circuit below exactly
+    // as the backend's `allowlist_covers` does (Dangerous is never covered). The
+    // `as` keeps the union type so the dangerous guard isn't narrowed away to a
+    // tautology — the demo emits "write", but the check models the full contract.
+    const safety = "write" as ApprovalSafety;
     turn.pendingToolCalls.push(callId);
     this.emit(this.toolCallListeners, {
       sessionId,
@@ -1147,13 +1184,36 @@ export class MockIpc implements FfIpc {
       tool: "edit",
       args: { path: "README.md", old_str: "FlowForge", new_str: "FlowForge!" },
     });
+    // Backend-owned short-circuit (#229): a tool the user marked "always" or
+    // "this session" is approved before any event is emitted — no prompt, no
+    // flicker. Mirrors `allowlist_covers`: Dangerous calls are never covered, so
+    // they fall through to the prompt even with a grant. Resolve straight to the
+    // result otherwise.
+    if (
+      safety !== "dangerous" &&
+      (this.alwaysApproved.has("edit") ||
+        this.sessionApproved.get(sessionId)?.has("edit"))
+    ) {
+      turn.pendingToolCalls = turn.pendingToolCalls.filter(
+        (id) => id !== callId,
+      );
+      this.emit(this.toolResultListeners, {
+        sessionId,
+        messageId,
+        callId,
+        success: true,
+        result: "(mocked) edited README.md",
+      });
+      this.streamWords(sessionId, turn);
+      return;
+    }
     this.emit(this.approvalRequestListeners, {
       sessionId,
       messageId,
       callId,
       tool: "edit",
       args: { path: "README.md", old_str: "FlowForge", new_str: "FlowForge!" },
-      safety: "write",
+      safety,
     });
     this.pendingApprovals.set(approvalKey(sessionId, callId), (approved) => {
       turn.pendingToolCalls = turn.pendingToolCalls.filter(

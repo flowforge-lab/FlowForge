@@ -11,6 +11,7 @@ import {
   type ControlOverrides,
 } from "@/lib/control";
 import { useControlConfigStore } from "@/store/control-config";
+import { AlwaysApprovedTools } from "@/components/settings/control/always-approved-tools";
 
 function CellMarkIcon({ mark }: { mark: CellMark }) {
   if (mark === "check") {
@@ -260,6 +261,8 @@ export function PermissionsTab() {
           ))}
         </div>
       </section>
+
+      <AlwaysApprovedTools />
     </div>
   );
 }
