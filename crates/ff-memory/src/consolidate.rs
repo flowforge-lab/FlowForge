@@ -18,7 +18,11 @@ use sha2::{Digest, Sha256};
 
 use chrono::{Local, NaiveDate};
 
-use crate::{MemoryChunk, MemorySource, Result, WriteTarget};
+use crate::{read_lenient, MemoryChunk, MemorySource, Result, Stratum, WriteTarget};
+
+/// Canonical strata, emitted in this fixed who/how/what order during the
+/// consolidate rewrite (RFC 0008 §4, issue #254).
+const CANONICAL_STRATA: [Stratum; 3] = [Stratum::Identity, Stratum::Patterns, Stratum::Focus];
 
 /// Stable chunk identity: `source + heading-path + hash(normalized text)`.
 ///
@@ -155,18 +159,151 @@ pub struct ConsolidationReport {
     pub bytes_after: usize,
 }
 
-/// Rebuild curated Markdown from the kept chunks. Each chunk's `text` already
-/// includes its heading line, so the trimmed bodies join with a blank line.
-/// Re-chunking this output is stable, which the idempotent re-run relies on.
+/// Map a chunk's (stripped) heading to a canonical [`Stratum`], if it is one.
+/// `chunk.heading` holds the heading text without leading `#`s (e.g. `Identity`),
+/// so we compare against each stratum's `## Heading` line.
+fn stratum_for_heading(heading: &str) -> Option<Stratum> {
+    let line = format!("## {}", heading.trim());
+    CANONICAL_STRATA.into_iter().find(|s| s.heading() == line)
+}
+
+/// The body of a chunk with its leading heading line removed. `chunk_markdown`
+/// prepends the raw heading line to a section's `text`, so when the first line
+/// is that heading we drop it; otherwise (a preamble chunk, or a non-first
+/// window of a large split section) the whole trimmed text is the body.
+fn body_without_heading(chunk: &MemoryChunk) -> &str {
+    let text = chunk.text.trim();
+    let Some(h) = chunk.heading.as_deref() else {
+        return text;
+    };
+    let mut parts = text.splitn(2, '\n');
+    let first = parts.next().unwrap_or("");
+    if first.trim_start().starts_with('#')
+        && first.trim_start().trim_start_matches('#').trim() == h.trim()
+    {
+        parts.next().unwrap_or("").trim()
+    } else {
+        text
+    }
+}
+
+/// Rebuild curated Markdown from the kept chunks, **grouping** them under the
+/// canonical strata headings (RFC 0008 §4, issue #254): a preamble (heading-less
+/// chunks) first, then `## Identity` / `## Patterns` / `## Focus` in that fixed
+/// order, then any freeform headings in first-seen order. Chunks that share a
+/// heading collapse into a single section (no duplicate `## Identity`), and
+/// freeform headings are preserved rather than dropped.
+///
+/// This is a **fixpoint**: re-chunking the output yields one chunk per heading,
+/// and re-grouping is the identity — which is what keeps the consolidate re-run
+/// idempotent and `chunk_key` stable.
 fn render_curated(chunks: &[MemoryChunk]) -> String {
-    let mut out = chunks
-        .iter()
-        .map(|c| c.text.trim())
-        .filter(|t| !t.is_empty())
-        .collect::<Vec<_>>()
-        .join("\n\n");
+    let mut preamble: Vec<&str> = Vec::new();
+    // Canonical strata: heading line -> joined bodies.
+    let mut canonical: HashMap<&'static str, Vec<&str>> = HashMap::new();
+    // Freeform headings: first-seen order + (original heading line, bodies).
+    let mut freeform_order: Vec<String> = Vec::new();
+    let mut freeform: HashMap<String, (String, Vec<&str>)> = HashMap::new();
+
+    for c in chunks {
+        let body = body_without_heading(c);
+        match c.heading.as_deref() {
+            None => {
+                if !body.is_empty() {
+                    preamble.push(body);
+                }
+            }
+            Some(h) => {
+                if let Some(strat) = stratum_for_heading(h) {
+                    canonical.entry(strat.heading()).or_default().push(body);
+                } else {
+                    let original = c.text.trim().lines().next().unwrap_or("").trim();
+                    let entry = freeform.entry(h.to_string()).or_insert_with(|| {
+                        freeform_order.push(h.to_string());
+                        (original.to_string(), Vec::new())
+                    });
+                    entry.1.push(body);
+                }
+            }
+        }
+    }
+
+    let join_section = |heading: Option<&str>, bodies: &[&str]| -> String {
+        let body = bodies
+            .iter()
+            .filter(|b| !b.is_empty())
+            .copied()
+            .collect::<Vec<_>>()
+            .join("\n");
+        match (heading, body.is_empty()) {
+            (None, _) => body,
+            (Some(h), true) => h.to_string(),
+            (Some(h), false) => format!("{h}\n{body}"),
+        }
+    };
+
+    let mut sections: Vec<String> = Vec::new();
+    let pre = preamble.join("\n\n");
+    if !pre.is_empty() {
+        sections.push(pre);
+    }
+    for strat in CANONICAL_STRATA {
+        if let Some(bodies) = canonical.get(strat.heading()) {
+            sections.push(join_section(Some(strat.heading()), bodies));
+        }
+    }
+    for key in &freeform_order {
+        let (hline, bodies) = &freeform[key];
+        sections.push(join_section(Some(hline), bodies));
+    }
+
+    let mut out = sections.join("\n\n");
     if !out.is_empty() {
         out.push('\n');
+    }
+    out
+}
+
+/// Re-join the overlapping line-windows that [`chunk_markdown`] emits for a
+/// section larger than `CHUNK_TARGET_BYTES` back into one whole-section chunk.
+///
+/// Windowing is an index/embedding concern (focused vectors); the rewrite path
+/// must see each section's *whole* body. Otherwise [`render_curated`] re-joins
+/// the windows' bodies and re-emits their ~15% overlap as duplicated lines, and
+/// re-chunking the larger output never reaches a fixpoint (#254).
+///
+/// Windows of one section arrive consecutively, share `(source, path, heading)`,
+/// and have overlapping or adjacent line spans -- exactly the run folded here.
+/// Distinct same-heading sections are separated by other chunks, so they stay
+/// apart (and `render_curated` collapses them by heading, as intended).
+fn coalesce_windows(chunks: Vec<MemoryChunk>) -> Vec<MemoryChunk> {
+    let mut out: Vec<MemoryChunk> = Vec::with_capacity(chunks.len());
+    for c in chunks {
+        if let Some(last) = out.last_mut() {
+            // A true window genuinely *overlaps* the previous chunk's line span
+            // (chunk_markdown carries ~15% of bytes into the next window). Two
+            // distinct same-heading sections are only adjacent (blank line
+            // between them), never overlapping -- so require strict overlap to
+            // avoid folding separate sections that `render_curated` should keep
+            // apart and collapse by heading.
+            let is_window_of_last = last.source == c.source
+                && last.path == c.path
+                && last.heading == c.heading
+                && c.line_start <= last.line_end;
+            if is_window_of_last {
+                // Drop the leading lines of `c` already covered by `last`, then
+                // append only the new tail so the overlapping lines appear once.
+                let skip = (last.line_end + 1).saturating_sub(c.line_start) as usize;
+                let tail: Vec<&str> = c.text.lines().skip(skip).collect();
+                if !tail.is_empty() {
+                    last.text.push('\n');
+                    last.text.push_str(&tail.join("\n"));
+                }
+                last.line_end = last.line_end.max(c.line_end);
+                continue;
+            }
+        }
+        out.push(c);
     }
     out
 }
@@ -202,10 +339,11 @@ impl crate::Memory {
             return Ok(report);
         }
 
-        // Gather and split curated vs daily.
+        // Gather and split curated vs daily. Coalesce windowed sections back to
+        // whole bodies first so the rewrite path never re-emits window overlap.
         let mut curated: Vec<MemoryChunk> = Vec::new();
         let mut daily: Vec<MemoryChunk> = Vec::new();
-        for c in self.all_chunks() {
+        for c in coalesce_windows(self.all_chunks()) {
             match c.source {
                 MemorySource::Curated => curated.push(c),
                 MemorySource::Daily { .. } => daily.push(c),
@@ -284,9 +422,16 @@ impl crate::Memory {
             }
         }
 
-        report.ran = report.merged > 0 || report.promoted > 0 || report.demoted > 0;
+        // Group the kept chunks under the canonical strata headings (#254). A
+        // pure regroup (no merge/promote/demote) still rewrites when it changes
+        // the file, so a scattered curated file self-heals into who/how/what
+        // shape. Grouping is a fixpoint, so the next run finds nothing to do.
+        let rendered = render_curated(&curated);
+        let regrouped = rendered != read_lenient(&self.curated_path());
+
+        report.ran = report.merged > 0 || report.promoted > 0 || report.demoted > 0 || regrouped;
         if report.ran {
-            self.rewrite_curated(&render_curated(&curated))?;
+            self.rewrite_curated(&rendered)?;
             report.bytes_after = std::fs::metadata(self.curated_path())
                 .map(|m| m.len())
                 .unwrap_or(0) as usize;
@@ -528,6 +673,106 @@ mod tests {
         );
     }
 
+    // --- #254: strata grouping in render_curated -------------------------
+
+    fn curated_chunk(heading: Option<&str>, text: &str) -> MemoryChunk {
+        make_chunk(MemorySource::Curated, heading, text)
+    }
+
+    #[test]
+    fn render_curated_groups_canonical_strata_in_fixed_order() {
+        // Deliberately out of order: Focus before Identity.
+        let chunks = vec![
+            curated_chunk(Some("Focus"), "## Focus\nmaps work"),
+            curated_chunk(Some("Identity"), "## Identity\nL5 SDE"),
+            curated_chunk(Some("Patterns"), "## Patterns\nprefers Python"),
+        ];
+        assert_eq!(
+            render_curated(&chunks),
+            "## Identity\nL5 SDE\n\n## Patterns\nprefers Python\n\n## Focus\nmaps work\n"
+        );
+    }
+
+    #[test]
+    fn render_curated_collapses_duplicate_heading_sections() {
+        let chunks = vec![
+            curated_chunk(Some("Identity"), "## Identity\nL5 SDE"),
+            curated_chunk(Some("Identity"), "## Identity\nbased in Austin"),
+        ];
+        let out = render_curated(&chunks);
+        assert_eq!(out, "## Identity\nL5 SDE\nbased in Austin\n");
+        assert_eq!(
+            out.matches("## Identity").count(),
+            1,
+            "no duplicate heading"
+        );
+    }
+
+    #[test]
+    fn render_curated_preserves_freeform_headings_after_canonical() {
+        let chunks = vec![
+            curated_chunk(Some("Projects"), "## Projects\nflowforge"),
+            curated_chunk(Some("Identity"), "## Identity\nL5 SDE"),
+        ];
+        assert_eq!(
+            render_curated(&chunks),
+            "## Identity\nL5 SDE\n\n## Projects\nflowforge\n"
+        );
+    }
+
+    #[test]
+    fn render_curated_keeps_preamble_first() {
+        let chunks = vec![
+            curated_chunk(None, "intro line"),
+            curated_chunk(Some("Identity"), "## Identity\nL5 SDE"),
+        ];
+        assert_eq!(
+            render_curated(&chunks),
+            "intro line\n\n## Identity\nL5 SDE\n"
+        );
+    }
+
+    #[test]
+    fn render_curated_is_a_fixpoint() {
+        let chunks = vec![
+            curated_chunk(Some("Focus"), "## Focus\nmaps work"),
+            curated_chunk(Some("Identity"), "## Identity\nL5 SDE"),
+            curated_chunk(Some("Identity"), "## Identity\nbased in Austin"),
+        ];
+        let once = render_curated(&chunks);
+        let rechunked = crate::chunk_markdown(
+            &once,
+            MemorySource::Curated,
+            std::path::Path::new("MEMORY.md"),
+        );
+        assert_eq!(render_curated(&rechunked), once, "regroup must be stable");
+    }
+
+    #[test]
+    fn consolidate_groups_scattered_strata_into_canonical_shape() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = mem_with(dir.path(), 4096, false);
+        m.rewrite_curated(
+            "## Focus\nmaps work\n\n## Identity\nL5 SDE\n\n## Identity\nbased in Austin\n",
+        )
+        .unwrap();
+
+        let report = m.consolidate(&RecencyFrequencySalience::default()).unwrap();
+        assert!(report.ran, "a scattered curated file should regroup");
+
+        let curated = std::fs::read_to_string(m.curated_path()).unwrap();
+        assert_eq!(
+            curated,
+            "## Identity\nL5 SDE\nbased in Austin\n\n## Focus\nmaps work\n"
+        );
+        assert_eq!(curated.matches("## Identity").count(), 1);
+
+        // Second run: already grouped -> no-op.
+        let second = m.consolidate(&RecencyFrequencySalience::default()).unwrap();
+        assert!(!second.ran, "re-run on grouped file must be a no-op");
+        assert_eq!(std::fs::read_to_string(m.curated_path()).unwrap(), curated);
+    }
+
     #[test]
     fn consolidate_disabled_is_noop() {
         let dir = tempfile::tempdir().unwrap();
@@ -544,5 +789,59 @@ mod tests {
 
         assert!(!report.ran);
         assert_eq!(std::fs::read_to_string(m.curated_path()).unwrap(), before);
+    }
+
+    #[test]
+    fn consolidate_coalesces_windowed_section_without_duplication() {
+        // A single canonical section larger than CHUNK_TARGET_BYTES is windowed
+        // by chunk_markdown into overlapping chunks. Consolidation must rebuild
+        // the whole section once -- not re-emit the ~15% overlap -- and reach a
+        // fixpoint even though the section stays under the injection budget.
+        let dir = tempfile::tempdir().unwrap();
+        let m = mem_with(dir.path(), 8192, false);
+
+        let mut body = String::from("## Patterns\n");
+        for i in 0..120 {
+            body.push_str(&format!(
+                "- fact number {i:03} with enough descriptive text to grow the section\n"
+            ));
+        }
+        assert!(
+            body.len() > 2048 && body.len() < 8192,
+            "section must be windowed (>2KB) yet under budget, got {}",
+            body.len()
+        );
+        m.rewrite_curated(&body).unwrap();
+
+        // Already canonical and whole: the windowed read must not be mistaken
+        // for a regroup, and nothing may be duplicated.
+        let report = m.consolidate(&RecencyFrequencySalience::default()).unwrap();
+        assert!(
+            !report.ran,
+            "a whole, already-grouped section must be a no-op even when windowed"
+        );
+
+        let curated = std::fs::read_to_string(m.curated_path()).unwrap();
+        assert_eq!(
+            curated, body,
+            "file must be byte-identical (no overlap re-emitted)"
+        );
+        let max_dup = {
+            let mut counts: std::collections::HashMap<&str, usize> =
+                std::collections::HashMap::new();
+            for line in curated.lines().filter(|l| l.starts_with("- fact")) {
+                *counts.entry(line).or_default() += 1;
+            }
+            counts.values().copied().max().unwrap_or(0)
+        };
+        assert_eq!(max_dup, 1, "no fact line may appear more than once");
+
+        // Re-run is a fixpoint.
+        let second = m.consolidate(&RecencyFrequencySalience::default()).unwrap();
+        assert!(
+            !second.ran,
+            "re-run on the windowed section must stay a no-op"
+        );
+        assert_eq!(std::fs::read_to_string(m.curated_path()).unwrap(), curated);
     }
 }
