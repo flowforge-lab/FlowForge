@@ -37,6 +37,12 @@ export const SHORTCUTS: Shortcut[] = [
 
   { group: "Session", keys: ["Mod", "N"], label: "New session" },
   { group: "Session", keys: ["Mod", "1–9"], label: "Jump to session" },
+  // Global, session-scoped (like New session / Jump) — not a textarea binding.
+  {
+    group: "Session",
+    keys: ["Mod", "."],
+    label: "Cycle agent mode (Plan / Act / Auto)",
+  },
 ];
 
 /**

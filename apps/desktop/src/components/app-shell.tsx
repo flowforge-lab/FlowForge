@@ -14,6 +14,7 @@ import { useSplitStore } from "@/store/split";
 import { usePaletteStore } from "@/store/palette";
 import { useSettingsStore } from "@/store/settings";
 import { useShortcutsStore } from "@/store/shortcuts";
+import { useSessionModeStore } from "@/store/session-mode";
 
 // True when focus is in a text-entry element, so a bare "?" types instead of
 // opening the shortcuts overlay.
@@ -94,6 +95,18 @@ function useGlobalShortcuts() {
           if (id && focused)
             usePanesStore.getState().setPaneSession(focused, id);
         });
+        return;
+      }
+      // Cycle the focused pane's agent mode (#266): Plan → Act → Auto. The active
+      // session mirrors the focused pane, so cycling it targets where the user is.
+      if (mod && e.key === ".") {
+        const sid = store.activeSessionId;
+        if (sid) {
+          e.preventDefault();
+          useSessionModeStore
+            .getState()
+            .cycleMode(sid, usePrefsStore.getState().defaultMode);
+        }
         return;
       }
       if (mod && e.key >= "1" && e.key <= "9") {
