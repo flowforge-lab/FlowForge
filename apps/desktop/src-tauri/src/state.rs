@@ -300,7 +300,7 @@ fn tool_permissions_path() -> Option<PathBuf> {
 
 /// `~/.config/flowforge/phenotype.json` — the name of the active phenotype, persisted
 /// so a switch survives a restart (RFC 0001 §7). Separate from the phenotype
-/// *definitions* in `~/.flowforge/phenotypes/`; this only records which one is active.
+/// *definitions* in `~/.flowforge/phenos/`; this only records which one is active.
 fn active_phenotype_path() -> Option<PathBuf> {
     dirs::config_dir().map(|d| d.join("flowforge").join("phenotype.json"))
 }
@@ -371,16 +371,16 @@ fn save_default_mode(mode: Mode) {
     }
 }
 
-/// `~/.flowforge/phenotypes`, where phenotype definition TOML files live.
+/// `~/.flowforge/phenos`, where phenotype definition TOML files live.
 fn phenotypes_root() -> PathBuf {
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".flowforge")
-        .join("phenotypes")
+        .join("phenos")
 }
 
 /// Resolve a phenotype by name: the built-in `default`, otherwise a definition from
-/// `~/.flowforge/phenotypes/`. Returns `None` for an unknown name.
+/// `~/.flowforge/phenos/`. Returns `None` for an unknown name.
 fn resolve_phenotype(name: &str) -> Option<Phenotype> {
     if name == DEFAULT_PHENOTYPE {
         return Some(default_phenotype());
@@ -995,7 +995,7 @@ impl AppState {
     }
 
     /// All selectable phenotypes: the built-in `default` plus every definition in
-    /// `~/.flowforge/phenotypes/`, name-sorted. Re-scanned per call (few files).
+    /// `~/.flowforge/phenos/`, name-sorted. Re-scanned per call (few files).
     pub fn list_phenotypes(&self) -> Vec<Phenotype> {
         let (map, errors) = load_phenotypes(&phenotypes_root());
         for e in &errors {
