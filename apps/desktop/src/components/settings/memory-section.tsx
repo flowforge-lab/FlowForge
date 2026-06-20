@@ -1,5 +1,5 @@
-import { useEffect, useMemo } from "react";
-import { Search } from "lucide-react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { Search, Sparkles, X } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Input } from "@/components/ui/input";
 import { useSettingsStore } from "@/store/settings";
@@ -101,11 +101,30 @@ export function MemorySection() {
   const load = useMemoryStore((s) => s.load);
   const setQuery = useMemoryStore((s) => s.setQuery);
   const resetSearch = useMemoryStore((s) => s.resetSearch);
+  const flushCount = useMemoryStore((s) => s.flushCount);
+  const lastFlushWrites = useMemoryStore((s) => s.lastFlushWrites);
   const registerResetHandler = useSettingsStore((s) => s.registerResetHandler);
+
+  // Dismiss the provenance banner until the next flush bumps the count.
+  const [dismissedFlush, setDismissedFlush] = useState(0);
+  const showFlushBanner = flushCount > 0 && flushCount !== dismissedFlush;
 
   useEffect(() => {
     void load();
   }, [load]);
+
+  // Re-pull files when a flush curates memory mid-session (#283) so freshly
+  // written content shows without reopening the pane. Skip the initial render so
+  // this doesn't race the mount load above when `flushCount` is already > 0 (the
+  // pane opened after an earlier flush) — only *subsequent* flushes reload.
+  const didMountFlushWatch = useRef(false);
+  useEffect(() => {
+    if (!didMountFlushWatch.current) {
+      didMountFlushWatch.current = true;
+      return;
+    }
+    if (flushCount > 0) void load();
+  }, [flushCount, load]);
 
   useEffect(() => {
     registerResetHandler(() => resetSearch());
@@ -137,6 +156,28 @@ export function MemorySection() {
         ) : null}
         . Captured automatically; edit the files directly to change it.
       </p>
+
+      {showFlushBanner ? (
+        <div
+          role="status"
+          className="flex items-center gap-2 rounded-md border border-emerald-500/30 bg-emerald-500/10 px-2.5 py-1.5 text-[12px] text-emerald-700 dark:text-emerald-300"
+        >
+          <Sparkles className="size-3.5 shrink-0" />
+          <span className="min-w-0 flex-1">
+            Memory was auto-curated this session — {lastFlushWrites} new{" "}
+            {lastFlushWrites === 1 ? "entry" : "entries"} from the latest flush.
+          </span>
+          <button
+            type="button"
+            aria-label="Dismiss"
+            title="Dismiss"
+            onClick={() => setDismissedFlush(flushCount)}
+            className="shrink-0 rounded p-0.5 text-emerald-700/70 transition-colors hover:bg-emerald-500/15 hover:text-emerald-700 dark:text-emerald-300/70 dark:hover:text-emerald-200"
+          >
+            <X className="size-3.5" />
+          </button>
+        </div>
+      ) : null}
 
       {error ? (
         <p className="text-[12px] text-destructive" role="alert">

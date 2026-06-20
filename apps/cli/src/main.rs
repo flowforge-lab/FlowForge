@@ -573,6 +573,12 @@ fn render_event_text(event: AgentEvent) {
                 eprintln!("{snippet}");
             }
         }
+        AgentEvent::MemoryFlushed { writes, .. } => {
+            eprintln!(
+                "\n[memory] auto-curated {writes} durable fact{}",
+                if writes == 1 { "" } else { "s" }
+            );
+        }
         AgentEvent::Done { .. } => {}
         AgentEvent::Reasoning { .. } => {}
         AgentEvent::Error { message } => {
@@ -648,6 +654,10 @@ mod tests {
                 final_message: Some("Hello world!".into()),
                 turns: Some(2),
                 token_count: None,
+            },
+            AgentEvent::MemoryFlushed {
+                message_id: "m1".into(),
+                writes: 3,
             },
         ];
 

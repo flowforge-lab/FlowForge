@@ -18,6 +18,8 @@ function reset() {
     query: "",
     loading: false,
     error: null,
+    flushCount: 0,
+    lastFlushWrites: 0,
   });
 }
 
@@ -72,6 +74,18 @@ describe("memory store (SET.8, #131)", () => {
       s.files.filter((f) => f.kind === "daily").length,
     );
     expect(journal.every((e) => e.date !== "")).toBe(true);
+  });
+
+  it("noteFlush records flush provenance (#283)", () => {
+    expect(useMemoryStore.getState().flushCount).toBe(0);
+
+    useMemoryStore.getState().noteFlush(2);
+    expect(useMemoryStore.getState().flushCount).toBe(1);
+    expect(useMemoryStore.getState().lastFlushWrites).toBe(2);
+
+    useMemoryStore.getState().noteFlush(1);
+    expect(useMemoryStore.getState().flushCount).toBe(2);
+    expect(useMemoryStore.getState().lastFlushWrites).toBe(1);
   });
 
   it("surfaces a load error from the IPC layer", async () => {

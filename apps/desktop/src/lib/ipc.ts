@@ -38,6 +38,7 @@ import type {
   McpStatusChangedEvent,
   MemoryFileInfo,
   MemoryOverview,
+  MemoryFlushedEvent,
 } from "../bindings";
 
 export type Unlisten = () => void;
@@ -271,6 +272,10 @@ export interface FfIpc {
    *  an enable/disable/add/remove reload). Carries the full snapshot; re-fetch
    *  definitions via `listMcpServers`. */
   onMcpStatusChanged(cb: (e: McpStatusChangedEvent) => void): Promise<Unlisten>;
+  /** A silent context-pressure memory flush wrote durable facts to on-disk memory
+   *  mid-turn (#283). Fires only when something was written, so the memory browser
+   *  can surface provenance. Re-read files via `listMemoryFiles`/`memoryOverview`. */
+  onMemoryFlushed(cb: (e: MemoryFlushedEvent) => void): Promise<Unlisten>;
 }
 
 // Explicit mock flag OR auto-fallback when not inside a Tauri window.
@@ -454,6 +459,8 @@ class TauriIpc implements FfIpc {
     );
   onMcpStatusChanged = (cb: (e: McpStatusChangedEvent) => void) =>
     this.listen<McpStatusChangedEvent>("mcp:status-changed", cb);
+  onMemoryFlushed = (cb: (e: MemoryFlushedEvent) => void) =>
+    this.listen<MemoryFlushedEvent>("memory:flushed", cb);
 }
 
 // `MockIpc` is pulled in with a dynamic import so the bundler gives it its own

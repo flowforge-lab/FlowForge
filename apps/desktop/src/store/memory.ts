@@ -21,12 +21,20 @@ interface MemoryState {
   query: string;
   loading: boolean;
   error: string | null;
+  /** How many silent context-pressure flushes wrote to memory this app session
+   *  (#283) — drives the "memory auto-curated" provenance banner. */
+  flushCount: number;
+  /** Durable facts written by the most recent flush. */
+  lastFlushWrites: number;
 
   /** Fetch list + overview + curated/daily bodies (on panel mount). */
   load: () => Promise<void>;
   setQuery: (q: string) => void;
   /** Footer "Reset to defaults" — clears the search only (no IPC writes). */
   resetSearch: () => void;
+  /** Record a `memory:flushed` event (wired in lib/events.ts). The Settings pane
+   *  reloads on the bump so freshly-flushed content shows. */
+  noteFlush: (writes: number) => void;
 }
 
 export const useMemoryStore = create<MemoryState>((set) => ({
@@ -37,6 +45,8 @@ export const useMemoryStore = create<MemoryState>((set) => ({
   query: "",
   loading: false,
   error: null,
+  flushCount: 0,
+  lastFlushWrites: 0,
 
   load: async () => {
     set({ loading: true, error: null });
@@ -81,4 +91,6 @@ export const useMemoryStore = create<MemoryState>((set) => ({
 
   setQuery: (query) => set({ query }),
   resetSearch: () => set({ query: "" }),
+  noteFlush: (writes) =>
+    set((s) => ({ flushCount: s.flushCount + 1, lastFlushWrites: writes })),
 }));

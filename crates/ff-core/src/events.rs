@@ -113,6 +113,20 @@ pub struct TurnErrorEvent {
     pub message: String,
 }
 
+/// A silent context-pressure memory flush wrote durable facts to the user's
+/// on-disk memory mid-turn (#283, follow-up to #244 R5). Emitted only when the
+/// flush actually wrote something, so the memory browser can surface provenance
+/// ("memory auto-updated this turn").
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "../../../apps/desktop/src/bindings/")]
+pub struct MemoryFlushedEvent {
+    pub session_id: String,
+    pub message_id: String,
+    /// Number of durable facts written this turn (always > 0 when emitted).
+    pub writes: u32,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export, export_to = "../../../apps/desktop/src/bindings/")]
