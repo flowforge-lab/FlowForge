@@ -69,6 +69,13 @@ const REPEAT_NUDGE_AT: usize = 3;
 /// turn with a clear notice rather than spinning to the iteration cap.
 const REPEAT_BREAK_AT: usize = 5;
 
+/// Tool results are appended verbatim to the session history and replayed on the
+/// next request, so one oversized result (a big file read, a long command dump) can
+/// dominate the context budget on its own. Cap what is *persisted to history* at
+/// this many bytes (#244 R8); the emitted `ToolCallFinished` event still carries the
+/// full untruncated content for the UI.
+const TOOL_RESULT_MAX_BYTES: usize = 8 * 1024;
+
 /// Events the agent emits during a turn. The host (Tauri shell or a test) decides
 /// how to surface them — over IPC, to a channel, or into assertions.
 #[derive(Debug, Clone, Serialize)]
@@ -205,6 +212,36 @@ impl CancelToken {
     pub fn is_cancelled(&self) -> bool {
         self.0.load(Ordering::SeqCst)
     }
+}
+
+/// Head+tail truncation of an over-budget tool result on UTF-8 char boundaries
+/// (#244 R8). Keeps roughly the first and last halves of the byte budget with a
+/// marker between them, so both the start (often a summary/header) and the end
+/// (often the conclusion/error) survive. Returns the input unchanged when it is
+/// already within `TOOL_RESULT_MAX_BYTES`.
+fn truncate_tool_result(content: &str) -> String {
+    if content.len() <= TOOL_RESULT_MAX_BYTES {
+        return content.to_string();
+    }
+    let marker = "\n\n[... tool result truncated to fit context ...]\n\n";
+    let budget = TOOL_RESULT_MAX_BYTES.saturating_sub(marker.len());
+    let head_budget = budget / 2;
+    let tail_budget = budget - head_budget;
+
+    let mut head_end = head_budget.min(content.len());
+    while head_end > 0 && !content.is_char_boundary(head_end) {
+        head_end -= 1;
+    }
+    let mut tail_start = content.len().saturating_sub(tail_budget);
+    while tail_start < content.len() && !content.is_char_boundary(tail_start) {
+        tail_start += 1;
+    }
+    format!(
+        "{}{}{}",
+        &content[..head_end],
+        marker,
+        &content[tail_start..]
+    )
 }
 
 fn role_str(role: Role) -> &'static str {
@@ -634,7 +671,11 @@ pub async fn run_turn(
                 }
             };
 
-            store.add_tool_result_message(session_id, call.id.clone(), outcome.content.clone());
+            store.add_tool_result_message(
+                session_id,
+                call.id.clone(),
+                truncate_tool_result(&outcome.content),
+            );
             executed.push(call.id.clone());
             on_event(AgentEvent::ToolCallFinished {
                 message_id: message_id.clone(),
@@ -2418,5 +2459,146 @@ mod tests {
         let tc = seen.lock().unwrap().expect("Done event was emitted");
         let tc = tc.expect("token_count must be populated, not None");
         assert!(tc > 0, "estimated token count should be positive, got {tc}");
+    }
+
+    // ----- #244 R8: oversized tool-result history truncation -----
+
+    #[test]
+    fn truncate_tool_result_passes_through_small_input() {
+        let small = "ok";
+        assert_eq!(truncate_tool_result(small), small);
+        let exact = "x".repeat(TOOL_RESULT_MAX_BYTES);
+        assert_eq!(truncate_tool_result(&exact), exact);
+    }
+
+    #[test]
+    fn truncate_tool_result_caps_and_keeps_head_and_tail() {
+        let big = format!("HEAD{}TAIL", "x".repeat(TOOL_RESULT_MAX_BYTES * 2));
+        let out = truncate_tool_result(&big);
+        assert!(
+            out.len() <= TOOL_RESULT_MAX_BYTES,
+            "truncated to {} bytes, cap {}",
+            out.len(),
+            TOOL_RESULT_MAX_BYTES
+        );
+        assert!(out.starts_with("HEAD"), "head slice must survive");
+        assert!(out.ends_with("TAIL"), "tail slice must survive");
+        assert!(out.contains("truncated"), "marker must be present");
+    }
+
+    #[test]
+    fn truncate_tool_result_respects_utf8_boundaries() {
+        // A grinning-face emoji is 4 bytes; a naive byte slice mid-codepoint would
+        // panic. The output must stay valid UTF-8 and within the cap.
+        let big = "😀".repeat(TOOL_RESULT_MAX_BYTES);
+        let out = truncate_tool_result(&big);
+        assert!(out.len() <= TOOL_RESULT_MAX_BYTES);
+        assert!(out.chars().count() > 0);
+    }
+
+    /// A tool whose result is far larger than the history cap.
+    struct BigResultTool {
+        bytes: usize,
+    }
+    #[async_trait]
+    impl ff_tools::Tool for BigResultTool {
+        fn name(&self) -> &str {
+            "big"
+        }
+        fn description(&self) -> &str {
+            "returns a large blob"
+        }
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({ "type": "object", "properties": {} })
+        }
+        fn safety(&self, _args: &serde_json::Value) -> Safety {
+            Safety::ReadOnly
+        }
+        async fn run(&self, _args: serde_json::Value, _root: &Path) -> ff_tools::ToolOutcome {
+            ff_tools::ToolOutcome::ok("B".repeat(self.bytes))
+        }
+    }
+
+    /// First call invokes `big`; second call returns plain text.
+    struct BigToolThenText {
+        calls: AtomicUsize,
+    }
+    #[async_trait]
+    impl Provider for BigToolThenText {
+        async fn chat_stream(&self, _req: ChatRequest) -> Result<ChunkStream, LlmError> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            let chunks = if n == 0 {
+                vec![Ok(Chunk {
+                    tool_calls: vec![ToolCallDelta {
+                        index: 0,
+                        id: Some("call_1".into()),
+                        name: Some("big".into()),
+                        arguments: "{}".into(),
+                    }],
+                    done: true,
+                    ..Chunk::default()
+                })]
+            } else {
+                vec![Ok(Chunk {
+                    delta: "done".into(),
+                    done: true,
+                    ..Chunk::default()
+                })]
+            };
+            Ok(futures_util::stream::iter(chunks).boxed())
+        }
+    }
+
+    #[tokio::test]
+    async fn oversized_tool_result_is_truncated_in_history_but_full_in_event() {
+        let store = SessionStore::new();
+        let s = store.create_session(None);
+        store.add_message(&s.id, Role::User, "go".into());
+        let mut registry = ToolRegistry::new();
+        let full_len = TOOL_RESULT_MAX_BYTES * 3;
+        registry.register(Box::new(BigResultTool { bytes: full_len }));
+        let root = std::env::current_dir().unwrap();
+        let approve = AlwaysApprove;
+
+        let mut event_result_len = 0usize;
+        run_turn(
+            &BigToolThenText {
+                calls: AtomicUsize::new(0),
+            },
+            &store,
+            &ctx(&registry, &root, &approve),
+            &s.id,
+            "mock",
+            None,
+            false,
+            CancelToken::new(),
+            |ev| {
+                if let AgentEvent::ToolCallFinished { result, .. } = ev {
+                    event_result_len = result.len();
+                }
+            },
+        )
+        .await
+        .unwrap();
+
+        // The UI event keeps the full, untruncated result.
+        assert_eq!(event_result_len, full_len, "event must carry full content");
+
+        // History (replayed to the model) is capped.
+        let history = store.get_messages(&s.id);
+        let tool_msg = history
+            .iter()
+            .find(|m| m.role == Role::Tool)
+            .expect("a tool result message");
+        assert!(
+            tool_msg.content.len() <= TOOL_RESULT_MAX_BYTES,
+            "history result {} exceeds cap {}",
+            tool_msg.content.len(),
+            TOOL_RESULT_MAX_BYTES
+        );
+        assert!(
+            tool_msg.content.contains("truncated"),
+            "history result should carry the truncation marker"
+        );
     }
 }
