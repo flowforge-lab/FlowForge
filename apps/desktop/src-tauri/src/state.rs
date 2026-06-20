@@ -484,6 +484,18 @@ impl AppState {
     /// persona overrides. Unknown skill names are dropped with a warning rather than
     /// failing — the installed set can drift from a phenotype definition.
     fn apply_phenotype(&self, pheno: Phenotype) {
+        let next = self.resolve_skills(&pheno);
+        *self.active_skills.lock().unwrap() = next.into_iter().collect();
+        *self.active_phenotype.lock().unwrap() = pheno;
+    }
+
+    /// Resolve a phenotype's declared skills against the installed registry,
+    /// dropping (with a warning) any name that is not installed — the installed
+    /// set can drift from a phenotype definition, and a missing skill must not
+    /// fail the turn. Returns a name-sorted, deduplicated set. Shared by
+    /// [`apply_phenotype`](Self::apply_phenotype) (global switch) and the
+    /// per-session resolver (#246) so both paths validate identically.
+    pub(crate) fn resolve_skills(&self, pheno: &Phenotype) -> BTreeSet<String> {
         let known = self.skills.read().unwrap();
         let mut next = BTreeSet::new();
         for name in &pheno.skills {
@@ -493,9 +505,7 @@ impl AppState {
                 tracing::warn!(skill = %name, phenotype = %pheno.name, "phenotype names unknown skill; skipping");
             }
         }
-        drop(known);
-        *self.active_skills.lock().unwrap() = next;
-        *self.active_phenotype.lock().unwrap() = pheno;
+        next
     }
 
     /// Run a pre-compaction memory flush if the session is now under context
@@ -916,16 +926,49 @@ impl AppState {
         Ok(pheno)
     }
 
-    /// The active phenotype's persona preamble, if any (prepended to the system
-    /// prompt for each turn).
-    pub fn active_persona(&self) -> Option<String> {
-        self.active_phenotype.lock().unwrap().persona.clone()
-    }
-
     /// The active phenotype's model override, if any (replaces the provider config's
     /// model for the turn).
     pub fn active_model_override(&self) -> Option<String> {
         self.active_phenotype.lock().unwrap().model.clone()
+    }
+
+    /// Resolve the phenotype a *session* runs as (#246). A session with an explicit
+    /// binding (set via [`set_session_phenotype`](Self::set_session_phenotype)) gets
+    /// that phenotype; an unbound session — or one whose bound name no longer exists
+    /// — inherits the global active phenotype. This is the single source of truth a
+    /// turn uses to derive persona / skills / model (and, once #244-R3 lands,
+    /// `max_iterations`), so two panes can run different Phenos simultaneously.
+    pub fn session_phenotype(&self, session_id: &str) -> Phenotype {
+        match self.store.session_phenotype(session_id) {
+            Some(name) => resolve_phenotype(&name).unwrap_or_else(|| {
+                tracing::warn!(
+                    phenotype = %name,
+                    session = %session_id,
+                    "session bound to unknown phenotype; inheriting global active"
+                );
+                self.active_phenotype()
+            }),
+            None => self.active_phenotype(),
+        }
+    }
+
+    /// Bind `session_id` to a phenotype by name, or clear it (`None`) so the session
+    /// inherits the global active one again (#246). Validates the name against the
+    /// phenotype registry up front so a stale UI cannot bind a phantom — unknown
+    /// names error rather than silently falling back. No-op-safe for the binding
+    /// itself: clearing always succeeds.
+    pub fn set_session_phenotype(
+        &self,
+        session_id: &str,
+        name: Option<String>,
+    ) -> Result<(), String> {
+        if let Some(ref n) = name {
+            if resolve_phenotype(n).is_none() {
+                return Err(format!("unknown phenotype: {n}"));
+            }
+        }
+        self.store.set_session_phenotype(session_id, name);
+        Ok(())
     }
 }
 
@@ -1505,7 +1548,7 @@ mod tests {
             Some("qwen3-coder")
         );
         assert_eq!(
-            state.active_persona().as_deref(),
+            state.active_phenotype().persona.as_deref(),
             Some("You are a Rust expert.")
         );
         assert_eq!(state.active_phenotype().name, "rust");
@@ -1522,8 +1565,75 @@ mod tests {
         });
         state.apply_phenotype(default_phenotype());
         assert!(state.active_model_override().is_none());
-        assert!(state.active_persona().is_none());
+        assert!(state.active_phenotype().persona.is_none());
         assert!(state.active_skills().is_empty());
+    }
+
+    #[test]
+    fn unbound_session_inherits_global_active_phenotype() {
+        let state = AppState::new();
+        // Make the global active phenotype non-default so inheritance is observable.
+        state.apply_phenotype(Phenotype {
+            name: "rust".into(),
+            skills: vec![],
+            model: Some("qwen3-coder".into()),
+            persona: Some("You are a Rust expert.".into()),
+        });
+        let s = state.store.create_session(None);
+        let resolved = state.session_phenotype(&s.id);
+        assert_eq!(resolved.name, "rust");
+        assert_eq!(resolved.model.as_deref(), Some("qwen3-coder"));
+        assert_eq!(resolved.persona.as_deref(), Some("You are a Rust expert."));
+    }
+
+    #[test]
+    fn bound_session_resolves_to_its_own_phenotype() {
+        let state = AppState::new();
+        // Global active is the built-in default...
+        let s = state.store.create_session(None);
+        // ...but bind this session explicitly to `default` and confirm it resolves
+        // to a real, named phenotype (the built-in is always resolvable).
+        state
+            .set_session_phenotype(&s.id, Some(DEFAULT_PHENOTYPE.into()))
+            .unwrap();
+        let resolved = state.session_phenotype(&s.id);
+        assert_eq!(resolved.name, DEFAULT_PHENOTYPE);
+    }
+
+    #[test]
+    fn session_bound_to_unknown_phenotype_falls_back_to_global() {
+        let state = AppState::new();
+        state.apply_phenotype(Phenotype {
+            name: "rust".into(),
+            skills: vec![],
+            model: None,
+            persona: None,
+        });
+        let s = state.store.create_session(None);
+        // Inject a dangling binding directly through the store (the validated
+        // setter would reject it) to exercise the resolver's graceful fallback.
+        state
+            .store
+            .set_session_phenotype(&s.id, Some("ghost-phenotype".into()));
+        let resolved = state.session_phenotype(&s.id);
+        assert_eq!(
+            resolved.name, "rust",
+            "unknown binding inherits global active"
+        );
+    }
+
+    #[test]
+    fn set_session_phenotype_validates_name() {
+        let state = AppState::new();
+        let s = state.store.create_session(None);
+        let err = state
+            .set_session_phenotype(&s.id, Some("not-a-real-pheno".into()))
+            .unwrap_err();
+        assert!(err.contains("unknown phenotype"), "{err}");
+        // The rejected name must NOT have been written.
+        assert!(state.store.session_phenotype(&s.id).is_none());
+        // Clearing always succeeds.
+        state.set_session_phenotype(&s.id, None).unwrap();
     }
 
     // Regression guard for issue #117: the supervisor actor is `tokio::spawn`'d, so

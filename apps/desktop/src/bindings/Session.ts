@@ -23,4 +23,12 @@ createdAt: number,
 /**
  * Unix epoch milliseconds.
  */
-updatedAt: number, };
+updatedAt: number, 
+/**
+ * The phenotype this session runs as (#246). The *name* of a phenotype
+ * (`default` or a file stem under `~/.flowforge/phenotypes/`), resolved per
+ * turn to its persona / skills / model. `None` means "inherit the global
+ * active phenotype" — so two panes can run different phenotypes while
+ * untouched sessions always track the last-used global choice.
+ */
+phenotype?: string, };
