@@ -1,6 +1,5 @@
 //! Built-in tools the agent can call: `bash`, `python`, `view`, `edit`, `write`,
-//! `apply_patch`, `grep`, `glob`, `tree`, `todo`, `web_fetch`, `ask_user`. The `web_search`
-//! tool lives in the desktop crate (it reads user-configured search settings).
+//! `apply_patch`, `grep`, `glob`, `tree`, `todo`, `web_fetch`, `web_search`, `ask_user`.
 //!
 //! File tools ([`view`], [`edit`], [`write`]) are hard-jailed to a per-session workspace root
 //! via [`jail::resolve_in_root`]. `bash` runs in that root as its working directory
@@ -10,9 +9,11 @@
 //! Search/discovery tools ([`grep`], [`glob`], [`tree`]) are read-only and jailed
 //! to the same root; [`todo`] is a stateless planning checklist (full-replace).
 //!
-//! [`web_fetch`] reaches the network: it is `Safety::Write` (approval-gated) and
-//! guarded against SSRF (internal/loopback/cloud-metadata targets) by
-//! [`url_safety::SsrfPolicy`].
+//! [`web_fetch`] and [`web_search`] reach the network: both are `Safety::Write`
+//! (approval-gated) and guarded against SSRF (internal/loopback/cloud-metadata
+//! targets) by [`url_safety::SsrfPolicy`]. [`web_search`] is stateful -- it reads a
+//! host-injected [`web_search::WebSearchTool`] config ([`ff_core::SearchConfig`]) at
+//! call time -- so the host constructs it via [`web_search::WebSearchTool::new`].
 //!
 //! [`ask_user`] is interactive: it pauses the turn for user input (#44) rather than
 //! executing, so the agent loop routes it through the host's `Approver::ask`.
@@ -35,8 +36,10 @@ mod tree;
 pub mod url_safety;
 mod view;
 mod web_fetch;
+pub mod web_search;
 mod write;
 
 pub use agent_tool::{AgentTool, AGENT_TOOL_NAME};
 pub use registry::{is_subagent, Safety, Tool, ToolOutcome, ToolRegistry};
 pub use url_safety::SsrfPolicy;
+pub use web_search::WebSearchTool;

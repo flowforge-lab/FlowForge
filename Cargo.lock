@@ -1416,6 +1416,7 @@ dependencies = [
  "chrono",
  "dom_smoothie",
  "fast_html2md",
+ "ff-core",
  "ff-memory",
  "futures-util",
  "globset",

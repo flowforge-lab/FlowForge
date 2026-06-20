@@ -2,22 +2,22 @@
 //!
 //! Network egress, so it is `Safety::Write` (approval-gated by the agent loop). The
 //! tool reads the user's persisted [`SearchConfig`](ff_core::SearchConfig) at call
-//! time: this PR wires the keyless, self-hosted SearXNG JSON API. The hosted
+//! time: the keyless, self-hosted SearXNG JSON API is wired. The hosted
 //! `Brave` / `OpenAiCompatible` backends are recognized but refused with a clear
 //! message until API-key storage lands (Issue #8).
 //!
 //! The configured endpoint is itself an SSRF vector (a misconfigured `base_url`
 //! could point at internal infra), so every request is validated by
-//! [`SsrfPolicy`](ff_tools::SsrfPolicy) — both the literal URL and, for named
+//! [`SsrfPolicy`](crate::SsrfPolicy) — both the literal URL and, for named
 //! hosts, the resolved IP — before connecting.
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use crate::{SsrfPolicy, Tool, ToolOutcome};
 use async_trait::async_trait;
 use ff_core::{SearchBackend, SearchConfig};
-use ff_tools::{SsrfPolicy, Tool, ToolOutcome};
 use reqwest::header::USER_AGENT;
 use reqwest::redirect::Policy;
 use serde_json::Value;
@@ -259,7 +259,7 @@ impl Tool for WebSearchTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ff_tools::Safety;
+    use crate::Safety;
     use wiremock::matchers::{method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
