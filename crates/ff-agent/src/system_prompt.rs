@@ -15,6 +15,43 @@
 
 use ff_skills::SkillRegistry;
 
+/// Coarse time-of-day band for the ambient context (RFC 0008 §6). A *band*, not a
+/// timestamp: it transitions at most a few times per session, so it adds
+/// human-meaningful "evening" awareness without busting the system prompt's
+/// prefix cache the way minute-precision would. It is situational context only —
+/// never a directive the agent gates behavior on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimeOfDay {
+    Morning,
+    Afternoon,
+    Evening,
+    Night,
+}
+
+impl TimeOfDay {
+    /// Map a local-clock hour (0–23) to its band (RFC 0008 §6):
+    /// Morning 05:00–11:59, Afternoon 12:00–16:59, Evening 17:00–20:59,
+    /// Night 21:00–04:59. Pure so the bands are testable without a clock.
+    pub fn from_hour(hour: u32) -> Self {
+        match hour % 24 {
+            5..=11 => TimeOfDay::Morning,
+            12..=16 => TimeOfDay::Afternoon,
+            17..=20 => TimeOfDay::Evening,
+            _ => TimeOfDay::Night,
+        }
+    }
+
+    /// Lowercase label used in the ambient render, e.g. `"evening"`.
+    pub fn label(self) -> &'static str {
+        match self {
+            TimeOfDay::Morning => "morning",
+            TimeOfDay::Afternoon => "afternoon",
+            TimeOfDay::Evening => "evening",
+            TimeOfDay::Night => "night",
+        }
+    }
+}
+
 /// Ambient, zero-permission context handed to the model so it stops assuming its
 /// training-cutoff date. M3.1b scope is **time only** (RFC 0002 phase 1); location
 /// is a separate post-M3 track. The fields are preformatted strings so the prompt
@@ -30,17 +67,23 @@ pub struct UserContext {
     pub local_date: String,
     /// IANA timezone name, e.g. `America/Chicago`.
     pub timezone: String,
+    /// Coarse local time-of-day band (RFC 0008 §6).
+    pub time_of_day: TimeOfDay,
 }
 
 impl UserContext {
     /// Capture the current local date and IANA timezone from the host clock.
     pub fn now() -> Self {
-        let local_date = chrono::Local::now().format("%Y-%m-%d").to_string();
+        use chrono::Timelike;
+        let now = chrono::Local::now();
+        let local_date = now.format("%Y-%m-%d").to_string();
+        let time_of_day = TimeOfDay::from_hour(now.hour());
         let timezone =
             iana_time_zone::get_timezone().unwrap_or_else(|_| "unknown timezone".to_string());
         Self {
             local_date,
             timezone,
+            time_of_day,
         }
     }
 }
@@ -99,8 +142,10 @@ pub fn build_system_prompt(
 
     out.push_str("## User context\n");
     out.push_str(&format!(
-        "Current date: {} ({}).\n",
-        user.local_date, user.timezone
+        "Current: {}, {} ({}).\n",
+        user.local_date,
+        user.time_of_day.label(),
+        user.timezone
     ));
 
     // Durable memory (RFC 0006) sits in the volatile tail beside the user
@@ -144,6 +189,7 @@ mod tests {
         UserContext {
             local_date: "2026-06-13".into(),
             timezone: "America/Chicago".into(),
+            time_of_day: TimeOfDay::Evening,
         }
     }
 
@@ -188,9 +234,53 @@ mod tests {
         let out = build_system_prompt(None, &reg, &[], &ctx(), None);
         assert!(out.contains("## User context"));
         assert!(
-            out.contains("Current date: 2026-06-13 (America/Chicago)."),
+            out.contains("Current: 2026-06-13, evening (America/Chicago)."),
             "{out}"
         );
+    }
+
+    #[test]
+    fn time_of_day_bands_cover_every_boundary() {
+        // RFC 0008 §6: Morning 05–11, Afternoon 12–16, Evening 17–20, Night 21–04.
+        assert_eq!(TimeOfDay::from_hour(4), TimeOfDay::Night);
+        assert_eq!(TimeOfDay::from_hour(5), TimeOfDay::Morning);
+        assert_eq!(TimeOfDay::from_hour(11), TimeOfDay::Morning);
+        assert_eq!(TimeOfDay::from_hour(12), TimeOfDay::Afternoon);
+        assert_eq!(TimeOfDay::from_hour(16), TimeOfDay::Afternoon);
+        assert_eq!(TimeOfDay::from_hour(17), TimeOfDay::Evening);
+        assert_eq!(TimeOfDay::from_hour(20), TimeOfDay::Evening);
+        assert_eq!(TimeOfDay::from_hour(21), TimeOfDay::Night);
+        assert_eq!(TimeOfDay::from_hour(0), TimeOfDay::Night);
+        assert_eq!(TimeOfDay::from_hour(23), TimeOfDay::Night);
+    }
+
+    #[test]
+    fn time_of_day_labels_are_lowercase() {
+        assert_eq!(TimeOfDay::Morning.label(), "morning");
+        assert_eq!(TimeOfDay::Afternoon.label(), "afternoon");
+        assert_eq!(TimeOfDay::Evening.label(), "evening");
+        assert_eq!(TimeOfDay::Night.label(), "night");
+    }
+
+    #[test]
+    fn user_context_renders_time_of_day_band() {
+        let reg = SkillRegistry::new();
+        let mut user = ctx();
+        user.time_of_day = TimeOfDay::Morning;
+        let out = build_system_prompt(None, &reg, &[], &user, None);
+        assert!(
+            out.contains("Current: 2026-06-13, morning (America/Chicago)."),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn now_captures_a_valid_band() {
+        let band = UserContext::now().time_of_day;
+        assert!(matches!(
+            band,
+            TimeOfDay::Morning | TimeOfDay::Afternoon | TimeOfDay::Evening | TimeOfDay::Night
+        ));
     }
 
     #[test]
