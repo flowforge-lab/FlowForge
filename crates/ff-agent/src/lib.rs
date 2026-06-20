@@ -379,6 +379,11 @@ pub async fn run_turn(
                 Err(e) => {
                     if e.is_transient() && attempt < MAX_PROVIDER_ATTEMPTS {
                         cancellable_backoff(&cancel, RETRY_BACKOFF_BASE_MS << (attempt - 1)).await;
+                        // Cancelled during the backoff -> stop now instead of issuing one
+                        // more wasted provider call (#244 R1 follow-up).
+                        if cancel.is_cancelled() {
+                            break;
+                        }
                         continue;
                     }
                     on_event(AgentEvent::Error {
@@ -435,6 +440,11 @@ pub async fn run_turn(
             match stream_err {
                 Some(e) if e.is_transient() && !emitted_any && attempt < MAX_PROVIDER_ATTEMPTS => {
                     cancellable_backoff(&cancel, RETRY_BACKOFF_BASE_MS << (attempt - 1)).await;
+                    // Cancelled during the backoff -> stop now instead of issuing one
+                    // more wasted provider call (#244 R1 follow-up).
+                    if cancel.is_cancelled() {
+                        break;
+                    }
                     continue;
                 }
                 Some(e) => {
@@ -442,6 +452,21 @@ pub async fn run_turn(
                         message: e.to_string(),
                     });
                     return Err(e.into());
+                }
+                // A clean stream that produced neither text nor a tool call is a provider
+                // anomaly, not a real final answer (#244 R7). Retry (bounded, same backoff
+                // as a transient error) rather than emitting a silent empty bubble; a
+                // cancelled turn falls through to break and stops.
+                None if acc.trim().is_empty()
+                    && calls.is_empty()
+                    && !cancel.is_cancelled()
+                    && attempt < MAX_PROVIDER_ATTEMPTS =>
+                {
+                    cancellable_backoff(&cancel, RETRY_BACKOFF_BASE_MS << (attempt - 1)).await;
+                    if cancel.is_cancelled() {
+                        break;
+                    }
+                    continue;
                 }
                 None => break,
             }
@@ -452,6 +477,17 @@ pub async fn run_turn(
 
         // No tool calls -> this is the final text answer.
         if calls.is_empty() {
+            // Empty even after the bounded R7 retries (or the turn was cancelled): don't
+            // emit an empty Done bubble. Set a notice and let the post-loop finalize on
+            // this same reserved message, so there is no orphan empty assistant message.
+            if final_text.trim().is_empty() {
+                if !cancel.is_cancelled() && stop_reason.is_none() {
+                    stop_reason =
+                        Some("[stopped: the model returned an empty response]".to_string());
+                }
+                last = Some(finalized);
+                break;
+            }
             on_event(AgentEvent::Done {
                 message_id: message_id.clone(),
                 final_message: Some(final_text),
@@ -573,7 +609,10 @@ pub async fn run_turn(
                      without making progress]",
                     call.name
                 ));
-            } else if *count == REPEAT_NUDGE_AT {
+            } else if *count >= REPEAT_NUDGE_AT {
+                // Keep nudging through the recovery window (#244 R2 follow-up): re-arm on
+                // every repeat from the nudge threshold up to the break, so a model that
+                // ignores the first reminder still gets one before we break the turn.
                 repeat_nudge = Some(call.name.clone());
             }
         }
@@ -1964,6 +2003,199 @@ mod tests {
             msg.content.contains("repeated the identical"),
             "got: {}",
             msg.content
+        );
+    }
+
+    // ----- #244 R7 + R1/R2 follow-up nits: loop polish -----
+
+    /// Cancels the turn, then returns a transient setup error -- so the retry backoff
+    /// runs with the token already cancelled. Counts how many times the provider is hit.
+    struct CancelDuringBackoff {
+        calls: Arc<AtomicUsize>,
+        cancel: CancelToken,
+    }
+    #[async_trait]
+    impl Provider for CancelDuringBackoff {
+        async fn chat_stream(&self, _req: ChatRequest) -> Result<ChunkStream, LlmError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.cancel.cancel();
+            Err(LlmError::Transport("reset".into()))
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn no_extra_chat_stream_after_cancel_during_backoff() {
+        let store = SessionStore::new();
+        let s = store.create_session(None);
+        store.add_message(&s.id, Role::User, "hi".into());
+        let registry = ToolRegistry::new();
+        let root = std::env::current_dir().unwrap();
+        let approve = AlwaysApprove;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let cancel = CancelToken::new();
+        let provider = CancelDuringBackoff {
+            calls: calls.clone(),
+            cancel: cancel.clone(),
+        };
+
+        let _ = run_turn(
+            &provider,
+            &store,
+            &ctx(&registry, &root, &approve),
+            &s.id,
+            "mock",
+            None,
+            false,
+            cancel,
+            |_| {},
+        )
+        .await;
+
+        // Without the cancel-after-backoff check the loop would issue two more wasted
+        // calls before surfacing; the fix stops it dead after the first (#244 R1 nit).
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "cancel during backoff must not issue another provider call"
+        );
+    }
+
+    /// Returns an empty (no text, no tool call) but successful stream for the first
+    /// `empties` calls, then a real text turn -- a provider hiccup (#244 R7).
+    struct EmptyThenText {
+        empties: usize,
+        calls: Arc<AtomicUsize>,
+    }
+    #[async_trait]
+    impl Provider for EmptyThenText {
+        async fn chat_stream(&self, _req: ChatRequest) -> Result<ChunkStream, LlmError> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            if n < self.empties {
+                return Ok(futures_util::stream::iter(vec![Ok(Chunk {
+                    done: true,
+                    ..Chunk::default()
+                })])
+                .boxed());
+            }
+            Ok(futures_util::stream::iter(vec![Ok(Chunk {
+                delta: "recovered".into(),
+                done: true,
+                ..Chunk::default()
+            })])
+            .boxed())
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn empty_response_retries_then_recovers() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = EmptyThenText {
+            empties: 1,
+            calls: calls.clone(),
+        };
+        let (res, errored) = run_text_turn(&provider).await;
+        assert_eq!(res.unwrap().content, "recovered");
+        assert!(
+            !errored,
+            "an anomaly that recovers should not surface an error"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "one empty response retried, then success"
+        );
+    }
+
+    /// Always returns an empty successful stream -- a persistent anomaly.
+    struct AlwaysEmpty {
+        calls: Arc<AtomicUsize>,
+    }
+    #[async_trait]
+    impl Provider for AlwaysEmpty {
+        async fn chat_stream(&self, _req: ChatRequest) -> Result<ChunkStream, LlmError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(futures_util::stream::iter(vec![Ok(Chunk {
+                done: true,
+                ..Chunk::default()
+            })])
+            .boxed())
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn empty_response_exhausts_to_notice() {
+        let store = SessionStore::new();
+        let s = store.create_session(None);
+        store.add_message(&s.id, Role::User, "go".into());
+        let registry = ToolRegistry::new();
+        let root = std::env::current_dir().unwrap();
+        let approve = AlwaysApprove;
+        let calls = Arc::new(AtomicUsize::new(0));
+
+        let msg = run_turn(
+            &AlwaysEmpty {
+                calls: calls.clone(),
+            },
+            &store,
+            &ctx(&registry, &root, &approve),
+            &s.id,
+            "mock",
+            None,
+            false,
+            CancelToken::new(),
+            |_| {},
+        )
+        .await
+        .unwrap();
+
+        // The empty-response retry is bounded by the provider-attempt cap within one
+        // iteration -- not an infinite spin.
+        assert_eq!(calls.load(Ordering::SeqCst), MAX_PROVIDER_ATTEMPTS);
+        // ...and the turn ends with a clear notice, never a silent empty bubble.
+        assert!(
+            msg.content.contains("empty response"),
+            "got: {}",
+            msg.content
+        );
+    }
+
+    #[tokio::test]
+    async fn repeat_nudge_persists_through_the_recovery_window() {
+        let store = SessionStore::new();
+        let s = store.create_session(None);
+        store.add_message(&s.id, Role::User, "go".into());
+        let registry = ToolRegistry::new();
+        let root = std::env::current_dir().unwrap();
+        let approve = AlwaysApprove;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let saw_nudge = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let tools = ToolContext::new(&registry, &root, &approve, 20);
+        run_turn(
+            &RepeatProvider {
+                calls: calls.clone(),
+                saw_nudge: saw_nudge.clone(),
+            },
+            &store,
+            &tools,
+            &s.id,
+            "mock",
+            None,
+            false,
+            CancelToken::new(),
+            |_| {},
+        )
+        .await
+        .unwrap();
+
+        // Five requests fire before the break at REPEAT_BREAK_AT (5). The nudge is
+        // re-armed across the whole window, so both the count-4 request (index 3) and
+        // the count-5 request (index 4) carry it -- not just the first (#244 R2 nit).
+        let seen = saw_nudge.lock().unwrap();
+        assert_eq!(
+            seen.as_slice(),
+            &[false, false, false, true, true],
+            "{seen:?}"
         );
     }
 }
