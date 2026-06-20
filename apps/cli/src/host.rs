@@ -34,6 +34,9 @@ fn build_provider(config: &ProviderConfig) -> Box<dyn Provider> {
     match config.kind {
         ProviderKind::CandleVllm => Box::new(OpenAiProvider::new(base_url, None)),
         ProviderKind::Ollama => Box::new(OllamaProvider::new(base_url)),
+        // The Bedrock provider lands in #202 PR-2; PR-1 ships only the contract.
+        // The CLI cannot select Bedrock until then, so this arm is unreachable.
+        ProviderKind::Bedrock => unimplemented!("Bedrock provider lands in #202 PR-2"),
     }
 }
 

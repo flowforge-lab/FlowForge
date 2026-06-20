@@ -3,6 +3,7 @@
 //! calls into a crate, and returns. Streaming responses go out as Tauri events.
 
 mod optimize;
+mod secrets;
 mod state;
 mod tools;
 
@@ -17,7 +18,7 @@ use ff_core::events::{
 use ff_core::{
     McpServerConfig, McpServerStatus, MemoryFileInfo, MemoryFileKind, MemoryOverview, Message,
     Mode, Phenotype, ProviderConfig, ProviderConnection, ProviderKind, ProviderRegistry, Role,
-    SearchConfig, Session, SessionWorkspace, Skill, SkillInfo, SkillManifest,
+    SearchConfig, SecretKind, Session, SessionWorkspace, Skill, SkillInfo, SkillManifest,
 };
 use ff_signals::SkillAggregate;
 use ff_tools::Safety;
@@ -670,6 +671,29 @@ fn remove_connection(state: State<'_, Arc<AppState>>, id: String) -> CmdResult<(
     state.remove_connection(&id)
 }
 
+/// Store a provider secret for a connection in the OS keychain and flip its hasKey
+/// flag. The secret value is never returned to the frontend.
+#[tauri::command]
+fn set_provider_secret(
+    state: State<'_, Arc<AppState>>,
+    connection_id: String,
+    kind: SecretKind,
+    value: String,
+) -> CmdResult<()> {
+    state.set_connection_secret(&connection_id, kind, &value)
+}
+
+/// Clear a provider secret for a connection and recompute its hasKey flag from the
+/// remaining stored secrets.
+#[tauri::command]
+fn clear_provider_secret(
+    state: State<'_, Arc<AppState>>,
+    connection_id: String,
+    kind: SecretKind,
+) -> CmdResult<()> {
+    state.clear_connection_secret(&connection_id, kind)
+}
+
 /// Current persisted web-search settings.
 #[tauri::command]
 fn get_search_config(state: State<'_, Arc<AppState>>) -> SearchConfig {
@@ -1196,6 +1220,8 @@ pub fn run() {
             set_active_connection,
             upsert_connection,
             remove_connection,
+            set_provider_secret,
+            clear_provider_secret,
             get_search_config,
             set_search_config,
             list_models,

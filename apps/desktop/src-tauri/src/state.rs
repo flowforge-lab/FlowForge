@@ -10,7 +10,7 @@ use ff_agent::{
 };
 use ff_core::{
     Mode, Phenotype, ProviderConfig, ProviderConnection, ProviderKind, ProviderRegistry,
-    SearchConfig,
+    SearchConfig, SecretKind,
 };
 use ff_llm::{OllamaProvider, OpenAiProvider, Provider};
 use ff_mcp::{McpConfigWatcher, SupervisorHandle};
@@ -125,6 +125,10 @@ fn build_provider(conn: &ProviderConnection) -> Box<dyn Provider> {
     match conn.kind {
         ProviderKind::CandleVllm => Box::new(OpenAiProvider::new(base_url, None)),
         ProviderKind::Ollama => Box::new(OllamaProvider::new(base_url)),
+        // The Bedrock provider (AWS SDK + keychain-resolved credentials) lands in
+        // #202 PR-2. PR-1 ships only the contract + secret plumbing, and no Bedrock
+        // connection can be created until then, so this arm is unreachable in PR-1.
+        ProviderKind::Bedrock => unimplemented!("Bedrock provider lands in #202 PR-2"),
     }
 }
 
@@ -146,6 +150,7 @@ fn display_name_for(kind: ProviderKind) -> String {
     match kind {
         ProviderKind::CandleVllm => "candle-vLLM",
         ProviderKind::Ollama => "Ollama",
+        ProviderKind::Bedrock => "Amazon Bedrock",
     }
     .to_string()
 }
@@ -162,6 +167,10 @@ fn config_to_connection(config: ProviderConfig) -> ProviderConnection {
         model: config.model,
         has_key: config.has_key,
         thinking: config.thinking,
+        region: None,
+        auth_mode: None,
+        aws_profile: None,
+        access_key_id: None,
     }
 }
 
@@ -796,6 +805,52 @@ impl AppState {
         let snapshot = {
             let mut reg = self.registry.lock().unwrap();
             reg.remove(id)?;
+            reg.clone()
+        };
+        save_registry(&snapshot);
+        Ok(())
+    }
+
+    /// Store a provider secret of `kind` for connection `conn_id` in the OS keychain,
+    /// then flip that connection's `has_key` flag and persist. The secret value never
+    /// enters the registry — only the coarse flag does. `Err` (without writing the
+    /// secret) on an unknown connection id.
+    pub fn set_connection_secret(
+        &self,
+        conn_id: &str,
+        kind: SecretKind,
+        value: &str,
+    ) -> Result<(), String> {
+        let snapshot = {
+            let mut reg = self.registry.lock().unwrap();
+            let conn = reg
+                .connections
+                .iter_mut()
+                .find(|c| c.id == conn_id)
+                .ok_or_else(|| format!("unknown connection: {conn_id}"))?;
+            crate::secrets::set(conn_id, kind, value)?;
+            conn.has_key = true;
+            reg.clone()
+        };
+        save_registry(&snapshot);
+        Ok(())
+    }
+
+    /// Remove the secret of `kind` for `conn_id`, recompute `has_key` from the
+    /// remaining stored secrets, and persist. Idempotent. `Err` on an unknown id.
+    pub fn clear_connection_secret(&self, conn_id: &str, kind: SecretKind) -> Result<(), String> {
+        crate::secrets::clear(conn_id, kind)?;
+        let has_key = SecretKind::ALL
+            .iter()
+            .any(|k| crate::secrets::get(conn_id, *k).is_some());
+        let snapshot = {
+            let mut reg = self.registry.lock().unwrap();
+            let conn = reg
+                .connections
+                .iter_mut()
+                .find(|c| c.id == conn_id)
+                .ok_or_else(|| format!("unknown connection: {conn_id}"))?;
+            conn.has_key = has_key;
             reg.clone()
         };
         save_registry(&snapshot);
@@ -1857,6 +1912,10 @@ mod tests {
                 model: "saved".into(),
                 has_key: false,
                 thinking: true,
+                region: None,
+                auth_mode: None,
+                aws_profile: None,
+                access_key_id: None,
             }],
         };
         fs::write(&reg_path, serde_json::to_string(&existing).unwrap()).unwrap();
@@ -1996,11 +2055,77 @@ mod tests {
             model: "x".into(),
             has_key: false,
             thinking: true,
+            region: None,
+            auth_mode: None,
+            aws_profile: None,
+            access_key_id: None,
         });
         assert_eq!(stored.id, "openrouter");
         assert_eq!(state.provider_registry().connections.len(), 3);
         state.remove_connection("openrouter").unwrap();
         assert_eq!(state.provider_registry().connections.len(), 2);
+    }
+
+    fn has_key_of(state: &AppState, id: &str) -> bool {
+        state
+            .provider_registry()
+            .connections
+            .into_iter()
+            .find(|c| c.id == id)
+            .unwrap()
+            .has_key
+    }
+
+    #[test]
+    fn set_connection_secret_flips_has_key_without_leaking_value() {
+        let state = AppState::with_registry(ProviderRegistry::default());
+        let id = "candle-vllm";
+        assert!(!has_key_of(&state, id));
+        state
+            .set_connection_secret(id, SecretKind::ApiKey, "sk-secret-aaa")
+            .unwrap();
+        assert!(has_key_of(&state, id));
+        // The value lands in the keychain (MemStore under cfg(test))...
+        assert_eq!(
+            crate::secrets::get(id, SecretKind::ApiKey).as_deref(),
+            Some("sk-secret-aaa")
+        );
+        // ...but never in the registry the frontend receives.
+        let json = serde_json::to_string(&state.provider_registry()).unwrap();
+        assert!(!json.contains("sk-secret-aaa"));
+    }
+
+    #[test]
+    fn set_connection_secret_unknown_id_errors_and_writes_nothing() {
+        let state = AppState::with_registry(ProviderRegistry::default());
+        let err = state
+            .set_connection_secret("nonexistent-xyz", SecretKind::ApiKey, "nope")
+            .unwrap_err();
+        assert!(err.contains("nonexistent-xyz"));
+        assert!(crate::secrets::get("nonexistent-xyz", SecretKind::ApiKey).is_none());
+    }
+
+    #[test]
+    fn clear_connection_secret_recomputes_has_key() {
+        let state = AppState::with_registry(ProviderRegistry::default());
+        let id = "ollama";
+        state
+            .set_connection_secret(id, SecretKind::SecretAccessKey, "aws-secret")
+            .unwrap();
+        state
+            .set_connection_secret(id, SecretKind::SessionToken, "aws-token")
+            .unwrap();
+        assert!(has_key_of(&state, id));
+        // One of two secrets remains => has_key stays true.
+        state
+            .clear_connection_secret(id, SecretKind::SessionToken)
+            .unwrap();
+        assert!(has_key_of(&state, id));
+        // Last secret cleared => has_key flips false.
+        state
+            .clear_connection_secret(id, SecretKind::SecretAccessKey)
+            .unwrap();
+        assert!(!has_key_of(&state, id));
     }
 
     #[test]
