@@ -9,10 +9,10 @@ use ff_agent::{
     MemoryFlush, ProxyTokenEstimator, DEFAULT_FLUSH_AT_FRACTION,
 };
 use ff_core::{
-    Mode, Phenotype, ProviderConfig, ProviderConnection, ProviderKind, ProviderRegistry,
-    SearchConfig, SecretKind,
+    BedrockAuth, Mode, Phenotype, ProviderConfig, ProviderConnection, ProviderKind,
+    ProviderRegistry, SearchConfig, SecretKind,
 };
-use ff_llm::{OllamaProvider, OpenAiProvider, Provider};
+use ff_llm::{BedrockCreds, BedrockProvider, OllamaProvider, OpenAiProvider, Provider};
 use ff_mcp::{McpConfigWatcher, SupervisorHandle};
 use ff_memory::watch::MemoryWatcher;
 use ff_memory::{
@@ -125,10 +125,33 @@ fn build_provider(conn: &ProviderConnection) -> Box<dyn Provider> {
     match conn.kind {
         ProviderKind::CandleVllm => Box::new(OpenAiProvider::new(base_url, None)),
         ProviderKind::Ollama => Box::new(OllamaProvider::new(base_url)),
-        // The Bedrock provider (AWS SDK + keychain-resolved credentials) lands in
-        // #202 PR-2. PR-1 ships only the contract + secret plumbing, and no Bedrock
-        // connection can be created until then, so this arm is unreachable in PR-1.
-        ProviderKind::Bedrock => unimplemented!("Bedrock provider lands in #202 PR-2"),
+        // Bedrock resolves credentials by auth mode, pulling secret material from the
+        // OS keychain here so the provider crate stays keychain-free (#202 PR-2).
+        ProviderKind::Bedrock => {
+            let region = conn
+                .region
+                .clone()
+                .unwrap_or_else(|| "us-east-1".to_string());
+            let id = conn.id.as_str();
+            let creds = match conn.auth_mode.unwrap_or(BedrockAuth::Profile) {
+                BedrockAuth::Profile => BedrockCreds::Profile {
+                    name: conn
+                        .aws_profile
+                        .clone()
+                        .unwrap_or_else(|| "default".to_string()),
+                },
+                BedrockAuth::IamKeys => BedrockCreds::IamKeys {
+                    access_key_id: conn.access_key_id.clone().unwrap_or_default(),
+                    secret_access_key: crate::secrets::get(id, SecretKind::SecretAccessKey)
+                        .unwrap_or_default(),
+                    session_token: crate::secrets::get(id, SecretKind::SessionToken),
+                },
+                BedrockAuth::ApiKey => BedrockCreds::ApiKey {
+                    token: crate::secrets::get(id, SecretKind::ApiKey).unwrap_or_default(),
+                },
+            };
+            Box::new(BedrockProvider::new(region, creds))
+        }
     }
 }
 
@@ -846,15 +869,20 @@ impl AppState {
         kind: SecretKind,
         value: &str,
     ) -> Result<(), String> {
+        // Validate the id before any keychain write, but never hold the registry
+        // lock across keychain I/O (#202 follow-up).
+        {
+            let reg = self.registry.lock().unwrap();
+            if !reg.connections.iter().any(|c| c.id == conn_id) {
+                return Err(format!("unknown connection: {conn_id}"));
+            }
+        }
+        crate::secrets::set(conn_id, kind, value)?;
         let snapshot = {
             let mut reg = self.registry.lock().unwrap();
-            let conn = reg
-                .connections
-                .iter_mut()
-                .find(|c| c.id == conn_id)
-                .ok_or_else(|| format!("unknown connection: {conn_id}"))?;
-            crate::secrets::set(conn_id, kind, value)?;
-            conn.has_key = true;
+            if let Some(conn) = reg.connections.iter_mut().find(|c| c.id == conn_id) {
+                conn.has_key = true;
+            }
             reg.clone()
         };
         save_registry(&snapshot);
@@ -864,18 +892,22 @@ impl AppState {
     /// Remove the secret of `kind` for `conn_id`, recompute `has_key` from the
     /// remaining stored secrets, and persist. Idempotent. `Err` on an unknown id.
     pub fn clear_connection_secret(&self, conn_id: &str, kind: SecretKind) -> Result<(), String> {
+        // Validate the id before touching the keychain (#202 follow-up, mirrors set).
+        {
+            let reg = self.registry.lock().unwrap();
+            if !reg.connections.iter().any(|c| c.id == conn_id) {
+                return Err(format!("unknown connection: {conn_id}"));
+            }
+        }
         crate::secrets::clear(conn_id, kind)?;
         let has_key = SecretKind::ALL
             .iter()
             .any(|k| crate::secrets::get(conn_id, *k).is_some());
         let snapshot = {
             let mut reg = self.registry.lock().unwrap();
-            let conn = reg
-                .connections
-                .iter_mut()
-                .find(|c| c.id == conn_id)
-                .ok_or_else(|| format!("unknown connection: {conn_id}"))?;
-            conn.has_key = has_key;
+            if let Some(conn) = reg.connections.iter_mut().find(|c| c.id == conn_id) {
+                conn.has_key = has_key;
+            }
             reg.clone()
         };
         save_registry(&snapshot);
