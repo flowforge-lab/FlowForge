@@ -4,7 +4,7 @@
 - **Milestone:** _M3 (UX hardening)_
 - **Author:** tonytan4ever
 - **Depends on:** nothing hard. Complements RFC 0011 P2 (#265 — persisting per-session `mode`); reuses the `ff-memory` `FlushLedger` SQLite pattern.
-- **Tracking issue:** _TBD (epic)_
+- **Tracking issue:** #280 (epic)
 
 ## 1. Summary & Goals
 
