@@ -30,6 +30,14 @@ pub struct Session {
     /// Unix epoch milliseconds.
     #[ts(type = "number")]
     pub updated_at: i64,
+    /// The phenotype this session runs as (#246). The *name* of a phenotype
+    /// (`default` or a file stem under `~/.flowforge/phenotypes/`), resolved per
+    /// turn to its persona / skills / model. `None` means "inherit the global
+    /// active phenotype" — so two panes can run different phenotypes while
+    /// untouched sessions always track the last-used global choice.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub phenotype: Option<String>,
 }
 
 /// A session's working directory as surfaced to the frontend selector (#200,

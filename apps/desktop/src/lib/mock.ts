@@ -1014,6 +1014,27 @@ export class MockIpc implements FfIpc {
     return pheno;
   }
 
+  // Per-session phenotype binding (#246). Mirrors the backend: validate the name
+  // (unless clearing), then store it on the session record. Other sessions are
+  // untouched. `null` clears the binding so the session inherits the global active
+  // phenotype again.
+  async setSessionPhenotype(
+    sessionId: string,
+    name: string | null,
+  ): Promise<void> {
+    if (name !== null) {
+      const known =
+        name === DEFAULT_PHENOTYPE.name ||
+        MOCK_PHENOTYPES.some((p) => p.name === name);
+      if (!known) throw new Error(`unknown phenotype: ${name}`);
+    }
+    const s = this.sessions.get(sessionId);
+    if (s) {
+      s.phenotype = name ?? undefined;
+      s.updatedAt = now();
+    }
+  }
+
   // Profile marketplace search (SET.7). Empty query lists the full catalog,
   // install-count descending; a query ranks by relevance and drops non-matches.
   async searchProfileMarketplace(query: string): Promise<MarketplaceProfile[]> {

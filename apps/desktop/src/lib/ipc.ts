@@ -197,6 +197,11 @@ export interface FfIpc {
   /** Switch the active phenotype: replaces the active-skill set and persists the
    *  choice across restarts. Rejects an unknown name. Resolves with the phenotype now active. */
   switchPhenotype(name: string): Promise<Phenotype>;
+  /** Bind a single session to a phenotype, or clear the binding (`name: null`) so it
+   *  inherits the global active one (#246). Only the named session changes — other
+   *  panes are untouched. Rejects an unknown phenotype name. Used by the pane Pheno
+   *  selector (#245) to make a pane's phenotype truly per-session. */
+  setSessionPhenotype(sessionId: string, name: string | null): Promise<void>;
   // CONTRACT NOTE (SET.7): FE-owned mock command — no backend/ts-rs binding for a
   // remote profile catalog exists yet. `MarketplaceProfile` lives in
   // `lib/profile-marketplace.ts` (mirroring SET.5's `MarketplaceSkill`);
@@ -395,6 +400,8 @@ class TauriIpc implements FfIpc {
   getPhenotype = () => this.invoke<Phenotype>("get_phenotype");
   switchPhenotype = (name: string) =>
     this.invoke<Phenotype>("switch_phenotype", { name });
+  setSessionPhenotype = (sessionId: string, name: string | null) =>
+    this.invoke<void>("set_session_phenotype", { sessionId, name });
   searchProfileMarketplace = (query: string) =>
     this.invoke<MarketplaceProfile[]>("search_profile_marketplace", { query });
   listScheduledTasks = () =>

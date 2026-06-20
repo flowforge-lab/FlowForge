@@ -48,6 +48,7 @@ impl SessionStore {
             status: SessionStatus::Active,
             created_at: ts,
             updated_at: ts,
+            phenotype: None,
         };
         let mut inner = self.inner.lock().unwrap();
         inner.sessions.insert(session.id.clone(), session.clone());
@@ -125,6 +126,30 @@ impl SessionStore {
         }
     }
 
+    /// Bind this session to a phenotype by name, or clear the binding with `None`
+    /// so it inherits the global active phenotype again (#246). No-op for an
+    /// unknown session. The name is *not* validated here — the store is dumb
+    /// persistence; the app layer validates against the phenotype registry before
+    /// calling, and resolution falls back to global on an unknown name anyway.
+    pub fn set_session_phenotype(&self, session_id: &str, phenotype: Option<String>) {
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(s) = inner.sessions.get_mut(session_id) {
+            s.phenotype = phenotype;
+            s.updated_at = now_ms();
+        }
+    }
+
+    /// The session's bound phenotype name, or `None` if it inherits the global
+    /// active one (or the session is unknown).
+    pub fn session_phenotype(&self, session_id: &str) -> Option<String> {
+        self.inner
+            .lock()
+            .unwrap()
+            .sessions
+            .get(session_id)
+            .and_then(|s| s.phenotype.clone())
+    }
+
     pub fn set_message_content(
         &self,
         message_id: &str,
@@ -193,6 +218,9 @@ impl SessionStore {
             status: source.status,
             created_at: ts,
             updated_at: ts,
+            // A fork keeps the parent's phenotype binding so the copy runs as the
+            // same Pheno (#246).
+            phenotype: source.phenotype.clone(),
         };
         let cloned: Vec<Message> = inner
             .messages
@@ -352,5 +380,45 @@ mod tests {
         assert_eq!(after[0].id, before[0].id);
         assert_eq!(after[0].session_id, s.id);
         assert_eq!(store.list_sessions().len(), 2);
+    }
+
+    #[test]
+    fn new_session_has_no_phenotype_binding() {
+        let store = SessionStore::new();
+        let s = store.create_session(None);
+        assert!(s.phenotype.is_none());
+        assert!(store.session_phenotype(&s.id).is_none());
+    }
+
+    #[test]
+    fn set_and_clear_session_phenotype() {
+        let store = SessionStore::new();
+        let s = store.create_session(None);
+
+        store.set_session_phenotype(&s.id, Some("codon".into()));
+        assert_eq!(store.session_phenotype(&s.id).as_deref(), Some("codon"));
+
+        store.set_session_phenotype(&s.id, None);
+        assert!(store.session_phenotype(&s.id).is_none());
+    }
+
+    #[test]
+    fn set_session_phenotype_unknown_session_is_noop() {
+        let store = SessionStore::new();
+        store.set_session_phenotype("nope", Some("codon".into()));
+        assert!(store.session_phenotype("nope").is_none());
+    }
+
+    #[test]
+    fn fork_session_copies_phenotype_binding() {
+        let store = SessionStore::new();
+        let s = store.create_session(None);
+        store.set_session_phenotype(&s.id, Some("codon".into()));
+
+        let forked = store.fork_session(&s.id).unwrap();
+        assert_eq!(forked.phenotype.as_deref(), Some("codon"));
+        // Changing the fork's binding does not touch the source.
+        store.set_session_phenotype(&forked.id, Some("default".into()));
+        assert_eq!(store.session_phenotype(&s.id).as_deref(), Some("codon"));
     }
 }

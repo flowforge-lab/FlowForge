@@ -368,10 +368,18 @@ fn send_message(
     // Snapshot the provider from the current config for this turn; a settings
     // change between turns is picked up on the next `send_message`.
     let (provider, default_model) = state.build_provider();
-    // The active phenotype may override the model and prepend a persona (RFC 0001 §7).
-    let model = state.active_model_override().unwrap_or(default_model);
-    let persona = state.active_persona();
-    let max_iterations = state.active_max_iterations();
+    // Resolve THIS session's phenotype (#246): an explicit per-pane binding, else
+    // the global active one. It supplies the model override, persona, active
+    // skills, and the loop iteration cap for the turn (RFC 0001 §7) — so two panes
+    // can run different Phenos.
+    let pheno = state.session_phenotype(&session_id);
+    let model = pheno.model.clone().unwrap_or(default_model);
+    let persona = pheno.persona.clone();
+    // Per-pane iteration cap (#244-R3 x #246): the resolved phenotype carries
+    // `max_iterations`, so the bound Pheno governs the loop cap with no extra plumbing.
+    let max_iterations = pheno
+        .max_iterations
+        .unwrap_or(ff_agent::DEFAULT_MAX_ITERATIONS);
     tauri::async_runtime::spawn(async move {
         let sid = session_id.clone();
         let approver = UiApprover {
@@ -384,11 +392,14 @@ fn send_message(
         let session_root = state.session_root(&sid);
         let tool_ctx = ToolContext::new(&registry, &session_root, &approver, max_iterations);
         // Skills + ambient context for this turn (RFC 0001 §4, RFC 0002 phase 1):
-        // the active phenotype's persona, installed-skill descriptions, the bodies of
+        // the resolved persona, installed-skill descriptions, the bodies of the
         // active skills, and the current local time.
         let skills = state.skills_snapshot();
         let user_ctx = ff_agent::UserContext::now();
-        let active = state.active_skills();
+        // Active-skill source (#246): an explicit per-pane binding uses the
+        // phenotype's declared skills; an unbound session keeps the global active
+        // set so the command palette still affects turns. See `turn_active_skills`.
+        let active: Vec<String> = state.turn_active_skills(&sid);
         let memory = state.memory().ambient_block();
         let system_prompt = ff_agent::build_system_prompt(
             persona.as_deref(),
@@ -995,6 +1006,20 @@ fn switch_phenotype(
     Ok(pheno)
 }
 
+/// Bind a single session to a phenotype, or clear the binding (`name: None`) so it
+/// inherits the global active one (#246). Unlike `switch_phenotype`, this changes
+/// only the named session's Pheno — other panes are untouched — and persists
+/// nothing globally. Errors on an unknown phenotype name. The FE pane selector
+/// (#245) calls this to make a pane's Pheno truly per-session.
+#[tauri::command]
+fn set_session_phenotype(
+    state: State<'_, Arc<AppState>>,
+    session_id: String,
+    name: Option<String>,
+) -> CmdResult<()> {
+    state.set_session_phenotype(&session_id, name)
+}
+
 // ---- MCP server control (M4.4, RFC 0003 §3,5) ----
 //
 // Enable/disable/add/remove write `mcp.json` via `ff_mcp::config`; the existing config
@@ -1138,6 +1163,7 @@ pub fn run() {
             list_phenotypes,
             get_phenotype,
             switch_phenotype,
+            set_session_phenotype,
             list_mcp_servers,
             restart_mcp_server,
             set_mcp_server_enabled,
