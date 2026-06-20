@@ -11,7 +11,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use ff_core::{Message, Role};
+use ff_core::{Message, Mode, Role};
 use ff_llm::{ChatMessage, ChatRequest, FunctionCall, LlmError, Provider, ToolCall as LlmToolCall};
 use ff_session::SessionStore;
 use ff_tools::{Safety, ToolRegistry};
@@ -165,6 +165,9 @@ pub struct ToolContext<'a> {
     /// When `Some`, the only tool names this (sub-)agent may call or be advertised.
     /// `None` = the full registry. Used to scope a delegated subtask.
     pub allowed: Option<std::collections::HashSet<String>>,
+    /// Agent autonomy mode (RFC 0011). In [`Mode::Plan`] only ReadOnly tools are
+    /// advertised, so the model cannot see or call anything that mutates.
+    pub mode: Mode,
 }
 
 impl<'a> ToolContext<'a> {
@@ -183,6 +186,7 @@ impl<'a> ToolContext<'a> {
             depth: 0,
             max_depth: DEFAULT_MAX_DELEGATION_DEPTH,
             allowed: None,
+            mode: Mode::default(),
         }
     }
 }
@@ -254,6 +258,27 @@ struct CallBuf {
     arguments: String,
 }
 
+/// The set of tool names to advertise to the model this turn.
+///
+/// In [`Mode::Plan`] (RFC 0011) only the registry's ReadOnly tools are advertised so
+/// the model cannot see — let alone call — anything that mutates; this is intersected
+/// with any sub-agent allowlist (fail safe). In Act/Auto the allowlist passes through
+/// unchanged (`None` = full registry).
+fn advertised_tools(
+    mode: Mode,
+    allowed: Option<&std::collections::HashSet<String>>,
+    registry: &ToolRegistry,
+) -> Option<std::collections::HashSet<String>> {
+    if !mode.is_plan() {
+        return allowed.cloned();
+    }
+    let readonly = registry.readonly_tool_names();
+    Some(match allowed {
+        Some(set) => set.intersection(&readonly).cloned().collect(),
+        None => readonly,
+    })
+}
+
 /// Runs one assistant turn for `session_id`, executing any tool calls the model
 /// requests until it produces a plain text answer (or the iteration cap is hit).
 /// `on_event` is called synchronously as the turn progresses. The final assistant
@@ -276,9 +301,10 @@ pub async fn run_turn(
     mut on_event: impl FnMut(AgentEvent),
 ) -> Result<Message, AgentError> {
     let allow_subagent = tools.depth < tools.max_depth;
+    let advertised = advertised_tools(tools.mode, tools.allowed.as_ref(), tools.registry);
     let tool_schemas = tools
         .registry
-        .openai_tools_for(tools.allowed.as_ref(), allow_subagent);
+        .openai_tools_for(advertised.as_ref(), allow_subagent);
     let mut last: Option<Message> = None;
 
     let max_iter = tools.max_iterations.max(1);
@@ -681,6 +707,7 @@ async fn run_subagent(
         depth: parent.depth + 1,
         max_depth: parent.max_depth,
         allowed,
+        mode: parent.mode,
     };
 
     // Child events are swallowed: the parent receives only the summary, never the
@@ -713,6 +740,49 @@ mod tests {
     use async_trait::async_trait;
     use ff_llm::{Chunk, ChunkStream, LlmError, ToolCallDelta};
     use std::sync::atomic::AtomicUsize;
+
+    #[test]
+    fn plan_mode_advertises_only_readonly_tools() {
+        let reg = ToolRegistry::with_defaults();
+        let advertised = advertised_tools(Mode::Plan, None, &reg).expect("Plan restricts");
+        for name in ["view", "grep", "glob", "tree", "todo", "ask_user"] {
+            assert!(advertised.contains(name), "Plan should advertise {name}");
+        }
+        for name in [
+            "bash",
+            "python",
+            "edit",
+            "write",
+            "apply_patch",
+            "web_fetch",
+            "agent",
+        ] {
+            assert!(!advertised.contains(name), "Plan must hide {name}");
+        }
+    }
+
+    #[test]
+    fn plan_mode_intersects_with_subagent_allowlist() {
+        let reg = ToolRegistry::with_defaults();
+        // A sub-agent scoped to {view, edit}: Plan further drops the mutating `edit`.
+        let allowed: std::collections::HashSet<String> =
+            ["view", "edit"].iter().map(|s| s.to_string()).collect();
+        let advertised = advertised_tools(Mode::Plan, Some(&allowed), &reg).unwrap();
+        assert_eq!(advertised, ["view".to_string()].into_iter().collect());
+    }
+
+    #[test]
+    fn act_and_auto_pass_the_allowlist_through_unchanged() {
+        let reg = ToolRegistry::with_defaults();
+        assert_eq!(advertised_tools(Mode::Act, None, &reg), None);
+        assert_eq!(advertised_tools(Mode::Auto, None, &reg), None);
+        let allowed: std::collections::HashSet<String> =
+            ["view", "edit"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(
+            advertised_tools(Mode::Auto, Some(&allowed), &reg),
+            Some(allowed)
+        );
+    }
 
     struct AlwaysApprove;
     #[async_trait]
@@ -1359,7 +1429,7 @@ mod tests {
             timezone: "America/Chicago".into(),
             time_of_day: TimeOfDay::Morning,
         };
-        let system = build_system_prompt(None, &skills, &[], &user, None);
+        let system = build_system_prompt(None, &skills, &[], &user, None, Mode::default());
 
         let store = SessionStore::new();
         let s = store.create_session(None);
@@ -1465,6 +1535,7 @@ mod tests {
             depth: 1,
             max_depth: 1,
             allowed: None,
+            mode: Mode::default(),
         };
 
         run_turn(
@@ -1517,6 +1588,7 @@ mod tests {
             depth: 1,
             max_depth: 1,
             allowed: Some(["view".to_string()].into_iter().collect()),
+            mode: Mode::default(),
         };
 
         run_turn(

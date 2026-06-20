@@ -56,6 +56,14 @@ pub trait Tool: Send + Sync {
     fn safety(&self, _args: &Value) -> Safety {
         Safety::Write
     }
+    /// Worst-case safety this tool can ever reach, independent of arguments. Used to
+    /// decide whether the tool is advertised at all in capability-restricted modes
+    /// (Plan, RFC 0011): only tools whose ceiling is [`Safety::ReadOnly`] are shown.
+    /// Defaults to the same conservative [`Safety::Write`] as [`Tool::safety`];
+    /// tools with dynamic per-call safety (e.g. `bash`) override to their true ceiling.
+    fn max_safety(&self) -> Safety {
+        Safety::Write
+    }
     /// Interactive tools don't execute against the workspace — they pause the turn to
     /// ask the user something and resume with the answer (e.g. `ask_user`, #44). The
     /// agent loop routes them through [`Approver::ask`] instead of [`Tool::run`].
@@ -139,6 +147,18 @@ impl ToolRegistry {
                     }
                 })
             })
+            .collect()
+    }
+
+    /// Names of every tool whose worst-case safety is [`Safety::ReadOnly`]. This is
+    /// the set advertised in Plan mode (RFC 0011): mutating tools are absent from the
+    /// schema entirely, so the model cannot call them. Tools with an unknown/elevated
+    /// ceiling are excluded (fail safe).
+    pub fn readonly_tool_names(&self) -> HashSet<String> {
+        self.tools
+            .values()
+            .filter(|t| t.max_safety() == Safety::ReadOnly)
+            .map(|t| t.name().to_string())
             .collect()
     }
 
@@ -245,6 +265,31 @@ mod tests {
                 Safety::ReadOnly,
                 "{name} should be read-only"
             );
+        }
+    }
+
+    #[test]
+    fn readonly_tool_names_excludes_mutating_and_dynamic_tools() {
+        let reg = ToolRegistry::with_defaults();
+        let ro = reg.readonly_tool_names();
+
+        // Every ReadOnly-ceiling default tool is present.
+        for name in ["view", "grep", "glob", "tree", "todo", "ask_user"] {
+            assert!(ro.contains(name), "{name} should be a read-only tool");
+        }
+        // Mutating tools and dynamically-classified tools (bash) are absent: in Plan
+        // mode they must not even be advertised to the model. web_fetch is Write
+        // (network egress), so it is excluded too.
+        for name in [
+            "bash",
+            "python",
+            "edit",
+            "write",
+            "apply_patch",
+            "web_fetch",
+            "agent",
+        ] {
+            assert!(!ro.contains(name), "{name} must not be a read-only tool");
         }
     }
 

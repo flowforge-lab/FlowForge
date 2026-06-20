@@ -106,6 +106,10 @@ impl Tool for MemorySearchTool {
         Safety::ReadOnly
     }
 
+    fn max_safety(&self) -> Safety {
+        Safety::ReadOnly
+    }
+
     async fn run(&self, args: Value, _root: &Path) -> ToolOutcome {
         if !self.memory.is_enabled() {
             return ToolOutcome::ok("(memory is disabled)");
@@ -180,6 +184,10 @@ impl Tool for MemoryGetTool {
     }
 
     fn safety(&self, _args: &Value) -> Safety {
+        Safety::ReadOnly
+    }
+
+    fn max_safety(&self) -> Safety {
         Safety::ReadOnly
     }
 

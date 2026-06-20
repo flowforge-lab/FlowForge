@@ -66,6 +66,10 @@ impl Tool for TodoTool {
         Safety::ReadOnly
     }
 
+    fn max_safety(&self) -> Safety {
+        Safety::ReadOnly
+    }
+
     async fn run(&self, args: Value, _root: &Path) -> ToolOutcome {
         let Some(items) = args.get("items").and_then(Value::as_array) else {
             return ToolOutcome::error("missing required argument: items (an array)");

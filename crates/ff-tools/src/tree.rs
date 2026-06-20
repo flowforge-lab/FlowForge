@@ -44,6 +44,10 @@ impl Tool for TreeTool {
         Safety::ReadOnly
     }
 
+    fn max_safety(&self) -> Safety {
+        Safety::ReadOnly
+    }
+
     async fn run(&self, args: Value, root: &Path) -> ToolOutcome {
         let rel = args.get("path").and_then(Value::as_str).unwrap_or(".");
         let max_depth = args

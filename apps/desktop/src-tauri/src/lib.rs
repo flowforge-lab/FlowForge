@@ -407,6 +407,7 @@ fn send_message(
             &active,
             &user_ctx,
             memory.as_deref(),
+            ff_core::Mode::default(),
         );
 
         // Telemetry (RFC 0001 §8): one SkillActivated per active skill, plus a

@@ -301,6 +301,7 @@ async fn run(
         &inputs.active,
         &user_ctx,
         memory.as_deref(),
+        ff_core::Mode::default(),
     );
 
     let tool_ctx = ToolContext::new(&registry, &workspace, &approver, inputs.max_iterations);
@@ -442,8 +443,14 @@ async fn chat_repl(
 
         let user_ctx = UserContext::now();
         let memory = memory_store.ambient_block();
-        let system_prompt =
-            ff_agent::build_system_prompt(None, skills, &[], &user_ctx, memory.as_deref());
+        let system_prompt = ff_agent::build_system_prompt(
+            None,
+            skills,
+            &[],
+            &user_ctx,
+            memory.as_deref(),
+            ff_core::Mode::default(),
+        );
 
         let cancel = CancelToken::new();
         let cancel_signal = cancel.clone();

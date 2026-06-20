@@ -52,6 +52,10 @@ impl Tool for GrepTool {
         Safety::ReadOnly
     }
 
+    fn max_safety(&self) -> Safety {
+        Safety::ReadOnly
+    }
+
     async fn run(&self, args: Value, root: &Path) -> ToolOutcome {
         let Some(pattern) = args.get("pattern").and_then(Value::as_str) else {
             return ToolOutcome::error("missing required argument: pattern");
