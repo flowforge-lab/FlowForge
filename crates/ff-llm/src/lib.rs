@@ -93,8 +93,26 @@ pub struct Chunk {
 pub enum LlmError {
     #[error("transport error: {0}")]
     Transport(String),
+    #[error("api error (status {status}): {message}")]
+    Api { status: u16, message: String },
     #[error("decode error: {0}")]
     Decode(String),
+}
+
+impl LlmError {
+    /// Whether the error is worth retrying. Transport blips (connection refused,
+    /// timeout, reset) and overloaded/transient HTTP statuses (408, 429, 5xx) are
+    /// transient; client errors (other 4xx) and decode failures are fatal and must
+    /// surface immediately so the user fixes the request rather than retrying it.
+    pub fn is_transient(&self) -> bool {
+        match self {
+            LlmError::Transport(_) => true,
+            LlmError::Api { status, .. } => {
+                *status == 408 || *status == 429 || (500..=599).contains(status)
+            }
+            LlmError::Decode(_) => false,
+        }
+    }
 }
 
 pub type ChunkStream = BoxStream<'static, Result<Chunk, LlmError>>;
@@ -188,5 +206,35 @@ mod tests {
             provider.polled.load(Ordering::SeqCst) <= 32,
             "warmup drained too many chunks"
         );
+    }
+
+    #[test]
+    fn transient_errors_are_retryable() {
+        assert!(LlmError::Transport("connection refused".into()).is_transient());
+        for status in [408u16, 429, 500, 502, 503, 504] {
+            assert!(
+                LlmError::Api {
+                    status,
+                    message: "x".into()
+                }
+                .is_transient(),
+                "status {status} should be transient"
+            );
+        }
+    }
+
+    #[test]
+    fn client_and_decode_errors_are_fatal() {
+        for status in [400u16, 401, 403, 404, 422] {
+            assert!(
+                !LlmError::Api {
+                    status,
+                    message: "x".into()
+                }
+                .is_transient(),
+                "status {status} should be fatal"
+            );
+        }
+        assert!(!LlmError::Decode("bad json".into()).is_transient());
     }
 }

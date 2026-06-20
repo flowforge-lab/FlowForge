@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use ff_core::{Message, Role};
-use ff_llm::{ChatMessage, ChatRequest, FunctionCall, Provider, ToolCall as LlmToolCall};
+use ff_llm::{ChatMessage, ChatRequest, FunctionCall, LlmError, Provider, ToolCall as LlmToolCall};
 use ff_session::SessionStore;
 use ff_tools::{Safety, ToolRegistry};
 use futures_util::StreamExt;
@@ -37,6 +37,28 @@ pub const DEFAULT_MAX_ITERATIONS: usize = 8;
 /// the loop injects a transient "wrap up" nudge so the model produces a final
 /// answer instead of being cut mid-tool-call (#244 R3).
 const WRAP_UP_AT_REMAINING: usize = 1;
+
+/// A transient provider error (connection blip, 429/5xx) is retried up to this many
+/// total attempts before the turn surfaces the failure (#244 R1). Bounded so a hard
+/// outage fails in seconds rather than spinning.
+const MAX_PROVIDER_ATTEMPTS: usize = 3;
+
+/// Base backoff between provider retries; attempt N waits `BASE << (N-1)` ms
+/// (~250ms, 500ms), capped well under a second so retries stay snappy.
+const RETRY_BACKOFF_BASE_MS: u64 = 250;
+
+/// Sleep `ms`, but wake early (and often) if the turn is cancelled, so a retry
+/// backoff never holds a cancelled turn open. `CancelToken` is a bare flag with no
+/// future to await, so we poll it in small steps.
+async fn cancellable_backoff(cancel: &CancelToken, ms: u64) {
+    const STEP_MS: u64 = 50;
+    let mut elapsed = 0;
+    while elapsed < ms && !cancel.is_cancelled() {
+        let step = STEP_MS.min(ms - elapsed);
+        tokio::time::sleep(std::time::Duration::from_millis(step)).await;
+        elapsed += step;
+    }
+}
 
 /// Events the agent emits during a turn. The host (Tauri shell or a test) decides
 /// how to surface them — over IPC, to a channel, or into assertions.
@@ -291,69 +313,103 @@ pub async fn run_turn(
                 name: None,
             });
         }
-        let req = ChatRequest {
-            model: model.to_string(),
-            messages,
-            tools: tool_schemas.clone(),
-            thinking: enable_reasoning,
-        };
-
         // Reserve the assistant message id up front so the frontend can route tokens.
         let message_id = store
             .add_message(session_id, Role::Assistant, String::new())
             .id;
 
-        let mut stream = match provider.chat_stream(req).await {
-            Ok(s) => s,
-            Err(e) => {
-                on_event(AgentEvent::Error {
-                    message: e.to_string(),
-                });
-                return Err(e.into());
-            }
-        };
-
+        // Bounded retry for transient provider failures (#244 R1). A setup error
+        // (request never started) is always safe to retry. A mid-stream error is
+        // only retried when nothing has been emitted yet this attempt -- once tokens
+        // or tool-call fragments have reached the frontend, replaying would duplicate
+        // them, so we surface the error instead. Fatal errors (auth, 4xx, decode)
+        // never retry.
         let mut acc = String::new();
         let mut calls: BTreeMap<u32, CallBuf> = BTreeMap::new();
-        while let Some(item) = stream.next().await {
-            if cancel.is_cancelled() {
-                break;
-            }
-            match item {
-                Ok(chunk) => {
-                    if enable_reasoning && !chunk.reasoning_delta.is_empty() {
-                        on_event(AgentEvent::Reasoning {
-                            message_id: message_id.clone(),
-                            delta: chunk.reasoning_delta,
-                        });
-                    }
-                    if !chunk.delta.is_empty() {
-                        acc.push_str(&chunk.delta);
-                        on_event(AgentEvent::Token {
-                            message_id: message_id.clone(),
-                            delta: chunk.delta,
-                        });
-                    }
-                    for frag in chunk.tool_calls {
-                        let buf = calls.entry(frag.index).or_default();
-                        if let Some(id) = frag.id {
-                            buf.id = id;
-                        }
-                        if let Some(name) = frag.name {
-                            buf.name = name;
-                        }
-                        buf.arguments.push_str(&frag.arguments);
-                    }
-                    if chunk.done {
-                        break;
-                    }
-                }
+        let mut attempt = 0usize;
+        loop {
+            attempt += 1;
+            acc.clear();
+            calls.clear();
+            let mut emitted_any = false;
+
+            let req = ChatRequest {
+                model: model.to_string(),
+                messages: messages.clone(),
+                tools: tool_schemas.clone(),
+                thinking: enable_reasoning,
+            };
+
+            let mut stream = match provider.chat_stream(req).await {
+                Ok(s) => s,
                 Err(e) => {
+                    if e.is_transient() && attempt < MAX_PROVIDER_ATTEMPTS {
+                        cancellable_backoff(&cancel, RETRY_BACKOFF_BASE_MS << (attempt - 1)).await;
+                        continue;
+                    }
                     on_event(AgentEvent::Error {
                         message: e.to_string(),
                     });
                     return Err(e.into());
                 }
+            };
+
+            let mut stream_err: Option<LlmError> = None;
+            while let Some(item) = stream.next().await {
+                if cancel.is_cancelled() {
+                    break;
+                }
+                match item {
+                    Ok(chunk) => {
+                        if enable_reasoning && !chunk.reasoning_delta.is_empty() {
+                            emitted_any = true;
+                            on_event(AgentEvent::Reasoning {
+                                message_id: message_id.clone(),
+                                delta: chunk.reasoning_delta,
+                            });
+                        }
+                        if !chunk.delta.is_empty() {
+                            emitted_any = true;
+                            acc.push_str(&chunk.delta);
+                            on_event(AgentEvent::Token {
+                                message_id: message_id.clone(),
+                                delta: chunk.delta,
+                            });
+                        }
+                        for frag in chunk.tool_calls {
+                            emitted_any = true;
+                            let buf = calls.entry(frag.index).or_default();
+                            if let Some(id) = frag.id {
+                                buf.id = id;
+                            }
+                            if let Some(name) = frag.name {
+                                buf.name = name;
+                            }
+                            buf.arguments.push_str(&frag.arguments);
+                        }
+                        if chunk.done {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        stream_err = Some(e);
+                        break;
+                    }
+                }
+            }
+
+            match stream_err {
+                Some(e) if e.is_transient() && !emitted_any && attempt < MAX_PROVIDER_ATTEMPTS => {
+                    cancellable_backoff(&cancel, RETRY_BACKOFF_BASE_MS << (attempt - 1)).await;
+                    continue;
+                }
+                Some(e) => {
+                    on_event(AgentEvent::Error {
+                        message: e.to_string(),
+                    });
+                    return Err(e.into());
+                }
+                None => break,
             }
         }
 
@@ -1612,6 +1668,167 @@ mod tests {
             tool_reply.content.contains("not valid JSON"),
             "tool reply should explain the parse failure, got: {}",
             tool_reply.content
+        );
+    }
+
+    // ----- #244 R1: transient-error retry with backoff -----
+
+    /// Returns a transient setup error for the first `fails` calls, then a text turn.
+    struct FlakySetup {
+        fails: usize,
+        calls: Arc<AtomicUsize>,
+    }
+    #[async_trait]
+    impl Provider for FlakySetup {
+        async fn chat_stream(&self, _req: ChatRequest) -> Result<ChunkStream, LlmError> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            if n < self.fails {
+                return Err(LlmError::Transport("connection refused".into()));
+            }
+            let chunks = vec![Ok(Chunk {
+                delta: "recovered".into(),
+                done: true,
+                ..Chunk::default()
+            })];
+            Ok(futures_util::stream::iter(chunks).boxed())
+        }
+    }
+
+    /// Always fails the request setup with a fatal (client) error.
+    struct FatalSetup {
+        calls: Arc<AtomicUsize>,
+    }
+    #[async_trait]
+    impl Provider for FatalSetup {
+        async fn chat_stream(&self, _req: ChatRequest) -> Result<ChunkStream, LlmError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err(LlmError::Api {
+                status: 401,
+                message: "unauthorized".into(),
+            })
+        }
+    }
+
+    /// First call yields a transient error mid-stream; `emit_first` controls whether a
+    /// token is emitted before the error. Later calls return a text turn.
+    struct MidStreamErr {
+        calls: Arc<AtomicUsize>,
+        emit_first: bool,
+    }
+    #[async_trait]
+    impl Provider for MidStreamErr {
+        async fn chat_stream(&self, _req: ChatRequest) -> Result<ChunkStream, LlmError> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            if n == 0 {
+                let mut chunks: Vec<Result<Chunk, LlmError>> = Vec::new();
+                if self.emit_first {
+                    chunks.push(Ok(Chunk {
+                        delta: "partial".into(),
+                        ..Chunk::default()
+                    }));
+                }
+                chunks.push(Err(LlmError::Transport("reset".into())));
+                return Ok(futures_util::stream::iter(chunks).boxed());
+            }
+            let chunks = vec![Ok(Chunk {
+                delta: "recovered".into(),
+                done: true,
+                ..Chunk::default()
+            })];
+            Ok(futures_util::stream::iter(chunks).boxed())
+        }
+    }
+
+    async fn run_text_turn(provider: &dyn Provider) -> (Result<Message, AgentError>, bool) {
+        let store = SessionStore::new();
+        let s = store.create_session(None);
+        store.add_message(&s.id, Role::User, "hi".into());
+        let registry = ToolRegistry::new();
+        let root = std::env::current_dir().unwrap();
+        let approve = AlwaysApprove;
+        let mut errored = false;
+        let res = run_turn(
+            provider,
+            &store,
+            &ctx(&registry, &root, &approve),
+            &s.id,
+            "mock",
+            None,
+            false,
+            CancelToken::new(),
+            |ev| {
+                if let AgentEvent::Error { .. } = ev {
+                    errored = true;
+                }
+            },
+        )
+        .await;
+        (res, errored)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn transient_setup_error_retries_then_succeeds() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = FlakySetup {
+            fails: 2,
+            calls: calls.clone(),
+        };
+        let (res, errored) = run_text_turn(&provider).await;
+        assert_eq!(res.unwrap().content, "recovered");
+        assert!(!errored, "recovered turn should not surface an error");
+        assert_eq!(calls.load(Ordering::SeqCst), 3, "two retries then success");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn fatal_setup_error_surfaces_without_retry() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = FatalSetup {
+            calls: calls.clone(),
+        };
+        let (res, errored) = run_text_turn(&provider).await;
+        assert!(res.is_err(), "fatal error must surface");
+        assert!(errored, "an Error event should fire");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "fatal errors are not retried"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn mid_stream_error_before_emit_retries() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = MidStreamErr {
+            calls: calls.clone(),
+            emit_first: false,
+        };
+        let (res, errored) = run_text_turn(&provider).await;
+        assert_eq!(res.unwrap().content, "recovered");
+        assert!(!errored);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "retried after pre-emit blip"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn mid_stream_error_after_emit_surfaces() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = MidStreamErr {
+            calls: calls.clone(),
+            emit_first: true,
+        };
+        let (res, errored) = run_text_turn(&provider).await;
+        assert!(
+            res.is_err(),
+            "error after streamed output must surface, not replay"
+        );
+        assert!(errored);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "no retry once tokens reached the UI"
         );
     }
 }
