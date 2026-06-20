@@ -5,8 +5,10 @@ installed skills are the latent genes and a phenotype is the expressed set. `cod
 is a programming phenotype: an engineering-discipline persona plus the `codegraph`
 skill as its DNA, so switching to it brings code-aware navigation along.
 
-This directory holds version-controlled copies of the content; FlowForge reads its
-phenotypes and skills from `~/.flowforge/`, so install them as below.
+**FlowForge ships Codon built in.** On first run it seeds `phenos/codon.toml` and
+`skills/codegraph/SKILL.md` into `~/.flowforge/` if they are absent, so the
+phenotype and its skill are present without any manual copy. The files in this
+directory are the single source of truth those seeded copies are bundled from.
 
 ## What's here
 
@@ -14,7 +16,11 @@ phenotypes and skills from `~/.flowforge/`, so install them as below.
   `max_iterations` for long edit/build/test/fix loops.
 - `skills/codegraph/SKILL.md` — the codegraph skill, declaring `mcp: ["codegraph"]`.
 
-## Install
+## Setup
+
+Seeding handles the FlowForge-authored content. You still need codegraph's
+**third-party** binary and its MCP server entry — FlowForge does not (and cannot)
+install those for you.
 
 ### 1. Install codegraph and index your project
 
@@ -42,30 +48,27 @@ FlowForge — wire it up manually in step 2.
 
 The server id `codegraph` must match the `mcp` entry in the skill's frontmatter.
 
-### 3. Install the codegraph skill
-
-Install from this directory (it is copied into `~/.flowforge/skills/`):
-
-```sh
-# via the FlowForge skill installer (desktop Settings → Skills → Install, or CLI)
-install_skill docs/examples/codon/skills/codegraph
-# …or copy it by hand:
-cp -r docs/examples/codon/skills/codegraph ~/.flowforge/skills/codegraph
-```
-
-### 4. Install the phenotype
-
-```sh
-mkdir -p ~/.flowforge/phenos
-cp docs/examples/codon/phenos/codon.toml ~/.flowforge/phenos/codon.toml
-```
-
-### 5. Select it
+### 3. Select it
 
 Pick the **codon** phenotype in the composer's phenotype switcher, or run the CLI
 with `--pheno codon`. On activation FlowForge warns if the `codegraph` server is
 missing from `mcp.json` or not running — the persona still loads and grep/glob
 fallbacks work, but codegraph's tools won't be available until you complete step 2.
+
+## Customizing
+
+The seed never clobbers an existing file, so you can edit your copies freely:
+
+- Tune the persona or bump `max_iterations` in `~/.flowforge/phenos/codon.toml`.
+- Author your own variant by copying these files under a new name:
+
+  ```sh
+  cp docs/examples/codon/phenos/codon.toml ~/.flowforge/phenos/my-codon.toml
+  cp -r docs/examples/codon/skills/codegraph ~/.flowforge/skills/codegraph
+  ```
+
+Deleting a seeded file makes it reappear on the next launch (seed-if-absent); a
+permanent removal is part of the Phase 2 follow-up below.
 
 ## Notes
 
@@ -74,3 +77,7 @@ fallbacks work, but codegraph's tools won't be available until you complete step
 - FlowForge currently *requires* the codegraph server to be present (require +
   warn); it does not inject it into `mcp.json` on activation. Auto-injection
   ("zero-step DNA") is a tracked follow-up.
+- **Bundling.** Phase 1 (seeded on first run, write-if-absent) ships today. Phase 2
+  — compiling Codon in as a true built-in that survives deletion or a read-only
+  home, like the `default` phenotype — is tracked in
+  [#306](https://github.com/flowforge-lab/FlowForge/issues/306).
