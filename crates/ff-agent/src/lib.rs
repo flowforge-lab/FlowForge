@@ -69,6 +69,12 @@ const REPEAT_NUDGE_AT: usize = 3;
 /// turn with a clear notice rather than spinning to the iteration cap.
 const REPEAT_BREAK_AT: usize = 5;
 
+/// Once a session is over the context-pressure threshold, re-run the memory flush
+/// again only after the transcript has grown by this many messages, so a long
+/// over-budget conversation flushes periodically rather than every single turn
+/// (#244 R5). Passed to [`flush_due`] as its re-flush interval.
+const DEFAULT_REFLUSH_INTERVAL_MESSAGES: u64 = 8;
+
 /// Tool results are appended verbatim to the session history and replayed on the
 /// next request, so one oversized result (a big file read, a long command dump) can
 /// dominate the context budget on its own. Cap what is *persisted to history* at
@@ -353,6 +359,10 @@ pub async fn run_turn(
     let mut call_counts: HashMap<(String, String), usize> = HashMap::new();
     let mut repeat_nudge: Option<String> = None;
     let mut stop_reason: Option<String> = None;
+    // Context-pressure flush bookkeeping (#244 R5): the transcript length at the last
+    // flush, so we re-flush on growth rather than every iteration. `None` = never
+    // flushed this turn.
+    let mut last_flush_count: Option<u64> = None;
     for iter in 0..max_iter {
         turn_count += 1;
         if cancel.is_cancelled() {
@@ -360,6 +370,40 @@ pub async fn run_turn(
         }
 
         let history = store.get_messages(session_id);
+        // Context-pressure flush (#244 R5): before sending this iteration's request,
+        // estimate how full the context is and, once over the budget fraction, run a
+        // silent memory flush so durable facts are persisted before any future
+        // compaction summarizes them away. The flush snapshots the transcript
+        // read-only and writes only to on-disk memory -- it never mutates this
+        // session's messages, so `messages` below is unaffected. Best-effort: a flush
+        // failure must not abort the user's turn.
+        let message_count = history.len() as u64;
+        let pressure = ProxyTokenEstimator::default().assess(&history, model);
+        if !cancel.is_cancelled()
+            && flush_due(
+                pressure,
+                message_count,
+                last_flush_count,
+                DEFAULT_FLUSH_AT_FRACTION,
+                DEFAULT_REFLUSH_INTERVAL_MESSAGES,
+            )
+        {
+            let _ = MemoryFlush
+                .compact(CompactionContext {
+                    provider,
+                    store,
+                    registry: tools.registry,
+                    root: tools.root,
+                    session_id,
+                    model,
+                    cancel: cancel.clone(),
+                })
+                .await;
+            // Record the attempt regardless of outcome so a no-op or failing flush
+            // does not re-fire every iteration.
+            last_flush_count = Some(message_count);
+        }
+
         let mut messages = Vec::new();
         if let Some(system) = system_prompt {
             // Transient: the system prompt is injected into the request only, never
@@ -2600,5 +2644,111 @@ mod tests {
             tool_msg.content.contains("truncated"),
             "history result should carry the truncation marker"
         );
+    }
+
+    // ----- #244 R5: in-turn context-pressure flush -----
+
+    /// Always returns the same short text turn, counting how many times it is hit.
+    /// Used to observe whether a flush fired (the flush issues an extra provider
+    /// call before the main turn).
+    struct CountingText {
+        calls: Arc<AtomicUsize>,
+    }
+    #[async_trait]
+    impl Provider for CountingText {
+        async fn chat_stream(&self, _req: ChatRequest) -> Result<ChunkStream, LlmError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(futures_util::stream::iter(vec![Ok(Chunk {
+                delta: "ok".into(),
+                done: true,
+                ..Chunk::default()
+            })])
+            .boxed())
+        }
+    }
+
+    #[tokio::test]
+    async fn context_pressure_under_budget_skips_flush() {
+        let store = SessionStore::new();
+        let s = store.create_session(None);
+        store.add_message(&s.id, Role::User, "hi".into());
+        let registry = ToolRegistry::new();
+        let root = std::env::current_dir().unwrap();
+        let approve = AlwaysApprove;
+        let calls = Arc::new(AtomicUsize::new(0));
+
+        run_turn(
+            &CountingText {
+                calls: calls.clone(),
+            },
+            &store,
+            &ctx(&registry, &root, &approve),
+            &s.id,
+            "mock",
+            None,
+            false,
+            CancelToken::new(),
+            |_| {},
+        )
+        .await
+        .unwrap();
+
+        // A tiny transcript is well under the budget fraction -> no flush, so the
+        // provider is hit exactly once (the main turn).
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "under-budget turn must not trigger a flush"
+        );
+    }
+
+    #[tokio::test]
+    async fn context_pressure_over_budget_triggers_flush() {
+        let store = SessionStore::new();
+        let s = store.create_session(None);
+        // Push the proxy estimate (chars/4) over 0.75 * DEFAULT_CONTEXT_BUDGET_TOKENS:
+        // 0.75 * 24_000 = 18_000 tokens -> 72_000 chars. 100k chars clears it.
+        let huge = "x".repeat(100_000);
+        store.add_message(&s.id, Role::User, huge);
+        let registry = ToolRegistry::new();
+        let root = std::env::current_dir().unwrap();
+        let approve = AlwaysApprove;
+        let calls = Arc::new(AtomicUsize::new(0));
+
+        // Sanity: the seeded transcript really is over budget.
+        let pressure = ProxyTokenEstimator::default().assess(&store.get_messages(&s.id), "mock");
+        assert!(
+            pressure.is_over(DEFAULT_FLUSH_AT_FRACTION),
+            "test precondition: transcript must exceed the flush threshold"
+        );
+
+        run_turn(
+            &CountingText {
+                calls: calls.clone(),
+            },
+            &store,
+            &ctx(&registry, &root, &approve),
+            &s.id,
+            "mock",
+            None,
+            false,
+            CancelToken::new(),
+            |_| {},
+        )
+        .await
+        .unwrap();
+
+        // Over budget on the first iteration -> a silent flush fires (one extra
+        // provider call that returns no tool calls -> NoReply) before the main turn.
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "over-budget turn must run exactly one flush before the main turn"
+        );
+        // The flush is silent: it must not add any message to the visible transcript
+        // (memory writes go to disk, not the session). Still just the one user msg
+        // plus the single assistant reply from the main turn.
+        let history = store.get_messages(&s.id);
+        assert_eq!(history.len(), 2, "flush must not mutate the transcript");
     }
 }
