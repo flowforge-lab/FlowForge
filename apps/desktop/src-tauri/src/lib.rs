@@ -503,7 +503,11 @@ fn send_message(
                         },
                     );
                 }
-                AgentEvent::Done { message_id, .. } => {
+                AgentEvent::Done {
+                    message_id,
+                    token_count,
+                    ..
+                } => {
                     if let Ok(mut m) = metrics_for_events.lock() {
                         m.note_turn(&message_id);
                     }
@@ -512,6 +516,7 @@ fn send_message(
                         TurnDoneEvent {
                             session_id: sid.clone(),
                             message_id,
+                            token_count,
                         },
                     );
                 }

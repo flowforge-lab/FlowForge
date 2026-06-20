@@ -82,6 +82,10 @@ interface ChatState {
   toolStepsByMessage: Record<string, ToolStep[]>;
   /** assistant messageId -> accumulated reasoning text (not persisted on Message). */
   reasoningByMessage: Record<string, string>;
+  /** sessionId -> estimated context token count from the last completed turn
+   *  (#244 R6). Populated from TurnDoneEvent.tokenCount; drives a context-usage
+   *  indicator. Undefined until the first turn completes with an estimate. */
+  contextTokensBySession: Record<string, number>;
   /** Frontend-only custom titles (Session has no title field in the contract). */
   sessionTitles: Record<string, string>;
   /** FE mirror of the backend's "Allow this session" sets, keyed by sessionId
@@ -236,6 +240,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   turnStartByMessage: {},
   toolStepsByMessage: {},
   reasoningByMessage: {},
+  contextTokensBySession: {},
   sessionTitles: loadTitles(),
   sessionApprovedBySession: {},
   alwaysApproved: new Set<string>(),
@@ -573,6 +578,13 @@ export const useChatStore = create<ChatState>((set, get) => ({
       sessions: s.sessions.map((sess) =>
         sess.id === e.sessionId ? { ...sess, updatedAt: Date.now() } : sess,
       ),
+      // Record the backend's context-usage estimate so the FE can surface it
+      // (#244 R6). Only overwrite when an estimate is present — a Done without
+      // a count must not clobber the prior value.
+      contextTokensBySession:
+        e.tokenCount != null
+          ? { ...s.contextTokensBySession, [e.sessionId]: e.tokenCount }
+          : s.contextTokensBySession,
     }));
   },
 
