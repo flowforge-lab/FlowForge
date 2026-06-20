@@ -742,6 +742,19 @@ async fn list_models(
     Ok(provider.list_models().await.unwrap_or_default())
 }
 
+/// Probe a connection for the settings "Test Connection" button. `id` defaults to
+/// the active connection. Returns `Ok(())` on a successful round-trip, or an
+/// `Err(String)` message the UI can show. Unlike `list_models`, the error is
+/// surfaced (the button reports failure) rather than swallowed.
+#[tauri::command]
+async fn test_connection(state: State<'_, Arc<AppState>>, id: Option<String>) -> CmdResult<()> {
+    let (provider, model) = state.build_provider_for(id.as_deref());
+    provider
+        .test_connection(&model)
+        .await
+        .map_err(|e| e.to_string())
+}
+
 /// Wake the configured model server so its GPU/compute pipelines are hot before
 /// the user's first message. The composer fires this (debounced) when it gains
 /// focus. Fully best-effort: any failure (server down, busy) is swallowed so
@@ -1235,6 +1248,7 @@ pub fn run() {
             get_search_config,
             set_search_config,
             list_models,
+            test_connection,
             warmup,
             install_skill,
             uninstall_skill,
