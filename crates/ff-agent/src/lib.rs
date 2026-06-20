@@ -514,11 +514,19 @@ pub async fn run_turn(
                 last = Some(finalized);
                 break;
             }
+            // Approximate context size at completion so the frontend can show a
+            // token gauge (#244 R6). The proxy estimator (chars/4) is intentionally
+            // coarse; per-model tokenizers plug in via ContextPressureEstimator later.
+            let token_count = Some(
+                ProxyTokenEstimator::default()
+                    .assess(&store.get_messages(session_id), model)
+                    .estimated_tokens as u32,
+            );
             on_event(AgentEvent::Done {
                 message_id: message_id.clone(),
                 final_message: Some(final_text),
                 turns: Some(turn_count),
-                token_count: None,
+                token_count,
             });
             return Ok(finalized);
         }
@@ -691,11 +699,17 @@ pub async fn run_turn(
         };
         msg = store.set_message_content(&msg.id, session_id, notice);
     }
+    // Same context-size estimate as the plain-text completion path (#244 R6).
+    let token_count = Some(
+        ProxyTokenEstimator::default()
+            .assess(&store.get_messages(session_id), model)
+            .estimated_tokens as u32,
+    );
     on_event(AgentEvent::Done {
         message_id: msg.id.clone(),
         final_message: Some(msg.content.clone()),
         turns: Some(turn_count),
-        token_count: None,
+        token_count,
     });
     Ok(msg)
 }
@@ -2369,5 +2383,40 @@ mod tests {
             &[false, false, false, true, true],
             "{seen:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn done_event_reports_estimated_token_count() {
+        let store = SessionStore::new();
+        let s = store.create_session(None);
+        store.add_message(&s.id, Role::User, "hi".into());
+        let registry = ToolRegistry::new();
+        let root = std::env::current_dir().unwrap();
+        let approve = AlwaysApprove;
+
+        let seen = std::sync::Mutex::new(None);
+        run_turn(
+            &TextProvider,
+            &store,
+            &ctx(&registry, &root, &approve),
+            &s.id,
+            "mock",
+            None,
+            false,
+            CancelToken::new(),
+            |ev| {
+                if let AgentEvent::Done { token_count, .. } = ev {
+                    *seen.lock().unwrap() = Some(token_count);
+                }
+            },
+        )
+        .await
+        .unwrap();
+
+        // The Done event must carry a populated, non-zero estimate (#244 R6) rather
+        // than the previous hardcoded None.
+        let tc = seen.lock().unwrap().expect("Done event was emitted");
+        let tc = tc.expect("token_count must be populated, not None");
+        assert!(tc > 0, "estimated token count should be positive, got {tc}");
     }
 }
