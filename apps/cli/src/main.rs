@@ -280,12 +280,7 @@ async fn run(
         memory.as_deref(),
     );
 
-    let tool_ctx = ToolContext {
-        registry: &registry,
-        root: &workspace,
-        approve: &approver,
-        max_iterations: 8,
-    };
+    let tool_ctx = ToolContext::new(&registry, &workspace, &approver, 8);
 
     let cancel = CancelToken::new();
     // Ctrl-C cancels the turn cooperatively. `ctrl_c()` is portable across Unix and
@@ -349,12 +344,7 @@ async fn chat(json: bool, approval_mode: ApprovalMode) -> ExitCode {
     let approver = CliApprover::new(approval_mode);
     let session = store.create_session(None);
 
-    let tool_ctx = ToolContext {
-        registry: &registry,
-        root: &workspace,
-        approve: &approver,
-        max_iterations: 8,
-    };
+    let tool_ctx = ToolContext::new(&registry, &workspace, &approver, 8);
 
     let stdin = std::io::stdin();
     chat_repl(
@@ -639,12 +629,7 @@ mod tests {
         let registry = ToolRegistry::new();
         let root = std::env::current_dir().unwrap();
         let approver = TestApprover;
-        let tool_ctx = ToolContext {
-            registry: &registry,
-            root: &root,
-            approve: &approver,
-            max_iterations: 8,
-        };
+        let tool_ctx = ToolContext::new(&registry, &root, &approver, 8);
 
         let mut stdout = Vec::new();
         let msg = run_turn(
@@ -724,12 +709,7 @@ mod tests {
         let registry = ToolRegistry::new();
         let root = std::env::current_dir().unwrap();
         let approver = TestApprover;
-        let tool_ctx = ToolContext {
-            registry: &registry,
-            root: &root,
-            approve: &approver,
-            max_iterations: 8,
-        };
+        let tool_ctx = ToolContext::new(&registry, &root, &approver, 8);
 
         let memory_store = Arc::new(Memory::with_default_root(MemoryConfig::default()));
         let skills = SkillRegistry::new();
@@ -796,12 +776,7 @@ mod tests {
         let registry = ToolRegistry::new();
         let root = std::env::current_dir().unwrap();
         let approver = TestApprover;
-        let tool_ctx = ToolContext {
-            registry: &registry,
-            root: &root,
-            approve: &approver,
-            max_iterations: 8,
-        };
+        let tool_ctx = ToolContext::new(&registry, &root, &approver, 8);
 
         let memory_store = Arc::new(Memory::with_default_root(MemoryConfig::default()));
         let skills = SkillRegistry::new();
@@ -835,12 +810,7 @@ mod tests {
         let registry = ToolRegistry::new();
         let root = std::env::current_dir().unwrap();
         let approver = TestApprover;
-        let tool_ctx = ToolContext {
-            registry: &registry,
-            root: &root,
-            approve: &approver,
-            max_iterations: 8,
-        };
+        let tool_ctx = ToolContext::new(&registry, &root, &approver, 8);
 
         let memory_store = Arc::new(Memory::with_default_root(MemoryConfig::default()));
         let skills = SkillRegistry::new();

@@ -104,6 +104,11 @@ pub trait Approver: Send + Sync {
     }
 }
 
+/// Default cap on sub-agent delegation depth (#234): a top-level agent may spawn
+/// children, but those children may not spawn further sub-agents. Prevents an
+/// unbounded sub-agent tree.
+pub const DEFAULT_MAX_DELEGATION_DEPTH: usize = 1;
+
 /// Everything the loop needs to dispatch tools.
 pub struct ToolContext<'a> {
     pub registry: &'a ToolRegistry,
@@ -111,6 +116,33 @@ pub struct ToolContext<'a> {
     pub root: &'a Path,
     pub approve: &'a dyn Approver,
     pub max_iterations: usize,
+    /// Current delegation depth: 0 at the top level, +1 per nested sub-agent (#234).
+    pub depth: usize,
+    /// Depth at which sub-agent spawning is refused.
+    pub max_depth: usize,
+    /// When `Some`, the only tool names this (sub-)agent may call or be advertised.
+    /// `None` = the full registry. Used to scope a delegated subtask.
+    pub allowed: Option<std::collections::HashSet<String>>,
+}
+
+impl<'a> ToolContext<'a> {
+    /// A top-level context: full toolset, no delegation parent, default depth cap.
+    pub fn new(
+        registry: &'a ToolRegistry,
+        root: &'a Path,
+        approve: &'a dyn Approver,
+        max_iterations: usize,
+    ) -> Self {
+        Self {
+            registry,
+            root,
+            approve,
+            max_iterations,
+            depth: 0,
+            max_depth: DEFAULT_MAX_DELEGATION_DEPTH,
+            allowed: None,
+        }
+    }
 }
 
 /// Cooperative cancellation flag, shared between a running turn and `cancel`.
@@ -201,7 +233,10 @@ pub async fn run_turn(
     cancel: CancelToken,
     mut on_event: impl FnMut(AgentEvent),
 ) -> Result<Message, AgentError> {
-    let tool_schemas = tools.registry.openai_tools();
+    let allow_subagent = tools.depth < tools.max_depth;
+    let tool_schemas = tools
+        .registry
+        .openai_tools_for(tools.allowed.as_ref(), allow_subagent);
     let mut last: Option<Message> = None;
 
     let mut turn_count: u32 = 0;
@@ -336,11 +371,34 @@ pub async fn run_turn(
             // tool result. A dismissed/cancelled question yields a result too, so the
             // assistant `tool_calls` message always has a matching reply (no malformed
             // history). Asking is read-only, so it never reaches the approval gate.
+            let permitted = tools
+                .allowed
+                .as_ref()
+                .is_none_or(|set| set.contains(&call.name));
             let outcome = if tools.registry.is_interactive(&call.name) {
                 match tools.approve.ask(&message_id, &call.id, &args).await {
                     Some(answer) => ff_tools::ToolOutcome::ok(answer),
                     None => ff_tools::ToolOutcome::error("[no answer: question dismissed]"),
                 }
+            } else if !permitted {
+                ff_tools::ToolOutcome::error(format!(
+                    "tool `{}` is not permitted for this sub-agent",
+                    call.name
+                ))
+            } else if ff_tools::is_subagent(&call.name) {
+                // Delegation (#234): drive a child turn in a fresh ephemeral session and
+                // return only its summary. The child reuses the same provider/approver,
+                // so its tool calls hit the identical approval gate (no escalation).
+                run_subagent(
+                    provider,
+                    store,
+                    tools,
+                    model,
+                    system_prompt,
+                    cancel.clone(),
+                    &args,
+                )
+                .await
             } else {
                 let safety = tools.registry.safety(&call.name, &args);
                 let approved = safety == Safety::ReadOnly
@@ -404,6 +462,89 @@ pub async fn run_turn(
         token_count: None,
     });
     Ok(msg)
+}
+
+/// Spawns a scoped child agent for an `agent` tool call (#234): a fresh ephemeral
+/// session seeded with the `task`, run to completion against the same workspace and
+/// approver, returning only the child's final message as the tool result. The child
+/// session is deleted afterward — the parent never inherits its transcript.
+#[allow(clippy::too_many_arguments)]
+async fn run_subagent(
+    provider: &dyn Provider,
+    store: &SessionStore,
+    parent: &ToolContext<'_>,
+    model: &str,
+    system_prompt: Option<&str>,
+    cancel: CancelToken,
+    args: &serde_json::Value,
+) -> ff_tools::ToolOutcome {
+    if parent.depth >= parent.max_depth {
+        return ff_tools::ToolOutcome::error(
+            "sub-agents cannot spawn further sub-agents (max delegation depth reached)",
+        );
+    }
+
+    let task = match args.get("task").and_then(|v| v.as_str()) {
+        Some(t) if !t.trim().is_empty() => t.to_string(),
+        _ => {
+            return ff_tools::ToolOutcome::error(
+                "agent: `task` is required and must be a non-empty string",
+            )
+        }
+    };
+
+    // Clamp the child's iteration budget to a safe ceiling.
+    const SUBAGENT_ITER_CAP: usize = 16;
+    let max_iterations = args
+        .get("max_iterations")
+        .and_then(|v| v.as_u64())
+        .map(|n| (n as usize).clamp(1, SUBAGENT_ITER_CAP))
+        .unwrap_or(SUBAGENT_ITER_CAP);
+
+    // Optional tool allowlist for the subtask (e.g. a read-only audit).
+    let allowed: Option<std::collections::HashSet<String>> =
+        args.get("tools").and_then(|v| v.as_array()).map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str())
+                .map(|s| s.to_string())
+                .collect()
+        });
+
+    let child = store.create_session(Some(task.clone()));
+    store.add_message(&child.id, Role::User, task);
+
+    let child_ctx = ToolContext {
+        registry: parent.registry,
+        root: parent.root,
+        approve: parent.approve,
+        max_iterations,
+        depth: parent.depth + 1,
+        max_depth: parent.max_depth,
+        allowed,
+    };
+
+    // Child events are swallowed: the parent receives only the summary, never the
+    // child's token/tool stream — the whole point of fresh-context delegation.
+    let result = Box::pin(run_turn(
+        provider,
+        store,
+        &child_ctx,
+        &child.id,
+        model,
+        system_prompt,
+        false,
+        cancel,
+        |_event| {},
+    ))
+    .await;
+
+    store.delete_session(&child.id);
+
+    match result {
+        Ok(msg) if !msg.content.trim().is_empty() => ff_tools::ToolOutcome::ok(msg.content),
+        Ok(_) => ff_tools::ToolOutcome::ok("[sub-agent finished without a summary]"),
+        Err(e) => ff_tools::ToolOutcome::error(format!("sub-agent failed: {e}")),
+    }
 }
 
 #[cfg(test)]
@@ -482,12 +623,7 @@ mod tests {
         root: &'a Path,
         approve: &'a dyn Approver,
     ) -> ToolContext<'a> {
-        ToolContext {
-            registry,
-            root,
-            approve,
-            max_iterations: 8,
-        }
+        ToolContext::new(registry, root, approve, 8)
     }
 
     struct TextProvider;
@@ -567,6 +703,43 @@ mod tests {
                     done: true,
                     ..Chunk::default()
                 })]
+            };
+            Ok(futures_util::stream::iter(chunks).boxed())
+        }
+    }
+
+    /// First call requests an `agent` (sub-agent) call; the child's call returns a
+    /// summary; the parent's final call returns plain text. One shared counter drives
+    /// parent and child turns through the same provider instance.
+    struct AgentThenText {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl Provider for AgentThenText {
+        async fn chat_stream(&self, _req: ChatRequest) -> Result<ChunkStream, LlmError> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            let chunks = match n {
+                0 => vec![Ok(Chunk {
+                    tool_calls: vec![ToolCallDelta {
+                        index: 0,
+                        id: Some("agent_1".into()),
+                        name: Some("agent".into()),
+                        arguments: r#"{"task":"audit the foo module"}"#.into(),
+                    }],
+                    done: true,
+                    ..Chunk::default()
+                })],
+                1 => vec![Ok(Chunk {
+                    delta: "child: audit complete, 0 issues".into(),
+                    done: true,
+                    ..Chunk::default()
+                })],
+                _ => vec![Ok(Chunk {
+                    delta: "parent: delegated and done".into(),
+                    done: true,
+                    ..Chunk::default()
+                })],
             };
             Ok(futures_util::stream::iter(chunks).boxed())
         }
@@ -1065,5 +1238,149 @@ mod tests {
         assert_eq!(history.len(), 2);
         assert_eq!(history[0].role, Role::User);
         assert_eq!(history[1].role, Role::Assistant);
+    }
+
+    #[tokio::test]
+    async fn subagent_delegates_and_returns_summary() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::new();
+        let s = store.create_session(None);
+        store.add_message(&s.id, Role::User, "delegate an audit".into());
+        let registry = ToolRegistry::with_defaults();
+        let root = dir.path().to_path_buf();
+        let approve = AlwaysApprove;
+        let provider = AgentThenText {
+            calls: AtomicUsize::new(0),
+        };
+
+        let msg = run_turn(
+            &provider,
+            &store,
+            &ctx(&registry, &root, &approve),
+            &s.id,
+            "mock",
+            None,
+            false,
+            CancelToken::new(),
+            |_| {},
+        )
+        .await
+        .unwrap();
+
+        // Parent finished with its own answer, having delegated mid-turn.
+        assert_eq!(msg.content, "parent: delegated and done");
+
+        // The child's summary came back as the parent's tool result.
+        let history = store.get_messages(&s.id);
+        let tool_result = history
+            .iter()
+            .find(|m| m.role == Role::Tool)
+            .expect("parent should have a tool result for the agent call");
+        assert_eq!(tool_result.content, "child: audit complete, 0 issues");
+
+        // The ephemeral child session was deleted — only the parent remains.
+        assert_eq!(store.list_sessions().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn subagent_depth_guard_refuses_nested_spawn() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::new();
+        let s = store.create_session(None);
+        store.add_message(&s.id, Role::User, "try to delegate from a child".into());
+        let registry = ToolRegistry::with_defaults();
+        let root = dir.path().to_path_buf();
+        let approve = AlwaysApprove;
+        let provider = AgentThenText {
+            calls: AtomicUsize::new(0),
+        };
+
+        // Simulate an agent already at the depth cap.
+        let at_cap = ToolContext {
+            registry: &registry,
+            root: &root,
+            approve: &approve,
+            max_iterations: 8,
+            depth: 1,
+            max_depth: 1,
+            allowed: None,
+        };
+
+        run_turn(
+            &provider,
+            &store,
+            &at_cap,
+            &s.id,
+            "mock",
+            None,
+            false,
+            CancelToken::new(),
+            |_| {},
+        )
+        .await
+        .unwrap();
+
+        let history = store.get_messages(&s.id);
+        let tool_result = history
+            .iter()
+            .find(|m| m.role == Role::Tool)
+            .expect("the refused spawn still produces a tool result");
+        assert!(
+            tool_result.content.contains("max delegation depth"),
+            "{}",
+            tool_result.content
+        );
+        // No child session was ever created.
+        assert_eq!(store.list_sessions().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn subagent_allowlist_blocks_disallowed_tool() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::new();
+        let s = store.create_session(None);
+        store.add_message(&s.id, Role::User, "scoped read-only run".into());
+        let registry = ToolRegistry::with_defaults();
+        let root = dir.path().to_path_buf();
+        let approve = AlwaysApprove;
+        let provider = ToolThenText {
+            calls: AtomicUsize::new(0),
+        };
+
+        // A sub-agent scoped to read-only tools tries to call `bash`.
+        let scoped = ToolContext {
+            registry: &registry,
+            root: &root,
+            approve: &approve,
+            max_iterations: 8,
+            depth: 1,
+            max_depth: 1,
+            allowed: Some(["view".to_string()].into_iter().collect()),
+        };
+
+        run_turn(
+            &provider,
+            &store,
+            &scoped,
+            &s.id,
+            "mock",
+            None,
+            false,
+            CancelToken::new(),
+            |_| {},
+        )
+        .await
+        .unwrap();
+
+        let history = store.get_messages(&s.id);
+        let tool_result = history
+            .iter()
+            .find(|m| m.role == Role::Tool)
+            .expect("the disallowed call still produces a tool result");
+        assert!(
+            tool_result.content.contains("not permitted"),
+            "{}",
+            tool_result.content
+        );
     }
 }

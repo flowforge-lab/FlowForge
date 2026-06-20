@@ -1,6 +1,6 @@
 //! The tool abstraction and the registry the agent loop dispatches through.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use async_trait::async_trait;
@@ -96,6 +96,7 @@ impl ToolRegistry {
         r.register(Box::new(crate::todo::TodoTool));
         r.register(Box::new(crate::web_fetch::WebFetchTool::new()));
         r.register(Box::new(crate::ask_user::AskUserTool));
+        r.register(Box::new(crate::agent_tool::AgentTool));
         r
     }
 
@@ -113,8 +114,21 @@ impl ToolRegistry {
 
     /// All tools as OpenAI `tools` request entries.
     pub fn openai_tools(&self) -> Vec<Value> {
+        self.openai_tools_for(None, true)
+    }
+
+    /// OpenAI `tools` entries, optionally restricted to a sub-agent's allowlist and
+    /// with the `agent` delegation tool suppressed once the depth cap is reached
+    /// (so a sub-agent at max depth is never even offered a spawn it cannot make).
+    pub fn openai_tools_for(
+        &self,
+        allowed: Option<&HashSet<String>>,
+        allow_subagent: bool,
+    ) -> Vec<Value> {
         self.tools
             .values()
+            .filter(|t| allowed.is_none_or(|set| set.contains(t.name())))
+            .filter(|t| allow_subagent || !is_subagent(t.name()))
             .map(|t| {
                 serde_json::json!({
                     "type": "function",
@@ -153,6 +167,12 @@ impl ToolRegistry {
     }
 }
 
+/// Whether `name` is the `agent` delegation tool the loop intercepts to spawn a
+/// scoped sub-agent (#234) rather than dispatching through [`Tool::run`].
+pub fn is_subagent(name: &str) -> bool {
+    name == crate::agent_tool::AGENT_TOOL_NAME
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -169,7 +189,7 @@ mod tests {
     fn advertises_default_schemas() {
         let reg = ToolRegistry::with_defaults();
         let tools = reg.openai_tools();
-        assert_eq!(tools.len(), 12);
+        assert_eq!(tools.len(), 13);
         let names: Vec<_> = tools
             .iter()
             .map(|t| t["function"]["name"].as_str().unwrap())
@@ -187,9 +207,33 @@ mod tests {
             "todo",
             "web_fetch",
             "ask_user",
+            "agent",
         ] {
             assert!(names.contains(&expected), "missing tool: {expected}");
         }
+    }
+
+    #[test]
+    fn openai_tools_for_honors_allowlist_and_depth() {
+        let reg = ToolRegistry::with_defaults();
+
+        let allowed: HashSet<String> = ["view", "grep"].iter().map(|s| s.to_string()).collect();
+        let restricted = reg.openai_tools_for(Some(&allowed), true);
+        let names: Vec<_> = restricted
+            .iter()
+            .map(|t| t["function"]["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names.len(), 2);
+        assert!(names.contains(&"view") && names.contains(&"grep"));
+
+        // At the depth cap the delegation tool is not advertised at all.
+        let no_subagent = reg.openai_tools_for(None, false);
+        let names: Vec<_> = no_subagent
+            .iter()
+            .map(|t| t["function"]["name"].as_str().unwrap())
+            .collect();
+        assert!(!names.contains(&"agent"));
+        assert_eq!(no_subagent.len(), 12);
     }
 
     #[test]
