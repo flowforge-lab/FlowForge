@@ -25,6 +25,8 @@ export function StepGroup({
   reasoning,
   hasAnswer,
   onRespond,
+  onApproveSession,
+  onApproveAlways,
   onAnswer,
 }: {
   steps: ToolStep[];
@@ -35,6 +37,8 @@ export function StepGroup({
   reasoning?: string;
   hasAnswer?: boolean;
   onRespond: (callId: string, approved: boolean) => void;
+  onApproveSession: (callId: string, tool: string) => void;
+  onApproveAlways: (callId: string, tool: string) => void;
   onAnswer?: (callId: string, answer: string) => void;
 }) {
   const awaiting = steps.some(
@@ -118,6 +122,8 @@ export function StepGroup({
               key={step.callId}
               step={step}
               onRespond={onRespond}
+              onApproveSession={onApproveSession}
+              onApproveAlways={onApproveAlways}
               onAnswer={onAnswer}
             />
           ))}

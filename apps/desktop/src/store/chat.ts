@@ -36,6 +36,12 @@ export interface ToolStep {
   safety?: ApprovalSafety;
   /** Set when status is "awaiting-answer" — the `ask_user` question (#44). */
   question?: string;
+  /** Approved via "Allow this session" (#229) — renders the amber "session" badge.
+   *  Set on the resolving step and pre-set on later auto-approved calls of the
+   *  same tool (the backend short-circuits those with no approval event). */
+  sessionApproved?: boolean;
+  /** Approved via "Always allow" (#229) — renders the emerald "always" badge. */
+  alwaysApproved?: boolean;
   result?: string;
   /** Wall-clock epoch ms when the tool:call arrived. Frontend-set — the backend
    *  contract carries no timing (Issue #17); used only to derive a turn's total
@@ -78,6 +84,13 @@ interface ChatState {
   reasoningByMessage: Record<string, string>;
   /** Frontend-only custom titles (Session has no title field in the contract). */
   sessionTitles: Record<string, string>;
+  /** FE mirror of the backend's "Allow this session" sets, keyed by sessionId
+   *  (#229). Drives the "session" badge on auto-approved follow-up calls; the
+   *  backend stays the source of truth for the gate itself. */
+  sessionApprovedBySession: Record<string, Set<string>>;
+  /** FE mirror of the backend's persistent "Always allow" set (#229). Loaded at
+   *  bootstrap; drives the "always" badge and the Settings revocation list. */
+  alwaysApproved: Set<string>;
   /** Set when bootstrap() fails so the UI can show a clear error instead of a
    *  silently broken input bar. */
   bootstrapError: string | null;
@@ -132,6 +145,50 @@ interface ChatState {
     callId: string,
     answer: string,
   ) => Promise<void>;
+
+  // Four-option approval (#229). Each pairs the persistent-set write with the
+  // existing approve round-trip so the in-flight call is also released.
+  /** "Allow this session": approve `tool` for `sessionId` and release this call. */
+  approveSession: (
+    sessionId: string,
+    messageId: string,
+    callId: string,
+    tool: string,
+  ) => Promise<void>;
+  /** "Always allow": persist `tool` and release this call. */
+  approveAlways: (
+    sessionId: string,
+    messageId: string,
+    callId: string,
+    tool: string,
+  ) => Promise<void>;
+  /** Load the persistent always-approved set into the mirror (bootstrap + the
+   *  Settings panel on mount). Resolves `true` on success, `false` if the IPC
+   *  fetch failed — the Settings panel uses this to distinguish a load error
+   *  from a genuinely empty list. */
+  loadAlwaysApproved: () => Promise<boolean>;
+  /** Revoke `tool` from the always-approved set (Settings). Optimistic. */
+  revokeAlways: (tool: string) => Promise<void>;
+}
+
+/** Replace one step (by callId) within a message's step list, merging `patch`.
+ *  No-op when the message has no steps yet. */
+function patchStep(
+  s: Pick<ChatState, "toolStepsByMessage">,
+  messageId: string,
+  callId: string,
+  patch: Partial<ToolStep>,
+): Pick<ChatState, "toolStepsByMessage"> | null {
+  const steps = s.toolStepsByMessage[messageId];
+  if (!steps) return null;
+  return {
+    toolStepsByMessage: {
+      ...s.toolStepsByMessage,
+      [messageId]: steps.map((step) =>
+        step.callId === callId ? { ...step, ...patch } : step,
+      ),
+    },
+  };
 }
 
 /** Wall-clock turn start when streaming begins (#180). */
@@ -180,6 +237,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
   toolStepsByMessage: {},
   reasoningByMessage: {},
   sessionTitles: loadTitles(),
+  sessionApprovedBySession: {},
+  alwaysApproved: new Set<string>(),
   bootstrapError: null,
 
   bootstrap: async () => {
@@ -207,6 +266,10 @@ export const useChatStore = create<ChatState>((set, get) => ({
           ),
         }));
       }
+
+      // Hydrate the always-approved mirror so badges render correctly from the
+      // first turn (the gate itself stays backend-owned).
+      void get().loadAlwaysApproved();
 
       const first = sessions[0];
       if (first) await get().selectSession(first.id);
@@ -531,12 +594,20 @@ export const useChatStore = create<ChatState>((set, get) => ({
       const steps = s.toolStepsByMessage[e.messageId] ?? [];
       // Idempotent: ignore a duplicate call event for the same callId.
       if (steps.some((step) => step.callId === e.callId)) return s;
+      // Pre-set the trust badge for a tool the user already approved this session
+      // or always: the backend short-circuits the gate for these, so the step
+      // never enters "awaiting-approval" and would otherwise carry no badge.
+      const sessionApproved =
+        s.sessionApprovedBySession[e.sessionId]?.has(e.tool) ?? false;
+      const alwaysApproved = s.alwaysApproved.has(e.tool);
       const step: ToolStep = {
         callId: e.callId,
         tool: e.tool,
         args: e.args,
         status: "running",
         startedAt: Date.now(),
+        ...(sessionApproved ? { sessionApproved: true } : {}),
+        ...(alwaysApproved ? { alwaysApproved: true } : {}),
       };
       // A tool call can precede any streamed token (the backend emits no token
       // for empty deltas), so applyToken may never create the anchoring assistant
@@ -697,6 +768,125 @@ export const useChatStore = create<ChatState>((set, get) => ({
       // so the user can retry; `question` is untouched, so it re-renders intact.
       console.error("respondAsk IPC failed:", err);
       setStatus("awaiting-answer");
+    }
+  },
+
+  approveSession: async (sessionId, messageId, callId, tool) => {
+    // Contract guard (#232): the allowlist never covers Dangerous calls, so a
+    // session grant would be written yet the backend would keep prompting. Refuse
+    // it here too (defense in depth — the UI already hides the button).
+    const safety = get().toolStepsByMessage[messageId]?.find(
+      (s) => s.callId === callId,
+    )?.safety;
+    if (safety === "dangerous") return;
+    const had = get().sessionApprovedBySession[sessionId]?.has(tool) ?? false;
+    // Optimistic: flip to running (the round-trip + tool exec are in flight),
+    // tag the step's badge, and add the tool to the session mirror.
+    set((s) => {
+      const next = new Set(s.sessionApprovedBySession[sessionId] ?? []);
+      next.add(tool);
+      return {
+        ...(patchStep(s, messageId, callId, {
+          status: "running",
+          sessionApproved: true,
+        }) ?? {}),
+        sessionApprovedBySession: {
+          ...s.sessionApprovedBySession,
+          [sessionId]: next,
+        },
+      };
+    });
+    try {
+      await ipc.setSessionApprove(sessionId, tool);
+      await ipc.respondApproval(sessionId, callId, true);
+    } catch (err) {
+      // Revert to the gate so the user can retry. Only drop the mirror entry if
+      // this call is the one that added it (a prior success may already own it).
+      console.error("approveSession failed:", err);
+      set((s) => {
+        const next = new Set(s.sessionApprovedBySession[sessionId] ?? []);
+        if (!had) next.delete(tool);
+        return {
+          ...(patchStep(s, messageId, callId, {
+            status: "awaiting-approval",
+            sessionApproved: false,
+          }) ?? {}),
+          sessionApprovedBySession: {
+            ...s.sessionApprovedBySession,
+            [sessionId]: next,
+          },
+        };
+      });
+    }
+  },
+
+  approveAlways: async (sessionId, messageId, callId, tool) => {
+    // Contract guard (#232): Dangerous calls are never allowlist-covered — see
+    // `approveSession`.
+    const safety = get().toolStepsByMessage[messageId]?.find(
+      (s) => s.callId === callId,
+    )?.safety;
+    if (safety === "dangerous") return;
+    const had = get().alwaysApproved.has(tool);
+    set((s) => {
+      const next = new Set(s.alwaysApproved);
+      next.add(tool);
+      return {
+        ...(patchStep(s, messageId, callId, {
+          status: "running",
+          alwaysApproved: true,
+        }) ?? {}),
+        alwaysApproved: next,
+      };
+    });
+    try {
+      await ipc.setAlwaysApprove(tool);
+      await ipc.respondApproval(sessionId, callId, true);
+    } catch (err) {
+      console.error("approveAlways failed:", err);
+      set((s) => {
+        const next = new Set(s.alwaysApproved);
+        if (!had) next.delete(tool);
+        return {
+          ...(patchStep(s, messageId, callId, {
+            status: "awaiting-approval",
+            alwaysApproved: false,
+          }) ?? {}),
+          alwaysApproved: next,
+        };
+      });
+    }
+  },
+
+  loadAlwaysApproved: async () => {
+    try {
+      const tools = await ipc.listAlwaysApproved();
+      set({ alwaysApproved: new Set(tools) });
+      return true;
+    } catch (err) {
+      console.error("listAlwaysApproved failed:", err);
+      return false;
+    }
+  },
+
+  revokeAlways: async (tool) => {
+    const prev = get().alwaysApproved;
+    if (!prev.has(tool)) return;
+    set(() => {
+      const next = new Set(prev);
+      next.delete(tool);
+      return { alwaysApproved: next };
+    });
+    try {
+      await ipc.removeAlwaysApprove(tool);
+    } catch (err) {
+      // Restore the entry so the list reflects backend truth.
+      console.error("removeAlwaysApprove failed:", err);
+      set((s) => {
+        const next = new Set(s.alwaysApproved);
+        next.add(tool);
+        return { alwaysApproved: next };
+      });
     }
   },
 }));

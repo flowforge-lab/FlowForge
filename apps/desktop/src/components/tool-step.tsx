@@ -124,13 +124,38 @@ function ToolLabel({ tool }: { tool: string }) {
   );
 }
 
+/** Trust badge for a step approved via "Allow this session" / "Always allow"
+ *  (#229). Sits next to the tool name on a resolved step. */
+function TrustBadge({ kind }: { kind: "session" | "always" }) {
+  const always = kind === "always";
+  return (
+    <span
+      className={cn(
+        "rounded px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide",
+        always
+          ? "bg-emerald-500/15 text-emerald-700 dark:text-emerald-400"
+          : "bg-amber-500/15 text-amber-700 dark:text-amber-400",
+      )}
+    >
+      {kind}
+    </span>
+  );
+}
+
 export function ToolStepBlock({
   step,
   onRespond,
+  onApproveSession,
+  onApproveAlways,
   onAnswer,
 }: {
   step: ToolStep;
   onRespond: (callId: string, approved: boolean) => void;
+  /** "Allow this session" — approves `tool` for the session, then this call.
+   *  Required (like `onRespond`) so the approval buttons never silently no-op. */
+  onApproveSession: (callId: string, tool: string) => void;
+  /** "Always allow" — persists `tool`, then approves this call. */
+  onApproveAlways: (callId: string, tool: string) => void;
   onAnswer?: (callId: string, answer: string) => void;
 }) {
   const awaiting = step.status === "awaiting-approval";
@@ -182,6 +207,10 @@ export function ToolStepBlock({
           {mcp ? <ToolLabel tool={step.tool} /> : description}
         </span>
         {awaiting && step.safety && <SafetyBadge safety={step.safety} />}
+        {!awaiting && step.alwaysApproved && <TrustBadge kind="always" />}
+        {!awaiting && !step.alwaysApproved && step.sessionApproved && (
+          <TrustBadge kind="session" />
+        )}
         {asking && (
           <span className="rounded bg-sky-500/15 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-sky-700 dark:text-sky-400">
             needs answer
@@ -210,22 +239,49 @@ export function ToolStepBlock({
             </pre>
           </div>
           {awaiting && (
-            <div className="flex items-center gap-2 pt-1">
-              <Button
-                size="sm"
-                className="h-7 px-3 text-xs"
-                onClick={() => onRespond(step.callId, true)}
-              >
-                Approve
-              </Button>
-              <Button
-                size="sm"
-                variant="outline"
-                className="h-7 px-3 text-xs"
-                onClick={() => onRespond(step.callId, false)}
-              >
-                Deny
-              </Button>
+            <div className="space-y-1.5 pt-1">
+              <div className="flex flex-wrap items-center gap-2">
+                <Button
+                  size="sm"
+                  className="h-7 px-3 text-xs"
+                  onClick={() => onRespond(step.callId, true)}
+                >
+                  Allow once
+                </Button>
+                {/* Dangerous tools are never covered by the session/always
+                    allowlist (#232: `allowlist_covers` excludes Dangerous), so
+                    only offer the persistent tiers for non-dangerous calls —
+                    otherwise the grant would be written but the backend would
+                    keep prompting. Dangerous steps get Allow once / Deny only. */}
+                {step.safety !== "dangerous" && (
+                  <>
+                    <Button
+                      size="sm"
+                      variant="secondary"
+                      className="h-7 px-3 text-xs"
+                      onClick={() => onApproveSession(step.callId, step.tool)}
+                    >
+                      Allow this session
+                    </Button>
+                    <Button
+                      size="sm"
+                      variant="secondary"
+                      className="h-7 px-3 text-xs"
+                      onClick={() => onApproveAlways(step.callId, step.tool)}
+                    >
+                      Always allow
+                    </Button>
+                  </>
+                )}
+                <Button
+                  size="sm"
+                  variant="outline"
+                  className="h-7 px-3 text-xs"
+                  onClick={() => onRespond(step.callId, false)}
+                >
+                  Deny
+                </Button>
+              </div>
               <span className="text-[11px] text-muted-foreground/70">
                 {step.safety === "dangerous"
                   ? "Destructive — review carefully."
