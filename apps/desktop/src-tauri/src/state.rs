@@ -298,6 +298,31 @@ fn tool_permissions_path() -> Option<PathBuf> {
     dirs::config_dir().map(|d| d.join("flowforge").join("tool_permissions.json"))
 }
 
+/// The on-disk session database (RFC 0012 / #277). `None` if no config dir resolves,
+/// in which case the store falls back to `:memory:`.
+fn sessions_db_path() -> Option<PathBuf> {
+    dirs::config_dir().map(|d| d.join("flowforge").join("sessions.db"))
+}
+
+/// Open the persistent session store, falling back to an ephemeral in-memory store
+/// (with a warning) if the path is unavailable or the file cannot be opened — same
+/// resilience as the FlushLedger open.
+fn build_session_store() -> SessionStore {
+    // Tests must never write to the real config dir (see load_or_migrate_registry).
+    // An on-disk session db is exercised directly in `session_db_survives_restart`.
+    if cfg!(test) {
+        return SessionStore::new();
+    }
+    let Some(path) = sessions_db_path() else {
+        tracing::warn!("no config dir; sessions will not persist across restarts");
+        return SessionStore::new();
+    };
+    SessionStore::open(&path).unwrap_or_else(|e| {
+        tracing::warn!(error = %e, path = %path.display(), "session db unavailable; sessions will not persist");
+        SessionStore::new()
+    })
+}
+
 /// `~/.config/flowforge/phenotype.json` — the name of the active phenotype, persisted
 /// so a switch survives a restart (RFC 0001 §7). Separate from the phenotype
 /// *definitions* in `~/.flowforge/phenos/`; this only records which one is active.
@@ -485,7 +510,7 @@ impl AppState {
             )
             .ok();
         let state = Self {
-            store: SessionStore::new(),
+            store: build_session_store(),
             registry: Mutex::new(registry),
             search_config,
             workspace_root: default_workspace_root(),
@@ -1490,6 +1515,34 @@ mod tests {
     // before the turn (and thus any approval) starts.
     fn arm(state: &AppState, session_id: &str) {
         state.register_cancel(session_id, CancelToken::new());
+    }
+
+    // #277: the desktop store persists across a "restart". `build_session_store`
+    // delegates to `SessionStore::open`, so this exercises the same path-backed
+    // contract over an explicit temp db (without touching the real config dir).
+    #[test]
+    fn session_db_survives_restart() {
+        use ff_core::Role;
+        use ff_session::SessionStore;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sessions.db");
+
+        let session_id = {
+            let store = SessionStore::open(&path).unwrap();
+            let s = store.create_session(Some("persist me".into()));
+            store.add_message(&s.id, Role::User, "still here?".into());
+            s.id
+        };
+
+        // A fresh store over the same path == an app restart.
+        let store = SessionStore::open(&path).unwrap();
+        let sessions = store.list_sessions();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].id, session_id);
+        let msgs = store.get_messages(&session_id);
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].content, "still here?");
     }
 
     #[tokio::test]
