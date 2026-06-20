@@ -387,14 +387,21 @@ pub async fn run_turn(
             if cancel.is_cancelled() {
                 break;
             }
-            let args: serde_json::Value =
-                serde_json::from_str(&call.arguments).unwrap_or(serde_json::Value::Null);
+            // Parse the model-supplied JSON arguments. On failure, return a clear,
+            // actionable tool result instead of silently passing Null (#244 R4): the
+            // model sees "your arguments were not valid JSON" and self-corrects, rather
+            // than an opaque downstream tool error.
+            let parsed_args = serde_json::from_str::<serde_json::Value>(&call.arguments);
 
             on_event(AgentEvent::ToolCallStarted {
                 message_id: message_id.clone(),
                 call_id: call.id.clone(),
                 name: call.name.clone(),
-                args: args.clone(),
+                args: parsed_args
+                    .as_ref()
+                    .ok()
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null),
             });
 
             // Interactive tools (`ask_user`, #44) don't execute against the workspace:
@@ -406,44 +413,53 @@ pub async fn run_turn(
                 .allowed
                 .as_ref()
                 .is_none_or(|set| set.contains(&call.name));
-            let outcome = if tools.registry.is_interactive(&call.name) {
-                match tools.approve.ask(&message_id, &call.id, &args).await {
-                    Some(answer) => ff_tools::ToolOutcome::ok(answer),
-                    None => ff_tools::ToolOutcome::error("[no answer: question dismissed]"),
-                }
-            } else if !permitted {
-                ff_tools::ToolOutcome::error(format!(
-                    "tool `{}` is not permitted for this sub-agent",
-                    call.name
-                ))
-            } else if ff_tools::is_subagent(&call.name) {
-                // Delegation (#234): drive a child turn in a fresh ephemeral session and
-                // return only its summary. The child reuses the same provider/approver,
-                // so its tool calls hit the identical approval gate (no escalation).
-                run_subagent(
-                    provider,
-                    store,
-                    tools,
-                    model,
-                    system_prompt,
-                    cancel.clone(),
-                    &args,
-                )
-                .await
-            } else {
-                let safety = tools.registry.safety(&call.name, &args);
-                let approved = safety == Safety::ReadOnly
-                    || tools
-                        .approve
-                        .approve(&message_id, &call.id, &call.name, safety, &args)
-                        .await;
-                if approved {
-                    tools.registry.run(&call.name, args, tools.root).await
-                } else {
-                    ff_tools::ToolOutcome::error(format!(
-                        "call to `{}` was not approved",
-                        call.name
-                    ))
+            let outcome = match parsed_args {
+                Err(e) => ff_tools::ToolOutcome::error(format!(
+                    "tool `{}` arguments were not valid JSON ({e}); received: `{}`. \
+                     Re-issue the call with a valid JSON object matching the tool schema.",
+                    call.name, call.arguments
+                )),
+                Ok(args) => {
+                    if tools.registry.is_interactive(&call.name) {
+                        match tools.approve.ask(&message_id, &call.id, &args).await {
+                            Some(answer) => ff_tools::ToolOutcome::ok(answer),
+                            None => ff_tools::ToolOutcome::error("[no answer: question dismissed]"),
+                        }
+                    } else if !permitted {
+                        ff_tools::ToolOutcome::error(format!(
+                            "tool `{}` is not permitted for this sub-agent",
+                            call.name
+                        ))
+                    } else if ff_tools::is_subagent(&call.name) {
+                        // Delegation (#234): drive a child turn in a fresh ephemeral session and
+                        // return only its summary. The child reuses the same provider/approver,
+                        // so its tool calls hit the identical approval gate (no escalation).
+                        run_subagent(
+                            provider,
+                            store,
+                            tools,
+                            model,
+                            system_prompt,
+                            cancel.clone(),
+                            &args,
+                        )
+                        .await
+                    } else {
+                        let safety = tools.registry.safety(&call.name, &args);
+                        let approved = safety == Safety::ReadOnly
+                            || tools
+                                .approve
+                                .approve(&message_id, &call.id, &call.name, safety, &args)
+                                .await;
+                        if approved {
+                            tools.registry.run(&call.name, args, tools.root).await
+                        } else {
+                            ff_tools::ToolOutcome::error(format!(
+                                "call to `{}` was not approved",
+                                call.name
+                            ))
+                        }
+                    }
                 }
             };
 
@@ -1513,5 +1529,89 @@ mod tests {
         let seen = nudge_seen.lock().unwrap();
         // With a single-iteration cap there is no "next step" to wrap up toward.
         assert_eq!(seen.as_slice(), &[false]);
+    }
+
+    // ----- #244 R4: tool-argument parse feedback -----
+
+    /// First call emits a tool call with malformed JSON arguments; the second returns
+    /// plain text (the model "self-correcting" after seeing the parse error).
+    struct BadArgsThenText {
+        calls: Arc<AtomicUsize>,
+    }
+    #[async_trait]
+    impl Provider for BadArgsThenText {
+        async fn chat_stream(&self, _req: ChatRequest) -> Result<ChunkStream, LlmError> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            let chunks = if n == 0 {
+                vec![Ok(Chunk {
+                    tool_calls: vec![ToolCallDelta {
+                        index: 0,
+                        id: Some("call_bad".into()),
+                        name: Some("bash".into()),
+                        arguments: "{not valid json".into(),
+                    }],
+                    done: true,
+                    ..Chunk::default()
+                })]
+            } else {
+                vec![Ok(Chunk {
+                    delta: "fixed and done".into(),
+                    done: true,
+                    ..Chunk::default()
+                })]
+            };
+            Ok(futures_util::stream::iter(chunks).boxed())
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_tool_args_return_parse_error_and_loop_continues() {
+        let store = SessionStore::new();
+        let s = store.create_session(None);
+        store.add_message(&s.id, Role::User, "go".into());
+        let registry = ToolRegistry::new();
+        let root = std::env::current_dir().unwrap();
+        let approve = AlwaysApprove;
+        let calls = Arc::new(AtomicUsize::new(0));
+
+        let mut finished_success = true;
+        let msg = run_turn(
+            &BadArgsThenText {
+                calls: calls.clone(),
+            },
+            &store,
+            &ctx(&registry, &root, &approve),
+            &s.id,
+            "mock",
+            None,
+            false,
+            CancelToken::new(),
+            |ev| {
+                if let AgentEvent::ToolCallFinished { success, .. } = ev {
+                    finished_success = success;
+                }
+            },
+        )
+        .await
+        .unwrap();
+
+        // The model got a second turn and produced a real answer.
+        assert_eq!(msg.content, "fixed and done");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        // The bad call surfaced as a failed tool result, not a silent Null.
+        assert!(!finished_success);
+
+        // History integrity: the assistant tool_calls message has a matching tool
+        // reply, and that reply tells the model its JSON was invalid.
+        let history = store.get_messages(&s.id);
+        let tool_reply = history
+            .iter()
+            .find(|m| m.role == Role::Tool)
+            .expect("a tool result must exist for the bad call");
+        assert!(
+            tool_reply.content.contains("not valid JSON"),
+            "tool reply should explain the parse failure, got: {}",
+            tool_reply.content
+        );
     }
 }
