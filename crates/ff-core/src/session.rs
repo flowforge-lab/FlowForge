@@ -46,6 +46,12 @@ pub struct Session {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub mode: Option<Mode>,
+    /// The working directory this session's tools run in (#200, #279). An absolute,
+    /// symlink-resolved path; `None` means "inherit the global default workspace".
+    /// Persisted in the session row so a chosen cwd survives a restart (RFC 0012 P4).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub workspace: Option<String>,
 }
 
 /// A session's working directory as surfaced to the frontend selector (#200,
