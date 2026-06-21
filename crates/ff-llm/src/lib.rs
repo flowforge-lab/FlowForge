@@ -1,8 +1,10 @@
 //! LLM provider abstraction. M1 ships two providers behind a single trait:
 //! [`OpenAiProvider`] (OpenAI-compatible SSE — candle-vllm, vLLM, LM Studio, OpenAI)
-//! and [`OllamaProvider`] (Ollama-native NDJSON `/api/chat`). Bedrock and Anthropic
-//! land in later milestones behind the same trait.
+//! and [`OllamaProvider`] (Ollama-native NDJSON `/api/chat`). [`BedrockProvider`]
+//! (AWS Converse) and [`AnthropicProvider`] (native Messages API) land behind the
+//! same trait.
 
+mod anthropic;
 mod bedrock;
 mod ollama;
 mod openai;
@@ -12,6 +14,7 @@ use futures_util::stream::BoxStream;
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 
+pub use anthropic::AnthropicProvider;
 pub use bedrock::{BedrockCreds, BedrockProvider};
 pub use ollama::OllamaProvider;
 pub use openai::OpenAiProvider;
