@@ -565,12 +565,6 @@ pub struct AppState {
     /// session shares one default root; the field is threaded so the picker is
     /// purely additive later.
     pub workspace_root: PathBuf,
-    /// Per-session working directories (slice 3a, issue #200). Absent until a
-    /// session's cwd is set away from the default; [`session_root`](Self::session_root)
-    /// falls back to [`workspace_root`](Self::workspace_root). Host-internal and
-    /// in-memory (no contract change) -- the future `set_workspace` command/tool
-    /// (slice 3b) is the writer.
-    session_cwd: Mutex<HashMap<String, PathBuf>>,
     /// Installed skills, kept current by `_skill_watcher`. Snapshotted per turn
     /// (`skills_snapshot`) so a mid-turn reload never races (RFC 0001 §9).
     skills: SharedRegistry,
@@ -653,7 +647,6 @@ impl AppState {
             registry: Mutex::new(registry),
             search_config,
             workspace_root: default_workspace_root(),
-            session_cwd: Mutex::new(HashMap::new()),
             skills,
             _skill_watcher: Mutex::new(watcher),
             approvals: Mutex::new({
@@ -856,24 +849,24 @@ impl AppState {
     }
 
     /// The working directory for `session_id`'s tools this turn. Returns the
-    /// session's cwd if one has been set (slice 3b), otherwise the default
-    /// [`workspace_root`](Self::workspace_root).
+    /// session's persisted cwd if one has been set (#200/#279), otherwise the
+    /// default [`workspace_root`](Self::workspace_root). A stored path that no
+    /// longer resolves to a directory (e.g. deleted between runs) also falls back,
+    /// so a restored session never runs its tools against a missing root.
     pub fn session_root(&self, session_id: &str) -> PathBuf {
-        self.session_cwd
-            .lock()
-            .unwrap()
-            .get(session_id)
-            .cloned()
+        self.store
+            .session_workspace(session_id)
+            .map(PathBuf::from)
+            .filter(|p| p.is_dir())
             .unwrap_or_else(|| self.workspace_root.clone())
     }
 
-    /// Set `session_id`'s working directory. Called by the `set_session_workspace`
-    /// command (slice 3b, issue #200) and exercised by tests.
+    /// Set `session_id`'s working directory, persisted in the session row so it
+    /// survives a restart (#279). Called by the `set_session_workspace` command
+    /// (#200) and exercised by tests. No-op for an unknown session.
     pub fn set_session_cwd(&self, session_id: &str, dir: PathBuf) {
-        self.session_cwd
-            .lock()
-            .unwrap()
-            .insert(session_id.to_string(), dir);
+        self.store
+            .set_session_workspace(session_id, Some(dir.display().to_string()));
     }
 
     /// The shared durable-memory store (RFC 0006), used for per-turn ambient
@@ -2428,9 +2421,34 @@ mod tests {
     #[test]
     fn session_root_returns_set_cwd() {
         let state = AppState::new();
-        let dir = std::path::PathBuf::from("/tmp/ff-session-cwd-test");
-        state.set_session_cwd("sess-a", dir.clone());
-        assert_eq!(state.session_root("sess-a"), dir);
+        let sess = state.store.create_session(None);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_path_buf();
+        state.set_session_cwd(&sess.id, path.clone());
+        assert_eq!(state.session_root(&sess.id), path);
+    }
+
+    #[test]
+    fn session_cwd_persists_across_a_fresh_state_over_the_same_db() {
+        // #279: the cwd lives in the session row, so a restart (a new store over
+        // the same db file) restores it rather than dropping it.
+        let db = tempfile::tempdir().unwrap();
+        let db_path = db.path().join("sessions.db");
+        let work = tempfile::tempdir().unwrap();
+        let work_path = work.path().to_path_buf();
+
+        let sess_id = {
+            let store = ff_session::SessionStore::open(&db_path).unwrap();
+            let s = store.create_session(None);
+            store.set_session_workspace(&s.id, Some(work_path.display().to_string()));
+            s.id
+        };
+        // A fresh store over the same file == an app restart.
+        let store = ff_session::SessionStore::open(&db_path).unwrap();
+        assert_eq!(
+            store.session_workspace(&sess_id),
+            Some(work_path.display().to_string())
+        );
     }
 
     #[test]
@@ -2450,11 +2468,14 @@ mod tests {
     #[test]
     fn session_cwd_is_isolated_per_session() {
         let state = AppState::new();
-        let a = std::path::PathBuf::from("/tmp/ff-a");
-        state.set_session_cwd("sess-a", a.clone());
-        assert_eq!(state.session_root("sess-a"), a);
+        let sess_a = state.store.create_session(None);
+        let sess_b = state.store.create_session(None);
+        let a = tempfile::tempdir().unwrap();
+        let a_path = a.path().to_path_buf();
+        state.set_session_cwd(&sess_a.id, a_path.clone());
+        assert_eq!(state.session_root(&sess_a.id), a_path);
         // A different session is unaffected and still falls back to the default.
-        assert_eq!(state.session_root("sess-b"), state.workspace_root);
+        assert_eq!(state.session_root(&sess_b.id), state.workspace_root);
     }
 
     #[test]

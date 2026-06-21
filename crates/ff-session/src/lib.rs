@@ -94,12 +94,13 @@ impl SessionStore {
             updated_at: ts,
             phenotype: None,
             mode: None,
+            workspace: None,
         };
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT INTO sessions
-                 (id, goal, title, summary, status, created_at, updated_at, phenotype, mode)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                 (id, goal, title, summary, status, created_at, updated_at, phenotype, mode, workspace)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 session.id,
                 session.goal,
@@ -110,6 +111,7 @@ impl SessionStore {
                 session.updated_at,
                 session.phenotype,
                 session.mode.as_ref().map(enum_to_text),
+                session.workspace,
             ],
         )
         .expect("insert session");
@@ -120,7 +122,7 @@ impl SessionStore {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
             .prepare(
-                "SELECT id, goal, title, summary, status, created_at, updated_at, phenotype, mode
+                "SELECT id, goal, title, summary, status, created_at, updated_at, phenotype, mode, workspace
                  FROM sessions
                  ORDER BY updated_at DESC",
             )
@@ -299,6 +301,33 @@ impl SessionStore {
         text.as_deref().and_then(text_to_enum)
     }
 
+    /// Set (or clear, with `None`) this session's working directory (#279). The
+    /// path is stored verbatim; the app layer validates it exists before calling.
+    /// No-op for an unknown session. Mirrors [`set_session_phenotype`](Self::set_session_phenotype).
+    pub fn set_session_workspace(&self, session_id: &str, workspace: Option<String>) {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE sessions SET workspace = ?1, updated_at = ?2 WHERE id = ?3",
+            params![workspace, now_ms(), session_id],
+        )
+        .ok();
+    }
+
+    /// The session's persisted working directory, or `None` if it inherits the
+    /// global default (or the session is unknown).
+    pub fn session_workspace(&self, session_id: &str) -> Option<String> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT workspace FROM sessions WHERE id = ?1",
+            params![session_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()
+        .ok()
+        .flatten()
+        .flatten()
+    }
+
     pub fn set_message_content(
         &self,
         message_id: &str,
@@ -380,7 +409,7 @@ impl SessionStore {
         let conn = self.conn.lock().unwrap();
         let source = conn
             .query_row(
-                "SELECT id, goal, title, summary, status, created_at, updated_at, phenotype, mode
+                "SELECT id, goal, title, summary, status, created_at, updated_at, phenotype, mode, workspace
                  FROM sessions WHERE id = ?1",
                 params![session_id],
                 row_to_session,
@@ -401,11 +430,13 @@ impl SessionStore {
             phenotype: source.phenotype.clone(),
             // ...and its mode binding, so the copy runs at the same autonomy (#265).
             mode: source.mode,
+            // ...and its workspace, so the copy runs in the same cwd (#279).
+            workspace: source.workspace.clone(),
         };
         conn.execute(
             "INSERT INTO sessions
-                 (id, goal, title, summary, status, created_at, updated_at, phenotype, mode)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                 (id, goal, title, summary, status, created_at, updated_at, phenotype, mode, workspace)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 forked.id,
                 forked.goal,
@@ -416,6 +447,7 @@ impl SessionStore {
                 forked.updated_at,
                 forked.phenotype,
                 forked.mode.as_ref().map(enum_to_text),
+                forked.workspace,
             ],
         )
         .expect("insert forked session");
@@ -436,7 +468,7 @@ impl SessionStore {
     pub fn get_session(&self, session_id: &str) -> Option<Session> {
         let conn = self.conn.lock().unwrap();
         conn.query_row(
-            "SELECT id, goal, title, summary, status, created_at, updated_at, phenotype, mode
+            "SELECT id, goal, title, summary, status, created_at, updated_at, phenotype, mode, workspace
              FROM sessions WHERE id = ?1",
             params![session_id],
             row_to_session,
@@ -582,6 +614,13 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
         )?;
         conn.pragma_update(None, "user_version", 1)?;
     }
+    if version < 2 {
+        // P4 (#279): per-session workspace moves off `AppState`'s in-memory map into
+        // the session row, so a chosen cwd survives a restart. Added via ALTER so
+        // existing v1 databases gain the column without losing data.
+        conn.execute_batch("ALTER TABLE sessions ADD COLUMN workspace TEXT;")?;
+        conn.pragma_update(None, "user_version", 2)?;
+    }
     Ok(())
 }
 
@@ -598,6 +637,7 @@ fn row_to_session(row: &rusqlite::Row) -> rusqlite::Result<Session> {
         updated_at: row.get("updated_at")?,
         phenotype: row.get("phenotype")?,
         mode: mode.as_deref().and_then(text_to_enum),
+        workspace: row.get("workspace")?,
     })
 }
 
@@ -798,6 +838,50 @@ mod tests {
     }
 
     #[test]
+    fn new_session_has_no_workspace() {
+        let store = SessionStore::new();
+        let s = store.create_session(None);
+        assert!(s.workspace.is_none());
+        assert!(store.session_workspace(&s.id).is_none());
+    }
+
+    #[test]
+    fn set_and_clear_session_workspace() {
+        let store = SessionStore::new();
+        let s = store.create_session(None);
+        store.set_session_workspace(&s.id, Some("/work/proj".into()));
+        assert_eq!(
+            store.session_workspace(&s.id).as_deref(),
+            Some("/work/proj")
+        );
+        store.set_session_workspace(&s.id, None);
+        assert!(store.session_workspace(&s.id).is_none());
+    }
+
+    #[test]
+    fn set_session_workspace_unknown_session_is_noop() {
+        let store = SessionStore::new();
+        store.set_session_workspace("nope", Some("/work/proj".into()));
+        assert!(store.session_workspace("nope").is_none());
+    }
+
+    #[test]
+    fn fork_session_copies_workspace() {
+        let store = SessionStore::new();
+        let s = store.create_session(None);
+        store.set_session_workspace(&s.id, Some("/work/proj".into()));
+
+        let forked = store.fork_session(&s.id).unwrap();
+        assert_eq!(forked.workspace.as_deref(), Some("/work/proj"));
+        // Changing the fork's cwd does not touch the source.
+        store.set_session_workspace(&forked.id, Some("/work/other".into()));
+        assert_eq!(
+            store.session_workspace(&s.id).as_deref(),
+            Some("/work/proj")
+        );
+    }
+
+    #[test]
     fn new_session_has_no_mode_binding() {
         let store = SessionStore::new();
         let s = store.create_session(None);
@@ -853,6 +937,7 @@ mod tests {
             store.set_title(&s.id, "Durable".into());
             store.set_session_phenotype(&s.id, Some("codon".into()));
             store.set_session_mode(&s.id, Some(Mode::Act));
+            store.set_session_workspace(&s.id, Some("/work/proj".into()));
             let m = store.add_message(&s.id, Role::User, "remember me".into());
             mid = m.id.clone();
             store.add_message(&s.id, Role::Assistant, "noted".into());
@@ -868,6 +953,7 @@ mod tests {
         assert_eq!(reopened.goal.as_deref(), Some("durable goal"));
         assert_eq!(store.session_phenotype(&sid).as_deref(), Some("codon"));
         assert_eq!(store.session_mode(&sid), Some(Mode::Act));
+        assert_eq!(store.session_workspace(&sid).as_deref(), Some("/work/proj"));
 
         let msgs = store.get_messages(&sid);
         assert_eq!(msgs.len(), 2);
@@ -945,7 +1031,7 @@ mod tests {
             .unwrap()
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 1);
+        assert_eq!(version, 2);
     }
 
     #[test]

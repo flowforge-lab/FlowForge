@@ -38,4 +38,10 @@ phenotype?: string,
  * means "inherit the global `defaultMode` preference" — so a new session tracks
  * the user's default while a pane can override it independently (#148).
  */
-mode?: Mode, };
+mode?: Mode, 
+/**
+ * The working directory this session's tools run in (#200, #279). An absolute,
+ * symlink-resolved path; `None` means "inherit the global default workspace".
+ * Persisted in the session row so a chosen cwd survives a restart (RFC 0012 P4).
+ */
+workspace?: string, };
