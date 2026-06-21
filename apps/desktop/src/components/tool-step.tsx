@@ -15,6 +15,7 @@ import { parseMcpToolName } from "@/lib/mcp";
 import { describeStep } from "@/lib/step-describe";
 import { parseTodo } from "@/lib/todo";
 import { TodoList } from "@/components/todo-list";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 import type { ToolStep } from "@/store/chat";
@@ -93,18 +94,10 @@ function AskPrompt({
 }
 
 function SafetyBadge({ safety }: { safety: NonNullable<ToolStep["safety"]> }) {
-  const dangerous = safety === "dangerous";
   return (
-    <span
-      className={cn(
-        "rounded px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide",
-        dangerous
-          ? "bg-destructive/15 text-destructive"
-          : "bg-amber-500/15 text-amber-700 dark:text-amber-400",
-      )}
-    >
+    <Badge tone={safety === "dangerous" ? "destructive" : "amber"}>
       {safety}
-    </span>
+    </Badge>
   );
 }
 
@@ -127,19 +120,7 @@ function ToolLabel({ tool }: { tool: string }) {
 /** Trust badge for a step approved via "Allow this session" / "Always allow"
  *  (#229). Sits next to the tool name on a resolved step. */
 function TrustBadge({ kind }: { kind: "session" | "always" }) {
-  const always = kind === "always";
-  return (
-    <span
-      className={cn(
-        "rounded px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide",
-        always
-          ? "bg-emerald-500/15 text-emerald-700 dark:text-emerald-400"
-          : "bg-amber-500/15 text-amber-700 dark:text-amber-400",
-      )}
-    >
-      {kind}
-    </span>
-  );
+  return <Badge tone={kind === "always" ? "emerald" : "amber"}>{kind}</Badge>;
 }
 
 export function ToolStepBlock({
@@ -211,11 +192,7 @@ export function ToolStepBlock({
         {!awaiting && !step.alwaysApproved && step.sessionApproved && (
           <TrustBadge kind="session" />
         )}
-        {asking && (
-          <span className="rounded bg-sky-500/15 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-sky-700 dark:text-sky-400">
-            needs answer
-          </span>
-        )}
+        {asking && <Badge tone="sky">needs answer</Badge>}
       </button>
       {open && asking && (
         <AskPrompt
