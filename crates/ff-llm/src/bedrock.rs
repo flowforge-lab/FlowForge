@@ -412,10 +412,34 @@ fn to_tool(spec: &serde_json::Value) -> Option<Tool> {
     if let Some(desc) = function.get("description").and_then(|d| d.as_str()) {
         builder = builder.description(desc);
     }
-    if let Some(params) = function.get("parameters") {
-        builder = builder.input_schema(ToolInputSchema::Json(json_to_doc(params)));
-    }
+    // Bedrock Converse requires every tool inputSchema.json to be a JSON Schema
+    // with a top-level `"type": "object"`. OpenAI-style specs -- and MCP server
+    // schemas, which we pass through verbatim -- do not always satisfy this, so
+    // normalize first. inputSchema is required, so set it even when the spec omits
+    // `parameters`.
+    let schema = normalize_object_schema(function.get("parameters"));
+    builder = builder.input_schema(ToolInputSchema::Json(json_to_doc(&schema)));
     builder.build().ok().map(Tool::ToolSpec)
+}
+
+/// Coerce a tool parameter schema into a Bedrock-valid object schema: a JSON
+/// object whose top-level `type` is `"object"`. An object schema that merely omits
+/// `type` keeps its `properties`/`required` and gets `"type":"object"` injected;
+/// anything else (an empty `{}`, a non-object `type`, a non-object value, or
+/// `None`) becomes a minimal `{"type":"object","properties":{}}`.
+fn normalize_object_schema(params: Option<&serde_json::Value>) -> serde_json::Value {
+    use serde_json::{json, Value};
+    match params {
+        Some(Value::Object(map)) if map.get("type").and_then(|t| t.as_str()) == Some("object") => {
+            Value::Object(map.clone())
+        }
+        Some(Value::Object(map)) if !map.is_empty() && !map.contains_key("type") => {
+            let mut m = map.clone();
+            m.insert("type".into(), Value::String("object".into()));
+            Value::Object(m)
+        }
+        _ => json!({ "type": "object", "properties": {} }),
+    }
 }
 
 fn json_to_doc(value: &serde_json::Value) -> Document {
@@ -677,6 +701,59 @@ mod tests {
     #[test]
     fn no_tools_yields_no_config() {
         assert!(to_tool_config(&[]).is_none());
+    }
+
+    #[test]
+    fn schema_with_object_type_passes_through() {
+        let params = serde_json::json!({
+            "type": "object",
+            "properties": { "x": { "type": "string" } },
+            "required": ["x"]
+        });
+        assert_eq!(normalize_object_schema(Some(&params)), params);
+    }
+
+    #[test]
+    fn schema_missing_type_gets_object_injected() {
+        let params = serde_json::json!({ "properties": { "x": { "type": "string" } } });
+        let out = normalize_object_schema(Some(&params));
+        assert_eq!(out["type"], "object");
+        assert_eq!(out["properties"]["x"]["type"], "string");
+    }
+
+    #[test]
+    fn empty_or_non_object_schemas_become_object() {
+        let want = serde_json::json!({ "type": "object", "properties": {} });
+        assert_eq!(normalize_object_schema(Some(&serde_json::json!({}))), want);
+        assert_eq!(
+            normalize_object_schema(Some(&serde_json::json!({ "type": "string" }))),
+            want
+        );
+        assert_eq!(normalize_object_schema(None), want);
+    }
+
+    #[test]
+    fn to_tool_always_sends_object_typed_schema() {
+        // An MCP-style spec whose params lack a top-level object type must still
+        // reach Bedrock as a valid object schema (the #202 ValidationException).
+        let spec = serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "weird",
+                "description": "no top-level type",
+                "parameters": { "properties": { "q": { "type": "string" } } }
+            }
+        });
+        let cfg = to_tool_config(&[spec]).unwrap();
+        match &cfg.tools[0] {
+            Tool::ToolSpec(s) => match s.input_schema.as_ref().unwrap() {
+                ToolInputSchema::Json(doc) => {
+                    assert_eq!(doc_to_json(doc)["type"], "object");
+                }
+                _ => panic!("expected json input schema"),
+            },
+            _ => panic!("expected tool spec"),
+        }
     }
 
     #[test]
