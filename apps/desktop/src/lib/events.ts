@@ -8,6 +8,7 @@ import { useChatStore } from "@/store/chat";
 import { useSkillsStore } from "@/store/skills";
 import { useMcpStore } from "@/store/mcp";
 import { useMemoryStore } from "@/store/memory";
+import { usePhenoMcpNoticeStore } from "@/store/pheno-mcp-notice";
 
 let started = false;
 
@@ -60,6 +61,12 @@ export function startIpcEvents(): void {
   // the memory browser surfaces provenance and reloads.
   void ipc.onMemoryFlushed((e) => {
     useMemoryStore.getState().noteFlush(e.writes);
+  });
+  // A just-activated phenotype lists a skill whose declared MCP server is
+  // unavailable (#301) — surface it as a non-blocking toast. Activation itself
+  // never blocks; this is informational.
+  void ipc.onPhenotypeMcpUnavailable((e) => {
+    usePhenoMcpNoticeStore.getState().show(e);
   });
   // No UI for intention signals yet (NeuroForge, M8) — observe only.
   void ipc.onIntention((e) => {

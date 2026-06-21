@@ -9,6 +9,7 @@ import type { ControlConfig } from "@/lib/control";
 import type { MarketplaceSkill } from "@/lib/marketplace";
 import type { MarketplaceProfile } from "@/lib/profile-marketplace";
 import type { ScheduledTask, CreateScheduledTaskInput } from "@/lib/scheduled";
+import type { PhenotypeMcpUnavailableEvent } from "@/lib/phenotype-mcp";
 import type {
   Message,
   ProviderConfig,
@@ -276,6 +277,20 @@ export interface FfIpc {
    *  mid-turn (#283). Fires only when something was written, so the memory browser
    *  can surface provenance. Re-read files via `listMemoryFiles`/`memoryOverview`. */
   onMemoryFlushed(cb: (e: MemoryFlushedEvent) => void): Promise<Unlisten>;
+  // CONTRACT CHANGE (#301, surface unavailable skill-required MCP servers): NEW
+  // event needing a real Rust emitter — please review @backend-owner. PR #296
+  // added the backend compute (`AppState::unavailable_required_servers`) but it is
+  // `tracing::warn!`-only; this carries that list to the UI. It must be emitted
+  // from the phenotype activation path (`switch_phenotype` + `set_session_phenotype`)
+  // alongside the existing warn — non-fatal, never blocks activation. The payload
+  // is FE-owned (lib/phenotype-mcp.ts) until the backend adds a ts-rs binding;
+  // `bindings/` is untouched. Mocked under `VITE_FF_MOCK=1` for now.
+  /** A just-activated phenotype lists a skill whose declared MCP server is absent
+   *  from `mcp.json` or present but not running, so its bridged tools are silently
+   *  unavailable. Fires only when the unavailable list is non-empty. */
+  onPhenotypeMcpUnavailable(
+    cb: (e: PhenotypeMcpUnavailableEvent) => void,
+  ): Promise<Unlisten>;
 }
 
 // Explicit mock flag OR auto-fallback when not inside a Tauri window.
@@ -461,6 +476,8 @@ class TauriIpc implements FfIpc {
     this.listen<McpStatusChangedEvent>("mcp:status-changed", cb);
   onMemoryFlushed = (cb: (e: MemoryFlushedEvent) => void) =>
     this.listen<MemoryFlushedEvent>("memory:flushed", cb);
+  onPhenotypeMcpUnavailable = (cb: (e: PhenotypeMcpUnavailableEvent) => void) =>
+    this.listen<PhenotypeMcpUnavailableEvent>("phenotype:mcp-unavailable", cb);
 }
 
 // `MockIpc` is pulled in with a dynamic import so the bundler gives it its own
