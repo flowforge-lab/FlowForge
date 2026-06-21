@@ -434,6 +434,19 @@ export class MockIpc implements FfIpc {
         authMode: "profile",
         awsProfile: "bedrock-profile",
       },
+      // SiliconFlow (#329): a hosted, OpenAI-compatible connection so the
+      // hosted-key provider card (editable base URL + bearer API key) is
+      // exercisable offline. Keyless by default → the Test probe fails until a
+      // key is stored, mirroring the real `list_models`-based probe. `baseUrl`
+      // unset defaults to the global `.com` endpoint.
+      {
+        id: "siliconflow",
+        kind: "siliconFlow",
+        displayName: "SiliconFlow",
+        model: "deepseek-ai/DeepSeek-V3",
+        hasKey: false,
+        thinking: true,
+      },
     ],
   };
 
@@ -450,6 +463,15 @@ export class MockIpc implements FfIpc {
       "us.meta.llama4-maverick-17b-instruct",
       "amazon.nova-pro-v1:0",
       "amazon.nova-lite-v1:0",
+    ],
+    // SiliconFlow catalog sample (#329) — a few popular OpenAI-compatible model
+    // ids so the picker populates from `list_models` offline.
+    siliconflow: [
+      "deepseek-ai/DeepSeek-V3",
+      "Qwen/Qwen3-8B",
+      "Qwen/Qwen2.5-72B-Instruct",
+      "THUDM/glm-4-9b-chat",
+      "meta-llama/Llama-3.3-70B-Instruct",
     ],
   };
 
@@ -937,13 +959,21 @@ export class MockIpc implements FfIpc {
 
   // Test Connection (Issue #202 PR-3a). `id` defaults to the active connection.
   // Resolves on a successful probe; rejects with a message the UI surfaces. Local
-  // kinds always pass; Bedrock passes only when the active auth mode has the
-  // credentials it needs (profile resolves from ~/.aws; IAM/API-Key need a stored
-  // secret) — exercising both the ok and error result paths offline.
+  // kinds always pass; SiliconFlow (#329) needs a stored API key (mirroring the
+  // real `list_models` probe, which 401s without a valid bearer key); Bedrock
+  // passes only when the active auth mode has the credentials it needs (profile
+  // resolves from ~/.aws; IAM/API-Key need a stored secret) — exercising both the
+  // ok and error result paths offline.
   async testConnection(id?: string): Promise<void> {
     const target = id ?? this.registry.active;
     const conn = this.registry.connections.find((c) => c.id === target);
     if (!conn) throw new Error(`unknown connection: ${target}`);
+    if (conn.kind === "siliconFlow") {
+      if (!this.secretsByConnection.get(conn.id)?.has("apiKey")) {
+        throw new Error("No SiliconFlow API key configured.");
+      }
+      return;
+    }
     if (conn.kind !== "bedrock") return;
     const secrets = this.secretsByConnection.get(conn.id);
     switch (conn.authMode) {

@@ -14,7 +14,7 @@ const conn = (over: Partial<ProviderConnection> = {}): ProviderConnection => ({
 });
 
 describe("MockIpc provider connection registry", () => {
-  it("seeds candle-vLLM (active), a keyless Ollama, and AWS Bedrock", async () => {
+  it("seeds candle-vLLM (active), a keyless Ollama, AWS Bedrock, and SiliconFlow", async () => {
     const ipc = new MockIpc();
     const reg = await ipc.getProviderRegistry();
     expect(reg.active).toBe("candle-vllm");
@@ -22,12 +22,18 @@ describe("MockIpc provider connection registry", () => {
       "candle-vllm",
       "ollama",
       "bedrock",
+      "siliconflow",
     ]);
     expect(reg.connections.every((c) => c.hasKey === false)).toBe(true);
     const bedrock = reg.connections.find((c) => c.id === "bedrock");
     expect(bedrock?.kind).toBe("bedrock");
     expect(bedrock?.region).toBe("us-east-1");
     expect(bedrock?.authMode).toBe("profile");
+    const sf = reg.connections.find((c) => c.id === "siliconflow");
+    expect(sf?.kind).toBe("siliconFlow");
+    expect(sf?.displayName).toBe("SiliconFlow");
+    // Unset baseUrl → defaults to the global `.com` endpoint.
+    expect(sf?.baseUrl).toBeUndefined();
   });
 
   it("getProviderRegistry returns a copy callers cannot mutate", async () => {
@@ -36,7 +42,7 @@ describe("MockIpc provider connection registry", () => {
     reg.connections.pop();
     reg.active = "tampered";
     const fresh = await ipc.getProviderRegistry();
-    expect(fresh.connections).toHaveLength(3);
+    expect(fresh.connections).toHaveLength(4);
     expect(fresh.active).toBe("candle-vllm");
   });
 
@@ -58,7 +64,7 @@ describe("MockIpc provider connection registry", () => {
     );
     expect(stored.model).toBe("qwen2.5");
     const reg = await ipc.getProviderRegistry();
-    expect(reg.connections).toHaveLength(3);
+    expect(reg.connections).toHaveLength(4);
     expect(reg.connections.find((c) => c.id === "ollama")?.model).toBe(
       "qwen2.5",
     );
@@ -70,7 +76,7 @@ describe("MockIpc provider connection registry", () => {
       conn({ vendor: "OpenRouter", displayName: "OpenRouter" }),
     );
     expect(stored.id).toBe("openrouter");
-    expect((await ipc.getProviderRegistry()).connections).toHaveLength(4);
+    expect((await ipc.getProviderRegistry()).connections).toHaveLength(5);
   });
 
   it("dedupes derived ids with a numeric suffix", async () => {
@@ -90,6 +96,7 @@ describe("MockIpc provider connection registry", () => {
     expect(reg.connections.map((c) => c.id)).toEqual([
       "candle-vllm",
       "bedrock",
+      "siliconflow",
     ]);
     expect(reg.active).toBe("candle-vllm");
   });
@@ -98,6 +105,7 @@ describe("MockIpc provider connection registry", () => {
     const ipc = new MockIpc();
     await ipc.removeConnection("ollama");
     await ipc.removeConnection("bedrock");
+    await ipc.removeConnection("siliconflow");
     await expect(ipc.removeConnection("candle-vllm")).rejects.toThrow(/last/);
   });
 
@@ -185,6 +193,22 @@ describe("MockIpc provider connection registry", () => {
     // Both present → the probe passes.
     await ipc.setProviderSecret("bedrock", "secretAccessKey", "shhh");
     await expect(ipc.testConnection("bedrock")).resolves.toBeUndefined();
+  });
+
+  it("lists SiliconFlow model ids for the siliconflow connection", async () => {
+    const ipc = new MockIpc();
+    const models = await ipc.listModels("siliconflow");
+    expect(models).toContain("deepseek-ai/DeepSeek-V3");
+    expect(models).toContain("Qwen/Qwen3-8B");
+  });
+
+  it("test_connection fails for SiliconFlow until an API key is stored", async () => {
+    const ipc = new MockIpc();
+    await expect(ipc.testConnection("siliconflow")).rejects.toThrow(
+      /SiliconFlow API key/,
+    );
+    await ipc.setProviderSecret("siliconflow", "apiKey", "sk-abc123");
+    await expect(ipc.testConnection("siliconflow")).resolves.toBeUndefined();
   });
 
   it("getProviderConfig/setProviderConfig shim the active connection", async () => {

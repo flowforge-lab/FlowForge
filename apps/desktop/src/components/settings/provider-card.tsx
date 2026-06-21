@@ -46,6 +46,32 @@ function authLabel(mode: BedrockAuth | undefined): string {
   }
 }
 
+/** Hosted, OpenAI-compatible providers authenticated with a single bearer API
+ *  key over an editable base URL (vs. Bedrock's region/auth form or the local
+ *  kinds' plain host field). */
+function isHostedKeyKind(kind: ProviderConnection["kind"]): boolean {
+  return kind === "openai" || kind === "siliconFlow";
+}
+
+/** Base-URL field copy per hosted kind: the default endpoint (shown as the
+ *  placeholder) plus a hint. SiliconFlow's hint points `.cn` users at the China
+ *  endpoint; the field is editable so they can switch regions without an enum. */
+function hostedBaseUrlMeta(kind: ProviderConnection["kind"]): {
+  placeholder: string;
+  hint: string;
+} {
+  if (kind === "siliconFlow") {
+    return {
+      placeholder: "https://api.siliconflow.com/v1",
+      hint: "Default is the global endpoint. Use https://api.siliconflow.cn/v1 for the China region.",
+    };
+  }
+  return {
+    placeholder: "https://api.openai.com/v1",
+    hint: "Leave blank for the default endpoint.",
+  };
+}
+
 function fieldLabelClass() {
   return "text-[11px] font-semibold tracking-wide text-muted-foreground uppercase";
 }
@@ -74,6 +100,7 @@ export function ProviderCard({ conn }: { conn: ProviderConnection }) {
   const [open, setOpen] = useState(isDefault);
   const meta = KIND_META[conn.kind];
   const isBedrock = conn.kind === "bedrock";
+  const isHostedKey = isHostedKeyKind(conn.kind);
 
   // Editable non-secret fields, seeded from the stored connection.
   const [baseUrl, setBaseUrl] = useState(conn.baseUrl ?? "");
@@ -92,10 +119,16 @@ export function ProviderCard({ conn }: { conn: ProviderConnection }) {
   const [discovering, setDiscovering] = useState(false);
   const [discoverOpen, setDiscoverOpen] = useState(false);
 
-  const configured = isBedrock ? authMode === "profile" || conn.hasKey : true;
+  const configured = isBedrock
+    ? authMode === "profile" || conn.hasKey
+    : isHostedKey
+      ? conn.hasKey
+      : true;
   const detail = isBedrock
     ? `${conn.region ?? region} · ${authLabel(conn.authMode)}`
-    : (conn.baseUrl ?? "default endpoint");
+    : isHostedKey
+      ? (conn.baseUrl ?? hostedBaseUrlMeta(conn.kind).placeholder)
+      : (conn.baseUrl ?? "default endpoint");
 
   // Radio rows show only the persisted default; "Add model" discovery lists the
   // rest of the fetched catalog (everything that isn't already the default).
@@ -136,6 +169,11 @@ export function ProviderCard({ conn }: { conn: ProviderConnection }) {
       }
       setSecretAccessKey("");
       setSessionToken("");
+      setApiKey("");
+    } else if (isHostedKey) {
+      await saveConnection({ ...conn, baseUrl: baseUrl.trim() || undefined });
+      // Persist a freshly-entered key (write-only), then drop it locally.
+      if (apiKey) await setSecret(conn.id, "apiKey", apiKey);
       setApiKey("");
     } else {
       await saveConnection({ ...conn, baseUrl: baseUrl.trim() || undefined });
@@ -309,6 +347,36 @@ export function ProviderCard({ conn }: { conn: ProviderConnection }) {
                     onClear={() => void clearSecret(conn.id, "apiKey")}
                   />
                 ) : null}
+              </>
+            ) : isHostedKey ? (
+              <>
+                <div className="space-y-1.5">
+                  <label
+                    htmlFor={`baseurl-${conn.id}`}
+                    className={fieldLabelClass()}
+                  >
+                    Base URL
+                  </label>
+                  <Input
+                    id={`baseurl-${conn.id}`}
+                    value={baseUrl}
+                    placeholder={hostedBaseUrlMeta(conn.kind).placeholder}
+                    onChange={(e) => setBaseUrl(e.target.value)}
+                  />
+                  <p className="text-[11px] text-muted-foreground">
+                    {hostedBaseUrlMeta(conn.kind).hint}
+                  </p>
+                </div>
+                <SecretField
+                  id={`apikey-${conn.id}`}
+                  label="API Key"
+                  placeholder="sk-…"
+                  value={apiKey}
+                  onChange={setApiKey}
+                  hasKey={conn.hasKey}
+                  hint="Stored securely in the OS keychain."
+                  onClear={() => void clearSecret(conn.id, "apiKey")}
+                />
               </>
             ) : (
               <div className="space-y-1.5">

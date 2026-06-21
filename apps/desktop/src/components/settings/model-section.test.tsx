@@ -101,11 +101,32 @@ afterEach(() => {
 });
 
 describe("ModelSection provider accordion", () => {
-  it("renders a card per registry connection, including Bedrock", async () => {
+  it("renders a card per registry connection, including Bedrock and SiliconFlow", async () => {
     await renderSection();
     expect(cardHeader("candle-vLLM")).not.toBeNull();
     expect(cardHeader("Ollama")).not.toBeNull();
     expect(cardHeader("AWS Bedrock")).not.toBeNull();
+    expect(cardHeader("SiliconFlow")).not.toBeNull();
+  });
+
+  it("shows the hosted-key fields (Base URL + API Key) for SiliconFlow", async () => {
+    await renderSection();
+    await click(cardHeader("SiliconFlow"));
+    const sf = card("SiliconFlow");
+    expect(hasLabel("Base URL", sf)).toBe(true);
+    expect(hasLabel("API Key", sf)).toBe(true);
+    // Hosted, not the local "Host (optional)" or Bedrock region form.
+    expect(hasLabel("Host (optional)", sf)).toBe(false);
+    expect(hasLabel("Region", sf)).toBe(false);
+  });
+
+  it("surfaces a Test Connection error for SiliconFlow with no key", async () => {
+    await renderSection();
+    await click(cardHeader("SiliconFlow"));
+    const sf = card("SiliconFlow");
+    await click(byText("Test Connection", "button", sf));
+    const alert = card("SiliconFlow").querySelector('[role="alert"]');
+    expect(alert?.textContent).toMatch(/SiliconFlow API key/i);
   });
 
   it("switches Bedrock auth mode, revealing the matching fields", async () => {

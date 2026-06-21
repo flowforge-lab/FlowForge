@@ -22,11 +22,12 @@ import type { ProviderKind } from "@/bindings/ProviderKind";
 
 /** Kinds the backend can serve (matches `ProviderKind`). Used to offer only
  *  add-able providers — the registry seeds candle-vLLM + Ollama, so in practice
- *  this surfaces AWS Bedrock. */
+ *  this surfaces AWS Bedrock and the hosted OpenAI-compatible providers. */
 const ADDABLE: ReadonlyArray<{ kind: ProviderKind; label: string }> = [
   { kind: "candleVllm", label: "candle-vLLM" },
   { kind: "ollama", label: "Ollama" },
   { kind: "bedrock", label: "AWS Bedrock" },
+  { kind: "siliconFlow", label: "SiliconFlow" },
 ];
 
 const EFFORT_OPTIONS: ReadonlyArray<{ value: Effort; label: string }> = [
