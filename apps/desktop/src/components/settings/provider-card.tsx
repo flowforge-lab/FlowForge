@@ -17,6 +17,7 @@ const KIND_META: Record<
   ollama: { badge: "O", color: "#8bc34a", tier: "Local" },
   bedrock: { badge: "B", color: "#ff9900", tier: "Hosted" },
   openai: { badge: "AI", color: "#10a37f", tier: "Hosted" },
+  siliconFlow: { badge: "SF", color: "#6d28d9", tier: "Hosted" },
 };
 
 const AUTH_OPTIONS: ReadonlyArray<{ value: BedrockAuth; label: string }> = [

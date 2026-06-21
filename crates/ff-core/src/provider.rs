@@ -33,6 +33,9 @@ pub enum ProviderKind {
     /// default `openAi`) so it matches `slug()` and the `vendor` descriptor.
     #[serde(rename = "openai")]
     OpenAi,
+    /// SiliconFlow. Hosted, OpenAI-compatible (`.com` global / `.cn` China); a
+    /// bearer API key in the keychain. Served by the OpenAI-compatible provider.
+    SiliconFlow,
 }
 
 impl ProviderKind {
@@ -46,6 +49,9 @@ impl ProviderKind {
             // This default is only a placeholder for the rare base_url-less probe.
             ProviderKind::Bedrock => "https://bedrock-runtime.us-east-1.amazonaws.com",
             ProviderKind::OpenAi => "https://api.openai.com/v1",
+            // Global endpoint; `.cn` users override base_url with
+            // https://api.siliconflow.cn/v1.
+            ProviderKind::SiliconFlow => "https://api.siliconflow.com/v1",
         }
     }
 
@@ -57,6 +63,7 @@ impl ProviderKind {
             ProviderKind::Ollama => "ollama",
             ProviderKind::Bedrock => "bedrock",
             ProviderKind::OpenAi => "openai",
+            ProviderKind::SiliconFlow => "siliconflow",
         }
     }
 }
@@ -401,6 +408,21 @@ mod tests {
         assert_eq!(cfg.kind, ProviderKind::CandleVllm);
         assert_eq!(cfg.base_url, None);
         assert!(!cfg.has_key);
+    }
+
+    #[test]
+    fn siliconflow_kind_defaults_global_endpoint_and_slug() {
+        assert_eq!(
+            ProviderKind::SiliconFlow.default_base_url(),
+            "https://api.siliconflow.com/v1"
+        );
+        assert_eq!(ProviderKind::SiliconFlow.slug(), "siliconflow");
+    }
+
+    #[test]
+    fn siliconflow_kind_serializes_camel_case() {
+        let json = serde_json::to_string(&ProviderKind::SiliconFlow).unwrap();
+        assert_eq!(json, "\"siliconFlow\"");
     }
 
     #[test]
