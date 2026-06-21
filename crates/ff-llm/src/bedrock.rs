@@ -444,9 +444,15 @@ fn assistant_blocks(msg: &ChatMessage) -> Vec<ContentBlock> {
     let mut blocks = text_blocks(msg);
     if let Some(calls) = &msg.tool_calls {
         for call in calls {
+            // Bedrock rejects a null/empty `toolUse.input` ("input is empty"). A no-arg
+            // call streams no argument fragments, so its persisted `arguments` is "" and
+            // fails to parse -- default to an empty object, matching the always-object
+            // tool schema (the Bedrock/Anthropic convention for a no-arg call is `{}`).
             let input = serde_json::from_str::<serde_json::Value>(&call.function.arguments)
+                .ok()
+                .filter(serde_json::Value::is_object)
                 .map(|v| json_to_doc(&v))
-                .unwrap_or(Document::Null);
+                .unwrap_or_else(|| json_to_doc(&serde_json::json!({})));
             if let Ok(block) = ToolUseBlock::builder()
                 .tool_use_id(call.id.clone())
                 .name(call.function.name.clone())
@@ -682,6 +688,39 @@ mod tests {
             }
             _ => panic!("expected tool-use block"),
         }
+    }
+
+    fn tool_use_input(args: &str) -> serde_json::Value {
+        let (_, messages) = to_converse(&[assistant_with_call(args)]);
+        match &messages[0].content[0] {
+            ContentBlock::ToolUse(b) => doc_to_json(&b.input),
+            _ => panic!("expected tool-use block"),
+        }
+    }
+
+    #[test]
+    fn empty_args_tool_use_becomes_empty_object() {
+        // A no-arg call streams no argument fragments -> persisted as "". Must serialize
+        // as an empty object, not null (Bedrock: "toolUse.input is empty").
+        assert_eq!(tool_use_input(""), serde_json::json!({}));
+    }
+
+    #[test]
+    fn invalid_args_tool_use_becomes_empty_object() {
+        assert_eq!(tool_use_input("not json"), serde_json::json!({}));
+    }
+
+    #[test]
+    fn null_args_tool_use_becomes_empty_object() {
+        assert_eq!(tool_use_input("null"), serde_json::json!({}));
+    }
+
+    #[test]
+    fn object_args_are_preserved() {
+        assert_eq!(
+            tool_use_input(r#"{"command":"ls"}"#),
+            serde_json::json!({"command": "ls"})
+        );
     }
 
     fn assistant_with_calls(ids: &[&str]) -> ChatMessage {
