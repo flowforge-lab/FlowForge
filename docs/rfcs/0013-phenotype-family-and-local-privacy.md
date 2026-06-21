@@ -8,18 +8,25 @@
 
 ## 1. Summary & Goals
 
-FlowForge ships exactly one phenotype today: a reserved, empty `default` (no skills,
-no overrides). Everything past "bare agent" is left to the user to assemble. This RFC
-proposes a curated **phenotype family** — three opinionated, ready-to-use phenos — and
-the one piece of new machinery they need to be honest: a **network-egress policy** so a
-phenotype can guarantee "no data leaves this machine," not just "the model runs
-locally."
+FlowForge ships two phenotypes today: a reserved, empty `default` (the deletion-proof
+fallback) and a seeded **`codon`** (码子) — a *coding specialist* (codegraph DNA, a
+disciplined Research -> Plan -> Implement -> Verify engineer persona,
+`max_iterations = 50`) that is the current factory-active default (#298, explicitly a
+"for now" choice "until we revisit defaults"). Codon is a specialist, not a generalist;
+there is no general-purpose orchestrator and no privacy-restricted pheno. This RFC
+proposes rounding out a curated **phenotype family** — adding three opinionated,
+ready-to-use phenos alongside `codon` — and the one piece of new machinery they need to
+be honest: a **network-egress policy** so a phenotype can guarantee "no data leaves this
+machine," not just "the model runs locally."
 
-The three phenotypes:
+The three new phenotypes (joining the existing `codon`):
 
-- **`orchestrator`** — the factory-active default. An Aki-equivalent generalist tuned
-  to *decompose, delegate, and summarise* rather than to out-reason a frontier model.
-  Cheap, fast, good at routing work to sub-agents and MCP tools.
+- **`orchestrator`** — the *proposed* new factory-active default. An Aki-equivalent
+  generalist tuned to *decompose, delegate, and summarise* rather than to out-reason a
+  frontier model. Cheap, fast, good at routing work to sub-agents and MCP tools — it can
+  hand a coding sub-task to `codon`, a hard analysis to `erudite`. (Today's factory
+  default, `codon`, is a coding specialist; this RFC revisits that "for now" choice — see
+  §5.)
 - **`erudite`** — a deep-reasoning specialist. Pins a strong "thinking" model, a high
   iteration cap, and a rigorous-analysis persona. The pheno the orchestrator delegates
   hard problems to.
@@ -29,7 +36,9 @@ The three phenotypes:
 
 Goals:
 
-- Give users a useful working set on day one instead of a blank `default`.
+- Round out the working set: a general-purpose default plus a small bench of specialists
+  (`codon` for code, `erudite` for reasoning, `enclave` for privacy), instead of only a
+  coding specialist or a blank `default`.
 - Make "no PII over the internet" an **enforceable** property of a pheno, not a hope
   that rests on the user picking a local model.
 - Reuse the existing toolset-filtering seam (RFC 0011 / #240) so the egress policy is a
@@ -68,6 +77,13 @@ the enclave pheno in particular will track whatever local VLM the deployment has
   built-in `default` (reserved, empty) always exists so the app has a valid baseline.
   A pheno can already pin a model, a persona, and an iteration cap — that covers
   `orchestrator` and `erudite` with **zero new fields**.
+- **Existing seed + selection machinery** (#304, #298): `seed_builtin_content` writes
+  `~/.flowforge/phenos/codon.toml` and the bundled `codegraph` skill *write-if-absent* on
+  first run, and `initial_phenotype(persisted, resolve)` resolves the factory-active pheno
+  (persisted choice -> `codon` -> built-in `default`). The new phenos slot straight into
+  this seed path; changing the factory default is a one-line change to that resolver's
+  preferred name. `codon` itself is the model: a seeded `.toml` carrying skills + persona
+  + `max_iterations`, `model` intentionally unset so it inherits the connection's model.
 - **Toolset filtering** (RFC 0011 / #240): the agent already filters the *advertised*
   toolset per turn — Plan mode advertises only `Safety::ReadOnly` tools via
   `ToolContext.allowed`. The egress policy reuses this exact seam, keyed on a tool's
@@ -118,7 +134,7 @@ local-only by construction.
 Seed files land in the same place user phenos do (`~/.flowforge/phenos/<name>.toml`),
 written on first run if absent (the existing write-if-absent seed path).
 
-**`orchestrator`** (factory-active)
+**`orchestrator`** (proposed factory-active)
 
 ```toml
 # orchestrator.toml
@@ -127,7 +143,8 @@ model = ""                                  # unset -> the connection's default 
 persona = """
 You are an orchestrator. Decompose the request into sub-tasks, delegate each to the
 right sub-agent or tool, and synthesise a concise result. Prefer routing over solving
-everything yourself; hand hard reasoning to a reasoning-specialist pheno.
+everything yourself; hand coding to a coding pheno (codon) and hard reasoning to a
+reasoning specialist (erudite).
 """
 max_iterations = 20
 egress = "open"
@@ -162,17 +179,27 @@ max_iterations = 30
 egress = "local-only"
 ```
 
-The `default` pheno is **unchanged** — it stays the reserved, empty safety net the code
-relies on (`DEFAULT_PHENOTYPE = "default"`). We do **not** redefine it. Instead the
-factory **active** selection moves to `orchestrator`, so users land on a useful pheno out
-of the box while `default` remains as the bare fallback.
+The built-in `default` pheno is **unchanged** — it stays the reserved, empty safety net
+the code relies on (`DEFAULT_PHENOTYPE = "default"`, the final fallback in
+`initial_phenotype`). We do **not** redefine it.
+
+The factory-**active** selection is the live question. Today it is `codon` (#298), which
+the code comments flag as a "for now" default "until we revisit defaults" — this RFC is
+that revisit. `codon` is a *coding* specialist; landing every new user in a coding pheno
+is the wrong first impression for a general assistant. Proposal: move the factory-active
+selection to **`orchestrator`** (a one-line change to the preferred name in
+`initial_phenotype`), and keep `codon` seeded and one switch away for coding sessions —
+the orchestrator can also delegate coding sub-tasks to it. `default` remains the bare
+fallback when no seed landed. A persisted user choice still always wins, so no existing
+user who selected `codon` is disturbed.
 
 ## 6. Composition story
 
-`orchestrator` routes, `erudite` reasons, `enclave` contains:
+`orchestrator` routes, `codon` codes, `erudite` reasons, `enclave` contains:
 
-- The orchestrator delegates a hard analytical sub-task to an `erudite` sub-agent and
-  summarises the result — small router model + strong reasoner, no single giant model.
+- The orchestrator delegates a coding sub-task to a `codon` sub-agent (codegraph DNA,
+  the verify loop) and a hard analytical sub-task to an `erudite` sub-agent, then
+  summarises — a small router model driving specialists, no single giant model.
 - In a privacy-restricted deployment the active pheno is `enclave`; every session is
   local-only by construction, including any sub-agents it spawns (the egress policy is
   inherited by children, same as the Mode/allowlist inheritance today).
@@ -199,7 +226,9 @@ without it leaving the box." That needs the provider send-path to actually consu
   -> bool`) with a conservative default of `true` for unannotated/MCP tools.
 - The advertised-toolset filter in the agent loop gains an egress pass alongside the
   existing Mode/`allowed` pass.
-- Three seed `.toml` files + a factory-active-pheno value of `orchestrator`.
+- Three new seed `.toml` files (`orchestrator`, `erudite`, `enclave`) added to the
+  existing `seed_builtin_content` path alongside `codon`; the factory-active preferred
+  name in `initial_phenotype` changes from `codon` to `orchestrator`.
 - No session-record or IPC schema churn beyond the pheno field.
 
 ## 9. Phasing
@@ -207,7 +236,7 @@ without it leaving the box." That needs the provider send-path to actually consu
 | Phase | Label | Scope | Ships alone? |
 |-------|-------|-------|--------------|
 | **P1** | backend | `Egress` enum + `Phenotype.egress` field + tool network classification + the local-only advertised-toolset filter (reusing the #240 seam). Unit-tested in ff-agent/ff-core. | Yes — CLI value |
-| **P2** | backend | Seed the three phenos write-if-absent + move factory-active selection to `orchestrator`. CLI can select any of them. | Yes |
+| **P2** | backend | Seed the three new phenos write-if-absent (alongside the existing `codon`) + change the factory-active preferred name in `initial_phenotype` from `codon` to `orchestrator`. CLI can select any of them. | Yes |
 | **P3** | frontend | Surface `egress` in the pheno/Settings UI (a "local-only" badge on the pill so the guarantee is visible); TS bindings. | Yes |
 | **P4** | backend | Ollama attachment send-path (the #332 follow-up) so `enclave` can do local vision. | Yes |
 
@@ -238,6 +267,7 @@ Dependency: **P1 -> P2/P3**; P4 is independent and can land in parallel.
   no-network-restricted bash worth building, or is "no shell in enclave" acceptable for
   v1? Proposal: no shell in enclave for v1.
 
-**Resolved:** the three names are `orchestrator` / `erudite` / `enclave`; `default`
-stays the reserved empty fallback and `orchestrator` becomes the factory-active
-selection. Not open.
+**Resolved:** the three new names are `orchestrator` / `erudite` / `enclave`, joining the
+existing `codon`; the built-in `default` stays the reserved empty fallback. **Revisited
+(was #298 "for now"):** the factory-active selection moves from `codon` to `orchestrator`,
+with `codon` kept seeded and one switch away.
