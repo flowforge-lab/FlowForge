@@ -16,7 +16,17 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "str
 
 # Bedrock provider (#202). default-features=false + an explicit rustls-ring HTTP
 # client keeps us off aws-lc-rs, which needs cmake/nasm on CI runners.
-aws-config = { version = "1", default-features = false, features = ["behavior-version-latest", "rt-tokio"] }
+aws-config = { version = "1", default-features = false, features = [
+    "behavior-version-latest",
+    "rt-tokio",
+    # default-features = false (rustls-ring discipline, no aws-lc) also drops
+    # these two from the aws-config defaults; re-add them so Profile auth works:
+    # credentials-process runs credential_process profiles (e.g. ada), sso handles
+    # SSO profiles. Without them a profile resolves no credentials and every
+    # Bedrock call fails at request construction (#202).
+    "credentials-process",
+    "sso",
+] }
 aws-sdk-bedrockruntime = { version = "1", default-features = false, features = ["behavior-version-latest", "rt-tokio"] }
 # Control-plane client, used only by list_models (ListInferenceProfiles). Same
 # no-aws-lc-rs discipline as the runtime crate above.
