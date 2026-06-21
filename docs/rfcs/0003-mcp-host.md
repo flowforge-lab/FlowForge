@@ -168,7 +168,7 @@ and tool-step UI need **no special-casing**:
 
 - On a server reaching `Running`, its tools are **dynamically registered** into the
   `ToolRegistry` under a namespaced id **`mcp__<server>__<tool>`** (double-underscore,
-  matching the Aki/Claude convention) to prevent collisions with built-ins and
+  matching the Claude convention) to prevent collisions with built-ins and
   across servers. On stop/failure they are **unregistered**.
 - Each bridged tool defaults to **`Safety::Write`** → it is **approval-gated**,
   reusing the exact M2 approval round-trip and tool-step UI that built-in tools and

@@ -2,9 +2,11 @@
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
+import { ipc } from "@/lib/ipc";
 import {
   SUMMARY_THRESHOLD_MAX,
   SUMMARY_THRESHOLD_MIN,
+  activeConnection,
   useModelConfigStore,
 } from "@/store/model-config";
 
@@ -38,68 +40,115 @@ describe("model-config reasoning controls", () => {
     );
   });
 
-  it("resetModel restores local defaults without touching provider", () => {
+  it("resetModel restores local defaults without touching the registry", () => {
     useModelConfigStore.setState({
       effort: "low",
       summarizationThreshold: 300_000,
-      provider: {
-        kind: "ollama",
-        model: "llama3.2",
-        hasKey: false,
-        thinking: false,
-      },
+      registry: { active: "ollama", connections: [] },
     });
     useModelConfigStore.getState().resetModel();
     const s = useModelConfigStore.getState();
     expect(s.effort).toBe("medium");
     expect(s.summarizationThreshold).toBe(150_000);
-    // Provider is backend-owned — reset leaves it alone.
-    expect(s.provider?.kind).toBe("ollama");
-    expect(s.provider?.thinking).toBe(false);
+    // The registry is backend-owned — reset leaves it alone.
+    expect(s.registry?.active).toBe("ollama");
   });
 });
 
-describe("model-config provider load (mock IPC)", () => {
-  it("loads the provider config and model list", async () => {
-    await useModelConfigStore.getState().load();
-    const s = useModelConfigStore.getState();
-    expect(s.provider?.kind).toBe("candleVllm");
-    expect(s.provider?.model).toBeTruthy();
-    expect(s.provider?.thinking).toBe(true);
-    expect(s.models.length).toBeGreaterThan(0);
-  });
-
-  it("round-trips a provider kind change through IPC", async () => {
-    await useModelConfigStore.getState().load();
-    await useModelConfigStore.getState().setKind("ollama");
-    expect(useModelConfigStore.getState().provider?.kind).toBe("ollama");
-  });
-
-  it("switching kind keeps each connection's own model (no spillover)", async () => {
-    const { load, setKind } = useModelConfigStore.getState();
-    await load();
-    // Normalize to candle-vLLM regardless of prior test order.
-    if (useModelConfigStore.getState().provider?.kind !== "candleVllm") {
-      await setKind("candleVllm");
+describe("model-config registry (mock IPC)", () => {
+  // The store talks to a module-level MockIpc singleton, so state (active
+  // connection, stored secrets, the bedrock auth mode mutated by a prior `it`)
+  // bleeds across tests. Reset it to the seed before each test for isolation.
+  beforeEach(async () => {
+    for (const kind of ["apiKey", "secretAccessKey", "sessionToken"] as const) {
+      await ipc.clearProviderSecret("bedrock", kind);
     }
-    expect(useModelConfigStore.getState().provider?.model).toBe(
-      "Qwen3-4B-Instruct-2507",
-    );
-
-    await setKind("ollama");
-    const s = useModelConfigStore.getState();
-    expect(s.provider?.kind).toBe("ollama");
-    // The Ollama connection's own model — not the candle model carried over.
-    expect(s.provider?.model).toBe("llama3.2");
-    expect(s.provider?.model).not.toBe("Qwen3-4B-Instruct-2507");
-    expect(s.models).toContain("llama3.2");
+    await ipc.upsertConnection({
+      id: "bedrock",
+      kind: "bedrock",
+      displayName: "AWS Bedrock",
+      model: "us.anthropic.claude-sonnet-4-0",
+      hasKey: false,
+      thinking: true,
+      region: "us-east-1",
+      authMode: "profile",
+      awsProfile: "bedrock-profile",
+    });
+    await ipc.setActiveConnection("candle-vllm");
+    useModelConfigStore.setState({
+      registry: null,
+      modelsById: {},
+      test: {},
+      loading: false,
+      saving: false,
+      error: null,
+    });
   });
 
-  it("persists the thinking toggle through IPC", async () => {
+  it("loads the registry and the active connection's models", async () => {
     await useModelConfigStore.getState().load();
-    await useModelConfigStore.getState().setThinking(false);
-    expect(useModelConfigStore.getState().provider?.thinking).toBe(false);
-    await useModelConfigStore.getState().setThinking(true);
-    expect(useModelConfigStore.getState().provider?.thinking).toBe(true);
+    const s = useModelConfigStore.getState();
+    const active = activeConnection(s.registry);
+    expect(active?.kind).toBe("candleVllm");
+    expect(active?.model).toBeTruthy();
+    expect(s.modelsById[s.registry!.active].length).toBeGreaterThan(0);
+  });
+
+  it("includes a Bedrock connection with region + auth mode", async () => {
+    await useModelConfigStore.getState().load();
+    const bedrock = useModelConfigStore
+      .getState()
+      .registry?.connections.find((c) => c.kind === "bedrock");
+    expect(bedrock?.region).toBe("us-east-1");
+    expect(bedrock?.authMode).toBe("profile");
+  });
+
+  it("switches the default (active) connection through IPC", async () => {
+    const { load, setActiveConnection } = useModelConfigStore.getState();
+    await load();
+    await setActiveConnection("ollama");
+    expect(useModelConfigStore.getState().registry?.active).toBe("ollama");
+  });
+
+  it("picking a default model also activates that connection", async () => {
+    const { load, setDefaultModel } = useModelConfigStore.getState();
+    await load();
+    await setDefaultModel("ollama", "qwen2.5");
+    const s = useModelConfigStore.getState();
+    expect(s.registry?.active).toBe("ollama");
+    expect(s.registry?.connections.find((c) => c.id === "ollama")?.model).toBe(
+      "qwen2.5",
+    );
+  });
+
+  it("stores a secret write-only and flips hasKey from the registry", async () => {
+    const { load, setSecret, clearSecret } = useModelConfigStore.getState();
+    await load();
+    await setSecret("bedrock", "apiKey", "br-secret-value");
+    expect(
+      useModelConfigStore
+        .getState()
+        .registry?.connections.find((c) => c.id === "bedrock")?.hasKey,
+    ).toBe(true);
+    await clearSecret("bedrock", "apiKey");
+    expect(
+      useModelConfigStore
+        .getState()
+        .registry?.connections.find((c) => c.id === "bedrock")?.hasKey,
+    ).toBe(false);
+  });
+
+  it("records a test-connection error when API-Key creds are missing", async () => {
+    const { load, saveConnection, clearSecret, testConnection } =
+      useModelConfigStore.getState();
+    await load();
+    const bedrock = useModelConfigStore
+      .getState()
+      .registry!.connections.find((c) => c.id === "bedrock")!;
+    await clearSecret("bedrock", "apiKey");
+    await saveConnection({ ...bedrock, authMode: "apiKey" });
+    await testConnection("bedrock");
+    const result = useModelConfigStore.getState().test["bedrock"];
+    expect(result?.state).toBe("error");
   });
 });

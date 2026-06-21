@@ -14,12 +14,20 @@ const conn = (over: Partial<ProviderConnection> = {}): ProviderConnection => ({
 });
 
 describe("MockIpc provider connection registry", () => {
-  it("seeds candle-vLLM (active) plus a keyless Ollama", async () => {
+  it("seeds candle-vLLM (active), a keyless Ollama, and AWS Bedrock", async () => {
     const ipc = new MockIpc();
     const reg = await ipc.getProviderRegistry();
     expect(reg.active).toBe("candle-vllm");
-    expect(reg.connections.map((c) => c.id)).toEqual(["candle-vllm", "ollama"]);
+    expect(reg.connections.map((c) => c.id)).toEqual([
+      "candle-vllm",
+      "ollama",
+      "bedrock",
+    ]);
     expect(reg.connections.every((c) => c.hasKey === false)).toBe(true);
+    const bedrock = reg.connections.find((c) => c.id === "bedrock");
+    expect(bedrock?.kind).toBe("bedrock");
+    expect(bedrock?.region).toBe("us-east-1");
+    expect(bedrock?.authMode).toBe("profile");
   });
 
   it("getProviderRegistry returns a copy callers cannot mutate", async () => {
@@ -28,7 +36,7 @@ describe("MockIpc provider connection registry", () => {
     reg.connections.pop();
     reg.active = "tampered";
     const fresh = await ipc.getProviderRegistry();
-    expect(fresh.connections).toHaveLength(2);
+    expect(fresh.connections).toHaveLength(3);
     expect(fresh.active).toBe("candle-vllm");
   });
 
@@ -50,7 +58,7 @@ describe("MockIpc provider connection registry", () => {
     );
     expect(stored.model).toBe("qwen2.5");
     const reg = await ipc.getProviderRegistry();
-    expect(reg.connections).toHaveLength(2);
+    expect(reg.connections).toHaveLength(3);
     expect(reg.connections.find((c) => c.id === "ollama")?.model).toBe(
       "qwen2.5",
     );
@@ -62,7 +70,7 @@ describe("MockIpc provider connection registry", () => {
       conn({ vendor: "OpenRouter", displayName: "OpenRouter" }),
     );
     expect(stored.id).toBe("openrouter");
-    expect((await ipc.getProviderRegistry()).connections).toHaveLength(3);
+    expect((await ipc.getProviderRegistry()).connections).toHaveLength(4);
   });
 
   it("dedupes derived ids with a numeric suffix", async () => {
@@ -79,13 +87,17 @@ describe("MockIpc provider connection registry", () => {
     await ipc.setActiveConnection("ollama");
     await ipc.removeConnection("ollama");
     const reg = await ipc.getProviderRegistry();
-    expect(reg.connections.map((c) => c.id)).toEqual(["candle-vllm"]);
+    expect(reg.connections.map((c) => c.id)).toEqual([
+      "candle-vllm",
+      "bedrock",
+    ]);
     expect(reg.active).toBe("candle-vllm");
   });
 
   it("rejects removing the last connection", async () => {
     const ipc = new MockIpc();
     await ipc.removeConnection("ollama");
+    await ipc.removeConnection("bedrock");
     await expect(ipc.removeConnection("candle-vllm")).rejects.toThrow(/last/);
   });
 
@@ -98,6 +110,81 @@ describe("MockIpc provider connection registry", () => {
       "mistral",
     ]);
     expect(await ipc.listModels("unknown")).toEqual([]);
+  });
+
+  it("lists Bedrock inference-profile ids for the bedrock connection", async () => {
+    const ipc = new MockIpc();
+    const models = await ipc.listModels("bedrock");
+    expect(models).toContain("us.anthropic.claude-sonnet-4-0");
+    expect(models).toContain("amazon.nova-pro-v1:0");
+  });
+
+  it("stores a secret write-only and flips hasKey, then clears it", async () => {
+    const ipc = new MockIpc();
+    await ipc.setProviderSecret("bedrock", "apiKey", "br-abc123");
+    expect(
+      (await ipc.getProviderRegistry()).connections.find(
+        (c) => c.id === "bedrock",
+      )?.hasKey,
+    ).toBe(true);
+    await ipc.clearProviderSecret("bedrock", "apiKey");
+    expect(
+      (await ipc.getProviderRegistry()).connections.find(
+        (c) => c.id === "bedrock",
+      )?.hasKey,
+    ).toBe(false);
+  });
+
+  it("rejects writing a secret to an unknown connection", async () => {
+    const ipc = new MockIpc();
+    await expect(ipc.setProviderSecret("nope", "apiKey", "x")).rejects.toThrow(
+      /unknown/,
+    );
+  });
+
+  it("test_connection passes for a local kind and a profile-mode Bedrock", async () => {
+    const ipc = new MockIpc();
+    await expect(ipc.testConnection("candle-vllm")).resolves.toBeUndefined();
+    // Seeded Bedrock is profile mode → resolves from ~/.aws, no secret needed.
+    await expect(ipc.testConnection("bedrock")).resolves.toBeUndefined();
+  });
+
+  it("test_connection fails for API-Key Bedrock with no stored key", async () => {
+    const ipc = new MockIpc();
+    const bedrock = (await ipc.getProviderRegistry()).connections.find(
+      (c) => c.id === "bedrock",
+    )!;
+    await ipc.upsertConnection({ ...bedrock, authMode: "apiKey" });
+    await expect(ipc.testConnection("bedrock")).rejects.toThrow(/API key/);
+    // Once the key is stored, the probe passes.
+    await ipc.setProviderSecret("bedrock", "apiKey", "br-abc123");
+    await expect(ipc.testConnection("bedrock")).resolves.toBeUndefined();
+  });
+
+  it("test_connection fails for IAM-Keys Bedrock until both key id and secret are set", async () => {
+    const ipc = new MockIpc();
+    const bedrock = (await ipc.getProviderRegistry()).connections.find(
+      (c) => c.id === "bedrock",
+    )!;
+    // IAM mode with neither the access key id nor the secret access key.
+    await ipc.upsertConnection({
+      ...bedrock,
+      authMode: "iamKeys",
+      accessKeyId: undefined,
+    });
+    await expect(ipc.testConnection("bedrock")).rejects.toThrow(/IAM keys/);
+
+    // Access key id alone is still incomplete (secret access key missing).
+    await ipc.upsertConnection({
+      ...bedrock,
+      authMode: "iamKeys",
+      accessKeyId: "AKIAEXAMPLE",
+    });
+    await expect(ipc.testConnection("bedrock")).rejects.toThrow(/IAM keys/);
+
+    // Both present → the probe passes.
+    await ipc.setProviderSecret("bedrock", "secretAccessKey", "shhh");
+    await expect(ipc.testConnection("bedrock")).resolves.toBeUndefined();
   });
 
   it("getProviderConfig/setProviderConfig shim the active connection", async () => {

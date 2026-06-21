@@ -41,6 +41,7 @@ import type {
   MemoryFlushedEvent,
 } from "../bindings";
 import type { Format } from "../bindings/Format";
+import type { SecretKind } from "../bindings/SecretKind";
 
 export type Unlisten = () => void;
 
@@ -126,6 +127,25 @@ export interface FfIpc {
   /** Best-effort model ids for a connection (defaults to the active one); `[]`
    *  when the endpoint is unreachable. */
   listModels(id?: string): Promise<string[]>;
+  // Provider secrets (Issue #202 PR-3). Write-only: secret material (API key,
+  // AWS secret access key, session token) goes to the OS keychain and is NEVER
+  // read back over IPC — the only observable signal is `hasKey` on the refreshed
+  // `ProviderConnection`. `bindings/` is untouched; `SecretKind` is the generated
+  // discriminator already shipped with the registry types (#126).
+  /** Store one secret for a connection in the OS keychain; flips its `hasKey`.
+   *  The value is never returned or logged. */
+  setProviderSecret(
+    connectionId: string,
+    kind: SecretKind,
+    value: string,
+  ): Promise<void>;
+  /** Remove one stored secret for a connection; recomputes `hasKey` from what
+   *  remains. Idempotent. */
+  clearProviderSecret(connectionId: string, kind: SecretKind): Promise<void>;
+  /** Probe a connection end-to-end (defaults to the active one) for the settings
+   *  "Test Connection" button. Resolves on a successful round-trip; rejects with a
+   *  message to show on failure. Unlike `listModels`, the error is surfaced. */
+  testConnection(id?: string): Promise<void>;
 
   // Web search (Issue #43). SearXNG is wired keyless; hosted backends are gated
   // until key storage (#8). Secrets are never part of this contract.
@@ -380,6 +400,12 @@ class TauriIpc implements FfIpc {
   removeConnection = (id: string) =>
     this.invoke<void>("remove_connection", { id });
   listModels = (id?: string) => this.invoke<string[]>("list_models", { id });
+  setProviderSecret = (connectionId: string, kind: SecretKind, value: string) =>
+    this.invoke<void>("set_provider_secret", { connectionId, kind, value });
+  clearProviderSecret = (connectionId: string, kind: SecretKind) =>
+    this.invoke<void>("clear_provider_secret", { connectionId, kind });
+  testConnection = (id?: string) =>
+    this.invoke<void>("test_connection", { id });
 
   getSearchConfig = () => this.invoke<SearchConfig>("get_search_config");
   setSearchConfig = (backend: SearchBackend, baseUrl: string | undefined) =>
