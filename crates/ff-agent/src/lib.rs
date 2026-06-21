@@ -373,11 +373,8 @@ impl<'a> ToolResultBackfill<'a> {
 impl Drop for ToolResultBackfill<'_> {
     fn drop(&mut self) {
         for call_id in self.pending.drain() {
-            self.store.add_tool_result_message(
-                self.session_id,
-                call_id,
-                "[cancelled]".to_string(),
-            );
+            self.store
+                .add_tool_result_message(self.session_id, call_id, "[cancelled]".to_string());
         }
     }
 }
