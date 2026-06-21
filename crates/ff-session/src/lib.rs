@@ -13,7 +13,7 @@
 use std::path::Path;
 use std::sync::Mutex;
 
-use ff_core::{auto_title, Message, Mode, Role, Session, SessionStatus, ToolCall};
+use ff_core::{auto_title, Format, Message, Mode, Role, Session, SessionStatus, ToolCall};
 use rusqlite::{params, Connection, OptionalExtension};
 
 fn now_ms() -> i64 {
@@ -431,6 +431,123 @@ impl SessionStore {
         .expect("clone forked messages");
         Some(forked)
     }
+
+    /// Fetch a single session by id, or `None` if it does not exist.
+    pub fn get_session(&self, session_id: &str) -> Option<Session> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT id, goal, title, summary, status, created_at, updated_at, phenotype, mode
+             FROM sessions WHERE id = ?1",
+            params![session_id],
+            row_to_session,
+        )
+        .optional()
+        .ok()
+        .flatten()
+    }
+
+    /// Render a session and its full transcript as JSON or Markdown (RFC 0012,
+    /// #278). Returns `None` for an unknown session id.
+    ///
+    /// JSON is a lossless `{ session, messages }` envelope that deserializes back
+    /// to the same values. Markdown is a folded transcript meant to be read in a
+    /// Markdown viewer.
+    pub fn export_session(&self, session_id: &str, format: Format) -> Option<String> {
+        let session = self.get_session(session_id)?;
+        let messages = self.get_messages(session_id);
+        Some(match format {
+            Format::Json => export_json(&session, &messages),
+            Format::Markdown => export_markdown(&session, &messages),
+        })
+    }
+}
+
+/// JSON export envelope. Private: the public surface is the serialized string, but
+/// tests deserialize back into this to prove the round trip is lossless.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ExportEnvelope {
+    session: Session,
+    messages: Vec<Message>,
+}
+
+fn export_json(session: &Session, messages: &[Message]) -> String {
+    let envelope = ExportEnvelope {
+        session: session.clone(),
+        messages: messages.to_vec(),
+    };
+    serde_json::to_string_pretty(&envelope).expect("serialize export envelope")
+}
+
+/// Tool output longer than this many characters is folded into a collapsed block
+/// so a transcript stays scannable; the full text is preserved, just collapsed.
+const TOOL_OUTPUT_FOLD_THRESHOLD: usize = 600;
+
+fn export_markdown(session: &Session, messages: &[Message]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    let title = session.title.as_deref().unwrap_or("Untitled session");
+    let _ = writeln!(out, "# {title}\n");
+    let _ = writeln!(out, "- **Created:** {}", fmt_ts(session.created_at));
+    let _ = writeln!(out, "- **Updated:** {}", fmt_ts(session.updated_at));
+    if let Some(goal) = &session.goal {
+        let _ = writeln!(out, "- **Goal:** {goal}");
+    }
+    if let Some(phenotype) = &session.phenotype {
+        let _ = writeln!(out, "- **Phenotype:** {phenotype}");
+    }
+    if let Some(mode) = session.mode {
+        let _ = writeln!(out, "- **Mode:** {}", mode_label(mode));
+    }
+    out.push('\n');
+
+    // Messages are stored in `seq` order, so a tool result already follows the
+    // assistant message that requested it -- the tool_call_id binding is honored
+    // by that ordering.
+    for msg in messages {
+        let heading = match msg.role {
+            Role::System => continue,
+            Role::User => "## You",
+            Role::Assistant => "## Assistant",
+            Role::Tool => "## Tool",
+        };
+        let _ = writeln!(out, "{heading}\n");
+
+        let content = msg.content.trim_end();
+        if !content.is_empty() {
+            if msg.role == Role::Tool && content.chars().count() > TOOL_OUTPUT_FOLD_THRESHOLD {
+                let len = content.chars().count();
+                let _ = writeln!(
+                    out,
+                    "<details><summary>Tool output ({len} chars)</summary>\n"
+                );
+                let _ = writeln!(out, "```\n{content}\n```\n");
+                let _ = writeln!(out, "</details>\n");
+            } else {
+                let _ = writeln!(out, "{content}\n");
+            }
+        }
+
+        if let Some(calls) = &msg.tool_calls {
+            for call in calls {
+                let _ = writeln!(out, "**Tool call:** {}({})\n", call.name, call.arguments);
+            }
+        }
+    }
+    out
+}
+
+fn fmt_ts(ms: i64) -> String {
+    chrono::DateTime::from_timestamp_millis(ms)
+        .map(|dt| dt.format("%Y-%m-%d %H:%M UTC").to_string())
+        .unwrap_or_else(|| ms.to_string())
+}
+
+fn mode_label(mode: Mode) -> &'static str {
+    match mode {
+        Mode::Plan => "Plan",
+        Mode::Act => "Act",
+        Mode::Auto => "Auto",
+    }
 }
 
 /// Version-gated migration runner. Bumps `PRAGMA user_version` as the schema
@@ -829,5 +946,67 @@ mod tests {
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
         assert_eq!(version, 1);
+    }
+
+    #[test]
+    fn export_json_round_trips() {
+        let store = SessionStore::new();
+        let s = store.create_session(Some("ship it".into()));
+        store.add_message(&s.id, Role::User, "hello".into());
+        store.add_message(&s.id, Role::Assistant, "hi there".into());
+
+        let json = store.export_session(&s.id, Format::Json).unwrap();
+        let env: ExportEnvelope = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(env.session, store.get_session(&s.id).unwrap());
+        assert_eq!(env.messages, store.get_messages(&s.id));
+    }
+
+    #[test]
+    fn export_markdown_has_headings_and_folds_large_tool_output() {
+        let store = SessionStore::new();
+        let s = store.create_session(Some("debug".into()));
+        store.add_message(&s.id, Role::User, "whats wrong".into());
+        let assistant = store.add_message(&s.id, Role::Assistant, "let me check".into());
+        store.attach_tool_calls(
+            &assistant.id,
+            &s.id,
+            vec![ToolCall {
+                id: "call_1".into(),
+                name: "read_file".into(),
+                arguments: "{\"path\":\"x\"}".into(),
+            }],
+        );
+        let big = "x".repeat(TOOL_OUTPUT_FOLD_THRESHOLD + 100);
+        store.add_tool_result_message(&s.id, "call_1".into(), big);
+
+        let md = store.export_session(&s.id, Format::Markdown).unwrap();
+
+        assert!(md.contains("- **Goal:** debug"));
+        assert!(md.contains("## You"));
+        assert!(md.contains("## Assistant"));
+        assert!(md.contains("## Tool"));
+        assert!(md.contains("**Tool call:** read_file("));
+        assert!(md.contains("<details>"));
+    }
+
+    #[test]
+    fn export_markdown_skips_system_messages() {
+        let store = SessionStore::new();
+        let s = store.create_session(None);
+        store.add_message(&s.id, Role::System, "you are a helpful agent".into());
+        store.add_message(&s.id, Role::User, "hi".into());
+
+        let md = store.export_session(&s.id, Format::Markdown).unwrap();
+
+        assert!(!md.contains("you are a helpful agent"));
+        assert!(md.contains("## You"));
+    }
+
+    #[test]
+    fn export_unknown_session_is_none() {
+        let store = SessionStore::new();
+        assert!(store.export_session("nope", Format::Json).is_none());
+        assert!(store.export_session("nope", Format::Markdown).is_none());
     }
 }

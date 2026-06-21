@@ -4,6 +4,7 @@
 //! regenerate bindings (`cargo test`) and update the mock in the same PR.
 
 pub mod events;
+mod export;
 mod mcp;
 mod memory;
 mod message;
@@ -13,6 +14,7 @@ mod search;
 mod session;
 mod skill;
 
+pub use export::Format;
 pub use mcp::{McpServerConfig, McpServerState, McpServerStatus, McpToolInfo};
 pub use memory::{MemoryFileInfo, MemoryFileKind, MemoryOverview};
 pub use message::{Message, Role, ToolCall};
