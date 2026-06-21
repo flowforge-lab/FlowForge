@@ -61,13 +61,16 @@ impl ProviderKind {
     }
 }
 
-/// How a Bedrock connection authenticates. All three resolve credentials
+/// How a Bedrock connection authenticates. Every mode resolves credentials
 /// backend-side; secret material (secret access key, session token, bearer API
 /// key) lives in the OS keychain and never on this contract.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export, export_to = "../../../apps/desktop/src/bindings/")]
 pub enum BedrockAuth {
+    /// Resolve by precedence from whatever is configured: API key > profile >
+    /// IAM keys (#320). The default for new connections. See [`BedrockAuth::resolve_auto`].
+    Auto,
     /// A named AWS profile from `~/.aws/config` (cred chain).
     Profile,
     /// Static IAM keys: access key id (non-secret, on the connection) plus a
@@ -75,6 +78,27 @@ pub enum BedrockAuth {
     IamKeys,
     /// A Bedrock bearer API key (in the keychain); skips SigV4.
     ApiKey,
+}
+
+impl BedrockAuth {
+    /// The concrete auth mode [`BedrockAuth::Auto`] picks from what a connection has
+    /// configured, in precedence order: a bearer **API key** wins over SigV4 (the
+    /// universal Bedrock-client convention), then a **profile**, then static **IAM
+    /// keys**. Profile-over-IAM is deliberate: static IAM keys are long-lived (AWS
+    /// discourages them), whereas a profile is typically SSO/role-backed. With
+    /// nothing configured it falls back to [`BedrockAuth::Profile`] so the probe
+    /// surfaces the real, actionable auth failure rather than a silent no-op.
+    pub fn resolve_auto(has_api_key: bool, has_profile: bool, has_iam_keys: bool) -> BedrockAuth {
+        if has_api_key {
+            BedrockAuth::ApiKey
+        } else if has_profile {
+            BedrockAuth::Profile
+        } else if has_iam_keys {
+            BedrockAuth::IamKeys
+        } else {
+            BedrockAuth::Profile
+        }
+    }
 }
 
 /// A piece of secret material stored in the OS keychain for a connection. Used as
@@ -609,6 +633,7 @@ mod tests {
     #[test]
     fn bedrock_auth_serializes_camel_case() {
         for (variant, wire) in [
+            (BedrockAuth::Auto, "\"auto\""),
             (BedrockAuth::Profile, "\"profile\""),
             (BedrockAuth::IamKeys, "\"iamKeys\""),
             (BedrockAuth::ApiKey, "\"apiKey\""),
@@ -616,6 +641,19 @@ mod tests {
             assert_eq!(serde_json::to_string(&variant).unwrap(), wire);
             assert_eq!(serde_json::from_str::<BedrockAuth>(wire).unwrap(), variant);
         }
+    }
+
+    #[test]
+    fn resolve_auto_prefers_api_key_then_profile_then_iam_keys() {
+        use BedrockAuth::*;
+        // (has_api_key, has_profile, has_iam_keys) => expected winner
+        assert_eq!(BedrockAuth::resolve_auto(true, true, true), ApiKey);
+        assert_eq!(BedrockAuth::resolve_auto(false, true, true), Profile);
+        assert_eq!(BedrockAuth::resolve_auto(false, false, true), IamKeys);
+        assert_eq!(BedrockAuth::resolve_auto(true, false, false), ApiKey);
+        assert_eq!(BedrockAuth::resolve_auto(false, true, false), Profile);
+        // Nothing configured falls back to Profile so the probe surfaces the failure.
+        assert_eq!(BedrockAuth::resolve_auto(false, false, false), Profile);
     }
 
     #[test]
