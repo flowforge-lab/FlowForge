@@ -26,6 +26,13 @@ pub enum ProviderKind {
     /// AWS Bedrock. Hosted; credentials resolved backend-side (AWS profile, IAM
     /// keys, or a bearer API key) and the endpoint derived from the region.
     Bedrock,
+    /// Hosted OpenAI, or any OpenAI-compatible hosted gateway (OpenRouter,
+    /// Azure OpenAI, Together). Bearer API key from the OS keychain; speaks the
+    /// same OpenAI-compatible `/chat/completions` + `/models` wire as the local
+    /// candle-vLLM kind. The wire tag is pinned to `openai` (not the camelCase
+    /// default `openAi`) so it matches `slug()` and the `vendor` descriptor.
+    #[serde(rename = "openai")]
+    OpenAi,
 }
 
 impl ProviderKind {
@@ -38,6 +45,7 @@ impl ProviderKind {
             // `bedrock-runtime.<region>.amazonaws.com` from the connection region.
             // This default is only a placeholder for the rare base_url-less probe.
             ProviderKind::Bedrock => "https://bedrock-runtime.us-east-1.amazonaws.com",
+            ProviderKind::OpenAi => "https://api.openai.com/v1",
         }
     }
 
@@ -48,6 +56,7 @@ impl ProviderKind {
             ProviderKind::CandleVllm => "candle-vllm",
             ProviderKind::Ollama => "ollama",
             ProviderKind::Bedrock => "bedrock",
+            ProviderKind::OpenAi => "openai",
         }
     }
 }
@@ -574,6 +583,27 @@ mod tests {
         );
         let k: ProviderKind = serde_json::from_str("\"bedrock\"").unwrap();
         assert_eq!(k, ProviderKind::Bedrock);
+    }
+
+    #[test]
+    fn openai_kind_slug_and_base_url() {
+        assert_eq!(ProviderKind::OpenAi.slug(), "openai");
+        assert_eq!(
+            ProviderKind::OpenAi.default_base_url(),
+            "https://api.openai.com/v1"
+        );
+    }
+
+    #[test]
+    fn openai_kind_wire_tag_is_pinned_not_camel_case() {
+        // The variant is pinned to "openai" via #[serde(rename)], NOT the
+        // camelCase default "openAi". Round-trips and matches slug()/vendor.
+        assert_eq!(
+            serde_json::to_string(&ProviderKind::OpenAi).unwrap(),
+            "\"openai\""
+        );
+        let k: ProviderKind = serde_json::from_str("\"openai\"").unwrap();
+        assert_eq!(k, ProviderKind::OpenAi);
     }
 
     #[test]
