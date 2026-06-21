@@ -343,7 +343,94 @@ fn to_converse(messages: &[ChatMessage]) -> (Vec<SystemContentBlock>, Vec<Messag
         }
     }
 
-    (system, out)
+    (system, enforce_tool_result_pairing(out))
+}
+
+/// Bedrock rejects any assistant `tool_use` block whose id lacks a `tool_result`
+/// in the immediately-following message. A turn whose future was dropped (window
+/// closed, command aborted, a new turn started over an in-flight one) can persist
+/// an assistant `tool_use` with no result, since the agent's `[cancelled]` backfill
+/// only runs on cooperative cancel -- not on async drop. That malformed history is
+/// replayed verbatim on the next turn and 400s the provider. Repair it here so an
+/// already-broken session can still be sent: inject a synthetic `tool_result` for
+/// every dangling `tool_use` id.
+fn enforce_tool_result_pairing(messages: Vec<Message>) -> Vec<Message> {
+    let mut out: Vec<Message> = Vec::with_capacity(messages.len() + 1);
+    let mut iter = messages.into_iter().peekable();
+
+    while let Some(msg) = iter.next() {
+        let tool_use_ids = collect_tool_use_ids(&msg);
+        out.push(msg);
+        if tool_use_ids.is_empty() {
+            continue;
+        }
+
+        // Ids the following message already answers (only a user message can).
+        let covered = match iter.peek() {
+            Some(next) if next.role == ConversationRole::User => collect_tool_result_ids(next),
+            _ => Vec::new(),
+        };
+        let synth: Vec<ContentBlock> = tool_use_ids
+            .into_iter()
+            .filter(|id| !covered.contains(id))
+            .map(synthetic_tool_result)
+            .collect();
+        if synth.is_empty() {
+            continue;
+        }
+
+        match iter.peek_mut() {
+            // Prepend so tool results lead the following user turn.
+            Some(next) if next.role == ConversationRole::User => {
+                let mut content = synth;
+                content.append(&mut next.content);
+                next.content = content;
+            }
+            // Trailing assistant, or a non-user message follows: insert a fresh user
+            // message carrying the synthetic results.
+            _ => out.push(
+                Message::builder()
+                    .role(ConversationRole::User)
+                    .set_content(Some(synth))
+                    .build()
+                    .expect("role is always set"),
+            ),
+        }
+    }
+
+    out
+}
+
+fn collect_tool_use_ids(msg: &Message) -> Vec<String> {
+    msg.content
+        .iter()
+        .filter_map(|b| match b {
+            ContentBlock::ToolUse(u) => Some(u.tool_use_id.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn collect_tool_result_ids(msg: &Message) -> Vec<String> {
+    msg.content
+        .iter()
+        .filter_map(|b| match b {
+            ContentBlock::ToolResult(r) => Some(r.tool_use_id.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn synthetic_tool_result(id: String) -> ContentBlock {
+    ContentBlock::ToolResult(
+        ToolResultBlock::builder()
+            .tool_use_id(id)
+            .content(ToolResultContentBlock::Text(
+                "[no result recorded]".to_string(),
+            ))
+            .build()
+            .expect("tool_use_id is always set"),
+    )
 }
 
 fn text_blocks(msg: &ChatMessage) -> Vec<ContentBlock> {
@@ -595,6 +682,95 @@ mod tests {
             }
             _ => panic!("expected tool-use block"),
         }
+    }
+
+    fn assistant_with_calls(ids: &[&str]) -> ChatMessage {
+        ChatMessage {
+            role: "assistant".into(),
+            content: None,
+            tool_calls: Some(
+                ids.iter()
+                    .map(|id| ToolCall {
+                        id: (*id).into(),
+                        kind: "function".into(),
+                        function: FunctionCall {
+                            name: "bash".into(),
+                            arguments: r#"{"command":"ls"}"#.into(),
+                        },
+                    })
+                    .collect(),
+            ),
+            tool_call_id: None,
+            name: None,
+        }
+    }
+
+    fn tool_result(id: &str) -> ChatMessage {
+        ChatMessage {
+            role: "tool".into(),
+            content: Some("ok".into()),
+            tool_calls: None,
+            tool_call_id: Some(id.into()),
+            name: Some("bash".into()),
+        }
+    }
+
+    fn result_ids(msg: &Message) -> Vec<&str> {
+        msg.content
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::ToolResult(r) => Some(r.tool_use_id.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn dangling_tool_use_gets_synthetic_result() {
+        // assistant(tool_use) immediately followed by a plain user prompt: the
+        // result was never persisted, so a synthetic one must lead that user turn.
+        let (_, messages) = to_converse(&[
+            assistant_with_calls(&["call_1"]),
+            ChatMessage::text("user", "what next?"),
+        ]);
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[1].role, ConversationRole::User);
+        assert_eq!(result_ids(&messages[1]), vec!["call_1"]);
+        // The original user text is preserved after the injected result.
+        assert!(matches!(messages[1].content[1], ContentBlock::Text(_)));
+    }
+
+    #[test]
+    fn trailing_tool_use_gets_synthetic_result() {
+        // History ends on an assistant tool_use (turn future dropped before the
+        // result was recorded): append a fresh user message carrying the result.
+        let (_, messages) = to_converse(&[assistant_with_calls(&["call_1"])]);
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[1].role, ConversationRole::User);
+        assert_eq!(result_ids(&messages[1]), vec!["call_1"]);
+    }
+
+    #[test]
+    fn partial_tool_results_backfilled() {
+        // Two parallel calls, only the first result persisted: the second is
+        // backfilled into the same following user message.
+        let (_, messages) = to_converse(&[
+            assistant_with_calls(&["call_1", "call_2"]),
+            tool_result("call_1"),
+        ]);
+        assert_eq!(messages.len(), 2);
+        let mut ids = result_ids(&messages[1]);
+        ids.sort_unstable();
+        assert_eq!(ids, vec!["call_1", "call_2"]);
+    }
+
+    #[test]
+    fn well_formed_history_is_unchanged() {
+        let (_, messages) =
+            to_converse(&[assistant_with_calls(&["call_1"]), tool_result("call_1")]);
+        assert_eq!(messages.len(), 2);
+        assert_eq!(result_ids(&messages[1]), vec!["call_1"]);
+        assert_eq!(messages[1].content.len(), 1);
     }
 
     #[test]
