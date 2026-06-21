@@ -2647,6 +2647,63 @@ mod tests {
         assert!(!has_key_of(&state, id));
     }
 
+    // ---- #311 PR-2: OpenAI connection secret lifecycle ----
+
+    /// A hosted-OpenAI connection (keychain `ApiKey`, no AWS fields). Unique id so
+    /// the process-global MemStore keychain stays isolated across parallel tests.
+    fn openai_conn(id: &str) -> ProviderConnection {
+        ProviderConnection {
+            id: id.into(),
+            kind: ProviderKind::OpenAi,
+            display_name: "OpenAI".into(),
+            vendor: None,
+            base_url: None,
+            model: "gpt-4o".into(),
+            has_key: false,
+            thinking: false,
+            region: None,
+            auth_mode: None,
+            aws_profile: None,
+            access_key_id: None,
+        }
+    }
+
+    #[test]
+    fn openai_connection_api_key_lifecycle() {
+        // Proves PR-1's "works end-to-end once a key is stored" claim for the
+        // OpenAI kind: the generic ApiKey plumbing flips has_key, keeps the value
+        // out of the registry, reports presence, and clears cleanly.
+        let id = "openai-lifecycle";
+        let state = AppState::with_registry(ProviderRegistry::default());
+        state.upsert_connection(openai_conn(id));
+
+        assert!(!has_key_of(&state, id));
+        assert!(state.connection_secret_presence(id).unwrap().is_empty());
+
+        state
+            .set_connection_secret(id, SecretKind::ApiKey, "sk-openai-xyz")
+            .unwrap();
+
+        assert!(has_key_of(&state, id));
+        assert_eq!(
+            crate::secrets::get(id, SecretKind::ApiKey).as_deref(),
+            Some("sk-openai-xyz")
+        );
+        assert_eq!(
+            state.connection_secret_presence(id).unwrap(),
+            vec![SecretKind::ApiKey]
+        );
+        // The secret value never enters the registry the frontend receives.
+        let json = serde_json::to_string(&state.provider_registry()).unwrap();
+        assert!(!json.contains("sk-openai-xyz"));
+
+        state
+            .clear_connection_secret(id, SecretKind::ApiKey)
+            .unwrap();
+        assert!(!has_key_of(&state, id));
+        assert!(state.connection_secret_presence(id).unwrap().is_empty());
+    }
+
     // ---- #320: per-kind presence + Auto auth resolution ----
 
     /// Build + insert a Bedrock connection with the given id and auth mode, leaving
