@@ -309,6 +309,8 @@ mod tests {
             }]),
             tool_call_id: None,
             name: None,
+
+            attachments: Vec::new(),
         };
         let v = serde_json::to_value([msg]).unwrap();
         let args = &v[0]["tool_calls"][0]["function"]["arguments"];

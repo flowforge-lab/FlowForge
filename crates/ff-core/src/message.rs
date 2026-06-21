@@ -21,6 +21,47 @@ pub struct ToolCall {
     pub arguments: String,
 }
 
+/// What an [`Attachment`] is, so a provider/UI can route it (vision vs. document).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "lowercase")]
+#[ts(export, export_to = "../../../apps/desktop/src/bindings/")]
+pub enum AttachmentKind {
+    Image,
+    Document,
+}
+
+/// Where an attachment's bytes live. A `Path` reference is preferred — it keeps the
+/// transcript and the database small, with base64 materialized only at provider
+/// send time. `Inline` carries base64 directly for sources that have no file on
+/// disk (e.g. a clipboard paste).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase", tag = "type", content = "value")]
+#[ts(export, export_to = "../../../apps/desktop/src/bindings/")]
+pub enum AttachmentSource {
+    Path(String),
+    Inline(String),
+}
+
+/// A file attached to a message (image or document). Round-trips through
+/// persistence and bridges to each provider's wire format at send time. Foundation
+/// for multimodal support (#332); providers consume it in their own tickets.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "../../../apps/desktop/src/bindings/")]
+pub struct Attachment {
+    pub kind: AttachmentKind,
+    /// IANA media type, e.g. "image/png" or "application/pdf".
+    pub media_type: String,
+    pub source: AttachmentSource,
+    /// Original file name, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub name: Option<String>,
+    /// Size of the payload in bytes.
+    #[ts(type = "number")]
+    pub bytes: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export, export_to = "../../../apps/desktop/src/bindings/")]
@@ -37,6 +78,11 @@ pub struct Message {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub tool_call_id: Option<String>,
+    /// Files attached to this message (multimodal, #332). Absent for a plain
+    /// text message; omitted from the wire/binding when none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub attachments: Option<Vec<Attachment>>,
     /// Unix epoch milliseconds.
     #[ts(type = "number")]
     pub created_at: i64,
