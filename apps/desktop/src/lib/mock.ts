@@ -36,6 +36,7 @@ import type {
   MemoryOverview,
   MemoryFlushedEvent,
 } from "../bindings";
+import type { Format } from "../bindings/Format";
 import type { SecretKind } from "../bindings/SecretKind";
 import type { FfIpc, Unlisten } from "./ipc";
 import type { MarketplaceSkill } from "./marketplace";
@@ -334,6 +335,51 @@ const bumpPatch = (version: string): string => {
   return `${version}.1`;
 };
 
+// Tool output beyond this many chars is folded in the Markdown export so a noisy
+// step doesn't dominate the document (mirrors the backend's truncation).
+const TOOL_FOLD_LIMIT = 2000;
+
+/** Human-readable Markdown for a session: title + metadata, then `## You` /
+ *  `## Assistant` / `## Tool` sections. `Role::System` is skipped; assistant tool
+ *  calls render as `**Tool call:** name(args)`; long tool output is folded. */
+function renderSessionMarkdown(session: Session, messages: Message[]): string {
+  const lines: string[] = [
+    `# ${session.title?.trim() || "Untitled session"}`,
+    "",
+  ];
+  const meta: string[] = [];
+  if (session.goal) meta.push(`- **Goal:** ${session.goal}`);
+  meta.push(`- **Created:** ${new Date(session.createdAt).toISOString()}`);
+  meta.push(`- **Updated:** ${new Date(session.updatedAt).toISOString()}`);
+  if (session.phenotype) meta.push(`- **Phenotype:** ${session.phenotype}`);
+  if (meta.length) lines.push(...meta, "");
+
+  for (const m of messages) {
+    if (m.role === "system") continue;
+    lines.push(
+      m.role === "user"
+        ? "## You"
+        : m.role === "assistant"
+          ? "## Assistant"
+          : "## Tool",
+      "",
+    );
+    if (m.content.trim()) {
+      const body =
+        m.role === "tool" && m.content.length > TOOL_FOLD_LIMIT
+          ? `${m.content.slice(0, TOOL_FOLD_LIMIT)}\n… (${m.content.length - TOOL_FOLD_LIMIT} more chars truncated)`
+          : m.content.trim();
+      lines.push(body, "");
+    }
+    if (m.role === "assistant" && m.toolCalls?.length) {
+      for (const c of m.toolCalls) {
+        lines.push(`**Tool call:** ${c.name}(${c.arguments})`, "");
+      }
+    }
+  }
+  return `${lines.join("\n").trimEnd()}\n`;
+}
+
 export class MockIpc implements FfIpc {
   private sessions = new Map<string, Session>();
   private messages = new Map<string, Message[]>();
@@ -549,6 +595,19 @@ export class MockIpc implements FfIpc {
 
   async getMessages(sessionId: string): Promise<Message[]> {
     return [...(this.messages.get(sessionId) ?? [])];
+  }
+
+  // Export (#278). Mirrors the backend `export_session`: a lossless JSON envelope
+  // ({ session, messages }, pretty-printed) or a human-readable Markdown render.
+  // Rejects an unknown id (the backend returns None → the command errors).
+  async exportSession(sessionId: string, format: Format): Promise<string> {
+    const session = this.sessions.get(sessionId);
+    if (!session) throw new Error(`unknown session: ${sessionId}`);
+    const messages = this.messages.get(sessionId) ?? [];
+    if (format === "json") {
+      return JSON.stringify({ session, messages }, null, 2);
+    }
+    return renderSessionMarkdown(session, messages);
   }
 
   async sendMessage(sessionId: string, content: string): Promise<string> {

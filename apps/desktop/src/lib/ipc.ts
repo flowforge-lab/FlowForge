@@ -40,6 +40,7 @@ import type {
   MemoryOverview,
   MemoryFlushedEvent,
 } from "../bindings";
+import type { Format } from "../bindings/Format";
 import type { SecretKind } from "../bindings/SecretKind";
 
 export type Unlisten = () => void;
@@ -55,6 +56,10 @@ export interface FfIpc {
   forkSession(sessionId: string): Promise<Session>;
   listSessions(): Promise<Session[]>;
   getMessages(sessionId: string): Promise<Message[]>;
+  /** Serialize a session for export (#278): lossless `json` ({session, messages})
+   *  or human-readable `markdown`. Rejects an unknown id. The FE writes the
+   *  returned string to a user-chosen path; no file IO crosses this seam. */
+  exportSession(sessionId: string, format: Format): Promise<string>;
   /** Sets a session's persisted display title (server-truth). */
   renameSession(sessionId: string, title: string): Promise<void>;
   /** Permanently remove a session and its transcript. Destructive; pairs with the
@@ -347,6 +352,8 @@ class TauriIpc implements FfIpc {
   listSessions = () => this.invoke<Session[]>("list_sessions");
   getMessages = (sessionId: string) =>
     this.invoke<Message[]>("get_messages", { sessionId });
+  exportSession = (sessionId: string, format: Format) =>
+    this.invoke<string>("export_session", { sessionId, format });
   renameSession = (sessionId: string, title: string) =>
     this.invoke<void>("rename_session", { sessionId, title });
   deleteSession = (sessionId: string) =>
