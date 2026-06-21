@@ -1922,6 +1922,7 @@ dependencies = [
 name = "ff-session"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "ff-core",
  "rusqlite",
  "serde",

@@ -16,9 +16,9 @@ use ff_core::events::{
     ToolAskRequestEvent, ToolCallEvent, ToolResultEvent, TurnDoneEvent, TurnErrorEvent,
 };
 use ff_core::{
-    McpServerConfig, McpServerStatus, MemoryFileInfo, MemoryFileKind, MemoryOverview, Message,
-    Mode, Phenotype, ProviderConfig, ProviderConnection, ProviderKind, ProviderRegistry, Role,
-    SearchConfig, SecretKind, Session, SessionWorkspace, Skill, SkillInfo, SkillManifest,
+    Format, McpServerConfig, McpServerStatus, MemoryFileInfo, MemoryFileKind, MemoryOverview,
+    Message, Mode, Phenotype, ProviderConfig, ProviderConnection, ProviderKind, ProviderRegistry,
+    Role, SearchConfig, SecretKind, Session, SessionWorkspace, Skill, SkillInfo, SkillManifest,
 };
 use ff_signals::SkillAggregate;
 use ff_tools::Safety;
@@ -171,6 +171,21 @@ fn list_sessions(state: State<'_, Arc<AppState>>) -> Vec<Session> {
 #[tauri::command]
 fn get_messages(state: State<'_, Arc<AppState>>, session_id: String) -> Vec<Message> {
     state.store.get_messages(&session_id)
+}
+
+/// Export a session and its transcript as Markdown or JSON (#278). Returns the
+/// rendered string for the frontend to save via a file dialog. Errors when the
+/// session id is unknown so the UI can surface it rather than write an empty file.
+#[tauri::command]
+fn export_session(
+    state: State<'_, Arc<AppState>>,
+    session_id: String,
+    format: Format,
+) -> Result<String, String> {
+    state
+        .store
+        .export_session(&session_id, format)
+        .ok_or_else(|| format!("session not found: {session_id}"))
 }
 
 /// Set a session's display title (server-truth). Used by the sidebar rename and
@@ -1221,6 +1236,7 @@ pub fn run() {
             create_session,
             list_sessions,
             get_messages,
+            export_session,
             rename_session,
             delete_session,
             fork_session,
