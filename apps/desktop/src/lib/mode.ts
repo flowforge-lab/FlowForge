@@ -23,10 +23,10 @@ export interface ModeMeta {
   dotClass: string;
 }
 
-// Descriptions state the *intent* of each mode, not an enforced guarantee: until
-// the backend mode-IPC seam lands (#281 follow-up), this selection is display-only
-// and does not yet gate the turn (see NOT_ENFORCED_NOTE). Light tints bumped to the
-// 700 token so `text-xs` clears WCAG AA on the 500/10 background.
+// Descriptions state what each mode does to the turn (#265 wired the backend gate):
+// Plan advertises only ReadOnly tools, Act prompts on every Write, Auto auto-approves
+// Write. Light tints bumped to the 700 token so `text-xs` clears WCAG AA on the
+// 500/10 background.
 export const MODE_META: Record<Mode, ModeMeta> = {
   plan: {
     label: "Plan",
@@ -50,8 +50,3 @@ export const MODE_META: Record<Mode, ModeMeta> = {
     dotClass: "bg-amber-500",
   },
 };
-
-/** Until modes gate the backend turn, the pill/settings surface this so the choice
- *  is never read as an active safety guarantee (review #287). */
-export const MODE_NOT_ENFORCED_NOTE =
-  "Display-only for now — modes don't gate the agent until backend wiring lands.";
