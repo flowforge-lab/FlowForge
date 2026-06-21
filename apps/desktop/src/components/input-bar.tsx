@@ -16,7 +16,7 @@ import { useComposerStore } from "@/store/composer";
 import { usePrefsStore } from "@/store/prefs";
 import { useSessionWorkspaceStore } from "@/store/session-workspace";
 import { useSessionModeStore, nextMode } from "@/store/session-mode";
-import { MODE_META, MODE_NOT_ENFORCED_NOTE } from "@/lib/mode";
+import { MODE_META } from "@/lib/mode";
 
 // Platform modifier glyph for tooltips (mirrors keyboard-section.tsx / the overlay).
 const MOD_GLYPH =
@@ -122,8 +122,8 @@ export function InputBar({
     mode === "plan" && lastIsAssistantPlan && !streaming && !pending;
 
   // Flip the pill to Act and send a continuation — the manual two-step (RFC 0011
-  // §8) collapsed into one click. Display-only re the backend until the mode-IPC
-  // seam lands; the copy is deliberately mechanical, not a safety "approval" (#288).
+  // §8) collapsed into one click. The mode flip now gates the backend turn (#265),
+  // so the copy stays mechanical, not a safety "approval".
   function switchToActAndContinue() {
     if (!targetSessionId || streaming || pending) return;
     setMode(targetSessionId, "act");
@@ -192,14 +192,13 @@ export function InputBar({
       <div className="mx-auto flex max-w-3xl flex-col gap-2">
         {/* Plan → Act handoff (#267): after the agent proposes a plan in Plan mode,
             one click flips the pill to Act and continues — the manual two-step
-            collapsed. Framed as the mechanical action, not a safety "approval": the
-            mode flip is display-only until the backend seam lands (#288), so the
-            copy must not imply mutation is now authorized server-side. */}
+            collapsed. Framed as the mechanical action, not a safety "approval":
+            switching to Act still gates each Write behind a prompt (#265). */}
         {showHandoff && (
           <button
             type="button"
             onClick={switchToActAndContinue}
-            title={`Switch the pill to Act and send a continuation.\n${MODE_NOT_ENFORCED_NOTE}`}
+            title="Switch the pill to Act and send a continuation."
             className="flex items-center justify-center gap-2 rounded-lg border border-emerald-500/40 bg-emerald-500/10 px-3 py-2 text-[12px] font-medium text-emerald-700 transition-colors hover:bg-emerald-500/20 dark:text-emerald-400"
           >
             <ArrowRight className="size-3.5 shrink-0" aria-hidden />
@@ -304,8 +303,8 @@ export function ModePill({ sessionId }: { sessionId: string }) {
     <button
       type="button"
       onClick={() => cycleMode(sessionId, defaultMode)}
-      title={`Mode: ${meta.label} — ${meta.description}\nClick (or ${MOD_GLYPH}.) to switch to ${MODE_META[nextMode(mode)].label}.\n${MODE_NOT_ENFORCED_NOTE}`}
-      aria-label={`Agent mode: ${meta.label} (display-only). Click to cycle.`}
+      title={`Mode: ${meta.label} — ${meta.description}\nClick (or ${MOD_GLYPH}.) to switch to ${MODE_META[nextMode(mode)].label}.`}
+      aria-label={`Agent mode: ${meta.label}. Click to cycle.`}
       className={cn(
         "inline-flex shrink-0 items-center gap-1.5 rounded-md border px-2 py-1.5 text-xs font-medium transition-colors",
         meta.pillClass,
