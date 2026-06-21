@@ -20,6 +20,10 @@ use crate::approver::{ApprovalMode, CliApprover};
 
 /// FlowForge on the command line: run an agent turn, inspect skills, no GUI.
 /// With no subcommand, opens an interactive REPL (multi-turn chat).
+///
+/// Exit codes (`run`): 0 = success, non-zero on an agent error or a
+/// required-but-denied tool approval. The REPL exits 0 on clean shutdown
+/// (EOF / `exit`); per-turn failures are printed inline.
 #[derive(Parser)]
 #[command(name = "flowforge", version, about)]
 struct Cli {
@@ -51,6 +55,10 @@ impl From<ModeArg> for Mode {
 #[derive(Subcommand)]
 enum Command {
     /// Run a single agent turn against a prompt and stream the result.
+    ///
+    /// Use `--json` for machine-readable output (one JSON event per line).
+    /// The process exits non-zero if an agent error occurs or a required
+    /// tool approval is denied (`--deny`, piped-no-policy, or `N` at a prompt).
     Run {
         /// The instruction for the agent (quote multi-word prompts).
         prompt: String,
@@ -397,7 +405,14 @@ async fn run(
     };
 
     match result {
-        Ok(_) => ExitCode::SUCCESS,
+        Ok(_) => {
+            if approver.was_denied() {
+                eprintln!("error: one or more required tool approvals were denied");
+                ExitCode::FAILURE
+            } else {
+                ExitCode::SUCCESS
+            }
+        }
         Err(e) => {
             eprintln!("error: {e}");
             ExitCode::FAILURE

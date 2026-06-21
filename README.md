@@ -140,6 +140,44 @@ pnpm --dir apps/desktop dev:mock
 cargo tauri build
 ```
 
+## 💻 Headless / CLI
+
+FlowForge ships a CLI binary (`flowforge`) for scripting, CI, and headless use
+— same agent loop, same tools, no GUI.
+
+```bash
+# One-shot: run a single turn and print the result
+flowforge run "summarize the contents of src/"
+
+# Non-interactive: auto-approve writes, stream JSON events to stdout
+flowforge run --json --yes "add a README section for the new memory crate"
+
+# Read-only analysis: deny all writes (safe default for CI)
+flowforge run --deny "audit src/ for unused dependencies"
+
+# Interactive REPL (default when no subcommand is given)
+flowforge
+```
+
+### Exit codes
+
+The `run` subcommand follows a scripting-friendly contract:
+
+- **0** — the turn completed successfully.
+- **non-zero** — an agent error occurred (e.g. LLM failure), or a required
+  tool approval was denied (by `--deny`, by the piped-no-policy rule, or by
+  answering `N` at a prompt).
+
+The interactive REPL always exits **0** on clean shutdown (EOF / `exit`);
+per-turn failures are printed inline and do not terminate the session.
+
+### Approval in CI
+
+When stdin is not a terminal and no `--yes` or `--deny` flag is provided, every
+write/dangerous tool call is **loudly denied** rather than silently run. This
+makes `--deny` the safe default for read-only CI pipelines, and `--yes` the
+explicit opt-in for autonomous runs.
+
 ## 🗺️ Roadmap
 
 - [x] Repository bootstrap & architecture definition

@@ -5,6 +5,7 @@
 //! loudly denied rather than silently run.
 
 use std::io::{self, IsTerminal, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
 use ff_agent::Approver;
@@ -34,11 +35,30 @@ pub(crate) enum ApprovalDecision {
 pub struct CliApprover {
     policy: ApprovalMode,
     agent_mode: Mode,
+    /// Latches `true` the first time a write/dangerous call is denied.
+    denied: AtomicBool,
 }
 
 impl CliApprover {
     pub fn new(policy: ApprovalMode, agent_mode: Mode) -> Self {
-        Self { policy, agent_mode }
+        Self {
+            policy,
+            agent_mode,
+            denied: AtomicBool::new(false),
+        }
+    }
+
+    /// Returns `true` if any write/dangerous tool call was denied since
+    /// construction.
+    ///
+    /// Read-only calls bypass the approver entirely, so this only flips
+    /// when a call that *needed* approval was refused — by `--deny`, by
+    /// the piped-no-policy rule, or by the user answering `N` at a prompt.
+    /// The `run` subcommand checks this after the turn to honor the
+    /// exit-code contract: a turn in which a required approval was denied
+    /// exits non-zero even if the model recovered with a text answer.
+    pub fn was_denied(&self) -> bool {
+        self.denied.load(Ordering::Relaxed)
     }
 
     /// Resolve an approval decision. The explicit `--yes/--deny` policy always wins:
@@ -102,7 +122,8 @@ impl Approver for CliApprover {
         let pretty = serde_json::to_string_pretty(args).unwrap_or_else(|_| args.to_string());
         eprintln!("{pretty}");
 
-        match Self::decide(self.agent_mode, self.policy, Self::input_mode(), safety) {
+        let approved = match Self::decide(self.agent_mode, self.policy, Self::input_mode(), safety)
+        {
             ApprovalDecision::Allow => {
                 if self.policy == ApprovalMode::Yes {
                     eprintln!("[approval] auto-approved by --yes");
@@ -128,11 +149,17 @@ impl Approver for CliApprover {
                 let _ = io::stderr().flush();
                 let mut line = String::new();
                 if io::stdin().read_line(&mut line).is_err() {
-                    return false;
+                    false
+                } else {
+                    matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes")
                 }
-                matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes")
             }
+        };
+
+        if !approved {
+            self.denied.store(true, Ordering::Relaxed);
         }
+        approved
     }
 
     async fn ask(
@@ -163,6 +190,7 @@ impl Approver for CliApprover {
 #[cfg(test)]
 mod tests {
     use super::{ApprovalDecision, ApprovalMode, CliApprover, InputMode};
+    use ff_agent::Approver;
     use ff_core::Mode;
     use ff_tools::Safety;
 
@@ -316,5 +344,43 @@ mod tests {
                 ApprovalDecision::Deny
             );
         }
+    }
+
+    #[tokio::test]
+    async fn was_denied_is_set_when_a_call_is_denied_by_policy() {
+        let approver = CliApprover::new(ApprovalMode::Deny, Mode::Act);
+        let approved = approver
+            .approve(
+                "msg",
+                "call",
+                "test_tool",
+                Safety::Dangerous,
+                &serde_json::json!({}),
+            )
+            .await;
+        assert!(!approved, "a dangerous call under --deny should be denied");
+        assert!(
+            approver.was_denied(),
+            "was_denied() must be true after a --deny denial"
+        );
+    }
+
+    #[tokio::test]
+    async fn was_denied_stays_false_when_a_call_is_allowed_by_yes() {
+        let approver = CliApprover::new(ApprovalMode::Yes, Mode::Act);
+        let approved = approver
+            .approve(
+                "msg",
+                "call",
+                "test_tool",
+                Safety::Dangerous,
+                &serde_json::json!({}),
+            )
+            .await;
+        assert!(approved, "a dangerous call under --yes should be allowed");
+        assert!(
+            !approver.was_denied(),
+            "was_denied() must stay false when the call is allowed"
+        );
     }
 }
