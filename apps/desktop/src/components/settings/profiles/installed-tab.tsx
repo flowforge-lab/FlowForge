@@ -32,6 +32,7 @@ export function InstalledTab() {
   const error = useProfilesStore((s) => s.error);
   const setActive = useProfilesStore((s) => s.setActive);
   const [installHint, setInstallHint] = useState(false);
+  const defaultId = defaultProfileId(profiles);
 
   return (
     <div className="space-y-5">
@@ -73,7 +74,7 @@ export function InstalledTab() {
                 key={profile.id}
                 profile={profile}
                 active={profile.id === activeId}
-                isDefault={profile.id === defaultProfileId(profiles)}
+                isDefault={profile.id === defaultId}
                 disabled={saving}
                 onSelect={() => void setActive(profile.id)}
               />
