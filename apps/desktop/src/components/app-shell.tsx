@@ -6,6 +6,7 @@ import { SplitPanel } from "@/components/split-panel";
 import { CommandPalette } from "@/components/palette";
 import { ShortcutsOverlay } from "@/components/shortcuts-overlay";
 import { SettingsPanel } from "@/components/settings-panel";
+import { PhenoMcpToast } from "@/components/pheno-mcp-toast";
 import { Button } from "@/components/ui/button";
 import { useChatStore } from "@/store/chat";
 import { usePrefsStore } from "@/store/prefs";
@@ -223,6 +224,7 @@ export function AppShell() {
       <CommandPalette />
       <ShortcutsOverlay />
       <SettingsPanel />
+      <PhenoMcpToast />
     </div>
   );
 }

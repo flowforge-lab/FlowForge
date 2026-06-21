@@ -49,6 +49,7 @@ import {
   type BackupResult,
 } from "./about";
 import { autoTitle } from "./auto-title";
+import type { PhenotypeMcpUnavailableEvent } from "./phenotype-mcp";
 
 type Listener<T> = (e: T) => void;
 
@@ -124,6 +125,15 @@ const MOCK_SKILLS: SkillInfo[] = [
     score: 0,
   },
 ];
+
+// Required MCP server ids per skill, mirroring `SkillManifest.mcp` (which the
+// `SkillInfo` binding deliberately omits, so the FE can't read it). Lets the mock
+// reproduce PR #296's `missing_skill_mcp_servers` diff and emit the #301 event:
+// `codegraph` wants the `codegraph` server, which is absent from `MOCK_MCP`, so
+// switching to the `codon` phenotype surfaces the unavailable-tools toast.
+const SKILL_MCP_REQUIREMENTS: Record<string, string[]> = {
+  codegraph: ["codegraph"],
+};
 
 // Mirrors `ff_skills::search_skills` scoring so the mock ranks like the backend:
 // exact keyword (4) > name prefix (3) > name substring (2) > description (1).
@@ -507,6 +517,9 @@ export class MockIpc implements FfIpc {
   );
   private mcpStatusListeners = new Set<Listener<McpStatusChangedEvent>>();
   private memoryFlushedListeners = new Set<Listener<MemoryFlushedEvent>>();
+  private phenoMcpUnavailableListeners = new Set<
+    Listener<PhenotypeMcpUnavailableEvent>
+  >();
   // Sessions that have already simulated a context-pressure flush (#283). The
   // real flush only fires once a session crosses the budget; the mock stands in
   // by flushing once per session so the provenance surface is exercisable.
@@ -692,6 +705,12 @@ export class MockIpc implements FfIpc {
 
   onMemoryFlushed(cb: Listener<MemoryFlushedEvent>): Promise<Unlisten> {
     return this.subscribe(this.memoryFlushedListeners, cb);
+  }
+
+  onPhenotypeMcpUnavailable(
+    cb: Listener<PhenotypeMcpUnavailableEvent>,
+  ): Promise<Unlisten> {
+    return this.subscribe(this.phenoMcpUnavailableListeners, cb);
   }
 
   async listMcpServers(): Promise<McpServerStatus[]> {
@@ -1214,6 +1233,9 @@ Shipping the Settings redesign — currently the Memory browser (SET.8).
     );
     this.activePhenotype = pheno;
     this.emitSkillsChanged();
+    // Mirror the backend warn (#296) as a UI signal (#301): a phenotype skill may
+    // declare an MCP server that isn't available.
+    this.emitPhenoMcpUnavailable(pheno.name, this.activeSkills);
     return pheno;
   }
 
@@ -1226,10 +1248,17 @@ Shipping the Settings redesign — currently the Memory browser (SET.8).
     name: string | null,
   ): Promise<void> {
     if (name !== null) {
-      const known =
-        name === DEFAULT_PHENOTYPE.name ||
-        MOCK_PHENOTYPES.some((p) => p.name === name);
-      if (!known) throw new Error(`unknown phenotype: ${name}`);
+      const pheno =
+        name === DEFAULT_PHENOTYPE.name
+          ? DEFAULT_PHENOTYPE
+          : MOCK_PHENOTYPES.find((p) => p.name === name);
+      if (!pheno) throw new Error(`unknown phenotype: ${name}`);
+      // Mirror the backend warn (#296/#301) on the per-pane path too, scoped to
+      // the bound phenotype's skills (the global active set is left untouched).
+      this.emitPhenoMcpUnavailable(
+        pheno.name,
+        pheno.skills.filter((n) => MOCK_SKILLS.some((s) => s.name === n)),
+      );
     }
     const s = this.sessions.get(sessionId);
     if (s) {
@@ -1578,6 +1607,35 @@ Shipping the Settings redesign — currently the Memory browser (SET.8).
         .sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))
         .map((s) => ({ ...s })),
     });
+  }
+
+  // Required-but-unavailable MCP server ids for a set of active skills (#301),
+  // mirroring the backend's `unavailable_required_servers`: collect each skill's
+  // declared servers, drop those present AND running, name-sort + dedupe.
+  private unavailableSkillMcp(skills: Iterable<string>): string[] {
+    const required = new Set<string>();
+    for (const name of skills) {
+      for (const server of SKILL_MCP_REQUIREMENTS[name] ?? []) {
+        required.add(server);
+      }
+    }
+    const running = new Set(
+      [...this.mcpServers.values()]
+        .filter((s) => s.state === "running")
+        .map((s) => s.id),
+    );
+    return [...required].filter((id) => !running.has(id)).sort();
+  }
+
+  // Emit `phenotype:mcp-unavailable` only when something is actually unavailable
+  // (matches the backend warn, which is per-missing-server). No-op otherwise.
+  private emitPhenoMcpUnavailable(
+    phenotype: string,
+    skills: Iterable<string>,
+  ): void {
+    const servers = this.unavailableSkillMcp(skills);
+    if (servers.length === 0) return;
+    this.emit(this.phenoMcpUnavailableListeners, { phenotype, servers });
   }
 
   private emit<T>(set: Set<Listener<T>>, payload: T): void {
