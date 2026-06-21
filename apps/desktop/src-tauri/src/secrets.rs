@@ -111,6 +111,16 @@ pub fn clear(conn_id: &str, kind: SecretKind) -> Result<(), String> {
     store().delete(&account(conn_id, kind))
 }
 
+/// The secret kinds currently stored for `conn_id`, in [`SecretKind::ALL`] order.
+/// The keychain is the single source of truth, so this is recomputed on demand
+/// rather than persisted (#320). Values never leave the backend — presence only.
+pub fn present(conn_id: &str) -> Vec<SecretKind> {
+    SecretKind::ALL
+        .into_iter()
+        .filter(|k| get(conn_id, *k).is_some())
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -128,6 +138,22 @@ mod tests {
     #[test]
     fn clearing_absent_secret_is_ok() {
         clear("conn-secrets-absent", SecretKind::SessionToken).unwrap();
+    }
+
+    #[test]
+    fn present_reflects_stored_kinds_in_all_order() {
+        let id = "conn-secrets-present";
+        assert!(present(id).is_empty());
+        set(id, SecretKind::SessionToken, "tok").unwrap();
+        set(id, SecretKind::ApiKey, "sk").unwrap();
+        // Returned in SecretKind::ALL order (ApiKey, SecretAccessKey, SessionToken),
+        // not insertion order.
+        assert_eq!(
+            present(id),
+            vec![SecretKind::ApiKey, SecretKind::SessionToken]
+        );
+        clear(id, SecretKind::ApiKey).unwrap();
+        assert_eq!(present(id), vec![SecretKind::SessionToken]);
     }
 
     #[test]

@@ -16,9 +16,10 @@ use ff_core::events::{
     ToolAskRequestEvent, ToolCallEvent, ToolResultEvent, TurnDoneEvent, TurnErrorEvent,
 };
 use ff_core::{
-    Format, McpServerConfig, McpServerStatus, MemoryFileInfo, MemoryFileKind, MemoryOverview,
-    Message, Mode, Phenotype, ProviderConfig, ProviderConnection, ProviderKind, ProviderRegistry,
-    Role, SearchConfig, SecretKind, Session, SessionWorkspace, Skill, SkillInfo, SkillManifest,
+    BedrockAuth, Format, McpServerConfig, McpServerStatus, MemoryFileInfo, MemoryFileKind,
+    MemoryOverview, Message, Mode, Phenotype, ProviderConfig, ProviderConnection, ProviderKind,
+    ProviderRegistry, Role, SearchConfig, SecretKind, Session, SessionWorkspace, Skill, SkillInfo,
+    SkillManifest,
 };
 use ff_signals::SkillAggregate;
 use ff_tools::Safety;
@@ -719,6 +720,27 @@ fn clear_provider_secret(
     state.clear_connection_secret(&connection_id, kind)
 }
 
+/// Which secret kinds are stored for a connection (#320), so each Bedrock secret
+/// field shows its own Stored/Clear state. Presence only — no value is returned.
+#[tauri::command]
+fn provider_secret_presence(
+    state: State<'_, Arc<AppState>>,
+    connection_id: String,
+) -> CmdResult<Vec<SecretKind>> {
+    state.connection_secret_presence(&connection_id)
+}
+
+/// The Bedrock auth a connection resolves to right now (#320) — the explicit mode,
+/// or the `Auto` precedence winner (API key > profile > IAM keys). `None` for
+/// non-Bedrock or unknown connections; lets the UI badge the active credential.
+#[tauri::command]
+fn resolved_bedrock_auth(
+    state: State<'_, Arc<AppState>>,
+    connection_id: String,
+) -> Option<BedrockAuth> {
+    state.resolved_bedrock_auth(&connection_id)
+}
+
 /// Current persisted web-search settings.
 #[tauri::command]
 fn get_search_config(state: State<'_, Arc<AppState>>) -> SearchConfig {
@@ -1262,6 +1284,8 @@ pub fn run() {
             remove_connection,
             set_provider_secret,
             clear_provider_secret,
+            provider_secret_presence,
+            resolved_bedrock_auth,
             get_search_config,
             set_search_config,
             list_models,

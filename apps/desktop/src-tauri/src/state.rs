@@ -133,7 +133,16 @@ fn build_provider(conn: &ProviderConnection) -> Box<dyn Provider> {
                 .clone()
                 .unwrap_or_else(|| "us-east-1".to_string());
             let id = conn.id.as_str();
-            let creds = match conn.auth_mode.unwrap_or(BedrockAuth::Profile) {
+            // Auto (the default) resolves to a concrete mode by precedence
+            // (API key > profile > IAM keys, #320); explicit modes pin themselves.
+            // The probe path (build_provider_for) flows through here too, so it
+            // validates the exact credential a run will use.
+            let mode = match conn.auth_mode.unwrap_or(BedrockAuth::Auto) {
+                BedrockAuth::Auto => resolve_bedrock_auth(conn),
+                other => other,
+            };
+            let creds = match mode {
+                BedrockAuth::Auto => unreachable!("Auto resolved above"),
                 BedrockAuth::Profile => BedrockCreds::Profile {
                     name: conn
                         .aws_profile
@@ -153,6 +162,20 @@ fn build_provider(conn: &ProviderConnection) -> Box<dyn Provider> {
             Box::new(BedrockProvider::new(region, creds))
         }
     }
+}
+
+/// Concrete auth a Bedrock connection in `Auto` mode resolves to, reading live
+/// keychain presence (#320). A profile counts only when its name is non-empty;
+/// IAM keys count only when both the access key id and the secret access key are
+/// present. Pure delegation to [`BedrockAuth::resolve_auto`] for the precedence.
+fn resolve_bedrock_auth(conn: &ProviderConnection) -> BedrockAuth {
+    let id = conn.id.as_str();
+    BedrockAuth::resolve_auto(
+        crate::secrets::get(id, SecretKind::ApiKey).is_some(),
+        conn.aws_profile.as_deref().is_some_and(|p| !p.is_empty()),
+        conn.access_key_id.is_some()
+            && crate::secrets::get(id, SecretKind::SecretAccessKey).is_some(),
+    )
 }
 
 /// The active connection, or the built-in default when the `active` pointer dangles
@@ -1094,6 +1117,37 @@ impl AppState {
         };
         save_registry(&snapshot);
         Ok(())
+    }
+
+    /// The secret kinds currently stored for a connection (#320), so the UI can
+    /// render Stored/Clear per field instead of off the coarse `has_key` flag.
+    /// Presence only — no secret value leaves the backend. `Err` on an unknown id.
+    pub fn connection_secret_presence(&self, conn_id: &str) -> Result<Vec<SecretKind>, String> {
+        {
+            let reg = self.registry.lock().unwrap();
+            if !reg.connections.iter().any(|c| c.id == conn_id) {
+                return Err(format!("unknown connection: {conn_id}"));
+            }
+        }
+        Ok(crate::secrets::present(conn_id))
+    }
+
+    /// The concrete Bedrock auth a connection resolves to right now (#320): the
+    /// explicit mode if pinned, otherwise the `Auto` precedence winner against live
+    /// keychain presence. `None` for non-Bedrock connections or an unknown id, so
+    /// the UI can flag which credential field is actually "active".
+    pub fn resolved_bedrock_auth(&self, conn_id: &str) -> Option<BedrockAuth> {
+        let conn = {
+            let reg = self.registry.lock().unwrap();
+            reg.connections.iter().find(|c| c.id == conn_id).cloned()?
+        };
+        if conn.kind != ProviderKind::Bedrock {
+            return None;
+        }
+        Some(match conn.auth_mode.unwrap_or(BedrockAuth::Auto) {
+            BedrockAuth::Auto => resolve_bedrock_auth(&conn),
+            other => other,
+        })
     }
 
     /// Current provider settings projected from the active connection (clone —
@@ -2549,6 +2603,135 @@ mod tests {
             .clear_connection_secret(id, SecretKind::SecretAccessKey)
             .unwrap();
         assert!(!has_key_of(&state, id));
+    }
+
+    // ---- #320: per-kind presence + Auto auth resolution ----
+
+    /// Build + insert a Bedrock connection with the given id and auth mode, leaving
+    /// secret material to the caller (keychain is a process-global MemStore in tests,
+    /// so each test uses a unique id to stay isolated).
+    fn bedrock_conn(id: &str, auth_mode: Option<BedrockAuth>) -> ProviderConnection {
+        ProviderConnection {
+            id: id.into(),
+            kind: ProviderKind::Bedrock,
+            display_name: "Amazon Bedrock".into(),
+            vendor: None,
+            base_url: None,
+            model: "anthropic.claude-3-5-sonnet".into(),
+            has_key: false,
+            thinking: false,
+            region: Some("us-east-1".into()),
+            auth_mode,
+            aws_profile: None,
+            access_key_id: None,
+        }
+    }
+
+    #[test]
+    fn connection_secret_presence_lists_stored_kinds_and_errors_on_unknown_id() {
+        let state = AppState::with_registry(ProviderRegistry::default());
+        let id = "candle-vllm";
+        assert!(state.connection_secret_presence(id).unwrap().is_empty());
+        state
+            .set_connection_secret(id, SecretKind::ApiKey, "sk-1")
+            .unwrap();
+        state
+            .set_connection_secret(id, SecretKind::SessionToken, "tok-1")
+            .unwrap();
+        assert_eq!(
+            state.connection_secret_presence(id).unwrap(),
+            vec![SecretKind::ApiKey, SecretKind::SessionToken]
+        );
+        assert!(state.connection_secret_presence("ghost").is_err());
+    }
+
+    #[test]
+    fn resolved_auth_auto_prefers_api_key_over_iam_keys() {
+        let id = "bedrock-auto-api-wins";
+        let state = AppState::with_registry(ProviderRegistry::default());
+        let mut conn = bedrock_conn(id, Some(BedrockAuth::Auto));
+        conn.access_key_id = Some("AKIA...".into());
+        state.upsert_connection(conn);
+        // Both an IAM secret and an API key are stored => API key wins.
+        state
+            .set_connection_secret(id, SecretKind::SecretAccessKey, "iam-secret")
+            .unwrap();
+        state
+            .set_connection_secret(id, SecretKind::ApiKey, "br-bearer")
+            .unwrap();
+        assert_eq!(state.resolved_bedrock_auth(id), Some(BedrockAuth::ApiKey));
+    }
+
+    #[test]
+    fn resolved_auth_auto_prefers_profile_over_iam_keys() {
+        let id = "bedrock-auto-profile-wins";
+        let state = AppState::with_registry(ProviderRegistry::default());
+        let mut conn = bedrock_conn(id, Some(BedrockAuth::Auto));
+        conn.aws_profile = Some("dev".into());
+        conn.access_key_id = Some("AKIA...".into());
+        state.upsert_connection(conn);
+        state
+            .set_connection_secret(id, SecretKind::SecretAccessKey, "iam-secret")
+            .unwrap();
+        // No API key => profile beats IAM keys.
+        assert_eq!(state.resolved_bedrock_auth(id), Some(BedrockAuth::Profile));
+    }
+
+    #[test]
+    fn resolved_auth_auto_falls_back_to_iam_keys_then_profile() {
+        let id = "bedrock-auto-iam-only";
+        let state = AppState::with_registry(ProviderRegistry::default());
+        let mut conn = bedrock_conn(id, Some(BedrockAuth::Auto));
+        conn.access_key_id = Some("AKIA...".into());
+        state.upsert_connection(conn);
+        state
+            .set_connection_secret(id, SecretKind::SecretAccessKey, "iam-secret")
+            .unwrap();
+        // Only IAM keys configured.
+        assert_eq!(state.resolved_bedrock_auth(id), Some(BedrockAuth::IamKeys));
+        // Nothing configured at all => Profile fallback so the probe surfaces it.
+        let bare = "bedrock-auto-bare";
+        state.upsert_connection(bedrock_conn(bare, Some(BedrockAuth::Auto)));
+        assert_eq!(
+            state.resolved_bedrock_auth(bare),
+            Some(BedrockAuth::Profile)
+        );
+    }
+
+    #[test]
+    fn resolved_auth_explicit_pin_wins_over_auto_preference() {
+        let id = "bedrock-pinned-iam";
+        let state = AppState::with_registry(ProviderRegistry::default());
+        let mut conn = bedrock_conn(id, Some(BedrockAuth::IamKeys));
+        conn.access_key_id = Some("AKIA...".into());
+        state.upsert_connection(conn);
+        state
+            .set_connection_secret(id, SecretKind::SecretAccessKey, "iam-secret")
+            .unwrap();
+        // An API key is ALSO stored, but the explicit IamKeys pin is honored.
+        state
+            .set_connection_secret(id, SecretKind::ApiKey, "br-bearer")
+            .unwrap();
+        assert_eq!(state.resolved_bedrock_auth(id), Some(BedrockAuth::IamKeys));
+    }
+
+    #[test]
+    fn resolved_auth_legacy_none_defaults_to_auto() {
+        // A pre-#320 Bedrock connection persisted with auth_mode: None and only a
+        // profile resolves to Profile under the new Auto default -> no regression.
+        let id = "bedrock-legacy-none";
+        let state = AppState::with_registry(ProviderRegistry::default());
+        let mut conn = bedrock_conn(id, None);
+        conn.aws_profile = Some("default".into());
+        state.upsert_connection(conn);
+        assert_eq!(state.resolved_bedrock_auth(id), Some(BedrockAuth::Profile));
+    }
+
+    #[test]
+    fn resolved_auth_is_none_for_non_bedrock_or_unknown() {
+        let state = AppState::with_registry(ProviderRegistry::default());
+        assert_eq!(state.resolved_bedrock_auth("candle-vllm"), None);
+        assert_eq!(state.resolved_bedrock_auth("ghost"), None);
     }
 
     #[test]
