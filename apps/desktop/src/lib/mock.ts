@@ -190,6 +190,8 @@ const DEFAULT_PHENOTYPE: Phenotype = { name: "default", skills: [] };
 const MOCK_PHENOTYPES: Phenotype[] = [
   // The out-of-box default phenotype (#298), seeded on first run (#304). Listed
   // first after `default` so the Phenos → Installed star/reset target it.
+  // Keep in sync with docs/examples/codon/phenos/codon.toml (#304) — the seed is
+  // the source of truth; persona is summarized here.
   {
     name: "codon",
     skills: ["codegraph"],
