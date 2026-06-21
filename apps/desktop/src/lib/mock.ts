@@ -36,6 +36,7 @@ import type {
   MemoryOverview,
   MemoryFlushedEvent,
 } from "../bindings";
+import type { SecretKind } from "../bindings/SecretKind";
 import type { FfIpc, Unlisten } from "./ipc";
 import type { MarketplaceSkill } from "./marketplace";
 import type { MarketplaceProfile } from "./profile-marketplace";
@@ -323,8 +324,9 @@ export class MockIpc implements FfIpc {
   private activeTimers = new Map<string, ActiveTurn>();
 
   // Provider connection registry (Issue #138, RFC 0005 Phase A). Mirrors the
-  // backend default: local candle-vLLM (active) plus a ready keyless Ollama.
-  // Persistence is in-memory for the mock session.
+  // backend default (local candle-vLLM active + a keyless Ollama), plus a hosted
+  // AWS Bedrock connection (#202 PR-3b) so the provider-card surface and the
+  // Bedrock credentials form are exercisable offline. Persistence is in-memory.
   private registry: ProviderRegistry = {
     active: "candle-vllm",
     connections: [
@@ -344,14 +346,41 @@ export class MockIpc implements FfIpc {
         hasKey: false,
         thinking: true,
       },
+      {
+        id: "bedrock",
+        kind: "bedrock",
+        displayName: "AWS Bedrock",
+        model: "us.anthropic.claude-sonnet-4-0",
+        hasKey: false,
+        thinking: true,
+        region: "us-east-1",
+        authMode: "profile",
+        awsProfile: "bedrock-profile",
+      },
     ],
   };
 
-  // Canned per-connection model lists so the picker is exercisable offline.
+  // Canned per-connection model lists so the picker is exercisable offline. The
+  // Bedrock list mirrors a ListInferenceProfiles response (cross-region + on-demand
+  // inference-profile ids).
   private modelsByConnection: Record<string, string[]> = {
     "candle-vllm": ["Qwen3-4B-Instruct-2507", "Qwen3-8B-Instruct"],
     ollama: ["llama3.2", "qwen2.5", "mistral"],
+    bedrock: [
+      "us.anthropic.claude-opus-4-0",
+      "us.anthropic.claude-sonnet-4-0",
+      "us.anthropic.claude-haiku-3-5",
+      "us.meta.llama4-maverick-17b-instruct",
+      "amazon.nova-pro-v1:0",
+      "amazon.nova-lite-v1:0",
+    ],
   };
+
+  // Per-connection secret material stored "in the keychain" (Issue #202 PR-3).
+  // The mock only tracks *which* `SecretKind`s are set so it can recompute
+  // `hasKey`; the values themselves are written then discarded, mirroring the
+  // backend's write-only contract (a secret value is never read back over IPC).
+  private secretsByConnection = new Map<string, Set<SecretKind>>();
 
   // Web-search settings (Issue #43). Defaults mirror the backend: SearXNG with no
   // endpoint configured. Persistence is in-memory for the mock session.
@@ -772,6 +801,69 @@ export class MockIpc implements FfIpc {
   async listModels(id?: string): Promise<string[]> {
     const target = id ?? this.registry.active;
     return this.modelsByConnection[target] ?? [];
+  }
+
+  // Provider secrets (Issue #202 PR-3). Write-only: the mock records which kinds
+  // are set (to recompute `hasKey`) and drops the value, mirroring the backend's
+  // keychain write that never returns the secret over IPC.
+  async setProviderSecret(
+    connectionId: string,
+    kind: SecretKind,
+    value: string,
+  ): Promise<void> {
+    const conn = this.registry.connections.find((c) => c.id === connectionId);
+    if (!conn) throw new Error(`unknown connection: ${connectionId}`);
+    // No empty-value guard: the `set_provider_secret` contract doesn't forbid an
+    // empty string, so the mock must not be stricter than the real backend.
+    void value;
+    let set = this.secretsByConnection.get(connectionId);
+    if (!set) {
+      set = new Set<SecretKind>();
+      this.secretsByConnection.set(connectionId, set);
+    }
+    set.add(kind);
+    conn.hasKey = set.size > 0;
+  }
+
+  async clearProviderSecret(
+    connectionId: string,
+    kind: SecretKind,
+  ): Promise<void> {
+    const conn = this.registry.connections.find((c) => c.id === connectionId);
+    if (!conn) throw new Error(`unknown connection: ${connectionId}`);
+    const set = this.secretsByConnection.get(connectionId);
+    set?.delete(kind);
+    conn.hasKey = (set?.size ?? 0) > 0;
+  }
+
+  // Test Connection (Issue #202 PR-3a). `id` defaults to the active connection.
+  // Resolves on a successful probe; rejects with a message the UI surfaces. Local
+  // kinds always pass; Bedrock passes only when the active auth mode has the
+  // credentials it needs (profile resolves from ~/.aws; IAM/API-Key need a stored
+  // secret) — exercising both the ok and error result paths offline.
+  async testConnection(id?: string): Promise<void> {
+    const target = id ?? this.registry.active;
+    const conn = this.registry.connections.find((c) => c.id === target);
+    if (!conn) throw new Error(`unknown connection: ${target}`);
+    if (conn.kind !== "bedrock") return;
+    const secrets = this.secretsByConnection.get(conn.id);
+    switch (conn.authMode) {
+      case "iamKeys":
+        if (!conn.accessKeyId?.trim() || !secrets?.has("secretAccessKey")) {
+          throw new Error(
+            "IAM keys incomplete — set an access key id and secret access key.",
+          );
+        }
+        return;
+      case "apiKey":
+        if (!secrets?.has("apiKey")) {
+          throw new Error("No Bedrock API key configured.");
+        }
+        return;
+      default:
+        // Profile (or unset): assume the named/default profile resolves.
+        return;
+    }
   }
 
   async getSearchConfig(): Promise<SearchConfig> {
