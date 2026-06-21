@@ -2,7 +2,7 @@
 //!
 //! Each running MCP server's tools are registered into the per-turn `ToolRegistry`
 //! under a namespaced id `mcp__<server>__<tool>` (double-underscore, matching the
-//! Aki/Claude convention) to prevent collisions with built-ins and across servers.
+//! Claude convention) to prevent collisions with built-ins and across servers.
 //! Every bridged tool defaults to `Safety::Write` so it is approval-gated — external
 //! code touching the user's machine is never auto-run.
 //!

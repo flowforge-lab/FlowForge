@@ -31,6 +31,6 @@ dist
 .codegraph/
 .idea/
 
-# Aki agent scratch — local-only, never commit
+# Local agent scratch — local-only, never commit
 .followups/
 design/

@@ -330,14 +330,14 @@ mod tests {
     fn user_context_is_placed_last() {
         let reg = registry(vec![skill("alpha", "A things", "abody")]);
         let out = build_system_prompt(
-            Some("You are Akisa."),
+            Some("You are a coding assistant."),
             &reg,
             &["alpha".into()],
             &ctx(),
             None,
             Mode::default(),
         );
-        let persona = out.find("You are Akisa.").unwrap();
+        let persona = out.find("You are a coding assistant.").unwrap();
         let available = out.find("## Available skills").unwrap();
         let active = out.find("## Active skill instructions").unwrap();
         let user = out.find("## User context").unwrap();
@@ -351,14 +351,14 @@ mod tests {
     fn persona_is_prepended_when_set_and_absent_when_none() {
         let reg = SkillRegistry::new();
         let with = build_system_prompt(
-            Some("You are Akisa."),
+            Some("You are a coding assistant."),
             &reg,
             &[],
             &ctx(),
             None,
             Mode::default(),
         );
-        assert!(with.starts_with("You are Akisa.\n\n"));
+        assert!(with.starts_with("You are a coding assistant.\n\n"));
         let without = build_system_prompt(None, &reg, &[], &ctx(), None, Mode::default());
         assert!(without.starts_with("## User context"));
     }
