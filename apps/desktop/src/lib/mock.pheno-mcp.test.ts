@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import { MockIpc } from "./mock";
-import type { PhenotypeMcpUnavailableEvent } from "./phenotype-mcp";
+import type { PhenotypeMcpUnavailableEvent } from "@/bindings";
 
 describe("MockIpc phenotype:mcp-unavailable (#301)", () => {
   it("fires on switch to a phenotype whose skill needs an absent server", async () => {

@@ -1,4 +1,4 @@
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import { PlugZap, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { unavailableToastBody } from "@/lib/phenotype-mcp";
@@ -22,13 +22,19 @@ export function PhenoMcpToast() {
   const openSettings = useSettingsStore((s) => s.openSettings);
   const setSection = useSettingsStore((s) => s.setSection);
 
+  // Pause the auto-dismiss while the pointer is over the toast or it holds focus,
+  // so a user reading or about to click it never has it vanish mid-action. Leaving
+  // (or blurring) re-arms a fresh full countdown.
+  const [paused, setPaused] = useState(false);
+
   // Re-arm on every show (`seq`), not just when a notice first appears, so a
-  // replacement notice resets the countdown.
+  // replacement notice resets the countdown. Skipped while paused; clearing
+  // `paused` re-runs this and starts a fresh interval.
   useEffect(() => {
-    if (!notice) return;
+    if (!notice || paused) return;
     const handle = setTimeout(dismiss, AUTO_DISMISS_MS);
     return () => clearTimeout(handle);
-  }, [seq, notice, dismiss]);
+  }, [seq, notice, dismiss, paused]);
 
   if (!notice) return null;
 
@@ -46,6 +52,10 @@ export function PhenoMcpToast() {
         role="status"
         aria-live="polite"
         className="pointer-events-auto w-full rounded-lg border bg-popover/95 p-3 text-popover-foreground shadow-lg backdrop-blur"
+        onMouseEnter={() => setPaused(true)}
+        onMouseLeave={() => setPaused(false)}
+        onFocus={() => setPaused(true)}
+        onBlur={() => setPaused(false)}
       >
         <div className="flex items-start gap-2.5">
           <PlugZap className="mt-0.5 size-4 shrink-0 text-muted-foreground" />

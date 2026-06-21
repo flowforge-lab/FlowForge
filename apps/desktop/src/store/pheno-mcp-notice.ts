@@ -6,7 +6,7 @@
 // even when one notice replaces another with the same content.
 
 import { create } from "zustand";
-import type { PhenotypeMcpUnavailableEvent } from "@/lib/phenotype-mcp";
+import type { PhenotypeMcpUnavailableEvent } from "@/bindings";
 
 interface PhenoMcpNoticeState {
   notice: PhenotypeMcpUnavailableEvent | null;
