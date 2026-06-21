@@ -222,6 +222,15 @@ impl Provider for OpenAiProvider {
             .map_err(|e| LlmError::Decode(e.to_string()))?;
         Ok(list.data.into_iter().map(|m| m.id).collect())
     }
+
+    /// Probe the endpoint by listing models. A hosted, key-gated server (e.g.
+    /// SiliconFlow) returns 401 on a bad key, surfacing as an [`LlmError::Api`]; a
+    /// local server returns its catalog. Zero token cost, and the lightest call
+    /// that exercises both the URL and the credentials -- so the settings "Test
+    /// Connection" button means something for every OpenAI-compatible backend.
+    async fn test_connection(&self, _model: &str) -> Result<(), LlmError> {
+        self.list_models().await.map(|_| ())
+    }
 }
 
 #[cfg(test)]

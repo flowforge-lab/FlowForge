@@ -167,6 +167,12 @@ fn build_provider(conn: &ProviderConnection) -> Box<dyn Provider> {
             let key = crate::secrets::get(conn.id.as_str(), SecretKind::ApiKey);
             Box::new(OpenAiProvider::new(base_url, key))
         }
+        // SiliconFlow is OpenAI-compatible; the bearer key is pulled from the OS
+        // keychain here so the provider crate stays keychain-free (mirrors Bedrock).
+        ProviderKind::SiliconFlow => {
+            let key = crate::secrets::get(conn.id.as_str(), SecretKind::ApiKey);
+            Box::new(OpenAiProvider::new(base_url, key))
+        }
     }
 }
 
@@ -204,6 +210,7 @@ fn display_name_for(kind: ProviderKind) -> String {
         ProviderKind::Ollama => "Ollama",
         ProviderKind::Bedrock => "Amazon Bedrock",
         ProviderKind::OpenAi => "OpenAI",
+        ProviderKind::SiliconFlow => "SiliconFlow",
     }
     .to_string()
 }

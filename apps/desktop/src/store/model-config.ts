@@ -60,6 +60,8 @@ function defaultConnection(kind: ProviderKind): ProviderConnection {
       return { ...base, displayName: "candle-vLLM" };
     case "openai":
       return { ...base, displayName: "OpenAI" };
+    case "siliconFlow":
+      return { ...base, displayName: "SiliconFlow" };
   }
 }
 

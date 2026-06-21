@@ -56,6 +56,15 @@ fn build_provider(config: &ProviderConfig) -> Box<dyn Provider> {
             base_url,
             std::env::var("OPENAI_API_KEY").ok(),
         )),
+        // SiliconFlow is OpenAI-compatible. The CLI has no keychain, so the bearer
+        // key comes from SILICONFLOW_API_KEY (empty/unset = anonymous, which the
+        // hosted endpoint will reject -- the same env-var pattern as Bedrock above).
+        ProviderKind::SiliconFlow => {
+            let key = std::env::var("SILICONFLOW_API_KEY")
+                .ok()
+                .filter(|k| !k.is_empty());
+            Box::new(OpenAiProvider::new(base_url, key))
+        }
     }
 }
 
