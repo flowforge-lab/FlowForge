@@ -49,6 +49,13 @@ fn build_provider(config: &ProviderConfig) -> Box<dyn Provider> {
             };
             Box::new(BedrockProvider::new(region, creds))
         }
+        // The CLI has no keychain, so a hosted OpenAI key comes from the
+        // OPENAI_API_KEY env var (absent => keyless, for OpenAI-compatible
+        // local gateways that need none).
+        ProviderKind::OpenAi => Box::new(OpenAiProvider::new(
+            base_url,
+            std::env::var("OPENAI_API_KEY").ok(),
+        )),
     }
 }
 

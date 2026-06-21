@@ -152,6 +152,12 @@ fn build_provider(conn: &ProviderConnection) -> Box<dyn Provider> {
             };
             Box::new(BedrockProvider::new(region, creds))
         }
+        // Hosted OpenAI (-compatible). Bearer key pulled from the keychain here so
+        // the provider crate stays keychain-free, mirroring the Bedrock arm (#311).
+        ProviderKind::OpenAi => {
+            let key = crate::secrets::get(conn.id.as_str(), SecretKind::ApiKey);
+            Box::new(OpenAiProvider::new(base_url, key))
+        }
     }
 }
 
@@ -174,6 +180,7 @@ fn display_name_for(kind: ProviderKind) -> String {
         ProviderKind::CandleVllm => "candle-vLLM",
         ProviderKind::Ollama => "Ollama",
         ProviderKind::Bedrock => "Amazon Bedrock",
+        ProviderKind::OpenAi => "OpenAI",
     }
     .to_string()
 }

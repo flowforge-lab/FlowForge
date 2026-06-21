@@ -3,4 +3,4 @@
 /**
  * Which LLM backend FlowForge talks to.
  */
-export type ProviderKind = "candleVllm" | "ollama" | "bedrock";
+export type ProviderKind = "candleVllm" | "ollama" | "bedrock" | "openai";
