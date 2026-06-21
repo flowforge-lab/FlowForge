@@ -6,7 +6,7 @@
 //! loop. The loop is capped by [`ToolContext::max_iterations`] so a misbehaving model
 //! cannot spin forever.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -329,6 +329,57 @@ fn advertised_tools(
         Some(set) => set.intersection(&readonly).cloned().collect(),
         None => readonly,
     })
+}
+
+/// RAII guard that guarantees every assistant `tool_use` gets a matching tool
+/// result, even if the `run_turn` future is *dropped* mid-loop (window closed,
+/// runtime torn down, or a new turn superseding an in-flight one). Rust async
+/// drop runs no code after the current await point, so a sequential backfill
+/// after the call loop is skipped on drop — leaving a dangling `tool_use` that
+/// strict providers (Bedrock, OpenAI) reject on the next turn (#316).
+///
+/// Seeded with every requested call id after `attach_tool_calls`; each completed
+/// call is removed via [`fulfilled`](Self::fulfilled). On `Drop` — whether the
+/// turn ended cleanly, was cooperatively cancelled, or the future was dropped —
+/// any still-pending id gets a synchronous `[cancelled]` result. The store call
+/// is synchronous, so a plain `Drop` impl suffices (no async drop needed).
+struct ToolResultBackfill<'a> {
+    store: &'a SessionStore,
+    session_id: &'a str,
+    pending: HashSet<String>,
+}
+
+impl<'a> ToolResultBackfill<'a> {
+    fn new(store: &'a SessionStore, session_id: &'a str) -> Self {
+        Self {
+            store,
+            session_id,
+            pending: HashSet::new(),
+        }
+    }
+
+    /// Mark a call id as awaiting a result; it will be backfilled on drop unless
+    /// later [`fulfilled`](Self::fulfilled).
+    fn expect(&mut self, call_id: &str) {
+        self.pending.insert(call_id.to_string());
+    }
+
+    /// A real tool result was persisted for this id, so it no longer needs backfill.
+    fn fulfilled(&mut self, call_id: &str) {
+        self.pending.remove(call_id);
+    }
+}
+
+impl Drop for ToolResultBackfill<'_> {
+    fn drop(&mut self) {
+        for call_id in self.pending.drain() {
+            self.store.add_tool_result_message(
+                self.session_id,
+                call_id,
+                "[cancelled]".to_string(),
+            );
+        }
+    }
 }
 
 /// Runs one assistant turn for `session_id`, executing any tool calls the model
@@ -654,7 +705,14 @@ pub async fn run_turn(
             .collect();
         store.attach_tool_calls(&message_id, session_id, core_calls);
 
-        let mut executed: Vec<String> = Vec::new();
+        // Drop-safe backfill (#316): seed a guard with every requested call id, so
+        // a dropped turn future (or cooperative cancel) cannot leave a `tool_use`
+        // without a matching tool result. Each call removes its id once its real
+        // result is persisted; the guard's Drop backfills whatever remains.
+        let mut backfill = ToolResultBackfill::new(store, session_id);
+        for call in calls.values() {
+            backfill.expect(&call.id);
+        }
         for call in calls.values() {
             if cancel.is_cancelled() {
                 break;
@@ -751,7 +809,7 @@ pub async fn run_turn(
                 call.id.clone(),
                 truncate_tool_result(&outcome.content),
             );
-            executed.push(call.id.clone());
+            backfill.fulfilled(&call.id);
             on_event(AgentEvent::ToolCallFinished {
                 message_id: message_id.clone(),
                 call_id: call.id.clone(),
@@ -778,18 +836,12 @@ pub async fn run_turn(
             }
         }
 
-        // If we were cancelled mid-loop, every requested call still needs a matching
-        // tool result, or the next request's history is malformed (an assistant
-        // `tool_calls` message with no tool replies -> provider rejects it with 400).
-        for call in calls.values() {
-            if !executed.contains(&call.id) {
-                store.add_tool_result_message(
-                    session_id,
-                    call.id.clone(),
-                    "[cancelled]".to_string(),
-                );
-            }
-        }
+        // Any call without a real result (cooperative cancel mid-loop, or a turn
+        // future about to be dropped) is backfilled with `[cancelled]` when
+        // `backfill` drops at the end of this iteration's scope (#316). This is
+        // the *same* Drop path that protects a dropped future, so the two cases
+        // can't diverge into malformed history.
+        drop(backfill);
 
         last = Some(finalized);
 
@@ -1550,6 +1602,123 @@ mod tests {
             .any(|m| m.role == Role::Tool && m.content == "[cancelled]"));
         // The final bubble is never empty.
         assert!(!msg.content.is_empty());
+    }
+
+    /// Dropping the `run_turn` future mid tool-loop (window closed, runtime torn
+    /// down, or a superseding turn) must NOT leave an assistant `tool_use` without
+    /// a matching tool result — strict providers reject that on the next turn
+    /// (#316). The cooperative-cancel backfill (`cancel_mid_loop_backfills_tool_results`)
+    /// only fires if execution reaches it; a dropped future skips it. The RAII
+    /// guard closes that gap.
+    #[tokio::test]
+    async fn dropped_future_backfills_tool_results() {
+        use std::future::Future;
+        use std::task::{Context, Poll};
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::new();
+        let s = store.create_session(None);
+        store.add_message(&s.id, Role::User, "do two things".into());
+        let registry = ToolRegistry::with_defaults();
+
+        // Two write (approval-gated) calls; the loop parks on the first call's
+        // approval, which is exactly the window between `attach_tool_calls` and the
+        // first tool result.
+        struct TwoWrites;
+        #[async_trait]
+        impl Provider for TwoWrites {
+            async fn chat_stream(&self, _req: ChatRequest) -> Result<ChunkStream, LlmError> {
+                let chunks = vec![Ok(Chunk {
+                    tool_calls: vec![
+                        ToolCallDelta {
+                            index: 0,
+                            id: Some("call_a".into()),
+                            name: Some("bash".into()),
+                            arguments: r#"{"command":"touch a"}"#.into(),
+                        },
+                        ToolCallDelta {
+                            index: 1,
+                            id: Some("call_b".into()),
+                            name: Some("bash".into()),
+                            arguments: r#"{"command":"touch b"}"#.into(),
+                        },
+                    ],
+                    done: true,
+                    ..Chunk::default()
+                })];
+                Ok(futures_util::stream::iter(chunks).boxed())
+            }
+        }
+
+        // Never resolves: the turn future parks forever awaiting approval, so we
+        // can drop it while a `tool_use` is persisted but un-resulted.
+        struct NeverApprove;
+        #[async_trait]
+        impl Approver for NeverApprove {
+            async fn approve(
+                &self,
+                _message_id: &str,
+                _call_id: &str,
+                _name: &str,
+                _safety: Safety,
+                _args: &serde_json::Value,
+            ) -> bool {
+                std::future::pending::<()>().await;
+                unreachable!("pending() never resolves")
+            }
+        }
+
+        let approve = NeverApprove;
+        let tool_ctx = ctx(&registry, dir.path(), &approve);
+        let fut = run_turn(
+            &TwoWrites,
+            &store,
+            &tool_ctx,
+            &s.id,
+            "mock",
+            None,
+            false,
+            CancelToken::new(),
+            |_| {},
+        );
+
+        // Poll the turn future a bounded number of times so it reaches and parks on
+        // the first approval, then drop it — simulating the host abandoning the turn.
+        let mut fut = Box::pin(fut);
+        let waker = futures_util::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        for _ in 0..256 {
+            match fut.as_mut().poll(&mut cx) {
+                Poll::Pending => {}
+                Poll::Ready(_) => panic!("turn should park on NeverApprove, not complete"),
+            }
+        }
+        drop(fut);
+
+        // Every requested tool call has a matching Role::Tool reply despite the drop.
+        let history = store.get_messages(&s.id);
+        let assistant = history
+            .iter()
+            .find(|m| m.tool_calls.is_some())
+            .expect("assistant tool-call message persisted before the drop");
+        let requested: Vec<&str> = assistant
+            .tool_calls
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|c| c.id.as_str())
+            .collect();
+        let replied: Vec<String> = history
+            .iter()
+            .filter(|m| m.role == Role::Tool)
+            .filter_map(|m| m.tool_call_id.clone())
+            .collect();
+        for id in &requested {
+            assert!(
+                replied.iter().any(|r| r == id),
+                "dropped turn left tool_use {id} without a result"
+            );
+        }
     }
 
     #[tokio::test]
