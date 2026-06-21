@@ -45,6 +45,7 @@ function defaultConnection(kind: ProviderKind): ProviderConnection {
     model: "",
     hasKey: false,
     thinking: true,
+    supportsVision: false,
   };
   switch (kind) {
     case "bedrock":

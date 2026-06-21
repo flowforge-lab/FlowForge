@@ -414,6 +414,7 @@ export class MockIpc implements FfIpc {
         model: "Qwen3-4B-Instruct-2507",
         hasKey: false,
         thinking: true,
+        supportsVision: false,
       },
       {
         id: "ollama",
@@ -422,6 +423,7 @@ export class MockIpc implements FfIpc {
         model: "llama3.2",
         hasKey: false,
         thinking: true,
+        supportsVision: false,
       },
       {
         id: "bedrock",
@@ -430,6 +432,7 @@ export class MockIpc implements FfIpc {
         model: "us.anthropic.claude-sonnet-4-0",
         hasKey: false,
         thinking: true,
+        supportsVision: false,
         region: "us-east-1",
         authMode: "profile",
         awsProfile: "bedrock-profile",

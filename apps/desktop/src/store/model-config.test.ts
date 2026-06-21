@@ -70,6 +70,7 @@ describe("model-config registry (mock IPC)", () => {
       model: "us.anthropic.claude-sonnet-4-0",
       hasKey: false,
       thinking: true,
+      supportsVision: false,
       region: "us-east-1",
       authMode: "profile",
       awsProfile: "bedrock-profile",

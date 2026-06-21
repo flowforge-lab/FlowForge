@@ -123,8 +123,12 @@ impl ApprovalRegistry {
 fn build_provider(conn: &ProviderConnection) -> Box<dyn Provider> {
     let base_url = conn.resolved_base_url().to_string();
     match conn.kind {
-        ProviderKind::CandleVllm => Box::new(OpenAiProvider::new(base_url, None)),
-        ProviderKind::Ollama => Box::new(OllamaProvider::new(base_url)),
+        ProviderKind::CandleVllm => {
+            Box::new(OpenAiProvider::new(base_url, None).with_vision(conn.supports_vision))
+        }
+        ProviderKind::Ollama => {
+            Box::new(OllamaProvider::new(base_url).with_vision(conn.supports_vision))
+        }
         // Bedrock resolves credentials by auth mode, pulling secret material from the
         // OS keychain here so the provider crate stays keychain-free (#202 PR-2).
         ProviderKind::Bedrock => {
@@ -165,13 +169,13 @@ fn build_provider(conn: &ProviderConnection) -> Box<dyn Provider> {
         // the provider crate stays keychain-free, mirroring the Bedrock arm (#311).
         ProviderKind::OpenAi => {
             let key = crate::secrets::get(conn.id.as_str(), SecretKind::ApiKey);
-            Box::new(OpenAiProvider::new(base_url, key))
+            Box::new(OpenAiProvider::new(base_url, key).with_vision(conn.supports_vision))
         }
         // SiliconFlow is OpenAI-compatible; the bearer key is pulled from the OS
         // keychain here so the provider crate stays keychain-free (mirrors Bedrock).
         ProviderKind::SiliconFlow => {
             let key = crate::secrets::get(conn.id.as_str(), SecretKind::ApiKey);
-            Box::new(OpenAiProvider::new(base_url, key))
+            Box::new(OpenAiProvider::new(base_url, key).with_vision(conn.supports_vision))
         }
     }
 }
@@ -227,6 +231,7 @@ fn config_to_connection(config: ProviderConfig) -> ProviderConnection {
         model: config.model,
         has_key: config.has_key,
         thinking: config.thinking,
+        supports_vision: false,
         region: None,
         auth_mode: None,
         aws_profile: None,
@@ -2396,6 +2401,7 @@ mod tests {
                 model: "saved".into(),
                 has_key: false,
                 thinking: true,
+                supports_vision: false,
                 region: None,
                 auth_mode: None,
                 aws_profile: None,
@@ -2567,6 +2573,7 @@ mod tests {
             model: "x".into(),
             has_key: false,
             thinking: true,
+            supports_vision: false,
             region: None,
             auth_mode: None,
             aws_profile: None,
@@ -2655,6 +2662,7 @@ mod tests {
             model: "anthropic.claude-3-5-sonnet".into(),
             has_key: false,
             thinking: false,
+            supports_vision: false,
             region: Some("us-east-1".into()),
             auth_mode,
             aws_profile: None,

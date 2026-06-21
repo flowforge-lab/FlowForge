@@ -11,6 +11,11 @@ pub struct OpenAiProvider {
     base_url: String,
     api_key: Option<String>,
     client: reqwest::Client,
+    /// Whether the connection's model accepts attachments (#332/#334). When
+    /// false, attachments are stripped before serialization so a raw `attachments`
+    /// field never reaches the wire (this provider serializes `ChatMessage`
+    /// directly). Defaults false; set via [`OpenAiProvider::with_vision`].
+    supports_vision: bool,
 }
 
 impl OpenAiProvider {
@@ -19,7 +24,14 @@ impl OpenAiProvider {
             base_url: base_url.into(),
             api_key,
             client: reqwest::Client::new(),
+            supports_vision: false,
         }
+    }
+
+    /// Declare whether the target model can accept image/document attachments.
+    pub fn with_vision(mut self, supports_vision: bool) -> Self {
+        self.supports_vision = supports_vision;
+        self
     }
 
     /// Local candle-vllm server (FlowForge M1 default, no credentials).
@@ -149,9 +161,10 @@ fn parse_sse_line(line: &[u8]) -> Option<Result<Chunk, LlmError>> {
 #[async_trait]
 impl Provider for OpenAiProvider {
     async fn chat_stream(&self, req: ChatRequest) -> Result<ChunkStream, LlmError> {
+        let messages = crate::messages_for_wire(&req.messages, self.supports_vision);
         let mut body = serde_json::json!({
             "model": req.model,
-            "messages": req.messages,
+            "messages": messages,
             "stream": true,
         });
         if !req.tools.is_empty() {
