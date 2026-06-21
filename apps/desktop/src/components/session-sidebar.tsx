@@ -1,6 +1,7 @@
 import type { ComponentType, ReactNode } from "react";
 import { useEffect, useRef, useState } from "react";
 import {
+  Download,
   EyeOff,
   Folder,
   MoreHorizontal,
@@ -23,6 +24,8 @@ import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Separator } from "@/components/ui/separator";
 import { cn } from "@/lib/utils";
+import { exportSessionToFile } from "@/lib/export-session";
+import type { Format } from "@/bindings/Format";
 import { resolveEffectiveTheme } from "@/lib/theme";
 import { useTheme, usePrefsStore, clampSidebarWidth } from "@/store/prefs";
 import { useSettingsStore } from "@/store/settings";
@@ -113,6 +116,7 @@ interface SessionMenuItemsProps {
   onTogglePin: () => void;
   onDismissToggle: () => void;
   onRename: () => void;
+  onExport: (format: Format) => void;
   onDelete: () => void;
 }
 
@@ -126,6 +130,7 @@ export function SessionMenuItems({
   onTogglePin,
   onDismissToggle,
   onRename,
+  onExport,
   onDelete,
 }: SessionMenuItemsProps) {
   return (
@@ -158,6 +163,16 @@ export function SessionMenuItems({
         <Pencil />
         Rename
       </P.Item>
+      <P.Sub>
+        <P.SubTrigger>
+          <Download />
+          Export
+        </P.SubTrigger>
+        <P.SubContent>
+          <P.Item onSelect={() => onExport("markdown")}>Markdown (.md)</P.Item>
+          <P.Item onSelect={() => onExport("json")}>JSON (.json)</P.Item>
+        </P.SubContent>
+      </P.Sub>
       <P.Separator />
       <P.Item
         onSelect={onDelete}
@@ -190,6 +205,7 @@ export function SessionItem({
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState("");
   const [confirmingDelete, setConfirmingDelete] = useState(false);
+  const [toast, setToast] = useState<string | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
 
   const sessionTitles = useChatStore((s) => s.sessionTitles);
@@ -212,6 +228,32 @@ export function SessionItem({
   const onDelete = () => setConfirmingDelete(true);
 
   const currentLabel = resolveLabel(session, sessionTitles[session.id]);
+
+  // Export to Markdown/JSON (#278): the backend serializes, the helper writes the
+  // user-chosen file, and we surface the outcome as a transient toast.
+  async function onExport(format: Format) {
+    try {
+      const result = await exportSessionToFile(
+        session.id,
+        currentLabel === "New session" ? null : currentLabel,
+        format,
+      );
+      if (result.status === "saved") {
+        setToast(`Exported to ${result.path}`);
+      }
+    } catch (err) {
+      setToast(
+        `Export failed: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+
+  // Auto-dismiss the toast (mirrors the about-section confirmation pattern).
+  useEffect(() => {
+    if (!toast) return;
+    const t = setTimeout(() => setToast(null), 3000);
+    return () => clearTimeout(t);
+  }, [toast]);
 
   // Click loads the session into the focused pane (#148) so it appears where the
   // user is looking; falls back to a global switch if panes aren't initialized.
@@ -354,6 +396,7 @@ export function SessionItem({
                           onTogglePin={onTogglePin}
                           onDismissToggle={onDismissToggle}
                           onRename={onRename}
+                          onExport={onExport}
                           onDelete={onDelete}
                         />
                       </DropdownMenuContent>
@@ -381,6 +424,7 @@ export function SessionItem({
           onTogglePin={onTogglePin}
           onDismissToggle={onDismissToggle}
           onRename={onRename}
+          onExport={onExport}
           onDelete={onDelete}
         />
       </ContextMenuContent>
@@ -403,6 +447,15 @@ export function SessionItem({
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
+
+      {toast ? (
+        <div
+          role="status"
+          className="fixed bottom-4 left-4 z-50 max-w-xs rounded-md border border-border bg-popover px-3 py-2 text-[12px] text-popover-foreground shadow-md"
+        >
+          {toast}
+        </div>
+      ) : null}
     </ContextMenu>
   );
 }

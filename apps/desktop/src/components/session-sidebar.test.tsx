@@ -79,6 +79,7 @@ describe("SessionMenuItems", () => {
         onTogglePin={() => {}}
         onDismissToggle={() => {}}
         onRename={() => {}}
+        onExport={() => {}}
         onDelete={() => {}}
         {...over}
       />,
