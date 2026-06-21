@@ -50,11 +50,11 @@ fn build_provider(config: &ProviderConfig) -> Box<dyn Provider> {
             Box::new(BedrockProvider::new(region, creds))
         }
         // The CLI has no keychain, so a hosted OpenAI key comes from the
-        // OPENAI_API_KEY env var (absent => keyless, for OpenAI-compatible
+        // OPENAI_API_KEY env var (absent or empty => keyless, for OpenAI-compatible
         // local gateways that need none).
         ProviderKind::OpenAi => Box::new(OpenAiProvider::new(
             base_url,
-            std::env::var("OPENAI_API_KEY").ok(),
+            api_key_from_env("OPENAI_API_KEY"),
         )),
         // SiliconFlow is OpenAI-compatible. The CLI has no keychain, so the bearer
         // key comes from SILICONFLOW_API_KEY (empty/unset = anonymous, which the
@@ -66,6 +66,14 @@ fn build_provider(config: &ProviderConfig) -> Box<dyn Provider> {
             Box::new(OpenAiProvider::new(base_url, key))
         }
     }
+}
+
+/// A bearer key from `var`, or `None` when the variable is unset *or* empty.
+/// An empty string is treated as "no key" (keyless) rather than sent as a blank
+/// `Authorization: Bearer`, matching the `!token.is_empty()` guard the Bedrock
+/// and SiliconFlow CLI arms use.
+fn api_key_from_env(var: &str) -> Option<String> {
+    std::env::var(var).ok().filter(|k| !k.is_empty())
 }
 
 /// `~/.flowforge/skills` — the installed-skills directory shared with the desktop
@@ -165,5 +173,31 @@ mod tests {
     fn unknown_name_returns_none() {
         let tmp = tempfile::tempdir().unwrap();
         assert!(resolve_phenotype_in("nope", tmp.path()).is_none());
+    }
+
+    #[test]
+    fn api_key_from_env_reads_a_set_key() {
+        // Unique per-test var name so parallel tests never race on process env.
+        let var = "FF_TEST_OPENAI_KEY_SET";
+        std::env::set_var(var, "sk-abc123");
+        assert_eq!(super::api_key_from_env(var), Some("sk-abc123".to_string()));
+        std::env::remove_var(var);
+    }
+
+    #[test]
+    fn api_key_from_env_treats_empty_as_keyless() {
+        let var = "FF_TEST_OPENAI_KEY_EMPTY";
+        std::env::set_var(var, "");
+        assert_eq!(super::api_key_from_env(var), None);
+        std::env::remove_var(var);
+    }
+
+    #[test]
+    fn api_key_from_env_unset_is_none() {
+        // A var name that is never set anywhere.
+        assert_eq!(
+            super::api_key_from_env("FF_TEST_OPENAI_KEY_NEVER_SET"),
+            None
+        );
     }
 }
