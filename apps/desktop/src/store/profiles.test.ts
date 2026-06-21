@@ -2,10 +2,30 @@ import { beforeEach, describe, expect, it } from "vitest";
 
 import { ipc } from "@/lib/ipc";
 import {
+  CODON_PROFILE_ID,
   DEFAULT_PROFILE_ID,
+  defaultProfileId,
   phenotypeToProfile,
   useProfilesStore,
 } from "@/store/profiles";
+
+describe("defaultProfileId", () => {
+  it("targets codon when it is installed", () => {
+    const profiles = [
+      phenotypeToProfile({ name: "default", skills: [] }, 0),
+      phenotypeToProfile({ name: "codon", skills: ["codegraph"] }, 1),
+    ];
+    expect(defaultProfileId(profiles)).toBe(CODON_PROFILE_ID);
+  });
+
+  it("falls back to the built-in default when codon is absent", () => {
+    const profiles = [
+      phenotypeToProfile({ name: "default", skills: [] }, 0),
+      phenotypeToProfile({ name: "rust", skills: [] }, 1),
+    ];
+    expect(defaultProfileId(profiles)).toBe(DEFAULT_PROFILE_ID);
+  });
+});
 
 describe("phenotypeToProfile", () => {
   it("maps phenotype fields and marks the built-in default as locked", () => {
@@ -18,6 +38,12 @@ describe("phenotypeToProfile", () => {
       accent: "blue",
     });
     expect(p.description).toMatch(/base working set/i);
+  });
+
+  it("leaves codon unlocked — it is user-installed content, not the built-in", () => {
+    const p = phenotypeToProfile({ name: "codon", skills: ["codegraph"] }, 1);
+    expect(p.id).toBe("codon");
+    expect(p.locked).toBe(false);
   });
 
   it("title-cases names, counts skills, and uses persona as the description", () => {
@@ -84,14 +110,18 @@ describe("useProfilesStore", () => {
     expect(useProfilesStore.getState().error).toMatch(/unknown phenotype/i);
   });
 
-  it("resetProfiles returns to the default profile", async () => {
+  it("resetProfiles returns to the out-of-box default (codon when installed)", async () => {
     await useProfilesStore.getState().load();
+    // Switch away from the out-of-box default to something else, then reset.
     const other = useProfilesStore
       .getState()
-      .profiles.find((p) => p.id !== DEFAULT_PROFILE_ID)!;
+      .profiles.find(
+        (p) => p.id !== DEFAULT_PROFILE_ID && p.id !== CODON_PROFILE_ID,
+      )!;
     await useProfilesStore.getState().setActive(other.id);
 
     await useProfilesStore.getState().resetProfiles();
-    expect(useProfilesStore.getState().activeId).toBe(DEFAULT_PROFILE_ID);
+    // The mock seeds codon, so reset targets codon rather than the built-in default.
+    expect(useProfilesStore.getState().activeId).toBe(CODON_PROFILE_ID);
   });
 });

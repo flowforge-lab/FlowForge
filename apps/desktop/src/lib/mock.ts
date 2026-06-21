@@ -111,6 +111,16 @@ const MOCK_SKILLS: SkillInfo[] = [
     active: false,
     score: 0,
   },
+  // Bundled with the Codon phenotype (#235/#304); seeded on first run.
+  {
+    name: "codegraph",
+    description:
+      "Code-aware navigation: definitions, callers, callees, impact.",
+    version: "0.1.0",
+    keywords: ["code", "graph", "navigation"],
+    active: false,
+    score: 0,
+  },
 ];
 
 // Mirrors `ff_skills::search_skills` scoring so the mock ranks like the backend:
@@ -178,6 +188,15 @@ const DEFAULT_PHENOTYPE: Phenotype = { name: "default", skills: [] };
 // Canned phenotypes so the `pheno` palette (#28) is exercisable offline. `default`
 // is prepended by `listPhenotypes`, matching the backend.
 const MOCK_PHENOTYPES: Phenotype[] = [
+  // The out-of-box default phenotype (#298), seeded on first run (#304). Listed
+  // first after `default` so the Phenos → Installed star/reset target it.
+  {
+    name: "codon",
+    skills: ["codegraph"],
+    persona:
+      "A disciplined software engineer: Research → Plan → Implement → Verify, codegraph-first navigation.",
+    maxIterations: 50,
+  },
   {
     name: "rust",
     skills: ["rust-debugging", "write-tests"],

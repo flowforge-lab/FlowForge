@@ -20,8 +20,22 @@ const ACCENTS: readonly ProfileAccent[] = [
   "rose",
 ];
 
-/** The built-in phenotype id — locked and shown with the default star. */
+/** The built-in phenotype id — always present and locked (cannot be removed). */
 export const DEFAULT_PROFILE_ID = "default";
+
+/** The out-of-box default phenotype id (#298). Seeded on first run (#304); when
+ *  present it is the starred "Default Phenotype", but unlike the built-in it is
+ *  user-installed content, so it is NOT locked. */
+export const CODON_PROFILE_ID = "codon";
+
+/** The id of the out-of-box default profile for the current install: `codon` when
+ *  it's installed, else the built-in `default`. Drives the ⭐ star and the footer
+ *  "Reset to defaults". */
+export function defaultProfileId(profiles: Profile[]): string {
+  return profiles.some((p) => p.id === CODON_PROFILE_ID)
+    ? CODON_PROFILE_ID
+    : DEFAULT_PROFILE_ID;
+}
 
 /** A profile card's view model. `id`/`name`/`skillCount` map from `Phenotype`;
  *  `locked`/`accent` are FE-only presentation. */
@@ -118,6 +132,7 @@ export const useProfilesStore = create<ProfilesState>((set, get) => ({
     }
   },
 
-  // Footer reset: return to the built-in default profile.
-  resetProfiles: () => get().setActive(DEFAULT_PROFILE_ID),
+  // Footer reset: return to the out-of-box default (codon when installed, else the
+  // built-in default).
+  resetProfiles: () => get().setActive(defaultProfileId(get().profiles)),
 }));
