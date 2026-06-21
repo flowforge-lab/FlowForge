@@ -127,3 +127,41 @@ The canonical reference implementation is [glob.rs](crates/ff-tools/src/glob.rs)
 - [ ] Unit tests + jail-escape test present
 - [ ] Module exposed in `lib.rs`, registered in `registry.rs` (or `tools.rs` if Tauri-backed)
 - [ ] `cargo fmt --check`, `clippy --all-targets -- -D warnings`, and `cargo test --workspace` all pass
+
+---
+
+## CLI (`apps/cli`)
+
+FlowForge ships a headless CLI binary (`flowforge`) that reuses the same agent
+loop, tools, and provider stack as the desktop app — no GUI, no Tauri.
+
+### Building & testing
+
+```bash
+cargo build -p ff-cli
+cargo test  -p ff-cli
+cargo run   -p ff-cli -- --help
+```
+
+### Exit-code contract
+
+The `run` subcommand follows a scripting-friendly contract:
+
+- **0** — turn completed successfully (no agent error, no denied approval).
+- **non-zero** — an agent error occurred, or a required tool approval was
+  denied (`--deny`, piped-no-policy, or `N` at a prompt).
+
+The interactive REPL exits **0** on clean shutdown; per-turn failures are
+printed inline.
+
+### Code map
+
+- `main.rs` — clap CLI, subcommand dispatch, `run` / `chat` entry points
+- `approver.rs` — `CliApprover`: approval policy (`--yes` / `--deny` / prompt),
+  denial tracking (`was_denied()`), piped-no-policy loud-deny rule
+- `host.rs` — provider loading, workspace setup, tool registry construction
+- `json_events.rs` — `--json` event serialization for machine-readable output
+
+When adding a new flag or subcommand, update the doc comments (they drive
+`--help` via clap) and the exit-code section in `README.md` if the contract
+changes.
