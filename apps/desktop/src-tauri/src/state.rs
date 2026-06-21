@@ -2661,6 +2661,7 @@ mod tests {
             model: "gpt-4o".into(),
             has_key: false,
             thinking: false,
+            supports_vision: false,
             region: None,
             auth_mode: None,
             aws_profile: None,
