@@ -3,7 +3,7 @@ import { FolderPlus, Lock, Star } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import {
-  DEFAULT_PROFILE_ID,
+  defaultProfileId,
   useProfilesStore,
   type Profile,
   type ProfileAccent,
@@ -73,6 +73,7 @@ export function InstalledTab() {
                 key={profile.id}
                 profile={profile}
                 active={profile.id === activeId}
+                isDefault={profile.id === defaultProfileId(profiles)}
                 disabled={saving}
                 onSelect={() => void setActive(profile.id)}
               />
@@ -87,15 +88,16 @@ export function InstalledTab() {
 function ProfileCard({
   profile,
   active,
+  isDefault,
   disabled,
   onSelect,
 }: {
   profile: Profile;
   active: boolean;
+  isDefault: boolean;
   disabled: boolean;
   onSelect: () => void;
 }) {
-  const isDefault = profile.id === DEFAULT_PROFILE_ID;
   return (
     <li>
       <button

@@ -530,6 +530,26 @@ fn resolve_phenotype(name: &str) -> Option<Phenotype> {
     map.remove(name)
 }
 
+/// The out-of-box default phenotype name (#298, a "for now" default until we revisit
+/// defaults). Seeded on first run by #304; a compiled-in, deletion-proof built-in is
+/// tracked as #306.
+const CODON_PHENOTYPE: &str = "codon";
+
+/// First-run phenotype selection. A persisted user choice always wins; otherwise we
+/// prefer the out-of-box `codon` default (seeded into `~/.flowforge/phenos/` on first
+/// run), falling back to the built-in `default` when codon isn't installed (e.g. a
+/// read-only home where the seed couldn't land). Pure over its inputs so the branch
+/// matrix is unit-testable without touching `~/.flowforge`.
+fn initial_phenotype(
+    persisted: Option<String>,
+    resolve: impl Fn(&str) -> Option<Phenotype>,
+) -> Phenotype {
+    persisted
+        .and_then(|n| resolve(n.as_str()))
+        .or_else(|| resolve(CODON_PHENOTYPE))
+        .unwrap_or_else(default_phenotype)
+}
+
 pub struct AppState {
     pub store: SessionStore,
     /// Persisted, non-secret LLM provider connection registry (RFC 0005 Phase A).
@@ -657,11 +677,9 @@ impl AppState {
             process_supervisor: Arc::new(ProcessSupervisor::new()),
         };
         // Restore the persisted phenotype so its active skills survive a restart.
-        // An unknown/missing pointer falls back to the built-in default.
-        let initial = state
-            .persisted_phenotype_name()
-            .and_then(|n| resolve_phenotype(n.as_str()))
-            .unwrap_or_else(default_phenotype);
+        // With no persisted choice, prefer the out-of-box `codon` default (#298),
+        // falling back to the built-in `default` when codon isn't installed.
+        let initial = initial_phenotype(state.persisted_phenotype_name(), resolve_phenotype);
         state.apply_phenotype(initial);
         state
     }
@@ -1896,6 +1914,48 @@ mod tests {
         // Deactivating an absent skill is a no-op.
         state.deactivate_skill("nope");
         assert_eq!(state.active_skills(), vec!["zeta"]);
+    }
+
+    // First-run phenotype selection (#298). A fake resolver lets us cover the whole
+    // branch matrix without touching `~/.flowforge`. `codon` and `default` resolve;
+    // anything else is unknown.
+    fn fake_resolve(name: &str) -> Option<Phenotype> {
+        match name {
+            "codon" | "default" | "rust" => Some(Phenotype {
+                name: name.to_string(),
+                skills: vec![],
+                model: None,
+                persona: None,
+                max_iterations: None,
+            }),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn initial_phenotype_prefers_persisted_choice() {
+        let pheno = initial_phenotype(Some("rust".to_string()), fake_resolve);
+        assert_eq!(pheno.name, "rust");
+    }
+
+    #[test]
+    fn initial_phenotype_defaults_to_codon_when_no_persisted_choice() {
+        let pheno = initial_phenotype(None, fake_resolve);
+        assert_eq!(pheno.name, "codon");
+    }
+
+    #[test]
+    fn initial_phenotype_unknown_persisted_falls_through_to_codon() {
+        let pheno = initial_phenotype(Some("ghost".to_string()), fake_resolve);
+        assert_eq!(pheno.name, "codon");
+    }
+
+    #[test]
+    fn initial_phenotype_falls_back_to_default_when_codon_absent() {
+        // Codon not installed (rare seed-failure): resolver only knows `default`.
+        let resolve = |name: &str| (name == "default").then(default_phenotype);
+        let pheno = initial_phenotype(None, resolve);
+        assert_eq!(pheno.name, DEFAULT_PHENOTYPE);
     }
 
     #[test]
