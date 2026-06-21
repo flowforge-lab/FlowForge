@@ -16,6 +16,7 @@ const KIND_META: Record<
   candleVllm: { badge: "C", color: "#4a9eff", tier: "Local" },
   ollama: { badge: "O", color: "#8bc34a", tier: "Local" },
   bedrock: { badge: "B", color: "#ff9900", tier: "Hosted" },
+  openai: { badge: "AI", color: "#10a37f", tier: "Hosted" },
 };
 
 const AUTH_OPTIONS: ReadonlyArray<{ value: BedrockAuth; label: string }> = [

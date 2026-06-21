@@ -58,6 +58,8 @@ function defaultConnection(kind: ProviderKind): ProviderConnection {
       return { ...base, displayName: "Ollama" };
     case "candleVllm":
       return { ...base, displayName: "candle-vLLM" };
+    case "openai":
+      return { ...base, displayName: "OpenAI" };
   }
 }
 
