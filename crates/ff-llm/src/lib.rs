@@ -34,6 +34,11 @@ pub struct ChatMessage {
     /// Tool name, set on a `role: "tool"` message.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// Files attached to the message (multimodal, #332). Empty for a plain text
+    /// turn; skipped on the wire when empty, so a text-only request is unchanged.
+    /// Providers map these to their own block formats in their own tickets.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<ff_core::Attachment>,
 }
 
 impl ChatMessage {
@@ -45,6 +50,23 @@ impl ChatMessage {
             tool_calls: None,
             tool_call_id: None,
             name: None,
+            attachments: Vec::new(),
+        }
+    }
+
+    /// A user message carrying text plus one or more attachments (#332).
+    pub fn multimodal(
+        role: impl Into<String>,
+        content: impl Into<String>,
+        attachments: Vec<ff_core::Attachment>,
+    ) -> Self {
+        Self {
+            role: role.into(),
+            content: Some(content.into()),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+            attachments,
         }
     }
 }

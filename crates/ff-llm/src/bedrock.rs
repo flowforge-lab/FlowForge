@@ -633,6 +633,8 @@ mod tests {
             }]),
             tool_call_id: None,
             name: None,
+
+            attachments: Vec::new(),
         }
     }
 
@@ -667,6 +669,8 @@ mod tests {
             tool_calls: None,
             tool_call_id: Some("call_1".into()),
             name: Some("bash".into()),
+
+            attachments: Vec::new(),
         };
         let (_, messages) = to_converse(&[msg]);
         assert_eq!(messages.len(), 1);
@@ -741,6 +745,8 @@ mod tests {
             ),
             tool_call_id: None,
             name: None,
+
+            attachments: Vec::new(),
         }
     }
 
@@ -751,6 +757,8 @@ mod tests {
             tool_calls: None,
             tool_call_id: Some(id.into()),
             name: Some("bash".into()),
+
+            attachments: Vec::new(),
         }
     }
 

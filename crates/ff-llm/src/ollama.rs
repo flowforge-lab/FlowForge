@@ -331,6 +331,8 @@ mod tests {
             }]),
             tool_call_id: None,
             name: None,
+
+            attachments: Vec::new(),
         }
     }
 
@@ -403,6 +405,8 @@ mod tests {
             ]),
             tool_call_id: None,
             name: None,
+
+            attachments: Vec::new(),
         };
         let out = ollama_messages(&[msg]).unwrap();
         assert_eq!(out[0]["tool_calls"][0]["function"]["arguments"]["x"], 1);

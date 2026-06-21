@@ -13,7 +13,9 @@
 use std::path::Path;
 use std::sync::Mutex;
 
-use ff_core::{auto_title, Format, Message, Mode, Role, Session, SessionStatus, ToolCall};
+use ff_core::{
+    auto_title, Attachment, Format, Message, Mode, Role, Session, SessionStatus, ToolCall,
+};
 use rusqlite::{params, Connection, OptionalExtension};
 
 fn now_ms() -> i64 {
@@ -137,7 +139,7 @@ impl SessionStore {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
             .prepare(
-                "SELECT id, session_id, role, content, tool_calls, tool_call_id, created_at
+                "SELECT id, session_id, role, content, tool_calls, tool_call_id, attachments, created_at
                  FROM messages
                  WHERE session_id = ?1
                  ORDER BY seq",
@@ -157,6 +159,27 @@ impl SessionStore {
             content,
             tool_calls: None,
             tool_call_id: None,
+            attachments: None,
+            created_at: now_ms(),
+        })
+    }
+
+    /// Append a user/assistant message that carries attachments (multimodal, #332).
+    pub fn add_message_with_attachments(
+        &self,
+        session_id: &str,
+        role: Role,
+        content: String,
+        attachments: Vec<Attachment>,
+    ) -> Message {
+        self.push_message(Message {
+            id: new_id(),
+            session_id: session_id.to_string(),
+            role,
+            content,
+            tool_calls: None,
+            tool_call_id: None,
+            attachments: (!attachments.is_empty()).then_some(attachments),
             created_at: now_ms(),
         })
     }
@@ -175,6 +198,7 @@ impl SessionStore {
             content,
             tool_calls: None,
             tool_call_id: Some(tool_call_id),
+            attachments: None,
             created_at: now_ms(),
         })
     }
@@ -202,10 +226,16 @@ impl SessionStore {
             .tool_calls
             .as_ref()
             .map(|c| serde_json::to_string(c).expect("serialize tool_calls"));
+        // Store NULL when there are no attachments so text-only rows stay compact.
+        let attachments = msg
+            .attachments
+            .as_ref()
+            .filter(|a| !a.is_empty())
+            .map(|a| serde_json::to_string(a).expect("serialize attachments"));
         conn.execute(
             "INSERT INTO messages
-                 (id, session_id, seq, role, content, tool_calls, tool_call_id, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                 (id, session_id, seq, role, content, tool_calls, tool_call_id, attachments, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 msg.id,
                 msg.session_id,
@@ -214,6 +244,7 @@ impl SessionStore {
                 msg.content,
                 tool_calls,
                 msg.tool_call_id,
+                attachments,
                 msg.created_at,
             ],
         )
@@ -346,7 +377,7 @@ impl SessionStore {
         if updated > 0 {
             if let Some(msg) = conn
                 .query_row(
-                    "SELECT id, session_id, role, content, tool_calls, tool_call_id, created_at
+                    "SELECT id, session_id, role, content, tool_calls, tool_call_id, attachments, created_at
                      FROM messages WHERE id = ?1",
                     params![message_id],
                     row_to_message,
@@ -365,6 +396,7 @@ impl SessionStore {
             content,
             tool_calls: None,
             tool_call_id: None,
+            attachments: None,
             created_at: ts,
         }
     }
@@ -454,9 +486,9 @@ impl SessionStore {
         // Re-key the transcript to the new session, preserving `seq` order.
         conn.execute(
             "INSERT INTO messages
-                 (id, session_id, seq, role, content, tool_calls, tool_call_id, created_at)
+                 (id, session_id, seq, role, content, tool_calls, tool_call_id, attachments, created_at)
              SELECT lower(hex(randomblob(16))), ?1, seq, role, content, tool_calls,
-                    tool_call_id, created_at
+                    tool_call_id, attachments, created_at
              FROM messages WHERE session_id = ?2",
             params![forked.id, session_id],
         )
@@ -621,6 +653,13 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
         conn.execute_batch("ALTER TABLE sessions ADD COLUMN workspace TEXT;")?;
         conn.pragma_update(None, "user_version", 2)?;
     }
+    if version < 3 {
+        // BE-1 (#333): message attachments (multimodal, #332) persist as a JSON
+        // array of `Attachment`, NULL when a message has none. Added via ALTER so
+        // existing v2 databases gain the column without losing data.
+        conn.execute_batch("ALTER TABLE messages ADD COLUMN attachments TEXT;")?;
+        conn.pragma_update(None, "user_version", 3)?;
+    }
     Ok(())
 }
 
@@ -644,6 +683,7 @@ fn row_to_session(row: &rusqlite::Row) -> rusqlite::Result<Session> {
 fn row_to_message(row: &rusqlite::Row) -> rusqlite::Result<Message> {
     let role: String = row.get("role")?;
     let tool_calls: Option<String> = row.get("tool_calls")?;
+    let attachments: Option<String> = row.get("attachments")?;
     Ok(Message {
         id: row.get("id")?,
         session_id: row.get("session_id")?,
@@ -651,6 +691,7 @@ fn row_to_message(row: &rusqlite::Row) -> rusqlite::Result<Message> {
         content: row.get("content")?,
         tool_calls: tool_calls.and_then(|s| serde_json::from_str(&s).ok()),
         tool_call_id: row.get("tool_call_id")?,
+        attachments: attachments.and_then(|s| serde_json::from_str(&s).ok()),
         created_at: row.get("created_at")?,
     })
 }
@@ -739,6 +780,75 @@ mod tests {
         assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[0].role, Role::User);
         assert_eq!(msgs[1].content, "hi");
+    }
+
+    #[test]
+    fn message_attachments_round_trip() {
+        use ff_core::{AttachmentKind, AttachmentSource};
+        let store = SessionStore::new();
+        let s = store.create_session(None);
+        let attachments = vec![
+            Attachment {
+                kind: AttachmentKind::Image,
+                media_type: "image/png".into(),
+                source: AttachmentSource::Path("/tmp/shot.png".into()),
+                name: Some("shot.png".into()),
+                bytes: 2048,
+            },
+            Attachment {
+                kind: AttachmentKind::Document,
+                media_type: "application/pdf".into(),
+                source: AttachmentSource::Inline("JVBERi0=".into()),
+                name: None,
+                bytes: 8,
+            },
+        ];
+        store.add_message_with_attachments(
+            &s.id,
+            Role::User,
+            "look at these".into(),
+            attachments.clone(),
+        );
+
+        let msgs = store.get_messages(&s.id);
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].content, "look at these");
+        assert_eq!(msgs[0].attachments.as_deref(), Some(attachments.as_slice()));
+    }
+
+    #[test]
+    fn plain_message_has_no_attachments() {
+        let store = SessionStore::new();
+        let s = store.create_session(None);
+        store.add_message(&s.id, Role::User, "hi".into());
+        assert!(store.get_messages(&s.id)[0].attachments.is_none());
+    }
+
+    #[test]
+    fn empty_attachments_persist_as_none() {
+        let store = SessionStore::new();
+        let s = store.create_session(None);
+        store.add_message_with_attachments(&s.id, Role::User, "hi".into(), vec![]);
+        assert!(store.get_messages(&s.id)[0].attachments.is_none());
+    }
+
+    #[test]
+    fn fork_session_copies_attachments() {
+        use ff_core::{AttachmentKind, AttachmentSource};
+        let store = SessionStore::new();
+        let s = store.create_session(None);
+        let att = Attachment {
+            kind: AttachmentKind::Image,
+            media_type: "image/jpeg".into(),
+            source: AttachmentSource::Path("/tmp/a.jpg".into()),
+            name: None,
+            bytes: 10,
+        };
+        store.add_message_with_attachments(&s.id, Role::User, "see".into(), vec![att.clone()]);
+
+        let forked = store.fork_session(&s.id).unwrap();
+        let msgs = store.get_messages(&forked.id);
+        assert_eq!(msgs[0].attachments.as_deref(), Some([att].as_slice()));
     }
 
     #[test]
@@ -1031,7 +1141,7 @@ mod tests {
             .unwrap()
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 2);
+        assert_eq!(version, 3);
     }
 
     #[test]

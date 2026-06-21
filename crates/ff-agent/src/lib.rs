@@ -297,6 +297,7 @@ pub(crate) fn to_chat(messages: &[Message]) -> Vec<ChatMessage> {
                 tool_calls,
                 tool_call_id: m.tool_call_id.clone(),
                 name: None,
+                attachments: m.attachments.clone().unwrap_or_default(),
             }
         })
         .collect()
@@ -484,6 +485,8 @@ pub async fn run_turn(
                 tool_calls: None,
                 tool_call_id: None,
                 name: None,
+
+                attachments: Vec::new(),
             });
         }
         messages.extend(to_chat(&history));
@@ -504,6 +507,8 @@ pub async fn run_turn(
                 tool_calls: None,
                 tool_call_id: None,
                 name: None,
+
+                attachments: Vec::new(),
             });
         }
 
@@ -521,6 +526,8 @@ pub async fn run_turn(
                 tool_calls: None,
                 tool_call_id: None,
                 name: None,
+
+                attachments: Vec::new(),
             });
         }
 

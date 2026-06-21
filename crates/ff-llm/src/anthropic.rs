@@ -547,6 +547,8 @@ mod tests {
             tool_calls: Some(calls),
             tool_call_id: None,
             name: None,
+
+            attachments: Vec::new(),
         }
     }
 
@@ -557,6 +559,8 @@ mod tests {
             tool_calls: None,
             tool_call_id: Some(id.into()),
             name: None,
+
+            attachments: Vec::new(),
         }
     }
 
@@ -619,6 +623,8 @@ mod tests {
             tool_calls: None,
             tool_call_id: None,
             name: None,
+
+            attachments: Vec::new(),
         };
         let (_, out) = to_anthropic_messages(&[msg]);
         assert!(out.is_empty());
@@ -636,6 +642,8 @@ mod tests {
             )]),
             tool_call_id: None,
             name: None,
+
+            attachments: Vec::new(),
         };
         let (_, out) = to_anthropic_messages(&[msg]);
         let content = out[0]["content"].as_array().unwrap();
