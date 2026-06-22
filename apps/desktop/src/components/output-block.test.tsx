@@ -91,4 +91,16 @@ describe("OutputBlock (#331)", () => {
     const { content } = useSplitStore.getState();
     expect(content).toEqual({ kind: "text", text: SHORT, title: "my-tool" });
   });
+
+  it("renders the folded preview as a width-bounded single-line truncation (#384)", () => {
+    render(<OutputBlock output={LONG} title="t" />);
+    // The collapsed preview button leads with the output text (not the toggle,
+    // which leads with "output"). It must be a block bounded to the container
+    // width so `truncate` clips to one line instead of wrapping.
+    const preview = button(LONG.slice(0, 10));
+    expect(preview).toBeTruthy();
+    expect(preview?.className).toContain("truncate");
+    expect(preview?.className).toContain("block");
+    expect(preview?.className).toContain("w-full");
+  });
 });

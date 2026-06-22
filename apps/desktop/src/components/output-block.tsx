@@ -110,7 +110,7 @@ export function OutputBlock({
         <button
           type="button"
           onClick={() => setUserOpen(true)}
-          className="truncate text-left text-muted-foreground/70 transition-colors hover:text-foreground"
+          className="block w-full truncate text-left text-muted-foreground/70 transition-colors hover:text-foreground"
         >
           {output.slice(0, 120)}…
         </button>
