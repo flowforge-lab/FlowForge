@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use chrono::Utc;
 use ff_memory::{
     chunk_markdown, Memory, MemoryIndex, MemorySource, RecencyFrequencySalience, ScoredChunk,
     Stratum, WriteTarget,
@@ -40,16 +41,33 @@ fn resolve(memory: &Memory, raw: &str) -> PathBuf {
 }
 
 fn format_hits(memory: &Memory, hits: &[ScoredChunk]) -> String {
+    let threshold = memory.config().decay.dormant_threshold;
+    let now_ms = Utc::now().timestamp_millis();
     let mut out = String::new();
-    for (i, ScoredChunk { chunk, .. }) in hits.iter().enumerate() {
+    for (i, sc) in hits.iter().enumerate() {
+        let chunk = &sc.chunk;
         let path = rel_path(memory, &chunk.path);
         let heading = chunk
             .heading
             .as_deref()
             .map(|h| format!(" \u{203a} {h}"))
             .unwrap_or_default();
+        // Dormancy is a derived predicate (RFC 0007 §3): a hit below the
+        // threshold is still returned, but tagged so the model knows the fact is
+        // old. A search hit also reinforces the chunk (caller-side), so recall
+        // can lift it back above the threshold. The tag never appears when decay
+        // is disabled (weight stays 1.0).
+        let tag = if sc.weight < threshold {
+            let age = sc
+                .last_accessed_ms
+                .map(|ms| human_age_ms(now_ms - ms))
+                .unwrap_or_else(|| "long ago".to_string());
+            format!(" [dormant \u{b7} last recalled ~{age}]")
+        } else {
+            String::new()
+        };
         out.push_str(&format!(
-            "[{}] {path}{heading} (lines {}-{})\n{}\n\n",
+            "[{}] {path}{heading}{tag} (lines {}-{})\n{}\n\n",
             i + 1,
             chunk.line_start,
             chunk.line_end,
@@ -57,6 +75,25 @@ fn format_hits(memory: &Memory, hits: &[ScoredChunk]) -> String {
         ));
     }
     out.trim_end().to_string()
+}
+
+/// Coarse human-readable age for a positive epoch-ms delta, e.g. `6 months ago`.
+/// Used only for the dormant tag, so approximate buckets are fine.
+fn human_age_ms(delta_ms: i64) -> String {
+    let days = (delta_ms.max(0) as f64 / 86_400_000.0).floor() as i64;
+    let (n, unit) = if days >= 365 {
+        (days / 365, "year")
+    } else if days >= 30 {
+        (days / 30, "month")
+    } else if days >= 7 {
+        (days / 7, "week")
+    } else if days >= 1 {
+        (days, "day")
+    } else {
+        return "today".to_string();
+    };
+    let plural = if n == 1 { "" } else { "s" };
+    format!("{n} {unit}{plural} ago")
 }
 
 /// `memory_search` — ranked BM25 recall over durable memory.
@@ -452,7 +489,7 @@ impl Tool for MemoryConsolidateTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ff_memory::{Fts5Index, HybridIndex, MemoryConfig, OpenAiEmbedder};
+    use ff_memory::{Fts5Index, HybridIndex, MemoryChunk, MemoryConfig, OpenAiEmbedder};
     use std::sync::Arc;
     use tempfile::TempDir;
     use wiremock::matchers::{method, path as wm_path};
@@ -479,6 +516,66 @@ mod tests {
         ));
         let index: Arc<dyn MemoryIndex> = Arc::new(Fts5Index::open_in_memory().unwrap());
         (dir, memory, index)
+    }
+
+    fn hit(weight: f32, last_accessed_ms: Option<i64>) -> ScoredChunk {
+        ScoredChunk {
+            chunk: MemoryChunk {
+                id: 1,
+                source: MemorySource::Curated,
+                path: PathBuf::from("MEMORY.md"),
+                heading: Some("Prefs".to_string()),
+                text: "user prefers rust".to_string(),
+                line_start: 1,
+                line_end: 2,
+                embedding: None,
+            },
+            score: 1.0,
+            weight,
+            last_accessed_ms,
+        }
+    }
+
+    #[test]
+    fn format_hits_tags_dormant_chunk_with_age() {
+        // Default dormant_threshold is 0.25; a 0.1-weight hit recalled ~6 months
+        // ago must be returned but tagged (RFC 0007 §3).
+        let (_dir, memory, _index) = setup();
+        let six_months_ago = Utc::now().timestamp_millis() - 180 * 86_400_000;
+        let out = format_hits(&memory, &[hit(0.1, Some(six_months_ago))]);
+        assert!(out.contains("[dormant"), "missing dormant tag: {out}");
+        assert!(out.contains("last recalled ~"), "{out}");
+        assert!(out.contains("months ago"), "{out}");
+        // The chunk body is still present -- dormant means tagged, not dropped.
+        assert!(out.contains("user prefers rust"), "{out}");
+    }
+
+    #[test]
+    fn format_hits_leaves_live_chunk_untagged() {
+        let (_dir, memory, _index) = setup();
+        let out = format_hits(&memory, &[hit(0.9, Some(Utc::now().timestamp_millis()))]);
+        assert!(
+            !out.contains("dormant"),
+            "live chunk must not be tagged: {out}"
+        );
+    }
+
+    #[test]
+    fn format_hits_dormant_without_timestamp_says_long_ago() {
+        let (_dir, memory, _index) = setup();
+        let out = format_hits(&memory, &[hit(0.0, None)]);
+        assert!(out.contains("long ago"), "{out}");
+    }
+
+    #[test]
+    fn human_age_ms_buckets() {
+        let day = 86_400_000_i64;
+        assert_eq!(human_age_ms(0), "today");
+        assert_eq!(human_age_ms(day * 3 / 2), "1 day ago");
+        assert_eq!(human_age_ms(day * 2), "2 days ago");
+        assert_eq!(human_age_ms(day * 14), "2 weeks ago");
+        assert_eq!(human_age_ms(day * 180), "6 months ago");
+        assert_eq!(human_age_ms(day * 400), "1 year ago");
     }
 
     #[tokio::test]

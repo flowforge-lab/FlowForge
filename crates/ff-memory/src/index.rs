@@ -31,6 +31,22 @@ const ONE_DAY_MS: f32 = 86_400_000.0;
 pub struct ScoredChunk {
     pub chunk: MemoryChunk,
     pub score: f32,
+    /// Effective (lazily-decayed) usage weight at search time (RFC 0007 §3).
+    /// `1.0` when decay is disabled or the chunk has no `chunk_stats` row, so a
+    /// fresh / never-recalled chunk is never dormant.
+    pub weight: f32,
+    /// Epoch-ms of the last recorded access, if any — drives the dormant age
+    /// tag in `memory_search`. `None` when decay is disabled or no row exists.
+    pub last_accessed_ms: Option<i64>,
+}
+
+/// Read-time usage stats for a chunk: `weight` lazily decayed to the query
+/// instant (RFC 0007 §3 — dormancy is a *derived* predicate, computed not
+/// stored), plus the raw `last_accessed` for age display.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EffectiveStat {
+    pub weight: f32,
+    pub last_accessed_ms: i64,
 }
 
 /// Recall backend (RFC 0006 §6). Swappable so M5.3 can add a hybrid vector index
@@ -50,6 +66,18 @@ pub trait MemoryIndex: Send + Sync {
     /// index) need no change; [`Fts5Index`] overrides it.
     fn reinforce(&self, _hits: &[ScoredChunk]) -> Result<()> {
         Ok(())
+    }
+    /// Read-time effective (decayed) usage stats for `keys`, computed against
+    /// `now_ms` without persisting (RFC 0007 §3). Keys with no `chunk_stats`
+    /// row — and *all* keys when decay is disabled — are omitted from the map;
+    /// callers treat an absent key as weight `1.0` (never dormant). The default
+    /// is empty so backends without a stats table need no change.
+    fn effective_stats(
+        &self,
+        _keys: &[String],
+        _now_ms: i64,
+    ) -> Result<HashMap<String, EffectiveStat>> {
+        Ok(HashMap::new())
     }
 }
 
@@ -297,45 +325,98 @@ impl MemoryIndex for Fts5Index {
         let Some(match_query) = fts_query(query) else {
             return Ok(Vec::new());
         };
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT c.id, c.source, c.path, c.heading, c.text, c.line_start, c.line_end,
-                    bm25(chunks_fts) AS score
-             FROM chunks_fts
-             JOIN chunks c ON c.id = chunks_fts.rowid
-             WHERE chunks_fts MATCH ?1
-             ORDER BY score
-             LIMIT ?2",
-        )?;
-        let rows = stmt.query_map(params![match_query, k as i64], |row| {
-            let source: String = row.get(1)?;
-            let path: String = row.get(2)?;
-            let bm25: f64 = row.get(7)?;
-            Ok(ScoredChunk {
-                chunk: MemoryChunk {
-                    id: row.get(0)?,
-                    source: source_from_str(&source),
-                    path: PathBuf::from(path),
-                    heading: row.get(3)?,
-                    text: row.get(4)?,
-                    line_start: row.get(5)?,
-                    line_end: row.get(6)?,
-                    embedding: None,
-                },
-                // bm25() is a distance (lower = better, typically negative); negate
-                // so a larger score means more relevant.
-                score: -bm25 as f32,
-            })
-        })?;
-        let mut out = Vec::new();
-        for r in rows {
-            out.push(r?);
+        // Scope the connection lock so it is released before `effective_stats`
+        // re-locks it below (the Mutex is not reentrant).
+        let mut out = {
+            let conn = self.conn.lock().unwrap();
+            let mut stmt = conn.prepare(
+                "SELECT c.id, c.source, c.path, c.heading, c.text, c.line_start, c.line_end,
+                        bm25(chunks_fts) AS score
+                 FROM chunks_fts
+                 JOIN chunks c ON c.id = chunks_fts.rowid
+                 WHERE chunks_fts MATCH ?1
+                 ORDER BY score
+                 LIMIT ?2",
+            )?;
+            let rows = stmt.query_map(params![match_query, k as i64], |row| {
+                let source: String = row.get(1)?;
+                let path: String = row.get(2)?;
+                let bm25: f64 = row.get(7)?;
+                Ok(ScoredChunk {
+                    chunk: MemoryChunk {
+                        id: row.get(0)?,
+                        source: source_from_str(&source),
+                        path: PathBuf::from(path),
+                        heading: row.get(3)?,
+                        text: row.get(4)?,
+                        line_start: row.get(5)?,
+                        line_end: row.get(6)?,
+                        embedding: None,
+                    },
+                    // bm25() is a distance (lower = better, typically negative); negate
+                    // so a larger score means more relevant.
+                    score: -bm25 as f32,
+                    // Annotated below from chunk_stats; defaults keep a fresh chunk
+                    // non-dormant.
+                    weight: 1.0,
+                    last_accessed_ms: None,
+                })
+            })?;
+            let mut v = Vec::new();
+            for r in rows {
+                v.push(r?);
+            }
+            v
+        };
+
+        // Annotate each hit with its read-time effective weight + last access so
+        // `memory_search` can tag dormant chunks (RFC 0007 §3). No-op when decay
+        // is disabled (`effective_stats` returns empty), keeping output identical
+        // to M5.
+        if !out.is_empty() {
+            let keys: Vec<String> = out.iter().map(|s| chunk_key(&s.chunk)).collect();
+            let stats = self.effective_stats(&keys, Utc::now().timestamp_millis())?;
+            for (s, key) in out.iter_mut().zip(&keys) {
+                if let Some(es) = stats.get(key) {
+                    s.weight = es.weight;
+                    s.last_accessed_ms = Some(es.last_accessed_ms);
+                }
+            }
         }
         Ok(out)
     }
 
     fn reinforce(&self, hits: &[ScoredChunk]) -> Result<()> {
         self.reinforce_at(hits, Utc::now().timestamp_millis())
+    }
+
+    fn effective_stats(
+        &self,
+        keys: &[String],
+        now_ms: i64,
+    ) -> Result<HashMap<String, EffectiveStat>> {
+        let mut out = HashMap::new();
+        if !self.decay.enabled || keys.is_empty() {
+            return Ok(out);
+        }
+        let conn = self.conn.lock().unwrap();
+        let mut sel =
+            conn.prepare("SELECT weight, last_accessed FROM chunk_stats WHERE chunk_key = ?1")?;
+        for key in keys {
+            let row: Option<(f64, i64)> = sel
+                .query_row(params![key], |r| Ok((r.get(0)?, r.get(1)?)))
+                .optional()?;
+            if let Some((w, last)) = row {
+                out.insert(
+                    key.clone(),
+                    EffectiveStat {
+                        weight: decayed_weight(w as f32, last, now_ms, self.decay.factor),
+                        last_accessed_ms: last,
+                    },
+                );
+            }
+        }
+        Ok(out)
     }
 }
 
@@ -432,6 +513,14 @@ impl<E: Embedder> MemoryIndex for HybridIndex<E> {
         self.inner.reinforce(hits)
     }
 
+    fn effective_stats(
+        &self,
+        keys: &[String],
+        now_ms: i64,
+    ) -> Result<HashMap<String, EffectiveStat>> {
+        self.inner.effective_stats(keys, now_ms)
+    }
+
     fn search(&self, query: &str, k: usize) -> Result<Vec<ScoredChunk>> {
         // No query vector (embeddings off / unavailable) -> pure BM25, identical
         // to Fts5Index. This is the fallback guarantee and the common path.
@@ -487,6 +576,10 @@ impl<E: Embedder> MemoryIndex for HybridIndex<E> {
             .map(|(i, score)| ScoredChunk {
                 chunk: bm25[i].chunk.clone(),
                 score,
+                // Usage stats are populated by the inner BM25 search; carry them
+                // through the fusion re-rank unchanged.
+                weight: bm25[i].weight,
+                last_accessed_ms: bm25[i].last_accessed_ms,
             })
             .collect())
     }
@@ -806,6 +899,8 @@ mod tests {
             .map(|c| ScoredChunk {
                 chunk: c.clone(),
                 score: 0.0,
+                weight: 1.0,
+                last_accessed_ms: None,
             })
             .collect()
     }
@@ -950,5 +1045,117 @@ mod tests {
         idx.reinforce(&scored(&cs)).unwrap();
         idx.reindex(&[]).unwrap();
         assert!(read_stat(&idx, &chunk_key(&cs[0])).is_none());
+    }
+
+    // ----- M6.1 dormancy reads (RFC 0007 §3) -------------------------------
+
+    #[test]
+    fn search_then_reinforce_lands_on_indexed_key() {
+        // Guards the production invariant (PR #367 review): a chunk reconstructed
+        // by `search` must hash to the same `chunk_key` as the indexed chunk, so
+        // search-driven reinforcement updates the row the orphan sweep keeps. A
+        // future change to search's SELECT or to chunk_key's inputs would break
+        // this silently with every other test still green.
+        let idx = Fts5Index::open_in_memory()
+            .unwrap()
+            .with_decay(enabled_decay());
+        let cs = chunks("## Prefs\nuser prefers rust", "MEMORY.md");
+        idx.reindex(&cs).unwrap();
+
+        let hits = idx.search("rust", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        idx.reinforce(&hits).unwrap();
+
+        let indexed_key = chunk_key(&cs[0]);
+        let (_, _, count) = read_stat(&idx, &indexed_key)
+            .expect("reinforce(search hits) must update the indexed chunk stats row");
+        assert_eq!(count, 1);
+        assert_eq!(
+            chunk_key(&hits[0].chunk),
+            indexed_key,
+            "search-reconstructed key must match the indexed key"
+        );
+    }
+
+    #[test]
+    fn effective_stats_decays_at_read_time_without_persisting() {
+        let decay = DecayConfig {
+            enabled: true,
+            factor: 0.5,
+            ..DecayConfig::default()
+        };
+        let idx = Fts5Index::open_in_memory().unwrap().with_decay(decay);
+        let cs = chunks("## H\nalpha body", "MEMORY.md");
+        idx.reindex(&cs).unwrap();
+        idx.reinforce_at(&scored(&cs), 0).unwrap();
+        let key = chunk_key(&cs[0]);
+
+        // Two idle days later (factor 0.5): effective weight = 1.0 * 0.5^2 = 0.25.
+        let day = ONE_DAY_MS as i64;
+        let stats = idx
+            .effective_stats(std::slice::from_ref(&key), day * 2)
+            .unwrap();
+        let es = stats.get(&key).expect("row present");
+        assert!((es.weight - 0.25).abs() < 1e-4, "weight {}", es.weight);
+        assert_eq!(es.last_accessed_ms, 0);
+        // Read-only: the persisted weight is untouched.
+        assert_eq!(read_stat(&idx, &key).unwrap().0, 1.0);
+    }
+
+    #[test]
+    fn effective_stats_omits_unknown_keys() {
+        let idx = Fts5Index::open_in_memory()
+            .unwrap()
+            .with_decay(enabled_decay());
+        let stats = idx.effective_stats(&["nope".to_string()], 0).unwrap();
+        assert!(
+            stats.is_empty(),
+            "unknown key absent -> caller treats as 1.0"
+        );
+    }
+
+    #[test]
+    fn effective_stats_empty_when_decay_disabled() {
+        let idx = Fts5Index::open_in_memory().unwrap();
+        let cs = chunks("## H\nalpha body", "MEMORY.md");
+        idx.reindex(&cs).unwrap();
+        idx.reinforce_at(&scored(&cs), 0).unwrap();
+        let stats = idx
+            .effective_stats(&[chunk_key(&cs[0])], ONE_DAY_MS as i64 * 100)
+            .unwrap();
+        assert!(
+            stats.is_empty(),
+            "disabled -> nothing dormant, identical to M5"
+        );
+    }
+
+    #[test]
+    fn search_annotates_decayed_weight() {
+        let decay = DecayConfig {
+            enabled: true,
+            factor: 0.5,
+            ..DecayConfig::default()
+        };
+        let idx = Fts5Index::open_in_memory().unwrap().with_decay(decay);
+        let cs = chunks("## Prefs\nuser prefers rust", "MEMORY.md");
+        idx.reindex(&cs).unwrap();
+        // Last access at the epoch: read-time decay to "now" collapses the weight.
+        idx.reinforce_at(&scored(&cs), 0).unwrap();
+
+        let hits = idx.search("rust", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].weight < 0.25, "decayed weight {}", hits[0].weight);
+        assert_eq!(hits[0].last_accessed_ms, Some(0));
+    }
+
+    #[test]
+    fn search_weight_stays_one_when_decay_disabled() {
+        let idx = Fts5Index::open_in_memory().unwrap();
+        let cs = chunks("## Prefs\nuser prefers rust", "MEMORY.md");
+        idx.reindex(&cs).unwrap();
+        idx.reinforce_at(&scored(&cs), 0).unwrap();
+        let hits = idx.search("rust", 10).unwrap();
+        assert_eq!(hits[0].weight, 1.0, "disabled decay -> weight neutral");
+        assert_eq!(hits[0].last_accessed_ms, None);
     }
 }
