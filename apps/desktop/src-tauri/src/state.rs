@@ -1700,6 +1700,7 @@ fn env_flag(name: &str) -> bool {
 fn build_memory() -> (Arc<Memory>, Arc<dyn MemoryIndex>, Option<MemoryWatcher>) {
     let config = memory_config_from_env();
     let embedder = local_embedder_from_env(&config);
+    let decay = config.decay.clone();
     let memory = Arc::new(Memory::with_default_root(config));
     let wrap = |i: Fts5Index| -> Arc<dyn MemoryIndex> {
         match &embedder {
@@ -1711,11 +1712,11 @@ fn build_memory() -> (Arc<Memory>, Arc<dyn MemoryIndex>, Option<MemoryWatcher>) 
         }
     };
     let index: Arc<dyn MemoryIndex> = match Fts5Index::open(memory.index_path()) {
-        Ok(i) => wrap(i),
+        Ok(i) => wrap(i.with_decay(decay.clone())),
         Err(e) => {
             tracing::warn!(error = %e, "memory index unavailable on disk; using in-memory");
             match Fts5Index::open_in_memory() {
-                Ok(i) => wrap(i),
+                Ok(i) => wrap(i.with_decay(decay.clone())),
                 Err(e) => {
                     tracing::warn!(error = %e, "memory index unavailable; recall disabled");
                     return (memory, Arc::new(NullIndex), None);

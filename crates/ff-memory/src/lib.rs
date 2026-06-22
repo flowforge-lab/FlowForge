@@ -141,7 +141,7 @@ pub struct MemoryChunk {
 /// this is only ever built via `Default` and never deserialized from disk. When
 /// on-disk persistence lands, keep the file camelCase too (or add an explicit
 /// migration) so a snake_case settings file isn't silently reintroduced.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, TS)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export, export_to = "../../../apps/desktop/src/bindings/")]
 pub struct MemoryConfig {
@@ -165,6 +165,42 @@ pub struct MemoryConfig {
     /// M6.1 flips this off once decay/dormancy governs injection instead.
     #[serde(default = "default_evict_to_budget")]
     pub evict_to_budget: bool,
+    /// Usage-driven decay knobs (RFC 0007 §5). Disabled by default in M6.0:
+    /// statistics are recorded but never decayed, so behaviour is byte-identical
+    /// to M5. M6.1 flips this default on once dormancy consumes `weight`.
+    #[serde(default)]
+    pub decay: DecayConfig,
+}
+
+/// Usage-driven decay configuration (RFC 0007 §5). Each knob has a conservative
+/// default; the whole mechanism is gated by `enabled`.
+///
+/// M6.0 is observe-only: stats are recorded, but `weight` only decays/reinforces
+/// when `enabled = true`. `enabled` defaults to `false` (issue #291) so the
+/// foundation slice is a no-op rollback path; M6.1 flips it on with dormancy.
+/// `ambient_gain` and `dormant_threshold` are part of the schema now but are not
+/// consumed until M6.1.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "../../../apps/desktop/src/bindings/")]
+pub struct DecayConfig {
+    /// Master switch for decay + reinforcement (RFC 0007 §5). When `false`,
+    /// stats are still recorded but `weight` is never modified.
+    #[serde(default = "default_decay_enabled")]
+    pub enabled: bool,
+    /// Daily multiplier applied per idle day: `weight *= factor.powf(days)`
+    /// (~35-day half-life at 0.98).
+    #[serde(default = "default_decay_factor")]
+    pub factor: f32,
+    /// Strength of a `memory_search` hit: `weight += gain * (1.0 - weight)`.
+    #[serde(default = "default_reinforce_gain")]
+    pub reinforce_gain: f32,
+    /// Weaker reinforcement for an ambient-only hit (schema now; consumed M6.1).
+    #[serde(default = "default_ambient_gain")]
+    pub ambient_gain: f32,
+    /// `weight` below this marks a chunk dormant (schema now; consumed M6.1).
+    #[serde(default = "default_dormant_threshold")]
+    pub dormant_threshold: f32,
 }
 
 /// Hybrid recall configuration (RFC 0006, M5.3). When `enabled = false`
@@ -201,6 +237,21 @@ fn default_budget() -> usize {
 fn default_evict_to_budget() -> bool {
     true
 }
+fn default_decay_enabled() -> bool {
+    false
+}
+fn default_decay_factor() -> f32 {
+    0.98
+}
+fn default_reinforce_gain() -> f32 {
+    0.3
+}
+fn default_ambient_gain() -> f32 {
+    0.05
+}
+fn default_dormant_threshold() -> f32 {
+    0.25
+}
 
 impl Default for MemoryConfig {
     fn default() -> Self {
@@ -209,6 +260,19 @@ impl Default for MemoryConfig {
             injection_budget_bytes: default_budget(),
             embeddings: EmbeddingsConfig::default(),
             evict_to_budget: default_evict_to_budget(),
+            decay: DecayConfig::default(),
+        }
+    }
+}
+
+impl Default for DecayConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_decay_enabled(),
+            factor: default_decay_factor(),
+            reinforce_gain: default_reinforce_gain(),
+            ambient_gain: default_ambient_gain(),
+            dormant_threshold: default_dormant_threshold(),
         }
     }
 }

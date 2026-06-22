@@ -128,7 +128,16 @@ impl Tool for MemorySearchTool {
         // runtime thread (it still degrades to BM25 internally on failure).
         let index = self.index.clone();
         let query = query.to_string();
-        match tokio::task::spawn_blocking(move || index.search(&query, limit)).await {
+        match tokio::task::spawn_blocking(move || {
+            let hits = index.search(&query, limit)?;
+            // Reinforce the surfaced top-k (RFC 0007 sec 2, M6.0). Best-effort: a
+            // stats write must never fail recall. It is a no-op for backends
+            // without a chunk_stats table, and weight-neutral when decay is off.
+            let _ = index.reinforce(&hits);
+            ff_memory::Result::Ok(hits)
+        })
+        .await
+        {
             Ok(Ok(hits)) if hits.is_empty() => ToolOutcome::ok("No matching memory."),
             Ok(Ok(hits)) => ToolOutcome::ok(format_hits(&self.memory, &hits)),
             Ok(Err(e)) => ToolOutcome::error(format!("memory search failed: {e}")),
