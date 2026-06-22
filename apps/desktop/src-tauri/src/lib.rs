@@ -1249,6 +1249,71 @@ fn remove_mcp_server(state: State<'_, Arc<AppState>>, id: String) -> CmdResult<(
     ff_mcp::remove(&path, &id).map_err(|e| e.to_string())
 }
 
+/// Outcome of an update check, serialized to the FE-owned `UpdateStatus` contract
+/// in `lib/about.ts` (`{ kind: "upToDate", version }` | `{ kind: "available",
+/// version, notes }`). The FE owns the toast copy; the backend reports only the
+/// structured outcome (#159, RFC 0014).
+#[derive(serde::Serialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+enum UpdateStatus {
+    UpToDate {
+        version: String,
+    },
+    Available {
+        version: String,
+        notes: Option<String>,
+    },
+}
+
+/// Build the updater. In prod it reads `plugins.updater` from `tauri.conf.json`
+/// (the GitHub `latest.json` feed). When `FF_UPDATER_ENDPOINT` is set (the RFC 0014
+/// D1 dev/dogfood channel) it points at that feed instead and accepts any version
+/// that differs from the running one, so a locally-built artifact installs without a
+/// version bump. Inert in prod (env unset).
+fn updater(app: &tauri::AppHandle) -> CmdResult<tauri_plugin_updater::Updater> {
+    use tauri_plugin_updater::UpdaterExt;
+    if let Ok(endpoint) = std::env::var("FF_UPDATER_ENDPOINT") {
+        let endpoint = url::Url::parse(&endpoint).map_err(|e| e.to_string())?;
+        app.updater_builder()
+            .endpoints(vec![endpoint])
+            .map_err(|e| e.to_string())?
+            .version_comparator(|current, update| update.version != current)
+            .build()
+            .map_err(|e| e.to_string())
+    } else {
+        app.updater().map_err(|e| e.to_string())
+    }
+}
+
+/// Check the configured update feed. Returns the structured `UpdateStatus` so the UI
+/// can branch (offer "Update now" on `available`). Errors (offline, malformed
+/// manifest) surface as `Err(String)` for the FE to toast.
+#[tauri::command]
+async fn check_for_updates(app: tauri::AppHandle) -> CmdResult<UpdateStatus> {
+    let current = app.package_info().version.to_string();
+    match updater(&app)?.check().await.map_err(|e| e.to_string())? {
+        Some(update) => Ok(UpdateStatus::Available {
+            version: update.version.clone(),
+            notes: update.body.clone(),
+        }),
+        None => Ok(UpdateStatus::UpToDate { version: current }),
+    }
+}
+
+/// Download and install the available update, then relaunch. Re-checks rather than
+/// caching the `Update` handle across IPC calls. A no-op if nothing is available.
+#[tauri::command]
+async fn install_update(app: tauri::AppHandle) -> CmdResult<()> {
+    let Some(update) = updater(&app)?.check().await.map_err(|e| e.to_string())? else {
+        return Ok(());
+    };
+    update
+        .download_and_install(|_chunk, _total| {}, || {})
+        .await
+        .map_err(|e| e.to_string())?;
+    app.restart();
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let state = Arc::new(AppState::new());
@@ -1256,6 +1321,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(state.clone())
         .setup(move |app| {
             // `init_mcp` enters the shared Tokio runtime itself, so it's safe to
@@ -1337,6 +1403,8 @@ pub fn run() {
             set_mcp_server_enabled,
             add_mcp_server,
             remove_mcp_server,
+            check_for_updates,
+            install_update,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");
@@ -1356,9 +1424,39 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    use super::{git_branch, mode_auto_approves, resolve_workspace_dir};
+    use super::{git_branch, mode_auto_approves, resolve_workspace_dir, UpdateStatus};
     use ff_core::Mode;
     use ff_tools::Safety;
+
+    // `UpdateStatus` has no ts-rs binding -- it is cast on the FE side from the JSON
+    // this serializes to (`lib/about.ts`). Pin the wire shape so the hand-written FE
+    // type and this enum cannot drift apart silently (#159).
+    #[test]
+    fn update_status_matches_fe_contract() {
+        assert_eq!(
+            serde_json::to_value(UpdateStatus::UpToDate {
+                version: "0.1.0".into()
+            })
+            .unwrap(),
+            serde_json::json!({ "kind": "upToDate", "version": "0.1.0" })
+        );
+        assert_eq!(
+            serde_json::to_value(UpdateStatus::Available {
+                version: "0.2.0".into(),
+                notes: Some("notes".into()),
+            })
+            .unwrap(),
+            serde_json::json!({ "kind": "available", "version": "0.2.0", "notes": "notes" })
+        );
+        assert_eq!(
+            serde_json::to_value(UpdateStatus::Available {
+                version: "0.2.0".into(),
+                notes: None,
+            })
+            .unwrap(),
+            serde_json::json!({ "kind": "available", "version": "0.2.0", "notes": null })
+        );
+    }
 
     // The one mode-driven auto-approve carve-out (#265): only Auto+Write is silent.
     // Dangerous always prompts (any mode), and the other modes prompt every write.
