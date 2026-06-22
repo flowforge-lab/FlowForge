@@ -220,6 +220,12 @@ pub struct ProviderConnection {
     /// When true, request and surface model reasoning/thinking streams (#181).
     #[serde(default = "default_thinking")]
     pub thinking: bool,
+    /// Whether this connection's model can accept image/document attachments
+    /// (multimodal, #332). Drives the composer attach-button gate (FE-4) and the
+    /// backend safety strip (a non-vision connection never emits a raw attachments
+    /// field). Defaults false; opted in per connection in settings.
+    #[serde(default)]
+    pub supports_vision: bool,
     /// AWS region for a Bedrock connection (e.g. `"us-east-1"`); the provider
     /// derives `bedrock-runtime.<region>.amazonaws.com` from it. `None` for
     /// non-Bedrock kinds.
@@ -372,6 +378,7 @@ impl Default for ProviderRegistry {
             model: "Qwen3-4B-Instruct-2507".to_string(),
             has_key: false,
             thinking: true,
+            supports_vision: false,
             region: None,
             auth_mode: None,
             aws_profile: None,
@@ -386,6 +393,7 @@ impl Default for ProviderRegistry {
             model: "llama3.2".to_string(),
             has_key: false,
             thinking: true,
+            supports_vision: false,
             region: None,
             auth_mode: None,
             aws_profile: None,
@@ -477,6 +485,7 @@ mod tests {
             model: "m".to_string(),
             has_key: false,
             thinking: true,
+            supports_vision: false,
             region: None,
             auth_mode: None,
             aws_profile: None,
@@ -589,6 +598,7 @@ mod tests {
             model: "llama3.2".into(),
             has_key: false,
             thinking: true,
+            supports_vision: false,
             region: None,
             auth_mode: None,
             aws_profile: None,
@@ -701,6 +711,26 @@ mod tests {
         assert!(!json.contains("accessKeyId"));
         let back: ProviderConnection = serde_json::from_str(&json).unwrap();
         assert_eq!(conn, back);
+    }
+
+    #[test]
+    fn supports_vision_defaults_false_and_round_trips() {
+        let conn = blank_conn("Local", None, ProviderKind::Ollama);
+        assert!(!conn.supports_vision);
+        // Absent in legacy JSON -> defaults false on deserialize.
+        let mut v: serde_json::Value = serde_json::to_value(&conn).unwrap();
+        v.as_object_mut().unwrap().remove("supportsVision");
+        let back: ProviderConnection = serde_json::from_value(v).unwrap();
+        assert!(!back.supports_vision);
+        // Set true -> serializes and round-trips.
+        let vision = ProviderConnection {
+            supports_vision: true,
+            ..conn
+        };
+        let json = serde_json::to_string(&vision).unwrap();
+        assert!(json.contains("\"supportsVision\":true"));
+        let back: ProviderConnection = serde_json::from_str(&json).unwrap();
+        assert!(back.supports_vision);
     }
 
     #[test]

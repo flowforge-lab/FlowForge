@@ -20,6 +20,11 @@ use crate::{ChatMessage, ChatRequest, Chunk, ChunkStream, LlmError, Provider, To
 pub struct OllamaProvider {
     base_url: String,
     client: reqwest::Client,
+    /// Whether the connection's model accepts attachments (#332/#334). When
+    /// false, attachments are stripped before serialization so a raw `attachments`
+    /// field never reaches the wire. Defaults false; set via
+    /// [`OllamaProvider::with_vision`].
+    supports_vision: bool,
 }
 
 impl OllamaProvider {
@@ -27,7 +32,14 @@ impl OllamaProvider {
         Self {
             base_url: base_url.into(),
             client: reqwest::Client::new(),
+            supports_vision: false,
         }
+    }
+
+    /// Declare whether the target model can accept image/document attachments.
+    pub fn with_vision(mut self, supports_vision: bool) -> Self {
+        self.supports_vision = supports_vision;
+        self
     }
 }
 
@@ -171,9 +183,10 @@ fn ollama_messages(messages: &[ChatMessage]) -> Result<serde_json::Value, LlmErr
 #[async_trait]
 impl Provider for OllamaProvider {
     async fn chat_stream(&self, req: ChatRequest) -> Result<ChunkStream, LlmError> {
+        let messages = crate::messages_for_wire(&req.messages, self.supports_vision);
         let mut body = serde_json::json!({
             "model": req.model,
-            "messages": ollama_messages(&req.messages)?,
+            "messages": ollama_messages(&messages)?,
             "stream": true,
             "think": req.thinking,
         });

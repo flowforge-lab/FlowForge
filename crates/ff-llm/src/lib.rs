@@ -144,6 +144,32 @@ impl LlmError {
 
 pub type ChunkStream = BoxStream<'static, Result<Chunk, LlmError>>;
 
+/// Drop attachments from every message for providers that cannot carry them
+/// (the capability strip, #332/#334). Borrows on the common path (no message has
+/// attachments) and only clones when a strip is actually needed, so a text-only
+/// turn is zero-cost. When `supports_vision` is true the messages pass through
+/// untouched -- the per-provider adapter (#335/#336/#337) reshapes attachments
+/// into that API's real content blocks.
+pub(crate) fn messages_for_wire(
+    messages: &[ChatMessage],
+    supports_vision: bool,
+) -> std::borrow::Cow<'_, [ChatMessage]> {
+    if supports_vision || messages.iter().all(|m| m.attachments.is_empty()) {
+        std::borrow::Cow::Borrowed(messages)
+    } else {
+        std::borrow::Cow::Owned(
+            messages
+                .iter()
+                .map(|m| {
+                    let mut m = m.clone();
+                    m.attachments.clear();
+                    m
+                })
+                .collect(),
+        )
+    }
+}
+
 #[async_trait]
 pub trait Provider: Send + Sync {
     async fn chat_stream(&self, req: ChatRequest) -> Result<ChunkStream, LlmError>;
@@ -201,6 +227,43 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
+
+    fn img_attachment() -> ff_core::Attachment {
+        ff_core::Attachment {
+            kind: ff_core::AttachmentKind::Image,
+            media_type: "image/png".into(),
+            source: ff_core::AttachmentSource::Inline("aGk=".into()),
+            name: None,
+            bytes: 2,
+        }
+    }
+
+    #[test]
+    fn messages_for_wire_strips_attachments_when_no_vision() {
+        let msg = ChatMessage::multimodal("user", "see this", vec![img_attachment()]);
+        let stripped = messages_for_wire(std::slice::from_ref(&msg), false);
+        assert!(stripped[0].attachments.is_empty());
+        // A stripped, text-only message serializes without an `attachments` key.
+        let v = serde_json::to_value(&stripped[0]).unwrap();
+        assert!(v.get("attachments").is_none());
+    }
+
+    #[test]
+    fn messages_for_wire_keeps_attachments_when_vision() {
+        let msg = ChatMessage::multimodal("user", "see this", vec![img_attachment()]);
+        let kept = messages_for_wire(std::slice::from_ref(&msg), true);
+        assert_eq!(kept[0].attachments.len(), 1);
+    }
+
+    #[test]
+    fn messages_for_wire_borrows_text_only_path() {
+        let msgs = vec![ChatMessage::text("user", "hi")];
+        // No attachments anywhere -> borrowed (zero-copy), regardless of the flag.
+        assert!(matches!(
+            messages_for_wire(&msgs, false),
+            std::borrow::Cow::Borrowed(_)
+        ));
+    }
 
     struct EndlessProvider {
         polled: Arc<AtomicUsize>,
