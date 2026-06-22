@@ -12,7 +12,7 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 APP_NAME="FlowForge.app"
-BUNDLE_DIR="$REPO_ROOT/apps/desktop/src-tauri/target/release/bundle/macos"
+BUNDLE_DIR="$REPO_ROOT/target/release/bundle/macos"
 INSTALL_DIR="/Applications"
 
 if [[ "$(uname)" != "Darwin" ]]; then
@@ -21,9 +21,12 @@ if [[ "$(uname)" != "Darwin" ]]; then
 fi
 
 echo "==> Building release bundle (pnpm tauri build)"
-cd "$REPO_ROOT"
+# pnpm/tauri scripts live in apps/desktop; the cargo workspace target is at the
+# repo root. Build the app bundle only -- no .dmg (flaky bundle_dmg.sh) and no
+# updater artifact (D2 has no updater, so signing keys are not required).
+cd "$REPO_ROOT/apps/desktop"
 pnpm install --frozen-lockfile
-pnpm tauri build
+pnpm tauri build --bundles app --config '{"bundle":{"createUpdaterArtifacts":false}}'
 
 BUILT_APP="$BUNDLE_DIR/$APP_NAME"
 if [[ ! -d "$BUILT_APP" ]]; then
