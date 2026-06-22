@@ -38,6 +38,7 @@ export type { McpServerState } from "./McpServerState";
 export type { McpServerStatus } from "./McpServerStatus";
 export type { McpToolInfo } from "./McpToolInfo";
 export type { McpStatusChangedEvent } from "./McpStatusChangedEvent";
+export type { PhenotypeMcpUnavailableEvent } from "./PhenotypeMcpUnavailableEvent";
 export type { MemoryFileInfo } from "./MemoryFileInfo";
 export type { MemoryFileKind } from "./MemoryFileKind";
 export type { MemoryOverview } from "./MemoryOverview";

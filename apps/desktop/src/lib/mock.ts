@@ -49,7 +49,7 @@ import {
   type BackupResult,
 } from "./about";
 import { autoTitle } from "./auto-title";
-import type { PhenotypeMcpUnavailableEvent } from "./phenotype-mcp";
+import type { PhenotypeMcpUnavailableEvent } from "@/bindings";
 
 type Listener<T> = (e: T) => void;
 

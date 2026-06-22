@@ -8,19 +8,13 @@
 // Kept free of React/stores so the copy is unit-testable in vitest's node env
 // (mirrors lib/mcp.ts / lib/steps.ts).
 //
-// CONTRACT NOTE (#301): mock-only today. There is no backend/ts-rs binding for
-// this event yet — `SkillInfo` deliberately omits `mcp`, so the FE cannot derive
-// the list itself. The shape mirrors the issue's proposal (`{ phenotype, servers }`)
-// and lives here (like SET.5/7's FE-owned types) until the backend emits
-// `phenotype:mcp-unavailable` for real. See `ipc.ts` `onPhenotypeMcpUnavailable`.
+// The event payload is the ts-rs-generated `PhenotypeMcpUnavailableEvent` binding
+// (`crates/ff-core/src/events.rs`, #301); the backend emits it for real from the
+// phenotype-switch commands. Imported here only to type the copy helpers below;
+// consumers import the type straight from `@/bindings`. See `ipc.ts`
+// `onPhenotypeMcpUnavailable`.
 
-export interface PhenotypeMcpUnavailableEvent {
-  /** The phenotype that was just activated. */
-  phenotype: string;
-  /** Required-but-unavailable MCP server ids, name-sorted and deduplicated.
-   *  Non-empty whenever the event is emitted. */
-  servers: string[];
-}
+import type { PhenotypeMcpUnavailableEvent } from "@/bindings";
 
 /** Lead sentence naming the phenotype and the unavailable server(s).
  *  Singular/plural aware. */

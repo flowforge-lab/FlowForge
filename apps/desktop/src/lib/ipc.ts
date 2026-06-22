@@ -9,7 +9,7 @@ import type { ControlConfig } from "@/lib/control";
 import type { MarketplaceSkill } from "@/lib/marketplace";
 import type { MarketplaceProfile } from "@/lib/profile-marketplace";
 import type { ScheduledTask, CreateScheduledTaskInput } from "@/lib/scheduled";
-import type { PhenotypeMcpUnavailableEvent } from "@/lib/phenotype-mcp";
+import type { PhenotypeMcpUnavailableEvent } from "@/bindings";
 import type {
   Message,
   ProviderConfig,

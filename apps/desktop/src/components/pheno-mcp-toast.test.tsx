@@ -26,6 +26,12 @@ function click(el: Element | null) {
   });
 }
 
+function fire(el: Element | null, type: string) {
+  act(() => {
+    el?.dispatchEvent(new MouseEvent(type, { bubbles: true }));
+  });
+}
+
 function findButton(label: string): HTMLButtonElement | undefined {
   return [...container.querySelectorAll("button")].find((el) =>
     el.textContent?.includes(label),
@@ -92,6 +98,50 @@ describe("PhenoMcpToast", () => {
         .show({ phenotype: "codon", servers: ["codegraph"] });
     });
     click(container.querySelector('button[aria-label="Dismiss"]'));
+    expect(container.querySelector('[role="status"]')).toBeNull();
+  });
+
+  it("does not auto-dismiss while the pointer is over it", () => {
+    render(<PhenoMcpToast />);
+    act(() => {
+      usePhenoMcpNoticeStore
+        .getState()
+        .show({ phenotype: "codon", servers: ["codegraph"] });
+    });
+    const card = container.querySelector('[role="status"]');
+    // React synthesizes onMouseEnter/Leave from native mouseover/mouseout.
+    fire(card, "mouseover");
+    act(() => {
+      vi.advanceTimersByTime(12_000);
+    });
+    expect(container.querySelector('[role="status"]')).not.toBeNull();
+    expect(usePhenoMcpNoticeStore.getState().notice).not.toBeNull();
+  });
+
+  it("re-arms a fresh countdown after the pointer leaves", () => {
+    render(<PhenoMcpToast />);
+    act(() => {
+      usePhenoMcpNoticeStore
+        .getState()
+        .show({ phenotype: "codon", servers: ["codegraph"] });
+    });
+    const card = container.querySelector('[role="status"]');
+    fire(card, "mouseover");
+    act(() => {
+      vi.advanceTimersByTime(12_000);
+    });
+    expect(container.querySelector('[role="status"]')).not.toBeNull();
+
+    fire(card, "mouseout");
+    // Leaving re-arms the full interval, so it survives a partial advance...
+    act(() => {
+      vi.advanceTimersByTime(11_000);
+    });
+    expect(container.querySelector('[role="status"]')).not.toBeNull();
+    // ...and dismisses once the fresh full interval elapses.
+    act(() => {
+      vi.advanceTimersByTime(1_000);
+    });
     expect(container.querySelector('[role="status"]')).toBeNull();
   });
 

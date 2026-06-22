@@ -183,6 +183,21 @@ pub struct McpStatusChangedEvent {
     pub servers: Vec<McpServerStatus>,
 }
 
+/// Backend -> frontend notice that a just-activated phenotype lists a skill whose
+/// declared MCP server is unavailable (#301/#235) -- absent from `mcp.json`, or
+/// present but not `Running`. Mirrors the warn-only signal `warn_missing_skill_mcp`
+/// logs; emitted only when the unavailable list is non-empty so the frontend toast
+/// fires exactly when there is something to report. Non-fatal: activation never
+/// blocks and the skill's grep/glob fallbacks still work. `servers` is name-sorted
+/// and deduplicated.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "../../../apps/desktop/src/bindings/")]
+pub struct PhenotypeMcpUnavailableEvent {
+    pub phenotype: String,
+    pub servers: Vec<String>,
+}
+
 /// Backend -> frontend telemetry: a skill became active for a turn (M3.5, RFC 0001
 /// §8). Emitted once per active skill at the start of each agent turn. `ff-signals`
 /// folds these into per-skill aggregates (activation counts); the frontend may also
@@ -246,4 +261,27 @@ pub struct SkillEvolveApprovalRequestEvent {
     pub before_body: String,
     pub after_body: String,
     pub cost_estimate: EvolveCostEstimate,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn phenotype_mcp_unavailable_serializes_with_exact_contract_keys() {
+        let ev = PhenotypeMcpUnavailableEvent {
+            phenotype: "codon".into(),
+            servers: vec!["codegraph".into(), "fetch".into()],
+        };
+        let v = serde_json::to_value(&ev).unwrap();
+        // The frontend listener (lib/ipc.ts onPhenotypeMcpUnavailable) reads these
+        // exact keys; both are single words so camelCase leaves them unchanged.
+        assert_eq!(
+            v,
+            serde_json::json!({ "phenotype": "codon", "servers": ["codegraph", "fetch"] })
+        );
+        let back: PhenotypeMcpUnavailableEvent = serde_json::from_value(v).unwrap();
+        assert_eq!(back.phenotype, "codon");
+        assert_eq!(back.servers, vec!["codegraph", "fetch"]);
+    }
 }

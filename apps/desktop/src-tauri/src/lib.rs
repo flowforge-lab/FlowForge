@@ -11,9 +11,10 @@ use async_trait::async_trait;
 use ff_agent::{run_turn, AgentEvent, Approver, CancelToken, ToolContext};
 use ff_core::events::{
     ApprovalSafety, EvolveCostEstimate, IntentionSignal, McpStatusChangedEvent, MemoryFlushedEvent,
-    ReasoningEvent, SkillActivated, SkillCompleted, SkillEvolveApprovalRequestEvent,
-    SkillInstallApprovalRequestEvent, SkillsChangedEvent, TokenEvent, ToolApprovalRequestEvent,
-    ToolAskRequestEvent, ToolCallEvent, ToolResultEvent, TurnDoneEvent, TurnErrorEvent,
+    PhenotypeMcpUnavailableEvent, ReasoningEvent, SkillActivated, SkillCompleted,
+    SkillEvolveApprovalRequestEvent, SkillInstallApprovalRequestEvent, SkillsChangedEvent,
+    TokenEvent, ToolApprovalRequestEvent, ToolAskRequestEvent, ToolCallEvent, ToolResultEvent,
+    TurnDoneEvent, TurnErrorEvent,
 };
 use ff_core::{
     BedrockAuth, Format, McpServerConfig, McpServerStatus, MemoryFileInfo, MemoryFileKind,
@@ -880,6 +881,23 @@ fn emit_skills_changed(app: &tauri::AppHandle, state: &AppState) {
     );
 }
 
+/// Emit `phenotype:mcp-unavailable` when `phenotype`'s skills declare an MCP server
+/// that is absent or not running (#301), so the frontend can surface a non-blocking
+/// toast over the warn-only backend signal. Fires only when the list is non-empty,
+/// matching the frontend listener contract; best-effort (a dropped emit is harmless).
+fn emit_pheno_mcp_unavailable(app: &tauri::AppHandle, state: &AppState, phenotype: &str) {
+    let servers = state.unavailable_skill_mcp_servers(phenotype);
+    if !servers.is_empty() {
+        let _ = app.emit(
+            "phenotype:mcp-unavailable",
+            PhenotypeMcpUnavailableEvent {
+                phenotype: phenotype.to_string(),
+                servers,
+            },
+        );
+    }
+}
+
 /// All installed skills, name-sorted, each flagged with its active state. `score`
 /// is always `0` here — ranking is `search_skills`' job. Backs the command palette
 /// skill source (#11/#16).
@@ -1117,6 +1135,7 @@ fn switch_phenotype(
 ) -> CmdResult<Phenotype> {
     let pheno = state.switch_phenotype(&name)?;
     emit_skills_changed(&app, &state);
+    emit_pheno_mcp_unavailable(&app, &state, &pheno.name);
     Ok(pheno)
 }
 
@@ -1128,10 +1147,15 @@ fn switch_phenotype(
 #[tauri::command]
 fn set_session_phenotype(
     state: State<'_, Arc<AppState>>,
+    app: tauri::AppHandle,
     session_id: String,
     name: Option<String>,
 ) -> CmdResult<()> {
-    state.set_session_phenotype(&session_id, name)
+    state.set_session_phenotype(&session_id, name.clone())?;
+    if let Some(n) = name {
+        emit_pheno_mcp_unavailable(&app, &state, &n);
+    }
+    Ok(())
 }
 
 /// Bind a single session's autonomy mode, or clear it (`mode: None`) so it inherits

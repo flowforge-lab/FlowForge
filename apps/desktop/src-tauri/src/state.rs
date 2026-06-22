@@ -822,6 +822,19 @@ impl AppState {
         }
     }
 
+    /// The required-but-unavailable MCP servers for `phenotype_name`'s resolved skills
+    /// (#301). Same list [`warn_missing_skill_mcp`](Self::warn_missing_skill_mcp) logs,
+    /// surfaced read-only so the command layer (which holds the `AppHandle`) can emit
+    /// `phenotype:mcp-unavailable` alongside the warn. Name-sorted and deduplicated;
+    /// empty for an unknown phenotype or when every required server is present and
+    /// running.
+    pub fn unavailable_skill_mcp_servers(&self, phenotype_name: &str) -> Vec<String> {
+        match resolve_phenotype(phenotype_name) {
+            Some(pheno) => self.missing_skill_mcp_servers(&self.resolve_skills(&pheno)),
+            None => Vec::new(),
+        }
+    }
+
     /// Run a pre-compaction memory flush if the session is now under context
     /// pressure (RFC 0006 §7.2). Best-effort and silent: it persists durable facts
     /// to memory before older detail is summarized away, and never touches the
@@ -2133,6 +2146,28 @@ mod tests {
             state.missing_skill_mcp_servers(&skills),
             vec!["codegraph".to_string(), "zeta".to_string()]
         );
+    }
+
+    #[test]
+    fn unavailable_skill_mcp_servers_is_empty_for_unknown_phenotype() {
+        let state = AppState::new();
+        // The query resolves the phenotype by name first; an unknown name yields no
+        // requirement (the command never emits in that case).
+        assert!(state
+            .unavailable_skill_mcp_servers("definitely-not-a-phenotype")
+            .is_empty());
+    }
+
+    #[test]
+    fn unavailable_skill_mcp_servers_resolves_and_delegates_for_known_phenotype() {
+        let state = AppState::new();
+        // The default phenotype always resolves; no skills are installed in the test
+        // environment, so it requires no MCP server. This exercises the resolve +
+        // delegate path (the non-empty list building is covered by the
+        // missing_skill_mcp_servers / unavailable_required_servers tests above).
+        assert!(state
+            .unavailable_skill_mcp_servers(DEFAULT_PHENOTYPE)
+            .is_empty());
     }
 
     #[test]
