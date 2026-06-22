@@ -5,6 +5,7 @@ import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import { SegmentedControl } from "@/components/settings/segmented-control";
 import {
+  isHostedKeyKind,
   normalizeBaseUrl,
   useModelConfigStore,
   type TestState,
@@ -50,16 +51,10 @@ function authLabel(mode: BedrockAuth | undefined): string {
   }
 }
 
-/** Hosted, OpenAI-compatible providers authenticated with a single bearer API
- *  key over an editable base URL (vs. Bedrock's region/auth form or the local
- *  kinds' plain host field). */
-function isHostedKeyKind(kind: ProviderConnection["kind"]): boolean {
-  return kind === "openai" || kind === "siliconFlow";
-}
-
 /** Base-URL field copy per hosted kind: the default endpoint (shown as the
  *  placeholder) plus a hint. SiliconFlow's hint points `.cn` users at the China
- *  endpoint; the field is editable so they can switch regions without an enum. */
+ *  endpoint; OpenAI's notes the optional compatible-gateway override. The field is
+ *  editable so users can switch regions/gateways without an enum. */
 function hostedBaseUrlMeta(kind: ProviderConnection["kind"]): {
   placeholder: string;
   hint: string;
@@ -72,7 +67,7 @@ function hostedBaseUrlMeta(kind: ProviderConnection["kind"]): {
   }
   return {
     placeholder: "https://api.openai.com/v1",
-    hint: "Leave blank for the default endpoint.",
+    hint: "Leave blank for the default OpenAI endpoint, or set an OpenAI-compatible base URL (e.g. OpenRouter, Azure).",
   };
 }
 
