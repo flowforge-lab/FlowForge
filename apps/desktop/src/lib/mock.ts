@@ -451,6 +451,21 @@ export class MockIpc implements FfIpc {
         thinking: true,
         supportsVision: false,
       },
+      // OpenAI (#311 PR-3b): a hosted, OpenAI-compatible connection so the
+      // hosted-key card is exercisable offline. Keyless by default → the Test
+      // probe fails until a key is stored, mirroring the real `list_models`
+      // probe (401 on a missing/bad key). `baseUrl` unset defaults to
+      // https://api.openai.com/v1.
+      {
+        id: "openai",
+        kind: "openai",
+        displayName: "OpenAI",
+        model: "gpt-4o",
+        hasKey: false,
+        thinking: true,
+        // gpt-4o is vision-capable.
+        supportsVision: true,
+      },
     ],
   };
 
@@ -504,6 +519,8 @@ export class MockIpc implements FfIpc {
       "openai/gpt-oss-120b",
       "openai/gpt-oss-20b",
     ],
+    // OpenAI catalog sample (#311) so the picker populates from `list_models`.
+    openai: ["gpt-4o", "gpt-4o-mini", "gpt-4.1", "o3", "o4-mini"],
   };
 
   // Per-connection secret material stored "in the keychain" (Issue #202 PR-3).
@@ -990,18 +1007,19 @@ export class MockIpc implements FfIpc {
 
   // Test Connection (Issue #202 PR-3a). `id` defaults to the active connection.
   // Resolves on a successful probe; rejects with a message the UI surfaces. Local
-  // kinds always pass; SiliconFlow (#329) needs a stored API key (mirroring the
-  // real `list_models` probe, which 401s without a valid bearer key); Bedrock
-  // passes only when the active auth mode has the credentials it needs (profile
-  // resolves from ~/.aws; IAM/API-Key need a stored secret) — exercising both the
-  // ok and error result paths offline.
+  // kinds always pass; the hosted OpenAI-compatible kinds (SiliconFlow #329,
+  // OpenAI #311) need a stored API key (mirroring the real `list_models` probe,
+  // which 401s without a valid bearer key); Bedrock passes only when the active
+  // auth mode has the credentials it needs (profile resolves from ~/.aws;
+  // IAM/API-Key need a stored secret) — exercising both result paths offline.
   async testConnection(id?: string): Promise<void> {
     const target = id ?? this.registry.active;
     const conn = this.registry.connections.find((c) => c.id === target);
     if (!conn) throw new Error(`unknown connection: ${target}`);
-    if (conn.kind === "siliconFlow") {
+    if (conn.kind === "openai" || conn.kind === "siliconFlow") {
       if (!this.secretsByConnection.get(conn.id)?.has("apiKey")) {
-        throw new Error("No SiliconFlow API key configured.");
+        const name = conn.kind === "openai" ? "OpenAI" : "SiliconFlow";
+        throw new Error(`No ${name} API key configured.`);
       }
       return;
     }

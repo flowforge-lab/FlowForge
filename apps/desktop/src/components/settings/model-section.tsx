@@ -15,6 +15,7 @@ import {
   SUMMARY_THRESHOLD_MAX,
   SUMMARY_THRESHOLD_MIN,
   activeConnection,
+  reasoningToggleNoOp,
   useModelConfigStore,
   type Effort,
 } from "@/store/model-config";
@@ -27,6 +28,7 @@ const ADDABLE: ReadonlyArray<{ kind: ProviderKind; label: string }> = [
   { kind: "candleVllm", label: "candle-vLLM" },
   { kind: "ollama", label: "Ollama" },
   { kind: "bedrock", label: "AWS Bedrock" },
+  { kind: "openai", label: "OpenAI" },
   { kind: "siliconFlow", label: "SiliconFlow" },
 ];
 
@@ -80,6 +82,13 @@ export function ModelSection() {
 
   const active = activeConnection(registry);
   const thinking = active?.thinking ?? true;
+  // For OpenAI / SiliconFlow the backend sends no reasoning-*enable* param, so the
+  // Thinking toggle has no wire effect (reasoning still streams when the model
+  // emits it). Disable it with an honest hint rather than letting it read as a
+  // working on/off switch (#311).
+  const reasoningToggleNoEffect = active
+    ? reasoningToggleNoOp(active.kind)
+    : false;
   const present = new Set(registry?.connections.map((c) => c.kind) ?? []);
   const addable = ADDABLE.filter((a) => !present.has(a.kind));
 
@@ -142,9 +151,13 @@ export function ModelSection() {
       <section className="space-y-5 border-t pt-5">
         <SettingsSwitch
           label="Thinking"
-          description="Let the default model reason before answering."
+          description={
+            reasoningToggleNoEffect
+              ? "This provider doesn't support toggling reasoning; it's shown when the model emits it."
+              : "Let the default model reason before answering."
+          }
           checked={thinking}
-          disabled={!active || saving}
+          disabled={!active || saving || reasoningToggleNoEffect}
           onCheckedChange={(v) => {
             if (active) void setThinking(active.id, v);
           }}

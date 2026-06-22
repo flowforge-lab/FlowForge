@@ -101,12 +101,13 @@ afterEach(() => {
 });
 
 describe("ModelSection provider accordion", () => {
-  it("renders a card per registry connection, including Bedrock and SiliconFlow", async () => {
+  it("renders a card per registry connection, including Bedrock, SiliconFlow, and OpenAI", async () => {
     await renderSection();
     expect(cardHeader("candle-vLLM")).not.toBeNull();
     expect(cardHeader("Ollama")).not.toBeNull();
     expect(cardHeader("AWS Bedrock")).not.toBeNull();
     expect(cardHeader("SiliconFlow")).not.toBeNull();
+    expect(cardHeader("OpenAI")).not.toBeNull();
   });
 
   it("shows the hosted-key fields (Base URL + API Key) for SiliconFlow", async () => {
@@ -127,6 +128,49 @@ describe("ModelSection provider accordion", () => {
     await click(byText("Test Connection", "button", sf));
     const alert = card("SiliconFlow").querySelector('[role="alert"]');
     expect(alert?.textContent).toMatch(/SiliconFlow API key/i);
+  });
+
+  it("shows the hosted-key fields (Base URL + API Key) for OpenAI", async () => {
+    await renderSection();
+    await click(cardHeader("OpenAI"));
+    const openai = card("OpenAI");
+    expect(hasLabel("Base URL", openai)).toBe(true);
+    expect(hasLabel("API Key", openai)).toBe(true);
+    expect(hasLabel("Host (optional)", openai)).toBe(false);
+    expect(hasLabel("Region", openai)).toBe(false);
+  });
+
+  it("surfaces a Test Connection error for OpenAI with no key", async () => {
+    await renderSection();
+    await click(cardHeader("OpenAI"));
+    const openai = card("OpenAI");
+    await click(byText("Test Connection", "button", openai));
+    const alert = card("OpenAI").querySelector('[role="alert"]');
+    expect(alert?.textContent).toMatch(/OpenAI API key/i);
+  });
+
+  it("disables the Thinking switch when a hosted OpenAI-compatible connection is active", async () => {
+    await renderSection();
+    // candle-vLLM (active by default) supports the thinking flag.
+    const before = container.querySelector(
+      'button[aria-label="Thinking"]',
+    ) as HTMLButtonElement;
+    expect(before.disabled).toBe(false);
+
+    await act(async () => {
+      await useModelConfigStore.getState().setActiveConnection("openai");
+      await flush();
+    });
+
+    const after = container.querySelector(
+      'button[aria-label="Thinking"]',
+    ) as HTMLButtonElement;
+    expect(after.disabled).toBe(true);
+    expect(
+      byText(
+        "This provider doesn't support toggling reasoning; it's shown when the model emits it.",
+      ),
+    ).not.toBeNull();
   });
 
   it("switches Bedrock auth mode, revealing the matching fields", async () => {

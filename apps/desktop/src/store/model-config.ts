@@ -335,3 +335,19 @@ export function normalizeBaseUrl(input: string): string {
   url = url.replace(/\/+$/, "");
   return url;
 }
+
+/** Hosted, OpenAI-compatible providers authenticated with a single bearer API key
+ *  over an editable base URL (vs. Bedrock's region/auth form or the local kinds'
+ *  plain host field). Drives the provider-card credentials layout. */
+export function isHostedKeyKind(kind: ProviderKind): boolean {
+  return kind === "openai" || kind === "siliconFlow";
+}
+
+/** Kinds whose backend chat request sends no reasoning-*enable* parameter, so the
+ *  "Thinking" toggle has no wire effect — flipping it changes nothing the server
+ *  acts on (reasoning still streams when the model emits `reasoning_content` /
+ *  `reasoning`). Kept distinct from [`isHostedKeyKind`] (credentials shape): the
+ *  two sets coincide today but answer different questions. */
+export function reasoningToggleNoOp(kind: ProviderKind): boolean {
+  return kind === "openai" || kind === "siliconFlow";
+}
