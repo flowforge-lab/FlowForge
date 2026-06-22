@@ -97,7 +97,7 @@ function CodeBlock({
           <CopyButton value={raw} />
         </div>
       </div>
-      <pre className="overflow-x-auto px-3 py-2.5 text-[12.5px] leading-relaxed">
+      <pre className="overflow-x-auto whitespace-pre-wrap break-words px-3 py-2.5 text-[12.5px] leading-relaxed">
         {children}
       </pre>
     </div>
