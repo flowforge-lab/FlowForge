@@ -449,6 +449,7 @@ export class MockIpc implements FfIpc {
         model: "deepseek-ai/DeepSeek-V3",
         hasKey: false,
         thinking: true,
+        supportsVision: false,
       },
     ],
   };
