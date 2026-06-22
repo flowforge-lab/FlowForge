@@ -6,7 +6,9 @@
 use std::path::PathBuf;
 
 use ff_core::{ProviderConfig, ProviderKind};
-use ff_llm::{BedrockCreds, BedrockProvider, OllamaProvider, OpenAiProvider, Provider};
+use ff_llm::{
+    wire_dialect, BedrockCreds, BedrockProvider, OllamaProvider, OpenAiProvider, Provider,
+};
 use ff_skills::SkillRegistry;
 
 /// The provider + default model, honoring the same `~/.config/flowforge/provider.json`
@@ -31,8 +33,13 @@ fn provider_config_path() -> Option<PathBuf> {
 
 fn build_provider(config: &ProviderConfig) -> Box<dyn Provider> {
     let base_url = config.resolved_base_url().to_string();
+    // CLI has no per-connection vendor descriptor (#375); the model name is the
+    // only signal we have for SiliconFlow GLM/MiniMax detection.
+    let dialect = wire_dialect(config.kind, None, &config.model);
     match config.kind {
-        ProviderKind::CandleVllm => Box::new(OpenAiProvider::new(base_url, None)),
+        ProviderKind::CandleVllm => {
+            Box::new(OpenAiProvider::new(base_url, None).with_dialect(dialect))
+        }
         ProviderKind::Ollama => Box::new(OllamaProvider::new(base_url)),
         // The CLI has no keychain or connection registry, so Bedrock here uses the
         // standard AWS credential chain: a bearer token from AWS_BEARER_TOKEN_BEDROCK
@@ -52,10 +59,9 @@ fn build_provider(config: &ProviderConfig) -> Box<dyn Provider> {
         // The CLI has no keychain, so a hosted OpenAI key comes from the
         // OPENAI_API_KEY env var (absent or empty => keyless, for OpenAI-compatible
         // local gateways that need none).
-        ProviderKind::OpenAi => Box::new(OpenAiProvider::new(
-            base_url,
-            api_key_from_env("OPENAI_API_KEY"),
-        )),
+        ProviderKind::OpenAi => Box::new(
+            OpenAiProvider::new(base_url, api_key_from_env("OPENAI_API_KEY")).with_dialect(dialect),
+        ),
         // SiliconFlow is OpenAI-compatible. The CLI has no keychain, so the bearer
         // key comes from SILICONFLOW_API_KEY (empty/unset = anonymous, which the
         // hosted endpoint will reject -- the same env-var pattern as Bedrock above).
@@ -63,7 +69,7 @@ fn build_provider(config: &ProviderConfig) -> Box<dyn Provider> {
             let key = std::env::var("SILICONFLOW_API_KEY")
                 .ok()
                 .filter(|k| !k.is_empty());
-            Box::new(OpenAiProvider::new(base_url, key))
+            Box::new(OpenAiProvider::new(base_url, key).with_dialect(dialect))
         }
     }
 }

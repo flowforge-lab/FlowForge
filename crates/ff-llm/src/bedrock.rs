@@ -789,6 +789,7 @@ mod tests {
             name: None,
 
             attachments: Vec::new(),
+            reasoning: None,
         }
     }
 
@@ -825,6 +826,7 @@ mod tests {
             name: Some("bash".into()),
 
             attachments: Vec::new(),
+            reasoning: None,
         };
         let (_, messages) = to_converse(&[msg]);
         assert_eq!(messages.len(), 1);
@@ -901,6 +903,7 @@ mod tests {
             name: None,
 
             attachments: Vec::new(),
+            reasoning: None,
         }
     }
 
@@ -913,6 +916,7 @@ mod tests {
             name: Some("bash".into()),
 
             attachments: Vec::new(),
+            reasoning: None,
         }
     }
 

@@ -40,6 +40,15 @@ pub struct ChatMessage {
     /// Providers map these to their own block formats in their own tickets.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<ff_core::Attachment>,
+    /// Carrier for prior-turn reasoning text (#375). NEVER serialized through
+    /// the derived path: each provider re-injects it into the wire under the
+    /// dialect-specific field name (`reasoning_content` for SiliconFlow,
+    /// `reasoning` for OpenRouter, omitted for vanilla OpenAI). `#[serde(skip)]`
+    /// is load-bearing — `OpenAiProvider::message_to_wire` calls
+    /// `serde_json::to_value(msg)`, which would otherwise leak this field
+    /// through unchanged on every gateway.
+    #[serde(skip)]
+    pub reasoning: Option<String>,
 }
 
 impl ChatMessage {
@@ -52,6 +61,7 @@ impl ChatMessage {
             tool_call_id: None,
             name: None,
             attachments: Vec::new(),
+            reasoning: None,
         }
     }
 
@@ -68,6 +78,7 @@ impl ChatMessage {
             tool_call_id: None,
             name: None,
             attachments,
+            reasoning: None,
         }
     }
 }
@@ -144,6 +155,75 @@ impl LlmError {
 }
 
 pub type ChunkStream = BoxStream<'static, Result<Chunk, LlmError>>;
+
+/// How a gateway expects prior-turn reasoning to be replayed on the assistant
+/// turn that requested tool calls (#375). Default is `None` — vanilla OpenAI,
+/// candle-vllm, LM Studio, Ollama strip reasoning silently and never want it
+/// echoed. Hosted reasoning gateways (SiliconFlow, OpenRouter) reject or
+/// degrade thinking mode when reasoning is dropped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ReasoningWire {
+    /// Drop reasoning on the wire (vanilla OpenAI / candle-vllm / Ollama / LM Studio).
+    #[default]
+    None,
+    /// Re-inject as `reasoning_content` (SiliconFlow gateway).
+    ReasoningContent,
+    /// Re-inject as `reasoning` (OpenRouter gateway).
+    Reasoning,
+}
+
+/// How a gateway represents an assistant tool-call turn whose `content` field
+/// is empty. SiliconFlow's GLM/MiniMax models reject `content: null` (HTTP 400
+/// `code 20015`) and require an empty string or omission; vanilla OpenAI, every
+/// other SiliconFlow model, and OpenRouter accept all three forms.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ToolCallContent {
+    /// Omit the field when content is empty (`#[serde(skip_serializing_if)]`
+    /// already does this — the default).
+    #[default]
+    Omit,
+    /// Emit `"content": ""` when content is empty (SiliconFlow GLM/MiniMax).
+    EmptyString,
+}
+
+/// Per-connection wire-dialect choices for the OpenAI-compatible adapter. Pure
+/// data; resolved once at provider build time and threaded through
+/// `OpenAiProvider::message_to_wire`. Defaults are no-ops for every shipping
+/// connection — only hosted reasoning gateways override them.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct WireDialect {
+    pub reasoning: ReasoningWire,
+    pub tool_call_content: ToolCallContent,
+}
+
+/// Resolve a wire dialect from a connection's `(kind, vendor, model)`. Pure,
+/// table-driven; called once at provider build time so the per-turn hot path
+/// only sees a `Copy` struct. The mapping is documented in
+/// `docs/rfcs/0015-provider-wire-dialects.md` §4.
+pub fn wire_dialect(kind: ff_core::ProviderKind, vendor: Option<&str>, model: &str) -> WireDialect {
+    use ff_core::ProviderKind as K;
+    let model_lc = model.to_ascii_lowercase();
+    let is_glm_or_minimax = model_lc.contains("glm") || model_lc.contains("minimax");
+    let vendor_lc = vendor.map(|v| v.to_ascii_lowercase());
+    let is_openrouter = vendor_lc.as_deref() == Some("openrouter");
+
+    match kind {
+        K::SiliconFlow => WireDialect {
+            reasoning: ReasoningWire::ReasoningContent,
+            tool_call_content: if is_glm_or_minimax {
+                ToolCallContent::EmptyString
+            } else {
+                ToolCallContent::Omit
+            },
+        },
+        // OpenRouter rides the OpenAi kind today; detect by vendor descriptor.
+        K::OpenAi if is_openrouter => WireDialect {
+            reasoning: ReasoningWire::Reasoning,
+            tool_call_content: ToolCallContent::Omit,
+        },
+        K::CandleVllm | K::Ollama | K::Bedrock | K::OpenAi => WireDialect::default(),
+    }
+}
 
 /// Drop attachments from every message for providers that cannot carry them
 /// (the capability strip, #332/#334). Borrows on the common path (no message has
@@ -359,5 +439,72 @@ mod tests {
             );
         }
         assert!(!LlmError::Decode("bad json".into()).is_transient());
+    }
+
+    // ---- #375 PR-2: wire-dialect selector + carrier hygiene ----
+
+    #[test]
+    fn wire_dialect_defaults_for_local_and_vanilla_gateways() {
+        use ff_core::ProviderKind as K;
+        for kind in [K::CandleVllm, K::Ollama, K::Bedrock] {
+            let d = wire_dialect(kind, None, "any-model");
+            assert_eq!(d.reasoning, ReasoningWire::None, "{kind:?}");
+            assert_eq!(d.tool_call_content, ToolCallContent::Omit, "{kind:?}");
+        }
+        // Vanilla OpenAI (no vendor descriptor) is also a no-op.
+        let d = wire_dialect(K::OpenAi, None, "gpt-4o-mini");
+        assert_eq!(d.reasoning, ReasoningWire::None);
+        assert_eq!(d.tool_call_content, ToolCallContent::Omit);
+    }
+
+    #[test]
+    fn wire_dialect_siliconflow_replays_reasoning_content() {
+        // Confirmed empirically against api.siliconflow.com: DeepSeek thinking
+        // mode returns intermittent HTTP 400 (code 20015) without this echo.
+        let d = wire_dialect(
+            ff_core::ProviderKind::SiliconFlow,
+            None,
+            "deepseek-ai/DeepSeek-V4-Pro",
+        );
+        assert_eq!(d.reasoning, ReasoningWire::ReasoningContent);
+        assert_eq!(d.tool_call_content, ToolCallContent::Omit);
+    }
+
+    #[test]
+    fn wire_dialect_siliconflow_glm_minimax_use_empty_string() {
+        // Confirmed empirically: GLM-5.2 returns 20015 "content cannot be null"
+        // when an assistant tool-call message omits content; "" is accepted.
+        for model in ["zai-org/GLM-5.2", "MiniMax/MiniMax-M3"] {
+            let d = wire_dialect(ff_core::ProviderKind::SiliconFlow, None, model);
+            assert_eq!(d.reasoning, ReasoningWire::ReasoningContent, "{model}");
+            assert_eq!(d.tool_call_content, ToolCallContent::EmptyString, "{model}");
+        }
+    }
+
+    #[test]
+    fn wire_dialect_openrouter_replays_reasoning_field() {
+        // OpenRouter rides the OpenAi kind today; vendor descriptor selects the dialect.
+        let d = wire_dialect(
+            ff_core::ProviderKind::OpenAi,
+            Some("openrouter"),
+            "anthropic/claude-3.7-sonnet:thinking",
+        );
+        assert_eq!(d.reasoning, ReasoningWire::Reasoning);
+        assert_eq!(d.tool_call_content, ToolCallContent::Omit);
+    }
+
+    #[test]
+    fn chat_message_reasoning_is_never_serialized_through_derive() {
+        // The carrier MUST be #[serde(skip)] -- openai::message_to_wire calls
+        // serde_json::to_value(msg) and would otherwise leak this field on every
+        // gateway, breaking vanilla OpenAI which rejects unknown fields.
+        let mut msg = ChatMessage::text("assistant", "");
+        msg.reasoning = Some("chain of thought".to_string());
+        let v = serde_json::to_value(&msg).unwrap();
+        assert!(
+            v.get("reasoning").is_none(),
+            "reasoning leaked through derive: {v}"
+        );
+        assert!(v.get("reasoning_content").is_none());
     }
 }

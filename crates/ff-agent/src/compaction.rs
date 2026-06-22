@@ -165,6 +165,7 @@ impl CompactionStrategy for MemoryFlush {
             name: None,
 
             attachments: Vec::new(),
+            reasoning: None,
         }];
         messages.extend(to_chat(&history));
 
@@ -271,6 +272,7 @@ fn assistant_tool_calls_message(calls: &[CollectedCall]) -> ChatMessage {
         name: None,
 
         attachments: Vec::new(),
+        reasoning: None,
     }
 }
 
@@ -283,6 +285,7 @@ fn tool_result_message(call_id: &str, content: String) -> ChatMessage {
         name: None,
 
         attachments: Vec::new(),
+        reasoning: None,
     }
 }
 

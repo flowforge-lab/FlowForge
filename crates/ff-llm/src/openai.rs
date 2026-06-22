@@ -4,7 +4,10 @@ use serde::Deserialize;
 
 use base64::Engine as _;
 
-use crate::{ChatMessage, ChatRequest, Chunk, ChunkStream, LlmError, Provider, ToolCallDelta};
+use crate::{
+    ChatMessage, ChatRequest, Chunk, ChunkStream, LlmError, Provider, ReasoningWire,
+    ToolCallContent, ToolCallDelta, WireDialect,
+};
 
 /// Talks to any OpenAI-compatible `/v1/chat/completions` server over Server-Sent
 /// Events. candle-vllm, vLLM, LM Studio, Ollama's `/v1` shim, and OpenAI itself all
@@ -18,6 +21,12 @@ pub struct OpenAiProvider {
     /// field never reaches the wire (this provider serializes `ChatMessage`
     /// directly). Defaults false; set via [`OpenAiProvider::with_vision`].
     supports_vision: bool,
+    /// Per-gateway wire-shape choices (#375). Defaults are no-ops for vanilla
+    /// OpenAI / candle-vllm / Ollama-compat / LM Studio; SiliconFlow and
+    /// OpenRouter override to re-inject prior reasoning on tool-call turns and
+    /// (for SiliconFlow GLM/MiniMax) emit `content: ""` instead of omitting it.
+    /// See `crate::wire_dialect`.
+    dialect: WireDialect,
 }
 
 impl OpenAiProvider {
@@ -27,12 +36,20 @@ impl OpenAiProvider {
             api_key,
             client: reqwest::Client::new(),
             supports_vision: false,
+            dialect: WireDialect::default(),
         }
     }
 
     /// Declare whether the target model can accept image/document attachments.
     pub fn with_vision(mut self, supports_vision: bool) -> Self {
         self.supports_vision = supports_vision;
+        self
+    }
+
+    /// Set the per-gateway wire dialect (#375). Defaults to no-ops; resolve via
+    /// [`crate::wire_dialect`] at provider build time.
+    pub fn with_dialect(mut self, dialect: WireDialect) -> Self {
+        self.dialect = dialect;
         self
     }
 
@@ -195,7 +212,12 @@ fn image_data_uri(a: &ff_core::Attachment) -> Option<String> {
 /// `content`, byte-identical to the text-only path. The internal `attachments`
 /// field is always removed so it never leaks onto the wire. Document attachments
 /// aren't representable as `image_url` and are skipped here (degrade handling, #338).
-fn message_to_wire(msg: &ChatMessage) -> serde_json::Value {
+///
+/// `dialect` carries the per-gateway tweaks (#375): re-inject prior reasoning
+/// under the gateway's field name on assistant tool-call turns, and (for
+/// SiliconFlow GLM/MiniMax) materialize an empty `content: ""` instead of
+/// letting `serde(skip_serializing_if = "Option::is_none")` drop the key.
+fn message_to_wire(msg: &ChatMessage, dialect: WireDialect) -> serde_json::Value {
     let mut value = serde_json::to_value(msg).unwrap_or_else(|_| serde_json::json!({}));
     if let Some(obj) = value.as_object_mut() {
         obj.remove("attachments");
@@ -211,27 +233,74 @@ fn message_to_wire(msg: &ChatMessage) -> serde_json::Value {
             }
         })
         .collect();
-    if image_uris.is_empty() {
-        return value;
+    if !image_uris.is_empty() {
+        let mut content = Vec::new();
+        if let Some(text) = msg.content.as_deref().filter(|t| !t.is_empty()) {
+            content.push(serde_json::json!({ "type": "text", "text": text }));
+        }
+        for uri in image_uris {
+            content.push(serde_json::json!({ "type": "image_url", "image_url": { "url": uri } }));
+        }
+        if let Some(obj) = value.as_object_mut() {
+            obj.insert("content".into(), serde_json::Value::Array(content));
+        }
     }
-    let mut content = Vec::new();
-    if let Some(text) = msg.content.as_deref().filter(|t| !t.is_empty()) {
-        content.push(serde_json::json!({ "type": "text", "text": text }));
-    }
-    for uri in image_uris {
-        content.push(serde_json::json!({ "type": "image_url", "image_url": { "url": uri } }));
-    }
-    if let Some(obj) = value.as_object_mut() {
-        obj.insert("content".into(), serde_json::Value::Array(content));
-    }
+
+    apply_dialect(&mut value, msg, dialect);
     value
+}
+
+/// Apply per-gateway wire dialect to an already-shaped message value (#375).
+/// Two independent hooks, both gated on "this is an assistant message that
+/// only carries tool calls":
+/// 1. Reasoning replay: when the model sent reasoning the previous turn AND
+///    this turn's history slot is the same assistant message that requested
+///    tool calls, echo the reasoning back under the dialect's field name
+///    (`reasoning_content` for SiliconFlow, `reasoning` for OpenRouter).
+/// 2. Empty-content shape: SiliconFlow GLM/MiniMax reject `content: null`
+///    on the tool-call turn (HTTP 400, code 20015) and require either an
+///    empty string or omission. Default `Omit` lets `serde(skip_serializing_if)`
+///    drop the field; `EmptyString` puts it back as `""`.
+fn apply_dialect(value: &mut serde_json::Value, msg: &ChatMessage, dialect: WireDialect) {
+    let Some(obj) = value.as_object_mut() else {
+        return;
+    };
+    let is_assistant_tool_call = msg.role == "assistant" && msg.tool_calls.is_some();
+    if !is_assistant_tool_call {
+        return;
+    }
+
+    let field = match dialect.reasoning {
+        ReasoningWire::None => None,
+        ReasoningWire::ReasoningContent => Some("reasoning_content"),
+        ReasoningWire::Reasoning => Some("reasoning"),
+    };
+    if let (Some(reasoning), Some(field)) =
+        (msg.reasoning.as_deref().filter(|s| !s.is_empty()), field)
+    {
+        obj.insert(
+            field.into(),
+            serde_json::Value::String(reasoning.to_string()),
+        );
+    }
+
+    if dialect.tool_call_content == ToolCallContent::EmptyString
+        && msg.content.as_deref().is_none_or(str::is_empty)
+        && !obj.contains_key("content")
+    {
+        obj.insert("content".into(), serde_json::Value::String(String::new()));
+    }
 }
 
 #[async_trait]
 impl Provider for OpenAiProvider {
     async fn chat_stream(&self, req: ChatRequest) -> Result<ChunkStream, LlmError> {
         let messages = crate::messages_for_wire(&req.messages, self.supports_vision);
-        let wire_messages: Vec<serde_json::Value> = messages.iter().map(message_to_wire).collect();
+        let dialect = self.dialect;
+        let wire_messages: Vec<serde_json::Value> = messages
+            .iter()
+            .map(|m| message_to_wire(m, dialect))
+            .collect();
         let mut body = serde_json::json!({
             "model": req.model,
             "messages": wire_messages,
@@ -400,6 +469,7 @@ mod tests {
             name: None,
 
             attachments: Vec::new(),
+            reasoning: None,
         };
         let v = serde_json::to_value([msg]).unwrap();
         let args = &v[0]["tool_calls"][0]["function"]["arguments"];
@@ -437,7 +507,7 @@ mod tests {
                 AttachmentSource::Inline(inline_b64(&[0x89, 0x50, 0x4e, 0x47])),
             )],
         );
-        let v = message_to_wire(&msg);
+        let v = message_to_wire(&msg, WireDialect::default());
         let content = v["content"].as_array().expect("content is an array");
         assert_eq!(content.len(), 2, "text block then image block");
         assert_eq!(content[0]["type"], "text");
@@ -456,7 +526,10 @@ mod tests {
 
     #[test]
     fn text_only_message_keeps_plain_string_content() {
-        let v = message_to_wire(&ChatMessage::text("user", "plain turn"));
+        let v = message_to_wire(
+            &ChatMessage::text("user", "plain turn"),
+            WireDialect::default(),
+        );
         assert!(v["content"].is_string(), "content stays a plain string");
         assert_eq!(v["content"], "plain turn");
         assert!(v.get("attachments").is_none());
@@ -472,7 +545,7 @@ mod tests {
                 AttachmentSource::Inline(inline_b64(&[0xff, 0xd8, 0xff])),
             )],
         );
-        let content = message_to_wire(&msg)["content"]
+        let content = message_to_wire(&msg, WireDialect::default())["content"]
             .as_array()
             .expect("content is an array")
             .clone();
@@ -494,7 +567,7 @@ mod tests {
                 AttachmentSource::Path(file.to_string_lossy().into_owned()),
             )],
         );
-        let url = message_to_wire(&msg)["content"][0]["image_url"]["url"]
+        let url = message_to_wire(&msg, WireDialect::default())["content"][0]["image_url"]["url"]
             .as_str()
             .unwrap()
             .to_string();
@@ -515,7 +588,7 @@ mod tests {
                 bytes: 8,
             }],
         );
-        let v = message_to_wire(&msg);
+        let v = message_to_wire(&msg, WireDialect::default());
         assert!(v["content"].is_string(), "no image block -> plain string");
         assert!(v.get("attachments").is_none());
     }
@@ -530,7 +603,7 @@ mod tests {
                 AttachmentSource::Inline(inline_b64(b"<svg/>")),
             )],
         );
-        let v = message_to_wire(&msg);
+        let v = message_to_wire(&msg, WireDialect::default());
         assert!(v["content"].is_string(), "unsupported type skipped");
     }
 
@@ -544,7 +617,7 @@ mod tests {
                 AttachmentSource::Path("/nonexistent/ff/missing.png".into()),
             )],
         );
-        let v = message_to_wire(&msg);
+        let v = message_to_wire(&msg, WireDialect::default());
         assert!(v["content"].is_string(), "unreadable file skipped");
     }
 
@@ -638,5 +711,116 @@ mod tests {
             .await;
         let provider = OpenAiProvider::new(server.uri(), Some("sk-plumbed".into()));
         assert!(provider.test_connection("gpt-4o").await.is_ok());
+    }
+
+    // ---- #375 PR-2: per-gateway wire dialect ----
+
+    use crate::{FunctionCall, ReasoningWire, ToolCall, ToolCallContent, WireDialect};
+
+    fn assistant_tool_call_with_reasoning(reasoning: Option<&str>) -> ChatMessage {
+        ChatMessage {
+            role: "assistant".into(),
+            content: None,
+            tool_calls: Some(vec![ToolCall {
+                id: "call_1".into(),
+                kind: "function".into(),
+                function: FunctionCall {
+                    name: "search".into(),
+                    arguments: "{}".into(),
+                },
+            }]),
+            tool_call_id: None,
+            name: None,
+            attachments: Vec::new(),
+            reasoning: reasoning.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn dialect_default_omits_reasoning_and_content() {
+        let msg = assistant_tool_call_with_reasoning(Some("hidden CoT"));
+        let v = message_to_wire(&msg, WireDialect::default());
+        // Vanilla OpenAI must never see the reasoning carrier nor its replay.
+        assert!(v.get("reasoning").is_none());
+        assert!(v.get("reasoning_content").is_none());
+        // Default Omit: no "content" key (serde drops the None).
+        assert!(v.get("content").is_none());
+    }
+
+    #[test]
+    fn dialect_reasoning_content_replays_on_tool_call_turn() {
+        let msg = assistant_tool_call_with_reasoning(Some("because A then B"));
+        let dialect = WireDialect {
+            reasoning: ReasoningWire::ReasoningContent,
+            tool_call_content: ToolCallContent::Omit,
+        };
+        let v = message_to_wire(&msg, dialect);
+        assert_eq!(v["reasoning_content"], "because A then B");
+        assert!(v.get("reasoning").is_none());
+    }
+
+    #[test]
+    fn dialect_reasoning_field_replays_for_openrouter() {
+        let msg = assistant_tool_call_with_reasoning(Some("step"));
+        let dialect = WireDialect {
+            reasoning: ReasoningWire::Reasoning,
+            tool_call_content: ToolCallContent::Omit,
+        };
+        let v = message_to_wire(&msg, dialect);
+        assert_eq!(v["reasoning"], "step");
+        assert!(v.get("reasoning_content").is_none());
+    }
+
+    #[test]
+    fn dialect_does_not_replay_when_no_reasoning_present() {
+        let msg = assistant_tool_call_with_reasoning(None);
+        let dialect = WireDialect {
+            reasoning: ReasoningWire::ReasoningContent,
+            tool_call_content: ToolCallContent::Omit,
+        };
+        let v = message_to_wire(&msg, dialect);
+        assert!(v.get("reasoning_content").is_none());
+        assert!(v.get("reasoning").is_none());
+    }
+
+    #[test]
+    fn dialect_replays_only_on_tool_call_turn_not_on_plain_assistant() {
+        // A plain assistant turn (no tool_calls) keeps its content; reasoning
+        // is private to the model and never replayed back to it on a normal turn.
+        let mut msg = ChatMessage::text("assistant", "the answer is 42");
+        msg.reasoning = Some("...".into());
+        let dialect = WireDialect {
+            reasoning: ReasoningWire::ReasoningContent,
+            tool_call_content: ToolCallContent::Omit,
+        };
+        let v = message_to_wire(&msg, dialect);
+        assert!(v.get("reasoning_content").is_none());
+        assert_eq!(v["content"], "the answer is 42");
+    }
+
+    #[test]
+    fn dialect_empty_string_content_for_glm_minimax() {
+        let msg = assistant_tool_call_with_reasoning(None);
+        let dialect = WireDialect {
+            reasoning: ReasoningWire::ReasoningContent,
+            tool_call_content: ToolCallContent::EmptyString,
+        };
+        let v = message_to_wire(&msg, dialect);
+        // GLM/MiniMax reject content: null with HTTP 400 code 20015; empty string is accepted.
+        assert_eq!(v["content"], "");
+    }
+
+    #[test]
+    fn dialect_empty_string_only_when_content_actually_missing() {
+        // If the tool-call turn has accompanying text (a "thinking out loud" preamble),
+        // the EmptyString rule must NOT clobber it.
+        let mut msg = assistant_tool_call_with_reasoning(None);
+        msg.content = Some("let me search".into());
+        let dialect = WireDialect {
+            reasoning: ReasoningWire::ReasoningContent,
+            tool_call_content: ToolCallContent::EmptyString,
+        };
+        let v = message_to_wire(&msg, dialect);
+        assert_eq!(v["content"], "let me search");
     }
 }

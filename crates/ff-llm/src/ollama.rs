@@ -346,6 +346,7 @@ mod tests {
             name: None,
 
             attachments: Vec::new(),
+            reasoning: None,
         }
     }
 
@@ -420,6 +421,7 @@ mod tests {
             name: None,
 
             attachments: Vec::new(),
+            reasoning: None,
         };
         let out = ollama_messages(&[msg]).unwrap();
         assert_eq!(out[0]["tool_calls"][0]["function"]["arguments"]["x"], 1);

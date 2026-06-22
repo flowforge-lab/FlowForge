@@ -12,7 +12,9 @@ use ff_core::{
     BedrockAuth, McpServerState, McpServerStatus, Mode, Phenotype, ProviderConfig,
     ProviderConnection, ProviderKind, ProviderRegistry, SearchConfig, SecretKind,
 };
-use ff_llm::{BedrockCreds, BedrockProvider, OllamaProvider, OpenAiProvider, Provider};
+use ff_llm::{
+    wire_dialect, BedrockCreds, BedrockProvider, OllamaProvider, OpenAiProvider, Provider,
+};
 use ff_mcp::{McpConfigWatcher, SupervisorHandle};
 use ff_memory::watch::MemoryWatcher;
 use ff_memory::{
@@ -122,10 +124,16 @@ impl ApprovalRegistry {
 /// shared, mutable provider to swap, only the persisted registry.
 fn build_provider(conn: &ProviderConnection) -> Box<dyn Provider> {
     let base_url = conn.resolved_base_url().to_string();
+    // Per-gateway wire-dialect choices (#375). Resolved once here so the per-turn
+    // hot path only carries a `Copy` struct; defaults are no-ops for vanilla
+    // OpenAI / candle-vllm / Ollama / LM Studio.
+    let dialect = wire_dialect(conn.kind, conn.vendor.as_deref(), &conn.model);
     match conn.kind {
-        ProviderKind::CandleVllm => {
-            Box::new(OpenAiProvider::new(base_url, None).with_vision(conn.supports_vision))
-        }
+        ProviderKind::CandleVllm => Box::new(
+            OpenAiProvider::new(base_url, None)
+                .with_vision(conn.supports_vision)
+                .with_dialect(dialect),
+        ),
         ProviderKind::Ollama => {
             Box::new(OllamaProvider::new(base_url).with_vision(conn.supports_vision))
         }
@@ -169,13 +177,21 @@ fn build_provider(conn: &ProviderConnection) -> Box<dyn Provider> {
         // the provider crate stays keychain-free, mirroring the Bedrock arm (#311).
         ProviderKind::OpenAi => {
             let key = crate::secrets::get(conn.id.as_str(), SecretKind::ApiKey);
-            Box::new(OpenAiProvider::new(base_url, key).with_vision(conn.supports_vision))
+            Box::new(
+                OpenAiProvider::new(base_url, key)
+                    .with_vision(conn.supports_vision)
+                    .with_dialect(dialect),
+            )
         }
         // SiliconFlow is OpenAI-compatible; the bearer key is pulled from the OS
         // keychain here so the provider crate stays keychain-free (mirrors Bedrock).
         ProviderKind::SiliconFlow => {
             let key = crate::secrets::get(conn.id.as_str(), SecretKind::ApiKey);
-            Box::new(OpenAiProvider::new(base_url, key).with_vision(conn.supports_vision))
+            Box::new(
+                OpenAiProvider::new(base_url, key)
+                    .with_vision(conn.supports_vision)
+                    .with_dialect(dialect),
+            )
         }
     }
 }

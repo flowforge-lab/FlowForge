@@ -549,6 +549,7 @@ mod tests {
             name: None,
 
             attachments: Vec::new(),
+            reasoning: None,
         }
     }
 
@@ -561,6 +562,7 @@ mod tests {
             name: None,
 
             attachments: Vec::new(),
+            reasoning: None,
         }
     }
 
@@ -625,6 +627,7 @@ mod tests {
             name: None,
 
             attachments: Vec::new(),
+            reasoning: None,
         };
         let (_, out) = to_anthropic_messages(&[msg]);
         assert!(out.is_empty());
@@ -644,6 +647,7 @@ mod tests {
             name: None,
 
             attachments: Vec::new(),
+            reasoning: None,
         };
         let (_, out) = to_anthropic_messages(&[msg]);
         let content = out[0]["content"].as_array().unwrap();
