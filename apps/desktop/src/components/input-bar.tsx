@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
-  ArrowRight,
   ArrowUp,
+  Check,
   ChevronsUpDown,
   Folder,
   Search,
@@ -9,21 +9,20 @@ import {
 } from "lucide-react";
 import { Popover as PopoverPrimitive } from "radix-ui";
 import { Button } from "@/components/ui/button";
+import {
+  DropdownMenu,
+  DropdownMenuTrigger,
+  DropdownMenuContent,
+  DropdownMenuItem,
+} from "@/components/ui/dropdown-menu";
 import { cn } from "@/lib/utils";
 import { ipc } from "@/lib/ipc";
 import { useChatStore } from "@/store/chat";
 import { useComposerStore } from "@/store/composer";
 import { usePrefsStore } from "@/store/prefs";
 import { useSessionWorkspaceStore } from "@/store/session-workspace";
-import { useSessionModeStore, nextMode } from "@/store/session-mode";
+import { useSessionModeStore, MODE_ORDER } from "@/store/session-mode";
 import { MODE_META } from "@/lib/mode";
-
-// Platform modifier glyph for tooltips (mirrors keyboard-section.tsx / the overlay).
-const MOD_GLYPH =
-  typeof navigator !== "undefined" &&
-  /mac/i.test(navigator.platform || navigator.userAgent || "")
-    ? "⌘"
-    : "Ctrl";
 
 // A local model server (candle-vllm, Ollama, …) clocks its GPU down when idle,
 // so the first token after a pause crawls while the device ramps back up. We
@@ -97,38 +96,13 @@ export function InputBar({
   const cancelTurn = useChatStore((s) => s.cancelTurn);
   const sendMessageKey = usePrefsStore((s) => s.sendMessageKey);
 
-  // Resolved mode for this pane's session — drives the Plan handoff affordance and
-  // the Plan-aware placeholder (#267, RFC 0011 §8).
+  // Resolved mode for this pane's session — drives the Plan-aware placeholder
+  // (#267, RFC 0011 §8). Switching modes is done via the pill dropdown (#344).
   const defaultMode = usePrefsStore((s) => s.defaultMode);
   const explicitMode = useSessionModeStore((s) =>
     targetSessionId ? s.modeBySession[targetSessionId] : undefined,
   );
   const mode = explicitMode ?? defaultMode;
-  const setMode = useSessionModeStore((s) => s.setMode);
-  // A plan is just a normal assistant message (RFC 0011 §8): the handoff shows
-  // when we're in Plan, the agent has produced a non-empty reply, and the turn is
-  // idle. Gating on content (not just role) avoids surfacing on an empty / tool-only
-  // assistant stub or an error that left a blank assistant message (#288).
-  const lastIsAssistantPlan = useChatStore((s) => {
-    const msgs = targetSessionId
-      ? s.messagesBySession[targetSessionId]
-      : undefined;
-    const last = msgs && msgs.length > 0 ? msgs[msgs.length - 1] : undefined;
-    return Boolean(
-      last && last.role === "assistant" && last.content.trim() !== "",
-    );
-  });
-  const showHandoff =
-    mode === "plan" && lastIsAssistantPlan && !streaming && !pending;
-
-  // Flip the pill to Act and send a continuation — the manual two-step (RFC 0011
-  // §8) collapsed into one click. The mode flip now gates the backend turn (#265),
-  // so the copy stays mechanical, not a safety "approval".
-  function switchToActAndContinue() {
-    if (!targetSessionId || streaming || pending) return;
-    setMode(targetSessionId, "act");
-    void send("Go ahead.", targetSessionId);
-  }
 
   const autoGrow = useCallback((el: HTMLTextAreaElement) => {
     el.style.height = "auto";
@@ -190,21 +164,6 @@ export function InputBar({
   return (
     <div className="px-4 pb-4 pt-2">
       <div className="mx-auto flex max-w-3xl flex-col gap-2">
-        {/* Plan → Act handoff (#267): after the agent proposes a plan in Plan mode,
-            one click flips the pill to Act and continues — the manual two-step
-            collapsed. Framed as the mechanical action, not a safety "approval":
-            switching to Act still gates each Write behind a prompt (#265). */}
-        {showHandoff && (
-          <button
-            type="button"
-            onClick={switchToActAndContinue}
-            title="Switch the pill to Act and send a continuation."
-            className="flex items-center justify-center gap-2 rounded-lg border border-emerald-500/40 bg-emerald-500/10 px-3 py-2 text-[12px] font-medium text-emerald-700 transition-colors hover:bg-emerald-500/20 dark:text-emerald-400"
-          >
-            <ArrowRight className="size-3.5 shrink-0" aria-hidden />
-            Switch to Act &amp; continue
-          </button>
-        )}
         {/* Unified composer: textarea + workspace chip + send/stop in one card. */}
         <div
           ref={boxRef}
@@ -296,23 +255,58 @@ export function InputBar({
 export function ModePill({ sessionId }: { sessionId: string }) {
   const defaultMode = usePrefsStore((s) => s.defaultMode);
   const explicit = useSessionModeStore((s) => s.modeBySession[sessionId]);
-  const cycleMode = useSessionModeStore((s) => s.cycleMode);
+  const setMode = useSessionModeStore((s) => s.setMode);
   const mode = explicit ?? defaultMode;
   const meta = MODE_META[mode];
   return (
-    <button
-      type="button"
-      onClick={() => cycleMode(sessionId, defaultMode)}
-      title={`Mode: ${meta.label} — ${meta.description}\nClick (or ${MOD_GLYPH}.) to switch to ${MODE_META[nextMode(mode)].label}.`}
-      aria-label={`Agent mode: ${meta.label}. Click to cycle.`}
-      className={cn(
-        "inline-flex shrink-0 items-center gap-1.5 rounded-md border px-2 py-1.5 text-xs font-medium transition-colors",
-        meta.pillClass,
-      )}
-    >
-      <span className={cn("size-1.5 shrink-0 rounded-full", meta.dotClass)} />
-      {meta.label}
-    </button>
+    <DropdownMenu>
+      <DropdownMenuTrigger asChild>
+        <button
+          type="button"
+          title={`Mode: ${meta.label} — ${meta.description}`}
+          aria-label={`Agent mode: ${meta.label}`}
+          className={cn(
+            "inline-flex shrink-0 items-center gap-1.5 rounded-md border px-2 py-1.5 text-xs font-medium transition-colors",
+            meta.pillClass,
+          )}
+        >
+          <span
+            className={cn("size-1.5 shrink-0 rounded-full", meta.dotClass)}
+          />
+          {meta.label}
+        </button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="start" className="w-64">
+        {MODE_ORDER.map((m) => {
+          const mMeta = MODE_META[m];
+          return (
+            <DropdownMenuItem
+              key={m}
+              onSelect={() => setMode(sessionId, m)}
+              className="items-start gap-2"
+            >
+              <span
+                className={cn(
+                  "mt-1 size-1.5 shrink-0 rounded-full",
+                  mMeta.dotClass,
+                )}
+              />
+              <span className="flex min-w-0 flex-col">
+                <span className="font-medium text-foreground">
+                  {mMeta.label}
+                </span>
+                <span className="text-[11px] text-muted-foreground">
+                  {mMeta.description}
+                </span>
+              </span>
+              {m === mode && (
+                <Check className="mt-0.5 ml-auto size-3.5 shrink-0 text-foreground" />
+              )}
+            </DropdownMenuItem>
+          );
+        })}
+      </DropdownMenuContent>
+    </DropdownMenu>
   );
 }
 
