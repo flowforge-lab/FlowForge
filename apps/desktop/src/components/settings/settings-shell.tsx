@@ -46,7 +46,7 @@ export function SettingsShell() {
         >
           <SectionNav />
 
-          <div className="flex min-w-0 flex-1 flex-col">
+          <div className="flex min-h-0 min-w-0 flex-1 flex-col">
             <header className="flex h-12 shrink-0 items-center justify-between border-b px-4">
               <h3 className="text-[13px] font-semibold text-foreground">
                 {title}
@@ -62,7 +62,7 @@ export function SettingsShell() {
               </Button>
             </header>
 
-            <ScrollArea className="flex-1">
+            <ScrollArea className="min-h-0 flex-1">
               <div className="px-5 py-4">
                 <SettingsSectionContent id={activeSection} />
               </div>
