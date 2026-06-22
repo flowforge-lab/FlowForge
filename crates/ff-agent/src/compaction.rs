@@ -336,6 +336,7 @@ mod tests {
             tool_calls: None,
             tool_call_id: None,
             attachments: None,
+            reasoning: None,
             created_at: 0,
         }
     }

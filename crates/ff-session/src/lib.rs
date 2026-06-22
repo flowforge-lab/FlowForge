@@ -139,7 +139,7 @@ impl SessionStore {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
             .prepare(
-                "SELECT id, session_id, role, content, tool_calls, tool_call_id, attachments, created_at
+                "SELECT id, session_id, role, content, tool_calls, tool_call_id, attachments, reasoning, created_at
                  FROM messages
                  WHERE session_id = ?1
                  ORDER BY seq",
@@ -160,6 +160,7 @@ impl SessionStore {
             tool_calls: None,
             tool_call_id: None,
             attachments: None,
+            reasoning: None,
             created_at: now_ms(),
         })
     }
@@ -180,6 +181,7 @@ impl SessionStore {
             tool_calls: None,
             tool_call_id: None,
             attachments: (!attachments.is_empty()).then_some(attachments),
+            reasoning: None,
             created_at: now_ms(),
         })
     }
@@ -199,6 +201,7 @@ impl SessionStore {
             tool_calls: None,
             tool_call_id: Some(tool_call_id),
             attachments: None,
+            reasoning: None,
             created_at: now_ms(),
         })
     }
@@ -234,8 +237,8 @@ impl SessionStore {
             .map(|a| serde_json::to_string(a).expect("serialize attachments"));
         conn.execute(
             "INSERT INTO messages
-                 (id, session_id, seq, role, content, tool_calls, tool_call_id, attachments, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                 (id, session_id, seq, role, content, tool_calls, tool_call_id, attachments, reasoning, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 msg.id,
                 msg.session_id,
@@ -245,6 +248,7 @@ impl SessionStore {
                 tool_calls,
                 msg.tool_call_id,
                 attachments,
+                msg.reasoning,
                 msg.created_at,
             ],
         )
@@ -377,7 +381,7 @@ impl SessionStore {
         if updated > 0 {
             if let Some(msg) = conn
                 .query_row(
-                    "SELECT id, session_id, role, content, tool_calls, tool_call_id, attachments, created_at
+                    "SELECT id, session_id, role, content, tool_calls, tool_call_id, attachments, reasoning, created_at
                      FROM messages WHERE id = ?1",
                     params![message_id],
                     row_to_message,
@@ -397,6 +401,7 @@ impl SessionStore {
             tool_calls: None,
             tool_call_id: None,
             attachments: None,
+            reasoning: None,
             created_at: ts,
         }
     }
@@ -409,6 +414,19 @@ impl SessionStore {
         conn.execute(
             "UPDATE messages SET tool_calls = ?1 WHERE id = ?2 AND session_id = ?3",
             params![json, message_id, session_id],
+        )
+        .ok();
+    }
+
+    /// Persist the model's reasoning/CoT onto an already-reserved assistant
+    /// message, so a later turn can round-trip it to reasoning-capable providers
+    /// (#375). Stored verbatim; the caller skips empty reasoning so non-reasoning
+    /// turns keep a NULL column. No-op for an unknown message.
+    pub fn set_message_reasoning(&self, message_id: &str, session_id: &str, reasoning: &str) {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE messages SET reasoning = ?1 WHERE id = ?2 AND session_id = ?3",
+            params![reasoning, message_id, session_id],
         )
         .ok();
     }
@@ -486,9 +504,9 @@ impl SessionStore {
         // Re-key the transcript to the new session, preserving `seq` order.
         conn.execute(
             "INSERT INTO messages
-                 (id, session_id, seq, role, content, tool_calls, tool_call_id, attachments, created_at)
+                 (id, session_id, seq, role, content, tool_calls, tool_call_id, attachments, reasoning, created_at)
              SELECT lower(hex(randomblob(16))), ?1, seq, role, content, tool_calls,
-                    tool_call_id, attachments, created_at
+                    tool_call_id, attachments, reasoning, created_at
              FROM messages WHERE session_id = ?2",
             params![forked.id, session_id],
         )
@@ -660,6 +678,14 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
         conn.execute_batch("ALTER TABLE messages ADD COLUMN attachments TEXT;")?;
         conn.pragma_update(None, "user_version", 3)?;
     }
+    if version < 4 {
+        // PR-1 (#375): persist the assistant reasoning/CoT so it can be
+        // round-tripped to reasoning-capable providers on later tool-calling
+        // turns. NULL for non-reasoning turns. Added via ALTER so existing v3
+        // databases gain the column without losing data.
+        conn.execute_batch("ALTER TABLE messages ADD COLUMN reasoning TEXT;")?;
+        conn.pragma_update(None, "user_version", 4)?;
+    }
     Ok(())
 }
 
@@ -692,6 +718,7 @@ fn row_to_message(row: &rusqlite::Row) -> rusqlite::Result<Message> {
         tool_calls: tool_calls.and_then(|s| serde_json::from_str(&s).ok()),
         tool_call_id: row.get("tool_call_id")?,
         attachments: attachments.and_then(|s| serde_json::from_str(&s).ok()),
+        reasoning: row.get("reasoning")?,
         created_at: row.get("created_at")?,
     })
 }
@@ -849,6 +876,133 @@ mod tests {
         let forked = store.fork_session(&s.id).unwrap();
         let msgs = store.get_messages(&forked.id);
         assert_eq!(msgs[0].attachments.as_deref(), Some([att].as_slice()));
+    }
+
+    #[test]
+    fn set_message_reasoning_round_trips() {
+        let store = SessionStore::new();
+        let s = store.create_session(None);
+        let m = store.add_message(&s.id, Role::Assistant, String::new());
+        store.set_message_reasoning(&m.id, &s.id, "step 1: multiply 17 by 23");
+
+        let msgs = store.get_messages(&s.id);
+        assert_eq!(
+            msgs[0].reasoning.as_deref(),
+            Some("step 1: multiply 17 by 23")
+        );
+    }
+
+    #[test]
+    fn set_message_reasoning_is_returned_by_set_message_content() {
+        // run_turn persists reasoning, then finalizes content; the finalized
+        // Message must carry both (#375 PR-1).
+        let store = SessionStore::new();
+        let s = store.create_session(None);
+        let m = store.add_message(&s.id, Role::Assistant, String::new());
+        store.set_message_reasoning(&m.id, &s.id, "thinking...");
+        let finalized = store.set_message_content(&m.id, &s.id, "answer".into());
+        assert_eq!(finalized.content, "answer");
+        assert_eq!(finalized.reasoning.as_deref(), Some("thinking..."));
+    }
+
+    #[test]
+    fn plain_message_has_no_reasoning() {
+        let store = SessionStore::new();
+        let s = store.create_session(None);
+        store.add_message(&s.id, Role::Assistant, "hi".into());
+        assert!(store.get_messages(&s.id)[0].reasoning.is_none());
+    }
+
+    #[test]
+    fn set_message_reasoning_unknown_message_is_noop() {
+        let store = SessionStore::new();
+        let s = store.create_session(None);
+        store.set_message_reasoning("nope", &s.id, "orphan");
+        assert!(store.get_messages(&s.id).is_empty());
+    }
+
+    #[test]
+    fn reasoning_round_trips_through_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sessions.db");
+        let sid;
+        let mid;
+        {
+            let store = SessionStore::open(&path).unwrap();
+            let s = store.create_session(None);
+            sid = s.id.clone();
+            let m = store.add_message(&s.id, Role::Assistant, "answer".into());
+            mid = m.id.clone();
+            store.set_message_reasoning(&mid, &sid, "chain of thought");
+        }
+        let store = SessionStore::open(&path).unwrap();
+        let msgs = store.get_messages(&sid);
+        assert_eq!(msgs[0].id, mid);
+        assert_eq!(msgs[0].reasoning.as_deref(), Some("chain of thought"));
+    }
+
+    #[test]
+    fn fork_session_copies_reasoning() {
+        let store = SessionStore::new();
+        let s = store.create_session(None);
+        let m = store.add_message(&s.id, Role::Assistant, "a".into());
+        store.set_message_reasoning(&m.id, &s.id, "because");
+
+        let forked = store.fork_session(&s.id).unwrap();
+        let msgs = store.get_messages(&forked.id);
+        assert_eq!(msgs[0].reasoning.as_deref(), Some("because"));
+    }
+
+    #[test]
+    fn migration_v3_to_v4_preserves_messages_and_adds_reasoning() {
+        // A v3 database (pre-reasoning) must gain the column on open without
+        // losing existing rows, and old rows read back with reasoning = None.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sessions.db");
+        let sid = "sess-1";
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE sessions (
+                     id TEXT PRIMARY KEY, goal TEXT, title TEXT, summary TEXT,
+                     status TEXT NOT NULL, created_at INTEGER NOT NULL,
+                     updated_at INTEGER NOT NULL, phenotype TEXT, mode TEXT, workspace TEXT
+                 );
+                 CREATE TABLE messages (
+                     id TEXT PRIMARY KEY, session_id TEXT NOT NULL, seq INTEGER NOT NULL,
+                     role TEXT NOT NULL, content TEXT NOT NULL, tool_calls TEXT,
+                     tool_call_id TEXT, attachments TEXT, created_at INTEGER NOT NULL
+                 );",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO sessions (id, status, created_at, updated_at)
+                 VALUES (?1, 'active', 0, 0)",
+                params![sid],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO messages (id, session_id, seq, role, content, created_at)
+                 VALUES ('m1', ?1, 0, 'assistant', 'legacy', 0)",
+                params![sid],
+            )
+            .unwrap();
+            conn.pragma_update(None, "user_version", 3).unwrap();
+        }
+
+        let store = SessionStore::open(&path).unwrap();
+        let msgs = store.get_messages(sid);
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].content, "legacy");
+        assert!(msgs[0].reasoning.is_none());
+
+        let version: i64 = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 4);
     }
 
     #[test]
@@ -1141,7 +1295,7 @@ mod tests {
             .unwrap()
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 3);
+        assert_eq!(version, 4);
     }
 
     #[test]

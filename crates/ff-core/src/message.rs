@@ -83,6 +83,13 @@ pub struct Message {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub attachments: Option<Vec<Attachment>>,
+    /// The model's chain-of-thought for an assistant turn, captured from the
+    /// reasoning stream so it can be round-tripped to reasoning-capable providers
+    /// on later tool-calling turns (#375). Absent for non-reasoning turns; stored
+    /// verbatim and omitted from the wire/binding when none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub reasoning: Option<String>,
     /// Unix epoch milliseconds.
     #[ts(type = "number")]
     pub created_at: i64,
