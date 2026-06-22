@@ -147,6 +147,33 @@ A new `.github/workflows/release.yml`:
 
 The existing `ci.yml` (PR gates) is untouched.
 
+### 6.1 Local / dev update channel
+
+For dogfooding without cutting a real GitHub Release, the repo ships two
+developer scripts (documented in `docs/SOP-rust-setup.md` section 8):
+
+- **`scripts/dev-install.sh`** (D2) — the daily loop. Runs `pnpm tauri build`,
+  replaces `/Applications/FlowForge.app`, and clears the macOS quarantine
+  attribute. No update feed involved; you just relaunch the freshly built app.
+- **`scripts/dev-release.sh`** (D1) — exercises the *update path itself*. Does a
+  signed build, generates a `latest.json`, and serves it over
+  `http://localhost:8787` so the in-app "Check for updates" / "Update now" flow
+  can be tested end-to-end against a local feed.
+
+D1 relies on a dev-only Tauri config overlay,
+`apps/desktop/src-tauri/tauri.local.conf.json`, applied at build time via
+`--config` (it is **never** part of the shipped `tauri.conf.json`):
+
+- `plugins.updater.endpoints` -> `http://localhost:8787/latest.json`
+- `plugins.updater.dangerousInsecureTransportProtocol: true` (lets the updater
+  talk to a plain-HTTP localhost feed; the shipped config stays strict-HTTPS)
+- `version: "0.0.0-dev"` so any real release version compares as "newer"
+
+The backend honors an `FF_UPDATER_ENDPOINT` env override and uses a lenient
+`version_comparator` (`update.version != current`) so a local feed can push the
+same or an older version for testing. Production builds use neither override and
+keep the strict-HTTPS, monotonic-version behavior.
+
 ## 7. Versioning
 
 - **Single source of truth:** `tauri.conf.json` `version`. `apps/desktop/package.json`
@@ -208,8 +235,10 @@ Dependency: **P1 -> P2**. P3 and P4 are independent and unscheduled.
 
 **Non-goals:**
 
-- **Not background auto-update.** The user clicks Check / Update now. Silent
-  download-on-launch is a later option, not v1.
+- **Not silent background download/install.** A background *check* on startup
+  and on an interval (gated to production builds) is in scope (#363) — it only
+  *surfaces* the "Update now" button. The user always clicks "Update now" to
+  download and install; nothing is fetched or applied without that click.
 - **Not delta/differential updates.** Each update is a full bundle. Fine at this size.
 - **Not a private/auth'd update feed.** The repo is public; the endpoint is a plain URL.
   If the repo ever goes private, the updater needs a token or a public mirror — flagged,

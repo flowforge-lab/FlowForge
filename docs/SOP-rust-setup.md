@@ -1,9 +1,14 @@
-# SOP — Rust Backend Setup & Frontend/Backend Split
+# SOP — FlowForge Dev Setup & Operations
 
 **Audience:** FlowForge contributors
 **Owner (backend):** Tony (ytonytan)
 **Owner (frontend):** Abid
-**Status:** Living document — update when the IPC contract or workspace layout changes
+**Status:** Living document — update when the IPC contract, workspace layout, or the
+local install/update loops change
+
+**Scope:** the front/back split + IPC contract (§0–§6), the historical M1 bootstrap
+(§2, §7 — done, kept for reference), and **running & updating your local install** (§8 —
+the day-to-day dogfood loop, RFC 0014).
 
 ---
 
@@ -59,6 +64,9 @@ pnpm tauri --version     # invokes the local @tauri-apps/cli
 ---
 
 ## 2. Restructure: Single Crate → Workspace
+
+> **Historical (M1 — done).** The workspace already exists; this section is kept as the
+> record of how it was built. New contributors do **not** need to redo any of it.
 
 The stock scaffold ships one crate (`appsdesktop`). Before real work, convert to the
 workspace from the README so the engine is testable headlessly (no Tauri needed for unit tests).
@@ -235,6 +243,10 @@ Definition of done for a backend change: `fmt` clean, `clippy` zero warnings,
 
 ## 7. M1 Acceptance (what "Rust setup done" means)
 
+> **Historical (M1 — done).** All boxes below are checked; kept as the definition-of-done
+> record for the initial setup milestone.
+
+
 - [ ] Workspace compiles: `cargo build --workspace`
 - [ ] Tauri crate renamed to `flowforge-desktop`, depends on `ff-*`
 - [ ] `ff-core` defines `Message`, `Session`, `Role` with `ts-rs` export
@@ -246,3 +258,69 @@ Definition of done for a backend change: `fmt` clean, `clippy` zero warnings,
 
 Once §7 is checked, Abid is fully unblocked on the chat UI, command palette, and theming
 against the typed contract + mock.
+
+---
+
+## 8. Running & Updating Your Local Install (RFC 0014)
+
+`pnpm tauri dev` (§5) runs the app against the dev server — great for editing, but not how
+you *use* FlowForge day to day. This section covers running the **installed** app and
+keeping it current. Local state (`~/.flowforge`, `~/.config/flowforge`) lives in your home
+directory, **not** the app bundle, so it survives every reinstall and update for free.
+
+### 8.1 First install
+
+- **From a release (once one exists):** download the `.dmg` from the GitHub Release and
+  drag the app to `/Applications`. The build is not yet Apple-notarized (RFC 0014 §9), so
+  Gatekeeper flags the first open: right-click → **Open**, or
+  `xattr -dr com.apple.quarantine /Applications/FlowForge.app`.
+- **From source:** run the D2 loop below — it builds and installs in one step.
+
+### 8.2 D2 — direct reinstall (the daily loop)
+
+The everyday loop: build locally and replace the installed app. No updater, no server.
+
+```bash
+./scripts/dev-install.sh
+```
+
+It runs `pnpm tauri build`, replaces `/Applications/FlowForge.app` with the fresh bundle,
+clears the quarantine flag, and tells you to relaunch. Use this for almost all dogfooding.
+
+### 8.3 D1 — local update feed (optional, exercises "Update now")
+
+Use this only when you want to test the in-app **Settings → About → Update now** button
+against a local build instead of a real GitHub release.
+
+```bash
+export TAURI_SIGNING_PRIVATE_KEY="$(cat ~/.tauri/flowforge.key)"
+export TAURI_SIGNING_PRIVATE_KEY_PASSWORD="…"   # the key's password
+./scripts/dev-release.sh 8787
+```
+
+`dev-release.sh` builds a signed updater bundle with a bumped `0.0.0-dev.<timestamp>`
+version (so the updater always sees it as newer), writes a `latest.json` pointing at
+`http://localhost:8787/FlowForge.app.tar.gz`, and serves the bundle directory. In another
+terminal, launch the install pointed at the local feed:
+
+```bash
+FF_UPDATER_ENDPOINT="http://localhost:8787/latest.json" \
+  /Applications/FlowForge.app/Contents/MacOS/FlowForge
+```
+
+Then click **Settings → About → Check for updates → Update now**. The dev-only config
+patch (`apps/desktop/src-tauri/tauri.local.conf.json`) supplies the localhost endpoint and
+`dangerousInsecureTransportProtocol: true` so the dev build trusts a plain-HTTP feed. It is
+applied only via `tauri build --config` and is **never shipped** — `tauri.conf.json` stays
+strict-HTTPS for prod/CI.
+
+### 8.4 Which loop?
+
+| You want to… | Use |
+|---|---|
+| Run the latest local code as the installed app | **D2** (`dev-install.sh`) |
+| Verify the in-app updater / "Update now" end to end | **D1** (`dev-release.sh` + local feed) |
+| Edit with hot-reload | `pnpm tauri dev` (§5) |
+
+> The publish flow (tag → CI → signed GitHub Release → `latest.json`) is a separate
+> milestone (RFC 0014 P2, `release.yml` + `RELEASING.md`) and is out of scope here.
