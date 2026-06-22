@@ -1,0 +1,229 @@
+# 0014 — Release & Self-Update
+
+- **Status:** Proposed
+- **Milestone:** _M4 (distribution)_
+- **Author:** tonytan4ever
+- **Depends on:** nothing hard. Tauri v2 `updater` + `process` plugins; GitHub Releases; complements RFC 0012 (durable persistence — the config this design deliberately does *not* back up). Fills in the About IPC stubs from #134/#158.
+- **Tracking issue:** #159
+
+## 1. Summary & Goals
+
+Ship FlowForge as an **installable, self-updating desktop app** instead of a thing you
+run with `pnpm tauri dev`. After a one-time install, Settings -> About gains a working
+**Check for updates / Update now** button that pulls every new release. This is the real
+backend behind the SET.11 About stubs (#134, PR #158), which today are mock no-ops.
+
+The design is **local-first but public-ready**: the first milestone gets a handful of
+developers (the author included) self-updating at zero cost; the same pipeline extends to
+the general public by switching on OS code-signing later, with no rearchitecture.
+
+Goals:
+
+- Replace the `check_for_updates` mock stub with a real Tauri updater, returning the
+  already-defined structured `UpdateStatus` (up-to-date vs. available + version + notes)
+  so the UI can branch and offer "Update now".
+- Stand up a tagged-release pipeline (GitHub Actions -> GitHub Releases) that produces a
+  signed, installable macOS build and the updater manifest the app reads.
+- Get the author off the dev server: install once, update in-app thereafter.
+- Design the signing and packaging so the public path (Apple notarization, Windows
+  signing, multi-platform matrix) is a later switch, not a redesign.
+
+Non-goals up front (see §10): backup/restore (descoped — §8), Apple notarization,
+Windows/Linux builds, auto-download-in-background, and delta updates.
+
+## 2. Background — what exists, what doesn't
+
+- **FE contract is already structured.** `lib/about.ts` defines `UpdateStatus = { kind:
+  "upToDate"; version } | { kind: "available"; version; notes }` and `formatUpdateStatus`
+  (FE owns the toast copy). `ipc.ts` exposes `checkForUpdates(): Promise<UpdateStatus>`
+  with a `CONTRACT NOTE (SET.11)` pointing here. So the contract-redesign half of #159 is
+  largely done; the `Promise<string>` in the issue body is stale.
+- **No Rust backend.** `check_for_updates` / `export_backup` / `restore_backup` have no
+  Rust implementation and are absent from `generate_handler!` — only `MockIpc` fulfils
+  them.
+- **Tauri v2**, plugins `opener` / `dialog` / `fs`. `tauri.conf.json` has no
+  `plugins.updater`, `bundle.targets: "all"`, version `0.1.0`. No updater artifacts.
+- **Repo is public**, `0` releases, one CI workflow (`ci.yml`: rust + web gates), no
+  release workflow.
+- **The only way to run the app today is `pnpm tauri dev`** against a local build.
+
+## 3. Architecture — Tauri updater + GitHub Releases + minisign
+
+The standard Tauri v2 self-update topology, which the public repo makes trivial:
+
+```
+  release tag (vX.Y.Z)
+        |
+        v
+  GitHub Actions (release.yml, macOS runner)
+        |  tauri-action: build + sign + publish
+        v
+  GitHub Release  ->  FlowForge.app.tar.gz + .sig + .dmg + latest.json
+        ^                                                      |
+        |  HTTPS GET (no auth - public repo)                   |
+  installed app  <------ updater plugin reads latest.json -----+
+        |  verifies .sig against baked-in minisign pubkey
+        v
+  download -> install -> relaunch
+```
+
+- **Update feed:** the Tauri updater polls a static **`latest.json`** manifest published
+  as a release asset. Because the repo is public, the endpoint is a plain URL with no
+  token: `https://github.com/flowforge-lab/FlowForge/releases/latest/download/latest.json`.
+- **Flow (Tauri v2):** `app.updater()?.check()` -> `Option<Update>`. `None` => up-to-date;
+  `Some(u)` => `u.version` + `u.body` (release notes). Install =
+  `update.download_and_install(...).await` then `app.restart()` (via `tauri-plugin-process`).
+- **Integrity:** every artifact is signed with a **minisign** key (see §4); the installed
+  app carries the matching public key and refuses any update whose signature does not
+  verify. This is independent of OS code-signing.
+
+## 4. Signing — two independent layers
+
+These are separate concerns and are often confused:
+
+| Layer | What it protects against | Cost / account | Phase |
+|-------|--------------------------|----------------|-------|
+| **Updater signature (minisign)** | A malicious or corrupt *update* being installed. The app verifies the `.sig` against a baked-in public key before applying. | Free, no account. | **Required now** — the updater will not install an unsigned update. |
+| **OS code-signing (Apple notarization / Windows Authenticode)** | The *first install* triggering Gatekeeper / SmartScreen "unknown developer / damaged app" warnings. | Apple Developer Program ($99/yr); a Windows cert. | **Phase 2** (public). |
+
+**Minisign mechanics:**
+
+1. Generate a keypair once: `pnpm tauri signer generate` -> private key (secret) + public
+   key (not secret).
+2. Public key is committed into `tauri.conf.json` (`plugins.updater.pubkey`); it ships in
+   every install.
+3. CI signs each artifact with the private key at release time, producing `.sig` files.
+4. The private key + its password are stored as **GitHub Actions repository secrets**
+   (`TAURI_SIGNING_PRIVATE_KEY`, `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`) and consumed by the
+   release workflow. They are never committed and never pushed through an API; they are
+   pasted into the repo's Settings -> Secrets and variables -> Actions by a maintainer.
+
+Losing the private key means the existing installed base can no longer be updated (a new
+key requires a manual reinstall), so it is backed up out-of-band.
+
+## 5. IPC contract
+
+The existing `UpdateStatus` is unchanged. One command is **added** to make "Update now"
+possible, since the SET.11 stub only modelled the *check*, not the *install*:
+
+```ts
+checkForUpdates(): Promise<UpdateStatus>;   // existing - now real
+installUpdate():   Promise<void>;           // new - downloads, installs, relaunches
+```
+
+- `check_for_updates` (Rust): `app.updater()?.check()` -> map `None`/`Some` to
+  `UpdateStatus`. Errors (offline, malformed manifest) surface as a normal `CmdResult` err
+  the FE toasts.
+- `install_update` (Rust): re-runs `check()` then `download_and_install()` then
+  `app.restart()`. It re-checks rather than caching the `Update` handle across IPC calls —
+  the handle is awkward to hold `'static` between invocations, and a second cheap check is
+  robust against the user having sat on the dialog. Progress events are out of scope for
+  v1 (the button shows a spinner; a `download-progress` event is a later nicety).
+- `MockIpc.installUpdate` resolves immediately (no-op) so mock dev is unaffected.
+- **About UI:** the "Update now" affordance renders only when `checkForUpdates` returned
+  `kind: "available"`; otherwise the section shows the current version + "You're on the
+  latest version."
+
+The `backup` stubs (`export_backup` / `restore_backup`) are left as mock no-ops for now —
+see §8.
+
+## 6. Release workflow
+
+A new `.github/workflows/release.yml`:
+
+- **Triggers:** `push` of a `v*` tag (the real release path) **and** `workflow_dispatch`
+  (so a maintainer can cut an on-demand build from `main` without tagging, for fast
+  dogfooding).
+- **Runner:** `macos-14` (Apple silicon / arm64) for the first milestone — the author's
+  platform. The matrix expands to x86 macOS / Linux / Windows in phase 2.
+- **Steps:** checkout -> setup pnpm + node + rust -> `pnpm install --frozen-lockfile` ->
+  `tauri-apps/tauri-action@v0` with `projectPath: apps/desktop`, the two signing-key env
+  vars, and `GITHUB_TOKEN`. tauri-action builds, creates/updates the GitHub Release for
+  the tag, uploads the `.dmg` + `.app.tar.gz` + `.sig`, and **auto-generates `latest.json`**
+  when `createUpdaterArtifacts` is on and the signing key is present.
+- **Config changes (PR-1):** `bundle.createUpdaterArtifacts: true`;
+  `plugins.updater.{endpoints, pubkey}`; `capabilities/default.json` gains
+  `updater:default` and `process:allow-restart`.
+
+The existing `ci.yml` (PR gates) is untouched.
+
+## 7. Versioning
+
+- **Single source of truth:** `tauri.conf.json` `version`. `apps/desktop/package.json`
+  `version` is kept in lockstep (both `0.1.0` today). `getAppVersion()` already reads the
+  Tauri metadata at runtime.
+- **Convention:** bump the version in both files, commit, tag `vX.Y.Z`, push the tag ->
+  the workflow releases. The updater compares the running app's version against
+  `latest.json`'s `version`; a newer manifest version => `available`.
+- SemVer: pre-1.0, breaking changes bump the minor. A `RELEASING.md` (PR-2) documents the
+  bump-tag-push steps and the first-install instructions.
+
+## 8. Why backup is descoped
+
+`~/.config/flowforge/` (sessions.db, provider-registry.json, search.json,
+tool_permissions.json, phenotype.json, mode.json) and `~/.flowforge/` (skills, phenos,
+memory, mcp.json) live in the **user's home directory, not the app bundle**. Installing or
+self-updating the app replaces only the bundle; it never touches these. So all local state
+**survives updates and reinstalls for free** — which is the only durability the dogfooding
+goal needs.
+
+Backup/restore (`export_backup` / `restore_backup`) only adds value for *new-machine
+migration* or *corruption recovery*, neither of which is in scope for self-update. It also
+carries real design weight: a WAL-safe `sessions.db` copy (`VACUUM INTO` over the live
+connection), a versioned archive format, and the explicit decision that **keychain secrets
+are excluded** (they are not on disk, and excluding them is the safer default — a restored
+backup on a new machine re-prompts for API keys). Those tasks stay on #159 as a deferred
+checkbox; the mock stubs remain until then. This keeps the milestone to "self-update,
+done well".
+
+## 9. macOS first-install friction (and how phase 2 removes it)
+
+Until Apple notarization (phase 2), the macOS build is unsigned by Apple, so Gatekeeper
+flags the first install ("FlowForge can't be opened / is damaged"). For local developers
+this is a documented one-time bypass: right-click -> Open, or
+`xattr -dr com.apple.quarantine /Applications/FlowForge.app`. The updater itself is
+unaffected — minisign verification (independent of Apple) guarantees update integrity, and
+updater-delivered bundles inherit the same trust the user already granted.
+
+**The first install is always a manual download** of the `.dmg` from the GitHub Release —
+the updater only updates an *already-installed* app. After that, the in-app button is the
+only step. `RELEASING.md` documents both.
+
+Phase 2 (Developer ID signing + notarization) removes the Gatekeeper prompt entirely and
+is purely additive: more secrets + a few `tauri.conf.json`/workflow flags, no contract or
+architecture change.
+
+## 10. Phasing
+
+| Phase | Label | Scope | Ships alone? |
+|-------|-------|-------|--------------|
+| **P1** | backend + plumbing | `tauri-plugin-updater` + `tauri-plugin-process`; `check_for_updates` + `install_update` commands (+ `generate_handler!`); updater config (`endpoints`, `pubkey`, `createUpdaterArtifacts`); capability perms; FE `installUpdate` + "Update now" button; minisign keypair generated, pubkey committed, private key into repo secrets. | No (needs P2 to have a feed) |
+| **P2** | release pipeline | `release.yml` (tag + `workflow_dispatch`, macOS arm64, tauri-action) + `RELEASING.md`; cut `v0.1.0`. **After P2 the author installs once and self-updates.** | Yes (the deliverable) |
+| **P3** *(deferred)* | backup | Real `export_backup` / `restore_backup` (§8). Stays on #159. | Yes |
+| **P4** *(deferred)* | public hardening | Apple notarization, Windows signing, multi-platform matrix; real Slack invite URL (swap `ABOUT_SLACK_URL`). | Yes |
+
+Dependency: **P1 -> P2**. P3 and P4 are independent and unscheduled.
+
+## 11. Non-goals & open questions
+
+**Non-goals:**
+
+- **Not background auto-update.** The user clicks Check / Update now. Silent
+  download-on-launch is a later option, not v1.
+- **Not delta/differential updates.** Each update is a full bundle. Fine at this size.
+- **Not a private/auth'd update feed.** The repo is public; the endpoint is a plain URL.
+  If the repo ever goes private, the updater needs a token or a public mirror — flagged,
+  not solved.
+- **Not backup/restore** (§8) and **not OS code-signing** (§4) in this milestone.
+
+**Open questions:**
+
+- **Download progress UX.** v1 shows a spinner on "Update now". Worth wiring the
+  `download-progress` event into a real progress bar later?
+- **On-demand `main` builds.** `workflow_dispatch` lets a maintainer build from `main`
+  without a tag — useful for dogfooding, but those builds have no stable version bump.
+  Convention TBD (e.g. a `-dev` suffix) so the updater does not see an un-tagged build as
+  "newer".
+- **Key custody.** Where does the minisign private key live out-of-band (the loss case in
+  §4)? Proposal: the maintainer's password manager; revisit if the project gains more
+  maintainers.
