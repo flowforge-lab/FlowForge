@@ -13,11 +13,13 @@ use aws_sdk_bedrockruntime::types::{
 };
 use aws_sdk_bedrockruntime::Client;
 use aws_smithy_types::{Blob, Document, Number};
-use base64::Engine as _;
-use ff_core::{Attachment, AttachmentSource};
+use ff_core::Attachment;
 use futures_util::stream::{self, StreamExt};
 
-use crate::{ChatMessage, ChatRequest, Chunk, ChunkStream, LlmError, Provider, ToolCallDelta};
+use crate::{
+    attachment_bytes, ChatMessage, ChatRequest, Chunk, ChunkStream, LlmError, Provider,
+    ToolCallDelta,
+};
 
 /// Which credential source the provider uses to sign requests. Built by the
 /// desktop host from a `ProviderConnection` plus any keychain secrets.
@@ -454,20 +456,6 @@ fn text_blocks(msg: &ChatMessage) -> Vec<ContentBlock> {
     blocks
 }
 
-/// Materialize an attachment's raw bytes: read a `Path` from disk, or base64-decode
-/// an `Inline` payload. Returns the bytes as Bedrock's sources take raw bytes (the
-/// SDK base64-encodes on the wire); other providers re-encode in their own tickets.
-fn attachment_bytes(a: &Attachment) -> Result<Vec<u8>, String> {
-    match &a.source {
-        AttachmentSource::Path(path) => {
-            std::fs::read(path).map_err(|e| format!("read {path}: {e}"))
-        }
-        AttachmentSource::Inline(b64) => base64::engine::general_purpose::STANDARD
-            .decode(b64)
-            .map_err(|e| format!("decode inline base64: {e}")),
-    }
-}
-
 /// Map an IANA media type to a Bedrock [`ImageFormat`]. Bedrock accepts only this
 /// fixed allowlist, so an unrecognized type yields `None` and the caller skips the
 /// attachment rather than emitting a block Bedrock would reject (trust-boundary:
@@ -775,6 +763,8 @@ mod tests {
     use aws_sdk_bedrockruntime::types::{
         ContentBlockDeltaEvent, ContentBlockStartEvent, ToolUseBlockDelta, ToolUseBlockStart,
     };
+    use base64::Engine as _;
+    use ff_core::AttachmentSource;
 
     fn assistant_with_call(args: &str) -> ChatMessage {
         ChatMessage {

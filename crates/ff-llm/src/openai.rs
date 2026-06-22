@@ -2,7 +2,9 @@ use async_trait::async_trait;
 use futures_util::StreamExt;
 use serde::Deserialize;
 
-use crate::{ChatRequest, Chunk, ChunkStream, LlmError, Provider, ToolCallDelta};
+use base64::Engine as _;
+
+use crate::{ChatMessage, ChatRequest, Chunk, ChunkStream, LlmError, Provider, ToolCallDelta};
 
 /// Talks to any OpenAI-compatible `/v1/chat/completions` server over Server-Sent
 /// Events. candle-vllm, vLLM, LM Studio, Ollama's `/v1` shim, and OpenAI itself all
@@ -158,13 +160,81 @@ fn parse_sse_line(line: &[u8]) -> Option<Result<Chunk, LlmError>> {
     }
 }
 
+/// Whitelisted image media types an OpenAI-compatible vision model accepts as a
+/// data URI. `supports_vision` being true doesn't guarantee every format is taken
+/// (trust-boundary, #334), so an unrecognized type is skipped rather than sent.
+fn openai_image_media_type(media_type: &str) -> Option<&'static str> {
+    match media_type.trim().to_ascii_lowercase().as_str() {
+        "image/png" => Some("image/png"),
+        "image/jpeg" | "image/jpg" => Some("image/jpeg"),
+        "image/gif" => Some("image/gif"),
+        "image/webp" => Some("image/webp"),
+        _ => None,
+    }
+}
+
+/// Build an `image_url` data URI (`data:<media_type>;base64,<b64>`) for one image
+/// attachment, or `None` (with a warning) when it can't be sent: an unsupported
+/// media type, an unreadable file, or undecodable inline data. Skipping rather than
+/// failing keeps one bad attachment from dropping the whole turn.
+fn image_data_uri(a: &ff_core::Attachment) -> Option<String> {
+    let Some(media_type) = openai_image_media_type(&a.media_type) else {
+        tracing::warn!(media_type = %a.media_type, "skipping image attachment: unsupported media type for OpenAI");
+        return None;
+    };
+    let bytes = crate::attachment_bytes(a)
+        .map_err(|e| tracing::warn!(error = %e, "skipping image attachment"))
+        .ok()?;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(bytes);
+    Some(format!("data:{media_type};base64,{b64}"))
+}
+
+/// Reshape a message into its OpenAI wire object. A message with image attachments
+/// gets the array `content` shape -- a text block (when non-empty) followed by one
+/// `image_url` block per image; every other message keeps its plain-string
+/// `content`, byte-identical to the text-only path. The internal `attachments`
+/// field is always removed so it never leaks onto the wire. Document attachments
+/// aren't representable as `image_url` and are skipped here (degrade handling, #338).
+fn message_to_wire(msg: &ChatMessage) -> serde_json::Value {
+    let mut value = serde_json::to_value(msg).unwrap_or_else(|_| serde_json::json!({}));
+    if let Some(obj) = value.as_object_mut() {
+        obj.remove("attachments");
+    }
+    let image_uris: Vec<String> = msg
+        .attachments
+        .iter()
+        .filter_map(|a| match a.kind {
+            ff_core::AttachmentKind::Image => image_data_uri(a),
+            ff_core::AttachmentKind::Document => {
+                tracing::warn!(media_type = %a.media_type, "skipping document attachment: OpenAI chat has no portable document block (#338)");
+                None
+            }
+        })
+        .collect();
+    if image_uris.is_empty() {
+        return value;
+    }
+    let mut content = Vec::new();
+    if let Some(text) = msg.content.as_deref().filter(|t| !t.is_empty()) {
+        content.push(serde_json::json!({ "type": "text", "text": text }));
+    }
+    for uri in image_uris {
+        content.push(serde_json::json!({ "type": "image_url", "image_url": { "url": uri } }));
+    }
+    if let Some(obj) = value.as_object_mut() {
+        obj.insert("content".into(), serde_json::Value::Array(content));
+    }
+    value
+}
+
 #[async_trait]
 impl Provider for OpenAiProvider {
     async fn chat_stream(&self, req: ChatRequest) -> Result<ChunkStream, LlmError> {
         let messages = crate::messages_for_wire(&req.messages, self.supports_vision);
+        let wire_messages: Vec<serde_json::Value> = messages.iter().map(message_to_wire).collect();
         let mut body = serde_json::json!({
             "model": req.model,
-            "messages": messages,
+            "messages": wire_messages,
             "stream": true,
         });
         if !req.tools.is_empty() {
@@ -337,6 +407,145 @@ mod tests {
             args.is_string(),
             "OpenAI arguments must stay a string, got {args}"
         );
+    }
+
+    // ---- #336 BE-4: OpenAI image_url data-URI content blocks ----
+
+    use ff_core::{Attachment, AttachmentKind, AttachmentSource};
+
+    fn inline_b64(bytes: &[u8]) -> String {
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    }
+
+    fn image_attachment(media_type: &str, source: AttachmentSource) -> Attachment {
+        Attachment {
+            kind: AttachmentKind::Image,
+            media_type: media_type.into(),
+            source,
+            name: Some("shot.png".into()),
+            bytes: 4,
+        }
+    }
+
+    #[test]
+    fn multimodal_message_emits_image_url_block() {
+        let msg = ChatMessage::multimodal(
+            "user",
+            "look",
+            vec![image_attachment(
+                "image/png",
+                AttachmentSource::Inline(inline_b64(&[0x89, 0x50, 0x4e, 0x47])),
+            )],
+        );
+        let v = message_to_wire(&msg);
+        let content = v["content"].as_array().expect("content is an array");
+        assert_eq!(content.len(), 2, "text block then image block");
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[0]["text"], "look");
+        assert_eq!(content[1]["type"], "image_url");
+        let url = content[1]["image_url"]["url"].as_str().unwrap();
+        assert!(
+            url.starts_with("data:image/png;base64,"),
+            "data URI prefix, got {url}"
+        );
+        assert!(
+            v.get("attachments").is_none(),
+            "internal field must not leak"
+        );
+    }
+
+    #[test]
+    fn text_only_message_keeps_plain_string_content() {
+        let v = message_to_wire(&ChatMessage::text("user", "plain turn"));
+        assert!(v["content"].is_string(), "content stays a plain string");
+        assert_eq!(v["content"], "plain turn");
+        assert!(v.get("attachments").is_none());
+    }
+
+    #[test]
+    fn image_only_message_omits_text_block() {
+        let msg = ChatMessage::multimodal(
+            "user",
+            "",
+            vec![image_attachment(
+                "image/jpeg",
+                AttachmentSource::Inline(inline_b64(&[0xff, 0xd8, 0xff])),
+            )],
+        );
+        let content = message_to_wire(&msg)["content"]
+            .as_array()
+            .expect("content is an array")
+            .clone();
+        assert_eq!(content.len(), 1, "only the image block");
+        assert_eq!(content[0]["type"], "image_url");
+    }
+
+    #[test]
+    fn path_image_is_read_and_base64_encoded() {
+        let dir = std::env::temp_dir();
+        let file = dir.join(format!("ff-openai-test-{}.png", std::process::id()));
+        let bytes = [0x89u8, 0x50, 0x4e, 0x47, 0x0d, 0x0a];
+        std::fs::write(&file, bytes).unwrap();
+        let msg = ChatMessage::multimodal(
+            "user",
+            "",
+            vec![image_attachment(
+                "image/png",
+                AttachmentSource::Path(file.to_string_lossy().into_owned()),
+            )],
+        );
+        let url = message_to_wire(&msg)["content"][0]["image_url"]["url"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        std::fs::remove_file(&file).ok();
+        assert_eq!(url, format!("data:image/png;base64,{}", inline_b64(&bytes)));
+    }
+
+    #[test]
+    fn document_attachment_is_skipped() {
+        let msg = ChatMessage::multimodal(
+            "user",
+            "summarize",
+            vec![Attachment {
+                kind: AttachmentKind::Document,
+                media_type: "application/pdf".into(),
+                source: AttachmentSource::Inline(inline_b64(b"%PDF-1.4")),
+                name: Some("doc.pdf".into()),
+                bytes: 8,
+            }],
+        );
+        let v = message_to_wire(&msg);
+        assert!(v["content"].is_string(), "no image block -> plain string");
+        assert!(v.get("attachments").is_none());
+    }
+
+    #[test]
+    fn unsupported_image_type_is_skipped() {
+        let msg = ChatMessage::multimodal(
+            "user",
+            "look",
+            vec![image_attachment(
+                "image/svg+xml",
+                AttachmentSource::Inline(inline_b64(b"<svg/>")),
+            )],
+        );
+        let v = message_to_wire(&msg);
+        assert!(v["content"].is_string(), "unsupported type skipped");
+    }
+
+    #[test]
+    fn unreadable_path_is_skipped() {
+        let msg = ChatMessage::multimodal(
+            "user",
+            "look",
+            vec![image_attachment(
+                "image/png",
+                AttachmentSource::Path("/nonexistent/ff/missing.png".into()),
+            )],
+        );
+        let v = message_to_wire(&msg);
+        assert!(v["content"].is_string(), "unreadable file skipped");
     }
 
     // ---- #311 PR-3a: list_models / test_connection probe (HTTP-level) ----

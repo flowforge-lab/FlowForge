@@ -10,6 +10,7 @@ mod ollama;
 mod openai;
 
 use async_trait::async_trait;
+use base64::Engine as _;
 use futures_util::stream::BoxStream;
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -167,6 +168,20 @@ pub(crate) fn messages_for_wire(
                 })
                 .collect(),
         )
+    }
+}
+
+/// Materialize an attachment as raw bytes: read a `Path` from disk, or base64-decode
+/// an `Inline` payload. Shared by the per-provider adapters (#335/#336/#337) -- Bedrock
+/// sends these raw, the OpenAI-compatible adapter re-encodes them into a data URI.
+pub(crate) fn attachment_bytes(a: &ff_core::Attachment) -> Result<Vec<u8>, String> {
+    match &a.source {
+        ff_core::AttachmentSource::Path(path) => {
+            std::fs::read(path).map_err(|e| format!("read {path}: {e}"))
+        }
+        ff_core::AttachmentSource::Inline(b64) => base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .map_err(|e| format!("decode inline base64: {e}")),
     }
 }
 
