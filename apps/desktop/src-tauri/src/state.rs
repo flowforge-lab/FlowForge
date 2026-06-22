@@ -946,6 +946,12 @@ impl AppState {
         self.memory.clone()
     }
 
+    /// The shared recall index, so per-turn ambient injection can skip dormant
+    /// chunks (RFC 0007 §M6.1). Same `Arc` the `memory_*` tools hold.
+    pub fn index(&self) -> Arc<dyn MemoryIndex> {
+        self.memory_index.clone()
+    }
+
     /// The directory installed skills live in.
     pub fn skills_root(&self) -> PathBuf {
         skills_root()

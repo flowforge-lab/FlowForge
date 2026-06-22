@@ -80,6 +80,15 @@ exactly two behaviours:
 Dormancy is a **derived predicate** (`weight < dormant_threshold`), not stored state, so
 there is no separate lifecycle to keep consistent.
 
+**Never-recalled chunks are never dormant.** The age clock starts at the *first recall*,
+not at creation: a chunk with no `chunk_stats` row has effective weight `1.0`, so a fresh
+curated `MEMORY.md` entry is always injected until it has been recalled at least once and
+then gone cold. This is intentional — a just-written fact should not be hidden before it
+has had a chance to be used. It interacts with weak **ambient reinforcement** (§10.1): if
+ambient injection itself ever counts as a soft "touch" (`ambient_gain`), the age clock
+would instead start at first injection, changing this behaviour. Until that lands, ambient
+injection is observe-free and never-recalled stays `1.0`.
+
 ## 4. Persistence: A Durable Side Table
 
 RFC 0006 §4 is explicit that the SQLite index is a **derived artifact, rebuildable from

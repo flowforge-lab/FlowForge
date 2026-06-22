@@ -4,11 +4,11 @@
  * Usage-driven decay configuration (RFC 0007 §5). Each knob has a conservative
  * default; the whole mechanism is gated by `enabled`.
  *
- * M6.0 is observe-only: stats are recorded, but `weight` only decays/reinforces
- * when `enabled = true`. `enabled` defaults to `false` (issue #291) so the
- * foundation slice is a no-op rollback path; M6.1 flips it on with dormancy.
- * `ambient_gain` and `dormant_threshold` are part of the schema now but are not
- * consumed until M6.1.
+ * `weight` only decays/reinforces when `enabled = true`. M6.0 (#291) shipped
+ * `enabled = false` as a no-op rollback path; M6.1 (#292) flips the default on
+ * and consumes `dormant_threshold` to skip dormant chunks from ambient
+ * injection. `ambient_gain` (weak ambient reinforcement, RFC §10.1) is schema
+ * now, consumed in a follow-up.
  */
 export type DecayConfig = { 
 /**
@@ -26,10 +26,12 @@ factor: number,
  */
 reinforceGain: number, 
 /**
- * Weaker reinforcement for an ambient-only hit (schema now; consumed M6.1).
+ * Weaker reinforcement for an ambient-only hit (schema now; consumed in
+ * the ambient-reinforcement follow-up, RFC §10.1).
  */
 ambientGain: number, 
 /**
- * `weight` below this marks a chunk dormant (schema now; consumed M6.1).
+ * `weight` below this marks a chunk dormant — skipped from ambient
+ * injection while staying recallable (RFC 0007 §M6.1).
  */
 dormantThreshold: number, };

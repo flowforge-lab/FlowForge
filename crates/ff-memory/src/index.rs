@@ -221,7 +221,7 @@ impl Fts5Index {
     ///   reinforce, bump `access_count`, stamp `now_ms`.
     /// - **existing, decay disabled**: record the access (count + timestamp) but
     ///   leave `weight` untouched -- behaviour is byte-identical to M5.
-    fn reinforce_at(&self, hits: &[ScoredChunk], now_ms: i64) -> Result<()> {
+    pub(crate) fn reinforce_at(&self, hits: &[ScoredChunk], now_ms: i64) -> Result<()> {
         if hits.is_empty() {
             return Ok(());
         }
@@ -912,6 +912,13 @@ mod tests {
         }
     }
 
+    fn disabled_decay() -> DecayConfig {
+        DecayConfig {
+            enabled: false,
+            ..DecayConfig::default()
+        }
+    }
+
     #[test]
     fn decay_lazy_equals_repeated_daily() {
         let f = 0.98_f32;
@@ -975,8 +982,11 @@ mod tests {
 
     #[test]
     fn disabled_records_stats_but_never_decays() {
-        // Decay disabled (the M6.0 default): access is recorded but weight is frozen.
-        let idx = Fts5Index::open_in_memory().unwrap();
+        // Decay explicitly disabled (the M5 rollback path): access is recorded but
+        // weight is frozen.
+        let idx = Fts5Index::open_in_memory()
+            .unwrap()
+            .with_decay(disabled_decay());
         let cs = chunks("## H\nalpha body", "MEMORY.md");
         idx.reindex(&cs).unwrap();
         let hits = scored(&cs);
@@ -1116,7 +1126,9 @@ mod tests {
 
     #[test]
     fn effective_stats_empty_when_decay_disabled() {
-        let idx = Fts5Index::open_in_memory().unwrap();
+        let idx = Fts5Index::open_in_memory()
+            .unwrap()
+            .with_decay(disabled_decay());
         let cs = chunks("## H\nalpha body", "MEMORY.md");
         idx.reindex(&cs).unwrap();
         idx.reinforce_at(&scored(&cs), 0).unwrap();
@@ -1150,7 +1162,9 @@ mod tests {
 
     #[test]
     fn search_weight_stays_one_when_decay_disabled() {
-        let idx = Fts5Index::open_in_memory().unwrap();
+        let idx = Fts5Index::open_in_memory()
+            .unwrap()
+            .with_decay(disabled_decay());
         let cs = chunks("## Prefs\nuser prefers rust", "MEMORY.md");
         idx.reindex(&cs).unwrap();
         idx.reinforce_at(&scored(&cs), 0).unwrap();
