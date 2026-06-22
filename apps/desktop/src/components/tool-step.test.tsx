@@ -150,3 +150,53 @@ describe("ToolStepBlock — four-option approval (#229)", () => {
     expect(container.textContent).toContain("always");
   });
 });
+
+describe("ToolStepBlock — output (#331)", () => {
+  function doneStep(over: Partial<ToolStep> = {}): ToolStep {
+    return {
+      callId: "c1",
+      tool: "bash",
+      args: {},
+      status: "done",
+      result: "all good",
+      ...over,
+    };
+  }
+
+  /** Expand the collapsed-by-default step to reveal its body. */
+  function expandStep() {
+    click(container.querySelector("button"));
+  }
+
+  it("renders settled output neutral (not red)", () => {
+    render(
+      <ToolStepBlock
+        step={doneStep()}
+        onRespond={vi.fn()}
+        onApproveSession={vi.fn()}
+        onApproveAlways={vi.fn()}
+      />,
+    );
+    expandStep();
+    // The OutputBlock <pre> (max-h-64), not the args <pre> above it.
+    const pre = container.querySelector("pre.max-h-64");
+    expect(pre?.textContent).toBe("all good");
+    expect(pre?.className).toContain("text-foreground/90");
+    expect(pre?.className).not.toContain("text-destructive");
+  });
+
+  it("colors a failed step's output destructive", () => {
+    render(
+      <ToolStepBlock
+        step={doneStep({ status: "error", result: "boom" })}
+        onRespond={vi.fn()}
+        onApproveSession={vi.fn()}
+        onApproveAlways={vi.fn()}
+      />,
+    );
+    expandStep();
+    expect(container.querySelector("pre.max-h-64")?.className).toContain(
+      "text-destructive",
+    );
+  });
+});

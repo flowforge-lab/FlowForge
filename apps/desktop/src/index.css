@@ -232,7 +232,7 @@ body {
 /* --- Assistant Markdown prose (components/markdown.tsx) --- */
 
 .ff-prose {
-  font-size: 13px;
+  font-size: 14px;
   line-height: 1.6;
 }
 /* Collapse outer margins so a bubble doesn't gain stray top/bottom space. */

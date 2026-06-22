@@ -5,7 +5,6 @@ import {
   CornerDownLeft,
   Loader2,
   MessageCircleQuestion,
-  PanelRight,
   ShieldAlert,
   X,
 } from "lucide-react";
@@ -19,7 +18,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 import type { ToolStep } from "@/store/chat";
-import { useSplitStore } from "@/store/split";
+import { OutputBlock } from "@/components/output-block";
 
 function StatusIcon({ status }: { status: ToolStep["status"] }) {
   if (status === "running") {
@@ -152,7 +151,6 @@ export function ToolStepBlock({
   // honor the manual toggle.
   const open =
     awaiting || asking || (todoItems !== null ? !userToggled : userToggled);
-  const openInSplit = useSplitStore((s) => s.openInSplit);
   const args = formatArgs(step.args);
   const mcp = parseMcpToolName(step.tool);
   const description = describeStep(step);
@@ -167,7 +165,7 @@ export function ToolStepBlock({
   return (
     <div
       className={cn(
-        "rounded-md border bg-muted/40 font-mono text-xs",
+        "rounded-md border bg-muted/40 font-mono text-[11px]",
         awaiting && "border-amber-500/40 bg-amber-500/5",
         asking && "border-sky-500/40 bg-sky-500/5",
       )}
@@ -267,38 +265,11 @@ export function ToolStepBlock({
             </div>
           )}
           {step.result !== undefined && (
-            <div>
-              <div className="mb-0.5 flex items-center justify-between">
-                <span className="text-[10px] uppercase tracking-wide text-muted-foreground/60">
-                  output
-                </span>
-                <button
-                  type="button"
-                  onClick={() =>
-                    openInSplit({
-                      kind: "text",
-                      text: step.result ?? "",
-                      title: step.tool,
-                    })
-                  }
-                  title="Open in split"
-                  className="flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] text-muted-foreground/80 transition-colors hover:bg-foreground/10 hover:text-foreground"
-                >
-                  <PanelRight className="size-3" />
-                  Split
-                </button>
-              </div>
-              <pre
-                className={cn(
-                  "max-h-64 overflow-auto whitespace-pre-wrap break-words",
-                  step.status === "error"
-                    ? "text-destructive"
-                    : "text-foreground/90",
-                )}
-              >
-                {step.result}
-              </pre>
-            </div>
+            <OutputBlock
+              output={step.result}
+              title={step.tool}
+              error={step.status === "error"}
+            />
           )}
         </div>
       )}

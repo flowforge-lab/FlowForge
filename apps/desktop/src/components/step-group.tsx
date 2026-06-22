@@ -71,7 +71,7 @@ export function StepGroup({
   });
 
   return (
-    <div className="w-full font-mono text-xs">
+    <div className="w-full font-mono text-[11px]">
       <button
         type="button"
         aria-expanded={open}
