@@ -177,25 +177,12 @@ fn parse_sse_line(line: &[u8]) -> Option<Result<Chunk, LlmError>> {
     }
 }
 
-/// Whitelisted image media types an OpenAI-compatible vision model accepts as a
-/// data URI. `supports_vision` being true doesn't guarantee every format is taken
-/// (trust-boundary, #334), so an unrecognized type is skipped rather than sent.
-fn openai_image_media_type(media_type: &str) -> Option<&'static str> {
-    match media_type.trim().to_ascii_lowercase().as_str() {
-        "image/png" => Some("image/png"),
-        "image/jpeg" | "image/jpg" => Some("image/jpeg"),
-        "image/gif" => Some("image/gif"),
-        "image/webp" => Some("image/webp"),
-        _ => None,
-    }
-}
-
 /// Build an `image_url` data URI (`data:<media_type>;base64,<b64>`) for one image
 /// attachment, or `None` (with a warning) when it can't be sent: an unsupported
 /// media type, an unreadable file, or undecodable inline data. Skipping rather than
 /// failing keeps one bad attachment from dropping the whole turn.
 fn image_data_uri(a: &ff_core::Attachment) -> Option<String> {
-    let Some(media_type) = openai_image_media_type(&a.media_type) else {
+    let Some(media_type) = crate::image_media_type(&a.media_type) else {
         tracing::warn!(media_type = %a.media_type, "skipping image attachment: unsupported media type for OpenAI");
         return None;
     };
