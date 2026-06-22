@@ -328,7 +328,7 @@ fn to_converse(messages: &[ChatMessage]) -> (Vec<SystemContentBlock>, Vec<Messag
         let (role, blocks) = match msg.role.as_str() {
             "tool" => (ConversationRole::User, tool_result_blocks(msg)),
             "assistant" => (ConversationRole::Assistant, assistant_blocks(msg)),
-            _ => (ConversationRole::User, text_blocks(msg)),
+            _ => (ConversationRole::User, user_blocks(msg)),
         };
         if blocks.is_empty() {
             continue;
@@ -439,14 +439,21 @@ fn synthetic_tool_result(id: String) -> ContentBlock {
 }
 
 fn text_blocks(msg: &ChatMessage) -> Vec<ContentBlock> {
-    let mut blocks = match &msg.content {
+    match &msg.content {
         Some(text) if !text.is_empty() => vec![ContentBlock::Text(text.clone())],
         _ => vec![],
-    };
-    // Append a native image/document block per attachment (#332, #335). Each block
-    // is built independently so one bad attachment can be skipped without losing
-    // the rest of the turn; an attachment-only message therefore still yields a
-    // non-empty Vec and is not dropped by `to_converse`s `is_empty` guard.
+    }
+}
+
+/// Blocks for a user turn: the text block (if any) followed by a native
+/// image/document block per attachment (#332, #335). Each attachment block is built
+/// independently so one bad attachment is skipped without losing the rest of the
+/// turn; an attachment-only message therefore still yields a non-empty Vec and is
+/// not dropped by `to_converse`s `is_empty` guard. Attachments are a user-message
+/// concept (and Bedrock only accepts image/document blocks on user turns), so this
+/// lives apart from `text_blocks` -- the assistant path stays image-free.
+fn user_blocks(msg: &ChatMessage) -> Vec<ContentBlock> {
+    let mut blocks = text_blocks(msg);
     let mut doc_names: Vec<String> = Vec::new();
     blocks.extend(
         msg.attachments
@@ -1368,5 +1375,32 @@ mod tests {
             ContentBlock::Text(t) => assert_eq!(t, "plain turn"),
             other => panic!("expected text block, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn assistant_message_with_attachments_emits_no_image_block() {
+        // Attachments are a user-turn concept and Bedrock rejects image/document
+        // blocks on an assistant message. Guard that the assistant path stays
+        // image-free even if a message is constructed with attachments.
+        let msg = ChatMessage::multimodal(
+            "assistant",
+            "here you go",
+            vec![Attachment {
+                kind: ff_core::AttachmentKind::Image,
+                media_type: "image/png".into(),
+                source: AttachmentSource::Inline(inline_b64(&[0x89, 0x50, 0x4e, 0x47])),
+                name: None,
+                bytes: 4,
+            }],
+        );
+        let (_, messages) = to_converse(&[msg]);
+        assert_eq!(messages.len(), 1);
+        assert!(
+            messages[0]
+                .content
+                .iter()
+                .all(|b| !matches!(b, ContentBlock::Image(_) | ContentBlock::Document(_))),
+            "assistant turn must not carry image/document blocks"
+        );
     }
 }
