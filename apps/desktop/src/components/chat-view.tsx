@@ -4,6 +4,7 @@ import { cn } from "@/lib/utils";
 import { useChatStore } from "@/store/chat";
 import type { ToolStep } from "@/store/chat";
 import { ToolStepBlock } from "@/components/tool-step";
+import { OutputBlock } from "@/components/output-block";
 import { StepGroup } from "@/components/step-group";
 import { ThinkingBlock } from "@/components/thinking-block";
 import { Markdown } from "@/components/markdown";
@@ -78,13 +79,15 @@ function MessageRowImpl({
     );
   }
 
+  // Persisted tool/system rows on session reload (#331). Render through the same
+  // collapsible OutputBlock as a live step so reloaded output looks and folds
+  // identically — neutral, not the old red dump. A persisted Message carries no
+  // status, so there's no error signal here; red is reserved for the live step
+  // path (where `status` exists).
   if (message.role === "system" || message.role === "tool") {
     return (
-      <div
-        data-selectable
-        className="whitespace-pre-wrap rounded-md border border-destructive/30 bg-destructive/10 px-3 py-1.5 font-mono text-xs leading-relaxed text-muted-foreground"
-      >
-        {message.content}
+      <div className="w-full max-w-[80%] rounded-md border bg-muted/40 px-2.5 py-1.5 font-mono text-[11px] leading-relaxed">
+        <OutputBlock output={message.content} title="tool output" />
       </div>
     );
   }
@@ -136,7 +139,7 @@ function MessageRowImpl({
           <div
             data-selectable
             className={cn(
-              "px-0.5 py-1 text-[13px] leading-relaxed text-foreground",
+              "px-0.5 py-1 text-sm leading-relaxed text-foreground",
               streaming && "ff-streaming-caret",
             )}
           >
