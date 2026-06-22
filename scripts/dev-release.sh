@@ -29,7 +29,7 @@ if [[ "$(uname)" != "Darwin" ]]; then
   exit 1
 fi
 if [[ -z "${TAURI_SIGNING_PRIVATE_KEY:-}" ]]; then
-  echo "TAURI_SIGNING_PRIVATE_KEY is not set; the updater artifact will be unsigned." >&2
+  echo "TAURI_SIGNING_PRIVATE_KEY is not set; aborting (the updater artifact must be signed)." >&2
   echo "Export the minisign key (and _PASSWORD) before running, e.g. from ~/.tauri." >&2
   exit 1
 fi
