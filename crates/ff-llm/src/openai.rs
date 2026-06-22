@@ -241,6 +241,12 @@ impl Provider for OpenAiProvider {
     /// local server returns its catalog. Zero token cost, and the lightest call
     /// that exercises both the URL and the credentials -- so the settings "Test
     /// Connection" button means something for every OpenAI-compatible backend.
+    ///
+    /// Unlike `BedrockProvider::test_connection`, which fires a chat round-trip
+    /// because a Bedrock token may be allowed to converse yet lack
+    /// `bedrock:ListInferenceProfiles`, an OpenAI-compatible key gates `/models`
+    /// and `/chat/completions` identically -- so `list_models` is a valid
+    /// auth + reachability probe with no token cost, and no chat probe is needed.
     async fn test_connection(&self, _model: &str) -> Result<(), LlmError> {
         self.list_models().await.map(|_| ())
     }
@@ -331,5 +337,97 @@ mod tests {
             args.is_string(),
             "OpenAI arguments must stay a string, got {args}"
         );
+    }
+
+    // ---- #311 PR-3a: list_models / test_connection probe (HTTP-level) ----
+
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn models_body(ids: &[&str]) -> serde_json::Value {
+        serde_json::json!({ "data": ids.iter().map(|id| serde_json::json!({ "id": id })).collect::<Vec<_>>() })
+    }
+
+    #[tokio::test]
+    async fn test_connection_ok_on_reachable_endpoint() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(models_body(&["gpt-4o"])))
+            .mount(&server)
+            .await;
+        let provider = OpenAiProvider::new(server.uri(), Some("sk-test".into()));
+        assert!(provider.test_connection("gpt-4o").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_connection_surfaces_401_on_bad_key() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&server)
+            .await;
+        let provider = OpenAiProvider::new(server.uri(), Some("sk-bad".into()));
+        match provider.test_connection("gpt-4o").await {
+            Err(LlmError::Api { status, .. }) => assert_eq!(status, 401),
+            other => panic!("expected Api 401, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_connection_surfaces_5xx() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        let provider = OpenAiProvider::new(server.uri(), Some("sk-test".into()));
+        match provider.test_connection("gpt-4o").await {
+            Err(LlmError::Api { status, .. }) => assert_eq!(status, 500),
+            other => panic!("expected Api 500, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_connection_ok_on_empty_catalog() {
+        // Reachable + authenticated, but the server lists no models. A bare 200 is
+        // still a successful probe -- the credential and URL are valid.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(models_body(&[])))
+            .mount(&server)
+            .await;
+        let provider = OpenAiProvider::new(server.uri(), Some("sk-test".into()));
+        assert!(provider.test_connection("gpt-4o").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn list_models_parses_ids() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(models_body(&["a", "b"])))
+            .mount(&server)
+            .await;
+        let provider = OpenAiProvider::new(server.uri(), None);
+        assert_eq!(provider.list_models().await.unwrap(), vec!["a", "b"]);
+    }
+
+    #[tokio::test]
+    async fn list_models_sends_bearer_when_key_present() {
+        // The mock only matches when the Authorization header carries the key, so a
+        // pass proves the bearer is plumbed onto the request.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .and(header("authorization", "Bearer sk-plumbed"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(models_body(&["gpt-4o"])))
+            .mount(&server)
+            .await;
+        let provider = OpenAiProvider::new(server.uri(), Some("sk-plumbed".into()));
+        assert!(provider.test_connection("gpt-4o").await.is_ok());
     }
 }
