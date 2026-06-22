@@ -12,13 +12,18 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use chrono::NaiveDate;
-use rusqlite::{params, Connection};
+use chrono::{NaiveDate, Utc};
+use rusqlite::{params, Connection, OptionalExtension};
 
+use crate::consolidate::chunk_key;
 use crate::embed::Embedder;
 
 use crate::error::Result;
-use crate::{MemoryChunk, MemorySource};
+use crate::{DecayConfig, MemoryChunk, MemorySource};
+
+/// Milliseconds in a day, for converting `last_accessed` deltas to fractional
+/// decay days (RFC 0007 §2).
+const ONE_DAY_MS: f32 = 86_400_000.0;
 
 /// A search hit: the chunk plus a relevance score (higher = more relevant; it is
 /// the negated BM25 distance, so callers can sort descending intuitively).
@@ -40,12 +45,19 @@ pub trait MemoryIndex: Send + Sync {
     fn remove_path(&self, path: &Path) -> Result<()>;
     /// Ranked BM25 search. An empty/whitespace query yields no hits.
     fn search(&self, query: &str, k: usize) -> Result<Vec<ScoredChunk>>;
+    /// Reinforce usage stats for the surfaced top-k `hits` (RFC 0007 §2). The
+    /// default is a no-op so backends without a `chunk_stats` table (e.g. a null
+    /// index) need no change; [`Fts5Index`] overrides it.
+    fn reinforce(&self, _hits: &[ScoredChunk]) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// FTS5/BM25 index over a SQLite database. `open` on a path persists to disk;
 /// [`open_in_memory`](Self::open_in_memory) is for tests.
 pub struct Fts5Index {
     conn: Mutex<Connection>,
+    decay: DecayConfig,
 }
 
 impl Fts5Index {
@@ -92,12 +104,26 @@ impl Fts5Index {
                  INSERT INTO chunks_fts(chunks_fts, rowid, text)
                      VALUES('delete', old.id, old.text);
                  INSERT INTO chunks_fts(rowid, text) VALUES (new.id, new.text);
-             END;",
+             END;
+             CREATE TABLE IF NOT EXISTS chunk_stats (
+                 chunk_key     TEXT PRIMARY KEY,
+                 weight        REAL    NOT NULL DEFAULT 1.0,
+                 last_accessed INTEGER NOT NULL,
+                 access_count  INTEGER NOT NULL DEFAULT 0
+             );",
         )?;
         Self::ensure_embedding_column(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
+            decay: DecayConfig::default(),
         })
+    }
+
+    /// Attach decay configuration (RFC 0007 §5). Builder so existing call sites
+    /// and tests keep the disabled-by-default behaviour.
+    pub fn with_decay(mut self, decay: DecayConfig) -> Self {
+        self.decay = decay;
+        self
     }
 
     /// Back-fill the `embedding` column on indexes created before M5.3.0 (#196).
@@ -158,6 +184,60 @@ impl Fts5Index {
         }
         Ok(out)
     }
+
+    /// Reinforce `hits` against `now_ms` (RFC 0007 §2). Split from the trait
+    /// method so tests can inject a deterministic clock. For each hit, looks up
+    /// the `chunk_stats` row by stable [`chunk_key`]:
+    /// - **new key**: insert at `weight = 1.0`, `access_count = 1`.
+    /// - **existing, decay enabled**: lazily decay from `last_accessed`, then
+    ///   reinforce, bump `access_count`, stamp `now_ms`.
+    /// - **existing, decay disabled**: record the access (count + timestamp) but
+    ///   leave `weight` untouched -- behaviour is byte-identical to M5.
+    fn reinforce_at(&self, hits: &[ScoredChunk], now_ms: i64) -> Result<()> {
+        if hits.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        {
+            let mut sel = tx.prepare(
+                "SELECT weight, last_accessed, access_count
+                 FROM chunk_stats WHERE chunk_key = ?1",
+            )?;
+            let mut up = tx.prepare(
+                "INSERT INTO chunk_stats (chunk_key, weight, last_accessed, access_count)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(chunk_key) DO UPDATE SET
+                     weight = ?2, last_accessed = ?3, access_count = ?4",
+            )?;
+            for hit in hits {
+                let key = chunk_key(&hit.chunk);
+                let existing: Option<(f64, i64, i64)> = sel
+                    .query_row(params![key], |row| {
+                        Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                    })
+                    .optional()?;
+                let (weight, count) = match existing {
+                    None => (1.0_f32, 1_i64),
+                    Some((w, last, c)) => {
+                        let w = w as f32;
+                        let new_w = if self.decay.enabled {
+                            reinforced_weight(
+                                decayed_weight(w, last, now_ms, self.decay.factor),
+                                self.decay.reinforce_gain,
+                            )
+                        } else {
+                            w
+                        };
+                        (new_w, c + 1)
+                    }
+                };
+                up.execute(params![key, weight as f64, now_ms, count])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
 }
 
 impl MemoryIndex for Fts5Index {
@@ -166,6 +246,28 @@ impl MemoryIndex for Fts5Index {
         let tx = conn.transaction()?;
         tx.execute("DELETE FROM chunks", [])?;
         Self::insert_chunks(&tx, chunks)?;
+        // Orphan sweep (RFC 0007 §4): a full rebuild knows the complete keyset, so
+        // drop stats whose chunk no longer exists. Stats for surviving keys are
+        // kept untouched -- chunk_key is stable across reindex, so the row re-joins
+        // by key with no work. (reindex_path is partial and cannot sweep globally;
+        // the next full reindex reconciles.)
+        let keys: Vec<String> = chunks.iter().map(chunk_key).collect();
+        if keys.is_empty() {
+            tx.execute("DELETE FROM chunk_stats", [])?;
+        } else {
+            tx.execute("CREATE TEMP TABLE valid_keys (k TEXT PRIMARY KEY)", [])?;
+            {
+                let mut stmt = tx.prepare("INSERT OR IGNORE INTO valid_keys (k) VALUES (?1)")?;
+                for k in &keys {
+                    stmt.execute(params![k])?;
+                }
+            }
+            tx.execute(
+                "DELETE FROM chunk_stats WHERE chunk_key NOT IN (SELECT k FROM valid_keys)",
+                [],
+            )?;
+            tx.execute("DROP TABLE valid_keys", [])?;
+        }
         tx.commit()?;
         Ok(())
     }
@@ -231,6 +333,24 @@ impl MemoryIndex for Fts5Index {
         }
         Ok(out)
     }
+
+    fn reinforce(&self, hits: &[ScoredChunk]) -> Result<()> {
+        self.reinforce_at(hits, Utc::now().timestamp_millis())
+    }
+}
+
+/// Lazy exponential decay (RFC 0007 §2): `weight * factor^days`, where `days` is
+/// the fractional idle days since `last_ms`. Path-independent -- one lazy
+/// application over N days equals N daily applications (`factor^(a+b) ==
+/// factor^a * factor^b`), so no per-day cron is needed.
+fn decayed_weight(weight: f32, last_ms: i64, now_ms: i64, factor: f32) -> f32 {
+    let days = ((now_ms - last_ms) as f32 / ONE_DAY_MS).max(0.0);
+    weight * factor.powf(days)
+}
+
+/// Hebbian reinforcement (RFC 0007 §2): bump `weight` toward 1.0, clamped.
+fn reinforced_weight(weight: f32, gain: f32) -> f32 {
+    (weight + gain * (1.0 - weight)).min(1.0)
 }
 
 fn source_to_str(source: &MemorySource) -> String {
@@ -306,6 +426,10 @@ impl<E: Embedder> MemoryIndex for HybridIndex<E> {
 
     fn remove_path(&self, path: &Path) -> Result<()> {
         self.inner.remove_path(path)
+    }
+
+    fn reinforce(&self, hits: &[ScoredChunk]) -> Result<()> {
+        self.inner.reinforce(hits)
     }
 
     fn search(&self, query: &str, k: usize) -> Result<Vec<ScoredChunk>> {
@@ -658,5 +782,173 @@ mod tests {
         let hits = idx.search("rust", 10).unwrap();
         assert_eq!(hits.len(), 1);
         assert!(hits[0].chunk.text.contains("rust"));
+    }
+
+    // ----- M6.0 chunk_stats foundation (RFC 0007) --------------------------
+
+    use crate::DecayConfig;
+
+    /// Read a `chunk_stats` row by key: `(weight, last_accessed, access_count)`.
+    fn read_stat(idx: &Fts5Index, key: &str) -> Option<(f32, i64, i64)> {
+        let conn = idx.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT weight, last_accessed, access_count FROM chunk_stats WHERE chunk_key = ?1",
+            params![key],
+            |r| Ok((r.get::<_, f64>(0)? as f32, r.get(1)?, r.get(2)?)),
+        )
+        .optional()
+        .unwrap()
+    }
+
+    fn scored(chunks: &[MemoryChunk]) -> Vec<ScoredChunk> {
+        chunks
+            .iter()
+            .map(|c| ScoredChunk {
+                chunk: c.clone(),
+                score: 0.0,
+            })
+            .collect()
+    }
+
+    fn enabled_decay() -> DecayConfig {
+        DecayConfig {
+            enabled: true,
+            ..DecayConfig::default()
+        }
+    }
+
+    #[test]
+    fn decay_lazy_equals_repeated_daily() {
+        let f = 0.98_f32;
+        let day = ONE_DAY_MS as i64;
+        let lazy = decayed_weight(1.0, 0, day * 10, f);
+        let mut step = 1.0_f32;
+        for _ in 0..10 {
+            step = decayed_weight(step, 0, day, f);
+        }
+        assert!((lazy - step).abs() < 1e-4, "lazy {lazy} vs daily {step}");
+    }
+
+    #[test]
+    fn reinforcement_clamps_at_one() {
+        let mut w = 0.2_f32;
+        for _ in 0..100 {
+            w = reinforced_weight(w, 0.3);
+            assert!(w <= 1.0 + f32::EPSILON, "weight escaped 1.0: {w}");
+        }
+        assert!((w - 1.0).abs() < 1e-3);
+        // A fresh fully-salient chunk stays put.
+        assert_eq!(reinforced_weight(1.0, 0.3), 1.0);
+    }
+
+    #[test]
+    fn reinforce_records_new_chunk_at_full_weight() {
+        let idx = Fts5Index::open_in_memory()
+            .unwrap()
+            .with_decay(enabled_decay());
+        let cs = chunks("## H\nalpha body", "MEMORY.md");
+        idx.reindex(&cs).unwrap();
+        idx.reinforce(&scored(&cs)).unwrap();
+        let key = chunk_key(&cs[0]);
+        let (w, _, count) = read_stat(&idx, &key).expect("stat row created");
+        assert_eq!(w, 1.0);
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn reinforce_decays_then_lifts_existing_weight() {
+        let decay = DecayConfig {
+            enabled: true,
+            factor: 0.5,
+            reinforce_gain: 0.3,
+            ..DecayConfig::default()
+        };
+        let idx = Fts5Index::open_in_memory().unwrap().with_decay(decay);
+        let cs = chunks("## H\nalpha body", "MEMORY.md");
+        idx.reindex(&cs).unwrap();
+        let hits = scored(&cs);
+        idx.reinforce_at(&hits, 0).unwrap();
+        // Two idle days later: decay 1.0 -> 0.25, reinforce -> 0.25 + 0.3*0.75 = 0.475.
+        let day = ONE_DAY_MS as i64;
+        idx.reinforce_at(&hits, day * 2).unwrap();
+        let key = chunk_key(&cs[0]);
+        let (w, last, count) = read_stat(&idx, &key).unwrap();
+        assert!((w - 0.475).abs() < 1e-4, "weight {w}");
+        assert_eq!(last, day * 2);
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn disabled_records_stats_but_never_decays() {
+        // Decay disabled (the M6.0 default): access is recorded but weight is frozen.
+        let idx = Fts5Index::open_in_memory().unwrap();
+        let cs = chunks("## H\nalpha body", "MEMORY.md");
+        idx.reindex(&cs).unwrap();
+        let hits = scored(&cs);
+        idx.reinforce_at(&hits, 0).unwrap();
+        let day = ONE_DAY_MS as i64;
+        idx.reinforce_at(&hits, day * 10).unwrap();
+        let key = chunk_key(&cs[0]);
+        let (w, last, count) = read_stat(&idx, &key).unwrap();
+        assert_eq!(w, 1.0, "weight must not decay when disabled");
+        assert_eq!(last, day * 10, "last_accessed is still recorded");
+        assert_eq!(count, 2, "access_count is still recorded");
+    }
+
+    #[test]
+    fn stats_survive_edit_and_reindex_under_stable_key() {
+        let idx = Fts5Index::open_in_memory()
+            .unwrap()
+            .with_decay(enabled_decay());
+        let cs = chunks("## H\nalpha body", "MEMORY.md");
+        idx.reindex(&cs).unwrap();
+        idx.reinforce(&scored(&cs)).unwrap();
+        let key = chunk_key(&cs[0]);
+        assert_eq!(read_stat(&idx, &key).unwrap().2, 1);
+
+        // Re-author the same fact with whitespace / line shifts: chunk_key is
+        // stable (consolidate.rs), so the row must survive the orphan sweep.
+        let edited = chunks("\n\n## H\nalpha body   \n\n", "MEMORY.md");
+        assert_eq!(
+            chunk_key(&edited[0]),
+            key,
+            "key must be stable across edits"
+        );
+        idx.reindex(&edited).unwrap();
+        idx.reinforce(&scored(&edited)).unwrap();
+        let (_, _, count) = read_stat(&idx, &key).expect("stat row survived reindex");
+        assert_eq!(count, 2, "row persisted, so access_count accumulated");
+    }
+
+    #[test]
+    fn reindex_sweeps_orphaned_stats() {
+        let idx = Fts5Index::open_in_memory()
+            .unwrap()
+            .with_decay(enabled_decay());
+        let cs = chunks("## H\nalpha body", "MEMORY.md");
+        idx.reindex(&cs).unwrap();
+        idx.reinforce(&scored(&cs)).unwrap();
+        let stale_key = chunk_key(&cs[0]);
+        assert!(read_stat(&idx, &stale_key).is_some());
+
+        // Replace with genuinely new content: the old key is orphaned and swept.
+        let fresh = chunks("## H\ncompletely different content", "MEMORY.md");
+        idx.reindex(&fresh).unwrap();
+        assert!(
+            read_stat(&idx, &stale_key).is_none(),
+            "orphan must be swept"
+        );
+    }
+
+    #[test]
+    fn empty_reindex_sweeps_all_stats() {
+        let idx = Fts5Index::open_in_memory()
+            .unwrap()
+            .with_decay(enabled_decay());
+        let cs = chunks("## H\nalpha body", "MEMORY.md");
+        idx.reindex(&cs).unwrap();
+        idx.reinforce(&scored(&cs)).unwrap();
+        idx.reindex(&[]).unwrap();
+        assert!(read_stat(&idx, &chunk_key(&cs[0])).is_none());
     }
 }
