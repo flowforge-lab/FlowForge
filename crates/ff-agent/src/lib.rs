@@ -298,6 +298,10 @@ pub(crate) fn to_chat(messages: &[Message]) -> Vec<ChatMessage> {
                 tool_call_id: m.tool_call_id.clone(),
                 name: None,
                 attachments: m.attachments.clone().unwrap_or_default(),
+                // Persisted reasoning from prior assistant turns (#375 PR-1).
+                // The provider re-injects it under the gateway's field name on
+                // tool-call turns; vanilla providers ignore it via the dialect.
+                reasoning: m.reasoning.clone(),
             }
         })
         .collect()
@@ -487,6 +491,7 @@ pub async fn run_turn(
                 name: None,
 
                 attachments: Vec::new(),
+                reasoning: None,
             });
         }
         messages.extend(to_chat(&history));
@@ -509,6 +514,7 @@ pub async fn run_turn(
                 name: None,
 
                 attachments: Vec::new(),
+                reasoning: None,
             });
         }
 
@@ -528,6 +534,7 @@ pub async fn run_turn(
                 name: None,
 
                 attachments: Vec::new(),
+                reasoning: None,
             });
         }
 
@@ -984,6 +991,31 @@ mod tests {
     use async_trait::async_trait;
     use ff_llm::{Chunk, ChunkStream, LlmError, ToolCallDelta};
     use std::sync::atomic::{AtomicBool, AtomicUsize};
+
+    #[test]
+    fn to_chat_carries_reasoning_from_persisted_message() {
+        // #375 PR-2: ff-agent must lift Message.reasoning into ChatMessage.reasoning
+        // so the OpenAI-compatible provider can re-inject it under the gateway's
+        // field name on the next tool-call turn.
+        let msg = ff_core::Message {
+            id: "m1".into(),
+            session_id: "s1".into(),
+            role: Role::Assistant,
+            content: String::new(),
+            tool_calls: Some(vec![ff_core::ToolCall {
+                id: "call_1".into(),
+                name: "search".into(),
+                arguments: "{}".into(),
+            }]),
+            tool_call_id: None,
+            attachments: None,
+            reasoning: Some("because A then B".into()),
+            created_at: 0,
+        };
+        let out = to_chat(std::slice::from_ref(&msg));
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].reasoning.as_deref(), Some("because A then B"));
+    }
 
     #[test]
     fn plan_mode_advertises_only_readonly_tools() {
