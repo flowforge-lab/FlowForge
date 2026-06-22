@@ -7,11 +7,14 @@
 use async_trait::async_trait;
 use aws_sdk_bedrockruntime::types::{
     ContentBlock, ContentBlockDelta, ContentBlockStart, ConversationRole, ConverseStreamOutput,
-    Message, ReasoningContentBlockDelta, SystemContentBlock, Tool, ToolConfiguration,
-    ToolInputSchema, ToolResultBlock, ToolResultContentBlock, ToolSpecification, ToolUseBlock,
+    DocumentBlock, DocumentFormat, DocumentSource, ImageBlock, ImageFormat, ImageSource, Message,
+    ReasoningContentBlockDelta, SystemContentBlock, Tool, ToolConfiguration, ToolInputSchema,
+    ToolResultBlock, ToolResultContentBlock, ToolSpecification, ToolUseBlock,
 };
 use aws_sdk_bedrockruntime::Client;
-use aws_smithy_types::{Document, Number};
+use aws_smithy_types::{Blob, Document, Number};
+use base64::Engine as _;
+use ff_core::{Attachment, AttachmentSource};
 use futures_util::stream::{self, StreamExt};
 
 use crate::{ChatMessage, ChatRequest, Chunk, ChunkStream, LlmError, Provider, ToolCallDelta};
@@ -434,10 +437,164 @@ fn synthetic_tool_result(id: String) -> ContentBlock {
 }
 
 fn text_blocks(msg: &ChatMessage) -> Vec<ContentBlock> {
-    match &msg.content {
+    let mut blocks = match &msg.content {
         Some(text) if !text.is_empty() => vec![ContentBlock::Text(text.clone())],
         _ => vec![],
+    };
+    // Append a native image/document block per attachment (#332, #335). Each block
+    // is built independently so one bad attachment can be skipped without losing
+    // the rest of the turn; an attachment-only message therefore still yields a
+    // non-empty Vec and is not dropped by `to_converse`s `is_empty` guard.
+    let mut doc_names: Vec<String> = Vec::new();
+    blocks.extend(
+        msg.attachments
+            .iter()
+            .filter_map(|a| attachment_block(a, &mut doc_names)),
+    );
+    blocks
+}
+
+/// Materialize an attachment's raw bytes: read a `Path` from disk, or base64-decode
+/// an `Inline` payload. Returns the bytes as Bedrock's sources take raw bytes (the
+/// SDK base64-encodes on the wire); other providers re-encode in their own tickets.
+fn attachment_bytes(a: &Attachment) -> Result<Vec<u8>, String> {
+    match &a.source {
+        AttachmentSource::Path(path) => {
+            std::fs::read(path).map_err(|e| format!("read {path}: {e}"))
+        }
+        AttachmentSource::Inline(b64) => base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .map_err(|e| format!("decode inline base64: {e}")),
     }
+}
+
+/// Map an IANA media type to a Bedrock [`ImageFormat`]. Bedrock accepts only this
+/// fixed allowlist, so an unrecognized type yields `None` and the caller skips the
+/// attachment rather than emitting a block Bedrock would reject (trust-boundary:
+/// `supportsVision` does not guarantee every format is accepted, #334).
+fn image_format(media_type: &str) -> Option<ImageFormat> {
+    match media_type.trim().to_ascii_lowercase().as_str() {
+        "image/png" => Some(ImageFormat::Png),
+        "image/jpeg" | "image/jpg" => Some(ImageFormat::Jpeg),
+        "image/gif" => Some(ImageFormat::Gif),
+        "image/webp" => Some(ImageFormat::Webp),
+        _ => None,
+    }
+}
+
+/// Map an IANA media type (falling back to the file-name extension) to a Bedrock
+/// [`DocumentFormat`]. Same fixed-allowlist discipline as [`image_format`].
+fn document_format(media_type: &str, name: Option<&str>) -> Option<DocumentFormat> {
+    let by_media = match media_type.trim().to_ascii_lowercase().as_str() {
+        "text/csv" => Some(DocumentFormat::Csv),
+        "application/msword" => Some(DocumentFormat::Doc),
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document" => {
+            Some(DocumentFormat::Docx)
+        }
+        "text/html" => Some(DocumentFormat::Html),
+        "text/markdown" => Some(DocumentFormat::Md),
+        "application/pdf" => Some(DocumentFormat::Pdf),
+        "text/plain" => Some(DocumentFormat::Txt),
+        "application/vnd.ms-excel" => Some(DocumentFormat::Xls),
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" => {
+            Some(DocumentFormat::Xlsx)
+        }
+        _ => None,
+    };
+    by_media.or_else(|| {
+        let ext = name?.rsplit_once('.')?.1.to_ascii_lowercase();
+        match ext.as_str() {
+            "csv" => Some(DocumentFormat::Csv),
+            "doc" => Some(DocumentFormat::Doc),
+            "docx" => Some(DocumentFormat::Docx),
+            "html" | "htm" => Some(DocumentFormat::Html),
+            "md" | "markdown" => Some(DocumentFormat::Md),
+            "pdf" => Some(DocumentFormat::Pdf),
+            "txt" => Some(DocumentFormat::Txt),
+            "xls" => Some(DocumentFormat::Xls),
+            "xlsx" => Some(DocumentFormat::Xlsx),
+            _ => None,
+        }
+    })
+}
+
+/// Bedrock requires a document `name` drawn from a restricted charset (alphanumerics,
+/// whitespace, hyphens, parentheses, square brackets). Sanitize the original name,
+/// collapsing every other character to a space, and fall back to "document" when
+/// nothing usable remains. Uniqueness within a message is enforced by the caller.
+fn sanitize_document_name(name: Option<&str>) -> String {
+    let cleaned: String = name
+        .unwrap_or("")
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, ' ' | '-' | '(' | ')' | '[' | ']') {
+                c
+            } else {
+                ' '
+            }
+        })
+        .collect();
+    let trimmed = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
+    if trimmed.is_empty() {
+        "document".to_string()
+    } else {
+        trimmed
+    }
+}
+
+/// Build a Converse content block for one attachment, or `None` (with a warning) when
+/// it cannot be sent: an unsupported media type, an unreadable file, or undecodable
+/// inline data. Skipping rather than failing keeps one bad file from dropping the
+/// whole turn. `doc_names` tracks names already used in this message so duplicates get
+/// a `-2`, `-3`, ... suffix (Bedrock requires distinct document names).
+fn attachment_block(a: &Attachment, doc_names: &mut Vec<String>) -> Option<ContentBlock> {
+    match a.kind {
+        ff_core::AttachmentKind::Image => {
+            let Some(format) = image_format(&a.media_type) else {
+                tracing::warn!(media_type = %a.media_type, "skipping image attachment: unsupported media type for Bedrock");
+                return None;
+            };
+            let bytes = attachment_bytes(a)
+                .map_err(|e| tracing::warn!(error = %e, "skipping image attachment"))
+                .ok()?;
+            let block = ImageBlock::builder()
+                .format(format)
+                .source(ImageSource::Bytes(Blob::new(bytes)))
+                .build()
+                .ok()?;
+            Some(ContentBlock::Image(block))
+        }
+        ff_core::AttachmentKind::Document => {
+            let Some(format) = document_format(&a.media_type, a.name.as_deref()) else {
+                tracing::warn!(media_type = %a.media_type, "skipping document attachment: unsupported media type for Bedrock");
+                return None;
+            };
+            let bytes = attachment_bytes(a)
+                .map_err(|e| tracing::warn!(error = %e, "skipping document attachment"))
+                .ok()?;
+            let name = unique_document_name(sanitize_document_name(a.name.as_deref()), doc_names);
+            let block = DocumentBlock::builder()
+                .format(format)
+                .name(name)
+                .source(DocumentSource::Bytes(Blob::new(bytes)))
+                .build()
+                .ok()?;
+            Some(ContentBlock::Document(block))
+        }
+    }
+}
+
+/// Return a name not already present in `used`, appending `-2`, `-3`, ... on collision,
+/// and record the chosen name. Bedrock rejects duplicate document names in a message.
+fn unique_document_name(base: String, used: &mut Vec<String>) -> String {
+    let mut candidate = base.clone();
+    let mut n = 2;
+    while used.contains(&candidate) {
+        candidate = format!("{base}-{n}");
+        n += 1;
+    }
+    used.push(candidate.clone());
+    candidate
 }
 
 fn assistant_blocks(msg: &ChatMessage) -> Vec<ContentBlock> {
@@ -1061,5 +1218,165 @@ mod tests {
                 session_token: None,
             },
         );
+    }
+
+    fn inline_b64(bytes: &[u8]) -> String {
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    }
+
+    fn image_msg(media_type: &str, source: AttachmentSource) -> ChatMessage {
+        ChatMessage::multimodal(
+            "user",
+            "look at this",
+            vec![Attachment {
+                kind: ff_core::AttachmentKind::Image,
+                media_type: media_type.into(),
+                source,
+                name: Some("shot.png".into()),
+                bytes: 4,
+            }],
+        )
+    }
+
+    #[test]
+    fn multimodal_user_message_carries_image_block() {
+        let msg = image_msg(
+            "image/png",
+            AttachmentSource::Inline(inline_b64(&[0x89, 0x50, 0x4e, 0x47])),
+        );
+        let (_, messages) = to_converse(&[msg]);
+        assert_eq!(messages.len(), 1);
+        let content = &messages[0].content;
+        assert_eq!(content.len(), 2, "text block then image block");
+        assert!(matches!(content[0], ContentBlock::Text(_)));
+        match &content[1] {
+            ContentBlock::Image(img) => assert_eq!(img.format, ImageFormat::Png),
+            other => panic!("expected image block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn document_attachment_maps_to_document_block_with_sanitized_name() {
+        let msg = ChatMessage::multimodal(
+            "user",
+            "summarize",
+            vec![Attachment {
+                kind: ff_core::AttachmentKind::Document,
+                media_type: "application/pdf".into(),
+                source: AttachmentSource::Inline(inline_b64(b"%PDF-1.4")),
+                name: Some("Q3 report (final)/v2.pdf".into()),
+                bytes: 8,
+            }],
+        );
+        let (_, messages) = to_converse(&[msg]);
+        match &messages[0].content[1] {
+            ContentBlock::Document(doc) => {
+                assert_eq!(doc.format, DocumentFormat::Pdf);
+                assert_eq!(doc.name, "Q3 report (final) v2 pdf");
+            }
+            other => panic!("expected document block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn multiple_unnamed_documents_get_unique_names() {
+        let doc = |src: &str| Attachment {
+            kind: ff_core::AttachmentKind::Document,
+            media_type: "application/pdf".into(),
+            source: AttachmentSource::Inline(inline_b64(src.as_bytes())),
+            name: None,
+            bytes: src.len() as u64,
+        };
+        let msg = ChatMessage::multimodal("user", "", vec![doc("a"), doc("b")]);
+        let (_, messages) = to_converse(&[msg]);
+        let names: Vec<&str> = messages[0]
+            .content
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::Document(d) => Some(d.name.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(names, vec!["document", "document-2"]);
+    }
+
+    #[test]
+    fn image_only_message_is_not_dropped() {
+        let msg = ChatMessage::multimodal(
+            "user",
+            "",
+            vec![Attachment {
+                kind: ff_core::AttachmentKind::Image,
+                media_type: "image/jpeg".into(),
+                source: AttachmentSource::Inline(inline_b64(&[0xff, 0xd8, 0xff])),
+                name: None,
+                bytes: 3,
+            }],
+        );
+        let (_, messages) = to_converse(&[msg]);
+        assert_eq!(messages.len(), 1, "image-only turn must not be dropped");
+        assert_eq!(messages[0].content.len(), 1);
+        assert!(matches!(messages[0].content[0], ContentBlock::Image(_)));
+    }
+
+    #[test]
+    fn unsupported_media_type_is_skipped() {
+        let msg = image_msg(
+            "image/svg+xml",
+            AttachmentSource::Inline(inline_b64(b"<svg/>")),
+        );
+        let (_, messages) = to_converse(&[msg]);
+        assert_eq!(messages.len(), 1, "turn still sent");
+        assert_eq!(messages[0].content.len(), 1, "only the text block remains");
+        assert!(matches!(messages[0].content[0], ContentBlock::Text(_)));
+    }
+
+    #[test]
+    fn unreadable_path_attachment_is_skipped() {
+        let msg = image_msg(
+            "image/png",
+            AttachmentSource::Path("/nonexistent/flowforge/does-not-exist.png".into()),
+        );
+        let (_, messages) = to_converse(&[msg]);
+        assert_eq!(messages[0].content.len(), 1, "unreadable file dropped");
+        assert!(matches!(messages[0].content[0], ContentBlock::Text(_)));
+    }
+
+    #[test]
+    fn undecodable_inline_base64_is_skipped() {
+        let msg = image_msg("image/png", AttachmentSource::Inline("not!base64!".into()));
+        let (_, messages) = to_converse(&[msg]);
+        assert_eq!(messages[0].content.len(), 1, "bad base64 dropped");
+    }
+
+    #[test]
+    fn document_format_falls_back_to_extension() {
+        let msg = ChatMessage::multimodal(
+            "user",
+            "",
+            vec![Attachment {
+                kind: ff_core::AttachmentKind::Document,
+                media_type: "application/octet-stream".into(),
+                source: AttachmentSource::Inline(inline_b64(b"col1,col2")),
+                name: Some("data.csv".into()),
+                bytes: 9,
+            }],
+        );
+        let (_, messages) = to_converse(&[msg]);
+        match &messages[0].content[0] {
+            ContentBlock::Document(d) => assert_eq!(d.format, DocumentFormat::Csv),
+            other => panic!("expected document block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn text_only_message_is_unchanged() {
+        let (_, messages) = to_converse(&[ChatMessage::text("user", "plain turn")]);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].content.len(), 1);
+        match &messages[0].content[0] {
+            ContentBlock::Text(t) => assert_eq!(t, "plain turn"),
+            other => panic!("expected text block, got {other:?}"),
+        }
     }
 }
