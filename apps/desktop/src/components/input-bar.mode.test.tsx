@@ -1,27 +1,50 @@
 // @vitest-environment jsdom
 
+import { cleanup, render, screen, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import {
-  cleanup,
-  fireEvent,
-  render,
-  screen,
-  within,
-} from "@testing-library/react";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { ModePill } from "@/components/input-bar";
+  afterEach,
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  it,
+  vi,
+} from "vitest";
+import { InputBar, ModePill } from "@/components/input-bar";
+import { ipc } from "@/lib/ipc";
+import { useChatStore } from "@/store/chat";
+import { useComposerStore } from "@/store/composer";
 import { usePrefsStore } from "@/store/prefs";
 import { useSessionModeStore } from "@/store/session-mode";
+import type { Message } from "@/bindings";
 
-function label(testId: string): string {
+// Radix DropdownMenu calls these pointer/scroll APIs that jsdom doesn't implement.
+beforeAll(() => {
+  const proto = Element.prototype as unknown as Record<string, unknown>;
+  proto.hasPointerCapture ??= () => false;
+  proto.setPointerCapture ??= () => {};
+  proto.releasePointerCapture ??= () => {};
+  proto.scrollIntoView ??= () => {};
+});
+
+// The pill trigger's text (dot is a span, so textContent is just the mode label).
+function pillLabel(testId: string): string {
   return (
     within(screen.getByTestId(testId)).getByRole("button").textContent ?? ""
   );
 }
-function clickPill(testId: string) {
-  fireEvent.click(within(screen.getByTestId(testId)).getByRole("button"));
+
+/** Open a pane's mode dropdown and select `mode` — the new one-click direct-select. */
+async function selectMode(testId: string, mode: string) {
+  const user = userEvent.setup();
+  await user.click(within(screen.getByTestId(testId)).getByRole("button"));
+  await user.click(
+    await screen.findByRole("menuitem", { name: new RegExp(mode) }),
+  );
 }
 
-describe("ModePill (#266)", () => {
+describe("ModePill dropdown (#344)", () => {
   beforeEach(() => {
     localStorage.clear();
     usePrefsStore.setState({ defaultMode: "auto" });
@@ -38,32 +61,79 @@ describe("ModePill (#266)", () => {
     );
   });
 
-  afterEach(() => {
-    // Unmount the React trees (drops their zustand subscriptions) rather than just
-    // wiping the DOM, so state doesn't leak across tests (#287 review).
-    cleanup();
+  afterEach(() => cleanup());
+
+  it("shows the default mode and switches directly to the chosen mode in one step", async () => {
+    expect(pillLabel("a")).toBe("Auto"); // inherits defaultMode
+
+    await selectMode("a", "Plan");
+    expect(pillLabel("a")).toBe("Plan");
+
+    await selectMode("a", "Act");
+    expect(pillLabel("a")).toBe("Act");
   });
 
-  it("shows the default mode and cycles Plan → Act → Auto on click", () => {
-    expect(label("a")).toBe("Auto"); // inherits defaultMode
-
-    clickPill("a"); // auto → plan
-    expect(label("a")).toBe("Plan");
-    clickPill("a"); // plan → act
-    expect(label("a")).toBe("Act");
-    clickPill("a"); // act → auto
-    expect(label("a")).toBe("Auto");
+  it("keeps each session's (pane's) mode independent", async () => {
+    await selectMode("a", "Plan");
+    expect(pillLabel("a")).toBe("Plan");
+    expect(pillLabel("b")).toBe("Auto"); // b untouched
   });
 
-  it("keeps each session's (pane's) mode independent", () => {
-    clickPill("a"); // a → plan
-    expect(label("a")).toBe("Plan");
-    expect(label("b")).toBe("Auto"); // b untouched
-  });
-
-  it("persists the per-session mode to localStorage", () => {
-    clickPill("a"); // a → plan
+  it("persists the per-session mode to localStorage", async () => {
+    await selectMode("a", "Plan");
     const blob = JSON.parse(localStorage.getItem("ff-session-mode") ?? "{}");
     expect(blob.state.modeBySession.a).toBe("plan");
+  });
+});
+
+// InputBar-level behavior tied to mode (placeholder + the removed handoff, #344).
+const SID = "s1";
+
+function assistantMsg(content = "Here is the plan…"): Message {
+  return { id: "m1", sessionId: SID, role: "assistant", content, createdAt: 0 };
+}
+
+function seed(mode: "plan" | "act" | "auto", withReply = false) {
+  usePrefsStore.setState({ defaultMode: "auto" });
+  useSessionModeStore.setState({ modeBySession: { [SID]: mode } });
+  useComposerStore.setState({
+    textBySession: {},
+    focusNonceBySession: {},
+    rejectNonceBySession: {},
+  });
+  useChatStore.setState({
+    activeSessionId: SID,
+    messagesBySession: withReply ? { [SID]: [assistantMsg()] } : {},
+    streamingBySession: {},
+    turnStartBySession: {},
+  });
+}
+
+describe("InputBar mode behavior (#344)", () => {
+  beforeEach(() => {
+    vi.spyOn(ipc, "getSessionWorkspace").mockResolvedValue({
+      path: "/tmp",
+      gitBranch: null,
+    });
+  });
+  afterEach(() => {
+    cleanup();
+    vi.restoreAllMocks();
+  });
+
+  it("uses a Plan-aware composer placeholder", () => {
+    seed("plan");
+    render(<InputBar sessionId={SID} />);
+    expect(
+      screen.getByPlaceholderText(/plan mode — ask the agent to read/i),
+    ).not.toBeNull();
+  });
+
+  it("does not render the old Plan→Act handoff button after a plan reply", () => {
+    seed("plan", /* withReply */ true);
+    render(<InputBar sessionId={SID} />);
+    expect(
+      screen.queryByRole("button", { name: /switch to act & continue/i }),
+    ).toBeNull();
   });
 });
