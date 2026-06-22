@@ -437,6 +437,29 @@ mod tests {
         assert!(tc.arguments.contains("\"command\""));
     }
 
+    /// #374: SiliconFlow GLM-5.2 streams the name only in the first fragment, then
+    /// sends `function.name: ""` (an empty string, not null/omitted) on every
+    /// continuation fragment. This must decode to `Some("")`, not `None`, so the
+    /// agent accumulator can recognise it as an empty continuation to ignore rather
+    /// than clobbering the real name. (A vanilla provider omits the field -> `None`.)
+    #[test]
+    fn decodes_empty_string_continuation_name_as_some_empty() {
+        let line = br#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"","arguments":"{\"city\":"}}]},"finish_reason":null}]}"#;
+        let chunk = parse_sse_line(line).unwrap().unwrap();
+        let tc = &chunk.tool_calls[0];
+        assert_eq!(tc.name.as_deref(), Some(""));
+        assert_eq!(tc.arguments, "{\"city\":");
+    }
+
+    /// A continuation fragment that omits `name` entirely decodes to `None`, the
+    /// vanilla-OpenAI shape -- distinct from GLM's empty-string above.
+    #[test]
+    fn decodes_omitted_continuation_name_as_none() {
+        let line = br#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"Paris\"}"}}]},"finish_reason":null}]}"#;
+        let chunk = parse_sse_line(line).unwrap().unwrap();
+        assert_eq!(chunk.tool_calls[0].name, None);
+    }
+
     #[test]
     fn tool_calls_finish_reason_marks_done() {
         let line =
