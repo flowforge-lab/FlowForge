@@ -468,14 +468,41 @@ export class MockIpc implements FfIpc {
       "amazon.nova-pro-v1:0",
       "amazon.nova-lite-v1:0",
     ],
-    // SiliconFlow catalog sample (#329) — a few popular OpenAI-compatible model
-    // ids so the picker populates from `list_models` offline.
+    // SiliconFlow catalog sample (#329) — a representative slice of the real
+    // catalog so the model picker populates from `list_models` and overflows its
+    // scroll area offline (the real endpoint returns ~70 ids).
     siliconflow: [
+      "deepseek-ai/DeepSeek-R1",
       "deepseek-ai/DeepSeek-V3",
+      "deepseek-ai/DeepSeek-V3.1",
+      "deepseek-ai/deepseek-vl2",
       "Qwen/Qwen3-8B",
+      "Qwen/Qwen3-14B",
+      "Qwen/Qwen3-32B",
+      "Qwen/Qwen3-235B-A22B",
+      "Qwen/Qwen3-30B-A3B-Instruct-2507",
+      "Qwen/Qwen3-Coder-30B-A3B-Instruct",
+      "Qwen/Qwen3-Coder-480B-A35B-Instruct",
+      "Qwen/Qwen2.5-7B-Instruct",
+      "Qwen/Qwen2.5-14B-Instruct",
+      "Qwen/Qwen2.5-32B-Instruct",
       "Qwen/Qwen2.5-72B-Instruct",
-      "THUDM/glm-4-9b-chat",
+      "Qwen/Qwen2.5-VL-7B-Instruct",
+      "THUDM/GLM-4-9B-0414",
+      "THUDM/GLM-4-32B-0414",
+      "THUDM/GLM-Z1-32B-0414",
+      "zai-org/GLM-4.5",
+      "zai-org/GLM-4.5-Air",
+      "zai-org/GLM-4.6",
+      "moonshotai/Kimi-K2-Instruct",
+      "moonshotai/Kimi-K2-Thinking",
+      "meta-llama/Meta-Llama-3.1-8B-Instruct",
       "meta-llama/Llama-3.3-70B-Instruct",
+      "tencent/Hunyuan-A13B-Instruct",
+      "baidu/ERNIE-4.5-300B-A47B",
+      "ByteDance-Seed/Seed-OSS-36B-Instruct",
+      "openai/gpt-oss-120b",
+      "openai/gpt-oss-20b",
     ],
   };
 

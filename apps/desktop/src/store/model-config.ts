@@ -320,3 +320,18 @@ export function activeConnection(
   if (!registry) return null;
   return registry.connections.find((c) => c.id === registry.active) ?? null;
 }
+
+/** Canonicalize a provider base URL before it's stored. The provider client
+ *  appends `/models` and `/chat/completions` itself, so a base URL that already
+ *  ends in `/chat/completions` (a common copy-paste from SiliconFlow/OpenAI curl
+ *  docs) yields `…/chat/completions/models` → 404. Trim whitespace, drop trailing
+ *  slashes, and strip a trailing `/chat/completions` (or `/chat/completions/`).
+ *  Returns "" for blank input (callers map that to the default endpoint). */
+export function normalizeBaseUrl(input: string): string {
+  let url = input.trim();
+  if (!url) return "";
+  url = url.replace(/\/+$/, "");
+  url = url.replace(/\/chat\/completions$/i, "");
+  url = url.replace(/\/+$/, "");
+  return url;
+}

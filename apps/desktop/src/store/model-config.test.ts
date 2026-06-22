@@ -7,8 +7,33 @@ import {
   SUMMARY_THRESHOLD_MAX,
   SUMMARY_THRESHOLD_MIN,
   activeConnection,
+  normalizeBaseUrl,
   useModelConfigStore,
 } from "@/store/model-config";
+
+describe("normalizeBaseUrl", () => {
+  it("strips a trailing /chat/completions pasted from curl docs", () => {
+    expect(
+      normalizeBaseUrl("https://api.siliconflow.cn/v1/chat/completions"),
+    ).toBe("https://api.siliconflow.cn/v1");
+    expect(
+      normalizeBaseUrl("https://api.siliconflow.cn/v1/chat/completions/"),
+    ).toBe("https://api.siliconflow.cn/v1");
+  });
+
+  it("trims whitespace and trailing slashes", () => {
+    expect(normalizeBaseUrl("  https://api.openai.com/v1/  ")).toBe(
+      "https://api.openai.com/v1",
+    );
+  });
+
+  it("leaves a correct base URL untouched and maps blank to empty", () => {
+    expect(normalizeBaseUrl("https://api.openai.com/v1")).toBe(
+      "https://api.openai.com/v1",
+    );
+    expect(normalizeBaseUrl("   ")).toBe("");
+  });
+});
 
 describe("model-config reasoning controls", () => {
   beforeEach(() => {

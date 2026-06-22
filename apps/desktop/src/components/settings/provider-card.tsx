@@ -4,7 +4,11 @@ import { cn } from "@/lib/utils";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import { SegmentedControl } from "@/components/settings/segmented-control";
-import { useModelConfigStore, type TestState } from "@/store/model-config";
+import {
+  normalizeBaseUrl,
+  useModelConfigStore,
+  type TestState,
+} from "@/store/model-config";
 import type { ProviderConnection } from "@/bindings/ProviderConnection";
 import type { BedrockAuth } from "@/bindings/BedrockAuth";
 
@@ -171,12 +175,18 @@ export function ProviderCard({ conn }: { conn: ProviderConnection }) {
       setSessionToken("");
       setApiKey("");
     } else if (isHostedKey) {
-      await saveConnection({ ...conn, baseUrl: baseUrl.trim() || undefined });
+      // Canonicalize so a pasted `…/v1/chat/completions` doesn't become
+      // `…/chat/completions/models` on the model/probe call.
+      const normalized = normalizeBaseUrl(baseUrl);
+      setBaseUrl(normalized);
+      await saveConnection({ ...conn, baseUrl: normalized || undefined });
       // Persist a freshly-entered key (write-only), then drop it locally.
       if (apiKey) await setSecret(conn.id, "apiKey", apiKey);
       setApiKey("");
     } else {
-      await saveConnection({ ...conn, baseUrl: baseUrl.trim() || undefined });
+      const normalized = normalizeBaseUrl(baseUrl);
+      setBaseUrl(normalized);
+      await saveConnection({ ...conn, baseUrl: normalized || undefined });
     }
   };
 
