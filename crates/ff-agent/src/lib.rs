@@ -82,6 +82,15 @@ const DEFAULT_REFLUSH_INTERVAL_MESSAGES: u64 = 8;
 /// full untruncated content for the UI.
 const TOOL_RESULT_MAX_BYTES: usize = 8 * 1024;
 
+/// Persisted assistant reasoning is replayed on every later tool-call turn for
+/// reasoning gateways (#375 PR-2), so an unbounded chain-of-thought grows both
+/// the stored row and -- compounding across turns -- the wire payload. Cap what
+/// is persisted at this many bytes (#378). Larger than the tool-result cap
+/// because a legitimate CoT is longer than a tool dump; the gateway accepts a
+/// truncated reasoning_content (verified -- it checks presence, not integrity),
+/// so a cap is safe for the round-trip.
+const REASONING_MAX_BYTES: usize = 16 * 1024;
+
 /// Events the agent emits during a turn. The host (Tauri shell or a test) decides
 /// how to surface them — over IPC, to a channel, or into assertions.
 #[derive(Debug, Clone, Serialize)]
@@ -257,6 +266,26 @@ fn truncate_tool_result(content: &str) -> String {
         marker,
         &content[tail_start..]
     )
+}
+
+/// Tail-biased truncation of an over-budget reasoning string on UTF-8 char
+/// boundaries (#378). Unlike a tool result (head+tail), a chain-of-thought is
+/// most useful at its *end* -- the final reasoning state the next turn should
+/// continue from -- so keep the last REASONING_MAX_BYTES with a leading marker.
+/// Returns the input unchanged when already within budget. Applied at persist
+/// time, so the stored value is also the wire value and re-truncation is
+/// idempotent.
+fn truncate_reasoning(reasoning: &str) -> String {
+    if reasoning.len() <= REASONING_MAX_BYTES {
+        return reasoning.to_string();
+    }
+    let marker = "[... earlier reasoning truncated ...]\n\n";
+    let budget = REASONING_MAX_BYTES.saturating_sub(marker.len());
+    let mut tail_start = reasoning.len().saturating_sub(budget);
+    while tail_start < reasoning.len() && !reasoning.is_char_boundary(tail_start) {
+        tail_start += 1;
+    }
+    format!("{}{}", marker, &reasoning[tail_start..])
 }
 
 fn role_str(role: Role) -> &'static str {
@@ -677,8 +706,11 @@ pub async fn run_turn(
 
         // Persist reasoning before content so the finalized row carries both (#375
         // PR-1). Skip empty reasoning so non-reasoning turns keep a NULL column.
+        // Cap it (#378): a long CoT is replayed on every later tool-call turn, so
+        // truncate at write time -- the stored value is then also the wire value.
         if !reasoning_acc.trim().is_empty() {
-            store.set_message_reasoning(&message_id, session_id, &reasoning_acc);
+            let reasoning = truncate_reasoning(&reasoning_acc);
+            store.set_message_reasoning(&message_id, session_id, &reasoning);
         }
         let final_text = acc.clone();
         let finalized = store.set_message_content(&message_id, session_id, acc);
@@ -2876,6 +2908,42 @@ mod tests {
         let big = "😀".repeat(TOOL_RESULT_MAX_BYTES);
         let out = truncate_tool_result(&big);
         assert!(out.len() <= TOOL_RESULT_MAX_BYTES);
+        assert!(out.chars().count() > 0);
+    }
+
+    // ----- #378: persisted reasoning sizing -----
+
+    #[test]
+    fn truncate_reasoning_passes_through_small_input() {
+        let small = "thought briefly";
+        assert_eq!(truncate_reasoning(small), small);
+        let exact = "x".repeat(REASONING_MAX_BYTES);
+        assert_eq!(truncate_reasoning(&exact), exact);
+    }
+
+    #[test]
+    fn truncate_reasoning_caps_and_keeps_tail() {
+        // A chain-of-thought is most useful at its end, so unlike a tool result the
+        // truncation keeps the TAIL and drops the head.
+        let big = format!("HEAD{}TAIL", "x".repeat(REASONING_MAX_BYTES * 2));
+        let out = truncate_reasoning(&big);
+        assert!(
+            out.len() <= REASONING_MAX_BYTES,
+            "truncated to {} bytes, cap {}",
+            out.len(),
+            REASONING_MAX_BYTES
+        );
+        assert!(out.ends_with("TAIL"), "tail slice must survive");
+        assert!(!out.contains("HEAD"), "head must be dropped (tail-biased)");
+        assert!(out.contains("truncated"), "marker must be present");
+    }
+
+    #[test]
+    fn truncate_reasoning_respects_utf8_boundaries() {
+        // Tail-biased slicing must land on a char boundary, not mid-codepoint.
+        let big = "😀".repeat(REASONING_MAX_BYTES);
+        let out = truncate_reasoning(&big);
+        assert!(out.len() <= REASONING_MAX_BYTES);
         assert!(out.chars().count() > 0);
     }
 
