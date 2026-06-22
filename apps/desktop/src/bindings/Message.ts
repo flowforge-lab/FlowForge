@@ -18,6 +18,13 @@ toolCallId?: string,
  */
 attachments?: Array<Attachment>, 
 /**
+ * The model's chain-of-thought for an assistant turn, captured from the
+ * reasoning stream so it can be round-tripped to reasoning-capable providers
+ * on later tool-calling turns (#375). Absent for non-reasoning turns; stored
+ * verbatim and omitted from the wire/binding when none.
+ */
+reasoning?: string, 
+/**
  * Unix epoch milliseconds.
  */
 createdAt: number, };

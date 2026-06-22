@@ -552,11 +552,13 @@ pub async fn run_turn(
         // them, so we surface the error instead. Fatal errors (auth, 4xx, decode)
         // never retry.
         let mut acc = String::new();
+        let mut reasoning_acc = String::new();
         let mut calls: BTreeMap<u32, CallBuf> = BTreeMap::new();
         let mut attempt = 0usize;
         loop {
             attempt += 1;
             acc.clear();
+            reasoning_acc.clear();
             calls.clear();
             let mut emitted_any = false;
 
@@ -595,6 +597,7 @@ pub async fn run_turn(
                     Ok(chunk) => {
                         if enable_reasoning && !chunk.reasoning_delta.is_empty() {
                             emitted_any = true;
+                            reasoning_acc.push_str(&chunk.reasoning_delta);
                             on_event(AgentEvent::Reasoning {
                                 message_id: message_id.clone(),
                                 delta: chunk.reasoning_delta,
@@ -665,6 +668,11 @@ pub async fn run_turn(
             }
         }
 
+        // Persist reasoning before content so the finalized row carries both (#375
+        // PR-1). Skip empty reasoning so non-reasoning turns keep a NULL column.
+        if !reasoning_acc.trim().is_empty() {
+            store.set_message_reasoning(&message_id, session_id, &reasoning_acc);
+        }
         let final_text = acc.clone();
         let finalized = store.set_message_content(&message_id, session_id, acc);
 
@@ -1201,6 +1209,32 @@ mod tests {
         }
     }
 
+    /// Emits a reasoning stream then a text answer, to verify run_turn persists
+    /// the accumulated CoT onto the assistant message (#375 PR-1).
+    struct ReasoningThenText;
+
+    #[async_trait]
+    impl Provider for ReasoningThenText {
+        async fn chat_stream(&self, _req: ChatRequest) -> Result<ChunkStream, LlmError> {
+            let chunks = vec![
+                Ok(Chunk {
+                    reasoning_delta: "let me ".into(),
+                    ..Chunk::default()
+                }),
+                Ok(Chunk {
+                    reasoning_delta: "think".into(),
+                    ..Chunk::default()
+                }),
+                Ok(Chunk {
+                    delta: "42".into(),
+                    done: true,
+                    ..Chunk::default()
+                }),
+            ];
+            Ok(futures_util::stream::iter(chunks).boxed())
+        }
+    }
+
     /// First call requests a `bash` tool call; second call returns plain text.
     struct ToolThenText {
         calls: AtomicUsize,
@@ -1360,6 +1394,73 @@ mod tests {
         assert_eq!(tokens, "Hello");
         assert!(done);
         assert_eq!(msg.content, "Hello");
+    }
+
+    #[tokio::test]
+    async fn persists_reasoning_onto_assistant_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::new();
+        let s = store.create_session(None);
+        store.add_message(&s.id, Role::User, "what is the answer?".into());
+        let registry = ToolRegistry::with_defaults();
+        let approve = AlwaysApprove;
+        let provider = ReasoningThenText;
+
+        let mut reasoning_seen = String::new();
+        let msg = run_turn(
+            &provider,
+            &store,
+            &ctx(&registry, dir.path(), &approve),
+            &s.id,
+            "mock",
+            None,
+            true,
+            CancelToken::new(),
+            |ev| {
+                if let AgentEvent::Reasoning { delta, .. } = ev {
+                    reasoning_seen.push_str(&delta);
+                }
+            },
+        )
+        .await
+        .unwrap();
+
+        // Still streamed to the FE...
+        assert_eq!(reasoning_seen, "let me think");
+        assert_eq!(msg.content, "42");
+        // ...and now also persisted on the message for later round-tripping.
+        assert_eq!(msg.reasoning.as_deref(), Some("let me think"));
+        let history = store.get_messages(&s.id);
+        assert_eq!(
+            history.last().unwrap().reasoning.as_deref(),
+            Some("let me think")
+        );
+    }
+
+    #[tokio::test]
+    async fn no_reasoning_leaves_column_null() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::new();
+        let s = store.create_session(None);
+        store.add_message(&s.id, Role::User, "hi".into());
+        let registry = ToolRegistry::with_defaults();
+        let approve = AlwaysApprove;
+        // TextProvider emits no reasoning; even with reasoning enabled the column
+        // must stay NULL (skip-empty guard).
+        let msg = run_turn(
+            &TextProvider,
+            &store,
+            &ctx(&registry, dir.path(), &approve),
+            &s.id,
+            "mock",
+            None,
+            true,
+            CancelToken::new(),
+            |_| {},
+        )
+        .await
+        .unwrap();
+        assert!(msg.reasoning.is_none());
     }
 
     #[tokio::test]
