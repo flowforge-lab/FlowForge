@@ -82,6 +82,29 @@ FlowForge's `to_chat` sets `content: None`, which serializes to *omitted* (the w
 policy** so a future refactor that emits a spec-literal `null` cannot silently break
 GLM.
 
+**Streamed tool-call name fragmentation (the #374 quirk — corrected premise):**
+
+#374 was originally hypothesized as "GLM emits a native `<tool_call>` template and
+needs `tool_stream=true`". A live SiliconFlow probe (2026-06) **disproved** this:
+`zai-org/GLM-5.2` streams **standard OpenAI `tool_calls`** — the function name arrives
+in the first fragment and `finish_reason: tool_calls` is set; `tool_stream=true` makes
+no difference and no `<tool_call>` appears in content. The single quirk is that every
+**continuation** fragment carries `function.name: ""` (an empty string) rather than the
+vanilla `null`/omitted:
+
+```
+delta#1: index=0 id=… name="get_weather" args=None
+delta#2: index=0 id=None name=""          args="{"
+delta#n: index=0 id=None name=""          args=…fragments…
+```
+
+The agent accumulator overwrote the name on every fragment, so the empty-string
+continuations clobbered `get_weather` → `""` → cryptic `unknown tool:`. The fix is in
+the **accumulator, not a wire dialect**: ignore an empty-string name fragment (keep the
+first non-empty name). So GLM-5.2 *via SiliconFlow* **is** fully OpenAI-compatible for
+tool-calling — no `WireDialect` entry, no `tool_stream`, and **no direct-GLM adapter is
+needed** for SiliconFlow-hosted GLM.
+
 ## 4. Design — `WireDialect`
 
 Internal to `ff-llm` (not an IPC/ts-rs type — no FE/settings surface):
@@ -167,9 +190,10 @@ ProviderConnection {kind,vendor,model}
 - **New OpenAI-compatible gateway** → one arm in `wire_dialect`.
 - **`reasoning_details[]`** (structured thought signatures) → add a `ReasoningWire`
   variant + one injection branch. Carrier already exists.
-- **Inline `<think>` for a *direct* GLM endpoint** (#374) → add a `ToolCallContent` /
+- **Inline `<think>` for a *direct* GLM endpoint** → add a `ToolCallContent` /
   reasoning-shaping variant; same apply site. PR-2 deliberately does **not** add it
-  because no shipping connection exhibits it.
+  because no shipping connection exhibits it (SiliconFlow-hosted GLM normalizes to
+  `reasoning_content` and is OpenAI-compatible for tools — see §3, #374).
 - **Other tool-call wire quirks** (parallel-tool-calls toggle, `tool_choice` policy) →
   new field on `WireDialect`, selected in `wire_dialect`, applied in `message_to_wire`.
 
@@ -193,7 +217,9 @@ The invariant: **one selector function, one apply function, per-adapter injectio
 - FE display of persisted reasoning on reload (separate ticket).
 - Per-provider reasoning-effort params (`reasoning_effort`, `thinking.type`).
 - Structured `reasoning_details[]` round-trip (carrier ready; deferred).
-- Inline `<think>` parsing/stripping for a direct-GLM endpoint — #374's domain; not
-  exhibited by any shipping connection (SiliconFlow normalizes to `reasoning_content`).
+- Inline `<think>` parsing/stripping for a direct-GLM endpoint — not exhibited by any
+  shipping connection (SiliconFlow normalizes to `reasoning_content`). Note: #374 turned
+  out **not** to be this — it was a streamed empty-string tool-name clobber fixed in the
+  agent accumulator (§3), not a wire-dialect concern.
 - Making `WireDialect` user-overridable in settings (kept internal; revisit only if a
   real connection needs a manual override).

@@ -653,8 +653,15 @@ pub async fn run_turn(
                             if let Some(id) = frag.id {
                                 buf.id = id;
                             }
+                            // Some gateways (SiliconFlow GLM-5.2, #374) stream the name in
+                            // the first tool_call fragment and then send name: "" (an empty
+                            // string, not null) on every continuation fragment. A blind
+                            // overwrite would clobber the real name to "", which later
+                            // dispatches as `unknown tool:`. Only adopt a non-empty name.
                             if let Some(name) = frag.name {
-                                buf.name = name;
+                                if !name.is_empty() {
+                                    buf.name = name;
+                                }
                             }
                             buf.arguments.push_str(&frag.arguments);
                         }
@@ -799,57 +806,72 @@ pub async fn run_turn(
             let permitted = advertised
                 .as_ref()
                 .is_none_or(|set| set.contains(&call.name));
-            let outcome = match parsed_args {
-                Err(e) => ff_tools::ToolOutcome::error(format!(
-                    "tool `{}` arguments were not valid JSON ({e}); received: `{}`. \
+            let outcome = if call.name.trim().is_empty() {
+                // Defense-in-depth (#374): a model that never sends a tool name at all
+                // would otherwise dispatch "" and surface a cryptic `unknown tool:`. The
+                // empty-string-continuation quirk (GLM-5.2) is fixed at accumulation; this
+                // catches a genuinely nameless call with an actionable message instead.
+                ff_tools::ToolOutcome::error(
+                    "the model returned a tool call with no name -- it likely does not \
+                     support OpenAI-compatible tool-calling in FlowForge. Try a standard \
+                     tool-caller (Bedrock Claude, or deepseek-ai/DeepSeek-V4-Pro on \
+                     SiliconFlow).",
+                )
+            } else {
+                match parsed_args {
+                    Err(e) => ff_tools::ToolOutcome::error(format!(
+                        "tool `{}` arguments were not valid JSON ({e}); received: `{}`. \
                      Re-issue the call with a valid JSON object matching the tool schema.",
-                    call.name, call.arguments
-                )),
-                Ok(args) => {
-                    if tools.registry.is_interactive(&call.name) {
-                        match tools.approve.ask(&message_id, &call.id, &args).await {
-                            Some(answer) => ff_tools::ToolOutcome::ok(answer),
-                            None => ff_tools::ToolOutcome::error("[no answer: question dismissed]"),
-                        }
-                    } else if !permitted {
-                        // Distinguish the two reasons a tool can be hidden so the model
-                        // gets an actionable result instead of a silent failure.
-                        ff_tools::ToolOutcome::error(if tools.mode.is_plan() {
-                            format!(
+                        call.name, call.arguments
+                    )),
+                    Ok(args) => {
+                        if tools.registry.is_interactive(&call.name) {
+                            match tools.approve.ask(&message_id, &call.id, &args).await {
+                                Some(answer) => ff_tools::ToolOutcome::ok(answer),
+                                None => {
+                                    ff_tools::ToolOutcome::error("[no answer: question dismissed]")
+                                }
+                            }
+                        } else if !permitted {
+                            // Distinguish the two reasons a tool can be hidden so the model
+                            // gets an actionable result instead of a silent failure.
+                            ff_tools::ToolOutcome::error(if tools.mode.is_plan() {
+                                format!(
                                 "tool `{}` is not available in Plan mode (read-only tools only)",
                                 call.name
                             )
+                            } else {
+                                format!("tool `{}` is not permitted for this sub-agent", call.name)
+                            })
+                        } else if ff_tools::is_subagent(&call.name) {
+                            // Delegation (#234): drive a child turn in a fresh ephemeral session and
+                            // return only its summary. The child reuses the same provider/approver,
+                            // so its tool calls hit the identical approval gate (no escalation).
+                            run_subagent(
+                                provider,
+                                store,
+                                tools,
+                                model,
+                                system_prompt,
+                                cancel.clone(),
+                                &args,
+                            )
+                            .await
                         } else {
-                            format!("tool `{}` is not permitted for this sub-agent", call.name)
-                        })
-                    } else if ff_tools::is_subagent(&call.name) {
-                        // Delegation (#234): drive a child turn in a fresh ephemeral session and
-                        // return only its summary. The child reuses the same provider/approver,
-                        // so its tool calls hit the identical approval gate (no escalation).
-                        run_subagent(
-                            provider,
-                            store,
-                            tools,
-                            model,
-                            system_prompt,
-                            cancel.clone(),
-                            &args,
-                        )
-                        .await
-                    } else {
-                        let safety = tools.registry.safety(&call.name, &args);
-                        let approved = safety == Safety::ReadOnly
-                            || tools
-                                .approve
-                                .approve(&message_id, &call.id, &call.name, safety, &args)
-                                .await;
-                        if approved {
-                            tools.registry.run(&call.name, args, tools.root).await
-                        } else {
-                            ff_tools::ToolOutcome::error(format!(
-                                "call to `{}` was not approved",
-                                call.name
-                            ))
+                            let safety = tools.registry.safety(&call.name, &args);
+                            let approved = safety == Safety::ReadOnly
+                                || tools
+                                    .approve
+                                    .approve(&message_id, &call.id, &call.name, safety, &args)
+                                    .await;
+                            if approved {
+                                tools.registry.run(&call.name, args, tools.root).await
+                            } else {
+                                ff_tools::ToolOutcome::error(format!(
+                                    "call to `{}` was not approved",
+                                    call.name
+                                ))
+                            }
                         }
                     }
                 }
@@ -1330,6 +1352,94 @@ mod tests {
         }
     }
 
+    /// First call streams a tool call the way SiliconFlow GLM-5.2 does (#374): the
+    /// name arrives only in the first fragment, then every continuation fragment
+    /// carries `name: Some("")` (an empty string, not `None`) alongside the argument
+    /// pieces. A blind overwrite would clobber the name to "" -> `unknown tool:`.
+    struct GlmFragmentedToolCall {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl Provider for GlmFragmentedToolCall {
+        async fn chat_stream(&self, _req: ChatRequest) -> Result<ChunkStream, LlmError> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            let chunks = if n == 0 {
+                vec![
+                    Ok(Chunk {
+                        tool_calls: vec![ToolCallDelta {
+                            index: 0,
+                            id: Some("call_1".into()),
+                            name: Some("bash".into()),
+                            arguments: String::new(),
+                        }],
+                        ..Chunk::default()
+                    }),
+                    Ok(Chunk {
+                        tool_calls: vec![ToolCallDelta {
+                            index: 0,
+                            id: None,
+                            name: Some(String::new()),
+                            arguments: r#"{"command":"#.into(),
+                        }],
+                        ..Chunk::default()
+                    }),
+                    Ok(Chunk {
+                        tool_calls: vec![ToolCallDelta {
+                            index: 0,
+                            id: None,
+                            name: Some(String::new()),
+                            arguments: r#""echo wired"}"#.into(),
+                        }],
+                        done: true,
+                        ..Chunk::default()
+                    }),
+                ]
+            } else {
+                vec![Ok(Chunk {
+                    delta: "done: wired".into(),
+                    done: true,
+                    ..Chunk::default()
+                })]
+            };
+            Ok(futures_util::stream::iter(chunks).boxed())
+        }
+    }
+
+    /// First call streams a tool call whose name never arrives (the fragment carries
+    /// `name: None`), the way a model with no real OpenAI-compatible tool-calling
+    /// would (#374); the second call returns plain text so the turn can resume after
+    /// the actionable error result. Must fail with that message, not `unknown tool:`.
+    struct NamelessToolCall {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl Provider for NamelessToolCall {
+        async fn chat_stream(&self, _req: ChatRequest) -> Result<ChunkStream, LlmError> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            let chunks = if n == 0 {
+                vec![Ok(Chunk {
+                    tool_calls: vec![ToolCallDelta {
+                        index: 0,
+                        id: Some("call_x".into()),
+                        name: None,
+                        arguments: r#"{"command":"ls"}"#.into(),
+                    }],
+                    done: true,
+                    ..Chunk::default()
+                })]
+            } else {
+                vec![Ok(Chunk {
+                    delta: "ok, switching approach".into(),
+                    done: true,
+                    ..Chunk::default()
+                })]
+            };
+            Ok(futures_util::stream::iter(chunks).boxed())
+        }
+    }
+
     /// First call requests an `ask_user` tool call; second call returns plain text.
     struct AskThenText {
         calls: AtomicUsize,
@@ -1584,6 +1694,121 @@ mod tests {
         assert!(history[1].tool_calls.is_some());
         assert_eq!(history[2].role, Role::Tool);
         assert_eq!(history[2].tool_call_id.as_deref(), Some("call_1"));
+    }
+
+    /// #374: GLM-5.2 streams `name: ""` on every continuation fragment. The
+    /// accumulator must keep the name from the first fragment and still assemble the
+    /// arguments, so the call dispatches to `bash` -- not a clobbered `unknown tool:`.
+    #[tokio::test]
+    async fn glm_empty_string_name_fragments_do_not_clobber_the_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::new();
+        let s = store.create_session(None);
+        store.add_message(&s.id, Role::User, "run echo".into());
+        let registry = ToolRegistry::with_defaults();
+        let approve = AlwaysApprove;
+        let provider = GlmFragmentedToolCall {
+            calls: AtomicUsize::new(0),
+        };
+
+        let mut started_name = String::new();
+        let mut finished_ok = false;
+        let mut result = String::new();
+        let mut final_text = String::new();
+        let msg = run_turn(
+            &provider,
+            &store,
+            &ctx(&registry, dir.path(), &approve),
+            &s.id,
+            "mock",
+            None,
+            false,
+            CancelToken::new(),
+            |ev| match ev {
+                AgentEvent::ToolCallStarted { name, .. } => started_name = name,
+                AgentEvent::ToolCallFinished {
+                    success, result: r, ..
+                } => {
+                    finished_ok = success;
+                    result = r;
+                }
+                AgentEvent::Token { delta, .. } => final_text.push_str(&delta),
+                AgentEvent::Reasoning { .. } => {}
+                AgentEvent::Error { message } => panic!("error: {message}"),
+                AgentEvent::Done { .. } => {}
+                AgentEvent::MemoryFlushed { .. } => {}
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            started_name, "bash",
+            "name must survive the empty-string frags"
+        );
+        assert!(
+            finished_ok,
+            "the bash call must run, not fail as unknown tool"
+        );
+        assert!(
+            result.contains("wired"),
+            "args must assemble across fragments"
+        );
+        assert_eq!(msg.content, "done: wired");
+        assert!(
+            !result.contains("unknown tool"),
+            "must not regress to the clobbered-name failure"
+        );
+    }
+
+    /// #374: a model that never sends a tool name at all must fail with an actionable
+    /// message, not the cryptic `unknown tool:` from dispatching an empty name.
+    #[tokio::test]
+    async fn nameless_tool_call_fails_with_actionable_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::new();
+        let s = store.create_session(None);
+        store.add_message(&s.id, Role::User, "do something".into());
+        let registry = ToolRegistry::with_defaults();
+        let approve = AlwaysApprove;
+
+        let mut finished_ok = true;
+        let mut result = String::new();
+        let provider = NamelessToolCall {
+            calls: AtomicUsize::new(0),
+        };
+        run_turn(
+            &provider,
+            &store,
+            &ctx(&registry, dir.path(), &approve),
+            &s.id,
+            "mock",
+            None,
+            false,
+            CancelToken::new(),
+            |ev| match ev {
+                AgentEvent::ToolCallFinished {
+                    success, result: r, ..
+                } => {
+                    finished_ok = success;
+                    result = r;
+                }
+                AgentEvent::Error { message } => panic!("error: {message}"),
+                _ => {}
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(!finished_ok, "a nameless call is a failed tool result");
+        assert!(
+            result.contains("no name"),
+            "must explain the model returned a tool call with no name, got: {result}"
+        );
+        assert!(
+            !result.contains("unknown tool"),
+            "must not surface the cryptic unknown-tool error"
+        );
     }
 
     /// #44: an `ask_user` call routes to `Approver::ask`; the answer becomes the tool
