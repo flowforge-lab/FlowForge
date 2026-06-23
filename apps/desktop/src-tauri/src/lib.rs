@@ -17,10 +17,10 @@ use ff_core::events::{
     TurnDoneEvent, TurnErrorEvent,
 };
 use ff_core::{
-    BedrockAuth, Format, McpServerConfig, McpServerStatus, MemoryFileInfo, MemoryFileKind,
-    MemoryOverview, Message, Mode, Phenotype, ProviderConfig, ProviderConnection, ProviderKind,
-    ProviderRegistry, Role, SearchConfig, SecretKind, Session, SessionWorkspace, Skill, SkillInfo,
-    SkillManifest,
+    Attachment, BedrockAuth, Format, McpServerConfig, McpServerStatus, MemoryFileInfo,
+    MemoryFileKind, MemoryOverview, Message, Mode, Phenotype, ProviderConfig, ProviderConnection,
+    ProviderKind, ProviderRegistry, Role, SearchConfig, SecretKind, Session, SessionWorkspace,
+    Skill, SkillInfo, SkillManifest,
 };
 use ff_signals::SkillAggregate;
 use ff_tools::Safety;
@@ -392,8 +392,17 @@ fn send_message(
     app: tauri::AppHandle,
     session_id: String,
     content: String,
+    // Sent by the composer (#399); persisted on the user message so `run_turn`
+    // forwards them to vision-capable providers. `None` for a plain text turn.
+    attachments: Option<Vec<Attachment>>,
 ) -> CmdResult<String> {
-    let user_msg = state.store.add_message(&session_id, Role::User, content);
+    let user_msg =
+        match attachments {
+            Some(attachments) if !attachments.is_empty() => state
+                .store
+                .add_message_with_attachments(&session_id, Role::User, content, attachments),
+            _ => state.store.add_message(&session_id, Role::User, content),
+        };
 
     let cancel = CancelToken::new();
     state.register_cancel(&session_id, cancel.clone());
