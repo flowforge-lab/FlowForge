@@ -2007,6 +2007,10 @@ mod tests {
     #[test]
     fn activate_unknown_skill_errors() {
         let state = AppState::new();
+        // `new()` restores the persisted phenotype from the real config dir, which
+        // can pre-populate the active set; this test exercises only the activate
+        // guard, so start from a known-empty baseline (test-isolation, not behavior).
+        state.active_skills.lock().unwrap().clear();
         let err = state
             .activate_skill("definitely-not-installed-skill-xyz")
             .unwrap_err();
@@ -2021,6 +2025,9 @@ mod tests {
             // Bypass the install-check guard: this test exercises the accessor and
             // deactivate, not the registry lookup (covered elsewhere).
             let mut guard = state.active_skills.lock().unwrap();
+            // Clear the phenotype `new()` restored from the real config dir so the
+            // assertions below own the full expected set (test-isolation).
+            guard.clear();
             guard.insert("zeta".into());
             guard.insert("alpha".into());
             guard.insert("alpha".into());
