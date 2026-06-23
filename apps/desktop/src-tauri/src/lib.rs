@@ -442,9 +442,9 @@ fn send_message(
         // phenotype's declared skills; an unbound session keeps the global active
         // set so the command palette still affects turns. See `turn_active_skills`.
         let active: Vec<String> = state.turn_active_skills(&sid);
-        let memory = state
+        let (memory, ambient_keys) = state
             .memory()
-            .ambient_block_filtered(state.index().as_ref());
+            .ambient_block_filtered_keyed(state.index().as_ref());
         let system_prompt = ff_agent::build_system_prompt(
             persona.as_deref(),
             &skills,
@@ -633,6 +633,10 @@ fn send_message(
         // finished cleanly, persist any durable facts before context pressure forces
         // a summarization that would drop them. Silent — never adds to the transcript.
         if success {
+            // Weak ambient reinforcement (RFC 0007 §10.1): the turn replied, so
+            // refresh the curated chunks that were ambient-injected. No-op unless
+            // `decay.ambient_gain > 0`.
+            let _ = state.index().reinforce_ambient(&ambient_keys);
             state
                 .maybe_flush_memory(provider.as_ref(), &registry, &sid, &model, cancel_probe)
                 .await;

@@ -67,6 +67,17 @@ pub trait MemoryIndex: Send + Sync {
     fn reinforce(&self, _hits: &[ScoredChunk]) -> Result<()> {
         Ok(())
     }
+    /// Weak reinforcement for chunks that were *ambient-injected* and the turn
+    /// produced a reply (RFC 0007 §10.1). Bumps each key's `weight` toward `1.0`
+    /// by the smaller `decay.ambient_gain` (vs `reinforce_gain` for a recall) and
+    /// refreshes `last_accessed`, so a still-shown chunk ages more slowly. A
+    /// complete no-op unless decay is enabled *and* `ambient_gain > 0`, and it
+    /// never creates a row for a never-recalled chunk — so the RFC §3
+    /// never-recalled-stays-`1.0` invariant is preserved. The default is a no-op
+    /// so backends without a `chunk_stats` table need no change.
+    fn reinforce_ambient(&self, _keys: &[String]) -> Result<()> {
+        Ok(())
+    }
     /// Read-time effective (decayed) usage stats for `keys`, computed against
     /// `now_ms` without persisting (RFC 0007 §3). Keys with no `chunk_stats`
     /// row — and *all* keys when decay is disabled — are omitted from the map;
@@ -266,6 +277,47 @@ impl Fts5Index {
         tx.commit()?;
         Ok(())
     }
+
+    /// Time-injectable core of [`reinforce_ambient`](MemoryIndex::reinforce_ambient).
+    /// Gated: no-op unless decay is enabled and `ambient_gain > 0`. Only updates
+    /// keys that already have a `chunk_stats` row (a never-recalled chunk has no
+    /// row and is left untouched, preserving RFC §3).
+    pub(crate) fn reinforce_ambient_at(&self, keys: &[String], now_ms: i64) -> Result<()> {
+        if keys.is_empty() || !self.decay.enabled || self.decay.ambient_gain <= 0.0 {
+            return Ok(());
+        }
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        {
+            let mut sel = tx.prepare(
+                "SELECT weight, last_accessed, access_count
+                 FROM chunk_stats WHERE chunk_key = ?1",
+            )?;
+            let mut up = tx.prepare(
+                "UPDATE chunk_stats
+                 SET weight = ?2, last_accessed = ?3, access_count = ?4
+                 WHERE chunk_key = ?1",
+            )?;
+            for key in keys {
+                let existing: Option<(f64, i64, i64)> = sel
+                    .query_row(params![key], |row| {
+                        Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                    })
+                    .optional()?;
+                // Never-recalled chunks (no row) are intentionally skipped: ambient
+                // injection does not start the age clock (RFC §3).
+                if let Some((w, last, c)) = existing {
+                    let new_w = reinforced_weight(
+                        decayed_weight(w as f32, last, now_ms, self.decay.factor),
+                        self.decay.ambient_gain,
+                    );
+                    up.execute(params![key, new_w as f64, now_ms, c + 1])?;
+                }
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
 }
 
 impl MemoryIndex for Fts5Index {
@@ -390,6 +442,10 @@ impl MemoryIndex for Fts5Index {
         self.reinforce_at(hits, Utc::now().timestamp_millis())
     }
 
+    fn reinforce_ambient(&self, keys: &[String]) -> Result<()> {
+        self.reinforce_ambient_at(keys, Utc::now().timestamp_millis())
+    }
+
     fn effective_stats(
         &self,
         keys: &[String],
@@ -511,6 +567,10 @@ impl<E: Embedder> MemoryIndex for HybridIndex<E> {
 
     fn reinforce(&self, hits: &[ScoredChunk]) -> Result<()> {
         self.inner.reinforce(hits)
+    }
+
+    fn reinforce_ambient(&self, keys: &[String]) -> Result<()> {
+        self.inner.reinforce_ambient(keys)
     }
 
     fn effective_stats(
@@ -919,6 +979,14 @@ mod tests {
         }
     }
 
+    fn ambient_decay(gain: f32) -> DecayConfig {
+        DecayConfig {
+            enabled: true,
+            ambient_gain: gain,
+            ..DecayConfig::default()
+        }
+    }
+
     #[test]
     fn decay_lazy_equals_repeated_daily() {
         let f = 0.98_f32;
@@ -1171,5 +1239,75 @@ mod tests {
         let hits = idx.search("rust", 10).unwrap();
         assert_eq!(hits[0].weight, 1.0, "disabled decay -> weight neutral");
         assert_eq!(hits[0].last_accessed_ms, None);
+    }
+    const DAY_MS_I: i64 = ONE_DAY_MS as i64;
+
+    #[test]
+    fn reinforce_ambient_bumps_existing_row_weaker_than_recall() {
+        let idx = Fts5Index::open_in_memory()
+            .unwrap()
+            .with_decay(ambient_decay(0.1));
+        let cs = chunks("## H\nalpha body", "MEMORY.md");
+        idx.reindex(&cs).unwrap();
+        idx.reinforce_at(&scored(&cs), 0).unwrap(); // recall: weight 1.0 @ t=0
+
+        let later = DAY_MS_I * 100;
+        idx.reinforce_ambient_at(&[chunk_key(&cs[0])], later)
+            .unwrap();
+
+        let decayed = decayed_weight(1.0, 0, later, 0.98);
+        let recall_bump = reinforced_weight(decayed, 0.3); // reinforce_gain
+        let (w, last, count) = read_stat(&idx, &chunk_key(&cs[0])).unwrap();
+        assert!(w > decayed, "ambient gain must bump above pure decay");
+        assert!(
+            w < recall_bump,
+            "ambient bump must be weaker than a recall bump"
+        );
+        assert_eq!(last, later, "ambient touch refreshes last_accessed");
+        assert_eq!(count, 2, "ambient touch counts as an access");
+    }
+
+    #[test]
+    fn reinforce_ambient_skips_never_recalled_chunk() {
+        let idx = Fts5Index::open_in_memory()
+            .unwrap()
+            .with_decay(ambient_decay(0.1));
+        let cs = chunks("## H\nalpha body", "MEMORY.md");
+        idx.reindex(&cs).unwrap();
+        // Never recalled -> no chunk_stats row. Ambient must NOT create one (RFC §3).
+        idx.reinforce_ambient_at(&[chunk_key(&cs[0])], DAY_MS_I)
+            .unwrap();
+        assert!(
+            read_stat(&idx, &chunk_key(&cs[0])).is_none(),
+            "ambient injection must not start the age clock for a never-recalled chunk"
+        );
+    }
+
+    #[test]
+    fn reinforce_ambient_noop_when_gain_zero() {
+        let idx = Fts5Index::open_in_memory()
+            .unwrap()
+            .with_decay(ambient_decay(0.0));
+        let cs = chunks("## H\nalpha body", "MEMORY.md");
+        idx.reindex(&cs).unwrap();
+        idx.reinforce_at(&scored(&cs), 0).unwrap();
+        idx.reinforce_ambient_at(&[chunk_key(&cs[0])], DAY_MS_I * 100)
+            .unwrap();
+        let (w, last, count) = read_stat(&idx, &chunk_key(&cs[0])).unwrap();
+        assert_eq!((w, last, count), (1.0, 0, 1), "gain 0 => complete no-op");
+    }
+
+    #[test]
+    fn reinforce_ambient_noop_when_decay_disabled() {
+        let idx = Fts5Index::open_in_memory()
+            .unwrap()
+            .with_decay(disabled_decay());
+        let cs = chunks("## H\nalpha body", "MEMORY.md");
+        idx.reindex(&cs).unwrap();
+        idx.reinforce_at(&scored(&cs), 0).unwrap();
+        idx.reinforce_ambient_at(&[chunk_key(&cs[0])], DAY_MS_I * 100)
+            .unwrap();
+        let (w, last, count) = read_stat(&idx, &chunk_key(&cs[0])).unwrap();
+        assert_eq!((w, last, count), (1.0, 0, 1), "decay off => complete no-op");
     }
 }

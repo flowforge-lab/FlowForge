@@ -130,7 +130,7 @@ inert until tuned:
 | `memory.decay.enabled` | `true` | master switch for the whole M6 mechanism |
 | `memory.decay.factor` | `0.98` | daily multiplier (~35-day half-life) |
 | `memory.decay.reinforce_gain` | `0.3` | search-hit reinforcement strength |
-| `memory.decay.ambient_gain` | `0.05` | weak reinforcement for an ambient-only hit |
+| `memory.decay.ambient_gain` | `0` (off) | weak reinforcement for an ambient-only hit (opt-in; see §10.1) |
 | `memory.decay.dormant_threshold` | `0.25` | below this → dormant |
 
 With `memory.decay.enabled = false`, M6 records statistics but never decays or marks
@@ -178,8 +178,13 @@ Consistent with RFC 0006 §8 (memory is inspectable and user-owned):
 ## 10. Open Questions
 
 1. **Ambient reinforcement signal.** Is "chunk was in the ambient block and the turn
-   produced a reply" too weak/noisy to count as a hit at all? M6.0 records it behind
-   `ambient_gain` so it can be tuned to `0` without code change.
+   produced a reply" too weak/noisy to count as a hit at all? **Resolved (M6.1, #387):
+   shipped off by default (`ambient_gain = 0`), opt-in.** The mechanism is wired but
+   disabled out of the box, because once ambient skips dormant chunks
+   (§3), only *live* curated chunks are injected — so any nonzero gain refreshes every
+   still-shown chunk every turn, meaning curated facts never go dormant during active
+   use and the SNR win is lost. It can be enabled (`> 0`) without a code change once
+   real usage shows whether the signal is worth the cost.
 2. **Half-life default.** Is ~35 days (`factor 0.98`) right for a personal assistant, or
    should curated facts decay slower than daily-log chunks (per-source factors)?
 3. **Pin vs. high weight.** Is an explicit pin needed, or does normal reinforcement keep

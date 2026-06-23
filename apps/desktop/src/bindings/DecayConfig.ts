@@ -7,8 +7,8 @@
  * `weight` only decays/reinforces when `enabled = true`. M6.0 (#291) shipped
  * `enabled = false` as a no-op rollback path; M6.1 (#292) flips the default on
  * and consumes `dormant_threshold` to skip dormant chunks from ambient
- * injection. `ambient_gain` (weak ambient reinforcement, RFC §10.1) is schema
- * now, consumed in a follow-up.
+ * injection. `ambient_gain` (weak ambient reinforcement, RFC §10.1, #387) is
+ * consumed but defaults to `0` — opt-in (see [`default_ambient_gain`]).
  */
 export type DecayConfig = { 
 /**
@@ -26,8 +26,9 @@ factor: number,
  */
 reinforceGain: number, 
 /**
- * Weaker reinforcement for an ambient-only hit (schema now; consumed in
- * the ambient-reinforcement follow-up, RFC §10.1).
+ * Weak reinforcement for a chunk that was ambient-injected and the turn
+ * produced a reply (RFC 0007 §10.1). Defaults to `0` (off) — a nonzero value
+ * keeps still-shown curated chunks fresh; set > 0 to opt in.
  */
 ambientGain: number, 
 /**
