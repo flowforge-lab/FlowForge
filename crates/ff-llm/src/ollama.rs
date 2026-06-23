@@ -32,7 +32,7 @@ impl OllamaProvider {
     pub fn new(base_url: impl Into<String>) -> Self {
         Self {
             base_url: base_url.into(),
-            client: reqwest::Client::new(),
+            client: crate::build_streaming_http_client(),
             supports_vision: false,
         }
     }
