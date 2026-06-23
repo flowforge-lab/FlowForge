@@ -3,9 +3,12 @@ import {
   ArrowUp,
   Check,
   ChevronsUpDown,
+  FileText,
   Folder,
+  Paperclip,
   Search,
   Square,
+  X,
 } from "@/components/ui/icon";
 import { Popover as PopoverPrimitive } from "radix-ui";
 import { Button } from "@/components/ui/button";
@@ -15,7 +18,10 @@ import {
   DropdownMenuContent,
   DropdownMenuItem,
 } from "@/components/ui/dropdown-menu";
+import type { Attachment } from "@/bindings";
+import { fileToAttachment } from "@/lib/attachments";
 import { cn } from "@/lib/utils";
+import { formatBytes } from "@/lib/memory-view";
 import { ipc } from "@/lib/ipc";
 import { useChatStore } from "@/store/chat";
 import { useComposerStore } from "@/store/composer";
@@ -44,6 +50,7 @@ export function InputBar({
 }: { sessionId?: string; focused?: boolean } = {}) {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const boxRef = useRef<HTMLDivElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   // Read inside the focus effects without making them depend on `focused`: only
   // the focused pane (#148) should grab the composer, but merely focusing a pane
@@ -95,6 +102,8 @@ export function InputBar({
   const send = useChatStore((s) => s.send);
   const cancelTurn = useChatStore((s) => s.cancelTurn);
   const sendMessageKey = usePrefsStore((s) => s.sendMessageKey);
+  const [attachments, setAttachments] = useState<Attachment[]>([]);
+  const [dragOver, setDragOver] = useState(false);
 
   // Resolved mode for this pane's session — drives the Plan-aware placeholder
   // (#267, RFC 0011 §8). Switching modes is done via the pill dropdown (#344).
@@ -108,6 +117,64 @@ export function InputBar({
     el.style.height = "auto";
     el.style.height = `${Math.min(el.scrollHeight, 160)}px`;
   }, []);
+
+  // --- Attach affordances (#339) ---
+
+  const handlePaste = useCallback(
+    (e: React.ClipboardEvent<HTMLTextAreaElement>) => {
+      const items = Array.from(e.clipboardData.items);
+      for (const item of items) {
+        if (item.type.startsWith("image/")) {
+          e.preventDefault();
+          const file = item.getAsFile();
+          if (!file) continue;
+          fileToAttachment(file).then((att) =>
+            setAttachments((prev) => [...prev, att]),
+          );
+        }
+      }
+    },
+    [],
+  );
+
+  const handleDragOver = useCallback((e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setDragOver(true);
+  }, []);
+
+  const handleDragLeave = useCallback((e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    // Only clear when leaving the container entirely, not when crossing a child.
+    if (!e.currentTarget.contains(e.relatedTarget as Node)) setDragOver(false);
+  }, []);
+
+  const handleDrop = useCallback((e: React.DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setDragOver(false);
+    const files = Array.from(e.dataTransfer.files);
+    for (const file of files) {
+      if (!file.type.startsWith("image/")) continue;
+      fileToAttachment(file).then((att) =>
+        setAttachments((prev) => [...prev, att]),
+      );
+    }
+  }, []);
+
+  function handleFilePick(e: React.ChangeEvent<HTMLInputElement>) {
+    const files = e.target.files;
+    if (!files) return;
+    for (const file of Array.from(files)) {
+      if (!file.type.startsWith("image/")) continue;
+      fileToAttachment(file).then((att) =>
+        setAttachments((prev) => [...prev, att]),
+      );
+    }
+    // Reset so the same file can be re-selected.
+    e.target.value = "";
+  }
 
   // Throttled, fire-and-forget server warmup (see note at top of file).
   const lastWarmupRef = useRef(0);
@@ -154,11 +221,19 @@ export function InputBar({
 
   function submit() {
     const content = value.trim();
-    if (!content || streaming || pending || !targetSessionId) return;
+    if (
+      (!content && attachments.length === 0) ||
+      streaming ||
+      pending ||
+      !targetSessionId
+    )
+      return;
+    const attach = attachments;
     setText("");
+    setAttachments([]);
     // Collapse the box back to one line (it may have grown for a resend draft).
     if (textareaRef.current) textareaRef.current.style.height = "auto";
-    void send(content, targetSessionId);
+    void send(content, targetSessionId, attach);
   }
 
   return (
@@ -167,7 +242,13 @@ export function InputBar({
         {/* Unified composer: textarea + workspace chip + send/stop in one card. */}
         <div
           ref={boxRef}
-          className="rounded-xl border bg-card p-1.5 shadow-sm transition-all focus-within:border-ring focus-within:shadow-md focus-within:ring-2 focus-within:ring-ring/25"
+          className={cn(
+            "rounded-xl border bg-card p-1.5 shadow-sm transition-all focus-within:border-ring focus-within:shadow-md focus-within:ring-2 focus-within:ring-ring/25",
+            dragOver && "border-primary ring-2 ring-primary/30",
+          )}
+          onDragOver={handleDragOver}
+          onDragLeave={handleDragLeave}
+          onDrop={handleDrop}
         >
           <textarea
             ref={textareaRef}
@@ -182,6 +263,7 @@ export function InputBar({
             }
             className="max-h-40 min-h-8 w-full resize-none bg-transparent px-2 py-1.5 text-[13px] leading-relaxed placeholder:text-muted-foreground/50 focus-visible:outline-none"
             onFocus={warmup}
+            onPaste={handlePaste}
             onChange={(e) => {
               warmup();
               setText(e.currentTarget.value);
@@ -202,14 +284,44 @@ export function InputBar({
             }}
           />
 
+          {/* Staged attachments (#340): one removable chip/thumbnail per file,
+              between the textarea and the toolbar so it reads as part of the draft. */}
+          {attachments.length > 0 ? (
+            <AttachmentChips
+              attachments={attachments}
+              onRemove={(idx) =>
+                setAttachments((prev) => prev.filter((_, i) => i !== idx))
+              }
+            />
+          ) : null}
+
           {/* Bottom toolbar inside the composer: working-directory chip (left)
               and Send/Stop (right), so the controls read as one input box. */}
           <div className="flex items-center justify-between gap-2 border-t border-border/40 px-1.5 pb-1 pt-1.5">
             <div className="flex min-w-0 items-center gap-1.5">
               {targetSessionId ? (
                 <>
+                  <input
+                    ref={fileInputRef}
+                    type="file"
+                    accept="image/*"
+                    multiple
+                    className="hidden"
+                    onChange={handleFilePick}
+                  />
                   <ModePill sessionId={targetSessionId} />
                   <WorkspaceSelector sessionId={targetSessionId} />
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="icon-xs"
+                    className="shrink-0 text-muted-foreground hover:text-foreground"
+                    onClick={() => fileInputRef.current?.click()}
+                    title="Attach image"
+                    aria-label="Attach image"
+                  >
+                    <Paperclip className="size-3.5" />
+                  </Button>
                 </>
               ) : (
                 <span />
@@ -231,7 +343,10 @@ export function InputBar({
               <Button
                 size="icon"
                 className="size-8 shrink-0 rounded-lg"
-                disabled={!value.trim() || !targetSessionId}
+                disabled={
+                  (!value.trim() && attachments.length === 0) ||
+                  !targetSessionId
+                }
                 onClick={submit}
                 title={
                   sendMessageKey === "ctrlEnter"
@@ -245,6 +360,109 @@ export function InputBar({
           </div>
         </div>
       </div>
+    </div>
+  );
+}
+
+// Staged-attachment strip (#340). Renders one removable chip per file the user has
+// staged in the composer: a thumbnail for images, a document icon otherwise, plus the
+// file name, humanized size, and type. Pure view over the composer's local state.
+function AttachmentChips({
+  attachments,
+  onRemove,
+}: {
+  attachments: Attachment[];
+  onRemove: (index: number) => void;
+}) {
+  return (
+    <div className="flex flex-wrap gap-1.5 px-1.5 pt-1.5">
+      {attachments.map((att, idx) => (
+        <AttachmentChip
+          // No stable id on a staged attachment; index is fine for an
+          // append/remove-only list that never reorders.
+          key={idx}
+          attachment={att}
+          onRemove={() => onRemove(idx)}
+        />
+      ))}
+    </div>
+  );
+}
+
+function AttachmentChip({
+  attachment,
+  onRemove,
+}: {
+  attachment: Attachment;
+  onRemove: () => void;
+}) {
+  const { kind, mediaType, source, name, bytes } = attachment;
+  const isImage = kind === "image";
+  // Short, human type label from the IANA media type: "image/png" -> "PNG".
+  const typeLabel =
+    mediaType.split("/")[1]?.toUpperCase() ?? kind.toUpperCase();
+  const label = name ?? typeLabel;
+
+  // Inline (base64) previews resolve synchronously; a path reference is resolved
+  // lazily through Tauri's asset protocol (dynamic import, like ipc.ts, so the mock
+  // build never statically bundles Tauri). Falls back to the icon tile if absent.
+  const [thumb, setThumb] = useState<string | undefined>(() =>
+    isImage && source.type === "inline"
+      ? `data:${mediaType};base64,${source.value}`
+      : undefined,
+  );
+  useEffect(() => {
+    if (!isImage || source.type !== "path") return;
+    let alive = true;
+    void import("@tauri-apps/api/core")
+      .then(({ convertFileSrc }) => {
+        if (alive) setThumb(convertFileSrc(source.value));
+      })
+      .catch(() => {
+        /* no asset protocol (e.g. mock/browser) — keep the icon fallback */
+      });
+    return () => {
+      alive = false;
+    };
+  }, [isImage, source.type, source.value]);
+
+  return (
+    <div
+      className="group relative flex items-center gap-2 rounded-md border bg-muted/40 py-1 pl-1 pr-2"
+      title={
+        name ? `${name} · ${typeLabel} · ${formatBytes(bytes)}` : undefined
+      }
+    >
+      <div className="flex size-9 shrink-0 items-center justify-center overflow-hidden rounded bg-background text-muted-foreground">
+        {thumb ? (
+          <img
+            src={thumb}
+            alt={label}
+            className="size-9 rounded object-cover"
+          />
+        ) : (
+          <FileText className="size-4" />
+        )}
+      </div>
+      <div className="flex min-w-0 flex-col">
+        <span className="max-w-32 truncate text-xs text-foreground">
+          {label}
+        </span>
+        <span className="text-[10px] uppercase tracking-wide text-muted-foreground">
+          {typeLabel} · {formatBytes(bytes)}
+        </span>
+      </div>
+      <Button
+        type="button"
+        variant="ghost"
+        size="icon-xs"
+        className="ml-1 shrink-0 text-muted-foreground hover:text-foreground"
+        onClick={onRemove}
+        title={name ? `Remove ${name}` : "Remove attachment"}
+        aria-label="Remove attachment"
+      >
+        <X className="size-3" />
+      </Button>
     </div>
   );
 }
