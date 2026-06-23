@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Pause, Play, Plus, SquareArrowOutUpRight } from "lucide-react";
+import { Pause, Play, Plus, SquareArrowOutUpRight } from "@/components/ui/icon";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { cn } from "@/lib/utils";

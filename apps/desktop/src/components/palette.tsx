@@ -19,7 +19,7 @@ import {
   SplitSquareVertical,
   TextCursorInput,
   WrapText,
-} from "lucide-react";
+} from "@/components/ui/icon";
 import { cn } from "@/lib/utils";
 import { ipc } from "@/lib/ipc";
 import type { SkillInfo } from "@/bindings";

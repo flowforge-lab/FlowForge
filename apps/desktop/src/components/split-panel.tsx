@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { Check, Copy, WrapText, X } from "lucide-react";
+import { Check, Copy, WrapText, X } from "@/components/ui/icon";
 import { cn } from "@/lib/utils";
 import { HighlightedCode } from "@/components/markdown";
 import {

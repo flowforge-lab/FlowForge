@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { ShieldCheck, X } from "lucide-react";
+import { ShieldCheck, X } from "@/components/ui/icon";
 import { Button } from "@/components/ui/button";
 import { useChatStore } from "@/store/chat";
 

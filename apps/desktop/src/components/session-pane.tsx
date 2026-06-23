@@ -1,4 +1,4 @@
-import { Columns2, Rows2, X } from "lucide-react";
+import { Columns2, Rows2, X } from "@/components/ui/icon";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { ChatView } from "@/components/chat-view";
