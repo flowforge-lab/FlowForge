@@ -217,10 +217,6 @@ impl BedrockProvider {
 /// thinking is on, since Converse requires `maxTokens > budget_tokens` (#394).
 const BEDROCK_ANSWER_HEADROOM: u32 = 4_096;
 
-/// Concrete reasoning budget for High effort -- Bedrock Converse needs an explicit
-/// `budget_tokens`, so "uncapped" resolves to a generous fixed ceiling (#394).
-const BEDROCK_HIGH_BUDGET: u32 = 24_576;
-
 /// Build the `additionalModelRequestFields` document that turns on Claude
 /// extended thinking with the given reasoning-token budget (#394).
 fn reasoning_config_doc(budget_tokens: u32) -> Document {
@@ -262,7 +258,7 @@ impl Provider for BedrockProvider {
         // matching maxTokens with answer headroom. Non-thinking turns are
         // untouched, preserving the model's default maxTokens.
         if req.thinking {
-            let budget = self.reasoning_effort.budget_or(BEDROCK_HIGH_BUDGET);
+            let budget = self.reasoning_effort.budget_tokens();
             call = call
                 .inference_config(
                     InferenceConfiguration::builder()
@@ -858,17 +854,13 @@ mod tests {
 
     #[test]
     fn reasoning_config_doc_enables_thinking_with_budget() {
-        // Each effort level resolves to a concrete budget for Converse, with
-        // High clamped to the fixed ceiling (no "uncapped" mode on Bedrock).
-        let low = ReasoningEffort::Low.budget_or(BEDROCK_HIGH_BUDGET);
-        let med = ReasoningEffort::Medium.budget_or(BEDROCK_HIGH_BUDGET);
-        let high = ReasoningEffort::High.budget_or(BEDROCK_HIGH_BUDGET);
-        assert_eq!(budget_of(&reasoning_config_doc(low)), 2048);
-        assert_eq!(budget_of(&reasoning_config_doc(med)), 8192);
-        assert_eq!(
-            budget_of(&reasoning_config_doc(high)),
-            BEDROCK_HIGH_BUDGET as u64
-        );
+        // Each effort level maps to its uniform concrete budget for Converse.
+        let low = ReasoningEffort::Low.budget_tokens();
+        let med = ReasoningEffort::Medium.budget_tokens();
+        let high = ReasoningEffort::High.budget_tokens();
+        assert_eq!(budget_of(&reasoning_config_doc(low)), 1024);
+        assert_eq!(budget_of(&reasoning_config_doc(med)), 4096);
+        assert_eq!(budget_of(&reasoning_config_doc(high)), 8192);
         // maxTokens (budget + headroom) stays above every budget, so Converse
         // accepts the request.
         for b in [low, med, high] {

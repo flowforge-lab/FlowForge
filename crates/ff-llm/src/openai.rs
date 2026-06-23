@@ -319,13 +319,11 @@ impl Provider for OpenAiProvider {
         match self.reasoning {
             ReasoningControl::None => {}
             ReasoningControl::SiliconFlow { effort } => {
-                if !req.thinking {
+                if req.thinking {
+                    body["thinking_budget"] = serde_json::json!(effort.budget_tokens());
+                } else {
                     body["enable_thinking"] = serde_json::json!(false);
-                } else if let Some(budget) = effort.budget_tokens() {
-                    body["thinking_budget"] = serde_json::json!(budget);
                 }
-                // High effort is uncapped: emit nothing and let the gateway use
-                // its own default reasoning depth.
             }
         }
 
@@ -904,7 +902,7 @@ mod tests {
             },
         );
         let body = captured_body(&provider, &server, user_req(true)).await;
-        assert_eq!(body["thinking_budget"], 8192);
+        assert_eq!(body["thinking_budget"], 4096);
         assert!(
             body.get("enable_thinking").is_none(),
             "budget cap, not the off-switch, when thinking is on"
@@ -920,13 +918,13 @@ mod tests {
             },
         );
         let body = captured_body(&provider, &server, user_req(true)).await;
-        assert_eq!(body["thinking_budget"], 2048);
+        assert_eq!(body["thinking_budget"], 1024);
     }
 
     #[tokio::test]
-    async fn siliconflow_high_effort_is_uncapped() {
-        // High effort sends neither knob when thinking is on: the gateway uses
-        // its own default depth (the user explicitly opted into deep reasoning).
+    async fn siliconflow_high_effort_caps_at_8192() {
+        // High is a hard 8192 cap (not uncapped), keeping the cost guard intact
+        // even at the top of the dial.
         let server = MockServer::start().await;
         let provider = OpenAiProvider::new(server.uri(), None).with_reasoning_control(
             ReasoningControl::SiliconFlow {
@@ -934,7 +932,7 @@ mod tests {
             },
         );
         let body = captured_body(&provider, &server, user_req(true)).await;
-        assert!(body.get("thinking_budget").is_none());
+        assert_eq!(body["thinking_budget"], 8192);
         assert!(body.get("enable_thinking").is_none());
     }
 

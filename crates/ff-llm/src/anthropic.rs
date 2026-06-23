@@ -11,6 +11,10 @@ use crate::{
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
 const DEFAULT_MAX_TOKENS: u32 = 4096;
+/// Tokens reserved for the visible answer above the thinking budget. Anthropic's
+/// `max_tokens` caps thinking + answer combined and must exceed `budget_tokens`,
+/// so on a thinking turn we bump it to `budget + this` when it would be too low.
+const ANTHROPIC_ANSWER_HEADROOM: u32 = 4096;
 
 /// Native Anthropic Messages API provider (`POST /v1/messages`, server-sent events).
 ///
@@ -231,10 +235,15 @@ fn to_anthropic_request(req: &ChatRequest, max_tokens: u32, effort: ReasoningEff
         body["tools"] = Value::Array(tools);
     }
     if req.thinking {
-        // Anthropic requires budget_tokens < max_tokens; reserve room for the
-        // answer. High effort uses all available headroom (max_tokens - 1).
-        let budget = effort.budget_or(max_tokens.saturating_sub(1));
+        let budget = effort.budget_tokens();
         body["thinking"] = json!({ "type": "enabled", "budget_tokens": budget });
+        // Anthropic requires budget_tokens < max_tokens (thinking + answer share
+        // the cap), so raise max_tokens to leave answer room when the configured
+        // cap is too low for this budget.
+        let needed = budget + ANTHROPIC_ANSWER_HEADROOM;
+        if needed > max_tokens {
+            body["max_tokens"] = json!(needed);
+        }
     }
     body
 }
@@ -930,11 +939,17 @@ mod tests {
             tools: vec![],
             thinking: true,
         };
-        // Medium effort caps at 8192 but must stay below max_tokens (4096).
+        // Medium budget is 4096; with the default 4096 cap, max_tokens is bumped
+        // so budget stays strictly below it (Anthropic requirement).
         let body = to_anthropic_request(&req, 4096, ReasoningEffort::Medium);
         assert_eq!(body["thinking"]["type"], "enabled");
         let budget = body["thinking"]["budget_tokens"].as_u64().unwrap();
-        assert!(budget < 4096);
+        let max_tokens = body["max_tokens"].as_u64().unwrap();
+        assert_eq!(budget, 4096);
+        assert!(
+            budget < max_tokens,
+            "budget {budget} !< max_tokens {max_tokens}"
+        );
     }
 
     #[test]
@@ -945,14 +960,15 @@ mod tests {
             tools: vec![],
             thinking: true,
         };
-        // With generous max_tokens, Low/Medium hit their caps and High uses
-        // all available headroom (max_tokens - 1).
+        // Budgets are uniform and concrete regardless of max_tokens.
         let low = to_anthropic_request(&req, 32000, ReasoningEffort::Low);
-        assert_eq!(low["thinking"]["budget_tokens"], 2048);
+        assert_eq!(low["thinking"]["budget_tokens"], 1024);
         let med = to_anthropic_request(&req, 32000, ReasoningEffort::Medium);
-        assert_eq!(med["thinking"]["budget_tokens"], 8192);
+        assert_eq!(med["thinking"]["budget_tokens"], 4096);
         let high = to_anthropic_request(&req, 32000, ReasoningEffort::High);
-        assert_eq!(high["thinking"]["budget_tokens"], 31999);
+        assert_eq!(high["thinking"]["budget_tokens"], 8192);
+        // A generous cap is left untouched (only bumped when too low).
+        assert_eq!(high["max_tokens"], 32000);
     }
 
     #[test]

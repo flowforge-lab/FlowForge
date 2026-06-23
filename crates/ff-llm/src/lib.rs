@@ -261,35 +261,31 @@ pub fn wire_dialect(kind: ff_core::ProviderKind, vendor: Option<&str>, model: &s
 /// Bedrock Converse and native Anthropic extended thinking (`budget_tokens`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ReasoningEffort {
-    /// Shallow reasoning -- a tight budget that still bounds runaway cost.
+    /// Shallow reasoning -- a tight budget that still bounds runaway cost. 1024
+    /// is the Anthropic/Bedrock documented minimum and recommended starting point.
     Low,
-    /// The default. Generous enough to preserve normal reasoning quality while
-    /// capping the chain-of-thought; this is what tamed SiliconFlow's auto-`max`
-    /// escalation that burned tokens in a coding session (#394).
+    /// The default. Caps the chain-of-thought well above every model's natural
+    /// reasoning length (194-527 tokens for SiliconFlow GLM/Kimi/DeepSeek, #394),
+    /// so it only bites runaway agentic loops -- which is what burned tokens.
     #[default]
     Medium,
-    /// Deepest reasoning. `None` budget -- let the provider use its own default /
-    /// maximum (the SiliconFlow gateway emits no cap; native APIs use headroom).
+    /// Deepest reasoning. A hard 8192 cap rather than uncapped, keeping #394's
+    /// cost guard intact even at the top of the dial. (Adaptive-effort models
+    /// such as Opus 4.7, which deprecated `budget_tokens`, are out of scope.)
     High,
 }
 
 impl ReasoningEffort {
-    /// Reasoning/thinking token budget for this effort level. `None` means
-    /// "no explicit cap" (High) -- backends that need a concrete number resolve
-    /// it via [`ReasoningEffort::budget_or`].
-    pub fn budget_tokens(self) -> Option<u32> {
+    /// Reasoning/thinking token budget for this effort level. Uniform across
+    /// every supported backend (SiliconFlow `thinking_budget`, Bedrock Converse
+    /// and native Anthropic `budget_tokens`). All values are >= the 1024
+    /// Anthropic/Bedrock minimum and <= the 32k model maximum.
+    pub fn budget_tokens(self) -> u32 {
         match self {
-            ReasoningEffort::Low => Some(2048),
-            ReasoningEffort::Medium => Some(8192),
-            ReasoningEffort::High => None,
+            ReasoningEffort::Low => 1024,
+            ReasoningEffort::Medium => 4096,
+            ReasoningEffort::High => 8192,
         }
-    }
-
-    /// Concrete budget for backends that require an explicit token count and have
-    /// no "uncapped" mode (Bedrock Converse, native Anthropic). High resolves to
-    /// `high_cap`, the backend's available headroom.
-    pub fn budget_or(self, high_cap: u32) -> u32 {
-        self.budget_tokens().map_or(high_cap, |b| b.min(high_cap))
     }
 }
 
@@ -681,14 +677,18 @@ mod tests {
 
     #[test]
     fn reasoning_effort_budgets_match_frontend_dial() {
-        assert_eq!(ReasoningEffort::Low.budget_tokens(), Some(2048));
-        assert_eq!(ReasoningEffort::Medium.budget_tokens(), Some(8192));
-        assert_eq!(ReasoningEffort::High.budget_tokens(), None);
+        assert_eq!(ReasoningEffort::Low.budget_tokens(), 1024);
+        assert_eq!(ReasoningEffort::Medium.budget_tokens(), 4096);
+        assert_eq!(ReasoningEffort::High.budget_tokens(), 8192);
         assert_eq!(ReasoningEffort::default(), ReasoningEffort::Medium);
-        // budget_or clamps to the backend headroom and resolves High to it.
-        assert_eq!(ReasoningEffort::Low.budget_or(4095), 2048);
-        assert_eq!(ReasoningEffort::Medium.budget_or(4095), 4095);
-        assert_eq!(ReasoningEffort::High.budget_or(4095), 4095);
+        // Every level sits in the Anthropic/Bedrock valid range [1024, 32000).
+        for e in [
+            ReasoningEffort::Low,
+            ReasoningEffort::Medium,
+            ReasoningEffort::High,
+        ] {
+            assert!((1024..32_000).contains(&e.budget_tokens()), "{e:?}");
+        }
     }
 
     #[test]
