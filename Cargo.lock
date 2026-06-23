@@ -1991,6 +1991,7 @@ dependencies = [
  "fast_html2md",
  "ff-core",
  "ff-memory",
+ "ff-session",
  "futures-util",
  "globset",
  "grep-regex",

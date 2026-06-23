@@ -27,7 +27,8 @@ pub use compaction::{
     DEFAULT_FLUSH_AT_FRACTION,
 };
 pub use compaction_extractive::{
-    classify, proxy_tokens, CompactionSavings, ContentKind, ExtractiveCompactor, ReversibleCache,
+    classify, proxy_tokens, CompactionSavings, CompressOutcome, ContentKind, ExtractiveCompactor,
+    ReversibleCache,
 };
 pub use system_prompt::{build_flush_prompt, build_system_prompt, TimeOfDay, UserContext};
 
@@ -913,11 +914,22 @@ pub async fn run_turn(
                 }
             };
 
-            store.add_tool_result_message(
+            // Content-aware, reversible compaction at ingest (M7.1a, RFC 0016
+            // Tier 1): shrink large tool results before they enter the transcript
+            // and stash the verbatim original keyed by the marker's hash so the
+            // model can `compaction_retrieve` it. `truncate_tool_result` stays as
+            // a hard byte backstop for pathological payloads that still exceed the
+            // cap after compaction.
+            let compacted = compaction_extractive::ExtractiveCompactor::default()
+                .compress_one(&outcome.content);
+            let result_msg = store.add_tool_result_message(
                 session_id,
                 call.id.clone(),
-                truncate_tool_result(&outcome.content),
+                truncate_tool_result(&compacted.text),
             );
+            if let Some((key, original)) = compacted.original {
+                store.put_compaction_original(session_id, &result_msg.id, &key, &original);
+            }
             backfill.fulfilled(&call.id);
             on_event(AgentEvent::ToolCallFinished {
                 message_id: message_id.clone(),
@@ -3413,6 +3425,216 @@ mod tests {
             tool_msg.content.contains("truncated"),
             "history result should carry the truncation marker"
         );
+    }
+
+    /// A tool whose result is a large, compressible JSON blob.
+    struct JsonResultTool;
+    #[async_trait]
+    impl ff_tools::Tool for JsonResultTool {
+        fn name(&self) -> &str {
+            "jsonbig"
+        }
+        fn description(&self) -> &str {
+            "returns a large json blob"
+        }
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({ "type": "object", "properties": {} })
+        }
+        fn safety(&self, _args: &serde_json::Value) -> Safety {
+            Safety::ReadOnly
+        }
+        async fn run(&self, _args: serde_json::Value, _root: &Path) -> ff_tools::ToolOutcome {
+            let blob = serde_json::to_string(&serde_json::json!({
+                "summary": "x".repeat(4000),
+                "items": (0..50).map(|i| format!("row {i}")).collect::<Vec<_>>(),
+            }))
+            .unwrap();
+            ff_tools::ToolOutcome::ok(blob)
+        }
+    }
+
+    /// First call invokes `jsonbig`; second returns plain text.
+    struct JsonToolThenText {
+        calls: AtomicUsize,
+    }
+    #[async_trait]
+    impl Provider for JsonToolThenText {
+        async fn chat_stream(&self, _req: ChatRequest) -> Result<ChunkStream, LlmError> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            let chunks = if n == 0 {
+                vec![Ok(Chunk {
+                    tool_calls: vec![ToolCallDelta {
+                        index: 0,
+                        id: Some("call_1".into()),
+                        name: Some("jsonbig".into()),
+                        arguments: "{}".into(),
+                    }],
+                    done: true,
+                    ..Chunk::default()
+                })]
+            } else {
+                vec![Ok(Chunk {
+                    delta: "done".into(),
+                    done: true,
+                    ..Chunk::default()
+                })]
+            };
+            Ok(futures_util::stream::iter(chunks).boxed())
+        }
+    }
+
+    #[tokio::test]
+    async fn large_tool_result_is_compacted_and_retrievable() {
+        let store = SessionStore::new();
+        let s = store.create_session(None);
+        store.add_message(&s.id, Role::User, "go".into());
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(JsonResultTool));
+        let root = std::env::current_dir().unwrap();
+        let approve = AlwaysApprove;
+
+        let mut full_len = 0usize;
+        run_turn(
+            &JsonToolThenText {
+                calls: AtomicUsize::new(0),
+            },
+            &store,
+            &ctx(&registry, &root, &approve),
+            &s.id,
+            "mock",
+            None,
+            false,
+            CancelToken::new(),
+            |ev| {
+                if let AgentEvent::ToolCallFinished { result, .. } = ev {
+                    full_len = result.len();
+                }
+            },
+        )
+        .await
+        .unwrap();
+
+        let history = store.get_messages(&s.id);
+        let tool_msg = history
+            .iter()
+            .find(|m| m.role == Role::Tool)
+            .expect("a tool result message");
+
+        // The stored content was compacted (smaller than the original) and carries
+        // the reversible retrieve marker.
+        assert!(
+            tool_msg.content.contains("[compacted; retrieve key="),
+            "compacted tool result must carry a retrieve marker: {}",
+            tool_msg.content
+        );
+        assert!(
+            tool_msg.content.len() < full_len,
+            "compacted content ({}) must be smaller than the original ({full_len})",
+            tool_msg.content.len()
+        );
+
+        // The marker key resolves to the verbatim original in the store.
+        let key = tool_msg
+            .content
+            .rsplit("key=")
+            .next()
+            .unwrap()
+            .trim_end_matches(']')
+            .trim();
+        let original = store
+            .compaction_original(key)
+            .expect("the original must be retrievable by the marker key");
+        assert_eq!(
+            original.len(),
+            full_len,
+            "retrieved original must be verbatim"
+        );
+    }
+
+    /// A tool result below the compaction threshold is stored verbatim with no
+    /// marker and no stored original.
+    struct SmallResultTool;
+    #[async_trait]
+    impl ff_tools::Tool for SmallResultTool {
+        fn name(&self) -> &str {
+            "small"
+        }
+        fn description(&self) -> &str {
+            "returns a tiny blob"
+        }
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({ "type": "object", "properties": {} })
+        }
+        fn safety(&self, _args: &serde_json::Value) -> Safety {
+            Safety::ReadOnly
+        }
+        async fn run(&self, _args: serde_json::Value, _root: &Path) -> ff_tools::ToolOutcome {
+            ff_tools::ToolOutcome::ok("ok: 3 results")
+        }
+    }
+
+    struct SmallToolThenText {
+        calls: AtomicUsize,
+    }
+    #[async_trait]
+    impl Provider for SmallToolThenText {
+        async fn chat_stream(&self, _req: ChatRequest) -> Result<ChunkStream, LlmError> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            let chunks = if n == 0 {
+                vec![Ok(Chunk {
+                    tool_calls: vec![ToolCallDelta {
+                        index: 0,
+                        id: Some("call_1".into()),
+                        name: Some("small".into()),
+                        arguments: "{}".into(),
+                    }],
+                    done: true,
+                    ..Chunk::default()
+                })]
+            } else {
+                vec![Ok(Chunk {
+                    delta: "done".into(),
+                    done: true,
+                    ..Chunk::default()
+                })]
+            };
+            Ok(futures_util::stream::iter(chunks).boxed())
+        }
+    }
+
+    #[tokio::test]
+    async fn small_tool_result_is_passed_through_uncompacted() {
+        let store = SessionStore::new();
+        let s = store.create_session(None);
+        store.add_message(&s.id, Role::User, "go".into());
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(SmallResultTool));
+        let root = std::env::current_dir().unwrap();
+        let approve = AlwaysApprove;
+
+        run_turn(
+            &SmallToolThenText {
+                calls: AtomicUsize::new(0),
+            },
+            &store,
+            &ctx(&registry, &root, &approve),
+            &s.id,
+            "mock",
+            None,
+            false,
+            CancelToken::new(),
+            |_ev| {},
+        )
+        .await
+        .unwrap();
+
+        let history = store.get_messages(&s.id);
+        let tool_msg = history
+            .iter()
+            .find(|m| m.role == Role::Tool)
+            .expect("a tool result message");
+        assert_eq!(tool_msg.content, "ok: 3 results");
+        assert!(!tool_msg.content.contains("[compacted"));
     }
 
     // ----- #244 R5: in-turn context-pressure flush -----

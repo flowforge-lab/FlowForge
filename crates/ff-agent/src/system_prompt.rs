@@ -142,6 +142,17 @@ pub fn build_system_prompt(
         out.push('\n');
     }
 
+    // Stable guidance (kept in the cache-stable prefix): large tool results are
+    // compacted at ingest (RFC 0016 Tier 1) and carry a retrieve marker, so the
+    // model knows it can recover dropped detail on demand.
+    out.push_str(
+        "## Compacted tool results\n\
+         Large tool results are abbreviated to save context and end with a \
+         `[compacted; retrieve key=<HEX>]` marker. When you need detail the \
+         abbreviation dropped, call `compaction_retrieve` with that key to read \
+         the verbatim original.\n\n",
+    );
+
     out.push_str("## User context\n");
     out.push_str(&format!(
         "Current: {}, {} ({}).\n",
@@ -360,14 +371,15 @@ mod tests {
         );
         assert!(with.starts_with("You are a coding assistant.\n\n"));
         let without = build_system_prompt(None, &reg, &[], &ctx(), None, Mode::default());
-        assert!(without.starts_with("## User context"));
+        assert!(!without.starts_with("You are"));
+        assert!(without.starts_with("## Compacted tool results"));
     }
 
     #[test]
     fn blank_persona_is_ignored() {
         let reg = SkillRegistry::new();
         let out = build_system_prompt(Some("   \n  "), &reg, &[], &ctx(), None, Mode::default());
-        assert!(out.starts_with("## User context"), "{out}");
+        assert!(out.starts_with("## Compacted tool results"), "{out}");
     }
 
     #[test]

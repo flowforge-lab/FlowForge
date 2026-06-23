@@ -476,7 +476,7 @@ fn send_message(
         let thinking = state.provider_config().thinking;
         let result = run_turn(
             provider.as_ref(),
-            &state.store,
+            state.store.as_ref(),
             &tool_ctx,
             &sid,
             &model,

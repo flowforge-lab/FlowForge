@@ -320,8 +320,11 @@ async fn run(
     let (provider, default_model) = host::load_provider();
     let skills = host::load_skills();
     let workspace = host::workspace_root();
-    let store = ff_session::SessionStore::new();
-    let (registry, memory_store, memory_index) = build_registry_with_memory();
+    let store = std::sync::Arc::new(ff_session::SessionStore::new());
+    let (mut registry, memory_store, memory_index) = build_registry_with_memory();
+    registry.register(Box::new(ff_tools::CompactionRetrieveTool::new(
+        store.clone(),
+    )));
     let approver = CliApprover::new(approval_mode, mode);
 
     let session = store.create_session(None);
@@ -442,8 +445,11 @@ async fn chat(json: bool, approval_mode: ApprovalMode, mode: Mode) -> ExitCode {
     let (provider, model) = host::load_provider();
     let skills = host::load_skills();
     let workspace = host::workspace_root();
-    let store = ff_session::SessionStore::new();
-    let (registry, memory_store, memory_index) = build_registry_with_memory();
+    let store = std::sync::Arc::new(ff_session::SessionStore::new());
+    let (mut registry, memory_store, memory_index) = build_registry_with_memory();
+    registry.register(Box::new(ff_tools::CompactionRetrieveTool::new(
+        store.clone(),
+    )));
     let approver = CliApprover::new(approval_mode, mode);
     let session = store.create_session(None);
 

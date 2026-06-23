@@ -206,6 +206,43 @@ impl SessionStore {
         })
     }
 
+    /// Persist the verbatim original of a compacted tool result, keyed by the
+    /// content hash carried in its `[compacted; retrieve key=...]` marker
+    /// (M7.1a, RFC 0016 Tier 1). Idempotent: an identical original (same key)
+    /// is written once -- repeated tool outputs share one row.
+    pub fn put_compaction_original(
+        &self,
+        session_id: &str,
+        message_id: &str,
+        key: &str,
+        content: &str,
+    ) {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO compaction_originals
+                 (key, session_id, message_id, content, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![key, session_id, message_id, content, now_ms()],
+        )
+        .ok();
+    }
+
+    /// Look up a compacted tool result's verbatim original by its retrieve key.
+    /// Returns `None` when no original is stored for the key (e.g. it was never
+    /// compacted, or its session was deleted).
+    #[must_use]
+    pub fn compaction_original(&self, key: &str) -> Option<String> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT content FROM compaction_originals WHERE key = ?1",
+            params![key],
+            |row| row.get(0),
+        )
+        .optional()
+        .ok()
+        .flatten()
+    }
+
     fn push_message(&self, msg: Message) -> Message {
         let conn = self.conn.lock().unwrap();
         let seq: i64 = conn
@@ -686,6 +723,27 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
         conn.execute_batch("ALTER TABLE messages ADD COLUMN reasoning TEXT;")?;
         conn.pragma_update(None, "user_version", 4)?;
     }
+    if version < 5 {
+        // M7.1a (RFC 0016 Tier 1): reversible tool-result compaction. A compacted
+        // tool result stores its compressed form in messages.content and the
+        // verbatim original here, keyed by the content hash carried in the
+        // [compacted; retrieve key=...] marker. The compaction_retrieve tool reads
+        // this table on demand. ON DELETE CASCADE frees originals when a session is
+        // wiped so the table cannot outlive the transcript it backs.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS compaction_originals (
+                 key         TEXT PRIMARY KEY,
+                 session_id  TEXT NOT NULL,
+                 message_id  TEXT,
+                 content     TEXT NOT NULL,
+                 created_at  INTEGER NOT NULL,
+                 FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
+             );
+             CREATE INDEX IF NOT EXISTS idx_compaction_originals_session
+                 ON compaction_originals(session_id);",
+        )?;
+        conn.pragma_update(None, "user_version", 5)?;
+    }
     Ok(())
 }
 
@@ -1002,7 +1060,95 @@ mod tests {
             .unwrap()
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 4);
+        assert_eq!(version, 5);
+    }
+
+    #[test]
+    fn put_and_get_compaction_original_round_trip() {
+        let store = SessionStore::new();
+        let s = store.create_session(None);
+        let m = store.add_tool_result_message(&s.id, "call-1".into(), "compressed".into());
+        store.put_compaction_original(&s.id, &m.id, "abc123", "the full original blob");
+        assert_eq!(
+            store.compaction_original("abc123").as_deref(),
+            Some("the full original blob")
+        );
+        assert!(store.compaction_original("missing").is_none());
+    }
+
+    #[test]
+    fn put_compaction_original_is_idempotent_on_key() {
+        let store = SessionStore::new();
+        let s = store.create_session(None);
+        store.put_compaction_original(&s.id, "m1", "k", "first");
+        store.put_compaction_original(&s.id, "m2", "k", "second");
+        assert_eq!(store.compaction_original("k").as_deref(), Some("first"));
+    }
+
+    #[test]
+    fn compaction_originals_cascade_on_session_delete() {
+        let store = SessionStore::new();
+        let s = store.create_session(None);
+        store.put_compaction_original(&s.id, "m1", "k", "blob");
+        assert!(store.compaction_original("k").is_some());
+        assert!(store.delete_session(&s.id));
+        assert!(
+            store.compaction_original("k").is_none(),
+            "deleting a session must cascade-drop its compaction originals"
+        );
+    }
+
+    #[test]
+    fn migration_v4_to_v5_preserves_messages_and_creates_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sessions.db");
+        let sid = "sess-1";
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE sessions (
+                     id TEXT PRIMARY KEY, goal TEXT, title TEXT, summary TEXT,
+                     status TEXT NOT NULL, created_at INTEGER NOT NULL,
+                     updated_at INTEGER NOT NULL, phenotype TEXT, mode TEXT, workspace TEXT
+                 );
+                 CREATE TABLE messages (
+                     id TEXT PRIMARY KEY, session_id TEXT NOT NULL, seq INTEGER NOT NULL,
+                     role TEXT NOT NULL, content TEXT NOT NULL, tool_calls TEXT,
+                     tool_call_id TEXT, attachments TEXT, reasoning TEXT,
+                     created_at INTEGER NOT NULL
+                 );",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO sessions (id, status, created_at, updated_at)
+                 VALUES (?1, 'active', 0, 0)",
+                params![sid],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO messages (id, session_id, seq, role, content, created_at)
+                 VALUES ('m1', ?1, 0, 'assistant', 'legacy', 0)",
+                params![sid],
+            )
+            .unwrap();
+            conn.pragma_update(None, "user_version", 4).unwrap();
+        }
+
+        let store = SessionStore::open(&path).unwrap();
+        let msgs = store.get_messages(sid);
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].content, "legacy");
+
+        store.put_compaction_original(sid, "m1", "k", "blob");
+        assert_eq!(store.compaction_original("k").as_deref(), Some("blob"));
+
+        let version: i64 = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 5);
     }
 
     #[test]
@@ -1295,7 +1441,7 @@ mod tests {
             .unwrap()
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 4);
+        assert_eq!(version, 5);
     }
 
     #[test]
