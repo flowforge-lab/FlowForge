@@ -171,7 +171,7 @@ fn build_provider(conn: &ProviderConnection) -> Box<dyn Provider> {
                     token: crate::secrets::get(id, SecretKind::ApiKey).unwrap_or_default(),
                 },
             };
-            Box::new(BedrockProvider::new(region, creds))
+            Box::new(BedrockProvider::new(region, creds).with_vision(conn.supports_vision))
         }
         // Hosted OpenAI (-compatible). Bearer key pulled from the keychain here so
         // the provider crate stays keychain-free, mirroring the Bedrock arm (#311).

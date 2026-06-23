@@ -620,6 +620,12 @@ fn render_event_text(event: AgentEvent) {
                 if writes == 1 { "" } else { "s" }
             );
         }
+        AgentEvent::AttachmentsDropped { count, .. } => {
+            eprintln!(
+                "\n[attachments] {count} attachment{} not sent -- this model cannot see images.",
+                if count == 1 { "" } else { "s" }
+            );
+        }
         AgentEvent::Done { .. } => {}
         AgentEvent::Reasoning { .. } => {}
         AgentEvent::Error { message } => {

@@ -133,6 +133,14 @@ pub enum AgentEvent {
         message_id: String,
         writes: u32,
     },
+    /// One or more attachments on the user's turn were dropped before the request
+    /// because the active model lacks vision (#338). The per-provider capability
+    /// strip is otherwise silent; this turns the drop into a visible notice. Emitted
+    /// once per turn (first iteration only), keyed to that turn's assistant message.
+    AttachmentsDropped {
+        message_id: String,
+        count: u32,
+    },
     Error {
         message: String,
     },
@@ -579,6 +587,30 @@ pub async fn run_turn(
                 message_id: message_id.clone(),
                 writes,
             });
+        }
+
+        // Graceful-degradation notice (#338): when the active model can't see images,
+        // the per-provider capability strip silently drops attachments before they
+        // reach the wire. Surface that once per turn so the drop isn't invisible.
+        // Count the attachments on the turn's triggering user message (the last user
+        // message in history); gating on the first iteration avoids re-notifying on
+        // each tool-loop iteration, and counting only the last user message avoids
+        // re-firing on later turns whose own input carries nothing.
+        if iter == 0 && !provider.supports_vision() {
+            let dropped = history
+                .iter()
+                .rev()
+                .find(|m| m.role == Role::User)
+                .and_then(|m| m.attachments.as_ref())
+                .map_or(0, |a| a.len());
+            if let Ok(count) = u32::try_from(dropped) {
+                if count > 0 {
+                    on_event(AgentEvent::AttachmentsDropped {
+                        message_id: message_id.clone(),
+                        count,
+                    });
+                }
+            }
         }
 
         // Bounded retry for transient provider failures (#244 R1). A setup error
@@ -1570,6 +1602,104 @@ mod tests {
         assert_eq!(msg.content, "Hello");
     }
 
+    /// A text provider that reports no vision support, for the #338 degrade notice.
+    struct NoVisionText;
+
+    #[async_trait]
+    impl Provider for NoVisionText {
+        fn supports_vision(&self) -> bool {
+            false
+        }
+
+        async fn chat_stream(&self, _req: ChatRequest) -> Result<ChunkStream, LlmError> {
+            Ok(futures_util::stream::iter(vec![Ok(Chunk {
+                delta: "ok".into(),
+                done: true,
+                ..Chunk::default()
+            })])
+            .boxed())
+        }
+    }
+
+    fn one_image() -> Vec<ff_core::Attachment> {
+        vec![ff_core::Attachment {
+            kind: ff_core::AttachmentKind::Image,
+            media_type: "image/png".into(),
+            source: ff_core::AttachmentSource::Inline("aGk=".into()),
+            name: None,
+            bytes: 2,
+        }]
+    }
+
+    #[tokio::test]
+    async fn no_vision_model_emits_one_attachments_dropped_notice() {
+        let store = SessionStore::new();
+        let s = store.create_session(None);
+        store.add_message_with_attachments(&s.id, Role::User, "look at this".into(), one_image());
+        let registry = ToolRegistry::new();
+        let root = std::env::current_dir().unwrap();
+        let approve = AlwaysApprove;
+
+        let mut dropped: Vec<u32> = Vec::new();
+        run_turn(
+            &NoVisionText,
+            &store,
+            &ctx(&registry, &root, &approve),
+            &s.id,
+            "mock",
+            None,
+            false,
+            CancelToken::new(),
+            |ev| {
+                if let AgentEvent::AttachmentsDropped { count, .. } = ev {
+                    dropped.push(count);
+                }
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            dropped,
+            vec![1],
+            "a non-vision model emits exactly one notice carrying the dropped count"
+        );
+    }
+
+    #[tokio::test]
+    async fn vision_model_does_not_emit_attachments_dropped() {
+        let store = SessionStore::new();
+        let s = store.create_session(None);
+        store.add_message_with_attachments(&s.id, Role::User, "look at this".into(), one_image());
+        let registry = ToolRegistry::new();
+        let root = std::env::current_dir().unwrap();
+        let approve = AlwaysApprove;
+
+        let mut emitted = false;
+        run_turn(
+            &TextProvider,
+            &store,
+            &ctx(&registry, &root, &approve),
+            &s.id,
+            "mock",
+            None,
+            false,
+            CancelToken::new(),
+            |ev| {
+                if matches!(ev, AgentEvent::AttachmentsDropped { .. }) {
+                    emitted = true;
+                }
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            !emitted,
+            "a vision-capable model keeps attachments, so no drop notice fires"
+        );
+    }
+
     #[tokio::test]
     async fn persists_reasoning_onto_assistant_message() {
         let dir = tempfile::tempdir().unwrap();
@@ -1677,6 +1807,7 @@ mod tests {
                 AgentEvent::Error { message } => panic!("error: {message}"),
                 AgentEvent::Done { .. } => {}
                 AgentEvent::MemoryFlushed { .. } => {}
+                AgentEvent::AttachmentsDropped { .. } => {}
             },
         )
         .await
@@ -1737,6 +1868,7 @@ mod tests {
                 AgentEvent::Error { message } => panic!("error: {message}"),
                 AgentEvent::Done { .. } => {}
                 AgentEvent::MemoryFlushed { .. } => {}
+                AgentEvent::AttachmentsDropped { .. } => {}
             },
         )
         .await
@@ -1851,6 +1983,7 @@ mod tests {
                 AgentEvent::Error { message } => panic!("error: {message}"),
                 AgentEvent::Done { .. } => {}
                 AgentEvent::MemoryFlushed { .. } => {}
+                AgentEvent::AttachmentsDropped { .. } => {}
             },
         )
         .await
