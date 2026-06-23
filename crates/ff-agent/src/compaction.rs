@@ -89,7 +89,14 @@ impl Default for ProxyTokenEstimator {
 
 impl ContextPressureEstimator for ProxyTokenEstimator {
     fn assess(&self, messages: &[Message], _model: &str) -> ContextPressure {
-        let chars: usize = messages.iter().map(|m| m.content.len()).sum();
+        // Count reasoning too (#378): it is replayed on the wire for reasoning
+        // gateways (#375 PR-2), so a turn's true cost includes its persisted CoT.
+        // Without this, injected reasoning bloats the request without ever tripping
+        // compaction -- the window blows before pressure is even noticed.
+        let chars: usize = messages
+            .iter()
+            .map(|m| m.content.len() + m.reasoning.as_deref().map_or(0, str::len))
+            .sum();
         ContextPressure {
             estimated_tokens: (chars / 4) as u64,
             budget_tokens: self.budget_tokens,
@@ -354,6 +361,18 @@ mod tests {
         assert_eq!(p.budget_tokens, 100);
         assert!((p.fraction() - 0.1).abs() < 1e-9);
         assert!(!p.is_over(0.75));
+    }
+
+    #[test]
+    fn proxy_estimator_counts_reasoning_bytes() {
+        // Persisted reasoning is replayed on the wire (#378), so it must count
+        // toward context pressure alongside content.
+        let est = ProxyTokenEstimator { budget_tokens: 100 };
+        let mut m = msg(Role::Assistant, &"x".repeat(40));
+        m.reasoning = Some("y".repeat(40));
+        // 40 content + 40 reasoning = 80 chars -> 20 proxy tokens.
+        let p = est.assess(&[m], "any-model");
+        assert_eq!(p.estimated_tokens, 20);
     }
 
     #[test]
