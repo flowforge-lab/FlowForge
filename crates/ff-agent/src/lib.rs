@@ -16,7 +16,7 @@ use ff_llm::{ChatMessage, ChatRequest, FunctionCall, LlmError, Provider, ToolCal
 use ff_session::SessionStore;
 use ff_tools::{Safety, ToolRegistry};
 use futures_util::StreamExt;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 mod compaction;
 mod compaction_extractive;
@@ -97,7 +97,7 @@ const REASONING_MAX_BYTES: usize = 16 * 1024;
 
 /// Events the agent emits during a turn. The host (Tauri shell or a test) decides
 /// how to surface them — over IPC, to a channel, or into assertions.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum AgentEvent {
     Token {
         message_id: String,

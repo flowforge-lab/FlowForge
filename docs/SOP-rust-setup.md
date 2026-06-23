@@ -220,8 +220,12 @@ pnpm tauri dev                    # hot-reloads both Rust and React
 # Local production bundle (no signing key needed)
 pnpm build:local            # .app/.dmg without the signed updater artifact
 
+# Production build
 # Release/CI build (signs the updater artifact)
 pnpm tauri build            # requires TAURI_SIGNING_PRIVATE_KEY (see below)
+# To bundle the CLI sidecar, pass the bundle overlay:
+#   pnpm tauri build --config src-tauri/tauri.bundle.conf.json
+# The dev scripts (scripts/dev-*.sh) do this for you.
 ```
 
 > **Heads-up:** `tauri.conf.json` sets `bundle.createUpdaterArtifacts: true` with a

@@ -27,6 +27,7 @@ use ff_tools::Safety;
 use state::AppState;
 use std::sync::Arc;
 use tauri::{Emitter, Manager, State};
+use tauri_plugin_shell::ShellExt;
 use uuid::Uuid;
 
 /// Per-turn telemetry accumulator (RFC 0001 §8), filled by the agent-event closure
@@ -482,110 +483,29 @@ fn send_message(
             Some(system_prompt.as_str()),
             thinking,
             cancel,
-            |event| match event {
-                AgentEvent::Token { message_id, delta } => {
-                    if let Ok(mut m) = metrics_for_events.lock() {
-                        m.note_turn(&message_id);
-                        m.chars += delta.chars().count();
+            |event| {
+                // Telemetry (RFC 0001 §8): fold per-turn metrics for events
+                // that carry a message_id. Token also counts streamed chars as
+                // a coarse token-cost proxy. In-process only — the sidecar path
+                // has no local accumulator and goes straight to emit_agent_event.
+                if let Ok(mut m) = metrics_for_events.lock() {
+                    match &event {
+                        AgentEvent::Token { message_id, delta } => {
+                            m.note_turn(message_id);
+                            m.chars += delta.chars().count();
+                        }
+                        AgentEvent::Reasoning { message_id, .. }
+                        | AgentEvent::ToolCallStarted { message_id, .. }
+                        | AgentEvent::Done { message_id, .. } => {
+                            m.note_turn(message_id);
+                        }
+                        _ => {}
                     }
-                    let _ = app.emit(
-                        "turn:token",
-                        TokenEvent {
-                            session_id: sid.clone(),
-                            message_id,
-                            delta,
-                        },
-                    );
                 }
-                AgentEvent::Reasoning { message_id, delta } => {
-                    if let Ok(mut m) = metrics_for_events.lock() {
-                        m.note_turn(&message_id);
-                    }
-                    let _ = app.emit(
-                        "turn:reasoning",
-                        ReasoningEvent {
-                            session_id: sid.clone(),
-                            message_id,
-                            delta,
-                        },
-                    );
-                }
-                AgentEvent::ToolCallStarted {
-                    message_id,
-                    call_id,
-                    name,
-                    args,
-                } => {
-                    if let Ok(mut m) = metrics_for_events.lock() {
-                        m.note_turn(&message_id);
-                    }
-                    let _ = app.emit(
-                        "tool:call",
-                        ToolCallEvent {
-                            session_id: sid.clone(),
-                            message_id,
-                            call_id,
-                            tool: name,
-                            args,
-                        },
-                    );
-                }
-                AgentEvent::ToolCallFinished {
-                    message_id,
-                    call_id,
-                    success,
-                    result,
-                } => {
-                    let _ = app.emit(
-                        "tool:result",
-                        ToolResultEvent {
-                            session_id: sid.clone(),
-                            message_id,
-                            call_id,
-                            success,
-                            result,
-                        },
-                    );
-                }
-                AgentEvent::Done {
-                    message_id,
-                    token_count,
-                    ..
-                } => {
-                    if let Ok(mut m) = metrics_for_events.lock() {
-                        m.note_turn(&message_id);
-                    }
-                    let _ = app.emit(
-                        "turn:done",
-                        TurnDoneEvent {
-                            session_id: sid.clone(),
-                            message_id,
-                            token_count,
-                        },
-                    );
-                }
-                AgentEvent::MemoryFlushed { message_id, writes } => {
-                    let _ = app.emit(
-                        "memory:flushed",
-                        MemoryFlushedEvent {
-                            session_id: sid.clone(),
-                            message_id,
-                            writes,
-                        },
-                    );
-                }
-                AgentEvent::AttachmentsDropped { .. } => {
-                    // User-facing notice deferred to PR-2 / #342 (transcript render).
-                }
-                AgentEvent::Error { message } => {
-                    let _ = app.emit(
-                        "turn:error",
-                        TurnErrorEvent {
-                            session_id: sid.clone(),
-                            message,
-                        },
-                    );
-                }
+                // Wire mapping is shared with the sidecar path via
+                // emit_agent_event, so the two cannot drift — the whole point
+                // of the sidecar parity test (RFC 0004 §5).
+                emit_agent_event(&app, &sid, event);
             },
         )
         .await;
@@ -1323,6 +1243,188 @@ async fn install_update(app: tauri::AppHandle) -> CmdResult<()> {
     app.restart();
 }
 
+/// Map an [`AgentEvent`] to its frontend Tauri event and emit it.
+///
+/// This is the single source of truth for the `AgentEvent → app.emit(…)` wire
+/// mapping shared by both turn paths — the in-process `run_turn` closure (in
+/// `send_message`) and the CLI sidecar loop below (`run_sidecar_turn`).
+/// Keeping both paths on one helper is exactly what the sidecar parity
+/// smoke-test (RFC 0004 §5) guards against drift: if the mapping changes, it
+/// changes in one place.
+fn emit_agent_event(app: &tauri::AppHandle, session_id: &str, event: AgentEvent) {
+    match event {
+        AgentEvent::Token { message_id, delta } => {
+            let _ = app.emit(
+                "turn:token",
+                TokenEvent {
+                    session_id: session_id.to_string(),
+                    message_id,
+                    delta,
+                },
+            );
+        }
+        AgentEvent::Reasoning { message_id, delta } => {
+            let _ = app.emit(
+                "turn:reasoning",
+                ReasoningEvent {
+                    session_id: session_id.to_string(),
+                    message_id,
+                    delta,
+                },
+            );
+        }
+        AgentEvent::ToolCallStarted {
+            message_id,
+            call_id,
+            name,
+            args,
+        } => {
+            let _ = app.emit(
+                "tool:call",
+                ToolCallEvent {
+                    session_id: session_id.to_string(),
+                    message_id,
+                    call_id,
+                    tool: name,
+                    args,
+                },
+            );
+        }
+        AgentEvent::ToolCallFinished {
+            message_id,
+            call_id,
+            success,
+            result,
+        } => {
+            let _ = app.emit(
+                "tool:result",
+                ToolResultEvent {
+                    session_id: session_id.to_string(),
+                    message_id,
+                    call_id,
+                    success,
+                    result,
+                },
+            );
+        }
+        AgentEvent::Done {
+            message_id,
+            token_count,
+            ..
+        } => {
+            let _ = app.emit(
+                "turn:done",
+                TurnDoneEvent {
+                    session_id: session_id.to_string(),
+                    message_id,
+                    token_count,
+                },
+            );
+        }
+        AgentEvent::MemoryFlushed { message_id, writes } => {
+            let _ = app.emit(
+                "memory:flushed",
+                MemoryFlushedEvent {
+                    session_id: session_id.to_string(),
+                    message_id,
+                    writes,
+                },
+            );
+        }
+        AgentEvent::AttachmentsDropped { .. } => {
+            // User-facing notice deferred to PR-2 / #342 (transcript render).
+        }
+        AgentEvent::Error { message } => {
+            let _ = app.emit(
+                "turn:error",
+                TurnErrorEvent {
+                    session_id: session_id.to_string(),
+                    message,
+                },
+            );
+        }
+    }
+}
+
+/// CLI.7 — Sidecar parity smoke-test (RFC 0004 §5).
+///
+/// Spawns the bundled `flowforge` CLI as a Tauri sidecar (`externalBin`),
+/// invokes `flowforge run "<prompt>" --json`, and re-emits every parsed
+/// `AgentEvent` as the same Tauri events the in-process `run_turn` path
+/// emits (`turn:token`, `tool:call`, `turn:done`, …).  This lets the
+/// frontend verify that the sidecar produces an event stream equivalent
+/// to the in-process path.
+///
+/// **PATH caveat (RFC 0004 §5):** the bundled sidecar binary lives inside
+/// the app bundle and is NOT on the user's PATH.  Users who want
+/// `flowforge` on the command line must install it separately or symlink
+/// it manually — see the caveat doc in `docs/rfcs/0004-cli.md`.
+#[tauri::command]
+async fn run_sidecar_turn(
+    app: tauri::AppHandle,
+    prompt: String,
+) -> Result<serde_json::Value, String> {
+    let session_id = Uuid::new_v4().to_string();
+
+    let command = app
+        .shell()
+        .sidecar("flowforge")
+        .map_err(|e| format!("failed to resolve sidecar: {e}"))?
+        .args(["run", prompt.as_str(), "--json"]);
+
+    let (mut rx, _child) = command
+        .spawn()
+        .map_err(|e| format!("failed to spawn sidecar: {e}"))?;
+
+    let mut event_count = 0usize;
+
+    while let Some(event) = rx.recv().await {
+        match event {
+            tauri_plugin_shell::process::CommandEvent::Stdout(line) => {
+                let line = String::from_utf8_lossy(&line);
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                let agent_event: AgentEvent = match serde_json::from_str(line) {
+                    Ok(e) => e,
+                    // The CLI emits only `AgentEvent` lines under `--json`, so a parse
+                    // failure normally means a schema drift between the two binaries.
+                    // Break loudly rather than swallowing it without a trace.
+                    Err(e) => {
+                        eprintln!(
+                            "[sidecar] failed to parse stdout line as AgentEvent ({e}); \
+                             this usually signals a schema drift between the desktop and \
+                             CLI binaries. line: {line}"
+                        );
+                        continue;
+                    }
+                };
+                event_count += 1;
+                emit_agent_event(&app, &session_id, agent_event);
+            }
+            tauri_plugin_shell::process::CommandEvent::Stderr(bytes) => {
+                eprintln!("[sidecar stderr] {}", String::from_utf8_lossy(&bytes));
+            }
+            tauri_plugin_shell::process::CommandEvent::Terminated(payload) => {
+                if payload.code != Some(0) {
+                    return Err(format!("sidecar exited with code {:?}", payload.code));
+                }
+                break;
+            }
+            tauri_plugin_shell::process::CommandEvent::Error(err) => {
+                return Err(format!("sidecar error: {err}"));
+            }
+            _ => {}
+        }
+    }
+
+    Ok(serde_json::json!({
+        "session_id": session_id,
+        "events": event_count,
+    }))
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let state = Arc::new(AppState::new());
@@ -1331,6 +1433,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_shell::init())
         .manage(state.clone())
         .setup(move |app| {
             // `init_mcp` enters the shared Tokio runtime itself, so it's safe to
@@ -1368,6 +1471,7 @@ pub fn run() {
             read_memory_file,
             memory_overview,
             send_message,
+            run_sidecar_turn,
             cancel_turn,
             respond_approval,
             respond_ask,

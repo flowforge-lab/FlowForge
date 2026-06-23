@@ -23,6 +23,7 @@ PORT="${1:-8787}"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BUNDLE_DIR="$REPO_ROOT/apps/desktop/src-tauri/target/release/bundle/macos"
 LOCAL_CONF="src-tauri/tauri.local.conf.json"
+BUNDLE_CONF="src-tauri/tauri.bundle.conf.json"
 
 if [[ "$(uname)" != "Darwin" ]]; then
   echo "dev-release.sh currently supports macOS only (the P1 dogfood platform)." >&2
@@ -41,9 +42,16 @@ case "$(uname -m)" in
 esac
 
 DEV_VERSION="0.0.0-dev.$(date +%s)"
+echo "==> Building CLI sidecar binary (CLI.7)"
+TRIPLE=$(rustc -vV | sed -n 's/^host: //p')
+mkdir -p "$REPO_ROOT/apps/desktop/src-tauri/binaries"
+cargo build -p ff-cli --release
+cp "$REPO_ROOT/target/release/flowforge" \
+   "$REPO_ROOT/apps/desktop/src-tauri/binaries/flowforge-$TRIPLE"
+
 echo "==> Building signed updater bundle, version $DEV_VERSION"
 cd "$REPO_ROOT/apps/desktop"
-pnpm tauri build --config "$LOCAL_CONF" --config "{\"version\":\"$DEV_VERSION\"}"
+pnpm tauri build --config "$LOCAL_CONF" --config "$BUNDLE_CONF" --config "{\"version\":\"$DEV_VERSION\"}"
 
 TARBALL="$BUNDLE_DIR/FlowForge.app.tar.gz"
 SIG="$TARBALL.sig"

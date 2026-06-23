@@ -20,13 +20,22 @@ if [[ "$(uname)" != "Darwin" ]]; then
   exit 1
 fi
 
+echo "==> Building CLI sidecar binary (CLI.7)"
+TRIPLE=$(rustc -vV | sed -n 's/^host: //p')
+mkdir -p "$REPO_ROOT/apps/desktop/src-tauri/binaries"
+cargo build -p ff-cli --release
+cp "$REPO_ROOT/target/release/flowforge" \
+   "$REPO_ROOT/apps/desktop/src-tauri/binaries/flowforge-$TRIPLE"
+
 echo "==> Building release bundle (pnpm tauri build)"
 # pnpm/tauri scripts live in apps/desktop; the cargo workspace target is at the
 # repo root. Build the app bundle only -- no .dmg (flaky bundle_dmg.sh) and no
 # updater artifact (D2 has no updater, so signing keys are not required).
 cd "$REPO_ROOT/apps/desktop"
 pnpm install --frozen-lockfile
-pnpm tauri build --bundles app --config '{"bundle":{"createUpdaterArtifacts":false}}'
+pnpm tauri build --bundles app \
+  --config src-tauri/tauri.bundle.conf.json \
+  --config '{"bundle":{"createUpdaterArtifacts":false}}'
 
 BUILT_APP="$BUNDLE_DIR/$APP_NAME"
 if [[ ! -d "$BUILT_APP" ]]; then

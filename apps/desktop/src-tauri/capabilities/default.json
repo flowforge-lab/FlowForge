@@ -8,6 +8,26 @@
     "opener:default",
     "dialog:allow-open",
     "dialog:allow-save",
-    "fs:allow-write-text-file"
+    "fs:allow-write-text-file",
+    {
+      "identifier": "shell:allow-execute",
+      "allow": [
+        {
+          "name": "binaries/flowforge",
+          "sidecar": true,
+          "args": true
+        }
+      ]
+    },
+    {
+      "identifier": "shell:allow-spawn",
+      "allow": [
+        {
+          "name": "binaries/flowforge",
+          "sidecar": true,
+          "args": true
+        }
+      ]
+    }
   ]
 }
