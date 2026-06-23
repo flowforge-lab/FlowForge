@@ -5,8 +5,8 @@ use serde::Deserialize;
 use base64::Engine as _;
 
 use crate::{
-    ChatMessage, ChatRequest, Chunk, ChunkStream, LlmError, Provider, ReasoningWire,
-    ToolCallContent, ToolCallDelta, WireDialect,
+    ChatMessage, ChatRequest, Chunk, ChunkStream, LlmError, Provider, ReasoningControl,
+    ReasoningWire, ToolCallContent, ToolCallDelta, WireDialect,
 };
 
 /// Talks to any OpenAI-compatible `/v1/chat/completions` server over Server-Sent
@@ -27,6 +27,10 @@ pub struct OpenAiProvider {
     /// (for SiliconFlow GLM/MiniMax) emit `content: ""` instead of omitting it.
     /// See `crate::wire_dialect`.
     dialect: WireDialect,
+    /// Per-gateway reasoning-cost controls (#394). Default emits nothing; the
+    /// SiliconFlow gateway caps reasoning tokens (per effort) / disables thinking.
+    /// Resolved at build time via [`crate::reasoning_control`].
+    reasoning: ReasoningControl,
 }
 
 impl OpenAiProvider {
@@ -37,6 +41,7 @@ impl OpenAiProvider {
             client: crate::build_streaming_http_client(),
             supports_vision: false,
             dialect: WireDialect::default(),
+            reasoning: ReasoningControl::default(),
         }
     }
 
@@ -50,6 +55,13 @@ impl OpenAiProvider {
     /// [`crate::wire_dialect`] at provider build time.
     pub fn with_dialect(mut self, dialect: WireDialect) -> Self {
         self.dialect = dialect;
+        self
+    }
+
+    /// Set the per-gateway reasoning-cost controls (#394). Defaults to a no-op;
+    /// resolve via [`crate::reasoning_control`] at provider build time.
+    pub fn with_reasoning_control(mut self, reasoning: ReasoningControl) -> Self {
+        self.reasoning = reasoning;
         self
     }
 
@@ -300,6 +312,19 @@ impl Provider for OpenAiProvider {
         if !req.tools.is_empty() {
             body["tools"] = serde_json::Value::Array(req.tools.clone());
             body["tool_choice"] = serde_json::json!("auto");
+        }
+        // Reasoning-cost controls (#394). Only the SiliconFlow gateway emits
+        // these; vanilla OpenAI / candle-vllm / LM Studio / OpenRouter would
+        // reject unknown fields, so the default ReasoningControl::None is silent.
+        match self.reasoning {
+            ReasoningControl::None => {}
+            ReasoningControl::SiliconFlow { effort } => {
+                if req.thinking {
+                    body["thinking_budget"] = serde_json::json!(effort.budget_tokens());
+                } else {
+                    body["enable_thinking"] = serde_json::json!(false);
+                }
+            }
         }
 
         let mut builder = self
@@ -729,7 +754,9 @@ mod tests {
 
     // ---- #375 PR-2: per-gateway wire dialect ----
 
-    use crate::{FunctionCall, ReasoningWire, ToolCall, ToolCallContent, WireDialect};
+    use crate::{
+        FunctionCall, ReasoningEffort, ReasoningWire, ToolCall, ToolCallContent, WireDialect,
+    };
 
     fn assistant_tool_call_with_reasoning(reasoning: Option<&str>) -> ChatMessage {
         ChatMessage {
@@ -836,6 +863,104 @@ mod tests {
         };
         let v = message_to_wire(&msg, dialect);
         assert_eq!(v["content"], "let me search");
+    }
+
+    // ---- reasoning-cost controls (#394): SiliconFlow thinking_budget /
+    // enable_thinking emission, gated so other gateways stay clean. ----
+
+    fn user_req(thinking: bool) -> ChatRequest {
+        ChatRequest {
+            model: "zai-org/GLM-5.2".into(),
+            messages: vec![ChatMessage::text("user", "hi")],
+            tools: Vec::new(),
+            thinking,
+        }
+    }
+
+    /// Capture the JSON body the provider POSTs for one request.
+    async fn captured_body(
+        provider: &OpenAiProvider,
+        server: &MockServer,
+        req: ChatRequest,
+    ) -> serde_json::Value {
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("data: [DONE]\n\n"))
+            .mount(server)
+            .await;
+        let _ = provider.chat_stream(req).await.expect("send succeeds");
+        let reqs = server.received_requests().await.expect("requests recorded");
+        serde_json::from_slice(&reqs[0].body).expect("body is json")
+    }
+
+    #[tokio::test]
+    async fn siliconflow_thinking_on_sends_effort_budget_cap() {
+        let server = MockServer::start().await;
+        let provider = OpenAiProvider::new(server.uri(), None).with_reasoning_control(
+            ReasoningControl::SiliconFlow {
+                effort: ReasoningEffort::Medium,
+            },
+        );
+        let body = captured_body(&provider, &server, user_req(true)).await;
+        assert_eq!(body["thinking_budget"], 4096);
+        assert!(
+            body.get("enable_thinking").is_none(),
+            "budget cap, not the off-switch, when thinking is on"
+        );
+    }
+
+    #[tokio::test]
+    async fn siliconflow_low_effort_caps_tighter_than_medium() {
+        let server = MockServer::start().await;
+        let provider = OpenAiProvider::new(server.uri(), None).with_reasoning_control(
+            ReasoningControl::SiliconFlow {
+                effort: ReasoningEffort::Low,
+            },
+        );
+        let body = captured_body(&provider, &server, user_req(true)).await;
+        assert_eq!(body["thinking_budget"], 1024);
+    }
+
+    #[tokio::test]
+    async fn siliconflow_high_effort_caps_at_8192() {
+        // High is a hard 8192 cap (not uncapped), keeping the cost guard intact
+        // even at the top of the dial.
+        let server = MockServer::start().await;
+        let provider = OpenAiProvider::new(server.uri(), None).with_reasoning_control(
+            ReasoningControl::SiliconFlow {
+                effort: ReasoningEffort::High,
+            },
+        );
+        let body = captured_body(&provider, &server, user_req(true)).await;
+        assert_eq!(body["thinking_budget"], 8192);
+        assert!(body.get("enable_thinking").is_none());
+    }
+
+    #[tokio::test]
+    async fn siliconflow_thinking_off_disables_reasoning() {
+        let server = MockServer::start().await;
+        let provider = OpenAiProvider::new(server.uri(), None).with_reasoning_control(
+            ReasoningControl::SiliconFlow {
+                effort: ReasoningEffort::High,
+            },
+        );
+        let body = captured_body(&provider, &server, user_req(false)).await;
+        assert_eq!(body["enable_thinking"], false);
+        assert!(
+            body.get("thinking_budget").is_none(),
+            "off-switch, not a budget, when thinking is off"
+        );
+    }
+
+    #[tokio::test]
+    async fn default_provider_emits_no_reasoning_params() {
+        // Vanilla OpenAI / candle-vllm / LM Studio reject unknown fields, so the
+        // default ReasoningControl::None must keep the body clean either way.
+        let server = MockServer::start().await;
+        let provider = OpenAiProvider::new(server.uri(), None);
+        let body = captured_body(&provider, &server, user_req(true)).await;
+        assert!(body.get("thinking_budget").is_none());
+        assert!(body.get("enable_thinking").is_none());
     }
 
     // ---- read_timeout: a mid-stream stall must surface as a transient error,

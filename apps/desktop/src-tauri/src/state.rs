@@ -13,7 +13,8 @@ use ff_core::{
     ProviderConnection, ProviderKind, ProviderRegistry, SearchConfig, SecretKind,
 };
 use ff_llm::{
-    wire_dialect, BedrockCreds, BedrockProvider, OllamaProvider, OpenAiProvider, Provider,
+    reasoning_control, wire_dialect, BedrockCreds, BedrockProvider, OllamaProvider, OpenAiProvider,
+    Provider, ReasoningEffort,
 };
 use ff_mcp::{McpConfigWatcher, SupervisorHandle};
 use ff_memory::watch::MemoryWatcher;
@@ -128,11 +129,19 @@ fn build_provider(conn: &ProviderConnection) -> Box<dyn Provider> {
     // hot path only carries a `Copy` struct; defaults are no-ops for vanilla
     // OpenAI / candle-vllm / Ollama / LM Studio.
     let dialect = wire_dialect(conn.kind, conn.vendor.as_deref(), &conn.model);
+    // Reasoning depth dial (#394). Medium by default -- the per-connection user
+    // override is #395; until then this both caps SiliconFlow's auto-`max`
+    // escalation and bounds Bedrock/Anthropic extended thinking.
+    let effort = ReasoningEffort::default();
+    // OpenAI-wire reasoning controls (#394). No-op except for the SiliconFlow
+    // gateway; native providers take the effort dial directly below.
+    let reasoning = reasoning_control(conn.kind, &conn.model, effort);
     match conn.kind {
         ProviderKind::CandleVllm => Box::new(
             OpenAiProvider::new(base_url, None)
                 .with_vision(conn.supports_vision)
-                .with_dialect(dialect),
+                .with_dialect(dialect)
+                .with_reasoning_control(reasoning),
         ),
         ProviderKind::Ollama => {
             Box::new(OllamaProvider::new(base_url).with_vision(conn.supports_vision))
@@ -171,7 +180,11 @@ fn build_provider(conn: &ProviderConnection) -> Box<dyn Provider> {
                     token: crate::secrets::get(id, SecretKind::ApiKey).unwrap_or_default(),
                 },
             };
-            Box::new(BedrockProvider::new(region, creds).with_vision(conn.supports_vision))
+            Box::new(
+                BedrockProvider::new(region, creds)
+                    .with_vision(conn.supports_vision)
+                    .with_reasoning_effort(effort),
+            )
         }
         // Hosted OpenAI (-compatible). Bearer key pulled from the keychain here so
         // the provider crate stays keychain-free, mirroring the Bedrock arm (#311).
@@ -180,7 +193,8 @@ fn build_provider(conn: &ProviderConnection) -> Box<dyn Provider> {
             Box::new(
                 OpenAiProvider::new(base_url, key)
                     .with_vision(conn.supports_vision)
-                    .with_dialect(dialect),
+                    .with_dialect(dialect)
+                    .with_reasoning_control(reasoning),
             )
         }
         // SiliconFlow is OpenAI-compatible; the bearer key is pulled from the OS
@@ -190,7 +204,8 @@ fn build_provider(conn: &ProviderConnection) -> Box<dyn Provider> {
             Box::new(
                 OpenAiProvider::new(base_url, key)
                     .with_vision(conn.supports_vision)
-                    .with_dialect(dialect),
+                    .with_dialect(dialect)
+                    .with_reasoning_control(reasoning),
             )
         }
     }

@@ -3,11 +3,18 @@ use futures_util::StreamExt;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crate::{ChatMessage, ChatRequest, Chunk, ChunkStream, LlmError, Provider, ToolCallDelta};
+use crate::{
+    ChatMessage, ChatRequest, Chunk, ChunkStream, LlmError, Provider, ReasoningEffort,
+    ToolCallDelta,
+};
 
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
 const DEFAULT_MAX_TOKENS: u32 = 4096;
+/// Tokens reserved for the visible answer above the thinking budget. Anthropic's
+/// `max_tokens` caps thinking + answer combined and must exceed `budget_tokens`,
+/// so on a thinking turn we bump it to `budget + this` when it would be too low.
+const ANTHROPIC_ANSWER_HEADROOM: u32 = 4096;
 
 /// Native Anthropic Messages API provider (`POST /v1/messages`, server-sent events).
 ///
@@ -21,6 +28,9 @@ pub struct AnthropicProvider {
     base_url: String,
     api_key: String,
     max_tokens: u32,
+    /// Reasoning depth dial (#394). Drives `thinking.budget_tokens` when a turn
+    /// requests thinking; defaults to [`ReasoningEffort::Medium`].
+    reasoning_effort: ReasoningEffort,
     client: reqwest::Client,
 }
 
@@ -31,6 +41,7 @@ impl AnthropicProvider {
             base_url: DEFAULT_BASE_URL.to_string(),
             api_key: api_key.into(),
             max_tokens: DEFAULT_MAX_TOKENS,
+            reasoning_effort: ReasoningEffort::default(),
             client: crate::build_streaming_http_client(),
         }
     }
@@ -46,6 +57,14 @@ impl AnthropicProvider {
     /// field; the default is [`DEFAULT_MAX_TOKENS`].
     pub fn with_max_tokens(mut self, max_tokens: u32) -> Self {
         self.max_tokens = max_tokens;
+        self
+    }
+
+    /// Set the reasoning depth dial (#394). Applies only on thinking turns,
+    /// where it caps `thinking.budget_tokens` to the effort budget (clamped below
+    /// `max_tokens`). Defaults to [`ReasoningEffort::Medium`].
+    pub fn with_reasoning_effort(mut self, effort: ReasoningEffort) -> Self {
+        self.reasoning_effort = effort;
         self
     }
 }
@@ -201,7 +220,7 @@ fn parse_anthropic_line(line: &[u8]) -> Option<Result<Chunk, LlmError>> {
 }
 
 /// Build the `/v1/messages` request body from OpenAI-shaped history.
-fn to_anthropic_request(req: &ChatRequest, max_tokens: u32) -> Value {
+fn to_anthropic_request(req: &ChatRequest, max_tokens: u32, effort: ReasoningEffort) -> Value {
     let (system, messages) = to_anthropic_messages(&req.messages);
     let mut body = json!({
         "model": req.model,
@@ -216,9 +235,15 @@ fn to_anthropic_request(req: &ChatRequest, max_tokens: u32) -> Value {
         body["tools"] = Value::Array(tools);
     }
     if req.thinking {
-        // Anthropic requires budget_tokens < max_tokens; reserve room for the answer.
-        let budget = max_tokens.saturating_sub(1).min(2048);
+        let budget = effort.budget_tokens();
         body["thinking"] = json!({ "type": "enabled", "budget_tokens": budget });
+        // Anthropic requires budget_tokens < max_tokens (thinking + answer share
+        // the cap), so raise max_tokens to leave answer room when the configured
+        // cap is too low for this budget.
+        let needed = budget + ANTHROPIC_ANSWER_HEADROOM;
+        if needed > max_tokens {
+            body["max_tokens"] = json!(needed);
+        }
     }
     body
 }
@@ -434,7 +459,7 @@ fn extract_error_message(body: &str) -> Option<String> {
 #[async_trait]
 impl Provider for AnthropicProvider {
     async fn chat_stream(&self, req: ChatRequest) -> Result<ChunkStream, LlmError> {
-        let body = to_anthropic_request(&req, self.max_tokens);
+        let body = to_anthropic_request(&req, self.max_tokens, self.reasoning_effort);
 
         let resp = self
             .client
@@ -898,7 +923,7 @@ mod tests {
             tools: vec![],
             thinking: false,
         };
-        let body = to_anthropic_request(&req, 4096);
+        let body = to_anthropic_request(&req, 4096, ReasoningEffort::Medium);
         assert_eq!(body["max_tokens"], 4096);
         assert_eq!(body["model"], "claude-x");
         assert_eq!(body["stream"], true);
@@ -914,10 +939,36 @@ mod tests {
             tools: vec![],
             thinking: true,
         };
-        let body = to_anthropic_request(&req, 4096);
+        // Medium budget is 4096; with the default 4096 cap, max_tokens is bumped
+        // so budget stays strictly below it (Anthropic requirement).
+        let body = to_anthropic_request(&req, 4096, ReasoningEffort::Medium);
         assert_eq!(body["thinking"]["type"], "enabled");
         let budget = body["thinking"]["budget_tokens"].as_u64().unwrap();
-        assert!(budget < 4096);
+        let max_tokens = body["max_tokens"].as_u64().unwrap();
+        assert_eq!(budget, 4096);
+        assert!(
+            budget < max_tokens,
+            "budget {budget} !< max_tokens {max_tokens}"
+        );
+    }
+
+    #[test]
+    fn thinking_budget_scales_with_effort() {
+        let req = ChatRequest {
+            model: "claude-x".into(),
+            messages: vec![ChatMessage::text("user", "hi")],
+            tools: vec![],
+            thinking: true,
+        };
+        // Budgets are uniform and concrete regardless of max_tokens.
+        let low = to_anthropic_request(&req, 32000, ReasoningEffort::Low);
+        assert_eq!(low["thinking"]["budget_tokens"], 1024);
+        let med = to_anthropic_request(&req, 32000, ReasoningEffort::Medium);
+        assert_eq!(med["thinking"]["budget_tokens"], 4096);
+        let high = to_anthropic_request(&req, 32000, ReasoningEffort::High);
+        assert_eq!(high["thinking"]["budget_tokens"], 8192);
+        // A generous cap is left untouched (only bumped when too low).
+        assert_eq!(high["max_tokens"], 32000);
     }
 
     #[test]
@@ -933,7 +984,7 @@ mod tests {
             ],
             thinking: false,
         };
-        let body = to_anthropic_request(&req, 100);
+        let body = to_anthropic_request(&req, 100, ReasoningEffort::Medium);
         assert_eq!(body["system"], "sys");
         assert_eq!(body["tools"][0]["name"], "f");
     }

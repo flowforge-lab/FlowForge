@@ -7,9 +7,10 @@
 use async_trait::async_trait;
 use aws_sdk_bedrockruntime::types::{
     ContentBlock, ContentBlockDelta, ContentBlockStart, ConversationRole, ConverseStreamOutput,
-    DocumentBlock, DocumentFormat, DocumentSource, ImageBlock, ImageFormat, ImageSource, Message,
-    ReasoningContentBlockDelta, SystemContentBlock, Tool, ToolConfiguration, ToolInputSchema,
-    ToolResultBlock, ToolResultContentBlock, ToolSpecification, ToolUseBlock,
+    DocumentBlock, DocumentFormat, DocumentSource, ImageBlock, ImageFormat, ImageSource,
+    InferenceConfiguration, Message, ReasoningContentBlockDelta, SystemContentBlock, Tool,
+    ToolConfiguration, ToolInputSchema, ToolResultBlock, ToolResultContentBlock, ToolSpecification,
+    ToolUseBlock,
 };
 use aws_sdk_bedrockruntime::Client;
 use aws_smithy_types::{Blob, Document, Number};
@@ -18,7 +19,7 @@ use futures_util::stream::{self, StreamExt};
 
 use crate::{
     attachment_bytes, ChatMessage, ChatRequest, Chunk, ChunkStream, LlmError, Provider,
-    ToolCallDelta,
+    ReasoningEffort, ToolCallDelta,
 };
 
 /// Which credential source the provider uses to sign requests. Built by the
@@ -75,6 +76,10 @@ pub struct BedrockProvider {
     /// request is built so a non-vision model never receives image/document
     /// blocks it would reject. Defaults false; set via [`BedrockProvider::with_vision`].
     supports_vision: bool,
+    /// Reasoning depth dial (#394). On a thinking turn, drives the Converse
+    /// `reasoning_config.budget_tokens` (Claude extended thinking) and the
+    /// matching `maxTokens`. Defaults to [`ReasoningEffort::Medium`].
+    reasoning_effort: ReasoningEffort,
 }
 
 impl BedrockProvider {
@@ -83,12 +88,21 @@ impl BedrockProvider {
             region: region.into(),
             creds,
             supports_vision: false,
+            reasoning_effort: ReasoningEffort::default(),
         }
     }
 
     /// Declare whether the target model can accept image/document attachments.
     pub fn with_vision(mut self, supports_vision: bool) -> Self {
         self.supports_vision = supports_vision;
+        self
+    }
+
+    /// Set the reasoning depth dial (#394). Applies only on thinking turns, where
+    /// it sets Claude extended-thinking `budget_tokens` and a matching `maxTokens`.
+    /// Defaults to [`ReasoningEffort::Medium`].
+    pub fn with_reasoning_effort(mut self, effort: ReasoningEffort) -> Self {
+        self.reasoning_effort = effort;
         self
     }
 
@@ -199,6 +213,25 @@ impl BedrockProvider {
     }
 }
 
+/// Headroom reserved for the answer above the reasoning budget when extended
+/// thinking is on, since Converse requires `maxTokens > budget_tokens` (#394).
+const BEDROCK_ANSWER_HEADROOM: u32 = 4_096;
+
+/// Build the `additionalModelRequestFields` document that turns on Claude
+/// extended thinking with the given reasoning-token budget (#394).
+fn reasoning_config_doc(budget_tokens: u32) -> Document {
+    Document::Object(std::collections::HashMap::from([(
+        "reasoning_config".to_string(),
+        Document::Object(std::collections::HashMap::from([
+            ("type".to_string(), Document::String("enabled".to_string())),
+            (
+                "budget_tokens".to_string(),
+                Document::Number(Number::PosInt(budget_tokens as u64)),
+            ),
+        ])),
+    )]))
+}
+
 #[async_trait]
 impl Provider for BedrockProvider {
     fn supports_vision(&self) -> bool {
@@ -219,6 +252,20 @@ impl Provider for BedrockProvider {
         }
         if let Some(cfg) = to_tool_config(&req.tools) {
             call = call.tool_config(cfg);
+        }
+        // Claude extended thinking (#394): enable reasoning and cap its budget by
+        // the effort dial. Converse needs maxTokens > budget_tokens, so pin a
+        // matching maxTokens with answer headroom. Non-thinking turns are
+        // untouched, preserving the model's default maxTokens.
+        if req.thinking {
+            let budget = self.reasoning_effort.budget_tokens();
+            call = call
+                .inference_config(
+                    InferenceConfiguration::builder()
+                        .max_tokens((budget + BEDROCK_ANSWER_HEADROOM) as i32)
+                        .build(),
+                )
+                .additional_model_request_fields(reasoning_config_doc(budget));
         }
 
         let output = call.send().await.map_err(map_sdk_err)?;
@@ -789,6 +836,37 @@ mod tests {
     };
     use base64::Engine as _;
     use ff_core::AttachmentSource;
+
+    /// Pull a `u64` out of a `Document` at `obj.reasoning_config.budget_tokens`.
+    fn budget_of(doc: &Document) -> u64 {
+        let Document::Object(top) = doc else {
+            panic!("expected object")
+        };
+        let Document::Object(rc) = &top["reasoning_config"] else {
+            panic!("expected reasoning_config object")
+        };
+        assert_eq!(rc["type"], Document::String("enabled".to_string()));
+        match rc["budget_tokens"] {
+            Document::Number(Number::PosInt(v)) => v,
+            _ => panic!("budget_tokens not a positive int"),
+        }
+    }
+
+    #[test]
+    fn reasoning_config_doc_enables_thinking_with_budget() {
+        // Each effort level maps to its uniform concrete budget for Converse.
+        let low = ReasoningEffort::Low.budget_tokens();
+        let med = ReasoningEffort::Medium.budget_tokens();
+        let high = ReasoningEffort::High.budget_tokens();
+        assert_eq!(budget_of(&reasoning_config_doc(low)), 1024);
+        assert_eq!(budget_of(&reasoning_config_doc(med)), 4096);
+        assert_eq!(budget_of(&reasoning_config_doc(high)), 8192);
+        // maxTokens (budget + headroom) stays above every budget, so Converse
+        // accepts the request.
+        for b in [low, med, high] {
+            assert!(b + BEDROCK_ANSWER_HEADROOM > b);
+        }
+    }
 
     fn assistant_with_call(args: &str) -> ChatMessage {
         ChatMessage {
