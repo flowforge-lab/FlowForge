@@ -14,7 +14,7 @@ use ff_core::{
 };
 use ff_llm::{
     reasoning_control, wire_dialect, BedrockCreds, BedrockProvider, OllamaProvider, OpenAiProvider,
-    Provider,
+    Provider, ReasoningEffort,
 };
 use ff_mcp::{McpConfigWatcher, SupervisorHandle};
 use ff_memory::watch::MemoryWatcher;
@@ -129,9 +129,13 @@ fn build_provider(conn: &ProviderConnection) -> Box<dyn Provider> {
     // hot path only carries a `Copy` struct; defaults are no-ops for vanilla
     // OpenAI / candle-vllm / Ollama / LM Studio.
     let dialect = wire_dialect(conn.kind, conn.vendor.as_deref(), &conn.model);
-    // Reasoning-cost controls (#394). No-op except for SiliconFlow GLM, which
-    // otherwise auto-escalates to `max` effort and burns reasoning tokens.
-    let reasoning = reasoning_control(conn.kind, &conn.model);
+    // Reasoning depth dial (#394). Medium by default -- the per-connection user
+    // override is #395; until then this both caps SiliconFlow's auto-`max`
+    // escalation and bounds Bedrock/Anthropic extended thinking.
+    let effort = ReasoningEffort::default();
+    // OpenAI-wire reasoning controls (#394). No-op except for the SiliconFlow
+    // gateway; native providers take the effort dial directly below.
+    let reasoning = reasoning_control(conn.kind, &conn.model, effort);
     match conn.kind {
         ProviderKind::CandleVllm => Box::new(
             OpenAiProvider::new(base_url, None)
@@ -176,7 +180,11 @@ fn build_provider(conn: &ProviderConnection) -> Box<dyn Provider> {
                     token: crate::secrets::get(id, SecretKind::ApiKey).unwrap_or_default(),
                 },
             };
-            Box::new(BedrockProvider::new(region, creds).with_vision(conn.supports_vision))
+            Box::new(
+                BedrockProvider::new(region, creds)
+                    .with_vision(conn.supports_vision)
+                    .with_reasoning_effort(effort),
+            )
         }
         // Hosted OpenAI (-compatible). Bearer key pulled from the keychain here so
         // the provider crate stays keychain-free, mirroring the Bedrock arm (#311).

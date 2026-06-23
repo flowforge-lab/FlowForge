@@ -252,38 +252,88 @@ pub fn wire_dialect(kind: ff_core::ProviderKind, vendor: Option<&str>, model: &s
     }
 }
 
-/// Conservative cap on SiliconFlow reasoning tokens when thinking is on (#394).
-/// SiliconFlow auto-escalates agent-type requests to `max` effort otherwise,
-/// which burned through reasoning tokens fast in a coding session. Verified
-/// against `zai-org/GLM-5.2`: `thinking_budget` hard-stops the chain-of-thought
-/// at the requested count. Generous enough to preserve normal reasoning quality
-/// while bounding runaway; the user-facing dial that overrides it is #395.
-pub const DEFAULT_SILICONFLOW_THINKING_BUDGET: u32 = 8192;
+/// User-facing reasoning *depth* dial (#394/#395), mirroring the frontend
+/// `Effort` (apps/desktop/src/store/model-config.ts: `low | medium | high`,
+/// default `medium`). Orthogonal to the on/off gate [`ChatRequest::thinking`]:
+/// effort only matters when thinking is on, where it picks the reasoning token
+/// budget every supported backend honors -- the SiliconFlow gateway
+/// (`thinking_budget`, verified #394 across GLM-5.2 / Kimi-K2.7 / DeepSeek-V4-Pro),
+/// Bedrock Converse and native Anthropic extended thinking (`budget_tokens`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ReasoningEffort {
+    /// Shallow reasoning -- a tight budget that still bounds runaway cost.
+    Low,
+    /// The default. Generous enough to preserve normal reasoning quality while
+    /// capping the chain-of-thought; this is what tamed SiliconFlow's auto-`max`
+    /// escalation that burned tokens in a coding session (#394).
+    #[default]
+    Medium,
+    /// Deepest reasoning. `None` budget -- let the provider use its own default /
+    /// maximum (the SiliconFlow gateway emits no cap; native APIs use headroom).
+    High,
+}
 
-/// Per-gateway reasoning-cost controls (#394). Resolved once at provider build
-/// time, like [`WireDialect`]. The default emits nothing, preserving vanilla
-/// OpenAI / candle-vllm / LM Studio / OpenRouter behavior.
+impl ReasoningEffort {
+    /// Reasoning/thinking token budget for this effort level. `None` means
+    /// "no explicit cap" (High) -- backends that need a concrete number resolve
+    /// it via [`ReasoningEffort::budget_or`].
+    pub fn budget_tokens(self) -> Option<u32> {
+        match self {
+            ReasoningEffort::Low => Some(2048),
+            ReasoningEffort::Medium => Some(8192),
+            ReasoningEffort::High => None,
+        }
+    }
+
+    /// Concrete budget for backends that require an explicit token count and have
+    /// no "uncapped" mode (Bedrock Converse, native Anthropic). High resolves to
+    /// `high_cap`, the backend's available headroom.
+    pub fn budget_or(self, high_cap: u32) -> u32 {
+        self.budget_tokens().map_or(high_cap, |b| b.min(high_cap))
+    }
+}
+
+/// Per-gateway reasoning-cost controls for the OpenAI-compatible wire (#394).
+/// Resolved once at provider build time, like [`WireDialect`]. The default emits
+/// nothing, preserving vanilla OpenAI / candle-vllm / LM Studio / OpenRouter
+/// behavior. Native-reasoning providers (Bedrock, Anthropic) take a
+/// [`ReasoningEffort`] directly instead -- they have no gateway ambiguity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ReasoningControl {
     /// Emit no reasoning parameters.
     #[default]
     None,
-    /// SiliconFlow knobs (verified #394 on GLM-5.2): `enable_thinking: false`
-    /// turns reasoning fully off, and `thinking_budget` hard-caps reasoning
-    /// tokens. Which one is sent depends on `ChatRequest::thinking`.
-    SiliconFlow { budget_tokens: u32 },
+    /// SiliconFlow gateway knobs (verified #394 across GLM-5.2, Kimi-K2.7-Code
+    /// and DeepSeek-V4-Pro): `enable_thinking: false` turns reasoning fully off,
+    /// and `thinking_budget` hard-caps reasoning tokens to the effort budget.
+    /// Which knob is sent depends on [`ChatRequest::thinking`].
+    SiliconFlow { effort: ReasoningEffort },
 }
 
-/// Resolve reasoning controls from a connection's `(kind, model)`. Scoped to
-/// SiliconFlow GLM -- the only combination verified to honor `enable_thinking` /
-/// `thinking_budget` as hard controls (#394); everything else emits nothing.
-pub fn reasoning_control(kind: ff_core::ProviderKind, model: &str) -> ReasoningControl {
+/// SiliconFlow models that run in a forced/always-on reasoning mode and reject
+/// `enable_thinking` toggling (e.g. DeepSeek-R1, QwQ/QvQ). They get no controls
+/// so a thinking-off turn never trips a 400; everything else on the gateway
+/// honors the knobs (verified #394).
+fn is_forced_reasoning_model(model: &str) -> bool {
+    let m = model.to_ascii_lowercase();
+    m.contains("-r1") || m.contains("qwq") || m.contains("qvq")
+}
+
+/// Resolve OpenAI-wire reasoning controls from a connection's `(kind, model)`
+/// and the user's effort dial. Scoped to the SiliconFlow gateway -- the only
+/// OpenAI-compatible one verified to honor `enable_thinking` / `thinking_budget`
+/// as hard controls (#394) -- excluding forced-reasoning models; everything else
+/// emits nothing.
+pub fn reasoning_control(
+    kind: ff_core::ProviderKind,
+    model: &str,
+    effort: ReasoningEffort,
+) -> ReasoningControl {
     use ff_core::ProviderKind as K;
-    let is_glm = model.to_ascii_lowercase().contains("glm");
     match kind {
-        K::SiliconFlow if is_glm => ReasoningControl::SiliconFlow {
-            budget_tokens: DEFAULT_SILICONFLOW_THINKING_BUDGET,
-        },
+        K::SiliconFlow if !is_forced_reasoning_model(model) => {
+            ReasoningControl::SiliconFlow { effort }
+        }
         _ => ReasoningControl::None,
     }
 }
@@ -581,30 +631,64 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_control_only_targets_siliconflow_glm() {
+    fn reasoning_control_targets_all_siliconflow_except_forced_reasoning() {
         use ff_core::ProviderKind as K;
-        // SiliconFlow + GLM is the only verified combination (#394).
+        // Verified #394: GLM-5.2, Kimi-K2.7-Code and DeepSeek-V4-Pro all honor
+        // the gateway knobs. The effort dial selects the cap, default Medium.
+        for model in [
+            "zai-org/GLM-5.2",
+            "moonshotai/Kimi-K2.7-Code",
+            "deepseek-ai/DeepSeek-V4-Pro",
+        ] {
+            assert_eq!(
+                reasoning_control(K::SiliconFlow, model, ReasoningEffort::Medium),
+                ReasoningControl::SiliconFlow {
+                    effort: ReasoningEffort::Medium
+                },
+                "{model}"
+            );
+        }
+        // The effort dial flows through unchanged.
         assert_eq!(
-            reasoning_control(K::SiliconFlow, "zai-org/GLM-5.2"),
+            reasoning_control(K::SiliconFlow, "zai-org/GLM-5.2", ReasoningEffort::Low),
             ReasoningControl::SiliconFlow {
-                budget_tokens: DEFAULT_SILICONFLOW_THINKING_BUDGET
+                effort: ReasoningEffort::Low
             }
         );
-        // SiliconFlow non-GLM (e.g. DeepSeek-R1) is left alone -- unverified, and
-        // some always-reasoning models reject enable_thinking.
-        assert_eq!(
-            reasoning_control(K::SiliconFlow, "deepseek-ai/DeepSeek-R1"),
-            ReasoningControl::None
-        );
+        // Forced-reasoning models (DeepSeek-R1, QwQ) reject enable_thinking, so
+        // they are left alone.
+        for model in ["deepseek-ai/DeepSeek-R1", "Qwen/QwQ-32B"] {
+            assert_eq!(
+                reasoning_control(K::SiliconFlow, model, ReasoningEffort::Medium),
+                ReasoningControl::None,
+                "{model}"
+            );
+        }
         // Other gateways never emit SiliconFlow-specific params.
         assert_eq!(
-            reasoning_control(K::OpenAi, "gpt-4o"),
+            reasoning_control(K::OpenAi, "gpt-4o", ReasoningEffort::High),
             ReasoningControl::None
         );
         assert_eq!(
-            reasoning_control(K::CandleVllm, "any-glm-named-local"),
+            reasoning_control(
+                K::CandleVllm,
+                "any-glm-named-local",
+                ReasoningEffort::Medium
+            ),
             ReasoningControl::None
         );
+    }
+
+    #[test]
+    fn reasoning_effort_budgets_match_frontend_dial() {
+        assert_eq!(ReasoningEffort::Low.budget_tokens(), Some(2048));
+        assert_eq!(ReasoningEffort::Medium.budget_tokens(), Some(8192));
+        assert_eq!(ReasoningEffort::High.budget_tokens(), None);
+        assert_eq!(ReasoningEffort::default(), ReasoningEffort::Medium);
+        // budget_or clamps to the backend headroom and resolves High to it.
+        assert_eq!(ReasoningEffort::Low.budget_or(4095), 2048);
+        assert_eq!(ReasoningEffort::Medium.budget_or(4095), 4095);
+        assert_eq!(ReasoningEffort::High.budget_or(4095), 4095);
     }
 
     #[test]

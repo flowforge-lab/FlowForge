@@ -27,9 +27,9 @@ pub struct OpenAiProvider {
     /// (for SiliconFlow GLM/MiniMax) emit `content: ""` instead of omitting it.
     /// See `crate::wire_dialect`.
     dialect: WireDialect,
-    /// Per-gateway reasoning-cost controls (#394). Default emits nothing;
-    /// SiliconFlow GLM caps reasoning tokens / disables thinking. Resolved at
-    /// build time via [`crate::reasoning_control`].
+    /// Per-gateway reasoning-cost controls (#394). Default emits nothing; the
+    /// SiliconFlow gateway caps reasoning tokens (per effort) / disables thinking.
+    /// Resolved at build time via [`crate::reasoning_control`].
     reasoning: ReasoningControl,
 }
 
@@ -318,12 +318,14 @@ impl Provider for OpenAiProvider {
         // reject unknown fields, so the default ReasoningControl::None is silent.
         match self.reasoning {
             ReasoningControl::None => {}
-            ReasoningControl::SiliconFlow { budget_tokens } => {
-                if req.thinking {
-                    body["thinking_budget"] = serde_json::json!(budget_tokens);
-                } else {
+            ReasoningControl::SiliconFlow { effort } => {
+                if !req.thinking {
                     body["enable_thinking"] = serde_json::json!(false);
+                } else if let Some(budget) = effort.budget_tokens() {
+                    body["thinking_budget"] = serde_json::json!(budget);
                 }
+                // High effort is uncapped: emit nothing and let the gateway use
+                // its own default reasoning depth.
             }
         }
 
@@ -754,7 +756,9 @@ mod tests {
 
     // ---- #375 PR-2: per-gateway wire dialect ----
 
-    use crate::{FunctionCall, ReasoningWire, ToolCall, ToolCallContent, WireDialect};
+    use crate::{
+        FunctionCall, ReasoningEffort, ReasoningWire, ToolCall, ToolCallContent, WireDialect,
+    };
 
     fn assistant_tool_call_with_reasoning(reasoning: Option<&str>) -> ChatMessage {
         ChatMessage {
@@ -863,7 +867,7 @@ mod tests {
         assert_eq!(v["content"], "let me search");
     }
 
-    // ---- reasoning-cost controls (#394): SiliconFlow GLM thinking_budget /
+    // ---- reasoning-cost controls (#394): SiliconFlow thinking_budget /
     // enable_thinking emission, gated so other gateways stay clean. ----
 
     fn user_req(thinking: bool) -> ChatRequest {
@@ -892,11 +896,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn siliconflow_thinking_on_sends_budget_cap() {
+    async fn siliconflow_thinking_on_sends_effort_budget_cap() {
         let server = MockServer::start().await;
         let provider = OpenAiProvider::new(server.uri(), None).with_reasoning_control(
             ReasoningControl::SiliconFlow {
-                budget_tokens: 8192,
+                effort: ReasoningEffort::Medium,
             },
         );
         let body = captured_body(&provider, &server, user_req(true)).await;
@@ -908,11 +912,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn siliconflow_low_effort_caps_tighter_than_medium() {
+        let server = MockServer::start().await;
+        let provider = OpenAiProvider::new(server.uri(), None).with_reasoning_control(
+            ReasoningControl::SiliconFlow {
+                effort: ReasoningEffort::Low,
+            },
+        );
+        let body = captured_body(&provider, &server, user_req(true)).await;
+        assert_eq!(body["thinking_budget"], 2048);
+    }
+
+    #[tokio::test]
+    async fn siliconflow_high_effort_is_uncapped() {
+        // High effort sends neither knob when thinking is on: the gateway uses
+        // its own default depth (the user explicitly opted into deep reasoning).
+        let server = MockServer::start().await;
+        let provider = OpenAiProvider::new(server.uri(), None).with_reasoning_control(
+            ReasoningControl::SiliconFlow {
+                effort: ReasoningEffort::High,
+            },
+        );
+        let body = captured_body(&provider, &server, user_req(true)).await;
+        assert!(body.get("thinking_budget").is_none());
+        assert!(body.get("enable_thinking").is_none());
+    }
+
+    #[tokio::test]
     async fn siliconflow_thinking_off_disables_reasoning() {
         let server = MockServer::start().await;
         let provider = OpenAiProvider::new(server.uri(), None).with_reasoning_control(
             ReasoningControl::SiliconFlow {
-                budget_tokens: 8192,
+                effort: ReasoningEffort::High,
             },
         );
         let body = captured_body(&provider, &server, user_req(false)).await;
