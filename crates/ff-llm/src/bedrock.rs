@@ -869,8 +869,11 @@ mod tests {
             budget_of(&reasoning_config_doc(high)),
             BEDROCK_HIGH_BUDGET as u64
         );
-        // maxTokens must stay above the budget so Converse accepts the request.
-        assert!(high + BEDROCK_ANSWER_HEADROOM as u32 > high);
+        // maxTokens (budget + headroom) stays above every budget, so Converse
+        // accepts the request.
+        for b in [low, med, high] {
+            assert!(b + BEDROCK_ANSWER_HEADROOM > b);
+        }
     }
 
     fn assistant_with_call(args: &str) -> ChatMessage {
