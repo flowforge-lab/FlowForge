@@ -273,6 +273,9 @@ export interface FfIpc {
   // bindings + a real updater/backup backend when they land (#159).
   /** Check for app updates. */
   checkForUpdates(): Promise<UpdateStatus>;
+  /** Download and install the available update; the backend relaunches the app on
+   *  success (so this never resolves in the real app — see #363 / #362). */
+  installUpdate(): Promise<void>;
   /** Export a local backup. */
   exportBackup(): Promise<BackupResult>;
   /** Restore from a backup. */
@@ -483,6 +486,7 @@ class TauriIpc implements FfIpc {
     this.invoke<void>("remove_mcp_server", { id });
 
   checkForUpdates = () => this.invoke<UpdateStatus>("check_for_updates");
+  installUpdate = () => this.invoke<void>("install_update");
   exportBackup = () => this.invoke<BackupResult>("export_backup");
   restoreBackup = () => this.invoke<BackupResult>("restore_backup");
 

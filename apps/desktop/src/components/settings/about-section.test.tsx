@@ -4,7 +4,9 @@ import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AboutSection } from "@/components/settings/about-section";
+import { ipc } from "@/lib/ipc";
 import { useSettingsStore } from "@/store/settings";
+import { useUpdateStore } from "@/store/update";
 
 (
   globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }
@@ -32,6 +34,7 @@ beforeEach(() => {
     root = createRoot(container);
   });
   useSettingsStore.setState({ activeSection: "about", resetHandler: null });
+  useUpdateStore.setState({ status: null, installing: false });
 });
 
 afterEach(() => {
@@ -63,5 +66,55 @@ describe("AboutSection", () => {
     expect(container.querySelector('[role="status"]')?.textContent).toContain(
       "You're on the latest version.",
     );
+  });
+
+  function updateNowButton(): HTMLButtonElement | undefined {
+    return [...container.querySelectorAll("button")].find((el) =>
+      el.textContent?.includes("Update now"),
+    ) as HTMLButtonElement | undefined;
+  }
+
+  it("shows 'Update now' only when an update is available", () => {
+    useUpdateStore.setState({
+      status: { kind: "available", version: "9.9.9", notes: null },
+    });
+    render(<AboutSection />);
+    const btn = updateNowButton();
+    expect(btn).toBeDefined();
+    expect(btn?.textContent).toContain("9.9.9");
+  });
+
+  it("does not show 'Update now' when up to date", () => {
+    useUpdateStore.setState({
+      status: { kind: "upToDate", version: "0.1.0" },
+    });
+    render(<AboutSection />);
+    expect(updateNowButton()).toBeUndefined();
+  });
+
+  it("'Update now' calls installUpdate once", async () => {
+    const spy = vi.spyOn(ipc, "installUpdate").mockResolvedValue();
+    useUpdateStore.setState({
+      status: { kind: "available", version: "9.9.9", notes: null },
+    });
+    render(<AboutSection />);
+    await act(async () => {
+      updateNowButton()?.dispatchEvent(
+        new MouseEvent("click", { bubbles: true }),
+      );
+    });
+    expect(spy).toHaveBeenCalledTimes(1);
+  });
+
+  it("disables 'Update now' and shows a spinner while installing", () => {
+    useUpdateStore.setState({
+      status: { kind: "available", version: "9.9.9", notes: null },
+      installing: true,
+    });
+    render(<AboutSection />);
+    const btn = updateNowButton();
+    expect(btn).toBeDefined();
+    expect(btn?.disabled).toBe(true);
+    expect(btn?.querySelector(".animate-spin")).not.toBeNull();
   });
 });

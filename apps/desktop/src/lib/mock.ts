@@ -1374,6 +1374,10 @@ Shipping the Settings redesign — currently the Memory browser (SET.8).
     return { kind: "upToDate", version: APP_VERSION_FALLBACK };
   }
 
+  // No-op in the mock: there is no real updater, so "Update now" just resolves
+  // (the real backend downloads + relaunches — see #362/#363).
+  async installUpdate(): Promise<void> {}
+
   async exportBackup(): Promise<BackupResult> {
     return { path: "~/Downloads/flowforge-backup.json" };
   }
