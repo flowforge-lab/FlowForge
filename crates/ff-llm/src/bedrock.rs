@@ -70,6 +70,11 @@ impl std::fmt::Debug for BedrockCreds {
 pub struct BedrockProvider {
     region: String,
     creds: BedrockCreds,
+    /// Whether the connection's model accepts image/document attachments
+    /// (#332/#334). When false, attachments are stripped before the Converse
+    /// request is built so a non-vision model never receives image/document
+    /// blocks it would reject. Defaults false; set via [`BedrockProvider::with_vision`].
+    supports_vision: bool,
 }
 
 impl BedrockProvider {
@@ -77,7 +82,14 @@ impl BedrockProvider {
         Self {
             region: region.into(),
             creds,
+            supports_vision: false,
         }
+    }
+
+    /// Declare whether the target model can accept image/document attachments.
+    pub fn with_vision(mut self, supports_vision: bool) -> Self {
+        self.supports_vision = supports_vision;
+        self
     }
 
     /// Build a Bedrock client for the configured region and credential mode.
@@ -189,8 +201,13 @@ impl BedrockProvider {
 
 #[async_trait]
 impl Provider for BedrockProvider {
+    fn supports_vision(&self) -> bool {
+        self.supports_vision
+    }
+
     async fn chat_stream(&self, req: ChatRequest) -> Result<ChunkStream, LlmError> {
-        let (system, messages) = to_converse(&req.messages);
+        let wire = crate::messages_for_wire(&req.messages, self.supports_vision);
+        let (system, messages) = to_converse(&wire);
         let client = self.client().await;
 
         let mut call = client
@@ -1405,6 +1422,45 @@ mod tests {
                 .iter()
                 .all(|b| !matches!(b, ContentBlock::Image(_) | ContentBlock::Document(_))),
             "assistant turn must not carry image/document blocks"
+        );
+    }
+
+    // The capability strip (#338): `chat_stream` routes `req.messages` through
+    // `messages_for_wire(_, supports_vision)` before `to_converse`, so a non-vision
+    // Bedrock model never receives image/document blocks it would reject. These
+    // exercise that exact composition.
+    #[test]
+    fn vision_off_strips_attachments_before_converse() {
+        let msg = image_msg(
+            "image/png",
+            AttachmentSource::Inline(inline_b64(&[0x89, 0x50, 0x4e, 0x47])),
+        );
+        let wire = crate::messages_for_wire(std::slice::from_ref(&msg), false);
+        let (_, messages) = to_converse(&wire);
+        assert_eq!(messages.len(), 1);
+        assert!(
+            messages[0]
+                .content
+                .iter()
+                .all(|b| !matches!(b, ContentBlock::Image(_) | ContentBlock::Document(_))),
+            "vision off: no image/document block reaches Converse"
+        );
+    }
+
+    #[test]
+    fn vision_on_keeps_image_block() {
+        let msg = image_msg(
+            "image/png",
+            AttachmentSource::Inline(inline_b64(&[0x89, 0x50, 0x4e, 0x47])),
+        );
+        let wire = crate::messages_for_wire(std::slice::from_ref(&msg), true);
+        let (_, messages) = to_converse(&wire);
+        assert!(
+            messages[0]
+                .content
+                .iter()
+                .any(|b| matches!(b, ContentBlock::Image(_))),
+            "vision on: the image block is emitted"
         );
     }
 }

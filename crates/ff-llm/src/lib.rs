@@ -284,6 +284,15 @@ pub(crate) fn image_media_type(media_type: &str) -> Option<&'static str> {
 pub trait Provider: Send + Sync {
     async fn chat_stream(&self, req: ChatRequest) -> Result<ChunkStream, LlmError>;
 
+    /// Whether the active model accepts image/document attachments. Hosts read
+    /// this to warn the user when a turn's attachments will be stripped before
+    /// they reach the model (#338) -- the capability strip itself is silent, so
+    /// this is what turns a silent drop into a visible notice. Defaults true; the
+    /// concrete providers override to report their connection's configured flag.
+    fn supports_vision(&self) -> bool {
+        true
+    }
+
     /// Best-effort list of model ids the server currently has loaded. Used by the
     /// provider settings panel to populate the model picker; callers treat any
     /// error (server down, endpoint unsupported) as "no suggestions". Providers

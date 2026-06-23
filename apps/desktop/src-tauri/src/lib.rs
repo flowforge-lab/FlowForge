@@ -574,6 +574,9 @@ fn send_message(
                         },
                     );
                 }
+                AgentEvent::AttachmentsDropped { .. } => {
+                    // User-facing notice deferred to PR-2 / #342 (transcript render).
+                }
                 AgentEvent::Error { message } => {
                     let _ = app.emit(
                         "turn:error",

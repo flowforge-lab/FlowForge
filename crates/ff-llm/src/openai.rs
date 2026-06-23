@@ -281,6 +281,10 @@ fn apply_dialect(value: &mut serde_json::Value, msg: &ChatMessage, dialect: Wire
 
 #[async_trait]
 impl Provider for OpenAiProvider {
+    fn supports_vision(&self) -> bool {
+        self.supports_vision
+    }
+
     async fn chat_stream(&self, req: ChatRequest) -> Result<ChunkStream, LlmError> {
         let messages = crate::messages_for_wire(&req.messages, self.supports_vision);
         let dialect = self.dialect;
