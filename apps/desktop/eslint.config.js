@@ -28,7 +28,9 @@ export default tseslint.config(
         { argsIgnorePattern: "^_", varsIgnorePattern: "^_" },
       ],
       // Icons flow through the central module (#284 §1) so the icon set stays
-      // curated and the library is swappable from one place.
+      // curated and the library is swappable from one place. `paths` blocks the
+      // bare specifier; `patterns` closes the deep-import escape hatch
+      // (`lucide-react/dist/...`) so the gate is airtight.
       "no-restricted-imports": [
         "error",
         {
@@ -37,6 +39,13 @@ export default tseslint.config(
               name: "lucide-react",
               message:
                 "Import icons from '@/components/ui/icon' instead of 'lucide-react' directly.",
+            },
+          ],
+          patterns: [
+            {
+              group: ["lucide-react/*"],
+              message:
+                "Import icons from '@/components/ui/icon' instead of deep 'lucide-react' paths.",
             },
           ],
         },

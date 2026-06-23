@@ -1,4 +1,4 @@
-import { Image, X } from "@/components/ui/icon";
+import { ImageIcon, X } from "@/components/ui/icon";
 import { Button } from "@/components/ui/button";
 import { SettingsSwitch } from "@/components/settings/switch";
 import { cn } from "@/lib/utils";
@@ -118,7 +118,7 @@ function FilePickerRow({
           disabled={disabled}
           onClick={onChoose}
         >
-          <Image />
+          <ImageIcon />
           Choose file…
         </Button>
         {path ? (
