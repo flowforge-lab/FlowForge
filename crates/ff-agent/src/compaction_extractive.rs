@@ -142,15 +142,15 @@ fn content_key(original: &str) -> String {
 }
 
 /// Result of compressing a single blob in a storage-agnostic way.
-///  is what should be sent to the model;  carries the
-///  the caller must persist (e.g. to a DB) to make the
-/// compaction reversible.  is  when nothing shrank.
+/// `text` is what should be sent to the model; `original` carries the
+/// `(key, original)` the caller must persist (e.g. to a DB) to make the
+/// compaction reversible. `original` is `None` when nothing shrank.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompressOutcome {
     /// The compressed (or, when nothing shrank, unchanged) text.
     pub text: String,
-    ///  when the input shrank and the verbatim original
-    /// must be persisted under  for [];  otherwise.
+    /// `Some((key, original))` when the input shrank and the verbatim original
+    /// must be persisted under `key` for the `compaction_retrieve` tool; `None` otherwise.
     pub original: Option<(String, String)>,
 }
 
