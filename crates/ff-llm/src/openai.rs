@@ -929,4 +929,66 @@ mod tests {
             other => panic!("expected a transient Transport error from the stall, got {other:?}"),
         }
     }
+
+    /// Accepts the connection, consumes the request, then holds the socket open
+    /// without ever sending a response -- no status line, no headers. This is the
+    /// "connected, request sent, server silent before responding" stall, distinct
+    /// from a mid-body stall: it must trip during chat_stream's `.send()` await,
+    /// not hang.
+    async fn spawn_no_response_server() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 4096];
+                let _ = sock.read(&mut buf).await;
+                tokio::time::sleep(Duration::from_secs(3600)).await;
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn header_wait_stall_surfaces_transient_transport_error() {
+        let base = spawn_no_response_server().await;
+        let mut provider = OpenAiProvider::new(base, None);
+        // Production read_timeout is 60s; a short one keeps the test fast. The
+        // behavior under test (no response bytes -> Transport error) is identical.
+        provider.client = reqwest::Client::builder()
+            .read_timeout(Duration::from_millis(400))
+            .build()
+            .unwrap();
+
+        let req = ChatRequest {
+            model: "test-model".into(),
+            messages: vec![ChatMessage {
+                role: "user".into(),
+                content: Some("hi".into()),
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+                reasoning: None,
+                attachments: Vec::new(),
+            }],
+            tools: Vec::new(),
+            thinking: false,
+        };
+
+        // The stall is before any response, so it surfaces from chat_stream itself
+        // (the `.send()` await), not from polling the stream. This mirrors the
+        // continuation-call hang seen in the field (tool ran, next provider call
+        // never responded). Bound on wall-clock so a regression fails loudly.
+        let result = tokio::time::timeout(Duration::from_secs(10), provider.chat_stream(req))
+            .await
+            .expect("chat_stream must return or error, never hang");
+
+        match result {
+            Err(e @ LlmError::Transport(_)) => assert!(
+                e.is_transient(),
+                "header-wait stall must be retryable so run_turn retries the call"
+            ),
+            Err(other) => panic!("expected a transient Transport error, got {other:?}"),
+            Ok(_) => panic!("expected an error from a server that never responds"),
+        }
+    }
 }
