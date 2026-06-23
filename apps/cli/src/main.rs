@@ -276,7 +276,11 @@ fn load_search_config() -> ff_core::SearchConfig {
 /// Shared durable-memory setup (RFC 0006). Builds the store + FTS5 index, does a
 /// full reindex from disk, and registers the three memory tools. Best-effort: an
 /// index failure leaves the ambient block working but skips the recall tools.
-fn build_registry_with_memory() -> (ff_tools::ToolRegistry, std::sync::Arc<ff_memory::Memory>) {
+fn build_registry_with_memory() -> (
+    ff_tools::ToolRegistry,
+    std::sync::Arc<ff_memory::Memory>,
+    Option<std::sync::Arc<dyn ff_memory::MemoryIndex>>,
+) {
     let mut registry = ff_tools::ToolRegistry::with_defaults();
     registry.register(Box::new(ff_tools::WebSearchTool::new(std::sync::Arc::new(
         std::sync::Mutex::new(load_search_config()),
@@ -284,6 +288,7 @@ fn build_registry_with_memory() -> (ff_tools::ToolRegistry, std::sync::Arc<ff_me
     let memory_store = std::sync::Arc::new(ff_memory::Memory::with_default_root(
         ff_memory::MemoryConfig::default(),
     ));
+    let mut memory_index: Option<std::sync::Arc<dyn ff_memory::MemoryIndex>> = None;
     if let Ok(index) = ff_memory::Fts5Index::open(memory_store.index_path()) {
         let index: std::sync::Arc<dyn ff_memory::MemoryIndex> = std::sync::Arc::new(index);
         let _ = ff_memory::MemoryIndex::reindex(index.as_ref(), &memory_store.all_chunks());
@@ -298,8 +303,9 @@ fn build_registry_with_memory() -> (ff_tools::ToolRegistry, std::sync::Arc<ff_me
             memory_store.clone(),
             index.clone(),
         )));
+        memory_index = Some(index);
     }
-    (registry, memory_store)
+    (registry, memory_store, memory_index)
 }
 
 async fn run(
@@ -315,7 +321,7 @@ async fn run(
     let skills = host::load_skills();
     let workspace = host::workspace_root();
     let store = ff_session::SessionStore::new();
-    let (registry, memory_store) = build_registry_with_memory();
+    let (registry, memory_store, memory_index) = build_registry_with_memory();
     let approver = CliApprover::new(approval_mode, mode);
 
     let session = store.create_session(None);
@@ -350,7 +356,10 @@ async fn run(
     };
 
     let user_ctx = UserContext::now();
-    let memory = memory_store.ambient_block();
+    let memory = match &memory_index {
+        Some(idx) => memory_store.ambient_block_filtered(idx.as_ref()),
+        None => memory_store.ambient_block(),
+    };
     let system_prompt = ff_agent::build_system_prompt(
         inputs.persona.as_deref(),
         &skills,
@@ -428,7 +437,7 @@ async fn chat(json: bool, approval_mode: ApprovalMode, mode: Mode) -> ExitCode {
     let skills = host::load_skills();
     let workspace = host::workspace_root();
     let store = ff_session::SessionStore::new();
-    let (registry, memory_store) = build_registry_with_memory();
+    let (registry, memory_store, memory_index) = build_registry_with_memory();
     let approver = CliApprover::new(approval_mode, mode);
     let session = store.create_session(None);
 
@@ -447,6 +456,7 @@ async fn chat(json: bool, approval_mode: ApprovalMode, mode: Mode) -> ExitCode {
         &skills,
         &store,
         &memory_store,
+        memory_index.as_ref(),
         &tool_ctx,
         &session.id,
         json,
@@ -465,6 +475,7 @@ async fn chat_repl(
     skills: &ff_skills::SkillRegistry,
     store: &ff_session::SessionStore,
     memory_store: &std::sync::Arc<ff_memory::Memory>,
+    memory_index: Option<&std::sync::Arc<dyn ff_memory::MemoryIndex>>,
     tool_ctx: &ToolContext<'_>,
     session_id: &str,
     json: bool,
@@ -509,7 +520,10 @@ async fn chat_repl(
         store.add_message(session_id, Role::User, trimmed.to_string());
 
         let user_ctx = UserContext::now();
-        let memory = memory_store.ambient_block();
+        let memory = match memory_index {
+            Some(idx) => memory_store.ambient_block_filtered(idx.as_ref()),
+            None => memory_store.ambient_block(),
+        };
         let system_prompt =
             ff_agent::build_system_prompt(None, skills, &[], &user_ctx, memory.as_deref(), mode);
 
@@ -831,6 +845,7 @@ mod tests {
             &skills,
             &store,
             &memory_store,
+            None,
             &tool_ctx,
             &session.id,
             false,
@@ -894,6 +909,7 @@ mod tests {
             &skills,
             &store,
             &memory_store,
+            None,
             &tool_ctx,
             &session.id,
             false,
@@ -930,6 +946,7 @@ mod tests {
                 &skills,
                 &store,
                 &memory_store,
+                None,
                 &tool_ctx,
                 &session.id,
                 false,
@@ -1090,7 +1107,7 @@ mod tests {
 
     #[test]
     fn cli_registry_includes_web_search() {
-        let (registry, _memory) = build_registry_with_memory();
+        let (registry, _memory, _index) = build_registry_with_memory();
         assert!(
             registry.get("web_search").is_some(),
             "web_search must be registered in the CLI tool registry (#241)"

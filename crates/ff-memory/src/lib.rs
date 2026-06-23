@@ -33,7 +33,7 @@ pub use index::{Fts5Index, HybridIndex, MemoryIndex, ScoredChunk};
 
 use std::path::{Path, PathBuf};
 
-use chrono::{Local, NaiveDate};
+use chrono::{Local, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
@@ -175,11 +175,11 @@ pub struct MemoryConfig {
 /// Usage-driven decay configuration (RFC 0007 §5). Each knob has a conservative
 /// default; the whole mechanism is gated by `enabled`.
 ///
-/// M6.0 is observe-only: stats are recorded, but `weight` only decays/reinforces
-/// when `enabled = true`. `enabled` defaults to `false` (issue #291) so the
-/// foundation slice is a no-op rollback path; M6.1 flips it on with dormancy.
-/// `ambient_gain` and `dormant_threshold` are part of the schema now but are not
-/// consumed until M6.1.
+/// `weight` only decays/reinforces when `enabled = true`. M6.0 (#291) shipped
+/// `enabled = false` as a no-op rollback path; M6.1 (#292) flips the default on
+/// and consumes `dormant_threshold` to skip dormant chunks from ambient
+/// injection. `ambient_gain` (weak ambient reinforcement, RFC §10.1) is schema
+/// now, consumed in a follow-up.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export, export_to = "../../../apps/desktop/src/bindings/")]
@@ -195,10 +195,12 @@ pub struct DecayConfig {
     /// Strength of a `memory_search` hit: `weight += gain * (1.0 - weight)`.
     #[serde(default = "default_reinforce_gain")]
     pub reinforce_gain: f32,
-    /// Weaker reinforcement for an ambient-only hit (schema now; consumed M6.1).
+    /// Weaker reinforcement for an ambient-only hit (schema now; consumed in
+    /// the ambient-reinforcement follow-up, RFC §10.1).
     #[serde(default = "default_ambient_gain")]
     pub ambient_gain: f32,
-    /// `weight` below this marks a chunk dormant (schema now; consumed M6.1).
+    /// `weight` below this marks a chunk dormant — skipped from ambient
+    /// injection while staying recallable (RFC 0007 §M6.1).
     #[serde(default = "default_dormant_threshold")]
     pub dormant_threshold: f32,
 }
@@ -238,7 +240,7 @@ fn default_evict_to_budget() -> bool {
     true
 }
 fn default_decay_enabled() -> bool {
-    false
+    true
 }
 fn default_decay_factor() -> f32 {
     0.98
@@ -600,6 +602,123 @@ impl Memory {
             out.push_str(&d);
         }
         Some(out)
+    }
+
+    /// [`ambient_block`](Self::ambient_block) with dormant curated chunks excised
+    /// (RFC 0007 §M6.1). A curated chunk whose effective (read-time decayed)
+    /// weight has fallen below `decay.dormant_threshold` is dropped from the
+    /// ambient block — the SNR / token-budget win — while staying fully
+    /// recallable: a `memory_search` hit reinforces it back above threshold (wake
+    /// via recall, no "undelete"). Daily logs are never filtered (yesterday/today
+    /// are never dormant).
+    ///
+    /// **Byte-identical when decay is disabled.** [`MemoryIndex::effective_stats`]
+    /// returns an empty map when `decay.enabled = false`, so no chunk is ever
+    /// dormant and this returns the same bytes as
+    /// [`ambient_block`](Self::ambient_block) — the M5 rollback path.
+    ///
+    /// **Never-recalled stays present.** A chunk with no `chunk_stats` row has
+    /// effective weight `1.0` (the age clock starts at first *recall*, not
+    /// creation — RFC 0007 §3), so a fresh `MEMORY.md` entry is never skipped.
+    /// This is intended; it interacts with the deferred ambient-reinforcement
+    /// piece (`ambient_gain`, RFC §10.1) — if ambient injection itself ever counts
+    /// as a soft "touch", this behaviour changes.
+    pub fn ambient_block_filtered(&self, index: &dyn MemoryIndex) -> Option<String> {
+        self.ambient_block_filtered_for(
+            index,
+            Local::now().date_naive(),
+            Utc::now().timestamp_millis(),
+        )
+    }
+
+    /// [`ambient_block_filtered`](Self::ambient_block_filtered) with injected
+    /// clocks — the testable core (the public method supplies the host clock).
+    pub fn ambient_block_filtered_for(
+        &self,
+        index: &dyn MemoryIndex,
+        today: NaiveDate,
+        now_ms: i64,
+    ) -> Option<String> {
+        if !self.config.enabled {
+            return None;
+        }
+        let curated = self.curated_section_filtered(index, now_ms);
+        let daily = self.daily_section(today);
+        if curated.is_none() && daily.is_none() {
+            return None;
+        }
+        let mut out = String::from("## Memory\n");
+        if let Some(c) = curated {
+            out.push('\n');
+            out.push_str(&c);
+            out.push('\n');
+        }
+        if let Some(d) = daily {
+            out.push_str(&d);
+        }
+        Some(out)
+    }
+
+    /// [`curated_section`](Self::curated_section) with dormant chunks' line ranges
+    /// excised from the *original* curated text before truncation (line-range
+    /// deletion, not chunk-rejoin, so surrounding text stays verbatim). Chunks are
+    /// derived exactly as the index sees them (`chunk_markdown` over the raw file)
+    /// so `chunk_key` correlation holds. With no dormant chunks the raw text is
+    /// passed through unchanged, giving the byte-identical guarantee.
+    fn curated_section_filtered(&self, index: &dyn MemoryIndex, now_ms: i64) -> Option<String> {
+        let raw = read_lenient(&self.curated_path());
+        if raw.trim().is_empty() {
+            return None;
+        }
+        let curated_path = self.curated_path();
+        let chunks = chunk_markdown(&raw, MemorySource::Curated, &curated_path);
+        let keys: Vec<String> = chunks.iter().map(chunk_key).collect();
+        let stats = index.effective_stats(&keys, now_ms).unwrap_or_default();
+        let threshold = self.config.decay.dormant_threshold;
+
+        // A line is removed only if it is covered by a dormant chunk and by no
+        // live chunk — chunked large sections produce overlapping line-windows, so
+        // a line shared with a still-live window must survive.
+        let mut dormant_lines: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        let mut live_lines: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        for (chunk, key) in chunks.iter().zip(keys.iter()) {
+            let is_dormant = stats.get(key).is_some_and(|s| s.weight < threshold);
+            let target = if is_dormant {
+                &mut dormant_lines
+            } else {
+                &mut live_lines
+            };
+            for ln in chunk.line_start..=chunk.line_end {
+                target.insert(ln);
+            }
+        }
+        let remove: std::collections::HashSet<u32> =
+            dormant_lines.difference(&live_lines).copied().collect();
+
+        let kept = if remove.is_empty() {
+            raw.clone()
+        } else {
+            raw.lines()
+                .enumerate()
+                .filter(|(i, _)| !remove.contains(&((*i as u32) + 1)))
+                .map(|(_, l)| l)
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        let curated = kept.trim();
+        if curated.is_empty() {
+            return None;
+        }
+        let budget = self.config.injection_budget_bytes;
+        if curated.len() > budget {
+            let head = head_within(curated, budget);
+            Some(format!(
+                "{head}\n\n_(memory truncated — use `memory_search` for the rest)_"
+            ))
+        } else {
+            Some(curated.to_string())
+        }
     }
 
     fn curated_section(&self) -> Option<String> {
@@ -1261,5 +1380,173 @@ mod tests {
         // At 111 bytes -> yes
         m.rewrite_curated(&"x".repeat(111)).unwrap();
         assert!(m.needs_consolidation());
+    }
+
+    // --- Ambient dormant-skip (RFC 0007 §M6.1, #292) ---
+
+    use crate::index::{Fts5Index, ScoredChunk};
+
+    fn enabled_index() -> Fts5Index {
+        Fts5Index::open_in_memory()
+            .unwrap()
+            .with_decay(DecayConfig {
+                enabled: true,
+                ..DecayConfig::default()
+            })
+    }
+
+    fn disabled_index() -> Fts5Index {
+        Fts5Index::open_in_memory()
+            .unwrap()
+            .with_decay(DecayConfig {
+                enabled: false,
+                ..DecayConfig::default()
+            })
+    }
+
+    const DAY_MS: i64 = 86_400_000;
+    const T0: i64 = 1_700_000_000_000;
+
+    fn search_for(idx: &Fts5Index, q: &str) -> Vec<ScoredChunk> {
+        idx.search(q, 10).unwrap()
+    }
+
+    #[test]
+    fn ambient_skips_dormant_curated_chunk_keeps_live() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = mem(dir.path());
+        write(
+            &m.curated_path(),
+            "## Likes\nuser prefers rust\n\n## Dislikes\nuser dislikes verbose logs\n",
+        );
+        let idx = enabled_index();
+        idx.reindex(&m.all_chunks()).unwrap();
+
+        // Recall the Likes chunk once, long ago, so it decays dormant by `future`.
+        let hits = search_for(&idx, "rust");
+        assert_eq!(hits.len(), 1, "only the Likes chunk matches 'rust'");
+        idx.reinforce_at(&hits, T0).unwrap();
+        let future = T0 + 500 * DAY_MS;
+
+        let today = NaiveDate::from_ymd_opt(2026, 6, 22).unwrap();
+        let block = m.ambient_block_filtered_for(&idx, today, future).unwrap();
+
+        // Dormant Likes chunk (heading + body) excised; the never-recalled
+        // Dislikes chunk stays (no stats row -> weight 1.0 -> never dormant).
+        assert!(
+            !block.contains("user prefers rust"),
+            "dormant body excised: {block}"
+        );
+        assert!(
+            !block.contains("## Likes"),
+            "dormant heading excised: {block}"
+        );
+        assert!(block.contains("## Dislikes"), "live heading kept: {block}");
+        assert!(
+            block.contains("user dislikes verbose logs"),
+            "live body kept: {block}"
+        );
+    }
+
+    #[test]
+    fn ambient_filtered_byte_identical_when_decay_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = mem(dir.path());
+        write(
+            &m.curated_path(),
+            "## Likes\nuser prefers rust\n\n## Dislikes\nuser dislikes verbose logs\n",
+        );
+        let today = NaiveDate::from_ymd_opt(2026, 6, 22).unwrap();
+        write(&m.daily_path(today), "shipped the dormant skip");
+
+        let idx = disabled_index();
+        idx.reindex(&m.all_chunks()).unwrap();
+        // Even after a recall, a disabled index never decays -> nothing dormant.
+        idx.reinforce_at(&search_for(&idx, "rust"), T0).unwrap();
+        let future = T0 + 500 * DAY_MS;
+
+        assert_eq!(
+            m.ambient_block_filtered_for(&idx, today, future),
+            m.ambient_block_for(today),
+            "decay-disabled filtered ambient must be byte-identical to unfiltered",
+        );
+    }
+
+    #[test]
+    fn ambient_excision_keeps_surrounding_text_verbatim() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = mem(dir.path());
+        write(
+            &m.curated_path(),
+            "## Alpha\nfirst section keep me\n\n## Beta\nmiddle section rust drop\n\n## Gamma\nlast section keep me too\n",
+        );
+        let idx = enabled_index();
+        idx.reindex(&m.all_chunks()).unwrap();
+        idx.reinforce_at(&search_for(&idx, "rust"), T0).unwrap();
+        let future = T0 + 500 * DAY_MS;
+
+        let today = NaiveDate::from_ymd_opt(2026, 6, 22).unwrap();
+        let block = m.ambient_block_filtered_for(&idx, today, future).unwrap();
+
+        assert!(!block.contains("## Beta"));
+        assert!(!block.contains("middle section rust drop"));
+        // Surrounding sections survive verbatim, in order.
+        assert!(block.contains("## Alpha\nfirst section keep me"));
+        assert!(block.contains("## Gamma\nlast section keep me too"));
+        let a = block.find("## Alpha").unwrap();
+        let g = block.find("## Gamma").unwrap();
+        assert!(a < g, "section order preserved: {block}");
+    }
+
+    #[test]
+    fn ambient_filter_leaves_daily_section_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = mem(dir.path());
+        write(&m.curated_path(), "## Likes\nuser prefers rust\n");
+        let today = NaiveDate::from_ymd_opt(2026, 6, 22).unwrap();
+        write(&m.daily_path(today), "today I shipped dormancy");
+
+        let idx = enabled_index();
+        idx.reindex(&m.all_chunks()).unwrap();
+        idx.reinforce_at(&search_for(&idx, "rust"), T0).unwrap();
+        let future = T0 + 500 * DAY_MS;
+
+        let block = m.ambient_block_filtered_for(&idx, today, future).unwrap();
+        // Curated dormant chunk gone, daily log intact.
+        assert!(!block.contains("user prefers rust"));
+        assert!(block.contains("Recent daily log"));
+        assert!(block.contains("today I shipped dormancy"));
+    }
+
+    #[test]
+    fn ambient_wake_via_recall_restores_dormant_chunk() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = mem(dir.path());
+        // A never-recalled anchor keeps the block non-empty across both states.
+        write(
+            &m.curated_path(),
+            "## Pinned\nanchor stays\n\n## Likes\nuser prefers rust\n",
+        );
+        let idx = enabled_index();
+        idx.reindex(&m.all_chunks()).unwrap();
+
+        idx.reinforce_at(&search_for(&idx, "rust"), T0).unwrap();
+        let future = T0 + 500 * DAY_MS;
+        let today = NaiveDate::from_ymd_opt(2026, 6, 22).unwrap();
+
+        // Dormant at `future`.
+        let before = m.ambient_block_filtered_for(&idx, today, future).unwrap();
+        assert!(
+            !before.contains("user prefers rust"),
+            "dormant before recall: {before}"
+        );
+
+        // A recall at `future` reinforces the chunk back above threshold.
+        idx.reinforce_at(&search_for(&idx, "rust"), future).unwrap();
+        let after = m.ambient_block_filtered_for(&idx, today, future).unwrap();
+        assert!(
+            after.contains("user prefers rust"),
+            "woken by recall: {after}"
+        );
     }
 }

@@ -442,7 +442,9 @@ fn send_message(
         // phenotype's declared skills; an unbound session keeps the global active
         // set so the command palette still affects turns. See `turn_active_skills`.
         let active: Vec<String> = state.turn_active_skills(&sid);
-        let memory = state.memory().ambient_block();
+        let memory = state
+            .memory()
+            .ambient_block_filtered(state.index().as_ref());
         let system_prompt = ff_agent::build_system_prompt(
             persona.as_deref(),
             &skills,
