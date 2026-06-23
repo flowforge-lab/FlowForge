@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { PlugZap, X } from "lucide-react";
+import { PlugZap, X } from "@/components/ui/icon";
 import { Button } from "@/components/ui/button";
 import { unavailableToastBody } from "@/lib/phenotype-mcp";
 import { usePhenoMcpNoticeStore } from "@/store/pheno-mcp-notice";

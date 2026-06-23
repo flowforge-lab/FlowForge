@@ -1,5 +1,5 @@
 import { useEffect, useRef } from "react";
-import { RotateCcw, X } from "lucide-react";
+import { RotateCcw, X } from "@/components/ui/icon";
 import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { SectionNav } from "@/components/settings/section-nav";

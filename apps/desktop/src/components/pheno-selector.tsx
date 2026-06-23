@@ -1,5 +1,5 @@
 import { useEffect } from "react";
-import { Check, ChevronDown, Dna, Loader2 } from "lucide-react";
+import { Check, ChevronDown, Dna, Loader2 } from "@/components/ui/icon";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import {

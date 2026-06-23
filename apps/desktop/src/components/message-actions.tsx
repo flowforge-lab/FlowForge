@@ -1,5 +1,5 @@
 import { useState, type ReactNode } from "react";
-import { Check, Copy, PencilLine } from "lucide-react";
+import { Check, Copy, PencilLine } from "@/components/ui/icon";
 import { cn } from "@/lib/utils";
 import { useComposerStore } from "@/store/composer";
 import type { Message } from "@/bindings";

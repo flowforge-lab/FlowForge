@@ -27,6 +27,25 @@ export default tseslint.config(
         "error",
         { argsIgnorePattern: "^_", varsIgnorePattern: "^_" },
       ],
+      // Icons flow through the central module (#284 §1) so the icon set stays
+      // curated and the library is swappable from one place.
+      "no-restricted-imports": [
+        "error",
+        {
+          paths: [
+            {
+              name: "lucide-react",
+              message:
+                "Import icons from '@/components/ui/icon' instead of 'lucide-react' directly.",
+            },
+          ],
+        },
+      ],
     },
+  },
+  // The icon module is the one allowed place to import lucide-react.
+  {
+    files: ["src/components/ui/icon.ts"],
+    rules: { "no-restricted-imports": "off" },
   },
 );

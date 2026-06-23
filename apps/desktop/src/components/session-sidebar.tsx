@@ -19,7 +19,7 @@ import {
   Sun,
   Trash2,
   X,
-} from "lucide-react";
+} from "@/components/ui/icon";
 import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Separator } from "@/components/ui/separator";

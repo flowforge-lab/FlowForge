@@ -1,5 +1,11 @@
 import { useState } from "react";
-import { ChevronDown, Plus, Loader2, Check, Trash2 } from "lucide-react";
+import {
+  ChevronDown,
+  Plus,
+  Loader2,
+  Check,
+  Trash2,
+} from "@/components/ui/icon";
 import { cn } from "@/lib/utils";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";

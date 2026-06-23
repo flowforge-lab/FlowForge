@@ -16,7 +16,7 @@ import {
   SlidersHorizontal,
   Users,
   type LucideIcon,
-} from "lucide-react";
+} from "@/components/ui/icon";
 
 export type SettingsSectionId =
   | "model" // PROFILE

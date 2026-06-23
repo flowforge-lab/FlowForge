@@ -1,5 +1,5 @@
 import { memo, useEffect, useRef, useState } from "react";
-import { ChevronDown } from "lucide-react";
+import { ChevronDown } from "@/components/ui/icon";
 import { cn } from "@/lib/utils";
 import { useChatStore } from "@/store/chat";
 import type { ToolStep } from "@/store/chat";

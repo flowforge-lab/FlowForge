@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { FolderPlus, Lock, Star } from "lucide-react";
+import { FolderPlus, Lock, Star } from "@/components/ui/icon";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import {

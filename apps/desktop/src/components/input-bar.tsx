@@ -6,7 +6,7 @@ import {
   Folder,
   Search,
   Square,
-} from "lucide-react";
+} from "@/components/ui/icon";
 import { Popover as PopoverPrimitive } from "radix-ui";
 import { Button } from "@/components/ui/button";
 import {

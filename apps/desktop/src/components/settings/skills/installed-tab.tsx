@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { ChevronRight, FolderPlus, Package } from "lucide-react";
+import { ChevronRight, FolderPlus, Package } from "@/components/ui/icon";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { useSkillsStore } from "@/store/skills";

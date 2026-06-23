@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { ChevronRight, Loader2 } from "lucide-react";
+import { ChevronRight, Loader2 } from "@/components/ui/icon";
 import { cn } from "@/lib/utils";
 
 /** Fold state for the Thinking block (#205): collapsed by default — even mid-stream —

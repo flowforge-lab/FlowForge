@@ -1,5 +1,5 @@
 import { useEffect } from "react";
-import { Plus, Info } from "lucide-react";
+import { Plus, Info } from "@/components/ui/icon";
 import { SegmentedControl } from "@/components/settings/segmented-control";
 import { SettingsSwitch } from "@/components/settings/switch";
 import { SettingsSlider } from "@/components/settings/slider";

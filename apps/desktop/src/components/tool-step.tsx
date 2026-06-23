@@ -7,7 +7,7 @@ import {
   MessageCircleQuestion,
   ShieldAlert,
   X,
-} from "lucide-react";
+} from "@/components/ui/icon";
 import { cn } from "@/lib/utils";
 import { formatArgs } from "@/lib/tool-args";
 import { parseMcpToolName } from "@/lib/mcp";

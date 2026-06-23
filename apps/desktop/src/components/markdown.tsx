@@ -3,7 +3,7 @@ import { isValidElement } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import rehypeHighlight from "rehype-highlight";
-import { Check, Copy, PanelRight } from "lucide-react";
+import { Check, Copy, PanelRight } from "@/components/ui/icon";
 import { cn } from "@/lib/utils";
 import { useSplitStore } from "@/store/split";
 

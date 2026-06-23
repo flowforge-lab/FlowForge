@@ -1,4 +1,4 @@
-import { Power, RotateCcw, Trash2 } from "lucide-react";
+import { Power, RotateCcw, Trash2 } from "@/components/ui/icon";
 import { Button } from "@/components/ui/button";
 import { StateBadge } from "@/components/settings/mcp/state-badge";
 import { useMcpStore } from "@/store/mcp";

@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { Check, ChevronRight, Copy, PanelRight } from "lucide-react";
+import { Check, ChevronRight, Copy, PanelRight } from "@/components/ui/icon";
 import { cn } from "@/lib/utils";
 import { useSplitStore } from "@/store/split";
 

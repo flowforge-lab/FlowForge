@@ -1,5 +1,5 @@
 import { useEffect } from "react";
-import { AlertTriangle, PanelLeft } from "lucide-react";
+import { AlertTriangle, PanelLeft } from "@/components/ui/icon";
 import { SessionSidebar } from "@/components/session-sidebar";
 import { PaneTree } from "@/components/pane-tree";
 import { SplitPanel } from "@/components/split-panel";
