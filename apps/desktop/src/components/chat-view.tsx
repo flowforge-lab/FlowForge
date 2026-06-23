@@ -9,6 +9,7 @@ import { StepGroup } from "@/components/step-group";
 import { ThinkingBlock } from "@/components/thinking-block";
 import { Markdown } from "@/components/markdown";
 import { MessageActions } from "@/components/message-actions";
+import { MessageAttachments } from "@/components/message-attachments";
 import { ThinkingIndicator } from "@/components/thinking-indicator";
 import type { Message } from "@/bindings";
 
@@ -64,17 +65,27 @@ function MessageRowImpl({
   const onAnswer = (callId: string, answer: string) =>
     void respondAsk(message.sessionId, message.id, callId, answer);
   if (message.role === "user") {
+    const hasAttachments =
+      message.attachments && message.attachments.length > 0;
     return (
-      <div className="flex justify-end">
-        <div className="group relative max-w-[80%]">
-          <div
-            data-selectable
-            className="whitespace-pre-wrap rounded-2xl rounded-br-md bg-primary px-3.5 py-2 text-[13px] leading-relaxed text-primary-foreground shadow-sm"
-          >
-            {message.content}
+      <div className="flex flex-col items-end gap-1.5">
+        {hasAttachments && (
+          <div className="max-w-[80%]">
+            <MessageAttachments attachments={message.attachments!} />
           </div>
-          <MessageActions message={message} side="left" />
-        </div>
+        )}
+        {/* Skip the bubble entirely for an image-only message (no text). */}
+        {message.content && (
+          <div className="group relative max-w-[80%]">
+            <div
+              data-selectable
+              className="whitespace-pre-wrap rounded-2xl rounded-br-md bg-primary px-3.5 py-2 text-[13px] leading-relaxed text-primary-foreground shadow-sm"
+            >
+              {message.content}
+            </div>
+            <MessageActions message={message} side="left" />
+          </div>
+        )}
       </div>
     );
   }
