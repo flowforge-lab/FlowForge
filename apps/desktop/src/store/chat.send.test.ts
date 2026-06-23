@@ -28,7 +28,7 @@ describe("chat store — session-scoped send/cancel (#148)", () => {
   it("send defaults to the active session", async () => {
     const spy = vi.spyOn(ipc, "sendMessage").mockResolvedValue("m1");
     await useChatStore.getState().send("hi");
-    expect(spy).toHaveBeenCalledWith(ACTIVE, "hi");
+    expect(spy).toHaveBeenCalledWith(ACTIVE, "hi", undefined);
   });
 
   it("send marks the turn pending (started, not yet streaming) - the send-button spinner window", async () => {
@@ -44,7 +44,7 @@ describe("chat store — session-scoped send/cancel (#148)", () => {
   it("send targets an explicit background session without touching the active one", async () => {
     const spy = vi.spyOn(ipc, "sendMessage").mockResolvedValue("m2");
     await useChatStore.getState().send("bg work", BG);
-    expect(spy).toHaveBeenCalledWith(BG, "bg work");
+    expect(spy).toHaveBeenCalledWith(BG, "bg work", undefined);
     expect(useChatStore.getState().activeSessionId).toBe(ACTIVE);
     expect(useChatStore.getState().messagesBySession[BG]).toHaveLength(1);
     expect(useChatStore.getState().messagesBySession[ACTIVE]).toBeUndefined();

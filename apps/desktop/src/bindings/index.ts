@@ -1,6 +1,9 @@
 // Barrel for ts-rs generated bindings. Generated files are committed; regenerate
 // with `cargo test` after changing any `ff-core` type. Do not hand-edit the *.ts here.
 export type { Message } from "./Message";
+export type { Attachment } from "./Attachment";
+export type { AttachmentKind } from "./AttachmentKind";
+export type { AttachmentSource } from "./AttachmentSource";
 export type { Role } from "./Role";
 export type { Session } from "./Session";
 export type { SessionWorkspace } from "./SessionWorkspace";

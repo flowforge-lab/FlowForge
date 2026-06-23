@@ -6,6 +6,7 @@ import { create } from "zustand";
 import { ipc } from "@/lib/ipc";
 import { autoTitle } from "@/lib/auto-title";
 import type {
+  Attachment,
   ApprovalSafety,
   Message,
   Session,
@@ -122,7 +123,11 @@ interface ChatState {
   deleteSession: (sessionId: string) => Promise<boolean>;
   /** Send into `sessionId`, defaulting to the active session. Panes pass their own
    *  session so a background pane can send/stream independently. */
-  send: (content: string, sessionId?: string) => Promise<void>;
+  send: (
+    content: string,
+    sessionId?: string,
+    attachments?: Attachment[],
+  ) => Promise<void>;
   /** Cancel the streaming turn in `sessionId` (session-scoped). */
   cancelTurn: (sessionId: string) => Promise<void>;
   cancelActiveTurn: () => Promise<void>;
@@ -411,7 +416,11 @@ export const useChatStore = create<ChatState>((set, get) => ({
     return true;
   },
 
-  send: async (content, sessionId = get().activeSessionId ?? undefined) => {
+  send: async (
+    content,
+    sessionId = get().activeSessionId ?? undefined,
+    attachments,
+  ) => {
     if (!sessionId || get().streamingBySession[sessionId]) return;
 
     // Auto-title: the backend seeds the title from the first user message; mirror
@@ -437,6 +446,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       sessionId,
       role: "user",
       content,
+      attachments: attachments?.length ? attachments : undefined,
       createdAt: Date.now(),
     };
     set((s) => ({
@@ -448,7 +458,11 @@ export const useChatStore = create<ChatState>((set, get) => ({
     }));
 
     try {
-      const userMessageId = await ipc.sendMessage(sessionId, content);
+      const userMessageId = await ipc.sendMessage(
+        sessionId,
+        content,
+        attachments,
+      );
       set((s) => ({
         messagesBySession: {
           ...s.messagesBySession,

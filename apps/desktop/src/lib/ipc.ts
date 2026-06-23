@@ -11,6 +11,7 @@ import type { MarketplaceProfile } from "@/lib/profile-marketplace";
 import type { ScheduledTask, CreateScheduledTaskInput } from "@/lib/scheduled";
 import type { PhenotypeMcpUnavailableEvent } from "@/bindings";
 import type {
+  Attachment,
   Message,
   ProviderConfig,
   ProviderConnection,
@@ -74,7 +75,11 @@ export interface FfIpc {
    *  directory and returns the canonical path to display; rejects otherwise. */
   setSessionWorkspace(sessionId: string, path: string): Promise<string>;
   /** Persists the user message and starts the assistant turn. Returns the user message id. */
-  sendMessage(sessionId: string, content: string): Promise<string>;
+  sendMessage(
+    sessionId: string,
+    content: string,
+    attachments?: Attachment[],
+  ): Promise<string>;
   cancelTurn(sessionId: string): Promise<void>;
   /** Frontend's reply to a [`ToolApprovalRequestEvent`]. Keyed by `(sessionId,
    *  callId)` so it never resolves a colliding call in another session. */
@@ -377,8 +382,11 @@ class TauriIpc implements FfIpc {
     this.invoke<SessionWorkspace>("get_session_workspace", { sessionId });
   setSessionWorkspace = (sessionId: string, path: string) =>
     this.invoke<string>("set_session_workspace", { sessionId, path });
-  sendMessage = (sessionId: string, content: string) =>
-    this.invoke<string>("send_message", { sessionId, content });
+  sendMessage = (
+    sessionId: string,
+    content: string,
+    attachments?: Attachment[],
+  ) => this.invoke<string>("send_message", { sessionId, content, attachments });
   cancelTurn = (sessionId: string) =>
     this.invoke<void>("cancel_turn", { sessionId });
   respondApproval = (sessionId: string, callId: string, approved: boolean) =>

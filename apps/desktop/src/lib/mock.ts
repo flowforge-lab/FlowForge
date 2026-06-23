@@ -5,6 +5,7 @@
 // gives you enough time to hit Stop and verify the cancelTurn path.
 
 import type {
+  Attachment,
   Message,
   ProviderConfig,
   ProviderConnection,
@@ -693,8 +694,12 @@ export class MockIpc implements FfIpc {
     return renderSessionMarkdown(session, messages);
   }
 
-  async sendMessage(sessionId: string, content: string): Promise<string> {
-    const user = this.append(sessionId, "user", content);
+  async sendMessage(
+    sessionId: string,
+    content: string,
+    attachments?: Attachment[],
+  ): Promise<string> {
+    const user = this.append(sessionId, "user", content, attachments);
     this.streamAssistant(sessionId);
     return user.id;
   }
@@ -1383,12 +1388,14 @@ Shipping the Settings redesign — currently the Memory browser (SET.8).
     sessionId: string,
     role: Message["role"],
     content: string,
+    attachments?: Attachment[],
   ): Message {
     const msg: Message = {
       id: uid(),
       sessionId,
       role,
       content,
+      ...(attachments?.length ? { attachments } : {}),
       createdAt: now(),
     };
     const list = this.messages.get(sessionId);
