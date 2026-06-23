@@ -624,7 +624,7 @@ fn initial_phenotype(
 }
 
 pub struct AppState {
-    pub store: SessionStore,
+    pub store: Arc<SessionStore>,
     /// Persisted, non-secret LLM provider connection registry (RFC 0005 Phase A).
     /// The active connection drives each turn; snapshotted (never held across an
     /// await) per turn. Mutated by the connection commands and the legacy
@@ -716,7 +716,7 @@ impl AppState {
             )
             .ok();
         let state = Self {
-            store: build_session_store(),
+            store: Arc::new(build_session_store()),
             registry: Mutex::new(registry),
             search_config,
             workspace_root: default_workspace_root(),
@@ -915,7 +915,7 @@ impl AppState {
         let outcome = MemoryFlush
             .compact(CompactionContext {
                 provider,
-                store: &self.store,
+                store: self.store.as_ref(),
                 registry,
                 root: &session_root,
                 session_id,
@@ -1023,6 +1023,11 @@ impl AppState {
         reg.register(Box::new(MemoryConsolidateTool::new(
             self.memory.clone(),
             self.memory_index.clone(),
+        )));
+        // Reversible tool-result compaction retrieve (M7.1a, RFC 0016 Tier 1).
+        // Shares the live session store so it can read originals stashed at ingest.
+        reg.register(Box::new(ff_tools::CompactionRetrieveTool::new(
+            self.store.clone(),
         )));
         // Bridge MCP tools from currently-running servers (M4.3).
         if let Some(handle) = self.mcp_handle() {

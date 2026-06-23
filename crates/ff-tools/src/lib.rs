@@ -22,6 +22,7 @@ mod agent_tool;
 mod apply_patch;
 mod ask_user;
 mod bash;
+mod compaction;
 mod edit;
 mod glob;
 mod grep;
@@ -40,6 +41,7 @@ pub mod web_search;
 mod write;
 
 pub use agent_tool::{AgentTool, AGENT_TOOL_NAME};
+pub use compaction::CompactionRetrieveTool;
 pub use registry::{is_subagent, Safety, Tool, ToolOutcome, ToolRegistry};
 pub use url_safety::SsrfPolicy;
 pub use web_search::WebSearchTool;

@@ -141,6 +141,19 @@ fn content_key(original: &str) -> String {
     format!("{:016x}", h.finish())
 }
 
+/// Result of compressing a single blob in a storage-agnostic way.
+///  is what should be sent to the model;  carries the
+///  the caller must persist (e.g. to a DB) to make the
+/// compaction reversible.  is  when nothing shrank.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompressOutcome {
+    /// The compressed (or, when nothing shrank, unchanged) text.
+    pub text: String,
+    ///  when the input shrank and the verbatim original
+    /// must be persisted under  for [];  otherwise.
+    pub original: Option<(String, String)>,
+}
+
 /// Token savings from a compaction pass.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CompactionSavings {
@@ -212,26 +225,49 @@ impl ExtractiveCompactor {
     /// return the input unchanged and leave the cache untouched.
     #[must_use]
     pub fn compress(&self, content: &str, cache: &mut ReversibleCache) -> String {
-        if proxy_tokens(content) < self.min_tokens_to_compact {
-            return content.to_string();
+        let outcome = self.compress_one(content);
+        if let Some((_, original)) = &outcome.original {
+            let _ = cache.put(original.clone());
         }
-        let kind = classify(content);
-        let compressed = match kind {
+        outcome.text
+    }
+
+    /// Storage-agnostic compression. Returns the compressed text and, when the
+    /// input actually shrank, the `(key, original)` the caller must persist to
+    /// make the result retrievable. `original` is `None` when the input was
+    /// below `min_tokens_to_compact` or would not shrink -- in that case
+    /// `text` is the input unchanged and nothing needs to be stored. The key is
+    /// the same content hash [`ReversibleCache`] uses, so a marker emitted here
+    /// resolves against either an in-memory cache or a persistent store.
+    #[must_use]
+    pub fn compress_one(&self, content: &str) -> CompressOutcome {
+        if proxy_tokens(content) < self.min_tokens_to_compact {
+            return CompressOutcome {
+                text: content.to_string(),
+                original: None,
+            };
+        }
+        let compressed = match classify(content) {
             ContentKind::Json => self.compress_json(content),
             ContentKind::Code | ContentKind::Prose => self.compress_lines(content),
         };
-        // Only commit to a cache entry when the compression actually shrank the
-        // text by enough to also amortize the marker we'll append.
+        // Only mark (and ask the caller to persist) when the compression
+        // actually shrank the text by enough to amortize the trailing marker.
         let key = content_key(content);
         let with_marker = format!(
             "{compressed}\n[compacted; retrieve key={key}]",
             compressed = compressed.trim_end()
         );
         if proxy_tokens(&with_marker) < proxy_tokens(content) {
-            let _ = cache.put(content.to_string());
-            with_marker
+            CompressOutcome {
+                text: with_marker,
+                original: Some((key, content.to_string())),
+            }
         } else {
-            content.to_string()
+            CompressOutcome {
+                text: content.to_string(),
+                original: None,
+            }
         }
     }
 
@@ -561,5 +597,58 @@ mod tests {
             .trim_end_matches(']')
             .to_string();
         assert_eq!(cache.retrieve(&key), Some(original.as_str()));
+    }
+
+    #[test]
+    fn compress_one_returns_key_and_original_on_shrink() {
+        let comp = ExtractiveCompactor {
+            min_tokens_to_compact: 0,
+            ..ExtractiveCompactor::default()
+        };
+        let big = (1..=40)
+            .map(|i| format!("log line number {i} with some filler text"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let out = comp.compress_one(&big);
+        let (key, original) = out.original.expect("a large blob must shrink and cache");
+        assert_eq!(original, big, "the cached original must be byte-identical");
+        assert!(
+            out.text.contains(&format!("key={key}")),
+            "the marker must carry the same key the caller persists"
+        );
+        assert!(proxy_tokens(&out.text) < proxy_tokens(&big));
+    }
+
+    #[test]
+    fn compress_one_returns_none_below_threshold() {
+        let comp = ExtractiveCompactor::default();
+        let small = "a short tool result";
+        let out = comp.compress_one(small);
+        assert_eq!(out.text, small);
+        assert!(out.original.is_none());
+        assert!(!out.text.contains("[compacted"));
+    }
+
+    #[test]
+    fn compress_one_key_matches_marker() {
+        let comp = ExtractiveCompactor {
+            max_value_chars: 8,
+            min_tokens_to_compact: 0,
+            ..ExtractiveCompactor::default()
+        };
+        let blob = serde_json::to_string(&serde_json::json!({
+            "field": "x".repeat(2000)
+        }))
+        .unwrap();
+        let out = comp.compress_one(&blob);
+        let (key, _) = out.original.clone().expect("shrinks");
+        let marker_key = out
+            .text
+            .rsplit("key=")
+            .next()
+            .unwrap()
+            .trim_end_matches(']')
+            .to_string();
+        assert_eq!(marker_key, key);
     }
 }
