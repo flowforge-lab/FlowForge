@@ -19,11 +19,15 @@ use futures_util::StreamExt;
 use serde::Serialize;
 
 mod compaction;
+mod compaction_extractive;
 mod system_prompt;
 pub use compaction::{
     flush_due, CompactionContext, CompactionOutcome, CompactionStrategy, ContextPressure,
     ContextPressureEstimator, MemoryFlush, ProxyTokenEstimator, DEFAULT_CONTEXT_BUDGET_TOKENS,
     DEFAULT_FLUSH_AT_FRACTION,
+};
+pub use compaction_extractive::{
+    classify, proxy_tokens, CompactionSavings, ContentKind, ExtractiveCompactor, ReversibleCache,
 };
 pub use system_prompt::{build_flush_prompt, build_system_prompt, TimeOfDay, UserContext};
 
