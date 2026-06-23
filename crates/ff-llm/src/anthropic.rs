@@ -31,7 +31,7 @@ impl AnthropicProvider {
             base_url: DEFAULT_BASE_URL.to_string(),
             api_key: api_key.into(),
             max_tokens: DEFAULT_MAX_TOKENS,
-            client: reqwest::Client::new(),
+            client: crate::build_streaming_http_client(),
         }
     }
 

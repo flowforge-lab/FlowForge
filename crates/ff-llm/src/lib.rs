@@ -20,6 +20,33 @@ pub use bedrock::{BedrockCreds, BedrockProvider};
 pub use ollama::OllamaProvider;
 pub use openai::OpenAiProvider;
 
+use std::time::Duration;
+
+/// Initial TCP/TLS connect budget for the SSE providers.
+pub(crate) const CONNECT_TIMEOUT_SECS: u64 = 10;
+
+/// Maximum mid-stream silence (no bytes received) tolerated before a read is
+/// aborted. A stalled SSE stream -- headers sent, then bytes stop with no
+/// `[DONE]` or connection close -- otherwise hangs forever (observed with
+/// SiliconFlow GLM, ~31 min stuck). Tripping this surfaces a `Transport` error,
+/// which [`LlmError::is_transient`] marks retryable, so the agent loop's
+/// existing bounded retry recovers automatically. This is an idle-between-reads
+/// timeout, NOT a total-request timeout: long legitimate reasoning streams that
+/// keep emitting bytes are unaffected.
+pub(crate) const IDLE_READ_TIMEOUT_SECS: u64 = 60;
+
+/// Shared reqwest client for the SSE-based providers (OpenAI-compatible,
+/// Ollama-native, Anthropic Messages). Bedrock builds its own client through the
+/// AWS SDK, which carries its own timeouts. Falls back to a default client if the
+/// builder fails so provider construction stays infallible.
+pub(crate) fn build_streaming_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(CONNECT_TIMEOUT_SECS))
+        .read_timeout(Duration::from_secs(IDLE_READ_TIMEOUT_SECS))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: String,
@@ -319,6 +346,15 @@ pub(crate) fn image_media_type(media_type: &str) -> Option<&'static str> {
 #[async_trait]
 pub trait Provider: Send + Sync {
     async fn chat_stream(&self, req: ChatRequest) -> Result<ChunkStream, LlmError>;
+
+    /// Whether the active model accepts image/document attachments. Hosts read
+    /// this to warn the user when a turn's attachments will be stripped before
+    /// they reach the model (#338) -- the capability strip itself is silent, so
+    /// this is what turns a silent drop into a visible notice. Defaults true; the
+    /// concrete providers override to report their connection's configured flag.
+    fn supports_vision(&self) -> bool {
+        true
+    }
 
     /// Best-effort list of model ids the server currently has loaded. Used by the
     /// provider settings panel to populate the model picker; callers treat any

@@ -32,7 +32,7 @@ impl OllamaProvider {
     pub fn new(base_url: impl Into<String>) -> Self {
         Self {
             base_url: base_url.into(),
-            client: reqwest::Client::new(),
+            client: crate::build_streaming_http_client(),
             supports_vision: false,
         }
     }
@@ -222,6 +222,10 @@ fn ollama_messages(messages: &[ChatMessage]) -> Result<serde_json::Value, LlmErr
 
 #[async_trait]
 impl Provider for OllamaProvider {
+    fn supports_vision(&self) -> bool {
+        self.supports_vision
+    }
+
     async fn chat_stream(&self, req: ChatRequest) -> Result<ChunkStream, LlmError> {
         let messages = crate::messages_for_wire(&req.messages, self.supports_vision);
         let mut body = serde_json::json!({

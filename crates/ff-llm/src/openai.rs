@@ -38,7 +38,7 @@ impl OpenAiProvider {
         Self {
             base_url: base_url.into(),
             api_key,
-            client: reqwest::Client::new(),
+            client: crate::build_streaming_http_client(),
             supports_vision: false,
             dialect: WireDialect::default(),
             reasoning: ReasoningControl::default(),
@@ -293,6 +293,10 @@ fn apply_dialect(value: &mut serde_json::Value, msg: &ChatMessage, dialect: Wire
 
 #[async_trait]
 impl Provider for OpenAiProvider {
+    fn supports_vision(&self) -> bool {
+        self.supports_vision
+    }
+
     async fn chat_stream(&self, req: ChatRequest) -> Result<ChunkStream, LlmError> {
         let messages = crate::messages_for_wire(&req.messages, self.supports_vision);
         let dialect = self.dialect;
@@ -928,5 +932,163 @@ mod tests {
         let body = captured_body(&provider, &server, user_req(true)).await;
         assert!(body.get("thinking_budget").is_none());
         assert!(body.get("enable_thinking").is_none());
+    }
+
+    // ---- read_timeout: a mid-stream stall must surface as a transient error,
+    // not hang forever (SiliconFlow GLM ~31 min stuck). ----
+
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// Accepts one connection, sends HTTP headers + a single SSE `data:` chunk,
+    /// then holds the socket open without ever sending more bytes or closing --
+    /// the exact "headers sent, then silence" failure mode. Returns the base URL.
+    async fn spawn_stalling_sse_server() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 2048];
+                let _ = sock.read(&mut buf).await;
+                let frame = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n";
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n{}\r\n",
+                    frame.len(),
+                    frame
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+                let _ = sock.flush().await;
+                // Never send the terminating chunk; stall well past the read timeout.
+                tokio::time::sleep(Duration::from_secs(3600)).await;
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn mid_stream_stall_surfaces_transient_transport_error() {
+        let base = spawn_stalling_sse_server().await;
+        let mut provider = OpenAiProvider::new(base, None);
+        // Production read_timeout is 60s; use a short one so the test is fast.
+        // The behavior under test (idle silence -> Transport error) is identical.
+        provider.client = reqwest::Client::builder()
+            .read_timeout(Duration::from_millis(300))
+            .build()
+            .unwrap();
+
+        let req = ChatRequest {
+            model: "test-model".into(),
+            messages: vec![ChatMessage {
+                role: "user".into(),
+                content: Some("hi".into()),
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+                reasoning: None,
+                attachments: Vec::new(),
+            }],
+            tools: Vec::new(),
+            thinking: false,
+        };
+
+        let mut stream = provider.chat_stream(req).await.expect("headers arrive");
+
+        // Consume exactly as the agent loop does: take items until the first error,
+        // bounding the whole thing on wall-clock so a regression (real hang) fails
+        // loudly instead of stalling the suite. A stalled body otherwise blocks
+        // forever; with read_timeout it errors within ~300ms.
+        let mut saw_content = false;
+        let mut stall_err: Option<LlmError> = None;
+        loop {
+            let next = tokio::time::timeout(Duration::from_secs(10), stream.next())
+                .await
+                .expect("stream must yield or error, never hang");
+            match next {
+                Some(Ok(chunk)) => {
+                    if chunk.delta == "hi" {
+                        saw_content = true;
+                    }
+                }
+                Some(Err(e)) => {
+                    stall_err = Some(e);
+                    break;
+                }
+                None => break,
+            }
+        }
+
+        assert!(
+            saw_content,
+            "expected the initial content chunk before the stall"
+        );
+        match stall_err {
+            Some(e @ LlmError::Transport(_)) => assert!(
+                e.is_transient(),
+                "stall error must be retryable so the agent loop recovers"
+            ),
+            other => panic!("expected a transient Transport error from the stall, got {other:?}"),
+        }
+    }
+
+    /// Accepts the connection, consumes the request, then holds the socket open
+    /// without ever sending a response -- no status line, no headers. This is the
+    /// "connected, request sent, server silent before responding" stall, distinct
+    /// from a mid-body stall: it must trip during chat_stream's `.send()` await,
+    /// not hang.
+    async fn spawn_no_response_server() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 4096];
+                let _ = sock.read(&mut buf).await;
+                tokio::time::sleep(Duration::from_secs(3600)).await;
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn header_wait_stall_surfaces_transient_transport_error() {
+        let base = spawn_no_response_server().await;
+        let mut provider = OpenAiProvider::new(base, None);
+        // Production read_timeout is 60s; a short one keeps the test fast. The
+        // behavior under test (no response bytes -> Transport error) is identical.
+        provider.client = reqwest::Client::builder()
+            .read_timeout(Duration::from_millis(400))
+            .build()
+            .unwrap();
+
+        let req = ChatRequest {
+            model: "test-model".into(),
+            messages: vec![ChatMessage {
+                role: "user".into(),
+                content: Some("hi".into()),
+                tool_calls: None,
+                tool_call_id: None,
+                name: None,
+                reasoning: None,
+                attachments: Vec::new(),
+            }],
+            tools: Vec::new(),
+            thinking: false,
+        };
+
+        // The stall is before any response, so it surfaces from chat_stream itself
+        // (the `.send()` await), not from polling the stream. This mirrors the
+        // continuation-call hang seen in the field (tool ran, next provider call
+        // never responded). Bound on wall-clock so a regression fails loudly.
+        let result = tokio::time::timeout(Duration::from_secs(10), provider.chat_stream(req))
+            .await
+            .expect("chat_stream must return or error, never hang");
+
+        match result {
+            Err(e @ LlmError::Transport(_)) => assert!(
+                e.is_transient(),
+                "header-wait stall must be retryable so run_turn retries the call"
+            ),
+            Err(other) => panic!("expected a transient Transport error, got {other:?}"),
+            Ok(_) => panic!("expected an error from a server that never responds"),
+        }
     }
 }
