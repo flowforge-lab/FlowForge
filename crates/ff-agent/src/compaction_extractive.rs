@@ -141,6 +141,11 @@ fn content_key(original: &str) -> String {
     format!("{:016x}", h.finish())
 }
 
+/// The literal prefix every compaction marker carries. Used to detect content
+/// that was already compacted (e.g. tool results compacted at ingest in M7.1a)
+/// so the cold-prefix pass does not double-compact it.
+pub const COMPACTION_MARKER_PREFIX: &str = "[compacted; retrieve key=";
+
 /// Result of compressing a single blob in a storage-agnostic way.
 /// `text` is what should be sent to the model; `original` carries the
 /// `(key, original)` the caller must persist (e.g. to a DB) to make the
@@ -183,6 +188,22 @@ impl CompactionSavings {
             self.saved() as f64 / self.before_tokens as f64
         }
     }
+}
+
+/// Outcome of a storage-agnostic cold-prefix compaction over a transcript.
+/// `messages` is the wire-ready transcript (recent messages verbatim, cold
+/// messages compacted); `originals` carries `(message_id, key, original)` for
+/// every blob that actually shrank, which the caller must persist to make the
+/// compaction reversible via the `compaction_retrieve` tool.
+#[derive(Debug, Clone)]
+pub struct ColdCompaction {
+    /// The wire-ready transcript to send to the model.
+    pub messages: Vec<Message>,
+    /// `(message_id, key, original)` for each blob that shrank and must be
+    /// persisted so the verbatim original can be retrieved later.
+    pub originals: Vec<(String, String, String)>,
+    /// Proxy-token savings for this pass.
+    pub savings: CompactionSavings,
 }
 
 /// Configuration for [`ExtractiveCompactor`]. Defaults are tuned conservatively:
@@ -309,6 +330,51 @@ impl ExtractiveCompactor {
                 originals_cached: cache.len() - cache_len_before,
             },
         )
+    }
+
+    /// Compact the cold prefix of a transcript in a storage-agnostic way,
+    /// leaving the most recent `keep_recent` messages byte-identical. Unlike
+    /// [`Self::compact_cold`], this collects the `(message_id, key, original)`
+    /// triples the caller must persist (rather than mutating an in-memory
+    /// cache), so it can be wired directly to a durable store.
+    ///
+    /// Messages whose content already carries a [`COMPACTION_MARKER_PREFIX`]
+    /// (e.g. tool results compacted at ingest) are passed through untouched to
+    /// avoid double-compaction.
+    #[must_use]
+    pub fn compact_cold_collect(&self, messages: &[Message], keep_recent: usize) -> ColdCompaction {
+        let n = messages.len();
+        let cold_end = n.saturating_sub(keep_recent);
+        let mut before = 0usize;
+        let mut after = 0usize;
+        let mut out = Vec::with_capacity(n);
+        let mut originals = Vec::new();
+        for (i, m) in messages.iter().enumerate() {
+            before += proxy_tokens(&m.content);
+            if i < cold_end && !m.content.contains(COMPACTION_MARKER_PREFIX) {
+                let outcome = self.compress_one(&m.content);
+                after += proxy_tokens(&outcome.text);
+                if let Some((key, original)) = outcome.original {
+                    originals.push((m.id.clone(), key, original));
+                }
+                let mut clone = m.clone();
+                clone.content = outcome.text;
+                out.push(clone);
+            } else {
+                after += proxy_tokens(&m.content);
+                out.push(m.clone());
+            }
+        }
+        let originals_cached = originals.len();
+        ColdCompaction {
+            messages: out,
+            originals,
+            savings: CompactionSavings {
+                before_tokens: before,
+                after_tokens: after,
+                originals_cached,
+            },
+        }
     }
 
     fn compress_json(&self, content: &str) -> String {
@@ -650,5 +716,93 @@ mod tests {
             .trim_end_matches(']')
             .to_string();
         assert_eq!(marker_key, key);
+    }
+
+    fn msg_with_id(id: &str, role: Role, content: &str) -> Message {
+        let mut m = msg(role, content);
+        m.id = id.to_string();
+        m
+    }
+
+    #[test]
+    fn compact_cold_collect_keeps_recent_verbatim() {
+        let comp = ExtractiveCompactor {
+            keep_head_lines: 2,
+            keep_tail_lines: 2,
+            min_lines_to_elide: 6,
+            min_tokens_to_compact: 0,
+            ..ExtractiveCompactor::default()
+        };
+        let cold_a = (1..=30)
+            .map(|i| format!("a{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let cold_b = (1..=30)
+            .map(|i| format!("b{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let recent = "the exact recent state";
+        let messages = vec![
+            msg_with_id("m0", Role::User, &cold_a),
+            msg_with_id("m1", Role::Assistant, &cold_b),
+            msg_with_id("m2", Role::User, recent),
+        ];
+
+        let cold = comp.compact_cold_collect(&messages, 1);
+
+        assert_eq!(cold.messages.len(), 3);
+        // Cold prefix compacted.
+        assert!(cold.messages[0].content.contains(COMPACTION_MARKER_PREFIX));
+        assert!(cold.messages[1].content.contains(COMPACTION_MARKER_PREFIX));
+        // Recent message is byte-identical.
+        assert_eq!(cold.messages[2].content, recent);
+        assert!(cold.savings.saved() > 0);
+    }
+
+    #[test]
+    fn compact_cold_collect_skips_already_compacted() {
+        let comp = ExtractiveCompactor {
+            min_tokens_to_compact: 0,
+            ..ExtractiveCompactor::default()
+        };
+        // A cold message that already carries the ingest-time marker must pass
+        // through untouched -- no double-compaction, no original collected.
+        let already = format!("short summary\n{COMPACTION_MARKER_PREFIX}deadbeefdeadbeef]");
+        let messages = vec![
+            msg_with_id("m0", Role::Tool, &already),
+            msg_with_id("m1", Role::User, "recent"),
+        ];
+
+        let cold = comp.compact_cold_collect(&messages, 1);
+
+        assert_eq!(cold.messages[0].content, already);
+        assert!(cold.originals.is_empty());
+    }
+
+    #[test]
+    fn compact_cold_collect_collects_originals_with_message_ids() {
+        let comp = ExtractiveCompactor {
+            max_value_chars: 8,
+            min_tokens_to_compact: 0,
+            ..ExtractiveCompactor::default()
+        };
+        let blob = serde_json::to_string(&serde_json::json!({
+            "field": "x".repeat(2000)
+        }))
+        .unwrap();
+        let messages = vec![
+            msg_with_id("cold-id", Role::Tool, &blob),
+            msg_with_id("recent-id", Role::User, "recent"),
+        ];
+
+        let cold = comp.compact_cold_collect(&messages, 1);
+
+        assert_eq!(cold.originals.len(), 1);
+        let (mid, key, original) = &cold.originals[0];
+        assert_eq!(mid, "cold-id");
+        assert_eq!(original, &blob);
+        // The collected key matches the marker emitted on the wire content.
+        assert!(cold.messages[0].content.contains(&format!("key={key}]")));
+        assert_eq!(cold.savings.originals_cached, 1);
     }
 }

@@ -27,8 +27,8 @@ pub use compaction::{
     DEFAULT_FLUSH_AT_FRACTION,
 };
 pub use compaction_extractive::{
-    classify, proxy_tokens, CompactionSavings, CompressOutcome, ContentKind, ExtractiveCompactor,
-    ReversibleCache,
+    classify, proxy_tokens, ColdCompaction, CompactionSavings, CompressOutcome, ContentKind,
+    ExtractiveCompactor, ReversibleCache, COMPACTION_MARKER_PREFIX,
 };
 pub use system_prompt::{build_flush_prompt, build_system_prompt, TimeOfDay, UserContext};
 
@@ -79,6 +79,18 @@ const REPEAT_BREAK_AT: usize = 5;
 /// over-budget conversation flushes periodically rather than every single turn
 /// (#244 R5). Passed to [`flush_due`] as its re-flush interval.
 const DEFAULT_REFLUSH_INTERVAL_MESSAGES: u64 = 8;
+
+/// Number of most-recent messages kept byte-identical on the wire when the
+/// cold-prefix extractive compaction runs. The model needs exact recent state;
+/// only the cold prefix is eligible for lossy-but-reversible compaction (RFC
+/// 0016 M7.1b).
+const KEEP_RECENT_VERBATIM: usize = 6;
+
+/// Context-pressure fraction at which the cold-prefix extractive compaction
+/// engages as a deterministic, pre-send wire transform. Set at the same budget
+/// fraction as the memory flush so the two pressure responses move together
+/// (RFC 0016 M7.1b).
+const EXTRACTIVE_COMPACT_AT_FRACTION: f64 = 0.75;
 
 /// Tool results are appended verbatim to the session history and replayed on the
 /// next request, so one oversized result (a big file read, a long command dump) can
@@ -536,7 +548,25 @@ pub async fn run_turn(
                 reasoning: None,
             });
         }
-        messages.extend(to_chat(&history));
+        // Cold-prefix extractive compaction (RFC 0016 M7.1b): once over the budget
+        // fraction, compact the cold prefix of the transcript into a reversible,
+        // marker-tagged form *for this request only*. The store keeps the full
+        // verbatim transcript -- this is a deterministic pre-send wire transform,
+        // never a mutation of session state. Recent messages stay byte-identical;
+        // any blob that shrank has its verbatim original persisted so the
+        // `compaction_retrieve` tool can fetch it back. Messages already compacted
+        // at ingest (M7.1a tool results) are skipped to avoid double-compaction.
+        let wire = if pressure.is_over(EXTRACTIVE_COMPACT_AT_FRACTION) {
+            let cold =
+                ExtractiveCompactor::default().compact_cold_collect(&history, KEEP_RECENT_VERBATIM);
+            for (mid, key, original) in &cold.originals {
+                store.put_compaction_original(session_id, mid, key, original);
+            }
+            cold.messages
+        } else {
+            history.clone()
+        };
+        messages.extend(to_chat(&wire));
 
         // Near the iteration cap, nudge the model to stop calling tools and answer,
         // so a long turn ends with a real reply instead of "[stopped: reached
@@ -3858,5 +3888,186 @@ mod tests {
         );
         // Provenance, not mutation: the visible transcript stays user + assistant.
         assert_eq!(store.get_messages(&s.id).len(), 2);
+    }
+
+    fn extract_marker_key(content: &str) -> Option<String> {
+        if !content.contains(COMPACTION_MARKER_PREFIX) {
+            return None;
+        }
+        Some(
+            content
+                .rsplit("key=")
+                .next()
+                .unwrap()
+                .trim_end_matches(']')
+                .trim()
+                .to_string(),
+        )
+    }
+
+    #[tokio::test]
+    async fn over_pressure_compacts_wire_but_store_stays_verbatim() {
+        // Build a transcript heavy enough to clear the 0.75 budget fraction with
+        // a long cold prefix of large, compressible blobs followed by small recent
+        // turns. The wire request must be compacted; the store must stay verbatim.
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::new();
+        let s = store.create_session(None);
+
+        // 10 cold messages, each a large JSON blob that compresses decisively.
+        let mut cold_contents = Vec::new();
+        for i in 0..10 {
+            let blob = serde_json::to_string(&serde_json::json!({
+                "idx": i,
+                "summary": "y".repeat(9000),
+                "items": (0..60).collect::<Vec<i32>>(),
+            }))
+            .unwrap();
+            let role = if i % 2 == 0 {
+                Role::User
+            } else {
+                Role::Assistant
+            };
+            store.add_message(&s.id, role, blob.clone());
+            cold_contents.push(blob);
+        }
+        // 6 small recent turns kept byte-identical on the wire.
+        let recents = ["r0", "r1", "r2", "r3", "r4", "r5"];
+        for (i, r) in recents.iter().enumerate() {
+            let role = if i % 2 == 0 {
+                Role::User
+            } else {
+                Role::Assistant
+            };
+            store.add_message(&s.id, role, (*r).to_string());
+        }
+
+        // Sanity: we are actually over the extractive threshold.
+        let history = store.get_messages(&s.id);
+        let pressure = ProxyTokenEstimator::default().assess(&history, "mock");
+        assert!(
+            pressure.is_over(EXTRACTIVE_COMPACT_AT_FRACTION),
+            "test transcript must exceed the extractive threshold: fraction={}",
+            pressure.fraction()
+        );
+
+        let registry = ToolRegistry::new();
+        let root = dir.path().to_path_buf();
+        let approve = AlwaysApprove;
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = RecordingProvider { seen: seen.clone() };
+
+        run_turn(
+            &provider,
+            &store,
+            &ctx(&registry, &root, &approve),
+            &s.id,
+            "mock",
+            None,
+            false,
+            CancelToken::new(),
+            |_| {},
+        )
+        .await
+        .unwrap();
+
+        let wire = seen.lock().unwrap().clone();
+        // Wire has no system prompt here -> first message is the first cold blob.
+        // The cold prefix must be compacted (marker present) and shorter.
+        let cold_wire = &wire[0];
+        assert!(
+            cold_wire
+                .content
+                .as_deref()
+                .unwrap()
+                .contains(COMPACTION_MARKER_PREFIX),
+            "cold prefix must be compacted on the wire"
+        );
+        assert!(
+            cold_wire.content.as_deref().unwrap().len() < cold_contents[0].len(),
+            "compacted wire content must be shorter than the original blob"
+        );
+
+        // The 6 most recent messages stay byte-identical on the wire.
+        let n = wire.len();
+        for (i, r) in recents.iter().enumerate() {
+            assert_eq!(
+                wire[n - recents.len() + i].content.as_deref().unwrap(),
+                *r,
+                "recent message {i} must be verbatim on the wire"
+            );
+        }
+
+        // The store keeps the full verbatim transcript untouched.
+        let stored = store.get_messages(&s.id);
+        for (i, original) in cold_contents.iter().enumerate() {
+            assert_eq!(
+                &stored[i].content, original,
+                "store must keep cold message {i} verbatim"
+            );
+        }
+
+        // Each compacted blob's original is retrievable by its marker key.
+        let key = extract_marker_key(cold_wire.content.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            store.compaction_original(&key).as_deref(),
+            Some(cold_contents[0].as_str()),
+            "the verbatim original must be retrievable by its marker key"
+        );
+    }
+
+    #[tokio::test]
+    async fn below_pressure_wire_is_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::new();
+        let s = store.create_session(None);
+        store.add_message(&s.id, Role::User, "a short question".into());
+        store.add_message(&s.id, Role::Assistant, "a short answer".into());
+        store.add_message(&s.id, Role::User, "another short one".into());
+
+        let history = store.get_messages(&s.id);
+        let pressure = ProxyTokenEstimator::default().assess(&history, "mock");
+        assert!(
+            !pressure.is_over(EXTRACTIVE_COMPACT_AT_FRACTION),
+            "small transcript must be below the extractive threshold"
+        );
+
+        let registry = ToolRegistry::new();
+        let root = dir.path().to_path_buf();
+        let approve = AlwaysApprove;
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = RecordingProvider { seen: seen.clone() };
+
+        run_turn(
+            &provider,
+            &store,
+            &ctx(&registry, &root, &approve),
+            &s.id,
+            "mock",
+            None,
+            false,
+            CancelToken::new(),
+            |_| {},
+        )
+        .await
+        .unwrap();
+
+        let wire = seen.lock().unwrap().clone();
+        for m in &wire {
+            assert!(
+                !m.content
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains(COMPACTION_MARKER_PREFIX),
+                "below pressure, no message may be compacted on the wire"
+            );
+        }
+        // And nothing was persisted to the originals store.
+        assert!(
+            history
+                .iter()
+                .all(|m| store.compaction_original(&m.id).is_none()),
+            "below pressure, no originals may be persisted"
+        );
     }
 }
