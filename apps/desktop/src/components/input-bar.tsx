@@ -3,6 +3,7 @@ import {
   ArrowUp,
   Check,
   ChevronsUpDown,
+  EyeOff,
   FileText,
   Folder,
   Paperclip,
@@ -18,6 +19,12 @@ import {
   DropdownMenuContent,
   DropdownMenuItem,
 } from "@/components/ui/dropdown-menu";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
 import type { Attachment } from "@/bindings";
 import { fileToAttachment } from "@/lib/attachments";
 import { cn } from "@/lib/utils";
@@ -28,6 +35,7 @@ import { useComposerStore } from "@/store/composer";
 import { usePrefsStore } from "@/store/prefs";
 import { useSessionWorkspaceStore } from "@/store/session-workspace";
 import { useSessionModeStore, MODE_ORDER } from "@/store/session-mode";
+import { useModelConfigStore, activeConnection } from "@/store/model-config";
 import { MODE_META } from "@/lib/mode";
 
 // A local model server (candle-vllm, Ollama, …) clocks its GPU down when idle,
@@ -105,6 +113,14 @@ export function InputBar({
   const [attachments, setAttachments] = useState<Attachment[]>([]);
   const [dragOver, setDragOver] = useState(false);
 
+  // Capability gate (#342): the active model may not be able to see images. Read
+  // `supportsVision` off the active connection and fail OPEN when unknown (registry
+  // not yet loaded / no active connection) so the composer is never falsely blocked.
+  const supportsVision = useModelConfigStore(
+    (s) => activeConnection(s.registry)?.supportsVision,
+  );
+  const visionGated = supportsVision === false;
+
   // Resolved mode for this pane's session — drives the Plan-aware placeholder
   // (#267, RFC 0011 §8). Switching modes is done via the pill dropdown (#344).
   const defaultMode = usePrefsStore((s) => s.defaultMode);
@@ -122,6 +138,8 @@ export function InputBar({
 
   const handlePaste = useCallback(
     (e: React.ClipboardEvent<HTMLTextAreaElement>) => {
+      // Vision-gated (#342): let the paste fall through as text; don't stage images.
+      if (visionGated) return;
       const items = Array.from(e.clipboardData.items);
       for (const item of items) {
         if (item.type.startsWith("image/")) {
@@ -134,14 +152,18 @@ export function InputBar({
         }
       }
     },
-    [],
+    [visionGated],
   );
 
-  const handleDragOver = useCallback((e: React.DragEvent) => {
-    e.preventDefault();
-    e.stopPropagation();
-    setDragOver(true);
-  }, []);
+  const handleDragOver = useCallback(
+    (e: React.DragEvent) => {
+      if (visionGated) return;
+      e.preventDefault();
+      e.stopPropagation();
+      setDragOver(true);
+    },
+    [visionGated],
+  );
 
   const handleDragLeave = useCallback((e: React.DragEvent) => {
     e.preventDefault();
@@ -150,22 +172,26 @@ export function InputBar({
     if (!e.currentTarget.contains(e.relatedTarget as Node)) setDragOver(false);
   }, []);
 
-  const handleDrop = useCallback((e: React.DragEvent) => {
-    e.preventDefault();
-    e.stopPropagation();
-    setDragOver(false);
-    const files = Array.from(e.dataTransfer.files);
-    for (const file of files) {
-      if (!file.type.startsWith("image/")) continue;
-      fileToAttachment(file).then((att) =>
-        setAttachments((prev) => [...prev, att]),
-      );
-    }
-  }, []);
+  const handleDrop = useCallback(
+    (e: React.DragEvent) => {
+      e.preventDefault();
+      e.stopPropagation();
+      setDragOver(false);
+      if (visionGated) return;
+      const files = Array.from(e.dataTransfer.files);
+      for (const file of files) {
+        if (!file.type.startsWith("image/")) continue;
+        fileToAttachment(file).then((att) =>
+          setAttachments((prev) => [...prev, att]),
+        );
+      }
+    },
+    [visionGated],
+  );
 
   function handleFilePick(e: React.ChangeEvent<HTMLInputElement>) {
     const files = e.target.files;
-    if (!files) return;
+    if (!files || visionGated) return;
     for (const file of Array.from(files)) {
       if (!file.type.startsWith("image/")) continue;
       fileToAttachment(file).then((att) =>
@@ -311,17 +337,47 @@ export function InputBar({
                   />
                   <ModePill sessionId={targetSessionId} />
                   <WorkspaceSelector sessionId={targetSessionId} />
-                  <Button
-                    type="button"
-                    variant="ghost"
-                    size="icon-xs"
-                    className="shrink-0 text-muted-foreground hover:text-foreground"
-                    onClick={() => fileInputRef.current?.click()}
-                    title="Attach image"
-                    aria-label="Attach image"
-                  >
-                    <Paperclip className="size-3.5" />
-                  </Button>
+                  {visionGated ? (
+                    // Capability gate (#342): the active model can't see images, so
+                    // the attach button is disabled + badged with an EyeOff marker and
+                    // a tooltip explaining why. The disabled <button> won't fire pointer
+                    // events, so the tooltip hangs off a <span> wrapper.
+                    <TooltipProvider delayDuration={150}>
+                      <Tooltip>
+                        <TooltipTrigger asChild>
+                          <span className="inline-flex">
+                            <Button
+                              type="button"
+                              variant="ghost"
+                              size="icon-xs"
+                              disabled
+                              className="relative shrink-0 text-muted-foreground"
+                              aria-label="Attach image (unavailable: this model can't see images)"
+                            >
+                              <Paperclip className="size-3.5" />
+                              <EyeOff className="absolute -bottom-0.5 -right-0.5 size-2.5 rounded-full bg-card" />
+                            </Button>
+                          </span>
+                        </TooltipTrigger>
+                        <TooltipContent className="max-w-56">
+                          This model can&apos;t see images — switch to a
+                          vision-capable model to attach.
+                        </TooltipContent>
+                      </Tooltip>
+                    </TooltipProvider>
+                  ) : (
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="icon-xs"
+                      className="shrink-0 text-muted-foreground hover:text-foreground"
+                      onClick={() => fileInputRef.current?.click()}
+                      title="Attach image"
+                      aria-label="Attach image"
+                    >
+                      <Paperclip className="size-3.5" />
+                    </Button>
+                  )}
                 </>
               ) : (
                 <span />
