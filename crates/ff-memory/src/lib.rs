@@ -178,8 +178,8 @@ pub struct MemoryConfig {
 /// `weight` only decays/reinforces when `enabled = true`. M6.0 (#291) shipped
 /// `enabled = false` as a no-op rollback path; M6.1 (#292) flips the default on
 /// and consumes `dormant_threshold` to skip dormant chunks from ambient
-/// injection. `ambient_gain` (weak ambient reinforcement, RFC §10.1) is schema
-/// now, consumed in a follow-up.
+/// injection. `ambient_gain` (weak ambient reinforcement, RFC §10.1, #387) is
+/// consumed but defaults to `0` — opt-in (see [`default_ambient_gain`]).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export, export_to = "../../../apps/desktop/src/bindings/")]
@@ -195,8 +195,9 @@ pub struct DecayConfig {
     /// Strength of a `memory_search` hit: `weight += gain * (1.0 - weight)`.
     #[serde(default = "default_reinforce_gain")]
     pub reinforce_gain: f32,
-    /// Weaker reinforcement for an ambient-only hit (schema now; consumed in
-    /// the ambient-reinforcement follow-up, RFC §10.1).
+    /// Weak reinforcement for a chunk that was ambient-injected and the turn
+    /// produced a reply (RFC 0007 §10.1). Defaults to `0` (off) — a nonzero value
+    /// keeps still-shown curated chunks fresh; set > 0 to opt in.
     #[serde(default = "default_ambient_gain")]
     pub ambient_gain: f32,
     /// `weight` below this marks a chunk dormant — skipped from ambient
@@ -249,7 +250,10 @@ fn default_reinforce_gain() -> f32 {
     0.3
 }
 fn default_ambient_gain() -> f32 {
-    0.05
+    // Off by default (RFC 0007 §10 Open Q#1): with dormant-skip, a nonzero gain
+    // would refresh every still-shown curated chunk every turn, so curated facts
+    // would never go dormant during active use. Opt-in; set > 0 to enable.
+    0.0
 }
 fn default_dormant_threshold() -> f32 {
     0.25
@@ -620,11 +624,24 @@ impl Memory {
     /// **Never-recalled stays present.** A chunk with no `chunk_stats` row has
     /// effective weight `1.0` (the age clock starts at first *recall*, not
     /// creation — RFC 0007 §3), so a fresh `MEMORY.md` entry is never skipped.
-    /// This is intended; it interacts with the deferred ambient-reinforcement
-    /// piece (`ambient_gain`, RFC §10.1) — if ambient injection itself ever counts
-    /// as a soft "touch", this behaviour changes.
+    /// This is intended and preserved by weak ambient reinforcement (`ambient_gain`,
+    /// RFC §10.1): ambient reinforcement only bumps chunks that already have a
+    /// `chunk_stats` row, so it never starts the age clock for a never-recalled
+    /// chunk — a fresh entry stays at weight `1.0` until its first real recall.
     pub fn ambient_block_filtered(&self, index: &dyn MemoryIndex) -> Option<String> {
-        self.ambient_block_filtered_for(
+        self.ambient_block_filtered_keyed(index).0
+    }
+
+    /// [`ambient_block_filtered`](Self::ambient_block_filtered) returning the
+    /// block *and* the `chunk_key`s of the curated chunks that were injected (not
+    /// dormant). The host reinforces those keys after a successful turn (weak
+    /// ambient reinforcement, RFC 0007 §10.1) — daily chunks are excluded (they
+    /// are never dormant, so reinforcing them is meaningless).
+    pub fn ambient_block_filtered_keyed(
+        &self,
+        index: &dyn MemoryIndex,
+    ) -> (Option<String>, Vec<String>) {
+        self.ambient_block_filtered_keyed_for(
             index,
             Local::now().date_naive(),
             Utc::now().timestamp_millis(),
@@ -639,13 +656,25 @@ impl Memory {
         today: NaiveDate,
         now_ms: i64,
     ) -> Option<String> {
+        self.ambient_block_filtered_keyed_for(index, today, now_ms)
+            .0
+    }
+
+    /// [`ambient_block_filtered_keyed`](Self::ambient_block_filtered_keyed) with
+    /// injected clocks — the testable core.
+    pub fn ambient_block_filtered_keyed_for(
+        &self,
+        index: &dyn MemoryIndex,
+        today: NaiveDate,
+        now_ms: i64,
+    ) -> (Option<String>, Vec<String>) {
         if !self.config.enabled {
-            return None;
+            return (None, Vec::new());
         }
-        let curated = self.curated_section_filtered(index, now_ms);
+        let (curated, curated_keys) = self.curated_filter(index, now_ms);
         let daily = self.daily_section(today);
         if curated.is_none() && daily.is_none() {
-            return None;
+            return (None, Vec::new());
         }
         let mut out = String::from("## Memory\n");
         if let Some(c) = curated {
@@ -656,19 +685,27 @@ impl Memory {
         if let Some(d) = daily {
             out.push_str(&d);
         }
-        Some(out)
+        (Some(out), curated_keys)
     }
 
-    /// [`curated_section`](Self::curated_section) with dormant chunks' line ranges
-    /// excised from the *original* curated text before truncation (line-range
-    /// deletion, not chunk-rejoin, so surrounding text stays verbatim). Chunks are
-    /// derived exactly as the index sees them (`chunk_markdown` over the raw file)
-    /// so `chunk_key` correlation holds. With no dormant chunks the raw text is
-    /// passed through unchanged, giving the byte-identical guarantee.
-    fn curated_section_filtered(&self, index: &dyn MemoryIndex, now_ms: i64) -> Option<String> {
+    /// The dormancy-filtered curated section *and* the `chunk_key`s of the curated
+    /// chunks that survived (were actually injected) — the latter is the input to
+    /// weak ambient reinforcement (RFC 0007 §10.1).
+    ///
+    /// Dormant chunks' line ranges are excised from the *original* curated text
+    /// before truncation (line-range deletion, not chunk-rejoin, so surrounding
+    /// text stays verbatim). Chunks are derived exactly as the index sees them
+    /// (`chunk_markdown` over the raw file) so `chunk_key` correlation holds. With
+    /// no dormant chunks the raw text is passed through unchanged, giving the
+    /// byte-identical guarantee.
+    fn curated_filter(
+        &self,
+        index: &dyn MemoryIndex,
+        now_ms: i64,
+    ) -> (Option<String>, Vec<String>) {
         let raw = read_lenient(&self.curated_path());
         if raw.trim().is_empty() {
-            return None;
+            return (None, Vec::new());
         }
         let curated_path = self.curated_path();
         let chunks = chunk_markdown(&raw, MemorySource::Curated, &curated_path);
@@ -681,8 +718,12 @@ impl Memory {
         // a line shared with a still-live window must survive.
         let mut dormant_lines: std::collections::HashSet<u32> = std::collections::HashSet::new();
         let mut live_lines: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        let mut live_keys: Vec<String> = Vec::new();
         for (chunk, key) in chunks.iter().zip(keys.iter()) {
             let is_dormant = stats.get(key).is_some_and(|s| s.weight < threshold);
+            if !is_dormant && !live_keys.contains(key) {
+                live_keys.push(key.clone());
+            }
             let target = if is_dormant {
                 &mut dormant_lines
             } else {
@@ -708,17 +749,16 @@ impl Memory {
 
         let curated = kept.trim();
         if curated.is_empty() {
-            return None;
+            return (None, Vec::new());
         }
         let budget = self.config.injection_budget_bytes;
-        if curated.len() > budget {
+        let text = if curated.len() > budget {
             let head = head_within(curated, budget);
-            Some(format!(
-                "{head}\n\n_(memory truncated — use `memory_search` for the rest)_"
-            ))
+            format!("{head}\n\n_(memory truncated — use `memory_search` for the rest)_")
         } else {
-            Some(curated.to_string())
-        }
+            curated.to_string()
+        };
+        (Some(text), live_keys)
     }
 
     fn curated_section(&self) -> Option<String> {
@@ -1547,6 +1587,85 @@ mod tests {
         assert!(
             after.contains("user prefers rust"),
             "woken by recall: {after}"
+        );
+    }
+    #[test]
+    fn keyed_ambient_returns_live_curated_keys_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = mem(dir.path());
+        write(
+            &m.curated_path(),
+            "## Likes\nuser prefers rust\n\n## Dislikes\nuser dislikes verbose logs\n",
+        );
+        let today = NaiveDate::from_ymd_opt(2026, 6, 22).unwrap();
+        write(&m.daily_path(today), "shipped reinforcement");
+        let idx = enabled_index();
+        idx.reindex(&m.all_chunks()).unwrap();
+
+        // Recall the Likes chunk long ago so it decays dormant by `future`.
+        idx.reinforce_at(&search_for(&idx, "rust"), T0).unwrap();
+        let future = T0 + 500 * DAY_MS;
+
+        let (block, keys) = m.ambient_block_filtered_keyed_for(&idx, today, future);
+        assert!(
+            !block.unwrap().contains("user prefers rust"),
+            "dormant excised"
+        );
+
+        let curated: Vec<MemoryChunk> = m
+            .all_chunks()
+            .into_iter()
+            .filter(|c| matches!(c.source, MemorySource::Curated))
+            .collect();
+        let likes_key = chunk_key(curated.iter().find(|c| c.text.contains("rust")).unwrap());
+        let dislikes_key = chunk_key(curated.iter().find(|c| c.text.contains("verbose")).unwrap());
+        // Only the live (non-dormant) curated chunk's key — no dormant key, no daily key.
+        assert_eq!(keys, vec![dislikes_key], "only the live curated chunk key");
+        assert!(!keys.contains(&likes_key), "dormant key excluded");
+    }
+
+    #[test]
+    fn keyed_ambient_keys_feed_reinforcement_end_to_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = mem(dir.path());
+        write(&m.curated_path(), "## Likes\nuser prefers rust\n");
+        let idx = Fts5Index::open_in_memory()
+            .unwrap()
+            .with_decay(DecayConfig {
+                enabled: true,
+                ambient_gain: 0.3,
+                ..DecayConfig::default()
+            });
+        idx.reindex(&m.all_chunks()).unwrap();
+        let today = NaiveDate::from_ymd_opt(2026, 6, 22).unwrap();
+
+        // Recall once at T0 so the chunk is tracked (weight 1.0).
+        idx.reinforce_at(&search_for(&idx, "rust"), T0).unwrap();
+
+        // 60 days later it is still live (above dormant_threshold), so the keyed
+        // ambient call surfaces its key.
+        let future = T0 + 60 * DAY_MS;
+        let key = m
+            .ambient_block_filtered_keyed_for(&idx, today, future)
+            .1
+            .into_iter()
+            .next()
+            .expect("a live curated key");
+
+        let before = idx
+            .effective_stats(std::slice::from_ref(&key), future)
+            .unwrap()[&key]
+            .weight;
+        // Ambient injection + reply reinforces exactly that injected key.
+        idx.reinforce_ambient_at(std::slice::from_ref(&key), future)
+            .unwrap();
+        let after = idx
+            .effective_stats(std::slice::from_ref(&key), future)
+            .unwrap()[&key]
+            .weight;
+        assert!(
+            after > before,
+            "ambient reinforcement of the injected key lifted its weight ({before} -> {after})"
         );
     }
 }

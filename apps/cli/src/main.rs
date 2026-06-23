@@ -356,9 +356,9 @@ async fn run(
     };
 
     let user_ctx = UserContext::now();
-    let memory = match &memory_index {
-        Some(idx) => memory_store.ambient_block_filtered(idx.as_ref()),
-        None => memory_store.ambient_block(),
+    let (memory, ambient_keys) = match &memory_index {
+        Some(idx) => memory_store.ambient_block_filtered_keyed(idx.as_ref()),
+        None => (memory_store.ambient_block(), Vec::new()),
     };
     let system_prompt = ff_agent::build_system_prompt(
         inputs.persona.as_deref(),
@@ -415,6 +415,12 @@ async fn run(
 
     match result {
         Ok(_) => {
+            // Weak ambient reinforcement (RFC 0007 §10.1): the turn produced a
+            // reply, so refresh the curated chunks that were ambient-injected.
+            // No-op unless `decay.ambient_gain > 0`.
+            if let Some(idx) = &memory_index {
+                let _ = idx.reinforce_ambient(&ambient_keys);
+            }
             if approver.was_denied() {
                 eprintln!("error: one or more required tool approvals were denied");
                 ExitCode::FAILURE
@@ -520,9 +526,9 @@ async fn chat_repl(
         store.add_message(session_id, Role::User, trimmed.to_string());
 
         let user_ctx = UserContext::now();
-        let memory = match memory_index {
-            Some(idx) => memory_store.ambient_block_filtered(idx.as_ref()),
-            None => memory_store.ambient_block(),
+        let (memory, ambient_keys) = match memory_index {
+            Some(idx) => memory_store.ambient_block_filtered_keyed(idx.as_ref()),
+            None => (memory_store.ambient_block(), Vec::new()),
         };
         let system_prompt =
             ff_agent::build_system_prompt(None, skills, &[], &user_ctx, memory.as_deref(), mode);
@@ -568,7 +574,13 @@ async fn chat_repl(
         ctrlc_handle.abort();
 
         match result {
-            Ok(_) => {}
+            Ok(_) => {
+                // Weak ambient reinforcement (RFC 0007 §10.1) for the curated
+                // chunks injected this turn. No-op unless `ambient_gain > 0`.
+                if let Some(idx) = memory_index {
+                    let _ = idx.reinforce_ambient(&ambient_keys);
+                }
+            }
             Err(e) => {
                 eprintln!("\n[error] {e}");
             }
