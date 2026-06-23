@@ -10,6 +10,8 @@
     "build": "tsc && vite build",
     "preview": "vite preview",
     "tauri": "tauri",
+    "//build:local": "Local production bundle WITHOUT the signed updater artifact, so it builds without TAURI_SIGNING_PRIVATE_KEY. The release/CI path uses `tauri build` (signed). See docs/SOP-rust-setup.md §5.",
+    "build:local": "tauri build --config '{\"bundle\":{\"createUpdaterArtifacts\":false}}'",
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
     "lint:fix": "eslint . --fix",

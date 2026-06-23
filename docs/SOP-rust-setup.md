@@ -217,9 +217,21 @@ cargo test --workspace            # also regenerates ts-rs bindings
 pnpm install
 pnpm tauri dev                    # hot-reloads both Rust and React
 
-# Production build
-pnpm tauri build
+# Local production bundle (no signing key needed)
+pnpm build:local            # .app/.dmg without the signed updater artifact
+
+# Release/CI build (signs the updater artifact)
+pnpm tauri build            # requires TAURI_SIGNING_PRIVATE_KEY (see below)
 ```
+
+> **Heads-up:** `tauri.conf.json` sets `bundle.createUpdaterArtifacts: true` with a
+> committed updater `pubkey` (RFC 0014 self-update). Because of that, a bare
+> `pnpm tauri build` *signs* the `.app.tar.gz` updater artifact and fails with
+> *"A public key has been found, but no private key… set `TAURI_SIGNING_PRIVATE_KEY`"*
+> unless that release secret is in your env. For everyday local builds use
+> **`pnpm build:local`** (passes `--config '{"bundle":{"createUpdaterArtifacts":false}}'`,
+> the same flag `dev-install.sh` uses) — it produces a runnable bundle with no key.
+> Only the release path (CI) and the D1 update-feed loop (§8.3) need the signing key.
 
 Definition of done for a backend change: `fmt` clean, `clippy` zero warnings,
 `test` green, bindings committed if any `ff-core` type changed.
