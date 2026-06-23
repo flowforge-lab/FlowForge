@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use base64::Engine as _;
 use futures_util::StreamExt;
 use serde::Deserialize;
 
@@ -152,13 +153,52 @@ fn parse_ollama_line(line: &[u8], tool_idx: &mut u32) -> Option<Result<Chunk, Ll
 /// call back. We adapt only at this boundary; the stored/OpenAI representation is
 /// untouched. Arguments that are empty, unparseable, or parse to a non-object
 /// JSON value (e.g. an array or scalar) become `{}` — Ollama requires an object.
+/// Base64-encode one image attachment for Ollama's `images: [base64, ...]` field,
+/// or `None` (with a warning) when it can't be sent: an unsupported media type, an
+/// unreadable file, or undecodable inline data. Unlike OpenAI's data URI, Ollama
+/// takes the **bare** base64 with no `data:` prefix. Skipping rather than failing
+/// keeps one bad attachment from dropping the whole turn (trust boundary, #334/#337).
+fn ollama_image_base64(a: &ff_core::Attachment) -> Option<String> {
+    if crate::image_media_type(&a.media_type).is_none() {
+        tracing::warn!(media_type = %a.media_type, "skipping image attachment: unsupported media type for Ollama");
+        return None;
+    }
+    let bytes = crate::attachment_bytes(a)
+        .map_err(|e| tracing::warn!(error = %e, "skipping image attachment"))
+        .ok()?;
+    Some(base64::engine::general_purpose::STANDARD.encode(bytes))
+}
+
 fn ollama_messages(messages: &[ChatMessage]) -> Result<serde_json::Value, LlmError> {
     let mut value = serde_json::to_value(messages).map_err(|e| LlmError::Decode(e.to_string()))?;
     let Some(arr) = value.as_array_mut() else {
         return Ok(value);
     };
-    for msg in arr {
-        let Some(calls) = msg.get_mut("tool_calls").and_then(|v| v.as_array_mut()) else {
+    for (src, msg) in messages.iter().zip(arr.iter_mut()) {
+        let Some(obj) = msg.as_object_mut() else {
+            continue;
+        };
+        // Drop the internal attachments field so it never reaches Ollama (mirrors the
+        // OpenAI adapter); serde already skips an empty Vec, so a text-only turn has no
+        // key here and stays byte-identical. Then emit image attachments as Ollama's
+        // `images: [base64, ...]` sibling field, leaving `content` a plain string.
+        obj.remove("attachments");
+        let images: Vec<String> = src
+            .attachments
+            .iter()
+            .filter_map(|a| match a.kind {
+                ff_core::AttachmentKind::Image => ollama_image_base64(a),
+                ff_core::AttachmentKind::Document => {
+                    tracing::warn!(media_type = %a.media_type, "skipping document attachment: Ollama chat has no portable document block (#338)");
+                    None
+                }
+            })
+            .collect();
+        if !images.is_empty() {
+            obj.insert("images".into(), serde_json::json!(images));
+        }
+
+        let Some(calls) = obj.get_mut("tool_calls").and_then(|v| v.as_array_mut()) else {
             continue;
         };
         for call in calls {
@@ -426,5 +466,148 @@ mod tests {
         let out = ollama_messages(&[msg]).unwrap();
         assert_eq!(out[0]["tool_calls"][0]["function"]["arguments"]["x"], 1);
         assert_eq!(out[0]["tool_calls"][1]["function"]["arguments"]["y"], 2);
+    }
+
+    use ff_core::{Attachment, AttachmentKind, AttachmentSource};
+
+    fn inline_b64(bytes: &[u8]) -> String {
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    }
+
+    fn image(media_type: &str, source: AttachmentSource) -> Attachment {
+        Attachment {
+            kind: AttachmentKind::Image,
+            media_type: media_type.into(),
+            source,
+            name: Some("shot.png".into()),
+            bytes: 4,
+        }
+    }
+
+    const PNG: [u8; 4] = [0x89, 0x50, 0x4e, 0x47];
+
+    #[test]
+    fn image_attachment_emits_bare_base64_in_images_array() {
+        let b64 = inline_b64(&PNG);
+        let msgs = vec![ChatMessage::multimodal(
+            "user",
+            "look at this",
+            vec![image("image/png", AttachmentSource::Inline(b64.clone()))],
+        )];
+        let out = ollama_messages(&msgs).unwrap();
+        let m = &out[0];
+        assert!(
+            m.get("attachments").is_none(),
+            "internal field must not leak"
+        );
+        assert!(m["content"].is_string(), "content stays a plain string");
+        let images = m["images"].as_array().expect("images array present");
+        assert_eq!(images.len(), 1);
+        let entry = images[0].as_str().unwrap();
+        assert_eq!(entry, b64, "bare base64, byte-identical to the payload");
+        assert!(
+            !entry.starts_with("data:"),
+            "Ollama takes bare base64, not a data URI"
+        );
+    }
+
+    #[test]
+    fn document_attachment_is_skipped_no_images() {
+        let msgs = vec![ChatMessage::multimodal(
+            "user",
+            "read this",
+            vec![Attachment {
+                kind: AttachmentKind::Document,
+                media_type: "application/pdf".into(),
+                source: AttachmentSource::Inline(inline_b64(b"%PDF-1.4")),
+                name: Some("doc.pdf".into()),
+                bytes: 8,
+            }],
+        )];
+        let out = ollama_messages(&msgs).unwrap();
+        assert!(
+            out[0].get("images").is_none(),
+            "no image block for a document"
+        );
+        assert!(out[0].get("attachments").is_none());
+    }
+
+    #[test]
+    fn unsupported_image_type_is_skipped() {
+        let msgs = vec![ChatMessage::multimodal(
+            "user",
+            "svg here",
+            vec![image(
+                "image/svg+xml",
+                AttachmentSource::Inline(inline_b64(b"<svg/>")),
+            )],
+        )];
+        let out = ollama_messages(&msgs).unwrap();
+        assert!(
+            out[0].get("images").is_none(),
+            "unsupported type produces no images"
+        );
+    }
+
+    #[test]
+    fn text_only_turn_is_byte_identical() {
+        let msgs = vec![ChatMessage::text("user", "hi")];
+        let out = ollama_messages(&msgs).unwrap();
+        assert_eq!(out, serde_json::to_value(&msgs).unwrap());
+        assert!(out[0].get("images").is_none());
+        assert!(out[0].get("attachments").is_none());
+    }
+
+    /// Folded from the #368 review: one bad attachment must not drop the turn -- the
+    /// valid image still lands in `images`, the unreadable one is skipped.
+    #[test]
+    fn mixed_valid_and_unreadable_keeps_the_good_image() {
+        let msgs = vec![ChatMessage::multimodal(
+            "user",
+            "two images",
+            vec![
+                image("image/png", AttachmentSource::Inline(inline_b64(&PNG))),
+                image(
+                    "image/png",
+                    AttachmentSource::Path("/nonexistent/flowforge/missing.png".into()),
+                ),
+            ],
+        )];
+        let out = ollama_messages(&msgs).unwrap();
+        let images = out[0]["images"].as_array().expect("images present");
+        assert_eq!(images.len(), 1, "only the readable image survives");
+        assert_eq!(images[0].as_str().unwrap(), inline_b64(&PNG));
+    }
+
+    /// Folded from the #368 review: exercise the strip (messages_for_wire) and reshape
+    /// (ollama_messages) layers together. Vision off => no images and no leaked field;
+    /// vision on => images present.
+    #[test]
+    fn strip_then_reshape_composition() {
+        let msgs = vec![ChatMessage::multimodal(
+            "user",
+            "look",
+            vec![image(
+                "image/png",
+                AttachmentSource::Inline(inline_b64(&PNG)),
+            )],
+        )];
+
+        let off = ollama_messages(&crate::messages_for_wire(&msgs, false)).unwrap();
+        assert!(
+            off[0].get("images").is_none(),
+            "vision off: image stripped before reshape"
+        );
+        assert!(
+            off[0].get("attachments").is_none(),
+            "vision off: no leaked field"
+        );
+
+        let on = ollama_messages(&crate::messages_for_wire(&msgs, true)).unwrap();
+        assert!(
+            on[0]["images"].as_array().is_some_and(|a| a.len() == 1),
+            "vision on: image emitted"
+        );
+        assert!(on[0].get("attachments").is_none());
     }
 }

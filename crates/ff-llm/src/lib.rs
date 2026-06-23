@@ -265,6 +265,21 @@ pub(crate) fn attachment_bytes(a: &ff_core::Attachment) -> Result<Vec<u8>, Strin
     }
 }
 
+/// Canonical image media type a vision model accepts, or `None` for an unsupported
+/// type. `supports_vision` being true doesn't guarantee every format is taken
+/// (trust-boundary, #334), so an unrecognized type is skipped rather than sent.
+/// Shared by the OpenAI-compatible (data URI) and Ollama (bare base64) adapters
+/// (#336/#337); the returned canonical type is what a data URI should advertise.
+pub(crate) fn image_media_type(media_type: &str) -> Option<&'static str> {
+    match media_type.trim().to_ascii_lowercase().as_str() {
+        "image/png" => Some("image/png"),
+        "image/jpeg" | "image/jpg" => Some("image/jpeg"),
+        "image/gif" => Some("image/gif"),
+        "image/webp" => Some("image/webp"),
+        _ => None,
+    }
+}
+
 #[async_trait]
 pub trait Provider: Send + Sync {
     async fn chat_stream(&self, req: ChatRequest) -> Result<ChunkStream, LlmError>;
