@@ -225,6 +225,42 @@ pub fn wire_dialect(kind: ff_core::ProviderKind, vendor: Option<&str>, model: &s
     }
 }
 
+/// Conservative cap on SiliconFlow reasoning tokens when thinking is on (#394).
+/// SiliconFlow auto-escalates agent-type requests to `max` effort otherwise,
+/// which burned through reasoning tokens fast in a coding session. Verified
+/// against `zai-org/GLM-5.2`: `thinking_budget` hard-stops the chain-of-thought
+/// at the requested count. Generous enough to preserve normal reasoning quality
+/// while bounding runaway; the user-facing dial that overrides it is #395.
+pub const DEFAULT_SILICONFLOW_THINKING_BUDGET: u32 = 8192;
+
+/// Per-gateway reasoning-cost controls (#394). Resolved once at provider build
+/// time, like [`WireDialect`]. The default emits nothing, preserving vanilla
+/// OpenAI / candle-vllm / LM Studio / OpenRouter behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ReasoningControl {
+    /// Emit no reasoning parameters.
+    #[default]
+    None,
+    /// SiliconFlow knobs (verified #394 on GLM-5.2): `enable_thinking: false`
+    /// turns reasoning fully off, and `thinking_budget` hard-caps reasoning
+    /// tokens. Which one is sent depends on `ChatRequest::thinking`.
+    SiliconFlow { budget_tokens: u32 },
+}
+
+/// Resolve reasoning controls from a connection's `(kind, model)`. Scoped to
+/// SiliconFlow GLM -- the only combination verified to honor `enable_thinking` /
+/// `thinking_budget` as hard controls (#394); everything else emits nothing.
+pub fn reasoning_control(kind: ff_core::ProviderKind, model: &str) -> ReasoningControl {
+    use ff_core::ProviderKind as K;
+    let is_glm = model.to_ascii_lowercase().contains("glm");
+    match kind {
+        K::SiliconFlow if is_glm => ReasoningControl::SiliconFlow {
+            budget_tokens: DEFAULT_SILICONFLOW_THINKING_BUDGET,
+        },
+        _ => ReasoningControl::None,
+    }
+}
+
 /// Drop attachments from every message for providers that cannot carry them
 /// (the capability strip, #332/#334). Borrows on the common path (no message has
 /// attachments) and only clones when a strip is actually needed, so a text-only
@@ -506,6 +542,33 @@ mod tests {
         );
         assert_eq!(d.reasoning, ReasoningWire::Reasoning);
         assert_eq!(d.tool_call_content, ToolCallContent::Omit);
+    }
+
+    #[test]
+    fn reasoning_control_only_targets_siliconflow_glm() {
+        use ff_core::ProviderKind as K;
+        // SiliconFlow + GLM is the only verified combination (#394).
+        assert_eq!(
+            reasoning_control(K::SiliconFlow, "zai-org/GLM-5.2"),
+            ReasoningControl::SiliconFlow {
+                budget_tokens: DEFAULT_SILICONFLOW_THINKING_BUDGET
+            }
+        );
+        // SiliconFlow non-GLM (e.g. DeepSeek-R1) is left alone -- unverified, and
+        // some always-reasoning models reject enable_thinking.
+        assert_eq!(
+            reasoning_control(K::SiliconFlow, "deepseek-ai/DeepSeek-R1"),
+            ReasoningControl::None
+        );
+        // Other gateways never emit SiliconFlow-specific params.
+        assert_eq!(
+            reasoning_control(K::OpenAi, "gpt-4o"),
+            ReasoningControl::None
+        );
+        assert_eq!(
+            reasoning_control(K::CandleVllm, "any-glm-named-local"),
+            ReasoningControl::None
+        );
     }
 
     #[test]
