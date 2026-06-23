@@ -311,21 +311,26 @@ fn load_or_migrate_registry_at(
     reg_path: Option<PathBuf>,
     cfg_path: Option<PathBuf>,
 ) -> ProviderRegistry {
-    if let Some(registry) = reg_path
+    let mut registry = if let Some(registry) = reg_path
         .as_ref()
         .and_then(|p| fs::read_to_string(p).ok())
         .and_then(|s| serde_json::from_str::<ProviderRegistry>(&s).ok())
     {
-        return registry;
-    }
-    if let Some(config) = cfg_path
+        registry
+    } else if let Some(config) = cfg_path
         .as_ref()
         .and_then(|p| fs::read_to_string(p).ok())
         .and_then(|s| serde_json::from_str::<ProviderConfig>(&s).ok())
     {
-        return build_migrated_registry(config);
-    }
-    ProviderRegistry::default()
+        build_migrated_registry(config)
+    } else {
+        ProviderRegistry::default()
+    };
+    // OR-upgrade `supports_vision` from the model capability map so older saves
+    // (which always persisted `false`) reflect the model'"'"'s actual capability for
+    // the FE attach gate (#408). Idempotent; explicit `true` is preserved.
+    registry.normalize_capabilities();
+    registry
 }
 
 /// Migrate a legacy single [`ProviderConfig`] into a registry: it becomes the

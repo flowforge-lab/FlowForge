@@ -256,6 +256,56 @@ impl ProviderConnection {
     }
 }
 
+/// Whether `(kind, model)` is known to accept image/document attachments. Pure
+/// capability lookup, conservative by design: returning `false` only means we
+/// don't know -- the FE gate (#408 / FE-4) and provider safety strip both fail
+/// closed on unknowns, so a wrong `false` only forces the user to rely on an
+/// explicit override.
+///
+/// Keep the map narrow. Adding a model here un-gates attachments app-wide for
+/// every connection on that model, so favor known-good families over loose
+/// substring matches.
+pub fn model_supports_vision(kind: ProviderKind, model: &str) -> bool {
+    let m = model.to_ascii_lowercase();
+    match kind {
+        // Modern Claude (3.x and 4.x, plus the named Mythos/Fable lines) all
+        // accept image input on Bedrock.
+        ProviderKind::Bedrock => {
+            m.contains("claude-3")
+                || m.contains("claude-opus-4")
+                || m.contains("claude-sonnet-4")
+                || m.contains("claude-haiku-4")
+                || m.contains("mythos")
+                || m.contains("fable")
+        }
+        // OpenAI vision-capable families: gpt-4o*, gpt-4-turbo (vision), gpt-4.1,
+        // gpt-5*, o1 with vision. gpt-3.5 stays text-only.
+        ProviderKind::OpenAi => {
+            m.contains("gpt-4o")
+                || m.contains("gpt-4.1")
+                || m.contains("gpt-4-turbo")
+                || m.contains("gpt-5")
+                || m.starts_with("o1")
+                || m.starts_with("o3")
+        }
+        // Ollama vision tags: explicit `llava`, `*-vision`, `moondream`, and the
+        // `qwen2-vl` family. Plain `llama3.2` etc. stays text-only.
+        ProviderKind::Ollama => {
+            m.contains("llava")
+                || m.contains("-vision")
+                || m.contains("moondream")
+                || m.contains("bakllava")
+                || m.contains("qwen2-vl")
+        }
+        // SiliconFlow ships text + a few `*-VL` multimodal entries (Qwen-VL,
+        // GLM-4V). Match the documented suffixes only.
+        ProviderKind::SiliconFlow => m.contains("-vl") || m.contains("-4v"),
+        // CandleVllm hosts whatever the user serves; we can't infer reliably.
+        // The user keeps the explicit override.
+        ProviderKind::CandleVllm => false,
+    }
+}
+
 /// The full set of configured connections plus a pointer to the active one.
 /// Replaces the single [`ProviderConfig`] as the persisted provider contract;
 /// switching providers is now non-destructive.
@@ -307,11 +357,29 @@ impl ProviderRegistry {
         if conn.id.trim().is_empty() {
             conn.id = self.derive_id(&conn);
         }
+        // OR-upgrade `supports_vision` from the model capability map so a
+        // freshly-saved connection on a known vision-capable model un-gates
+        // attachments without a manual settings toggle. Never downgrades an
+        // explicit `true`. See [`model_supports_vision`].
+        conn.supports_vision =
+            conn.supports_vision || model_supports_vision(conn.kind, &conn.model);
         match self.connections.iter_mut().find(|c| c.id == conn.id) {
             Some(slot) => *slot = conn.clone(),
             None => self.connections.push(conn.clone()),
         }
         conn
+    }
+
+    /// Apply [`model_supports_vision`] to every connection, OR'"'"'ing the inferred
+    /// capability into the stored flag. Idempotent and never downgrades an
+    /// explicit `true`. Callers should run this once after loading a persisted
+    /// registry so older saves (which never set `supportsVision`) reflect the
+    /// model'"'"'s actual capability for the FE attach gate (#408).
+    pub fn normalize_capabilities(&mut self) {
+        for conn in &mut self.connections {
+            conn.supports_vision =
+                conn.supports_vision || model_supports_vision(conn.kind, &conn.model);
+        }
     }
 
     /// Remove a connection by id. `Err` when it is the last one. If the removed
@@ -731,6 +799,130 @@ mod tests {
         assert!(json.contains("\"supportsVision\":true"));
         let back: ProviderConnection = serde_json::from_str(&json).unwrap();
         assert!(back.supports_vision);
+    }
+
+    #[test]
+    fn model_supports_vision_covers_known_families() {
+        // Modern Claude on Bedrock: 3.x and 4.x, plus the named Mythos/Fable.
+        for m in [
+            "us.anthropic.claude-opus-4-8",
+            "us.anthropic.claude-opus-4-5",
+            "us.anthropic.claude-sonnet-4-6",
+            "anthropic.claude-3-5-sonnet-20241022-v2:0",
+            "us.anthropic.claude-3-opus-20240229-v1:0",
+            "claude-mythos-5",
+            "claude-fable-5",
+        ] {
+            assert!(
+                model_supports_vision(ProviderKind::Bedrock, m),
+                "Bedrock vision: {m}"
+            );
+        }
+        // OpenAI vision-capable.
+        for m in [
+            "gpt-4o",
+            "gpt-4o-mini",
+            "gpt-4.1",
+            "gpt-4-turbo",
+            "gpt-5",
+            "o1",
+            "o3-mini",
+        ] {
+            assert!(
+                model_supports_vision(ProviderKind::OpenAi, m),
+                "OpenAI vision: {m}"
+            );
+        }
+        // Ollama vision tags.
+        for m in ["llava:7b", "llama3.2-vision", "moondream", "qwen2-vl:7b"] {
+            assert!(
+                model_supports_vision(ProviderKind::Ollama, m),
+                "Ollama vision: {m}"
+            );
+        }
+        // SiliconFlow VL/4V suffixes.
+        for m in ["Qwen/Qwen2-VL-7B-Instruct", "zai-org/GLM-4V-9B"] {
+            assert!(
+                model_supports_vision(ProviderKind::SiliconFlow, m),
+                "SiliconFlow vision: {m}"
+            );
+        }
+        // Negative coverage: text-only stays text-only.
+        for (k, m) in [
+            (ProviderKind::Ollama, "llama3.2"),
+            (ProviderKind::OpenAi, "gpt-3.5-turbo"),
+            (ProviderKind::Bedrock, "meta.llama3-70b-instruct-v1:0"),
+            (ProviderKind::SiliconFlow, "deepseek-ai/DeepSeek-V3"),
+            (ProviderKind::CandleVllm, "anything"),
+        ] {
+            assert!(
+                !model_supports_vision(k, m),
+                "expected text-only: {k:?} {m}"
+            );
+        }
+    }
+
+    #[test]
+    fn registry_normalize_capabilities_upgrades_false_and_keeps_true() {
+        let mut reg = ProviderRegistry {
+            active: "bed".into(),
+            connections: vec![
+                ProviderConnection {
+                    id: "bed".into(),
+                    kind: ProviderKind::Bedrock,
+                    model: "us.anthropic.claude-opus-4-8".into(),
+                    supports_vision: false,
+                    ..blank_conn("Bedrock", Some("aws"), ProviderKind::Bedrock)
+                },
+                ProviderConnection {
+                    id: "oll".into(),
+                    kind: ProviderKind::Ollama,
+                    model: "llama3.2".into(),
+                    supports_vision: false,
+                    ..blank_conn("Ollama", None, ProviderKind::Ollama)
+                },
+                ProviderConnection {
+                    id: "candle".into(),
+                    kind: ProviderKind::CandleVllm,
+                    model: "anything".into(),
+                    supports_vision: true,
+                    ..blank_conn("Candle", None, ProviderKind::CandleVllm)
+                },
+            ],
+        };
+        reg.normalize_capabilities();
+        // Inferred upgrade.
+        assert!(reg.connections[0].supports_vision, "Opus 4.8 ⇒ vision");
+        // Unknown stays false.
+        assert!(!reg.connections[1].supports_vision, "llama3.2 stays text");
+        // Explicit true preserved despite no inference.
+        assert!(
+            reg.connections[2].supports_vision,
+            "explicit true preserved"
+        );
+        // Idempotent.
+        let before = reg.clone();
+        reg.normalize_capabilities();
+        assert_eq!(reg, before);
+    }
+
+    #[test]
+    fn upsert_or_upgrades_vision_from_model_id() {
+        let mut reg = ProviderRegistry {
+            active: "x".into(),
+            connections: vec![],
+        };
+        let stored = reg.upsert(ProviderConnection {
+            id: "bed".into(),
+            kind: ProviderKind::Bedrock,
+            model: "us.anthropic.claude-opus-4-8".into(),
+            supports_vision: false,
+            ..blank_conn("Bedrock", Some("aws"), ProviderKind::Bedrock)
+        });
+        assert!(
+            stored.supports_vision,
+            "saved Opus 4.8 ⇒ supportsVision=true"
+        );
     }
 
     #[test]
