@@ -51,6 +51,25 @@ export function liveElapsedMs(
   return Math.max(0, now - start);
 }
 
+/**
+ * Plain-text glimpse of a turn's answer for the collapsed StepGroup preview (#414).
+ * Strips common Markdown syntax so the muted 2-line preview reads as prose, not
+ * source — still the raw answer content, never a model-generated summary. Leaves
+ * `_` alone so identifiers like `snake_case` survive.
+ */
+export function answerPreview(raw: string): string {
+  return raw
+    .replace(/```[\s\S]*?```/g, " ") // fenced code blocks
+    .replace(/`([^`]+)`/g, "$1") // inline code
+    .replace(/!\[[^\]]*\]\([^)]*\)/g, " ") // images
+    .replace(/\[([^\]]+)\]\([^)]*\)/g, "$1") // links → text
+    .replace(/^\s{0,3}(#{1,6}|>)\s+/gm, "") // headings / blockquotes
+    .replace(/^\s{0,3}([-*+]|\d+\.)\s+/gm, "") // list markers
+    .replace(/[*~]/g, "") // bold/italic/strikethrough markers
+    .replace(/\s+/g, " ") // collapse whitespace/newlines
+    .trim();
+}
+
 /** Compact, human duration matching the reference transcript: "<1s", "8s", "1m 3s". */
 export function formatDuration(ms: number): string {
   if (ms < 1000) return "<1s";

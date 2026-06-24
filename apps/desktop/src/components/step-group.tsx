@@ -5,6 +5,7 @@ import type { ToolStep } from "@/store/chat";
 import { ToolStepBlock } from "@/components/tool-step";
 import { ThinkingBlock } from "@/components/thinking-block";
 import {
+  answerPreview,
   formatDuration,
   groupDurationMs,
   liveElapsedMs,
@@ -24,6 +25,7 @@ export function StepGroup({
   turnStartMs,
   reasoning,
   hasAnswer,
+  answer,
   onRespond,
   onApproveSession,
   onApproveAlways,
@@ -36,6 +38,10 @@ export function StepGroup({
   /** Model reasoning for this turn (#205); folds under this group, above the steps. */
   reasoning?: string;
   hasAnswer?: boolean;
+  /** The turn's final answer text. When the group is collapsed, a muted 2-line
+   *  preview of it shows under the header so the outcome is visible without
+   *  expanding (#414). Raw content — no model-generated summary. */
+  answer?: string;
   onRespond: (callId: string, approved: boolean) => void;
   onApproveSession: (callId: string, tool: string) => void;
   onApproveAlways: (callId: string, tool: string) => void;
@@ -63,6 +69,9 @@ export function StepGroup({
   const showDuration = durationMs !== null;
 
   const earlierCount = Math.max(0, steps.length - STEP_WINDOW);
+
+  // Muted prose glimpse of the answer shown under the collapsed header (#414).
+  const preview = answer ? answerPreview(answer) : "";
 
   const { visible } = selectStepWindow(steps, {
     streaming,
@@ -97,6 +106,11 @@ export function StepGroup({
           )}
         </span>
       </button>
+      {!open && preview && (
+        <p className="line-clamp-2 pb-1.5 pl-7 pr-2.5 font-sans leading-relaxed text-muted-foreground/70">
+          {preview}
+        </p>
+      )}
       {open && (
         <div className="mt-1.5 flex flex-col gap-1.5 border-l border-border/60 pl-2.5">
           {reasoning ? (

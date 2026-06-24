@@ -125,6 +125,7 @@ function MessageRowImpl({
               turnStartMs={turnStartMs}
               reasoning={reasoning}
               hasAnswer={message.content.length > 0}
+              answer={message.content}
               onRespond={onRespond}
               onApproveSession={onApproveSession}
               onApproveAlways={onApproveAlways}

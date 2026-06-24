@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import {
+  answerPreview,
   formatDuration,
   groupDurationMs,
   liveElapsedMs,
@@ -34,6 +35,36 @@ describe("groupDurationMs", () => {
     expect(groupDurationMs([step({ startedAt: 5000, finishedAt: 4000 })])).toBe(
       0,
     );
+  });
+});
+
+describe("answerPreview", () => {
+  it("strips headings, emphasis, and collapses whitespace into prose", () => {
+    expect(
+      answerPreview("### Mocked reply\n\nThis is a **bold** answer."),
+    ).toBe("Mocked reply This is a bold answer.");
+  });
+
+  it("unwraps inline code and links, drops fenced blocks", () => {
+    expect(
+      answerPreview("Run `npm test` then see [docs](http://x) ```code\nx\n```"),
+    ).toBe("Run npm test then see docs");
+  });
+
+  it("flattens list and blockquote markers", () => {
+    expect(answerPreview("- first\n- second\n> quote")).toBe(
+      "first second quote",
+    );
+  });
+
+  it("leaves identifiers with underscores intact", () => {
+    expect(answerPreview("Edited `snake_case_var` in file")).toBe(
+      "Edited snake_case_var in file",
+    );
+  });
+
+  it("is empty for whitespace-only content", () => {
+    expect(answerPreview("   \n  ")).toBe("");
   });
 });
 
