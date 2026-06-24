@@ -243,6 +243,20 @@ fn apply_hunks(path: &str, content: &str, hunks: &[Hunk]) -> Result<String, Stri
 /// no-trailing-newline property.
 fn apply_one_hunk(path: &str, i: usize, content: &str, hunk: &Hunk) -> Result<String, String> {
     let n = i + 1;
+
+    // A hunk with neither context nor removal lines leaves `old` empty, so there
+    // is no anchor locating where the added lines belong. On a non-empty file the
+    // empty `old` would otherwise match every byte position and surface a
+    // confusing "N matches" ambiguity. Reject it with a clear message instead. A
+    // pure addition against an empty file is unambiguous (the only position), and
+    // the only way to populate an existing-but-empty file, so it falls through to
+    // the strict path below where `""` matches exactly once.
+    if hunk.old.is_empty() && !content.is_empty() {
+        return Err(format!(
+            "{path}: hunk {n} has no context line to anchor the addition; add a surrounding context line"
+        ));
+    }
+
     let count = content.matches(&hunk.old).count();
     if count == 1 {
         return Ok(content.replacen(&hunk.old, &hunk.new, 1));
@@ -664,6 +678,73 @@ mod tests {
         assert_eq!(
             fs::read_to_string(dir.path().join("f.txt")).unwrap(),
             "one\nTWO\nthree\nFOUR"
+        );
+    }
+
+    #[tokio::test]
+    async fn pure_addition_without_context_on_nonempty_file_rejected() {
+        // Only `+` lines — `old` is empty, so there is no anchor for the
+        // insertion. Previously this surfaced a confusing "(N matches)"
+        // ambiguity; it now gives a targeted message and changes nothing.
+        let dir = tempfile::tempdir().unwrap();
+        let original = "one\ntwo\nthree\n";
+        fs::write(dir.path().join("f.txt"), original).unwrap();
+        let patch = env("*** Update File: f.txt\n@@\n+four");
+        let out = ApplyPatchTool
+            .run(serde_json::json!({ "patch": patch }), dir.path())
+            .await;
+        assert!(!out.success, "{}", out.content);
+        assert!(
+            out.content
+                .contains("no context line to anchor the addition"),
+            "{}",
+            out.content
+        );
+        assert!(
+            !out.content.contains("ambiguous"),
+            "should not surface the N-match ambiguity: {}",
+            out.content
+        );
+        // Fails safe: the file is untouched.
+        assert_eq!(
+            fs::read_to_string(dir.path().join("f.txt")).unwrap(),
+            original
+        );
+    }
+
+    #[tokio::test]
+    async fn pure_addition_into_empty_file_is_allowed() {
+        // An existing-but-empty file cannot be Add-ed (Add rejects existing
+        // files), so a pure-addition Update is the only way to populate it.
+        // There is a single position to insert, so it is unambiguous and allowed.
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("f.txt"), "").unwrap();
+        let patch = env("*** Update File: f.txt\n@@\n+one\n+two");
+        let out = ApplyPatchTool
+            .run(serde_json::json!({ "patch": patch }), dir.path())
+            .await;
+        assert!(out.success, "{}", out.content);
+        assert_eq!(
+            fs::read_to_string(dir.path().join("f.txt")).unwrap(),
+            "one\ntwo\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn addition_anchored_by_context_in_middle() {
+        // Regression: a `+`-only insertion that *is* anchored by a context line
+        // must still succeed — the empty-`old` guard only fires for truly
+        // unanchored additions.
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("f.txt"), "one\ntwo\nthree\n").unwrap();
+        let patch = env("*** Update File: f.txt\n@@\n two\n+mid\n three");
+        let out = ApplyPatchTool
+            .run(serde_json::json!({ "patch": patch }), dir.path())
+            .await;
+        assert!(out.success, "{}", out.content);
+        assert_eq!(
+            fs::read_to_string(dir.path().join("f.txt")).unwrap(),
+            "one\ntwo\nmid\nthree\n"
         );
     }
 }
