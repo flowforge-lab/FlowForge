@@ -40,6 +40,15 @@ impl ToolOutcome {
     }
 }
 
+/// Sentinel session id meaning "no owning session" — the call has no session
+/// affinity. Used by [`Tool::run`] and [`ToolRegistry::run`] when the caller
+/// has no session to thread (external/test entry points). Tools that bucket by
+/// session (e.g. [`crate::process::ProcessManager`]) treat all such calls as
+/// sharing one anonymous bucket, which is fine for one-off calls but would
+/// collide if a *real* session id were ever empty. Real session ids are UUIDs
+/// assigned by the host and are never empty.
+pub const NO_SESSION: &str = "";
+
 /// A callable the model can invoke. Implementors describe themselves as an
 /// OpenAI-style function schema and execute against a jailed workspace `root`.
 ///
@@ -75,6 +84,17 @@ pub trait Tool: Send + Sync {
         false
     }
     async fn run(&self, args: Value, root: &Path) -> ToolOutcome;
+
+    /// Session-aware dispatch point. Tools that need per-session affinity
+    /// (e.g. `process_manager`, which scopes its live-process table to the
+    /// owning session and auto-reaps on close) override this. The default
+    /// delegates to [`run`](Self::run), ignoring `session_id`. Callers without
+    /// a session pass [`NO_SESSION`] as the sentinel; a real session id is a
+    /// non-empty UUID threaded from the host.
+    async fn run_with_session(&self, args: Value, root: &Path, session_id: &str) -> ToolOutcome {
+        let _ = session_id;
+        self.run(args, root).await
+    }
 }
 
 /// Name -> tool. Built with the M2 defaults (bash, view, edit) and queried by the
@@ -162,11 +182,25 @@ impl ToolRegistry {
             .collect()
     }
 
-    /// Dispatch a call by name. Unknown tools and malformed arguments return an
-    /// error outcome rather than failing the turn.
+    /// Dispatch a call by name with an anonymous session ([`NO_SESSION`]). No
+    /// session affinity — equivalent to
+    /// [`run_with_session`](Self::run_with_session) with [`NO_SESSION`].
     pub async fn run(&self, name: &str, args: Value, root: &Path) -> ToolOutcome {
+        self.run_with_session(name, args, root, NO_SESSION).await
+    }
+
+    /// Dispatch a call by name, threading the owning `session_id` to tools
+    /// that implement [`Tool::run_with_session`]. Unknown tools and malformed
+    /// arguments return an error outcome rather than failing the turn.
+    pub async fn run_with_session(
+        &self,
+        name: &str,
+        args: Value,
+        root: &Path,
+        session_id: &str,
+    ) -> ToolOutcome {
         match self.get(name) {
-            Some(tool) => tool.run(args, root).await,
+            Some(tool) => tool.run_with_session(args, root, session_id).await,
             None => ToolOutcome::error(format!("unknown tool: {name}")),
         }
     }

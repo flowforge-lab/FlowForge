@@ -1123,7 +1123,10 @@ pub async fn run_turn(
                                     .approve(&message_id, &call.id, &call.name, safety, &args)
                                     .await;
                             if approved {
-                                tools.registry.run(&call.name, args, tools.root).await
+                                tools
+                                    .registry
+                                    .run_with_session(&call.name, args, tools.root, session_id)
+                                    .await
                             } else {
                                 ff_tools::ToolOutcome::error(format!(
                                     "call to `{}` was not approved",
