@@ -112,6 +112,16 @@ const TOOL_RESULT_MAX_BYTES: usize = 8 * 1024;
 /// so a cap is safe for the round-trip.
 const REASONING_MAX_BYTES: usize = 16 * 1024;
 
+/// How many of the most-recent assistant tool-call turns keep their persisted
+/// reasoning when building the wire request. Reasoning gateways (#375) replay
+/// `reasoning_content` on *every* prior tool-call turn, so an N-turn task resends
+/// every earlier CoT on every call -- O(n^2) prefill growth. Only the most recent
+/// turns' reasoning meaningfully aids continuation, so older CoT is dropped from
+/// the wire (the store keeps the verbatim original untouched). Latency win is
+/// model-agnostic; correctness is unaffected because the dialect simply omits
+/// absent reasoning.
+const REASONING_REPLAY_KEEP: usize = 2;
+
 /// Events the agent emits during a turn. The host (Tauri shell or a test) decides
 /// how to surface them — over IPC, to a channel, or into assertions.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -331,7 +341,7 @@ fn role_str(role: Role) -> &'static str {
 }
 
 pub(crate) fn to_chat(messages: &[Message]) -> Vec<ChatMessage> {
-    messages
+    let mut chat: Vec<ChatMessage> = messages
         .iter()
         .map(|m| {
             let tool_calls = m.tool_calls.as_ref().map(|calls| {
@@ -366,7 +376,31 @@ pub(crate) fn to_chat(messages: &[Message]) -> Vec<ChatMessage> {
                 reasoning: m.reasoning.clone(),
             }
         })
-        .collect()
+        .collect();
+    cap_reasoning_replay(&mut chat, REASONING_REPLAY_KEEP);
+    chat
+}
+
+/// Drop replayed reasoning from all but the most-recent `keep` assistant
+/// tool-call turns (#375 follow-up; see [`REASONING_REPLAY_KEEP`]). Walks the
+/// wire messages newest-first; once `keep` reasoning-bearing tool-call turns have
+/// been seen, every older one has its `reasoning` cleared so it is omitted from
+/// the wire. Only assistant turns that actually carry tool calls are counted --
+/// those are the only ones a reasoning gateway replays. Plain assistant answers
+/// are untouched (the dialect never replays their reasoning anyway).
+fn cap_reasoning_replay(messages: &mut [ChatMessage], keep: usize) {
+    let mut seen = 0usize;
+    for m in messages.iter_mut().rev() {
+        let is_tool_call_turn = m.role == "assistant" && m.tool_calls.is_some();
+        if !is_tool_call_turn || m.reasoning.is_none() {
+            continue;
+        }
+        if seen < keep {
+            seen += 1;
+        } else {
+            m.reasoning = None;
+        }
+    }
 }
 
 /// Accumulates streamed tool-call fragments keyed by `index`.
@@ -1225,6 +1259,38 @@ mod tests {
         let out = to_chat(std::slice::from_ref(&msg));
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].reasoning.as_deref(), Some("because A then B"));
+    }
+
+    #[test]
+    fn to_chat_caps_reasoning_replay_to_last_n_tool_turns() {
+        // C1: a transcript with more than REASONING_REPLAY_KEEP reasoning-bearing
+        // tool-call turns keeps reasoning only on the most-recent `keep` of them;
+        // older CoT is dropped from the wire (the store keeps it verbatim).
+        let tool_turn = |id: &str, cot: &str| ff_core::Message {
+            id: id.into(),
+            session_id: "s1".into(),
+            role: Role::Assistant,
+            content: String::new(),
+            tool_calls: Some(vec![ff_core::ToolCall {
+                id: format!("call_{id}"),
+                name: "search".into(),
+                arguments: "{}".into(),
+            }]),
+            tool_call_id: None,
+            attachments: None,
+            reasoning: Some(cot.into()),
+            created_at: 0,
+        };
+        let history = vec![
+            tool_turn("m1", "oldest"),
+            tool_turn("m2", "middle"),
+            tool_turn("m3", "newest"),
+        ];
+        assert_eq!(REASONING_REPLAY_KEEP, 2);
+        let out = to_chat(&history);
+        assert_eq!(out[0].reasoning, None, "oldest CoT dropped from wire");
+        assert_eq!(out[1].reasoning.as_deref(), Some("middle"));
+        assert_eq!(out[2].reasoning.as_deref(), Some("newest"));
     }
 
     #[test]

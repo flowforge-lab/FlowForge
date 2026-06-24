@@ -153,6 +153,17 @@ pub fn build_system_prompt(
          the verbatim original.\n\n",
     );
 
+    // Stable guidance (cache-stable prefix): batching independent tool calls into
+    // a single turn lets the agent run them concurrently, collapsing many slow
+    // provider round-trips into one. The biggest, most model-agnostic latency win.
+    out.push_str(
+        "## Batch independent tool calls\n\
+         When you need to inspect several files or run independent searches, issue \
+         all those tool calls together in a single turn rather than one at a time. \
+         Independent read-only calls run concurrently, so batching them is much \
+         faster than sequential one-call-per-turn round-trips.\n\n",
+    );
+
     out.push_str("## User context\n");
     out.push_str(&format!(
         "Current: {}, {} ({}).\n",
