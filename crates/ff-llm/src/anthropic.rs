@@ -229,9 +229,22 @@ fn to_anthropic_request(req: &ChatRequest, max_tokens: u32, effort: ReasoningEff
         "messages": messages,
     });
     if let Some(system) = system {
-        body["system"] = Value::String(system);
+        // Prompt caching (#437): mark the stable system prefix as a cache
+        // breakpoint. Anthropic caches `tools` then `system` up to this point, so
+        // prefill is near-free from turn 2. Below the minimum cacheable size the
+        // breakpoint is silently ignored, so this is safe for every Claude model.
+        body["system"] = json!([{
+            "type": "text",
+            "text": system,
+            "cache_control": { "type": "ephemeral" },
+        }]);
     }
-    if let Some(tools) = to_anthropic_tools(&req.tools) {
+    if let Some(mut tools) = to_anthropic_tools(&req.tools) {
+        // Second breakpoint on the last tool: the tool-schema block is the largest
+        // stable prefix segment and rarely changes within a session.
+        if let Some(last) = tools.last_mut() {
+            last["cache_control"] = json!({ "type": "ephemeral" });
+        }
         body["tools"] = Value::Array(tools);
     }
     if req.thinking {
@@ -1007,8 +1020,31 @@ mod tests {
             thinking: false,
         };
         let body = to_anthropic_request(&req, 100, ReasoningEffort::Medium);
-        assert_eq!(body["system"], "sys");
+        // System is now a block array with a cache breakpoint (#437).
+        assert_eq!(body["system"][0]["text"], "sys");
+        assert_eq!(body["system"][0]["cache_control"]["type"], "ephemeral");
         assert_eq!(body["tools"][0]["name"], "f");
+    }
+
+    // #437: the system prefix and the *last* tool each carry a cache breakpoint,
+    // so the stable tools+system prefix is cached from turn 2 onward.
+    #[test]
+    fn system_and_last_tool_carry_cache_control() {
+        let req = ChatRequest {
+            model: "claude-x".into(),
+            messages: vec![ChatMessage::text("system", "sys")],
+            tools: vec![
+                json!({"function":{"name":"a","parameters":{"type":"object","properties":{}}}}),
+                json!({"function":{"name":"b","parameters":{"type":"object","properties":{}}}}),
+            ],
+            thinking: false,
+        };
+        let body = to_anthropic_request(&req, 100, ReasoningEffort::Medium);
+        assert_eq!(body["system"][0]["cache_control"]["type"], "ephemeral");
+        // Only the last tool gets the breakpoint; the first stays plain.
+        assert!(body["tools"][0].get("cache_control").is_none());
+        assert_eq!(body["tools"][1]["name"], "b");
+        assert_eq!(body["tools"][1]["cache_control"]["type"], "ephemeral");
     }
 
     // --- creds --------------------------------------------------------------
