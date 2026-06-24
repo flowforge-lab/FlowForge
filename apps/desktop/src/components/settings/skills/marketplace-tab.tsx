@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { Download, Search } from "@/components/ui/icon";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
+import { ErrorState } from "@/components/ui/error-state";
 import { ipc } from "@/lib/ipc";
 import type { MarketplaceSkill } from "@/lib/marketplace";
 
@@ -19,6 +20,8 @@ export function MarketplaceTab() {
   const [query, setQuery] = useState("");
   const [results, setResults] = useState<MarketplaceSkill[]>([]);
   const [state, setState] = useState<LoadState>("loading");
+  // Bumped by the error-state retry to re-run the search effect.
+  const [reloadKey, setReloadKey] = useState(0);
 
   useEffect(() => {
     let alive = true;
@@ -41,7 +44,7 @@ export function MarketplaceTab() {
       alive = false;
       clearTimeout(handle);
     };
-  }, [query]);
+  }, [query, reloadKey]);
 
   return (
     <div className="space-y-4">
@@ -59,9 +62,10 @@ export function MarketplaceTab() {
       {state === "loading" ? (
         <MarketplaceSkeleton />
       ) : state === "error" ? (
-        <p className="text-[12px] text-destructive" role="alert">
-          Couldn’t reach the marketplace.
-        </p>
+        <ErrorState
+          message="Couldn’t reach the marketplace."
+          onRetry={() => setReloadKey((k) => k + 1)}
+        />
       ) : results.length === 0 ? (
         <p className="text-[12px] text-muted-foreground">
           No skills match “{query.trim()}”.

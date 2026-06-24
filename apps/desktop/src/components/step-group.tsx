@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
-import { ChevronRight, Download, Loader2 } from "@/components/ui/icon";
+import { ChevronRight, Download } from "@/components/ui/icon";
 import { cn } from "@/lib/utils";
+import { Spinner } from "@/components/ui/spinner";
 import type { ToolStep } from "@/store/chat";
 import type { TurnItem } from "@/lib/turn-groups";
 import { ToolStepBlock } from "@/components/tool-step";
@@ -125,9 +126,7 @@ export function StepGroup({
               open && "rotate-90",
             )}
           />
-          {streaming && (
-            <Loader2 className="size-3.5 shrink-0 animate-spin text-muted-foreground" />
-          )}
+          {streaming && <Spinner className="shrink-0 text-muted-foreground" />}
           <span className="min-w-0 flex-1 font-medium text-foreground">
             {steps.length} {steps.length === 1 ? "step" : "steps"}
             {showDuration && (

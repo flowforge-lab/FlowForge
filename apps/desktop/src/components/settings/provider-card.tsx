@@ -1,14 +1,9 @@
 import { useState } from "react";
-import {
-  ChevronDown,
-  Plus,
-  Loader2,
-  Check,
-  Trash2,
-} from "@/components/ui/icon";
+import { ChevronDown, Plus, Check, Trash2 } from "@/components/ui/icon";
 import { cn } from "@/lib/utils";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
+import { Spinner } from "@/components/ui/spinner";
 import { SegmentedControl } from "@/components/settings/segmented-control";
 import {
   isHostedKeyKind,
@@ -423,9 +418,7 @@ export function ProviderCard({ conn }: { conn: ProviderConnection }) {
                 disabled={test?.state === "loading"}
                 onClick={() => void testConnection(conn.id)}
               >
-                {test?.state === "loading" ? (
-                  <Loader2 className="animate-spin" />
-                ) : null}
+                {test?.state === "loading" ? <Spinner /> : null}
                 Test Connection
               </Button>
               <Button
@@ -497,7 +490,7 @@ export function ProviderCard({ conn }: { conn: ProviderConnection }) {
                 </p>
                 {discovering ? (
                   <p className="flex items-center gap-2 text-[12px] text-muted-foreground">
-                    <Loader2 className="size-3.5 animate-spin" />
+                    <Spinner />
                     {isBedrock
                       ? "Fetching via ListInferenceProfiles…"
                       : "Fetching models…"}

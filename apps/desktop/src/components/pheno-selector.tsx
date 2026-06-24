@@ -1,7 +1,8 @@
 import { useEffect } from "react";
-import { Check, ChevronDown, Dna, Loader2 } from "@/components/ui/icon";
+import { Check, ChevronDown, Dna } from "@/components/ui/icon";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
+import { Spinner } from "@/components/ui/spinner";
 import {
   DropdownMenu,
   DropdownMenuTrigger,
@@ -50,7 +51,7 @@ export function PhenoSelector() {
           className="h-6 max-w-[45%] gap-1 px-1.5 text-xs font-medium text-muted-foreground hover:text-foreground"
         >
           {saving ? (
-            <Loader2 className="size-3.5 shrink-0 animate-spin" />
+            <Spinner className="shrink-0" />
           ) : (
             <Dna className="size-3.5 shrink-0" />
           )}
