@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState, type ReactNode } from "react";
-import { ChevronRight } from "@/components/ui/icon";
+import { ChevronRight, Loader2 } from "@/components/ui/icon";
 import { cn } from "@/lib/utils";
 import {
   ABOUT_BUG_REPORT_URL,
@@ -11,6 +11,7 @@ import {
 } from "@/lib/about";
 import { ipc } from "@/lib/ipc";
 import { useSettingsStore } from "@/store/settings";
+import { useUpdateStore } from "@/store/update";
 
 const TOAST_MS = 3200;
 
@@ -23,6 +24,12 @@ export function AboutSection() {
   const setSection = useSettingsStore((s) => s.setSection);
   const [version, setVersion] = useState<string | null>(null);
   const [toast, setToast] = useState<string | null>(null);
+
+  // Update state lives in a shared store (#363) so a future background indicator
+  // can reuse it; the manual check below also feeds it so "Update now" appears.
+  const updateStatus = useUpdateStore((s) => s.status);
+  const installing = useUpdateStore((s) => s.installing);
+  const install = useUpdateStore((s) => s.install);
 
   useEffect(() => {
     let alive = true;
@@ -52,6 +59,20 @@ export function AboutSection() {
     [showToast],
   );
 
+  // Manual check: store the result (so the "Update now" row can appear) and toast
+  // the FE-owned copy. Distinct from the store's silent background `refresh`.
+  const onCheckForUpdates = useCallback(() => {
+    void (async () => {
+      try {
+        const status = await ipc.checkForUpdates();
+        useUpdateStore.setState({ status });
+        showToast(formatUpdateStatus(status));
+      } catch (err) {
+        showToast(err instanceof Error ? err.message : String(err));
+      }
+    })();
+  }, [showToast]);
+
   return (
     <div className="space-y-6">
       <p className="text-[13px] text-foreground">
@@ -65,12 +86,22 @@ export function AboutSection() {
       </p>
 
       <AboutGroup>
-        <AboutRow
-          label="Check for updates"
-          onClick={() =>
-            void runIpcAction(() => ipc.checkForUpdates(), formatUpdateStatus)
-          }
-        />
+        <AboutRow label="Check for updates" onClick={onCheckForUpdates} />
+        {updateStatus?.kind === "available" ? (
+          <AboutRow
+            label={`Update now — version ${updateStatus.version}`}
+            onClick={() => void install()}
+            disabled={installing}
+            trailing={
+              installing ? (
+                <Loader2
+                  className="size-4 shrink-0 animate-spin text-muted-foreground"
+                  aria-hidden
+                />
+              ) : undefined
+            }
+          />
+        ) : null}
         <AboutRow
           label="What's New"
           onClick={() =>
@@ -158,21 +189,36 @@ function AboutGroup({
   );
 }
 
-function AboutRow({ label, onClick }: { label: string; onClick: () => void }) {
+function AboutRow({
+  label,
+  onClick,
+  disabled = false,
+  trailing,
+}: {
+  label: string;
+  onClick: () => void;
+  disabled?: boolean;
+  /** Overrides the default chevron (e.g. a spinner while an action runs). */
+  trailing?: ReactNode;
+}) {
   return (
     <button
       type="button"
       onClick={onClick}
+      disabled={disabled}
       className={cn(
         "flex w-full items-center justify-between gap-3 border-b px-3 py-2.5 text-left text-[13px] text-foreground last:border-b-0",
         "transition-colors hover:bg-muted/40",
+        "disabled:pointer-events-none disabled:opacity-60",
       )}
     >
       <span>{label}</span>
-      <ChevronRight
-        className="size-4 shrink-0 text-muted-foreground"
-        aria-hidden
-      />
+      {trailing ?? (
+        <ChevronRight
+          className="size-4 shrink-0 text-muted-foreground"
+          aria-hidden
+        />
+      )}
     </button>
   );
 }
