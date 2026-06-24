@@ -14,7 +14,7 @@ use ff_core::events::{
     PhenotypeMcpUnavailableEvent, ReasoningEvent, SkillActivated, SkillCompleted,
     SkillEvolveApprovalRequestEvent, SkillInstallApprovalRequestEvent, SkillsChangedEvent,
     TokenEvent, ToolApprovalRequestEvent, ToolAskRequestEvent, ToolCallEvent, ToolResultEvent,
-    TurnDoneEvent, TurnErrorEvent,
+    TurnDoneEvent, TurnErrorEvent, TurnStatsEvent,
 };
 use ff_core::{
     Attachment, BedrockAuth, Format, McpServerConfig, McpServerStatus, MemoryFileInfo,
@@ -38,16 +38,44 @@ use uuid::Uuid;
 struct TurnMetrics {
     chars: usize,
     message_ids: std::collections::HashSet<String>,
+    /// First-seen instant of each distinct assistant message, in arrival order.
+    /// One per agent loop iteration (provider round-trip); consecutive deltas
+    /// give the per-iteration wall-clock baseline (F1, #427).
+    iter_marks: Vec<std::time::Instant>,
+    /// Silent mid-turn memory flushes, each an extra provider round-trip (#427).
+    flushes: u32,
 }
 
 impl TurnMetrics {
     fn note_turn(&mut self, message_id: &str) {
-        self.message_ids.insert(message_id.to_string());
+        if self.message_ids.insert(message_id.to_string()) {
+            self.iter_marks.push(std::time::Instant::now());
+        }
+    }
+
+    fn note_flush(&mut self) {
+        self.flushes += 1;
     }
 
     /// `(streamed assistant chars, distinct turn count)`.
     fn snapshot(&self) -> (usize, usize) {
         (self.chars, self.message_ids.len())
+    }
+
+    /// Per-turn timing breakdown for the #427 baseline: `(round_trips, per-iteration
+    /// ms in arrival order, flushes)`. `turn_end` closes the final iteration.
+    fn timing(&self, turn_end: std::time::Instant) -> (u32, Vec<u32>, u32) {
+        let iter_ms = self
+            .iter_marks
+            .iter()
+            .enumerate()
+            .map(|(i, start)| {
+                let end = self.iter_marks.get(i + 1).copied().unwrap_or(turn_end);
+                u32::try_from(end.saturating_duration_since(*start).as_millis()).unwrap_or(u32::MAX)
+            })
+            .collect();
+        let round_trips = u32::try_from(self.iter_marks.len()).unwrap_or(u32::MAX);
+        (round_trips, iter_ms, self.flushes)
     }
 }
 
@@ -509,6 +537,10 @@ fn send_message(
                         | AgentEvent::Done { message_id, .. } => {
                             m.note_turn(message_id);
                         }
+                        AgentEvent::MemoryFlushed { message_id, .. } => {
+                            m.note_turn(message_id);
+                            m.note_flush();
+                        }
                         _ => {}
                     }
                 }
@@ -533,11 +565,44 @@ fn send_message(
         // Telemetry (RFC 0001 §8): fold this turn's metrics into each active skill's
         // aggregate and emit a SkillCompleted per skill. Success = a clean finish
         // (run_turn returned Ok and the turn was not cancelled).
-        let m = metrics.lock().map(|m| m.snapshot()).unwrap_or_default();
+        let turn_end = std::time::Instant::now();
+        let (chars, turn_count, round_trips, iter_ms, flushes) = metrics
+            .lock()
+            .map(|m| {
+                let (c, t) = m.snapshot();
+                let (rt, ims, fl) = m.timing(turn_end);
+                (c, t, rt, ims, fl)
+            })
+            .unwrap_or_default();
         let success = result.is_ok() && !cancel_probe.is_cancelled();
-        let latency_ms = u32::try_from(turn_start.elapsed().as_millis()).unwrap_or(u32::MAX);
-        let tokens = u32::try_from(m.0 / 4).unwrap_or(u32::MAX);
-        let turns = u32::try_from(m.1).unwrap_or(u32::MAX);
+        let latency_ms = u32::try_from(turn_end.saturating_duration_since(turn_start).as_millis())
+            .unwrap_or(u32::MAX);
+        let tokens = u32::try_from(chars / 4).unwrap_or(u32::MAX);
+        let turns = u32::try_from(turn_count).unwrap_or(u32::MAX);
+
+        // F1 (#427): emit the per-turn timing baseline the performance epic (#426)
+        // measures every later change against. Additive telemetry -- never alters
+        // turn behavior. `tracing` mirrors it to the dev log for a `tauri dev` run.
+        let stats = TurnStatsEvent {
+            session_id: sid.clone(),
+            round_trips,
+            total_ms: latency_ms,
+            iter_ms,
+            flushes,
+            chars: u32::try_from(chars).unwrap_or(u32::MAX),
+        };
+        tracing::info!(
+            target: "turn_metrics",
+            session_id = %sid,
+            round_trips,
+            total_ms = latency_ms,
+            flushes,
+            chars = stats.chars,
+            iter_ms = ?stats.iter_ms,
+            "turn metrics (F1 baseline)"
+        );
+        let _ = app.emit("turn:stats", stats);
+
         for skill in &active {
             let ev = SkillCompleted {
                 skill: skill.clone(),
@@ -1547,7 +1612,7 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    use super::{git_branch, mode_auto_approves, resolve_workspace_dir, UpdateStatus};
+    use super::{git_branch, mode_auto_approves, resolve_workspace_dir, TurnMetrics, UpdateStatus};
     use ff_core::Mode;
     use ff_tools::Safety;
 
@@ -1649,5 +1714,40 @@ mod tests {
     fn git_branch_is_none_when_not_a_repo() {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(git_branch(dir.path()), None);
+    }
+
+    // F1 (#427): the turn-metrics accumulator counts one round-trip per distinct
+    // assistant message, breaks the turn into per-iteration wall-clock, and counts
+    // silent memory flushes -- the baseline the performance epic measures against.
+    #[test]
+    fn turn_metrics_counts_round_trips_flushes_and_iterations() {
+        let mut m = TurnMetrics::default();
+        // Two iterations (two distinct message ids); repeats are idempotent.
+        m.note_turn("m1");
+        m.note_turn("m1");
+        m.chars += 5;
+        m.note_flush();
+        m.note_turn("m2");
+        m.note_turn("m2");
+
+        let (chars, turns) = m.snapshot();
+        assert_eq!(chars, 5);
+        assert_eq!(turns, 2, "two distinct assistant messages = two turns");
+
+        let (round_trips, iter_ms, flushes) = m.timing(std::time::Instant::now());
+        assert_eq!(round_trips, 2, "one round-trip per distinct message id");
+        assert_eq!(iter_ms.len(), 2, "one wall-clock sample per iteration");
+        assert_eq!(flushes, 1, "exactly one mid-turn flush counted");
+    }
+
+    // A turn that never reached the model (no assistant message) reports a clean
+    // zero baseline rather than panicking on the empty iteration vector.
+    #[test]
+    fn turn_metrics_empty_turn_is_zeroed() {
+        let m = TurnMetrics::default();
+        let (round_trips, iter_ms, flushes) = m.timing(std::time::Instant::now());
+        assert_eq!(round_trips, 0);
+        assert!(iter_ms.is_empty());
+        assert_eq!(flushes, 0);
     }
 }

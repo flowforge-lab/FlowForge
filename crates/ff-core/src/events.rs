@@ -105,6 +105,24 @@ pub struct TurnDoneEvent {
     pub token_count: Option<u32>,
 }
 
+/// Per-turn timing baseline (F1, #427): the wall-clock breakdown the performance
+/// epic (#426) measures every later change against. `round_trips` is the number of
+/// provider responses (agent loop iterations) this turn; `iter_ms` is the
+/// per-iteration wall-clock in arrival order; `flushes` counts silent mid-turn
+/// memory flushes (each an extra provider round-trip); `chars` is the streamed
+/// assistant text, a coarse token-cost proxy. Emitted once at turn end.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "../../../apps/desktop/src/bindings/")]
+pub struct TurnStatsEvent {
+    pub session_id: String,
+    pub round_trips: u32,
+    pub total_ms: u32,
+    pub iter_ms: Vec<u32>,
+    pub flushes: u32,
+    pub chars: u32,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export, export_to = "../../../apps/desktop/src/bindings/")]
