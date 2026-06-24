@@ -270,8 +270,9 @@ pub enum ReasoningEffort {
     #[default]
     Medium,
     /// Deepest reasoning. A hard 8192 cap rather than uncapped, keeping #394's
-    /// cost guard intact even at the top of the dial. (Adaptive-effort models
-    /// such as Opus 4.7, which deprecated `budget_tokens`, are out of scope.)
+    /// cost guard intact even at the top of the dial. On adaptive-effort models
+    /// (Opus 4.6+, which deprecated `budget_tokens`) this maps to
+    /// `output_config.effort = "high"` instead (see [`Self::effort_str`]).
     High,
 }
 
@@ -285,6 +286,18 @@ impl ReasoningEffort {
             ReasoningEffort::Low => 1024,
             ReasoningEffort::Medium => 4096,
             ReasoningEffort::High => 8192,
+        }
+    }
+
+    /// Effort label for adaptive-thinking models (Opus 4.6+, Sonnet 4.6+), which
+    /// deprecated `budget_tokens` in favor of `output_config.effort`. We never
+    /// emit `"max"` (Opus-4.6-only), so the dial maps cleanly onto the three
+    /// portable levels.
+    pub fn effort_str(self) -> &'static str {
+        match self {
+            ReasoningEffort::Low => "low",
+            ReasoningEffort::Medium => "medium",
+            ReasoningEffort::High => "high",
         }
     }
 }

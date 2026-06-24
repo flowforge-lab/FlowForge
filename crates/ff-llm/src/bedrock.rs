@@ -218,7 +218,9 @@ impl BedrockProvider {
 const BEDROCK_ANSWER_HEADROOM: u32 = 4_096;
 
 /// Build the `additionalModelRequestFields` document that turns on Claude
-/// extended thinking with the given reasoning-token budget (#394).
+/// extended thinking with the given reasoning-token budget (#394). The legacy
+/// `reasoning_config.type = "enabled"` interface, used by Opus/Sonnet 4.5 and
+/// older; adaptive-era models reject it (see [`adaptive_thinking_doc`]).
 fn reasoning_config_doc(budget_tokens: u32) -> Document {
     Document::Object(std::collections::HashMap::from([(
         "reasoning_config".to_string(),
@@ -232,6 +234,64 @@ fn reasoning_config_doc(budget_tokens: u32) -> Document {
     )]))
 }
 
+/// Build the `additionalModelRequestFields` document for adaptive thinking
+/// (Opus 4.6+, Sonnet 4.6+). These models deprecated `reasoning_config`/
+/// `budget_tokens` and return a `ValidationException` for `type = "enabled"`;
+/// they take `thinking.type = "adaptive"` plus an effort label that must live in
+/// a separate `output_config` object (effort inside `thinking` is rejected). No
+/// `maxTokens` pin is needed -- adaptive has no explicit budget to clear.
+fn adaptive_thinking_doc(effort: ReasoningEffort) -> Document {
+    Document::Object(std::collections::HashMap::from([
+        (
+            "thinking".to_string(),
+            Document::Object(std::collections::HashMap::from([(
+                "type".to_string(),
+                Document::String("adaptive".to_string()),
+            )])),
+        ),
+        (
+            "output_config".to_string(),
+            Document::Object(std::collections::HashMap::from([(
+                "effort".to_string(),
+                Document::String(effort.effort_str().to_string()),
+            )])),
+        ),
+    ]))
+}
+
+/// Whether `model` is an adaptive-thinking Claude (Opus 4.6+, Sonnet 4.6+, and
+/// the named Mythos/Fable lines), which require [`adaptive_thinking_doc`] rather
+/// than the legacy [`reasoning_config_doc`]. Version-aware so future minors
+/// (e.g. Opus 4.9) stay on the adaptive path; Opus/Sonnet 4.5 and older fall
+/// through to the legacy path. Matches Bedrock ids like
+/// `us.anthropic.claude-opus-4-8` and Anthropic-native `claude-sonnet-4-6`.
+fn uses_adaptive_thinking(model: &str) -> bool {
+    let m = model.to_ascii_lowercase();
+    if m.contains("mythos") || m.contains("fable") {
+        return true;
+    }
+    for family in ["opus", "sonnet"] {
+        if let Some(rest) = m.split(&format!("{family}-")).nth(1) {
+            let mut parts = rest.split(['-', '.', ':']).filter(|s| !s.is_empty());
+            if let (Some(major), minor) = (parts.next(), parts.next()) {
+                if let Ok(major) = major.parse::<u32>() {
+                    // Guard against the older `claude-3-5-sonnet-<date>` naming,
+                    // where the family is FOLLOWED by an 8-digit date rather than
+                    // a version. Real version majors stay well under 100.
+                    if major >= 100 {
+                        continue;
+                    }
+                    let minor = minor.and_then(|x| x.parse::<u32>().ok()).unwrap_or(0);
+                    if major > 4 || (major == 4 && minor >= 6) {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
 #[async_trait]
 impl Provider for BedrockProvider {
     fn supports_vision(&self) -> bool {
@@ -243,6 +303,7 @@ impl Provider for BedrockProvider {
         let (system, messages) = to_converse(&wire);
         let client = self.client().await;
 
+        let adaptive = uses_adaptive_thinking(&req.model);
         let mut call = client
             .converse_stream()
             .model_id(req.model)
@@ -253,19 +314,27 @@ impl Provider for BedrockProvider {
         if let Some(cfg) = to_tool_config(&req.tools) {
             call = call.tool_config(cfg);
         }
-        // Claude extended thinking (#394): enable reasoning and cap its budget by
-        // the effort dial. Converse needs maxTokens > budget_tokens, so pin a
-        // matching maxTokens with answer headroom. Non-thinking turns are
-        // untouched, preserving the model's default maxTokens.
+        // Claude extended thinking (#394). Two wire shapes by model generation:
+        //   - Adaptive (Opus 4.6+, Sonnet 4.6+): thinking.type = "adaptive" +
+        //     output_config.effort. No maxTokens pin -- adaptive has no explicit
+        //     budget, and the legacy "enabled" shape is rejected with a 400.
+        //   - Legacy (Opus/Sonnet 4.5 and older): reasoning_config + a maxTokens
+        //     pin, since Converse needs maxTokens > budget_tokens.
+        // Non-thinking turns are untouched, preserving the model's default maxTokens.
         if req.thinking {
-            let budget = self.reasoning_effort.budget_tokens();
-            call = call
-                .inference_config(
-                    InferenceConfiguration::builder()
-                        .max_tokens((budget + BEDROCK_ANSWER_HEADROOM) as i32)
-                        .build(),
-                )
-                .additional_model_request_fields(reasoning_config_doc(budget));
+            if adaptive {
+                call = call
+                    .additional_model_request_fields(adaptive_thinking_doc(self.reasoning_effort));
+            } else {
+                let budget = self.reasoning_effort.budget_tokens();
+                call = call
+                    .inference_config(
+                        InferenceConfiguration::builder()
+                            .max_tokens((budget + BEDROCK_ANSWER_HEADROOM) as i32)
+                            .build(),
+                    )
+                    .additional_model_request_fields(reasoning_config_doc(budget));
+            }
         }
 
         let output = call.send().await.map_err(map_sdk_err)?;
@@ -865,6 +934,62 @@ mod tests {
         // accepts the request.
         for b in [low, med, high] {
             assert!(b + BEDROCK_ANSWER_HEADROOM > b);
+        }
+    }
+
+    #[test]
+    fn adaptive_thinking_doc_emits_type_and_effort() {
+        // effort lives in a SEPARATE output_config object, not inside thinking
+        // (Bedrock rejects effort nested under thinking).
+        for (effort, label) in [
+            (ReasoningEffort::Low, "low"),
+            (ReasoningEffort::Medium, "medium"),
+            (ReasoningEffort::High, "high"),
+        ] {
+            let Document::Object(top) = adaptive_thinking_doc(effort) else {
+                panic!("expected object")
+            };
+            let Document::Object(thinking) = &top["thinking"] else {
+                panic!("expected thinking object")
+            };
+            assert_eq!(thinking["type"], Document::String("adaptive".to_string()));
+            assert!(
+                !thinking.contains_key("effort"),
+                "effort must not nest inside thinking"
+            );
+            let Document::Object(oc) = &top["output_config"] else {
+                panic!("expected output_config object")
+            };
+            assert_eq!(oc["effort"], Document::String(label.to_string()));
+            // No legacy budget interface leaks into the adaptive shape.
+            assert!(!top.contains_key("reasoning_config"));
+        }
+    }
+
+    #[test]
+    fn uses_adaptive_thinking_splits_by_model_generation() {
+        // Adaptive era: Opus/Sonnet 4.6+, future minors, and the named lines.
+        for m in [
+            "us.anthropic.claude-opus-4-8",
+            "us.anthropic.claude-opus-4-6",
+            "us.anthropic.claude-opus-4-7",
+            "claude-sonnet-4-6",
+            "us.anthropic.claude-opus-4-9",
+            "us.anthropic.claude-opus-5-0",
+            "claude-mythos-5",
+            "claude-fable-5",
+        ] {
+            assert!(uses_adaptive_thinking(m), "expected adaptive: {m}");
+        }
+        // Legacy era: Opus/Sonnet 4.5 and older, and non-Claude.
+        for m in [
+            "us.anthropic.claude-opus-4-5",
+            "us.anthropic.claude-sonnet-4-5",
+            "anthropic.claude-3-5-sonnet-20241022-v2:0",
+            "us.anthropic.claude-3-opus-20240229-v1:0",
+            "meta.llama3-70b",
+        ] {
+            assert!(!uses_adaptive_thinking(m), "expected legacy: {m}");
         }
     }
 
