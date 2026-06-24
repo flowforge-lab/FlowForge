@@ -1025,6 +1025,21 @@ mod tests {
     }
 
     #[test]
+    fn user_summary_stays_in_messages_not_hoisted() {
+        // role=user keeps the compaction summary in its chronological slot;
+        // only system-role messages are hoisted into the top-level system param.
+        let (system, messages) = to_converse(&[
+            ChatMessage::text("system", "be brief"),
+            ChatMessage::text("user", "Summary of 40 earlier messages"),
+            ChatMessage::text("assistant", "recent verbatim reply"),
+        ]);
+        assert_eq!(system.len(), 1);
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].role, ConversationRole::User);
+        assert_eq!(messages[1].role, ConversationRole::Assistant);
+    }
+
+    #[test]
     fn consecutive_same_role_messages_merge() {
         let (_, messages) = to_converse(&[
             ChatMessage::text("user", "a"),

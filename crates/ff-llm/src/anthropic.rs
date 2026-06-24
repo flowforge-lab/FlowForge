@@ -607,6 +607,28 @@ mod tests {
     }
 
     #[test]
+    fn user_summary_stays_in_messages_not_hoisted() {
+        // A compaction summary uses role=user precisely so it keeps its
+        // chronological slot: only system-role messages are hoisted into the
+        // top-level system param, which would tear it before the recent tail.
+        let msgs = vec![
+            ChatMessage::text("system", "be brief"),
+            ChatMessage::text("user", "Summary of 40 earlier messages"),
+            ChatMessage::text("assistant", "recent verbatim reply"),
+        ];
+        let (system, out) = to_anthropic_messages(&msgs);
+        assert_eq!(system.as_deref(), Some("be brief"));
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0]["role"], "user");
+        assert_eq!(
+            out[0]["content"][0]["text"],
+            "Summary of 40 earlier messages"
+        );
+        assert_eq!(out[1]["role"], "assistant");
+        assert_eq!(out[1]["content"][0]["text"], "recent verbatim reply");
+    }
+
+    #[test]
     fn multiple_system_messages_join() {
         let msgs = vec![
             ChatMessage::text("system", "a"),

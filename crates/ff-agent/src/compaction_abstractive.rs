@@ -145,6 +145,10 @@ impl AbstractiveSummarizer {
         let mut out = Vec::with_capacity(keep_recent + 1);
         out.push(summary_message(&content, cold));
         out.extend_from_slice(&messages[cold_end..]);
+        // Key the persisted original under the last cold message id: retrieval is
+        // by content-hash (`key`), but the mid anchors cascade-on-session-delete.
+        // Tier 1 keys per-message because each tool result is its own retrievable
+        // unit; Tier 2 collapses the whole cold block into one stored original.
         let mid = cold.last().map(|m| m.id.clone()).unwrap_or_default();
         Ok(Some(SummaryResult {
             messages: out,
@@ -223,7 +227,11 @@ fn summary_message(content: &str, cold: &[Message]) -> Message {
             .first()
             .map(|m| m.session_id.clone())
             .unwrap_or_default(),
-        role: Role::System,
+        // User (not System): on Anthropic/Bedrock every system-role message is
+        // hoisted into the top-level system param regardless of position, which
+        // would tear this summary out of its chronological slot before the recent
+        // verbatim tail. A user-role message preserves position on all providers.
+        role: Role::User,
         content: content.to_string(),
         tool_calls: None,
         tool_call_id: None,
@@ -369,7 +377,7 @@ mod tests {
 
         // Wire = [summary] + the 2 recent verbatim messages.
         assert_eq!(result.messages.len(), 3);
-        assert_eq!(result.messages[0].role, Role::System);
+        assert_eq!(result.messages[0].role, Role::User);
         assert!(result.messages[0].content.contains("Condensed summary"));
         assert_eq!(result.messages[1].content, "recent exact state");
         assert_eq!(result.messages[2].content, "recent exact state");

@@ -591,6 +591,12 @@ pub async fn run_turn(
         // transcript and the collapsed block's original is persisted so
         // `compaction_retrieve` can fetch it back. Best-effort -- a failed or
         // cancelled summary falls back to `wire` and never aborts the user's turn.
+        //
+        // A fresh estimator here is deliberate: Tier 1 (above) assesses raw
+        // `history`, but Tier 2 must gate on the projected request size *after*
+        // extractive compression, i.e. the post-Tier-1 `wire`. Both share the same
+        // default 24k budget today; when model-aware budgets land (RFC 0016 6 /
+        // M7.2) every ProxyTokenEstimator::default() site adopts it together.
         let wire = if tools.abstractive.enabled
             && ProxyTokenEstimator::default()
                 .assess(&wire, model)
@@ -4220,7 +4226,7 @@ mod tests {
         // passed), and the 6 most recent messages stay byte-identical.
         let wire = seen.lock().unwrap().clone();
         let summary = &wire[0];
-        assert_eq!(summary.role.as_str(), "system");
+        assert_eq!(summary.role.as_str(), "user");
         let summary_text = summary.content.as_deref().unwrap();
         assert!(
             summary_text.contains("Summary of") && summary_text.contains(COMPACTION_MARKER_PREFIX),
