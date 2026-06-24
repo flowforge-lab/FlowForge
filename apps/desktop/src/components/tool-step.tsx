@@ -12,6 +12,7 @@ import { cn } from "@/lib/utils";
 import { formatArgs } from "@/lib/tool-args";
 import { parseMcpToolName } from "@/lib/mcp";
 import { describeStep } from "@/lib/step-describe";
+import { formatDuration } from "@/lib/steps";
 import { parseTodo } from "@/lib/todo";
 import { TodoList } from "@/components/todo-list";
 import { Badge } from "@/components/ui/badge";
@@ -161,6 +162,13 @@ export function ToolStepBlock({
     (typeof (step.args as { question?: unknown } | null)?.question === "string"
       ? (step.args as { question: string }).question
       : "");
+  // Per-step duration (#413): shown once a step has settled (both timestamps
+  // present); omitted while running or when timing is absent (e.g. reloaded rows
+  // with no createdAt spread). Reuses the shared formatDuration — no new logic.
+  const stepDurationMs =
+    step.startedAt != null && step.finishedAt != null
+      ? Math.max(0, step.finishedAt - step.startedAt)
+      : null;
 
   return (
     <div
@@ -191,6 +199,11 @@ export function ToolStepBlock({
           <TrustBadge kind="session" />
         )}
         {asking && <Badge tone="sky">needs answer</Badge>}
+        {stepDurationMs !== null && (
+          <span className="ml-auto shrink-0 font-normal text-muted-foreground/60">
+            {formatDuration(stepDurationMs)}
+          </span>
+        )}
       </button>
       {open && asking && (
         <AskPrompt
