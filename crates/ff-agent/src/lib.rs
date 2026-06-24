@@ -915,7 +915,71 @@ pub async fn run_turn(
         for call in calls.values() {
             backfill.expect(&call.id);
         }
+        // Partition this turn's calls (#A1). A call is **parallel-eligible** only
+        // when it is side-effect-free: valid JSON args, a permitted, non-interactive,
+        // non-subagent tool whose `safety` is `ReadOnly`. Such calls touch only the
+        // workspace (reads) and borrow nothing mutable, so running them concurrently
+        // is safe and collapses N sequential provider-driven round-trips into one --
+        // the single biggest, most model-agnostic latency win. Everything else
+        // (writes/dangerous behind the approval gate, interactive `ask_user`,
+        // sub-agents, hidden/unpermitted tools, unparseable args, nameless calls)
+        // stays on the **serial** path with its exact prior semantics.
+        let mut parallel: Vec<(&CallBuf, serde_json::Value)> = Vec::new();
+        let mut serial: Vec<&CallBuf> = Vec::new();
         for call in calls.values() {
+            let parsed = serde_json::from_str::<serde_json::Value>(&call.arguments);
+            let eligible = match &parsed {
+                Ok(args) => {
+                    !call.name.trim().is_empty()
+                        && advertised
+                            .as_ref()
+                            .is_none_or(|set| set.contains(&call.name))
+                        && !tools.registry.is_interactive(&call.name)
+                        && !ff_tools::is_subagent(&call.name)
+                        && tools.registry.safety(&call.name, args) == Safety::ReadOnly
+                }
+                Err(_) => false,
+            };
+            match parsed {
+                Ok(args) if eligible => parallel.push((call, args)),
+                _ => serial.push(call),
+            }
+        }
+
+        // Outcomes keyed by call id; filled by the parallel batch and the serial
+        // pass, then drained in original call order for persistence + events so the
+        // transcript and the frontend see a stable ordering regardless of which path
+        // produced each result.
+        let mut outcomes: HashMap<String, ff_tools::ToolOutcome> = HashMap::new();
+
+        // Read-only batch: announce each (in call order), then run all concurrently.
+        // Skipped wholesale on cancel; unrun calls fall to the backfill guard.
+        if !cancel.is_cancelled() && !parallel.is_empty() {
+            for (call, args) in &parallel {
+                on_event(AgentEvent::ToolCallStarted {
+                    message_id: message_id.clone(),
+                    call_id: call.id.clone(),
+                    name: call.name.clone(),
+                    args: args.clone(),
+                });
+            }
+            let futs = parallel.iter().map(|(call, args)| {
+                let name = call.name.clone();
+                let args = args.clone();
+                async move {
+                    (
+                        call.id.clone(),
+                        tools.registry.run(&name, args, tools.root).await,
+                    )
+                }
+            });
+            for (id, outcome) in futures_util::future::join_all(futs).await {
+                outcomes.insert(id, outcome);
+            }
+        }
+
+        // Serial pass: order-preserving, sequential, awaiting each as before.
+        for call in &serial {
             if cancel.is_cancelled() {
                 break;
             }
@@ -962,7 +1026,7 @@ pub async fn run_turn(
                      SiliconFlow).",
                 )
             } else {
-                match parsed_args {
+                match serde_json::from_str::<serde_json::Value>(&call.arguments) {
                     Err(e) => ff_tools::ToolOutcome::error(format!(
                         "tool `{}` arguments were not valid JSON ({e}); received: `{}`. \
                      Re-issue the call with a valid JSON object matching the tool schema.",
@@ -1020,7 +1084,17 @@ pub async fn run_turn(
                     }
                 }
             };
+            outcomes.insert(call.id.clone(), outcome);
+        }
 
+        // Persist results, emit Finished, and run repeat-stall accounting in
+        // original call order, regardless of which path produced each outcome. A
+        // call with no outcome (cancelled before it ran) is left to the backfill
+        // guard, which writes a `[cancelled]` result on drop (#316).
+        for call in calls.values() {
+            let Some(outcome) = outcomes.remove(&call.id) else {
+                continue;
+            };
             // Content-aware, reversible compaction at ingest (M7.1a, RFC 0016
             // Tier 1): shrink large tool results before they enter the transcript
             // and stash the verbatim original keyed by the marker's hash so the
@@ -1387,6 +1461,33 @@ mod tests {
             _args: &serde_json::Value,
         ) -> bool {
             false
+        }
+    }
+
+    /// A `Safety::ReadOnly` tool that sleeps before returning, so two concurrent
+    /// invocations finish in ~one sleep's wall-clock rather than two -- letting the
+    /// #A1 parallel-execution test prove concurrency by timing.
+    struct SlowRead;
+    #[async_trait]
+    impl ff_tools::Tool for SlowRead {
+        fn name(&self) -> &str {
+            "slow_read"
+        }
+        fn description(&self) -> &str {
+            "test-only read tool that sleeps 150ms"
+        }
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({"type":"object","properties":{"k":{"type":"string"}}})
+        }
+        fn safety(&self, _args: &serde_json::Value) -> Safety {
+            Safety::ReadOnly
+        }
+        fn max_safety(&self) -> Safety {
+            Safety::ReadOnly
+        }
+        async fn run(&self, _args: serde_json::Value, _root: &Path) -> ff_tools::ToolOutcome {
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            ff_tools::ToolOutcome::ok("read done")
         }
     }
 
@@ -2254,6 +2355,179 @@ mod tests {
             .any(|m| m.role == Role::Tool && m.content == "[cancelled]"));
         // The final bubble is never empty.
         assert!(!msg.content.is_empty());
+    }
+
+    /// #A1: two read-only tool calls in one turn run concurrently (timed), and each
+    /// requested call id gets exactly one tool result.
+    #[tokio::test]
+    async fn parallel_readonly_calls_run_concurrently() {
+        struct TwoReadsThenText {
+            calls: AtomicUsize,
+        }
+        #[async_trait]
+        impl Provider for TwoReadsThenText {
+            async fn chat_stream(&self, _req: ChatRequest) -> Result<ChunkStream, LlmError> {
+                let n = self.calls.fetch_add(1, Ordering::SeqCst);
+                let chunks = if n == 0 {
+                    vec![Ok(Chunk {
+                        tool_calls: vec![
+                            ToolCallDelta {
+                                index: 0,
+                                id: Some("r1".into()),
+                                name: Some("slow_read".into()),
+                                arguments: r#"{"k":"a"}"#.into(),
+                            },
+                            ToolCallDelta {
+                                index: 1,
+                                id: Some("r2".into()),
+                                name: Some("slow_read".into()),
+                                arguments: r#"{"k":"b"}"#.into(),
+                            },
+                        ],
+                        done: true,
+                        ..Chunk::default()
+                    })]
+                } else {
+                    vec![Ok(Chunk {
+                        delta: "done reading".into(),
+                        done: true,
+                        ..Chunk::default()
+                    })]
+                };
+                Ok(futures_util::stream::iter(chunks).boxed())
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::new();
+        let s = store.create_session(None);
+        store.add_message(&s.id, Role::User, "read two".into());
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(SlowRead));
+        let approve = AlwaysApprove;
+        let provider = TwoReadsThenText {
+            calls: AtomicUsize::new(0),
+        };
+
+        let start = std::time::Instant::now();
+        let msg = run_turn(
+            &provider,
+            &store,
+            &ctx(&registry, dir.path(), &approve),
+            &s.id,
+            "mock",
+            None,
+            false,
+            CancelToken::new(),
+            |_| {},
+        )
+        .await
+        .unwrap();
+        let elapsed = start.elapsed();
+
+        // Two 150ms reads concurrently ~= 150ms; serial would be ~300ms.
+        assert!(
+            elapsed < std::time::Duration::from_millis(280),
+            "read-only calls must run concurrently, took {elapsed:?}"
+        );
+        // Exactly one tool result per requested id.
+        let history = store.get_messages(&s.id);
+        let replied: Vec<String> = history
+            .iter()
+            .filter(|m| m.role == Role::Tool)
+            .filter_map(|m| m.tool_call_id.clone())
+            .collect();
+        assert_eq!(replied.len(), 2, "one result per call: {replied:?}");
+        assert!(replied.iter().any(|r| r == "r1"));
+        assert!(replied.iter().any(|r| r == "r2"));
+        assert_eq!(msg.content, "done reading");
+    }
+
+    /// #A1: a turn mixing a read-only call and a write call keeps the write on the
+    /// serial, approval-gated path; the read-only call never reaches the approver.
+    #[tokio::test]
+    async fn mixed_read_and_write_keeps_write_gated() {
+        struct ReadAndWriteThenText {
+            calls: AtomicUsize,
+        }
+        #[async_trait]
+        impl Provider for ReadAndWriteThenText {
+            async fn chat_stream(&self, _req: ChatRequest) -> Result<ChunkStream, LlmError> {
+                let n = self.calls.fetch_add(1, Ordering::SeqCst);
+                let chunks = if n == 0 {
+                    vec![Ok(Chunk {
+                        tool_calls: vec![
+                            ToolCallDelta {
+                                index: 0,
+                                id: Some("r1".into()),
+                                name: Some("slow_read".into()),
+                                arguments: r#"{"k":"a"}"#.into(),
+                            },
+                            ToolCallDelta {
+                                index: 1,
+                                id: Some("w1".into()),
+                                name: Some("bash".into()),
+                                arguments: r#"{"command":"touch made_by_write"}"#.into(),
+                            },
+                        ],
+                        done: true,
+                        ..Chunk::default()
+                    })]
+                } else {
+                    vec![Ok(Chunk {
+                        delta: "did both".into(),
+                        done: true,
+                        ..Chunk::default()
+                    })]
+                };
+                Ok(futures_util::stream::iter(chunks).boxed())
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::new();
+        let s = store.create_session(None);
+        store.add_message(&s.id, Role::User, "read and write".into());
+        let mut registry = ToolRegistry::with_defaults();
+        registry.register(Box::new(SlowRead));
+        let consulted = Arc::new(AtomicBool::new(false));
+        let approve = RecordingApprover {
+            consulted: consulted.clone(),
+        };
+        let provider = ReadAndWriteThenText {
+            calls: AtomicUsize::new(0),
+        };
+
+        run_turn(
+            &provider,
+            &store,
+            &ctx(&registry, dir.path(), &approve),
+            &s.id,
+            "mock",
+            None,
+            false,
+            CancelToken::new(),
+            |_| {},
+        )
+        .await
+        .unwrap();
+
+        // The write went through the approval gate; the read-only call did not need it.
+        assert!(
+            consulted.load(Ordering::SeqCst),
+            "the write call must be approval-gated on the serial path"
+        );
+        // Both calls produced a tool result.
+        let history = store.get_messages(&s.id);
+        let replied: Vec<String> = history
+            .iter()
+            .filter(|m| m.role == Role::Tool)
+            .filter_map(|m| m.tool_call_id.clone())
+            .collect();
+        assert!(replied.iter().any(|r| r == "r1"));
+        assert!(replied.iter().any(|r| r == "w1"));
+        // The approved write actually ran.
+        assert!(dir.path().join("made_by_write").exists());
     }
 
     /// Dropping the `run_turn` future mid tool-loop (window closed, runtime torn
