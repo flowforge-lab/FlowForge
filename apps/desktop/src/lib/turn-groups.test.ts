@@ -201,3 +201,89 @@ describe("persistedStepToToolStep — adapter", () => {
     expect(step.finishedAt).toBeUndefined();
   });
 });
+
+describe("foldTurns — interleaved prose (#415)", () => {
+  function tags(turn: ReturnType<typeof foldTurns>[number]): string[] {
+    if (turn.kind !== "assistant") throw new Error("expected assistant turn");
+    return turn.items.map((it) =>
+      it.kind === "prose" ? `prose:${it.text}` : `step:${it.step.tool}`,
+    );
+  }
+
+  it("interleaves intermediate prose between steps, in message order", () => {
+    const groups = foldTurns([
+      msg({ role: "user", content: "go" }),
+      msg({
+        id: "a1",
+        role: "assistant",
+        content: "Let me read the file.",
+        toolCalls: [call("c1", "view", {})],
+      }),
+      msg({ role: "tool", toolCallId: "c1", content: "r1" }),
+      msg({
+        id: "a2",
+        role: "assistant",
+        content: "Found it. Now searching.",
+        toolCalls: [call("c2", "grep", {})],
+      }),
+      msg({ role: "tool", toolCallId: "c2", content: "r2" }),
+      msg({ id: "a3", role: "assistant", content: "All done." }),
+    ]);
+    const turn = groups[1];
+    expect(tags(turn)).toEqual([
+      "prose:Let me read the file.",
+      "step:view",
+      "prose:Found it. Now searching.",
+      "step:grep",
+    ]);
+    if (turn.kind !== "assistant") throw new Error("expected assistant turn");
+    // The final assistant message is the answer, never a prose row.
+    expect(turn.message.id).toBe("a3");
+    expect(turn.message.content).toBe("All done.");
+    expect(turn.steps).toHaveLength(2);
+  });
+
+  it("emits no prose for a single-assistant turn (its content is the answer)", () => {
+    const groups = foldTurns([
+      msg({ role: "user", content: "go" }),
+      msg({
+        id: "a1",
+        role: "assistant",
+        content: "answer only",
+        toolCalls: [call("c1", "view", {})],
+      }),
+      msg({ role: "tool", toolCallId: "c1", content: "r1" }),
+    ]);
+    expect(tags(groups[1])).toEqual(["step:view"]);
+  });
+
+  it("prefers live steps over reconstruction, per assistant message", () => {
+    const liveStep = {
+      callId: "c1",
+      tool: "bash",
+      args: {},
+      status: "done" as const,
+      result: "live result",
+      startedAt: 1000,
+      finishedAt: 1200,
+    };
+    const groups = foldTurns(
+      [
+        msg({ role: "user", content: "go" }),
+        msg({
+          id: "a1",
+          role: "assistant",
+          content: "Working on it.",
+          toolCalls: [call("c1", "view", {})],
+        }),
+        msg({ id: "a2", role: "assistant", content: "done" }),
+      ],
+      { a1: [liveStep] },
+    );
+    const turn = groups[1];
+    if (turn.kind !== "assistant") throw new Error("expected assistant turn");
+    expect(turn.steps).toHaveLength(1);
+    expect(turn.steps[0].result).toBe("live result");
+    expect(tags(turn)).toEqual(["prose:Working on it.", "step:bash"]);
+  });
+});

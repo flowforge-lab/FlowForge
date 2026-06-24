@@ -12,14 +12,17 @@ import { MessageActions } from "@/components/message-actions";
 import { MessageAttachments } from "@/components/message-attachments";
 import { ThinkingIndicator } from "@/components/thinking-indicator";
 import { foldTurns } from "@/lib/turn-groups";
+import type { TurnItem } from "@/lib/turn-groups";
 import type { Message } from "@/bindings";
 
 const NO_STEPS: ToolStep[] = [];
+const NO_ITEMS: TurnItem[] = [];
 
 function MessageRowImpl({
   message,
   streaming,
   toolSteps,
+  items,
   turnStartMs,
   reasoning,
   respondApproval,
@@ -30,6 +33,7 @@ function MessageRowImpl({
   message: Message;
   streaming: boolean;
   toolSteps: ToolStep[];
+  items: TurnItem[];
   turnStartMs?: number | null;
   reasoning: string;
   respondApproval: (
@@ -108,10 +112,14 @@ function MessageRowImpl({
     <div className="flex flex-col items-start gap-1.5">
       {toolSteps.length > 0 ? (
         <div className="flex w-full max-w-[80%] flex-col gap-1.5">
-          {/* Single settled step stays bare; streaming (any count), 2+ steps, or any
-              reasoning to fold in (#205) use StepGroup so the live timer, peek window
-              (#180), and grouped Thinking block apply. */}
-          {toolSteps.length === 1 && !streaming && !reasoning ? (
+          {/* Single settled step stays bare; streaming (any count), 2+ steps, any
+              reasoning to fold in (#205), or any intermediate prose to interleave
+              (#415) use StepGroup so the live timer, peek window (#180), grouped
+              Thinking block, and folded prose rows apply. */}
+          {toolSteps.length === 1 &&
+          !streaming &&
+          !reasoning &&
+          !items.some((it) => it.kind === "prose") ? (
             <ToolStepBlock
               step={toolSteps[0]}
               onRespond={onRespond}
@@ -122,6 +130,7 @@ function MessageRowImpl({
           ) : (
             <StepGroup
               steps={toolSteps}
+              items={items}
               streaming={streaming}
               turnStartMs={turnStartMs}
               reasoning={reasoning}
@@ -199,10 +208,14 @@ export function ChatView({ sessionId }: { sessionId?: string } = {}) {
   const approveAlways = useChatStore((s) => s.approveAlways);
   const respondAsk = useChatStore((s) => s.respondAsk);
 
-  // Fold the transcript into per-turn render groups (#413). Reloaded multi-step
-  // turns (no live `toolSteps`) carry steps reconstructed from the persisted
-  // tool/system messages so they render through the same StepGroup as live turns.
-  const groups = useMemo(() => foldTurns(messages ?? []), [messages]);
+  // Fold the transcript into per-turn render groups (#413/#415). Steps are resolved
+  // per assistant message: live `toolStepsByMessage` while streaming (aggregated
+  // across every iteration of a multi-step turn), or reconstructed from the persisted
+  // tool/system messages on reload. Intermediate prose interleaves as folded rows.
+  const groups = useMemo(
+    () => foldTurns(messages ?? [], toolStepsByMessage),
+    [messages, toolStepsByMessage],
+  );
 
   const scrollRef = useRef<HTMLDivElement>(null);
   const pinnedToBottom = useRef(true);
@@ -275,11 +288,10 @@ export function ChatView({ sessionId }: { sessionId?: string } = {}) {
         <div className="mx-auto flex max-w-3xl flex-col gap-3 px-4 py-4">
           {groups.map((g) => {
             const m = g.message;
-            // Live steps always win over reconstruction (they survive a same-run
-            // session switch); reconstructed steps drive a reloaded turn.
-            const liveSteps = toolStepsByMessage[m.id] ?? NO_STEPS;
-            const reconstructed = g.kind === "assistant" ? g.steps : NO_STEPS;
-            const toolSteps = liveSteps.length > 0 ? liveSteps : reconstructed;
+            // foldTurns already resolved each turn's steps (live or reconstructed)
+            // and interleaved prose items (#415).
+            const toolSteps = g.kind === "assistant" ? g.steps : NO_STEPS;
+            const items = g.kind === "assistant" ? g.items : NO_ITEMS;
             // Prefer live reasoning when present; fall back to the reasoning
             // persisted on the assistant message for a reloaded turn (#375).
             const reasoning =
@@ -291,6 +303,7 @@ export function ChatView({ sessionId }: { sessionId?: string } = {}) {
                 message={m}
                 streaming={m.id === streamingId}
                 toolSteps={toolSteps}
+                items={items}
                 turnStartMs={
                   turnStartByMessage[m.id] ?? turnStartBySession[m.sessionId]
                 }

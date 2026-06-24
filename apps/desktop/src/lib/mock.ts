@@ -1415,22 +1415,42 @@ Shipping the Settings redesign — currently the Memory browser (SET.8).
     return msg;
   }
 
+  // Emit a single intermediate-prose assistant message: the narration the real
+  // backend persists on each per-iteration assistant message (#415). Appended to
+  // history and streamed as one token so the frontend materializes it live.
+  private emitProse(sessionId: string, text: string): string {
+    const msg = this.append(sessionId, "assistant", text);
+    this.emit(this.tokenListeners, {
+      sessionId,
+      messageId: msg.id,
+      delta: text,
+    });
+    return msg.id;
+  }
+
   private streamAssistant(sessionId: string): void {
-    const assistant = this.append(sessionId, "assistant", "");
     const turn: ActiveTurn = {
       timers: [],
-      messageId: assistant.id,
+      messageId: "",
       pendingToolCalls: [],
     };
     this.activeTimers.set(sessionId, turn);
 
-    // A planning checklist first (exercises the todo render — Issue #42), then a
-    // couple of auto-resolving read steps before the approval-gated write, so a
-    // turn is genuinely multi-step and exercises the StepGroup fold (#17): the
-    // "N steps" header, live count while streaming, and collapse on turn:done.
+    // The backend mints one assistant message per tool-calling iteration, each
+    // carrying its own prose; we mirror that so the turn exercises the StepGroup
+    // fold (#17), cross-iteration step aggregation, and interleaved prose rows
+    // (#415) — intermediate narration folded between the steps it describes.
+
+    // Iteration 1: a line of prose, then a planning checklist (todo render, #42)
+    // and a couple of auto-resolving reads.
+    const a1 = this.emitProse(
+      sessionId,
+      "I'll read the README and find the FlowForge references, then update the title.",
+    );
+    turn.messageId = a1;
     this.emitAutoStep(
       sessionId,
-      assistant.id,
+      a1,
       "todo",
       {
         items: [
@@ -1443,25 +1463,35 @@ Shipping the Settings redesign — currently the Memory browser (SET.8).
     );
     this.emitAutoStep(
       sessionId,
-      assistant.id,
+      a1,
       "view",
       { path: "README.md" },
       "(mocked) read 42 lines from README.md",
     );
     this.emitAutoStep(
       sessionId,
-      assistant.id,
+      a1,
       "grep",
       { pattern: "FlowForge", path: "." },
       "(mocked) 7 matches across 3 files",
     );
 
-    // First an interactive `ask_user` step (#44) — exercises the tool:call ->
-    // tool:ask-request -> respondAsk -> tool:result path under VITE_FF_MOCK=1.
-    // Once the user answers, we fall through to the approval-gated write so the
-    // mock turn covers both the ask and the approve round-trips.
-    this.emitAskStep(sessionId, assistant.id, turn, () => {
-      this.emitApprovalStep(sessionId, assistant.id, turn);
+    // Iteration 2: more prose, then the interactive `ask_user` step (#44) and the
+    // approval-gated write — exercising the tool:call -> ask-request -> respondAsk
+    // and the approve round-trips under VITE_FF_MOCK=1.
+    const a2 = this.emitProse(
+      sessionId,
+      "Found 7 references across 3 files. I'll confirm the file, then make the edit.",
+    );
+    turn.messageId = a2;
+    this.emitAskStep(sessionId, a2, turn, () => {
+      this.emitApprovalStep(sessionId, a2, turn, () => {
+        // Final iteration: the answer lands on its own assistant message, so the
+        // intermediate prose above renders as folded rows rather than the answer.
+        const a3 = this.append(sessionId, "assistant", "").id;
+        turn.messageId = a3;
+        this.streamWords(sessionId, turn);
+      });
     });
   }
 
@@ -1512,6 +1542,7 @@ Shipping the Settings redesign — currently the Memory browser (SET.8).
     sessionId: string,
     messageId: string,
     turn: ActiveTurn,
+    next: () => void = () => this.streamWords(sessionId, turn),
   ): void {
     const callId = uidShort();
     // The demo write step's trust level; gates the short-circuit below exactly
@@ -1547,7 +1578,7 @@ Shipping the Settings redesign — currently the Memory browser (SET.8).
         success: true,
         result: "(mocked) edited README.md",
       });
-      this.streamWords(sessionId, turn);
+      next();
       return;
     }
     this.emit(this.approvalRequestListeners, {
@@ -1571,7 +1602,7 @@ Shipping the Settings redesign — currently the Memory browser (SET.8).
           ? "(mocked) edited README.md"
           : "call to `edit` was not approved",
       });
-      this.streamWords(sessionId, turn);
+      next();
     });
   }
 
