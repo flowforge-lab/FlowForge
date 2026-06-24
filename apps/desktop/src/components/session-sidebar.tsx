@@ -21,6 +21,7 @@ import {
   X,
 } from "@/components/ui/icon";
 import { Button } from "@/components/ui/button";
+import { EmptyState } from "@/components/ui/empty-state";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Separator } from "@/components/ui/separator";
 import { cn } from "@/lib/utils";
@@ -752,13 +753,9 @@ export function SessionSidebar() {
         <nav className="flex flex-col gap-px p-1.5">
           {visible.length === 0 ? (
             filtering && effectiveTab === "all" ? (
-              <p className="px-2 py-6 text-center text-[12px] text-muted-foreground/60">
-                No sessions match “{filter.trim()}”
-              </p>
+              <EmptyState title={`No sessions match “${filter.trim()}”`} />
             ) : effectiveTab === "dismissed" ? (
-              <p className="px-2 py-6 text-center text-[12px] text-muted-foreground/60">
-                No dismissed sessions
-              </p>
+              <EmptyState title="No dismissed sessions" />
             ) : null
           ) : (
             visible.map((session) => (

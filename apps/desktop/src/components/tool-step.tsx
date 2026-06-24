@@ -3,7 +3,6 @@ import {
   Check,
   ChevronRight,
   CornerDownLeft,
-  Loader2,
   MessageCircleQuestion,
   ShieldAlert,
   X,
@@ -17,13 +16,14 @@ import { parseTodo } from "@/lib/todo";
 import { TodoList } from "@/components/todo-list";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Spinner } from "@/components/ui/spinner";
 import { Textarea } from "@/components/ui/textarea";
 import type { ToolStep } from "@/store/chat";
 import { OutputBlock } from "@/components/output-block";
 
 function StatusIcon({ status }: { status: ToolStep["status"] }) {
   if (status === "running") {
-    return <Loader2 className="size-3.5 animate-spin text-muted-foreground" />;
+    return <Spinner className="text-muted-foreground" />;
   }
   if (status === "awaiting-approval") {
     return <ShieldAlert className="size-3.5 text-amber-500" />;

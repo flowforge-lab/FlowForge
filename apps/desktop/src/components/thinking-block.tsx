@@ -1,6 +1,7 @@
 import { useState } from "react";
-import { ChevronRight, Loader2 } from "@/components/ui/icon";
+import { ChevronRight } from "@/components/ui/icon";
 import { cn } from "@/lib/utils";
+import { Spinner } from "@/components/ui/spinner";
 
 /** Fold state for the Thinking block (#205): collapsed by default — even mid-stream —
  *  so a turn stays compact. A manual toggle (`userOpen`) wins for the rest of the turn. */
@@ -38,7 +39,7 @@ export function ThinkingBlock({
           )}
         />
         {streaming && !hasAnswer && (
-          <Loader2 className="size-3.5 shrink-0 animate-spin text-muted-foreground" />
+          <Spinner className="shrink-0 text-muted-foreground" />
         )}
         <span className="font-medium text-foreground/90">Thinking</span>
         {!open && (
