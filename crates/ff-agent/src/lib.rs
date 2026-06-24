@@ -480,6 +480,17 @@ impl Drop for ToolResultBackfill<'_> {
     }
 }
 
+/// Whether a given loop iteration should request model reasoning (#D1). Reasoning
+/// is reserved for the steps where it pays off: the **first** iteration (initial
+/// planning, before any tool result exists) and the **wrap-up** step near the cap
+/// (final synthesis). The mid-loop tool-dispatch steps -- "I have a tool result,
+/// issue the next call" -- skip it, since reasoning there is mostly latency on a
+/// slow model. `iter` is 0-based; `remaining` counts iterations left including the
+/// current one (so `remaining == 1` is the last step).
+fn should_reason(iter: usize, remaining: usize) -> bool {
+    iter == 0 || remaining <= WRAP_UP_AT_REMAINING
+}
+
 /// Runs one assistant turn for `session_id`, executing any tool calls the model
 /// requests until it produces a plain text answer (or the iteration cap is hit).
 /// `on_event` is called synchronously as the turn progresses. The final assistant
@@ -683,6 +694,13 @@ pub async fn run_turn(
         // so a long turn ends with a real reply instead of "[stopped: reached
         // tool-call limit]" cut mid-tool (#244 R3). Transient: request-only.
         let remaining = max_iter - iter; // iterations left, including this one
+                                         // Adaptive per-step reasoning (#D1): when the master switch is on, only the
+                                         // planning step (first iteration) and the final-synthesis step (the wrap-up,
+                                         // near the cap) reason. The 20-50 mid-loop tool-dispatch steps ("I have a
+                                         // result, what next") skip reasoning entirely -- that is pure latency on a
+                                         // slow model. Effort, where reasoning IS on, stays whatever the connection
+                                         // set (Medium by default); this gates only *whether* a step reasons.
+        let step_thinking = enable_reasoning && should_reason(iter, remaining);
         if remaining <= WRAP_UP_AT_REMAINING && max_iter > 1 {
             messages.push(ChatMessage {
                 role: "system".to_string(),
@@ -780,7 +798,7 @@ pub async fn run_turn(
                 model: model.to_string(),
                 messages: messages.clone(),
                 tools: tool_schemas.clone(),
-                thinking: enable_reasoning,
+                thinking: step_thinking,
             };
 
             let mut stream = match provider.chat_stream(req).await {
@@ -809,7 +827,7 @@ pub async fn run_turn(
                 }
                 match item {
                     Ok(chunk) => {
-                        if enable_reasoning && !chunk.reasoning_delta.is_empty() {
+                        if step_thinking && !chunk.reasoning_delta.is_empty() {
                             emitted_any = true;
                             reasoning_acc.push_str(&chunk.reasoning_delta);
                             on_event(AgentEvent::Reasoning {
@@ -1365,6 +1383,19 @@ mod tests {
         assert_eq!(out[0].reasoning, None, "oldest CoT dropped from wire");
         assert_eq!(out[1].reasoning.as_deref(), Some("middle"));
         assert_eq!(out[2].reasoning.as_deref(), Some("newest"));
+    }
+
+    #[test]
+    fn should_reason_only_on_planning_and_wrapup_steps() {
+        // D1: reason on the first iteration and the wrap-up step; skip mid-loop.
+        let max_iter = 25usize;
+        // iter 0 = planning -> reason.
+        assert!(should_reason(0, max_iter));
+        // mid-loop tool-dispatch steps -> no reasoning.
+        assert!(!should_reason(1, max_iter - 1));
+        assert!(!should_reason(10, max_iter - 10));
+        // wrap-up step (remaining <= WRAP_UP_AT_REMAINING) -> reason again.
+        assert!(should_reason(max_iter - 1, WRAP_UP_AT_REMAINING));
     }
 
     #[test]
