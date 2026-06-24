@@ -45,9 +45,9 @@ Non-goals are in §8.
 
 The field has moved past "summarize history." A survey (full citations in §11):
 
-- **Threshold-triggered abstractive summary** — Aki's user-adjustable *Summarization
-  Threshold*, OpenClaw's *Context Compaction* lifecycle, and the Strands
-  `ConversationManager` (sliding-window vs summarization). The common shape: estimate
+- **Threshold-triggered abstractive summary** — OpenClaw's *Context Compaction*
+  lifecycle and the Strands `ConversationManager` (sliding-window vs summarization)
+  are representative. The common shape: estimate
   tokens, fire at a fraction of the window, condense the cold tail, keep recent turns
   verbatim, flush durable facts first. This is necessary but is the *fallback*, not the
   headline — abstractive summary has a quality cliff and is irreversible.
@@ -111,9 +111,13 @@ allows it, and let the decay clock pick how dense.**
 
 ## 4. Architecture: Tiered Strategies on the Existing Seam
 
-All tiers implement the existing `CompactionStrategy` trait; the existing
-`ContextPressureEstimator` decides *when*. The host composes them in order, each relieving
-more pressure (and costing more) than the last.
+The existing `ContextPressureEstimator` decides *when*. The host composes the tiers in
+order, each relieving more pressure (and costing more) than the last. Tier 0 (flush) and
+Tier 2 (abstractive) plug into the existing async, provider-driven `CompactionStrategy`
+trait; **Tier 1 (extractive) is deliberately *not* a `CompactionStrategy`** — it is a
+deterministic, synchronous pre-send wire transform applied to the request transcript
+(see "Tier 1" below and §9 Q1 amendment). This avoids forcing a pure-CPU mechanism through
+an async/Provider-shaped seam, while keeping `is_over(fraction)` the single trigger.
 
 - **Tier 0 — Flush (shipped).** `MemoryFlush`: a silent bounded turn that persists durable
   facts to memory before anything is compressed away. Runs first so later lossy tiers can
@@ -123,7 +127,12 @@ more pressure (and costing more) than the last.
   AST-trim for code, key-path prune for JSON/tool-output, LLMLingua-2-style token-prune
   for prose. Originals are cached keyed by message id (an FTS5 side table, reusing the
   RFC 0006 index machinery); a `compaction_retrieve` tool lets the model pull the original
-  back on demand. Cheap, local, no quality cliff, reversible.
+  back on demand. Cheap, local, no quality cliff, reversible. **Wired (M7.1a + M7.1b)** as (a) a per-tool-result
+  compaction at ingest, persisting `(message_id, key, original)` to a `compaction_originals`
+  side table; and (b) a cold-prefix wire transform in `run_turn` gated by
+  `is_over(EXTRACTIVE_COMPACT_AT_FRACTION)`, leaving the `KEEP_RECENT_VERBATIM` most
+  recent messages byte-identical and skipping content already carrying the marker so
+  ingest-time and pre-send passes never double-compact.
 - **Tier 2 — Abstractive cold-tail summary (new, fallback).** When Tier 1 is exhausted,
   LLM-condense the oldest turns into a summary message, preserve the most recent N turns
   verbatim, and mark the boundary with the existing summary divider so the UI can render a
@@ -193,6 +202,10 @@ user-inspectable, consistent with RFC 0007's "everything is inspectable" posture
 
 1. **Tier ordering vs. cost.** Should Tier 1 (extractive) always precede Tier 2
    (abstractive), or should the router pick directly based on content type and pressure?
+   *Amendment (M7.1b):* Tier 1 is implemented as a deterministic pre-send wire transform,
+   not a `CompactionStrategy` impl. Tier 2 stays on the async/provider-driven strategy
+   seam; ordering reduces to "extractive runs first because it is mechanical and free,
+   abstractive is the fallback when extractive cannot relieve enough pressure."
 2. **CCR cache lifetime.** How long are compaction originals retained, and do they share
    the FTS5 index / decay with memory, or live in a session-scoped side store?
 3. **Optical decode trust.** At 20x optical compression DeepSeek-OCR is ~60% accurate —
@@ -241,10 +254,7 @@ Listed to credit the work that informed this design.
     baseline in §2.
 12. **OpenClaw.** Context & Context Compaction documentation. https://docs.openclaw.ai
     — `contextTokens` cap, threshold-triggered summarize-and-replace, memory flush.
-13. **Aki (Amazon internal).** User-adjustable Summarization Threshold / context-summarization
-    behavior — the threshold-trigger UX reference.
-
-> Note: items 11-13 are framework/product references used as design influences; 1-10 are
+> Note: items 11-12 are framework/product references used as design influences; 1-10 are
 > primary sources. Where a result is quoted (compression ratios, bits/s), the number is
 > taken from the cited source and should be re-verified before it is used as an engineering
 > constant.
