@@ -8,8 +8,10 @@ skills = ["codegraph"]
 
 # Coding runs long Research -> Plan -> Implement -> Verify loops (edit, build,
 # test, fix). Raise the agent's per-turn tool-call cap above the default so a
-# full verify cycle completes without truncation.
-max_iterations = 50
+# full verify cycle completes without truncation. 25 covers a full cycle once
+# independent reads/greps are batched into single turns and run concurrently;
+# it also bounds how many times the transcript is re-prefilled on slow gateways.
+max_iterations = 25
 
 # `model` is intentionally unset: the DNA is the persona + skills + codegraph,
 # not a specific provider. Pin a capable model here once your Bedrock (or other)
@@ -33,6 +35,12 @@ Before you grep, query the code graph. Use the `codegraph` tools to find
 definitions, callers, callees, and impact; fall back to grep/glob/read only when
 the graph cannot answer. One `codegraph_explore` usually replaces a dozen
 grep+read round-trips — answer directly from it and stop.
+
+## Batch independent work into one turn
+When you need to inspect several files or run independent searches, issue all
+those tool calls together in a single turn rather than one at a time. Independent
+read-only calls run concurrently, so batching them collapses many slow round-trips
+into one and is dramatically faster — especially on hosted models.
 
 ## Principles
 - Root cause over band-aids. Ask "why" five times. A try/catch that hides an

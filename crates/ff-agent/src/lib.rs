@@ -112,6 +112,24 @@ const TOOL_RESULT_MAX_BYTES: usize = 8 * 1024;
 /// so a cap is safe for the round-trip.
 const REASONING_MAX_BYTES: usize = 16 * 1024;
 
+/// How many of the most-recent assistant tool-call turns keep their persisted
+/// reasoning when building the wire request. Reasoning gateways (#375) replay
+/// `reasoning_content` on *every* prior tool-call turn, so an N-turn task resends
+/// every earlier CoT on every call -- O(n^2) prefill growth. Only the most recent
+/// turns' reasoning meaningfully aids continuation, so older CoT is dropped from
+/// the wire (the store keeps the verbatim original untouched). Latency win is
+/// model-agnostic; correctness is unaffected because the dialect simply omits
+/// absent reasoning.
+const REASONING_REPLAY_KEEP: usize = 2;
+
+/// Fraction of a model's real context window used as the compaction budget. The
+/// headroom (the remaining ~20%) absorbs the model's own response and the
+/// coarseness of the chars/4 proxy estimate, so compaction engages before the
+/// true window is hit rather than after. Combined with the per-model window from
+/// `Provider::context_window`, this stops a large-window model from being
+/// force-compacted at a small fixed ceiling (#B1).
+const CONTEXT_BUDGET_SAFETY: f64 = 0.8;
+
 /// Events the agent emits during a turn. The host (Tauri shell or a test) decides
 /// how to surface them — over IPC, to a channel, or into assertions.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -331,7 +349,7 @@ fn role_str(role: Role) -> &'static str {
 }
 
 pub(crate) fn to_chat(messages: &[Message]) -> Vec<ChatMessage> {
-    messages
+    let mut chat: Vec<ChatMessage> = messages
         .iter()
         .map(|m| {
             let tool_calls = m.tool_calls.as_ref().map(|calls| {
@@ -366,7 +384,42 @@ pub(crate) fn to_chat(messages: &[Message]) -> Vec<ChatMessage> {
                 reasoning: m.reasoning.clone(),
             }
         })
-        .collect()
+        .collect();
+    cap_reasoning_replay(&mut chat, REASONING_REPLAY_KEEP);
+    chat
+}
+
+/// Drop replayed reasoning from all but the most-recent `keep` assistant
+/// tool-call turns (#375 follow-up; see [`REASONING_REPLAY_KEEP`]). Walks the
+/// wire messages newest-first; once `keep` reasoning-bearing tool-call turns have
+/// been seen, every older one has its `reasoning` cleared so it is omitted from
+/// the wire. Only assistant turns that actually carry tool calls are counted --
+/// those are the only ones a reasoning gateway replays. Plain assistant answers
+/// are untouched (the dialect never replays their reasoning anyway).
+fn cap_reasoning_replay(messages: &mut [ChatMessage], keep: usize) {
+    let mut seen = 0usize;
+    for m in messages.iter_mut().rev() {
+        let is_tool_call_turn = m.role == "assistant" && m.tool_calls.is_some();
+        if !is_tool_call_turn || m.reasoning.is_none() {
+            continue;
+        }
+        if seen < keep {
+            seen += 1;
+        } else {
+            m.reasoning = None;
+        }
+    }
+}
+
+/// Whether a given loop iteration should request model reasoning (#D1). Reasoning
+/// is reserved for the steps where it pays off: the **first** iteration (initial
+/// planning, before any tool result exists) and the **wrap-up** step near the cap
+/// (final synthesis). The mid-loop tool-dispatch steps -- "I have a tool result,
+/// issue the next call" -- skip it, since reasoning there is mostly latency on a
+/// slow model. `iter` is 0-based; `remaining` counts iterations left including the
+/// current one (so `remaining == 1` is the last step).
+fn should_reason(iter: usize, remaining: usize) -> bool {
+    iter == 0 || remaining <= WRAP_UP_AT_REMAINING
 }
 
 /// Accumulates streamed tool-call fragments keyed by `index`.
@@ -475,6 +528,12 @@ pub async fn run_turn(
     let mut last: Option<Message> = None;
 
     let max_iter = tools.max_iterations.max(1);
+    // Size the compaction budget to THIS model's real context window (#B1) so a
+    // large-window model isn't force-compacted at a small fixed ceiling. Built
+    // once per turn and reused for every pressure check below.
+    let estimator = ProxyTokenEstimator {
+        budget_tokens: ((provider.context_window(model) as f64) * CONTEXT_BUDGET_SAFETY) as u64,
+    };
     let mut turn_count: u32 = 0;
     // Repeated-call / no-progress guard (#244 R2): count identical `(tool, arguments)`
     // calls across the turn; `repeat_nudge` carries a tool name to warn about on the
@@ -509,7 +568,7 @@ pub async fn run_turn(
         // session's messages, so `messages` below is unaffected. Best-effort: a flush
         // failure must not abort the user's turn.
         let message_count = history.len() as u64;
-        let pressure = ProxyTokenEstimator::default().assess(&history, model);
+        let pressure = estimator.assess(&history, model);
         // Carries the flush's write count to the `MemoryFlushed` event below, once
         // this iteration's assistant message id exists to correlate it with.
         let mut flushed_writes: Option<u32> = None;
@@ -649,6 +708,13 @@ pub async fn run_turn(
         // so a long turn ends with a real reply instead of "[stopped: reached
         // tool-call limit]" cut mid-tool (#244 R3). Transient: request-only.
         let remaining = max_iter - iter; // iterations left, including this one
+                                         // Adaptive per-step reasoning (#D1): when the master switch is on, only the
+                                         // planning step (first iteration) and the final-synthesis step (the wrap-up,
+                                         // near the cap) reason. The 20-50 mid-loop tool-dispatch steps ("I have a
+                                         // result, what next") skip reasoning entirely -- that is pure latency on a
+                                         // slow model. Effort, where reasoning IS on, stays whatever the connection
+                                         // set (Medium by default); this gates only *whether* a step reasons.
+        let step_thinking = enable_reasoning && should_reason(iter, remaining);
         if remaining <= WRAP_UP_AT_REMAINING && max_iter > 1 {
             messages.push(ChatMessage {
                 role: "system".to_string(),
@@ -746,7 +812,7 @@ pub async fn run_turn(
                 model: model.to_string(),
                 messages: messages.clone(),
                 tools: tool_schemas.clone(),
-                thinking: enable_reasoning,
+                thinking: step_thinking,
             };
 
             let mut stream = match provider.chat_stream(req).await {
@@ -775,7 +841,7 @@ pub async fn run_turn(
                 }
                 match item {
                     Ok(chunk) => {
-                        if enable_reasoning && !chunk.reasoning_delta.is_empty() {
+                        if step_thinking && !chunk.reasoning_delta.is_empty() {
                             emitted_any = true;
                             reasoning_acc.push_str(&chunk.reasoning_delta);
                             on_event(AgentEvent::Reasoning {
@@ -883,7 +949,7 @@ pub async fn run_turn(
             // token gauge (#244 R6). The proxy estimator (chars/4) is intentionally
             // coarse; per-model tokenizers plug in via ContextPressureEstimator later.
             let token_count = Some(
-                ProxyTokenEstimator::default()
+                estimator
                     .assess(&store.get_messages(session_id), model)
                     .estimated_tokens as u32,
             );
@@ -915,7 +981,71 @@ pub async fn run_turn(
         for call in calls.values() {
             backfill.expect(&call.id);
         }
+        // Partition this turn's calls (#A1). A call is **parallel-eligible** only
+        // when it is side-effect-free: valid JSON args, a permitted, non-interactive,
+        // non-subagent tool whose `safety` is `ReadOnly`. Such calls touch only the
+        // workspace (reads) and borrow nothing mutable, so running them concurrently
+        // is safe and collapses N sequential provider-driven round-trips into one --
+        // the single biggest, most model-agnostic latency win. Everything else
+        // (writes/dangerous behind the approval gate, interactive `ask_user`,
+        // sub-agents, hidden/unpermitted tools, unparseable args, nameless calls)
+        // stays on the **serial** path with its exact prior semantics.
+        let mut parallel: Vec<(&CallBuf, serde_json::Value)> = Vec::new();
+        let mut serial: Vec<&CallBuf> = Vec::new();
         for call in calls.values() {
+            let parsed = serde_json::from_str::<serde_json::Value>(&call.arguments);
+            let eligible = match &parsed {
+                Ok(args) => {
+                    !call.name.trim().is_empty()
+                        && advertised
+                            .as_ref()
+                            .is_none_or(|set| set.contains(&call.name))
+                        && !tools.registry.is_interactive(&call.name)
+                        && !ff_tools::is_subagent(&call.name)
+                        && tools.registry.safety(&call.name, args) == Safety::ReadOnly
+                }
+                Err(_) => false,
+            };
+            match parsed {
+                Ok(args) if eligible => parallel.push((call, args)),
+                _ => serial.push(call),
+            }
+        }
+
+        // Outcomes keyed by call id; filled by the parallel batch and the serial
+        // pass, then drained in original call order for persistence + events so the
+        // transcript and the frontend see a stable ordering regardless of which path
+        // produced each result.
+        let mut outcomes: HashMap<String, ff_tools::ToolOutcome> = HashMap::new();
+
+        // Read-only batch: announce each (in call order), then run all concurrently.
+        // Skipped wholesale on cancel; unrun calls fall to the backfill guard.
+        if !cancel.is_cancelled() && !parallel.is_empty() {
+            for (call, args) in &parallel {
+                on_event(AgentEvent::ToolCallStarted {
+                    message_id: message_id.clone(),
+                    call_id: call.id.clone(),
+                    name: call.name.clone(),
+                    args: args.clone(),
+                });
+            }
+            let futs = parallel.iter().map(|(call, args)| {
+                let name = call.name.clone();
+                let args = args.clone();
+                async move {
+                    (
+                        call.id.clone(),
+                        tools.registry.run(&name, args, tools.root).await,
+                    )
+                }
+            });
+            for (id, outcome) in futures_util::future::join_all(futs).await {
+                outcomes.insert(id, outcome);
+            }
+        }
+
+        // Serial pass: order-preserving, sequential, awaiting each as before.
+        for call in &serial {
             if cancel.is_cancelled() {
                 break;
             }
@@ -962,7 +1092,7 @@ pub async fn run_turn(
                      SiliconFlow).",
                 )
             } else {
-                match parsed_args {
+                match serde_json::from_str::<serde_json::Value>(&call.arguments) {
                     Err(e) => ff_tools::ToolOutcome::error(format!(
                         "tool `{}` arguments were not valid JSON ({e}); received: `{}`. \
                      Re-issue the call with a valid JSON object matching the tool schema.",
@@ -1020,7 +1150,17 @@ pub async fn run_turn(
                     }
                 }
             };
+            outcomes.insert(call.id.clone(), outcome);
+        }
 
+        // Persist results, emit Finished, and run repeat-stall accounting in
+        // original call order, regardless of which path produced each outcome. A
+        // call with no outcome (cancelled before it ran) is left to the backfill
+        // guard, which writes a `[cancelled]` result on drop (#316).
+        for call in calls.values() {
+            let Some(outcome) = outcomes.remove(&call.id) else {
+                continue;
+            };
             // Content-aware, reversible compaction at ingest (M7.1a, RFC 0016
             // Tier 1): shrink large tool results before they enter the transcript
             // and stash the verbatim original keyed by the marker's hash so the
@@ -1097,7 +1237,7 @@ pub async fn run_turn(
     }
     // Same context-size estimate as the plain-text completion path (#244 R6).
     let token_count = Some(
-        ProxyTokenEstimator::default()
+        estimator
             .assess(&store.get_messages(session_id), model)
             .estimated_tokens as u32,
     );
@@ -1225,6 +1365,51 @@ mod tests {
         let out = to_chat(std::slice::from_ref(&msg));
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].reasoning.as_deref(), Some("because A then B"));
+    }
+
+    #[test]
+    fn to_chat_caps_reasoning_replay_to_last_n_tool_turns() {
+        // C1: a transcript with more than REASONING_REPLAY_KEEP reasoning-bearing
+        // tool-call turns keeps reasoning only on the most-recent `keep` of them;
+        // older CoT is dropped from the wire (the store keeps it verbatim).
+        let tool_turn = |id: &str, cot: &str| ff_core::Message {
+            id: id.into(),
+            session_id: "s1".into(),
+            role: Role::Assistant,
+            content: String::new(),
+            tool_calls: Some(vec![ff_core::ToolCall {
+                id: format!("call_{id}"),
+                name: "search".into(),
+                arguments: "{}".into(),
+            }]),
+            tool_call_id: None,
+            attachments: None,
+            reasoning: Some(cot.into()),
+            created_at: 0,
+        };
+        let history = vec![
+            tool_turn("m1", "oldest"),
+            tool_turn("m2", "middle"),
+            tool_turn("m3", "newest"),
+        ];
+        assert_eq!(REASONING_REPLAY_KEEP, 2);
+        let out = to_chat(&history);
+        assert_eq!(out[0].reasoning, None, "oldest CoT dropped from wire");
+        assert_eq!(out[1].reasoning.as_deref(), Some("middle"));
+        assert_eq!(out[2].reasoning.as_deref(), Some("newest"));
+    }
+
+    #[test]
+    fn should_reason_only_on_planning_and_wrapup_steps() {
+        // D1: reason on the first iteration and the wrap-up step; skip mid-loop.
+        let max_iter = 25usize;
+        // iter 0 = planning -> reason.
+        assert!(should_reason(0, max_iter));
+        // mid-loop tool-dispatch steps -> no reasoning.
+        assert!(!should_reason(1, max_iter - 1));
+        assert!(!should_reason(10, max_iter - 10));
+        // wrap-up step (remaining <= WRAP_UP_AT_REMAINING) -> reason again.
+        assert!(should_reason(max_iter - 1, WRAP_UP_AT_REMAINING));
     }
 
     #[test]
@@ -1387,6 +1572,33 @@ mod tests {
             _args: &serde_json::Value,
         ) -> bool {
             false
+        }
+    }
+
+    /// A `Safety::ReadOnly` tool that sleeps before returning, so two concurrent
+    /// invocations finish in ~one sleep's wall-clock rather than two -- letting the
+    /// #A1 parallel-execution test prove concurrency by timing.
+    struct SlowRead;
+    #[async_trait]
+    impl ff_tools::Tool for SlowRead {
+        fn name(&self) -> &str {
+            "slow_read"
+        }
+        fn description(&self) -> &str {
+            "test-only read tool that sleeps 150ms"
+        }
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({"type":"object","properties":{"k":{"type":"string"}}})
+        }
+        fn safety(&self, _args: &serde_json::Value) -> Safety {
+            Safety::ReadOnly
+        }
+        fn max_safety(&self) -> Safety {
+            Safety::ReadOnly
+        }
+        async fn run(&self, _args: serde_json::Value, _root: &Path) -> ff_tools::ToolOutcome {
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            ff_tools::ToolOutcome::ok("read done")
         }
     }
 
@@ -2254,6 +2466,179 @@ mod tests {
             .any(|m| m.role == Role::Tool && m.content == "[cancelled]"));
         // The final bubble is never empty.
         assert!(!msg.content.is_empty());
+    }
+
+    /// #A1: two read-only tool calls in one turn run concurrently (timed), and each
+    /// requested call id gets exactly one tool result.
+    #[tokio::test]
+    async fn parallel_readonly_calls_run_concurrently() {
+        struct TwoReadsThenText {
+            calls: AtomicUsize,
+        }
+        #[async_trait]
+        impl Provider for TwoReadsThenText {
+            async fn chat_stream(&self, _req: ChatRequest) -> Result<ChunkStream, LlmError> {
+                let n = self.calls.fetch_add(1, Ordering::SeqCst);
+                let chunks = if n == 0 {
+                    vec![Ok(Chunk {
+                        tool_calls: vec![
+                            ToolCallDelta {
+                                index: 0,
+                                id: Some("r1".into()),
+                                name: Some("slow_read".into()),
+                                arguments: r#"{"k":"a"}"#.into(),
+                            },
+                            ToolCallDelta {
+                                index: 1,
+                                id: Some("r2".into()),
+                                name: Some("slow_read".into()),
+                                arguments: r#"{"k":"b"}"#.into(),
+                            },
+                        ],
+                        done: true,
+                        ..Chunk::default()
+                    })]
+                } else {
+                    vec![Ok(Chunk {
+                        delta: "done reading".into(),
+                        done: true,
+                        ..Chunk::default()
+                    })]
+                };
+                Ok(futures_util::stream::iter(chunks).boxed())
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::new();
+        let s = store.create_session(None);
+        store.add_message(&s.id, Role::User, "read two".into());
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(SlowRead));
+        let approve = AlwaysApprove;
+        let provider = TwoReadsThenText {
+            calls: AtomicUsize::new(0),
+        };
+
+        let start = std::time::Instant::now();
+        let msg = run_turn(
+            &provider,
+            &store,
+            &ctx(&registry, dir.path(), &approve),
+            &s.id,
+            "mock",
+            None,
+            false,
+            CancelToken::new(),
+            |_| {},
+        )
+        .await
+        .unwrap();
+        let elapsed = start.elapsed();
+
+        // Two 150ms reads concurrently ~= 150ms; serial would be ~300ms.
+        assert!(
+            elapsed < std::time::Duration::from_millis(280),
+            "read-only calls must run concurrently, took {elapsed:?}"
+        );
+        // Exactly one tool result per requested id.
+        let history = store.get_messages(&s.id);
+        let replied: Vec<String> = history
+            .iter()
+            .filter(|m| m.role == Role::Tool)
+            .filter_map(|m| m.tool_call_id.clone())
+            .collect();
+        assert_eq!(replied.len(), 2, "one result per call: {replied:?}");
+        assert!(replied.iter().any(|r| r == "r1"));
+        assert!(replied.iter().any(|r| r == "r2"));
+        assert_eq!(msg.content, "done reading");
+    }
+
+    /// #A1: a turn mixing a read-only call and a write call keeps the write on the
+    /// serial, approval-gated path; the read-only call never reaches the approver.
+    #[tokio::test]
+    async fn mixed_read_and_write_keeps_write_gated() {
+        struct ReadAndWriteThenText {
+            calls: AtomicUsize,
+        }
+        #[async_trait]
+        impl Provider for ReadAndWriteThenText {
+            async fn chat_stream(&self, _req: ChatRequest) -> Result<ChunkStream, LlmError> {
+                let n = self.calls.fetch_add(1, Ordering::SeqCst);
+                let chunks = if n == 0 {
+                    vec![Ok(Chunk {
+                        tool_calls: vec![
+                            ToolCallDelta {
+                                index: 0,
+                                id: Some("r1".into()),
+                                name: Some("slow_read".into()),
+                                arguments: r#"{"k":"a"}"#.into(),
+                            },
+                            ToolCallDelta {
+                                index: 1,
+                                id: Some("w1".into()),
+                                name: Some("bash".into()),
+                                arguments: r#"{"command":"touch made_by_write"}"#.into(),
+                            },
+                        ],
+                        done: true,
+                        ..Chunk::default()
+                    })]
+                } else {
+                    vec![Ok(Chunk {
+                        delta: "did both".into(),
+                        done: true,
+                        ..Chunk::default()
+                    })]
+                };
+                Ok(futures_util::stream::iter(chunks).boxed())
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::new();
+        let s = store.create_session(None);
+        store.add_message(&s.id, Role::User, "read and write".into());
+        let mut registry = ToolRegistry::with_defaults();
+        registry.register(Box::new(SlowRead));
+        let consulted = Arc::new(AtomicBool::new(false));
+        let approve = RecordingApprover {
+            consulted: consulted.clone(),
+        };
+        let provider = ReadAndWriteThenText {
+            calls: AtomicUsize::new(0),
+        };
+
+        run_turn(
+            &provider,
+            &store,
+            &ctx(&registry, dir.path(), &approve),
+            &s.id,
+            "mock",
+            None,
+            false,
+            CancelToken::new(),
+            |_| {},
+        )
+        .await
+        .unwrap();
+
+        // The write went through the approval gate; the read-only call did not need it.
+        assert!(
+            consulted.load(Ordering::SeqCst),
+            "the write call must be approval-gated on the serial path"
+        );
+        // Both calls produced a tool result.
+        let history = store.get_messages(&s.id);
+        let replied: Vec<String> = history
+            .iter()
+            .filter(|m| m.role == Role::Tool)
+            .filter_map(|m| m.tool_call_id.clone())
+            .collect();
+        assert!(replied.iter().any(|r| r == "r1"));
+        assert!(replied.iter().any(|r| r == "w1"));
+        // The approved write actually ran.
+        assert!(dir.path().join("made_by_write").exists());
     }
 
     /// Dropping the `run_turn` future mid tool-loop (window closed, runtime torn
