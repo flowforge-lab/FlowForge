@@ -375,9 +375,80 @@ pub(crate) fn image_media_type(media_type: &str) -> Option<&'static str> {
     }
 }
 
+/// Conservative context-window fallback (in tokens) for a model whose family we
+/// don't recognize. Small enough that a tiny local model won't overflow, and the
+/// agent's compaction still has a real ceiling to measure against.
+pub const DEFAULT_CONTEXT_WINDOW_TOKENS: u64 = 32_000;
+
+/// Best-effort context window (in tokens) for a model id, keyed on the family
+/// substring rather than the exact id so new point-releases inherit the right
+/// window without a code change. Used to size the agent's compaction budget so a
+/// large-window model isn't force-compacted at a tiny fixed ceiling (and a small
+/// one isn't allowed to overflow). The window is a property of the *model*, not
+/// the transport, so this is shared across providers; a provider with a quirky
+/// deployment can still override [`Provider::context_window`].
+///
+/// Values are the raw served context windows (verified against the SiliconFlow API
+/// on 2026-06-24 for the open-weight families, official docs for Claude/OpenAI).
+/// The agent applies its own headroom (`CONTEXT_BUDGET_SAFETY`) on top, so these
+/// are stored undiscounted -- discounting here would double-count. When in doubt a
+/// family is omitted and falls through to [`DEFAULT_CONTEXT_WINDOW_TOKENS`].
+pub fn model_context_window(model: &str) -> u64 {
+    let m = model.to_lowercase();
+    // Order matters: match the most specific family substrings first. A flat
+    // per-vendor window does not hold -- e.g. GLM-4.5-Air serves only 96K while
+    // GLM-5.2 serves 1M, so a single `glm` rule would either overflow the small
+    // model or starve the large one.
+    if m.contains("glm-5.2") {
+        1_048_576
+    } else if m.contains("glm-4.5-air") {
+        // Must precede the generic `glm` rule: its 96K window is below the old
+        // flat 128K, so inheriting 128K would push the budget past the real cap.
+        98_304
+    } else if m.contains("glm-5") || m.contains("glm-5v") || m.contains("glm-4.6") {
+        202_752
+    } else if m.contains("glm") {
+        // GLM-4.5 and older standard deployments.
+        131_072
+    } else if m.contains("deepseek-v4") {
+        1_000_000
+    } else if m.contains("deepseek") {
+        163_840
+    } else if m.contains("kimi") {
+        262_144
+    } else if m.contains("minimax-m3") {
+        700_000
+    } else if m.contains("minimax") {
+        196_608
+    } else if m.contains("claude")
+        || m.contains("anthropic")
+        || m.contains("opus")
+        || m.contains("sonnet")
+        || m.contains("haiku")
+    {
+        // 200K is the standard window across Claude 3/3.5/3.7/4/4.5; the 1M window
+        // is Sonnet-4/4.5 beta-only (gated header + higher tier) and Bedrock's
+        // standard is also 200K, so 200K is the safe shared value.
+        200_000
+    } else if m.contains("gpt-4o") || m.contains("gpt-4.1") || m.contains("o1") || m.contains("o3")
+    {
+        128_000
+    } else {
+        DEFAULT_CONTEXT_WINDOW_TOKENS
+    }
+}
+
 #[async_trait]
 pub trait Provider: Send + Sync {
     async fn chat_stream(&self, req: ChatRequest) -> Result<ChunkStream, LlmError>;
+
+    /// The model's context window in tokens, used by the agent to size its
+    /// compaction budget so a capable large-window model isn't penalized by a
+    /// fixed ceiling. Defaults to the shared [`model_context_window`] family
+    /// lookup; a provider with a non-standard deployment may override.
+    fn context_window(&self, model: &str) -> u64 {
+        model_context_window(model)
+    }
 
     /// Whether the active model accepts image/document attachments. Hosts read
     /// this to warn the user when a turn's attachments will be stripped before
@@ -441,6 +512,76 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn model_context_window_maps_known_families_and_defaults() {
+        // Family substrings (case-insensitive), not exact ids, so point releases inherit.
+        // Values are the raw served windows probed on 2026-06-24.
+        assert_eq!(model_context_window("zai-org/GLM-5.2"), 1_048_576);
+        assert_eq!(model_context_window("zai-org/GLM-5"), 202_752);
+        assert_eq!(model_context_window("zai-org/GLM-4.5"), 131_072);
+        assert_eq!(
+            model_context_window("deepseek-ai/DeepSeek-V4-Pro"),
+            1_000_000
+        );
+        assert_eq!(model_context_window("deepseek-ai/DeepSeek-V3.2"), 163_840);
+        assert_eq!(model_context_window("moonshotai/Kimi-K2.7-Code"), 262_144);
+        assert_eq!(model_context_window("MiniMaxAI/MiniMax-M3"), 700_000);
+        assert_eq!(model_context_window("MiniMaxAI/MiniMax-M2.5"), 196_608);
+        assert_eq!(model_context_window("anthropic.claude-opus-4"), 200_000);
+        assert_eq!(model_context_window("gpt-4o-mini"), 128_000);
+        // Unknown family falls back to the conservative default.
+        assert_eq!(
+            model_context_window("some-local-7b"),
+            DEFAULT_CONTEXT_WINDOW_TOKENS
+        );
+    }
+
+    /// GLM-4.5-Air must NOT inherit a generic `glm` window: its served cap (98,304)
+    /// is below the budget the old flat 128K rule produced (128_000 * 0.8 = 102,400),
+    /// which would have pushed the agent's budget *above* the real window and let the
+    /// request overflow before compaction ever engaged. The more specific rule wins.
+    #[test]
+    fn glm_4_5_air_is_not_oversized_by_generic_glm_rule() {
+        assert_eq!(model_context_window("zai-org/GLM-4.5-Air"), 98_304);
+        assert_ne!(model_context_window("zai-org/GLM-4.5-Air"), 131_072);
+    }
+
+    /// Regression guard: no rule may report a window larger than the cap the
+    /// provider actually serves. A budget computed from an oversized window never
+    /// triggers compaction in time, so this catches the GLM-4.5-Air class of bug
+    /// for every family we have probed.
+    #[test]
+    fn no_family_window_exceeds_probed_served_cap() {
+        // (model id, served `max_prompt_tokens` measured against the live API)
+        let probed: &[(&str, u64)] = &[
+            ("zai-org/GLM-5.2", 1_048_576),
+            ("zai-org/GLM-5.1", 202_752),
+            ("zai-org/GLM-5", 202_752),
+            ("zai-org/GLM-5V-Turbo", 202_752),
+            ("zai-org/GLM-4.5-Air", 98_304),
+            ("deepseek-ai/DeepSeek-V4-Pro", 1_000_000),
+            ("deepseek-ai/DeepSeek-V4-Flash", 1_048_576),
+            ("deepseek-ai/DeepSeek-V3.2", 163_840),
+            ("moonshotai/Kimi-K2.7-Code", 262_144),
+            ("MiniMaxAI/MiniMax-M3", 700_000),
+            ("MiniMaxAI/MiniMax-M2.5", 196_608),
+        ];
+        for (model, served) in probed {
+            assert!(
+                model_context_window(model) <= *served,
+                "{model}: reported window {} exceeds served cap {served}",
+                model_context_window(model),
+            );
+        }
+    }
+
+    #[test]
+    fn context_window_trait_default_delegates_to_family_lookup() {
+        let p = OpenAiProvider::candle_vllm();
+        assert_eq!(p.context_window("zai-org/GLM-5.2"), 1_048_576);
+        assert_eq!(p.context_window("unknown"), DEFAULT_CONTEXT_WINDOW_TOKENS);
+    }
 
     fn img_attachment() -> ff_core::Attachment {
         ff_core::Attachment {
