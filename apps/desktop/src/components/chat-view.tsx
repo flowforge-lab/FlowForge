@@ -1,4 +1,4 @@
-import { memo, useEffect, useRef, useState } from "react";
+import { memo, useEffect, useMemo, useRef, useState } from "react";
 import { ChevronDown } from "@/components/ui/icon";
 import { cn } from "@/lib/utils";
 import { useChatStore } from "@/store/chat";
@@ -11,6 +11,7 @@ import { Markdown } from "@/components/markdown";
 import { MessageActions } from "@/components/message-actions";
 import { MessageAttachments } from "@/components/message-attachments";
 import { ThinkingIndicator } from "@/components/thinking-indicator";
+import { foldTurns } from "@/lib/turn-groups";
 import type { Message } from "@/bindings";
 
 const NO_STEPS: ToolStep[] = [];
@@ -197,6 +198,11 @@ export function ChatView({ sessionId }: { sessionId?: string } = {}) {
   const approveAlways = useChatStore((s) => s.approveAlways);
   const respondAsk = useChatStore((s) => s.respondAsk);
 
+  // Fold the transcript into per-turn render groups (#413). Reloaded multi-step
+  // turns (no live `toolSteps`) carry steps reconstructed from the persisted
+  // tool/system messages so they render through the same StepGroup as live turns.
+  const groups = useMemo(() => foldTurns(messages ?? []), [messages]);
+
   const scrollRef = useRef<HTMLDivElement>(null);
   const pinnedToBottom = useRef(true);
   // Render-state mirror of `pinnedToBottom` so the floating "Jump to latest" button
@@ -266,22 +272,35 @@ export function ChatView({ sessionId }: { sessionId?: string } = {}) {
         className="min-h-0 flex-1 overflow-y-auto"
       >
         <div className="mx-auto flex max-w-3xl flex-col gap-3 px-4 py-4">
-          {messages.map((m) => (
-            <MessageRow
-              key={m.id}
-              message={m}
-              streaming={m.id === streamingId}
-              toolSteps={toolStepsByMessage[m.id] ?? NO_STEPS}
-              turnStartMs={
-                turnStartByMessage[m.id] ?? turnStartBySession[m.sessionId]
-              }
-              reasoning={reasoningByMessage[m.id] ?? ""}
-              respondApproval={respondApproval}
-              approveSession={approveSession}
-              approveAlways={approveAlways}
-              respondAsk={respondAsk}
-            />
-          ))}
+          {groups.map((g) => {
+            const m = g.message;
+            // Live steps always win over reconstruction (they survive a same-run
+            // session switch); reconstructed steps drive a reloaded turn.
+            const liveSteps = toolStepsByMessage[m.id] ?? NO_STEPS;
+            const reconstructed = g.kind === "assistant" ? g.steps : NO_STEPS;
+            const toolSteps = liveSteps.length > 0 ? liveSteps : reconstructed;
+            // Prefer live reasoning when present; fall back to the reasoning
+            // persisted on the assistant message for a reloaded turn (#375).
+            const reasoning =
+              reasoningByMessage[m.id] ??
+              (g.kind === "assistant" ? g.reasoning : "");
+            return (
+              <MessageRow
+                key={m.id}
+                message={m}
+                streaming={m.id === streamingId}
+                toolSteps={toolSteps}
+                turnStartMs={
+                  turnStartByMessage[m.id] ?? turnStartBySession[m.sessionId]
+                }
+                reasoning={reasoning}
+                respondApproval={respondApproval}
+                approveSession={approveSession}
+                approveAlways={approveAlways}
+                respondAsk={respondAsk}
+              />
+            );
+          })}
           {pending && <ThinkingIndicator />}
         </div>
       </div>
