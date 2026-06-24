@@ -13,6 +13,9 @@ import { MessageAttachments } from "@/components/message-attachments";
 import { ThinkingIndicator } from "@/components/thinking-indicator";
 import { foldTurns } from "@/lib/turn-groups";
 import type { TurnItem } from "@/lib/turn-groups";
+import { useExperimentalStore } from "@/store/experimental";
+import { useModelConfigStore, activeConnection } from "@/store/model-config";
+import { downloadStepTimeline } from "@/lib/export-step-timeline";
 import type { Message } from "@/bindings";
 
 const NO_STEPS: ToolStep[] = [];
@@ -25,6 +28,9 @@ function MessageRowImpl({
   items,
   turnStartMs,
   reasoning,
+  exportEnabled,
+  exportModel,
+  exportTiming,
   respondApproval,
   approveSession,
   approveAlways,
@@ -36,6 +42,10 @@ function MessageRowImpl({
   items: TurnItem[];
   turnStartMs?: number | null;
   reasoning: string;
+  /** Dev step-timeline export gated by the experimental flag (#417). */
+  exportEnabled: boolean;
+  exportModel: string | null;
+  exportTiming: "exact" | "approx-created-at";
   respondApproval: (
     sessionId: string,
     messageId: string,
@@ -136,6 +146,21 @@ function MessageRowImpl({
               reasoning={reasoning}
               hasAnswer={message.content.length > 0}
               answer={message.content}
+              onExportTimeline={
+                exportEnabled
+                  ? (format) =>
+                      void downloadStepTimeline(
+                        toolSteps,
+                        {
+                          sessionId: message.sessionId,
+                          model: exportModel,
+                          timing: exportTiming,
+                          capturedAt: Date.now(),
+                        },
+                        format,
+                      )
+                  : undefined
+              }
               onRespond={onRespond}
               onApproveSession={onApproveSession}
               onApproveAlways={onApproveAlways}
@@ -203,6 +228,12 @@ export function ChatView({ sessionId }: { sessionId?: string } = {}) {
   const turnStartByMessage = useChatStore((s) => s.turnStartByMessage);
   const turnStartBySession = useChatStore((s) => s.turnStartBySession);
   const reasoningByMessage = useChatStore((s) => s.reasoningByMessage);
+  // Dev step-timeline export (#417): the affordance shows only with the flag on; the
+  // active model id is stamped into the dump's meta.
+  const exportEnabled = useExperimentalStore((s) => s.flags.stepTimelineExport);
+  const exportModel = useModelConfigStore(
+    (s) => activeConnection(s.registry)?.model ?? null,
+  );
   const respondApproval = useChatStore((s) => s.respondApproval);
   const approveSession = useChatStore((s) => s.approveSession);
   const approveAlways = useChatStore((s) => s.approveAlways);
@@ -297,6 +328,9 @@ export function ChatView({ sessionId }: { sessionId?: string } = {}) {
             const reasoning =
               reasoningByMessage[m.id] ??
               (g.kind === "assistant" ? g.reasoning : "");
+            // Live steps (this session) carry exact wall-clock timing; a reloaded
+            // turn's steps are reconstructed from `createdAt`, so tag it approx (#417).
+            const liveTiming = (toolStepsByMessage[m.id]?.length ?? 0) > 0;
             return (
               <MessageRow
                 key={m.id}
@@ -308,6 +342,9 @@ export function ChatView({ sessionId }: { sessionId?: string } = {}) {
                   turnStartByMessage[m.id] ?? turnStartBySession[m.sessionId]
                 }
                 reasoning={reasoning}
+                exportEnabled={exportEnabled}
+                exportModel={exportModel}
+                exportTiming={liveTiming ? "exact" : "approx-created-at"}
                 respondApproval={respondApproval}
                 approveSession={approveSession}
                 approveAlways={approveAlways}

@@ -8,14 +8,18 @@ import { persist } from "zustand/middleware";
 
 const STORAGE_KEY = "ff-experimental";
 
-/** The six opt-in flags. Keep in sync with the rows in experimental-section.tsx. */
+/** The opt-in flags. Keep in sync with the rows in experimental-section.tsx. */
 export type FlagId =
   | "ownApiKey"
   | "spotlight"
   | "preventSleep"
   | "remoteExecution"
   | "backgroundObservers"
-  | "smartSkillSurfacing";
+  | "smartSkillSurfacing"
+  // FE-only dev affordance (#417): gates the step-timeline download on the
+  // StepGroup header. Unlike the others it gates a shipped FE behavior, not a
+  // future backend.
+  | "stepTimelineExport";
 
 export const FLAG_IDS: readonly FlagId[] = [
   "ownApiKey",
@@ -24,6 +28,7 @@ export const FLAG_IDS: readonly FlagId[] = [
   "remoteExecution",
   "backgroundObservers",
   "smartSkillSurfacing",
+  "stepTimelineExport",
 ];
 
 export type ExperimentalFlags = Record<FlagId, boolean>;
@@ -36,6 +41,7 @@ export const EXPERIMENTAL_DEFAULTS: ExperimentalFlags = {
   remoteExecution: false,
   backgroundObservers: false,
   smartSkillSurfacing: false,
+  stepTimelineExport: false,
 };
 
 export interface ExperimentalState {
