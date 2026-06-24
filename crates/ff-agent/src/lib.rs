@@ -481,12 +481,22 @@ impl Drop for ToolResultBackfill<'_> {
 }
 
 /// Whether a given loop iteration should request model reasoning (#D1). Reasoning
-/// is reserved for the steps where it pays off: the **first** iteration (initial
-/// planning, before any tool result exists) and the **wrap-up** step near the cap
-/// (final synthesis). The mid-loop tool-dispatch steps -- "I have a tool result,
-/// issue the next call" -- skip it, since reasoning there is mostly latency on a
-/// slow model. `iter` is 0-based; `remaining` counts iterations left including the
-/// current one (so `remaining == 1` is the last step).
+/// is requested on the **first** iteration (initial planning, before any tool
+/// result exists) and on the **cap-forced wrap-up** step (`remaining <=
+/// WRAP_UP_AT_REMAINING`); every other iteration -- the mid-loop tool-dispatch
+/// steps, "I have a tool result, issue the next call" -- skips it, since reasoning
+/// there is mostly latency on a slow model.
+///
+/// Deliberate limitation (conscious choice, reviewed on #449): in a single-pass
+/// loop we cannot know *before* a model call whether that step will dispatch more
+/// tools or emit the final answer -- the model decides by whether it returns tool
+/// calls. So a turn that finishes naturally *before* the cap (the common case)
+/// synthesizes its answer with reasoning OFF; only the planning step and a
+/// cap-forced finish reason. That trades a dedicated reasoning pass on the natural
+/// synthesis step for the latency win, and is trivially reversible (gate the
+/// request on `enable_reasoning` instead of `step_thinking`) if validation shows a
+/// quality regression. `iter` is 0-based; `remaining` counts iterations left
+/// including the current one (so `remaining == 1` is the last step).
 fn should_reason(iter: usize, remaining: usize) -> bool {
     iter == 0 || remaining <= WRAP_UP_AT_REMAINING
 }
@@ -694,12 +704,15 @@ pub async fn run_turn(
         // so a long turn ends with a real reply instead of "[stopped: reached
         // tool-call limit]" cut mid-tool (#244 R3). Transient: request-only.
         let remaining = max_iter - iter; // iterations left, including this one
-                                         // Adaptive per-step reasoning (#D1): when the master switch is on, only the
-                                         // planning step (first iteration) and the final-synthesis step (the wrap-up,
-                                         // near the cap) reason. The 20-50 mid-loop tool-dispatch steps ("I have a
-                                         // result, what next") skip reasoning entirely -- that is pure latency on a
-                                         // slow model. Effort, where reasoning IS on, stays whatever the connection
-                                         // set (Medium by default); this gates only *whether* a step reasons.
+
+        // Adaptive per-step reasoning (#D1): with the master switch on, reason only
+        // on the planning step (first iteration) and the cap-forced wrap-up step;
+        // the mid-loop tool-dispatch steps skip reasoning, which is pure latency on
+        // a slow model. A turn that finishes naturally before the cap therefore
+        // answers with reasoning off (see `should_reason` for why the synthesis step
+        // can't be targeted a priori). Effort, where reasoning IS on, stays whatever
+        // the connection set (Medium by default); this gates only *whether* a step
+        // reasons.
         let step_thinking = enable_reasoning && should_reason(iter, remaining);
         if remaining <= WRAP_UP_AT_REMAINING && max_iter > 1 {
             messages.push(ChatMessage {
