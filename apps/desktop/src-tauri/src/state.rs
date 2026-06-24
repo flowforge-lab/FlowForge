@@ -282,14 +282,15 @@ fn connection_to_config(conn: &ProviderConnection) -> ProviderConfig {
     }
 }
 
-/// `~/.config/flowforge/provider.json` — the legacy single-provider file. Still
+/// `<config dir>/flowforge/provider.json` — the legacy single-provider file
+/// (`~/Library/Application Support` on macOS, `~/.config` on Linux). Still
 /// read for one-time migration into the registry, and left in place afterward as a
 /// backup. `None` only when the OS exposes no config dir.
 fn config_path() -> Option<PathBuf> {
     dirs::config_dir().map(|d| d.join("flowforge").join("provider.json"))
 }
 
-/// `~/.config/flowforge/provider-registry.json` — the persisted connection registry
+/// `<config dir>/flowforge/provider-registry.json` — the persisted connection registry
 /// (replaces `provider.json`). `None` only when the OS exposes no config dir, in
 /// which case settings stay in-memory for the session.
 fn registry_path() -> Option<PathBuf> {
@@ -305,26 +306,82 @@ fn load_or_migrate_registry() -> ProviderRegistry {
     load_or_migrate_registry_at(registry_path(), config_path())
 }
 
+/// Outcome of reading the persisted registry file: cleanly loaded, genuinely
+/// absent, or present-but-unreadable. Distinguishing the last case is what keeps
+/// a corrupt or half-written file from silently masquerading as "no config" and
+/// wiping the user's connections back to the factory default.
+enum RegistryRead {
+    Loaded(ProviderRegistry),
+    Absent,
+    Corrupt,
+}
+
+/// Read and parse the registry file without ever destroying data on failure. A
+/// file that exists but cannot be read or parsed (e.g. truncated by a crash
+/// mid-write) is renamed to a `*.corrupt-<unix>.json` sibling and reported as
+/// [`RegistryRead::Corrupt`] so the caller seeds a fresh default without
+/// overwriting the preserved bytes.
+fn read_registry_file(path: Option<&Path>) -> RegistryRead {
+    let Some(path) = path else {
+        return RegistryRead::Absent;
+    };
+    let raw = match fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return RegistryRead::Absent,
+        Err(e) => {
+            tracing::error!(path = %path.display(), error = %e,
+                "provider registry unreadable; quarantining and seeding default");
+            quarantine_registry(path);
+            return RegistryRead::Corrupt;
+        }
+    };
+    match serde_json::from_str::<ProviderRegistry>(&raw) {
+        Ok(registry) => RegistryRead::Loaded(registry),
+        Err(e) => {
+            tracing::error!(path = %path.display(), error = %e,
+                "provider registry unparseable; quarantining and seeding default");
+            quarantine_registry(path);
+            RegistryRead::Corrupt
+        }
+    }
+}
+
+/// Preserve an unreadable registry file by renaming it alongside the original
+/// rather than letting the next save truncate it. Best-effort: a rename failure
+/// is logged but never fatal.
+fn quarantine_registry(path: &Path) {
+    let unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let preserved = path.with_extension(format!("corrupt-{unix}.json"));
+    match fs::rename(path, &preserved) {
+        Ok(()) => {
+            tracing::warn!(preserved = %preserved.display(), "preserved unreadable provider registry")
+        }
+        Err(e) => tracing::warn!(path = %path.display(), error = %e,
+            "could not preserve unreadable provider registry"),
+    }
+}
+
 /// Path-injectable core of [`load_or_migrate_registry`] so tests can drive it with
 /// tempdir paths instead of the real config dir.
 fn load_or_migrate_registry_at(
     reg_path: Option<PathBuf>,
     cfg_path: Option<PathBuf>,
 ) -> ProviderRegistry {
-    let mut registry = if let Some(registry) = reg_path
-        .as_ref()
-        .and_then(|p| fs::read_to_string(p).ok())
-        .and_then(|s| serde_json::from_str::<ProviderRegistry>(&s).ok())
-    {
-        registry
-    } else if let Some(config) = cfg_path
-        .as_ref()
-        .and_then(|p| fs::read_to_string(p).ok())
-        .and_then(|s| serde_json::from_str::<ProviderConfig>(&s).ok())
-    {
-        build_migrated_registry(config)
-    } else {
-        ProviderRegistry::default()
+    let mut registry = match read_registry_file(reg_path.as_deref()) {
+        RegistryRead::Loaded(registry) => registry,
+        // Only a genuinely absent registry falls through to legacy migration; a
+        // quarantined (corrupt) one seeds a clean default so stale legacy state is
+        // never re-migrated over a registry the user was actively using.
+        RegistryRead::Absent => cfg_path
+            .as_ref()
+            .and_then(|p| fs::read_to_string(p).ok())
+            .and_then(|s| serde_json::from_str::<ProviderConfig>(&s).ok())
+            .map(build_migrated_registry)
+            .unwrap_or_default(),
+        RegistryRead::Corrupt => ProviderRegistry::default(),
     };
     // OR-upgrade `supports_vision` from the model capability map so older saves
     // (which always persisted `false`) reflect the model'"'"'s actual capability for
@@ -350,22 +407,37 @@ fn build_migrated_registry(config: ProviderConfig) -> ProviderRegistry {
     }
 }
 
+/// Atomically write `contents` to `path`: write a sibling `.tmp` file, then
+/// rename it over the target. Rename is atomic on the same filesystem, so a
+/// crash or kill mid-write leaves the previous (valid) file intact instead of a
+/// truncated one — the root cause behind config silently resetting to default.
+fn write_atomic(path: &Path, contents: &str) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension("tmp");
+    fs::write(&tmp, contents)?;
+    fs::rename(&tmp, path)
+}
+
 /// Persists the connection registry. Best-effort: a write failure leaves the
 /// in-memory registry authoritative for this session rather than failing the
-/// command (mirrors the search-config write path).
+/// command (mirrors the search-config write path). Written atomically so an
+/// interrupted save never corrupts the existing file.
 fn save_registry(registry: &ProviderRegistry) {
     let Some(path) = registry_path() else {
         return;
     };
-    if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-    if let Ok(json) = serde_json::to_string_pretty(registry) {
-        let _ = fs::write(path, json);
+    let Ok(json) = serde_json::to_string_pretty(registry) else {
+        return;
+    };
+    if let Err(e) = write_atomic(&path, &json) {
+        tracing::warn!(path = %path.display(), error = %e,
+            "provider registry save failed; in-memory state authoritative this session");
     }
 }
 
-/// `~/.config/flowforge/search.json` — persisted, non-secret web-search settings.
+/// `<config dir>/flowforge/search.json` — persisted, non-secret web-search settings.
 /// `None` only when the OS exposes no config dir (settings stay in-memory then).
 fn search_config_path() -> Option<PathBuf> {
     dirs::config_dir().map(|d| d.join("flowforge").join("search.json"))
@@ -380,16 +452,17 @@ fn load_search_config() -> SearchConfig {
         .unwrap_or_default()
 }
 
-/// Persists web-search settings. Best-effort, like [`save_registry`].
+/// Persists web-search settings. Best-effort and atomic, like [`save_registry`].
 fn save_search_config(config: &SearchConfig) {
     let Some(path) = search_config_path() else {
         return;
     };
-    if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-    if let Ok(json) = serde_json::to_string_pretty(config) {
-        let _ = fs::write(path, json);
+    let Ok(json) = serde_json::to_string_pretty(config) else {
+        return;
+    };
+    if let Err(e) = write_atomic(&path, &json) {
+        tracing::warn!(path = %path.display(), error = %e,
+            "search config save failed; in-memory state authoritative this session");
     }
 }
 
@@ -2564,6 +2637,72 @@ mod tests {
             Some(tmp.path().join("provider.json")),
         );
         assert_eq!(loaded, ProviderRegistry::default());
+    }
+
+    #[test]
+    fn corrupt_registry_is_quarantined_not_overwritten() {
+        let tmp = tempfile::tempdir().unwrap();
+        let reg_path = tmp.path().join("provider-registry.json");
+        // A truncated / half-written file (the crash-mid-write failure mode).
+        fs::write(&reg_path, "{ \"connections\": [ {").unwrap();
+
+        let loaded = load_or_migrate_registry_at(Some(reg_path.clone()), None);
+
+        // A corrupt file seeds a clean default rather than silently nuking config.
+        assert_eq!(loaded, ProviderRegistry::default());
+        // The unreadable bytes are preserved in a sibling, never destroyed...
+        let preserved: Vec<_> = fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("provider-registry.corrupt-")
+            })
+            .collect();
+        assert_eq!(
+            preserved.len(),
+            1,
+            "corrupt file should be quarantined once"
+        );
+        // ...and the original path is moved aside (so the next save starts clean).
+        assert!(!reg_path.exists());
+    }
+
+    #[test]
+    fn corrupt_registry_does_not_trigger_legacy_migration() {
+        let tmp = tempfile::tempdir().unwrap();
+        let reg_path = tmp.path().join("provider-registry.json");
+        let cfg_path = tmp.path().join("provider.json");
+        fs::write(&reg_path, "not json at all").unwrap();
+        // A legacy config exists, but a *corrupt* registry must not re-migrate it
+        // over the user's (now quarantined) active registry — seed default instead.
+        fs::write(
+            &cfg_path,
+            serde_json::to_string(&ProviderConfig {
+                kind: ProviderKind::Ollama,
+                model: "legacy".into(),
+                ..Default::default()
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        let loaded = load_or_migrate_registry_at(Some(reg_path), Some(cfg_path));
+        assert_eq!(loaded, ProviderRegistry::default());
+    }
+
+    #[test]
+    fn write_atomic_replaces_existing_and_leaves_no_tmp() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("provider-registry.json");
+        write_atomic(&path, "first").unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "first");
+        // A second write fully replaces the contents (no append / partial state)...
+        write_atomic(&path, "second").unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "second");
+        // ...and never leaves the intermediate .tmp file behind.
+        assert!(!tmp.path().join("provider-registry.tmp").exists());
     }
 
     #[test]
