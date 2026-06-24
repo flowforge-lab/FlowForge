@@ -415,6 +415,7 @@ export class MockIpc implements FfIpc {
         model: "Qwen3-4B-Instruct-2507",
         hasKey: false,
         thinking: true,
+        reasoningEffort: "medium",
         supportsVision: false,
       },
       {
@@ -424,6 +425,7 @@ export class MockIpc implements FfIpc {
         model: "llama3.2",
         hasKey: false,
         thinking: true,
+        reasoningEffort: "medium",
         supportsVision: false,
       },
       {
@@ -433,6 +435,7 @@ export class MockIpc implements FfIpc {
         model: "us.anthropic.claude-sonnet-4-0",
         hasKey: false,
         thinking: true,
+        reasoningEffort: "low",
         supportsVision: false,
         region: "us-east-1",
         authMode: "profile",
@@ -450,6 +453,7 @@ export class MockIpc implements FfIpc {
         model: "deepseek-ai/DeepSeek-V3",
         hasKey: false,
         thinking: true,
+        reasoningEffort: "high",
         supportsVision: false,
       },
       // OpenAI (#311 PR-3b): a hosted, OpenAI-compatible connection so the
@@ -464,6 +468,7 @@ export class MockIpc implements FfIpc {
         model: "gpt-4o",
         hasKey: false,
         thinking: true,
+        reasoningEffort: "medium",
         // gpt-4o is vision-capable.
         supportsVision: true,
       },
