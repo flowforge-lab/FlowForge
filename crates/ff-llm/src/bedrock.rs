@@ -818,7 +818,8 @@ fn cache_point() -> Option<CachePointBlock> {
 /// v1, Opus 3, Haiku 3) that predate caching.
 fn model_supports_cache_point(model: &str) -> bool {
     let m = model.to_ascii_lowercase();
-    // Amazon Nova (text sizes) support prompt caching.
+    // Amazon Nova (text sizes) support prompt caching. New text sizes must be
+    // added here explicitly -- multimodal Nova variants (canvas/reel) are out.
     if m.contains("nova-micro") || m.contains("nova-lite") || m.contains("nova-pro") {
         return true;
     }
@@ -831,11 +832,30 @@ fn model_supports_cache_point(model: &str) -> bool {
     if SUPPORTED.iter().any(|s| m.contains(s)) {
         return true;
     }
-    // Claude 4+ (Opus/Sonnet/Haiku) and the named adaptive lines all support it.
-    uses_adaptive_thinking(&m)
-        || m.contains("opus-4")
-        || m.contains("sonnet-4")
-        || m.contains("haiku-4")
+    // Every Claude 4+ family supports cachePoint. `uses_adaptive_thinking` only
+    // covers the opus/sonnet adaptive lines (and mythos/fable), so cache support
+    // for any 4+ family -- including a future haiku-5+ -- is matched separately by
+    // major version rather than the old `*-4` substrings (which missed 5+).
+    uses_adaptive_thinking(&m) || claude_major_ge_4(&m)
+}
+
+/// True when `model` names a Claude opus/sonnet/haiku at major version >= 4.
+/// Matches by version rather than literal `*-4` so future majors (haiku-5, ...)
+/// are covered symmetrically. The `< 100` ceiling rejects the legacy
+/// `claude-3-5-sonnet-<8-digit-date>` ids, whose date parses as a huge "major".
+fn claude_major_ge_4(m: &str) -> bool {
+    for family in ["opus", "sonnet", "haiku"] {
+        if let Some(rest) = m.split(&format!("{family}-")).nth(1) {
+            if let Some(major) = rest.split(['-', '.', ':']).next() {
+                if let Ok(major) = major.parse::<u32>() {
+                    if (4..100).contains(&major) {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
 }
 
 fn to_tool(spec: &serde_json::Value) -> Option<Tool> {
@@ -1402,6 +1422,9 @@ mod tests {
             "anthropic.claude-opus-4-20250514-v1:0",
             "us.anthropic.claude-opus-4-6",
             "anthropic.claude-sonnet-4-20250514-v1:0",
+            // Future majors must be covered symmetrically across families.
+            "anthropic.claude-haiku-5-20260101-v1:0",
+            "us.anthropic.claude-opus-5-20260101-v1:0",
         ] {
             assert!(model_supports_cache_point(m), "expected supported: {m}");
         }
