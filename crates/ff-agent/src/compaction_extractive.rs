@@ -133,7 +133,10 @@ impl ReversibleCache {
     }
 }
 
-fn content_key(original: &str) -> String {
+/// Stable content-hash key for a blob, as carried in the trailing
+/// `[compacted; retrieve key=...]` marker. Shared with the Tier-2 abstractive
+/// path so both tiers key their persisted originals identically.
+pub(crate) fn content_key(original: &str) -> String {
     let mut h = DefaultHasher::new();
     original.hash(&mut h);
     // 16 hex chars are plenty to disambiguate a per-session cache and stay

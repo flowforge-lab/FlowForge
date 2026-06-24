@@ -19,12 +19,16 @@ use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 
 mod compaction;
+mod compaction_abstractive;
 mod compaction_extractive;
 mod system_prompt;
 pub use compaction::{
     flush_due, CompactionContext, CompactionOutcome, CompactionStrategy, ContextPressure,
     ContextPressureEstimator, MemoryFlush, ProxyTokenEstimator, DEFAULT_CONTEXT_BUDGET_TOKENS,
     DEFAULT_FLUSH_AT_FRACTION,
+};
+pub use compaction_abstractive::{
+    build_summary_prompt, summary_due, AbstractiveConfig, AbstractiveSummarizer, SummaryResult,
 };
 pub use compaction_extractive::{
     classify, proxy_tokens, ColdCompaction, CompactionSavings, CompressOutcome, ContentKind,
@@ -224,6 +228,9 @@ pub struct ToolContext<'a> {
     /// Agent autonomy mode (RFC 0011). In [`Mode::Plan`] only ReadOnly tools are
     /// advertised, so the model cannot see or call anything that mutates.
     pub mode: Mode,
+    /// Tier-2 abstractive cold-tail summary config (RFC 0016 M7.0). Default-off;
+    /// the host enables/tunes it. Sub-agents inherit the parent's setting.
+    pub abstractive: AbstractiveConfig,
 }
 
 impl<'a> ToolContext<'a> {
@@ -243,6 +250,7 @@ impl<'a> ToolContext<'a> {
             max_depth: DEFAULT_MAX_DELEGATION_DEPTH,
             allowed: None,
             mode: Mode::default(),
+            abstractive: AbstractiveConfig::default(),
         }
     }
 }
@@ -479,6 +487,13 @@ pub async fn run_turn(
     // flush, so we re-flush on growth rather than every iteration. `None` = never
     // flushed this turn.
     let mut last_flush_count: Option<u64> = None;
+    // Tier-2 abstractive summary cache (RFC 0016 M7.0): the summary covering the
+    // cold prefix and the boundary it covers, plus the transcript length when it
+    // was produced. Reused across iterations until the transcript grows by the
+    // re-flush interval, so a long turn pays for at most one summarizer call per
+    // window instead of one per tool round.
+    let mut last_summary: Option<(usize, Message)> = None;
+    let mut last_summary_count: Option<u64> = None;
     for iter in 0..max_iter {
         turn_count += 1;
         if cancel.is_cancelled() {
@@ -565,6 +580,68 @@ pub async fn run_turn(
             cold.messages
         } else {
             history.clone()
+        };
+
+        // Tier-2 abstractive cold-tail summary (RFC 0016 M7.0): the fallback when
+        // the mechanical, free Tier-1 pass above cannot relieve enough pressure.
+        // Re-estimate pressure on the post-extractive wire and, once over the
+        // (higher) Tier-2 fraction, condense the cold prefix into a single summary
+        // message via the session LLM (or a configured override), keeping the
+        // recent tail verbatim. Request-only, like Tier 1: the store keeps the full
+        // transcript and the collapsed block's original is persisted so
+        // `compaction_retrieve` can fetch it back. Best-effort -- a failed or
+        // cancelled summary falls back to `wire` and never aborts the user's turn.
+        //
+        // A fresh estimator here is deliberate: Tier 1 (above) assesses raw
+        // `history`, but Tier 2 must gate on the projected request size *after*
+        // extractive compression, i.e. the post-Tier-1 `wire`. Both share the same
+        // default 24k budget today; when model-aware budgets land (RFC 0016 6 /
+        // M7.2) every ProxyTokenEstimator::default() site adopts it together.
+        let wire = if tools.abstractive.enabled
+            && ProxyTokenEstimator::default()
+                .assess(&wire, model)
+                .is_over(tools.abstractive.fire_at_fraction)
+        {
+            let reuse = match last_summary.as_ref() {
+                Some((boundary, msg))
+                    if *boundary <= wire.len()
+                        && !summary_due(
+                            message_count,
+                            last_summary_count,
+                            DEFAULT_REFLUSH_INTERVAL_MESSAGES,
+                        ) =>
+                {
+                    // Reuse the cached summary: prepend it and keep everything after
+                    // its fixed boundary verbatim, so messages appended since the
+                    // summary was produced are preserved exactly.
+                    let mut out = Vec::with_capacity(wire.len() - boundary + 1);
+                    out.push(msg.clone());
+                    out.extend_from_slice(&wire[*boundary..]);
+                    Some(out)
+                }
+                _ => None,
+            };
+            match reuse {
+                Some(out) => out,
+                None => {
+                    match AbstractiveSummarizer::new(tools.abstractive.clone())
+                        .summarize_cold(provider, model, &wire, KEEP_RECENT_VERBATIM, &cancel)
+                        .await
+                    {
+                        Ok(Some(result)) => {
+                            if let Some((mid, key, original)) = &result.original {
+                                store.put_compaction_original(session_id, mid, key, original);
+                            }
+                            last_summary = Some((result.boundary, result.messages[0].clone()));
+                            last_summary_count = Some(message_count);
+                            result.messages
+                        }
+                        _ => wire,
+                    }
+                }
+            }
+        } else {
+            wire
         };
         messages.extend(to_chat(&wire));
 
@@ -1091,6 +1168,7 @@ async fn run_subagent(
         max_depth: parent.max_depth,
         allowed,
         mode: parent.mode,
+        abstractive: parent.abstractive.clone(),
     };
 
     // Child events are swallowed: the parent receives only the summary, never the
@@ -1240,6 +1318,7 @@ mod tests {
             max_depth: 1,
             allowed: None,
             mode: Mode::Plan,
+            abstractive: AbstractiveConfig::default(),
         };
 
         run_turn(
@@ -2549,6 +2628,7 @@ mod tests {
             max_depth: 1,
             allowed: None,
             mode: Mode::default(),
+            abstractive: AbstractiveConfig::default(),
         };
 
         run_turn(
@@ -2602,6 +2682,7 @@ mod tests {
             max_depth: 1,
             allowed: Some(["view".to_string()].into_iter().collect()),
             mode: Mode::default(),
+            abstractive: AbstractiveConfig::default(),
         };
 
         run_turn(
@@ -4069,5 +4150,115 @@ mod tests {
                 .all(|m| store.compaction_original(&m.id).is_none()),
             "below pressure, no originals may be persisted"
         );
+    }
+
+    #[tokio::test]
+    async fn tier2_summarizes_cold_prefix_but_store_stays_verbatim() {
+        // Single-line cold messages that the Tier-1 extractive pass leaves alone
+        // (one line each, so its line-elision never triggers): pressure stays high
+        // *after* Tier 1, so the Tier-2 abstractive fallback engages and collapses
+        // the cold prefix into a single summary message.
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::new();
+        let s = store.create_session(None);
+
+        let mut cold_contents = Vec::new();
+        for i in 0..30 {
+            let line = format!("cold-{i} {}", "lorem ipsum dolor sit amet ".repeat(150));
+            let role = if i % 2 == 0 {
+                Role::User
+            } else {
+                Role::Assistant
+            };
+            store.add_message(&s.id, role, line.clone());
+            cold_contents.push(line);
+        }
+        let recents = ["r0", "r1", "r2", "r3", "r4", "r5"];
+        for (i, r) in recents.iter().enumerate() {
+            let role = if i % 2 == 0 {
+                Role::User
+            } else {
+                Role::Assistant
+            };
+            store.add_message(&s.id, role, (*r).to_string());
+        }
+
+        // Sanity: even after Tier 1 would run, these single-line blobs do not
+        // shrink, so the wire stays over the Tier-2 fraction.
+        let history = store.get_messages(&s.id);
+        let wire_t1 =
+            ExtractiveCompactor::default().compact_cold_collect(&history, KEEP_RECENT_VERBATIM);
+        let pressure = ProxyTokenEstimator::default().assess(&wire_t1.messages, "mock");
+        assert!(
+            pressure.is_over(0.90),
+            "post-Tier-1 transcript must exceed the Tier-2 fraction: fraction={}",
+            pressure.fraction()
+        );
+
+        let registry = ToolRegistry::new();
+        let root = dir.path().to_path_buf();
+        let approve = AlwaysApprove;
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let provider = RecordingProvider { seen: seen.clone() };
+
+        let mut tctx = ctx(&registry, &root, &approve);
+        tctx.abstractive = AbstractiveConfig {
+            enabled: true,
+            fire_at_fraction: 0.90,
+            ..AbstractiveConfig::default()
+        };
+
+        run_turn(
+            &provider,
+            &store,
+            &tctx,
+            &s.id,
+            "mock",
+            None,
+            false,
+            CancelToken::new(),
+            |_| {},
+        )
+        .await
+        .unwrap();
+
+        // The main-turn wire begins with the synthetic summary (no system prompt
+        // passed), and the 6 most recent messages stay byte-identical.
+        let wire = seen.lock().unwrap().clone();
+        let summary = &wire[0];
+        assert_eq!(summary.role.as_str(), "user");
+        let summary_text = summary.content.as_deref().unwrap();
+        assert!(
+            summary_text.contains("Summary of") && summary_text.contains(COMPACTION_MARKER_PREFIX),
+            "the wire must lead with the abstractive summary + retrieve marker"
+        );
+        let n = wire.len();
+        for (i, r) in recents.iter().enumerate() {
+            assert_eq!(
+                wire[n - recents.len() + i].content.as_deref().unwrap(),
+                *r,
+                "recent message {i} must be verbatim on the wire"
+            );
+        }
+        // The collapsed cold prefix is far smaller than the 30 originals combined.
+        assert!(wire.len() < history.len(), "cold prefix must be collapsed");
+
+        // The store keeps the full verbatim transcript (plus this turn's reply).
+        let stored = store.get_messages(&s.id);
+        assert!(stored.len() >= history.len());
+        for (i, original) in cold_contents.iter().enumerate() {
+            assert_eq!(
+                &stored[i].content, original,
+                "store keeps cold {i} verbatim"
+            );
+        }
+
+        // Reversible: the marker key resolves to the verbatim cold block.
+        let key = extract_marker_key(summary_text).unwrap();
+        let retrieved = store
+            .compaction_original(&key)
+            .expect("cold block is retrievable");
+        assert!(retrieved.contains("cold-0"));
+        assert!(retrieved.contains("cold-23"));
     }
 }

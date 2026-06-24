@@ -189,8 +189,19 @@ user-inspectable, consistent with RFC 0007's "everything is inspectable" posture
 
 ## 8. Phasing
 
-- **M7.0** — Land Tier 2 (abstractive cold-tail summary) on the existing seam, default-off.
-  The smallest closure of the "we never actually compact" gap; gives a baseline.
+- **M7.0 (in progress)** — Tier 2 (abstractive cold-tail summary), default-off. The
+  smallest closure of the "we never actually compact" gap; gives a baseline.
+  *Amendment:* like Tier 1, Tier 2 is applied as a pre-send wire transform at the
+  `run_turn` site rather than as a `CompactionStrategy` impl — it differs only in
+  being async/provider-driven (it calls the LLM to condense). It supersedes Tier 1
+  on the cold prefix when it fires (it is the heavier hammer, not a parallel pass).
+  The summarizer model defaults to the session model and is overridable on the same
+  provider/connection; cross-connection routing is a follow-up. The collapsed block
+  is persisted to the same `compaction_originals` store and carries the shared
+  `[compacted; retrieve key=...]` marker, so it is retrievable via the existing
+  `compaction_retrieve` tool. The produced summary is cached and reused until the
+  transcript grows by the re-flush interval, so a long turn pays for at most one
+  summarizer round-trip per window.
 - **M7.1** — Tier 1: `ContentRouter` + JSON/AST/prose compressors + CCR cache +
   `compaction_retrieve` tool. The primary token-ROI tier. Default-off, opt-in.
 - **M7.2** — Real per-model context windows into `ProxyTokenEstimator` (§6); accurate
@@ -203,9 +214,15 @@ user-inspectable, consistent with RFC 0007's "everything is inspectable" posture
 1. **Tier ordering vs. cost.** Should Tier 1 (extractive) always precede Tier 2
    (abstractive), or should the router pick directly based on content type and pressure?
    *Amendment (M7.1b):* Tier 1 is implemented as a deterministic pre-send wire transform,
-   not a `CompactionStrategy` impl. Tier 2 stays on the async/provider-driven strategy
-   seam; ordering reduces to "extractive runs first because it is mechanical and free,
-   abstractive is the fallback when extractive cannot relieve enough pressure."
+   not a `CompactionStrategy` impl. *Amendment (M7.0):* Tier 2 is **also** applied at the
+   `run_turn` wire site (request-only substitution), not as a `CompactionStrategy` impl —
+   the strategy seam's side-effect-shaped outcome (`Wrote`/`NoReply`) fits the memory
+   flush but not a transcript transformation, and a strategy reads from the store rather
+   than the in-flight post-Tier-1 transcript that Tier 2 must consume. The
+   `CompactionStrategy` seam remains for side-effect strategies (flush). Ordering reduces
+   to "extractive runs first because it is mechanical and free; abstractive is the
+   fallback when extractive cannot relieve enough pressure, and supersedes it on the
+   cold prefix when it fires."
 2. **CCR cache lifetime.** How long are compaction originals retained, and do they share
    the FTS5 index / decay with memory, or live in a session-scoped side store?
 3. **Optical decode trust.** At 20x optical compression DeepSeek-OCR is ~60% accurate —

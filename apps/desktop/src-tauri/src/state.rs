@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 
 use ff_agent::{
-    flush_due, CancelToken, CompactionContext, CompactionStrategy, ContextPressureEstimator,
-    MemoryFlush, ProxyTokenEstimator, DEFAULT_FLUSH_AT_FRACTION,
+    flush_due, AbstractiveConfig, CancelToken, CompactionContext, CompactionStrategy,
+    ContextPressureEstimator, MemoryFlush, ProxyTokenEstimator, DEFAULT_FLUSH_AT_FRACTION,
 };
 use ff_core::{
     BedrockAuth, McpServerState, McpServerStatus, Mode, Phenotype, ProviderConfig,
@@ -1699,6 +1699,33 @@ fn memory_config_from_env() -> MemoryConfig {
     if env_flag("FF_MEMORY_EMBEDDINGS") {
         config.embeddings.enabled = true;
         config.embeddings.provider = EmbeddingProvider::Local;
+    }
+    config
+}
+
+/// Tier-2 abstractive cold-tail summary config from the environment (RFC 0016
+/// M7.0). Default-off; opt in with `FF_COMPACT_ABSTRACTIVE`. The summarizer model
+/// defaults to the session model and is overridable (same provider/connection)
+/// with `FF_COMPACT_ABSTRACTIVE_MODEL`; the fire fraction is tunable via
+/// `FF_COMPACT_ABSTRACTIVE_AT` (a 0..1 budget fraction).
+pub(crate) fn abstractive_config_from_env() -> AbstractiveConfig {
+    let mut config = AbstractiveConfig {
+        enabled: env_flag("FF_COMPACT_ABSTRACTIVE"),
+        ..AbstractiveConfig::default()
+    };
+    if let Some(model) = std::env::var("FF_COMPACT_ABSTRACTIVE_MODEL")
+        .ok()
+        .map(|m| m.trim().to_string())
+        .filter(|m| !m.is_empty())
+    {
+        config.model = Some(model);
+    }
+    if let Some(at) = std::env::var("FF_COMPACT_ABSTRACTIVE_AT")
+        .ok()
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .filter(|v| (0.0..=1.0).contains(v))
+    {
+        config.fire_at_fraction = at;
     }
     config
 }

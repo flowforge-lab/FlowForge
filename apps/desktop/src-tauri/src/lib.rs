@@ -443,6 +443,7 @@ fn send_message(
         let session_root = state.session_root(&sid);
         let mut tool_ctx = ToolContext::new(&registry, &session_root, &approver, max_iterations);
         tool_ctx.mode = mode;
+        tool_ctx.abstractive = crate::state::abstractive_config_from_env();
         // Skills + ambient context for this turn (RFC 0001 §4, RFC 0002 phase 1):
         // the resolved persona, installed-skill descriptions, the bodies of the
         // active skills, and the current local time.
