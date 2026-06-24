@@ -21,7 +21,7 @@ pub use message::{Attachment, AttachmentKind, AttachmentSource, Message, Role, T
 pub use mode::Mode;
 pub use provider::{
     BedrockAuth, ConnectionId, ProviderConfig, ProviderConnection, ProviderKind, ProviderRegistry,
-    SecretKind,
+    ReasoningEffort, SecretKind,
 };
 pub use search::{SearchBackend, SearchConfig};
 pub use session::{auto_title, Session, SessionStatus, SessionWorkspace};

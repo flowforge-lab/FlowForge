@@ -13,6 +13,63 @@ fn default_thinking() -> bool {
     true
 }
 
+/// User-facing reasoning *depth* dial (#394/#395), mirroring the frontend
+/// `Effort` (apps/desktop/src/store/model-config.ts: `low | medium | high`,
+/// default `medium`). Orthogonal to the on/off gate (`ChatRequest::thinking`):
+/// effort only matters when thinking is on, where it picks the reasoning token
+/// budget every supported backend honors -- the SiliconFlow gateway
+/// (`thinking_budget`, verified #394 across GLM-5.2 / Kimi-K2.7 / DeepSeek-V4-Pro),
+/// Bedrock Converse and native Anthropic extended thinking (`budget_tokens`).
+///
+/// Lives in `ff-core` (not `ff-llm`) so it can be both a field on the
+/// [`ProviderConnection`] settings contract (exported to TS) and consumed by the
+/// providers in `ff-llm`, which re-export it -- `ff-llm` depends on `ff-core`, so
+/// the type cannot live the other way round without a dependency cycle (#395).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, TS)]
+#[serde(rename_all = "lowercase")]
+#[ts(export, export_to = "../../../apps/desktop/src/bindings/")]
+pub enum ReasoningEffort {
+    /// Shallow reasoning -- a tight budget that still bounds runaway cost. 1024
+    /// is the Anthropic/Bedrock documented minimum and recommended starting point.
+    Low,
+    /// The default. Caps the chain-of-thought well above every model's natural
+    /// reasoning length (194-527 tokens for SiliconFlow GLM/Kimi/DeepSeek, #394),
+    /// so it only bites runaway agentic loops -- which is what burned tokens.
+    #[default]
+    Medium,
+    /// Deepest reasoning. A hard 8192 cap rather than uncapped, keeping #394's
+    /// cost guard intact even at the top of the dial. On adaptive-effort models
+    /// (Opus 4.6+, which deprecated `budget_tokens`) this maps to
+    /// `output_config.effort = "high"` instead (see [`Self::effort_str`]).
+    High,
+}
+
+impl ReasoningEffort {
+    /// Reasoning/thinking token budget for this effort level. Uniform across
+    /// every supported backend (SiliconFlow `thinking_budget`, Bedrock Converse
+    /// and native Anthropic `budget_tokens`). All values are >= the 1024
+    /// Anthropic/Bedrock minimum and <= the 32k model maximum.
+    pub fn budget_tokens(self) -> u32 {
+        match self {
+            ReasoningEffort::Low => 1024,
+            ReasoningEffort::Medium => 4096,
+            ReasoningEffort::High => 8192,
+        }
+    }
+
+    /// Effort label for adaptive-thinking models (Opus 4.6+, Sonnet 4.6+), which
+    /// deprecated `budget_tokens` in favor of `output_config.effort`. We never
+    /// emit `"max"` (Opus-4.6-only), so the dial maps cleanly onto the three
+    /// portable levels.
+    pub fn effort_str(self) -> &'static str {
+        match self {
+            ReasoningEffort::Low => "low",
+            ReasoningEffort::Medium => "medium",
+            ReasoningEffort::High => "high",
+        }
+    }
+}
+
 /// Which LLM backend FlowForge talks to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
@@ -220,6 +277,12 @@ pub struct ProviderConnection {
     /// When true, request and surface model reasoning/thinking streams (#181).
     #[serde(default = "default_thinking")]
     pub thinking: bool,
+    /// Reasoning *depth* dial for this connection (#395). Only bites when
+    /// `thinking` is on; picks the per-backend reasoning token budget in
+    /// `build_provider`. `#[serde(default)]` keeps pre-#395 registries loading as
+    /// [`ReasoningEffort::Medium`].
+    #[serde(default)]
+    pub reasoning_effort: ReasoningEffort,
     /// Whether this connection's model can accept image/document attachments
     /// (multimodal, #332). Drives the composer attach-button gate (FE-4) and the
     /// backend safety strip (a non-vision connection never emits a raw attachments
@@ -446,6 +509,7 @@ impl Default for ProviderRegistry {
             model: "Qwen3-4B-Instruct-2507".to_string(),
             has_key: false,
             thinking: true,
+            reasoning_effort: ReasoningEffort::default(),
             supports_vision: false,
             region: None,
             auth_mode: None,
@@ -461,6 +525,7 @@ impl Default for ProviderRegistry {
             model: "llama3.2".to_string(),
             has_key: false,
             thinking: true,
+            reasoning_effort: ReasoningEffort::default(),
             supports_vision: false,
             region: None,
             auth_mode: None,
@@ -553,6 +618,7 @@ mod tests {
             model: "m".to_string(),
             has_key: false,
             thinking: true,
+            reasoning_effort: ReasoningEffort::default(),
             supports_vision: false,
             region: None,
             auth_mode: None,
@@ -666,6 +732,7 @@ mod tests {
             model: "llama3.2".into(),
             has_key: false,
             thinking: true,
+            reasoning_effort: ReasoningEffort::default(),
             supports_vision: false,
             region: None,
             auth_mode: None,

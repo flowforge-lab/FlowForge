@@ -252,55 +252,12 @@ pub fn wire_dialect(kind: ff_core::ProviderKind, vendor: Option<&str>, model: &s
     }
 }
 
-/// User-facing reasoning *depth* dial (#394/#395), mirroring the frontend
-/// `Effort` (apps/desktop/src/store/model-config.ts: `low | medium | high`,
-/// default `medium`). Orthogonal to the on/off gate [`ChatRequest::thinking`]:
-/// effort only matters when thinking is on, where it picks the reasoning token
-/// budget every supported backend honors -- the SiliconFlow gateway
-/// (`thinking_budget`, verified #394 across GLM-5.2 / Kimi-K2.7 / DeepSeek-V4-Pro),
-/// Bedrock Converse and native Anthropic extended thinking (`budget_tokens`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum ReasoningEffort {
-    /// Shallow reasoning -- a tight budget that still bounds runaway cost. 1024
-    /// is the Anthropic/Bedrock documented minimum and recommended starting point.
-    Low,
-    /// The default. Caps the chain-of-thought well above every model's natural
-    /// reasoning length (194-527 tokens for SiliconFlow GLM/Kimi/DeepSeek, #394),
-    /// so it only bites runaway agentic loops -- which is what burned tokens.
-    #[default]
-    Medium,
-    /// Deepest reasoning. A hard 8192 cap rather than uncapped, keeping #394's
-    /// cost guard intact even at the top of the dial. On adaptive-effort models
-    /// (Opus 4.6+, which deprecated `budget_tokens`) this maps to
-    /// `output_config.effort = "high"` instead (see [`Self::effort_str`]).
-    High,
-}
-
-impl ReasoningEffort {
-    /// Reasoning/thinking token budget for this effort level. Uniform across
-    /// every supported backend (SiliconFlow `thinking_budget`, Bedrock Converse
-    /// and native Anthropic `budget_tokens`). All values are >= the 1024
-    /// Anthropic/Bedrock minimum and <= the 32k model maximum.
-    pub fn budget_tokens(self) -> u32 {
-        match self {
-            ReasoningEffort::Low => 1024,
-            ReasoningEffort::Medium => 4096,
-            ReasoningEffort::High => 8192,
-        }
-    }
-
-    /// Effort label for adaptive-thinking models (Opus 4.6+, Sonnet 4.6+), which
-    /// deprecated `budget_tokens` in favor of `output_config.effort`. We never
-    /// emit `"max"` (Opus-4.6-only), so the dial maps cleanly onto the three
-    /// portable levels.
-    pub fn effort_str(self) -> &'static str {
-        match self {
-            ReasoningEffort::Low => "low",
-            ReasoningEffort::Medium => "medium",
-            ReasoningEffort::High => "high",
-        }
-    }
-}
+/// Reasoning *depth* dial (#394/#395). Defined in `ff-core` so it can be both a
+/// [`ProviderConnection`](ff_core::ProviderConnection) settings field (exported to
+/// TS) and consumed here by the providers; `ff-llm` depends on `ff-core`, so the
+/// type cannot live in `ff-llm` without a dependency cycle. Re-exported so existing
+/// `ff_llm::ReasoningEffort` / `crate::ReasoningEffort` paths keep resolving.
+pub use ff_core::ReasoningEffort;
 
 /// Per-gateway reasoning-cost controls for the OpenAI-compatible wire (#394).
 /// Resolved once at provider build time, like [`WireDialect`]. The default emits

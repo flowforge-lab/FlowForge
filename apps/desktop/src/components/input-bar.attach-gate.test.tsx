@@ -22,6 +22,7 @@ function registry(supportsVision: boolean): ProviderRegistry {
         model: "m",
         hasKey: false,
         thinking: false,
+        reasoningEffort: "medium",
         supportsVision,
       },
     ],

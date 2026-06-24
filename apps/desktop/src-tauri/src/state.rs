@@ -10,11 +10,11 @@ use ff_agent::{
 };
 use ff_core::{
     BedrockAuth, McpServerState, McpServerStatus, Mode, Phenotype, ProviderConfig,
-    ProviderConnection, ProviderKind, ProviderRegistry, SearchConfig, SecretKind,
+    ProviderConnection, ProviderKind, ProviderRegistry, ReasoningEffort, SearchConfig, SecretKind,
 };
 use ff_llm::{
     reasoning_control, wire_dialect, BedrockCreds, BedrockProvider, OllamaProvider, OpenAiProvider,
-    Provider, ReasoningEffort,
+    Provider,
 };
 use ff_mcp::{McpConfigWatcher, SupervisorHandle};
 use ff_memory::watch::MemoryWatcher;
@@ -129,10 +129,10 @@ fn build_provider(conn: &ProviderConnection) -> Box<dyn Provider> {
     // hot path only carries a `Copy` struct; defaults are no-ops for vanilla
     // OpenAI / candle-vllm / Ollama / LM Studio.
     let dialect = wire_dialect(conn.kind, conn.vendor.as_deref(), &conn.model);
-    // Reasoning depth dial (#394). Medium by default -- the per-connection user
-    // override is #395; until then this both caps SiliconFlow's auto-`max`
-    // escalation and bounds Bedrock/Anthropic extended thinking.
-    let effort = ReasoningEffort::default();
+    // Reasoning depth dial (#394/#395). The per-connection user override now
+    // drives it: it both caps SiliconFlow's auto-`max` escalation and bounds
+    // Bedrock/Anthropic extended thinking. Medium for pre-#395 registries.
+    let effort = conn.reasoning_effort;
     // OpenAI-wire reasoning controls (#394). No-op except for the SiliconFlow
     // gateway; native providers take the effort dial directly below.
     let reasoning = reasoning_control(conn.kind, &conn.model, effort);
@@ -262,6 +262,9 @@ fn config_to_connection(config: ProviderConfig) -> ProviderConnection {
         model: config.model,
         has_key: config.has_key,
         thinking: config.thinking,
+        // Legacy single-config migration predates the per-connection dial (#395);
+        // default to Medium, same as a fresh registry.
+        reasoning_effort: ReasoningEffort::default(),
         supports_vision: false,
         region: None,
         auth_mode: None,
@@ -2518,6 +2521,7 @@ mod tests {
                 model: "saved".into(),
                 has_key: false,
                 thinking: true,
+                reasoning_effort: ReasoningEffort::default(),
                 supports_vision: false,
                 region: None,
                 auth_mode: None,
@@ -2690,6 +2694,7 @@ mod tests {
             model: "x".into(),
             has_key: false,
             thinking: true,
+            reasoning_effort: ReasoningEffort::default(),
             supports_vision: false,
             region: None,
             auth_mode: None,
@@ -2778,6 +2783,7 @@ mod tests {
             model: "gpt-4o".into(),
             has_key: false,
             thinking: false,
+            reasoning_effort: ReasoningEffort::default(),
             supports_vision: false,
             region: None,
             auth_mode: None,
@@ -2837,6 +2843,7 @@ mod tests {
             model: "anthropic.claude-3-5-sonnet".into(),
             has_key: false,
             thinking: false,
+            reasoning_effort: ReasoningEffort::default(),
             supports_vision: false,
             region: Some("us-east-1".into()),
             auth_mode,

@@ -45,6 +45,7 @@ function defaultConnection(kind: ProviderKind): ProviderConnection {
     model: "",
     hasKey: false,
     thinking: true,
+    reasoningEffort: "medium",
     supportsVision: false,
   };
   switch (kind) {
