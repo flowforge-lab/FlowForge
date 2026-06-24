@@ -6,11 +6,11 @@
 
 use async_trait::async_trait;
 use aws_sdk_bedrockruntime::types::{
-    ContentBlock, ContentBlockDelta, ContentBlockStart, ConversationRole, ConverseStreamOutput,
-    DocumentBlock, DocumentFormat, DocumentSource, ImageBlock, ImageFormat, ImageSource,
-    InferenceConfiguration, Message, ReasoningContentBlockDelta, SystemContentBlock, Tool,
-    ToolConfiguration, ToolInputSchema, ToolResultBlock, ToolResultContentBlock, ToolSpecification,
-    ToolUseBlock,
+    CachePointBlock, CachePointType, ContentBlock, ContentBlockDelta, ContentBlockStart,
+    ConversationRole, ConverseStreamOutput, DocumentBlock, DocumentFormat, DocumentSource,
+    ImageBlock, ImageFormat, ImageSource, InferenceConfiguration, Message,
+    ReasoningContentBlockDelta, SystemContentBlock, Tool, ToolConfiguration, ToolInputSchema,
+    ToolResultBlock, ToolResultContentBlock, ToolSpecification, ToolUseBlock,
 };
 use aws_sdk_bedrockruntime::Client;
 use aws_smithy_types::{Blob, Document, Number};
@@ -300,8 +300,20 @@ impl Provider for BedrockProvider {
 
     async fn chat_stream(&self, req: ChatRequest) -> Result<ChunkStream, LlmError> {
         let wire = crate::messages_for_wire(&req.messages, self.supports_vision);
-        let (system, messages) = to_converse(&wire);
+        let (mut system, messages) = to_converse(&wire);
         let client = self.client().await;
+
+        // Prompt caching (#437): on models that support it, mark the stable
+        // system + tool-schema prefix with a cache point so prefill is near-free
+        // from turn 2. Gated to a known-supported allowlist -- an unsupported
+        // model 400s on a cachePoint block, and a validation error is not
+        // retried, so a false positive would break the turn.
+        let cache = model_supports_cache_point(&req.model);
+        if cache {
+            if let (false, Some(point)) = (system.is_empty(), cache_point()) {
+                system.push(SystemContentBlock::CachePoint(point));
+            }
+        }
 
         let adaptive = uses_adaptive_thinking(&req.model);
         let mut call = client
@@ -311,7 +323,7 @@ impl Provider for BedrockProvider {
         if !system.is_empty() {
             call = call.set_system(Some(system));
         }
-        if let Some(cfg) = to_tool_config(&req.tools) {
+        if let Some(cfg) = to_tool_config(&req.tools, cache) {
             call = call.tool_config(cfg);
         }
         // Claude extended thinking (#394). Two wire shapes by model generation:
@@ -772,15 +784,58 @@ fn tool_result_blocks(msg: &ChatMessage) -> Vec<ContentBlock> {
 
 /// Translate OpenAI `tools` specs into a Converse [`ToolConfiguration`]. Returns
 /// `None` for a plain chat turn (no tools).
-fn to_tool_config(tools: &[serde_json::Value]) -> Option<ToolConfiguration> {
-    let specs: Vec<Tool> = tools.iter().filter_map(to_tool).collect();
+fn to_tool_config(tools: &[serde_json::Value], cache: bool) -> Option<ToolConfiguration> {
+    let mut specs: Vec<Tool> = tools.iter().filter_map(to_tool).collect();
     if specs.is_empty() {
         return None;
+    }
+    // Prompt caching (#437): a trailing cache point caches the tool-schema block,
+    // the largest stable prefix segment. Only on models known to support it.
+    if cache {
+        if let Some(point) = cache_point() {
+            specs.push(Tool::CachePoint(point));
+        }
     }
     ToolConfiguration::builder()
         .set_tools(Some(specs))
         .build()
         .ok()
+}
+
+/// A `default`-type cache point block, or `None` if the SDK rejects the build
+/// (treated as best-effort: a missing cache point just forgoes the speedup).
+fn cache_point() -> Option<CachePointBlock> {
+    CachePointBlock::builder()
+        .r#type(CachePointType::Default)
+        .build()
+        .ok()
+}
+
+/// Whether `model` is known to support Converse prompt caching (`cachePoint`).
+/// Conservative allowlist: an unsupported model 400s on a cache point and the
+/// error is not retried, so this biases hard toward off. A false negative just
+/// forgoes the speedup. Excludes the legacy date-suffixed 3.x ids (3.5 Sonnet
+/// v1, Opus 3, Haiku 3) that predate caching.
+fn model_supports_cache_point(model: &str) -> bool {
+    let m = model.to_ascii_lowercase();
+    // Amazon Nova (text sizes) support prompt caching.
+    if m.contains("nova-micro") || m.contains("nova-lite") || m.contains("nova-pro") {
+        return true;
+    }
+    // Claude families with documented cachePoint support, matched by id substring.
+    const SUPPORTED: &[&str] = &[
+        "claude-3-7-sonnet",
+        "claude-3-5-haiku",
+        "claude-3-5-sonnet-20241022", // v2 only -- v1 (20240620) does not support it
+    ];
+    if SUPPORTED.iter().any(|s| m.contains(s)) {
+        return true;
+    }
+    // Claude 4+ (Opus/Sonnet/Haiku) and the named adaptive lines all support it.
+    uses_adaptive_thinking(&m)
+        || m.contains("opus-4")
+        || m.contains("sonnet-4")
+        || m.contains("haiku-4")
 }
 
 fn to_tool(spec: &serde_json::Value) -> Option<Tool> {
@@ -1306,7 +1361,7 @@ mod tests {
                 }
             }
         });
-        let cfg = to_tool_config(&[spec]).unwrap();
+        let cfg = to_tool_config(&[spec], false).unwrap();
         assert_eq!(cfg.tools.len(), 1);
         match &cfg.tools[0] {
             Tool::ToolSpec(s) => assert_eq!(s.name, "bash"),
@@ -1316,7 +1371,51 @@ mod tests {
 
     #[test]
     fn no_tools_yields_no_config() {
-        assert!(to_tool_config(&[]).is_none());
+        assert!(to_tool_config(&[], false).is_none());
+    }
+
+    #[test]
+    fn cache_point_appended_to_tools_when_enabled() {
+        let spec = serde_json::json!({
+            "type": "function",
+            "function": { "name": "bash", "parameters": { "type": "object", "properties": {} } }
+        });
+        // Disabled: tools are byte-identical to today (one ToolSpec, no cache point).
+        let off = to_tool_config(std::slice::from_ref(&spec), false).unwrap();
+        assert_eq!(off.tools.len(), 1);
+        assert!(matches!(off.tools[0], Tool::ToolSpec(_)));
+        // Enabled: a trailing CachePoint follows the tool spec.
+        let on = to_tool_config(&[spec], true).unwrap();
+        assert_eq!(on.tools.len(), 2);
+        assert!(matches!(on.tools[0], Tool::ToolSpec(_)));
+        assert!(matches!(on.tools[1], Tool::CachePoint(_)));
+    }
+
+    #[test]
+    fn model_cache_support_allowlist() {
+        // Supported: Nova, Claude 3.7 / 3.5 Haiku / 3.5 Sonnet v2, and 4+.
+        for m in [
+            "amazon.nova-pro-v1:0",
+            "anthropic.claude-3-7-sonnet-20250219-v1:0",
+            "anthropic.claude-3-5-haiku-20241022-v1:0",
+            "anthropic.claude-3-5-sonnet-20241022-v2:0",
+            "anthropic.claude-opus-4-20250514-v1:0",
+            "us.anthropic.claude-opus-4-6",
+            "anthropic.claude-sonnet-4-20250514-v1:0",
+        ] {
+            assert!(model_supports_cache_point(m), "expected supported: {m}");
+        }
+        // Unsupported: legacy date-suffixed 3.x and unknown models -- must NOT
+        // emit a cache point (would 400 / break the turn).
+        for m in [
+            "anthropic.claude-3-5-sonnet-20240620-v1:0",
+            "anthropic.claude-3-opus-20240229-v1:0",
+            "anthropic.claude-3-haiku-20240307-v1:0",
+            "meta.llama3-70b",
+            "deepseek-v4-pro",
+        ] {
+            assert!(!model_supports_cache_point(m), "expected unsupported: {m}");
+        }
     }
 
     #[test]
@@ -1360,7 +1459,7 @@ mod tests {
                 "parameters": { "properties": { "q": { "type": "string" } } }
             }
         });
-        let cfg = to_tool_config(&[spec]).unwrap();
+        let cfg = to_tool_config(&[spec], false).unwrap();
         match &cfg.tools[0] {
             Tool::ToolSpec(s) => match s.input_schema.as_ref().unwrap() {
                 ToolInputSchema::Json(doc) => {
