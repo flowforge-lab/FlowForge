@@ -651,13 +651,15 @@ pub async fn run_turn(
         // `compaction_retrieve` can fetch it back. Best-effort -- a failed or
         // cancelled summary falls back to `wire` and never aborts the user's turn.
         //
-        // A fresh estimator here is deliberate: Tier 1 (above) assesses raw
-        // `history`, but Tier 2 must gate on the projected request size *after*
-        // extractive compression, i.e. the post-Tier-1 `wire`. Both share the same
-        // default 24k budget today; when model-aware budgets land (RFC 0016 6 /
-        // M7.2) every ProxyTokenEstimator::default() site adopts it together.
+        // Tier 1 (above) assesses raw `history`; Tier 2 must gate on the projected
+        // request size *after* extractive compression, i.e. the post-Tier-1 `wire`.
+        // It reuses the same model-aware `estimator` built at the top of the turn
+        // (#B1 / RFC 0016 6), so a large-window model is no longer force-summarized
+        // at the old fixed 24k ceiling -- only when `wire` genuinely nears its real
+        // window. The differing input (`wire`, not `history`) is the intended
+        // distinction between the two tiers, not the budget.
         let wire = if tools.abstractive.enabled
-            && ProxyTokenEstimator::default()
+            && estimator
                 .assess(&wire, model)
                 .is_over(tools.abstractive.fire_at_fraction)
         {
