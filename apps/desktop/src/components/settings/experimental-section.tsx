@@ -51,6 +51,12 @@ const FLAGS: readonly FlagMeta[] = [
     description:
       "Proactively suggest relevant skills based on the current conversation.",
   },
+  {
+    id: "stepTimelineExport",
+    label: "Step timeline export",
+    description:
+      "Show a developer download on each step group to export its per-step timing (JSON/CSV) for diagnosing slow runs.",
+  },
 ];
 
 /**

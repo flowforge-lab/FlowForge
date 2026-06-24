@@ -1,11 +1,17 @@
 import { useEffect, useState } from "react";
-import { ChevronRight, Loader2 } from "@/components/ui/icon";
+import { ChevronRight, Download, Loader2 } from "@/components/ui/icon";
 import { cn } from "@/lib/utils";
 import type { ToolStep } from "@/store/chat";
 import type { TurnItem } from "@/lib/turn-groups";
 import { ToolStepBlock } from "@/components/tool-step";
 import { ProseStepBlock } from "@/components/prose-step";
 import { ThinkingBlock } from "@/components/thinking-block";
+import {
+  DropdownMenu,
+  DropdownMenuTrigger,
+  DropdownMenuContent,
+  DropdownMenuItem,
+} from "@/components/ui/dropdown-menu";
 import {
   answerPreview,
   formatDuration,
@@ -29,6 +35,7 @@ export function StepGroup({
   reasoning,
   hasAnswer,
   answer,
+  onExportTimeline,
   onRespond,
   onApproveSession,
   onApproveAlways,
@@ -47,6 +54,9 @@ export function StepGroup({
    *  preview of it shows under the header so the outcome is visible without
    *  expanding (#414). Raw content — no model-generated summary. */
   answer?: string;
+  /** Dev-only step-timeline export (#417). When provided, a Download control shows in
+   *  the header; gated upstream by the `stepTimelineExport` experimental flag. */
+  onExportTimeline?: (format: "json" | "csv") => void;
   onRespond: (callId: string, approved: boolean) => void;
   onApproveSession: (callId: string, tool: string) => void;
   onApproveAlways: (callId: string, tool: string) => void;
@@ -100,31 +110,57 @@ export function StepGroup({
 
   return (
     <div className="w-full font-mono text-[11px]">
-      <button
-        type="button"
-        aria-expanded={open}
-        onClick={() => setUserOpen(!open)}
-        className="flex w-full items-center gap-1.5 rounded-md px-2.5 py-1.5 text-left text-muted-foreground transition-colors hover:text-foreground"
-      >
-        <ChevronRight
-          className={cn(
-            "size-3.5 shrink-0 transition-transform",
-            open && "rotate-90",
+      {/* The fold toggle and the dev export control are siblings, so clicking the
+          download icon doesn't toggle the fold. */}
+      <div className="flex w-full items-center gap-1">
+        <button
+          type="button"
+          aria-expanded={open}
+          onClick={() => setUserOpen(!open)}
+          className="flex min-w-0 flex-1 items-center gap-1.5 rounded-md px-2.5 py-1.5 text-left text-muted-foreground transition-colors hover:text-foreground"
+        >
+          <ChevronRight
+            className={cn(
+              "size-3.5 shrink-0 transition-transform",
+              open && "rotate-90",
+            )}
+          />
+          {streaming && (
+            <Loader2 className="size-3.5 shrink-0 animate-spin text-muted-foreground" />
           )}
-        />
-        {streaming && (
-          <Loader2 className="size-3.5 shrink-0 animate-spin text-muted-foreground" />
+          <span className="min-w-0 flex-1 font-medium text-foreground">
+            {steps.length} {steps.length === 1 ? "step" : "steps"}
+            {showDuration && (
+              <span className="font-normal text-muted-foreground/60">
+                {" · "}
+                {formatDuration(durationMs)}
+              </span>
+            )}
+          </span>
+        </button>
+        {onExportTimeline && (
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <button
+                type="button"
+                aria-label="Export step timeline"
+                title="Export step timeline (dev)"
+                className="shrink-0 rounded-md p-1 text-muted-foreground/50 transition-colors hover:text-foreground"
+              >
+                <Download className="size-3.5" />
+              </button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="end">
+              <DropdownMenuItem onSelect={() => onExportTimeline("json")}>
+                Download JSON
+              </DropdownMenuItem>
+              <DropdownMenuItem onSelect={() => onExportTimeline("csv")}>
+                Download CSV
+              </DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
         )}
-        <span className="min-w-0 flex-1 font-medium text-foreground">
-          {steps.length} {steps.length === 1 ? "step" : "steps"}
-          {showDuration && (
-            <span className="font-normal text-muted-foreground/60">
-              {" · "}
-              {formatDuration(durationMs)}
-            </span>
-          )}
-        </span>
-      </button>
+      </div>
       {!open && preview && (
         <p className="line-clamp-2 pb-1.5 pl-7 pr-2.5 font-sans leading-relaxed text-muted-foreground/70">
           {preview}
