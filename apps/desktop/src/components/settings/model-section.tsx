@@ -46,9 +46,9 @@ function formatThreshold(tokens: number): string {
 /**
  * Model section (#126, #202 PR-3b): a provider-centric accordion. Each registry
  * connection is a card carrying its own credentials + default-model picker (durable
- * via IPC; secrets write-only to the OS keychain). Global reasoning controls
- * (thinking via IPC on the active connection; effort / summarization threshold
- * persisted locally) sit below. Registers `resetModel` for the footer reset.
+ * via IPC; secrets write-only to the OS keychain). Reasoning controls for the active
+ * connection (thinking + effort, both per-connection via IPC) and the locally-persisted
+ * summarization threshold sit below. Registers `resetModel` for the footer reset.
  */
 export function ModelSection() {
   const registry = useModelConfigStore((s) => s.registry);
@@ -59,7 +59,6 @@ export function ModelSection() {
   const addConnection = useModelConfigStore((s) => s.addConnection);
   const setThinking = useModelConfigStore((s) => s.setThinking);
 
-  const effort = useModelConfigStore((s) => s.effort);
   const summarizationThreshold = useModelConfigStore(
     (s) => s.summarizationThreshold,
   );
@@ -82,6 +81,8 @@ export function ModelSection() {
 
   const active = activeConnection(registry);
   const thinking = active?.thinking ?? true;
+  // Effort is now a per-connection backend field (#395); read the active one.
+  const effort = active?.reasoningEffort ?? "medium";
   // For OpenAI / SiliconFlow the backend sends no reasoning-*enable* param, so the
   // Thinking toggle has no wire effect (reasoning still streams when the model
   // emits it). Disable it with an honest hint rather than letting it read as a
@@ -169,8 +170,10 @@ export function ModelSection() {
             label="Reasoning effort"
             options={EFFORT_OPTIONS}
             value={effort}
-            onValueChange={setEffort}
-            disabled={!thinking}
+            onValueChange={(v) => {
+              if (active) void setEffort(active.id, v);
+            }}
+            disabled={!active || saving || !thinking}
           />
         </div>
 

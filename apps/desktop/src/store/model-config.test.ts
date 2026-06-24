@@ -43,15 +43,8 @@ describe("model-config reasoning controls", () => {
     localStorage.clear();
   });
 
-  it("defaults medium effort and 150k threshold", () => {
-    const s = useModelConfigStore.getState();
-    expect(s.effort).toBe("medium");
-    expect(s.summarizationThreshold).toBe(150_000);
-  });
-
-  it("updates the local reasoning controls", () => {
-    useModelConfigStore.getState().setEffort("high");
-    expect(useModelConfigStore.getState().effort).toBe("high");
+  it("defaults the 150k threshold", () => {
+    expect(useModelConfigStore.getState().summarizationThreshold).toBe(150_000);
   });
 
   it("clamps the summarization threshold to its bounds", () => {
@@ -65,18 +58,31 @@ describe("model-config reasoning controls", () => {
     );
   });
 
-  it("resetModel restores local defaults without touching the registry", () => {
+  it("resetModel restores the local threshold and leaves the registry (incl. effort) alone", () => {
     useModelConfigStore.setState({
-      effort: "low",
       summarizationThreshold: 300_000,
-      registry: { active: "ollama", connections: [] },
+      registry: {
+        active: "ollama",
+        connections: [
+          {
+            id: "ollama",
+            kind: "ollama",
+            displayName: "Ollama",
+            model: "llama3.2",
+            hasKey: false,
+            thinking: true,
+            reasoningEffort: "low",
+            supportsVision: false,
+          },
+        ],
+      },
     });
     useModelConfigStore.getState().resetModel();
     const s = useModelConfigStore.getState();
-    expect(s.effort).toBe("medium");
     expect(s.summarizationThreshold).toBe(150_000);
-    // The registry is backend-owned — reset leaves it alone.
+    // The registry is backend-owned — reset leaves it (and per-connection effort) alone.
     expect(s.registry?.active).toBe("ollama");
+    expect(activeConnection(s.registry)?.reasoningEffort).toBe("low");
   });
 });
 
@@ -135,6 +141,32 @@ describe("model-config registry (mock IPC)", () => {
     await load();
     await setActiveConnection("ollama");
     expect(useModelConfigStore.getState().registry?.active).toBe("ollama");
+  });
+
+  it("reads the seeded active connection's reasoning effort (default medium)", async () => {
+    await useModelConfigStore.getState().load();
+    const active = activeConnection(useModelConfigStore.getState().registry);
+    expect(active?.kind).toBe("candleVllm");
+    expect(active?.reasoningEffort).toBe("medium");
+  });
+
+  it("setEffort persists a connection's reasoning effort via IPC", async () => {
+    const { load, setEffort } = useModelConfigStore.getState();
+    await load();
+    await setEffort("ollama", "high");
+    expect(
+      useModelConfigStore
+        .getState()
+        .registry?.connections.find((c) => c.id === "ollama")?.reasoningEffort,
+    ).toBe("high");
+    // Survives a fresh reload from the backend (not just optimistic local state).
+    useModelConfigStore.setState({ registry: null });
+    await useModelConfigStore.getState().load();
+    expect(
+      useModelConfigStore
+        .getState()
+        .registry?.connections.find((c) => c.id === "ollama")?.reasoningEffort,
+    ).toBe("high");
   });
 
   it("picking a default model also activates that connection", async () => {

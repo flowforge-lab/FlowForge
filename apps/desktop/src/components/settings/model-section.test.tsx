@@ -4,7 +4,7 @@ import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { ModelSection } from "@/components/settings/model-section";
-import { useModelConfigStore } from "@/store/model-config";
+import { activeConnection, useModelConfigStore } from "@/store/model-config";
 import { useSettingsStore } from "@/store/settings";
 
 (
@@ -77,6 +77,18 @@ function hasLabel(text: string, scope: ParentNode = container): boolean {
   return [...scope.querySelectorAll("label")].some(
     (el) => el.textContent?.trim() === text,
   );
+}
+
+/** The "Reasoning effort" segmented control group. */
+function effortGroup(): HTMLElement {
+  const g = container.querySelector('[aria-label="Reasoning effort"]');
+  if (!g) throw new Error("no reasoning-effort group");
+  return g as HTMLElement;
+}
+
+/** Currently-selected effort label (the `data-state="on"` segment). */
+function selectedEffort(): string | undefined {
+  return effortGroup().querySelector('[data-state="on"]')?.textContent?.trim();
 }
 
 beforeEach(async () => {
@@ -171,6 +183,69 @@ describe("ModelSection provider accordion", () => {
         "This provider doesn't support toggling reasoning; it's shown when the model emits it.",
       ),
     ).not.toBeNull();
+  });
+
+  // The module-level MockIpc singleton persists the active pointer and connection
+  // edits across tests, so each effort test establishes its own starting state
+  // rather than relying on the seed defaults.
+  it("reflects the active connection's reasoning effort and updates it on click", async () => {
+    await renderSection();
+    const id = activeConnection(useModelConfigStore.getState().registry)!.id;
+    await act(async () => {
+      await useModelConfigStore.getState().setEffort(id, "low");
+      await flush();
+    });
+    expect(selectedEffort()).toBe("Low");
+
+    await click(byText("High", "button", effortGroup()));
+    expect(selectedEffort()).toBe("High");
+    // Persisted onto the active connection (per-connection field, #395).
+    expect(
+      activeConnection(useModelConfigStore.getState().registry)
+        ?.reasoningEffort,
+    ).toBe("high");
+  });
+
+  it("shows each connection's own effort when the active one changes", async () => {
+    await renderSection();
+    await act(async () => {
+      const { setEffort } = useModelConfigStore.getState();
+      await setEffort("candle-vllm", "medium");
+      await setEffort("bedrock", "low");
+      await useModelConfigStore.getState().setActiveConnection("candle-vllm");
+      await flush();
+    });
+    expect(selectedEffort()).toBe("Medium");
+
+    await act(async () => {
+      await useModelConfigStore.getState().setActiveConnection("bedrock");
+      await flush();
+    });
+    // The dial follows the active connection's own effort.
+    expect(selectedEffort()).toBe("Low");
+  });
+
+  it("disables the effort dial when Thinking is off", async () => {
+    await renderSection();
+    // candle-vLLM supports the thinking toggle; make it active with thinking on.
+    await act(async () => {
+      await useModelConfigStore.getState().setActiveConnection("candle-vllm");
+      await useModelConfigStore.getState().setThinking("candle-vllm", true);
+      await flush();
+    });
+    const high = byText("High", "button", effortGroup()) as HTMLButtonElement;
+    expect(high.disabled).toBe(false);
+
+    await act(async () => {
+      await useModelConfigStore.getState().setThinking("candle-vllm", false);
+      await flush();
+    });
+    const highOff = byText(
+      "High",
+      "button",
+      effortGroup(),
+    ) as HTMLButtonElement;
+    expect(highOff.disabled).toBe(true);
   });
 
   it("switches Bedrock auth mode, revealing the matching fields", async () => {

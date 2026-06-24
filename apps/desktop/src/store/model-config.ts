@@ -1,7 +1,8 @@
 // Model section state (#126, extended for the provider-card surface in #202 PR-3b).
 // The provider registry (connections + active pointer) is durable backend config,
-// loaded from / persisted via IPC. Effort / summarization threshold have no backend
-// field yet, so they persist locally under `ff-model` until one lands; `partialize`
+// loaded from / persisted via IPC; reasoning effort is now a per-connection field on
+// it (#395), set like `thinking` via `upsertConnection`. The summarization threshold
+// still has no backend field, so it persists locally under `ff-model`; `partialize`
 // keeps the IPC-backed cache out of localStorage.
 
 import { create } from "zustand";
@@ -24,14 +25,13 @@ export type TestState =
 export const SUMMARY_THRESHOLD_MIN = 50_000;
 export const SUMMARY_THRESHOLD_MAX = 300_000;
 
-/** Locally-persisted reasoning controls without a backend field yet. */
+/** Locally-persisted reasoning controls without a backend field yet. Effort moved
+ *  to a per-connection backend field in #395; only the threshold remains local. */
 interface LocalReasoningPrefs {
-  effort: Effort;
   summarizationThreshold: number;
 }
 
 const LOCAL_REASONING_DEFAULTS: LocalReasoningPrefs = {
-  effort: "medium",
   summarizationThreshold: 150_000,
 };
 
@@ -102,10 +102,13 @@ interface ModelConfigState extends LocalReasoningPrefs {
   /** Drop a connection's test result (e.g. when the user edits creds again). */
   clearTest: (id: string) => void;
 
-  setEffort: (effort: Effort) => void;
+  /** Set a connection's reasoning effort (per-connection, IPC-backed like
+   *  `thinking`; the active connection drives the global reasoning controls). */
+  setEffort: (id: string, effort: Effort) => Promise<void>;
   setSummarizationThreshold: (tokens: number) => void;
-  /** Reset the local reasoning controls to defaults (footer reset). The durable
-   *  registry is backend-owned and left untouched. */
+  /** Reset the local reasoning controls to defaults (footer reset). Effort is now
+   *  backend-owned (per-connection), so reset leaves it untouched — only the local
+   *  summarization threshold returns to default. */
   resetModel: () => void;
 }
 
@@ -296,7 +299,18 @@ export const useModelConfigStore = create<ModelConfigState>()(
             return { test: rest };
           }),
 
-        setEffort: (effort) => set({ effort }),
+        setEffort: async (id, effort) => {
+          const conn = get().registry?.connections.find((c) => c.id === id);
+          if (!conn || conn.reasoningEffort === effort) return;
+          set({ saving: true, error: null });
+          try {
+            await ipc.upsertConnection({ ...conn, reasoningEffort: effort });
+            await refresh();
+            set({ saving: false });
+          } catch (err) {
+            set({ saving: false, error: errMsg(err) });
+          }
+        },
         setSummarizationThreshold: (tokens) =>
           set({ summarizationThreshold: clampThreshold(tokens) }),
 
@@ -305,9 +319,9 @@ export const useModelConfigStore = create<ModelConfigState>()(
     },
     {
       name: "ff-model",
-      // Only effort/threshold persist locally; the registry is backend-owned.
+      // Only the summarization threshold persists locally; the registry (incl.
+      // per-connection effort, #395) is backend-owned.
       partialize: (s) => ({
-        effort: s.effort,
         summarizationThreshold: s.summarizationThreshold,
       }),
     },
