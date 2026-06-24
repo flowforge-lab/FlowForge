@@ -1,10 +1,17 @@
-//! Atomic multi-file patch application within the jailed workspace.
+//! Multi-file patch application within the jailed workspace.
 //!
 //! Accepts a Codex/OpenAI-style patch envelope (V4A) describing add/update/delete
-//! operations across one or more files and applies them **all-or-nothing**: every
-//! operation is validated against the current on-disk contents first, and only if
-//! all validate are the writes committed. A single mismatched hunk aborts the
-//! whole patch and touches nothing, so the model never lands a half-applied edit.
+//! operations across one or more files and applies them in two phases:
+//!
+//! - **Validation** is all-or-nothing. Every operation is checked against the
+//!   current on-disk contents (or an earlier op's planned result) *before* a
+//!   single byte is written, and a single mismatched hunk aborts the whole patch.
+//!   The model can never land an edit whose precondition did not hold.
+//! - **Commit** writes the validated final state file by file in order. This
+//!   phase is not yet atomic across files: if write #1 succeeds and write #2
+//!   fails on an I/O error (permissions, disk full), #1 is already on disk and
+//!   the error is surfaced verbatim. True multi-file atomicity would require a
+//!   temp-write + rename/swap commit; tracked as a follow-up until then.
 //!
 //! The envelope is context-anchored rather than line-numbered, which is robust to
 //! a model miscounting line offsets:
@@ -62,7 +69,8 @@ impl Tool for ApplyPatchTool {
     }
 
     fn description(&self) -> &str {
-        "Apply a multi-file patch atomically (all-or-nothing) within the workspace. \
+        "Apply a multi-file patch within the workspace; every op is validated \
+         all-or-nothing (a single bad hunk aborts) before any file is written. \
          The `patch` is a Codex-style envelope delimited by `*** Begin Patch` / \
          `*** End Patch`, with `*** Add File:`, `*** Update File:`, and \
          `*** Delete File:` sections. Update sections use unified-diff hunks \
@@ -224,11 +232,29 @@ async fn read_existing(root: &Path, path: &str) -> Result<String, String> {
 fn apply_hunks(path: &str, content: &str, hunks: &[Hunk]) -> Result<String, String> {
     let mut out = content.to_string();
     for (i, hunk) in hunks.iter().enumerate() {
+        // A pure-context block with no `-`/`+` reconstructs identical `old` and
+        // `new`; skip it as a no-op.
         if hunk.old == hunk.new {
             continue;
         }
+        // A hunk with only `+` lines has an empty `old`, so there is nothing to
+        // anchor where the additions should land. An empty needle would instead
+        // match at every position ("ambiguous (N matches)"), so reject it up
+        // front with a targeted message. A fuzzy pass may later anchor such a
+        // hunk to the file head/tail; see docs/plans/apply-patch-followups.md.
+        if hunk.old.is_empty() {
+            return Err(format!(
+                "{path}: hunk {} has no context line to anchor the addition; \
+                 prepend a context line (` `) before the `+` line(s)",
+                i + 1
+            ));
+        }
         let count = out.matches(&hunk.old).count();
         if count == 0 {
+            // Reconstructed `old` lines each carry a trailing `\n`, so a hunk
+            // touching the final line of a no-trailing-newline file misses here
+            // and fails safe. A trailing-newline-normalizing match pass would
+            // relax this; see docs/plans/apply-patch-followups.md.
             return Err(format!(
                 "{path}: hunk {} context not found in current file",
                 i + 1
@@ -490,6 +516,30 @@ mod tests {
             .await;
         assert!(!out.success);
         assert!(out.content.contains("ambiguous"), "{}", out.content);
+    }
+
+    #[tokio::test]
+    async fn pure_addition_hunk_gives_targeted_error() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("b.txt"), "keep\n").unwrap();
+        // A hunk with only `+` lines has no context/removal to anchor where the
+        // addition lands; it must be rejected with a clear message rather than
+        // the misleading "N matches" an empty needle would produce.
+        let patch = env("*** Update File: b.txt\n@@\n+injected");
+        let out = ApplyPatchTool
+            .run(serde_json::json!({ "patch": patch }), dir.path())
+            .await;
+        assert!(!out.success);
+        assert!(
+            out.content.contains("no context line to anchor"),
+            "{}",
+            out.content
+        );
+        assert!(
+            !out.content.contains("ambiguous"),
+            "pure-addition should not be reported as ambiguity: {}",
+            out.content
+        );
     }
 
     #[tokio::test]
