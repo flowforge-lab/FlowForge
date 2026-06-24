@@ -147,3 +147,78 @@ describe("ChatView reloaded multi-step turns (#413)", () => {
     expect(within(container).getByText("Run `ls`")).toBeTruthy();
   });
 });
+
+describe("ChatView interleaved intermediate prose (#415)", () => {
+  function interleavedTurn(): Message[] {
+    return [
+      { id: "u1", sessionId: SID, role: "user", content: "go", createdAt: 1 },
+      {
+        id: "a1",
+        sessionId: SID,
+        role: "assistant",
+        content: "Reading the file.",
+        toolCalls: [bashCall("c1", "ls")],
+        createdAt: 1,
+      },
+      {
+        id: "tr1",
+        sessionId: SID,
+        role: "tool",
+        toolCallId: "c1",
+        content: "out1",
+        createdAt: 2,
+      },
+      {
+        id: "a2",
+        sessionId: SID,
+        role: "assistant",
+        content: "Now searching.",
+        toolCalls: [bashCall("c2", "pwd")],
+        createdAt: 2,
+      },
+      {
+        id: "tr2",
+        sessionId: SID,
+        role: "tool",
+        toolCallId: "c2",
+        content: "out2",
+        createdAt: 3,
+      },
+      {
+        id: "a3",
+        sessionId: SID,
+        role: "assistant",
+        content: "Done.",
+        createdAt: 3,
+      },
+    ];
+  }
+
+  it("renders intermediate prose as folded rows, interleaved with the steps", () => {
+    seed(interleavedTurn());
+    const { container } = render(<ChatView />);
+
+    const header = groupHeader(container);
+    expect(header!.textContent).toContain("2 steps");
+    // Collapsed by default: prose rows not shown yet.
+    expect(within(container).queryByText("Reading the file.")).toBeNull();
+
+    fireEvent.click(header!);
+    const q = within(container);
+    expect(q.getByText("Reading the file.")).toBeTruthy();
+    expect(q.getByText("Now searching.")).toBeTruthy();
+    expect(q.getByText("Run `ls`")).toBeTruthy();
+    expect(q.getByText("Run `pwd`")).toBeTruthy();
+
+    // Order: prose₁ → step₁ → prose₂ → step₂.
+    const body = container.textContent ?? "";
+    const order = [
+      "Reading the file.",
+      "Run `ls`",
+      "Now searching.",
+      "Run `pwd`",
+    ].map((t) => body.indexOf(t));
+    expect(order).toEqual([...order].sort((a, b) => a - b));
+    expect(order.every((i) => i >= 0)).toBe(true);
+  });
+});

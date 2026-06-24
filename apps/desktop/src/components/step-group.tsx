@@ -2,7 +2,9 @@ import { useEffect, useState } from "react";
 import { ChevronRight, Loader2 } from "@/components/ui/icon";
 import { cn } from "@/lib/utils";
 import type { ToolStep } from "@/store/chat";
+import type { TurnItem } from "@/lib/turn-groups";
 import { ToolStepBlock } from "@/components/tool-step";
+import { ProseStepBlock } from "@/components/prose-step";
 import { ThinkingBlock } from "@/components/thinking-block";
 import {
   answerPreview,
@@ -21,6 +23,7 @@ import {
 // settled → collapsed, but a manual toggle wins and survives the flip.
 export function StepGroup({
   steps,
+  items,
   streaming,
   turnStartMs,
   reasoning,
@@ -32,6 +35,8 @@ export function StepGroup({
   onAnswer,
 }: {
   steps: ToolStep[];
+  /** Ordered prose + step rows (#415). Defaults to the steps alone when omitted. */
+  items?: TurnItem[];
   streaming: boolean;
   /** Wall-clock turn start from send / first stream (#180). */
   turnStartMs?: number | null;
@@ -78,6 +83,20 @@ export function StepGroup({
     awaiting,
     peekExpanded: effectivePeekExpanded,
   });
+
+  // Render interleaved prose + steps (#415); fall back to the steps alone. While the
+  // peek window hides earlier steps, drop the items before the first visible step so
+  // the prose stays anchored to the steps it narrates.
+  const allItems: TurnItem[] =
+    items ?? steps.map((step) => ({ kind: "step", step }));
+  const firstVisible = visible[0];
+  const sliceFrom =
+    visible.length < steps.length && firstVisible
+      ? allItems.findIndex(
+          (it) => it.kind === "step" && it.step === firstVisible,
+        )
+      : 0;
+  const visibleItems = sliceFrom > 0 ? allItems.slice(sliceFrom) : allItems;
 
   return (
     <div className="w-full font-mono text-[11px]">
@@ -131,16 +150,20 @@ export function StepGroup({
                 : `+${earlierCount} earlier ${earlierCount === 1 ? "step" : "steps"}`}
             </button>
           )}
-          {visible.map((step) => (
-            <ToolStepBlock
-              key={step.callId}
-              step={step}
-              onRespond={onRespond}
-              onApproveSession={onApproveSession}
-              onApproveAlways={onApproveAlways}
-              onAnswer={onAnswer}
-            />
-          ))}
+          {visibleItems.map((it) =>
+            it.kind === "prose" ? (
+              <ProseStepBlock key={`prose:${it.key}`} text={it.text} />
+            ) : (
+              <ToolStepBlock
+                key={it.step.callId}
+                step={it.step}
+                onRespond={onRespond}
+                onApproveSession={onApproveSession}
+                onApproveAlways={onApproveAlways}
+                onAnswer={onAnswer}
+              />
+            ),
+          )}
         </div>
       )}
     </div>
