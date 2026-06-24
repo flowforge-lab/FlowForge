@@ -1,10 +1,17 @@
-//! Atomic multi-file patch application within the jailed workspace.
+//! Multi-file patch application within the jailed workspace.
 //!
 //! Accepts a Codex/OpenAI-style patch envelope (V4A) describing add/update/delete
-//! operations across one or more files and applies them **all-or-nothing**: every
-//! operation is validated against the current on-disk contents first, and only if
-//! all validate are the writes committed. A single mismatched hunk aborts the
-//! whole patch and touches nothing, so the model never lands a half-applied edit.
+//! operations across one or more files. Application is split into two phases:
+//!
+//! * **Validation (all-or-nothing):** every operation is checked against the
+//!   current on-disk contents (or an earlier op's planned result) before a single
+//!   byte is written. A single mismatched hunk aborts the whole patch and leaves
+//!   the workspace untouched, so a context error never lands a half-applied edit.
+//! * **Commit (per-file, best-effort):** once validation passes, the planned
+//!   writes and deletes are applied one file at a time. Commit is *not* atomic
+//!   across files: if the write for file N fails (permissions, disk full), files
+//!   1..N-1 are already on disk and are not rolled back. True multi-file
+//!   atomicity would require temp-write + rename/swap, which is not yet done.
 //!
 //! The envelope is context-anchored rather than line-numbered, which is robust to
 //! a model miscounting line offsets:
@@ -62,8 +69,10 @@ impl Tool for ApplyPatchTool {
     }
 
     fn description(&self) -> &str {
-        "Apply a multi-file patch atomically (all-or-nothing) within the workspace. \
-         The `patch` is a Codex-style envelope delimited by `*** Begin Patch` / \
+        "Apply a multi-file patch within the workspace. Validation is all-or-nothing \
+         (a mismatched hunk aborts before any write); commit then applies file-by-file \
+         with no cross-file rollback on a mid-commit I/O error. The `patch` is a \
+         Codex-style envelope delimited by `*** Begin Patch` / \
          `*** End Patch`, with `*** Add File:`, `*** Update File:`, and \
          `*** Delete File:` sections. Update sections use unified-diff hunks \
          (lines prefixed with a space for context, `-` to remove, `+` to add), \
@@ -112,7 +121,10 @@ impl Tool for ApplyPatchTool {
         }
 
         // Phase 2: commit. Validation already passed, so these are expected to
-        // succeed; any I/O error here is surfaced verbatim.
+        // succeed; any I/O error here is surfaced verbatim. Commit is per-file,
+        // not cross-file atomic: a failure on file N leaves files 1..N-1 already
+        // written, with no rollback. True atomicity would need temp-write +
+        // rename/swap across all targets (not yet implemented).
         let mut written = 0usize;
         let mut deleted = 0usize;
         for (path, state) in &planned {
