@@ -33,18 +33,34 @@ pub(crate) const CONNECT_TIMEOUT_SECS: u64 = 10;
 /// existing bounded retry recovers automatically. This is an idle-between-reads
 /// timeout, NOT a total-request timeout: long legitimate reasoning streams that
 /// keep emitting bytes are unaffected.
-pub(crate) const IDLE_READ_TIMEOUT_SECS: u64 = 60;
+///
+/// Set to 30s (down from 60s): a healthy hosted gateway's time-to-first-byte is
+/// well under this, and with up to `MAX_PROVIDER_ATTEMPTS` retries a 60s idle
+/// budget meant a single stall could silently burn ~3 min before recovery.
+pub(crate) const IDLE_READ_TIMEOUT_SECS: u64 = 30;
 
 /// Shared reqwest client for the SSE-based providers (OpenAI-compatible,
 /// Ollama-native, Anthropic Messages). Bedrock builds its own client through the
 /// AWS SDK, which carries its own timeouts. Falls back to a default client if the
 /// builder fails so provider construction stays infallible.
+///
+/// The client is built **once** and cached process-wide (#B3): a `reqwest::Client`
+/// is `Arc`-internally and clones share one connection pool, so reusing it across
+/// provider builds lets a new turn reuse the previous turn's kept-alive TLS
+/// connection instead of paying a cold TCP+TLS handshake every turn. The timeout
+/// config is identical for every build, so a singleton is behavior-equivalent
+/// apart from the (desirable) connection reuse.
 pub(crate) fn build_streaming_http_client() -> reqwest::Client {
-    reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(CONNECT_TIMEOUT_SECS))
-        .read_timeout(Duration::from_secs(IDLE_READ_TIMEOUT_SECS))
-        .build()
-        .unwrap_or_else(|_| reqwest::Client::new())
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(CONNECT_TIMEOUT_SECS))
+                .read_timeout(Duration::from_secs(IDLE_READ_TIMEOUT_SECS))
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new())
+        })
+        .clone()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
