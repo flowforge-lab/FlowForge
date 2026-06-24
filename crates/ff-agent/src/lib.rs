@@ -43,9 +43,12 @@ pub use system_prompt::{build_flush_prompt, build_system_prompt, TimeOfDay, User
 pub const DEFAULT_MAX_ITERATIONS: usize = 8;
 
 /// When this many iterations (including the current one) remain before the cap,
-/// the loop injects a transient "wrap up" nudge so the model produces a final
-/// answer instead of being cut mid-tool-call (#244 R3).
-const WRAP_UP_AT_REMAINING: usize = 1;
+/// the loop injects a transient "wrap up" nudge so the model has runway to
+/// converge on a final answer instead of being cut mid-tool-call (#244 R3). On
+/// the very last iteration (`remaining == 1`) the tool schema is additionally
+/// withheld so the model *must* emit text rather than another tool call that
+/// would be lost to the cap (RC3, #454).
+const WRAP_UP_AT_REMAINING: usize = 3;
 
 /// A transient provider error (connection blip, 429/5xx) is retried up to this many
 /// total attempts before the turn surfaces the failure (#244 R1). Bounded so a hard
@@ -823,10 +826,19 @@ pub async fn run_turn(
             calls.clear();
             let mut emitted_any = false;
 
+            // On the very last iteration, withhold tools entirely so the model
+            // emits a final answer instead of another tool call that would be cut
+            // off as "[stopped: reached tool-call limit]" (RC3, #454). The widened
+            // wrap-up nudge above gives advance warning; this is the hard stop.
+            let withhold_tools = max_iter > 1 && remaining <= 1;
             let req = ChatRequest {
                 model: model.to_string(),
                 messages: messages.clone(),
-                tools: tool_schemas.clone(),
+                tools: if withhold_tools {
+                    Vec::new()
+                } else {
+                    tool_schemas.clone()
+                },
                 thinking: step_thinking,
             };
 
@@ -3118,10 +3130,12 @@ mod tests {
     }
 
     /// Always requests a tool call (never finishes on its own), and records, per
-    /// request, whether the wrap-up nudge system message was present. Lets a test
-    /// drive the loop to its iteration cap and assert when the nudge fires.
+    /// request, whether the wrap-up nudge system message was present and whether
+    /// the tool schema was withheld. Lets a test drive the loop to its iteration
+    /// cap and assert when the nudge fires and when tools are withdrawn.
     struct RecordingToolLooper {
         nudge_seen: Arc<std::sync::Mutex<Vec<bool>>>,
+        tools_withheld: Arc<std::sync::Mutex<Vec<bool>>>,
     }
 
     #[async_trait]
@@ -3134,6 +3148,10 @@ mod tests {
                         .is_some_and(|c| c.contains("final step before the tool-call limit"))
             });
             self.nudge_seen.lock().unwrap().push(saw);
+            self.tools_withheld
+                .lock()
+                .unwrap()
+                .push(req.tools.is_empty());
             Ok(futures_util::stream::iter(vec![Ok(Chunk {
                 tool_calls: vec![ToolCallDelta {
                     index: 0,
@@ -3149,7 +3167,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wrap_up_nudge_fires_only_on_final_iteration() {
+    async fn wrap_up_nudge_fires_in_window_and_tools_withheld_on_final_iteration() {
         let dir = tempfile::tempdir().unwrap();
         let store = SessionStore::new();
         let s = store.create_session(None);
@@ -3157,10 +3175,13 @@ mod tests {
         let registry = ToolRegistry::with_defaults();
         let approve = AlwaysApprove;
         let nudge_seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let tools_withheld = Arc::new(std::sync::Mutex::new(Vec::new()));
         let provider = RecordingToolLooper {
             nudge_seen: nudge_seen.clone(),
+            tools_withheld: tools_withheld.clone(),
         };
-        let tools = ToolContext::new(&registry, dir.path(), &approve, 3);
+        // Cap 5 with WRAP_UP_AT_REMAINING == 3: remaining counts down 5,4,3,2,1.
+        let tools = ToolContext::new(&registry, dir.path(), &approve, 5);
 
         run_turn(
             &provider,
@@ -3178,9 +3199,12 @@ mod tests {
 
         let seen = nudge_seen.lock().unwrap();
         // The provider is hit once per iteration, up to the cap.
-        assert_eq!(seen.len(), 3, "loop should run to the iteration cap");
-        // The nudge is injected only on the final iteration (remaining == 1).
-        assert_eq!(seen.as_slice(), &[false, false, true]);
+        assert_eq!(seen.len(), 5, "loop should run to the iteration cap");
+        // The nudge fires across the wrap-up window (remaining <= 3): the last 3.
+        assert_eq!(seen.as_slice(), &[false, false, true, true, true]);
+        // Tools are withheld only on the very last iteration (remaining == 1).
+        let withheld = tools_withheld.lock().unwrap();
+        assert_eq!(withheld.as_slice(), &[false, false, false, false, true]);
     }
 
     #[tokio::test]
@@ -3194,6 +3218,7 @@ mod tests {
         let nudge_seen = Arc::new(std::sync::Mutex::new(Vec::new()));
         let provider = RecordingToolLooper {
             nudge_seen: nudge_seen.clone(),
+            tools_withheld: Arc::new(std::sync::Mutex::new(Vec::new())),
         };
         let tools = ToolContext::new(&registry, dir.path(), &approve, 1);
 
@@ -3214,6 +3239,75 @@ mod tests {
         let seen = nudge_seen.lock().unwrap();
         // With a single-iteration cap there is no "next step" to wrap up toward.
         assert_eq!(seen.as_slice(), &[false]);
+    }
+
+    /// Loops on tool calls while tools are advertised, but emits a final text
+    /// answer the moment the request carries no tools. Lets a test prove that
+    /// withholding tools on the last iteration forces a real answer.
+    struct FinalizesWhenToolsWithdrawn;
+    #[async_trait]
+    impl Provider for FinalizesWhenToolsWithdrawn {
+        async fn chat_stream(&self, req: ChatRequest) -> Result<ChunkStream, LlmError> {
+            let chunk = if req.tools.is_empty() {
+                Chunk {
+                    delta: "wrapped up".into(),
+                    done: true,
+                    ..Chunk::default()
+                }
+            } else {
+                Chunk {
+                    tool_calls: vec![ToolCallDelta {
+                        index: 0,
+                        id: Some("call_1".into()),
+                        name: Some("bash".into()),
+                        arguments: r#"{"command":"echo loop"}"#.into(),
+                    }],
+                    done: true,
+                    ..Chunk::default()
+                }
+            };
+            Ok(futures_util::stream::iter(vec![Ok(chunk)]).boxed())
+        }
+    }
+
+    #[tokio::test]
+    async fn cap_finalization_produces_answer_not_stopped_notice() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::new();
+        let s = store.create_session(None);
+        store.add_message(&s.id, Role::User, "review this".into());
+        let registry = ToolRegistry::with_defaults();
+        let approve = AlwaysApprove;
+        // A model that never finishes on its own would previously loop to the cap
+        // and yield "[stopped: reached tool-call limit]". Withholding tools on the
+        // final iteration (RC3, #454) must instead force a real text answer.
+        let tools = ToolContext::new(&registry, dir.path(), &approve, 3);
+
+        let final_msg = run_turn(
+            &FinalizesWhenToolsWithdrawn,
+            &store,
+            &tools,
+            &s.id,
+            "mock",
+            None,
+            false,
+            CancelToken::new(),
+            |_| {},
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            final_msg.content.contains("wrapped up"),
+            "the turn must end with a real answer, got: {}",
+            final_msg.content
+        );
+        assert!(
+            !final_msg
+                .content
+                .contains("[stopped: reached tool-call limit]"),
+            "withholding tools on the final iteration must avoid the dead-end notice"
+        );
     }
 
     // ----- #244 R4: tool-argument parse feedback -----
