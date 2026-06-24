@@ -219,30 +219,66 @@ async fn read_existing(root: &Path, path: &str) -> Result<String, String> {
 }
 
 /// Apply each hunk's `old -> new` substitution in order against the evolving
-/// content. `old` must occur exactly once (unique), mirroring `edit`'s contract,
-/// so an ambiguous anchor aborts rather than guessing.
+/// content. Each hunk must match exactly once (unique), mirroring `edit`'s
+/// contract, so an absent or ambiguous anchor aborts rather than guessing.
 fn apply_hunks(path: &str, content: &str, hunks: &[Hunk]) -> Result<String, String> {
     let mut out = content.to_string();
     for (i, hunk) in hunks.iter().enumerate() {
         if hunk.old == hunk.new {
             continue;
         }
-        let count = out.matches(&hunk.old).count();
-        if count == 0 {
-            return Err(format!(
-                "{path}: hunk {} context not found in current file",
-                i + 1
-            ));
-        }
-        if count > 1 {
-            return Err(format!(
-                "{path}: hunk {} context is ambiguous ({count} matches); add more context lines",
-                i + 1
-            ));
-        }
-        out = out.replacen(&hunk.old, &hunk.new, 1);
+        out = apply_one_hunk(path, i, &out, hunk)?;
     }
     Ok(out)
+}
+
+/// Locate `hunk.old` exactly once in `content` and substitute `hunk.new`.
+///
+/// The parser rebuilds `old`/`new` with a trailing `\n` after every line. Files
+/// frequently omit the final newline, so a hunk anchored on the last line would
+/// otherwise never match (the reconstructed `old` ends in `\n`; the file does
+/// not). When the strict, newline-terminated `old` is absent, we fall back to an
+/// end-of-file match: the trailing `\n` is dropped from both `old` and `new` and
+/// the replacement is anchored to the end of the content, preserving the file's
+/// no-trailing-newline property.
+fn apply_one_hunk(path: &str, i: usize, content: &str, hunk: &Hunk) -> Result<String, String> {
+    let n = i + 1;
+    let count = content.matches(&hunk.old).count();
+    if count == 1 {
+        return Ok(content.replacen(&hunk.old, &hunk.new, 1));
+    }
+    if count > 1 {
+        return Err(format!(
+            "{path}: hunk {n} context is ambiguous ({count} matches); add more context lines"
+        ));
+    }
+
+    // `count == 0`: the newline-terminated `old` is not present. Try the
+    // end-of-file variant — drop the trailing newline so a file that does not
+    // end in `\n` can still match when the hunk touches its final line.
+    let Some(old_eof) = hunk.old.strip_suffix('\n') else {
+        return Err(format!(
+            "{path}: hunk {n} context not found in current file"
+        ));
+    };
+    let new_eof: &str = match hunk.new.strip_suffix('\n') {
+        Some(s) => s,
+        // Empty `new` (pure deletion): nothing to strip, leave it empty.
+        None => hunk.new.as_str(),
+    };
+
+    let eof_count = content.matches(old_eof).count();
+    if eof_count == 1 && content.ends_with(old_eof) {
+        return Ok(content.replacen(old_eof, new_eof, 1));
+    }
+    if eof_count > 1 {
+        return Err(format!(
+            "{path}: hunk {n} context is ambiguous ({eof_count} matches); add more context lines"
+        ));
+    }
+    Err(format!(
+        "{path}: hunk {n} context not found in current file"
+    ))
 }
 
 /// Parse a V4A patch envelope into ordered file operations. Strict: requires the
@@ -548,5 +584,86 @@ mod tests {
         let out = ApplyPatchTool.run(serde_json::json!({}), dir.path()).await;
         assert!(!out.success);
         assert!(out.content.contains("missing required argument"));
+    }
+
+    #[tokio::test]
+    async fn updates_last_line_without_trailing_newline() {
+        let dir = tempfile::tempdir().unwrap();
+        // File ends with no trailing newline.
+        fs::write(dir.path().join("f.txt"), "one\ntwo\nthree").unwrap();
+        let patch = env("*** Update File: f.txt\n@@\n two\n-three\n+THREE");
+        let out = ApplyPatchTool
+            .run(serde_json::json!({ "patch": patch }), dir.path())
+            .await;
+        assert!(out.success, "{}", out.content);
+        assert_eq!(
+            fs::read_to_string(dir.path().join("f.txt")).unwrap(),
+            "one\ntwo\nTHREE"
+        );
+    }
+
+    #[tokio::test]
+    async fn adds_line_at_eof_without_trailing_newline() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("f.txt"), "one\ntwo\nthree").unwrap();
+        let patch = env("*** Update File: f.txt\n@@\n three\n+four");
+        let out = ApplyPatchTool
+            .run(serde_json::json!({ "patch": patch }), dir.path())
+            .await;
+        assert!(out.success, "{}", out.content);
+        // The no-trailing-newline property is preserved on the new last line.
+        assert_eq!(
+            fs::read_to_string(dir.path().join("f.txt")).unwrap(),
+            "one\ntwo\nthree\nfour"
+        );
+    }
+
+    #[tokio::test]
+    async fn removes_last_line_without_trailing_newline() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("f.txt"), "one\ntwo\nthree").unwrap();
+        let patch = env("*** Update File: f.txt\n@@\n two\n-three");
+        let out = ApplyPatchTool
+            .run(serde_json::json!({ "patch": patch }), dir.path())
+            .await;
+        assert!(out.success, "{}", out.content);
+        assert_eq!(
+            fs::read_to_string(dir.path().join("f.txt")).unwrap(),
+            "one\ntwo"
+        );
+    }
+
+    #[tokio::test]
+    async fn trailing_newline_file_still_matches_strictly_at_eof() {
+        // Regression: a file that *does* end in `\n` must keep its trailing
+        // newline when its last line is edited (strict path, not the EOF one).
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("f.txt"), "one\ntwo\nthree\n").unwrap();
+        let patch = env("*** Update File: f.txt\n@@\n two\n-three\n+THREE");
+        let out = ApplyPatchTool
+            .run(serde_json::json!({ "patch": patch }), dir.path())
+            .await;
+        assert!(out.success, "{}", out.content);
+        assert_eq!(
+            fs::read_to_string(dir.path().join("f.txt")).unwrap(),
+            "one\ntwo\nTHREE\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_trailing_newline_then_multi_hunk_in_sequence() {
+        // First hunk edits a middle line (strict), second hunk edits the EOF
+        // line without a trailing newline — both in one Update section.
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("f.txt"), "one\ntwo\nthree\nfour").unwrap();
+        let patch = env("*** Update File: f.txt\n@@\n one\n-two\n+TWO\n@@\n three\n-four\n+FOUR");
+        let out = ApplyPatchTool
+            .run(serde_json::json!({ "patch": patch }), dir.path())
+            .await;
+        assert!(out.success, "{}", out.content);
+        assert_eq!(
+            fs::read_to_string(dir.path().join("f.txt")).unwrap(),
+            "one\nTWO\nthree\nFOUR"
+        );
     }
 }
