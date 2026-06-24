@@ -9,6 +9,7 @@ mod mcp;
 mod memory;
 mod message;
 mod mode;
+mod model_specs;
 mod provider;
 mod search;
 mod session;
@@ -19,6 +20,10 @@ pub use mcp::{McpServerConfig, McpServerState, McpServerStatus, McpToolInfo};
 pub use memory::{MemoryFileInfo, MemoryFileKind, MemoryOverview};
 pub use message::{Attachment, AttachmentKind, AttachmentSource, Message, Role, ToolCall};
 pub use mode::Mode;
+pub use model_specs::{
+    bundled_rules, context_window_in, parse_specs, ModelSpec, ModelSpecs,
+    DEFAULT_CONTEXT_WINDOW_TOKENS,
+};
 pub use provider::{
     BedrockAuth, ConnectionId, ProviderConfig, ProviderConnection, ProviderKind, ProviderRegistry,
     ReasoningEffort, SecretKind,

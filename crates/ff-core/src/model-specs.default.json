@@ -1,0 +1,24 @@
+{
+  "rules": [
+    { "match": "glm-5.2", "context_window": 1048576 },
+    { "match": "glm-4.5-air", "context_window": 98304 },
+    { "match": "glm-5", "context_window": 202752 },
+    { "match": "glm-5v", "context_window": 202752 },
+    { "match": "glm-4.6", "context_window": 202752 },
+    { "match": "glm", "context_window": 131072 },
+    { "match": "deepseek-v4", "context_window": 1000000 },
+    { "match": "deepseek", "context_window": 163840 },
+    { "match": "kimi", "context_window": 262144 },
+    { "match": "minimax-m3", "context_window": 700000 },
+    { "match": "minimax", "context_window": 196608 },
+    { "match": "claude", "context_window": 200000 },
+    { "match": "anthropic", "context_window": 200000 },
+    { "match": "opus", "context_window": 200000 },
+    { "match": "sonnet", "context_window": 200000 },
+    { "match": "haiku", "context_window": 200000 },
+    { "match": "gpt-4o", "context_window": 128000 },
+    { "match": "gpt-4.1", "context_window": 128000 },
+    { "match": "o1", "context_window": 128000 },
+    { "match": "o3", "context_window": 128000 }
+  ]
+}

@@ -7,6 +7,7 @@ repository.workspace = true
 
 [dependencies]
 ff-core = { workspace = true }
+dirs = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 async-trait = { workspace = true }
@@ -40,3 +41,4 @@ aws-credential-types = { version = "1", features = ["hardcoded-credentials"] }
 [dev-dependencies]
 tokio = { workspace = true }
 wiremock = { workspace = true }
+tempfile = { workspace = true }
