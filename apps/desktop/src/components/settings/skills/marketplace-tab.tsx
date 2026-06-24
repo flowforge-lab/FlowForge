@@ -3,6 +3,7 @@ import { Download, Search } from "@/components/ui/icon";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import { ErrorState } from "@/components/ui/error-state";
+import { Skeleton } from "@/components/ui/skeleton";
 import { ipc } from "@/lib/ipc";
 import type { MarketplaceSkill } from "@/lib/marketplace";
 
@@ -119,9 +120,9 @@ function MarketplaceSkeleton() {
       {[0, 1, 2].map((i) => (
         <li key={i} className="rounded-md border px-3 py-2.5">
           <div className="space-y-2">
-            <div className="h-3 w-1/3 animate-pulse rounded bg-muted" />
-            <div className="h-2.5 w-3/4 animate-pulse rounded bg-muted" />
-            <div className="h-2.5 w-1/4 animate-pulse rounded bg-muted" />
+            <Skeleton className="h-3 w-1/3" />
+            <Skeleton className="h-2.5 w-3/4" />
+            <Skeleton className="h-2.5 w-1/4" />
           </div>
         </li>
       ))}

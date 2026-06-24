@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { PlugZap, X } from "@/components/ui/icon";
 import { Button } from "@/components/ui/button";
+import { Toast, ToastViewport } from "@/components/ui/toast";
 import { unavailableToastBody } from "@/lib/phenotype-mcp";
 import { usePhenoMcpNoticeStore } from "@/store/pheno-mcp-notice";
 import { useSettingsStore } from "@/store/settings";
@@ -45,13 +46,10 @@ export function PhenoMcpToast() {
   };
 
   return (
-    // Wrapper is click-through so it never blocks the canvas behind it; the card
-    // re-enables pointer events.
-    <div className="pointer-events-none fixed bottom-4 right-4 z-50 flex max-w-sm">
-      <div
-        role="status"
-        aria-live="polite"
-        className="pointer-events-auto w-full rounded-lg border bg-popover/95 p-3 text-popover-foreground shadow-lg backdrop-blur"
+    // Viewport is click-through so it never blocks the canvas behind it; the
+    // card re-enables pointer events.
+    <ToastViewport>
+      <Toast
         onMouseEnter={() => setPaused(true)}
         onMouseLeave={() => setPaused(false)}
         onFocus={() => setPaused(true)}
@@ -86,7 +84,7 @@ export function PhenoMcpToast() {
             <X className="size-3.5" />
           </Button>
         </div>
-      </div>
-    </div>
+      </Toast>
+    </ToastViewport>
   );
 }

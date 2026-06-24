@@ -20,6 +20,7 @@ export {
   Check,
   ChevronDown,
   ChevronRight,
+  ChevronUp,
   ChevronsUpDown,
   CircleDot,
   CircleOff,
