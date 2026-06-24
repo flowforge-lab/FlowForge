@@ -26,6 +26,7 @@ export type { ToolCallEvent } from "./ToolCallEvent";
 export type { ToolResultEvent } from "./ToolResultEvent";
 export type { TurnDoneEvent } from "./TurnDoneEvent";
 export type { TurnErrorEvent } from "./TurnErrorEvent";
+export type { TurnStatsEvent } from "./TurnStatsEvent";
 export type { MemoryFlushedEvent } from "./MemoryFlushedEvent";
 export type { IntentionSignal } from "./IntentionSignal";
 export type { SkillInstallApprovalRequestEvent } from "./SkillInstallApprovalRequestEvent";
