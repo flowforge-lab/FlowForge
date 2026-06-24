@@ -1145,20 +1145,26 @@ pub async fn run_turn(
             let Some(outcome) = outcomes.remove(&call.id) else {
                 continue;
             };
-            // Content-aware, reversible compaction at ingest (M7.1a, RFC 0016
-            // Tier 1): shrink large tool results before they enter the transcript
-            // and stash the verbatim original keyed by the marker's hash so the
-            // model can `compaction_retrieve` it. `truncate_tool_result` stays as
-            // a hard byte backstop for pathological payloads that still exceed the
-            // cap after compaction.
-            let compacted = compaction_extractive::ExtractiveCompactor::default()
-                .compress_one(&outcome.content);
-            let result_msg = store.add_tool_result_message(
-                session_id,
-                call.id.clone(),
-                truncate_tool_result(&compacted.text),
-            );
-            if let Some((key, original)) = compacted.original {
+            // Keep a tool result verbatim on the turn it is produced (RC1, #453):
+            // the model must read the full content on its first look, or it is
+            // forced into a `compaction_retrieve` round-trip / re-read loop. Only a
+            // result that exceeds the hard per-result byte cap is reversibly
+            // compacted at ingest -- so an oversized payload stays retrievable
+            // rather than hard-truncated -- while everything within the cap is
+            // stored byte-for-byte. Whole-transcript pressure is still relieved by
+            // cold-tail compaction (`compact_cold_collect` + `KEEP_RECENT_VERBATIM`)
+            // once a result ages out of the hot window; `truncate_tool_result`
+            // remains the last-resort backstop for an oversized payload that does
+            // not compress below the cap.
+            let (stored, original) = if outcome.content.len() > TOOL_RESULT_MAX_BYTES {
+                let compacted = compaction_extractive::ExtractiveCompactor::default()
+                    .compress_one(&outcome.content);
+                (truncate_tool_result(&compacted.text), compacted.original)
+            } else {
+                (outcome.content.clone(), None)
+            };
+            let result_msg = store.add_tool_result_message(session_id, call.id.clone(), stored);
+            if let Some((key, original)) = original {
                 store.put_compaction_original(session_id, &result_msg.id, &key, &original);
             }
             backfill.fulfilled(&call.id);
@@ -3894,8 +3900,10 @@ mod tests {
         );
     }
 
-    /// A tool whose result is a large, compressible JSON blob.
-    struct JsonResultTool;
+    /// A tool whose result is a compressible JSON blob of a configurable size.
+    struct JsonResultTool {
+        summary_len: usize,
+    }
     #[async_trait]
     impl ff_tools::Tool for JsonResultTool {
         fn name(&self) -> &str {
@@ -3912,7 +3920,7 @@ mod tests {
         }
         async fn run(&self, _args: serde_json::Value, _root: &Path) -> ff_tools::ToolOutcome {
             let blob = serde_json::to_string(&serde_json::json!({
-                "summary": "x".repeat(4000),
+                "summary": "x".repeat(self.summary_len),
                 "items": (0..50).map(|i| format!("row {i}")).collect::<Vec<_>>(),
             }))
             .unwrap();
@@ -3956,7 +3964,11 @@ mod tests {
         let s = store.create_session(None);
         store.add_message(&s.id, Role::User, "go".into());
         let mut registry = ToolRegistry::new();
-        registry.register(Box::new(JsonResultTool));
+        // Over the hard per-result byte cap, so it takes the reversible ingest
+        // compaction path (RC1 #453: only oversized results are compacted at ingest).
+        registry.register(Box::new(JsonResultTool {
+            summary_len: TOOL_RESULT_MAX_BYTES + 4000,
+        }));
         let root = std::env::current_dir().unwrap();
         let approve = AlwaysApprove;
 
@@ -4015,6 +4027,74 @@ mod tests {
             original.len(),
             full_len,
             "retrieved original must be verbatim"
+        );
+    }
+
+    /// RC1 reproduction (PR #452 review timeline): a large tool result produced
+    /// on the CURRENT turn must reach the model verbatim. Today it is compressed
+    /// at ingest (lib.rs `compress_one` on the just-produced outcome) before the
+    /// model ever reads it, so the model's first read of a large diff comes back
+    /// already `[compacted; retrieve key=...]`. That forces a `compaction_retrieve`
+    /// round-trip (or a re-read with a different tool), which is the redundant-step
+    /// loop Abid observed. The cold-tail path (`compact_cold_collect` +
+    /// `KEEP_RECENT_VERBATIM`) already compresses results once they age out of the
+    /// hot window, so ingest-time compression of the hot result is both redundant
+    /// and harmful.
+    ///
+    /// This test asserts the DESIRED behavior and currently FAILS, reproducing RC1.
+    #[tokio::test]
+    async fn current_turn_tool_result_reaches_model_verbatim() {
+        let store = SessionStore::new();
+        let s = store.create_session(None);
+        store.add_message(&s.id, Role::User, "review this".into());
+        let mut registry = ToolRegistry::new();
+        // Within the hard per-result byte cap: must be stored verbatim at ingest.
+        registry.register(Box::new(JsonResultTool { summary_len: 4000 }));
+        let root = std::env::current_dir().unwrap();
+        let approve = AlwaysApprove;
+
+        let mut full_len = 0usize;
+        run_turn(
+            &JsonToolThenText {
+                calls: AtomicUsize::new(0),
+            },
+            &store,
+            &ctx(&registry, &root, &approve),
+            &s.id,
+            "mock",
+            None,
+            false,
+            CancelToken::new(),
+            |ev| {
+                if let AgentEvent::ToolCallFinished { result, .. } = ev {
+                    full_len = result.len();
+                }
+            },
+        )
+        .await
+        .unwrap();
+
+        let history = store.get_messages(&s.id);
+        let tool_msg = history
+            .iter()
+            .find(|m| m.role == Role::Tool)
+            .expect("a tool result message");
+
+        // The most-recent tool result is in the hot window: the model has not yet
+        // had a chance to read it, so it must be stored verbatim with NO retrieve
+        // marker. A marker here means the model's first read is already compacted.
+        assert!(
+            !tool_msg.content.contains("[compacted; retrieve key="),
+            "a current-turn tool result must NOT be compacted at ingest \
+             (the model has not read it yet); got: {}",
+            &tool_msg.content[..tool_msg.content.len().min(200)]
+        );
+        assert_eq!(
+            tool_msg.content.len(),
+            full_len,
+            "the current-turn tool result must reach the transcript verbatim \
+             (stored {} bytes vs original {full_len})",
+            tool_msg.content.len()
         );
     }
 
