@@ -122,6 +122,14 @@ const REASONING_MAX_BYTES: usize = 16 * 1024;
 /// absent reasoning.
 const REASONING_REPLAY_KEEP: usize = 2;
 
+/// Fraction of a model's real context window used as the compaction budget. The
+/// headroom (the remaining ~20%) absorbs the model's own response and the
+/// coarseness of the chars/4 proxy estimate, so compaction engages before the
+/// true window is hit rather than after. Combined with the per-model window from
+/// `Provider::context_window`, this stops a large-window model from being
+/// force-compacted at a small fixed ceiling (#B1).
+const CONTEXT_BUDGET_SAFETY: f64 = 0.8;
+
 /// Events the agent emits during a turn. The host (Tauri shell or a test) decides
 /// how to surface them — over IPC, to a channel, or into assertions.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -509,6 +517,12 @@ pub async fn run_turn(
     let mut last: Option<Message> = None;
 
     let max_iter = tools.max_iterations.max(1);
+    // Size the compaction budget to THIS model's real context window (#B1) so a
+    // large-window model isn't force-compacted at a small fixed ceiling. Built
+    // once per turn and reused for every pressure check below.
+    let estimator = ProxyTokenEstimator {
+        budget_tokens: ((provider.context_window(model) as f64) * CONTEXT_BUDGET_SAFETY) as u64,
+    };
     let mut turn_count: u32 = 0;
     // Repeated-call / no-progress guard (#244 R2): count identical `(tool, arguments)`
     // calls across the turn; `repeat_nudge` carries a tool name to warn about on the
@@ -543,7 +557,7 @@ pub async fn run_turn(
         // session's messages, so `messages` below is unaffected. Best-effort: a flush
         // failure must not abort the user's turn.
         let message_count = history.len() as u64;
-        let pressure = ProxyTokenEstimator::default().assess(&history, model);
+        let pressure = estimator.assess(&history, model);
         // Carries the flush's write count to the `MemoryFlushed` event below, once
         // this iteration's assistant message id exists to correlate it with.
         let mut flushed_writes: Option<u32> = None;
@@ -626,13 +640,15 @@ pub async fn run_turn(
         // `compaction_retrieve` can fetch it back. Best-effort -- a failed or
         // cancelled summary falls back to `wire` and never aborts the user's turn.
         //
-        // A fresh estimator here is deliberate: Tier 1 (above) assesses raw
-        // `history`, but Tier 2 must gate on the projected request size *after*
-        // extractive compression, i.e. the post-Tier-1 `wire`. Both share the same
-        // default 24k budget today; when model-aware budgets land (RFC 0016 6 /
-        // M7.2) every ProxyTokenEstimator::default() site adopts it together.
+        // Tier 1 (above) assesses raw `history`; Tier 2 must gate on the projected
+        // request size *after* extractive compression, i.e. the post-Tier-1 `wire`.
+        // It reuses the same model-aware `estimator` built at the top of the turn
+        // (#B1 / RFC 0016 6), so a large-window model is no longer force-summarized
+        // at the old fixed 24k ceiling -- only when `wire` genuinely nears its real
+        // window. The differing input (`wire`, not `history`) is the intended
+        // distinction between the two tiers, not the budget.
         let wire = if tools.abstractive.enabled
-            && ProxyTokenEstimator::default()
+            && estimator
                 .assess(&wire, model)
                 .is_over(tools.abstractive.fire_at_fraction)
         {
@@ -917,7 +933,7 @@ pub async fn run_turn(
             // token gauge (#244 R6). The proxy estimator (chars/4) is intentionally
             // coarse; per-model tokenizers plug in via ContextPressureEstimator later.
             let token_count = Some(
-                ProxyTokenEstimator::default()
+                estimator
                     .assess(&store.get_messages(session_id), model)
                     .estimated_tokens as u32,
             );
@@ -1205,7 +1221,7 @@ pub async fn run_turn(
     }
     // Same context-size estimate as the plain-text completion path (#244 R6).
     let token_count = Some(
-        ProxyTokenEstimator::default()
+        estimator
             .assess(&store.get_messages(session_id), model)
             .estimated_tokens as u32,
     );
