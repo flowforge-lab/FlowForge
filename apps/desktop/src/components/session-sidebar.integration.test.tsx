@@ -71,7 +71,6 @@ describe("SessionSidebar integration (#185)", () => {
       messagesBySession: {},
       streamingBySession: {},
       toolStepsByMessage: {},
-      sessionTitles: {},
       bootstrapError: null,
     });
   });

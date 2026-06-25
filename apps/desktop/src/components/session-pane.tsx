@@ -31,7 +31,7 @@ export function SessionPane({
 
   const title = useChatStore((s) => {
     const session = s.sessions.find((x) => x.id === sessionId);
-    return session?.title || s.sessionTitles[sessionId] || "New session";
+    return session?.title || "New session";
   });
 
   return (

@@ -167,7 +167,6 @@ function PaletteBody() {
 
   const sessions = useChatStore((s) => s.sessions);
   const activeSessionId = useChatStore((s) => s.activeSessionId);
-  const sessionTitles = useChatStore((s) => s.sessionTitles);
   const leafCount = usePanesStore((s) => s.leafCount());
 
   const phenotypes = useSkillsStore((s) => s.phenotypes);
@@ -206,7 +205,6 @@ function PaletteBody() {
       ...buildCommands({
         sessions,
         activeSessionId,
-        sessionTitles,
         canSplit: leafCount < MAX_PANES,
       }),
       ...buildPhenotypeCommands({ phenotypes, activePhenotype }),
@@ -215,7 +213,6 @@ function PaletteBody() {
     [
       sessions,
       activeSessionId,
-      sessionTitles,
       leafCount,
       phenotypes,
       activePhenotype,

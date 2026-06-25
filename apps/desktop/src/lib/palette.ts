@@ -15,11 +15,10 @@ import { mcpStateMeta } from "@/lib/mcp";
 export function buildCommands(args: {
   sessions: Session[];
   activeSessionId: string | null;
-  sessionTitles: Record<string, string>;
   /** False when the pane cap is reached, so split actions are hidden (#148). */
   canSplit?: boolean;
 }): PaletteCommand[] {
-  const { sessions, activeSessionId, sessionTitles, canSplit = true } = args;
+  const { sessions, activeSessionId, canSplit = true } = args;
 
   const actions: PaletteCommand[] = [
     {
@@ -77,7 +76,7 @@ export function buildCommands(args: {
       kind: "switch-session" as const,
       id: `session:${session.id}`,
       sessionId: session.id,
-      title: resolveLabel(session, sessionTitles[session.id]),
+      title: resolveLabel(session),
       keywords: "session switch jump go to open",
       hint: i < 9 ? `⌘${i + 1}` : undefined,
     }));

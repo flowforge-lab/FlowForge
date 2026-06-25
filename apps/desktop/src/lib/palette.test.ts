@@ -49,12 +49,11 @@ describe("buildCommands", () => {
   const sessions = [
     session({ id: "a" }), // active
     session({ id: "b", goal: "Write docs" }),
-    session({ id: "c" }), // untitled, will be renamed via sessionTitles
+    session({ id: "c", title: "Renamed C" }), // has a server-truth title
   ];
   const built = buildCommands({
     sessions,
     activeSessionId: "a",
-    sessionTitles: { c: "Renamed C" },
   });
   const byId = new Map(built.map((c) => [c.id, c] as const));
 
@@ -74,9 +73,9 @@ describe("buildCommands", () => {
     expect(switchIds).toEqual(["session:b", "session:c"]); // "a" excluded
   });
 
-  it("labels switch commands via resolveLabel (goal, then custom title)", () => {
+  it("labels switch commands via resolveLabel (title beats goal)", () => {
     expect(byId.get("session:b")?.title).toBe("Write docs"); // from goal
-    expect(byId.get("session:c")?.title).toBe("Renamed C"); // custom title wins
+    expect(byId.get("session:c")?.title).toBe("Renamed C"); // server-truth title
   });
 
   it("maps the ⌘1–9 hint to each session's index in the FULL list", () => {
@@ -94,7 +93,6 @@ describe("buildCommands", () => {
     const capped = buildCommands({
       sessions,
       activeSessionId: "a",
-      sessionTitles: {},
       canSplit: false,
     });
     const ids = capped.map((c) => c.id);
@@ -107,7 +105,6 @@ describe("buildCommands", () => {
     const builtMany = buildCommands({
       sessions: many,
       activeSessionId: null,
-      sessionTitles: {},
     });
     const byIdMany = new Map(builtMany.map((c) => [c.id, c] as const));
     expect(byIdMany.get("session:s8")?.hint).toBe("⌘9"); // index 8
@@ -119,7 +116,6 @@ describe("filterCommands", () => {
   const commands = buildCommands({
     sessions: [session({ id: "a" }), session({ id: "b", goal: "Write docs" })],
     activeSessionId: "a",
-    sessionTitles: {},
   });
 
   it("orders recently-run commands first on an empty query", () => {
@@ -206,7 +202,6 @@ describe("mergePaletteResults", () => {
   const staticCmds = buildCommands({
     sessions: [],
     activeSessionId: null,
-    sessionTitles: {},
   });
   const skillCmds = buildSkillCommands([
     {

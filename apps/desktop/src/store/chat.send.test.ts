@@ -16,7 +16,6 @@ describe("chat store — session-scoped send/cancel (#148)", () => {
       turnStartBySession: {},
       turnStartByMessage: {},
       toolStepsByMessage: {},
-      sessionTitles: {},
       bootstrapError: null,
     });
   });
