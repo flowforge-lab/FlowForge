@@ -227,6 +227,23 @@ impl SessionStore {
         .ok();
     }
 
+    /// Re-assign a compacted tool result's verbatim original to a different
+    /// session so it survives that session's deletion (#469). When a sub-agent's
+    /// summary keeps a `[compacted; retrieve key=...]` marker, the backing
+    /// original must be re-homed to the parent session *before* the ephemeral
+    /// child session -- and its `ON DELETE CASCADE` -- tears the row down, or the
+    /// marker dangles and `compaction_retrieve` has nothing to return. No-op when
+    /// `key` is unknown.
+    pub fn rehome_compaction_original(&self, key: &str, new_session_id: &str) {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE compaction_originals SET session_id = ?2, message_id = NULL
+             WHERE key = ?1",
+            params![key, new_session_id],
+        )
+        .ok();
+    }
+
     /// Look up a compacted tool result's verbatim original by its retrieve key.
     /// Returns `None` when no original is stored for the key (e.g. it was never
     /// compacted, or its session was deleted).
@@ -1096,6 +1113,39 @@ mod tests {
             store.compaction_original("k").is_none(),
             "deleting a session must cascade-drop its compaction originals"
         );
+    }
+
+    #[test]
+    fn rehome_compaction_original_survives_child_session_delete() {
+        // #469: a sub-agent stashes originals under its ephemeral child session.
+        // Re-homing a marker's original to the parent before the child is deleted
+        // must keep it retrievable; a sibling original left behind must still cascade.
+        let store = SessionStore::new();
+        let parent = store.create_session(None);
+        let child = store.create_session(None);
+        store.put_compaction_original(&child.id, "m1", "kept", "the kept original");
+        store.put_compaction_original(&child.id, "m2", "dropped", "the dropped original");
+
+        store.rehome_compaction_original("kept", &parent.id);
+        assert!(store.delete_session(&child.id));
+
+        assert_eq!(
+            store.compaction_original("kept").as_deref(),
+            Some("the kept original"),
+            "a re-homed original must survive the child session teardown"
+        );
+        assert!(
+            store.compaction_original("dropped").is_none(),
+            "an original left on the child session must still cascade away"
+        );
+    }
+
+    #[test]
+    fn rehome_compaction_original_unknown_key_is_noop() {
+        let store = SessionStore::new();
+        let s = store.create_session(None);
+        store.rehome_compaction_original("nope", &s.id);
+        assert!(store.compaction_original("nope").is_none());
     }
 
     #[test]
