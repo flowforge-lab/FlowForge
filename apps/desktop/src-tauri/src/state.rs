@@ -1416,6 +1416,20 @@ impl AppState {
         self.approvals.lock().unwrap().cancels.remove(session_id)
     }
 
+    /// Remove this session's cancel token only when it is still `expected` — the
+    /// token THIS turn registered. A successor turn (the re-run that
+    /// `edit_message` spawns after cancelling the in-flight one) may have already
+    /// replaced it via `register_cancel`; removing unconditionally would strip
+    /// the live turn's token, killing its Stop button and auto-denying its tool
+    /// approvals. Identity is by shared flag (`CancelToken::ptr_eq`), not value.
+    pub fn take_cancel_if(&self, session_id: &str, expected: &CancelToken) -> Option<CancelToken> {
+        let mut reg = self.approvals.lock().unwrap();
+        match reg.cancels.get(session_id) {
+            Some(tok) if tok.ptr_eq(expected) => reg.cancels.remove(session_id),
+            _ => None,
+        }
+    }
+
     /// A cheap clone of the current skill set, taken at turn start.
     pub fn skills_snapshot(&self) -> SkillRegistry {
         self.skills.read().unwrap().clone()
@@ -2104,6 +2118,45 @@ mod tests {
         assert!(rx.await.unwrap());
         // The flow releases the liveness token afterward.
         assert!(state.take_cancel("op").is_some());
+    }
+
+    #[test]
+    fn take_cancel_if_removes_only_its_own_token() {
+        // The clean single-turn finish: the token a turn registered is still the
+        // live one, so its epilogue removes it.
+        let state = AppState::new();
+        let token = CancelToken::new();
+        state.register_cancel("sess", token.clone());
+        assert!(
+            state.take_cancel_if("sess", &token).is_some(),
+            "a turn drops its own still-registered token"
+        );
+        assert!(state.take_cancel("sess").is_none(), "map is now empty");
+    }
+
+    #[test]
+    fn take_cancel_if_leaves_a_successor_turns_token() {
+        // The edit-during-live-turn race (#464/#468 blocker): turn A is cancelled
+        // and a re-run turn B registers its token before A's epilogue runs. A must
+        // NOT strip B's token, or B loses its Stop button and auto-denies tools.
+        let state = AppState::new();
+        let token_a = CancelToken::new();
+        state.register_cancel("sess", token_a.clone());
+
+        // Turn B replaces the session's token (mirrors edit_message -> spawn).
+        let token_b = CancelToken::new();
+        state.register_cancel("sess", token_b.clone());
+
+        // Turn A's epilogue: identity check fails, B's token survives.
+        assert!(
+            state.take_cancel_if("sess", &token_a).is_none(),
+            "A must not remove B's token"
+        );
+        // B's token is still live and removable by B's own epilogue.
+        assert!(
+            state.take_cancel_if("sess", &token_b).is_some(),
+            "B drops its own token cleanly"
+        );
     }
 
     #[tokio::test]

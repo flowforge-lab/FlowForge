@@ -44,6 +44,32 @@ fn text_to_enum<T: serde::de::DeserializeOwned>(text: &str) -> Option<T> {
     serde_json::from_value(serde_json::Value::String(text.to_owned())).ok()
 }
 
+/// Why an [`SessionStore::edit_user_message`] call was rejected. Kept as a small
+/// typed error so the command layer can map each case to a clear message; the
+/// transcript is never mutated on any of these.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EditMessageError {
+    /// No message with that id exists in the given session.
+    UnknownMessage,
+    /// The message exists but is not a user message (only user turns are editable).
+    NotUserMessage,
+    /// A database error occurred while applying the edit. The transaction is never
+    /// committed on this path, so the transcript is left intact.
+    Storage(String),
+}
+
+impl std::fmt::Display for EditMessageError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnknownMessage => write!(f, "no such message in this session"),
+            Self::NotUserMessage => write!(f, "only user messages can be edited"),
+            Self::Storage(msg) => write!(f, "storage error while editing message: {msg}"),
+        }
+    }
+}
+
+impl std::error::Error for EditMessageError {}
+
 pub struct SessionStore {
     conn: Mutex<Connection>,
 }
@@ -503,6 +529,87 @@ impl SessionStore {
             .execute("DELETE FROM sessions WHERE id = ?1", params![session_id])
             .unwrap_or(0);
         removed > 0
+    }
+
+    /// Edit a prior **user** message in place and truncate the transcript after
+    /// it, in support of the ChatGPT/Claude-style "edit + re-run" flow (#464).
+    /// Replaces the message's content (and attachments) at its original `seq`,
+    /// then deletes every message that followed it -- the old assistant response
+    /// and anything after. The caller (the `edit_message` command) re-runs the
+    /// turn from the now-final edited prompt.
+    ///
+    /// Rejects an unknown id, an id belonging to another session, or a non-user
+    /// message, so the FE can surface the reason rather than silently corrupt the
+    /// transcript. The edit + truncation run in one transaction so a relaunch
+    /// never observes a half-truncated history.
+    pub fn edit_user_message(
+        &self,
+        session_id: &str,
+        message_id: &str,
+        content: String,
+        attachments: Option<Vec<Attachment>>,
+    ) -> Result<String, EditMessageError> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn
+            .transaction()
+            .map_err(|e| EditMessageError::Storage(e.to_string()))?;
+
+        // Look up the target message's position and role, scoped to the session.
+        let row = tx
+            .query_row(
+                "SELECT seq, role FROM messages WHERE id = ?1 AND session_id = ?2",
+                params![message_id, session_id],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(|e| EditMessageError::Storage(e.to_string()))?;
+        let (seq, role_text) = row.ok_or(EditMessageError::UnknownMessage)?;
+        if text_to_enum::<Role>(&role_text) != Some(Role::User) {
+            return Err(EditMessageError::NotUserMessage);
+        }
+
+        // Replace content + attachments in place (NULL when empty, matching
+        // `push_message` so text-only rows stay compact).
+        let attachments_json = attachments
+            .as_ref()
+            .filter(|a| !a.is_empty())
+            .map(|a| serde_json::to_string(a).expect("serialize attachments"));
+        tx.execute(
+            "UPDATE messages SET content = ?1, attachments = ?2 WHERE id = ?3",
+            params![content, attachments_json, message_id],
+        )
+        .map_err(|e| EditMessageError::Storage(e.to_string()))?;
+
+        // Drop reversible-compaction blobs backing the messages we are about to
+        // truncate. They are keyed by content hash (not a message FK), so the
+        // `ON DELETE CASCADE` on `compaction_originals` only fires on a full
+        // session delete -- a partial truncate would otherwise orphan them.
+        tx.execute(
+            "DELETE FROM compaction_originals
+             WHERE session_id = ?1
+               AND message_id IN (
+                   SELECT id FROM messages WHERE session_id = ?1 AND seq > ?2
+               )",
+            params![session_id, seq],
+        )
+        .ok();
+
+        // Truncate: the old response and everything after the edited message.
+        tx.execute(
+            "DELETE FROM messages WHERE session_id = ?1 AND seq > ?2",
+            params![session_id, seq],
+        )
+        .map_err(|e| EditMessageError::Storage(e.to_string()))?;
+
+        tx.execute(
+            "UPDATE sessions SET updated_at = ?1 WHERE id = ?2",
+            params![now_ms(), session_id],
+        )
+        .ok();
+
+        tx.commit()
+            .map_err(|e| EditMessageError::Storage(e.to_string()))?;
+        Ok(message_id.to_string())
     }
 
     /// Clone a session and its full transcript into a new session. The copy gets
@@ -1554,5 +1661,148 @@ mod tests {
         let store = SessionStore::new();
         assert!(store.export_session("nope", Format::Json).is_none());
         assert!(store.export_session("nope", Format::Markdown).is_none());
+    }
+
+    // --- edit_user_message (#464) ---
+
+    #[test]
+    fn edit_user_message_replaces_content_and_truncates_after() {
+        let store = SessionStore::new();
+        let s = store.create_session(None);
+        let u1 = store.add_message(&s.id, Role::User, "first question".into());
+        store.add_message(&s.id, Role::Assistant, "first answer".into());
+        store.add_message(&s.id, Role::User, "second question".into());
+        store.add_message(&s.id, Role::Assistant, "second answer".into());
+
+        let edited = store
+            .edit_user_message(&s.id, &u1.id, "first question (edited)".into(), None)
+            .unwrap();
+        assert_eq!(edited, u1.id, "returns the edited message's id");
+
+        let msgs = store.get_messages(&s.id);
+        assert_eq!(
+            msgs.len(),
+            1,
+            "old response and everything after is dropped"
+        );
+        assert_eq!(msgs[0].id, u1.id);
+        assert_eq!(msgs[0].content, "first question (edited)");
+    }
+
+    #[test]
+    fn edit_user_message_truncation_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sessions.db");
+        let session_id;
+        let edited_id;
+        {
+            let store = SessionStore::open(&path).unwrap();
+            let s = store.create_session(None);
+            session_id = s.id.clone();
+            let u1 = store.add_message(&s.id, Role::User, "q1".into());
+            edited_id = u1.id.clone();
+            store.add_message(&s.id, Role::Assistant, "a1".into());
+            store.add_message(&s.id, Role::User, "q2".into());
+            store
+                .edit_user_message(&s.id, &u1.id, "q1 edited".into(), None)
+                .unwrap();
+        }
+        let store = SessionStore::open(&path).unwrap();
+        let msgs = store.get_messages(&session_id);
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].id, edited_id);
+        assert_eq!(msgs[0].content, "q1 edited");
+    }
+
+    #[test]
+    fn edit_user_message_updates_and_clears_attachments() {
+        let store = SessionStore::new();
+        let s = store.create_session(None);
+        let u = store.add_message(&s.id, Role::User, "look".into());
+
+        let att = vec![Attachment {
+            kind: ff_core::AttachmentKind::Image,
+            media_type: "image/png".into(),
+            source: ff_core::AttachmentSource::Inline("AAAA".into()),
+            name: Some("shot.png".into()),
+            bytes: 3,
+        }];
+        store
+            .edit_user_message(&s.id, &u.id, "look (with image)".into(), Some(att))
+            .unwrap();
+        let msgs = store.get_messages(&s.id);
+        assert_eq!(msgs[0].attachments.as_ref().map(Vec::len), Some(1));
+
+        // Editing again with no attachments clears them back to NULL.
+        store
+            .edit_user_message(&s.id, &u.id, "look (no image)".into(), None)
+            .unwrap();
+        let msgs = store.get_messages(&s.id);
+        assert_eq!(msgs[0].attachments, None);
+    }
+
+    #[test]
+    fn edit_user_message_rejects_non_user_message() {
+        let store = SessionStore::new();
+        let s = store.create_session(None);
+        store.add_message(&s.id, Role::User, "q".into());
+        let a = store.add_message(&s.id, Role::Assistant, "a".into());
+
+        let err = store
+            .edit_user_message(&s.id, &a.id, "tampered".into(), None)
+            .unwrap_err();
+        assert_eq!(err, EditMessageError::NotUserMessage);
+        // Transcript untouched.
+        assert_eq!(store.get_messages(&s.id).len(), 2);
+        assert_eq!(store.get_messages(&s.id)[1].content, "a");
+    }
+
+    #[test]
+    fn edit_user_message_rejects_unknown_id() {
+        let store = SessionStore::new();
+        let s = store.create_session(None);
+        store.add_message(&s.id, Role::User, "q".into());
+
+        let err = store
+            .edit_user_message(&s.id, "does-not-exist", "x".into(), None)
+            .unwrap_err();
+        assert_eq!(err, EditMessageError::UnknownMessage);
+    }
+
+    #[test]
+    fn edit_user_message_rejects_id_from_another_session() {
+        let store = SessionStore::new();
+        let a = store.create_session(None);
+        let b = store.create_session(None);
+        let u = store.add_message(&a.id, Role::User, "in a".into());
+
+        // The id exists, but not in session b.
+        let err = store
+            .edit_user_message(&b.id, &u.id, "x".into(), None)
+            .unwrap_err();
+        assert_eq!(err, EditMessageError::UnknownMessage);
+        // Session a is untouched.
+        assert_eq!(store.get_messages(&a.id)[0].content, "in a");
+    }
+
+    #[test]
+    fn edit_user_message_drops_orphaned_compaction_originals() {
+        let store = SessionStore::new();
+        let s = store.create_session(None);
+        let u = store.add_message(&s.id, Role::User, "q".into());
+        let a = store.add_message(&s.id, Role::Assistant, "a".into());
+        store.put_compaction_original(&s.id, &a.id, "hash-key-1", "verbatim original");
+        assert_eq!(
+            store.compaction_original("hash-key-1").as_deref(),
+            Some("verbatim original")
+        );
+
+        store
+            .edit_user_message(&s.id, &u.id, "q edited".into(), None)
+            .unwrap();
+
+        // The assistant message that backed the original was truncated, so its
+        // original must be gone too (no orphan).
+        assert_eq!(store.compaction_original("hash-key-1"), None);
     }
 }
