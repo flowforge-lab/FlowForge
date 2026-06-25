@@ -69,6 +69,17 @@ pub fn bump_patch(version: &str) -> String {
     }
 }
 
+/// Sort key for dotted versions: each `.`-segment is compared numerically when it
+/// parses as a `u64`, otherwise lexically. This avoids the lexicographic trap where
+/// `"0.1.10"` sorts before `"0.1.9"` under plain string comparison. Non-numeric
+/// segments sort before numeric ones (`None < Some`), with the segment string used
+/// only to break ties between two non-numeric segments.
+fn version_key(v: &str) -> Vec<(Option<u64>, String)> {
+    v.split('.')
+        .map(|seg| (seg.parse::<u64>().ok(), seg.to_string()))
+        .collect()
+}
+
 /// Render a `SKILL.md` from a manifest + body: re-serialized YAML frontmatter inside
 /// `---` fences, then the trimmed body and a trailing newline.
 fn render_skill_md(manifest: &ff_core::SkillManifest, body: &str) -> Result<String, VersionError> {
@@ -183,9 +194,10 @@ pub fn rollback_skill(
     Ok(())
 }
 
-/// Retained version names for a skill, descending (newest-looking first by string
-/// order is not meaningful for semver, so this sorts lexicographically and reverses).
-/// Missing history is an empty list, not an error.
+/// Retained version names for a skill, descending (newest first). Each `.`-segment
+/// is compared numerically where it parses as a number (so `0.1.10` sorts after
+/// `0.1.9`), with a lexical fallback for non-numeric segments. Missing history is
+/// an empty list, not an error.
 pub fn list_skill_versions(history_root: &Path, name: &str) -> Result<Vec<String>, VersionError> {
     let name = validated_segment(name)?;
     let dir = history_root.join(name);
@@ -199,7 +211,7 @@ pub fn list_skill_versions(history_root: &Path, name: &str) -> Result<Vec<String
         .filter(|e| e.path().is_dir())
         .filter_map(|e| e.file_name().to_str().map(str::to_string))
         .collect();
-    versions.sort();
+    versions.sort_by_cached_key(|v| version_key(v));
     versions.reverse();
     Ok(versions)
 }
@@ -318,6 +330,35 @@ mod tests {
             list_skill_versions(history.path(), "a/b"),
             Err(VersionError::InvalidName(_))
         ));
+    }
+
+    #[test]
+    fn version_key_orders_numerically() {
+        // The lexicographic trap: under plain string sort "0.1.10" < "0.1.9".
+        assert!(version_key("0.1.9") < version_key("0.1.10"));
+        assert!(version_key("0.1.2") < version_key("0.1.9"));
+        assert!(version_key("1.0.0") < version_key("1.2.0"));
+        // Non-numeric segments fall back to lexical order.
+        assert!(version_key("1.0.x") < version_key("1.1.0"));
+    }
+
+    #[test]
+    fn list_versions_sorts_numerically_past_ten() {
+        let history = tempfile::tempdir().unwrap();
+        let root = history.path().join("alpha");
+        for v in ["0.1.2", "0.1.9", "0.1.10"] {
+            std::fs::create_dir_all(root.join(v)).unwrap();
+        }
+        // Lexically "0.1.10" < "0.1.9", so the old sort()+reverse() returned
+        // 0.1.9 first; numeric per-segment comparison puts 0.1.10 newest.
+        assert_eq!(
+            list_skill_versions(history.path(), "alpha").unwrap(),
+            vec![
+                "0.1.10".to_string(),
+                "0.1.9".to_string(),
+                "0.1.2".to_string()
+            ]
+        );
     }
 
     #[test]
