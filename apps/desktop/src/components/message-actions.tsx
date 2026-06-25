@@ -61,7 +61,7 @@ export function MessageActions({
   message: Message;
   side: "left" | "right";
 }) {
-  const prefill = useComposerStore((s) => s.prefill);
+  const beginEdit = useComposerStore((s) => s.beginEdit);
   return (
     <div
       className={cn(
@@ -73,7 +73,9 @@ export function MessageActions({
       {message.role === "user" && (
         <ActionButton
           title="Edit & resend"
-          onClick={() => prefill(message.sessionId, message.content)}
+          onClick={() =>
+            beginEdit(message.sessionId, message.id, message.content)
+          }
         >
           <PencilLine className="size-3" />
         </ActionButton>

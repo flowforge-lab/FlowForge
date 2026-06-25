@@ -7,6 +7,7 @@ import {
   FileText,
   Folder,
   Paperclip,
+  PencilLine,
   Search,
   Square,
   X,
@@ -86,6 +87,12 @@ export function InputBar({
   const rejectNonce = useComposerStore((s) =>
     targetSessionId ? (s.rejectNonceBySession[targetSessionId] ?? 0) : 0,
   );
+  // In-place edit mode (#463): the user message id being edited in this pane, or
+  // undefined when composing fresh. Routes submit to `editMessage` and shows a banner.
+  const editingMessageId = useComposerStore((s) =>
+    targetSessionId ? s.editingBySession[targetSessionId] : undefined,
+  );
+  const cancelEdit = useComposerStore((s) => s.cancelEdit);
   const setText = useCallback(
     (text: string) => {
       if (targetSessionId) setTextFor(targetSessionId, text);
@@ -108,6 +115,7 @@ export function InputBar({
       : false,
   );
   const send = useChatStore((s) => s.send);
+  const editMessage = useChatStore((s) => s.editMessage);
   const cancelTurn = useChatStore((s) => s.cancelTurn);
   const sendMessageKey = usePrefsStore((s) => s.sendMessageKey);
   const [attachments, setAttachments] = useState<Attachment[]>([]);
@@ -249,17 +257,25 @@ export function InputBar({
     const content = value.trim();
     if (
       (!content && attachments.length === 0) ||
-      streaming ||
-      pending ||
+      // A fresh send waits for the turn to settle, but an in-place edit (#463) may
+      // be submitted mid-turn — the backend cancels the running turn and re-runs.
+      ((streaming || pending) && !editingMessageId) ||
       !targetSessionId
     )
       return;
     const attach = attachments;
-    setText("");
     setAttachments([]);
     // Collapse the box back to one line (it may have grown for a resend draft).
     if (textareaRef.current) textareaRef.current.style.height = "auto";
-    void send(content, targetSessionId, attach);
+    if (editingMessageId) {
+      // In-place edit (#463): replace + re-run from the edited message. cancelEdit
+      // clears both the editing binding and the composer text.
+      cancelEdit(targetSessionId);
+      void editMessage(targetSessionId, editingMessageId, content, attach);
+    } else {
+      setText("");
+      void send(content, targetSessionId, attach);
+    }
   }
 
   return (
@@ -276,6 +292,23 @@ export function InputBar({
           onDragLeave={handleDragLeave}
           onDrop={handleDrop}
         >
+          {/* In-place edit banner (#463): submitting replaces the original message
+              and re-runs from it; Cancel/Escape exits without mutating history. */}
+          {editingMessageId && targetSessionId ? (
+            <div className="mb-1 flex items-center gap-1.5 rounded-lg bg-muted/50 px-2.5 py-1.5 text-[11px] text-muted-foreground">
+              <PencilLine className="size-3 shrink-0" />
+              <span className="flex-1">
+                Editing message — submitting replaces it and re-runs.
+              </span>
+              <button
+                type="button"
+                onClick={() => cancelEdit(targetSessionId)}
+                className="flex items-center gap-0.5 rounded px-1 py-0.5 font-medium hover:bg-foreground/10 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/40"
+              >
+                <X className="size-3" /> Cancel
+              </button>
+            </div>
+          ) : null}
           <textarea
             ref={textareaRef}
             data-composer
@@ -296,6 +329,16 @@ export function InputBar({
               autoGrow(e.currentTarget);
             }}
             onKeyDown={(e) => {
+              // Escape exits in-place edit mode without mutating the transcript.
+              // Stop propagation so the shell's global Esc (cancel active turn,
+              // app-shell.tsx) doesn't also fire — abandoning the edit must not
+              // also kill an in-flight turn.
+              if (e.key === "Escape" && editingMessageId && targetSessionId) {
+                e.preventDefault();
+                e.stopPropagation();
+                cancelEdit(targetSessionId);
+                return;
+              }
               if (e.key !== "Enter") return;
               // Enter mode: plain Enter sends (Shift+Enter = new line, unchanged).
               // Ctrl+Enter mode: Ctrl/⌘+Enter sends; any other Enter is a new line.
@@ -383,7 +426,7 @@ export function InputBar({
                 <span />
               )}
             </div>
-            {streaming || pending ? (
+            {(streaming || pending) && !editingMessageId ? (
               <Button
                 variant="outline"
                 size="icon"
