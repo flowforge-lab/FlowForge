@@ -6,6 +6,7 @@
 
 mod anthropic;
 mod bedrock;
+mod model_specs;
 mod ollama;
 mod openai;
 
@@ -376,66 +377,29 @@ pub(crate) fn image_media_type(media_type: &str) -> Option<&'static str> {
 }
 
 /// Conservative context-window fallback (in tokens) for a model whose family we
-/// don't recognize. Small enough that a tiny local model won't overflow, and the
-/// agent's compaction still has a real ceiling to measure against.
-pub const DEFAULT_CONTEXT_WINDOW_TOKENS: u64 = 32_000;
+/// don't recognize. Defined in [`ff_core::model_specs`] (the schema's owner) and
+/// re-exported here so existing `ff_llm::DEFAULT_CONTEXT_WINDOW_TOKENS` callers
+/// keep working.
+pub use ff_core::DEFAULT_CONTEXT_WINDOW_TOKENS;
 
-/// Best-effort context window (in tokens) for a model id, keyed on the family
-/// substring rather than the exact id so new point-releases inherit the right
-/// window without a code change. Used to size the agent's compaction budget so a
-/// large-window model isn't force-compacted at a tiny fixed ceiling (and a small
-/// one isn't allowed to overflow). The window is a property of the *model*, not
-/// the transport, so this is shared across providers; a provider with a quirky
-/// deployment can still override [`Provider::context_window`].
+/// Best-effort context window (in tokens) for a model id. Resolved from a
+/// data-driven, layered rule set (see [`model_specs`]): bundled defaults seeded
+/// from live probes, overlaid by an optional user `model-specs.json`. Matching
+/// is a case-insensitive family substring, not the exact id, so new point
+/// releases inherit the right window without a code change. Used to size the
+/// agent's compaction budget so a large-window model isn't force-compacted at a
+/// tiny fixed ceiling (and a small one isn't allowed to overflow). The window is
+/// a property of the *model*, not the transport, so this is shared across
+/// providers; a provider with a quirky deployment can still override
+/// [`Provider::context_window`].
 ///
 /// Values are the raw served context windows (verified against the SiliconFlow API
 /// on 2026-06-24 for the open-weight families, official docs for Claude/OpenAI).
 /// The agent applies its own headroom (`CONTEXT_BUDGET_SAFETY`) on top, so these
-/// are stored undiscounted -- discounting here would double-count. When in doubt a
-/// family is omitted and falls through to [`DEFAULT_CONTEXT_WINDOW_TOKENS`].
+/// are stored undiscounted -- discounting here would double-count. Unknown
+/// families fall through to [`DEFAULT_CONTEXT_WINDOW_TOKENS`].
 pub fn model_context_window(model: &str) -> u64 {
-    let m = model.to_lowercase();
-    // Order matters: match the most specific family substrings first. A flat
-    // per-vendor window does not hold -- e.g. GLM-4.5-Air serves only 96K while
-    // GLM-5.2 serves 1M, so a single `glm` rule would either overflow the small
-    // model or starve the large one.
-    if m.contains("glm-5.2") {
-        1_048_576
-    } else if m.contains("glm-4.5-air") {
-        // Must precede the generic `glm` rule: its 96K window is below the old
-        // flat 128K, so inheriting 128K would push the budget past the real cap.
-        98_304
-    } else if m.contains("glm-5") || m.contains("glm-5v") || m.contains("glm-4.6") {
-        202_752
-    } else if m.contains("glm") {
-        // GLM-4.5 and older standard deployments.
-        131_072
-    } else if m.contains("deepseek-v4") {
-        1_000_000
-    } else if m.contains("deepseek") {
-        163_840
-    } else if m.contains("kimi") {
-        262_144
-    } else if m.contains("minimax-m3") {
-        700_000
-    } else if m.contains("minimax") {
-        196_608
-    } else if m.contains("claude")
-        || m.contains("anthropic")
-        || m.contains("opus")
-        || m.contains("sonnet")
-        || m.contains("haiku")
-    {
-        // 200K is the standard window across Claude 3/3.5/3.7/4/4.5; the 1M window
-        // is Sonnet-4/4.5 beta-only (gated header + higher tier) and Bedrock's
-        // standard is also 200K, so 200K is the safe shared value.
-        200_000
-    } else if m.contains("gpt-4o") || m.contains("gpt-4.1") || m.contains("o1") || m.contains("o3")
-    {
-        128_000
-    } else {
-        DEFAULT_CONTEXT_WINDOW_TOKENS
-    }
+    model_specs::lookup(model)
 }
 
 #[async_trait]
