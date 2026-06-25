@@ -83,6 +83,15 @@ pub trait Tool: Send + Sync {
     fn interactive(&self) -> bool {
         false
     }
+    /// A stable identity for a *content read*, used by the agent's per-turn semantic
+    /// read-dedupe (#458 RC5). A read tool (e.g. `view`) returns a key — typically
+    /// the path it reads — so the loop can detect a re-read of the same target this
+    /// turn and, when the content is unchanged, return a sentinel instead of
+    /// re-injecting the bytes. Non-read tools keep the `None` default and are never
+    /// deduped. Pure: it must not perform I/O — keying is by reference, not content.
+    fn dedupe_key(&self, _args: &Value) -> Option<String> {
+        None
+    }
     async fn run(&self, args: Value, root: &Path) -> ToolOutcome;
 
     /// Session-aware dispatch point. Tools that need per-session affinity
@@ -219,6 +228,12 @@ impl ToolRegistry {
     pub fn is_interactive(&self, name: &str) -> bool {
         self.get(name).is_some_and(Tool::interactive)
     }
+
+    /// The per-turn read-dedupe key for a call (#458 RC5), or `None` for an unknown
+    /// tool or one that isn't a content read.
+    pub fn dedupe_key(&self, name: &str, args: &Value) -> Option<String> {
+        self.get(name).and_then(|tool| tool.dedupe_key(args))
+    }
 }
 
 /// Whether `name` is the `agent` delegation tool the loop intercepts to spawn a
@@ -334,5 +349,21 @@ mod tests {
             reg.safety("nope", &serde_json::json!({})),
             Safety::Dangerous
         );
+    }
+
+    #[test]
+    fn dedupe_key_only_for_read_tools() {
+        // #458 RC5: `view` exposes a read identity; non-read tools and unknown names
+        // return None, so the per-turn dedupe is scoped to file reads.
+        let reg = ToolRegistry::with_defaults();
+        assert_eq!(
+            reg.dedupe_key("view", &serde_json::json!({"path": "a.rs"})),
+            Some("a.rs".to_string())
+        );
+        assert_eq!(
+            reg.dedupe_key("bash", &serde_json::json!({"command": "ls"})),
+            None
+        );
+        assert_eq!(reg.dedupe_key("nope", &serde_json::json!({})), None);
     }
 }

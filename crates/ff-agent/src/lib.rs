@@ -515,6 +515,17 @@ fn should_reason(iter: usize, remaining: usize) -> bool {
     iter == 0 || remaining <= WRAP_UP_AT_REMAINING
 }
 
+/// Cheap content hash for the per-turn read-dedupe (#458 RC5). Uses the same
+/// `DefaultHasher` idiom as `compaction_extractive`, so no new dependency: this is
+/// a same-process collision check ("did this exact content already appear this
+/// turn"), not a security or cross-run digest.
+fn content_hash(s: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    s.hash(&mut h);
+    h.finish()
+}
+
 /// Runs one assistant turn for `session_id`, executing any tool calls the model
 /// requests until it produces a plain text answer (or the iteration cap is hit).
 /// `on_event` is called synchronously as the turn progresses. The final assistant
@@ -558,6 +569,13 @@ pub async fn run_turn(
     let mut call_counts: HashMap<(String, String), usize> = HashMap::new();
     let mut repeat_nudge: Option<String> = None;
     let mut stop_reason: Option<String> = None;
+    // Per-turn semantic read-dedupe (#458 RC5): read key (e.g. a file path) -> the
+    // step it was first read at + a hash of that content. A later re-read whose
+    // content is unchanged is collapsed to a sentinel instead of re-injecting the
+    // bytes. Complements the byte-identical repeat-breaker above, which only catches
+    // identical `(tool, args)` calls -- this fires on identical *content* regardless
+    // of how the read was phrased (e.g. a different line range).
+    let mut read_cache: HashMap<String, (u32, u64)> = HashMap::new();
     // Context-pressure flush bookkeeping (#244 R5): the transcript length at the last
     // flush, so we re-flush on growth rather than every iteration. `None` = never
     // flushed this turn.
@@ -1208,9 +1226,32 @@ pub async fn run_turn(
         // call with no outcome (cancelled before it ran) is left to the backfill
         // guard, which writes a `[cancelled]` result on drop (#316).
         for call in calls.values() {
-            let Some(outcome) = outcomes.remove(&call.id) else {
+            let Some(mut outcome) = outcomes.remove(&call.id) else {
                 continue;
             };
+            // Semantic read-dedupe (#458 RC5): if this is a content read (e.g. `view`)
+            // whose content is byte-identical to an earlier read of the same target
+            // this turn, replace the payload with a small staleness sentinel instead
+            // of re-injecting the bytes. A changed file (different hash, e.g. after an
+            // `edit`) is not deduped -- the full content flows through. Only successful
+            // reads participate; an error result is never cached.
+            if outcome.success {
+                let args = serde_json::from_str::<serde_json::Value>(&call.arguments)
+                    .unwrap_or(serde_json::Value::Null);
+                if let Some(key) = tools.registry.dedupe_key(&call.name, &args) {
+                    let hash = content_hash(&outcome.content);
+                    match read_cache.get(&key) {
+                        Some(&(step, prev)) if prev == hash => {
+                            outcome.content = format!(
+                                "[unchanged since step {step} -- identical content, not re-sent]"
+                            );
+                        }
+                        _ => {
+                            read_cache.insert(key, (turn_count, hash));
+                        }
+                    }
+                }
+            }
             // Keep a tool result verbatim on the turn it is produced (RC1, #453):
             // the model must read the full content on its first look, or it is
             // forced into a `compaction_retrieve` round-trip / re-read loop. Only a
@@ -4876,5 +4917,182 @@ mod tests {
             .expect("cold block is retrievable");
         assert!(retrieved.contains("cold-0"));
         assert!(retrieved.contains("cold-23"));
+    }
+
+    // ---- #458 RC5: per-turn semantic read dedupe ----
+
+    #[tokio::test]
+    async fn rereads_of_unchanged_file_collapse_to_sentinel() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("f.txt"), "hello world\nsecond line\n").unwrap();
+        let store = SessionStore::new();
+        let s = store.create_session(None);
+        store.add_message(&s.id, Role::User, "read it twice".into());
+        let registry = ToolRegistry::with_defaults();
+        let approve = AlwaysApprove;
+
+        // Two views of the same file under *different* args (a line range on the
+        // second), so the byte-identical repeat-breaker would NOT fire -- only RC5's
+        // content dedupe catches it.
+        struct ViewTwice {
+            calls: AtomicUsize,
+        }
+        #[async_trait]
+        impl Provider for ViewTwice {
+            async fn chat_stream(&self, _req: ChatRequest) -> Result<ChunkStream, LlmError> {
+                let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let chunk = match n {
+                    0 => Chunk {
+                        tool_calls: vec![ToolCallDelta {
+                            index: 0,
+                            id: Some("v1".into()),
+                            name: Some("view".into()),
+                            arguments: r#"{"path":"f.txt"}"#.into(),
+                        }],
+                        done: true,
+                        ..Chunk::default()
+                    },
+                    1 => Chunk {
+                        tool_calls: vec![ToolCallDelta {
+                            index: 0,
+                            id: Some("v2".into()),
+                            name: Some("view".into()),
+                            arguments: r#"{"path":"f.txt","start_line":1}"#.into(),
+                        }],
+                        done: true,
+                        ..Chunk::default()
+                    },
+                    _ => Chunk {
+                        delta: "done".into(),
+                        done: true,
+                        ..Chunk::default()
+                    },
+                };
+                Ok(futures_util::stream::iter(vec![Ok(chunk)]).boxed())
+            }
+        }
+
+        run_turn(
+            &ViewTwice {
+                calls: AtomicUsize::new(0),
+            },
+            &store,
+            &ctx(&registry, dir.path(), &approve),
+            &s.id,
+            "mock",
+            None,
+            false,
+            CancelToken::new(),
+            |_| {},
+        )
+        .await
+        .unwrap();
+
+        let history = store.get_messages(&s.id);
+        let results: Vec<&str> = history
+            .iter()
+            .filter(|m| m.role == Role::Tool)
+            .map(|m| m.content.as_str())
+            .collect();
+        assert_eq!(results.len(), 2, "two view calls -> two tool results");
+        assert!(
+            results[0].contains("hello world"),
+            "first read returns full content: {}",
+            results[0]
+        );
+        assert!(
+            results[1].contains("unchanged since step"),
+            "re-read of unchanged file is deduped to the sentinel: {}",
+            results[1]
+        );
+    }
+
+    #[tokio::test]
+    async fn changed_file_is_not_deduped() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("f.txt"), "v1\n").unwrap();
+        let store = SessionStore::new();
+        let s = store.create_session(None);
+        store.add_message(&s.id, Role::User, "read, change, read".into());
+        let registry = ToolRegistry::with_defaults();
+        let approve = AlwaysApprove;
+
+        // view -> bash overwrites the file -> view again. The second read's content
+        // differs (different hash), so it must NOT be deduped.
+        struct ViewEditView {
+            calls: AtomicUsize,
+        }
+        #[async_trait]
+        impl Provider for ViewEditView {
+            async fn chat_stream(&self, _req: ChatRequest) -> Result<ChunkStream, LlmError> {
+                let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let tc = |id: &str, name: &str, args: &str| ToolCallDelta {
+                    index: 0,
+                    id: Some(id.into()),
+                    name: Some(name.into()),
+                    arguments: args.into(),
+                };
+                let chunk = match n {
+                    0 => Chunk {
+                        tool_calls: vec![tc("v1", "view", r#"{"path":"f.txt"}"#)],
+                        done: true,
+                        ..Chunk::default()
+                    },
+                    1 => Chunk {
+                        tool_calls: vec![tc(
+                            "b2",
+                            "bash",
+                            r#"{"command":"printf 'v2\n' > f.txt"}"#,
+                        )],
+                        done: true,
+                        ..Chunk::default()
+                    },
+                    2 => Chunk {
+                        tool_calls: vec![tc("v3", "view", r#"{"path":"f.txt"}"#)],
+                        done: true,
+                        ..Chunk::default()
+                    },
+                    _ => Chunk {
+                        delta: "done".into(),
+                        done: true,
+                        ..Chunk::default()
+                    },
+                };
+                Ok(futures_util::stream::iter(vec![Ok(chunk)]).boxed())
+            }
+        }
+
+        run_turn(
+            &ViewEditView {
+                calls: AtomicUsize::new(0),
+            },
+            &store,
+            &ctx(&registry, dir.path(), &approve),
+            &s.id,
+            "mock",
+            None,
+            false,
+            CancelToken::new(),
+            |_| {},
+        )
+        .await
+        .unwrap();
+
+        let history = store.get_messages(&s.id);
+        // The second view (id v3) returns the new content in full, not a sentinel.
+        let reread = history
+            .iter()
+            .find(|m| m.role == Role::Tool && m.tool_call_id.as_deref() == Some("v3"))
+            .expect("re-read tool result present");
+        assert!(
+            reread.content.contains("v2"),
+            "changed file is re-read in full: {}",
+            reread.content
+        );
+        assert!(
+            !reread.content.contains("unchanged since step"),
+            "a changed file must NOT be deduped: {}",
+            reread.content
+        );
     }
 }
