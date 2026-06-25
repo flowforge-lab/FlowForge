@@ -16,7 +16,10 @@
 //! dependency on `ff-llm`.
 //!
 //! ## Matching
-//! `match` is a case-insensitive substring of the model id; rules are evaluated
+//! `match` is tested against the model id per the rule's `match_kind`
+//! (case-insensitive; substring by default, `prefix`-anchored on request, #473)
+//! through the single shared [`ModelSpec::matches`] so the window and vision
+//! lookups cannot drift. Rules are evaluated
 //! **first-match-wins**, so the list is ordered most-specific-first (e.g.
 //! `glm-4.5-air` before `glm`). Per-field absent semantics differ by capability
 //! and are documented on each lookup:
@@ -43,15 +46,36 @@ pub const DEFAULT_CONTEXT_WINDOW_TOKENS: u64 = 32_000;
 /// build/CI defect, caught by [`tests::bundled_rules_parse_and_lookup`].
 const DEFAULT_JSON: &str = include_str!("model-specs.default.json");
 
-/// One capability rule. `match` is a case-insensitive substring of the model id.
-/// Capability fields are optional so a rule can describe only what it knows; new
-/// fields (`max_output`, pricing, …) can be added later with `#[serde(default)]`
-/// without breaking files written against an older schema (serde also ignores
-/// unknown fields on the way in).
+/// How a rule's `match` pattern is tested against a (lowercased) model id (#473).
+/// Defaults to [`Contains`](MatchKind::Contains) so existing rules and any
+/// user-override file written against the older schema keep their behavior; a
+/// short pattern that would over-match as a substring (e.g. OpenAI `o1`/`o3`,
+/// which must not match `proto1`) sets `prefix` to anchor at the start.
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum MatchKind {
+    /// `match` may appear anywhere in the id (the historical default).
+    #[default]
+    Contains,
+    /// The id must start with `match`. Mirrors the legacy `starts_with` arm.
+    Prefix,
+}
+
+/// One capability rule. `match` is tested against the model id per `match_kind`
+/// (case-insensitive, substring by default). Capability fields are optional so a
+/// rule can describe only what it knows; new fields (`max_output`, pricing, …)
+/// can be added later with `#[serde(default)]` without breaking files written
+/// against an older schema (serde also ignores unknown fields on the way in).
 #[derive(Debug, Clone, Deserialize)]
 pub struct ModelSpec {
     #[serde(rename = "match")]
     pattern: String,
+    /// How `pattern` is tested against the model id (#473). Defaults to
+    /// `contains`; set `prefix` to anchor a short pattern that would otherwise
+    /// over-match. Both capability lookups route through [`ModelSpec::matches`],
+    /// so the choice applies consistently to the window and vision lookups.
+    #[serde(default)]
+    match_kind: MatchKind,
     /// Context window in tokens. Absent on a rule that describes only other
     /// capabilities (e.g. a future vision-only rule).
     #[serde(default)]
@@ -82,6 +106,19 @@ pub fn parse_specs(json: &str) -> Result<ModelSpecs, serde_json::Error> {
     serde_json::from_str(json)
 }
 
+impl ModelSpec {
+    /// The single matcher both capability lookups consult, so substring/anchor
+    /// semantics cannot drift between the window and vision paths (#473).
+    /// `model_lower` must already be lowercased (each lookup lowercases once).
+    fn matches(&self, model_lower: &str) -> bool {
+        let pattern = self.pattern.to_lowercase();
+        match self.match_kind {
+            MatchKind::Contains => model_lower.contains(&pattern),
+            MatchKind::Prefix => model_lower.starts_with(&pattern),
+        }
+    }
+}
+
 /// The compiled-in default rules, parsed once.
 pub fn bundled_rules() -> &'static [ModelSpec] {
     use std::sync::OnceLock;
@@ -102,7 +139,7 @@ pub fn context_window_in(rules: &[ModelSpec], model: &str) -> u64 {
     let m = model.to_lowercase();
     rules
         .iter()
-        .filter(|r| m.contains(&r.pattern.to_lowercase()))
+        .filter(|r| r.matches(&m))
         .find_map(|r| r.context_window)
         .unwrap_or(DEFAULT_CONTEXT_WINDOW_TOKENS)
 }
@@ -118,9 +155,7 @@ pub fn context_window_in(rules: &[ModelSpec], model: &str) -> u64 {
 pub fn supports_vision_in(rules: &[ModelSpec], kind: ProviderKind, model: &str) -> bool {
     let m = model.to_lowercase();
     rules.iter().any(|r| {
-        r.supports_vision == Some(true)
-            && r.provider.is_none_or(|p| p == kind)
-            && m.contains(&r.pattern.to_lowercase())
+        r.supports_vision == Some(true) && r.provider.is_none_or(|p| p == kind) && r.matches(&m)
     })
 }
 
@@ -362,11 +397,10 @@ mod tests {
     /// closure is the pre-migration logic, frozen here so a future data edit that
     /// silently changes a known family fails loudly.
     ///
-    /// Known divergence (documented, accepted): the old OpenAI arm used
-    /// `starts_with("o1"|"o3")` while rules match by substring, so an id that
-    /// merely *contains* `o1`/`o3` now matches on an OpenAI connection. No real
-    /// OpenAI vision id is affected; the cross-cutting word-boundary matcher is
-    /// tracked separately. The adversarial `proto1` case below pins this.
+    /// The OpenAI `o1`/`o3` rules are `match_kind: prefix` (#473), reproducing
+    /// the old `starts_with` arm exactly, so there is no longer a divergence: an
+    /// id that merely *contains* `o1`/`o3` (e.g. `proto1`, `foo-o1`) does not
+    /// match, just as the legacy arm required.
     #[test]
     fn data_driven_matches_legacy_arms() {
         fn legacy(kind: ProviderKind, model: &str) -> bool {
@@ -431,6 +465,10 @@ mod tests {
             "deepseek-ai/DeepSeek-V3",
             "anything",
             "some-local-7b",
+            // #473 adversarial: contain "o1"/"o3" but are not prefixed by them.
+            "proto1",
+            "foo-o1",
+            "gpt-4o3",
         ];
         for &k in &kinds {
             for &model in &models {
@@ -441,8 +479,55 @@ mod tests {
                 );
             }
         }
-        // Documented divergence: substring vs the old `starts_with` for o1/o3.
-        assert!(!legacy(ProviderKind::OpenAi, "proto1"));
-        assert!(supports_vision_in(r, ProviderKind::OpenAi, "proto1"));
+    }
+
+    /// #473: anchoring the `o1`/`o3` rules as `prefix` fixes the substring trap
+    /// consistently across BOTH the window and the vision lookup -- an id that
+    /// merely contains `o1`/`o3` falls through to the defaults, while a real
+    /// reasoning id (prefixed) still matches.
+    #[test]
+    fn o1_o3_prefix_rules_do_not_match_substring_ids() {
+        let r = bundled_rules();
+        for trap in ["proto1", "foo-o1", "macro3"] {
+            assert_eq!(
+                context_window_in(r, trap),
+                DEFAULT_CONTEXT_WINDOW_TOKENS,
+                "{trap} must not pick up the o1/o3 window rule"
+            );
+            assert!(
+                !supports_vision_in(r, ProviderKind::OpenAi, trap),
+                "{trap} must not pick up the o1/o3 vision rule"
+            );
+        }
+        for real in ["o1", "o1-mini", "o1-preview", "o3", "o3-mini"] {
+            assert_eq!(
+                context_window_in(r, real),
+                128_000,
+                "{real} should match the o1/o3 window rule"
+            );
+            assert!(
+                supports_vision_in(r, ProviderKind::OpenAi, real),
+                "{real} should match the o1/o3 vision rule"
+            );
+        }
+    }
+
+    /// #473: the shared matcher honors `match_kind` for both `contains` (default)
+    /// and `prefix`, parsed from JSON.
+    #[test]
+    fn match_kind_contains_and_prefix() {
+        let specs = parse_specs(
+            r#"{ "rules": [
+                { "match": "foo", "context_window": 111 },
+                { "match": "bar", "match_kind": "prefix", "context_window": 222 }
+            ] }"#,
+        )
+        .unwrap();
+        let r = &specs.rules;
+        // contains: matches anywhere.
+        assert_eq!(context_window_in(r, "x-foo-y"), 111);
+        // prefix: only at the start.
+        assert_eq!(context_window_in(r, "bar-1"), 222);
+        assert_eq!(context_window_in(r, "x-bar"), DEFAULT_CONTEXT_WINDOW_TOKENS);
     }
 }
