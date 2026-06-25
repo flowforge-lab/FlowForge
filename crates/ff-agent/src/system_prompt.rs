@@ -164,6 +164,17 @@ pub fn build_system_prompt(
          faster than sequential one-call-per-turn round-trips.\n\n",
     );
 
+    // Stable guidance (cache-stable prefix): shell environment conventions (#458).
+    // Pre-empts the two highest-frequency self-inflicted frictions -- a redundant
+    // `cd <workspace>` prefix and reaching for a sandbox-denied `/tmp`.
+    out.push_str(
+        "## Shell environment\n\
+         The `bash` tool already runs from the workspace root. Issue bare commands; \
+         do not prefix `cd <workspace>` (use the tool's `working_dir` for a \
+         subdirectory). For temporary files, use the workspace scratch dir \
+         `.ff-scratch/` (created for you) rather than `/tmp`.\n\n",
+    );
+
     out.push_str("## User context\n");
     out.push_str(&format!(
         "Current: {}, {} ({}).\n",

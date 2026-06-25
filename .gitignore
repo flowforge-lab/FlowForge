@@ -34,3 +34,6 @@ dist
 # Local agent scratch — local-only, never commit
 .followups/
 design/
+
+# Bash-tool workspace scratch dir (#458 RC4c) — local-only, never commit
+.ff-scratch/
