@@ -44,10 +44,13 @@ pub const DEFAULT_MAX_ITERATIONS: usize = 8;
 
 /// When this many iterations (including the current one) remain before the cap,
 /// the loop injects a transient "wrap up" nudge so the model has runway to
-/// converge on a final answer instead of being cut mid-tool-call (#244 R3). On
-/// the very last iteration (`remaining == 1`) the tool schema is additionally
-/// withheld so the model *must* emit text rather than another tool call that
-/// would be lost to the cap (RC3, #454).
+/// converge on a final answer instead of being cut mid-tool-call (#244 R3). The
+/// nudge copy graduates: while still in the window it is a soft "approaching the
+/// limit, start converging" message with tools still advertised; on the very last
+/// iteration (`remaining == 1`) it hardens to "do not call any more tools" *and*
+/// the tool schema is withheld, so the model *must* emit text rather than another
+/// tool call that would be lost to the cap -- the instruction matching the
+/// mechanism (RC3, #454).
 const WRAP_UP_AT_REMAINING: usize = 3;
 
 /// A transient provider error (connection blip, 429/5xx) is retried up to this many
@@ -719,9 +722,13 @@ pub async fn run_turn(
         };
         messages.extend(to_chat(&wire));
 
-        // Near the iteration cap, nudge the model to stop calling tools and answer,
-        // so a long turn ends with a real reply instead of "[stopped: reached
-        // tool-call limit]" cut mid-tool (#244 R3). Transient: request-only.
+        // Near the iteration cap, nudge the model toward a final answer so a long
+        // turn ends with a real reply instead of "[stopped: reached tool-call
+        // limit]" cut mid-tool (#244 R3). The copy graduates across the window: a
+        // soft convergence nudge while tools are still advertised, hardening to
+        // "do not call tools" only on the final iteration -- where the tool schema
+        // is also withheld below, so the instruction matches the mechanism rather
+        // than crying "final step" with steps to spare. Transient: request-only.
         let remaining = max_iter - iter; // iterations left, including this one
 
         // Adaptive per-step reasoning (#D1): with the master switch on, reason only
@@ -734,14 +741,27 @@ pub async fn run_turn(
         // reasons.
         let step_thinking = enable_reasoning && should_reason(iter, remaining);
         if remaining <= WRAP_UP_AT_REMAINING && max_iter > 1 {
+            let content = if remaining <= 1 {
+                // Final iteration: tools are withheld below, so the model must
+                // answer now -- this hard copy is both true and matched by the
+                // mechanism.
+                "This is your final step before the tool-call limit. Do not call any \
+                 more tools; summarize what you have done and give your final answer \
+                 to the user now."
+                    .to_string()
+            } else {
+                // Earlier in the wrap-up window: tools are still advertised, so
+                // nudge toward convergence without falsely claiming this is the
+                // last step (`remaining` is >= 2 here, so "steps" is always plural).
+                format!(
+                    "You're approaching the tool-call limit -- about {remaining} steps \
+                     left. Start converging: finish any essential tool calls now and \
+                     prepare to give your final answer soon."
+                )
+            };
             messages.push(ChatMessage {
                 role: "system".to_string(),
-                content: Some(
-                    "This is your final step before the tool-call limit. Do not call any \
-                     more tools; summarize what you have done and give your final answer \
-                     to the user now."
-                        .to_string(),
-                ),
+                content: Some(content),
                 tool_calls: None,
                 tool_call_id: None,
                 name: None,
@@ -3130,24 +3150,35 @@ mod tests {
     }
 
     /// Always requests a tool call (never finishes on its own), and records, per
-    /// request, whether the wrap-up nudge system message was present and whether
-    /// the tool schema was withheld. Lets a test drive the loop to its iteration
-    /// cap and assert when the nudge fires and when tools are withdrawn.
+    /// request, whether a wrap-up nudge was present (`nudge_seen`, either copy),
+    /// whether the *hard* "do not call tools" copy was present (`hard_copy_seen`),
+    /// and whether the tool schema was withheld (`tools_withheld`). Lets a test
+    /// drive the loop to its cap and assert that the soft nudge spans the window
+    /// while the hard copy and tool-withholding align only on the final iteration.
     struct RecordingToolLooper {
         nudge_seen: Arc<std::sync::Mutex<Vec<bool>>>,
+        hard_copy_seen: Arc<std::sync::Mutex<Vec<bool>>>,
         tools_withheld: Arc<std::sync::Mutex<Vec<bool>>>,
     }
 
     #[async_trait]
     impl Provider for RecordingToolLooper {
         async fn chat_stream(&self, req: ChatRequest) -> Result<ChunkStream, LlmError> {
-            let saw = req.messages.iter().any(|m| {
-                m.role == "system"
-                    && m.content
-                        .as_deref()
-                        .is_some_and(|c| c.contains("final step before the tool-call limit"))
-            });
-            self.nudge_seen.lock().unwrap().push(saw);
+            let system_text = |needle: &str| {
+                req.messages.iter().any(|m| {
+                    m.role == "system" && m.content.as_deref().is_some_and(|c| c.contains(needle))
+                })
+            };
+            // "tool-call limit" appears in both the soft and hard wrap-up copies
+            // (and not in the repeat-stall nudge), so it marks the whole window.
+            self.nudge_seen
+                .lock()
+                .unwrap()
+                .push(system_text("tool-call limit"));
+            self.hard_copy_seen
+                .lock()
+                .unwrap()
+                .push(system_text("Do not call any more tools"));
             self.tools_withheld
                 .lock()
                 .unwrap()
@@ -3167,7 +3198,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wrap_up_nudge_fires_in_window_and_tools_withheld_on_final_iteration() {
+    async fn wrap_up_nudge_graduates_then_hard_stops_and_withholds_tools_on_final_iteration() {
         let dir = tempfile::tempdir().unwrap();
         let store = SessionStore::new();
         let s = store.create_session(None);
@@ -3175,9 +3206,11 @@ mod tests {
         let registry = ToolRegistry::with_defaults();
         let approve = AlwaysApprove;
         let nudge_seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let hard_copy_seen = Arc::new(std::sync::Mutex::new(Vec::new()));
         let tools_withheld = Arc::new(std::sync::Mutex::new(Vec::new()));
         let provider = RecordingToolLooper {
             nudge_seen: nudge_seen.clone(),
+            hard_copy_seen: hard_copy_seen.clone(),
             tools_withheld: tools_withheld.clone(),
         };
         // Cap 5 with WRAP_UP_AT_REMAINING == 3: remaining counts down 5,4,3,2,1.
@@ -3200,9 +3233,14 @@ mod tests {
         let seen = nudge_seen.lock().unwrap();
         // The provider is hit once per iteration, up to the cap.
         assert_eq!(seen.len(), 5, "loop should run to the iteration cap");
-        // The nudge fires across the wrap-up window (remaining <= 3): the last 3.
+        // A wrap-up nudge (either copy) fires across the window (remaining <= 3).
         assert_eq!(seen.as_slice(), &[false, false, true, true, true]);
-        // Tools are withheld only on the very last iteration (remaining == 1).
+        // But the hard "do not call tools" copy is reserved for the final
+        // iteration (remaining == 1) -- the earlier window gets the soft nudge.
+        let hard = hard_copy_seen.lock().unwrap();
+        assert_eq!(hard.as_slice(), &[false, false, false, false, true]);
+        // ...and tool-withholding aligns exactly with the hard copy, so the
+        // instruction never tells the model to stop while tools are still offered.
         let withheld = tools_withheld.lock().unwrap();
         assert_eq!(withheld.as_slice(), &[false, false, false, false, true]);
     }
@@ -3218,6 +3256,7 @@ mod tests {
         let nudge_seen = Arc::new(std::sync::Mutex::new(Vec::new()));
         let provider = RecordingToolLooper {
             nudge_seen: nudge_seen.clone(),
+            hard_copy_seen: Arc::new(std::sync::Mutex::new(Vec::new())),
             tools_withheld: Arc::new(std::sync::Mutex::new(Vec::new())),
         };
         let tools = ToolContext::new(&registry, dir.path(), &approve, 1);
