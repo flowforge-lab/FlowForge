@@ -103,7 +103,11 @@ impl SessionStore {
 
     fn from_conn(conn: Connection) -> rusqlite::Result<Self> {
         // Per-connection: foreign keys are off by default in SQLite.
-        conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+        conn.execute_batch(
+            "PRAGMA foreign_keys = ON;
+             PRAGMA journal_mode = WAL;
+             PRAGMA synchronous = NORMAL;",
+        )?;
         migrate(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
@@ -125,7 +129,7 @@ impl SessionStore {
             workspace: None,
         };
         let conn = self.conn.lock().unwrap();
-        conn.execute(
+        let inserted = conn.execute(
             "INSERT INTO sessions
                  (id, goal, title, summary, status, created_at, updated_at, phenotype, mode, workspace)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
@@ -141,8 +145,11 @@ impl SessionStore {
                 session.mode.as_ref().map(enum_to_text),
                 session.workspace,
             ],
-        )
-        .expect("insert session");
+        );
+        if let Err(error) = &inserted {
+            tracing::error!(%error, "session write failed");
+        }
+        inserted.expect("insert session");
         session
     }
 
@@ -315,7 +322,7 @@ impl SessionStore {
             .as_ref()
             .filter(|a| !a.is_empty())
             .map(|a| serde_json::to_string(a).expect("serialize attachments"));
-        conn.execute(
+        let inserted = conn.execute(
             "INSERT INTO messages
                  (id, session_id, seq, role, content, tool_calls, tool_call_id, attachments, reasoning, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
@@ -331,8 +338,11 @@ impl SessionStore {
                 msg.reasoning,
                 msg.created_at,
             ],
-        )
-        .expect("insert message");
+        );
+        if let Err(error) = &inserted {
+            tracing::error!(%error, "session write failed");
+        }
+        inserted.expect("insert message");
         conn.execute(
             "UPDATE sessions SET updated_at = ?1 WHERE id = ?2",
             params![msg.created_at, msg.session_id],
@@ -644,7 +654,14 @@ impl SessionStore {
             // ...and its workspace, so the copy runs in the same cwd (#279).
             workspace: source.workspace.clone(),
         };
-        conn.execute(
+        let tx = match conn.unchecked_transaction() {
+            Ok(tx) => tx,
+            Err(error) => {
+                tracing::error!(%error, "session write failed");
+                panic!("start fork transaction: {error}");
+            }
+        };
+        let inserted = tx.execute(
             "INSERT INTO sessions
                  (id, goal, title, summary, status, created_at, updated_at, phenotype, mode, workspace)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
@@ -660,18 +677,75 @@ impl SessionStore {
                 forked.mode.as_ref().map(enum_to_text),
                 forked.workspace,
             ],
-        )
-        .expect("insert forked session");
+        );
+        if let Err(error) = &inserted {
+            tracing::error!(%error, "session write failed");
+        }
+        inserted.expect("insert forked session");
+
         // Re-key the transcript to the new session, preserving `seq` order.
-        conn.execute(
-            "INSERT INTO messages
-                 (id, session_id, seq, role, content, tool_calls, tool_call_id, attachments, reasoning, created_at)
-             SELECT lower(hex(randomblob(16))), ?1, seq, role, content, tool_calls,
-                    tool_call_id, attachments, reasoning, created_at
-             FROM messages WHERE session_id = ?2",
-            params![forked.id, session_id],
-        )
-        .expect("clone forked messages");
+        {
+            let mut stmt = tx
+                .prepare(
+                    "SELECT seq, role, content, tool_calls, tool_call_id, attachments, reasoning, created_at
+                     FROM messages WHERE session_id = ?1
+                     ORDER BY seq",
+                )
+                .expect("prepare forked messages");
+            let rows = stmt
+                .query_map(params![session_id], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, Option<String>>(6)?,
+                        row.get::<_, i64>(7)?,
+                    ))
+                })
+                .expect("query forked messages");
+
+            for row in rows {
+                let (
+                    seq,
+                    role,
+                    content,
+                    tool_calls,
+                    tool_call_id,
+                    attachments,
+                    reasoning,
+                    created_at,
+                ) = row.expect("read forked message");
+                let inserted = tx.execute(
+                    "INSERT INTO messages
+                         (id, session_id, seq, role, content, tool_calls, tool_call_id, attachments, reasoning, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                    params![
+                        new_id(),
+                        forked.id,
+                        seq,
+                        role,
+                        content,
+                        tool_calls,
+                        tool_call_id,
+                        attachments,
+                        reasoning,
+                        created_at,
+                    ],
+                );
+                if let Err(error) = &inserted {
+                    tracing::error!(%error, "session write failed");
+                }
+                inserted.expect("clone forked message");
+            }
+        }
+        let committed = tx.commit();
+        if let Err(error) = &committed {
+            tracing::error!(%error, "session write failed");
+        }
+        committed.expect("commit forked session");
         Some(forked)
     }
 
@@ -1527,6 +1601,38 @@ mod tests {
         assert_eq!(msgs[0].id, mid);
         assert_eq!(msgs[0].content, "remember me");
         assert_eq!(msgs[1].role, Role::Assistant);
+    }
+
+    #[test]
+    fn fork_session_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sessions.db");
+
+        let source_id;
+        let forked_id;
+        {
+            let store = SessionStore::open(&path).unwrap();
+            let s = store.create_session(Some("durable fork".into()));
+            source_id = s.id.clone();
+            store.set_title(&s.id, "Durable fork".into());
+            store.add_message(&s.id, Role::User, "copy me".into());
+            store.add_message(&s.id, Role::Assistant, "copied".into());
+
+            let forked = store.fork_session(&s.id).unwrap();
+            forked_id = forked.id;
+        }
+
+        let store = SessionStore::open(&path).unwrap();
+        let source_msgs = store.get_messages(&source_id);
+        let forked_msgs = store.get_messages(&forked_id);
+        assert_eq!(forked_msgs.len(), source_msgs.len());
+        assert_eq!(forked_msgs[0].content, "copy me");
+        assert_eq!(forked_msgs[1].content, "copied");
+        assert_eq!(forked_msgs[0].session_id, forked_id);
+        assert_ne!(forked_msgs[0].id, source_msgs[0].id);
+
+        let forked = store.get_session(&forked_id).unwrap();
+        assert_eq!(forked.title.as_deref(), Some("Durable fork (copy)"));
     }
 
     #[test]
