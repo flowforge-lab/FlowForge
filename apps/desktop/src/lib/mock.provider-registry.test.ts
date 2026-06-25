@@ -205,8 +205,12 @@ describe("MockIpc provider connection registry", () => {
     await expect(ipc.testConnection("bedrock")).resolves.toBeUndefined();
   });
 
-  it("lists SiliconFlow model ids for the siliconflow connection", async () => {
+  it("lists SiliconFlow model ids only once an API key is stored", async () => {
     const ipc = new MockIpc();
+    // Without a key the probe 401s — `list_models` returns empty, not the catalog
+    // (#486: lets the FE's post-credentials recovery be exercised offline).
+    expect(await ipc.listModels("siliconflow")).toEqual([]);
+    await ipc.setProviderSecret("siliconflow", "apiKey", "sk-abc123");
     const models = await ipc.listModels("siliconflow");
     expect(models).toContain("deepseek-ai/DeepSeek-V3");
     expect(models).toContain("Qwen/Qwen3-8B");
@@ -221,8 +225,10 @@ describe("MockIpc provider connection registry", () => {
     await expect(ipc.testConnection("siliconflow")).resolves.toBeUndefined();
   });
 
-  it("lists OpenAI model ids for the openai connection", async () => {
+  it("lists OpenAI model ids only once an API key is stored", async () => {
     const ipc = new MockIpc();
+    expect(await ipc.listModels("openai")).toEqual([]);
+    await ipc.setProviderSecret("openai", "apiKey", "sk-abc123");
     const models = await ipc.listModels("openai");
     expect(models).toContain("gpt-4o");
     expect(models).toContain("o3");

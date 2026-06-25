@@ -283,6 +283,9 @@ export const useModelConfigStore = create<ModelConfigState>()(
           try {
             await ipc.testConnection(id);
             set((s) => ({ test: { ...s.test, [id]: { state: "ok" } } }));
+            // A now-passing probe means creds are good — refresh the catalog so a
+            // connection that previously cached an empty list recovers (#486).
+            await get().loadModels(id);
           } catch (err) {
             set((s) => ({
               test: {
