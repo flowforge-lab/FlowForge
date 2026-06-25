@@ -17,7 +17,12 @@ use tokio::time::timeout;
 
 use crate::registry::{Safety, Tool, ToolOutcome};
 
-const TIMEOUT: Duration = Duration::from_secs(120);
+/// Default per-call wall-clock budget when `timeout_secs` is not supplied.
+const DEFAULT_TIMEOUT_SECS: u64 = 120;
+/// Hard ceiling for a caller-supplied `timeout_secs`. Long enough for a cold
+/// `cargo build` + test (the case that used to force a background-poll loop),
+/// short enough to stay a foreground call rather than an unbounded job.
+const MAX_TIMEOUT_SECS: u64 = 600;
 
 /// Workspace-relative scratch directory (#458 RC4c). A sanctioned, always-writable
 /// temp location under the workspace root so the agent never reaches for `/tmp`
@@ -56,6 +61,17 @@ impl BashTool {
         args.get("command")
             .and_then(Value::as_str)
             .map(Self::strip_command_prefix)
+    }
+
+    /// Resolve the per-call timeout: an optional `timeout_secs`, clamped to
+    /// `[1, MAX_TIMEOUT_SECS]`, else the default. Lets a multi-minute build run in
+    /// one foreground call instead of a background job polled with `sleep`-loops
+    /// that re-hit a fixed ceiling (#479).
+    fn timeout_for(args: &Value) -> Duration {
+        match args.get("timeout_secs").and_then(Value::as_u64) {
+            Some(secs) => Duration::from_secs(secs.clamp(1, MAX_TIMEOUT_SECS)),
+            None => Duration::from_secs(DEFAULT_TIMEOUT_SECS),
+        }
     }
 
     /// Strip a single leaked `command:` key prefix from the value (#458 RC4a).
@@ -188,7 +204,9 @@ impl Tool for BashTool {
          Commands already run from the workspace root -- issue bare commands; do NOT \
          prefix `cd <workspace>` (use `working_dir` for a subdirectory instead). For \
          temporary files use the workspace scratch dir `.ff-scratch/` (created for \
-         you), never `/tmp`."
+         you), never `/tmp`. A command runs for at most 120s by default; for a slow \
+         build or test, pass `timeout_secs` (max 600) and run it in the foreground \
+         rather than backgrounding and polling."
     }
 
     fn parameters(&self) -> Value {
@@ -203,6 +221,13 @@ impl Tool for BashTool {
                     "type": "string",
                     "description": "Directory to run the command in, relative to the \
                                     workspace root or absolute. Defaults to the workspace root."
+                },
+                "timeout_secs": {
+                    "type": "integer",
+                    "description": "Wall-clock budget for this command, in seconds \
+                                    (default 120, max 600). Raise it to run a slow build \
+                                    or test suite in the foreground in a single call \
+                                    instead of backgrounding and polling."
                 }
             },
             "required": ["command"]
@@ -250,6 +275,7 @@ impl Tool for BashTool {
             }
         }
 
+        let timeout_budget = Self::timeout_for(&args);
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
         let child = Command::new(&shell)
             .arg("-c")
@@ -262,7 +288,7 @@ impl Tool for BashTool {
             .kill_on_drop(true)
             .output();
 
-        match timeout(TIMEOUT, child).await {
+        match timeout(timeout_budget, child).await {
             Ok(Ok(output)) => {
                 let stdout = String::from_utf8_lossy(&output.stdout);
                 let stderr = String::from_utf8_lossy(&output.stderr);
@@ -279,7 +305,11 @@ impl Tool for BashTool {
                 }
             }
             Ok(Err(e)) => ToolOutcome::error(format!("failed to spawn command: {e}")),
-            Err(_) => ToolOutcome::error(format!("command timed out after {}s", TIMEOUT.as_secs())),
+            Err(_) => ToolOutcome::error(format!(
+                "command timed out after {}s. For a longer job, pass `timeout_secs` (max {}); for one longer than that, run it in the background and poll with quick, non-blocking checks rather than sleeping inside a call.",
+                timeout_budget.as_secs(),
+                MAX_TIMEOUT_SECS
+            )),
         }
     }
 }
@@ -532,6 +562,55 @@ mod tests {
             std::fs::read_to_string(scratch.join(".gitignore")).unwrap(),
             "custom\n",
             "an existing .gitignore must be preserved"
+        );
+    }
+
+    // ---- #479: configurable per-call timeout ----
+
+    #[test]
+    fn timeout_defaults_when_absent() {
+        let d = BashTool::timeout_for(&serde_json::json!({"command": "true"}));
+        assert_eq!(d, Duration::from_secs(DEFAULT_TIMEOUT_SECS));
+    }
+
+    #[test]
+    fn timeout_honors_and_clamps_caller_value() {
+        // An in-range value is honored.
+        assert_eq!(
+            BashTool::timeout_for(&serde_json::json!({"timeout_secs": 300})),
+            Duration::from_secs(300)
+        );
+        // Above the ceiling clamps down.
+        assert_eq!(
+            BashTool::timeout_for(&serde_json::json!({"timeout_secs": 99999})),
+            Duration::from_secs(MAX_TIMEOUT_SECS)
+        );
+        // Zero clamps up to the 1s floor (never an instant timeout).
+        assert_eq!(
+            BashTool::timeout_for(&serde_json::json!({"timeout_secs": 0})),
+            Duration::from_secs(1)
+        );
+        // A non-integer value falls back to the default.
+        assert_eq!(
+            BashTool::timeout_for(&serde_json::json!({"timeout_secs": "lots"})),
+            Duration::from_secs(DEFAULT_TIMEOUT_SECS)
+        );
+    }
+
+    #[tokio::test]
+    async fn run_enforces_a_short_caller_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = BashTool
+            .run(
+                serde_json::json!({"command": "sleep 5", "timeout_secs": 1}),
+                dir.path(),
+            )
+            .await;
+        assert!(!out.success, "a 5s sleep under a 1s budget must time out");
+        assert!(
+            out.content.contains("timed out after 1s") && out.content.contains("timeout_secs"),
+            "the timeout error should name the budget and teach `timeout_secs`: {}",
+            out.content
         );
     }
 }
