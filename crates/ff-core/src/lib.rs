@@ -21,7 +21,7 @@ pub use memory::{MemoryFileInfo, MemoryFileKind, MemoryOverview};
 pub use message::{Attachment, AttachmentKind, AttachmentSource, Message, Role, ToolCall};
 pub use mode::Mode;
 pub use model_specs::{
-    bundled_rules, context_window_in, parse_specs, ModelSpec, ModelSpecs,
+    bundled_rules, context_window_in, parse_specs, supports_vision_in, ModelSpec, ModelSpecs,
     DEFAULT_CONTEXT_WINDOW_TOKENS,
 };
 pub use provider::{
