@@ -1127,7 +1127,12 @@ impl AppState {
     pub fn reap_session_processes(&self, session_id: &str) {
         let sup = self.process_supervisor.clone();
         let id = session_id.to_owned();
-        tokio::spawn(async move {
+        // `tauri::async_runtime::spawn` (not bare `tokio::spawn`) so this is safe to
+        // call from the synchronous `delete_session` command, which Tauri runs off
+        // the reactor on macOS (#117). A bare `tokio::spawn` there panics with "no
+        // reactor running", and the unwind through the command FFI boundary takes
+        // the whole app down (#471).
+        tauri::async_runtime::spawn(async move {
             let n = sup.reap_session(&id).await;
             if n > 0 {
                 tracing::info!(session_id = %id, reaped = n, "reaped session processes");
@@ -3182,6 +3187,18 @@ mod tests {
         // doesn't panic. The loop is detached and dies with the test process.
         let state = AppState::new();
         state.start_process_reaper();
+        // No panic == the spawn succeeded.
+    }
+
+    #[test]
+    fn reap_session_processes_spawns_without_an_entered_runtime() {
+        // #471: `delete_session` is a synchronous Tauri command, which runs off the
+        // reactor on macOS (issue #117). `reap_session_processes` must therefore use
+        // a reactor-safe spawn -- a bare `tokio::spawn` here panics with "no reactor
+        // running" and the unwind through the command FFI takes the whole app down.
+        // Plain `#[test]` (no `#[tokio::test]`) so there is no ambient runtime.
+        let state = AppState::new();
+        state.reap_session_processes("any-session");
         // No panic == the spawn succeeded.
     }
 
