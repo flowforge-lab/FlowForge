@@ -3218,7 +3218,12 @@ mod tests {
     #[test]
     fn connection_secret_presence_lists_stored_kinds_and_errors_on_unknown_id() {
         let state = AppState::with_registry(ProviderRegistry::default());
-        let id = "candle-vllm";
+        // Unique, self-registered id: the keychain MemStore is process-global in
+        // tests, so sharing a default connection id (e.g. `candle-vllm`) with
+        // another secret-storing test makes the initial emptiness assertion
+        // order-dependent.
+        let id = "secret-presence-listing";
+        state.upsert_connection(bedrock_conn(id, None));
         assert!(state.connection_secret_presence(id).unwrap().is_empty());
         state
             .set_connection_secret(id, SecretKind::ApiKey, "sk-1")
