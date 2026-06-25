@@ -1006,6 +1006,7 @@ mod tests {
             model: model.map(str::to_string),
             persona: persona.map(str::to_string),
             max_iterations: None,
+            provider: None,
         }
     }
 

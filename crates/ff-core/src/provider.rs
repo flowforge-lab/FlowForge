@@ -357,6 +357,19 @@ pub struct ProviderRegistry {
     pub active: ConnectionId,
 }
 
+/// A resolved `(connection, model)` pair -- the unit of model selection at every
+/// tier (session / phenotype / global) in RFC 0005 §11. `connection` picks the
+/// endpoint + credentials; `model` is the model to run on it. Capabilities (e.g.
+/// vision) are derived from the connection's `kind` + this `model` via
+/// [`model_supports_vision`], never stored on the selection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "../../../apps/desktop/src/bindings/")]
+pub struct ModelSelection {
+    pub connection: ConnectionId,
+    pub model: String,
+}
+
 impl ProviderRegistry {
     /// The currently selected connection, or `None` if `active` dangles (which
     /// the registry invariants forbid, but callers should degrade gracefully).

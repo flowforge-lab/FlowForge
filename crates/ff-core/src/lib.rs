@@ -25,8 +25,8 @@ pub use model_specs::{
     DEFAULT_CONTEXT_WINDOW_TOKENS,
 };
 pub use provider::{
-    BedrockAuth, ConnectionId, ProviderConfig, ProviderConnection, ProviderKind, ProviderRegistry,
-    ReasoningEffort, SecretKind,
+    BedrockAuth, ConnectionId, ModelSelection, ProviderConfig, ProviderConnection, ProviderKind,
+    ProviderRegistry, ReasoningEffort, SecretKind,
 };
 pub use search::{SearchBackend, SearchConfig};
 pub use session::{auto_title, Session, SessionStatus, SessionWorkspace};

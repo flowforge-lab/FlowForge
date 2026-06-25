@@ -85,6 +85,12 @@ pub struct Phenotype {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub model: Option<String>,
+    /// Binds this phenotype to a specific provider connection (RFC 0005 Phase C).
+    /// `None` inherits the globally active connection. Pairs with `model` to form
+    /// the phenotype tier of three-tier model resolution (RFC 0005 §11.2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub provider: Option<crate::provider::ConnectionId>,
     /// Extra system-prompt preamble for this phenotype.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
@@ -169,6 +175,7 @@ mod tests {
             model: Some("Qwen3-4B-Instruct-2507".into()),
             persona: None,
             max_iterations: None,
+            provider: None,
         };
         let json = serde_json::to_string(&p).unwrap();
         assert_eq!(p, serde_json::from_str(&json).unwrap());
