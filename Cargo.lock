@@ -1867,6 +1867,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "wiremock",
 ]
 
 [[package]]

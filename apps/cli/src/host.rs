@@ -7,7 +7,8 @@ use std::path::PathBuf;
 
 use ff_core::{ProviderConfig, ProviderKind};
 use ff_llm::{
-    wire_dialect, BedrockCreds, BedrockProvider, OllamaProvider, OpenAiProvider, Provider,
+    reasoning_control, wire_dialect, BedrockCreds, BedrockProvider, OllamaProvider, OpenAiProvider,
+    Provider,
 };
 use ff_skills::SkillRegistry;
 
@@ -36,6 +37,10 @@ fn build_provider(config: &ProviderConfig) -> Box<dyn Provider> {
     // CLI has no per-connection vendor descriptor (#375); the model name is the
     // only signal we have for SiliconFlow GLM/MiniMax detection.
     let dialect = wire_dialect(config.kind, None, &config.model);
+    // OpenAI-wire reasoning controls (#394), mirroring the desktop's `build_provider`.
+    // A no-op except on the SiliconFlow gateway; the effort dial comes from
+    // `provider.json` (`reasoning_effort`), defaulting to Medium for legacy files.
+    let reasoning = reasoning_control(config.kind, &config.model, config.reasoning_effort);
     match config.kind {
         ProviderKind::CandleVllm => {
             Box::new(OpenAiProvider::new(base_url, None).with_dialect(dialect))
@@ -60,7 +65,9 @@ fn build_provider(config: &ProviderConfig) -> Box<dyn Provider> {
         // OPENAI_API_KEY env var (absent or empty => keyless, for OpenAI-compatible
         // local gateways that need none).
         ProviderKind::OpenAi => Box::new(
-            OpenAiProvider::new(base_url, api_key_from_env("OPENAI_API_KEY")).with_dialect(dialect),
+            OpenAiProvider::new(base_url, api_key_from_env("OPENAI_API_KEY"))
+                .with_dialect(dialect)
+                .with_reasoning_control(reasoning),
         ),
         // SiliconFlow is OpenAI-compatible. The CLI has no keychain, so the bearer
         // key comes from SILICONFLOW_API_KEY (empty/unset = anonymous, which the
@@ -69,7 +76,11 @@ fn build_provider(config: &ProviderConfig) -> Box<dyn Provider> {
             let key = std::env::var("SILICONFLOW_API_KEY")
                 .ok()
                 .filter(|k| !k.is_empty());
-            Box::new(OpenAiProvider::new(base_url, key).with_dialect(dialect))
+            Box::new(
+                OpenAiProvider::new(base_url, key)
+                    .with_dialect(dialect)
+                    .with_reasoning_control(reasoning),
+            )
         }
     }
 }
@@ -205,5 +216,68 @@ mod tests {
             super::api_key_from_env("FF_TEST_OPENAI_KEY_NEVER_SET"),
             None
         );
+    }
+
+    // ---- reasoning-control wiring (#394): the CLI must mirror the desktop and emit
+    // SiliconFlow's enable_thinking / thinking_budget on the wire. Without the
+    // with_reasoning_control hook in build_provider, per-step thinking is invisible
+    // through `flowforge run`. ----
+
+    use ff_core::{ProviderConfig, ProviderKind, ReasoningEffort};
+    use ff_llm::{ChatMessage, ChatRequest};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// Build the SiliconFlow CLI provider against `server`, POST one chat turn, and
+    /// return the JSON body it sent. Mirrors the body-capture tests in
+    /// `crates/ff-llm/src/openai.rs`.
+    async fn siliconflow_body(thinking: bool, effort: ReasoningEffort) -> serde_json::Value {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("data: [DONE]\n\n"))
+            .mount(&server)
+            .await;
+
+        let config = ProviderConfig {
+            kind: ProviderKind::SiliconFlow,
+            base_url: Some(server.uri()),
+            model: "zai-org/GLM-5.2".into(),
+            reasoning_effort: effort,
+            ..Default::default()
+        };
+        let provider = super::build_provider(&config);
+        let req = ChatRequest {
+            model: config.model.clone(),
+            messages: vec![ChatMessage::text("user", "hi")],
+            tools: Vec::new(),
+            thinking,
+        };
+        let _ = provider.chat_stream(req).await.expect("send succeeds");
+        let reqs = server.received_requests().await.expect("requests recorded");
+        serde_json::from_slice(&reqs[0].body).expect("body is json")
+    }
+
+    #[tokio::test]
+    async fn siliconflow_cli_provider_emits_thinking_budget() {
+        // thinking on => the Medium budget cap rides the wire (not the off-switch).
+        let body = siliconflow_body(true, ReasoningEffort::Medium).await;
+        assert_eq!(body["thinking_budget"], 4096);
+        assert!(body.get("enable_thinking").is_none());
+    }
+
+    #[tokio::test]
+    async fn siliconflow_cli_provider_effort_dial_is_honored() {
+        // The reasoning_effort field from provider.json picks the budget.
+        let body = siliconflow_body(true, ReasoningEffort::Low).await;
+        assert_eq!(body["thinking_budget"], 1024);
+    }
+
+    #[tokio::test]
+    async fn siliconflow_cli_provider_thinking_off_disables_reasoning() {
+        // thinking off => enable_thinking: false, so the model does not reason.
+        let body = siliconflow_body(false, ReasoningEffort::Medium).await;
+        assert_eq!(body["enable_thinking"], false);
+        assert!(body.get("thinking_budget").is_none());
     }
 }

@@ -670,6 +670,8 @@ fn set_provider_config(
         // Secrets are a later phase; preserve whatever the backend already knows.
         has_key: current.has_key,
         thinking,
+        // This legacy shim has no effort control; preserve the persisted dial.
+        reasoning_effort: current.reasoning_effort,
     };
     state.set_provider_config(config.clone());
     config
