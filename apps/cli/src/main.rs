@@ -707,6 +707,9 @@ mod tests {
                 final_message: Some("Hello world!".into()),
                 turns: Some(2),
                 token_count: None,
+                prefill_estimates: None,
+                tier1_fires: None,
+                tier2_fires: None,
             },
             AgentEvent::MemoryFlushed {
                 message_id: "m1".into(),

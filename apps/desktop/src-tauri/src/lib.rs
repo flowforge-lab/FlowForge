@@ -44,6 +44,11 @@ struct TurnMetrics {
     iter_marks: Vec<std::time::Instant>,
     /// Silent mid-turn memory flushes, each an extra provider round-trip (#427).
     flushes: u32,
+    /// F1b (#441): captured from the turn's `Done` event -- the per-round-trip
+    /// prefill estimate and how often each compaction tier engaged this turn.
+    prefill_estimates: Vec<u32>,
+    tier1_fires: u32,
+    tier2_fires: u32,
 }
 
 impl TurnMetrics {
@@ -55,6 +60,14 @@ impl TurnMetrics {
 
     fn note_flush(&mut self) {
         self.flushes += 1;
+    }
+
+    /// Fold the agent-side F1b signal carried by the turn's `Done` event (#441).
+    /// Fires once per turn, so a plain assign is correct.
+    fn note_done(&mut self, prefill_estimates: &[u32], tier1_fires: u32, tier2_fires: u32) {
+        self.prefill_estimates = prefill_estimates.to_vec();
+        self.tier1_fires = tier1_fires;
+        self.tier2_fires = tier2_fires;
     }
 
     /// `(streamed assistant chars, distinct turn count)`.
@@ -534,9 +547,22 @@ fn send_message(
                             m.chars += delta.chars().count();
                         }
                         AgentEvent::Reasoning { message_id, .. }
-                        | AgentEvent::ToolCallStarted { message_id, .. }
-                        | AgentEvent::Done { message_id, .. } => {
+                        | AgentEvent::ToolCallStarted { message_id, .. } => {
                             m.note_turn(message_id);
+                        }
+                        AgentEvent::Done {
+                            message_id,
+                            prefill_estimates,
+                            tier1_fires,
+                            tier2_fires,
+                            ..
+                        } => {
+                            m.note_turn(message_id);
+                            m.note_done(
+                                prefill_estimates.as_deref().unwrap_or(&[]),
+                                tier1_fires.unwrap_or(0),
+                                tier2_fires.unwrap_or(0),
+                            );
                         }
                         AgentEvent::MemoryFlushed { message_id, .. } => {
                             m.note_turn(message_id);
@@ -567,12 +593,30 @@ fn send_message(
         // aggregate and emit a SkillCompleted per skill. Success = a clean finish
         // (run_turn returned Ok and the turn was not cancelled).
         let turn_end = std::time::Instant::now();
-        let (chars, turn_count, round_trips, iter_ms, flushes) = metrics
+        let (
+            chars,
+            turn_count,
+            round_trips,
+            iter_ms,
+            flushes,
+            prefill_estimates,
+            tier1_fires,
+            tier2_fires,
+        ) = metrics
             .lock()
             .map(|m| {
                 let (c, t) = m.snapshot();
                 let (rt, ims, fl) = m.timing(turn_end);
-                (c, t, rt, ims, fl)
+                (
+                    c,
+                    t,
+                    rt,
+                    ims,
+                    fl,
+                    m.prefill_estimates.clone(),
+                    m.tier1_fires,
+                    m.tier2_fires,
+                )
             })
             .unwrap_or_default();
         let success = result.is_ok() && !cancel_probe.is_cancelled();
@@ -591,6 +635,9 @@ fn send_message(
             iter_ms,
             flushes,
             chars: u32::try_from(chars).unwrap_or(u32::MAX),
+            prefill_estimates,
+            tier1_fires,
+            tier2_fires,
         };
         tracing::info!(
             target: "turn_metrics",
@@ -600,6 +647,9 @@ fn send_message(
             flushes,
             chars = stats.chars,
             iter_ms = ?stats.iter_ms,
+            tier1_fires = stats.tier1_fires,
+            tier2_fires = stats.tier2_fires,
+            prefill_estimates = ?stats.prefill_estimates,
             "turn metrics (F1 baseline)"
         );
         let _ = app.emit("turn:stats", stats);
@@ -1757,5 +1807,20 @@ mod tests {
         assert_eq!(round_trips, 0);
         assert!(iter_ms.is_empty());
         assert_eq!(flushes, 0);
+        // F1b (#441): a turn whose Done carried no telemetry reports a clean zero.
+        assert!(m.prefill_estimates.is_empty());
+        assert_eq!(m.tier1_fires, 0);
+        assert_eq!(m.tier2_fires, 0);
+    }
+
+    #[test]
+    fn turn_metrics_note_done_folds_f1b_telemetry() {
+        // #441: the per-round-trip prefill estimate and the two compaction-fire
+        // counts from the turn's Done event are captured verbatim for `turn:stats`.
+        let mut m = TurnMetrics::default();
+        m.note_done(&[120, 340, 75], 2, 1);
+        assert_eq!(m.prefill_estimates, vec![120, 340, 75]);
+        assert_eq!(m.tier1_fires, 2);
+        assert_eq!(m.tier2_fires, 1);
     }
 }

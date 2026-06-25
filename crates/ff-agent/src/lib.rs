@@ -168,6 +168,21 @@ pub enum AgentEvent {
         turns: Option<u32>,
         #[serde(skip_serializing_if = "Option::is_none")]
         token_count: Option<u32>,
+        /// F1b (#441): the projected prefill-token estimate of every round-trip's
+        /// outgoing request (post-compaction wire), in iteration order. Lets the
+        /// perf epic (#426) see whether the budget / reasoning-replay-cap work
+        /// actually shrank the per-iteration request size. `None` only for events
+        /// that did not originate from `run_turn`.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        prefill_estimates: Option<Vec<u32>>,
+        /// F1b (#441): how many iterations this turn engaged the Tier-1 extractive
+        /// cold-prefix compaction pass (RFC 0016 M7.1b).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        tier1_fires: Option<u32>,
+        /// F1b (#441): how many iterations this turn engaged the Tier-2 abstractive
+        /// cold-tail summary (RFC 0016 M7.0).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        tier2_fires: Option<u32>,
     },
     /// A silent context-pressure memory flush (#244 R5) wrote `writes` durable
     /// facts to the user's on-disk memory this turn (#283). Emitted only when
@@ -587,6 +602,13 @@ pub async fn run_turn(
     // window instead of one per tool round.
     let mut last_summary: Option<(usize, Message)> = None;
     let mut last_summary_count: Option<u64> = None;
+    // F1b (#441) telemetry: the projected prefill estimate of each round-trip's
+    // outgoing wire, plus how often each compaction tier engaged this turn. Folded
+    // into the `Done` event so the desktop's `turn:stats` can report them. Purely
+    // observational -- never gates behavior.
+    let mut prefill_estimates: Vec<u32> = Vec::new();
+    let mut tier1_fires: u32 = 0;
+    let mut tier2_fires: u32 = 0;
     for iter in 0..max_iter {
         turn_count += 1;
         if cancel.is_cancelled() {
@@ -665,6 +687,7 @@ pub async fn run_turn(
         // `compaction_retrieve` tool can fetch it back. Messages already compacted
         // at ingest (M7.1a tool results) are skipped to avoid double-compaction.
         let wire = if pressure.is_over(EXTRACTIVE_COMPACT_AT_FRACTION) {
+            tier1_fires += 1;
             let cold =
                 ExtractiveCompactor::default().compact_cold_collect(&history, KEEP_RECENT_VERBATIM);
             for (mid, key, original) in &cold.originals {
@@ -697,6 +720,7 @@ pub async fn run_turn(
                 .assess(&wire, model)
                 .is_over(tools.abstractive.fire_at_fraction)
         {
+            tier2_fires += 1;
             let reuse = match last_summary.as_ref() {
                 Some((boundary, msg))
                     if *boundary <= wire.len()
@@ -739,6 +763,11 @@ pub async fn run_turn(
             wire
         };
         messages.extend(to_chat(&wire));
+        // F1b (#441): record the projected prefill of the actual outgoing wire
+        // (post Tier-1/Tier-2), so the metric reflects what compaction left to send.
+        prefill_estimates.push(
+            u32::try_from(estimator.assess(&wire, model).estimated_tokens).unwrap_or(u32::MAX),
+        );
 
         // Near the iteration cap, nudge the model toward a final answer so a long
         // turn ends with a real reply instead of "[stopped: reached tool-call
@@ -1023,6 +1052,9 @@ pub async fn run_turn(
                 final_message: Some(final_text),
                 turns: Some(turn_count),
                 token_count,
+                prefill_estimates: Some(prefill_estimates.clone()),
+                tier1_fires: Some(tier1_fires),
+                tier2_fires: Some(tier2_fires),
             });
             return Ok(finalized);
         }
@@ -1351,6 +1383,9 @@ pub async fn run_turn(
         final_message: Some(msg.content.clone()),
         turns: Some(turn_count),
         token_count,
+        prefill_estimates: Some(prefill_estimates),
+        tier1_fires: Some(tier1_fires),
+        tier2_fires: Some(tier2_fires),
     });
     Ok(msg)
 }
@@ -4003,6 +4038,67 @@ mod tests {
         let tc = seen.lock().unwrap().expect("Done event was emitted");
         let tc = tc.expect("token_count must be populated, not None");
         assert!(tc > 0, "estimated token count should be positive, got {tc}");
+    }
+
+    #[tokio::test]
+    async fn done_event_reports_f1b_prefill_and_compaction_telemetry() {
+        // #441: the Done event carries one prefill estimate per provider round-trip,
+        // and zero compaction fires for a tiny transcript well under the budget.
+        let store = SessionStore::new();
+        let s = store.create_session(None);
+        // A non-trivial prompt so the chars/4 proxy rounds to a positive estimate.
+        store.add_message(
+            &s.id,
+            Role::User,
+            "please summarize the architecture of this project in detail".into(),
+        );
+        let registry = ToolRegistry::new();
+        let root = std::env::current_dir().unwrap();
+        let approve = AlwaysApprove;
+
+        type F1b = (Option<Vec<u32>>, Option<u32>, Option<u32>);
+        let seen: std::sync::Mutex<Option<F1b>> = std::sync::Mutex::new(None);
+        run_turn(
+            &TextProvider,
+            &store,
+            &ctx(&registry, &root, &approve),
+            &s.id,
+            "mock",
+            None,
+            false,
+            CancelToken::new(),
+            |ev| {
+                if let AgentEvent::Done {
+                    prefill_estimates,
+                    tier1_fires,
+                    tier2_fires,
+                    ..
+                } = ev
+                {
+                    *seen.lock().unwrap() = Some((prefill_estimates, tier1_fires, tier2_fires));
+                }
+            },
+        )
+        .await
+        .unwrap();
+
+        let (prefill, t1, t2) = seen
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("Done event was emitted");
+        let prefill = prefill.expect("prefill_estimates must be populated");
+        // TextProvider answers in a single round-trip -> exactly one estimate, > 0.
+        assert_eq!(prefill.len(), 1, "one prefill estimate per round-trip");
+        assert!(
+            prefill[0] > 0,
+            "estimate should be positive, got {}",
+            prefill[0]
+        );
+        // A two-message transcript is far under budget: no compaction engages, and
+        // Tier-2 is default-off regardless.
+        assert_eq!(t1, Some(0), "Tier-1 must not fire under budget");
+        assert_eq!(t2, Some(0), "Tier-2 must not fire (and is default-off)");
     }
 
     // ----- #244 R8: oversized tool-result history truncation -----

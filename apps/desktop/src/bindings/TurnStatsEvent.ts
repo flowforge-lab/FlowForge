@@ -6,6 +6,21 @@
  * provider responses (agent loop iterations) this turn; `iter_ms` is the
  * per-iteration wall-clock in arrival order; `flushes` counts silent mid-turn
  * memory flushes (each an extra provider round-trip); `chars` is the streamed
- * assistant text, a coarse token-cost proxy. Emitted once at turn end.
+ * assistant text, a coarse token-cost proxy; `prefill_estimates` is the per-
+ * round-trip projected request size and `tier1_fires`/`tier2_fires` count how
+ * often each compaction tier engaged (F1b, #441). Emitted once at turn end.
  */
-export type TurnStatsEvent = { sessionId: string, roundTrips: number, totalMs: number, iterMs: Array<number>, flushes: number, chars: number, };
+export type TurnStatsEvent = { sessionId: string, roundTrips: number, totalMs: number, iterMs: Array<number>, flushes: number, chars: number, 
+/**
+ * F1b (#441): projected prefill-token estimate of each round-trip's outgoing
+ * request (post-compaction wire), in iteration order.
+ */
+prefillEstimates: Array<number>, 
+/**
+ * F1b (#441): iterations that engaged the Tier-1 extractive compaction pass.
+ */
+tier1Fires: number, 
+/**
+ * F1b (#441): iterations that engaged the Tier-2 abstractive cold-tail summary.
+ */
+tier2Fires: number, };
