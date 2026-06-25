@@ -2736,6 +2736,125 @@ mod tests {
         assert!(!reg_path.exists());
     }
 
+    /// Regression (#487): a real on-disk registry holding a profile-auth Bedrock
+    /// connection -- captured verbatim from a user's `provider-registry.json` -- must
+    /// survive load with every Bedrock field intact. This exercises the exact bytes,
+    /// including the pre-#395 absence of `reasoningEffort` (must default to Medium) and
+    /// the camelCase Bedrock fields (`authMode`, `awsProfile`). Proves the persistence
+    /// layer never silently drops the connection on load.
+    #[test]
+    fn load_preserves_profile_auth_bedrock_connection_verbatim() {
+        let tmp = tempfile::tempdir().unwrap();
+        let reg_path = tmp.path().join("provider-registry.json");
+        // Exact shape of the field-reported file (active Bedrock, profile auth, no key).
+        let on_disk = r#"{
+          "connections": [
+            {
+              "id": "ollama",
+              "kind": "ollama",
+              "displayName": "Ollama",
+              "model": "llama3.2",
+              "hasKey": false,
+              "thinking": true,
+              "supportsVision": false
+            },
+            {
+              "id": "aws-bedrock",
+              "kind": "bedrock",
+              "displayName": "AWS Bedrock",
+              "model": "us.anthropic.claude-opus-4-8",
+              "hasKey": false,
+              "thinking": false,
+              "supportsVision": false,
+              "region": "us-east-2",
+              "authMode": "profile",
+              "awsProfile": "bedrock-profile"
+            }
+          ],
+          "active": "aws-bedrock"
+        }"#;
+        fs::write(&reg_path, on_disk).unwrap();
+
+        let loaded = load_or_migrate_registry_at(Some(reg_path), None);
+
+        // Neither connection is dropped, and Bedrock stays active.
+        assert_eq!(
+            loaded.connections.len(),
+            2,
+            "both connections must survive load"
+        );
+        assert_eq!(loaded.active, "aws-bedrock");
+
+        let bedrock = loaded
+            .connections
+            .iter()
+            .find(|c| c.id == "aws-bedrock")
+            .expect("the Bedrock connection must not be dropped on load");
+        assert_eq!(bedrock.kind, ProviderKind::Bedrock);
+        assert_eq!(bedrock.region.as_deref(), Some("us-east-2"));
+        assert_eq!(bedrock.auth_mode, Some(BedrockAuth::Profile));
+        assert_eq!(bedrock.aws_profile.as_deref(), Some("bedrock-profile"));
+        assert_eq!(bedrock.model, "us.anthropic.claude-opus-4-8");
+        // A file written before #395 carries no reasoningEffort -> defaults to Medium.
+        assert_eq!(bedrock.reasoning_effort, ReasoningEffort::default());
+    }
+
+    /// Editing one connection (the legacy active-config shim, or a per-connection
+    /// upsert) must never drop a sibling -- the failure mode behind "my Bedrock
+    /// connection vanished after I touched Ollama".
+    #[test]
+    fn editing_one_connection_preserves_siblings() {
+        let mut reg = ProviderRegistry {
+            active: "aws-bedrock".into(),
+            connections: vec![
+                ProviderConnection {
+                    id: "ollama".into(),
+                    kind: ProviderKind::Ollama,
+                    display_name: "Ollama".into(),
+                    vendor: None,
+                    base_url: None,
+                    model: "llama3.2".into(),
+                    has_key: false,
+                    thinking: true,
+                    reasoning_effort: ReasoningEffort::default(),
+                    supports_vision: false,
+                    region: None,
+                    auth_mode: None,
+                    aws_profile: None,
+                    access_key_id: None,
+                },
+                ProviderConnection {
+                    id: "aws-bedrock".into(),
+                    kind: ProviderKind::Bedrock,
+                    display_name: "AWS Bedrock".into(),
+                    vendor: None,
+                    base_url: None,
+                    model: "us.anthropic.claude-opus-4-8".into(),
+                    has_key: false,
+                    thinking: false,
+                    reasoning_effort: ReasoningEffort::default(),
+                    supports_vision: false,
+                    region: Some("us-east-2".into()),
+                    auth_mode: Some(BedrockAuth::Profile),
+                    aws_profile: Some("bedrock-profile".into()),
+                    access_key_id: None,
+                },
+            ],
+        };
+        // Per-connection upsert of an existing id edits in place, keeps the sibling.
+        reg.upsert(ProviderConnection {
+            model: "llama3.3".into(),
+            ..reg.connections[0].clone()
+        });
+        assert_eq!(
+            reg.connections.len(),
+            2,
+            "upsert must not drop the Bedrock sibling"
+        );
+        assert!(reg.connections.iter().any(|c| c.id == "aws-bedrock"));
+        assert_eq!(reg.connections[0].model, "llama3.3");
+    }
+
     #[test]
     fn load_falls_back_to_default_when_no_files() {
         let tmp = tempfile::tempdir().unwrap();
