@@ -8,7 +8,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -29,6 +29,12 @@ const MAX_TIMEOUT_SECS: u64 = 600;
 /// (sandbox-denied in the field). Created lazily and exported as `TMPDIR`/`TMP` for
 /// the child so even tools that default to `/tmp` redirect here.
 const SCRATCH_DIR: &str = ".ff-scratch";
+
+/// Scratch entries older than this are pruned on the next `bash` run (#483). Intermediate
+/// scripts and middle-result files are ephemeral; a week is long enough that anything this
+/// old belongs to a finished session. `.ff-scratch/` is workspace-scoped, so nothing else
+/// ever clears it.
+const MAX_SCRATCH_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 /// First tokens that are unambiguously read-only — auto-runnable without approval.
 const READ_ONLY_CMDS: &[&str] = &[
@@ -53,6 +59,38 @@ const DANGEROUS_PATTERNS: &[&str] = &[
     "curl",
     "wget",
 ];
+
+/// Best-effort age prune of the scratch dir (#483): remove entries whose mtime is older
+/// than `max_age`, preserving the dir itself and its `.gitignore`. All errors are
+/// swallowed -- a prune failure must never fail the tool call (same discipline as the
+/// scratch creation above).
+fn prune_scratch(scratch: &Path, max_age: Duration) {
+    let Ok(entries) = std::fs::read_dir(scratch) else {
+        return;
+    };
+    let now = SystemTime::now();
+    for entry in entries.flatten() {
+        if entry.file_name() == ".gitignore" {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        let Ok(modified) = meta.modified() else {
+            continue;
+        };
+        // A future mtime (clock skew) reads as not-old, so the entry is kept.
+        if now.duration_since(modified).unwrap_or(Duration::ZERO) <= max_age {
+            continue;
+        }
+        let path = entry.path();
+        if meta.is_dir() {
+            let _ = std::fs::remove_dir_all(&path);
+        } else {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+}
 
 pub struct BashTool;
 
@@ -273,6 +311,10 @@ impl Tool for BashTool {
             if !ignore.exists() {
                 let _ = std::fs::write(&ignore, "*\n");
             }
+            // Age-prune stale scratch (#483) so ephemeral scripts/results from finished
+            // sessions don't accumulate unbounded -- the dir is workspace-scoped, so no
+            // session-delete or quit hook ever clears it.
+            prune_scratch(&scratch, MAX_SCRATCH_AGE);
         }
 
         let timeout_budget = Self::timeout_for(&args);
@@ -612,5 +654,61 @@ mod tests {
             "the timeout error should name the budget and teach `timeout_secs`: {}",
             out.content
         );
+    }
+
+    // ---- #483: age-based scratch prune ----
+
+    /// Backdate an entry's mtime so the age prune treats it as stale.
+    fn age_entry(path: &Path, age: Duration) {
+        let when = SystemTime::now() - age;
+        std::fs::File::open(path)
+            .unwrap()
+            .set_modified(when)
+            .unwrap();
+    }
+
+    #[test]
+    fn prune_removes_stale_entries_and_keeps_recent_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let scratch = dir.path();
+
+        let stale_file = scratch.join("old.txt");
+        std::fs::write(&stale_file, "x").unwrap();
+        age_entry(&stale_file, Duration::from_secs(10 * 24 * 60 * 60));
+
+        let stale_dir = scratch.join("old-run");
+        std::fs::create_dir(&stale_dir).unwrap();
+        std::fs::write(stale_dir.join("r.json"), "{}").unwrap();
+        age_entry(&stale_dir, Duration::from_secs(8 * 24 * 60 * 60));
+
+        let fresh = scratch.join("recent.txt");
+        std::fs::write(&fresh, "y").unwrap();
+
+        prune_scratch(scratch, MAX_SCRATCH_AGE);
+
+        assert!(!stale_file.exists(), "stale file should be pruned");
+        assert!(!stale_dir.exists(), "stale dir should be pruned");
+        assert!(fresh.exists(), "recent entry must be kept");
+    }
+
+    #[test]
+    fn prune_preserves_gitignore_even_when_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        let scratch = dir.path();
+        let ignore = scratch.join(".gitignore");
+        std::fs::write(&ignore, "*\n").unwrap();
+        age_entry(&ignore, Duration::from_secs(30 * 24 * 60 * 60));
+
+        prune_scratch(scratch, MAX_SCRATCH_AGE);
+
+        assert!(ignore.exists(), ".gitignore must never be pruned");
+        assert_eq!(std::fs::read_to_string(&ignore).unwrap(), "*\n");
+    }
+
+    #[test]
+    fn prune_on_missing_dir_is_a_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        // Does not panic and leaves nothing behind.
+        prune_scratch(&dir.path().join("does-not-exist"), MAX_SCRATCH_AGE);
     }
 }
