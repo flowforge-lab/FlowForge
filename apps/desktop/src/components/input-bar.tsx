@@ -27,7 +27,7 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import type { Attachment } from "@/bindings";
-import { fileToAttachment } from "@/lib/attachments";
+import { attachmentKindFor, fileToAttachment } from "@/lib/attachments";
 import { cn } from "@/lib/utils";
 import { formatBytes } from "@/lib/memory-view";
 import { ipc } from "@/lib/ipc";
@@ -121,13 +121,41 @@ export function InputBar({
   const [attachments, setAttachments] = useState<Attachment[]>([]);
   const [dragOver, setDragOver] = useState(false);
 
-  // Capability gate (#342): the active model may not be able to see images. Read
-  // `supportsVision` off the active connection and fail OPEN when unknown (registry
-  // not yet loaded / no active connection) so the composer is never falsely blocked.
+  // Capability gates (#342/#504): the active model may accept images, documents,
+  // both, or neither. Read each capability off the active connection and fail OPEN
+  // when unknown (registry not yet loaded / no active connection) so the composer is
+  // never falsely blocked. Vision and documents gate independently.
   const supportsVision = useModelConfigStore(
     (s) => activeConnection(s.registry)?.supportsVision,
   );
+  const supportsDocuments = useModelConfigStore(
+    (s) => activeConnection(s.registry)?.supportsDocuments,
+  );
   const visionGated = supportsVision === false;
+  const docGated = supportsDocuments === false;
+  // The attach button is only fully disabled when neither kind is allowed.
+  const attachGated = visionGated && docGated;
+  // Capability-aware affordance copy: name only the kinds the model can take.
+  const attachLabel =
+    !visionGated && !docGated
+      ? "Attach image or document"
+      : visionGated
+        ? "Attach document"
+        : "Attach image";
+
+  // Stage a file only if its kind is one the active model accepts (#504): images
+  // need vision, documents need document support. Unsupported file types are
+  // dropped. Mirrors the backend `messages_for_wire` strip so the composer never
+  // stages something the provider would silently discard.
+  const canStage = useCallback(
+    (file: File) => {
+      const kind = attachmentKindFor(file);
+      if (kind === "image") return !visionGated;
+      if (kind === "document") return !docGated;
+      return false;
+    },
+    [visionGated, docGated],
+  );
 
   // Resolved mode for this pane's session — drives the Plan-aware placeholder
   // (#267, RFC 0011 §8). Switching modes is done via the pill dropdown (#344).
@@ -146,31 +174,30 @@ export function InputBar({
 
   const handlePaste = useCallback(
     (e: React.ClipboardEvent<HTMLTextAreaElement>) => {
-      // Vision-gated (#342): let the paste fall through as text; don't stage images.
-      if (visionGated) return;
+      // Attach-gated (#342/#504): let the paste fall through as text; stage nothing.
+      if (attachGated) return;
       const items = Array.from(e.clipboardData.items);
       for (const item of items) {
-        if (item.type.startsWith("image/")) {
-          e.preventDefault();
-          const file = item.getAsFile();
-          if (!file) continue;
-          fileToAttachment(file).then((att) =>
-            setAttachments((prev) => [...prev, att]),
-          );
-        }
+        if (item.kind !== "file") continue;
+        const file = item.getAsFile();
+        if (!file || !canStage(file)) continue;
+        e.preventDefault();
+        fileToAttachment(file).then((att) =>
+          setAttachments((prev) => [...prev, att]),
+        );
       }
     },
-    [visionGated],
+    [attachGated, canStage],
   );
 
   const handleDragOver = useCallback(
     (e: React.DragEvent) => {
-      if (visionGated) return;
+      if (attachGated) return;
       e.preventDefault();
       e.stopPropagation();
       setDragOver(true);
     },
-    [visionGated],
+    [attachGated],
   );
 
   const handleDragLeave = useCallback((e: React.DragEvent) => {
@@ -185,23 +212,23 @@ export function InputBar({
       e.preventDefault();
       e.stopPropagation();
       setDragOver(false);
-      if (visionGated) return;
+      if (attachGated) return;
       const files = Array.from(e.dataTransfer.files);
       for (const file of files) {
-        if (!file.type.startsWith("image/")) continue;
+        if (!canStage(file)) continue;
         fileToAttachment(file).then((att) =>
           setAttachments((prev) => [...prev, att]),
         );
       }
     },
-    [visionGated],
+    [attachGated, canStage],
   );
 
   function handleFilePick(e: React.ChangeEvent<HTMLInputElement>) {
     const files = e.target.files;
-    if (!files || visionGated) return;
+    if (!files || attachGated) return;
     for (const file of Array.from(files)) {
-      if (!file.type.startsWith("image/")) continue;
+      if (!canStage(file)) continue;
       fileToAttachment(file).then((att) =>
         setAttachments((prev) => [...prev, att]),
       );
@@ -373,18 +400,19 @@ export function InputBar({
                   <input
                     ref={fileInputRef}
                     type="file"
-                    accept="image/*"
+                    accept="image/*,.csv,.doc,.docx,.html,.htm,.md,.markdown,.pdf,.txt,.xls,.xlsx,.json,application/pdf,application/json"
                     multiple
                     className="hidden"
                     onChange={handleFilePick}
                   />
                   <ModePill sessionId={targetSessionId} />
                   <WorkspaceSelector sessionId={targetSessionId} />
-                  {visionGated ? (
-                    // Capability gate (#342): the active model can't see images, so
-                    // the attach button is disabled + badged with an EyeOff marker and
-                    // a tooltip explaining why. The disabled <button> won't fire pointer
-                    // events, so the tooltip hangs off a <span> wrapper.
+                  {attachGated ? (
+                    // Capability gate (#342/#504): the active model accepts neither
+                    // images nor documents, so the attach button is disabled + badged
+                    // with an EyeOff marker and a tooltip explaining why. The disabled
+                    // <button> won't fire pointer events, so the tooltip hangs off a
+                    // <span> wrapper.
                     <TooltipProvider delayDuration={150}>
                       <Tooltip>
                         <TooltipTrigger asChild>
@@ -395,7 +423,7 @@ export function InputBar({
                               size="icon-xs"
                               disabled
                               className="relative shrink-0 text-muted-foreground"
-                              aria-label="Attach image (unavailable: this model can't see images)"
+                              aria-label="Attach (unavailable: this model can't accept attachments)"
                             >
                               <Paperclip className="size-3.5" />
                               <EyeOff className="absolute -bottom-0.5 -right-0.5 size-2.5 rounded-full bg-card" />
@@ -403,8 +431,8 @@ export function InputBar({
                           </span>
                         </TooltipTrigger>
                         <TooltipContent className="max-w-56">
-                          This model can&apos;t see images — switch to a
-                          vision-capable model to attach.
+                          This model can&apos;t accept attachments — switch to a
+                          model that supports images or documents.
                         </TooltipContent>
                       </Tooltip>
                     </TooltipProvider>
@@ -415,8 +443,8 @@ export function InputBar({
                       size="icon-xs"
                       className="shrink-0 text-muted-foreground hover:text-foreground"
                       onClick={() => fileInputRef.current?.click()}
-                      title="Attach image"
-                      aria-label="Attach image"
+                      title={attachLabel}
+                      aria-label={attachLabel}
                     >
                       <Paperclip className="size-3.5" />
                     </Button>

@@ -311,7 +311,7 @@ impl Provider for OpenAiProvider {
     }
 
     async fn chat_stream(&self, req: ChatRequest) -> Result<ChunkStream, LlmError> {
-        let messages = crate::messages_for_wire(&req.messages, self.supports_vision);
+        let messages = crate::messages_for_wire(&req.messages, self.supports_vision, false);
         let dialect = self.dialect;
         let wire_messages: Vec<serde_json::Value> = messages
             .iter()

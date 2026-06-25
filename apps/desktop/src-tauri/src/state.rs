@@ -184,6 +184,7 @@ fn build_provider(conn: &ProviderConnection) -> Box<dyn Provider> {
             Box::new(
                 BedrockProvider::new(region, creds)
                     .with_vision(conn.supports_vision)
+                    .with_documents(conn.supports_documents)
                     .with_reasoning_effort(effort),
             )
         }
@@ -267,6 +268,7 @@ fn config_to_connection(config: ProviderConfig) -> ProviderConnection {
         // the field deserializes to Medium (`#[serde(default)]`), same as before.
         reasoning_effort: config.reasoning_effort,
         supports_vision: false,
+        supports_documents: false,
         region: None,
         auth_mode: None,
         aws_profile: None,
@@ -2699,6 +2701,7 @@ mod tests {
                 thinking: true,
                 reasoning_effort: ReasoningEffort::default(),
                 supports_vision: false,
+                supports_documents: false,
                 region: None,
                 auth_mode: None,
                 aws_profile: None,
@@ -2818,6 +2821,7 @@ mod tests {
                     thinking: true,
                     reasoning_effort: ReasoningEffort::default(),
                     supports_vision: false,
+                    supports_documents: false,
                     region: None,
                     auth_mode: None,
                     aws_profile: None,
@@ -2834,6 +2838,7 @@ mod tests {
                     thinking: false,
                     reasoning_effort: ReasoningEffort::default(),
                     supports_vision: false,
+                    supports_documents: false,
                     region: Some("us-east-2".into()),
                     auth_mode: Some(BedrockAuth::Profile),
                     aws_profile: Some("bedrock-profile".into()),
@@ -3059,6 +3064,7 @@ mod tests {
             thinking: true,
             reasoning_effort: ReasoningEffort::default(),
             supports_vision: false,
+            supports_documents: false,
             region: None,
             auth_mode: None,
             aws_profile: None,
@@ -3148,6 +3154,7 @@ mod tests {
             thinking: false,
             reasoning_effort: ReasoningEffort::default(),
             supports_vision: false,
+            supports_documents: false,
             region: None,
             auth_mode: None,
             aws_profile: None,
@@ -3208,6 +3215,7 @@ mod tests {
             thinking: false,
             reasoning_effort: ReasoningEffort::default(),
             supports_vision: false,
+            supports_documents: false,
             region: Some("us-east-1".into()),
             auth_mode,
             aws_profile: None,

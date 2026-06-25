@@ -11,7 +11,10 @@ import type { ProviderRegistry } from "@/bindings";
 
 const SID = "s1";
 
-function registry(supportsVision: boolean): ProviderRegistry {
+function registry(
+  supportsVision: boolean,
+  supportsDocuments: boolean,
+): ProviderRegistry {
   return {
     active: "c1",
     connections: [
@@ -24,13 +27,16 @@ function registry(supportsVision: boolean): ProviderRegistry {
         thinking: false,
         reasoningEffort: "medium",
         supportsVision,
+        supportsDocuments,
       },
     ],
   };
 }
 
-function seed(supportsVision: boolean) {
-  useModelConfigStore.setState({ registry: registry(supportsVision) });
+function seed(supportsVision: boolean, supportsDocuments = false) {
+  useModelConfigStore.setState({
+    registry: registry(supportsVision, supportsDocuments),
+  });
   useComposerStore.setState({
     textBySession: {},
     focusNonceBySession: {},
@@ -44,7 +50,7 @@ function seed(supportsVision: boolean) {
   });
 }
 
-describe("InputBar attach vision gate (#342)", () => {
+describe("InputBar attach capability gate (#342/#504)", () => {
   beforeEach(() => {
     vi.spyOn(ipc, "getSessionWorkspace").mockResolvedValue({
       path: "/tmp",
@@ -56,18 +62,17 @@ describe("InputBar attach vision gate (#342)", () => {
     vi.restoreAllMocks();
   });
 
-  it("disables and badges the attach button when the model lacks vision", () => {
-    seed(/* supportsVision */ false);
+  it("disables and badges the attach button when the model accepts neither images nor documents", () => {
+    seed(/* vision */ false, /* documents */ false);
     render(<InputBar sessionId={SID} />);
 
     const gated = screen.getByRole("button", { name: /unavailable/i });
     expect((gated as HTMLButtonElement).disabled).toBe(true);
-    // The plain enabled affordance is not present while gated.
     expect(screen.queryByRole("button", { name: /^Attach image$/ })).toBeNull();
   });
 
-  it("enables the attach button when the model supports vision", () => {
-    seed(/* supportsVision */ true);
+  it("enables the attach button labelled for images when only vision is supported", () => {
+    seed(/* vision */ true, /* documents */ false);
     render(<InputBar sessionId={SID} />);
 
     const attach = screen.getByRole("button", { name: /^Attach image$/ });
@@ -75,8 +80,27 @@ describe("InputBar attach vision gate (#342)", () => {
     expect(screen.queryByRole("button", { name: /unavailable/i })).toBeNull();
   });
 
-  it("does not stage a picked file while gated", () => {
-    seed(/* supportsVision */ false);
+  it("enables the attach button labelled for documents when only documents are supported", () => {
+    seed(/* vision */ false, /* documents */ true);
+    render(<InputBar sessionId={SID} />);
+
+    const attach = screen.getByRole("button", { name: /^Attach document$/ });
+    expect((attach as HTMLButtonElement).disabled).toBe(false);
+    expect(screen.queryByRole("button", { name: /unavailable/i })).toBeNull();
+  });
+
+  it("labels the attach button for both when images and documents are supported", () => {
+    seed(/* vision */ true, /* documents */ true);
+    render(<InputBar sessionId={SID} />);
+
+    const attach = screen.getByRole("button", {
+      name: /^Attach image or document$/,
+    });
+    expect((attach as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it("does not stage a picked file while fully gated", () => {
+    seed(/* vision */ false, /* documents */ false);
     const { container } = render(<InputBar sessionId={SID} />);
 
     const input = container.querySelector(
@@ -85,7 +109,21 @@ describe("InputBar attach vision gate (#342)", () => {
     const file = new File(["x"], "a.png", { type: "image/png" });
     fireEvent.change(input, { target: { files: [file] } });
 
-    // No chip / remove affordance materializes.
+    expect(
+      screen.queryByRole("button", { name: /remove attachment/i }),
+    ).toBeNull();
+  });
+
+  it("does not stage an image when only documents are supported", () => {
+    seed(/* vision */ false, /* documents */ true);
+    const { container } = render(<InputBar sessionId={SID} />);
+
+    const input = container.querySelector(
+      'input[type="file"]',
+    ) as HTMLInputElement;
+    const image = new File(["x"], "a.png", { type: "image/png" });
+    fireEvent.change(input, { target: { files: [image] } });
+
     expect(
       screen.queryByRole("button", { name: /remove attachment/i }),
     ).toBeNull();

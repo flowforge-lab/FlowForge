@@ -417,6 +417,7 @@ export class MockIpc implements FfIpc {
         thinking: true,
         reasoningEffort: "medium",
         supportsVision: false,
+        supportsDocuments: false,
       },
       {
         id: "ollama",
@@ -427,6 +428,7 @@ export class MockIpc implements FfIpc {
         thinking: true,
         reasoningEffort: "medium",
         supportsVision: false,
+        supportsDocuments: false,
       },
       {
         id: "bedrock",
@@ -437,6 +439,7 @@ export class MockIpc implements FfIpc {
         thinking: true,
         reasoningEffort: "low",
         supportsVision: false,
+        supportsDocuments: true,
         region: "us-east-1",
         authMode: "profile",
         awsProfile: "bedrock-profile",
@@ -455,6 +458,7 @@ export class MockIpc implements FfIpc {
         thinking: true,
         reasoningEffort: "high",
         supportsVision: false,
+        supportsDocuments: false,
       },
       // OpenAI (#311 PR-3b): a hosted, OpenAI-compatible connection so the
       // hosted-key card is exercisable offline. Keyless by default → the Test
@@ -471,6 +475,7 @@ export class MockIpc implements FfIpc {
         reasoningEffort: "medium",
         // gpt-4o is vision-capable.
         supportsVision: true,
+        supportsDocuments: false,
       },
     ],
   };
