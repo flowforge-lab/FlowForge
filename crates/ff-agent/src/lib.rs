@@ -43,9 +43,15 @@ pub use system_prompt::{build_flush_prompt, build_system_prompt, TimeOfDay, User
 pub const DEFAULT_MAX_ITERATIONS: usize = 8;
 
 /// When this many iterations (including the current one) remain before the cap,
-/// the loop injects a transient "wrap up" nudge so the model produces a final
-/// answer instead of being cut mid-tool-call (#244 R3).
-const WRAP_UP_AT_REMAINING: usize = 1;
+/// the loop injects a transient "wrap up" nudge so the model has runway to
+/// converge on a final answer instead of being cut mid-tool-call (#244 R3). The
+/// nudge copy graduates: while still in the window it is a soft "approaching the
+/// limit, start converging" message with tools still advertised; on the very last
+/// iteration (`remaining == 1`) it hardens to "do not call any more tools" *and*
+/// the tool schema is withheld, so the model *must* emit text rather than another
+/// tool call that would be lost to the cap -- the instruction matching the
+/// mechanism (RC3, #454).
+const WRAP_UP_AT_REMAINING: usize = 3;
 
 /// A transient provider error (connection blip, 429/5xx) is retried up to this many
 /// total attempts before the turn surfaces the failure (#244 R1). Bounded so a hard
@@ -516,6 +522,17 @@ fn should_reason(iter: usize, remaining: usize) -> bool {
     iter == 0 || remaining <= WRAP_UP_AT_REMAINING
 }
 
+/// Cheap content hash for the per-turn read-dedupe (#458 RC5). Uses the same
+/// `DefaultHasher` idiom as `compaction_extractive`, so no new dependency: this is
+/// a same-process collision check ("did this exact content already appear this
+/// turn"), not a security or cross-run digest.
+fn content_hash(s: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    s.hash(&mut h);
+    h.finish()
+}
+
 /// Runs one assistant turn for `session_id`, executing any tool calls the model
 /// requests until it produces a plain text answer (or the iteration cap is hit).
 /// `on_event` is called synchronously as the turn progresses. The final assistant
@@ -559,6 +576,13 @@ pub async fn run_turn(
     let mut call_counts: HashMap<(String, String), usize> = HashMap::new();
     let mut repeat_nudge: Option<String> = None;
     let mut stop_reason: Option<String> = None;
+    // Per-turn semantic read-dedupe (#458 RC5): read key (e.g. a file path) -> the
+    // step it was first read at + a hash of that content. A later re-read whose
+    // content is unchanged is collapsed to a sentinel instead of re-injecting the
+    // bytes. Complements the byte-identical repeat-breaker above, which only catches
+    // identical `(tool, args)` calls -- this fires on identical *content* regardless
+    // of how the read was phrased (e.g. a different line range).
+    let mut read_cache: HashMap<String, (u32, u64)> = HashMap::new();
     // Context-pressure flush bookkeeping (#244 R5): the transcript length at the last
     // flush, so we re-flush on growth rather than every iteration. `None` = never
     // flushed this turn.
@@ -723,9 +747,13 @@ pub async fn run_turn(
         };
         messages.extend(to_chat(&wire));
 
-        // Near the iteration cap, nudge the model to stop calling tools and answer,
-        // so a long turn ends with a real reply instead of "[stopped: reached
-        // tool-call limit]" cut mid-tool (#244 R3). Transient: request-only.
+        // Near the iteration cap, nudge the model toward a final answer so a long
+        // turn ends with a real reply instead of "[stopped: reached tool-call
+        // limit]" cut mid-tool (#244 R3). The copy graduates across the window: a
+        // soft convergence nudge while tools are still advertised, hardening to
+        // "do not call tools" only on the final iteration -- where the tool schema
+        // is also withheld below, so the instruction matches the mechanism rather
+        // than crying "final step" with steps to spare. Transient: request-only.
         let remaining = max_iter - iter; // iterations left, including this one
 
         // Adaptive per-step reasoning (#D1): with the master switch on, reason only
@@ -738,14 +766,27 @@ pub async fn run_turn(
         // reasons.
         let step_thinking = enable_reasoning && should_reason(iter, remaining);
         if remaining <= WRAP_UP_AT_REMAINING && max_iter > 1 {
+            let content = if remaining <= 1 {
+                // Final iteration: tools are withheld below, so the model must
+                // answer now -- this hard copy is both true and matched by the
+                // mechanism.
+                "This is your final step before the tool-call limit. Do not call any \
+                 more tools; summarize what you have done and give your final answer \
+                 to the user now."
+                    .to_string()
+            } else {
+                // Earlier in the wrap-up window: tools are still advertised, so
+                // nudge toward convergence without falsely claiming this is the
+                // last step (`remaining` is >= 2 here, so "steps" is always plural).
+                format!(
+                    "You're approaching the tool-call limit -- about {remaining} steps \
+                     left. Start converging: finish any essential tool calls now and \
+                     prepare to give your final answer soon."
+                )
+            };
             messages.push(ChatMessage {
                 role: "system".to_string(),
-                content: Some(
-                    "This is your final step before the tool-call limit. Do not call any \
-                     more tools; summarize what you have done and give your final answer \
-                     to the user now."
-                        .to_string(),
-                ),
+                content: Some(content),
                 tool_calls: None,
                 tool_call_id: None,
                 name: None,
@@ -830,10 +871,19 @@ pub async fn run_turn(
             calls.clear();
             let mut emitted_any = false;
 
+            // On the very last iteration, withhold tools entirely so the model
+            // emits a final answer instead of another tool call that would be cut
+            // off as "[stopped: reached tool-call limit]" (RC3, #454). The widened
+            // wrap-up nudge above gives advance warning; this is the hard stop.
+            let withhold_tools = max_iter > 1 && remaining <= 1;
             let req = ChatRequest {
                 model: model.to_string(),
                 messages: messages.clone(),
-                tools: tool_schemas.clone(),
+                tools: if withhold_tools {
+                    Vec::new()
+                } else {
+                    tool_schemas.clone()
+                },
                 thinking: step_thinking,
             };
 
@@ -1151,6 +1201,7 @@ pub async fn run_turn(
                                 system_prompt,
                                 cancel.clone(),
                                 &args,
+                                session_id,
                             )
                             .await
                         } else {
@@ -1183,9 +1234,32 @@ pub async fn run_turn(
         // call with no outcome (cancelled before it ran) is left to the backfill
         // guard, which writes a `[cancelled]` result on drop (#316).
         for call in calls.values() {
-            let Some(outcome) = outcomes.remove(&call.id) else {
+            let Some(mut outcome) = outcomes.remove(&call.id) else {
                 continue;
             };
+            // Semantic read-dedupe (#458 RC5): if this is a content read (e.g. `view`)
+            // whose content is byte-identical to an earlier read of the same target
+            // this turn, replace the payload with a small staleness sentinel instead
+            // of re-injecting the bytes. A changed file (different hash, e.g. after an
+            // `edit`) is not deduped -- the full content flows through. Only successful
+            // reads participate; an error result is never cached.
+            if outcome.success {
+                let args = serde_json::from_str::<serde_json::Value>(&call.arguments)
+                    .unwrap_or(serde_json::Value::Null);
+                if let Some(key) = tools.registry.dedupe_key(&call.name, &args) {
+                    let hash = content_hash(&outcome.content);
+                    match read_cache.get(&key) {
+                        Some(&(step, prev)) if prev == hash => {
+                            outcome.content = format!(
+                                "[unchanged since step {step} -- identical content, not re-sent]"
+                            );
+                        }
+                        _ => {
+                            read_cache.insert(key, (turn_count, hash));
+                        }
+                    }
+                }
+            }
             // Keep a tool result verbatim on the turn it is produced (RC1, #453):
             // the model must read the full content on its first look, or it is
             // forced into a `compaction_retrieve` round-trip / re-read loop. Only a
@@ -1294,6 +1368,7 @@ async fn run_subagent(
     system_prompt: Option<&str>,
     cancel: CancelToken,
     args: &serde_json::Value,
+    parent_session_id: &str,
 ) -> ff_tools::ToolOutcome {
     if parent.depth >= parent.max_depth {
         return ff_tools::ToolOutcome::error(
@@ -1357,13 +1432,47 @@ async fn run_subagent(
     ))
     .await;
 
-    store.delete_session(&child.id);
-
-    match result {
-        Ok(msg) if !msg.content.trim().is_empty() => ff_tools::ToolOutcome::ok(msg.content),
+    // Re-home any compaction originals the child summary still points at, so they
+    // survive the child-session teardown below (#469). A `[compacted; retrieve
+    // key=...]` marker that crosses the delegation boundary would otherwise dangle:
+    // `compaction_originals` cascades on session delete, so the row would vanish and
+    // `compaction_retrieve` would have nothing to return -- forcing the parent to
+    // re-delegate. Re-homing keeps the marker compact in the parent transcript while
+    // the verbatim original stays retrievable on demand from the parent session.
+    let outcome = match result {
+        Ok(msg) if !msg.content.trim().is_empty() => {
+            for key in marker_keys(&msg.content) {
+                store.rehome_compaction_original(key, parent_session_id);
+            }
+            ff_tools::ToolOutcome::ok(msg.content)
+        }
         Ok(_) => ff_tools::ToolOutcome::ok("[sub-agent finished without a summary]"),
         Err(e) => ff_tools::ToolOutcome::error(format!("sub-agent failed: {e}")),
+    };
+
+    store.delete_session(&child.id);
+    outcome
+}
+
+/// Extract every `[compacted; retrieve key=<HEX>]` marker key in `content`, in
+/// order. Used to re-home a sub-agent's surviving compaction originals to the
+/// parent session before the child session is torn down (#469). A marker missing
+/// its closing `]` is skipped.
+fn marker_keys(content: &str) -> Vec<&str> {
+    let mut keys = Vec::new();
+    let mut rest = content;
+    while let Some(start) = rest.find(COMPACTION_MARKER_PREFIX) {
+        let after = &rest[start + COMPACTION_MARKER_PREFIX.len()..];
+        let Some(end) = after.find(']') else {
+            break;
+        };
+        let key = &after[..end];
+        if !key.is_empty() {
+            keys.push(key);
+        }
+        rest = &after[end + 1..];
     }
+    keys
 }
 
 #[cfg(test)]
@@ -1384,6 +1493,24 @@ mod tests {
             !token.ptr_eq(&other),
             "two independently-created tokens are distinct"
         );
+    }
+
+    #[test]
+    fn marker_keys_extracts_one_many_zero_and_skips_unterminated() {
+        // #469: re-homing depends on pulling every retrieve key out of a sub-agent
+        // summary. Single, multiple-in-order, none, empty-key, and a marker missing
+        // its closing `]` must all behave.
+        assert_eq!(
+            marker_keys("see report\n[compacted; retrieve key=4f441c46bdb87160]"),
+            vec!["4f441c46bdb87160"]
+        );
+        assert_eq!(
+            marker_keys("a [compacted; retrieve key=aaa] mid b [compacted; retrieve key=bbb] end"),
+            vec!["aaa", "bbb"]
+        );
+        assert!(marker_keys("a plain summary with no markers").is_empty());
+        assert!(marker_keys("[compacted; retrieve key=]").is_empty());
+        assert!(marker_keys("dangling [compacted; retrieve key=ccc no bracket").is_empty());
     }
 
     #[test]
@@ -3141,22 +3268,39 @@ mod tests {
     }
 
     /// Always requests a tool call (never finishes on its own), and records, per
-    /// request, whether the wrap-up nudge system message was present. Lets a test
-    /// drive the loop to its iteration cap and assert when the nudge fires.
+    /// request, whether a wrap-up nudge was present (`nudge_seen`, either copy),
+    /// whether the *hard* "do not call tools" copy was present (`hard_copy_seen`),
+    /// and whether the tool schema was withheld (`tools_withheld`). Lets a test
+    /// drive the loop to its cap and assert that the soft nudge spans the window
+    /// while the hard copy and tool-withholding align only on the final iteration.
     struct RecordingToolLooper {
         nudge_seen: Arc<std::sync::Mutex<Vec<bool>>>,
+        hard_copy_seen: Arc<std::sync::Mutex<Vec<bool>>>,
+        tools_withheld: Arc<std::sync::Mutex<Vec<bool>>>,
     }
 
     #[async_trait]
     impl Provider for RecordingToolLooper {
         async fn chat_stream(&self, req: ChatRequest) -> Result<ChunkStream, LlmError> {
-            let saw = req.messages.iter().any(|m| {
-                m.role == "system"
-                    && m.content
-                        .as_deref()
-                        .is_some_and(|c| c.contains("final step before the tool-call limit"))
-            });
-            self.nudge_seen.lock().unwrap().push(saw);
+            let system_text = |needle: &str| {
+                req.messages.iter().any(|m| {
+                    m.role == "system" && m.content.as_deref().is_some_and(|c| c.contains(needle))
+                })
+            };
+            // "tool-call limit" appears in both the soft and hard wrap-up copies
+            // (and not in the repeat-stall nudge), so it marks the whole window.
+            self.nudge_seen
+                .lock()
+                .unwrap()
+                .push(system_text("tool-call limit"));
+            self.hard_copy_seen
+                .lock()
+                .unwrap()
+                .push(system_text("Do not call any more tools"));
+            self.tools_withheld
+                .lock()
+                .unwrap()
+                .push(req.tools.is_empty());
             Ok(futures_util::stream::iter(vec![Ok(Chunk {
                 tool_calls: vec![ToolCallDelta {
                     index: 0,
@@ -3172,7 +3316,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wrap_up_nudge_fires_only_on_final_iteration() {
+    async fn wrap_up_nudge_graduates_then_hard_stops_and_withholds_tools_on_final_iteration() {
         let dir = tempfile::tempdir().unwrap();
         let store = SessionStore::new();
         let s = store.create_session(None);
@@ -3180,10 +3324,15 @@ mod tests {
         let registry = ToolRegistry::with_defaults();
         let approve = AlwaysApprove;
         let nudge_seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let hard_copy_seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let tools_withheld = Arc::new(std::sync::Mutex::new(Vec::new()));
         let provider = RecordingToolLooper {
             nudge_seen: nudge_seen.clone(),
+            hard_copy_seen: hard_copy_seen.clone(),
+            tools_withheld: tools_withheld.clone(),
         };
-        let tools = ToolContext::new(&registry, dir.path(), &approve, 3);
+        // Cap 5 with WRAP_UP_AT_REMAINING == 3: remaining counts down 5,4,3,2,1.
+        let tools = ToolContext::new(&registry, dir.path(), &approve, 5);
 
         run_turn(
             &provider,
@@ -3201,9 +3350,17 @@ mod tests {
 
         let seen = nudge_seen.lock().unwrap();
         // The provider is hit once per iteration, up to the cap.
-        assert_eq!(seen.len(), 3, "loop should run to the iteration cap");
-        // The nudge is injected only on the final iteration (remaining == 1).
-        assert_eq!(seen.as_slice(), &[false, false, true]);
+        assert_eq!(seen.len(), 5, "loop should run to the iteration cap");
+        // A wrap-up nudge (either copy) fires across the window (remaining <= 3).
+        assert_eq!(seen.as_slice(), &[false, false, true, true, true]);
+        // But the hard "do not call tools" copy is reserved for the final
+        // iteration (remaining == 1) -- the earlier window gets the soft nudge.
+        let hard = hard_copy_seen.lock().unwrap();
+        assert_eq!(hard.as_slice(), &[false, false, false, false, true]);
+        // ...and tool-withholding aligns exactly with the hard copy, so the
+        // instruction never tells the model to stop while tools are still offered.
+        let withheld = tools_withheld.lock().unwrap();
+        assert_eq!(withheld.as_slice(), &[false, false, false, false, true]);
     }
 
     #[tokio::test]
@@ -3217,6 +3374,8 @@ mod tests {
         let nudge_seen = Arc::new(std::sync::Mutex::new(Vec::new()));
         let provider = RecordingToolLooper {
             nudge_seen: nudge_seen.clone(),
+            hard_copy_seen: Arc::new(std::sync::Mutex::new(Vec::new())),
+            tools_withheld: Arc::new(std::sync::Mutex::new(Vec::new())),
         };
         let tools = ToolContext::new(&registry, dir.path(), &approve, 1);
 
@@ -3237,6 +3396,75 @@ mod tests {
         let seen = nudge_seen.lock().unwrap();
         // With a single-iteration cap there is no "next step" to wrap up toward.
         assert_eq!(seen.as_slice(), &[false]);
+    }
+
+    /// Loops on tool calls while tools are advertised, but emits a final text
+    /// answer the moment the request carries no tools. Lets a test prove that
+    /// withholding tools on the last iteration forces a real answer.
+    struct FinalizesWhenToolsWithdrawn;
+    #[async_trait]
+    impl Provider for FinalizesWhenToolsWithdrawn {
+        async fn chat_stream(&self, req: ChatRequest) -> Result<ChunkStream, LlmError> {
+            let chunk = if req.tools.is_empty() {
+                Chunk {
+                    delta: "wrapped up".into(),
+                    done: true,
+                    ..Chunk::default()
+                }
+            } else {
+                Chunk {
+                    tool_calls: vec![ToolCallDelta {
+                        index: 0,
+                        id: Some("call_1".into()),
+                        name: Some("bash".into()),
+                        arguments: r#"{"command":"echo loop"}"#.into(),
+                    }],
+                    done: true,
+                    ..Chunk::default()
+                }
+            };
+            Ok(futures_util::stream::iter(vec![Ok(chunk)]).boxed())
+        }
+    }
+
+    #[tokio::test]
+    async fn cap_finalization_produces_answer_not_stopped_notice() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::new();
+        let s = store.create_session(None);
+        store.add_message(&s.id, Role::User, "review this".into());
+        let registry = ToolRegistry::with_defaults();
+        let approve = AlwaysApprove;
+        // A model that never finishes on its own would previously loop to the cap
+        // and yield "[stopped: reached tool-call limit]". Withholding tools on the
+        // final iteration (RC3, #454) must instead force a real text answer.
+        let tools = ToolContext::new(&registry, dir.path(), &approve, 3);
+
+        let final_msg = run_turn(
+            &FinalizesWhenToolsWithdrawn,
+            &store,
+            &tools,
+            &s.id,
+            "mock",
+            None,
+            false,
+            CancelToken::new(),
+            |_| {},
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            final_msg.content.contains("wrapped up"),
+            "the turn must end with a real answer, got: {}",
+            final_msg.content
+        );
+        assert!(
+            !final_msg
+                .content
+                .contains("[stopped: reached tool-call limit]"),
+            "withholding tools on the final iteration must avoid the dead-end notice"
+        );
     }
 
     // ----- #244 R4: tool-argument parse feedback -----
@@ -4763,5 +4991,182 @@ mod tests {
             .expect("cold block is retrievable");
         assert!(retrieved.contains("cold-0"));
         assert!(retrieved.contains("cold-23"));
+    }
+
+    // ---- #458 RC5: per-turn semantic read dedupe ----
+
+    #[tokio::test]
+    async fn rereads_of_unchanged_file_collapse_to_sentinel() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("f.txt"), "hello world\nsecond line\n").unwrap();
+        let store = SessionStore::new();
+        let s = store.create_session(None);
+        store.add_message(&s.id, Role::User, "read it twice".into());
+        let registry = ToolRegistry::with_defaults();
+        let approve = AlwaysApprove;
+
+        // Two views of the same file under *different* args (a line range on the
+        // second), so the byte-identical repeat-breaker would NOT fire -- only RC5's
+        // content dedupe catches it.
+        struct ViewTwice {
+            calls: AtomicUsize,
+        }
+        #[async_trait]
+        impl Provider for ViewTwice {
+            async fn chat_stream(&self, _req: ChatRequest) -> Result<ChunkStream, LlmError> {
+                let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let chunk = match n {
+                    0 => Chunk {
+                        tool_calls: vec![ToolCallDelta {
+                            index: 0,
+                            id: Some("v1".into()),
+                            name: Some("view".into()),
+                            arguments: r#"{"path":"f.txt"}"#.into(),
+                        }],
+                        done: true,
+                        ..Chunk::default()
+                    },
+                    1 => Chunk {
+                        tool_calls: vec![ToolCallDelta {
+                            index: 0,
+                            id: Some("v2".into()),
+                            name: Some("view".into()),
+                            arguments: r#"{"path":"f.txt","start_line":1}"#.into(),
+                        }],
+                        done: true,
+                        ..Chunk::default()
+                    },
+                    _ => Chunk {
+                        delta: "done".into(),
+                        done: true,
+                        ..Chunk::default()
+                    },
+                };
+                Ok(futures_util::stream::iter(vec![Ok(chunk)]).boxed())
+            }
+        }
+
+        run_turn(
+            &ViewTwice {
+                calls: AtomicUsize::new(0),
+            },
+            &store,
+            &ctx(&registry, dir.path(), &approve),
+            &s.id,
+            "mock",
+            None,
+            false,
+            CancelToken::new(),
+            |_| {},
+        )
+        .await
+        .unwrap();
+
+        let history = store.get_messages(&s.id);
+        let results: Vec<&str> = history
+            .iter()
+            .filter(|m| m.role == Role::Tool)
+            .map(|m| m.content.as_str())
+            .collect();
+        assert_eq!(results.len(), 2, "two view calls -> two tool results");
+        assert!(
+            results[0].contains("hello world"),
+            "first read returns full content: {}",
+            results[0]
+        );
+        assert!(
+            results[1].contains("unchanged since step"),
+            "re-read of unchanged file is deduped to the sentinel: {}",
+            results[1]
+        );
+    }
+
+    #[tokio::test]
+    async fn changed_file_is_not_deduped() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("f.txt"), "v1\n").unwrap();
+        let store = SessionStore::new();
+        let s = store.create_session(None);
+        store.add_message(&s.id, Role::User, "read, change, read".into());
+        let registry = ToolRegistry::with_defaults();
+        let approve = AlwaysApprove;
+
+        // view -> bash overwrites the file -> view again. The second read's content
+        // differs (different hash), so it must NOT be deduped.
+        struct ViewEditView {
+            calls: AtomicUsize,
+        }
+        #[async_trait]
+        impl Provider for ViewEditView {
+            async fn chat_stream(&self, _req: ChatRequest) -> Result<ChunkStream, LlmError> {
+                let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let tc = |id: &str, name: &str, args: &str| ToolCallDelta {
+                    index: 0,
+                    id: Some(id.into()),
+                    name: Some(name.into()),
+                    arguments: args.into(),
+                };
+                let chunk = match n {
+                    0 => Chunk {
+                        tool_calls: vec![tc("v1", "view", r#"{"path":"f.txt"}"#)],
+                        done: true,
+                        ..Chunk::default()
+                    },
+                    1 => Chunk {
+                        tool_calls: vec![tc(
+                            "b2",
+                            "bash",
+                            r#"{"command":"printf 'v2\n' > f.txt"}"#,
+                        )],
+                        done: true,
+                        ..Chunk::default()
+                    },
+                    2 => Chunk {
+                        tool_calls: vec![tc("v3", "view", r#"{"path":"f.txt"}"#)],
+                        done: true,
+                        ..Chunk::default()
+                    },
+                    _ => Chunk {
+                        delta: "done".into(),
+                        done: true,
+                        ..Chunk::default()
+                    },
+                };
+                Ok(futures_util::stream::iter(vec![Ok(chunk)]).boxed())
+            }
+        }
+
+        run_turn(
+            &ViewEditView {
+                calls: AtomicUsize::new(0),
+            },
+            &store,
+            &ctx(&registry, dir.path(), &approve),
+            &s.id,
+            "mock",
+            None,
+            false,
+            CancelToken::new(),
+            |_| {},
+        )
+        .await
+        .unwrap();
+
+        let history = store.get_messages(&s.id);
+        // The second view (id v3) returns the new content in full, not a sentinel.
+        let reread = history
+            .iter()
+            .find(|m| m.role == Role::Tool && m.tool_call_id.as_deref() == Some("v3"))
+            .expect("re-read tool result present");
+        assert!(
+            reread.content.contains("v2"),
+            "changed file is re-read in full: {}",
+            reread.content
+        );
+        assert!(
+            !reread.content.contains("unchanged since step"),
+            "a changed file must NOT be deduped: {}",
+            reread.content
+        );
     }
 }

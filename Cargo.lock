@@ -1867,6 +1867,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "wiremock",
 ]
 
 [[package]]
@@ -1890,11 +1891,13 @@ dependencies = [
  "aws-smithy-http-client",
  "aws-smithy-types",
  "base64 0.22.1",
+ "dirs 5.0.1",
  "ff-core",
  "futures-util",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tracing",

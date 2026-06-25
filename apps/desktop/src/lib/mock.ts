@@ -917,6 +917,7 @@ export class MockIpc implements FfIpc {
       model: c.model,
       hasKey: c.hasKey,
       thinking: c.thinking,
+      reasoningEffort: c.reasoningEffort,
     };
   }
 
@@ -940,6 +941,7 @@ export class MockIpc implements FfIpc {
       model: c.model,
       hasKey: c.hasKey,
       thinking: c.thinking,
+      reasoningEffort: c.reasoningEffort,
     };
   }
 

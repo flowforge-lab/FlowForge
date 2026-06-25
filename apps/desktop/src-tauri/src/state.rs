@@ -11,7 +11,7 @@ use ff_agent::{
 };
 use ff_core::{
     BedrockAuth, McpServerState, McpServerStatus, Mode, Phenotype, ProviderConfig,
-    ProviderConnection, ProviderKind, ProviderRegistry, ReasoningEffort, SearchConfig, SecretKind,
+    ProviderConnection, ProviderKind, ProviderRegistry, SearchConfig, SecretKind,
 };
 use ff_llm::{
     reasoning_control, wire_dialect, BedrockCreds, BedrockProvider, OllamaProvider, OpenAiProvider,
@@ -263,9 +263,9 @@ fn config_to_connection(config: ProviderConfig) -> ProviderConnection {
         model: config.model,
         has_key: config.has_key,
         thinking: config.thinking,
-        // Legacy single-config migration predates the per-connection dial (#395);
-        // default to Medium, same as a fresh registry.
-        reasoning_effort: ReasoningEffort::default(),
+        // Carry the depth dial through migration; a legacy `provider.json` without
+        // the field deserializes to Medium (`#[serde(default)]`), same as before.
+        reasoning_effort: config.reasoning_effort,
         supports_vision: false,
         region: None,
         auth_mode: None,
@@ -283,6 +283,7 @@ fn connection_to_config(conn: &ProviderConnection) -> ProviderConfig {
         model: conn.model.clone(),
         has_key: conn.has_key,
         thinking: conn.thinking,
+        reasoning_effort: conn.reasoning_effort,
     }
 }
 
@@ -1126,7 +1127,12 @@ impl AppState {
     pub fn reap_session_processes(&self, session_id: &str) {
         let sup = self.process_supervisor.clone();
         let id = session_id.to_owned();
-        tokio::spawn(async move {
+        // `tauri::async_runtime::spawn` (not bare `tokio::spawn`) so this is safe to
+        // call from the synchronous `delete_session` command, which Tauri runs off
+        // the reactor on macOS (#117). A bare `tokio::spawn` there panics with "no
+        // reactor running", and the unwind through the command FFI boundary takes
+        // the whole app down (#471).
+        tauri::async_runtime::spawn(async move {
             let n = sup.reap_session(&id).await;
             if n > 0 {
                 tracing::info!(session_id = %id, reaped = n, "reaped session processes");
@@ -2011,6 +2017,7 @@ pub fn reload_registry(root: &Path, registry: &SharedRegistry) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ff_core::ReasoningEffort;
 
     // Approvals are only registered while a turn is live, so a cancel token must
     // exist for the session first — mirrors `send_message` registering the token
@@ -2813,6 +2820,7 @@ mod tests {
             model: "solo".into(),
             has_key: false,
             thinking: true,
+            ..Default::default()
         });
         assert_eq!(conn.id, "ollama");
         assert_eq!(conn.display_name, "Ollama");
@@ -2832,6 +2840,7 @@ mod tests {
             model: "edited".into(),
             has_key: false,
             thinking: true,
+            ..Default::default()
         });
         let reg = state.provider_registry();
         // No new connection; the active one is edited in place.
@@ -3231,6 +3240,18 @@ mod tests {
         // doesn't panic. The loop is detached and dies with the test process.
         let state = AppState::new();
         state.start_process_reaper();
+        // No panic == the spawn succeeded.
+    }
+
+    #[test]
+    fn reap_session_processes_spawns_without_an_entered_runtime() {
+        // #471: `delete_session` is a synchronous Tauri command, which runs off the
+        // reactor on macOS (issue #117). `reap_session_processes` must therefore use
+        // a reactor-safe spawn -- a bare `tokio::spawn` here panics with "no reactor
+        // running" and the unwind through the command FFI takes the whole app down.
+        // Plain `#[test]` (no `#[tokio::test]`) so there is no ambient runtime.
+        let state = AppState::new();
+        state.reap_session_processes("any-session");
         // No panic == the spawn succeeded.
     }
 
