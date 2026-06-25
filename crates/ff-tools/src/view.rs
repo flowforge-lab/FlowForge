@@ -44,6 +44,13 @@ impl Tool for ViewTool {
         Safety::ReadOnly
     }
 
+    /// Read identity for per-turn semantic dedupe (#458 RC5): the `path` argument.
+    /// A line-range is intentionally ignored so re-reading the same file under a
+    /// different window still hits the cache (the content hash decides staleness).
+    fn dedupe_key(&self, args: &Value) -> Option<String> {
+        args.get("path").and_then(Value::as_str).map(str::to_string)
+    }
+
     async fn run(&self, args: Value, root: &Path) -> ToolOutcome {
         let Some(path) = args.get("path").and_then(Value::as_str) else {
             return ToolOutcome::error("missing required argument: path");
@@ -107,6 +114,21 @@ impl Tool for ViewTool {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn dedupe_key_is_the_path_ignoring_range() {
+        // #458 RC5: the read identity is the path; a line range doesn't change it,
+        // so re-reading the same file under a different window still hits the cache.
+        assert_eq!(
+            ViewTool.dedupe_key(&serde_json::json!({"path": "a.rs"})),
+            Some("a.rs".to_string())
+        );
+        assert_eq!(
+            ViewTool.dedupe_key(&serde_json::json!({"path": "a.rs", "start_line": 10})),
+            Some("a.rs".to_string())
+        );
+        assert_eq!(ViewTool.dedupe_key(&serde_json::json!({})), None);
+    }
 
     #[tokio::test]
     async fn reads_with_line_numbers() {
