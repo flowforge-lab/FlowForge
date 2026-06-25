@@ -19,6 +19,12 @@ use crate::registry::{Safety, Tool, ToolOutcome};
 
 const TIMEOUT: Duration = Duration::from_secs(120);
 
+/// Workspace-relative scratch directory (#458 RC4c). A sanctioned, always-writable
+/// temp location under the workspace root so the agent never reaches for `/tmp`
+/// (sandbox-denied in the field). Created lazily and exported as `TMPDIR`/`TMP` for
+/// the child so even tools that default to `/tmp` redirect here.
+const SCRATCH_DIR: &str = ".ff-scratch";
+
 /// First tokens that are unambiguously read-only — auto-runnable without approval.
 const READ_ONLY_CMDS: &[&str] = &[
     "ls", "cat", "pwd", "echo", "head", "tail", "wc", "rg", "grep", "fd", "stat", "file", "tree",
@@ -47,7 +53,31 @@ pub struct BashTool;
 
 impl BashTool {
     fn command_arg(args: &Value) -> Option<&str> {
-        args.get("command").and_then(Value::as_str)
+        args.get("command")
+            .and_then(Value::as_str)
+            .map(Self::strip_command_prefix)
+    }
+
+    /// Strip a single leaked `command:` key prefix from the value (#458 RC4a).
+    /// Some models (SiliconFlow GLM / DeepSeek) echo the schema key into the value,
+    /// so the tool argument arrives as `command: ls` and the shell then runs the
+    /// literal `command:` token and fails. Normalizing here -- the single chokepoint
+    /// feeding both `run` and `safety` -- fixes dispatch and classification at once.
+    ///
+    /// Narrow on purpose: only a *single leading* `command` (case-insensitive),
+    /// optional whitespace, then `:` is removed. A command that merely contains
+    /// `command:` later (`git commit -m "command: x"`) or uses the shell builtin
+    /// (`command -v ls`, no colon) is left untouched.
+    fn strip_command_prefix(s: &str) -> &str {
+        let t = s.trim_start();
+        if t.get(..7)
+            .is_some_and(|p| p.eq_ignore_ascii_case("command"))
+        {
+            if let Some(rest) = t[7..].trim_start().strip_prefix(':') {
+                return rest.trim_start();
+            }
+        }
+        s
     }
 
     /// Resolve the effective working directory. `working_dir` is optional: absent
@@ -65,6 +95,52 @@ impl BashTool {
                 }
             }
             _ => root.to_path_buf(),
+        }
+    }
+
+    /// Strip a redundant leading `cd <workspace> && …` from the command (#458 RC4b).
+    /// The bash tool already runs from the workspace root, so an agent-prepended
+    /// `cd /abs/workspace && …` either no-ops or fails (`no such file or directory`)
+    /// and burns a call. Conservative: only strips when the `cd` target resolves to
+    /// `root` itself -- a real `cd subdir && …` is left intact. A bare `cd <root>`
+    /// with nothing after becomes a no-op (`true`). Returns the command to execute.
+    fn strip_redundant_cd<'a>(command: &'a str, root: &Path) -> &'a str {
+        let t = command.trim_start();
+        let Some(after_cd) = t.strip_prefix("cd ").map(str::trim_start) else {
+            return command;
+        };
+        // The cd target runs to the first command separator (&&, ;, or newline).
+        let sep = ["&&", ";", "\n"]
+            .iter()
+            .filter_map(|s| after_cd.find(s).map(|i| (i, s.len())))
+            .min_by_key(|&(i, _)| i);
+        let (target_raw, rest) = match sep {
+            Some((i, len)) => (after_cd[..i].trim(), after_cd[i + len..].trim_start()),
+            None => (after_cd.trim(), ""),
+        };
+        // Unquote a simply-quoted target ("..." or '...').
+        let target = target_raw
+            .strip_prefix('"')
+            .and_then(|s| s.strip_suffix('"'))
+            .or_else(|| {
+                target_raw
+                    .strip_prefix('\'')
+                    .and_then(|s| s.strip_suffix('\''))
+            })
+            .unwrap_or(target_raw);
+        let is_root = std::fs::canonicalize(target)
+            .ok()
+            .zip(std::fs::canonicalize(root).ok())
+            .map(|(a, b)| a == b)
+            .unwrap_or_else(|| Path::new(target) == root);
+        if is_root {
+            if rest.is_empty() {
+                "true"
+            } else {
+                rest
+            }
+        } else {
+            command
         }
     }
 
@@ -109,7 +185,10 @@ impl Tool for BashTool {
     fn description(&self) -> &str {
         "Execute a shell command in the workspace directory and return its stdout, \
          stderr, and exit status. Use for builds, tests, git, and file inspection. \
-         Pass `working_dir` to run in a subdirectory of the workspace."
+         Commands already run from the workspace root -- issue bare commands; do NOT \
+         prefix `cd <workspace>` (use `working_dir` for a subdirectory instead). For \
+         temporary files use the workspace scratch dir `.ff-scratch/` (created for \
+         you), never `/tmp`."
     }
 
     fn parameters(&self) -> Value {
@@ -145,6 +224,8 @@ impl Tool for BashTool {
         let Some(command) = Self::command_arg(&args) else {
             return ToolOutcome::error("missing required argument: command");
         };
+        // Drop a redundant `cd <workspace> && …` the model sometimes prepends (#458 RC4b).
+        let command = Self::strip_redundant_cd(command, root);
 
         let dir = Self::resolve_dir(&args, root);
         if !dir.is_dir() {
@@ -154,11 +235,19 @@ impl Tool for BashTool {
             ));
         }
 
+        // Sanctioned workspace scratch dir (#458 RC4c): create it and point the
+        // child's TMPDIR/TMP at it so `/tmp`-defaulting tools redirect. Best-effort:
+        // a creation failure just leaves the system default temp dir in place.
+        let scratch = root.join(SCRATCH_DIR);
+        let _ = std::fs::create_dir_all(&scratch);
+
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
         let child = Command::new(&shell)
             .arg("-c")
             .arg(command)
             .current_dir(&dir)
+            .env("TMPDIR", &scratch)
+            .env("TMP", &scratch)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true)
@@ -309,5 +398,107 @@ mod tests {
             .await;
         assert!(!out.success);
         assert!(out.content.contains("working_dir does not exist"));
+    }
+
+    // ---- #458 RC4a: leaked `command:` prefix ----
+
+    #[test]
+    fn strips_leaked_command_prefix() {
+        assert_eq!(
+            BashTool::strip_command_prefix("command: echo hi"),
+            "echo hi"
+        );
+        assert_eq!(BashTool::strip_command_prefix("command:echo hi"), "echo hi");
+        assert_eq!(BashTool::strip_command_prefix("  COMMAND : ls"), "ls");
+        // Only a single leading prefix is removed.
+        assert_eq!(
+            BashTool::strip_command_prefix("command: command: ls"),
+            "command: ls"
+        );
+    }
+
+    #[test]
+    fn command_prefix_strip_is_narrow() {
+        // `command` builtin with no colon is untouched.
+        assert_eq!(
+            BashTool::strip_command_prefix("command -v ls"),
+            "command -v ls"
+        );
+        // A `command:` that merely appears later is preserved.
+        let c = r#"git commit -m "command: x""#;
+        assert_eq!(BashTool::strip_command_prefix(c), c);
+    }
+
+    #[tokio::test]
+    async fn run_normalizes_command_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = BashTool
+            .run(
+                serde_json::json!({"command": "command: echo hi"}),
+                dir.path(),
+            )
+            .await;
+        assert!(out.success, "{}", out.content);
+        assert!(out.content.contains("hi"));
+        // The literal `command:` token never reached the shell (no "command not found").
+        assert!(!out.content.to_lowercase().contains("command not found"));
+    }
+
+    // ---- #458 RC4b: redundant `cd <workspace>` ----
+
+    #[test]
+    fn strips_redundant_cd_into_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let cmd = format!("cd {} && echo hi", root.display());
+        assert_eq!(BashTool::strip_redundant_cd(&cmd, root), "echo hi");
+        // Bare `cd <root>` with nothing after becomes a no-op.
+        let bare = format!("cd {}", root.display());
+        assert_eq!(BashTool::strip_redundant_cd(&bare, root), "true");
+    }
+
+    #[test]
+    fn keeps_real_cd_into_subdir() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        let cmd = "cd sub && ls";
+        // A genuine subdir cd is left intact.
+        assert_eq!(BashTool::strip_redundant_cd(cmd, dir.path()), cmd);
+        // A command with no leading cd is untouched.
+        assert_eq!(BashTool::strip_redundant_cd("ls -la", dir.path()), "ls -la");
+    }
+
+    #[tokio::test]
+    async fn run_strips_redundant_cd() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = BashTool
+            .run(
+                serde_json::json!({"command": format!("cd {} && echo hi", dir.path().display())}),
+                dir.path(),
+            )
+            .await;
+        assert!(out.success, "{}", out.content);
+        assert!(out.content.contains("hi"));
+        assert!(!out.content.contains("No such file or directory"));
+    }
+
+    // ---- #458 RC4c: workspace scratch dir + TMPDIR ----
+
+    #[tokio::test]
+    async fn creates_scratch_dir_and_points_tmpdir_at_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = BashTool
+            .run(serde_json::json!({"command": "echo $TMPDIR"}), dir.path())
+            .await;
+        assert!(out.success, "{}", out.content);
+        assert!(
+            out.content.contains(SCRATCH_DIR),
+            "TMPDIR should point at the scratch dir: {}",
+            out.content
+        );
+        assert!(
+            dir.path().join(SCRATCH_DIR).is_dir(),
+            "scratch dir must be created"
+        );
     }
 }
