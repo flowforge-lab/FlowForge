@@ -10,7 +10,7 @@ use ff_agent::{
 };
 use ff_core::{
     BedrockAuth, McpServerState, McpServerStatus, Mode, Phenotype, ProviderConfig,
-    ProviderConnection, ProviderKind, ProviderRegistry, ReasoningEffort, SearchConfig, SecretKind,
+    ProviderConnection, ProviderKind, ProviderRegistry, SearchConfig, SecretKind,
 };
 use ff_llm::{
     reasoning_control, wire_dialect, BedrockCreds, BedrockProvider, OllamaProvider, OpenAiProvider,
@@ -262,9 +262,9 @@ fn config_to_connection(config: ProviderConfig) -> ProviderConnection {
         model: config.model,
         has_key: config.has_key,
         thinking: config.thinking,
-        // Legacy single-config migration predates the per-connection dial (#395);
-        // default to Medium, same as a fresh registry.
-        reasoning_effort: ReasoningEffort::default(),
+        // Carry the depth dial through migration; a legacy `provider.json` without
+        // the field deserializes to Medium (`#[serde(default)]`), same as before.
+        reasoning_effort: config.reasoning_effort,
         supports_vision: false,
         region: None,
         auth_mode: None,
@@ -282,6 +282,7 @@ fn connection_to_config(conn: &ProviderConnection) -> ProviderConfig {
         model: conn.model.clone(),
         has_key: conn.has_key,
         thinking: conn.thinking,
+        reasoning_effort: conn.reasoning_effort,
     }
 }
 
@@ -1954,6 +1955,7 @@ pub fn reload_registry(root: &Path, registry: &SharedRegistry) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ff_core::ReasoningEffort;
 
     // Approvals are only registered while a turn is live, so a cancel token must
     // exist for the session first — mirrors `send_message` registering the token
@@ -2717,6 +2719,7 @@ mod tests {
             model: "solo".into(),
             has_key: false,
             thinking: true,
+            ..Default::default()
         });
         assert_eq!(conn.id, "ollama");
         assert_eq!(conn.display_name, "Ollama");
@@ -2736,6 +2739,7 @@ mod tests {
             model: "edited".into(),
             has_key: false,
             thinking: true,
+            ..Default::default()
         });
         let reg = state.provider_registry();
         // No new connection; the active one is edited in place.

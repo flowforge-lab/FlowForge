@@ -218,6 +218,12 @@ pub struct ProviderConfig {
     /// When true, request and surface model reasoning/thinking streams (#181).
     #[serde(default = "default_thinking")]
     pub thinking: bool,
+    /// Reasoning *depth* dial (#395). Only bites when `thinking` is on; picks the
+    /// per-backend reasoning token budget in the host's `build_provider`. Mirrors
+    /// [`ProviderConnection::reasoning_effort`]. `#[serde(default)]` keeps legacy
+    /// `provider.json` files (and the CLI's) loading as [`ReasoningEffort::Medium`].
+    #[serde(default)]
+    pub reasoning_effort: ReasoningEffort,
 }
 
 /// FlowForge's out-of-the-box default: local candle-vllm serving Qwen3-4B.
@@ -229,6 +235,7 @@ impl Default for ProviderConfig {
             model: "Qwen3-4B-Instruct-2507".to_string(),
             has_key: false,
             thinking: true,
+            reasoning_effort: ReasoningEffort::default(),
         }
     }
 }
