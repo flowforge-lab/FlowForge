@@ -116,6 +116,30 @@ export function ProviderCard({ conn }: { conn: ProviderConnection }) {
   );
   const [awsProfile, setAwsProfile] = useState(conn.awsProfile ?? "");
   const [accessKeyId, setAccessKeyId] = useState(conn.accessKeyId ?? "");
+
+  // Re-sync the editable non-secret fields when the stored connection changes
+  // in place (same id) -- e.g. region/profile populated by a load. The useState
+  // seeds above run only on mount, and the parent keys the card by conn.id, so
+  // without this an in-place update leaves the form on its mount-time defaults
+  // and a later Save would persist those stale values over the real config
+  // (#508). Adjust state during render (React's endorsed alternative to a sync
+  // effect) when the source fields change. Secrets stay unsynced (write-only).
+  const connFieldSig = JSON.stringify([
+    conn.baseUrl,
+    conn.region,
+    conn.authMode,
+    conn.awsProfile,
+    conn.accessKeyId,
+  ]);
+  const [syncedSig, setSyncedSig] = useState(connFieldSig);
+  if (syncedSig !== connFieldSig) {
+    setSyncedSig(connFieldSig);
+    setBaseUrl(conn.baseUrl ?? "");
+    setRegion(conn.region ?? "us-east-1");
+    setAuthMode(conn.authMode ?? "profile");
+    setAwsProfile(conn.awsProfile ?? "");
+    setAccessKeyId(conn.accessKeyId ?? "");
+  }
   // Write-only secret inputs — never seeded from the backend, cleared on save.
   const [secretAccessKey, setSecretAccessKey] = useState("");
   const [sessionToken, setSessionToken] = useState("");
