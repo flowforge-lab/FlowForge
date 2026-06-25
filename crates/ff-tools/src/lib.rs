@@ -41,7 +41,7 @@ pub mod web_search;
 mod write;
 
 pub use agent_tool::{AgentTool, AGENT_TOOL_NAME};
-pub use compaction::CompactionRetrieveTool;
+pub use compaction::{CompactionRetrieveTool, COMPACTION_RETRIEVE_TOOL};
 pub use registry::{is_subagent, Safety, Tool, ToolOutcome, ToolRegistry};
 pub use url_safety::SsrfPolicy;
 pub use web_search::WebSearchTool;

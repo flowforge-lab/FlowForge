@@ -14,7 +14,7 @@ use std::sync::Arc;
 use ff_core::{Message, Mode, Role};
 use ff_llm::{ChatMessage, ChatRequest, FunctionCall, LlmError, Provider, ToolCall as LlmToolCall};
 use ff_session::SessionStore;
-use ff_tools::{Safety, ToolRegistry};
+use ff_tools::{Safety, ToolRegistry, COMPACTION_RETRIEVE_TOOL};
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 
@@ -1264,7 +1264,14 @@ pub async fn run_turn(
             // once a result ages out of the hot window; `truncate_tool_result`
             // remains the last-resort backstop for an oversized payload that does
             // not compress below the cap.
-            let (stored, original) = if outcome.content.len() > TOOL_RESULT_MAX_BYTES {
+            // `compaction_retrieve` returns a verbatim original the model explicitly
+            // asked to un-compact; re-compacting it here would re-emit the same
+            // elision and the same deterministic key -- a no-op loop that makes
+            // retrieve useless for any original above the cap (RC6, #476). Pass it
+            // through verbatim; it ages out normally via cold-tail compaction.
+            let (stored, original) = if outcome.content.len() > TOOL_RESULT_MAX_BYTES
+                && call.name != COMPACTION_RETRIEVE_TOOL
+            {
                 let compacted = compaction_extractive::ExtractiveCompactor::default()
                     .compress_one(&outcome.content);
                 (truncate_tool_result(&compacted.text), compacted.original)
@@ -4231,6 +4238,140 @@ mod tests {
             };
             Ok(futures_util::stream::iter(chunks).boxed())
         }
+    }
+
+    /// Call 0 invokes `jsonbig` (oversized -> compacted at ingest, gains a retrieve
+    /// marker); call 1 reads the key out of that marker and invokes
+    /// `compaction_retrieve`; call 2 returns plain text. Drives the RC6 path.
+    struct JsonThenRetrieveThenText {
+        calls: AtomicUsize,
+    }
+    #[async_trait]
+    impl Provider for JsonThenRetrieveThenText {
+        async fn chat_stream(&self, req: ChatRequest) -> Result<ChunkStream, LlmError> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            let chunks = match n {
+                0 => vec![Ok(Chunk {
+                    tool_calls: vec![ToolCallDelta {
+                        index: 0,
+                        id: Some("call_1".into()),
+                        name: Some("jsonbig".into()),
+                        arguments: "{}".into(),
+                    }],
+                    done: true,
+                    ..Chunk::default()
+                })],
+                1 => {
+                    // Pull the retrieve key out of the compacted tool result the loop
+                    // just appended to the request, exactly as a real model would.
+                    let key = req
+                        .messages
+                        .iter()
+                        .filter_map(|m| m.content.as_deref())
+                        .find_map(|c| c.split("[compacted; retrieve key=").nth(1))
+                        .and_then(|rest| rest.split(']').next())
+                        .map(str::to_owned)
+                        .expect("the jsonbig result must carry a retrieve key");
+                    vec![Ok(Chunk {
+                        tool_calls: vec![ToolCallDelta {
+                            index: 0,
+                            id: Some("call_2".into()),
+                            name: Some(COMPACTION_RETRIEVE_TOOL.into()),
+                            arguments: format!(r#"{{"key":"{key}"}}"#),
+                        }],
+                        done: true,
+                        ..Chunk::default()
+                    })]
+                }
+                _ => vec![Ok(Chunk {
+                    delta: "done".into(),
+                    done: true,
+                    ..Chunk::default()
+                })],
+            };
+            Ok(futures_util::stream::iter(chunks).boxed())
+        }
+    }
+
+    /// RC6 (#476): `compaction_retrieve` returns a verbatim original that is, by
+    /// definition, larger than the cap (exceeding the cap is the only reason it was
+    /// compacted). The ingest gate must NOT re-compact the retrieve result -- doing
+    /// so re-emits the same elision and the same deterministic key, a no-op loop
+    /// that makes retrieve useless for any large original. The model's retrieve must
+    /// land verbatim, marker-free.
+    #[tokio::test]
+    async fn retrieve_output_is_not_recompacted_at_ingest() {
+        let store = std::sync::Arc::new(SessionStore::new());
+        let s = store.create_session(None);
+        store.add_message(&s.id, Role::User, "expand the diff".into());
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(JsonResultTool {
+            summary_len: TOOL_RESULT_MAX_BYTES + 4000,
+        }));
+        registry.register(Box::new(ff_tools::CompactionRetrieveTool::new(
+            std::sync::Arc::clone(&store),
+        )));
+        let root = std::env::current_dir().unwrap();
+        let approve = AlwaysApprove;
+
+        run_turn(
+            &JsonThenRetrieveThenText {
+                calls: AtomicUsize::new(0),
+            },
+            &store,
+            &ctx(&registry, &root, &approve),
+            &s.id,
+            "mock",
+            None,
+            false,
+            CancelToken::new(),
+            |_| {},
+        )
+        .await
+        .unwrap();
+
+        let history = store.get_messages(&s.id);
+        let tool_msgs: Vec<_> = history.iter().filter(|m| m.role == Role::Tool).collect();
+        assert_eq!(
+            tool_msgs.len(),
+            2,
+            "one jsonbig result + one retrieve result"
+        );
+
+        // Sanity: the original jsonbig result was compacted at ingest (it is oversized).
+        let jsonbig = &tool_msgs[0];
+        assert!(
+            jsonbig.content.contains("[compacted; retrieve key="),
+            "oversized jsonbig result should be compacted: {}",
+            jsonbig.content
+        );
+
+        // The fix: the retrieve result reaches the transcript verbatim -- no marker,
+        // and larger than the cap (so it was neither re-compacted nor truncated).
+        let retrieved = &tool_msgs[1];
+        assert!(
+            !retrieved.content.contains("[compacted; retrieve key="),
+            "retrieve output must NOT be re-compacted at ingest: {}",
+            &retrieved.content[..retrieved.content.len().min(200)]
+        );
+        assert!(
+            retrieved.content.len() > TOOL_RESULT_MAX_BYTES,
+            "retrieve output must be the verbatim (oversized) original, got {} bytes",
+            retrieved.content.len()
+        );
+        // And it is exactly the original stored under the marker key.
+        let key = jsonbig
+            .content
+            .rsplit("key=")
+            .next()
+            .unwrap()
+            .trim_end_matches(']')
+            .trim();
+        assert_eq!(
+            retrieved.content,
+            store.compaction_original(key).expect("original stored"),
+            "retrieve output must equal the verbatim stored original"
+        );
     }
 
     #[tokio::test]

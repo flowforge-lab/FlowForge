@@ -16,6 +16,10 @@ use serde_json::Value;
 
 use crate::registry::{Safety, Tool, ToolOutcome};
 
+/// The tool name, single-sourced so the agent loop can identify a retrieve
+/// call without a magic string (mirrors `AGENT_TOOL_NAME`).
+pub const COMPACTION_RETRIEVE_TOOL: &str = "compaction_retrieve";
+
 /// Retrieve the verbatim original of a previously-compacted tool result.
 pub struct CompactionRetrieveTool {
     store: Arc<SessionStore>,
@@ -31,7 +35,7 @@ impl CompactionRetrieveTool {
 #[async_trait]
 impl Tool for CompactionRetrieveTool {
     fn name(&self) -> &str {
-        "compaction_retrieve"
+        COMPACTION_RETRIEVE_TOOL
     }
 
     fn description(&self) -> &str {
