@@ -336,44 +336,12 @@ impl ProviderConnection {
 /// every connection on that model, so favor known-good families over loose
 /// substring matches.
 pub fn model_supports_vision(kind: ProviderKind, model: &str) -> bool {
-    let m = model.to_ascii_lowercase();
-    match kind {
-        // Modern Claude (3.x and 4.x, plus the named Mythos/Fable lines) all
-        // accept image input on Bedrock.
-        ProviderKind::Bedrock => {
-            m.contains("claude-3")
-                || m.contains("claude-opus-4")
-                || m.contains("claude-sonnet-4")
-                || m.contains("claude-haiku-4")
-                || m.contains("mythos")
-                || m.contains("fable")
-        }
-        // OpenAI vision-capable families: gpt-4o*, gpt-4-turbo (vision), gpt-4.1,
-        // gpt-5*, o1 with vision. gpt-3.5 stays text-only.
-        ProviderKind::OpenAi => {
-            m.contains("gpt-4o")
-                || m.contains("gpt-4.1")
-                || m.contains("gpt-4-turbo")
-                || m.contains("gpt-5")
-                || m.starts_with("o1")
-                || m.starts_with("o3")
-        }
-        // Ollama vision tags: explicit `llava`, `*-vision`, `moondream`, and the
-        // `qwen2-vl` family. Plain `llama3.2` etc. stays text-only.
-        ProviderKind::Ollama => {
-            m.contains("llava")
-                || m.contains("-vision")
-                || m.contains("moondream")
-                || m.contains("bakllava")
-                || m.contains("qwen2-vl")
-        }
-        // SiliconFlow ships text + a few `*-VL` multimodal entries (Qwen-VL,
-        // GLM-4V). Match the documented suffixes only.
-        ProviderKind::SiliconFlow => m.contains("-vl") || m.contains("-4v"),
-        // CandleVllm hosts whatever the user serves; we can't infer reliably.
-        // The user keeps the explicit override.
-        ProviderKind::CandleVllm => false,
-    }
+    // Data-driven (#466): the per-provider vision families now live in
+    // `model-specs.default.json` as rules carrying `provider` + `supports_vision`,
+    // and the provider-scoped, fail-closed lookup lives in `model_specs`. Keeping
+    // this thin wrapper preserves the call sites (`normalize_capabilities`, upsert)
+    // and the public signature.
+    crate::model_specs::supports_vision_in(crate::model_specs::bundled_rules(), kind, model)
 }
 
 /// The full set of configured connections plus a pointer to the active one.

@@ -24,9 +24,10 @@
 //!   `context_window` wins; unknowns fall through to
 //!   [`DEFAULT_CONTEXT_WINDOW_TOKENS`]. Provider-agnostic — the window is a
 //!   property of the model, not the transport, so `provider` is ignored here.
-//! - `supports_vision` / `provider` are **reserved** for the forthcoming vision
-//!   migration (provider-scoped, fail-closed `false`); they are parsed and
-//!   carried but not yet consulted.
+//! - [`supports_vision_in`]: provider-scoped (the `provider` field is consulted;
+//!   `None` matches any) and fail-closed -- `false` unless some matching rule
+//!   carries `supports_vision: true`. Unlike the window lookup it is an OR over
+//!   all matching rules, not first-match-wins (#466).
 
 use serde::Deserialize;
 
@@ -55,18 +56,17 @@ pub struct ModelSpec {
     /// capabilities (e.g. a future vision-only rule).
     #[serde(default)]
     context_window: Option<u64>,
-    /// Reserved (#457): provider-scoped matching for the vision migration. The
-    /// same model substring can mean different things per provider (`-vl` is
-    /// vision on SiliconFlow, nothing on Bedrock), so vision rules will be keyed
-    /// on this; `None` means "any provider". Not consulted yet.
+    /// Provider scope for the rule (#466). The same model substring can mean
+    /// different things per provider (`-vl` is vision on SiliconFlow, nothing on
+    /// Bedrock), so vision rules are keyed on this; `None` means "any provider".
+    /// Consulted by [`supports_vision_in`]; ignored by the provider-agnostic
+    /// [`context_window_in`].
     #[serde(default)]
-    #[allow(dead_code)]
     provider: Option<ProviderKind>,
-    /// Reserved (#457): whether the model accepts image/document input. Will
-    /// back the vision gate (fail-closed: absent/`None` means "unknown" ->
-    /// treated as `false`). Not consulted yet.
+    /// Whether the model accepts image/document input (#466). Backs the vision
+    /// gate via [`supports_vision_in`], fail-closed: absent/`None` means "unknown"
+    /// and is treated as `false`. A rule must set this to `true` to grant vision.
     #[serde(default)]
-    #[allow(dead_code)]
     supports_vision: Option<bool>,
 }
 
@@ -105,6 +105,23 @@ pub fn context_window_in(rules: &[ModelSpec], model: &str) -> u64 {
         .filter(|r| m.contains(&r.pattern.to_lowercase()))
         .find_map(|r| r.context_window)
         .unwrap_or(DEFAULT_CONTEXT_WINDOW_TOKENS)
+}
+
+/// Provider-scoped, fail-closed vision capability lookup over a rule slice (#466).
+/// Returns `true` only when some rule matches *and* carries `supports_vision:
+/// true`; a rule's `provider` must be `None` (any) or equal `kind`. This is an OR
+/// over all matching rules (not first-match-wins): the question is whether *any*
+/// rule grants vision for `(kind, model)`. Window-only rules (`supports_vision:
+/// None`) never grant or block vision, so they cannot interfere. Conservative by
+/// design -- an unknown model returns `false`, and the FE attach gate and provider
+/// safety strip both fail closed on `false`.
+pub fn supports_vision_in(rules: &[ModelSpec], kind: ProviderKind, model: &str) -> bool {
+    let m = model.to_lowercase();
+    rules.iter().any(|r| {
+        r.supports_vision == Some(true)
+            && r.provider.is_none_or(|p| p == kind)
+            && m.contains(&r.pattern.to_lowercase())
+    })
 }
 
 #[cfg(test)]
@@ -193,9 +210,10 @@ mod tests {
         assert_eq!(context_window_in(&specs.rules, "foo-7b"), 4096);
     }
 
-    /// Reserved fields parse without being consulted by the window lookup.
+    /// Vision fields are consulted by `supports_vision_in` but never by the
+    /// provider-agnostic window lookup.
     #[test]
-    fn reserved_fields_parse_and_are_ignored_by_window_lookup() {
+    fn vision_fields_are_ignored_by_window_lookup() {
         let specs = parse_specs(
             r#"{ "rules": [
                 { "match": "bar", "context_window": 8192,
@@ -204,5 +222,227 @@ mod tests {
         )
         .unwrap();
         assert_eq!(context_window_in(&specs.rules, "bar-v1"), 8192);
+    }
+
+    // ---- #466: provider-scoped, fail-closed vision lookup ----
+
+    #[test]
+    fn supports_vision_covers_known_families_per_provider() {
+        let r = bundled_rules();
+        // Bedrock: modern Claude + named Mythos/Fable.
+        for m in [
+            "us.anthropic.claude-opus-4-8",
+            "us.anthropic.claude-sonnet-4-6",
+            "anthropic.claude-3-5-sonnet-20241022-v2:0",
+            "us.anthropic.claude-3-opus-20240229-v1:0",
+            "claude-mythos-5",
+            "claude-fable-5",
+        ] {
+            assert!(
+                supports_vision_in(r, ProviderKind::Bedrock, m),
+                "bedrock {m}"
+            );
+        }
+        // OpenAI vision families.
+        for m in [
+            "gpt-4o",
+            "gpt-4o-mini",
+            "gpt-4.1",
+            "gpt-4-turbo",
+            "gpt-5",
+            "o1",
+            "o3-mini",
+        ] {
+            assert!(supports_vision_in(r, ProviderKind::OpenAi, m), "openai {m}");
+        }
+        // Ollama vision tags.
+        for m in [
+            "llava:7b",
+            "llama3.2-vision",
+            "moondream",
+            "qwen2-vl:7b",
+            "bakllava",
+        ] {
+            assert!(supports_vision_in(r, ProviderKind::Ollama, m), "ollama {m}");
+        }
+        // SiliconFlow VL / 4V suffixes.
+        for m in ["Qwen/Qwen2-VL-7B-Instruct", "zai-org/GLM-4V-9B"] {
+            assert!(
+                supports_vision_in(r, ProviderKind::SiliconFlow, m),
+                "siliconflow {m}"
+            );
+        }
+        // Text-only stays text-only, and CandleVllm has no rules (always false).
+        for (k, m) in [
+            (ProviderKind::Ollama, "llama3.2"),
+            (ProviderKind::OpenAi, "gpt-3.5-turbo"),
+            (ProviderKind::Bedrock, "meta.llama3-70b-instruct-v1:0"),
+            (ProviderKind::SiliconFlow, "deepseek-ai/DeepSeek-V3"),
+            (ProviderKind::CandleVllm, "anything"),
+        ] {
+            assert!(
+                !supports_vision_in(r, k, m),
+                "expected text-only: {k:?} {m}"
+            );
+        }
+    }
+
+    #[test]
+    fn vision_is_provider_scoped() {
+        let r = bundled_rules();
+        // `-vl` is a SiliconFlow vision suffix; the same substring on Bedrock or
+        // OpenAI must not grant vision (the rule's `provider` is scoped).
+        assert!(supports_vision_in(
+            r,
+            ProviderKind::SiliconFlow,
+            "qwen2-vl-7b"
+        ));
+        assert!(!supports_vision_in(
+            r,
+            ProviderKind::Bedrock,
+            "some-vl-model"
+        ));
+        assert!(!supports_vision_in(
+            r,
+            ProviderKind::OpenAi,
+            "some-vl-model"
+        ));
+        // OpenAI `o1`/`o3` reasoning vision must not leak to other providers.
+        assert!(supports_vision_in(r, ProviderKind::OpenAi, "o1-mini"));
+        assert!(!supports_vision_in(r, ProviderKind::Ollama, "o1-mini"));
+    }
+
+    #[test]
+    fn window_only_rules_do_not_grant_vision() {
+        // The generic `glm` / `deepseek` window rules carry no `supports_vision`,
+        // so they must never un-gate vision regardless of provider.
+        let r = bundled_rules();
+        assert!(!supports_vision_in(
+            r,
+            ProviderKind::SiliconFlow,
+            "zai-org/GLM-4.5"
+        ));
+        assert!(!supports_vision_in(
+            r,
+            ProviderKind::SiliconFlow,
+            "deepseek-ai/DeepSeek-V3"
+        ));
+    }
+
+    #[test]
+    fn vision_fail_closed_and_supports_vision_false_does_not_grant() {
+        // A matching rule must carry `supports_vision: true`; an explicit `false`
+        // or an absent field never grants. Unknown model -> false.
+        let specs = parse_specs(
+            r#"{ "rules": [
+                { "match": "x1", "provider": "openai", "supports_vision": false },
+                { "match": "x2", "provider": "openai" }
+            ] }"#,
+        )
+        .unwrap();
+        assert!(!supports_vision_in(
+            &specs.rules,
+            ProviderKind::OpenAi,
+            "x1-model"
+        ));
+        assert!(!supports_vision_in(
+            &specs.rules,
+            ProviderKind::OpenAi,
+            "x2-model"
+        ));
+        assert!(!supports_vision_in(
+            &specs.rules,
+            ProviderKind::OpenAi,
+            "unknown"
+        ));
+    }
+
+    /// Migration parity guard (#466): the data-driven lookup must reproduce the
+    /// old hardcoded `match` arms across representative + adversarial ids. The
+    /// closure is the pre-migration logic, frozen here so a future data edit that
+    /// silently changes a known family fails loudly.
+    ///
+    /// Known divergence (documented, accepted): the old OpenAI arm used
+    /// `starts_with("o1"|"o3")` while rules match by substring, so an id that
+    /// merely *contains* `o1`/`o3` now matches on an OpenAI connection. No real
+    /// OpenAI vision id is affected; the cross-cutting word-boundary matcher is
+    /// tracked separately. The adversarial `proto1` case below pins this.
+    #[test]
+    fn data_driven_matches_legacy_arms() {
+        fn legacy(kind: ProviderKind, model: &str) -> bool {
+            let m = model.to_ascii_lowercase();
+            match kind {
+                ProviderKind::Bedrock => {
+                    m.contains("claude-3")
+                        || m.contains("claude-opus-4")
+                        || m.contains("claude-sonnet-4")
+                        || m.contains("claude-haiku-4")
+                        || m.contains("mythos")
+                        || m.contains("fable")
+                }
+                ProviderKind::OpenAi => {
+                    m.contains("gpt-4o")
+                        || m.contains("gpt-4.1")
+                        || m.contains("gpt-4-turbo")
+                        || m.contains("gpt-5")
+                        || m.starts_with("o1")
+                        || m.starts_with("o3")
+                }
+                ProviderKind::Ollama => {
+                    m.contains("llava")
+                        || m.contains("-vision")
+                        || m.contains("moondream")
+                        || m.contains("bakllava")
+                        || m.contains("qwen2-vl")
+                }
+                ProviderKind::SiliconFlow => m.contains("-vl") || m.contains("-4v"),
+                ProviderKind::CandleVllm => false,
+            }
+        }
+        let r = bundled_rules();
+        let kinds = [
+            ProviderKind::Bedrock,
+            ProviderKind::OpenAi,
+            ProviderKind::Ollama,
+            ProviderKind::SiliconFlow,
+            ProviderKind::CandleVllm,
+        ];
+        let models = [
+            "gpt-4o",
+            "gpt-4o-mini",
+            "gpt-4.1",
+            "gpt-4-turbo",
+            "gpt-5",
+            "o1",
+            "o3-mini",
+            "gpt-3.5-turbo",
+            "us.anthropic.claude-opus-4-8",
+            "claude-3-5-sonnet",
+            "claude-mythos-5",
+            "claude-fable-5",
+            "meta.llama3-70b",
+            "llava:7b",
+            "llama3.2-vision",
+            "moondream",
+            "qwen2-vl:7b",
+            "llama3.2",
+            "Qwen/Qwen2-VL-7B",
+            "zai-org/GLM-4V-9B",
+            "deepseek-ai/DeepSeek-V3",
+            "anything",
+            "some-local-7b",
+        ];
+        for &k in &kinds {
+            for &model in &models {
+                assert_eq!(
+                    supports_vision_in(r, k, model),
+                    legacy(k, model),
+                    "parity mismatch for {k:?} / {model}"
+                );
+            }
+        }
+        // Documented divergence: substring vs the old `starts_with` for o1/o3.
+        assert!(!legacy(ProviderKind::OpenAi, "proto1"));
+        assert!(supports_vision_in(r, ProviderKind::OpenAi, "proto1"));
     }
 }
