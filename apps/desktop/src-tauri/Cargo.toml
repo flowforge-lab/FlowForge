@@ -42,7 +42,19 @@ reqwest = { workspace = true, features = ["rustls-tls"] }
 url = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
-keyring = { version = "3", features = ["apple-native", "windows-native"] }
+# OS keychain backends, split by target so each platform compiles only its own.
+# secrets.rs is provider-agnostic, so this backs every secret-holding provider
+# (Bedrock IAM/API keys, SiliconFlow, OpenAI, any OpenAI-compatible). Linux uses
+# the Secret Service (DBus) backend, which links libdbus -- the CI image and any
+# Linux build need libdbus-1-dev / dbus-devel. See #324.
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "3", features = ["apple-native"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+keyring = { version = "3", features = ["windows-native"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+keyring = { version = "3", features = ["sync-secret-service", "crypto-rust"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }
