@@ -26,7 +26,6 @@ function seed(sessions: Session[], active: string | null) {
     messagesBySession: Object.fromEntries(sessions.map((s) => [s.id, []])),
     streamingBySession: {},
     toolStepsByMessage: {},
-    sessionTitles: {},
     bootstrapError: null,
   });
 }

@@ -52,20 +52,6 @@ export interface ToolStep {
   finishedAt?: number;
 }
 
-// ── Title helpers ────────────────────────────────────────────────────────────
-
-const TITLE_STORAGE_KEY = "ff-session-titles";
-
-function loadTitles(): Record<string, string> {
-  try {
-    return JSON.parse(
-      localStorage.getItem(TITLE_STORAGE_KEY) ?? "{}",
-    ) as Record<string, string>;
-  } catch {
-    return {};
-  }
-}
-
 // ── Store types ──────────────────────────────────────────────────────────────
 
 interface ChatState {
@@ -87,8 +73,6 @@ interface ChatState {
    *  (#244 R6). Populated from TurnDoneEvent.tokenCount; drives a context-usage
    *  indicator. Undefined until the first turn completes with an estimate. */
   contextTokensBySession: Record<string, number>;
-  /** Frontend-only custom titles (Session has no title field in the contract). */
-  sessionTitles: Record<string, string>;
   /** FE mirror of the backend's "Allow this session" sets, keyed by sessionId
    *  (#229). Drives the "session" badge on auto-approved follow-up calls; the
    *  backend stays the source of truth for the gate itself. */
@@ -256,7 +240,6 @@ export const useChatStore = create<ChatState>((set, get) => ({
   toolStepsByMessage: {},
   reasoningByMessage: {},
   contextTokensBySession: {},
-  sessionTitles: loadTitles(),
   sessionApprovedBySession: {},
   alwaysApproved: new Set<string>(),
   bootstrapError: null,
@@ -269,23 +252,6 @@ export const useChatStore = create<ChatState>((set, get) => ({
         sessions = await ipc.listSessions();
       }
       set({ sessions, bootstrapError: null });
-
-      // One-time migration: lift legacy localStorage titles to the backend for
-      // any session the server hasn't titled, so labels become server-truth.
-      const legacy = get().sessionTitles;
-      const toMigrate = sessions.filter((s) => !s.title && legacy[s.id]);
-      if (toMigrate.length > 0) {
-        await Promise.all(
-          toMigrate.map((s) =>
-            ipc.renameSession(s.id, legacy[s.id]).catch(() => {}),
-          ),
-        );
-        set((st) => ({
-          sessions: st.sessions.map((s) =>
-            !s.title && legacy[s.id] ? { ...s, title: legacy[s.id] } : s,
-          ),
-        }));
-      }
 
       // Hydrate the always-approved mirror so badges render correctly from the
       // first turn (the gate itself stays backend-owned).
@@ -438,8 +404,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
     const priorMessages = get().messagesBySession[sessionId] ?? [];
     const hasUserMessage = priorMessages.some((m) => m.role === "user");
     const existing = get().sessions.find((x) => x.id === sessionId);
-    const hasTitle =
-      Boolean(existing?.title) || Boolean(get().sessionTitles[sessionId]);
+    const hasTitle = Boolean(existing?.title);
     if (!hasUserMessage && !hasTitle) {
       const title = autoTitle(content);
       set((s) => ({

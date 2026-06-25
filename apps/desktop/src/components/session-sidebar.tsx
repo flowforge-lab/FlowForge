@@ -209,7 +209,6 @@ export function SessionItem({
   const [toast, setToast] = useState<string | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
 
-  const sessionTitles = useChatStore((s) => s.sessionTitles);
   const selectSession = useChatStore((s) => s.selectSession);
   const loadSession = useChatStore((s) => s.loadSession);
   const setSessionTitle = useChatStore((s) => s.setSessionTitle);
@@ -228,7 +227,7 @@ export function SessionItem({
   // to avoid the dialog and the closing menu fighting over focus.
   const onDelete = () => setConfirmingDelete(true);
 
-  const currentLabel = resolveLabel(session, sessionTitles[session.id]);
+  const currentLabel = resolveLabel(session);
 
   // Export to Markdown/JSON (#278): the backend serializes, the helper writes the
   // user-chosen file, and we surface the outcome as a transient toast.
@@ -467,7 +466,6 @@ export function SessionSidebar() {
   const sessions = useChatStore((s) => s.sessions);
   const activeSessionId = useChatStore((s) => s.activeSessionId);
   const streamingBySession = useChatStore((s) => s.streamingBySession);
-  const sessionTitles = useChatStore((s) => s.sessionTitles);
   const newSession = useChatStore((s) => s.newSession);
 
   const sidebarCollapsed = usePrefsStore((s) => s.sidebarCollapsed);
@@ -575,7 +573,7 @@ export function SessionSidebar() {
     setOverflowExpanded(false);
   };
 
-  const filtered = filterSessions(sessions, filter, sessionTitles);
+  const filtered = filterSessions(sessions, filter);
   // Each session's index in the *full* list — keeps the ⌘1–9 hint accurate when
   // the visible list is filtered (the global shortcut indexes the full list).
   const indexById = new Map(sessions.map((s, i) => [s.id, i]));

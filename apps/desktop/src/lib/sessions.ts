@@ -5,17 +5,14 @@
 import type { Session } from "@/bindings";
 
 /**
- * The label a user sees for a session: persisted title > legacy localStorage
- * title > goal > fallback. `session.title` is server-truth (auto-derived or
- * renamed); `customTitle` is the legacy `sessionTitles` map, kept as a
- * read-through fallback until every client has migrated (see store `bootstrap`).
+ * The label a user sees for a session: persisted title > goal > fallback.
+ * `session.title` is server-truth (auto-derived from the first user message,
+ * overridable via `rename_session`); the durable session store (ff-session,
+ * RFC 0012) means the title survives a restart, so the frontend no longer
+ * keeps a legacy localStorage fallback (#52).
  */
-export function resolveLabel(
-  session: Session,
-  customTitle: string | undefined,
-): string {
+export function resolveLabel(session: Session): string {
   if (session.title) return session.title;
-  if (customTitle) return customTitle;
   if (session.goal) return session.goal;
   return "New session";
 }
@@ -25,15 +22,11 @@ export function resolveLabel(
  * renamed title and a goal both match what the user actually sees. An empty or
  * whitespace-only query returns the list unchanged, order preserved.
  */
-export function filterSessions(
-  sessions: Session[],
-  query: string,
-  sessionTitles: Record<string, string>,
-): Session[] {
+export function filterSessions(sessions: Session[], query: string): Session[] {
   const q = query.trim().toLowerCase();
   if (!q) return sessions;
   return sessions.filter((session) =>
-    resolveLabel(session, sessionTitles[session.id]).toLowerCase().includes(q),
+    resolveLabel(session).toLowerCase().includes(q),
   );
 }
 
