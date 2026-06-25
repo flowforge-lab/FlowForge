@@ -287,6 +287,13 @@ impl CancelToken {
     pub fn is_cancelled(&self) -> bool {
         self.0.load(Ordering::SeqCst)
     }
+    /// True when both handles share the same underlying flag (i.e. clones of one
+    /// token), as opposed to two independently-created tokens. Lets the host
+    /// remove a session's registered token only while it is still the one a
+    /// given turn owns, so a successor turn's token is never clobbered.
+    pub fn ptr_eq(&self, other: &CancelToken) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
 }
 
 /// Head+tail truncation of an over-budget tool result on UTF-8 char boundaries
@@ -1365,6 +1372,19 @@ mod tests {
     use async_trait::async_trait;
     use ff_llm::{Chunk, ChunkStream, LlmError, ToolCallDelta};
     use std::sync::atomic::{AtomicBool, AtomicUsize};
+
+    #[test]
+    fn cancel_token_ptr_eq_distinguishes_clone_from_fresh() {
+        let token = CancelToken::new();
+        let clone = token.clone();
+        assert!(token.ptr_eq(&clone), "a clone shares the underlying flag");
+        assert!(clone.ptr_eq(&token), "ptr_eq is symmetric");
+        let other = CancelToken::new();
+        assert!(
+            !token.ptr_eq(&other),
+            "two independently-created tokens are distinct"
+        );
+    }
 
     #[test]
     fn to_chat_carries_reasoning_from_persisted_message() {

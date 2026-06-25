@@ -47,12 +47,15 @@ fn text_to_enum<T: serde::de::DeserializeOwned>(text: &str) -> Option<T> {
 /// Why an [`SessionStore::edit_user_message`] call was rejected. Kept as a small
 /// typed error so the command layer can map each case to a clear message; the
 /// transcript is never mutated on any of these.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EditMessageError {
     /// No message with that id exists in the given session.
     UnknownMessage,
     /// The message exists but is not a user message (only user turns are editable).
     NotUserMessage,
+    /// A database error occurred while applying the edit. The transaction is never
+    /// committed on this path, so the transcript is left intact.
+    Storage(String),
 }
 
 impl std::fmt::Display for EditMessageError {
@@ -60,6 +63,7 @@ impl std::fmt::Display for EditMessageError {
         match self {
             Self::UnknownMessage => write!(f, "no such message in this session"),
             Self::NotUserMessage => write!(f, "only user messages can be edited"),
+            Self::Storage(msg) => write!(f, "storage error while editing message: {msg}"),
         }
     }
 }
@@ -531,7 +535,7 @@ impl SessionStore {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn
             .transaction()
-            .map_err(|_| EditMessageError::UnknownMessage)?;
+            .map_err(|e| EditMessageError::Storage(e.to_string()))?;
 
         // Look up the target message's position and role, scoped to the session.
         let row = tx
@@ -541,7 +545,7 @@ impl SessionStore {
                 |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
             )
             .optional()
-            .map_err(|_| EditMessageError::UnknownMessage)?;
+            .map_err(|e| EditMessageError::Storage(e.to_string()))?;
         let (seq, role_text) = row.ok_or(EditMessageError::UnknownMessage)?;
         if text_to_enum::<Role>(&role_text) != Some(Role::User) {
             return Err(EditMessageError::NotUserMessage);
@@ -557,7 +561,7 @@ impl SessionStore {
             "UPDATE messages SET content = ?1, attachments = ?2 WHERE id = ?3",
             params![content, attachments_json, message_id],
         )
-        .map_err(|_| EditMessageError::UnknownMessage)?;
+        .map_err(|e| EditMessageError::Storage(e.to_string()))?;
 
         // Drop reversible-compaction blobs backing the messages we are about to
         // truncate. They are keyed by content hash (not a message FK), so the
@@ -578,7 +582,7 @@ impl SessionStore {
             "DELETE FROM messages WHERE session_id = ?1 AND seq > ?2",
             params![session_id, seq],
         )
-        .map_err(|_| EditMessageError::UnknownMessage)?;
+        .map_err(|e| EditMessageError::Storage(e.to_string()))?;
 
         tx.execute(
             "UPDATE sessions SET updated_at = ?1 WHERE id = ?2",
@@ -586,7 +590,8 @@ impl SessionStore {
         )
         .ok();
 
-        tx.commit().map_err(|_| EditMessageError::UnknownMessage)?;
+        tx.commit()
+            .map_err(|e| EditMessageError::Storage(e.to_string()))?;
         Ok(message_id.to_string())
     }
 

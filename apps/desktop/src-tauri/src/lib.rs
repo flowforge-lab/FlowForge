@@ -630,14 +630,16 @@ fn spawn_assistant_turn(state: Arc<AppState>, app: tauri::AppHandle, session_id:
         // Persist the turn's telemetry once, lock-free (addresses #77 nit 1).
         state.persist_signals();
 
-        // Drop the session's cancel token *before* the flush. The token is keyed
-        // by session_id alone, so leaving it registered across the (potentially
-        // multi-second, multi-round-trip) silent flush lets the next turn's
-        // register_cancel overwrite it — then this task's take_cancel would remove
-        // the *new* turn's token, silently disabling its Stop button and
-        // auto-denying all of its tool approvals. The flush runs on cancel_probe,
-        // the task-local clone it already owns, so it stays bounded and silent.
-        state.take_cancel(&session_id);
+        // Drop the session's cancel token *before* the flush — but only if it is
+        // still THIS turn's token. The map is keyed by session_id alone, so a
+        // successor turn (e.g. the re-run that `edit_message` spawns after
+        // cancelling this one) may have already replaced it via register_cancel.
+        // Removing unconditionally would strip the live successor's token, killing
+        // its Stop button and auto-denying its tool approvals. The identity check
+        // on cancel_probe (the task-local clone this turn owns) leaves a
+        // successor's token intact and also subsumes the single-turn case where
+        // the next turn registers during this turn's multi-second silent flush.
+        state.take_cancel_if(&session_id, &cancel_probe);
 
         // Pre-compaction memory flush (RFC 0006 §7.2): once the visible turn has
         // finished cleanly, persist any durable facts before context pressure forces
