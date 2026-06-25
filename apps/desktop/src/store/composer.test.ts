@@ -10,6 +10,7 @@ describe("composer store (per-session, #148)", () => {
       textBySession: {},
       focusNonceBySession: {},
       rejectNonceBySession: {},
+      editingBySession: {},
     });
   });
 
@@ -64,5 +65,27 @@ describe("composer store (per-session, #148)", () => {
     expect(useComposerStore.getState().textBySession[B]).toBe("edit me");
     expect(useComposerStore.getState().focusNonceBySession[B]).toBe(1);
     expect(useComposerStore.getState().rejectNonceBySession[B] ?? 0).toBe(0);
+  });
+
+  it("beginEdit binds the session to a message id, loads the text, and focuses (#463)", () => {
+    useComposerStore.getState().beginEdit(A, "msg-1", "edit me");
+    expect(useComposerStore.getState().editingBySession[A]).toBe("msg-1");
+    expect(useComposerStore.getState().textBySession[A]).toBe("edit me");
+    expect(useComposerStore.getState().focusNonceBySession[A]).toBe(1);
+  });
+
+  it("beginEdit sets the text directly over an in-progress draft (targeted, no #48 guard)", () => {
+    useComposerStore.getState().setText(A, "half-typed draft");
+    useComposerStore.getState().beginEdit(A, "msg-1", "edit me");
+    expect(useComposerStore.getState().textBySession[A]).toBe("edit me");
+    expect(useComposerStore.getState().editingBySession[A]).toBe("msg-1");
+    expect(useComposerStore.getState().rejectNonceBySession[A] ?? 0).toBe(0);
+  });
+
+  it("cancelEdit clears the editing binding and the composer text", () => {
+    useComposerStore.getState().beginEdit(A, "msg-1", "edit me");
+    useComposerStore.getState().cancelEdit(A);
+    expect(useComposerStore.getState().editingBySession[A]).toBeUndefined();
+    expect(useComposerStore.getState().textBySession[A]).toBe("");
   });
 });

@@ -80,6 +80,17 @@ export interface FfIpc {
     content: string,
     attachments?: Attachment[],
   ): Promise<string>;
+  /** Edit a prior user message in place, truncate the transcript after it, and
+   *  re-run the turn from the edited prompt (#463; backend #464). Cancels any
+   *  in-flight turn + pending approvals for the session first, then re-runs over
+   *  the existing `turn:*` / `tool:*` events. Rejects an unknown/wrong-session id
+   *  or a non-user message. Returns the edited message id. */
+  editMessage(
+    sessionId: string,
+    messageId: string,
+    content: string,
+    attachments?: Attachment[],
+  ): Promise<string>;
   cancelTurn(sessionId: string): Promise<void>;
   /** Frontend's reply to a [`ToolApprovalRequestEvent`]. Keyed by `(sessionId,
    *  callId)` so it never resolves a colliding call in another session. */
@@ -390,6 +401,18 @@ class TauriIpc implements FfIpc {
     content: string,
     attachments?: Attachment[],
   ) => this.invoke<string>("send_message", { sessionId, content, attachments });
+  editMessage = (
+    sessionId: string,
+    messageId: string,
+    content: string,
+    attachments?: Attachment[],
+  ) =>
+    this.invoke<string>("edit_message", {
+      sessionId,
+      messageId,
+      content,
+      attachments,
+    });
   cancelTurn = (sessionId: string) =>
     this.invoke<void>("cancel_turn", { sessionId });
   respondApproval = (sessionId: string, callId: string, approved: boolean) =>

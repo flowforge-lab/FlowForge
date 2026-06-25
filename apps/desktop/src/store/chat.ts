@@ -128,6 +128,16 @@ interface ChatState {
     sessionId?: string,
     attachments?: Attachment[],
   ) => Promise<void>;
+  /** Edit a prior user message in place and re-run from it (#463). Optimistically
+   *  replaces the message and truncates everything after it, then calls the backend
+   *  `editMessage`, which cancels any in-flight turn and re-runs over the existing
+   *  `turn:*` events. Restores the transcript on failure. */
+  editMessage: (
+    sessionId: string,
+    messageId: string,
+    content: string,
+    attachments?: Attachment[],
+  ) => Promise<void>;
   /** Cancel the streaming turn in `sessionId` (session-scoped). */
   cancelTurn: (sessionId: string) => Promise<void>;
   cancelActiveTurn: () => Promise<void>;
@@ -486,6 +496,92 @@ export const useChatStore = create<ChatState>((set, get) => ({
                 (m) => m.id !== tempId,
               ),
               systemMessage(sessionId, `Failed to send: ${String(err)}`),
+            ],
+          },
+        };
+      });
+    }
+  },
+
+  editMessage: async (sessionId, messageId, content, attachments) => {
+    const prior = get().messagesBySession[sessionId] ?? [];
+    const idx = prior.findIndex((m) => m.id === messageId);
+    if (idx < 0) return;
+
+    // Optimistic: replace the edited message in place and truncate everything
+    // after it (the old response + anything following), then mark the turn as
+    // in-flight so the composer shows Stop and the transcript a "thinking" row —
+    // the backend cancels any running turn and re-runs over the existing events.
+    const edited: Message = {
+      ...prior[idx],
+      content,
+      attachments: attachments?.length ? attachments : undefined,
+    };
+    set((s) => {
+      // Drop any in-flight streaming pointer: editing mid-turn truncates the
+      // streaming assistant message away, and the backend cancels that turn before
+      // re-running. Fresh turn timing then drives the pending/Stop indicator.
+      const cleared = clearSessionTurnTiming(s, sessionId);
+      const messagesBySession = {
+        ...s.messagesBySession,
+        [sessionId]: [...prior.slice(0, idx), edited],
+      };
+      // GC the per-message maps for the truncated messages, mirroring the
+      // history-reconcile path (see loadSession) — without this they only grow.
+      const liveIds = new Set<string>(
+        Object.values(cleared.streamingBySession),
+      );
+      for (const msgs of Object.values(messagesBySession)) {
+        for (const m of msgs) liveIds.add(m.id);
+      }
+      const toolStepsByMessage = Object.fromEntries(
+        Object.entries(s.toolStepsByMessage).filter(([id]) => liveIds.has(id)),
+      );
+      const turnStartByMessage = Object.fromEntries(
+        Object.entries(s.turnStartByMessage).filter(([id]) => liveIds.has(id)),
+      );
+      return {
+        messagesBySession,
+        toolStepsByMessage,
+        turnStartByMessage,
+        streamingBySession: cleared.streamingBySession,
+        turnStartBySession: {
+          ...cleared.turnStartBySession,
+          [sessionId]: Date.now(),
+        },
+      };
+    });
+
+    try {
+      const editedId = await ipc.editMessage(
+        sessionId,
+        messageId,
+        content,
+        attachments,
+      );
+      set((s) => ({
+        messagesBySession: {
+          ...s.messagesBySession,
+          [sessionId]: (s.messagesBySession[sessionId] ?? []).map((m) =>
+            m.id === messageId ? { ...m, id: editedId } : m,
+          ),
+        },
+        sessions: s.sessions.map((sess) =>
+          sess.id === sessionId ? { ...sess, updatedAt: Date.now() } : sess,
+        ),
+      }));
+    } catch (err) {
+      // The backend never mutates the transcript on a failed edit — restore the
+      // snapshot and surface the error rather than leaving a truncated history.
+      set((s) => {
+        const { [sessionId]: _, ...turnStartBySession } = s.turnStartBySession;
+        return {
+          turnStartBySession,
+          messagesBySession: {
+            ...s.messagesBySession,
+            [sessionId]: [
+              ...prior,
+              systemMessage(sessionId, `Failed to edit: ${String(err)}`),
             ],
           },
         };

@@ -709,6 +709,32 @@ export class MockIpc implements FfIpc {
     return user.id;
   }
 
+  async editMessage(
+    sessionId: string,
+    messageId: string,
+    content: string,
+    attachments?: Attachment[],
+  ): Promise<string> {
+    const list = this.messages.get(sessionId);
+    const idx = list?.findIndex((m) => m.id === messageId) ?? -1;
+    if (!list || idx < 0) throw new Error("no such message");
+    if (list[idx].role !== "user") throw new Error("not a user message");
+    // Mirror the backend: cancel any in-flight turn before mutating the
+    // transcript, so a running turn can't append past the cut we're making.
+    await this.cancelTurn(sessionId);
+    // Replace the edited message in place and truncate everything after it.
+    const edited: Message = {
+      ...list[idx],
+      content,
+      ...(attachments?.length ? { attachments } : { attachments: undefined }),
+    };
+    this.messages.set(sessionId, [...list.slice(0, idx), edited]);
+    const s = this.sessions.get(sessionId);
+    if (s) s.updatedAt = now();
+    this.streamAssistant(sessionId);
+    return edited.id;
+  }
+
   async cancelTurn(sessionId: string): Promise<void> {
     const active = this.activeTimers.get(sessionId);
     if (!active) return;
