@@ -28,7 +28,6 @@ describe("chat store — in-place editMessage (#463)", () => {
       turnStartBySession: {},
       turnStartByMessage: {},
       toolStepsByMessage: {},
-      sessionTitles: {},
       bootstrapError: null,
     });
   });
