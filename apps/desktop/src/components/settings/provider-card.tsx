@@ -1,5 +1,11 @@
 import { useState } from "react";
-import { ChevronDown, Plus, Check, Trash2 } from "@/components/ui/icon";
+import {
+  ChevronDown,
+  Plus,
+  Check,
+  RotateCcw,
+  Trash2,
+} from "@/components/ui/icon";
 import { cn } from "@/lib/utils";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
@@ -184,6 +190,9 @@ export function ProviderCard({ conn }: { conn: ProviderConnection }) {
       setBaseUrl(normalized);
       await saveConnection({ ...conn, baseUrl: normalized || undefined });
     }
+    // Refresh the catalog now that the corrected creds are persisted, so a list
+    // that previously cached empty recovers without a Remove + re-add (#486).
+    await loadModels(conn.id);
   };
 
   return (
@@ -496,9 +505,20 @@ export function ProviderCard({ conn }: { conn: ProviderConnection }) {
                       : "Fetching models…"}
                   </p>
                 ) : undiscovered.length === 0 ? (
-                  <p className="text-[12px] text-muted-foreground">
-                    No additional models found.
-                  </p>
+                  <div className="flex items-center justify-between gap-2">
+                    <p className="text-[12px] text-muted-foreground">
+                      {shown.length === 0
+                        ? "No models found."
+                        : "No additional models found."}
+                    </p>
+                    <button
+                      type="button"
+                      onClick={() => void onDiscover()}
+                      className="flex shrink-0 items-center gap-1.5 rounded-md px-2 py-1 text-[12px] font-medium text-primary transition-colors hover:bg-primary/5"
+                    >
+                      <RotateCcw className="size-3.5" /> Refresh
+                    </button>
+                  </div>
                 ) : (
                   <ul className="-mx-1 max-h-64 overflow-y-auto">
                     {undiscovered.map((model) => (

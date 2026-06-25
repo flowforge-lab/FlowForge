@@ -981,6 +981,14 @@ export class MockIpc implements FfIpc {
 
   async listModels(id?: string): Promise<string[]> {
     const target = id ?? this.registry.active;
+    // Hosted OpenAI-compatible kinds (#311/#329) need a stored API key — the real
+    // `list_models` probe 401s without a valid bearer, mirroring `testConnection`
+    // above. Return empty (not the catalog) until a key is set, so the FE's
+    // post-credentials recovery (#486) is exercisable offline.
+    const conn = this.registry.connections.find((c) => c.id === target);
+    if (conn && (conn.kind === "openai" || conn.kind === "siliconFlow")) {
+      if (!this.secretsByConnection.get(conn.id)?.has("apiKey")) return [];
+    }
     return this.modelsByConnection[target] ?? [];
   }
 
