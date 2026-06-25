@@ -1,6 +1,7 @@
 # 0005 — Provider Connections & Registry
 
-- **Status:** Proposed
+- **Status:** Phases A-B landed; Phases C-D proposed (this revision)
+- **Revision (2026-06-25):** Added three-tier model selection (§11) — per-session / per-phenotype / global model resolution, with capabilities derived from `(kind, model)`. Promotes Phase C from a one-line reservation to a full design and adds Phase D (UX + capability derivation).
 - **Milestone:** Settings UI (SET epic #125) · cashes in #8
 - **Author:** tonytan4ever
 - **Depends on:** RFC 0001 (phenotype = `{skills, tools, model, persona}`; per-session switch), #49 (landed Phase-1 `ProviderConfig` contract)
@@ -80,6 +81,15 @@ struct ProviderRegistry {
     connections: Vec<ProviderConnection>,   // >= 1
     active: ConnectionId,
 }
+
+/// A resolved (connection, model) pair — the unit of model selection at every
+/// tier (session / phenotype / global). `connection` picks the endpoint+creds;
+/// `model` is one of that connection's served models. Capabilities (e.g. vision)
+/// are DERIVED from `(kind, model)` via ff-core model_specs, never stored here.
+struct ModelSelection {
+    connection: ConnectionId,
+    model: String,
+}
 ```
 
 All four types derive `Serialize`/`Deserialize`/`TS` and export to
@@ -143,6 +153,9 @@ detail card** — consistent with the monochrome settings UI.
   connections + an **Add provider** affordance (catalog autocomplete -> data-driven
   field form) + #126's Thinking / Effort / Threshold controls + reset.
 
+> Phase D extends this section with a per-connection **Model** picker and surfaces the
+> resolved **(provider, model)** pair; see §11.4.
+
 ## 7. Commands & Migration
 
 ```
@@ -179,11 +192,73 @@ add/edit/remove/switch — so the Model section is fully buildable under
 - **Phase B (#8 Phase 2):** OS-keychain secrets + `set_connection_secret`; add the
   `OpenAiCompatible` kind and unhide hosted/keyed descriptors (OpenAI, OpenRouter,
   SiliconFlow...). Catalog + form already support them.
-- **Phase C:** `Phenotype.provider: Option<ConnectionId>` beside the existing `model`
-  override; per-turn resolution = phenotype's connection else `registry.active`.
+- **Phase C (backend, this revision):** add `Phenotype.provider: Option<ConnectionId>`
+  beside the existing `model: Option<String>` override, and a three-tier resolver
+  (session > phenotype > global) that produces a `ModelSelection` and routes the turn
+  through `build_provider_for(connection)`. Fixes the latent cross-endpoint bug (§11.1).
+- **Phase D (UX + capabilities, this revision):** `set_session_model_selection` + a
+  per-pane model chip, Provider/Model rows in the phenotype editor, and capability
+  derivation from `(kind, model)` — retiring the per-connection `supports_vision`
+  field (§11.3 / §11.4).
 
 ## 10. Non-Goals
 
-Keychain/secrets, hosted vendors, Bedrock SigV4, phenotype-provider binding, and
-multiple connections of the same keyed vendor are explicitly out of Phase A. The data
-model reserves the slots for them so the contract does not churn twice.
+Keychain/secrets, hosted vendors, and Bedrock SigV4 were out of Phase A and landed in
+Phase B. Phenotype-provider binding and per-session/per-phenotype model selection,
+formerly deferred, are the subject of Phases C-D (§11). Still out of scope: multiple
+*simultaneously active* connections (resolution always collapses to one `ModelSelection`
+per turn), automatic model routing/failover, and a model marketplace/catalog beyond the
+per-connection `list_models` already specified.
+
+## 11. Three-Tier Model Selection (Phases C-D)
+
+### 11.1 The bug Phase C fixes
+
+A phenotype's `model` override is currently a bare string applied to whatever the
+**global active connection** is. In `spawn_assistant_turn` the turn builds the active
+provider's client and then swaps in `pheno.model` — so an override model can ride the
+wrong endpoint (e.g. a SiliconFlow-only model name sent to a candle-vLLM client). The
+override carries a model but no provider, so there is nothing to route it to its
+intended connection.
+
+### 11.2 The resolver
+
+Model selection becomes a `ModelSelection { connection, model }` resolved at three
+tiers, most specific wins:
+
+```
+session override   (set_session_model_selection, per pane)        -- highest
+  else phenotype    (Phenotype.provider + Phenotype.model)
+    else global      (registry.active + active connection's model) -- lowest
+```
+
+Each tier may specify a connection, a model, or both; unspecified fields inherit from
+the next tier down. The resolved pair routes the turn through
+`build_provider_for(connection)` (already present, state.rs) -> the override model can
+never ride the wrong endpoint. This mirrors the autonomy-mode precedent (#265):
+`get/set_default_*` (global) + `set_session_*` (per pane) + inherit-when-None.
+
+### 11.3 Capabilities are derived, not stored
+
+`supports_vision` is today a per-connection stored flag. Since #466 introduced a
+data-driven `model_supports_vision(kind, model)` lookup in ff-core model_specs,
+capability is a pure function of the resolved `(kind, model)`. Phase D derives it at
+resolution time and **retires the stored `supports_vision` field**, removing a class of
+stale-flag bugs (flag set on the connection but wrong for the chosen model).
+
+### 11.4 UX (Phase D)
+
+- A **model chip** on each pane shows the resolved model and opens a quick picker
+  (connection -> model) for a **session-scoped** `ModelSelection`; clearing it falls
+  back to phenotype/global.
+- The phenotype editor gains **Provider** and **Model** rows (Provider = a connection
+  combobox; Model = the connection's `list_models`, editable) writing `Phenotype.provider`
+  / `Phenotype.model`.
+- §6's Model section continues to own the **global** active connection + its model.
+
+### 11.5 Migration
+
+Additive and lossless. `Phenotype.provider: Option<ConnectionId>` is added beside the
+unchanged `model: Option<String>`; existing phenotypes (provider = None) resolve exactly
+as today via the global active connection. No registry or phenotype file rewrite is
+required; the new field defaults to `None` on deserialize.
