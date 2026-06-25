@@ -61,3 +61,45 @@ pub struct MemoryOverview {
     /// Absolute path to the memory root directory.
     pub root_path: String,
 }
+
+/// Per-chunk salience stats for the Settings "Salience" surface (Issue #293,
+/// RFC 0007 §7). One row per indexed memory chunk, joining the chunk's identity
+/// with its `chunk_stats` usage. The backend computes `weight` (effective,
+/// pin-aware) and `dormant` authoritatively so the frontend never re-derives the
+/// dormancy threshold.
+///
+/// **No-row (never recalled) case:** a chunk that has been indexed but never
+/// surfaced by `memory_search` has no `chunk_stats` row, so it reads
+/// `weight = 1.0`, `access_count = 0`, `last_accessed_ms = None`,
+/// `dormant = false`, `pinned = false`. The age clock starts at first *recall*,
+/// not creation — the UI should render "never recalled" rather than an epoch
+/// timestamp.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "../../../apps/desktop/src/bindings/")]
+pub struct MemoryChunkStat {
+    /// Stable chunk identity (`ff_memory::chunk_key`) — the mutation handle for
+    /// `resetMemoryChunk` / `setMemoryChunkPinned`.
+    pub chunk_key: String,
+    /// Path relative to the memory root, forward slashes, e.g. `MEMORY.md` or
+    /// `daily/2026-06-25.md`.
+    pub rel_path: String,
+    /// Nearest Markdown heading, or `None` for pre-heading preamble.
+    pub heading: Option<String>,
+    /// First non-empty content line of the chunk, trimmed and length-capped — a
+    /// human-readable summary for the list row.
+    pub preview: String,
+    /// Effective (decayed, pin-aware) weight — NOT the raw stored
+    /// `chunk_stats.weight`. A pinned chunk reads `1.0`.
+    pub weight: f32,
+    /// Times this chunk has been reinforced by a recall.
+    #[ts(type = "number")]
+    pub access_count: u32,
+    /// Last-recalled time as Unix epoch milliseconds, or `None` if never recalled.
+    #[ts(type = "number | null")]
+    pub last_accessed_ms: Option<i64>,
+    /// Server-computed: `decay.enabled && weight < threshold && !pinned`.
+    pub dormant: bool,
+    /// Whether the chunk is pinned (weight held at `1.0`, decay skipped).
+    pub pinned: bool,
+}

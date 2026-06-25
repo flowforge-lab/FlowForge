@@ -33,6 +33,7 @@ import type {
   McpServerStatus,
   McpServerConfig,
   McpStatusChangedEvent,
+  MemoryChunkStat,
   MemoryFileInfo,
   MemoryOverview,
   MemoryFlushedEvent,
@@ -1209,6 +1210,81 @@ Shipping the Settings redesign — currently the Memory browser (SET.8).
       totalBytes: this.memoryFiles.reduce((sum, f) => sum + f.sizeBytes, 0),
       rootPath: "/mock/memory",
     };
+  }
+
+  // Salience surface (M6.2, #293). Seeds one live, one dormant, one pinned, and
+  // one never-recalled chunk so the Salience UI is exercisable under
+  // VITE_FF_MOCK=1 independently of the backend. `dormant`/`weight` are the
+  // backend-authoritative values the FE renders verbatim (no threshold here).
+  private memoryChunks: MemoryChunkStat[] = [
+    {
+      chunkKey: "curated:identity#0",
+      relPath: "MEMORY.md",
+      heading: "Identity",
+      preview: "Abid owns the React frontend; Tony owns the Rust backend.",
+      weight: 0.92,
+      accessCount: 7,
+      lastAccessedMs: 1_718_700_000_000,
+      dormant: false,
+      pinned: false,
+    },
+    {
+      chunkKey: "curated:patterns#0",
+      relPath: "MEMORY.md",
+      heading: "Patterns",
+      preview: "One PR per issue, verified under the in-browser mock.",
+      weight: 1.0,
+      accessCount: 3,
+      lastAccessedMs: 1_718_600_000_000,
+      dormant: false,
+      pinned: true,
+    },
+    {
+      chunkKey: "curated:focus#0",
+      relPath: "MEMORY.md",
+      heading: "Focus",
+      preview: "Shipping the Settings redesign — the Memory browser.",
+      weight: 0.12,
+      accessCount: 1,
+      lastAccessedMs: 1_715_000_000_000,
+      dormant: true,
+      pinned: false,
+    },
+    {
+      chunkKey: "daily:2026-06-18#0",
+      relPath: "daily/2026-06-18.md",
+      heading: null,
+      preview: "Shipped the memory IPC contract today.",
+      weight: 1.0,
+      accessCount: 0,
+      lastAccessedMs: null,
+      dormant: false,
+      pinned: false,
+    },
+  ];
+
+  async listMemoryChunks(): Promise<MemoryChunkStat[]> {
+    return this.memoryChunks.map((c) => ({ ...c }));
+  }
+
+  async resetMemoryChunk(chunkKey: string): Promise<void> {
+    const c = this.memoryChunks.find((m) => m.chunkKey === chunkKey);
+    if (c) {
+      c.weight = 1.0;
+      c.dormant = false;
+      c.lastAccessedMs = Date.now();
+    }
+  }
+
+  async setMemoryChunkPinned(chunkKey: string, pinned: boolean): Promise<void> {
+    const c = this.memoryChunks.find((m) => m.chunkKey === chunkKey);
+    if (c) {
+      c.pinned = pinned;
+      if (pinned) {
+        c.weight = 1.0;
+        c.dormant = false;
+      }
+    }
   }
 
   async listSkills(): Promise<SkillInfo[]> {

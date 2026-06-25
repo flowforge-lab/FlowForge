@@ -38,6 +38,7 @@ import type {
   McpServerStatus,
   McpServerConfig,
   McpStatusChangedEvent,
+  MemoryChunkStat,
   MemoryFileInfo,
   MemoryOverview,
   MemoryFlushedEvent,
@@ -191,6 +192,16 @@ export interface FfIpc {
   readMemoryFile(relPath: string): Promise<string>;
   /** Store summary (file/byte counts, root, enabled flag) for the pane header. */
   memoryOverview(): Promise<MemoryOverview>;
+  // Salience surface (RFC 0007 M6.2, #293). Per-chunk weight/dormant + reset/pin.
+  // `weight`/`dormant` are computed authoritatively by the backend; the FE never
+  // re-derives the dormancy threshold. Decay/dormancy/pin never edit Markdown —
+  // they only change ambient injection.
+  /** Per-chunk salience stats: effective weight, dormant flag, access count, pin. */
+  listMemoryChunks(): Promise<MemoryChunkStat[]>;
+  /** Reset (wake) a chunk: weight back to 1.0, stamp last-accessed now. */
+  resetMemoryChunk(chunkKey: string): Promise<void>;
+  /** Pin/unpin a chunk: pinned holds weight at 1.0 and is never dormant. */
+  setMemoryChunkPinned(chunkKey: string, pinned: boolean): Promise<void>;
 
   // Control settings (Issue #127). `ControlConfig` is a FE-owned shape (lib/control.ts):
   // there is no backend/ts-rs type yet, and the permission matrix does NOT map to
@@ -383,6 +394,11 @@ class TauriIpc implements FfIpc {
   readMemoryFile = (relPath: string) =>
     this.invoke<string>("read_memory_file", { relPath });
   memoryOverview = () => this.invoke<MemoryOverview>("memory_overview");
+  listMemoryChunks = () => this.invoke<MemoryChunkStat[]>("list_memory_chunks");
+  resetMemoryChunk = (chunkKey: string) =>
+    this.invoke<void>("reset_memory_chunk", { chunkKey });
+  setMemoryChunkPinned = (chunkKey: string, pinned: boolean) =>
+    this.invoke<void>("set_memory_chunk_pinned", { chunkKey, pinned });
   listSessions = () => this.invoke<Session[]>("list_sessions");
   getMessages = (sessionId: string) =>
     this.invoke<Message[]>("get_messages", { sessionId });

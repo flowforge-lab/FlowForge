@@ -367,6 +367,104 @@ fn memory_overview(state: State<'_, Arc<AppState>>) -> MemoryOverview {
     }
 }
 
+/// Wall-clock now in epoch milliseconds (the read instant for lazy decay). Uses
+/// `SystemTime` to avoid pulling `chrono` into this crate just for one call.
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// A chunk path made relative to the memory root, with forward slashes — the
+/// same shape `MemoryFileInfo::rel_path` uses (e.g. `MEMORY.md`,
+/// `daily/2026-06-25.md`).
+fn chunk_rel_path(root: &std::path::Path, path: &std::path::Path) -> String {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// First non-empty, non-heading line of a chunk, trimmed and capped to ~80
+/// chars — the human-readable summary for a Salience list row (#293). Heading
+/// lines (hash-prefixed) are skipped because the heading is already its own
+/// field; a char slice would cut mid-word and start on blank/heading lines.
+fn chunk_preview(text: &str) -> String {
+    const MAX: usize = 80;
+    let line = text
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty() && !l.starts_with("#"))
+        .unwrap_or("");
+    if line.chars().count() > MAX {
+        let head: String = line.chars().take(MAX).collect();
+        format!("{}…", head.trim_end())
+    } else {
+        line.to_string()
+    }
+}
+
+/// Per-chunk salience stats for the Settings Salience surface (#293). Joins every
+/// indexed chunk (`all_chunks`) with its `chunk_stats` usage
+/// (`chunk_stats_snapshot`); a chunk with no stats row is a never-recalled chunk
+/// (weight `1.0`, never dormant, not pinned, no `last_accessed`).
+#[tauri::command]
+fn list_memory_chunks(state: State<'_, Arc<AppState>>) -> Vec<ff_core::MemoryChunkStat> {
+    let mem = state.memory();
+    let root = mem.root().to_path_buf();
+    let chunks = mem.all_chunks();
+    let keys: Vec<String> = chunks.iter().map(ff_memory::chunk_key).collect();
+    let stats = state
+        .index()
+        .chunk_stats_snapshot(&keys, now_ms())
+        .unwrap_or_default();
+    chunks
+        .iter()
+        .zip(keys.iter())
+        .map(|(chunk, key)| {
+            let snap = stats.get(key);
+            ff_core::MemoryChunkStat {
+                chunk_key: key.clone(),
+                rel_path: chunk_rel_path(&root, &chunk.path),
+                heading: chunk.heading.clone(),
+                preview: chunk_preview(&chunk.text),
+                weight: snap.map(|s| s.weight).unwrap_or(1.0),
+                access_count: snap.map(|s| s.access_count).unwrap_or(0),
+                last_accessed_ms: snap.map(|s| s.last_accessed_ms),
+                dormant: snap.is_some_and(|s| s.dormant),
+                pinned: snap.is_some_and(|s| s.pinned),
+            }
+        })
+        .collect()
+}
+
+/// Reset (wake) a chunk: restore its weight to `1.0` and stamp `last_accessed`
+/// now, creating the stats row if absent (#293). Never edits Markdown.
+#[tauri::command]
+fn reset_memory_chunk(state: State<'_, Arc<AppState>>, chunk_key: String) -> Result<(), String> {
+    state
+        .index()
+        .reset_chunk(&chunk_key)
+        .map_err(|e| e.to_string())
+}
+
+/// Pin/unpin a chunk: a pinned chunk holds effective weight `1.0` (decay
+/// skipped) and is never dormant (#293). Never edits Markdown.
+#[tauri::command]
+fn set_memory_chunk_pinned(
+    state: State<'_, Arc<AppState>>,
+    chunk_key: String,
+    pinned: bool,
+) -> Result<(), String> {
+    state
+        .index()
+        .set_chunk_pinned(&chunk_key, pinned)
+        .map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 fn cancel_turn(state: State<'_, Arc<AppState>>, session_id: String) {
     if let Some(token) = state.take_cancel(&session_id) {
@@ -1648,6 +1746,9 @@ pub fn run() {
             list_memory_files,
             read_memory_file,
             memory_overview,
+            list_memory_chunks,
+            reset_memory_chunk,
+            set_memory_chunk_pinned,
             send_message,
             edit_message,
             run_sidecar_turn,
