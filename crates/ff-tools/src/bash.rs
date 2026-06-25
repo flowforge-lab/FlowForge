@@ -239,7 +239,16 @@ impl Tool for BashTool {
         // child's TMPDIR/TMP at it so `/tmp`-defaulting tools redirect. Best-effort:
         // a creation failure just leaves the system default temp dir in place.
         let scratch = root.join(SCRATCH_DIR);
-        let _ = std::fs::create_dir_all(&scratch);
+        if std::fs::create_dir_all(&scratch).is_ok() {
+            // Make the dir self-ignoring in ANY host project (#458 review follow-up):
+            // a `.gitignore` of `*` keeps `.ff-scratch/` out of the user's `git status`
+            // even when their repo's own `.gitignore` knows nothing about it. Written
+            // only if absent so we never clobber a user edit.
+            let ignore = scratch.join(".gitignore");
+            if !ignore.exists() {
+                let _ = std::fs::write(&ignore, "*\n");
+            }
+        }
 
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
         let child = Command::new(&shell)
@@ -499,6 +508,30 @@ mod tests {
         assert!(
             dir.path().join(SCRATCH_DIR).is_dir(),
             "scratch dir must be created"
+        );
+        // Self-ignoring in any host project (#458 review follow-up).
+        let ignore = dir.path().join(SCRATCH_DIR).join(".gitignore");
+        assert_eq!(
+            std::fs::read_to_string(&ignore).unwrap_or_default(),
+            "*\n",
+            "scratch dir must carry a `*` .gitignore"
+        );
+    }
+
+    #[tokio::test]
+    async fn scratch_gitignore_is_not_clobbered_if_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let scratch = dir.path().join(SCRATCH_DIR);
+        std::fs::create_dir_all(&scratch).unwrap();
+        std::fs::write(scratch.join(".gitignore"), "custom\n").unwrap();
+        let out = BashTool
+            .run(serde_json::json!({"command": "true"}), dir.path())
+            .await;
+        assert!(out.success, "{}", out.content);
+        assert_eq!(
+            std::fs::read_to_string(scratch.join(".gitignore")).unwrap(),
+            "custom\n",
+            "an existing .gitignore must be preserved"
         );
     }
 }
