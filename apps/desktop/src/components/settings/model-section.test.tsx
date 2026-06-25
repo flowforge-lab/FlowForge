@@ -122,6 +122,44 @@ describe("ModelSection provider accordion", () => {
     expect(cardHeader("OpenAI")).not.toBeNull();
   });
 
+  it("re-syncs Bedrock form fields when the connection is updated in place (no remount)", async () => {
+    await renderSection();
+    await click(cardHeader("AWS Bedrock"));
+    const regionInput = () =>
+      container.querySelector<HTMLInputElement>("#region-bedrock");
+    const profileInput = () =>
+      container.querySelector<HTMLInputElement>("#profile-bedrock");
+    // Mount-time seed values (from the mock registry).
+    expect(regionInput()?.value).toBe("us-east-1");
+    expect(profileInput()?.value).toBe("bedrock-profile");
+
+    // Update the same connection (id unchanged, so the card is NOT remounted).
+    await act(async () => {
+      const reg = useModelConfigStore.getState().registry!;
+      useModelConfigStore.setState({
+        registry: {
+          ...reg,
+          connections: reg.connections.map((c) =>
+            c.id === "bedrock"
+              ? {
+                  ...c,
+                  region: "ap-southeast-2",
+                  authMode: "profile" as const,
+                  awsProfile: "team-profile",
+                }
+              : c,
+          ),
+        },
+      });
+      await flush();
+    });
+
+    // The form reflects the updated connection rather than the stale mount-time
+    // seeds, so a later Save can't persist defaults over the real config (#508).
+    expect(regionInput()?.value).toBe("ap-southeast-2");
+    expect(profileInput()?.value).toBe("team-profile");
+  });
+
   it("shows the hosted-key fields (Base URL + API Key) for SiliconFlow", async () => {
     await renderSection();
     await click(cardHeader("SiliconFlow"));
