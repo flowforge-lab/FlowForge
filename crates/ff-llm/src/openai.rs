@@ -125,8 +125,21 @@ struct StreamToolCall {
 #[derive(Deserialize, Default)]
 struct StreamFunction {
     name: Option<String>,
-    #[serde(default)]
+    // SiliconFlow `.com` sends `"arguments": null` in the opening tool-call delta
+    // fragment (id/name only). `#[serde(default)]` covers a missing field but not an
+    // explicit null, so map both to "" (#493).
+    #[serde(default, deserialize_with = "null_to_empty_string")]
     arguments: String,
+}
+
+/// Deserialize a string that may arrive missing or explicitly `null` as `""`.
+/// OpenAI-compatible gateways differ on the opening tool-call delta: some omit
+/// `arguments`, some send `""`, and SiliconFlow sends `null` (#493).
+fn null_to_empty_string<'de, D>(d: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<String>::deserialize(d)?.unwrap_or_default())
 }
 
 #[derive(Deserialize)]
@@ -474,6 +487,19 @@ mod tests {
         let line = br#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"Paris\"}"}}]},"finish_reason":null}]}"#;
         let chunk = parse_sse_line(line).unwrap().unwrap();
         assert_eq!(chunk.tool_calls[0].name, None);
+    }
+
+    /// #493: SiliconFlow `.com` sends `"arguments": null` in the opening tool-call
+    /// delta fragment. `#[serde(default)]` alone rejects an explicit null
+    /// ("invalid type: null, expected a string"), so this must decode to `""`
+    /// rather than a `Decode` error that aborts the whole stream.
+    #[test]
+    fn decodes_null_arguments_as_empty_string() {
+        let line = br#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"bash","arguments":null}}]},"finish_reason":null}]}"#;
+        let chunk = parse_sse_line(line).unwrap().unwrap();
+        let tc = &chunk.tool_calls[0];
+        assert_eq!(tc.name.as_deref(), Some("bash"));
+        assert_eq!(tc.arguments, "");
     }
 
     #[test]
