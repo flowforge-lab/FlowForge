@@ -236,6 +236,7 @@ fn delete_session(state: State<'_, Arc<AppState>>, session_id: String) {
     state.cancel_pending_approvals(&session_id);
     state.clear_session_approvals(&session_id);
     state.store.delete_session(&session_id);
+    state.reap_session_processes(&session_id);
 }
 
 /// Clone a session and its transcript into a fresh session (server-truth).
@@ -1515,6 +1516,11 @@ pub fn run() {
             // call here even though Tauri's `setup` runs on the main thread outside
             // an entered reactor on macOS (issue #117).
             state.init_mcp();
+            // Drive the periodic idle-process reaper (`ProcessSupervisor::reap_idle`)
+            // from the same setup path: it enters the runtime itself, so it's safe
+            // here too. Finished processes and ones the agent abandoned (started but
+            // never polled again) are cleaned up on a timer.
+            state.start_process_reaper();
             // Forward supervisor status changes to the FE as `mcp:status-changed`, so
             // the servers panel reflects start/stop/restart/health without polling. The
             // watch tick coalesces; we re-snapshot on each wake. Runs on Tauri's managed

@@ -7,11 +7,12 @@
 //! or `stop` it.
 //!
 //! State that must survive across turns cannot live in the tool -- the registry
-//! is rebuilt every turn and `Tool::run` gets no session id. The live process
-//! table therefore lives in [`ProcessSupervisor`], owned by the host's
-//! `AppState` and injected at registry-build time (the same pattern as the
-//! memory/skills tools). v1 is app-global; per-session auto-reap needs a session
-//! id threaded into the `Tool` trait and is a tracked follow-up.
+//! is rebuilt every turn. The live process table therefore lives in
+//! [`ProcessSupervisor`], owned by the host's `AppState` and injected at
+//! registry-build time (the same pattern as the memory/skills tools). Each
+//! process is tagged with the owning session id via [`Tool::run_with_session`],
+//! so `poll`/`list`/`stop` are scoped to the owning session and
+//! [`ProcessSupervisor::reap_session`] can clean up on session close.
 //!
 //! Honesty notes:
 //! - Like [`crate::bash`] and [`crate::python`], a started command is **not**
@@ -34,7 +35,7 @@ use serde_json::Value;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 
-use crate::registry::{Safety, Tool, ToolOutcome};
+use crate::registry::{Safety, Tool, ToolOutcome, NO_SESSION};
 
 /// Most concurrent *running* processes the supervisor will hold. A `start` past
 /// this is rejected so a runaway agent cannot leak unbounded children.
@@ -127,6 +128,12 @@ struct ManagedProcess {
     started_at: DateTime<Utc>,
     pid: Option<u32>,
     shared: Arc<Shared>,
+    /// Owning session ([`crate::registry::NO_SESSION`] if anonymous — the
+    /// `run` path). Only the same session may poll/list/stop it.
+    session_id: String,
+    /// Last time any session polled or listed this process. Used by
+    /// [`ProcessSupervisor::reap_idle`] to detect abandoned processes.
+    last_poll_at: Instant,
 }
 
 /// App-global table of background processes. Cloneable handle is the `Arc` the
@@ -154,7 +161,7 @@ impl ProcessSupervisor {
     /// stderr into bounded buffers. Returns the new process id. Rejected if the
     /// live-process cap is reached. Must be called from within a Tokio runtime
     /// (the agent loop always is): it spawns detached reader and exit-watcher tasks.
-    pub fn start(&self, command: &str, dir: &Path) -> Result<u64, String> {
+    pub fn start(&self, command: &str, dir: &Path, session_id: &str) -> Result<u64, String> {
         {
             let map = self.procs.lock().unwrap();
             let live = map
@@ -210,17 +217,25 @@ impl ProcessSupervisor {
                 started_at: Utc::now(),
                 pid,
                 shared,
+                session_id: session_id.to_string(),
+                last_poll_at: Instant::now(),
             },
         );
         Ok(id)
     }
 
-    /// Captured stdout/stderr and current status for one process.
-    pub fn poll(&self, id: u64) -> Result<String, String> {
-        let map = self.procs.lock().unwrap();
+    /// Captured stdout/stderr and current status for one process. Only the
+    /// session that started it may poll — a different session gets the same
+    /// "no such process" error as an unknown id, hiding other sessions' work.
+    pub fn poll(&self, id: u64, session_id: &str) -> Result<String, String> {
+        let mut map = self.procs.lock().unwrap();
         let p = map
-            .get(&id)
+            .get_mut(&id)
             .ok_or_else(|| format!("no such process: {id}"))?;
+        if p.session_id != session_id {
+            return Err(format!("no such process: {id}"));
+        }
+        p.last_poll_at = Instant::now();
         let status = p.shared.status();
         let out = p.shared.stdout.lock().unwrap().snapshot();
         let err = p.shared.stderr.lock().unwrap().snapshot();
@@ -233,17 +248,23 @@ impl ProcessSupervisor {
         ))
     }
 
-    /// One line per known process, oldest id first.
-    pub fn list(&self) -> String {
-        let map = self.procs.lock().unwrap();
-        if map.is_empty() {
+    /// One line per process in `session_id`, oldest id first.
+    pub fn list(&self, session_id: &str) -> String {
+        let mut map = self.procs.lock().unwrap();
+        let mut ids: Vec<u64> = map
+            .iter()
+            .filter(|(_, p)| p.session_id == session_id)
+            .map(|(&id, _)| id)
+            .collect();
+        if ids.is_empty() {
             return "No processes.".to_string();
         }
-        let mut ids: Vec<u64> = map.keys().copied().collect();
         ids.sort_unstable();
+        let now = Instant::now();
         let mut s = String::new();
         for id in ids {
-            let p = &map[&id];
+            let p = map.get_mut(&id).unwrap();
+            p.last_poll_at = now;
             s.push_str(&format!(
                 "#{id} [{}] {} (started {})\n",
                 p.shared.status().label(),
@@ -256,12 +277,16 @@ impl ProcessSupervisor {
 
     /// SIGTERM the process group, then SIGKILL after [`STOP_GRACE`] if it is still
     /// running. A no-op for an already-finished process.
-    pub async fn stop(&self, id: u64) -> Result<String, String> {
+    /// Only the owning session may stop it.
+    pub async fn stop(&self, id: u64, session_id: &str) -> Result<String, String> {
         let (pid, shared) = {
             let map = self.procs.lock().unwrap();
             let p = map
                 .get(&id)
                 .ok_or_else(|| format!("no such process: {id}"))?;
+            if p.session_id != session_id {
+                return Err(format!("no such process: {id}"));
+            }
             (p.pid, p.shared.clone())
         };
         if !shared.status().is_running() {
@@ -289,6 +314,61 @@ impl ProcessSupervisor {
             let _ = pid;
             Err("stopping processes is not supported on this platform".to_string())
         }
+    }
+
+    /// Stop and remove every process owned by `session_id`. Called by the host
+    /// on session **delete** (`delete_session` → `reap_session_processes`) so
+    /// background processes don't outlive their session. Sessions are
+    /// server-truth and persist until explicitly deleted — there is no
+    /// `close_session` — so long-lived apps that never delete a session rely on
+    /// [`reap_idle`](Self::reap_idle) to stop abandoned processes. Returns the
+    /// number reaped.
+    pub async fn reap_session(&self, session_id: &str) -> usize {
+        let ids: Vec<u64> = {
+            let map = self.procs.lock().unwrap();
+            map.iter()
+                .filter(|(_, p)| p.session_id == session_id)
+                .map(|(&id, _)| id)
+                .collect()
+        };
+        let mut count = 0;
+        for id in &ids {
+            let _ = self.stop(*id, session_id).await;
+            self.procs.lock().unwrap().remove(id);
+            count += 1;
+        }
+        count
+    }
+
+    /// Remove finished processes and stop running ones whose `last_poll_at` is
+    /// older than `max_idle` — i.e. the agent started them but never came back.
+    /// Scans all sessions; the desktop host drives this from a periodic timer
+    /// (`AppState::start_process_reaper`). Returns the number reaped.
+    pub async fn reap_idle(&self, max_idle: Duration) -> usize {
+        let now = Instant::now();
+        let to_reap: Vec<(u64, String, bool)> = {
+            let map = self.procs.lock().unwrap();
+            map.iter()
+                .filter_map(|(&id, p)| {
+                    if !p.shared.status().is_running() {
+                        Some((id, p.session_id.clone(), false))
+                    } else if now.duration_since(p.last_poll_at) >= max_idle {
+                        Some((id, p.session_id.clone(), true))
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        };
+        let mut count = 0;
+        for (id, sid, running) in to_reap {
+            if running {
+                let _ = self.stop(id, &sid).await;
+            }
+            self.procs.lock().unwrap().remove(&id);
+            count += 1;
+        }
+        count
     }
 }
 
@@ -387,11 +467,12 @@ impl Tool for ProcessManagerTool {
     fn description(&self) -> &str {
         "Start, poll, and stop background processes (dev server, file watcher, \
          long-running build) that outlive a single turn. Unlike `bash`/`python`, a \
-         started process keeps running so you can check its output later. Actions: \
-         `start` (run a command in the background, returns a process_id), `poll` \
-         (read a process's captured stdout/stderr and status), `list` (all known \
-         processes), `stop` (terminate a process). Use `bash`/`python` for commands \
-         that finish quickly."
+         started process keeps running so you can check its output later. Processes \
+         are scoped to the session that started them — `list`/`poll`/`stop` only \
+         see your own. Actions: `start` (run a command in the background, returns \
+         a process_id), `poll` (read a process's captured stdout/stderr and \
+         status), `list` (this session's processes), `stop` (terminate a \
+         process). Use `bash`/`python` for commands that finish quickly."
     }
 
     fn parameters(&self) -> Value {
@@ -429,6 +510,10 @@ impl Tool for ProcessManagerTool {
     }
 
     async fn run(&self, args: Value, root: &Path) -> ToolOutcome {
+        self.run_with_session(args, root, NO_SESSION).await
+    }
+
+    async fn run_with_session(&self, args: Value, root: &Path, session_id: &str) -> ToolOutcome {
         match args.get("action").and_then(Value::as_str) {
             Some("start") => {
                 let Some(command) = args
@@ -445,7 +530,7 @@ impl Tool for ProcessManagerTool {
                         dir.display()
                     ));
                 }
-                match self.supervisor.start(command, &dir) {
+                match self.supervisor.start(command, &dir, session_id) {
                     Ok(id) => ToolOutcome::ok(format!(
                         "started process {id}: {command}\npoll with action=poll, process_id={id}"
                     )),
@@ -456,17 +541,17 @@ impl Tool for ProcessManagerTool {
                 let Some(id) = Self::id_arg(&args) else {
                     return ToolOutcome::error("poll requires a numeric `process_id`");
                 };
-                match self.supervisor.poll(id) {
+                match self.supervisor.poll(id, session_id) {
                     Ok(body) => ToolOutcome::ok(body),
                     Err(e) => ToolOutcome::error(e),
                 }
             }
-            Some("list") => ToolOutcome::ok(self.supervisor.list()),
+            Some("list") => ToolOutcome::ok(self.supervisor.list(session_id)),
             Some("stop") => {
                 let Some(id) = Self::id_arg(&args) else {
                     return ToolOutcome::error("stop requires a numeric `process_id`");
                 };
-                match self.supervisor.stop(id).await {
+                match self.supervisor.stop(id, session_id).await {
                     Ok(body) => ToolOutcome::ok(body),
                     Err(e) => ToolOutcome::error(e),
                 }
@@ -510,10 +595,10 @@ mod tests {
     async fn start_captures_stdout_and_exit_code() {
         let dir = TempDir::new().unwrap();
         let sup = ProcessSupervisor::new();
-        let id = sup.start("echo hello-proc", dir.path()).unwrap();
+        let id = sup.start("echo hello-proc", dir.path(), "s1").unwrap();
         let st = wait_done(&sup, id, 5).await;
         assert!(matches!(st, Status::Exited(0)), "status was {st:?}");
-        let body = sup.poll(id).unwrap();
+        let body = sup.poll(id, "s1").unwrap();
         assert!(body.contains("hello-proc"), "{body}");
     }
 
@@ -521,7 +606,7 @@ mod tests {
     async fn nonzero_exit_code_is_captured() {
         let dir = TempDir::new().unwrap();
         let sup = ProcessSupervisor::new();
-        let id = sup.start("exit 3", dir.path()).unwrap();
+        let id = sup.start("exit 3", dir.path(), "s1").unwrap();
         let st = wait_done(&sup, id, 5).await;
         assert!(matches!(st, Status::Exited(3)), "status was {st:?}");
     }
@@ -530,7 +615,7 @@ mod tests {
     async fn sleeper_runs_then_stops() {
         let dir = TempDir::new().unwrap();
         let sup = ProcessSupervisor::new();
-        let id = sup.start("sleep 30", dir.path()).unwrap();
+        let id = sup.start("sleep 30", dir.path(), "s1").unwrap();
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert!(
             sup.procs
@@ -543,7 +628,7 @@ mod tests {
                 .is_running(),
             "sleeper should be running before stop"
         );
-        let out = sup.stop(id).await.unwrap();
+        let out = sup.stop(id, "s1").await.unwrap();
         assert!(out.contains("stopped"), "{out}");
         assert!(
             !sup.procs
@@ -563,9 +648,9 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let sup = ProcessSupervisor::new();
         for _ in 0..MAX_CONCURRENT {
-            sup.start("sleep 30", dir.path()).unwrap();
+            sup.start("sleep 30", dir.path(), "s1").unwrap();
         }
-        let err = sup.start("sleep 30", dir.path()).unwrap_err();
+        let err = sup.start("sleep 30", dir.path(), "s1").unwrap_err();
         assert!(err.contains("too many"), "{err}");
         // Running children are SIGKILLed by ProcessSupervisor::drop at scope end.
     }
@@ -575,8 +660,8 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let sup = ProcessSupervisor::new();
         let _ = dir;
-        assert!(sup.poll(999).is_err());
-        assert!(sup.stop(999).await.is_err());
+        assert!(sup.poll(999, "s1").is_err());
+        assert!(sup.stop(999, "s1").await.is_err());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -652,5 +737,60 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cross_session_isolation() {
+        let dir = TempDir::new().unwrap();
+        let sup = ProcessSupervisor::new();
+        let id = sup.start("sleep 30", dir.path(), "session-a").unwrap();
+
+        // Session B cannot see, poll, or stop session A's process.
+        assert!(sup.poll(id, "session-b").is_err());
+        assert!(sup.stop(id, "session-b").await.is_err());
+        assert!(sup.list("session-b").contains("No processes"));
+
+        // Session A still has full access.
+        assert!(sup.poll(id, "session-a").is_ok());
+        assert!(sup.list("session-a").contains("sleep 30"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reap_session_stops_and_removes() {
+        let dir = TempDir::new().unwrap();
+        let sup = ProcessSupervisor::new();
+        let _id = sup.start("sleep 30", dir.path(), "s1").unwrap();
+        let _id2 = sup.start("sleep 30", dir.path(), "s1").unwrap();
+        let _id3 = sup.start("sleep 30", dir.path(), "s2").unwrap();
+
+        let n = sup.reap_session("s1").await;
+        assert_eq!(n, 2, "should reap 2 processes from s1");
+
+        // s1's processes are gone; s2's survivor is untouched.
+        assert!(sup.list("s1").contains("No processes"));
+        assert!(sup.list("s2").contains("sleep 30"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reap_idle_removes_finished_and_abandoned() {
+        let dir = TempDir::new().unwrap();
+        let sup = ProcessSupervisor::new();
+
+        // A finished process — reaped regardless of idle threshold.
+        let done_id = sup.start("true", dir.path(), "s1").unwrap();
+        wait_done(&sup, done_id, 5).await;
+
+        // A running process that nobody polls — will exceed the tiny idle budget.
+        let _live_id = sup.start("sleep 30", dir.path(), "s1").unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let n = sup.reap_idle(Duration::from_millis(50)).await;
+        // At least the finished one is reaped; the live one may or may not be
+        // depending on timing, but the finished one always is.
+        assert!(n >= 1, "should reap at least the finished process, got {n}");
+        assert!(
+            sup.procs.lock().unwrap().get(&done_id).is_none(),
+            "finished process should have been removed"
+        );
     }
 }

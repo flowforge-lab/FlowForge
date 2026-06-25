@@ -200,7 +200,9 @@ impl CompactionStrategy for MemoryFlush {
                 let args: serde_json::Value =
                     serde_json::from_str(&call.arguments).unwrap_or(serde_json::Value::Null);
                 let outcome = if call.name.starts_with("memory_") {
-                    ctx.registry.run(&call.name, args, ctx.root).await
+                    ctx.registry
+                        .run_with_session(&call.name, args, ctx.root, ctx.session_id)
+                        .await
                 } else {
                     ToolOutcome::error("only memory tools are available during a flush")
                 };

@@ -3,6 +3,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
+use std::time::Duration;
 
 use ff_agent::{
     flush_due, AbstractiveConfig, CancelToken, CompactionContext, CompactionStrategy,
@@ -1117,6 +1118,48 @@ impl AppState {
             }
         }
         reg
+    }
+
+    /// Stop and remove all background processes owned by `session_id` (#218).
+    /// Fire-and-forget: the session is already gone from the store; process
+    /// cleanup is best-effort and must not block the UI thread.
+    pub fn reap_session_processes(&self, session_id: &str) {
+        let sup = self.process_supervisor.clone();
+        let id = session_id.to_owned();
+        tokio::spawn(async move {
+            let n = sup.reap_session(&id).await;
+            if n > 0 {
+                tracing::info!(session_id = %id, reaped = n, "reaped session processes");
+            }
+        });
+    }
+
+    /// Start a periodic background reaper that drives
+    /// [`ProcessSupervisor::reap_idle`] to remove finished processes and stop
+    /// abandoned ones (started by the agent but never polled again) across all
+    /// sessions. Fire-and-forget: the task lives for the app's lifetime on the
+    /// shared Tokio runtime. Like [`init_mcp`](Self::init_mcp), it enters the
+    /// runtime itself, so it's safe to call from Tauri's `setup` — which runs
+    /// off-reactor on macOS (issue #117).
+    pub fn start_process_reaper(&self) {
+        let sup = self.process_supervisor.clone();
+        // `tokio::spawn` needs an entered reactor; `setup` may not have one.
+        let rt = tauri::async_runtime::handle();
+        let _guard = rt.inner().enter();
+        tokio::spawn(async move {
+            // Scan every minute; reap processes unpolled for ten minutes. A
+            // finished process is reaped on the first tick regardless of the idle
+            // budget; a running one is only stopped once it has gone untouched.
+            let mut interval = tokio::time::interval(Duration::from_secs(60));
+            let idle = Duration::from_secs(10 * 60);
+            loop {
+                interval.tick().await;
+                let n = sup.reap_idle(idle).await;
+                if n > 0 {
+                    tracing::info!(reaped = n, "periodic process reaper cleaned up");
+                }
+            }
+        });
     }
 
     /// Start the MCP host: begin watching `~/.flowforge/mcp.json` and spawn the
@@ -3126,6 +3169,16 @@ mod tests {
             Some(path),
             "control commands must write back to the watched file"
         );
+    }
+
+    #[test]
+    fn start_process_reaper_spawns_without_an_entered_runtime() {
+        // Same off-reactor `setup` path as `init_mcp` (issue #117): the method
+        // must enter the runtime itself so a caller with no entered reactor
+        // doesn't panic. The loop is detached and dies with the test process.
+        let state = AppState::new();
+        state.start_process_reaper();
+        // No panic == the spawn succeeded.
     }
 
     // --- Four-option approval tests (#229) ---
