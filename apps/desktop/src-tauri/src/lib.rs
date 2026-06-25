@@ -433,13 +433,24 @@ fn send_message(
             _ => state.store.add_message(&session_id, Role::User, content),
         };
 
+    spawn_assistant_turn(state.inner().clone(), app, session_id);
+
+    Ok(user_msg.id)
+}
+
+/// Set up and spawn the assistant turn for `session_id`: snapshots the provider,
+/// resolves the session's phenotype/mode, builds the tool registry + system
+/// prompt, runs the turn (streaming over `turn:*` / `tool:*`), and folds the
+/// per-turn telemetry. Shared by `send_message` (after persisting the user turn)
+/// and `edit_message` (after editing + truncating), so both paths run identical
+/// turn semantics.
+fn spawn_assistant_turn(state: Arc<AppState>, app: tauri::AppHandle, session_id: String) {
     let cancel = CancelToken::new();
     state.register_cancel(&session_id, cancel.clone());
     // A clone kept by the host so the post-turn telemetry can tell a clean finish
     // from a user cancel (the original is moved into `run_turn`).
     let cancel_probe = cancel.clone();
 
-    let state = state.inner().clone();
     // Snapshot the provider from the current config for this turn; a settings
     // change between turns is picked up on the next `send_message`.
     let (provider, default_model) = state.build_provider();
@@ -641,8 +652,40 @@ fn send_message(
                 .await;
         }
     });
+}
 
-    Ok(user_msg.id)
+/// Edit a prior user message in place, truncate the transcript after it, and
+/// re-run the turn from the edited prompt (#464, backend for #463). Cancels any
+/// in-flight turn + pending approvals for the session first so a running turn
+/// cannot append after the truncation, validates the edit in the store (rejecting
+/// an unknown id, a wrong-session id, or a non-user message), then spawns a fresh
+/// assistant turn over the existing `turn:*` / `tool:*` events. Returns the edited
+/// message's id.
+#[tauri::command]
+fn edit_message(
+    state: State<'_, Arc<AppState>>,
+    app: tauri::AppHandle,
+    session_id: String,
+    message_id: String,
+    content: String,
+    attachments: Option<Vec<Attachment>>,
+) -> CmdResult<String> {
+    // Stop any turn already streaming into this session before we mutate its
+    // transcript (mirrors `cancel_turn`): otherwise the running turn would keep
+    // appending messages past the cut we are about to make.
+    if let Some(token) = state.take_cancel(&session_id) {
+        token.cancel();
+    }
+    state.cancel_pending_approvals(&session_id);
+
+    let edited_id = state
+        .store
+        .edit_user_message(&session_id, &message_id, content, attachments)
+        .map_err(|e| e.to_string())?;
+
+    spawn_assistant_turn(state.inner().clone(), app, session_id);
+
+    Ok(edited_id)
 }
 
 /// Current LLM provider settings for the settings panel.
@@ -1552,6 +1595,7 @@ pub fn run() {
             read_memory_file,
             memory_overview,
             send_message,
+            edit_message,
             run_sidecar_turn,
             cancel_turn,
             respond_approval,
