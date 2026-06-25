@@ -1176,6 +1176,7 @@ pub async fn run_turn(
                                 system_prompt,
                                 cancel.clone(),
                                 &args,
+                                session_id,
                             )
                             .await
                         } else {
@@ -1319,6 +1320,7 @@ async fn run_subagent(
     system_prompt: Option<&str>,
     cancel: CancelToken,
     args: &serde_json::Value,
+    parent_session_id: &str,
 ) -> ff_tools::ToolOutcome {
     if parent.depth >= parent.max_depth {
         return ff_tools::ToolOutcome::error(
@@ -1382,13 +1384,47 @@ async fn run_subagent(
     ))
     .await;
 
-    store.delete_session(&child.id);
-
-    match result {
-        Ok(msg) if !msg.content.trim().is_empty() => ff_tools::ToolOutcome::ok(msg.content),
+    // Re-home any compaction originals the child summary still points at, so they
+    // survive the child-session teardown below (#469). A `[compacted; retrieve
+    // key=...]` marker that crosses the delegation boundary would otherwise dangle:
+    // `compaction_originals` cascades on session delete, so the row would vanish and
+    // `compaction_retrieve` would have nothing to return -- forcing the parent to
+    // re-delegate. Re-homing keeps the marker compact in the parent transcript while
+    // the verbatim original stays retrievable on demand from the parent session.
+    let outcome = match result {
+        Ok(msg) if !msg.content.trim().is_empty() => {
+            for key in marker_keys(&msg.content) {
+                store.rehome_compaction_original(key, parent_session_id);
+            }
+            ff_tools::ToolOutcome::ok(msg.content)
+        }
         Ok(_) => ff_tools::ToolOutcome::ok("[sub-agent finished without a summary]"),
         Err(e) => ff_tools::ToolOutcome::error(format!("sub-agent failed: {e}")),
+    };
+
+    store.delete_session(&child.id);
+    outcome
+}
+
+/// Extract every `[compacted; retrieve key=<HEX>]` marker key in `content`, in
+/// order. Used to re-home a sub-agent's surviving compaction originals to the
+/// parent session before the child session is torn down (#469). A marker missing
+/// its closing `]` is skipped.
+fn marker_keys(content: &str) -> Vec<&str> {
+    let mut keys = Vec::new();
+    let mut rest = content;
+    while let Some(start) = rest.find(COMPACTION_MARKER_PREFIX) {
+        let after = &rest[start + COMPACTION_MARKER_PREFIX.len()..];
+        let Some(end) = after.find(']') else {
+            break;
+        };
+        let key = &after[..end];
+        if !key.is_empty() {
+            keys.push(key);
+        }
+        rest = &after[end + 1..];
     }
+    keys
 }
 
 #[cfg(test)]
@@ -1397,6 +1433,24 @@ mod tests {
     use async_trait::async_trait;
     use ff_llm::{Chunk, ChunkStream, LlmError, ToolCallDelta};
     use std::sync::atomic::{AtomicBool, AtomicUsize};
+
+    #[test]
+    fn marker_keys_extracts_one_many_zero_and_skips_unterminated() {
+        // #469: re-homing depends on pulling every retrieve key out of a sub-agent
+        // summary. Single, multiple-in-order, none, empty-key, and a marker missing
+        // its closing `]` must all behave.
+        assert_eq!(
+            marker_keys("see report\n[compacted; retrieve key=4f441c46bdb87160]"),
+            vec!["4f441c46bdb87160"]
+        );
+        assert_eq!(
+            marker_keys("a [compacted; retrieve key=aaa] mid b [compacted; retrieve key=bbb] end"),
+            vec!["aaa", "bbb"]
+        );
+        assert!(marker_keys("a plain summary with no markers").is_empty());
+        assert!(marker_keys("[compacted; retrieve key=]").is_empty());
+        assert!(marker_keys("dangling [compacted; retrieve key=ccc no bracket").is_empty());
+    }
 
     #[test]
     fn to_chat_carries_reasoning_from_persisted_message() {
