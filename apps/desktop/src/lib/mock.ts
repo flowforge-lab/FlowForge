@@ -40,6 +40,7 @@ import type {
 } from "../bindings";
 import type { Format } from "../bindings/Format";
 import type { SecretKind } from "../bindings/SecretKind";
+import type { BedrockAuth } from "../bindings/BedrockAuth";
 import type { FfIpc, Unlisten } from "./ipc";
 import type { MarketplaceSkill } from "./marketplace";
 import type { MarketplaceProfile } from "./profile-marketplace";
@@ -57,6 +58,14 @@ type Listener<T> = (e: T) => void;
 
 const uid = () => crypto.randomUUID();
 const now = () => Date.now();
+
+// `SecretKind::ALL` order (#320) — `provider_secret_presence` returns kinds in
+// this order so the mock matches the backend's stable presence ordering.
+const SECRET_KIND_ALL: readonly SecretKind[] = [
+  "apiKey",
+  "secretAccessKey",
+  "sessionToken",
+];
 
 // 300 ms/word in slow mode — long enough to see the Stop button and click it.
 const TOKEN_INTERVAL_MS = import.meta.env.VITE_FF_MOCK_SLOW === "1" ? 300 : 40;
@@ -1052,6 +1061,42 @@ export class MockIpc implements FfIpc {
     conn.hasKey = (set?.size ?? 0) > 0;
   }
 
+  // Which secret kinds are stored for a connection (#320), in `SecretKind::ALL`
+  // order, so each Bedrock field shows its own Stored/Clear state. Presence only —
+  // no value is returned; rejects on an unknown id (mirrors the backend command).
+  async providerSecretPresence(connectionId: string): Promise<SecretKind[]> {
+    if (!this.registry.connections.some((c) => c.id === connectionId)) {
+      throw new Error(`unknown connection: ${connectionId}`);
+    }
+    const set = this.secretsByConnection.get(connectionId);
+    return SECRET_KIND_ALL.filter((k) => set?.has(k));
+  }
+
+  // The Bedrock auth a connection resolves to right now (#320): the explicit pin,
+  // or the `Auto` precedence winner. `null` for non-Bedrock / unknown connections.
+  async resolvedBedrockAuth(connectionId: string): Promise<BedrockAuth | null> {
+    const conn = this.registry.connections.find((c) => c.id === connectionId);
+    if (!conn || conn.kind !== "bedrock") return null;
+    const mode = conn.authMode ?? "auto";
+    return mode === "auto" ? this.resolveBedrockAuto(conn) : mode;
+  }
+
+  // `BedrockAuth::resolve_auto` mirror: API key > profile > IAM keys, falling back
+  // to profile so the probe surfaces the real auth failure. A profile counts only
+  // when non-empty; IAM keys only when both the access key id and the secret access
+  // key are present.
+  private resolveBedrockAuto(conn: ProviderConnection): BedrockAuth {
+    const set = this.secretsByConnection.get(conn.id);
+    const hasApiKey = set?.has("apiKey") ?? false;
+    const hasProfile = !!conn.awsProfile?.trim();
+    const hasIamKeys =
+      !!conn.accessKeyId?.trim() && (set?.has("secretAccessKey") ?? false);
+    if (hasApiKey) return "apiKey";
+    if (hasProfile) return "profile";
+    if (hasIamKeys) return "iamKeys";
+    return "profile";
+  }
+
   // Test Connection (Issue #202 PR-3a). `id` defaults to the active connection.
   // Resolves on a successful probe; rejects with a message the UI surfaces. Local
   // kinds always pass; the hosted OpenAI-compatible kinds (SiliconFlow #329,
@@ -1072,7 +1117,14 @@ export class MockIpc implements FfIpc {
     }
     if (conn.kind !== "bedrock") return;
     const secrets = this.secretsByConnection.get(conn.id);
-    switch (conn.authMode) {
+    // `Auto` (the default) resolves to a concrete mode by precedence before the
+    // probe validates it, mirroring the backend — so the probe checks the same
+    // credential the next run will use.
+    const mode =
+      !conn.authMode || conn.authMode === "auto"
+        ? this.resolveBedrockAuto(conn)
+        : conn.authMode;
+    switch (mode) {
       case "iamKeys":
         if (!conn.accessKeyId?.trim() || !secrets?.has("secretAccessKey")) {
           throw new Error(
@@ -1086,7 +1138,7 @@ export class MockIpc implements FfIpc {
         }
         return;
       default:
-        // Profile (or unset): assume the named/default profile resolves.
+        // Profile: assume the named/default profile resolves.
         return;
     }
   }

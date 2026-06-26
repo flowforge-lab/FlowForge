@@ -243,6 +243,76 @@ describe("MockIpc provider connection registry", () => {
     await expect(ipc.testConnection("openai")).resolves.toBeUndefined();
   });
 
+  it("provider_secret_presence returns stored kinds in ALL order, throws on unknown", async () => {
+    const ipc = new MockIpc();
+    expect(await ipc.providerSecretPresence("bedrock")).toEqual([]);
+    // Store out of order; presence reports in SecretKind::ALL order.
+    await ipc.setProviderSecret("bedrock", "sessionToken", "tok");
+    await ipc.setProviderSecret("bedrock", "apiKey", "br-key");
+    expect(await ipc.providerSecretPresence("bedrock")).toEqual([
+      "apiKey",
+      "sessionToken",
+    ]);
+    await ipc.clearProviderSecret("bedrock", "apiKey");
+    expect(await ipc.providerSecretPresence("bedrock")).toEqual([
+      "sessionToken",
+    ]);
+    await expect(ipc.providerSecretPresence("nope")).rejects.toThrow(/unknown/);
+  });
+
+  it("resolved_bedrock_auth returns the explicit pin and null for non-Bedrock/unknown", async () => {
+    const ipc = new MockIpc();
+    // Non-Bedrock kinds and unknown ids resolve to null.
+    expect(await ipc.resolvedBedrockAuth("candle-vllm")).toBeNull();
+    expect(await ipc.resolvedBedrockAuth("nope")).toBeNull();
+    // An explicit pin is returned verbatim, regardless of what's stored.
+    const bedrock = (await ipc.getProviderRegistry()).connections.find(
+      (c) => c.id === "bedrock",
+    )!;
+    await ipc.upsertConnection({ ...bedrock, authMode: "iamKeys" });
+    expect(await ipc.resolvedBedrockAuth("bedrock")).toBe("iamKeys");
+  });
+
+  it("resolved_bedrock_auth (auto) follows API key > profile > IAM keys, falling back to profile", async () => {
+    const ipc = new MockIpc();
+    const bedrock = (await ipc.getProviderRegistry()).connections.find(
+      (c) => c.id === "bedrock",
+    )!;
+    const setAuto = (over: Partial<typeof bedrock> = {}) =>
+      ipc.upsertConnection({ ...bedrock, authMode: "auto", ...over });
+
+    // Nothing configured (seed profile cleared) → profile fallback.
+    await setAuto({ awsProfile: undefined });
+    expect(await ipc.resolvedBedrockAuth("bedrock")).toBe("profile");
+
+    // IAM keys only (access key id + secret access key, no profile) → iamKeys.
+    await setAuto({ accessKeyId: "AKIAEXAMPLE", awsProfile: undefined });
+    await ipc.setProviderSecret("bedrock", "secretAccessKey", "shhh");
+    expect(await ipc.resolvedBedrockAuth("bedrock")).toBe("iamKeys");
+
+    // Add a profile → profile wins over IAM keys.
+    await setAuto({ accessKeyId: "AKIAEXAMPLE", awsProfile: "dev" });
+    expect(await ipc.resolvedBedrockAuth("bedrock")).toBe("profile");
+
+    // Add an API key → API key wins over everything.
+    await ipc.setProviderSecret("bedrock", "apiKey", "br-key");
+    expect(await ipc.resolvedBedrockAuth("bedrock")).toBe("apiKey");
+  });
+
+  it("test_connection (auto) resolves a credential by precedence before probing", async () => {
+    const ipc = new MockIpc();
+    const bedrock = (await ipc.getProviderRegistry()).connections.find(
+      (c) => c.id === "bedrock",
+    )!;
+    // Auto with nothing stored resolves to profile → the probe passes.
+    await ipc.upsertConnection({ ...bedrock, authMode: "auto" });
+    await expect(ipc.testConnection("bedrock")).resolves.toBeUndefined();
+    // Auto with a stored API key resolves to apiKey → still passes.
+    await ipc.setProviderSecret("bedrock", "apiKey", "br-key");
+    await expect(ipc.testConnection("bedrock")).resolves.toBeUndefined();
+    expect(await ipc.resolvedBedrockAuth("bedrock")).toBe("apiKey");
+  });
+
   it("getProviderConfig/setProviderConfig shim the active connection", async () => {
     const ipc = new MockIpc();
     await ipc.setProviderConfig(
