@@ -56,6 +56,10 @@ struct OllamaChunk {
     message: OllamaMessage,
     #[serde(default)]
     done: bool,
+    /// "length" when generation stopped on the `num_predict` cap rather than a
+    /// natural end of turn, mirroring OpenAI `finish_reason` (#528).
+    #[serde(default)]
+    done_reason: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -136,6 +140,7 @@ fn parse_ollama_line(line: &[u8], tool_idx: &mut u32) -> Option<Result<Chunk, Ll
                 reasoning_delta: c.message.thinking,
                 tool_calls,
                 done: c.done,
+                truncated: c.done_reason.as_deref() == Some("length"),
             }))
         }
         Err(e) => Some(Err(LlmError::Decode(e.to_string()))),
