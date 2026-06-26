@@ -1,5 +1,6 @@
 {
   "rules": [
+    { "match": "qwen3.6", "context_window": 262144 },
     { "match": "glm-5.2", "context_window": 1048576 },
     { "match": "glm-4.5-air", "context_window": 98304 },
     { "match": "glm-5", "context_window": 202752 },
