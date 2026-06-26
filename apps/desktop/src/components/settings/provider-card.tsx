@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import {
   ChevronDown,
   Plus,
@@ -19,6 +19,7 @@ import {
 } from "@/store/model-config";
 import type { ProviderConnection } from "@/bindings/ProviderConnection";
 import type { BedrockAuth } from "@/bindings/BedrockAuth";
+import type { SecretKind } from "@/bindings/SecretKind";
 
 /** Per-kind presentation (badge glyph/color, tier label). */
 const KIND_META: Record<
@@ -33,6 +34,7 @@ const KIND_META: Record<
 };
 
 const AUTH_OPTIONS: ReadonlyArray<{ value: BedrockAuth; label: string }> = [
+  { value: "auto", label: "Auto" },
   { value: "profile", label: "Profile" },
   { value: "iamKeys", label: "IAM Keys" },
   { value: "apiKey", label: "API Key" },
@@ -49,6 +51,8 @@ const REGION_SUGGESTIONS = [
 
 function authLabel(mode: BedrockAuth | undefined): string {
   switch (mode) {
+    case "auto":
+      return "auto";
     case "iamKeys":
       return "IAM keys";
     case "apiKey":
@@ -92,9 +96,12 @@ export function ProviderCard({ conn }: { conn: ProviderConnection }) {
     (s) => s.registry?.connections.length ?? 0,
   );
   const models = useModelConfigStore((s) => s.modelsById[conn.id]);
+  const presence = useModelConfigStore((s) => s.secretsById[conn.id]);
+  const resolvedAuth = useModelConfigStore((s) => s.resolvedAuthById[conn.id]);
   const test = useModelConfigStore((s) => s.test[conn.id]);
   const saving = useModelConfigStore((s) => s.saving);
   const loadModels = useModelConfigStore((s) => s.loadModels);
+  const loadConnectionMeta = useModelConfigStore((s) => s.loadConnectionMeta);
   const setDefaultModel = useModelConfigStore((s) => s.setDefaultModel);
   const saveConnection = useModelConfigStore((s) => s.saveConnection);
   const removeConnection = useModelConfigStore((s) => s.removeConnection);
@@ -112,7 +119,7 @@ export function ProviderCard({ conn }: { conn: ProviderConnection }) {
   const [baseUrl, setBaseUrl] = useState(conn.baseUrl ?? "");
   const [region, setRegion] = useState(conn.region ?? "us-east-1");
   const [authMode, setAuthMode] = useState<BedrockAuth>(
-    conn.authMode ?? "profile",
+    conn.authMode ?? "auto",
   );
   const [awsProfile, setAwsProfile] = useState(conn.awsProfile ?? "");
   const [accessKeyId, setAccessKeyId] = useState(conn.accessKeyId ?? "");
@@ -136,7 +143,7 @@ export function ProviderCard({ conn }: { conn: ProviderConnection }) {
     setSyncedSig(connFieldSig);
     setBaseUrl(conn.baseUrl ?? "");
     setRegion(conn.region ?? "us-east-1");
-    setAuthMode(conn.authMode ?? "profile");
+    setAuthMode(conn.authMode ?? "auto");
     setAwsProfile(conn.awsProfile ?? "");
     setAccessKeyId(conn.accessKeyId ?? "");
   }
@@ -149,13 +156,28 @@ export function ProviderCard({ conn }: { conn: ProviderConnection }) {
   const [discovering, setDiscovering] = useState(false);
   const [discoverOpen, setDiscoverOpen] = useState(false);
 
+  // Per-`SecretKind` presence + resolved Bedrock auth power the per-field
+  // Stored/Clear indicators and the "Active" badge (#320). Fetch them when a
+  // Bedrock card is open (presence-only; no secret value crosses the IPC seam).
+  useEffect(() => {
+    if (open && isBedrock) void loadConnectionMeta(conn.id);
+  }, [open, isBedrock, conn.id, loadConnectionMeta]);
+  const hasSecret = (kind: SecretKind) => (presence ?? []).includes(kind);
+
+  // Profile and Auto both fall back to the default AWS credential chain, so a
+  // bare connection in either mode is still "configured" (#320).
   const configured = isBedrock
-    ? authMode === "profile" || conn.hasKey
+    ? authMode === "profile" || authMode === "auto" || conn.hasKey
     : isHostedKey
       ? conn.hasKey
       : true;
+  // In Auto mode, surface the resolved winner alongside the mode once meta loads.
+  const bedrockAuthDetail =
+    conn.authMode === "auto" && resolvedAuth
+      ? `auto · ${authLabel(resolvedAuth)}`
+      : authLabel(conn.authMode);
   const detail = isBedrock
-    ? `${conn.region ?? region} · ${authLabel(conn.authMode)}`
+    ? `${conn.region ?? region} · ${bedrockAuthDetail}`
     : isHostedKey
       ? (conn.baseUrl ?? hostedBaseUrlMeta(conn.kind).placeholder)
       : (conn.baseUrl ?? "default endpoint");
@@ -164,6 +186,21 @@ export function ProviderCard({ conn }: { conn: ProviderConnection }) {
   // rest of the fetched catalog (everything that isn't already the default).
   const shown = conn.model ? [conn.model] : [];
   const undiscovered = (models ?? []).filter((m) => m !== conn.model);
+
+  // In Auto mode every Bedrock credential group is visible at once; each gets a
+  // small header that badges the resolved winner (#320).
+  const showAllBedrockAuth = authMode === "auto";
+  const bedrockGroupHeader = (mode: BedrockAuth, label: string) =>
+    showAllBedrockAuth ? (
+      <div className="flex items-center gap-2">
+        <span className={fieldLabelClass()}>{label}</span>
+        {resolvedAuth === mode ? (
+          <span className="rounded-md border border-primary/30 bg-primary/5 px-1.5 py-0.5 text-[9px] font-semibold tracking-wide text-primary uppercase">
+            Active
+          </span>
+        ) : null}
+      </div>
+    ) : null;
 
   const expand = () => {
     const next = !open;
@@ -189,14 +226,12 @@ export function ProviderCard({ conn }: { conn: ProviderConnection }) {
         accessKeyId: accessKeyId.trim() || undefined,
       });
       // Persist any freshly-entered secrets (write-only), then drop them locally.
-      if (authMode === "iamKeys") {
-        if (secretAccessKey)
-          await setSecret(conn.id, "secretAccessKey", secretAccessKey);
-        if (sessionToken)
-          await setSecret(conn.id, "sessionToken", sessionToken);
-      } else if (authMode === "apiKey") {
-        if (apiKey) await setSecret(conn.id, "apiKey", apiKey);
-      }
+      // Auto shows all three credential groups, so save whichever were filled in
+      // regardless of mode; hidden fields stay empty and are skipped (#320).
+      if (secretAccessKey)
+        await setSecret(conn.id, "secretAccessKey", secretAccessKey);
+      if (sessionToken) await setSecret(conn.id, "sessionToken", sessionToken);
+      if (apiKey) await setSecret(conn.id, "apiKey", apiKey);
       setSecretAccessKey("");
       setSessionToken("");
       setApiKey("");
@@ -313,8 +348,16 @@ export function ProviderCard({ conn }: { conn: ProviderConnection }) {
                   />
                 </div>
 
-                {authMode === "profile" ? (
+                {authMode === "auto" ? (
+                  <p className="text-[11px] text-muted-foreground">
+                    Uses whichever credential is configured, in order: API key,
+                    then profile, then IAM keys. The active one is badged below.
+                  </p>
+                ) : null}
+
+                {authMode === "auto" || authMode === "profile" ? (
                   <div className="space-y-1.5">
+                    {bedrockGroupHeader("profile", "Profile")}
                     <label
                       htmlFor={`profile-${conn.id}`}
                       className={fieldLabelClass()}
@@ -334,8 +377,9 @@ export function ProviderCard({ conn }: { conn: ProviderConnection }) {
                   </div>
                 ) : null}
 
-                {authMode === "iamKeys" ? (
-                  <>
+                {authMode === "auto" || authMode === "iamKeys" ? (
+                  <div className="space-y-3.5">
+                    {bedrockGroupHeader("iamKeys", "IAM Keys")}
                     <div className="space-y-1.5">
                       <label
                         htmlFor={`akid-${conn.id}`}
@@ -356,7 +400,7 @@ export function ProviderCard({ conn }: { conn: ProviderConnection }) {
                       placeholder="••••••"
                       value={secretAccessKey}
                       onChange={setSecretAccessKey}
-                      hasKey={conn.hasKey}
+                      hasKey={hasSecret("secretAccessKey")}
                       onClear={() =>
                         void clearSecret(conn.id, "secretAccessKey")
                       }
@@ -367,24 +411,27 @@ export function ProviderCard({ conn }: { conn: ProviderConnection }) {
                       placeholder="For temporary credentials"
                       value={sessionToken}
                       onChange={setSessionToken}
-                      hasKey={conn.hasKey}
+                      hasKey={hasSecret("sessionToken")}
                       hint="Stored in the OS keychain. Never written to disk."
                       onClear={() => void clearSecret(conn.id, "sessionToken")}
                     />
-                  </>
+                  </div>
                 ) : null}
 
-                {authMode === "apiKey" ? (
-                  <SecretField
-                    id={`brk-${conn.id}`}
-                    label="Bedrock API Key"
-                    placeholder="br-…"
-                    value={apiKey}
-                    onChange={setApiKey}
-                    hasKey={conn.hasKey}
-                    hint="Stored securely in the OS keychain."
-                    onClear={() => void clearSecret(conn.id, "apiKey")}
-                  />
+                {authMode === "auto" || authMode === "apiKey" ? (
+                  <div className="space-y-1.5">
+                    {bedrockGroupHeader("apiKey", "API Key")}
+                    <SecretField
+                      id={`brk-${conn.id}`}
+                      label="Bedrock API Key"
+                      placeholder="br-…"
+                      value={apiKey}
+                      onChange={setApiKey}
+                      hasKey={hasSecret("apiKey")}
+                      hint="Stored securely in the OS keychain."
+                      onClear={() => void clearSecret(conn.id, "apiKey")}
+                    />
+                  </div>
                 ) : null}
               </>
             ) : isHostedKey ? (

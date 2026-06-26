@@ -12,6 +12,7 @@ import type { ProviderConnection } from "@/bindings/ProviderConnection";
 import type { ProviderRegistry } from "@/bindings/ProviderRegistry";
 import type { ProviderKind } from "@/bindings/ProviderKind";
 import type { SecretKind } from "@/bindings/SecretKind";
+import type { BedrockAuth } from "@/bindings/BedrockAuth";
 
 export type Effort = "low" | "medium" | "high";
 
@@ -55,7 +56,9 @@ function defaultConnection(kind: ProviderKind): ProviderConnection {
         ...base,
         displayName: "AWS Bedrock",
         region: "us-east-1",
-        authMode: "profile",
+        // Auto resolves API key > profile > IAM keys from what's stored (#320);
+        // the user can still pin an explicit mode in the card.
+        authMode: "auto",
       };
     case "ollama":
       return { ...base, displayName: "Ollama" };
@@ -73,6 +76,12 @@ interface ModelConfigState extends LocalReasoningPrefs {
   registry: ProviderRegistry | null;
   /** Best-effort model ids per connection id (lazy; populated on load/expand). */
   modelsById: Record<string, string[]>;
+  /** Stored `SecretKind`s per connection id (#320); drives per-field Stored/Clear.
+   *  Lazy — populated on card expand and after secret/save mutations. */
+  secretsById: Record<string, SecretKind[]>;
+  /** The Bedrock auth each connection resolves to right now (#320); `null` for
+   *  non-Bedrock. Drives the "Active" credential badge. */
+  resolvedAuthById: Record<string, BedrockAuth | null>;
   /** In-flight "Test Connection" results, keyed by connection id. */
   test: Record<string, TestState>;
   loading: boolean;
@@ -82,6 +91,9 @@ interface ModelConfigState extends LocalReasoningPrefs {
   load: () => Promise<void>;
   /** Best-effort refresh of one connection's model list (e.g. on card expand). */
   loadModels: (id: string) => Promise<void>;
+  /** Best-effort refresh of one connection's stored-secret presence and resolved
+   *  Bedrock auth (#320); on card expand and after secret/save mutations. */
+  loadConnectionMeta: (id: string) => Promise<void>;
   /** Make a connection the default (active) provider. */
   setActiveConnection: (id: string) => Promise<void>;
   /** Pick a connection's default model — also makes that connection active. */
@@ -138,6 +150,8 @@ export const useModelConfigStore = create<ModelConfigState>()(
         ...LOCAL_REASONING_DEFAULTS,
         registry: null,
         modelsById: {},
+        secretsById: {},
+        resolvedAuthById: {},
         test: {},
         loading: false,
         saving: false,
@@ -165,6 +179,22 @@ export const useModelConfigStore = create<ModelConfigState>()(
           } catch {
             // Best-effort: an unreachable endpoint just leaves the list empty.
             set((s) => ({ modelsById: { ...s.modelsById, [id]: [] } }));
+          }
+        },
+
+        loadConnectionMeta: async (id) => {
+          // Best-effort: a stale/unknown id leaves the prior meta untouched.
+          try {
+            const [secrets, resolvedAuth] = await Promise.all([
+              ipc.providerSecretPresence(id),
+              ipc.resolvedBedrockAuth(id),
+            ]);
+            set((s) => ({
+              secretsById: { ...s.secretsById, [id]: secrets },
+              resolvedAuthById: { ...s.resolvedAuthById, [id]: resolvedAuth },
+            }));
+          } catch {
+            // Leave the existing presence/resolved values in place.
           }
         },
 
@@ -204,6 +234,8 @@ export const useModelConfigStore = create<ModelConfigState>()(
           try {
             const stored = await ipc.upsertConnection(conn);
             await refresh();
+            // Profile / access-key-id edits move the Auto winner (#320).
+            await get().loadConnectionMeta(stored.id);
             set({ saving: false });
             return stored;
           } catch (err) {
@@ -236,7 +268,15 @@ export const useModelConfigStore = create<ModelConfigState>()(
             set((s) => {
               const { [id]: _t, ...test } = s.test;
               const { [id]: _m, ...modelsById } = s.modelsById;
-              return { saving: false, test, modelsById };
+              const { [id]: _s, ...secretsById } = s.secretsById;
+              const { [id]: _r, ...resolvedAuthById } = s.resolvedAuthById;
+              return {
+                saving: false,
+                test,
+                modelsById,
+                secretsById,
+                resolvedAuthById,
+              };
             });
           } catch (err) {
             set({ saving: false, error: errMsg(err) });
@@ -261,6 +301,8 @@ export const useModelConfigStore = create<ModelConfigState>()(
           try {
             await ipc.setProviderSecret(id, kind, value);
             await refresh();
+            // Per-kind presence and the resolved winner change here (#320).
+            await get().loadConnectionMeta(id);
             set({ saving: false });
           } catch (err) {
             set({ saving: false, error: errMsg(err) });
@@ -273,6 +315,7 @@ export const useModelConfigStore = create<ModelConfigState>()(
           try {
             await ipc.clearProviderSecret(id, kind);
             await refresh();
+            await get().loadConnectionMeta(id);
             set({ saving: false });
           } catch (err) {
             set({ saving: false, error: errMsg(err) });

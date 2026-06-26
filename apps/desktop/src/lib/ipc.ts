@@ -45,6 +45,7 @@ import type {
 } from "../bindings";
 import type { Format } from "../bindings/Format";
 import type { SecretKind } from "../bindings/SecretKind";
+import type { BedrockAuth } from "../bindings/BedrockAuth";
 
 export type Unlisten = () => void;
 
@@ -160,6 +161,15 @@ export interface FfIpc {
   /** Remove one stored secret for a connection; recomputes `hasKey` from what
    *  remains. Idempotent. */
   clearProviderSecret(connectionId: string, kind: SecretKind): Promise<void>;
+  /** Which `SecretKind`s are stored for a connection (#320), in `SecretKind::ALL`
+   *  order, so each Bedrock `SecretField` can render Stored/Clear off its own kind
+   *  instead of the aggregate `hasKey`. Presence only — no secret value is returned;
+   *  rejects on an unknown connection id. */
+  providerSecretPresence(connectionId: string): Promise<SecretKind[]>;
+  /** The Bedrock auth a connection resolves to right now (#320): the explicit pin,
+   *  or the `Auto` precedence winner (API key > profile > IAM keys). `null` for
+   *  non-Bedrock or unknown connections — lets the UI badge the active credential. */
+  resolvedBedrockAuth(connectionId: string): Promise<BedrockAuth | null>;
   /** Probe a connection end-to-end (defaults to the active one) for the settings
    *  "Test Connection" button. Resolves on a successful round-trip; rejects with a
    *  message to show on failure. Unlike `listModels`, the error is surfaced. */
@@ -469,6 +479,10 @@ class TauriIpc implements FfIpc {
     this.invoke<void>("set_provider_secret", { connectionId, kind, value });
   clearProviderSecret = (connectionId: string, kind: SecretKind) =>
     this.invoke<void>("clear_provider_secret", { connectionId, kind });
+  providerSecretPresence = (connectionId: string) =>
+    this.invoke<SecretKind[]>("provider_secret_presence", { connectionId });
+  resolvedBedrockAuth = (connectionId: string) =>
+    this.invoke<BedrockAuth | null>("resolved_bedrock_auth", { connectionId });
   testConnection = (id?: string) =>
     this.invoke<void>("test_connection", { id });
 
