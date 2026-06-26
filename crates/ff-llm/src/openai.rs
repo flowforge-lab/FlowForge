@@ -351,12 +351,8 @@ impl Provider for OpenAiProvider {
         let resp = builder
             .send()
             .await
-            .map_err(|e| LlmError::Transport(e.to_string()))?
-            .error_for_status()
-            .map_err(|e| LlmError::Api {
-                status: e.status().map(|s| s.as_u16()).unwrap_or(0),
-                message: e.to_string(),
-            })?;
+            .map_err(|e| LlmError::Transport(e.to_string()))?;
+        let resp = crate::error_for_status_with_body(resp).await?;
 
         // SSE frames are newline-delimited; reassemble lines across byte-chunk
         // boundaries, then decode each `data:` line into a Chunk.
@@ -391,12 +387,8 @@ impl Provider for OpenAiProvider {
         let resp = builder
             .send()
             .await
-            .map_err(|e| LlmError::Transport(e.to_string()))?
-            .error_for_status()
-            .map_err(|e| LlmError::Api {
-                status: e.status().map(|s| s.as_u16()).unwrap_or(0),
-                message: e.to_string(),
-            })?;
+            .map_err(|e| LlmError::Transport(e.to_string()))?;
+        let resp = crate::error_for_status_with_body(resp).await?;
         let list: ModelList = resp
             .json()
             .await
@@ -734,6 +726,83 @@ mod tests {
         match provider.test_connection("gpt-4o").await {
             Err(LlmError::Api { status, .. }) => assert_eq!(status, 500),
             other => panic!("expected Api 500, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn list_models_surfaces_error_body_on_4xx() {
+        // A provider 400 carries a diagnostic body (e.g. SiliconFlow
+        // `{"code":20015,"message":"Field required"}`). The body text must reach
+        // `LlmError::Api.message` rather than being discarded, so the user can
+        // see *why* the request was rejected.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .respond_with(
+                ResponseTemplate::new(400)
+                    .set_body_json(serde_json::json!({"code": 20015, "message": "Field required"})),
+            )
+            .mount(&server)
+            .await;
+        let provider = OpenAiProvider::new(server.uri(), Some("sk-test".into()));
+        match provider.list_models().await {
+            Err(LlmError::Api { status, message }) => {
+                assert_eq!(status, 400);
+                assert!(
+                    message.contains("Field required") && message.contains("20015"),
+                    "body not surfaced: {message:?}"
+                );
+            }
+            other => panic!("expected Api 400 with body, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn list_models_falls_back_to_reason_on_empty_body() {
+        // No body to surface -- the message must not be empty; fall back to the
+        // status's canonical reason so the error still reads sensibly.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&server)
+            .await;
+        let provider = OpenAiProvider::new(server.uri(), Some("sk-test".into()));
+        match provider.list_models().await {
+            Err(LlmError::Api { status, message }) => {
+                assert_eq!(status, 403);
+                assert!(!message.is_empty(), "message should fall back to reason");
+            }
+            other => panic!("expected Api 403, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn list_models_truncates_oversized_error_body() {
+        // A pathologically large error body must be bounded so it cannot bloat
+        // the surfaced message; truncation keeps the head and flags itself.
+        let server = MockServer::start().await;
+        let huge = "x".repeat(10_000);
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .respond_with(ResponseTemplate::new(400).set_body_string(huge))
+            .mount(&server)
+            .await;
+        let provider = OpenAiProvider::new(server.uri(), Some("sk-test".into()));
+        match provider.list_models().await {
+            Err(LlmError::Api { status, message }) => {
+                assert_eq!(status, 400);
+                assert!(
+                    message.ends_with("...[truncated]"),
+                    "expected truncation flag"
+                );
+                assert!(
+                    message.len() < 2_100,
+                    "message not bounded: {}",
+                    message.len()
+                );
+            }
+            other => panic!("expected Api 400, got {other:?}"),
         }
     }
 

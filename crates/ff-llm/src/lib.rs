@@ -198,6 +198,42 @@ impl LlmError {
     }
 }
 
+/// Like `reqwest::Response::error_for_status`, but on a non-2xx response it
+/// reads the body into `LlmError::Api.message` instead of discarding it. The
+/// surfaced body is what makes a provider's `{"code":...,"message":...}` 400
+/// diagnosable rather than a bare "api error (status 400)". On success the
+/// response is returned untouched and its body is left unread, so callers can
+/// still consume it as a stream.
+pub(crate) async fn error_for_status_with_body(
+    resp: reqwest::Response,
+) -> Result<reqwest::Response, LlmError> {
+    let status = resp.status();
+    if status.is_success() {
+        return Ok(resp);
+    }
+    let code = status.as_u16();
+    let mut message = resp.text().await.unwrap_or_default().trim().to_string();
+    const MAX: usize = 2048;
+    if message.len() > MAX {
+        let end = (0..=MAX)
+            .rev()
+            .find(|&i| message.is_char_boundary(i))
+            .unwrap_or(0);
+        message.truncate(end);
+        message.push_str("...[truncated]");
+    }
+    if message.is_empty() {
+        message = status
+            .canonical_reason()
+            .unwrap_or("request failed")
+            .to_string();
+    }
+    Err(LlmError::Api {
+        status: code,
+        message,
+    })
+}
+
 pub type ChunkStream = BoxStream<'static, Result<Chunk, LlmError>>;
 
 /// How a gateway expects prior-turn reasoning to be replayed on the assistant

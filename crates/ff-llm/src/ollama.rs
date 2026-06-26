@@ -246,12 +246,8 @@ impl Provider for OllamaProvider {
             .json(&body)
             .send()
             .await
-            .map_err(|e| LlmError::Transport(e.to_string()))?
-            .error_for_status()
-            .map_err(|e| LlmError::Api {
-                status: e.status().map(|s| s.as_u16()).unwrap_or(0),
-                message: e.to_string(),
-            })?;
+            .map_err(|e| LlmError::Transport(e.to_string()))?;
+        let resp = crate::error_for_status_with_body(resp).await?;
 
         // Ollama streams newline-delimited JSON objects. Reassemble lines across
         // byte-chunk boundaries, parsing each complete line into a Chunk. The
@@ -288,12 +284,8 @@ impl Provider for OllamaProvider {
             .get(format!("{}/api/tags", self.base_url))
             .send()
             .await
-            .map_err(|e| LlmError::Transport(e.to_string()))?
-            .error_for_status()
-            .map_err(|e| LlmError::Api {
-                status: e.status().map(|s| s.as_u16()).unwrap_or(0),
-                message: e.to_string(),
-            })?;
+            .map_err(|e| LlmError::Transport(e.to_string()))?;
+        let resp = crate::error_for_status_with_body(resp).await?;
         let list: TagList = resp
             .json()
             .await
