@@ -8,6 +8,7 @@
 
 import { create } from "zustand";
 import { ipc } from "@/lib/ipc";
+import type { MemoryChunkStat } from "@/bindings/MemoryChunkStat";
 import type { MemoryFileInfo } from "@/bindings/MemoryFileInfo";
 import type { MemoryOverview } from "@/bindings/MemoryOverview";
 
@@ -18,6 +19,10 @@ interface MemoryState {
   curatedBody: string | null;
   /** Daily file body by relPath, used only to derive JOURNAL previews. */
   journalBodies: Record<string, string>;
+  /** Per-chunk salience stats for the Salience surface (M6.2, #293). */
+  chunks: MemoryChunkStat[];
+  /** chunkKeys with an in-flight reset/pin mutation, for per-row busy state. */
+  chunkBusy: Record<string, boolean>;
   query: string;
   loading: boolean;
   error: string | null;
@@ -27,21 +32,37 @@ interface MemoryState {
   /** Durable facts written by the most recent flush. */
   lastFlushWrites: number;
 
-  /** Fetch list + overview + curated/daily bodies (on panel mount). */
+  /** Fetch list + overview + curated/daily bodies + chunk stats (on panel mount). */
   load: () => Promise<void>;
   setQuery: (q: string) => void;
   /** Footer "Reset to defaults" — clears the search only (no IPC writes). */
   resetSearch: () => void;
+  /** Reset (wake) a chunk: weight back to 1.0; re-pulls the authoritative stats. */
+  resetChunk: (chunkKey: string) => Promise<void>;
+  /** Pin/unpin a chunk: pinned holds weight at 1.0 and is never dormant. */
+  setPinned: (chunkKey: string, pinned: boolean) => Promise<void>;
   /** Record a `memory:flushed` event (wired in lib/events.ts). The Settings pane
    *  reloads on the bump so freshly-flushed content shows. */
   noteFlush: (writes: number) => void;
 }
 
-export const useMemoryStore = create<MemoryState>((set) => ({
+/** Remove a key from the busy map without mutating the original. */
+function clearBusy(
+  busy: Record<string, boolean>,
+  chunkKey: string,
+): Record<string, boolean> {
+  const next = { ...busy };
+  delete next[chunkKey];
+  return next;
+}
+
+export const useMemoryStore = create<MemoryState>((set, get) => ({
   files: [],
   overview: null,
   curatedBody: null,
   journalBodies: {},
+  chunks: [],
+  chunkBusy: {},
   query: "",
   loading: false,
   error: null,
@@ -51,9 +72,10 @@ export const useMemoryStore = create<MemoryState>((set) => ({
   load: async () => {
     set({ loading: true, error: null });
     try {
-      const [files, overview] = await Promise.all([
+      const [files, overview, chunks] = await Promise.all([
         ipc.listMemoryFiles(),
         ipc.memoryOverview(),
+        ipc.listMemoryChunks(),
       ]);
 
       // Curated body drives the category cards; a missing MEMORY.md is fine.
@@ -79,6 +101,7 @@ export const useMemoryStore = create<MemoryState>((set) => ({
         overview,
         curatedBody,
         journalBodies: Object.fromEntries(bodies),
+        chunks,
         loading: false,
       });
     } catch (e) {
@@ -91,6 +114,49 @@ export const useMemoryStore = create<MemoryState>((set) => ({
 
   setQuery: (query) => set({ query }),
   resetSearch: () => set({ query: "" }),
+
+  // Reset/pin never edit Markdown — they only change `chunk_stats`, so we re-pull
+  // the backend-authoritative snapshot rather than patching `weight`/`dormant`
+  // locally (the FE never re-derives those). Mirrors store/mcp.ts's IPC-then-
+  // reconcile pattern; per-row `chunkBusy` disables the controls while in flight.
+  // The `chunkBusy` check is also an internal re-entrancy guard, so a double-fire
+  // can't race even if a caller bypasses the UI's `disabled={busy}`.
+  resetChunk: async (chunkKey) => {
+    if (get().chunkBusy[chunkKey]) return;
+    set((s) => ({
+      chunkBusy: { ...s.chunkBusy, [chunkKey]: true },
+      error: null,
+    }));
+    try {
+      await ipc.resetMemoryChunk(chunkKey);
+      const chunks = await ipc.listMemoryChunks();
+      set((s) => ({ chunks, chunkBusy: clearBusy(s.chunkBusy, chunkKey) }));
+    } catch (e) {
+      set((s) => ({
+        error: e instanceof Error ? e.message : String(e),
+        chunkBusy: clearBusy(s.chunkBusy, chunkKey),
+      }));
+    }
+  },
+
+  setPinned: async (chunkKey, pinned) => {
+    if (get().chunkBusy[chunkKey]) return;
+    set((s) => ({
+      chunkBusy: { ...s.chunkBusy, [chunkKey]: true },
+      error: null,
+    }));
+    try {
+      await ipc.setMemoryChunkPinned(chunkKey, pinned);
+      const chunks = await ipc.listMemoryChunks();
+      set((s) => ({ chunks, chunkBusy: clearBusy(s.chunkBusy, chunkKey) }));
+    } catch (e) {
+      set((s) => ({
+        error: e instanceof Error ? e.message : String(e),
+        chunkBusy: clearBusy(s.chunkBusy, chunkKey),
+      }));
+    }
+  },
+
   noteFlush: (writes) =>
     set((s) => ({ flushCount: s.flushCount + 1, lastFlushWrites: writes })),
 }));

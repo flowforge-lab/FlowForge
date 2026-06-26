@@ -9,6 +9,7 @@
 // FE-shaped (derived presentation, not a wire contract): the backend exposes
 // whole-file Markdown, and this module is where we interpret it.
 
+import type { MemoryChunkStat } from "@/bindings/MemoryChunkStat";
 import type { MemoryFileInfo } from "@/bindings/MemoryFileInfo";
 import type { MemoryFileKind } from "@/bindings/MemoryFileKind";
 
@@ -203,4 +204,69 @@ export function formatMemoryFooter(
 ): string {
   const noun = fileCount === 1 ? "file" : "files";
   return `${fileCount} ${noun} · ${formatBytes(totalBytes)}`;
+}
+
+// ── Salience surface (M6.2, #293) ────────────────────────────────────────────
+// Presentation helpers over the backend-authoritative `MemoryChunkStat`. The
+// backend owns `weight` (effective, pin-aware) and `dormant`; these helpers only
+// shape that for the list row — they never re-derive the dormancy threshold.
+
+const ONE_DAY_MS = 86_400_000;
+
+/** Effective weight (0–1) → an integer 0–100 percentage for the `<Progress>` bar. */
+export function weightPercent(weight: number): number {
+  return Math.round(Math.min(1, Math.max(0, weight)) * 100);
+}
+
+/**
+ * Humanize a chunk's last-recalled time for the row's age line. The clock starts
+ * at first *recall*, not creation, so a chunk with no `chunk_stats` row reads
+ * `null` → "never recalled" (not an epoch timestamp). Buckets mirror the
+ * backend's `human_age_ms` tagging (#373) for consistency with `memory_search`.
+ */
+export function humanAge(
+  lastAccessedMs: number | null,
+  now: number = Date.now(),
+): string {
+  if (lastAccessedMs === null) return "never recalled";
+  const days = Math.floor((now - lastAccessedMs) / ONE_DAY_MS);
+  if (days <= 0) return "today";
+  if (days < 7) return `~${days} ${days === 1 ? "day" : "days"} ago`;
+  if (days < 35) {
+    const weeks = Math.round(days / 7);
+    return `~${weeks} ${weeks === 1 ? "week" : "weeks"} ago`;
+  }
+  if (days < 365) {
+    const months = Math.round(days / 30);
+    return `~${months} ${months === 1 ? "month" : "months"} ago`;
+  }
+  const years = Math.round(days / 365);
+  return `~${years} ${years === 1 ? "year" : "years"} ago`;
+}
+
+/**
+ * Order chunks for the Salience list: pinned first (the user held them), then by
+ * effective weight ascending so the coldest/dormant chunks — the ones a user
+ * might want to wake or prune from attention — surface to the top. Stable, pure.
+ */
+export function sortChunks(chunks: MemoryChunkStat[]): MemoryChunkStat[] {
+  return [...chunks].sort((a, b) => {
+    if (a.pinned !== b.pinned) return a.pinned ? -1 : 1;
+    return a.weight - b.weight;
+  });
+}
+
+/** Filter chunks by a substring query over the heading, preview, and relPath. */
+export function filterChunks(
+  chunks: MemoryChunkStat[],
+  query: string,
+): MemoryChunkStat[] {
+  const q = query.trim().toLowerCase();
+  if (q === "") return chunks;
+  return chunks.filter(
+    (c) =>
+      (c.heading?.toLowerCase().includes(q) ?? false) ||
+      c.preview.toLowerCase().includes(q) ||
+      c.relPath.toLowerCase().includes(q),
+  );
 }

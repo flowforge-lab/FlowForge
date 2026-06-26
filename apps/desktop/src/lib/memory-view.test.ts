@@ -1,16 +1,21 @@
 import { describe, expect, it } from "vitest";
 
+import type { MemoryChunkStat } from "@/bindings/MemoryChunkStat";
 import type { MemoryFileInfo } from "@/bindings/MemoryFileInfo";
 import {
   buildFiles,
   buildJournal,
   categoryMatches,
+  filterChunks,
   filterFiles,
   filterJournal,
   firstMeaningfulLine,
   formatBytes,
   formatMemoryFooter,
+  humanAge,
   parseCategories,
+  sortChunks,
+  weightPercent,
 } from "@/lib/memory-view";
 
 const CURATED = `# Memory
@@ -147,5 +152,83 @@ describe("memory-view — formatting", () => {
   it("formatMemoryFooter renders count + summed size, pluralized", () => {
     expect(formatMemoryFooter(3, 1536)).toBe("3 files · 1.5 KB");
     expect(formatMemoryFooter(1, 64)).toBe("1 file · 64 B");
+  });
+});
+
+describe("memory-view — salience helpers (M6.2, #293)", () => {
+  const chunk = (over: Partial<MemoryChunkStat>): MemoryChunkStat => ({
+    chunkKey: "k",
+    relPath: "MEMORY.md",
+    heading: null,
+    preview: "",
+    weight: 1,
+    accessCount: 0,
+    lastAccessedMs: null,
+    dormant: false,
+    pinned: false,
+    ...over,
+  });
+
+  it("weightPercent maps 0–1 to 0–100 and clamps out-of-range", () => {
+    expect(weightPercent(0)).toBe(0);
+    expect(weightPercent(0.123)).toBe(12);
+    expect(weightPercent(1)).toBe(100);
+    expect(weightPercent(1.5)).toBe(100);
+    expect(weightPercent(-0.2)).toBe(0);
+  });
+
+  it("humanAge renders 'never recalled' for a null timestamp", () => {
+    expect(humanAge(null)).toBe("never recalled");
+  });
+
+  it("humanAge buckets by elapsed time relative to now", () => {
+    const now = 1_000 * 86_400_000; // day 1000 in epoch-ms
+    const daysAgo = (d: number) => now - d * 86_400_000;
+    expect(humanAge(daysAgo(0), now)).toBe("today");
+    expect(humanAge(daysAgo(1), now)).toBe("~1 day ago");
+    expect(humanAge(daysAgo(3), now)).toBe("~3 days ago");
+    expect(humanAge(daysAgo(14), now)).toBe("~2 weeks ago");
+    expect(humanAge(daysAgo(180), now)).toBe("~6 months ago");
+    expect(humanAge(daysAgo(400), now)).toBe("~1 year ago");
+  });
+
+  it("sortChunks puts pinned first, then ascending weight (dormant surfaced)", () => {
+    const cold = chunk({ chunkKey: "cold", weight: 0.1, dormant: true });
+    const warm = chunk({ chunkKey: "warm", weight: 0.8 });
+    const pinned = chunk({ chunkKey: "pin", weight: 1, pinned: true });
+    const sorted = sortChunks([warm, pinned, cold]);
+    expect(sorted.map((c) => c.chunkKey)).toEqual(["pin", "cold", "warm"]);
+  });
+
+  it("sortChunks is pure — it does not mutate its input", () => {
+    const input = [
+      chunk({ chunkKey: "a", weight: 0.5 }),
+      chunk({ chunkKey: "b", weight: 0.1 }),
+    ];
+    const snapshot = input.map((c) => c.chunkKey);
+    sortChunks(input);
+    expect(input.map((c) => c.chunkKey)).toEqual(snapshot);
+  });
+
+  it("filterChunks matches heading, preview, or relPath", () => {
+    const chunks = [
+      chunk({ chunkKey: "a", heading: "Identity", preview: "role" }),
+      chunk({
+        chunkKey: "b",
+        relPath: "daily/2026-06-18.md",
+        preview: "shipped",
+      }),
+    ];
+    expect(filterChunks(chunks, "identity").map((c) => c.chunkKey)).toEqual([
+      "a",
+    ]);
+    expect(filterChunks(chunks, "shipped").map((c) => c.chunkKey)).toEqual([
+      "b",
+    ]);
+    expect(filterChunks(chunks, "2026-06").map((c) => c.chunkKey)).toEqual([
+      "b",
+    ]);
+    expect(filterChunks(chunks, "")).toHaveLength(2);
+    expect(filterChunks(chunks, "nope")).toHaveLength(0);
   });
 });

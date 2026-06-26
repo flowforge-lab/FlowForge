@@ -15,6 +15,8 @@ function reset() {
     overview: null,
     curatedBody: null,
     journalBodies: {},
+    chunks: [],
+    chunkBusy: {},
     query: "",
     loading: false,
     error: null,
@@ -94,5 +96,80 @@ describe("memory store (SET.8, #131)", () => {
     const s = useMemoryStore.getState();
     expect(s.error).toBe("offline");
     expect(s.loading).toBe(false);
+  });
+
+  it("load() populates per-chunk salience stats (M6.2, #293)", async () => {
+    await useMemoryStore.getState().load();
+    const { chunks } = useMemoryStore.getState();
+    expect(chunks.length).toBeGreaterThan(0);
+    // The mock seeds one dormant and one pinned chunk.
+    expect(chunks.some((c) => c.dormant)).toBe(true);
+    expect(chunks.some((c) => c.pinned)).toBe(true);
+  });
+
+  it("resetChunk wakes a dormant chunk back to full weight", async () => {
+    await useMemoryStore.getState().load();
+    const dormant = useMemoryStore
+      .getState()
+      .chunks.find((c) => c.dormant && !c.pinned);
+    expect(dormant).toBeTruthy();
+
+    await useMemoryStore.getState().resetChunk(dormant!.chunkKey);
+
+    const after = useMemoryStore
+      .getState()
+      .chunks.find((c) => c.chunkKey === dormant!.chunkKey);
+    expect(after?.weight).toBe(1);
+    expect(after?.dormant).toBe(false);
+    expect(after?.lastAccessedMs).not.toBeNull();
+    // Busy flag is cleared once the mutation settles.
+    expect(
+      useMemoryStore.getState().chunkBusy[dormant!.chunkKey],
+    ).toBeUndefined();
+  });
+
+  it("setPinned round-trips and a pinned chunk is never dormant", async () => {
+    await useMemoryStore.getState().load();
+    // Pick any unpinned chunk — the mock is a shared singleton, so an earlier
+    // test may have woken the dormant one; we only need pin to round-trip here.
+    const target = useMemoryStore.getState().chunks.find((c) => !c.pinned);
+    expect(target).toBeTruthy();
+
+    await useMemoryStore.getState().setPinned(target!.chunkKey, true);
+    let row = useMemoryStore
+      .getState()
+      .chunks.find((c) => c.chunkKey === target!.chunkKey);
+    expect(row?.pinned).toBe(true);
+    expect(row?.dormant).toBe(false);
+
+    await useMemoryStore.getState().setPinned(target!.chunkKey, false);
+    row = useMemoryStore
+      .getState()
+      .chunks.find((c) => c.chunkKey === target!.chunkKey);
+    expect(row?.pinned).toBe(false);
+  });
+
+  it("surfaces a mutation error and clears the busy flag", async () => {
+    await useMemoryStore.getState().load();
+    const key = useMemoryStore.getState().chunks[0].chunkKey;
+    vi.spyOn(ipc, "resetMemoryChunk").mockRejectedValue(
+      new Error("write failed"),
+    );
+
+    await useMemoryStore.getState().resetChunk(key);
+    const s = useMemoryStore.getState();
+    expect(s.error).toBe("write failed");
+    expect(s.chunkBusy[key]).toBeUndefined();
+  });
+
+  it("guards against re-entrant mutations on a busy chunk", async () => {
+    await useMemoryStore.getState().load();
+    const key = useMemoryStore.getState().chunks[0].chunkKey;
+    const spy = vi.spyOn(ipc, "setMemoryChunkPinned");
+
+    // Mark the row busy, then a second call should no-op (not hit the IPC).
+    useMemoryStore.setState({ chunkBusy: { [key]: true } });
+    await useMemoryStore.getState().setPinned(key, true);
+    expect(spy).not.toHaveBeenCalled();
   });
 });
