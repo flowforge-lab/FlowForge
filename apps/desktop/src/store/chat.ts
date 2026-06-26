@@ -5,6 +5,7 @@
 import { create } from "zustand";
 import { ipc } from "@/lib/ipc";
 import { autoTitle } from "@/lib/auto-title";
+import { isCappedNotice } from "@/store/capped-turn";
 import type {
   Attachment,
   ApprovalSafety,
@@ -73,6 +74,12 @@ interface ChatState {
    *  (#244 R6). Populated from TurnDoneEvent.tokenCount; drives a context-usage
    *  indicator. Undefined until the first turn completes with an estimate. */
   contextTokensBySession: Record<string, number>;
+  /** sessionId -> the last turn ended without a usable answer (the agent loop hit
+   *  the tool-call cap or stalled), so a one-click "Continue" affordance is offered
+   *  (#513). Set in `finishTurn` when the done turn streamed no content and the
+   *  refetched final message is a reason-bearing `[stopped: …]` notice; cleared the
+   *  moment the next turn starts (send / edit / cancel). */
+  cappedBySession: Record<string, boolean>;
   /** FE mirror of the backend's "Allow this session" sets, keyed by sessionId
    *  (#229). Drives the "session" badge on auto-approved follow-up calls; the
    *  backend stays the source of truth for the gate itself. */
@@ -222,6 +229,14 @@ function clearSessionTurnTiming(
   return { streamingBySession, turnStartBySession };
 }
 
+/** Drop a session's "offer Continue" flag (#513) — a new turn is starting, so any
+ *  prior capped/stopped state is stale. */
+function clearCapped(s: Pick<ChatState, "cappedBySession">, sessionId: string) {
+  if (!(sessionId in s.cappedBySession)) return null;
+  const { [sessionId]: _capped, ...cappedBySession } = s.cappedBySession;
+  return { cappedBySession };
+}
+
 const systemMessage = (sessionId: string, content: string): Message => ({
   id: crypto.randomUUID(),
   sessionId,
@@ -240,6 +255,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   toolStepsByMessage: {},
   reasoningByMessage: {},
   contextTokensBySession: {},
+  cappedBySession: {},
   sessionApprovedBySession: {},
   alwaysApproved: new Set<string>(),
   bootstrapError: null,
@@ -425,6 +441,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       createdAt: Date.now(),
     };
     set((s) => ({
+      ...clearCapped(s, sessionId),
       messagesBySession: {
         ...s.messagesBySession,
         [sessionId]: [...(s.messagesBySession[sessionId] ?? []), optimistic],
@@ -487,6 +504,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       // streaming assistant message away, and the backend cancels that turn before
       // re-running. Fresh turn timing then drives the pending/Stop indicator.
       const cleared = clearSessionTurnTiming(s, sessionId);
+      const cappedCleared = clearCapped(s, sessionId);
       const messagesBySession = {
         ...s.messagesBySession,
         [sessionId]: [...prior.slice(0, idx), edited],
@@ -506,6 +524,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
         Object.entries(s.turnStartByMessage).filter(([id]) => liveIds.has(id)),
       );
       return {
+        ...cappedCleared,
         messagesBySession,
         toolStepsByMessage,
         turnStartByMessage,
@@ -580,7 +599,10 @@ export const useChatStore = create<ChatState>((set, get) => ({
       return;
     }
     await ipc.cancelTurn(sessionId);
-    set((s) => clearSessionTurnTiming(s, sessionId));
+    set((s) => ({
+      ...clearSessionTurnTiming(s, sessionId),
+      ...clearCapped(s, sessionId),
+    }));
   },
 
   cancelActiveTurn: async () => {
@@ -648,6 +670,16 @@ export const useChatStore = create<ChatState>((set, get) => ({
   },
 
   finishTurn: (e) => {
+    // A turn that ends with no streamed content is the structural signature of
+    // the agent loop's cap/stall finalizer: it writes a `[stopped: …]` notice via
+    // set_message_content, which emits no token and isn't carried on turn:done, so
+    // the bubble is empty here until we re-pull history (#513). Capture that before
+    // the set so a later normal turn can't mask it.
+    const doneMsg = (get().messagesBySession[e.sessionId] ?? []).find(
+      (m) => m.id === e.messageId,
+    );
+    const endedEmpty = !doneMsg || doneMsg.content.trim() === "";
+
     set((s) => ({
       ...clearSessionTurnTiming(s, e.sessionId),
       sessions: s.sessions.map((sess) =>
@@ -661,6 +693,45 @@ export const useChatStore = create<ChatState>((set, get) => ({
           ? { ...s.contextTokensBySession, [e.sessionId]: e.tokenCount }
           : s.contextTokensBySession,
     }));
+
+    if (!endedEmpty) return;
+    // Re-pull authoritative history (the notice text only lives on the backend),
+    // then offer Continue if the final assistant message is a reason-bearing stop
+    // notice — never for a bare `[stopped]` (a deliberate user cancel).
+    void get()
+      .loadSession(e.sessionId)
+      .then(() => {
+        // Bail if a newer turn superseded this one in the window between turn:done
+        // and this refetch resolving (the user clicked Continue / sent meanwhile):
+        // `send` already cleared the flag, and re-setting it here would resurrect a
+        // stale flag that the next real-content turn early-returns past without
+        // clearing — a spurious lingering button (review nit). Two guards: an
+        // in-flight turn, and the done message no longer being the last assistant
+        // (a newer turn that already finished).
+        if (
+          get().turnStartBySession[e.sessionId] ||
+          get().streamingBySession[e.sessionId]
+        ) {
+          return;
+        }
+        const after = get().messagesBySession[e.sessionId] ?? [];
+        const lastAssistant = [...after]
+          .reverse()
+          .find((m) => m.role === "assistant");
+        if (
+          lastAssistant &&
+          lastAssistant.id === e.messageId &&
+          isCappedNotice(lastAssistant.content)
+        ) {
+          set((s) => ({
+            cappedBySession: { ...s.cappedBySession, [e.sessionId]: true },
+          }));
+        }
+      })
+      .catch(() => {
+        // Best-effort: a refetch failure just means no Continue affordance this
+        // time — the user can still type "continue" as before.
+      });
   },
 
   failTurn: (e) => {

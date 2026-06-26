@@ -720,6 +720,24 @@ export class MockIpc implements FfIpc {
     attachments?: Attachment[],
   ): Promise<string> {
     const user = this.append(sessionId, "user", content, attachments);
+    // Dev-only: `/cap` reproduces a turn that ends at the tool-call limit with no
+    // streamed answer — the agent loop's empty-content finalizer writes a
+    // `[stopped: …]` notice server-side without emitting tokens (#513). It's stored
+    // as history (surfaced on the next getMessages refetch) and the turn is closed
+    // with `turn:done`, so the one-click Continue affordance can be exercised here.
+    if (content.trim() === "/cap") {
+      const stopped = this.append(
+        sessionId,
+        "assistant",
+        "[stopped: reached tool-call limit]",
+      );
+      this.emit(this.doneListeners, {
+        sessionId,
+        messageId: stopped.id,
+        tokenCount: null,
+      });
+      return user.id;
+    }
     this.streamAssistant(sessionId);
     return user.id;
   }
