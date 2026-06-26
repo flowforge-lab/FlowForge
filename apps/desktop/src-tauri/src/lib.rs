@@ -18,9 +18,9 @@ use ff_core::events::{
 };
 use ff_core::{
     Attachment, BedrockAuth, Format, McpServerConfig, McpServerStatus, MemoryFileInfo,
-    MemoryFileKind, MemoryOverview, Message, Mode, Phenotype, ProviderConfig, ProviderConnection,
-    ProviderKind, ProviderRegistry, Role, SearchConfig, SecretKind, Session, SessionWorkspace,
-    Skill, SkillInfo, SkillManifest,
+    MemoryFileKind, MemoryOverview, Message, Mode, ModelSelection, Phenotype, ProviderConfig,
+    ProviderConnection, ProviderKind, ProviderRegistry, Role, SearchConfig, SecretKind, Session,
+    SessionWorkspace, Skill, SkillInfo, SkillManifest,
 };
 use ff_signals::SkillAggregate;
 use ff_tools::Safety;
@@ -1369,6 +1369,40 @@ fn set_session_mode(state: State<'_, Arc<AppState>>, session_id: String, mode: O
     state.set_session_mode(&session_id, mode);
 }
 
+/// Pin a single session's model, or clear it (`selection: None`) so it inherits its
+/// phenotype's model again (RFC 0005 §11 Phase D, #499). Per-pane, like
+/// `set_session_phenotype`. Errors on an unknown connection id so a stale UI cannot
+/// pin a phantom endpoint. The FE per-pane model chip (#523) calls this.
+#[tauri::command]
+fn set_session_model_selection(
+    state: State<'_, Arc<AppState>>,
+    session_id: String,
+    selection: Option<ModelSelection>,
+) -> CmdResult<()> {
+    state.set_session_model(&session_id, selection)?;
+    Ok(())
+}
+
+/// A session's explicit per-pane model selection, or `None` if it inherits its
+/// phenotype's model (#499). The raw binding, *not* the resolved selection -- use
+/// `resolve_model_selection` for what a turn actually runs on.
+#[tauri::command]
+fn get_session_model_selection(
+    state: State<'_, Arc<AppState>>,
+    session_id: String,
+) -> Option<ModelSelection> {
+    state.session_model(&session_id)
+}
+
+/// The resolved `(connection, model)` a turn for this session runs on, applying the
+/// RFC 0005 §11.2 three-tier precedence session > phenotype > global (#499). The FE
+/// renders this on the per-pane model chip so the displayed model matches what the
+/// next turn will actually use.
+#[tauri::command]
+fn resolve_model_selection(state: State<'_, Arc<AppState>>, session_id: String) -> ModelSelection {
+    state.resolve_model_selection(&session_id)
+}
+
 /// The global default autonomy mode (#265), inherited by sessions with no explicit
 /// binding. Factory value `Auto`.
 #[tauri::command]
@@ -1793,6 +1827,9 @@ pub fn run() {
             switch_phenotype,
             set_session_phenotype,
             set_session_mode,
+            set_session_model_selection,
+            get_session_model_selection,
+            resolve_model_selection,
             get_default_mode,
             set_default_mode,
             list_mcp_servers,

@@ -14,7 +14,8 @@ use std::path::Path;
 use std::sync::Mutex;
 
 use ff_core::{
-    auto_title, Attachment, Format, Message, Mode, Role, Session, SessionStatus, ToolCall,
+    auto_title, Attachment, Format, Message, Mode, ModelSelection, Role, Session, SessionStatus,
+    ToolCall,
 };
 use rusqlite::{params, Connection, OptionalExtension};
 
@@ -127,12 +128,13 @@ impl SessionStore {
             phenotype: None,
             mode: None,
             workspace: None,
+            model: None,
         };
         let conn = self.conn.lock().unwrap();
         let inserted = conn.execute(
             "INSERT INTO sessions
-                 (id, goal, title, summary, status, created_at, updated_at, phenotype, mode, workspace)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                 (id, goal, title, summary, status, created_at, updated_at, phenotype, mode, workspace, model)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 session.id,
                 session.goal,
@@ -144,6 +146,7 @@ impl SessionStore {
                 session.phenotype,
                 session.mode.as_ref().map(enum_to_text),
                 session.workspace,
+                session.model.as_ref().and_then(|m| serde_json::to_string(m).ok()),
             ],
         );
         if let Err(error) = &inserted {
@@ -157,7 +160,7 @@ impl SessionStore {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
             .prepare(
-                "SELECT id, goal, title, summary, status, created_at, updated_at, phenotype, mode, workspace
+                "SELECT id, goal, title, summary, status, created_at, updated_at, phenotype, mode, workspace, model
                  FROM sessions
                  ORDER BY updated_at DESC",
             )
@@ -453,6 +456,37 @@ impl SessionStore {
         .flatten()
     }
 
+    /// Bind (or clear, with `None`) this session's model selection (#499). The
+    /// selection is stored verbatim as JSON; the app layer validates the
+    /// connection id exists before calling. No-op for an unknown session. Mirrors
+    /// [`set_session_phenotype`](Self::set_session_phenotype).
+    pub fn set_session_model(&self, session_id: &str, model: Option<ModelSelection>) {
+        let conn = self.conn.lock().unwrap();
+        let json = model.as_ref().and_then(|m| serde_json::to_string(m).ok());
+        conn.execute(
+            "UPDATE sessions SET model = ?1, updated_at = ?2 WHERE id = ?3",
+            params![json, now_ms(), session_id],
+        )
+        .ok();
+    }
+
+    /// The session's bound model selection, or `None` if it inherits the
+    /// phenotype's model (or the session is unknown / the stored JSON is corrupt).
+    pub fn session_model(&self, session_id: &str) -> Option<ModelSelection> {
+        let conn = self.conn.lock().unwrap();
+        let json: Option<String> = conn
+            .query_row(
+                "SELECT model FROM sessions WHERE id = ?1",
+                params![session_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .ok()
+            .flatten()
+            .flatten();
+        json.and_then(|s| serde_json::from_str(&s).ok())
+    }
+
     pub fn set_message_content(
         &self,
         message_id: &str,
@@ -630,7 +664,7 @@ impl SessionStore {
         let conn = self.conn.lock().unwrap();
         let source = conn
             .query_row(
-                "SELECT id, goal, title, summary, status, created_at, updated_at, phenotype, mode, workspace
+                "SELECT id, goal, title, summary, status, created_at, updated_at, phenotype, mode, workspace, model
                  FROM sessions WHERE id = ?1",
                 params![session_id],
                 row_to_session,
@@ -653,6 +687,8 @@ impl SessionStore {
             mode: source.mode,
             // ...and its workspace, so the copy runs in the same cwd (#279).
             workspace: source.workspace.clone(),
+            // ...and its model selection, so the copy runs on the same model (#499).
+            model: source.model.clone(),
         };
         let tx = match conn.unchecked_transaction() {
             Ok(tx) => tx,
@@ -663,8 +699,8 @@ impl SessionStore {
         };
         let inserted = tx.execute(
             "INSERT INTO sessions
-                 (id, goal, title, summary, status, created_at, updated_at, phenotype, mode, workspace)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                 (id, goal, title, summary, status, created_at, updated_at, phenotype, mode, workspace, model)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 forked.id,
                 forked.goal,
@@ -676,6 +712,7 @@ impl SessionStore {
                 forked.phenotype,
                 forked.mode.as_ref().map(enum_to_text),
                 forked.workspace,
+                forked.model.as_ref().and_then(|m| serde_json::to_string(m).ok()),
             ],
         );
         if let Err(error) = &inserted {
@@ -753,7 +790,7 @@ impl SessionStore {
     pub fn get_session(&self, session_id: &str) -> Option<Session> {
         let conn = self.conn.lock().unwrap();
         conn.query_row(
-            "SELECT id, goal, title, summary, status, created_at, updated_at, phenotype, mode, workspace
+            "SELECT id, goal, title, summary, status, created_at, updated_at, phenotype, mode, workspace, model
              FROM sessions WHERE id = ?1",
             params![session_id],
             row_to_session,
@@ -942,12 +979,21 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
         )?;
         conn.pragma_update(None, "user_version", 5)?;
     }
+    if version < 6 {
+        // Phase D (RFC 0005 section 11, #499): per-session model selection. A
+        // resolved connection+model pair stored as JSON, NULL when the session
+        // inherits its phenotype's model. Added via ALTER so existing v5 databases
+        // gain the column without losing data.
+        conn.execute_batch("ALTER TABLE sessions ADD COLUMN model TEXT;")?;
+        conn.pragma_update(None, "user_version", 6)?;
+    }
     Ok(())
 }
 
 fn row_to_session(row: &rusqlite::Row) -> rusqlite::Result<Session> {
     let status: String = row.get("status")?;
     let mode: Option<String> = row.get("mode")?;
+    let model: Option<String> = row.get("model")?;
     Ok(Session {
         id: row.get("id")?,
         goal: row.get("goal")?,
@@ -959,6 +1005,7 @@ fn row_to_session(row: &rusqlite::Row) -> rusqlite::Result<Session> {
         phenotype: row.get("phenotype")?,
         mode: mode.as_deref().and_then(text_to_enum),
         workspace: row.get("workspace")?,
+        model: model.and_then(|s| serde_json::from_str(&s).ok()),
     })
 }
 
@@ -1258,7 +1305,7 @@ mod tests {
             .unwrap()
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 5);
+        assert_eq!(version, 6);
     }
 
     #[test]
@@ -1379,7 +1426,52 @@ mod tests {
             .unwrap()
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 5);
+        assert_eq!(version, 6);
+    }
+
+    #[test]
+    fn migration_v5_to_v6_preserves_session_and_adds_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sessions.db");
+        let sid = "sess-1";
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE sessions (
+                     id TEXT PRIMARY KEY, goal TEXT, title TEXT, summary TEXT,
+                     status TEXT NOT NULL, created_at INTEGER NOT NULL,
+                     updated_at INTEGER NOT NULL, phenotype TEXT, mode TEXT, workspace TEXT
+                 );",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO sessions (id, goal, status, created_at, updated_at)
+                 VALUES (?1, 'legacy goal', 'active', 0, 0)",
+                params![sid],
+            )
+            .unwrap();
+            conn.pragma_update(None, "user_version", 5).unwrap();
+        }
+
+        let store = SessionStore::open(&path).unwrap();
+        // The pre-existing row survives the ALTER with a NULL (inherited) model.
+        let s = store.get_session(sid).unwrap();
+        assert_eq!(s.goal.as_deref(), Some("legacy goal"));
+        assert!(s.model.is_none());
+        // ...and the new column is writable post-upgrade.
+        store.set_session_model(sid, Some(model_sel("openai-main", "gpt-4o")));
+        assert_eq!(
+            store.session_model(sid),
+            Some(model_sel("openai-main", "gpt-4o"))
+        );
+
+        let version: i64 = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 6);
     }
 
     #[test]
@@ -1562,6 +1654,55 @@ mod tests {
         assert_eq!(store.session_mode(&s.id), Some(Mode::Act));
     }
 
+    fn model_sel(connection: &str, model: &str) -> ModelSelection {
+        ModelSelection {
+            connection: connection.into(),
+            model: model.into(),
+        }
+    }
+
+    #[test]
+    fn new_session_has_no_model_binding() {
+        let store = SessionStore::new();
+        let s = store.create_session(None);
+        assert!(s.model.is_none());
+        assert!(store.session_model(&s.id).is_none());
+    }
+
+    #[test]
+    fn set_and_clear_session_model() {
+        let store = SessionStore::new();
+        let s = store.create_session(None);
+
+        let sel = model_sel("openai-main", "gpt-4o");
+        store.set_session_model(&s.id, Some(sel.clone()));
+        assert_eq!(store.session_model(&s.id), Some(sel));
+
+        store.set_session_model(&s.id, None);
+        assert!(store.session_model(&s.id).is_none());
+    }
+
+    #[test]
+    fn set_session_model_unknown_session_is_noop() {
+        let store = SessionStore::new();
+        store.set_session_model("nope", Some(model_sel("openai-main", "gpt-4o")));
+        assert!(store.session_model("nope").is_none());
+    }
+
+    #[test]
+    fn fork_session_copies_model_binding() {
+        let store = SessionStore::new();
+        let s = store.create_session(None);
+        let sel = model_sel("openai-main", "gpt-4o");
+        store.set_session_model(&s.id, Some(sel.clone()));
+
+        let forked = store.fork_session(&s.id).unwrap();
+        assert_eq!(forked.model, Some(sel.clone()));
+        // Changing the fork's binding does not touch the source.
+        store.set_session_model(&forked.id, Some(model_sel("anthropic", "claude")));
+        assert_eq!(store.session_model(&s.id), Some(sel));
+    }
+
     // --- SQLite-backed persistence (RFC 0012 / #276) ---
 
     #[test]
@@ -1579,6 +1720,7 @@ mod tests {
             store.set_session_phenotype(&s.id, Some("codon".into()));
             store.set_session_mode(&s.id, Some(Mode::Act));
             store.set_session_workspace(&s.id, Some("/work/proj".into()));
+            store.set_session_model(&s.id, Some(model_sel("openai-main", "gpt-4o")));
             let m = store.add_message(&s.id, Role::User, "remember me".into());
             mid = m.id.clone();
             store.add_message(&s.id, Role::Assistant, "noted".into());
@@ -1595,6 +1737,10 @@ mod tests {
         assert_eq!(store.session_phenotype(&sid).as_deref(), Some("codon"));
         assert_eq!(store.session_mode(&sid), Some(Mode::Act));
         assert_eq!(store.session_workspace(&sid).as_deref(), Some("/work/proj"));
+        assert_eq!(
+            store.session_model(&sid),
+            Some(model_sel("openai-main", "gpt-4o"))
+        );
 
         let msgs = store.get_messages(&sid);
         assert_eq!(msgs.len(), 2);
@@ -1704,7 +1850,7 @@ mod tests {
             .unwrap()
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 5);
+        assert_eq!(version, 6);
     }
 
     #[test]

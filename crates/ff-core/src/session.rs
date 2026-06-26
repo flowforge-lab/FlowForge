@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::Mode;
+use crate::{Mode, ModelSelection};
 use ts_rs::TS;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
@@ -52,6 +52,14 @@ pub struct Session {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub workspace: Option<String>,
+    /// The model this session runs on (RFC 0005 §11 Phase D, #499). A resolved
+    /// `(connection, model)` pair that overrides the phenotype's model for this
+    /// session only; `None` means "inherit the phenotype's model, falling back to
+    /// the global active selection" -- so a pane can pin its own model while
+    /// untouched sessions follow their phenotype.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub model: Option<ModelSelection>,
 }
 
 /// A session's working directory as surfaced to the frontend selector (#200,
