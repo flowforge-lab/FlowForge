@@ -987,7 +987,11 @@ pub async fn run_turn(
                 }
                 match item {
                     Ok(chunk) => {
-                        output_truncated = chunk.truncated;
+                        // OR-accumulate (not last-write): once a chunk reports the
+                        // output cap was hit, a later non-truncated chunk -- e.g. a
+                        // provider's trailing terminal frame -- must not silently reset
+                        // it and re-mislabel the cut-off tool call as invalid JSON (#528).
+                        output_truncated |= chunk.truncated;
                         if step_thinking && !chunk.reasoning_delta.is_empty() {
                             emitted_any = true;
                             reasoning_acc.push_str(&chunk.reasoning_delta);
@@ -3923,6 +3927,95 @@ mod tests {
         assert!(
             tool_reply.content.contains("truncated"),
             "a cap-truncated call should report truncation, got: {}",
+            tool_reply.content
+        );
+        assert!(
+            !tool_reply.content.contains("not valid JSON"),
+            "truncation must not be mislabeled as invalid JSON (#528), got: {}",
+            tool_reply.content
+        );
+    }
+
+    /// First turn: a truncated chunk (cut tool-call JSON, `done:false`) followed by
+    /// a *clean* terminal chunk (`done:true`, `truncated:false`) -- mirroring a
+    /// provider that streams a `length`/`MaxTokens` frame and then a separate
+    /// terminal frame. The trailing clean chunk must NOT reset the truncation flag
+    /// (OR-accumulate, not last-write), or the cut call re-mislabels as invalid
+    /// JSON -- the exact #528 regression the `|=` guards against. Second turn: a
+    /// real answer.
+    struct TruncatedThenCleanTerminal {
+        calls: Arc<AtomicUsize>,
+    }
+    #[async_trait]
+    impl Provider for TruncatedThenCleanTerminal {
+        async fn chat_stream(&self, _req: ChatRequest) -> Result<ChunkStream, LlmError> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            let chunks = if n == 0 {
+                vec![
+                    Ok(Chunk {
+                        tool_calls: vec![ToolCallDelta {
+                            index: 0,
+                            id: Some("call_cut".into()),
+                            name: Some("write".into()),
+                            arguments: r#"{"path": "docs/rfc.md"#.into(),
+                        }],
+                        done: false,
+                        truncated: true,
+                        ..Chunk::default()
+                    }),
+                    Ok(Chunk {
+                        done: true,
+                        truncated: false,
+                        ..Chunk::default()
+                    }),
+                ]
+            } else {
+                vec![Ok(Chunk {
+                    delta: "done in chunks".into(),
+                    done: true,
+                    ..Chunk::default()
+                })]
+            };
+            Ok(futures_util::stream::iter(chunks).boxed())
+        }
+    }
+
+    #[tokio::test]
+    async fn truncation_survives_a_trailing_clean_terminal_chunk() {
+        let store = SessionStore::new();
+        let s = store.create_session(None);
+        store.add_message(&s.id, Role::User, "write a long file".into());
+        let registry = ToolRegistry::new();
+        let root = std::env::current_dir().unwrap();
+        let approve = AlwaysApprove;
+        let calls = Arc::new(AtomicUsize::new(0));
+
+        let msg = run_turn(
+            &TruncatedThenCleanTerminal {
+                calls: calls.clone(),
+            },
+            &store,
+            &ctx(&registry, &root, &approve),
+            &s.id,
+            "mock",
+            None,
+            false,
+            CancelToken::new(),
+            |_| {},
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(msg.content, "done in chunks");
+
+        let tool_reply = store
+            .get_messages(&s.id)
+            .into_iter()
+            .find(|m| m.role == Role::Tool)
+            .expect("a tool result must exist for the truncated call");
+        assert!(
+            tool_reply.content.contains("truncated"),
+            "a trailing clean chunk must not reset the truncation flag (#528), got: {}",
             tool_reply.content
         );
         assert!(
