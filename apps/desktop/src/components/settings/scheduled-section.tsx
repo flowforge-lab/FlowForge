@@ -5,7 +5,7 @@ import { Input } from "@/components/ui/input";
 import { cn } from "@/lib/utils";
 import { useSettingsStore } from "@/store/settings";
 import { useScheduledStore } from "@/store/scheduled";
-import type { ScheduledTask } from "@/lib/scheduled";
+import type { ScheduledTask } from "@/bindings";
 
 const when = new Intl.DateTimeFormat(undefined, {
   weekday: "short",
@@ -13,8 +13,8 @@ const when = new Intl.DateTimeFormat(undefined, {
   minute: "2-digit",
 });
 
-function fmt(ms: number | null): string {
-  return ms === null ? "never" : when.format(ms);
+function fmt(ms: number | null | undefined): string {
+  return ms == null ? "never" : when.format(ms);
 }
 
 /**
@@ -103,7 +103,7 @@ function TaskCard({ task }: { task: ScheduledTask }) {
           <span className="truncate text-[13px] font-medium text-foreground">
             {task.name}
           </span>
-          {task.builtin ? (
+          {task.kind.kind === "builtin" ? (
             <span className="shrink-0 rounded-full bg-muted px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-wide text-muted-foreground">
               Builtin
             </span>
@@ -157,8 +157,10 @@ function NewTaskForm({ onDone }: { onDone: () => void }) {
     if (!canCreate) return;
     void create({
       name: name.trim(),
-      cron: "0 9 * * *", // placeholder; real cron editing is out of scope
-      cadenceLabel: cadence.trim(),
+      // Placeholder schedule + prompt; the real schedule builder is #541.
+      cron: "0 0 9 * * *", // 6-field (sec min hour dom mon dow): 9:00 AM daily
+      kind: { kind: "prompt", value: cadence.trim() },
+      safetyCeiling: "read_only",
     }).then(onDone);
   };
 

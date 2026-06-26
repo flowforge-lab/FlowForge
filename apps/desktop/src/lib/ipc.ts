@@ -8,7 +8,7 @@ import type { UpdateStatus, BackupResult } from "@/lib/about";
 import type { ControlConfig } from "@/lib/control";
 import type { MarketplaceSkill } from "@/lib/marketplace";
 import type { MarketplaceProfile } from "@/lib/profile-marketplace";
-import type { ScheduledTask, CreateScheduledTaskInput } from "@/lib/scheduled";
+import type { ScheduledTask, CreateScheduledTaskInput } from "@/bindings";
 import type { PhenotypeMcpUnavailableEvent } from "@/bindings";
 import type {
   Attachment,
@@ -298,16 +298,22 @@ export interface FfIpc {
   /** Search the (mock) profile marketplace. Empty query lists the full catalog. */
   searchProfileMarketplace(query: string): Promise<MarketplaceProfile[]>;
 
-  // Scheduled tasks (#132, SET.9). CONTRACT NOTE: FE-owned mock commands — there is
-  // no backend/ts-rs type or cron runner yet. `ScheduledTask` lives in
-  // `lib/scheduled.ts` (mirroring SET.5/7); `bindings/` is untouched. Replace with
-  // a generated binding + real commands when the scheduler backend lands — Refs #188.
-  /** All scheduled tasks (built-in + user-created). */
+  // Scheduled tasks (RFC 0017, #540). Real backend commands over the `ff-scheduled`
+  // store; `ScheduledTask` / `CreateScheduledTaskInput` are generated bindings. The
+  // cadence label and next-run are derived server-side (one source of truth) — the
+  // FE never computes or sends them. Firing is a separate concern (#542).
+  /** All scheduled tasks (built-in + user-created), newest first. */
   listScheduledTasks(): Promise<ScheduledTask[]>;
   /** Pause/resume a task; resolves with the updated task. Rejects an unknown id. */
   toggleScheduledTask(id: string): Promise<ScheduledTask>;
-  /** Create a user task; resolves with the stored task (server-assigned id). */
+  /** Create a user task; resolves with the stored task (server-assigned id +
+   *  derived cadence label / next run). Rejects an invalid cron expression. */
   createScheduledTask(input: CreateScheduledTaskInput): Promise<ScheduledTask>;
+  /** Delete a task. Rejects for built-in tasks (they ship with the app). */
+  deleteScheduledTask(id: string): Promise<void>;
+  /** The human cadence label a cron expression would produce (e.g. "Daily at
+   *  5:00 PM"), for the New-task form's Custom-cron preview. Rejects bad cron. */
+  previewCadence(cron: string): Promise<string>;
 
   // MCP servers (M4.4, RFC 0003). Enable/disable/add/remove write `mcp.json`; the
   // config watcher reconciles the supervisor, which then emits `mcp:status-changed`.
@@ -562,6 +568,10 @@ class TauriIpc implements FfIpc {
     this.invoke<ScheduledTask>("toggle_scheduled_task", { id });
   createScheduledTask = (input: CreateScheduledTaskInput) =>
     this.invoke<ScheduledTask>("create_scheduled_task", { input });
+  deleteScheduledTask = (id: string) =>
+    this.invoke<void>("delete_scheduled_task", { id });
+  previewCadence = (cron: string) =>
+    this.invoke<string>("preview_cadence", { cron });
 
   listMcpServers = () => this.invoke<McpServerStatus[]>("list_mcp_servers");
   restartMcpServer = (id: string) =>

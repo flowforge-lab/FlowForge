@@ -4,7 +4,7 @@
 
 import { create } from "zustand";
 import { ipc } from "@/lib/ipc";
-import type { CreateScheduledTaskInput, ScheduledTask } from "@/lib/scheduled";
+import type { CreateScheduledTaskInput, ScheduledTask } from "@/bindings";
 
 interface ScheduledState {
   tasks: ScheduledTask[];

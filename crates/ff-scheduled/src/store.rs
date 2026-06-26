@@ -247,9 +247,17 @@ fn builtin_to_text(a: BuiltinAction) -> &'static str {
     }
 }
 
-fn text_to_builtin(_s: &str) -> BuiltinAction {
-    // Only one variant today; decoding is total by construction.
-    BuiltinAction::MemoryConsolidate
+fn text_to_builtin(s: &str) -> BuiltinAction {
+    match s {
+        "memory_consolidate" => BuiltinAction::MemoryConsolidate,
+        // Only one variant today; an unknown tag means a forward-compat gap
+        // (a newer variant written by a later build). Warn rather than silently
+        // coerce, then fall back to the sole known action.
+        other => {
+            tracing::warn!(builtin = %other, "unknown builtin action; falling back to memory_consolidate");
+            BuiltinAction::MemoryConsolidate
+        }
+    }
 }
 
 fn ceiling_to_text(c: SafetyCeiling) -> &'static str {

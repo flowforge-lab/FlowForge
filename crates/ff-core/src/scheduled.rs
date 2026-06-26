@@ -124,6 +124,7 @@ pub enum RunStatus {
 #[serde(rename_all = "camelCase")]
 #[ts(export, export_to = "../../../apps/desktop/src/bindings/")]
 pub struct RunRecord {
+    #[ts(type = "number")]
     pub id: i64,
     pub task_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]

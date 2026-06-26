@@ -5,4 +5,4 @@ import type { RunStatus } from "./RunStatus";
  * A record of one fire, backing the ↗ open-session affordance and the audit
  * trail (#544 surfaces it; the type + store land here).
  */
-export type RunRecord = { id: bigint, taskId: string, sessionId?: string, firedMs: number, status: RunStatus, };
+export type RunRecord = { id: number, taskId: string, sessionId?: string, firedMs: number, status: RunStatus, };

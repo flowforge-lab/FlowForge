@@ -63,8 +63,10 @@ pub fn cadence_label(expr: &str) -> String {
     // 6-field: sec min hour dom mon dow
     if fields.len() == 6 {
         let (dom, dow) = (fields[3], fields[5]);
-        // Hourly: minute/hour wildcards collapse to "Hourly".
-        if fields[2] == "*" {
+        // Hourly: a wildcard hour with a concrete minute (e.g. `0 30 * * * *`).
+        // A wildcard minute too (`0 * * * * *`) is every-minute, not hourly, so
+        // it falls through to the generic label rather than being mislabeled.
+        if fields[2] == "*" && fields[1] != "*" {
             return "Hourly".to_string();
         }
         if dow == "*" && dom == "*" {
@@ -248,5 +250,7 @@ mod tests {
             "Monthly on day 17 at 5:00 PM"
         );
         assert_eq!(cadence_label(&hourly(0)), "Hourly");
+        // Every-minute is not hourly: a wildcard minute must not be mislabeled.
+        assert_ne!(cadence_label("0 * * * * *"), "Hourly");
     }
 }

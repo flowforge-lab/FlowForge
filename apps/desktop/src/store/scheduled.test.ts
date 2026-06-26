@@ -17,7 +17,7 @@ describe("useScheduledStore", () => {
     const { tasks } = useScheduledStore.getState();
     expect(tasks.length).toBeGreaterThanOrEqual(1);
     const builtin = tasks.find((t) => t.id === "memory-organizer");
-    expect(builtin?.builtin).toBe(true);
+    expect(builtin?.kind.kind).toBe("builtin");
   });
 
   it("toggle flips a task's paused state", async () => {
@@ -39,8 +39,9 @@ describe("useScheduledStore", () => {
 
     await useScheduledStore.getState().create({
       name: "Nightly Backup",
-      cron: "0 2 * * *",
-      cadenceLabel: "Daily at 2:00 AM",
+      cron: "0 0 2 * * *",
+      kind: { kind: "prompt", value: "Back up the database." },
+      safetyCeiling: "read_only",
     });
     const tasks = useScheduledStore.getState().tasks;
     expect(tasks.length).toBe(countBefore + 1);
