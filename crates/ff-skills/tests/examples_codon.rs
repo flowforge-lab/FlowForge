@@ -64,3 +64,31 @@ fn codegraph_skill_loads_and_requires_the_codegraph_server() {
         "the codegraph skill must document its tools"
     );
 }
+
+#[test]
+fn pr_review_skill_loads_and_stays_diff_scoped() {
+    // #426 RC2: a review skill for the codon ecosystem that overrides the
+    // persona's "codegraph first" push and keeps the agent scoped to the diff.
+    let (registry, errors) = SkillRegistry::load_dir(&examples_dir().join("skills"));
+    assert!(errors.is_empty(), "skills failed to load: {errors:?}");
+
+    let skill = registry
+        .get("pr-review")
+        .expect("pr-review skill present in the examples");
+    assert!(
+        skill.manifest.mcp.is_empty(),
+        "pr-review must not declare MCP dependencies -- it is pure guidance"
+    );
+    assert!(
+        skill.body.contains("overrides") && skill.body.contains("codegraph first"),
+        "pr-review must explicitly override the codon codegraph-first guidance"
+    );
+    assert!(
+        skill.body.contains("unified diff"),
+        "pr-review must tell the agent to fetch the diff"
+    );
+    assert!(
+        skill.body.contains("Do not spider the call graph"),
+        "pr-review must forbid call-graph traversal during a review"
+    );
+}
