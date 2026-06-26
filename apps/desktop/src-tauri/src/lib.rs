@@ -1345,25 +1345,6 @@ fn switch_phenotype(
     Ok(pheno)
 }
 
-/// Persist an edited phenotype to disk (RFC 0005 Phase D / #525). Accepts the whole
-/// `Phenotype` (lossless read-modify-write). The built-in `default` is immutable and
-/// rejected. When the edited phenotype is the one currently active, its skills and
-/// overrides are re-applied immediately and `skills:changed` is emitted so the FE
-/// active set updates. Returns the saved phenotype.
-#[tauri::command]
-fn update_phenotype(
-    state: State<'_, Arc<AppState>>,
-    app: tauri::AppHandle,
-    phenotype: Phenotype,
-) -> CmdResult<Phenotype> {
-    let pheno = state.update_phenotype(phenotype)?;
-    if pheno.name == state.active_phenotype().name {
-        emit_skills_changed(&app, &state);
-        emit_pheno_mcp_unavailable(&app, &state, &pheno.name);
-    }
-    Ok(pheno)
-}
-
 /// Bind a single session to a phenotype, or clear the binding (`name: None`) so it
 /// inherits the global active one (#246). Unlike `switch_phenotype`, this changes
 /// only the named session's Pheno — other panes are untouched — and persists
@@ -1846,7 +1827,6 @@ pub fn run() {
             list_phenotypes,
             get_phenotype,
             switch_phenotype,
-            update_phenotype,
             set_session_phenotype,
             set_session_mode,
             set_session_model_selection,

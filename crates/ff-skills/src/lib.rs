@@ -19,9 +19,7 @@ pub use install::{
     commit_install, install, prepare_install, uninstall, InstallError, StagedInstall,
 };
 pub use parse::parse_skill;
-pub use phenotype::{
-    default_phenotype, load_phenotypes, save_phenotype, PhenotypeError, DEFAULT_PHENOTYPE,
-};
+pub use phenotype::{default_phenotype, load_phenotypes, PhenotypeError, DEFAULT_PHENOTYPE};
 pub use registry::{first_executable, first_executable_recursive, SkillRegistry};
 pub use search::{search_skills, SkillHit};
 pub use version::{bump_patch, bump_skill, list_skill_versions, rollback_skill, VersionError};
