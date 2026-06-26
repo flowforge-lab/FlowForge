@@ -748,9 +748,11 @@ fn spawn_assistant_turn(state: Arc<AppState>, app: tauri::AppHandle, session_id:
             iter_ms,
             flushes,
             chars: u32::try_from(chars).unwrap_or(u32::MAX),
-            prefill_estimates,
-            tier1_fires,
-            tier2_fires,
+            // F1b fields are Option on the wire (#475 follow-up); the desktop
+            // always populates them.
+            prefill_estimates: Some(prefill_estimates),
+            tier1_fires: Some(tier1_fires),
+            tier2_fires: Some(tier2_fires),
         };
         tracing::info!(
             target: "turn_metrics",

@@ -112,7 +112,9 @@ pub struct TurnDoneEvent {
 /// memory flushes (each an extra provider round-trip); `chars` is the streamed
 /// assistant text, a coarse token-cost proxy; `prefill_estimates` is the per-
 /// round-trip projected request size and `tier1_fires`/`tier2_fires` count how
-/// often each compaction tier engaged (F1b, #441). Emitted once at turn end.
+/// often each compaction tier engaged (F1b, #441). The F1b fields are optional on
+/// the wire -- the desktop always populates them, but a non-desktop emitter may
+/// omit them cleanly (#475 follow-up). Emitted once at turn end.
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export, export_to = "../../../apps/desktop/src/bindings/")]
@@ -124,12 +126,25 @@ pub struct TurnStatsEvent {
     pub flushes: u32,
     pub chars: u32,
     /// F1b (#441): projected prefill-token estimate of each round-trip's outgoing
-    /// request (post-compaction wire), in iteration order.
-    pub prefill_estimates: Vec<u32>,
+    /// request (post-compaction wire), in iteration order. Omitted by emitters that
+    /// do not compute F1b telemetry.
+    ///
+    /// Invariant when present: `prefill_estimates.len() == round_trips` (one
+    /// estimate per round-trip). The frontend should assert this when it eventually
+    /// consumes `turn:stats` events.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub prefill_estimates: Option<Vec<u32>>,
     /// F1b (#441): iterations that engaged the Tier-1 extractive compaction pass.
-    pub tier1_fires: u32,
+    /// Omitted by emitters that do not compute F1b telemetry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub tier1_fires: Option<u32>,
     /// F1b (#441): iterations that engaged the Tier-2 abstractive cold-tail summary.
-    pub tier2_fires: u32,
+    /// Omitted by emitters that do not compute F1b telemetry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub tier2_fires: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
