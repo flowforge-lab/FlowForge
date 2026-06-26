@@ -35,6 +35,7 @@ export {
   FlaskConical,
   Folder,
   FolderPlus,
+  Gauge,
   // Aliased: a bare `Image` re-export would shadow the global DOM `Image`
   // constructor in any consumer (#284 §1 review nit).
   Image as ImageIcon,

@@ -2,6 +2,7 @@ import { Columns2, Rows2, X } from "@/components/ui/icon";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { ChatView } from "@/components/chat-view";
+import { ContextGauge } from "@/components/context-gauge";
 import { InputBar } from "@/components/input-bar";
 import { PhenoSelector } from "@/components/pheno-selector";
 import { useChatStore } from "@/store/chat";
@@ -53,7 +54,10 @@ export function SessionPane({
             {title}
           </span>
         </div>
-        <div className="flex shrink-0 items-center gap-0.5">
+        <div className="flex shrink-0 items-center gap-1">
+          {/* Estimated context usage for this session (#282). Self-hides until
+              the first turn completes with an estimate. */}
+          <ContextGauge sessionId={sessionId} />
           {/* Fork: duplicate this pane's session into the new pane (#149). */}
           <Button
             variant="ghost"
