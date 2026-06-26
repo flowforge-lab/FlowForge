@@ -17,6 +17,7 @@ import type {
   ProviderConnection,
   ProviderRegistry,
   ProviderKind,
+  ModelSelection,
   SearchConfig,
   SearchBackend,
   Session,
@@ -266,6 +267,26 @@ export interface FfIpc {
    *  panes are untouched. Rejects an unknown phenotype name. Used by the pane Pheno
    *  selector (#245) to make a pane's phenotype truly per-session. */
   setSessionPhenotype(sessionId: string, name: string | null): Promise<void>;
+
+  // Per-session model selection (RFC 0005 §11.2, Phase D; #499). A per-pane
+  // override over the phenotype/global tiers, mirroring the set_session_phenotype
+  // + autonomy-mode (#265) precedent (global default + per-session override +
+  // inherit-when-None). `ModelSelection` already exists from Phase C; capabilities
+  // are derived from (kind, model), never stored on the selection (§11.3).
+  /** Bind a single session (pane) to a `ModelSelection`, or clear it (`null`) so it
+   *  inherits the phenotype/global tiers. Rejects an unknown connection id. */
+  setSessionModelSelection(
+    sessionId: string,
+    selection: ModelSelection | null,
+  ): Promise<void>;
+  /** The raw per-session override, or `null` when the session inherits — drives the
+   *  chip's "overridden / clear" affordance. */
+  getSessionModelSelection(sessionId: string): Promise<ModelSelection | null>;
+  /** The authoritative resolved pair for a session: session ?? phenotype ?? global
+   *  (§11.2). Wraps the backend resolver so the FE never duplicates it; drives the
+   *  per-pane model chip's label. */
+  resolveModelSelection(sessionId: string): Promise<ModelSelection>;
+
   // CONTRACT NOTE (SET.7): FE-owned mock command — no backend/ts-rs binding for a
   // remote profile catalog exists yet. `MarketplaceProfile` lives in
   // `lib/profile-marketplace.ts` (mirroring SET.5's `MarketplaceSkill`);
@@ -519,6 +540,17 @@ class TauriIpc implements FfIpc {
     this.invoke<Phenotype>("switch_phenotype", { name });
   setSessionPhenotype = (sessionId: string, name: string | null) =>
     this.invoke<void>("set_session_phenotype", { sessionId, name });
+  setSessionModelSelection = (
+    sessionId: string,
+    selection: ModelSelection | null,
+  ) =>
+    this.invoke<void>("set_session_model_selection", { sessionId, selection });
+  getSessionModelSelection = (sessionId: string) =>
+    this.invoke<ModelSelection | null>("get_session_model_selection", {
+      sessionId,
+    });
+  resolveModelSelection = (sessionId: string) =>
+    this.invoke<ModelSelection>("resolve_model_selection", { sessionId });
   searchProfileMarketplace = (query: string) =>
     this.invoke<MarketplaceProfile[]>("search_profile_marketplace", { query });
   listScheduledTasks = () =>
