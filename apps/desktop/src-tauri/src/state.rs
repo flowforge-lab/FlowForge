@@ -10,8 +10,9 @@ use ff_agent::{
     ContextPressureEstimator, MemoryFlush, ProxyTokenEstimator, DEFAULT_FLUSH_AT_FRACTION,
 };
 use ff_core::{
-    BedrockAuth, McpServerState, McpServerStatus, Mode, ModelSelection, Phenotype, ProviderConfig,
-    ProviderConnection, ProviderKind, ProviderRegistry, SearchConfig, SecretKind,
+    model_supports_documents, model_supports_vision, BedrockAuth, McpServerState, McpServerStatus,
+    Mode, ModelSelection, Phenotype, ProviderConfig, ProviderConnection, ProviderKind,
+    ProviderRegistry, ResolvedModel, SearchConfig, SecretKind,
 };
 use ff_llm::{
     reasoning_control, wire_dialect, BedrockCreds, BedrockProvider, OllamaProvider, OpenAiProvider,
@@ -124,29 +125,32 @@ impl ApprovalRegistry {
 /// Builds a fresh [`Provider`] from a [`ProviderConnection`]. Called once per turn
 /// so a runtime provider switch takes effect on the next message — there is no
 /// shared, mutable provider to swap, only the persisted registry.
-fn build_provider(conn: &ProviderConnection) -> Box<dyn Provider> {
+fn build_provider(conn: &ProviderConnection, model: &str) -> Box<dyn Provider> {
     let base_url = conn.resolved_base_url().to_string();
     // Per-gateway wire-dialect choices (#375). Resolved once here so the per-turn
     // hot path only carries a `Copy` struct; defaults are no-ops for vanilla
     // OpenAI / candle-vllm / Ollama / LM Studio.
-    let dialect = wire_dialect(conn.kind, conn.vendor.as_deref(), &conn.model);
+    let dialect = wire_dialect(conn.kind, conn.vendor.as_deref(), model);
     // Reasoning depth dial (#394/#395). The per-connection user override now
     // drives it: it both caps SiliconFlow's auto-`max` escalation and bounds
     // Bedrock/Anthropic extended thinking. Medium for pre-#395 registries.
     let effort = conn.reasoning_effort;
     // OpenAI-wire reasoning controls (#394). No-op except for the SiliconFlow
     // gateway; native providers take the effort dial directly below.
-    let reasoning = reasoning_control(conn.kind, &conn.model, effort);
+    let reasoning = reasoning_control(conn.kind, model, effort);
+    // Attachment capabilities are derived from the resolved `(kind, model)` (RFC
+    // 0005 §11.3), never a stored connection flag, so a per-session model override
+    // is gated by the model actually running. Fail-closed on unknown models.
+    let vision = model_supports_vision(conn.kind, model);
+    let documents = model_supports_documents(conn.kind, model);
     match conn.kind {
         ProviderKind::CandleVllm => Box::new(
             OpenAiProvider::new(base_url, None)
-                .with_vision(conn.supports_vision)
+                .with_vision(vision)
                 .with_dialect(dialect)
                 .with_reasoning_control(reasoning),
         ),
-        ProviderKind::Ollama => {
-            Box::new(OllamaProvider::new(base_url).with_vision(conn.supports_vision))
-        }
+        ProviderKind::Ollama => Box::new(OllamaProvider::new(base_url).with_vision(vision)),
         // Bedrock resolves credentials by auth mode, pulling secret material from the
         // OS keychain here so the provider crate stays keychain-free (#202 PR-2).
         ProviderKind::Bedrock => {
@@ -183,8 +187,8 @@ fn build_provider(conn: &ProviderConnection) -> Box<dyn Provider> {
             };
             Box::new(
                 BedrockProvider::new(region, creds)
-                    .with_vision(conn.supports_vision)
-                    .with_documents(conn.supports_documents)
+                    .with_vision(vision)
+                    .with_documents(documents)
                     .with_reasoning_effort(effort),
             )
         }
@@ -194,7 +198,7 @@ fn build_provider(conn: &ProviderConnection) -> Box<dyn Provider> {
             let key = crate::secrets::get(conn.id.as_str(), SecretKind::ApiKey);
             Box::new(
                 OpenAiProvider::new(base_url, key)
-                    .with_vision(conn.supports_vision)
+                    .with_vision(vision)
                     .with_dialect(dialect)
                     .with_reasoning_control(reasoning),
             )
@@ -205,7 +209,7 @@ fn build_provider(conn: &ProviderConnection) -> Box<dyn Provider> {
             let key = crate::secrets::get(conn.id.as_str(), SecretKind::ApiKey);
             Box::new(
                 OpenAiProvider::new(base_url, key)
-                    .with_vision(conn.supports_vision)
+                    .with_vision(vision)
                     .with_dialect(dialect)
                     .with_reasoning_control(reasoning),
             )
@@ -267,8 +271,6 @@ fn config_to_connection(config: ProviderConfig) -> ProviderConnection {
         // Carry the depth dial through migration; a legacy `provider.json` without
         // the field deserializes to Medium (`#[serde(default)]`), same as before.
         reasoning_effort: config.reasoning_effort,
-        supports_vision: false,
-        supports_documents: false,
         region: None,
         auth_mode: None,
         aws_profile: None,
@@ -377,7 +379,7 @@ fn load_or_migrate_registry_at(
     reg_path: Option<PathBuf>,
     cfg_path: Option<PathBuf>,
 ) -> ProviderRegistry {
-    let mut registry = match read_registry_file(reg_path.as_deref()) {
+    let registry = match read_registry_file(reg_path.as_deref()) {
         RegistryRead::Loaded(registry) => registry,
         // Only a genuinely absent registry falls through to legacy migration; a
         // quarantined (corrupt) one seeds a clean default so stale legacy state is
@@ -390,10 +392,6 @@ fn load_or_migrate_registry_at(
             .unwrap_or_default(),
         RegistryRead::Corrupt => ProviderRegistry::default(),
     };
-    // OR-upgrade `supports_vision` from the model capability map so older saves
-    // (which always persisted `false`) reflect the model'"'"'s actual capability for
-    // the FE attach gate (#408). Idempotent; explicit `true` is preserved.
-    registry.normalize_capabilities();
     registry
 }
 
@@ -1388,13 +1386,19 @@ impl AppState {
 
     /// Build a provider + model snapshot from the active connection for one turn.
     pub fn build_provider(&self) -> (Box<dyn Provider>, String) {
-        self.build_provider_for(None)
+        self.build_provider_for(None, None)
     }
 
     /// Build a provider + model snapshot for a specific connection (`None` = the
-    /// active one). Used by `list_models(id?)` to probe a connection the user is
-    /// editing without switching the active one.
-    pub fn build_provider_for(&self, id: Option<&str>) -> (Box<dyn Provider>, String) {
+    /// active one) running `model` (`None` = the connection's own default model).
+    /// `send_message` passes the *resolved* model so the provider's wire-strip
+    /// capabilities match the model actually running (RFC 0005 §11.3); `list_models`
+    /// probes a connection with `None`. Returns the provider + the model it runs.
+    pub fn build_provider_for(
+        &self,
+        id: Option<&str>,
+        model: Option<&str>,
+    ) -> (Box<dyn Provider>, String) {
         let conn = {
             let reg = self.registry.lock().unwrap();
             match id {
@@ -1403,7 +1407,8 @@ impl AppState {
             }
             .unwrap_or_else(|| active_connection_or_default(&reg))
         };
-        (build_provider(&conn), conn.model)
+        let resolved_model = model.unwrap_or(&conn.model).to_string();
+        (build_provider(&conn, &resolved_model), resolved_model)
     }
 
     /// Resolve the `(connection, model)` for a turn using RFC 0005 §11.2 three-tier
@@ -1413,21 +1418,40 @@ impl AppState {
     /// phenotype binding over the globally active connection. `model` falls back to the
     /// *resolved connection's* own model, never a foreign tier's, so a phenotype model
     /// override can never ride the wrong endpoint -- the latent bug in RFC 0005 §11.1.
-    pub fn resolve_model_selection(&self, session_id: &str) -> ModelSelection {
-        if let Some(model) = self.store.session_model(session_id) {
-            return model;
-        }
-        let pheno = self.session_phenotype(session_id);
-        let reg = self.registry.lock().unwrap();
-        let connection = pheno.provider.clone().unwrap_or_else(|| reg.active.clone());
-        let model = pheno.model.clone().unwrap_or_else(|| {
+    pub fn resolve_model_selection(&self, session_id: &str) -> ResolvedModel {
+        let (connection, model) = if let Some(sel) = self.store.session_model(session_id) {
+            (sel.connection, sel.model)
+        } else {
+            let pheno = self.session_phenotype(session_id);
+            let reg = self.registry.lock().unwrap();
+            let connection = pheno.provider.clone().unwrap_or_else(|| reg.active.clone());
+            let model = pheno.model.clone().unwrap_or_else(|| {
+                reg.connections
+                    .iter()
+                    .find(|c| c.id == connection)
+                    .map(|c| c.model.clone())
+                    .unwrap_or_else(|| active_connection_or_default(&reg).model)
+            });
+            (connection, model)
+        };
+        // Derive attachment caps from the resolved `(kind, model)` (RFC 0005 §11.3),
+        // single-sourcing them at the resolution point. Fail-closed when the
+        // connection dangles (no kind -> no caps), matching the gate's fail-closed.
+        let kind = {
+            let reg = self.registry.lock().unwrap();
             reg.connections
                 .iter()
                 .find(|c| c.id == connection)
-                .map(|c| c.model.clone())
-                .unwrap_or_else(|| active_connection_or_default(&reg).model)
-        });
-        ModelSelection { connection, model }
+                .map(|c| c.kind)
+        };
+        let supports_vision = kind.is_some_and(|k| model_supports_vision(k, &model));
+        let supports_documents = kind.is_some_and(|k| model_supports_documents(k, &model));
+        ResolvedModel {
+            connection,
+            model,
+            supports_vision,
+            supports_documents,
+        }
     }
 
     pub fn register_cancel(&self, session_id: &str, token: CancelToken) {
@@ -2710,6 +2734,52 @@ mod tests {
         assert_eq!(sel.model, "pinned-model");
     }
 
+    // RFC 0005 §11.3 (#525 PR C): attachment caps are derived from the *resolved*
+    // `(kind, model)`, so a per-session model override is gated by the model it runs.
+    #[test]
+    fn resolved_caps_follow_session_override_model() {
+        let state = AppState::with_registry(ProviderRegistry::default());
+        let s = state.store.create_session(None);
+        // Unbound: active candle-vllm @ Qwen3-4B is text-only.
+        let base = state.resolve_model_selection(&s.id);
+        assert!(!base.supports_vision);
+        // Pin the session to a vision-capable Ollama model; caps follow the override.
+        state
+            .set_session_model(
+                &s.id,
+                Some(ModelSelection {
+                    connection: "ollama".into(),
+                    model: "llama3.2-vision".into(),
+                }),
+            )
+            .unwrap();
+        let sel = state.resolve_model_selection(&s.id);
+        assert_eq!(sel.connection, "ollama");
+        assert!(sel.supports_vision, "vision tag => derived supports_vision");
+        assert!(!sel.supports_documents, "ollama wire has no document block");
+    }
+
+    #[test]
+    fn resolved_caps_fail_closed_when_connection_missing() {
+        let state = AppState::with_registry(ProviderRegistry::default());
+        // A phenotype bound to a connection that does not exist (e.g. since removed),
+        // with a model name that *would* be vision-capable on a real connection.
+        state.apply_phenotype(Phenotype {
+            name: "rust".into(),
+            skills: vec![],
+            model: Some("llama3.2-vision".into()),
+            persona: None,
+            max_iterations: None,
+            provider: Some("ghost-conn".into()),
+        });
+        let s = state.store.create_session(None);
+        let sel = state.resolve_model_selection(&s.id);
+        assert_eq!(sel.connection, "ghost-conn");
+        // No kind to scope the capability lookup -> fail closed, matching the gate.
+        assert!(!sel.supports_vision);
+        assert!(!sel.supports_documents);
+    }
+
     #[test]
     fn set_session_model_rejects_unknown_connection() {
         let state = AppState::with_registry(ProviderRegistry::default());
@@ -2902,8 +2972,6 @@ mod tests {
                 has_key: false,
                 thinking: true,
                 reasoning_effort: ReasoningEffort::default(),
-                supports_vision: false,
-                supports_documents: false,
                 region: None,
                 auth_mode: None,
                 aws_profile: None,
@@ -3017,7 +3085,7 @@ mod tests {
 
         conn.base_url = Some(server.uri());
         let model = conn.model.clone();
-        let provider = super::build_provider(&conn);
+        let provider = super::build_provider(&conn, &conn.model);
         let req = ChatRequest {
             model,
             messages: vec![ChatMessage::text("user", "hi")],
@@ -3040,8 +3108,6 @@ mod tests {
             has_key: false,
             thinking: true,
             reasoning_effort: effort,
-            supports_vision: false,
-            supports_documents: false,
             region: None,
             auth_mode: None,
             aws_profile: None,
@@ -3097,8 +3163,6 @@ mod tests {
                     has_key: false,
                     thinking: true,
                     reasoning_effort: ReasoningEffort::default(),
-                    supports_vision: false,
-                    supports_documents: false,
                     region: None,
                     auth_mode: None,
                     aws_profile: None,
@@ -3114,8 +3178,6 @@ mod tests {
                     has_key: false,
                     thinking: false,
                     reasoning_effort: ReasoningEffort::default(),
-                    supports_vision: false,
-                    supports_documents: false,
                     region: Some("us-east-2".into()),
                     auth_mode: Some(BedrockAuth::Profile),
                     aws_profile: Some("bedrock-profile".into()),
@@ -3340,8 +3402,6 @@ mod tests {
             has_key: false,
             thinking: true,
             reasoning_effort: ReasoningEffort::default(),
-            supports_vision: false,
-            supports_documents: false,
             region: None,
             auth_mode: None,
             aws_profile: None,
@@ -3430,8 +3490,6 @@ mod tests {
             has_key: false,
             thinking: false,
             reasoning_effort: ReasoningEffort::default(),
-            supports_vision: false,
-            supports_documents: false,
             region: None,
             auth_mode: None,
             aws_profile: None,
@@ -3491,8 +3549,6 @@ mod tests {
             has_key: false,
             thinking: false,
             reasoning_effort: ReasoningEffort::default(),
-            supports_vision: false,
-            supports_documents: false,
             region: Some("us-east-1".into()),
             auth_mode,
             aws_profile: None,

@@ -290,19 +290,6 @@ pub struct ProviderConnection {
     /// [`ReasoningEffort::Medium`].
     #[serde(default)]
     pub reasoning_effort: ReasoningEffort,
-    /// Whether this connection's model can accept image/document attachments
-    /// (multimodal, #332). Drives the composer attach-button gate (FE-4) and the
-    /// backend safety strip (a non-vision connection never emits a raw attachments
-    /// field). Defaults false; opted in per connection in settings.
-    #[serde(default)]
-    pub supports_vision: bool,
-    /// Whether this connection's model can accept *document* attachments
-    /// (PDF/DOCX/CSV/…, #504). Distinct from [`supports_vision`]: a Bedrock
-    /// text-only model reads documents but has no vision, and an OpenAI vision
-    /// model cannot take documents. Drives the composer doc attach-gate and the
-    /// backend `Document` strip independently of vision. Defaults false.
-    #[serde(default)]
-    pub supports_documents: bool,
     /// AWS region for a Bedrock connection (e.g. `"us-east-1"`); the provider
     /// derives `bedrock-runtime.<region>.amazonaws.com` from it. `None` for
     /// non-Bedrock kinds.
@@ -387,6 +374,23 @@ pub struct ModelSelection {
     pub model: String,
 }
 
+/// A *resolved* model selection plus the capabilities derived from it (RFC 0005
+/// §11.3). `connection` + `model` are the resolved pair (after the session,
+/// phenotype, then global precedence); `supports_vision` and `supports_documents`
+/// are derived from the resolved `(kind, model)` via [`model_supports_vision`] and
+/// [`model_supports_documents`], never stored on a connection. This single-sources
+/// attachment capability at the resolution point so a per-session model override is
+/// gated by the model it actually runs, not the connection's default model.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "../../../apps/desktop/src/bindings/")]
+pub struct ResolvedModel {
+    pub connection: ConnectionId,
+    pub model: String,
+    pub supports_vision: bool,
+    pub supports_documents: bool,
+}
+
 impl ProviderRegistry {
     /// The currently selected connection, or `None` if `active` dangles (which
     /// the registry invariants forbid, but callers should degrade gracefully).
@@ -425,33 +429,11 @@ impl ProviderRegistry {
         if conn.id.trim().is_empty() {
             conn.id = self.derive_id(&conn);
         }
-        // OR-upgrade `supports_vision` from the model capability map so a
-        // freshly-saved connection on a known vision-capable model un-gates
-        // attachments without a manual settings toggle. Never downgrades an
-        // explicit `true`. See [`model_supports_vision`].
-        conn.supports_vision =
-            conn.supports_vision || model_supports_vision(conn.kind, &conn.model);
-        conn.supports_documents =
-            conn.supports_documents || model_supports_documents(conn.kind, &conn.model);
         match self.connections.iter_mut().find(|c| c.id == conn.id) {
             Some(slot) => *slot = conn.clone(),
             None => self.connections.push(conn.clone()),
         }
         conn
-    }
-
-    /// Apply [`model_supports_vision`] to every connection, OR'"'"'ing the inferred
-    /// capability into the stored flag. Idempotent and never downgrades an
-    /// explicit `true`. Callers should run this once after loading a persisted
-    /// registry so older saves (which never set `supportsVision`) reflect the
-    /// model'"'"'s actual capability for the FE attach gate (#408).
-    pub fn normalize_capabilities(&mut self) {
-        for conn in &mut self.connections {
-            conn.supports_vision =
-                conn.supports_vision || model_supports_vision(conn.kind, &conn.model);
-            conn.supports_documents =
-                conn.supports_documents || model_supports_documents(conn.kind, &conn.model);
-        }
     }
 
     /// Remove a connection by id. `Err` when it is the last one. If the removed
@@ -519,8 +501,6 @@ impl Default for ProviderRegistry {
             has_key: false,
             thinking: true,
             reasoning_effort: ReasoningEffort::default(),
-            supports_vision: false,
-            supports_documents: false,
             region: None,
             auth_mode: None,
             aws_profile: None,
@@ -536,8 +516,6 @@ impl Default for ProviderRegistry {
             has_key: false,
             thinking: true,
             reasoning_effort: ReasoningEffort::default(),
-            supports_vision: false,
-            supports_documents: false,
             region: None,
             auth_mode: None,
             aws_profile: None,
@@ -630,8 +608,6 @@ mod tests {
             has_key: false,
             thinking: true,
             reasoning_effort: ReasoningEffort::default(),
-            supports_vision: false,
-            supports_documents: false,
             region: None,
             auth_mode: None,
             aws_profile: None,
@@ -745,8 +721,6 @@ mod tests {
             has_key: false,
             thinking: true,
             reasoning_effort: ReasoningEffort::default(),
-            supports_vision: false,
-            supports_documents: false,
             region: None,
             auth_mode: None,
             aws_profile: None,
@@ -862,27 +836,6 @@ mod tests {
     }
 
     #[test]
-    fn supports_vision_defaults_false_and_round_trips() {
-        let conn = blank_conn("Local", None, ProviderKind::Ollama);
-        assert!(!conn.supports_vision);
-        // Absent in legacy JSON -> defaults false on deserialize.
-        let mut v: serde_json::Value = serde_json::to_value(&conn).unwrap();
-        v.as_object_mut().unwrap().remove("supportsVision");
-        let back: ProviderConnection = serde_json::from_value(v).unwrap();
-        assert!(!back.supports_vision);
-        // Set true -> serializes and round-trips.
-        let vision = ProviderConnection {
-            supports_vision: true,
-            supports_documents: false,
-            ..conn
-        };
-        let json = serde_json::to_string(&vision).unwrap();
-        assert!(json.contains("\"supportsVision\":true"));
-        let back: ProviderConnection = serde_json::from_str(&json).unwrap();
-        assert!(back.supports_vision);
-    }
-
-    #[test]
     fn model_supports_vision_covers_known_families() {
         // Modern Claude on Bedrock: 3.x and 4.x, plus the named Mythos/Fable.
         for m in [
@@ -969,73 +922,6 @@ mod tests {
                 "expected no documents: {k:?} {m}"
             );
         }
-    }
-
-    #[test]
-    fn registry_normalize_capabilities_upgrades_false_and_keeps_true() {
-        let mut reg = ProviderRegistry {
-            active: "bed".into(),
-            connections: vec![
-                ProviderConnection {
-                    id: "bed".into(),
-                    kind: ProviderKind::Bedrock,
-                    model: "us.anthropic.claude-opus-4-8".into(),
-                    supports_vision: false,
-                    supports_documents: false,
-                    ..blank_conn("Bedrock", Some("aws"), ProviderKind::Bedrock)
-                },
-                ProviderConnection {
-                    id: "oll".into(),
-                    kind: ProviderKind::Ollama,
-                    model: "llama3.2".into(),
-                    supports_vision: false,
-                    supports_documents: false,
-                    ..blank_conn("Ollama", None, ProviderKind::Ollama)
-                },
-                ProviderConnection {
-                    id: "candle".into(),
-                    kind: ProviderKind::CandleVllm,
-                    model: "anything".into(),
-                    supports_vision: true,
-                    supports_documents: false,
-                    ..blank_conn("Candle", None, ProviderKind::CandleVllm)
-                },
-            ],
-        };
-        reg.normalize_capabilities();
-        // Inferred upgrade.
-        assert!(reg.connections[0].supports_vision, "Opus 4.8 ⇒ vision");
-        // Unknown stays false.
-        assert!(!reg.connections[1].supports_vision, "llama3.2 stays text");
-        // Explicit true preserved despite no inference.
-        assert!(
-            reg.connections[2].supports_vision,
-            "explicit true preserved"
-        );
-        // Idempotent.
-        let before = reg.clone();
-        reg.normalize_capabilities();
-        assert_eq!(reg, before);
-    }
-
-    #[test]
-    fn upsert_or_upgrades_vision_from_model_id() {
-        let mut reg = ProviderRegistry {
-            active: "x".into(),
-            connections: vec![],
-        };
-        let stored = reg.upsert(ProviderConnection {
-            id: "bed".into(),
-            kind: ProviderKind::Bedrock,
-            model: "us.anthropic.claude-opus-4-8".into(),
-            supports_vision: false,
-            supports_documents: false,
-            ..blank_conn("Bedrock", Some("aws"), ProviderKind::Bedrock)
-        });
-        assert!(
-            stored.supports_vision,
-            "saved Opus 4.8 ⇒ supportsVision=true"
-        );
     }
 
     #[test]
