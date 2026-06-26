@@ -193,6 +193,7 @@ fn parse_sse_line(line: &[u8]) -> Option<Result<Chunk, LlmError>> {
                         })
                         .collect(),
                     done: c.finish_reason.is_some(),
+                    truncated: c.finish_reason.as_deref() == Some("length"),
                 },
                 None => Chunk::default(),
             };
@@ -430,6 +431,21 @@ mod tests {
         let chunk = parse_sse_line(line).unwrap().unwrap();
         assert_eq!(chunk.delta, "");
         assert!(chunk.done);
+        assert!(
+            !chunk.truncated,
+            "finish_reason stop is a clean end of turn"
+        );
+    }
+
+    #[test]
+    fn finish_reason_length_marks_truncated() {
+        let line = br#"data: {"choices":[{"delta":{},"finish_reason":"length"}]}"#;
+        let chunk = parse_sse_line(line).unwrap().unwrap();
+        assert!(chunk.done);
+        assert!(
+            chunk.truncated,
+            "finish_reason length means the output cap cut the turn off (#528)"
+        );
     }
 
     #[test]

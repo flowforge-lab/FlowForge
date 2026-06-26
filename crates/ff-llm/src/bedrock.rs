@@ -9,8 +9,8 @@ use aws_sdk_bedrockruntime::types::{
     CachePointBlock, CachePointType, ContentBlock, ContentBlockDelta, ContentBlockStart,
     ConversationRole, ConverseStreamOutput, DocumentBlock, DocumentFormat, DocumentSource,
     ImageBlock, ImageFormat, ImageSource, InferenceConfiguration, Message,
-    ReasoningContentBlockDelta, SystemContentBlock, Tool, ToolConfiguration, ToolInputSchema,
-    ToolResultBlock, ToolResultContentBlock, ToolSpecification, ToolUseBlock,
+    ReasoningContentBlockDelta, StopReason, SystemContentBlock, Tool, ToolConfiguration,
+    ToolInputSchema, ToolResultBlock, ToolResultContentBlock, ToolSpecification, ToolUseBlock,
 };
 use aws_sdk_bedrockruntime::Client;
 use aws_smithy_types::{Blob, Document, Number};
@@ -236,6 +236,15 @@ impl BedrockProvider {
 /// thinking is on, since Converse requires `maxTokens > budget_tokens` (#394).
 const BEDROCK_ANSWER_HEADROOM: u32 = 4_096;
 
+/// Output-token ceiling pinned on adaptive-thinking Claude turns (Opus 4.6+,
+/// Sonnet 4.6+). Adaptive thinking has no explicit reasoning budget to clear,
+/// but extended-thinking tokens still count against the model's output cap.
+/// Left on the small per-model default, a hard-thinking turn can exhaust the
+/// budget and stop on `MaxTokens` mid `toolUse.input`, truncating the
+/// tool-call JSON (which then surfaced as "invalid JSON", #528). Pin a
+/// generous ceiling so thinking plus a full tool call fit comfortably.
+const ADAPTIVE_THINKING_MAX_TOKENS: i32 = 32_768;
+
 /// Build the `additionalModelRequestFields` document that turns on Claude
 /// extended thinking with the given reasoning-token budget (#394). The legacy
 /// `reasoning_config.type = "enabled"` interface, used by Opus/Sonnet 4.5 and
@@ -257,8 +266,9 @@ fn reasoning_config_doc(budget_tokens: u32) -> Document {
 /// (Opus 4.6+, Sonnet 4.6+). These models deprecated `reasoning_config`/
 /// `budget_tokens` and return a `ValidationException` for `type = "enabled"`;
 /// they take `thinking.type = "adaptive"` plus an effort label that must live in
-/// a separate `output_config` object (effort inside `thinking` is rejected). No
-/// `maxTokens` pin is needed -- adaptive has no explicit budget to clear.
+/// a separate `output_config` object (effort inside `thinking` is rejected).
+/// The caller still pins a generous `ADAPTIVE_THINKING_MAX_TOKENS` ceiling so
+/// thinking tokens cannot starve the tool-call output (#528).
 fn adaptive_thinking_doc(effort: ReasoningEffort) -> Document {
     Document::Object(std::collections::HashMap::from([
         (
@@ -282,7 +292,10 @@ fn adaptive_thinking_doc(effort: ReasoningEffort) -> Document {
 /// turn. This is the single branch used by the emitted request path.
 fn thinking_request_config(model: &str, effort: ReasoningEffort) -> (Document, Option<i32>) {
     if uses_adaptive_thinking(model) {
-        (adaptive_thinking_doc(effort), None)
+        (
+            adaptive_thinking_doc(effort),
+            Some(ADAPTIVE_THINKING_MAX_TOKENS),
+        )
     } else {
         let budget = effort.budget_tokens();
         (
@@ -362,8 +375,9 @@ impl Provider for BedrockProvider {
         }
         // Claude extended thinking (#394). Two wire shapes by model generation:
         //   - Adaptive (Opus 4.6+, Sonnet 4.6+): thinking.type = "adaptive" +
-        //     output_config.effort. No maxTokens pin -- adaptive has no explicit
-        //     budget, and the legacy "enabled" shape is rejected with a 400.
+        //     output_config.effort, plus a generous maxTokens ceiling so thinking
+        //     tokens cannot starve the tool-call output (#528). The legacy
+        //     "enabled" shape is rejected with a 400.
         //   - Legacy (Opus/Sonnet 4.5 and older): reasoning_config + a maxTokens
         //     pin, since Converse needs maxTokens > budget_tokens.
         // Non-thinking turns are untouched, preserving the model's default maxTokens.
@@ -476,8 +490,9 @@ fn event_to_chunk(event: ConverseStreamOutput) -> Option<Chunk> {
             }
             _ => None,
         },
-        ConverseStreamOutput::MessageStop(_) => Some(Chunk {
+        ConverseStreamOutput::MessageStop(ev) => Some(Chunk {
             done: true,
+            truncated: matches!(ev.stop_reason(), StopReason::MaxTokens),
             ..Chunk::default()
         }),
         _ => None,
@@ -1087,7 +1102,11 @@ mod tests {
 
         let (adaptive, adaptive_max) =
             thinking_request_config("us.anthropic.claude-opus-4-8", ReasoningEffort::High);
-        assert_eq!(adaptive_max, None, "adaptive thinking has no budget pin");
+        assert_eq!(
+            adaptive_max,
+            Some(ADAPTIVE_THINKING_MAX_TOKENS),
+            "adaptive thinking pins a generous maxTokens so thinking cannot starve tool output (#528)"
+        );
         let Document::Object(top) = adaptive else {
             panic!("expected object")
         };
@@ -1130,7 +1149,11 @@ mod tests {
 
         // Adaptive model — output_config.effort path.
         let (adaptive, adaptive_max) = provider.thinking_config_for("us.anthropic.claude-opus-4-8");
-        assert_eq!(adaptive_max, None, "adaptive thinking has no budget pin");
+        assert_eq!(
+            adaptive_max,
+            Some(ADAPTIVE_THINKING_MAX_TOKENS),
+            "adaptive thinking pins a generous maxTokens so thinking cannot starve tool output (#528)"
+        );
         let Document::Object(top) = adaptive else {
             panic!("expected object")
         };
@@ -1471,6 +1494,34 @@ mod tests {
         );
         let chunk = event_to_chunk(event).unwrap();
         assert!(chunk.done);
+        assert!(!chunk.truncated, "EndTurn is a clean stop, not truncation");
+    }
+
+    #[test]
+    fn message_stop_max_tokens_marks_truncated() {
+        let event = ConverseStreamOutput::MessageStop(
+            aws_sdk_bedrockruntime::types::MessageStopEvent::builder()
+                .stop_reason(StopReason::MaxTokens)
+                .build()
+                .unwrap(),
+        );
+        let chunk = event_to_chunk(event).unwrap();
+        assert!(chunk.done);
+        assert!(
+            chunk.truncated,
+            "MaxTokens means the output cap cut the turn off mid-stream (#528)"
+        );
+    }
+
+    #[test]
+    fn adaptive_thinking_pins_a_generous_max_tokens() {
+        let (_, max_tokens) =
+            thinking_request_config("us.anthropic.claude-opus-4-8", ReasoningEffort::High);
+        assert_eq!(
+            max_tokens,
+            Some(ADAPTIVE_THINKING_MAX_TOKENS),
+            "adaptive thinking must pin maxTokens so thinking cannot starve tool-call output (#528)"
+        );
     }
 
     #[test]

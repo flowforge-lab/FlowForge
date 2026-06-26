@@ -170,6 +170,11 @@ pub struct Chunk {
     pub reasoning_delta: String,
     pub tool_calls: Vec<ToolCallDelta>,
     pub done: bool,
+    /// The provider stopped because the output token cap was reached
+    /// (Bedrock `MaxTokens` / OpenAI `finish_reason = "length"`). Any
+    /// in-flight tool-call arguments may be cut off mid-JSON, so the agent
+    /// should report truncation rather than "invalid JSON" (#528).
+    pub truncated: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -692,6 +697,7 @@ mod tests {
                         reasoning_delta: String::new(),
                         tool_calls: vec![],
                         done: false,
+                        truncated: false,
                     };
                     Some((Ok(chunk), i + 1))
                 }
