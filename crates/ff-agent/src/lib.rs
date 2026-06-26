@@ -413,8 +413,49 @@ pub(crate) fn to_chat(messages: &[Message]) -> Vec<ChatMessage> {
             }
         })
         .collect();
+    repair_empty_tool_call_ids(&mut chat);
     cap_reasoning_replay(&mut chat, REASONING_REPLAY_KEEP);
     chat
+}
+
+/// Repair tool-call ids that a gateway persisted empty because it omitted the id
+/// on its streaming delta (SiliconFlow, #512). An empty id on the wire makes the
+/// gateway reject the replayed turn with a 400, so a session recorded before the
+/// capture-site fix would stay wedged. Mint a stable id for each empty assistant
+/// tool_call and bind the following tool result(s) to it in order: results are
+/// persisted in the same index order as their calls, so a FIFO match restores
+/// the pairing. Messages that already carry a non-empty id are left untouched.
+///
+/// The FIFO match assumes each empty-id assistant call is followed by its own
+/// result in order. That holds for any well-formed transcript; the one degenerate
+/// input is a *dangling* empty-id call (a turn cancelled after the assistant
+/// message persisted but before its result), which leaves a stale id in `pending`
+/// and could misbind a later result. Such a transcript -- an assistant `tool_call`
+/// with no matching result -- is already a 400-class malformation on its own, so
+/// this heuristic does not make a recoverable session worse.
+fn repair_empty_tool_call_ids(messages: &mut [ChatMessage]) {
+    let mut pending: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+    let mut counter = 0usize;
+    for m in messages.iter_mut() {
+        if let Some(calls) = m.tool_calls.as_mut() {
+            for call in calls.iter_mut() {
+                if call.id.is_empty() {
+                    let id = format!("call_repair_{counter}");
+                    counter += 1;
+                    call.id = id.clone();
+                    pending.push_back(id);
+                }
+            }
+        } else if m.role == "tool" {
+            if let Some(tcid) = m.tool_call_id.as_mut() {
+                if tcid.is_empty() {
+                    if let Some(id) = pending.pop_front() {
+                        *tcid = id;
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Drop replayed reasoning from all but the most-recent `keep` assistant
@@ -1064,6 +1105,17 @@ pub async fn run_turn(
                 tier2_fires: Some(tier2_fires),
             });
             return Ok(finalized);
+        }
+
+        // Some gateways (SiliconFlow streaming, #512) never emit a tool_call id in
+        // the delta, leaving the accumulated buffer id empty. Persisting "" makes
+        // the assistant tool_call and its tool result both carry an empty id, which
+        // the gateway then rejects with a 400 when the turn is replayed. Mint a
+        // stable per-index id so the request side and the result side stay matched.
+        for (index, buf) in calls.iter_mut() {
+            if buf.id.is_empty() {
+                buf.id = format!("call_{index}");
+            }
         }
 
         // Persist the tool calls on the assistant message, then execute each.
@@ -2022,6 +2074,40 @@ mod tests {
         }
     }
 
+    /// First call streams a tool call the way SiliconFlow does (#512): the delta
+    /// never carries an `id` (every fragment has `id: None`), so the accumulated
+    /// buffer id stays empty. The capture site must mint a stable id so the
+    /// persisted assistant tool_call and its tool result are not bound to "".
+    struct IdlessToolCall {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl Provider for IdlessToolCall {
+        async fn chat_stream(&self, _req: ChatRequest) -> Result<ChunkStream, LlmError> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            let chunks = if n == 0 {
+                vec![Ok(Chunk {
+                    tool_calls: vec![ToolCallDelta {
+                        index: 0,
+                        id: None,
+                        name: Some("bash".into()),
+                        arguments: r#"{"command":"echo wired"}"#.into(),
+                    }],
+                    done: true,
+                    ..Chunk::default()
+                })]
+            } else {
+                vec![Ok(Chunk {
+                    delta: "done: wired".into(),
+                    done: true,
+                    ..Chunk::default()
+                })]
+            };
+            Ok(futures_util::stream::iter(chunks).boxed())
+        }
+    }
+
     /// First call requests an `ask_user` tool call; second call returns plain text.
     struct AskThenText {
         calls: AtomicUsize,
@@ -2375,6 +2461,168 @@ mod tests {
         assert!(history[1].tool_calls.is_some());
         assert_eq!(history[2].role, Role::Tool);
         assert_eq!(history[2].tool_call_id.as_deref(), Some("call_1"));
+    }
+
+    #[tokio::test]
+    async fn idless_tool_call_gets_synthesized_id_matched_to_its_result() {
+        // #512: SiliconFlow streams tool calls without an id. The capture site must
+        // mint a stable id so the persisted assistant tool_call and its tool result
+        // share a non-empty id; an empty id is what the gateway later rejects (400).
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::new();
+        let s = store.create_session(None);
+        store.add_message(&s.id, Role::User, "run echo".into());
+        let registry = ToolRegistry::with_defaults();
+        let approve = AlwaysApprove;
+        let provider = IdlessToolCall {
+            calls: AtomicUsize::new(0),
+        };
+        run_turn(
+            &provider,
+            &store,
+            &ctx(&registry, dir.path(), &approve),
+            &s.id,
+            "mock",
+            None,
+            false,
+            CancelToken::new(),
+            |_| {},
+        )
+        .await
+        .unwrap();
+
+        let history = store.get_messages(&s.id);
+        let call_id = history[1].tool_calls.as_ref().unwrap()[0].id.clone();
+        assert!(
+            !call_id.is_empty(),
+            "assistant tool_call id must be synthesized"
+        );
+        assert_eq!(
+            history[2].tool_call_id.as_deref(),
+            Some(call_id.as_str()),
+            "tool result must bind to the same synthesized id"
+        );
+    }
+
+    #[test]
+    fn repair_binds_persisted_empty_ids_in_fifo_order() {
+        // #512 salvage path: a session recorded before the capture-site fix has
+        // empty ids on both the assistant tool_call and its tool result. to_chat
+        // must mint matching non-empty ids so the replayed turn is accepted.
+        let assistant = ff_core::Message {
+            id: "m1".into(),
+            session_id: "s1".into(),
+            role: Role::Assistant,
+            content: String::new(),
+            tool_calls: Some(vec![ff_core::ToolCall {
+                id: String::new(),
+                name: "bash".into(),
+                arguments: "{}".into(),
+            }]),
+            tool_call_id: None,
+            attachments: None,
+            reasoning: None,
+            created_at: 0,
+        };
+        let tool = ff_core::Message {
+            id: "m2".into(),
+            session_id: "s1".into(),
+            role: Role::Tool,
+            content: "ok".into(),
+            tool_calls: None,
+            tool_call_id: Some(String::new()),
+            attachments: None,
+            reasoning: None,
+            created_at: 1,
+        };
+        let out = to_chat(&[assistant, tool]);
+        let call_id = out[0].tool_calls.as_ref().unwrap()[0].id.clone();
+        assert!(!call_id.is_empty(), "assistant id must be repaired");
+        assert_eq!(
+            out[1].tool_call_id.as_deref(),
+            Some(call_id.as_str()),
+            "tool result must be bound to the repaired id"
+        );
+    }
+
+    #[test]
+    fn repair_binds_multiple_empty_ids_in_one_message_in_fifo_order() {
+        // Depth >1: two id-less calls in a single assistant message, then their two
+        // results. The minted ids must be distinct and each result must bind to its
+        // call in order -- locks the VecDeque FIFO contract beyond the single-call path.
+        let assistant = ff_core::Message {
+            id: "m1".into(),
+            session_id: "s1".into(),
+            role: Role::Assistant,
+            content: String::new(),
+            tool_calls: Some(vec![
+                ff_core::ToolCall {
+                    id: String::new(),
+                    name: "bash".into(),
+                    arguments: "{}".into(),
+                },
+                ff_core::ToolCall {
+                    id: String::new(),
+                    name: "view".into(),
+                    arguments: "{}".into(),
+                },
+            ]),
+            tool_call_id: None,
+            attachments: None,
+            reasoning: None,
+            created_at: 0,
+        };
+        let result = |mid: &str, ts: i64| ff_core::Message {
+            id: mid.into(),
+            session_id: "s1".into(),
+            role: Role::Tool,
+            content: "ok".into(),
+            tool_calls: None,
+            tool_call_id: Some(String::new()),
+            attachments: None,
+            reasoning: None,
+            created_at: ts,
+        };
+        let out = to_chat(&[assistant, result("m2", 1), result("m3", 2)]);
+        let calls = out[0].tool_calls.as_ref().unwrap();
+        let (id0, id1) = (calls[0].id.clone(), calls[1].id.clone());
+        assert!(!id0.is_empty() && !id1.is_empty());
+        assert_ne!(id0, id1, "minted ids must be distinct");
+        assert_eq!(out[1].tool_call_id.as_deref(), Some(id0.as_str()));
+        assert_eq!(out[2].tool_call_id.as_deref(), Some(id1.as_str()));
+    }
+
+    #[test]
+    fn repair_leaves_valid_tool_call_ids_untouched() {
+        let assistant = ff_core::Message {
+            id: "m1".into(),
+            session_id: "s1".into(),
+            role: Role::Assistant,
+            content: String::new(),
+            tool_calls: Some(vec![ff_core::ToolCall {
+                id: "call_real".into(),
+                name: "bash".into(),
+                arguments: "{}".into(),
+            }]),
+            tool_call_id: None,
+            attachments: None,
+            reasoning: None,
+            created_at: 0,
+        };
+        let tool = ff_core::Message {
+            id: "m2".into(),
+            session_id: "s1".into(),
+            role: Role::Tool,
+            content: "ok".into(),
+            tool_calls: None,
+            tool_call_id: Some("call_real".into()),
+            attachments: None,
+            reasoning: None,
+            created_at: 1,
+        };
+        let out = to_chat(&[assistant, tool]);
+        assert_eq!(out[0].tool_calls.as_ref().unwrap()[0].id, "call_real");
+        assert_eq!(out[1].tool_call_id.as_deref(), Some("call_real"));
     }
 
     /// #374: GLM-5.2 streams `name: ""` on every continuation fragment. The
