@@ -76,6 +76,11 @@ pub struct BedrockProvider {
     /// request is built so a non-vision model never receives image/document
     /// blocks it would reject. Defaults false; set via [`BedrockProvider::with_vision`].
     supports_vision: bool,
+    /// Whether the connection's model accepts *document* attachments (#504).
+    /// Independent of [`supports_vision`]: a text-only Claude reads PDFs but has
+    /// no vision. When false, documents are stripped before the Converse request
+    /// is built. Defaults false; set via [`BedrockProvider::with_documents`].
+    supports_documents: bool,
     /// Reasoning depth dial (#394). On a thinking turn, drives the Converse
     /// `reasoning_config.budget_tokens` (Claude extended thinking) and the
     /// matching `maxTokens`. Defaults to [`ReasoningEffort::Medium`].
@@ -88,13 +93,20 @@ impl BedrockProvider {
             region: region.into(),
             creds,
             supports_vision: false,
+            supports_documents: false,
             reasoning_effort: ReasoningEffort::default(),
         }
     }
 
-    /// Declare whether the target model can accept image/document attachments.
+    /// Declare whether the target model can accept image attachments.
     pub fn with_vision(mut self, supports_vision: bool) -> Self {
         self.supports_vision = supports_vision;
+        self
+    }
+
+    /// Declare whether the target model can accept document attachments (#504).
+    pub fn with_documents(mut self, supports_documents: bool) -> Self {
+        self.supports_documents = supports_documents;
         self
     }
 
@@ -299,7 +311,8 @@ impl Provider for BedrockProvider {
     }
 
     async fn chat_stream(&self, req: ChatRequest) -> Result<ChunkStream, LlmError> {
-        let wire = crate::messages_for_wire(&req.messages, self.supports_vision);
+        let wire =
+            crate::messages_for_wire(&req.messages, self.supports_vision, self.supports_documents);
         let (mut system, messages) = to_converse(&wire);
         let client = self.client().await;
 
@@ -639,6 +652,9 @@ fn document_format(media_type: &str, name: Option<&str>) -> Option<DocumentForma
         "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" => {
             Some(DocumentFormat::Xlsx)
         }
+        // Bedrock's DocumentFormat has no JSON variant; route it to Txt so JSON
+        // attachments still reach the model as readable text (#504).
+        "application/json" | "text/json" => Some(DocumentFormat::Txt),
         _ => None,
     };
     by_media.or_else(|| {
@@ -653,6 +669,7 @@ fn document_format(media_type: &str, name: Option<&str>) -> Option<DocumentForma
             "txt" => Some(DocumentFormat::Txt),
             "xls" => Some(DocumentFormat::Xls),
             "xlsx" => Some(DocumentFormat::Xlsx),
+            "json" => Some(DocumentFormat::Txt),
             _ => None,
         }
     })
@@ -1728,6 +1745,33 @@ mod tests {
     }
 
     #[test]
+    fn json_document_maps_to_txt() {
+        // Bedrock has no JSON DocumentFormat; both the media type and the .json
+        // extension route to Txt so JSON still reaches the model (#504).
+        for (media, name) in [
+            ("application/json", "config.json"),
+            ("application/octet-stream", "config.json"),
+        ] {
+            let msg = ChatMessage::multimodal(
+                "user",
+                "",
+                vec![Attachment {
+                    kind: ff_core::AttachmentKind::Document,
+                    media_type: media.into(),
+                    source: AttachmentSource::Inline(inline_b64(b"{\"k\":1}")),
+                    name: Some(name.into()),
+                    bytes: 7,
+                }],
+            );
+            let (_, messages) = to_converse(&[msg]);
+            match &messages[0].content[0] {
+                ContentBlock::Document(d) => assert_eq!(d.format, DocumentFormat::Txt),
+                other => panic!("expected document block, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
     fn text_only_message_is_unchanged() {
         let (_, messages) = to_converse(&[ChatMessage::text("user", "plain turn")]);
         assert_eq!(messages.len(), 1);
@@ -1775,7 +1819,7 @@ mod tests {
             "image/png",
             AttachmentSource::Inline(inline_b64(&[0x89, 0x50, 0x4e, 0x47])),
         );
-        let wire = crate::messages_for_wire(std::slice::from_ref(&msg), false);
+        let wire = crate::messages_for_wire(std::slice::from_ref(&msg), false, false);
         let (_, messages) = to_converse(&wire);
         assert_eq!(messages.len(), 1);
         assert!(
@@ -1793,7 +1837,7 @@ mod tests {
             "image/png",
             AttachmentSource::Inline(inline_b64(&[0x89, 0x50, 0x4e, 0x47])),
         );
-        let wire = crate::messages_for_wire(std::slice::from_ref(&msg), true);
+        let wire = crate::messages_for_wire(std::slice::from_ref(&msg), true, true);
         let (_, messages) = to_converse(&wire);
         assert!(
             messages[0]

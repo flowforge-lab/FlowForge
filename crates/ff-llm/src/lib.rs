@@ -321,17 +321,29 @@ pub fn reasoning_control(
     }
 }
 
-/// Drop attachments from every message for providers that cannot carry them
-/// (the capability strip, #332/#334). Borrows on the common path (no message has
-/// attachments) and only clones when a strip is actually needed, so a text-only
-/// turn is zero-cost. When `supports_vision` is true the messages pass through
-/// untouched -- the per-provider adapter (#335/#336/#337) reshapes attachments
-/// into that API's real content blocks.
+/// Drop attachments a provider cannot carry (the capability strip, #332/#334,
+/// #504). Vision and documents gate independently: a `Document` survives only
+/// when `supports_documents`, an `Image` only when `supports_vision`, so a
+/// Bedrock text-only model keeps PDFs while shedding images. Borrows on the
+/// common path (every attachment is allowed) and only clones when a strip is
+/// actually needed, so a text-only turn is zero-cost. Surviving attachments are
+/// reshaped into the API's real content blocks by the per-provider adapter
+/// (#335/#336/#337).
 pub(crate) fn messages_for_wire(
     messages: &[ChatMessage],
     supports_vision: bool,
+    supports_documents: bool,
 ) -> std::borrow::Cow<'_, [ChatMessage]> {
-    if supports_vision || messages.iter().all(|m| m.attachments.is_empty()) {
+    use ff_core::AttachmentKind;
+    let kept = |a: &ff_core::Attachment| match a.kind {
+        AttachmentKind::Image => supports_vision,
+        AttachmentKind::Document => supports_documents,
+    };
+    let needs_strip = messages
+        .iter()
+        .flat_map(|m| m.attachments.iter())
+        .any(|a| !kept(a));
+    if !needs_strip {
         std::borrow::Cow::Borrowed(messages)
     } else {
         std::borrow::Cow::Owned(
@@ -339,7 +351,7 @@ pub(crate) fn messages_for_wire(
                 .iter()
                 .map(|m| {
                     let mut m = m.clone();
-                    m.attachments.clear();
+                    m.attachments.retain(&kept);
                     m
                 })
                 .collect(),
@@ -560,7 +572,7 @@ mod tests {
     #[test]
     fn messages_for_wire_strips_attachments_when_no_vision() {
         let msg = ChatMessage::multimodal("user", "see this", vec![img_attachment()]);
-        let stripped = messages_for_wire(std::slice::from_ref(&msg), false);
+        let stripped = messages_for_wire(std::slice::from_ref(&msg), false, false);
         assert!(stripped[0].attachments.is_empty());
         // A stripped, text-only message serializes without an `attachments` key.
         let v = serde_json::to_value(&stripped[0]).unwrap();
@@ -570,7 +582,7 @@ mod tests {
     #[test]
     fn messages_for_wire_keeps_attachments_when_vision() {
         let msg = ChatMessage::multimodal("user", "see this", vec![img_attachment()]);
-        let kept = messages_for_wire(std::slice::from_ref(&msg), true);
+        let kept = messages_for_wire(std::slice::from_ref(&msg), true, false);
         assert_eq!(kept[0].attachments.len(), 1);
     }
 
@@ -579,7 +591,48 @@ mod tests {
         let msgs = vec![ChatMessage::text("user", "hi")];
         // No attachments anywhere -> borrowed (zero-copy), regardless of the flag.
         assert!(matches!(
-            messages_for_wire(&msgs, false),
+            messages_for_wire(&msgs, false, false),
+            std::borrow::Cow::Borrowed(_)
+        ));
+    }
+
+    fn doc_attachment() -> ff_core::Attachment {
+        ff_core::Attachment {
+            kind: ff_core::AttachmentKind::Document,
+            media_type: "application/pdf".into(),
+            source: ff_core::AttachmentSource::Inline("aGk=".into()),
+            name: Some("report.pdf".into()),
+            bytes: 2,
+        }
+    }
+
+    #[test]
+    fn messages_for_wire_gates_image_and_document_independently() {
+        let msg = ChatMessage::multimodal(
+            "user",
+            "see these",
+            vec![img_attachment(), doc_attachment()],
+        );
+
+        let vision_only = messages_for_wire(std::slice::from_ref(&msg), true, false);
+        assert_eq!(vision_only[0].attachments.len(), 1);
+        assert_eq!(
+            vision_only[0].attachments[0].kind,
+            ff_core::AttachmentKind::Image
+        );
+
+        let docs_only = messages_for_wire(std::slice::from_ref(&msg), false, true);
+        assert_eq!(docs_only[0].attachments.len(), 1);
+        assert_eq!(
+            docs_only[0].attachments[0].kind,
+            ff_core::AttachmentKind::Document
+        );
+
+        let neither = messages_for_wire(std::slice::from_ref(&msg), false, false);
+        assert!(neither[0].attachments.is_empty());
+
+        assert!(matches!(
+            messages_for_wire(std::slice::from_ref(&msg), true, true),
             std::borrow::Cow::Borrowed(_)
         ));
     }

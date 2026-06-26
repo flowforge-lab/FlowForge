@@ -227,7 +227,7 @@ impl Provider for OllamaProvider {
     }
 
     async fn chat_stream(&self, req: ChatRequest) -> Result<ChunkStream, LlmError> {
-        let messages = crate::messages_for_wire(&req.messages, self.supports_vision);
+        let messages = crate::messages_for_wire(&req.messages, self.supports_vision, false);
         let mut body = serde_json::json!({
             "model": req.model,
             "messages": ollama_messages(&messages)?,
@@ -597,7 +597,7 @@ mod tests {
             )],
         )];
 
-        let off = ollama_messages(&crate::messages_for_wire(&msgs, false)).unwrap();
+        let off = ollama_messages(&crate::messages_for_wire(&msgs, false, false)).unwrap();
         assert!(
             off[0].get("images").is_none(),
             "vision off: image stripped before reshape"
@@ -607,7 +607,7 @@ mod tests {
             "vision off: no leaked field"
         );
 
-        let on = ollama_messages(&crate::messages_for_wire(&msgs, true)).unwrap();
+        let on = ollama_messages(&crate::messages_for_wire(&msgs, true, false)).unwrap();
         assert!(
             on[0]["images"].as_array().is_some_and(|a| a.len() == 1),
             "vision on: image emitted"

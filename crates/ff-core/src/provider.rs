@@ -296,6 +296,13 @@ pub struct ProviderConnection {
     /// field). Defaults false; opted in per connection in settings.
     #[serde(default)]
     pub supports_vision: bool,
+    /// Whether this connection's model can accept *document* attachments
+    /// (PDF/DOCX/CSV/…, #504). Distinct from [`supports_vision`]: a Bedrock
+    /// text-only model reads documents but has no vision, and an OpenAI vision
+    /// model cannot take documents. Drives the composer doc attach-gate and the
+    /// backend `Document` strip independently of vision. Defaults false.
+    #[serde(default)]
+    pub supports_documents: bool,
     /// AWS region for a Bedrock connection (e.g. `"us-east-1"`); the provider
     /// derives `bedrock-runtime.<region>.amazonaws.com` from it. `None` for
     /// non-Bedrock kinds.
@@ -342,6 +349,16 @@ pub fn model_supports_vision(kind: ProviderKind, model: &str) -> bool {
     // this thin wrapper preserves the call sites (`normalize_capabilities`, upsert)
     // and the public signature.
     crate::model_specs::supports_vision_in(crate::model_specs::bundled_rules(), kind, model)
+}
+
+/// Whether `(kind, model)` can accept *document* attachments (PDF/DOCX/CSV/…,
+/// #504). Provider-scoped: only Bedrock's Converse API carries a portable
+/// `DocumentBlock`; the OpenAI-compatible and Ollama wire formats have no
+/// document block (#338), so they fail closed here. The `model` argument is
+/// reserved for a future data-driven split (mirrors the #466 vision migration)
+/// once a non-Bedrock provider gains native document support.
+pub fn model_supports_documents(kind: ProviderKind, _model: &str) -> bool {
+    matches!(kind, ProviderKind::Bedrock)
 }
 
 /// The full set of configured connections plus a pointer to the active one.
@@ -414,6 +431,8 @@ impl ProviderRegistry {
         // explicit `true`. See [`model_supports_vision`].
         conn.supports_vision =
             conn.supports_vision || model_supports_vision(conn.kind, &conn.model);
+        conn.supports_documents =
+            conn.supports_documents || model_supports_documents(conn.kind, &conn.model);
         match self.connections.iter_mut().find(|c| c.id == conn.id) {
             Some(slot) => *slot = conn.clone(),
             None => self.connections.push(conn.clone()),
@@ -430,6 +449,8 @@ impl ProviderRegistry {
         for conn in &mut self.connections {
             conn.supports_vision =
                 conn.supports_vision || model_supports_vision(conn.kind, &conn.model);
+            conn.supports_documents =
+                conn.supports_documents || model_supports_documents(conn.kind, &conn.model);
         }
     }
 
@@ -499,6 +520,7 @@ impl Default for ProviderRegistry {
             thinking: true,
             reasoning_effort: ReasoningEffort::default(),
             supports_vision: false,
+            supports_documents: false,
             region: None,
             auth_mode: None,
             aws_profile: None,
@@ -515,6 +537,7 @@ impl Default for ProviderRegistry {
             thinking: true,
             reasoning_effort: ReasoningEffort::default(),
             supports_vision: false,
+            supports_documents: false,
             region: None,
             auth_mode: None,
             aws_profile: None,
@@ -608,6 +631,7 @@ mod tests {
             thinking: true,
             reasoning_effort: ReasoningEffort::default(),
             supports_vision: false,
+            supports_documents: false,
             region: None,
             auth_mode: None,
             aws_profile: None,
@@ -722,6 +746,7 @@ mod tests {
             thinking: true,
             reasoning_effort: ReasoningEffort::default(),
             supports_vision: false,
+            supports_documents: false,
             region: None,
             auth_mode: None,
             aws_profile: None,
@@ -848,6 +873,7 @@ mod tests {
         // Set true -> serializes and round-trips.
         let vision = ProviderConnection {
             supports_vision: true,
+            supports_documents: false,
             ..conn
         };
         let json = serde_json::to_string(&vision).unwrap();
@@ -918,6 +944,34 @@ mod tests {
     }
 
     #[test]
+    fn model_supports_documents_is_bedrock_only() {
+        // Bedrock's Converse API carries a portable DocumentBlock regardless of
+        // the model's vision capability (a text-only Claude still reads PDFs).
+        for m in [
+            "us.anthropic.claude-opus-4-8",
+            "meta.llama3-70b-instruct-v1:0",
+            "anything",
+        ] {
+            assert!(
+                model_supports_documents(ProviderKind::Bedrock, m),
+                "Bedrock documents: {m}"
+            );
+        }
+        // No portable document block on the OpenAI-compatible or Ollama wire (#338).
+        for (k, m) in [
+            (ProviderKind::OpenAi, "gpt-4o"),
+            (ProviderKind::SiliconFlow, "Qwen/Qwen2-VL-7B-Instruct"),
+            (ProviderKind::Ollama, "llava:7b"),
+            (ProviderKind::CandleVllm, "anything"),
+        ] {
+            assert!(
+                !model_supports_documents(k, m),
+                "expected no documents: {k:?} {m}"
+            );
+        }
+    }
+
+    #[test]
     fn registry_normalize_capabilities_upgrades_false_and_keeps_true() {
         let mut reg = ProviderRegistry {
             active: "bed".into(),
@@ -927,6 +981,7 @@ mod tests {
                     kind: ProviderKind::Bedrock,
                     model: "us.anthropic.claude-opus-4-8".into(),
                     supports_vision: false,
+                    supports_documents: false,
                     ..blank_conn("Bedrock", Some("aws"), ProviderKind::Bedrock)
                 },
                 ProviderConnection {
@@ -934,6 +989,7 @@ mod tests {
                     kind: ProviderKind::Ollama,
                     model: "llama3.2".into(),
                     supports_vision: false,
+                    supports_documents: false,
                     ..blank_conn("Ollama", None, ProviderKind::Ollama)
                 },
                 ProviderConnection {
@@ -941,6 +997,7 @@ mod tests {
                     kind: ProviderKind::CandleVllm,
                     model: "anything".into(),
                     supports_vision: true,
+                    supports_documents: false,
                     ..blank_conn("Candle", None, ProviderKind::CandleVllm)
                 },
             ],
@@ -972,6 +1029,7 @@ mod tests {
             kind: ProviderKind::Bedrock,
             model: "us.anthropic.claude-opus-4-8".into(),
             supports_vision: false,
+            supports_documents: false,
             ..blank_conn("Bedrock", Some("aws"), ProviderKind::Bedrock)
         });
         assert!(
