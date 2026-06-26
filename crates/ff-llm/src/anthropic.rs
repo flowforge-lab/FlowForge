@@ -67,6 +67,13 @@ impl AnthropicProvider {
         self.reasoning_effort = effort;
         self
     }
+
+    /// Emitted Anthropic request body — the exact JSON `chat_stream` POSTs to
+    /// `/v1/messages`.  Factored out (#395 acceptance) so the provider's private
+    /// `reasoning_effort` dial is assertable without a live Anthropic call.
+    fn emitted_body_for(&self, req: &ChatRequest) -> Value {
+        to_anthropic_request(req, self.max_tokens, self.reasoning_effort)
+    }
 }
 
 impl std::fmt::Debug for AnthropicProvider {
@@ -472,7 +479,7 @@ fn extract_error_message(body: &str) -> Option<String> {
 #[async_trait]
 impl Provider for AnthropicProvider {
     async fn chat_stream(&self, req: ChatRequest) -> Result<ChunkStream, LlmError> {
-        let body = to_anthropic_request(&req, self.max_tokens, self.reasoning_effort);
+        let body = self.emitted_body_for(&req);
 
         let resp = self
             .client
@@ -1004,6 +1011,28 @@ mod tests {
         assert_eq!(high["thinking"]["budget_tokens"], 8192);
         // A generous cap is left untouched (only bumped when too low).
         assert_eq!(high["max_tokens"], 32000);
+    }
+
+    /// #395 acceptance: the provider's private `reasoning_effort` dial (set via
+    /// `with_reasoning_effort`) must reach the emitted Anthropic wire body, not
+    /// just `to_anthropic_request`'s return value when the effort is passed
+    /// directly.  High → `thinking.budget_tokens = 8192`.
+    #[test]
+    fn high_effort_provider_emits_8192_thinking_budget() {
+        let req = ChatRequest {
+            model: "claude-x".into(),
+            messages: vec![ChatMessage::text("user", "hi")],
+            tools: vec![],
+            thinking: true,
+        };
+        let provider = AnthropicProvider::new("sk-ant-test")
+            .with_max_tokens(32000)
+            .with_reasoning_effort(ReasoningEffort::High);
+
+        // The effort comes from the provider's private field — not passed
+        // explicitly. This proves `chat_stream`'s code path threads the dial.
+        let body = provider.emitted_body_for(&req);
+        assert_eq!(body["thinking"]["budget_tokens"], 8192);
     }
 
     #[test]
