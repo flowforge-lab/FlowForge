@@ -175,6 +175,30 @@ pub fn build_system_prompt(
          `.ff-scratch/` (created for you) rather than `/tmp`.\n\n",
     );
 
+    // Stable guidance (cache-stable prefix): PR-review scoping (#426 RC2).
+    // Without this the agent over-explored during reviews -- reading entire
+    // unchanged files and spidering the call graph (PR #452). Appended
+    // unconditionally but phrased as conditional ("When your task is to review
+    // ..."), so it is inert on implementation turns yet bounds a review to the
+    // changed hunks.
+    out.push_str(
+        "## Reviewing pull requests\n\
+         When your task is to review a pull request or a diff, stay scoped to the \
+         change:\n\
+         - Fetch the PR metadata, review comments, and unified diff once -- a single \
+         `gh pr view --json title,body,comments` plus `gh pr diff`. Reuse that result \
+         for the whole review; do not re-read the same files or re-run the same diff \
+         piecemeal across turns.\n\
+         - Reason about the changed hunks first. The diff is the review's subject; \
+         everything else is supporting evidence, not the thing under review.\n\
+         - Read wider context only when a specific comment or suspected defect \
+         requires it -- to confirm a caller's behaviour, a type contract, or a test \
+         that should have changed. Before opening a file, name the hunk and the \
+         concern it serves.\n\
+         - Do not spider the call graph or read entire unchanged files to \
+         \"understand the area\". A review verifies the change, not the codebase.\n\n",
+    );
+
     out.push_str("## User context\n");
     out.push_str(&format!(
         "Current: {}, {} ({}).\n",
@@ -474,5 +498,43 @@ mod tests {
         assert!(!without.contains("## Memory"));
         let blank = build_system_prompt(None, &reg, &[], &ctx(), Some("   \n  "), Mode::default());
         assert!(!blank.contains("## Memory"));
+    }
+
+    #[test]
+    fn review_scoping_guidance_is_in_the_stable_prefix() {
+        // #426 RC2: the agent over-explored during PR reviews (PR #452) because the
+        // system prompt carried zero diff-scoping guidance. The review-scoping
+        // section must sit in the cache-stable prefix -- after the other stable
+        // guidance and before the volatile User context -- so it is always present
+        // and never falls out of the prompt.
+        let reg = SkillRegistry::new();
+        let out = build_system_prompt(None, &reg, &[], &ctx(), None, Mode::default());
+        let shell = out.find("## Shell environment").unwrap();
+        let review = out
+            .find("## Reviewing pull requests")
+            .expect("review-scoping guidance present");
+        let user = out.find("## User context").unwrap();
+        assert!(
+            shell < review && review < user,
+            "review guidance must sit in the stable prefix, after Shell environment \
+             and before User context: {out}"
+        );
+        // The four load-bearing invariants from the issue's Fix.
+        assert!(
+            out.contains("unified diff"),
+            "must say to fetch the diff once"
+        );
+        assert!(
+            out.contains("changed hunks"),
+            "must scope reasoning to hunks"
+        );
+        assert!(
+            out.contains("Do not spider the call graph"),
+            "must forbid call-graph spidering"
+        );
+        assert!(
+            out.contains("Reuse that result"),
+            "must tell the agent to reuse the single fetch"
+        );
     }
 }
