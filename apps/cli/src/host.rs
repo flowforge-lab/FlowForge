@@ -46,21 +46,7 @@ fn build_provider(config: &ProviderConfig) -> Box<dyn Provider> {
             Box::new(OpenAiProvider::new(base_url, None).with_dialect(dialect))
         }
         ProviderKind::Ollama => Box::new(OllamaProvider::new(base_url)),
-        // The CLI has no keychain or connection registry, so Bedrock here uses the
-        // standard AWS credential chain: a bearer token from AWS_BEARER_TOKEN_BEDROCK
-        // when set, otherwise a named profile (AWS_PROFILE, default "default").
-        ProviderKind::Bedrock => {
-            let region = std::env::var("AWS_REGION")
-                .or_else(|_| std::env::var("AWS_DEFAULT_REGION"))
-                .unwrap_or_else(|_| "us-east-1".to_string());
-            let creds = match std::env::var("AWS_BEARER_TOKEN_BEDROCK") {
-                Ok(token) if !token.is_empty() => BedrockCreds::ApiKey { token },
-                _ => BedrockCreds::Profile {
-                    name: std::env::var("AWS_PROFILE").unwrap_or_else(|_| "default".to_string()),
-                },
-            };
-            Box::new(BedrockProvider::new(region, creds))
-        }
+        ProviderKind::Bedrock => Box::new(build_bedrock_provider(config)),
         // The CLI has no keychain, so a hosted OpenAI key comes from the
         // OPENAI_API_KEY env var (absent or empty => keyless, for OpenAI-compatible
         // local gateways that need none).
@@ -83,6 +69,26 @@ fn build_provider(config: &ProviderConfig) -> Box<dyn Provider> {
             )
         }
     }
+}
+
+/// Build a Bedrock provider from `config`, mirroring the desktop's `build_provider`.
+/// Extracted so the reasoning-effort dial (#394) is assertable without a live Bedrock
+/// call — without `with_reasoning_effort`, per-step thinking is invisible through
+/// `flowforge run` (same bug surface as desktop #426 acceptance).
+fn build_bedrock_provider(config: &ProviderConfig) -> BedrockProvider {
+    // The CLI has no keychain or connection registry, so Bedrock here uses the
+    // standard AWS credential chain: a bearer token from AWS_BEARER_TOKEN_BEDROCK
+    // when set, otherwise a named profile (AWS_PROFILE, default "default").
+    let region = std::env::var("AWS_REGION")
+        .or_else(|_| std::env::var("AWS_DEFAULT_REGION"))
+        .unwrap_or_else(|_| "us-east-1".to_string());
+    let creds = match std::env::var("AWS_BEARER_TOKEN_BEDROCK") {
+        Ok(token) if !token.is_empty() => BedrockCreds::ApiKey { token },
+        _ => BedrockCreds::Profile {
+            name: std::env::var("AWS_PROFILE").unwrap_or_else(|_| "default".to_string()),
+        },
+    };
+    BedrockProvider::new(region, creds).with_reasoning_effort(config.reasoning_effort)
 }
 
 /// A bearer key from `var`, or `None` when the variable is unset *or* empty.
@@ -279,5 +285,36 @@ mod tests {
         let body = siliconflow_body(false, ReasoningEffort::Medium).await;
         assert_eq!(body["enable_thinking"], false);
         assert!(body.get("thinking_budget").is_none());
+    }
+
+    // ---- Bedrock reasoning-effort wiring (#394/#426): the CLI must mirror the
+    // desktop and forward `config.reasoning_effort` to the Bedrock provider's
+    // thinking budget. Without `with_reasoning_effort` in build_bedrock_provider,
+    // per-step thinking is invisible through `flowforge run`. ----
+
+    #[test]
+    fn bedrock_cli_provider_forwards_reasoning_effort() {
+        // The reasoning_effort field from provider.json reaches the Bedrock
+        // provider — assertable via the public accessor, no live Bedrock call.
+        let config = ProviderConfig {
+            kind: ProviderKind::Bedrock,
+            model: "anthropic.claude-3-5-sonnet-20241022-v2:0".into(),
+            reasoning_effort: ReasoningEffort::High,
+            ..Default::default()
+        };
+        let provider = super::build_bedrock_provider(&config);
+        assert_eq!(provider.reasoning_effort(), ReasoningEffort::High);
+    }
+
+    #[test]
+    fn bedrock_cli_provider_default_effort_is_medium() {
+        // Without an explicit reasoning_effort, the provider defaults to Medium.
+        let config = ProviderConfig {
+            kind: ProviderKind::Bedrock,
+            model: "anthropic.claude-3-5-sonnet-20241022-v2:0".into(),
+            ..Default::default()
+        };
+        let provider = super::build_bedrock_provider(&config);
+        assert_eq!(provider.reasoning_effort(), ReasoningEffort::Medium);
     }
 }
