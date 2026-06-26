@@ -2935,6 +2935,7 @@ mod tests {
             thinking: true,
             reasoning_effort: effort,
             supports_vision: false,
+            supports_documents: false,
             region: None,
             auth_mode: None,
             aws_profile: None,
