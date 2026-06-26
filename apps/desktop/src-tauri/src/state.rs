@@ -1407,12 +1407,16 @@ impl AppState {
     }
 
     /// Resolve the `(connection, model)` for a turn using RFC 0005 §11.2 three-tier
-    /// precedence: session > phenotype > global. The session tier has no setter yet
-    /// (Phase D, #499), so today this resolves the phenotype binding over the globally
-    /// active connection. `model` falls back to the *resolved connection's* own model,
-    /// never a foreign tier's, so a phenotype model override can never ride the wrong
-    /// endpoint -- the latent bug in RFC 0005 §11.1.
+    /// precedence: session > phenotype > global. An explicit per-session selection
+    /// (set via [`set_session_model`](Self::set_session_model)) wins outright -- it is
+    /// already a coherent `(connection, model)` pair. Absent that, this resolves the
+    /// phenotype binding over the globally active connection. `model` falls back to the
+    /// *resolved connection's* own model, never a foreign tier's, so a phenotype model
+    /// override can never ride the wrong endpoint -- the latent bug in RFC 0005 §11.1.
     pub fn resolve_model_selection(&self, session_id: &str) -> ModelSelection {
+        if let Some(model) = self.store.session_model(session_id) {
+            return model;
+        }
         let pheno = self.session_phenotype(session_id);
         let reg = self.registry.lock().unwrap();
         let connection = pheno.provider.clone().unwrap_or_else(|| reg.active.clone());
@@ -1634,6 +1638,33 @@ impl AppState {
     /// global default again (#265).
     pub fn set_session_mode(&self, session_id: &str, mode: Option<Mode>) {
         self.store.set_session_mode(session_id, mode);
+    }
+
+    /// The session's explicit per-pane model selection, or `None` if it inherits the
+    /// phenotype's model (#499). Raw passthrough; resolution lives in
+    /// [`resolve_model_selection`](Self::resolve_model_selection).
+    pub fn session_model(&self, session_id: &str) -> Option<ModelSelection> {
+        self.store.session_model(session_id)
+    }
+
+    /// Bind `session_id` to an explicit `(connection, model)` selection, or clear it
+    /// (`None`) so the session inherits its phenotype's model again (#499). Validates
+    /// the connection id against the live registry up front so a stale UI cannot pin a
+    /// phantom endpoint -- unknown ids error rather than silently riding the wrong
+    /// connection. Clearing always succeeds.
+    pub fn set_session_model(
+        &self,
+        session_id: &str,
+        selection: Option<ModelSelection>,
+    ) -> Result<(), String> {
+        if let Some(ref sel) = selection {
+            let reg = self.registry.lock().unwrap();
+            if !reg.connections.iter().any(|c| c.id == sel.connection) {
+                return Err(format!("unknown connection: {}", sel.connection));
+            }
+        }
+        self.store.set_session_model(session_id, selection);
+        Ok(())
     }
 }
 
@@ -2648,6 +2679,81 @@ mod tests {
         let sel = state.resolve_model_selection(&s.id);
         assert_eq!(sel.connection, "ollama");
         assert_eq!(sel.model, "llama3.2:70b");
+    }
+
+    // RFC 0005 §11.2 Phase D (#499): an explicit per-session selection is the top tier.
+    #[test]
+    fn session_model_override_wins_over_phenotype() {
+        let state = AppState::with_registry(ProviderRegistry::default());
+        // A phenotype binding that would otherwise route to ollama/llama3.2...
+        state.apply_phenotype(Phenotype {
+            name: "rust".into(),
+            skills: vec![],
+            model: None,
+            persona: None,
+            max_iterations: None,
+            provider: Some("ollama".into()),
+        });
+        let s = state.store.create_session(None);
+        // ...is overridden by an explicit session pin to the active connection.
+        state
+            .set_session_model(
+                &s.id,
+                Some(ModelSelection {
+                    connection: "candle-vllm".into(),
+                    model: "pinned-model".into(),
+                }),
+            )
+            .unwrap();
+        let sel = state.resolve_model_selection(&s.id);
+        assert_eq!(sel.connection, "candle-vllm");
+        assert_eq!(sel.model, "pinned-model");
+    }
+
+    #[test]
+    fn set_session_model_rejects_unknown_connection() {
+        let state = AppState::with_registry(ProviderRegistry::default());
+        let s = state.store.create_session(None);
+        let err = state
+            .set_session_model(
+                &s.id,
+                Some(ModelSelection {
+                    connection: "ghost-conn".into(),
+                    model: "whatever".into(),
+                }),
+            )
+            .unwrap_err();
+        assert!(err.contains("unknown connection"), "{err}");
+        // The rejected selection must NOT have been written.
+        assert!(state.session_model(&s.id).is_none());
+    }
+
+    #[test]
+    fn clearing_session_model_falls_back_to_phenotype() {
+        let state = AppState::with_registry(ProviderRegistry::default());
+        state.apply_phenotype(Phenotype {
+            name: "rust".into(),
+            skills: vec![],
+            model: None,
+            persona: None,
+            max_iterations: None,
+            provider: Some("ollama".into()),
+        });
+        let s = state.store.create_session(None);
+        state
+            .set_session_model(
+                &s.id,
+                Some(ModelSelection {
+                    connection: "candle-vllm".into(),
+                    model: "pinned-model".into(),
+                }),
+            )
+            .unwrap();
+        // Clearing the pin returns resolution to the phenotype tier.
+        state.set_session_model(&s.id, None).unwrap();
+        let sel = state.resolve_model_selection(&s.id);
+        assert_eq!(sel.connection, "ollama");
+        assert_eq!(sel.model, "llama3.2");
     }
 
     #[test]
