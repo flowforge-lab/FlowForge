@@ -10,6 +10,7 @@ import type {
   ProviderConfig,
   ProviderConnection,
   ProviderRegistry,
+  ModelSelection,
   ProviderKind,
   SearchConfig,
   ApprovalSafety,
@@ -230,6 +231,11 @@ const MOCK_PHENOTYPES: Phenotype[] = [
   {
     name: "reviewer",
     skills: ["create-pr"],
+    // Binds a provider + model (RFC 0005 §11.2, Phase C) so the per-pane model
+    // chip's phenotype tier is exercisable offline: a session on this phenotype
+    // (no session override) resolves to openai/gpt-4o, not the global default.
+    provider: "openai",
+    model: "gpt-4o",
   },
 ];
 
@@ -601,6 +607,9 @@ export class MockIpc implements FfIpc {
   private archivedVersions = new Map<string, string[]>();
   private activeSkills = new Set<string>();
   private activePhenotype: Phenotype = DEFAULT_PHENOTYPE;
+  // Per-session model overrides (RFC 0005 §11.2, Phase D; #499). Absent → the
+  // session inherits the phenotype/global tiers; see resolveModelSelection.
+  private sessionModelSelections = new Map<string, ModelSelection>();
 
   // MCP server statuses, keyed by id (mutated by enable/disable/restart/add/remove).
   private mcpServers = new Map<string, McpServerStatus>(
@@ -1541,6 +1550,53 @@ Shipping the Settings redesign — currently the Memory browser (SET.8).
       s.phenotype = name ?? undefined;
       s.updatedAt = now();
     }
+  }
+
+  // Per-session model selection (RFC 0005 §11.2, Phase D; #499). Mirrors the
+  // backend: validate the connection (unless clearing) then store/drop the
+  // per-session override. Other sessions are untouched.
+  async setSessionModelSelection(
+    sessionId: string,
+    selection: ModelSelection | null,
+  ): Promise<void> {
+    if (selection !== null) {
+      const conn = this.registry.connections.find(
+        (c) => c.id === selection.connection,
+      );
+      if (!conn) throw new Error(`unknown connection: ${selection.connection}`);
+      this.sessionModelSelections.set(sessionId, { ...selection });
+    } else {
+      this.sessionModelSelections.delete(sessionId);
+    }
+  }
+
+  async getSessionModelSelection(
+    sessionId: string,
+  ): Promise<ModelSelection | null> {
+    const sel = this.sessionModelSelections.get(sessionId);
+    return sel ? { ...sel } : null;
+  }
+
+  // Authoritative resolver mirror (§11.2), most-specific wins: session override →
+  // the session's phenotype (its `provider`/`model`, each inheriting when None) →
+  // the global active connection + its model.
+  async resolveModelSelection(sessionId: string): Promise<ModelSelection> {
+    const override = this.sessionModelSelections.get(sessionId);
+    if (override) return { ...override };
+
+    const bound = this.sessions.get(sessionId)?.phenotype;
+    const pheno =
+      (bound === DEFAULT_PHENOTYPE.name
+        ? DEFAULT_PHENOTYPE
+        : bound
+          ? MOCK_PHENOTYPES.find((p) => p.name === bound)
+          : undefined) ?? this.activePhenotype;
+
+    const connId = pheno.provider ?? this.registry.active;
+    const conn =
+      this.registry.connections.find((c) => c.id === connId) ??
+      this.activeConnection();
+    return { connection: conn.id, model: pheno.model ?? conn.model };
   }
 
   // Profile marketplace search (SET.7). Empty query lists the full catalog,

@@ -14,6 +14,7 @@ import {
 } from "@/components/ui/icon";
 import { Popover as PopoverPrimitive } from "radix-ui";
 import { Button } from "@/components/ui/button";
+import { ModelChip } from "@/components/model-chip";
 import {
   DropdownMenu,
   DropdownMenuTrigger,
@@ -407,6 +408,7 @@ export function InputBar({
                   />
                   <ModePill sessionId={targetSessionId} />
                   <WorkspaceSelector sessionId={targetSessionId} />
+                  <ModelChip sessionId={targetSessionId} />
                   {attachGated ? (
                     // Capability gate (#342/#504): the active model accepts neither
                     // images nor documents, so the attach button is disabled + badged
