@@ -2038,6 +2038,9 @@ pub fn reload_registry(root: &Path, registry: &SharedRegistry) {
 mod tests {
     use super::*;
     use ff_core::ReasoningEffort;
+    use ff_llm::{ChatMessage, ChatRequest};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     // Approvals are only registered while a turn is live, so a cancel token must
     // exist for the session first — mirrors `send_message` registering the token
@@ -2890,6 +2893,80 @@ mod tests {
         assert_eq!(bedrock.model, "us.anthropic.claude-opus-4-8");
         // A file written before #395 carries no reasoningEffort -> defaults to Medium.
         assert_eq!(bedrock.reasoning_effort, ReasoningEffort::default());
+    }
+
+    async fn siliconflow_connection_body(
+        mut conn: ProviderConnection,
+        thinking: bool,
+    ) -> serde_json::Value {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("data: [DONE]\n\n"))
+            .mount(&server)
+            .await;
+
+        conn.base_url = Some(server.uri());
+        let model = conn.model.clone();
+        let provider = super::build_provider(&conn);
+        let req = ChatRequest {
+            model,
+            messages: vec![ChatMessage::text("user", "hi")],
+            tools: Vec::new(),
+            thinking,
+        };
+        let _ = provider.chat_stream(req).await.expect("send succeeds");
+        let reqs = server.received_requests().await.expect("requests recorded");
+        serde_json::from_slice(&reqs[0].body).expect("body is json")
+    }
+
+    fn siliconflow_conn(id: &str, effort: ReasoningEffort) -> ProviderConnection {
+        ProviderConnection {
+            id: id.into(),
+            kind: ProviderKind::SiliconFlow,
+            display_name: "SiliconFlow".into(),
+            vendor: None,
+            base_url: None,
+            model: "zai-org/GLM-5.2".into(),
+            has_key: false,
+            thinking: true,
+            reasoning_effort: effort,
+            supports_vision: false,
+            region: None,
+            auth_mode: None,
+            aws_profile: None,
+            access_key_id: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn build_provider_threads_high_connection_effort_to_siliconflow_request() {
+        let body = siliconflow_connection_body(
+            siliconflow_conn("sf-high-effort", ReasoningEffort::High),
+            true,
+        )
+        .await;
+
+        assert_eq!(body["thinking_budget"], 8192);
+        assert!(body.get("enable_thinking").is_none());
+    }
+
+    #[tokio::test]
+    async fn legacy_connection_without_reasoning_effort_emits_medium_budget() {
+        let legacy = r#"{
+          "id": "sf-legacy-effort",
+          "kind": "siliconFlow",
+          "displayName": "SiliconFlow",
+          "model": "zai-org/GLM-5.2",
+          "hasKey": false,
+          "thinking": true,
+          "supportsVision": false
+        }"#;
+        let conn: ProviderConnection = serde_json::from_str(legacy).unwrap();
+        assert_eq!(conn.reasoning_effort, ReasoningEffort::Medium);
+
+        let body = siliconflow_connection_body(conn, true).await;
+        assert_eq!(body["thinking_budget"], 4096);
     }
 
     /// Editing one connection (the legacy active-config shim, or a per-connection

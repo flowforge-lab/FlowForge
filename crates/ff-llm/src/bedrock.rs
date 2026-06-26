@@ -106,6 +106,13 @@ impl BedrockProvider {
         self
     }
 
+    /// Thinking config that `chat_stream` emits on the Converse wire request.
+    /// Factored out (#395 acceptance) so the provider's private
+    /// `reasoning_effort` dial is assertable without a live Bedrock call.
+    fn thinking_config_for(&self, model: &str) -> (Document, Option<i32>) {
+        thinking_request_config(model, self.reasoning_effort)
+    }
+
     /// Build a Bedrock client for the configured region and credential mode.
     /// A rustls-ring HTTP client is wired explicitly so we never pull aws-lc-rs.
     async fn client(&self) -> Client {
@@ -259,6 +266,20 @@ fn adaptive_thinking_doc(effort: ReasoningEffort) -> Document {
     ]))
 }
 
+/// Extra Converse request fields (and any paired `maxTokens` pin) for a thinking
+/// turn. This is the single branch used by the emitted request path.
+fn thinking_request_config(model: &str, effort: ReasoningEffort) -> (Document, Option<i32>) {
+    if uses_adaptive_thinking(model) {
+        (adaptive_thinking_doc(effort), None)
+    } else {
+        let budget = effort.budget_tokens();
+        (
+            reasoning_config_doc(budget),
+            Some((budget + BEDROCK_ANSWER_HEADROOM) as i32),
+        )
+    }
+}
+
 /// Whether `model` is an adaptive-thinking Claude (Opus 4.6+, Sonnet 4.6+, and
 /// the named Mythos/Fable lines), which require [`adaptive_thinking_doc`] rather
 /// than the legacy [`reasoning_config_doc`]. Version-aware so future minors
@@ -314,8 +335,8 @@ impl Provider for BedrockProvider {
                 system.push(SystemContentBlock::CachePoint(point));
             }
         }
+        let thinking_config = req.thinking.then(|| self.thinking_config_for(&req.model));
 
-        let adaptive = uses_adaptive_thinking(&req.model);
         let mut call = client
             .converse_stream()
             .model_id(req.model)
@@ -333,20 +354,15 @@ impl Provider for BedrockProvider {
         //   - Legacy (Opus/Sonnet 4.5 and older): reasoning_config + a maxTokens
         //     pin, since Converse needs maxTokens > budget_tokens.
         // Non-thinking turns are untouched, preserving the model's default maxTokens.
-        if req.thinking {
-            if adaptive {
-                call = call
-                    .additional_model_request_fields(adaptive_thinking_doc(self.reasoning_effort));
-            } else {
-                let budget = self.reasoning_effort.budget_tokens();
-                call = call
-                    .inference_config(
-                        InferenceConfiguration::builder()
-                            .max_tokens((budget + BEDROCK_ANSWER_HEADROOM) as i32)
-                            .build(),
-                    )
-                    .additional_model_request_fields(reasoning_config_doc(budget));
+        if let Some((fields, max_tokens)) = thinking_config {
+            if let Some(max_tokens) = max_tokens {
+                call = call.inference_config(
+                    InferenceConfiguration::builder()
+                        .max_tokens(max_tokens)
+                        .build(),
+                );
             }
+            call = call.additional_model_request_fields(fields);
         }
 
         let output = call.send().await.map_err(map_sdk_err)?;
@@ -1039,6 +1055,79 @@ mod tests {
             // No legacy budget interface leaks into the adaptive shape.
             assert!(!top.contains_key("reasoning_config"));
         }
+    }
+
+    #[test]
+    fn thinking_request_config_emits_legacy_budget_or_adaptive_effort() {
+        let (legacy, legacy_max) =
+            thinking_request_config("anthropic.claude-sonnet-4-5", ReasoningEffort::High);
+        assert_eq!(budget_of(&legacy), 8192);
+        assert_eq!(
+            legacy_max,
+            Some((8192 + BEDROCK_ANSWER_HEADROOM) as i32),
+            "legacy Converse thinking pins maxTokens above the budget"
+        );
+
+        let (adaptive, adaptive_max) =
+            thinking_request_config("us.anthropic.claude-opus-4-8", ReasoningEffort::High);
+        assert_eq!(adaptive_max, None, "adaptive thinking has no budget pin");
+        let Document::Object(top) = adaptive else {
+            panic!("expected object")
+        };
+        assert!(
+            !top.contains_key("reasoning_config"),
+            "adaptive models must not emit deprecated budget_tokens"
+        );
+        let Document::Object(output_config) = &top["output_config"] else {
+            panic!("expected output_config object")
+        };
+        assert_eq!(
+            output_config["effort"],
+            Document::String(ReasoningEffort::High.effort_str().to_string())
+        );
+    }
+
+    /// #395 acceptance: the provider's private `reasoning_effort` dial (set via
+    /// `with_reasoning_effort`) must reach the thinking config that `chat_stream`
+    /// emits on the wire — not just `thinking_request_config`'s return value
+    /// when the effort is passed directly.  High → legacy budget 8192 /
+    /// adaptive `output_config.effort = "high"`.
+    #[test]
+    fn high_effort_provider_emits_legacy_budget_or_adaptive_effort() {
+        let provider = BedrockProvider::new(
+            "us-east-2",
+            BedrockCreds::ApiKey {
+                token: "secret".into(),
+            },
+        )
+        .with_reasoning_effort(ReasoningEffort::High);
+
+        // Legacy model — budget_tokens path.
+        let (legacy, legacy_max) = provider.thinking_config_for("anthropic.claude-sonnet-4-5");
+        assert_eq!(budget_of(&legacy), 8192);
+        assert_eq!(
+            legacy_max,
+            Some((8192 + BEDROCK_ANSWER_HEADROOM) as i32),
+            "legacy Converse thinking pins maxTokens above the budget"
+        );
+
+        // Adaptive model — output_config.effort path.
+        let (adaptive, adaptive_max) = provider.thinking_config_for("us.anthropic.claude-opus-4-8");
+        assert_eq!(adaptive_max, None, "adaptive thinking has no budget pin");
+        let Document::Object(top) = adaptive else {
+            panic!("expected object")
+        };
+        assert!(
+            !top.contains_key("reasoning_config"),
+            "adaptive models must not emit deprecated budget_tokens"
+        );
+        let Document::Object(output_config) = &top["output_config"] else {
+            panic!("expected output_config object")
+        };
+        assert_eq!(
+            output_config["effort"],
+            Document::String(ReasoningEffort::High.effort_str().to_string())
+        );
     }
 
     #[test]
