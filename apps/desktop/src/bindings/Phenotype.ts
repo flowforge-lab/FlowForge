@@ -18,6 +18,12 @@ skills: Array<string>,
  */
 model?: string, 
 /**
+ * Binds this phenotype to a specific provider connection (RFC 0005 Phase C).
+ * `None` inherits the globally active connection. Pairs with `model` to form
+ * the phenotype tier of three-tier model resolution (RFC 0005 §11.2).
+ */
+provider?: string, 
+/**
  * Extra system-prompt preamble for this phenotype.
  */
 persona?: string, 

@@ -564,13 +564,17 @@ fn spawn_assistant_turn(state: Arc<AppState>, app: tauri::AppHandle, session_id:
 
     // Snapshot the provider from the current config for this turn; a settings
     // change between turns is picked up on the next `send_message`.
-    let (provider, default_model) = state.build_provider();
     // Resolve THIS session's phenotype (#246): an explicit per-pane binding, else
-    // the global active one. It supplies the model override, persona, active
-    // skills, and the loop iteration cap for the turn (RFC 0001 §7) — so two panes
-    // can run different Phenos.
+    // the global active one. It supplies the persona, active skills, and the loop
+    // iteration cap for the turn (RFC 0001 §7) — so two panes can run different Phenos.
     let pheno = state.session_phenotype(&session_id);
-    let model = pheno.model.clone().unwrap_or(default_model);
+    // Resolve the (connection, model) for the turn via the three-tier precedence
+    // session > phenotype > global (RFC 0005 §11.2) and build the provider for the
+    // RESOLVED connection. This routes a phenotype model override through its intended
+    // endpoint rather than the global active one (fixes RFC 0005 §11.1).
+    let selection = state.resolve_model_selection(&session_id);
+    let (provider, _) = state.build_provider_for(Some(&selection.connection));
+    let model = selection.model;
     let persona = pheno.persona.clone();
     // Per-pane iteration cap (#244-R3 x #246): the resolved phenotype carries
     // `max_iterations`, so the bound Pheno governs the loop cap with no extra plumbing.

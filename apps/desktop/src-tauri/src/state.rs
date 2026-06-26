@@ -10,7 +10,7 @@ use ff_agent::{
     ContextPressureEstimator, MemoryFlush, ProxyTokenEstimator, DEFAULT_FLUSH_AT_FRACTION,
 };
 use ff_core::{
-    BedrockAuth, McpServerState, McpServerStatus, Mode, Phenotype, ProviderConfig,
+    BedrockAuth, McpServerState, McpServerStatus, Mode, ModelSelection, Phenotype, ProviderConfig,
     ProviderConnection, ProviderKind, ProviderRegistry, SearchConfig, SecretKind,
 };
 use ff_llm::{
@@ -1404,6 +1404,26 @@ impl AppState {
         (build_provider(&conn), conn.model)
     }
 
+    /// Resolve the `(connection, model)` for a turn using RFC 0005 §11.2 three-tier
+    /// precedence: session > phenotype > global. The session tier has no setter yet
+    /// (Phase D, #499), so today this resolves the phenotype binding over the globally
+    /// active connection. `model` falls back to the *resolved connection's* own model,
+    /// never a foreign tier's, so a phenotype model override can never ride the wrong
+    /// endpoint -- the latent bug in RFC 0005 §11.1.
+    pub fn resolve_model_selection(&self, session_id: &str) -> ModelSelection {
+        let pheno = self.session_phenotype(session_id);
+        let reg = self.registry.lock().unwrap();
+        let connection = pheno.provider.clone().unwrap_or_else(|| reg.active.clone());
+        let model = pheno.model.clone().unwrap_or_else(|| {
+            reg.connections
+                .iter()
+                .find(|c| c.id == connection)
+                .map(|c| c.model.clone())
+                .unwrap_or_else(|| active_connection_or_default(&reg).model)
+        });
+        ModelSelection { connection, model }
+    }
+
     pub fn register_cancel(&self, session_id: &str, token: CancelToken) {
         self.approvals
             .lock()
@@ -2267,6 +2287,7 @@ mod tests {
                 model: None,
                 persona: None,
                 max_iterations: None,
+                provider: None,
             }),
             _ => None,
         }
@@ -2329,6 +2350,7 @@ mod tests {
             model: Some("qwen3-coder".into()),
             persona: Some("You are a Rust expert.".into()),
             max_iterations: None,
+            provider: None,
         };
         state.apply_phenotype(pheno);
         assert!(state.active_skills().is_empty());
@@ -2466,6 +2488,7 @@ mod tests {
             model: None,
             persona: None,
             max_iterations: None,
+            provider: None,
         });
         // Unknown skills are dropped; the returned set mirrors the active set so the
         // caller can warn about MCP requirements without re-resolving.
@@ -2487,6 +2510,7 @@ mod tests {
             model: Some("m".into()),
             persona: Some("p".into()),
             max_iterations: None,
+            provider: None,
         });
         state.apply_phenotype(default_phenotype());
         assert!(state.active_model_override().is_none());
@@ -2504,6 +2528,7 @@ mod tests {
             model: Some("qwen3-coder".into()),
             persona: Some("You are a Rust expert.".into()),
             max_iterations: Some(40),
+            provider: None,
         });
         let s = state.store.create_session(None);
         let resolved = state.session_phenotype(&s.id);
@@ -2538,6 +2563,7 @@ mod tests {
             model: None,
             persona: None,
             max_iterations: None,
+            provider: None,
         });
         let s = state.store.create_session(None);
         // Inject a dangling binding directly through the store (the validated
@@ -2550,6 +2576,73 @@ mod tests {
             resolved.name, "rust",
             "unknown binding inherits global active"
         );
+    }
+
+    // RFC 0005 Phase C (#498): three-tier model resolution. `with_registry` seeds the
+    // default registry (active `candle-vllm` @ Qwen3-4B + `ollama` @ llama3.2), so a
+    // phenotype `provider` binding is observable against a real second connection.
+    #[test]
+    fn unbound_session_resolves_to_active_connection_and_its_model() {
+        let state = AppState::with_registry(ProviderRegistry::default());
+        let s = state.store.create_session(None);
+        let sel = state.resolve_model_selection(&s.id);
+        assert_eq!(sel.connection, "candle-vllm");
+        assert_eq!(sel.model, "Qwen3-4B-Instruct-2507");
+    }
+
+    #[test]
+    fn phenotype_model_override_without_provider_rides_active_connection() {
+        let state = AppState::with_registry(ProviderRegistry::default());
+        state.apply_phenotype(Phenotype {
+            name: "rust".into(),
+            skills: vec![],
+            model: Some("custom-model".into()),
+            persona: None,
+            max_iterations: None,
+            provider: None,
+        });
+        let s = state.store.create_session(None);
+        let sel = state.resolve_model_selection(&s.id);
+        // No provider binding -> stays on the active connection (backward compatible),
+        // but now the override model is routed through it explicitly.
+        assert_eq!(sel.connection, "candle-vllm");
+        assert_eq!(sel.model, "custom-model");
+    }
+
+    #[test]
+    fn phenotype_provider_binding_routes_to_that_connections_model() {
+        let state = AppState::with_registry(ProviderRegistry::default());
+        state.apply_phenotype(Phenotype {
+            name: "rust".into(),
+            skills: vec![],
+            model: None,
+            persona: None,
+            max_iterations: None,
+            provider: Some("ollama".into()),
+        });
+        let s = state.store.create_session(None);
+        let sel = state.resolve_model_selection(&s.id);
+        // Provider bound, no explicit model -> the BOUND connection's own model, never
+        // the active connection's (the RFC 0005 §11.1 cross-endpoint bug).
+        assert_eq!(sel.connection, "ollama");
+        assert_eq!(sel.model, "llama3.2");
+    }
+
+    #[test]
+    fn phenotype_provider_and_model_are_both_honored() {
+        let state = AppState::with_registry(ProviderRegistry::default());
+        state.apply_phenotype(Phenotype {
+            name: "rust".into(),
+            skills: vec![],
+            model: Some("llama3.2:70b".into()),
+            persona: None,
+            max_iterations: None,
+            provider: Some("ollama".into()),
+        });
+        let s = state.store.create_session(None);
+        let sel = state.resolve_model_selection(&s.id);
+        assert_eq!(sel.connection, "ollama");
+        assert_eq!(sel.model, "llama3.2:70b");
     }
 
     #[test]

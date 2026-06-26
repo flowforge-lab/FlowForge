@@ -42,6 +42,7 @@ pub fn default_phenotype() -> Phenotype {
         model: None,
         persona: None,
         max_iterations: None,
+        provider: None,
     }
 }
 
@@ -59,6 +60,8 @@ struct PhenotypeFile {
     persona: Option<String>,
     #[serde(default)]
     max_iterations: Option<usize>,
+    #[serde(default)]
+    provider: Option<String>,
 }
 
 impl PhenotypeFile {
@@ -69,6 +72,7 @@ impl PhenotypeFile {
             model: self.model,
             persona: self.persona,
             max_iterations: self.max_iterations,
+            provider: self.provider,
         }
     }
 }
