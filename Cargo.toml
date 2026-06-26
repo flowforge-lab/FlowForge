@@ -42,6 +42,7 @@ ff-llm = { path = "crates/ff-llm" }
 ff-mcp = { path = "crates/ff-mcp" }
 ff-memory = { path = "crates/ff-memory" }
 ff-session = { path = "crates/ff-session" }
+ff-scheduled = { path = "crates/ff-scheduled" }
 ff-signals = { path = "crates/ff-signals" }
 ff-skills = { path = "crates/ff-skills" }
 ff-tools = { path = "crates/ff-tools" }
