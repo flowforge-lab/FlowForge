@@ -2,7 +2,7 @@
 name: pr-review
 description: Scope a pull-request review to the changed hunks. Fetch the diff once, reason about the change, and do not spider the call graph.
 version: 0.1.0
-author: tonytan4ever
+author: isaacm
 keywords:
   - review
   - pull-request
