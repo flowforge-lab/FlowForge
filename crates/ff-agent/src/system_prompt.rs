@@ -150,7 +150,9 @@ pub fn build_system_prompt(
          Large tool results are abbreviated to save context and end with a \
          `[compacted; retrieve key=<HEX>]` marker. When you need detail the \
          abbreviation dropped, call `compaction_retrieve` with that key to read \
-         the verbatim original.\n\n",
+         the verbatim original. These markers and any `[N lines elided]` \
+         placeholders are scaffolding, not content -- never copy them into your \
+         reply. If your answer needs that detail, retrieve it first.\n\n",
     );
 
     // Stable guidance (cache-stable prefix): batching independent tool calls into
@@ -185,10 +187,19 @@ pub fn build_system_prompt(
         "## Reviewing pull requests\n\
          When your task is to review a pull request or a diff, stay scoped to the \
          change:\n\
-         - Fetch the PR metadata, review comments, and unified diff once -- a single \
-         `gh pr view --json title,body,comments` plus `gh pr diff`. Reuse that result \
-         for the whole review; do not re-read the same files or re-run the same diff \
-         piecemeal across turns.\n\
+         - Fetch what you need once, as compactly as possible:\n\
+           - The change itself as a unified diff: `Accept: application/vnd.github.diff` \
+         on `.../pulls/<n>` returns the raw diff text (not JSON). If the `gh` CLI is \
+         available, `gh pr diff` is equivalent.\n\
+           - Title/body and review comments: `.../pulls/<n>` (without the diff media \
+         type) and `.../issues/<n>/comments`, or `gh pr view --json title,body,comments` \
+         if `gh` is available.\n\
+         Reuse those single results for the whole review; do not re-read the same files \
+         or re-run the same diff piecemeal across turns.\n\
+         - Never request the JSON file listing (`.../pulls/<n>/files`): that payload is \
+         many times larger than the diff text, floods the context, and forces \
+         compaction that drops the very review you are writing. Use it only if you \
+         specifically need per-file metadata the diff cannot give.\n\
          - Reason about the changed hunks first. The diff is the review's subject; \
          everything else is supporting evidence, not the thing under review.\n\
          - Read wider context only when a specific comment or suspected defect \
@@ -533,8 +544,30 @@ mod tests {
             "must forbid call-graph spidering"
         );
         assert!(
-            out.contains("Reuse that result"),
+            out.contains("Reuse those single results"),
             "must tell the agent to reuse the single fetch"
+        );
+        assert!(
+            out.contains("application/vnd.github.diff"),
+            "must offer a gh-free diff fetch path"
+        );
+        assert!(
+            out.contains(".../pulls/<n>/files"),
+            "must name the heavy file-listing anti-pattern"
+        );
+    }
+
+    #[test]
+    fn compaction_guidance_forbids_reproducing_markers() {
+        // A weaker model regurgitated [N lines elided] / [compacted; retrieve
+        // key=...] placeholders as its answer instead of calling
+        // compaction_retrieve (see #512). The guidance must explicitly forbid
+        // copying the markers into the reply.
+        let reg = SkillRegistry::new();
+        let out = build_system_prompt(None, &reg, &[], &ctx(), None, Mode::default());
+        assert!(
+            out.contains("never copy them into your reply"),
+            "must forbid reproducing compaction markers: {out}"
         );
     }
 }
