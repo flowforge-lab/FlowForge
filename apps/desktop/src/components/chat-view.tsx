@@ -11,6 +11,7 @@ import { Markdown } from "@/components/markdown";
 import { MessageActions } from "@/components/message-actions";
 import { MessageAttachments } from "@/components/message-attachments";
 import { ThinkingIndicator } from "@/components/thinking-indicator";
+import { ContinueAffordance } from "@/components/continue-affordance";
 import { foldTurns } from "@/lib/turn-groups";
 import type { TurnItem } from "@/lib/turn-groups";
 import { useExperimentalStore } from "@/store/experimental";
@@ -353,6 +354,7 @@ export function ChatView({ sessionId }: { sessionId?: string } = {}) {
             );
           })}
           {pending && <ThinkingIndicator />}
+          <ContinueAffordance sessionId={targetSessionId} />
         </div>
       </div>
 
