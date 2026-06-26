@@ -17,7 +17,7 @@ mod skill;
 
 pub use export::Format;
 pub use mcp::{McpServerConfig, McpServerState, McpServerStatus, McpToolInfo};
-pub use memory::{MemoryFileInfo, MemoryFileKind, MemoryOverview};
+pub use memory::{MemoryChunkStat, MemoryFileInfo, MemoryFileKind, MemoryOverview};
 pub use message::{Attachment, AttachmentKind, AttachmentSource, Message, Role, ToolCall};
 pub use mode::Mode;
 pub use model_specs::{

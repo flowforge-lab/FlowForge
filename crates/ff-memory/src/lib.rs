@@ -29,7 +29,7 @@ pub use consolidate::{chunk_key, ConsolidationReport, RecencyFrequencySalience, 
 pub use embed::{Embedder, NoopEmbedder, OpenAiEmbedder};
 pub use error::{MemoryError, Result};
 pub use flush::{FlushLedger, FlushRecord};
-pub use index::{Fts5Index, HybridIndex, MemoryIndex, ScoredChunk};
+pub use index::{ChunkStatSnapshot, Fts5Index, HybridIndex, MemoryIndex, ScoredChunk};
 
 use std::path::{Path, PathBuf};
 
@@ -1486,6 +1486,37 @@ mod tests {
             block.contains("user dislikes verbose logs"),
             "live body kept: {block}"
         );
+    }
+
+    #[test]
+    fn ambient_keeps_pinned_curated_chunk_even_when_decayed() {
+        // A chunk recalled long ago WOULD decay dormant and be excised — but
+        // pinning it holds effective weight at 1.0, so curated_filter (which reads
+        // effective_stats) keeps it in the ambient block. Pinning thus retains a
+        // fact in ambient injection as well as out of dormancy (RFC 0007 §7, #293).
+        let dir = tempfile::tempdir().unwrap();
+        let m = mem(dir.path());
+        write(
+            &m.curated_path(),
+            "## Likes\nuser prefers rust\n\n## Dislikes\nuser dislikes verbose logs\n",
+        );
+        let idx = enabled_index();
+        idx.reindex(&m.all_chunks()).unwrap();
+
+        let hits = search_for(&idx, "rust");
+        idx.reinforce_at(&hits, T0).unwrap();
+        let likes_key = crate::chunk_key(&hits[0].chunk);
+        idx.set_chunk_pinned_at(&likes_key, true, T0).unwrap();
+        let future = T0 + 500 * DAY_MS;
+
+        let today = NaiveDate::from_ymd_opt(2026, 6, 22).unwrap();
+        let block = m.ambient_block_filtered_for(&idx, today, future).unwrap();
+
+        assert!(
+            block.contains("user prefers rust"),
+            "pinned chunk retained in ambient despite long decay: {block}"
+        );
+        assert!(block.contains("## Likes"), "pinned heading kept: {block}");
     }
 
     #[test]

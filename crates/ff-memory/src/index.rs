@@ -49,6 +49,23 @@ pub struct EffectiveStat {
     pub last_accessed_ms: i64,
 }
 
+/// Full read-time usage snapshot for one chunk, backing the M6.2 "Salience"
+/// surface (#293). Unlike [`EffectiveStat`] this is emitted for *every* keyed
+/// row regardless of the decay flag, and carries the raw `access_count` and
+/// `pinned` flag plus a server-computed `dormant` predicate — so the frontend
+/// never re-derives the threshold (RFC 0007 §7). `weight` is pin-aware: a
+/// pinned chunk reads `1.0` (decay skipped), matching [`effective_stats`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ChunkStatSnapshot {
+    /// Effective (pin-aware, lazily decayed) weight at the query instant.
+    pub weight: f32,
+    pub last_accessed_ms: i64,
+    pub access_count: u32,
+    pub pinned: bool,
+    /// `decay.enabled && weight < dormant_threshold && !pinned` (RFC 0007 §3).
+    pub dormant: bool,
+}
+
 /// Recall backend (RFC 0006 §6). Swappable so M5.3 can add a hybrid vector index
 /// behind the same seam; v1 ships [`Fts5Index`].
 pub trait MemoryIndex: Send + Sync {
@@ -89,6 +106,33 @@ pub trait MemoryIndex: Send + Sync {
         _now_ms: i64,
     ) -> Result<HashMap<String, EffectiveStat>> {
         Ok(HashMap::new())
+    }
+    /// Full per-chunk usage snapshot for the M6.2 Salience surface (#293):
+    /// effective (pin-aware) weight, `last_accessed_ms`, `access_count`, `pinned`,
+    /// and the server-computed `dormant` predicate, for every key that has a
+    /// `chunk_stats` row — emitted regardless of the decay flag (unlike
+    /// [`effective_stats`](Self::effective_stats), which is empty when decay is
+    /// off). Keys with no row are omitted; callers treat an absent key as a
+    /// never-recalled chunk (weight `1.0`, never dormant, not pinned). The
+    /// default is empty so backends without a stats table need no change.
+    fn chunk_stats_snapshot(
+        &self,
+        _keys: &[String],
+        _now_ms: i64,
+    ) -> Result<HashMap<String, ChunkStatSnapshot>> {
+        Ok(HashMap::new())
+    }
+    /// Reset (wake) a chunk: restore `weight` to `1.0` and stamp `last_accessed`
+    /// to now, creating the row if absent (RFC 0007 §7). The default is a no-op
+    /// so backends without a stats table need no change.
+    fn reset_chunk(&self, _key: &str) -> Result<()> {
+        Ok(())
+    }
+    /// Set a chunk's `pinned` flag, creating the row if absent. A pinned chunk
+    /// reads effective weight `1.0` (decay skipped) and is never dormant (#293).
+    /// The default is a no-op so backends without a stats table need no change.
+    fn set_chunk_pinned(&self, _key: &str, _pinned: bool) -> Result<()> {
+        Ok(())
     }
 }
 
@@ -148,10 +192,12 @@ impl Fts5Index {
                  chunk_key     TEXT PRIMARY KEY,
                  weight        REAL    NOT NULL DEFAULT 1.0,
                  last_accessed INTEGER NOT NULL,
-                 access_count  INTEGER NOT NULL DEFAULT 0
+                 access_count  INTEGER NOT NULL DEFAULT 0,
+                 pinned        INTEGER NOT NULL DEFAULT 0
              );",
         )?;
         Self::ensure_embedding_column(&conn)?;
+        Self::ensure_pinned_column(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
             decay: DecayConfig::default(),
@@ -181,6 +227,27 @@ impl Fts5Index {
             .any(|name| name == "embedding");
         if !has_embedding {
             conn.execute("ALTER TABLE chunks ADD COLUMN embedding BLOB", [])?;
+        }
+        Ok(())
+    }
+
+    /// Back-fill the `pinned` column on `chunk_stats` tables created before M6.2
+    /// (#293). The M6.0 schema had no `pinned` column, and the `CREATE TABLE IF
+    /// NOT EXISTS` above is a no-op against a pre-existing table — so an old
+    /// on-disk index would lack the column and every pin write would fail. Mirror
+    /// of [`ensure_embedding_column`] for the stats side table.
+    fn ensure_pinned_column(conn: &Connection) -> Result<()> {
+        let has_pinned = conn
+            .prepare("PRAGMA table_info(chunk_stats)")?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<std::result::Result<Vec<String>, _>>()?
+            .iter()
+            .any(|name| name == "pinned");
+        if !has_pinned {
+            conn.execute(
+                "ALTER TABLE chunk_stats ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
         }
         Ok(())
     }
@@ -316,6 +383,39 @@ impl Fts5Index {
             }
         }
         tx.commit()?;
+        Ok(())
+    }
+
+    /// Time-injectable core of [`reset_chunk`](MemoryIndex::reset_chunk) (#293).
+    /// Restores `weight` to `1.0` and stamps `last_accessed = now_ms`, creating
+    /// the row if absent (a never-recalled chunk has no row). `access_count` and
+    /// `pinned` are preserved on an existing row; a fresh row starts at count `0`,
+    /// unpinned.
+    pub(crate) fn reset_chunk_at(&self, key: &str, now_ms: i64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO chunk_stats (chunk_key, weight, last_accessed, access_count, pinned)
+             VALUES (?1, 1.0, ?2, 0, 0)
+             ON CONFLICT(chunk_key) DO UPDATE SET weight = 1.0, last_accessed = ?2",
+            params![key, now_ms],
+        )?;
+        Ok(())
+    }
+
+    /// Time-injectable core of
+    /// [`set_chunk_pinned`](MemoryIndex::set_chunk_pinned) (#293). Sets the
+    /// `pinned` flag, creating the row if absent. A new row starts at weight
+    /// `1.0` with `last_accessed = now_ms` (so pinning a never-recalled chunk
+    /// does not fabricate an epoch-0 timestamp); an existing row keeps its
+    /// stored weight/timestamp — the pin overrides at read time anyway.
+    pub(crate) fn set_chunk_pinned_at(&self, key: &str, pinned: bool, now_ms: i64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO chunk_stats (chunk_key, weight, last_accessed, access_count, pinned)
+             VALUES (?1, 1.0, ?2, 0, ?3)
+             ON CONFLICT(chunk_key) DO UPDATE SET pinned = ?3",
+            params![key, now_ms, pinned as i64],
+        )?;
         Ok(())
     }
 }
@@ -456,23 +556,89 @@ impl MemoryIndex for Fts5Index {
             return Ok(out);
         }
         let conn = self.conn.lock().unwrap();
-        let mut sel =
-            conn.prepare("SELECT weight, last_accessed FROM chunk_stats WHERE chunk_key = ?1")?;
+        let mut sel = conn.prepare(
+            "SELECT weight, last_accessed, pinned FROM chunk_stats WHERE chunk_key = ?1",
+        )?;
         for key in keys {
-            let row: Option<(f64, i64)> = sel
-                .query_row(params![key], |r| Ok((r.get(0)?, r.get(1)?)))
+            let row: Option<(f64, i64, i64)> = sel
+                .query_row(params![key], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
                 .optional()?;
-            if let Some((w, last)) = row {
+            if let Some((w, last, pinned)) = row {
+                // A pinned chunk holds weight 1.0 (decay skipped), so the
+                // ambient-injection skip path (`curated_filter`) keeps it live —
+                // pinned facts never decay (RFC 0007 §7).
+                let weight = if pinned != 0 {
+                    1.0
+                } else {
+                    decayed_weight(w as f32, last, now_ms, self.decay.factor)
+                };
                 out.insert(
                     key.clone(),
                     EffectiveStat {
-                        weight: decayed_weight(w as f32, last, now_ms, self.decay.factor),
+                        weight,
                         last_accessed_ms: last,
                     },
                 );
             }
         }
         Ok(out)
+    }
+
+    fn chunk_stats_snapshot(
+        &self,
+        keys: &[String],
+        now_ms: i64,
+    ) -> Result<HashMap<String, ChunkStatSnapshot>> {
+        let mut out = HashMap::new();
+        if keys.is_empty() {
+            return Ok(out);
+        }
+        let threshold = self.decay.dormant_threshold;
+        let conn = self.conn.lock().unwrap();
+        let mut sel = conn.prepare(
+            "SELECT weight, last_accessed, access_count, pinned
+             FROM chunk_stats WHERE chunk_key = ?1",
+        )?;
+        for key in keys {
+            let row: Option<(f64, i64, i64, i64)> = sel
+                .query_row(params![key], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+                })
+                .optional()?;
+            if let Some((w, last, count, pinned)) = row {
+                let pinned = pinned != 0;
+                // Effective weight is pin-aware, and decay applies only when the
+                // flag is on — mirrors `effective_stats`, but emitted regardless
+                // of the decay flag so the Salience panel is not all-or-nothing.
+                let weight = if pinned {
+                    1.0
+                } else if self.decay.enabled {
+                    decayed_weight(w as f32, last, now_ms, self.decay.factor)
+                } else {
+                    w as f32
+                };
+                let dormant = self.decay.enabled && !pinned && weight < threshold;
+                out.insert(
+                    key.clone(),
+                    ChunkStatSnapshot {
+                        weight,
+                        last_accessed_ms: last,
+                        access_count: count.max(0) as u32,
+                        pinned,
+                        dormant,
+                    },
+                );
+            }
+        }
+        Ok(out)
+    }
+
+    fn reset_chunk(&self, key: &str) -> Result<()> {
+        self.reset_chunk_at(key, Utc::now().timestamp_millis())
+    }
+
+    fn set_chunk_pinned(&self, key: &str, pinned: bool) -> Result<()> {
+        self.set_chunk_pinned_at(key, pinned, Utc::now().timestamp_millis())
     }
 }
 
@@ -579,6 +745,22 @@ impl<E: Embedder> MemoryIndex for HybridIndex<E> {
         now_ms: i64,
     ) -> Result<HashMap<String, EffectiveStat>> {
         self.inner.effective_stats(keys, now_ms)
+    }
+
+    fn chunk_stats_snapshot(
+        &self,
+        keys: &[String],
+        now_ms: i64,
+    ) -> Result<HashMap<String, ChunkStatSnapshot>> {
+        self.inner.chunk_stats_snapshot(keys, now_ms)
+    }
+
+    fn reset_chunk(&self, key: &str) -> Result<()> {
+        self.inner.reset_chunk(key)
+    }
+
+    fn set_chunk_pinned(&self, key: &str, pinned: bool) -> Result<()> {
+        self.inner.set_chunk_pinned(key, pinned)
     }
 
     fn search(&self, query: &str, k: usize) -> Result<Vec<ScoredChunk>> {
@@ -1309,5 +1491,188 @@ mod tests {
             .unwrap();
         let (w, last, count) = read_stat(&idx, &chunk_key(&cs[0])).unwrap();
         assert_eq!((w, last, count), (1.0, 0, 1), "decay off => complete no-op");
+    }
+
+    // ----- M6.2 snapshot + reset + pin (RFC 0007 §7, #293) -----------------
+
+    fn read_pinned(idx: &Fts5Index, key: &str) -> Option<bool> {
+        let conn = idx.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT pinned FROM chunk_stats WHERE chunk_key = ?1",
+            params![key],
+            |r| r.get::<_, i64>(0),
+        )
+        .optional()
+        .unwrap()
+        .map(|p| p != 0)
+    }
+
+    #[test]
+    fn pin_holds_weight_at_one_across_a_decay_pass() {
+        // factor 0.5 would collapse an unpinned chunk to ~0 after 10 idle days;
+        // a pinned chunk reads 1.0 from BOTH the snapshot and effective_stats, so
+        // the ambient-injection skip path keeps it live (pinned facts never decay).
+        let decay = DecayConfig {
+            enabled: true,
+            factor: 0.5,
+            ..DecayConfig::default()
+        };
+        let idx = Fts5Index::open_in_memory().unwrap().with_decay(decay);
+        let cs = chunks("## H\nalpha body", "MEMORY.md");
+        idx.reindex(&cs).unwrap();
+        idx.reinforce_at(&scored(&cs), 0).unwrap();
+        let key = chunk_key(&cs[0]);
+        idx.set_chunk_pinned_at(&key, true, 0).unwrap();
+
+        let later = DAY_MS_I * 10;
+        let snap = idx
+            .chunk_stats_snapshot(std::slice::from_ref(&key), later)
+            .unwrap();
+        let s = snap.get(&key).expect("row present");
+        assert_eq!(s.weight, 1.0, "pinned weight held at 1.0");
+        assert!(!s.dormant, "pinned chunk is never dormant");
+        assert!(s.pinned);
+
+        let es = idx
+            .effective_stats(std::slice::from_ref(&key), later)
+            .unwrap();
+        assert_eq!(
+            es.get(&key).unwrap().weight,
+            1.0,
+            "effective_stats is pin-aware so curated_filter keeps the chunk live"
+        );
+    }
+
+    #[test]
+    fn unpinned_chunk_below_threshold_is_dormant_in_snapshot() {
+        let decay = DecayConfig {
+            enabled: true,
+            factor: 0.5,
+            ..DecayConfig::default()
+        };
+        let idx = Fts5Index::open_in_memory().unwrap().with_decay(decay);
+        let cs = chunks("## H\nalpha body", "MEMORY.md");
+        idx.reindex(&cs).unwrap();
+        idx.reinforce_at(&scored(&cs), 0).unwrap();
+        let key = chunk_key(&cs[0]);
+
+        // 3 idle days: 1.0 * 0.5^3 = 0.125 < dormant_threshold (0.25).
+        let snap = idx
+            .chunk_stats_snapshot(std::slice::from_ref(&key), DAY_MS_I * 3)
+            .unwrap();
+        let s = snap.get(&key).unwrap();
+        assert!((s.weight - 0.125).abs() < 1e-4, "weight {}", s.weight);
+        assert!(s.dormant, "below threshold and unpinned => dormant");
+        assert_eq!(s.access_count, 1);
+        assert!(!s.pinned);
+    }
+
+    #[test]
+    fn snapshot_emitted_even_when_decay_disabled() {
+        // Unlike effective_stats (empty when decay off), the snapshot still
+        // reports stored weight/access_count/pinned so the Salience panel is not
+        // all-or-nothing on the decay flag; nothing is ever dormant though.
+        let idx = Fts5Index::open_in_memory()
+            .unwrap()
+            .with_decay(disabled_decay());
+        let cs = chunks("## H\nalpha body", "MEMORY.md");
+        idx.reindex(&cs).unwrap();
+        idx.reinforce_at(&scored(&cs), 0).unwrap();
+        let key = chunk_key(&cs[0]);
+        let snap = idx
+            .chunk_stats_snapshot(std::slice::from_ref(&key), DAY_MS_I * 100)
+            .unwrap();
+        let s = snap.get(&key).expect("row present despite decay off");
+        assert_eq!(s.weight, 1.0, "decay off => stored weight, no decay");
+        assert!(!s.dormant, "decay off => never dormant");
+        assert_eq!(s.access_count, 1);
+    }
+
+    #[test]
+    fn snapshot_omits_unknown_keys() {
+        let idx = Fts5Index::open_in_memory()
+            .unwrap()
+            .with_decay(enabled_decay());
+        let snap = idx.chunk_stats_snapshot(&["nope".to_string()], 0).unwrap();
+        assert!(
+            snap.is_empty(),
+            "no row => caller treats as never-recalled 1.0"
+        );
+    }
+
+    #[test]
+    fn reset_restores_weight_and_creates_row_if_absent() {
+        let decay = DecayConfig {
+            enabled: true,
+            factor: 0.5,
+            ..DecayConfig::default()
+        };
+        let idx = Fts5Index::open_in_memory().unwrap().with_decay(decay);
+        let cs = chunks("## H\nalpha body", "MEMORY.md");
+        idx.reindex(&cs).unwrap();
+        let key = chunk_key(&cs[0]);
+
+        // Never recalled => no row. Reset must create it (wake) at weight 1.0.
+        assert!(read_stat(&idx, &key).is_none());
+        idx.reset_chunk_at(&key, 5_000).unwrap();
+        let (w, last, count) = read_stat(&idx, &key).expect("reset created the row");
+        assert_eq!((w, last, count), (1.0, 5_000, 0));
+
+        // Decay it, then reset again: weight back to 1.0, timestamp refreshed.
+        idx.reinforce_at(&scored(&cs), 0).unwrap(); // count -> 1, weight path
+        idx.reset_chunk_at(&key, DAY_MS_I).unwrap();
+        let (w, last, _) = read_stat(&idx, &key).unwrap();
+        assert_eq!(w, 1.0, "reset restores neutral weight");
+        assert_eq!(last, DAY_MS_I, "reset stamps last_accessed");
+    }
+
+    #[test]
+    fn set_pinned_round_trips_and_creates_row_if_absent() {
+        let idx = Fts5Index::open_in_memory()
+            .unwrap()
+            .with_decay(enabled_decay());
+        let cs = chunks("## H\nalpha body", "MEMORY.md");
+        idx.reindex(&cs).unwrap();
+        let key = chunk_key(&cs[0]);
+
+        assert!(read_stat(&idx, &key).is_none());
+        idx.set_chunk_pinned_at(&key, true, 7_000).unwrap();
+        assert_eq!(read_pinned(&idx, &key), Some(true), "pin creates the row");
+        let (w, last, count) = read_stat(&idx, &key).unwrap();
+        assert_eq!(
+            (w, last, count),
+            (1.0, 7_000, 0),
+            "fresh pinned row defaults"
+        );
+
+        idx.set_chunk_pinned_at(&key, false, 9_000).unwrap();
+        assert_eq!(read_pinned(&idx, &key), Some(false), "unpin round-trips");
+    }
+
+    #[test]
+    fn ensure_pinned_column_upgrades_a_columnless_db() {
+        // Simulate an M6.0 on-disk index: chunk_stats without the pinned column.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE chunk_stats (
+                 chunk_key     TEXT PRIMARY KEY,
+                 weight        REAL    NOT NULL DEFAULT 1.0,
+                 last_accessed INTEGER NOT NULL,
+                 access_count  INTEGER NOT NULL DEFAULT 0
+             );
+             INSERT INTO chunk_stats (chunk_key, weight, last_accessed, access_count)
+                 VALUES ('old:key', 0.5, 0, 3);",
+        )
+        .unwrap();
+
+        // from_conn must ALTER-in-place so pin writes succeed on the upgraded DB.
+        let idx = Fts5Index::from_conn(conn).unwrap();
+        assert_eq!(
+            read_pinned(&idx, "old:key"),
+            Some(false),
+            "back-filled column defaults to 0 on the pre-existing row"
+        );
+        idx.set_chunk_pinned_at("old:key", true, 1_000).unwrap();
+        assert_eq!(read_pinned(&idx, "old:key"), Some(true));
     }
 }
