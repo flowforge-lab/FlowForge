@@ -7,9 +7,12 @@ import {
   SUMMARY_THRESHOLD_MAX,
   SUMMARY_THRESHOLD_MIN,
   activeConnection,
+  concreteAuthMode,
   normalizeBaseUrl,
   useModelConfigStore,
 } from "@/store/model-config";
+import type { BedrockAuth } from "@/bindings/BedrockAuth";
+import type { ProviderConnection } from "@/bindings/ProviderConnection";
 
 describe("normalizeBaseUrl", () => {
   it("strips a trailing /chat/completions pasted from curl docs", () => {
@@ -32,6 +35,55 @@ describe("normalizeBaseUrl", () => {
       "https://api.openai.com/v1",
     );
     expect(normalizeBaseUrl("   ")).toBe("");
+  });
+});
+
+describe("concreteAuthMode", () => {
+  // Minimal Bedrock connection; each test overrides only the auth-relevant fields.
+  const bedrock = (
+    over: Partial<ProviderConnection> = {},
+  ): ProviderConnection => ({
+    id: "bedrock",
+    kind: "bedrock",
+    displayName: "AWS Bedrock",
+    model: "",
+    hasKey: false,
+    thinking: true,
+    reasoningEffort: "medium",
+    reasoningVisibility: "all",
+    region: "us-east-1",
+    ...over,
+  });
+
+  it("passes through the three concrete modes untouched", () => {
+    for (const mode of ["profile", "iamKeys", "apiKey"] as BedrockAuth[]) {
+      expect(concreteAuthMode(bedrock({ authMode: mode }))).toBe(mode);
+    }
+  });
+
+  it("migrates legacy auto to profile when a profile is set", () => {
+    expect(
+      concreteAuthMode(bedrock({ authMode: "auto", awsProfile: "default" })),
+    ).toBe("profile");
+  });
+
+  it("migrates legacy auto to iamKeys when an access key id is set", () => {
+    expect(
+      concreteAuthMode(bedrock({ authMode: "auto", accessKeyId: "AKIA…" })),
+    ).toBe("iamKeys");
+  });
+
+  it("migrates legacy auto to apiKey when only a stored secret is present (#554)", () => {
+    // No profile, no accessKeyId, but hasKey → the secret can only be the Bedrock
+    // API key; honors the backend precedence (API key → profile → IAM keys).
+    expect(concreteAuthMode(bedrock({ authMode: "auto", hasKey: true }))).toBe(
+      "apiKey",
+    );
+  });
+
+  it("defaults a bare auto (and an unset mode) to profile", () => {
+    expect(concreteAuthMode(bedrock({ authMode: "auto" }))).toBe("profile");
+    expect(concreteAuthMode(bedrock({ authMode: undefined }))).toBe("profile");
   });
 });
 
