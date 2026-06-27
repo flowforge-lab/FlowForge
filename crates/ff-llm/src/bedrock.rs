@@ -118,10 +118,17 @@ impl BedrockProvider {
         self
     }
 
+    /// The configured reasoning-effort dial (#394). Assertable without a live
+    /// Bedrock call, so callers (e.g. the CLI's `build_provider`) can prove the
+    /// dial reaches the provider without emitting a Converse request.
+    pub fn reasoning_effort(&self) -> ReasoningEffort {
+        self.reasoning_effort
+    }
+
     /// Thinking config that `chat_stream` emits on the Converse wire request.
     /// Factored out (#395 acceptance) so the provider's private
     /// `reasoning_effort` dial is assertable without a live Bedrock call.
-    fn thinking_config_for(&self, model: &str) -> (Document, Option<i32>) {
+    pub fn thinking_config_for(&self, model: &str) -> (Document, Option<i32>) {
         thinking_request_config(model, self.reasoning_effort)
     }
 
