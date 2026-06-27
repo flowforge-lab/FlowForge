@@ -26,8 +26,8 @@ use ff_memory::{
 use ff_session::SessionStore;
 use ff_signals::{SignalStore, SkillAggregate, SkillCompleted};
 use ff_skills::{
-    default_phenotype, load_phenotypes, SharedRegistry, SkillRegistry, SkillWatcher,
-    DEFAULT_PHENOTYPE,
+    default_phenotype, load_phenotypes, save_phenotype, SharedRegistry, SkillRegistry,
+    SkillWatcher, DEFAULT_PHENOTYPE,
 };
 use ff_tools::memory::{MemoryConsolidateTool, MemoryGetTool, MemorySearchTool, MemoryWriteTool};
 use ff_tools::process::{ProcessManagerTool, ProcessSupervisor};
@@ -1552,6 +1552,27 @@ impl AppState {
         Ok(pheno)
     }
 
+    /// Persist an edited phenotype and, when it is the one currently active, re-apply
+    /// it so the change takes effect immediately (RFC 0005 Phase D / #525). The
+    /// built-in `default` is immutable and rejected by [`save_phenotype`]. A
+    /// `provider` binding is validated against the live registry up front -- mirroring
+    /// [`set_session_model`](Self::set_session_model) -- so the editor cannot pin a
+    /// phantom connection. Returns the saved phenotype.
+    pub fn update_phenotype(&self, pheno: Phenotype) -> Result<Phenotype, String> {
+        if let Some(ref provider) = pheno.provider {
+            let reg = self.registry.lock().unwrap();
+            if !reg.connections.iter().any(|c| &c.id == provider) {
+                return Err(format!("unknown connection: {provider}"));
+            }
+        }
+        save_phenotype(&phenotypes_root(), &pheno).map_err(|e| e.to_string())?;
+        if pheno.name == self.active_phenotype().name {
+            let skills = self.apply_phenotype(pheno.clone());
+            self.warn_missing_skill_mcp(&pheno.name, &skills);
+        }
+        Ok(pheno)
+    }
+
     /// The active phenotype's model override, if any (replaces the provider config's
     /// model for the turn).
     pub fn active_model_override(&self) -> Option<String> {
@@ -2373,6 +2394,31 @@ mod tests {
             .map(|p| p.name)
             .collect();
         assert!(names.contains(&DEFAULT_PHENOTYPE.to_string()), "{names:?}");
+    }
+
+    #[test]
+    fn update_phenotype_rejects_immutable_default() {
+        // Guard fires before any disk I/O -- the built-in `default` is never written.
+        let state = AppState::new();
+        let err = state.update_phenotype(default_phenotype()).unwrap_err();
+        assert!(err.contains("immutable"), "{err}");
+    }
+
+    #[test]
+    fn update_phenotype_rejects_unknown_provider() {
+        // Provider binding is validated against the live registry before saving, so a
+        // stale editor cannot pin a phantom connection (mirrors set_session_model).
+        let state = AppState::new();
+        let pheno = Phenotype {
+            name: "rust".into(),
+            skills: vec![],
+            model: None,
+            persona: None,
+            max_iterations: None,
+            provider: Some("definitely-not-a-connection-xyz".into()),
+        };
+        let err = state.update_phenotype(pheno).unwrap_err();
+        assert!(err.contains("unknown connection"), "{err}");
     }
 
     #[test]
