@@ -11,6 +11,7 @@ mod message;
 mod mode;
 mod model_specs;
 mod provider;
+mod scheduled;
 mod search;
 mod session;
 mod skill;
@@ -28,6 +29,10 @@ pub use provider::{
     model_supports_documents, model_supports_vision, BedrockAuth, ConnectionId, ModelSelection,
     ProviderConfig, ProviderConnection, ProviderKind, ProviderRegistry, ReasoningEffort,
     ResolvedModel, SecretKind,
+};
+pub use scheduled::{
+    BuiltinAction, CreateScheduledTaskInput, RunRecord, RunStatus, SafetyCeiling, ScheduledTask,
+    TaskKind,
 };
 pub use search::{SearchBackend, SearchConfig};
 pub use session::{auto_title, Session, SessionStatus, SessionWorkspace};
