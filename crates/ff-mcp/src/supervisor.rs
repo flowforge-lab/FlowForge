@@ -29,6 +29,7 @@
 //! Tauri `RunEvent::ExitRequested` hook so reaping completes before exit.
 
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
@@ -187,6 +188,29 @@ impl SupervisorHandle {
         let _ = self.cmd_tx.send(Cmd::Restart { id: id.to_string() }).await;
     }
 
+    /// Set (or clear, with `None`) the working directory a server's child is spawned
+    /// in, restarting it if the directory changed so it re-spawns in the new dir. The
+    /// desktop points the workspace-aware server (codegraph) at the active session's
+    /// workspace this way (#548 W1b). Idempotent: an unchanged value is a no-op (no
+    /// restart). Awaits until the supervisor has applied it, so a caller can rely on
+    /// the new dir taking effect on the next connect.
+    pub async fn set_server_cwd(&self, id: &str, cwd: Option<PathBuf>) {
+        let (ack_tx, ack_rx) = oneshot::channel();
+        if self
+            .cmd_tx
+            .send(Cmd::SetServerCwd {
+                id: id.to_string(),
+                cwd,
+                ack: ack_tx,
+            })
+            .await
+            .is_err()
+        {
+            return;
+        }
+        let _ = ack_rx.await;
+    }
+
     /// Stop every server and exit the actor. Returns once all graceful-close calls
     /// have completed (or timed out) so the caller can let the Tokio runtime wind
     /// down with no children still waiting to be reaped.
@@ -207,6 +231,11 @@ enum Cmd {
     Reconcile,
     Restart {
         id: String,
+    },
+    SetServerCwd {
+        id: String,
+        cwd: Option<PathBuf>,
+        ack: oneshot::Sender<()>,
     },
     StopAll(oneshot::Sender<()>),
     CallTool {
@@ -286,6 +315,7 @@ pub fn spawn(
     let actor = Supervisor {
         config,
         handles: BTreeMap::new(),
+        cwd_overrides: BTreeMap::new(),
         shared_config,
         status: Arc::clone(&status),
         tools: Arc::clone(&tools),
@@ -307,6 +337,11 @@ pub fn spawn(
 struct Supervisor {
     config: SupervisorConfig,
     handles: BTreeMap<String, ServerHandle>,
+    /// Per-server working-directory overrides (id -> cwd). Applied at connect so a
+    /// workspace-aware server (codegraph) tracks the active workspace (#548 W1b). Held
+    /// in the actor rather than the shared config so a `mcp.json` reload cannot clobber
+    /// the runtime value.
+    cwd_overrides: BTreeMap<String, PathBuf>,
     shared_config: SharedConfig,
     status: SharedStatus,
     tools: SharedTools,
@@ -337,6 +372,10 @@ impl Supervisor {
                 Some(cmd) = self.cmd_rx.recv() => match cmd {
                     Cmd::Reconcile => self.reconcile().await,
                     Cmd::Restart { id } => self.restart(&id).await,
+                    Cmd::SetServerCwd { id, cwd, ack } => {
+                        self.set_server_cwd(id, cwd).await;
+                        let _ = ack.send(());
+                    }
                     Cmd::StopAll(ack) => {
                         self.stop_all().await;
                         let _ = ack.send(());
@@ -398,6 +437,31 @@ impl Supervisor {
         self.publish();
     }
 
+    /// Apply a per-server cwd override and restart the server if the directory changed,
+    /// so it re-spawns in the new working directory (#548 W1b). No-op when the value is
+    /// unchanged, the server is unknown, or it is disabled (the override still takes
+    /// effect when the user later enables it).
+    async fn set_server_cwd(&mut self, id: String, cwd: Option<PathBuf>) {
+        if self.cwd_overrides.get(&id) == cwd.as_ref() {
+            return;
+        }
+        match &cwd {
+            Some(p) => {
+                self.cwd_overrides.insert(id.clone(), p.clone());
+            }
+            None => {
+                self.cwd_overrides.remove(&id);
+            }
+        }
+        let restartable = self
+            .handles
+            .get(&id)
+            .is_some_and(|h| h.state != McpServerState::Disabled);
+        if restartable {
+            self.restart(&id).await;
+        }
+    }
+
     async fn start(&mut self, cfg: McpServerConfig) {
         let id = cfg.id.clone();
         if cfg.disabled {
@@ -456,7 +520,8 @@ impl Supervisor {
             .iter()
             .map(String::as_str)
             .collect();
-        let connect_result = McpClient::connect(&cfg, &allow_refs).await;
+        let cwd = self.cwd_overrides.get(id).cloned();
+        let connect_result = McpClient::connect(&cfg, &allow_refs, cwd.as_deref()).await;
         let outcome = match connect_result {
             Ok(client) => match client.list_tools().await {
                 Ok(tools) => Ok((client, tools)),

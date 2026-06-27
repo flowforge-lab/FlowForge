@@ -4,6 +4,8 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+use std::path::Path;
+
 use ff_core::{McpServerConfig, McpToolInfo};
 use rmcp::model::CallToolRequestParams;
 use rmcp::service::{NotificationContext, RunningService};
@@ -47,9 +49,15 @@ impl McpClient {
     pub async fn connect(
         config: &McpServerConfig,
         env_allowlist: &[&str],
+        cwd: Option<&Path>,
     ) -> Result<Self, McpError> {
         let mut cmd = Command::new(&config.command);
         cmd.args(&config.args);
+        // Run the child in `cwd` when set, so a workspace-aware server (e.g. codegraph)
+        // indexes the active checkout rather than the app's launch directory (#548).
+        if let Some(dir) = cwd {
+            cmd.current_dir(dir);
+        }
         cmd.env_clear();
         for key in env_allowlist {
             if let Ok(value) = std::env::var(key) {

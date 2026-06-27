@@ -21,7 +21,7 @@ fn echo_config() -> McpServerConfig {
 
 #[tokio::test]
 async fn handshake_lists_and_calls_a_tool_over_stdio() {
-    let client = McpClient::connect(&echo_config(), &[])
+    let client = McpClient::connect(&echo_config(), &[], None)
         .await
         .expect("connect + initialize");
 
@@ -48,7 +48,7 @@ async fn handshake_lists_and_calls_a_tool_over_stdio() {
 
 #[tokio::test]
 async fn bad_arguments_are_rejected_before_dispatch() {
-    let client = McpClient::connect(&echo_config(), &[])
+    let client = McpClient::connect(&echo_config(), &[], None)
         .await
         .expect("connect + initialize");
     let err = client
@@ -56,5 +56,36 @@ async fn bad_arguments_are_rejected_before_dispatch() {
         .await
         .expect_err("non-object arguments must error");
     assert!(matches!(err, ff_mcp::McpError::BadArguments), "{err:?}");
+    client.shutdown().await.expect("shutdown");
+}
+
+fn cwd_config() -> McpServerConfig {
+    McpServerConfig {
+        id: "cwd".into(),
+        command: env!("CARGO_BIN_EXE_mcp_cwd").to_string(),
+        args: vec![],
+        env: BTreeMap::new(),
+        disabled: false,
+    }
+}
+
+/// #548 W1b: a configured cwd is applied to the spawned child, so a workspace-aware
+/// server runs in (and indexes) the requested directory rather than the launcher's.
+#[tokio::test]
+async fn connect_runs_the_child_in_the_configured_cwd() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    // Canonicalize: on macOS the tempdir lives under a /var -> /private/var symlink,
+    // and the child reports its resolved cwd.
+    let want = std::fs::canonicalize(dir.path()).expect("canonicalize tempdir");
+
+    let client = McpClient::connect(&cwd_config(), &["PATH"], Some(&want))
+        .await
+        .expect("connect + initialize");
+    let out = client
+        .call_tool("pwd", serde_json::Value::Null)
+        .await
+        .expect("call_tool pwd");
+    let got = std::fs::canonicalize(out.trim()).expect("canonicalize reported cwd");
+    assert_eq!(got, want, "child cwd should be the configured directory");
     client.shutdown().await.expect("shutdown");
 }

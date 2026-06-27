@@ -594,9 +594,13 @@ fn spawn_assistant_turn(state: Arc<AppState>, app: tauri::AppHandle, session_id:
             session_id: sid.clone(),
             mode,
         };
+        // Point the workspace-aware MCP server (codegraph) at this session's workspace
+        // before snapshotting tools, so its code graph reflects the active checkout
+        // (#548 W1b). Idempotent; restarts codegraph only when the path changed.
+        let session_root = state.session_root(&sid);
+        state.align_codegraph_workspace(&session_root).await;
         // Snapshot built-in + MCP-bridged tools for this turn (RFC 0003 §6).
         let registry = state.build_tool_registry();
-        let session_root = state.session_root(&sid);
         let mut tool_ctx = ToolContext::new(&registry, &session_root, &approver, max_iterations);
         tool_ctx.mode = mode;
         tool_ctx.abstractive = crate::state::abstractive_config_from_env();

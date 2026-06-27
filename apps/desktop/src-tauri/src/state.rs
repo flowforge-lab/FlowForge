@@ -588,6 +588,11 @@ fn phenotypes_root() -> PathBuf {
 /// example can never drift.
 const CODON_PHENOTYPE_TOML: &str =
     include_str!("../../../../docs/examples/codon/phenos/codon.toml");
+/// The id of the workspace-aware MCP server. Its code graph should track the active
+/// session's workspace, so the desktop points it at the session root each turn
+/// ([`AppState::align_codegraph_workspace`]). Matches the seeded `codegraph` entry.
+const CODEGRAPH_SERVER_ID: &str = "codegraph";
+
 /// The codegraph skill Codon depends on, bundled from the same example tree.
 const CODEGRAPH_SKILL_MD: &str =
     include_str!("../../../../docs/examples/codon/skills/codegraph/SKILL.md");
@@ -1119,6 +1124,17 @@ impl AppState {
             }
         }
         reg
+    }
+
+    /// Point the workspace-aware MCP server (codegraph) at `root` so its code graph
+    /// reflects the active session's checkout, restarting it if the path changed
+    /// (#548 W1b). Idempotent and best-effort: a no-op when MCP is uninitialized or
+    /// codegraph is not configured, and unchanged paths never trigger a restart.
+    pub async fn align_codegraph_workspace(&self, root: &Path) {
+        if let Some(sup) = self.mcp_handle() {
+            sup.set_server_cwd(CODEGRAPH_SERVER_ID, Some(root.to_path_buf()))
+                .await;
+        }
     }
 
     /// Stop and remove all background processes owned by `session_id` (#218).
