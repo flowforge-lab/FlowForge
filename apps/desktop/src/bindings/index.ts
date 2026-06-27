@@ -9,6 +9,7 @@ export type { Session } from "./Session";
 export type { SessionWorkspace } from "./SessionWorkspace";
 export type { Phenotype } from "./Phenotype";
 export type { ModelSelection } from "./ModelSelection";
+export type { ResolvedModel } from "./ResolvedModel";
 export type { SkillInfo } from "./SkillInfo";
 export type { SkillManifest } from "./SkillManifest";
 export type { ProviderConfig } from "./ProviderConfig";

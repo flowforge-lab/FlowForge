@@ -45,21 +45,6 @@ thinking: boolean,
  */
 reasoningEffort: ReasoningEffort, 
 /**
- * Whether this connection's model can accept image/document attachments
- * (multimodal, #332). Drives the composer attach-button gate (FE-4) and the
- * backend safety strip (a non-vision connection never emits a raw attachments
- * field). Defaults false; opted in per connection in settings.
- */
-supportsVision: boolean, 
-/**
- * Whether this connection's model can accept *document* attachments
- * (PDF/DOCX/CSV/…, #504). Distinct from [`supports_vision`]: a Bedrock
- * text-only model reads documents but has no vision, and an OpenAI vision
- * model cannot take documents. Drives the composer doc attach-gate and the
- * backend `Document` strip independently of vision. Defaults false.
- */
-supportsDocuments: boolean, 
-/**
  * AWS region for a Bedrock connection (e.g. `"us-east-1"`); the provider
  * derives `bedrock-runtime.<region>.amazonaws.com` from it. `None` for
  * non-Bedrock kinds.

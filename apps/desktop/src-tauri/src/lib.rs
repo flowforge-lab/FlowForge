@@ -19,8 +19,8 @@ use ff_core::events::{
 use ff_core::{
     Attachment, BedrockAuth, Format, McpServerConfig, McpServerStatus, MemoryFileInfo,
     MemoryFileKind, MemoryOverview, Message, Mode, ModelSelection, Phenotype, ProviderConfig,
-    ProviderConnection, ProviderKind, ProviderRegistry, Role, SearchConfig, SecretKind, Session,
-    SessionWorkspace, Skill, SkillInfo, SkillManifest,
+    ProviderConnection, ProviderKind, ProviderRegistry, ResolvedModel, Role, SearchConfig,
+    SecretKind, Session, SessionWorkspace, Skill, SkillInfo, SkillManifest,
 };
 use ff_signals::SkillAggregate;
 use ff_tools::Safety;
@@ -573,7 +573,8 @@ fn spawn_assistant_turn(state: Arc<AppState>, app: tauri::AppHandle, session_id:
     // RESOLVED connection. This routes a phenotype model override through its intended
     // endpoint rather than the global active one (fixes RFC 0005 §11.1).
     let selection = state.resolve_model_selection(&session_id);
-    let (provider, _) = state.build_provider_for(Some(&selection.connection));
+    let (provider, _) =
+        state.build_provider_for(Some(&selection.connection), Some(&selection.model));
     let model = selection.model;
     let persona = pheno.persona.clone();
     // Per-pane iteration cap (#244-R3 x #246): the resolved phenotype carries
@@ -982,7 +983,7 @@ async fn list_models(
     state: State<'_, Arc<AppState>>,
     id: Option<String>,
 ) -> CmdResult<Vec<String>> {
-    let (provider, _model) = state.build_provider_for(id.as_deref());
+    let (provider, _model) = state.build_provider_for(id.as_deref(), None);
     Ok(provider.list_models().await.unwrap_or_default())
 }
 
@@ -992,7 +993,7 @@ async fn list_models(
 /// surfaced (the button reports failure) rather than swallowed.
 #[tauri::command]
 async fn test_connection(state: State<'_, Arc<AppState>>, id: Option<String>) -> CmdResult<()> {
-    let (provider, model) = state.build_provider_for(id.as_deref());
+    let (provider, model) = state.build_provider_for(id.as_deref(), None);
     provider
         .test_connection(&model)
         .await
@@ -1420,7 +1421,7 @@ fn get_session_model_selection(
 /// renders this on the per-pane model chip so the displayed model matches what the
 /// next turn will actually use.
 #[tauri::command]
-fn resolve_model_selection(state: State<'_, Arc<AppState>>, session_id: String) -> ModelSelection {
+fn resolve_model_selection(state: State<'_, Arc<AppState>>, session_id: String) -> ResolvedModel {
     state.resolve_model_selection(&session_id)
 }
 

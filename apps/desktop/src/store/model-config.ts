@@ -47,8 +47,6 @@ function defaultConnection(kind: ProviderKind): ProviderConnection {
     hasKey: false,
     thinking: true,
     reasoningEffort: "medium",
-    supportsVision: false,
-    supportsDocuments: false,
   };
   switch (kind) {
     case "bedrock":
