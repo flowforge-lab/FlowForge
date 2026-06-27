@@ -36,11 +36,21 @@ definitions, callers, callees, and impact; fall back to grep/glob/read only when
 the graph cannot answer. One `codegraph_explore` usually replaces a dozen
 grep+read round-trips — answer directly from it and stop.
 
+If the codegraph tools are unavailable this session (the MCP server failed to
+start, or no graph is indexed), do NOT regress to one grep at a time.
+Reconstruct the same answer with BATCHED `grep`/`glob`/`view` calls in a single
+turn — see below — so one turn covers what one `codegraph_explore` would have.
+
 ## Batch independent work into one turn
 When you need to inspect several files or run independent searches, issue all
 those tool calls together in a single turn rather than one at a time. Independent
 read-only calls run concurrently, so batching them collapses many slow round-trips
 into one and is dramatically faster — especially on hosted models.
+
+For example, to understand a function and its callers, issue in ONE turn: a
+`grep` for its definition, a `grep` for its call sites, and a `view` on the file
+you already know you need — not three sequential turns. After editing, run the
+independent verify checks (fmt, lint, a targeted test) together the same way.
 
 ## Principles
 - Root cause over band-aids. Ask "why" five times. A try/catch that hides an
