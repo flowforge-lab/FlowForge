@@ -70,7 +70,38 @@ impl ReasoningEffort {
     }
 }
 
-/// Which LLM backend FlowForge talks to.
+/// How widely model reasoning (chain-of-thought) is requested across a turn's
+/// loop steps (#549). Orthogonal to the on/off gate (`ChatRequest::thinking` /
+/// `ProviderConfig::thinking`) and to the *depth* dial ([`ReasoningEffort`]):
+/// this controls *which steps* request reasoning, not whether reasoning is on or
+/// how long it runs.
+///
+/// Background: a turn cannot know a-priori whether the current loop step will
+/// dispatch more tools or emit the final answer (the model decides by returning
+/// tool calls). So requesting reasoning only on a "final answer" step is not
+/// expressible without requesting it on every step. The two honest points on
+/// that tradeoff are:
+/// - [`WrapUp`](Self::WrapUp): planning (first step) + the cap-forced wrap-up
+///   step only -- the latency-optimized choice (#449). A turn that finishes
+///   naturally before the cap answers with reasoning off, so its final answer
+///   shows no Thought block.
+/// - [`All`](Self::All): every step. A short turn's natural final answer now
+///   carries reasoning. The persisted reasoning is always the *final* step's
+///   (the whole turn shares one assistant message id, and each step overwrites
+///   the row), so `All` does not bloat storage with mid-loop chains -- it only
+///   trades mid-loop reasoning latency for final-answer visibility.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "../../../apps/desktop/src/bindings/")]
+pub enum ReasoningVisibility {
+    /// First step + cap-forced wrap-up only (#449 latency optimization).
+    WrapUp,
+    /// Every step, so a natural final answer carries reasoning (#549). The
+    /// default when reasoning is enabled.
+    #[default]
+    All,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export, export_to = "../../../apps/desktop/src/bindings/")]
@@ -224,6 +255,11 @@ pub struct ProviderConfig {
     /// `provider.json` files (and the CLI's) loading as [`ReasoningEffort::Medium`].
     #[serde(default)]
     pub reasoning_effort: ReasoningEffort,
+    /// Which loop steps request reasoning (#549). Only bites when `thinking` is
+    /// on. `#[serde(default)]` keeps legacy `provider.json` files loading as
+    /// [`ReasoningVisibility::All`] (the natural final answer shows a Thought).
+    #[serde(default)]
+    pub reasoning_visibility: ReasoningVisibility,
 }
 
 /// FlowForge's out-of-the-box default: local candle-vllm serving Qwen3-4B.
@@ -236,6 +272,7 @@ impl Default for ProviderConfig {
             has_key: false,
             thinking: true,
             reasoning_effort: ReasoningEffort::default(),
+            reasoning_visibility: ReasoningVisibility::default(),
         }
     }
 }
@@ -290,6 +327,11 @@ pub struct ProviderConnection {
     /// [`ReasoningEffort::Medium`].
     #[serde(default)]
     pub reasoning_effort: ReasoningEffort,
+    /// Which loop steps request reasoning for this connection (#549). Only bites
+    /// when `thinking` is on. `#[serde(default)]` keeps pre-#549 registries
+    /// loading as [`ReasoningVisibility::All`].
+    #[serde(default)]
+    pub reasoning_visibility: ReasoningVisibility,
     /// AWS region for a Bedrock connection (e.g. `"us-east-1"`); the provider
     /// derives `bedrock-runtime.<region>.amazonaws.com` from it. `None` for
     /// non-Bedrock kinds.
@@ -501,6 +543,7 @@ impl Default for ProviderRegistry {
             has_key: false,
             thinking: true,
             reasoning_effort: ReasoningEffort::default(),
+            reasoning_visibility: ReasoningVisibility::default(),
             region: None,
             auth_mode: None,
             aws_profile: None,
@@ -516,6 +559,7 @@ impl Default for ProviderRegistry {
             has_key: false,
             thinking: true,
             reasoning_effort: ReasoningEffort::default(),
+            reasoning_visibility: ReasoningVisibility::default(),
             region: None,
             auth_mode: None,
             aws_profile: None,
@@ -585,6 +629,16 @@ mod tests {
     }
 
     #[test]
+    fn legacy_config_without_visibility_defaults_to_all() {
+        // #549: a pre-#549 provider.json carries no `reasoningVisibility`; it must
+        // load as `All` so the natural final answer shows a Thought block.
+        let json = r#"{"kind":"ollama","model":"llama3","hasKey":false,"thinking":true}"#;
+        let cfg: ProviderConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.reasoning_visibility, ReasoningVisibility::All);
+        assert_eq!(ReasoningVisibility::default(), ReasoningVisibility::All);
+    }
+
+    #[test]
     fn default_registry_has_two_local_connections_candle_active() {
         let reg = ProviderRegistry::default();
         assert_eq!(reg.connections.len(), 2);
@@ -608,6 +662,7 @@ mod tests {
             has_key: false,
             thinking: true,
             reasoning_effort: ReasoningEffort::default(),
+            reasoning_visibility: ReasoningVisibility::default(),
             region: None,
             auth_mode: None,
             aws_profile: None,
@@ -721,6 +776,7 @@ mod tests {
             has_key: false,
             thinking: true,
             reasoning_effort: ReasoningEffort::default(),
+            reasoning_visibility: ReasoningVisibility::default(),
             region: None,
             auth_mode: None,
             aws_profile: None,

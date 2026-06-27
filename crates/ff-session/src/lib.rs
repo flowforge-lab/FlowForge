@@ -866,6 +866,21 @@ fn export_markdown(session: &Session, messages: &[Message]) -> String {
         };
         let _ = writeln!(out, "{heading}\n");
 
+        // Persisted chain-of-thought (#375/#549) for an assistant turn, folded so
+        // the export stays readable. Emitted before the answer it produced.
+        if msg.role == Role::Assistant {
+            if let Some(reasoning) = msg
+                .reasoning
+                .as_deref()
+                .map(str::trim)
+                .filter(|r| !r.is_empty())
+            {
+                let _ = writeln!(out, "<details><summary>Thought</summary>\n");
+                let _ = writeln!(out, "{reasoning}\n");
+                let _ = writeln!(out, "</details>\n");
+            }
+        }
+
         let content = msg.content.trim_end();
         if !content.is_empty() {
             if msg.role == Role::Tool && content.chars().count() > TOOL_OUTPUT_FOLD_THRESHOLD {
@@ -1906,6 +1921,23 @@ mod tests {
 
         assert!(!md.contains("you are a helpful agent"));
         assert!(md.contains("## You"));
+    }
+
+    #[test]
+    fn export_markdown_includes_reasoning() {
+        // #549: persisted chain-of-thought is folded into the Markdown export.
+        let store = SessionStore::new();
+        let s = store.create_session(None);
+        store.add_message(&s.id, Role::User, "what is 17*23?".into());
+        let a = store.add_message(&s.id, Role::Assistant, "391".into());
+        store.set_message_reasoning(&a.id, &s.id, "17 * 23 = 391");
+
+        let md = store.export_session(&s.id, Format::Markdown).unwrap();
+
+        assert!(md.contains("<details><summary>Thought</summary>"));
+        assert!(md.contains("17 * 23 = 391"));
+        // The answer is still present after the fold.
+        assert!(md.contains("391"));
     }
 
     #[test]
