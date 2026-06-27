@@ -6,36 +6,27 @@ import { InputBar } from "@/components/input-bar";
 import { ipc } from "@/lib/ipc";
 import { useChatStore } from "@/store/chat";
 import { useComposerStore } from "@/store/composer";
-import { useModelConfigStore } from "@/store/model-config";
-import type { ProviderRegistry } from "@/bindings";
+import { useSessionModelStore } from "@/store/session-model";
+import type { ResolvedModel } from "@/bindings";
 
 const SID = "s1";
 
-function registry(
-  supportsVision: boolean,
-  supportsDocuments: boolean,
-): ProviderRegistry {
-  return {
-    active: "c1",
-    connections: [
-      {
-        id: "c1",
-        kind: "candleVllm",
-        displayName: "Test",
-        model: "m",
-        hasKey: false,
-        thinking: false,
-        reasoningEffort: "medium",
-        supportsVision,
-        supportsDocuments,
-      },
-    ],
-  };
-}
-
+// The composer gates attachments off the *resolved model* for this pane (RFC 0005
+// §11.3) via the session-model store — caps are derived from `(kind, model)`, no
+// longer a per-connection flag. Seed the resolved entry directly, and stub the
+// resolver to the same value so the model chip's async load can't clobber the seed.
 function seed(supportsVision: boolean, supportsDocuments = false) {
-  useModelConfigStore.setState({
-    registry: registry(supportsVision, supportsDocuments),
+  const resolved: ResolvedModel = {
+    connection: "c1",
+    model: "m",
+    supportsVision,
+    supportsDocuments,
+  };
+  vi.spyOn(ipc, "resolveModelSelection").mockResolvedValue(resolved);
+  useSessionModelStore.setState({
+    resolvedBySession: { [SID]: resolved },
+    overrideBySession: {},
+    unavailableBySession: {},
   });
   useComposerStore.setState({
     textBySession: {},

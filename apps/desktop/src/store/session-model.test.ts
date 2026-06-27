@@ -6,9 +6,13 @@ import { useSessionModelStore } from "@/store/session-model";
 // These run against the in-browser MockIpc (the test build is VITE_FF_MOCK), so
 // they also exercise the three new mock commands + the §11.2 resolver mirror.
 // The mock's global default is the active connection candle-vLLM + its model.
+// Caps are derived from the resolved (kind, model) (§11.3): candle-vLLM/Qwen is
+// text-only, so both are false.
 const GLOBAL_DEFAULT = {
   connection: "candle-vllm",
   model: "Qwen3-4B-Instruct-2507",
+  supportsVision: false,
+  supportsDocuments: false,
 };
 
 beforeEach(() => {
@@ -41,7 +45,12 @@ describe("session-model store (#499)", () => {
     await useSessionModelStore.getState().set("s-set", sel);
     const s = useSessionModelStore.getState();
     expect(s.overrideBySession["s-set"]).toEqual(sel);
-    expect(s.resolvedBySession["s-set"]).toEqual(sel);
+    // resolved folds in the derived caps (§11.3); ollama/qwen2.5 is text-only.
+    expect(s.resolvedBySession["s-set"]).toEqual({
+      ...sel,
+      supportsVision: false,
+      supportsDocuments: false,
+    });
   });
 
   it("clear drops the override and falls back to the default", async () => {
@@ -100,9 +109,12 @@ describe("session-model store (#499)", () => {
     await useSessionModelStore.getState().load(session.id);
     const s = useSessionModelStore.getState();
     expect(s.overrideBySession[session.id]).toBeNull();
+    // openai/gpt-4o is vision-capable → derived supportsVision (§11.3).
     expect(s.resolvedBySession[session.id]).toEqual({
       connection: "openai",
       model: "gpt-4o",
+      supportsVision: true,
+      supportsDocuments: false,
     });
   });
 });

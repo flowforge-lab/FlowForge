@@ -11,8 +11,6 @@ const conn = (over: Partial<ProviderConnection> = {}): ProviderConnection => ({
   hasKey: false,
   thinking: true,
   reasoningEffort: "medium",
-  supportsVision: false,
-  supportsDocuments: false,
   ...over,
 });
 

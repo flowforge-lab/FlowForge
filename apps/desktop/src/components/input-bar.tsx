@@ -37,7 +37,7 @@ import { useComposerStore } from "@/store/composer";
 import { usePrefsStore } from "@/store/prefs";
 import { useSessionWorkspaceStore } from "@/store/session-workspace";
 import { useSessionModeStore, MODE_ORDER } from "@/store/session-mode";
-import { useModelConfigStore, activeConnection } from "@/store/model-config";
+import { useSessionModelStore } from "@/store/session-model";
 import { MODE_META } from "@/lib/mode";
 
 // A local model server (candle-vllm, Ollama, …) clocks its GPU down when idle,
@@ -122,16 +122,18 @@ export function InputBar({
   const [attachments, setAttachments] = useState<Attachment[]>([]);
   const [dragOver, setDragOver] = useState(false);
 
-  // Capability gates (#342/#504): the active model may accept images, documents,
-  // both, or neither. Read each capability off the active connection and fail OPEN
-  // when unknown (registry not yet loaded / no active connection) so the composer is
-  // never falsely blocked. Vision and documents gate independently.
-  const supportsVision = useModelConfigStore(
-    (s) => activeConnection(s.registry)?.supportsVision,
+  // Capability gates (#342/#504, RFC 0005 §11.3): the resolved model for THIS pane
+  // may accept images, documents, both, or neither. Caps are derived backend-side
+  // from the resolved `(kind, model)` and carried on `ResolvedModel` (the model chip
+  // loads it per session), so a per-session model override gates the composer by the
+  // model it actually runs — not the global active connection. Fail OPEN when unknown
+  // (not loaded yet / no session) so the composer is never falsely blocked. Vision
+  // and documents gate independently.
+  const resolved = useSessionModelStore((s) =>
+    targetSessionId ? s.resolvedBySession[targetSessionId] : undefined,
   );
-  const supportsDocuments = useModelConfigStore(
-    (s) => activeConnection(s.registry)?.supportsDocuments,
-  );
+  const supportsVision = resolved?.supportsVision;
+  const supportsDocuments = resolved?.supportsDocuments;
   const visionGated = supportsVision === false;
   const docGated = supportsDocuments === false;
   // The attach button is only fully disabled when neither kind is allowed.

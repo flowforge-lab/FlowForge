@@ -8,12 +8,13 @@
 
 import { create } from "zustand";
 import { ipc } from "@/lib/ipc";
-import type { ModelSelection } from "@/bindings";
+import type { ModelSelection, ResolvedModel } from "@/bindings";
 
 export interface SessionModelState {
-  /** The authoritative resolved `(connection, model)` per session — drives the
-   *  chip label. Absent = not loaded yet. */
-  resolvedBySession: Record<string, ModelSelection>;
+  /** The authoritative resolved `(connection, model)` per session, plus the
+   *  attachment capabilities derived from it (§11.3) — drives the chip label and
+   *  the composer attach gate. Absent = not loaded yet. */
+  resolvedBySession: Record<string, ResolvedModel>;
   /** The raw per-session override, or `null` when the session inherits the
    *  phenotype/global tiers. Absent = not loaded yet; drives the "clear" item. */
   overrideBySession: Record<string, ModelSelection | null>;
