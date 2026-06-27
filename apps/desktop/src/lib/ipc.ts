@@ -268,6 +268,13 @@ export interface FfIpc {
    *  panes are untouched. Rejects an unknown phenotype name. Used by the pane Pheno
    *  selector (#245) to make a pane's phenotype truly per-session. */
   setSessionPhenotype(sessionId: string, name: string | null): Promise<void>;
+  /** Persist an edited phenotype (RFC 0005 Phase D / #525). Accepts the whole
+   *  `Phenotype` — a lossless read-modify-write upsert keyed by `name`. Validates
+   *  `provider` against the live registry (rejects an unknown connection) and rejects
+   *  the built-in `default` (immutable). When the edited phenotype is the active one,
+   *  its skills are re-applied and `skills:changed` is emitted. Resolves with the
+   *  saved phenotype. */
+  updatePhenotype(phenotype: Phenotype): Promise<Phenotype>;
 
   // Per-session model selection (RFC 0005 §11.2, Phase D; #499). A per-pane
   // override over the phenotype/global tiers, mirroring the set_session_phenotype
@@ -549,6 +556,8 @@ class TauriIpc implements FfIpc {
     this.invoke<Phenotype>("switch_phenotype", { name });
   setSessionPhenotype = (sessionId: string, name: string | null) =>
     this.invoke<void>("set_session_phenotype", { sessionId, name });
+  updatePhenotype = (phenotype: Phenotype) =>
+    this.invoke<Phenotype>("update_phenotype", { phenotype });
   setSessionModelSelection = (
     sessionId: string,
     selection: ModelSelection | null,

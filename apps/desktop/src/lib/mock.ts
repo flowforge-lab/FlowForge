@@ -598,6 +598,9 @@ export class MockIpc implements FfIpc {
   private archivedVersions = new Map<string, string[]>();
   private activeSkills = new Set<string>();
   private activePhenotype: Phenotype = DEFAULT_PHENOTYPE;
+  // User phenotypes (everything but the built-in `default`). Mutable so the editor
+  // write path (`updatePhenotype`, #530) can upsert; seeded from the canned set.
+  private phenotypes: Phenotype[] = MOCK_PHENOTYPES.map((p) => ({ ...p }));
   // Per-session model overrides (RFC 0005 §11.2, Phase D; #499). Absent → the
   // session inherits the phenotype/global tiers; see resolveModelSelection.
   private sessionModelSelections = new Map<string, ModelSelection>();
@@ -1505,7 +1508,7 @@ Shipping the Settings redesign — currently the Memory browser (SET.8).
   }
 
   async listPhenotypes(): Promise<Phenotype[]> {
-    return [DEFAULT_PHENOTYPE, ...MOCK_PHENOTYPES];
+    return [DEFAULT_PHENOTYPE, ...this.phenotypes].map((p) => ({ ...p }));
   }
 
   async getPhenotype(): Promise<Phenotype> {
@@ -1516,7 +1519,7 @@ Shipping the Settings redesign — currently the Memory browser (SET.8).
     const pheno =
       name === DEFAULT_PHENOTYPE.name
         ? DEFAULT_PHENOTYPE
-        : MOCK_PHENOTYPES.find((p) => p.name === name);
+        : this.phenotypes.find((p) => p.name === name);
     if (!pheno) throw new Error(`unknown phenotype: ${name}`);
     // Replace the active set with the phenotype's installed skills (dropping any
     // that aren't installed), mirroring the backend.
@@ -1543,7 +1546,7 @@ Shipping the Settings redesign — currently the Memory browser (SET.8).
       const pheno =
         name === DEFAULT_PHENOTYPE.name
           ? DEFAULT_PHENOTYPE
-          : MOCK_PHENOTYPES.find((p) => p.name === name);
+          : this.phenotypes.find((p) => p.name === name);
       if (!pheno) throw new Error(`unknown phenotype: ${name}`);
       // Mirror the backend warn (#296/#301) on the per-pane path too, scoped to
       // the bound phenotype's skills (the global active set is left untouched).
@@ -1557,6 +1560,37 @@ Shipping the Settings redesign — currently the Memory browser (SET.8).
       s.phenotype = name ?? undefined;
       s.updatedAt = now();
     }
+  }
+
+  // Persist an edited phenotype (RFC 0005 Phase D / #525, #530). Mirrors
+  // state.rs::update_phenotype: reject the immutable built-in `default`, validate any
+  // `provider` against the live registry, then upsert by name (lossless whole-record
+  // write). When the edited phenotype is the active one, re-apply its skills and emit
+  // skills:changed so the FE active set updates.
+  async updatePhenotype(pheno: Phenotype): Promise<Phenotype> {
+    if (pheno.name === DEFAULT_PHENOTYPE.name) {
+      throw new Error(`phenotype '${pheno.name}' is immutable`);
+    }
+    if (pheno.provider !== undefined) {
+      const conn = this.registry.connections.find(
+        (c) => c.id === pheno.provider,
+      );
+      if (!conn) throw new Error(`unknown connection: ${pheno.provider}`);
+    }
+    const saved: Phenotype = { ...pheno };
+    const idx = this.phenotypes.findIndex((p) => p.name === saved.name);
+    if (idx >= 0) this.phenotypes[idx] = saved;
+    else this.phenotypes.push(saved);
+
+    if (saved.name === this.activePhenotype.name) {
+      this.activePhenotype = saved;
+      this.activeSkills = new Set(
+        saved.skills.filter((n) => MOCK_SKILLS.some((s) => s.name === n)),
+      );
+      this.emitSkillsChanged();
+      this.emitPhenoMcpUnavailable(saved.name, this.activeSkills);
+    }
+    return { ...saved };
   }
 
   // Per-session model selection (RFC 0005 §11.2, Phase D; #499). Mirrors the
@@ -1618,7 +1652,7 @@ Shipping the Settings redesign — currently the Memory browser (SET.8).
         (bound === DEFAULT_PHENOTYPE.name
           ? DEFAULT_PHENOTYPE
           : bound
-            ? MOCK_PHENOTYPES.find((p) => p.name === bound)
+            ? this.phenotypes.find((p) => p.name === bound)
             : undefined) ?? this.activePhenotype;
 
       const connId = pheno.provider ?? this.registry.active;
