@@ -24,6 +24,7 @@ use ff_memory::{
     EmbeddingProvider, FlushLedger, Fts5Index, HybridIndex, Memory, MemoryConfig, MemoryIndex,
     NoopEmbedder, OpenAiEmbedder,
 };
+use ff_scheduled::ScheduledStore;
 use ff_session::SessionStore;
 use ff_signals::{SignalStore, SkillAggregate, SkillCompleted};
 use ff_skills::{
@@ -502,6 +503,27 @@ fn build_session_store() -> SessionStore {
     })
 }
 
+/// `~/.config/flowforge/scheduled.db` — the durable scheduled-task store.
+fn scheduled_db_path() -> Option<PathBuf> {
+    dirs::config_dir().map(|d| d.join("flowforge").join("scheduled.db"))
+}
+
+/// Open the scheduled-task store, falling back to an ephemeral in-memory store (with
+/// a warning) if the path is unavailable — same resilience as `build_session_store`.
+fn build_scheduled_store() -> ScheduledStore {
+    if cfg!(test) {
+        return ScheduledStore::open_in_memory().expect("in-memory scheduled store");
+    }
+    let Some(path) = scheduled_db_path() else {
+        tracing::warn!("no config dir; scheduled tasks will not persist across restarts");
+        return ScheduledStore::open_in_memory().expect("in-memory scheduled store");
+    };
+    ScheduledStore::open(&path).unwrap_or_else(|e| {
+        tracing::warn!(error = %e, path = %path.display(), "scheduled db unavailable; tasks will not persist");
+        ScheduledStore::open_in_memory().expect("in-memory scheduled store")
+    })
+}
+
 /// `~/.config/flowforge/phenotype.json` — the name of the active phenotype, persisted
 /// so a switch survives a restart (RFC 0001 §7). Separate from the phenotype
 /// *definitions* in `~/.flowforge/phenos/`; this only records which one is active.
@@ -708,6 +730,9 @@ fn initial_phenotype(
 
 pub struct AppState {
     pub store: Arc<SessionStore>,
+    /// Durable scheduled-task store (RFC 0017, #539/#540). Shared (via `Arc`) so a
+    /// later headless runner (#542) can read the due set without rebuilding state.
+    pub scheduled: Arc<ScheduledStore>,
     /// Persisted, non-secret LLM provider connection registry (RFC 0005 Phase A).
     /// The active connection drives each turn; snapshotted (never held across an
     /// await) per turn. Mutated by the connection commands and the legacy
@@ -800,6 +825,7 @@ impl AppState {
             .ok();
         let state = Self {
             store: Arc::new(build_session_store()),
+            scheduled: Arc::new(build_scheduled_store()),
             registry: Mutex::new(registry),
             search_config,
             workspace_root: default_workspace_root(),

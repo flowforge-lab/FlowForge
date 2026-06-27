@@ -17,10 +17,11 @@ use ff_core::events::{
     TurnDoneEvent, TurnErrorEvent, TurnStatsEvent,
 };
 use ff_core::{
-    Attachment, BedrockAuth, Format, McpServerConfig, McpServerStatus, MemoryFileInfo,
-    MemoryFileKind, MemoryOverview, Message, Mode, ModelSelection, Phenotype, ProviderConfig,
-    ProviderConnection, ProviderKind, ProviderRegistry, ResolvedModel, Role, SearchConfig,
-    SecretKind, Session, SessionWorkspace, Skill, SkillInfo, SkillManifest,
+    Attachment, BedrockAuth, CreateScheduledTaskInput, Format, McpServerConfig, McpServerStatus,
+    MemoryFileInfo, MemoryFileKind, MemoryOverview, Message, Mode, ModelSelection, Phenotype,
+    ProviderConfig, ProviderConnection, ProviderKind, ProviderRegistry, ResolvedModel, Role,
+    ScheduledTask, SearchConfig, SecretKind, Session, SessionWorkspace, Skill, SkillInfo,
+    SkillManifest,
 };
 use ff_signals::SkillAggregate;
 use ff_tools::Safety;
@@ -250,6 +251,53 @@ fn delete_session(state: State<'_, Arc<AppState>>, session_id: String) {
     state.clear_session_approvals(&session_id);
     state.store.delete_session(&session_id);
     state.reap_session_processes(&session_id);
+}
+
+/// All scheduled tasks, newest first, with derived cadence label / next run
+/// (RFC 0017 #540). Built-in + user-created.
+#[tauri::command]
+fn list_scheduled_tasks(state: State<'_, Arc<AppState>>) -> Vec<ScheduledTask> {
+    state.scheduled.list()
+}
+
+/// Create a scheduled task. Validates the cron expression; the human cadence
+/// label and next-run are derived server-side, never sent by the FE.
+#[tauri::command]
+fn create_scheduled_task(
+    state: State<'_, Arc<AppState>>,
+    input: CreateScheduledTaskInput,
+) -> Result<ScheduledTask, String> {
+    state.scheduled.create(input)
+}
+
+/// Pause/resume a task; returns the updated task. Errors on an unknown id.
+#[tauri::command]
+fn toggle_scheduled_task(
+    state: State<'_, Arc<AppState>>,
+    id: String,
+) -> Result<ScheduledTask, String> {
+    state
+        .scheduled
+        .toggle_paused(&id)
+        .ok_or_else(|| format!("unknown scheduled task: {id}"))
+}
+
+/// Delete a task. Rejected for built-in tasks (they ship with the app).
+#[tauri::command]
+fn delete_scheduled_task(state: State<'_, Arc<AppState>>, id: String) -> Result<(), String> {
+    state
+        .scheduled
+        .delete(&id)
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+/// Preview the human cadence label a cron expression would produce, for the
+/// New-task form's Custom-cron field. Derived from the same source as `list`.
+#[tauri::command]
+fn preview_cadence(cron: String) -> Result<String, String> {
+    ff_scheduled::cron::parse(&cron)?;
+    Ok(ff_scheduled::cron::cadence_label(&cron))
 }
 
 /// Clone a session and its transcript into a fresh session (server-truth).
@@ -1801,6 +1849,11 @@ pub fn run() {
             rename_session,
             delete_session,
             fork_session,
+            list_scheduled_tasks,
+            create_scheduled_task,
+            toggle_scheduled_task,
+            delete_scheduled_task,
+            preview_cadence,
             get_session_workspace,
             set_session_workspace,
             list_memory_files,

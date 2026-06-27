@@ -2153,6 +2153,7 @@ dependencies = [
  "ff-llm",
  "ff-mcp",
  "ff-memory",
+ "ff-scheduled",
  "ff-session",
  "ff-signals",
  "ff-skills",

@@ -46,7 +46,7 @@ import type { BedrockAuth } from "../bindings/BedrockAuth";
 import type { FfIpc, Unlisten } from "./ipc";
 import type { MarketplaceSkill } from "./marketplace";
 import type { MarketplaceProfile } from "./profile-marketplace";
-import type { ScheduledTask, CreateScheduledTaskInput } from "./scheduled";
+import type { ScheduledTask, CreateScheduledTaskInput } from "@/bindings";
 import { CONTROL_DEFAULTS, type ControlConfig } from "./control";
 import {
   APP_VERSION_FALLBACK,
@@ -291,7 +291,7 @@ function scoreProfile(profile: MarketplaceProfile, q: string): number {
 
 const HOUR_MS = 60 * 60 * 1000;
 
-// Seed scheduled tasks (SET.9) with times relative to load so "Next/Last" read
+// Seed scheduled tasks (RFC 0017) with times relative to load so "Next/Last" read
 // sensibly offline. One built-in "Memory Organizer" (RFC 0006 consolidation) that
 // runs daily, plus a weekly digest, so the list shows running + paused states.
 function initialScheduledTasks(): ScheduledTask[] {
@@ -300,8 +300,9 @@ function initialScheduledTasks(): ScheduledTask[] {
     {
       id: "memory-organizer",
       name: "Memory Organizer",
-      builtin: true,
-      cron: "0 17 * * *",
+      kind: { kind: "builtin", value: "memory_consolidate" },
+      cron: "0 0 17 * * *",
+      safetyCeiling: "read_only",
       cadenceLabel: "Daily at 5:00 PM",
       nextRun: now + 6 * HOUR_MS,
       lastRun: now - 18 * HOUR_MS,
@@ -310,12 +311,12 @@ function initialScheduledTasks(): ScheduledTask[] {
     {
       id: "weekly-digest",
       name: "Weekly Digest",
-      builtin: false,
-      cron: "0 9 * * 1",
+      kind: { kind: "prompt", value: "Summarise my week." },
+      cron: "0 0 9 * * 1",
+      safetyCeiling: "read_only",
       cadenceLabel: "Mondays at 9:00 AM",
-      nextRun: null, // paused → no scheduled run (matches toggle behavior)
-      lastRun: now - 4 * 24 * HOUR_MS,
       paused: true,
+      lastRun: now - 4 * 24 * HOUR_MS,
     },
   ];
 }
@@ -1201,7 +1202,7 @@ export class MockIpc implements FfIpc {
     if (!task) throw new Error(`unknown scheduled task: ${id}`);
     task.paused = !task.paused;
     // A paused task has no next run; resuming schedules it ~a day out.
-    task.nextRun = task.paused ? null : Date.now() + 24 * HOUR_MS;
+    task.nextRun = task.paused ? undefined : Date.now() + 24 * HOUR_MS;
     return { ...task };
   }
 
@@ -1211,15 +1212,31 @@ export class MockIpc implements FfIpc {
     const task: ScheduledTask = {
       id: uid(),
       name: input.name,
-      builtin: false,
+      kind: input.kind,
       cron: input.cron,
-      cadenceLabel: input.cadenceLabel,
+      workspace: input.workspace,
+      profile: input.profile,
+      safetyCeiling: input.safetyCeiling ?? "read_only",
+      // Derived server-side in the real backend; the mock fakes a label.
+      cadenceLabel: input.name,
       nextRun: Date.now() + 24 * HOUR_MS,
-      lastRun: null,
       paused: false,
     };
     this.scheduledTasks.push(task);
     return { ...task };
+  }
+
+  async deleteScheduledTask(id: string): Promise<void> {
+    const task = this.scheduledTasks.find((t) => t.id === id);
+    if (task && task.kind.kind === "builtin") {
+      throw new Error("built-in tasks cannot be deleted");
+    }
+    this.scheduledTasks = this.scheduledTasks.filter((t) => t.id !== id);
+  }
+
+  async previewCadence(cron: string): Promise<string> {
+    // The mock cannot parse cron; echo a stable placeholder.
+    return `Runs on \`${cron}\``;
   }
 
   async warmup(): Promise<void> {
