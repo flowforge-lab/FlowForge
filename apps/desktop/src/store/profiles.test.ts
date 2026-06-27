@@ -77,7 +77,9 @@ describe("useProfilesStore", () => {
     await ipc.switchPhenotype(DEFAULT_PROFILE_ID);
     useProfilesStore.setState({
       profiles: [],
+      phenotypesById: {},
       activeId: DEFAULT_PROFILE_ID,
+      selectedId: null,
       loading: false,
       saving: false,
       error: null,
@@ -123,5 +125,80 @@ describe("useProfilesStore", () => {
     await useProfilesStore.getState().resetProfiles();
     // The mock seeds codon, so reset targets codon rather than the built-in default.
     expect(useProfilesStore.getState().activeId).toBe(CODON_PROFILE_ID);
+  });
+});
+
+describe("useProfilesStore editor (#530)", () => {
+  beforeEach(async () => {
+    useProfilesStore.setState({
+      profiles: [],
+      phenotypesById: {},
+      activeId: DEFAULT_PROFILE_ID,
+      selectedId: null,
+      loading: false,
+      saving: false,
+      error: null,
+    });
+    await useProfilesStore.getState().load();
+  });
+
+  it("load keeps the raw phenotype and auto-selects the active one", () => {
+    const { phenotypesById, selectedId, activeId } =
+      useProfilesStore.getState();
+    expect(phenotypesById[DEFAULT_PROFILE_ID]).toMatchObject({
+      name: "default",
+    });
+    // First open targets the active phenotype so the editor is discoverable.
+    expect(selectedId).toBe(activeId);
+  });
+
+  it("select opens / closes a phenotype's editor panel", () => {
+    useProfilesStore.getState().select("rust");
+    expect(useProfilesStore.getState().selectedId).toBe("rust");
+    useProfilesStore.getState().select(null);
+    expect(useProfilesStore.getState().selectedId).toBeNull();
+  });
+
+  it("savePhenotype binds provider/model losslessly and round-trips through load", async () => {
+    await useProfilesStore
+      .getState()
+      .savePhenotype("rust", { provider: "openai", model: "gpt-4o" });
+    expect(useProfilesStore.getState().phenotypesById["rust"]).toMatchObject({
+      provider: "openai",
+      model: "gpt-4o",
+      // Skills/persona are preserved (whole-record write).
+      skills: ["rust-debugging", "write-tests"],
+      persona: "You are a meticulous Rust engineer.",
+    });
+    // Persisted in the backend: a fresh read still has the binding.
+    const raw = (await ipc.listPhenotypes()).find((p) => p.name === "rust");
+    expect(raw).toMatchObject({ provider: "openai", model: "gpt-4o" });
+  });
+
+  it("savePhenotype with undefined clears the binding (inherit)", async () => {
+    await useProfilesStore
+      .getState()
+      .savePhenotype("reviewer", { provider: undefined, model: undefined });
+    const reviewer = useProfilesStore.getState().phenotypesById["reviewer"];
+    expect(reviewer.provider).toBeUndefined();
+    expect(reviewer.model).toBeUndefined();
+  });
+
+  it("savePhenotype records the error when the write rejects", async () => {
+    await useProfilesStore
+      .getState()
+      .savePhenotype("rust", { provider: "ghost-conn" });
+    expect(useProfilesStore.getState().error).toMatch(/unknown connection/i);
+  });
+
+  it("duplicatePhenotype creates a uniquely-named clone and selects it", async () => {
+    await useProfilesStore.getState().duplicatePhenotype(DEFAULT_PROFILE_ID);
+    const { profiles, selectedId } = useProfilesStore.getState();
+    expect(profiles.map((p) => p.id)).toContain("default-copy");
+    expect(selectedId).toBe("default-copy");
+
+    // A second duplicate avoids the name collision.
+    await useProfilesStore.getState().duplicatePhenotype(DEFAULT_PROFILE_ID);
+    expect(useProfilesStore.getState().selectedId).toBe("default-copy-2");
   });
 });

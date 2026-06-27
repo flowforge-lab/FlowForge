@@ -42,3 +42,71 @@ describe("MockIpc phenotypes", () => {
     );
   });
 });
+
+describe("MockIpc updatePhenotype (#530)", () => {
+  it("rejects the immutable built-in default", async () => {
+    const ipc = new MockIpc();
+    await expect(
+      ipc.updatePhenotype({ name: "default", skills: [] }),
+    ).rejects.toThrow(/immutable/);
+  });
+
+  it("rejects an unknown provider connection", async () => {
+    const ipc = new MockIpc();
+    await expect(
+      ipc.updatePhenotype({ name: "rust", skills: [], provider: "ghost-conn" }),
+    ).rejects.toThrow(/unknown connection/);
+  });
+
+  it("upserts a brand-new phenotype (appears in listPhenotypes)", async () => {
+    const ipc = new MockIpc();
+    const saved = await ipc.updatePhenotype({
+      name: "data-science",
+      skills: [],
+      provider: "openai",
+      model: "gpt-4o",
+    });
+    expect(saved).toMatchObject({ name: "data-science", provider: "openai" });
+    const names = (await ipc.listPhenotypes()).map((p) => p.name);
+    expect(names).toContain("data-science");
+  });
+
+  it("overwrites an existing phenotype by name (lossless round-trip)", async () => {
+    const ipc = new MockIpc();
+    await ipc.updatePhenotype({
+      name: "rust",
+      skills: ["rust-debugging", "write-tests"],
+      persona: "You are a meticulous Rust engineer.",
+      provider: "ollama",
+      model: "qwen2.5",
+    });
+    const rust = (await ipc.listPhenotypes()).find((p) => p.name === "rust");
+    expect(rust).toMatchObject({ provider: "ollama", model: "qwen2.5" });
+    // Untouched fields survive the write.
+    expect(rust?.persona).toBe("You are a meticulous Rust engineer.");
+    expect(rust?.skills).toEqual(["rust-debugging", "write-tests"]);
+  });
+
+  it("re-applies skills and emits skills:changed when the active phenotype is edited", async () => {
+    const ipc = new MockIpc();
+    await ipc.switchPhenotype("rust");
+    const events: string[][] = [];
+    await ipc.onSkillsChanged((e) => events.push(e.active));
+
+    await ipc.updatePhenotype({
+      name: "rust",
+      skills: ["write-tests"],
+      persona: "You are a meticulous Rust engineer.",
+    });
+    expect((await ipc.getPhenotype()).skills).toEqual(["write-tests"]);
+    expect(events[events.length - 1]).toEqual(["write-tests"]);
+  });
+
+  it("does not emit for an edit to a non-active phenotype", async () => {
+    const ipc = new MockIpc();
+    const events: string[][] = [];
+    await ipc.onSkillsChanged((e) => events.push(e.active));
+    await ipc.updatePhenotype({ name: "rust", skills: ["write-tests"] });
+    expect(events).toHaveLength(0);
+  });
+});

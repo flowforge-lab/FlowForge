@@ -2,6 +2,7 @@ import { useState } from "react";
 import { FolderPlus, Lock, Star } from "@/components/ui/icon";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
+import { PhenotypeDetail } from "@/components/settings/profiles/phenotype-detail";
 import {
   defaultProfileId,
   useProfilesStore,
@@ -21,16 +22,17 @@ const ACCENT_BORDER: Record<ProfileAccent, string> = {
 /**
  * Installed sub-tab (SET.7): profile cards (name, description, skill count, lock
  * icon, accent border, ACTIVE badge, default star) plus "Install local profile…".
- * Selecting a card switches the active phenotype via `useProfilesStore`. Local
- * install isn't wired — the button surfaces that it arrives with the backend.
+ * Selecting a card opens its detail/editor panel below the grid (#530), where the
+ * phenotype can be activated and its Provider/Model bound. Local install isn't
+ * wired — the button surfaces that it arrives with the backend.
  */
 export function InstalledTab() {
   const profiles = useProfilesStore((s) => s.profiles);
   const activeId = useProfilesStore((s) => s.activeId);
+  const selectedId = useProfilesStore((s) => s.selectedId);
   const loading = useProfilesStore((s) => s.loading);
-  const saving = useProfilesStore((s) => s.saving);
   const error = useProfilesStore((s) => s.error);
-  const setActive = useProfilesStore((s) => s.setActive);
+  const select = useProfilesStore((s) => s.select);
   const [installHint, setInstallHint] = useState(false);
   const defaultId = defaultProfileId(profiles);
 
@@ -74,14 +76,16 @@ export function InstalledTab() {
                 key={profile.id}
                 profile={profile}
                 active={profile.id === activeId}
+                selected={profile.id === selectedId}
                 isDefault={profile.id === defaultId}
-                disabled={saving}
-                onSelect={() => void setActive(profile.id)}
+                onSelect={() => select(profile.id)}
               />
             ))}
           </ul>
         )}
       </section>
+
+      {selectedId ? <PhenotypeDetail phenotypeId={selectedId} /> : null}
     </div>
   );
 }
@@ -89,29 +93,27 @@ export function InstalledTab() {
 function ProfileCard({
   profile,
   active,
+  selected,
   isDefault,
-  disabled,
   onSelect,
 }: {
   profile: Profile;
   active: boolean;
+  selected: boolean;
   isDefault: boolean;
-  disabled: boolean;
   onSelect: () => void;
 }) {
   return (
     <li>
       <button
         type="button"
-        aria-pressed={active}
-        disabled={disabled}
+        aria-pressed={selected}
         onClick={onSelect}
         className={cn(
           "flex w-full flex-col gap-1.5 rounded-md border border-l-2 px-3 py-2.5 text-left transition-colors outline-none",
           ACCENT_BORDER[profile.accent],
           "hover:bg-muted/40 focus-visible:ring-2 focus-visible:ring-primary/30",
-          "disabled:cursor-not-allowed disabled:opacity-60",
-          active && "bg-primary/5 ring-2 ring-primary/30",
+          selected && "bg-primary/5 ring-2 ring-primary/30",
         )}
       >
         <div className="flex items-center gap-1.5">
