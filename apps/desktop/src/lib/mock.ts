@@ -11,6 +11,7 @@ import type {
   ProviderConnection,
   ProviderRegistry,
   ModelSelection,
+  ResolvedModel,
   ProviderKind,
   SearchConfig,
   ApprovalSafety,
@@ -432,8 +433,6 @@ export class MockIpc implements FfIpc {
         hasKey: false,
         thinking: true,
         reasoningEffort: "medium",
-        supportsVision: false,
-        supportsDocuments: false,
       },
       {
         id: "ollama",
@@ -443,8 +442,6 @@ export class MockIpc implements FfIpc {
         hasKey: false,
         thinking: true,
         reasoningEffort: "medium",
-        supportsVision: false,
-        supportsDocuments: false,
       },
       {
         id: "bedrock",
@@ -454,8 +451,6 @@ export class MockIpc implements FfIpc {
         hasKey: false,
         thinking: true,
         reasoningEffort: "low",
-        supportsVision: false,
-        supportsDocuments: true,
         region: "us-east-1",
         authMode: "profile",
         awsProfile: "bedrock-profile",
@@ -473,8 +468,6 @@ export class MockIpc implements FfIpc {
         hasKey: false,
         thinking: true,
         reasoningEffort: "high",
-        supportsVision: false,
-        supportsDocuments: false,
       },
       // OpenAI (#311 PR-3b): a hosted, OpenAI-compatible connection so the
       // hosted-key card is exercisable offline. Keyless by default → the Test
@@ -489,9 +482,6 @@ export class MockIpc implements FfIpc {
         hasKey: false,
         thinking: true,
         reasoningEffort: "medium",
-        // gpt-4o is vision-capable.
-        supportsVision: true,
-        supportsDocuments: false,
       },
     ],
   };
@@ -1577,26 +1567,55 @@ Shipping the Settings redesign — currently the Memory browser (SET.8).
     return sel ? { ...sel } : null;
   }
 
+  // Mirror of the backend capability derivation (RFC 0005 §11.3): attachment caps
+  // come from the resolved `(kind, model)`, never a stored connection flag. Documents
+  // are Bedrock-only (matching `model_supports_documents`); vision is a deliberately
+  // small, mock-faithful subset of the data-driven model-specs (#466) — enough to
+  // exercise the composer gate offline (gpt-4o and any `*-vision` model un-gate
+  // images). Fail-closed when the kind is unknown.
+  private modelCaps(
+    kind: ProviderKind | undefined,
+    model: string,
+  ): { supportsVision: boolean; supportsDocuments: boolean } {
+    if (!kind) return { supportsVision: false, supportsDocuments: false };
+    const m = model.toLowerCase();
+    const supportsVision =
+      m.includes("vision") || (kind === "openai" && m.startsWith("gpt-4o"));
+    return { supportsVision, supportsDocuments: kind === "bedrock" };
+  }
+
   // Authoritative resolver mirror (§11.2), most-specific wins: session override →
   // the session's phenotype (its `provider`/`model`, each inheriting when None) →
-  // the global active connection + its model.
-  async resolveModelSelection(sessionId: string): Promise<ModelSelection> {
+  // the global active connection + its model. Caps are derived from the resolved
+  // `(kind, model)` and folded into the `ResolvedModel` response (§11.3).
+  async resolveModelSelection(sessionId: string): Promise<ResolvedModel> {
     const override = this.sessionModelSelections.get(sessionId);
-    if (override) return { ...override };
+    let connection: string;
+    let model: string;
+    if (override) {
+      connection = override.connection;
+      model = override.model;
+    } else {
+      const bound = this.sessions.get(sessionId)?.phenotype;
+      const pheno =
+        (bound === DEFAULT_PHENOTYPE.name
+          ? DEFAULT_PHENOTYPE
+          : bound
+            ? MOCK_PHENOTYPES.find((p) => p.name === bound)
+            : undefined) ?? this.activePhenotype;
 
-    const bound = this.sessions.get(sessionId)?.phenotype;
-    const pheno =
-      (bound === DEFAULT_PHENOTYPE.name
-        ? DEFAULT_PHENOTYPE
-        : bound
-          ? MOCK_PHENOTYPES.find((p) => p.name === bound)
-          : undefined) ?? this.activePhenotype;
+      const connId = pheno.provider ?? this.registry.active;
+      const conn =
+        this.registry.connections.find((c) => c.id === connId) ??
+        this.activeConnection();
+      connection = conn.id;
+      model = pheno.model ?? conn.model;
+    }
 
-    const connId = pheno.provider ?? this.registry.active;
-    const conn =
-      this.registry.connections.find((c) => c.id === connId) ??
-      this.activeConnection();
-    return { connection: conn.id, model: pheno.model ?? conn.model };
+    const kind = this.registry.connections.find(
+      (c) => c.id === connection,
+    )?.kind;
+    return { connection, model, ...this.modelCaps(kind, model) };
   }
 
   // Profile marketplace search (SET.7). Empty query lists the full catalog,

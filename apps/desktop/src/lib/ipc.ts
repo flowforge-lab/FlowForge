@@ -18,6 +18,7 @@ import type {
   ProviderRegistry,
   ProviderKind,
   ModelSelection,
+  ResolvedModel,
   SearchConfig,
   SearchBackend,
   Session,
@@ -283,9 +284,11 @@ export interface FfIpc {
    *  chip's "overridden / clear" affordance. */
   getSessionModelSelection(sessionId: string): Promise<ModelSelection | null>;
   /** The authoritative resolved pair for a session: session ?? phenotype ?? global
-   *  (§11.2). Wraps the backend resolver so the FE never duplicates it; drives the
-   *  per-pane model chip's label. */
-  resolveModelSelection(sessionId: string): Promise<ModelSelection>;
+   *  (§11.2), plus the attachment capabilities derived from the resolved
+   *  `(kind, model)` (§11.3) — never stored on a connection. Wraps the backend
+   *  resolver so the FE never duplicates it; drives the per-pane model chip's label
+   *  and the composer attach gate. */
+  resolveModelSelection(sessionId: string): Promise<ResolvedModel>;
 
   // CONTRACT NOTE (SET.7): FE-owned mock command — no backend/ts-rs binding for a
   // remote profile catalog exists yet. `MarketplaceProfile` lives in
@@ -550,7 +553,7 @@ class TauriIpc implements FfIpc {
       sessionId,
     });
   resolveModelSelection = (sessionId: string) =>
-    this.invoke<ModelSelection>("resolve_model_selection", { sessionId });
+    this.invoke<ResolvedModel>("resolve_model_selection", { sessionId });
   searchProfileMarketplace = (query: string) =>
     this.invoke<MarketplaceProfile[]>("search_profile_marketplace", { query });
   listScheduledTasks = () =>
