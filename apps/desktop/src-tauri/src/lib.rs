@@ -20,13 +20,15 @@ use ff_core::{
     Attachment, BedrockAuth, CreateScheduledTaskInput, Format, McpServerConfig, McpServerStatus,
     MemoryFileInfo, MemoryFileKind, MemoryOverview, Message, Mode, ModelSelection, Phenotype,
     ProviderConfig, ProviderConnection, ProviderKind, ProviderRegistry, ResolvedModel, Role,
-    ScheduledTask, SearchConfig, SecretKind, Session, SessionWorkspace, Skill, SkillInfo,
-    SkillManifest,
+    RunStatus, ScheduledTask, SearchConfig, SecretKind, Session, SessionWorkspace, Skill,
+    SkillInfo, SkillManifest, TaskKind,
 };
+use ff_scheduled::ScheduledApprover;
 use ff_signals::SkillAggregate;
 use ff_tools::Safety;
 use state::AppState;
 use std::sync::Arc;
+use std::time::Duration;
 use tauri::{Emitter, Manager, State};
 use tauri_plugin_shell::ShellExt;
 use uuid::Uuid;
@@ -298,6 +300,36 @@ fn delete_scheduled_task(state: State<'_, Arc<AppState>>, id: String) -> Result<
 fn preview_cadence(cron: String) -> Result<String, String> {
     ff_scheduled::cron::parse(&cron)?;
     Ok(ff_scheduled::cron::cadence_label(&cron))
+}
+
+/// Fire a scheduled task immediately, off-schedule (RFC 0017 section 8.3). Runs
+/// the same bounded headless turn the scheduler would, records the run, and
+/// stamps `last_run` so the manual fire counts as the most recent run (and the
+/// background sweep will not immediately re-fire it).
+#[tauri::command]
+async fn run_scheduled_task_now(
+    state: State<'_, Arc<AppState>>,
+    app: tauri::AppHandle,
+    id: String,
+) -> Result<(), String> {
+    let task = state
+        .scheduled
+        .get(&id)
+        .ok_or_else(|| format!("unknown scheduled task: {id}"))?;
+    let runner = DesktopTaskRunner {
+        state: state.inner().clone(),
+        app,
+    };
+    let fired_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    let outcome = ff_scheduled::TaskRunner::fire(&runner, &task).await;
+    state
+        .scheduled
+        .append_run(&task.id, outcome.session_id.as_deref(), outcome.status);
+    state.scheduled.stamp_last_run(&task.id, fired_ms);
+    Ok(())
 }
 
 /// Clone a session and its transcript into a fresh session (server-truth).
@@ -863,6 +895,152 @@ fn spawn_assistant_turn(state: Arc<AppState>, app: tauri::AppHandle, session_id:
                 .await;
         }
     });
+}
+
+/// Per-fire wall-clock budget for a scheduled run (RFC 0017 §8.2). A fire is a
+/// bounded single `run_turn`; if it overruns it is cancelled and recorded
+/// `cancelled`, so one hung fire cannot starve later due tasks.
+const SCHEDULED_FIRE_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// Fires a due scheduled task as a headless agent turn (RFC 0017 §4). Mirrors
+/// `spawn_assistant_turn`: create a session, bind the task's workspace + profile,
+/// resolve the provider + phenotype, run one bounded `run_turn` under a
+/// `ScheduledApprover` at the task's safety ceiling, and map the result to a
+/// terminal `RunStatus`. Lives here (not in `ff-scheduled`) so that crate stays
+/// Tauri-free; this is the host-supplied `TaskRunner`.
+struct DesktopTaskRunner {
+    state: Arc<AppState>,
+    app: tauri::AppHandle,
+}
+
+#[async_trait]
+impl ff_scheduled::TaskRunner for DesktopTaskRunner {
+    async fn fire(&self, task: &ScheduledTask) -> ff_scheduled::RunOutcome {
+        // Builtin dispatch (e.g. memory consolidation) is #544; a prompt task is
+        // the only kind that fires today.
+        let prompt = match &task.kind {
+            TaskKind::Prompt(text) => text.clone(),
+            TaskKind::Builtin(_) => {
+                return ff_scheduled::RunOutcome {
+                    session_id: None,
+                    status: RunStatus::Error,
+                };
+            }
+        };
+
+        // Create the fire's session and bind the task's workspace + profile so the
+        // turn runs in the intended checkout under the intended persona. A stale
+        // profile name fails the fire (`error`), surfaced on the run record.
+        let session = self.state.store.create_session(Some(task.name.clone()));
+        let sid = session.id;
+        if let Some(ws) = &task.workspace {
+            self.state
+                .store
+                .set_session_workspace(&sid, Some(ws.clone()));
+        }
+        if let Some(profile) = &task.profile {
+            if let Err(e) = self
+                .state
+                .set_session_phenotype(&sid, Some(profile.clone()))
+            {
+                tracing::warn!(task = %task.id, error = %e, "scheduled fire: unresolved profile");
+                return ff_scheduled::RunOutcome {
+                    session_id: Some(sid),
+                    status: RunStatus::Error,
+                };
+            }
+        }
+        self.state.store.add_message(&sid, Role::User, prompt);
+
+        // The safety ceiling maps to the advertised toolset: a read-only task runs
+        // in Plan (only read-only tools advertised), a write task in Act (write
+        // tools advertised; the approver allows Write and denies Dangerous).
+        let mode = match task.safety_ceiling {
+            ff_core::SafetyCeiling::ReadOnly => Mode::Plan,
+            ff_core::SafetyCeiling::Write => Mode::Act,
+        };
+
+        let pheno = self.state.session_phenotype(&sid);
+        let selection = self.state.resolve_model_selection(&sid);
+        let (provider, _) = self
+            .state
+            .build_provider_for(Some(&selection.connection), Some(&selection.model));
+        let model = selection.model;
+        let max_iterations = pheno
+            .max_iterations
+            .unwrap_or(ff_agent::DEFAULT_MAX_ITERATIONS);
+
+        let session_root = self.state.session_root(&sid);
+        self.state.align_codegraph_workspace(&session_root).await;
+        let registry = self.state.build_tool_registry();
+        let approver = ScheduledApprover::new(task.safety_ceiling);
+        let mut tool_ctx = ToolContext::new(&registry, &session_root, &approver, max_iterations);
+        tool_ctx.mode = mode;
+        tool_ctx.abstractive = crate::state::abstractive_config_from_env();
+
+        let skills = self.state.skills_snapshot();
+        let user_ctx = ff_agent::UserContext::now();
+        let active: Vec<String> = self.state.turn_active_skills(&sid);
+        let (memory, _ambient_keys) = self
+            .state
+            .memory()
+            .ambient_block_filtered_keyed(self.state.index().as_ref());
+        let system_prompt = ff_agent::build_system_prompt(
+            pheno.persona.as_deref(),
+            &skills,
+            &active,
+            &user_ctx,
+            memory.as_deref(),
+            mode,
+        );
+
+        let cancel = CancelToken::new();
+        let thinking = self.state.provider_config().thinking;
+        let reasoning_visibility = self.state.provider_config().reasoning_visibility;
+        let app = self.app.clone();
+        let sid_for_events = sid.clone();
+        let turn = run_turn(
+            provider.as_ref(),
+            self.state.store.as_ref(),
+            &tool_ctx,
+            &sid,
+            &model,
+            Some(system_prompt.as_str()),
+            thinking,
+            reasoning_visibility,
+            cancel.clone(),
+            move |event| emit_agent_event(&app, &sid_for_events, event),
+        );
+        let result = tokio::time::timeout(SCHEDULED_FIRE_TIMEOUT, turn).await;
+
+        // Outcome precedence (RFC 0017 §8.4): an ask_user dismissal surfaces as
+        // needs_attention regardless of how the rest of the turn ended; else a
+        // timeout is a cancellation; else a run_turn error; else ok (a denied
+        // write within an otherwise-complete run is still ok).
+        let status = if approver.needs_attention() {
+            RunStatus::NeedsAttention
+        } else {
+            match result {
+                Err(_elapsed) => {
+                    cancel.cancel();
+                    RunStatus::Cancelled
+                }
+                Ok(Err(_)) => RunStatus::Error,
+                Ok(Ok(_)) => RunStatus::Ok,
+            }
+        };
+
+        let _ = self.app.emit(
+            "scheduled:fired",
+            serde_json::json!({ "id": task.id, "sessionId": sid, "status": status }),
+        );
+        let _ = self.app.emit("scheduled:changed", ());
+
+        ff_scheduled::RunOutcome {
+            session_id: Some(sid),
+            status,
+        }
+    }
 }
 
 /// Edit a prior user message in place, truncate the transcript after it, and
@@ -1858,6 +2036,19 @@ pub fn run() {
                     }
                 });
             }
+            // Drive the scheduled-task firing engine (RFC 0017 section 4, #542):
+            // a background sweep fires due tasks through the desktop runner. The
+            // tick is coarse; the due predicate is minute-granular, so a 30s sweep
+            // never misses a slot and never double-fires (stamped last_run gates it).
+            let scheduler_runner: Arc<dyn ff_scheduled::TaskRunner> = Arc::new(DesktopTaskRunner {
+                state: state.clone(),
+                app: app.handle().clone(),
+            });
+            ff_scheduled::spawn_scheduler(
+                state.scheduled.clone(),
+                scheduler_runner,
+                Duration::from_secs(30),
+            );
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -1872,6 +2063,7 @@ pub fn run() {
             create_scheduled_task,
             toggle_scheduled_task,
             delete_scheduled_task,
+            run_scheduled_task_now,
             preview_cadence,
             get_session_workspace,
             set_session_workspace,

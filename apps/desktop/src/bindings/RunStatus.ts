@@ -4,4 +4,4 @@
  * Terminal status of one fire (RFC 0017 §8.4). A tool denial is incidental
  * within an otherwise-`Ok` run, not a terminal status.
  */
-export type RunStatus = "ok" | "error" | "cancelled";
+export type RunStatus = "ok" | "error" | "cancelled" | "needs_attention";

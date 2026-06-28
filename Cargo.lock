@@ -2017,13 +2017,18 @@ dependencies = [
 name = "ff-scheduled"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "chrono",
  "cron",
+ "ff-agent",
  "ff-core",
+ "ff-tools",
+ "futures-util",
  "rusqlite",
  "serde",
  "serde_json",
  "tempfile",
+ "tokio",
  "tracing",
  "uuid",
 ]

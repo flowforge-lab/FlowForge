@@ -178,6 +178,20 @@ impl ScheduledStore {
         conn.last_insert_rowid()
     }
 
+    /// Status text of each run for a task, oldest first. Test-only reader so the
+    /// runner's tests can assert recorded outcomes without exposing the schema.
+    #[cfg(test)]
+    pub(crate) fn run_statuses(&self, task_id: &str) -> Vec<String> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT status FROM scheduled_runs WHERE task_id = ?1 ORDER BY fired_ms ASC")
+            .unwrap();
+        let rows = stmt
+            .query_map(params![task_id], |r| r.get::<_, String>(0))
+            .unwrap();
+        rows.map(|r| r.unwrap()).collect()
+    }
+
     /// Tasks that are due to fire at `now` (local time): not paused, and the
     /// most recent occurrence at/before `now` is strictly newer than the last
     /// fire (RFC 0017 §4). A `None` `last_run` means "never fired", so any past
@@ -279,6 +293,7 @@ fn status_to_text(s: RunStatus) -> &'static str {
         RunStatus::Ok => "ok",
         RunStatus::Error => "error",
         RunStatus::Cancelled => "cancelled",
+        RunStatus::NeedsAttention => "needs_attention",
     }
 }
 

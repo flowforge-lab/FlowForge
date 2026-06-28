@@ -116,6 +116,10 @@ pub enum RunStatus {
     Ok,
     Error,
     Cancelled,
+    /// The turn fired but called `ask_user` and was dismissed (no interactive
+    /// surface in a headless fire), so it surfaced for the user rather than
+    /// continuing on a dismissed answer (RFC 0017 §3.1, §8.4).
+    NeedsAttention,
 }
 
 /// A record of one fire, backing the ↗ open-session affordance and the audit
