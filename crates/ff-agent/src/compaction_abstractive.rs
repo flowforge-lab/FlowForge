@@ -125,6 +125,8 @@ impl AbstractiveSummarizer {
             tools: Vec::new(),
             // Internal condensation turn -- never stream reasoning here.
             thinking: false,
+            // Bounded internal output; no large tool-call payload to protect.
+            max_tokens: None,
         };
         let summary = collect_text(provider, req, cancel).await?;
         let summary = summary.trim();

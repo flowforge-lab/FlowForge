@@ -3182,6 +3182,7 @@ mod tests {
             messages: vec![ChatMessage::text("user", "hi")],
             tools: Vec::new(),
             thinking,
+            max_tokens: None,
         };
         let _ = provider.chat_stream(req).await.expect("send succeeds");
         let reqs = server.received_requests().await.expect("requests recorded");

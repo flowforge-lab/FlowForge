@@ -448,6 +448,7 @@ impl Provider for BedrockProvider {
             messages: vec![ChatMessage::text("user", "ping")],
             tools: Vec::new(),
             thinking: false,
+            max_tokens: None,
         };
         let mut stream = self.chat_stream(req).await?;
         match stream.next().await {

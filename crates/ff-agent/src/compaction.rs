@@ -187,6 +187,8 @@ impl CompactionStrategy for MemoryFlush {
                 tools: tools.clone(),
                 // Internal summarization turn — never stream reasoning here.
                 thinking: false,
+                // Bounded internal output; no large tool-call payload to protect.
+                max_tokens: None,
             };
             let calls = collect_tool_calls(ctx.provider, req).await?;
 

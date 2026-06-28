@@ -19,7 +19,9 @@ impl Tool for WriteTool {
     fn description(&self) -> &str {
         "Create or overwrite a file with the given content, creating parent \
          directories as needed. Use this to create new files; use `edit` to \
-         modify an existing file in place."
+         modify an existing file in place. For a very large file, write a short \
+         initial file and append the remainder in chunks (e.g. via `bash`) so the \
+         tool-call payload is not truncated by the output-token limit."
     }
 
     fn parameters(&self) -> Value {
