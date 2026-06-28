@@ -305,9 +305,46 @@ pub struct SkillEvolveApprovalRequestEvent {
     pub cost_estimate: EvolveCostEstimate,
 }
 
+/// Download progress for an in-flight self-update install (#566, RFC 0014 section
+/// 12.2). Emitted as `update:progress` from `install_update` per downloaded chunk;
+/// `total` is the content length, absent when the feed does not send one (the UI
+/// then renders an indeterminate bar). App-global -- there is one install at a time,
+/// so no session id. A terminal `update:download-finished` event (empty payload)
+/// follows the last chunk, before the app relaunches.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "../../../apps/desktop/src/bindings/")]
+pub struct UpdateProgressEvent {
+    pub downloaded: u64,
+    pub total: Option<u64>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn update_progress_serializes_with_exact_contract_keys() {
+        let ev = UpdateProgressEvent {
+            downloaded: 1024,
+            total: Some(4096),
+        };
+        // The frontend listener reads these exact keys; both are single words so
+        // camelCase leaves them unchanged.
+        assert_eq!(
+            serde_json::to_value(&ev).unwrap(),
+            serde_json::json!({ "downloaded": 1024, "total": 4096 })
+        );
+        // An absent content length serializes as null, not a missing key.
+        let unknown = UpdateProgressEvent {
+            downloaded: 1024,
+            total: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&unknown).unwrap(),
+            serde_json::json!({ "downloaded": 1024, "total": null })
+        );
+    }
 
     #[test]
     fn phenotype_mcp_unavailable_serializes_with_exact_contract_keys() {

@@ -14,7 +14,7 @@ use ff_core::events::{
     PhenotypeMcpUnavailableEvent, ReasoningEvent, SkillActivated, SkillCompleted,
     SkillEvolveApprovalRequestEvent, SkillInstallApprovalRequestEvent, SkillsChangedEvent,
     TokenEvent, ToolApprovalRequestEvent, ToolAskRequestEvent, ToolCallEvent, ToolResultEvent,
-    TurnDoneEvent, TurnErrorEvent, TurnStatsEvent,
+    TurnDoneEvent, TurnErrorEvent, TurnStatsEvent, UpdateProgressEvent,
 };
 use ff_core::{
     Attachment, BedrockAuth, CreateScheduledTaskInput, Format, McpServerConfig, McpServerStatus,
@@ -1622,8 +1622,20 @@ async fn install_update(app: tauri::AppHandle) -> CmdResult<()> {
     let Some(update) = updater(&app)?.check().await.map_err(|e| e.to_string())? else {
         return Ok(());
     };
+    let progress_app = app.clone();
+    let finish_app = app.clone();
+    let mut downloaded: u64 = 0;
     update
-        .download_and_install(|_chunk, _total| {}, || {})
+        .download_and_install(
+            move |chunk, total| {
+                downloaded += chunk as u64;
+                let _ =
+                    progress_app.emit("update:progress", UpdateProgressEvent { downloaded, total });
+            },
+            move || {
+                let _ = finish_app.emit("update:download-finished", ());
+            },
+        )
         .await
         .map_err(|e| e.to_string())?;
     app.restart();
