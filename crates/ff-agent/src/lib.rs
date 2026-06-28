@@ -62,6 +62,67 @@ const MAX_PROVIDER_ATTEMPTS: usize = 3;
 /// (~250ms, 500ms), capped well under a second so retries stay snappy.
 const RETRY_BACKOFF_BASE_MS: u64 = 250;
 
+/// A rate-limit (429/quota) window is a ~minute-scale TPM/RPM reset, not a
+/// transport blip, so it gets its own, larger retry budget (#571). Waiting out a
+/// window must not consume the snappy transport-retry budget above.
+const MAX_RATE_LIMIT_ATTEMPTS: usize = 5;
+
+/// Base backoff for rate-limit retries when the gateway sends no `Retry-After`:
+/// the Nth retry (0-based) waits `BASE << N` ms (1s, 2s, 4s, 8s, 16s), capped.
+const RATE_LIMIT_BACKOFF_BASE_MS: u64 = 1_000;
+
+/// Hard ceiling on any single rate-limit wait, whether from exponential backoff
+/// or a `Retry-After` header, so a hostile/buggy header cannot park a turn for
+/// minutes.
+const RATE_LIMIT_BACKOFF_MAX_MS: u64 = 30_000;
+
+/// Backoff (ms) before a rate-limit retry. Honors the gateway's `Retry-After`
+/// when present (clamped to [`RATE_LIMIT_BACKOFF_MAX_MS`]); otherwise exponential
+/// on the 0-based `attempt` (1s, 2s, 4s, ... capped). Pure for unit testing.
+fn rate_limit_delay(attempt: usize, retry_after: Option<std::time::Duration>) -> u64 {
+    if let Some(d) = retry_after {
+        let ms = u64::try_from(d.as_millis()).unwrap_or(RATE_LIMIT_BACKOFF_MAX_MS);
+        return ms.min(RATE_LIMIT_BACKOFF_MAX_MS);
+    }
+    RATE_LIMIT_BACKOFF_BASE_MS
+        .checked_shl(attempt as u32)
+        .unwrap_or(RATE_LIMIT_BACKOFF_MAX_MS)
+        .min(RATE_LIMIT_BACKOFF_MAX_MS)
+}
+
+/// Decide whether a transient provider error should be retried, and if so how
+/// long to back off. Splits the two regimes (#571): a `RateLimited` window uses
+/// the seconds-scale schedule + its own `rate_limit_attempt` budget (honoring
+/// `Retry-After`), while every other transient error keeps the snappy
+/// transport-blip schedule + the `attempt` budget. Returns `Some(delay_ms)` to
+/// retry, or `None` to surface the error. `attempt` / `rate_limit_attempt` are
+/// the counts *already consumed* for each regime (1-based: the unconditional
+/// `attempt += 1` at the loop top runs before this is consulted).
+fn retry_backoff_ms(error: &LlmError, attempt: usize, rate_limit_attempt: usize) -> Option<u64> {
+    if !error.is_transient() {
+        return None;
+    }
+    match error {
+        LlmError::RateLimited { retry_after, .. } => {
+            if rate_limit_attempt >= MAX_RATE_LIMIT_ATTEMPTS {
+                return None;
+            }
+            Some(rate_limit_delay(rate_limit_attempt, *retry_after))
+        }
+        _ => {
+            if attempt >= MAX_PROVIDER_ATTEMPTS {
+                return None;
+            }
+            Some(RETRY_BACKOFF_BASE_MS << (attempt - 1))
+        }
+    }
+}
+
+/// Whether an error is a rate-limit window (used to bump the right counter).
+fn is_rate_limited(error: &LlmError) -> bool {
+    matches!(error, LlmError::RateLimited { .. })
+}
+
 /// Sleep `ms`, but wake early (and often) if the turn is cancelled, so a retry
 /// backoff never holds a cancelled turn open. `CancelToken` is a bare flag with no
 /// future to await, so we poll it in small steps.
@@ -944,6 +1005,10 @@ pub async fn run_turn(
         // failure can report truncation instead of a misleading "invalid JSON".
         let mut output_truncated = false;
         let mut attempt = 0usize;
+        // Rate-limit (429/quota) retries use a separate budget + seconds-scale
+        // schedule so waiting out a TPM window does not exhaust the transport
+        // retry budget (#571).
+        let mut rate_limit_attempt = 0usize;
         loop {
             attempt += 1;
             acc.clear();
@@ -975,8 +1040,15 @@ pub async fn run_turn(
             let mut stream = match provider.chat_stream(req).await {
                 Ok(s) => s,
                 Err(e) => {
-                    if e.is_transient() && attempt < MAX_PROVIDER_ATTEMPTS {
-                        cancellable_backoff(&cancel, RETRY_BACKOFF_BASE_MS << (attempt - 1)).await;
+                    if let Some(delay) = retry_backoff_ms(&e, attempt, rate_limit_attempt) {
+                        if is_rate_limited(&e) {
+                            // A rate-limit wait must not consume the transport
+                            // budget that the unconditional `attempt += 1` above
+                            // just charged (#571).
+                            attempt -= 1;
+                            rate_limit_attempt += 1;
+                        }
+                        cancellable_backoff(&cancel, delay).await;
                         // Cancelled during the backoff -> stop now instead of issuing one
                         // more wasted provider call (#244 R1 follow-up).
                         if cancel.is_cancelled() {
@@ -1049,8 +1121,17 @@ pub async fn run_turn(
             }
 
             match stream_err {
-                Some(e) if e.is_transient() && !emitted_any && attempt < MAX_PROVIDER_ATTEMPTS => {
-                    cancellable_backoff(&cancel, RETRY_BACKOFF_BASE_MS << (attempt - 1)).await;
+                Some(e)
+                    if !emitted_any
+                        && retry_backoff_ms(&e, attempt, rate_limit_attempt).is_some() =>
+                {
+                    // Safe: the guard only matches when `retry_backoff_ms` is Some.
+                    let delay = retry_backoff_ms(&e, attempt, rate_limit_attempt).unwrap();
+                    if is_rate_limited(&e) {
+                        attempt -= 1;
+                        rate_limit_attempt += 1;
+                    }
+                    cancellable_backoff(&cancel, delay).await;
                     // Cancelled during the backoff -> stop now instead of issuing one
                     // more wasted provider call (#244 R1 follow-up).
                     if cancel.is_cancelled() {
@@ -4301,6 +4382,126 @@ mod tests {
             calls.load(Ordering::SeqCst),
             1,
             "fatal errors are not retried"
+        );
+    }
+
+    /// Fails the first `fails` requests with a 429 RateLimited (optionally with a
+    /// Retry-After), then returns a text turn — to exercise the window-aware path.
+    struct RateLimitedSetup {
+        fails: usize,
+        retry_after: Option<std::time::Duration>,
+        calls: Arc<AtomicUsize>,
+    }
+    #[async_trait]
+    impl Provider for RateLimitedSetup {
+        async fn chat_stream(&self, _req: ChatRequest) -> Result<ChunkStream, LlmError> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            if n < self.fails {
+                return Err(LlmError::RateLimited {
+                    retry_after: self.retry_after,
+                    message: "rate limit: TPM exceeded".into(),
+                });
+            }
+            let chunks = vec![Ok(Chunk {
+                delta: "recovered".into(),
+                done: true,
+                ..Chunk::default()
+            })];
+            Ok(futures_util::stream::iter(chunks).boxed())
+        }
+    }
+
+    #[test]
+    fn rate_limit_delay_honors_retry_after_clamped() {
+        use std::time::Duration;
+        // Retry-After honored verbatim when sane.
+        assert_eq!(rate_limit_delay(0, Some(Duration::from_secs(12))), 12_000);
+        // Clamped to the max ceiling.
+        assert_eq!(
+            rate_limit_delay(0, Some(Duration::from_secs(9999))),
+            RATE_LIMIT_BACKOFF_MAX_MS
+        );
+        // Absent -> exponential on the 0-based attempt: 1s, 2s, 4s ...
+        assert_eq!(rate_limit_delay(0, None), 1_000);
+        assert_eq!(rate_limit_delay(1, None), 2_000);
+        assert_eq!(rate_limit_delay(2, None), 4_000);
+        // Far-out attempt saturates at the ceiling, never overflows.
+        assert_eq!(rate_limit_delay(64, None), RATE_LIMIT_BACKOFF_MAX_MS);
+    }
+
+    #[test]
+    fn retry_backoff_routes_by_regime() {
+        let rl = LlmError::RateLimited {
+            retry_after: Some(std::time::Duration::from_secs(5)),
+            message: "tpm".into(),
+        };
+        let blip = LlmError::Transport("reset".into());
+        let fatal = LlmError::Api {
+            status: 400,
+            message: "bad".into(),
+        };
+        // Rate-limit uses its own budget + Retry-After (transport attempt irrelevant).
+        assert_eq!(retry_backoff_ms(&rl, 99, 0), Some(5_000));
+        assert_eq!(retry_backoff_ms(&rl, 0, MAX_RATE_LIMIT_ATTEMPTS), None);
+        // Transport blip uses the snappy schedule + transport budget.
+        assert_eq!(retry_backoff_ms(&blip, 1, 0), Some(RETRY_BACKOFF_BASE_MS));
+        assert_eq!(retry_backoff_ms(&blip, MAX_PROVIDER_ATTEMPTS, 0), None);
+        // Fatal is never retried.
+        assert_eq!(retry_backoff_ms(&fatal, 1, 0), None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn rate_limited_then_success_completes_turn() {
+        // A 429 window clears: two RateLimited rejections then success. The
+        // seconds-scale backoff is waited out (virtual time) and the turn recovers.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = RateLimitedSetup {
+            fails: 2,
+            retry_after: None,
+            calls: calls.clone(),
+        };
+        let (res, errored) = run_text_turn(&provider).await;
+        assert_eq!(res.unwrap().content, "recovered");
+        assert!(
+            !errored,
+            "a recovered rate-limit turn should not surface an error"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 3, "two waits then success");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn rate_limited_honors_retry_after_and_recovers() {
+        // With a Retry-After present the turn still recovers (delay is honored,
+        // virtual time advances through it).
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = RateLimitedSetup {
+            fails: 1,
+            retry_after: Some(std::time::Duration::from_secs(20)),
+            calls: calls.clone(),
+        };
+        let (res, _) = run_text_turn(&provider).await;
+        assert_eq!(res.unwrap().content, "recovered");
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "one wait then success");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn persistent_rate_limit_fails_after_bounded_attempts() {
+        // A window that never clears must fail cleanly after MAX_RATE_LIMIT_ATTEMPTS,
+        // not spin forever. `fails` is large so every attempt is a 429.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = RateLimitedSetup {
+            fails: 999,
+            retry_after: None,
+            calls: calls.clone(),
+        };
+        let (res, errored) = run_text_turn(&provider).await;
+        assert!(res.is_err(), "a persistent rate limit must surface");
+        assert!(errored);
+        // First attempt + MAX_RATE_LIMIT_ATTEMPTS retries before giving up.
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            MAX_RATE_LIMIT_ATTEMPTS + 1,
+            "bounded by the rate-limit budget, separate from the transport budget"
         );
     }
 

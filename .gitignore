@@ -37,3 +37,4 @@ design/
 
 # Bash-tool workspace scratch dir (#458 RC4c) — local-only, never commit
 .ff-scratch/
+.ff_msg
