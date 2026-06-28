@@ -221,6 +221,12 @@ impl LlmError {
     }
 }
 
+/// Upper bound on how many bytes of an error body are read off the wire before
+/// the stream is stopped. Comfortably above the 2 KB `MAX` truncation applied
+/// afterwards, so the surfaced message is identical for any realistic error
+/// body while bounding peak memory. (#517 nit 2)
+const ERROR_BODY_READ_LIMIT: usize = 4096;
+
 /// Like `reqwest::Response::error_for_status`, but on a non-2xx response it
 /// reads the body into `LlmError::Api.message` instead of discarding it. The
 /// surfaced body is what makes a provider's `{"code":...,"message":...}` 400
@@ -235,9 +241,19 @@ pub(crate) async fn error_for_status_with_body(
         return Ok(resp);
     }
     let code = status.as_u16();
-    // Headers must be read before `text()` consumes the response.
+    // Headers must be read before the body is consumed.
     let retry_after = parse_retry_after(resp.headers());
-    let mut message = resp.text().await.unwrap_or_default().trim().to_string();
+    // Read the body with a hard byte ceiling rather than `resp.text()`, which
+    // buffers the entire body into memory before any truncation. A pathological
+    // multi-GB error body (only a risk if this is ever pointed at an untrusted
+    // gateway) would otherwise be fully buffered before the 2 KB cap below. The
+    // read stops after `ERROR_BODY_READ_LIMIT` bytes — comfortably above the
+    // `MAX` truncation point — so the surfaced message is identical for any
+    // realistic error body while bounding peak memory. (#517 nit 2)
+    let mut message = read_bounded_body(resp, ERROR_BODY_READ_LIMIT)
+        .await
+        .trim()
+        .to_string();
     const MAX: usize = 2048;
     if message.len() > MAX {
         let end = (0..=MAX)
@@ -266,6 +282,30 @@ pub(crate) async fn error_for_status_with_body(
         status: code,
         message,
     })
+}
+
+/// Read at most `limit` bytes from a response body, lossy-decoding as UTF-8.
+/// Stops reading once `limit` is reached, so an oversized body is never fully
+/// buffered into memory. Mirrors the bounded-accumulate pattern used by
+/// `ff_tools::web_fetch`. (#517 nit 2)
+async fn read_bounded_body(resp: reqwest::Response, limit: usize) -> String {
+    let mut stream = resp.bytes_stream();
+    let mut buf = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        match chunk {
+            Ok(bytes) => {
+                buf.extend_from_slice(&bytes);
+                if buf.len() >= limit {
+                    buf.truncate(limit);
+                    break;
+                }
+            }
+            // A transport error mid-body is treated like an early EOF: we surface
+            // whatever we have so far rather than discarding it.
+            Err(_) => break,
+        }
+    }
+    String::from_utf8_lossy(&buf).into_owned()
 }
 
 /// Parse a `Retry-After` header into a delay. Supports both forms from RFC 9110:
@@ -1110,5 +1150,98 @@ mod tests {
         let mut h = reqwest::header::HeaderMap::new();
         h.insert(reqwest::header::RETRY_AFTER, "soon".parse().unwrap());
         assert_eq!(parse_retry_after(&h), None);
+    }
+
+    #[tokio::test]
+    async fn read_bounded_body_stops_at_read_limit() {
+        // A body far larger than the read limit must not be fully buffered into
+        // memory. The bounded read stops after `ERROR_BODY_READ_LIMIT` bytes
+        // rather than reading the entire body and truncating afterwards. (#517 nit 2)
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let huge = "x".repeat(100_000);
+        Mock::given(method("GET"))
+            .and(path("/"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(huge))
+            .mount(&server)
+            .await;
+
+        let resp = build_streaming_http_client()
+            .get(server.uri())
+            .send()
+            .await
+            .unwrap();
+        let text = read_bounded_body(resp, ERROR_BODY_READ_LIMIT).await;
+        assert_eq!(
+            text.len(),
+            ERROR_BODY_READ_LIMIT,
+            "read should stop at the limit, not buffer the full 100 KB body"
+        );
+    }
+
+    #[tokio::test]
+    async fn error_for_status_with_body_surfaces_normal_body_unchanged() {
+        // For a normal-sized error body the surfaced message must be identical
+        // to the pre-hardening behavior — the bounded read is transparent. (#517 nit 2)
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let body = r#"{"code":20015,"message":"Field required"}"#;
+        Mock::given(method("GET"))
+            .and(path("/"))
+            .respond_with(ResponseTemplate::new(400).set_body_string(body))
+            .mount(&server)
+            .await;
+
+        let resp = build_streaming_http_client()
+            .get(server.uri())
+            .send()
+            .await
+            .unwrap();
+        match error_for_status_with_body(resp).await {
+            Err(LlmError::Api { status, message }) => {
+                assert_eq!(status, 400);
+                assert_eq!(message, body, "normal-sized body surfaced unchanged");
+            }
+            other => panic!("expected Api 400, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn error_for_status_with_body_truncates_oversized_body() {
+        // An oversized error body is truncated to the 2 KB cap with a flag — the
+        // same surfaced result as before the hardening, but now the read itself
+        // is bounded. (#517 nit 2)
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let huge = "x".repeat(10_000);
+        Mock::given(method("GET"))
+            .and(path("/"))
+            .respond_with(ResponseTemplate::new(400).set_body_string(huge))
+            .mount(&server)
+            .await;
+
+        let resp = build_streaming_http_client()
+            .get(server.uri())
+            .send()
+            .await
+            .unwrap();
+        match error_for_status_with_body(resp).await {
+            Err(LlmError::Api { status, message }) => {
+                assert_eq!(status, 400);
+                assert!(message.ends_with("...[truncated]"));
+                assert!(
+                    message.len() < 2_100,
+                    "message not bounded: {}",
+                    message.len()
+                );
+            }
+            other => panic!("expected Api 400, got {other:?}"),
+        }
     }
 }
