@@ -82,6 +82,7 @@ pub async fn propose_rewrite(
         messages: build_messages(skill, body, aggregate, transcript),
         tools: Vec::new(),
         thinking: false,
+        max_tokens: None,
     };
     let mut stream = provider.chat_stream(req).await.map_err(|e| e.to_string())?;
     let mut acc = String::new();
