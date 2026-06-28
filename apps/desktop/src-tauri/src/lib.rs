@@ -2040,25 +2040,28 @@ pub fn run() {
             // a background sweep fires due tasks through the desktop runner. The
             // tick is coarse; the due predicate is minute-granular, so a 30s sweep
             // never misses a slot and never double-fires (stamped last_run gates it).
-            //
-            // `spawn_scheduler` does a bare `tokio::spawn` internally (the crate is
-            // deliberately Tauri-free), but Tauri's `setup` runs outside an entered
-            // reactor on macOS (#117) — calling it here directly aborts the process
-            // ("must be called from the context of a Tokio runtime"). Run it from
-            // within Tauri's managed runtime, mirroring the `mcp:status-changed`
-            // watcher above, so the inner spawn has a reactor.
+            // Spawned via `tauri::async_runtime::spawn` (not a bare `tokio::spawn`)
+            // because Tauri's macOS `setup` hook runs before the reactor is entered on
+            // the main thread -- a bare spawn there aborts the process with "must be
+            // called from the context of a Tokio runtime" (same no-reactor issue as
+            // `init_mcp`, #117). The sweep loop is inlined into the managed spawn rather
+            // than calling `ff_scheduled::spawn_scheduler` (which does its own internal
+            // `tokio::spawn`), so this single managed task owns it directly.
             let scheduler_runner: Arc<dyn ff_scheduled::TaskRunner> = Arc::new(DesktopTaskRunner {
                 state: state.clone(),
                 app: app.handle().clone(),
             });
-            let scheduled_store = state.scheduled.clone();
-            tauri::async_runtime::spawn(async move {
-                ff_scheduled::spawn_scheduler(
-                    scheduled_store,
-                    scheduler_runner,
-                    Duration::from_secs(30),
-                );
-            });
+            {
+                let sched_store = state.scheduled.clone();
+                tauri::async_runtime::spawn(async move {
+                    let mut interval = tokio::time::interval(Duration::from_secs(30));
+                    loop {
+                        interval.tick().await;
+                        ff_scheduled::run_due_once(sched_store.as_ref(), scheduler_runner.as_ref())
+                            .await;
+                    }
+                });
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
