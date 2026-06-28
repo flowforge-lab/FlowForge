@@ -81,6 +81,16 @@ describe("concreteAuthMode", () => {
     );
   });
 
+  it("prefers apiKey over a profile when both coexist (#554)", () => {
+    // Backend auto resolves API key first, so the migration must too; otherwise the
+    // next Save would persist "profile" and silently drop the stored API key.
+    expect(
+      concreteAuthMode(
+        bedrock({ authMode: "auto", awsProfile: "default", hasKey: true }),
+      ),
+    ).toBe("apiKey");
+  });
+
   it("defaults a bare auto (and an unset mode) to profile", () => {
     expect(concreteAuthMode(bedrock({ authMode: "auto" }))).toBe("profile");
     expect(concreteAuthMode(bedrock({ authMode: undefined }))).toBe("profile");

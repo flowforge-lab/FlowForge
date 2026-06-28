@@ -391,16 +391,18 @@ export function normalizeBaseUrl(input: string): string {
  *  (or an unset mode) is migrated synchronously from what the connection exposes so
  *  the card's selector always opens on a valid choice, honoring the backend
  *  precedence (API key → profile → IAM keys) as far as the connection reveals it:
- *  a profile wins, else IAM keys (an `accessKeyId` is present), else a stored
- *  secret with no profile/`accessKeyId` can only be the Bedrock API key (#554).
- *  The next Save persists whatever concrete mode is shown. */
+ *  a stored secret with no `accessKeyId` can only be the Bedrock API key and wins
+ *  first, else a profile, else IAM keys (an `accessKeyId` is present) (#554). The
+ *  next Save persists whatever concrete mode is shown. */
 export function concreteAuthMode(conn: ProviderConnection): BedrockAuth {
   const mode = conn.authMode;
   if (mode === "profile" || mode === "iamKeys" || mode === "apiKey")
     return mode;
+  // Match the backend `auto` precedence (API key -> profile -> IAM keys): a stored
+  // secret with no `accessKeyId` can only be the Bedrock API key, so it wins first.
+  if (conn.hasKey && !conn.accessKeyId) return "apiKey";
   if (conn.awsProfile) return "profile";
   if (conn.accessKeyId) return "iamKeys";
-  if (conn.hasKey) return "apiKey";
   return "profile";
 }
 
