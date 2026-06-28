@@ -279,6 +279,7 @@ fn status_to_text(s: RunStatus) -> &'static str {
         RunStatus::Ok => "ok",
         RunStatus::Error => "error",
         RunStatus::Cancelled => "cancelled",
+        RunStatus::NeedsAttention => "needs_attention",
     }
 }
 
