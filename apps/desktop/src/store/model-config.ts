@@ -78,9 +78,6 @@ interface ModelConfigState extends LocalReasoningPrefs {
   /** Stored `SecretKind`s per connection id (#320); drives per-field Stored/Clear.
    *  Lazy — populated on card expand and after secret/save mutations. */
   secretsById: Record<string, SecretKind[]>;
-  /** The Bedrock auth each connection resolves to right now (#320); `null` for
-   *  non-Bedrock. Drives the "Active" credential badge. */
-  resolvedAuthById: Record<string, BedrockAuth | null>;
   /** In-flight "Test Connection" results, keyed by connection id. */
   test: Record<string, TestState>;
   loading: boolean;
@@ -90,8 +87,8 @@ interface ModelConfigState extends LocalReasoningPrefs {
   load: () => Promise<void>;
   /** Best-effort refresh of one connection's model list (e.g. on card expand). */
   loadModels: (id: string) => Promise<void>;
-  /** Best-effort refresh of one connection's stored-secret presence and resolved
-   *  Bedrock auth (#320); on card expand and after secret/save mutations. */
+  /** Best-effort refresh of one connection's stored-secret presence (#320); on
+   *  card expand and after secret/save mutations. */
   loadConnectionMeta: (id: string) => Promise<void>;
   /** Make a connection the default (active) provider. */
   setActiveConnection: (id: string) => Promise<void>;
@@ -150,7 +147,6 @@ export const useModelConfigStore = create<ModelConfigState>()(
         registry: null,
         modelsById: {},
         secretsById: {},
-        resolvedAuthById: {},
         test: {},
         loading: false,
         saving: false,
@@ -184,16 +180,12 @@ export const useModelConfigStore = create<ModelConfigState>()(
         loadConnectionMeta: async (id) => {
           // Best-effort: a stale/unknown id leaves the prior meta untouched.
           try {
-            const [secrets, resolvedAuth] = await Promise.all([
-              ipc.providerSecretPresence(id),
-              ipc.resolvedBedrockAuth(id),
-            ]);
+            const secrets = await ipc.providerSecretPresence(id);
             set((s) => ({
               secretsById: { ...s.secretsById, [id]: secrets },
-              resolvedAuthById: { ...s.resolvedAuthById, [id]: resolvedAuth },
             }));
           } catch {
-            // Leave the existing presence/resolved values in place.
+            // Leave the existing presence values in place.
           }
         },
 
@@ -268,13 +260,11 @@ export const useModelConfigStore = create<ModelConfigState>()(
               const { [id]: _t, ...test } = s.test;
               const { [id]: _m, ...modelsById } = s.modelsById;
               const { [id]: _s, ...secretsById } = s.secretsById;
-              const { [id]: _r, ...resolvedAuthById } = s.resolvedAuthById;
               return {
                 saving: false,
                 test,
                 modelsById,
                 secretsById,
-                resolvedAuthById,
               };
             });
           } catch (err) {
@@ -300,7 +290,7 @@ export const useModelConfigStore = create<ModelConfigState>()(
           try {
             await ipc.setProviderSecret(id, kind, value);
             await refresh();
-            // Per-kind presence and the resolved winner change here (#320).
+            // Per-kind presence changes here (#320).
             await get().loadConnectionMeta(id);
             set({ saving: false });
           } catch (err) {
@@ -395,6 +385,25 @@ export function normalizeBaseUrl(input: string): string {
   url = url.replace(/\/chat\/completions$/i, "");
   url = url.replace(/\/+$/, "");
   return url;
+}
+
+/** Map a stored Bedrock auth mode to a concrete, selectable one. A legacy `auto`
+ *  (or an unset mode) is migrated synchronously from what the connection exposes so
+ *  the card's selector always opens on a valid choice, honoring the backend
+ *  precedence (API key → profile → IAM keys) as far as the connection reveals it:
+ *  a stored secret with no `accessKeyId` can only be the Bedrock API key and wins
+ *  first, else a profile, else IAM keys (an `accessKeyId` is present) (#554). The
+ *  next Save persists whatever concrete mode is shown. */
+export function concreteAuthMode(conn: ProviderConnection): BedrockAuth {
+  const mode = conn.authMode;
+  if (mode === "profile" || mode === "iamKeys" || mode === "apiKey")
+    return mode;
+  // Match the backend `auto` precedence (API key -> profile -> IAM keys): a stored
+  // secret with no `accessKeyId` can only be the Bedrock API key, so it wins first.
+  if (conn.hasKey && !conn.accessKeyId) return "apiKey";
+  if (conn.awsProfile) return "profile";
+  if (conn.accessKeyId) return "iamKeys";
+  return "profile";
 }
 
 /** Hosted, OpenAI-compatible providers authenticated with a single bearer API key
