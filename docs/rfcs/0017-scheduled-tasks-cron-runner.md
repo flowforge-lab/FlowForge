@@ -4,9 +4,11 @@
 - **Milestone:** M7+
 - **Author:** tonytan4ever
 - **Depends on:** RFC 0005 (three-tier model selection — `resolve_model_selection`),
-  RFC 0011 (Plan/Act/Auto modes — `Approver` trait + `Safety` tiers), RFC 0012
-  (durable session persistence — the `ff-session` SQLite store pattern), and #74
-  (loop durability for `goal` mode — a fired task is a headless goal run)
+  RFC 0011 (Plan/Act/Auto modes — `Approver` trait + `Safety` tiers), and RFC 0012
+  (durable session persistence — the `ff-session` SQLite store pattern). The headless
+  long-run behavior this needs is the four-clause contract in §3–§3.2, owned here — it is
+  **no longer gated on #74**; #74 stays open for goal-mode loop durability (its items 1–3,
+  not required by a bounded scheduled fire)
 - **Tracking issue:** #188 (real scheduled-task cron runner + ts-rs bindings)
 - **Supersedes:** the FE-owned mock contract in `apps/desktop/src/lib/scheduled.ts`
   (#132 / SET.9)
@@ -90,8 +92,34 @@ up to a per-task **safety ceiling**:
 denial outcome the run records (same as CLI `Deny`) — it never hangs. We ship the safe
 default; the ceiling knob is free.
 
-This is why the runner half of #188 sequences behind **#74**: a fire is a headless goal
-run, and it should not ship before the goal loop it triggers is durable.
+This is why the runner half of #188 was originally sequenced behind **#74**: a fire is a
+headless run, and it should not ship before its long-run behavior is bounded and safe.
+
+### 3.1 Halt-and-surface on `ask_user` (the fourth contract clause)
+
+The safety ceiling above handles `Write` / `Dangerous` tool calls. One more headless gap
+remains: `ask_user`. A live UI fire blocks on a human answering; a headless fire has no
+human, and the current dismissed-answer path (`agent/lib.rs:1279`) lets the model *continue
+on the dismissed result* — i.e. grind on or guess a decision that needed a person.
+
+**Decision:** a mid-fire `ask_user` **halts the run and records a distinct terminal
+outcome, `needs_attention`** — not folded under `error` (it is not a failure), `cancelled`
+(it is not a timeout/cancel), or `ok` (it did not complete). This keeps the "a human
+decision is pending" signal legible to the UI, the audit trail (`scheduled_runs.status`,
+§8.4), and any later resume path. A scheduled fire that stops for a human is reported
+differently from timeout cancellation, policy denial, runtime error, and success.
+
+### 3.2 The full headless-safe contract (and why this RFC, not #74)
+
+Clauses 1–4 — **bounded** (max-iterations + per-fire timeout + cancellation, §8.2),
+**safety ceiling** (`Dangerous` always denied, §3), **mechanical terminal status**
+(§8.4), and **halt-and-surface on `ask_user`** (§3.1) — are the complete minimal subset a
+headless fire needs. A fire runs a **bounded single `run_turn`**, *not* the open-ended
+`goal` loop, so it does **not** require the durable task ledger / fresh-context iteration
+from #74 (deferred to the goal-mode milestone). This RFC therefore now carries the full
+headless-safe contract: the runner (PR-B / #542) depends on this section, **not** on the
+open-ended #74 discussion. #74 remains open for goal-mode loop durability (its items 1–3),
+which a bounded scheduled fire does not need.
 
 ## 4. Architecture
 
@@ -216,7 +244,7 @@ CREATE TABLE scheduled_runs (          -- backs the ↗ "open session" affordanc
   task_id     TEXT NOT NULL REFERENCES scheduled_tasks(id) ON DELETE CASCADE,
   session_id  TEXT,
   fired_ms    INTEGER NOT NULL,
-  status      TEXT NOT NULL            -- ok | error | cancelled (see §8.4)
+  status      TEXT NOT NULL            -- ok | error | cancelled | needs_attention (see §8.4)
 );
 ```
 
@@ -281,7 +309,7 @@ These are visible in the FE design but unspecified by #188; the RFC pins them do
   that records a `stub` run). Tasks persist, list, and compute `next_run` / `cadence_label`
   — unblocking the FE against real bindings immediately.
 
-**PR-B (behind #74):**
+**PR-B (#542; gated on the §3–§3.2 headless-safe contract, not on the open-ended #74):**
 - `runner.rs` tick loop + the desktop `TaskRunner` impl (real `run_turn` + `ScheduledApprover`).
 - `scheduled:fired` / `scheduled:changed` events; `last_run` stamping; `run_scheduled_task_now`.
 
@@ -303,9 +331,13 @@ linkage, a global "pause all scheduled tasks" kill-switch, and a per-task `catch
    `scheduled_runs.status` is the audit trail. The ceiling is enforced in `ScheduledApprover`
    regardless of task kind (a builtin cannot escalate).
 4. **`scheduled_runs.status` semantics.** A run usually *completes* even if a tool was
-   denied (the agent continues read-only), so terminal status is **`ok` | `error` |
+   denied (the agent continues read-only), so most terminal status is **`ok` | `error` |
    `cancelled`**; a denial is incidental within an otherwise-`ok` run, not a terminal status.
-   A stale profile / moved workspace fails the fire with `error`, surfaced on ↗.
+   A stale profile / moved workspace fails the fire with `error`, surfaced on ↗. An
+   `ask_user` mid-fire is the one exception that gets its own terminal status,
+   **`needs_attention`** (§3.1) — it is neither a failure nor a cancellation nor a success,
+   and folding it under any of those would lose the "a human decision is pending" signal.
+   So the full terminal set is **`ok` | `error` | `cancelled` | `needs_attention`**.
 
 ## 9. Verification Plan
 
@@ -319,6 +351,9 @@ linkage, a global "pause all scheduled tasks" kill-switch, and a per-task `catch
 - **`ScheduledApprover`** tests mirroring `approver.rs`: `ReadOnly` ceiling denies
   Write/Dangerous; `Write` ceiling allows Write, denies Dangerous; `Dangerous` denied for a
   builtin too; a denial never blocks the run.
+- **Halt-and-surface (§3.1):** a mid-fire `ask_user` halts the run and records
+  `scheduled_runs.status = needs_attention` (not `ok`/`error`/`cancelled`); the run does not
+  continue on the dismissed-answer path and does not hang.
 - **Desktop:** command round-trips under `VITE_FF_MOCK=0`; `bindings/ScheduledTask.ts`
   generated; `lib/scheduled.ts` removed; `pnpm typecheck && lint && test` green.
 - **Workspace:** `cargo test -p ff-scheduled`, `cargo clippy --workspace --all-targets -D warnings`,
