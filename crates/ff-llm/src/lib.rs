@@ -300,7 +300,9 @@ pub(crate) fn is_rate_limit_body(body: &str) -> bool {
         || b.contains("tpm")
         || b.contains("rpm")
         || b.contains("quota")
-        || b.contains("exceeded")
+        // Bare "exceeded" is too broad — "maximum context length exceeded" is a
+        // common non-retryable 422 — so require it to co-occur with a limit term.
+        || (b.contains("exceeded") && b.contains("limit"))
 }
 
 pub type ChunkStream = BoxStream<'static, Result<Chunk, LlmError>>;
@@ -1053,6 +1055,10 @@ mod tests {
             "invalid 'messages': must be a non-empty array",
             "unsupported model",
             "missing required field 'model'",
+            // Bare "exceeded" must not match: context-length is a common,
+            // non-retryable 422 that has no limit/quota/rate term.
+            "This model's maximum context length is 32768 tokens; however you requested 40000 exceeded",
+            "maximum context length exceeded",
         ] {
             assert!(!is_rate_limit_body(body), "should not match: {body}");
         }
