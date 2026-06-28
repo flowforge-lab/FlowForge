@@ -274,3 +274,153 @@ async fn stop_all_preempts_in_flight_tool_call() {
         "preempted call should return an error, got {result:?}"
     );
 }
+
+fn cwd_cfg() -> McpServerConfig {
+    McpServerConfig {
+        id: "cwd".into(),
+        command: env!("CARGO_BIN_EXE_mcp_cwd").to_string(),
+        args: vec![],
+        env: BTreeMap::new(),
+        disabled: false,
+    }
+}
+
+/// #548 W1b: `set_server_cwd` restarts the server in the requested directory, so the
+/// workspace-aware server tracks the active workspace. The `pwd` tool reports the
+/// child's cwd; after the override it must equal the new directory.
+#[tokio::test]
+async fn set_server_cwd_restarts_child_in_new_directory() {
+    let shared: SharedConfig = Arc::new(RwLock::new(vec![cwd_cfg()]));
+    let (_change_tx, change_rx) = mpsc::unbounded_channel::<()>();
+    let sup = spawn_supervisor(shared, change_rx, fast_config());
+
+    // A manual restart re-spawns a fresh handle, so detect the change via the pid
+    // (the restarts counter resets on a manual restart -- see manual_restart test).
+    let first_pid = wait_for(&sup, Duration::from_secs(5), |snap| {
+        snap.iter()
+            .find(|s| s.id == "cwd" && s.state == McpServerState::Running)
+            .and_then(|s| s.pid)
+    })
+    .await
+    .expect("cwd server reaches Running");
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let want = std::fs::canonicalize(dir.path()).expect("canonicalize tempdir");
+    sup.set_server_cwd("cwd", Some(want.clone())).await;
+
+    // It restarts in the new dir: wait for a fresh child (different pid).
+    let second_pid = wait_for(&sup, Duration::from_secs(5), |snap| {
+        snap.iter()
+            .find(|s| {
+                s.id == "cwd"
+                    && s.state == McpServerState::Running
+                    && s.pid.is_some()
+                    && s.pid != Some(first_pid)
+            })
+            .and_then(|s| s.pid)
+    })
+    .await
+    .expect("cwd server restarts after set_server_cwd");
+    assert_ne!(
+        first_pid, second_pid,
+        "set_server_cwd should respawn the child"
+    );
+
+    let out = sup
+        .call_tool("cwd", "pwd", serde_json::Value::Null)
+        .await
+        .expect("pwd call");
+    let got = std::fs::canonicalize(out.trim()).expect("canonicalize reported cwd");
+    assert_eq!(
+        got, want,
+        "child should run in the directory set via set_server_cwd"
+    );
+
+    // Setting the same dir again is a no-op: no respawn, so the pid is unchanged.
+    sup.set_server_cwd("cwd", Some(want.clone())).await;
+    let pid_after = sup
+        .status
+        .read()
+        .unwrap()
+        .iter()
+        .find(|s| s.id == "cwd")
+        .and_then(|s| s.pid);
+    assert_eq!(
+        pid_after,
+        Some(second_pid),
+        "an unchanged cwd must not respawn the child"
+    );
+
+    sup.stop_all().await;
+}
+
+/// #548 W1b follow-up: removing a server via reconcile prunes its cwd override, so a
+/// later re-add starts in the default working directory rather than inheriting the
+/// stale workspace.
+#[tokio::test]
+async fn reconcile_removal_prunes_cwd_override() {
+    let shared: SharedConfig = Arc::new(RwLock::new(vec![cwd_cfg()]));
+    let (change_tx, change_rx) = mpsc::unbounded_channel::<()>();
+    let sup = spawn_supervisor(Arc::clone(&shared), change_rx, fast_config());
+
+    let first_pid = wait_for(&sup, Duration::from_secs(5), |snap| {
+        snap.iter()
+            .find(|s| s.id == "cwd" && s.state == McpServerState::Running)
+            .and_then(|s| s.pid)
+    })
+    .await
+    .expect("cwd server reaches Running");
+
+    // Point the server at a tempdir and wait for the override-driven restart.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let want = std::fs::canonicalize(dir.path()).expect("canonicalize tempdir");
+    sup.set_server_cwd("cwd", Some(want.clone())).await;
+    wait_for(&sup, Duration::from_secs(5), |snap| {
+        snap.iter()
+            .find(|s| {
+                s.id == "cwd"
+                    && s.state == McpServerState::Running
+                    && s.pid.is_some()
+                    && s.pid != Some(first_pid)
+            })
+            .map(|_| ())
+    })
+    .await
+    .expect("cwd server restarts in the override dir");
+
+    // Remove the server: reconcile issues Stop, which must drop the override too.
+    shared.write().unwrap().clear();
+    change_tx.send(()).expect("signal config change");
+    wait_for(&sup, Duration::from_secs(5), |snap| {
+        snap.iter().all(|s| s.id != "cwd").then_some(())
+    })
+    .await
+    .expect("cwd server is removed");
+
+    // Re-add it: with the override pruned, the child must start in the default cwd,
+    // not the stale tempdir.
+    *shared.write().unwrap() = vec![cwd_cfg()];
+    change_tx.send(()).expect("signal config change");
+    wait_for(&sup, Duration::from_secs(5), |snap| {
+        snap.iter()
+            .find(|s| s.id == "cwd" && s.state == McpServerState::Running)
+            .map(|_| ())
+    })
+    .await
+    .expect("cwd server is re-added and Running");
+
+    let out = sup
+        .call_tool("cwd", "pwd", serde_json::Value::Null)
+        .await
+        .expect("pwd call");
+    let got = std::fs::canonicalize(out.trim()).expect("canonicalize reported cwd");
+    let default_cwd = std::fs::canonicalize(std::env::current_dir().expect("current_dir"))
+        .expect("canonicalize cwd");
+    assert_eq!(
+        got, default_cwd,
+        "a re-added server must not inherit the pruned cwd override"
+    );
+    assert_ne!(got, want, "stale override must not apply after re-add");
+
+    sup.stop_all().await;
+}
