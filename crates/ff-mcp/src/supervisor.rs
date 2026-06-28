@@ -15,20 +15,22 @@
 //! the serialization point. The handle the rest of the app holds is a cheap
 //! `mpsc::Sender` plus a read-only `SharedStatus`.
 //!
-//! Liveness: every tick the supervisor polls each `Running` server's connection
-//! ([`McpClient::is_closed`]). A stdio server that exits — cleanly on idle (e.g.
-//! codegraph) or by crash — closes its transport, so this catches the exit within a
-//! tick instead of waiting up to `health_interval`. A server that had been Running for
-//! at least `min_healthy_uptime` is restarted promptly **without** counting toward
-//! `max_failures`, so an idle-exiting server is never parked in `Failed`; one that exits
-//! sooner is treated as flapping and counts as a failure (so a genuinely broken server
-//! still parks).
+//! Liveness / health (RFC 0003 §5): every `health_interval` the supervisor calls
+//! `list_tools` on each `Running` server. A server that has exited — cleanly on idle
+//! (e.g. codegraph) or by crash — has a dead transport, so the probe fails; that failure
+//! is treated like a crash: the connection is dropped, `failures` is bumped, and the
+//! server moves to `Restarting`. A server that had been Running for at least
+//! `min_healthy_uptime` then has its `failures`/`backoff` cleared on the next tick (it
+//! has *proven* healthy), so an idle-exiting server reconnects and is never parked in
+//! `Failed`; one that keeps exiting before `min_healthy_uptime` is flapping — its
+//! `failures` accumulate and, once `failures >= max_failures`, it is parked in `Failed`
+//! and not retried until the config is reloaded (saving CPU on a permanently-broken
+//! server, e.g. a wrong command).
 //!
-//! Health (RFC 0003 §5): every `health_interval`, the supervisor calls `list_tools` on
-//! each `Running` server. A failure is treated like a crash: the connection is dropped,
-//! `failures` is bumped, and the server moves to `Restarting`. Once `failures >=
-//! max_failures` the server is parked in `Failed` and not retried until the config is
-//! reloaded — saving CPU on a permanently-broken server (e.g. wrong command).
+//! Recovery latency is bounded by `health_interval`: rmcp 1.7 exposes no non-consuming
+//! child-exit signal to detect a close sooner (`RunningService::is_closed` does not flip
+//! on a stdio child exit, and `waiting()` consumes the service the supervisor keeps for
+//! tool calls).
 //!
 //! Backoff: capped exponential ([`Backoff`]). A successful connect resets it.
 //!
@@ -282,10 +284,6 @@ struct ServerHandle {
     /// When the server last entered `Running`. Used to decide whether a transport
     /// close is a recoverable idle/clean exit (healthy long enough) or flapping.
     running_since: Option<Instant>,
-    /// Set when a reconnect is scheduled after a detected close, so the next
-    /// successful connect counts as a restart even when no failure was recorded
-    /// (a clean idle exit recovers without bumping `failures`).
-    pending_recovery: bool,
 }
 
 impl ServerHandle {
@@ -308,7 +306,6 @@ impl ServerHandle {
             next_retry_at: None,
             last_health_check: None,
             running_since: None,
-            pending_recovery: false,
         }
     }
 
@@ -568,7 +565,7 @@ impl Supervisor {
         };
         match outcome {
             Ok((client, tools)) => {
-                let was_restart = h.restarts > 0 || h.failures > 0 || h.pending_recovery;
+                let was_restart = h.restarts > 0 || h.failures > 0;
                 h.pid = client.pid();
                 h.client = Some(client);
                 h.tools = tools;
@@ -581,7 +578,6 @@ impl Supervisor {
                 h.next_retry_at = None;
                 h.last_health_check = Some(Instant::now());
                 h.running_since = Some(Instant::now());
-                h.pending_recovery = false;
                 if was_restart {
                     h.restarts = h.restarts.saturating_add(1);
                 }
@@ -610,7 +606,6 @@ impl Supervisor {
         let now = Instant::now();
         let mut due_retry: Vec<String> = Vec::new();
         let mut due_probe: Vec<String> = Vec::new();
-        let mut due_recover: Vec<String> = Vec::new();
         let mut proven_healthy: Vec<String> = Vec::new();
 
         for (id, h) in &self.handles {
@@ -623,28 +618,23 @@ impl Supervisor {
                     }
                 }
                 McpServerState::Running => {
-                    // A closed transport means the child exited (idle exit or crash);
-                    // recover promptly. Otherwise health-probe a live-but-quiet server.
-                    if h.client.as_ref().map(|c| c.is_closed()).unwrap_or(true) {
-                        due_recover.push(id.clone());
-                    } else {
-                        // Once a server has stayed up for `min_healthy_uptime`, it has
-                        // proven healthy: clear any failure debt so a later isolated
-                        // exit recovers cleanly rather than counting toward a park.
-                        let proven = h.failures > 0
-                            && h.running_since
-                                .map(|t| now.duration_since(t) >= self.config.min_healthy_uptime)
-                                .unwrap_or(false);
-                        if proven {
-                            proven_healthy.push(id.clone());
-                        }
-                        let due = h
-                            .last_health_check
-                            .map(|t| now.duration_since(t) >= self.config.health_interval)
-                            .unwrap_or(true);
-                        if due {
-                            due_probe.push(id.clone());
-                        }
+                    // Once a server has stayed up for `min_healthy_uptime`, it has
+                    // proven healthy: clear any failure debt so a later isolated exit
+                    // (detected by the next health probe) recovers cleanly rather than
+                    // counting toward a park.
+                    let proven = h.failures > 0
+                        && h.running_since
+                            .map(|t| now.duration_since(t) >= self.config.min_healthy_uptime)
+                            .unwrap_or(false);
+                    if proven {
+                        proven_healthy.push(id.clone());
+                    }
+                    let due = h
+                        .last_health_check
+                        .map(|t| now.duration_since(t) >= self.config.health_interval)
+                        .unwrap_or(true);
+                    if due {
+                        due_probe.push(id.clone());
                     }
                 }
                 _ => {}
@@ -657,58 +647,12 @@ impl Supervisor {
                 h.backoff.reset();
             }
         }
-        for id in due_recover {
-            self.recover_closed(&id).await;
-        }
         for id in due_retry {
             self.try_connect(&id).await;
         }
         for id in due_probe {
             self.health_probe(&id).await;
         }
-    }
-
-    /// Handle a `Running` server whose transport has closed (the child exited). If it
-    /// had been Running for at least `min_healthy_uptime`, treat the exit as a
-    /// recoverable idle/clean exit: schedule an immediate reconnect WITHOUT counting it
-    /// toward `max_failures`, so a stdio server that idle-exits (e.g. codegraph) is
-    /// never parked in `Failed`. An exit sooner than that is flapping: count it as a
-    /// failure with backoff so a genuinely broken server still parks.
-    async fn recover_closed(&mut self, id: &str) {
-        let max_failures = self.config.max_failures;
-        let min_uptime = self.config.min_healthy_uptime;
-        let Some(h) = self.handles.get_mut(id) else {
-            return;
-        };
-        // The child has already exited; drop the dead client and clear its tools so
-        // the bridge stops advertising them immediately.
-        h.client = None;
-        h.pid = None;
-        h.tools.clear();
-        let healthy = h
-            .running_since
-            .map(|t| t.elapsed() >= min_uptime)
-            .unwrap_or(false);
-        h.running_since = None;
-        if healthy {
-            h.last_error = Some("server connection closed; restarting".to_string());
-            h.failures = 0;
-            h.backoff.reset();
-            h.pending_recovery = true;
-            h.state = McpServerState::Restarting;
-            h.next_retry_at = Some(Instant::now());
-        } else {
-            h.last_error = Some("server exited shortly after starting".to_string());
-            h.failures = h.failures.saturating_add(1);
-            if h.failures >= max_failures {
-                h.state = McpServerState::Failed;
-                h.next_retry_at = None;
-            } else {
-                h.state = McpServerState::Restarting;
-                h.next_retry_at = Some(Instant::now() + h.backoff.next_delay());
-            }
-        }
-        self.publish();
     }
 
     /// `list_tools` against the live client; treat errors like a crash.

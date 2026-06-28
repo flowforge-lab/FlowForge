@@ -99,14 +99,6 @@ impl McpClient {
         &self.server_id
     }
 
-    /// Whether the underlying connection has closed -- the child process exited or
-    /// the transport broke. Cheap, non-consuming, and non-blocking: the supervisor
-    /// polls this each tick so a server that exits (cleanly on idle, or by crash) is
-    /// detected promptly instead of only at the next health probe.
-    pub fn is_closed(&self) -> bool {
-        self.service.is_closed()
-    }
-
     /// Enumerate the server's tools, stamped with this server's id. Mapped into
     /// `ff-core::McpToolInfo` so callers never touch `rmcp` types.
     pub async fn list_tools(&self) -> Result<Vec<McpToolInfo>, McpError> {
