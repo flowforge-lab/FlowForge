@@ -1040,9 +1040,7 @@ pub async fn run_turn(
             let mut stream = match provider.chat_stream(req).await {
                 Ok(s) => s,
                 Err(e) => {
-                    if let Some(delay) =
-                        retry_backoff_ms(&e, attempt, rate_limit_attempt)
-                    {
+                    if let Some(delay) = retry_backoff_ms(&e, attempt, rate_limit_attempt) {
                         if is_rate_limited(&e) {
                             // A rate-limit wait must not consume the transport
                             // budget that the unconditional `attempt += 1` above
@@ -4384,6 +4382,126 @@ mod tests {
             calls.load(Ordering::SeqCst),
             1,
             "fatal errors are not retried"
+        );
+    }
+
+    /// Fails the first `fails` requests with a 429 RateLimited (optionally with a
+    /// Retry-After), then returns a text turn — to exercise the window-aware path.
+    struct RateLimitedSetup {
+        fails: usize,
+        retry_after: Option<std::time::Duration>,
+        calls: Arc<AtomicUsize>,
+    }
+    #[async_trait]
+    impl Provider for RateLimitedSetup {
+        async fn chat_stream(&self, _req: ChatRequest) -> Result<ChunkStream, LlmError> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            if n < self.fails {
+                return Err(LlmError::RateLimited {
+                    retry_after: self.retry_after,
+                    message: "rate limit: TPM exceeded".into(),
+                });
+            }
+            let chunks = vec![Ok(Chunk {
+                delta: "recovered".into(),
+                done: true,
+                ..Chunk::default()
+            })];
+            Ok(futures_util::stream::iter(chunks).boxed())
+        }
+    }
+
+    #[test]
+    fn rate_limit_delay_honors_retry_after_clamped() {
+        use std::time::Duration;
+        // Retry-After honored verbatim when sane.
+        assert_eq!(rate_limit_delay(0, Some(Duration::from_secs(12))), 12_000);
+        // Clamped to the max ceiling.
+        assert_eq!(
+            rate_limit_delay(0, Some(Duration::from_secs(9999))),
+            RATE_LIMIT_BACKOFF_MAX_MS
+        );
+        // Absent -> exponential on the 0-based attempt: 1s, 2s, 4s ...
+        assert_eq!(rate_limit_delay(0, None), 1_000);
+        assert_eq!(rate_limit_delay(1, None), 2_000);
+        assert_eq!(rate_limit_delay(2, None), 4_000);
+        // Far-out attempt saturates at the ceiling, never overflows.
+        assert_eq!(rate_limit_delay(64, None), RATE_LIMIT_BACKOFF_MAX_MS);
+    }
+
+    #[test]
+    fn retry_backoff_routes_by_regime() {
+        let rl = LlmError::RateLimited {
+            retry_after: Some(std::time::Duration::from_secs(5)),
+            message: "tpm".into(),
+        };
+        let blip = LlmError::Transport("reset".into());
+        let fatal = LlmError::Api {
+            status: 400,
+            message: "bad".into(),
+        };
+        // Rate-limit uses its own budget + Retry-After (transport attempt irrelevant).
+        assert_eq!(retry_backoff_ms(&rl, 99, 0), Some(5_000));
+        assert_eq!(retry_backoff_ms(&rl, 0, MAX_RATE_LIMIT_ATTEMPTS), None);
+        // Transport blip uses the snappy schedule + transport budget.
+        assert_eq!(retry_backoff_ms(&blip, 1, 0), Some(RETRY_BACKOFF_BASE_MS));
+        assert_eq!(retry_backoff_ms(&blip, MAX_PROVIDER_ATTEMPTS, 0), None);
+        // Fatal is never retried.
+        assert_eq!(retry_backoff_ms(&fatal, 1, 0), None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn rate_limited_then_success_completes_turn() {
+        // A 429 window clears: two RateLimited rejections then success. The
+        // seconds-scale backoff is waited out (virtual time) and the turn recovers.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = RateLimitedSetup {
+            fails: 2,
+            retry_after: None,
+            calls: calls.clone(),
+        };
+        let (res, errored) = run_text_turn(&provider).await;
+        assert_eq!(res.unwrap().content, "recovered");
+        assert!(
+            !errored,
+            "a recovered rate-limit turn should not surface an error"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 3, "two waits then success");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn rate_limited_honors_retry_after_and_recovers() {
+        // With a Retry-After present the turn still recovers (delay is honored,
+        // virtual time advances through it).
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = RateLimitedSetup {
+            fails: 1,
+            retry_after: Some(std::time::Duration::from_secs(20)),
+            calls: calls.clone(),
+        };
+        let (res, _) = run_text_turn(&provider).await;
+        assert_eq!(res.unwrap().content, "recovered");
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "one wait then success");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn persistent_rate_limit_fails_after_bounded_attempts() {
+        // A window that never clears must fail cleanly after MAX_RATE_LIMIT_ATTEMPTS,
+        // not spin forever. `fails` is large so every attempt is a 429.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let provider = RateLimitedSetup {
+            fails: 999,
+            retry_after: None,
+            calls: calls.clone(),
+        };
+        let (res, errored) = run_text_turn(&provider).await;
+        assert!(res.is_err(), "a persistent rate limit must surface");
+        assert!(errored);
+        // First attempt + MAX_RATE_LIMIT_ATTEMPTS retries before giving up.
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            MAX_RATE_LIMIT_ATTEMPTS + 1,
+            "bounded by the rate-limit budget, separate from the transport budget"
         );
     }
 

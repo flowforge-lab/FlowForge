@@ -272,7 +272,9 @@ pub(crate) async fn error_for_status_with_body(
 /// delta-seconds (`Retry-After: 30`) and an HTTP-date (`Retry-After: Wed, 21 Oct
 /// 2026 07:28:00 GMT`), the latter converted to a delay from now (saturating at
 /// zero for a past date). Returns `None` when the header is absent or unparseable.
-pub(crate) fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<std::time::Duration> {
+pub(crate) fn parse_retry_after(
+    headers: &reqwest::header::HeaderMap,
+) -> Option<std::time::Duration> {
     let raw = headers.get(reqwest::header::RETRY_AFTER)?.to_str().ok()?;
     let raw = raw.trim();
     if let Ok(secs) = raw.parse::<u64>() {
