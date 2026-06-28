@@ -22,6 +22,7 @@ fn fast_config() -> SupervisorConfig {
         backoff_base: Duration::from_millis(50),
         backoff_max: Duration::from_millis(200),
         max_failures: 3,
+        min_healthy_uptime: Duration::ZERO,
         env_allowlist: vec!["PATH".into()],
     }
 }

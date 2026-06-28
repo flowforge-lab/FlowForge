@@ -21,8 +21,21 @@ fn fast_config() -> SupervisorConfig {
         backoff_base: Duration::from_millis(50),
         backoff_max: Duration::from_millis(200),
         max_failures: 3,
+        // ZERO so a transport close right after Running is treated as a recoverable
+        // clean exit; per-test overrides set a real threshold to exercise flapping.
+        min_healthy_uptime: Duration::ZERO,
         // PATH only — sufficient because tests use absolute `CARGO_BIN_EXE_*` paths.
         env_allowlist: vec!["PATH".into()],
+    }
+}
+
+fn idle_exit_cfg() -> McpServerConfig {
+    McpServerConfig {
+        id: "idle".into(),
+        command: env!("CARGO_BIN_EXE_mcp_idle_exit").to_string(),
+        args: vec![],
+        env: BTreeMap::new(),
+        disabled: false,
     }
 }
 
@@ -421,6 +434,80 @@ async fn reconcile_removal_prunes_cwd_override() {
         "a re-added server must not inherit the pruned cwd override"
     );
     assert_ne!(got, want, "stale override must not apply after re-add");
+
+    sup.stop_all().await;
+}
+
+/// #548 W1: a stdio server that idle-exits cleanly after a healthy run must be
+/// restarted and its tools re-bridged, and it must never be parked in `Failed`
+/// (the regression that left codegraph un-bridged for a whole session). The fixture
+/// exits 0 every ~300ms; with `min_healthy_uptime = 0` each exit is a recoverable
+/// clean exit, so the supervisor keeps reviving it and `restarts` climbs.
+#[tokio::test]
+async fn clean_idle_exit_recovers_without_parking() {
+    let shared: SharedConfig = Arc::new(RwLock::new(vec![idle_exit_cfg()]));
+    let (_change_tx, change_rx) = mpsc::unbounded_channel::<()>();
+    let sup = spawn_supervisor(shared, change_rx, fast_config());
+
+    // First Running with its tool bridged.
+    wait_for(&sup, Duration::from_secs(5), |snap| {
+        snap.iter()
+            .find(|s| s.id == "idle" && s.state == McpServerState::Running && s.tool_count >= 1)
+            .map(|_| ())
+    })
+    .await
+    .expect("idle server reaches Running with its tool");
+
+    // It exits and is revived repeatedly: restarts climbs past one clean cycle.
+    let restarts = wait_for(&sup, Duration::from_secs(8), |snap| {
+        snap.iter()
+            .find(|s| s.id == "idle" && s.state == McpServerState::Running && s.restarts >= 2)
+            .map(|s| s.restarts)
+    })
+    .await
+    .expect("idle server auto-recovers across multiple clean exits");
+    assert!(restarts >= 2, "expected repeated recovery, got {restarts}");
+
+    // It must never have been parked in Failed.
+    let parked = sup
+        .status
+        .read()
+        .unwrap()
+        .iter()
+        .any(|s| s.id == "idle" && s.state == McpServerState::Failed);
+    assert!(
+        !parked,
+        "a cleanly idle-exiting server must not be parked in Failed"
+    );
+
+    sup.stop_all().await;
+}
+
+/// #548 W1 hot-loop guard: a server that exits *before* `min_healthy_uptime` is
+/// flapping, not idle-exiting, so each exit counts as a failure and it still parks
+/// in `Failed` after `max_failures`. The fixture exits at ~300ms; a 2s threshold
+/// makes every exit count.
+#[tokio::test]
+async fn fast_flapping_server_still_parks_in_failed() {
+    let cfg = SupervisorConfig {
+        min_healthy_uptime: Duration::from_secs(2),
+        ..fast_config()
+    };
+    let shared: SharedConfig = Arc::new(RwLock::new(vec![idle_exit_cfg()]));
+    let (_change_tx, change_rx) = mpsc::unbounded_channel::<()>();
+    let sup = spawn_supervisor(shared, change_rx, cfg);
+
+    let last_error = wait_for(&sup, Duration::from_secs(10), |snap| {
+        snap.iter()
+            .find(|s| s.id == "idle" && s.state == McpServerState::Failed)
+            .and_then(|s| s.last_error.clone())
+    })
+    .await
+    .expect("a server that exits faster than min_healthy_uptime parks in Failed");
+    assert!(
+        !last_error.is_empty(),
+        "last_error should describe the early exit"
+    );
 
     sup.stop_all().await;
 }

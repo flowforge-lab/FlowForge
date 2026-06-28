@@ -15,11 +15,22 @@
 //! the serialization point. The handle the rest of the app holds is a cheap
 //! `mpsc::Sender` plus a read-only `SharedStatus`.
 //!
-//! Health (RFC 0003 §5): every `health_interval`, the supervisor calls `list_tools` on
-//! each `Running` server. A failure is treated like a crash: the connection is dropped,
-//! `failures` is bumped, and the server moves to `Restarting`. Once `failures >=
-//! max_failures` the server is parked in `Failed` and not retried until the config is
-//! reloaded — saving CPU on a permanently-broken server (e.g. wrong command).
+//! Liveness / health (RFC 0003 §5): every `health_interval` the supervisor calls
+//! `list_tools` on each `Running` server. A server that has exited — cleanly on idle
+//! (e.g. codegraph) or by crash — has a dead transport, so the probe fails; that failure
+//! is treated like a crash: the connection is dropped, `failures` is bumped, and the
+//! server moves to `Restarting`. A server that had been Running for at least
+//! `min_healthy_uptime` then has its `failures`/`backoff` cleared on the next tick (it
+//! has *proven* healthy), so an idle-exiting server reconnects and is never parked in
+//! `Failed`; one that keeps exiting before `min_healthy_uptime` is flapping — its
+//! `failures` accumulate and, once `failures >= max_failures`, it is parked in `Failed`
+//! and not retried until the config is reloaded (saving CPU on a permanently-broken
+//! server, e.g. a wrong command).
+//!
+//! Recovery latency is bounded by `health_interval`: rmcp 1.7 exposes no non-consuming
+//! child-exit signal to detect a close sooner (`RunningService::is_closed` does not flip
+//! on a stdio child exit, and `waiting()` consumes the service the supervisor keeps for
+//! tool calls).
 //!
 //! Backoff: capped exponential ([`Backoff`]). A successful connect resets it.
 //!
@@ -75,6 +86,11 @@ pub struct SupervisorConfig {
     pub backoff_max: Duration,
     /// Consecutive failures before a server is parked in `Failed`.
     pub max_failures: u32,
+    /// How long a server must stay `Running` before a transport close is treated as a
+    /// recoverable idle/clean exit (restart without penalty) rather than flapping
+    /// (count toward `max_failures`). Guards against a hot restart loop on a server
+    /// that exits immediately on every start.
+    pub min_healthy_uptime: Duration,
     /// Host environment variables passed through to children. Anything outside this
     /// list (and the server's declared `env`) is stripped — see [`McpClient::connect`].
     pub env_allowlist: Vec<String>,
@@ -98,6 +114,7 @@ impl Default for SupervisorConfig {
             backoff_base: Duration::from_millis(500),
             backoff_max: Duration::from_secs(30),
             max_failures: 5,
+            min_healthy_uptime: Duration::from_secs(10),
             env_allowlist: allow,
         }
     }
@@ -264,6 +281,9 @@ struct ServerHandle {
     /// while parked in `Failed`.
     next_retry_at: Option<Instant>,
     last_health_check: Option<Instant>,
+    /// When the server last entered `Running`. Used to decide whether a transport
+    /// close is a recoverable idle/clean exit (healthy long enough) or flapping.
+    running_since: Option<Instant>,
 }
 
 impl ServerHandle {
@@ -285,6 +305,7 @@ impl ServerHandle {
             backoff: Backoff::new(sup.backoff_base, sup.backoff_max),
             next_retry_at: None,
             last_health_check: None,
+            running_since: None,
         }
     }
 
@@ -550,10 +571,13 @@ impl Supervisor {
                 h.tools = tools;
                 h.state = McpServerState::Running;
                 h.last_error = None;
-                h.failures = 0;
-                h.backoff.reset();
+                // Do NOT clear `failures`/`backoff` here: a server that connects but
+                // exits again before `min_healthy_uptime` is flapping, and clearing on
+                // every connect would let it loop forever. The counters are cleared in
+                // `on_tick` once the server has *proven* healthy (stayed up long enough).
                 h.next_retry_at = None;
                 h.last_health_check = Some(Instant::now());
+                h.running_since = Some(Instant::now());
                 if was_restart {
                     h.restarts = h.restarts.saturating_add(1);
                 }
@@ -582,6 +606,7 @@ impl Supervisor {
         let now = Instant::now();
         let mut due_retry: Vec<String> = Vec::new();
         let mut due_probe: Vec<String> = Vec::new();
+        let mut proven_healthy: Vec<String> = Vec::new();
 
         for (id, h) in &self.handles {
             match h.state {
@@ -593,11 +618,22 @@ impl Supervisor {
                     }
                 }
                 McpServerState::Running => {
+                    // Once a server has stayed up for `min_healthy_uptime`, it has
+                    // proven healthy: clear any failure debt so a later isolated exit
+                    // (detected by the next health probe) recovers cleanly rather than
+                    // counting toward a park.
+                    let proven = h.failures > 0
+                        && h.running_since
+                            .map(|t| now.duration_since(t) >= self.config.min_healthy_uptime)
+                            .unwrap_or(false);
+                    if proven {
+                        proven_healthy.push(id.clone());
+                    }
                     let due = h
                         .last_health_check
                         .map(|t| now.duration_since(t) >= self.config.health_interval)
                         .unwrap_or(true);
-                    if due && h.client.is_some() {
+                    if due {
                         due_probe.push(id.clone());
                     }
                 }
@@ -605,6 +641,12 @@ impl Supervisor {
             }
         }
 
+        for id in proven_healthy {
+            if let Some(h) = self.handles.get_mut(&id) {
+                h.failures = 0;
+                h.backoff.reset();
+            }
+        }
         for id in due_retry {
             self.try_connect(&id).await;
         }
