@@ -228,8 +228,13 @@ architecture change.
 | **P2** | release pipeline | `release.yml` (tag + `workflow_dispatch`, macOS arm64, tauri-action) + `RELEASING.md`; cut `v0.1.0`. **After P2 the author installs once and self-updates.** | Yes (the deliverable) |
 | **P3** *(deferred)* | backup | Real `export_backup` / `restore_backup` (§8). Stays on #159. | Yes |
 | **P4** *(deferred)* | public hardening | Apple notarization, Windows signing, multi-platform matrix; real Slack invite URL (swap `ABOUT_SLACK_URL`). | Yes |
+| **P5a** | global update bar | Promote the "Update now" affordance to a global, full-width app bar (§12.1). FE-only; reuses the existing global `useUpdateStore`. | Yes |
+| **P5b** | download progress | Backend emits a `download-progress` event; FE renders a determinate/indeterminate progress bar in the global bar and Settings → About (§12.2). | Yes |
+| **P5c** | local dev channel | Experimental opt-in that lets a dev build poll a localhost feed so the running app picks up a fresh `dev-release.sh` build via the same bar (§12.3). FE-only. | Yes |
 
-Dependency: **P1 -> P2**. P3 and P4 are independent and unscheduled.
+Dependency: **P1 -> P2**. P3 and P4 are independent and unscheduled. P5a/P5b/P5c
+build on the shipped P1/P2 spine and are mutually independent (P5b enriches the bar
+P5a introduces, but P5a does not block on it).
 
 ## 11. Non-goals & open questions
 
@@ -247,12 +252,113 @@ Dependency: **P1 -> P2**. P3 and P4 are independent and unscheduled.
 
 **Open questions:**
 
-- **Download progress UX.** v1 shows a spinner on "Update now". Worth wiring the
-  `download-progress` event into a real progress bar later?
-- **On-demand `main` builds.** `workflow_dispatch` lets a maintainer build from `main`
-  without a tag — useful for dogfooding, but those builds have no stable version bump.
-  Convention TBD (e.g. a `-dev` suffix) so the updater does not see an un-tagged build as
-  "newer".
+- **Download progress UX.** _Resolved — see §12.2._ v1 shipped a spinner; the
+  `download-progress` event is now wired into a real progress bar.
+- **Surfacing location.** _Resolved — see §12.1._ The "Update now" affordance lived only
+  in Settings → About; it is promoted to a global, full-width app bar so an available
+  update is visible without opening Settings.
+- **On-demand `main` builds / dogfood loop.** _Partially resolved — see §12.3._ A
+  developer building FlowForge with FlowForge wants the running app to pick up a fresh
+  local build without a manual reinstall. The local dev update channel (§12.3) makes the
+  global bar fire against a localhost feed (`dev-release.sh`), gated behind an Experimental
+  opt-in so a plain `pnpm tauri dev` process never polls a release feed. The `-dev`
+  version-suffix convention from the original question is satisfied by
+  `dev-release.sh` (`0.0.0-dev.<epoch>`) plus the lenient `version_comparator`.
 - **Key custody.** Where does the minisign private key live out-of-band (the loss case in
   §4)? Proposal: the maintainer's password manager; revisit if the project gains more
   maintainers.
+
+## 12. Amendment — global update bar, progress, and local-dev channel
+
+P1/P2 shipped the self-update spine: a prod-gated background check populates a
+global `useUpdateStore`, and Settings → About renders "Update now" when an update is
+available (#362/#363/#364, PR #409). This amendment promotes that affordance to an
+app-level surface, gives it a real progress bar, and adds a dogfood loop for
+developers who build FlowForge with FlowForge. All three reuse the existing
+`useUpdateStore`; the button is source-agnostic (a GitHub release and a local build
+both resolve to `status.kind === "available"`).
+
+### 12.1 Global update bar (P5a, FE-only)
+
+Today the only path to "Update now" is opening Settings → About. P5a renders a slim,
+full-width bar at the **top of the whole window** (above `<main>`, so it spans the
+session sidebar, the chat pane tree, and the split panel) whenever
+`useUpdateStore.status?.kind === "available"`. This matches the conventional
+"restart to update" bar pattern (browsers, editors, chat apps) and reads as truly
+app-level rather than chat-level.
+
+- **Placement:** `apps/desktop/src/components/app-shell.tsx`, above the `<main>`
+  element. The existing `bootstrapError` banner (chat-column scoped) is the visual
+  precedent; the update bar is its window-wide sibling.
+- **Content:** "FlowForge `<version>` is available" + an **Update** button →
+  `useUpdateStore.install()`, plus a dismiss control. Dismiss is session-local (a
+  `dismissed` flag in the store) so the bar does not nag; it reappears on the next
+  poll or launch while the update is still available.
+- **Settings → About is retained.** It stays the manual / debug path and remains the
+  only surface that toasts feed errors (the background poll swallows them). Both read
+  the one store — no duplicated install logic.
+- **One-click install + auto-relaunch.** Clicking Update calls the existing
+  `install_update`, which downloads, installs, and calls `app.restart()`. This is not
+  an in-process hot reload (infeasible for a native Rust binary holding live DB
+  connections and MCP child processes — see §12.4); it is a one-click
+  install-and-relaunch that removes the manual reinstall step. Local state in
+  `~/.config/flowforge` / `~/.flowforge` survives the relaunch (§8), so the app
+  reopens to roughly where it was. (Optional: restore the active session/pane after
+  relaunch to make the restart near-invisible — a small additive nicety, not
+  required for P5a.)
+
+### 12.2 Download progress (P5b, backend + FE)
+
+The backend currently discards updater progress:
+`download_and_install(|_chunk, _total| {}, || {})` (`lib.rs:1618`). The callback
+already receives bytes-this-chunk and an `Option<u64>` content length; P5b emits them
+instead of dropping them.
+
+- **Backend:** in `install_update`, replace the no-op callback with one that emits a
+  Tauri event (e.g. `update://progress` carrying `{ downloaded, total }`) per chunk,
+  and a terminal event when the download completes. Contained change; no contract
+  change to `check_for_updates` / `install_update`.
+- **FE:** `lib/events.ts` (the existing one-time event-wiring point) listens and
+  writes `progress: { downloaded, total } | null` into `useUpdateStore`. The global
+  bar (and Settings → About) render a **determinate** progress bar when `total` is
+  known and an **indeterminate** one when content length is absent (it can be).
+- Out of scope: delta updates, pause/resume.
+
+### 12.3 Local dev update channel (P5c, FE-only)
+
+Goal: a developer iterating on FlowForge runs `dev-release.sh` (D1, §6.1) and the
+**already-running app picks up the new build via the same global bar** — no manual
+`dev-install.sh` + relaunch. The backend already supports this feed
+(`FF_UPDATER_ENDPOINT` + lenient `version_comparator`, `lib.rs:1585`); the missing
+piece is purely the FE poll gate.
+
+- Today the background poll is `import.meta.env.PROD`-only (`App.tsx:28`) so a dev
+  build never polls — deliberately, to avoid a `pnpm tauri dev` process surfacing a
+  real GitHub release over itself.
+- P5c adds one Experimental flag, `localUpdateChannel`, to `store/experimental.ts` +
+  a row in `experimental-section.tsx` (default off, clearly dev-only, mirroring the
+  existing flags). The poll condition becomes:
+  `import.meta.env.PROD || (import.meta.env.DEV && flags.localUpdateChannel)`.
+- **Safety guard:** the dev branch is meaningful only when a **local** feed is set
+  (`FF_UPDATER_ENDPOINT`). With the flag on but no local feed configured,
+  `check_for_updates` simply returns up-to-date, so a dev process never reaches the
+  public GitHub feed. The flag + a running `dev-release.sh` feed are the two
+  conditions for the dev bar to fire.
+- Note: this pairs with `dev-release.sh` (D1, a local updater feed), **not**
+  `dev-install.sh` (D2, a direct `/Applications` file swap with the updater disabled
+  and no feed — the in-app bar cannot apply to it; D2 stays a manual relaunch loop).
+
+### 12.4 Why not in-process hot reload
+
+True hot reload of the running app is explicitly out of scope:
+
+- **Frontend** changes are already hot-reloaded by Vite HMR under `pnpm tauri dev`;
+  no feature is needed for the FE inner loop.
+- **Backend (Rust)** changes cannot be swapped into a running native binary. The only
+  Rust hot-reload approaches (`hot-lib-reloader`, `dexterous-developer`) require
+  carving logic into a `dylib` behind an FFI-safe boundary that holds no state across
+  reloads — incompatible with FlowForge's live SQLite connections, tokio runtime, and
+  spawned MCP child processes, and they drop exactly the state we want preserved. The
+  standard Rust loop (`pnpm tauri dev` auto-rebuild + auto-restart) is the closest the
+  ecosystem offers. The one-click install + auto-relaunch (§12.1) is the right tool
+  for picking up a built bundle without a manual reinstall.
