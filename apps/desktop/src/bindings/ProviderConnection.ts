@@ -2,6 +2,7 @@
 import type { BedrockAuth } from "./BedrockAuth";
 import type { ProviderKind } from "./ProviderKind";
 import type { ReasoningEffort } from "./ReasoningEffort";
+import type { ReasoningVisibility } from "./ReasoningVisibility";
 
 /**
  * One configured provider endpoint. A registry holds several of these so the
@@ -44,6 +45,12 @@ thinking: boolean,
  * [`ReasoningEffort::Medium`].
  */
 reasoningEffort: ReasoningEffort, 
+/**
+ * Which loop steps request reasoning for this connection (#549). Only bites
+ * when `thinking` is on. `#[serde(default)]` keeps pre-#549 registries
+ * loading as [`ReasoningVisibility::All`].
+ */
+reasoningVisibility: ReasoningVisibility, 
 /**
  * AWS region for a Bedrock connection (e.g. `"us-east-1"`); the provider
  * derives `bedrock-runtime.<region>.amazonaws.com` from it. `None` for

@@ -11,7 +11,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use ff_core::{Message, Mode, Role};
+use ff_core::{Message, Mode, ReasoningVisibility, Role};
 use ff_llm::{ChatMessage, ChatRequest, FunctionCall, LlmError, Provider, ToolCall as LlmToolCall};
 use ff_session::SessionStore;
 use ff_tools::{Safety, ToolRegistry, COMPACTION_RETRIEVE_TOOL};
@@ -557,25 +557,26 @@ impl Drop for ToolResultBackfill<'_> {
     }
 }
 
-/// Whether a given loop iteration should request model reasoning (#D1). Reasoning
-/// is requested on the **first** iteration (initial planning, before any tool
-/// result exists) and on the **cap-forced wrap-up** step (`remaining <=
-/// WRAP_UP_AT_REMAINING`); every other iteration -- the mid-loop tool-dispatch
-/// steps, "I have a tool result, issue the next call" -- skips it, since reasoning
-/// there is mostly latency on a slow model.
+/// Whether a given loop iteration should request model reasoning (#D1, widened
+/// in #549). Driven by [`ReasoningVisibility`]:
+/// - [`WrapUp`](ReasoningVisibility::WrapUp): the **first** iteration (initial
+///   planning, before any tool result) and the **cap-forced wrap-up** step
+///   (`remaining <= WRAP_UP_AT_REMAINING`) only. Mid-loop tool-dispatch steps
+///   skip reasoning — pure latency on a slow model (#449).
+/// - [`All`](ReasoningVisibility::All): every step, so a turn that finishes
+///   naturally *before* the cap (the common case) carries reasoning on its final
+///   answer. We can't target only the synthesis step a-priori (the model decides
+///   by whether it returns tool calls), so `All` requests on every step; the
+///   persisted reasoning still ends up being the final step's, since the turn
+///   shares one assistant message id and each step overwrites the row.
 ///
-/// Deliberate limitation (conscious choice, reviewed on #449): in a single-pass
-/// loop we cannot know *before* a model call whether that step will dispatch more
-/// tools or emit the final answer -- the model decides by whether it returns tool
-/// calls. So a turn that finishes naturally *before* the cap (the common case)
-/// synthesizes its answer with reasoning OFF; only the planning step and a
-/// cap-forced finish reason. That trades a dedicated reasoning pass on the natural
-/// synthesis step for the latency win, and is trivially reversible (gate the
-/// request on `enable_reasoning` instead of `step_thinking`) if validation shows a
-/// quality regression. `iter` is 0-based; `remaining` counts iterations left
-/// including the current one (so `remaining == 1` is the last step).
-fn should_reason(iter: usize, remaining: usize) -> bool {
-    iter == 0 || remaining <= WRAP_UP_AT_REMAINING
+/// `iter` is 0-based; `remaining` counts iterations left including the current
+/// one (so `remaining == 1` is the last step).
+fn should_reason(iter: usize, remaining: usize, visibility: ReasoningVisibility) -> bool {
+    match visibility {
+        ReasoningVisibility::WrapUp => iter == 0 || remaining <= WRAP_UP_AT_REMAINING,
+        ReasoningVisibility::All => true,
+    }
 }
 
 /// Cheap content hash for the per-turn read-dedupe (#458 RC5). Uses the same
@@ -594,8 +595,10 @@ fn content_hash(s: &str) -> u64 {
 /// `on_event` is called synchronously as the turn progresses. The final assistant
 /// message is persisted and returned.
 ///
-/// When `enable_reasoning` is true, provider reasoning streams are requested and
-/// emitted as [`AgentEvent::Reasoning`] (not persisted in message content).
+/// When `enable_reasoning` is true, provider reasoning streams are requested on
+/// the steps selected by `reasoning_visibility` and emitted as
+/// [`AgentEvent::Reasoning`]; the final step's reasoning is persisted via
+/// `set_message_reasoning` (not in message content).
 #[allow(clippy::too_many_arguments)]
 pub async fn run_turn(
     provider: &dyn Provider,
@@ -607,6 +610,8 @@ pub async fn run_turn(
     // + ambient context). Built by the host via `build_system_prompt`.
     system_prompt: Option<&str>,
     enable_reasoning: bool,
+    // Which loop steps request reasoning when `enable_reasoning` is true (#549).
+    reasoning_visibility: ReasoningVisibility,
     cancel: CancelToken,
     mut on_event: impl FnMut(AgentEvent),
 ) -> Result<Message, AgentError> {
@@ -834,7 +839,8 @@ pub async fn run_turn(
         // can't be targeted a priori). Effort, where reasoning IS on, stays whatever
         // the connection set (Medium by default); this gates only *whether* a step
         // reasons.
-        let step_thinking = enable_reasoning && should_reason(iter, remaining);
+        let step_thinking =
+            enable_reasoning && should_reason(iter, remaining, reasoning_visibility);
         if remaining <= WRAP_UP_AT_REMAINING && max_iter > 1 {
             let content = if remaining <= 1 {
                 // Final iteration: tools are withheld below, so the model must
@@ -1538,6 +1544,7 @@ async fn run_subagent(
         model,
         system_prompt,
         false,
+        ReasoningVisibility::WrapUp,
         cancel,
         |_event| {},
     ))
@@ -1682,16 +1689,19 @@ mod tests {
     }
 
     #[test]
-    fn should_reason_only_on_planning_and_wrapup_steps() {
-        // D1: reason on the first iteration and the wrap-up step; skip mid-loop.
+    fn should_reason_wrapup_only_on_planning_and_wrapup_steps() {
+        use ReasoningVisibility::{All, WrapUp};
+        // WrapUp (#449): reason on the first iteration and the wrap-up step; skip mid-loop.
         let max_iter = 25usize;
-        // iter 0 = planning -> reason.
-        assert!(should_reason(0, max_iter));
-        // mid-loop tool-dispatch steps -> no reasoning.
-        assert!(!should_reason(1, max_iter - 1));
-        assert!(!should_reason(10, max_iter - 10));
-        // wrap-up step (remaining <= WRAP_UP_AT_REMAINING) -> reason again.
-        assert!(should_reason(max_iter - 1, WRAP_UP_AT_REMAINING));
+        assert!(should_reason(0, max_iter, WrapUp)); // planning
+        assert!(!should_reason(1, max_iter - 1, WrapUp)); // mid-loop
+        assert!(!should_reason(10, max_iter - 10, WrapUp));
+        assert!(should_reason(max_iter - 1, WRAP_UP_AT_REMAINING, WrapUp)); // wrap-up
+                                                                            // All (#549): every step reasons, including the natural mid/final ones.
+        assert!(should_reason(0, max_iter, All));
+        assert!(should_reason(1, max_iter - 1, All));
+        assert!(should_reason(10, max_iter - 10, All));
+        assert!(should_reason(max_iter - 1, WRAP_UP_AT_REMAINING, All));
     }
 
     #[test]
@@ -1796,6 +1806,7 @@ mod tests {
             "mock",
             None,
             false,
+            ReasoningVisibility::All,
             CancelToken::new(),
             |_| {},
         )
@@ -2239,6 +2250,7 @@ mod tests {
             "mock",
             None,
             false,
+            ReasoningVisibility::All,
             CancelToken::new(),
             |ev| match ev {
                 AgentEvent::Token { delta, .. } => tokens.push_str(&delta),
@@ -2302,6 +2314,7 @@ mod tests {
             "mock",
             None,
             false,
+            ReasoningVisibility::All,
             CancelToken::new(),
             |ev| {
                 if let AgentEvent::AttachmentsDropped { count, .. } = ev {
@@ -2337,6 +2350,7 @@ mod tests {
             "mock",
             None,
             false,
+            ReasoningVisibility::All,
             CancelToken::new(),
             |ev| {
                 if matches!(ev, AgentEvent::AttachmentsDropped { .. }) {
@@ -2372,6 +2386,7 @@ mod tests {
             "mock",
             None,
             true,
+            ReasoningVisibility::All,
             CancelToken::new(),
             |ev| {
                 if let AgentEvent::Reasoning { delta, .. } = ev {
@@ -2394,6 +2409,117 @@ mod tests {
         );
     }
 
+    /// Step 0 returns a tool call (no reasoning emitted there); step 1 — the
+    /// *natural* final-answer step, well before any cap — emits reasoning then
+    /// text. Models the #549 gap: a turn that finishes naturally must still show
+    /// and persist a Thought block for its answer.
+    struct ToolThenReasonedText {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl Provider for ToolThenReasonedText {
+        async fn chat_stream(&self, _req: ChatRequest) -> Result<ChunkStream, LlmError> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            let chunks = if n == 0 {
+                vec![Ok(Chunk {
+                    tool_calls: vec![ToolCallDelta {
+                        index: 0,
+                        id: Some("call_1".into()),
+                        name: Some("bash".into()),
+                        arguments: r#"{"command":"echo hi"}"#.into(),
+                    }],
+                    done: true,
+                    ..Chunk::default()
+                })]
+            } else {
+                vec![
+                    Ok(Chunk {
+                        reasoning_delta: "the output ".into(),
+                        ..Chunk::default()
+                    }),
+                    Ok(Chunk {
+                        reasoning_delta: "says hi".into(),
+                        ..Chunk::default()
+                    }),
+                    Ok(Chunk {
+                        delta: "It printed hi.".into(),
+                        done: true,
+                        ..Chunk::default()
+                    }),
+                ]
+            };
+            Ok(futures_util::stream::iter(chunks).boxed())
+        }
+    }
+
+    #[tokio::test]
+    async fn all_visibility_persists_reasoning_on_natural_final_answer() {
+        // #549: with All, the natural synthesis step (step 1, not a cap wrap-up)
+        // carries reasoning, and it is persisted on the assistant message.
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::new();
+        let s = store.create_session(None);
+        store.add_message(&s.id, Role::User, "run echo".into());
+        let registry = ToolRegistry::with_defaults();
+        let approve = AlwaysApprove;
+        let provider = ToolThenReasonedText {
+            calls: AtomicUsize::new(0),
+        };
+
+        let msg = run_turn(
+            &provider,
+            &store,
+            &ctx(&registry, dir.path(), &approve),
+            &s.id,
+            "mock",
+            None,
+            true,
+            ReasoningVisibility::All,
+            CancelToken::new(),
+            |_| {},
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(msg.content, "It printed hi.");
+        assert_eq!(msg.reasoning.as_deref(), Some("the output says hi"));
+    }
+
+    #[tokio::test]
+    async fn wrapup_visibility_skips_reasoning_on_natural_final_answer() {
+        // The contrast: under WrapUp the same step-1 synthesis runs with reasoning
+        // OFF (it is neither the planning step nor a cap wrap-up), so nothing is
+        // persisted — the #449 latency optimization, now opt-in.
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::new();
+        let s = store.create_session(None);
+        store.add_message(&s.id, Role::User, "run echo".into());
+        let registry = ToolRegistry::with_defaults();
+        let approve = AlwaysApprove;
+        let provider = ToolThenReasonedText {
+            calls: AtomicUsize::new(0),
+        };
+
+        let msg = run_turn(
+            &provider,
+            &store,
+            &ctx(&registry, dir.path(), &approve),
+            &s.id,
+            "mock",
+            None,
+            true,
+            ReasoningVisibility::WrapUp,
+            CancelToken::new(),
+            |_| {},
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(msg.content, "It printed hi.");
+        assert_eq!(msg.reasoning, None);
+    }
+
     #[tokio::test]
     async fn no_reasoning_leaves_column_null() {
         let dir = tempfile::tempdir().unwrap();
@@ -2412,6 +2538,7 @@ mod tests {
             "mock",
             None,
             true,
+            ReasoningVisibility::All,
             CancelToken::new(),
             |_| {},
         )
@@ -2443,6 +2570,7 @@ mod tests {
             "mock",
             None,
             false,
+            ReasoningVisibility::All,
             CancelToken::new(),
             |ev| match ev {
                 AgentEvent::ToolCallStarted { name, .. } => {
@@ -2502,6 +2630,7 @@ mod tests {
             "mock",
             None,
             false,
+            ReasoningVisibility::All,
             CancelToken::new(),
             |_| {},
         )
@@ -2669,6 +2798,7 @@ mod tests {
             "mock",
             None,
             false,
+            ReasoningVisibility::All,
             CancelToken::new(),
             |ev| match ev {
                 AgentEvent::ToolCallStarted { name, .. } => started_name = name,
@@ -2732,6 +2862,7 @@ mod tests {
             "mock",
             None,
             false,
+            ReasoningVisibility::All,
             CancelToken::new(),
             |ev| match ev {
                 AgentEvent::ToolCallFinished {
@@ -2784,6 +2915,7 @@ mod tests {
             "mock",
             None,
             false,
+            ReasoningVisibility::All,
             CancelToken::new(),
             |ev| match ev {
                 AgentEvent::ToolCallStarted { name, .. } => started_name = name,
@@ -2842,6 +2974,7 @@ mod tests {
             "mock",
             None,
             false,
+            ReasoningVisibility::All,
             CancelToken::new(),
             |ev| {
                 if let AgentEvent::ToolCallFinished { result: r, .. } = ev {
@@ -2908,6 +3041,7 @@ mod tests {
             "mock",
             None,
             false,
+            ReasoningVisibility::All,
             cancel,
             |_| {},
         )
@@ -3007,6 +3141,7 @@ mod tests {
             "mock",
             None,
             false,
+            ReasoningVisibility::All,
             CancelToken::new(),
             |_| {},
         )
@@ -3095,6 +3230,7 @@ mod tests {
             "mock",
             None,
             false,
+            ReasoningVisibility::All,
             CancelToken::new(),
             |_| {},
         )
@@ -3193,6 +3329,7 @@ mod tests {
             "mock",
             None,
             false,
+            ReasoningVisibility::All,
             CancelToken::new(),
             |_| {},
         );
@@ -3287,6 +3424,7 @@ mod tests {
             "mock",
             None,
             false,
+            ReasoningVisibility::All,
             CancelToken::new(),
             |ev| {
                 if let AgentEvent::ToolCallFinished {
@@ -3332,6 +3470,7 @@ mod tests {
             "mock",
             None,
             false,
+            ReasoningVisibility::All,
             CancelToken::new(),
             |ev| {
                 if let AgentEvent::ToolCallFinished { success, .. } = ev {
@@ -3403,6 +3542,7 @@ mod tests {
             "mock",
             Some(&system),
             false,
+            ReasoningVisibility::All,
             CancelToken::new(),
             |_| {},
         )
@@ -3447,6 +3587,7 @@ mod tests {
             "mock",
             None,
             false,
+            ReasoningVisibility::All,
             CancelToken::new(),
             |_| {},
         )
@@ -3502,6 +3643,7 @@ mod tests {
             "mock",
             None,
             false,
+            ReasoningVisibility::All,
             CancelToken::new(),
             |_| {},
         )
@@ -3556,6 +3698,7 @@ mod tests {
             "mock",
             None,
             false,
+            ReasoningVisibility::All,
             CancelToken::new(),
             |_| {},
         )
@@ -3649,6 +3792,7 @@ mod tests {
             "mock",
             None,
             false,
+            ReasoningVisibility::All,
             CancelToken::new(),
             |_| {},
         )
@@ -3694,6 +3838,7 @@ mod tests {
             "mock",
             None,
             false,
+            ReasoningVisibility::All,
             CancelToken::new(),
             |_| {},
         )
@@ -3755,6 +3900,7 @@ mod tests {
             "mock",
             None,
             false,
+            ReasoningVisibility::All,
             CancelToken::new(),
             |_| {},
         )
@@ -3828,6 +3974,7 @@ mod tests {
             "mock",
             None,
             false,
+            ReasoningVisibility::All,
             CancelToken::new(),
             |ev| {
                 if let AgentEvent::ToolCallFinished { success, .. } = ev {
@@ -3910,6 +4057,7 @@ mod tests {
             "mock",
             None,
             false,
+            ReasoningVisibility::All,
             CancelToken::new(),
             |_| {},
         )
@@ -4000,6 +4148,7 @@ mod tests {
             "mock",
             None,
             false,
+            ReasoningVisibility::All,
             CancelToken::new(),
             |_| {},
         )
@@ -4109,6 +4258,7 @@ mod tests {
             "mock",
             None,
             false,
+            ReasoningVisibility::All,
             CancelToken::new(),
             |ev| {
                 if let AgentEvent::Error { .. } = ev {
@@ -4243,6 +4393,7 @@ mod tests {
             "mock",
             None,
             false,
+            ReasoningVisibility::All,
             CancelToken::new(),
             |_| {},
         )
@@ -4304,6 +4455,7 @@ mod tests {
             "mock",
             None,
             false,
+            ReasoningVisibility::All,
             cancel,
             |_| {},
         )
@@ -4400,6 +4552,7 @@ mod tests {
             "mock",
             None,
             false,
+            ReasoningVisibility::All,
             CancelToken::new(),
             |_| {},
         )
@@ -4440,6 +4593,7 @@ mod tests {
             "mock",
             None,
             false,
+            ReasoningVisibility::All,
             CancelToken::new(),
             |_| {},
         )
@@ -4475,6 +4629,7 @@ mod tests {
             "mock",
             None,
             false,
+            ReasoningVisibility::All,
             CancelToken::new(),
             |ev| {
                 if let AgentEvent::Done { token_count, .. } = ev {
@@ -4518,6 +4673,7 @@ mod tests {
             "mock",
             None,
             false,
+            ReasoningVisibility::All,
             CancelToken::new(),
             |ev| {
                 if let AgentEvent::Done {
@@ -4699,6 +4855,7 @@ mod tests {
             "mock",
             None,
             false,
+            ReasoningVisibility::All,
             CancelToken::new(),
             |ev| {
                 if let AgentEvent::ToolCallFinished { result, .. } = ev {
@@ -4872,6 +5029,7 @@ mod tests {
             "mock",
             None,
             false,
+            ReasoningVisibility::All,
             CancelToken::new(),
             |_| {},
         )
@@ -4947,6 +5105,7 @@ mod tests {
             "mock",
             None,
             false,
+            ReasoningVisibility::All,
             CancelToken::new(),
             |ev| {
                 if let AgentEvent::ToolCallFinished { result, .. } = ev {
@@ -5028,6 +5187,7 @@ mod tests {
             "mock",
             None,
             false,
+            ReasoningVisibility::All,
             CancelToken::new(),
             |ev| {
                 if let AgentEvent::ToolCallFinished { result, .. } = ev {
@@ -5133,6 +5293,7 @@ mod tests {
             "mock",
             None,
             false,
+            ReasoningVisibility::All,
             CancelToken::new(),
             |_ev| {},
         )
@@ -5189,6 +5350,7 @@ mod tests {
             "mock",
             None,
             false,
+            ReasoningVisibility::All,
             CancelToken::new(),
             |_| {},
         )
@@ -5236,6 +5398,7 @@ mod tests {
             "mock",
             None,
             false,
+            ReasoningVisibility::All,
             CancelToken::new(),
             |ev| {
                 if matches!(ev, AgentEvent::MemoryFlushed { .. }) {
@@ -5347,6 +5510,7 @@ mod tests {
             "mock",
             None,
             false,
+            ReasoningVisibility::All,
             CancelToken::new(),
             |ev| {
                 if let AgentEvent::MemoryFlushed { writes, .. } = ev {
@@ -5446,6 +5610,7 @@ mod tests {
             "mock",
             None,
             false,
+            ReasoningVisibility::All,
             CancelToken::new(),
             |_| {},
         )
@@ -5527,6 +5692,7 @@ mod tests {
             "mock",
             None,
             false,
+            ReasoningVisibility::All,
             CancelToken::new(),
             |_| {},
         )
@@ -5616,6 +5782,7 @@ mod tests {
             "mock",
             None,
             false,
+            ReasoningVisibility::All,
             CancelToken::new(),
             |_| {},
         )
@@ -5725,6 +5892,7 @@ mod tests {
             "mock",
             None,
             false,
+            ReasoningVisibility::All,
             CancelToken::new(),
             |_| {},
         )
@@ -5815,6 +5983,7 @@ mod tests {
             "mock",
             None,
             false,
+            ReasoningVisibility::All,
             CancelToken::new(),
             |_| {},
         )

@@ -692,6 +692,7 @@ fn spawn_assistant_turn(state: Arc<AppState>, app: tauri::AppHandle, session_id:
         let metrics_for_events = metrics.clone();
 
         let thinking = state.provider_config().thinking;
+        let reasoning_visibility = state.provider_config().reasoning_visibility;
         let result = run_turn(
             provider.as_ref(),
             state.store.as_ref(),
@@ -700,6 +701,7 @@ fn spawn_assistant_turn(state: Arc<AppState>, app: tauri::AppHandle, session_id:
             &model,
             Some(system_prompt.as_str()),
             thinking,
+            reasoning_visibility,
             cancel,
             |event| {
                 // Telemetry (RFC 0001 §8): fold per-turn metrics for events
@@ -924,6 +926,7 @@ fn set_provider_config(
         thinking,
         // This legacy shim has no effort control; preserve the persisted dial.
         reasoning_effort: current.reasoning_effort,
+        reasoning_visibility: current.reasoning_visibility,
     };
     state.set_provider_config(config.clone());
     config

@@ -28,7 +28,7 @@ pub use model_specs::{
 pub use provider::{
     model_supports_documents, model_supports_vision, BedrockAuth, ConnectionId, ModelSelection,
     ProviderConfig, ProviderConnection, ProviderKind, ProviderRegistry, ReasoningEffort,
-    ResolvedModel, SecretKind,
+    ReasoningVisibility, ResolvedModel, SecretKind,
 };
 pub use scheduled::{
     BuiltinAction, CreateScheduledTaskInput, RunRecord, RunStatus, SafetyCeiling, ScheduledTask,

@@ -14,7 +14,7 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use ff_agent::{run_turn, AgentEvent, CancelToken, ToolContext, UserContext};
-use ff_core::{Mode, Role};
+use ff_core::{Mode, ReasoningVisibility, Role};
 
 use crate::approver::{ApprovalMode, CliApprover};
 
@@ -395,6 +395,7 @@ async fn run(
             &inputs.model,
             Some(system_prompt.as_str()),
             true,
+            ReasoningVisibility::All,
             cancel,
             |event| {
                 json_events::emit_line(&event);
@@ -410,6 +411,7 @@ async fn run(
             &inputs.model,
             Some(system_prompt.as_str()),
             true,
+            ReasoningVisibility::All,
             cancel,
             render_event_text,
         )
@@ -556,6 +558,7 @@ async fn chat_repl(
                 model,
                 Some(system_prompt.as_str()),
                 true,
+                ReasoningVisibility::All,
                 cancel,
                 |event| json_events::emit_line(&event),
             )
@@ -569,6 +572,7 @@ async fn chat_repl(
                 model,
                 Some(system_prompt.as_str()),
                 true,
+                ReasoningVisibility::All,
                 cancel,
                 render_event_text,
             )
@@ -651,7 +655,7 @@ mod tests {
     use clap::CommandFactory;
     use clap::Parser;
     use ff_agent::{run_turn, AgentEvent, Approver, CancelToken, ToolContext};
-    use ff_core::{Phenotype, Role};
+    use ff_core::{Phenotype, ReasoningVisibility, Role};
     use ff_llm::{ChatRequest, Chunk, ChunkStream, LlmError, Provider};
     use ff_memory::{Memory, MemoryConfig};
     use ff_session::SessionStore;
@@ -787,6 +791,7 @@ mod tests {
             "mock",
             None,
             false,
+            ReasoningVisibility::WrapUp,
             CancelToken::new(),
             |event| {
                 json_events::emit_line_to(&event, &mut stdout).expect("write JSON event");

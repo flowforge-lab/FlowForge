@@ -272,6 +272,7 @@ fn config_to_connection(config: ProviderConfig) -> ProviderConnection {
         // Carry the depth dial through migration; a legacy `provider.json` without
         // the field deserializes to Medium (`#[serde(default)]`), same as before.
         reasoning_effort: config.reasoning_effort,
+        reasoning_visibility: config.reasoning_visibility,
         region: None,
         auth_mode: None,
         aws_profile: None,
@@ -289,6 +290,7 @@ fn connection_to_config(conn: &ProviderConnection) -> ProviderConfig {
         has_key: conn.has_key,
         thinking: conn.thinking,
         reasoning_effort: conn.reasoning_effort,
+        reasoning_visibility: conn.reasoning_visibility,
     }
 }
 
@@ -2157,7 +2159,7 @@ pub fn reload_registry(root: &Path, registry: &SharedRegistry) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ff_core::ReasoningEffort;
+    use ff_core::{ReasoningEffort, ReasoningVisibility};
     use ff_llm::{ChatMessage, ChatRequest};
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -3060,6 +3062,7 @@ mod tests {
                 has_key: false,
                 thinking: true,
                 reasoning_effort: ReasoningEffort::default(),
+                reasoning_visibility: ReasoningVisibility::default(),
                 region: None,
                 auth_mode: None,
                 aws_profile: None,
@@ -3196,6 +3199,7 @@ mod tests {
             has_key: false,
             thinking: true,
             reasoning_effort: effort,
+            reasoning_visibility: ReasoningVisibility::default(),
             region: None,
             auth_mode: None,
             aws_profile: None,
@@ -3251,6 +3255,7 @@ mod tests {
                     has_key: false,
                     thinking: true,
                     reasoning_effort: ReasoningEffort::default(),
+                    reasoning_visibility: ReasoningVisibility::default(),
                     region: None,
                     auth_mode: None,
                     aws_profile: None,
@@ -3266,6 +3271,7 @@ mod tests {
                     has_key: false,
                     thinking: false,
                     reasoning_effort: ReasoningEffort::default(),
+                    reasoning_visibility: ReasoningVisibility::default(),
                     region: Some("us-east-2".into()),
                     auth_mode: Some(BedrockAuth::Profile),
                     aws_profile: Some("bedrock-profile".into()),
@@ -3490,6 +3496,7 @@ mod tests {
             has_key: false,
             thinking: true,
             reasoning_effort: ReasoningEffort::default(),
+            reasoning_visibility: ReasoningVisibility::default(),
             region: None,
             auth_mode: None,
             aws_profile: None,
@@ -3578,6 +3585,7 @@ mod tests {
             has_key: false,
             thinking: false,
             reasoning_effort: ReasoningEffort::default(),
+            reasoning_visibility: ReasoningVisibility::default(),
             region: None,
             auth_mode: None,
             aws_profile: None,
@@ -3637,6 +3645,7 @@ mod tests {
             has_key: false,
             thinking: false,
             reasoning_effort: ReasoningEffort::default(),
+            reasoning_visibility: ReasoningVisibility::default(),
             region: Some("us-east-1".into()),
             auth_mode,
             aws_profile: None,
