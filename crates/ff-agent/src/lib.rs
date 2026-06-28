@@ -956,6 +956,10 @@ pub async fn run_turn(
             // off as "[stopped: reached tool-call limit]" (RC3, #454). The widened
             // wrap-up nudge above gives advance warning; this is the hard stop.
             let withhold_tools = max_iter > 1 && remaining <= 1;
+            // Pin a context-aware output ceiling so a large tool-call payload is not
+            // truncated at the gateway's small default cap (#550). Reuse this turn's
+            // prefill estimate (pushed above) as the input size.
+            let input_tokens = prefill_estimates.last().copied().unwrap_or(0) as u64;
             let req = ChatRequest {
                 model: model.to_string(),
                 messages: messages.clone(),
@@ -965,6 +969,7 @@ pub async fn run_turn(
                     tool_schemas.clone()
                 },
                 thinking: step_thinking,
+                max_tokens: ff_llm::budgeted_max_output_tokens(model, input_tokens),
             };
 
             let mut stream = match provider.chat_stream(req).await {

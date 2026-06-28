@@ -177,6 +177,14 @@ pub fn build_system_prompt(
          `.ff-scratch/` (created for you) rather than `/tmp`.\n\n",
     );
 
+    // Stable guidance (cache-stable prefix): steer large file creation away from a
+    // single giant `write` argument (#550). Tool-call arguments share the model's
+    // output budget, so a whole-file `write` can be cut off mid-JSON; chunking or
+    // editing the delta keeps each call comfortably within the cap.
+    out.push_str(
+        "## Large file writes\nTool-call arguments share the model's output-token budget, so a very large `write` (the whole file body is one argument) can be truncated mid-JSON. For a big new file, create it with a short `write`, then append the rest in chunks with `bash` (e.g. a `>>` heredoc). To change an existing file, prefer `edit` or `apply_patch` -- they carry only the delta, not the whole file.\n\n",
+    );
+
     // Stable guidance (cache-stable prefix): PR-review scoping (#426 RC2).
     // Without this the agent over-explored during reviews -- reading entire
     // unchanged files and spidering the call graph (PR #452). Appended
@@ -325,6 +333,16 @@ mod tests {
         let out = build_system_prompt(None, &reg, &[], &ctx(), None, Mode::Plan);
         assert!(out.contains("## Mode: Plan"), "{out}");
         assert!(out.contains("Only read-only tools"), "{out}");
+    }
+
+    #[test]
+    fn includes_the_large_file_writes_steer() {
+        // #550: steer large file creation toward chunked write / edit so a giant
+        // single `write` argument is not truncated at the output cap.
+        let reg = SkillRegistry::new();
+        let out = build_system_prompt(None, &reg, &[], &ctx(), None, Mode::default());
+        assert!(out.contains("## Large file writes"), "{out}");
+        assert!(out.contains("append the rest in chunks"), "{out}");
     }
 
     #[test]

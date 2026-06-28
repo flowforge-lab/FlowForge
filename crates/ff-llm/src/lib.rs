@@ -143,7 +143,7 @@ pub struct FunctionCall {
     pub arguments: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ChatRequest {
     pub model: String,
     pub messages: Vec<ChatMessage>,
@@ -151,6 +151,12 @@ pub struct ChatRequest {
     pub tools: Vec<serde_json::Value>,
     /// When true, request provider reasoning/thinking streams when supported (#181).
     pub thinking: bool,
+    /// Output-token ceiling for this turn. `Some` pins the provider's `max_tokens`
+    /// so a large tool-call payload (the whole-file `write` body is an argument)
+    /// plus any thinking cannot be cut off mid-JSON (#550, the gateway-path sibling
+    /// of the Bedrock #529 pin). `None` leaves the provider default. Honored on the
+    /// OpenAI/gateway path; Bedrock and Anthropic pin their own ceilings internally.
+    pub max_tokens: Option<u32>,
 }
 
 /// One incremental tool-call fragment within a stream. Servers may split a single
@@ -455,6 +461,31 @@ pub fn model_context_window(model: &str) -> u64 {
     model_specs::lookup(model)
 }
 
+/// Output-token ceiling for a turn, sized to the model's context window minus the
+/// estimated input and a safety buffer, capped at a generous ceiling. Pinning this
+/// on the gateway path keeps a large tool-call payload (plus any thinking) from
+/// being truncated at the provider's small default output cap (#550).
+///
+/// Returns `None` when the remaining headroom is too small to be worth pinning: a
+/// tiny cap helps nothing, and relieving genuine context pressure is compaction's
+/// job, not this knob's. The buffer matches SiliconFlow's guidance to reserve
+/// headroom below the window; the ceiling mirrors the Bedrock adaptive pin (#529).
+pub fn budgeted_max_output_tokens(model: &str, input_tokens: u64) -> Option<u32> {
+    /// Headroom reserved below the context window for prompt growth and overhead.
+    const OUTPUT_SAFETY_BUFFER: u64 = 10_240;
+    /// Generous upper bound; matches `ADAPTIVE_THINKING_MAX_TOKENS` on the Bedrock path.
+    const MAX_OUTPUT_CEIL: u64 = 32_768;
+    /// Below this, skip the pin and let the provider default stand.
+    const MIN_USEFUL_OUTPUT: u64 = 2_048;
+
+    let ctx = model_context_window(model);
+    let headroom = ctx
+        .saturating_sub(input_tokens)
+        .saturating_sub(OUTPUT_SAFETY_BUFFER);
+    let capped = headroom.min(MAX_OUTPUT_CEIL);
+    (capped >= MIN_USEFUL_OUTPUT).then_some(capped as u32)
+}
+
 #[async_trait]
 pub trait Provider: Send + Sync {
     async fn chat_stream(&self, req: ChatRequest) -> Result<ChunkStream, LlmError>;
@@ -499,6 +530,7 @@ pub trait Provider: Send + Sync {
             messages: vec![ChatMessage::text("user", "ok")],
             tools: Vec::new(),
             thinking: false,
+            max_tokens: None,
         };
         let mut stream = self.chat_stream(req).await?;
         // Draining ~32 decode steps is what it empirically takes for an idle
@@ -552,6 +584,44 @@ mod tests {
             model_context_window("some-local-7b"),
             DEFAULT_CONTEXT_WINDOW_TOKENS
         );
+    }
+
+    #[test]
+    fn budgeted_max_output_tokens_pins_the_ceiling_for_a_large_window() {
+        // GLM-5.2 has a 1M window; light input leaves plenty of room, so the cap is
+        // the generous ceiling rather than the full (huge) headroom.
+        assert_eq!(
+            budgeted_max_output_tokens("zai-org/GLM-5.2", 5_000),
+            Some(32_768)
+        );
+    }
+
+    #[test]
+    fn budgeted_max_output_tokens_scales_down_as_context_fills() {
+        // gpt-4o-mini: 128k window, 100k input. 128_000 - 100_000 - 10_240 = 17_760,
+        // which is below the ceiling, so the pin tracks the remaining headroom.
+        assert_eq!(
+            budgeted_max_output_tokens("gpt-4o-mini", 100_000),
+            Some(17_760)
+        );
+    }
+
+    #[test]
+    fn budgeted_max_output_tokens_is_none_when_headroom_is_tiny() {
+        // gpt-4o-mini with input near the window: 128_000 - 126_000 - 10_240 saturates
+        // below MIN_USEFUL_OUTPUT, so we skip the pin and let the provider default
+        // stand (relieving real context pressure is compaction's job).
+        assert_eq!(budgeted_max_output_tokens("gpt-4o-mini", 126_000), None);
+    }
+
+    #[test]
+    fn budgeted_max_output_tokens_never_exceeds_a_small_window() {
+        // A small unknown-family model (default window) with the safety buffer alone
+        // consuming most of it must not be pinned above what it can serve; here the
+        // remaining headroom is below the useful floor, so None.
+        let ctx = model_context_window("some-local-7b");
+        let near_full = ctx.saturating_sub(1_000);
+        assert_eq!(budgeted_max_output_tokens("some-local-7b", near_full), None);
     }
 
     /// GLM-4.5-Air must NOT inherit a generic `glm` window: its served cap (98,304)

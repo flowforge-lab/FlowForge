@@ -556,6 +556,7 @@ impl Provider for AnthropicProvider {
             messages: vec![ChatMessage::text("user", "ping")],
             tools: Vec::new(),
             thinking: false,
+            max_tokens: None,
         };
         let mut stream = self.chat_stream(req).await?;
         match stream.next().await {
@@ -960,6 +961,7 @@ mod tests {
             messages: vec![ChatMessage::text("user", "hi")],
             tools: vec![],
             thinking: false,
+            max_tokens: None,
         };
         let body = to_anthropic_request(&req, 4096, ReasoningEffort::Medium);
         assert_eq!(body["max_tokens"], 4096);
@@ -976,6 +978,7 @@ mod tests {
             messages: vec![ChatMessage::text("user", "hi")],
             tools: vec![],
             thinking: true,
+            max_tokens: None,
         };
         // Medium budget is 4096; with the default 4096 cap, max_tokens is bumped
         // so budget stays strictly below it (Anthropic requirement).
@@ -997,6 +1000,7 @@ mod tests {
             messages: vec![ChatMessage::text("user", "hi")],
             tools: vec![],
             thinking: true,
+            max_tokens: None,
         };
         // Budgets are uniform and concrete regardless of max_tokens.
         let low = to_anthropic_request(&req, 32000, ReasoningEffort::Low);
@@ -1020,6 +1024,7 @@ mod tests {
             messages: vec![ChatMessage::text("user", "hi")],
             tools: vec![],
             thinking: true,
+            max_tokens: None,
         };
         let provider = AnthropicProvider::new("sk-ant-test")
             .with_max_tokens(32000)
@@ -1043,6 +1048,7 @@ mod tests {
                 json!({"function":{"name":"f","parameters":{"type":"object","properties":{}}}}),
             ],
             thinking: false,
+            max_tokens: None,
         };
         let body = to_anthropic_request(&req, 100, ReasoningEffort::Medium);
         // System is now a block array with a cache breakpoint (#437).
@@ -1063,6 +1069,7 @@ mod tests {
                 json!({"function":{"name":"b","parameters":{"type":"object","properties":{}}}}),
             ],
             thinking: false,
+            max_tokens: None,
         };
         let body = to_anthropic_request(&req, 100, ReasoningEffort::Medium);
         assert_eq!(body["system"][0]["cache_control"]["type"], "ephemeral");

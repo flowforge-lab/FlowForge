@@ -327,6 +327,13 @@ impl Provider for OpenAiProvider {
             body["tools"] = serde_json::Value::Array(req.tools.clone());
             body["tool_choice"] = serde_json::json!("auto");
         }
+        // Pin the output ceiling so a large tool-call payload (plus any thinking)
+        // is not cut off at the gateway's small default cap (#550). `max_tokens` is
+        // the OpenAI-standard field accepted by every compatible backend (including
+        // SiliconFlow), so it is safe to send whenever the caller sets one.
+        if let Some(max_tokens) = req.max_tokens {
+            body["max_tokens"] = serde_json::json!(max_tokens);
+        }
         // Reasoning-cost controls (#394). Only the SiliconFlow gateway emits
         // these; vanilla OpenAI / candle-vllm / LM Studio / OpenRouter would
         // reject unknown fields, so the default ReasoningControl::None is silent.
@@ -985,6 +992,7 @@ mod tests {
             messages: vec![ChatMessage::text("user", "hi")],
             tools: Vec::new(),
             thinking,
+            max_tokens: None,
         }
     }
 
@@ -1064,6 +1072,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn max_tokens_is_sent_when_set_on_the_request() {
+        // The output-cap pin (#550) must reach the wire so the gateway does not
+        // apply its small default and truncate a large tool-call payload.
+        let server = MockServer::start().await;
+        let provider = OpenAiProvider::new(server.uri(), None);
+        let req = ChatRequest {
+            max_tokens: Some(32_768),
+            ..user_req(false)
+        };
+        let body = captured_body(&provider, &server, req).await;
+        assert_eq!(body["max_tokens"], 32_768);
+    }
+
+    #[tokio::test]
+    async fn max_tokens_is_omitted_when_unset() {
+        // No pin -> no field, so the provider/gateway default stands untouched.
+        let server = MockServer::start().await;
+        let provider = OpenAiProvider::new(server.uri(), None);
+        let body = captured_body(&provider, &server, user_req(false)).await;
+        assert!(body.get("max_tokens").is_none());
+    }
+
+    #[tokio::test]
     async fn default_provider_emits_no_reasoning_params() {
         // Vanilla OpenAI / candle-vllm / LM Studio reject unknown fields, so the
         // default ReasoningControl::None must keep the body clean either way.
@@ -1129,6 +1160,7 @@ mod tests {
             }],
             tools: Vec::new(),
             thinking: false,
+            max_tokens: None,
         };
 
         let mut stream = provider.chat_stream(req).await.expect("headers arrive");
@@ -1212,6 +1244,7 @@ mod tests {
             }],
             tools: Vec::new(),
             thinking: false,
+            max_tokens: None,
         };
 
         // The stall is before any response, so it surfaces from chat_stream itself
