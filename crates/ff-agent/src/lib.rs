@@ -62,6 +62,67 @@ const MAX_PROVIDER_ATTEMPTS: usize = 3;
 /// (~250ms, 500ms), capped well under a second so retries stay snappy.
 const RETRY_BACKOFF_BASE_MS: u64 = 250;
 
+/// A rate-limit (429/quota) window is a ~minute-scale TPM/RPM reset, not a
+/// transport blip, so it gets its own, larger retry budget (#571). Waiting out a
+/// window must not consume the snappy transport-retry budget above.
+const MAX_RATE_LIMIT_ATTEMPTS: usize = 5;
+
+/// Base backoff for rate-limit retries when the gateway sends no `Retry-After`:
+/// the Nth retry (0-based) waits `BASE << N` ms (1s, 2s, 4s, 8s, 16s), capped.
+const RATE_LIMIT_BACKOFF_BASE_MS: u64 = 1_000;
+
+/// Hard ceiling on any single rate-limit wait, whether from exponential backoff
+/// or a `Retry-After` header, so a hostile/buggy header cannot park a turn for
+/// minutes.
+const RATE_LIMIT_BACKOFF_MAX_MS: u64 = 30_000;
+
+/// Backoff (ms) before a rate-limit retry. Honors the gateway's `Retry-After`
+/// when present (clamped to [`RATE_LIMIT_BACKOFF_MAX_MS`]); otherwise exponential
+/// on the 0-based `attempt` (1s, 2s, 4s, ... capped). Pure for unit testing.
+fn rate_limit_delay(attempt: usize, retry_after: Option<std::time::Duration>) -> u64 {
+    if let Some(d) = retry_after {
+        let ms = u64::try_from(d.as_millis()).unwrap_or(RATE_LIMIT_BACKOFF_MAX_MS);
+        return ms.min(RATE_LIMIT_BACKOFF_MAX_MS);
+    }
+    RATE_LIMIT_BACKOFF_BASE_MS
+        .checked_shl(attempt as u32)
+        .unwrap_or(RATE_LIMIT_BACKOFF_MAX_MS)
+        .min(RATE_LIMIT_BACKOFF_MAX_MS)
+}
+
+/// Decide whether a transient provider error should be retried, and if so how
+/// long to back off. Splits the two regimes (#571): a `RateLimited` window uses
+/// the seconds-scale schedule + its own `rate_limit_attempt` budget (honoring
+/// `Retry-After`), while every other transient error keeps the snappy
+/// transport-blip schedule + the `attempt` budget. Returns `Some(delay_ms)` to
+/// retry, or `None` to surface the error. `attempt` / `rate_limit_attempt` are
+/// the counts *already consumed* for each regime (1-based: the unconditional
+/// `attempt += 1` at the loop top runs before this is consulted).
+fn retry_backoff_ms(error: &LlmError, attempt: usize, rate_limit_attempt: usize) -> Option<u64> {
+    if !error.is_transient() {
+        return None;
+    }
+    match error {
+        LlmError::RateLimited { retry_after, .. } => {
+            if rate_limit_attempt >= MAX_RATE_LIMIT_ATTEMPTS {
+                return None;
+            }
+            Some(rate_limit_delay(rate_limit_attempt, *retry_after))
+        }
+        _ => {
+            if attempt >= MAX_PROVIDER_ATTEMPTS {
+                return None;
+            }
+            Some(RETRY_BACKOFF_BASE_MS << (attempt - 1))
+        }
+    }
+}
+
+/// Whether an error is a rate-limit window (used to bump the right counter).
+fn is_rate_limited(error: &LlmError) -> bool {
+    matches!(error, LlmError::RateLimited { .. })
+}
+
 /// Sleep `ms`, but wake early (and often) if the turn is cancelled, so a retry
 /// backoff never holds a cancelled turn open. `CancelToken` is a bare flag with no
 /// future to await, so we poll it in small steps.
@@ -944,6 +1005,10 @@ pub async fn run_turn(
         // failure can report truncation instead of a misleading "invalid JSON".
         let mut output_truncated = false;
         let mut attempt = 0usize;
+        // Rate-limit (429/quota) retries use a separate budget + seconds-scale
+        // schedule so waiting out a TPM window does not exhaust the transport
+        // retry budget (#571).
+        let mut rate_limit_attempt = 0usize;
         loop {
             attempt += 1;
             acc.clear();
@@ -975,8 +1040,17 @@ pub async fn run_turn(
             let mut stream = match provider.chat_stream(req).await {
                 Ok(s) => s,
                 Err(e) => {
-                    if e.is_transient() && attempt < MAX_PROVIDER_ATTEMPTS {
-                        cancellable_backoff(&cancel, RETRY_BACKOFF_BASE_MS << (attempt - 1)).await;
+                    if let Some(delay) =
+                        retry_backoff_ms(&e, attempt, rate_limit_attempt)
+                    {
+                        if is_rate_limited(&e) {
+                            // A rate-limit wait must not consume the transport
+                            // budget that the unconditional `attempt += 1` above
+                            // just charged (#571).
+                            attempt -= 1;
+                            rate_limit_attempt += 1;
+                        }
+                        cancellable_backoff(&cancel, delay).await;
                         // Cancelled during the backoff -> stop now instead of issuing one
                         // more wasted provider call (#244 R1 follow-up).
                         if cancel.is_cancelled() {
@@ -1049,8 +1123,17 @@ pub async fn run_turn(
             }
 
             match stream_err {
-                Some(e) if e.is_transient() && !emitted_any && attempt < MAX_PROVIDER_ATTEMPTS => {
-                    cancellable_backoff(&cancel, RETRY_BACKOFF_BASE_MS << (attempt - 1)).await;
+                Some(e)
+                    if !emitted_any
+                        && retry_backoff_ms(&e, attempt, rate_limit_attempt).is_some() =>
+                {
+                    // Safe: the guard only matches when `retry_backoff_ms` is Some.
+                    let delay = retry_backoff_ms(&e, attempt, rate_limit_attempt).unwrap();
+                    if is_rate_limited(&e) {
+                        attempt -= 1;
+                        rate_limit_attempt += 1;
+                    }
+                    cancellable_backoff(&cancel, delay).await;
                     // Cancelled during the backoff -> stop now instead of issuing one
                     // more wasted provider call (#244 R1 follow-up).
                     if cancel.is_cancelled() {

@@ -189,18 +189,30 @@ pub enum LlmError {
     Transport(String),
     #[error("api error (status {status}): {message}")]
     Api { status: u16, message: String },
+    /// The gateway rejected the request for exceeding a rate/usage limit (HTTP
+    /// 429, or a 422 whose body matches a rate-limit signature). Unlike a generic
+    /// `Api` error this is transient, and it carries the gateway's `Retry-After`
+    /// delay when one was sent so the agent loop can wait out the window instead
+    /// of burning its transport-blip retry budget in milliseconds (#571).
+    #[error("rate limited{}: {message}", retry_after.map(|d| format!(" (retry after {}s)", d.as_secs())).unwrap_or_default())]
+    RateLimited {
+        retry_after: Option<std::time::Duration>,
+        message: String,
+    },
     #[error("decode error: {0}")]
     Decode(String),
 }
 
 impl LlmError {
     /// Whether the error is worth retrying. Transport blips (connection refused,
-    /// timeout, reset) and overloaded/transient HTTP statuses (408, 429, 5xx) are
-    /// transient; client errors (other 4xx) and decode failures are fatal and must
-    /// surface immediately so the user fixes the request rather than retrying it.
+    /// timeout, reset), rate-limit windows, and overloaded/transient HTTP statuses
+    /// (408, 429, 5xx) are transient; client errors (other 4xx) and decode
+    /// failures are fatal and must surface immediately so the user fixes the
+    /// request rather than retrying it.
     pub fn is_transient(&self) -> bool {
         match self {
             LlmError::Transport(_) => true,
+            LlmError::RateLimited { .. } => true,
             LlmError::Api { status, .. } => {
                 *status == 408 || *status == 429 || (500..=599).contains(status)
             }
@@ -223,6 +235,8 @@ pub(crate) async fn error_for_status_with_body(
         return Ok(resp);
     }
     let code = status.as_u16();
+    // Headers must be read before `text()` consumes the response.
+    let retry_after = parse_retry_after(resp.headers());
     let mut message = resp.text().await.unwrap_or_default().trim().to_string();
     const MAX: usize = 2048;
     if message.len() > MAX {
@@ -239,10 +253,52 @@ pub(crate) async fn error_for_status_with_body(
             .unwrap_or("request failed")
             .to_string();
     }
+    // 429 is always a rate limit. 422 is rate-limited only when its body matches a
+    // known limit signature (SiliconFlow returns 422 for some quota errors, #571);
+    // a generic 422 (e.g. malformed request) stays a fatal `Api` error.
+    if code == 429 || (code == 422 && is_rate_limit_body(&message)) {
+        return Err(LlmError::RateLimited {
+            retry_after,
+            message,
+        });
+    }
     Err(LlmError::Api {
         status: code,
         message,
     })
+}
+
+/// Parse a `Retry-After` header into a delay. Supports both forms from RFC 9110:
+/// delta-seconds (`Retry-After: 30`) and an HTTP-date (`Retry-After: Wed, 21 Oct
+/// 2026 07:28:00 GMT`), the latter converted to a delay from now (saturating at
+/// zero for a past date). Returns `None` when the header is absent or unparseable.
+pub(crate) fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<std::time::Duration> {
+    let raw = headers.get(reqwest::header::RETRY_AFTER)?.to_str().ok()?;
+    let raw = raw.trim();
+    if let Ok(secs) = raw.parse::<u64>() {
+        return Some(std::time::Duration::from_secs(secs));
+    }
+    let when = httpdate::parse_http_date(raw).ok()?;
+    Some(
+        when.duration_since(std::time::SystemTime::now())
+            .unwrap_or(std::time::Duration::ZERO),
+    )
+}
+
+/// Whether an error body looks like a rate/usage-limit rejection, used to
+/// classify ambiguous 422s. Conservative substring match (case-insensitive) on
+/// the signatures gateways use; a false negative just falls back to a fatal
+/// `Api` error, a false positive only grants a retry.
+pub(crate) fn is_rate_limit_body(body: &str) -> bool {
+    let b = body.to_ascii_lowercase();
+    b.contains("rate limit")
+        || b.contains("rate_limit")
+        || b.contains("ratelimit")
+        || b.contains("too many requests")
+        || b.contains("tpm")
+        || b.contains("rpm")
+        || b.contains("quota")
+        || b.contains("exceeded")
 }
 
 pub type ChunkStream = BoxStream<'static, Result<Chunk, LlmError>>;
@@ -960,5 +1016,91 @@ mod tests {
             "reasoning leaked through derive: {v}"
         );
         assert!(v.get("reasoning_content").is_none());
+    }
+
+    // --- #571: rate-limit classification + Retry-After parsing -------------
+
+    #[test]
+    fn rate_limited_is_transient() {
+        assert!(LlmError::RateLimited {
+            retry_after: None,
+            message: "slow down".into()
+        }
+        .is_transient());
+        assert!(LlmError::RateLimited {
+            retry_after: Some(std::time::Duration::from_secs(30)),
+            message: "tpm".into()
+        }
+        .is_transient());
+    }
+
+    #[test]
+    fn is_rate_limit_body_matches_known_signatures() {
+        for body in [
+            "Rate limit exceeded",
+            "rate_limit_exceeded",
+            "Too Many Requests",
+            "TPM limit reached for this model",
+            "RPM quota exceeded",
+            "You have exceeded your quota",
+        ] {
+            assert!(is_rate_limit_body(body), "should match: {body}");
+        }
+        // A generic 422 body is NOT a rate limit.
+        for body in [
+            "invalid 'messages': must be a non-empty array",
+            "unsupported model",
+            "missing required field 'model'",
+        ] {
+            assert!(!is_rate_limit_body(body), "should not match: {body}");
+        }
+    }
+
+    #[test]
+    fn parse_retry_after_delta_seconds() {
+        let mut h = reqwest::header::HeaderMap::new();
+        h.insert(reqwest::header::RETRY_AFTER, "30".parse().unwrap());
+        assert_eq!(
+            parse_retry_after(&h),
+            Some(std::time::Duration::from_secs(30))
+        );
+    }
+
+    #[test]
+    fn parse_retry_after_http_date_in_future() {
+        // 1 hour from now, formatted as an HTTP-date.
+        let future = std::time::SystemTime::now() + std::time::Duration::from_secs(3600);
+        let mut h = reqwest::header::HeaderMap::new();
+        h.insert(
+            reqwest::header::RETRY_AFTER,
+            httpdate::fmt_http_date(future).parse().unwrap(),
+        );
+        let d = parse_retry_after(&h).expect("date parses");
+        // Allow a few seconds of slack for clock/rounding between fmt and parse.
+        assert!(
+            d.as_secs() >= 3590 && d.as_secs() <= 3600,
+            "expected ~3600s, got {}",
+            d.as_secs()
+        );
+    }
+
+    #[test]
+    fn parse_retry_after_past_date_saturates_to_zero() {
+        let past = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        let mut h = reqwest::header::HeaderMap::new();
+        h.insert(
+            reqwest::header::RETRY_AFTER,
+            httpdate::fmt_http_date(past).parse().unwrap(),
+        );
+        assert_eq!(parse_retry_after(&h), Some(std::time::Duration::ZERO));
+    }
+
+    #[test]
+    fn parse_retry_after_absent_or_garbage_is_none() {
+        let empty = reqwest::header::HeaderMap::new();
+        assert_eq!(parse_retry_after(&empty), None);
+        let mut h = reqwest::header::HeaderMap::new();
+        h.insert(reqwest::header::RETRY_AFTER, "soon".parse().unwrap());
+        assert_eq!(parse_retry_after(&h), None);
     }
 }

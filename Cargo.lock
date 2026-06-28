@@ -1963,6 +1963,7 @@ dependencies = [
  "dirs 5.0.1",
  "ff-core",
  "futures-util",
+ "httpdate",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
