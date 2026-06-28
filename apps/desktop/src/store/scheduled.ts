@@ -15,6 +15,12 @@ interface ScheduledState {
   load: () => Promise<void>;
   toggle: (id: string) => Promise<void>;
   create: (input: CreateScheduledTaskInput) => Promise<void>;
+  /** Delete a user task (built-ins are rejected by the backend). */
+  remove: (id: string) => Promise<void>;
+  /** Save an edit to a user task. The RFC command surface has no `update`, so this
+   *  is delete-then-recreate (#541): the row keeps its position but gets a fresh id
+   *  and reset run stamps. Rejects if the recreate fails after the delete. */
+  edit: (id: string, input: CreateScheduledTaskInput) => Promise<void>;
   /** Footer reset: resume every paused task (the default running state). */
   resetScheduled: () => Promise<void>;
 }
@@ -59,6 +65,43 @@ export const useScheduledStore = create<ScheduledState>((set, get) => ({
     try {
       const task = await ipc.createScheduledTask(input);
       set((s) => ({ tasks: [...s.tasks, task], saving: false }));
+    } catch (err) {
+      set({
+        saving: false,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  },
+
+  remove: async (id) => {
+    set({ saving: true, error: null });
+    try {
+      await ipc.deleteScheduledTask(id);
+      set((s) => ({
+        tasks: s.tasks.filter((t) => t.id !== id),
+        saving: false,
+      }));
+    } catch (err) {
+      set({
+        saving: false,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  },
+
+  edit: async (id, input) => {
+    set({ saving: true, error: null });
+    try {
+      // No `update` command exists, so recreate. Delete first; if create then
+      // fails, surface the error (the old row is already gone — the list reload
+      // on next open reflects backend truth).
+      await ipc.deleteScheduledTask(id);
+      const task = await ipc.createScheduledTask(input);
+      set((s) => ({
+        // Replace in place so the edited task keeps its position in the list.
+        tasks: s.tasks.map((t) => (t.id === id ? task : t)),
+        saving: false,
+      }));
     } catch (err) {
       set({
         saving: false,

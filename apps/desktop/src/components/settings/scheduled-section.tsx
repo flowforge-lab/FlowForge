@@ -1,10 +1,18 @@
 import { useEffect, useState } from "react";
-import { Pause, Play, Plus, SquareArrowOutUpRight } from "@/components/ui/icon";
+import {
+  Check,
+  Pause,
+  Pencil,
+  Play,
+  Plus,
+  SquareArrowOutUpRight,
+  Trash2,
+} from "@/components/ui/icon";
 import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
 import { cn } from "@/lib/utils";
 import { useSettingsStore } from "@/store/settings";
 import { useScheduledStore } from "@/store/scheduled";
+import { ScheduledTaskForm } from "@/components/settings/scheduled-task-form";
 import type { ScheduledTask } from "@/bindings";
 
 const when = new Intl.DateTimeFormat(undefined, {
@@ -18,9 +26,10 @@ function fmt(ms: number | null | undefined): string {
 }
 
 /**
- * Scheduled section (#132, SET.9): cron-scheduled agent tasks. Lists tasks from
- * the mock IPC (a built-in "Memory Organizer" + a user task), supports pause/resume
- * and a stub New-task form. Footer "Reset to defaults" resumes every paused task.
+ * Scheduled section (#132 → #541): cron-scheduled agent tasks against the real
+ * `ff-scheduled` commands. Lists tasks (built-in + user), with a new/edit form +
+ * schedule builder and store-backed create / edit / delete / pause. Footer "Reset to
+ * defaults" resumes every paused task. Firing / run-now / open-session are FE-2.
  */
 export function ScheduledSection() {
   const tasks = useScheduledStore((s) => s.tasks);
@@ -30,7 +39,8 @@ export function ScheduledSection() {
   const resetScheduled = useScheduledStore((s) => s.resetScheduled);
   const registerResetHandler = useSettingsStore((s) => s.registerResetHandler);
 
-  const [creating, setCreating] = useState(false);
+  // `"new"` while creating, a task id while editing that row, or null when closed.
+  const [editing, setEditing] = useState<"new" | string | null>(null);
 
   useEffect(() => {
     void load();
@@ -53,14 +63,16 @@ export function ScheduledSection() {
           variant="outline"
           size="sm"
           className="shrink-0"
-          onClick={() => setCreating((v) => !v)}
+          onClick={() => setEditing((v) => (v === "new" ? null : "new"))}
         >
           <Plus />
           New task
         </Button>
       </div>
 
-      {creating ? <NewTaskForm onDone={() => setCreating(false)} /> : null}
+      {editing === "new" ? (
+        <ScheduledTaskForm onDone={() => setEditing(null)} />
+      ) : null}
 
       {error ? (
         <p className="text-[12px] text-destructive" role="alert">
@@ -76,34 +88,64 @@ export function ScheduledSection() {
         </p>
       ) : (
         <ul className="flex flex-col gap-2">
-          {tasks.map((task) => (
-            <TaskCard key={task.id} task={task} />
-          ))}
+          {tasks.map((task) =>
+            editing === task.id ? (
+              <li key={task.id}>
+                <ScheduledTaskForm
+                  task={task}
+                  onDone={() => setEditing(null)}
+                />
+              </li>
+            ) : (
+              <TaskCard
+                key={task.id}
+                task={task}
+                onEdit={() => setEditing(task.id)}
+              />
+            ),
+          )}
         </ul>
       )}
     </div>
   );
 }
 
-function TaskCard({ task }: { task: ScheduledTask }) {
+function TaskCard({
+  task,
+  onEdit,
+}: {
+  task: ScheduledTask;
+  onEdit: () => void;
+}) {
   const toggle = useScheduledStore((s) => s.toggle);
+  const remove = useScheduledStore((s) => s.remove);
   const saving = useScheduledStore((s) => s.saving);
+  const isBuiltin = task.kind.kind === "builtin";
 
   return (
     <li className="flex items-center gap-3 rounded-md border px-3 py-2.5">
       <span
         className={cn(
-          "size-2 shrink-0 rounded-full",
-          task.paused ? "bg-muted-foreground/40" : "bg-emerald-500",
+          "flex size-5 shrink-0 items-center justify-center rounded-full",
+          task.paused
+            ? "bg-muted text-muted-foreground"
+            : "bg-emerald-500/10 text-emerald-600 dark:text-emerald-400",
         )}
+        title={task.paused ? "Paused" : "Running"}
         aria-label={task.paused ? "Paused" : "Running"}
-      />
+      >
+        {task.paused ? (
+          <Pause className="size-3" />
+        ) : (
+          <Check className="size-3.5" />
+        )}
+      </span>
       <div className="min-w-0 flex-1">
         <div className="flex items-center gap-2">
           <span className="truncate text-[13px] font-medium text-foreground">
             {task.name}
           </span>
-          {task.kind.kind === "builtin" ? (
+          {isBuiltin ? (
             <span className="shrink-0 rounded-full bg-muted px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-wide text-muted-foreground">
               Builtin
             </span>
@@ -126,6 +168,19 @@ function TaskCard({ task }: { task: ScheduledTask }) {
         >
           <SquareArrowOutUpRight />
         </Button>
+        {!isBuiltin ? (
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon-xs"
+            className="text-muted-foreground hover:text-foreground"
+            onClick={onEdit}
+            title="Edit task"
+            aria-label="Edit task"
+          >
+            <Pencil />
+          </Button>
+        ) : null}
         <Button
           type="button"
           variant="ghost"
@@ -138,78 +193,21 @@ function TaskCard({ task }: { task: ScheduledTask }) {
         >
           {task.paused ? <Play /> : <Pause />}
         </Button>
+        {!isBuiltin ? (
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon-xs"
+            className="text-muted-foreground hover:text-destructive"
+            disabled={saving}
+            onClick={() => void remove(task.id)}
+            title="Delete task"
+            aria-label="Delete task"
+          >
+            <Trash2 />
+          </Button>
+        ) : null}
       </div>
     </li>
-  );
-}
-
-/** Stub New-task form: name + cadence label → create. cron is a placeholder until
- *  the real scheduler lands. */
-function NewTaskForm({ onDone }: { onDone: () => void }) {
-  const create = useScheduledStore((s) => s.create);
-  const saving = useScheduledStore((s) => s.saving);
-  const [name, setName] = useState("");
-  const [cadence, setCadence] = useState("");
-
-  const canCreate = name.trim() !== "" && cadence.trim() !== "";
-
-  const submit = () => {
-    if (!canCreate) return;
-    void create({
-      name: name.trim(),
-      // Placeholder schedule + prompt; the real schedule builder is #541.
-      cron: "0 0 9 * * *", // 6-field (sec min hour dom mon dow): 9:00 AM daily
-      kind: { kind: "prompt", value: cadence.trim() },
-      safetyCeiling: "read_only",
-    }).then(onDone);
-  };
-
-  return (
-    <div className="space-y-3 rounded-md border bg-muted/30 p-3">
-      <div className="space-y-1.5">
-        <label
-          htmlFor="task-name"
-          className="text-[11px] font-medium text-muted-foreground"
-        >
-          Name
-        </label>
-        <Input
-          id="task-name"
-          value={name}
-          placeholder="Weekly Digest"
-          autoComplete="off"
-          onChange={(e) => setName(e.target.value)}
-        />
-      </div>
-      <div className="space-y-1.5">
-        <label
-          htmlFor="task-cadence"
-          className="text-[11px] font-medium text-muted-foreground"
-        >
-          Cadence
-        </label>
-        <Input
-          id="task-cadence"
-          value={cadence}
-          placeholder="Mondays at 9:00 AM"
-          autoComplete="off"
-          onChange={(e) => setCadence(e.target.value)}
-        />
-      </div>
-      <div className="flex items-center justify-end gap-1.5">
-        <Button type="button" variant="ghost" size="sm" onClick={onDone}>
-          Cancel
-        </Button>
-        <Button
-          type="button"
-          variant="outline"
-          size="sm"
-          disabled={!canCreate || saving}
-          onClick={submit}
-        >
-          Create
-        </Button>
-      </div>
-    </div>
   );
 }
