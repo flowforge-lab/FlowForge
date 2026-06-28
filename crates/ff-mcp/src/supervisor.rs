@@ -403,7 +403,12 @@ impl Supervisor {
 
         for action in actions {
             match action {
-                ReconcileAction::Stop(id) => self.stop(&id).await,
+                ReconcileAction::Stop(id) => {
+                    self.stop(&id).await;
+                    // Prune the per-server cwd override on true removal so a later
+                    // re-add can't inherit a stale workspace (#548 W1b follow-up).
+                    self.cwd_overrides.remove(&id);
+                }
                 ReconcileAction::Restart(cfg) => {
                     self.stop(&cfg.id).await;
                     self.start(cfg).await;
