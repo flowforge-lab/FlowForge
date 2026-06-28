@@ -5,10 +5,12 @@
 //! the agent loop, while tests supply a fake. Event emission lives in the impl,
 //! not the loop.
 
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use futures_util::FutureExt;
 
 use crate::store::ScheduledStore;
 use ff_core::{RunStatus, ScheduledTask};
@@ -48,10 +50,25 @@ pub fn spawn_scheduler(
 
 /// Fire every currently-due task once. Factored out of the loop so tests can
 /// drive a single sweep deterministically without waiting on a timer.
+///
+/// Each fire is panic-isolated: a `fire()` that panics (e.g. a desktop helper on
+/// a misconfigured task) is caught, recorded as an `Error` run, and stamped like
+/// any other outcome, so one bad task cannot unwind and silently kill the
+/// long-lived scheduler loop. Stamping a caught panic also prevents it from
+/// hot-looping (it stays due until stamped).
 pub async fn run_due_once(store: &ScheduledStore, runner: &dyn TaskRunner) {
     for task in store.due_tasks() {
         let fired_ms = chrono::Local::now().timestamp_millis();
-        let outcome = runner.fire(&task).await;
+        let outcome = match AssertUnwindSafe(runner.fire(&task)).catch_unwind().await {
+            Ok(outcome) => outcome,
+            Err(_) => {
+                tracing::error!(task = %task.id, "scheduled fire panicked; recording error and continuing");
+                RunOutcome {
+                    session_id: None,
+                    status: RunStatus::Error,
+                }
+            }
+        };
         store.append_run(&task.id, outcome.session_id.as_deref(), outcome.status);
         store.stamp_last_run(&task.id, fired_ms);
     }
@@ -143,5 +160,37 @@ mod tests {
         run_due_once(&store, &runner).await;
 
         assert_eq!(runner.fires.load(Ordering::SeqCst), 0);
+    }
+
+    /// A fire that panics must not unwind the scheduler loop: the panic is
+    /// caught, recorded as an `Error` run, and `last_run` is stamped so the task
+    /// does not hot-loop and the next due task still fires.
+    #[tokio::test]
+    async fn panicking_fire_is_isolated_recorded_and_stamped() {
+        struct PanickingRunner;
+        #[async_trait]
+        impl TaskRunner for PanickingRunner {
+            async fn fire(&self, _task: &ScheduledTask) -> RunOutcome {
+                panic!("boom");
+            }
+        }
+
+        let store = ScheduledStore::open_in_memory().unwrap();
+        store.create(every_minute_task("t")).unwrap();
+
+        // Does not panic out of run_due_once.
+        run_due_once(&store, &PanickingRunner).await;
+
+        let task = &store.list()[0];
+        assert!(
+            task.last_run.is_some(),
+            "a caught panic must still stamp last_run so the task does not hot-loop"
+        );
+        let statuses = store.run_statuses(&task.id);
+        assert_eq!(
+            statuses,
+            vec!["error".to_string()],
+            "a caught panic is recorded as one error run"
+        );
     }
 }

@@ -2023,6 +2023,7 @@ dependencies = [
  "ff-agent",
  "ff-core",
  "ff-tools",
+ "futures-util",
  "rusqlite",
  "serde",
  "serde_json",

@@ -12,6 +12,7 @@ ff-tools = { workspace = true }
 chrono = { workspace = true }
 tokio = { workspace = true }
 async-trait = { workspace = true }
+futures-util = { workspace = true }
 cron = "0.12"
 uuid = { workspace = true }
 serde = { workspace = true }
