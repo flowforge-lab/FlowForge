@@ -102,6 +102,7 @@ pub enum ReasoningVisibility {
     All,
 }
 
+/// Which LLM backend FlowForge talks to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export, export_to = "../../../apps/desktop/src/bindings/")]
