@@ -2040,15 +2040,25 @@ pub fn run() {
             // a background sweep fires due tasks through the desktop runner. The
             // tick is coarse; the due predicate is minute-granular, so a 30s sweep
             // never misses a slot and never double-fires (stamped last_run gates it).
+            //
+            // `spawn_scheduler` does a bare `tokio::spawn` internally (the crate is
+            // deliberately Tauri-free), but Tauri's `setup` runs outside an entered
+            // reactor on macOS (#117) — calling it here directly aborts the process
+            // ("must be called from the context of a Tokio runtime"). Run it from
+            // within Tauri's managed runtime, mirroring the `mcp:status-changed`
+            // watcher above, so the inner spawn has a reactor.
             let scheduler_runner: Arc<dyn ff_scheduled::TaskRunner> = Arc::new(DesktopTaskRunner {
                 state: state.clone(),
                 app: app.handle().clone(),
             });
-            ff_scheduled::spawn_scheduler(
-                state.scheduled.clone(),
-                scheduler_runner,
-                Duration::from_secs(30),
-            );
+            let scheduled_store = state.scheduled.clone();
+            tauri::async_runtime::spawn(async move {
+                ff_scheduled::spawn_scheduler(
+                    scheduled_store,
+                    scheduler_runner,
+                    Duration::from_secs(30),
+                );
+            });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

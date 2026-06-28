@@ -48,6 +48,63 @@ describe("useScheduledStore", () => {
     expect(tasks[tasks.length - 1].name).toBe("Nightly Backup");
   });
 
+  it("remove deletes a user task from the list", async () => {
+    await useScheduledStore.getState().load();
+    await useScheduledStore.getState().create({
+      name: "Throwaway",
+      cron: "0 0 2 * * *",
+      kind: { kind: "prompt", value: "noop" },
+      safetyCeiling: "read_only",
+    });
+    const created = useScheduledStore
+      .getState()
+      .tasks.find((t) => t.name === "Throwaway")!;
+
+    await useScheduledStore.getState().remove(created.id);
+    expect(
+      useScheduledStore.getState().tasks.some((t) => t.id === created.id),
+    ).toBe(false);
+  });
+
+  it("remove surfaces an error for a built-in task and keeps it", async () => {
+    await useScheduledStore.getState().load();
+    await useScheduledStore.getState().remove("memory-organizer");
+    expect(useScheduledStore.getState().error).toBeTruthy();
+    expect(
+      useScheduledStore
+        .getState()
+        .tasks.some((t) => t.id === "memory-organizer"),
+    ).toBe(true);
+  });
+
+  it("edit recreates the task in place with the new fields", async () => {
+    await useScheduledStore.getState().load();
+    await useScheduledStore.getState().create({
+      name: "Before",
+      cron: "0 0 2 * * *",
+      kind: { kind: "prompt", value: "old" },
+      safetyCeiling: "read_only",
+    });
+    const before = useScheduledStore
+      .getState()
+      .tasks.find((t) => t.name === "Before")!;
+    const indexBefore = useScheduledStore
+      .getState()
+      .tasks.findIndex((t) => t.id === before.id);
+
+    await useScheduledStore.getState().edit(before.id, {
+      name: "After",
+      cron: "0 0 9 * * 1",
+      kind: { kind: "prompt", value: "new" },
+      safetyCeiling: "write",
+    });
+    const tasks = useScheduledStore.getState().tasks;
+    // Same slot, new identity + fields (delete + recreate).
+    expect(tasks.some((t) => t.id === before.id)).toBe(false);
+    expect(tasks[indexBefore].name).toBe("After");
+    expect(tasks[indexBefore].safetyCeiling).toBe("write");
+  });
+
   it("resetScheduled resumes every paused task", async () => {
     await useScheduledStore.getState().load();
     // Pause a task so there's something to reset.
