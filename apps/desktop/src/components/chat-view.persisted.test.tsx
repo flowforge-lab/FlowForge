@@ -222,3 +222,65 @@ describe("ChatView interleaved intermediate prose (#415)", () => {
     expect(order.every((i) => i >= 0)).toBe(true);
   });
 });
+
+describe("ChatView persisted reasoning (#549 W2)", () => {
+  // A reloaded single-message turn whose assistant answer carries persisted
+  // chain-of-thought (#375/#558). No tool calls → the Thought block stands alone.
+  function reasoningTurn(reasoning: string): Message[] {
+    return [
+      { id: "u1", sessionId: SID, role: "user", content: "go", createdAt: 1 },
+      {
+        id: "a1",
+        sessionId: SID,
+        role: "assistant",
+        content: "all done",
+        reasoning,
+        createdAt: 1,
+      },
+    ];
+  }
+
+  it("renders a Thought block from a loaded message's reasoning, with no live event", () => {
+    // seed() sets reasoningByMessage: {} — nothing streamed this session, so the
+    // block can only come from the persisted Message.reasoning (the W2 contract).
+    seed(reasoningTurn("plan-the-approach-7f3"));
+    const { container } = render(<ChatView />);
+
+    const q = within(container);
+    expect(q.getByText("Thinking")).toBeTruthy();
+    expect(q.getByText(/plan-the-approach-7f3/)).toBeTruthy();
+  });
+
+  it("lets a live reasoning event override the persisted value while streaming", () => {
+    // Live accumulator present for a1 → it wins over Message.reasoning
+    // (chat-view.tsx: reasoningByMessage[m.id] ?? g.reasoning).
+    useChatStore.setState({
+      activeSessionId: SID,
+      messagesBySession: { [SID]: reasoningTurn("persisted-cot-old") },
+      streamingBySession: { [SID]: "a1" },
+      turnStartBySession: {},
+      turnStartByMessage: {},
+      toolStepsByMessage: {},
+      reasoningByMessage: { a1: "live-cot-new" },
+    });
+    const { container } = render(<ChatView />);
+
+    const q = within(container);
+    expect(q.getByText(/live-cot-new/)).toBeTruthy();
+    expect(q.queryByText(/persisted-cot-old/)).toBeNull();
+  });
+
+  it("renders persisted reasoning inside a reloaded multi-step fold", () => {
+    const msgs = multiStepTurn([1000, 2000, 9000]);
+    // Attach reasoning to the turn's assistant message (a1).
+    msgs[1] = { ...msgs[1], reasoning: "folded-cot-9k2" };
+    seed(msgs);
+    const { container } = render(<ChatView />);
+
+    // Folded by default; expand the "N steps" header to reveal the Thought block.
+    fireEvent.click(groupHeader(container)!);
+    const q = within(container);
+    expect(q.getByText("Thinking")).toBeTruthy();
+    expect(q.getByText(/folded-cot-9k2/)).toBeTruthy();
+  });
+});
