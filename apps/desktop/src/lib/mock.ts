@@ -39,6 +39,7 @@ import type {
   MemoryFileInfo,
   MemoryOverview,
   MemoryFlushedEvent,
+  UpdateProgressEvent,
 } from "../bindings";
 import type { Format } from "../bindings/Format";
 import type { SecretKind } from "../bindings/SecretKind";
@@ -619,6 +620,8 @@ export class MockIpc implements FfIpc {
   private phenoMcpUnavailableListeners = new Set<
     Listener<PhenotypeMcpUnavailableEvent>
   >();
+  private updateProgressListeners = new Set<Listener<UpdateProgressEvent>>();
+  private updateDownloadFinishedListeners = new Set<Listener<void>>();
   private workspaceBranchListeners = new Set<Listener<SessionWorkspace>>();
   // Sessions that have already simulated a context-pressure flush (#283). The
   // real flush only fires once a session crosses the budget; the mock stands in
@@ -863,6 +866,14 @@ export class MockIpc implements FfIpc {
   }
   onWorkspaceBranchChanged(cb: Listener<SessionWorkspace>): Promise<Unlisten> {
     return this.subscribe(this.workspaceBranchListeners, cb);
+  }
+
+  onUpdateProgress(cb: Listener<UpdateProgressEvent>): Promise<Unlisten> {
+    return this.subscribe(this.updateProgressListeners, cb);
+  }
+
+  onUpdateDownloadFinished(cb: Listener<void>): Promise<Unlisten> {
+    return this.subscribe(this.updateDownloadFinishedListeners, cb);
   }
 
   async listMcpServers(): Promise<McpServerStatus[]> {
@@ -1704,9 +1715,25 @@ Shipping the Settings redesign — currently the Memory browser (SET.8).
     return { kind: "upToDate", version: APP_VERSION_FALLBACK };
   }
 
-  // No-op in the mock: there is no real updater, so "Update now" just resolves
-  // (the real backend downloads + relaunches — see #362/#363).
-  async installUpdate(): Promise<void> {}
+  // The real backend streams `update:progress` per downloaded chunk then relaunches
+  // (#362/#363/#566). The mock has no real updater, so it simulates the chunk stream:
+  // ~5 cumulative progress ticks up to a fixed total, then `update:download-finished`,
+  // so the determinate progress bar is exercisable under VITE_FF_MOCK=1. Resolves once
+  // the stream completes (the real path never resolves — it relaunches).
+  async installUpdate(): Promise<void> {
+    const total = 5 * 1024 * 1024; // 5 MiB
+    const chunks = 5;
+    const step = total / chunks;
+    for (let i = 1; i <= chunks; i++) {
+      await new Promise((r) => setTimeout(r, 220));
+      this.emit(this.updateProgressListeners, {
+        downloaded: BigInt(Math.round(step * i)),
+        total: BigInt(total),
+      });
+    }
+    await new Promise((r) => setTimeout(r, 220));
+    this.emit(this.updateDownloadFinishedListeners, undefined);
+  }
 
   async exportBackup(): Promise<BackupResult> {
     return { path: "~/Downloads/flowforge-backup.json" };

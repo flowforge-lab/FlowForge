@@ -10,6 +10,7 @@ import type { MarketplaceSkill } from "@/lib/marketplace";
 import type { MarketplaceProfile } from "@/lib/profile-marketplace";
 import type { ScheduledTask, CreateScheduledTaskInput } from "@/bindings";
 import type { PhenotypeMcpUnavailableEvent } from "@/bindings";
+import type { UpdateProgressEvent } from "@/bindings";
 import type {
   Attachment,
   Message,
@@ -393,6 +394,15 @@ export interface FfIpc {
   onPhenotypeMcpUnavailable(
     cb: (e: PhenotypeMcpUnavailableEvent) => void,
   ): Promise<Unlisten>;
+  // FE completion of the already-merged backend emit (#566, #568). `install_update`
+  // emits `update:progress` per downloaded chunk (cumulative bytes; `total` is the
+  // content length, `null` -> indeterminate bar), then a terminal
+  // `update:download-finished` before the auto-relaunch. The event names + payload
+  // are fixed by the backend; the binding (`UpdateProgressEvent`) is generated.
+  /** Self-update download progress: cumulative bytes downloaded + content length. */
+  onUpdateProgress(cb: (e: UpdateProgressEvent) => void): Promise<Unlisten>;
+  /** The self-update download finished; the app relaunches shortly after. */
+  onUpdateDownloadFinished(cb: () => void): Promise<Unlisten>;
   // CONTRACT CHANGE (#561, live-sync git branch when HEAD changes): NEW event
   // needing a real Rust emitter — please review @backend-owner. The backend's
   // `GitHeadWatcher` (mirroring `McpConfigWatcher`/`SkillWatcher`) watches the
@@ -646,6 +656,10 @@ class TauriIpc implements FfIpc {
     this.listen<MemoryFlushedEvent>("memory:flushed", cb);
   onPhenotypeMcpUnavailable = (cb: (e: PhenotypeMcpUnavailableEvent) => void) =>
     this.listen<PhenotypeMcpUnavailableEvent>("phenotype:mcp-unavailable", cb);
+  onUpdateProgress = (cb: (e: UpdateProgressEvent) => void) =>
+    this.listen<UpdateProgressEvent>("update:progress", cb);
+  onUpdateDownloadFinished = (cb: () => void) =>
+    this.listen<void>("update:download-finished", () => cb());
   onWorkspaceBranchChanged = (cb: (e: SessionWorkspace) => void) =>
     this.listen<SessionWorkspace>("workspace:branch-changed", cb);
 }

@@ -3,10 +3,14 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { ipc } from "@/lib/ipc";
-import { shouldPollUpdate, useUpdateStore } from "@/store/update";
+import {
+  progressPercent,
+  shouldPollUpdate,
+  useUpdateStore,
+} from "@/store/update";
 
 afterEach(() => {
-  useUpdateStore.setState({ status: null, installing: false });
+  useUpdateStore.setState({ status: null, installing: false, progress: null });
   vi.restoreAllMocks();
 });
 
@@ -86,5 +90,37 @@ describe("useUpdateStore (#363)", () => {
     it("always polls in prod (flag on, irrelevant)", () => {
       expect(shouldPollUpdate(true, false, true)).toBe(true);
     });
+  });
+});
+
+describe("download progress (#566)", () => {
+  it("setProgress stores progress; the terminal event clears it", () => {
+    useUpdateStore.getState().setProgress({ downloaded: 512, total: 1024 });
+    expect(useUpdateStore.getState().progress).toEqual({
+      downloaded: 512,
+      total: 1024,
+    });
+    // The `update:download-finished` listener clears progress (lib/events.ts).
+    useUpdateStore.getState().setProgress(null);
+    expect(useUpdateStore.getState().progress).toBeNull();
+  });
+
+  it("install() resets progress to null on start", async () => {
+    useUpdateStore.setState({ progress: { downloaded: 1, total: 2 } });
+    vi.spyOn(ipc, "installUpdate").mockResolvedValue();
+    await useUpdateStore.getState().install();
+    expect(useUpdateStore.getState().progress).toBeNull();
+  });
+
+  it("progressPercent is determinate when total is known", () => {
+    expect(progressPercent({ downloaded: 256, total: 1024 })).toBe(25);
+    expect(progressPercent({ downloaded: 1024, total: 1024 })).toBe(100);
+  });
+
+  it("progressPercent is null (indeterminate) without a total", () => {
+    expect(progressPercent(null)).toBeNull();
+    expect(progressPercent({ downloaded: 999, total: null })).toBeNull();
+    // total 0 is a degenerate content length -> indeterminate, not a divide-by-zero.
+    expect(progressPercent({ downloaded: 0, total: 0 })).toBeNull();
   });
 });

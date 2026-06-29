@@ -9,6 +9,7 @@ import { useSkillsStore } from "@/store/skills";
 import { useMcpStore } from "@/store/mcp";
 import { useMemoryStore } from "@/store/memory";
 import { usePhenoMcpNoticeStore } from "@/store/pheno-mcp-notice";
+import { useUpdateStore } from "@/store/update";
 import { useSessionWorkspaceStore } from "@/store/session-workspace";
 
 let started = false;
@@ -80,5 +81,19 @@ export function startIpcEvents(): void {
   // No UI for intention signals yet (NeuroForge, M8) — observe only.
   void ipc.onIntention((e) => {
     console.debug("[signal:intention]", e.sessionId, e.goal);
+  });
+  // Self-update download progress (#566): feed the shared update store so the global
+  // update bar (#565) and Settings → About render a real progress bar. `bigint` on the
+  // wire -> `number` here (byte counts are within Number's safe range). The terminal
+  // event clears progress, flipping the UI to the indeterminate "finalizing" state
+  // until the backend relaunches.
+  void ipc.onUpdateProgress((e) => {
+    useUpdateStore.getState().setProgress({
+      downloaded: Number(e.downloaded),
+      total: e.total == null ? null : Number(e.total),
+    });
+  });
+  void ipc.onUpdateDownloadFinished(() => {
+    useUpdateStore.getState().setProgress(null);
   });
 }
