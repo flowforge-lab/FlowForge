@@ -21,11 +21,14 @@ import type { ToolCall } from "@/bindings/ToolCall";
 import type { ToolStep } from "@/store/chat";
 import { groupDurationMs } from "@/lib/steps";
 
-/** An ordered row inside an assistant turn: a tool step, or a chunk of the model's
- *  intermediate prose ("Now let me check …") that preceded the next tool call (#415). */
+/** An ordered row inside an assistant turn: a tool step, a chunk of the model's
+ *  intermediate prose ("Now let me check …") that preceded the next tool call (#415),
+ *  or that iteration's reasoning, sitting where the thinking happened — immediately
+ *  before the tool calls it produced (#574). */
 export type TurnItem =
   | { kind: "step"; step: ToolStep }
-  | { kind: "prose"; text: string; key: string };
+  | { kind: "prose"; text: string; key: string }
+  | { kind: "reasoning"; text: string; key: string };
 
 /** One rendered transcript row. */
 export type RenderGroup =
@@ -119,17 +122,21 @@ function reconstructSteps(
 /**
  * Fold a transcript into ordered render groups. Each user message is its own group;
  * the run of non-user messages that follows is one assistant turn. Within a turn,
- * each assistant message contributes its prose (folded row) followed by its steps —
- * live steps from `liveSteps[messageId]` when present, else reconstructed from the
- * following persisted `tool` results. A run with no assistant message is emitted as
- * bare `loose` rows (#331).
+ * each assistant message contributes its reasoning then its prose (folded rows)
+ * followed by its steps — live steps from `liveSteps[messageId]` when present, else
+ * reconstructed from the following persisted `tool` results. A run with no assistant
+ * message is emitted as bare `loose` rows (#331).
  *
- * @param liveSteps  The store's `toolStepsByMessage`; live steps win over
- *                   reconstruction (they carry real status/timing while streaming).
+ * @param liveSteps      The store's `toolStepsByMessage`; live steps win over
+ *                       reconstruction (they carry real status/timing while streaming).
+ * @param liveReasoning  The store's `reasoningByMessage`; the live stream wins over the
+ *                       reasoning persisted on a message so streaming order matches the
+ *                       persisted order on reload (#574).
  */
 export function foldTurns(
   messages: Message[],
   liveSteps?: Record<string, ToolStep[]>,
+  liveReasoning?: Record<string, string>,
 ): RenderGroup[] {
   const groups: RenderGroup[] = [];
   let i = 0;
@@ -175,7 +182,17 @@ export function foldTurns(
     const steps: ToolStep[] = [];
     let reasoning = "";
     for (const { assistant: a, followers } of blocks) {
+      // Group-level reasoning is kept only for the no-steps fallback (a standalone
+      // Thinking block; see chat-view.tsx). When the turn has steps, reasoning is
+      // interleaved per iteration as a `reasoning` item below — never floated to the top.
       if (!reasoning && a.reasoning) reasoning = a.reasoning;
+      // This iteration's reasoning, in position — immediately before the prose/steps it
+      // produced (#574). The live stream wins over the persisted copy so streaming order
+      // matches the persisted order on reload.
+      const aReasoning = liveReasoning?.[a.id] ?? a.reasoning ?? "";
+      if (aReasoning.trim()) {
+        items.push({ kind: "reasoning", text: aReasoning, key: a.id });
+      }
       // Intermediate prose: a non-final assistant message's content is narration
       // between tool calls (#415). The final message's content is the answer,
       // rendered below the group — never a prose row.

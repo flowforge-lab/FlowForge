@@ -3,7 +3,11 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { ipc } from "@/lib/ipc";
-import { progressPercent, useUpdateStore } from "@/store/update";
+import {
+  progressPercent,
+  shouldPollUpdate,
+  useUpdateStore,
+} from "@/store/update";
 
 afterEach(() => {
   useUpdateStore.setState({ status: null, installing: false, progress: null });
@@ -68,6 +72,24 @@ describe("useUpdateStore (#363)", () => {
     });
     await useUpdateStore.getState().refresh();
     expect(useUpdateStore.getState().dismissed).toBe(false);
+  });
+
+  describe("shouldPollUpdate (#567)", () => {
+    it("does not poll in dev when the flag is off", () => {
+      expect(shouldPollUpdate(false, true, false)).toBe(false);
+    });
+
+    it("polls in dev when the flag is on", () => {
+      expect(shouldPollUpdate(false, true, true)).toBe(true);
+    });
+
+    it("always polls in prod (flag off)", () => {
+      expect(shouldPollUpdate(true, false, false)).toBe(true);
+    });
+
+    it("always polls in prod (flag on, irrelevant)", () => {
+      expect(shouldPollUpdate(true, false, true)).toBe(true);
+    });
   });
 });
 
