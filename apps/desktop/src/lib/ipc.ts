@@ -393,6 +393,22 @@ export interface FfIpc {
   onPhenotypeMcpUnavailable(
     cb: (e: PhenotypeMcpUnavailableEvent) => void,
   ): Promise<Unlisten>;
+  // CONTRACT CHANGE (#561, live-sync git branch when HEAD changes): NEW event
+  // needing a real Rust emitter — please review @backend-owner. The backend's
+  // `GitHeadWatcher` (mirroring `McpConfigWatcher`/`SkillWatcher`) watches the
+  // active workspace's `.git/HEAD` and, on a debounced change, re-resolves
+  // `git_branch(root)` and emits `workspace:branch-changed`. The payload reuses
+  // the existing `SessionWorkspace` (`{ path, gitBranch }`) — NO new ts-rs
+  // binding; `bindings/` is untouched. Detached HEAD carries `gitBranch: null`,
+  // preserving the existing semantics. Mocked under `VITE_FF_MOCK=1` (a synthetic
+  // emit on `setSessionWorkspace`) so the reactive path is exercisable without a
+  // watcher.
+  /** The active workspace's git HEAD changed on disk — a terminal checkout,
+   *  rebase, or the assistant's own `bash` switching branches. Patches the cached
+   *  `gitBranch` for every session sharing `path`; no remount, no reload. */
+  onWorkspaceBranchChanged(
+    cb: (e: SessionWorkspace) => void,
+  ): Promise<Unlisten>;
 }
 
 // Explicit mock flag OR auto-fallback when not inside a Tauri window.
@@ -630,6 +646,8 @@ class TauriIpc implements FfIpc {
     this.listen<MemoryFlushedEvent>("memory:flushed", cb);
   onPhenotypeMcpUnavailable = (cb: (e: PhenotypeMcpUnavailableEvent) => void) =>
     this.listen<PhenotypeMcpUnavailableEvent>("phenotype:mcp-unavailable", cb);
+  onWorkspaceBranchChanged = (cb: (e: SessionWorkspace) => void) =>
+    this.listen<SessionWorkspace>("workspace:branch-changed", cb);
 }
 
 // `MockIpc` is pulled in with a dynamic import so the bundler gives it its own
