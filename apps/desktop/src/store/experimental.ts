@@ -19,7 +19,12 @@ export type FlagId =
   // FE-only dev affordance (#417): gates the step-timeline download on the
   // StepGroup header. Unlike the others it gates a shipped FE behavior, not a
   // future backend.
-  | "stepTimelineExport";
+  | "stepTimelineExport"
+  // FE-only dev affordance (#567, RFC 0014 §12.3, P5c): lets the background
+  // update poll run in a dev build so the global update bar picks up a local
+  // `dev-release.sh` feed. Pairs with `FF_UPDATER_ENDPOINT`; without a local
+  // feed the check returns up-to-date, so it never reaches the public feed.
+  | "localUpdateChannel";
 
 export const FLAG_IDS: readonly FlagId[] = [
   "ownApiKey",
@@ -29,6 +34,7 @@ export const FLAG_IDS: readonly FlagId[] = [
   "backgroundObservers",
   "smartSkillSurfacing",
   "stepTimelineExport",
+  "localUpdateChannel",
 ];
 
 export type ExperimentalFlags = Record<FlagId, boolean>;
@@ -42,6 +48,7 @@ export const EXPERIMENTAL_DEFAULTS: ExperimentalFlags = {
   backgroundObservers: false,
   smartSkillSurfacing: false,
   stepTimelineExport: false,
+  localUpdateChannel: false,
 };
 
 export interface ExperimentalState {

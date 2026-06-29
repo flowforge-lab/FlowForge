@@ -21,6 +21,23 @@ interface UpdateState {
   install: () => Promise<void>;
 }
 
+/**
+ * Whether the background update poll should run (#567, RFC 0014 §12.3). Prod
+ * always polls; a dev build polls only when the `localUpdateChannel`
+ * experimental flag is on (to pick up a local `dev-release.sh` feed).
+ * Extracted as a pure predicate because `import.meta.env.PROD`/`DEV` are Vite
+ * compile-time constants that can't be flipped per-test. The dev feed is gated
+ * by `FF_UPDATER_ENDPOINT`; without it the check returns up-to-date, so a dev
+ * process never reaches the public GitHub feed.
+ */
+export function shouldPollUpdate(
+  prod: boolean,
+  dev: boolean,
+  localUpdateChannel: boolean,
+): boolean {
+  return prod || (dev && localUpdateChannel);
+}
+
 export const useUpdateStore = create<UpdateState>((set) => ({
   status: null,
   installing: false,

@@ -57,6 +57,13 @@ const FLAGS: readonly FlagMeta[] = [
     description:
       "Show a developer download on each step group to export its per-step timing (JSON/CSV) for diagnosing slow runs.",
   },
+  {
+    id: "localUpdateChannel",
+    label: "Local update channel",
+    description:
+      "Enable the background update poll in a dev build so the global update bar picks up a local dev-release.sh feed (D1, local updater endpoint). Pairs with FF_UPDATER_ENDPOINT — without a local feed the check returns up-to-date, so it never reaches the public GitHub feed. Not dev-install.sh (D2, direct file swap, no feed).",
+    restartRequired: true,
+  },
 ];
 
 /**
