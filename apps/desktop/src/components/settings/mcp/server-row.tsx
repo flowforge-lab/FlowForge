@@ -31,7 +31,8 @@ export function ServerRow({ server }: { server: McpServerStatus }) {
         ) : null}
       </div>
 
-      {server.state === "failed" && server.lastError ? (
+      {(server.state === "failed" || server.state === "restarting") &&
+      server.lastError ? (
         <p
           className="mt-1.5 text-[11px] leading-relaxed text-destructive"
           role="alert"

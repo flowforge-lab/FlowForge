@@ -44,6 +44,8 @@ to keep skills portable).
 
 ## 3. Configuration — `~/.flowforge/mcp.json`
 
+> **Amended by [RFC 0018](0018-tiered-and-workspace-scoped-mcp.md) §3, §14.** The watched `mcp.json` is now the **Global tier** of a tiered desired set (global / phenotype / session), not the whole desired set. The shape and hot-reload discipline here are unchanged.
+
 FlowForge adopts the de-facto Claude/Cursor `mcpServers` shape so existing server
 definitions paste in unchanged:
 
@@ -143,6 +145,8 @@ pub struct McpToolInfo {
 ```
 
 ## 5. Supervisor
+
+> **Amended by [RFC 0018](0018-tiered-and-workspace-scoped-mcp.md) §4.2, §14.** Supervisor handles are keyed by `(id, ScopeKey)` rather than `server_id` alone, so a workspace-scoped server runs one instance per distinct workspace root. Global-scoped servers keep the one-instance-per-id semantics described here; the spawn / health / backoff / graceful-shutdown rules below are unchanged and reused by ref-count eviction.
 
 The supervisor owns process lifecycle so the rest of the app only ever sees
 `McpServerStatus`:

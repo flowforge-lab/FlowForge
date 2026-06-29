@@ -403,6 +403,22 @@ export interface FfIpc {
   onUpdateProgress(cb: (e: UpdateProgressEvent) => void): Promise<Unlisten>;
   /** The self-update download finished; the app relaunches shortly after. */
   onUpdateDownloadFinished(cb: () => void): Promise<Unlisten>;
+  // CONTRACT CHANGE (#561, live-sync git branch when HEAD changes): NEW event
+  // needing a real Rust emitter — please review @backend-owner. The backend's
+  // `GitHeadWatcher` (mirroring `McpConfigWatcher`/`SkillWatcher`) watches the
+  // active workspace's `.git/HEAD` and, on a debounced change, re-resolves
+  // `git_branch(root)` and emits `workspace:branch-changed`. The payload reuses
+  // the existing `SessionWorkspace` (`{ path, gitBranch }`) — NO new ts-rs
+  // binding; `bindings/` is untouched. Detached HEAD carries `gitBranch: null`,
+  // preserving the existing semantics. Mocked under `VITE_FF_MOCK=1` (a synthetic
+  // emit on `setSessionWorkspace`) so the reactive path is exercisable without a
+  // watcher.
+  /** The active workspace's git HEAD changed on disk — a terminal checkout,
+   *  rebase, or the assistant's own `bash` switching branches. Patches the cached
+   *  `gitBranch` for every session sharing `path`; no remount, no reload. */
+  onWorkspaceBranchChanged(
+    cb: (e: SessionWorkspace) => void,
+  ): Promise<Unlisten>;
 }
 
 // Explicit mock flag OR auto-fallback when not inside a Tauri window.
@@ -644,6 +660,8 @@ class TauriIpc implements FfIpc {
     this.listen<UpdateProgressEvent>("update:progress", cb);
   onUpdateDownloadFinished = (cb: () => void) =>
     this.listen<void>("update:download-finished", () => cb());
+  onWorkspaceBranchChanged = (cb: (e: SessionWorkspace) => void) =>
+    this.listen<SessionWorkspace>("workspace:branch-changed", cb);
 }
 
 // `MockIpc` is pulled in with a dynamic import so the bundler gives it its own

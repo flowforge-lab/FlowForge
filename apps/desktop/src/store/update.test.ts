@@ -49,6 +49,26 @@ describe("useUpdateStore (#363)", () => {
     await expect(useUpdateStore.getState().install()).rejects.toThrow("boom");
     expect(useUpdateStore.getState().installing).toBe(false);
   });
+
+  it("dismiss() sets the dismissed flag", () => {
+    useUpdateStore.setState({ dismissed: false });
+    useUpdateStore.getState().dismiss();
+    expect(useUpdateStore.getState().dismissed).toBe(true);
+  });
+
+  it("refresh() clears dismissed so a still-available update resurfaces (#565)", async () => {
+    useUpdateStore.setState({
+      status: { kind: "available", version: "9.9.9", notes: null },
+      dismissed: true,
+    });
+    vi.spyOn(ipc, "checkForUpdates").mockResolvedValue({
+      kind: "available",
+      version: "9.9.9",
+      notes: null,
+    });
+    await useUpdateStore.getState().refresh();
+    expect(useUpdateStore.getState().dismissed).toBe(false);
+  });
 });
 
 describe("download progress (#566)", () => {

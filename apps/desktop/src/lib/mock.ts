@@ -622,6 +622,7 @@ export class MockIpc implements FfIpc {
   >();
   private updateProgressListeners = new Set<Listener<UpdateProgressEvent>>();
   private updateDownloadFinishedListeners = new Set<Listener<void>>();
+  private workspaceBranchListeners = new Set<Listener<SessionWorkspace>>();
   // Sessions that have already simulated a context-pressure flush (#283). The
   // real flush only fires once a session crosses the budget; the mock stands in
   // by flushing once per session so the provenance surface is exercisable.
@@ -681,6 +682,7 @@ export class MockIpc implements FfIpc {
     const trimmed = path.trim();
     if (!trimmed) throw new Error("cannot resolve directory: empty path");
     this.workspaces.set(sessionId, trimmed);
+    this.emitBranchChanged(trimmed);
     return trimmed;
   }
 
@@ -861,6 +863,9 @@ export class MockIpc implements FfIpc {
     cb: Listener<PhenotypeMcpUnavailableEvent>,
   ): Promise<Unlisten> {
     return this.subscribe(this.phenoMcpUnavailableListeners, cb);
+  }
+  onWorkspaceBranchChanged(cb: Listener<SessionWorkspace>): Promise<Unlisten> {
+    return this.subscribe(this.workspaceBranchListeners, cb);
   }
 
   onUpdateProgress(cb: Listener<UpdateProgressEvent>): Promise<Unlisten> {
@@ -2109,6 +2114,21 @@ Shipping the Settings redesign — currently the Memory browser (SET.8).
     const servers = this.unavailableSkillMcp(skills);
     if (servers.length === 0) return;
     this.emit(this.phenoMcpUnavailableListeners, { phenotype, servers });
+  }
+
+  // The mock has no filesystem, so it can't observe `.git/HEAD`. Stand in for
+  // the backend's debounced `GitHeadWatcher` by synthesizing a branch from the
+  // path and emitting `workspace:branch-changed` on the next macrotask — after
+  // the store's `set` runs `load` (which resets `gitBranch` to null), so the
+  // reactive patch is observable in `pnpm dev:mock`. Dev/mock only; a production
+  // build always runs inside Tauri, so MockIpc is dead-code-eliminated there.
+  private emitBranchChanged(path: string): void {
+    const parts = path.replace(/\/+$/, "").split("/");
+    const name = parts[parts.length - 1] || path;
+    const branch = `mock-${name}`;
+    setTimeout(() => {
+      this.emit(this.workspaceBranchListeners, { path, gitBranch: branch });
+    }, 0);
   }
 
   private emit<T>(set: Set<Listener<T>>, payload: T): void {
