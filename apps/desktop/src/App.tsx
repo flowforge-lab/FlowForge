@@ -4,7 +4,8 @@ import { startIpcEvents } from "@/lib/events";
 import { initPrefs } from "@/store/prefs";
 import { useChatStore } from "@/store/chat";
 import { useModelConfigStore } from "@/store/model-config";
-import { useUpdateStore } from "@/store/update";
+import { shouldPollUpdate, useUpdateStore } from "@/store/update";
+import { useExperimentalStore } from "@/store/experimental";
 
 // How often the production build re-checks for an update in the background.
 const UPDATE_POLL_MS = 6 * 60 * 60 * 1000;
@@ -23,9 +24,21 @@ function App() {
       // Load the provider registry so the composer knows the active model's
       // vision capability app-wide (FE-4, #342) — not just after Settings opens.
       void useModelConfigStore.getState().load();
-      // Background update check, prod only — mock/dev never polls (#363). Initial
-      // check on launch, then every few hours; cleared on teardown.
-      if (import.meta.env.PROD) {
+      // Background update check (#363). Prod always polls; in a dev build the
+      // poll runs only when the `localUpdateChannel` experimental flag is on
+      // (#567). Pair the flag with a local `FF_UPDATER_ENDPOINT`; without it the
+      // poll still reaches the default public GitHub feed, so set the endpoint
+      // when enabling the flag in a `pnpm tauri dev` process.
+      // Initial check on launch, then every few hours; cleared on teardown.
+      const localUpdateChannel =
+        useExperimentalStore.getState().flags.localUpdateChannel;
+      if (
+        shouldPollUpdate(
+          import.meta.env.PROD,
+          import.meta.env.DEV,
+          localUpdateChannel,
+        )
+      ) {
         void useUpdateStore.getState().refresh();
         const id = setInterval(
           () => void useUpdateStore.getState().refresh(),

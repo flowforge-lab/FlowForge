@@ -2,6 +2,7 @@
 //! all business logic lives in the `ff-*` crates. Each handler deserializes,
 //! calls into a crate, and returns. Streaming responses go out as Tauri events.
 
+mod git_watch;
 mod optimize;
 mod secrets;
 mod state;
@@ -359,7 +360,7 @@ fn get_session_workspace(state: State<'_, Arc<AppState>>, session_id: String) ->
 /// than spawning `git` and dependency-free; `ref: refs/heads/<name>` yields the
 /// branch, a bare commit SHA (detached) yields `None`. Extracted as a free fn so
 /// it is unit-testable without a Tauri `State`.
-fn git_branch(dir: &std::path::Path) -> Option<String> {
+pub(crate) fn git_branch(dir: &std::path::Path) -> Option<String> {
     let head = std::fs::read_to_string(dir.join(".git").join("HEAD")).ok()?;
     head.trim()
         .strip_prefix("ref: refs/heads/")
@@ -679,6 +680,11 @@ fn spawn_assistant_turn(state: Arc<AppState>, app: tauri::AppHandle, session_id:
         // (#548 W1b). Idempotent; restarts codegraph only when the path changed.
         let session_root = state.session_root(&sid);
         state.align_codegraph_workspace(&session_root).await;
+        // Re-aim the git HEAD watcher at this session's checkout (#561 BE half),
+        // mirroring the codegraph alignment above. Idempotent; a no-op when the path
+        // is unchanged. Drives the live `workspace:branch-changed` event the FE
+        // listener (PR #581) patches into the composer chip.
+        state.align_git_watcher(&session_root);
         // Snapshot built-in + MCP-bridged tools for this turn (RFC 0003 §6).
         let registry = state.build_tool_registry();
         let mut tool_ctx = ToolContext::new(&registry, &session_root, &approver, max_iterations);
@@ -972,6 +978,9 @@ impl ff_scheduled::TaskRunner for DesktopTaskRunner {
 
         let session_root = self.state.session_root(&sid);
         self.state.align_codegraph_workspace(&session_root).await;
+        // Keep the git HEAD watcher aimed at the active checkout here too (#561), so
+        // a scheduled-task turn that switches branches live-updates the FE chip.
+        self.state.align_git_watcher(&session_root);
         let registry = self.state.build_tool_registry();
         let approver = ScheduledApprover::new(task.safety_ceiling);
         let mut tool_ctx = ToolContext::new(&registry, &session_root, &approver, max_iterations);
@@ -2016,6 +2025,21 @@ pub fn run() {
             // call here even though Tauri's `setup` runs on the main thread outside
             // an entered reactor on macOS (issue #117).
             state.init_mcp();
+            // Live-sync the active session's git branch (#561 BE half): the
+            // GitHeadWatcher observes the workspace's `.git/HEAD` and emits
+            // `workspace:branch-changed` on a real branch change, which the FE listener
+            // merged in PR #581 patches into the composer chip with no remount. Spawned
+            // via `tauri::async_runtime::spawn` (not bare `tokio::spawn`) because setup
+            // runs off-reactor on macOS (#117). A `None` rx means the watcher could not
+            // start -- live sync degrades to off rather than failing the app.
+            if let Some(mut rx) = state.init_git_watcher() {
+                let app_handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    while let Some(ws) = rx.recv().await {
+                        let _ = app_handle.emit("workspace:branch-changed", ws);
+                    }
+                });
+            }
             // Drive the periodic idle-process reaper (`ProcessSupervisor::reap_idle`)
             // from the same setup path: it enters the runtime itself, so it's safe
             // here too. Finished processes and ones the agent abandoned (started but

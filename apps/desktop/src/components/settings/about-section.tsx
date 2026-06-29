@@ -10,8 +10,9 @@ import {
   openExternalUrl,
 } from "@/lib/about";
 import { ipc } from "@/lib/ipc";
+import { Progress } from "@/components/ui/progress";
 import { useSettingsStore } from "@/store/settings";
-import { useUpdateStore } from "@/store/update";
+import { progressPercent, useUpdateStore } from "@/store/update";
 
 const TOAST_MS = 3200;
 
@@ -30,6 +31,9 @@ export function AboutSection() {
   const updateStatus = useUpdateStore((s) => s.status);
   const installing = useUpdateStore((s) => s.installing);
   const install = useUpdateStore((s) => s.install);
+  const progress = useUpdateStore((s) => s.progress);
+  // Determinate percent when the feed sent a content length; null -> indeterminate.
+  const percent = progressPercent(progress);
 
   useEffect(() => {
     let alive = true;
@@ -88,19 +92,31 @@ export function AboutSection() {
       <AboutGroup>
         <AboutRow label="Check for updates" onClick={onCheckForUpdates} />
         {updateStatus?.kind === "available" ? (
-          <AboutRow
-            label={`Update now — version ${updateStatus.version}`}
-            onClick={() => void install()}
-            disabled={installing}
-            trailing={
-              installing ? (
-                <Loader2
-                  className="size-4 shrink-0 animate-spin text-muted-foreground"
-                  aria-hidden
+          <>
+            <AboutRow
+              label={`Update now — version ${updateStatus.version}`}
+              onClick={() => void install()}
+              disabled={installing}
+              trailing={
+                installing ? (
+                  <Loader2
+                    className="size-4 shrink-0 animate-spin text-muted-foreground"
+                    aria-hidden
+                  />
+                ) : undefined
+              }
+            />
+            {installing ? (
+              // Real download progress (#566): determinate when a content length is
+              // known, indeterminate (pulsing) track otherwise.
+              <div className="border-b px-3 py-2.5 last:border-b-0">
+                <Progress
+                  value={percent}
+                  className={percent == null ? "animate-pulse" : undefined}
                 />
-              ) : undefined
-            }
-          />
+              </div>
+            ) : null}
+          </>
         ) : null}
         <AboutRow
           label="What's New"

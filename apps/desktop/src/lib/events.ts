@@ -10,6 +10,8 @@ import { useMcpStore } from "@/store/mcp";
 import { useMemoryStore } from "@/store/memory";
 import { usePhenoMcpNoticeStore } from "@/store/pheno-mcp-notice";
 import { useScheduledStore } from "@/store/scheduled";
+import { useUpdateStore } from "@/store/update";
+import { useSessionWorkspaceStore } from "@/store/session-workspace";
 
 let started = false;
 
@@ -82,8 +84,30 @@ export function startIpcEvents(): void {
   void ipc.onScheduledChanged((e) => {
     useScheduledStore.getState().applyChanged(e);
   });
+  // #561 — the active workspace's git HEAD changed on disk (terminal checkout,
+  // rebase, or the assistant's own bash switching branches). Patch the cached
+  // `gitBranch` for every session sharing `path` in place — no reload, no
+  // remount. The backend's GitHeadWatcher debounces; this just applies the
+  // resolved `SessionWorkspace` payload.
+  void ipc.onWorkspaceBranchChanged((ws) => {
+    useSessionWorkspaceStore.getState().applyBranchChanged(ws);
+  });
   // No UI for intention signals yet (NeuroForge, M8) — observe only.
   void ipc.onIntention((e) => {
     console.debug("[signal:intention]", e.sessionId, e.goal);
+  });
+  // Self-update download progress (#566): feed the shared update store so the global
+  // update bar (#565) and Settings → About render a real progress bar. `bigint` on the
+  // wire -> `number` here (byte counts are within Number's safe range). The terminal
+  // event clears progress, flipping the UI to the indeterminate "finalizing" state
+  // until the backend relaunches.
+  void ipc.onUpdateProgress((e) => {
+    useUpdateStore.getState().setProgress({
+      downloaded: Number(e.downloaded),
+      total: e.total == null ? null : Number(e.total),
+    });
+  });
+  void ipc.onUpdateDownloadFinished(() => {
+    useUpdateStore.getState().setProgress(null);
   });
 }
