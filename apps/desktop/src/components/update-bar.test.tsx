@@ -36,6 +36,7 @@ beforeEach(() => {
     status: null,
     installing: false,
     dismissed: false,
+    progress: null,
   });
 });
 
@@ -130,5 +131,38 @@ describe("UpdateBar (#565)", () => {
     );
     expect(updateBtn).not.toBeNull();
     expect(updateBtn?.disabled).toBe(true);
+  });
+
+  it("renders a determinate progress bar while installing with a known total (#566)", () => {
+    useUpdateStore.setState({
+      status: { kind: "available", version: "9.9.9", notes: null },
+      installing: true,
+      progress: { downloaded: 25, total: 100 },
+    });
+    render(<UpdateBar />);
+    const bar = container.querySelector('[role="progressbar"]');
+    expect(bar).not.toBeNull();
+    expect(bar?.getAttribute("aria-valuenow")).toBe("25");
+  });
+
+  it("renders an indeterminate progress bar when total is unknown (#566)", () => {
+    useUpdateStore.setState({
+      status: { kind: "available", version: "9.9.9", notes: null },
+      installing: true,
+      progress: { downloaded: 1234, total: null },
+    });
+    render(<UpdateBar />);
+    const bar = container.querySelector('[role="progressbar"]');
+    expect(bar).not.toBeNull();
+    expect(bar?.getAttribute("aria-valuenow")).toBeNull();
+  });
+
+  it("shows no progress bar when not installing (#566)", () => {
+    useUpdateStore.setState({
+      status: { kind: "available", version: "9.9.9", notes: null },
+      installing: false,
+    });
+    render(<UpdateBar />);
+    expect(container.querySelector('[role="progressbar"]')).toBeNull();
   });
 });
