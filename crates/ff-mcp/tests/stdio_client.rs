@@ -22,7 +22,7 @@ fn echo_config() -> McpServerConfig {
 
 #[tokio::test]
 async fn handshake_lists_and_calls_a_tool_over_stdio() {
-    let client = McpClient::connect(&echo_config(), &[], None)
+    let client = McpClient::connect(&echo_config(), &[], None, &[])
         .await
         .expect("connect + initialize");
 
@@ -49,7 +49,7 @@ async fn handshake_lists_and_calls_a_tool_over_stdio() {
 
 #[tokio::test]
 async fn bad_arguments_are_rejected_before_dispatch() {
-    let client = McpClient::connect(&echo_config(), &[], None)
+    let client = McpClient::connect(&echo_config(), &[], None, &[])
         .await
         .expect("connect + initialize");
     let err = client
@@ -80,7 +80,7 @@ async fn connect_runs_the_child_in_the_configured_cwd() {
     // and the child reports its resolved cwd.
     let want = std::fs::canonicalize(dir.path()).expect("canonicalize tempdir");
 
-    let client = McpClient::connect(&cwd_config(), &["PATH"], Some(&want))
+    let client = McpClient::connect(&cwd_config(), &["PATH"], Some(&want), &[want.as_path()])
         .await
         .expect("connect + initialize");
     let out = client

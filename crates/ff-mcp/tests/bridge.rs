@@ -9,8 +9,8 @@ use std::time::Duration;
 
 use ff_core::{McpScope, McpServerConfig};
 use ff_mcp::{
-    build_bridged_tools, spawn_supervisor, McpBridgedTool, SharedConfig, SupervisorConfig,
-    SupervisorHandle,
+    build_bridged_tools, spawn_supervisor, InstanceKey, McpBridgedTool, SharedConfig,
+    SupervisorConfig, SupervisorHandle,
 };
 use ff_tools::Safety;
 use tokio::sync::mpsc;
@@ -35,6 +35,18 @@ fn echo_cfg() -> McpServerConfig {
         env: BTreeMap::new(),
         disabled: false,
         scope: McpScope::Global,
+    }
+}
+
+fn cwd_cfg() -> McpServerConfig {
+    McpServerConfig {
+        id: "cwd".into(),
+        command: env!("CARGO_BIN_EXE_mcp_cwd").to_string(),
+        args: vec![],
+        env: BTreeMap::new(),
+        // Workspace-scoped: one instance per session root (RFC 0018 §4.2).
+        scope: McpScope::Workspace,
+        disabled: false,
     }
 }
 
@@ -63,13 +75,13 @@ async fn tools_snapshot_contains_running_server_tools() {
 
     let tools = sup.tools_snapshot();
     assert!(!tools.is_empty(), "should have tools after Running");
-    let echo_tool = tools.iter().find(|t| t.name == "echo");
+    let echo_tool = tools.iter().find(|t| t.info.name == "echo");
     assert!(
         echo_tool.is_some(),
         "echo tool should be advertised; got: {:?}",
-        tools.iter().map(|t| &t.name).collect::<Vec<_>>()
+        tools.iter().map(|t| &t.info.name).collect::<Vec<_>>()
     );
-    assert_eq!(echo_tool.unwrap().server, "echo");
+    assert_eq!(echo_tool.unwrap().info.server, "echo");
 
     sup.stop_all().await;
 }
@@ -84,7 +96,7 @@ async fn call_tool_routes_through_supervisor() {
 
     let result = sup
         .call_tool(
-            "echo",
+            &InstanceKey::global("echo"),
             "echo",
             serde_json::json!({"message": "bridge-test"}),
         )
@@ -122,7 +134,7 @@ async fn bridged_tool_name_and_safety() {
 
     wait_running(&sup, Duration::from_secs(5)).await;
 
-    let bridged = build_bridged_tools(&sup);
+    let bridged = build_bridged_tools(&sup, std::path::Path::new("."));
     assert!(!bridged.is_empty());
     let tool = &bridged[0];
     assert_eq!(tool.name(), "mcp__echo__echo");
@@ -140,7 +152,7 @@ async fn bridged_tool_run_returns_result() {
 
     wait_running(&sup, Duration::from_secs(5)).await;
 
-    let bridged = build_bridged_tools(&sup);
+    let bridged = build_bridged_tools(&sup, std::path::Path::new("."));
     let tool = bridged
         .iter()
         .find(|t| t.name() == "mcp__echo__echo")
@@ -153,6 +165,74 @@ async fn bridged_tool_run_returns_result() {
         .await;
     assert!(outcome.success);
     assert!(outcome.content.contains("hello from tool"));
+
+    sup.stop_all().await;
+}
+
+/// RFC 0018 §4.6 acceptance: under two concurrent workspace sessions, a bridged tool
+/// built for one root routes its call to that root's instance. Both turns see the same
+/// model-facing name (`mcp__cwd__pwd`) but bind to distinct instances.
+#[tokio::test]
+async fn bridge_routes_to_per_root_instance() {
+    let shared: SharedConfig = Arc::new(RwLock::new(vec![cwd_cfg()]));
+    let (_tx, change_rx) = mpsc::unbounded_channel::<()>();
+    let sup = spawn_supervisor(shared, change_rx, fast_config());
+
+    let dir_a = tempfile::tempdir().expect("tempdir a");
+    let dir_b = tempfile::tempdir().expect("tempdir b");
+    let root_a = std::fs::canonicalize(dir_a.path()).unwrap();
+    let root_b = std::fs::canonicalize(dir_b.path()).unwrap();
+    sup.align_session("sa", root_a.clone()).await;
+    sup.align_session("sb", root_b.clone()).await;
+
+    // Wait for both per-root instances to be Running.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let running = sup
+            .status_snapshot()
+            .into_iter()
+            .filter(|s| s.id == "cwd" && s.state == ff_core::McpServerState::Running)
+            .count();
+        if running == 2 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "two per-root instances should reach Running"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // A turn on root_a sees exactly the cwd tool bound to root_a's instance.
+    let tools_a = build_bridged_tools(&sup, &root_a);
+    let pwd_a = tools_a
+        .iter()
+        .find(|t| t.name() == "mcp__cwd__pwd")
+        .expect("cwd tool bridged for root_a");
+    let out_a = pwd_a
+        .run(serde_json::Value::Null, std::path::Path::new("."))
+        .await;
+    assert!(out_a.success);
+    assert_eq!(
+        std::fs::canonicalize(out_a.content.trim()).unwrap(),
+        root_a,
+        "tool built for root_a must route to root_a's instance"
+    );
+
+    let tools_b = build_bridged_tools(&sup, &root_b);
+    let pwd_b = tools_b
+        .iter()
+        .find(|t| t.name() == "mcp__cwd__pwd")
+        .expect("cwd tool bridged for root_b");
+    let out_b = pwd_b
+        .run(serde_json::Value::Null, std::path::Path::new("."))
+        .await;
+    assert!(out_b.success);
+    assert_eq!(
+        std::fs::canonicalize(out_b.content.trim()).unwrap(),
+        root_b,
+        "tool built for root_b must route to root_b's instance"
+    );
 
     sup.stop_all().await;
 }

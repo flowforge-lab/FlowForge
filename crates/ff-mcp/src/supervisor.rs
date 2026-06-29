@@ -39,16 +39,17 @@
 //! Tokio runtime is still alive — the desktop wrapper invokes `stop_all` from the
 //! Tauri `RunEvent::ExitRequested` hook so reaping completes before exit.
 
-use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
-use ff_core::{McpServerConfig, McpServerState, McpServerStatus, McpToolInfo};
+use ff_core::{McpScope, McpServerConfig, McpServerState, McpServerStatus, McpToolInfo};
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::backoff::Backoff;
 use crate::client::McpClient;
+use crate::key::{InstanceKey, ScopeKey};
 use crate::reconcile::{reconcile, ReconcileAction};
 use crate::watch::SharedConfig;
 
@@ -56,10 +57,20 @@ use crate::watch::SharedConfig;
 /// rebuilt vec on every state change; readers never block on the actor.
 pub type SharedStatus = Arc<RwLock<Vec<McpServerStatus>>>;
 
+/// One advertised tool stamped with the [`InstanceKey`] of the instance that serves
+/// it, so the per-turn bridge can route a call to the right instance under concurrent
+/// workspace sessions (RFC 0018 §4.6).
+#[derive(Clone, Debug)]
+pub struct PublishedTool {
+    pub key: InstanceKey,
+    pub info: McpToolInfo,
+}
+
 /// The flat list of every `Running` server's tools, shared with the desktop shell so
 /// it can compose a per-turn [`ToolRegistry`](ff_tools::ToolRegistry) (M4.3 bridge).
+/// Each entry carries its serving instance's key for per-turn routing (RFC 0018 §4.6).
 /// Rebuilt by the actor whenever the running tool set changes; readers never block.
-pub type SharedTools = Arc<RwLock<Vec<McpToolInfo>>>;
+pub type SharedTools = Arc<RwLock<Vec<PublishedTool>>>;
 
 /// How long a single graceful `shutdown` may take before we give up and drop the
 /// client, letting `process_wrap`'s kill-on-drop reap the child. Bounds app-exit
@@ -148,7 +159,7 @@ impl SupervisorHandle {
 
     /// A snapshot of the currently advertised tools across all `Running` servers.
     /// Cheap read (clone of the shared vec under a read lock).
-    pub fn tools_snapshot(&self) -> Vec<McpToolInfo> {
+    pub fn tools_snapshot(&self) -> Vec<PublishedTool> {
         self.tools.read().unwrap_or_else(|p| p.into_inner()).clone()
     }
 
@@ -174,13 +185,13 @@ impl SupervisorHandle {
     /// running / the call failed / timed out.
     pub async fn call_tool(
         &self,
-        server: &str,
+        key: &InstanceKey,
         tool: &str,
         args: serde_json::Value,
     ) -> Result<String, crate::McpError> {
         let (reply_tx, reply_rx) = oneshot::channel();
         let cmd = Cmd::CallTool {
-            server: server.to_string(),
+            key: key.clone(),
             tool: tool.to_string(),
             args,
             reply: reply_tx,
@@ -205,19 +216,40 @@ impl SupervisorHandle {
         let _ = self.cmd_tx.send(Cmd::Restart { id: id.to_string() }).await;
     }
 
-    /// Set (or clear, with `None`) the working directory a server's child is spawned
-    /// in, restarting it if the directory changed so it re-spawns in the new dir. The
-    /// desktop points the workspace-aware server (codegraph) at the active session's
-    /// workspace this way (#548 W1b). Idempotent: an unchanged value is a no-op (no
-    /// restart). Awaits until the supervisor has applied it, so a caller can rely on
-    /// the new dir taking effect on the next connect.
-    pub async fn set_server_cwd(&self, id: &str, cwd: Option<PathBuf>) {
+    /// Align the supervisor's live instance set for `session_id`, now rooted at
+    /// `root`: the session references one workspace instance per `Workspace`-scoped
+    /// server in the watched config (RFC 0018 §4.3). The supervisor adds the session to
+    /// those instances' ref-lists, drops it from any it no longer references (evicting a
+    /// workspace instance whose ref-list empties), and proactively (re)starts each
+    /// referenced instance that is not `Running` -- the one place a codegraph parked in
+    /// `Failed` is revived for a new turn (RFC 0018 §4.5, #557 Finding 2). Awaits until
+    /// applied so the caller can snapshot tools right after.
+    pub async fn align_session(&self, session_id: &str, root: PathBuf) {
         let (ack_tx, ack_rx) = oneshot::channel();
         if self
             .cmd_tx
-            .send(Cmd::SetServerCwd {
-                id: id.to_string(),
-                cwd,
+            .send(Cmd::SetSessionRoot {
+                session_id: session_id.to_string(),
+                root,
+                ack: ack_tx,
+            })
+            .await
+            .is_err()
+        {
+            return;
+        }
+        let _ = ack_rx.await;
+    }
+
+    /// Drop `session_id` from every workspace instance's ref-list, evicting any whose
+    /// ref-list empties (RFC 0018 §4.3). Called when a session is closed/deleted so a
+    /// per-workspace codegraph is reaped once no live session references its path.
+    pub async fn release_session(&self, session_id: &str) {
+        let (ack_tx, ack_rx) = oneshot::channel();
+        if self
+            .cmd_tx
+            .send(Cmd::ReleaseSession {
+                session_id: session_id.to_string(),
                 ack: ack_tx,
             })
             .await
@@ -249,14 +281,18 @@ enum Cmd {
     Restart {
         id: String,
     },
-    SetServerCwd {
-        id: String,
-        cwd: Option<PathBuf>,
+    SetSessionRoot {
+        session_id: String,
+        root: PathBuf,
+        ack: oneshot::Sender<()>,
+    },
+    ReleaseSession {
+        session_id: String,
         ack: oneshot::Sender<()>,
     },
     StopAll(oneshot::Sender<()>),
     CallTool {
-        server: String,
+        key: InstanceKey,
         tool: String,
         args: serde_json::Value,
         reply: oneshot::Sender<Result<String, crate::McpError>>,
@@ -264,6 +300,10 @@ enum Cmd {
 }
 
 struct ServerHandle {
+    /// The instance key this handle is filed under (RFC 0018 §4.2): `(id, scope)`. A
+    /// workspace instance carries its canonical root here, used at connect for the MCP
+    /// root and the child cwd.
+    key: InstanceKey,
     /// The config the server was *started with*. `reconcile` compares against this so
     /// an unchanged definition produces no action.
     config: McpServerConfig,
@@ -287,9 +327,10 @@ struct ServerHandle {
 }
 
 impl ServerHandle {
-    fn new(config: McpServerConfig, sup: &SupervisorConfig) -> Self {
+    fn new(key: InstanceKey, config: McpServerConfig, sup: &SupervisorConfig) -> Self {
         let disabled = config.disabled;
         Self {
+            key,
             config,
             client: None,
             state: if disabled {
@@ -317,6 +358,7 @@ impl ServerHandle {
             last_error: self.last_error.clone(),
             restarts: self.restarts,
             pid: self.pid,
+            scope_key: self.key.scope.display(),
         }
     }
 }
@@ -336,7 +378,7 @@ pub fn spawn(
     let actor = Supervisor {
         config,
         handles: BTreeMap::new(),
-        cwd_overrides: BTreeMap::new(),
+        ws_refs: BTreeMap::new(),
         shared_config,
         status: Arc::clone(&status),
         tools: Arc::clone(&tools),
@@ -357,12 +399,11 @@ pub fn spawn(
 
 struct Supervisor {
     config: SupervisorConfig,
-    handles: BTreeMap<String, ServerHandle>,
-    /// Per-server working-directory overrides (id -> cwd). Applied at connect so a
-    /// workspace-aware server (codegraph) tracks the active workspace (#548 W1b). Held
-    /// in the actor rather than the shared config so a `mcp.json` reload cannot clobber
-    /// the runtime value.
-    cwd_overrides: BTreeMap<String, PathBuf>,
+    handles: BTreeMap<InstanceKey, ServerHandle>,
+    /// Per workspace-scoped instance, the set of live session ids referencing it
+    /// (RFC 0018 §4.3). A workspace instance is evicted when its set empties. Global
+    /// instances are not tracked here -- they are always-on, driven by `reconcile`.
+    ws_refs: BTreeMap<InstanceKey, BTreeSet<String>>,
     shared_config: SharedConfig,
     status: SharedStatus,
     tools: SharedTools,
@@ -393,8 +434,12 @@ impl Supervisor {
                 Some(cmd) = self.cmd_rx.recv() => match cmd {
                     Cmd::Reconcile => self.reconcile().await,
                     Cmd::Restart { id } => self.restart(&id).await,
-                    Cmd::SetServerCwd { id, cwd, ack } => {
-                        self.set_server_cwd(id, cwd).await;
+                    Cmd::SetSessionRoot { session_id, root, ack } => {
+                        self.set_session_root(session_id, root).await;
+                        let _ = ack.send(());
+                    }
+                    Cmd::ReleaseSession { session_id, ack } => {
+                        self.release_session(session_id).await;
                         let _ = ack.send(());
                     }
                     Cmd::StopAll(ack) => {
@@ -402,8 +447,8 @@ impl Supervisor {
                         let _ = ack.send(());
                         return;
                     }
-                    Cmd::CallTool { server, tool, args, reply } => {
-                        let result = self.do_call_tool(&server, &tool, args).await;
+                    Cmd::CallTool { key, tool, args, reply } => {
+                        let result = self.do_call_tool(&key, &tool, args).await;
                         let _ = reply.send(result);
                     }
                 },
@@ -412,101 +457,188 @@ impl Supervisor {
         }
     }
 
-    /// Snapshot the desired config and apply Stop / Restart / Start to close the gap.
+    /// Reconcile the **global-tier** instances against the watched config (RFC 0018
+    /// §4.1). Global servers are always-on as before; `Workspace`-scoped servers are
+    /// ref-driven ([`set_session_root`](Self::set_session_root)) and intentionally left
+    /// untouched here -- they have no root until a session references them. A workspace
+    /// server whose definition changed in the file is re-aligned on the next turn (its
+    /// config is re-read then).
     async fn reconcile(&mut self) {
-        let desired: Vec<McpServerConfig> = match self.shared_config.read() {
+        let all: Vec<McpServerConfig> = match self.shared_config.read() {
             Ok(g) => g.clone(),
             Err(_) => return,
         };
-        let running: Vec<McpServerConfig> =
-            self.handles.values().map(|h| h.config.clone()).collect();
+        let desired: Vec<McpServerConfig> = all
+            .into_iter()
+            .filter(|c| c.scope == McpScope::Global)
+            .collect();
+        let running: Vec<McpServerConfig> = self
+            .handles
+            .values()
+            .filter(|h| h.key.scope == ScopeKey::Global)
+            .map(|h| h.config.clone())
+            .collect();
         let actions = reconcile(&desired, &running);
 
         for action in actions {
             match action {
                 ReconcileAction::Stop(id) => {
-                    self.stop(&id).await;
-                    // Prune the per-server cwd override on true removal so a later
-                    // re-add can't inherit a stale workspace (#548 W1b follow-up).
-                    self.cwd_overrides.remove(&id);
+                    self.stop(&InstanceKey::global(&id)).await;
                 }
                 ReconcileAction::Restart(cfg) => {
-                    self.stop(&cfg.id).await;
-                    self.start(cfg).await;
+                    let key = InstanceKey::global(&cfg.id);
+                    self.stop(&key).await;
+                    self.start(key, cfg).await;
                 }
-                ReconcileAction::Start(cfg) => self.start(cfg).await,
+                ReconcileAction::Start(cfg) => {
+                    let key = InstanceKey::global(&cfg.id);
+                    self.start(key, cfg).await;
+                }
             }
         }
         self.publish();
     }
 
-    /// Manual restart of a single server (from [`SupervisorHandle::restart`]). Resolves
-    /// the definition from the live handle, falling back to the desired config, so even
-    /// a server parked in `Failed` (auto-retry exhausted) can be revived. Stops the
-    /// current client, then starts fresh — bypassing the backoff timer. A fresh handle
-    /// resets the auto-`restarts` counter, which is correct: that counter tracks
-    /// automatic recoveries since the last clean start. Unknown ids are a no-op.
+    /// Manual restart of a server by id (from [`SupervisorHandle::restart`]). Restarts
+    /// **every** live instance with that id -- the global one and any per-workspace ones
+    /// -- reusing each instance's key and config, so even one parked in `Failed`
+    /// (auto-retry exhausted) is revived. If no instance is live, a global-scoped config
+    /// entry is started fresh. Bypasses the backoff timer. Unknown ids are a no-op.
     async fn restart(&mut self, id: &str) {
-        let cfg = match self.handles.get(id) {
-            Some(h) => Some(h.config.clone()),
-            None => self
-                .shared_config
-                .read()
-                .ok()
-                .and_then(|g| g.iter().find(|c| c.id == id).cloned()),
-        };
-        let Some(cfg) = cfg else {
+        let targets: Vec<(InstanceKey, McpServerConfig)> = self
+            .handles
+            .iter()
+            .filter(|(k, _)| k.id == id)
+            .map(|(k, h)| (k.clone(), h.config.clone()))
+            .collect();
+        if targets.is_empty() {
+            let cfg = self.shared_config.read().ok().and_then(|g| {
+                g.iter()
+                    .find(|c| c.id == id && c.scope == McpScope::Global)
+                    .cloned()
+            });
+            if let Some(cfg) = cfg {
+                self.start(InstanceKey::global(id), cfg).await;
+                self.publish();
+            }
             return;
-        };
-        self.stop(id).await;
-        self.start(cfg).await;
+        }
+        for (key, cfg) in targets {
+            self.stop(&key).await;
+            self.start(key, cfg).await;
+        }
         self.publish();
     }
 
-    /// Apply a per-server cwd override and restart the server if the directory changed,
-    /// so it re-spawns in the new working directory (#548 W1b). No-op when the value is
-    /// unchanged, the server is unknown, or it is disabled (the override still takes
-    /// effect when the user later enables it).
-    async fn set_server_cwd(&mut self, id: String, cwd: Option<PathBuf>) {
-        if self.cwd_overrides.get(&id) == cwd.as_ref() {
-            return;
+    /// Recompute the workspace instances `session_id` references now that it is rooted
+    /// at `root`: update ref-lists, evict emptied workspace instances, and proactively
+    /// (re)start each referenced instance that is not `Running` (RFC 0018 §4.3, §4.5).
+    async fn set_session_root(&mut self, session_id: String, root: PathBuf) {
+        // The workspace-scoped servers this session wants, keyed at its canonical root.
+        // C2's resolved set is the global-tier file filtered to `scope: workspace`; C3
+        // merges phenotype/session tiers (the desktop then computes the desired set).
+        let scope_key = ScopeKey::workspace(&root);
+        let wanted: BTreeMap<InstanceKey, McpServerConfig> = match self.shared_config.read() {
+            Ok(g) => g
+                .iter()
+                .filter(|c| c.scope == McpScope::Workspace && !c.disabled)
+                .map(|c| {
+                    (
+                        InstanceKey {
+                            id: c.id.clone(),
+                            scope: scope_key.clone(),
+                        },
+                        c.clone(),
+                    )
+                })
+                .collect(),
+            Err(_) => return,
+        };
+
+        // Drop this session from any workspace instance it no longer references.
+        let stale: Vec<InstanceKey> = self
+            .ws_refs
+            .iter()
+            .filter(|(k, refs)| refs.contains(&session_id) && !wanted.contains_key(k))
+            .map(|(k, _)| k.clone())
+            .collect();
+        for key in stale {
+            self.release_ref(&key, &session_id).await;
         }
-        match &cwd {
-            Some(p) => {
-                self.cwd_overrides.insert(id.clone(), p.clone());
-            }
-            None => {
-                self.cwd_overrides.remove(&id);
-            }
+
+        // Add this session to each wanted instance, (re)starting it as needed.
+        for (key, cfg) in wanted {
+            self.ws_refs
+                .entry(key.clone())
+                .or_default()
+                .insert(session_id.clone());
+            self.ensure_running(key, cfg).await;
         }
-        let restartable = self
-            .handles
-            .get(&id)
-            .is_some_and(|h| h.state != McpServerState::Disabled);
-        if restartable {
-            self.restart(&id).await;
+        self.publish();
+    }
+
+    /// Drop `session_id` from every workspace instance ref-list, evicting any that
+    /// empties (RFC 0018 §4.3).
+    async fn release_session(&mut self, session_id: String) {
+        let keys: Vec<InstanceKey> = self
+            .ws_refs
+            .iter()
+            .filter(|(_, refs)| refs.contains(&session_id))
+            .map(|(k, _)| k.clone())
+            .collect();
+        for key in keys {
+            self.release_ref(&key, &session_id).await;
+        }
+        self.publish();
+    }
+
+    /// Remove one session's reference to a workspace instance; if the ref-list empties,
+    /// stop and forget the instance (RFC 0018 §4.3).
+    async fn release_ref(&mut self, key: &InstanceKey, session_id: &str) {
+        if let Some(refs) = self.ws_refs.get_mut(key) {
+            refs.remove(session_id);
+            if refs.is_empty() {
+                self.ws_refs.remove(key);
+                self.stop(key).await;
+            }
         }
     }
 
-    async fn start(&mut self, cfg: McpServerConfig) {
-        let id = cfg.id.clone();
+    /// Ensure a referenced workspace instance exists, runs the current config, and is
+    /// `Running` -- proactively (re)starting it otherwise (RFC 0018 §4.5). A changed
+    /// definition (command/args/env/disabled) restarts; a `Failed`/`Restarting`/exited
+    /// instance is revived for this turn.
+    async fn ensure_running(&mut self, key: InstanceKey, cfg: McpServerConfig) {
+        match self.handles.get(&key) {
+            Some(h) if h.config != cfg => {
+                self.stop(&key).await;
+                self.start(key, cfg).await;
+            }
+            Some(h) if h.state == McpServerState::Running => {}
+            Some(_) => self.try_connect(&key).await,
+            None => self.start(key, cfg).await,
+        }
+    }
+
+    async fn start(&mut self, key: InstanceKey, cfg: McpServerConfig) {
         if cfg.disabled {
             // Reconcile wouldn't ask for this, but be defensive.
-            let mut handle = ServerHandle::new(cfg, &self.config);
+            let mut handle = ServerHandle::new(key.clone(), cfg, &self.config);
             handle.state = McpServerState::Disabled;
-            self.handles.insert(id, handle);
+            self.handles.insert(key, handle);
             return;
         }
-        let handle = ServerHandle::new(cfg, &self.config);
-        self.handles.insert(id.clone(), handle);
-        self.try_connect(&id).await;
+        let handle = ServerHandle::new(key.clone(), cfg, &self.config);
+        self.handles.insert(key.clone(), handle);
+        self.try_connect(&key).await;
     }
 
-    async fn stop(&mut self, id: &str) {
-        if let Some(mut handle) = self.handles.remove(id) {
+    async fn stop(&mut self, key: &InstanceKey) {
+        if let Some(mut handle) = self.handles.remove(key) {
             if let Some(client) = handle.client.take() {
                 // Bound the graceful close: a wedged child must not stall app exit.
                 // On timeout we drop the client and let kill-on-drop reap it.
+                let id = &key.id;
                 match tokio::time::timeout(SHUTDOWN_TIMEOUT, client.shutdown()).await {
                     Ok(Ok(())) => {}
                     Ok(Err(e)) => tracing::warn!(server = id, error = %e, "mcp shutdown"),
@@ -519,22 +651,22 @@ impl Supervisor {
     }
 
     async fn stop_all(&mut self) {
-        let ids: Vec<String> = self.handles.keys().cloned().collect();
-        for id in ids {
-            self.stop(&id).await;
+        let keys: Vec<InstanceKey> = self.handles.keys().cloned().collect();
+        for key in keys {
+            self.stop(&key).await;
         }
         self.publish();
     }
 
     /// Attempt a connect for `id`. Updates state, tool_count, pid, error, and the
     /// retry schedule based on the outcome.
-    async fn try_connect(&mut self, id: &str) {
-        let cfg = match self.handles.get(id) {
+    async fn try_connect(&mut self, key: &InstanceKey) {
+        let cfg = match self.handles.get(key) {
             Some(h) => h.config.clone(),
             None => return,
         };
         // Mark Starting + publish so the UI sees the transition.
-        if let Some(h) = self.handles.get_mut(id) {
+        if let Some(h) = self.handles.get_mut(key) {
             h.state = McpServerState::Starting;
             h.pid = None;
         }
@@ -546,8 +678,12 @@ impl Supervisor {
             .iter()
             .map(String::as_str)
             .collect();
-        let cwd = self.cwd_overrides.get(id).cloned();
-        let connect_result = McpClient::connect(&cfg, &allow_refs, cwd.as_deref()).await;
+        // A workspace instance learns its checkout from its key's root: advertised as
+        // an MCP root and set as the child cwd (belt-and-braces). A global instance has
+        // no root (RFC 0018 §4.4).
+        let root = key.scope.root().map(Path::to_path_buf);
+        let roots: Vec<&Path> = root.as_deref().into_iter().collect();
+        let connect_result = McpClient::connect(&cfg, &allow_refs, root.as_deref(), &roots).await;
         let outcome = match connect_result {
             Ok(client) => match client.list_tools().await {
                 Ok(tools) => Ok((client, tools)),
@@ -560,7 +696,7 @@ impl Supervisor {
         };
 
         let max_failures = self.config.max_failures;
-        let Some(h) = self.handles.get_mut(id) else {
+        let Some(h) = self.handles.get_mut(key) else {
             return;
         };
         match outcome {
@@ -604,17 +740,17 @@ impl Supervisor {
     /// servers due for a health check.
     async fn on_tick(&mut self) {
         let now = Instant::now();
-        let mut due_retry: Vec<String> = Vec::new();
-        let mut due_probe: Vec<String> = Vec::new();
-        let mut proven_healthy: Vec<String> = Vec::new();
+        let mut due_retry: Vec<InstanceKey> = Vec::new();
+        let mut due_probe: Vec<InstanceKey> = Vec::new();
+        let mut proven_healthy: Vec<InstanceKey> = Vec::new();
 
-        for (id, h) in &self.handles {
+        for (key, h) in &self.handles {
             match h.state {
                 McpServerState::Restarting => {
                     if h.failures < self.config.max_failures
                         && h.next_retry_at.map(|t| now >= t).unwrap_or(true)
                     {
-                        due_retry.push(id.clone());
+                        due_retry.push(key.clone());
                     }
                 }
                 McpServerState::Running => {
@@ -627,45 +763,45 @@ impl Supervisor {
                             .map(|t| now.duration_since(t) >= self.config.min_healthy_uptime)
                             .unwrap_or(false);
                     if proven {
-                        proven_healthy.push(id.clone());
+                        proven_healthy.push(key.clone());
                     }
                     let due = h
                         .last_health_check
                         .map(|t| now.duration_since(t) >= self.config.health_interval)
                         .unwrap_or(true);
                     if due {
-                        due_probe.push(id.clone());
+                        due_probe.push(key.clone());
                     }
                 }
                 _ => {}
             }
         }
 
-        for id in proven_healthy {
-            if let Some(h) = self.handles.get_mut(&id) {
+        for key in proven_healthy {
+            if let Some(h) = self.handles.get_mut(&key) {
                 h.failures = 0;
                 h.backoff.reset();
             }
         }
-        for id in due_retry {
-            self.try_connect(&id).await;
+        for key in due_retry {
+            self.try_connect(&key).await;
         }
-        for id in due_probe {
-            self.health_probe(&id).await;
+        for key in due_probe {
+            self.health_probe(&key).await;
         }
     }
 
     /// `list_tools` against the live client; treat errors like a crash.
-    async fn health_probe(&mut self, id: &str) {
+    async fn health_probe(&mut self, key: &InstanceKey) {
         // Take the client out so we can `await` without holding a `&mut` borrow on
         // `self.handles`. Put it back if the probe succeeds.
-        let client = match self.handles.get_mut(id).and_then(|h| h.client.take()) {
+        let client = match self.handles.get_mut(key).and_then(|h| h.client.take()) {
             Some(c) => c,
             None => return,
         };
         let result = client.list_tools().await;
         let max_failures = self.config.max_failures;
-        let Some(h) = self.handles.get_mut(id) else {
+        let Some(h) = self.handles.get_mut(key) else {
             // Server was removed mid-probe: drop the client.
             let _ = client.shutdown().await;
             return;
@@ -699,8 +835,11 @@ impl Supervisor {
     }
 
     fn publish(&self) {
+        // `handles` is a BTreeMap keyed by `(id, scope)`, so `values()` already yields
+        // a deterministic id-then-scope order; the explicit sort keeps the published
+        // contract (id-sorted, instances of one id grouped) independent of that.
         let mut snap: Vec<McpServerStatus> = self.handles.values().map(|h| h.snapshot()).collect();
-        snap.sort_by(|a, b| a.id.cmp(&b.id));
+        snap.sort_by(|a, b| a.id.cmp(&b.id).then(a.scope_key.cmp(&b.scope_key)));
         // Recover from a poisoned lock rather than skipping: we fully overwrite the
         // Vec, so a previous writer's panic can't leave bad data behind, and skipping
         // would otherwise freeze the published status permanently. Matches the
@@ -708,11 +847,16 @@ impl Supervisor {
         *self.status.write().unwrap_or_else(|p| p.into_inner()) = snap;
         // Rebuild the flat tool list for the bridge (M4.3). Only Running servers
         // contribute; Restarting/Failed ones have empty tool vecs anyway.
-        let all_tools: Vec<McpToolInfo> = self
+        let all_tools: Vec<PublishedTool> = self
             .handles
             .values()
             .filter(|h| h.state == McpServerState::Running)
-            .flat_map(|h| h.tools.iter().cloned())
+            .flat_map(|h| {
+                h.tools.iter().cloned().map(|info| PublishedTool {
+                    key: h.key.clone(),
+                    info,
+                })
+            })
             .collect();
         *self.tools.write().unwrap_or_else(|p| p.into_inner()) = all_tools;
         // Wake any status subscriber (the desktop shell's event forwarder). Coalescing
@@ -728,13 +872,14 @@ impl Supervisor {
     /// intact, preserving clean reaping and graceful close (see RFC 0003 §6).
     async fn do_call_tool(
         &mut self,
-        server: &str,
+        key: &InstanceKey,
         tool: &str,
         args: serde_json::Value,
     ) -> Result<String, crate::McpError> {
+        let server = &key.id;
         let client = self
             .handles
-            .get_mut(server)
+            .get_mut(key)
             .and_then(|h| {
                 if h.state == McpServerState::Running {
                     h.client.take()
@@ -766,7 +911,7 @@ impl Supervisor {
         // preemption the in-flight request is intentionally left to resolve-and-drop:
         // rmcp multiplexes by request id, so a late response to the abandoned call
         // won't be mismatched against the next call on the reused client.
-        if let Some(h) = self.handles.get_mut(server) {
+        if let Some(h) = self.handles.get_mut(key) {
             h.client = Some(client);
         }
 

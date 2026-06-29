@@ -4,4 +4,10 @@ import type { McpServerState } from "./McpServerState";
 /**
  * A snapshot of one server's status for the UI / supervisor.
  */
-export type McpServerStatus = { id: string, state: McpServerState, toolCount: number, lastError?: string, restarts: number, pid?: number, };
+export type McpServerStatus = { id: string, state: McpServerState, toolCount: number, lastError?: string, restarts: number, pid?: number, 
+/**
+ * For a workspace-scoped instance, a short label for its root (the path) so the
+ * UI can disambiguate two instances of the same server id (RFC 0018 section 4.2).
+ * `None` for a global instance.
+ */
+scopeKey?: string, };

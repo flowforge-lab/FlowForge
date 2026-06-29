@@ -6,27 +6,34 @@
 //! Every bridged tool defaults to `Safety::Write` so it is approval-gated — external
 //! code touching the user's machine is never auto-run.
 //!
-//! # Turn lifecycle
+//! # Turn lifecycle & instance routing
 //!
-//! `build_bridged_tools(handle)` snapshots the supervisor's tool list and returns
-//! `Box<dyn Tool>` instances ready for `ToolRegistry::register`. The snapshot is
-//! taken once per turn so a hot-reload mid-turn never races an in-flight call.
+//! [`build_bridged_tools`] snapshots the supervisor's tool list and returns
+//! `Box<dyn Tool>` instances ready for `ToolRegistry::register`. The snapshot is taken
+//! once per turn so a hot-reload mid-turn never races an in-flight call.
+//!
+//! Each tool is bound to the [`InstanceKey`] of the instance that serves it (RFC 0018
+//! §4.6). For a turn on workspace `/A`, only `Global` instances and the `Workspace(/A)`
+//! instances are exposed, and a `mcp__codegraph__context` call routes to
+//! `Workspace(/A)`; the same-named call in a concurrent turn on `/B` routes to
+//! `Workspace(/B)`. The model-facing name stays stable across instances.
 
 use async_trait::async_trait;
 use serde_json::Value;
 use std::path::Path;
 
-use ff_core::McpToolInfo;
 use ff_tools::{Safety, Tool, ToolOutcome};
 
+use crate::key::{InstanceKey, ScopeKey};
 use crate::supervisor::SupervisorHandle;
 
 /// A single MCP tool exposed through the `ToolRegistry`. Routes calls through the
-/// [`SupervisorHandle`] so the supervisor's actor (which owns the live client) does
-/// the actual `call_tool` — preserving single-ownership + clean reaping.
+/// [`SupervisorHandle`] (keyed by the bound [`InstanceKey`]) so the supervisor's actor
+/// — which owns the live client — does the actual `call_tool`, preserving
+/// single-ownership + clean reaping.
 pub struct McpBridgedTool {
     handle: SupervisorHandle,
-    server: String,
+    key: InstanceKey,
     tool_name: String,
     full_name: String,
     description: String,
@@ -39,11 +46,11 @@ impl McpBridgedTool {
         format!("mcp__{server}__{tool}")
     }
 
-    fn new(handle: SupervisorHandle, info: &McpToolInfo) -> Self {
-        let full_name = Self::namespaced_name(&info.server, &info.name);
+    fn new(handle: SupervisorHandle, key: InstanceKey, info: &ff_core::McpToolInfo) -> Self {
+        let full_name = Self::namespaced_name(&key.id, &info.name);
         Self {
             handle,
-            server: info.server.clone(),
+            key,
             tool_name: info.name.clone(),
             full_name,
             description: info.description.clone(),
@@ -74,7 +81,7 @@ impl Tool for McpBridgedTool {
     async fn run(&self, args: Value, _root: &Path) -> ToolOutcome {
         match self
             .handle
-            .call_tool(&self.server, &self.tool_name, args)
+            .call_tool(&self.key, &self.tool_name, args)
             .await
         {
             Ok(text) => ToolOutcome::ok(text),
@@ -83,14 +90,23 @@ impl Tool for McpBridgedTool {
     }
 }
 
-/// Snapshot the supervisor's running tools and build bridge instances ready for
-/// registration. Call once per turn so the model sees exactly the tools that were
-/// live at turn start (RFC 0003 §6, same discipline as skill snapshots).
-pub fn build_bridged_tools(handle: &SupervisorHandle) -> Vec<Box<dyn Tool>> {
+/// Snapshot the supervisor's running tools and build bridge instances for the turn on
+/// `session_root`. Only the tools served by instances this session resolves to are
+/// included: every `Global` instance plus the `Workspace(session_root)` instances
+/// (RFC 0018 §4.6). Call once per turn so the model sees exactly the tools that were
+/// live at turn start (same discipline as skill snapshots).
+pub fn build_bridged_tools(handle: &SupervisorHandle, session_root: &Path) -> Vec<Box<dyn Tool>> {
+    let session_scope = ScopeKey::workspace(session_root);
     handle
         .tools_snapshot()
-        .iter()
-        .map(|info| Box::new(McpBridgedTool::new(handle.clone(), info)) as Box<dyn Tool>)
+        .into_iter()
+        .filter(|t| match &t.key.scope {
+            ScopeKey::Global => true,
+            ScopeKey::Workspace(_) => t.key.scope == session_scope,
+        })
+        .map(|t| {
+            Box::new(McpBridgedTool::new(handle.clone(), t.key.clone(), &t.info)) as Box<dyn Tool>
+        })
         .collect()
 }
 
