@@ -9,6 +9,7 @@ import { useSkillsStore } from "@/store/skills";
 import { useMcpStore } from "@/store/mcp";
 import { useMemoryStore } from "@/store/memory";
 import { usePhenoMcpNoticeStore } from "@/store/pheno-mcp-notice";
+import { useSessionWorkspaceStore } from "@/store/session-workspace";
 
 let started = false;
 
@@ -67,6 +68,14 @@ export function startIpcEvents(): void {
   // never blocks; this is informational.
   void ipc.onPhenotypeMcpUnavailable((e) => {
     usePhenoMcpNoticeStore.getState().show(e);
+  });
+  // #561 — the active workspace's git HEAD changed on disk (terminal checkout,
+  // rebase, or the assistant's own bash switching branches). Patch the cached
+  // `gitBranch` for every session sharing `path` in place — no reload, no
+  // remount. The backend's GitHeadWatcher debounces; this just applies the
+  // resolved `SessionWorkspace` payload.
+  void ipc.onWorkspaceBranchChanged((ws) => {
+    useSessionWorkspaceStore.getState().applyBranchChanged(ws);
   });
   // No UI for intention signals yet (NeuroForge, M8) — observe only.
   void ipc.onIntention((e) => {

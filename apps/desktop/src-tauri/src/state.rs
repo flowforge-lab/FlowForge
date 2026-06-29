@@ -12,13 +12,15 @@ use ff_agent::{
 use ff_core::{
     model_supports_documents, model_supports_vision, BedrockAuth, McpServerState, McpServerStatus,
     Mode, ModelSelection, Phenotype, ProviderConfig, ProviderConnection, ProviderKind,
-    ProviderRegistry, ResolvedModel, SearchConfig, SecretKind,
+    ProviderRegistry, ResolvedModel, SearchConfig, SecretKind, SessionWorkspace,
 };
 use ff_llm::{
     reasoning_control, wire_dialect, BedrockCreds, BedrockProvider, OllamaProvider, OpenAiProvider,
     Provider,
 };
 use ff_mcp::{McpConfigWatcher, SupervisorHandle};
+
+use crate::git_watch::GitHeadWatcher;
 use ff_memory::watch::MemoryWatcher;
 use ff_memory::{
     EmbeddingProvider, FlushLedger, Fts5Index, HybridIndex, Memory, MemoryConfig, MemoryIndex,
@@ -782,6 +784,10 @@ pub struct AppState {
     /// (the supervisor needs a live Tokio runtime to spawn its actor) and `None`
     /// when no `mcp.json` is present or the watcher cannot start.
     _mcp_watcher: Mutex<Option<McpConfigWatcher>>,
+    /// Owns the git HEAD watcher (#561); dropping it stops live branch sync. `Mutex`
+    /// for `Sync` (the `notify` watcher is `Send` but not `Sync`); `None` when the
+    /// watcher could not start. Re-pointed per active session by [`align_git_watcher`](Self::align_git_watcher).
+    _git_watcher: Mutex<Option<GitHeadWatcher>>,
     mcp: Mutex<Option<SupervisorHandle>>,
     /// Path to the watched `mcp.json`, captured when [`init_mcp_at`](Self::init_mcp_at)
     /// runs. The MCP control commands write back to this exact file so their edits flow
@@ -850,6 +856,7 @@ impl AppState {
             default_mode: Mutex::new(load_default_mode()),
             signals: Mutex::new(load_signals()),
             _mcp_watcher: Mutex::new(None),
+            _git_watcher: Mutex::new(None),
             mcp: Mutex::new(None),
             mcp_config_path: Mutex::new(None),
             memory,
@@ -1162,6 +1169,37 @@ impl AppState {
         if let Some(sup) = self.mcp_handle() {
             sup.set_server_cwd(CODEGRAPH_SERVER_ID, Some(root.to_path_buf()))
                 .await;
+        }
+    }
+
+    /// Start the git HEAD watcher (#561 BE half) and store it. Returns the receiver
+    /// that yields a `SessionWorkspace` after each changed branch resolution so the
+    /// caller (the Tauri `setup` hook) can forward it as `workspace:branch-changed`.
+    /// `None` when the watcher could not start -- live branch sync then degrades to
+    /// off rather than failing app startup. Mirrors [`init_mcp`](Self::init_mcp): the
+    /// watcher is parked in `AppState` and re-pointed per turn by
+    /// [`align_git_watcher`](Self::align_git_watcher).
+    pub fn init_git_watcher(
+        &self,
+    ) -> Option<tokio::sync::mpsc::UnboundedReceiver<SessionWorkspace>> {
+        match GitHeadWatcher::spawn() {
+            Ok((watcher, rx)) => {
+                *self._git_watcher.lock().unwrap() = Some(watcher);
+                Some(rx)
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "git head watcher unavailable");
+                None
+            }
+        }
+    }
+
+    /// Aim the git HEAD watcher at the active session's `root`, mirroring
+    /// [`align_codegraph_workspace`](Self::align_codegraph_workspace). Idempotent and
+    /// best-effort: a no-op when the watcher could not start or `root` is unchanged.
+    pub fn align_git_watcher(&self, root: &Path) {
+        if let Some(w) = self._git_watcher.lock().unwrap().as_mut() {
+            w.re_point(root);
         }
     }
 
