@@ -42,6 +42,21 @@ jobs:
       - name: cargo test
         run: cargo test --workspace
 
+  windows-check:
+    name: Windows (compile check)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # ff-tools carries the only #[cfg(windows)] code (process Job Object kill
+      # path). The Linux job never compiles it, so this guards against bit-rot.
+      - name: cargo check (ff-tools)
+        run: cargo check -p ff-tools --all-targets
+
   web:
     name: Web (typecheck, lint, format, build)
     runs-on: ubuntu-latest

@@ -20,7 +20,11 @@
 //!   covers it (`poll`/`list` are read-only).
 //! - On Unix each process is spawned in its **own process group** so `stop` can
 //!   signal the whole tree (a dev server and its children), SIGTERM then SIGKILL
-//!   after a grace window. Non-Unix platforms can start/poll/list but not stop.
+//!   after a grace window. On Windows each process is placed in a kill-on-close
+//!   Job Object, so `stop` (and supervisor drop, and even a FlowForge crash --
+//!   the OS closes the handle) kills the whole tree; `taskkill /T /F` is the
+//!   fallback if job assignment fails. Only other (non-unix, non-windows)
+//!   platforms can start/poll/list but not stop.
 
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
@@ -36,6 +40,33 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 
 use crate::registry::{Safety, Tool, ToolOutcome, NO_SESSION};
+#[cfg(windows)]
+use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+#[cfg(windows)]
+use windows_sys::Win32::System::JobObjects::{
+    AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+    SetInformationJobObject, TerminateJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+};
+
+/// Owns a Job Object handle. The job is created with `KILL_ON_JOB_CLOSE`, so the
+/// kernel kills every member when the last handle closes -- on `stop`, on
+/// supervisor drop, or even if FlowForge crashes (the OS closes the handle).
+#[cfg(windows)]
+struct JobHandle(HANDLE);
+
+// The raw `HANDLE` is only ever touched under the supervisor's `Mutex`.
+#[cfg(windows)]
+unsafe impl Send for JobHandle {}
+
+#[cfg(windows)]
+impl Drop for JobHandle {
+    fn drop(&mut self) {
+        unsafe {
+            CloseHandle(self.0);
+        }
+    }
+}
 
 /// Most concurrent *running* processes the supervisor will hold. A `start` past
 /// this is rejected so a runaway agent cannot leak unbounded children.
@@ -127,6 +158,11 @@ struct ManagedProcess {
     command: String,
     started_at: DateTime<Utc>,
     pid: Option<u32>,
+    /// Windows-only: the kill-on-close Job Object the process was assigned to.
+    /// `None` if job creation/assignment failed (the `stop` path falls back to
+    /// `taskkill /T /F`).
+    #[cfg(windows)]
+    job: Option<JobHandle>,
     shared: Arc<Shared>,
     /// Owning session ([`crate::registry::NO_SESSION`] if anonymous — the
     /// `run` path). Only the same session may poll/list/stop it.
@@ -192,6 +228,12 @@ impl ProcessSupervisor {
             .spawn()
             .map_err(|e| format!("failed to spawn process ({shell} -c): {e}"))?;
         let pid = child.id();
+        // Place the child (and its descendants) in a kill-on-close Job Object so
+        // `stop`/drop can terminate the whole tree -- the Windows analogue of the
+        // unix process group above. Must happen before `child` is moved into the
+        // exit-watcher task below. `None` falls back to `taskkill` at stop time.
+        #[cfg(windows)]
+        let job = child.raw_handle().and_then(assign_to_new_job);
         let shared = Arc::new(Shared::new(MAX_BUFFER_BYTES));
 
         if let Some(out) = child.stdout.take() {
@@ -216,6 +258,8 @@ impl ProcessSupervisor {
                 command: command.to_string(),
                 started_at: Utc::now(),
                 pid,
+                #[cfg(windows)]
+                job,
                 shared,
                 session_id: session_id.to_string(),
                 last_poll_at: Instant::now(),
@@ -309,7 +353,30 @@ impl ProcessSupervisor {
                 shared.status().label()
             ))
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        {
+            // Primary: terminate the whole Job Object (the process and every
+            // descendant) in one call. Fallback: taskkill the pid tree.
+            let terminated = {
+                let map = self.procs.lock().unwrap();
+                map.get(&id)
+                    .and_then(|p| p.job.as_ref())
+                    .map(|j| unsafe { TerminateJobObject(j.0, 1) != 0 })
+                    .unwrap_or(false)
+            };
+            if !terminated {
+                let _ = Command::new("taskkill")
+                    .args(["/PID", &pid.to_string(), "/T", "/F"])
+                    .output()
+                    .await;
+            }
+            wait_until_exited(&shared, STOP_GRACE).await;
+            Ok(format!(
+                "process {id} stopped ({})",
+                shared.status().label()
+            ))
+        }
+        #[cfg(not(any(unix, windows)))]
         {
             let _ = pid;
             Err("stopping processes is not supported on this platform".to_string())
@@ -382,6 +449,26 @@ impl Drop for ProcessSupervisor {
                 }
             }
         }
+        // The JobHandle's own Drop (CloseHandle -> KILL_ON_JOB_CLOSE) is the
+        // guaranteed net; terminate eagerly here too so the tree dies now rather
+        // than whenever the map entry is dropped.
+        #[cfg(windows)]
+        if let Ok(map) = self.procs.lock() {
+            for p in map.values() {
+                if !p.shared.status().is_running() {
+                    continue;
+                }
+                if let Some(job) = &p.job {
+                    unsafe {
+                        TerminateJobObject(job.0, 1);
+                    }
+                } else if let Some(pid) = p.pid {
+                    let _ = std::process::Command::new("taskkill")
+                        .args(["/PID", &pid.to_string(), "/T", "/F"])
+                        .spawn();
+                }
+            }
+        }
     }
 }
 
@@ -404,7 +491,7 @@ async fn drain<R: AsyncRead + Unpin>(mut reader: R, shared: Arc<Shared>, is_err:
 }
 
 /// Poll the shared status until it leaves `Running` or `budget` elapses.
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 async fn wait_until_exited(shared: &Shared, budget: Duration) {
     let deadline = Instant::now() + budget;
     while Instant::now() < deadline {
@@ -421,6 +508,33 @@ async fn wait_until_exited(shared: &Shared, budget: Duration) {
 fn signal_group(pid: u32, sig: i32) {
     unsafe {
         libc::kill(-(pid as i32), sig);
+    }
+}
+
+/// Create a kill-on-close Job Object and assign `process` to it. Returns the
+/// owning handle, or `None` if any step fails (the caller falls back to
+/// `taskkill`). Closing the returned handle kills every job member.
+#[cfg(windows)]
+fn assign_to_new_job(process: std::os::windows::io::RawHandle) -> Option<JobHandle> {
+    unsafe {
+        let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+        if job.is_null() {
+            return None;
+        }
+        let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        let ok = SetInformationJobObject(
+            job,
+            JobObjectExtendedLimitInformation,
+            &info as *const _ as *const core::ffi::c_void,
+            std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        ) != 0
+            && AssignProcessToJobObject(job, process as HANDLE) != 0;
+        if !ok {
+            CloseHandle(job);
+            return None;
+        }
+        Some(JobHandle(job))
     }
 }
 
