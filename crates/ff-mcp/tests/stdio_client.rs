@@ -4,7 +4,7 @@
 
 use std::collections::BTreeMap;
 
-use ff_core::McpServerConfig;
+use ff_core::{McpScope, McpServerConfig};
 use ff_mcp::McpClient;
 
 fn echo_config() -> McpServerConfig {
@@ -16,6 +16,7 @@ fn echo_config() -> McpServerConfig {
         args: vec![],
         env: BTreeMap::new(),
         disabled: false,
+        scope: McpScope::Global,
     }
 }
 
@@ -66,6 +67,7 @@ fn cwd_config() -> McpServerConfig {
         args: vec![],
         env: BTreeMap::new(),
         disabled: false,
+        scope: McpScope::Global,
     }
 }
 

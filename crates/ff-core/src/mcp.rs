@@ -7,6 +7,26 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
+/// Where an MCP server instance is keyed (RFC 0018 §4.1). `Global` keeps RFC 0003's
+/// one-instance-per-id semantics; `Workspace` runs one instance per distinct
+/// workspace root. Absent in `mcp.json` means `Global`, so existing configs are
+/// unchanged.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "lowercase")]
+#[ts(export, export_to = "../../../apps/desktop/src/bindings/")]
+pub enum McpScope {
+    #[default]
+    Global,
+    Workspace,
+}
+
+impl McpScope {
+    /// Predicate for `skip_serializing_if`: omit `scope` when it is the default `Global`.
+    pub fn is_global(&self) -> bool {
+        matches!(self, McpScope::Global)
+    }
+}
+
 /// One external MCP server definition, as it appears in `~/.flowforge/mcp.json`
 /// (Claude/Cursor `mcpServers` shape).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
@@ -21,6 +41,8 @@ pub struct McpServerConfig {
     pub env: BTreeMap<String, String>,
     #[serde(default)]
     pub disabled: bool,
+    #[serde(default, skip_serializing_if = "McpScope::is_global")]
+    pub scope: McpScope,
 }
 
 /// Lifecycle state of a supervised MCP server (RFC 0003 §5). The supervisor (M4.2)
@@ -94,12 +116,37 @@ mod tests {
             ],
             env: BTreeMap::from([("LOG_LEVEL".to_string(), "info".to_string())]),
             disabled: false,
+            scope: McpScope::Global,
         };
         round_trip(&cfg);
         // `disabled` defaults so a minimal config parses.
         let minimal: McpServerConfig =
             serde_json::from_str(r#"{"id":"x","command":"echo"}"#).unwrap();
         assert!(minimal.args.is_empty() && !minimal.disabled);
+        // An absent `scope` field defaults to Global (RFC 0018 back-compat).
+        assert_eq!(minimal.scope, McpScope::Global);
+        // Global is skip-serialized, so existing configs round-trip without a
+        // `scope` key on the wire.
+        let json = serde_json::to_string(&minimal).unwrap();
+        assert!(!json.contains("scope"), "{json}");
+        // An explicit workspace scope parses and round-trips.
+        let ws: McpServerConfig =
+            serde_json::from_str(r#"{"id":"x","command":"echo","scope":"workspace"}"#).unwrap();
+        assert_eq!(ws.scope, McpScope::Workspace);
+        round_trip(&ws);
+        assert!(serde_json::to_string(&ws)
+            .unwrap()
+            .contains("\"scope\":\"workspace\""));
+    }
+
+    #[test]
+    fn scope_defaults_to_global_and_serializes_lowercase() {
+        assert_eq!(McpScope::default(), McpScope::Global);
+        assert_eq!(
+            serde_json::to_string(&McpScope::Workspace).unwrap(),
+            "\"workspace\""
+        );
+        round_trip(&McpScope::Workspace);
     }
 
     #[test]

@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
-use ff_core::{McpServerConfig, McpServerState};
+use ff_core::{McpScope, McpServerConfig, McpServerState};
 use ff_mcp::{spawn_supervisor, SharedConfig, SupervisorConfig, SupervisorHandle};
 use tokio::sync::mpsc;
 
@@ -36,6 +36,7 @@ fn idle_exit_cfg() -> McpServerConfig {
         args: vec![],
         env: BTreeMap::new(),
         disabled: false,
+        scope: McpScope::Global,
     }
 }
 
@@ -46,6 +47,7 @@ fn echo_cfg() -> McpServerConfig {
         args: vec![],
         env: BTreeMap::new(),
         disabled: false,
+        scope: McpScope::Global,
     }
 }
 
@@ -56,6 +58,7 @@ fn exit_cfg() -> McpServerConfig {
         args: vec![],
         env: BTreeMap::new(),
         disabled: false,
+        scope: McpScope::Global,
     }
 }
 
@@ -66,6 +69,7 @@ fn slow_cfg() -> McpServerConfig {
         args: vec![],
         env: BTreeMap::new(),
         disabled: false,
+        scope: McpScope::Global,
     }
 }
 
@@ -295,6 +299,7 @@ fn cwd_cfg() -> McpServerConfig {
         args: vec![],
         env: BTreeMap::new(),
         disabled: false,
+        scope: McpScope::Global,
     }
 }
 

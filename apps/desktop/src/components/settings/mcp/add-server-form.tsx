@@ -32,6 +32,7 @@ export function AddServerForm() {
       args: args.trim() === "" ? [] : args.trim().split(/\s+/),
       env: {},
       disabled: false,
+      scope: "global",
     });
     reset();
   }

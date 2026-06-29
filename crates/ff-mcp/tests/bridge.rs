@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use ff_core::McpServerConfig;
+use ff_core::{McpScope, McpServerConfig};
 use ff_mcp::{
     build_bridged_tools, spawn_supervisor, McpBridgedTool, SharedConfig, SupervisorConfig,
     SupervisorHandle,
@@ -34,6 +34,7 @@ fn echo_cfg() -> McpServerConfig {
         args: vec![],
         env: BTreeMap::new(),
         disabled: false,
+        scope: McpScope::Global,
     }
 }
 

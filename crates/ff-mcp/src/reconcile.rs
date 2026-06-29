@@ -72,6 +72,7 @@ pub fn reconcile(desired: &[McpServerConfig], running: &[McpServerConfig]) -> Ve
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ff_core::McpScope;
     use std::collections::BTreeMap;
 
     fn cfg(id: &str, command: &str) -> McpServerConfig {
@@ -81,6 +82,7 @@ mod tests {
             args: vec![],
             env: BTreeMap::new(),
             disabled: false,
+            scope: McpScope::Global,
         }
     }
 

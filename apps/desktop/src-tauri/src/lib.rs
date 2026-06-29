@@ -1729,6 +1729,7 @@ fn add_mcp_server(state: State<'_, Arc<AppState>>, def: McpServerConfig) -> CmdR
         args: def.args,
         env: def.env,
         disabled: def.disabled,
+        scope: def.scope,
     };
     ff_mcp::upsert(&path, &input).map_err(|e| e.to_string())
 }

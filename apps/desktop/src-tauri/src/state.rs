@@ -677,6 +677,7 @@ fn seed_codegraph_mcp_entry_if_absent(mcp_path: &Path) {
         args: vec!["serve".to_string(), "--mcp".to_string()],
         env: std::collections::BTreeMap::new(),
         disabled: true,
+        scope: ff_core::McpScope::Global,
     };
     if let Err(e) = ff_mcp::upsert(mcp_path, &def) {
         tracing::warn!(error = %e, "seed codegraph mcp entry: write");
