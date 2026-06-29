@@ -206,7 +206,11 @@ describe("foldTurns — interleaved prose (#415)", () => {
   function tags(turn: ReturnType<typeof foldTurns>[number]): string[] {
     if (turn.kind !== "assistant") throw new Error("expected assistant turn");
     return turn.items.map((it) =>
-      it.kind === "prose" ? `prose:${it.text}` : `step:${it.step.tool}`,
+      it.kind === "reasoning"
+        ? `reasoning:${it.text}`
+        : it.kind === "prose"
+          ? `prose:${it.text}`
+          : `step:${it.step.tool}`,
     );
   }
 
@@ -285,5 +289,105 @@ describe("foldTurns — interleaved prose (#415)", () => {
     expect(turn.steps).toHaveLength(1);
     expect(turn.steps[0].result).toBe("live result");
     expect(tags(turn)).toEqual(["prose:Working on it.", "step:bash"]);
+  });
+});
+
+describe("foldTurns — interleaved reasoning (#574)", () => {
+  // Includes the reasoning variant so we can assert chronological position.
+  function tags(turn: ReturnType<typeof foldTurns>[number]): string[] {
+    if (turn.kind !== "assistant") throw new Error("expected assistant turn");
+    return turn.items.map((it) =>
+      it.kind === "reasoning"
+        ? `reasoning:${it.text}`
+        : it.kind === "prose"
+          ? `prose:${it.text}`
+          : `step:${it.step.tool}`,
+    );
+  }
+
+  it("places each iteration's reasoning immediately before its steps, in order", () => {
+    // Reasoning on iterations 1 and 3; none on iteration 2 → two reasoning items.
+    const groups = foldTurns([
+      msg({ role: "user", content: "go" }),
+      msg({
+        id: "a1",
+        role: "assistant",
+        reasoning: "plan: read the file",
+        toolCalls: [call("c1", "view", {})],
+      }),
+      msg({ role: "tool", toolCallId: "c1", content: "r1" }),
+      msg({
+        id: "a2",
+        role: "assistant",
+        toolCalls: [call("c2", "grep", {})],
+      }),
+      msg({ role: "tool", toolCallId: "c2", content: "r2" }),
+      msg({
+        id: "a3",
+        role: "assistant",
+        reasoning: "now I can answer",
+        content: "All done.",
+      }),
+    ]);
+    const turn = groups[1];
+    expect(tags(turn)).toEqual([
+      "reasoning:plan: read the file",
+      "step:view",
+      "step:grep",
+      "reasoning:now I can answer",
+    ]);
+    if (turn.kind !== "assistant") throw new Error("expected assistant turn");
+    // The final answer text stays on the turn's representative message, not a row.
+    expect(turn.message.id).toBe("a3");
+    expect(turn.message.content).toBe("All done.");
+  });
+
+  it("orders reasoning before prose before steps within one iteration", () => {
+    const groups = foldTurns([
+      msg({ role: "user", content: "go" }),
+      msg({
+        id: "a1",
+        role: "assistant",
+        reasoning: "thinking",
+        content: "Let me check.",
+        toolCalls: [call("c1", "view", {})],
+      }),
+      msg({ role: "tool", toolCallId: "c1", content: "r1" }),
+      msg({ id: "a2", role: "assistant", content: "done" }),
+    ]);
+    expect(tags(groups[1])).toEqual([
+      "reasoning:thinking",
+      "prose:Let me check.",
+      "step:view",
+    ]);
+  });
+
+  it("prefers live reasoning over the persisted copy, per assistant message", () => {
+    const groups = foldTurns(
+      [
+        msg({ role: "user", content: "go" }),
+        msg({
+          id: "a1",
+          role: "assistant",
+          reasoning: "persisted",
+          toolCalls: [call("c1", "view", {})],
+        }),
+        msg({ role: "tool", toolCallId: "c1", content: "r1" }),
+        msg({ id: "a2", role: "assistant", content: "done" }),
+      ],
+      undefined,
+      { a1: "live stream" },
+    );
+    expect(tags(groups[1])).toEqual(["reasoning:live stream", "step:view"]);
+  });
+
+  it("emits no reasoning item when an iteration has no reasoning", () => {
+    const groups = foldTurns([
+      msg({ role: "user", content: "go" }),
+      msg({ id: "a1", role: "assistant", toolCalls: [call("c1", "view", {})] }),
+      msg({ role: "tool", toolCallId: "c1", content: "r1" }),
+      msg({ id: "a2", role: "assistant", content: "done" }),
+    ]);
+    expect(tags(groups[1])).toEqual(["step:view"]);
   });
 });
