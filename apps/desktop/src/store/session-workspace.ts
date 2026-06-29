@@ -28,6 +28,12 @@ export interface SessionWorkspaceState {
    *  backend's canonical path and resolved git branch. Throws (and leaves the
    *  cache unchanged) if the backend rejects the path. */
   set: (sessionId: string, path: string) => Promise<void>;
+  /** Apply a `workspace:branch-changed` event (#561): patch `gitBranch` in place
+   *  for every cached session whose `path` matches `workspace.path` — no reload,
+   *  no remount. A no-op when no cached session matches (e.g. the event is for a
+   *  workspace not currently loaded) or when the branch is unchanged, so it
+   *  never spurs a re-render. `gitBranch` may be `null` (detached HEAD). */
+  applyBranchChanged: (workspace: SessionWorkspace) => void;
   /** The cached workspace for a session, or `undefined` if not loaded. */
   get: (sessionId: string) => SessionWorkspace | undefined;
 }
@@ -49,6 +55,26 @@ export const useSessionWorkspaceStore = create<SessionWorkspaceState>(
       await ipc.setSessionWorkspace(sessionId, path);
       await get().load(sessionId);
     },
+
+    // #561 — the backend's GitHeadWatcher emits `workspace:branch-changed`; this
+    // patches the cached `gitBranch` for every session sharing `workspace.path`.
+    // Returns the existing state object when nothing matched (or the branch is
+    // already current) so Zustand skips the re-render entirely.
+    applyBranchChanged: (workspace) =>
+      set((s) => {
+        let changed = false;
+        const bySession = { ...s.bySession };
+        for (const [id, ws] of Object.entries(bySession)) {
+          if (
+            ws.path === workspace.path &&
+            ws.gitBranch !== workspace.gitBranch
+          ) {
+            bySession[id] = { ...ws, gitBranch: workspace.gitBranch };
+            changed = true;
+          }
+        }
+        return changed ? { bySession } : s;
+      }),
 
     get: (sessionId) => get().bySession[sessionId],
   }),
