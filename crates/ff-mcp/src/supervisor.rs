@@ -839,6 +839,33 @@ impl Supervisor {
         // a deterministic id-then-scope order; the explicit sort keeps the published
         // contract (id-sorted, instances of one id grouped) independent of that.
         let mut snap: Vec<McpServerStatus> = self.handles.values().map(|h| h.snapshot()).collect();
+        // Surface *disabled* configured servers that have no live instance as synthetic
+        // rows (review #595). A server only gets a `ServerHandle` once instantiated: a
+        // Global server via `reconcile`, a Workspace server via `set_session_root` (which
+        // skips disabled). So a disabled Workspace server -- e.g. the seeded codegraph --
+        // never produces a handle, and with the status list built purely from handles its
+        // Settings -> MCP row would vanish, leaving the user no way to enable it. An
+        // enabled server instead surfaces through its real handle (Global immediately;
+        // Workspace once a session roots it), so we only synthesize the disabled case.
+        let live_ids: std::collections::HashSet<&str> =
+            self.handles.keys().map(|k| k.id.as_str()).collect();
+        if let Ok(cfgs) = self.shared_config.read() {
+            for c in cfgs
+                .iter()
+                .filter(|c| c.disabled && !live_ids.contains(c.id.as_str()))
+            {
+                snap.push(McpServerStatus {
+                    id: c.id.clone(),
+                    state: McpServerState::Disabled,
+                    tool_count: 0,
+                    last_error: None,
+                    restarts: 0,
+                    pid: None,
+                    // No live instance, so no concrete scope to disambiguate.
+                    scope_key: None,
+                });
+            }
+        }
         snap.sort_by(|a, b| a.id.cmp(&b.id).then(a.scope_key.cmp(&b.scope_key)));
         // Recover from a poisoned lock rather than skipping: we fully overwrite the
         // Vec, so a previous writer's panic can't leave bad data behind, and skipping

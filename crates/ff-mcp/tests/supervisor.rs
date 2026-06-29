@@ -514,3 +514,29 @@ async fn fast_flapping_server_still_parks_in_failed() {
 
     sup.stop_all().await;
 }
+
+/// A disabled Workspace-scoped server (e.g. the seeded codegraph) never produces a
+/// `ServerHandle` -- reconcile skips non-Global, and `set_session_root` skips
+/// disabled. Without a synthetic row Settings -> MCP could neither show nor enable
+/// it (review #595). The supervisor surfaces it as a `Disabled` row keyed by id with
+/// no scope (no live instance to disambiguate).
+#[tokio::test]
+async fn disabled_workspace_server_surfaces_as_synthetic_row() {
+    let mut cfg = cwd_cfg();
+    cfg.disabled = true;
+    let shared: SharedConfig = Arc::new(RwLock::new(vec![cfg]));
+    let (_change_tx, change_rx) = mpsc::unbounded_channel::<()>();
+    let sup = spawn_supervisor(shared, change_rx, fast_config());
+
+    let row = wait_for(&sup, Duration::from_secs(5), |snap| {
+        snap.iter().find(|s| s.id == "cwd").cloned()
+    })
+    .await
+    .expect("disabled workspace server appears as a synthetic status row");
+
+    assert_eq!(row.state, McpServerState::Disabled);
+    assert_eq!(row.scope_key, None, "no live instance -> no scope key");
+    assert_eq!(row.pid, None);
+
+    sup.stop_all().await;
+}
