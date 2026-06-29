@@ -36,7 +36,7 @@ export const useUpdateStore = create<UpdateState>((set) => ({
   refresh: async () => {
     try {
       const status = await ipc.checkForUpdates();
-      // Re-show the bar if the update is still available after a dismiss.
+      // Clear dismiss on every fresh poll so a still-available update resurfaces.
       set({ status, dismissed: false });
     } catch {
       // Best-effort: a failed check leaves the previous status untouched.

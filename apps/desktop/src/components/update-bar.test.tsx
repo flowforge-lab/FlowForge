@@ -73,8 +73,8 @@ describe("UpdateBar (#565)", () => {
       status: { kind: "available", version: "9.9.9", notes: null },
     });
     render(<UpdateBar />);
-    const updateBtn = [...container.querySelectorAll("button")].find((el) =>
-      el.textContent?.includes("Update"),
+    const updateBtn = [...container.querySelectorAll("button")].find(
+      (el) => el.textContent?.trim() === "Update",
     );
     await act(async () => {
       updateBtn?.dispatchEvent(new MouseEvent("click", { bubbles: true }));

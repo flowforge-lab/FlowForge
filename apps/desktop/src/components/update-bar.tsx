@@ -25,7 +25,11 @@ export function UpdateBar() {
   if (!show) return null;
 
   return (
-    <div className="update-bar flex shrink-0 items-center justify-between gap-3 border-b border-amber-400/30 bg-amber-50/80 px-4 py-2 text-[13px] text-amber-800 dark:border-amber-600/30 dark:bg-amber-950/40 dark:text-amber-200">
+    <div
+      role="status"
+      aria-live="polite"
+      className="update-bar flex shrink-0 items-center justify-between gap-3 border-b border-amber-400/30 bg-amber-50/80 px-4 py-2 text-[13px] text-amber-800 dark:border-amber-600/30 dark:bg-amber-950/40 dark:text-amber-200"
+    >
       <span className="flex items-center gap-1.5">
         <Download className="size-4 shrink-0" />
         <span>
