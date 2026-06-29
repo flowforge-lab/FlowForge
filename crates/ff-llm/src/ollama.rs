@@ -26,6 +26,15 @@ pub struct OllamaProvider {
     /// field never reaches the wire. Defaults false; set via
     /// [`OllamaProvider::with_vision`].
     supports_vision: bool,
+    /// The context window to request from Ollama, in tokens (#538). When `Some`,
+    /// it is sent as `options.num_ctx` on every `/api/chat` request -- so the
+    /// runtime serves exactly this window regardless of the server's
+    /// `OLLAMA_CONTEXT_LENGTH` default -- and is also the value
+    /// [`context_window`](OllamaProvider::context_window) reports (clamped to the
+    /// model's trained ceiling) so the agent's compaction budget matches what
+    /// Ollama actually serves. `None` leaves the request unset and the reported
+    /// window conservative; see [`context_window`](OllamaProvider::context_window).
+    num_ctx: Option<u64>,
 }
 
 impl OllamaProvider {
@@ -34,6 +43,7 @@ impl OllamaProvider {
             base_url: base_url.into(),
             client: crate::build_streaming_http_client(),
             supports_vision: false,
+            num_ctx: None,
         }
     }
 
@@ -42,12 +52,32 @@ impl OllamaProvider {
         self.supports_vision = supports_vision;
         self
     }
+
+    /// Set the context window to request from Ollama (`options.num_ctx`), in
+    /// tokens (#538). This both sizes the served window and the agent's reported
+    /// [`context_window`], keeping the compaction budget aligned with what the
+    /// runtime serves rather than the model's trained maximum.
+    pub fn with_num_ctx(mut self, num_ctx: Option<u64>) -> Self {
+        self.num_ctx = num_ctx;
+        self
+    }
 }
 
 impl Default for OllamaProvider {
     fn default() -> Self {
         Self::new("http://localhost:11434")
     }
+}
+
+/// Read the optional Ollama context-window override from the environment
+/// (`FLOWFORGE_OLLAMA_NUM_CTX`), in tokens (#538). Hosts thread this into
+/// [`OllamaProvider::with_num_ctx`] so the served window and the agent's
+/// compaction budget agree. Invalid or zero values are ignored (treated as unset).
+pub fn ollama_num_ctx_from_env() -> Option<u64> {
+    std::env::var("FLOWFORGE_OLLAMA_NUM_CTX")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&n| n > 0)
 }
 
 #[derive(Deserialize)]
@@ -244,6 +274,13 @@ impl Provider for OllamaProvider {
         if !req.tools.is_empty() {
             body["tools"] = serde_json::Value::Array(req.tools.clone());
         }
+        // Pin the served context window (#538). Ollama serves `min(num_ctx,
+        // trained_max)`; without this it falls back to the server's
+        // `OLLAMA_CONTEXT_LENGTH` default, which the agent cannot see and which
+        // may not match the budget it sized from `context_window`.
+        if let Some(n) = self.num_ctx {
+            body["options"] = serde_json::json!({ "num_ctx": n });
+        }
 
         let resp = self
             .client
@@ -296,6 +333,23 @@ impl Provider for OllamaProvider {
             .await
             .map_err(|e| LlmError::Decode(e.to_string()))?;
         Ok(list.models.into_iter().map(|m| m.name).collect())
+    }
+
+    /// The window Ollama will actually serve, not the model's trained maximum
+    /// (#538). When a `num_ctx` is configured it is the served window, clamped to
+    /// the trained ceiling from the shared family lookup. Without one we fall back
+    /// to the conservative [`DEFAULT_CONTEXT_WINDOW_TOKENS`] rather than the
+    /// trained max: Ollama serves `min(OLLAMA_CONTEXT_LENGTH, trained)` from a
+    /// server default the agent cannot see, so reporting the trained max would
+    /// over-size the compaction budget and overflow the real window. Under-filling
+    /// is always safe; over-filling silently truncates context.
+    ///
+    /// [`DEFAULT_CONTEXT_WINDOW_TOKENS`]: crate::DEFAULT_CONTEXT_WINDOW_TOKENS
+    fn context_window(&self, model: &str) -> u64 {
+        match self.num_ctx {
+            Some(n) => n.min(crate::model_context_window(model)),
+            None => crate::DEFAULT_CONTEXT_WINDOW_TOKENS,
+        }
     }
 }
 
@@ -610,5 +664,97 @@ mod tests {
             "vision on: image emitted"
         );
         assert!(on[0].get("attachments").is_none());
+    }
+
+    fn req(model: &str) -> ChatRequest {
+        ChatRequest {
+            model: model.to_string(),
+            messages: vec![],
+            tools: vec![],
+            thinking: false,
+            max_tokens: None,
+        }
+    }
+
+    #[test]
+    fn context_window_reports_configured_num_ctx() {
+        // A configured num_ctx is the served window the agent budgets against,
+        // not the model's trained maximum (#538).
+        let p = OllamaProvider::default().with_num_ctx(Some(131_072));
+        assert_eq!(p.context_window("Qwen/Qwen3.6-35B-A3B"), 131_072);
+    }
+
+    #[test]
+    fn context_window_clamps_num_ctx_to_trained_ceiling() {
+        // num_ctx above the model's trained window cannot be served, so the
+        // reported window is clamped to the family-lookup ceiling.
+        let p = OllamaProvider::default().with_num_ctx(Some(9_999_999));
+        assert_eq!(
+            p.context_window("Qwen/Qwen3.6-35B-A3B"),
+            crate::model_context_window("Qwen/Qwen3.6-35B-A3B"),
+        );
+    }
+
+    #[test]
+    fn context_window_unset_is_conservative() {
+        // With no num_ctx the served window is the server's OLLAMA_CONTEXT_LENGTH
+        // default, which the agent cannot see; report the conservative default so
+        // the budget under-fills rather than overflowing (#538).
+        let p = OllamaProvider::default();
+        assert_eq!(
+            p.context_window("Qwen/Qwen3.6-35B-A3B"),
+            crate::DEFAULT_CONTEXT_WINDOW_TOKENS,
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_stream_sends_num_ctx_when_configured() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string("{\"message\":{\"content\":\"\"},\"done\":true}\n"),
+            )
+            .mount(&server)
+            .await;
+
+        let provider = OllamaProvider::new(server.uri()).with_num_ctx(Some(131_072));
+        let mut stream = provider.chat_stream(req("qwen3.6:35b-a3b")).await.unwrap();
+        while stream.next().await.is_some() {}
+
+        let reqs = server.received_requests().await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&reqs[0].body).unwrap();
+        assert_eq!(body["options"]["num_ctx"], 131_072);
+    }
+
+    #[tokio::test]
+    async fn chat_stream_omits_num_ctx_when_unset() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string("{\"message\":{\"content\":\"\"},\"done\":true}\n"),
+            )
+            .mount(&server)
+            .await;
+
+        let provider = OllamaProvider::new(server.uri());
+        let mut stream = provider.chat_stream(req("qwen3.6:35b-a3b")).await.unwrap();
+        while stream.next().await.is_some() {}
+
+        let reqs = server.received_requests().await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&reqs[0].body).unwrap();
+        assert!(
+            body.get("options").is_none(),
+            "no num_ctx => no options key"
+        );
     }
 }
