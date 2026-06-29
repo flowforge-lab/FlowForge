@@ -4,19 +4,37 @@
 
 import { create } from "zustand";
 import { ipc } from "@/lib/ipc";
-import type { CreateScheduledTaskInput, ScheduledTask } from "@/bindings";
+import type {
+  CreateScheduledTaskInput,
+  RunRecord,
+  ScheduledTask,
+} from "@/bindings";
 
 interface ScheduledState {
   tasks: ScheduledTask[];
   loading: boolean;
   saving: boolean;
   error: string | null;
+  /** Latest fired-run session id per task id, from `runNow` + `scheduled:fired`.
+   *  Backs the ↗ open-session jump; a task absent here has no known session yet. */
+  runsByTask: Record<string, string>;
+  /** The task id currently mid `runNow` (drives the row's run-now spinner), or null. */
+  runningId: string | null;
 
   load: () => Promise<void>;
   toggle: (id: string) => Promise<void>;
   create: (input: CreateScheduledTaskInput) => Promise<void>;
   /** Delete a user task (built-ins are rejected by the backend). */
   remove: (id: string) => Promise<void>;
+  /** Fire a task out of band; caches the run's session for the ↗ jump. The
+   *  `scheduled:fired` / `scheduled:changed` events finalize the row state. */
+  runNow: (id: string) => Promise<void>;
+  /** A `scheduled:fired` event: cache the run's session and optimistically stamp
+   *  `lastRun` until the `scheduled:changed` snapshot lands. */
+  applyFired: (run: RunRecord) => void;
+  /** A `scheduled:changed` snapshot: replace the task list wholesale (server truth),
+   *  preserving the locally-cached run sessions. */
+  applyChanged: (tasks: ScheduledTask[]) => void;
   /** Save an edit to a user task. The RFC command surface has no `update`, so this
    *  is delete-then-recreate (#541): the row keeps its position but gets a fresh id
    *  and reset run stamps. Rejects if the recreate fails after the delete. */
@@ -30,6 +48,8 @@ export const useScheduledStore = create<ScheduledState>((set, get) => ({
   loading: false,
   saving: false,
   error: null,
+  runsByTask: {},
+  runningId: null,
 
   load: async () => {
     set({ loading: true, error: null });
@@ -87,6 +107,40 @@ export const useScheduledStore = create<ScheduledState>((set, get) => ({
         error: err instanceof Error ? err.message : String(err),
       });
     }
+  },
+
+  runNow: async (id) => {
+    set({ runningId: id, error: null });
+    try {
+      const run = await ipc.runScheduledTaskNow(id);
+      set((s) => ({
+        runningId: null,
+        runsByTask: run.sessionId
+          ? { ...s.runsByTask, [id]: run.sessionId }
+          : s.runsByTask,
+      }));
+    } catch (err) {
+      set({
+        runningId: null,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  },
+
+  applyFired: (run) => {
+    set((s) => ({
+      runsByTask: run.sessionId
+        ? { ...s.runsByTask, [run.taskId]: run.sessionId }
+        : s.runsByTask,
+      // Optimistic stamp; the `scheduled:changed` snapshot is the source of truth.
+      tasks: s.tasks.map((t) =>
+        t.id === run.taskId ? { ...t, lastRun: run.firedMs } : t,
+      ),
+    }));
+  },
+
+  applyChanged: (tasks) => {
+    set({ tasks });
   },
 
   edit: async (id, input) => {

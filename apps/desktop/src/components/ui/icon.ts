@@ -24,6 +24,7 @@ export {
   ChevronsUpDown,
   CircleDot,
   CircleOff,
+  CirclePlay,
   Columns2,
   Copy,
   CornerDownLeft,

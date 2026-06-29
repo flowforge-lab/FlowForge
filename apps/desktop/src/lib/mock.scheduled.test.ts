@@ -48,4 +48,43 @@ describe("MockIpc scheduled tasks (RFC 0017)", () => {
       "built-in",
     );
   });
+
+  it("runScheduledTaskNow returns a run linked to a fresh session and bumps lastRun", async () => {
+    const ipc = new MockIpc();
+    const before = Date.now();
+    const run = await ipc.runScheduledTaskNow("memory-organizer");
+    expect(run.taskId).toBe("memory-organizer");
+    expect(run.status).toBe("ok");
+    expect(run.sessionId).toBeTruthy();
+    expect(run.firedMs).toBeGreaterThanOrEqual(before);
+
+    // The fire's session actually exists.
+    const sessions = await ipc.listSessions();
+    expect(sessions.some((s) => s.id === run.sessionId)).toBe(true);
+
+    // Last run is stamped on the task.
+    const task = (await ipc.listScheduledTasks()).find(
+      (t) => t.id === "memory-organizer",
+    );
+    expect(task?.lastRun).toBe(run.firedMs);
+  });
+
+  it("runScheduledTaskNow emits scheduled:fired and scheduled:changed", async () => {
+    const ipc = new MockIpc();
+    let fired: { taskId: string; sessionId?: string } | null = null;
+    let snapshotLen = 0;
+    await ipc.onScheduledFired((e) => (fired = e));
+    await ipc.onScheduledChanged((e) => (snapshotLen = e.length));
+
+    const run = await ipc.runScheduledTaskNow("memory-organizer");
+    expect(fired).not.toBeNull();
+    expect(fired!.taskId).toBe("memory-organizer");
+    expect(fired!.sessionId).toBe(run.sessionId);
+    expect(snapshotLen).toBeGreaterThanOrEqual(1);
+  });
+
+  it("rejects running an unknown task", async () => {
+    const ipc = new MockIpc();
+    await expect(ipc.runScheduledTaskNow("ghost")).rejects.toThrow("unknown");
+  });
 });
