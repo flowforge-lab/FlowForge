@@ -17,7 +17,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
-use ff_core::McpServerConfig;
+use ff_core::{McpScope, McpServerConfig};
 use serde::{Deserialize, Serialize};
 
 use crate::error::McpError;
@@ -44,6 +44,8 @@ struct RawServerEntry {
     env: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "is_false")]
     disabled: bool,
+    #[serde(default, skip_serializing_if = "McpScope::is_global")]
+    scope: McpScope,
 }
 
 /// `skip_serializing_if` predicate: omit `disabled` when it is the default `false`.
@@ -66,6 +68,7 @@ pub struct McpServerInput {
     pub args: Vec<String>,
     pub env: BTreeMap<String, String>,
     pub disabled: bool,
+    pub scope: McpScope,
 }
 
 /// Parse and validate `mcp.json` at `path`, returning the server set sorted by id.
@@ -113,6 +116,7 @@ pub fn upsert(path: &Path, def: &McpServerInput) -> Result<(), McpError> {
             args: def.args.clone(),
             env: def.env.clone(),
             disabled: def.disabled,
+            scope: def.scope,
         },
     );
     write_raw(path, &raw)
@@ -188,6 +192,7 @@ fn parse(
             args,
             env,
             disabled: entry.disabled,
+            scope: entry.scope,
         });
     }
     // BTreeMap iteration is already id-sorted; keep that contract explicit.
@@ -379,6 +384,47 @@ mod tests {
     }
 
     #[test]
+    fn scope_parses_from_json_and_round_trips_through_upsert() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("mcp.json");
+
+        // A hand-authored mcp.json with an explicit workspace scope must parse
+        // (RawServerEntry uses deny_unknown_fields, so `scope` had to be added).
+        std::fs::write(
+            &path,
+            r#"{"mcpServers":{"cg":{"command":"codegraph","scope":"workspace"}}}"#,
+        )
+        .unwrap();
+        let loaded = load(&path).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].scope, McpScope::Workspace);
+
+        // An absent scope still defaults to Global (back-compat).
+        std::fs::write(&path, r#"{"mcpServers":{"g":{"command":"echo"}}}"#).unwrap();
+        assert_eq!(load(&path).unwrap()[0].scope, McpScope::Global);
+
+        // upsert preserves scope on write-back.
+        upsert(
+            &path,
+            &McpServerInput {
+                id: "ws".into(),
+                command: "c".into(),
+                args: Vec::new(),
+                env: BTreeMap::new(),
+                disabled: false,
+                scope: McpScope::Workspace,
+            },
+        )
+        .unwrap();
+        let ws = load(&path)
+            .unwrap()
+            .into_iter()
+            .find(|s| s.id == "ws")
+            .unwrap();
+        assert_eq!(ws.scope, McpScope::Workspace);
+    }
+
+    #[test]
     fn upsert_adds_then_replaces() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("mcp.json");
@@ -389,6 +435,7 @@ mod tests {
             args: vec!["-y".into(), "server-filesystem".into()],
             env: BTreeMap::new(),
             disabled: false,
+            scope: McpScope::Global,
         };
         upsert(&path, &def).unwrap();
         let loaded = load(&path).unwrap();
@@ -414,6 +461,7 @@ mod tests {
             args: Vec::new(),
             env: BTreeMap::new(),
             disabled: false,
+            scope: McpScope::Global,
         };
         upsert(&path, &def).unwrap();
         assert!(path.exists());
@@ -437,6 +485,7 @@ mod tests {
                 args: Vec::new(),
                 env,
                 disabled: false,
+                scope: McpScope::Global,
             },
         )
         .unwrap();
