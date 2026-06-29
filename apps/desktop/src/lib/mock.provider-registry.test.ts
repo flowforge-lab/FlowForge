@@ -9,6 +9,7 @@ const conn = (over: Partial<ProviderConnection> = {}): ProviderConnection => ({
   displayName: "New Connection",
   model: "some-model",
   hasKey: false,
+  secretMissing: false,
   thinking: true,
   reasoningEffort: "medium",
   reasoningVisibility: "all",

@@ -45,6 +45,7 @@ function defaultConnection(kind: ProviderKind): ProviderConnection {
     displayName: "",
     model: "",
     hasKey: false,
+    secretMissing: false,
     thinking: true,
     reasoningEffort: "medium",
     reasoningVisibility: "all",

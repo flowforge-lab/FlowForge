@@ -263,12 +263,18 @@ export function ProviderCard({ conn }: { conn: ProviderConnection }) {
             <span
               className={cn(
                 "rounded-full px-1.5 py-0.5 text-[9px] font-semibold tracking-wide uppercase",
-                configured
-                  ? "bg-emerald-500/10 text-emerald-600 dark:text-emerald-400"
-                  : "bg-muted text-muted-foreground",
+                conn.secretMissing
+                  ? "bg-amber-500/10 text-amber-600 dark:text-amber-400"
+                  : configured
+                    ? "bg-emerald-500/10 text-emerald-600 dark:text-emerald-400"
+                    : "bg-muted text-muted-foreground",
               )}
             >
-              {configured ? "Configured" : "Not configured"}
+              {conn.secretMissing
+                ? "Key missing"
+                : configured
+                  ? "Configured"
+                  : "Not configured"}
             </span>
           </span>
           <span className="mt-0.5 block truncate font-mono text-[11px] text-muted-foreground">
@@ -292,6 +298,13 @@ export function ProviderCard({ conn }: { conn: ProviderConnection }) {
           {/* ── Credentials ─────────────────────────────────── */}
           <section className="space-y-3.5 border-b border-border px-4 py-4">
             <h4 className={fieldLabelClass()}>Credentials</h4>
+
+            {conn.secretMissing && (
+              <p className="text-xs text-amber-600 dark:text-amber-400">
+                Keychain secret missing (common after an app rebuild or
+                reinstall). Re-enter your credentials below to restore access.
+              </p>
+            )}
 
             {isBedrock ? (
               <>

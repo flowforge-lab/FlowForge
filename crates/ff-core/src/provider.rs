@@ -319,6 +319,13 @@ pub struct ProviderConnection {
     pub model: String,
     /// Whether an API key is stored for this connection (OS keychain).
     pub has_key: bool,
+    /// True when the registry believes a key is stored (`has_key`) but the OS
+    /// keychain no longer returns it — most often because an app rebuild changed
+    /// the code-signing identity and the keychain ACL denied the new binary.
+    /// Lets the UI prompt "re-enter your key" instead of failing auth silently.
+    /// Computed on the read path; never persisted as `true`.
+    #[serde(default)]
+    pub secret_missing: bool,
     /// When true, request and surface model reasoning/thinking streams (#181).
     #[serde(default = "default_thinking")]
     pub thinking: bool,
@@ -542,6 +549,7 @@ impl Default for ProviderRegistry {
             base_url: None,
             model: "Qwen3-4B-Instruct-2507".to_string(),
             has_key: false,
+            secret_missing: false,
             thinking: true,
             reasoning_effort: ReasoningEffort::default(),
             reasoning_visibility: ReasoningVisibility::default(),
@@ -558,6 +566,7 @@ impl Default for ProviderRegistry {
             base_url: None,
             model: "llama3.2".to_string(),
             has_key: false,
+            secret_missing: false,
             thinking: true,
             reasoning_effort: ReasoningEffort::default(),
             reasoning_visibility: ReasoningVisibility::default(),
@@ -661,6 +670,7 @@ mod tests {
             base_url: None,
             model: "m".to_string(),
             has_key: false,
+            secret_missing: false,
             thinking: true,
             reasoning_effort: ReasoningEffort::default(),
             reasoning_visibility: ReasoningVisibility::default(),
@@ -775,6 +785,7 @@ mod tests {
             base_url: None,
             model: "llama3.2".into(),
             has_key: false,
+            secret_missing: false,
             thinking: true,
             reasoning_effort: ReasoningEffort::default(),
             reasoning_visibility: ReasoningVisibility::default(),
