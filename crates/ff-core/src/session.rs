@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::{Mode, ModelSelection};
+use crate::{McpServerConfig, Mode, ModelSelection};
 use ts_rs::TS;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
@@ -60,6 +60,14 @@ pub struct Session {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub model: Option<ModelSelection>,
+    /// Session-tier MCP server overrides (RFC 0018 section 3.1, top tier). Whole-record
+    /// overlay-by-id over the phenotype and global tiers (RFC section 11.5); `None`
+    /// means "inherit the phenotype + global resolution" -- so a pane can pin its own
+    /// MCP set while untouched sessions follow their phenotype. Persisted as JSON,
+    /// exactly like [`model`](Self::model).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub mcp_servers: Option<Vec<McpServerConfig>>,
 }
 
 /// A session's working directory as surfaced to the frontend selector (#200,

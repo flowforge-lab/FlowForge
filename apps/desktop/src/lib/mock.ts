@@ -213,7 +213,11 @@ function scoreMarketplace(skill: MarketplaceSkill, q: string): number {
 }
 
 // The built-in phenotype: no skills, no overrides (RFC 0001 §7). Always present.
-const DEFAULT_PHENOTYPE: Phenotype = { name: "default", skills: [] };
+const DEFAULT_PHENOTYPE: Phenotype = {
+  name: "default",
+  skills: [],
+  mcpServers: [],
+};
 
 // Canned phenotypes so the `pheno` palette (#28) is exercisable offline. `default`
 // is prepended by `listPhenotypes`, matching the backend.
@@ -228,11 +232,23 @@ const MOCK_PHENOTYPES: Phenotype[] = [
     persona:
       "A disciplined software engineer: Research → Plan → Implement → Verify, codegraph-first navigation.",
     maxIterations: 50,
+    // codegraph travels with codon as a workspace-scoped MCP server (RFC 0018 C3).
+    mcpServers: [
+      {
+        id: "codegraph",
+        command: "codegraph",
+        args: ["serve", "--mcp"],
+        env: {},
+        disabled: false,
+        scope: "workspace",
+      },
+    ],
   },
   {
     name: "rust",
     skills: ["rust-debugging", "write-tests"],
     persona: "You are a meticulous Rust engineer.",
+    mcpServers: [],
   },
   {
     name: "reviewer",
@@ -242,6 +258,7 @@ const MOCK_PHENOTYPES: Phenotype[] = [
     // (no session override) resolves to openai/gpt-4o, not the global default.
     provider: "openai",
     model: "gpt-4o",
+    mcpServers: [],
   },
 ];
 

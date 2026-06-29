@@ -159,8 +159,8 @@ describe("buildSkillCommands", () => {
 
 describe("buildPhenotypeCommands", () => {
   const phenotypes: Phenotype[] = [
-    { name: "default", skills: [] },
-    { name: "rust", skills: ["rust-debugging"] },
+    { name: "default", skills: [], mcpServers: [] },
+    { name: "rust", skills: ["rust-debugging"], mcpServers: [] },
   ];
 
   it("lists switch rows for non-active phenotypes", () => {
