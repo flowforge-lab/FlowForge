@@ -254,6 +254,16 @@ fn delete_session(state: State<'_, Arc<AppState>>, session_id: String) {
     state.clear_session_approvals(&session_id);
     state.store.delete_session(&session_id);
     state.reap_session_processes(&session_id);
+    // Release this session's per-workspace MCP instance refs, evicting any instance no
+    // live session references (RFC 0018 §4.3). Spawned (not awaited) like the process
+    // reap above: `delete_session` is a sync Tauri command that runs off the reactor on
+    // macOS (#117), so a bare block_on/await would panic -- `tauri::async_runtime::spawn`
+    // enters the shared runtime.
+    let state_for_mcp = state.inner().clone();
+    let sid = session_id.clone();
+    tauri::async_runtime::spawn(async move {
+        state_for_mcp.release_session_mcp(&sid).await;
+    });
 }
 
 /// All scheduled tasks, newest first, with derived cadence label / next run
@@ -679,14 +689,14 @@ fn spawn_assistant_turn(state: Arc<AppState>, app: tauri::AppHandle, session_id:
         // before snapshotting tools, so its code graph reflects the active checkout
         // (#548 W1b). Idempotent; restarts codegraph only when the path changed.
         let session_root = state.session_root(&sid);
-        state.align_codegraph_workspace(&session_root).await;
+        state.align_session_mcp(&sid, &session_root).await;
         // Re-aim the git HEAD watcher at this session's checkout (#561 BE half),
         // mirroring the codegraph alignment above. Idempotent; a no-op when the path
         // is unchanged. Drives the live `workspace:branch-changed` event the FE
         // listener (PR #581) patches into the composer chip.
         state.align_git_watcher(&session_root);
         // Snapshot built-in + MCP-bridged tools for this turn (RFC 0003 §6).
-        let registry = state.build_tool_registry();
+        let registry = state.build_tool_registry(&session_root);
         let mut tool_ctx = ToolContext::new(&registry, &session_root, &approver, max_iterations);
         tool_ctx.mode = mode;
         tool_ctx.abstractive = crate::state::abstractive_config_from_env();
@@ -977,11 +987,11 @@ impl ff_scheduled::TaskRunner for DesktopTaskRunner {
             .unwrap_or(ff_agent::DEFAULT_MAX_ITERATIONS);
 
         let session_root = self.state.session_root(&sid);
-        self.state.align_codegraph_workspace(&session_root).await;
+        self.state.align_session_mcp(&sid, &session_root).await;
         // Keep the git HEAD watcher aimed at the active checkout here too (#561), so
         // a scheduled-task turn that switches branches live-updates the FE chip.
         self.state.align_git_watcher(&session_root);
-        let registry = self.state.build_tool_registry();
+        let registry = self.state.build_tool_registry(&session_root);
         let approver = ScheduledApprover::new(task.safety_ceiling);
         let mut tool_ctx = ToolContext::new(&registry, &session_root, &approver, max_iterations);
         tool_ctx.mode = mode;

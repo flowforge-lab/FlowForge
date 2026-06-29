@@ -74,6 +74,12 @@ pub struct McpServerStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub pid: Option<u32>,
+    /// For a workspace-scoped instance, a short label for its root (the path) so the
+    /// UI can disambiguate two instances of the same server id (RFC 0018 section 4.2).
+    /// `None` for a global instance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub scope_key: Option<String>,
 }
 
 /// One tool advertised by an MCP server (RFC 0003 §4). `input_schema` is the raw
@@ -167,6 +173,7 @@ mod tests {
             last_error: Some("handshake timed out".into()),
             restarts: 3,
             pid: None,
+            scope_key: None,
         });
     }
 

@@ -615,11 +615,6 @@ fn phenotypes_root() -> PathBuf {
 /// example can never drift.
 const CODON_PHENOTYPE_TOML: &str =
     include_str!("../../../../docs/examples/codon/phenos/codon.toml");
-/// The id of the workspace-aware MCP server. Its code graph should track the active
-/// session's workspace, so the desktop points it at the session root each turn
-/// ([`AppState::align_codegraph_workspace`]). Matches the seeded `codegraph` entry.
-const CODEGRAPH_SERVER_ID: &str = "codegraph";
-
 /// The codegraph skill Codon depends on, bundled from the same example tree.
 const CODEGRAPH_SKILL_MD: &str =
     include_str!("../../../../docs/examples/codon/skills/codegraph/SKILL.md");
@@ -680,7 +675,10 @@ fn seed_codegraph_mcp_entry_if_absent(mcp_path: &Path) {
         args: vec!["serve".to_string(), "--mcp".to_string()],
         env: std::collections::BTreeMap::new(),
         disabled: true,
-        scope: ff_core::McpScope::Global,
+        // Workspace-scoped (RFC 0018 §4.4): one codegraph instance per session
+        // checkout, learning its root via the MCP roots capability. No `--path` arg --
+        // a pinned path would defeat per-turn alignment.
+        scope: ff_core::McpScope::Workspace,
     };
     if let Err(e) = ff_mcp::upsert(mcp_path, &def) {
         tracing::warn!(error = %e, "seed codegraph mcp entry: write");
@@ -1112,7 +1110,7 @@ impl AppState {
     /// Build the per-turn tool registry: built-in tools + MCP-bridged tools from
     /// running servers (RFC 0003 §6). Snapshotted per turn so a hot-reload mid-turn
     /// never races an in-flight tool call — same discipline as skill snapshots.
-    pub fn build_tool_registry(&self) -> ToolRegistry {
+    pub fn build_tool_registry(&self, session_root: &Path) -> ToolRegistry {
         let mut reg = ToolRegistry::with_defaults();
         reg.register(Box::new(ff_tools::WebSearchTool::new(
             self.search_config.clone(),
@@ -1154,23 +1152,35 @@ impl AppState {
         reg.register(Box::new(ff_tools::CompactionRetrieveTool::new(
             self.store.clone(),
         )));
-        // Bridge MCP tools from currently-running servers (M4.3).
+        // Bridge MCP tools from the instances this session resolves to (M4.3): every
+        // global instance plus the workspace instances rooted at `session_root` (RFC
+        // 0018 §4.6). Routing is by instance key, so a concurrent turn on another
+        // workspace binds the same tool name to its own instance.
         if let Some(handle) = self.mcp_handle() {
-            for tool in ff_mcp::build_bridged_tools(&handle) {
+            for tool in ff_mcp::build_bridged_tools(&handle, session_root) {
                 reg.register(tool);
             }
         }
         reg
     }
 
-    /// Point the workspace-aware MCP server (codegraph) at `root` so its code graph
-    /// reflects the active session's checkout, restarting it if the path changed
-    /// (#548 W1b). Idempotent and best-effort: a no-op when MCP is uninitialized or
-    /// codegraph is not configured, and unchanged paths never trigger a restart.
-    pub async fn align_codegraph_workspace(&self, root: &Path) {
+    /// Align the MCP supervisor's live instance set for `session_id`, now rooted at
+    /// `root` (RFC 0018 §4.3/§4.5). Each `Workspace`-scoped server (e.g. codegraph) gets
+    /// a per-root instance, ref-counted by session; a referenced instance not currently
+    /// `Running` is proactively (re)started for this turn -- the fix for a codegraph
+    /// parked in `Failed` (#557). Best-effort: a no-op when MCP is uninitialized.
+    pub async fn align_session_mcp(&self, session_id: &str, root: &Path) {
         if let Some(sup) = self.mcp_handle() {
-            sup.set_server_cwd(CODEGRAPH_SERVER_ID, Some(root.to_path_buf()))
-                .await;
+            sup.align_session(session_id, root.to_path_buf()).await;
+        }
+    }
+
+    /// Release `session_id`'s references to per-workspace MCP instances, evicting any
+    /// whose ref-list empties (RFC 0018 §4.3). Called on session close/delete so a
+    /// per-workspace codegraph is reaped once no live session references its path.
+    pub async fn release_session_mcp(&self, session_id: &str) {
+        if let Some(sup) = self.mcp_handle() {
+            sup.release_session(session_id).await;
         }
     }
 
@@ -1197,7 +1207,7 @@ impl AppState {
     }
 
     /// Aim the git HEAD watcher at the active session's `root`, mirroring
-    /// [`align_codegraph_workspace`](Self::align_codegraph_workspace). Idempotent and
+    /// [`align_session_mcp`](Self::align_session_mcp). Idempotent and
     /// best-effort: a no-op when the watcher could not start or `root` is unchanged.
     pub fn align_git_watcher(&self, root: &Path) {
         if let Some(w) = self._git_watcher.lock().unwrap().as_mut() {
@@ -2665,6 +2675,7 @@ mod tests {
             last_error: None,
             restarts: 0,
             pid: None,
+            scope_key: None,
         };
         let required: BTreeSet<String> =
             ["running".into(), "failed".into(), "disabled".into()].into();

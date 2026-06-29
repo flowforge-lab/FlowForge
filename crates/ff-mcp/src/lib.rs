@@ -13,6 +13,7 @@ mod bridge;
 mod client;
 mod config;
 mod error;
+mod key;
 mod reconcile;
 mod supervisor;
 mod watch;
@@ -24,9 +25,11 @@ pub use bridge::{build_bridged_tools, McpBridgedTool};
 pub use client::McpClient;
 pub use config::{load, remove, set_disabled, upsert, McpServerInput};
 pub use error::McpError;
+pub use key::{InstanceKey, ScopeKey};
 pub use reconcile::{reconcile, ReconcileAction};
 pub use supervisor::{
-    spawn as spawn_supervisor, SharedStatus, SharedTools, SupervisorConfig, SupervisorHandle,
+    spawn as spawn_supervisor, PublishedTool, SharedStatus, SharedTools, SupervisorConfig,
+    SupervisorHandle,
 };
 pub use watch::{McpConfigWatcher, SharedConfig};
 

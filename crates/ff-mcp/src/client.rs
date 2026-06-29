@@ -8,23 +8,50 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use ff_core::{McpServerConfig, McpToolInfo};
-use rmcp::model::CallToolRequestParams;
-use rmcp::service::{NotificationContext, RunningService};
+use rmcp::model::{
+    CallToolRequestParams, ClientCapabilities, ClientInfo, Implementation, ListRootsResult, Root,
+};
+use rmcp::service::{NotificationContext, RequestContext, RunningService};
 use rmcp::transport::TokioChildProcess;
-use rmcp::{ClientHandler, RoleClient, ServiceExt};
+use rmcp::{ClientHandler, ErrorData as RmcpErrorData, RoleClient, ServiceExt};
 use tokio::process::Command;
 
 use crate::error::McpError;
 
-/// A `ClientHandler` whose only job is to flip a flag when the server announces
-/// `tools/list_changed`, so the caller knows to re-`list_tools` (RFC 0003 §4). Every
-/// other notification keeps the trait default (ignored).
+/// The client-side `ClientHandler` for a supervised MCP server connection. It does
+/// two jobs:
+///
+/// 1. Flips a flag when the server announces `tools/list_changed`, so the caller knows
+///    to re-`list_tools` (RFC 0003 §4).
+/// 2. Advertises the connection's **workspace roots** (RFC 0018 §4.4): a
+///    `Workspace`-scoped server (e.g. codegraph) learns the active checkout from the
+///    `roots`/`rootUri` capability rather than a thrashed process cwd. `get_info`
+///    declares the `roots` capability and `list_roots` returns the resolved roots set
+///    at connect. A `Global`-scoped server passes an empty roots list and behaves as
+///    before. Every other notification keeps the trait default (ignored).
 #[derive(Clone, Default)]
-struct ListChangedFlag(Arc<AtomicBool>);
+struct FfClientHandler {
+    tools_changed: Arc<AtomicBool>,
+    roots: Arc<Vec<Root>>,
+}
 
-impl ClientHandler for ListChangedFlag {
+impl ClientHandler for FfClientHandler {
     async fn on_tool_list_changed(&self, _context: NotificationContext<RoleClient>) {
-        self.0.store(true, Ordering::SeqCst);
+        self.tools_changed.store(true, Ordering::SeqCst);
+    }
+
+    async fn list_roots(
+        &self,
+        _context: RequestContext<RoleClient>,
+    ) -> Result<ListRootsResult, RmcpErrorData> {
+        Ok(ListRootsResult::new((*self.roots).clone()))
+    }
+
+    fn get_info(&self) -> ClientInfo {
+        ClientInfo::new(
+            ClientCapabilities::builder().enable_roots().build(),
+            Implementation::new("flowforge", env!("CARGO_PKG_VERSION")),
+        )
     }
 }
 
@@ -73,10 +100,19 @@ fn augment_path(inherited: Option<OsString>, extra: &[PathBuf]) -> OsString {
     std::env::join_paths(&parts).unwrap_or_else(|_| inherited.unwrap_or_default())
 }
 
+/// Map workspace root paths to MCP [`Root`]s with `file://` URIs (RFC 0018 §4.4),
+/// the channel a workspace-aware server reads its checkout from.
+fn root_uris(roots: &[&Path]) -> Vec<Root> {
+    roots
+        .iter()
+        .map(|p| Root::new(format!("file://{}", p.display())))
+        .collect()
+}
+
 /// A live connection to one MCP server. Dropping or `shutdown`-ing it ends the child.
 pub struct McpClient {
     server_id: String,
-    service: RunningService<RoleClient, ListChangedFlag>,
+    service: RunningService<RoleClient, FfClientHandler>,
     tools_changed: Arc<AtomicBool>,
     pid: Option<u32>,
 }
@@ -92,10 +128,16 @@ impl McpClient {
     /// host secrets. The supervisor (M4.2) supplies the allowlist; pass `&[]` for a
     /// fully sealed environment (a server then needs an absolute `command` + declared
     /// `env`).
+    ///
+    /// `roots` are advertised to the server via the MCP roots capability (RFC 0018
+    /// §4.4) so a workspace-aware server learns its checkout from `rootUri` rather than
+    /// a mutable process cwd. `cwd` is still set as a belt-and-braces fallback. Pass an
+    /// empty `roots` slice for a `Global`-scoped server.
     pub async fn connect(
         config: &McpServerConfig,
         env_allowlist: &[&str],
         cwd: Option<&Path>,
+        roots: &[&Path],
     ) -> Result<Self, McpError> {
         let mut cmd = Command::new(&config.command);
         cmd.args(&config.args);
@@ -130,8 +172,11 @@ impl McpClient {
         // The transport is consumed by `serve`, so capture the child PID first — it
         // surfaces in `McpServerStatus` and lets the supervisor verify reaping.
         let pid = transport.id();
-        let handler = ListChangedFlag::default();
-        let tools_changed = handler.0.clone();
+        let handler = FfClientHandler {
+            tools_changed: Arc::new(AtomicBool::new(false)),
+            roots: Arc::new(root_uris(roots)),
+        };
+        let tools_changed = handler.tools_changed.clone();
         let service = handler
             .serve(transport)
             .await
@@ -297,5 +342,38 @@ mod tests {
             "bare command should resolve via the augmented PATH"
         );
         assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "ok");
+    }
+
+    #[test]
+    fn root_uris_maps_paths_to_file_uris() {
+        let roots = root_uris(&[Path::new("/work/A"), Path::new("/work/B")]);
+        assert_eq!(
+            roots.iter().map(|r| r.uri.clone()).collect::<Vec<_>>(),
+            vec!["file:///work/A".to_string(), "file:///work/B".to_string()],
+        );
+    }
+
+    #[test]
+    fn root_uris_empty_for_global() {
+        assert!(root_uris(&[]).is_empty());
+    }
+
+    #[tokio::test]
+    async fn handler_advertises_roots_and_lists_them() {
+        let handler = FfClientHandler {
+            tools_changed: Arc::new(AtomicBool::new(false)),
+            roots: Arc::new(root_uris(&[Path::new("/work/A")])),
+        };
+        // The client must declare the roots capability so a server knows to query it.
+        assert!(handler.get_info().capabilities.roots.is_some());
+        // And the stored roots are exactly what was resolved at connect.
+        assert_eq!(
+            handler
+                .roots
+                .iter()
+                .map(|r| r.uri.clone())
+                .collect::<Vec<_>>(),
+            vec!["file:///work/A".to_string()],
+        );
     }
 }

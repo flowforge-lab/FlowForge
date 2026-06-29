@@ -11,7 +11,7 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use ff_core::{McpScope, McpServerConfig, McpServerState};
-use ff_mcp::{spawn_supervisor, SharedConfig, SupervisorConfig, SupervisorHandle};
+use ff_mcp::{spawn_supervisor, InstanceKey, SharedConfig, SupervisorConfig, SupervisorHandle};
 use tokio::sync::mpsc;
 
 fn fast_config() -> SupervisorConfig {
@@ -266,7 +266,11 @@ async fn stop_all_preempts_in_flight_tool_call() {
     let caller = sup.clone();
     let call = tokio::spawn(async move {
         caller
-            .call_tool("slow", "sleep", serde_json::json!({ "ms": 60_000 }))
+            .call_tool(
+                &InstanceKey::global("slow"),
+                "sleep",
+                serde_json::json!({ "ms": 60_000 }),
+            )
             .await
     });
 
@@ -299,146 +303,140 @@ fn cwd_cfg() -> McpServerConfig {
         args: vec![],
         env: BTreeMap::new(),
         disabled: false,
-        scope: McpScope::Global,
+        // Workspace-scoped: one instance per session root (RFC 0018 §4.2).
+        scope: McpScope::Workspace,
     }
 }
 
-/// #548 W1b: `set_server_cwd` restarts the server in the requested directory, so the
-/// workspace-aware server tracks the active workspace. The `pwd` tool reports the
-/// child's cwd; after the override it must equal the new directory.
+/// RFC 0018 §4.4/§4.5: `align_session` starts a workspace-scoped server as a per-root
+/// instance, and the child runs in that root (the `pwd` tool reports its cwd). This
+/// replaces the retired `set_server_cwd` hack -- the root now rides the instance key
+/// (and is advertised as an MCP root). The status snapshot tags the instance with its
+/// root so the UI can disambiguate two instances of the same id.
 #[tokio::test]
-async fn set_server_cwd_restarts_child_in_new_directory() {
+async fn align_session_runs_workspace_instance_in_its_root() {
     let shared: SharedConfig = Arc::new(RwLock::new(vec![cwd_cfg()]));
     let (_change_tx, change_rx) = mpsc::unbounded_channel::<()>();
     let sup = spawn_supervisor(shared, change_rx, fast_config());
 
-    // A manual restart re-spawns a fresh handle, so detect the change via the pid
-    // (the restarts counter resets on a manual restart -- see manual_restart test).
-    let first_pid = wait_for(&sup, Duration::from_secs(5), |snap| {
-        snap.iter()
-            .find(|s| s.id == "cwd" && s.state == McpServerState::Running)
-            .and_then(|s| s.pid)
-    })
-    .await
-    .expect("cwd server reaches Running");
-
     let dir = tempfile::tempdir().expect("tempdir");
     let want = std::fs::canonicalize(dir.path()).expect("canonicalize tempdir");
-    sup.set_server_cwd("cwd", Some(want.clone())).await;
+    sup.align_session("s1", want.clone()).await;
 
-    // It restarts in the new dir: wait for a fresh child (different pid).
-    let second_pid = wait_for(&sup, Duration::from_secs(5), |snap| {
+    wait_for(&sup, Duration::from_secs(5), |snap| {
         snap.iter()
-            .find(|s| {
-                s.id == "cwd"
-                    && s.state == McpServerState::Running
-                    && s.pid.is_some()
-                    && s.pid != Some(first_pid)
-            })
-            .and_then(|s| s.pid)
+            .find(|s| s.id == "cwd" && s.state == McpServerState::Running)
+            .map(|_| ())
     })
     .await
-    .expect("cwd server restarts after set_server_cwd");
-    assert_ne!(
-        first_pid, second_pid,
-        "set_server_cwd should respawn the child"
-    );
+    .expect("workspace instance reaches Running");
 
     let out = sup
-        .call_tool("cwd", "pwd", serde_json::Value::Null)
+        .call_tool(
+            &InstanceKey::workspace("cwd", &want),
+            "pwd",
+            serde_json::Value::Null,
+        )
         .await
         .expect("pwd call");
     let got = std::fs::canonicalize(out.trim()).expect("canonicalize reported cwd");
     assert_eq!(
         got, want,
-        "child should run in the directory set via set_server_cwd"
+        "child should run in the session's workspace root"
     );
 
-    // Setting the same dir again is a no-op: no respawn, so the pid is unchanged.
-    sup.set_server_cwd("cwd", Some(want.clone())).await;
-    let pid_after = sup
-        .status
-        .read()
-        .unwrap()
-        .iter()
+    let scope_key = sup
+        .status_snapshot()
+        .into_iter()
         .find(|s| s.id == "cwd")
-        .and_then(|s| s.pid);
-    assert_eq!(
-        pid_after,
-        Some(second_pid),
-        "an unchanged cwd must not respawn the child"
-    );
+        .and_then(|s| s.scope_key);
+    assert_eq!(scope_key, Some(want.display().to_string()));
 
     sup.stop_all().await;
 }
 
-/// #548 W1b follow-up: removing a server via reconcile prunes its cwd override, so a
-/// later re-add starts in the default working directory rather than inheriting the
-/// stale workspace.
+/// RFC 0018 §4.2 / #557: two sessions on distinct workspace roots get two separate
+/// instances of the same server id, and a call routes to the instance for its root.
 #[tokio::test]
-async fn reconcile_removal_prunes_cwd_override() {
+async fn distinct_roots_get_distinct_instances() {
     let shared: SharedConfig = Arc::new(RwLock::new(vec![cwd_cfg()]));
-    let (change_tx, change_rx) = mpsc::unbounded_channel::<()>();
-    let sup = spawn_supervisor(Arc::clone(&shared), change_rx, fast_config());
+    let (_change_tx, change_rx) = mpsc::unbounded_channel::<()>();
+    let sup = spawn_supervisor(shared, change_rx, fast_config());
 
-    let first_pid = wait_for(&sup, Duration::from_secs(5), |snap| {
-        snap.iter()
-            .find(|s| s.id == "cwd" && s.state == McpServerState::Running)
-            .and_then(|s| s.pid)
-    })
-    .await
-    .expect("cwd server reaches Running");
+    let dir_a = tempfile::tempdir().expect("tempdir a");
+    let dir_b = tempfile::tempdir().expect("tempdir b");
+    let root_a = std::fs::canonicalize(dir_a.path()).unwrap();
+    let root_b = std::fs::canonicalize(dir_b.path()).unwrap();
+    sup.align_session("sa", root_a.clone()).await;
+    sup.align_session("sb", root_b.clone()).await;
 
-    // Point the server at a tempdir and wait for the override-driven restart.
-    let dir = tempfile::tempdir().expect("tempdir");
-    let want = std::fs::canonicalize(dir.path()).expect("canonicalize tempdir");
-    sup.set_server_cwd("cwd", Some(want.clone())).await;
     wait_for(&sup, Duration::from_secs(5), |snap| {
-        snap.iter()
-            .find(|s| {
-                s.id == "cwd"
-                    && s.state == McpServerState::Running
-                    && s.pid.is_some()
-                    && s.pid != Some(first_pid)
-            })
-            .map(|_| ())
+        let running = snap
+            .iter()
+            .filter(|s| s.id == "cwd" && s.state == McpServerState::Running)
+            .count();
+        (running == 2).then_some(())
     })
     .await
-    .expect("cwd server restarts in the override dir");
+    .expect("two distinct workspace instances reach Running");
 
-    // Remove the server: reconcile issues Stop, which must drop the override too.
-    shared.write().unwrap().clear();
-    change_tx.send(()).expect("signal config change");
+    let out_a = sup
+        .call_tool(
+            &InstanceKey::workspace("cwd", &root_a),
+            "pwd",
+            serde_json::Value::Null,
+        )
+        .await
+        .expect("pwd a");
+    let out_b = sup
+        .call_tool(
+            &InstanceKey::workspace("cwd", &root_b),
+            "pwd",
+            serde_json::Value::Null,
+        )
+        .await
+        .expect("pwd b");
+    assert_eq!(std::fs::canonicalize(out_a.trim()).unwrap(), root_a);
+    assert_eq!(std::fs::canonicalize(out_b.trim()).unwrap(), root_b);
+
+    sup.stop_all().await;
+}
+
+/// RFC 0018 §4.3: a workspace instance is ref-counted across sessions and evicted only
+/// when the last referencing session is released.
+#[tokio::test]
+async fn workspace_instance_evicted_on_last_session_release() {
+    let shared: SharedConfig = Arc::new(RwLock::new(vec![cwd_cfg()]));
+    let (_change_tx, change_rx) = mpsc::unbounded_channel::<()>();
+    let sup = spawn_supervisor(shared, change_rx, fast_config());
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = std::fs::canonicalize(dir.path()).unwrap();
+    // Two sessions share the same root -> one instance, ref-count 2.
+    sup.align_session("s1", root.clone()).await;
+    sup.align_session("s2", root.clone()).await;
+
+    wait_for(&sup, Duration::from_secs(5), |snap| {
+        (snap.iter().filter(|s| s.id == "cwd").count() == 1).then_some(())
+    })
+    .await
+    .expect("shared root yields exactly one instance");
+
+    // Releasing one session keeps the instance alive (still referenced by the other).
+    sup.release_session("s1").await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert!(
+        sup.status_snapshot().iter().any(|s| s.id == "cwd"),
+        "instance must survive while another session references it"
+    );
+
+    // Releasing the last session evicts it.
+    sup.release_session("s2").await;
     wait_for(&sup, Duration::from_secs(5), |snap| {
         snap.iter().all(|s| s.id != "cwd").then_some(())
     })
     .await
-    .expect("cwd server is removed");
-
-    // Re-add it: with the override pruned, the child must start in the default cwd,
-    // not the stale tempdir.
-    *shared.write().unwrap() = vec![cwd_cfg()];
-    change_tx.send(()).expect("signal config change");
-    wait_for(&sup, Duration::from_secs(5), |snap| {
-        snap.iter()
-            .find(|s| s.id == "cwd" && s.state == McpServerState::Running)
-            .map(|_| ())
-    })
-    .await
-    .expect("cwd server is re-added and Running");
-
-    let out = sup
-        .call_tool("cwd", "pwd", serde_json::Value::Null)
-        .await
-        .expect("pwd call");
-    let got = std::fs::canonicalize(out.trim()).expect("canonicalize reported cwd");
-    let default_cwd = std::fs::canonicalize(std::env::current_dir().expect("current_dir"))
-        .expect("canonicalize cwd");
-    assert_eq!(
-        got, default_cwd,
-        "a re-added server must not inherit the pruned cwd override"
-    );
-    assert_ne!(got, want, "stale override must not apply after re-add");
+    .expect("instance evicted once its last session is released");
 
     sup.stop_all().await;
 }
@@ -513,6 +511,32 @@ async fn fast_flapping_server_still_parks_in_failed() {
         !last_error.is_empty(),
         "last_error should describe the early exit"
     );
+
+    sup.stop_all().await;
+}
+
+/// A disabled Workspace-scoped server (e.g. the seeded codegraph) never produces a
+/// `ServerHandle` -- reconcile skips non-Global, and `set_session_root` skips
+/// disabled. Without a synthetic row Settings -> MCP could neither show nor enable
+/// it (review #595). The supervisor surfaces it as a `Disabled` row keyed by id with
+/// no scope (no live instance to disambiguate).
+#[tokio::test]
+async fn disabled_workspace_server_surfaces_as_synthetic_row() {
+    let mut cfg = cwd_cfg();
+    cfg.disabled = true;
+    let shared: SharedConfig = Arc::new(RwLock::new(vec![cfg]));
+    let (_change_tx, change_rx) = mpsc::unbounded_channel::<()>();
+    let sup = spawn_supervisor(shared, change_rx, fast_config());
+
+    let row = wait_for(&sup, Duration::from_secs(5), |snap| {
+        snap.iter().find(|s| s.id == "cwd").cloned()
+    })
+    .await
+    .expect("disabled workspace server appears as a synthetic status row");
+
+    assert_eq!(row.state, McpServerState::Disabled);
+    assert_eq!(row.scope_key, None, "no live instance -> no scope key");
+    assert_eq!(row.pid, None);
 
     sup.stop_all().await;
 }
