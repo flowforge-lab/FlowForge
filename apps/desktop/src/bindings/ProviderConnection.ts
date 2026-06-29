@@ -35,6 +35,14 @@ baseUrl?: string, model: string,
  */
 hasKey: boolean, 
 /**
+ * True when the registry believes a key is stored (`has_key`) but the OS
+ * keychain no longer returns it — most often because an app rebuild changed
+ * the code-signing identity and the keychain ACL denied the new binary.
+ * Lets the UI prompt "re-enter your key" instead of failing auth silently.
+ * Computed on the read path; never persisted as `true`.
+ */
+secretMissing: boolean, 
+/**
  * When true, request and surface model reasoning/thinking streams (#181).
  */
 thinking: boolean, 

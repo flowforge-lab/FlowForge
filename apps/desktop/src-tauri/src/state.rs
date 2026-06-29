@@ -270,6 +270,7 @@ fn config_to_connection(config: ProviderConfig) -> ProviderConnection {
         base_url: config.base_url,
         model: config.model,
         has_key: config.has_key,
+        secret_missing: false,
         thinking: config.thinking,
         // Carry the depth dial through migration; a legacy `provider.json` without
         // the field deserializes to Medium (`#[serde(default)]`), same as before.
@@ -1307,7 +1308,20 @@ impl AppState {
 
     /// The full connection registry (clone — callers never hold the lock).
     pub fn provider_registry(&self) -> ProviderRegistry {
-        self.registry.lock().unwrap().clone()
+        let mut reg = self.registry.lock().unwrap().clone();
+        // Cross-check `has_key` against the live OS keychain. An app rebuild can
+        // change the code-signing identity, after which the keychain ACL denies
+        // the new binary and secrets written by the old build read back as
+        // `None` — so `has_key` still says "key present" while auth fails. Flag
+        // those connections so the UI can prompt to re-enter the key instead of
+        // failing silently. Read-only probe over the clone; the persisted
+        // registry is untouched, so `secret_missing` is never saved as `true`.
+        for conn in &mut reg.connections {
+            if conn.has_key && crate::secrets::present(conn.id.as_str()).is_empty() {
+                conn.secret_missing = true;
+            }
+        }
+        reg
     }
 
     /// Select the active connection by id; persists. `Err` on an unknown id.
@@ -3099,6 +3113,7 @@ mod tests {
                 base_url: None,
                 model: "saved".into(),
                 has_key: false,
+                secret_missing: false,
                 thinking: true,
                 reasoning_effort: ReasoningEffort::default(),
                 reasoning_visibility: ReasoningVisibility::default(),
@@ -3237,6 +3252,7 @@ mod tests {
             base_url: None,
             model: "zai-org/GLM-5.2".into(),
             has_key: false,
+            secret_missing: false,
             thinking: true,
             reasoning_effort: effort,
             reasoning_visibility: ReasoningVisibility::default(),
@@ -3293,6 +3309,7 @@ mod tests {
                     base_url: None,
                     model: "llama3.2".into(),
                     has_key: false,
+                    secret_missing: false,
                     thinking: true,
                     reasoning_effort: ReasoningEffort::default(),
                     reasoning_visibility: ReasoningVisibility::default(),
@@ -3309,6 +3326,7 @@ mod tests {
                     base_url: None,
                     model: "us.anthropic.claude-opus-4-8".into(),
                     has_key: false,
+                    secret_missing: false,
                     thinking: false,
                     reasoning_effort: ReasoningEffort::default(),
                     reasoning_visibility: ReasoningVisibility::default(),
@@ -3534,6 +3552,7 @@ mod tests {
             base_url: Some("https://openrouter.ai/api/v1".into()),
             model: "x".into(),
             has_key: false,
+            secret_missing: false,
             thinking: true,
             reasoning_effort: ReasoningEffort::default(),
             reasoning_visibility: ReasoningVisibility::default(),
@@ -3623,6 +3642,7 @@ mod tests {
             base_url: None,
             model: "gpt-4o".into(),
             has_key: false,
+            secret_missing: false,
             thinking: false,
             reasoning_effort: ReasoningEffort::default(),
             reasoning_visibility: ReasoningVisibility::default(),
@@ -3683,6 +3703,7 @@ mod tests {
             base_url: None,
             model: "anthropic.claude-3-5-sonnet".into(),
             has_key: false,
+            secret_missing: false,
             thinking: false,
             reasoning_effort: ReasoningEffort::default(),
             reasoning_visibility: ReasoningVisibility::default(),
