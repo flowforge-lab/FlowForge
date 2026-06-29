@@ -41,9 +41,9 @@ read to a specific hunk, do not make it.
 
 ## Do not spider the call graph
 
-This is the key override: do NOT use `codegraph_explore`, `codegraph_callers`,
-`codegraph_callees`, or `codegraph_impact` to map the area around the change.
-Call-graph traversal turns a scoped review into an open-ended survey and reads
-far past the change under review. A single targeted `codegraph_callers` on one
-changed symbol is acceptable only when a specific hunk makes you suspect a caller
-broke; a blanket "let me explore the impact" is not.
+This is the key override: do NOT use `codegraph_explore`, `codegraph_node`, or
+`codegraph_trace` to map the area around the change. Call-graph traversal turns a
+scoped review into an open-ended survey and reads far past the change under
+review. A single targeted `codegraph_node` on one changed symbol -- it returns
+that symbol's caller/callee trail -- is acceptable only when a specific hunk makes
+you suspect a caller broke; a blanket "let me explore the impact" is not.

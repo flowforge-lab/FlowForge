@@ -1,7 +1,7 @@
 ---
 name: codegraph
-description: Code-aware navigation via the codegraph MCP server — query the symbol graph (definitions, callers, callees, impact) instead of grepping.
-version: 0.1.0
+description: Code-aware navigation via the codegraph MCP server — query the symbol graph (definitions, neighborhoods, call paths) in a few calls instead of grepping.
+version: 0.1.1
 author: tonytan4ever
 mcp:
   - codegraph
@@ -9,8 +9,8 @@ keywords:
   - code
   - navigation
   - graph
-  - callers
   - references
+  - call-path
   - refactor
 ---
 # Codegraph — navigate code as a graph
@@ -25,32 +25,40 @@ tools are simply unavailable; fall back to `grep`/`glob`/`view`. codegraph only
 helps when you query it directly — don't delegate exploration to file-reading
 sub-agents, or the index becomes overhead.
 
-## Tools (prefixed `mcp__codegraph__` once bridged)
+## Invoking the tools
 
-- **`codegraph_explore`** — the primary tool. Returns the relevant symbols' source
-  grouped by file plus a relationship map, in one call. Use it for almost
-  anything: "how does X work", "how does X reach Y", or surveying an area. Answer
-  from its output and stop.
-- **`codegraph_search`** — locate a symbol by name across the codebase.
-- **`codegraph_callers`** — every call site of a function (including callback
-  registrations). Use before changing a signature.
-- **`codegraph_callees`** — what a function calls.
-- **`codegraph_impact`** — the impact radius of changing a symbol; run before an edit.
-- **`codegraph_node`** — one symbol's details and full source + callers, or read a
-  file like the `view` tool (with line numbers).
-- **`codegraph_files`** — the indexed file structure (faster than scanning the FS).
-- **`codegraph_status`** — index health and pending-sync status.
+The tools below are named as codegraph advertises them. FlowForge bridges every
+MCP tool under a namespaced id, so you must call them with the `mcp__codegraph__`
+prefix — for example, invoke `codegraph_context` as
+`mcp__codegraph__codegraph_context`. Calling the bare name will not resolve.
+
+## Tools
+
+- **`codegraph_context`** — the PRIMARY tool; call it FIRST for any "how does X
+  work", architecture, or bug question. Give it a `task` description; it returns
+  entry points + related symbols + key code in one call, usually answering with
+  no further search or file reads.
+- **`codegraph_explore`** — source of SEVERAL related symbols grouped by file, in
+  one capped call. Its `query` is a bag of symbol/file names (not a question).
+  The returned source is verbatim and Read-equivalent — don't re-open shown files.
+- **`codegraph_search`** — quick symbol search by name; returns locations only (no
+  code). Use it when you just need where a symbol lives.
+- **`codegraph_node`** — one symbol's location, signature, and callers/callees
+  trail; pass `includeCode` to get the verbatim body.
+- **`codegraph_trace`** — the call path between two symbols ("how does `from` reach
+  `to`?"), with each hop's body inlined, in one call. Ideal for flow questions.
 
 ## When to use which
 
-1. Starting a task or answering "how does X work?" -> `codegraph_explore`.
-2. Just need where a symbol lives -> `codegraph_search`.
-3. About to change a function -> `codegraph_callers` + `codegraph_impact` first.
-4. Reading a specific symbol or file -> `codegraph_node`.
-5. Only when the graph can't answer -> grep/glob/read.
+1. Starting a task or answering "how does X work?" -> `codegraph_context`.
+2. Surveying several symbols/files you can already name -> `codegraph_explore`.
+3. Just need where a symbol lives -> `codegraph_search`.
+4. One symbol's details or body -> `codegraph_node`.
+5. "How does A reach B?" (a flow or call path) -> `codegraph_trace`.
+6. Only when the graph can't answer -> grep/glob/read.
 
 ## Freshness
 
 codegraph auto-syncs on file changes (debounced) and reconciles on reconnect. If a
 response prepends a `⚠️` staleness banner for a file, read that file directly for
-its live content. Check `codegraph_status` if results look stale.
+its live content.
