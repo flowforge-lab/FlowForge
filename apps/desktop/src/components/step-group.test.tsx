@@ -4,6 +4,7 @@ import { render, fireEvent, within } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
 import { StepGroup } from "@/components/step-group";
 import type { ToolStep } from "@/store/chat";
+import type { TurnItem } from "@/lib/turn-groups";
 
 const noop = () => {};
 
@@ -81,5 +82,44 @@ describe("StepGroup collapsed answer preview (#414)", () => {
     const { container } = renderGroup({ streaming: true, answer: ANSWER });
     expect(header(container).getAttribute("aria-expanded")).toBe("true");
     expect(within(container).queryByText(ANSWER)).toBeNull();
+  });
+});
+
+describe("StepGroup interleaved reasoning (#574)", () => {
+  it("renders a reasoning row in position, before its sibling step rows", () => {
+    const steps = [
+      step({ callId: "c1", args: { command: "ls" } }),
+      step({ callId: "c2", args: { command: "pwd" } }),
+    ];
+    const items: TurnItem[] = [
+      { kind: "reasoning", text: "plan: list then locate", key: "a1" },
+      { kind: "step", step: steps[0] },
+      { kind: "step", step: steps[1] },
+    ];
+    // streaming keeps the group expanded so every row is visible.
+    const { container } = render(
+      <StepGroup
+        steps={steps}
+        items={items}
+        streaming
+        hasAnswer={false}
+        onRespond={noop}
+        onApproveSession={noop}
+        onApproveAlways={noop}
+        onAnswer={noop}
+      />,
+    );
+
+    // Exactly one Thinking block — no top-pinned duplicate above the steps.
+    const thinking = within(container).getAllByText("Thinking");
+    expect(thinking).toHaveLength(1);
+
+    // The reasoning row precedes the first step row in document order.
+    const reasoning = thinking[0];
+    const firstStep = within(container).getByText("Run `ls`");
+    expect(
+      reasoning.compareDocumentPosition(firstStep) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
   });
 });

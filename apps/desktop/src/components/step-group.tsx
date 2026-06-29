@@ -33,7 +33,6 @@ export function StepGroup({
   items,
   streaming,
   turnStartMs,
-  reasoning,
   hasAnswer,
   answer,
   onExportTimeline,
@@ -43,13 +42,12 @@ export function StepGroup({
   onAnswer,
 }: {
   steps: ToolStep[];
-  /** Ordered prose + step rows (#415). Defaults to the steps alone when omitted. */
+  /** Ordered reasoning + prose + step rows (#415/#574). Each iteration's reasoning is
+   *  a `reasoning` item in position; defaults to the steps alone when omitted. */
   items?: TurnItem[];
   streaming: boolean;
   /** Wall-clock turn start from send / first stream (#180). */
   turnStartMs?: number | null;
-  /** Model reasoning for this turn (#205); folds under this group, above the steps. */
-  reasoning?: string;
   hasAnswer?: boolean;
   /** The turn's final answer text. When the group is collapsed, a muted 2-line
    *  preview of it shows under the header so the outcome is visible without
@@ -167,13 +165,6 @@ export function StepGroup({
       )}
       {open && (
         <div className="mt-1.5 flex flex-col gap-1.5 border-l border-border/60 pl-2.5">
-          {reasoning ? (
-            <ThinkingBlock
-              reasoning={reasoning}
-              streaming={streaming}
-              hasAnswer={hasAnswer ?? false}
-            />
-          ) : null}
           {earlierCount > 0 && streaming && !awaiting && (
             <button
               type="button"
@@ -186,7 +177,14 @@ export function StepGroup({
             </button>
           )}
           {visibleItems.map((it) =>
-            it.kind === "prose" ? (
+            it.kind === "reasoning" ? (
+              <ThinkingBlock
+                key={`reasoning:${it.key}`}
+                reasoning={it.text}
+                streaming={streaming}
+                hasAnswer={hasAnswer ?? false}
+              />
+            ) : it.kind === "prose" ? (
               <ProseStepBlock key={`prose:${it.key}`} text={it.text} />
             ) : (
               <ToolStepBlock

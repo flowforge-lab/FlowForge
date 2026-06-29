@@ -125,8 +125,8 @@ function MessageRowImpl({
         <div className="flex w-full max-w-[80%] flex-col gap-1.5">
           {/* Single settled step stays bare; streaming (any count), 2+ steps, any
               reasoning to fold in (#205), or any intermediate prose to interleave
-              (#415) use StepGroup so the live timer, peek window (#180), grouped
-              Thinking block, and folded prose rows apply. */}
+              (#415) use StepGroup so the live timer, peek window (#180), and the
+              inline Thinking + prose rows (#574/#415) apply in chronological order. */}
           {toolSteps.length === 1 &&
           !streaming &&
           !reasoning &&
@@ -144,7 +144,6 @@ function MessageRowImpl({
               items={items}
               streaming={streaming}
               turnStartMs={turnStartMs}
-              reasoning={reasoning}
               hasAnswer={message.content.length > 0}
               answer={message.content}
               onExportTimeline={
@@ -245,8 +244,8 @@ export function ChatView({ sessionId }: { sessionId?: string } = {}) {
   // across every iteration of a multi-step turn), or reconstructed from the persisted
   // tool/system messages on reload. Intermediate prose interleaves as folded rows.
   const groups = useMemo(
-    () => foldTurns(messages ?? [], toolStepsByMessage),
-    [messages, toolStepsByMessage],
+    () => foldTurns(messages ?? [], toolStepsByMessage, reasoningByMessage),
+    [messages, toolStepsByMessage, reasoningByMessage],
   );
 
   const scrollRef = useRef<HTMLDivElement>(null);
