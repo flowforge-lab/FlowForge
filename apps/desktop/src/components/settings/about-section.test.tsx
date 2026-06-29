@@ -34,7 +34,7 @@ beforeEach(() => {
     root = createRoot(container);
   });
   useSettingsStore.setState({ activeSection: "about", resetHandler: null });
-  useUpdateStore.setState({ status: null, installing: false });
+  useUpdateStore.setState({ status: null, installing: false, progress: null });
 });
 
 afterEach(() => {
@@ -116,5 +116,40 @@ describe("AboutSection", () => {
     expect(btn).toBeDefined();
     expect(btn?.disabled).toBe(true);
     expect(btn?.querySelector(".animate-spin")).not.toBeNull();
+  });
+
+  it("renders a determinate progress bar while downloading with a known total (#566)", () => {
+    useUpdateStore.setState({
+      status: { kind: "available", version: "9.9.9", notes: null },
+      installing: true,
+      progress: { downloaded: 256, total: 1024 },
+    });
+    render(<AboutSection />);
+    const bar = container.querySelector('[role="progressbar"]');
+    expect(bar).not.toBeNull();
+    expect(bar?.getAttribute("aria-valuenow")).toBe("25");
+  });
+
+  it("renders an indeterminate bar while downloading without a total (#566)", () => {
+    useUpdateStore.setState({
+      status: { kind: "available", version: "9.9.9", notes: null },
+      installing: true,
+      progress: { downloaded: 999, total: null },
+    });
+    render(<AboutSection />);
+    const bar = container.querySelector('[role="progressbar"]');
+    expect(bar).not.toBeNull();
+    // No content length -> indeterminate: no aria-valuenow, pulsing track.
+    expect(bar?.getAttribute("aria-valuenow")).toBeNull();
+    expect(bar?.classList.contains("animate-pulse")).toBe(true);
+  });
+
+  it("renders no progress bar when not installing (#566)", () => {
+    useUpdateStore.setState({
+      status: { kind: "available", version: "9.9.9", notes: null },
+      installing: false,
+    });
+    render(<AboutSection />);
+    expect(container.querySelector('[role="progressbar"]')).toBeNull();
   });
 });
