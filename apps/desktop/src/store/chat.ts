@@ -92,6 +92,10 @@ interface ChatState {
   bootstrapError: string | null;
 
   bootstrap: () => Promise<void>;
+  /** Re-pull the session list from the backend (e.g. after a scheduled task fires
+   *  and creates a session out of band, #543), so it appears in the sidebar and the
+   *  ↗ open-session jump can resolve it. Replaces the list with backend truth. */
+  refreshSessions: () => Promise<void>;
   selectSession: (sessionId: string) => Promise<void>;
   /** Pull a session's history into messagesBySession WITHOUT changing the active
    *  session. Used by split panes, which each show an independent session while
@@ -280,6 +284,11 @@ export const useChatStore = create<ChatState>((set, get) => ({
       console.error("[FlowForge] bootstrap failed:", msg);
       set({ bootstrapError: msg });
     }
+  },
+
+  refreshSessions: async () => {
+    const sessions = await ipc.listSessions();
+    set({ sessions });
   },
 
   selectSession: async (sessionId) => {

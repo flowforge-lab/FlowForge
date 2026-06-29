@@ -9,6 +9,8 @@ describe("useScheduledStore", () => {
       loading: false,
       saving: false,
       error: null,
+      runsByTask: {},
+      runningId: null,
     });
   });
 
@@ -103,6 +105,48 @@ describe("useScheduledStore", () => {
     expect(tasks.some((t) => t.id === before.id)).toBe(false);
     expect(tasks[indexBefore].name).toBe("After");
     expect(tasks[indexBefore].safetyCeiling).toBe("write");
+  });
+
+  it("runNow caches the fired run's session for the open-session jump", async () => {
+    await useScheduledStore.getState().load();
+    await useScheduledStore.getState().runNow("memory-organizer");
+    const { runsByTask, runningId } = useScheduledStore.getState();
+    expect(runningId).toBeNull();
+    expect(runsByTask["memory-organizer"]).toBeTruthy();
+  });
+
+  it("applyFired caches the session and stamps lastRun", async () => {
+    await useScheduledStore.getState().load();
+    useScheduledStore.getState().applyFired({
+      id: 1,
+      taskId: "memory-organizer",
+      sessionId: "sess-123",
+      firedMs: 42,
+      status: "ok",
+    });
+    const { runsByTask, tasks } = useScheduledStore.getState();
+    expect(runsByTask["memory-organizer"]).toBe("sess-123");
+    expect(tasks.find((t) => t.id === "memory-organizer")?.lastRun).toBe(42);
+  });
+
+  it("applyChanged replaces the task list wholesale, preserving cached runs", async () => {
+    await useScheduledStore.getState().load();
+    useScheduledStore.setState({ runsByTask: { keep: "sess-keep" } });
+    useScheduledStore.getState().applyChanged([
+      {
+        id: "only",
+        name: "Only One",
+        cron: "0 0 9 * * *",
+        kind: { kind: "prompt", value: "x" },
+        safetyCeiling: "read_only",
+        cadenceLabel: "Daily at 9:00 AM",
+        paused: false,
+      },
+    ]);
+    const { tasks, runsByTask } = useScheduledStore.getState();
+    expect(tasks).toHaveLength(1);
+    expect(tasks[0].id).toBe("only");
+    expect(runsByTask["keep"]).toBe("sess-keep");
   });
 
   it("resetScheduled resumes every paused task", async () => {

@@ -1,6 +1,8 @@
 import { useEffect, useState } from "react";
 import {
   Check,
+  CirclePlay,
+  Loader2,
   Pause,
   Pencil,
   Play,
@@ -12,6 +14,8 @@ import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { useSettingsStore } from "@/store/settings";
 import { useScheduledStore } from "@/store/scheduled";
+import { useChatStore } from "@/store/chat";
+import { usePanesStore } from "@/store/panes";
 import { ScheduledTaskForm } from "@/components/settings/scheduled-task-form";
 import type { ScheduledTask } from "@/bindings";
 
@@ -26,10 +30,12 @@ function fmt(ms: number | null | undefined): string {
 }
 
 /**
- * Scheduled section (#132 → #541): cron-scheduled agent tasks against the real
- * `ff-scheduled` commands. Lists tasks (built-in + user), with a new/edit form +
- * schedule builder and store-backed create / edit / delete / pause. Footer "Reset to
- * defaults" resumes every paused task. Firing / run-now / open-session are FE-2.
+ * Scheduled section (#132 → #541 → #543): cron-scheduled agent tasks against the
+ * real `ff-scheduled` commands. Lists tasks (built-in + user), with a new/edit form +
+ * schedule builder and store-backed create / edit / delete / pause. Each row can be
+ * fired now (▶) and, once a fire produces a session, jumped to (↗). `Next` / `Last`
+ * live-update from `scheduled:fired` / `scheduled:changed`. Footer "Reset to defaults"
+ * resumes every paused task.
  */
 export function ScheduledSection() {
   const tasks = useScheduledStore((s) => s.tasks);
@@ -119,8 +125,27 @@ function TaskCard({
 }) {
   const toggle = useScheduledStore((s) => s.toggle);
   const remove = useScheduledStore((s) => s.remove);
+  const runNow = useScheduledStore((s) => s.runNow);
   const saving = useScheduledStore((s) => s.saving);
+  const running = useScheduledStore((s) => s.runningId === task.id);
+  const sessionId = useScheduledStore((s) => s.runsByTask[task.id]);
   const isBuiltin = task.kind.kind === "builtin";
+
+  // Leave Settings and land on the session the most recent fire produced. Load it
+  // into the focused pane (so it shows where the user is looking), mirroring the
+  // sidebar's open() (#148); fall back to a global switch before panes initialize.
+  const openSession = () => {
+    if (!sessionId) return;
+    const chat = useChatStore.getState();
+    const focused = usePanesStore.getState().focusedPaneId;
+    if (focused) {
+      usePanesStore.getState().setPaneSession(focused, sessionId);
+      void chat.loadSession(sessionId);
+    } else {
+      void chat.selectSession(sessionId);
+    }
+    useSettingsStore.getState().closeSettings();
+  };
 
   return (
     <li className="flex items-center gap-3 rounded-md border px-3 py-2.5">
@@ -162,9 +187,26 @@ function TaskCard({
           variant="ghost"
           size="icon-xs"
           className="text-muted-foreground hover:text-foreground"
-          disabled
-          title="Open task — coming soon"
-          aria-label="Open task — coming soon"
+          disabled={running || task.paused}
+          onClick={() => void runNow(task.id)}
+          title={
+            task.paused ? "Resume to run" : running ? "Running…" : "Run now"
+          }
+          aria-label={running ? "Running task" : "Run task now"}
+        >
+          {running ? <Loader2 className="animate-spin" /> : <CirclePlay />}
+        </Button>
+        <Button
+          type="button"
+          variant="ghost"
+          size="icon-xs"
+          className="text-muted-foreground hover:text-foreground"
+          disabled={!sessionId}
+          onClick={openSession}
+          title={sessionId ? "Open last run's session" : "No run yet"}
+          aria-label={
+            sessionId ? "Open last run's session" : "No run to open yet"
+          }
         >
           <SquareArrowOutUpRight />
         </Button>

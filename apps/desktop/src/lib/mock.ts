@@ -47,7 +47,11 @@ import type { BedrockAuth } from "../bindings/BedrockAuth";
 import type { FfIpc, Unlisten } from "./ipc";
 import type { MarketplaceSkill } from "./marketplace";
 import type { MarketplaceProfile } from "./profile-marketplace";
-import type { ScheduledTask, CreateScheduledTaskInput } from "@/bindings";
+import type {
+  ScheduledTask,
+  CreateScheduledTaskInput,
+  RunRecord,
+} from "@/bindings";
 import { CONTROL_DEFAULTS, type ControlConfig } from "./control";
 import {
   APP_VERSION_FALLBACK,
@@ -617,6 +621,13 @@ export class MockIpc implements FfIpc {
   );
   private mcpStatusListeners = new Set<Listener<McpStatusChangedEvent>>();
   private memoryFlushedListeners = new Set<Listener<MemoryFlushedEvent>>();
+  // Scheduled-task firing (#543). `scheduled:fired` carries the run a fire created
+  // (taskId → sessionId linkage); `scheduled:changed` carries a full task snapshot
+  // that replaces the store wholesale (mirrors `mcp:status-changed`).
+  private scheduledFiredListeners = new Set<Listener<RunRecord>>();
+  private scheduledChangedListeners = new Set<Listener<ScheduledTask[]>>();
+  /** Monotonic run-id source for the `RunRecord`s `runScheduledTaskNow` mints. */
+  private scheduledRunSeq = 0;
   private phenoMcpUnavailableListeners = new Set<
     Listener<PhenotypeMcpUnavailableEvent>
   >();
@@ -857,6 +868,14 @@ export class MockIpc implements FfIpc {
 
   onMemoryFlushed(cb: Listener<MemoryFlushedEvent>): Promise<Unlisten> {
     return this.subscribe(this.memoryFlushedListeners, cb);
+  }
+
+  onScheduledFired(cb: Listener<RunRecord>): Promise<Unlisten> {
+    return this.subscribe(this.scheduledFiredListeners, cb);
+  }
+
+  onScheduledChanged(cb: Listener<ScheduledTask[]>): Promise<Unlisten> {
+    return this.subscribe(this.scheduledChangedListeners, cb);
   }
 
   onPhenotypeMcpUnavailable(
@@ -1263,6 +1282,34 @@ export class MockIpc implements FfIpc {
   async previewCadence(cron: string): Promise<string> {
     // The mock cannot parse cron; echo a stable placeholder.
     return `Runs on \`${cron}\``;
+  }
+
+  async runScheduledTaskNow(id: string): Promise<RunRecord> {
+    const task = this.scheduledTasks.find((t) => t.id === id);
+    if (!task) throw new Error(`unknown scheduled task: ${id}`);
+    // A manual fire spawns a session the run is attached to (the real runner does
+    // the same), so the UI's ↗ open-session jump has somewhere to land.
+    const session = await this.createSession(`Scheduled: ${task.name}`);
+    const firedMs = Date.now();
+    // The fire updates the derived stamps: last run is now; an active task's next
+    // run rolls forward (a paused task still has none).
+    task.lastRun = firedMs;
+    task.nextRun = task.paused ? undefined : firedMs + 24 * HOUR_MS;
+    const run: RunRecord = {
+      id: (this.scheduledRunSeq += 1),
+      taskId: id,
+      sessionId: session.id,
+      firedMs,
+      status: "ok",
+    };
+    // Fire first (carries the session linkage), then the snapshot that live-updates
+    // Next / Last in the list without a reload.
+    this.emit(this.scheduledFiredListeners, run);
+    this.emit(
+      this.scheduledChangedListeners,
+      this.scheduledTasks.map((t) => ({ ...t })),
+    );
+    return run;
   }
 
   async warmup(): Promise<void> {

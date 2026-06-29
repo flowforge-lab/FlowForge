@@ -9,6 +9,7 @@ import { useSkillsStore } from "@/store/skills";
 import { useMcpStore } from "@/store/mcp";
 import { useMemoryStore } from "@/store/memory";
 import { usePhenoMcpNoticeStore } from "@/store/pheno-mcp-notice";
+import { useScheduledStore } from "@/store/scheduled";
 import { useUpdateStore } from "@/store/update";
 import { useSessionWorkspaceStore } from "@/store/session-workspace";
 
@@ -69,6 +70,19 @@ export function startIpcEvents(): void {
   // never blocks; this is informational.
   void ipc.onPhenotypeMcpUnavailable((e) => {
     usePhenoMcpNoticeStore.getState().show(e);
+  });
+  // A scheduled task fired (#543): cache the run's session for the ↗ jump and
+  // optimistically stamp Last; the snapshot below is the source of truth. The fire
+  // created a session out of band, so re-pull the session list (it lands in the
+  // sidebar, and the ↗ jump can resolve its title/history).
+  void ipc.onScheduledFired((e) => {
+    useScheduledStore.getState().applyFired(e);
+    void useChatStore.getState().refreshSessions();
+  });
+  // Scheduled-task state changed: a full snapshot replaces the list wholesale, so
+  // Next / Last live-update without a reload (mirrors mcp:status-changed).
+  void ipc.onScheduledChanged((e) => {
+    useScheduledStore.getState().applyChanged(e);
   });
   // #561 — the active workspace's git HEAD changed on disk (terminal checkout,
   // rebase, or the assistant's own bash switching branches). Patch the cached

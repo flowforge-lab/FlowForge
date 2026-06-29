@@ -8,7 +8,11 @@ import type { UpdateStatus, BackupResult } from "@/lib/about";
 import type { ControlConfig } from "@/lib/control";
 import type { MarketplaceSkill } from "@/lib/marketplace";
 import type { MarketplaceProfile } from "@/lib/profile-marketplace";
-import type { ScheduledTask, CreateScheduledTaskInput } from "@/bindings";
+import type {
+  ScheduledTask,
+  CreateScheduledTaskInput,
+  RunRecord,
+} from "@/bindings";
 import type { PhenotypeMcpUnavailableEvent } from "@/bindings";
 import type { UpdateProgressEvent } from "@/bindings";
 import type {
@@ -322,6 +326,16 @@ export interface FfIpc {
   /** The human cadence label a cron expression would produce (e.g. "Daily at
    *  5:00 PM"), for the New-task form's Custom-cron preview. Rejects bad cron. */
   previewCadence(cron: string): Promise<string>;
+  // CONTRACT CHANGE (#543, depends on backend Issue C — runner + events): NEW
+  // command + the `scheduled:fired` / `scheduled:changed` events below need a real
+  // Rust emitter — please review @backend-owner. Both events reuse existing
+  // generated bindings (`RunRecord`, `ScheduledTask`), so `bindings/` is untouched;
+  // only the Rust command (`run_scheduled_task_now`) + the two emits are owed.
+  // Mocked under `VITE_FF_MOCK=1` for now.
+  /** Fire a task immediately (out of band of its cron). Resolves with the run it
+   *  created — `RunRecord.sessionId` is the session the fire spawned, backing the
+   *  ↗ open-session jump. Also drives a `scheduled:fired` + `scheduled:changed`. */
+  runScheduledTaskNow(id: string): Promise<RunRecord>;
 
   // MCP servers (M4.4, RFC 0003). Enable/disable/add/remove write `mcp.json`; the
   // config watcher reconciles the supervisor, which then emits `mcp:status-changed`.
@@ -380,6 +394,15 @@ export interface FfIpc {
    *  mid-turn (#283). Fires only when something was written, so the memory browser
    *  can surface provenance. Re-read files via `listMemoryFiles`/`memoryOverview`. */
   onMemoryFlushed(cb: (e: MemoryFlushedEvent) => void): Promise<Unlisten>;
+  /** A scheduled task fired (via cron or `runScheduledTaskNow`) and produced a run.
+   *  Carries the `RunRecord` so the UI can cache the run's `sessionId` for the ↗
+   *  open-session jump. See the CONTRACT CHANGE note on `runScheduledTaskNow`. */
+  onScheduledFired(cb: (e: RunRecord) => void): Promise<Unlisten>;
+  /** A scheduled task's derived state changed (a fire recomputed next/last, or a
+   *  create/delete/toggle the runner applied). Carries the full task-list snapshot,
+   *  which replaces the store wholesale (mirrors `onMcpStatusChanged`) so `Next` /
+   *  `Last` update live without a reload. */
+  onScheduledChanged(cb: (e: ScheduledTask[]) => void): Promise<Unlisten>;
   // CONTRACT CHANGE (#301, surface unavailable skill-required MCP servers): NEW
   // event needing a real Rust emitter — please review @backend-owner. PR #296
   // added the backend compute (`AppState::unavailable_required_servers`) but it is
@@ -607,6 +630,8 @@ class TauriIpc implements FfIpc {
     this.invoke<void>("delete_scheduled_task", { id });
   previewCadence = (cron: string) =>
     this.invoke<string>("preview_cadence", { cron });
+  runScheduledTaskNow = (id: string) =>
+    this.invoke<RunRecord>("run_scheduled_task_now", { id });
 
   listMcpServers = () => this.invoke<McpServerStatus[]>("list_mcp_servers");
   restartMcpServer = (id: string) =>
@@ -654,6 +679,10 @@ class TauriIpc implements FfIpc {
     this.listen<McpStatusChangedEvent>("mcp:status-changed", cb);
   onMemoryFlushed = (cb: (e: MemoryFlushedEvent) => void) =>
     this.listen<MemoryFlushedEvent>("memory:flushed", cb);
+  onScheduledFired = (cb: (e: RunRecord) => void) =>
+    this.listen<RunRecord>("scheduled:fired", cb);
+  onScheduledChanged = (cb: (e: ScheduledTask[]) => void) =>
+    this.listen<ScheduledTask[]>("scheduled:changed", cb);
   onPhenotypeMcpUnavailable = (cb: (e: PhenotypeMcpUnavailableEvent) => void) =>
     this.listen<PhenotypeMcpUnavailableEvent>("phenotype:mcp-unavailable", cb);
   onUpdateProgress = (cb: (e: UpdateProgressEvent) => void) =>
