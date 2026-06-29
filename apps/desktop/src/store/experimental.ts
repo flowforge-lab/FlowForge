@@ -22,8 +22,9 @@ export type FlagId =
   | "stepTimelineExport"
   // FE-only dev affordance (#567, RFC 0014 §12.3, P5c): lets the background
   // update poll run in a dev build so the global update bar picks up a local
-  // `dev-release.sh` feed. Pairs with `FF_UPDATER_ENDPOINT`; without a local
-  // feed the check returns up-to-date, so it never reaches the public feed.
+  // `dev-release.sh` feed. Pair with `FF_UPDATER_ENDPOINT`: with it unset the
+  // poll falls through to the default public feed, inert only while the dev
+  // version matches the latest release.
   | "localUpdateChannel";
 
 export const FLAG_IDS: readonly FlagId[] = [

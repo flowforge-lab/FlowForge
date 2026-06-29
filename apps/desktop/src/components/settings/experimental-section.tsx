@@ -61,7 +61,7 @@ const FLAGS: readonly FlagMeta[] = [
     id: "localUpdateChannel",
     label: "Local update channel",
     description:
-      "Enable the background update poll in a dev build so the global update bar picks up a local dev-release.sh feed (D1, local updater endpoint). Pairs with FF_UPDATER_ENDPOINT — without a local feed the check returns up-to-date, so it never reaches the public GitHub feed. Not dev-install.sh (D2, direct file swap, no feed).",
+      "Enable the background update poll in a dev build so the global update bar picks up a local dev-release.sh feed (D1, local updater endpoint). Set FF_UPDATER_ENDPOINT when you turn this on: without it the poll falls through to the default public GitHub feed (inert only while your dev version matches the latest release). Not dev-install.sh (D2, direct file swap, no feed).",
     restartRequired: true,
   },
 ];

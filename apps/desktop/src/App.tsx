@@ -26,8 +26,9 @@ function App() {
       void useModelConfigStore.getState().load();
       // Background update check (#363). Prod always polls; in a dev build the
       // poll runs only when the `localUpdateChannel` experimental flag is on
-      // (#567), so a `pnpm tauri dev` process never surfaces a real GitHub
-      // release unless a developer opts in to the local dev-release.sh feed.
+      // (#567). Pair the flag with a local `FF_UPDATER_ENDPOINT`; without it the
+      // poll still reaches the default public GitHub feed, so set the endpoint
+      // when enabling the flag in a `pnpm tauri dev` process.
       // Initial check on launch, then every few hours; cleared on teardown.
       const localUpdateChannel =
         useExperimentalStore.getState().flags.localUpdateChannel;
