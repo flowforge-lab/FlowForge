@@ -175,9 +175,9 @@ impl ProcessSupervisor {
             }
         }
 
-        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
-        let mut cmd = Command::new(&shell);
-        cmd.arg("-c")
+        let (program, flag) = crate::shell::shell_invocation();
+        let mut cmd = Command::new(&program);
+        cmd.arg(flag)
             .arg(command)
             .current_dir(dir)
             .stdin(Stdio::null())
@@ -190,7 +190,7 @@ impl ProcessSupervisor {
 
         let mut child = cmd
             .spawn()
-            .map_err(|e| format!("failed to spawn process ({shell} -c): {e}"))?;
+            .map_err(|e| format!("failed to spawn process ({program} {flag}): {e}"))?;
         let pid = child.id();
         let shared = Arc::new(Shared::new(MAX_BUFFER_BYTES));
 
