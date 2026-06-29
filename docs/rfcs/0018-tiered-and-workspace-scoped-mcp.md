@@ -385,4 +385,32 @@ the same trade the model tier makes.
 | codegraph decoupling | `docs/examples/codon`, seed retirement | low |
 
 Refs #557, #573, #548, #556.
-RFCEOF;echo "RFC written"; wc -l docs/rfcs/0018-tiered-and-workspace-scoped-mcp.md; git -C /Users/ytonytan/projects/flowforge status --short | tee "/Users/ytonytan/.aki/.tasks/tool-toolu_bdrk_013DqJZffEGsESyJFh2EfLDx/pipe_full.log" | head
+
+## 14. Relationship to RFC 0003 (MCP Host & Supervisor)
+
+RFC 0003 defines the MCP host: the `McpServerConfig` shape, the supervisor's
+spawn/reap lifecycle, the stdio client contract, env isolation, the approval gate,
+and the `mcp__<server>__<tool>` bridge. This RFC builds **on top of** that host. It
+does not re-litigate any of those decisions; it adds two orthogonal axes (tiered
+resolution + instance scope) and, in two narrow places, supersedes an implicit
+single-instance assumption. The table below is the authoritative reconciliation.
+
+| RFC 0003 item | Loc. | RFC 0018 treatment |
+|---------------|------|--------------------|
+| `McpServerConfig` struct (no `scope`) | §4 | **Extended.** §4.1 adds `scope: McpScope` defaulting to `Global`. Additive and back-compat — an absent field deserializes to `Global`, so every existing `mcp.json` keeps its exact prior behaviour. |
+| One running instance per server id (handles keyed by `server_id`) | §5 | **Superseded for workspace scope.** §4.2 re-keys handles to `(id, ScopeKey)`. `Global`-scoped servers retain 0003's one-instance-per-id semantics verbatim; only `Workspace`-scoped servers get one instance per distinct workspace root. |
+| Config source = the single watched `mcp.json`; snapshot the running set at turn start | §3, §9 risk 3 | **Source generalized, discipline kept.** §3.2 makes the desired set a computed union of the tiered resolution over live sessions instead of one file's contents. The turn-start snapshot discipline (0003 §9 risk 3) is retained unchanged; the watched `mcp.json` now feeds only the **Global** tier. |
+| Env isolation + declared-key allowlist; never inherit full host env | §9.2 | **Unchanged.** Tiering and scope do not alter env handling. (PR-B / #580's PATH augmentation is orthogonal and compatible — it adds resolved bin dirs to `PATH` for spawn discovery, not arbitrary host env.) |
+| Secrets via `${env:VAR}` + keychain | §9.3 | **Unchanged.** |
+| Approval gate — every bridged tool defaults to `Safety::Write`, routes through the M2 approver | §6, §9.4 | **Unchanged.** Instance binding (below) changes *which process* a call reaches, not whether it is gated. |
+| Bridge naming `mcp__<server>__<tool>` | §6, §9 risk 5 | **Name unchanged; routing bound to `InstanceKey`.** §4.6 keeps the tool name stable (no collision-model change). When N workspace instances share one id they expose the same logical tool name; the per-turn registry resolves each call to the instance keyed by the active session's `ScopeKey`. The global tool list may therefore show one logical `mcp__codegraph__context` even when several instances back it. |
+| Graceful shutdown / no orphans — reap on every exit path (SIGTERM→SIGKILL) | §5, §9.1 | **Unchanged + reused.** §4.3's ref-count eviction (stop when the referencing-session set empties) is a *new stop trigger* that reuses 0003's existing graceful-shutdown/reaping path; it adds no new teardown mechanism. |
+| `disabled` keeps a definition without spawning | §3 | **Consistent, now per-tier.** §3.2 overloads `disabled: true` as a tier-level suppress (a higher tier can disable a lower-tier server by id), which matches 0003's "defined but not spawned" intent. |
+| Client contract = initialize + list_tools + call_tool + tools/list_changed | §4 | **Extended.** §4.4 adds a `list_roots` client handler so the server learns its workspace root via the roots capability instead of process cwd. This is an addition to the M4.0 client surface, not a change to existing methods. |
+| Non-goals: SSE/HTTP transports, per-tool Safety overrides | §10 | **Still non-goals.** §12 carries both forward unchanged; no conflict. |
+
+**Net amendments to RFC 0003.** Only two: (a) §5's implicit single-instance-per-id
+keying is amended to `(id, ScopeKey)` for workspace-scoped servers, and (b) §3's
+"the watched file is the desired set" is amended to "the watched file is the Global
+tier of the desired set." Both are recorded here rather than by editing 0003, which
+remains the canonical description of the host; this RFC is the delta.
