@@ -463,9 +463,16 @@ impl Drop for ProcessSupervisor {
                         TerminateJobObject(job.0, 1);
                     }
                 } else if let Some(pid) = p.pid {
+                    // Block on taskkill (best-effort, like the unix SIGKILL
+                    // syscall above) rather than fire-and-forget: the kill is
+                    // actually issued before the supervisor goes away, and no
+                    // orphaned taskkill is left behind. Stdio is nulled so it
+                    // stays quiet during shutdown.
                     let _ = std::process::Command::new("taskkill")
                         .args(["/PID", &pid.to_string(), "/T", "/F"])
-                        .spawn();
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .status();
                 }
             }
         }
