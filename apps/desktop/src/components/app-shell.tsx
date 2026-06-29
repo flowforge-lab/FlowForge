@@ -7,6 +7,7 @@ import { CommandPalette } from "@/components/palette";
 import { ShortcutsOverlay } from "@/components/shortcuts-overlay";
 import { SettingsPanel } from "@/components/settings-panel";
 import { PhenoMcpToast } from "@/components/pheno-mcp-toast";
+import { UpdateBar } from "@/components/update-bar";
 import { Button } from "@/components/ui/button";
 import { useChatStore } from "@/store/chat";
 import { usePrefsStore } from "@/store/prefs";
@@ -179,48 +180,51 @@ export function AppShell() {
   const setSidebarCollapsed = usePrefsStore((s) => s.setSidebarCollapsed);
 
   return (
-    <div className="flex h-full bg-background text-foreground">
-      <SessionSidebar />
-      <main className="flex min-w-0 flex-1 flex-col">
-        {sidebarCollapsed && (
-          <div className="flex h-12 shrink-0 items-center gap-2 border-b px-2">
-            <Button
-              variant="ghost"
-              size="icon"
-              className="size-8 text-muted-foreground hover:text-foreground"
-              onClick={() => setSidebarCollapsed(false)}
-              title="Show sidebar"
-              aria-label="Show sidebar"
-            >
-              <PanelLeft className="size-4" />
-            </Button>
-          </div>
-        )}
-        <div className="flex min-h-0 min-w-0 flex-1">
-          {/* Chat column. When the split is closed it stays full-width — no
+    <div className="flex h-full flex-col bg-background text-foreground">
+      <UpdateBar />
+      <div className="flex min-h-0 flex-1">
+        <SessionSidebar />
+        <main className="flex min-w-0 flex-1 flex-col">
+          {sidebarCollapsed && (
+            <div className="flex h-12 shrink-0 items-center gap-2 border-b px-2">
+              <Button
+                variant="ghost"
+                size="icon"
+                className="size-8 text-muted-foreground hover:text-foreground"
+                onClick={() => setSidebarCollapsed(false)}
+                title="Show sidebar"
+                aria-label="Show sidebar"
+              >
+                <PanelLeft className="size-4" />
+              </Button>
+            </div>
+          )}
+          <div className="flex min-h-0 min-w-0 flex-1">
+            {/* Chat column. When the split is closed it stays full-width — no
               visual change from before the panel existed. */}
-          <div className="flex min-w-0 flex-1 flex-col">
-            {bootstrapError && (
-              <div className="flex items-center gap-2 border-b border-destructive/30 bg-destructive/10 px-4 py-2 text-[13px] text-destructive">
-                <AlertTriangle className="size-4 shrink-0" />
-                <span>
-                  <strong>Backend unreachable:</strong> {bootstrapError}. Run{" "}
-                  <code className="rounded bg-destructive/15 px-1 font-mono text-xs">
-                    VITE_FF_MOCK=1 pnpm dev
-                  </code>{" "}
-                  to use the mock backend, or{" "}
-                  <code className="rounded bg-destructive/15 px-1 font-mono text-xs">
-                    pnpm tauri dev
-                  </code>{" "}
-                  for the real backend.
-                </span>
-              </div>
-            )}
-            <PaneTree />
+            <div className="flex min-w-0 flex-1 flex-col">
+              {bootstrapError && (
+                <div className="flex items-center gap-2 border-b border-destructive/30 bg-destructive/10 px-4 py-2 text-[13px] text-destructive">
+                  <AlertTriangle className="size-4 shrink-0" />
+                  <span>
+                    <strong>Backend unreachable:</strong> {bootstrapError}. Run{" "}
+                    <code className="rounded bg-destructive/15 px-1 font-mono text-xs">
+                      VITE_FF_MOCK=1 pnpm dev
+                    </code>{" "}
+                    to use the mock backend, or{" "}
+                    <code className="rounded bg-destructive/15 px-1 font-mono text-xs">
+                      pnpm tauri dev
+                    </code>{" "}
+                    for the real backend.
+                  </span>
+                </div>
+              )}
+              <PaneTree />
+            </div>
+            <SplitPanel />
           </div>
-          <SplitPanel />
-        </div>
-      </main>
+        </main>
+      </div>
       <CommandPalette />
       <ShortcutsOverlay />
       <SettingsPanel />
