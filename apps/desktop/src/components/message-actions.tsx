@@ -1,4 +1,4 @@
-import { useState, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import { Check, Copy, PencilLine } from "@/components/ui/icon";
 import { cn } from "@/lib/utils";
 import { useComposerStore } from "@/store/composer";
@@ -32,11 +32,14 @@ function ActionButton({
 // unavailable in an insecure context or without permission.
 function useCopied() {
   const [copied, setCopied] = useState(false);
+  const timer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  useEffect(() => () => clearTimeout(timer.current), []);
   const copy = async (text: string) => {
     try {
       await navigator.clipboard.writeText(text);
       setCopied(true);
-      setTimeout(() => setCopied(false), 1500);
+      clearTimeout(timer.current);
+      timer.current = setTimeout(() => setCopied(false), 1500);
     } catch {
       // Clipboard unavailable (permissions / insecure context); fail quiet.
     }
