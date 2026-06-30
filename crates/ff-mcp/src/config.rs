@@ -234,6 +234,31 @@ fn interpolate(
     Ok(out)
 }
 
+/// Replace `${workspace}`/`${root}` placeholders in a resolved server config with
+/// the session's canonical checkout `root` (#544). Applied at connect for a
+/// `Workspace`-scoped instance, *after* load-time `${env:}` resolution -- the root
+/// is unknown until a session references the server, so it cannot be resolved in
+/// [`load`]. A no-op when `root` is `None` (a `Global` instance has no checkout):
+/// the placeholder is left intact rather than blanked, so a misuse is visible.
+pub fn substitute_workspace(mut cfg: McpServerConfig, root: Option<&Path>) -> McpServerConfig {
+    let Some(root) = root else {
+        return cfg;
+    };
+    let path = root.to_string_lossy();
+    let sub = |s: &str| {
+        s.replace("${workspace}", path.as_ref())
+            .replace("${root}", path.as_ref())
+    };
+    cfg.command = sub(&cfg.command);
+    for a in &mut cfg.args {
+        *a = sub(a);
+    }
+    for v in cfg.env.values_mut() {
+        *v = sub(v);
+    }
+    cfg
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -291,6 +316,40 @@ mod tests {
     fn rejects_unknown_fields() {
         let text = r#"{"mcpServers":{"x":{"command":"c","bogus":1}}}"#;
         assert!(matches!(parse(text, &no_env), Err(McpError::Config(_))));
+    }
+
+    #[test]
+    fn substitute_workspace_resolves_placeholders_in_command_args_env() {
+        let cfg = McpServerConfig {
+            id: "codegraph".into(),
+            command: "${workspace}/bin/cg".into(),
+            args: vec!["serve".into(), "--path".into(), "${workspace}".into()],
+            env: {
+                let mut m = BTreeMap::new();
+                m.insert("DB".into(), "${root}/.cg/db".into());
+                m
+            },
+            disabled: false,
+            scope: McpScope::Workspace,
+        };
+        let out = substitute_workspace(cfg, Some(Path::new("/Users/me/projects/repo")));
+        assert_eq!(out.command, "/Users/me/projects/repo/bin/cg");
+        assert_eq!(out.args[2], "/Users/me/projects/repo");
+        assert_eq!(out.env["DB"], "/Users/me/projects/repo/.cg/db");
+    }
+
+    #[test]
+    fn substitute_workspace_is_noop_and_keeps_placeholder_without_root() {
+        let cfg = McpServerConfig {
+            id: "codegraph".into(),
+            command: "cg".into(),
+            args: vec!["--path".into(), "${workspace}".into()],
+            env: BTreeMap::new(),
+            disabled: false,
+            scope: McpScope::Global,
+        };
+        let out = substitute_workspace(cfg, None);
+        assert_eq!(out.args[1], "${workspace}");
     }
 
     #[test]

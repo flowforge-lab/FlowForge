@@ -704,7 +704,8 @@ fn spawn_assistant_turn(state: Arc<AppState>, app: tauri::AppHandle, session_id:
         // the resolved persona, installed-skill descriptions, the bodies of the
         // active skills, and the current local time.
         let skills = state.skills_snapshot();
-        let user_ctx = ff_agent::UserContext::now();
+        let user_ctx =
+            ff_agent::UserContext::now().with_working_dir(session_root.display().to_string());
         // Active-skill source (#246): an explicit per-pane binding uses the
         // phenotype's declared skills; an unbound session keeps the global active
         // set so the command palette still affects turns. See `turn_active_skills`.
@@ -1005,7 +1006,8 @@ impl ff_scheduled::TaskRunner for DesktopTaskRunner {
         tool_ctx.abstractive = crate::state::abstractive_config_from_env();
 
         let skills = self.state.skills_snapshot();
-        let user_ctx = ff_agent::UserContext::now();
+        let user_ctx =
+            ff_agent::UserContext::now().with_working_dir(session_root.display().to_string());
         let active: Vec<String> = self.state.turn_active_skills(&sid);
         let (memory, _ambient_keys) = self
             .state

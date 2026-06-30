@@ -694,6 +694,10 @@ impl Supervisor {
         // no root (RFC 0018 §4.4).
         let root = key.scope.root().map(Path::to_path_buf);
         let roots: Vec<&Path> = root.as_deref().into_iter().collect();
+        // Resolve ${workspace}/${root} in the config against this instance's checkout
+        // (#544), so a workspace-aware server (e.g. codegraph) gets an explicit
+        // --path even when it ignores the advertised MCP root / child cwd.
+        let cfg = crate::config::substitute_workspace(cfg, root.as_deref());
         let connect_result = McpClient::connect(&cfg, &allow_refs, root.as_deref(), &roots).await;
         let outcome = match connect_result {
             Ok(client) => match client.list_tools().await {
