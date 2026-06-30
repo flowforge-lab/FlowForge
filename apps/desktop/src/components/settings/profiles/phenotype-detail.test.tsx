@@ -45,7 +45,7 @@ describe("PhenotypeDetail (#530)", () => {
     // Mock (no call-through) so the shared mock's phenotype set isn't mutated.
     const spy = vi
       .spyOn(ipc, "updatePhenotype")
-      .mockResolvedValue({ name: "default-copy", skills: [] });
+      .mockResolvedValue({ name: "default-copy", skills: [], mcpServers: [] });
     render(<PhenotypeDetail phenotypeId="default" />);
 
     // No provider/model pickers — the rows are read-only.
@@ -58,9 +58,11 @@ describe("PhenotypeDetail (#530)", () => {
   });
 
   it("shows the phenotype's bound provider and writes the whole record on change", async () => {
-    const spy = vi
-      .spyOn(ipc, "updatePhenotype")
-      .mockResolvedValue({ name: "reviewer", skills: ["create-pr"] });
+    const spy = vi.spyOn(ipc, "updatePhenotype").mockResolvedValue({
+      name: "reviewer",
+      skills: ["create-pr"],
+      mcpServers: [],
+    });
     render(<PhenotypeDetail phenotypeId="reviewer" />);
 
     // The reviewer phenotype is bound to OpenAI in the mock.

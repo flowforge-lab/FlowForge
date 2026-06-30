@@ -9,7 +9,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use ff_core::Phenotype;
+use ff_core::{McpServerConfig, Phenotype};
 
 /// The reserved name of the built-in phenotype.
 pub const DEFAULT_PHENOTYPE: &str = "default";
@@ -53,6 +53,7 @@ pub fn default_phenotype() -> Phenotype {
         persona: None,
         max_iterations: None,
         provider: None,
+        mcp_servers: Vec::new(),
     }
 }
 
@@ -72,6 +73,8 @@ struct PhenotypeFile {
     max_iterations: Option<usize>,
     #[serde(default)]
     provider: Option<String>,
+    #[serde(default)]
+    mcp_servers: Vec<McpServerConfig>,
 }
 
 impl PhenotypeFile {
@@ -83,6 +86,7 @@ impl PhenotypeFile {
             persona: self.persona,
             max_iterations: self.max_iterations,
             provider: self.provider,
+            mcp_servers: self.mcp_servers,
         }
     }
 }
@@ -149,6 +153,8 @@ struct PhenotypeOut {
     max_iterations: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     provider: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    mcp_servers: Vec<McpServerConfig>,
 }
 
 /// Whether `name` is safe to use as a single-segment file stem. Rejects empty
@@ -182,6 +188,7 @@ pub fn save_phenotype(root: &Path, pheno: &Phenotype) -> Result<(), PhenotypeErr
         persona: pheno.persona.clone(),
         max_iterations: pheno.max_iterations,
         provider: pheno.provider.clone(),
+        mcp_servers: pheno.mcp_servers.clone(),
     };
     let body = toml::to_string_pretty(&out).map_err(|source| PhenotypeError::Serialize {
         name: pheno.name.clone(),
@@ -264,6 +271,27 @@ max_iterations = 40
     }
 
     #[test]
+    fn loads_mcp_servers_from_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "codon.toml",
+            "skills = [\"codegraph\"]\n\n[[mcp_servers]]\nid = \"codegraph\"\ncommand = \"codegraph\"\nargs = [\"serve\", \"--mcp\"]\nscope = \"workspace\"\n",
+        );
+        let (map, errs) = load_phenotypes(dir.path());
+        assert!(errs.is_empty(), "{errs:?}");
+        let p = map.get("codon").expect("codon phenotype");
+        assert_eq!(p.mcp_servers.len(), 1);
+        let srv = &p.mcp_servers[0];
+        assert_eq!(srv.id, "codegraph");
+        assert_eq!(srv.command, "codegraph");
+        assert_eq!(srv.args, vec!["serve", "--mcp"]);
+        assert_eq!(srv.scope, ff_core::McpScope::Workspace);
+        // A workspace-scoped server must never pin --path (RFC 0018 section 4.4).
+        assert!(!srv.args.iter().any(|a| a == "--path"));
+    }
+
+    #[test]
     fn name_comes_from_filename_not_toml() {
         let dir = tempfile::tempdir().unwrap();
         write(dir.path(), "writing.toml", "skills = []\n");
@@ -310,6 +338,14 @@ max_iterations = 40
             persona: Some("Rust expert.".into()),
             max_iterations: Some(40),
             provider: Some("local-ollama".into()),
+            mcp_servers: vec![McpServerConfig {
+                id: "codegraph".into(),
+                command: "codegraph".into(),
+                args: vec!["serve".into(), "--mcp".into()],
+                env: Default::default(),
+                disabled: false,
+                scope: ff_core::McpScope::Workspace,
+            }],
         }
     }
 
@@ -333,6 +369,7 @@ max_iterations = 40
             persona: None,
             max_iterations: None,
             provider: None,
+            mcp_servers: Vec::new(),
         };
         save_phenotype(dir.path(), &bare).unwrap();
         let body = fs::read_to_string(dir.path().join("bare.toml")).unwrap();

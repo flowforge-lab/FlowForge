@@ -224,13 +224,19 @@ impl SupervisorHandle {
     /// referenced instance that is not `Running` -- the one place a codegraph parked in
     /// `Failed` is revived for a new turn (RFC 0018 §4.5, #557 Finding 2). Awaits until
     /// applied so the caller can snapshot tools right after.
-    pub async fn align_session(&self, session_id: &str, root: PathBuf) {
+    pub async fn align_session(
+        &self,
+        session_id: &str,
+        root: PathBuf,
+        servers: Vec<McpServerConfig>,
+    ) {
         let (ack_tx, ack_rx) = oneshot::channel();
         if self
             .cmd_tx
             .send(Cmd::SetSessionRoot {
                 session_id: session_id.to_string(),
                 root,
+                servers,
                 ack: ack_tx,
             })
             .await
@@ -284,6 +290,7 @@ enum Cmd {
     SetSessionRoot {
         session_id: String,
         root: PathBuf,
+        servers: Vec<McpServerConfig>,
         ack: oneshot::Sender<()>,
     },
     ReleaseSession {
@@ -434,8 +441,8 @@ impl Supervisor {
                 Some(cmd) = self.cmd_rx.recv() => match cmd {
                     Cmd::Reconcile => self.reconcile().await,
                     Cmd::Restart { id } => self.restart(&id).await,
-                    Cmd::SetSessionRoot { session_id, root, ack } => {
-                        self.set_session_root(session_id, root).await;
+                    Cmd::SetSessionRoot { session_id, root, servers, ack } => {
+                        self.set_session_root(session_id, root, servers).await;
                         let _ = ack.send(());
                     }
                     Cmd::ReleaseSession { session_id, ack } => {
@@ -533,27 +540,31 @@ impl Supervisor {
     /// Recompute the workspace instances `session_id` references now that it is rooted
     /// at `root`: update ref-lists, evict emptied workspace instances, and proactively
     /// (re)start each referenced instance that is not `Running` (RFC 0018 §4.3, §4.5).
-    async fn set_session_root(&mut self, session_id: String, root: PathBuf) {
+    async fn set_session_root(
+        &mut self,
+        session_id: String,
+        root: PathBuf,
+        servers: Vec<McpServerConfig>,
+    ) {
         // The workspace-scoped servers this session wants, keyed at its canonical root.
-        // C2's resolved set is the global-tier file filtered to `scope: workspace`; C3
-        // merges phenotype/session tiers (the desktop then computes the desired set).
+        // `servers` is the session's resolved tier set (RFC 0018 §3.2) computed by the
+        // desktop -- global file overlaid by the phenotype + session tiers (C3). We take
+        // the `scope: workspace` subset here; global-scoped servers are always-on via
+        // `reconcile` against the watched file (RFC 0018 §14, the Global tier).
         let scope_key = ScopeKey::workspace(&root);
-        let wanted: BTreeMap<InstanceKey, McpServerConfig> = match self.shared_config.read() {
-            Ok(g) => g
-                .iter()
-                .filter(|c| c.scope == McpScope::Workspace && !c.disabled)
-                .map(|c| {
-                    (
-                        InstanceKey {
-                            id: c.id.clone(),
-                            scope: scope_key.clone(),
-                        },
-                        c.clone(),
-                    )
-                })
-                .collect(),
-            Err(_) => return,
-        };
+        let wanted: BTreeMap<InstanceKey, McpServerConfig> = servers
+            .into_iter()
+            .filter(|c| c.scope == McpScope::Workspace && !c.disabled)
+            .map(|c| {
+                (
+                    InstanceKey {
+                        id: c.id.clone(),
+                        scope: scope_key.clone(),
+                    },
+                    c,
+                )
+            })
+            .collect();
 
         // Drop this session from any workspace instance it no longer references.
         let stale: Vec<InstanceKey> = self

@@ -13,6 +13,8 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
+use crate::McpServerConfig;
+
 /// The `SKILL.md` frontmatter. Collection fields default to empty so a minimal
 /// manifest (just `name` + `description` + `version`) deserializes cleanly.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
@@ -101,6 +103,12 @@ pub struct Phenotype {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub max_iterations: Option<usize>,
+    /// Phenotype-tier MCP server definitions (RFC 0018 section 3.1). These overlay
+    /// the global `mcp.json` by id (whole-record, RFC section 11.5) when this
+    /// phenotype is active; a `scope: workspace` entry (e.g. codegraph) is keyed
+    /// per workspace root. Empty contributes nothing, identical to today.
+    #[serde(default)]
+    pub mcp_servers: Vec<McpServerConfig>,
 }
 
 #[cfg(test)]
@@ -176,6 +184,7 @@ mod tests {
             persona: None,
             max_iterations: None,
             provider: None,
+            mcp_servers: Vec::new(),
         };
         let json = serde_json::to_string(&p).unwrap();
         assert_eq!(p, serde_json::from_str(&json).unwrap());

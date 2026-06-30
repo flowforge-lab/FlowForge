@@ -47,14 +47,19 @@ describe("MockIpc updatePhenotype (#530)", () => {
   it("rejects the immutable built-in default", async () => {
     const ipc = new MockIpc();
     await expect(
-      ipc.updatePhenotype({ name: "default", skills: [] }),
+      ipc.updatePhenotype({ name: "default", skills: [], mcpServers: [] }),
     ).rejects.toThrow(/immutable/);
   });
 
   it("rejects an unknown provider connection", async () => {
     const ipc = new MockIpc();
     await expect(
-      ipc.updatePhenotype({ name: "rust", skills: [], provider: "ghost-conn" }),
+      ipc.updatePhenotype({
+        name: "rust",
+        skills: [],
+        provider: "ghost-conn",
+        mcpServers: [],
+      }),
     ).rejects.toThrow(/unknown connection/);
   });
 
@@ -65,6 +70,7 @@ describe("MockIpc updatePhenotype (#530)", () => {
       skills: [],
       provider: "openai",
       model: "gpt-4o",
+      mcpServers: [],
     });
     expect(saved).toMatchObject({ name: "data-science", provider: "openai" });
     const names = (await ipc.listPhenotypes()).map((p) => p.name);
@@ -79,6 +85,7 @@ describe("MockIpc updatePhenotype (#530)", () => {
       persona: "You are a meticulous Rust engineer.",
       provider: "ollama",
       model: "qwen2.5",
+      mcpServers: [],
     });
     const rust = (await ipc.listPhenotypes()).find((p) => p.name === "rust");
     expect(rust).toMatchObject({ provider: "ollama", model: "qwen2.5" });
@@ -97,6 +104,7 @@ describe("MockIpc updatePhenotype (#530)", () => {
       name: "rust",
       skills: ["write-tests"],
       persona: "You are a meticulous Rust engineer.",
+      mcpServers: [],
     });
     expect((await ipc.getPhenotype()).skills).toEqual(["write-tests"]);
     expect(events[events.length - 1]).toEqual(["write-tests"]);
@@ -106,7 +114,11 @@ describe("MockIpc updatePhenotype (#530)", () => {
     const ipc = new MockIpc();
     const events: string[][] = [];
     await ipc.onSkillsChanged((e) => events.push(e.active));
-    await ipc.updatePhenotype({ name: "rust", skills: ["write-tests"] });
+    await ipc.updatePhenotype({
+      name: "rust",
+      skills: ["write-tests"],
+      mcpServers: [],
+    });
     expect(events).toHaveLength(0);
   });
 });

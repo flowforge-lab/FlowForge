@@ -10,9 +10,10 @@ use ff_agent::{
     ContextPressureEstimator, MemoryFlush, ProxyTokenEstimator, DEFAULT_FLUSH_AT_FRACTION,
 };
 use ff_core::{
-    model_supports_documents, model_supports_vision, BedrockAuth, McpServerState, McpServerStatus,
-    Mode, ModelSelection, Phenotype, ProviderConfig, ProviderConnection, ProviderKind,
-    ProviderRegistry, ResolvedModel, SearchConfig, SecretKind, SessionWorkspace,
+    model_supports_documents, model_supports_vision, BedrockAuth, McpScope, McpServerConfig,
+    McpServerState, McpServerStatus, Mode, ModelSelection, Phenotype, ProviderConfig,
+    ProviderConnection, ProviderKind, ProviderRegistry, ResolvedModel, SearchConfig, SecretKind,
+    SessionWorkspace,
 };
 use ff_llm::{
     ollama_num_ctx_from_env, reasoning_control, wire_dialect, BedrockCreds, BedrockProvider,
@@ -640,9 +641,10 @@ fn seed_builtin_content() {
 /// a tempdir instead of the real home. Each built-in is written only when absent,
 /// leaving a user-edited copy untouched; the codegraph skill body is written at
 /// `skills/codegraph/SKILL.md` (the layout [`SkillRegistry`] scans). When an
-/// `mcp.json` path is known, a **disabled** codegraph server entry is also seeded
-/// so the wiring exists out of the box (the user enables it after installing the
-/// codegraph binary); `None` skips it (no home dir).
+/// `mcp.json` path is known we retire a previously seeded, unmodified disabled
+/// codegraph entry (RFC 0018 C3 #590) -- codegraph now travels with the codon
+/// phenotype, not the global file; a user-edited entry is left intact. `None` skips
+/// it (no home dir).
 fn seed_builtin_content_at(phenotypes_root: &Path, skills_root: &Path, mcp_path: Option<&Path>) {
     seed_if_absent(&phenotypes_root.join("codon.toml"), CODON_PHENOTYPE_TOML);
     seed_if_absent(
@@ -650,42 +652,46 @@ fn seed_builtin_content_at(phenotypes_root: &Path, skills_root: &Path, mcp_path:
         CODEGRAPH_SKILL_MD,
     );
     if let Some(mcp_path) = mcp_path {
-        seed_codegraph_mcp_entry_if_absent(mcp_path);
+        retire_seeded_codegraph_if_unmodified(mcp_path);
     }
 }
 
-/// Seed a **disabled** `codegraph` server into `mcp.json` if no entry with that id
-/// already exists, so Codon's DNA is wired without a manual edit. Written disabled
-/// because the codegraph binary is a third-party install that may be absent — an
-/// enabled entry would make the supervisor spawn a missing command and churn on
-/// backoff. The user enables it (Settings -> MCP) after `codegraph install`; the
-/// #296 activation warn points there.
-///
-/// Write-if-absent (an existing `codegraph` entry, user- or seed-written, is never
-/// overwritten) and best-effort: a parse or write failure is logged and skipped so
-/// a hand-managed or read-only `mcp.json` is never clobbered or blocks startup.
-fn seed_codegraph_mcp_entry_if_absent(mcp_path: &Path) {
-    match ff_mcp::load(mcp_path) {
-        Ok(servers) if servers.iter().any(|s| s.id == "codegraph") => return,
-        Ok(_) => {}
+/// The exact shape the pre-C3 seed wrote for codegraph. A live `mcp.json` entry that
+/// matches this is an unmodified seed safe to retire; any difference (a user-set
+/// command/args/env, or an enabled entry the user turned on) means the user owns it
+/// and it is left alone.
+fn is_unmodified_codegraph_seed(srv: &McpServerConfig) -> bool {
+    srv.id == "codegraph"
+        && srv.command == "codegraph"
+        && srv.args == ["serve", "--mcp"]
+        && srv.env.is_empty()
+        && srv.disabled
+        && srv.scope == McpScope::Workspace
+}
+
+/// Remove the pre-C3 seeded codegraph entry from the global `mcp.json` now that
+/// codegraph travels with the codon phenotype (RFC 0018 C3 #590). Removes ONLY an
+/// unmodified, disabled seed ([`is_unmodified_codegraph_seed`]); a user-edited entry
+/// (e.g. the #573 absolute-`command` workaround) keeps working as a global-tier
+/// override. Best-effort: a parse or write failure is logged and skipped so a
+/// hand-managed or read-only `mcp.json` is never clobbered or blocks startup.
+fn retire_seeded_codegraph_if_unmodified(mcp_path: &Path) {
+    let servers = match ff_mcp::load(mcp_path) {
+        Ok(servers) => servers,
         Err(e) => {
-            tracing::warn!(error = %e, "seed codegraph mcp entry: read existing mcp.json");
+            tracing::warn!(error = %e, "retire codegraph mcp seed: read existing mcp.json");
             return;
         }
-    }
-    let def = ff_mcp::McpServerInput {
-        id: "codegraph".to_string(),
-        command: "codegraph".to_string(),
-        args: vec!["serve".to_string(), "--mcp".to_string()],
-        env: std::collections::BTreeMap::new(),
-        disabled: true,
-        // Workspace-scoped (RFC 0018 §4.4): one codegraph instance per session
-        // checkout, learning its root via the MCP roots capability. No `--path` arg --
-        // a pinned path would defeat per-turn alignment.
-        scope: ff_core::McpScope::Workspace,
     };
-    if let Err(e) = ff_mcp::upsert(mcp_path, &def) {
-        tracing::warn!(error = %e, "seed codegraph mcp entry: write");
+    let is_seed = servers
+        .iter()
+        .find(|s| s.id == "codegraph")
+        .is_some_and(is_unmodified_codegraph_seed);
+    if !is_seed {
+        return;
+    }
+    if let Err(e) = ff_mcp::remove(mcp_path, "codegraph") {
+        tracing::warn!(error = %e, "retire codegraph mcp seed: write");
     }
 }
 
@@ -1175,7 +1181,9 @@ impl AppState {
     /// parked in `Failed` (#557). Best-effort: a no-op when MCP is uninitialized.
     pub async fn align_session_mcp(&self, session_id: &str, root: &Path) {
         if let Some(sup) = self.mcp_handle() {
-            sup.align_session(session_id, root.to_path_buf()).await;
+            let servers = self.resolve_mcp_servers(session_id);
+            sup.align_session(session_id, root.to_path_buf(), servers)
+                .await;
         }
     }
 
@@ -1563,6 +1571,42 @@ impl AppState {
             supports_vision,
             supports_documents,
         }
+    }
+
+    /// Resolve this session's MCP server set for a turn using RFC 0018 §3.2 three-tier
+    /// precedence: session > phenotype > global. The sibling of
+    /// [`resolve_model_selection`](Self::resolve_model_selection) -- one mental model
+    /// for both. Composition is **whole-record override-by-id** (RFC §11.5): a later
+    /// tier's entry replaces a lower tier's entry with the same id as a unit (command +
+    /// args + env + scope), never a field-level merge. A tier may set `disabled: true`
+    /// to suppress an inherited server for this turn; suppressed entries are filtered
+    /// out of the resolved set. Insertion order is preserved (global first) for stable
+    /// reconcile/bridge ordering.
+    pub fn resolve_mcp_servers(&self, session_id: &str) -> Vec<McpServerConfig> {
+        let mut resolved: Vec<McpServerConfig> = self
+            .mcp_config_path()
+            .and_then(|p| ff_mcp::load(&p).ok())
+            .unwrap_or_default();
+
+        let overlay = |resolved: &mut Vec<McpServerConfig>, srv: McpServerConfig| match resolved
+            .iter_mut()
+            .find(|e| e.id == srv.id)
+        {
+            Some(existing) => *existing = srv,
+            None => resolved.push(srv),
+        };
+
+        for srv in self.session_phenotype(session_id).mcp_servers {
+            overlay(&mut resolved, srv);
+        }
+        if let Some(session_servers) = self.store.session_mcp_servers(session_id) {
+            for srv in session_servers {
+                overlay(&mut resolved, srv);
+            }
+        }
+
+        resolved.retain(|s| !s.disabled);
+        resolved
     }
 
     pub fn register_cancel(&self, session_id: &str, token: CancelToken) {
@@ -2480,6 +2524,7 @@ mod tests {
                 persona: None,
                 max_iterations: None,
                 provider: None,
+                mcp_servers: Vec::new(),
             }),
             _ => None,
         }
@@ -2551,6 +2596,7 @@ mod tests {
             persona: None,
             max_iterations: None,
             provider: Some("definitely-not-a-connection-xyz".into()),
+            mcp_servers: Vec::new(),
         };
         let err = state.update_phenotype(pheno).unwrap_err();
         assert!(err.contains("unknown connection"), "{err}");
@@ -2568,6 +2614,7 @@ mod tests {
             persona: Some("You are a Rust expert.".into()),
             max_iterations: None,
             provider: None,
+            mcp_servers: Vec::new(),
         };
         state.apply_phenotype(pheno);
         assert!(state.active_skills().is_empty());
@@ -2707,6 +2754,7 @@ mod tests {
             persona: None,
             max_iterations: None,
             provider: None,
+            mcp_servers: Vec::new(),
         });
         // Unknown skills are dropped; the returned set mirrors the active set so the
         // caller can warn about MCP requirements without re-resolving.
@@ -2729,6 +2777,7 @@ mod tests {
             persona: Some("p".into()),
             max_iterations: None,
             provider: None,
+            mcp_servers: Vec::new(),
         });
         state.apply_phenotype(default_phenotype());
         assert!(state.active_model_override().is_none());
@@ -2747,6 +2796,7 @@ mod tests {
             persona: Some("You are a Rust expert.".into()),
             max_iterations: Some(40),
             provider: None,
+            mcp_servers: Vec::new(),
         });
         let s = state.store.create_session(None);
         let resolved = state.session_phenotype(&s.id);
@@ -2782,6 +2832,7 @@ mod tests {
             persona: None,
             max_iterations: None,
             provider: None,
+            mcp_servers: Vec::new(),
         });
         let s = state.store.create_session(None);
         // Inject a dangling binding directly through the store (the validated
@@ -2818,6 +2869,7 @@ mod tests {
             persona: None,
             max_iterations: None,
             provider: None,
+            mcp_servers: Vec::new(),
         });
         let s = state.store.create_session(None);
         let sel = state.resolve_model_selection(&s.id);
@@ -2837,6 +2889,7 @@ mod tests {
             persona: None,
             max_iterations: None,
             provider: Some("ollama".into()),
+            mcp_servers: Vec::new(),
         });
         let s = state.store.create_session(None);
         let sel = state.resolve_model_selection(&s.id);
@@ -2856,6 +2909,7 @@ mod tests {
             persona: None,
             max_iterations: None,
             provider: Some("ollama".into()),
+            mcp_servers: Vec::new(),
         });
         let s = state.store.create_session(None);
         let sel = state.resolve_model_selection(&s.id);
@@ -2875,6 +2929,7 @@ mod tests {
             persona: None,
             max_iterations: None,
             provider: Some("ollama".into()),
+            mcp_servers: Vec::new(),
         });
         let s = state.store.create_session(None);
         // ...is overridden by an explicit session pin to the active connection.
@@ -2929,6 +2984,7 @@ mod tests {
             persona: None,
             max_iterations: None,
             provider: Some("ghost-conn".into()),
+            mcp_servers: Vec::new(),
         });
         let s = state.store.create_session(None);
         let sel = state.resolve_model_selection(&s.id);
@@ -2966,6 +3022,7 @@ mod tests {
             persona: None,
             max_iterations: None,
             provider: Some("ollama".into()),
+            mcp_servers: Vec::new(),
         });
         let s = state.store.create_session(None);
         state
@@ -2982,6 +3039,134 @@ mod tests {
         let sel = state.resolve_model_selection(&s.id);
         assert_eq!(sel.connection, "ollama");
         assert_eq!(sel.model, "llama3.2");
+    }
+
+    // --- RFC 0018 C3 (#590): tiered MCP resolution (session > phenotype > global) ---
+
+    fn mcp_cfg(id: &str, command: &str, scope: McpScope) -> McpServerConfig {
+        McpServerConfig {
+            id: id.into(),
+            command: command.into(),
+            args: vec!["serve".into(), "--mcp".into()],
+            env: Default::default(),
+            disabled: false,
+            scope,
+        }
+    }
+
+    fn pheno_with_mcp(name: &str, servers: Vec<McpServerConfig>) -> Phenotype {
+        Phenotype {
+            name: name.into(),
+            skills: vec![],
+            model: None,
+            persona: None,
+            max_iterations: None,
+            provider: None,
+            mcp_servers: servers,
+        }
+    }
+
+    #[test]
+    fn unbound_session_resolves_no_mcp_servers_by_default() {
+        let state = AppState::new();
+        let s = state.store.create_session(None);
+        // No global file, default phenotype, no session override -> empty (today's
+        // behavior preserved).
+        assert!(state.resolve_mcp_servers(&s.id).is_empty());
+    }
+
+    #[test]
+    fn global_mcp_json_feeds_resolution() {
+        let state = AppState::new();
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("mcp.json");
+        fs::write(&path, r#"{"mcpServers":{"github":{"command":"gh-mcp"}}}"#).unwrap();
+        state.init_mcp_at(path);
+
+        let s = state.store.create_session(None);
+        let resolved = state.resolve_mcp_servers(&s.id);
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].id, "github");
+        // Absent `scope` deserializes to Global (back-compat).
+        assert_eq!(resolved[0].scope, McpScope::Global);
+    }
+
+    #[test]
+    fn phenotype_mcp_servers_resolve_for_unbound_session() {
+        let state = AppState::new();
+        state.apply_phenotype(pheno_with_mcp(
+            "codon",
+            vec![mcp_cfg("codegraph", "codegraph", McpScope::Workspace)],
+        ));
+        let s = state.store.create_session(None);
+        let resolved = state.resolve_mcp_servers(&s.id);
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].id, "codegraph");
+        assert_eq!(resolved[0].scope, McpScope::Workspace);
+    }
+
+    #[test]
+    fn phenotype_overrides_global_by_id_whole_record() {
+        let state = AppState::new();
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("mcp.json");
+        // Global declares codegraph as a global-scoped server.
+        fs::write(
+            &path,
+            r#"{"mcpServers":{"codegraph":{"command":"old-codegraph"}}}"#,
+        )
+        .unwrap();
+        state.init_mcp_at(path);
+        // The phenotype's codegraph wins as a WHOLE record (command + scope), not a
+        // field-level merge (RFC 0018 section 11.5).
+        state.apply_phenotype(pheno_with_mcp(
+            "codon",
+            vec![mcp_cfg("codegraph", "codegraph", McpScope::Workspace)],
+        ));
+
+        let s = state.store.create_session(None);
+        let resolved = state.resolve_mcp_servers(&s.id);
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].command, "codegraph");
+        assert_eq!(resolved[0].scope, McpScope::Workspace);
+    }
+
+    #[test]
+    fn session_tier_overrides_phenotype_by_id() {
+        let state = AppState::new();
+        state.apply_phenotype(pheno_with_mcp(
+            "codon",
+            vec![mcp_cfg("codegraph", "pheno-codegraph", McpScope::Workspace)],
+        ));
+        let s = state.store.create_session(None);
+        state.store.set_session_mcp_servers(
+            &s.id,
+            Some(vec![mcp_cfg(
+                "codegraph",
+                "session-codegraph",
+                McpScope::Workspace,
+            )]),
+        );
+
+        let resolved = state.resolve_mcp_servers(&s.id);
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].command, "session-codegraph");
+    }
+
+    #[test]
+    fn disabled_at_a_tier_suppresses_an_inherited_server() {
+        let state = AppState::new();
+        state.apply_phenotype(pheno_with_mcp(
+            "codon",
+            vec![mcp_cfg("codegraph", "codegraph", McpScope::Workspace)],
+        ));
+        let s = state.store.create_session(None);
+        // The session suppresses the phenotype's codegraph for this turn.
+        let mut off = mcp_cfg("codegraph", "codegraph", McpScope::Workspace);
+        off.disabled = true;
+        state.store.set_session_mcp_servers(&s.id, Some(vec![off]));
+
+        assert!(state.resolve_mcp_servers(&s.id).is_empty());
     }
 
     #[test]
@@ -4038,61 +4223,78 @@ mod tests {
     }
 
     #[test]
-    fn seed_writes_disabled_codegraph_mcp_entry_when_absent() {
+    fn retire_removes_an_unmodified_disabled_codegraph_seed() {
         let mcp = tempfile::tempdir().unwrap();
         let path = mcp.path().join("mcp.json");
-        seed_codegraph_mcp_entry_if_absent(&path);
+        // The exact shape the pre-C3 seed wrote (disabled, workspace, serve --mcp).
+        let seeded = r#"{"mcpServers":{"codegraph":{"command":"codegraph","args":["serve","--mcp"],"disabled":true,"scope":"workspace"}}}"#;
+        fs::write(&path, seeded).unwrap();
 
-        let servers = ff_mcp::load(&path).expect("seeded mcp.json must parse");
-        let codegraph = servers
-            .iter()
-            .find(|s| s.id == "codegraph")
-            .expect("codegraph server seeded");
+        retire_seeded_codegraph_if_unmodified(&path);
+
+        let servers = ff_mcp::load(&path).expect("mcp.json must still parse");
         assert!(
-            codegraph.disabled,
-            "the seeded entry must be disabled until the binary is installed"
-        );
-        assert_eq!(codegraph.command, "codegraph");
-        assert_eq!(
-            codegraph.args,
-            vec!["serve".to_string(), "--mcp".to_string()]
+            !servers.iter().any(|s| s.id == "codegraph"),
+            "an unmodified disabled seed must be retired (codegraph now lives in the codon phenotype)"
         );
     }
 
     #[test]
-    fn seed_does_not_clobber_an_existing_codegraph_mcp_entry() {
+    fn retire_leaves_a_user_edited_codegraph_entry() {
         let mcp = tempfile::tempdir().unwrap();
         let path = mcp.path().join("mcp.json");
-        // A user who already wired codegraph their own way (enabled, custom args).
+        // The #573 workaround: an absolute command, enabled. The user owns this.
         let user =
             r#"{"mcpServers":{"codegraph":{"command":"my-codegraph","args":["--port","9000"]}}}"#;
         fs::write(&path, user).unwrap();
 
-        seed_codegraph_mcp_entry_if_absent(&path);
+        retire_seeded_codegraph_if_unmodified(&path);
 
         let servers = ff_mcp::load(&path).unwrap();
-        let codegraph = servers.iter().find(|s| s.id == "codegraph").unwrap();
-        assert_eq!(codegraph.command, "my-codegraph", "user entry must survive");
+        let codegraph = servers
+            .iter()
+            .find(|s| s.id == "codegraph")
+            .expect("user entry must survive");
+        assert_eq!(codegraph.command, "my-codegraph");
         assert_eq!(
             codegraph.args,
             vec!["--port".to_string(), "9000".to_string()]
         );
-        assert!(
-            !codegraph.disabled,
-            "user's enabled state must be untouched"
-        );
     }
 
     #[test]
-    fn seed_codegraph_mcp_entry_is_idempotent() {
+    fn retire_leaves_an_enabled_seed_the_user_turned_on() {
         let mcp = tempfile::tempdir().unwrap();
         let path = mcp.path().join("mcp.json");
-        seed_codegraph_mcp_entry_if_absent(&path);
-        let first = fs::read_to_string(&path).unwrap();
+        // Seed args/command/scope, but the user enabled it -> no longer an unmodified
+        // seed, so it is the user's and must be left intact.
+        let enabled = r#"{"mcpServers":{"codegraph":{"command":"codegraph","args":["serve","--mcp"],"disabled":false,"scope":"workspace"}}}"#;
+        fs::write(&path, enabled).unwrap();
 
-        seed_codegraph_mcp_entry_if_absent(&path);
-        let second = fs::read_to_string(&path).unwrap();
+        retire_seeded_codegraph_if_unmodified(&path);
 
-        assert_eq!(first, second, "a second seed run must be a no-op");
+        let servers = ff_mcp::load(&path).unwrap();
+        let codegraph = servers
+            .iter()
+            .find(|s| s.id == "codegraph")
+            .expect("an enabled (user-owned) entry must survive");
+        assert!(!codegraph.disabled);
+    }
+
+    #[test]
+    fn retire_is_a_noop_when_no_codegraph_entry() {
+        let mcp = tempfile::tempdir().unwrap();
+        let path = mcp.path().join("mcp.json");
+        let other = r#"{"mcpServers":{"github":{"command":"gh-mcp"}}}"#;
+        fs::write(&path, other).unwrap();
+
+        retire_seeded_codegraph_if_unmodified(&path);
+
+        let servers = ff_mcp::load(&path).unwrap();
+        assert!(
+            servers.iter().any(|s| s.id == "github"),
+            "unrelated entries untouched"
+        );
+        assert_eq!(servers.len(), 1);
     }
 }

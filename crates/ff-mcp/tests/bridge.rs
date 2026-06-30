@@ -182,8 +182,10 @@ async fn bridge_routes_to_per_root_instance() {
     let dir_b = tempfile::tempdir().expect("tempdir b");
     let root_a = std::fs::canonicalize(dir_a.path()).unwrap();
     let root_b = std::fs::canonicalize(dir_b.path()).unwrap();
-    sup.align_session("sa", root_a.clone()).await;
-    sup.align_session("sb", root_b.clone()).await;
+    sup.align_session("sa", root_a.clone(), vec![cwd_cfg()])
+        .await;
+    sup.align_session("sb", root_b.clone(), vec![cwd_cfg()])
+        .await;
 
     // Wait for both per-root instances to be Running.
     let deadline = std::time::Instant::now() + Duration::from_secs(5);

@@ -14,8 +14,8 @@ use std::path::Path;
 use std::sync::Mutex;
 
 use ff_core::{
-    auto_title, Attachment, Format, Message, Mode, ModelSelection, Role, Session, SessionStatus,
-    ToolCall,
+    auto_title, Attachment, Format, McpServerConfig, Message, Mode, ModelSelection, Role, Session,
+    SessionStatus, ToolCall,
 };
 use rusqlite::{params, Connection, OptionalExtension};
 
@@ -129,12 +129,13 @@ impl SessionStore {
             mode: None,
             workspace: None,
             model: None,
+            mcp_servers: None,
         };
         let conn = self.conn.lock().unwrap();
         let inserted = conn.execute(
             "INSERT INTO sessions
-                 (id, goal, title, summary, status, created_at, updated_at, phenotype, mode, workspace, model)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                 (id, goal, title, summary, status, created_at, updated_at, phenotype, mode, workspace, model, mcp_servers)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 session.id,
                 session.goal,
@@ -147,6 +148,10 @@ impl SessionStore {
                 session.mode.as_ref().map(enum_to_text),
                 session.workspace,
                 session.model.as_ref().and_then(|m| serde_json::to_string(m).ok()),
+                session
+                    .mcp_servers
+                    .as_ref()
+                    .and_then(|m| serde_json::to_string(m).ok()),
             ],
         );
         if let Err(error) = &inserted {
@@ -160,7 +165,7 @@ impl SessionStore {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
             .prepare(
-                "SELECT id, goal, title, summary, status, created_at, updated_at, phenotype, mode, workspace, model
+                "SELECT id, goal, title, summary, status, created_at, updated_at, phenotype, mode, workspace, model, mcp_servers
                  FROM sessions
                  ORDER BY updated_at DESC",
             )
@@ -487,6 +492,38 @@ impl SessionStore {
         json.and_then(|s| serde_json::from_str(&s).ok())
     }
 
+    /// Bind (or clear, with `None`) this session's MCP server overrides (RFC 0018
+    /// C3, the session tier). Stored verbatim as a JSON array; the resolver overlays
+    /// them by id over the phenotype + global tiers. No-op for an unknown session.
+    /// Mirrors [`set_session_model`](Self::set_session_model).
+    pub fn set_session_mcp_servers(&self, session_id: &str, servers: Option<Vec<McpServerConfig>>) {
+        let conn = self.conn.lock().unwrap();
+        let json = servers.as_ref().and_then(|s| serde_json::to_string(s).ok());
+        conn.execute(
+            "UPDATE sessions SET mcp_servers = ?1, updated_at = ?2 WHERE id = ?3",
+            params![json, now_ms(), session_id],
+        )
+        .ok();
+    }
+
+    /// The session's bound MCP server overrides, or `None` if it inherits the
+    /// phenotype + global resolution (or the session is unknown / the stored JSON is
+    /// corrupt). Mirrors [`session_model`](Self::session_model).
+    pub fn session_mcp_servers(&self, session_id: &str) -> Option<Vec<McpServerConfig>> {
+        let conn = self.conn.lock().unwrap();
+        let json: Option<String> = conn
+            .query_row(
+                "SELECT mcp_servers FROM sessions WHERE id = ?1",
+                params![session_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .ok()
+            .flatten()
+            .flatten();
+        json.and_then(|s| serde_json::from_str(&s).ok())
+    }
+
     pub fn set_message_content(
         &self,
         message_id: &str,
@@ -664,7 +701,7 @@ impl SessionStore {
         let conn = self.conn.lock().unwrap();
         let source = conn
             .query_row(
-                "SELECT id, goal, title, summary, status, created_at, updated_at, phenotype, mode, workspace, model
+                "SELECT id, goal, title, summary, status, created_at, updated_at, phenotype, mode, workspace, model, mcp_servers
                  FROM sessions WHERE id = ?1",
                 params![session_id],
                 row_to_session,
@@ -689,6 +726,8 @@ impl SessionStore {
             workspace: source.workspace.clone(),
             // ...and its model selection, so the copy runs on the same model (#499).
             model: source.model.clone(),
+            // ...and its MCP server overrides (RFC 0018 session tier).
+            mcp_servers: source.mcp_servers.clone(),
         };
         let tx = match conn.unchecked_transaction() {
             Ok(tx) => tx,
@@ -699,8 +738,8 @@ impl SessionStore {
         };
         let inserted = tx.execute(
             "INSERT INTO sessions
-                 (id, goal, title, summary, status, created_at, updated_at, phenotype, mode, workspace, model)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                 (id, goal, title, summary, status, created_at, updated_at, phenotype, mode, workspace, model, mcp_servers)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 forked.id,
                 forked.goal,
@@ -713,6 +752,10 @@ impl SessionStore {
                 forked.mode.as_ref().map(enum_to_text),
                 forked.workspace,
                 forked.model.as_ref().and_then(|m| serde_json::to_string(m).ok()),
+                forked
+                    .mcp_servers
+                    .as_ref()
+                    .and_then(|m| serde_json::to_string(m).ok()),
             ],
         );
         if let Err(error) = &inserted {
@@ -790,7 +833,7 @@ impl SessionStore {
     pub fn get_session(&self, session_id: &str) -> Option<Session> {
         let conn = self.conn.lock().unwrap();
         conn.query_row(
-            "SELECT id, goal, title, summary, status, created_at, updated_at, phenotype, mode, workspace, model
+            "SELECT id, goal, title, summary, status, created_at, updated_at, phenotype, mode, workspace, model, mcp_servers
              FROM sessions WHERE id = ?1",
             params![session_id],
             row_to_session,
@@ -1002,6 +1045,14 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
         conn.execute_batch("ALTER TABLE sessions ADD COLUMN model TEXT;")?;
         conn.pragma_update(None, "user_version", 6)?;
     }
+    if version < 7 {
+        // RFC 0018 C3 (#590): per-session MCP server overrides (the session tier). A
+        // JSON array of `McpServerConfig`, NULL when the session inherits its
+        // phenotype + global resolution. Added via ALTER so existing v6 databases
+        // gain the column without losing data -- mirrors the v5->v6 `model` add.
+        conn.execute_batch("ALTER TABLE sessions ADD COLUMN mcp_servers TEXT;")?;
+        conn.pragma_update(None, "user_version", 7)?;
+    }
     Ok(())
 }
 
@@ -1009,6 +1060,7 @@ fn row_to_session(row: &rusqlite::Row) -> rusqlite::Result<Session> {
     let status: String = row.get("status")?;
     let mode: Option<String> = row.get("mode")?;
     let model: Option<String> = row.get("model")?;
+    let mcp_servers: Option<String> = row.get("mcp_servers")?;
     Ok(Session {
         id: row.get("id")?,
         goal: row.get("goal")?,
@@ -1021,6 +1073,7 @@ fn row_to_session(row: &rusqlite::Row) -> rusqlite::Result<Session> {
         mode: mode.as_deref().and_then(text_to_enum),
         workspace: row.get("workspace")?,
         model: model.and_then(|s| serde_json::from_str(&s).ok()),
+        mcp_servers: mcp_servers.and_then(|s| serde_json::from_str(&s).ok()),
     })
 }
 
@@ -1320,7 +1373,7 @@ mod tests {
             .unwrap()
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 6);
+        assert_eq!(version, 7);
     }
 
     #[test]
@@ -1441,7 +1494,7 @@ mod tests {
             .unwrap()
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 6);
+        assert_eq!(version, 7);
     }
 
     #[test]
@@ -1486,7 +1539,7 @@ mod tests {
             .unwrap()
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 6);
+        assert_eq!(version, 7);
     }
 
     #[test]
@@ -1718,6 +1771,105 @@ mod tests {
         assert_eq!(store.session_model(&s.id), Some(sel));
     }
 
+    // --- Session-tier MCP overrides (RFC 0018 C3, #590) ---
+
+    fn ws_server(id: &str) -> McpServerConfig {
+        McpServerConfig {
+            id: id.into(),
+            command: "codegraph".into(),
+            args: vec!["serve".into(), "--mcp".into()],
+            env: Default::default(),
+            disabled: false,
+            scope: ff_core::McpScope::Workspace,
+        }
+    }
+
+    #[test]
+    fn new_session_has_no_mcp_servers_binding() {
+        let store = SessionStore::new();
+        let s = store.create_session(None);
+        assert!(s.mcp_servers.is_none());
+        assert!(store.session_mcp_servers(&s.id).is_none());
+    }
+
+    #[test]
+    fn set_and_clear_session_mcp_servers() {
+        let store = SessionStore::new();
+        let s = store.create_session(None);
+
+        let servers = vec![ws_server("codegraph")];
+        store.set_session_mcp_servers(&s.id, Some(servers.clone()));
+        assert_eq!(store.session_mcp_servers(&s.id), Some(servers));
+
+        store.set_session_mcp_servers(&s.id, None);
+        assert!(store.session_mcp_servers(&s.id).is_none());
+    }
+
+    #[test]
+    fn set_session_mcp_servers_unknown_session_is_noop() {
+        let store = SessionStore::new();
+        store.set_session_mcp_servers("nope", Some(vec![ws_server("codegraph")]));
+        assert!(store.session_mcp_servers("nope").is_none());
+    }
+
+    #[test]
+    fn fork_session_copies_mcp_servers_binding() {
+        let store = SessionStore::new();
+        let s = store.create_session(None);
+        let servers = vec![ws_server("codegraph")];
+        store.set_session_mcp_servers(&s.id, Some(servers.clone()));
+
+        let forked = store.fork_session(&s.id).unwrap();
+        assert_eq!(forked.mcp_servers, Some(servers.clone()));
+        // Changing the fork's binding does not touch the source.
+        store.set_session_mcp_servers(&forked.id, Some(vec![ws_server("other")]));
+        assert_eq!(store.session_mcp_servers(&s.id), Some(servers));
+    }
+
+    #[test]
+    fn migration_v6_to_v7_preserves_session_and_adds_mcp_servers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sessions.db");
+        let sid = "sess-1";
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE sessions (
+                     id TEXT PRIMARY KEY, goal TEXT, title TEXT, summary TEXT,
+                     status TEXT NOT NULL, created_at INTEGER NOT NULL,
+                     updated_at INTEGER NOT NULL, phenotype TEXT, mode TEXT,
+                     workspace TEXT, model TEXT
+                 );",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO sessions (id, goal, status, created_at, updated_at)
+                 VALUES (?1, 'legacy goal', 'active', 0, 0)",
+                params![sid],
+            )
+            .unwrap();
+            conn.pragma_update(None, "user_version", 6).unwrap();
+        }
+
+        let store = SessionStore::open(&path).unwrap();
+        // The pre-existing v6 row survives the ALTER with a NULL (inherited) set.
+        let s = store.get_session(sid).unwrap();
+        assert_eq!(s.goal.as_deref(), Some("legacy goal"));
+        assert!(s.mcp_servers.is_none());
+        // ...and the new column is writable post-upgrade.
+        let servers = vec![ws_server("codegraph")];
+        store.set_session_mcp_servers(sid, Some(servers.clone()));
+        assert_eq!(store.session_mcp_servers(sid), Some(servers));
+
+        let version: i64 = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 7);
+    }
+
     // --- SQLite-backed persistence (RFC 0012 / #276) ---
 
     #[test]
@@ -1865,7 +2017,7 @@ mod tests {
             .unwrap()
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 6);
+        assert_eq!(version, 7);
     }
 
     #[test]

@@ -1,8 +1,9 @@
 # Codon (码子) — a programming phenotype that carries codegraph as its DNA.
 #
-# Copy this file to ~/.flowforge/phenos/codon.toml, install the bundled
-# `codegraph` skill, and add the codegraph MCP server to ~/.flowforge/mcp.json
-# (see ../README.md). The file stem ("codon") is the phenotype name.
+# Copy this file to ~/.flowforge/phenos/codon.toml and install the bundled
+# `codegraph` skill (see ../README.md). The codegraph MCP server now travels with
+# this phenotype (the [[mcp_servers]] entry below) -- no global mcp.json edit is
+# needed. The file stem ("codon") is the phenotype name.
 
 skills = ["codegraph"]
 
@@ -60,3 +61,14 @@ independent verify checks (fmt, lint, a targeted test) together the same way.
 - Quality bar: build passes, tests pass, no placeholders. New code earns tests.
 - No redundant comments. Code explains the "what"; comment only the "why".
 """
+
+# codegraph travels with codon as a workspace-scoped MCP server (RFC 0018 C3).
+# `scope = "workspace"` gives each session's checkout its own indexed instance,
+# keyed by workspace root and ref-counted across panes. Do NOT pin `--path`: the
+# root is advertised per turn via the MCP roots capability, and a hard-coded
+# --path silently defeats per-turn alignment (RFC 0018 section 4.4).
+[[mcp_servers]]
+id = "codegraph"
+command = "codegraph"
+args = ["serve", "--mcp"]
+scope = "workspace"

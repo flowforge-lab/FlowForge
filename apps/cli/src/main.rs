@@ -1012,6 +1012,7 @@ mod tests {
             persona: persona.map(str::to_string),
             max_iterations: None,
             provider: None,
+            mcp_servers: Vec::new(),
         }
     }
 

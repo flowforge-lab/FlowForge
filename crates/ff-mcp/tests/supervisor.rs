@@ -321,7 +321,7 @@ async fn align_session_runs_workspace_instance_in_its_root() {
 
     let dir = tempfile::tempdir().expect("tempdir");
     let want = std::fs::canonicalize(dir.path()).expect("canonicalize tempdir");
-    sup.align_session("s1", want.clone()).await;
+    sup.align_session("s1", want.clone(), vec![cwd_cfg()]).await;
 
     wait_for(&sup, Duration::from_secs(5), |snap| {
         snap.iter()
@@ -367,8 +367,10 @@ async fn distinct_roots_get_distinct_instances() {
     let dir_b = tempfile::tempdir().expect("tempdir b");
     let root_a = std::fs::canonicalize(dir_a.path()).unwrap();
     let root_b = std::fs::canonicalize(dir_b.path()).unwrap();
-    sup.align_session("sa", root_a.clone()).await;
-    sup.align_session("sb", root_b.clone()).await;
+    sup.align_session("sa", root_a.clone(), vec![cwd_cfg()])
+        .await;
+    sup.align_session("sb", root_b.clone(), vec![cwd_cfg()])
+        .await;
 
     wait_for(&sup, Duration::from_secs(5), |snap| {
         let running = snap
@@ -413,8 +415,8 @@ async fn workspace_instance_evicted_on_last_session_release() {
     let dir = tempfile::tempdir().expect("tempdir");
     let root = std::fs::canonicalize(dir.path()).unwrap();
     // Two sessions share the same root -> one instance, ref-count 2.
-    sup.align_session("s1", root.clone()).await;
-    sup.align_session("s2", root.clone()).await;
+    sup.align_session("s1", root.clone(), vec![cwd_cfg()]).await;
+    sup.align_session("s2", root.clone(), vec![cwd_cfg()]).await;
 
     wait_for(&sup, Duration::from_secs(5), |snap| {
         (snap.iter().filter(|s| s.id == "cwd").count() == 1).then_some(())

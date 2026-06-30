@@ -12,16 +12,19 @@ import {
 describe("defaultProfileId", () => {
   it("targets codon when it is installed", () => {
     const profiles = [
-      phenotypeToProfile({ name: "default", skills: [] }, 0),
-      phenotypeToProfile({ name: "codon", skills: ["codegraph"] }, 1),
+      phenotypeToProfile({ name: "default", skills: [], mcpServers: [] }, 0),
+      phenotypeToProfile(
+        { name: "codon", skills: ["codegraph"], mcpServers: [] },
+        1,
+      ),
     ];
     expect(defaultProfileId(profiles)).toBe(CODON_PROFILE_ID);
   });
 
   it("falls back to the built-in default when codon is absent", () => {
     const profiles = [
-      phenotypeToProfile({ name: "default", skills: [] }, 0),
-      phenotypeToProfile({ name: "rust", skills: [] }, 1),
+      phenotypeToProfile({ name: "default", skills: [], mcpServers: [] }, 0),
+      phenotypeToProfile({ name: "rust", skills: [], mcpServers: [] }, 1),
     ];
     expect(defaultProfileId(profiles)).toBe(DEFAULT_PROFILE_ID);
   });
@@ -29,7 +32,10 @@ describe("defaultProfileId", () => {
 
 describe("phenotypeToProfile", () => {
   it("maps phenotype fields and marks the built-in default as locked", () => {
-    const p = phenotypeToProfile({ name: "default", skills: [] }, 0);
+    const p = phenotypeToProfile(
+      { name: "default", skills: [], mcpServers: [] },
+      0,
+    );
     expect(p).toMatchObject({
       id: "default",
       name: "Default",
@@ -41,14 +47,22 @@ describe("phenotypeToProfile", () => {
   });
 
   it("leaves codon unlocked — it is user-installed content, not the built-in", () => {
-    const p = phenotypeToProfile({ name: "codon", skills: ["codegraph"] }, 1);
+    const p = phenotypeToProfile(
+      { name: "codon", skills: ["codegraph"], mcpServers: [] },
+      1,
+    );
     expect(p.id).toBe("codon");
     expect(p.locked).toBe(false);
   });
 
   it("title-cases names, counts skills, and uses persona as the description", () => {
     const p = phenotypeToProfile(
-      { name: "data-science", skills: ["a", "b"], persona: "You crunch data." },
+      {
+        name: "data-science",
+        skills: ["a", "b"],
+        persona: "You crunch data.",
+        mcpServers: [],
+      },
       1,
     );
     expect(p.name).toBe("Data Science");
@@ -59,7 +73,9 @@ describe("phenotypeToProfile", () => {
 
   it("assigns a stable accent by list position", () => {
     const accents = [0, 1, 2, 3, 4, 5].map(
-      (i) => phenotypeToProfile({ name: `p${i}`, skills: [] }, i).accent,
+      (i) =>
+        phenotypeToProfile({ name: `p${i}`, skills: [], mcpServers: [] }, i)
+          .accent,
     );
     expect(accents).toEqual([
       "blue",
