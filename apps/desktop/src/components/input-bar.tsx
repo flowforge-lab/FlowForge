@@ -6,6 +6,7 @@ import {
   EyeOff,
   FileText,
   Folder,
+  GitBranch,
   Paperclip,
   PencilLine,
   Search,
@@ -311,7 +312,8 @@ export function InputBar({
   return (
     <div className="px-4 pb-4 pt-2">
       <div className="mx-auto flex max-w-3xl flex-col gap-2">
-        {/* Unified composer: textarea + workspace chip + send/stop in one card. */}
+        {/* Primary composer card: textarea + mode/model/attach + send/stop. The
+            workspace + branch live in a separate bar below (#606). */}
         <div
           ref={boxRef}
           className={cn(
@@ -348,9 +350,9 @@ export function InputBar({
             placeholder={
               mode === "plan"
                 ? "Plan mode — ask the agent to read and propose…"
-                : "Message FlowForge…"
+                : "Send a message..."
             }
-            className="max-h-40 min-h-8 w-full resize-none bg-transparent px-2 py-1.5 text-[13px] leading-relaxed placeholder:text-muted-foreground/50 focus-visible:outline-none"
+            className="max-h-40 min-h-20 w-full resize-none bg-transparent px-2 py-1.5 text-[13px] leading-relaxed placeholder:text-muted-foreground/50 focus-visible:outline-none"
             onFocus={warmup}
             onPaste={handlePaste}
             onChange={(e) => {
@@ -394,8 +396,8 @@ export function InputBar({
             />
           ) : null}
 
-          {/* Bottom toolbar inside the composer: working-directory chip (left)
-              and Send/Stop (right), so the controls read as one input box. */}
+          {/* Bottom toolbar inside the composer: mode/model/attach (left) and
+              Send/Stop (right), so the controls read as one input box. */}
           <div className="flex items-center justify-between gap-2 border-t border-border/40 px-1.5 pb-1 pt-1.5">
             <div className="flex min-w-0 items-center gap-1.5">
               {targetSessionId ? (
@@ -409,7 +411,6 @@ export function InputBar({
                     onChange={handleFilePick}
                   />
                   <ModePill sessionId={targetSessionId} />
-                  <WorkspaceSelector sessionId={targetSessionId} />
                   <ModelChip sessionId={targetSessionId} />
                   {attachGated ? (
                     // Capability gate (#342/#504): the active model accepts neither
@@ -490,6 +491,18 @@ export function InputBar({
             )}
           </div>
         </div>
+
+        {/* Separate workspace bar (#606): session context — workspace + git
+            branch — sits below the card as a distinct, compact row rather than
+            another control mixed into the toolbar. */}
+        {targetSessionId ? (
+          <div
+            data-testid="workspace-bar"
+            className="flex min-w-0 items-center px-1 text-xs"
+          >
+            <WorkspaceSelector sessionId={targetSessionId} />
+          </div>
+        ) : null}
       </div>
     </div>
   );
@@ -668,6 +681,11 @@ function basename(path: string): string {
   return parts[parts.length - 1] || path;
 }
 
+// Shared styling for the workspace + branch chips in the bar below the composer
+// (#606). `min-w-0` lets the inner label truncate when the bar is narrow.
+const WORKSPACE_CHIP_CLASS =
+  "inline-flex min-w-0 items-center gap-1.5 rounded-md border border-border bg-muted/40 px-2 py-1.5 text-xs text-muted-foreground transition-colors hover:bg-muted/60 hover:text-foreground data-[state=open]:bg-muted/70 data-[state=open]:text-foreground";
+
 // The working directory a session's tools run in (#200). A filterable combobox
 // (#210): a compact chip opens a popover with a Filter box, the recent workspaces
 // (the active one highlighted), and Browse docked as a footer that opens the
@@ -731,21 +749,41 @@ function WorkspaceSelector({ sessionId }: { sessionId: string }) {
         if (!next) setFilter("");
       }}
     >
-      <PopoverPrimitive.Trigger asChild>
-        <button
-          type="button"
-          className="inline-flex w-max max-w-[calc(100%-2.5rem)] items-center gap-1.5 rounded-md border border-border bg-muted/40 px-2 py-1.5 text-xs text-muted-foreground transition-colors hover:bg-muted/60 hover:text-foreground data-[state=open]:bg-muted/70 data-[state=open]:text-foreground"
-        >
-          <Folder className="size-3.5 shrink-0" />
-          <span className="truncate" title={path ?? undefined}>
-            {path ? basename(path) : "Loading…"}
-          </span>
-          {branch ? (
-            <span className="truncate text-muted-foreground/60">{branch}</span>
-          ) : null}
-          <ChevronsUpDown className="size-3 shrink-0 opacity-60" />
-        </button>
-      </PopoverPrimitive.Trigger>
+      {/* Two chips — workspace (folder) and git branch — open the same popover
+          (#606). Only the folder chip is the Radix Trigger so a single
+          `triggerRef` owns focus return on close; the branch chip is a plain
+          button that opens the (controlled) popover, and is hidden on a detached
+          HEAD / non-repo (`branch === null`). */}
+      <div className="flex min-w-0 items-center gap-1.5">
+        <PopoverPrimitive.Trigger asChild>
+          <button
+            type="button"
+            className={WORKSPACE_CHIP_CLASS}
+            aria-label={`Workspace: ${path ? basename(path) : "Loading"}`}
+          >
+            <Folder className="size-3.5 shrink-0" />
+            <span className="truncate" title={path ?? undefined}>
+              {path ? basename(path) : "Loading…"}
+            </span>
+            <ChevronsUpDown className="size-3 shrink-0 opacity-60" />
+          </button>
+        </PopoverPrimitive.Trigger>
+        {branch ? (
+          <button
+            type="button"
+            className={WORKSPACE_CHIP_CLASS}
+            aria-haspopup="dialog"
+            aria-expanded={open}
+            title={`Branch: ${branch}`}
+            aria-label={`Git branch: ${branch}`}
+            onClick={() => setOpen(true)}
+          >
+            <GitBranch className="size-3.5 shrink-0" />
+            <span className="truncate">{branch}</span>
+            <ChevronsUpDown className="size-3 shrink-0 opacity-60" />
+          </button>
+        ) : null}
+      </div>
       <PopoverPrimitive.Portal>
         <PopoverPrimitive.Content
           side="top"
