@@ -16,6 +16,7 @@ import {
 import { useModelConfigStore } from "@/store/model-config";
 import { useProfilesStore } from "@/store/profiles";
 import { useSessionModelStore } from "@/store/session-model";
+import { ModelWindowInfo } from "@/components/model-window-info";
 
 // Per-pane model chip (RFC 0005 §11.4, Phase D; #499). Shows the resolved model
 // for this session and opens a quick picker (connection → model) that writes a
@@ -40,6 +41,11 @@ export function ModelChip({ sessionId }: { sessionId: string }) {
   );
   const unavailable = useSessionModelStore(
     (s) => s.unavailableBySession[sessionId] ?? false,
+  );
+  // Served context window + source for this session (#602). Absent until the
+  // backend forwards it; drives the dropdown readout and the under-fill warning dot.
+  const servedWindow = useSessionModelStore(
+    (s) => s.servedWindowBySession[sessionId],
   );
   const load = useSessionModelStore((s) => s.load);
   const setSelection = useSessionModelStore((s) => s.set);
@@ -100,10 +106,30 @@ export function ModelChip({ sessionId }: { sessionId: string }) {
               className="size-1.5 shrink-0 rounded-full bg-primary"
             />
           ) : null}
+          {/* Always-visible under-fill warning (#602): the served window fell back to
+              the conservative default — likely a mis-set OLLAMA_CONTEXT_LENGTH — so
+              flag it here rather than letting it pass silently. */}
+          {servedWindow?.source === "default" ? (
+            <span
+              className="size-1.5 shrink-0 rounded-full bg-amber-500"
+              title="Context window not detected — using the conservative default. Set OLLAMA_CONTEXT_LENGTH or FLOWFORGE_OLLAMA_NUM_CTX."
+              aria-label="Context window not detected — using the conservative default"
+            />
+          ) : null}
           <ChevronDown className="size-3 shrink-0 opacity-60" />
         </Button>
       </DropdownMenuTrigger>
       <DropdownMenuContent align="start" className="min-w-48">
+        {/* Served context window + source (#602), shown above the picker so the
+            user can see what window the active model is actually serving. */}
+        {servedWindow ? (
+          <>
+            <div className="px-2 py-1.5">
+              <ModelWindowInfo info={servedWindow} />
+            </div>
+            <DropdownMenuSeparator />
+          </>
+        ) : null}
         {connections.length === 0 ? (
           <DropdownMenuItem disabled>
             {registryLoading ? "Loading…" : "No connections"}

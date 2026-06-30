@@ -9,6 +9,7 @@
 import { create } from "zustand";
 import { ipc } from "@/lib/ipc";
 import type { ModelSelection, ResolvedModel } from "@/bindings";
+import type { ServedWindow } from "@/lib/served-window";
 
 export interface SessionModelState {
   /** The authoritative resolved `(connection, model)` per session, plus the
@@ -23,10 +24,23 @@ export interface SessionModelState {
    *  chip hides for these rather than spinning forever or leaking an unhandled
    *  rejection; it reappears once `load` succeeds after the backend lands. */
   unavailableBySession: Record<string, boolean>;
+  /** The served context window + source per session (#602). Absent until the
+   *  backend forwards it. PENDING CONTRACT: today this is only seeded by the mock /
+   *  tests; once Tony lands the `/api/ps` probe and the `ResolvedModel` fields
+   *  (`contextWindow` / `trainedContextWindow` / `contextWindowSource`), populate it
+   *  from `resolved.*` in `load()` below — no new IPC call, it rides on
+   *  `resolveModelSelection`. See lib/served-window.ts. */
+  servedWindowBySession: Record<string, ServedWindow | undefined>;
 
   /** Fetch and cache a session's resolved selection + raw override. Never rejects:
    *  a backend failure marks the session unavailable instead. */
   load: (sessionId: string) => Promise<void>;
+  /** Seed/replace the served window for a session (#602). Used by the mock / tests
+   *  now; the real populate happens in `load()` once the contract carries it. */
+  setServedWindow: (
+    sessionId: string,
+    window: ServedWindow | undefined,
+  ) => void;
   /** Set a session's override, then reload so the cache carries the backend's
    *  canonical resolved pair. Throws (cache unchanged) if the backend rejects it. */
   set: (sessionId: string, selection: ModelSelection) => Promise<void>;
@@ -38,6 +52,15 @@ export const useSessionModelStore = create<SessionModelState>((set, get) => ({
   resolvedBySession: {},
   overrideBySession: {},
   unavailableBySession: {},
+  servedWindowBySession: {},
+
+  setServedWindow: (sessionId, window) =>
+    set((s) => ({
+      servedWindowBySession: {
+        ...s.servedWindowBySession,
+        [sessionId]: window,
+      },
+    })),
 
   load: async (sessionId) => {
     try {
