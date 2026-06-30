@@ -11,7 +11,9 @@ import type { ContextWindowSource } from "@/bindings/ContextWindowSource";
 export type ServedWindowSource = ContextWindowSource;
 
 export interface ServedWindow {
-  /** Effective served window, in tokens (the denominator the budget is sized from). */
+  /** Effective served window, in tokens -- the denominator the agent's compaction
+   *  budget is sized from (#612). Before the model is loaded the probe falls to the
+   *  conservative default, so the chip and the budget agree on a safe under-fill. */
   window: number;
   /** Trained ceiling (`/api/show` context_length), or null when unknown. */
   trained: number | null;

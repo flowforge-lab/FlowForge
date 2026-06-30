@@ -35,6 +35,13 @@ pub struct OllamaProvider {
     /// Ollama actually serves. `None` leaves the request unset and the reported
     /// window conservative; see [`context_window`](OllamaProvider::context_window).
     num_ctx: Option<u64>,
+    /// The *probed* served window (#602/#612), primed from `/api/ps` before a
+    /// turn via [`set_context_budget`](OllamaProvider::set_context_budget). Unlike
+    /// [`num_ctx`] this never reaches the wire -- it only feeds
+    /// [`context_window`](OllamaProvider::context_window) so the compaction budget
+    /// tracks the window the runtime is actually serving when no explicit
+    /// `num_ctx` was requested. `None` falls through to the conservative default.
+    budget_window: Option<u64>,
 }
 
 impl OllamaProvider {
@@ -44,6 +51,7 @@ impl OllamaProvider {
             client: crate::build_streaming_http_client(),
             supports_vision: false,
             num_ctx: None,
+            budget_window: None,
         }
     }
 
@@ -59,6 +67,15 @@ impl OllamaProvider {
     /// runtime serves rather than the model's trained maximum.
     pub fn with_num_ctx(mut self, num_ctx: Option<u64>) -> Self {
         self.num_ctx = num_ctx;
+        self
+    }
+
+    /// Prime the probed served window used by
+    /// [`context_window`](OllamaProvider::context_window) when no explicit
+    /// `num_ctx` was requested (#612). Builder-style mirror of
+    /// [`Provider::set_context_budget`](crate::Provider::set_context_budget).
+    pub fn with_budget_window(mut self, budget_window: Option<u64>) -> Self {
+        self.budget_window = budget_window;
         self
     }
 
@@ -459,20 +476,32 @@ impl Provider for OllamaProvider {
     }
 
     /// The window Ollama will actually serve, not the model's trained maximum
-    /// (#538). When a `num_ctx` is configured it is the served window, clamped to
-    /// the trained ceiling from the shared family lookup. Without one we fall back
-    /// to the conservative [`DEFAULT_CONTEXT_WINDOW_TOKENS`] rather than the
-    /// trained max: Ollama serves `min(OLLAMA_CONTEXT_LENGTH, trained)` from a
-    /// server default the agent cannot see, so reporting the trained max would
-    /// over-size the compaction budget and overflow the real window. Under-filling
-    /// is always safe; over-filling silently truncates context.
+    /// (#538/#602/#612). Precedence mirrors [`resolve_served_window`] exactly, so
+    /// the budget this sizes equals the window the model chip displays:
+    /// 1. an explicit `num_ctx` (clamped to the trained ceiling, since Ollama
+    ///    serves `min(num_ctx, trained)`);
+    /// 2. otherwise the probed served window from `/api/ps`
+    ///    ([`budget_window`], primed via [`set_context_budget`]);
+    /// 3. otherwise the conservative [`DEFAULT_CONTEXT_WINDOW_TOKENS`].
+    ///
+    /// Falling back to the default rather than the trained max keeps the budget
+    /// under the real window: Ollama serves `min(OLLAMA_CONTEXT_LENGTH, trained)`
+    /// from a server default, so reporting the trained max would over-size the
+    /// budget and overflow. Before the first turn `/api/ps` lists no loaded model,
+    /// so the budget falls to the default until the model is resident -- a safe
+    /// under-fill. Under-filling never truncates context; over-filling does.
     ///
     /// [`DEFAULT_CONTEXT_WINDOW_TOKENS`]: crate::DEFAULT_CONTEXT_WINDOW_TOKENS
+    /// [`set_context_budget`]: crate::Provider::set_context_budget
     fn context_window(&self, model: &str) -> u64 {
-        match self.num_ctx {
-            Some(n) => n.min(crate::model_context_window(model)),
-            None => crate::DEFAULT_CONTEXT_WINDOW_TOKENS,
-        }
+        self.num_ctx
+            .map(|n| n.min(crate::model_context_window(model)))
+            .or(self.budget_window)
+            .unwrap_or(crate::DEFAULT_CONTEXT_WINDOW_TOKENS)
+    }
+
+    fn set_context_budget(&mut self, window: Option<u64>) {
+        self.budget_window = window;
     }
 }
 
@@ -828,6 +857,51 @@ mod tests {
             p.context_window("Qwen/Qwen3.6-35B-A3B"),
             crate::DEFAULT_CONTEXT_WINDOW_TOKENS,
         );
+    }
+
+    #[test]
+    fn context_window_uses_probed_budget_when_no_num_ctx() {
+        // With no explicit num_ctx, the probed served window (#612) becomes the
+        // budget denominator -- so a user who raised OLLAMA_CONTEXT_LENGTH budgets
+        // against the window the runtime actually serves, not the 32k default.
+        let p = OllamaProvider::default().with_budget_window(Some(131_072));
+        assert_eq!(p.context_window("Qwen/Qwen3.6-35B-A3B"), 131_072);
+    }
+
+    #[test]
+    fn context_window_explicit_num_ctx_overrides_probed_budget() {
+        // An explicit num_ctx is the served window the request pins, so it wins
+        // over a probed budget -- and is still clamped to the trained ceiling.
+        let trained = crate::model_context_window("Qwen/Qwen3.6-35B-A3B");
+        let p = OllamaProvider::default()
+            .with_num_ctx(Some(8_192))
+            .with_budget_window(Some(131_072));
+        assert_eq!(p.context_window("Qwen/Qwen3.6-35B-A3B"), 8_192);
+        let clamped = OllamaProvider::default()
+            .with_num_ctx(Some(9_999_999))
+            .with_budget_window(Some(131_072));
+        assert_eq!(clamped.context_window("Qwen/Qwen3.6-35B-A3B"), trained);
+    }
+
+    #[test]
+    fn context_window_falls_to_default_when_neither_set() {
+        // No num_ctx and an unprimed/empty probe (cold start, before /api/ps lists
+        // the model) falls to the conservative default -- a safe under-fill.
+        let mut p = OllamaProvider::default();
+        Provider::set_context_budget(&mut p, None);
+        assert_eq!(
+            p.context_window("Qwen/Qwen3.6-35B-A3B"),
+            crate::DEFAULT_CONTEXT_WINDOW_TOKENS,
+        );
+    }
+
+    #[test]
+    fn set_context_budget_threads_probed_window_into_budget() {
+        // The Provider-trait setter the host calls before a turn primes the same
+        // budget the builder does, so the wiring in lib.rs reaches context_window.
+        let mut p = OllamaProvider::default();
+        Provider::set_context_budget(&mut p, Some(262_144));
+        assert_eq!(p.context_window("moonshotai/Kimi-K2.7-Code"), 262_144);
     }
 
     #[test]

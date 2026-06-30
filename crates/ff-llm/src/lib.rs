@@ -592,13 +592,25 @@ pub fn budgeted_max_output_tokens(model: &str, input_tokens: u64) -> Option<u32>
 pub trait Provider: Send + Sync {
     async fn chat_stream(&self, req: ChatRequest) -> Result<ChunkStream, LlmError>;
 
-    /// The model's context window in tokens, used by the agent to size its
-    /// compaction budget so a capable large-window model isn't penalized by a
-    /// fixed ceiling. Defaults to the shared [`model_context_window`] family
-    /// lookup; a provider with a non-standard deployment may override.
+    /// The model's context window in tokens -- the denominator the agent sizes
+    /// its compaction budget from, so a capable large-window model isn't
+    /// penalized by a fixed ceiling. Defaults to the shared
+    /// [`model_context_window`] family lookup; a provider with a non-standard
+    /// deployment may override. For backends that serve a window smaller than the
+    /// trained maximum (e.g. Ollama's `OLLAMA_CONTEXT_LENGTH`), the host primes
+    /// the served value via [`set_context_budget`](Provider::set_context_budget)
+    /// before each turn; until that value is known the override reports a
+    /// conservative default so the budget under-fills rather than overflows.
     fn context_window(&self, model: &str) -> u64 {
         model_context_window(model)
     }
+
+    /// Prime the served context window the agent should budget against, when the
+    /// host has probed a value the provider cannot know synchronously (#612).
+    /// Defaults to a no-op: providers whose [`context_window`](Provider::context_window)
+    /// is self-contained ignore it. Ollama overrides it to feed the `/api/ps`
+    /// probed window into its budget when no explicit `num_ctx` was requested.
+    fn set_context_budget(&mut self, _window: Option<u64>) {}
 
     /// Whether the active model accepts image/document attachments. Hosts read
     /// this to warn the user when a turn's attachments will be stripped before
