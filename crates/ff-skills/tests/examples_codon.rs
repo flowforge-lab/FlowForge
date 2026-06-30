@@ -38,8 +38,8 @@ fn codon_phenotype_loads_and_declares_codegraph() {
     );
     assert_eq!(
         codon.max_iterations,
-        Some(25),
-        "codon raises the iteration cap to 25 for long verify loops"
+        Some(200),
+        "codon raises the iteration cap to 200 for long verify loops"
     );
 }
 

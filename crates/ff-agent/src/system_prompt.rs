@@ -70,6 +70,11 @@ pub struct UserContext {
     pub timezone: String,
     /// Coarse local time-of-day band (RFC 0008 §6).
     pub time_of_day: TimeOfDay,
+    /// Absolute path of the session's working directory -- the cwd  runs in
+    /// and the root file tools are jailed to. Stated in the prompt so the model
+    /// works from the real checkout instead of guessing a path (and prepending a
+    /// wrong ). Empty when the host did not supply one; then it is not rendered.
+    pub working_dir: String,
 }
 
 impl UserContext {
@@ -85,7 +90,17 @@ impl UserContext {
             local_date,
             timezone,
             time_of_day,
+            working_dir: String::new(),
         }
+    }
+
+    /// Attach the session's working directory (absolute path) so the prompt can
+    /// state where  runs and file tools are rooted. Builder-style; stable
+    /// within a session, so it sits in the volatile tail without busting the
+    /// prefix cache any more than the date already does.
+    pub fn with_working_dir(mut self, dir: impl Into<String>) -> Self {
+        self.working_dir = dir.into();
+        self
     }
 }
 
@@ -225,6 +240,14 @@ pub fn build_system_prompt(
         user.time_of_day.label(),
         user.timezone
     ));
+    if !user.working_dir.is_empty() {
+        out.push_str(&format!(
+            "Working directory: {}\n\
+             Shell commands run here and file tools are rooted here; use paths \
+             relative to it and do not prepend a  to another directory.\n",
+            user.working_dir
+        ));
+    }
 
     // Durable memory (RFC 0006) sits in the volatile tail beside the user
     // context: like the date, it changes between sessions, so keeping it after
@@ -289,6 +312,7 @@ mod tests {
             local_date: "2026-06-13".into(),
             timezone: "America/Chicago".into(),
             time_of_day: TimeOfDay::Evening,
+            working_dir: String::new(),
         }
     }
 
@@ -493,6 +517,25 @@ mod tests {
         );
         // Description of the inactive skill still appears in Available skills.
         assert!(out.contains("- idle: Unused"));
+    }
+
+    #[test]
+    fn working_dir_renders_when_set_and_is_absent_when_empty() {
+        let reg = registry(vec![skill("a", "desc", "body")]);
+        let with = build_system_prompt(
+            None,
+            &reg,
+            &[],
+            &ctx().with_working_dir("/Users/me/projects/flowforge_abid"),
+            None,
+            Mode::default(),
+        );
+        assert!(
+            with.contains("Working directory: /Users/me/projects/flowforge_abid"),
+            "{with}"
+        );
+        let without = build_system_prompt(None, &reg, &[], &ctx(), None, Mode::default());
+        assert!(!without.contains("Working directory:"), "{without}");
     }
 
     #[test]

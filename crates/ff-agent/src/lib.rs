@@ -3626,6 +3626,7 @@ mod tests {
             local_date: "2026-06-13".into(),
             timezone: "America/Chicago".into(),
             time_of_day: TimeOfDay::Morning,
+            working_dir: String::new(),
         };
         let system = build_system_prompt(None, &skills, &[], &user, None, Mode::default());
 

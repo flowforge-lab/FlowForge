@@ -358,7 +358,7 @@ async fn run(
         }
     };
 
-    let user_ctx = UserContext::now();
+    let user_ctx = UserContext::now().with_working_dir(workspace.display().to_string());
     let (memory, ambient_keys) = match &memory_index {
         Some(idx) => memory_store.ambient_block_filtered_keyed(idx.as_ref()),
         None => (memory_store.ambient_block(), Vec::new()),
@@ -533,7 +533,7 @@ async fn chat_repl(
 
         store.add_message(session_id, Role::User, trimmed.to_string());
 
-        let user_ctx = UserContext::now();
+        let user_ctx = UserContext::now().with_working_dir(tool_ctx.root.display().to_string());
         let (memory, ambient_keys) = match memory_index {
             Some(idx) => memory_store.ambient_block_filtered_keyed(idx.as_ref()),
             None => (memory_store.ambient_block(), Vec::new()),

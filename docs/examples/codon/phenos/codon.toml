@@ -8,11 +8,13 @@
 skills = ["codegraph"]
 
 # Coding runs long Research -> Plan -> Implement -> Verify loops (edit, build,
-# test, fix). Raise the agent's per-turn tool-call cap above the default so a
-# full verify cycle completes without truncation. 25 covers a full cycle once
-# independent reads/greps are batched into single turns and run concurrently;
-# it also bounds how many times the transcript is re-prefilled on slow gateways.
-max_iterations = 25
+# test, fix). Raise the agent's per-turn tool-call cap well above the default so
+# a full RPIV cycle -- research, many edits, build/test/fix -- never truncates
+# mid-flight and force a manual "continue". This is a ceiling, not a target:
+# most turns finish far under it, and context-pressure compaction plus the
+# repeat/no-progress breaker bound a runaway turn regardless. Batching
+# independent reads/edits (see persona) keeps the typical turn well below it.
+max_iterations = 200
 
 # `model` is intentionally unset: the DNA is the persona + skills + codegraph,
 # not a specific provider. Pin a capable model here once your Bedrock (or other)
@@ -64,9 +66,13 @@ independent verify checks (fmt, lint, a targeted test) together the same way.
 
 # codegraph travels with codon as a workspace-scoped MCP server (RFC 0018 C3).
 # `scope = "workspace"` gives each session's checkout its own indexed instance,
-# keyed by workspace root and ref-counted across panes. Do NOT pin `--path`: the
-# root is advertised per turn via the MCP roots capability, and a hard-coded
-# --path silently defeats per-turn alignment (RFC 0018 section 4.4).
+# keyed by workspace root and ref-counted across panes. The root is advertised
+# per turn via the MCP roots capability, so a build that honors it needs no
+# `--path`. If your codegraph build instead requires an explicit project (a bare
+# call returns "No project loaded"), add `--path "${workspace}"`: the
+# `${workspace}` placeholder is resolved per instance to that session's root, so
+# it stays per-workspace correct. NEVER hard-code a literal path -- that pins all
+# workspaces to one repo and defeats per-turn alignment (RFC 0018 section 4.4).
 [[mcp_servers]]
 id = "codegraph"
 command = "codegraph"
