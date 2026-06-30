@@ -27,6 +27,7 @@ afterEach(async () => {
     resolvedBySession: {},
     overrideBySession: {},
     unavailableBySession: {},
+    servedWindowBySession: {},
   });
 });
 
@@ -101,5 +102,46 @@ describe("ModelChip (#499)", () => {
     );
     expect(await screen.findByText("qwen2.5")).not.toBeNull();
     expect(await screen.findByText(DEFAULT_MODEL)).not.toBeNull();
+  });
+});
+
+describe("ModelChip served-window display (#602)", () => {
+  const WARNING = /context window not detected/i;
+
+  it("shows the served window + source in the dropdown when present", async () => {
+    useSessionModelStore.setState({
+      servedWindowBySession: {
+        s1: { window: 131072, trained: 262144, source: "served" },
+      },
+    });
+    render(<ModelChip sessionId="s1" />);
+    await screen.findByText(DEFAULT_MODEL);
+    await userEvent.click(screen.getByLabelText("Session model"));
+
+    expect(await screen.findByText(/serving 128k/i)).not.toBeNull();
+    expect(screen.getByText(/trained 256k/i)).not.toBeNull();
+    expect(screen.getByText(/auto-detected from server/i)).not.toBeNull();
+    // Not the conservative-default fallback, so no under-fill warning dot.
+    expect(screen.queryByLabelText(WARNING)).toBeNull();
+  });
+
+  it("shows an always-visible warning dot on the trigger for the default fallback", async () => {
+    useSessionModelStore.setState({
+      servedWindowBySession: {
+        s1: { window: 32000, trained: null, source: "default" },
+      },
+    });
+    render(<ModelChip sessionId="s1" />);
+    await screen.findByText(DEFAULT_MODEL);
+    // The dot is visible without opening the dropdown.
+    expect(screen.getByLabelText(WARNING)).not.toBeNull();
+  });
+
+  it("renders neither the readout nor the warning dot when no served window is known", async () => {
+    render(<ModelChip sessionId="s1" />);
+    await screen.findByText(DEFAULT_MODEL);
+    expect(screen.queryByLabelText(WARNING)).toBeNull();
+    await userEvent.click(screen.getByLabelText("Session model"));
+    expect(screen.queryByText(/serving/i)).toBeNull();
   });
 });
