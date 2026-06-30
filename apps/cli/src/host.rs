@@ -7,8 +7,8 @@ use std::path::PathBuf;
 
 use ff_core::{ProviderConfig, ProviderKind};
 use ff_llm::{
-    reasoning_control, wire_dialect, BedrockCreds, BedrockProvider, OllamaProvider, OpenAiProvider,
-    Provider,
+    ollama_num_ctx_from_env, reasoning_control, wire_dialect, BedrockCreds, BedrockProvider,
+    OllamaProvider, OpenAiProvider, Provider,
 };
 use ff_skills::SkillRegistry;
 
@@ -45,7 +45,9 @@ fn build_provider(config: &ProviderConfig) -> Box<dyn Provider> {
         ProviderKind::CandleVllm => {
             Box::new(OpenAiProvider::new(base_url, None).with_dialect(dialect))
         }
-        ProviderKind::Ollama => Box::new(OllamaProvider::new(base_url)),
+        ProviderKind::Ollama => {
+            Box::new(OllamaProvider::new(base_url).with_num_ctx(ollama_num_ctx_from_env()))
+        }
         ProviderKind::Bedrock => Box::new(build_bedrock_provider(config)),
         // The CLI has no keychain, so a hosted OpenAI key comes from the
         // OPENAI_API_KEY env var (absent or empty => keyless, for OpenAI-compatible

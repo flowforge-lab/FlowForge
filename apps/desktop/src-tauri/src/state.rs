@@ -15,8 +15,8 @@ use ff_core::{
     ProviderRegistry, ResolvedModel, SearchConfig, SecretKind, SessionWorkspace,
 };
 use ff_llm::{
-    reasoning_control, wire_dialect, BedrockCreds, BedrockProvider, OllamaProvider, OpenAiProvider,
-    Provider,
+    ollama_num_ctx_from_env, reasoning_control, wire_dialect, BedrockCreds, BedrockProvider,
+    OllamaProvider, OpenAiProvider, Provider,
 };
 use ff_mcp::{McpConfigWatcher, SupervisorHandle};
 
@@ -153,7 +153,11 @@ fn build_provider(conn: &ProviderConnection, model: &str) -> Box<dyn Provider> {
                 .with_dialect(dialect)
                 .with_reasoning_control(reasoning),
         ),
-        ProviderKind::Ollama => Box::new(OllamaProvider::new(base_url).with_vision(vision)),
+        ProviderKind::Ollama => Box::new(
+            OllamaProvider::new(base_url)
+                .with_vision(vision)
+                .with_num_ctx(ollama_num_ctx_from_env()),
+        ),
         // Bedrock resolves credentials by auth mode, pulling secret material from the
         // OS keychain here so the provider crate stays keychain-free (#202 PR-2).
         ProviderKind::Bedrock => {
