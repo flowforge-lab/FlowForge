@@ -35,6 +35,13 @@ pub struct OllamaProvider {
     /// Ollama actually serves. `None` leaves the request unset and the reported
     /// window conservative; see [`context_window`](OllamaProvider::context_window).
     num_ctx: Option<u64>,
+    /// The *probed* served window (#602/#612), primed from `/api/ps` before a
+    /// turn via [`set_context_budget`](OllamaProvider::set_context_budget). Unlike
+    /// [`num_ctx`] this never reaches the wire -- it only feeds
+    /// [`context_window`](OllamaProvider::context_window) so the compaction budget
+    /// tracks the window the runtime is actually serving when no explicit
+    /// `num_ctx` was requested. `None` falls through to the conservative default.
+    budget_window: Option<u64>,
 }
 
 impl OllamaProvider {
@@ -44,6 +51,7 @@ impl OllamaProvider {
             client: crate::build_streaming_http_client(),
             supports_vision: false,
             num_ctx: None,
+            budget_window: None,
         }
     }
 
@@ -60,6 +68,71 @@ impl OllamaProvider {
     pub fn with_num_ctx(mut self, num_ctx: Option<u64>) -> Self {
         self.num_ctx = num_ctx;
         self
+    }
+
+    /// Prime the probed served window used by
+    /// [`context_window`](OllamaProvider::context_window) when no explicit
+    /// `num_ctx` was requested (#612). Builder-style mirror of
+    /// [`Provider::set_context_budget`](crate::Provider::set_context_budget).
+    pub fn with_budget_window(mut self, budget_window: Option<u64>) -> Self {
+        self.budget_window = budget_window;
+        self
+    }
+
+    /// Probe the *served* context window for `model` (#602): the trained ceiling
+    /// (`/api/show`, falling back to the family table), the live `/api/ps` value
+    /// for the loaded instance, and the effective window + source via
+    /// [`resolve_served_window`]. Best-effort — a failed probe degrades to the
+    /// conservative default rather than erroring, since this only drives a display
+    /// hint, never a turn. `/api/ps` reports only *loaded* models, so before the
+    /// first turn the source is `Default` until the model is resident.
+    pub async fn served_window(&self, model: &str) -> ServedWindowProbe {
+        let trained = self
+            .probe_trained_window(model)
+            .await
+            .or_else(|| Some(crate::model_context_window(model)));
+        let ps_served = self.probe_loaded_window(model).await;
+        let (window, source) = resolve_served_window(self.num_ctx, ps_served, trained);
+        ServedWindowProbe {
+            window: Some(window),
+            trained,
+            source: Some(source),
+        }
+    }
+
+    /// `GET /api/ps` -> the loaded instance's served `context_length`, or `None`
+    /// when the model is not resident or the build omits the field.
+    async fn probe_loaded_window(&self, model: &str) -> Option<u64> {
+        let resp = self
+            .client
+            .get(format!("{}/api/ps", self.base_url))
+            .send()
+            .await
+            .ok()?;
+        let resp = crate::error_for_status_with_body(resp).await.ok()?;
+        let list: PsList = resp.json().await.ok()?;
+        list.models
+            .into_iter()
+            .find(|m| m.name == model || m.model.as_deref() == Some(model))
+            .and_then(|m| m.context_length)
+    }
+
+    /// `POST /api/show` -> the trained ceiling from `model_info.*.context_length`,
+    /// or `None` when the server is unreachable or the field is absent.
+    async fn probe_trained_window(&self, model: &str) -> Option<u64> {
+        let resp = self
+            .client
+            .post(format!("{}/api/show", self.base_url))
+            .json(&serde_json::json!({ "model": model }))
+            .send()
+            .await
+            .ok()?;
+        let resp = crate::error_for_status_with_body(resp).await.ok()?;
+        let show: ShowResponse = resp.json().await.ok()?;
+        show.model_info
+            .iter()
+            .find(|(k, _)| k.ends_with(".context_length"))
+            .and_then(|(_, v)| v.as_u64())
     }
 }
 
@@ -78,6 +151,73 @@ pub fn ollama_num_ctx_from_env() -> Option<u64> {
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
         .filter(|&n| n > 0)
+}
+
+/// The served context window for a model plus how it was determined (#602).
+/// Carrier between the async probe ([`OllamaProvider::served_window`]) and the
+/// host, which folds it onto `ResolvedModel`. All `None` for a provider that does
+/// not expose a served-window probe.
+#[derive(Debug, Clone, Default)]
+pub struct ServedWindowProbe {
+    /// Effective served window in tokens, or `None` when unknown.
+    pub window: Option<u64>,
+    /// Trained ceiling (`/api/show`), or the family-table fallback.
+    pub trained: Option<u64>,
+    /// Which input produced `window`.
+    pub source: Option<ff_core::ContextWindowSource>,
+}
+
+/// Resolve the effective served window and its source from the three inputs, in
+/// precedence order (#602): an explicit `FLOWFORGE_OLLAMA_NUM_CTX` (clamped to the
+/// trained ceiling, since Ollama serves `min(num_ctx, trained)`) wins; otherwise
+/// the live `/api/ps` value; otherwise the conservative
+/// [`DEFAULT_CONTEXT_WINDOW_TOKENS`]. Pure so it is unit-tested without a server,
+/// and so #598 can size its budget denominator from the same single source.
+pub fn resolve_served_window(
+    env_num_ctx: Option<u64>,
+    ps_served: Option<u64>,
+    trained: Option<u64>,
+) -> (u64, ff_core::ContextWindowSource) {
+    use ff_core::ContextWindowSource;
+    if let Some(n) = env_num_ctx {
+        let clamped = trained.map_or(n, |t| n.min(t));
+        return (clamped, ContextWindowSource::Explicit);
+    }
+    if let Some(n) = ps_served {
+        return (n, ContextWindowSource::Served);
+    }
+    (
+        crate::DEFAULT_CONTEXT_WINDOW_TOKENS,
+        ContextWindowSource::Default,
+    )
+}
+
+/// `GET /api/ps` -> currently *loaded* model instances. `context_length` is the
+/// window the runtime is actually serving for that instance; it is version-
+/// dependent (older builds omit it) so it stays optional.
+#[derive(Deserialize)]
+struct PsList {
+    #[serde(default)]
+    models: Vec<PsEntry>,
+}
+
+#[derive(Deserialize)]
+struct PsEntry {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    context_length: Option<u64>,
+}
+
+/// `POST /api/show` -> model metadata. The trained ceiling lives in `model_info`
+/// under an architecture-prefixed key (e.g. `"llama.context_length"`), so we scan
+/// for any `*.context_length` rather than hard-coding the architecture.
+#[derive(Deserialize)]
+struct ShowResponse {
+    #[serde(default)]
+    model_info: serde_json::Map<String, serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -336,20 +476,32 @@ impl Provider for OllamaProvider {
     }
 
     /// The window Ollama will actually serve, not the model's trained maximum
-    /// (#538). When a `num_ctx` is configured it is the served window, clamped to
-    /// the trained ceiling from the shared family lookup. Without one we fall back
-    /// to the conservative [`DEFAULT_CONTEXT_WINDOW_TOKENS`] rather than the
-    /// trained max: Ollama serves `min(OLLAMA_CONTEXT_LENGTH, trained)` from a
-    /// server default the agent cannot see, so reporting the trained max would
-    /// over-size the compaction budget and overflow the real window. Under-filling
-    /// is always safe; over-filling silently truncates context.
+    /// (#538/#602/#612). Precedence mirrors [`resolve_served_window`] exactly, so
+    /// the budget this sizes equals the window the model chip displays:
+    /// 1. an explicit `num_ctx` (clamped to the trained ceiling, since Ollama
+    ///    serves `min(num_ctx, trained)`);
+    /// 2. otherwise the probed served window from `/api/ps`
+    ///    ([`budget_window`], primed via [`set_context_budget`]);
+    /// 3. otherwise the conservative [`DEFAULT_CONTEXT_WINDOW_TOKENS`].
+    ///
+    /// Falling back to the default rather than the trained max keeps the budget
+    /// under the real window: Ollama serves `min(OLLAMA_CONTEXT_LENGTH, trained)`
+    /// from a server default, so reporting the trained max would over-size the
+    /// budget and overflow. Before the first turn `/api/ps` lists no loaded model,
+    /// so the budget falls to the default until the model is resident -- a safe
+    /// under-fill. Under-filling never truncates context; over-filling does.
     ///
     /// [`DEFAULT_CONTEXT_WINDOW_TOKENS`]: crate::DEFAULT_CONTEXT_WINDOW_TOKENS
+    /// [`set_context_budget`]: crate::Provider::set_context_budget
     fn context_window(&self, model: &str) -> u64 {
-        match self.num_ctx {
-            Some(n) => n.min(crate::model_context_window(model)),
-            None => crate::DEFAULT_CONTEXT_WINDOW_TOKENS,
-        }
+        self.num_ctx
+            .map(|n| n.min(crate::model_context_window(model)))
+            .or(self.budget_window)
+            .unwrap_or(crate::DEFAULT_CONTEXT_WINDOW_TOKENS)
+    }
+
+    fn set_context_budget(&mut self, window: Option<u64>) {
+        self.budget_window = window;
     }
 }
 
@@ -705,6 +857,100 @@ mod tests {
             p.context_window("Qwen/Qwen3.6-35B-A3B"),
             crate::DEFAULT_CONTEXT_WINDOW_TOKENS,
         );
+    }
+
+    #[test]
+    fn context_window_uses_probed_budget_when_no_num_ctx() {
+        // With no explicit num_ctx, the probed served window (#612) becomes the
+        // budget denominator -- so a user who raised OLLAMA_CONTEXT_LENGTH budgets
+        // against the window the runtime actually serves, not the 32k default.
+        let p = OllamaProvider::default().with_budget_window(Some(131_072));
+        assert_eq!(p.context_window("Qwen/Qwen3.6-35B-A3B"), 131_072);
+    }
+
+    #[test]
+    fn context_window_explicit_num_ctx_overrides_probed_budget() {
+        // An explicit num_ctx is the served window the request pins, so it wins
+        // over a probed budget -- and is still clamped to the trained ceiling.
+        let trained = crate::model_context_window("Qwen/Qwen3.6-35B-A3B");
+        let p = OllamaProvider::default()
+            .with_num_ctx(Some(8_192))
+            .with_budget_window(Some(131_072));
+        assert_eq!(p.context_window("Qwen/Qwen3.6-35B-A3B"), 8_192);
+        let clamped = OllamaProvider::default()
+            .with_num_ctx(Some(9_999_999))
+            .with_budget_window(Some(131_072));
+        assert_eq!(clamped.context_window("Qwen/Qwen3.6-35B-A3B"), trained);
+    }
+
+    #[test]
+    fn context_window_falls_to_default_when_neither_set() {
+        // No num_ctx and an unprimed/empty probe (cold start, before /api/ps lists
+        // the model) falls to the conservative default -- a safe under-fill.
+        let mut p = OllamaProvider::default();
+        Provider::set_context_budget(&mut p, None);
+        assert_eq!(
+            p.context_window("Qwen/Qwen3.6-35B-A3B"),
+            crate::DEFAULT_CONTEXT_WINDOW_TOKENS,
+        );
+    }
+
+    #[test]
+    fn set_context_budget_threads_probed_window_into_budget() {
+        // The Provider-trait setter the host calls before a turn primes the same
+        // budget the builder does, so the wiring in lib.rs reaches context_window.
+        let mut p = OllamaProvider::default();
+        Provider::set_context_budget(&mut p, Some(262_144));
+        assert_eq!(p.context_window("moonshotai/Kimi-K2.7-Code"), 262_144);
+    }
+
+    #[test]
+    fn resolve_served_window_prefers_explicit_clamped_to_trained() {
+        use ff_core::ContextWindowSource;
+        // Explicit env wins and is reported as-is when within the trained ceiling.
+        assert_eq!(
+            resolve_served_window(Some(131_072), Some(8_192), Some(262_144)),
+            (131_072, ContextWindowSource::Explicit),
+        );
+        // Explicit above the trained ceiling clamps (Ollama serves min()).
+        assert_eq!(
+            resolve_served_window(Some(9_999_999), None, Some(262_144)),
+            (262_144, ContextWindowSource::Explicit),
+        );
+    }
+
+    #[test]
+    fn resolve_served_window_uses_ps_value_without_explicit() {
+        use ff_core::ContextWindowSource;
+        assert_eq!(
+            resolve_served_window(None, Some(40_960), Some(262_144)),
+            (40_960, ContextWindowSource::Served),
+        );
+    }
+
+    #[test]
+    fn resolve_served_window_falls_back_to_conservative_default() {
+        use ff_core::ContextWindowSource;
+        assert_eq!(
+            resolve_served_window(None, None, Some(262_144)),
+            (
+                crate::DEFAULT_CONTEXT_WINDOW_TOKENS,
+                ContextWindowSource::Default
+            ),
+        );
+    }
+
+    #[test]
+    fn ps_list_parses_context_length_present_and_absent() {
+        let with: PsList =
+            serde_json::from_str(r#"{"models":[{"name":"qwen3.6:35b","context_length":131072}]}"#)
+                .unwrap();
+        assert_eq!(with.models[0].context_length, Some(131_072));
+
+        // Older Ollama builds omit context_length; the field must stay optional.
+        let without: PsList =
+            serde_json::from_str(r#"{"models":[{"name":"qwen3.6:35b"}]}"#).unwrap();
+        assert_eq!(without.models[0].context_length, None);
     }
 
     #[tokio::test]

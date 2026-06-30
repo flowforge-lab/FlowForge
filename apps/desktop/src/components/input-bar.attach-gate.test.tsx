@@ -21,6 +21,9 @@ function seed(supportsVision: boolean, supportsDocuments = false) {
     model: "m",
     supportsVision,
     supportsDocuments,
+    contextWindow: null,
+    trainedContextWindow: null,
+    contextWindowSource: null,
   };
   vi.spyOn(ipc, "resolveModelSelection").mockResolvedValue(resolved);
   useSessionModelStore.setState({

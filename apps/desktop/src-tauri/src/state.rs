@@ -3,21 +3,21 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ff_agent::{
     flush_due, AbstractiveConfig, CancelToken, CompactionContext, CompactionStrategy,
     ContextPressureEstimator, MemoryFlush, ProxyTokenEstimator, DEFAULT_FLUSH_AT_FRACTION,
 };
 use ff_core::{
-    model_supports_documents, model_supports_vision, BedrockAuth, McpScope, McpServerConfig,
-    McpServerState, McpServerStatus, Mode, ModelSelection, Phenotype, ProviderConfig,
-    ProviderConnection, ProviderKind, ProviderRegistry, ResolvedModel, SearchConfig, SecretKind,
-    SessionWorkspace,
+    model_supports_documents, model_supports_vision, BedrockAuth, ConnectionId, McpScope,
+    McpServerConfig, McpServerState, McpServerStatus, Mode, ModelSelection, Phenotype,
+    ProviderConfig, ProviderConnection, ProviderKind, ProviderRegistry, ResolvedModel,
+    SearchConfig, SecretKind, SessionWorkspace,
 };
 use ff_llm::{
     ollama_num_ctx_from_env, reasoning_control, wire_dialect, BedrockCreds, BedrockProvider,
-    OllamaProvider, OpenAiProvider, Provider,
+    OllamaProvider, OpenAiProvider, Provider, ServedWindowProbe,
 };
 use ff_mcp::{McpConfigWatcher, SupervisorHandle};
 
@@ -819,7 +819,15 @@ pub struct AppState {
     /// one turn can be polled or stopped in a later one. Children are killed when
     /// the last `Arc` drops at app exit.
     process_supervisor: Arc<ProcessSupervisor>,
+    /// Short-TTL cache for the Ollama served-window probe (#602), keyed by the
+    /// resolved `(connection, model)`. The chip resolves on every render, but the
+    /// served window changes only when the model is (re)loaded, so a probe per
+    /// resolve would spam `/api/ps`. Entries expire after [`SERVED_WINDOW_TTL`].
+    served_window_cache: Mutex<HashMap<(ConnectionId, String), (Instant, ServedWindowProbe)>>,
 }
+
+/// How long a probed served window stays fresh before the next resolve re-probes.
+const SERVED_WINDOW_TTL: Duration = Duration::from_secs(10);
 
 impl AppState {
     pub fn new() -> Self {
@@ -874,6 +882,7 @@ impl AppState {
             flush_ledger,
             _memory_watcher: Mutex::new(memory_watcher),
             process_supervisor: Arc::new(ProcessSupervisor::new()),
+            served_window_cache: Mutex::new(HashMap::new()),
         };
         // Restore the persisted phenotype so its active skills survive a restart.
         // With no persisted choice, prefer the out-of-box `codon` default (#298),
@@ -1570,7 +1579,47 @@ impl AppState {
             model,
             supports_vision,
             supports_documents,
+            // Served-window fields populated in the async IPC command via
+            // [`served_window`](Self::served_window); the sync resolver leaves them
+            // None so internal callers (turn building, tests) keep the cheap path.
+            context_window: None,
+            trained_context_window: None,
+            context_window_source: None,
         }
+    }
+
+    /// Probe the served context window for the model `session_id` will run on
+    /// (#602), memoized for [`SERVED_WINDOW_TTL`] per `(connection, model)`. The
+    /// sync `resolve_model_selection` cannot do this -- the probe is HTTP -- so the
+    /// IPC command awaits this and folds the result onto the `ResolvedModel` it
+    /// returns. Ollama only; other kinds (and a dangling connection) yield an empty
+    /// probe so the chip simply hides the readout.
+    pub async fn served_window(&self, session_id: &str) -> ServedWindowProbe {
+        let resolved = self.resolve_model_selection(session_id);
+        let (kind, base_url) = {
+            let reg = self.registry.lock().unwrap();
+            match reg.connections.iter().find(|c| c.id == resolved.connection) {
+                Some(c) => (c.kind, c.resolved_base_url().to_string()),
+                None => return ServedWindowProbe::default(),
+            }
+        };
+        if kind != ProviderKind::Ollama {
+            return ServedWindowProbe::default();
+        }
+        let key = (resolved.connection.clone(), resolved.model.clone());
+        // Fresh cache hit short-circuits the HTTP round-trip.
+        if let Some((at, probe)) = self.served_window_cache.lock().unwrap().get(&key) {
+            if at.elapsed() < SERVED_WINDOW_TTL {
+                return probe.clone();
+            }
+        }
+        let provider = OllamaProvider::new(base_url).with_num_ctx(ollama_num_ctx_from_env());
+        let probe = provider.served_window(&resolved.model).await;
+        self.served_window_cache
+            .lock()
+            .unwrap()
+            .insert(key, (Instant::now(), probe.clone()));
+        probe
     }
 
     /// Resolve this session's MCP server set for a turn using RFC 0018 §3.2 three-tier

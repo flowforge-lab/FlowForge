@@ -108,11 +108,27 @@ describe("ModelChip (#499)", () => {
 describe("ModelChip served-window display (#602)", () => {
   const WARNING = /context window not detected/i;
 
+  // Spy on the resolver so the load() in ModelChip mount forwards the desired
+  // served-window fields, mirroring the production BE half (#602).
+  function mockResolved(extra: {
+    contextWindow: number | null;
+    trainedContextWindow: number | null;
+    contextWindowSource: "explicit" | "served" | "default" | null;
+  }) {
+    vi.spyOn(ipc, "resolveModelSelection").mockImplementation(async () => ({
+      connection: "candle",
+      model: DEFAULT_MODEL,
+      supportsVision: false,
+      supportsDocuments: false,
+      ...extra,
+    }));
+  }
+
   it("shows the served window + source in the dropdown when present", async () => {
-    useSessionModelStore.setState({
-      servedWindowBySession: {
-        s1: { window: 131072, trained: 262144, source: "served" },
-      },
+    mockResolved({
+      contextWindow: 131072,
+      trainedContextWindow: 262144,
+      contextWindowSource: "served",
     });
     render(<ModelChip sessionId="s1" />);
     await screen.findByText(DEFAULT_MODEL);
@@ -126,15 +142,14 @@ describe("ModelChip served-window display (#602)", () => {
   });
 
   it("shows an always-visible warning dot on the trigger for the default fallback", async () => {
-    useSessionModelStore.setState({
-      servedWindowBySession: {
-        s1: { window: 32000, trained: null, source: "default" },
-      },
+    mockResolved({
+      contextWindow: 32000,
+      trainedContextWindow: null,
+      contextWindowSource: "default",
     });
     render(<ModelChip sessionId="s1" />);
     await screen.findByText(DEFAULT_MODEL);
-    // The dot is visible without opening the dropdown.
-    expect(screen.getByLabelText(WARNING)).not.toBeNull();
+    await waitFor(() => expect(screen.getByLabelText(WARNING)).not.toBeNull());
   });
 
   it("renders neither the readout nor the warning dot when no served window is known", async () => {

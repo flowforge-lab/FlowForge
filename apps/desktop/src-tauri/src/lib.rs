@@ -664,7 +664,7 @@ fn spawn_assistant_turn(state: Arc<AppState>, app: tauri::AppHandle, session_id:
     // RESOLVED connection. This routes a phenotype model override through its intended
     // endpoint rather than the global active one (fixes RFC 0005 §11.1).
     let selection = state.resolve_model_selection(&session_id);
-    let (provider, _) =
+    let (mut provider, _) =
         state.build_provider_for(Some(&selection.connection), Some(&selection.model));
     let model = selection.model;
     let persona = pheno.persona.clone();
@@ -738,6 +738,13 @@ fn spawn_assistant_turn(state: Arc<AppState>, app: tauri::AppHandle, session_id:
         let turn_start = std::time::Instant::now();
         let metrics = std::sync::Arc::new(std::sync::Mutex::new(TurnMetrics::default()));
         let metrics_for_events = metrics.clone();
+
+        // Prime the compaction budget against the *served* context window (#612).
+        // For Ollama this is the already-cached `/api/ps` probe (the same value
+        // the model chip displays); other providers no-op. Before the model is
+        // resident `/api/ps` reports nothing, so this falls to the conservative
+        // default -- a safe under-fill -- and picks up the real window once loaded.
+        provider.set_context_budget(state.served_window(&sid).await.window);
 
         let thinking = state.provider_config().thinking;
         let reasoning_visibility = state.provider_config().reasoning_visibility;
@@ -978,7 +985,7 @@ impl ff_scheduled::TaskRunner for DesktopTaskRunner {
 
         let pheno = self.state.session_phenotype(&sid);
         let selection = self.state.resolve_model_selection(&sid);
-        let (provider, _) = self
+        let (mut provider, _) = self
             .state
             .build_provider_for(Some(&selection.connection), Some(&selection.model));
         let model = selection.model;
@@ -1012,6 +1019,11 @@ impl ff_scheduled::TaskRunner for DesktopTaskRunner {
             memory.as_deref(),
             mode,
         );
+
+        // Prime the compaction budget against the served context window (#612),
+        // mirroring the interactive `send_message` path; Ollama uses the cached
+        // `/api/ps` probe, other providers no-op.
+        provider.set_context_budget(self.state.served_window(&sid).await.window);
 
         let cancel = CancelToken::new();
         let thinking = self.state.provider_config().thinking;
@@ -1673,8 +1685,22 @@ fn get_session_model_selection(
 /// renders this on the per-pane model chip so the displayed model matches what the
 /// next turn will actually use.
 #[tauri::command]
-fn resolve_model_selection(state: State<'_, Arc<AppState>>, session_id: String) -> ResolvedModel {
-    state.resolve_model_selection(&session_id)
+async fn resolve_model_selection(
+    state: State<'_, Arc<AppState>>,
+    session_id: String,
+) -> Result<ResolvedModel, String> {
+    let mut resolved = state.resolve_model_selection(&session_id);
+    // Fold the async-only served-window probe onto the sync resolver's output
+    // (#602). Cast u64 -> u32 so the ts-rs binding stays `number` (u64 maps to
+    // `bigint`, which the FE `ServedWindow.window: number` cannot consume); a
+    // window above `u32::MAX` (~4.29B tokens) is absurd, so try_from is just a
+    // safety net rather than a real constraint. The `Result` wrapper is required
+    // for async tauri commands with reference inputs; we never actually err.
+    let probe = state.served_window(&session_id).await;
+    resolved.context_window = probe.window.and_then(|n| u32::try_from(n).ok());
+    resolved.trained_context_window = probe.trained.and_then(|n| u32::try_from(n).ok());
+    resolved.context_window_source = probe.source;
+    Ok(resolved)
 }
 
 /// The global default autonomy mode (#265), inherited by sessions with no explicit

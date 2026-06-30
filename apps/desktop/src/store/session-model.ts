@@ -24,19 +24,18 @@ export interface SessionModelState {
    *  chip hides for these rather than spinning forever or leaking an unhandled
    *  rejection; it reappears once `load` succeeds after the backend lands. */
   unavailableBySession: Record<string, boolean>;
-  /** The served context window + source per session (#602). Absent until the
-   *  backend forwards it. PENDING CONTRACT: today this is only seeded by the mock /
-   *  tests; once Tony lands the `/api/ps` probe and the `ResolvedModel` fields
-   *  (`contextWindow` / `trainedContextWindow` / `contextWindowSource`), populate it
-   *  from `resolved.*` in `load()` below — no new IPC call, it rides on
-   *  `resolveModelSelection`. See lib/served-window.ts. */
+  /** The served context window + source per session (#602). Populated in
+   *  `load()` from the backend-forwarded `ResolvedModel.{contextWindow,
+   *  trainedContextWindow, contextWindowSource}`; `undefined` for non-Ollama
+   *  connections, when the model isn't loaded yet, or when the probe failed. */
   servedWindowBySession: Record<string, ServedWindow | undefined>;
 
-  /** Fetch and cache a session's resolved selection + raw override. Never rejects:
-   *  a backend failure marks the session unavailable instead. */
+  /** Fetch and cache a session's resolved selection + raw override, including
+   *  its served context window (#602). Never rejects: a backend failure marks
+   *  the session unavailable instead. */
   load: (sessionId: string) => Promise<void>;
-  /** Seed/replace the served window for a session (#602). Used by the mock / tests
-   *  now; the real populate happens in `load()` once the contract carries it. */
+  /** Seed/replace the served window for a session. Test utility — production
+   *  populate rides on `load()` from the resolver. */
   setServedWindow: (
     sessionId: string,
     window: ServedWindow | undefined,
@@ -68,10 +67,26 @@ export const useSessionModelStore = create<SessionModelState>((set, get) => ({
         ipc.resolveModelSelection(sessionId),
         ipc.getSessionModelSelection(sessionId),
       ]);
+      // Map the backend-forwarded served-window contract (#602) to the FE store
+      // shape. Leave `undefined` -- never `{window: 0}` -- when the backend
+      // signals "no served window known" via null, so the model-chip simply
+      // hides the readout instead of showing a false amber under-fill dot.
+      const served: ServedWindow | undefined =
+        resolved.contextWindow == null || resolved.contextWindowSource == null
+          ? undefined
+          : {
+              window: resolved.contextWindow,
+              trained: resolved.trainedContextWindow,
+              source: resolved.contextWindowSource,
+            };
       set((s) => ({
         resolvedBySession: { ...s.resolvedBySession, [sessionId]: resolved },
         overrideBySession: { ...s.overrideBySession, [sessionId]: override },
         unavailableBySession: { ...s.unavailableBySession, [sessionId]: false },
+        servedWindowBySession: {
+          ...s.servedWindowBySession,
+          [sessionId]: served,
+        },
       }));
     } catch {
       // The backend half isn't present (the Phase D commands aren't registered, so
