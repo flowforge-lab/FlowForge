@@ -10,6 +10,9 @@ describe("useScheduledStore", () => {
       saving: false,
       error: null,
       runsByTask: {},
+      historyByTask: {},
+      loadingRunsIds: new Set(),
+      pausedAll: false,
       runningId: null,
     });
   });
@@ -148,6 +151,94 @@ describe("useScheduledStore", () => {
     expect(tasks).toHaveLength(1);
     expect(tasks[0].id).toBe("only");
     expect(runsByTask["keep"]).toBe("sess-keep");
+  });
+
+  it("loadRuns caches a task's fire history newest-first", async () => {
+    await useScheduledStore.getState().load();
+    // Seed history by firing the task a couple of times through the mock.
+    await useScheduledStore.getState().runNow("memory-organizer");
+    await useScheduledStore.getState().runNow("memory-organizer");
+
+    await useScheduledStore.getState().loadRuns("memory-organizer");
+    const history =
+      useScheduledStore.getState().historyByTask["memory-organizer"];
+    expect(history?.length).toBeGreaterThanOrEqual(2);
+    // Newest first: firedMs is non-increasing down the list.
+    for (let i = 1; i < history.length; i += 1) {
+      expect(history[i - 1].firedMs).toBeGreaterThanOrEqual(history[i].firedMs);
+    }
+    expect(
+      useScheduledStore.getState().loadingRunsIds.has("memory-organizer"),
+    ).toBe(false);
+  });
+
+  it("loadRuns tracks loading per task so panels are independent", async () => {
+    await useScheduledStore.getState().load();
+    // Two concurrent loads: each task ends up with its own history, and neither
+    // completion leaves the other's loading flag stuck (C1 — no shared slot).
+    await Promise.all([
+      useScheduledStore.getState().loadRuns("memory-organizer"),
+      useScheduledStore.getState().loadRuns("weekly-digest"),
+    ]);
+    const { historyByTask, loadingRunsIds } = useScheduledStore.getState();
+    expect("memory-organizer" in historyByTask).toBe(true);
+    expect("weekly-digest" in historyByTask).toBe(true);
+    expect(loadingRunsIds.size).toBe(0);
+  });
+
+  it("loadRuns skips a second in-flight fetch for the same task", async () => {
+    await useScheduledStore.getState().load();
+    const first = useScheduledStore.getState().loadRuns("memory-organizer");
+    // A second call while the first is in flight is a no-op (guards the same-task
+    // out-of-order overwrite); it resolves immediately without a second fetch.
+    await useScheduledStore.getState().loadRuns("memory-organizer");
+    await first;
+    expect(
+      useScheduledStore.getState().loadingRunsIds.has("memory-organizer"),
+    ).toBe(false);
+  });
+
+  it("applyFired prepends to an already-loaded history panel", async () => {
+    await useScheduledStore.getState().load();
+    useScheduledStore.setState({ historyByTask: { "memory-organizer": [] } });
+    useScheduledStore.getState().applyFired({
+      id: 7,
+      taskId: "memory-organizer",
+      sessionId: "sess-new",
+      firedMs: 99,
+      status: "ok",
+    });
+    const history =
+      useScheduledStore.getState().historyByTask["memory-organizer"];
+    expect(history).toHaveLength(1);
+    expect(history[0].id).toBe(7);
+  });
+
+  it("applyFired does not create a history panel that was never opened", () => {
+    useScheduledStore.getState().applyFired({
+      id: 1,
+      taskId: "never-opened",
+      firedMs: 1,
+      status: "ok",
+    });
+    expect("never-opened" in useScheduledStore.getState().historyByTask).toBe(
+      false,
+    );
+  });
+
+  it("setPausedAll engages the global kill-switch", async () => {
+    await useScheduledStore.getState().setPausedAll(true);
+    expect(useScheduledStore.getState().pausedAll).toBe(true);
+    await useScheduledStore.getState().setPausedAll(false);
+    expect(useScheduledStore.getState().pausedAll).toBe(false);
+  });
+
+  it("runNow surfaces an error and clears running when paused-all is engaged", async () => {
+    await useScheduledStore.getState().load();
+    await useScheduledStore.getState().setPausedAll(true);
+    await useScheduledStore.getState().runNow("memory-organizer");
+    expect(useScheduledStore.getState().error).toBeTruthy();
+    expect(useScheduledStore.getState().runningId).toBeNull();
   });
 
   it("resetScheduled resumes every paused task", async () => {

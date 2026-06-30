@@ -337,8 +337,10 @@ export interface FfIpc {
    *  ↗ open-session jump. Also drives a `scheduled:fired` + `scheduled:changed`.
    *  Rejects when the global pause-all kill-switch is engaged. */
   runScheduledTaskNow(id: string): Promise<RunRecord>;
-  /** A task's fire history, newest first (capped at 50). Backs the run-history
-   *  list and the ↗ open-session affordance (RFC 0017 §6.2, #544). */
+  /** A task's fire history, newest first (capped at 50). Ordering is guaranteed by
+   *  the backend query (`ORDER BY fired_ms DESC, id DESC`), so consumers render as-is
+   *  — no client re-sort. Backs the run-history list and the ↗ open-session
+   *  affordance (RFC 0017 §6.2, #544). */
   listScheduledRuns(id: string): Promise<RunRecord[]>;
   /** Engage/release the global pause-all kill-switch (RFC 0017 §8.3, #544). When
    *  engaged the sweep fires nothing, regardless of per-task pause — including
