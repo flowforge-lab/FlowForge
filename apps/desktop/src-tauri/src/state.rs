@@ -151,12 +151,14 @@ fn build_provider(conn: &ProviderConnection, model: &str) -> Box<dyn Provider> {
         ProviderKind::CandleVllm => Box::new(
             OpenAiProvider::new(base_url, None)
                 .with_vision(vision)
+                .with_documents(documents)
                 .with_dialect(dialect)
                 .with_reasoning_control(reasoning),
         ),
         ProviderKind::Ollama => Box::new(
             OllamaProvider::new(base_url)
                 .with_vision(vision)
+                .with_documents(documents)
                 .with_num_ctx(ollama_num_ctx_from_env()),
         ),
         // Bedrock resolves credentials by auth mode, pulling secret material from the
@@ -207,6 +209,7 @@ fn build_provider(conn: &ProviderConnection, model: &str) -> Box<dyn Provider> {
             Box::new(
                 OpenAiProvider::new(base_url, key)
                     .with_vision(vision)
+                    .with_documents(documents)
                     .with_dialect(dialect)
                     .with_reasoning_control(reasoning),
             )
@@ -218,6 +221,7 @@ fn build_provider(conn: &ProviderConnection, model: &str) -> Box<dyn Provider> {
             Box::new(
                 OpenAiProvider::new(base_url, key)
                     .with_vision(vision)
+                    .with_documents(documents)
                     .with_dialect(dialect)
                     .with_reasoning_control(reasoning),
             )
@@ -3018,7 +3022,13 @@ mod tests {
         let sel = state.resolve_model_selection(&s.id);
         assert_eq!(sel.connection, "ollama");
         assert!(sel.supports_vision, "vision tag => derived supports_vision");
-        assert!(!sel.supports_documents, "ollama wire has no document block");
+        // As of the #338 follow-up, every provider kind supports documents
+        // (OpenAI/Ollama via the text-extraction fallback), so an ollama
+        // session can still stage a document for extraction.
+        assert!(
+            sel.supports_documents,
+            "ollama supports documents via extraction"
+        );
     }
 
     #[test]

@@ -5,7 +5,7 @@
 
 use std::path::PathBuf;
 
-use ff_core::{ProviderConfig, ProviderKind};
+use ff_core::{model_supports_documents, ProviderConfig, ProviderKind};
 use ff_llm::{
     ollama_num_ctx_from_env, reasoning_control, wire_dialect, BedrockCreds, BedrockProvider,
     OllamaProvider, OpenAiProvider, Provider,
@@ -41,19 +41,30 @@ fn build_provider(config: &ProviderConfig) -> Box<dyn Provider> {
     // A no-op except on the SiliconFlow gateway; the effort dial comes from
     // `provider.json` (`reasoning_effort`), defaulting to Medium for legacy files.
     let reasoning = reasoning_control(config.kind, &config.model, config.reasoning_effort);
+    // Attachment capability derived from the resolved `(kind, model)` (RFC 0005
+    // §11.3), mirroring the desktop's `build_provider`. Documents are universal
+    // as of the #338 follow-up (extraction fallback for OpenAI/Ollama, native
+    // `DocumentBlock` for Bedrock); vision stays fail-closed in the CLI as
+    // before (the CLI has no image-attachment flow).
+    let documents = model_supports_documents(config.kind, &config.model);
     match config.kind {
-        ProviderKind::CandleVllm => {
-            Box::new(OpenAiProvider::new(base_url, None).with_dialect(dialect))
-        }
-        ProviderKind::Ollama => {
-            Box::new(OllamaProvider::new(base_url).with_num_ctx(ollama_num_ctx_from_env()))
-        }
-        ProviderKind::Bedrock => Box::new(build_bedrock_provider(config)),
+        ProviderKind::CandleVllm => Box::new(
+            OpenAiProvider::new(base_url, None)
+                .with_documents(documents)
+                .with_dialect(dialect),
+        ),
+        ProviderKind::Ollama => Box::new(
+            OllamaProvider::new(base_url)
+                .with_documents(documents)
+                .with_num_ctx(ollama_num_ctx_from_env()),
+        ),
+        ProviderKind::Bedrock => Box::new(build_bedrock_provider(config, documents)),
         // The CLI has no keychain, so a hosted OpenAI key comes from the
         // OPENAI_API_KEY env var (absent or empty => keyless, for OpenAI-compatible
         // local gateways that need none).
         ProviderKind::OpenAi => Box::new(
             OpenAiProvider::new(base_url, api_key_from_env("OPENAI_API_KEY"))
+                .with_documents(documents)
                 .with_dialect(dialect)
                 .with_reasoning_control(reasoning),
         ),
@@ -66,6 +77,7 @@ fn build_provider(config: &ProviderConfig) -> Box<dyn Provider> {
                 .filter(|k| !k.is_empty());
             Box::new(
                 OpenAiProvider::new(base_url, key)
+                    .with_documents(documents)
                     .with_dialect(dialect)
                     .with_reasoning_control(reasoning),
             )
@@ -77,7 +89,7 @@ fn build_provider(config: &ProviderConfig) -> Box<dyn Provider> {
 /// Extracted so the reasoning-effort dial (#394) is assertable without a live Bedrock
 /// call — without `with_reasoning_effort`, per-step thinking is invisible through
 /// `flowforge run` (same bug surface as desktop #426 acceptance).
-fn build_bedrock_provider(config: &ProviderConfig) -> BedrockProvider {
+fn build_bedrock_provider(config: &ProviderConfig, documents: bool) -> BedrockProvider {
     // The CLI has no keychain or connection registry, so Bedrock here uses the
     // standard AWS credential chain: a bearer token from AWS_BEARER_TOKEN_BEDROCK
     // when set, otherwise a named profile (AWS_PROFILE, default "default").
@@ -90,7 +102,9 @@ fn build_bedrock_provider(config: &ProviderConfig) -> BedrockProvider {
             name: std::env::var("AWS_PROFILE").unwrap_or_else(|_| "default".to_string()),
         },
     };
-    BedrockProvider::new(region, creds).with_reasoning_effort(config.reasoning_effort)
+    BedrockProvider::new(region, creds)
+        .with_documents(documents)
+        .with_reasoning_effort(config.reasoning_effort)
 }
 
 /// A bearer key from `var`, or `None` when the variable is unset *or* empty.
@@ -232,7 +246,7 @@ mod tests {
     // through `flowforge run`. ----
 
     use ff_core::{ProviderConfig, ProviderKind, ReasoningEffort};
-    use ff_llm::{ChatMessage, ChatRequest};
+    use ff_llm::{ChatMessage, ChatRequest, Provider};
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -305,8 +319,12 @@ mod tests {
             reasoning_effort: ReasoningEffort::High,
             ..Default::default()
         };
-        let provider = super::build_bedrock_provider(&config);
+        let provider = super::build_bedrock_provider(&config, true);
         assert_eq!(provider.reasoning_effort(), ReasoningEffort::High);
+        assert!(
+            provider.supports_documents(),
+            "documents flag forwarded to the Bedrock provider"
+        );
     }
 
     #[test]
@@ -317,7 +335,7 @@ mod tests {
             model: "anthropic.claude-3-5-sonnet-20241022-v2:0".into(),
             ..Default::default()
         };
-        let provider = super::build_bedrock_provider(&config);
+        let provider = super::build_bedrock_provider(&config, true);
         assert_eq!(provider.reasoning_effort(), ReasoningEffort::Medium);
     }
 }

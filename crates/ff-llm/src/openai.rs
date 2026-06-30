@@ -21,6 +21,14 @@ pub struct OpenAiProvider {
     /// field never reaches the wire (this provider serializes `ChatMessage`
     /// directly). Defaults false; set via [`OpenAiProvider::with_vision`].
     supports_vision: bool,
+    /// Whether the connection's model accepts *document* attachments via the
+    /// text-extraction fallback (#338 follow-up). The OpenAI chat-completions
+    /// wire has no portable document block, so when this is true the adapter
+    /// extracts each document's text client-side and folds it into the user
+    /// message's `content` before serialization. Defaults false — the #338
+    /// skip stays the no-extraction default; the host opts in via
+    /// [`OpenAiProvider::with_documents`] from the resolved model capability.
+    supports_documents: bool,
     /// Per-gateway wire-shape choices (#375). Defaults are no-ops for vanilla
     /// OpenAI / candle-vllm / Ollama-compat / LM Studio; SiliconFlow and
     /// OpenRouter override to re-inject prior reasoning on tool-call turns and
@@ -40,14 +48,25 @@ impl OpenAiProvider {
             api_key,
             client: crate::build_streaming_http_client(),
             supports_vision: false,
+            supports_documents: false,
             dialect: WireDialect::default(),
             reasoning: ReasoningControl::default(),
         }
     }
 
-    /// Declare whether the target model can accept image/document attachments.
+    /// Declare whether the target model can accept image attachments.
     pub fn with_vision(mut self, supports_vision: bool) -> Self {
         self.supports_vision = supports_vision;
+        self
+    }
+
+    /// Declare whether the target model can accept *document* attachments via
+    /// the text-extraction fallback (#338 follow-up). When true, document
+    /// attachments are extracted to text and folded into the user message's
+    /// prompt context; when false (the default), they are stripped at the
+    /// capability strip (the #338 skip). Mirrors [`BedrockProvider::with_documents`].
+    pub fn with_documents(mut self, supports_documents: bool) -> Self {
+        self.supports_documents = supports_documents;
         self
     }
 
@@ -311,8 +330,26 @@ impl Provider for OpenAiProvider {
         self.supports_vision
     }
 
+    fn supports_documents(&self) -> bool {
+        self.supports_documents
+    }
+
     async fn chat_stream(&self, req: ChatRequest) -> Result<ChunkStream, LlmError> {
-        let messages = crate::messages_for_wire(&req.messages, self.supports_vision, false);
+        // The capability strip: drops images when `supports_vision` is false and
+        // documents when `supports_documents` is false. When documents are
+        // supported, they survive the strip and are then folded into the user
+        // message's `content` as extracted text (#338 follow-up) — the OpenAI
+        // wire has no portable document block, so this fold IS the wire path.
+        let stripped =
+            crate::messages_for_wire(&req.messages, self.supports_vision, self.supports_documents);
+        // `messages_for_wire` borrows when no strip is needed; the fold clones
+        // only when a message actually carries documents, so a text-only turn is
+        // still zero-allocation on the borrow path.
+        let messages: Vec<ChatMessage> = if self.supports_documents {
+            crate::extract::fold_documents_into_text(&stripped)
+        } else {
+            stripped.into_owned()
+        };
         let dialect = self.dialect;
         let wire_messages: Vec<serde_json::Value> = messages
             .iter()
@@ -671,6 +708,88 @@ mod tests {
         let v = message_to_wire(&msg, WireDialect::default());
         assert!(v["content"].is_string(), "no image block -> plain string");
         assert!(v.get("attachments").is_none());
+    }
+
+    // ---- #338 follow-up: text-extraction fallback for the OpenAI wire ----
+
+    /// A text document attachment whose extracted text reaches the wire as part
+    /// of the user message's `content` when `with_documents(true)` is set. The
+    /// doc attachment itself is dropped (no `attachments` key leaks); the model
+    /// sees the user's text plus the extracted document text in one string.
+    #[tokio::test]
+    async fn document_text_is_folded_into_content_when_documents_enabled() {
+        let server = MockServer::start().await;
+        let provider = OpenAiProvider::new(server.uri(), None).with_documents(true);
+        let doc = Attachment {
+            kind: AttachmentKind::Document,
+            media_type: "text/plain".into(),
+            source: AttachmentSource::Inline(inline_b64(b" quarterly results ")),
+            name: Some("report.txt".into()),
+            bytes: 18,
+        };
+        let req = ChatRequest {
+            model: "gpt-4o".into(),
+            messages: vec![ChatMessage::multimodal("user", "summarize this", vec![doc])],
+            tools: Vec::new(),
+            thinking: false,
+            max_tokens: None,
+        };
+        let body = captured_body(&provider, &server, req).await;
+        let content = body["messages"][0]["content"]
+            .as_str()
+            .expect("string content");
+        assert!(
+            content.contains("summarize this"),
+            "user text preserved: {content}"
+        );
+        assert!(
+            content.contains("quarterly results"),
+            "extracted text folded in: {content}"
+        );
+        assert!(
+            content.contains("report.txt"),
+            "document named in envelope: {content}"
+        );
+        assert!(
+            body["messages"][0].get("attachments").is_none(),
+            "doc attachment must not leak onto the wire"
+        );
+    }
+
+    /// With `with_documents` left at its default (false), the capability strip
+    /// drops the document before it reaches `message_to_wire` — the #338 skip
+    /// stays the no-extraction default. The wire content is just the user's text.
+    #[tokio::test]
+    async fn document_is_stripped_when_documents_not_enabled() {
+        let server = MockServer::start().await;
+        // Default provider: no with_documents(true).
+        let provider = OpenAiProvider::new(server.uri(), None);
+        let doc = Attachment {
+            kind: AttachmentKind::Document,
+            media_type: "text/plain".into(),
+            source: AttachmentSource::Inline(inline_b64(b"secret payload")),
+            name: Some("report.txt".into()),
+            bytes: 14,
+        };
+        let req = ChatRequest {
+            model: "gpt-4o".into(),
+            messages: vec![ChatMessage::multimodal("user", "summarize this", vec![doc])],
+            tools: Vec::new(),
+            thinking: false,
+            max_tokens: None,
+        };
+        let body = captured_body(&provider, &server, req).await;
+        let content = body["messages"][0]["content"]
+            .as_str()
+            .expect("string content");
+        assert_eq!(
+            content, "summarize this",
+            "doc stripped, only user text remains"
+        );
+        assert!(
+            !content.contains("secret payload"),
+            "doc text must not leak"
+        );
     }
 
     #[test]

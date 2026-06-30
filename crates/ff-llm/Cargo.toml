@@ -18,6 +18,15 @@ base64 = { workspace = true }
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream"] }
 httpdate = "1"
 
+# Document text-extraction fallback (#338 follow-up): HTML→markdown via the same
+# `fast_html2md` rewriter `ff-tools` uses; `zip` + `quick-xml` crack the OOXML
+# containers (DOCX/XLSX) and pull their text. `zip` is pinned to deflate-only
+# (DOCX/XLSX use deflate) so we don't pull in bzip2/lzma/ppmd/zstd/xz for a
+# format we never read. `quick-xml` has no default features to disable.
+fast_html2md = { workspace = true }
+zip = { version = "4", default-features = false, features = ["deflate"] }
+quick-xml = { version = "0.39", default-features = false }
+
 # Bedrock provider (#202). default-features=false + an explicit rustls-ring HTTP
 # client keeps us off aws-lc-rs, which needs cmake/nasm on CI runners.
 aws-config = { version = "1", default-features = false, features = [

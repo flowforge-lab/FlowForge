@@ -26,6 +26,13 @@ pub struct OllamaProvider {
     /// field never reaches the wire. Defaults false; set via
     /// [`OllamaProvider::with_vision`].
     supports_vision: bool,
+    /// Whether the connection's model accepts *document* attachments via the
+    /// text-extraction fallback (#338 follow-up). Ollama's native `/api/chat`
+    /// has no document block, so when this is true the adapter extracts each
+    /// document's text and folds it into the user message's `content` before
+    /// serialization. Defaults false (the #338 skip); the host opts in via
+    /// [`OllamaProvider::with_documents`] from the resolved model capability.
+    supports_documents: bool,
     /// The context window to request from Ollama, in tokens (#538). When `Some`,
     /// it is sent as `options.num_ctx` on every `/api/chat` request -- so the
     /// runtime serves exactly this window regardless of the server's
@@ -50,14 +57,25 @@ impl OllamaProvider {
             base_url: base_url.into(),
             client: crate::build_streaming_http_client(),
             supports_vision: false,
+            supports_documents: false,
             num_ctx: None,
             budget_window: None,
         }
     }
 
-    /// Declare whether the target model can accept image/document attachments.
+    /// Declare whether the target model can accept image attachments.
     pub fn with_vision(mut self, supports_vision: bool) -> Self {
         self.supports_vision = supports_vision;
+        self
+    }
+
+    /// Declare whether the target model can accept *document* attachments via
+    /// the text-extraction fallback (#338 follow-up). When true, documents are
+    /// extracted to text and folded into the user message's prompt context;
+    /// when false (the default), they are stripped at the capability strip
+    /// (the #338 skip). Mirrors [`crate::BedrockProvider::with_documents`].
+    pub fn with_documents(mut self, supports_documents: bool) -> Self {
+        self.supports_documents = supports_documents;
         self
     }
 
@@ -401,8 +419,22 @@ impl Provider for OllamaProvider {
         self.supports_vision
     }
 
+    fn supports_documents(&self) -> bool {
+        self.supports_documents
+    }
+
     async fn chat_stream(&self, req: ChatRequest) -> Result<ChunkStream, LlmError> {
-        let messages = crate::messages_for_wire(&req.messages, self.supports_vision, false);
+        // Strip images without vision and documents without document support;
+        // surviving documents are folded into the user message's `content` as
+        // extracted text (#338 follow-up), since Ollama's wire has no document
+        // block. The fold clones only when a message carries documents.
+        let stripped =
+            crate::messages_for_wire(&req.messages, self.supports_vision, self.supports_documents);
+        let messages: Vec<ChatMessage> = if self.supports_documents {
+            crate::extract::fold_documents_into_text(&stripped)
+        } else {
+            stripped.into_owned()
+        };
         let mut body = serde_json::json!({
             "model": req.model,
             "messages": ollama_messages(&messages)?,
@@ -1001,6 +1033,64 @@ mod tests {
         assert!(
             body.get("options").is_none(),
             "no num_ctx => no options key"
+        );
+    }
+
+    // ---- #338 follow-up: text-extraction fallback on the Ollama wire ----
+
+    #[tokio::test]
+    async fn document_text_is_folded_into_content_when_documents_enabled() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string("{\"message\":{\"content\":\"\"},\"done\":true}\n"),
+            )
+            .mount(&server)
+            .await;
+
+        let doc = Attachment {
+            kind: AttachmentKind::Document,
+            media_type: "text/plain".into(),
+            source: AttachmentSource::Inline(inline_b64(b"the plan")),
+            name: Some("plan.txt".into()),
+            bytes: 8,
+        };
+        let req = ChatRequest {
+            model: "qwen3.6:35b-a3b".into(),
+            messages: vec![ChatMessage::multimodal("user", "read this", vec![doc])],
+            tools: Vec::new(),
+            thinking: false,
+            max_tokens: None,
+        };
+        let provider = OllamaProvider::new(server.uri()).with_documents(true);
+        let mut stream = provider.chat_stream(req).await.unwrap();
+        while stream.next().await.is_some() {}
+
+        let reqs = server.received_requests().await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&reqs[0].body).unwrap();
+        let content = body["messages"][0]["content"]
+            .as_str()
+            .expect("string content");
+        assert!(
+            content.contains("read this"),
+            "user text preserved: {content}"
+        );
+        assert!(
+            content.contains("the plan"),
+            "extracted text folded in: {content}"
+        );
+        assert!(
+            body["messages"][0].get("attachments").is_none(),
+            "doc attachment must not leak onto the Ollama wire"
+        );
+        assert!(
+            body["messages"][0].get("images").is_none(),
+            "no images for a doc-only message"
         );
     }
 }

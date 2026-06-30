@@ -1711,11 +1711,15 @@ Shipping the Settings redesign — currently the Memory browser (SET.8).
   }
 
   // Mirror of the backend capability derivation (RFC 0005 §11.3): attachment caps
-  // come from the resolved `(kind, model)`, never a stored connection flag. Documents
-  // are Bedrock-only (matching `model_supports_documents`); vision is a deliberately
-  // small, mock-faithful subset of the data-driven model-specs (#466) — enough to
-  // exercise the composer gate offline (gpt-4o and any `*-vision` model un-gate
-  // images). Fail-closed when the kind is unknown.
+  // come from the resolved `(kind, model)`, never a stored connection flag. As of
+  // the #338 follow-up, documents are universal — Bedrock carries a native
+  // `DocumentBlock`, OpenAI/Ollama extract document text client-side into the
+  // prompt — so `supportsDocuments` is true for every known kind. Vision is a
+  // deliberately small, mock-faithful subset of the data-driven model-specs
+  // (#466) — enough to exercise the composer gate offline (gpt-4o and any
+  // `*-vision` model un-gate images), and fail-closed for an unknown kind. The
+  // `!kind` early return below is a connection-missing guard (no connection ->
+  // no caps at all), distinct from the per-kind vision fail-closed.
   private modelCaps(
     kind: ProviderKind | undefined,
     model: string,
@@ -1724,7 +1728,7 @@ Shipping the Settings redesign — currently the Memory browser (SET.8).
     const m = model.toLowerCase();
     const supportsVision =
       m.includes("vision") || (kind === "openai" && m.startsWith("gpt-4o"));
-    return { supportsVision, supportsDocuments: kind === "bedrock" };
+    return { supportsVision, supportsDocuments: true };
   }
 
   // Authoritative resolver mirror (§11.2), most-specific wins: session override →

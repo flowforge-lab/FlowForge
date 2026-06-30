@@ -389,13 +389,15 @@ pub fn model_supports_vision(kind: ProviderKind, model: &str) -> bool {
 }
 
 /// Whether `(kind, model)` can accept *document* attachments (PDF/DOCX/CSV/…,
-/// #504). Provider-scoped: only Bedrock's Converse API carries a portable
-/// `DocumentBlock`; the OpenAI-compatible and Ollama wire formats have no
-/// document block (#338), so they fail closed here. The `model` argument is
+/// #504). Universal across providers as of the #338 follow-up: Bedrock's
+/// Converse API carries a native `DocumentBlock`, while the OpenAI-compatible
+/// and Ollama wire formats gain document support via a client-side
+/// text-extraction fallback (the adapter extracts the document's text and
+/// folds it into the user message's prompt context). The `model` argument is
 /// reserved for a future data-driven split (mirrors the #466 vision migration)
-/// once a non-Bedrock provider gains native document support.
-pub fn model_supports_documents(kind: ProviderKind, _model: &str) -> bool {
-    matches!(kind, ProviderKind::Bedrock)
+/// should a non-Bedrock provider narrow document support per model.
+pub fn model_supports_documents(_kind: ProviderKind, _model: &str) -> bool {
+    true
 }
 
 /// The full set of configured connections plus a pointer to the active one.
@@ -992,30 +994,30 @@ mod tests {
     }
 
     #[test]
-    fn model_supports_documents_is_bedrock_only() {
-        // Bedrock's Converse API carries a portable DocumentBlock regardless of
-        // the model's vision capability (a text-only Claude still reads PDFs).
-        for m in [
-            "us.anthropic.claude-opus-4-8",
-            "meta.llama3-70b-instruct-v1:0",
-            "anything",
+    fn model_supports_documents_is_universal() {
+        // As of the #338 follow-up, every provider kind supports document
+        // attachments: Bedrock via native `DocumentBlock`, OpenAI-compatible /
+        // Ollama via the client-side text-extraction fallback. The UI's document
+        // attachment gate (`ResolvedModel.supports_documents`) follows this, so a
+        // non-Bedrock session can still stage a document for extraction.
+        for k in [
+            ProviderKind::Bedrock,
+            ProviderKind::OpenAi,
+            ProviderKind::SiliconFlow,
+            ProviderKind::Ollama,
+            ProviderKind::CandleVllm,
         ] {
-            assert!(
-                model_supports_documents(ProviderKind::Bedrock, m),
-                "Bedrock documents: {m}"
-            );
-        }
-        // No portable document block on the OpenAI-compatible or Ollama wire (#338).
-        for (k, m) in [
-            (ProviderKind::OpenAi, "gpt-4o"),
-            (ProviderKind::SiliconFlow, "Qwen/Qwen2-VL-7B-Instruct"),
-            (ProviderKind::Ollama, "llava:7b"),
-            (ProviderKind::CandleVllm, "anything"),
-        ] {
-            assert!(
-                !model_supports_documents(k, m),
-                "expected no documents: {k:?} {m}"
-            );
+            for m in [
+                "anything",
+                "us.anthropic.claude-opus-4-8",
+                "gpt-4o",
+                "llama3.2",
+            ] {
+                assert!(
+                    model_supports_documents(k, m),
+                    "{k:?} + {m} should support documents"
+                );
+            }
         }
     }
 

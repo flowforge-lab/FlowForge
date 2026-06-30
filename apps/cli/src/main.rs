@@ -631,8 +631,12 @@ fn render_event_text(event: AgentEvent) {
             );
         }
         AgentEvent::AttachmentsDropped { count, .. } => {
+            // Documents are universally supported as of the #338 follow-up
+            // (Bedrock `DocumentBlock`; OpenAI/Ollama extraction fallback), so
+            // the only kind that can be dropped in the host path is images —
+            // name it specifically rather than the opaque "that attachment kind".
             eprintln!(
-                "\n[attachments] {count} attachment{} not sent -- this model cannot see images.",
+                "\n[attachments] {count} image{} not sent -- this model cannot see images.",
                 if count == 1 { "" } else { "s" }
             );
         }

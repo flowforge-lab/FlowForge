@@ -6,6 +6,7 @@
 
 mod anthropic;
 mod bedrock;
+mod extract;
 mod model_specs;
 mod ollama;
 mod openai;
@@ -612,13 +613,24 @@ pub trait Provider: Send + Sync {
     /// probed window into its budget when no explicit `num_ctx` was requested.
     fn set_context_budget(&mut self, _window: Option<u64>) {}
 
-    /// Whether the active model accepts image/document attachments. Hosts read
-    /// this to warn the user when a turn's attachments will be stripped before
-    /// they reach the model (#338) -- the capability strip itself is silent, so
-    /// this is what turns a silent drop into a visible notice. Defaults true; the
-    /// concrete providers override to report their connection's configured flag.
+    /// Whether the active model accepts image attachments. Hosts read this to
+    /// warn the user when a turn's image attachments will be stripped before they
+    /// reach the model (#338) -- the capability strip itself is silent, so this is
+    /// what turns a silent drop into a visible notice. Defaults true; the concrete
+    /// providers override to report their connection's configured flag.
     fn supports_vision(&self) -> bool {
         true
+    }
+
+    /// Whether the active model accepts *document* attachments. Independent of
+    /// [`supports_vision`](Self::supports_vision): a text-only model may still
+    /// read documents (Bedrock via native `DocumentBlock`, OpenAI/Ollama via the
+    /// text-extraction fallback #338 follow-up). Hosts read this alongside
+    /// `supports_vision` to scope the `AttachmentsDropped` notice to only the
+    /// attachments truly dropped. Defaults false (fail-closed); the concrete
+    /// providers override to report their connection's configured flag.
+    fn supports_documents(&self) -> bool {
+        false
     }
 
     /// Best-effort list of model ids the server currently has loaded. Used by the
