@@ -21,7 +21,8 @@ set -euo pipefail
 
 PORT="${1:-8787}"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-BUNDLE_DIR="$REPO_ROOT/apps/desktop/src-tauri/target/release/bundle/macos"
+# Workspace builds share a single target/ at the repo root (not src-tauri/target).
+BUNDLE_DIR="$REPO_ROOT/target/release/bundle/macos"
 LOCAL_CONF="src-tauri/tauri.local.conf.json"
 BUNDLE_CONF="src-tauri/tauri.bundle.conf.json"
 
