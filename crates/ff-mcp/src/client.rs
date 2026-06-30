@@ -411,34 +411,30 @@ mod tests {
             .unwrap()
     }
 
+    // PATHEXT casing here matches the synthetic file casing so the test is
+    // deterministic on a case-sensitive FS (Linux CI) as well as a case-insensitive
+    // one (macOS/Windows). On real Windows the OS resolves `is_file()`
+    // case-insensitively, which is exactly what makes a lowercase `npx.cmd` match an
+    // uppercase `.CMD` PATHEXT entry -- an OS concern, not this function's job.
     #[test]
     fn resolve_via_pathext_finds_a_cmd_shim() {
         let dir = tempfile::tempdir().unwrap();
         let shim = dir.path().join("npx.cmd");
         std::fs::write(&shim, b"").unwrap();
         let path = join(&["/no/such/dir".as_ref(), dir.path()]);
-        // Canonicalize both sides: a case-insensitive dev FS (macOS APFS) matches the
-        // uppercase PATHEXT against the lowercase file but keeps the `.CMD` casing in
-        // the returned path -- the same file, so compare by canonical form.
-        assert_eq!(
-            resolve_via_pathext("npx", &path, ".EXE;.CMD").map(|p| p.canonicalize().unwrap()),
-            Some(shim.canonicalize().unwrap()),
-        );
+        assert_eq!(resolve_via_pathext("npx", &path, ".exe;.cmd"), Some(shim),);
     }
 
     #[test]
     fn resolve_via_pathext_respects_pathext_then_path_order() {
-        // .EXE precedes .CMD in PATHEXT, and the first PATH dir wins. A dir holding
+        // .exe precedes .cmd in PATHEXT, and the first PATH dir wins. A dir holding
         // both npx.cmd and npx.exe must yield the .exe (earlier PATHEXT entry).
         let dir = tempfile::tempdir().unwrap();
         let exe = dir.path().join("npx.exe");
         std::fs::write(&exe, b"").unwrap();
         std::fs::write(dir.path().join("npx.cmd"), b"").unwrap();
         let path = join(&[dir.path()]);
-        assert_eq!(
-            resolve_via_pathext("npx", &path, ".EXE;.CMD").map(|p| p.canonicalize().unwrap()),
-            Some(exe.canonicalize().unwrap()),
-        );
+        assert_eq!(resolve_via_pathext("npx", &path, ".exe;.cmd"), Some(exe),);
     }
 
     #[test]
