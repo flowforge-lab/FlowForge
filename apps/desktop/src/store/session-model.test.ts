@@ -13,6 +13,10 @@ const GLOBAL_DEFAULT = {
   model: "Qwen3-4B-Instruct-2507",
   supportsVision: false,
   supportsDocuments: false,
+  // Mock has no live Ollama; the served-window contract (#602) carries nulls.
+  contextWindow: null,
+  trainedContextWindow: null,
+  contextWindowSource: null,
 };
 
 beforeEach(() => {
@@ -20,6 +24,7 @@ beforeEach(() => {
     resolvedBySession: {},
     overrideBySession: {},
     unavailableBySession: {},
+    servedWindowBySession: {},
   });
 });
 
@@ -50,6 +55,9 @@ describe("session-model store (#499)", () => {
       ...sel,
       supportsVision: false,
       supportsDocuments: false,
+      contextWindow: null,
+      trainedContextWindow: null,
+      contextWindowSource: null,
     });
   });
 
@@ -115,6 +123,44 @@ describe("session-model store (#499)", () => {
       model: "gpt-4o",
       supportsVision: true,
       supportsDocuments: false,
+      contextWindow: null,
+      trainedContextWindow: null,
+      contextWindowSource: null,
     });
+  });
+
+  it("populates servedWindowBySession from the resolver fields (#602)", async () => {
+    vi.spyOn(ipc, "resolveModelSelection").mockResolvedValue({
+      connection: "ollama",
+      model: "qwen3.6",
+      supportsVision: false,
+      supportsDocuments: false,
+      contextWindow: 131072,
+      trainedContextWindow: 262144,
+      contextWindowSource: "served",
+    });
+    await useSessionModelStore.getState().load("s-load");
+    expect(
+      useSessionModelStore.getState().servedWindowBySession["s-load"],
+    ).toEqual({ window: 131072, trained: 262144, source: "served" });
+  });
+
+  it("leaves servedWindowBySession undefined when the backend reports no served window (#602)", async () => {
+    // The null-coerce trap (the mapping must NOT yield `{window: 0, source:
+    // "default"}` for null backend fields, which would render "serving 0k" + a
+    // false amber under-fill dot in the chip).
+    vi.spyOn(ipc, "resolveModelSelection").mockResolvedValue({
+      connection: "candle-vllm",
+      model: "Qwen3-4B-Instruct-2507",
+      supportsVision: false,
+      supportsDocuments: false,
+      contextWindow: null,
+      trainedContextWindow: null,
+      contextWindowSource: null,
+    });
+    await useSessionModelStore.getState().load("s-load");
+    expect(
+      useSessionModelStore.getState().servedWindowBySession["s-load"],
+    ).toBeUndefined();
   });
 });

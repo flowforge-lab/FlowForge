@@ -1,16 +1,14 @@
-// Served context window (#602, Option B follow-up to #538). FE-local shape and
-// formatting for the window Ollama is actually serving for a model, plus the
-// source that produced it.
-//
-// PROPOSED CONTRACT — pending backend (Tony): these values will ride on
-// `ResolvedModel` once the `/api/ps` probe lands and ts-rs regenerates the binding
-// (proposed fields: `contextWindow`, `trainedContextWindow`, `contextWindowSource`).
-// Until then this is an FE-local type, seeded in the mock / tests and (once the
-// fields exist) populated in the session-model store's `load()` from `resolved.*`.
-// No `ipc.ts` / `bindings/` edits here — that regen is the backend owner's.
+// Served context window (#602, Option B follow-up to #538). FE-local readout
+// shape over the backend-forwarded `ResolvedModel.{contextWindow,
+// trainedContextWindow, contextWindowSource}`. Single-sources `ServedWindowSource`
+// as the generated `ContextWindowSource` binding so the FE union can never drift
+// from the Rust enum.
 
-/** How the effective served window was determined, in precedence order. */
-export type ServedWindowSource = "explicit" | "served" | "default";
+import type { ContextWindowSource } from "@/bindings/ContextWindowSource";
+
+/** How the effective served window was determined, in precedence order. Aliases
+ *  the generated `ContextWindowSource` binding to keep one source of truth. */
+export type ServedWindowSource = ContextWindowSource;
 
 export interface ServedWindow {
   /** Effective served window, in tokens (the denominator the budget is sized from). */

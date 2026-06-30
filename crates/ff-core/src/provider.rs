@@ -439,6 +439,33 @@ pub struct ResolvedModel {
     pub model: String,
     pub supports_vision: bool,
     pub supports_documents: bool,
+    /// Effective served context window in tokens (#602): the window the runtime
+    /// will actually serve, not the model's trained maximum. `None` for non-Ollama
+    /// connections and when no probe ran. This is the denominator the compaction
+    /// budget is sized from; #598 must forward this same number. Stored as `u32`
+    /// (windows are tiny relative to the range) so the binding is `number`, not the
+    /// `bigint` ts-rs emits for `u64`, matching the FE `ServedWindow.window`.
+    pub context_window: Option<u32>,
+    /// Trained context ceiling (`/api/show` `context_length`), or `None` when
+    /// unknown. The "trained X" half of the chip readout.
+    pub trained_context_window: Option<u32>,
+    /// Which input produced [`context_window`](Self::context_window) (#602), or
+    /// `None` when no served window is known.
+    pub context_window_source: Option<ContextWindowSource>,
+}
+
+/// How the effective served context window was determined, in precedence order
+/// (#602). `Explicit` = the `FLOWFORGE_OLLAMA_NUM_CTX` override; `Served` = probed
+/// from the live Ollama runtime via `/api/ps`; `Default` = the conservative
+/// [`crate::DEFAULT_CONTEXT_WINDOW_TOKENS`] fallback (model not loaded or the probe
+/// failed). Serializes to the matching camelCase string the FE union expects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "../../../apps/desktop/src/bindings/")]
+pub enum ContextWindowSource {
+    Explicit,
+    Served,
+    Default,
 }
 
 impl ProviderRegistry {

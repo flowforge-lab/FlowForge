@@ -26,9 +26,9 @@ pub use model_specs::{
     DEFAULT_CONTEXT_WINDOW_TOKENS,
 };
 pub use provider::{
-    model_supports_documents, model_supports_vision, BedrockAuth, ConnectionId, ModelSelection,
-    ProviderConfig, ProviderConnection, ProviderKind, ProviderRegistry, ReasoningEffort,
-    ReasoningVisibility, ResolvedModel, SecretKind,
+    model_supports_documents, model_supports_vision, BedrockAuth, ConnectionId,
+    ContextWindowSource, ModelSelection, ProviderConfig, ProviderConnection, ProviderKind,
+    ProviderRegistry, ReasoningEffort, ReasoningVisibility, ResolvedModel, SecretKind,
 };
 pub use scheduled::{
     BuiltinAction, CreateScheduledTaskInput, RunRecord, RunStatus, SafetyCeiling, ScheduledTask,

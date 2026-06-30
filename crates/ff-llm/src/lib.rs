@@ -18,7 +18,9 @@ use serde::{Deserialize, Serialize};
 
 pub use anthropic::AnthropicProvider;
 pub use bedrock::{BedrockCreds, BedrockProvider};
-pub use ollama::{ollama_num_ctx_from_env, OllamaProvider};
+pub use ollama::{
+    ollama_num_ctx_from_env, resolve_served_window, OllamaProvider, ServedWindowProbe,
+};
 pub use openai::OpenAiProvider;
 
 use std::time::Duration;

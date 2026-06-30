@@ -1673,8 +1673,22 @@ fn get_session_model_selection(
 /// renders this on the per-pane model chip so the displayed model matches what the
 /// next turn will actually use.
 #[tauri::command]
-fn resolve_model_selection(state: State<'_, Arc<AppState>>, session_id: String) -> ResolvedModel {
-    state.resolve_model_selection(&session_id)
+async fn resolve_model_selection(
+    state: State<'_, Arc<AppState>>,
+    session_id: String,
+) -> Result<ResolvedModel, String> {
+    let mut resolved = state.resolve_model_selection(&session_id);
+    // Fold the async-only served-window probe onto the sync resolver's output
+    // (#602). Cast u64 -> u32 so the ts-rs binding stays `number` (u64 maps to
+    // `bigint`, which the FE `ServedWindow.window: number` cannot consume); a
+    // window above `u32::MAX` (~4.29B tokens) is absurd, so try_from is just a
+    // safety net rather than a real constraint. The `Result` wrapper is required
+    // for async tauri commands with reference inputs; we never actually err.
+    let probe = state.served_window(&session_id).await;
+    resolved.context_window = probe.window.and_then(|n| u32::try_from(n).ok());
+    resolved.trained_context_window = probe.trained.and_then(|n| u32::try_from(n).ok());
+    resolved.context_window_source = probe.source;
+    Ok(resolved)
 }
 
 /// The global default autonomy mode (#265), inherited by sessions with no explicit

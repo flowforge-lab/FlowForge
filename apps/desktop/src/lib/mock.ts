@@ -1758,7 +1758,17 @@ Shipping the Settings redesign — currently the Memory browser (SET.8).
     const kind = this.registry.connections.find(
       (c) => c.id === connection,
     )?.kind;
-    return { connection, model, ...this.modelCaps(kind, model) };
+    // The mock has no live Ollama to probe, so the served-window contract
+    // (#602) carries nulls; the model-chip readout / amber dot stays hidden in
+    // mock mode by design.
+    return {
+      connection,
+      model,
+      ...this.modelCaps(kind, model),
+      contextWindow: null,
+      trainedContextWindow: null,
+      contextWindowSource: null,
+    };
   }
 
   // Profile marketplace search (SET.7). Empty query lists the full catalog,
