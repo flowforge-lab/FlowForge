@@ -32,6 +32,7 @@ pub mod memory;
 pub mod process;
 mod python;
 mod registry;
+mod shell;
 mod todo;
 mod tree;
 pub mod url_safety;
