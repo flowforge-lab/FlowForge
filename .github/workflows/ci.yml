@@ -52,10 +52,11 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      # ff-tools carries the only #[cfg(windows)] code (process Job Object kill
-      # path). The Linux job never compiles it, so this guards against bit-rot.
-      - name: cargo check (ff-tools)
-        run: cargo check -p ff-tools --all-targets
+      # ff-tools and ff-mcp carry the #[cfg(windows)] code (process Job Object kill
+      # path; MCP PATHEXT shim resolution, #596). The Linux job never compiles it, so
+      # this guards against bit-rot.
+      - name: cargo check (ff-tools + ff-mcp)
+        run: cargo check -p ff-tools -p ff-mcp --all-targets
 
   web:
     name: Web (typecheck, lint, format, build)

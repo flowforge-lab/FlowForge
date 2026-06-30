@@ -77,6 +77,45 @@ fn extra_path_dirs() -> Vec<PathBuf> {
     Vec::new()
 }
 
+/// Resolve a bare MCP `command` to an absolute path honoring `PATHEXT`, so Windows cmd
+/// shims (`npx.cmd`, `uvx.exe`, `pnpm.cmd`) resolve. Rust's `Command` only appends
+/// `.exe` and never consults `PATHEXT`, so a bare `npx` fails "program not found" and
+/// every documented MCP config is dead on Windows (#596). Spawning the resolved
+/// absolute path directly (rather than wrapping in `cmd /C`) keeps the child PID equal
+/// to the real server -- the supervisor surfaces and reaps by that PID -- and, when the
+/// path ends in `.cmd`/`.bat`, Rust std (>= 1.77) auto-escapes the args for `cmd.exe`.
+///
+/// Returns `None` to fall through to spawning the raw command when it already carries a
+/// path separator or extension, or is not found on the search path -- letting the real
+/// spawn error surface (the #573 loud-failure path) instead of masking it.
+///
+/// Host-agnostic (takes `path`/`pathext` as parameters and checks `is_file`) so it
+/// unit-tests on the non-Windows dev host and the `windows-check` CI leg alike; only
+/// the `connect` call site is `#[cfg(windows)]`.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn resolve_via_pathext(command: &str, path: &str, pathext: &str) -> Option<PathBuf> {
+    // Already qualified (absolute, or carries a separator/extension): let `Command`
+    // resolve it as-is so we never second-guess an explicit path.
+    if Path::new(command).is_absolute()
+        || command.contains('/')
+        || command.contains('\\')
+        || Path::new(command).extension().is_some()
+    {
+        return None;
+    }
+    let exts: Vec<&str> = pathext.split(';').filter(|e| !e.is_empty()).collect();
+    for dir in std::env::split_paths(path) {
+        for ext in &exts {
+            // PATHEXT entries include the leading dot (e.g. ".CMD").
+            let candidate = dir.join(format!("{command}{ext}"));
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
 /// Append `extra` directories to an inherited `PATH`, preserving order and dropping
 /// duplicates so the inherited entries keep priority and a dir already present is not
 /// repeated. Falls back to the inherited value unchanged if joining fails (e.g. a dir
@@ -139,7 +178,25 @@ impl McpClient {
         cwd: Option<&Path>,
         roots: &[&Path],
     ) -> Result<Self, McpError> {
-        let mut cmd = Command::new(&config.command);
+        // On Windows, resolve cmd shims (npx.cmd, uvx.exe, ...) via PATHEXT to an
+        // absolute path so a bare `command` spawns at all (#596); on every other
+        // platform this is byte-identical to `Command::new(&config.command)`.
+        let program: OsString = {
+            #[cfg(windows)]
+            {
+                let path = std::env::var("PATH").unwrap_or_default();
+                let pathext =
+                    std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".into());
+                resolve_via_pathext(&config.command, &path, &pathext)
+                    .map(Into::into)
+                    .unwrap_or_else(|| config.command.clone().into())
+            }
+            #[cfg(not(windows))]
+            {
+                config.command.clone().into()
+            }
+        };
+        let mut cmd = Command::new(&program);
         cmd.args(&config.args);
         // Run the child in `cwd` when set, so a workspace-aware server (e.g. codegraph)
         // indexes the active checkout rather than the app's launch directory (#548).
@@ -342,6 +399,66 @@ mod tests {
             "bare command should resolve via the augmented PATH"
         );
         assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "ok");
+    }
+
+    // #596 — PATHEXT resolution: a bare `npx`/`uvx`/`pnpm` must resolve to its cmd
+    // shim, which Rust's `Command` never finds on Windows (it only appends `.exe`).
+    // Host-agnostic: synthetic files + a joined PATH, so it runs on the dev host too.
+    fn join(dirs: &[&std::path::Path]) -> String {
+        std::env::join_paths(dirs.iter().map(|d| d.as_os_str()))
+            .unwrap()
+            .into_string()
+            .unwrap()
+    }
+
+    // PATHEXT casing here matches the synthetic file casing so the test is
+    // deterministic on a case-sensitive FS (Linux CI) as well as a case-insensitive
+    // one (macOS/Windows). On real Windows the OS resolves `is_file()`
+    // case-insensitively, which is exactly what makes a lowercase `npx.cmd` match an
+    // uppercase `.CMD` PATHEXT entry -- an OS concern, not this function's job.
+    #[test]
+    fn resolve_via_pathext_finds_a_cmd_shim() {
+        let dir = tempfile::tempdir().unwrap();
+        let shim = dir.path().join("npx.cmd");
+        std::fs::write(&shim, b"").unwrap();
+        let path = join(&["/no/such/dir".as_ref(), dir.path()]);
+        assert_eq!(resolve_via_pathext("npx", &path, ".exe;.cmd"), Some(shim),);
+    }
+
+    #[test]
+    fn resolve_via_pathext_respects_pathext_then_path_order() {
+        // .exe precedes .cmd in PATHEXT, and the first PATH dir wins. A dir holding
+        // both npx.cmd and npx.exe must yield the .exe (earlier PATHEXT entry).
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("npx.exe");
+        std::fs::write(&exe, b"").unwrap();
+        std::fs::write(dir.path().join("npx.cmd"), b"").unwrap();
+        let path = join(&[dir.path()]);
+        assert_eq!(resolve_via_pathext("npx", &path, ".exe;.cmd"), Some(exe),);
+    }
+
+    #[test]
+    fn resolve_via_pathext_none_when_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = join(&[dir.path()]);
+        assert!(resolve_via_pathext("npx", &path, ".EXE;.CMD").is_none());
+    }
+
+    #[test]
+    fn resolve_via_pathext_passes_through_qualified_commands() {
+        // Absolute paths, anything carrying a separator, or an explicit extension are
+        // left for `Command` to resolve as-is — we never second-guess them.
+        let path = "/nope";
+        assert!(resolve_via_pathext("/usr/bin/node", path, ".EXE;.CMD").is_none());
+        assert!(resolve_via_pathext("./local/tool", path, ".EXE;.CMD").is_none());
+        assert!(resolve_via_pathext("dir\\tool", path, ".EXE;.CMD").is_none());
+        assert!(resolve_via_pathext("server.js", path, ".EXE;.CMD").is_none());
+    }
+
+    #[test]
+    fn resolve_via_pathext_handles_empty_path_and_pathext() {
+        assert!(resolve_via_pathext("npx", "", ".EXE;.CMD").is_none());
+        assert!(resolve_via_pathext("npx", "/some/dir", "").is_none());
     }
 
     #[test]
