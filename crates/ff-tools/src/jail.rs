@@ -165,17 +165,72 @@ mod tests {
         assert!(err.contains("access denied"), "{err}");
     }
 
+    // This test exercises a unix-only primitive (symlinks); gating the whole
+    // fn avoids unused-variable warnings on Windows, where the body would
+    // otherwise allocate `outside`/`root` and never read them.
+    #[cfg(unix)]
     #[test]
     fn create_rejects_symlinked_ancestor_escape() {
         let outside = tempfile::tempdir().unwrap();
         let root = tempfile::tempdir().unwrap();
         // `root/link` -> outside; creating `root/link/x.txt` must be rejected.
-        #[cfg(unix)]
         std::os::unix::fs::symlink(outside.path(), root.path().join("link")).unwrap();
-        #[cfg(unix)]
-        {
-            let err = resolve_for_create(root.path(), "link/x.txt").unwrap_err();
-            assert!(err.contains("access denied"), "{err}");
-        }
+        let err = resolve_for_create(root.path(), "link/x.txt").unwrap_err();
+        assert!(err.contains("access denied"), "{err}");
+    }
+
+    // Windows: std::fs::canonicalize() yields a `\\?\` verbatim/UNC prefix on
+    // both sides, so starts_with() compares verbatim-to-verbatim. The
+    // #[cfg(unix)] symlink test above cannot run here, so these give Windows
+    // containment its only coverage: drive-absolute escape, `..` traversal,
+    // and case-insensitive match.
+    #[cfg(windows)]
+    #[test]
+    fn windows_rejects_drive_absolute_escape() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let outside_file = outside.path().join("secret.txt");
+        fs::write(&outside_file, "x").unwrap();
+        // A plain `C:\...\secret.txt` canonicalizes to `\\?\C:\...\secret.txt`
+        // inside resolve_in_root; starts_with(&root) must then reject it.
+        let err = resolve_in_root(root.path(), outside_file.to_str().unwrap())
+            .expect_err("drive-absolute path outside root must be denied");
+        assert!(err.contains("access denied"), "{err}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_rejects_backslash_parent_traversal() {
+        let root = tempfile::tempdir().unwrap();
+        // `..\escape.txt` (backslash separators) canonicalizes to root's parent
+        // — outside the workspace — and must be rejected.
+        let err = resolve_in_root(root.path(), r"..\escape.txt")
+            .expect_err("parent traversal must be denied");
+        assert!(err.contains("access denied"), "{err}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_case_insensitive_match_inside_root() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("MixedCase.txt"), "hi").unwrap();
+        // Windows is case-insensitive; canonicalize() must normalize both sides
+        // so the case-sensitive starts_with() still admits the file.
+        let got = resolve_in_root(root.path(), r"MIXEDCASE.TXT")
+            .expect("differently-cased inside-root file must be admitted");
+        assert!(got.ends_with("MixedCase.txt"), "{got:?}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_create_rejects_drive_absolute_escape() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        // A not-yet-existing file under an outside dir: the missing-tail branch
+        // anchors on the outside dir, then starts_with(&root) must reject.
+        let candidate = outside.path().join("escaped.txt");
+        let err = resolve_for_create(root.path(), candidate.to_str().unwrap())
+            .expect_err("drive-absolute create outside root must be denied");
+        assert!(err.contains("access denied"), "{err}");
     }
 }
