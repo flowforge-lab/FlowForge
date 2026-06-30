@@ -329,6 +329,7 @@ function initialScheduledTasks(): ScheduledTask[] {
       nextRun: now + 6 * HOUR_MS,
       lastRun: now - 18 * HOUR_MS,
       paused: false,
+      catchUp: false,
     },
     {
       id: "weekly-digest",
@@ -339,6 +340,7 @@ function initialScheduledTasks(): ScheduledTask[] {
       cadenceLabel: "Mondays at 9:00 AM",
       paused: true,
       lastRun: now - 4 * 24 * HOUR_MS,
+      catchUp: false,
     },
   ];
 }
@@ -650,6 +652,10 @@ export class MockIpc implements FfIpc {
   private scheduledChangedListeners = new Set<Listener<ScheduledTask[]>>();
   /** Monotonic run-id source for the `RunRecord`s `runScheduledTaskNow` mints. */
   private scheduledRunSeq = 0;
+  /** Per-task fire history (newest pushed last), backing `listScheduledRuns`. */
+  private scheduledRuns: RunRecord[] = [];
+  /** Global pause-all kill-switch state (RFC 0017 §8.3). */
+  private scheduledPausedAll = false;
   private phenoMcpUnavailableListeners = new Set<
     Listener<PhenotypeMcpUnavailableEvent>
   >();
@@ -1288,6 +1294,7 @@ export class MockIpc implements FfIpc {
       cadenceLabel: input.name,
       nextRun: Date.now() + 24 * HOUR_MS,
       paused: false,
+      catchUp: input.catchUp ?? false,
     };
     this.scheduledTasks.push(task);
     return { ...task };
@@ -1309,6 +1316,9 @@ export class MockIpc implements FfIpc {
   async runScheduledTaskNow(id: string): Promise<RunRecord> {
     const task = this.scheduledTasks.find((t) => t.id === id);
     if (!task) throw new Error(`unknown scheduled task: ${id}`);
+    if (this.scheduledPausedAll) {
+      throw new Error("scheduled tasks are globally paused");
+    }
     // A manual fire spawns a session the run is attached to (the real runner does
     // the same), so the UI's ↗ open-session jump has somewhere to land.
     const session = await this.createSession(`Scheduled: ${task.name}`);
@@ -1324,6 +1334,7 @@ export class MockIpc implements FfIpc {
       firedMs,
       status: "ok",
     };
+    this.scheduledRuns.push(run);
     // Fire first (carries the session linkage), then the snapshot that live-updates
     // Next / Last in the list without a reload.
     this.emit(this.scheduledFiredListeners, run);
@@ -1332,6 +1343,23 @@ export class MockIpc implements FfIpc {
       this.scheduledTasks.map((t) => ({ ...t })),
     );
     return run;
+  }
+
+  async listScheduledRuns(id: string): Promise<RunRecord[]> {
+    // Newest first, capped at 50 — mirrors the backend `runs(id, 50)` reader.
+    return this.scheduledRuns
+      .filter((r) => r.taskId === id)
+      .slice(-50)
+      .reverse();
+  }
+
+  async setScheduledPausedAll(paused: boolean): Promise<boolean> {
+    this.scheduledPausedAll = paused;
+    this.emit(
+      this.scheduledChangedListeners,
+      this.scheduledTasks.map((t) => ({ ...t })),
+    );
+    return paused;
   }
 
   async warmup(): Promise<void> {

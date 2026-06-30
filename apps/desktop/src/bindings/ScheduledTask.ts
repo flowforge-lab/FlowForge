@@ -23,6 +23,13 @@ workspace?: string,
  */
 profile?: string, safetyCeiling: SafetyCeiling, paused: boolean, 
 /**
+ * Per-task missed-fire policy (RFC 0017 §8.1). `false` (default) skips
+ * missed slots — only the most-recent past occurrence fires on wake. `true`
+ * opts into catching up missed fires. Persisted so the policy survives a
+ * restart; the multi-fire runtime is a follow-up (the field is the contract).
+ */
+catchUp: boolean, 
+/**
  * Human cadence summary derived from `cron` (e.g. "Daily at 5:00 PM").
  * Server-computed on read; never stored.
  */

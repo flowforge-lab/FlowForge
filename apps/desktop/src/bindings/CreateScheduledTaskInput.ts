@@ -6,4 +6,9 @@ import type { TaskKind } from "./TaskKind";
  * Payload for `create_scheduled_task`. Carries the fields the New-task form
  * collects; `id`/derived fields are server-assigned.
  */
-export type CreateScheduledTaskInput = { name: string, cron: string, kind: TaskKind, workspace?: string, profile?: string, safetyCeiling: SafetyCeiling, };
+export type CreateScheduledTaskInput = { name: string, cron: string, kind: TaskKind, workspace?: string, profile?: string, safetyCeiling: SafetyCeiling, 
+/**
+ * Per-task missed-fire policy (RFC 0017 §8.1); omitted/`None` defaults to
+ * skip. Optional in the binding so the New-task form can add it additively.
+ */
+catchUp?: boolean, };

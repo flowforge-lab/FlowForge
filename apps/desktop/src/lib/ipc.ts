@@ -334,8 +334,17 @@ export interface FfIpc {
   // Mocked under `VITE_FF_MOCK=1` for now.
   /** Fire a task immediately (out of band of its cron). Resolves with the run it
    *  created — `RunRecord.sessionId` is the session the fire spawned, backing the
-   *  ↗ open-session jump. Also drives a `scheduled:fired` + `scheduled:changed`. */
+   *  ↗ open-session jump. Also drives a `scheduled:fired` + `scheduled:changed`.
+   *  Rejects when the global pause-all kill-switch is engaged. */
   runScheduledTaskNow(id: string): Promise<RunRecord>;
+  /** A task's fire history, newest first (capped at 50). Backs the run-history
+   *  list and the ↗ open-session affordance (RFC 0017 §6.2, #544). */
+  listScheduledRuns(id: string): Promise<RunRecord[]>;
+  /** Engage/release the global pause-all kill-switch (RFC 0017 §8.3, #544). When
+   *  engaged the sweep fires nothing, regardless of per-task pause — including
+   *  tasks created while engaged. Resolves with the new state; emits
+   *  `scheduled:changed`. */
+  setScheduledPausedAll(paused: boolean): Promise<boolean>;
 
   // MCP servers (M4.4, RFC 0003). Enable/disable/add/remove write `mcp.json`; the
   // config watcher reconciles the supervisor, which then emits `mcp:status-changed`.
@@ -632,6 +641,10 @@ class TauriIpc implements FfIpc {
     this.invoke<string>("preview_cadence", { cron });
   runScheduledTaskNow = (id: string) =>
     this.invoke<RunRecord>("run_scheduled_task_now", { id });
+  listScheduledRuns = (id: string) =>
+    this.invoke<RunRecord[]>("list_scheduled_runs", { id });
+  setScheduledPausedAll = (paused: boolean) =>
+    this.invoke<boolean>("set_scheduled_paused_all", { paused });
 
   listMcpServers = () => this.invoke<McpServerStatus[]>("list_mcp_servers");
   restartMcpServer = (id: string) =>

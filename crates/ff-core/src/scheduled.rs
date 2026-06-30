@@ -74,6 +74,12 @@ pub struct ScheduledTask {
     pub profile: Option<String>,
     pub safety_ceiling: SafetyCeiling,
     pub paused: bool,
+    /// Per-task missed-fire policy (RFC 0017 §8.1). `false` (default) skips
+    /// missed slots — only the most-recent past occurrence fires on wake. `true`
+    /// opts into catching up missed fires. Persisted so the policy survives a
+    /// restart; the multi-fire runtime is a follow-up (the field is the contract).
+    #[serde(default)]
+    pub catch_up: bool,
     /// Human cadence summary derived from `cron` (e.g. "Daily at 5:00 PM").
     /// Server-computed on read; never stored.
     pub cadence_label: String,
@@ -105,6 +111,11 @@ pub struct CreateScheduledTaskInput {
     pub profile: Option<String>,
     #[serde(default)]
     pub safety_ceiling: SafetyCeiling,
+    /// Per-task missed-fire policy (RFC 0017 §8.1); omitted/`None` defaults to
+    /// skip. Optional in the binding so the New-task form can add it additively.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub catch_up: Option<bool>,
 }
 
 /// Terminal status of one fire (RFC 0017 §8.4). A tool denial is incidental

@@ -9,7 +9,8 @@ use std::sync::Mutex;
 
 use chrono::Local;
 use ff_core::{
-    BuiltinAction, CreateScheduledTaskInput, RunStatus, SafetyCeiling, ScheduledTask, TaskKind,
+    BuiltinAction, CreateScheduledTaskInput, RunRecord, RunStatus, SafetyCeiling, ScheduledTask,
+    TaskKind,
 };
 use rusqlite::{params, Connection, OptionalExtension};
 
@@ -72,8 +73,8 @@ impl ScheduledStore {
         conn.execute(
             "INSERT INTO scheduled_tasks
                  (id, name, cron, kind, kind_value, workspace, profile,
-                  safety_ceiling, paused, last_run_ms, created_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, NULL, ?9)",
+                  safety_ceiling, paused, catch_up, last_run_ms, created_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, NULL, ?10)",
             params![
                 id,
                 input.name,
@@ -83,6 +84,7 @@ impl ScheduledStore {
                 input.workspace,
                 input.profile,
                 ceiling_to_text(input.safety_ceiling),
+                input.catch_up.unwrap_or(false) as i64,
                 now_ms(),
             ],
         )
@@ -92,13 +94,59 @@ impl ScheduledStore {
             .ok_or_else(|| "task vanished after insert".into())
     }
 
+    /// Seed the app's built-in tasks on first run (RFC 0017 §6.3, #544).
+    /// Idempotent: a built-in with a given [`BuiltinAction`] is inserted only if
+    /// no task already carries it, so it survives restarts and never duplicates.
+    /// Seeded **paused** — a Memory Organizer pass mutates curated memory, so the
+    /// user opts in rather than having it run unattended on first launch.
+    pub fn seed_builtins(&self) {
+        const BUILTINS: &[(&str, BuiltinAction, &str)] = &[(
+            "Memory Organizer",
+            BuiltinAction::MemoryConsolidate,
+            // 03:00 local daily — a quiet hour; paused until the user enables it.
+            "0 0 3 * * *",
+        )];
+        for (name, action, cron_expr) in BUILTINS {
+            if self.has_builtin(*action) {
+                continue;
+            }
+            let id = new_id();
+            let (kind_tag, kind_value) = encode_kind(&TaskKind::Builtin(*action));
+            let conn = self.conn.lock().unwrap();
+            let r = conn.execute(
+                "INSERT INTO scheduled_tasks
+                     (id, name, cron, kind, kind_value, workspace, profile,
+                      safety_ceiling, paused, catch_up, last_run_ms, created_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL, 'read_only', 1, 0, NULL, ?6)",
+                params![id, name, cron_expr, kind_tag, kind_value, now_ms()],
+            );
+            if let Err(e) = r {
+                tracing::warn!(builtin = %name, error = %e, "failed to seed builtin task");
+            }
+        }
+    }
+
+    /// Whether a task with the given built-in action already exists.
+    fn has_builtin(&self, action: BuiltinAction) -> bool {
+        let (_, value) = encode_kind(&TaskKind::Builtin(action));
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT 1 FROM scheduled_tasks WHERE kind = 'builtin' AND kind_value = ?1 LIMIT 1",
+            params![value],
+            |_| Ok(()),
+        )
+        .optional()
+        .expect("query has_builtin")
+        .is_some()
+    }
+
     /// All tasks, newest first, with derived `cadence_label`/`next_run`.
     pub fn list(&self) -> Vec<ScheduledTask> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
             .prepare(
                 "SELECT id, name, cron, kind, kind_value, workspace, profile,
-                        safety_ceiling, paused, last_run_ms
+                        safety_ceiling, paused, catch_up, last_run_ms
                  FROM scheduled_tasks ORDER BY created_ms DESC",
             )
             .expect("prepare list");
@@ -115,7 +163,7 @@ impl ScheduledStore {
         let conn = self.conn.lock().unwrap();
         conn.query_row(
             "SELECT id, name, cron, kind, kind_value, workspace, profile,
-                    safety_ceiling, paused, last_run_ms
+                    safety_ceiling, paused, catch_up, last_run_ms
              FROM scheduled_tasks WHERE id = ?1",
             params![id],
             row_to_task,
@@ -166,16 +214,90 @@ impl ScheduledStore {
         .expect("stamp last_run");
     }
 
-    /// Append a fire record; returns its row id.
-    pub fn append_run(&self, task_id: &str, session_id: Option<&str>, status: RunStatus) -> i64 {
+    /// Append a fire record; returns the persisted [`RunRecord`] so callers can
+    /// emit the FE-facing event/command return without a re-read (#544).
+    pub fn append_run(
+        &self,
+        task_id: &str,
+        session_id: Option<&str>,
+        status: RunStatus,
+    ) -> RunRecord {
+        let fired_ms = now_ms();
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT INTO scheduled_runs (task_id, session_id, fired_ms, status)
              VALUES (?1, ?2, ?3, ?4)",
-            params![task_id, session_id, now_ms(), status_to_text(status)],
+            params![task_id, session_id, fired_ms, status_to_text(status)],
         )
         .expect("append run");
-        conn.last_insert_rowid()
+        RunRecord {
+            id: conn.last_insert_rowid(),
+            task_id: task_id.to_string(),
+            session_id: session_id.map(str::to_string),
+            fired_ms,
+            status,
+        }
+    }
+
+    /// A task's fire history, newest first, capped at `limit`. Backs the run
+    /// history list + the ↗ open-session affordance (RFC §6.2, #544).
+    pub fn runs(&self, task_id: &str, limit: usize) -> Vec<RunRecord> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, task_id, session_id, fired_ms, status
+                 FROM scheduled_runs WHERE task_id = ?1
+                 ORDER BY fired_ms DESC, id DESC LIMIT ?2",
+            )
+            .expect("prepare runs");
+        let rows = stmt
+            .query_map(params![task_id, limit as i64], row_to_run)
+            .expect("query runs")
+            .filter_map(Result::ok)
+            .collect();
+        rows
+    }
+
+    /// The session id of the most recent fire that created one, for the ↗ jump.
+    pub fn latest_session(&self, task_id: &str) -> Option<String> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT session_id FROM scheduled_runs
+             WHERE task_id = ?1 AND session_id IS NOT NULL
+             ORDER BY fired_ms DESC, id DESC LIMIT 1",
+            params![task_id],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()
+        .expect("query latest_session")
+    }
+
+    /// Whether the global pause-all kill-switch is engaged (RFC §8.3). Absent
+    /// meta defaults to off.
+    pub fn is_all_paused(&self) -> bool {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT value FROM scheduled_meta WHERE key = 'paused_all'",
+            [],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()
+        .expect("query paused_all")
+        .as_deref()
+            == Some("1")
+    }
+
+    /// Engage or release the global pause-all kill-switch. A true switch: it
+    /// gates the sweep regardless of per-task `paused`, so tasks created while
+    /// engaged stay held too.
+    pub fn set_all_paused(&self, paused: bool) {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO scheduled_meta (key, value) VALUES ('paused_all', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![if paused { "1" } else { "0" }],
+        )
+        .expect("set paused_all");
     }
 
     /// Status text of each run for a task, oldest first. Test-only reader so the
@@ -196,8 +318,12 @@ impl ScheduledStore {
     /// most recent occurrence at/before `now` is strictly newer than the last
     /// fire (RFC 0017 §4). A `None` `last_run` means "never fired", so any past
     /// occurrence makes it due. `now` is taken from the local clock so the
-    /// predicate matches the local-time cadence the user set.
+    /// predicate matches the local-time cadence the user set. The global
+    /// pause-all kill-switch (RFC §8.3) short-circuits the whole set.
     pub fn due_tasks(&self) -> Vec<ScheduledTask> {
+        if self.is_all_paused() {
+            return Vec::new();
+        }
         let now = Local::now();
         self.list()
             .into_iter()
@@ -236,6 +362,7 @@ fn row_to_task(row: &rusqlite::Row) -> rusqlite::Result<ScheduledTask> {
         profile: row.get("profile")?,
         safety_ceiling: text_to_ceiling(&ceiling),
         paused: row.get::<_, i64>("paused")? != 0,
+        catch_up: row.get::<_, i64>("catch_up")? != 0,
         next_run,
         last_run,
     })
@@ -297,6 +424,26 @@ fn status_to_text(s: RunStatus) -> &'static str {
     }
 }
 
+fn text_to_status(s: &str) -> RunStatus {
+    match s {
+        "error" => RunStatus::Error,
+        "cancelled" => RunStatus::Cancelled,
+        "needs_attention" => RunStatus::NeedsAttention,
+        _ => RunStatus::Ok,
+    }
+}
+
+fn row_to_run(row: &rusqlite::Row) -> rusqlite::Result<RunRecord> {
+    let status: String = row.get("status")?;
+    Ok(RunRecord {
+        id: row.get("id")?,
+        task_id: row.get("task_id")?,
+        session_id: row.get("session_id")?,
+        fired_ms: row.get("fired_ms")?,
+        status: text_to_status(&status),
+    })
+}
+
 // --- migrations ------------------------------------------------------------
 
 /// Version-gated migration runner (same shape as `ff-session`). v1 is the
@@ -331,6 +478,20 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
         )?;
         conn.pragma_update(None, "user_version", 1)?;
     }
+    if version < 2 {
+        // #544 PR-C: per-task `catch_up` policy (RFC §8.1) and a global
+        // `scheduled_meta` key/value table backing the pause-all kill-switch
+        // (RFC §8.3). `catch_up` defaults to 0 (skip), matching the v1 due
+        // predicate; `paused_all` is absent until first set (treated as off).
+        conn.execute_batch(
+            "ALTER TABLE scheduled_tasks ADD COLUMN catch_up INTEGER NOT NULL DEFAULT 0;
+             CREATE TABLE IF NOT EXISTS scheduled_meta (
+                 key   TEXT PRIMARY KEY,
+                 value TEXT NOT NULL
+             );",
+        )?;
+        conn.pragma_update(None, "user_version", 2)?;
+    }
     Ok(())
 }
 
@@ -347,6 +508,7 @@ mod tests {
             workspace: None,
             profile: None,
             safety_ceiling: SafetyCeiling::ReadOnly,
+            catch_up: None,
         }
     }
 
@@ -446,5 +608,116 @@ mod tests {
             )
             .unwrap();
         assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn seed_builtins_is_idempotent_and_paused() {
+        let s = ScheduledStore::open_in_memory().unwrap();
+        s.seed_builtins();
+        let after_first = s.list();
+        let builtins: Vec<_> = after_first.iter().filter(|t| t.kind.is_builtin()).collect();
+        assert_eq!(builtins.len(), 1, "exactly one builtin seeded");
+        let organizer = builtins[0];
+        assert_eq!(
+            organizer.kind,
+            TaskKind::Builtin(BuiltinAction::MemoryConsolidate)
+        );
+        assert!(organizer.paused, "builtin is seeded paused (opt-in)");
+
+        // A second seed does not duplicate it.
+        s.seed_builtins();
+        assert_eq!(s.list().len(), after_first.len(), "re-seed is a no-op");
+    }
+
+    #[test]
+    fn seeded_builtin_survives_restart_without_duplicating() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("sched.db");
+        {
+            let s = ScheduledStore::open(&path).unwrap();
+            s.seed_builtins();
+        }
+        // Reopen + re-seed (mirrors the startup path): still exactly one.
+        let s = ScheduledStore::open(&path).unwrap();
+        s.seed_builtins();
+        assert_eq!(s.list().iter().filter(|t| t.kind.is_builtin()).count(), 1);
+    }
+
+    #[test]
+    fn runs_returns_history_newest_first_and_latest_session() {
+        let s = ScheduledStore::open_in_memory().unwrap();
+        let t = s.create(prompt("p", &cron::daily(9, 0))).unwrap();
+        s.append_run(&t.id, Some("sess-a"), RunStatus::Ok);
+        s.append_run(&t.id, None, RunStatus::Error);
+        s.append_run(&t.id, Some("sess-c"), RunStatus::NeedsAttention);
+
+        let runs = s.runs(&t.id, 10);
+        assert_eq!(runs.len(), 3);
+        assert_eq!(runs[0].status, RunStatus::NeedsAttention, "newest first");
+        assert_eq!(runs[0].session_id.as_deref(), Some("sess-c"));
+        // latest_session skips the most recent run only if it had no session;
+        // here the newest run has sess-c.
+        assert_eq!(s.latest_session(&t.id).as_deref(), Some("sess-c"));
+
+        // The limit caps the returned history.
+        assert_eq!(s.runs(&t.id, 2).len(), 2);
+    }
+
+    #[test]
+    fn latest_session_skips_runs_without_a_session() {
+        let s = ScheduledStore::open_in_memory().unwrap();
+        let t = s.create(prompt("p", &cron::daily(9, 0))).unwrap();
+        s.append_run(&t.id, Some("sess-a"), RunStatus::Ok);
+        s.append_run(&t.id, None, RunStatus::Error); // newest, no session
+        assert_eq!(
+            s.latest_session(&t.id).as_deref(),
+            Some("sess-a"),
+            "falls back to the most recent run that created a session"
+        );
+    }
+
+    #[test]
+    fn append_run_returns_the_persisted_record() {
+        let s = ScheduledStore::open_in_memory().unwrap();
+        let t = s.create(prompt("p", &cron::daily(9, 0))).unwrap();
+        let rec = s.append_run(&t.id, Some("sess-1"), RunStatus::Ok);
+        assert_eq!(rec.task_id, t.id);
+        assert_eq!(rec.session_id.as_deref(), Some("sess-1"));
+        assert_eq!(rec.status, RunStatus::Ok);
+        assert!(rec.id > 0 && rec.fired_ms > 0);
+    }
+
+    #[test]
+    fn pause_all_kill_switch_empties_the_due_set() {
+        let s = ScheduledStore::open_in_memory().unwrap();
+        // A task that is due now (never fired, fires every minute).
+        s.create(prompt("due", "0 * * * * *")).unwrap();
+        assert_eq!(s.due_tasks().len(), 1, "due before pause-all");
+
+        s.set_all_paused(true);
+        assert!(s.is_all_paused());
+        assert!(s.due_tasks().is_empty(), "kill-switch gates the whole set");
+
+        // A task created while paused stays held too (true kill-switch).
+        s.create(prompt("due2", "0 * * * * *")).unwrap();
+        assert!(s.due_tasks().is_empty());
+
+        s.set_all_paused(false);
+        assert!(!s.is_all_paused());
+        assert_eq!(s.due_tasks().len(), 2, "releasing restores due-ness");
+    }
+
+    #[test]
+    fn catch_up_persists_and_defaults_to_skip() {
+        let s = ScheduledStore::open_in_memory().unwrap();
+        let default = s.create(prompt("d", &cron::daily(9, 0))).unwrap();
+        assert!(!default.catch_up, "defaults to skip");
+
+        let mut input = prompt("c", &cron::daily(9, 0));
+        input.catch_up = Some(true);
+        let task = s.create(input).unwrap();
+        assert!(task.catch_up);
+        // Survives a re-read.
+        assert!(s.get(&task.id).unwrap().catch_up);
     }
 }

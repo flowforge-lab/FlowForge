@@ -521,6 +521,14 @@ fn scheduled_db_path() -> Option<PathBuf> {
 /// Open the scheduled-task store, falling back to an ephemeral in-memory store (with
 /// a warning) if the path is unavailable — same resilience as `build_session_store`.
 fn build_scheduled_store() -> ScheduledStore {
+    let store = build_scheduled_store_inner();
+    // Seed the app's built-in tasks (e.g. Memory Organizer) on first run.
+    // Idempotent, so it is safe to call on every startup (RFC 0017 §6.3, #544).
+    store.seed_builtins();
+    store
+}
+
+fn build_scheduled_store_inner() -> ScheduledStore {
     if cfg!(test) {
         return ScheduledStore::open_in_memory().expect("in-memory scheduled store");
     }
