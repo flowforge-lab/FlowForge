@@ -157,7 +157,7 @@ impl ProcessSupervisor {
         }
     }
 
-    /// Spawn `command` (via the user's `$SHELL -c`) in `dir`, capturing stdout and
+    /// Spawn `command` (via [`crate::shell::shell_invocation`]) in `dir`, capturing stdout and
     /// stderr into bounded buffers. Returns the new process id. Rejected if the
     /// live-process cap is reached. Must be called from within a Tokio runtime
     /// (the agent loop always is): it spawns detached reader and exit-watcher tasks.

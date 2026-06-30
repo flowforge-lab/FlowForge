@@ -244,7 +244,7 @@ impl Tool for BashTool {
          temporary files use the workspace scratch dir `.ff-scratch/` (created for \
          you), never `/tmp`. A command runs for at most 120s by default; for a slow \
          build or test, pass `timeout_secs` (max 600) and run it in the foreground \
-         rather than backgrounding and polling. On Windows commands run under           PowerShell (`pwsh`) or `cmd.exe`, not bash -- prefer cross-platform           invocations."
+         rather than backgrounding and polling. On Windows commands run under PowerShell (`pwsh`) or `cmd.exe`, not bash -- prefer cross-platform invocations."
     }
 
     fn parameters(&self) -> Value {
