@@ -21,8 +21,8 @@ use ff_core::{
     Attachment, BedrockAuth, CreateScheduledTaskInput, Format, McpServerConfig, McpServerStatus,
     MemoryFileInfo, MemoryFileKind, MemoryOverview, Message, Mode, ModelSelection, Phenotype,
     ProviderConfig, ProviderConnection, ProviderKind, ProviderRegistry, ResolvedModel, Role,
-    RunStatus, ScheduledTask, SearchConfig, SecretKind, Session, SessionWorkspace, Skill,
-    SkillInfo, SkillManifest, TaskKind,
+    RunRecord, RunStatus, ScheduledTask, SearchConfig, SecretKind, Session, SessionWorkspace,
+    Skill, SkillInfo, SkillManifest, TaskKind,
 };
 use ff_scheduled::ScheduledApprover;
 use ff_signals::SkillAggregate;
@@ -313,34 +313,76 @@ fn preview_cadence(cron: String) -> Result<String, String> {
     Ok(ff_scheduled::cron::cadence_label(&cron))
 }
 
-/// Fire a scheduled task immediately, off-schedule (RFC 0017 section 8.3). Runs
-/// the same bounded headless turn the scheduler would, records the run, and
-/// stamps `last_run` so the manual fire counts as the most recent run (and the
-/// background sweep will not immediately re-fire it).
+/// A task's fire history, newest first, capped at 50. Backs the run-history list
+/// and the ↗ open-session affordance (RFC 0017 §6.2, #544).
+#[tauri::command]
+fn list_scheduled_runs(state: State<'_, Arc<AppState>>, id: String) -> Vec<RunRecord> {
+    state.scheduled.runs(&id, 50)
+}
+
+/// Engage or release the global pause-all kill-switch (RFC 0017 §8.3, #544). A
+/// true switch: the sweep is gated regardless of per-task `paused`, so tasks
+/// created while engaged stay held too. Emits `scheduled:changed` so the UI
+/// reflects the new gate.
+#[tauri::command]
+fn set_scheduled_paused_all(
+    state: State<'_, Arc<AppState>>,
+    app: tauri::AppHandle,
+    paused: bool,
+) -> bool {
+    state.scheduled.set_all_paused(paused);
+    let _ = app.emit("scheduled:changed", state.scheduled.list());
+    paused
+}
+
+/// Fire a scheduled task immediately, off-schedule (RFC 0017 §8.3). Runs the
+/// same bounded headless turn the scheduler would, records the run, and stamps
+/// `last_run` so the manual fire counts as the most recent run (and the
+/// background sweep will not immediately re-fire it). Returns the `RunRecord`
+/// and emits `scheduled:fired` + `scheduled:changed` so the UI live-updates.
 #[tauri::command]
 async fn run_scheduled_task_now(
     state: State<'_, Arc<AppState>>,
     app: tauri::AppHandle,
     id: String,
-) -> Result<(), String> {
+) -> Result<RunRecord, String> {
     let task = state
         .scheduled
         .get(&id)
         .ok_or_else(|| format!("unknown scheduled task: {id}"))?;
+    // The global kill-switch blocks manual fires too — "pause all" must mean
+    // nothing fires unattended, including a stray "run now" (RFC 0017 §8.3).
+    if state.scheduled.is_all_paused() {
+        return Err("scheduled tasks are globally paused".into());
+    }
     let runner = DesktopTaskRunner {
         state: state.inner().clone(),
-        app,
+        app: app.clone(),
     };
     let fired_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0);
     let outcome = ff_scheduled::TaskRunner::fire(&runner, &task).await;
-    state
-        .scheduled
-        .append_run(&task.id, outcome.session_id.as_deref(), outcome.status);
+    let record =
+        state
+            .scheduled
+            .append_run(&task.id, outcome.session_id.as_deref(), outcome.status);
     state.scheduled.stamp_last_run(&task.id, fired_ms);
-    Ok(())
+    emit_scheduled_fired(&app, &state.scheduled, &record);
+    Ok(record)
+}
+
+/// Emit `scheduled:fired` (the full `RunRecord`, matching the FE binding) plus a
+/// `scheduled:changed` snapshot of the task list, so the UI updates run history,
+/// the ↗ session link, and the derived next/last stamps without polling (#544).
+fn emit_scheduled_fired(
+    app: &tauri::AppHandle,
+    store: &ff_scheduled::ScheduledStore,
+    run: &RunRecord,
+) {
+    let _ = app.emit("scheduled:fired", run);
+    let _ = app.emit("scheduled:changed", store.list());
 }
 
 /// Clone a session and its transcript into a fresh session (server-truth).
@@ -936,17 +978,62 @@ struct DesktopTaskRunner {
     app: tauri::AppHandle,
 }
 
+impl DesktopTaskRunner {
+    /// Run a built-in action directly, mapping its result to a terminal
+    /// `RunStatus` (#544). A built-in has no free-text prompt and no agent loop,
+    /// so it never creates a session (`session_id: None`).
+    async fn fire_builtin(&self, action: ff_core::BuiltinAction) -> RunStatus {
+        match action {
+            ff_core::BuiltinAction::MemoryConsolidate => {
+                let memory = self.state.memory();
+                if !memory.is_enabled() {
+                    // A disabled memory store has nothing to organize; the fire
+                    // succeeded as a no-op rather than failing.
+                    return RunStatus::Ok;
+                }
+                let index = self.state.index();
+                // Both `consolidate` (file rewrite) and `reindex` (a possible
+                // blocking embed HTTP call) are sync/blocking, so run them off the
+                // async worker — mirrors `MemoryConsolidateTool::run`.
+                let result = tokio::task::spawn_blocking(move || {
+                    let report =
+                        memory.consolidate(&ff_memory::RecencyFrequencySalience::default())?;
+                    if report.ran {
+                        // Best-effort reindex; a recall-cache failure must not fail
+                        // the consolidation pass itself.
+                        let _ = index.reindex(&memory.all_chunks());
+                    }
+                    ff_memory::Result::Ok(())
+                })
+                .await;
+                match result {
+                    Ok(Ok(())) => RunStatus::Ok,
+                    Ok(Err(e)) => {
+                        tracing::warn!(error = %e, "scheduled builtin: memory_consolidate failed");
+                        RunStatus::Error
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "scheduled builtin: consolidate task panicked");
+                        RunStatus::Error
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[async_trait]
 impl ff_scheduled::TaskRunner for DesktopTaskRunner {
     async fn fire(&self, task: &ScheduledTask) -> ff_scheduled::RunOutcome {
-        // Builtin dispatch (e.g. memory consolidation) is #544; a prompt task is
-        // the only kind that fires today.
+        // A built-in runs its named action directly (no agent loop / session);
+        // a prompt task drives a headless `run_turn` below (#544).
         let prompt = match &task.kind {
             TaskKind::Prompt(text) => text.clone(),
-            TaskKind::Builtin(_) => {
+            TaskKind::Builtin(action) => {
+                let status = self.fire_builtin(*action).await;
                 return ff_scheduled::RunOutcome {
                     session_id: None,
-                    status: RunStatus::Error,
+                    status,
                 };
             }
         };
@@ -1060,12 +1147,6 @@ impl ff_scheduled::TaskRunner for DesktopTaskRunner {
                 Ok(Ok(_)) => RunStatus::Ok,
             }
         };
-
-        let _ = self.app.emit(
-            "scheduled:fired",
-            serde_json::json!({ "id": task.id, "sessionId": sid, "status": status }),
-        );
-        let _ = self.app.emit("scheduled:changed", ());
 
         ff_scheduled::RunOutcome {
             session_id: Some(sid),
@@ -2114,12 +2195,22 @@ pub fn run() {
             });
             {
                 let sched_store = state.scheduled.clone();
+                let sched_app = app.handle().clone();
                 tauri::async_runtime::spawn(async move {
                     let mut interval = tokio::time::interval(Duration::from_secs(30));
                     loop {
                         interval.tick().await;
-                        ff_scheduled::run_due_once(sched_store.as_ref(), scheduler_runner.as_ref())
-                            .await;
+                        let fired = ff_scheduled::run_due_once(
+                            sched_store.as_ref(),
+                            scheduler_runner.as_ref(),
+                        )
+                        .await;
+                        // Emit one `scheduled:fired` per appended run, plus a single
+                        // `scheduled:changed` snapshot when anything fired, so the UI
+                        // live-updates without polling (#544).
+                        for run in &fired {
+                            emit_scheduled_fired(&sched_app, sched_store.as_ref(), run);
+                        }
                     }
                 });
             }
@@ -2138,6 +2229,8 @@ pub fn run() {
             toggle_scheduled_task,
             delete_scheduled_task,
             run_scheduled_task_now,
+            list_scheduled_runs,
+            set_scheduled_paused_all,
             preview_cadence,
             get_session_workspace,
             set_session_workspace,

@@ -13,7 +13,7 @@ use async_trait::async_trait;
 use futures_util::FutureExt;
 
 use crate::store::ScheduledStore;
-use ff_core::{RunStatus, ScheduledTask};
+use ff_core::{RunRecord, RunStatus, ScheduledTask};
 
 /// The outcome of firing one task: the session it ran in (when one was created)
 /// and the terminal status to record (RFC 0017 §8.4).
@@ -49,14 +49,17 @@ pub fn spawn_scheduler(
 }
 
 /// Fire every currently-due task once. Factored out of the loop so tests can
-/// drive a single sweep deterministically without waiting on a timer.
+/// drive a single sweep deterministically without waiting on a timer. Returns
+/// the [`RunRecord`]s it appended (newest fire last) so the caller can emit the
+/// FE-facing `scheduled:fired` events without re-reading the store (#544).
 ///
 /// Each fire is panic-isolated: a `fire()` that panics (e.g. a desktop helper on
 /// a misconfigured task) is caught, recorded as an `Error` run, and stamped like
 /// any other outcome, so one bad task cannot unwind and silently kill the
 /// long-lived scheduler loop. Stamping a caught panic also prevents it from
 /// hot-looping (it stays due until stamped).
-pub async fn run_due_once(store: &ScheduledStore, runner: &dyn TaskRunner) {
+pub async fn run_due_once(store: &ScheduledStore, runner: &dyn TaskRunner) -> Vec<RunRecord> {
+    let mut records = Vec::new();
     for task in store.due_tasks() {
         let fired_ms = chrono::Local::now().timestamp_millis();
         let outcome = match AssertUnwindSafe(runner.fire(&task)).catch_unwind().await {
@@ -69,9 +72,11 @@ pub async fn run_due_once(store: &ScheduledStore, runner: &dyn TaskRunner) {
                 }
             }
         };
-        store.append_run(&task.id, outcome.session_id.as_deref(), outcome.status);
+        let record = store.append_run(&task.id, outcome.session_id.as_deref(), outcome.status);
         store.stamp_last_run(&task.id, fired_ms);
+        records.push(record);
     }
+    records
 }
 
 #[cfg(test)]
@@ -114,6 +119,7 @@ mod tests {
             workspace: None,
             profile: None,
             safety_ceiling: SafetyCeiling::ReadOnly,
+            catch_up: None,
         }
     }
 
@@ -123,16 +129,24 @@ mod tests {
         store.create(every_minute_task("t")).unwrap();
         let runner = CountingRunner::new(RunStatus::Ok);
 
-        run_due_once(&store, &runner).await;
+        let fired = run_due_once(&store, &runner).await;
 
         assert_eq!(runner.fires.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            fired.len(),
+            1,
+            "the appended record is returned for emission"
+        );
+        assert_eq!(fired[0].status, RunStatus::Ok);
+        assert_eq!(fired[0].session_id.as_deref(), Some("sess-1"));
         // last_run is stamped, so the task is no longer due on the next sweep.
-        run_due_once(&store, &runner).await;
+        let second = run_due_once(&store, &runner).await;
         assert_eq!(
             runner.fires.load(Ordering::SeqCst),
             1,
             "a stamped task must not re-fire within the same minute"
         );
+        assert!(second.is_empty(), "nothing due, no records returned");
         let task = &store.list()[0];
         assert!(task.last_run.is_some(), "last_run must be stamped");
     }

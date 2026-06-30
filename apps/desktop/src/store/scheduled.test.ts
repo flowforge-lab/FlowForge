@@ -141,6 +141,7 @@ describe("useScheduledStore", () => {
         safetyCeiling: "read_only",
         cadenceLabel: "Daily at 9:00 AM",
         paused: false,
+        catchUp: false,
       },
     ]);
     const { tasks, runsByTask } = useScheduledStore.getState();
