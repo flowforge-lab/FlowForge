@@ -31,6 +31,26 @@ use crate::registry::{Safety, Tool, ToolOutcome};
 const DEFAULT_TIMEOUT_SECS: u64 = 120;
 const MAX_TIMEOUT_SECS: u64 = 600;
 
+// Interpreter layout differs by platform. Unix venvs put the interpreter at
+// `bin/python` and the PATH fallback is `python3`; Windows venvs put it at
+// `Scripts\python.exe` and ships `python` (the `python3` alias is the Store shim
+// or absent). `py -3` would need a launcher arg, which the single-program spawn
+// here does not model, so the PATH fallback is `python`.
+#[cfg(not(windows))]
+const VENV_PYTHON_SUBPATH: &str = "bin/python";
+#[cfg(windows)]
+const VENV_PYTHON_SUBPATH: &str = "Scripts/python.exe";
+
+#[cfg(not(windows))]
+const PROJECT_VENV_PYTHON: [&str; 2] = [".venv/bin/python", "venv/bin/python"];
+#[cfg(windows)]
+const PROJECT_VENV_PYTHON: [&str; 2] = [".venv/Scripts/python.exe", "venv/Scripts/python.exe"];
+
+#[cfg(not(windows))]
+const PATH_INTERPRETER: &str = "python3";
+#[cfg(windows)]
+const PATH_INTERPRETER: &str = "python";
+
 pub struct PythonTool;
 
 impl PythonTool {
@@ -64,7 +84,9 @@ impl PythonTool {
         Duration::from_secs(secs)
     }
 
-    /// Pick the interpreter, in order of signal strength:
+    /// Pick the interpreter, in order of signal strength (the paths below are the
+    /// unix layout; on Windows the interpreter is at `Scripts\python.exe` and the
+    /// PATH fallback is `python` -- see [`VENV_PYTHON_SUBPATH`] / [`PATH_INTERPRETER`]):
     /// 1. an **activated** virtualenv (`$VIRTUAL_ENV/bin/python`) -- the explicit
     ///    intent of the launching shell (typically the CLI), which a working-dir
     ///    walk would never find;
@@ -85,20 +107,20 @@ impl PythonTool {
     /// testable without mutating process-global environment state.
     fn interpreter_with(virtual_env: Option<String>, dir: &Path) -> PathBuf {
         if let Some(ve) = virtual_env.filter(|v| !v.trim().is_empty()) {
-            let candidate = Path::new(&ve).join("bin").join("python");
+            let candidate = Path::new(&ve).join(VENV_PYTHON_SUBPATH);
             if candidate.is_file() {
                 return candidate;
             }
         }
         for ancestor in dir.ancestors() {
-            for venv in [".venv/bin/python", "venv/bin/python"] {
+            for venv in PROJECT_VENV_PYTHON {
                 let candidate = ancestor.join(venv);
                 if candidate.is_file() {
                     return candidate;
                 }
             }
         }
-        PathBuf::from("python3")
+        PathBuf::from(PATH_INTERPRETER)
     }
 }
 
@@ -222,7 +244,7 @@ mod tests {
     use super::*;
 
     fn skip_if_no_python() -> bool {
-        std::process::Command::new("python3")
+        std::process::Command::new(PATH_INTERPRETER)
             .arg("--version")
             .output()
             .map(|o| o.status.success())
@@ -367,6 +389,7 @@ mod tests {
         assert_eq!(PythonTool.max_safety(), Safety::Dangerous);
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn interpreter_finds_venv_in_an_ancestor_of_the_working_dir() {
         // .venv at the project root must be found when running in a nested subdir.
@@ -382,6 +405,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn interpreter_prefers_the_nearest_venv_when_several_ancestors_have_one() {
         let dir = tempfile::tempdir().unwrap();
@@ -398,6 +422,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn interpreter_falls_back_to_path_python3_without_any_venv() {
         let dir = tempfile::tempdir().unwrap();
@@ -407,6 +432,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn interpreter_prefers_an_activated_virtual_env_over_a_project_venv() {
         let dir = tempfile::tempdir().unwrap();
@@ -424,6 +450,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn interpreter_ignores_a_stale_or_empty_virtual_env_and_walks_up() {
         let dir = tempfile::tempdir().unwrap();
@@ -440,5 +467,34 @@ mod tests {
                 root.join(".venv/bin/python")
             );
         }
+    }
+
+    // Windows mirrors of the layout-specific cases above: venvs live at
+    // `Scripts\python.exe` (not `bin/python`) and the PATH fallback is `python`
+    // (not `python3`). The precedence logic itself is platform-independent and is
+    // covered by the unix tests above.
+    #[cfg(windows)]
+    #[test]
+    fn interpreter_finds_windows_scripts_venv_in_an_ancestor() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join(".venv/Scripts")).unwrap();
+        std::fs::write(root.join(".venv/Scripts/python.exe"), "").unwrap();
+        let sub = root.join("packages/app/src");
+        std::fs::create_dir_all(&sub).unwrap();
+        assert_eq!(
+            PythonTool::interpreter_with(None, &sub),
+            root.join(".venv/Scripts/python.exe")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn interpreter_falls_back_to_path_python_without_any_venv() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            PythonTool::interpreter_with(None, dir.path()),
+            PathBuf::from("python")
+        );
     }
 }
