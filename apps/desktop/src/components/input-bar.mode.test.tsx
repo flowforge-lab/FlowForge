@@ -17,6 +17,7 @@ import { useChatStore } from "@/store/chat";
 import { useComposerStore } from "@/store/composer";
 import { usePrefsStore } from "@/store/prefs";
 import { useSessionModeStore } from "@/store/session-mode";
+import { useSessionWorkspaceStore } from "@/store/session-workspace";
 import type { Message } from "@/bindings";
 
 // Radix DropdownMenu calls these pointer/scroll APIs that jsdom doesn't implement.
@@ -135,5 +136,24 @@ describe("InputBar mode behavior (#344)", () => {
     expect(
       screen.queryByRole("button", { name: /switch to act & continue/i }),
     ).toBeNull();
+  });
+
+  it("renders the workspace bar as a distinct element from the composer toolbar (#606)", () => {
+    seed("act");
+    // Seed the workspace synchronously so the folder chip renders without
+    // waiting on the (mocked) async load.
+    useSessionWorkspaceStore.setState({
+      bySession: { [SID]: { path: "/home/me/flowforge", gitBranch: null } },
+      recents: ["/home/me/flowforge"],
+    });
+    render(<InputBar sessionId={SID} />);
+
+    const bar = screen.getByTestId("workspace-bar");
+    // The workspace chip lives in the bar… (getByText throws if absent).
+    within(bar).getByText("flowforge");
+    // …and the Send button does NOT — it stays in the composer card's toolbar.
+    const send = screen.getByRole("button", { name: /send/i });
+    expect(within(bar).queryByRole("button", { name: /send/i })).toBeNull();
+    expect(send.closest('[data-testid="workspace-bar"]')).toBeNull();
   });
 });
