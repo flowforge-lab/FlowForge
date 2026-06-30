@@ -21,11 +21,14 @@ export interface ServedWindow {
   source: ServedWindowSource;
 }
 
-// Compact token formatting for a context window: prefers a clean power-of-two "k"
-// (131072 -> "128k", 262144 -> "256k"), falls back to decimal-rounded "k"
-// (32000 -> "32k"), exact below 1k. Mirrors the compact style of context-gauge's
-// `formatTokens` but tuned for the round window sizes models actually advertise.
+// Compact token formatting for a context window. Round-decimal windows render as
+// decimal "k" (32000 -> "32k", 128000 -> "128k"); binary windows render as their
+// natural power-of-two "k" (131072 -> "128k", 262144 -> "256k"); anything else is
+// decimal-rounded, exact below 1k. Decimal is checked first so a decimal-advertised
+// 128000 reads "128k" rather than the binary "125k". Mirrors the compact style of
+// context-gauge's `formatTokens` but tuned for the round sizes models advertise.
 export function formatContextWindow(n: number): string {
+  if (n >= 1000 && n % 1000 === 0) return `${n / 1000}k`;
   if (n >= 1024 && n % 1024 === 0) return `${n / 1024}k`;
   if (n >= 1000) return `${Math.round(n / 1000)}k`;
   return String(n);
@@ -41,5 +44,9 @@ export function servedWindowSourceLabel(source: ServedWindowSource): string {
       return "From FLOWFORGE_OLLAMA_NUM_CTX";
     case "default":
       return "Window not detected — using conservative default";
+    default: {
+      const _exhaustive: never = source;
+      return _exhaustive;
+    }
   }
 }

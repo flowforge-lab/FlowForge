@@ -18,6 +18,11 @@ describe("formatContextWindow (#602)", () => {
     expect(formatContextWindow(200000)).toBe("200k");
     expect(formatContextWindow(512)).toBe("512");
   });
+
+  it("prefers the decimal form for round-decimal windows over the binary one", () => {
+    // 128000 % 1024 === 0 would render "125k" if binary were checked first.
+    expect(formatContextWindow(128000)).toBe("128k");
+  });
 });
 
 describe("ModelWindowInfo (#602)", () => {

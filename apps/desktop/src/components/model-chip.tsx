@@ -111,6 +111,7 @@ export function ModelChip({ sessionId }: { sessionId: string }) {
               flag it here rather than letting it pass silently. */}
           {servedWindow?.source === "default" ? (
             <span
+              role="img"
               className="size-1.5 shrink-0 rounded-full bg-amber-500"
               title="Context window not detected — using the conservative default. Set OLLAMA_CONTEXT_LENGTH or FLOWFORGE_OLLAMA_NUM_CTX."
               aria-label="Context window not detected — using the conservative default"
