@@ -105,16 +105,21 @@ impl OllamaProvider {
     /// hint, never a turn. `/api/ps` reports only *loaded* models, so before the
     /// first turn the source is `Default` until the model is resident.
     pub async fn served_window(&self, model: &str) -> ServedWindowProbe {
-        let trained = self
-            .probe_trained_window(model)
-            .await
+        let show = self.probe_show(model).await;
+        let trained = show
+            .as_ref()
+            .and_then(ShowResponse::trained_window)
             .or_else(|| Some(crate::model_context_window(model)));
+        // `None` when the probe failed (server down); the host then leaves the
+        // name-based gate untouched. `Some(false)` is a definitive "no vision".
+        let supports_vision = show.as_ref().map(ShowResponse::supports_vision);
         let ps_served = self.probe_loaded_window(model).await;
         let (window, source) = resolve_served_window(self.num_ctx, ps_served, trained);
         ServedWindowProbe {
             window: Some(window),
             trained,
             source: Some(source),
+            supports_vision,
         }
     }
 
@@ -135,9 +140,11 @@ impl OllamaProvider {
             .and_then(|m| m.context_length)
     }
 
-    /// `POST /api/show` -> the trained ceiling from `model_info.*.context_length`,
-    /// or `None` when the server is unreachable or the field is absent.
-    async fn probe_trained_window(&self, model: &str) -> Option<u64> {
+    /// `POST /api/show` -> the model's metadata (trained window + capability
+    /// tags), or `None` when the server is unreachable or returns an error.
+    /// One round-trip backs both the served-window probe and the vision-capability
+    /// lookup (#625).
+    async fn probe_show(&self, model: &str) -> Option<ShowResponse> {
         let resp = self
             .client
             .post(format!("{}/api/show", self.base_url))
@@ -146,12 +153,29 @@ impl OllamaProvider {
             .await
             .ok()?;
         let resp = crate::error_for_status_with_body(resp).await.ok()?;
-        let show: ShowResponse = resp.json().await.ok()?;
-        show.model_info
-            .iter()
-            .find(|(k, _)| k.ends_with(".context_length"))
-            .and_then(|(_, v)| v.as_u64())
+        resp.json().await.ok()
     }
+
+    /// Whether the Ollama daemon reports this model as vision-capable (#625).
+    /// `false` when the server is unreachable or the model has no vision
+    /// capability, so the caller ORs it with the name-based gate -- which is the
+    /// offline / probe-failure floor, never overridden downward by this probe.
+    pub async fn probe_supports_vision(&self, model: &str) -> bool {
+        self.probe_show(model)
+            .await
+            .map(|s| s.supports_vision())
+            .unwrap_or(false)
+    }
+}
+
+/// Whether any message in the turn carries an image attachment (#625). Used to
+/// skip the `/api/show` vision probe on text-only turns.
+fn messages_have_image(messages: &[ChatMessage]) -> bool {
+    messages.iter().any(|m| {
+        m.attachments
+            .iter()
+            .any(|a| a.kind == ff_core::AttachmentKind::Image)
+    })
 }
 
 impl Default for OllamaProvider {
@@ -183,6 +207,10 @@ pub struct ServedWindowProbe {
     pub trained: Option<u64>,
     /// Which input produced `window`.
     pub source: Option<ff_core::ContextWindowSource>,
+    /// Whether the Ollama daemon reports this model as vision-capable (#625),
+    /// or `None` when the probe could not run. The host ORs `Some(true)` onto the
+    /// name-based vision gate; `None`/`Some(false)` leave the gate as-is.
+    pub supports_vision: Option<bool>,
 }
 
 /// Resolve the effective served window and its source from the three inputs, in
@@ -236,6 +264,27 @@ struct PsEntry {
 struct ShowResponse {
     #[serde(default)]
     model_info: serde_json::Map<String, serde_json::Value>,
+    /// Capability tags the daemon reports for this model (e.g. `"vision"`,
+    /// `"tools"`, `"thinking"`) (#625). Absent on older Ollama builds, hence the
+    /// `default`.
+    #[serde(default)]
+    capabilities: Vec<String>,
+}
+
+impl ShowResponse {
+    /// Trained context ceiling: the architecture-prefixed `*.context_length`
+    /// entry in `model_info`, or `None` when the field is absent.
+    fn trained_window(&self) -> Option<u64> {
+        self.model_info
+            .iter()
+            .find(|(k, _)| k.ends_with(".context_length"))
+            .and_then(|(_, v)| v.as_u64())
+    }
+
+    /// Whether the daemon advertises image input for this model (#625).
+    fn supports_vision(&self) -> bool {
+        self.capabilities.iter().any(|c| c == "vision")
+    }
 }
 
 #[derive(Deserialize)]
@@ -428,8 +477,21 @@ impl Provider for OllamaProvider {
         // surviving documents are folded into the user message's `content` as
         // extracted text (#338 follow-up), since Ollama's wire has no document
         // block. The fold clones only when a message carries documents.
+        // Vision is a floor-OR-probe decision (#625): the name-based hint set via
+        // `with_vision` is the floor; when it says no *and* the turn actually
+        // carries an image, ask the daemon directly so a genuinely multimodal
+        // model (e.g. a qwen3-vl MoE) is not stripped by a stale name allow-list.
+        // The probe is skipped on text-only turns and when vision is already
+        // granted, so it adds no latency to the common path.
+        let supports_vision = if self.supports_vision {
+            true
+        } else if messages_have_image(&req.messages) {
+            self.probe_supports_vision(&req.model).await
+        } else {
+            false
+        };
         let stripped =
-            crate::messages_for_wire(&req.messages, self.supports_vision, self.supports_documents);
+            crate::messages_for_wire(&req.messages, supports_vision, self.supports_documents);
         let messages: Vec<ChatMessage> = if self.supports_documents {
             crate::extract::fold_documents_into_text(&stripped)
         } else {
@@ -1092,5 +1154,199 @@ mod tests {
             body["messages"][0].get("images").is_none(),
             "no images for a doc-only message"
         );
+    }
+
+    // ---- #625: dynamic Ollama vision-capability detection via /api/show ----
+
+    #[test]
+    fn show_response_parses_capabilities_and_derives_vision() {
+        let show: ShowResponse = serde_json::from_str(
+            r#"{"model_info":{"qwen35moe.context_length":262144},
+                "capabilities":["completion","vision","tools","thinking"]}"#,
+        )
+        .unwrap();
+        assert_eq!(show.trained_window(), Some(262_144));
+        assert!(show.supports_vision());
+
+        // Text-only model: no vision tag, and older builds omit capabilities.
+        let text: ShowResponse =
+            serde_json::from_str(r#"{"model_info":{"llama.context_length":131072}}"#).unwrap();
+        assert_eq!(text.trained_window(), Some(131_072));
+        assert!(!text.supports_vision());
+    }
+
+    #[test]
+    fn messages_have_image_only_when_an_image_is_attached() {
+        let text = vec![ChatMessage::text("user", "hi")];
+        assert!(!messages_have_image(&text));
+
+        let doc = vec![ChatMessage::multimodal(
+            "user",
+            "read",
+            vec![Attachment {
+                kind: AttachmentKind::Document,
+                media_type: "application/pdf".into(),
+                source: AttachmentSource::Inline(inline_b64(b"%PDF")),
+                name: None,
+                bytes: 4,
+            }],
+        )];
+        assert!(!messages_have_image(&doc));
+
+        let img = vec![ChatMessage::multimodal(
+            "user",
+            "look",
+            vec![image(
+                "image/png",
+                AttachmentSource::Inline(inline_b64(&PNG)),
+            )],
+        )];
+        assert!(messages_have_image(&img));
+    }
+
+    fn image_req(model: &str) -> ChatRequest {
+        ChatRequest {
+            model: model.into(),
+            messages: vec![ChatMessage::multimodal(
+                "user",
+                "look",
+                vec![image(
+                    "image/png",
+                    AttachmentSource::Inline(inline_b64(&PNG)),
+                )],
+            )],
+            tools: Vec::new(),
+            thinking: false,
+            max_tokens: None,
+        }
+    }
+
+    async fn mount_show(server: &wiremock::MockServer, capabilities: &str) {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        Mock::given(method("POST"))
+            .and(path("/api/show"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+                "{{\"model_info\":{{\"qwen35moe.context_length\":262144}},\"capabilities\":{capabilities}}}"
+            )))
+            .mount(server)
+            .await;
+    }
+
+    async fn mount_chat(server: &wiremock::MockServer) {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string("{\"message\":{\"content\":\"\"},\"done\":true}\n"),
+            )
+            .mount(server)
+            .await;
+    }
+
+    /// A model built `with_vision(false)` still sends the image when the daemon
+    /// reports `vision` -- the name-based gate is only a floor (#625).
+    #[tokio::test]
+    async fn chat_stream_keeps_image_when_daemon_reports_vision() {
+        let server = wiremock::MockServer::start().await;
+        mount_show(&server, r#"["completion","vision"]"#).await;
+        mount_chat(&server).await;
+
+        let provider = OllamaProvider::new(server.uri()).with_vision(false);
+        let mut stream = provider
+            .chat_stream(image_req("qwen3.6:35b-a3b"))
+            .await
+            .unwrap();
+        while stream.next().await.is_some() {}
+
+        let reqs = server.received_requests().await.unwrap();
+        let chat = reqs
+            .iter()
+            .find(|r| r.url.path() == "/api/chat")
+            .expect("a /api/chat request");
+        let body: serde_json::Value = serde_json::from_slice(&chat.body).unwrap();
+        let images = body["messages"][0]["images"]
+            .as_array()
+            .expect("image survived the probe-granted vision");
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].as_str().unwrap(), inline_b64(&PNG));
+    }
+
+    /// When the daemon reports no `vision` capability and the name-based gate is
+    /// off, the image is stripped before the wire (#625, fail-closed preserved).
+    #[tokio::test]
+    async fn chat_stream_strips_image_when_daemon_reports_no_vision() {
+        let server = wiremock::MockServer::start().await;
+        mount_show(&server, r#"["completion","tools"]"#).await;
+        mount_chat(&server).await;
+
+        let provider = OllamaProvider::new(server.uri()).with_vision(false);
+        let mut stream = provider.chat_stream(image_req("qwen3:4b")).await.unwrap();
+        while stream.next().await.is_some() {}
+
+        let reqs = server.received_requests().await.unwrap();
+        let chat = reqs
+            .iter()
+            .find(|r| r.url.path() == "/api/chat")
+            .expect("a /api/chat request");
+        let body: serde_json::Value = serde_json::from_slice(&chat.body).unwrap();
+        assert!(
+            body["messages"][0].get("images").is_none(),
+            "no-vision model must drop the image"
+        );
+    }
+
+    /// A text-only turn never probes `/api/show` -- the probe is gated on an image
+    /// being present, so the common path adds no latency (#625).
+    #[tokio::test]
+    async fn chat_stream_does_not_probe_show_on_text_only_turn() {
+        let server = wiremock::MockServer::start().await;
+        mount_chat(&server).await; // intentionally no /api/show mock
+
+        let provider = OllamaProvider::new(server.uri()).with_vision(false);
+        let mut req = req("qwen3:4b");
+        req.messages = vec![ChatMessage::text("user", "hi")];
+        let mut stream = provider.chat_stream(req).await.unwrap();
+        while stream.next().await.is_some() {}
+
+        let reqs = server.received_requests().await.unwrap();
+        assert!(
+            reqs.iter().all(|r| r.url.path() != "/api/show"),
+            "no capability probe on a text-only turn"
+        );
+    }
+
+    /// The probe is also skipped when vision is already granted by name -- no
+    /// redundant `/api/show` round-trip (#625).
+    #[tokio::test]
+    async fn chat_stream_does_not_probe_show_when_vision_already_on() {
+        let server = wiremock::MockServer::start().await;
+        mount_chat(&server).await; // no /api/show mock
+
+        let provider = OllamaProvider::new(server.uri()).with_vision(true);
+        let mut stream = provider.chat_stream(image_req("llava:7b")).await.unwrap();
+        while stream.next().await.is_some() {}
+
+        let reqs = server.received_requests().await.unwrap();
+        assert!(
+            reqs.iter().all(|r| r.url.path() != "/api/show"),
+            "name-based vision short-circuits the probe"
+        );
+    }
+
+    /// `served_window` folds the daemon's vision capability into the probe so the
+    /// host can correct the name-based gate for the UI attach gate (#625).
+    #[tokio::test]
+    async fn served_window_probe_reports_vision_capability() {
+        let server = wiremock::MockServer::start().await;
+        mount_show(&server, r#"["completion","vision","tools"]"#).await;
+
+        let probe = OllamaProvider::new(server.uri())
+            .served_window("qwen3.6:35b-a3b")
+            .await;
+        assert_eq!(probe.supports_vision, Some(true));
+        assert_eq!(probe.trained, Some(262_144));
     }
 }
