@@ -11,7 +11,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use ff_core::{Message, Mode, ReasoningVisibility, Role};
+use ff_core::{AttachmentKind, Message, Mode, ReasoningVisibility, Role};
 use ff_llm::{ChatMessage, ChatRequest, FunctionCall, LlmError, Provider, ToolCall as LlmToolCall};
 use ff_session::SessionStore;
 use ff_tools::{Safety, ToolRegistry, COMPACTION_RETRIEVE_TOOL};
@@ -255,9 +255,14 @@ pub enum AgentEvent {
         writes: u32,
     },
     /// One or more attachments on the user's turn were dropped before the request
-    /// because the active model lacks vision (#338). The per-provider capability
-    /// strip is otherwise silent; this turns the drop into a visible notice. Emitted
-    /// once per turn (first iteration only), keyed to that turn's assistant message.
+    /// because the active model can't carry their kind (#338). The per-provider
+    /// capability strip is otherwise silent; this turns the drop into a visible
+    /// notice. Emitted once per turn (first iteration only), keyed to that turn's
+    /// assistant message. As of the #338 follow-up documents are universally
+    /// supported (Bedrock `DocumentBlock` + OpenAI/Ollama extraction fallback), so
+    /// in the host path the only kind that can drop is images — a non-vision
+    /// model. The agent logic stays general (counts per unsupported kind) so a
+    /// future provider that drops documents needs no change here.
     AttachmentsDropped {
         message_id: String,
         count: u32,
@@ -967,20 +972,33 @@ pub async fn run_turn(
             });
         }
 
-        // Graceful-degradation notice (#338): when the active model can't see images,
-        // the per-provider capability strip silently drops attachments before they
-        // reach the wire. Surface that once per turn so the drop isn't invisible.
-        // Count the attachments on the turn's triggering user message (the last user
-        // message in history); gating on the first iteration avoids re-notifying on
-        // each tool-loop iteration, and counting only the last user message avoids
-        // re-firing on later turns whose own input carries nothing.
-        if iter == 0 && !provider.supports_vision() {
+        // Graceful-degradation notice (#338): when the active model can't carry an
+        // attachment kind, the per-provider capability strip silently drops it
+        // before it reaches the wire. Surface that once per turn so the drop isn't
+        // invisible. Count only the attachments the model truly can't handle —
+        // images when `!supports_vision`, documents when `!supports_documents` —
+        // so the text-extraction fallback (#338 follow-up) doesn't false-fire a
+        // "dropped" notice for a document the model actually received as text.
+        // Counted on the turn's triggering user message (the last user message in
+        // history); first-iteration gating avoids re-notifying on each tool-loop
+        // iteration, and last-message scoping avoids re-firing on later turns
+        // whose own input carries nothing.
+        let supports_vision = provider.supports_vision();
+        let supports_documents = provider.supports_documents();
+        if iter == 0 && (!supports_vision || !supports_documents) {
             let dropped = history
                 .iter()
                 .rev()
                 .find(|m| m.role == Role::User)
                 .and_then(|m| m.attachments.as_ref())
-                .map_or(0, |a| a.len());
+                .map_or(0, |atts| {
+                    atts.iter()
+                        .filter(|a| match a.kind {
+                            AttachmentKind::Image => !supports_vision,
+                            AttachmentKind::Document => !supports_documents,
+                        })
+                        .count()
+                });
             if let Ok(count) = u32::try_from(dropped) {
                 if count > 0 {
                     on_event(AgentEvent::AttachmentsDropped {

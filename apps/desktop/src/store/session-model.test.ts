@@ -7,12 +7,13 @@ import { useSessionModelStore } from "@/store/session-model";
 // they also exercise the three new mock commands + the §11.2 resolver mirror.
 // The mock's global default is the active connection candle-vLLM + its model.
 // Caps are derived from the resolved (kind, model) (§11.3): candle-vLLM/Qwen is
-// text-only, so both are false.
+// text-only for vision, but documents are universal as of the #338 follow-up
+// (extraction fallback), so supportsDocuments is true even on a text-only model.
 const GLOBAL_DEFAULT = {
   connection: "candle-vllm",
   model: "Qwen3-4B-Instruct-2507",
   supportsVision: false,
-  supportsDocuments: false,
+  supportsDocuments: true,
   // Mock has no live Ollama; the served-window contract (#602) carries nulls.
   contextWindow: null,
   trainedContextWindow: null,
@@ -32,7 +33,7 @@ afterEach(async () => {
   vi.restoreAllMocks();
   // The MockIpc is a singleton — drop any overrides these tests set so they
   // don't bleed into the next case.
-  for (const sid of ["s-load", "s-set", "s-clear"]) {
+  for (const sid of ["s-load", "s-set", "s-clear", "s-anchor"]) {
     await ipc.setSessionModelSelection(sid, null);
   }
 });
@@ -50,11 +51,12 @@ describe("session-model store (#499)", () => {
     await useSessionModelStore.getState().set("s-set", sel);
     const s = useSessionModelStore.getState();
     expect(s.overrideBySession["s-set"]).toEqual(sel);
-    // resolved folds in the derived caps (§11.3); ollama/qwen2.5 is text-only.
+    // resolved folds in the derived caps (§11.3); ollama/qwen2.5 is text-only
+    // for vision, but documents are universal (extraction fallback, #338).
     expect(s.resolvedBySession["s-set"]).toEqual({
       ...sel,
       supportsVision: false,
-      supportsDocuments: false,
+      supportsDocuments: true,
       contextWindow: null,
       trainedContextWindow: null,
       contextWindowSource: null,
@@ -117,12 +119,13 @@ describe("session-model store (#499)", () => {
     await useSessionModelStore.getState().load(session.id);
     const s = useSessionModelStore.getState();
     expect(s.overrideBySession[session.id]).toBeNull();
-    // openai/gpt-4o is vision-capable → derived supportsVision (§11.3).
+    // openai/gpt-4o is vision-capable → derived supportsVision (§11.3);
+    // documents are universal (extraction fallback, #338).
     expect(s.resolvedBySession[session.id]).toEqual({
       connection: "openai",
       model: "gpt-4o",
       supportsVision: true,
-      supportsDocuments: false,
+      supportsDocuments: true,
       contextWindow: null,
       trainedContextWindow: null,
       contextWindowSource: null,
@@ -162,5 +165,21 @@ describe("session-model store (#499)", () => {
     expect(
       useSessionModelStore.getState().servedWindowBySession["s-load"],
     ).toBeUndefined();
+  });
+
+  it("supportsDocuments is true for a non-Bedrock kind (regression anchor, #338 follow-up)", async () => {
+    // Before the #338 follow-up, `model_supports_documents` was Bedrock-only,
+    // so every non-Bedrock kind reported supportsDocuments === false and the
+    // composer gated document attachments. The text-extraction fallback made
+    // documents universal; this anchor pins that guarantee so a future
+    // per-model narrowing — or a silent revert to Bedrock-only — can't drop it
+    // without failing here. (Vision still varies, so it is NOT asserted here:
+    // the point is the document universality, not the vision cap.)
+    await useSessionModelStore.getState().load("s-anchor");
+    const resolved =
+      useSessionModelStore.getState().resolvedBySession["s-anchor"];
+    expect(resolved).toBeDefined();
+    expect(resolved.connection).toBe("candle-vllm"); // a non-Bedrock kind
+    expect(resolved.supportsDocuments).toBe(true);
   });
 });

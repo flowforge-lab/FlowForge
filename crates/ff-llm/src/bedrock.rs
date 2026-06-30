@@ -351,6 +351,10 @@ impl Provider for BedrockProvider {
         self.supports_vision
     }
 
+    fn supports_documents(&self) -> bool {
+        self.supports_documents
+    }
+
     async fn chat_stream(&self, req: ChatRequest) -> Result<ChunkStream, LlmError> {
         let wire =
             crate::messages_for_wire(&req.messages, self.supports_vision, self.supports_documents);
