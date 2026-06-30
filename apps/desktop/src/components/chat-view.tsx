@@ -8,7 +8,10 @@ import { OutputBlock } from "@/components/output-block";
 import { StepGroup } from "@/components/step-group";
 import { ThinkingBlock } from "@/components/thinking-block";
 import { Markdown } from "@/components/markdown";
-import { MessageActions } from "@/components/message-actions";
+import {
+  MessageActions,
+  ResponseCopyButton,
+} from "@/components/message-actions";
 import { MessageAttachments } from "@/components/message-attachments";
 import { ThinkingIndicator } from "@/components/thinking-indicator";
 import { ContinueAffordance } from "@/components/continue-affordance";
@@ -192,7 +195,13 @@ function MessageRowImpl({
           >
             <Markdown content={message.content} streaming={streaming} />
           </div>
-          <MessageActions message={message} side="right" />
+          {/* Always-visible copy affordance under the response (#604). Hidden
+              mid-stream — copying a half-streamed answer is wrong. */}
+          {!streaming && (
+            <div className="mt-1 flex items-center px-0.5">
+              <ResponseCopyButton text={message.content} />
+            </div>
+          )}
         </div>
       )}
     </div>
