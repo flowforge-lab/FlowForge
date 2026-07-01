@@ -18,6 +18,17 @@ interface ScheduledState {
   /** Latest fired-run session id per task id, from `runNow` + `scheduled:fired`.
    *  Backs the ↗ open-session jump; a task absent here has no known session yet. */
   runsByTask: Record<string, string>;
+  /** Full fire history per task id (newest first), lazily loaded when a row's
+   *  history panel is opened (#544). Absent until `loadRuns` runs for that task. */
+  historyByTask: Record<string, RunRecord[]>;
+  /** Task ids whose history is currently being fetched. Per-task (not a single
+   *  slot) so two concurrently-open panels have independent spinners and one's
+   *  completion can't clear another's. */
+  loadingRunsIds: Set<string>;
+  /** The global pause-all kill-switch (RFC 0017 §8.3). When engaged the backend
+   *  fires nothing — including manual `runNow`. Tracked in-session: the command
+   *  surface exposes a setter but no getter, so this defaults to off on load. */
+  pausedAll: boolean;
   /** The task id currently mid `runNow` (drives the row's run-now spinner), or null. */
   runningId: string | null;
 
@@ -29,6 +40,12 @@ interface ScheduledState {
   /** Fire a task out of band; caches the run's session for the ↗ jump. The
    *  `scheduled:fired` / `scheduled:changed` events finalize the row state. */
   runNow: (id: string) => Promise<void>;
+  /** Load a task's fire history (newest first) into `historyByTask` for its
+   *  run-history panel. Re-runnable to refresh. */
+  loadRuns: (id: string) => Promise<void>;
+  /** Engage/release the global pause-all kill-switch. Optimistic, reverting on
+   *  failure; the resolved state is authoritative. */
+  setPausedAll: (paused: boolean) => Promise<void>;
   /** A `scheduled:fired` event: cache the run's session and optimistically stamp
    *  `lastRun` until the `scheduled:changed` snapshot lands. */
   applyFired: (run: RunRecord) => void;
@@ -49,6 +66,9 @@ export const useScheduledStore = create<ScheduledState>((set, get) => ({
   saving: false,
   error: null,
   runsByTask: {},
+  historyByTask: {},
+  loadingRunsIds: new Set(),
+  pausedAll: false,
   runningId: null,
 
   load: async () => {
@@ -127,11 +147,65 @@ export const useScheduledStore = create<ScheduledState>((set, get) => ({
     }
   },
 
+  loadRuns: async (id) => {
+    // A fetch for this task is already in flight — skip so a quick collapse/
+    // re-expand can't leave two `loadRuns(id)` racing to overwrite each other.
+    if (get().loadingRunsIds.has(id)) return;
+    set((s) => ({
+      loadingRunsIds: new Set(s.loadingRunsIds).add(id),
+      error: null,
+    }));
+    try {
+      const runs = await ipc.listScheduledRuns(id);
+      set((s) => {
+        const loadingRunsIds = new Set(s.loadingRunsIds);
+        loadingRunsIds.delete(id);
+        return {
+          historyByTask: { ...s.historyByTask, [id]: runs },
+          loadingRunsIds,
+        };
+      });
+    } catch (err) {
+      set((s) => {
+        const loadingRunsIds = new Set(s.loadingRunsIds);
+        loadingRunsIds.delete(id);
+        return {
+          loadingRunsIds,
+          error: err instanceof Error ? err.message : String(err),
+        };
+      });
+    }
+  },
+
+  setPausedAll: async (paused) => {
+    // Optimistic flip so the switch responds immediately; revert on failure.
+    const previous = get().pausedAll;
+    set({ pausedAll: paused, error: null });
+    try {
+      const next = await ipc.setScheduledPausedAll(paused);
+      set({ pausedAll: next });
+    } catch (err) {
+      set({
+        pausedAll: previous,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  },
+
   applyFired: (run) => {
     set((s) => ({
       runsByTask: run.sessionId
         ? { ...s.runsByTask, [run.taskId]: run.sessionId }
         : s.runsByTask,
+      // Prepend the fresh run to an already-open history panel so it live-updates;
+      // a panel that hasn't been opened stays absent and loads on demand.
+      historyByTask:
+        run.taskId in s.historyByTask
+          ? {
+              ...s.historyByTask,
+              [run.taskId]: [run, ...s.historyByTask[run.taskId]],
+            }
+          : s.historyByTask,
       // Optimistic stamp; the `scheduled:changed` snapshot is the source of truth.
       tasks: s.tasks.map((t) =>
         t.id === run.taskId ? { ...t, lastRun: run.firedMs } : t,

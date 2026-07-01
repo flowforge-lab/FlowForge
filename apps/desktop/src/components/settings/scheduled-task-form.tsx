@@ -113,6 +113,7 @@ export function ScheduledTaskForm({
   const [workspace, setWorkspace] = useState(task?.workspace ?? "");
   const [profile, setProfile] = useState(task?.profile ?? INHERIT);
   const [allowWrite, setAllowWrite] = useState(task?.safetyCeiling === "write");
+  const [catchUp, setCatchUp] = useState(task?.catchUp ?? false);
   const [schedule, setSchedule] = useState<ScheduleBuilderState>(
     task ? cronToBuilder(task.cron) : DEFAULT_BUILDER_STATE,
   );
@@ -178,6 +179,7 @@ export function ScheduledTaskForm({
       workspace: workspace.trim() || undefined,
       profile: profile === INHERIT ? undefined : profile,
       safetyCeiling: allowWrite ? "write" : "read_only",
+      catchUp,
     };
     if (isEdit) await edit(task.id, input);
     else await create(input);
@@ -301,6 +303,13 @@ export function ScheduledTaskForm({
         description="Lets a run write to disk. Off keeps runs read-only."
         checked={allowWrite}
         onCheckedChange={setAllowWrite}
+      />
+
+      <SettingsSwitch
+        label="Catch up on missed runs"
+        description="If a scheduled time passes while the app is closed, run once on next launch. Off skips missed runs."
+        checked={catchUp}
+        onCheckedChange={setCatchUp}
       />
 
       <div className="flex items-center justify-end gap-1.5 pt-0.5">
