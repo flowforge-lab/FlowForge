@@ -35,7 +35,7 @@ cd "$REPO_ROOT/apps/desktop"
 pnpm install --frozen-lockfile
 pnpm tauri build --bundles app \
   --config src-tauri/tauri.bundle.conf.json \
-  --config '{"bundle":{"createUpdaterArtifacts":false}}'
+  --config src-tauri/tauri.no-updater-sign.conf.json
 
 BUILT_APP="$BUNDLE_DIR/$APP_NAME"
 if [[ ! -d "$BUILT_APP" ]]; then
