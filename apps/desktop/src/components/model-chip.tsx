@@ -9,6 +9,7 @@ import {
   DropdownMenuTrigger,
   DropdownMenuContent,
   DropdownMenuItem,
+  DropdownMenuCheckboxItem,
   DropdownMenuSub,
   DropdownMenuSubTrigger,
   DropdownMenuSubContent,
@@ -139,10 +140,18 @@ export function ModelChip({ sessionId }: { sessionId: string }) {
         {/* Inline "Thinking" toggle for local models (#633) — surfaces the existing
             per-connection reasoning switch (also in Settings → Model) right where the
             model is picked, so the speed↔reasoning tradeoff on CPU is one click away.
-            `onSelect`-preventDefault keeps the menu open; the Switch owns the change. */}
+            A `CheckboxItem` (not a Switch nested in a plain Item) keeps the row
+            keyboard-operable inside the menu — Enter/Space toggles it, arrow keys reach
+            it — and exposes `menuitemcheckbox` / `aria-checked` to assistive tech.
+            `onSelect`-preventDefault keeps the menu open; the Switch is a presentational
+            mirror of the checked state (aria-hidden, non-interactive). */}
         {resolvedConn && isLocalKind(resolvedConn.kind) ? (
           <>
-            <DropdownMenuItem
+            <DropdownMenuCheckboxItem
+              aria-label="Thinking"
+              checked={resolvedConn.thinking}
+              disabled={saving}
+              onCheckedChange={(v) => void setThinking(resolvedConn.id, v)}
               onSelect={(e) => e.preventDefault()}
               className="flex items-start justify-between gap-3"
             >
@@ -155,12 +164,12 @@ export function ModelChip({ sessionId }: { sessionId: string }) {
                 </span>
               </span>
               <Switch
-                aria-label="Thinking"
+                aria-hidden
+                tabIndex={-1}
                 checked={resolvedConn.thinking}
-                disabled={saving}
-                onCheckedChange={(v) => void setThinking(resolvedConn.id, v)}
+                className="pointer-events-none"
               />
-            </DropdownMenuItem>
+            </DropdownMenuCheckboxItem>
             <DropdownMenuSeparator />
           </>
         ) : null}
