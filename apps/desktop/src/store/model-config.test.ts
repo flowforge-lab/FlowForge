@@ -234,6 +234,28 @@ describe("model-config registry (mock IPC)", () => {
     ).toBe("high");
   });
 
+  it("adds a fresh Ollama connection with reasoning off for local speed", async () => {
+    const { load, addConnection } = useModelConfigStore.getState();
+    await load();
+    const id = await addConnection("ollama");
+    const added = useModelConfigStore
+      .getState()
+      .registry?.connections.find((c) => c.id === id);
+    expect(added?.kind).toBe("ollama");
+    expect(added?.thinking).toBe(false);
+  });
+
+  it("adds a fresh candle-vLLM connection with reasoning left on", async () => {
+    // The local-speed default is scoped to Ollama; other kinds are unchanged.
+    const { load, addConnection } = useModelConfigStore.getState();
+    await load();
+    const id = await addConnection("candleVllm");
+    const added = useModelConfigStore
+      .getState()
+      .registry?.connections.find((c) => c.id === id);
+    expect(added?.thinking).toBe(true);
+  });
+
   it("picking a default model also activates that connection", async () => {
     const { load, setDefaultModel } = useModelConfigStore.getState();
     await load();

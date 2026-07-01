@@ -61,7 +61,13 @@ function defaultConnection(kind: ProviderKind): ProviderConnection {
         authMode: "auto",
       };
     case "ollama":
-      return { ...base, displayName: "Ollama" };
+      // Ollama runs locally, often CPU-only, where an always-on reasoning
+      // stream is the single biggest latency cost: a hybrid-thinking model
+      // spends dozens of tokens "thinking" before every answer, measured at
+      // ~9x slower for identical output on CPU. Default reasoning OFF so a
+      // fresh local connection is fast out of the box; the user can turn it
+      // back on per-connection (Settings > Model > Thinking) for hard tasks.
+      return { ...base, displayName: "Ollama", thinking: false };
     case "candleVllm":
       return { ...base, displayName: "candle-vLLM" };
     case "openai":

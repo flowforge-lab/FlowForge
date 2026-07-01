@@ -1156,8 +1156,7 @@ mod tests {
 
         // Explicit builder value so the assertion is independent of the ambient
         // FLOWFORGE_OLLAMA_KEEP_ALIVE env / process default.
-        let provider =
-            OllamaProvider::new(server.uri()).with_keep_alive(Some("30m".to_string()));
+        let provider = OllamaProvider::new(server.uri()).with_keep_alive(Some("30m".to_string()));
         let mut stream = provider.chat_stream(req("qwen3.6:35b-a3b")).await.unwrap();
         while stream.next().await.is_some() {}
 

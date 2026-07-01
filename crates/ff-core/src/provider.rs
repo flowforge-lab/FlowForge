@@ -596,7 +596,13 @@ impl Default for ProviderRegistry {
             model: "llama3.2".to_string(),
             has_key: false,
             secret_missing: false,
-            thinking: true,
+            // Local Ollama is frequently CPU-only, where an always-on reasoning
+            // stream is the dominant latency cost (~9x slower for identical
+            // output on a hybrid-thinking model). Seed reasoning OFF so the
+            // out-of-the-box local connection is fast; the user can enable it
+            // per-connection for hard tasks. Mirrors the frontend
+            // `defaultConnection("ollama")` default.
+            thinking: false,
             reasoning_effort: ReasoningEffort::default(),
             reasoning_visibility: ReasoningVisibility::default(),
             region: None,
@@ -688,6 +694,29 @@ mod tests {
             .connections
             .iter()
             .any(|c| c.kind == ProviderKind::Ollama));
+    }
+
+    #[test]
+    fn default_ollama_seed_starts_with_thinking_off_for_local_speed() {
+        // Local Ollama is often CPU-only where always-on reasoning is the
+        // dominant latency cost, so the out-of-the-box connection seeds
+        // reasoning OFF. candle-vLLM (and every other kind) is unaffected.
+        let reg = ProviderRegistry::default();
+        let ollama = reg
+            .connections
+            .iter()
+            .find(|c| c.kind == ProviderKind::Ollama)
+            .expect("ollama seeded");
+        assert!(
+            !ollama.thinking,
+            "fresh Ollama connection defaults thinking off"
+        );
+        let candle = reg
+            .connections
+            .iter()
+            .find(|c| c.kind == ProviderKind::CandleVllm)
+            .expect("candle seeded");
+        assert!(candle.thinking, "candle-vLLM default is unchanged");
     }
 
     fn blank_conn(display: &str, vendor: Option<&str>, kind: ProviderKind) -> ProviderConnection {
