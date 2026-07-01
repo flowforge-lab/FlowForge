@@ -1315,6 +1315,8 @@ fn set_provider_config(
         // This legacy shim has no effort control; preserve the persisted dial.
         reasoning_effort: current.reasoning_effort,
         reasoning_visibility: current.reasoning_visibility,
+        // No warmup control on this shim either; preserve the persisted value.
+        warmup_enabled: current.warmup_enabled,
     };
     state.set_provider_config(config.clone());
     config
@@ -1447,11 +1449,26 @@ async fn test_connection(state: State<'_, Arc<AppState>>, id: Option<String>) ->
 /// the user's first message. The composer fires this (debounced) when it gains
 /// focus. Fully best-effort: any failure (server down, busy) is swallowed so
 /// warmup never blocks the UI or surfaces an error.
+///
+/// Gated to local kinds with warmup enabled (#61): warming a *hosted* endpoint
+/// would fire a billed request on every composer focus, and a user who disabled
+/// warmup (e.g. on laptop battery) must not pay for it. The frontend also gates
+/// the nudge, so this is defense in depth.
 #[tauri::command]
 async fn warmup(state: State<'_, Arc<AppState>>) -> CmdResult<()> {
+    let cfg = state.provider_config();
+    if !should_warmup(cfg.kind, cfg.warmup_enabled) {
+        return Ok(());
+    }
     let (provider, model) = state.build_provider();
     let _ = provider.warmup(&model).await;
     Ok(())
+}
+
+/// Whether the composer warmup nudge should fire for a connection: only for
+/// local backends (#61) with warmup enabled. Pure so it is unit-testable.
+fn should_warmup(kind: ProviderKind, warmup_enabled: bool) -> bool {
+    kind.is_local() && warmup_enabled
 }
 
 /// Install a skill from a path / git URL / raw-Markdown URL. The bundle is fetched
@@ -2418,11 +2435,23 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::{
-        git_branch, list_local_branches, mode_auto_approves, resolve_workspace_dir, switch_branch,
-        TurnMetrics, UpdateStatus,
+        git_branch, list_local_branches, mode_auto_approves, resolve_workspace_dir, should_warmup,
+        switch_branch, TurnMetrics, UpdateStatus,
     };
-    use ff_core::Mode;
+    use ff_core::{Mode, ProviderKind};
     use ff_tools::Safety;
+
+    #[test]
+    fn should_warmup_only_for_local_kinds_with_warmup_enabled() {
+        assert!(should_warmup(ProviderKind::CandleVllm, true));
+        assert!(should_warmup(ProviderKind::Ollama, true));
+        // Disabled by the user -> no warmup even on a local kind.
+        assert!(!should_warmup(ProviderKind::Ollama, false));
+        // Hosted kinds never warm (would fire a billed request).
+        assert!(!should_warmup(ProviderKind::OpenAi, true));
+        assert!(!should_warmup(ProviderKind::Bedrock, true));
+        assert!(!should_warmup(ProviderKind::SiliconFlow, true));
+    }
 
     // `UpdateStatus` has no ts-rs binding -- it is cast on the FE side from the JSON
     // this serializes to (`lib/about.ts`). Pin the wire shape so the hand-written FE

@@ -16,6 +16,7 @@ import {
   SUMMARY_THRESHOLD_MIN,
   activeConnection,
   reasoningToggleNoOp,
+  isLocalKind,
   useModelConfigStore,
   type Effort,
 } from "@/store/model-config";
@@ -58,6 +59,7 @@ export function ModelSection() {
   const load = useModelConfigStore((s) => s.load);
   const addConnection = useModelConfigStore((s) => s.addConnection);
   const setThinking = useModelConfigStore((s) => s.setThinking);
+  const setWarmupEnabled = useModelConfigStore((s) => s.setWarmupEnabled);
 
   const summarizationThreshold = useModelConfigStore(
     (s) => s.summarizationThreshold,
@@ -90,6 +92,9 @@ export function ModelSection() {
   const reasoningToggleNoEffect = active
     ? reasoningToggleNoOp(active.kind)
     : false;
+  // Warmup only helps local backends (#61); hide the control for hosted kinds.
+  const warmupIsLocal = active ? isLocalKind(active.kind) : false;
+  const warmupEnabled = active?.warmupEnabled ?? true;
   const present = new Set(registry?.connections.map((c) => c.kind) ?? []);
   const addable = ADDABLE.filter((a) => !present.has(a.kind));
 
@@ -163,6 +168,18 @@ export function ModelSection() {
             if (active) void setThinking(active.id, v);
           }}
         />
+
+        {warmupIsLocal ? (
+          <SettingsSwitch
+            label="Warmup"
+            description="Nudge the local model while you type so the first token streams instantly. Turn off to avoid sustained GPU use (e.g. on laptop battery)."
+            checked={warmupEnabled}
+            disabled={!active || saving}
+            onCheckedChange={(v) => {
+              if (active) void setWarmupEnabled(active.id, v);
+            }}
+          />
+        ) : null}
 
         <div className="space-y-2">
           <h3 className="text-[13px] font-medium text-foreground">Effort</h3>

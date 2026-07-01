@@ -60,6 +60,14 @@ reasoningEffort: ReasoningEffort,
  */
 reasoningVisibility: ReasoningVisibility, 
 /**
+ * Whether the composer warmup nudge (#61) fires for this connection. Default
+ * `true` (no regression). Only meaningful for local kinds; the warmup command
+ * also gates on [`ProviderKind::is_local`]. Users disable it to avoid sustained
+ * GPU use (e.g. on laptop battery). `#[serde(default = "default_warmup_enabled")]`
+ * keeps pre-#61 registries loading as `true`.
+ */
+warmupEnabled: boolean, 
+/**
  * AWS region for a Bedrock connection (e.g. `"us-east-1"`); the provider
  * derives `bedrock-runtime.<region>.amazonaws.com` from it. `None` for
  * non-Bedrock kinds.

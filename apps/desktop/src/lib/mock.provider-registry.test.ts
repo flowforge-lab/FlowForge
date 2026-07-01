@@ -13,6 +13,7 @@ const conn = (over: Partial<ProviderConnection> = {}): ProviderConnection => ({
   thinking: true,
   reasoningEffort: "medium",
   reasoningVisibility: "all",
+  warmupEnabled: true,
   ...over,
 });
 

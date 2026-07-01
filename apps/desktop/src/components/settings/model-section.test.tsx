@@ -223,6 +223,35 @@ describe("ModelSection provider accordion", () => {
     ).not.toBeNull();
   });
 
+  it("shows the Warmup switch for local kinds and toggles it, hides it for hosted (#61)", async () => {
+    await renderSection();
+    // The MockIpc singleton persists edits across tests, so pin a known start:
+    // a local connection with warmup enabled.
+    await act(async () => {
+      await useModelConfigStore
+        .getState()
+        .setWarmupEnabled("candle-vllm", true);
+      await useModelConfigStore.getState().setActiveConnection("candle-vllm");
+      await flush();
+    });
+    const warmup = container.querySelector(
+      'button[aria-label="Warmup"]',
+    ) as HTMLButtonElement | null;
+    expect(warmup).not.toBeNull();
+
+    await click(warmup!);
+    expect(
+      activeConnection(useModelConfigStore.getState().registry)?.warmupEnabled,
+    ).toBe(false);
+
+    // Hosted kinds have no warmup nudge -> the control is not rendered.
+    await act(async () => {
+      await useModelConfigStore.getState().setActiveConnection("openai");
+      await flush();
+    });
+    expect(container.querySelector('button[aria-label="Warmup"]')).toBeNull();
+  });
+
   // The module-level MockIpc singleton persists the active pointer and connection
   // edits across tests, so each effort test establishes its own starting state
   // rather than relying on the seed defaults.
