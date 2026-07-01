@@ -851,10 +851,10 @@ function WorkspaceSelector({ sessionId }: { sessionId: string }) {
         if (!next) setFilter("");
       }}
     >
-      {/* Two chips — workspace (folder) and git branch — open the same popover
-          (#606). Only the folder chip is the Radix Trigger so a single
-          `triggerRef` owns focus return on close; the branch chip is a plain
-          button that opens the (controlled) popover, and is hidden on a detached
+      {/* Two chips: workspace (folder) and git branch. The folder chip is the
+          Radix Popover Trigger, so a single `triggerRef` owns focus return on
+          close. The branch chip is its own DropdownMenu branch picker (#618
+          item 2) that lists and checks out branches; it is hidden on a detached
           HEAD / non-repo (`branch === null`). */}
       <div className="flex min-w-0 items-center gap-1.5">
         <PopoverPrimitive.Trigger asChild>
