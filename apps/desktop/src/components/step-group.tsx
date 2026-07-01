@@ -5,7 +5,6 @@ import { Spinner } from "@/components/ui/spinner";
 import type { ToolStep } from "@/store/chat";
 import type { TurnItem } from "@/lib/turn-groups";
 import { ToolStepBlock } from "@/components/tool-step";
-import { ProseStepBlock } from "@/components/prose-step";
 import { ThinkingBlock } from "@/components/thinking-block";
 import {
   DropdownMenu,
@@ -42,8 +41,10 @@ export function StepGroup({
   onAnswer,
 }: {
   steps: ToolStep[];
-  /** Ordered reasoning + prose + step rows (#415/#574). Each iteration's reasoning is
-   *  a `reasoning` item in position; defaults to the steps alone when omitted. */
+  /** Ordered reasoning + step rows for this segment (#574/#619). Each iteration's
+   *  reasoning is a `reasoning` item in position; defaults to the steps alone when
+   *  omitted. Intermediate prose is hoisted to a top-level block by `segmentTurn`, so
+   *  it never reaches this group. */
   items?: TurnItem[];
   streaming: boolean;
   /** Wall-clock turn start from send / first stream (#180). */
@@ -184,9 +185,7 @@ export function StepGroup({
                 streaming={streaming}
                 hasAnswer={hasAnswer ?? false}
               />
-            ) : it.kind === "prose" ? (
-              <ProseStepBlock key={`prose:${it.key}`} text={it.text} />
-            ) : (
+            ) : it.kind === "step" ? (
               <ToolStepBlock
                 key={it.step.callId}
                 step={it.step}
@@ -195,7 +194,9 @@ export function StepGroup({
                 onApproveAlways={onApproveAlways}
                 onAnswer={onAnswer}
               />
-            ),
+            ) : // Intermediate prose is hoisted to a top-level block by `segmentTurn`
+            // (#619) and never reaches this group; the branch stays for exhaustiveness.
+            null,
           )}
         </div>
       )}

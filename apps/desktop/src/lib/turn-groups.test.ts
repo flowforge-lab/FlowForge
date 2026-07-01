@@ -1,7 +1,13 @@
 import { describe, it, expect } from "vitest";
-import { foldTurns, persistedStepToToolStep } from "@/lib/turn-groups";
+import {
+  foldTurns,
+  persistedStepToToolStep,
+  segmentTurn,
+} from "@/lib/turn-groups";
+import type { TurnItem } from "@/lib/turn-groups";
 import type { Message } from "@/bindings";
 import type { ToolCall } from "@/bindings/ToolCall";
+import type { ToolStep } from "@/store/chat";
 
 const SID = "s1";
 let seq = 0;
@@ -342,7 +348,7 @@ describe("foldTurns — interleaved reasoning (#574)", () => {
     expect(turn.message.content).toBe("All done.");
   });
 
-  it("orders reasoning before prose before steps within one iteration", () => {
+  it("orders prose before reasoning before steps within one iteration (#619)", () => {
     const groups = foldTurns([
       msg({ role: "user", content: "go" }),
       msg({
@@ -355,9 +361,11 @@ describe("foldTurns — interleaved reasoning (#574)", () => {
       msg({ role: "tool", toolCallId: "c1", content: "r1" }),
       msg({ id: "a2", role: "assistant", content: "done" }),
     ]);
+    // Prose leads so `segmentTurn` can hoist it to a top-level block, leaving the
+    // iteration's reasoning contiguous with the steps it produced.
     expect(tags(groups[1])).toEqual([
-      "reasoning:thinking",
       "prose:Let me check.",
+      "reasoning:thinking",
       "step:view",
     ]);
   });
@@ -389,5 +397,88 @@ describe("foldTurns — interleaved reasoning (#574)", () => {
       msg({ id: "a2", role: "assistant", content: "done" }),
     ]);
     expect(tags(groups[1])).toEqual(["step:view"]);
+  });
+});
+
+describe("segmentTurn (#619)", () => {
+  function step(callId: string, tool = "bash"): ToolStep {
+    return { callId, tool, args: {}, status: "done" };
+  }
+  // A compact tag per segment: `prose:<text>` or `steps[<n>]:<itemKinds>`.
+  function tag(seg: ReturnType<typeof segmentTurn>[number]): string {
+    if (seg.kind === "prose") return `prose:${seg.text}`;
+    const kinds = seg.items
+      .map((it) => (it.kind === "step" ? "step" : it.kind))
+      .join(",");
+    return `steps[${seg.steps.length}]:${kinds}`;
+  }
+
+  it("hoists prose into standalone segments, splitting the steps around it", () => {
+    const items: TurnItem[] = [
+      { kind: "prose", text: "Let me read the file.", key: "a1" },
+      { kind: "step", step: step("c1", "view") },
+      { kind: "prose", text: "Found it. Now searching.", key: "a2" },
+      { kind: "step", step: step("c2", "grep") },
+    ];
+    expect(segmentTurn(items).map(tag)).toEqual([
+      "prose:Let me read the file.",
+      "steps[1]:step",
+      "prose:Found it. Now searching.",
+      "steps[1]:step",
+    ]);
+  });
+
+  it("keeps an iteration's reasoning contiguous with its steps in one segment", () => {
+    const items: TurnItem[] = [
+      { kind: "prose", text: "narration", key: "a1" },
+      { kind: "reasoning", text: "thinking", key: "a1" },
+      { kind: "step", step: step("c1") },
+      { kind: "step", step: step("c2") },
+    ];
+    const segs = segmentTurn(items);
+    expect(segs.map(tag)).toEqual([
+      "prose:narration",
+      "steps[2]:reasoning,step,step",
+    ]);
+  });
+
+  it("returns a single steps segment when there is no prose", () => {
+    const items: TurnItem[] = [
+      { kind: "step", step: step("c1") },
+      { kind: "step", step: step("c2") },
+    ];
+    expect(segmentTurn(items).map(tag)).toEqual(["steps[2]:step,step"]);
+  });
+
+  it("returns one steps segment for a single step", () => {
+    const items: TurnItem[] = [{ kind: "step", step: step("c1") }];
+    const segs = segmentTurn(items);
+    expect(segs).toHaveLength(1);
+    expect(segs[0]).toMatchObject({ kind: "steps" });
+  });
+
+  it("interleaves multiple prose blocks with their step groups in order", () => {
+    const items: TurnItem[] = [
+      { kind: "prose", text: "p1", key: "a1" },
+      { kind: "step", step: step("c1") },
+      { kind: "prose", text: "p2", key: "a2" },
+      { kind: "step", step: step("c2") },
+      { kind: "prose", text: "p3", key: "a3" },
+      { kind: "step", step: step("c3") },
+    ];
+    const segs = segmentTurn(items);
+    // Three prose blocks, three steps groups, strictly alternating.
+    expect(segs.map((s) => s.kind)).toEqual([
+      "prose",
+      "steps",
+      "prose",
+      "steps",
+      "prose",
+      "steps",
+    ]);
+  });
+
+  it("returns nothing for an empty turn", () => {
+    expect(segmentTurn([])).toEqual([]);
   });
 });

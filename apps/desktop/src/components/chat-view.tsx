@@ -15,7 +15,7 @@ import {
 import { MessageAttachments } from "@/components/message-attachments";
 import { ThinkingIndicator } from "@/components/thinking-indicator";
 import { ContinueAffordance } from "@/components/continue-affordance";
-import { foldTurns } from "@/lib/turn-groups";
+import { foldTurns, segmentTurn } from "@/lib/turn-groups";
 import type { TurnItem } from "@/lib/turn-groups";
 import { useExperimentalStore } from "@/store/experimental";
 import { useModelConfigStore, activeConnection } from "@/store/model-config";
@@ -122,14 +122,24 @@ function MessageRowImpl({
     );
   }
 
+  // Split the turn on its intermediate prose (#619): prose renders top-level and
+  // always-visible; each contiguous reasoning+steps run is one collapsible group.
+  // The live timer / answer preview / export belong to the LAST steps group — it's
+  // the one that precedes the final answer.
+  const segments = segmentTurn(items);
+  let lastStepsIdx = -1;
+  segments.forEach((seg, i) => {
+    if (seg.kind === "steps") lastStepsIdx = i;
+  });
+
   return (
     <div className="flex flex-col items-start gap-1.5">
       {toolSteps.length > 0 ? (
         <div className="flex w-full max-w-[80%] flex-col gap-1.5">
-          {/* Single settled step stays bare; streaming (any count), 2+ steps, any
-              reasoning to fold in (#205), or any intermediate prose to interleave
-              (#415) use StepGroup so the live timer, peek window (#180), and the
-              inline Thinking + prose rows (#574/#415) apply in chronological order. */}
+          {/* A single settled step stays bare; streaming (any count), 2+ steps, or
+              any reasoning to fold in (#205) use StepGroup so the live timer, peek
+              window (#180), and inline Thinking rows (#574) apply. Intermediate prose
+              (#619) forces the segmented path below so it renders top-level. */}
           {toolSteps.length === 1 &&
           !streaming &&
           !reasoning &&
@@ -142,33 +152,51 @@ function MessageRowImpl({
               onAnswer={onAnswer}
             />
           ) : (
-            <StepGroup
-              steps={toolSteps}
-              items={items}
-              streaming={streaming}
-              turnStartMs={turnStartMs}
-              hasAnswer={message.content.length > 0}
-              answer={message.content}
-              onExportTimeline={
-                exportEnabled
-                  ? (format) =>
-                      void downloadStepTimeline(
-                        toolSteps,
-                        {
-                          sessionId: message.sessionId,
-                          model: exportModel,
-                          timing: exportTiming,
-                          capturedAt: Date.now(),
-                        },
-                        format,
-                      )
-                  : undefined
-              }
-              onRespond={onRespond}
-              onApproveSession={onApproveSession}
-              onApproveAlways={onApproveAlways}
-              onAnswer={onAnswer}
-            />
+            segments.map((seg, i) =>
+              seg.kind === "prose" ? (
+                // Intermediate narration — a top-level, always-visible markdown block
+                // between the collapsed groups it sat between (#619). Muted vs. the
+                // final answer; settled, so never streamed.
+                <div
+                  key={`prose:${seg.key}`}
+                  data-selectable
+                  className="px-0.5 py-1 text-sm leading-relaxed text-muted-foreground"
+                >
+                  <Markdown content={seg.text} />
+                </div>
+              ) : (
+                <StepGroup
+                  key={`steps:${seg.key}`}
+                  steps={seg.steps}
+                  items={seg.items}
+                  streaming={i === lastStepsIdx ? streaming : false}
+                  turnStartMs={i === lastStepsIdx ? turnStartMs : null}
+                  hasAnswer={
+                    i === lastStepsIdx ? message.content.length > 0 : false
+                  }
+                  answer={i === lastStepsIdx ? message.content : undefined}
+                  onExportTimeline={
+                    i === lastStepsIdx && exportEnabled
+                      ? (format) =>
+                          void downloadStepTimeline(
+                            toolSteps,
+                            {
+                              sessionId: message.sessionId,
+                              model: exportModel,
+                              timing: exportTiming,
+                              capturedAt: Date.now(),
+                            },
+                            format,
+                          )
+                      : undefined
+                  }
+                  onRespond={onRespond}
+                  onApproveSession={onApproveSession}
+                  onApproveAlways={onApproveAlways}
+                  onAnswer={onAnswer}
+                />
+              ),
+            )
           )}
         </div>
       ) : (
