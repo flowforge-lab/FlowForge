@@ -105,6 +105,100 @@ describe("ModelChip (#499)", () => {
   });
 });
 
+describe("ModelChip inline Thinking toggle (#633)", () => {
+  // Keyboard-operable menu checkbox (not a nested Switch): role menuitemcheckbox,
+  // named via aria-label; the visible Switch is a presentational, aria-hidden mirror.
+  const thinkingToggle = () =>
+    screen.queryByRole("menuitemcheckbox", { name: "Thinking" });
+
+  it("shows the Thinking toggle for a local resolved model (candle-vLLM default), reflecting its state", async () => {
+    render(<ModelChip sessionId="s1" />);
+    await screen.findByText(DEFAULT_MODEL); // inherited → candle-vLLM (local)
+    await userEvent.click(screen.getByLabelText("Session model"));
+
+    const toggle = await screen.findByRole("menuitemcheckbox", {
+      name: "Thinking",
+    });
+    // The mock candle-vLLM connection has thinking: true.
+    expect(toggle.getAttribute("aria-checked")).toBe("true");
+    expect(screen.getByText(/off is faster on local models/i)).not.toBeNull();
+  });
+
+  it("also shows for an Ollama (local) override", async () => {
+    await ipc.setSessionModelSelection("s2", {
+      connection: "ollama",
+      model: "qwen2.5",
+    });
+    render(<ModelChip sessionId="s2" />);
+    await screen.findByText("qwen2.5");
+    await userEvent.click(screen.getByLabelText("Session model"));
+    expect(
+      await screen.findByRole("menuitemcheckbox", { name: "Thinking" }),
+    ).not.toBeNull();
+  });
+
+  it("hides the toggle for a hosted resolved model (OpenAI)", async () => {
+    await ipc.setSessionModelSelection("s2", {
+      connection: "openai",
+      model: "gpt-4o",
+    });
+    render(<ModelChip sessionId="s2" />);
+    await screen.findByText("gpt-4o");
+    await userEvent.click(screen.getByLabelText("Session model"));
+    // Dropdown is open (clear item present) but no reasoning toggle for hosted kinds.
+    await screen.findByText("Use phenotype / global default");
+    expect(thinkingToggle()).toBeNull();
+  });
+
+  it("toggling persists via upsertConnection and keeps the menu open", async () => {
+    const upsert = vi
+      .spyOn(ipc, "upsertConnection")
+      .mockImplementation(async (conn) => conn);
+    await ipc.setSessionModelSelection("s2", {
+      connection: "ollama",
+      model: "qwen2.5",
+    });
+    render(<ModelChip sessionId="s2" />);
+    await screen.findByText("qwen2.5");
+    await userEvent.click(screen.getByLabelText("Session model"));
+
+    await userEvent.click(
+      await screen.findByRole("menuitemcheckbox", { name: "Thinking" }),
+    );
+
+    // Ollama's mock `thinking` is true, so the toggle flips it off.
+    expect(upsert).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "ollama", thinking: false }),
+    );
+    // Menu stayed open (onSelect preventDefault): the picker is still mounted.
+    expect(screen.getByText("Use phenotype / global default")).not.toBeNull();
+  });
+
+  it("toggles via keyboard (Enter on the focused row) without a pointer (#640)", async () => {
+    const upsert = vi
+      .spyOn(ipc, "upsertConnection")
+      .mockImplementation(async (conn) => conn);
+    await ipc.setSessionModelSelection("s2", {
+      connection: "ollama",
+      model: "qwen2.5",
+    });
+    render(<ModelChip sessionId="s2" />);
+    await screen.findByText("qwen2.5");
+    await userEvent.click(screen.getByLabelText("Session model"));
+
+    const toggle = await screen.findByRole("menuitemcheckbox", {
+      name: "Thinking",
+    });
+    toggle.focus();
+    await userEvent.keyboard("{Enter}");
+
+    expect(upsert).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "ollama", thinking: false }),
+    );
+    expect(screen.getByText("Use phenotype / global default")).not.toBeNull();
+  });
+});
+
 describe("ModelChip served-window display (#602)", () => {
   const WARNING = /context window not detected/i;
 
