@@ -440,6 +440,11 @@ export class MockIpc implements FfIpc {
   // in-memory session_cwd map; unset sessions report the default root.
   private workspaces = new Map<string, string>();
   private readonly defaultWorkspace = "/Users/you/projects/flowforge";
+  /** Per-session current git branch, set by `checkoutBranch` (#628). The mock has
+   *  no real repo, so this stands in for `.git/HEAD` and backs `getSessionWorkspace`. */
+  private mockBranches = new Map<string, string>();
+  /** Local branches the mock offers in the switch picker (#628). */
+  private readonly mockBranchList = ["main", "develop", "feature/demo"];
   // One active timer per session so cancelTurn can stop it.
   private activeTimers = new Map<string, ActiveTurn>();
 
@@ -710,10 +715,11 @@ export class MockIpc implements FfIpc {
   }
 
   async getSessionWorkspace(sessionId: string): Promise<SessionWorkspace> {
-    // The mock has no real filesystem, so it never resolves a git branch.
+    // The mock has no real filesystem; the branch is whatever `checkoutBranch`
+    // last set for this session (null until then), standing in for `.git/HEAD`.
     return {
       path: this.workspaces.get(sessionId) ?? this.defaultWorkspace,
-      gitBranch: null,
+      gitBranch: this.mockBranches.get(sessionId) ?? null,
     };
   }
 
@@ -723,6 +729,28 @@ export class MockIpc implements FfIpc {
     this.workspaces.set(sessionId, trimmed);
     this.emitBranchChanged(trimmed);
     return trimmed;
+  }
+
+  async listBranches(_sessionId: string): Promise<string[]> {
+    return [...this.mockBranchList];
+  }
+
+  async checkoutBranch(
+    sessionId: string,
+    branch: string,
+  ): Promise<SessionWorkspace> {
+    if (!this.mockBranchList.includes(branch)) {
+      throw new Error(`unknown branch: ${branch}`);
+    }
+    this.mockBranches.set(sessionId, branch);
+    const path = this.workspaces.get(sessionId) ?? this.defaultWorkspace;
+    // Mirror the real command: route the switch through `workspace:branch-changed`
+    // so the chip updates + flashes (#627) via the same reactive path an external
+    // checkout uses -- no extra FE wiring needed for the confirmation.
+    setTimeout(() => {
+      this.emit(this.workspaceBranchListeners, { path, gitBranch: branch });
+    }, 0);
+    return { path, gitBranch: branch };
   }
 
   async listSessions(): Promise<Session[]> {

@@ -83,6 +83,15 @@ export interface FfIpc {
   /** Set a session's working directory. Backend validates the path is an existing
    *  directory and returns the canonical path to display; rejects otherwise. */
   setSessionWorkspace(sessionId: string, path: string): Promise<string>;
+  /** Local branches in the session's cwd repo (refname-sorted), to populate a
+   *  branch-switch picker (#628). Empty when the cwd is not a git work tree. */
+  listBranches(sessionId: string): Promise<string[]>;
+  /** Check out `branch` in the session's cwd and return the updated workspace
+   *  (#628). Also emits `workspace:branch-changed`, so the chip updates and
+   *  flashes (#627) through the same reactive path an external checkout uses --
+   *  callers do not need to patch the workspace store themselves. Rejects on an
+   *  unknown branch or a checkout git refuses (e.g. a dirty working tree). */
+  checkoutBranch(sessionId: string, branch: string): Promise<SessionWorkspace>;
   /** Persists the user message and starts the assistant turn. Returns the user message id. */
   sendMessage(
     sessionId: string,
@@ -519,6 +528,10 @@ class TauriIpc implements FfIpc {
     this.invoke<SessionWorkspace>("get_session_workspace", { sessionId });
   setSessionWorkspace = (sessionId: string, path: string) =>
     this.invoke<string>("set_session_workspace", { sessionId, path });
+  listBranches = (sessionId: string) =>
+    this.invoke<string[]>("list_branches", { sessionId });
+  checkoutBranch = (sessionId: string, branch: string) =>
+    this.invoke<SessionWorkspace>("checkout_branch", { sessionId, branch });
   sendMessage = (
     sessionId: string,
     content: string,
