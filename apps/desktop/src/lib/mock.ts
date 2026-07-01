@@ -678,10 +678,25 @@ export class MockIpc implements FfIpc {
   private updateProgressListeners = new Set<Listener<UpdateProgressEvent>>();
   private updateDownloadFinishedListeners = new Set<Listener<void>>();
   private workspaceBranchListeners = new Set<Listener<SessionWorkspace>>();
+  // Paint-first boot (#599): the mock backend is "ready" immediately, so this is
+  // never emitted — the FE's subscribe-then-check sees `isAppReady` -> true and
+  // proceeds without waiting. Kept (not a no-op unlisten) so the surface mirrors
+  // the real IPC and stays exercisable if the mock later simulates a hydrate delay.
+  private appReadyListeners = new Set<Listener<void>>();
+  // #599 boot regression: never emitted by the mock (it never fails hydrate),
+  // but kept on the surface so the error path stays exercisable if the mock
+  // later simulates an init failure.
+  private appInitErrorListeners = new Set<Listener<string>>();
   // Sessions that have already simulated a context-pressure flush (#283). The
   // real flush only fires once a session crosses the budget; the mock stands in
   // by flushing once per session so the provenance surface is exercisable.
   private flushedSessions = new Set<string>();
+
+  async isAppReady(): Promise<boolean> {
+    // The mock has no deferred heavy init; it is ready immediately so the FE's
+    // loading gate never blocks offline UI dev.
+    return true;
+  }
 
   async createSession(goal?: string): Promise<Session> {
     const ts = now();
@@ -956,6 +971,14 @@ export class MockIpc implements FfIpc {
   }
   onWorkspaceBranchChanged(cb: Listener<SessionWorkspace>): Promise<Unlisten> {
     return this.subscribe(this.workspaceBranchListeners, cb);
+  }
+
+  onAppReady(cb: Listener<void>): Promise<Unlisten> {
+    return this.subscribe(this.appReadyListeners, cb);
+  }
+
+  onAppInitError(cb: Listener<string>): Promise<Unlisten> {
+    return this.subscribe(this.appInitErrorListeners, cb);
   }
 
   onUpdateProgress(cb: Listener<UpdateProgressEvent>): Promise<Unlisten> {
