@@ -29,10 +29,51 @@ use ff_signals::SkillAggregate;
 use ff_tools::Safety;
 use state::AppState;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::time::Duration;
 use tauri::{Emitter, Manager, State};
 use tauri_plugin_shell::ShellExt;
 use uuid::Uuid;
+
+// Boot-timing trace (#599 item 0). A single shared clock for the three cold-start
+// milestones — `AppState::new()`, the webview page-load, and FE first paint — so
+// the <200ms target is measured against real numbers instead of guesses. Every
+// `[boot-trace]` line reports milliseconds since `BOOT_T0` (set as the first line
+// of `run()`). Entirely gated behind the `FF_BOOT_TRACE` env var: unset, each
+// stamp is a cheap `OnceLock` load and returns before formatting or I/O, so a
+// normal launch pays nothing.
+static BOOT_T0: OnceLock<std::time::Instant> = OnceLock::new();
+static BOOT_TRACE_ON: OnceLock<bool> = OnceLock::new();
+
+fn boot_trace_enabled() -> bool {
+    *BOOT_TRACE_ON.get_or_init(|| std::env::var_os("FF_BOOT_TRACE").is_some())
+}
+
+/// Emit `[boot-trace] <label> +<ms>ms[ (<extra>)]`, the elapsed since `BOOT_T0`.
+/// Used for the cumulative milestones (window-relative), not per-step durations.
+pub(crate) fn boot_trace(label: &str, extra: Option<&str>) {
+    if !boot_trace_enabled() {
+        return;
+    }
+    let ms = BOOT_T0
+        .get()
+        .map(|t0| t0.elapsed().as_secs_f64() * 1000.0)
+        .unwrap_or(0.0);
+    match extra {
+        Some(e) => eprintln!("[boot-trace] {label} +{ms:.1}ms ({e})"),
+        None => eprintln!("[boot-trace] {label} +{ms:.1}ms"),
+    }
+}
+
+/// Emit `[boot-trace] <label> <ms>ms` for a single step's own duration (not
+/// since-`BOOT_T0`). Used by `AppState::new()` to break down each blocking open
+/// so items 1-4 are driven by which SQLite open / scan actually costs.
+pub(crate) fn boot_trace_step(label: &str, dur: Duration) {
+    if !boot_trace_enabled() {
+        return;
+    }
+    eprintln!("[boot-trace] {label} {:.1}ms", dur.as_secs_f64() * 1000.0);
+}
 
 /// Per-turn telemetry accumulator (RFC 0001 §8), filled by the agent-event closure
 /// and folded into per-skill aggregates when the turn ends. `message_ids` counts
@@ -2254,15 +2295,42 @@ async fn run_sidecar_turn(
     }))
 }
 
+/// Boot trace (#599 item 0): the FE reports first paint on the same `BOOT_T0`
+/// clock. `fe_nav_ms` is the webview-internal `performance.now()` (≈ navigation
+/// start → paint), which isolates the WKWebView/process floor from our own work.
+#[tauri::command]
+fn mark_fe_ready(phase: String, fe_nav_ms: f64) {
+    boot_trace(
+        &format!("fe.{phase}"),
+        Some(&format!("fe_nav {fe_nav_ms:.1}ms")),
+    );
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Boot-trace origin (#599 item 0): the earliest FlowForge-controlled point.
+    // OS process spawn + WKWebView init happen before any of our code and are
+    // unmeasurable from here (the platform floor the issue calls out); the FE's
+    // `performance.now()` in `mark_fe_ready` gives the closest proxy for that.
+    let _ = BOOT_T0.set(std::time::Instant::now());
     let state = Arc::new(AppState::new());
+    // Cumulative since t0 ≈ the blocking `AppState::new()` cost; per-step
+    // durations are emitted from `state.rs` (registry/seed/skills/memory/DBs).
+    boot_trace("app_state_new", None);
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_shell::init())
+        // Boot trace (#599 item 0): stamp when the webview begins loading our
+        // HTML (webview process up) and when the document finishes loading.
+        .on_page_load(|_webview, payload| match payload.event() {
+            tauri::webview::PageLoadEvent::Started => boot_trace("webview.page-load-started", None),
+            tauri::webview::PageLoadEvent::Finished => {
+                boot_trace("webview.page-load-finished", None)
+            }
+        })
         .manage(state.clone())
         .setup(move |app| {
             // `init_mcp` enters the shared Tokio runtime itself, so it's safe to
@@ -2421,6 +2489,7 @@ pub fn run() {
             remove_mcp_server,
             check_for_updates,
             install_update,
+            mark_fe_ready,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");
