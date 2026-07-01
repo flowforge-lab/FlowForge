@@ -449,6 +449,102 @@ fn resolve_workspace_dir(path: &str) -> Result<std::path::PathBuf, String> {
     Ok(canonical)
 }
 
+/// Local branch names in `dir`'s git work tree, refname-sorted, for the branch
+/// picker (#628). `Ok(vec![])` when `dir` is not a repo; `Err` only on an actual
+/// git failure. Uses `for-each-ref` (stable plumbing) so packed refs are included
+/// -- reading `.git/refs/heads/` directly, like [`git_branch`], would miss them.
+/// Extracted as a free fn so it is unit-testable against a temp repo without a
+/// Tauri `State`.
+pub(crate) fn list_local_branches(dir: &std::path::Path) -> Result<Vec<String>, String> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["for-each-ref", "--format=%(refname:short)", "refs/heads/"])
+        .output()
+        .map_err(|e| format!("cannot run git: {e}"))?;
+    if !out.status.success() {
+        // Not a repo (or a bare/broken one): no branches to offer rather than a
+        // hard error, mirroring how `git_branch` returns `None` off-repo.
+        return Ok(Vec::new());
+    }
+    Ok(String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
+/// Check out `branch` in `dir`. Validates that `branch` is one of the repo's local
+/// branches *before* spawning git: this yields a clean error for a stale picker
+/// entry and closes the `git checkout -<flag>` argument-injection vector (a branch
+/// literally named like a flag can never reach the checkout). On a checkout that
+/// git rejects (e.g. the working tree would be overwritten) the trimmed stderr is
+/// surfaced verbatim. Free fn for the same testability reason as above.
+pub(crate) fn switch_branch(dir: &std::path::Path, branch: &str) -> Result<(), String> {
+    if !list_local_branches(dir)?.iter().any(|b| b == branch) {
+        return Err(format!("unknown branch: {branch}"));
+    }
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["checkout", branch])
+        .output()
+        .map_err(|e| format!("cannot run git: {e}"))?;
+    if !out.status.success() {
+        let msg = String::from_utf8_lossy(&out.stderr);
+        let msg = msg.trim();
+        return Err(if msg.is_empty() {
+            format!("git checkout {branch} failed")
+        } else {
+            msg.to_string()
+        });
+    }
+    Ok(())
+}
+
+/// List the local branches of a session's cwd repo, for a switch picker (#628).
+/// Read-only; empty when the cwd is not a git work tree.
+#[tauri::command]
+fn list_branches(
+    state: State<'_, Arc<AppState>>,
+    session_id: String,
+) -> Result<Vec<String>, String> {
+    list_local_branches(&state.session_root(&session_id))
+}
+
+/// Check out `branch` in a session's cwd and return the updated workspace (#628,
+/// item #2 of #618).
+///
+/// DESIGN -- seamless connection with the #627 flash: this command *emits*
+/// `workspace:branch-changed` itself rather than leaning solely on `GitHeadWatcher`
+/// to notice the `.git/HEAD` write. The watcher is only re-pointed at turn-start
+/// (`align_git_watcher`), so a watcher-only path would (a) fire ~200ms late behind
+/// the debounce and (b) miss a switch made in a session that has not run a turn
+/// yet. Emitting here routes the change through the exact reactive channel an
+/// external checkout uses -- `onWorkspaceBranchChanged` -> store `applyBranchChanged`
+/// -> `ff-branch-flash` (#627) -- so the chip updates and flashes immediately and
+/// deterministically, with no extra FE wiring. When the watcher *is* pointed it may
+/// re-emit the same branch ~200ms later; that is harmless: `applyBranchChanged` is
+/// idempotent and #627's transition guard suppresses a second flash on an unchanged
+/// value.
+#[tauri::command]
+fn checkout_branch(
+    app: tauri::AppHandle,
+    state: State<'_, Arc<AppState>>,
+    session_id: String,
+    branch: String,
+) -> Result<SessionWorkspace, String> {
+    let root = state.session_root(&session_id);
+    switch_branch(&root, &branch)?;
+    let ws = SessionWorkspace {
+        git_branch: git_branch(&root),
+        path: root.display().to_string(),
+    };
+    let _ = app.emit("workspace:branch-changed", ws.clone());
+    Ok(ws)
+}
+
 /// Map an internal [`ff_memory::MemoryFile`] to the IPC [`MemoryFileInfo`] contract.
 fn to_file_info(f: ff_memory::MemoryFile) -> MemoryFileInfo {
     MemoryFileInfo {
@@ -2241,6 +2337,8 @@ pub fn run() {
             preview_cadence,
             get_session_workspace,
             set_session_workspace,
+            list_branches,
+            checkout_branch,
             list_memory_files,
             read_memory_file,
             memory_overview,
@@ -2319,7 +2417,10 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
-    use super::{git_branch, mode_auto_approves, resolve_workspace_dir, TurnMetrics, UpdateStatus};
+    use super::{
+        git_branch, list_local_branches, mode_auto_approves, resolve_workspace_dir, switch_branch,
+        TurnMetrics, UpdateStatus,
+    };
     use ff_core::Mode;
     use ff_tools::Safety;
 
@@ -2421,6 +2522,87 @@ mod tests {
     fn git_branch_is_none_when_not_a_repo() {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(git_branch(dir.path()), None);
+    }
+
+    /// Init a temp repo with one commit on `main` plus the extra `branches`, all
+    /// pointing at that commit. Returns the tempdir (keep it alive for the test).
+    /// Skips (returns `None`) if `git` is unavailable so the suite still passes on
+    /// a host without git installed.
+    #[cfg(test)]
+    fn temp_repo(branches: &[&str]) -> Option<tempfile::TempDir> {
+        let dir = tempfile::tempdir().unwrap();
+        let run = |args: &[&str]| -> bool {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir.path())
+                .args(args)
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        };
+        if !run(&["init", "-q", "-b", "main"]) {
+            return None; // git missing or too old for `-b`; skip.
+        }
+        run(&["config", "user.email", "t@example.com"]);
+        run(&["config", "user.name", "t"]);
+        std::fs::write(dir.path().join("f.txt"), "x").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-q", "-m", "init"]);
+        for b in branches {
+            run(&["branch", b]);
+        }
+        Some(dir)
+    }
+
+    #[test]
+    fn list_local_branches_returns_all_local_branches_sorted() {
+        let Some(dir) = temp_repo(&["develop", "feature/x"]) else {
+            return;
+        };
+        let mut got = list_local_branches(dir.path()).unwrap();
+        got.sort();
+        assert_eq!(got, vec!["develop", "feature/x", "main"]);
+    }
+
+    #[test]
+    fn list_local_branches_is_empty_when_not_a_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            list_local_branches(dir.path()).unwrap(),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn switch_branch_checks_out_and_moves_head() {
+        let Some(dir) = temp_repo(&["develop"]) else {
+            return;
+        };
+        assert_eq!(git_branch(dir.path()), Some("main".to_string()));
+        switch_branch(dir.path(), "develop").unwrap();
+        assert_eq!(git_branch(dir.path()), Some("develop".to_string()));
+    }
+
+    #[test]
+    fn switch_branch_rejects_unknown_branch() {
+        let Some(dir) = temp_repo(&[]) else {
+            return;
+        };
+        let err = switch_branch(dir.path(), "nope").unwrap_err();
+        assert!(err.contains("unknown branch"));
+        // HEAD did not move.
+        assert_eq!(git_branch(dir.path()), Some("main".to_string()));
+    }
+
+    #[test]
+    fn switch_branch_rejects_flag_like_branch_before_spawning_git() {
+        let Some(dir) = temp_repo(&[]) else {
+            return;
+        };
+        // A branch literally named like a flag is never a real local branch, so the
+        // membership check rejects it before it can reach `git checkout`.
+        let err = switch_branch(dir.path(), "--orphan").unwrap_err();
+        assert!(err.contains("unknown branch"));
     }
 
     // F1 (#427): the turn-metrics accumulator counts one round-trip per distinct

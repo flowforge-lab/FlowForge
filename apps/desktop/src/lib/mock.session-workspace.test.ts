@@ -71,3 +71,51 @@ describe("MockIpc workspace:branch-changed (#561)", () => {
     expect(events).toEqual([]);
   });
 });
+
+// #628: the branch-switch commands. `checkoutBranch` mirrors the real command by
+// routing the change through `workspace:branch-changed` (the #627 flash path), and
+// `getSessionWorkspace` then reflects the new branch.
+describe("MockIpc branch switch (#628)", () => {
+  it("lists the offered branches", async () => {
+    const ipc = new MockIpc();
+    const s = await ipc.createSession();
+    expect(await ipc.listBranches(s.id)).toEqual([
+      "main",
+      "develop",
+      "feature/demo",
+    ]);
+  });
+
+  it("checkoutBranch updates the workspace branch and emits branch-changed", async () => {
+    const ipc = new MockIpc();
+    const s = await ipc.createSession();
+    await ipc.setSessionWorkspace(s.id, "/tmp/proj");
+    // Drain setSessionWorkspace's own deferred branch-changed emit before we
+    // subscribe, so we assert only on checkoutBranch's event.
+    await new Promise((r) => setTimeout(r, 0));
+    const events: SessionWorkspace[] = [];
+    await ipc.onWorkspaceBranchChanged((e) => events.push(e));
+
+    const ws = await ipc.checkoutBranch(s.id, "develop");
+    expect(ws).toEqual({ path: "/tmp/proj", gitBranch: "develop" });
+    // getSessionWorkspace now reflects the switch.
+    expect((await ipc.getSessionWorkspace(s.id)).gitBranch).toBe("develop");
+
+    await new Promise((r) => setTimeout(r, 0));
+    expect(events).toEqual([{ path: "/tmp/proj", gitBranch: "develop" }]);
+  });
+
+  it("rejects an unknown branch and emits nothing", async () => {
+    const ipc = new MockIpc();
+    const s = await ipc.createSession();
+    const events: SessionWorkspace[] = [];
+    await ipc.onWorkspaceBranchChanged((e) => events.push(e));
+
+    await expect(ipc.checkoutBranch(s.id, "nope")).rejects.toThrow(
+      "unknown branch",
+    );
+    await new Promise((r) => setTimeout(r, 0));
+    expect(events).toEqual([]);
+    expect((await ipc.getSessionWorkspace(s.id)).gitBranch).toBeNull();
+  });
+});
