@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 
 import { act, cleanup, render, screen } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import {
   afterEach,
   beforeAll,
@@ -66,6 +67,19 @@ const folderChip = () => screen.getByRole("button", { name: /Workspace:/ });
 const flashed = (el: Element | null) =>
   el?.classList.contains("ff-branch-flash") ?? false;
 
+/** Stub `matchMedia` so the component's reduced-motion read is deterministic
+    (jsdom doesn't implement it; the component treats "absent" as no-preference). */
+function mockReducedMotion(reduce: boolean) {
+  vi.stubGlobal(
+    "matchMedia",
+    vi.fn().mockReturnValue({
+      matches: reduce,
+      addEventListener: () => {},
+      removeEventListener: () => {},
+    }),
+  );
+}
+
 describe("WorkspaceSelector branch-change flash (#618)", () => {
   beforeEach(() => {
     // The async load resolves to whatever is currently cached, so it never
@@ -81,6 +95,7 @@ describe("WorkspaceSelector branch-change flash (#618)", () => {
   afterEach(() => {
     cleanup();
     vi.restoreAllMocks();
+    vi.unstubAllGlobals();
   });
 
   it("flashes the branch chip and announces when the branch transitions to a new name", async () => {
@@ -159,5 +174,83 @@ describe("WorkspaceSelector branch-change flash (#618)", () => {
 
     expect(flashed(branchChip())).toBe(false);
     expect(screen.getByRole("status").textContent).toBe("");
+  });
+
+  it("checks out and flashes on a self-switch via the branch picker (#618 item 2)", async () => {
+    seed("a", { a: { path: PATH, gitBranch: "main" } });
+    vi.spyOn(ipc, "listBranches").mockResolvedValue([
+      "main",
+      "develop",
+      "feature/demo",
+    ]);
+    // Stand in for the events.ts listener the unit render doesn't wire: a real
+    // checkout emits `workspace:branch-changed`, which patches the store.
+    const checkout = vi
+      .spyOn(ipc, "checkoutBranch")
+      .mockImplementation(async (_sid, b) => {
+        const ws = { path: PATH, gitBranch: b };
+        useSessionWorkspaceStore.getState().applyBranchChanged(ws);
+        return ws;
+      });
+    await mount("a");
+
+    const user = userEvent.setup();
+    await user.click(branchChip()!);
+    await user.click(await screen.findByRole("menuitem", { name: "develop" }));
+
+    expect(checkout).toHaveBeenCalledWith("a", "develop");
+    expect(flashed(branchChip())).toBe(true);
+    expect(screen.getByRole("status").textContent).toBe(
+      "Working branch changed to develop",
+    );
+  });
+
+  it("does not check out or flash when the active branch is reselected", async () => {
+    seed("a", { a: { path: PATH, gitBranch: "main" } });
+    vi.spyOn(ipc, "listBranches").mockResolvedValue(["main", "develop"]);
+    const checkout = vi
+      .spyOn(ipc, "checkoutBranch")
+      .mockResolvedValue({ path: PATH, gitBranch: "main" });
+    await mount("a");
+
+    const user = userEvent.setup();
+    await user.click(branchChip()!);
+    await user.click(await screen.findByRole("menuitem", { name: "main" }));
+
+    expect(checkout).not.toHaveBeenCalled();
+    expect(flashed(branchChip())).toBe(false);
+    expect(screen.getByRole("status").textContent).toBe("");
+  });
+
+  it("suppresses the flash under prefers-reduced-motion but still announces", async () => {
+    mockReducedMotion(true);
+    seed("a", { a: { path: PATH, gitBranch: "main" } });
+    await mount("a");
+
+    act(() => {
+      useSessionWorkspaceStore
+        .getState()
+        .applyBranchChanged({ path: PATH, gitBranch: "feature" });
+    });
+
+    // The animation class is never applied; the announcement is unaffected.
+    expect(flashed(branchChip())).toBe(false);
+    expect(screen.getByRole("status").textContent).toBe(
+      "Working branch changed to feature",
+    );
+  });
+
+  it("still flashes when reduced motion is not requested", async () => {
+    mockReducedMotion(false);
+    seed("a", { a: { path: PATH, gitBranch: "main" } });
+    await mount("a");
+
+    act(() => {
+      useSessionWorkspaceStore
+        .getState()
+        .applyBranchChanged({ path: PATH, gitBranch: "feature" });
+    });
+
+    expect(flashed(branchChip())).toBe(true);
   });
 });

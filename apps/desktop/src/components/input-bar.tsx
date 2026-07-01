@@ -703,6 +703,27 @@ function WorkspaceSelector({ sessionId }: { sessionId: string }) {
   const [open, setOpen] = useState(false);
   const [filter, setFilter] = useState("");
 
+  // Branch-switch picker (#618 item 2). Lazy-loaded on open, like ModelChip.
+  const [branchOpen, setBranchOpen] = useState(false);
+  const [branches, setBranches] = useState<string[] | null>(null);
+  const [loadingBranches, setLoadingBranches] = useState(false);
+
+  // Fully disable the branch-change flash under `prefers-reduced-motion` (#618).
+  // Gating the class in the component (not just CSS) means *zero* animation — no
+  // background fade either — while the aria-live announcement still fires.
+  const [reducedMotion, setReducedMotion] = useState(
+    () =>
+      typeof window !== "undefined" &&
+      !!window.matchMedia?.("(prefers-reduced-motion: reduce)").matches,
+  );
+  useEffect(() => {
+    if (typeof window === "undefined" || !window.matchMedia) return;
+    const mq = window.matchMedia("(prefers-reduced-motion: reduce)");
+    const onChange = () => setReducedMotion(mq.matches);
+    mq.addEventListener("change", onChange);
+    return () => mq.removeEventListener("change", onChange);
+  }, []);
+
   useEffect(() => {
     void load(sessionId);
   }, [sessionId, load]);
@@ -784,6 +805,39 @@ function WorkspaceSelector({ sessionId }: { sessionId: string }) {
     if (chosen) await choose(chosen);
   }, [path, choose]);
 
+  // Lazy-load the branch list when the picker opens (#618) — reloaded on each
+  // open so a new/renamed branch or an external checkout shows up. Empty list
+  // (non-repo / detached HEAD) renders a disabled "No branches" row.
+  const openBranchPicker = useCallback(
+    (next: boolean) => {
+      setBranchOpen(next);
+      if (!next) return;
+      setLoadingBranches(true);
+      void ipc
+        .listBranches(sessionId)
+        .then((list) => setBranches(list))
+        .catch(() => setBranches([]))
+        .finally(() => setLoadingBranches(false));
+    },
+    [sessionId],
+  );
+
+  const switchTo = useCallback(
+    async (next: string) => {
+      setBranchOpen(false);
+      if (next === branch) return; // already on it — skip a needless checkout
+      try {
+        await ipc.checkoutBranch(sessionId, next);
+        // No manual store patch: checkout emits `workspace:branch-changed`, which
+        // events.ts routes to applyBranchChanged — that relabels the chip and fires
+        // the existing flash + announcement (the self-switch path, #618 item 2).
+      } catch {
+        // Backend rejected the checkout (dirty tree, unknown branch). Leave as-is.
+      }
+    },
+    [sessionId, branch],
+  );
+
   const query = filter.trim().toLowerCase();
   const filtered = query
     ? recents.filter((p) => p.toLowerCase().includes(query))
@@ -797,10 +851,10 @@ function WorkspaceSelector({ sessionId }: { sessionId: string }) {
         if (!next) setFilter("");
       }}
     >
-      {/* Two chips — workspace (folder) and git branch — open the same popover
-          (#606). Only the folder chip is the Radix Trigger so a single
-          `triggerRef` owns focus return on close; the branch chip is a plain
-          button that opens the (controlled) popover, and is hidden on a detached
+      {/* Two chips: workspace (folder) and git branch. The folder chip is the
+          Radix Popover Trigger, so a single `triggerRef` owns focus return on
+          close. The branch chip is its own DropdownMenu branch picker (#618
+          item 2) that lists and checks out branches; it is hidden on a detached
           HEAD / non-repo (`branch === null`). */}
       <div className="flex min-w-0 items-center gap-1.5">
         <PopoverPrimitive.Trigger asChild>
@@ -809,7 +863,7 @@ function WorkspaceSelector({ sessionId }: { sessionId: string }) {
             key={`folder-${flashTarget === "folder" ? flashNonce : 0}`}
             className={cn(
               WORKSPACE_CHIP_CLASS,
-              flashTarget === "folder" && "ff-branch-flash",
+              !reducedMotion && flashTarget === "folder" && "ff-branch-flash",
             )}
             aria-label={`Workspace: ${path ? basename(path) : "Loading"}`}
           >
@@ -821,23 +875,52 @@ function WorkspaceSelector({ sessionId }: { sessionId: string }) {
           </button>
         </PopoverPrimitive.Trigger>
         {branch ? (
-          <button
-            type="button"
-            key={`branch-${flashTarget === "branch" ? flashNonce : 0}`}
-            className={cn(
-              WORKSPACE_CHIP_CLASS,
-              flashTarget === "branch" && "ff-branch-flash",
-            )}
-            aria-haspopup="dialog"
-            aria-expanded={open}
-            title={`Branch: ${branch}`}
-            aria-label={`Git branch: ${branch}`}
-            onClick={() => setOpen(true)}
-          >
-            <GitBranch className="size-3.5 shrink-0" />
-            <span className="truncate">{branch}</span>
-            <ChevronsUpDown className="size-3 shrink-0 opacity-60" />
-          </button>
+          <DropdownMenu open={branchOpen} onOpenChange={openBranchPicker}>
+            <DropdownMenuTrigger asChild>
+              <button
+                type="button"
+                key={`branch-${flashTarget === "branch" ? flashNonce : 0}`}
+                className={cn(
+                  WORKSPACE_CHIP_CLASS,
+                  !reducedMotion &&
+                    flashTarget === "branch" &&
+                    "ff-branch-flash",
+                )}
+                title={`Branch: ${branch}`}
+                aria-label={`Git branch: ${branch}`}
+              >
+                <GitBranch className="size-3.5 shrink-0" />
+                <span className="truncate">{branch}</span>
+                <ChevronsUpDown className="size-3 shrink-0 opacity-60" />
+              </button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent
+              align="start"
+              className="max-h-72 w-56 overflow-y-auto"
+            >
+              {loadingBranches && branches === null ? (
+                <DropdownMenuItem disabled>Loading…</DropdownMenuItem>
+              ) : !branches || branches.length === 0 ? (
+                <DropdownMenuItem disabled>No branches</DropdownMenuItem>
+              ) : (
+                branches.map((b) => (
+                  <DropdownMenuItem
+                    key={b}
+                    onSelect={() => void switchTo(b)}
+                    className="gap-2"
+                  >
+                    <GitBranch className="size-3.5 shrink-0 text-muted-foreground" />
+                    <span className="min-w-0 flex-1 truncate" title={b}>
+                      {b}
+                    </span>
+                    {b === branch && (
+                      <Check className="ml-auto size-3.5 shrink-0 text-foreground" />
+                    )}
+                  </DropdownMenuItem>
+                ))
+              )}
+            </DropdownMenuContent>
+          </DropdownMenu>
         ) : null}
         {/* Visually-hidden live region so the branch shift isn't visual-only
             (#618) — paired with the flash, announced to screen readers. */}

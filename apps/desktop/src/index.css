@@ -247,22 +247,13 @@ body {
   animation: ff-branch-flash 1.5s ease-out 1;
 }
 
-/* Reduced motion: skip the ring pulse — keep a static tint that fades out
-   (color change only, no movement). The aria-live announcement is
-   component-driven and fires regardless. */
+/* Reduced motion: the flash is fully disabled. WorkspaceSelector gates the
+   `.ff-branch-flash` class on `prefers-reduced-motion` so the class is never
+   applied here — the aria-live announcement (component-driven) still fires.
+   `animation: none` stays as defense-in-depth if the class ever leaks through. */
 @media (prefers-reduced-motion: reduce) {
-  @keyframes ff-branch-flash {
-    0% {
-      background-color: var(--accent);
-    }
-    100% {
-      background-color: transparent;
-    }
-  }
-
   .ff-branch-flash {
-    animation: ff-branch-flash 1.5s ease-out 1;
-    box-shadow: none;
+    animation: none;
   }
 }
 
