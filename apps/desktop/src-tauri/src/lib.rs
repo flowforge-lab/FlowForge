@@ -1783,6 +1783,11 @@ async fn resolve_model_selection(
     resolved.context_window = probe.window.and_then(|n| u32::try_from(n).ok());
     resolved.trained_context_window = probe.trained.and_then(|n| u32::try_from(n).ok());
     resolved.context_window_source = probe.source;
+    // Ollama reports vision capability via `/api/show`; OR it onto the name-based
+    // gate so a daemon-reported multimodal model (e.g. a qwen3-vl MoE) isn't
+    // blocked by a stale name allow-list (#625). `None`/`Some(false)` leave the
+    // name-based result untouched.
+    resolved.supports_vision = resolved.supports_vision || probe.supports_vision.unwrap_or(false);
     Ok(resolved)
 }
 
