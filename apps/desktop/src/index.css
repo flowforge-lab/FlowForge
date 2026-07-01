@@ -229,6 +229,43 @@ body {
   animation-delay: 0.4s;
 }
 
+/* One-shot pulse on the workspace/branch chip when the cwd's git branch
+   transitions (#618). Draws the eye so the context shift isn't a silent text
+   swap. Tinted background + ring settle back to the chip's resting state. */
+@keyframes ff-branch-flash {
+  0% {
+    background-color: var(--accent);
+    box-shadow: 0 0 0 2px var(--ring);
+  }
+  100% {
+    background-color: transparent;
+    box-shadow: 0 0 0 0 transparent;
+  }
+}
+
+.ff-branch-flash {
+  animation: ff-branch-flash 1.5s ease-out 1;
+}
+
+/* Reduced motion: skip the ring pulse — keep a static tint that fades out
+   (color change only, no movement). The aria-live announcement is
+   component-driven and fires regardless. */
+@media (prefers-reduced-motion: reduce) {
+  @keyframes ff-branch-flash {
+    0% {
+      background-color: var(--accent);
+    }
+    100% {
+      background-color: transparent;
+    }
+  }
+
+  .ff-branch-flash {
+    animation: ff-branch-flash 1.5s ease-out 1;
+    box-shadow: none;
+  }
+}
+
 /* --- Assistant Markdown prose (components/markdown.tsx) --- */
 
 .ff-prose {

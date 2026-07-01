@@ -698,6 +698,7 @@ function WorkspaceSelector({ sessionId }: { sessionId: string }) {
   const setWorkspace = useSessionWorkspaceStore((s) => s.set);
   const path = workspace?.path;
   const branch = workspace?.gitBranch ?? null;
+  const loaded = workspace !== undefined;
 
   const [open, setOpen] = useState(false);
   const [filter, setFilter] = useState("");
@@ -705,6 +706,53 @@ function WorkspaceSelector({ sessionId }: { sessionId: string }) {
   useEffect(() => {
     void load(sessionId);
   }, [sessionId, load]);
+
+  // Flash the chip when the cwd's git branch *transitions* (#618) — an external
+  // terminal checkout (or, once #2 lands, a self-switch) both surface as a
+  // `workspace:branch-changed` store patch. A silent text swap is easy to miss,
+  // so we draw the eye with a one-shot pulse + an aria-live announcement.
+  //
+  // The refs distinguish a true transition from "first render / different
+  // session" (the store already no-ops equal values, but the component must not
+  // flash on mount or when switching panes). `branch === null` (detached HEAD /
+  // non-repo) hides the branch chip, so that transition flashes the folder chip
+  // — the element that stays meaningful — instead.
+  const prevSessionRef = useRef(sessionId);
+  const prevBranchRef = useRef<string | null | undefined>(undefined);
+  const [flashTarget, setFlashTarget] = useState<"branch" | "folder" | null>(
+    null,
+  );
+  const [flashNonce, setFlashNonce] = useState(0);
+  const [announce, setAnnounce] = useState("");
+
+  useEffect(() => {
+    // Session/pane switch: reset the baseline and never flash — the new
+    // session's branch is a fresh context, not a transition.
+    if (prevSessionRef.current !== sessionId) {
+      prevSessionRef.current = sessionId;
+      prevBranchRef.current = loaded ? branch : undefined;
+      return;
+    }
+    // Not loaded yet: hold off so the initial load (undefined → value) isn't
+    // read as a transition.
+    if (!loaded) return;
+
+    const prev = prevBranchRef.current;
+    prevBranchRef.current = branch;
+
+    if (prev === undefined) return; // first observation for this session
+    if (prev === branch) return; // unchanged — no flash
+
+    setFlashTarget(branch === null ? "folder" : "branch");
+    setFlashNonce((n) => n + 1);
+    setAnnounce(
+      branch === null
+        ? "Working branch changed: now in detached HEAD"
+        : `Working branch changed to ${branch}`,
+    );
+    const timer = setTimeout(() => setFlashTarget(null), 1500);
+    return () => clearTimeout(timer);
+  }, [sessionId, branch, loaded]);
 
   const choose = useCallback(
     async (next: string) => {
@@ -758,7 +806,11 @@ function WorkspaceSelector({ sessionId }: { sessionId: string }) {
         <PopoverPrimitive.Trigger asChild>
           <button
             type="button"
-            className={WORKSPACE_CHIP_CLASS}
+            key={`folder-${flashTarget === "folder" ? flashNonce : 0}`}
+            className={cn(
+              WORKSPACE_CHIP_CLASS,
+              flashTarget === "folder" && "ff-branch-flash",
+            )}
             aria-label={`Workspace: ${path ? basename(path) : "Loading"}`}
           >
             <Folder className="size-3.5 shrink-0" />
@@ -771,7 +823,11 @@ function WorkspaceSelector({ sessionId }: { sessionId: string }) {
         {branch ? (
           <button
             type="button"
-            className={WORKSPACE_CHIP_CLASS}
+            key={`branch-${flashTarget === "branch" ? flashNonce : 0}`}
+            className={cn(
+              WORKSPACE_CHIP_CLASS,
+              flashTarget === "branch" && "ff-branch-flash",
+            )}
             aria-haspopup="dialog"
             aria-expanded={open}
             title={`Branch: ${branch}`}
@@ -783,6 +839,11 @@ function WorkspaceSelector({ sessionId }: { sessionId: string }) {
             <ChevronsUpDown className="size-3 shrink-0 opacity-60" />
           </button>
         ) : null}
+        {/* Visually-hidden live region so the branch shift isn't visual-only
+            (#618) — paired with the flash, announced to screen readers. */}
+        <span role="status" aria-live="polite" className="sr-only">
+          {announce}
+        </span>
       </div>
       <PopoverPrimitive.Portal>
         <PopoverPrimitive.Content
