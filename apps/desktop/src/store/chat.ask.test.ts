@@ -44,9 +44,56 @@ describe("chat store — ask_user (#44)", () => {
       messageId: MESSAGE,
       callId: CALL,
       question: QUESTION,
+      secret: false,
     });
     expect(stepOf()?.status).toBe("awaiting-answer");
     expect(stepOf()?.question).toBe(QUESTION);
+  });
+
+  it("applyAskRequest carries the secret flag onto the step (#562)", () => {
+    seedStep();
+    useChatStore.getState().applyAskRequest({
+      sessionId: SESSION,
+      messageId: MESSAGE,
+      callId: CALL,
+      question: "Enter your sudo password:",
+      secret: true,
+    });
+    expect(stepOf()?.status).toBe("awaiting-answer");
+    expect(stepOf()?.secret).toBe(true);
+  });
+
+  it("respondAsk never stashes the entered answer on the step (#562)", async () => {
+    vi.spyOn(ipc, "respondAsk").mockResolvedValue();
+    seedStep({ status: "awaiting-answer", question: QUESTION, secret: true });
+
+    await useChatStore.getState().respondAsk(SESSION, MESSAGE, CALL, "hunter2");
+
+    // The value goes straight to the turn via ipc — it must not be persisted on
+    // the step (no cleartext secret in store state).
+    const step = stepOf();
+    expect(step?.status).toBe("running");
+    expect(JSON.stringify(step)).not.toContain("hunter2");
+  });
+
+  it("applyToolResult on a secret step carries no cleartext — only the redacted placeholder (#562)", () => {
+    // The backend redacts a secret answer at the source, so the returning
+    // `tool:result` carries the placeholder — the actual round-trip leak vector.
+    seedStep({ status: "running", question: QUESTION, secret: true });
+
+    useChatStore.getState().applyToolResult({
+      sessionId: SESSION,
+      messageId: MESSAGE,
+      callId: CALL,
+      success: true,
+      result: "[secret provided by user]",
+    });
+
+    const step = stepOf();
+    expect(step?.status).toBe("done");
+    expect(step?.result).toBe("[secret provided by user]");
+    // Nothing cleartext lands on the step for the UI to render or retain.
+    expect(JSON.stringify(step)).not.toContain("hunter2");
   });
 
   it("applyAskRequest is a no-op when the message has no tracked steps", () => {
@@ -55,6 +102,7 @@ describe("chat store — ask_user (#44)", () => {
       messageId: "unknown",
       callId: CALL,
       question: QUESTION,
+      secret: false,
     });
     expect(
       useChatStore.getState().toolStepsByMessage["unknown"],

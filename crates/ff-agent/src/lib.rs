@@ -170,6 +170,13 @@ const EXTRACTIVE_COMPACT_AT_FRACTION: f64 = 0.75;
 /// full untruncated content for the UI.
 const TOOL_RESULT_MAX_BYTES: usize = 8 * 1024;
 
+/// Stand-in for a secret `ask_user` answer (#562). When the model asked with
+/// `secret: true`, the real reply must never surface downstream — not in the
+/// stored transcript (chat history + replayed model context) and not on the
+/// `ToolCallFinished` event that reaches the UI. The outcome content is replaced
+/// with this placeholder at the source, so every consumer sees it instead.
+const SECRET_ANSWER_PLACEHOLDER: &str = "[secret provided by user]";
+
 /// Persisted assistant reasoning is replayed on every later tool-call turn for
 /// reasoning gateways (#375 PR-2), so an unbounded chain-of-thought grows both
 /// the stored row and -- compounding across turns -- the wire payload. Cap what
@@ -1487,6 +1494,22 @@ pub async fn run_turn(
             // elision and the same deterministic key -- a no-op loop that makes
             // retrieve useless for any original above the cap (RC6, #476). Pass it
             // through verbatim; it ages out normally via cold-tail compaction.
+            // Secret redaction (#562): an `ask_user` answered with `secret: true`
+            // must not surface the cleartext anywhere downstream. Replace the
+            // outcome content with the placeholder at the source so BOTH the
+            // persisted transcript row AND the `ToolCallFinished` event below carry
+            // the placeholder — never the real value. This is loss-free: nothing
+            // in-flight consumes it (the model replays the placeholder from history;
+            // `process.rs` spawns with `Stdio::null()`).
+            let is_secret_ask = outcome.success
+                && tools.registry.is_interactive(&call.name)
+                && serde_json::from_str::<serde_json::Value>(&call.arguments)
+                    .ok()
+                    .and_then(|a| a.get("secret").and_then(serde_json::Value::as_bool))
+                    .unwrap_or(false);
+            if is_secret_ask {
+                outcome.content = SECRET_ANSWER_PLACEHOLDER.to_string();
+            }
             let (stored, original) = if outcome.content.len() > TOOL_RESULT_MAX_BYTES
                 && call.name != COMPACTION_RETRIEVE_TOOL
             {
@@ -2335,6 +2358,61 @@ mod tests {
         }
     }
 
+    /// #562: requests a *secret* `ask_user` (`secret: true`) first, then plain text.
+    struct AskSecretThenText {
+        calls: AtomicUsize,
+    }
+    #[async_trait]
+    impl Provider for AskSecretThenText {
+        async fn chat_stream(&self, _req: ChatRequest) -> Result<ChunkStream, LlmError> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            let chunks = if n == 0 {
+                vec![Ok(Chunk {
+                    tool_calls: vec![ToolCallDelta {
+                        index: 0,
+                        id: Some("ask_1".into()),
+                        name: Some("ask_user".into()),
+                        arguments: r#"{"question":"Enter your sudo password:","secret":true}"#
+                            .into(),
+                    }],
+                    done: true,
+                    ..Chunk::default()
+                })]
+            } else {
+                vec![Ok(Chunk {
+                    delta: "done".into(),
+                    done: true,
+                    ..Chunk::default()
+                })]
+            };
+            Ok(futures_util::stream::iter(chunks).boxed())
+        }
+    }
+
+    /// Answers any interactive `ask` with a fixed value; denies approvals.
+    struct CannedSecret(&'static str);
+    #[async_trait]
+    impl Approver for CannedSecret {
+        async fn approve(
+            &self,
+            _message_id: &str,
+            _call_id: &str,
+            _name: &str,
+            _safety: Safety,
+            _args: &serde_json::Value,
+        ) -> bool {
+            false
+        }
+        async fn ask(
+            &self,
+            _message_id: &str,
+            _call_id: &str,
+            _args: &serde_json::Value,
+        ) -> Option<String> {
+            Some(self.0.to_string())
+        }
+    }
+
     #[tokio::test]
     async fn streams_and_persists_text_turn() {
         let store = SessionStore::new();
@@ -3052,6 +3130,66 @@ mod tests {
         assert_eq!(history[2].role, Role::Tool);
         assert_eq!(history[2].tool_call_id.as_deref(), Some("ask_1"));
         assert_eq!(history[2].content, "main.rs");
+    }
+
+    /// #562: a `secret: true` answer is redacted everywhere downstream — both the
+    /// emitted `ToolCallFinished` event (which reaches the UI) and the persisted
+    /// transcript row carry the placeholder, never the cleartext.
+    #[tokio::test]
+    async fn secret_ask_redacts_answer_from_both_event_and_transcript() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::new();
+        let s = store.create_session(None);
+        store.add_message(&s.id, Role::User, "run the install".into());
+        let registry = ToolRegistry::with_defaults();
+        let approve = CannedSecret("hunter2");
+        let provider = AskSecretThenText {
+            calls: AtomicUsize::new(0),
+        };
+
+        let mut result = String::new();
+        let mut ok = false;
+        run_turn(
+            &provider,
+            &store,
+            &ctx(&registry, dir.path(), &approve),
+            &s.id,
+            "mock",
+            None,
+            false,
+            ReasoningVisibility::All,
+            CancelToken::new(),
+            |ev| match ev {
+                AgentEvent::ToolCallFinished {
+                    success, result: r, ..
+                } => {
+                    ok = success;
+                    result = r;
+                }
+                AgentEvent::Error { message } => panic!("error: {message}"),
+                _ => {}
+            },
+        )
+        .await
+        .unwrap();
+
+        // The emitted event (the UI's source) carries the placeholder, not the
+        // cleartext — this is the leak vector the FE renders in its OutputBlock.
+        assert!(
+            ok,
+            "an answered secret question is a successful tool result"
+        );
+        assert_eq!(result, SECRET_ANSWER_PLACEHOLDER);
+
+        // …and the persisted transcript row is likewise the placeholder.
+        let history = store.get_messages(&s.id);
+        assert_eq!(history[2].role, Role::Tool);
+        assert_eq!(history[2].tool_call_id.as_deref(), Some("ask_1"));
+        assert_eq!(history[2].content, SECRET_ANSWER_PLACEHOLDER);
+        assert!(
+            !history.iter().any(|m| m.content.contains("hunter2")),
+            "the cleartext secret must not appear anywhere in the transcript"
+        );
     }
 
     /// #44: a dismissed question (the default `ask` returns `None`) still emits a

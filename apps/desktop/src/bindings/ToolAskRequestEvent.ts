@@ -7,4 +7,10 @@
  * resolves the question as "[no answer: question dismissed]" — never a hang. `call_id` correlates with
  * the [`ToolCallEvent`] / [`ToolResultEvent`] for the same step.
  */
-export type ToolAskRequestEvent = { sessionId: string, messageId: string, callId: string, question: string, };
+export type ToolAskRequestEvent = { sessionId: string, messageId: string, callId: string, question: string, 
+/**
+ * The model requested a secret (#562): the frontend renders a masked field
+ * and the resolved answer is redacted to a placeholder when persisted. `false`
+ * for an ordinary question.
+ */
+secret: boolean, };

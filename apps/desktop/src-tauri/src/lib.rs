@@ -169,12 +169,17 @@ impl Approver for UiApprover {
         call_id: &str,
         args: &serde_json::Value,
     ) -> Option<String> {
-        // The loop forwards the tool args; the host reads the `question` field.
+        // The loop forwards the tool args; the host reads the `question` field and
+        // the optional `secret` flag (#562).
         let question = args
             .get("question")
             .and_then(serde_json::Value::as_str)
             .unwrap_or("")
             .to_string();
+        let secret = args
+            .get("secret")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
         let rx = self.state.register_ask(&self.session_id, call_id);
         let _ = self.app.emit(
             "tool:ask-request",
@@ -183,6 +188,7 @@ impl Approver for UiApprover {
                 message_id: message_id.to_string(),
                 call_id: call_id.to_string(),
                 question,
+                secret,
             },
         );
         // Sender dropped (cancel/teardown) -> RecvError -> dismissed (None).

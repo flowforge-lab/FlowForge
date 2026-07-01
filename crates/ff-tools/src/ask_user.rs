@@ -34,6 +34,10 @@ impl Tool for AskUserTool {
                 "question": {
                     "type": "string",
                     "description": "The question to put to the user. Be specific and concise."
+                },
+                "secret": {
+                    "type": "boolean",
+                    "description": "Set true when asking for a sensitive value (password, passphrase, API key, PIN). The user gets a masked field and their answer is redacted in the transcript. Defaults to false."
                 }
             },
             "required": ["question"]
@@ -73,5 +77,8 @@ mod tests {
         let params = t.parameters();
         assert_eq!(params["required"][0], "question");
         assert_eq!(params["properties"]["question"]["type"], "string");
+        // `secret` (#562) is advertised but optional — never in `required`.
+        assert_eq!(params["properties"]["secret"]["type"], "boolean");
+        assert_eq!(params["required"].as_array().unwrap().len(), 1);
     }
 }
