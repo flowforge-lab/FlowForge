@@ -233,8 +233,11 @@ pnpm tauri build            # requires TAURI_SIGNING_PRIVATE_KEY (see below)
 > `pnpm tauri build` *signs* the `.app.tar.gz` updater artifact and fails with
 > *"A public key has been found, but no private key… set `TAURI_SIGNING_PRIVATE_KEY`"*
 > unless that release secret is in your env. For everyday local builds use
-> **`pnpm build:local`** (passes `--config '{"bundle":{"createUpdaterArtifacts":false}}'`,
-> the same flag `dev-install.sh` uses) — it produces a runnable bundle with no key.
+> **`pnpm build:local`** (passes `--config src-tauri/tauri.no-updater-sign.conf.json`,
+> the same overlay `dev-install.sh` uses) — it produces a runnable bundle with no key.
+> A file-path `--config` is used instead of an inline JSON string so the command is
+> shell-quoting-safe on Windows (`cmd.exe`/PowerShell don't strip single quotes the
+> way bash does).
 > Only the release path (CI) and the D1 update-feed loop (§8.3) need the signing key.
 
 Definition of done for a backend change: `fmt` clean, `clippy` zero warnings,
