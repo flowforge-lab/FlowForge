@@ -3,6 +3,7 @@ import { Check, ChevronDown, Cpu } from "@/components/ui/icon";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
+import { Switch } from "@/components/ui/switch";
 import {
   DropdownMenu,
   DropdownMenuTrigger,
@@ -13,7 +14,7 @@ import {
   DropdownMenuSubContent,
   DropdownMenuSeparator,
 } from "@/components/ui/dropdown-menu";
-import { useModelConfigStore } from "@/store/model-config";
+import { useModelConfigStore, isLocalKind } from "@/store/model-config";
 import { useProfilesStore } from "@/store/profiles";
 import { useSessionModelStore } from "@/store/session-model";
 import { ModelWindowInfo } from "@/components/model-window-info";
@@ -30,6 +31,10 @@ export function ModelChip({ sessionId }: { sessionId: string }) {
   const loadModels = useModelConfigStore((s) => s.loadModels);
   const loadRegistry = useModelConfigStore((s) => s.load);
   const registryLoading = useModelConfigStore((s) => s.loading);
+  // Inline reasoning toggle for local models (#633): reads/writes the resolved
+  // connection's `thinking` via the existing per-connection action — no new IPC.
+  const setThinking = useModelConfigStore((s) => s.setThinking);
+  const saving = useModelConfigStore((s) => s.saving);
 
   // Resolution depends on the global active connection + the active phenotype, so
   // re-resolve when either changes (the picker's own set/clear reloads directly).
@@ -128,6 +133,34 @@ export function ModelChip({ sessionId }: { sessionId: string }) {
             <div className="px-2 py-1.5">
               <ModelWindowInfo info={servedWindow} />
             </div>
+            <DropdownMenuSeparator />
+          </>
+        ) : null}
+        {/* Inline "Thinking" toggle for local models (#633) — surfaces the existing
+            per-connection reasoning switch (also in Settings → Model) right where the
+            model is picked, so the speed↔reasoning tradeoff on CPU is one click away.
+            `onSelect`-preventDefault keeps the menu open; the Switch owns the change. */}
+        {resolvedConn && isLocalKind(resolvedConn.kind) ? (
+          <>
+            <DropdownMenuItem
+              onSelect={(e) => e.preventDefault()}
+              className="flex items-start justify-between gap-3"
+            >
+              <span className="flex min-w-0 flex-col">
+                <span className="text-[13px] font-medium text-foreground">
+                  Thinking
+                </span>
+                <span className="text-[11px] leading-snug text-muted-foreground">
+                  Off is faster on local models; on for hard tasks.
+                </span>
+              </span>
+              <Switch
+                aria-label="Thinking"
+                checked={resolvedConn.thinking}
+                disabled={saving}
+                onCheckedChange={(v) => void setThinking(resolvedConn.id, v)}
+              />
+            </DropdownMenuItem>
             <DropdownMenuSeparator />
           </>
         ) : null}

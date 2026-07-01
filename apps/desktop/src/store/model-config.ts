@@ -422,3 +422,11 @@ export function isHostedKeyKind(kind: ProviderKind): boolean {
 export function reasoningToggleNoOp(kind: ProviderKind): boolean {
   return kind === "openai" || kind === "siliconFlow";
 }
+
+/** On-device provider kinds — run against a local server (Ollama / candle-vLLM)
+ *  rather than a hosted API. Local kinds are always reasoning-toggle-effective, so
+ *  they're where the inline "Thinking" toggle earns its place in the composer's
+ *  model picker (#633) — the speed↔reasoning tradeoff matters most on CPU. */
+export function isLocalKind(kind: ProviderKind): boolean {
+  return kind === "ollama" || kind === "candleVllm";
+}

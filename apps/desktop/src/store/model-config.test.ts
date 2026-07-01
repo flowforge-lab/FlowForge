@@ -8,6 +8,7 @@ import {
   SUMMARY_THRESHOLD_MIN,
   activeConnection,
   concreteAuthMode,
+  isLocalKind,
   normalizeBaseUrl,
   useModelConfigStore,
 } from "@/store/model-config";
@@ -147,6 +148,16 @@ describe("model-config reasoning controls", () => {
     // The registry is backend-owned — reset leaves it (and per-connection effort) alone.
     expect(s.registry?.active).toBe("ollama");
     expect(activeConnection(s.registry)?.reasoningEffort).toBe("low");
+  });
+});
+
+describe("isLocalKind", () => {
+  it("is true for the on-device kinds and false for hosted kinds", () => {
+    expect(isLocalKind("ollama")).toBe(true);
+    expect(isLocalKind("candleVllm")).toBe(true);
+    expect(isLocalKind("openai")).toBe(false);
+    expect(isLocalKind("siliconFlow")).toBe(false);
+    expect(isLocalKind("bedrock")).toBe(false);
   });
 });
 
