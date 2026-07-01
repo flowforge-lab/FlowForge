@@ -119,8 +119,8 @@ describe("ModelChip inline Thinking toggle (#633)", () => {
     const toggle = await screen.findByRole("menuitemcheckbox", {
       name: "Thinking",
     });
-    // The mock candle-vLLM connection has thinking: true.
-    expect(toggle.getAttribute("aria-checked")).toBe("true");
+    // The mock candle-vLLM connection defaults thinking off for local kinds (#633).
+    expect(toggle.getAttribute("aria-checked")).toBe("false");
     expect(screen.getByText(/off is faster on local models/i)).not.toBeNull();
   });
 
@@ -166,9 +166,9 @@ describe("ModelChip inline Thinking toggle (#633)", () => {
       await screen.findByRole("menuitemcheckbox", { name: "Thinking" }),
     );
 
-    // Ollama's mock `thinking` is true, so the toggle flips it off.
+    // Ollama's mock `thinking` defaults off for local kinds (#633), so the toggle flips it on.
     expect(upsert).toHaveBeenCalledWith(
-      expect.objectContaining({ id: "ollama", thinking: false }),
+      expect.objectContaining({ id: "ollama", thinking: true }),
     );
     // Menu stayed open (onSelect preventDefault): the picker is still mounted.
     expect(screen.getByText("Use phenotype / global default")).not.toBeNull();
@@ -193,7 +193,7 @@ describe("ModelChip inline Thinking toggle (#633)", () => {
     await userEvent.keyboard("{Enter}");
 
     expect(upsert).toHaveBeenCalledWith(
-      expect.objectContaining({ id: "ollama", thinking: false }),
+      expect.objectContaining({ id: "ollama", thinking: true }),
     );
     expect(screen.getByText("Use phenotype / global default")).not.toBeNull();
   });

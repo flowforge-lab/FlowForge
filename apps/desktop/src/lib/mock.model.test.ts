@@ -9,7 +9,8 @@ describe("MockIpc provider config", () => {
     expect(cfg.kind).toBe("candleVllm");
     expect(cfg.model).toBeTruthy();
     expect(cfg.hasKey).toBe(false);
-    expect(cfg.thinking).toBe(true);
+    // Local kinds default reasoning off (#633).
+    expect(cfg.thinking).toBe(false);
   });
 
   it("persists a provider/model change and echoes it back on reopen", async () => {

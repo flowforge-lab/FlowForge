@@ -11,4 +11,11 @@ export type ProviderRegistry = { connections: Array<ProviderConnection>,
  * Id of the connection [`build_provider`](crate) resolves against. Always
  * references one of `connections`.
  */
-active: string, };
+active: string, 
+/**
+ * Registry schema version, bumped when a persisted-shape migration must run
+ * exactly once on load (see [`ProviderRegistry::migrate`]). `#[serde(default)]`
+ * makes a pre-versioning `provider-registry.json` load as `0`, which triggers
+ * the pending migrations. Backend-internal; the frontend ignores it.
+ */
+schemaVersion: number, };
