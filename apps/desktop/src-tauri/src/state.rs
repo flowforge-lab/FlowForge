@@ -843,7 +843,11 @@ const SERVED_WINDOW_TTL: Duration = Duration::from_secs(10);
 
 impl AppState {
     pub fn new() -> Self {
-        Self::with_registry(load_or_migrate_registry())
+        // Boot trace (#599 item 0): time the provider.json read/migrate.
+        let t = std::time::Instant::now();
+        let registry = load_or_migrate_registry();
+        crate::boot_trace_step("app_state.registry", t.elapsed());
+        Self::with_registry(registry)
     }
 
     pub fn with_registry(registry: ProviderRegistry) -> Self {
@@ -852,23 +856,39 @@ impl AppState {
         // phenotype resolves below. Gated out of tests, which must not write to the
         // real `~/.flowforge/`; the seed core is exercised directly via tempdirs.
         #[cfg(not(test))]
-        seed_builtin_content();
+        {
+            let t = std::time::Instant::now();
+            seed_builtin_content();
+            crate::boot_trace_step("app_state.seed", t.elapsed());
+        }
+        let t = std::time::Instant::now();
         let (watcher, skills) = load_skills();
+        crate::boot_trace_step("app_state.skills", t.elapsed());
         // The installer tools are agent-callable, so they own the skills root and a
         // handle to the shared registry to refresh it on a successful install.
         // Shared so the registered `web_search` tool and `set_search_config` see the
         // same cell; a settings change takes effect on the next call.
         let search_config = Arc::new(Mutex::new(load_search_config()));
+        let t = std::time::Instant::now();
         let (memory, memory_index, memory_watcher) = build_memory();
+        crate::boot_trace_step("app_state.memory_fts5", t.elapsed());
+        let t = std::time::Instant::now();
         let flush_ledger = FlushLedger::open(memory.root().join("flush.db"))
             .map(Arc::new)
             .map_err(
                 |e| tracing::warn!(error = %e, "flush ledger unavailable; memory flush disabled"),
             )
             .ok();
+        crate::boot_trace_step("app_state.flush_db", t.elapsed());
+        let t = std::time::Instant::now();
+        let store = Arc::new(build_session_store());
+        crate::boot_trace_step("app_state.session_db", t.elapsed());
+        let t = std::time::Instant::now();
+        let scheduled = Arc::new(build_scheduled_store());
+        crate::boot_trace_step("app_state.scheduled_db", t.elapsed());
         let state = Self {
-            store: Arc::new(build_session_store()),
-            scheduled: Arc::new(build_scheduled_store()),
+            store,
+            scheduled,
             registry: Mutex::new(registry),
             search_config,
             workspace_root: default_workspace_root(),

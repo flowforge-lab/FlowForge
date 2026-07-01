@@ -1,6 +1,7 @@
 import { useEffect } from "react";
 import { AppShell } from "@/components/app-shell";
 import { startIpcEvents } from "@/lib/events";
+import { reportFirstPaint } from "@/lib/boot-trace";
 import { initPrefs } from "@/store/prefs";
 import { useChatStore } from "@/store/chat";
 import { useModelConfigStore } from "@/store/model-config";
@@ -20,6 +21,9 @@ function App() {
     startIpcEvents();
     if (!booted) {
       booted = true;
+      // #599 item 0: report FE first paint back to the Rust boot trace (dev /
+      // FF_BOOT_TRACE only, real webview only). No-op otherwise.
+      reportFirstPaint();
       void useChatStore.getState().bootstrap();
       // Load the provider registry so the composer knows the active model's
       // vision capability app-wide (FE-4, #342) — not just after Settings opens.
