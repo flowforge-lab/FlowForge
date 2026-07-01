@@ -210,8 +210,22 @@ impl ToolRegistry {
     ) -> ToolOutcome {
         match self.get(name) {
             Some(tool) => tool.run_with_session(args, root, session_id).await,
-            None => ToolOutcome::error(format!("unknown tool: {name}")),
+            // Name the registered tools so a model that hallucinated a tool name
+            // (e.g. `codegraph_explore`, #646) can self-correct in one turn instead
+            // of guessing again. The list is sorted for a stable, diff-friendly hint.
+            None => ToolOutcome::error(format!(
+                "unknown tool: {name}. Available tools: {}",
+                self.sorted_names().join(", ")
+            )),
         }
+    }
+
+    /// The registered tool names, sorted. Used to make an unknown-tool error
+    /// actionable (#646).
+    fn sorted_names(&self) -> Vec<&str> {
+        let mut names: Vec<&str> = self.tools.keys().map(String::as_str).collect();
+        names.sort_unstable();
+        names
     }
 
     /// Safety of a concrete call (defaults to [`Safety::Dangerous`] for unknown
@@ -252,6 +266,30 @@ mod tests {
         let out = reg.run("nope", serde_json::json!({}), Path::new(".")).await;
         assert!(!out.success);
         assert!(out.content.contains("unknown tool"));
+    }
+
+    #[tokio::test]
+    async fn unknown_tool_error_lists_available_tools() {
+        let reg = ToolRegistry::with_defaults();
+        let out = reg
+            .run("codegraph_explore", serde_json::json!({}), Path::new("."))
+            .await;
+        assert!(!out.success);
+        assert!(out.content.contains("unknown tool: codegraph_explore"));
+        assert!(
+            out.content.contains("Available tools:"),
+            "error should name the registered tools so the model can self-correct"
+        );
+        // Every registered tool is named, in sorted order.
+        let mut expected: Vec<&str> = reg.tools.keys().map(String::as_str).collect();
+        expected.sort_unstable();
+        assert!(!expected.is_empty(), "default registry has tools");
+        for name in &expected {
+            assert!(
+                out.content.contains(name),
+                "available-tools hint should include {name}"
+            );
+        }
     }
 
     #[test]
