@@ -53,6 +53,7 @@ describe("concreteAuthMode", () => {
     thinking: true,
     reasoningEffort: "medium",
     reasoningVisibility: "all",
+    warmupEnabled: true,
     region: "us-east-1",
     ...over,
   });
@@ -138,6 +139,7 @@ describe("model-config reasoning controls", () => {
             thinking: true,
             reasoningEffort: "low",
             reasoningVisibility: "all",
+            warmupEnabled: true,
           },
         ],
       },
@@ -179,6 +181,7 @@ describe("model-config registry (mock IPC)", () => {
       thinking: true,
       reasoningEffort: "low",
       reasoningVisibility: "all",
+      warmupEnabled: true,
       region: "us-east-1",
       authMode: "profile",
       awsProfile: "bedrock-profile",
@@ -243,6 +246,26 @@ describe("model-config registry (mock IPC)", () => {
         .getState()
         .registry?.connections.find((c) => c.id === "ollama")?.reasoningEffort,
     ).toBe("high");
+  });
+
+  it("setWarmupEnabled persists a connection's warmup flag via IPC (#61)", async () => {
+    const { load, setWarmupEnabled } = useModelConfigStore.getState();
+    await load();
+    // Seeded connections warm by default.
+    expect(
+      useModelConfigStore
+        .getState()
+        .registry?.connections.find((c) => c.id === "ollama")?.warmupEnabled,
+    ).toBe(true);
+    await setWarmupEnabled("ollama", false);
+    // Survives a fresh reload (persisted, not just optimistic).
+    useModelConfigStore.setState({ registry: null });
+    await useModelConfigStore.getState().load();
+    expect(
+      useModelConfigStore
+        .getState()
+        .registry?.connections.find((c) => c.id === "ollama")?.warmupEnabled,
+    ).toBe(false);
   });
 
   it("picking a default model also activates that connection", async () => {

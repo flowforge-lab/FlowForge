@@ -31,6 +31,11 @@ import {
 import type { Attachment } from "@/bindings";
 import { attachmentKindFor, fileToAttachment } from "@/lib/attachments";
 import { cn } from "@/lib/utils";
+import {
+  useModelConfigStore,
+  activeConnection,
+  isLocalKind,
+} from "@/store/model-config";
 import { formatBytes } from "@/lib/memory-view";
 import { ipc } from "@/lib/ipc";
 import { useChatStore } from "@/store/chat";
@@ -241,14 +246,23 @@ export function InputBar({
     e.target.value = "";
   }
 
+  // Warmup only helps local backends, and firing it against a hosted endpoint
+  // would bill a request on every focus (#61). Also honor the per-connection
+  // toggle (off e.g. on laptop battery). The backend gates too (defense in depth).
+  const warmupAllowed = useModelConfigStore((s) => {
+    const conn = activeConnection(s.registry);
+    return conn ? isLocalKind(conn.kind) && conn.warmupEnabled : false;
+  });
+
   // Throttled, fire-and-forget server warmup (see note at top of file).
   const lastWarmupRef = useRef(0);
   const warmup = useCallback(() => {
+    if (!warmupAllowed) return;
     const now = Date.now();
     if (now - lastWarmupRef.current < WARMUP_THROTTLE_MS) return;
     lastWarmupRef.current = now;
     void ipc.warmup().catch(() => {});
-  }, []);
+  }, [warmupAllowed]);
 
   // Keyboard-native: focus follows the (pane's) session — but only for the
   // focused pane, so background panes don't steal focus on mount.

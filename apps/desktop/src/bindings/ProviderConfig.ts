@@ -38,4 +38,12 @@ reasoningEffort: ReasoningEffort,
  * on. `#[serde(default)]` keeps legacy `provider.json` files loading as
  * [`ReasoningVisibility::All`] (the natural final answer shows a Thought).
  */
-reasoningVisibility: ReasoningVisibility, };
+reasoningVisibility: ReasoningVisibility, 
+/**
+ * Whether the composer warmup nudge (#61) fires for this connection. Default
+ * `true` (no regression). Only meaningful for local kinds; the warmup command
+ * also gates on [`ProviderKind::is_local`]. Users disable it to avoid sustained
+ * GPU use (e.g. on laptop battery). `#[serde(default = "default_warmup_enabled")]`
+ * keeps pre-#61 registries loading as `true`.
+ */
+warmupEnabled: boolean, };

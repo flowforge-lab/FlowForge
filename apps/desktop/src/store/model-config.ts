@@ -49,6 +49,7 @@ function defaultConnection(kind: ProviderKind): ProviderConnection {
     thinking: true,
     reasoningEffort: "medium",
     reasoningVisibility: "all",
+    warmupEnabled: true,
   };
   switch (kind) {
     case "bedrock":
@@ -103,6 +104,9 @@ interface ModelConfigState extends LocalReasoningPrefs {
   /** Toggle reasoning streams for a connection (the active one drives the global
    *  reasoning controls). */
   setThinking: (id: string, thinking: boolean) => Promise<void>;
+  /** Toggle the composer warmup nudge for a connection (#61). Only meaningful for
+   *  local kinds; disable to avoid sustained GPU use (e.g. on laptop battery). */
+  setWarmupEnabled: (id: string, warmupEnabled: boolean) => Promise<void>;
   /** Store a secret (write-only); `hasKey` updates from the refreshed registry. */
   setSecret: (id: string, kind: SecretKind, value: string) => Promise<void>;
   /** Clear a stored secret; `hasKey` updates from the refreshed registry. */
@@ -286,6 +290,19 @@ export const useModelConfigStore = create<ModelConfigState>()(
           }
         },
 
+        setWarmupEnabled: async (id, warmupEnabled) => {
+          const conn = get().registry?.connections.find((c) => c.id === id);
+          if (!conn || conn.warmupEnabled === warmupEnabled) return;
+          set({ saving: true, error: null });
+          try {
+            await ipc.upsertConnection({ ...conn, warmupEnabled });
+            await refresh();
+            set({ saving: false });
+          } catch (err) {
+            set({ saving: false, error: errMsg(err) });
+          }
+        },
+
         setSecret: async (id, kind, value) => {
           set({ saving: true, error: null });
           try {
@@ -424,9 +441,11 @@ export function reasoningToggleNoOp(kind: ProviderKind): boolean {
 }
 
 /** On-device provider kinds — run against a local server (Ollama / candle-vLLM)
- *  rather than a hosted API. Local kinds are always reasoning-toggle-effective, so
- *  they're where the inline "Thinking" toggle earns its place in the composer's
- *  model picker (#633) — the speed↔reasoning tradeoff matters most on CPU. */
+ *  rather than a hosted API. Mirrors `ProviderKind::is_local` (Rust). Local kinds
+ *  are always reasoning-toggle-effective, so they're where the inline "Thinking"
+ *  toggle earns its place in the composer's model picker (#633) — the
+ *  speed↔reasoning tradeoff matters most on CPU. Also gates the composer warmup
+ *  nudge (#61): warming a hosted endpoint would fire a billed request. */
 export function isLocalKind(kind: ProviderKind): boolean {
   return kind === "ollama" || kind === "candleVllm";
 }

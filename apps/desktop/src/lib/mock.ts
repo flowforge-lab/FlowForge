@@ -470,6 +470,7 @@ export class MockIpc implements FfIpc {
         thinking: true,
         reasoningEffort: "medium",
         reasoningVisibility: "all",
+        warmupEnabled: true,
       },
       {
         id: "ollama",
@@ -481,6 +482,7 @@ export class MockIpc implements FfIpc {
         thinking: true,
         reasoningEffort: "medium",
         reasoningVisibility: "all",
+        warmupEnabled: true,
       },
       {
         id: "bedrock",
@@ -492,6 +494,7 @@ export class MockIpc implements FfIpc {
         thinking: true,
         reasoningEffort: "low",
         reasoningVisibility: "all",
+        warmupEnabled: true,
         region: "us-east-1",
         authMode: "profile",
         awsProfile: "bedrock-profile",
@@ -511,6 +514,7 @@ export class MockIpc implements FfIpc {
         thinking: true,
         reasoningEffort: "high",
         reasoningVisibility: "all",
+        warmupEnabled: true,
       },
       // OpenAI (#311 PR-3b): a hosted, OpenAI-compatible connection so the
       // hosted-key card is exercisable offline. Keyless by default → the Test
@@ -527,6 +531,7 @@ export class MockIpc implements FfIpc {
         thinking: true,
         reasoningEffort: "medium",
         reasoningVisibility: "all",
+        warmupEnabled: true,
       },
     ],
   };
@@ -1086,6 +1091,7 @@ export class MockIpc implements FfIpc {
       thinking: c.thinking,
       reasoningEffort: c.reasoningEffort,
       reasoningVisibility: c.reasoningVisibility,
+      warmupEnabled: true,
     };
   }
 
@@ -1111,6 +1117,7 @@ export class MockIpc implements FfIpc {
       thinking: c.thinking,
       reasoningEffort: c.reasoningEffort,
       reasoningVisibility: c.reasoningVisibility,
+      warmupEnabled: true,
     };
   }
 

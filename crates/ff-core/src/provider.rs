@@ -13,6 +13,10 @@ fn default_thinking() -> bool {
     true
 }
 
+fn default_warmup_enabled() -> bool {
+    true
+}
+
 /// User-facing reasoning *depth* dial (#394/#395), mirroring the frontend
 /// `Effort` (apps/desktop/src/store/model-config.ts: `low | medium | high`,
 /// default `medium`). Orthogonal to the on/off gate (`ChatRequest::thinking`):
@@ -155,6 +159,14 @@ impl ProviderKind {
             ProviderKind::SiliconFlow => "siliconflow",
         }
     }
+
+    /// Whether this is a local, credential-free backend running on the user's
+    /// own machine (candle-vLLM or Ollama). Hosted kinds return `false`. Gates
+    /// the composer warmup nudge (#61): warming a *hosted* endpoint would fire a
+    /// billed request on every composer focus, so warmup is local-only.
+    pub fn is_local(self) -> bool {
+        matches!(self, ProviderKind::CandleVllm | ProviderKind::Ollama)
+    }
 }
 
 /// How a Bedrock connection authenticates. Every mode resolves credentials
@@ -261,6 +273,13 @@ pub struct ProviderConfig {
     /// [`ReasoningVisibility::All`] (the natural final answer shows a Thought).
     #[serde(default)]
     pub reasoning_visibility: ReasoningVisibility,
+    /// Whether the composer warmup nudge (#61) fires for this connection. Default
+    /// `true` (no regression). Only meaningful for local kinds; the warmup command
+    /// also gates on [`ProviderKind::is_local`]. Users disable it to avoid sustained
+    /// GPU use (e.g. on laptop battery). `#[serde(default = "default_warmup_enabled")]`
+    /// keeps pre-#61 registries loading as `true`.
+    #[serde(default = "default_warmup_enabled")]
+    pub warmup_enabled: bool,
 }
 
 /// FlowForge's out-of-the-box default: local candle-vllm serving Qwen3-4B.
@@ -274,6 +293,7 @@ impl Default for ProviderConfig {
             thinking: true,
             reasoning_effort: ReasoningEffort::default(),
             reasoning_visibility: ReasoningVisibility::default(),
+            warmup_enabled: true,
         }
     }
 }
@@ -340,6 +360,13 @@ pub struct ProviderConnection {
     /// loading as [`ReasoningVisibility::All`].
     #[serde(default)]
     pub reasoning_visibility: ReasoningVisibility,
+    /// Whether the composer warmup nudge (#61) fires for this connection. Default
+    /// `true` (no regression). Only meaningful for local kinds; the warmup command
+    /// also gates on [`ProviderKind::is_local`]. Users disable it to avoid sustained
+    /// GPU use (e.g. on laptop battery). `#[serde(default = "default_warmup_enabled")]`
+    /// keeps pre-#61 registries loading as `true`.
+    #[serde(default = "default_warmup_enabled")]
+    pub warmup_enabled: bool,
     /// AWS region for a Bedrock connection (e.g. `"us-east-1"`); the provider
     /// derives `bedrock-runtime.<region>.amazonaws.com` from it. `None` for
     /// non-Bedrock kinds.
@@ -582,6 +609,7 @@ impl Default for ProviderRegistry {
             thinking: true,
             reasoning_effort: ReasoningEffort::default(),
             reasoning_visibility: ReasoningVisibility::default(),
+            warmup_enabled: true,
             region: None,
             auth_mode: None,
             aws_profile: None,
@@ -599,6 +627,7 @@ impl Default for ProviderRegistry {
             thinking: true,
             reasoning_effort: ReasoningEffort::default(),
             reasoning_visibility: ReasoningVisibility::default(),
+            warmup_enabled: true,
             region: None,
             auth_mode: None,
             aws_profile: None,
@@ -621,6 +650,29 @@ mod tests {
         assert_eq!(cfg.kind, ProviderKind::CandleVllm);
         assert_eq!(cfg.base_url, None);
         assert!(!cfg.has_key);
+    }
+
+    #[test]
+    fn is_local_true_for_local_kinds_only() {
+        assert!(ProviderKind::CandleVllm.is_local());
+        assert!(ProviderKind::Ollama.is_local());
+        assert!(!ProviderKind::Bedrock.is_local());
+        assert!(!ProviderKind::OpenAi.is_local());
+        assert!(!ProviderKind::SiliconFlow.is_local());
+    }
+
+    #[test]
+    fn default_config_enables_warmup() {
+        assert!(ProviderConfig::default().warmup_enabled);
+    }
+
+    #[test]
+    fn legacy_config_without_warmup_defaults_enabled() {
+        // A pre-#61 provider.json has no `warmupEnabled` key; it must load as true
+        // so existing installs keep today's behavior (no regression).
+        let json = r#"{"kind":"ollama","model":"llama3.2","hasKey":false,"thinking":true}"#;
+        let cfg: ProviderConfig = serde_json::from_str(json).unwrap();
+        assert!(cfg.warmup_enabled);
     }
 
     #[test]
@@ -703,6 +755,7 @@ mod tests {
             thinking: true,
             reasoning_effort: ReasoningEffort::default(),
             reasoning_visibility: ReasoningVisibility::default(),
+            warmup_enabled: true,
             region: None,
             auth_mode: None,
             aws_profile: None,
@@ -818,6 +871,7 @@ mod tests {
             thinking: true,
             reasoning_effort: ReasoningEffort::default(),
             reasoning_visibility: ReasoningVisibility::default(),
+            warmup_enabled: true,
             region: None,
             auth_mode: None,
             aws_profile: None,
