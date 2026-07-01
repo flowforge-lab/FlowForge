@@ -122,7 +122,7 @@ function reconstructSteps(
 /**
  * Fold a transcript into ordered render groups. Each user message is its own group;
  * the run of non-user messages that follows is one assistant turn. Within a turn,
- * each assistant message contributes its reasoning then its prose (folded rows)
+ * each assistant message contributes its prose then its reasoning (folded rows)
  * followed by its steps — live steps from `liveSteps[messageId]` when present, else
  * reconstructed from the following persisted `tool` results. A run with no assistant
  * message is emitted as bare `loose` rows (#331).
@@ -186,18 +186,22 @@ export function foldTurns(
       // Thinking block; see chat-view.tsx). When the turn has steps, reasoning is
       // interleaved per iteration as a `reasoning` item below — never floated to the top.
       if (!reasoning && a.reasoning) reasoning = a.reasoning;
-      // This iteration's reasoning, in position — immediately before the prose/steps it
-      // produced (#574). The live stream wins over the persisted copy so streaming order
-      // matches the persisted order on reload.
-      const aReasoning = liveReasoning?.[a.id] ?? a.reasoning ?? "";
-      if (aReasoning.trim()) {
-        items.push({ kind: "reasoning", text: aReasoning, key: a.id });
-      }
+      // Push order per iteration is `prose → reasoning → steps` (#619): prose leads so
+      // `segmentTurn` can split it off as a top-level block, leaving this iteration's
+      // reasoning contiguous with the steps it produced (#574) inside one steps segment.
+      //
       // Intermediate prose: a non-final assistant message's content is narration
       // between tool calls (#415). The final message's content is the answer,
       // rendered below the group — never a prose row.
       if (a !== lastAssistant && a.content.trim()) {
         items.push({ kind: "prose", text: a.content, key: a.id });
+      }
+      // This iteration's reasoning, in position — immediately before the steps it
+      // produced (#574). The live stream wins over the persisted copy so streaming order
+      // matches the persisted order on reload.
+      const aReasoning = liveReasoning?.[a.id] ?? a.reasoning ?? "";
+      if (aReasoning.trim()) {
+        items.push({ kind: "reasoning", text: aReasoning, key: a.id });
       }
       const live = liveSteps?.[a.id];
       const aSteps =
@@ -218,4 +222,67 @@ export function foldTurns(
     });
   }
   return groups;
+}
+
+/** A chronological chunk of one assistant turn (#619). Intermediate prose is a
+ *  standalone, top-level block; the contiguous reasoning + steps around it are one
+ *  collapsible steps segment (a "N steps" group). Rendered in order, the turn reads
+ *  `prose → steps → prose → steps → …` so intermediate narration is visible without
+ *  expanding any group. */
+export type TurnSegment =
+  | { kind: "prose"; text: string; key: string }
+  | { kind: "steps"; items: TurnItem[]; steps: ToolStep[]; key: string };
+
+/**
+ * Split a turn's ordered {@link TurnItem}s into {@link TurnSegment}s: each `prose`
+ * item becomes its own standalone segment, and each run of contiguous
+ * `reasoning`/`step` items collapses into one `steps` segment (carrying its own flat
+ * `steps` for the per-group "N steps" count). Empty steps segments are dropped, so a
+ * turn with no prose yields a single steps segment — identical to the pre-split render.
+ *
+ * Pure and React-free (unit-tested in turn-groups.test.ts); the reorder in `foldTurns`
+ * to `prose → reasoning → steps` keeps each iteration's reasoning bound to its steps
+ * inside one segment (#574).
+ */
+export function segmentTurn(items: TurnItem[]): TurnSegment[] {
+  const segments: TurnSegment[] = [];
+  let buffer: TurnItem[] = [];
+  let bufferSteps: ToolStep[] = [];
+
+  const flush = () => {
+    if (buffer.length > 0) {
+      // Key off the first tool call in the run so the key stays stable while
+      // streaming: a step can be buffered before its iteration's reasoning tokens
+      // arrive, and pinning to `buffer[0]` would flip `callId` -> `messageId`
+      // mid-stream, remounting the group and dropping its collapse state (#629). A
+      // reasoning-only run (thinking, no tool calls) has no step, so fall back to
+      // that item's `key`.
+      const firstStep = buffer.find(
+        (it): it is Extract<TurnItem, { kind: "step" }> => it.kind === "step",
+      );
+      const first = buffer[0];
+      segments.push({
+        kind: "steps",
+        items: buffer,
+        steps: bufferSteps,
+        key:
+          firstStep?.step.callId ??
+          (first.kind === "step" ? first.step.callId : first.key),
+      });
+    }
+    buffer = [];
+    bufferSteps = [];
+  };
+
+  for (const it of items) {
+    if (it.kind === "prose") {
+      flush();
+      segments.push({ kind: "prose", text: it.text, key: it.key });
+    } else {
+      buffer.push(it);
+      if (it.kind === "step") bufferSteps.push(it.step);
+    }
+  }
+  flush();
+  return segments;
 }

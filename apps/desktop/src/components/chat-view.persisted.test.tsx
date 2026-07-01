@@ -148,7 +148,7 @@ describe("ChatView reloaded multi-step turns (#413)", () => {
   });
 });
 
-describe("ChatView interleaved intermediate prose (#415)", () => {
+describe("ChatView intermediate prose — top-level, split groups (#619, supersedes #415)", () => {
   function interleavedTurn(): Message[] {
     return [
       { id: "u1", sessionId: SID, role: "user", content: "go", createdAt: 1 },
@@ -194,32 +194,40 @@ describe("ChatView interleaved intermediate prose (#415)", () => {
     ];
   }
 
-  it("renders intermediate prose as folded rows, interleaved with the steps", () => {
+  it("hoists prose to top-level blocks and splits the steps into per-iteration groups", () => {
     seed(interleavedTurn());
     const { container } = render(<ChatView />);
-
-    const header = groupHeader(container);
-    expect(header!.textContent).toContain("2 steps");
-    // Collapsed by default: prose rows not shown yet.
-    expect(within(container).queryByText("Reading the file.")).toBeNull();
-
-    fireEvent.click(header!);
     const q = within(container);
+
+    // The turn splits into two collapsed "1 step" groups (not one "2 steps").
+    const headers = Array.from(
+      container.querySelectorAll<HTMLElement>("button[aria-expanded]"),
+    ).filter((b) => /\d+\s+steps?/.test(b.textContent ?? ""));
+    expect(headers).toHaveLength(2);
+    for (const h of headers) {
+      expect(h.getAttribute("aria-expanded")).toBe("false");
+      expect(h.textContent).toContain("1 step");
+    }
+
+    // Intermediate prose is visible at top level WITHOUT expanding any group…
     expect(q.getByText("Reading the file.")).toBeTruthy();
     expect(q.getByText("Now searching.")).toBeTruthy();
-    expect(q.getByText("Run `ls`")).toBeTruthy();
-    expect(q.getByText("Run `pwd`")).toBeTruthy();
+    // …while the steps stay folded until their group is expanded.
+    expect(q.queryByText("Run `ls`")).toBeNull();
+    expect(q.queryByText("Run `pwd`")).toBeNull();
 
-    // Order: prose₁ → step₁ → prose₂ → step₂.
+    // Chronological order: prose₁ → group₁ → prose₂ → group₂.
     const body = container.textContent ?? "";
-    const order = [
-      "Reading the file.",
-      "Run `ls`",
-      "Now searching.",
-      "Run `pwd`",
-    ].map((t) => body.indexOf(t));
-    expect(order).toEqual([...order].sort((a, b) => a - b));
-    expect(order.every((i) => i >= 0)).toBe(true);
+    expect(body.indexOf("Reading the file.")).toBeGreaterThanOrEqual(0);
+    expect(body.indexOf("Now searching.")).toBeGreaterThan(
+      body.indexOf("Reading the file."),
+    );
+
+    // Expanding each group reveals only its own step.
+    fireEvent.click(headers[0]);
+    expect(q.getByText("Run `ls`")).toBeTruthy();
+    fireEvent.click(headers[1]);
+    expect(q.getByText("Run `pwd`")).toBeTruthy();
   });
 });
 
