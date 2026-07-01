@@ -38,6 +38,11 @@ export interface ToolStep {
   safety?: ApprovalSafety;
   /** Set when status is "awaiting-answer" — the `ask_user` question (#44). */
   question?: string;
+  /** Set when status is "awaiting-answer" — the model requested a secret (#562):
+   *  render a masked single-line field; the answer is redacted at rest by the
+   *  backend. Never carries the entered value — that is passed straight to the
+   *  turn via `respondAsk` and never stashed on the step. */
+  secret?: boolean;
   /** Approved via "Allow this session" (#229) — renders the amber "session" badge.
    *  Set on the resolving step and pre-set on later auto-approved calls of the
    *  same tool (the backend short-circuits those with no approval event). */
@@ -900,7 +905,12 @@ export const useChatStore = create<ChatState>((set, get) => ({
           ...s.toolStepsByMessage,
           [e.messageId]: steps.map((step) =>
             step.callId === e.callId
-              ? { ...step, status: "awaiting-answer", question: e.question }
+              ? {
+                  ...step,
+                  status: "awaiting-answer",
+                  question: e.question,
+                  secret: e.secret,
+                }
               : step,
           ),
         },

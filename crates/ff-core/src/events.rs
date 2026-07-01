@@ -80,6 +80,10 @@ pub struct ToolAskRequestEvent {
     pub message_id: String,
     pub call_id: String,
     pub question: String,
+    /// The model requested a secret (#562): the frontend renders a masked field
+    /// and the resolved answer is redacted to a placeholder when persisted. `false`
+    /// for an ordinary question.
+    pub secret: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]

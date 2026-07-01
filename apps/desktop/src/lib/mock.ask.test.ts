@@ -28,6 +28,57 @@ describe("MockIpc ask_user round-trip", () => {
     expect(answered[0].success).toBe(true);
     expect(answered[0].result).toBe("src/main.ts");
   });
+
+  it("a secret/password message drives the masked ask variant (#562)", async () => {
+    const ipc = new MockIpc();
+    const session = await ipc.createSession();
+
+    const asks: { callId: string; secret: boolean }[] = [];
+    await ipc.onAskRequest((e) => {
+      asks.push({ callId: e.callId, secret: e.secret });
+    });
+
+    await ipc.sendMessage(session.id, "here is my sudo password");
+    expect(asks).toHaveLength(1);
+    expect(asks[0].secret).toBe(true);
+  });
+
+  it("a secret answer round-trips as the redacted placeholder, not cleartext (#562)", async () => {
+    const ipc = new MockIpc();
+    const session = await ipc.createSession();
+
+    let askCallId = "";
+    await ipc.onAskRequest((e) => {
+      askCallId = e.callId;
+    });
+    const results: ToolResultEvent[] = [];
+    await ipc.onToolResult((e) => {
+      results.push(e);
+    });
+
+    await ipc.sendMessage(session.id, "enter your password");
+    await ipc.respondAsk(session.id, askCallId, "hunter2");
+
+    const answered = results.filter((r) => r.callId === askCallId);
+    expect(answered).toHaveLength(1);
+    // The typed secret must never come back over the result event.
+    expect(answered[0].result).toBe("[secret provided by user]");
+    expect(answered[0].result).not.toContain("hunter2");
+  });
+
+  it("a plain message keeps the ask non-secret (#562)", async () => {
+    const ipc = new MockIpc();
+    const session = await ipc.createSession();
+
+    const asks: { secret: boolean }[] = [];
+    await ipc.onAskRequest((e) => {
+      asks.push({ secret: e.secret });
+    });
+
+    await ipc.sendMessage(session.id, "hello");
+    expect(asks).toHaveLength(1);
+    expect(asks[0].secret).toBe(false);
+  });
 });
 
 describe("MockIpc ask_user cancellation", () => {

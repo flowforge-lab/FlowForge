@@ -16,6 +16,7 @@ import { parseTodo } from "@/lib/todo";
 import { TodoList } from "@/components/todo-list";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import { Spinner } from "@/components/ui/spinner";
 import { Textarea } from "@/components/ui/textarea";
 import type { ToolStep } from "@/store/chat";
@@ -41,11 +42,19 @@ function StatusIcon({ status }: { status: ToolStep["status"] }) {
 // reply box. Submit (Enter, or the button) sends the answer back as the tool
 // result; Shift+Enter inserts a newline. Dismissing is the turn's Stop button —
 // the backend resolves a dropped ask without a hang, so there's no deny here.
+//
+// `secret` (#562): the model requested a sensitive answer (password, passphrase,
+// PIN…). Render a masked single-line `<input type="password">` instead of the
+// Textarea — no Shift+Enter newline, autocomplete off — and clear the local input
+// state the instant it's sent so no cleartext lingers in the component after
+// hand-off. The backend redacts the persisted tool result to a placeholder.
 function AskPrompt({
   question,
+  secret,
   onSubmit,
 }: {
   question: string;
+  secret?: boolean;
   onSubmit: (answer: string) => void;
 }) {
   const [answer, setAnswer] = useState("");
@@ -54,6 +63,9 @@ function AskPrompt({
   const submit = () => {
     if (!canSubmit) return;
     onSubmit(answer.trim());
+    // Drop the entered text immediately — especially for secrets, nothing should
+    // sit in component state past the send.
+    setAnswer("");
   };
 
   return (
@@ -61,20 +73,38 @@ function AskPrompt({
       <p className="whitespace-pre-wrap font-sans text-[13px] leading-relaxed text-foreground">
         {question}
       </p>
-      <Textarea
-        autoFocus
-        rows={2}
-        value={answer}
-        placeholder="Type your answer…"
-        className="min-h-16 font-sans text-[13px]"
-        onChange={(e) => setAnswer(e.currentTarget.value)}
-        onKeyDown={(e) => {
-          if (e.key === "Enter" && !e.shiftKey) {
-            e.preventDefault();
-            submit();
-          }
-        }}
-      />
+      {secret ? (
+        <Input
+          autoFocus
+          type="password"
+          autoComplete="off"
+          value={answer}
+          placeholder="Enter secret…"
+          className="font-sans text-[13px]"
+          onChange={(e) => setAnswer(e.currentTarget.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") {
+              e.preventDefault();
+              submit();
+            }
+          }}
+        />
+      ) : (
+        <Textarea
+          autoFocus
+          rows={2}
+          value={answer}
+          placeholder="Type your answer…"
+          className="min-h-16 font-sans text-[13px]"
+          onChange={(e) => setAnswer(e.currentTarget.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter" && !e.shiftKey) {
+              e.preventDefault();
+              submit();
+            }
+          }}
+        />
+      )}
       <div className="flex items-center gap-2">
         <Button
           size="sm"
@@ -86,7 +116,7 @@ function AskPrompt({
         </Button>
         <span className="flex items-center gap-1 text-[11px] text-muted-foreground/70">
           <CornerDownLeft className="size-3" />
-          to send · Shift+Enter for a new line
+          {secret ? "to send" : "to send · Shift+Enter for a new line"}
         </span>
       </div>
     </div>
@@ -208,6 +238,7 @@ export function ToolStepBlock({
       {open && asking && (
         <AskPrompt
           question={question}
+          secret={step.secret}
           onSubmit={(answer) => onAnswer?.(step.callId, answer)}
         />
       )}

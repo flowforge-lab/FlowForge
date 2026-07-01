@@ -77,6 +77,11 @@ const SECRET_KIND_ALL: readonly SecretKind[] = [
 // 300 ms/word in slow mode — long enough to see the Stop button and click it.
 const TOKEN_INTERVAL_MS = import.meta.env.VITE_FF_MOCK_SLOW === "1" ? 300 : 40;
 
+// Mirrors the backend `SECRET_ANSWER_PLACEHOLDER` (#562): a secret `ask_user`
+// answer is redacted at the source, so the `tool:result` the FE receives carries
+// this placeholder, never the typed value.
+const SECRET_ANSWER_PLACEHOLDER = "[secret provided by user]";
+
 // A small Markdown document so the renderer's features (headings, lists,
 // emphasis, inline code, a fenced + highlighted code block, a table, a link)
 // are all exercised under `VITE_FF_MOCK=1`. Uses single spaces between words so
@@ -818,7 +823,11 @@ export class MockIpc implements FfIpc {
       });
       return user.id;
     }
-    this.streamAssistant(sessionId);
+    // Dev-only (#562): a message mentioning a secret/password drives the
+    // `ask_user` step's masked variant, so the `<input type="password">` +
+    // at-rest redaction path is demoable under VITE_FF_MOCK=1.
+    const secret = /\b(secret|password|passphrase)\b/i.test(content);
+    this.streamAssistant(sessionId, secret);
     return user.id;
   }
 
@@ -1924,7 +1933,7 @@ Shipping the Settings redesign — currently the Memory browser (SET.8).
     return msg.id;
   }
 
-  private streamAssistant(sessionId: string): void {
+  private streamAssistant(sessionId: string, secret = false): void {
     const turn: ActiveTurn = {
       timers: [],
       messageId: "",
@@ -1980,7 +1989,7 @@ Shipping the Settings redesign — currently the Memory browser (SET.8).
       "Found 7 references across 3 files. I'll confirm the file, then make the edit.",
     );
     turn.messageId = a2;
-    this.emitAskStep(sessionId, a2, turn, () => {
+    this.emitAskStep(sessionId, a2, turn, secret, () => {
       this.emitApprovalStep(sessionId, a2, turn, () => {
         // Final iteration: the answer lands on its own assistant message, so the
         // intermediate prose above renders as folded rows rather than the answer.
@@ -1999,11 +2008,14 @@ Shipping the Settings redesign — currently the Memory browser (SET.8).
     sessionId: string,
     messageId: string,
     turn: ActiveTurn,
+    secret: boolean,
     next: () => void,
   ): void {
     const callId = uidShort();
     turn.pendingToolCalls.push(callId);
-    const args = { question: "Which file should I update?" };
+    const args = secret
+      ? { question: "Enter your sudo password to continue:", secret: true }
+      : { question: "Which file should I update?" };
     this.emit(this.toolCallListeners, {
       sessionId,
       messageId,
@@ -2016,6 +2028,7 @@ Shipping the Settings redesign — currently the Memory browser (SET.8).
       messageId,
       callId,
       question: args.question,
+      secret,
     });
     this.pendingAsks.set(approvalKey(sessionId, callId), (answer) => {
       turn.pendingToolCalls = turn.pendingToolCalls.filter(
@@ -2026,7 +2039,9 @@ Shipping the Settings redesign — currently the Memory browser (SET.8).
         messageId,
         callId,
         success: true,
-        result: answer,
+        // Backend redacts a secret answer at the source (#562), so the result the
+        // FE sees is the placeholder — never the typed value.
+        result: secret ? SECRET_ANSWER_PLACEHOLDER : answer,
       });
       next();
     });

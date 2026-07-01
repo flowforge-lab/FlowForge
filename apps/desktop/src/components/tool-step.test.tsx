@@ -151,6 +151,85 @@ describe("ToolStepBlock — four-option approval (#229)", () => {
   });
 });
 
+/** Set a controlled input/textarea's value the way React expects, then fire the
+ *  matching event so onChange runs. */
+function type(el: HTMLInputElement | HTMLTextAreaElement, value: string) {
+  const proto =
+    el instanceof HTMLTextAreaElement
+      ? HTMLTextAreaElement.prototype
+      : HTMLInputElement.prototype;
+  const setter = Object.getOwnPropertyDescriptor(proto, "value")?.set;
+  act(() => {
+    setter?.call(el, value);
+    el.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+}
+
+function keyDown(el: Element, key: string) {
+  act(() => {
+    el.dispatchEvent(new KeyboardEvent("keydown", { key, bubbles: true }));
+  });
+}
+
+describe("ToolStepBlock — ask_user secret variant (#562)", () => {
+  const askStep = (over: Partial<ToolStep> = {}): ToolStep => ({
+    callId: "c1",
+    tool: "ask_user",
+    args: { question: "Enter your sudo password:" },
+    status: "awaiting-answer",
+    question: "Enter your sudo password:",
+    ...over,
+  });
+
+  it("renders a masked password input (not a textarea) when secret", () => {
+    render(
+      <ToolStepBlock
+        step={askStep({ secret: true })}
+        onRespond={vi.fn()}
+        onApproveSession={vi.fn()}
+        onApproveAlways={vi.fn()}
+        onAnswer={vi.fn()}
+      />,
+    );
+    expect(container.querySelector('input[type="password"]')).toBeTruthy();
+    expect(container.querySelector("textarea")).toBeNull();
+  });
+
+  it("renders the plain textarea when not secret", () => {
+    render(
+      <ToolStepBlock
+        step={askStep()}
+        onRespond={vi.fn()}
+        onApproveSession={vi.fn()}
+        onApproveAlways={vi.fn()}
+        onAnswer={vi.fn()}
+      />,
+    );
+    expect(container.querySelector("textarea")).toBeTruthy();
+    expect(container.querySelector('input[type="password"]')).toBeNull();
+  });
+
+  it("Enter submits the secret via onAnswer and clears the field", () => {
+    const onAnswer = vi.fn();
+    render(
+      <ToolStepBlock
+        step={askStep({ secret: true })}
+        onRespond={vi.fn()}
+        onApproveSession={vi.fn()}
+        onApproveAlways={vi.fn()}
+        onAnswer={onAnswer}
+      />,
+    );
+    const input = container.querySelector(
+      'input[type="password"]',
+    ) as HTMLInputElement;
+    type(input, "hunter2");
+    keyDown(input, "Enter");
+    expect(onAnswer).toHaveBeenCalledWith("c1", "hunter2");
+    expect(input.value).toBe("");
+  });
+});
+
 describe("ToolStepBlock — output (#331)", () => {
   function doneStep(over: Partial<ToolStep> = {}): ToolStep {
     return {
