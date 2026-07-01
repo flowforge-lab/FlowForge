@@ -55,7 +55,7 @@ impl OllamaProvider {
     pub fn new(base_url: impl Into<String>) -> Self {
         Self {
             base_url: base_url.into(),
-            client: crate::build_streaming_http_client(),
+            client: crate::build_ollama_http_client(),
             supports_vision: false,
             supports_documents: false,
             num_ctx: None,

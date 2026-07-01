@@ -67,6 +67,42 @@ pub(crate) fn build_streaming_http_client() -> reqwest::Client {
         .clone()
 }
 
+/// Idle-read budget for the local Ollama provider, far wider than
+/// [`IDLE_READ_TIMEOUT_SECS`]. Ollama's `/api/chat` can sit silent well past 30s
+/// before the first byte: a cold model load (multi-GB weights off disk) or a
+/// large prompt's prefill both run before any token streams back, and reqwest's
+/// `read_timeout` covers that wait, not just gaps between bytes.
+///
+/// Measured directly against a CPU-bound 35B-A3B model (`llama-server`'s own
+/// `print_timing` log): a 2050-token prompt took 75s of prefill plus 53s to
+/// generate 205 tokens -- 128s server-side, ~174s end-to-end including HTTP
+/// overhead, for a prompt smaller than a typical pasted system prompt. A 180s
+/// budget left only seconds of headroom and still failed on larger real-world
+/// turns. Hosted-gateway SSE stalls (the reason [`IDLE_READ_TIMEOUT_SECS`]
+/// exists at all) don't apply to a local daemon -- there is no hung-forever
+/// failure mode to guard against, only genuinely slow hardware -- so Ollama
+/// gets a generous 10-minute budget instead of sharing the hosted-API one.
+pub(crate) const OLLAMA_IDLE_READ_TIMEOUT_SECS: u64 = 600;
+
+/// Dedicated reqwest client for [`OllamaProvider`], separate from
+/// [`build_streaming_http_client`] so a slow local prefill/model-load never
+/// races the hosted-API stall guard. Same connect budget, its own process-wide
+/// singleton so connections are still pooled across turns.
+///
+/// [`OllamaProvider`]: crate::OllamaProvider
+pub(crate) fn build_ollama_http_client() -> reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(CONNECT_TIMEOUT_SECS))
+                .read_timeout(Duration::from_secs(OLLAMA_IDLE_READ_TIMEOUT_SECS))
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new())
+        })
+        .clone()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: String,
