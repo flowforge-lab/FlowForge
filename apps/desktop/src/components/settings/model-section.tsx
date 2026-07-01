@@ -39,6 +39,16 @@ const EFFORT_OPTIONS: ReadonlyArray<{ value: Effort; label: string }> = [
   { value: "high", label: "High" },
 ];
 
+/** Ollama `keep_alive` presets (#637): how long the model stays resident after a
+ *  turn, so a pause between messages doesn't pay the model reload. `"default"` maps
+ *  to no field (the backend's own default); the others map to `keep_alive` strings. */
+const KEEP_ALIVE_DEFAULT = "default";
+const KEEP_ALIVE_OPTIONS: ReadonlyArray<{ value: string; label: string }> = [
+  { value: KEEP_ALIVE_DEFAULT, label: "30 min" },
+  { value: "1h", label: "1 hour" },
+  { value: "-1", label: "Until I quit" },
+];
+
 /** Tokens → compact "150k" readout. */
 function formatThreshold(tokens: number): string {
   return `${Math.round(tokens / 1000)}k`;
@@ -60,6 +70,7 @@ export function ModelSection() {
   const addConnection = useModelConfigStore((s) => s.addConnection);
   const setThinking = useModelConfigStore((s) => s.setThinking);
   const setWarmupEnabled = useModelConfigStore((s) => s.setWarmupEnabled);
+  const setKeepAlive = useModelConfigStore((s) => s.setKeepAlive);
 
   const summarizationThreshold = useModelConfigStore(
     (s) => s.summarizationThreshold,
@@ -95,6 +106,10 @@ export function ModelSection() {
   // Warmup only helps local backends (#61); hide the control for hosted kinds.
   const warmupIsLocal = active ? isLocalKind(active.kind) : false;
   const warmupEnabled = active?.warmupEnabled ?? true;
+  // keep_alive is an Ollama-only residency knob (#637); hide it for every other
+  // kind. Default choice ("30 min") maps to no persisted field.
+  const isOllama = active?.kind === "ollama";
+  const keepAlive = active?.keepAlive ?? KEEP_ALIVE_DEFAULT;
   const present = new Set(registry?.connections.map((c) => c.kind) ?? []);
   const addable = ADDABLE.filter((a) => !present.has(a.kind));
 
@@ -179,6 +194,31 @@ export function ModelSection() {
               if (active) void setWarmupEnabled(active.id, v);
             }}
           />
+        ) : null}
+
+        {isOllama ? (
+          <div className="space-y-2">
+            <h3 className="text-[13px] font-medium text-foreground">
+              Keep model warm
+            </h3>
+            <SegmentedControl
+              label="Keep-alive duration"
+              options={KEEP_ALIVE_OPTIONS}
+              value={keepAlive}
+              onValueChange={(v) => {
+                if (active)
+                  void setKeepAlive(
+                    active.id,
+                    v === KEEP_ALIVE_DEFAULT ? null : v,
+                  );
+              }}
+              disabled={!active || saving}
+            />
+            <p className="text-[11px] leading-relaxed text-muted-foreground">
+              How long Ollama keeps the model in memory after a turn — longer
+              avoids the reload wait when you pause between messages.
+            </p>
+          </div>
         ) : null}
 
         <div className="space-y-2">

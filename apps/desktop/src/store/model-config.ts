@@ -107,6 +107,10 @@ interface ModelConfigState extends LocalReasoningPrefs {
   /** Toggle the composer warmup nudge for a connection (#61). Only meaningful for
    *  local kinds; disable to avoid sustained GPU use (e.g. on laptop battery). */
   setWarmupEnabled: (id: string, warmupEnabled: boolean) => Promise<void>;
+  /** Set a connection's Ollama `keep_alive` residency (#637). `null` clears the
+   *  field, deferring to the backend default (env / Ollama's 30m). IPC-backed like
+   *  `thinking`. */
+  setKeepAlive: (id: string, value: string | null) => Promise<void>;
   /** Store a secret (write-only); `hasKey` updates from the refreshed registry. */
   setSecret: (id: string, kind: SecretKind, value: string) => Promise<void>;
   /** Clear a stored secret; `hasKey` updates from the refreshed registry. */
@@ -296,6 +300,22 @@ export const useModelConfigStore = create<ModelConfigState>()(
           set({ saving: true, error: null });
           try {
             await ipc.upsertConnection({ ...conn, warmupEnabled });
+            await refresh();
+            set({ saving: false });
+          } catch (err) {
+            set({ saving: false, error: errMsg(err) });
+          }
+        },
+
+        setKeepAlive: async (id, value) => {
+          const conn = get().registry?.connections.find((c) => c.id === id);
+          // Normalize the "default" choice to an absent field (backend applies its
+          // own default), and no-op when nothing actually changes.
+          const next = value ?? undefined;
+          if (!conn || (conn.keepAlive ?? undefined) === next) return;
+          set({ saving: true, error: null });
+          try {
+            await ipc.upsertConnection({ ...conn, keepAlive: next });
             await refresh();
             set({ saving: false });
           } catch (err) {

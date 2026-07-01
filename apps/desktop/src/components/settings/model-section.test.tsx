@@ -252,6 +252,38 @@ describe("ModelSection provider accordion", () => {
     expect(container.querySelector('button[aria-label="Warmup"]')).toBeNull();
   });
 
+  it("shows the keep-alive control only for Ollama and persists a choice (#637)", async () => {
+    const keepGroup = () =>
+      container.querySelector('[aria-label="Keep-alive duration"]');
+    await renderSection();
+
+    // Ollama: the control is present.
+    await act(async () => {
+      await useModelConfigStore.getState().setActiveConnection("ollama");
+      await flush();
+    });
+    expect(keepGroup()).not.toBeNull();
+
+    await click(byText("Until I quit", "button", keepGroup() ?? undefined));
+    expect(
+      activeConnection(useModelConfigStore.getState().registry)?.keepAlive,
+    ).toBe("-1");
+
+    // candle-vLLM is local but not Ollama → keep-alive is Ollama-only, so hidden.
+    await act(async () => {
+      await useModelConfigStore.getState().setActiveConnection("candle-vllm");
+      await flush();
+    });
+    expect(keepGroup()).toBeNull();
+
+    // Hosted kinds hide it too.
+    await act(async () => {
+      await useModelConfigStore.getState().setActiveConnection("openai");
+      await flush();
+    });
+    expect(keepGroup()).toBeNull();
+  });
+
   // The module-level MockIpc singleton persists the active pointer and connection
   // edits across tests, so each effort test establishes its own starting state
   // rather than relying on the seed defaults.

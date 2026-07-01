@@ -268,6 +268,25 @@ describe("model-config registry (mock IPC)", () => {
     ).toBe(false);
   });
 
+  it("setKeepAlive persists a connection's Ollama keep_alive via IPC (#637)", async () => {
+    const { load, setKeepAlive } = useModelConfigStore.getState();
+    await load();
+    const ollama = () =>
+      useModelConfigStore
+        .getState()
+        .registry?.connections.find((c) => c.id === "ollama");
+
+    await setKeepAlive("ollama", "-1");
+    // Survives a fresh reload (persisted, not just optimistic).
+    useModelConfigStore.setState({ registry: null });
+    await useModelConfigStore.getState().load();
+    expect(ollama()?.keepAlive).toBe("-1");
+
+    // `null` clears the field back to the backend default.
+    await useModelConfigStore.getState().setKeepAlive("ollama", null);
+    expect(ollama()?.keepAlive ?? undefined).toBeUndefined();
+  });
+
   it("picking a default model also activates that connection", async () => {
     const { load, setDefaultModel } = useModelConfigStore.getState();
     await load();
