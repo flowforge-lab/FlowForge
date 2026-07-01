@@ -49,6 +49,16 @@ pub struct OllamaProvider {
     /// tracks the window the runtime is actually serving when no explicit
     /// `num_ctx` was requested. `None` falls through to the conservative default.
     budget_window: Option<u64>,
+    /// How long Ollama keeps the model resident after a request, sent as the
+    /// top-level `keep_alive` field on `/api/chat`. Ollama's own default is 5
+    /// minutes, after which the model unloads and the next turn pays a full
+    /// reload from disk -- measured at ~68s for the 24 GB qwen3.6 MoE, turning a
+    /// 3s reply into a 70s one just for having paused to read. An interactive
+    /// desktop chat routinely idles past 5 minutes between turns, so the default
+    /// is widened to keep the model warm across normal think/read pauses.
+    /// `None` omits the field (Ollama's 5-minute default); see
+    /// [`default_keep_alive`].
+    keep_alive: Option<String>,
 }
 
 impl OllamaProvider {
@@ -60,6 +70,7 @@ impl OllamaProvider {
             supports_documents: false,
             num_ctx: None,
             budget_window: None,
+            keep_alive: default_keep_alive(),
         }
     }
 
@@ -94,6 +105,14 @@ impl OllamaProvider {
     /// [`Provider::set_context_budget`](crate::Provider::set_context_budget).
     pub fn with_budget_window(mut self, budget_window: Option<u64>) -> Self {
         self.budget_window = budget_window;
+        self
+    }
+
+    /// Override how long Ollama keeps the model resident (`keep_alive`). `None`
+    /// omits the field, falling back to Ollama's 5-minute default. See
+    /// [`default_keep_alive`] for the value [`new`](OllamaProvider::new) applies.
+    pub fn with_keep_alive(mut self, keep_alive: Option<String>) -> Self {
+        self.keep_alive = keep_alive;
         self
     }
 
@@ -193,6 +212,22 @@ pub fn ollama_num_ctx_from_env() -> Option<u64> {
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
         .filter(|&n| n > 0)
+}
+
+/// The `keep_alive` value [`OllamaProvider::new`] applies, so the model stays
+/// warm across the read/think pauses of an interactive chat instead of unloading
+/// on Ollama's 5-minute default and reloading (~68s for a 24 GB MoE) on the next
+/// turn. Overridable via `FLOWFORGE_OLLAMA_KEEP_ALIVE`, which takes any value
+/// Ollama accepts: a duration (`"30m"`, `"1h"`), a number of seconds (`"600"`),
+/// or `"-1"` to keep the model resident until it is explicitly stopped. An empty
+/// value opts back out to Ollama's own default (the field is omitted). Defaults
+/// to `"30m"`.
+fn default_keep_alive() -> Option<String> {
+    match std::env::var("FLOWFORGE_OLLAMA_KEEP_ALIVE") {
+        Ok(v) if v.trim().is_empty() => None,
+        Ok(v) => Some(v.trim().to_string()),
+        Err(_) => Some("30m".to_string()),
+    }
 }
 
 /// The served context window for a model plus how it was determined (#602).
@@ -514,6 +549,12 @@ impl Provider for OllamaProvider {
         // may not match the budget it sized from `context_window`.
         if let Some(n) = self.num_ctx {
             body["options"] = serde_json::json!({ "num_ctx": n });
+        }
+        // Keep the model resident across the pauses of an interactive chat so a
+        // turn after a short idle doesn't pay a full model reload (see
+        // [`default_keep_alive`]). Omitted when `None` (Ollama's own default).
+        if let Some(keep_alive) = &self.keep_alive {
+            body["keep_alive"] = serde_json::Value::String(keep_alive.clone());
         }
 
         let resp = self
@@ -1095,6 +1136,63 @@ mod tests {
         assert!(
             body.get("options").is_none(),
             "no num_ctx => no options key"
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_stream_sends_keep_alive_when_configured() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string("{\"message\":{\"content\":\"\"},\"done\":true}\n"),
+            )
+            .mount(&server)
+            .await;
+
+        // Explicit builder value so the assertion is independent of the ambient
+        // FLOWFORGE_OLLAMA_KEEP_ALIVE env / process default.
+        let provider =
+            OllamaProvider::new(server.uri()).with_keep_alive(Some("30m".to_string()));
+        let mut stream = provider.chat_stream(req("qwen3.6:35b-a3b")).await.unwrap();
+        while stream.next().await.is_some() {}
+
+        let reqs = server.received_requests().await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&reqs[0].body).unwrap();
+        assert_eq!(
+            body["keep_alive"], "30m",
+            "keep_alive is sent so the model stays warm between turns"
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_stream_omits_keep_alive_when_none() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string("{\"message\":{\"content\":\"\"},\"done\":true}\n"),
+            )
+            .mount(&server)
+            .await;
+
+        let provider = OllamaProvider::new(server.uri()).with_keep_alive(None);
+        let mut stream = provider.chat_stream(req("qwen3.6:35b-a3b")).await.unwrap();
+        while stream.next().await.is_some() {}
+
+        let reqs = server.received_requests().await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&reqs[0].body).unwrap();
+        assert!(
+            body.get("keep_alive").is_none(),
+            "None => no keep_alive key, deferring to Ollama's own default"
         );
     }
 
