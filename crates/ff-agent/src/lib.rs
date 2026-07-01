@@ -633,7 +633,7 @@ impl Drop for ToolResultBackfill<'_> {
 /// Notice written to a reserved-but-unfinalized assistant row when its turn is
 /// interrupted mid-flight. Shares the `[stopped: ...]` vocabulary with the
 /// in-loop terminal notices (empty-response / tool-call limit / cancel).
-const INTERRUPTED_NOTICE: &str = "[stopped: interrupted]";
+pub const INTERRUPTED_NOTICE: &str = "[stopped: interrupted]";
 
 /// RAII guard for the assistant message row reserved at the top of each loop
 /// iteration. The row is created empty (so the frontend can route streaming

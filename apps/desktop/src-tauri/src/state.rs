@@ -1704,6 +1704,17 @@ impl AppState {
         self.approvals.lock().unwrap().cancels.remove(session_id)
     }
 
+    /// Whether a turn is currently running for this session (a live cancel token
+    /// is registered). Used to gate the orphaned-row reconciliation so it never
+    /// touches a live turn's reserved tail row (#646).
+    pub fn has_active_turn(&self, session_id: &str) -> bool {
+        self.approvals
+            .lock()
+            .unwrap()
+            .cancels
+            .contains_key(session_id)
+    }
+
     /// Remove this session's cancel token only when it is still `expected` — the
     /// token THIS turn registered. A successor turn (the re-run that
     /// `edit_message` spawns after cancelling the in-flight one) may have already
@@ -2457,6 +2468,58 @@ mod tests {
         assert!(rx.await.unwrap());
         // The flow releases the liveness token afterward.
         assert!(state.take_cancel("op").is_some());
+    }
+
+    #[test]
+    fn has_active_turn_tracks_registered_cancel() {
+        // Gates the orphaned-row reconciliation (#646): true only while a turn
+        // holds a live cancel token, so the sweep never touches a live turn's
+        // reserved tail row.
+        let state = AppState::new();
+        assert!(!state.has_active_turn("sess"), "no turn registered");
+        state.register_cancel("sess", CancelToken::new());
+        assert!(state.has_active_turn("sess"), "turn is live");
+        state.take_cancel("sess");
+        assert!(!state.has_active_turn("sess"), "turn finished");
+    }
+
+    #[tokio::test]
+    async fn get_messages_reconciles_orphan_only_when_no_active_turn() {
+        // End-to-end guard behavior: an orphaned empty assistant row is relabeled
+        // on load, but not while a turn is live for that session (#646).
+        use ff_core::Role;
+        let state = AppState::new();
+        let s = state.store.create_session(None);
+        state.store.add_message(&s.id, Role::User, "hi".into());
+        state
+            .store
+            .add_message(&s.id, Role::Assistant, String::new());
+
+        // Live turn: the reserved tail row must be left untouched.
+        state.register_cancel(&s.id, CancelToken::new());
+        if !state.has_active_turn(&s.id) {
+            state
+                .store
+                .reconcile_orphaned_assistant_rows(&s.id, ff_agent::INTERRUPTED_NOTICE);
+        }
+        assert_eq!(
+            state.store.get_messages(&s.id)[1].content,
+            "",
+            "live turn's reserved row must not be reconciled"
+        );
+
+        // Turn ends: now the orphan is relabeled on the next load.
+        state.take_cancel(&s.id);
+        if !state.has_active_turn(&s.id) {
+            state
+                .store
+                .reconcile_orphaned_assistant_rows(&s.id, ff_agent::INTERRUPTED_NOTICE);
+        }
+        assert_eq!(
+            state.store.get_messages(&s.id)[1].content,
+            ff_agent::INTERRUPTED_NOTICE,
+            "orphan is relabeled once no turn is live"
+        );
     }
 
     #[test]
