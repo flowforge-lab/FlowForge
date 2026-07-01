@@ -251,13 +251,23 @@ export function segmentTurn(items: TurnItem[]): TurnSegment[] {
 
   const flush = () => {
     if (buffer.length > 0) {
+      // Key off the first tool call in the run so the key stays stable while
+      // streaming: a step can be buffered before its iteration's reasoning tokens
+      // arrive, and pinning to `buffer[0]` would flip `callId` -> `messageId`
+      // mid-stream, remounting the group and dropping its collapse state (#629). A
+      // reasoning-only run (thinking, no tool calls) has no step, so fall back to
+      // that item's `key`.
+      const firstStep = buffer.find(
+        (it): it is Extract<TurnItem, { kind: "step" }> => it.kind === "step",
+      );
+      const first = buffer[0];
       segments.push({
         kind: "steps",
         items: buffer,
         steps: bufferSteps,
-        // Stable key from the first buffered item — its `key` (reasoning) or the
-        // step's `callId`.
-        key: buffer[0].kind === "step" ? buffer[0].step.callId : buffer[0].key,
+        key:
+          firstStep?.step.callId ??
+          (first.kind === "step" ? first.step.callId : first.key),
       });
     }
     buffer = [];

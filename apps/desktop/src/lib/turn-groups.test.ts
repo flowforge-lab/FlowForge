@@ -481,4 +481,15 @@ describe("segmentTurn (#619)", () => {
   it("returns nothing for an empty turn", () => {
     expect(segmentTurn([])).toEqual([]);
   });
+
+  it("keeps a steps segment's key stable when reasoning streams in after the first step (#629)", () => {
+    const beforeReasoning: TurnItem[] = [{ kind: "step", step: step("c1") }];
+    const afterReasoning: TurnItem[] = [
+      { kind: "reasoning", text: "thinking", key: "a1" },
+      { kind: "step", step: step("c1") },
+    ];
+    expect(segmentTurn(afterReasoning)[0].key).toBe(
+      segmentTurn(beforeReasoning)[0].key,
+    );
+  });
 });

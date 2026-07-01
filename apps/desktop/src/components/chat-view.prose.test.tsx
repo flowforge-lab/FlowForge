@@ -87,23 +87,20 @@ describe("ChatView intermediate prose (#619)", () => {
     }
 
     // Chronological order: prose → group → prose → group, top to bottom.
-    const order = Array.from(
-      container.querySelectorAll<HTMLElement>("p, button[aria-expanded]"),
-    )
-      .map((el) => el.textContent ?? "")
-      .filter(
-        (t) =>
-          t.includes("First let me look around.") ||
-          t.includes("Now searching the code.") ||
-          /1 step/.test(t),
-      );
-    const firstProse = order.findIndex((t) =>
-      t.includes("First let me look around."),
-    );
-    const secondProse = order.findIndex((t) =>
-      t.includes("Now searching the code."),
-    );
-    expect(firstProse).toBeGreaterThanOrEqual(0);
-    expect(secondProse).toBeGreaterThan(firstProse);
+    // Read the flattened text (DOM order) so the assertion doesn't couple to the
+    // element the Markdown renderer wraps prose in (#629).
+    const body = container.textContent ?? "";
+    const sequence = [
+      "First let me look around.", // intermediate prose 1
+      "1 step", // first group header
+      "Now searching the code.", // intermediate prose 2
+      "1 step", // second group header
+    ];
+    let cursor = -1;
+    for (const anchor of sequence) {
+      const idx = body.indexOf(anchor, cursor + 1);
+      expect(idx).toBeGreaterThan(cursor);
+      cursor = idx;
+    }
   });
 });
