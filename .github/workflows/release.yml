@@ -4,20 +4,34 @@ name: Release
 # (Tauri) app whenever a `v*` tag is pushed, or on demand via
 # `workflow_dispatch` (pass the target `tag` input).
 #
-# Two build jobs fan out in parallel:
+# Build jobs fan out in parallel:
 #   - build-cli   native matrix (macOS arm64 + Linux x86_64) -> per-target
 #                 flowforge-<triple>.tar.gz archives
-#   - desktop     macOS arm64 (macos-14) via tauri-action -> .dmg +
-#                 FlowForge.app.tar.gz + .sig + auto-generated latest.json
+#   - desktop     OS matrix (macos-14 / ubuntu-latest / windows-latest) via
+#                 tauri-action. bundle.targets is "all", so each runner emits
+#                 every bundle its OS supports — macOS .dmg + .app.tar.gz,
+#                 Linux .deb/.rpm/.AppImage, Windows NSIS -setup.exe + .msi —
+#                 and merges its platform entry into one latest.json.
 #
 # `desktop` owns creation of the GitHub Release (it must, so tauri-action can
-# publish the updater feed). `release-cli` then attaches the CLI archives and a
-# consolidated SHA256SUMS to that same release. One tag, one Release.
+# attach the updater feed); the matrix jobs share one tag, so tauri-action
+# find-or-creates the release and each job attaches its bundles. `release-cli`
+# then attaches the CLI archives and a consolidated SHA256SUMS to that same
+# release. One tag, one Release.
 #
-# The updater artifact (FlowForge.app.tar.gz) is minisign-signed with
-# TAURI_SIGNING_PRIVATE_KEY; the matching pubkey ships in tauri.conf.json. The
-# desktop feed (latest.json) is published at .../releases/latest/download so the
-# in-app updater resolves the latest release (RFC 0014).
+# Draft-then-publish gate: the Release is created as a **draft** —
+# `releaseDraft: true` on tauri-action and `draft: true` on action-gh-release —
+# so a green build does NOT reach users. Drafts are invisible to
+# `releases/latest`, so the updater's .../releases/latest/download/latest.json
+# stays unresolved until a maintainer clicks *Publish* in the Releases UI. That
+# publish is the real release gate: inspect artifacts, edit the notes body, and
+# run the RELEASING.md checks against the draft first (RFC 0014).
+#
+# Updater artifacts (.app.tar.gz / -setup.exe + .sig) are minisign-signed with
+# TAURI_SIGNING_PRIVATE_KEY; the matching pubkey ships in tauri.conf.json.
+# updaterJsonPreferNsis points the Windows updater entry at the NSIS bundle
+# (MSI cannot auto-update). Requires TAURI_SIGNING_PRIVATE_KEY +
+# TAURI_SIGNING_PRIVATE_KEY_PASSWORD as repo secrets.
 
 on:
   push:
@@ -75,8 +89,25 @@ jobs:
           if-no-files-found: error
 
   desktop:
-    name: Build desktop (macOS arm64)
-    runs-on: macos-14
+    name: Build desktop (${{ matrix.platform }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # Native builds only — each runner matches its target triple, so no
+        # cross toolchain is needed. bundle.targets is "all", so each platform
+        # produces every bundle its OS supports: macOS .dmg + .app.tar.gz, Linux
+        # .deb/.rpm/.AppImage, Windows NSIS -setup.exe + .msi.
+        include:
+          - platform: macos-14
+            args: ''
+            cache-prefix: release-desktop-aarch64
+          - platform: ubuntu-latest
+            args: ''
+            cache-prefix: release-desktop-linux
+          - platform: windows-latest
+            args: ''
+            cache-prefix: release-desktop-windows
+    runs-on: ${{ matrix.platform }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
@@ -96,19 +127,37 @@ jobs:
         working-directory: apps/desktop
         run: pnpm install --frozen-lockfile
 
+      # Tauri's Linux bundling links WebKit/GTK and needs patchelf for AppImage.
+      # Reuse ci.yml's cached apt action so a hit takes seconds. runner.os keeps
+      # the guard independent of the matrix platform string.
+      - name: Install Linux WebKit deps (cached)
+        if: runner.os == 'Linux'
+        uses: awalsh128/cache-apt-pkgs-action@v1
+        timeout-minutes: 5
+        with:
+          packages: libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev libdbus-1-dev patchelf xdg-utils
+          version: 1.1
+
       - uses: dtolnay/rust-toolchain@stable
 
       # src-tauri is a workspace member, so cargo builds into the repo-root
       # target/ — cache it the same way ci.yml does (keyed on the workspace
-      # root + Cargo.lock), just namespaced for release builds.
+      # root + Cargo.lock), namespaced per platform for release builds.
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
-          prefix-key: release-desktop-aarch64
+          prefix-key: ${{ matrix.cache-prefix }}
 
       # tauri-action builds the app (beforeBuildCommand runs `pnpm build`),
-      # signs the updater artifact (.app.tar.gz + .sig) with the minisign key,
-      # then creates the GitHub Release and uploads .dmg/.app.tar.gz/.sig plus
-      # an auto-generated latest.json updater feed.
+      # signs the updater artifact (.app.tar.gz / -setup.exe + .sig) with the
+      # minisign key, then find-or-creates the GitHub Release for the tag **as a
+      # draft** and uploads the per-OS bundles plus a merged latest.json updater
+      # feed. Each matrix job adds its platform entry to latest.json;
+      # updaterJsonPreferNsis makes the Windows updater entry point at the NSIS
+      # -setup.exe (MSI cannot auto-update). `releaseDraft: true` leaves the
+      # Release unpublished — a maintainer must click *Publish* in the Releases
+      # UI before `releases/latest` (and thus the updater) sees it. Requires the
+      # TAURI_SIGNING_PRIVATE_KEY repo secret (the matching pubkey is pinned in
+      # tauri.conf.json); without it the updater feed is unusable.
       - uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -119,8 +168,10 @@ jobs:
           tauriScript: pnpm tauri
           tagName: ${{ inputs.tag || github.ref_name }}
           releaseName: 'FlowForge ${{ inputs.tag || github.ref_name }}'
-          releaseDraft: false
+          releaseDraft: true
           prerelease: false
+          updaterJsonPreferNsis: true
+          args: ${{ matrix.args }}
 
   release-cli:
     name: Attach CLI archives to Release
@@ -141,10 +192,17 @@ jobs:
           cat SHA256SUMS
           echo '::endgroup::'
 
+      # Attach CLI archives + checksums to the draft Release created by the
+      # `desktop` job. `draft: true` is required so this final job does NOT
+      # publish what `desktop` left as draft — the explicit *Publish* click in
+      # the Releases UI stays the release gate. `generate_release_notes` fills
+      # the draft body with GitHub's auto notes as a baseline for human
+      # review/edit-before-publish (no in-CI LLM call, no extra secrets).
       - name: Attach archives and checksums to release
         uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v3.0.1
         with:
           tag_name: ${{ inputs.tag || github.ref_name }}
+          draft: true
           generate_release_notes: true
           files: |
             artifacts/*.tar.gz

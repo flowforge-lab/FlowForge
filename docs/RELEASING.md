@@ -88,31 +88,65 @@ git push origin main        # make sure the tagged commit is on the remote
 git push origin vX.Y.Z      # ⬅ this triggers release.yml
 ```
 
-Pushing the `v*` tag runs two parallel build jobs and one publish job:
+Pushing the `v*` tag runs the parallel build jobs plus `release-cli`, which
+**assemble a single draft GitHub Release** — a green build does NOT reach
+users:
 
 - `build-cli` → `flowforge-<triple>.tar.gz` (macOS arm64, Linux x86_64)
-- `desktop` (macos-14, tauri-action) → creates the Release and uploads
-  `FlowForge_<v>_aarch64.dmg`, `FlowForge.app.tar.gz`, `FlowForge.app.tar.gz.sig`,
-  and a generated `latest.json`
+- `desktop` (OS matrix: macos-14 / ubuntu-latest / windows-latest, tauri-action)
+  → creates the Release **as a draft** and uploads the per-OS bundles: macOS
+  `FlowForge_<v>_aarch64.dmg` + `FlowForge.app.tar.gz` (+ `.sig`), Linux
+  `.deb`/`.rpm`/`.AppImage`, and Windows NSIS `FlowForge_<v>_x64-setup.exe`
+  (+ `.sig`) + `FlowForge_<v>_x64_en-US.msi`. Each platform merges its entry
+  into one generated `latest.json` (the Windows entry points at the NSIS
+  setup, since MSI can't auto-update).
 - `release-cli` → attaches the CLI archives + a consolidated `SHA256SUMS` and
-  fills in auto-generated release notes
+  fills in auto-generated release notes (still a draft — nothing is published).
+
+Because the Release stays a draft, `releases/latest/download/latest.json`
+does **not** resolve and the in-app updater sees nothing until the draft is
+published (next step).
 
 > **Re-running.** To re-trigger for an existing tag without retagging, use
-> *Actions → Release → Run workflow* and pass the `tag` input. The jobs publish
-> into that tag's Release.
+> *Actions → Release → Run workflow* and pass the `tag` input. The jobs refresh
+> that tag's draft Release (artifacts are re-uploaded; it is not published).
+
+### Publish the draft (the release gate)
+
+A successful build leaves a **draft** Release. Drafts are invisible to
+`releases/latest`, so the updater won't serve anything yet. Publishing is the
+explicit, human gate:
+
+1. Open the draft for `vX.Y.Z` in the **Releases** UI.
+2. Confirm the asset list (next section) is complete and give the notes body a
+   curated pass. The auto-generated notes are the baseline — regroup merged PRs
+   since the last tag into **Features / Fixes / Internal** and paste it into the
+   body. No in-CI LLM call or extra secret is needed; the draft gate makes this
+   a normal edit-before-publish step.
+3. Click **Publish**. Only now does `releases/latest/download/latest.json`
+   resolve and the in-app updater pick up the release; then run the end-to-end
+   in-app smoke (§4). To exercise updater plumbing *before* publishing, use the
+   local dev channel (§5), which needs no published Release.
 
 ---
 
 ## 3. Verify the Release
+
+> **Draft vs. published.** The `releases/latest/download/...` URLs below
+> resolve only **after** the draft is published. To verify a draft *before*
+> publishing, fetch assets with `gh release download vX.Y.Z` (or the Release
+> UI) and run the same checks against those local files.
 
 On the GitHub Release for `vX.Y.Z`, confirm these assets exist:
 
 - `flowforge-aarch64-apple-darwin.tar.gz`
 - `flowforge-x86_64-unknown-linux-gnu.tar.gz`
 - `SHA256SUMS`
-- `FlowForge_<v>_aarch64.dmg`
-- `FlowForge.app.tar.gz`
-- `FlowForge.app.tar.gz.sig`
+- `FlowForge_<v>_aarch64.dmg` (macOS)
+- `FlowForge.app.tar.gz` + `FlowForge.app.tar.gz.sig` (macOS updater bundle)
+- `FlowForge_<v>_amd64.deb` / `FlowForge-<v>.x86_64.rpm` / `FlowForge_<v>_amd64.AppImage` (Linux)
+- `FlowForge_<v>_x64-setup.exe` + `FlowForge_<v>_x64-setup.exe.sig` (Windows NSIS updater bundle)
+- `FlowForge_<v>_x64_en-US.msi` (Windows)
 - `latest.json`
 
 ### latest.json
@@ -122,8 +156,10 @@ TAG=vX.Y.Z
 curl -fsSL https://github.com/flowforge-lab/FlowForge/releases/latest/download/latest.json | python3 -m json.tool
 ```
 
-`version` must equal the tag (sans leading `v`), and
-`platforms.darwin-aarch64.signature` + `.url` must be present and non-empty.
+`version` must equal the tag (sans leading `v`), and each platform entry the
+release ships (`darwin-aarch64`, `linux-x86-64`, `windows-x86_64`) must have a
+non-empty `.signature` + `.url`. The Windows `.url` points at the NSIS
+`-setup.exe` (not the `.msi`).
 
 ### Signature verifies against the committed pubkey
 
@@ -206,8 +242,12 @@ build-and-replace loop.
   notarization. The one-time `xattr` bypass (above) is documented; the updater
   itself is unaffected (minisign verification is independent of Apple).
 - **One Release, two surfaces.** If `desktop` fails, `release-cli` is skipped,
-  so the Release stays desktop-less rather than publishing a CLI-only feed that
-  would break the updater. Fix the `desktop` job and re-run.
-- **Phase 2 (deferred).** Developer ID signing + notarization, Windows signing,
-  and a multi-platform desktop matrix are additive: more secrets and a few
-  config/flags, no contract change (RFC 0014 §10).
+  so the draft stays desktop-less. Either way nothing auto-publishes (the draft
+  gate), so a CLI-only updater feed can never reach users. Fix the `desktop` job
+  and re-run.
+- **Phase 2 (partially in place).** The desktop matrix now spans
+  macOS/Linux/Windows (RFC 0014 P4 matrix). Still deferred: Developer ID signing
+  + notarization and Windows Authenticode signing — additive: more secrets + a
+  few `tauri.conf.json`/workflow flags, no contract change (RFC 0014 §10). Until
+  those land, the macOS build still needs the one-time `xattr` Gatekeeper bypass
+  and the Windows build trips SmartScreen on first install.
