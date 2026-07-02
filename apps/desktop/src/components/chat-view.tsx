@@ -98,7 +98,7 @@ function MessageRowImpl({
           <div className="group relative max-w-[80%]">
             <div
               data-selectable
-              className="whitespace-pre-wrap rounded-2xl rounded-br-md bg-primary px-3.5 py-2 text-[13px] leading-relaxed text-primary-foreground shadow-sm"
+              className="whitespace-pre-wrap rounded-2xl rounded-br-md bg-primary px-3.5 py-2 text-[15px] leading-relaxed text-primary-foreground shadow-sm"
             >
               {message.content}
             </div>
@@ -353,7 +353,7 @@ export function ChatView({ sessionId }: { sessionId?: string } = {}) {
         onScroll={handleScroll}
         className="min-h-0 flex-1 overflow-y-auto"
       >
-        <div className="mx-auto flex max-w-3xl flex-col gap-3 px-4 py-4">
+        <div className="mx-auto flex max-w-4xl flex-col gap-3 px-4 py-4">
           {groups.map((g) => {
             const m = g.message;
             // foldTurns already resolved each turn's steps (live or reconstructed)
