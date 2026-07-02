@@ -26,6 +26,14 @@ export type TestState =
 export const SUMMARY_THRESHOLD_MIN = 50_000;
 export const SUMMARY_THRESHOLD_MAX = 300_000;
 
+/** Selectable served-context-window presets for local Ollama connections (#651),
+ *  in tokens. `null` = "Auto" (leave `numCtx` unset → env → probe → default). The
+ *  backend clamps any value to the model's trained ceiling, so offering the larger
+ *  windows here is safe. */
+export const NUM_CTX_PRESETS: ReadonlyArray<number> = [
+  4_096, 8_192, 16_384, 32_768, 65_536, 131_072,
+];
+
 /** Locally-persisted reasoning controls without a backend field yet. Effort moved
  *  to a per-connection backend field in #395; only the threshold remains local. */
 interface LocalReasoningPrefs {
@@ -110,6 +118,10 @@ interface ModelConfigState extends LocalReasoningPrefs {
   /** Toggle the composer warmup nudge for a connection (#61). Only meaningful for
    *  local kinds; disable to avoid sustained GPU use (e.g. on laptop battery). */
   setWarmupEnabled: (id: string, warmupEnabled: boolean) => Promise<void>;
+  /** Set a connection's served context window in tokens (#651). Only meaningful for
+   *  Ollama; `null` clears it ("Auto" → env → probe → default). IPC-backed like
+   *  `warmupEnabled`. */
+  setNumCtx: (id: string, numCtx: number | null) => Promise<void>;
   /** Store a secret (write-only); `hasKey` updates from the refreshed registry. */
   setSecret: (id: string, kind: SecretKind, value: string) => Promise<void>;
   /** Clear a stored secret; `hasKey` updates from the refreshed registry. */
@@ -299,6 +311,22 @@ export const useModelConfigStore = create<ModelConfigState>()(
           set({ saving: true, error: null });
           try {
             await ipc.upsertConnection({ ...conn, warmupEnabled });
+            await refresh();
+            set({ saving: false });
+          } catch (err) {
+            set({ saving: false, error: errMsg(err) });
+          }
+        },
+
+        setNumCtx: async (id, numCtx) => {
+          const conn = get().registry?.connections.find((c) => c.id === id);
+          // `null` (Auto) maps to `undefined` so the field is omitted on the wire
+          // (serde `skip_serializing_if`), restoring env→probe→default behavior.
+          const next = numCtx ?? undefined;
+          if (!conn || conn.numCtx === next) return;
+          set({ saving: true, error: null });
+          try {
+            await ipc.upsertConnection({ ...conn, numCtx: next });
             await refresh();
             set({ saving: false });
           } catch (err) {

@@ -291,6 +291,15 @@ pub struct ProviderConfig {
     /// keeps pre-#61 registries loading as `true`.
     #[serde(default = "default_warmup_enabled")]
     pub warmup_enabled: bool,
+    /// Served context window for local Ollama providers, in tokens (#538, #651).
+    /// `None` ⇒ fall back to `FLOWFORGE_OLLAMA_NUM_CTX`, then the probed window,
+    /// then the conservative default. Only meaningful for Ollama; clamped to the
+    /// model's trained ceiling by the served-window resolution. Mirrors
+    /// [`ProviderConnection::num_ctx`]. `#[serde(default)]` keeps pre-#651
+    /// `provider.json` files loading as `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub num_ctx: Option<u32>,
 }
 
 /// FlowForge's out-of-the-box default: local candle-vllm serving Qwen3-4B.
@@ -305,6 +314,7 @@ impl Default for ProviderConfig {
             reasoning_effort: ReasoningEffort::default(),
             reasoning_visibility: ReasoningVisibility::default(),
             warmup_enabled: true,
+            num_ctx: None,
         }
     }
 }
@@ -378,6 +388,14 @@ pub struct ProviderConnection {
     /// keeps pre-#61 registries loading as `true`.
     #[serde(default = "default_warmup_enabled")]
     pub warmup_enabled: bool,
+    /// Served context window for local Ollama connections, in tokens (#538, #651).
+    /// `None` ⇒ fall back to `FLOWFORGE_OLLAMA_NUM_CTX`, then the probed window,
+    /// then the conservative default. Only meaningful for Ollama; clamped to the
+    /// model's trained ceiling by the served-window resolution. `#[serde(default)]`
+    /// keeps pre-#651 registries loading as `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub num_ctx: Option<u32>,
     /// AWS region for a Bedrock connection (e.g. `"us-east-1"`); the provider
     /// derives `bedrock-runtime.<region>.amazonaws.com` from it. `None` for
     /// non-Bedrock kinds.
@@ -657,6 +675,7 @@ impl Default for ProviderRegistry {
             reasoning_effort: ReasoningEffort::default(),
             reasoning_visibility: ReasoningVisibility::default(),
             warmup_enabled: true,
+            num_ctx: None,
             region: None,
             auth_mode: None,
             aws_profile: None,
@@ -675,6 +694,7 @@ impl Default for ProviderRegistry {
             reasoning_effort: ReasoningEffort::default(),
             reasoning_visibility: ReasoningVisibility::default(),
             warmup_enabled: true,
+            num_ctx: None,
             region: None,
             auth_mode: None,
             aws_profile: None,
@@ -875,6 +895,7 @@ mod tests {
             reasoning_effort: ReasoningEffort::default(),
             reasoning_visibility: ReasoningVisibility::default(),
             warmup_enabled: true,
+            num_ctx: None,
             region: None,
             auth_mode: None,
             aws_profile: None,
@@ -992,6 +1013,7 @@ mod tests {
             reasoning_effort: ReasoningEffort::default(),
             reasoning_visibility: ReasoningVisibility::default(),
             warmup_enabled: true,
+            num_ctx: None,
             region: None,
             auth_mode: None,
             aws_profile: None,
@@ -1013,6 +1035,28 @@ mod tests {
         assert!(json.contains("candle-vllm"));
         let back: ProviderRegistry = serde_json::from_str(&json).unwrap();
         assert_eq!(reg, back);
+    }
+
+    #[test]
+    fn num_ctx_absent_deserializes_to_none_and_round_trips() {
+        // A pre-#651 connection (no `numCtx`) must load as `None` and re-serialize
+        // without the key, so old registries keep the env→probe→default behavior.
+        let conn = blank_conn("Ollama", None, ProviderKind::Ollama);
+        assert_eq!(conn.num_ctx, None);
+        let json = serde_json::to_string(&conn).unwrap();
+        assert!(!json.contains("numCtx"), "None must omit the field: {json}");
+        let back: ProviderConnection = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.num_ctx, None);
+
+        // A set value round-trips through the camelCase wire key.
+        let set = ProviderConnection {
+            num_ctx: Some(8192),
+            ..conn
+        };
+        let json = serde_json::to_string(&set).unwrap();
+        assert!(json.contains("\"numCtx\":8192"), "{json}");
+        let back: ProviderConnection = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.num_ctx, Some(8192));
     }
 
     #[test]

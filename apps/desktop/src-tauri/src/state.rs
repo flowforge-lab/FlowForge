@@ -159,7 +159,9 @@ fn build_provider(conn: &ProviderConnection, model: &str) -> Box<dyn Provider> {
             OllamaProvider::new(base_url)
                 .with_vision(vision)
                 .with_documents(documents)
-                .with_num_ctx(ollama_num_ctx_from_env()),
+                // Per-connection window (#651) wins; the env var stays as a
+                // global override for connections that leave it unset.
+                .with_num_ctx(conn.num_ctx.map(u64::from).or_else(ollama_num_ctx_from_env)),
         ),
         // Bedrock resolves credentials by auth mode, pulling secret material from the
         // OS keychain here so the provider crate stays keychain-free (#202 PR-2).
@@ -286,6 +288,9 @@ fn config_to_connection(config: ProviderConfig) -> ProviderConnection {
         reasoning_effort: config.reasoning_effort,
         reasoning_visibility: config.reasoning_visibility,
         warmup_enabled: config.warmup_enabled,
+        // Carry the served window through migration (#651); a legacy file without
+        // the field deserializes to `None`, same env→probe→default behavior as before.
+        num_ctx: config.num_ctx,
         region: None,
         auth_mode: None,
         aws_profile: None,
@@ -305,6 +310,7 @@ fn connection_to_config(conn: &ProviderConnection) -> ProviderConfig {
         reasoning_effort: conn.reasoning_effort,
         reasoning_visibility: conn.reasoning_visibility,
         warmup_enabled: conn.warmup_enabled,
+        num_ctx: conn.num_ctx,
     }
 }
 
@@ -1637,10 +1643,10 @@ impl AppState {
     /// probe so the chip simply hides the readout.
     pub async fn served_window(&self, session_id: &str) -> ServedWindowProbe {
         let resolved = self.resolve_model_selection(session_id);
-        let (kind, base_url) = {
+        let (kind, base_url, num_ctx) = {
             let reg = self.registry.lock().unwrap();
             match reg.connections.iter().find(|c| c.id == resolved.connection) {
-                Some(c) => (c.kind, c.resolved_base_url().to_string()),
+                Some(c) => (c.kind, c.resolved_base_url().to_string(), c.num_ctx),
                 None => return ServedWindowProbe::default(),
             }
         };
@@ -1654,7 +1660,10 @@ impl AppState {
                 return probe.clone();
             }
         }
-        let provider = OllamaProvider::new(base_url).with_num_ctx(ollama_num_ctx_from_env());
+        // Probe the same window the turn will request (#651): per-connection value
+        // first, else the env override, so the gauge and the served turn agree.
+        let provider = OllamaProvider::new(base_url)
+            .with_num_ctx(num_ctx.map(u64::from).or_else(ollama_num_ctx_from_env));
         let probe = provider.served_window(&resolved.model).await;
         self.served_window_cache
             .lock()
@@ -3478,6 +3487,7 @@ mod tests {
                 reasoning_effort: ReasoningEffort::default(),
                 reasoning_visibility: ReasoningVisibility::default(),
                 warmup_enabled: true,
+                num_ctx: None,
                 region: None,
                 auth_mode: None,
                 aws_profile: None,
@@ -3634,6 +3644,7 @@ mod tests {
             reasoning_effort: effort,
             reasoning_visibility: ReasoningVisibility::default(),
             warmup_enabled: true,
+            num_ctx: None,
             region: None,
             auth_mode: None,
             aws_profile: None,
@@ -3692,6 +3703,7 @@ mod tests {
                     reasoning_effort: ReasoningEffort::default(),
                     reasoning_visibility: ReasoningVisibility::default(),
                     warmup_enabled: true,
+                    num_ctx: None,
                     region: None,
                     auth_mode: None,
                     aws_profile: None,
@@ -3710,6 +3722,7 @@ mod tests {
                     reasoning_effort: ReasoningEffort::default(),
                     reasoning_visibility: ReasoningVisibility::default(),
                     warmup_enabled: true,
+                    num_ctx: None,
                     region: Some("us-east-2".into()),
                     auth_mode: Some(BedrockAuth::Profile),
                     aws_profile: Some("bedrock-profile".into()),
@@ -3938,6 +3951,7 @@ mod tests {
             reasoning_effort: ReasoningEffort::default(),
             reasoning_visibility: ReasoningVisibility::default(),
             warmup_enabled: true,
+            num_ctx: None,
             region: None,
             auth_mode: None,
             aws_profile: None,
@@ -4029,6 +4043,7 @@ mod tests {
             reasoning_effort: ReasoningEffort::default(),
             reasoning_visibility: ReasoningVisibility::default(),
             warmup_enabled: true,
+            num_ctx: None,
             region: None,
             auth_mode: None,
             aws_profile: None,
@@ -4091,6 +4106,7 @@ mod tests {
             reasoning_effort: ReasoningEffort::default(),
             reasoning_visibility: ReasoningVisibility::default(),
             warmup_enabled: true,
+            num_ctx: None,
             region: Some("us-east-1".into()),
             auth_mode,
             aws_profile: None,

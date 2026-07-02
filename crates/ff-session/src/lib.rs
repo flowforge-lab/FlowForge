@@ -180,7 +180,7 @@ impl SessionStore {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
             .prepare(
-                "SELECT id, session_id, role, content, tool_calls, tool_call_id, attachments, reasoning, stop_reason, created_at
+                "SELECT id, session_id, role, content, tool_calls, tool_call_id, attachments, reasoning, stop_reason, author_name, created_at
                  FROM messages
                  WHERE session_id = ?1
                  ORDER BY seq",
@@ -203,6 +203,7 @@ impl SessionStore {
             attachments: None,
             reasoning: None,
             stop_reason: None,
+            author_name: None,
             created_at: now_ms(),
         })
     }
@@ -225,6 +226,7 @@ impl SessionStore {
             attachments: (!attachments.is_empty()).then_some(attachments),
             reasoning: None,
             stop_reason: None,
+            author_name: None,
             created_at: now_ms(),
         })
     }
@@ -246,6 +248,7 @@ impl SessionStore {
             attachments: None,
             reasoning: None,
             stop_reason: None,
+            author_name: None,
             created_at: now_ms(),
         })
     }
@@ -304,8 +307,26 @@ impl SessionStore {
         .flatten()
     }
 
-    fn push_message(&self, msg: Message) -> Message {
+    fn push_message(&self, mut msg: Message) -> Message {
         let conn = self.conn.lock().unwrap();
+        // Stamp the authoring phenotype on assistant rows (#657) so a reloaded
+        // thread renders the true historical author instead of the currently
+        // active phenotype. The row is reserved at turn start, so the session
+        // binding read here is the phenotype that produced the turn. NULL when the
+        // session is unbound (default phenotype) -- the UI falls back to live
+        // resolution, matching pre-existing rows.
+        if msg.role == Role::Assistant && msg.author_name.is_none() {
+            msg.author_name = conn
+                .query_row(
+                    "SELECT phenotype FROM sessions WHERE id = ?1",
+                    params![msg.session_id],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .optional()
+                .ok()
+                .flatten()
+                .flatten();
+        }
         let seq: i64 = conn
             .query_row(
                 "SELECT COALESCE(MAX(seq), -1) + 1 FROM messages WHERE session_id = ?1",
@@ -335,8 +356,8 @@ impl SessionStore {
             .map(|a| serde_json::to_string(a).expect("serialize attachments"));
         let inserted = conn.execute(
             "INSERT INTO messages
-                 (id, session_id, seq, role, content, tool_calls, tool_call_id, attachments, reasoning, stop_reason, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                 (id, session_id, seq, role, content, tool_calls, tool_call_id, attachments, reasoning, stop_reason, author_name, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 msg.id,
                 msg.session_id,
@@ -348,6 +369,7 @@ impl SessionStore {
                 attachments,
                 msg.reasoning,
                 msg.stop_reason.map(|r| r.as_wire()),
+                msg.author_name,
                 msg.created_at,
             ],
         );
@@ -546,7 +568,7 @@ impl SessionStore {
         if updated > 0 {
             if let Some(msg) = conn
                 .query_row(
-                    "SELECT id, session_id, role, content, tool_calls, tool_call_id, attachments, reasoning, stop_reason, created_at
+                    "SELECT id, session_id, role, content, tool_calls, tool_call_id, attachments, reasoning, stop_reason, author_name, created_at
                      FROM messages WHERE id = ?1",
                     params![message_id],
                     row_to_message,
@@ -568,6 +590,7 @@ impl SessionStore {
             attachments: None,
             reasoning: None,
             stop_reason: None,
+            author_name: None,
             created_at: ts,
         }
     }
@@ -805,7 +828,7 @@ impl SessionStore {
         {
             let mut stmt = tx
                 .prepare(
-                    "SELECT seq, role, content, tool_calls, tool_call_id, attachments, reasoning, stop_reason, created_at
+                    "SELECT seq, role, content, tool_calls, tool_call_id, attachments, reasoning, stop_reason, author_name, created_at
                      FROM messages WHERE session_id = ?1
                      ORDER BY seq",
                 )
@@ -821,7 +844,8 @@ impl SessionStore {
                         row.get::<_, Option<String>>(5)?,
                         row.get::<_, Option<String>>(6)?,
                         row.get::<_, Option<String>>(7)?,
-                        row.get::<_, i64>(8)?,
+                        row.get::<_, Option<String>>(8)?,
+                        row.get::<_, i64>(9)?,
                     ))
                 })
                 .expect("query forked messages");
@@ -836,12 +860,13 @@ impl SessionStore {
                     attachments,
                     reasoning,
                     stop_reason,
+                    author_name,
                     created_at,
                 ) = row.expect("read forked message");
                 let inserted = tx.execute(
                     "INSERT INTO messages
-                         (id, session_id, seq, role, content, tool_calls, tool_call_id, attachments, reasoning, stop_reason, created_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                         (id, session_id, seq, role, content, tool_calls, tool_call_id, attachments, reasoning, stop_reason, author_name, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                     params![
                         new_id(),
                         forked.id,
@@ -853,6 +878,7 @@ impl SessionStore {
                         attachments,
                         reasoning,
                         stop_reason,
+                        author_name,
                         created_at,
                     ],
                 );
@@ -1095,12 +1121,22 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
         conn.pragma_update(None, "user_version", 7)?;
     }
     if version < 8 {
+        // #657: persist the phenotype that authored each assistant message so a
+        // reloaded thread shows the true historical author instead of relabeling
+        // past turns with the currently active phenotype. NULL for user/tool/system
+        // rows and for pre-existing rows (which fall back to live resolution in the
+        // UI). Added via ALTER so existing v7 databases gain the column without
+        // losing data -- mirrors the v3 `attachments` / v4 `reasoning` adds.
+        conn.execute_batch("ALTER TABLE messages ADD COLUMN author_name TEXT;")?;
+        conn.pragma_update(None, "user_version", 8)?;
+    }
+    if version < 9 {
         // #658: persist the structured stop reason for a turn that ended without a
         // usable answer, so the frontend classifies/renders the stop from this
         // column instead of string-matching the `[stopped…]` marker in `content`.
         // NULL for a normal turn. Added via ALTER so existing rows upgrade in place.
         conn.execute_batch("ALTER TABLE messages ADD COLUMN stop_reason TEXT;")?;
-        conn.pragma_update(None, "user_version", 8)?;
+        conn.pragma_update(None, "user_version", 9)?;
     }
     Ok(())
 }
@@ -1142,6 +1178,7 @@ fn row_to_message(row: &rusqlite::Row) -> rusqlite::Result<Message> {
         stop_reason: row
             .get::<_, Option<String>>("stop_reason")?
             .and_then(|s| StopReason::from_wire(&s)),
+        author_name: row.get("author_name")?,
         created_at: row.get("created_at")?,
     })
 }
@@ -1473,7 +1510,7 @@ mod tests {
             .unwrap()
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 8);
+        assert_eq!(version, 9);
     }
 
     #[test]
@@ -1594,7 +1631,7 @@ mod tests {
             .unwrap()
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 8);
+        assert_eq!(version, 9);
     }
 
     #[test]
@@ -1645,7 +1682,7 @@ mod tests {
             .unwrap()
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 8);
+        assert_eq!(version, 9);
     }
 
     #[test]
@@ -1702,6 +1739,49 @@ mod tests {
         assert_eq!(after[0].id, before[0].id);
         assert_eq!(after[0].session_id, s.id);
         assert_eq!(store.list_sessions().len(), 2);
+    }
+
+    #[test]
+    fn assistant_message_is_stamped_with_the_session_phenotype() {
+        let store = SessionStore::new();
+        let s = store.create_session(None);
+        store.set_session_phenotype(&s.id, Some("codon".into()));
+
+        store.add_message(&s.id, Role::User, "hi".into());
+        let reserved = store.add_message(&s.id, Role::Assistant, String::new());
+        // The returned reserved row already carries the stamped author, so events
+        // emitted from it surface the true author too.
+        assert_eq!(reserved.author_name.as_deref(), Some("codon"));
+
+        let msgs = store.get_messages(&s.id);
+        let user = msgs.iter().find(|m| m.role == Role::User).unwrap();
+        let assistant = msgs.iter().find(|m| m.role == Role::Assistant).unwrap();
+        // Only the assistant row is stamped; the user row is left to live resolution.
+        assert_eq!(user.author_name, None);
+        assert_eq!(assistant.author_name.as_deref(), Some("codon"));
+    }
+
+    #[test]
+    fn assistant_message_in_an_unbound_session_has_no_author() {
+        let store = SessionStore::new();
+        let s = store.create_session(None);
+        let m = store.add_message(&s.id, Role::Assistant, "ok".into());
+        assert_eq!(m.author_name, None);
+        assert_eq!(store.get_messages(&s.id)[0].author_name, None);
+    }
+
+    #[test]
+    fn fork_preserves_the_persisted_author() {
+        let store = SessionStore::new();
+        let s = store.create_session(None);
+        store.set_session_phenotype(&s.id, Some("codon".into()));
+        store.add_message(&s.id, Role::Assistant, "authored by codon".into());
+
+        let forked = store.fork_session(&s.id).unwrap();
+        assert_eq!(
+            store.get_messages(&forked.id)[0].author_name.as_deref(),
+            Some("codon")
+        );
     }
 
     #[test]
@@ -1979,12 +2059,13 @@ mod tests {
             .unwrap()
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 8);
+        assert_eq!(version, 9);
     }
 
     #[test]
-    fn migration_v7_to_v8_preserves_messages_and_adds_stop_reason() {
-        // A v7 database (pre-#658) must gain the messages.stop_reason column on open
+    fn migration_v7_to_v9_preserves_messages_and_adds_stop_reason() {
+        // A v7 database (pre-#657/#658) must gain both the author_name (v8) and
+        // stop_reason (v9) columns on open
         // without losing existing rows, and old rows read back with stop_reason =
         // None -- the read-time classifier is their only fallback.
         let dir = tempfile::tempdir().unwrap();
@@ -2040,7 +2121,7 @@ mod tests {
             .unwrap()
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 8);
+        assert_eq!(version, 9);
     }
 
     #[test]
@@ -2202,7 +2283,7 @@ mod tests {
             .unwrap()
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 8);
+        assert_eq!(version, 9);
     }
 
     #[test]

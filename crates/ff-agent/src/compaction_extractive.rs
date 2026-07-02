@@ -455,6 +455,7 @@ mod tests {
             attachments: None,
             reasoning: None,
             stop_reason: None,
+            author_name: None,
             created_at: 0,
         }
     }

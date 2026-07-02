@@ -1866,6 +1866,7 @@ mod tests {
             attachments: None,
             reasoning: Some("because A then B".into()),
             stop_reason: None,
+            author_name: None,
             created_at: 0,
         };
         let out = to_chat(std::slice::from_ref(&msg));
@@ -1892,6 +1893,7 @@ mod tests {
             attachments: None,
             reasoning: Some(cot.into()),
             stop_reason: None,
+            author_name: None,
             created_at: 0,
         };
         let history = vec![
@@ -2942,6 +2944,7 @@ mod tests {
             attachments: None,
             reasoning: None,
             stop_reason: None,
+            author_name: None,
             created_at: 0,
         };
         let tool = ff_core::Message {
@@ -2954,6 +2957,7 @@ mod tests {
             attachments: None,
             reasoning: None,
             stop_reason: None,
+            author_name: None,
             created_at: 1,
         };
         let out = to_chat(&[assistant, tool]);
@@ -2992,6 +2996,7 @@ mod tests {
             attachments: None,
             reasoning: None,
             stop_reason: None,
+            author_name: None,
             created_at: 0,
         };
         let result = |mid: &str, ts: i64| ff_core::Message {
@@ -3004,6 +3009,7 @@ mod tests {
             attachments: None,
             reasoning: None,
             stop_reason: None,
+            author_name: None,
             created_at: ts,
         };
         let out = to_chat(&[assistant, result("m2", 1), result("m3", 2)]);
@@ -3031,6 +3037,7 @@ mod tests {
             attachments: None,
             reasoning: None,
             stop_reason: None,
+            author_name: None,
             created_at: 0,
         };
         let tool = ff_core::Message {
@@ -3043,6 +3050,7 @@ mod tests {
             attachments: None,
             reasoning: None,
             stop_reason: None,
+            author_name: None,
             created_at: 1,
         };
         let out = to_chat(&[assistant, tool]);

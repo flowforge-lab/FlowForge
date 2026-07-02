@@ -153,6 +153,14 @@ pub struct Message {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub stop_reason: Option<StopReason>,
+    /// The phenotype that produced this (assistant) message, captured when the row
+    /// was created so history shows the true historical author rather than the
+    /// currently active phenotype (#657). Holds the raw phenotype name (the FE
+    /// profile id), resolved to a display name at render. `None` for user/tool/system
+    /// rows and for pre-existing rows, which fall back to live resolution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub author_name: Option<String>,
     /// Unix epoch milliseconds.
     #[ts(type = "number")]
     pub created_at: i64,

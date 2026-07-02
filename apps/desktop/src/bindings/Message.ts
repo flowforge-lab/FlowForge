@@ -33,6 +33,14 @@ reasoning?: string,
  */
 stopReason?: StopReason, 
 /**
+ * The phenotype that produced this (assistant) message, captured when the row
+ * was created so history shows the true historical author rather than the
+ * currently active phenotype (#657). Holds the raw phenotype name (the FE
+ * profile id), resolved to a display name at render. `None` for user/tool/system
+ * rows and for pre-existing rows, which fall back to live resolution.
+ */
+authorName?: string, 
+/**
  * Unix epoch milliseconds.
  */
 createdAt: number, };

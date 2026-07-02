@@ -1,18 +1,21 @@
 import { usePrefsStore } from "@/store/prefs";
-import { useProfilesStore } from "@/store/profiles";
+import { phenotypeDisplayName, useProfilesStore } from "@/store/profiles";
 import { formatMessageTime } from "@/lib/format-message-time";
 
 /**
  * Author + timestamp line above a chat message (#641): `<name>  <time>`, name in
- * medium weight, time muted to its right. Reads the author name from the stores by
- * role so chat-view stays a two-line change and headers update live:
+ * medium weight, time muted to its right. Reads the author name by role so
+ * chat-view stays a two-line change and headers update live:
  * - user → `prefs.displayName`, falling back to "You" when blank.
- * - assistant → the active phenotype display name, falling back to "Assistant".
+ * - assistant → the persisted authoring phenotype (#657), falling back to the
+ *   currently active phenotype for rows written before authors were stored.
  *
- * The assistant name reflects the *currently* active phenotype, not the one that
- * produced each message: a thread reloaded after the user switches phenotype will
- * re-label past assistant turns with the new name. A faithful per-message author
- * needs a `Message` author field (schema + bindings), tracked as a follow-up (#657).
+ * `authorName` is the raw phenotype name (the profile id) stamped on the message
+ * when the turn ran. Preferring it means a thread reloaded after the user switches
+ * phenotype keeps each past turn labeled with the phenotype that produced it,
+ * rather than relabeling the whole history with the new active phenotype. A
+ * persisted id whose profile no longer exists is title-cased for display; a row
+ * with no stored author (older messages) falls back to the live active phenotype.
  *
  * The parent message column (`items-end` for user, `items-start` for assistant)
  * handles left/right alignment. The time span is omitted when `createdAt` has no
@@ -21,18 +24,29 @@ import { formatMessageTime } from "@/lib/format-message-time";
 export function MessageHeader({
   role,
   createdAt,
+  authorName,
 }: {
   role: "user" | "assistant";
   createdAt: number;
+  authorName?: string | null;
 }) {
   const displayName = usePrefsStore((s) => s.displayName);
   const activeId = useProfilesStore((s) => s.activeId);
   const profiles = useProfilesStore((s) => s.profiles);
 
-  const name =
-    role === "user"
-      ? displayName || "You"
-      : (profiles.find((p) => p.id === activeId)?.name ?? "Assistant");
+  let name: string;
+  if (role === "user") {
+    name = displayName || "You";
+  } else if (authorName) {
+    // Persisted historical author: resolve to its current display name, or
+    // title-case the raw phenotype name when its profile no longer exists.
+    name =
+      profiles.find((p) => p.id === authorName)?.name ??
+      phenotypeDisplayName(authorName);
+  } else {
+    // Pre-authors rows: fall back to the live active phenotype.
+    name = profiles.find((p) => p.id === activeId)?.name ?? "Assistant";
+  }
 
   const time = formatMessageTime(createdAt);
 

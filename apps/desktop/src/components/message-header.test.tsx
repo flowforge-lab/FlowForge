@@ -58,6 +58,54 @@ describe("MessageHeader", () => {
     expect(screen.queryByText("default")).toBeNull();
   });
 
+  it("prefers the persisted author over the active phenotype (#657)", () => {
+    // Active phenotype is Data Science, but this message was authored by Codon --
+    // the header must show the historical author, not the current active one.
+    useProfilesStore.setState({
+      activeId: "data-science",
+      profiles: [
+        profile({ id: "data-science", name: "Data Science" }),
+        profile({ id: "codon", name: "Codon" }),
+      ],
+    });
+    render(
+      <MessageHeader
+        role="assistant"
+        createdAt={CREATED_AT}
+        authorName="codon"
+      />,
+    );
+    expect(screen.getByText("Codon")).toBeTruthy();
+    expect(screen.queryByText("Data Science")).toBeNull();
+  });
+
+  it("title-cases a persisted author whose profile no longer exists", () => {
+    // The authoring phenotype was deleted, so it is not in the list; fall back to
+    // a title-cased form of the raw name rather than the wrong active phenotype.
+    useProfilesStore.setState({
+      activeId: "data-science",
+      profiles: [profile({ id: "data-science", name: "Data Science" })],
+    });
+    render(
+      <MessageHeader
+        role="assistant"
+        createdAt={CREATED_AT}
+        authorName="legacy-bot"
+      />,
+    );
+    expect(screen.getByText("Legacy Bot")).toBeTruthy();
+  });
+
+  it("falls back to the active phenotype when no author is persisted", () => {
+    // Pre-#657 rows have no stored author; live resolution still applies.
+    useProfilesStore.setState({
+      activeId: "data-science",
+      profiles: [profile({ id: "data-science", name: "Data Science" })],
+    });
+    render(<MessageHeader role="assistant" createdAt={CREATED_AT} />);
+    expect(screen.getByText("Data Science")).toBeTruthy();
+  });
+
   it("omits the time when createdAt has no usable timestamp", () => {
     usePrefsStore.setState({ displayName: "Abid" });
     render(<MessageHeader role="user" createdAt={0} />);
