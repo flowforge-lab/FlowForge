@@ -2199,6 +2199,7 @@ fn emit_agent_event(app: &tauri::AppHandle, session_id: &str, event: AgentEvent)
         AgentEvent::Done {
             message_id,
             token_count,
+            stop_reason,
             ..
         } => {
             let _ = app.emit(
@@ -2207,6 +2208,7 @@ fn emit_agent_event(app: &tauri::AppHandle, session_id: &str, event: AgentEvent)
                     session_id: session_id.to_string(),
                     message_id,
                     token_count,
+                    stop_reason,
                 },
             );
         }

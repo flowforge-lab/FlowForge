@@ -178,10 +178,12 @@ function MessageRowImpl({
                   hasAnswer={
                     i === lastStepsIdx &&
                     message.content.length > 0 &&
+                    message.stopReason == null &&
                     !isResumableStopNotice(message.content)
                   }
                   answer={
                     i === lastStepsIdx &&
+                    message.stopReason == null &&
                     !isResumableStopNotice(message.content)
                       ? message.content
                       : undefined
@@ -224,14 +226,18 @@ function MessageRowImpl({
         )
       )}
       {message.content &&
-        // A settled turn whose final content is a resumable stop marker
-        // (`[stopped]` / `[stopped: …]`) renders as a calm Cancelled banner with an
-        // inline Continue button (#636) instead of the raw marker text. Only when
-        // settled — the marker can't legitimately appear mid-stream.
-        (!streaming && isResumableStopNotice(message.content) ? (
+        // A settled turn that stopped without a usable answer renders as a calm
+        // Cancelled banner with an inline Continue button (#636) instead of the raw
+        // marker text. Prefers the structured `stopReason` (#658); falls back to the
+        // `[stopped…]` marker string for rows persisted before the structured column.
+        // Only when settled — a stop can't legitimately appear mid-stream.
+        (!streaming &&
+        (message.stopReason != null ||
+          isResumableStopNotice(message.content)) ? (
           <CancelledNotice
             sessionId={message.sessionId}
             content={message.content}
+            stopReason={message.stopReason}
           />
         ) : (
           <div className="group relative max-w-[80%]">

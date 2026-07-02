@@ -11,7 +11,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use ff_core::{AttachmentKind, Message, Mode, ReasoningVisibility, Role};
+use ff_core::{AttachmentKind, Message, Mode, ReasoningVisibility, Role, StopReason};
 use ff_llm::{ChatMessage, ChatRequest, FunctionCall, LlmError, Provider, ToolCall as LlmToolCall};
 use ff_session::SessionStore;
 use ff_tools::{Safety, ToolRegistry, COMPACTION_RETRIEVE_TOOL};
@@ -232,6 +232,10 @@ pub enum AgentEvent {
         message_id: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         final_message: Option<String>,
+        /// Why the turn stopped without a usable answer (#658), when it did.
+        /// `None` for a normal text completion.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        stop_reason: Option<StopReason>,
         #[serde(skip_serializing_if = "Option::is_none")]
         turns: Option<u32>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -766,7 +770,7 @@ pub async fn run_turn(
     // persists past the nudge.
     let mut call_counts: HashMap<(String, String), usize> = HashMap::new();
     let mut repeat_nudge: Option<String> = None;
-    let mut stop_reason: Option<String> = None;
+    let mut stop_reason: Option<StopReason> = None;
     // Per-turn semantic read-dedupe (#458 RC5): read key (e.g. a file path) -> the
     // step it was first read at + a hash of that content. A later re-read whose
     // content is unchanged is collapsed to a sentinel instead of re-injecting the
@@ -1284,8 +1288,7 @@ pub async fn run_turn(
             // this same reserved message, so there is no orphan empty assistant message.
             if final_text.trim().is_empty() {
                 if !cancel.is_cancelled() && stop_reason.is_none() {
-                    stop_reason =
-                        Some("[stopped: the model returned an empty response]".to_string());
+                    stop_reason = Some(StopReason::EmptyResponse);
                 }
                 last = Some(finalized);
                 break;
@@ -1301,6 +1304,7 @@ pub async fn run_turn(
             on_event(AgentEvent::Done {
                 message_id: message_id.clone(),
                 final_message: Some(final_text),
+                stop_reason: None,
                 turns: Some(turn_count),
                 token_count,
                 prefill_estimates: Some(prefill_estimates.clone()),
@@ -1614,11 +1618,7 @@ pub async fn run_turn(
                 .or_insert(0);
             *count += 1;
             if *count >= REPEAT_BREAK_AT {
-                stop_reason = Some(format!(
-                    "[stopped: repeated the identical `{}` tool call {REPEAT_BREAK_AT} times \
-                     without making progress]",
-                    call.name
-                ));
+                stop_reason = Some(StopReason::Stall);
             } else if *count >= REPEAT_NUDGE_AT {
                 // Keep nudging through the recovery window (#244 R2 follow-up): re-arm on
                 // every repeat from the nudge threshold up to the break, so a model that
@@ -1646,18 +1646,29 @@ pub async fn run_turn(
     // Hit the iteration cap (or was cancelled) without a plain text answer.
     let mut msg =
         last.unwrap_or_else(|| store.add_message(session_id, Role::Assistant, String::new()));
-    if msg.content.is_empty() {
+    // The turn ended without a plain-text answer: resolve why so the notice text,
+    // the persisted structured `stop_reason`, and the `Done` event all agree (#658).
+    // A user cancel wins over any in-loop reason; absent one, the loop exhausted its
+    // iteration cap.
+    let reason = if cancel.is_cancelled() {
+        StopReason::Cancelled
+    } else {
+        stop_reason.unwrap_or(StopReason::ToolLimit)
+    };
+    let stop_reason = if msg.content.is_empty() {
         // The final assistant message only carried tool calls, so it would render as
-        // an empty bubble. Replace it with a notice explaining why the turn stopped.
-        let notice = if cancel.is_cancelled() {
-            "[stopped]".to_string()
-        } else if let Some(reason) = stop_reason {
-            reason
-        } else {
-            "[stopped: reached tool-call limit]".to_string()
-        };
-        msg = store.set_message_content(&msg.id, session_id, notice);
-    }
+        // an empty bubble. Persist the structured reason first, then replace the
+        // content with the reason's marker -- set_message_content re-selects the row,
+        // so the returned `msg` carries the just-written stop_reason too. The `Done`
+        // event and the persisted `Message.stop_reason` therefore always agree.
+        store.set_message_stop_reason(&msg.id, session_id, reason);
+        msg = store.set_message_content(&msg.id, session_id, reason.marker().to_string());
+        Some(reason)
+    } else {
+        // The turn produced real content (rare on this path): leave it as-is and
+        // report no stop reason, exactly as before #658.
+        None
+    };
     // Same context-size estimate as the plain-text completion path (#244 R6).
     let token_count = Some(
         estimator
@@ -1667,6 +1678,7 @@ pub async fn run_turn(
     on_event(AgentEvent::Done {
         message_id: msg.id.clone(),
         final_message: Some(msg.content.clone()),
+        stop_reason,
         turns: Some(turn_count),
         token_count,
         prefill_estimates: Some(prefill_estimates),
@@ -1853,6 +1865,7 @@ mod tests {
             tool_call_id: None,
             attachments: None,
             reasoning: Some("because A then B".into()),
+            stop_reason: None,
             created_at: 0,
         };
         let out = to_chat(std::slice::from_ref(&msg));
@@ -1878,6 +1891,7 @@ mod tests {
             tool_call_id: None,
             attachments: None,
             reasoning: Some(cot.into()),
+            stop_reason: None,
             created_at: 0,
         };
         let history = vec![
@@ -2927,6 +2941,7 @@ mod tests {
             tool_call_id: None,
             attachments: None,
             reasoning: None,
+            stop_reason: None,
             created_at: 0,
         };
         let tool = ff_core::Message {
@@ -2938,6 +2953,7 @@ mod tests {
             tool_call_id: Some(String::new()),
             attachments: None,
             reasoning: None,
+            stop_reason: None,
             created_at: 1,
         };
         let out = to_chat(&[assistant, tool]);
@@ -2975,6 +2991,7 @@ mod tests {
             tool_call_id: None,
             attachments: None,
             reasoning: None,
+            stop_reason: None,
             created_at: 0,
         };
         let result = |mid: &str, ts: i64| ff_core::Message {
@@ -2986,6 +3003,7 @@ mod tests {
             tool_call_id: Some(String::new()),
             attachments: None,
             reasoning: None,
+            stop_reason: None,
             created_at: ts,
         };
         let out = to_chat(&[assistant, result("m2", 1), result("m3", 2)]);
@@ -3012,6 +3030,7 @@ mod tests {
             tool_call_id: None,
             attachments: None,
             reasoning: None,
+            stop_reason: None,
             created_at: 0,
         };
         let tool = ff_core::Message {
@@ -3023,6 +3042,7 @@ mod tests {
             tool_call_id: Some("call_real".into()),
             attachments: None,
             reasoning: None,
+            stop_reason: None,
             created_at: 1,
         };
         let out = to_chat(&[assistant, tool]);
@@ -4917,9 +4937,11 @@ mod tests {
             saw_nudge.lock().unwrap().iter().any(|&b| b),
             "the repeat nudge should have been sent"
         );
-        // The turn ends with a clear repeated-call notice, not the generic cap notice.
+        // The turn ends with the structured stall marker, not the generic cap notice
+        // (#658 -- the reason is carried structurally; the marker text is static).
+        assert_eq!(msg.content, StopReason::Stall.marker());
         assert!(
-            msg.content.contains("repeated the identical"),
+            msg.content.contains("repeated a tool call"),
             "got: {}",
             msg.content
         );
