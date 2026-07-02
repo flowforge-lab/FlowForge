@@ -158,8 +158,12 @@ impl SearchProvider for TavilyProvider {
         // Fail loud on the keyless rate cap so the remedy is obvious rather than the
         // tool silently returning nothing.
         if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-            return Err("Tavily keyless rate limit reached (~30 searches/hour). Wait a                   few minutes and retry, or add a free Tavily API key in Settings →                   Search to raise the limit."
-                .to_string());
+            return Err(
+                "Tavily keyless hourly rate limit reached. Wait a few minutes \
+                 and retry, or add a free Tavily API key in Settings → Search to \
+                 raise the limit."
+                    .to_string(),
+            );
         }
         if !status.is_success() {
             return Err(format!("search endpoint returned HTTP {status}"));
@@ -249,7 +253,7 @@ impl WebSearchTool {
         if config.backend.requires_key() && !config.has_key {
             return Err(format!(
                 "the {:?} search backend needs an API key, which isn't supported yet \
-                 (tracked with the keychain work, #8); switch to SearXNG in Settings",
+                 (tracked with the keychain work, #8); switch to Tavily or SearXNG in Settings",
                 config.backend
             ));
         }
