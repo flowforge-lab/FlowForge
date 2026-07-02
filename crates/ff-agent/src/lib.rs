@@ -1853,6 +1853,7 @@ mod tests {
             tool_call_id: None,
             attachments: None,
             reasoning: Some("because A then B".into()),
+            author_name: None,
             created_at: 0,
         };
         let out = to_chat(std::slice::from_ref(&msg));
@@ -1878,6 +1879,7 @@ mod tests {
             tool_call_id: None,
             attachments: None,
             reasoning: Some(cot.into()),
+            author_name: None,
             created_at: 0,
         };
         let history = vec![
@@ -2927,6 +2929,7 @@ mod tests {
             tool_call_id: None,
             attachments: None,
             reasoning: None,
+            author_name: None,
             created_at: 0,
         };
         let tool = ff_core::Message {
@@ -2938,6 +2941,7 @@ mod tests {
             tool_call_id: Some(String::new()),
             attachments: None,
             reasoning: None,
+            author_name: None,
             created_at: 1,
         };
         let out = to_chat(&[assistant, tool]);
@@ -2975,6 +2979,7 @@ mod tests {
             tool_call_id: None,
             attachments: None,
             reasoning: None,
+            author_name: None,
             created_at: 0,
         };
         let result = |mid: &str, ts: i64| ff_core::Message {
@@ -2986,6 +2991,7 @@ mod tests {
             tool_call_id: Some(String::new()),
             attachments: None,
             reasoning: None,
+            author_name: None,
             created_at: ts,
         };
         let out = to_chat(&[assistant, result("m2", 1), result("m3", 2)]);
@@ -3012,6 +3018,7 @@ mod tests {
             tool_call_id: None,
             attachments: None,
             reasoning: None,
+            author_name: None,
             created_at: 0,
         };
         let tool = ff_core::Message {
@@ -3023,6 +3030,7 @@ mod tests {
             tool_call_id: Some("call_real".into()),
             attachments: None,
             reasoning: None,
+            author_name: None,
             created_at: 1,
         };
         let out = to_chat(&[assistant, tool]);

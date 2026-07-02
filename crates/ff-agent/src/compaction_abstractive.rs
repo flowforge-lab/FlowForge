@@ -239,6 +239,7 @@ fn summary_message(content: &str, cold: &[Message]) -> Message {
         tool_call_id: None,
         attachments: None,
         reasoning: None,
+        author_name: None,
         created_at: cold.first().map(|m| m.created_at).unwrap_or(0),
     }
 }
@@ -311,6 +312,7 @@ mod tests {
             tool_call_id: None,
             attachments: None,
             reasoning: None,
+            author_name: None,
             created_at: 0,
         }
     }

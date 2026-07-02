@@ -49,7 +49,7 @@ export interface Profile {
 }
 
 /** Title-case a phenotype name for display (`data-science` → `Data Science`). */
-function displayName(name: string): string {
+export function phenotypeDisplayName(name: string): string {
   return name
     .split(/[-_\s]+/)
     .filter(Boolean)
@@ -67,7 +67,7 @@ export function phenotypeToProfile(pheno: Phenotype, index: number): Profile {
       : "No skills active — the base working set.");
   return {
     id: pheno.name,
-    name: displayName(pheno.name),
+    name: phenotypeDisplayName(pheno.name),
     description,
     skillCount: pheno.skills.length,
     locked: pheno.name === DEFAULT_PROFILE_ID,
