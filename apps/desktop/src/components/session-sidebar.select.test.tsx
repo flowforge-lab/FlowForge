@@ -74,7 +74,6 @@ describe("SessionSidebar — multi-select (#643)", () => {
     vi.restoreAllMocks();
   });
 
-
   it("enters and exits select mode from the header toggle", async () => {
     const user = userEvent.setup();
     rtlRender(<SessionSidebar />);

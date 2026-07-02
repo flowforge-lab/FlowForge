@@ -193,9 +193,7 @@ describe("SessionSidebar integration (#185)", () => {
     const { container, cleanup } = render(<SessionSidebar />);
 
     // No All/Dismissed tab row.
-    expect(
-      container.querySelector('[aria-label="Session list"]'),
-    ).toBeNull();
+    expect(container.querySelector('[aria-label="Session list"]')).toBeNull();
     // Both are visible in one list (few enough to be within the first batch);
     // the dismissed row is dimmed and sinks below the live one.
     expect(container.textContent).toContain("Active one");
@@ -306,11 +304,15 @@ describe("SessionSidebar integration (#185)", () => {
     ).toBeNull();
 
     // The retained controls are present.
-    expect(container.querySelector('[title="Collapse sidebar"]')).not.toBeNull();
+    expect(
+      container.querySelector('[title="Collapse sidebar"]'),
+    ).not.toBeNull();
     expect(
       container.querySelector('[aria-label="Select sessions"]'),
     ).not.toBeNull();
-    expect(container.querySelector('[aria-label="New session"]')).not.toBeNull();
+    expect(
+      container.querySelector('[aria-label="New session"]'),
+    ).not.toBeNull();
     expect(
       container.querySelector('[aria-label="Sidebar options"]'),
     ).not.toBeNull();

@@ -95,9 +95,12 @@ describe("arrangeSessions", () => {
   });
 
   it("keeps the original order when nothing is pinned or dismissed", () => {
-    expect(
-      arrangeSessions(sessions, empty, empty).map((s) => s.id),
-    ).toEqual(["a", "b", "c", "d"]);
+    expect(arrangeSessions(sessions, empty, empty).map((s) => s.id)).toEqual([
+      "a",
+      "b",
+      "c",
+      "d",
+    ]);
   });
 
   it("sinks dismissed sessions to the bottom, even when pinned", () => {
@@ -145,7 +148,11 @@ describe("selectSessionOverflow", () => {
       selectSessionOverflow(sessions, null, SESSION_REVEAL_BATCH * 2).visible,
     ).toHaveLength(SESSION_REVEAL_BATCH * 2);
     // Third batch exceeds the total, so everything shows and no more remain.
-    const third = selectSessionOverflow(sessions, null, SESSION_REVEAL_BATCH * 3);
+    const third = selectSessionOverflow(
+      sessions,
+      null,
+      SESSION_REVEAL_BATCH * 3,
+    );
     expect(third.visible).toHaveLength(60);
     expect(third.hasMore).toBe(false);
   });
