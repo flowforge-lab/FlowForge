@@ -13,6 +13,7 @@ import {
   ResponseCopyButton,
 } from "@/components/message-actions";
 import { MessageAttachments } from "@/components/message-attachments";
+import { MessageHeader } from "@/components/message-header";
 import { ThinkingIndicator } from "@/components/thinking-indicator";
 import { ContinueAffordance } from "@/components/continue-affordance";
 import { foldTurns, segmentTurn } from "@/lib/turn-groups";
@@ -88,6 +89,7 @@ function MessageRowImpl({
       message.attachments && message.attachments.length > 0;
     return (
       <div className="flex flex-col items-end gap-1.5">
+        <MessageHeader role="user" createdAt={message.createdAt} />
         {hasAttachments && (
           <div className="max-w-[80%]">
             <MessageAttachments attachments={message.attachments!} />
@@ -134,6 +136,7 @@ function MessageRowImpl({
 
   return (
     <div className="flex flex-col items-start gap-1.5">
+      <MessageHeader role="assistant" createdAt={message.createdAt} />
       {toolSteps.length > 0 ? (
         <div className="flex w-full max-w-[80%] flex-col gap-1.5">
           {/* A single settled step stays bare; streaming (any count), 2+ steps, or
