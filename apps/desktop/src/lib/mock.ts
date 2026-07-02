@@ -866,6 +866,19 @@ export class MockIpc implements FfIpc {
       });
       return user.id;
     }
+    // Dev-only (#636): `/cancel` reproduces a user Stop during the pending window —
+    // the backend replaces the empty assistant message with a bare `[stopped]`
+    // marker (no tokens) and closes the turn. Surfaced on the next getMessages
+    // refetch so the Cancelled banner + one-click Continue can be exercised here.
+    if (content.trim() === "/cancel") {
+      const stopped = this.append(sessionId, "assistant", "[stopped]");
+      this.emit(this.doneListeners, {
+        sessionId,
+        messageId: stopped.id,
+        tokenCount: null,
+      });
+      return user.id;
+    }
     // Dev-only (#562): a message mentioning a secret/password drives the
     // `ask_user` step's masked variant, so the `<input type="password">` +
     // at-rest redaction path is demoable under VITE_FF_MOCK=1.

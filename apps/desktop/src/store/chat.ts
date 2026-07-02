@@ -5,7 +5,7 @@
 import { create } from "zustand";
 import { ipc } from "@/lib/ipc";
 import { autoTitle } from "@/lib/auto-title";
-import { isCappedNotice } from "@/store/capped-turn";
+import { isResumableStopNotice } from "@/store/capped-turn";
 import type {
   Attachment,
   ApprovalSafety,
@@ -79,12 +79,13 @@ interface ChatState {
    *  (#244 R6). Populated from TurnDoneEvent.tokenCount; drives a context-usage
    *  indicator. Undefined until the first turn completes with an estimate. */
   contextTokensBySession: Record<string, number>;
-  /** sessionId -> the last turn ended without a usable answer (the agent loop hit
-   *  the tool-call cap or stalled), so a one-click "Continue" affordance is offered
-   *  (#513). Set in `finishTurn` when the done turn streamed no content and the
-   *  refetched final message is a reason-bearing `[stopped: …]` notice; cleared the
-   *  moment the next turn starts (send / edit / cancel). */
-  cappedBySession: Record<string, boolean>;
+  /** sessionId -> the last turn ended without a usable answer the user can resume
+   *  with one click — the agent loop hit the tool-call cap / stalled (`[stopped: …]`),
+   *  or the user pressed Stop (a bare `[stopped]`, #636), so a one-click "Continue"
+   *  affordance is offered (#513/#636). Set in `finishTurn` when the done turn
+   *  streamed no content and the refetched final message is a resumable stop notice;
+   *  cleared the moment the next turn starts (send / edit / cancel). */
+  resumableBySession: Record<string, boolean>;
   /** FE mirror of the backend's "Allow this session" sets, keyed by sessionId
    *  (#229). Drives the "session" badge on auto-approved follow-up calls; the
    *  backend stays the source of truth for the gate itself. */
@@ -238,12 +239,16 @@ function clearSessionTurnTiming(
   return { streamingBySession, turnStartBySession };
 }
 
-/** Drop a session's "offer Continue" flag (#513) — a new turn is starting, so any
- *  prior capped/stopped state is stale. */
-function clearCapped(s: Pick<ChatState, "cappedBySession">, sessionId: string) {
-  if (!(sessionId in s.cappedBySession)) return null;
-  const { [sessionId]: _capped, ...cappedBySession } = s.cappedBySession;
-  return { cappedBySession };
+/** Drop a session's "offer Continue" flag (#513/#636) — a new turn is starting, so
+ *  any prior capped/stopped state is stale. */
+function clearResumable(
+  s: Pick<ChatState, "resumableBySession">,
+  sessionId: string,
+) {
+  if (!(sessionId in s.resumableBySession)) return null;
+  const { [sessionId]: _resumable, ...resumableBySession } =
+    s.resumableBySession;
+  return { resumableBySession };
 }
 
 const systemMessage = (sessionId: string, content: string): Message => ({
@@ -264,7 +269,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   toolStepsByMessage: {},
   reasoningByMessage: {},
   contextTokensBySession: {},
-  cappedBySession: {},
+  resumableBySession: {},
   sessionApprovedBySession: {},
   alwaysApproved: new Set<string>(),
   bootstrapError: null,
@@ -455,7 +460,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       createdAt: Date.now(),
     };
     set((s) => ({
-      ...clearCapped(s, sessionId),
+      ...clearResumable(s, sessionId),
       messagesBySession: {
         ...s.messagesBySession,
         [sessionId]: [...(s.messagesBySession[sessionId] ?? []), optimistic],
@@ -518,7 +523,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       // streaming assistant message away, and the backend cancels that turn before
       // re-running. Fresh turn timing then drives the pending/Stop indicator.
       const cleared = clearSessionTurnTiming(s, sessionId);
-      const cappedCleared = clearCapped(s, sessionId);
+      const resumableCleared = clearResumable(s, sessionId);
       const messagesBySession = {
         ...s.messagesBySession,
         [sessionId]: [...prior.slice(0, idx), edited],
@@ -538,7 +543,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
         Object.entries(s.turnStartByMessage).filter(([id]) => liveIds.has(id)),
       );
       return {
-        ...cappedCleared,
+        ...resumableCleared,
         messagesBySession,
         toolStepsByMessage,
         turnStartByMessage,
@@ -613,9 +618,11 @@ export const useChatStore = create<ChatState>((set, get) => ({
       return;
     }
     await ipc.cancelTurn(sessionId);
+    // Clear the flag now; the backend then writes a bare `[stopped]`, and after
+    // turn:done + the finishTurn refetch it is re-set so Continue reappears (#636).
     set((s) => ({
       ...clearSessionTurnTiming(s, sessionId),
-      ...clearCapped(s, sessionId),
+      ...clearResumable(s, sessionId),
     }));
   },
 
@@ -710,8 +717,9 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
     if (!endedEmpty) return;
     // Re-pull authoritative history (the notice text only lives on the backend),
-    // then offer Continue if the final assistant message is a reason-bearing stop
-    // notice — never for a bare `[stopped]` (a deliberate user cancel).
+    // then offer Continue if the final assistant message is a resumable stop
+    // notice — a reason-bearing `[stopped: …]` cap/stall OR a bare `[stopped]`
+    // from a user cancel (#636).
     void get()
       .loadSession(e.sessionId)
       .then(() => {
@@ -735,10 +743,13 @@ export const useChatStore = create<ChatState>((set, get) => ({
         if (
           lastAssistant &&
           lastAssistant.id === e.messageId &&
-          isCappedNotice(lastAssistant.content)
+          isResumableStopNotice(lastAssistant.content)
         ) {
           set((s) => ({
-            cappedBySession: { ...s.cappedBySession, [e.sessionId]: true },
+            resumableBySession: {
+              ...s.resumableBySession,
+              [e.sessionId]: true,
+            },
           }));
         }
       })

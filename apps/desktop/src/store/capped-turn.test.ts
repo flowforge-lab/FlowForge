@@ -1,34 +1,43 @@
 import { describe, expect, it } from "vitest";
 
-import { isCappedNotice } from "@/store/capped-turn";
+import { isResumableStopNotice } from "@/store/capped-turn";
 
-describe("isCappedNotice (#513)", () => {
+describe("isResumableStopNotice (#513/#636)", () => {
   it("matches the reason-bearing stop notices the agent loop writes", () => {
-    expect(isCappedNotice("[stopped: reached tool-call limit]")).toBe(true);
+    expect(isResumableStopNotice("[stopped: reached tool-call limit]")).toBe(
+      true,
+    );
     expect(
-      isCappedNotice(
+      isResumableStopNotice(
         "[stopped: repeated the identical `read` tool call 3 times without making progress]",
       ),
     ).toBe(true);
     expect(
-      isCappedNotice("[stopped: the model returned an empty response]"),
+      isResumableStopNotice("[stopped: the model returned an empty response]"),
     ).toBe(true);
   });
 
   it("tolerates surrounding whitespace", () => {
-    expect(isCappedNotice("  [stopped: reached tool-call limit]\n")).toBe(true);
+    expect(
+      isResumableStopNotice("  [stopped: reached tool-call limit]\n"),
+    ).toBe(true);
   });
 
-  it("excludes a bare [stopped] (deliberate user cancel)", () => {
-    expect(isCappedNotice("[stopped]")).toBe(false);
+  it("matches a bare [stopped] (user cancel via Stop) — now resumable (#636)", () => {
+    expect(isResumableStopNotice("[stopped]")).toBe(true);
+    expect(isResumableStopNotice("  [stopped]\n")).toBe(true);
   });
 
   it("does not match a normal assistant answer", () => {
-    expect(isCappedNotice("Here's the summary of what I did.")).toBe(false);
-    expect(isCappedNotice("")).toBe(false);
+    expect(isResumableStopNotice("Here's the summary of what I did.")).toBe(
+      false,
+    );
+    expect(isResumableStopNotice("")).toBe(false);
     // A notice mentioned mid-sentence is not a stop marker.
     expect(
-      isCappedNotice("The build [stopped: ...] message means the cap was hit."),
+      isResumableStopNotice(
+        "The build [stopped: ...] message means the cap was hit.",
+      ),
     ).toBe(false);
   });
 });

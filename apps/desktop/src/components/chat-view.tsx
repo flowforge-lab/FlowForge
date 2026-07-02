@@ -15,7 +15,8 @@ import {
 import { MessageAttachments } from "@/components/message-attachments";
 import { MessageHeader } from "@/components/message-header";
 import { ThinkingIndicator } from "@/components/thinking-indicator";
-import { ContinueAffordance } from "@/components/continue-affordance";
+import { CancelledNotice } from "@/components/cancelled-notice";
+import { isResumableStopNotice } from "@/store/capped-turn";
 import { foldTurns, segmentTurn } from "@/lib/turn-groups";
 import type { TurnItem } from "@/lib/turn-groups";
 import { useExperimentalStore } from "@/store/experimental";
@@ -175,9 +176,16 @@ function MessageRowImpl({
                   streaming={i === lastStepsIdx ? streaming : false}
                   turnStartMs={i === lastStepsIdx ? turnStartMs : null}
                   hasAnswer={
-                    i === lastStepsIdx ? message.content.length > 0 : false
+                    i === lastStepsIdx &&
+                    message.content.length > 0 &&
+                    !isResumableStopNotice(message.content)
                   }
-                  answer={i === lastStepsIdx ? message.content : undefined}
+                  answer={
+                    i === lastStepsIdx &&
+                    !isResumableStopNotice(message.content)
+                      ? message.content
+                      : undefined
+                  }
                   onExportTimeline={
                     i === lastStepsIdx && exportEnabled
                       ? (format) =>
@@ -215,26 +223,36 @@ function MessageRowImpl({
           </div>
         )
       )}
-      {message.content && (
-        <div className="group relative max-w-[80%]">
-          <div
-            data-selectable
-            className={cn(
-              "px-0.5 py-1 text-sm leading-relaxed text-foreground",
-              streaming && "ff-streaming-caret",
-            )}
-          >
-            <Markdown content={message.content} streaming={streaming} />
-          </div>
-          {/* Always-visible copy affordance under the response (#604). Hidden
-              mid-stream — copying a half-streamed answer is wrong. */}
-          {!streaming && (
-            <div className="mt-1 flex items-center px-0.5">
-              <ResponseCopyButton text={message.content} />
+      {message.content &&
+        // A settled turn whose final content is a resumable stop marker
+        // (`[stopped]` / `[stopped: …]`) renders as a calm Cancelled banner with an
+        // inline Continue button (#636) instead of the raw marker text. Only when
+        // settled — the marker can't legitimately appear mid-stream.
+        (!streaming && isResumableStopNotice(message.content) ? (
+          <CancelledNotice
+            sessionId={message.sessionId}
+            content={message.content}
+          />
+        ) : (
+          <div className="group relative max-w-[80%]">
+            <div
+              data-selectable
+              className={cn(
+                "px-0.5 py-1 text-sm leading-relaxed text-foreground",
+                streaming && "ff-streaming-caret",
+              )}
+            >
+              <Markdown content={message.content} streaming={streaming} />
             </div>
-          )}
-        </div>
-      )}
+            {/* Always-visible copy affordance under the response (#604). Hidden
+                mid-stream — copying a half-streamed answer is wrong. */}
+            {!streaming && (
+              <div className="mt-1 flex items-center px-0.5">
+                <ResponseCopyButton text={message.content} />
+              </div>
+            )}
+          </div>
+        ))}
     </div>
   );
 }
@@ -393,7 +411,6 @@ export function ChatView({ sessionId }: { sessionId?: string } = {}) {
             );
           })}
           {pending && <ThinkingIndicator />}
-          <ContinueAffordance sessionId={targetSessionId} />
         </div>
       </div>
 
