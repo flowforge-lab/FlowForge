@@ -24,8 +24,8 @@ use ff_mcp::{McpConfigWatcher, SupervisorHandle};
 use crate::git_watch::GitHeadWatcher;
 use ff_memory::watch::MemoryWatcher;
 use ff_memory::{
-    EmbeddingProvider, FlushLedger, Fts5Index, HybridIndex, Memory, MemoryConfig, MemoryIndex,
-    NoopEmbedder, OpenAiEmbedder,
+    DecayConfig, EmbeddingProvider, FlushLedger, Fts5Index, HybridIndex, Memory, MemoryConfig,
+    MemoryIndex, NoopEmbedder, OpenAiEmbedder,
 };
 use ff_scheduled::ScheduledStore;
 use ff_session::SessionStore;
@@ -884,23 +884,58 @@ impl AppState {
         // Shared so the registered `web_search` tool and `set_search_config` see the
         // same cell; a settings change takes effect on the next call.
         let search_config = Arc::new(Mutex::new(load_search_config()));
+
+        // The four boot stores open independent SQLite files (memory index,
+        // flush ledger, session, scheduled), so open them concurrently rather
+        // than serially to shorten time-to-ready (#599 item 2). `Memory` itself
+        // is I/O-free (a root path plus config), so it is built first and shared
+        // by reference into the memory-index and flush-ledger jobs.
+        let mem_config = memory_config_from_env();
+        let embedder = local_embedder_from_env(&mem_config);
+        let decay = mem_config.decay.clone();
+        let memory = Arc::new(Memory::with_default_root(mem_config));
+
         let t = std::time::Instant::now();
-        let (memory, memory_index, memory_watcher) = build_memory();
-        crate::boot_trace_step("app_state.memory_fts5", t.elapsed());
-        let t = std::time::Instant::now();
-        let flush_ledger = FlushLedger::open(memory.root().join("flush.db"))
-            .map(Arc::new)
-            .map_err(
-                |e| tracing::warn!(error = %e, "flush ledger unavailable; memory flush disabled"),
-            )
-            .ok();
-        crate::boot_trace_step("app_state.flush_db", t.elapsed());
-        let t = std::time::Instant::now();
-        let store = Arc::new(build_session_store());
-        crate::boot_trace_step("app_state.session_db", t.elapsed());
-        let t = std::time::Instant::now();
-        let scheduled = Arc::new(build_scheduled_store());
-        crate::boot_trace_step("app_state.scheduled_db", t.elapsed());
+        let ((memory_index, memory_watcher), flush_ledger, store, scheduled) = std::thread::scope(
+            |s| {
+                let mem_job = s.spawn(|| {
+                    let t = std::time::Instant::now();
+                    let out = open_memory_index(&memory, embedder, decay);
+                    crate::boot_trace_step("app_state.memory_fts5", t.elapsed());
+                    out
+                });
+                let flush_job = s.spawn(|| {
+                    let t = std::time::Instant::now();
+                    let out = FlushLedger::open(memory.root().join("flush.db"))
+                        .map(Arc::new)
+                        .map_err(|e| {
+                            tracing::warn!(error = %e, "flush ledger unavailable; memory flush disabled");
+                        })
+                        .ok();
+                    crate::boot_trace_step("app_state.flush_db", t.elapsed());
+                    out
+                });
+                let session_job = s.spawn(|| {
+                    let t = std::time::Instant::now();
+                    let out = Arc::new(build_session_store());
+                    crate::boot_trace_step("app_state.session_db", t.elapsed());
+                    out
+                });
+                let scheduled_job = s.spawn(|| {
+                    let t = std::time::Instant::now();
+                    let out = Arc::new(build_scheduled_store());
+                    crate::boot_trace_step("app_state.scheduled_db", t.elapsed());
+                    out
+                });
+                (
+                    mem_job.join().unwrap(),
+                    flush_job.join().unwrap(),
+                    session_job.join().unwrap(),
+                    scheduled_job.join().unwrap(),
+                )
+            },
+        );
+        crate::boot_trace_step("app_state.stores_parallel", t.elapsed());
         let state = Self {
             store,
             scheduled,
@@ -2273,11 +2308,15 @@ fn env_flag(name: &str) -> bool {
 
 /// `memory_*` tools degrade to no-ops rather than failing app start. The initial
 /// full reindex happens here (not in the watcher) so a build error is logged once.
-fn build_memory() -> (Arc<Memory>, Arc<dyn MemoryIndex>, Option<MemoryWatcher>) {
-    let config = memory_config_from_env();
-    let embedder = local_embedder_from_env(&config);
-    let decay = config.decay.clone();
-    let memory = Arc::new(Memory::with_default_root(config));
+/// Opens the memory recall index for an already-constructed [`Memory`]. Split out
+/// of the (now I/O-free) `Memory` construction so `with_registry` can open the
+/// four independent boot stores in parallel (#599 item 2). Carries the on-disk ->
+/// in-memory -> `NullIndex` fallback plus the initial reindex and watcher spawn.
+fn open_memory_index(
+    memory: &Arc<Memory>,
+    embedder: Option<(String, String, Option<String>)>,
+    decay: DecayConfig,
+) -> (Arc<dyn MemoryIndex>, Option<MemoryWatcher>) {
     let wrap = |i: Fts5Index| -> Arc<dyn MemoryIndex> {
         match &embedder {
             Some((base, model, key)) => Arc::new(HybridIndex::new(
@@ -2295,7 +2334,7 @@ fn build_memory() -> (Arc<Memory>, Arc<dyn MemoryIndex>, Option<MemoryWatcher>) 
                 Ok(i) => wrap(i.with_decay(decay.clone())),
                 Err(e) => {
                     tracing::warn!(error = %e, "memory index unavailable; recall disabled");
-                    return (memory, Arc::new(NullIndex), None);
+                    return (Arc::new(NullIndex), None);
                 }
             }
         }
@@ -2318,7 +2357,7 @@ fn build_memory() -> (Arc<Memory>, Arc<dyn MemoryIndex>, Option<MemoryWatcher>) 
     let watcher = MemoryWatcher::spawn(memory.clone(), index.clone())
         .map_err(|e| tracing::warn!(error = %e, "memory watcher unavailable"))
         .ok();
-    (memory, index, watcher)
+    (index, watcher)
 }
 
 /// A do-nothing recall index used only when SQLite is entirely unavailable, so the
