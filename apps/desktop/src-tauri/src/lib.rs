@@ -28,6 +28,8 @@ use ff_scheduled::ScheduledApprover;
 use ff_signals::SkillAggregate;
 use ff_tools::Safety;
 use state::AppState;
+use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -35,15 +37,23 @@ use tauri::{Emitter, Manager, State};
 use tauri_plugin_shell::ShellExt;
 use uuid::Uuid;
 
-// Boot-timing trace (#599 item 0). A single shared clock for the three cold-start
-// milestones — `AppState::new()`, the webview page-load, and FE first paint — so
-// the <200ms target is measured against real numbers instead of guesses. Every
-// `[boot-trace]` line reports milliseconds since `BOOT_T0` (set as the first line
-// of `run()`). Entirely gated behind the `FF_BOOT_TRACE` env var: unset, each
-// stamp is a cheap `OnceLock` load and returns before formatting or I/O, so a
-// normal launch pays nothing.
+// Boot-timing trace (#599 item 0). A single shared clock for the cold-start
+// milestones — webview page-load, FE first paint, `AppState::new()` (now run
+// post-paint on the background hydrate task — see `run`), and `app_ready` — so
+// the <200ms-to-paint target is measured against real numbers instead of
+// guesses. Every `[boot-trace]` line reports milliseconds since `BOOT_T0` (set
+// as the first line of `run()`). Entirely gated behind the `FF_BOOT_TRACE` env
+// var: unset, each stamp is a cheap `OnceLock` load and returns before
+// formatting or I/O, so a normal launch pays nothing.
 static BOOT_T0: OnceLock<std::time::Instant> = OnceLock::new();
 static BOOT_TRACE_ON: OnceLock<bool> = OnceLock::new();
+
+// Paint-first boot (#599): flipped by the background hydrate task in `run` once
+// `AppState::new()` has finished and the state has been managed. The FE gates
+// its backend-dependent work on the `app:ready` event plus this flag
+// (subscribe-then-check) so the invoke handlers — which read
+// `State<'_, Arc<AppState>>` — are never hit before the state exists.
+static APP_READY: AtomicBool = AtomicBool::new(false);
 
 fn boot_trace_enabled() -> bool {
     *BOOT_TRACE_ON.get_or_init(|| std::env::var_os("FF_BOOT_TRACE").is_some())
@@ -2315,6 +2325,57 @@ fn mark_fe_ready(phase: String, fe_nav_ms: f64) {
     );
 }
 
+/// Paint-first boot (#599): has the background hydrate task finished
+/// `AppState::new()` and published the managed state yet? Reads a static flag
+/// (no `AppState` dependency) so it is safe to call before the state is managed
+/// — the FE uses it as the "subscribe-then-check" half of the `app:ready` gate,
+/// closing the race where the event fired before its listener attached.
+#[tauri::command]
+fn is_app_ready() -> bool {
+    APP_READY.load(Ordering::SeqCst)
+}
+
+// Boot finalization seam (#599 review nit): the three side effects of "hydrate
+// done" — `manage(state)`, `APP_READY = true`, `emit("app:ready")` — must run in
+// exactly that order, or the FE's subscribe-then-check gate silently breaks:
+//   * `store` before `manage` → `is_app_ready()` is true while no state is
+//     managed, so a command the FE fires on the gate reads an unresolved
+//     `State<'_, Arc<AppState>>`.
+//   * `emit` before `store` → the FE's `isAppReady()` poll (run on receiving
+//     `app:ready`) returns false and the loading state hangs.
+// The order was correct as written but nothing guarded it — a future reorder of
+// those three lines would slip past review. `publish_app_ready` makes the order
+// a single reviewable unit, and `BootFinalize` lets a test substitute a spy
+// that asserts the order at call time (see `tests::boot_finalize_orders_*`).
+trait BootFinalize {
+    /// Publish the managed state to the command layer. Runs BEFORE the
+    /// `APP_READY` flag flips.
+    fn manage_state(&self, state: Arc<AppState>);
+    /// Notify the FE the loading gate may drop. Runs AFTER the `APP_READY`
+    /// flag flips AND after `manage_state`.
+    fn emit_ready(&self);
+}
+
+/// Run the boot-finalization sequence in the order the FE gate requires:
+/// `manage` → `APP_READY = true` → `emit("app:ready")`. The only call site is
+/// the hydrate task in `run()`; the order is the invariant guarded by
+/// `tests::boot_finalize_orders_manage_before_flag_before_emit`.
+fn publish_app_ready<F: BootFinalize>(finalizer: &F, state: Arc<AppState>) {
+    finalizer.manage_state(state);
+    APP_READY.store(true, Ordering::SeqCst);
+    boot_trace("app_ready", None);
+    finalizer.emit_ready();
+}
+
+impl<R: tauri::Runtime> BootFinalize for tauri::AppHandle<R> {
+    fn manage_state(&self, state: Arc<AppState>) {
+        self.manage(state);
+    }
+    fn emit_ready(&self) {
+        let _ = self.emit("app:ready", ());
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // Boot-trace origin (#599 item 0): the earliest FlowForge-controlled point.
@@ -2322,10 +2383,13 @@ pub fn run() {
     // unmeasurable from here (the platform floor the issue calls out); the FE's
     // `performance.now()` in `mark_fe_ready` gives the closest proxy for that.
     let _ = BOOT_T0.set(std::time::Instant::now());
-    let state = Arc::new(AppState::new());
-    // Cumulative since t0 ≈ the blocking `AppState::new()` cost; per-step
-    // durations are emitted from `state.rs` (registry/seed/skills/memory/DBs).
-    boot_trace("app_state_new", None);
+    // Paint-first boot (#599): `AppState::new()` and the supervisor / watcher /
+    // reaper / scheduler wiring are deferred to a background hydrate task (spawned
+    // from `setup` below) so the window is created and painted FIRST — the FE
+    // renders a loading state until the `app:ready` event (mirrors the
+    // `mcp:status-changed` / `workspace:branch-changed` hydrate pattern) and the
+    // `is_app_ready` flag. This is a reordering, not new logic: the same work runs,
+    // just off the synchronous pre-window path.
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
@@ -2333,90 +2397,151 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_shell::init())
         // Boot trace (#599 item 0): stamp when the webview begins loading our
-        // HTML (webview process up) and when the document finishes loading.
+        // HTML (webview process up) and when the document finishes loading. These
+        // now land BEFORE `app_state_new` — the win this reordering buys.
         .on_page_load(|_webview, payload| match payload.event() {
             tauri::webview::PageLoadEvent::Started => boot_trace("webview.page-load-started", None),
             tauri::webview::PageLoadEvent::Finished => {
                 boot_trace("webview.page-load-finished", None)
             }
         })
-        .manage(state.clone())
         .setup(move |app| {
-            // `init_mcp` enters the shared Tokio runtime itself, so it's safe to
-            // call here even though Tauri's `setup` runs on the main thread outside
-            // an entered reactor on macOS (issue #117).
-            state.init_mcp();
-            // Live-sync the active session's git branch (#561 BE half): the
-            // GitHeadWatcher observes the workspace's `.git/HEAD` and emits
-            // `workspace:branch-changed` on a real branch change, which the FE listener
-            // merged in PR #581 patches into the composer chip with no remount. Spawned
-            // via `tauri::async_runtime::spawn` (not bare `tokio::spawn`) because setup
-            // runs off-reactor on macOS (#117). A `None` rx means the watcher could not
-            // start -- live sync degrades to off rather than failing the app.
-            if let Some(mut rx) = state.init_git_watcher() {
-                let app_handle = app.handle().clone();
-                tauri::async_runtime::spawn(async move {
-                    while let Some(ws) = rx.recv().await {
-                        let _ = app_handle.emit("workspace:branch-changed", ws);
+            // Spawn the heavy init off the synchronous pre-window path. `setup`
+            // returns immediately, the window paints, and this task runs to
+            // completion before publishing the state and emitting `app:ready`.
+            //
+            // `AppState::new()` is sync blocking I/O (SQLite opens, skill scans,
+            // the FTS5 index build, fs seed); `spawn_blocking` runs it on the
+            // blocking pool so it never stalls an async worker, and — like the
+            // main-thread path it replaces — needs no entered reactor (the skill /
+            // memory / git watchers are `std::thread`, not `tokio::spawn`).
+            // `init_mcp` / `start_process_reaper` enter the runtime themselves
+            // (issue #117), so they are safe to call from this async task too.
+            let app_handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                let state = match tokio::task::spawn_blocking(AppState::new).await {
+                    Ok(s) => Arc::new(s),
+                    Err(e) => {
+                        let msg = format!("AppState::new() panicked: {e}");
+                        tracing::error!("{msg}");
+                        let _ = app_handle.emit("app:init-error", &msg);
+                        return;
                     }
-                });
-            }
-            // Drive the periodic idle-process reaper (`ProcessSupervisor::reap_idle`)
-            // from the same setup path: it enters the runtime itself, so it's safe
-            // here too. Finished processes and ones the agent abandoned (started but
-            // never polled again) are cleaned up on a timer.
-            state.start_process_reaper();
-            // Forward supervisor status changes to the FE as `mcp:status-changed`, so
-            // the servers panel reflects start/stop/restart/health without polling. The
-            // watch tick coalesces; we re-snapshot on each wake. Runs on Tauri's managed
-            // runtime, so it needs no entered reactor here.
-            if let Some(handle) = state.mcp_handle() {
-                let app_handle = app.handle().clone();
-                let mut rx = handle.status_changed_rx();
-                tauri::async_runtime::spawn(async move {
-                    while rx.changed().await.is_ok() {
-                        let servers = handle.status_snapshot();
-                        let _ = app_handle
-                            .emit("mcp:status-changed", McpStatusChangedEvent { servers });
+                };
+                // Cumulative since t0 ≈ the blocking `AppState::new()` cost (now
+                // post-paint); per-step durations are emitted from `state.rs`
+                // (registry/seed/skills/memory/DBs).
+                boot_trace("app_state_new", None);
+
+                // Guard the post-spawn_blocking body so no panic goes unlogged.
+                // This task's `JoinHandle` is dropped, so a panic in
+                // `init_mcp` / `init_git_watcher` / `start_process_reaper` / the
+                // scheduler wiring would be silently discarded by Tokio —
+                // leaving `APP_READY` false and the FE on a dead `<BootSplash>`
+                // spinner with no clue where it stopped (regression: previously
+                // this ran on the main thread, where a panic was a visible
+                // crash). Catch the unwind, log it, and emit `app:init-error`
+                // (the same wire the `AppState::new()` panic path above uses) so
+                // the FE can surface an actionable error. `error_handle` stays
+                // outside the closure so it survives the panic to emit.
+                let error_handle = app_handle.clone();
+                let post_init = move || {
+                    // `init_mcp` enters the shared Tokio runtime itself, so it's
+                    // safe to call here (issue #117).
+                    state.init_mcp();
+                    // Live-sync the active session's git branch (#561 BE half): the
+                    // GitHeadWatcher observes the workspace's `.git/HEAD` and emits
+                    // `workspace:branch-changed` on a real branch change, which the FE
+                    // listener merged in PR #581 patches into the composer chip with no
+                    // remount. A `None` rx means the watcher could not start -- live sync
+                    // degrades to off rather than failing the app.
+                    if let Some(mut rx) = state.init_git_watcher() {
+                        let app_handle = app_handle.clone();
+                        tauri::async_runtime::spawn(async move {
+                            while let Some(ws) = rx.recv().await {
+                                let _ = app_handle.emit("workspace:branch-changed", ws);
+                            }
+                        });
                     }
-                });
-            }
-            // Drive the scheduled-task firing engine (RFC 0017 section 4, #542):
-            // a background sweep fires due tasks through the desktop runner. The
-            // tick is coarse; the due predicate is minute-granular, so a 30s sweep
-            // never misses a slot and never double-fires (stamped last_run gates it).
-            // Spawned via `tauri::async_runtime::spawn` (not a bare `tokio::spawn`)
-            // because Tauri's macOS `setup` hook runs before the reactor is entered on
-            // the main thread -- a bare spawn there aborts the process with "must be
-            // called from the context of a Tokio runtime" (same no-reactor issue as
-            // `init_mcp`, #117). The sweep loop is inlined into the managed spawn rather
-            // than calling `ff_scheduled::spawn_scheduler` (which does its own internal
-            // `tokio::spawn`), so this single managed task owns it directly.
-            let scheduler_runner: Arc<dyn ff_scheduled::TaskRunner> = Arc::new(DesktopTaskRunner {
-                state: state.clone(),
-                app: app.handle().clone(),
+                    // Drive the periodic idle-process reaper
+                    // (`ProcessSupervisor::reap_idle`): finished processes and ones the
+                    // agent abandoned (started but never polled again) are cleaned up on
+                    // a timer. Enters the runtime itself, so it's safe here too.
+                    state.start_process_reaper();
+                    // Forward supervisor status changes to the FE as `mcp:status-changed`,
+                    // so the servers panel reflects start/stop/restart/health without
+                    // polling. The watch tick coalesces; we re-snapshot on each wake.
+                    if let Some(handle) = state.mcp_handle() {
+                        let app_handle = app_handle.clone();
+                        let mut rx = handle.status_changed_rx();
+                        tauri::async_runtime::spawn(async move {
+                            while rx.changed().await.is_ok() {
+                                let servers = handle.status_snapshot();
+                                let _ = app_handle
+                                    .emit("mcp:status-changed", McpStatusChangedEvent { servers });
+                            }
+                        });
+                    }
+                    // Drive the scheduled-task firing engine (RFC 0017 section 4, #542):
+                    // a background sweep fires due tasks through the desktop runner. The
+                    // tick is coarse; the due predicate is minute-granular, so a 30s sweep
+                    // never misses a slot and never double-fires (stamped last_run gates
+                    // it). The sweep loop is inlined here rather than calling
+                    // `ff_scheduled::spawn_scheduler` (which does its own internal
+                    // `tokio::spawn`), so this single task owns it directly.
+                    let scheduler_runner: Arc<dyn ff_scheduled::TaskRunner> =
+                        Arc::new(DesktopTaskRunner {
+                            state: state.clone(),
+                            app: app_handle.clone(),
+                        });
+                    {
+                        let sched_store = state.scheduled.clone();
+                        let sched_app = app_handle.clone();
+                        tauri::async_runtime::spawn(async move {
+                            let mut interval = tokio::time::interval(Duration::from_secs(30));
+                            loop {
+                                interval.tick().await;
+                                let fired = ff_scheduled::run_due_once(
+                                    sched_store.as_ref(),
+                                    scheduler_runner.as_ref(),
+                                )
+                                .await;
+                                // Emit one `scheduled:fired` per appended run, plus a
+                                // single `scheduled:changed` snapshot when anything fired,
+                                // so the UI live-updates without polling (#544).
+                                for run in &fired {
+                                    emit_scheduled_fired(&sched_app, sched_store.as_ref(), run);
+                                }
+                            }
+                        });
+                    }
+
+                    // State is now usable: publish it to the command layer and notify
+                    // the FE to drop its loading gate. Commands read
+                    // `State<'_, Arc<AppState>>`, which only resolves once `manage` runs
+                    // — the FE never invokes them before `app:ready` (gated by
+                    // `is_app_ready`), so the pre-ready window sees no unmanaged-state
+                    // error. `publish_app_ready` runs the three steps in the order the
+                    // gate requires (see its invariant); doing it inline would let a
+                    // future reorder break the gate silently.
+                    publish_app_ready(&app_handle, state);
+                };
+                if let Err(payload) = catch_unwind(AssertUnwindSafe(post_init)) {
+                    // A panic payload is `Box<dyn Any + Send>`; unwrap the two
+                    // common stringy forms and otherwise fall back to a generic
+                    // note, so the FE never gets an opaque "unknown" with no
+                    // clue where to look.
+                    let msg = if let Some(s) = payload.downcast_ref::<&'static str>() {
+                        format!("post-init panicked: {s}")
+                    } else if let Some(s) = payload.downcast_ref::<String>() {
+                        format!("post-init panicked: {s}")
+                    } else {
+                        "post-init panicked (non-string panic payload)".to_string()
+                    };
+                    tracing::error!("{msg}");
+                    let _ = error_handle.emit("app:init-error", &msg);
+                }
             });
-            {
-                let sched_store = state.scheduled.clone();
-                let sched_app = app.handle().clone();
-                tauri::async_runtime::spawn(async move {
-                    let mut interval = tokio::time::interval(Duration::from_secs(30));
-                    loop {
-                        interval.tick().await;
-                        let fired = ff_scheduled::run_due_once(
-                            sched_store.as_ref(),
-                            scheduler_runner.as_ref(),
-                        )
-                        .await;
-                        // Emit one `scheduled:fired` per appended run, plus a single
-                        // `scheduled:changed` snapshot when anything fired, so the UI
-                        // live-updates without polling (#544).
-                        for run in &fired {
-                            emit_scheduled_fired(&sched_app, sched_store.as_ref(), run);
-                        }
-                    }
-                });
-            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -2499,6 +2624,7 @@ pub fn run() {
             check_for_updates,
             install_update,
             mark_fe_ready,
+            is_app_ready,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");
@@ -2518,12 +2644,109 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
+    use super::state::AppState;
     use super::{
-        git_branch, list_local_branches, mode_auto_approves, resolve_workspace_dir, should_warmup,
-        switch_branch, TurnMetrics, UpdateStatus,
+        git_branch, is_app_ready, list_local_branches, mode_auto_approves, publish_app_ready,
+        resolve_workspace_dir, should_warmup, switch_branch, BootFinalize, TurnMetrics,
+        UpdateStatus, APP_READY,
     };
     use ff_core::{Mode, ProviderKind};
     use ff_tools::Safety;
+    use std::sync::atomic::Ordering;
+    use std::sync::{Arc, Mutex};
+
+    // `APP_READY` is a process-global static, and the boot-state tests below are
+    // the only tests in the crate that touch it. Guard them with a mutex so the
+    // two never race each other (parallel `cargo test` threads share the flag).
+    static BOOT_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    // Spy that asserts the `manage` → `store` → `emit` ordering at call time: a
+    // reordered `publish_app_ready` (e.g. `store` hoisted above `manage`, or
+    // `emit` moved above `store`) trips the assert inside the offending method
+    // and fails the test, instead of silently breaking the FE gate.
+    #[derive(Default)]
+    struct BootFinalizeSpy {
+        managed: std::sync::atomic::AtomicBool,
+        emitted: std::sync::atomic::AtomicBool,
+    }
+
+    impl BootFinalize for BootFinalizeSpy {
+        fn manage_state(&self, _state: Arc<AppState>) {
+            // `manage` runs BEFORE the flag flips — if it's already true here,
+            // someone hoisted `APP_READY.store` above `manage` and the FE would
+            // see `is_app_ready()==true` with no managed state.
+            assert!(
+                !APP_READY.load(Ordering::SeqCst),
+                "invariant violation: manage_state ran after APP_READY was already true \
+                 (store was reordered before manage)"
+            );
+            self.managed.store(true, Ordering::SeqCst);
+        }
+        fn emit_ready(&self) {
+            // `emit` runs AFTER the flag flips AND after `manage` — if the flag
+            // is false here, `emit` was moved before `store` (the FE's
+            // post-event `isAppReady()` poll would then read false and hang); if
+            // `manage` didn't run yet, `emit` was moved before `manage`.
+            assert!(
+                APP_READY.load(Ordering::SeqCst),
+                "invariant violation: emit_ready ran before APP_READY was set \
+                 (emit was reordered before store)"
+            );
+            assert!(
+                self.managed.load(Ordering::SeqCst),
+                "invariant violation: emit_ready ran before manage_state \
+                 (emit was reordered before manage)"
+            );
+            self.emitted.store(true, Ordering::SeqCst);
+        }
+    }
+
+    // #599 boot state machine: `is_app_ready()` reads a static flag flipped once
+    // at the end of the hydrate task. Pin the false-then-true transition so a
+    // future change that, say, reads the wrong flag or inverts the polarity is
+    // caught here rather than in a manual cold-start check.
+    #[test]
+    fn is_app_ready_flips_false_to_true() {
+        let _guard = BOOT_TEST_LOCK.lock().unwrap();
+        APP_READY.store(false, Ordering::SeqCst);
+        assert!(!is_app_ready(), "flag must read false before finalization");
+        APP_READY.store(true, Ordering::SeqCst);
+        assert!(
+            is_app_ready(),
+            "flag must read true after APP_READY.store(true)"
+        );
+        APP_READY.store(false, Ordering::SeqCst);
+    }
+
+    // #599 boot state machine: the manage→store→emit ordering is the invariant
+    // `publish_app_ready` exists to encode. A spy that self-asserts at each call
+    // catches every reorder that breaks the subscribe-then-check gate
+    // (store-before-manage, emit-before-store, emit-before-manage), and the
+    // post-call asserts catch a call being dropped entirely. A future reorder of
+    // those three lines now fails this test instead of slipping past review.
+    #[test]
+    fn publish_app_ready_orders_manage_before_flag_before_emit() {
+        let _guard = BOOT_TEST_LOCK.lock().unwrap();
+        APP_READY.store(false, Ordering::SeqCst);
+
+        let spy = BootFinalizeSpy::default();
+        publish_app_ready(&spy, Arc::new(AppState::new()));
+
+        assert!(
+            is_app_ready(),
+            "APP_READY must be true after publish_app_ready"
+        );
+        assert!(
+            spy.managed.load(Ordering::SeqCst),
+            "manage_state was never called"
+        );
+        assert!(
+            spy.emitted.load(Ordering::SeqCst),
+            "emit_ready was never called"
+        );
+
+        APP_READY.store(false, Ordering::SeqCst);
+    }
 
     #[test]
     fn should_warmup_only_for_local_kinds_with_warmup_enabled() {

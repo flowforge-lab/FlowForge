@@ -58,6 +58,15 @@ export type Unlisten = () => void;
 
 export interface FfIpc {
   // Commands (frontend -> backend)
+  // Paint-first boot (#599): the backend defers `AppState::new()` off the
+  // synchronous pre-window path onto a background hydrate task, so the window
+  // paints a loading state before the state is managed. The FE gates its
+  // backend-dependent work on `app:ready` + this flag (subscribe-then-check)
+  // — invoke handlers read `State<'_, Arc<AppState>>`, which only resolves once
+  // the task publishes the state, so no command below may run before it's true.
+  /** True once the background hydrate task has finished `AppState::new()` and
+   *  published the managed state. Safe to call pre-ready (reads a static flag). */
+  isAppReady(): Promise<boolean>;
   createSession(goal?: string): Promise<Session>;
   // CONTRACT CHANGE (#149, fork into split pane): NEW command needing a real Rust
   // implementation (mocked here for now) — please review @backend-owner. Clones a
@@ -462,6 +471,21 @@ export interface FfIpc {
   onWorkspaceBranchChanged(
     cb: (e: SessionWorkspace) => void,
   ): Promise<Unlisten>;
+  // Paint-first boot (#599): the backend emits this once `AppState::new()` has
+  // finished and the state is managed. Pair with `isAppReady` (subscribe-then-
+  // check) to close the race where the event fired before the listener attached.
+  /** The backend finished its deferred heavy init and is ready for command work. */
+  onAppReady(cb: () => void): Promise<Unlisten>;
+  // Error-surface counterpart to `onAppReady` (#599 boot regression): emitted on
+  // ANY early-exit path in the background hydrate task (an `AppState::new()`
+  // panic, or a panic in the post-init wiring — `init_mcp` / git watcher /
+  // reaper / scheduler setup) so the FE can surface an actionable error instead
+  // of hanging on `<BootSplash>` forever. Payload is the human-readable reason.
+  // Pair with a timeout in the FE (App.tsx) for the case where the task dies
+  // without emitting.
+  /** The background hydrate task failed; `reason` explains why. Never fires
+   *  alongside `onAppReady`. */
+  onAppInitError(cb: (reason: string) => void): Promise<Unlisten>;
 }
 
 // Explicit mock flag OR auto-fallback when not inside a Tauri window.
@@ -504,6 +528,7 @@ class TauriIpc implements FfIpc {
 
   createSession = (goal?: string) =>
     this.invoke<Session>("create_session", { goal });
+  isAppReady = (): Promise<boolean> => this.invoke<boolean>("is_app_ready");
   forkSession = (sessionId: string) =>
     this.invoke<Session>("fork_session", { sessionId });
   listMemoryFiles = () => this.invoke<MemoryFileInfo[]>("list_memory_files");
@@ -719,6 +744,9 @@ class TauriIpc implements FfIpc {
     this.listen<void>("update:download-finished", () => cb());
   onWorkspaceBranchChanged = (cb: (e: SessionWorkspace) => void) =>
     this.listen<SessionWorkspace>("workspace:branch-changed", cb);
+  onAppReady = (cb: () => void) => this.listen<void>("app:ready", () => cb());
+  onAppInitError = (cb: (reason: string) => void) =>
+    this.listen<string>("app:init-error", (reason) => cb(reason));
 }
 
 // `MockIpc` is pulled in with a dynamic import so the bundler gives it its own
