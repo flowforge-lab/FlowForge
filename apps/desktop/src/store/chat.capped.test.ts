@@ -20,13 +20,13 @@ const done = (messageId: string) => ({
   tokenCount: null,
 });
 
-describe("chat store — capped-turn detection (#513)", () => {
+describe("chat store — resumable-turn detection (#513/#636)", () => {
   beforeEach(() => {
     useChatStore.setState({
       messagesBySession: {},
       streamingBySession: {},
       turnStartBySession: {},
-      cappedBySession: {},
+      resumableBySession: {},
     });
   });
 
@@ -43,7 +43,7 @@ describe("chat store — capped-turn detection (#513)", () => {
     useChatStore.getState().finishTurn(done("m1"));
     // finishTurn schedules an async loadSession; let it settle.
     await vi.waitFor(() =>
-      expect(useChatStore.getState().cappedBySession[SID]).toBe(true),
+      expect(useChatStore.getState().resumableBySession[SID]).toBe(true),
     );
   });
 
@@ -54,18 +54,45 @@ describe("chat store — capped-turn detection (#513)", () => {
     });
     useChatStore.getState().finishTurn(done("m1"));
     await Promise.resolve();
-    expect(useChatStore.getState().cappedBySession[SID]).toBeUndefined();
+    expect(useChatStore.getState().resumableBySession[SID]).toBeUndefined();
     // No empty turn → no refetch.
     expect(getMessages).not.toHaveBeenCalled();
   });
 
-  it("does NOT flag a bare [stopped] (deliberate user cancel)", async () => {
+  it("flags a bare [stopped] (user cancel) as resumable (#636)", async () => {
     vi.spyOn(ipc, "getMessages").mockResolvedValue([
       assistant("m1", "[stopped]"),
     ]);
     useChatStore.getState().finishTurn(done("m1"));
-    await vi.waitFor(() => expect(ipc.getMessages).toHaveBeenCalled());
-    expect(useChatStore.getState().cappedBySession[SID]).toBeUndefined();
+    await vi.waitFor(() =>
+      expect(useChatStore.getState().resumableBySession[SID]).toBe(true),
+    );
+  });
+
+  it("cancel → [stopped] re-flags resumable after the refetch (#636)", async () => {
+    // Reproduces the Stop-button ordering: cancelTurn clears the flag, the backend
+    // writes a bare [stopped], then turn:done → finishTurn refetch re-sets it so the
+    // Continue button reliably appears. Seed a pre-cancel flag to prove it survives.
+    useChatStore.setState({
+      resumableBySession: { [SID]: true },
+      streamingBySession: { [SID]: "m1" },
+    });
+    vi.spyOn(ipc, "cancelTurn").mockResolvedValue(undefined);
+    vi.spyOn(ipc, "getMessages").mockResolvedValue([
+      assistant("m1", "[stopped]"),
+    ]);
+
+    await useChatStore.getState().cancelTurn(SID);
+    // cancelTurn clears the flag and the streaming pointer immediately.
+    expect(useChatStore.getState().resumableBySession[SID]).toBeUndefined();
+    expect(useChatStore.getState().streamingBySession[SID]).toBeUndefined();
+
+    // The message row is empty until the refetch pulls the [stopped] notice.
+    useChatStore.setState({ messagesBySession: { [SID]: [] } });
+    useChatStore.getState().finishTurn(done("m1"));
+    await vi.waitFor(() =>
+      expect(useChatStore.getState().resumableBySession[SID]).toBe(true),
+    );
   });
 
   it("does NOT resurrect the flag if a new turn supersedes during the refetch (review nit)", async () => {
@@ -77,7 +104,7 @@ describe("chat store — capped-turn detection (#513)", () => {
     // turn is now in flight. The in-flight .then must not re-set the flag.
     useChatStore.setState({ turnStartBySession: { [SID]: Date.now() } });
     await new Promise((r) => setTimeout(r, 0)); // drain the refetch microtasks
-    expect(useChatStore.getState().cappedBySession[SID]).toBeUndefined();
+    expect(useChatStore.getState().resumableBySession[SID]).toBeUndefined();
   });
 
   it("does NOT flag when a newer assistant message replaced the done one (review nit)", async () => {
@@ -90,13 +117,13 @@ describe("chat store — capped-turn detection (#513)", () => {
     useChatStore.getState().finishTurn(done("m1"));
     await vi.waitFor(() => expect(ipc.getMessages).toHaveBeenCalled());
     await new Promise((r) => setTimeout(r, 0));
-    expect(useChatStore.getState().cappedBySession[SID]).toBeUndefined();
+    expect(useChatStore.getState().resumableBySession[SID]).toBeUndefined();
   });
 
   it("send into the session clears a prior capped flag", async () => {
     vi.spyOn(ipc, "sendMessage").mockResolvedValue("u1");
-    useChatStore.setState({ cappedBySession: { [SID]: true } });
+    useChatStore.setState({ resumableBySession: { [SID]: true } });
     await useChatStore.getState().send("continue", SID);
-    expect(useChatStore.getState().cappedBySession[SID]).toBeUndefined();
+    expect(useChatStore.getState().resumableBySession[SID]).toBeUndefined();
   });
 });
