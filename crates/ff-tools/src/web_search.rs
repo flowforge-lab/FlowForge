@@ -2,14 +2,15 @@
 //!
 //! Network egress, so it is `Safety::Write` (approval-gated by the agent loop). The
 //! tool reads the user's persisted [`SearchConfig`](ff_core::SearchConfig) at call
-//! time: the keyless, self-hosted SearXNG JSON API is wired. The hosted
-//! `Brave` / `OpenAiCompatible` backends are recognized but refused with a clear
-//! message until API-key storage lands (Issue #8).
+//! time. The default is keyless [`Tavily`](ff_core::SearchBackend::Tavily), which
+//! works with zero setup; the keyless, self-hosted SearXNG JSON API is also wired.
+//! The hosted `Brave` / `OpenAiCompatible` backends are recognized but refused with
+//! a clear message until API-key storage lands (Issue #8).
 //!
-//! The configured endpoint is itself an SSRF vector (a misconfigured `base_url`
-//! could point at internal infra), so every request is validated by
-//! [`SsrfPolicy`](crate::SsrfPolicy) — both the literal URL and, for named
-//! hosts, the resolved IP — before connecting.
+//! A configured SearXNG `base_url` is itself an SSRF vector (it could point at
+//! internal infra), so every request — including Tavily's fixed endpoint — is
+//! validated by [`SsrfPolicy`](crate::SsrfPolicy): both the literal URL and, for
+//! named hosts, the resolved IP, before connecting.
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -26,6 +27,8 @@ use url::Url;
 /// Per-request timeout.
 const TIMEOUT_SECS: u64 = 15;
 const UA: &str = "FlowForge/0.1 (+web_search)";
+/// Tavily's search endpoint. A fixed, vetted HTTPS host (not user-supplied).
+const TAVILY_ENDPOINT: &str = "https://api.tavily.com/search";
 /// Default number of results when the caller omits `limit`.
 const DEFAULT_LIMIT: usize = 5;
 /// Hard cap on results regardless of the requested `limit`.
@@ -105,12 +108,78 @@ impl SearchProvider for SearxngProvider {
             .text()
             .await
             .map_err(|e| format!("failed to read search response: {e}"))?;
-        parse_searxng(&body, limit)
+        parse_results(&body, limit)
     }
 }
 
-/// Parse a SearXNG `format=json` body into capped [`SearchResult`]s.
-fn parse_searxng(body: &str, limit: usize) -> Result<Vec<SearchResult>, String> {
+/// Keyless Tavily backend, queried via its JSON API (`POST /search`). The endpoint
+/// is fixed and vetted, but is still SSRF-checked for defense in depth and to keep
+/// the request path uniform with SearXNG.
+struct TavilyProvider {
+    endpoint: String,
+    policy: SsrfPolicy,
+}
+
+impl TavilyProvider {
+    fn new() -> Self {
+        Self {
+            endpoint: TAVILY_ENDPOINT.to_string(),
+            policy: SsrfPolicy::strict(),
+        }
+    }
+}
+
+#[async_trait]
+impl SearchProvider for TavilyProvider {
+    async fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchResult>, String> {
+        // SSRF guard: validate the literal URL and the resolved host before connect.
+        let checked = self.policy.check_url(&self.endpoint)?;
+        self.policy.check_host(&checked).await?;
+
+        let client = reqwest::Client::builder()
+            .redirect(Policy::none())
+            .timeout(Duration::from_secs(TIMEOUT_SECS))
+            .build()
+            .map_err(|e| format!("failed to build HTTP client: {e}"))?;
+
+        let resp = client
+            .post(checked)
+            .header(USER_AGENT, UA)
+            // Keyless access mode is mandatory when no API key is sent; without it
+            // Tavily returns 401. An optional key (later phase) replaces this header
+            // with `Authorization: Bearer <key>` to raise the rate limit.
+            .header("X-Tavily-Access-Mode", "keyless")
+            .json(&serde_json::json!({ "query": query, "max_results": limit }))
+            .send()
+            .await
+            .map_err(|e| format!("search request failed: {e}"))?;
+
+        let status = resp.status();
+        // Fail loud on the keyless rate cap so the remedy is obvious rather than the
+        // tool silently returning nothing.
+        if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            return Err(
+                "Tavily keyless hourly rate limit reached. Wait a few minutes \
+                 and retry, or add a free Tavily API key in Settings → Search to \
+                 raise the limit."
+                    .to_string(),
+            );
+        }
+        if !status.is_success() {
+            return Err(format!("search endpoint returned HTTP {status}"));
+        }
+
+        let body = resp
+            .text()
+            .await
+            .map_err(|e| format!("failed to read search response: {e}"))?;
+        parse_results(&body, limit)
+    }
+}
+
+/// Parse a `results[]` JSON body (SearXNG `format=json` or Tavily — same field
+/// names: `title`, `url`, `content`) into capped [`SearchResult`]s.
+fn parse_results(body: &str, limit: usize) -> Result<Vec<SearchResult>, String> {
     let json: Value =
         serde_json::from_str(body).map_err(|e| format!("invalid search JSON: {e}"))?;
     let results = json
@@ -184,11 +253,12 @@ impl WebSearchTool {
         if config.backend.requires_key() && !config.has_key {
             return Err(format!(
                 "the {:?} search backend needs an API key, which isn't supported yet \
-                 (tracked with the keychain work, #8); switch to SearXNG in Settings",
+                 (tracked with the keychain work, #8); switch to Tavily or SearXNG in Settings",
                 config.backend
             ));
         }
         match config.backend {
+            SearchBackend::Tavily => Ok(Box::new(TavilyProvider::new())),
             SearchBackend::SearxNg => {
                 let base = config.resolved_base_url().ok_or_else(|| {
                     "no SearXNG endpoint configured — set one in Settings → Search".to_string()
@@ -212,7 +282,8 @@ impl Tool for WebSearchTool {
 
     fn description(&self) -> &str {
         "Search the web and return ranked results (title, URL, snippet). Uses the \
-         configured search backend (SearXNG). Requires approval (network access)."
+         configured search backend (Tavily by default). Requires approval (network \
+         access)."
     }
 
     fn parameters(&self) -> Value {
@@ -318,7 +389,11 @@ mod tests {
 
     #[tokio::test]
     async fn searxng_without_endpoint_errors() {
-        let tool = WebSearchTool::new(shared(SearchConfig::default()));
+        let tool = WebSearchTool::new(shared(SearchConfig {
+            backend: SearchBackend::SearxNg,
+            base_url: None,
+            has_key: false,
+        }));
         let out = tool
             .run(serde_json::json!({ "query": "rust" }), Path::new("."))
             .await;
@@ -355,7 +430,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_searxng_extracts_and_caps() {
+    fn parse_results_extracts_and_caps() {
         let body = serde_json::json!({
             "results": [
                 { "title": "A", "url": "https://a.test", "content": "first" },
@@ -364,15 +439,15 @@ mod tests {
             ]
         })
         .to_string();
-        let results = parse_searxng(&body, 2).unwrap();
+        let results = parse_results(&body, 2).unwrap();
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].title, "A");
         assert_eq!(results[0].url, "https://a.test");
     }
 
     #[test]
-    fn parse_searxng_rejects_missing_results() {
-        let err = parse_searxng("{}", 5).unwrap_err();
+    fn parse_results_rejects_missing_results() {
+        let err = parse_results("{}", 5).unwrap_err();
         assert!(err.contains("results"), "{err}");
     }
 
@@ -410,5 +485,72 @@ mod tests {
         let provider = SearxngProvider::new("http://169.254.169.254".into());
         let err = provider.search("rust", 5).await.unwrap_err();
         assert!(err.contains("SSRF guard"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn tavily_provider_posts_and_parses() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/search"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "results": [
+                    { "title": "Hit", "url": "https://example.test", "content": "snippet" }
+                ]
+            })))
+            .mount(&server)
+            .await;
+
+        // Loopback-relaxed policy so the wiremock server is reachable; private /
+        // metadata ranges stay blocked.
+        let provider = TavilyProvider {
+            endpoint: format!("{}/search", server.uri()),
+            policy: SsrfPolicy {
+                allow_loopback: true,
+            },
+        };
+        let results = provider.search("rust", 5).await.unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].title, "Hit");
+        assert_eq!(results[0].url, "https://example.test");
+        assert_eq!(results[0].snippet, "snippet");
+    }
+
+    #[tokio::test]
+    async fn tavily_provider_surfaces_rate_limit() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/search"))
+            .respond_with(ResponseTemplate::new(429).set_body_json(serde_json::json!({
+                "error": { "code": "hourly_cap_reached" }
+            })))
+            .mount(&server)
+            .await;
+
+        let provider = TavilyProvider {
+            endpoint: format!("{}/search", server.uri()),
+            policy: SsrfPolicy {
+                allow_loopback: true,
+            },
+        };
+        let err = provider.search("rust", 5).await.unwrap_err();
+        assert!(err.contains("rate limit"), "{err}");
+        assert!(err.contains("Settings"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn tavily_provider_refuses_internal_endpoint() {
+        let provider = TavilyProvider {
+            endpoint: "http://169.254.169.254/search".into(),
+            policy: SsrfPolicy::strict(),
+        };
+        let err = provider.search("rust", 5).await.unwrap_err();
+        assert!(err.contains("SSRF guard"), "{err}");
+    }
+
+    #[test]
+    fn default_backend_resolves_to_a_provider() {
+        // Default (Tavily keyless) must yield a working provider with no config.
+        let tool = WebSearchTool::new(shared(SearchConfig::default()));
+        assert!(tool.provider().is_ok());
     }
 }

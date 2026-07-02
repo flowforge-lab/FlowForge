@@ -3,16 +3,17 @@ import type { SearchBackend } from "./SearchBackend";
 
 /**
  * Non-secret, persisted web-search settings. Serialized as JSON to the app config
- * dir and round-tripped across IPC to drive the (future) settings panel.
+ * dir and round-tripped across IPC to drive the settings panel.
  */
 export type SearchConfig = { backend: SearchBackend, 
 /**
  * Endpoint base URL. Required for SearXNG (e.g. `https://searx.example.org`);
- * the path `/search?format=json` is appended by the tool.
+ * the path `/search?format=json` is appended by the tool. Unused for Tavily.
  */
 baseUrl?: string, 
 /**
- * Whether an API key is stored for this backend (OS keychain). Always `false`
- * for now — the field keeps the contract stable for when secrets land.
+ * Whether an API key is stored for this backend (OS keychain). For Tavily this
+ * means an optional key that raises the rate limit; for keyed backends it gates
+ * availability. Always `false` until the keychain work lands.
  */
 hasKey: boolean, };
