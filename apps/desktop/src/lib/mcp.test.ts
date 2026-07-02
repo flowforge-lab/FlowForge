@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { mcpStateMeta, parseMcpToolName } from "./mcp";
+import { mcpInstanceKey, mcpStateMeta, parseMcpToolName } from "./mcp";
 import type { McpServerState } from "@/bindings/McpServerState";
 
 describe("parseMcpToolName", () => {
@@ -25,6 +25,22 @@ describe("parseMcpToolName", () => {
   it("returns null for malformed namespacing", () => {
     expect(parseMcpToolName("mcp__github")).toBeNull(); // no tool segment
     expect(parseMcpToolName("mcp____tool")).toBeNull(); // empty server
+  });
+});
+
+describe("mcpInstanceKey", () => {
+  it("returns the bare id for a global instance (no scopeKey)", () => {
+    expect(mcpInstanceKey({ id: "codegraph" })).toBe("codegraph");
+    expect(mcpInstanceKey({ id: "codegraph", scopeKey: undefined })).toBe(
+      "codegraph",
+    );
+  });
+
+  it("keeps two same-id instances distinct by scope", () => {
+    const a = mcpInstanceKey({ id: "codegraph", scopeKey: "flowforge" });
+    const b = mcpInstanceKey({ id: "codegraph", scopeKey: "other-repo" });
+    expect(a).not.toBe(b);
+    expect(a).not.toBe(mcpInstanceKey({ id: "codegraph" }));
   });
 });
 

@@ -3,8 +3,23 @@
 // (mirrors lib/palette.ts / lib/steps.ts).
 
 import type { McpServerState } from "@/bindings/McpServerState";
+import type { McpServerStatus } from "@/bindings/McpServerStatus";
 
 const MCP_PREFIX = "mcp__";
+
+/**
+ * Unique per-instance key for a resolved MCP server. With workspace-scoped
+ * provenance (RFC 0018 §4) the same `id` can resolve once per workspace root, so
+ * `id` alone is no longer unique — combine it with `scopeKey` (absent = global) for
+ * React list keys and any per-instance lookup. Joined with a NUL (`\u0000`) separator
+ * (mirroring `approvalKey` in lib/mock.ts) so a path-like scope label can't collide
+ * with an `id` that itself contains the delimiter.
+ */
+export function mcpInstanceKey(
+  s: Pick<McpServerStatus, "id" | "scopeKey">,
+): string {
+  return s.scopeKey ? `${s.id}\u0000${s.scopeKey}` : s.id;
+}
 
 export interface ParsedMcpTool {
   /** The advertising server's id. */

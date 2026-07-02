@@ -34,6 +34,20 @@ describe("ServerRow", () => {
     expect(html).toContain("Disable");
   });
 
+  it("renders the workspace scope label to disambiguate same-id instances", () => {
+    // Two live instances of one server id, one per workspace root (RFC 0018).
+    const a: McpServerStatus = { ...running, scopeKey: "flowforge" };
+    const b: McpServerStatus = { ...running, scopeKey: "other-repo" };
+    const aHtml = renderToStaticMarkup(<ServerRow server={a} />);
+    const bHtml = renderToStaticMarkup(<ServerRow server={b} />);
+    expect(aHtml).toContain("flowforge");
+    expect(bHtml).toContain("other-repo");
+    // A global instance (no scopeKey) shows no scope label.
+    expect(renderToStaticMarkup(<ServerRow server={running} />)).not.toContain(
+      "flowforge",
+    );
+  });
+
   it("shows the last error and Enable action for a failed/disabled server", () => {
     const failedHtml = renderToStaticMarkup(<ServerRow server={failed} />);
     expect(failedHtml).toContain("Failed");

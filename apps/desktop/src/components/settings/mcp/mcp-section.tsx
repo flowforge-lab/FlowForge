@@ -2,6 +2,7 @@ import { useEffect } from "react";
 import { ServerRow } from "@/components/settings/mcp/server-row";
 import { AddServerForm } from "@/components/settings/mcp/add-server-form";
 import { useMcpStore } from "@/store/mcp";
+import { mcpInstanceKey } from "@/lib/mcp";
 
 /**
  * MCP servers section (#91, RFC 0003 §7). Lists configured servers with live
@@ -41,7 +42,7 @@ export function McpSection() {
       ) : (
         <div className="space-y-2">
           {servers.map((server) => (
-            <ServerRow key={server.id} server={server} />
+            <ServerRow key={mcpInstanceKey(server)} server={server} />
           ))}
         </div>
       )}

@@ -18,6 +18,14 @@ export function ServerRow({ server }: { server: McpServerStatus }) {
       <div className="flex items-center gap-2">
         <span className="min-w-0 flex-1 truncate text-[13px] font-medium text-foreground">
           {server.id}
+          {server.scopeKey ? (
+            <span
+              className="ml-1.5 font-normal text-[11px] text-muted-foreground"
+              title={`Workspace scope: ${server.scopeKey}`}
+            >
+              {server.scopeKey}
+            </span>
+          ) : null}
         </span>
         <StateBadge state={server.state} />
       </div>
