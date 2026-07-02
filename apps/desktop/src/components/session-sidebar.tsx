@@ -16,6 +16,7 @@ import {
   Settings,
   SplitSquareHorizontal,
   SplitSquareVertical,
+  SquareCheck,
   Sun,
   Trash2,
   X,
@@ -195,6 +196,9 @@ export function SessionItem({
   streaming,
   pinned,
   dismissed,
+  selectMode = false,
+  selected = false,
+  onToggleSelect,
 }: {
   session: Session;
   index: number;
@@ -202,6 +206,11 @@ export function SessionItem({
   streaming: boolean;
   pinned: boolean;
   dismissed: boolean;
+  /** Multi-select mode (#643): show a checkbox and toggle selection on row click
+   *  instead of opening the session. */
+  selectMode?: boolean;
+  selected?: boolean;
+  onToggleSelect?: () => void;
 }) {
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState("");
@@ -304,11 +313,16 @@ export function SessionItem({
         <div
           role="button"
           tabIndex={0}
-          onClick={() => !editing && open()}
+          onClick={() => {
+            if (editing) return;
+            if (selectMode) onToggleSelect?.();
+            else open();
+          }}
           onKeyDown={(e) => {
             if (!editing && (e.key === "Enter" || e.key === " ")) {
               e.preventDefault();
-              open();
+              if (selectMode) onToggleSelect?.();
+              else open();
             }
           }}
           className={cn(
@@ -319,6 +333,18 @@ export function SessionItem({
             dismissed && "opacity-60",
           )}
         >
+          {selectMode && !editing && (
+            <input
+              type="checkbox"
+              checked={selected}
+              onChange={() => onToggleSelect?.()}
+              // Stop the click from also reaching the row handler (which would
+              // toggle a second time and cancel this one out).
+              onClick={(e) => e.stopPropagation()}
+              aria-label={`Select ${currentLabel}`}
+              className="size-3.5 shrink-0 accent-primary"
+            />
+          )}
           {editing ? (
             /* ── Rename input ── */
             <input
@@ -357,7 +383,7 @@ export function SessionItem({
                 )}
                 {streaming ? (
                   <span className="size-1.5 animate-pulse rounded-full bg-primary" />
-                ) : (
+                ) : selectMode ? null : (
                   <>
                     {/* Pencil + ⋯ shown on hover; kbd hint shown when idle. */}
                     <button
@@ -526,12 +552,33 @@ export function SessionSidebar() {
 
   const pinnedIds = useSessionPrefsStore((s) => s.pinned);
   const dismissedIds = useSessionPrefsStore((s) => s.dismissed);
+  const dismiss = useSessionPrefsStore((s) => s.dismiss);
+  const restore = useSessionPrefsStore((s) => s.restore);
+  const deleteSession = useChatStore((s) => s.deleteSession);
 
   const [filter, setFilter] = useState("");
   const [listTab, setListTab] = useState<SessionListTab>("all");
   const [showFilter, setShowFilter] = useState(false);
   const [overflowExpanded, setOverflowExpanded] = useState(false);
   const filterRef = useRef<HTMLInputElement>(null);
+
+  // Multi-select mode (#643): bulk dismiss/delete across the visible list. State is
+  // sidebar-local; bulk handlers reuse the existing per-session store actions.
+  const [selectMode, setSelectMode] = useState(false);
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [confirmingBulkDelete, setConfirmingBulkDelete] = useState(false);
+
+  const exitSelect = () => {
+    setSelectMode(false);
+    setSelected(new Set());
+  };
+  const toggleSelect = (id: string) =>
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
 
   function revealFilter() {
     setShowFilter(true);
@@ -563,14 +610,18 @@ export function SessionSidebar() {
 
   // Switching tab or editing the filter resets the overflow expansion so a stale
   // "expanded" state can't carry across lists. Done in the handlers (not an effect)
-  // to keep clear of the set-state-in-effect rule.
+  // to keep clear of the set-state-in-effect rule. It also drops any selection: a
+  // selection is scoped to the view it was made in, and carrying it across a
+  // tab/filter change would let a bulk Delete remove now off-screen sessions (#643).
   const switchTab = (next: SessionListTab) => {
     setListTab(next);
     setOverflowExpanded(false);
+    setSelected(new Set());
   };
   const changeFilter = (next: string) => {
     setFilter(next);
     setOverflowExpanded(false);
+    setSelected(new Set());
   };
 
   const filtered = filterSessions(sessions, filter);
@@ -597,6 +648,31 @@ export function SessionSidebar() {
     selectSessionOverflow(arranged, pinnedSet, activeSessionId, false)
       .hiddenCount > 0;
 
+  // Select mode renders the full tab+filter list (no overflow cap) so every
+  // selectable row is on screen and Select-all covers exactly what's shown (#643).
+  const rows = selectMode ? arranged : visible;
+  const arrangedIds = arranged.map((s) => s.id);
+  const allSelected =
+    arrangedIds.length > 0 && arrangedIds.every((id) => selected.has(id));
+  const toggleSelectAll = () =>
+    setSelected(allSelected ? new Set() : new Set(arrangedIds));
+
+  const bulkDismiss = () => {
+    if (selected.size === 0) return;
+    for (const id of selected) {
+      if (effectiveTab === "dismissed") restore(id);
+      else dismiss(id);
+    }
+    exitSelect();
+  };
+  const bulkDelete = async () => {
+    // Sequential: deleteSession snapshots the store each call and re-selects the
+    // active session, so parallel deletes would race on that snapshot.
+    for (const id of selected) await deleteSession(id);
+    setConfirmingBulkDelete(false);
+    exitSelect();
+  };
+
   return (
     <aside
       ref={asideRef}
@@ -621,9 +697,11 @@ export function SessionSidebar() {
           className="absolute right-0 top-0 z-20 h-full w-1.5 cursor-col-resize hover:bg-primary/30"
         />
       )}
-      <div className="flex h-12 items-center justify-between px-3">
-        <span className="text-sm font-semibold tracking-tight">FlowForge</span>
-        <div className="flex items-center gap-0.5">
+      <div className="flex h-12 items-center justify-between gap-1 px-2">
+        <span className="truncate pl-1 text-sm font-semibold tracking-tight">
+          FlowForge
+        </span>
+        <div className="flex shrink-0 items-center gap-0.5">
           <Button
             variant="ghost"
             size="icon"
@@ -664,6 +742,20 @@ export function SessionSidebar() {
               </DropdownMenuSub>
             </DropdownMenuContent>
           </DropdownMenu>
+          <Button
+            variant="ghost"
+            size="icon"
+            className={cn(
+              "size-7 text-muted-foreground hover:text-foreground",
+              selectMode && "bg-sidebar-accent text-foreground",
+            )}
+            onClick={() => (selectMode ? exitSelect() : setSelectMode(true))}
+            title="Select sessions"
+            aria-label="Select sessions"
+            aria-pressed={selectMode}
+          >
+            <SquareCheck className="size-4" />
+          </Button>
           <Button
             variant="ghost"
             size="icon"
@@ -713,6 +805,63 @@ export function SessionSidebar() {
         />
       </div>
 
+      {/* Bulk action bar (#643) — revealed beneath the tabs while selecting. */}
+      {selectMode && (
+        <div className="flex items-center gap-2 px-2 pb-2">
+          <input
+            type="checkbox"
+            checked={allSelected}
+            onChange={toggleSelectAll}
+            aria-label="Select all sessions"
+            className="size-3.5 shrink-0 accent-primary"
+          />
+          <span className="text-[12px] text-muted-foreground">
+            {selected.size} selected
+          </span>
+          <div className="ml-auto flex items-center gap-0.5">
+            <Button
+              variant="ghost"
+              size="xs"
+              disabled={selected.size === 0}
+              onClick={bulkDismiss}
+              className="text-muted-foreground hover:text-foreground"
+            >
+              {effectiveTab === "dismissed" ? (
+                <>
+                  <RotateCcw className="size-3" />
+                  Restore
+                </>
+              ) : (
+                <>
+                  <EyeOff className="size-3" />
+                  Dismiss
+                </>
+              )}
+            </Button>
+            <Button
+              variant="ghost"
+              size="xs"
+              disabled={selected.size === 0}
+              onClick={() => setConfirmingBulkDelete(true)}
+              className="text-destructive hover:text-destructive"
+            >
+              <Trash2 className="size-3" />
+              Delete
+            </Button>
+            <Button
+              variant="ghost"
+              size="icon"
+              className="size-6 text-muted-foreground hover:text-foreground"
+              onClick={exitSelect}
+              title="Exit select mode"
+              aria-label="Exit select mode"
+            >
+              <X className="size-3.5" />
+            </Button>
+          </div>
+        </div>
+      )}
+
       {showFilter && (
         <div className="px-2 pb-2">
           <div className="flex items-center gap-1.5 rounded-md border bg-background/40 px-2 transition-colors focus-within:border-ring focus-within:ring-2 focus-within:ring-ring/25">
@@ -749,14 +898,14 @@ export function SessionSidebar() {
 
       <ScrollArea className="flex-1">
         <nav className="flex flex-col gap-px p-1.5">
-          {visible.length === 0 ? (
+          {rows.length === 0 ? (
             filtering && effectiveTab === "all" ? (
               <EmptyState title={`No sessions match “${filter.trim()}”`} />
             ) : effectiveTab === "dismissed" ? (
               <EmptyState title="No dismissed sessions" />
             ) : null
           ) : (
-            visible.map((session) => (
+            rows.map((session) => (
               <SessionItem
                 key={session.id}
                 session={session}
@@ -765,10 +914,13 @@ export function SessionSidebar() {
                 streaming={Boolean(streamingBySession[session.id])}
                 pinned={pinnedSet.has(session.id)}
                 dismissed={dismissedSet.has(session.id)}
+                selectMode={selectMode}
+                selected={selected.has(session.id)}
+                onToggleSelect={() => toggleSelect(session.id)}
               />
             ))
           )}
-          {hasOverflow && (
+          {!selectMode && hasOverflow && (
             <button
               type="button"
               onClick={() => setOverflowExpanded((v) => !v)}
@@ -779,6 +931,33 @@ export function SessionSidebar() {
           )}
         </nav>
       </ScrollArea>
+
+      <AlertDialog
+        open={confirmingBulkDelete}
+        onOpenChange={setConfirmingBulkDelete}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>
+              Delete {selected.size}{" "}
+              {selected.size === 1 ? "session" : "sessions"}?
+            </AlertDialogTitle>
+            <AlertDialogDescription>
+              This permanently removes the selected{" "}
+              {selected.size === 1 ? "session" : "sessions"} and{" "}
+              {selected.size === 1 ? "its" : "their"} transcript
+              {selected.size === 1 ? "" : "s"}. This can&rsquo;t be undone. (To
+              hide sessions without losing them, use Dismiss.)
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>Cancel</AlertDialogCancel>
+            <AlertDialogAction onClick={() => void bulkDelete()}>
+              Delete
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
 
       <Separator />
       <button

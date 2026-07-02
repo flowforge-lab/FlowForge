@@ -50,6 +50,20 @@ describe("SessionItem", () => {
   it("dims a dismissed row", () => {
     expect(render({ dismissed: true })).toContain("opacity-60");
   });
+
+  it("shows a selection checkbox and hides the ⋯ trigger in select mode (#643)", () => {
+    const html = render({ selectMode: true });
+    expect(html).toContain('aria-label="Select Parser cleanup"');
+    // Row actions (⋯ / ⌘ hint) are suppressed while selecting to keep it calm.
+    expect(html).not.toContain('aria-label="Session actions"');
+  });
+
+  it("reflects the checked state from the `selected` prop (#643)", () => {
+    expect(render({ selectMode: true, selected: true })).toContain("checked");
+    expect(render({ selectMode: true, selected: false })).not.toContain(
+      "checked",
+    );
+  });
 });
 
 // The shared menu body (used by BOTH the right-click ContextMenu and the
