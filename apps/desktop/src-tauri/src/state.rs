@@ -651,27 +651,135 @@ const CODON_PHENOTYPE_TOML: &str =
 const CODEGRAPH_SKILL_MD: &str =
     include_str!("../../../../docs/examples/codon/skills/codegraph/SKILL.md");
 
+/// Manual revision of the seed/retire *logic* (as opposed to the bundled
+/// content, which [`SEED_FINGERPRINT`] tracks automatically). Bump this when the
+/// shape of [`seed_builtin_content_at`] or [`retire_seeded_codegraph_if_unmodified`]
+/// changes so a user whose stamp already matches the (unchanged) content re-runs
+/// the pass exactly once. A pure change to the bundled `include_str!` sources
+/// needs no bump — it alters [`SEED_FINGERPRINT`] on its own.
+const SEED_LOGIC_VERSION: &str = "v1";
+
+/// FNV-1a-fold a byte slice into an accumulator (const-context helper for
+/// [`SEED_FINGERPRINT`]). Our own hasher, not `std`'s `DefaultHasher`, so the
+/// persisted stamp is stable across Rust toolchain updates — `DefaultHasher` is
+/// only guaranteed stable *within* a binary, not across toolchains, and a
+/// toolchain-driven mismatch would silently re-run the idempotent pass.
+const fn fnv1a_mix(mut h: u64, bytes: &[u8]) -> u64 {
+    let mut i = 0;
+    while i < bytes.len() {
+        h ^= bytes[i] as u64;
+        h = h.wrapping_mul(0x100000001b3);
+        i += 1;
+    }
+    h
+}
+
+/// Compile-time fingerprint of the bundled seed content (Codon phenotype +
+/// codegraph skill) folded with [`SEED_LOGIC_VERSION`]. Persisted to
+/// `~/.flowforge/.seed_version` after a successful seed pass; a matching stamp
+/// on the next launch short-circuits the whole pass ([`seed_builtin_content`])
+/// — no `exists()`/stat calls, no `mcp.json` read, no dir-walks (#599 item 3).
+/// Editing either `include_str!` source, or bumping [`SEED_LOGIC_VERSION`],
+/// yields a new fingerprint and re-runs the pass exactly once.
+const SEED_FINGERPRINT: u64 = {
+    let h = 0xcbf2_9ce4_8422_2325u64;
+    let h = fnv1a_mix(h, CODON_PHENOTYPE_TOML.as_bytes());
+    let h = fnv1a_mix(h, CODEGRAPH_SKILL_MD.as_bytes());
+    let h = fnv1a_mix(h, SEED_LOGIC_VERSION.as_bytes());
+    h
+};
+
+/// `~/.flowforge/.seed_version` — the version stamp written after a successful
+/// built-in seed pass. A dotfile at the `~/.flowforge` root, deliberately
+/// outside `phenos/` and `skills/` so the phenotype and skill loaders never try
+/// to parse it; and *inside* `~/.flowforge` (not `~/.config/flowforge`) so
+/// deleting `~/.flowforge` to reset also clears the stamp and forces a re-seed.
+/// `None` when the home directory cannot be resolved.
+#[cfg(not(test))]
+fn seed_stamp_path() -> Option<PathBuf> {
+    dirs::home_dir().map(|d| d.join(".flowforge").join(".seed_version"))
+}
+
 /// Seed the built-in content (the Codon phenotype and the codegraph skill it
 /// requires) into the real `~/.flowforge/` tree. Runs once at startup, before the
 /// skill watcher spawns and the persisted phenotype resolves, so a user who has
-/// selected Codon finds its skill already present.
+/// selected Codon finds its skill already present. Gated by the on-disk version
+/// stamp ([`seed_stamp_path`]): when the stamp matches [`SEED_FINGERPRINT`] the
+/// entire pass is skipped, so a steady-state launch does no `exists()`/stat
+/// calls and no `mcp.json` read (#599 item 3).
 #[cfg(not(test))]
 fn seed_builtin_content() {
-    seed_builtin_content_at(
+    seed_builtin_content_gated(
+        seed_stamp_path().as_deref(),
         &phenotypes_root(),
         &skills_root(),
         ff_mcp::config_path().as_deref(),
     );
 }
 
-/// Path-injectable core of [`seed_builtin_content`] so tests can drive it against
+/// Gated, path-injectable core of [`seed_builtin_content`]. Compares the on-disk
+/// stamp at `stamp_path` to [`SEED_FINGERPRINT`]; on a match the whole pass is
+/// skipped. Otherwise runs [`seed_builtin_content_at`] and (best-effort) writes
+/// the new stamp so the next launch short-circuits. `stamp_path` `None` (no home
+/// dir) skips the gate and always runs, matching the pre-gate behaviour. The
+/// stamp is written *after* the pass and only best-effort: a home so read-only
+/// that the seed writes were swallowed also rejects the stamp, so the next launch
+/// retries — a pass that succeeds but then fails to stamp simply re-runs a
+/// no-op seed next launch until the stamp lands.
+fn seed_builtin_content_gated(
+    stamp_path: Option<&Path>,
+    phenotypes_root: &Path,
+    skills_root: &Path,
+    mcp_path: Option<&Path>,
+) {
+    if let Some(stamp) = stamp_path {
+        if stamp_matches(stamp) {
+            tracing::debug!(stamp = %stamp.display(), "seed built-ins: stamp matches, skipping pass");
+            return;
+        }
+    }
+    seed_builtin_content_at(phenotypes_root, skills_root, mcp_path);
+    if let Some(stamp) = stamp_path {
+        write_seed_stamp(stamp);
+    }
+}
+
+/// True when the stamp at `path` matches the current [`SEED_FINGERPRINT`]. A
+/// missing, corrupt, or unreadable stamp is treated as a mismatch (so the pass
+/// re-runs) rather than an error — the seed is idempotent, so the only cost of a
+/// spurious mismatch is one redundant no-op pass.
+fn stamp_matches(path: &Path) -> bool {
+    let Ok(raw) = fs::read_to_string(path) else {
+        return false;
+    };
+    raw.trim() == format!("{:016x}", SEED_FINGERPRINT)
+}
+
+/// Persist [`SEED_FINGERPRINT`] to `path` so the next launch can short-circuit.
+/// Best-effort: a failure (read-only home, racing process) is logged and skipped
+/// — the next launch simply re-runs the idempotent pass.
+fn write_seed_stamp(path: &Path) {
+    if let Some(parent) = path.parent() {
+        if let Err(e) = fs::create_dir_all(parent) {
+            tracing::warn!(path = %path.display(), error = %e, "seed stamp: create dir");
+            return;
+        }
+    }
+    if let Err(e) = fs::write(path, format!("{:016x}\n", SEED_FINGERPRINT)) {
+        tracing::warn!(path = %path.display(), error = %e, "seed stamp: write");
+    }
+}
+
+/// Path-injectable, un-gated core of the seed pass so tests can drive it against
 /// a tempdir instead of the real home. Each built-in is written only when absent,
 /// leaving a user-edited copy untouched; the codegraph skill body is written at
 /// `skills/codegraph/SKILL.md` (the layout [`SkillRegistry`] scans). When an
 /// `mcp.json` path is known we retire a previously seeded, unmodified disabled
 /// codegraph entry (RFC 0018 C3 #590) -- codegraph now travels with the codon
-/// phenotype, not the global file; a user-edited entry is left intact. `None` skips
-/// it (no home dir).
+/// phenotype, not the global file; a user-edited entry is left intact. `None`
+/// skips it (no home dir). The startup path gates this behind
+/// [`seed_builtin_content_gated`]; tests drive it directly to exercise the
+/// writes without the version-stamp short-circuit.
 fn seed_builtin_content_at(phenotypes_root: &Path, skills_root: &Path, mcp_path: Option<&Path>) {
     seed_if_absent(&phenotypes_root.join("codon.toml"), CODON_PHENOTYPE_TOML);
     seed_if_absent(
@@ -687,6 +795,11 @@ fn seed_builtin_content_at(phenotypes_root: &Path, skills_root: &Path, mcp_path:
 /// matches this is an unmodified seed safe to retire; any difference (a user-set
 /// command/args/env, or an enabled entry the user turned on) means the user owns it
 /// and it is left alone.
+///
+/// This canonical shape is *not* covered by [`SEED_FINGERPRINT`] (only the
+/// `include_str!` bodies are); changing it without bumping
+/// [`SEED_LOGIC_VERSION`] would silently skip the corrected pass for
+/// already-stamped users.
 fn is_unmodified_codegraph_seed(srv: &McpServerConfig) -> bool {
     srv.id == "codegraph"
         && srv.command == "codegraph"
@@ -868,8 +981,12 @@ impl AppState {
     pub fn with_registry(registry: ProviderRegistry) -> Self {
         // Seed the bundled built-ins (Codon + codegraph) before the watcher loads
         // the skills dir, so the codegraph skill is present when a persisted Codon
-        // phenotype resolves below. Gated out of tests, which must not write to the
-        // real `~/.flowforge/`; the seed core is exercised directly via tempdirs.
+        // phenotype resolves below. Gated by a version stamp at
+        // `~/.flowforge/.seed_version`: a steady-state launch whose stamp matches
+        // the bundled-content fingerprint skips the whole pass (no `exists()`/stat
+        // calls, no `mcp.json` read) — #599 item 3. Gated out of tests, which must
+        // not write to the real `~/.flowforge/`; the seed core is exercised
+        // directly via tempdirs.
         #[cfg(not(test))]
         {
             let t = std::time::Instant::now();
@@ -4459,6 +4576,115 @@ mod tests {
         let second = fs::read_to_string(phenos.path().join("codon.toml")).unwrap();
 
         assert_eq!(first, second, "a second seed run must be a no-op");
+    }
+
+    #[test]
+    fn seed_gate_runs_and_stamps_when_no_stamp() {
+        let root = tempfile::tempdir().unwrap();
+        let phenos = root.path().join("phenos");
+        let skills = root.path().join("skills");
+        let stamp = root.path().join(".seed_version");
+
+        seed_builtin_content_gated(Some(&stamp), &phenos, &skills, None);
+
+        assert!(
+            phenos.join("codon.toml").exists(),
+            "codon.toml must be seeded"
+        );
+        assert!(
+            skills.join("codegraph").join("SKILL.md").exists(),
+            "codegraph SKILL.md must be seeded"
+        );
+        assert!(stamp.exists(), "a successful pass must write the stamp");
+        assert_eq!(
+            fs::read_to_string(&stamp).unwrap(),
+            format!("{:016x}\n", SEED_FINGERPRINT),
+            "the stamp must hold the current fingerprint"
+        );
+    }
+
+    #[test]
+    fn seed_gate_skips_the_whole_pass_when_stamp_matches() {
+        let root = tempfile::tempdir().unwrap();
+        let phenos = root.path().join("phenos");
+        let skills = root.path().join("skills");
+        let stamp = root.path().join(".seed_version");
+        // Pre-write a matching stamp, as a prior successful launch would have.
+        fs::write(&stamp, format!("{:016x}\n", SEED_FINGERPRINT)).unwrap();
+
+        seed_builtin_content_gated(Some(&stamp), &phenos, &skills, None);
+
+        // The pass was skipped: neither seed target nor its parent dirs were
+        // created (no exists()/stat calls touched the phenos/skills trees).
+        assert!(
+            !phenos.exists(),
+            "a matching stamp must skip the whole pass, never creating phenos/"
+        );
+        assert!(
+            !skills.exists(),
+            "skills/ must not be created on a skipped pass"
+        );
+        // A skipped pass must not rewrite the stamp.
+        assert_eq!(
+            fs::read_to_string(&stamp).unwrap(),
+            format!("{:016x}\n", SEED_FINGERPRINT)
+        );
+    }
+
+    #[test]
+    fn seed_gate_re_runs_when_stamp_is_stale() {
+        let root = tempfile::tempdir().unwrap();
+        let phenos = root.path().join("phenos");
+        let skills = root.path().join("skills");
+        let stamp = root.path().join(".seed_version");
+        fs::write(&stamp, "deadbeef\n").unwrap();
+
+        seed_builtin_content_gated(Some(&stamp), &phenos, &skills, None);
+
+        // A stale (wrong-version) stamp must re-run the pass and refresh it.
+        assert!(
+            phenos.join("codon.toml").exists(),
+            "stale stamp must re-run the seed"
+        );
+        assert!(skills.join("codegraph").join("SKILL.md").exists());
+        assert_eq!(
+            fs::read_to_string(&stamp).unwrap(),
+            format!("{:016x}\n", SEED_FINGERPRINT),
+            "a re-run pass must refresh the stamp to the current fingerprint"
+        );
+    }
+
+    #[test]
+    fn seed_gate_treats_corrupt_stamp_as_mismatch() {
+        let root = tempfile::tempdir().unwrap();
+        let phenos = root.path().join("phenos");
+        let skills = root.path().join("skills");
+        let stamp = root.path().join(".seed_version");
+        fs::write(&stamp, "not-a-fingerprint\n").unwrap();
+
+        seed_builtin_content_gated(Some(&stamp), &phenos, &skills, None);
+
+        assert!(
+            phenos.join("codon.toml").exists(),
+            "a corrupt stamp must be treated as not-stamped and re-run"
+        );
+        assert_eq!(
+            fs::read_to_string(&stamp).unwrap(),
+            format!("{:016x}\n", SEED_FINGERPRINT)
+        );
+    }
+
+    #[test]
+    fn seed_gate_runs_when_stamp_path_is_none() {
+        // No home dir → no stamp path → degrade to "always run" (pre-gate
+        // behaviour), never panicking.
+        let root = tempfile::tempdir().unwrap();
+        let phenos = root.path().join("phenos");
+        let skills = root.path().join("skills");
+
+        seed_builtin_content_gated(None, &phenos, &skills, None);
+
+        assert!(phenos.join("codon.toml").exists());
     }
 
     #[test]
