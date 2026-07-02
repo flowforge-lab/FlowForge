@@ -137,7 +137,11 @@ function MessageRowImpl({
 
   return (
     <div className="flex flex-col items-start gap-1.5">
-      <MessageHeader role="assistant" createdAt={message.createdAt} />
+      <MessageHeader
+        role="assistant"
+        createdAt={message.createdAt}
+        authorName={message.authorName}
+      />
       {toolSteps.length > 0 ? (
         <div className="flex w-full max-w-[80%] flex-col gap-1.5">
           {/* A single settled step stays bare; streaming (any count), 2+ steps, or
