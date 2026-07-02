@@ -168,4 +168,19 @@ describe("selectSessionOverflow", () => {
     // The active row is pulled in on top of the batch, so more still remain.
     expect(hasMore).toBe(true);
   });
+
+  it("does not flag more when the pulled-in active is the only overflow row", () => {
+    // Exactly one row past the cut, and it's the active one — pulling it in puts
+    // every row on screen, so no "Show more" should render (Abid nit, #669).
+    const sessions = mk(SESSION_REVEAL_BATCH + 1);
+    const activeId = `s${SESSION_REVEAL_BATCH}`;
+    const { visible, hasMore } = selectSessionOverflow(
+      sessions,
+      activeId,
+      SESSION_REVEAL_BATCH,
+    );
+    expect(visible).toHaveLength(SESSION_REVEAL_BATCH + 1);
+    expect(visible.some((s) => s.id === activeId)).toBe(true);
+    expect(hasMore).toBe(false);
+  });
 });

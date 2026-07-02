@@ -80,5 +80,8 @@ export function selectSessionOverflow(
     const active = arranged.find((s) => s.id === activeSessionId);
     if (active) head.push(active);
   }
-  return { visible: head, hasMore: true };
+  // `hasMore` only when rows still remain hidden after the pulled-in active — so
+  // pulling in the single overflow row (active) doesn't strand a "Show more" that
+  // reveals nothing.
+  return { visible: head, hasMore: head.length < arranged.length };
 }
