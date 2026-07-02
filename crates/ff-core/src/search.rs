@@ -1,12 +1,14 @@
 //! User-configurable web-search backend contract. Like [`crate::provider`], these
 //! types ARE the settings IPC surface, exported to TypeScript via `ts-rs`.
 //!
-//! This PR wires the keyless, self-hosted [`SearchBackend::SearxNg`] backend end to
-//! end. The hosted [`SearchBackend::Brave`] / [`SearchBackend::OpenAiCompatible`]
-//! variants exist so the contract is stable for when API keys land, but the tool
-//! refuses them until then. Secret material is NEVER part of this contract — keys
-//! will live in the OS keychain and surface only as the [`SearchConfig::has_key`]
-//! boolean (always `false` for now).
+//! The out-of-the-box default is [`SearchBackend::Tavily`], queried keylessly so
+//! `web_search` works on a fresh install with zero setup. Its endpoint is a fixed,
+//! vetted HTTPS host (not user-supplied), so it is not the SSRF vector that a
+//! user-provided [`SearchBackend::SearxNg`] `base_url` is. The hosted
+//! [`SearchBackend::Brave`] / [`SearchBackend::OpenAiCompatible`] variants exist so
+//! the contract is stable for when API keys land, but the tool refuses them until
+//! then. Secret material is NEVER part of this contract — keys will live in the OS
+//! keychain and surface only as the [`SearchConfig::has_key`] boolean.
 
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
@@ -16,10 +18,14 @@ use ts_rs::TS;
 #[serde(rename_all = "camelCase")]
 #[ts(export, export_to = "../../../apps/desktop/src/bindings/")]
 pub enum SearchBackend {
-    /// Self-hosted SearXNG, queried via its keyless JSON API (FlowForge default).
-    /// Requires a configured [`SearchConfig::base_url`] — there is no baked-in
-    /// public instance (those are unreliable and an unvetted egress target).
+    /// Tavily, queried via its keyless JSON API (FlowForge default). Works with no
+    /// setup; an optional API key (later phase) raises the rate limit but is never
+    /// required. The endpoint is a fixed vetted HTTPS host, so no `base_url`.
     #[default]
+    Tavily,
+    /// Self-hosted SearXNG, queried via its keyless JSON API. Requires a configured
+    /// [`SearchConfig::base_url`] — there is no baked-in public instance (those are
+    /// unreliable and an unvetted egress target).
     SearxNg,
     /// Brave Search API. Reserved — needs an API key, so the tool errors until the
     /// OS-keychain work lands (Issue #8).
@@ -30,35 +36,37 @@ pub enum SearchBackend {
 
 impl SearchBackend {
     /// Whether this backend needs an API key to function. Keyed backends are gated
-    /// off until secret storage exists.
+    /// off until secret storage exists. Tavily accepts an *optional* key (raises the
+    /// rate limit) but works keylessly, so it does not require one.
     pub fn requires_key(self) -> bool {
         matches!(self, SearchBackend::Brave | SearchBackend::OpenAiCompatible)
     }
 }
 
 /// Non-secret, persisted web-search settings. Serialized as JSON to the app config
-/// dir and round-tripped across IPC to drive the (future) settings panel.
+/// dir and round-tripped across IPC to drive the settings panel.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export, export_to = "../../../apps/desktop/src/bindings/")]
 pub struct SearchConfig {
     pub backend: SearchBackend,
     /// Endpoint base URL. Required for SearXNG (e.g. `https://searx.example.org`);
-    /// the path `/search?format=json` is appended by the tool.
+    /// the path `/search?format=json` is appended by the tool. Unused for Tavily.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub base_url: Option<String>,
-    /// Whether an API key is stored for this backend (OS keychain). Always `false`
-    /// for now — the field keeps the contract stable for when secrets land.
+    /// Whether an API key is stored for this backend (OS keychain). For Tavily this
+    /// means an optional key that raises the rate limit; for keyed backends it gates
+    /// availability. Always `false` until the keychain work lands.
     pub has_key: bool,
 }
 
-/// FlowForge's out-of-the-box default: SearXNG with no endpoint set yet (the tool
-/// asks the user to configure one rather than hitting an unvetted public instance).
+/// FlowForge's out-of-the-box default: keyless Tavily, which needs no endpoint and
+/// no key, so `web_search` works immediately on a fresh install.
 impl Default for SearchConfig {
     fn default() -> Self {
         Self {
-            backend: SearchBackend::SearxNg,
+            backend: SearchBackend::Tavily,
             base_url: None,
             has_key: false,
         }
@@ -77,9 +85,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_is_searxng_without_endpoint() {
+    fn default_is_tavily_keyless() {
         let cfg = SearchConfig::default();
-        assert_eq!(cfg.backend, SearchBackend::SearxNg);
+        assert_eq!(cfg.backend, SearchBackend::Tavily);
         assert_eq!(cfg.base_url, None);
         assert!(!cfg.has_key);
         assert_eq!(cfg.resolved_base_url(), None);
@@ -88,6 +96,7 @@ mod tests {
     #[test]
     fn resolved_base_url_ignores_blank_override() {
         let cfg = SearchConfig {
+            backend: SearchBackend::SearxNg,
             base_url: Some("   ".into()),
             ..SearchConfig::default()
         };
@@ -97,6 +106,7 @@ mod tests {
     #[test]
     fn resolved_base_url_returns_configured_endpoint() {
         let cfg = SearchConfig {
+            backend: SearchBackend::SearxNg,
             base_url: Some("https://searx.example.org".into()),
             ..SearchConfig::default()
         };
@@ -105,6 +115,7 @@ mod tests {
 
     #[test]
     fn only_hosted_backends_require_a_key() {
+        assert!(!SearchBackend::Tavily.requires_key());
         assert!(!SearchBackend::SearxNg.requires_key());
         assert!(SearchBackend::Brave.requires_key());
         assert!(SearchBackend::OpenAiCompatible.requires_key());
@@ -126,6 +137,8 @@ mod tests {
 
     #[test]
     fn backend_deserializes_from_camel_case() {
+        let b: SearchBackend = serde_json::from_str("\"tavily\"").unwrap();
+        assert_eq!(b, SearchBackend::Tavily);
         let b: SearchBackend = serde_json::from_str("\"searxNg\"").unwrap();
         assert_eq!(b, SearchBackend::SearxNg);
         let b: SearchBackend = serde_json::from_str("\"brave\"").unwrap();

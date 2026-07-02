@@ -14,6 +14,13 @@ export type SearchBackendMeta = {
 /** Backends exposed in settings — order matches the IPC contract. */
 export const SEARCH_BACKENDS: SearchBackendMeta[] = [
   {
+    id: "tavily",
+    label: "Tavily",
+    description: "Works out of the box — no setup or API key required",
+    requiresKey: false,
+    showBaseUrl: false,
+  },
+  {
     id: "searxNg",
     label: "SearXNG",
     description: "Self-hosted, keyless JSON API",

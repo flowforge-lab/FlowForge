@@ -3,4 +3,4 @@
 /**
  * Which web-search provider `web_search` queries.
  */
-export type SearchBackend = "searxNg" | "brave" | "openAiCompatible";
+export type SearchBackend = "tavily" | "searxNg" | "brave" | "openAiCompatible";
