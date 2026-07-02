@@ -7,8 +7,13 @@ import { formatMessageTime } from "@/lib/format-message-time";
  * medium weight, time muted to its right. Reads the author name from the stores by
  * role so chat-view stays a two-line change and headers update live:
  * - user → `prefs.displayName`, falling back to "You" when blank.
- * - assistant → the active phenotype's display name, falling back to `activeId` /
- *   "Assistant".
+ * - assistant → the active phenotype display name, falling back to "Assistant".
+ *
+ * The assistant name reflects the *currently* active phenotype, not the one that
+ * produced each message: a thread reloaded after the user switches phenotype will
+ * re-label past assistant turns with the new name. A faithful per-message author
+ * needs a `Message` author field (schema + bindings), tracked as a follow-up (#657).
+ *
  * The parent message column (`items-end` for user, `items-start` for assistant)
  * handles left/right alignment. The time span is omitted when `createdAt` has no
  * usable timestamp (see `formatMessageTime`).
@@ -27,9 +32,7 @@ export function MessageHeader({
   const name =
     role === "user"
       ? displayName || "You"
-      : (profiles.find((p) => p.id === activeId)?.name ??
-        activeId ??
-        "Assistant");
+      : (profiles.find((p) => p.id === activeId)?.name ?? "Assistant");
 
   const time = formatMessageTime(createdAt);
 

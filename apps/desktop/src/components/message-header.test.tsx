@@ -49,6 +49,15 @@ describe("MessageHeader", () => {
     expect(screen.getByText("Data Science")).toBeTruthy();
   });
 
+  it('falls back to "Assistant" when no profile matches the active id', () => {
+    // The reset state (activeId "default", no profiles) must not surface the raw
+    // id slug as the author name.
+    useProfilesStore.setState({ activeId: "default", profiles: [] });
+    render(<MessageHeader role="assistant" createdAt={CREATED_AT} />);
+    expect(screen.getByText("Assistant")).toBeTruthy();
+    expect(screen.queryByText("default")).toBeNull();
+  });
+
   it("omits the time when createdAt has no usable timestamp", () => {
     usePrefsStore.setState({ displayName: "Abid" });
     render(<MessageHeader role="user" createdAt={0} />);
