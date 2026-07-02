@@ -1459,6 +1459,9 @@ mod tests {
     /// not the candle-vLLM 32-step GPU-clock ramp (#61).
     #[test]
     fn warmup_ramp_is_a_single_residency_touch() {
-        assert_eq!(OllamaProvider::new("http://localhost:11434").warmup_ramp_steps(), 1);
+        assert_eq!(
+            OllamaProvider::new("http://localhost:11434").warmup_ramp_steps(),
+            1
+        );
     }
 }
