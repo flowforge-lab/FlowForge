@@ -46,4 +46,13 @@ reasoningVisibility: ReasoningVisibility,
  * GPU use (e.g. on laptop battery). `#[serde(default = "default_warmup_enabled")]`
  * keeps pre-#61 registries loading as `true`.
  */
-warmupEnabled: boolean, };
+warmupEnabled: boolean, 
+/**
+ * Served context window for local Ollama providers, in tokens (#538, #651).
+ * `None` ⇒ fall back to `FLOWFORGE_OLLAMA_NUM_CTX`, then the probed window,
+ * then the conservative default. Only meaningful for Ollama; clamped to the
+ * model's trained ceiling by the served-window resolution. Mirrors
+ * [`ProviderConnection::num_ctx`]. `#[serde(default)]` keeps pre-#651
+ * `provider.json` files loading as `None`.
+ */
+numCtx?: number, };

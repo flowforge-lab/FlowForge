@@ -252,6 +252,59 @@ describe("ModelSection provider accordion", () => {
     expect(container.querySelector('button[aria-label="Warmup"]')).toBeNull();
   });
 
+  it("shows the Context window select for Ollama, persists a preset, and hides it for other kinds (#651)", async () => {
+    await renderSection();
+    await act(async () => {
+      await useModelConfigStore.getState().setNumCtx("ollama", null);
+      await useModelConfigStore.getState().setActiveConnection("ollama");
+      await flush();
+    });
+    const trigger = container.querySelector(
+      'button[aria-label="Context window"]',
+    );
+    expect(trigger).not.toBeNull();
+    // Auto = the field is left unset (omitted on the wire).
+    expect(
+      activeConnection(useModelConfigStore.getState().registry)?.numCtx,
+    ).toBeUndefined();
+
+    // A chosen preset persists onto the active connection.
+    await act(async () => {
+      await useModelConfigStore.getState().setNumCtx("ollama", 8192);
+      await flush();
+    });
+    expect(
+      activeConnection(useModelConfigStore.getState().registry)?.numCtx,
+    ).toBe(8192);
+
+    // Clearing back to Auto drops the field again.
+    await act(async () => {
+      await useModelConfigStore.getState().setNumCtx("ollama", null);
+      await flush();
+    });
+    expect(
+      activeConnection(useModelConfigStore.getState().registry)?.numCtx,
+    ).toBeUndefined();
+
+    // candle-vLLM (the other local kind) serves its window at launch, so the
+    // control is not rendered for it (#311: no dead controls).
+    await act(async () => {
+      await useModelConfigStore.getState().setActiveConnection("candle-vllm");
+      await flush();
+    });
+    expect(
+      container.querySelector('button[aria-label="Context window"]'),
+    ).toBeNull();
+
+    // The MockIpc singleton persists the active pointer across tests; leave a
+    // thinking-enabled connection active so later tests don't inherit a local
+    // kind (whose reasoning controls are disabled).
+    await act(async () => {
+      await useModelConfigStore.getState().setActiveConnection("openai");
+      await flush();
+    });
+  });
+
   // The module-level MockIpc singleton persists the active pointer and connection
   // edits across tests, so each effort test establishes its own starting state
   // rather than relying on the seed defaults.

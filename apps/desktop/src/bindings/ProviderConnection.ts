@@ -68,6 +68,14 @@ reasoningVisibility: ReasoningVisibility,
  */
 warmupEnabled: boolean, 
 /**
+ * Served context window for local Ollama connections, in tokens (#538, #651).
+ * `None` ⇒ fall back to `FLOWFORGE_OLLAMA_NUM_CTX`, then the probed window,
+ * then the conservative default. Only meaningful for Ollama; clamped to the
+ * model's trained ceiling by the served-window resolution. `#[serde(default)]`
+ * keeps pre-#651 registries loading as `None`.
+ */
+numCtx?: number, 
+/**
  * AWS region for a Bedrock connection (e.g. `"us-east-1"`); the provider
  * derives `bedrock-runtime.<region>.amazonaws.com` from it. `None` for
  * non-Bedrock kinds.

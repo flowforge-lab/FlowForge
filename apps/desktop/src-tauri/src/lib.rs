@@ -1383,6 +1383,8 @@ fn set_provider_config(
         reasoning_visibility: current.reasoning_visibility,
         // No warmup control on this shim either; preserve the persisted value.
         warmup_enabled: current.warmup_enabled,
+        // No num_ctx control on this shim; preserve the persisted window (#651).
+        num_ctx: current.num_ctx,
     };
     state.set_provider_config(config.clone());
     config

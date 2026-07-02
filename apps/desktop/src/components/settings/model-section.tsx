@@ -10,8 +10,16 @@ import {
   DropdownMenuContent,
   DropdownMenuItem,
 } from "@/components/ui/dropdown-menu";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { useSettingsStore } from "@/store/settings";
 import {
+  NUM_CTX_PRESETS,
   SUMMARY_THRESHOLD_MAX,
   SUMMARY_THRESHOLD_MIN,
   activeConnection,
@@ -44,6 +52,14 @@ function formatThreshold(tokens: number): string {
   return `${Math.round(tokens / 1000)}k`;
 }
 
+/** Sentinel `Select` value for "Auto" (unset num_ctx); radix needs a value. */
+const NUM_CTX_AUTO = "auto";
+
+/** Tokens → compact "8K" / "128K" label for the context-window presets. */
+function formatNumCtx(tokens: number): string {
+  return `${tokens / 1024}K`;
+}
+
 /**
  * Model section (#126, #202 PR-3b): a provider-centric accordion. Each registry
  * connection is a card carrying its own credentials + default-model picker (durable
@@ -60,6 +76,7 @@ export function ModelSection() {
   const addConnection = useModelConfigStore((s) => s.addConnection);
   const setThinking = useModelConfigStore((s) => s.setThinking);
   const setWarmupEnabled = useModelConfigStore((s) => s.setWarmupEnabled);
+  const setNumCtx = useModelConfigStore((s) => s.setNumCtx);
 
   const summarizationThreshold = useModelConfigStore(
     (s) => s.summarizationThreshold,
@@ -95,6 +112,11 @@ export function ModelSection() {
   // Warmup only helps local backends (#61); hide the control for hosted kinds.
   const warmupIsLocal = active ? isLocalKind(active.kind) : false;
   const warmupEnabled = active?.warmupEnabled ?? true;
+  // num_ctx only reaches the wire on the Ollama provider (#651); candle-vLLM — the
+  // other local kind — serves its window at launch, so the control would be a no-op
+  // there. Gate to Ollama only rather than all local kinds (#311: no dead controls).
+  const numCtxIsOllama = active?.kind === "ollama";
+  const numCtx = active?.numCtx;
   const present = new Set(registry?.connections.map((c) => c.kind) ?? []);
   const addable = ADDABLE.filter((a) => !present.has(a.kind));
 
@@ -179,6 +201,43 @@ export function ModelSection() {
               if (active) void setWarmupEnabled(active.id, v);
             }}
           />
+        ) : null}
+
+        {numCtxIsOllama ? (
+          <div className="flex items-center justify-between gap-4">
+            <span className="flex flex-col gap-0.5">
+              <span className="text-[13px] font-medium text-foreground">
+                Context window
+              </span>
+              <span className="text-[12px] leading-relaxed text-muted-foreground">
+                Tokens Ollama is asked to serve. Auto uses the server default;
+                larger widens context but uses more memory.
+              </span>
+            </span>
+            <Select
+              value={numCtx?.toString() ?? NUM_CTX_AUTO}
+              onValueChange={(v) => {
+                if (active)
+                  void setNumCtx(
+                    active.id,
+                    v === NUM_CTX_AUTO ? null : Number(v),
+                  );
+              }}
+              disabled={!active || saving}
+            >
+              <SelectTrigger className="w-28" aria-label="Context window">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value={NUM_CTX_AUTO}>Auto</SelectItem>
+                {NUM_CTX_PRESETS.map((tokens) => (
+                  <SelectItem key={tokens} value={tokens.toString()}>
+                    {formatNumCtx(tokens)}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
         ) : null}
 
         <div className="space-y-2">
