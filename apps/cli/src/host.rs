@@ -56,7 +56,13 @@ fn build_provider(config: &ProviderConfig) -> Box<dyn Provider> {
         ProviderKind::Ollama => Box::new(
             OllamaProvider::new(base_url)
                 .with_documents(documents)
-                .with_num_ctx(ollama_num_ctx_from_env()),
+                // Per-connection window (#651) wins; env var stays as a global override.
+                .with_num_ctx(
+                    config
+                        .num_ctx
+                        .map(u64::from)
+                        .or_else(ollama_num_ctx_from_env),
+                ),
         ),
         ProviderKind::Bedrock => Box::new(build_bedrock_provider(config, documents)),
         // The CLI has no keychain, so a hosted OpenAI key comes from the
