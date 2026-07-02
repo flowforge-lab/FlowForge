@@ -4,7 +4,7 @@ import {
   filterSessions,
   arrangeSessions,
   selectSessionOverflow,
-  UNPINNED_SESSION_CAP,
+  SESSION_REVEAL_BATCH,
 } from "@/lib/sessions";
 import type { Session } from "@/bindings";
 
@@ -84,38 +84,32 @@ describe("arrangeSessions", () => {
     session({ id: "a" }),
     session({ id: "b" }),
     session({ id: "c" }),
+    session({ id: "d" }),
   ];
   const empty = new Set<string>();
 
-  it("floats pinned sessions to the top, stable within each group", () => {
-    const out = arrangeSessions(sessions, new Set(["c"]), empty, "all");
-    expect(out.map((s) => s.id)).toEqual(["c", "a", "b"]);
+  it("orders pinned first, then live, then dismissed — stable within each group", () => {
+    // pinned: d; dismissed: a. Expect d (pinned) → b, c (live) → a (dismissed).
+    const out = arrangeSessions(sessions, new Set(["d"]), new Set(["a"]));
+    expect(out.map((s) => s.id)).toEqual(["d", "b", "c", "a"]);
   });
 
-  it("keeps the original order when nothing is pinned", () => {
+  it("keeps the original order when nothing is pinned or dismissed", () => {
     expect(
-      arrangeSessions(sessions, empty, empty, "all").map((s) => s.id),
-    ).toEqual(["a", "b", "c"]);
+      arrangeSessions(sessions, empty, empty).map((s) => s.id),
+    ).toEqual(["a", "b", "c", "d"]);
   });
 
-  it("hides dismissed sessions on the All tab", () => {
-    const dismissed = new Set(["b"]);
-    expect(
-      arrangeSessions(sessions, empty, dismissed, "all").map((s) => s.id),
-    ).toEqual(["a", "c"]);
-  });
-
-  it("shows only dismissed sessions on the Dismissed tab", () => {
-    const dismissed = new Set(["b"]);
-    expect(
-      arrangeSessions(sessions, empty, dismissed, "dismissed").map((s) => s.id),
-    ).toEqual(["b"]);
+  it("sinks dismissed sessions to the bottom, even when pinned", () => {
+    // A dismissed session never floats above a live one, pin notwithstanding.
+    const out = arrangeSessions(sessions, new Set(["a"]), new Set(["a"]));
+    expect(out.map((s) => s.id)).toEqual(["b", "c", "d", "a"]);
   });
 
   it("does not mutate the input array", () => {
     const input = [...sessions];
-    arrangeSessions(input, new Set(["c"]), empty, "all");
-    expect(input.map((s) => s.id)).toEqual(["a", "b", "c"]);
+    arrangeSessions(input, new Set(["d"]), new Set(["a"]));
+    expect(input.map((s) => s.id)).toEqual(["a", "b", "c", "d"]);
   });
 });
 
@@ -125,66 +119,46 @@ describe("selectSessionOverflow", () => {
       session({ id: `s${i}`, goal: `Session ${i}` }),
     );
 
-  it("shows every session when unpinned count is within the cap", () => {
+  it("shows everything and reports no more when within the reveal count", () => {
     const sessions = mk(10);
-    const { visible, hiddenCount } = selectSessionOverflow(
-      sessions,
-      new Set(),
-      null,
-      false,
-    );
+    const { visible, hasMore } = selectSessionOverflow(sessions, null, 25);
     expect(visible).toHaveLength(10);
-    expect(hiddenCount).toBe(0);
+    expect(hasMore).toBe(false);
   });
 
-  it("caps unpinned sessions at 15 and reports the overflow count", () => {
-    const sessions = mk(20);
-    const { visible, hiddenCount } = selectSessionOverflow(
+  it("reveals only the first revealCount rows and flags more remain", () => {
+    const sessions = mk(60);
+    const { visible, hasMore } = selectSessionOverflow(
       sessions,
-      new Set(),
       null,
-      false,
+      SESSION_REVEAL_BATCH,
     );
     expect(visible.map((s) => s.id)).toEqual(
-      sessions.slice(0, UNPINNED_SESSION_CAP).map((s) => s.id),
+      sessions.slice(0, SESSION_REVEAL_BATCH).map((s) => s.id),
     );
-    expect(hiddenCount).toBe(5);
+    expect(hasMore).toBe(true);
   });
 
-  it("always renders pinned sessions regardless of cap", () => {
-    const sessions = mk(20);
-    const pinned = new Set(["s19", "s18"]);
-    const { visible, hiddenCount } = selectSessionOverflow(
-      sessions,
-      pinned,
-      null,
-      false,
-    );
-    expect(visible.some((s) => s.id === "s19")).toBe(true);
-    expect(visible.some((s) => s.id === "s18")).toBe(true);
-    expect(hiddenCount).toBe(3);
+  it("grows by the batch size on each successive reveal count", () => {
+    const sessions = mk(60);
+    expect(
+      selectSessionOverflow(sessions, null, SESSION_REVEAL_BATCH * 2).visible,
+    ).toHaveLength(SESSION_REVEAL_BATCH * 2);
+    // Third batch exceeds the total, so everything shows and no more remain.
+    const third = selectSessionOverflow(sessions, null, SESSION_REVEAL_BATCH * 3);
+    expect(third.visible).toHaveLength(60);
+    expect(third.hasMore).toBe(false);
   });
 
-  it("always renders the active session even when it would fall past the cap", () => {
-    const sessions = mk(20);
-    const { visible } = selectSessionOverflow(
+  it("always includes the active session even when it falls past the reveal cut", () => {
+    const sessions = mk(60);
+    const { visible, hasMore } = selectSessionOverflow(
       sessions,
-      new Set(),
-      "s19",
-      false,
+      "s59",
+      SESSION_REVEAL_BATCH,
     );
-    expect(visible.some((s) => s.id === "s19")).toBe(true);
-  });
-
-  it("revealAll bypasses the cap", () => {
-    const sessions = mk(20);
-    const { visible, hiddenCount } = selectSessionOverflow(
-      sessions,
-      new Set(),
-      null,
-      true,
-    );
-    expect(visible).toHaveLength(20);
-    expect(hiddenCount).toBe(0);
+    expect(visible.some((s) => s.id === "s59")).toBe(true);
+    // The active row is pulled in on top of the batch, so more still remain.
+    expect(hasMore).toBe(true);
   });
 });
