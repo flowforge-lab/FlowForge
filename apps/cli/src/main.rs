@@ -713,6 +713,7 @@ mod tests {
             AgentEvent::Done {
                 message_id: "m1".into(),
                 final_message: Some("Hello world!".into()),
+                stop_reason: None,
                 turns: Some(2),
                 token_count: None,
                 prefill_estimates: None,

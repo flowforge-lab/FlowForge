@@ -12,11 +12,11 @@
  *
  * Used to decide whether to offer the one-click "Continue" affordance (#513/#636).
  *
- * This is the single place coupled to the notice's text shape. The robust
- * trigger upstream is structural (a turn that ends with empty streamed content);
- * this only classifies the refetched notice. A structured `stopReason` on
- * `TurnDoneEvent` would let us drop the string match entirely — tracked as a
- * #512 backend follow-up.
+ * As of #658 the primary classifier is the structured `stopReason` on
+ * `TurnDoneEvent` / `Message`. This string match is retained as the documented
+ * **legacy fallback**: rows persisted before #658 carry only `content`, so
+ * deleting it would silently mis-render historical stopped turns. New turns take
+ * the structured path; this only fires when `stopReason` is absent.
  */
 export function isResumableStopNotice(content: string): boolean {
   return /^\[stopped/.test(content.trim());

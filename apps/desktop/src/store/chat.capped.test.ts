@@ -18,6 +18,7 @@ const done = (messageId: string) => ({
   sessionId: SID,
   messageId,
   tokenCount: null,
+  stopReason: null,
 });
 
 describe("chat store — resumable-turn detection (#513/#636)", () => {
@@ -62,6 +63,18 @@ describe("chat store — resumable-turn detection (#513/#636)", () => {
   it("flags a bare [stopped] (user cancel) as resumable (#636)", async () => {
     vi.spyOn(ipc, "getMessages").mockResolvedValue([
       assistant("m1", "[stopped]"),
+    ]);
+    useChatStore.getState().finishTurn(done("m1"));
+    await vi.waitFor(() =>
+      expect(useChatStore.getState().resumableBySession[SID]).toBe(true),
+    );
+  });
+
+  it("flags via the structured stopReason even when content has no marker (#658)", async () => {
+    // A #658-aware backend persists the reason structurally; the classifier must
+    // not depend on the `[stopped…]` marker string being present in content.
+    vi.spyOn(ipc, "getMessages").mockResolvedValue([
+      { ...assistant("m1", ""), stopReason: "toolLimit" },
     ]);
     useChatStore.getState().finishTurn(done("m1"));
     await vi.waitFor(() =>

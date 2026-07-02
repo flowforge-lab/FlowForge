@@ -11,6 +11,62 @@ pub enum Role {
     Tool,
 }
 
+/// Why a turn ended without a usable answer (#658). The single source of truth
+/// for the `[stopped…]` marker text the agent loop persists, so the frontend can
+/// classify and render a stopped turn structurally instead of string-matching the
+/// marker. Persisted on the assistant [`Message`] and carried on
+/// [`TurnDoneEvent`](crate::events::TurnDoneEvent); absent for a normal turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "../../../apps/desktop/src/bindings/")]
+pub enum StopReason {
+    /// The user pressed Stop (`cancel.is_cancelled()`).
+    Cancelled,
+    /// The agent loop hit its tool-call iteration cap.
+    ToolLimit,
+    /// A no-progress stall: the model repeated the identical tool call past the
+    /// repeat-breaker threshold (#244 R2).
+    Stall,
+    /// The model returned an empty response even after the bounded retries.
+    EmptyResponse,
+}
+
+impl StopReason {
+    /// The persisted `[stopped…]` notice text for this reason. The one place the
+    /// marker strings live, so the frontend never has to reproduce them.
+    pub fn marker(self) -> &'static str {
+        match self {
+            StopReason::Cancelled => "[stopped]",
+            StopReason::ToolLimit => "[stopped: reached tool-call limit]",
+            StopReason::Stall => "[stopped: repeated a tool call without making progress]",
+            StopReason::EmptyResponse => "[stopped: the model returned an empty response]",
+        }
+    }
+
+    /// The stable string persisted in SQLite / crossed on the wire (camelCase, to
+    /// match the ts-rs binding). Pairs with [`StopReason::from_wire`].
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            StopReason::Cancelled => "cancelled",
+            StopReason::ToolLimit => "toolLimit",
+            StopReason::Stall => "stall",
+            StopReason::EmptyResponse => "emptyResponse",
+        }
+    }
+
+    /// Parse a persisted wire string back into a variant; `None` for an unknown
+    /// value (a forward-compat guard for a row written by a newer schema).
+    pub fn from_wire(s: &str) -> Option<Self> {
+        match s {
+            "cancelled" => Some(StopReason::Cancelled),
+            "toolLimit" => Some(StopReason::ToolLimit),
+            "stall" => Some(StopReason::Stall),
+            "emptyResponse" => Some(StopReason::EmptyResponse),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export, export_to = "../../../apps/desktop/src/bindings/")]
@@ -90,6 +146,13 @@ pub struct Message {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub reasoning: Option<String>,
+    /// Why this assistant turn ended without a usable answer (#658). Present only
+    /// on a stopped turn's finalized notice message; lets the frontend classify
+    /// and render the stop structurally instead of string-matching `content`.
+    /// Omitted from the wire/binding when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub stop_reason: Option<StopReason>,
     /// The phenotype that produced this (assistant) message, captured when the row
     /// was created so history shows the true historical author rather than the
     /// currently active phenotype (#657). Holds the raw phenotype name (the FE

@@ -351,6 +351,7 @@ mod tests {
             tool_call_id: None,
             attachments: None,
             reasoning: None,
+            stop_reason: None,
             author_name: None,
             created_at: 0,
         }

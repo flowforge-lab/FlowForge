@@ -859,10 +859,14 @@ export class MockIpc implements FfIpc {
         "assistant",
         "[stopped: reached tool-call limit]",
       );
+      // #658: carry the structured reason so the mock exercises the primary
+      // (non-string-matching) render + classification path.
+      stopped.stopReason = "toolLimit";
       this.emit(this.doneListeners, {
         sessionId,
         messageId: stopped.id,
         tokenCount: null,
+        stopReason: "toolLimit",
       });
       return user.id;
     }
@@ -872,10 +876,13 @@ export class MockIpc implements FfIpc {
     // refetch so the Cancelled banner + one-click Continue can be exercised here.
     if (content.trim() === "/cancel") {
       const stopped = this.append(sessionId, "assistant", "[stopped]");
+      // #658: structured reason (see /cap above).
+      stopped.stopReason = "cancelled";
       this.emit(this.doneListeners, {
         sessionId,
         messageId: stopped.id,
         tokenCount: null,
+        stopReason: "cancelled",
       });
       return user.id;
     }
@@ -945,6 +952,7 @@ export class MockIpc implements FfIpc {
       // Rough estimate (~4 chars/token) — mirrors the real backend supplying a
       // context-usage token count on Done.
       tokenCount: Math.ceil(cancelledContent.length / 4),
+      stopReason: null,
     });
   }
 
@@ -2271,6 +2279,7 @@ Shipping the Settings redesign — currently the Memory browser (SET.8).
           // Rough estimate (~4 chars/token) — mirrors the real backend supplying
           // a context-usage token count on Done.
           tokenCount: Math.ceil((stored?.content.length ?? 0) / 4),
+          stopReason: null,
         });
         return;
       }

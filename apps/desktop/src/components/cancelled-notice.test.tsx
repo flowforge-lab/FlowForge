@@ -38,6 +38,36 @@ describe("parseStopNotice (#636)", () => {
       reason: "capped",
     });
   });
+
+  // #658: the structured stopReason is the primary path -- it wins over the
+  // marker string, and works even when `content` carries no `[stopped…]` marker.
+  it("prefers the structured stopReason over the marker text (#658)", () => {
+    expect(parseStopNotice("[stopped]", "toolLimit")).toEqual({
+      label: "reached tool-call limit",
+      reason: "capped",
+    });
+    expect(parseStopNotice("anything", "cancelled")).toEqual({
+      label: "Cancelled",
+      reason: "cancelled",
+    });
+    expect(parseStopNotice("", "stall")).toEqual({
+      label: "repeated a tool call without making progress",
+      reason: "capped",
+    });
+    expect(parseStopNotice("", "emptyResponse")).toEqual({
+      label: "the model returned an empty response",
+      reason: "capped",
+    });
+  });
+
+  it("falls back to the marker string when stopReason is absent (legacy row)", () => {
+    expect(parseStopNotice("[stopped: reached tool-call limit]", null)).toEqual(
+      {
+        label: "reached tool-call limit",
+        reason: "capped",
+      },
+    );
+  });
 });
 
 describe("CancelledNotice (#636)", () => {
@@ -57,6 +87,15 @@ describe("CancelledNotice (#636)", () => {
       />,
     );
     expect(screen.getByText("reached tool-call limit")).not.toBeNull();
+  });
+
+  it("renders from the structured stopReason with no marker in content (#658)", () => {
+    useChatStore.setState({ resumableBySession: { [SID]: true } });
+    render(
+      <CancelledNotice sessionId={SID} content="" stopReason="toolLimit" />,
+    );
+    expect(screen.getByText("reached tool-call limit")).not.toBeNull();
+    expect(screen.getByText("Continue")).not.toBeNull();
   });
 
   it("shows the label but hides Continue while a turn is busy", () => {

@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
-use crate::{McpServerStatus, SessionStatus};
+use crate::{McpServerStatus, SessionStatus, StopReason};
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
@@ -107,6 +107,11 @@ pub struct TurnDoneEvent {
     /// frontend context-usage indicator. `None` when not assessed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub token_count: Option<u32>,
+    /// Why the turn stopped without a usable answer (#658), when it did. `None`
+    /// for a normal completion. Lets the frontend offer the Continue affordance
+    /// and render the Cancelled banner without string-matching the notice text.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stop_reason: Option<StopReason>,
 }
 
 /// Per-turn timing baseline (F1, #427): the wall-clock breakdown the performance

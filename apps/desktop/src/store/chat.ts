@@ -716,10 +716,11 @@ export const useChatStore = create<ChatState>((set, get) => ({
     }));
 
     if (!endedEmpty) return;
-    // Re-pull authoritative history (the notice text only lives on the backend),
-    // then offer Continue if the final assistant message is a resumable stop
-    // notice — a reason-bearing `[stopped: …]` cap/stall OR a bare `[stopped]`
-    // from a user cancel (#636).
+    // Re-pull authoritative history (the stop reason + notice text live on the
+    // backend, not on the transient event's empty bubble), then offer Continue if
+    // the final assistant message stopped without an answer. The turn:done event
+    // now carries a structured `stopReason` (#658); the reloaded message carries the
+    // same field, which the classification below prefers over the marker string.
     void get()
       .loadSession(e.sessionId)
       .then(() => {
@@ -743,7 +744,10 @@ export const useChatStore = create<ChatState>((set, get) => ({
         if (
           lastAssistant &&
           lastAssistant.id === e.messageId &&
-          isResumableStopNotice(lastAssistant.content)
+          // Prefer the structured stop reason (#658); fall back to the legacy
+          // marker-string classifier for rows persisted before the column existed.
+          (lastAssistant.stopReason != null ||
+            isResumableStopNotice(lastAssistant.content))
         ) {
           set((s) => ({
             resumableBySession: {

@@ -15,7 +15,7 @@ use std::sync::Mutex;
 
 use ff_core::{
     auto_title, Attachment, Format, McpServerConfig, Message, Mode, ModelSelection, Role, Session,
-    SessionStatus, ToolCall,
+    SessionStatus, StopReason, ToolCall,
 };
 use rusqlite::{params, Connection, OptionalExtension};
 
@@ -180,7 +180,7 @@ impl SessionStore {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
             .prepare(
-                "SELECT id, session_id, role, content, tool_calls, tool_call_id, attachments, reasoning, author_name, created_at
+                "SELECT id, session_id, role, content, tool_calls, tool_call_id, attachments, reasoning, stop_reason, author_name, created_at
                  FROM messages
                  WHERE session_id = ?1
                  ORDER BY seq",
@@ -202,6 +202,7 @@ impl SessionStore {
             tool_call_id: None,
             attachments: None,
             reasoning: None,
+            stop_reason: None,
             author_name: None,
             created_at: now_ms(),
         })
@@ -224,6 +225,7 @@ impl SessionStore {
             tool_call_id: None,
             attachments: (!attachments.is_empty()).then_some(attachments),
             reasoning: None,
+            stop_reason: None,
             author_name: None,
             created_at: now_ms(),
         })
@@ -245,6 +247,7 @@ impl SessionStore {
             tool_call_id: Some(tool_call_id),
             attachments: None,
             reasoning: None,
+            stop_reason: None,
             author_name: None,
             created_at: now_ms(),
         })
@@ -353,8 +356,8 @@ impl SessionStore {
             .map(|a| serde_json::to_string(a).expect("serialize attachments"));
         let inserted = conn.execute(
             "INSERT INTO messages
-                 (id, session_id, seq, role, content, tool_calls, tool_call_id, attachments, reasoning, author_name, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                 (id, session_id, seq, role, content, tool_calls, tool_call_id, attachments, reasoning, stop_reason, author_name, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 msg.id,
                 msg.session_id,
@@ -365,6 +368,7 @@ impl SessionStore {
                 msg.tool_call_id,
                 attachments,
                 msg.reasoning,
+                msg.stop_reason.map(|r| r.as_wire()),
                 msg.author_name,
                 msg.created_at,
             ],
@@ -564,7 +568,7 @@ impl SessionStore {
         if updated > 0 {
             if let Some(msg) = conn
                 .query_row(
-                    "SELECT id, session_id, role, content, tool_calls, tool_call_id, attachments, reasoning, author_name, created_at
+                    "SELECT id, session_id, role, content, tool_calls, tool_call_id, attachments, reasoning, stop_reason, author_name, created_at
                      FROM messages WHERE id = ?1",
                     params![message_id],
                     row_to_message,
@@ -585,6 +589,7 @@ impl SessionStore {
             tool_call_id: None,
             attachments: None,
             reasoning: None,
+            stop_reason: None,
             author_name: None,
             created_at: ts,
         }
@@ -631,6 +636,19 @@ impl SessionStore {
         conn.execute(
             "UPDATE messages SET reasoning = ?1 WHERE id = ?2 AND session_id = ?3",
             params![reasoning, message_id, session_id],
+        )
+        .ok();
+    }
+
+    /// Persist why a turn stopped without a usable answer (#658) onto its finalized
+    /// notice message, so the frontend renders the stop structurally rather than
+    /// string-matching the marker. Stored as the reason's stable wire string; NULL
+    /// for a normal turn. No-op for an unknown message.
+    pub fn set_message_stop_reason(&self, message_id: &str, session_id: &str, reason: StopReason) {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE messages SET stop_reason = ?1 WHERE id = ?2 AND session_id = ?3",
+            params![reason.as_wire(), message_id, session_id],
         )
         .ok();
     }
@@ -810,7 +828,7 @@ impl SessionStore {
         {
             let mut stmt = tx
                 .prepare(
-                    "SELECT seq, role, content, tool_calls, tool_call_id, attachments, reasoning, author_name, created_at
+                    "SELECT seq, role, content, tool_calls, tool_call_id, attachments, reasoning, stop_reason, author_name, created_at
                      FROM messages WHERE session_id = ?1
                      ORDER BY seq",
                 )
@@ -826,7 +844,8 @@ impl SessionStore {
                         row.get::<_, Option<String>>(5)?,
                         row.get::<_, Option<String>>(6)?,
                         row.get::<_, Option<String>>(7)?,
-                        row.get::<_, i64>(8)?,
+                        row.get::<_, Option<String>>(8)?,
+                        row.get::<_, i64>(9)?,
                     ))
                 })
                 .expect("query forked messages");
@@ -840,13 +859,14 @@ impl SessionStore {
                     tool_call_id,
                     attachments,
                     reasoning,
+                    stop_reason,
                     author_name,
                     created_at,
                 ) = row.expect("read forked message");
                 let inserted = tx.execute(
                     "INSERT INTO messages
-                         (id, session_id, seq, role, content, tool_calls, tool_call_id, attachments, reasoning, author_name, created_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                         (id, session_id, seq, role, content, tool_calls, tool_call_id, attachments, reasoning, stop_reason, author_name, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                     params![
                         new_id(),
                         forked.id,
@@ -857,6 +877,7 @@ impl SessionStore {
                         tool_call_id,
                         attachments,
                         reasoning,
+                        stop_reason,
                         author_name,
                         created_at,
                     ],
@@ -1109,6 +1130,14 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
         conn.execute_batch("ALTER TABLE messages ADD COLUMN author_name TEXT;")?;
         conn.pragma_update(None, "user_version", 8)?;
     }
+    if version < 9 {
+        // #658: persist the structured stop reason for a turn that ended without a
+        // usable answer, so the frontend classifies/renders the stop from this
+        // column instead of string-matching the `[stopped…]` marker in `content`.
+        // NULL for a normal turn. Added via ALTER so existing rows upgrade in place.
+        conn.execute_batch("ALTER TABLE messages ADD COLUMN stop_reason TEXT;")?;
+        conn.pragma_update(None, "user_version", 9)?;
+    }
     Ok(())
 }
 
@@ -1146,6 +1175,9 @@ fn row_to_message(row: &rusqlite::Row) -> rusqlite::Result<Message> {
         tool_call_id: row.get("tool_call_id")?,
         attachments: attachments.and_then(|s| serde_json::from_str(&s).ok()),
         reasoning: row.get("reasoning")?,
+        stop_reason: row
+            .get::<_, Option<String>>("stop_reason")?
+            .and_then(|s| StopReason::from_wire(&s)),
         author_name: row.get("author_name")?,
         created_at: row.get("created_at")?,
     })
@@ -1478,7 +1510,7 @@ mod tests {
             .unwrap()
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 8);
+        assert_eq!(version, 9);
     }
 
     #[test]
@@ -1599,7 +1631,7 @@ mod tests {
             .unwrap()
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 8);
+        assert_eq!(version, 9);
     }
 
     #[test]
@@ -1650,7 +1682,7 @@ mod tests {
             .unwrap()
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 8);
+        assert_eq!(version, 9);
     }
 
     #[test]
@@ -2027,7 +2059,81 @@ mod tests {
             .unwrap()
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 8);
+        assert_eq!(version, 9);
+    }
+
+    #[test]
+    fn migration_v7_to_v9_preserves_messages_and_adds_stop_reason() {
+        // A v7 database (pre-#657/#658) must gain both the author_name (v8) and
+        // stop_reason (v9) columns on open
+        // without losing existing rows, and old rows read back with stop_reason =
+        // None -- the read-time classifier is their only fallback.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sessions.db");
+        let sid = "sess-1";
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE sessions (
+                     id TEXT PRIMARY KEY, goal TEXT, title TEXT, summary TEXT,
+                     status TEXT NOT NULL, created_at INTEGER NOT NULL,
+                     updated_at INTEGER NOT NULL, phenotype TEXT, mode TEXT,
+                     workspace TEXT, model TEXT, mcp_servers TEXT
+                 );
+                 CREATE TABLE messages (
+                     id TEXT PRIMARY KEY, session_id TEXT NOT NULL, seq INTEGER NOT NULL,
+                     role TEXT NOT NULL, content TEXT NOT NULL, tool_calls TEXT,
+                     tool_call_id TEXT, attachments TEXT, reasoning TEXT,
+                     created_at INTEGER NOT NULL
+                 );",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO sessions (id, status, created_at, updated_at)
+                 VALUES (?1, 'active', 0, 0)",
+                params![sid],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO messages (id, session_id, seq, role, content, created_at)
+                 VALUES ('m1', ?1, 0, 'assistant', '[stopped]', 0)",
+                params![sid],
+            )
+            .unwrap();
+            conn.pragma_update(None, "user_version", 7).unwrap();
+        }
+
+        let store = SessionStore::open(&path).unwrap();
+        // The pre-existing v7 row survives the ALTER with a NULL stop_reason.
+        let msgs = store.get_messages(sid);
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].content, "[stopped]");
+        assert!(msgs[0].stop_reason.is_none());
+
+        // ...and the new column is writable post-upgrade, round-tripping the variant.
+        store.set_message_stop_reason(&msgs[0].id, sid, StopReason::ToolLimit);
+        let reloaded = store.get_messages(sid);
+        assert_eq!(reloaded[0].stop_reason, Some(StopReason::ToolLimit));
+
+        let version: i64 = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 9);
+    }
+
+    #[test]
+    fn fork_session_copies_stop_reason() {
+        let store = SessionStore::new();
+        let s = store.create_session(None);
+        let m = store.add_message(&s.id, Role::Assistant, "[stopped]".into());
+        store.set_message_stop_reason(&m.id, &s.id, StopReason::Cancelled);
+
+        let forked = store.fork_session(&s.id).unwrap();
+        let msgs = store.get_messages(&forked.id);
+        assert_eq!(msgs[0].stop_reason, Some(StopReason::Cancelled));
     }
 
     // --- SQLite-backed persistence (RFC 0012 / #276) ---
@@ -2177,7 +2283,7 @@ mod tests {
             .unwrap()
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 8);
+        assert_eq!(version, 9);
     }
 
     #[test]
