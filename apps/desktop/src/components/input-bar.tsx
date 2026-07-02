@@ -325,7 +325,7 @@ export function InputBar({
 
   return (
     <div className="px-4 pb-4 pt-2">
-      <div className="mx-auto flex max-w-3xl flex-col gap-2">
+      <div className="mx-auto flex max-w-4xl flex-col gap-2">
         {/* Primary composer card: textarea + mode/model/attach + send/stop. The
             workspace + branch live in a separate bar below (#606). */}
         <div
