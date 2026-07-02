@@ -127,6 +127,7 @@ describe("model-config reasoning controls", () => {
     useModelConfigStore.setState({
       summarizationThreshold: 300_000,
       registry: {
+        schemaVersion: 1,
         active: "ollama",
         connections: [
           {
@@ -266,6 +267,31 @@ describe("model-config registry (mock IPC)", () => {
         .getState()
         .registry?.connections.find((c) => c.id === "ollama")?.warmupEnabled,
     ).toBe(false);
+  });
+
+  it("addConnection defaults reasoning off for a new local connection (#633)", async () => {
+    const { load, addConnection } = useModelConfigStore.getState();
+    await load();
+    await addConnection("ollama");
+    // Survives a fresh reload (persisted default, not just optimistic state).
+    useModelConfigStore.setState({ registry: null });
+    await useModelConfigStore.getState().load();
+    const ollama = useModelConfigStore
+      .getState()
+      .registry?.connections.find((c) => c.kind === "ollama");
+    expect(ollama?.thinking).toBe(false);
+  });
+
+  it("addConnection defaults reasoning on for a new hosted connection (#633)", async () => {
+    const { load, addConnection } = useModelConfigStore.getState();
+    await load();
+    await addConnection("openai");
+    useModelConfigStore.setState({ registry: null });
+    await useModelConfigStore.getState().load();
+    const openai = useModelConfigStore
+      .getState()
+      .registry?.connections.find((c) => c.kind === "openai");
+    expect(openai?.thinking).toBe(true);
   });
 
   it("picking a default model also activates that connection", async () => {

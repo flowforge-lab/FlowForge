@@ -167,6 +167,17 @@ impl ProviderKind {
     pub fn is_local(self) -> bool {
         matches!(self, ProviderKind::CandleVllm | ProviderKind::Ollama)
     }
+
+    /// The out-of-box `thinking` default for a *fresh* connection of this kind
+    /// (#633). Local kinds (candle-vLLM / Ollama) default reasoning **off**:
+    /// hybrid-thinking models emit reasoning tokens before every answer, the
+    /// dominant per-turn latency cost on local hardware, so fresh local
+    /// connections are fast out of the box; the user re-enables per-connection
+    /// via the model-picker / Settings Thinking toggle (#640) for hard tasks.
+    /// Hosted kinds default **on** -- they don't carry that local latency cost.
+    pub fn default_thinking(self) -> bool {
+        !self.is_local()
+    }
 }
 
 /// How a Bedrock connection authenticates. Every mode resolves credentials
@@ -290,7 +301,7 @@ impl Default for ProviderConfig {
             base_url: None,
             model: "Qwen3-4B-Instruct-2507".to_string(),
             has_key: false,
-            thinking: true,
+            thinking: ProviderKind::CandleVllm.default_thinking(),
             reasoning_effort: ReasoningEffort::default(),
             reasoning_visibility: ReasoningVisibility::default(),
             warmup_enabled: true,
@@ -438,6 +449,12 @@ pub struct ProviderRegistry {
     /// Id of the connection [`build_provider`](crate) resolves against. Always
     /// references one of `connections`.
     pub active: ConnectionId,
+    /// Registry schema version, bumped when a persisted-shape migration must run
+    /// exactly once on load (see [`ProviderRegistry::migrate`]). `#[serde(default)]`
+    /// makes a pre-versioning `provider-registry.json` load as `0`, which triggers
+    /// the pending migrations. Backend-internal; the frontend ignores it.
+    #[serde(default)]
+    pub schema_version: u32,
 }
 
 /// A resolved `(connection, model)` pair -- the unit of model selection at every
@@ -592,6 +609,36 @@ fn slugify(s: &str) -> String {
     }
 }
 
+/// Current [`ProviderRegistry`] schema version. Bump when adding a one-time
+/// on-load migration; a persisted registry with a lower `schema_version` runs the
+/// pending migrations in [`ProviderRegistry::migrate`].
+///
+/// - `1` (#633): default reasoning/thinking **off** for local connections and
+///   flip existing local connections once, so fresh installs are fast on local
+///   models and pre-#633 connections stop behaving differently from new ones.
+pub const REGISTRY_SCHEMA_VERSION: u32 = 1;
+
+impl ProviderRegistry {
+    /// Apply any pending one-time migrations to a loaded registry, in memory. Called
+    /// on the load path; the bumped `schema_version` (and any flipped values) persist
+    /// on the next registry mutation via the lazy-save path -- construction itself
+    /// never writes (a contract the load tests assert). Idempotent: a registry
+    /// already at [`REGISTRY_SCHEMA_VERSION`] is left untouched, so a user who
+    /// re-enables thinking after the migration is never re-flipped.
+    pub fn migrate(&mut self) {
+        if self.schema_version < 1 {
+            // #633: local reasoning defaults off. Flip existing local connections
+            // once so they match fresh ones; hosted connections keep their value.
+            for conn in &mut self.connections {
+                if conn.kind.is_local() {
+                    conn.thinking = false;
+                }
+            }
+        }
+        self.schema_version = REGISTRY_SCHEMA_VERSION;
+    }
+}
+
 /// FlowForge's out-of-the-box registry: local candle-vLLM (active) plus a ready
 /// keyless Ollama, so the user can switch between the two local backends with no
 /// setup.
@@ -606,7 +653,7 @@ impl Default for ProviderRegistry {
             model: "Qwen3-4B-Instruct-2507".to_string(),
             has_key: false,
             secret_missing: false,
-            thinking: true,
+            thinking: ProviderKind::CandleVllm.default_thinking(),
             reasoning_effort: ReasoningEffort::default(),
             reasoning_visibility: ReasoningVisibility::default(),
             warmup_enabled: true,
@@ -624,7 +671,7 @@ impl Default for ProviderRegistry {
             model: "llama3.2".to_string(),
             has_key: false,
             secret_missing: false,
-            thinking: true,
+            thinking: ProviderKind::Ollama.default_thinking(),
             reasoning_effort: ReasoningEffort::default(),
             reasoning_visibility: ReasoningVisibility::default(),
             warmup_enabled: true,
@@ -636,6 +683,7 @@ impl Default for ProviderRegistry {
         Self {
             active: candle.id.clone(),
             connections: vec![candle, ollama],
+            schema_version: REGISTRY_SCHEMA_VERSION,
         }
     }
 }
@@ -659,6 +707,77 @@ mod tests {
         assert!(!ProviderKind::Bedrock.is_local());
         assert!(!ProviderKind::OpenAi.is_local());
         assert!(!ProviderKind::SiliconFlow.is_local());
+    }
+
+    #[test]
+    fn default_thinking_off_for_local_on_for_hosted() {
+        assert!(!ProviderKind::CandleVllm.default_thinking());
+        assert!(!ProviderKind::Ollama.default_thinking());
+        assert!(ProviderKind::Bedrock.default_thinking());
+        assert!(ProviderKind::OpenAi.default_thinking());
+        assert!(ProviderKind::SiliconFlow.default_thinking());
+    }
+
+    #[test]
+    fn default_config_thinking_off_for_local() {
+        assert!(!ProviderConfig::default().thinking);
+    }
+
+    #[test]
+    fn default_registry_seeds_local_thinking_off() {
+        let reg = ProviderRegistry::default();
+        assert_eq!(reg.schema_version, REGISTRY_SCHEMA_VERSION);
+        for conn in &reg.connections {
+            assert!(conn.kind.is_local());
+            assert!(
+                !conn.thinking,
+                "seeded local connection {} should default thinking off",
+                conn.id
+            );
+        }
+    }
+
+    #[test]
+    fn migrate_flips_existing_local_thinking_off_and_stamps_version() {
+        let mut reg = ProviderRegistry {
+            active: "ollama".to_string(),
+            connections: vec![blank_conn("Ollama", None, ProviderKind::Ollama)],
+            schema_version: 0,
+        };
+        reg.connections[0].thinking = true;
+        reg.migrate();
+        assert_eq!(reg.schema_version, REGISTRY_SCHEMA_VERSION);
+        assert!(!reg.connections[0].thinking);
+    }
+
+    #[test]
+    fn migrate_leaves_hosted_thinking_untouched() {
+        let mut reg = ProviderRegistry {
+            active: "bedrock".to_string(),
+            connections: vec![blank_conn("AWS Bedrock", None, ProviderKind::Bedrock)],
+            schema_version: 0,
+        };
+        reg.connections[0].thinking = true;
+        reg.migrate();
+        assert!(
+            reg.connections[0].thinking,
+            "hosted connection thinking must survive migration"
+        );
+    }
+
+    #[test]
+    fn migrate_is_run_once_reenabled_local_thinking_survives() {
+        let mut reg = ProviderRegistry {
+            active: "ollama".to_string(),
+            connections: vec![blank_conn("Ollama", None, ProviderKind::Ollama)],
+            schema_version: REGISTRY_SCHEMA_VERSION,
+        };
+        reg.connections[0].thinking = true;
+        reg.migrate();
+        assert!(
+            reg.connections[0].thinking,
+            "already-migrated registry must not re-flip a re-enabled local connection"
+        );
     }
 
     #[test]
@@ -776,6 +895,7 @@ mod tests {
         let reg = ProviderRegistry {
             connections: vec![],
             active: String::new(),
+            schema_version: REGISTRY_SCHEMA_VERSION,
         };
         assert_eq!(
             reg.derive_id(&blank_conn(

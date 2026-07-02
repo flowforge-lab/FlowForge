@@ -396,7 +396,7 @@ fn load_or_migrate_registry_at(
     reg_path: Option<PathBuf>,
     cfg_path: Option<PathBuf>,
 ) -> ProviderRegistry {
-    let registry = match read_registry_file(reg_path.as_deref()) {
+    let mut registry = match read_registry_file(reg_path.as_deref()) {
         RegistryRead::Loaded(registry) => registry,
         // Only a genuinely absent registry falls through to legacy migration; a
         // quarantined (corrupt) one seeds a clean default so stale legacy state is
@@ -409,6 +409,10 @@ fn load_or_migrate_registry_at(
             .unwrap_or_default(),
         RegistryRead::Corrupt => ProviderRegistry::default(),
     };
+    // Run any pending one-time migrations in memory (#633 local-thinking flip);
+    // the bumped schema_version persists on the next mutation via lazy save, so
+    // construction stays write-free (asserted by the load tests below).
+    registry.migrate();
     registry
 }
 
@@ -426,6 +430,9 @@ fn build_migrated_registry(config: ProviderConfig) -> ProviderRegistry {
     ProviderRegistry {
         active: active.id,
         connections,
+        // Legacy `provider.json` predates #633; `schema_version: 0` lets the
+        // load-path migration flip its local connection's thinking default off.
+        schema_version: 0,
     }
 }
 
@@ -3454,8 +3461,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let reg_path = tmp.path().join("provider-registry.json");
         let cfg_path = tmp.path().join("provider.json");
-        // A registry file with a single ollama connection.
-        let existing = ProviderRegistry {
+        // A pre-#633 registry file (schema_version 0) with a single ollama
+        // connection stored thinking-on -- the old universal default.
+        let on_disk = ProviderRegistry {
             active: "ollama".into(),
             connections: vec![ProviderConnection {
                 id: "ollama".into(),
@@ -3475,8 +3483,9 @@ mod tests {
                 aws_profile: None,
                 access_key_id: None,
             }],
+            schema_version: 0,
         };
-        fs::write(&reg_path, serde_json::to_string(&existing).unwrap()).unwrap();
+        fs::write(&reg_path, serde_json::to_string(&on_disk).unwrap()).unwrap();
         // A legacy config that must be ignored when the registry file exists.
         fs::write(
             &cfg_path,
@@ -3484,7 +3493,16 @@ mod tests {
         )
         .unwrap();
         let loaded = load_or_migrate_registry_at(Some(reg_path), Some(cfg_path));
-        assert_eq!(loaded, existing);
+        // The registry file wins over the legacy config (model preserved)...
+        assert_eq!(loaded.active, "ollama");
+        assert_eq!(loaded.active_connection().unwrap().model, "saved");
+        // ...and the #633 migration flips the local connection off + stamps the
+        // current schema version.
+        assert!(!loaded.active_connection().unwrap().thinking);
+        assert_eq!(
+            loaded.schema_version,
+            ProviderRegistry::default().schema_version
+        );
     }
 
     #[test]
@@ -3503,6 +3521,12 @@ mod tests {
         let loaded = load_or_migrate_registry_at(Some(reg_path.clone()), Some(cfg_path));
         assert_eq!(loaded.active, "ollama");
         assert_eq!(loaded.active_connection().unwrap().model, "legacy");
+        // #633: a migrated legacy local connection also lands thinking-off.
+        assert!(!loaded.active_connection().unwrap().thinking);
+        assert_eq!(
+            loaded.schema_version,
+            ProviderRegistry::default().schema_version
+        );
         // Pure load: migration does not write the registry file (lazy persist).
         assert!(!reg_path.exists());
     }
@@ -3692,6 +3716,7 @@ mod tests {
                     access_key_id: None,
                 },
             ],
+            schema_version: 0,
         };
         // Per-connection upsert of an existing id edits in place, keeps the sibling.
         reg.upsert(ProviderConnection {

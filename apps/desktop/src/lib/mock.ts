@@ -458,6 +458,7 @@ export class MockIpc implements FfIpc {
   // AWS Bedrock connection (#202 PR-3b) so the provider-card surface and the
   // Bedrock credentials form are exercisable offline. Persistence is in-memory.
   private registry: ProviderRegistry = {
+    schemaVersion: 1,
     active: "candle-vllm",
     connections: [
       {
@@ -467,7 +468,7 @@ export class MockIpc implements FfIpc {
         model: "Qwen3-4B-Instruct-2507",
         hasKey: false,
         secretMissing: false,
-        thinking: true,
+        thinking: false,
         reasoningEffort: "medium",
         reasoningVisibility: "all",
         warmupEnabled: true,
@@ -479,7 +480,7 @@ export class MockIpc implements FfIpc {
         model: "llama3.2",
         hasKey: false,
         secretMissing: false,
-        thinking: true,
+        thinking: false,
         reasoningEffort: "medium",
         reasoningVisibility: "all",
         warmupEnabled: true,
@@ -1074,6 +1075,7 @@ export class MockIpc implements FfIpc {
 
   private cloneRegistry(): ProviderRegistry {
     return {
+      schemaVersion: this.registry.schemaVersion,
       active: this.registry.active,
       connections: this.registry.connections.map((c) => ({ ...c })),
     };

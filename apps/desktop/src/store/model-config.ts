@@ -46,7 +46,10 @@ function defaultConnection(kind: ProviderKind): ProviderConnection {
     model: "",
     hasKey: false,
     secretMissing: false,
-    thinking: true,
+    // Local kinds default reasoning off (#633) -- fast out of the box on local
+    // hardware; mirrors the Rust `ProviderKind::default_thinking`. Re-enable per
+    // connection via the model-picker / Settings Thinking toggle (#640).
+    thinking: !isLocalKind(kind),
     reasoningEffort: "medium",
     reasoningVisibility: "all",
     warmupEnabled: true,
