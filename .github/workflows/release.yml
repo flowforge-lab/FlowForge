@@ -99,7 +99,7 @@ jobs:
         # .deb/.rpm/.AppImage, Windows NSIS -setup.exe + .msi.
         include:
           - platform: macos-14
-            args: ''
+            args: '--target universal-apple-darwin'
             cache-prefix: release-desktop-aarch64
           - platform: ubuntu-latest
             args: ''
