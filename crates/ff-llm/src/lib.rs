@@ -686,6 +686,17 @@ pub trait Provider: Send + Sync {
     ///
     /// The default works for any streaming provider; `model` is the id the
     /// server expects (local backends generally ignore it).
+    /// Decode steps `warmup` drains before dropping the stream. The default 32 is
+    /// candle-vLLM's empirical GPU-clock ramp on Apple Silicon (#55): fewer leaves
+    /// the device half-clocked and the first real turn still stalls. Providers whose
+    /// warmth is residency-based rather than clock-based override this to a light
+    /// touch -- Ollama keeps the model resident via `keep_alive` (#634), so a single
+    /// chunk already confirms the load started and resets the TTL; draining 32 tokens
+    /// there is pure waste (#61).
+    fn warmup_ramp_steps(&self) -> u8 {
+        32
+    }
+
     async fn warmup(&self, model: &str) -> Result<(), LlmError> {
         let req = ChatRequest {
             model: model.to_string(),
@@ -695,11 +706,11 @@ pub trait Provider: Send + Sync {
             max_tokens: None,
         };
         let mut stream = self.chat_stream(req).await?;
-        // Draining ~32 decode steps is what it empirically takes for an idle
-        // Apple-Silicon GPU to reach its full clock; fewer leaves it half-ramped
-        // and the next real turn still stalls. Dropping the stream at end of
-        // scope aborts the request so the server stops generating early.
-        for _ in 0..32u8 {
+        // Drain the provider's ramp depth (`warmup_ramp_steps`), then drop the
+        // stream at end of scope, which aborts the request so the server stops
+        // generating early. candle-vLLM needs ~32 steps to reach full GPU clock;
+        // Ollama overrides to a light residency touch (#61).
+        for _ in 0..self.warmup_ramp_steps() {
             match stream.next().await {
                 Some(Ok(chunk)) if !chunk.done => continue,
                 _ => break,
@@ -913,10 +924,17 @@ mod tests {
     struct EndlessProvider {
         polled: Arc<AtomicUsize>,
         first_role: Mutex<Option<String>>,
+        // Ramp depth this double reports from `warmup_ramp_steps`, so a test can
+        // assert an override (e.g. Ollama's 1) is honored without a live daemon.
+        ramp: u8,
     }
 
     #[async_trait]
     impl Provider for EndlessProvider {
+        fn warmup_ramp_steps(&self) -> u8 {
+            self.ramp
+        }
+
         async fn chat_stream(&self, req: ChatRequest) -> Result<ChunkStream, LlmError> {
             *self.first_role.lock().unwrap() = req.messages.first().map(|m| m.role.clone());
             let polled = self.polled.clone();
@@ -943,6 +961,7 @@ mod tests {
         let provider = EndlessProvider {
             polled: Arc::new(AtomicUsize::new(0)),
             first_role: Mutex::new(None),
+            ramp: 32,
         };
         provider.test_connection("test-model").await.unwrap();
     }
@@ -952,13 +971,32 @@ mod tests {
         let provider = EndlessProvider {
             polled: Arc::new(AtomicUsize::new(0)),
             first_role: Mutex::new(None),
+            ramp: 32,
         };
         provider.warmup("test-model").await.unwrap();
         assert_eq!(provider.first_role.lock().unwrap().as_deref(), Some("user"));
-        // Bounded: warmup never drains the endless stream.
-        assert!(
-            provider.polled.load(Ordering::SeqCst) <= 32,
-            "warmup drained too many chunks"
+        // Bounded to the default ramp: warmup never drains the endless stream.
+        assert_eq!(
+            provider.polled.load(Ordering::SeqCst),
+            32,
+            "warmup should drain exactly the default ramp depth"
+        );
+    }
+
+    #[tokio::test]
+    async fn warmup_honors_a_shallow_ramp_override() {
+        // A residency-based provider (e.g. Ollama, ramp 1) must drain only its
+        // reported ramp depth, not the candle-vLLM default of 32 (#61).
+        let provider = EndlessProvider {
+            polled: Arc::new(AtomicUsize::new(0)),
+            first_role: Mutex::new(None),
+            ramp: 1,
+        };
+        provider.warmup("test-model").await.unwrap();
+        assert_eq!(
+            provider.polled.load(Ordering::SeqCst),
+            1,
+            "a ramp-1 provider must drain exactly one chunk"
         );
     }
 

@@ -46,16 +46,22 @@ import { useSessionModeStore, MODE_ORDER } from "@/store/session-mode";
 import { useSessionModelStore } from "@/store/session-model";
 import { MODE_META } from "@/lib/mode";
 
-// A local model server (candle-vllm, Ollama, …) clocks its GPU down when idle,
-// so the first token after a pause crawls while the device ramps back up. We
-// nudge it (`ipc.warmup`) while the user interacts with the composer — on focus
-// and as they type — so the device is at full clock by the time they hit send
-// and the first real token streams immediately.
+// A local model server (candle-vllm, Ollama, …) goes cold when idle, so the first
+// token after a pause crawls. We nudge it (`ipc.warmup`) while the user interacts
+// with the composer — on focus and as they type — so it is hot by the time they
+// hit send and the first real token streams immediately.
 //
-// Measured on Apple Silicon: warmth decays ~7-10s after activity, so the
-// throttle sits just under that window. When already warm a nudge is ~0.4s of
-// GPU; cold, it absorbs the ramp the real turn would otherwise pay.
+// candle-vLLM warmth is GPU clock: measured on Apple Silicon it decays ~7-10s
+// after activity, so the throttle sits just under that window to re-warm while
+// typing. When already warm a nudge is ~0.4s of GPU; cold, it absorbs the ramp
+// the real turn would otherwise pay.
 const WARMUP_THROTTLE_MS = 5_000;
+
+// Ollama warmth is model residency held by `keep_alive` (#634, default 30m), not
+// GPU clock, so once the focus-time nudge has (re)loaded the model, repeated
+// keystroke nudges are wasted work. Throttle hard so typing does not re-fire; the
+// occasional focus nudge is enough insurance against eviction (#61).
+const WARMUP_THROTTLE_RESIDENT_MS = 300_000;
 
 // `sessionId` scopes the composer to one session so split panes (#148) each keep
 // an independent draft and Stop/send target their own session. Defaults to the
@@ -249,20 +255,28 @@ export function InputBar({
   // Warmup only helps local backends, and firing it against a hosted endpoint
   // would bill a request on every focus (#61). Also honor the per-connection
   // toggle (off e.g. on laptop battery). The backend gates too (defense in depth).
-  const warmupAllowed = useModelConfigStore((s) => {
+  // Carry the kind through so the throttle can match how the backend goes cold.
+  const warmupKind = useModelConfigStore((s) => {
     const conn = activeConnection(s.registry);
-    return conn ? isLocalKind(conn.kind) && conn.warmupEnabled : false;
+    return conn && isLocalKind(conn.kind) && conn.warmupEnabled
+      ? conn.kind
+      : null;
   });
 
-  // Throttled, fire-and-forget server warmup (see note at top of file).
+  // Throttled, fire-and-forget server warmup (see note at top of file). Ollama is
+  // residency-based, so it re-fires far less often than clock-based candle-vLLM.
   const lastWarmupRef = useRef(0);
   const warmup = useCallback(() => {
-    if (!warmupAllowed) return;
+    if (!warmupKind) return;
+    const throttle =
+      warmupKind === "ollama"
+        ? WARMUP_THROTTLE_RESIDENT_MS
+        : WARMUP_THROTTLE_MS;
     const now = Date.now();
-    if (now - lastWarmupRef.current < WARMUP_THROTTLE_MS) return;
+    if (now - lastWarmupRef.current < throttle) return;
     lastWarmupRef.current = now;
     void ipc.warmup().catch(() => {});
-  }, [warmupAllowed]);
+  }, [warmupKind]);
 
   // Keyboard-native: focus follows the (pane's) session — but only for the
   // focused pane, so background panes don't steal focus on mount.

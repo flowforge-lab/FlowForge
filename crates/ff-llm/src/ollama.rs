@@ -507,6 +507,14 @@ impl Provider for OllamaProvider {
         self.supports_documents
     }
 
+    /// Ollama warmth is residency, not GPU clock: `keep_alive` (#634) holds the
+    /// model in memory, and a warmup ping mainly (re)loads it and resets that TTL.
+    /// One drained chunk confirms the load started, so the candle-vLLM 32-step ramp
+    /// would just burn tokens here (#61).
+    fn warmup_ramp_steps(&self) -> u8 {
+        1
+    }
+
     async fn chat_stream(&self, req: ChatRequest) -> Result<ChunkStream, LlmError> {
         // Strip images without vision and documents without document support;
         // surviving documents are folded into the user message's `content` as
@@ -1445,5 +1453,15 @@ mod tests {
             .await;
         assert_eq!(probe.supports_vision, Some(true));
         assert_eq!(probe.trained, Some(262_144));
+    }
+
+    /// Ollama warmth is residency (`keep_alive`), so warmup is a light reload nudge,
+    /// not the candle-vLLM 32-step GPU-clock ramp (#61).
+    #[test]
+    fn warmup_ramp_is_a_single_residency_touch() {
+        assert_eq!(
+            OllamaProvider::new("http://localhost:11434").warmup_ramp_steps(),
+            1
+        );
     }
 }
