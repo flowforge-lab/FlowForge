@@ -45,6 +45,7 @@ import type { Format } from "../bindings/Format";
 import type { SecretKind } from "../bindings/SecretKind";
 import type { BedrockAuth } from "../bindings/BedrockAuth";
 import type { FfIpc, Unlisten } from "./ipc";
+import { mcpInstanceKey } from "./mcp";
 import type { MarketplaceSkill } from "./marketplace";
 import type { MarketplaceProfile } from "./profile-marketplace";
 import type {
@@ -362,6 +363,25 @@ const MOCK_MCP: McpServerStatus[] = [
     lastError: "spawn npx ENOENT",
     restarts: 5,
   },
+  // Two workspace-scoped instances of one server id (RFC 0018 §4): same `id`,
+  // distinct `scopeKey`. Exercises the per-instance row keying (#608). (Not
+  // `codegraph` — that id must stay absent for the #301 unavailable-server fixture.)
+  {
+    id: "ripgrep",
+    state: "running",
+    toolCount: 2,
+    restarts: 0,
+    pid: 4244,
+    scopeKey: "flowforge",
+  },
+  {
+    id: "ripgrep",
+    state: "running",
+    toolCount: 2,
+    restarts: 0,
+    pid: 4245,
+    scopeKey: "other-repo",
+  },
 ];
 
 interface ActiveTurn {
@@ -654,9 +674,11 @@ export class MockIpc implements FfIpc {
   // session inherits the phenotype/global tiers; see resolveModelSelection.
   private sessionModelSelections = new Map<string, ModelSelection>();
 
-  // MCP server statuses, keyed by id (mutated by enable/disable/restart/add/remove).
+  // MCP server statuses, keyed by per-instance key (id + workspace scope, RFC 0018)
+  // so two workspace-scoped instances of one id don't collapse (#608). Mutated by
+  // enable/disable/restart/add/remove.
   private mcpServers = new Map<string, McpServerStatus>(
-    MOCK_MCP.map((s) => [s.id, { ...s }]),
+    MOCK_MCP.map((s) => [mcpInstanceKey(s), { ...s }]),
   );
   private mcpStatusListeners = new Set<Listener<McpStatusChangedEvent>>();
   private memoryFlushedListeners = new Set<Listener<MemoryFlushedEvent>>();
@@ -967,7 +989,7 @@ export class MockIpc implements FfIpc {
 
   async listMcpServers(): Promise<McpServerStatus[]> {
     return [...this.mcpServers.values()]
-      .sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))
+      .sort((a, b) => mcpInstanceKey(a).localeCompare(mcpInstanceKey(b)))
       .map((s) => ({ ...s }));
   }
 
@@ -2243,7 +2265,7 @@ Shipping the Settings redesign — currently the Memory browser (SET.8).
   private emitMcpStatusChanged(): void {
     this.emit(this.mcpStatusListeners, {
       servers: [...this.mcpServers.values()]
-        .sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))
+        .sort((a, b) => mcpInstanceKey(a).localeCompare(mcpInstanceKey(b)))
         .map((s) => ({ ...s })),
     });
   }
