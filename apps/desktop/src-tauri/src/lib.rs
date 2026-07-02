@@ -265,6 +265,15 @@ fn list_sessions(state: State<'_, Arc<AppState>>) -> Vec<Session> {
 
 #[tauri::command]
 fn get_messages(state: State<'_, Arc<AppState>>, session_id: String) -> Vec<Message> {
+    // Reconcile orphaned empty assistant rows left by a hard kill (SIGKILL /
+    // panic=abort), which runs no Drop guard (#646). Skip while a turn is live:
+    // that session's reserved tail row is a legitimate transient, and the
+    // AssistantRowGuard covers its graceful drop.
+    if !state.has_active_turn(&session_id) {
+        state
+            .store
+            .reconcile_orphaned_assistant_rows(&session_id, ff_agent::INTERRUPTED_NOTICE);
+    }
     state.store.get_messages(&session_id)
 }
 

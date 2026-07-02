@@ -567,6 +567,26 @@ impl SessionStore {
         }
     }
 
+    /// Relabel orphaned empty assistant rows with `notice`, returning how many
+    /// were changed. An orphan is an assistant row with empty content, no tool
+    /// calls, and no reasoning -- the row the agent loop reserves up front for
+    /// token routing but never finalized because the turn was interrupted by a
+    /// hard kill (SIGKILL / panic=abort), which runs no `Drop` guard (#646).
+    ///
+    /// Call this only when no turn is live for the session (checked by the caller),
+    /// since a live turn's reserved tail row is a legitimate transient orphan.
+    pub fn reconcile_orphaned_assistant_rows(&self, session_id: &str, notice: &str) -> usize {
+        let ts = now_ms();
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE messages SET content = ?1, created_at = ?2
+             WHERE session_id = ?3 AND role = 'assistant'
+               AND content = '' AND tool_calls IS NULL AND reasoning IS NULL",
+            params![notice, ts, session_id],
+        )
+        .unwrap_or(0)
+    }
+
     /// Attach tool calls to an already-reserved assistant message (the one whose
     /// id was handed out for token routing).
     pub fn attach_tool_calls(&self, message_id: &str, session_id: &str, tool_calls: Vec<ToolCall>) {
@@ -1247,6 +1267,54 @@ mod tests {
         let forked = store.fork_session(&s.id).unwrap();
         let msgs = store.get_messages(&forked.id);
         assert_eq!(msgs[0].attachments.as_deref(), Some([att].as_slice()));
+    }
+
+    #[test]
+    fn reconcile_relabels_orphaned_empty_assistant_row() {
+        let store = SessionStore::new();
+        let s = store.create_session(None);
+        store.add_message(&s.id, Role::User, "hi".into());
+        // The row the agent loop reserves and never finalizes.
+        store.add_message(&s.id, Role::Assistant, String::new());
+
+        let changed = store.reconcile_orphaned_assistant_rows(&s.id, "[stopped: interrupted]");
+        assert_eq!(changed, 1);
+        let msgs = store.get_messages(&s.id);
+        assert_eq!(msgs[1].content, "[stopped: interrupted]");
+    }
+
+    #[test]
+    fn reconcile_leaves_non_orphan_rows_untouched() {
+        let store = SessionStore::new();
+        let s = store.create_session(None);
+        // A normal answer.
+        store.add_message(&s.id, Role::Assistant, "real answer".into());
+        // A tool-call-only row (empty content but legitimately carries tool calls).
+        let tc = store.add_message(&s.id, Role::Assistant, String::new());
+        store.attach_tool_calls(
+            &tc.id,
+            &s.id,
+            vec![ToolCall {
+                id: "call_1".into(),
+                name: "view".into(),
+                arguments: "{}".into(),
+            }],
+        );
+        // A reasoning-only reserved row (mid-stream: CoT arrived before content).
+        let r = store.add_message(&s.id, Role::Assistant, String::new());
+        store.set_message_reasoning(&r.id, &s.id, "thinking");
+        // An empty user row must never be relabeled.
+        store.add_message(&s.id, Role::User, String::new());
+
+        let changed = store.reconcile_orphaned_assistant_rows(&s.id, "[stopped: interrupted]");
+        assert_eq!(changed, 0, "no genuine orphan present");
+        let msgs = store.get_messages(&s.id);
+        assert_eq!(msgs[0].content, "real answer");
+        assert_eq!(msgs[1].content, "");
+        assert!(msgs[1].tool_calls.is_some());
+        assert_eq!(msgs[2].content, "");
+        assert_eq!(msgs[2].reasoning.as_deref(), Some("thinking"));
+        assert_eq!(msgs[3].content, "");
     }
 
     #[test]

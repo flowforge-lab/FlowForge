@@ -630,6 +630,63 @@ impl Drop for ToolResultBackfill<'_> {
     }
 }
 
+/// Notice written to a reserved-but-unfinalized assistant row when its turn is
+/// interrupted mid-flight. Shares the `[stopped: ...]` vocabulary with the
+/// in-loop terminal notices (empty-response / tool-call limit / cancel).
+pub const INTERRUPTED_NOTICE: &str = "[stopped: interrupted]";
+
+/// RAII guard for the assistant message row reserved at the top of each loop
+/// iteration. The row is created empty (so the frontend can route streaming
+/// tokens) *before* the provider is called; if the `run_turn` future is dropped
+/// mid-iteration (window closed, superseding turn, runtime teardown) before the
+/// row is finalized with content, tool calls, or a terminal notice, the empty
+/// row would otherwise survive as a silent blank assistant bubble (#646).
+///
+/// Mirrors [`ToolResultBackfill`]: seeded per iteration, [`finalize`](Self::finalize)d
+/// on every normal exit path (content set, tool calls attached, or a break/return
+/// that hands off to the post-loop notice), and on `Drop` writes
+/// [`INTERRUPTED_NOTICE`] only when still unfinalized. The store call is
+/// synchronous, so a plain `Drop` impl suffices. This covers the *graceful* drop;
+/// a hard kill (SIGKILL / panic=abort) runs no `Drop`, so session load reconciles
+/// any orphan left behind (see the desktop `get_messages` sweep).
+struct AssistantRowGuard<'a> {
+    store: &'a SessionStore,
+    session_id: &'a str,
+    message_id: String,
+    finalized: bool,
+}
+
+impl<'a> AssistantRowGuard<'a> {
+    fn new(store: &'a SessionStore, session_id: &'a str, message_id: String) -> Self {
+        Self {
+            store,
+            session_id,
+            message_id,
+            finalized: false,
+        }
+    }
+
+    /// Mark the row as durably resolved: it now carries content, tool calls, or is
+    /// about to be finalized by the post-loop notice path. Suppresses the drop-time
+    /// interrupted notice so it never clobbers a more accurate terminal message.
+    fn finalize(&mut self) {
+        self.finalized = true;
+    }
+}
+
+impl Drop for AssistantRowGuard<'_> {
+    fn drop(&mut self) {
+        if self.finalized {
+            return;
+        }
+        self.store.set_message_content(
+            &self.message_id,
+            self.session_id,
+            INTERRUPTED_NOTICE.to_string(),
+        );
+    }
+}
+
 /// Whether a given loop iteration should request model reasoning (#D1, widened
 /// in #549). Driven by [`ReasoningVisibility`]:
 /// - [`WrapUp`](ReasoningVisibility::WrapUp): the **first** iteration (initial
@@ -970,6 +1027,13 @@ pub async fn run_turn(
             .add_message(session_id, Role::Assistant, String::new())
             .id;
 
+        // Drop-safe finalize (#646): the row above is persisted empty so streaming
+        // tokens have a home. If the turn future is dropped before the row is
+        // finalized with content, tool calls, or a terminal notice, this guard
+        // backfills an interrupted notice on Drop so the row is never a silent
+        // blank bubble. `finalize()` disarms it on every normal exit path.
+        let mut row_guard = AssistantRowGuard::new(store, session_id, message_id.clone());
+
         // Provenance for a flush that ran at the top of this iteration (#283): now
         // that the turn's assistant message id exists, correlate the event with it.
         if let Some(writes) = flushed_writes {
@@ -1084,6 +1148,10 @@ pub async fn run_turn(
                     on_event(AgentEvent::Error {
                         message: e.to_string(),
                     });
+                    // Fatal provider error: the Error event above already tells the
+                    // user why the turn ended. Disarm so the guard does not overwrite
+                    // the reserved row with a redundant interrupted notice (#646).
+                    row_guard.finalize();
                     return Err(e.into());
                 }
             };
@@ -1168,6 +1236,10 @@ pub async fn run_turn(
                     on_event(AgentEvent::Error {
                         message: e.to_string(),
                     });
+                    // Fatal provider error: the Error event above already tells the
+                    // user why the turn ended. Disarm so the guard does not overwrite
+                    // the reserved row with a redundant interrupted notice (#646).
+                    row_guard.finalize();
                     return Err(e.into());
                 }
                 // A clean stream that produced neither text nor a tool call is a provider
@@ -1199,6 +1271,11 @@ pub async fn run_turn(
         }
         let final_text = acc.clone();
         let finalized = store.set_message_content(&message_id, session_id, acc);
+        // The row is now committed (content, or an empty body that a subsequent
+        // break hands to the post-loop notice, or tool calls attached just below).
+        // Every path from here reaches a proper terminal state, so disarm the
+        // drop-time interrupted backfill (#646).
+        row_guard.finalize();
 
         // No tool calls -> this is the final text answer.
         if calls.is_empty() {
@@ -3613,6 +3690,76 @@ mod tests {
                 "dropped turn left tool_use {id} without a result"
             );
         }
+    }
+
+    /// Dropping the `run_turn` future *after* the per-iteration assistant row is
+    /// reserved but *before* any completion must not leave a silent empty bubble
+    /// (#646). The row is created empty at the top of the loop so streaming tokens
+    /// have a home; if the future is abandoned while the provider stream is still
+    /// pending, the `AssistantRowGuard` backfills an interrupted notice on Drop.
+    #[tokio::test]
+    async fn dropped_future_backfills_interrupted_notice_on_empty_row() {
+        use std::future::Future;
+        use std::task::{Context, Poll};
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::new();
+        let s = store.create_session(None);
+        store.add_message(&s.id, Role::User, "hello".into());
+        let registry = ToolRegistry::with_defaults();
+
+        // A provider whose stream never yields: `run_turn` reserves the assistant
+        // row, issues the request, and parks awaiting the first chunk -- exactly the
+        // window between row reservation and `set_message_content`.
+        struct PendingStream;
+        #[async_trait]
+        impl Provider for PendingStream {
+            async fn chat_stream(&self, _req: ChatRequest) -> Result<ChunkStream, LlmError> {
+                Ok(futures_util::stream::pending::<Result<Chunk, LlmError>>().boxed())
+            }
+        }
+
+        let approve = AlwaysApprove;
+        let tool_ctx = ctx(&registry, dir.path(), &approve);
+        let fut = run_turn(
+            &PendingStream,
+            &store,
+            &tool_ctx,
+            &s.id,
+            "mock",
+            None,
+            false,
+            ReasoningVisibility::All,
+            CancelToken::new(),
+            |_| {},
+        );
+
+        // Poll until the turn parks on the pending stream, then drop it.
+        let mut fut = Box::pin(fut);
+        let waker = futures_util::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        for _ in 0..256 {
+            match fut.as_mut().poll(&mut cx) {
+                Poll::Pending => {}
+                Poll::Ready(_) => panic!("turn should park on the pending stream, not complete"),
+            }
+        }
+        drop(fut);
+
+        // The reserved assistant row carries an interrupted notice, not empty content.
+        let history = store.get_messages(&s.id);
+        let assistant = history
+            .iter()
+            .find(|m| m.role == Role::Assistant)
+            .expect("assistant row reserved before the drop");
+        assert_eq!(
+            assistant.content, INTERRUPTED_NOTICE,
+            "dropped turn left a silent empty assistant bubble"
+        );
+        assert!(
+            assistant.tool_calls.is_none(),
+            "no tool calls were made, so none should be attached"
+        );
     }
 
     #[tokio::test]
