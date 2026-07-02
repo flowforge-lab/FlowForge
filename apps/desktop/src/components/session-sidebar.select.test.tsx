@@ -43,42 +43,37 @@ function session(id: string, partial: Partial<Session> = {}): Session {
   };
 }
 
-const dismissedTab = () =>
-  [
-    ...document.querySelectorAll('[aria-label="Session list"] button'),
-  ][1] as HTMLElement;
-
-beforeEach(() => {
-  Object.defineProperty(window, "matchMedia", {
-    writable: true,
-    value: (query: string) => ({
-      matches: query.includes("dark"),
-      media: query,
-      addEventListener: () => {},
-      removeEventListener: () => {},
-    }),
-  });
-  localStorage.clear();
-  usePrefsStore.setState({ sidebarCollapsed: false });
-  usePanesStore.setState({ root: null, focusedPaneId: null });
-  useSessionPrefsStore.setState({ pinned: [], dismissed: [] });
-  useChatStore.setState({
-    sessions: [session("s1"), session("s2"), session("s3")],
-    activeSessionId: "s1",
-    messagesBySession: {},
-    streamingBySession: {},
-    toolStepsByMessage: {},
-    bootstrapError: null,
-  });
-});
-
-afterEach(() => {
-  cleanup();
-  localStorage.clear();
-  vi.restoreAllMocks();
-});
-
 describe("SessionSidebar — multi-select (#643)", () => {
+  beforeEach(() => {
+    Object.defineProperty(window, "matchMedia", {
+      writable: true,
+      value: (query: string) => ({
+        matches: query.includes("dark"),
+        media: query,
+        addEventListener: () => {},
+        removeEventListener: () => {},
+      }),
+    });
+    localStorage.clear();
+    usePrefsStore.setState({ sidebarCollapsed: false });
+    usePanesStore.setState({ root: null, focusedPaneId: null });
+    useSessionPrefsStore.setState({ pinned: [], dismissed: [] });
+    useChatStore.setState({
+      sessions: [session("s1"), session("s2"), session("s3")],
+      activeSessionId: "s1",
+      messagesBySession: {},
+      streamingBySession: {},
+      toolStepsByMessage: {},
+      bootstrapError: null,
+    });
+  });
+
+  afterEach(() => {
+    cleanup();
+    localStorage.clear();
+    vi.restoreAllMocks();
+  });
+
   it("enters and exits select mode from the header toggle", async () => {
     const user = userEvent.setup();
     rtlRender(<SessionSidebar />);
@@ -124,42 +119,22 @@ describe("SessionSidebar — multi-select (#643)", () => {
     expect(screen.getByText("0 selected")).not.toBeNull();
   });
 
-  it("Select-all is scoped to the active tab (Dismissed) and offers Restore", async () => {
+  it("Select-all offers Restore when the whole selection is dismissed", async () => {
     const user = userEvent.setup();
+    // Only s3 is present and it's dismissed → Select-all selects it, and since the
+    // whole selection is dismissed the bulk action reads "Restore" (A1, #667).
+    useChatStore.setState({
+      sessions: [session("s3")],
+      activeSessionId: null,
+    });
     useSessionPrefsStore.setState({ dismissed: ["s3"] });
     rtlRender(<SessionSidebar />);
 
-    await user.click(dismissedTab());
     await user.click(screen.getByLabelText("Select sessions"));
     await user.click(screen.getByLabelText("Select all sessions"));
 
-    // Only the single dismissed session is in scope.
     expect(screen.getByText("1 selected")).not.toBeNull();
     expect(screen.getByRole("button", { name: /Restore/ })).not.toBeNull();
-  });
-
-  it("clears the selection when switching tabs so a later bulk action can't hit off-view sessions (#643 review)", async () => {
-    const user = userEvent.setup();
-    // s3 dismissed so the Dismissed tab is enabled; s1/s2 live in the All tab.
-    useSessionPrefsStore.setState({ dismissed: ["s3"] });
-    const delSpy = vi.spyOn(ipc, "deleteSession").mockResolvedValue();
-    rtlRender(<SessionSidebar />);
-
-    // Select the All-tab sessions, then switch to Dismissed.
-    await user.click(screen.getByLabelText("Select sessions"));
-    await user.click(screen.getByLabelText("Select all sessions"));
-    expect(screen.getByText("2 selected")).not.toBeNull();
-
-    await user.click(dismissedTab());
-    // Selection dropped — still in select mode, but nothing carried across.
-    expect(screen.getByText("0 selected")).not.toBeNull();
-
-    // A bulk Delete now can't touch the previously-selected (off-view) sessions.
-    expect(screen.getByRole("button", { name: /Delete/ })).toHaveProperty(
-      "disabled",
-      true,
-    );
-    expect(delSpy).not.toHaveBeenCalled();
   });
 
   it("clears the selection when the filter changes (#643 review)", async () => {
@@ -194,12 +169,17 @@ describe("SessionSidebar — multi-select (#643)", () => {
     expect(screen.queryByLabelText("Select all sessions")).toBeNull();
   });
 
-  it("bulk Restore un-hides the selection in the Dismissed tab", async () => {
+  it("bulk Restore un-hides the selection of dismissed sessions", async () => {
     const user = userEvent.setup();
+    // s2 + s3 dismissed and no live sessions, so Select-all picks exactly the two
+    // dismissed rows and the action reads Restore (A1, #667).
+    useChatStore.setState({
+      sessions: [session("s2"), session("s3")],
+      activeSessionId: null,
+    });
     useSessionPrefsStore.setState({ dismissed: ["s2", "s3"] });
     rtlRender(<SessionSidebar />);
 
-    await user.click(dismissedTab());
     await user.click(screen.getByLabelText("Select sessions"));
     await user.click(screen.getByLabelText("Select all sessions"));
     await user.click(screen.getByRole("button", { name: /Restore/ }));

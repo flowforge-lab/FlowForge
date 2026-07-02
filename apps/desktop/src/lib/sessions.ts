@@ -30,58 +30,58 @@ export function filterSessions(sessions: Session[], query: string): Session[] {
   );
 }
 
-/** Max unpinned sessions shown before the overflow affordance (#185). */
-export const UNPINNED_SESSION_CAP = 15;
-
-export type SessionListTab = "all" | "dismissed";
+/** How many rows the list grows by per "Show more" click, and the initial
+ *  batch size (#667). One endless, incremental reveal replaced the old
+ *  All/Dismissed tabs + fixed cap. */
+export const SESSION_REVEAL_BATCH = 25;
 
 /**
- * Apply the sidebar's view preferences (#169, #185): All tab hides dismissed;
- * Dismissed tab shows only dismissed. Pinned sessions float to the top. Order
- * within each group is preserved (stable).
+ * Order the full session list for display (#667): pinned first, then the rest of
+ * the non-dismissed sessions, then dismissed sessions last. Order within each of
+ * the three groups is preserved (stable). Dismissed always sink to the bottom
+ * regardless of pin, so a dismissed session never floats above a live one.
  */
 export function arrangeSessions(
   sessions: Session[],
   pinned: ReadonlySet<string>,
   dismissed: ReadonlySet<string>,
-  tab: SessionListTab,
 ): Session[] {
-  return sessions
-    .filter((s) => (tab === "all" ? !dismissed.has(s.id) : dismissed.has(s.id)))
-    .sort((a, b) => Number(pinned.has(b.id)) - Number(pinned.has(a.id)));
+  const rank = (s: Session): number => {
+    if (dismissed.has(s.id)) return 2; // dismissed: always last
+    if (pinned.has(s.id)) return 0; // pinned live: first
+    return 1; // other live
+  };
+  // Stable sort by group rank (Array.prototype.sort is stable), so insertion
+  // order is kept within each group.
+  return [...sessions].sort((a, b) => rank(a) - rank(b));
 }
 
 /**
- * Cap unpinned sessions at {@link UNPINNED_SESSION_CAP} while always showing
- * every pinned session and the active session (#185). Pure view-state helper.
+ * Reveal the first `revealCount` of the arranged list, always keeping the active
+ * session visible even if it falls past the cut (#185 carried forward). The
+ * caller arranges first (pinned → non-dismissed → dismissed) and filters before
+ * this, so batching applies to exactly what the user is looking at (#667).
+ *
+ * `hasMore` is true when arranged rows remain beyond what's shown, driving the
+ * "Show more" affordance. A pure view-state helper.
  */
 export function selectSessionOverflow(
-  sessions: Session[],
-  pinned: ReadonlySet<string>,
+  arranged: Session[],
   activeSessionId: string | null,
-  revealAll: boolean,
-  cap: number = UNPINNED_SESSION_CAP,
-): { visible: Session[]; hiddenCount: number } {
-  if (revealAll) return { visible: sessions, hiddenCount: 0 };
-
-  const visible: Session[] = [];
-  let unpinnedShown = 0;
-  let unpinnedHidden = 0;
-
-  for (const s of sessions) {
-    const isPinned = pinned.has(s.id);
-    const isActive = s.id === activeSessionId;
-    if (isPinned || isActive) {
-      visible.push(s);
-      continue;
-    }
-    if (unpinnedShown < cap) {
-      visible.push(s);
-      unpinnedShown += 1;
-    } else {
-      unpinnedHidden += 1;
-    }
+  revealCount: number,
+): { visible: Session[]; hasMore: boolean } {
+  if (revealCount >= arranged.length) {
+    return { visible: arranged, hasMore: false };
   }
-
-  return { visible, hiddenCount: unpinnedHidden };
+  const head = arranged.slice(0, revealCount);
+  // Pull the active session in even when it sits past the reveal cut, so the
+  // current session is never hidden behind "Show more".
+  if (activeSessionId && !head.some((s) => s.id === activeSessionId)) {
+    const active = arranged.find((s) => s.id === activeSessionId);
+    if (active) head.push(active);
+  }
+  // `hasMore` only when rows still remain hidden after the pulled-in active — so
+  // pulling in the single overflow row (active) doesn't strand a "Show more" that
+  // reveals nothing.
+  return { visible: head, hasMore: head.length < arranged.length };
 }

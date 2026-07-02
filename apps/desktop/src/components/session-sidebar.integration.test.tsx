@@ -180,7 +180,7 @@ describe("SessionSidebar integration (#185)", () => {
     expect(usePanesStore.getState().leafCount()).toBe(MAX_PANES);
   });
 
-  it("switches between All and Dismissed tabs", () => {
+  it("shows non-dismissed sessions and sinks dismissed ones to the bottom (no tabs)", () => {
     useChatStore.setState({
       sessions: [
         session("a", { title: "Active one" }),
@@ -192,21 +192,20 @@ describe("SessionSidebar integration (#185)", () => {
 
     const { container, cleanup } = render(<SessionSidebar />);
 
+    // No All/Dismissed tab row.
+    expect(container.querySelector('[aria-label="Session list"]')).toBeNull();
+    // Both are visible in one list (few enough to be within the first batch);
+    // the dismissed row is dimmed and sinks below the live one.
     expect(container.textContent).toContain("Active one");
-    expect(container.textContent).not.toContain("Dismissed one");
-
-    const dismissedTab = [
-      ...container.querySelectorAll('[aria-label="Session list"] button'),
-    ][1];
-    click(dismissedTab);
-
-    expect(container.textContent).not.toContain("Active one");
     expect(container.textContent).toContain("Dismissed one");
+    const activeIdx = (container.textContent ?? "").indexOf("Active one");
+    const dismissedIdx = (container.textContent ?? "").indexOf("Dismissed one");
+    expect(activeIdx).toBeLessThan(dismissedIdx);
     cleanup();
   });
 
-  it('shows "› N more" when unpinned sessions exceed the cap', () => {
-    const many = Array.from({ length: 20 }, (_, i) =>
+  it('shows "Show more" when sessions exceed the reveal batch and reveals +25', () => {
+    const many = Array.from({ length: 30 }, (_, i) =>
       session(`s${i}`, { title: `Chat ${i}` }),
     );
     useChatStore.setState({
@@ -216,83 +215,107 @@ describe("SessionSidebar integration (#185)", () => {
 
     const { container, cleanup } = render(<SessionSidebar />);
 
-    expect(container.textContent).toContain("Chat 14");
-    expect(container.textContent).toMatch(/›\s*5 more/);
-    expect(container.textContent).not.toContain("Chat 19");
+    // First batch of 25 shows Chat 0..24, not Chat 25+.
+    expect(container.textContent).toContain("Chat 24");
+    expect(container.textContent).toContain("Show more");
+    expect(container.textContent).not.toContain("Chat 29");
 
     const moreBtn = [...container.querySelectorAll("button")].find((b) =>
-      b.textContent?.includes("more"),
+      b.textContent?.includes("Show more"),
     );
     click(moreBtn);
-    expect(container.textContent).toContain("Chat 19");
+    expect(container.textContent).toContain("Chat 29");
     cleanup();
   });
 
-  it("keeps pinned and active sessions visible when overflow is capped", () => {
-    const many = Array.from({ length: 20 }, (_, i) =>
+  it("reveals dismissed sessions once Show more walks past the live ones", () => {
+    const live = Array.from({ length: 30 }, (_, i) =>
+      session(`s${i}`, { title: `Chat ${i}` }),
+    );
+    useChatStore.setState({
+      sessions: [...live, session("z", { title: "Dismissed tail" })],
+      activeSessionId: null,
+    });
+    useSessionPrefsStore.setState({ dismissed: ["z"] });
+
+    const { container, cleanup } = render(<SessionSidebar />);
+    // Dismissed sinks to the bottom, so it's past the first batch of 25.
+    expect(container.textContent).not.toContain("Dismissed tail");
+
+    const moreBtn = () =>
+      [...container.querySelectorAll("button")].find((b) =>
+        b.textContent?.includes("Show more"),
+      );
+    click(moreBtn());
+    expect(container.textContent).toContain("Dismissed tail");
+    cleanup();
+  });
+
+  it("keeps the active session visible even when it falls past the reveal batch", () => {
+    const many = Array.from({ length: 30 }, (_, i) =>
       session(`s${i}`, { title: `Chat ${i}` }),
     );
     useChatStore.setState({
       sessions: many,
-      activeSessionId: "s0",
+      activeSessionId: "s29",
     });
-    useSessionPrefsStore.setState({ pinned: ["s19"] });
 
     const { container, cleanup } = render(<SessionSidebar />);
 
-    expect(container.textContent).toContain("Chat 0");
-    expect(container.textContent).toContain("Chat 19");
-    expect(container.textContent).toMatch(/›\s*3 more/);
-    expect(container.textContent).not.toContain("Chat 18");
+    // s29 would fall past the first 25, but the active session is pulled in.
+    expect(container.textContent).toContain("Chat 29");
+    expect(container.textContent).toContain("Show more");
     cleanup();
   });
 
-  it("the overflow row toggles expanded and collapsed", () => {
-    const many = Array.from({ length: 20 }, (_, i) =>
+  it("Show more then Show less re-compacts to the first batch", () => {
+    const many = Array.from({ length: 30 }, (_, i) =>
       session(`s${i}`, { title: `Chat ${i}` }),
     );
     useChatStore.setState({ sessions: many, activeSessionId: null });
 
     const { container, cleanup } = render(<SessionSidebar />);
-    const overflowBtn = () =>
+    const btn = () =>
       [...container.querySelectorAll("button")].find((b) =>
-        /more|show less/i.test(b.textContent ?? ""),
+        /show more|show less/i.test(b.textContent ?? ""),
       );
 
-    expect(container.textContent).not.toContain("Chat 19");
-    click(overflowBtn());
-    expect(container.textContent).toContain("Chat 19");
+    expect(container.textContent).not.toContain("Chat 29");
+    click(btn()); // Show more → reveals all 30
+    expect(container.textContent).toContain("Chat 29");
     expect(container.textContent).toContain("Show less");
 
-    click(overflowBtn());
-    expect(container.textContent).not.toContain("Chat 19");
+    click(btn()); // Show less → back to first 25
+    expect(container.textContent).not.toContain("Chat 29");
     cleanup();
   });
 
-  it("falls back to All when the last dismissed session is restored on the Dismissed tab", () => {
-    useChatStore.setState({
-      sessions: [
-        session("a", { title: "Active one" }),
-        session("b", { title: "Dismissed one" }),
-      ],
-      activeSessionId: "a",
-    });
-    useSessionPrefsStore.setState({ dismissed: ["b"] });
-
+  it("header has no FlowForge title or theme toggle; keeps select, +, and options", () => {
+    useChatStore.setState({ sessions: [session("a")], activeSessionId: "a" });
     const { container, cleanup } = render(<SessionSidebar />);
-    const dismissedTab = [
-      ...container.querySelectorAll('[aria-label="Session list"] button'),
-    ][1];
-    click(dismissedTab);
-    expect(container.textContent).toContain("Dismissed one");
 
-    // Restoring the only dismissed session disables that tab — the effective tab
-    // falls back to All instead of stranding "No dismissed sessions".
-    act(() => {
-      useSessionPrefsStore.setState({ dismissed: [] });
-    });
-    expect(container.textContent).not.toContain("No dismissed sessions");
-    expect(container.textContent).toContain("Active one");
+    // #667: title text and the theme toggle are gone from the sidebar header.
+    expect(container.textContent).not.toContain("FlowForge");
+    expect(
+      container.querySelector('[title="Switch to dark theme"]'),
+    ).toBeNull();
+    expect(
+      container.querySelector('[title="Switch to light theme"]'),
+    ).toBeNull();
+
+    // The retained controls are present.
+    expect(
+      container.querySelector('[title="Collapse sidebar"]'),
+    ).not.toBeNull();
+    expect(
+      container.querySelector('[aria-label="Select sessions"]'),
+    ).not.toBeNull();
+    expect(
+      container.querySelector('[aria-label="New session"]'),
+    ).not.toBeNull();
+    expect(
+      container.querySelector('[aria-label="Sidebar options"]'),
+    ).not.toBeNull();
     cleanup();
   });
 });

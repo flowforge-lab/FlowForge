@@ -5,7 +5,6 @@ import {
   EyeOff,
   Folder,
   MoreHorizontal,
-  Moon,
   PanelLeft,
   Pencil,
   Pin,
@@ -17,7 +16,6 @@ import {
   SplitSquareHorizontal,
   SplitSquareVertical,
   SquareCheck,
-  Sun,
   Trash2,
   X,
 } from "@/components/ui/icon";
@@ -28,8 +26,7 @@ import { Separator } from "@/components/ui/separator";
 import { cn } from "@/lib/utils";
 import { exportSessionToFile } from "@/lib/export-session";
 import type { Format } from "@/bindings/Format";
-import { resolveEffectiveTheme } from "@/lib/theme";
-import { useTheme, usePrefsStore, clampSidebarWidth } from "@/store/prefs";
+import { usePrefsStore, clampSidebarWidth } from "@/store/prefs";
 import { useSettingsStore } from "@/store/settings";
 import { useChatStore } from "@/store/chat";
 import { useSessionPrefsStore } from "@/store/session-prefs";
@@ -69,9 +66,8 @@ import {
   filterSessions,
   resolveLabel,
   selectSessionOverflow,
+  SESSION_REVEAL_BATCH,
 } from "@/lib/sessions";
-import type { SessionListTab } from "@/lib/sessions";
-import { SegmentedControl } from "@/components/settings/segmented-control";
 import type { Session } from "@/bindings";
 
 // ── Shared menu body ─────────────────────────────────────────────────────────
@@ -545,10 +541,7 @@ export function SessionSidebar() {
       if (id && f) usePanesStore.getState().setPaneSession(f, id);
     });
   }
-  const theme = useTheme((s) => s.theme);
-  const toggleTheme = useTheme((s) => s.toggleTheme);
   const openSettings = useSettingsStore((s) => s.openSettings);
-  const effectiveTheme = resolveEffectiveTheme(theme);
 
   const pinnedIds = useSessionPrefsStore((s) => s.pinned);
   const dismissedIds = useSessionPrefsStore((s) => s.dismissed);
@@ -557,9 +550,11 @@ export function SessionSidebar() {
   const deleteSession = useChatStore((s) => s.deleteSession);
 
   const [filter, setFilter] = useState("");
-  const [listTab, setListTab] = useState<SessionListTab>("all");
   const [showFilter, setShowFilter] = useState(false);
-  const [overflowExpanded, setOverflowExpanded] = useState(false);
+  // How many rows the list reveals; grows by SESSION_REVEAL_BATCH per "Show
+  // more" click. One endless, incremental reveal replaced the All/Dismissed tabs
+  // + fixed cap (#667).
+  const [revealCount, setRevealCount] = useState(SESSION_REVEAL_BATCH);
   const filterRef = useRef<HTMLInputElement>(null);
 
   // Multi-select mode (#643): bulk dismiss/delete across the visible list. State is
@@ -598,29 +593,15 @@ export function SessionSidebar() {
 
   const pinnedSet = new Set(pinnedIds);
   const dismissedSet = new Set(dismissedIds);
-  const dismissedCount = sessions.reduce(
-    (n, s) => n + (dismissedSet.has(s.id) ? 1 : 0),
-    0,
-  );
 
-  // Restoring the last dismissed session disables the Dismissed tab; fall back to
-  // All so a disabled tab is never left selected (stranding "No dismissed sessions").
-  const effectiveTab: SessionListTab =
-    listTab === "dismissed" && dismissedCount === 0 ? "all" : listTab;
-
-  // Switching tab or editing the filter resets the overflow expansion so a stale
-  // "expanded" state can't carry across lists. Done in the handlers (not an effect)
-  // to keep clear of the set-state-in-effect rule. It also drops any selection: a
-  // selection is scoped to the view it was made in, and carrying it across a
-  // tab/filter change would let a bulk Delete remove now off-screen sessions (#643).
-  const switchTab = (next: SessionListTab) => {
-    setListTab(next);
-    setOverflowExpanded(false);
-    setSelected(new Set());
-  };
+  // Editing the filter resets the reveal to the first batch so a fresh search
+  // starts at the top of the matches (batching applies after filtering). It also
+  // drops any selection: a selection is scoped to the view it was made in, and
+  // carrying it across a filter change would let a bulk Delete remove now
+  // off-screen sessions (#643).
   const changeFilter = (next: string) => {
     setFilter(next);
-    setOverflowExpanded(false);
+    setRevealCount(SESSION_REVEAL_BATCH);
     setSelected(new Set());
   };
 
@@ -630,37 +611,36 @@ export function SessionSidebar() {
   const indexById = new Map(sessions.map((s, i) => [s.id, i]));
   const filtering = filter.trim().length > 0;
 
-  const arranged = arrangeSessions(
-    filtered,
-    pinnedSet,
-    dismissedSet,
-    effectiveTab,
-  );
-  const { visible, hiddenCount } = selectSessionOverflow(
+  // Ordered list: pinned → other live → dismissed (dismissed sink to the bottom),
+  // then revealed incrementally (#667). The active session is always kept visible.
+  const arranged = arrangeSessions(filtered, pinnedSet, dismissedSet);
+  const { visible, hasMore } = selectSessionOverflow(
     arranged,
-    pinnedSet,
     activeSessionId,
-    overflowExpanded,
+    revealCount,
   );
-  // Whether overflow exists at all (independent of the current expansion), so the
-  // toggle can offer "show less" once expanded.
-  const hasOverflow =
-    selectSessionOverflow(arranged, pinnedSet, activeSessionId, false)
-      .hiddenCount > 0;
 
-  // Select mode renders the full tab+filter list (no overflow cap) so every
-  // selectable row is on screen and Select-all covers exactly what's shown (#643).
-  const rows = selectMode ? arranged : visible;
-  const arrangedIds = arranged.map((s) => s.id);
+  // Select mode selects over exactly the revealed rows (B1): Select-all covers
+  // what's on screen, and "Show more" still reveals + makes more selectable.
+  const rows = visible;
+  const rowIds = rows.map((s) => s.id);
   const allSelected =
-    arrangedIds.length > 0 && arrangedIds.every((id) => selected.has(id));
+    rowIds.length > 0 && rowIds.every((id) => selected.has(id));
   const toggleSelectAll = () =>
-    setSelected(allSelected ? new Set() : new Set(arrangedIds));
+    setSelected(allSelected ? new Set() : new Set(rowIds));
+  // Label the bulk hide/unhide action for the selection: all-dismissed → Restore,
+  // otherwise Dismiss (a mixed selection dismisses live rows and restores
+  // dismissed ones — see bulkDismiss, A1).
+  const selectedAllDismissed =
+    selected.size > 0 && [...selected].every((id) => dismissedSet.has(id));
 
+  // Bulk actions run per row over the selection (A1): a dismissed row is
+  // restored, a live row is dismissed — so a mixed selection each goes the right
+  // way with no mode to pick.
   const bulkDismiss = () => {
     if (selected.size === 0) return;
     for (const id of selected) {
-      if (effectiveTab === "dismissed") restore(id);
+      if (dismissedSet.has(id)) restore(id);
       else dismiss(id);
     }
     exitSelect();
@@ -698,18 +678,40 @@ export function SessionSidebar() {
         />
       )}
       <div className="flex h-12 items-center justify-between gap-1 px-2">
-        <span className="truncate pl-1 text-sm font-semibold tracking-tight">
-          FlowForge
-        </span>
+        <Button
+          variant="ghost"
+          size="icon"
+          className="size-7 text-muted-foreground hover:text-foreground"
+          onClick={() => setSidebarCollapsed(true)}
+          title="Collapse sidebar"
+        >
+          <PanelLeft className="size-4" />
+        </Button>
         <div className="flex shrink-0 items-center gap-0.5">
           <Button
             variant="ghost"
             size="icon"
-            className="size-7 text-muted-foreground hover:text-foreground"
-            onClick={() => setSidebarCollapsed(true)}
-            title="Collapse sidebar"
+            className={cn(
+              "size-7 text-muted-foreground hover:text-foreground",
+              selectMode && "bg-sidebar-accent text-foreground",
+            )}
+            onClick={() => (selectMode ? exitSelect() : setSelectMode(true))}
+            title="Select sessions"
+            aria-label="Select sessions"
+            aria-pressed={selectMode}
           >
-            <PanelLeft className="size-4" />
+            <SquareCheck className="size-4" />
+          </Button>
+          {/* Primary action — accent-filled so "new session" reads as the
+              prominent control (reference design). */}
+          <Button
+            size="icon"
+            className="size-7 bg-emerald-600 text-white hover:bg-emerald-600/90"
+            onClick={newSessionInFocusedPane}
+            title="New session in split"
+            aria-label="New session"
+          >
+            <Plus className="size-4" />
           </Button>
           <DropdownMenu>
             <DropdownMenuTrigger asChild>
@@ -742,70 +744,12 @@ export function SessionSidebar() {
               </DropdownMenuSub>
             </DropdownMenuContent>
           </DropdownMenu>
-          <Button
-            variant="ghost"
-            size="icon"
-            className={cn(
-              "size-7 text-muted-foreground hover:text-foreground",
-              selectMode && "bg-sidebar-accent text-foreground",
-            )}
-            onClick={() => (selectMode ? exitSelect() : setSelectMode(true))}
-            title="Select sessions"
-            aria-label="Select sessions"
-            aria-pressed={selectMode}
-          >
-            <SquareCheck className="size-4" />
-          </Button>
-          <Button
-            variant="ghost"
-            size="icon"
-            className="size-7 text-muted-foreground hover:text-foreground"
-            onClick={toggleTheme}
-            title={
-              effectiveTheme === "light"
-                ? "Switch to dark theme"
-                : "Switch to light theme"
-            }
-          >
-            {effectiveTheme === "light" ? (
-              <Moon className="size-4" />
-            ) : (
-              <Sun className="size-4" />
-            )}
-          </Button>
-          {/* Primary action — accent-filled so "new session" reads as the
-              prominent control (reference design). */}
-          <Button
-            size="icon"
-            className="size-7 bg-emerald-600 text-white hover:bg-emerald-600/90"
-            onClick={newSessionInFocusedPane}
-            title="New session in split"
-            aria-label="New session"
-          >
-            <Plus className="size-4" />
-          </Button>
         </div>
       </div>
 
       <Separator />
 
-      <div className="flex justify-end px-2 py-2">
-        <SegmentedControl
-          label="Session list"
-          value={effectiveTab}
-          onValueChange={(v) => switchTab(v as SessionListTab)}
-          options={[
-            { value: "all", label: "All" },
-            {
-              value: "dismissed",
-              label: `Dismissed (${dismissedCount})`,
-              disabled: dismissedCount === 0,
-            },
-          ]}
-        />
-      </div>
-
-      {/* Bulk action bar (#643) — revealed beneath the tabs while selecting. */}
+      {/* Bulk action bar (#643) — revealed beneath the header while selecting. */}
       {selectMode && (
         <div className="flex items-center gap-2 px-2 pb-2">
           <input
@@ -826,7 +770,7 @@ export function SessionSidebar() {
               onClick={bulkDismiss}
               className="text-muted-foreground hover:text-foreground"
             >
-              {effectiveTab === "dismissed" ? (
+              {selectedAllDismissed ? (
                 <>
                   <RotateCcw className="size-3" />
                   Restore
@@ -899,10 +843,8 @@ export function SessionSidebar() {
       <ScrollArea className="flex-1">
         <nav className="flex flex-col gap-px p-1.5">
           {rows.length === 0 ? (
-            filtering && effectiveTab === "all" ? (
+            filtering ? (
               <EmptyState title={`No sessions match “${filter.trim()}”`} />
-            ) : effectiveTab === "dismissed" ? (
-              <EmptyState title="No dismissed sessions" />
             ) : null
           ) : (
             rows.map((session) => (
@@ -920,13 +862,25 @@ export function SessionSidebar() {
               />
             ))
           )}
-          {!selectMode && hasOverflow && (
+          {/* One endless, incremental reveal (#667): +25 rows per click, walking
+              non-dismissed then dismissed. "Show less" re-compacts to the first
+              batch once expanded. */}
+          {hasMore && (
             <button
               type="button"
-              onClick={() => setOverflowExpanded((v) => !v)}
+              onClick={() => setRevealCount((n) => n + SESSION_REVEAL_BATCH)}
               className="mx-0.5 rounded-md px-2 py-1.5 text-left text-[12px] text-muted-foreground/70 transition-colors hover:bg-sidebar-accent/50 hover:text-foreground"
             >
-              {overflowExpanded ? "‹ Show less" : `› ${hiddenCount} more`}
+              Show more
+            </button>
+          )}
+          {!hasMore && revealCount > SESSION_REVEAL_BATCH && (
+            <button
+              type="button"
+              onClick={() => setRevealCount(SESSION_REVEAL_BATCH)}
+              className="mx-0.5 rounded-md px-2 py-1.5 text-left text-[12px] text-muted-foreground/70 transition-colors hover:bg-sidebar-accent/50 hover:text-foreground"
+            >
+              Show less
             </button>
           )}
         </nav>
