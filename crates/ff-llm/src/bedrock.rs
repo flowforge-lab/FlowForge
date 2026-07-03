@@ -1243,7 +1243,10 @@ mod tests {
             },
         )
         .client_cache_key();
-        assert_ne!(profile_key, apikey, "credential mode must be part of the key");
+        assert_ne!(
+            profile_key, apikey,
+            "credential mode must be part of the key"
+        );
     }
 
     #[test]
