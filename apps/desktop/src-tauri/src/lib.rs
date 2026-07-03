@@ -2199,7 +2199,7 @@ fn start_dev_update_watcher(app: tauri::AppHandle) {
                 // when idle; the OS kqueue fd stays open).
                 std::mem::forget(_watcher);
                 let emit_app = app.clone();
-                tokio::spawn(async move {
+                tauri::async_runtime::spawn(async move {
                     while rx.recv().await.is_some() {
                         let _ = emit_app.emit("update:local-feed-changed", ());
                     }
