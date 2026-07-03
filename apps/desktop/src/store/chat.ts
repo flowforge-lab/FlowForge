@@ -156,6 +156,11 @@ interface ChatState {
   cancelTurn: (sessionId: string) => Promise<void>;
   cancelActiveTurn: () => Promise<void>;
   setSessionTitle: (sessionId: string, title: string) => void;
+  /** Patch a cached session's title locally, without re-persisting via IPC. Used
+   *  by the backend-driven `session:title-updated` event (#671 item 2b), where the
+   *  title is already persisted server-side — unlike `setSessionTitle`, which is a
+   *  user rename that must write back through the backend. */
+  patchSessionTitle: (sessionId: string, title: string) => void;
 
   // Driven by backend events (wired once in lib/events.ts).
   applyToken: (e: TokenEvent) => void;
@@ -637,6 +642,14 @@ export const useChatStore = create<ChatState>((set, get) => ({
     void ipc.renameSession(sessionId, title).catch((err) => {
       console.error("[FlowForge] rename_session failed:", err);
     });
+    set((s) => ({
+      sessions: s.sessions.map((sess) =>
+        sess.id === sessionId ? { ...sess, title } : sess,
+      ),
+    }));
+  },
+
+  patchSessionTitle: (sessionId, title) => {
     set((s) => ({
       sessions: s.sessions.map((sess) =>
         sess.id === sessionId ? { ...sess, title } : sess,

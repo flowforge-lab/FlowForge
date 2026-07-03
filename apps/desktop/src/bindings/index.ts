@@ -31,6 +31,7 @@ export type { TurnErrorEvent } from "./TurnErrorEvent";
 export type { TurnStatsEvent } from "./TurnStatsEvent";
 export type { MemoryFlushedEvent } from "./MemoryFlushedEvent";
 export type { IntentionSignal } from "./IntentionSignal";
+export type { SessionTitleUpdatedEvent } from "./SessionTitleUpdatedEvent";
 export type { SkillInstallApprovalRequestEvent } from "./SkillInstallApprovalRequestEvent";
 export type { SkillsChangedEvent } from "./SkillsChangedEvent";
 export type { OutcomeSignal } from "./OutcomeSignal";

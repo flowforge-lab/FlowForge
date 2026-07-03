@@ -22,3 +22,25 @@ describe("MockIpc skill telemetry (RFC 0001 §8)", () => {
     expect(await ipc.getSkillTelemetry("does-not-exist")).toBeNull();
   });
 });
+
+describe("MockIpc session:title-updated (#671 item 2b)", () => {
+  it("fires once after the first turn with a summarized title", async () => {
+    const ipc = new MockIpc();
+    const events: { sessionId: string; title: string }[] = [];
+    await ipc.onSessionTitleUpdated((e) => events.push(e));
+
+    const s = await ipc.createSession();
+    await ipc.sendMessage(s.id, "help me fix the flaky parser test");
+    // The title is emitted on a deferred tick, mirroring the post-turn backend.
+    await new Promise((r) => setTimeout(r, 0));
+
+    expect(events).toHaveLength(1);
+    expect(events[0].sessionId).toBe(s.id);
+    expect(events[0].title.length).toBeGreaterThan(0);
+
+    // A second message (past the first turn) does not re-title.
+    await ipc.sendMessage(s.id, "now check the linter");
+    await new Promise((r) => setTimeout(r, 0));
+    expect(events).toHaveLength(1);
+  });
+});

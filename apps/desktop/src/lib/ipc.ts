@@ -33,6 +33,7 @@ import type {
   TurnDoneEvent,
   TurnErrorEvent,
   IntentionSignal,
+  SessionTitleUpdatedEvent,
   ToolApprovalRequestEvent,
   ToolAskRequestEvent,
   ToolCallEvent,
@@ -400,6 +401,11 @@ export interface FfIpc {
   onTurnDone(cb: (e: TurnDoneEvent) => void): Promise<Unlisten>;
   onTurnError(cb: (e: TurnErrorEvent) => void): Promise<Unlisten>;
   onIntention(cb: (e: IntentionSignal) => void): Promise<Unlisten>;
+  /** A session's title was regenerated as an LLM summary after its first turn
+   *  (#671 item 2b). Patch the cached session title in place -- no refetch. */
+  onSessionTitleUpdated(
+    cb: (e: SessionTitleUpdatedEvent) => void,
+  ): Promise<Unlisten>;
   onToolCall(cb: (e: ToolCallEvent) => void): Promise<Unlisten>;
   onToolResult(cb: (e: ToolResultEvent) => void): Promise<Unlisten>;
   onApprovalRequest(
@@ -711,6 +717,8 @@ class TauriIpc implements FfIpc {
     this.listen<TurnErrorEvent>("turn:error", cb);
   onIntention = (cb: (e: IntentionSignal) => void) =>
     this.listen<IntentionSignal>("signal:intention", cb);
+  onSessionTitleUpdated = (cb: (e: SessionTitleUpdatedEvent) => void) =>
+    this.listen<SessionTitleUpdatedEvent>("session:title-updated", cb);
   onToolCall = (cb: (e: ToolCallEvent) => void) =>
     this.listen<ToolCallEvent>("tool:call", cb);
   onToolResult = (cb: (e: ToolResultEvent) => void) =>

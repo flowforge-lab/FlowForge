@@ -23,6 +23,7 @@ import type {
   TurnDoneEvent,
   TurnErrorEvent,
   IntentionSignal,
+  SessionTitleUpdatedEvent,
   ToolApprovalRequestEvent,
   ToolAskRequestEvent,
   ToolCallEvent,
@@ -66,6 +67,16 @@ type Listener<T> = (e: T) => void;
 
 const uid = () => crypto.randomUUID();
 const now = () => Date.now();
+
+// Deterministic stand-in for the backend's LLM-summarized title (#671 item 2b):
+// the first few meaningful words of the prompt, title-cased and capped. The real
+// backend calls the model; the mock just needs a stable, non-empty title so the
+// offline UI + tests can exercise the `session:title-updated` path.
+function mockSummarizedTitle(content: string): string {
+  const words = content.trim().split(/\s+/).filter(Boolean).slice(0, 5);
+  const title = words.join(" ").slice(0, 60).trim();
+  return title.length > 0 ? title : "New session";
+}
 
 // `SecretKind::ALL` order (#320) — `provider_secret_presence` returns kinds in
 // this order so the mock matches the backend's stable presence ordering.
@@ -637,6 +648,7 @@ export class MockIpc implements FfIpc {
   private doneListeners = new Set<Listener<TurnDoneEvent>>();
   private errorListeners = new Set<Listener<TurnErrorEvent>>();
   private intentionListeners = new Set<Listener<IntentionSignal>>();
+  private sessionTitleListeners = new Set<Listener<SessionTitleUpdatedEvent>>();
   private toolCallListeners = new Set<Listener<ToolCallEvent>>();
   private toolResultListeners = new Set<Listener<ToolResultEvent>>();
   private approvalRequestListeners = new Set<
@@ -923,6 +935,20 @@ export class MockIpc implements FfIpc {
     // at-rest redaction path is demoable under VITE_FF_MOCK=1.
     const secret = /\b(secret|password|passphrase)\b/i.test(content);
     this.streamAssistant(sessionId, secret);
+    // LLM-summarized title (#671 item 2b): mirror the backend firing once, after
+    // the first turn. Gated on this being the session's only user message; the
+    // real backend runs the summary post-turn, so defer past the stream start.
+    const userCount = (this.messages.get(sessionId) ?? []).filter(
+      (m) => m.role === "user",
+    ).length;
+    if (userCount === 1) {
+      const title = mockSummarizedTitle(content);
+      setTimeout(() => {
+        const s = this.sessions.get(sessionId);
+        if (s) s.title = title;
+        this.emit(this.sessionTitleListeners, { sessionId, title });
+      }, 0);
+    }
     return user.id;
   }
 
@@ -1002,6 +1028,11 @@ export class MockIpc implements FfIpc {
   }
   onIntention(cb: Listener<IntentionSignal>): Promise<Unlisten> {
     return this.subscribe(this.intentionListeners, cb);
+  }
+  onSessionTitleUpdated(
+    cb: Listener<SessionTitleUpdatedEvent>,
+  ): Promise<Unlisten> {
+    return this.subscribe(this.sessionTitleListeners, cb);
   }
   onToolCall(cb: Listener<ToolCallEvent>): Promise<Unlisten> {
     return this.subscribe(this.toolCallListeners, cb);
