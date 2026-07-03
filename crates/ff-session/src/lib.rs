@@ -98,6 +98,17 @@ fn text_to_enum<T: serde::de::DeserializeOwned>(text: &str) -> Option<T> {
     serde_json::from_value(serde_json::Value::String(text.to_owned())).ok()
 }
 
+/// Escape a user query for safe use as an FTS5 MATCH expression. Wraps each
+/// whitespace-separated token in double quotes so special characters (`*`, `"`,
+/// `NEAR`, etc.) are treated as literals.
+fn fts5_escape(query: &str) -> String {
+    query
+        .split_whitespace()
+        .map(|tok| format!("\"{}\"", tok.replace('"', "\"\"")))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Why an [`SessionStore::edit_user_message`] call was rejected. Kept as a small
 /// typed error so the command layer can map each case to a clear message; the
 /// transcript is never mutated on any of these.
@@ -123,6 +134,27 @@ impl std::fmt::Display for EditMessageError {
 }
 
 impl std::error::Error for EditMessageError {}
+
+/// A full-text search hit returned by [`SessionStore::search_messages`] and
+/// [`SessionStore::search_in_session`] (#679). This is an IPC return type, so
+/// its TypeScript binding is emitted to the desktop `bindings/` dir; the
+/// `#[serde(rename_all)]` drives the camelCase field casing (ts-rs serde-compat
+/// carries it into the binding), matching the ff-core convention.
+#[derive(Debug, Clone, serde::Serialize, ts_rs::TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "../../../apps/desktop/src/bindings/")]
+pub struct SearchHit {
+    pub session_id: String,
+    pub session_title: Option<String>,
+    pub message_id: String,
+    pub role: String,
+    pub snippet: String,
+    /// Unix epoch milliseconds. `#[ts(type = "number")]` matches the `Message`
+    /// / `Session` convention so the binding is `number`, not ts-rs's default
+    /// `bigint` for `i64` — the documented FE contract is `createdAt: number`.
+    #[ts(type = "number")]
+    pub created_at: i64,
+}
 
 pub struct SessionStore {
     conn: Mutex<Connection>,
@@ -219,6 +251,80 @@ impl SessionStore {
         let rows = stmt
             .query_map([], row_to_session)
             .expect("query list_sessions");
+        rows.filter_map(Result::ok).collect()
+    }
+
+    /// Full-text search across all sessions (#679). Returns up to `limit` hits
+    /// ranked by FTS5 BM25 relevance, with a snippet (highlighted with `<mark>`
+    /// tags) for each match. Empty/whitespace queries return no results.
+    pub fn search_messages(&self, query: &str, limit: usize) -> Vec<SearchHit> {
+        let query = query.trim();
+        if query.is_empty() {
+            return Vec::new();
+        }
+        let conn = self.conn.lock().unwrap();
+        // Escape FTS5 special characters by wrapping each token in double quotes.
+        let safe_query = fts5_escape(query);
+        let mut stmt = conn
+            .prepare(
+                "SELECT f.message_id, f.session_id, m.role, m.created_at, s.title,
+                        snippet(messages_fts, 2, '<mark>', '</mark>', '...', 32) AS snip
+                 FROM messages_fts f
+                 JOIN messages m ON m.id = f.message_id
+                 JOIN sessions s ON s.id = f.session_id
+                 WHERE messages_fts MATCH ?1
+                 ORDER BY rank
+                 LIMIT ?2",
+            )
+            .expect("prepare search_messages");
+        let rows = stmt
+            .query_map(params![safe_query, limit as i64], |row| {
+                Ok(SearchHit {
+                    message_id: row.get(0)?,
+                    session_id: row.get(1)?,
+                    role: row.get::<_, String>(2)?,
+                    created_at: row.get(3)?,
+                    session_title: row.get(4)?,
+                    snippet: row.get(5)?,
+                })
+            })
+            .expect("query search_messages");
+        rows.filter_map(Result::ok).collect()
+    }
+
+    /// Full-text search within a single session (#679). Returns all matches
+    /// in message order (by seq), for in-thread find navigation.
+    pub fn search_in_session(&self, session_id: &str, query: &str) -> Vec<SearchHit> {
+        let query = query.trim();
+        if query.is_empty() {
+            return Vec::new();
+        }
+        let conn = self.conn.lock().unwrap();
+        let safe_query = fts5_escape(query);
+        let mut stmt = conn
+            .prepare(
+                "SELECT f.message_id, f.session_id, m.role, m.created_at, s.title,
+                        snippet(messages_fts, 2, '<mark>', '</mark>', '...', 32) AS snip
+                 FROM messages_fts f
+                 JOIN messages m ON m.id = f.message_id
+                 JOIN sessions s ON s.id = f.session_id
+                 WHERE messages_fts MATCH ?1 AND f.session_id = ?2
+                 ORDER BY m.seq
+                 LIMIT 200",
+            )
+            .expect("prepare search_in_session");
+        let rows = stmt
+            .query_map(params![safe_query, session_id], |row| {
+                Ok(SearchHit {
+                    message_id: row.get(0)?,
+                    session_id: row.get(1)?,
+                    role: row.get::<_, String>(2)?,
+                    created_at: row.get(3)?,
+                    session_title: row.get(4)?,
+                    snippet: row.get(5)?,
+                })
+            })
+            .expect("query search_in_session");
         rows.filter_map(Result::ok).collect()
     }
 
@@ -1206,6 +1312,33 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
         conn.execute_batch("ALTER TABLE messages ADD COLUMN stop_reason TEXT;")?;
         conn.pragma_update(None, "user_version", 9)?;
     }
+    if version < 10 {
+        // #679: full-text search across session messages. A standalone FTS5 table
+        // indexes message content for cross-session and in-thread search. Triggers
+        // keep it in sync with the messages table on INSERT/UPDATE/DELETE.
+        conn.execute_batch(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts
+                 USING fts5(message_id UNINDEXED, session_id UNINDEXED, content);
+             CREATE TRIGGER IF NOT EXISTS messages_fts_ai AFTER INSERT ON messages BEGIN
+                 INSERT INTO messages_fts(message_id, session_id, content)
+                 VALUES (new.id, new.session_id, new.content);
+             END;
+             CREATE TRIGGER IF NOT EXISTS messages_fts_au AFTER UPDATE OF content ON messages BEGIN
+                 DELETE FROM messages_fts WHERE message_id = old.id;
+                 INSERT INTO messages_fts(message_id, session_id, content)
+                 VALUES (new.id, new.session_id, new.content);
+             END;
+             CREATE TRIGGER IF NOT EXISTS messages_fts_ad AFTER DELETE ON messages BEGIN
+                 DELETE FROM messages_fts WHERE message_id = old.id;
+             END;",
+        )?;
+        // Backfill existing messages into the FTS index.
+        conn.execute_batch(
+            "INSERT INTO messages_fts(message_id, session_id, content)
+             SELECT id, session_id, content FROM messages;",
+        )?;
+        conn.pragma_update(None, "user_version", 10)?;
+    }
     Ok(())
 }
 
@@ -1638,7 +1771,7 @@ mod tests {
             .unwrap()
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 9);
+        assert_eq!(version, 10);
     }
 
     #[test]
@@ -1759,7 +1892,7 @@ mod tests {
             .unwrap()
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 9);
+        assert_eq!(version, 10);
     }
 
     #[test]
@@ -1810,7 +1943,7 @@ mod tests {
             .unwrap()
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 9);
+        assert_eq!(version, 10);
     }
 
     #[test]
@@ -2187,7 +2320,7 @@ mod tests {
             .unwrap()
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 9);
+        assert_eq!(version, 10);
     }
 
     #[test]
@@ -2249,7 +2382,7 @@ mod tests {
             .unwrap()
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 9);
+        assert_eq!(version, 10);
     }
 
     #[test]
@@ -2411,7 +2544,7 @@ mod tests {
             .unwrap()
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 9);
+        assert_eq!(version, 10);
     }
 
     #[test]
@@ -2634,5 +2767,63 @@ mod tests {
         // The assistant message that backed the original was truncated, so its
         // original must be gone too (no orphan).
         assert_eq!(store.compaction_original("hash-key-1"), None);
+    }
+
+    #[test]
+    fn search_messages_finds_across_sessions() {
+        let store = SessionStore::new();
+        let s1 = store.create_session(Some("first".into()));
+        let s2 = store.create_session(Some("second".into()));
+        store.set_title(&s1.id, "Rust session".into());
+        store.set_title(&s2.id, "Python session".into());
+        store.add_message(
+            &s1.id,
+            Role::User,
+            "I want to learn Rust programming".into(),
+        );
+        store.add_message(&s1.id, Role::Assistant, "Rust is a systems language".into());
+        store.add_message(&s2.id, Role::User, "Tell me about Python".into());
+        store.add_message(
+            &s2.id,
+            Role::Assistant,
+            "Python is great for scripting".into(),
+        );
+
+        let hits = store.search_messages("Rust", 10);
+        assert_eq!(hits.len(), 2, "should find 2 messages mentioning Rust");
+        assert!(hits.iter().all(|h| h.session_id == s1.id));
+
+        let hits = store.search_messages("programming", 10);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].session_title.as_deref(), Some("Rust session"));
+
+        // Empty query returns nothing.
+        assert!(store.search_messages("", 10).is_empty());
+        assert!(store.search_messages("   ", 10).is_empty());
+    }
+
+    #[test]
+    fn search_in_session_scopes_to_one_session() {
+        let store = SessionStore::new();
+        let s1 = store.create_session(None);
+        let s2 = store.create_session(None);
+        store.add_message(&s1.id, Role::User, "hello world".into());
+        store.add_message(&s2.id, Role::User, "hello universe".into());
+
+        let hits = store.search_in_session(&s1.id, "hello");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].session_id, s1.id);
+        assert!(hits[0].snippet.contains("<mark>"));
+    }
+
+    #[test]
+    fn search_handles_fts5_special_chars() {
+        let store = SessionStore::new();
+        let s = store.create_session(None);
+        store.add_message(&s.id, Role::User, "file at /usr/local/bin/test*".into());
+
+        // Should not panic or error on special characters.
+        let hits = store.search_messages("test*", 10);
+        assert_eq!(hits.len(), 1);
     }
 }

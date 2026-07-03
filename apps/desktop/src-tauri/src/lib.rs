@@ -295,6 +295,26 @@ fn get_messages(state: State<'_, Arc<AppState>>, session_id: String) -> Vec<Mess
     state.store.get_messages(&session_id)
 }
 
+/// Full-text search across all sessions (#679). Returns ranked hits with snippets.
+#[tauri::command]
+fn search_messages(
+    state: State<'_, Arc<AppState>>,
+    query: String,
+    limit: Option<usize>,
+) -> Vec<ff_session::SearchHit> {
+    state.store.search_messages(&query, limit.unwrap_or(50))
+}
+
+/// Full-text search within a single session (#679). For in-thread find.
+#[tauri::command]
+fn search_in_session(
+    state: State<'_, Arc<AppState>>,
+    session_id: String,
+    query: String,
+) -> Vec<ff_session::SearchHit> {
+    state.store.search_in_session(&session_id, &query)
+}
+
 /// Export a session and its transcript as Markdown or JSON (#278). Returns the
 /// rendered string for the frontend to save via a file dialog. Errors when the
 /// session id is unknown so the UI can surface it rather than write an empty file.
@@ -2598,6 +2618,8 @@ pub fn run() {
             create_session,
             list_sessions,
             get_messages,
+            search_messages,
+            search_in_session,
             export_session,
             rename_session,
             delete_session,

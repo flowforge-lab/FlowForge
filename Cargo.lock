@@ -2048,6 +2048,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tracing",
+ "ts-rs",
  "uuid",
 ]
 

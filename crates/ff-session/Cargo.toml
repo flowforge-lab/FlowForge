@@ -13,6 +13,9 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 rusqlite = { version = "0.32", features = ["bundled"] }
 tracing = { workspace = true }
+# `SearchHit` is an IPC return type (#679): emit its TypeScript binding so the
+# desktop FE contract (camelCase) is generated, matching the ff-core idiom.
+ts-rs = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
