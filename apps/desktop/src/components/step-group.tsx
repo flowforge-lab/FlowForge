@@ -18,9 +18,51 @@ import {
   groupDurationMs,
   liveElapsedMs,
   resolveGroupOpen,
-  selectStepWindow,
+  selectItemWindow,
   STEP_WINDOW,
 } from "@/lib/steps";
+
+// A short/operational narration line folded inside the step group (#687). Mirrors
+// ThinkingBlock's compact row: a muted, collapsible line labelled "Thought" with a
+// truncated preview, so throwaway narration stays scannable without the visual weight
+// of a full-width prose block. Collapsed by default; a manual toggle reveals the full
+// text.
+function ThoughtRow({ text }: { text: string }) {
+  const [open, setOpen] = useState(false);
+  const trimmed = text.trim();
+  return (
+    <div className="w-full font-mono text-[11px]">
+      <button
+        type="button"
+        aria-expanded={open}
+        onClick={() => setOpen((v) => !v)}
+        className="flex w-full items-center gap-1.5 rounded-md px-2.5 py-1 text-left text-muted-foreground transition-colors hover:text-foreground"
+      >
+        <ChevronRight
+          className={cn(
+            "size-3.5 shrink-0 transition-transform",
+            open && "rotate-90",
+          )}
+        />
+        <span className="shrink-0 font-medium text-foreground/90">Thought</span>
+        {!open && (
+          <span className="min-w-0 truncate text-muted-foreground/70">
+            {trimmed.slice(0, 120)}
+            {trimmed.length > 120 ? "…" : ""}
+          </span>
+        )}
+      </button>
+      {open && (
+        <p
+          data-selectable
+          className="whitespace-pre-wrap px-2.5 pb-1 pl-7 font-sans leading-relaxed text-muted-foreground"
+        >
+          {trimmed}
+        </p>
+      )}
+    </div>
+  );
+}
 
 // Folds a turn's tool steps behind one "▸ N steps" header (Issue #17). Composes
 // ToolStepBlock unchanged — this only adds the turn-level fold + duration. The
@@ -83,30 +125,23 @@ export function StepGroup({
     : groupDurationMs(steps);
   const showDuration = durationMs !== null;
 
-  const earlierCount = Math.max(0, steps.length - STEP_WINDOW);
-
   // Muted prose glimpse of the answer shown under the collapsed header (#414).
   const preview = answer ? answerPreview(answer) : "";
 
-  const { visible } = selectStepWindow(steps, {
-    streaming,
-    awaiting,
-    peekExpanded: effectivePeekExpanded,
-  });
-
-  // Render interleaved prose + steps (#415); fall back to the steps alone. While the
-  // peek window hides earlier steps, drop the items before the first visible step so
-  // the prose stays anchored to the steps it narrates.
+  // Render interleaved reasoning + thoughts + steps (#415/#574/#687); fall back to the
+  // steps alone. While streaming, window to the last STEP_WINDOW *items* (steps and
+  // folded thoughts alike, #687) so the live view stays to recent activity; the peek
+  // ("+N earlier steps") expands to the full list, and settling shows everything.
   const allItems: TurnItem[] =
     items ?? steps.map((step) => ({ kind: "step", step }));
-  const firstVisible = visible[0];
-  const sliceFrom =
-    visible.length < steps.length && firstVisible
-      ? allItems.findIndex(
-          (it) => it.kind === "step" && it.step === firstVisible,
-        )
-      : 0;
-  const visibleItems = sliceFrom > 0 ? allItems.slice(sliceFrom) : allItems;
+  const { visible: visibleItems, hiddenCount: earlierCount } = selectItemWindow(
+    allItems,
+    {
+      streaming,
+      awaiting,
+      peekExpanded: effectivePeekExpanded,
+    },
+  );
 
   return (
     <div className="w-full font-mono text-[11px]">
@@ -172,9 +207,11 @@ export function StepGroup({
               onClick={() => setPeekExpanded((v) => !v)}
               className="rounded-md px-2.5 py-1 text-left text-muted-foreground/70 transition-colors hover:text-foreground"
             >
+              {/* Noun-neutral: `earlierCount` counts items (steps + folded thoughts,
+                  #687), so a fixed "steps" noun could misread when a thought is hidden. */}
               {effectivePeekExpanded
-                ? `Show last ${STEP_WINDOW} steps`
-                : `+${earlierCount} earlier ${earlierCount === 1 ? "step" : "steps"}`}
+                ? `Show last ${STEP_WINDOW}`
+                : `+${earlierCount} earlier`}
             </button>
           )}
           {visibleItems.map((it) =>
@@ -194,8 +231,12 @@ export function StepGroup({
                 onApproveAlways={onApproveAlways}
                 onAnswer={onAnswer}
               />
-            ) : // Intermediate prose is hoisted to a top-level block by `segmentTurn`
-            // (#619) and never reaches this group; the branch stays for exhaustiveness.
+            ) : it.kind === "thought" ? (
+              // Short/operational narration folded inside the group (#687).
+              <ThoughtRow key={`thought:${it.key}`} text={it.text} />
+            ) : // Substantive intermediate prose is hoisted to a top-level block by
+            // `segmentTurn` (#619/#687) and never reaches this group; the branch stays
+            // for exhaustiveness.
             null,
           )}
         </div>

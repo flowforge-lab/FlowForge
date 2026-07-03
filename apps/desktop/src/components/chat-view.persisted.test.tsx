@@ -149,6 +149,14 @@ describe("ChatView reloaded multi-step turns (#413)", () => {
 });
 
 describe("ChatView intermediate prose — top-level, split groups (#619, supersedes #415)", () => {
+  // Substantive intermediate prose (#687): long, unformatted, no operational prefix,
+  // so each chunk hoists to a top-level block (splitting the steps) rather than folding
+  // into the step group as a thought. Kept unformatted so the Markdown renderer emits a
+  // single plain text node the DOM assertions can match exactly.
+  const PROSE_A =
+    "Read the target file from top to bottom and confirmed its layout matches what the reconstruction expects, so the remaining work is limited to wiring the new classifier into the existing segmentation path without disturbing how reloaded turns are folded back into the render model that the live stream and the persisted path already share across every open pane today.";
+  const PROSE_B =
+    "Searched the whole component tree for other readers of this data and found none beyond the step group itself, which means the change stays contained to that one file and its unit tests and does not ripple outward into the shared inter-process contract or the generated type bindings that the two engineers deliberately keep frozen for the duration of this milestone.";
   function interleavedTurn(): Message[] {
     return [
       { id: "u1", sessionId: SID, role: "user", content: "go", createdAt: 1 },
@@ -156,7 +164,7 @@ describe("ChatView intermediate prose — top-level, split groups (#619, superse
         id: "a1",
         sessionId: SID,
         role: "assistant",
-        content: "Reading the file.",
+        content: PROSE_A,
         toolCalls: [bashCall("c1", "ls")],
         createdAt: 1,
       },
@@ -172,7 +180,7 @@ describe("ChatView intermediate prose — top-level, split groups (#619, superse
         id: "a2",
         sessionId: SID,
         role: "assistant",
-        content: "Now searching.",
+        content: PROSE_B,
         toolCalls: [bashCall("c2", "pwd")],
         createdAt: 2,
       },
@@ -210,18 +218,16 @@ describe("ChatView intermediate prose — top-level, split groups (#619, superse
     }
 
     // Intermediate prose is visible at top level WITHOUT expanding any group…
-    expect(q.getByText("Reading the file.")).toBeTruthy();
-    expect(q.getByText("Now searching.")).toBeTruthy();
+    expect(q.getByText(PROSE_A)).toBeTruthy();
+    expect(q.getByText(PROSE_B)).toBeTruthy();
     // …while the steps stay folded until their group is expanded.
     expect(q.queryByText("Run `ls`")).toBeNull();
     expect(q.queryByText("Run `pwd`")).toBeNull();
 
     // Chronological order: prose₁ → group₁ → prose₂ → group₂.
     const body = container.textContent ?? "";
-    expect(body.indexOf("Reading the file.")).toBeGreaterThanOrEqual(0);
-    expect(body.indexOf("Now searching.")).toBeGreaterThan(
-      body.indexOf("Reading the file."),
-    );
+    expect(body.indexOf(PROSE_A)).toBeGreaterThanOrEqual(0);
+    expect(body.indexOf(PROSE_B)).toBeGreaterThan(body.indexOf(PROSE_A));
 
     // Expanding each group reveals only its own step.
     fireEvent.click(headers[0]);

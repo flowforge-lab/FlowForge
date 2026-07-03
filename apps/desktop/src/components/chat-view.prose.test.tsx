@@ -8,6 +8,16 @@ import type { Message } from "@/bindings";
 
 const SID = "s1";
 
+// Substantive intermediate prose (#687): long (≥LONG), unformatted single paragraphs
+// with no operational prefix, so `segmentTurn` hoists each chunk to a top-level block
+// rather than folding it into the step group as a thought. Kept unformatted (no inline
+// code / bold / breaks) so the Markdown renderer emits one plain text node the DOM
+// assertions below can match exactly.
+const PROSE_1 =
+  "Scanned the workspace layout and confirmed that the composer component and its supporting store are the only places the intermediate rendering is assembled, which means the follow-up search can be narrowed to those two files and their tests without widening the change surface into the shared contract or the generated bindings the two engineers agreed to keep stable.";
+const PROSE_2 =
+  "The grep sweep across the source tree returned a single call site inside the step group, so the fix stays local to that one component and the unit tests around it, and there is no need to introduce a parallel helper or a new abstraction when the existing windowing utility can be generalized to operate over the interleaved items instead of only the tool steps it counts today.";
+
 function msg(
   partial: Partial<Message> & Pick<Message, "id" | "role">,
 ): Message {
@@ -26,14 +36,14 @@ function seedMultiIterationTurn() {
         msg({
           id: "a1",
           role: "assistant",
-          content: "First let me look around.",
+          content: PROSE_1,
           toolCalls: [{ id: "c1", name: "view", arguments: "{}" }],
         }),
         msg({ id: "t1", role: "tool", toolCallId: "c1", content: "result 1" }),
         msg({
           id: "a2",
           role: "assistant",
-          content: "Now searching the code.",
+          content: PROSE_2,
           toolCalls: [{ id: "c2", name: "grep", arguments: "{}" }],
         }),
         msg({ id: "t2", role: "tool", toolCallId: "c2", content: "result 2" }),
@@ -67,8 +77,8 @@ describe("ChatView intermediate prose (#619)", () => {
 
     // Both intermediate prose blocks are visible even though the turn is settled
     // and every step group is collapsed.
-    expect(screen.getByText("First let me look around.")).toBeTruthy();
-    expect(screen.getByText("Now searching the code.")).toBeTruthy();
+    expect(screen.getByText(PROSE_1)).toBeTruthy();
+    expect(screen.getByText(PROSE_2)).toBeTruthy();
 
     const headers = stepHeaders();
     expect(headers.length).toBeGreaterThanOrEqual(2);
@@ -91,9 +101,9 @@ describe("ChatView intermediate prose (#619)", () => {
     // element the Markdown renderer wraps prose in (#629).
     const body = container.textContent ?? "";
     const sequence = [
-      "First let me look around.", // intermediate prose 1
+      PROSE_1, // intermediate prose 1
       "1 step", // first group header
-      "Now searching the code.", // intermediate prose 2
+      PROSE_2, // intermediate prose 2
       "1 step", // second group header
     ];
     let cursor = -1;

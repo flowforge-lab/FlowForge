@@ -85,6 +85,46 @@ describe("StepGroup collapsed answer preview (#414)", () => {
   });
 });
 
+describe("StepGroup folded thought (#687)", () => {
+  it("renders a short/operational thought as a compact row inside the group", () => {
+    const steps = [step({ callId: "c1", args: { command: "ls" } })];
+    const items: TurnItem[] = [
+      { kind: "thought", text: "Now let me verify the helper.", key: "a1" },
+      { kind: "step", step: steps[0] },
+    ];
+    // streaming keeps the group expanded so the folded rows are visible.
+    const { container } = render(
+      <StepGroup
+        steps={steps}
+        items={items}
+        streaming
+        hasAnswer={false}
+        onRespond={noop}
+        onApproveSession={noop}
+        onApproveAlways={noop}
+        onAnswer={noop}
+      />,
+    );
+
+    // A compact "Thought" row renders (collapsed by default) with a truncated preview.
+    const label = within(container).getByText("Thought");
+    const row = label.closest("button")!;
+    expect(row.getAttribute("aria-expanded")).toBe("false");
+    expect(within(row).getByText(/Now let me verify the helper/)).toBeTruthy();
+
+    // The thought sits before the step row it narrates, inside the group.
+    const firstStep = within(container).getByText("Run `ls`");
+    expect(
+      label.compareDocumentPosition(firstStep) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+
+    // It expands to reveal the full text.
+    fireEvent.click(row);
+    expect(row.getAttribute("aria-expanded")).toBe("true");
+  });
+});
+
 describe("StepGroup interleaved reasoning (#574)", () => {
   it("renders a reasoning row in position, before its sibling step rows", () => {
     const steps = [
