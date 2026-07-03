@@ -16,6 +16,7 @@ use aws_sdk_bedrockruntime::Client;
 use aws_smithy_types::{Blob, Document, Number};
 use ff_core::Attachment;
 use futures_util::stream::{self, StreamExt};
+use tokio::sync::OnceCell;
 
 use crate::{
     attachment_bytes, ChatMessage, ChatRequest, Chunk, ChunkStream, LlmError, Provider,
@@ -85,6 +86,17 @@ pub struct BedrockProvider {
     /// `reasoning_config.budget_tokens` (Claude extended thinking) and the
     /// matching `maxTokens`. Defaults to [`ReasoningEffort::Medium`].
     reasoning_effort: ReasoningEffort,
+    /// Lazily-built, reused runtime (ConverseStream) client (#691). Building it
+    /// runs `aws_config::defaults(...).load()`, a flat ~950ms of SDK config +
+    /// credential-provider-chain assembly. Region and creds are immutable per
+    /// instance, so the client is safe to build once and reuse across every
+    /// `chat_stream` call — this also keeps the TLS connection pool warm across
+    /// agent-loop iterations. Anthropic/OpenAI cache their `reqwest::Client` the
+    /// same way; before this, Bedrock rebuilt on every call.
+    client: OnceCell<Client>,
+    /// Lazily-built, reused control-plane client (#691), used only by
+    /// `list_models`. Same rationale as [`Self::client`].
+    control_client: OnceCell<aws_sdk_bedrock::Client>,
 }
 
 impl BedrockProvider {
@@ -95,6 +107,8 @@ impl BedrockProvider {
             supports_vision: false,
             supports_documents: false,
             reasoning_effort: ReasoningEffort::default(),
+            client: OnceCell::new(),
+            control_client: OnceCell::new(),
         }
     }
 
@@ -132,9 +146,20 @@ impl BedrockProvider {
         thinking_request_config(model, self.reasoning_effort)
     }
 
+    /// The cached Bedrock runtime client, building it on first use (#691). The
+    /// AWS SDK client is `Arc`-backed, so the returned clone is cheap and shares
+    /// the connection pool; the expensive `build_client` (incl. `config.load()`)
+    /// runs at most once per provider instance.
+    async fn client(&self) -> Client {
+        self.client
+            .get_or_init(|| self.build_client())
+            .await
+            .clone()
+    }
+
     /// Build a Bedrock client for the configured region and credential mode.
     /// A rustls-ring HTTP client is wired explicitly so we never pull aws-lc-rs.
-    async fn client(&self) -> Client {
+    async fn build_client(&self) -> Client {
         use aws_sdk_bedrockruntime::config::{BehaviorVersion, Credentials, Region, Token};
 
         let http = aws_smithy_http_client::Builder::new()
@@ -184,11 +209,20 @@ impl BedrockProvider {
         }
     }
 
-    /// Build a Bedrock *control-plane* client, used only by `list_models`
-    /// (ListInferenceProfiles). Mirrors [`Self::client`] per credential mode; the
-    /// control-plane SDK crate has its own config `Builder` type, so the match
-    /// cannot be shared generically with the runtime client.
+    /// The cached Bedrock control-plane client, building it on first use (#691).
+    /// Same `Arc`-backed cheap-clone rationale as [`Self::client`].
     async fn control_client(&self) -> aws_sdk_bedrock::Client {
+        self.control_client
+            .get_or_init(|| self.build_control_client())
+            .await
+            .clone()
+    }
+
+    /// Build a Bedrock *control-plane* client, used only by `list_models`
+    /// (ListInferenceProfiles). Mirrors [`Self::build_client`] per credential
+    /// mode; the control-plane SDK crate has its own config `Builder` type, so
+    /// the match cannot be shared generically with the runtime client.
+    async fn build_control_client(&self) -> aws_sdk_bedrock::Client {
         use aws_sdk_bedrock::config::{BehaviorVersion, Credentials, Region, Token};
 
         let http = aws_smithy_http_client::Builder::new()
@@ -1054,6 +1088,38 @@ mod tests {
             Document::Number(Number::PosInt(v)) => v,
             _ => panic!("budget_tokens not a positive int"),
         }
+    }
+
+    #[tokio::test]
+    async fn client_is_built_once_and_reused_across_calls() {
+        // Regression for #691: `chat_stream` used to rebuild the AWS client (incl.
+        // a ~950ms `config.load()`) on every call. The client is now cached in a
+        // OnceCell, so it must be built at most once and reused. IamKeys mode
+        // builds synchronously with no network/credential-file I/O, so this test
+        // is hermetic.
+        let provider = BedrockProvider::new(
+            "us-east-2",
+            BedrockCreds::IamKeys {
+                access_key_id: "AKIAEXAMPLE".into(),
+                secret_access_key: "secret".into(),
+                session_token: None,
+            },
+        );
+        assert!(
+            !provider.client.initialized(),
+            "client must be lazy — not built until first use"
+        );
+        let _c1 = provider.client().await;
+        assert!(
+            provider.client.initialized(),
+            "first client() call must initialize the cache"
+        );
+        // A second call must not rebuild: OnceCell::get returns the same instance
+        // that get_or_init stored, so the cached value is unchanged.
+        let cached = provider.client.get().expect("client cached") as *const Client;
+        let _c2 = provider.client().await;
+        let after = provider.client.get().expect("client still cached") as *const Client;
+        assert_eq!(cached, after, "second client() call must reuse the cache");
     }
 
     #[test]
