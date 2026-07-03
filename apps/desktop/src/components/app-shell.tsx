@@ -1,5 +1,5 @@
 import { useEffect } from "react";
-import { AlertTriangle, PanelLeft } from "@/components/ui/icon";
+import { AlertTriangle } from "@/components/ui/icon";
 import { SessionSidebar } from "@/components/session-sidebar";
 import { PaneTree } from "@/components/pane-tree";
 import { SplitPanel } from "@/components/split-panel";
@@ -8,7 +8,6 @@ import { ShortcutsOverlay } from "@/components/shortcuts-overlay";
 import { SettingsPanel } from "@/components/settings-panel";
 import { PhenoMcpToast } from "@/components/pheno-mcp-toast";
 import { UpdateBar } from "@/components/update-bar";
-import { Button } from "@/components/ui/button";
 import { useChatStore } from "@/store/chat";
 import { usePrefsStore } from "@/store/prefs";
 import { usePanesStore } from "@/store/panes";
@@ -176,8 +175,6 @@ export function AppShell() {
   useGlobalShortcuts();
   usePaneInit();
   const bootstrapError = useChatStore((s) => s.bootstrapError);
-  const sidebarCollapsed = usePrefsStore((s) => s.sidebarCollapsed);
-  const setSidebarCollapsed = usePrefsStore((s) => s.setSidebarCollapsed);
 
   return (
     <div className="flex h-full flex-col bg-background text-foreground">
@@ -185,20 +182,6 @@ export function AppShell() {
       <div className="flex min-h-0 flex-1">
         <SessionSidebar />
         <main className="flex min-w-0 flex-1 flex-col">
-          {sidebarCollapsed && (
-            <div className="flex h-12 shrink-0 items-center gap-2 border-b px-2">
-              <Button
-                variant="ghost"
-                size="icon"
-                className="size-8 text-muted-foreground hover:text-foreground"
-                onClick={() => setSidebarCollapsed(false)}
-                title="Show sidebar"
-                aria-label="Show sidebar"
-              >
-                <PanelLeft className="size-4" />
-              </Button>
-            </div>
-          )}
           <div className="flex min-h-0 min-w-0 flex-1">
             {/* Chat column. When the split is closed it stays full-width — no
               visual change from before the panel existed. */}
