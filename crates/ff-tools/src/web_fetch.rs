@@ -1,6 +1,6 @@
 //! `web_fetch` — HTTP GET a URL and return its readable content as markdown.
 //!
-//! Network egress, so it is `Safety::Write` (approval-gated by the agent loop). An
+//! Network egress, so it is `Safety::Sensitive` (approval-gated by the agent loop). An
 //! [`SsrfPolicy`](crate::url_safety::SsrfPolicy) rejects internal / loopback /
 //! link-local / cloud-metadata targets before connecting and on every redirect hop.
 //! No JavaScript is executed (plain GET), matching the deterministic-tool ethos.
@@ -16,7 +16,7 @@ use serde_json::Value;
 use url::Url;
 
 use crate::html_text::{self, MAX_BYTES, TRUNCATE_BYTES};
-use crate::registry::{Tool, ToolOutcome};
+use crate::registry::{Safety, Tool, ToolOutcome};
 use crate::url_safety::SsrfPolicy;
 
 /// Cap on redirect hops we follow manually (each re-checked by the SSRF policy).
@@ -103,7 +103,17 @@ impl Tool for WebFetchTool {
         })
     }
 
-    // Defaults to `Safety::Write` (network egress) -> approval-gated. No override.
+    /// Network egress is externally-visible, so it is [`Safety::Sensitive`]
+    /// (#698) rather than the plain `Write` default. Treated identically to
+    /// `Write` for now — still approval-gated the same way; `max_safety` matches
+    /// so it stays hidden in Plan-mode advertisement.
+    fn safety(&self, _args: &Value) -> Safety {
+        Safety::Sensitive
+    }
+
+    fn max_safety(&self) -> Safety {
+        Safety::Sensitive
+    }
 
     async fn run(&self, args: Value, _root: &Path) -> ToolOutcome {
         let Some(url) = args.get("url").and_then(Value::as_str) else {
@@ -270,7 +280,6 @@ fn is_text_passthrough(content_type: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::registry::Safety;
     use crate::url_safety::SsrfPolicy;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -286,11 +295,10 @@ mod tests {
     }
 
     #[test]
-    fn safety_is_write_so_it_is_approval_gated() {
-        assert_eq!(
-            WebFetchTool::new().safety(&serde_json::json!({})),
-            Safety::Write
-        );
+    fn safety_is_sensitive_so_it_is_approval_gated() {
+        let tool = WebFetchTool::new();
+        assert_eq!(tool.safety(&serde_json::json!({})), Safety::Sensitive);
+        assert_eq!(tool.max_safety(), Safety::Sensitive);
     }
 
     #[test]

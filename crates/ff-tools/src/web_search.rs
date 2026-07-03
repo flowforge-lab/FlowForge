@@ -1,6 +1,6 @@
 //! `web_search` — query a configured web-search backend and return ranked results.
 //!
-//! Network egress, so it is `Safety::Write` (approval-gated by the agent loop). The
+//! Network egress, so it is `Safety::Sensitive` (approval-gated by the agent loop). The
 //! tool reads the user's persisted [`SearchConfig`](ff_core::SearchConfig) at call
 //! time. The default is keyless [`Tavily`](ff_core::SearchBackend::Tavily), which
 //! works with zero setup; the keyless, self-hosted SearXNG JSON API is also wired.
@@ -16,7 +16,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use crate::{SsrfPolicy, Tool, ToolOutcome};
+use crate::{Safety, SsrfPolicy, Tool, ToolOutcome};
 use async_trait::async_trait;
 use ff_core::{SearchBackend, SearchConfig};
 use reqwest::header::USER_AGENT;
@@ -300,7 +300,17 @@ impl Tool for WebSearchTool {
         })
     }
 
-    // Defaults to `Safety::Write` (network egress) -> approval-gated. No override.
+    /// Network egress is externally-visible, so it is [`Safety::Sensitive`]
+    /// (#698) rather than the plain `Write` default. Treated identically to
+    /// `Write` for now — still approval-gated the same way; `max_safety` matches
+    /// so it stays hidden in Plan-mode advertisement.
+    fn safety(&self, _args: &Value) -> Safety {
+        Safety::Sensitive
+    }
+
+    fn max_safety(&self) -> Safety {
+        Safety::Sensitive
+    }
 
     async fn run(&self, args: Value, _root: &Path) -> ToolOutcome {
         let Some(query) = args.get("query").and_then(Value::as_str) else {
@@ -374,9 +384,10 @@ mod tests {
     }
 
     #[test]
-    fn safety_is_write_so_it_is_approval_gated() {
+    fn safety_is_sensitive_so_it_is_approval_gated() {
         let tool = WebSearchTool::new(shared(SearchConfig::default()));
-        assert_eq!(tool.safety(&serde_json::json!({})), Safety::Write);
+        assert_eq!(tool.safety(&serde_json::json!({})), Safety::Sensitive);
+        assert_eq!(tool.max_safety(), Safety::Sensitive);
     }
 
     #[test]

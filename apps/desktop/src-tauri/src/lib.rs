@@ -151,11 +151,12 @@ impl TurnMetrics {
 /// Routes write/dangerous tool calls through a UI confirmation. Read-only calls
 /// never reach this approver — the agent loop short-circuits them.
 /// Whether the active autonomy mode auto-approves a call of this safety without a
-/// prompt. Only `Auto` + `Write` qualifies; `Dangerous` always prompts regardless
-/// of mode, preserving the #232 invariant that arbitrary code (python, `rm`) needs
-/// a deliberate yes. ReadOnly never reaches the approver.
+/// prompt. Only `Auto` + `Write`/`Sensitive` qualifies; `Dangerous` always prompts
+/// regardless of mode, preserving the #232 invariant that arbitrary code (python,
+/// `rm`) needs a deliberate yes. ReadOnly never reaches the approver. `Sensitive`
+/// is treated identically to `Write` here (#698) until a follow-up differentiates it.
 fn mode_auto_approves(mode: Mode, safety: Safety) -> bool {
-    mode == Mode::Auto && safety == Safety::Write
+    mode == Mode::Auto && matches!(safety, Safety::Write | Safety::Sensitive)
 }
 
 struct UiApprover {
@@ -192,6 +193,10 @@ impl Approver for UiApprover {
 
         let safety = match safety {
             Safety::Write => ApprovalSafety::Write,
+            // Sensitive maps to the Write wire signal for now (#698) — the
+            // ApprovalSafety contract (and its TS binding) gains no variant this
+            // PR, so the FE renders it identically to a write until PR 2.
+            Safety::Sensitive => ApprovalSafety::Write,
             Safety::Dangerous => ApprovalSafety::Dangerous,
             // The agent loop short-circuits ReadOnly before calling the approver,
             // so it never reaches the approval contract.
@@ -2867,12 +2872,17 @@ mod tests {
     #[test]
     fn mode_auto_approves_only_auto_write() {
         assert!(mode_auto_approves(Mode::Auto, Safety::Write));
+        // Sensitive is treated identically to Write for now (#698): auto-approved
+        // in Auto, prompted in Act/Plan.
+        assert!(mode_auto_approves(Mode::Auto, Safety::Sensitive));
         // Dangerous is never auto-approved by mode -- this is the #232 invariant
         // that keeps python / `rm` behind a deliberate yes.
         assert!(!mode_auto_approves(Mode::Auto, Safety::Dangerous));
         // Act and Plan prompt for writes too.
         assert!(!mode_auto_approves(Mode::Act, Safety::Write));
         assert!(!mode_auto_approves(Mode::Plan, Safety::Write));
+        assert!(!mode_auto_approves(Mode::Act, Safety::Sensitive));
+        assert!(!mode_auto_approves(Mode::Plan, Safety::Sensitive));
         assert!(!mode_auto_approves(Mode::Act, Safety::Dangerous));
         assert!(!mode_auto_approves(Mode::Plan, Safety::Dangerous));
         // ReadOnly never reaches the approver, but the helper is conservative.

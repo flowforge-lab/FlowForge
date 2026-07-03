@@ -66,9 +66,17 @@ impl Tool for AgentTool {
         })
     }
 
-    /// The child may write, and per-call approval is enforced inside the child loop.
+    /// Sub-agent spawn is externally-visible, so it is [`Safety::Sensitive`]
+    /// (#698); per-call approval is still enforced inside the child loop. Treated
+    /// identically to `Write` for now — same approval behavior.
     fn safety(&self, _args: &Value) -> Safety {
-        Safety::Write
+        Safety::Sensitive
+    }
+
+    /// Ceiling matches [`safety`](Self::safety): this tool is always `Sensitive`,
+    /// so it stays hidden in Plan-mode advertisement (same as `Write`).
+    fn max_safety(&self) -> Safety {
+        Safety::Sensitive
     }
 
     /// Never reached in the normal flow — the agent loop intercepts `agent` calls
@@ -88,7 +96,7 @@ mod tests {
         let t = AgentTool;
         assert_eq!(t.name(), "agent");
         assert!(!t.interactive());
-        assert_eq!(t.safety(&Value::Null), Safety::Write);
+        assert_eq!(t.safety(&Value::Null), Safety::Sensitive);
         let params = t.parameters();
         assert_eq!(params["required"][0], "task");
         assert_eq!(params["properties"]["task"]["type"], "string");

@@ -7,12 +7,20 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 /// How much trust a given invocation needs. The agent loop auto-runs
-/// [`Safety::ReadOnly`] and defers [`Safety::Write`] / [`Safety::Dangerous`] to an
-/// approval policy supplied by the host (UI confirm in the desktop shell).
+/// [`Safety::ReadOnly`] and defers [`Safety::Write`] / [`Safety::Sensitive`] /
+/// [`Safety::Dangerous`] to an approval policy supplied by the host (UI confirm
+/// in the desktop shell).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Safety {
     ReadOnly,
     Write,
+    /// Externally-visible actions (network egress, sub-agent spawn) that warrant
+    /// a distinct trust tier between [`Write`](Self::Write) and
+    /// [`Dangerous`](Self::Dangerous) (#682). Data modeling only for now (#698):
+    /// treated identically to [`Write`](Self::Write) everywhere — auto-approved
+    /// in Auto, prompted in Act/Plan, hidden in Plan-mode advertisement — until a
+    /// follow-up PR differentiates its handling.
+    Sensitive,
     Dangerous,
 }
 
