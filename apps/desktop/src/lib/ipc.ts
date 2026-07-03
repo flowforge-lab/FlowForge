@@ -391,6 +391,12 @@ export interface FfIpc {
   /** Download and install the available update; the backend relaunches the app on
    *  success (so this never resolves in the real app — see #363 / #362). */
   installUpdate(): Promise<void>;
+  /** Start the dev-update file-system watcher (#705). Idempotent; the watcher
+   *  observes `~/.config/flowforge/dev-update/latest.json` and emits
+   *  `update:local-feed-changed` instantly on write. */
+  startDevUpdateWatcher(): Promise<void>;
+  /** Fired by the dev-update watcher when a new build lands. */
+  onLocalFeedChanged(cb: () => void): Promise<Unlisten>;
   /** Export a local backup. */
   exportBackup(): Promise<BackupResult>;
   /** Restore from a backup. */
@@ -706,6 +712,9 @@ class TauriIpc implements FfIpc {
 
   checkForUpdates = () => this.invoke<UpdateStatus>("check_for_updates");
   installUpdate = () => this.invoke<void>("install_update");
+  startDevUpdateWatcher = () => this.invoke<void>("start_dev_update_watcher");
+  onLocalFeedChanged = (cb: () => void) =>
+    this.listen<void>("update:local-feed-changed", cb);
   exportBackup = () => this.invoke<BackupResult>("export_backup");
   restoreBackup = () => this.invoke<BackupResult>("restore_backup");
 

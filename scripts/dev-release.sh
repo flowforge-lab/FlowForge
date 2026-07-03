@@ -85,9 +85,37 @@ with open(out, "w") as f:
     json.dump(manifest, f, indent=2)
 PY
 
-echo "==> Serving $BUNDLE_DIR at http://localhost:$PORT (Ctrl-C to stop)"
-echo "    Launch the dev install pointed at the feed:"
-echo "      FF_UPDATER_ENDPOINT=\"http://localhost:$PORT/latest.json\" \\"
-echo "        /Applications/FlowForge.app/Contents/MacOS/FlowForge"
+DEV_UPDATE_DIR="$HOME/.config/flowforge/dev-update"
+PIDFILE="$HOME/.config/flowforge/dev-update-server.pid"
+mkdir -p "$(dirname "$PIDFILE")"
+
+# Kill any previous dev-update server so the port is free.
+if [[ -f "$PIDFILE" ]]; then
+  OLD_PID="$(cat "$PIDFILE")"
+  if kill -0 "$OLD_PID" 2>/dev/null; then
+    echo "==> Stopping previous dev-update server (PID $OLD_PID)"
+    kill "$OLD_PID" 2>/dev/null || true
+    sleep 0.3
+  fi
+  rm -f "$PIDFILE"
+fi
+
+# Copy the bundle + feed to the well-known dev-update directory that the
+# file-system watcher (#705 Phase 2) observes for instant detection.
+mkdir -p "$DEV_UPDATE_DIR"
+cp "$TARBALL" "$DEV_UPDATE_DIR/"
+# Write latest.json LAST so the watcher fires after the tarball is in place.
+cp "$BUNDLE_DIR/latest.json" "$DEV_UPDATE_DIR/latest.json"
+
+echo "==> Starting background HTTP server at http://localhost:$PORT"
 cd "$BUNDLE_DIR"
-exec python3 -m http.server "$PORT"
+python3 -m http.server "$PORT" &>/dev/null &
+SERVER_PID=$!
+echo "$SERVER_PID" > "$PIDFILE"
+
+echo "==> Done. Server PID $SERVER_PID (pidfile: $PIDFILE)"
+echo "    The running FlowForge app will detect the update within ~15s"
+echo "    (requires the localUpdateChannel experimental flag to be on)."
+echo ""
+echo "    To stop the server later:  kill $(cat "$PIDFILE")"
+echo "    To rebuild:                just re-run this script (auto-kills the old server)."

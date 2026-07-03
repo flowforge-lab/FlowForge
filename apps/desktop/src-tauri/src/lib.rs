@@ -2,6 +2,7 @@
 //! all business logic lives in the `ff-*` crates. Each handler deserializes,
 //! calls into a crate, and returns. Streaming responses go out as Tauri events.
 
+mod dev_update_watcher;
 mod git_watch;
 mod optimize;
 mod secrets;
@@ -2179,6 +2180,39 @@ async fn install_update(app: tauri::AppHandle) -> CmdResult<()> {
     app.restart();
 }
 
+/// Start the local dev-update file watcher (#705, Phase 2). Called by the FE on
+/// boot when the `localUpdateChannel` experimental flag is on. The watcher observes
+/// `~/.config/flowforge/dev-update/latest.json` via kqueue/inotify and emits
+/// `update:local-feed-changed` instantly when the file is written, so the FE can
+/// trigger an immediate `refresh()` without waiting for the 15s poll tick.
+///
+/// Idempotent: calling twice is a no-op (the watcher is stored in managed state and
+/// lives for the app lifetime; there is no stop — it is zero-cost when idle).
+#[tauri::command]
+fn start_dev_update_watcher(app: tauri::AppHandle) {
+    use std::sync::Once;
+    static STARTED: Once = Once::new();
+    STARTED.call_once(|| {
+        match dev_update_watcher::DevUpdateWatcher::spawn() {
+            Ok((_watcher, mut rx)) => {
+                // Leak the watcher so it lives for the process lifetime (zero-cost
+                // when idle; the OS kqueue fd stays open).
+                std::mem::forget(_watcher);
+                let emit_app = app.clone();
+                tokio::spawn(async move {
+                    while rx.recv().await.is_some() {
+                        let _ = emit_app.emit("update:local-feed-changed", ());
+                    }
+                });
+                tracing::info!("dev-update watcher started");
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to start dev-update watcher");
+            }
+        }
+    });
+}
+
 /// Map an [`AgentEvent`] to its frontend Tauri event and emit it.
 ///
 /// This is the single source of truth for the `AgentEvent → app.emit(…)` wire
@@ -2695,6 +2729,7 @@ pub fn run() {
             remove_mcp_server,
             check_for_updates,
             install_update,
+            start_dev_update_watcher,
             mark_fe_ready,
             is_app_ready,
         ])

@@ -2013,6 +2013,12 @@ Shipping the Settings redesign — currently the Memory browser (SET.8).
   // ~5 cumulative progress ticks up to a fixed total, then `update:download-finished`,
   // so the determinate progress bar is exercisable under VITE_FF_MOCK=1. Resolves once
   // the stream completes (the real path never resolves — it relaunches).
+  async startDevUpdateWatcher(): Promise<void> {
+    // No-op in mock — no filesystem watcher needed.
+  }
+  async onLocalFeedChanged(_cb: () => void): Promise<Unlisten> {
+    return () => {};
+  }
   async installUpdate(): Promise<void> {
     const total = 5 * 1024 * 1024; // 5 MiB
     const chunks = 5;
