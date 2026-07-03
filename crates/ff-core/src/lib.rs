@@ -5,6 +5,7 @@
 
 pub mod events;
 mod export;
+mod goal;
 mod mcp;
 mod memory;
 mod message;
@@ -17,6 +18,10 @@ mod session;
 mod skill;
 
 pub use export::Format;
+pub use goal::{
+    Goal, GoalBudget, GoalLedgerEntry, GoalSpend, GoalStatus, GoalStore, NextAction, StepStatus,
+    Verdict, DEFAULT_MAX_ITERATIONS,
+};
 pub use mcp::{McpScope, McpServerConfig, McpServerState, McpServerStatus, McpToolInfo};
 pub use memory::{MemoryChunkStat, MemoryFileInfo, MemoryFileKind, MemoryOverview};
 pub use message::{
