@@ -136,15 +136,23 @@ impl std::fmt::Display for EditMessageError {
 impl std::error::Error for EditMessageError {}
 
 /// A full-text search hit returned by [`SessionStore::search_messages`] and
-/// [`SessionStore::search_in_session`] (#679).
-#[derive(Debug, Clone, serde::Serialize)]
+/// [`SessionStore::search_in_session`] (#679). This is an IPC return type, so
+/// its TypeScript binding is emitted to the desktop `bindings/` dir; the
+/// `#[serde(rename_all)]` drives the camelCase field casing (ts-rs serde-compat
+/// carries it into the binding), matching the ff-core convention.
+#[derive(Debug, Clone, serde::Serialize, ts_rs::TS)]
 #[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "../../../apps/desktop/src/bindings/")]
 pub struct SearchHit {
     pub session_id: String,
     pub session_title: Option<String>,
     pub message_id: String,
     pub role: String,
     pub snippet: String,
+    /// Unix epoch milliseconds. `#[ts(type = "number")]` matches the `Message`
+    /// / `Session` convention so the binding is `number`, not ts-rs's default
+    /// `bigint` for `i64` — the documented FE contract is `createdAt: number`.
+    #[ts(type = "number")]
     pub created_at: i64,
 }
 
