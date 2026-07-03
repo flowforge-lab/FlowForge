@@ -268,7 +268,11 @@ impl SessionStore {
         let mut stmt = conn
             .prepare(
                 "SELECT f.message_id, f.session_id, m.role, m.created_at, s.title,
-                        snippet(messages_fts, 2, '<mark>', '</mark>', '...', 32) AS snip
+                        CASE
+                            WHEN snippet(messages_fts, 2, '<mark>', '</mark>', '...', 32) LIKE '%<mark>%'
+                                THEN snippet(messages_fts, 2, '<mark>', '</mark>', '...', 32)
+                            ELSE snippet(messages_fts, 3, '<mark>', '</mark>', '...', 32)
+                        END AS snip
                  FROM messages_fts f
                  JOIN messages m ON m.id = f.message_id
                  JOIN sessions s ON s.id = f.session_id
@@ -304,7 +308,11 @@ impl SessionStore {
         let mut stmt = conn
             .prepare(
                 "SELECT f.message_id, f.session_id, m.role, m.created_at, s.title,
-                        snippet(messages_fts, 2, '<mark>', '</mark>', '...', 32) AS snip
+                        CASE
+                            WHEN snippet(messages_fts, 2, '<mark>', '</mark>', '...', 32) LIKE '%<mark>%'
+                                THEN snippet(messages_fts, 2, '<mark>', '</mark>', '...', 32)
+                            ELSE snippet(messages_fts, 3, '<mark>', '</mark>', '...', 32)
+                        END AS snip
                  FROM messages_fts f
                  JOIN messages m ON m.id = f.message_id
                  JOIN sessions s ON s.id = f.session_id
@@ -1339,6 +1347,40 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
         )?;
         conn.pragma_update(None, "user_version", 10)?;
     }
+    if version < 11 {
+        // #679: also index tool-call *arguments*, not just message text and tool
+        // result bodies. The v10 index covered only `content`, so searching for the
+        // command/path/query of a tool call (e.g. "git rebase", a fetched URL) found
+        // nothing. FTS5 columns can't be added in place, so recreate the table and
+        // triggers with a `tool_calls` column and re-backfill. FTS5 MATCH spans all
+        // indexed columns, so a hit in either `content` or `tool_calls` is returned;
+        // the search snippet prefers whichever column actually matched.
+        conn.execute_batch(
+            "DROP TRIGGER IF EXISTS messages_fts_ai;
+             DROP TRIGGER IF EXISTS messages_fts_au;
+             DROP TRIGGER IF EXISTS messages_fts_ad;
+             DROP TABLE IF EXISTS messages_fts;
+             CREATE VIRTUAL TABLE messages_fts
+                 USING fts5(message_id UNINDEXED, session_id UNINDEXED, content, tool_calls);
+             CREATE TRIGGER messages_fts_ai AFTER INSERT ON messages BEGIN
+                 INSERT INTO messages_fts(message_id, session_id, content, tool_calls)
+                 VALUES (new.id, new.session_id, new.content, COALESCE(new.tool_calls, ''));
+             END;
+             CREATE TRIGGER messages_fts_au AFTER UPDATE OF content, tool_calls ON messages BEGIN
+                 DELETE FROM messages_fts WHERE message_id = old.id;
+                 INSERT INTO messages_fts(message_id, session_id, content, tool_calls)
+                 VALUES (new.id, new.session_id, new.content, COALESCE(new.tool_calls, ''));
+             END;
+             CREATE TRIGGER messages_fts_ad AFTER DELETE ON messages BEGIN
+                 DELETE FROM messages_fts WHERE message_id = old.id;
+             END;",
+        )?;
+        conn.execute_batch(
+            "INSERT INTO messages_fts(message_id, session_id, content, tool_calls)
+             SELECT id, session_id, content, COALESCE(tool_calls, '') FROM messages;",
+        )?;
+        conn.pragma_update(None, "user_version", 11)?;
+    }
     Ok(())
 }
 
@@ -1771,7 +1813,7 @@ mod tests {
             .unwrap()
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 10);
+        assert_eq!(version, 11);
     }
 
     #[test]
@@ -1892,7 +1934,7 @@ mod tests {
             .unwrap()
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 10);
+        assert_eq!(version, 11);
     }
 
     #[test]
@@ -1943,7 +1985,7 @@ mod tests {
             .unwrap()
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 10);
+        assert_eq!(version, 11);
     }
 
     #[test]
@@ -2320,7 +2362,7 @@ mod tests {
             .unwrap()
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 10);
+        assert_eq!(version, 11);
     }
 
     #[test]
@@ -2382,7 +2424,7 @@ mod tests {
             .unwrap()
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 10);
+        assert_eq!(version, 11);
     }
 
     #[test]
@@ -2544,7 +2586,7 @@ mod tests {
             .unwrap()
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 10);
+        assert_eq!(version, 11);
     }
 
     #[test]
@@ -2825,5 +2867,34 @@ mod tests {
         // Should not panic or error on special characters.
         let hits = store.search_messages("test*", 10);
         assert_eq!(hits.len(), 1);
+    }
+
+    #[test]
+    fn search_finds_tool_call_arguments() {
+        let store = SessionStore::new();
+        let s = store.create_session(None);
+        // A tool-call-only assistant row: empty text body, args live in tool_calls.
+        let msg = store.add_message(&s.id, Role::Assistant, String::new());
+        store.attach_tool_calls(
+            &msg.id,
+            &s.id,
+            vec![ToolCall {
+                id: "call_1".into(),
+                name: "bash".into(),
+                arguments: r#"{"command":"git rebase --interactive HEAD~3"}"#.into(),
+            }],
+        );
+
+        // A term that appears only inside the tool-call arguments must be found by
+        // both the cross-session and single-session search, with a `<mark>` snippet.
+        let hits = store.search_messages("rebase", 10);
+        assert_eq!(hits.len(), 1, "tool-call args should be searchable");
+        assert_eq!(hits[0].message_id, msg.id);
+        assert!(hits[0].snippet.contains("<mark>"));
+
+        let scoped = store.search_in_session(&s.id, "rebase");
+        assert_eq!(scoped.len(), 1);
+        assert_eq!(scoped[0].message_id, msg.id);
+        assert!(scoped[0].snippet.contains("<mark>"));
     }
 }
