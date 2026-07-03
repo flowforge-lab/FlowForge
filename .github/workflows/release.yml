@@ -103,12 +103,15 @@ jobs:
           - platform: macos-14
             args: '--target universal-apple-darwin'
             cache-prefix: release-desktop-aarch64
+            cli-targets: 'aarch64-apple-darwin x86_64-apple-darwin'
           - platform: ubuntu-latest
             args: ''
             cache-prefix: release-desktop-linux
+            cli-targets: 'x86_64-unknown-linux-gnu'
           - platform: windows-latest
             args: ''
             cache-prefix: release-desktop-windows
+            cli-targets: 'x86_64-pc-windows-msvc'
     runs-on: ${{ matrix.platform }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -151,6 +154,20 @@ jobs:
         with:
           prefix-key: ${{ matrix.cache-prefix }}
 
+      # Build the CLI sidecar binary for each target this platform needs.
+      # Tauri's externalBin expects binaries/flowforge-<triple>[.exe] to exist
+      # at bundle time. macOS universal needs both arm64 + x86_64 sidecars.
+      - name: Build CLI sidecar
+        shell: bash
+        run: |
+          mkdir -p apps/desktop/src-tauri/binaries
+          for triple in ${{ matrix.cli-targets }}; do
+            cargo build --release -p ff-cli --target "$triple"
+            ext=""
+            if [[ "$triple" == *windows* ]]; then ext=".exe"; fi
+            cp "target/$triple/release/flowforge$ext" "apps/desktop/src-tauri/binaries/flowforge-${triple}${ext}"
+          done
+
       # tauri-action builds the app (beforeBuildCommand runs `pnpm build`),
       # signs the updater artifact (.app.tar.gz / -setup.exe + .sig) with the
       # minisign key, then find-or-creates the GitHub Release for the tag **as a
@@ -186,7 +203,6 @@ jobs:
         with:
           path: artifacts
           merge-multiple: true
-          skip-decompress: true
 
       - name: Generate checksums
         working-directory: artifacts
