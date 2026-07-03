@@ -1,82 +1,83 @@
-# FlowForge 🔗🧠
+<p align="center">
+  <img src="docs/assets/banner.png" width="600" alt="FlowForge">
+</p>
 
-A fast, open-source AI interface built for flow-state interaction.  
-FlowForge is the **open UI layer** of the NeuroForge ecosystem — keyboard-native, local-first, and designed to make AI collaboration feel like a natural extension of your thoughts.
+<p align="center">
+  Open-source, local-first, keyboard-driven AI coding interface.
+</p>
 
-> 🚀 Not another agent wrapper. A personal interface tuned to the biology of focus.
+<p align="center">
+  <a href="README.zh-CN.md">中文</a> | English
+</p>
 
-> 📜 All contributions follow our [Engineering Principles](./PRINCIPLES.md) — read the charter before you build.
+---
 
-## ⚡ Core Principles
-| Principle | Implementation |
-|-----------|----------------|
-| **Flow-First UX** | `<200ms` cold start, `Cmd/Ctrl+K` keyboard-native invocation, zero-modal workflow |
-| **Local-First Architecture** | All logs, session state, and intention signals live in SQLite. Cloud sync is strictly opt-in |
-| **Failure-Friendly Design** | Abandoned tasks are auto-detected via context switches and surfaced as neutral learning signals — never guilt |
-| **Intention-Aware Sessions** | Every session begins with a stated goal and ends with an outcome signal. FlowForge closes the loop so downstream systems (NeuroForge) can learn |
+## Features
 
-## 🛠️ Tech Stack
-- **Runtime:** Tauri 2 (Rust backend + OS Webview)
-- **Frontend:** React 19 + TypeScript + Vite
-- **State & Storage:** Zustand + `tauri-plugin-sql` (SQLite)
-- **AI Layer:** candle-vllm (local Rust inference, OpenAI-compatible) + Amazon Bedrock (cloud route)
-- **Styling:** Tailwind CSS + shadcn/ui
+- **Multi-provider LLM** — OpenAI-compatible (Ollama, LM Studio, SiliconFlow, OpenRouter), Anthropic (native Messages API), AWS Bedrock (Converse API)
+- **Agent loop** — research, plan, implement, verify — with streaming tool calls and interactive approval
+- **Tool system** — bash, edit, view, grep, glob, web_fetch, web_search, python, apply_patch, and more
+- **MCP host** — connect external tool servers (stdio/SSE) with health monitoring and auto-restart
+- **Memory** — durable Markdown source-of-truth + SQLite FTS5 recall + optional local embeddings (hybrid BM25 + vector)
+- **Skills & phenotypes** — hot-reloadable YAML-manifest skills, composable agent personas
+- **Scheduled tasks** — cron-style automation with configurable approval ceilings
+- **Multi-pane sessions** — split-view editor, per-pane workspace and model binding
+- **CLI** — headless scripting with the same agent loop, CI-friendly exit codes
+- **Plan / Auto / Act modes** — dial agent autonomy from read-only analysis to full execution
 
-## 🧠 NeuroForge Integration
+## Tech Stack
 
-FlowForge and NeuroForge are separate but complementary systems:
+| Layer | Technology |
+|-------|-----------|
+| Shell | Tauri 2 (Rust backend + OS webview) |
+| Frontend | React 19 + TypeScript + Vite |
+| State | Zustand |
+| Storage | SQLite (sessions, memory index, scheduled tasks, flush ledger) |
+| Styling | Tailwind CSS + shadcn/ui |
+| AI | Multi-provider: OpenAI-compatible, Anthropic, Bedrock, Ollama (native) |
 
-```
-┌──────────────┐         ┌──────────────────┐
-│  FlowForge   │ signals │    NeuroForge    │
-│  (this repo) │────────▶│  (plugin system) │
-│              │◀────────│                  │
-│  UI + Agent  │ insights│  RPE models,     │
-│  + Tools     │         │  flow scoring,   │
-│              │         │  adaptive pacing  │
-└──────────────┘         └──────────────────┘
-```
-
-- **FlowForge generates the signal** — intention→outcome pairs, session timing, context-switch events, task abandonment patterns
-- **NeuroForge consumes via plugin API** — computes RPE (reward prediction error), models aMCC activation, scores flow states
-- **FlowForge surfaces the insights** — inline, non-intrusive feedback calibrated to reinforce sustainable cognitive habits
-
-FlowForge is fully functional without NeuroForge. The integration unlocks a closed-loop cognitive feedback system for users who opt in.
-
-## 📦 Architecture
+## Architecture
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │                      FlowForge Desktop                       │
-│                      (Tauri 2 Shell)                         │
+│                        (Tauri 2)                             │
 ├─────────────────────────────────────────────────────────────┤
 │  ┌───────────────────────────────────────────────────────┐  │
 │  │              React Frontend (Webview)                  │  │
 │  │                                                       │  │
 │  │  ┌─────────────┐  ┌──────────────┐  ┌────────────┐  │  │
-│  │  │  Chat View  │  │ Flow Canvas  │  │  Cmd+K Bar │  │  │
-│  │  │  (streams)  │  │ (workflows)  │  │  (palette) │  │  │
+│  │  │  Chat View  │  │  Split Panes │  │  Settings  │  │  │
+│  │  │  (streams)  │  │  (#148)      │  │  Panel     │  │  │
 │  │  └─────────────┘  └──────────────┘  └────────────┘  │  │
 │  │                                                       │  │
 │  │  ┌─────────────────────────────────────────────────┐  │  │
-│  │  │         Zustand Store + TanStack Query          │  │  │
+│  │  │                 Zustand Store                    │  │  │
 │  │  └─────────────────────────────────────────────────┘  │  │
 │  └───────────────────────┬───────────────────────────────┘  │
-│                          │ Tauri IPC (invoke/events)         │
+│                          │ Tauri IPC (invoke / events)       │
 ├──────────────────────────┼──────────────────────────────────┤
 │  ┌───────────────────────┴───────────────────────────────┐  │
-│  │              Rust Backend (src-tauri)                  │  │
+│  │                 Rust Backend                           │  │
 │  │                                                       │  │
 │  │  ┌───────────┐  ┌───────────┐  ┌──────────────────┐  │  │
 │  │  │ ff-agent  │  │  ff-llm   │  │    ff-memory     │  │  │
-│  │  │ (loop &   │  │ (Bedrock, │  │ (SQLite + vector │  │  │
-│  │  │  tools)   │  │  candle)  │  │  embeddings)     │  │  │
+│  │  │ (loop &   │  │ (OpenAI,  │  │ (Markdown +      │  │  │
+│  │  │  tools)   │  │  Bedrock, │  │  FTS5 + embed)   │  │  │
+│  │  │           │  │  Anthropic,│  │                  │  │  │
+│  │  │           │  │  Ollama)  │  │                  │  │  │
 │  │  └───────────┘  └───────────┘  └──────────────────┘  │  │
 │  │                                                       │  │
 │  │  ┌───────────┐  ┌───────────┐  ┌──────────────────┐  │  │
-│  │  │ff-signals │  │  ff-mcp   │  │   ff-skills      │  │  │
-│  │  │(intention │  │ (MCP host │  │ (discovery,      │  │  │
-│  │  │ + outcome)│  │  + supvr) │  │  hot-reload)     │  │  │
+│  │  │ff-session │  │  ff-mcp   │  │   ff-skills      │  │  │
+│  │  │(SQLite    │  │ (MCP host │  │ (discovery,      │  │  │
+│  │  │ store)    │  │  + supvr) │  │  hot-reload)     │  │  │
+│  │  └───────────┘  └───────────┘  └──────────────────┘  │  │
+│  │                                                       │  │
+│  │  ┌───────────┐  ┌───────────┐  ┌──────────────────┐  │  │
+│  │  │ff-signals │  │ff-scheduled│ │   ff-tools       │  │  │
+│  │  │(telemetry │  │ (cron     │  │ (bash, edit,     │  │  │
+│  │  │ + signals)│  │  runner)  │  │  view, web, ...) │  │  │
 │  │  └───────────┘  └───────────┘  └──────────────────┘  │  │
 │  └───────────────────────────────────────────────────────┘  │
 ├─────────────────────────────────────────────────────────────┤
@@ -84,52 +85,47 @@ FlowForge is fully functional without NeuroForge. The integration unlocks a clos
 │  ┌──────────────┐  ┌──────────────┐  ┌──────────────────┐  │
 │  │   SQLite DB  │  │  ~/.flowforge│  │  Skills (MD +    │  │
 │  │ (sessions,   │  │  /memory/    │  │  YAML manifests) │  │
-│  │  signals)    │  │  (flat files)│  │                  │  │
+│  │  scheduled)  │  │  (flat files)│  │                  │  │
 │  └──────────────┘  └──────────────┘  └──────────────────┘  │
 └─────────────────────────────────────────────────────────────┘
-         │                    │                    │
-         ▼                    ▼                    ▼
-┌─────────────────┐  ┌────────────────┐  ┌────────────────────┐
-│  LLM Providers  │  │  MCP Servers   │  │    NeuroForge      │
-│  (Bedrock,      │  │  (stdio/SSE,   │  │  (plugin system,   │
-│   candle,       │  │   external     │  │   RPE engine,      │
-│   Anthropic)    │  │   tools)       │  │   flow scoring)    │
-└─────────────────┘  └────────────────┘  └────────────────────┘
+         │                    │
+         ▼                    ▼
+┌─────────────────┐  ┌────────────────┐
+│  LLM Providers  │  │  MCP Servers   │
+│  (OpenAI-compat,│  │  (stdio/SSE,   │
+│   Bedrock,      │  │   external     │
+│   Anthropic,    │  │   tools)       │
+│   Ollama)       │  │                │
+└─────────────────┘  └────────────────┘
 ```
 
 ### Crate Map
 
 | Crate | Role |
 |-------|------|
-| `ff-core` | Domain types — Message, Turn, Skill, Profile, Session |
-| `ff-agent` | Agent loop (research → plan → implement → verify), tool dispatch |
-| `ff-llm` | Provider trait + implementations (candle-vllm, Bedrock, Anthropic) |
+| `ff-core` | Domain types — Message, Turn, Skill, Profile, ProviderConnection |
+| `ff-agent` | Agent loop (tool dispatch, compaction, approval gate) |
+| `ff-llm` | Provider trait + implementations (OpenAI-compatible, Anthropic, Bedrock, Ollama) |
 | `ff-mcp` | MCP client & supervisor — health monitoring, auto-restart, env isolation |
-| `ff-memory` | Markdown-owned durable memory (`MEMORY.md` + daily logs) + SQLite FTS5 recall; optional local embeddings + BM25 fusion ([RFC 0006](docs/rfcs/0006-memory.md)) |
-| `ff-signals` | Intention/outcome event emitter — lightweight signal bus for NeuroForge integration |
-| `ff-skills` | Skill discovery, YAML manifest parsing, hot-reload via filesystem watcher |
-| `ff-tools` | Built-in tools: bash, edit, view, web_fetch, glob, rg |
-| `ff-workflow` | DAG executor for multi-agent orchestration, retries, partial replay |
+| `ff-memory` | Markdown-owned durable memory + SQLite FTS5 recall + optional embeddings ([RFC 0006](docs/rfcs/0006-memory.md)) |
+| `ff-session` | Session persistence (SQLite store, transcript CRUD) |
+| `ff-signals` | Skill telemetry aggregates (activation count, cost, latency, success rate) + signal bus for future NeuroForge integration |
+| `ff-skills` | Skill discovery, YAML manifest parsing, phenotype resolution, hot-reload |
+| `ff-scheduled` | Cron-style task runner with configurable approval ceilings |
+| `ff-tools` | Built-in tools: bash, edit, view, grep, glob, web_fetch, web_search, python, apply_patch |
+| `ff-workflow` | Multi-agent orchestration *(planned — M7)* |
 
-### Open-Core Model
-
-- **Open (this repo):** The full desktop app, agent loop, tool system, skill engine, signal emitter, and local-first storage. You own your data, your workflows, your memory.
-- **Open (NeuroForge SDK):** The plugin API and reference implementations for consuming FlowForge signals. Build your own cognitive feedback plugins.
-- **Closed (NeuroForge Cloud — optional):** Advanced neuro-calibration models, cross-device sync, team collaboration, and hosted LLM routing with cost optimization.
-
-The open layer is fully functional standalone — cloud features unlock convenience, never gatekeep capability.
-
-## 🧪 Development
+## Development
 
 ```bash
 # Prerequisites: Rust 1.80+, Node 20+, pnpm 9+
-git clone https://github.com/flowforge-lab/flowforge.git
-cd flowforge
+git clone https://github.com/flowforge-lab/FlowForge.git
+cd FlowForge
 
 # Install frontend deps
 pnpm install
 
-# Run in development (Tauri hot-reload, real Rust backend + local LLM)
+# Run in development (Tauri hot-reload)
 cargo tauri dev
 
 # UI-only: run the frontend against the in-browser mock backend
@@ -140,10 +136,9 @@ pnpm --dir apps/desktop dev:mock
 cargo tauri build
 ```
 
-## 💻 Headless / CLI
+## CLI
 
-FlowForge ships a CLI binary (`flowforge`) for scripting, CI, and headless use
-— same agent loop, same tools, no GUI.
+FlowForge ships a CLI binary (`flowforge`) for scripting, CI, and headless use — same agent loop, same tools, no GUI.
 
 ```bash
 # One-shot: run a single turn and print the result
@@ -161,43 +156,39 @@ flowforge
 
 ### Exit codes
 
-The `run` subcommand follows a scripting-friendly contract:
+- **0** — turn completed successfully (or clean REPL shutdown).
+- **non-zero** — agent error, or a required tool approval was denied.
 
-- **0** — the turn completed successfully.
-- **non-zero** — an agent error occurred (e.g. LLM failure), or a required
-  tool approval was denied (by `--deny`, by the piped-no-policy rule, or by
-  answering `N` at a prompt).
+When stdin is not a terminal and no `--yes` or `--deny` flag is provided, every write/dangerous tool call is **denied by default** — making `--deny` the safe CI default and `--yes` the explicit opt-in for autonomous runs.
 
-The interactive REPL always exits **0** on clean shutdown (EOF / `exit`);
-per-turn failures are printed inline and do not terminate the session.
+## Roadmap
 
-### Approval in CI
-
-When stdin is not a terminal and no `--yes` or `--deny` flag is provided, every
-write/dangerous tool call is **loudly denied** rather than silently run. This
-makes `--deny` the safe default for read-only CI pipelines, and `--yes` the
-explicit opt-in for autonomous runs.
-
-## 🗺️ Roadmap
-
-- [x] Repository bootstrap & architecture definition
-- [x] **M1** — Tauri 2 shell + React chat UI + first LLM call (candle-vllm)
-- [x] **M2** — Tool calling (bash, view, edit) + streaming render + interactive approval
+- [x] **M1** — Tauri 2 shell + React chat UI + first LLM call
+- [x] **M2** — Tool calling (bash, view, edit) + streaming + interactive approval
 - [x] **M3** — Skills + phenotypes + command palette
-- [x] **M4** — MCP host & supervisor — external tool servers (stdio/SSE), lifecycle + server-status UI
-- [x] **M5** — Memory system — Markdown source-of-truth + local SQLite FTS5 recall (optional embeddings) ([RFC 0006](docs/rfcs/0006-memory.md))
-- [ ] **M6** — Cold-start optimization (<200ms)
-- [ ] **M7** — Workflow canvas (visual multi-agent DAGs)
-- [ ] **M8** — NeuroForge integration (intention signals + inline feedback)
+- [x] **M4** — MCP host & supervisor — external tool servers, lifecycle UI
+- [x] **M5** — Memory system — Markdown + FTS5 recall + optional embeddings ([RFC 0006](docs/rfcs/0006-memory.md))
+- 🚧 **M6** — Cold-start optimization (<200ms target)
+- 🔮 **M7** — Workflow canvas (visual multi-agent orchestration)
 
-## 🌐 Ecosystem
+### 0.2.0 (next)
+
+- Permission matrix restructure — `Safety::Sensitive` tier + editable Control panel ([RFC 0019](docs/rfcs/0019-permission-matrix-and-sensitive-tier.md), [#682](https://github.com/flowforge-lab/FlowForge/issues/682))
+- Goal mode — persistent autonomous objective loop ([#683](https://github.com/flowforge-lab/FlowForge/issues/683))
+- Dogfood harness — FlowForge developing FlowForge ([#684](https://github.com/flowforge-lab/FlowForge/issues/684))
+
+## NeuroForge (Planned)
+
+FlowForge and NeuroForge are separate but complementary systems. NeuroForge is a planned cognitive-health layer that consumes FlowForge's intention/outcome signals to model focus states, reward prediction, and adaptive pacing — inspired by neuroscience research on flow, aMCC activation, and dopamine-driven learning.
+
+FlowForge is fully functional standalone. NeuroForge integration will unlock a closed-loop cognitive feedback system for users who opt in.
 
 | Project | Role | Status |
 |---------|------|--------|
-| **FlowForge** (this repo) | Open AI interface — keyboard-native, local-first | Active |
-| **NeuroForge** | Cognitive health plugin system — RPE models, flow scoring, adaptive pacing | Planned |
-| **NeuroForge Cloud** | Cross-device sync, team features, hosted inference, advanced models | Future |
+| **FlowForge** (this repo) | Open AI coding interface — local-first, keyboard-native | Active |
+| **NeuroForge** | Cognitive health plugin — RPE models, flow scoring, adaptive pacing | Planned |
+| **NeuroForge Cloud** | Cross-device sync, team features, hosted inference | Future |
 
-## 📄 License
+## License
 
-[MIT](./LICENSE) — use it, fork it, ship it.
+[MIT](./LICENSE)
