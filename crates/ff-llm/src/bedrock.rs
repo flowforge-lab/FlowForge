@@ -16,7 +16,9 @@ use aws_sdk_bedrockruntime::Client;
 use aws_smithy_types::{Blob, Document, Number};
 use ff_core::Attachment;
 use futures_util::stream::{self, StreamExt};
-use tokio::sync::OnceCell;
+use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
+use std::sync::{Mutex, OnceLock};
 
 use crate::{
     attachment_bytes, ChatMessage, ChatRequest, Chunk, ChunkStream, LlmError, Provider,
@@ -86,17 +88,6 @@ pub struct BedrockProvider {
     /// `reasoning_config.budget_tokens` (Claude extended thinking) and the
     /// matching `maxTokens`. Defaults to [`ReasoningEffort::Medium`].
     reasoning_effort: ReasoningEffort,
-    /// Lazily-built, reused runtime (ConverseStream) client (#691). Building it
-    /// runs `aws_config::defaults(...).load()`, a flat ~950ms of SDK config +
-    /// credential-provider-chain assembly. Region and creds are immutable per
-    /// instance, so the client is safe to build once and reuse across every
-    /// `chat_stream` call — this also keeps the TLS connection pool warm across
-    /// agent-loop iterations. Anthropic/OpenAI cache their `reqwest::Client` the
-    /// same way; before this, Bedrock rebuilt on every call.
-    client: OnceCell<Client>,
-    /// Lazily-built, reused control-plane client (#691), used only by
-    /// `list_models`. Same rationale as [`Self::client`].
-    control_client: OnceCell<aws_sdk_bedrock::Client>,
 }
 
 impl BedrockProvider {
@@ -107,8 +98,6 @@ impl BedrockProvider {
             supports_vision: false,
             supports_documents: false,
             reasoning_effort: ReasoningEffort::default(),
-            client: OnceCell::new(),
-            control_client: OnceCell::new(),
         }
     }
 
@@ -147,14 +136,62 @@ impl BedrockProvider {
     }
 
     /// The cached Bedrock runtime client, building it on first use (#691). The
-    /// AWS SDK client is `Arc`-backed, so the returned clone is cheap and shares
-    /// the connection pool; the expensive `build_client` (incl. `config.load()`)
-    /// runs at most once per provider instance.
+    /// client is cached **process-wide** keyed by `(region, creds-fingerprint)`,
+    /// mirroring how the reqwest providers reuse [`crate::build_streaming_http_client`]
+    /// across turns. This matters because the desktop host rebuilds the provider
+    /// every turn (a config switch takes effect next message), so a per-instance
+    /// cache would die each turn and re-pay the ~950ms `aws_config::...load()`
+    /// plus a cold TLS handshake. Keying by region + a *fingerprint* (never the
+    /// raw secret) of the creds means a changed connection gets a fresh client
+    /// while an unchanged one reuses the warm one across iterations AND turns.
+    /// The AWS SDK client is `Arc`-backed, so the returned clone is cheap and
+    /// shares the connection pool.
     async fn client(&self) -> Client {
-        self.client
-            .get_or_init(|| self.build_client())
-            .await
-            .clone()
+        static CACHE: OnceLock<Mutex<HashMap<u64, Client>>> = OnceLock::new();
+        let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+        let key = self.client_cache_key();
+        if let Some(client) = cache.lock().unwrap().get(&key).cloned() {
+            return client;
+        }
+        // Build outside the lock: `build_client().await` runs `config.load()`,
+        // which must not hold the mutex across an await. A benign race where two
+        // first callers both build is harmless — both clients are valid; the map
+        // simply keeps the last one and the other drops.
+        let client = self.build_client().await;
+        cache.lock().unwrap().insert(key, client.clone());
+        client
+    }
+
+    /// Stable cache key for a client: the region plus a fingerprint of the
+    /// credential source. `Profile` keys on the profile *name* (no secret, and
+    /// stable across credential rotations — the cached client's own SDK provider
+    /// keeps refreshing vended creds). `IamKeys`/`ApiKey` hash their secret so a
+    /// user editing the key yields a new key and a fresh client, without ever
+    /// retaining the raw secret in a process-global map.
+    fn client_cache_key(&self) -> u64 {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        self.region.hash(&mut h);
+        match &self.creds {
+            BedrockCreds::Profile { name } => {
+                0u8.hash(&mut h);
+                name.hash(&mut h);
+            }
+            BedrockCreds::IamKeys {
+                access_key_id,
+                secret_access_key,
+                session_token,
+            } => {
+                1u8.hash(&mut h);
+                access_key_id.hash(&mut h);
+                secret_access_key.hash(&mut h);
+                session_token.hash(&mut h);
+            }
+            BedrockCreds::ApiKey { token } => {
+                2u8.hash(&mut h);
+                token.hash(&mut h);
+            }
+        }
+        h.finish()
     }
 
     /// Build a Bedrock client for the configured region and credential mode.
@@ -210,12 +247,18 @@ impl BedrockProvider {
     }
 
     /// The cached Bedrock control-plane client, building it on first use (#691).
-    /// Same `Arc`-backed cheap-clone rationale as [`Self::client`].
+    /// Same process-wide, fingerprint-keyed cache rationale as [`Self::client`];
+    /// used only by `list_models`.
     async fn control_client(&self) -> aws_sdk_bedrock::Client {
-        self.control_client
-            .get_or_init(|| self.build_control_client())
-            .await
-            .clone()
+        static CACHE: OnceLock<Mutex<HashMap<u64, aws_sdk_bedrock::Client>>> = OnceLock::new();
+        let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+        let key = self.client_cache_key();
+        if let Some(client) = cache.lock().unwrap().get(&key).cloned() {
+            return client;
+        }
+        let client = self.build_control_client().await;
+        cache.lock().unwrap().insert(key, client.clone());
+        client
     }
 
     /// Build a Bedrock *control-plane* client, used only by `list_models`
@@ -1091,35 +1134,116 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn client_is_built_once_and_reused_across_calls() {
+    async fn client_is_reused_across_calls_and_instances() {
         // Regression for #691: `chat_stream` used to rebuild the AWS client (incl.
-        // a ~950ms `config.load()`) on every call. The client is now cached in a
-        // OnceCell, so it must be built at most once and reused. IamKeys mode
-        // builds synchronously with no network/credential-file I/O, so this test
-        // is hermetic.
-        let provider = BedrockProvider::new(
+        // a ~950ms `config.load()`) on EVERY call, and the desktop host rebuilds
+        // the provider every turn — so the cost compounded per iteration and per
+        // turn. The client is now cached process-wide keyed by (region, creds
+        // fingerprint), so:
+        //   (a) repeated calls on one instance reuse it (per-iteration), and
+        //   (b) a fresh instance with the same connection reuses it (per-turn).
+        // The cache key is what enforces both. IamKeys mode is hermetic (no
+        // network / credential-file I/O), so client() is safe to call here.
+        let creds = || BedrockCreds::IamKeys {
+            access_key_id: "AKIAEXAMPLE".into(),
+            secret_access_key: "secret".into(),
+            session_token: None,
+        };
+        let a = BedrockProvider::new("us-east-2", creds());
+        let b = BedrockProvider::new("us-east-2", creds());
+
+        // (a) same instance, repeated calls -> same cache key.
+        assert_eq!(
+            a.client_cache_key(),
+            a.client_cache_key(),
+            "cache key must be stable across calls (per-iteration reuse)"
+        );
+        // (b) a rebuilt provider for the same connection -> same cache key, so a
+        // new turn reuses the warm client instead of re-paying config.load().
+        assert_eq!(
+            a.client_cache_key(),
+            b.client_cache_key(),
+            "identical connection must reuse the cached client across turns"
+        );
+
+        // Hermetic smoke: building twice succeeds and does not panic.
+        let _c1 = a.client().await;
+        let _c2 = b.client().await;
+    }
+
+    #[test]
+    fn client_cache_key_distinguishes_region_and_credentials() {
+        // A changed connection must yield a fresh client — differing region,
+        // profile name, or secret material each produce a distinct key.
+        let base = BedrockProvider::new(
             "us-east-2",
-            BedrockCreds::IamKeys {
-                access_key_id: "AKIAEXAMPLE".into(),
-                secret_access_key: "secret".into(),
-                session_token: None,
+            BedrockCreds::Profile {
+                name: "bedrock-profile".into(),
             },
         );
-        assert!(
-            !provider.client.initialized(),
-            "client must be lazy — not built until first use"
+        let other_region = BedrockProvider::new(
+            "us-west-2",
+            BedrockCreds::Profile {
+                name: "bedrock-profile".into(),
+            },
         );
-        let _c1 = provider.client().await;
-        assert!(
-            provider.client.initialized(),
-            "first client() call must initialize the cache"
+        let other_profile = BedrockProvider::new(
+            "us-east-2",
+            BedrockCreds::Profile {
+                name: "different-profile".into(),
+            },
         );
-        // A second call must not rebuild: OnceCell::get returns the same instance
-        // that get_or_init stored, so the cached value is unchanged.
-        let cached = provider.client.get().expect("client cached") as *const Client;
-        let _c2 = provider.client().await;
-        let after = provider.client.get().expect("client still cached") as *const Client;
-        assert_eq!(cached, after, "second client() call must reuse the cache");
+        assert_ne!(
+            base.client_cache_key(),
+            other_region.client_cache_key(),
+            "different region must not share a client"
+        );
+        assert_ne!(
+            base.client_cache_key(),
+            other_profile.client_cache_key(),
+            "different profile must not share a client"
+        );
+
+        // Same profile+region is stable (cross-turn reuse).
+        let same = BedrockProvider::new(
+            "us-east-2",
+            BedrockCreds::Profile {
+                name: "bedrock-profile".into(),
+            },
+        );
+        assert_eq!(base.client_cache_key(), same.client_cache_key());
+
+        // Editing an IAM secret rotates the key, so a fresh client is built.
+        let key1 = BedrockProvider::new(
+            "us-east-2",
+            BedrockCreds::IamKeys {
+                access_key_id: "AKIA".into(),
+                secret_access_key: "s1".into(),
+                session_token: None,
+            },
+        )
+        .client_cache_key();
+        let key2 = BedrockProvider::new(
+            "us-east-2",
+            BedrockCreds::IamKeys {
+                access_key_id: "AKIA".into(),
+                secret_access_key: "s2".into(),
+                session_token: None,
+            },
+        )
+        .client_cache_key();
+        assert_ne!(key1, key2, "a changed secret must not reuse the old client");
+
+        // Distinct credential *modes* never collide on the same material shape.
+        let profile_key = base.client_cache_key();
+        let apikey = BedrockProvider::new(
+            "us-east-2",
+            BedrockCreds::ApiKey {
+                token: "bedrock-profile".into(),
+            },
+        )
+        .client_cache_key();
+        assert_ne!(profile_key, apikey, "credential mode must be part of the key");
     }
 
     #[test]

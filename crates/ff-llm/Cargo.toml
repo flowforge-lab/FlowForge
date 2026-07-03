@@ -47,10 +47,6 @@ aws-sdk-bedrock = { version = "1", default-features = false, features = ["behavi
 aws-smithy-http-client = { version = "1", default-features = false, features = ["rustls-ring"] }
 aws-smithy-types = "1"
 aws-credential-types = { version = "1", features = ["hardcoded-credentials"] }
-# Async one-time init for the cached Bedrock clients (#691): the client build is
-# async (`config.load().await`), so std::sync::OnceLock can't initialize it —
-# tokio's OnceCell can. `sync` is the only feature needed for the non-test build.
-tokio = { version = "1", default-features = false, features = ["sync"] }
 
 [dev-dependencies]
 tokio = { workspace = true }
