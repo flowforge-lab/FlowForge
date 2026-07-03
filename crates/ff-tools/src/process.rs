@@ -40,6 +40,7 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 
 use crate::registry::{Safety, Tool, ToolOutcome, NO_SESSION};
+use crate::sink::{OutputSink, OutputStream};
 #[cfg(windows)]
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
 #[cfg(windows)]
@@ -683,6 +684,28 @@ impl Tool for ProcessManagerTool {
             None => ToolOutcome::error("missing required argument: action (start|poll|list|stop)"),
         }
     }
+
+    /// Streaming override (#680 V2): for `poll` and `list` actions, emit the captured
+    /// output to the sink so the frontend renders it progressively in the tool-call
+    /// block. For `start`/`stop`, delegates to `run_with_session` (one-shot output).
+    async fn run_streaming(
+        &self,
+        args: Value,
+        root: &Path,
+        session_id: &str,
+        sink: Option<OutputSink>,
+    ) -> ToolOutcome {
+        let outcome = self.run_with_session(args, root, session_id).await;
+        // Emit the result to the live sink so the FE can render it progressively.
+        // This is most useful for `poll` (potentially large buffered output from a
+        // running server) but we emit for all actions uniformly.
+        if let Some(sink) = sink {
+            if !outcome.content.is_empty() {
+                sink.emit(OutputStream::Stdout, outcome.content.clone());
+            }
+        }
+        outcome
+    }
 }
 
 #[cfg(test)]
@@ -912,6 +935,59 @@ mod tests {
         assert!(
             sup.procs.lock().unwrap().get(&done_id).is_none(),
             "finished process should have been removed"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_streaming_emits_poll_output_to_sink() {
+        let dir = TempDir::new().unwrap();
+        let sup = Arc::new(ProcessSupervisor::new());
+        let tool = ProcessManagerTool::new(sup.clone());
+
+        // Start a process that finishes quickly with known output.
+        let start_out = tool
+            .run_with_session(
+                json!({"action": "start", "command": "echo hello_stream"}),
+                dir.path(),
+                "s1",
+            )
+            .await;
+        assert!(start_out.success, "{}", start_out.content);
+        // Extract process id from "started process 1: ..."
+        let id: u64 = start_out
+            .content
+            .split_whitespace()
+            .nth(2)
+            .unwrap()
+            .trim_end_matches(':')
+            .parse()
+            .unwrap();
+
+        // Wait for process to finish.
+        wait_done(&sup, id, 5).await;
+
+        // Poll with a sink — should emit the output.
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let sink = OutputSink::new(tx);
+        let poll_out = tool
+            .run_streaming(
+                json!({"action": "poll", "process_id": id}),
+                dir.path(),
+                "s1",
+                Some(sink),
+            )
+            .await;
+        assert!(poll_out.success);
+        assert!(poll_out.content.contains("hello_stream"));
+
+        // The sink received the same content.
+        let mut streamed = String::new();
+        while let Ok((_stream, delta)) = rx.try_recv() {
+            streamed.push_str(&delta);
+        }
+        assert!(
+            streamed.contains("hello_stream"),
+            "sink should contain poll output: {streamed}"
         );
     }
 }
