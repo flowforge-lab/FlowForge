@@ -12,6 +12,9 @@ import { useExperimentalStore } from "@/store/experimental";
 
 // How often the production build re-checks for an update in the background.
 const UPDATE_POLL_MS = 6 * 60 * 60 * 1000;
+// Local dogfood channel (#705): poll every 15s so a dev-release.sh build is
+// picked up within seconds. Negligible on loopback (one tiny GET per tick).
+const DEV_POLL_MS = 15_000;
 
 // Module-level guard: StrictMode runs effects twice in dev; bootstrapping twice
 // would create duplicate sessions.
@@ -175,12 +178,39 @@ function App() {
         localUpdateChannel,
       )
     ) {
-      void useUpdateStore.getState().refresh();
-      const id = setInterval(
-        () => void useUpdateStore.getState().refresh(),
-        UPDATE_POLL_MS,
-      );
-      return () => clearInterval(id);
+      // In dogfood mode, auto-install detected updates without user
+      // intervention (#705). The refresh+install cycle is fire-and-forget.
+      const poll = async () => {
+        const store = useUpdateStore.getState();
+        await store.refresh();
+        if (
+          localUpdateChannel &&
+          !store.installing &&
+          useUpdateStore.getState().status?.kind === "available"
+        ) {
+          void store.install();
+        }
+      };
+      void poll();
+      const pollMs = localUpdateChannel ? DEV_POLL_MS : UPDATE_POLL_MS;
+      const id = setInterval(() => void poll(), pollMs);
+
+      // Phase 2 (#705): file-system watcher for instant detection. Start the
+      // backend watcher and listen for its event to trigger an immediate poll,
+      // skipping the 15s wait. Zero-cost when idle (OS kqueue/inotify).
+      let feedUnsub: (() => void) | undefined;
+      if (localUpdateChannel) {
+        void ipc.startDevUpdateWatcher();
+        void ipc
+          .onLocalFeedChanged(() => void poll())
+          .then((unsub) => {
+            feedUnsub = unsub;
+          });
+      }
+      return () => {
+        clearInterval(id);
+        feedUnsub?.();
+      };
     }
   }, [ready]);
 
