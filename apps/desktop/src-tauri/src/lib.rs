@@ -2460,6 +2460,22 @@ trait BootFinalize {
     fn emit_ready(&self);
 }
 
+/// Render a caught panic payload (`Box<dyn Any + Send>`) into a human-readable,
+/// `context`-prefixed message. A panic payload is one of two common stringy forms
+/// (`&'static str` from `panic!("literal")`, `String` from `panic!("{fmt}")`) or,
+/// rarely, something else; fall back to a generic note so the FE never gets an
+/// opaque "unknown" with no clue where to look. Shared by the detached MCP-init
+/// task and the outer `post-init` `catch_unwind` so both format identically.
+fn panic_message(context: &str, payload: &Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<&'static str>() {
+        format!("{context} panicked: {s}")
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        format!("{context} panicked: {s}")
+    } else {
+        format!("{context} panicked (non-string panic payload)")
+    }
+}
+
 /// Run the boot-finalization sequence in the order the FE gate requires:
 /// `manage` → `APP_READY = true` → `emit("app:ready")`. The only call site is
 /// the hydrate task in `run()`; the order is the invariant guarded by
@@ -2539,20 +2555,61 @@ pub fn run() {
 
                 // Guard the post-spawn_blocking body so no panic goes unlogged.
                 // This task's `JoinHandle` is dropped, so a panic in
-                // `init_mcp` / `init_git_watcher` / `start_process_reaper` / the
-                // scheduler wiring would be silently discarded by Tokio —
-                // leaving `APP_READY` false and the FE on a dead `<BootSplash>`
-                // spinner with no clue where it stopped (regression: previously
-                // this ran on the main thread, where a panic was a visible
-                // crash). Catch the unwind, log it, and emit `app:init-error`
-                // (the same wire the `AppState::new()` panic path above uses) so
-                // the FE can surface an actionable error. `error_handle` stays
-                // outside the closure so it survives the panic to emit.
+                // `init_git_watcher` / `start_process_reaper` / the scheduler
+                // wiring would be silently discarded by Tokio — leaving
+                // `APP_READY` false and the FE on a dead `<BootSplash>` spinner
+                // with no clue where it stopped (regression: previously this ran
+                // on the main thread, where a panic was a visible crash). Catch
+                // the unwind, log it, and emit `app:init-error` (the same wire the
+                // `AppState::new()` panic path above uses) so the FE can surface an
+                // actionable error. `error_handle` stays outside the closure so it
+                // survives the panic to emit. (The detached MCP-init task below
+                // guards its own body the same way — the outer catch covers only
+                // its `spawn` call, not the task's later execution.)
                 let error_handle = app_handle.clone();
                 let post_init = move || {
+                    // MCP servers are not needed for first paint (RFC 0003; the
+                    // composer works with zero tools, and `list_mcp_servers`
+                    // returns empty-not-error before the host is up), so init runs
+                    // in its OWN spawned task rather than inline here — keeping the
+                    // synchronous `mcp.json` read + OS watcher registration inside
+                    // `init_mcp` off the path to `publish_app_ready` (#599 item 5).
                     // `init_mcp` enters the shared Tokio runtime itself, so it's
-                    // safe to call here (issue #117).
-                    state.init_mcp();
+                    // safe from this task (issue #117). The `mcp:status-changed`
+                    // forwarder stays in the SAME task, sequenced AFTER `init_mcp`
+                    // returns, so `mcp_handle()` is populated before it is read —
+                    // no status updates are lost to a race. This task is detached,
+                    // so guard its body: a panic here would otherwise be discarded
+                    // by Tokio (the outer `catch_unwind` covers only the spawn).
+                    {
+                        let state = state.clone();
+                        let app_handle = app_handle.clone();
+                        tauri::async_runtime::spawn(async move {
+                            // `&AppState` is not `UnwindSafe`, so assert it across
+                            // the catch boundary (the state is only read here).
+                            let guarded = AssertUnwindSafe(|| state.init_mcp());
+                            if let Err(payload) = catch_unwind(guarded) {
+                                let msg = panic_message("mcp init", &payload);
+                                tracing::error!("{msg}");
+                                let _ = app_handle.emit("app:init-error", &msg);
+                                return;
+                            }
+                            // Forward supervisor status changes to the FE as
+                            // `mcp:status-changed`, so the servers panel reflects
+                            // start/stop/restart/health without polling. The watch
+                            // tick coalesces; we re-snapshot on each wake.
+                            if let Some(handle) = state.mcp_handle() {
+                                let mut rx = handle.status_changed_rx();
+                                while rx.changed().await.is_ok() {
+                                    let servers = handle.status_snapshot();
+                                    let _ = app_handle.emit(
+                                        "mcp:status-changed",
+                                        McpStatusChangedEvent { servers },
+                                    );
+                                }
+                            }
+                        });
+                    }
                     // Live-sync the active session's git branch (#561 BE half): the
                     // GitHeadWatcher observes the workspace's `.git/HEAD` and emits
                     // `workspace:branch-changed` on a real branch change, which the FE
@@ -2572,20 +2629,6 @@ pub fn run() {
                     // agent abandoned (started but never polled again) are cleaned up on
                     // a timer. Enters the runtime itself, so it's safe here too.
                     state.start_process_reaper();
-                    // Forward supervisor status changes to the FE as `mcp:status-changed`,
-                    // so the servers panel reflects start/stop/restart/health without
-                    // polling. The watch tick coalesces; we re-snapshot on each wake.
-                    if let Some(handle) = state.mcp_handle() {
-                        let app_handle = app_handle.clone();
-                        let mut rx = handle.status_changed_rx();
-                        tauri::async_runtime::spawn(async move {
-                            while rx.changed().await.is_ok() {
-                                let servers = handle.status_snapshot();
-                                let _ = app_handle
-                                    .emit("mcp:status-changed", McpStatusChangedEvent { servers });
-                            }
-                        });
-                    }
                     // Drive the scheduled-task firing engine (RFC 0017 section 4, #542):
                     // a background sweep fires due tasks through the desktop runner. The
                     // tick is coarse; the due predicate is minute-granular, so a 30s sweep
@@ -2631,17 +2674,7 @@ pub fn run() {
                     publish_app_ready(&app_handle, state);
                 };
                 if let Err(payload) = catch_unwind(AssertUnwindSafe(post_init)) {
-                    // A panic payload is `Box<dyn Any + Send>`; unwrap the two
-                    // common stringy forms and otherwise fall back to a generic
-                    // note, so the FE never gets an opaque "unknown" with no
-                    // clue where to look.
-                    let msg = if let Some(s) = payload.downcast_ref::<&'static str>() {
-                        format!("post-init panicked: {s}")
-                    } else if let Some(s) = payload.downcast_ref::<String>() {
-                        format!("post-init panicked: {s}")
-                    } else {
-                        "post-init panicked (non-string panic payload)".to_string()
-                    };
+                    let msg = panic_message("post-init", &payload);
                     tracing::error!("{msg}");
                     let _ = error_handle.emit("app:init-error", &msg);
                 }
@@ -2753,9 +2786,9 @@ pub fn run() {
 mod tests {
     use super::state::AppState;
     use super::{
-        git_branch, is_app_ready, list_local_branches, mode_auto_approves, publish_app_ready,
-        resolve_workspace_dir, should_warmup, switch_branch, BootFinalize, TurnMetrics,
-        UpdateStatus, APP_READY,
+        git_branch, is_app_ready, list_local_branches, mode_auto_approves, panic_message,
+        publish_app_ready, resolve_workspace_dir, should_warmup, switch_branch, BootFinalize,
+        TurnMetrics, UpdateStatus, APP_READY,
     };
     use ff_core::{Mode, ProviderKind};
     use ff_tools::Safety;
@@ -2853,6 +2886,30 @@ mod tests {
         );
 
         APP_READY.store(false, Ordering::SeqCst);
+    }
+
+    // `panic_message` renders both stringy panic-payload forms and the rare
+    // non-string fallback with the caller's context prefix, so a detached-task
+    // panic surfaces an actionable `app:init-error` rather than an opaque note.
+    #[test]
+    fn panic_message_formats_each_payload_form() {
+        let literal: Box<dyn std::any::Any + Send> = Box::new("boom");
+        assert_eq!(
+            panic_message("mcp init", &literal),
+            "mcp init panicked: boom"
+        );
+
+        let owned: Box<dyn std::any::Any + Send> = Box::new(String::from("kaboom"));
+        assert_eq!(
+            panic_message("post-init", &owned),
+            "post-init panicked: kaboom"
+        );
+
+        let other: Box<dyn std::any::Any + Send> = Box::new(42u32);
+        assert_eq!(
+            panic_message("mcp init", &other),
+            "mcp init panicked (non-string panic payload)"
+        );
     }
 
     #[test]
