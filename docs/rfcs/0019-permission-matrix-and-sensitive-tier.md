@@ -38,7 +38,10 @@ Goals:
 Non-goals:
 
 - OS-level sandboxing (RFC 0011 §12 stands).
-- Per-workspace or per-skill permission scoping (future RFC).
+- Per-**workspace** or per-skill permission scoping — a different trust axis (which
+  project), deferred to a future RFC. Note this is distinct from the per-**argument**
+  scoped rules in §9, which this RFC does cover (which path/command, within the
+  active workspace).
 - The "Prompts" / "Team" / "UI" tabs visible in the reference panel (separate scope).
 
 ## 2. The four safety tiers
@@ -158,12 +161,104 @@ Auto-mode goal loops auto-approve network egress with no gate.
 5. Ship the Settings → Control panel (FE).
 6. Write tests covering each cell x override combination.
 7. Update system-prompt mode preamble to describe the new Sensitive tier.
+8. Add scoped permission rules (§9): `PermissionRule` + matchers, evaluated before
+   overrides, with the Allow/Deny asymmetry (§9.3) and workspace-anchoring rails
+   (§9.4), plus the Control-panel "Rules" list. Lands after per-tool overrides.
 
-## 9. Open questions
+## 9. Scoped permission rules (path / command matchers)
+
+The matrix (§3) and overrides (§4) are keyed by **tool name + tier** only. That
+cannot express *"auto-approve a Write **when the path is under `~/workspaces/**`**,
+but keep asking elsewhere"* or *"auto-approve `bash` **when the command is
+`brazil-build …`**, but gate every other command"* — the exact rules that make an
+unattended long-running loop (#74) stop stalling on confirmation dialogs. This
+section adds an **argument-scoped** layer evaluated *before* overrides and the matrix.
+
+### 9.1 The rule
+
+```rust
+/// An ordered, first-match-wins rule evaluated before overrides + matrix.
+pub struct PermissionRule {
+    pub effect: RuleEffect,   // Allow | Deny
+    pub tool: String,         // tool id the rule applies to (e.g. "bash", "write")
+    pub matcher: ArgMatcher,  // what argument shape it matches
+}
+
+pub enum RuleEffect { Allow, Deny }
+
+/// Per-tool-kind argument matcher. The runtime picks the field to test from the
+/// tool: path-taking tools match on their path arg; `bash` matches on `command`.
+pub enum ArgMatcher {
+    /// Glob against the tool's path argument (view/edit/write/apply_patch, and any
+    /// filesystem tool). Workspace-anchored — see §9.4.
+    PathGlob(String),        // e.g. "~/workspaces/**", "src/**/*.rs"
+    /// Prefix match against `bash`'s `command` (after trimming), token-aware so
+    /// "brazil-build" does not match "brazil-build-evil".
+    CommandPrefix(String),   // e.g. "brazil-build"
+    /// Anchored regex against `bash`'s `command`, for the deny backstop.
+    CommandRegex(String),    // e.g. "^rm\\s+-rf\\b", "git\\s+push\\s+.*--force"
+}
+```
+
+Rules persist in the same `~/.flowforge/permissions.json` under a `rules: [...]`
+array, `#[serde(default)]` so existing configs (matrix + overrides only) load
+unchanged.
+
+### 9.2 Precedence
+
+Extends §4's chain — a rule sits **above** the per-tool override:
+
+```
+Deny rule  >  Allow rule  >  override (Denied/RequireApproval/Allowed)  >  matrix cell
+```
+
+First matching rule in file order wins. A rule that does not match falls through to
+the next layer unchanged. This makes the deny backstop absolute: a `Deny` rule
+(e.g. `rm -rf`, `git push --force`) fires regardless of mode, override, or tier.
+
+### 9.3 The Allow / Deny asymmetry (a hard invariant)
+
+- A **Deny rule may veto any tier, including `Dangerous`.** Backstops must be
+  unconditional.
+- An **Allow rule may NEVER auto-clear `Dangerous`.** It can auto-approve at most a
+  `Sensitive` call (mirroring today's `allowlist_covers`, which already refuses to
+  cover `Dangerous`, state.rs). An Allow rule matching a `Dangerous` call degrades
+  to `Ask`, never `Allow` — preserving the #229/#232 invariant that no configuration
+  path auto-runs a Dangerous action.
+
+### 9.4 Safety rails (this is the unattended path — rails are load-bearing)
+
+- **Allow rules apply only in Auto/Act, never Plan.** Plan stays read-only by
+  construction; a stray Allow rule cannot re-open it.
+- **Path globs are workspace-anchored.** A glob resolves against the session's cwd /
+  the configured allowed roots; a pattern that escapes it (via `..` or an absolute
+  path outside the roots) is rejected at rule-save time, not silently honored. An
+  Allow rule can only *widen auto-approval within* the workspace, never outside it.
+- **Every rule-driven auto-approve is logged** (`tracing`) with the rule + resolved
+  argument, so an unattended run leaves an audit trail of exactly what flew through.
+- **`bash` still consults its per-invocation safety hint (§2.1) first.** A command
+  the model itself flags `dangerous` cannot be auto-approved by a `CommandPrefix`
+  Allow rule — the rule matches, but §9.3 degrades it to `Ask`.
+
+### 9.5 Settings UI
+
+The Control panel (§5) gains a **"Rules"** list below the Custom Overrides:
+- Each row: effect (Allow/Deny) · tool · matcher, reorderable (order = precedence).
+- Add/edit/remove; a glob/regex is validated on save (workspace-anchoring for globs,
+  compile check for regexes).
+- "Reset to defaults" clears user rules and restores a small built-in **deny
+  backstop set** (e.g. `rm -rf` on `/` or `~`, `git push --force`, disk-format
+  commands) so the destructive-command floor exists out of the box.
+
+## 10. Open questions
 
 - Should MCP tools default to `Sensitive` (fail safe) or `Write`? Proposed: default
   `Sensitive` for external MCP servers; `Write` for local/stdio MCP.
 - Should the user be able to define per-workspace overrides (different project =
   different trust)? Deferred to a follow-up RFC.
+- Should scoped rules (§9) support a per-workspace *ruleset* (rules that only apply
+  when the session cwd is under a given root), or stay global with workspace-anchored
+  globs? Proposed: global rules with workspace-anchored globs for 0.2.0; per-workspace
+  rulesets fold into the same follow-up RFC as per-workspace overrides.
 - Should "Dangerous" in Act remain Ask or become Allow? Proposed: keep Ask (the
   #229/#232 invariant: no mode ever auto-approves Dangerous).
