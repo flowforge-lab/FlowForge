@@ -37,6 +37,7 @@ import type {
   ToolApprovalRequestEvent,
   ToolAskRequestEvent,
   ToolCallEvent,
+  ToolOutputChunkEvent,
   ToolResultEvent,
   SkillInfo,
   SkillAggregate,
@@ -407,6 +408,7 @@ export interface FfIpc {
     cb: (e: SessionTitleUpdatedEvent) => void,
   ): Promise<Unlisten>;
   onToolCall(cb: (e: ToolCallEvent) => void): Promise<Unlisten>;
+  onToolOutput(cb: (e: ToolOutputChunkEvent) => void): Promise<Unlisten>;
   onToolResult(cb: (e: ToolResultEvent) => void): Promise<Unlisten>;
   onApprovalRequest(
     cb: (e: ToolApprovalRequestEvent) => void,
@@ -721,6 +723,8 @@ class TauriIpc implements FfIpc {
     this.listen<SessionTitleUpdatedEvent>("session:title-updated", cb);
   onToolCall = (cb: (e: ToolCallEvent) => void) =>
     this.listen<ToolCallEvent>("tool:call", cb);
+  onToolOutput = (cb: (e: ToolOutputChunkEvent) => void) =>
+    this.listen<ToolOutputChunkEvent>("tool:output", cb);
   onToolResult = (cb: (e: ToolResultEvent) => void) =>
     this.listen<ToolResultEvent>("tool:result", cb);
   onApprovalRequest = (cb: (e: ToolApprovalRequestEvent) => void) =>

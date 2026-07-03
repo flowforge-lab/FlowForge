@@ -308,6 +308,12 @@ export function ToolStepBlock({
               </span>
             </div>
           )}
+          {/* Live output (#680): while the tool runs, show the streamed tail so
+              slow builds/tests visibly progress. On completion `result` (the
+              final, canonically-capped output) supersedes it below. */}
+          {step.status === "running" && step.output !== undefined && (
+            <OutputBlock output={step.output} title={step.tool} />
+          )}
           {step.result !== undefined && (
             <OutputBlock
               output={step.result}

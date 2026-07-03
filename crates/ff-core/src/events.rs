@@ -97,6 +97,31 @@ pub struct ToolResultEvent {
     pub result: String,
 }
 
+/// Which standard stream a live output chunk (#680) came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "lowercase")]
+#[ts(export, export_to = "../../../apps/desktop/src/bindings/")]
+pub enum OutputStreamKind {
+    Stdout,
+    Stderr,
+}
+
+/// A live chunk of a running command's output (#680), emitted as the process
+/// produces it — before (and in addition to) the final [`ToolResultEvent`]. The
+/// frontend appends `delta` to the running tool-call block so long builds/tests
+/// show progress instead of appearing frozen. `call_id` correlates with the
+/// [`ToolCallEvent`] / [`ToolResultEvent`] for the same step.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "../../../apps/desktop/src/bindings/")]
+pub struct ToolOutputChunkEvent {
+    pub session_id: String,
+    pub message_id: String,
+    pub call_id: String,
+    pub stream: OutputStreamKind,
+    pub delta: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export, export_to = "../../../apps/desktop/src/bindings/")]

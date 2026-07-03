@@ -27,6 +27,7 @@ import type {
   ToolApprovalRequestEvent,
   ToolAskRequestEvent,
   ToolCallEvent,
+  ToolOutputChunkEvent,
   ToolResultEvent,
   SkillInfo,
   SkillAggregate,
@@ -650,6 +651,7 @@ export class MockIpc implements FfIpc {
   private intentionListeners = new Set<Listener<IntentionSignal>>();
   private sessionTitleListeners = new Set<Listener<SessionTitleUpdatedEvent>>();
   private toolCallListeners = new Set<Listener<ToolCallEvent>>();
+  private toolOutputListeners = new Set<Listener<ToolOutputChunkEvent>>();
   private toolResultListeners = new Set<Listener<ToolResultEvent>>();
   private approvalRequestListeners = new Set<
     Listener<ToolApprovalRequestEvent>
@@ -1036,6 +1038,9 @@ export class MockIpc implements FfIpc {
   }
   onToolCall(cb: Listener<ToolCallEvent>): Promise<Unlisten> {
     return this.subscribe(this.toolCallListeners, cb);
+  }
+  onToolOutput(cb: Listener<ToolOutputChunkEvent>): Promise<Unlisten> {
+    return this.subscribe(this.toolOutputListeners, cb);
   }
   onToolResult(cb: Listener<ToolResultEvent>): Promise<Unlisten> {
     return this.subscribe(this.toolResultListeners, cb);

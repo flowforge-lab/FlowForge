@@ -278,6 +278,16 @@ pub enum AgentEvent {
         message_id: String,
         count: u32,
     },
+    /// A live chunk of a running tool's output (#680), emitted as it is produced —
+    /// before (and additive to) the final [`AgentEvent::ToolCallFinished`]. Only
+    /// streaming tools (currently `bash`) produce these; the frontend appends `delta`
+    /// to the running tool-call block so slow builds/tests show progress.
+    ToolOutputChunk {
+        message_id: String,
+        call_id: String,
+        stream: ff_tools::OutputStream,
+        delta: String,
+    },
     Error {
         message: String,
     },
@@ -1520,10 +1530,52 @@ pub async fn run_turn(
                                     .approve(&message_id, &call.id, &call.name, safety, &args)
                                     .await;
                             if approved {
-                                tools
-                                    .registry
-                                    .run_with_session(&call.name, args, tools.root, session_id)
-                                    .await
+                                // Stream live output (#680): pass a sink into the
+                                // streaming dispatch and drive the tool future
+                                // concurrently with a drain loop that forwards each
+                                // chunk via `on_event`. `on_event` is owned by this
+                                // loop and the tool `await` would otherwise block it,
+                                // so the concurrent drive is required. Non-streaming
+                                // tools ignore the sink and this reduces to a plain
+                                // await. The final outcome is unchanged.
+                                let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(
+                                    ff_tools::OutputStream,
+                                    String,
+                                )>();
+                                let sink = ff_tools::OutputSink::new(tx);
+                                let fut = tools.registry.run_streaming(
+                                    &call.name,
+                                    args,
+                                    tools.root,
+                                    session_id,
+                                    Some(sink),
+                                );
+                                tokio::pin!(fut);
+                                loop {
+                                    tokio::select! {
+                                        outcome = &mut fut => {
+                                            // Forward any chunks buffered before the
+                                            // future resolved and dropped its sender.
+                                            while let Ok((stream, delta)) = rx.try_recv() {
+                                                on_event(AgentEvent::ToolOutputChunk {
+                                                    message_id: message_id.clone(),
+                                                    call_id: call.id.clone(),
+                                                    stream,
+                                                    delta,
+                                                });
+                                            }
+                                            break outcome;
+                                        }
+                                        Some((stream, delta)) = rx.recv() => {
+                                            on_event(AgentEvent::ToolOutputChunk {
+                                                message_id: message_id.clone(),
+                                                call_id: call.id.clone(),
+                                                stream,
+                                                delta,
+                                            });
+                                        }
+                                    }
+                                }
                             } else {
                                 ff_tools::ToolOutcome::error(format!(
                                     "call to `{}` was not approved",
@@ -2243,6 +2295,39 @@ mod tests {
         }
     }
 
+    /// Like [`ToolThenText`] but the bash command is Write-classified (#680): `printf`
+    /// is not on the read-only allowlist, so the call runs on the serial pass where
+    /// live-output streaming is wired. Used to prove chunks stream before the finish.
+    struct StreamingToolThenText {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl Provider for StreamingToolThenText {
+        async fn chat_stream(&self, _req: ChatRequest) -> Result<ChunkStream, LlmError> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            let chunks = if n == 0 {
+                vec![Ok(Chunk {
+                    tool_calls: vec![ToolCallDelta {
+                        index: 0,
+                        id: Some("call_1".into()),
+                        name: Some("bash".into()),
+                        arguments: r#"{"command":"printf 'wired\\n'"}"#.into(),
+                    }],
+                    done: true,
+                    ..Chunk::default()
+                })]
+            } else {
+                vec![Ok(Chunk {
+                    delta: "done".into(),
+                    done: true,
+                    ..Chunk::default()
+                })]
+            };
+            Ok(futures_util::stream::iter(chunks).boxed())
+        }
+    }
+
     /// First call streams a tool call the way SiliconFlow GLM-5.2 does (#374): the
     /// name arrives only in the first fragment, then every continuation fragment
     /// carries `name: Some("")` (an empty string, not `None`) alongside the argument
@@ -2873,6 +2958,7 @@ mod tests {
                 AgentEvent::Done { .. } => {}
                 AgentEvent::MemoryFlushed { .. } => {}
                 AgentEvent::AttachmentsDropped { .. } => {}
+                AgentEvent::ToolOutputChunk { .. } => {}
             },
         )
         .await
@@ -2890,6 +2976,62 @@ mod tests {
         assert!(history[1].tool_calls.is_some());
         assert_eq!(history[2].role, Role::Tool);
         assert_eq!(history[2].tool_call_id.as_deref(), Some("call_1"));
+    }
+
+    #[tokio::test]
+    async fn streaming_tool_emits_output_chunks_before_finish() {
+        // #680: a bash call streams live output. The loop must forward at least one
+        // ToolOutputChunk for the call *before* its ToolCallFinished, and every chunk
+        // must carry the same call_id as the finish.
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::new();
+        let s = store.create_session(None);
+        store.add_message(&s.id, Role::User, "run printf".into());
+        let registry = ToolRegistry::with_defaults();
+        let approve = AlwaysApprove;
+        let provider = StreamingToolThenText {
+            calls: AtomicUsize::new(0),
+        };
+
+        let mut order: Vec<&'static str> = Vec::new();
+        let mut chunk_call_id = String::new();
+        let mut finish_call_id = String::new();
+        run_turn(
+            &provider,
+            &store,
+            &ctx(&registry, dir.path(), &approve),
+            &s.id,
+            "mock",
+            None,
+            false,
+            ReasoningVisibility::All,
+            CancelToken::new(),
+            |ev| match ev {
+                AgentEvent::ToolOutputChunk { call_id, .. } => {
+                    order.push("chunk");
+                    chunk_call_id = call_id;
+                }
+                AgentEvent::ToolCallFinished { call_id, .. } => {
+                    order.push("finish");
+                    finish_call_id = call_id;
+                }
+                _ => {}
+            },
+        )
+        .await
+        .unwrap();
+
+        let first_chunk = order.iter().position(|e| *e == "chunk");
+        let finish = order.iter().position(|e| *e == "finish");
+        assert!(first_chunk.is_some(), "at least one output chunk streamed");
+        assert!(
+            first_chunk < finish,
+            "chunks precede the finish event: {order:?}"
+        );
+        assert_eq!(
+            chunk_call_id, finish_call_id,
+            "chunk and finish share the call id"
+        );
     }
 
     #[tokio::test]
@@ -3110,6 +3252,7 @@ mod tests {
                 AgentEvent::Done { .. } => {}
                 AgentEvent::MemoryFlushed { .. } => {}
                 AgentEvent::AttachmentsDropped { .. } => {}
+                AgentEvent::ToolOutputChunk { .. } => {}
             },
         )
         .await
@@ -3227,6 +3370,7 @@ mod tests {
                 AgentEvent::Done { .. } => {}
                 AgentEvent::MemoryFlushed { .. } => {}
                 AgentEvent::AttachmentsDropped { .. } => {}
+                AgentEvent::ToolOutputChunk { .. } => {}
             },
         )
         .await

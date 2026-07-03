@@ -50,6 +50,7 @@ export function startIpcEvents(): void {
     reasoning.drain();
     store.applyToolCall(e);
   });
+  void ipc.onToolOutput(store.applyToolOutputChunk);
   void ipc.onToolResult(store.applyToolResult);
   void ipc.onApprovalRequest(store.applyApprovalRequest);
   void ipc.onAskRequest(store.applyAskRequest);

@@ -12,10 +12,11 @@ use async_trait::async_trait;
 use ff_agent::{run_turn, AgentEvent, Approver, CancelToken, ToolContext};
 use ff_core::events::{
     ApprovalSafety, EvolveCostEstimate, IntentionSignal, McpStatusChangedEvent, MemoryFlushedEvent,
-    PhenotypeMcpUnavailableEvent, ReasoningEvent, SessionTitleUpdatedEvent, SkillActivated,
-    SkillCompleted, SkillEvolveApprovalRequestEvent, SkillInstallApprovalRequestEvent,
-    SkillsChangedEvent, TokenEvent, ToolApprovalRequestEvent, ToolAskRequestEvent, ToolCallEvent,
-    ToolResultEvent, TurnDoneEvent, TurnErrorEvent, TurnStatsEvent, UpdateProgressEvent,
+    OutputStreamKind, PhenotypeMcpUnavailableEvent, ReasoningEvent, SessionTitleUpdatedEvent,
+    SkillActivated, SkillCompleted, SkillEvolveApprovalRequestEvent,
+    SkillInstallApprovalRequestEvent, SkillsChangedEvent, TokenEvent, ToolApprovalRequestEvent,
+    ToolAskRequestEvent, ToolCallEvent, ToolOutputChunkEvent, ToolResultEvent, TurnDoneEvent,
+    TurnErrorEvent, TurnStatsEvent, UpdateProgressEvent,
 };
 use ff_core::{
     Attachment, BedrockAuth, CreateScheduledTaskInput, Format, McpServerConfig, McpServerStatus,
@@ -2245,6 +2246,27 @@ fn emit_agent_event(app: &tauri::AppHandle, session_id: &str, event: AgentEvent)
                     session_id: session_id.to_string(),
                     message_id,
                     writes,
+                },
+            );
+        }
+        AgentEvent::ToolOutputChunk {
+            message_id,
+            call_id,
+            stream,
+            delta,
+        } => {
+            let stream = match stream {
+                ff_tools::OutputStream::Stdout => OutputStreamKind::Stdout,
+                ff_tools::OutputStream::Stderr => OutputStreamKind::Stderr,
+            };
+            let _ = app.emit(
+                "tool:output",
+                ToolOutputChunkEvent {
+                    session_id: session_id.to_string(),
+                    message_id,
+                    call_id,
+                    stream,
+                    delta,
                 },
             );
         }

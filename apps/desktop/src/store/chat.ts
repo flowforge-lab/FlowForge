@@ -18,6 +18,7 @@ import type {
   ToolApprovalRequestEvent,
   ToolAskRequestEvent,
   ToolCallEvent,
+  ToolOutputChunkEvent,
   ToolResultEvent,
 } from "@/bindings";
 
@@ -50,6 +51,11 @@ export interface ToolStep {
   /** Approved via "Always allow" (#229) — renders the emerald "always" badge. */
   alwaysApproved?: boolean;
   result?: string;
+  /** Live output accumulated from `tool:output` chunks (#680) while the tool runs.
+   *  Kept distinct from `result`: this is the streamed, possibly-capped tail shown
+   *  during "running"; on completion `result` (the final, canonically-capped output)
+   *  becomes the source of truth. */
+  output?: string;
   /** Wall-clock epoch ms when the tool:call arrived. Frontend-set — the backend
    *  contract carries no timing (Issue #17); used only to derive a turn's total
    *  duration for the StepGroup header. */
@@ -168,6 +174,7 @@ interface ChatState {
   finishTurn: (e: TurnDoneEvent) => void;
   failTurn: (e: TurnErrorEvent) => void;
   applyToolCall: (e: ToolCallEvent) => void;
+  applyToolOutputChunk: (e: ToolOutputChunkEvent) => void;
   applyToolResult: (e: ToolResultEvent) => void;
   applyApprovalRequest: (e: ToolApprovalRequestEvent) => void;
   respondApproval: (
@@ -887,6 +894,26 @@ export const useChatStore = create<ChatState>((set, get) => ({
         toolStepsByMessage: {
           ...s.toolStepsByMessage,
           [e.messageId]: [...steps, step],
+        },
+      };
+    });
+  },
+
+  applyToolOutputChunk: (e) => {
+    set((s) => {
+      const steps = s.toolStepsByMessage[e.messageId];
+      // Only append to a known, still-running step. A chunk that arrives with no
+      // matching call (lost/out-of-order) is dropped rather than materializing a
+      // partial step — the final tool:result still renders the canonical output.
+      if (!steps?.some((step) => step.callId === e.callId)) return s;
+      return {
+        toolStepsByMessage: {
+          ...s.toolStepsByMessage,
+          [e.messageId]: steps.map((step) =>
+            step.callId === e.callId
+              ? { ...step, output: (step.output ?? "") + e.delta }
+              : step,
+          ),
         },
       };
     });
