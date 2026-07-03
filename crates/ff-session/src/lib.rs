@@ -1354,6 +1354,9 @@ mod tests {
         assert_eq!(changed, 1);
         let msgs = store.get_messages(&s.id);
         assert_eq!(msgs[1].content, "[stopped: interrupted]");
+        // The sweep stamps the structured reason inline in the same UPDATE, so the
+        // reconciled row classifies on the FE without the legacy string match.
+        assert_eq!(msgs[1].stop_reason, Some(StopReason::Interrupted));
     }
 
     #[test]

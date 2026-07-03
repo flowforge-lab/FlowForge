@@ -36,8 +36,9 @@ function fromStopReason(stopReason: WireStopReason): {
       };
     case "interrupted":
       // The turn's future was dropped mid-stream (app shutdown / hard kill) — not
-      // a user Stop, so it resumes like a cap ("capped" affordance). Mirrors the
-      // legacy `[stopped: interrupted]` string-parse fallback below.
+      // a user Stop, so it resumes like a cap ("capped" affordance). Same resume
+      // path as the legacy `[stopped: interrupted]` fallback below; the capitalized
+      // label is intentional (structured rows read nicer than the verbatim marker).
       return { label: "Interrupted", reason: "capped" };
   }
 }
