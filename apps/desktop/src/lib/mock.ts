@@ -2273,14 +2273,25 @@ Shipping the Settings redesign — currently the Memory browser (SET.8).
             writes: 2,
           });
         }
+        // Whole-session estimate (~4 chars/token), so the count grows with the
+        // conversation like the real backend's context assessment does.
+        const sessionTokens = Math.ceil(
+          (this.messages.get(sessionId) ?? []).reduce(
+            (n, m) => n + m.content.length,
+            0,
+          ) / 4,
+        );
         this.emit(this.doneListeners, {
           sessionId,
           messageId: turn.messageId,
-          // Rough estimate (~4 chars/token) — mirrors the real backend supplying
-          // a context-usage token count on Done.
-          tokenCount: Math.ceil((stored?.content.length ?? 0) / 4),
+          tokenCount: sessionTokens,
+          // Effective compaction budget the gauge divides against (#598) — the real
+          // backend forwards `context_window(model) * 0.8`; a small dev value here so
+          // the ratio bar visibly climbs across a mock conversation. Emitted through
+          // the same field name the regenerated ts-rs binding will carry.
+          budgetTokens: 8_000,
           stopReason: null,
-        });
+        } as TurnDoneEvent & { budgetTokens: number });
         return;
       }
       const delta = (i === 0 ? "" : " ") + words[i];

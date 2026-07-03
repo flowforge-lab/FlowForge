@@ -79,6 +79,12 @@ interface ChatState {
    *  (#244 R6). Populated from TurnDoneEvent.tokenCount; drives a context-usage
    *  indicator. Undefined until the first turn completes with an estimate. */
   contextTokensBySession: Record<string, number>;
+  /** sessionId -> effective compaction budget (the denominator) from the last
+   *  completed turn (#598). The model-derived `context_window(model) * 0.8` the
+   *  loop actually compacts against, forwarded on TurnDoneEvent.budgetTokens.
+   *  Pairs with `contextTokensBySession` to render a usage ratio; undefined until a
+   *  turn reports one (so the gauge falls back to count-only). */
+  contextBudgetBySession: Record<string, number>;
   /** sessionId -> the last turn ended without a usable answer the user can resume
    *  with one click — the agent loop hit the tool-call cap / stalled (`[stopped: …]`),
    *  or the user pressed Stop (a bare `[stopped]`, #636), so a one-click "Continue"
@@ -269,6 +275,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   toolStepsByMessage: {},
   reasoningByMessage: {},
   contextTokensBySession: {},
+  contextBudgetBySession: {},
   resumableBySession: {},
   sessionApprovedBySession: {},
   alwaysApproved: new Set<string>(),
@@ -701,6 +708,12 @@ export const useChatStore = create<ChatState>((set, get) => ({
     );
     const endedEmpty = !doneMsg || doneMsg.content.trim() === "";
 
+    // Effective compaction budget the loop compacts against (#598). Read through a
+    // local augmentation until the ts-rs binding regeneration lands the field on
+    // TurnDoneEvent (backend/contract change) — drop the cast once it does.
+    const budget = (e as TurnDoneEvent & { budgetTokens?: number | null })
+      .budgetTokens;
+
     set((s) => ({
       ...clearSessionTurnTiming(s, e.sessionId),
       sessions: s.sessions.map((sess) =>
@@ -713,6 +726,12 @@ export const useChatStore = create<ChatState>((set, get) => ({
         e.tokenCount != null
           ? { ...s.contextTokensBySession, [e.sessionId]: e.tokenCount }
           : s.contextTokensBySession,
+      // Same guard for the ratio denominator (#598): a Done without a budget keeps
+      // the prior value rather than dropping the gauge back to count-only.
+      contextBudgetBySession:
+        budget != null
+          ? { ...s.contextBudgetBySession, [e.sessionId]: budget }
+          : s.contextBudgetBySession,
     }));
 
     if (!endedEmpty) return;
