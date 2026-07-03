@@ -12,10 +12,10 @@ use async_trait::async_trait;
 use ff_agent::{run_turn, AgentEvent, Approver, CancelToken, ToolContext};
 use ff_core::events::{
     ApprovalSafety, EvolveCostEstimate, IntentionSignal, McpStatusChangedEvent, MemoryFlushedEvent,
-    PhenotypeMcpUnavailableEvent, ReasoningEvent, SkillActivated, SkillCompleted,
-    SkillEvolveApprovalRequestEvent, SkillInstallApprovalRequestEvent, SkillsChangedEvent,
-    TokenEvent, ToolApprovalRequestEvent, ToolAskRequestEvent, ToolCallEvent, ToolResultEvent,
-    TurnDoneEvent, TurnErrorEvent, TurnStatsEvent, UpdateProgressEvent,
+    PhenotypeMcpUnavailableEvent, ReasoningEvent, SessionTitleUpdatedEvent, SkillActivated,
+    SkillCompleted, SkillEvolveApprovalRequestEvent, SkillInstallApprovalRequestEvent,
+    SkillsChangedEvent, TokenEvent, ToolApprovalRequestEvent, ToolAskRequestEvent, ToolCallEvent,
+    ToolResultEvent, TurnDoneEvent, TurnErrorEvent, TurnStatsEvent, UpdateProgressEvent,
 };
 use ff_core::{
     Attachment, BedrockAuth, CreateScheduledTaskInput, Format, McpServerConfig, McpServerStatus,
@@ -1125,6 +1125,23 @@ fn spawn_assistant_turn(state: Arc<AppState>, app: tauri::AppHandle, session_id:
             // refresh the curated chunks that were ambient-injected. No-op unless
             // `decay.ambient_gain > 0`.
             let _ = state.index().reinforce_ambient(&ambient_keys);
+            // LLM-summarized session title (#671 item 2b): after the first turn,
+            // replace the heuristic first-message title with a one-line summary and
+            // announce it so the sidebar re-titles in place. Best-effort — gated to
+            // fire once per session, and a failure/timeout leaves the heuristic title.
+            if let Some(title) = state
+                .generate_session_title(provider.as_ref(), &sid, &model, cancel_probe.clone())
+                .await
+            {
+                state.store.set_title(&sid, title.clone());
+                let _ = app.emit(
+                    "session:title-updated",
+                    SessionTitleUpdatedEvent {
+                        session_id: sid.clone(),
+                        title,
+                    },
+                );
+            }
             state
                 .maybe_flush_memory(provider.as_ref(), &registry, &sid, &model, cancel_probe)
                 .await;

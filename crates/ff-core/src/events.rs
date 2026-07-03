@@ -186,6 +186,18 @@ pub struct IntentionSignal {
     pub goal: String,
 }
 
+/// A session's title was regenerated as an LLM one-line summary after its first
+/// turn (#671 item 2b). The heuristic `auto_title` seeds an instant title on the
+/// first user message; this replaces it with a better summary once a reply exists.
+/// The frontend patches the cached session title in place -- no refetch.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "../../../apps/desktop/src/bindings/")]
+pub struct SessionTitleUpdatedEvent {
+    pub session_id: String,
+    pub title: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export, export_to = "../../../apps/desktop/src/bindings/")]

@@ -126,6 +126,101 @@ impl ApprovalRegistry {
     }
 }
 
+/// System prompt for the post-turn LLM title (#671 item 2b).
+const TITLE_SYSTEM_PROMPT: &str = "You write a concise title for a conversation. \
+Summarize it in 3 to 6 words. Reply with only the title text: no quotes, no \
+trailing punctuation, no preamble.";
+/// Hard wall-clock ceiling on the title call so a stuck provider never leaves a
+/// session mid-flight; the heuristic title stands on timeout.
+const TITLE_TIMEOUT: Duration = Duration::from_secs(20);
+/// Output-token cap: a title is a handful of words.
+const TITLE_MAX_TOKENS: u32 = 32;
+/// Per-message char budget when rendering the transcript into the title prompt, so
+/// a giant first message/reply cannot balloon the request.
+const TITLE_PROMPT_MSG_CHARS: usize = 2000;
+
+/// Render the (short, first-turn) transcript into a compact prompt body for the
+/// title model: one `Role: text` line per user/assistant message, each capped at
+/// [`TITLE_PROMPT_MSG_CHARS`]. Tool/other roles are skipped — a title summarizes
+/// the human-visible exchange.
+fn render_title_transcript(history: &[ff_core::Message]) -> String {
+    let mut out = String::new();
+    for m in history {
+        let label = match m.role {
+            ff_core::Role::User => "User",
+            ff_core::Role::Assistant => "Assistant",
+            _ => continue,
+        };
+        let body = m.content.trim();
+        if body.is_empty() {
+            continue;
+        }
+        let capped: String = body.chars().take(TITLE_PROMPT_MSG_CHARS).collect();
+        out.push_str(label);
+        out.push_str(": ");
+        out.push_str(&capped);
+        out.push('\n');
+    }
+    out
+}
+
+/// Drain a provider stream into its concatenated text deltas, aborting early if the
+/// turn's cancel token trips. Returns `None` on a transport/decode error or cancel,
+/// so the caller keeps the heuristic title. Tool-call fragments are ignored — the
+/// title request advertises no tools.
+async fn collect_stream_text(
+    provider: &dyn Provider,
+    req: ff_llm::ChatRequest,
+    cancel: &CancelToken,
+) -> Option<String> {
+    use futures_util::StreamExt;
+    let mut stream = match provider.chat_stream(req).await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(error = %e, "title generation stream failed");
+            return None;
+        }
+    };
+    let mut text = String::new();
+    while let Some(item) = stream.next().await {
+        if cancel.is_cancelled() {
+            return None;
+        }
+        match item {
+            Ok(chunk) => text.push_str(&chunk.delta),
+            Err(e) => {
+                tracing::warn!(error = %e, "title generation chunk failed");
+                return None;
+            }
+        }
+    }
+    Some(text)
+}
+
+/// Clean a raw model title into a display string, or `None` if nothing usable
+/// remains (#671 item 2b). Takes the first non-empty line, strips surrounding
+/// quotes/backticks and trailing sentence punctuation, collapses inner whitespace,
+/// and caps the length so a runaway response cannot overflow the sidebar.
+fn sanitize_generated_title(raw: &str) -> Option<String> {
+    const MAX_TITLE_CHARS: usize = 60;
+    let line = raw.lines().map(str::trim).find(|l| !l.is_empty())?;
+    // Strip wrapping quotes/backticks and any surrounding sentence punctuation
+    // together, so a quote nested inside a trailing period (e.g. `"Title".`) is
+    // fully removed rather than leaving a stray quote when the period is trimmed.
+    let stripped = line.trim_matches(|c: char| c.is_whitespace() || "\"'`.,;:!?".contains(c));
+    let collapsed = stripped.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.is_empty() {
+        return None;
+    }
+    let capped: String = collapsed.chars().take(MAX_TITLE_CHARS).collect();
+    let capped = capped.trim().to_string();
+    if capped.is_empty() {
+        None
+    } else {
+        Some(capped)
+    }
+}
+
 /// Builds a fresh [`Provider`] from a [`ProviderConnection`]. Called once per turn
 /// so a runtime provider switch takes effect on the next message — there is no
 /// shared, mutable provider to swap, only the persisted registry.
@@ -1273,6 +1368,66 @@ impl AppState {
             }
             Err(e) => tracing::warn!(error = %e, "memory flush failed"),
         }
+    }
+
+    /// Regenerate a session's title as a one-line LLM summary after its first turn
+    /// (#671 item 2b). The heuristic [`auto_title`] seeds an instant title on the
+    /// first user message; this replaces it with a better summary once a reply
+    /// exists. Non-blocking and best-effort: any failure, timeout, or cancel leaves
+    /// the heuristic title in place and returns `None`.
+    ///
+    /// Gated to run exactly once per session: it fires only when the transcript
+    /// holds a single user message plus at least one assistant reply — i.e. right
+    /// after the first turn. A later turn (user message count >= 2) is skipped, so
+    /// the title is not re-summarized on every round.
+    pub async fn generate_session_title(
+        &self,
+        provider: &dyn Provider,
+        session_id: &str,
+        model: &str,
+        cancel: CancelToken,
+    ) -> Option<String> {
+        if cancel.is_cancelled() {
+            return None;
+        }
+        let history = self.store.get_messages(session_id);
+        let user_count = history
+            .iter()
+            .filter(|m| m.role == ff_core::Role::User)
+            .count();
+        let has_reply = history.iter().any(|m| m.role == ff_core::Role::Assistant);
+        // Run once, after the first turn: exactly one user message and a reply.
+        if user_count != 1 || !has_reply {
+            return None;
+        }
+
+        let transcript = render_title_transcript(&history);
+        if transcript.trim().is_empty() {
+            return None;
+        }
+        let req = ff_llm::ChatRequest {
+            model: model.to_string(),
+            messages: vec![
+                ff_llm::ChatMessage::text("system", TITLE_SYSTEM_PROMPT),
+                ff_llm::ChatMessage::text("user", transcript),
+            ],
+            tools: Vec::new(),
+            thinking: false,
+            max_tokens: Some(TITLE_MAX_TOKENS),
+        };
+
+        let raw =
+            match tokio::time::timeout(TITLE_TIMEOUT, collect_stream_text(provider, req, &cancel))
+                .await
+            {
+                Ok(Some(text)) => text,
+                Ok(None) => return None,
+                Err(_) => {
+                    tracing::warn!(session = %session_id, "title generation timed out");
+                    return None;
+                }
+            };
+        sanitize_generated_title(&raw)
     }
 
     /// The working directory for `session_id`'s tools this turn. Returns the
@@ -2546,6 +2701,113 @@ mod tests {
     // before the turn (and thus any approval) starts.
     fn arm(state: &AppState, session_id: &str) {
         state.register_cancel(session_id, CancelToken::new());
+    }
+
+    // ---- LLM-summarized session title (#671 item 2b) ----
+
+    struct FixedTitleProvider(String);
+    #[async_trait::async_trait]
+    impl Provider for FixedTitleProvider {
+        async fn chat_stream(
+            &self,
+            _req: ff_llm::ChatRequest,
+        ) -> Result<ff_llm::ChunkStream, ff_llm::LlmError> {
+            use futures_util::StreamExt;
+            let chunk = ff_llm::Chunk {
+                delta: self.0.clone(),
+                done: true,
+                ..Default::default()
+            };
+            Ok(futures_util::stream::iter(vec![Ok(chunk)]).boxed())
+        }
+    }
+
+    #[test]
+    fn sanitize_title_strips_quotes_punctuation_and_caps() {
+        assert_eq!(
+            sanitize_generated_title("  \"Fix the parser bug\".  "),
+            Some("Fix the parser bug".to_string())
+        );
+        // First non-empty line only.
+        assert_eq!(
+            sanitize_generated_title("\n\nRefactor the store\nignored trailer"),
+            Some("Refactor the store".to_string())
+        );
+        // Collapses inner whitespace and strips backticks.
+        assert_eq!(
+            sanitize_generated_title("`Update   session   model`"),
+            Some("Update session model".to_string())
+        );
+        // Empty / punctuation-only -> None (keep the heuristic title).
+        assert_eq!(sanitize_generated_title("   "), None);
+        assert_eq!(sanitize_generated_title("\"\""), None);
+        // Length cap.
+        let long = "word ".repeat(40);
+        let title = sanitize_generated_title(&long).unwrap();
+        assert!(title.chars().count() <= 60);
+    }
+
+    #[tokio::test]
+    async fn generate_title_summarizes_after_first_turn() {
+        use ff_core::Role;
+        let state = AppState::new();
+        let s = state.store.create_session(None);
+        state
+            .store
+            .add_message(&s.id, Role::User, "help me fix the parser".into());
+        state
+            .store
+            .add_message(&s.id, Role::Assistant, "Sure, let's look.".into());
+
+        let provider = FixedTitleProvider("Fix the parser bug".into());
+        let title = state
+            .generate_session_title(&provider, &s.id, "test-model", CancelToken::new())
+            .await;
+        assert_eq!(title.as_deref(), Some("Fix the parser bug"));
+    }
+
+    #[tokio::test]
+    async fn generate_title_skips_before_a_reply_and_after_second_turn() {
+        use ff_core::Role;
+        let provider = FixedTitleProvider("Title".into());
+
+        // Only a user message, no assistant reply yet -> skip.
+        let state = AppState::new();
+        let s = state.store.create_session(None);
+        state.store.add_message(&s.id, Role::User, "first".into());
+        assert!(state
+            .generate_session_title(&provider, &s.id, "m", CancelToken::new())
+            .await
+            .is_none());
+
+        // Two user messages (past the first turn) -> skip so we don't re-title.
+        state
+            .store
+            .add_message(&s.id, Role::Assistant, "reply".into());
+        state.store.add_message(&s.id, Role::User, "second".into());
+        assert!(state
+            .generate_session_title(&provider, &s.id, "m", CancelToken::new())
+            .await
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn generate_title_bails_when_cancelled() {
+        use ff_core::Role;
+        let state = AppState::new();
+        let s = state.store.create_session(None);
+        state.store.add_message(&s.id, Role::User, "hi".into());
+        state
+            .store
+            .add_message(&s.id, Role::Assistant, "hello".into());
+
+        let provider = FixedTitleProvider("Greeting".into());
+        let cancel = CancelToken::new();
+        cancel.cancel();
+        assert!(state
+            .generate_session_title(&provider, &s.id, "m", cancel)
+            .await
+            .is_none());
     }
 
     // #277: the desktop store persists across a "restart". `build_session_store`

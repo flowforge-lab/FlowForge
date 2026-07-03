@@ -96,6 +96,12 @@ export function startIpcEvents(): void {
   void ipc.onIntention((e) => {
     console.debug("[signal:intention]", e.sessionId, e.goal);
   });
+  // The backend regenerated a session's title as an LLM summary after its first
+  // turn (#671 item 2b). It is already persisted server-side, so patch the cached
+  // title in place — no refetch, no write-back.
+  void ipc.onSessionTitleUpdated((e) => {
+    useChatStore.getState().patchSessionTitle(e.sessionId, e.title);
+  });
   // Self-update download progress (#566): feed the shared update store so the global
   // update bar (#565) and Settings → About render a real progress bar. `bigint` on the
   // wire -> `number` here (byte counts are within Number's safe range). The terminal
