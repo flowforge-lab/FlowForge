@@ -109,6 +109,10 @@ const DROPDOWN_PARTS: MenuParts = {
   Separator: DropdownMenuSeparator,
 };
 
+// Shared class for the flat ghost icon buttons in the sidebar header and
+// collapsed rail (#674): muted by default, foreground on hover.
+const RAIL_ICON_BTN = "size-7 text-muted-foreground hover:text-foreground";
+
 interface SessionMenuItemsProps {
   parts: MenuParts;
   atCap: boolean;
@@ -677,7 +681,7 @@ export function SessionSidebar() {
           <Button
             variant="ghost"
             size="icon"
-            className="size-7 text-muted-foreground hover:text-foreground"
+            className={RAIL_ICON_BTN}
             onClick={() => setSidebarCollapsed(false)}
             title="Expand sidebar"
             aria-label="Expand sidebar"
@@ -690,7 +694,7 @@ export function SessionSidebar() {
               <Button
                 variant="ghost"
                 size="icon"
-                className="size-7 text-muted-foreground hover:text-foreground"
+                className={RAIL_ICON_BTN}
                 title="Search sessions"
                 aria-label="Search sessions"
               >
@@ -707,9 +711,9 @@ export function SessionSidebar() {
           <Button
             variant="ghost"
             size="icon"
-            className="size-7 text-muted-foreground hover:text-foreground"
+            className={RAIL_ICON_BTN}
             onClick={newSessionInFocusedPane}
-            title="New session in split"
+            title="New session"
             aria-label="New session"
           >
             <Plus className="size-4" />
@@ -718,7 +722,7 @@ export function SessionSidebar() {
           <Button
             variant="ghost"
             size="icon"
-            className="size-7 text-muted-foreground hover:text-foreground"
+            className={RAIL_ICON_BTN}
             onClick={openSettings}
             title="Settings"
             aria-label="Settings"
@@ -739,7 +743,7 @@ export function SessionSidebar() {
             <Button
               variant="ghost"
               size="icon"
-              className="size-7 text-muted-foreground hover:text-foreground"
+              className={RAIL_ICON_BTN}
               onClick={() => setSidebarCollapsed(true)}
               title="Collapse sidebar"
             >
@@ -754,7 +758,7 @@ export function SessionSidebar() {
                 className={cn(
                   "size-7",
                   selectMode
-                    ? "bg-emerald-600 text-white hover:bg-emerald-600/90"
+                    ? "bg-emerald-600 text-white hover:bg-emerald-700 hover:text-white dark:hover:bg-emerald-700"
                     : "text-muted-foreground hover:text-foreground",
                 )}
                 onClick={() =>
@@ -771,9 +775,9 @@ export function SessionSidebar() {
               <Button
                 variant="ghost"
                 size="icon"
-                className="size-7 text-muted-foreground hover:text-foreground"
+                className={RAIL_ICON_BTN}
                 onClick={newSessionInFocusedPane}
-                title="New session in split"
+                title="New session"
                 aria-label="New session"
               >
                 <Plus className="size-4" />
@@ -783,7 +787,7 @@ export function SessionSidebar() {
                   <Button
                     variant="ghost"
                     size="icon"
-                    className="size-7 text-muted-foreground hover:text-foreground"
+                    className={RAIL_ICON_BTN}
                     title="Sidebar options"
                     aria-label="Sidebar options"
                   >
