@@ -2611,21 +2611,19 @@ fn open_memory_index(
             }
         }
     };
-    let chunks = memory.all_chunks();
-    if embedder.is_some() {
-        // With embeddings on, the full reindex is a serial blocking-HTTP loop
-        // (one embed call per chunk), so doing it inline would stall app launch
-        // on the embedding server. Run it off the startup path: recall stays
-        // available from the persisted on-disk FTS index and embeddings backfill
-        // shortly after (PR #215 review, nit 1).
-        let bg = index.clone();
-        std::thread::spawn(move || match bg.reindex(&chunks) {
-            Ok(()) => tracing::info!("memory embeddings reindex complete"),
+    // Defer the full reindex to a background thread (#599 item 4). The on-disk
+    // FTS5 DB persists across launches, so recall is immediately available from
+    // stale-but-valid data while the refresh runs async. This matches the existing
+    // embeddings-on path (PR #215) and removes reindex from the boot critical path.
+    let bg_index = index.clone();
+    let bg_memory = memory.clone();
+    std::thread::spawn(move || {
+        let chunks = bg_memory.all_chunks();
+        match bg_index.reindex(&chunks) {
+            Ok(()) => tracing::info!("memory reindex complete"),
             Err(e) => tracing::warn!(error = %e, "background memory reindex failed"),
-        });
-    } else if let Err(e) = index.reindex(&chunks) {
-        tracing::warn!(error = %e, "initial memory reindex failed");
-    }
+        }
+    });
     let watcher = MemoryWatcher::spawn(memory.clone(), index.clone())
         .map_err(|e| tracing::warn!(error = %e, "memory watcher unavailable"))
         .ok();
