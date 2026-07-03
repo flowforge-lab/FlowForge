@@ -10,6 +10,7 @@
 //! (Durable user memory -- facts, daily logs, recall -- is a separate concern,
 //! owned by the `ff-memory` crate per RFC 0006.)
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Mutex;
 
@@ -29,6 +30,58 @@ fn now_ms() -> i64 {
 
 fn new_id() -> String {
     uuid::Uuid::new_v4().to_string()
+}
+
+/// Construct a fresh `Session` (unpersisted). Both the immediate-write
+/// [`create_session`](SessionStore::create_session) and the deferred
+/// [`create_draft_session`](SessionStore::create_draft_session) build from here.
+fn new_session(goal: Option<String>) -> Session {
+    let ts = now_ms();
+    Session {
+        id: new_id(),
+        goal,
+        title: None,
+        summary: None,
+        status: SessionStatus::Active,
+        created_at: ts,
+        updated_at: ts,
+        phenotype: None,
+        mode: None,
+        workspace: None,
+        model: None,
+        mcp_servers: None,
+    }
+}
+
+/// Write a session row. The single INSERT used by both immediate creation and the
+/// deferred-draft flush ([`SessionStore::flush_pending`]).
+fn insert_session(conn: &Connection, session: &Session) {
+    let inserted = conn.execute(
+        "INSERT INTO sessions
+             (id, goal, title, summary, status, created_at, updated_at, phenotype, mode, workspace, model, mcp_servers)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+        params![
+            session.id,
+            session.goal,
+            session.title,
+            session.summary,
+            enum_to_text(&session.status),
+            session.created_at,
+            session.updated_at,
+            session.phenotype,
+            session.mode.as_ref().map(enum_to_text),
+            session.workspace,
+            session.model.as_ref().and_then(|m| serde_json::to_string(m).ok()),
+            session
+                .mcp_servers
+                .as_ref()
+                .and_then(|m| serde_json::to_string(m).ok()),
+        ],
+    );
+    if let Err(error) = &inserted {
+        tracing::error!(%error, "session write failed");
+    }
+    inserted.expect("insert session");
 }
 
 /// Serialize a small `rename_all` enum (Role/SessionStatus/Mode) to its string
@@ -73,6 +126,11 @@ impl std::error::Error for EditMessageError {}
 
 pub struct SessionStore {
     conn: Mutex<Connection>,
+    /// Sessions created but not yet persisted (#671 item 2a): a bare `＋` in the
+    /// desktop app makes an in-memory draft that stays off disk (and out of
+    /// `list_sessions`) until its first message — or first config write — flushes
+    /// it. Keeps empty "New session" rows from accumulating on every `＋` click.
+    pending: Mutex<HashMap<String, Session>>,
 }
 
 impl Default for SessionStore {
@@ -112,53 +170,41 @@ impl SessionStore {
         migrate(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
+            pending: Mutex::new(HashMap::new()),
         })
     }
 
     pub fn create_session(&self, goal: Option<String>) -> Session {
-        let ts = now_ms();
-        let session = Session {
-            id: new_id(),
-            goal,
-            title: None,
-            summary: None,
-            status: SessionStatus::Active,
-            created_at: ts,
-            updated_at: ts,
-            phenotype: None,
-            mode: None,
-            workspace: None,
-            model: None,
-            mcp_servers: None,
-        };
+        let session = new_session(goal);
         let conn = self.conn.lock().unwrap();
-        let inserted = conn.execute(
-            "INSERT INTO sessions
-                 (id, goal, title, summary, status, created_at, updated_at, phenotype, mode, workspace, model, mcp_servers)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-            params![
-                session.id,
-                session.goal,
-                session.title,
-                session.summary,
-                enum_to_text(&session.status),
-                session.created_at,
-                session.updated_at,
-                session.phenotype,
-                session.mode.as_ref().map(enum_to_text),
-                session.workspace,
-                session.model.as_ref().and_then(|m| serde_json::to_string(m).ok()),
-                session
-                    .mcp_servers
-                    .as_ref()
-                    .and_then(|m| serde_json::to_string(m).ok()),
-            ],
-        );
-        if let Err(error) = &inserted {
-            tracing::error!(%error, "session write failed");
-        }
-        inserted.expect("insert session");
+        insert_session(&conn, &session);
         session
+    }
+
+    /// Create a session **without persisting it** (#671 item 2a). The bare `＋` in
+    /// the desktop app makes an in-memory draft that stays off disk — and out of
+    /// [`list_sessions`](Self::list_sessions) — until its first message (or first
+    /// config write) flushes it via [`flush_pending`](Self::flush_pending). An
+    /// untouched draft leaves no row, so clicking `＋` never accrues empty "New
+    /// session" rows. Restarting before the first write simply drops the draft.
+    pub fn create_draft_session(&self) -> Session {
+        let session = new_session(None);
+        self.pending
+            .lock()
+            .unwrap()
+            .insert(session.id.clone(), session.clone());
+        session
+    }
+
+    /// Flush a deferred draft on its first write (#671 item 2a): if `session_id`
+    /// is a not-yet-persisted draft, INSERT it now so the following message or
+    /// config `UPDATE` lands on a real row (the FK requires the session to exist).
+    /// No-op for an already-persisted session. The caller holds the `conn` lock;
+    /// the lock order is always `conn` then `pending` to stay deadlock-free.
+    fn flush_pending(&self, conn: &Connection, session_id: &str) {
+        if let Some(session) = self.pending.lock().unwrap().remove(session_id) {
+            insert_session(conn, &session);
+        }
     }
 
     pub fn list_sessions(&self) -> Vec<Session> {
@@ -309,6 +355,10 @@ impl SessionStore {
 
     fn push_message(&self, mut msg: Message) -> Message {
         let conn = self.conn.lock().unwrap();
+        // Persist a deferred draft (#671 item 2a) before its first message: the
+        // session row must exist for the message FK and the first-user-msg
+        // auto-title below. No-op once the session is already on disk.
+        self.flush_pending(&conn, &msg.session_id);
         // Stamp the authoring phenotype on assistant rows (#657) so a reloaded
         // thread renders the true historical author instead of the currently
         // active phenotype. The row is reserved at turn start, so the session
@@ -396,6 +446,7 @@ impl SessionStore {
     /// always wins over the auto-derived one. No-op for an unknown session.
     pub fn set_title(&self, session_id: &str, title: String) {
         let conn = self.conn.lock().unwrap();
+        self.flush_pending(&conn, session_id);
         conn.execute(
             "UPDATE sessions SET title = ?1, updated_at = ?2 WHERE id = ?3",
             params![title, now_ms(), session_id],
@@ -410,6 +461,7 @@ impl SessionStore {
     /// calling, and resolution falls back to global on an unknown name anyway.
     pub fn set_session_phenotype(&self, session_id: &str, phenotype: Option<String>) {
         let conn = self.conn.lock().unwrap();
+        self.flush_pending(&conn, session_id);
         conn.execute(
             "UPDATE sessions SET phenotype = ?1, updated_at = ?2 WHERE id = ?3",
             params![phenotype, now_ms(), session_id],
@@ -436,6 +488,7 @@ impl SessionStore {
     /// [`set_session_phenotype`](Self::set_session_phenotype).
     pub fn set_session_mode(&self, session_id: &str, mode: Option<Mode>) {
         let conn = self.conn.lock().unwrap();
+        self.flush_pending(&conn, session_id);
         conn.execute(
             "UPDATE sessions SET mode = ?1, updated_at = ?2 WHERE id = ?3",
             params![mode.as_ref().map(enum_to_text), now_ms(), session_id],
@@ -465,6 +518,7 @@ impl SessionStore {
     /// No-op for an unknown session. Mirrors [`set_session_phenotype`](Self::set_session_phenotype).
     pub fn set_session_workspace(&self, session_id: &str, workspace: Option<String>) {
         let conn = self.conn.lock().unwrap();
+        self.flush_pending(&conn, session_id);
         conn.execute(
             "UPDATE sessions SET workspace = ?1, updated_at = ?2 WHERE id = ?3",
             params![workspace, now_ms(), session_id],
@@ -493,6 +547,7 @@ impl SessionStore {
     /// [`set_session_phenotype`](Self::set_session_phenotype).
     pub fn set_session_model(&self, session_id: &str, model: Option<ModelSelection>) {
         let conn = self.conn.lock().unwrap();
+        self.flush_pending(&conn, session_id);
         let json = model.as_ref().and_then(|m| serde_json::to_string(m).ok());
         conn.execute(
             "UPDATE sessions SET model = ?1, updated_at = ?2 WHERE id = ?3",
@@ -524,6 +579,7 @@ impl SessionStore {
     /// Mirrors [`set_session_model`](Self::set_session_model).
     pub fn set_session_mcp_servers(&self, session_id: &str, servers: Option<Vec<McpServerConfig>>) {
         let conn = self.conn.lock().unwrap();
+        self.flush_pending(&conn, session_id);
         let json = servers.as_ref().and_then(|s| serde_json::to_string(s).ok());
         conn.execute(
             "UPDATE sessions SET mcp_servers = ?1, updated_at = ?2 WHERE id = ?3",
@@ -659,6 +715,7 @@ impl SessionStore {
 
     pub fn set_status(&self, session_id: &str, status: SessionStatus) {
         let conn = self.conn.lock().unwrap();
+        self.flush_pending(&conn, session_id);
         conn.execute(
             "UPDATE sessions SET status = ?1, updated_at = ?2 WHERE id = ?3",
             params![enum_to_text(&status), now_ms(), session_id],
@@ -674,7 +731,10 @@ impl SessionStore {
         let removed = conn
             .execute("DELETE FROM sessions WHERE id = ?1", params![session_id])
             .unwrap_or(0);
-        removed > 0
+        // Also drop an un-persisted draft (#671 item 2a) so an abandoned `＋` never
+        // leaks in the pending map.
+        let drafted = self.pending.lock().unwrap().remove(session_id).is_some();
+        removed > 0 || drafted
     }
 
     /// Edit a prior **user** message in place and truncate the transcript after
@@ -903,15 +963,19 @@ impl SessionStore {
     /// Fetch a single session by id, or `None` if it does not exist.
     pub fn get_session(&self, session_id: &str) -> Option<Session> {
         let conn = self.conn.lock().unwrap();
-        conn.query_row(
-            "SELECT id, goal, title, summary, status, created_at, updated_at, phenotype, mode, workspace, model, mcp_servers
-             FROM sessions WHERE id = ?1",
-            params![session_id],
-            row_to_session,
-        )
-        .optional()
-        .ok()
-        .flatten()
+        let persisted = conn
+            .query_row(
+                "SELECT id, goal, title, summary, status, created_at, updated_at, phenotype, mode, workspace, model, mcp_servers
+                 FROM sessions WHERE id = ?1",
+                params![session_id],
+                row_to_session,
+            )
+            .optional()
+            .ok()
+            .flatten();
+        // An un-persisted draft (#671 item 2a) is not on disk yet; surface it from
+        // the pending map so its pane and config resolve before the first message.
+        persisted.or_else(|| self.pending.lock().unwrap().get(session_id).cloned())
     }
 
     /// Render a session and its full transcript as JSON or Markdown (RFC 0012,
@@ -1391,6 +1455,63 @@ mod tests {
         assert_eq!(msgs[2].content, "");
         assert_eq!(msgs[2].reasoning.as_deref(), Some("thinking"));
         assert_eq!(msgs[3].content, "");
+    }
+
+    #[test]
+    fn draft_session_defers_persistence_until_first_message() {
+        let store = SessionStore::new();
+        let draft = store.create_draft_session();
+        // Not on disk yet: absent from the list, but still resolvable as a draft.
+        assert!(store.list_sessions().is_empty());
+        assert_eq!(
+            store.get_session(&draft.id).map(|s| s.id),
+            Some(draft.id.clone()),
+        );
+
+        // The first user message flushes the draft: it now persists, lists, and
+        // carries the auto-title heuristic (#671 item 2a).
+        store.add_message(&draft.id, Role::User, "summarize the parser".into());
+        let listed = store.list_sessions();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, draft.id);
+        assert!(
+            listed[0].title.is_some(),
+            "first message seeds the auto-title"
+        );
+    }
+
+    #[test]
+    fn untouched_draft_leaves_no_row() {
+        let store = SessionStore::new();
+        let draft = store.create_draft_session();
+        // Never messaged or configured: nothing is persisted (a fresh store stands
+        // in for a fresh app start — the in-memory draft is simply gone).
+        assert!(store.list_sessions().is_empty());
+        // Deleting the abandoned draft succeeds and clears the pending entry.
+        assert!(store.delete_session(&draft.id));
+        assert!(store.get_session(&draft.id).is_none());
+    }
+
+    #[test]
+    fn config_write_flushes_a_draft() {
+        let store = SessionStore::new();
+        let draft = store.create_draft_session();
+        // Picking a model before the first message must not be lost: the write
+        // flushes the draft first, then lands the override on the real row.
+        let sel = model_sel("openai-main", "gpt-4o");
+        store.set_session_model(&draft.id, Some(sel.clone()));
+        assert_eq!(store.list_sessions().len(), 1);
+        assert_eq!(store.session_model(&draft.id), Some(sel));
+    }
+
+    #[test]
+    fn create_session_still_persists_immediately() {
+        // The direct store API (CLI, background flows) is unchanged: create_session
+        // writes a row right away — only the desktop `＋` uses the deferred draft.
+        let store = SessionStore::new();
+        let s = store.create_session(None);
+        assert_eq!(store.list_sessions().len(), 1);
+        assert_eq!(store.list_sessions()[0].id, s.id);
     }
 
     #[test]

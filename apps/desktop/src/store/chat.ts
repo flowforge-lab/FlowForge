@@ -96,6 +96,13 @@ interface ChatState {
   /** Set when bootstrap() fails so the UI can show a clear error instead of a
    *  silently broken input bar. */
   bootstrapError: string | null;
+  /** Ids of sessions created but not yet committed to one round of conversation
+   *  (#671 item 2). A fresh `＋` session lives here as an in-memory draft: it stays
+   *  in `sessions` (so its pane/transcript resolve) but is hidden from the sidebar
+   *  list until the first user message persists it. Promoted (removed here) on the
+   *  first successful `send`. The backend mirrors this by deferring its DB INSERT to
+   *  the first message, so an untouched draft leaves no row. */
+  draftSessionIds: Set<string>;
 
   bootstrap: () => Promise<void>;
   /** Re-pull the session list from the backend (e.g. after a scheduled task fires
@@ -273,14 +280,11 @@ export const useChatStore = create<ChatState>((set, get) => ({
   sessionApprovedBySession: {},
   alwaysApproved: new Set<string>(),
   bootstrapError: null,
+  draftSessionIds: new Set<string>(),
 
   bootstrap: async () => {
     try {
-      let sessions = await ipc.listSessions();
-      if (sessions.length === 0) {
-        await ipc.createSession();
-        sessions = await ipc.listSessions();
-      }
+      const sessions = await ipc.listSessions();
       set({ sessions, bootstrapError: null });
 
       // Hydrate the always-approved mirror so badges render correctly from the
@@ -288,7 +292,14 @@ export const useChatStore = create<ChatState>((set, get) => ({
       void get().loadAlwaysApproved();
 
       const first = sessions[0];
-      if (first) await get().selectSession(first.id);
+      if (first) {
+        await get().selectSession(first.id);
+      } else {
+        // No persisted sessions yet — open a fresh draft (#671 item 2) so the app is
+        // never session-less. It isn't written until the first message, so it stays
+        // out of the sidebar but is the active session in the pane, ready to type.
+        await get().newSession();
+      }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       console.error("[FlowForge] bootstrap failed:", msg);
@@ -297,8 +308,17 @@ export const useChatStore = create<ChatState>((set, get) => ({
   },
 
   refreshSessions: async () => {
-    const sessions = await ipc.listSessions();
-    set({ sessions });
+    const fetched = await ipc.listSessions();
+    set((s) => {
+      // Backend truth won't include not-yet-persisted drafts (#671 item 2), so
+      // carry any still-draft session over rather than letting a refresh drop it
+      // from `sessions` (which would let a split pane's leaf reconcile away).
+      const fetchedIds = new Set(fetched.map((f) => f.id));
+      const keptDrafts = s.sessions.filter(
+        (x) => s.draftSessionIds.has(x.id) && !fetchedIds.has(x.id),
+      );
+      return { sessions: [...keptDrafts, ...fetched] };
+    });
   },
 
   selectSession: async (sessionId) => {
@@ -349,6 +369,9 @@ export const useChatStore = create<ChatState>((set, get) => ({
     set((s) => ({
       sessions: [session, ...s.sessions],
       messagesBySession: { ...s.messagesBySession, [session.id]: [] },
+      // Fresh, empty session: hold it as a draft (#671 item 2) so it doesn't clutter
+      // the sidebar until the first message persists it. It stays active in its pane.
+      draftSessionIds: new Set(s.draftSessionIds).add(session.id),
     }));
     await get().selectSession(session.id);
   },
@@ -474,17 +497,27 @@ export const useChatStore = create<ChatState>((set, get) => ({
         content,
         attachments,
       );
-      set((s) => ({
-        messagesBySession: {
-          ...s.messagesBySession,
-          [sessionId]: (s.messagesBySession[sessionId] ?? []).map((m) =>
-            m.id === tempId ? { ...m, id: userMessageId } : m,
+      set((s) => {
+        // First round landed: the backend has now persisted this session, so drop
+        // its draft flag (#671 item 2) — it graduates into the sidebar list.
+        let draftSessionIds = s.draftSessionIds;
+        if (draftSessionIds.has(sessionId)) {
+          draftSessionIds = new Set(draftSessionIds);
+          draftSessionIds.delete(sessionId);
+        }
+        return {
+          draftSessionIds,
+          messagesBySession: {
+            ...s.messagesBySession,
+            [sessionId]: (s.messagesBySession[sessionId] ?? []).map((m) =>
+              m.id === tempId ? { ...m, id: userMessageId } : m,
+            ),
+          },
+          sessions: s.sessions.map((sess) =>
+            sess.id === sessionId ? { ...sess, updatedAt: Date.now() } : sess,
           ),
-        },
-        sessions: s.sessions.map((sess) =>
-          sess.id === sessionId ? { ...sess, updatedAt: Date.now() } : sess,
-        ),
-      }));
+        };
+      });
     } catch (err) {
       set((s) => {
         const { [sessionId]: _, ...turnStartBySession } = s.turnStartBySession;
