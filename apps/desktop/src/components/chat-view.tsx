@@ -196,7 +196,7 @@ function MessageRowImpl({
                     i === lastStepsIdx && exportEnabled
                       ? (format) =>
                           void downloadStepTimeline(
-                            toolSteps,
+                            items,
                             {
                               sessionId: message.sessionId,
                               model: exportModel,

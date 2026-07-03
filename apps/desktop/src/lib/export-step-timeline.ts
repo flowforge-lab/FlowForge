@@ -11,20 +11,21 @@ import {
   type TimelineMeta,
 } from "@/lib/step-export";
 import { saveTextToFile, type SaveResult } from "@/lib/save-file";
-import type { ToolStep } from "@/store/chat";
+import type { TurnItem } from "@/lib/turn-groups";
 
 const MIME = {
   json: "application/json",
   csv: "text/csv",
 } as const;
 
-/** Build + serialize a turn's step timeline and write it to a user-chosen file. */
+/** Build + serialize a turn's step timeline and write it to a user-chosen file. Takes
+ *  the turn's interleaved `items` (reasoning + steps in `foldTurns` order, #593). */
 export async function downloadStepTimeline(
-  steps: ToolStep[],
+  items: TurnItem[],
   meta: TimelineMeta,
   format: "json" | "csv",
 ): Promise<SaveResult> {
-  const dump = buildTimeline(steps, meta);
+  const dump = buildTimeline(items, meta);
   const content =
     format === "json" ? timelineToJson(dump) : timelineToCsv(dump);
   return saveTextToFile(content, {
