@@ -58,6 +58,12 @@ describe("parseStopNotice (#636)", () => {
       label: "the model returned an empty response",
       reason: "capped",
     });
+    // #666: the drop-path interrupted reason resolves structurally, matching the
+    // legacy `[stopped: interrupted]` fallback (resumable via the "capped" reason).
+    expect(parseStopNotice("", "interrupted")).toEqual({
+      label: "Interrupted",
+      reason: "capped",
+    });
   });
 
   it("falls back to the marker string when stopReason is absent (legacy row)", () => {
@@ -95,6 +101,19 @@ describe("CancelledNotice (#636)", () => {
       <CancelledNotice sessionId={SID} content="" stopReason="toolLimit" />,
     );
     expect(screen.getByText("reached tool-call limit")).not.toBeNull();
+    expect(screen.getByText("Continue")).not.toBeNull();
+  });
+
+  it("renders the Interrupted label + Continue from the drop-path reason (#666)", () => {
+    useChatStore.setState({ resumableBySession: { [SID]: true } });
+    render(
+      <CancelledNotice
+        sessionId={SID}
+        content="[stopped: interrupted]"
+        stopReason="interrupted"
+      />,
+    );
+    expect(screen.getByText("Interrupted")).not.toBeNull();
     expect(screen.getByText("Continue")).not.toBeNull();
   });
 

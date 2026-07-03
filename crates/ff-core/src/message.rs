@@ -29,17 +29,22 @@ pub enum StopReason {
     Stall,
     /// The model returned an empty response even after the bounded retries.
     EmptyResponse,
+    /// The turn's future was dropped mid-stream (app shutdown, panic, task
+    /// cancellation) before it could finalize. Backfilled by the agent's
+    /// `AssistantRowGuard` Drop path and the orphaned-row sweep.
+    Interrupted,
 }
 
 impl StopReason {
     /// The persisted `[stopped…]` notice text for this reason. The one place the
     /// marker strings live, so the frontend never has to reproduce them.
-    pub fn marker(self) -> &'static str {
+    pub const fn marker(self) -> &'static str {
         match self {
             StopReason::Cancelled => "[stopped]",
             StopReason::ToolLimit => "[stopped: reached tool-call limit]",
             StopReason::Stall => "[stopped: repeated a tool call without making progress]",
             StopReason::EmptyResponse => "[stopped: the model returned an empty response]",
+            StopReason::Interrupted => "[stopped: interrupted]",
         }
     }
 
@@ -51,6 +56,7 @@ impl StopReason {
             StopReason::ToolLimit => "toolLimit",
             StopReason::Stall => "stall",
             StopReason::EmptyResponse => "emptyResponse",
+            StopReason::Interrupted => "interrupted",
         }
     }
 
@@ -62,6 +68,7 @@ impl StopReason {
             "toolLimit" => Some(StopReason::ToolLimit),
             "stall" => Some(StopReason::Stall),
             "emptyResponse" => Some(StopReason::EmptyResponse),
+            "interrupted" => Some(StopReason::Interrupted),
             _ => None,
         }
     }
@@ -164,4 +171,33 @@ pub struct Message {
     /// Unix epoch milliseconds.
     #[ts(type = "number")]
     pub created_at: i64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stop_reason_wire_round_trips_every_variant() {
+        // The persisted wire string and the parser must stay in lockstep for every
+        // variant, so a row written by `as_wire` always reads back via `from_wire`.
+        for reason in [
+            StopReason::Cancelled,
+            StopReason::ToolLimit,
+            StopReason::Stall,
+            StopReason::EmptyResponse,
+            StopReason::Interrupted,
+        ] {
+            assert_eq!(
+                StopReason::from_wire(reason.as_wire()),
+                Some(reason),
+                "round-trip failed for {reason:?}"
+            );
+        }
+        // The interrupted contract, pinned explicitly.
+        assert_eq!(StopReason::Interrupted.as_wire(), "interrupted");
+        assert_eq!(StopReason::Interrupted.marker(), "[stopped: interrupted]");
+        // Unknown wire values are a forward-compat `None`, not a panic.
+        assert_eq!(StopReason::from_wire("nope"), None);
+    }
 }

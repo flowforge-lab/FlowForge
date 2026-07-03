@@ -7,4 +7,4 @@
  * marker. Persisted on the assistant [`Message`] and carried on
  * [`TurnDoneEvent`](crate::events::TurnDoneEvent); absent for a normal turn.
  */
-export type StopReason = "cancelled" | "toolLimit" | "stall" | "emptyResponse";
+export type StopReason = "cancelled" | "toolLimit" | "stall" | "emptyResponse" | "interrupted";

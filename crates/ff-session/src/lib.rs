@@ -606,11 +606,15 @@ impl SessionStore {
     pub fn reconcile_orphaned_assistant_rows(&self, session_id: &str, notice: &str) -> usize {
         let ts = now_ms();
         let conn = self.conn.lock().unwrap();
+        // This bulk sweep has no message id, so it can't call `set_message_stop_reason`
+        // per row (that's the `Drop` guard's job). Stamp the structured reason inline
+        // in the same UPDATE so the reconciled rows classify structurally on the FE,
+        // matching the notice text. The wire string stays single-sourced via `as_wire`.
         conn.execute(
-            "UPDATE messages SET content = ?1, created_at = ?2
-             WHERE session_id = ?3 AND role = 'assistant'
+            "UPDATE messages SET content = ?1, created_at = ?2, stop_reason = ?3
+             WHERE session_id = ?4 AND role = 'assistant'
                AND content = '' AND tool_calls IS NULL AND reasoning IS NULL",
-            params![notice, ts, session_id],
+            params![notice, ts, StopReason::Interrupted.as_wire(), session_id],
         )
         .unwrap_or(0)
     }

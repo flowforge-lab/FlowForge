@@ -34,6 +34,11 @@ function fromStopReason(stopReason: WireStopReason): {
         label: "the model returned an empty response",
         reason: "capped",
       };
+    case "interrupted":
+      // The turn's future was dropped mid-stream (app shutdown / hard kill) — not
+      // a user Stop, so it resumes like a cap ("capped" affordance). Mirrors the
+      // legacy `[stopped: interrupted]` string-parse fallback below.
+      return { label: "Interrupted", reason: "capped" };
   }
 }
 

@@ -637,7 +637,7 @@ impl Drop for ToolResultBackfill<'_> {
 /// Notice written to a reserved-but-unfinalized assistant row when its turn is
 /// interrupted mid-flight. Shares the `[stopped: ...]` vocabulary with the
 /// in-loop terminal notices (empty-response / tool-call limit / cancel).
-pub const INTERRUPTED_NOTICE: &str = "[stopped: interrupted]";
+pub const INTERRUPTED_NOTICE: &str = StopReason::Interrupted.marker();
 
 /// RAII guard for the assistant message row reserved at the top of each loop
 /// iteration. The row is created empty (so the frontend can route streaming
@@ -687,6 +687,15 @@ impl Drop for AssistantRowGuard<'_> {
             &self.message_id,
             self.session_id,
             INTERRUPTED_NOTICE.to_string(),
+        );
+        // Stamp the structured reason alongside the notice text so the frontend
+        // classifies the interrupted row via `Message.stop_reason` instead of the
+        // legacy `[stopped…]` string match. Both store calls are synchronous and the
+        // guard holds the id, so this is a direct second call — no async plumbing.
+        self.store.set_message_stop_reason(
+            &self.message_id,
+            self.session_id,
+            StopReason::Interrupted,
         );
     }
 }
@@ -3787,6 +3796,13 @@ mod tests {
         assert!(
             assistant.tool_calls.is_none(),
             "no tool calls were made, so none should be attached"
+        );
+        // The structured reason is stamped alongside the notice, so the frontend
+        // classifies the row without falling back to the legacy string match.
+        assert_eq!(
+            assistant.stop_reason,
+            Some(StopReason::Interrupted),
+            "dropped turn should record a structured Interrupted stop reason"
         );
     }
 
