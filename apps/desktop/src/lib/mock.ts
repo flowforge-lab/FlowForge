@@ -713,6 +713,12 @@ export class MockIpc implements FfIpc {
   // real flush only fires once a session crosses the budget; the mock stands in
   // by flushing once per session so the provenance surface is exercisable.
   private flushedSessions = new Set<string>();
+  // Draft sessions created by a bare `＋` (no goal) that haven't seen a first
+  // message yet (#671 item 2). Mirrors the real backend deferring its DB INSERT:
+  // held here (not in `sessions`, so `listSessions` omits them) until the first
+  // `sendMessage` flushes them into `sessions`. Their transcript already lives in
+  // `messages` so an open draft pane still resolves via `getMessages`.
+  private pendingSessions = new Map<string, Session>();
 
   async isAppReady(): Promise<boolean> {
     // The mock has no deferred heavy init; it is ready immediately so the FE's
@@ -731,11 +737,16 @@ export class MockIpc implements FfIpc {
       createdAt: ts,
       updatedAt: ts,
     };
-    this.sessions.set(session.id, session);
-    this.messages.set(session.id, []);
+    // A bare `＋` (no goal) stays an unpersisted draft until its first message
+    // (#671 item 2); a session created with an explicit goal/intention (e.g. a
+    // scheduled run, #543) is committed immediately so it lists right away.
     if (goal) {
+      this.sessions.set(session.id, session);
       this.emit(this.intentionListeners, { sessionId: session.id, goal });
+    } else {
+      this.pendingSessions.set(session.id, session);
     }
+    this.messages.set(session.id, []);
     return session;
   }
 
@@ -847,6 +858,14 @@ export class MockIpc implements FfIpc {
     content: string,
     attachments?: Attachment[],
   ): Promise<string> {
+    // First message commits a deferred draft (#671 item 2): move it out of the
+    // pending map into `sessions` so it now appears in `listSessions`, mirroring
+    // the real backend flushing its INSERT on the first round.
+    const pending = this.pendingSessions.get(sessionId);
+    if (pending) {
+      this.sessions.set(sessionId, pending);
+      this.pendingSessions.delete(sessionId);
+    }
     const user = this.append(sessionId, "user", content, attachments);
     // Dev-only: `/cap` reproduces a turn that ends at the tool-call limit with no
     // streamed answer — the agent loop's empty-content finalizer writes a

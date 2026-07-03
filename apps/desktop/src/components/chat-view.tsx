@@ -143,7 +143,7 @@ function MessageRowImpl({
         authorName={message.authorName}
       />
       {toolSteps.length > 0 ? (
-        <div className="flex w-full max-w-[80%] flex-col gap-1.5">
+        <div className="flex w-full flex-col gap-1.5">
           {/* A single settled step stays bare; streaming (any count), 2+ steps, or
               any reasoning to fold in (#205) use StepGroup so the live timer, peek
               window (#180), and inline Thinking rows (#574) apply. Intermediate prose
@@ -220,7 +220,7 @@ function MessageRowImpl({
         // No tool steps this turn: the Thinking block stands alone, but folded by
         // default (#205) so it stays compact.
         reasoning && (
-          <div className="w-full max-w-[80%]">
+          <div className="w-full">
             <ThinkingBlock
               reasoning={reasoning}
               streaming={streaming}
@@ -244,7 +244,7 @@ function MessageRowImpl({
             stopReason={message.stopReason}
           />
         ) : (
-          <div className="group relative max-w-[80%]">
+          <div className="group relative w-full">
             <div
               data-selectable
               className={cn(

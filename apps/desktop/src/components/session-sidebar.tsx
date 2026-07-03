@@ -1,5 +1,5 @@
 import type { ComponentType, ReactNode } from "react";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   Download,
   EyeOff,
@@ -494,7 +494,14 @@ export function SessionItem({
 // ── Sidebar ──────────────────────────────────────────────────────────────────
 
 export function SessionSidebar() {
-  const sessions = useChatStore((s) => s.sessions);
+  const allSessions = useChatStore((s) => s.sessions);
+  const draftSessionIds = useChatStore((s) => s.draftSessionIds);
+  // Hide not-yet-persisted drafts (#671 item 2): a fresh `＋` session shows in its
+  // pane but stays out of the list until its first message persists it.
+  const sessions = useMemo(
+    () => allSessions.filter((s) => !draftSessionIds.has(s.id)),
+    [allSessions, draftSessionIds],
+  );
   const activeSessionId = useChatStore((s) => s.activeSessionId);
   const streamingBySession = useChatStore((s) => s.streamingBySession);
   const newSession = useChatStore((s) => s.newSession);
@@ -533,17 +540,12 @@ export function SessionSidebar() {
     window.addEventListener("mouseup", onUp);
   }
 
-  // The + button spins off a new blank session in a right split, focusing it
-  // (#245 2a) — splitting is the useful default over swapping the focused pane.
-  // At the pane cap (or before panes initialize) it falls back to the old in-pane
-  // swap so the button never dead-ends. (⌘N stays an in-pane quick-swap.)
+  // The + button swaps the focused pane to a fresh session in place (#671 item 1),
+  // leaving every other pane untouched — no new split, so panes that already fill
+  // the width never get squeezed into a clipped extra column. With no panes open
+  // yet, newSession() still sets the active session, which the single-pane view
+  // renders. (The explicit split-pane actions still create splits.)
   function newSessionInFocusedPane() {
-    const panes = usePanesStore.getState();
-    const focused = panes.focusedPaneId;
-    if (focused && panes.leafCount() < MAX_PANES) {
-      void panes.splitNew(focused, "vertical");
-      return;
-    }
     void newSession().then(() => {
       const id = useChatStore.getState().activeSessionId;
       const f = usePanesStore.getState().focusedPaneId;
