@@ -23,12 +23,14 @@ import { groupDurationMs } from "@/lib/steps";
 
 /** An ordered row inside an assistant turn: a tool step, a chunk of the model's
  *  intermediate prose ("Now let me check …") that preceded the next tool call (#415),
- *  or that iteration's reasoning, sitting where the thinking happened — immediately
- *  before the tool calls it produced (#574). */
+ *  that iteration's reasoning, sitting where the thinking happened — immediately
+ *  before the tool calls it produced (#574) — or a short/operational narration line
+ *  that stays folded inside the step group as a compact "thought" (#687). */
 export type TurnItem =
   | { kind: "step"; step: ToolStep }
   | { kind: "prose"; text: string; key: string }
-  | { kind: "reasoning"; text: string; key: string };
+  | { kind: "reasoning"; text: string; key: string }
+  | { kind: "thought"; text: string; key: string };
 
 /** One rendered transcript row. */
 export type RenderGroup =
@@ -233,12 +235,41 @@ export type TurnSegment =
   | { kind: "prose"; text: string; key: string }
   | { kind: "steps"; items: TurnItem[]; steps: ToolStep[]; key: string };
 
+// Classification for intermediate prose (#687): decide whether a chunk of narration
+// is substantive (hoisted to a full-width block between step groups) or a throwaway
+// operational line (folded inside the step group as a compact "thought"). Constants
+// are exported so the bands stay tuneable in one place.
+//
+// The key insight: when the model *formats* text (backticks, bold, lists, paragraph
+// breaks) it means it to be read; plain operational narration ("Let me check…") does
+// not. So we combine formatting presence + an operational-prefix check + length bands
+// rather than a naive length threshold.
+export const HAS_FORMATTING = /`[^`]+`|\*\*[^*]+\*\*|^\s*[-*]\s|\n\n/m;
+export const OPERATIONAL_START =
+  /^(let me|now |wait|i'll|i need|let's|hmm|ok[, ]|actually|first|next |then |so |checking|looking|running|trying|verifying)/i;
+/** Below this, prose is always a thought. */
+export const SHORT = 120;
+/** At/above this, unformatted prose is still substantive. */
+export const LONG = 350;
+
+/** Whether an intermediate-prose chunk is substantive (→ top-level block) vs a
+ *  short/operational "thought" (→ folded inside the step group). See #687. */
+export function isSubstantiveProse(text: string): boolean {
+  const t = text.trim();
+  if (t.length < SHORT) return false; // very short = always thought
+  if (OPERATIONAL_START.test(t)) return false; // "Let me check…" = thought even if longish
+  if (HAS_FORMATTING.test(t)) return true; // has formatting = substantive
+  return t.length >= LONG; // long unformatted = still substantive
+}
+
 /**
- * Split a turn's ordered {@link TurnItem}s into {@link TurnSegment}s: each `prose`
- * item becomes its own standalone segment, and each run of contiguous
- * `reasoning`/`step` items collapses into one `steps` segment (carrying its own flat
- * `steps` for the per-group "N steps" count). Empty steps segments are dropped, so a
- * turn with no prose yields a single steps segment — identical to the pre-split render.
+ * Split a turn's ordered {@link TurnItem}s into {@link TurnSegment}s: a *substantive*
+ * `prose` item becomes its own standalone segment, while a short/operational one is
+ * demoted to a folded `thought` that stays inside the surrounding `steps` segment
+ * (#687). Each run of contiguous `reasoning`/`step`/`thought` items collapses into one
+ * `steps` segment (carrying its own flat `steps` for the per-group "N steps" count).
+ * Empty steps segments are dropped, so a turn with no prose yields a single steps
+ * segment — identical to the pre-split render.
  *
  * Pure and React-free (unit-tested in turn-groups.test.ts); the reorder in `foldTurns`
  * to `prose → reasoning → steps` keeps each iteration's reasoning bound to its steps
@@ -276,8 +307,14 @@ export function segmentTurn(items: TurnItem[]): TurnSegment[] {
 
   for (const it of items) {
     if (it.kind === "prose") {
-      flush();
-      segments.push({ kind: "prose", text: it.text, key: it.key });
+      if (isSubstantiveProse(it.text)) {
+        flush();
+        segments.push({ kind: "prose", text: it.text, key: it.key });
+      } else {
+        // Short/operational prose stays inside the step group as a folded thought
+        // (#687) rather than a full-width block.
+        buffer.push({ kind: "thought", text: it.text, key: it.key });
+      }
     } else {
       buffer.push(it);
       if (it.kind === "step") bufferSteps.push(it.step);

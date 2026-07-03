@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import {
   foldTurns,
+  isSubstantiveProse,
   persistedStepToToolStep,
   segmentTurn,
 } from "@/lib/turn-groups";
@@ -216,7 +217,9 @@ describe("foldTurns — interleaved prose (#415)", () => {
         ? `reasoning:${it.text}`
         : it.kind === "prose"
           ? `prose:${it.text}`
-          : `step:${it.step.tool}`,
+          : it.kind === "thought"
+            ? `thought:${it.text}`
+            : `step:${it.step.tool}`,
     );
   }
 
@@ -307,7 +310,9 @@ describe("foldTurns — interleaved reasoning (#574)", () => {
         ? `reasoning:${it.text}`
         : it.kind === "prose"
           ? `prose:${it.text}`
-          : `step:${it.step.tool}`,
+          : it.kind === "thought"
+            ? `thought:${it.text}`
+            : `step:${it.step.tool}`,
     );
   }
 
@@ -412,32 +417,39 @@ describe("segmentTurn (#619)", () => {
       .join(",");
     return `steps[${seg.steps.length}]:${kinds}`;
   }
+  // Prose that classifies as substantive (#687): ≥SHORT, no operational prefix, and
+  // formatted (inline code), so it stays hoisted as a top-level block. Short/plain
+  // narration would instead fold into the step group as a thought.
+  const SUB_A =
+    "Reconstructed the turn from persisted messages and matched each tool result to its assistant call so render order stays stable — see `foldTurns`.";
+  const SUB_B =
+    "The `grep` sweep confirmed the helper is only referenced from the step group and its own tests, so widening the window is safe to land here.";
 
-  it("hoists prose into standalone segments, splitting the steps around it", () => {
+  it("hoists substantive prose into standalone segments, splitting the steps around it", () => {
     const items: TurnItem[] = [
-      { kind: "prose", text: "Let me read the file.", key: "a1" },
+      { kind: "prose", text: SUB_A, key: "a1" },
       { kind: "step", step: step("c1", "view") },
-      { kind: "prose", text: "Found it. Now searching.", key: "a2" },
+      { kind: "prose", text: SUB_B, key: "a2" },
       { kind: "step", step: step("c2", "grep") },
     ];
     expect(segmentTurn(items).map(tag)).toEqual([
-      "prose:Let me read the file.",
+      `prose:${SUB_A}`,
       "steps[1]:step",
-      "prose:Found it. Now searching.",
+      `prose:${SUB_B}`,
       "steps[1]:step",
     ]);
   });
 
   it("keeps an iteration's reasoning contiguous with its steps in one segment", () => {
     const items: TurnItem[] = [
-      { kind: "prose", text: "narration", key: "a1" },
+      { kind: "prose", text: SUB_A, key: "a1" },
       { kind: "reasoning", text: "thinking", key: "a1" },
       { kind: "step", step: step("c1") },
       { kind: "step", step: step("c2") },
     ];
     const segs = segmentTurn(items);
     expect(segs.map(tag)).toEqual([
-      "prose:narration",
+      `prose:${SUB_A}`,
       "steps[2]:reasoning,step,step",
     ]);
   });
@@ -457,13 +469,13 @@ describe("segmentTurn (#619)", () => {
     expect(segs[0]).toMatchObject({ kind: "steps" });
   });
 
-  it("interleaves multiple prose blocks with their step groups in order", () => {
+  it("interleaves multiple substantive prose blocks with their step groups in order", () => {
     const items: TurnItem[] = [
-      { kind: "prose", text: "p1", key: "a1" },
+      { kind: "prose", text: SUB_A, key: "a1" },
       { kind: "step", step: step("c1") },
-      { kind: "prose", text: "p2", key: "a2" },
+      { kind: "prose", text: SUB_B, key: "a2" },
       { kind: "step", step: step("c2") },
-      { kind: "prose", text: "p3", key: "a3" },
+      { kind: "prose", text: SUB_A, key: "a3" },
       { kind: "step", step: step("c3") },
     ];
     const segs = segmentTurn(items);
@@ -491,5 +503,79 @@ describe("segmentTurn (#619)", () => {
     expect(segmentTurn(afterReasoning)[0].key).toBe(
       segmentTurn(beforeReasoning)[0].key,
     );
+  });
+});
+
+describe("isSubstantiveProse (#687)", () => {
+  it("treats very short prose as a thought regardless of content", () => {
+    expect(isSubstantiveProse("Let me check the helper.")).toBe(false); // 24ch
+    expect(isSubstantiveProse("The fix: `hasMore` should reflect it.")).toBe(
+      false, // <SHORT even though it has formatting
+    );
+  });
+
+  it("treats an operational-prefixed medium chunk as a thought", () => {
+    const t =
+      "Wait — the integration test expects the row to still render its label after the toggle, so the assertion has to move below the click.";
+    expect(t.length).toBeGreaterThanOrEqual(120);
+    expect(isSubstantiveProse(t)).toBe(false); // starts with "Wait"
+  });
+
+  it("treats a formatted medium chunk as substantive", () => {
+    const t =
+      "Critical finding: **model selection is the backend source of truth**, so the composer must gate on the resolved caps rather than the active connection.";
+    expect(t.length).toBeGreaterThanOrEqual(120);
+    expect(t.length).toBeLessThan(350);
+    expect(isSubstantiveProse(t)).toBe(true); // has **bold**
+  });
+
+  it("treats a long unformatted chunk as substantive", () => {
+    const t = "word ".repeat(80).trim(); // ~399ch, no formatting, no op prefix
+    expect(t.length).toBeGreaterThanOrEqual(350);
+    expect(isSubstantiveProse(t)).toBe(true);
+  });
+
+  it("counts paragraph breaks as formatting", () => {
+    const t =
+      "Verified the reader path against the persisted transcript.\n\nThe reconstructed steps line up with the live model, so reload renders identically.";
+    expect(t.length).toBeGreaterThanOrEqual(120);
+    expect(isSubstantiveProse(t)).toBe(true); // \n\n
+  });
+});
+
+describe("segmentTurn thought folding (#687)", () => {
+  function step(callId: string, tool = "bash"): ToolStep {
+    return { callId, tool, args: {}, status: "done" };
+  }
+
+  it("folds short/operational prose into the surrounding steps segment as a thought", () => {
+    const items: TurnItem[] = [
+      { kind: "prose", text: "Now let me verify.", key: "a1" },
+      { kind: "step", step: step("c1") },
+    ];
+    const segs = segmentTurn(items);
+    expect(segs).toHaveLength(1);
+    expect(segs[0].kind).toBe("steps");
+    const steps = segs[0] as Extract<
+      ReturnType<typeof segmentTurn>[number],
+      { kind: "steps" }
+    >;
+    expect(steps.items.map((it) => it.kind)).toEqual(["thought", "step"]);
+    // The demoted thought carries the prose text and does not count as a step.
+    expect(steps.steps).toHaveLength(1);
+  });
+
+  it("still hoists a substantive chunk in the same turn", () => {
+    const substantive =
+      "The `foldTurns` reconstruction matched every persisted tool result to its assistant call, so the reloaded turn renders in the original order.";
+    const items: TurnItem[] = [
+      { kind: "prose", text: "Let me look.", key: "a1" },
+      { kind: "step", step: step("c1") },
+      { kind: "prose", text: substantive, key: "a2" },
+      { kind: "step", step: step("c2") },
+    ];
+    const kinds = segmentTurn(items).map((s) => s.kind);
+    // thought folds into the first steps group; substantive prose splits the turn.
+    expect(kinds).toEqual(["steps", "prose", "steps"]);
   });
 });

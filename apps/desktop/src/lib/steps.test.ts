@@ -5,10 +5,11 @@ import {
   groupDurationMs,
   liveElapsedMs,
   resolveGroupOpen,
-  selectStepWindow,
+  selectItemWindow,
   turnStartMs,
 } from "@/lib/steps";
 import type { ToolStep } from "@/store/chat";
+import type { TurnItem } from "@/lib/turn-groups";
 
 function step(partial: Partial<ToolStep>): ToolStep {
   return { callId: "c", tool: "t", args: {}, status: "done", ...partial };
@@ -102,38 +103,46 @@ describe("turnStartMs / liveElapsedMs", () => {
   });
 });
 
-describe("selectStepWindow", () => {
-  const many = Array.from({ length: 5 }, (_, i) =>
-    step({ callId: `c${i}`, startedAt: i * 100 }),
-  );
+describe("selectItemWindow (#687)", () => {
+  // A mix of steps and a folded thought so the window is exercised over items, not
+  // just tool steps — a thought interleaved between calls still counts toward the tail.
+  const many: TurnItem[] = [
+    { kind: "step", step: step({ callId: "c0" }) },
+    { kind: "thought", text: "Now let me check.", key: "t1" },
+    { kind: "step", step: step({ callId: "c1" }) },
+    { kind: "step", step: step({ callId: "c2" }) },
+    { kind: "step", step: step({ callId: "c3" }) },
+  ];
+  const kindKey = (it: TurnItem) =>
+    it.kind === "step" ? `step:${it.step.callId}` : `${it.kind}:${it.key}`;
 
-  it("shows only the last 3 while streaming", () => {
-    const { visible, hiddenCount } = selectStepWindow(many, {
+  it("shows only the last 3 items (steps + thoughts) while streaming", () => {
+    const { visible, hiddenCount } = selectItemWindow(many, {
       streaming: true,
       awaiting: false,
       peekExpanded: false,
     });
-    expect(visible.map((s) => s.callId)).toEqual(["c2", "c3", "c4"]);
+    expect(visible.map(kindKey)).toEqual(["step:c1", "step:c2", "step:c3"]);
     expect(hiddenCount).toBe(2);
   });
 
-  it("shows all steps when peek-expanded, settled, or ≤ window", () => {
+  it("shows all items when peek-expanded, settled, or ≤ window", () => {
     expect(
-      selectStepWindow(many, {
+      selectItemWindow(many, {
         streaming: true,
         awaiting: false,
         peekExpanded: true,
       }).hiddenCount,
     ).toBe(0);
     expect(
-      selectStepWindow(many, {
+      selectItemWindow(many, {
         streaming: false,
         awaiting: false,
         peekExpanded: false,
       }).visible.length,
     ).toBe(5);
     expect(
-      selectStepWindow(many.slice(0, 2), {
+      selectItemWindow(many.slice(0, 2), {
         streaming: true,
         awaiting: false,
         peekExpanded: false,
@@ -141,11 +150,8 @@ describe("selectStepWindow", () => {
     ).toBe(0);
   });
 
-  it("shows all steps while awaiting approval or answer", () => {
-    const awaiting = many.map((s, i) =>
-      i === 4 ? { ...s, status: "awaiting-approval" as const } : s,
-    );
-    const { visible, hiddenCount } = selectStepWindow(awaiting, {
+  it("shows all items while awaiting approval or answer", () => {
+    const { visible, hiddenCount } = selectItemWindow(many, {
       streaming: true,
       awaiting: true,
       peekExpanded: false,

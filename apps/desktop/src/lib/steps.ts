@@ -81,25 +81,27 @@ export function formatDuration(ms: number): string {
 }
 
 /**
- * Which steps to render inside an open StepGroup. While streaming (and not
- * awaiting approval/answer), only the last {@link STEP_WINDOW} steps show unless
- * the user expands the peek via "+N earlier steps".
+ * Which turn items (steps + folded thoughts/reasoning, #687) to render inside an open
+ * StepGroup. While streaming (and not awaiting approval/answer), only the last
+ * {@link STEP_WINDOW} items show unless the user expands the peek via "+N earlier
+ * steps". Windowing on items — not just steps — keeps the streaming view to recent
+ * activity even when short thoughts are interleaved between tool calls.
  */
-export function selectStepWindow(
-  steps: ToolStep[],
+export function selectItemWindow<T>(
+  items: T[],
   opts: {
     streaming: boolean;
     awaiting: boolean;
     peekExpanded: boolean;
   },
-): { visible: ToolStep[]; hiddenCount: number } {
+): { visible: T[]; hiddenCount: number } {
   const { streaming, awaiting, peekExpanded } = opts;
-  if (awaiting || !streaming || peekExpanded || steps.length <= STEP_WINDOW) {
-    return { visible: steps, hiddenCount: 0 };
+  if (awaiting || !streaming || peekExpanded || items.length <= STEP_WINDOW) {
+    return { visible: items, hiddenCount: 0 };
   }
   return {
-    visible: steps.slice(-STEP_WINDOW),
-    hiddenCount: steps.length - STEP_WINDOW,
+    visible: items.slice(-STEP_WINDOW),
+    hiddenCount: items.length - STEP_WINDOW,
   };
 }
 
