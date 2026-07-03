@@ -255,17 +255,24 @@ fn create_session(
     app: tauri::AppHandle,
     goal: Option<String>,
 ) -> Session {
-    let session = state.store.create_session(goal.clone());
-    if let Some(goal) = goal {
-        let _ = app.emit(
-            "signal:intention",
-            IntentionSignal {
-                session_id: session.id.clone(),
-                goal,
-            },
-        );
+    // A bare `＋` (no goal) is a deferred draft (#671 item 2a): not written to
+    // disk until its first message, so clicking `＋` never accrues empty rows. A
+    // goal-bearing session (scheduled/intention run, #543) commits immediately and
+    // announces its intention so it lists and starts right away.
+    match goal {
+        Some(goal) => {
+            let session = state.store.create_session(Some(goal.clone()));
+            let _ = app.emit(
+                "signal:intention",
+                IntentionSignal {
+                    session_id: session.id.clone(),
+                    goal,
+                },
+            );
+            session
+        }
+        None => state.store.create_draft_session(),
     }
-    session
 }
 
 #[tauri::command]

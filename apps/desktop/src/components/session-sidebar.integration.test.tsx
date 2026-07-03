@@ -10,7 +10,6 @@ import { AppShell } from "@/components/app-shell";
 import { SessionSidebar } from "@/components/session-sidebar";
 import { useChatStore } from "@/store/chat";
 import { usePanesStore, leaves, MAX_PANES } from "@/store/panes";
-import type { SplitNode } from "@/store/panes";
 import { usePrefsStore } from "@/store/prefs";
 import { useSessionPrefsStore } from "@/store/session-prefs";
 import type { Session } from "@/bindings";
@@ -142,19 +141,27 @@ describe("SessionSidebar integration (#185)", () => {
     expect(screen.queryByLabelText("Filter sessions")).toBeNull();
   });
 
-  it("the + button splits a new blank session into a right pane (#245 2a)", async () => {
+  it("the + button swaps a new blank session into the focused pane (#671 item 1)", async () => {
     usePanesStore.setState({ root: null, focusedPaneId: null });
     usePanesStore.getState().init(["s1", "s2"], "s1");
     expect(usePanesStore.getState().leafCount()).toBe(1);
+
+    const focusedPane = usePanesStore.getState().focusedPaneId as string;
+    const sessionOf = (id: string) =>
+      leaves(usePanesStore.getState().root!).find((l) => l.id === id)
+        ?.sessionId;
+    const before = sessionOf(focusedPane);
 
     const user = userEvent.setup();
     rtlRender(<SessionSidebar />);
     await user.click(screen.getByLabelText("New session"));
 
-    await waitFor(() => expect(usePanesStore.getState().leafCount()).toBe(2));
-    const root = usePanesStore.getState().root as SplitNode;
-    expect(root.type).toBe("split");
-    expect(root.dir).toBe("vertical");
+    // #671 item 1 changed `＋` from "split into a new pane" to an in-place swap:
+    // the focused pane's session id changes, but the layout stays a single leaf so
+    // clicking `＋` never accretes empty panes.
+    await waitFor(() => expect(sessionOf(focusedPane)).not.toBe(before));
+    expect(usePanesStore.getState().leafCount()).toBe(1);
+    expect(usePanesStore.getState().root?.type).toBe("leaf");
   });
 
   it("the + button falls back to an in-pane swap at MAX_PANES (#245 2a)", async () => {

@@ -726,6 +726,18 @@ export class MockIpc implements FfIpc {
     return true;
   }
 
+  // Flush a pending draft into `sessions` so a config write or fork/export can
+  // find it. Mirrors the real backend's flush-on-config invariant (#671 item 2a):
+  // the first side-effect on a draft — first message OR any config write — commits
+  // the row.
+  private flushPending(sessionId: string): void {
+    const pending = this.pendingSessions.get(sessionId);
+    if (pending) {
+      this.sessions.set(sessionId, pending);
+      this.pendingSessions.delete(sessionId);
+    }
+  }
+
   async createSession(goal?: string): Promise<Session> {
     const ts = now();
     const session: Session = {
@@ -755,6 +767,7 @@ export class MockIpc implements FfIpc {
   // copy of its messages re-keyed to the new session id. Mirrors what the real
   // backend command must do server-side.
   async forkSession(sessionId: string): Promise<Session> {
+    this.flushPending(sessionId);
     const source = this.sessions.get(sessionId);
     if (!source) throw new Error(`unknown session: ${sessionId}`);
     const ts = now();
@@ -783,6 +796,7 @@ export class MockIpc implements FfIpc {
   }
 
   async setSessionWorkspace(sessionId: string, path: string): Promise<string> {
+    this.flushPending(sessionId);
     const trimmed = path.trim();
     if (!trimmed) throw new Error("cannot resolve directory: empty path");
     this.workspaces.set(sessionId, trimmed);
@@ -819,6 +833,7 @@ export class MockIpc implements FfIpc {
   }
 
   async renameSession(sessionId: string, title: string): Promise<void> {
+    this.flushPending(sessionId);
     const s = this.sessions.get(sessionId);
     if (s) {
       s.title = title;
@@ -830,6 +845,7 @@ export class MockIpc implements FfIpc {
   // deleting an unknown id is a no-op. Mirrors the real backend command.
   async deleteSession(sessionId: string): Promise<void> {
     this.sessions.delete(sessionId);
+    this.pendingSessions.delete(sessionId);
     this.messages.delete(sessionId);
     // Session-scoped approvals expire with the session (backend clears them in
     // `clear_session_approvals` on delete).
@@ -844,6 +860,7 @@ export class MockIpc implements FfIpc {
   // ({ session, messages }, pretty-printed) or a human-readable Markdown render.
   // Rejects an unknown id (the backend returns None → the command errors).
   async exportSession(sessionId: string, format: Format): Promise<string> {
+    this.flushPending(sessionId);
     const session = this.sessions.get(sessionId);
     if (!session) throw new Error(`unknown session: ${sessionId}`);
     const messages = this.messages.get(sessionId) ?? [];
@@ -858,14 +875,10 @@ export class MockIpc implements FfIpc {
     content: string,
     attachments?: Attachment[],
   ): Promise<string> {
-    // First message commits a deferred draft (#671 item 2): move it out of the
+    // First message commits a deferred draft (#671 item 2a): move it out of the
     // pending map into `sessions` so it now appears in `listSessions`, mirroring
     // the real backend flushing its INSERT on the first round.
-    const pending = this.pendingSessions.get(sessionId);
-    if (pending) {
-      this.sessions.set(sessionId, pending);
-      this.pendingSessions.delete(sessionId);
-    }
+    this.flushPending(sessionId);
     const user = this.append(sessionId, "user", content, attachments);
     // Dev-only: `/cap` reproduces a turn that ends at the tool-call limit with no
     // streamed answer — the agent loop's empty-content finalizer writes a
@@ -1806,6 +1819,7 @@ Shipping the Settings redesign — currently the Memory browser (SET.8).
         pheno.skills.filter((n) => MOCK_SKILLS.some((s) => s.name === n)),
       );
     }
+    this.flushPending(sessionId);
     const s = this.sessions.get(sessionId);
     if (s) {
       s.phenotype = name ?? undefined;
@@ -1860,6 +1874,7 @@ Shipping the Settings redesign — currently the Memory browser (SET.8).
     } else {
       this.sessionModelSelections.delete(sessionId);
     }
+    this.flushPending(sessionId);
   }
 
   async getSessionModelSelection(
