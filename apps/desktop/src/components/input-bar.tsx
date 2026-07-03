@@ -961,10 +961,11 @@ function WorkspaceSelector({ sessionId }: { sessionId: string }) {
           side="top"
           align="start"
           sideOffset={6}
-          className="z-50 w-72 overflow-hidden rounded-xl border bg-popover text-popover-foreground shadow-lg outline-none data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:animate-in data-[state=open]:fade-in-0 data-[state=open]:zoom-in-95"
+          collisionPadding={8}
+          className="z-50 flex max-h-(--radix-popover-content-available-height) w-72 flex-col overflow-hidden rounded-xl border bg-popover text-popover-foreground shadow-lg outline-none data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:animate-in data-[state=open]:fade-in-0 data-[state=open]:zoom-in-95"
         >
           {/* Filter */}
-          <div className="flex items-center gap-2 border-b px-2.5 py-2">
+          <div className="flex shrink-0 items-center gap-2 border-b px-2.5 py-2">
             <Search className="size-3.5 shrink-0 text-muted-foreground" />
             <input
               autoFocus
@@ -983,7 +984,7 @@ function WorkspaceSelector({ sessionId }: { sessionId: string }) {
           </div>
 
           {/* Recent workspaces */}
-          <div className="max-h-64 overflow-y-auto p-1">
+          <div className="min-h-0 flex-1 overflow-y-auto p-1">
             {filtered.length === 0 ? (
               <p className="px-2 py-6 text-center text-xs text-muted-foreground">
                 {recents.length === 0 ? "No workspaces yet" : "No matches"}
@@ -1023,7 +1024,7 @@ function WorkspaceSelector({ sessionId }: { sessionId: string }) {
           <button
             type="button"
             onClick={() => void browse()}
-            className="flex w-full items-center gap-2 border-t px-2.5 py-2 text-left text-xs text-muted-foreground transition-colors hover:bg-accent/60 hover:text-foreground"
+            className="flex w-full shrink-0 items-center gap-2 border-t px-2.5 py-2 text-left text-xs text-muted-foreground transition-colors hover:bg-accent/60 hover:text-foreground"
           >
             <Folder className="size-3.5 shrink-0" />
             Browse…
