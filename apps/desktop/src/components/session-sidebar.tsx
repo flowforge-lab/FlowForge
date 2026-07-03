@@ -20,6 +20,11 @@ import {
   X,
 } from "@/components/ui/icon";
 import { Button } from "@/components/ui/button";
+import {
+  Popover,
+  PopoverTrigger,
+  PopoverContent,
+} from "@/components/ui/popover";
 import { EmptyState } from "@/components/ui/empty-state";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Separator } from "@/components/ui/separator";
@@ -103,6 +108,10 @@ const DROPDOWN_PARTS: MenuParts = {
   SubContent: DropdownMenuSubContent,
   Separator: DropdownMenuSeparator,
 };
+
+// Shared class for the flat ghost icon buttons in the sidebar header and
+// collapsed rail (#674): muted by default, foreground on hover.
+const RAIL_ICON_BTN = "size-7 text-muted-foreground hover:text-foreground";
 
 interface SessionMenuItemsProps {
   parts: MenuParts;
@@ -656,273 +665,337 @@ export function SessionSidebar() {
   return (
     <aside
       ref={asideRef}
-      // Collapsed → width:0 via class; expanded → persisted px width via inline
-      // style (inline wins, so the width class is dropped when expanded).
+      // Collapsed → a ~48px icon rail (w-12); expanded → persisted px width via
+      // inline style (inline wins, so the width class is dropped when expanded).
       style={sidebarCollapsed ? undefined : { width: sidebarWidth }}
       className={cn(
         "relative flex h-full shrink-0 flex-col border-r bg-sidebar text-sidebar-foreground transition-[width,border] duration-200",
-        sidebarCollapsed ? "w-0 overflow-hidden border-r-0" : "overflow-hidden",
+        sidebarCollapsed ? "w-12 overflow-hidden" : "overflow-hidden",
       )}
-      aria-hidden={sidebarCollapsed}
-      // `aria-hidden` alone leaves descendants focusable; `inert` also pulls the
-      // collapsed sidebar's buttons/input out of the tab order (axe aria-hidden-focus).
-      inert={sidebarCollapsed || undefined}
     >
-      {/* Drag handle on the right edge (#204). Hidden while collapsed. */}
-      {!sidebarCollapsed && (
-        <div
-          onMouseDown={startResize}
-          title="Drag to resize"
-          aria-hidden
-          className="absolute right-0 top-0 z-20 h-full w-1.5 cursor-col-resize hover:bg-primary/30"
-        />
-      )}
-      <div className="flex h-12 items-center justify-between gap-1 px-2">
-        <Button
-          variant="ghost"
-          size="icon"
-          className="size-7 text-muted-foreground hover:text-foreground"
-          onClick={() => setSidebarCollapsed(true)}
-          title="Collapse sidebar"
-        >
-          <PanelLeft className="size-4" />
-        </Button>
-        <div className="flex shrink-0 items-center gap-0.5">
+      {sidebarCollapsed ? (
+        /* Collapsed rail (#670): a thin icon column — panel-toggle / search / new
+           session pinned to the top, settings gear pinned to the bottom. It owns
+           the "expand" affordance that used to live in the main pane's header. */
+        <div className="flex h-full flex-col items-center gap-1 py-2">
           <Button
             variant="ghost"
             size="icon"
-            className={cn(
-              "size-7 text-muted-foreground hover:text-foreground",
-              selectMode && "bg-sidebar-accent text-foreground",
-            )}
-            onClick={() => (selectMode ? exitSelect() : setSelectMode(true))}
-            title="Select sessions"
-            aria-label="Select sessions"
-            aria-pressed={selectMode}
+            className={RAIL_ICON_BTN}
+            onClick={() => setSidebarCollapsed(false)}
+            title="Expand sidebar"
+            aria-label="Expand sidebar"
           >
-            <SquareCheck className="size-4" />
+            <PanelLeft className="size-4" />
           </Button>
-          {/* Primary action — accent-filled so "new session" reads as the
-              prominent control (reference design). */}
+          {/* Placeholder search shell (#670) — real query wiring is a follow-up. */}
+          <Popover>
+            <PopoverTrigger asChild>
+              <Button
+                variant="ghost"
+                size="icon"
+                className={RAIL_ICON_BTN}
+                title="Search sessions"
+                aria-label="Search sessions"
+              >
+                <Search className="size-4" />
+              </Button>
+            </PopoverTrigger>
+            <PopoverContent side="right" align="start" className="w-56">
+              <p className="text-sm font-medium text-foreground">
+                Search sessions
+              </p>
+              <p className="mt-1 text-xs text-muted-foreground">Coming soon.</p>
+            </PopoverContent>
+          </Popover>
           <Button
+            variant="ghost"
             size="icon"
-            className="size-7 bg-emerald-600 text-white hover:bg-emerald-600/90"
+            className={RAIL_ICON_BTN}
             onClick={newSessionInFocusedPane}
-            title="New session in split"
+            title="New session"
             aria-label="New session"
           >
             <Plus className="size-4" />
           </Button>
-          <DropdownMenu>
-            <DropdownMenuTrigger asChild>
-              <Button
-                variant="ghost"
-                size="icon"
-                className="size-7 text-muted-foreground hover:text-foreground"
-                title="Sidebar options"
-                aria-label="Sidebar options"
-              >
-                <MoreHorizontal className="size-4" />
-              </Button>
-            </DropdownMenuTrigger>
-            <DropdownMenuContent align="end">
-              <DropdownMenuItem onSelect={revealFilter}>
-                <Search />
-                Search
-              </DropdownMenuItem>
-              <DropdownMenuItem disabled title="Coming soon">
-                <Folder />
-                Folder view
-              </DropdownMenuItem>
-              <DropdownMenuSub>
-                <DropdownMenuSubTrigger disabled title="Coming soon">
-                  Filter by source
-                </DropdownMenuSubTrigger>
-                <DropdownMenuSubContent>
-                  <DropdownMenuItem disabled>Coming soon</DropdownMenuItem>
-                </DropdownMenuSubContent>
-              </DropdownMenuSub>
-            </DropdownMenuContent>
-          </DropdownMenu>
+          <div className="flex-1" />
+          <Button
+            variant="ghost"
+            size="icon"
+            className={RAIL_ICON_BTN}
+            onClick={openSettings}
+            title="Settings"
+            aria-label="Settings"
+          >
+            <Settings className="size-4" />
+          </Button>
         </div>
-      </div>
-
-      <Separator />
-
-      {/* Bulk action bar (#643) — revealed beneath the header while selecting. */}
-      {selectMode && (
-        <div className="flex items-center gap-2 px-2 pb-2">
-          <input
-            type="checkbox"
-            checked={allSelected}
-            onChange={toggleSelectAll}
-            aria-label="Select all sessions"
-            className="size-3.5 shrink-0 accent-primary"
+      ) : (
+        <>
+          {/* Drag handle on the right edge (#204). */}
+          <div
+            onMouseDown={startResize}
+            title="Drag to resize"
+            aria-hidden
+            className="absolute right-0 top-0 z-20 h-full w-1.5 cursor-col-resize hover:bg-primary/30"
           />
-          <span className="text-[12px] text-muted-foreground">
-            {selected.size} selected
-          </span>
-          <div className="ml-auto flex items-center gap-0.5">
-            <Button
-              variant="ghost"
-              size="xs"
-              disabled={selected.size === 0}
-              onClick={bulkDismiss}
-              className="text-muted-foreground hover:text-foreground"
-            >
-              {selectedAllDismissed ? (
-                <>
-                  <RotateCcw className="size-3" />
-                  Restore
-                </>
-              ) : (
-                <>
-                  <EyeOff className="size-3" />
-                  Dismiss
-                </>
-              )}
-            </Button>
-            <Button
-              variant="ghost"
-              size="xs"
-              disabled={selected.size === 0}
-              onClick={() => setConfirmingBulkDelete(true)}
-              className="text-destructive hover:text-destructive"
-            >
-              <Trash2 className="size-3" />
-              Delete
-            </Button>
+          <div className="flex h-12 items-center justify-between gap-1 px-2">
             <Button
               variant="ghost"
               size="icon"
-              className="size-6 text-muted-foreground hover:text-foreground"
-              onClick={exitSelect}
-              title="Exit select mode"
-              aria-label="Exit select mode"
+              className={RAIL_ICON_BTN}
+              onClick={() => setSidebarCollapsed(true)}
+              title="Collapse sidebar"
             >
-              <X className="size-3.5" />
+              <PanelLeft className="size-4" />
             </Button>
-          </div>
-        </div>
-      )}
-
-      {showFilter && (
-        <div className="px-2 pb-2">
-          <div className="flex items-center gap-1.5 rounded-md border bg-background/40 px-2 transition-colors focus-within:border-ring focus-within:ring-2 focus-within:ring-ring/25">
-            <Search className="size-3.5 shrink-0 text-muted-foreground/60" />
-            <input
-              ref={filterRef}
-              value={filter}
-              onChange={(e) => changeFilter(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === "Escape") {
-                  e.preventDefault();
-                  e.stopPropagation();
-                  hideFilter();
+            <div className="flex shrink-0 items-center gap-0.5">
+              {/* Select toggle — plain ghost when idle, accent-filled only while
+              selecting so the accent signals the active mode (#670). */}
+              <Button
+                variant="ghost"
+                size="icon"
+                className={cn(
+                  "size-7",
+                  selectMode
+                    ? "bg-emerald-600 text-white hover:bg-emerald-700 hover:text-white dark:hover:bg-emerald-700"
+                    : "text-muted-foreground hover:text-foreground",
+                )}
+                onClick={() =>
+                  selectMode ? exitSelect() : setSelectMode(true)
                 }
-              }}
-              placeholder="Filter sessions…"
-              aria-label="Filter sessions"
-              spellCheck={false}
-              className="h-7 min-w-0 flex-1 bg-transparent text-[13px] text-foreground outline-none placeholder:text-muted-foreground/50"
-            />
-            {filtering && (
-              <button
-                type="button"
-                title="Clear filter (Esc)"
-                onClick={() => hideFilter()}
-                className="flex size-4 shrink-0 items-center justify-center rounded text-muted-foreground/60 hover:text-foreground"
+                title="Select sessions"
+                aria-label="Select sessions"
+                aria-pressed={selectMode}
               >
-                <X className="size-3" />
-              </button>
-            )}
+                <SquareCheck className="size-4" />
+              </Button>
+              {/* New session — a plain ghost icon button like the other header
+              controls (#670); the accent lives on the select toggle while active. */}
+              <Button
+                variant="ghost"
+                size="icon"
+                className={RAIL_ICON_BTN}
+                onClick={newSessionInFocusedPane}
+                title="New session"
+                aria-label="New session"
+              >
+                <Plus className="size-4" />
+              </Button>
+              <DropdownMenu>
+                <DropdownMenuTrigger asChild>
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    className={RAIL_ICON_BTN}
+                    title="Sidebar options"
+                    aria-label="Sidebar options"
+                  >
+                    <MoreHorizontal className="size-4" />
+                  </Button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent align="end">
+                  <DropdownMenuItem onSelect={revealFilter}>
+                    <Search />
+                    Search
+                  </DropdownMenuItem>
+                  <DropdownMenuItem disabled title="Coming soon">
+                    <Folder />
+                    Folder view
+                  </DropdownMenuItem>
+                  <DropdownMenuSub>
+                    <DropdownMenuSubTrigger disabled title="Coming soon">
+                      Filter by source
+                    </DropdownMenuSubTrigger>
+                    <DropdownMenuSubContent>
+                      <DropdownMenuItem disabled>Coming soon</DropdownMenuItem>
+                    </DropdownMenuSubContent>
+                  </DropdownMenuSub>
+                </DropdownMenuContent>
+              </DropdownMenu>
+            </div>
           </div>
-        </div>
-      )}
 
-      <ScrollArea className="flex-1">
-        <nav className="flex flex-col gap-px p-1.5">
-          {rows.length === 0 ? (
-            filtering ? (
-              <EmptyState title={`No sessions match “${filter.trim()}”`} />
-            ) : null
-          ) : (
-            rows.map((session) => (
-              <SessionItem
-                key={session.id}
-                session={session}
-                index={indexById.get(session.id) ?? 0}
-                active={session.id === activeSessionId}
-                streaming={Boolean(streamingBySession[session.id])}
-                pinned={pinnedSet.has(session.id)}
-                dismissed={dismissedSet.has(session.id)}
-                selectMode={selectMode}
-                selected={selected.has(session.id)}
-                onToggleSelect={() => toggleSelect(session.id)}
+          <Separator />
+
+          {/* Bulk action bar (#643) — revealed beneath the header while selecting. */}
+          {selectMode && (
+            <div className="flex items-center gap-2 px-2 pb-2">
+              <input
+                type="checkbox"
+                checked={allSelected}
+                onChange={toggleSelectAll}
+                aria-label="Select all sessions"
+                className="size-3.5 shrink-0 accent-primary"
               />
-            ))
+              <span className="text-[12px] text-muted-foreground">
+                {selected.size} selected
+              </span>
+              <div className="ml-auto flex items-center gap-0.5">
+                <Button
+                  variant="ghost"
+                  size="xs"
+                  disabled={selected.size === 0}
+                  onClick={bulkDismiss}
+                  className="text-muted-foreground hover:text-foreground"
+                >
+                  {selectedAllDismissed ? (
+                    <>
+                      <RotateCcw className="size-3" />
+                      Restore
+                    </>
+                  ) : (
+                    <>
+                      <EyeOff className="size-3" />
+                      Dismiss
+                    </>
+                  )}
+                </Button>
+                <Button
+                  variant="ghost"
+                  size="xs"
+                  disabled={selected.size === 0}
+                  onClick={() => setConfirmingBulkDelete(true)}
+                  className="text-destructive hover:text-destructive"
+                >
+                  <Trash2 className="size-3" />
+                  Delete
+                </Button>
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  className="size-6 text-muted-foreground hover:text-foreground"
+                  onClick={exitSelect}
+                  title="Exit select mode"
+                  aria-label="Exit select mode"
+                >
+                  <X className="size-3.5" />
+                </Button>
+              </div>
+            </div>
           )}
-          {/* One endless, incremental reveal (#667): +25 rows per click, walking
+
+          {showFilter && (
+            <div className="px-2 pb-2">
+              <div className="flex items-center gap-1.5 rounded-md border bg-background/40 px-2 transition-colors focus-within:border-ring focus-within:ring-2 focus-within:ring-ring/25">
+                <Search className="size-3.5 shrink-0 text-muted-foreground/60" />
+                <input
+                  ref={filterRef}
+                  value={filter}
+                  onChange={(e) => changeFilter(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Escape") {
+                      e.preventDefault();
+                      e.stopPropagation();
+                      hideFilter();
+                    }
+                  }}
+                  placeholder="Filter sessions…"
+                  aria-label="Filter sessions"
+                  spellCheck={false}
+                  className="h-7 min-w-0 flex-1 bg-transparent text-[13px] text-foreground outline-none placeholder:text-muted-foreground/50"
+                />
+                {filtering && (
+                  <button
+                    type="button"
+                    title="Clear filter (Esc)"
+                    onClick={() => hideFilter()}
+                    className="flex size-4 shrink-0 items-center justify-center rounded text-muted-foreground/60 hover:text-foreground"
+                  >
+                    <X className="size-3" />
+                  </button>
+                )}
+              </div>
+            </div>
+          )}
+
+          <ScrollArea className="flex-1">
+            <nav className="flex flex-col gap-px p-1.5">
+              {rows.length === 0 ? (
+                filtering ? (
+                  <EmptyState title={`No sessions match “${filter.trim()}”`} />
+                ) : null
+              ) : (
+                rows.map((session) => (
+                  <SessionItem
+                    key={session.id}
+                    session={session}
+                    index={indexById.get(session.id) ?? 0}
+                    active={session.id === activeSessionId}
+                    streaming={Boolean(streamingBySession[session.id])}
+                    pinned={pinnedSet.has(session.id)}
+                    dismissed={dismissedSet.has(session.id)}
+                    selectMode={selectMode}
+                    selected={selected.has(session.id)}
+                    onToggleSelect={() => toggleSelect(session.id)}
+                  />
+                ))
+              )}
+              {/* One endless, incremental reveal (#667): +25 rows per click, walking
               non-dismissed then dismissed. "Show less" re-compacts to the first
               batch once expanded. */}
-          {hasMore && (
-            <button
-              type="button"
-              onClick={() => setRevealCount((n) => n + SESSION_REVEAL_BATCH)}
-              className="mx-0.5 rounded-md px-2 py-1.5 text-left text-[12px] text-muted-foreground/70 transition-colors hover:bg-sidebar-accent/50 hover:text-foreground"
-            >
-              Show more
-            </button>
-          )}
-          {!hasMore && revealCount > SESSION_REVEAL_BATCH && (
-            <button
-              type="button"
-              onClick={() => setRevealCount(SESSION_REVEAL_BATCH)}
-              className="mx-0.5 rounded-md px-2 py-1.5 text-left text-[12px] text-muted-foreground/70 transition-colors hover:bg-sidebar-accent/50 hover:text-foreground"
-            >
-              Show less
-            </button>
-          )}
-        </nav>
-      </ScrollArea>
+              {hasMore && (
+                <button
+                  type="button"
+                  onClick={() =>
+                    setRevealCount((n) => n + SESSION_REVEAL_BATCH)
+                  }
+                  className="mx-0.5 rounded-md px-2 py-1.5 text-left text-[12px] text-muted-foreground/70 transition-colors hover:bg-sidebar-accent/50 hover:text-foreground"
+                >
+                  Show more
+                </button>
+              )}
+              {!hasMore && revealCount > SESSION_REVEAL_BATCH && (
+                <button
+                  type="button"
+                  onClick={() => setRevealCount(SESSION_REVEAL_BATCH)}
+                  className="mx-0.5 rounded-md px-2 py-1.5 text-left text-[12px] text-muted-foreground/70 transition-colors hover:bg-sidebar-accent/50 hover:text-foreground"
+                >
+                  Show less
+                </button>
+              )}
+            </nav>
+          </ScrollArea>
 
-      <AlertDialog
-        open={confirmingBulkDelete}
-        onOpenChange={setConfirmingBulkDelete}
-      >
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>
-              Delete {selected.size}{" "}
-              {selected.size === 1 ? "session" : "sessions"}?
-            </AlertDialogTitle>
-            <AlertDialogDescription>
-              This permanently removes the selected{" "}
-              {selected.size === 1 ? "session" : "sessions"} and{" "}
-              {selected.size === 1 ? "its" : "their"} transcript
-              {selected.size === 1 ? "" : "s"}. This can&rsquo;t be undone. (To
-              hide sessions without losing them, use Dismiss.)
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel>Cancel</AlertDialogCancel>
-            <AlertDialogAction onClick={() => void bulkDelete()}>
-              Delete
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
+          <AlertDialog
+            open={confirmingBulkDelete}
+            onOpenChange={setConfirmingBulkDelete}
+          >
+            <AlertDialogContent>
+              <AlertDialogHeader>
+                <AlertDialogTitle>
+                  Delete {selected.size}{" "}
+                  {selected.size === 1 ? "session" : "sessions"}?
+                </AlertDialogTitle>
+                <AlertDialogDescription>
+                  This permanently removes the selected{" "}
+                  {selected.size === 1 ? "session" : "sessions"} and{" "}
+                  {selected.size === 1 ? "its" : "their"} transcript
+                  {selected.size === 1 ? "" : "s"}. This can&rsquo;t be undone.
+                  (To hide sessions without losing them, use Dismiss.)
+                </AlertDialogDescription>
+              </AlertDialogHeader>
+              <AlertDialogFooter>
+                <AlertDialogCancel>Cancel</AlertDialogCancel>
+                <AlertDialogAction onClick={() => void bulkDelete()}>
+                  Delete
+                </AlertDialogAction>
+              </AlertDialogFooter>
+            </AlertDialogContent>
+          </AlertDialog>
 
-      <Separator />
-      <button
-        type="button"
-        onClick={openSettings}
-        title="Settings"
-        className="flex items-center gap-2 px-3 py-2.5 text-left text-[12px] text-muted-foreground transition-colors hover:bg-sidebar-accent/50 hover:text-foreground"
-      >
-        <Settings className="size-4 shrink-0" />
-        Settings
-      </button>
+          <Separator />
+          <button
+            type="button"
+            onClick={openSettings}
+            title="Settings"
+            className="flex items-center gap-2 px-3 py-2.5 text-left text-[12px] text-muted-foreground transition-colors hover:bg-sidebar-accent/50 hover:text-foreground"
+          >
+            <Settings className="size-4 shrink-0" />
+            Settings
+          </button>
+        </>
+      )}
     </aside>
   );
 }

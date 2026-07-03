@@ -80,14 +80,17 @@ describe("SessionSidebar integration (#185)", () => {
     localStorage.clear();
   });
 
-  it("collapses to width 0, persists, and reopens from the main header", () => {
+  it("collapses to the icon rail, persists, and reopens from the rail (#670)", () => {
     const { cleanup } = render(<AppShell />);
 
     const aside = document.querySelector("aside");
     // Expanded width now comes from the persisted inline style (#204), default 240px.
     expect((aside as HTMLElement | null)?.style.width).toBe("240px");
-    expect(aside?.className).not.toContain("w-0");
+    expect(aside?.className).not.toContain("w-12");
+    // No expand affordance while open, and the old in-main "Show sidebar" button
+    // is gone — the rail owns expand now (#670).
     expect(document.querySelector('[aria-label="Show sidebar"]')).toBeNull();
+    expect(document.querySelector('[aria-label="Expand sidebar"]')).toBeNull();
 
     click(document.querySelector('[title="Collapse sidebar"]'));
     expect(usePrefsStore.getState().sidebarCollapsed).toBe(true);
@@ -96,10 +99,11 @@ describe("SessionSidebar integration (#185)", () => {
         .sidebarCollapsed,
     ).toBe(true);
 
-    expect(document.querySelector("aside")?.className).toContain("w-0");
-    expect(document.querySelector("aside")?.getAttribute("aria-hidden")).toBe(
-      "true",
-    );
+    // Collapsed → a ~48px rail (w-12), not a fully hidden w-0 aside.
+    expect(document.querySelector("aside")?.className).toContain("w-12");
+    expect(
+      document.querySelector('[aria-label="Expand sidebar"]'),
+    ).not.toBeNull();
 
     cleanup();
     const persisted = JSON.parse(localStorage.getItem("ff-prefs") ?? "{}")
@@ -109,19 +113,16 @@ describe("SessionSidebar integration (#185)", () => {
     });
     render(<AppShell />);
 
-    expect(document.querySelector("aside")?.className).toContain("w-0");
-    expect(document.querySelector("aside")?.getAttribute("aria-hidden")).toBe(
-      "true",
-    );
+    expect(document.querySelector("aside")?.className).toContain("w-12");
 
-    const reopen = document.querySelector('[aria-label="Show sidebar"]');
+    const reopen = document.querySelector('[aria-label="Expand sidebar"]');
     expect(reopen).not.toBeNull();
     click(reopen);
     expect(usePrefsStore.getState().sidebarCollapsed).toBe(false);
     expect(
       (document.querySelector("aside") as HTMLElement | null)?.style.width,
     ).toBe("240px");
-    expect(document.querySelector("aside")?.className).not.toContain("w-0");
+    expect(document.querySelector("aside")?.className).not.toContain("w-12");
   });
 
   it("reveals the filter via ⋯ → Search and hides it on Esc", async () => {
