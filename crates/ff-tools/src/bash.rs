@@ -12,10 +12,12 @@ use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
 use serde_json::Value;
+use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 use tokio::time::timeout;
 
 use crate::registry::{Safety, Tool, ToolOutcome};
+use crate::sink::{OutputSink, OutputStream};
 
 /// Default per-call wall-clock budget when `timeout_secs` is not supplied.
 const DEFAULT_TIMEOUT_SECS: u64 = 120;
@@ -23,6 +25,13 @@ const DEFAULT_TIMEOUT_SECS: u64 = 120;
 /// `cargo build` + test (the case that used to force a background-poll loop),
 /// short enough to stay a foreground call rather than an unbounded job.
 const MAX_TIMEOUT_SECS: u64 = 600;
+
+/// Live-stream byte cap per stdout/stderr stream (#680). Bounds only the *live*
+/// output forwarded to the frontend as the process runs, independent of the final
+/// stored result (which the agent loop caps separately at `TOOL_RESULT_MAX_BYTES`).
+/// Generous because the live tail is transient and superseded by the final result;
+/// the cap just stops a chatty process from flooding the event channel unboundedly.
+const MAX_STREAM_BYTES: usize = 256 * 1024;
 
 /// Workspace-relative scratch directory (#458 RC4c). A sanctioned, always-writable
 /// temp location under the workspace root so the agent never reaches for `/tmp`
@@ -228,6 +237,89 @@ impl BashTool {
             Safety::Write
         }
     }
+
+    /// Shared setup for both the buffered ([`run`](Self::run)) and streaming
+    /// ([`run_streaming`](Self::run_streaming)) paths: validate args, resolve the
+    /// working dir, prepare the sanctioned scratch dir, and build the child
+    /// `Command` (stdio piped, kill-on-drop). Returns the command plus its
+    /// wall-clock budget, or an early error outcome.
+    fn prepare(args: &Value, root: &Path) -> Result<(Command, Duration), ToolOutcome> {
+        let Some(command) = Self::command_arg(args) else {
+            return Err(ToolOutcome::error("missing required argument: command"));
+        };
+        // Drop a redundant `cd <workspace> && …` the model sometimes prepends (#458 RC4b).
+        let command = Self::strip_redundant_cd(command, root);
+
+        let dir = Self::resolve_dir(args, root);
+        if !dir.is_dir() {
+            return Err(ToolOutcome::error(format!(
+                "working_dir does not exist or is not a directory: {}",
+                dir.display()
+            )));
+        }
+
+        // Sanctioned workspace scratch dir (#458 RC4c): create it and point the
+        // child's TMPDIR/TMP at it so `/tmp`-defaulting tools redirect. Best-effort:
+        // a creation failure just leaves the system default temp dir in place.
+        let scratch = root.join(SCRATCH_DIR);
+        if std::fs::create_dir_all(&scratch).is_ok() {
+            // Make the dir self-ignoring in ANY host project (#458 review follow-up):
+            // a `.gitignore` of `*` keeps `.ff-scratch/` out of the user's `git status`
+            // even when their repo's own `.gitignore` knows nothing about it. Written
+            // only if absent so we never clobber a user edit.
+            let ignore = scratch.join(".gitignore");
+            if !ignore.exists() {
+                let _ = std::fs::write(&ignore, "*\n");
+            }
+            // Age-prune stale scratch (#483) so ephemeral scripts/results from finished
+            // sessions don't accumulate unbounded -- the dir is workspace-scoped, so no
+            // session-delete or quit hook ever clears it.
+            prune_scratch(&scratch, MAX_SCRATCH_AGE);
+        }
+
+        let timeout_budget = Self::timeout_for(args);
+        let (program, flag) = crate::shell::shell_invocation();
+        let mut cmd = Command::new(&program);
+        cmd.arg(flag)
+            .arg(command)
+            .current_dir(&dir)
+            .env("TMPDIR", &scratch)
+            .env("TMP", &scratch)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        Ok((cmd, timeout_budget))
+    }
+
+    /// Format captured stdout/stderr + exit status into the tool result body. Shared
+    /// by both paths so the streamed run yields byte-for-byte identical output.
+    fn format_output(
+        stdout: &[u8],
+        stderr: &[u8],
+        status: std::process::ExitStatus,
+    ) -> ToolOutcome {
+        let out = String::from_utf8_lossy(stdout);
+        let err = String::from_utf8_lossy(stderr);
+        let code = status.code().unwrap_or(-1);
+        let body = format!(
+            "exit_code: {code}\n--- stdout ---\n{}\n--- stderr ---\n{}",
+            out.trim_end(),
+            err.trim_end()
+        );
+        if status.success() {
+            ToolOutcome::ok(body)
+        } else {
+            ToolOutcome::error(body)
+        }
+    }
+
+    fn timeout_outcome(budget: Duration) -> ToolOutcome {
+        ToolOutcome::error(format!(
+            "command timed out after {}s. For a longer job, pass `timeout_secs` (max {}); for one longer than that, run it in the background and poll with quick, non-blocking checks rather than sleeping inside a call.",
+            budget.as_secs(),
+            MAX_TIMEOUT_SECS
+        ))
+    }
 }
 
 #[async_trait]
@@ -284,76 +376,93 @@ impl Tool for BashTool {
     }
 
     async fn run(&self, args: Value, root: &Path) -> ToolOutcome {
-        let Some(command) = Self::command_arg(&args) else {
-            return ToolOutcome::error("missing required argument: command");
+        let (mut child, timeout_budget) = match Self::prepare(&args, root) {
+            Ok(v) => v,
+            Err(e) => return e,
         };
-        // Drop a redundant `cd <workspace> && …` the model sometimes prepends (#458 RC4b).
-        let command = Self::strip_redundant_cd(command, root);
-
-        let dir = Self::resolve_dir(&args, root);
-        if !dir.is_dir() {
-            return ToolOutcome::error(format!(
-                "working_dir does not exist or is not a directory: {}",
-                dir.display()
-            ));
-        }
-
-        // Sanctioned workspace scratch dir (#458 RC4c): create it and point the
-        // child's TMPDIR/TMP at it so `/tmp`-defaulting tools redirect. Best-effort:
-        // a creation failure just leaves the system default temp dir in place.
-        let scratch = root.join(SCRATCH_DIR);
-        if std::fs::create_dir_all(&scratch).is_ok() {
-            // Make the dir self-ignoring in ANY host project (#458 review follow-up):
-            // a `.gitignore` of `*` keeps `.ff-scratch/` out of the user's `git status`
-            // even when their repo's own `.gitignore` knows nothing about it. Written
-            // only if absent so we never clobber a user edit.
-            let ignore = scratch.join(".gitignore");
-            if !ignore.exists() {
-                let _ = std::fs::write(&ignore, "*\n");
-            }
-            // Age-prune stale scratch (#483) so ephemeral scripts/results from finished
-            // sessions don't accumulate unbounded -- the dir is workspace-scoped, so no
-            // session-delete or quit hook ever clears it.
-            prune_scratch(&scratch, MAX_SCRATCH_AGE);
-        }
-
-        let timeout_budget = Self::timeout_for(&args);
-        let (program, flag) = crate::shell::shell_invocation();
-        let child = Command::new(&program)
-            .arg(flag)
-            .arg(command)
-            .current_dir(&dir)
-            .env("TMPDIR", &scratch)
-            .env("TMP", &scratch)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .output();
-
-        match timeout(timeout_budget, child).await {
-            Ok(Ok(output)) => {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                let code = output.status.code().unwrap_or(-1);
-                let body = format!(
-                    "exit_code: {code}\n--- stdout ---\n{}\n--- stderr ---\n{}",
-                    stdout.trim_end(),
-                    stderr.trim_end()
-                );
-                if output.status.success() {
-                    ToolOutcome::ok(body)
-                } else {
-                    ToolOutcome::error(body)
-                }
-            }
+        match timeout(timeout_budget, child.output()).await {
+            Ok(Ok(output)) => Self::format_output(&output.stdout, &output.stderr, output.status),
             Ok(Err(e)) => ToolOutcome::error(format!("failed to spawn command: {e}")),
-            Err(_) => ToolOutcome::error(format!(
-                "command timed out after {}s. For a longer job, pass `timeout_secs` (max {}); for one longer than that, run it in the background and poll with quick, non-blocking checks rather than sleeping inside a call.",
-                timeout_budget.as_secs(),
-                MAX_TIMEOUT_SECS
-            )),
+            Err(_) => Self::timeout_outcome(timeout_budget),
         }
     }
+
+    /// Streaming variant (#680): when a `sink` is present, spawn the child and drain
+    /// its pipes as they produce, emitting each chunk to `sink` *while still building
+    /// the full capture* returned in the final outcome. The returned outcome is
+    /// byte-for-byte identical to [`run`](Self::run); the live stream is purely
+    /// additive. With no sink, this is exactly [`run`](Self::run).
+    async fn run_streaming(
+        &self,
+        args: Value,
+        root: &Path,
+        _session_id: &str,
+        sink: Option<OutputSink>,
+    ) -> ToolOutcome {
+        let Some(sink) = sink else {
+            return self.run(args, root).await;
+        };
+        let (mut child, timeout_budget) = match Self::prepare(&args, root) {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
+        match timeout(timeout_budget, spawn_and_stream(&mut child, sink)).await {
+            Ok(Ok((stdout, stderr, status))) => Self::format_output(&stdout, &stderr, status),
+            Ok(Err(e)) => ToolOutcome::error(format!("failed to spawn command: {e}")),
+            Err(_) => Self::timeout_outcome(timeout_budget),
+        }
+    }
+}
+
+/// Spawn `child` and drain both pipes concurrently until EOF, forwarding each chunk
+/// to `sink` (capped, #680) while accumulating the full bytes for the final capture.
+/// Returns the complete stdout/stderr buffers plus the exit status.
+async fn spawn_and_stream(
+    child: &mut Command,
+    sink: OutputSink,
+) -> std::io::Result<(Vec<u8>, Vec<u8>, std::process::ExitStatus)> {
+    let mut proc = child.spawn()?;
+    // Pipes are guaranteed present: `prepare` sets both to `Stdio::piped()`.
+    let stdout = proc.stdout.take().expect("stdout piped");
+    let stderr = proc.stderr.take().expect("stderr piped");
+    // Drain both to EOF (which the child reaches on exit) concurrently so a full
+    // pipe buffer can never block the child, then reap the exit status.
+    let (out_buf, err_buf) = tokio::join!(
+        drain_stream(stdout, OutputStream::Stdout, sink.clone()),
+        drain_stream(stderr, OutputStream::Stderr, sink),
+    );
+    let status = proc.wait().await?;
+    Ok((out_buf, err_buf, status))
+}
+
+/// Read `reader` to EOF, accumulating the full bytes for the final capture while
+/// emitting each chunk to `sink` up to [`MAX_STREAM_BYTES`] (#680). The returned
+/// buffer is complete regardless of the live cap.
+async fn drain_stream<R: AsyncRead + Unpin>(
+    mut reader: R,
+    stream: OutputStream,
+    sink: OutputSink,
+) -> Vec<u8> {
+    let mut full = Vec::new();
+    let mut emitted = 0usize;
+    let mut buf = [0u8; 4096];
+    loop {
+        match reader.read(&mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                full.extend_from_slice(&buf[..n]);
+                if emitted < MAX_STREAM_BYTES {
+                    let take = n.min(MAX_STREAM_BYTES - emitted);
+                    // A 4 KiB read can split a multibyte char at the boundary; the live
+                    // chunk may show a transient replacement char, but the final capture
+                    // (built from `full`) is always correct.
+                    sink.emit(stream, String::from_utf8_lossy(&buf[..take]).into_owned());
+                    emitted += take;
+                }
+            }
+        }
+    }
+    full
 }
 
 #[cfg(test)]
@@ -415,6 +524,81 @@ mod tests {
             .await;
         assert!(!out.success);
         assert!(out.content.contains("exit_code: 3"));
+    }
+
+    #[tokio::test]
+    async fn run_streaming_emits_progressive_chunks() {
+        // A command that prints three lines with a gap between them should reach the
+        // sink as separate chunks before the final outcome — not all at once at the end.
+        let dir = tempfile::tempdir().unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let sink = OutputSink::new(tx);
+        let out = BashTool
+            .run_streaming(
+                serde_json::json!({
+                    "command": "echo one; sleep 0.05; echo two; sleep 0.05; echo three"
+                }),
+                dir.path(),
+                crate::registry::NO_SESSION,
+                Some(sink),
+            )
+            .await;
+
+        // Final outcome is the normal buffered result.
+        assert!(out.success);
+        assert!(out.content.contains("exit_code: 0"));
+        assert!(out.content.contains("one"));
+        assert!(out.content.contains("three"));
+
+        // Chunks arrived on the sink; concatenating them reproduces the streamed
+        // stdout in order.
+        let mut streamed = String::new();
+        while let Ok((stream, delta)) = rx.try_recv() {
+            assert_eq!(stream, OutputStream::Stdout);
+            streamed.push_str(&delta);
+        }
+        assert!(streamed.contains("one"));
+        assert!(streamed.contains("two"));
+        assert!(streamed.contains("three"));
+        assert!(
+            streamed.find("one") < streamed.find("three"),
+            "chunks preserve output order"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_streaming_without_sink_matches_run() {
+        // With no sink, the streaming entry point is byte-for-byte identical to `run`.
+        let dir = tempfile::tempdir().unwrap();
+        let cmd = serde_json::json!({"command": "echo hello; echo err 1>&2"});
+        let buffered = BashTool.run(cmd.clone(), dir.path()).await;
+        let streamed = BashTool
+            .run_streaming(cmd, dir.path(), crate::registry::NO_SESSION, None)
+            .await;
+        assert_eq!(buffered, streamed);
+    }
+
+    #[tokio::test]
+    async fn run_streaming_captures_stderr() {
+        let dir = tempfile::tempdir().unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let sink = OutputSink::new(tx);
+        let out = BashTool
+            .run_streaming(
+                serde_json::json!({"command": "echo boom 1>&2"}),
+                dir.path(),
+                crate::registry::NO_SESSION,
+                Some(sink),
+            )
+            .await;
+        assert!(out.content.contains("boom"));
+        let mut saw_stderr = false;
+        while let Ok((stream, delta)) = rx.try_recv() {
+            if stream == OutputStream::Stderr && delta.contains("boom") {
+                saw_stderr = true;
+            }
+        }
+        assert!(saw_stderr, "stderr chunks are tagged Stderr and streamed");
     }
 
     #[tokio::test]

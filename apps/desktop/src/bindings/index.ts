@@ -26,6 +26,8 @@ export type { ToolAskRequestEvent } from "./ToolAskRequestEvent";
 export type { ApprovalSafety } from "./ApprovalSafety";
 export type { ToolCallEvent } from "./ToolCallEvent";
 export type { ToolResultEvent } from "./ToolResultEvent";
+export type { ToolOutputChunkEvent } from "./ToolOutputChunkEvent";
+export type { OutputStreamKind } from "./OutputStreamKind";
 export type { TurnDoneEvent } from "./TurnDoneEvent";
 export type { TurnErrorEvent } from "./TurnErrorEvent";
 export type { TurnStatsEvent } from "./TurnStatsEvent";

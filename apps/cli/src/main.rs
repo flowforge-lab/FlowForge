@@ -640,6 +640,12 @@ fn render_event_text(event: AgentEvent) {
                 if count == 1 { "" } else { "s" }
             );
         }
+        AgentEvent::ToolOutputChunk { delta, .. } => {
+            // Live command output (#680) streams to stderr so piping stdout still
+            // yields only the model's text.
+            eprint!("{delta}");
+            let _ = std::io::stderr().flush();
+        }
         AgentEvent::Done { .. } => {}
         AgentEvent::Reasoning { .. } => {}
         AgentEvent::Error { message } => {

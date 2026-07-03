@@ -104,6 +104,24 @@ pub trait Tool: Send + Sync {
         let _ = session_id;
         self.run(args, root).await
     }
+
+    /// Streaming dispatch point (#680). Tools that buffer output until the process
+    /// exits (e.g. `bash`) override this to push chunks to `sink` *as they are
+    /// produced*, in addition to the full capture they still return in the final
+    /// [`ToolOutcome`]. The live stream is additive: the returned result is
+    /// byte-for-byte identical to [`run_with_session`](Self::run_with_session). The
+    /// default ignores `sink` and delegates, so a non-streaming tool needs no change
+    /// and a caller can always pass a sink safely.
+    async fn run_streaming(
+        &self,
+        args: Value,
+        root: &Path,
+        session_id: &str,
+        sink: Option<crate::OutputSink>,
+    ) -> ToolOutcome {
+        let _ = sink;
+        self.run_with_session(args, root, session_id).await
+    }
 }
 
 /// Name -> tool. Built with the M2 defaults (bash, view, edit) and queried by the
@@ -213,6 +231,27 @@ impl ToolRegistry {
             // Name the registered tools so a model that hallucinated a tool name
             // (e.g. `codegraph_explore`, #646) can self-correct in one turn instead
             // of guessing again. The list is sorted for a stable, diff-friendly hint.
+            None => ToolOutcome::error(format!(
+                "unknown tool: {name}. Available tools: {}",
+                self.sorted_names().join(", ")
+            )),
+        }
+    }
+
+    /// Dispatch a call by name with an optional live-output `sink` (#680), threading
+    /// the owning `session_id`. Streaming tools (e.g. `bash`) push chunks to `sink`
+    /// as they are produced; non-streaming tools ignore it. The returned outcome is
+    /// identical to [`run_with_session`](Self::run_with_session).
+    pub async fn run_streaming(
+        &self,
+        name: &str,
+        args: Value,
+        root: &Path,
+        session_id: &str,
+        sink: Option<crate::OutputSink>,
+    ) -> ToolOutcome {
+        match self.get(name) {
+            Some(tool) => tool.run_streaming(args, root, session_id, sink).await,
             None => ToolOutcome::error(format!(
                 "unknown tool: {name}. Available tools: {}",
                 self.sorted_names().join(", ")
