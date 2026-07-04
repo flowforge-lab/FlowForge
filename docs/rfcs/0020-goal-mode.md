@@ -54,6 +54,18 @@ it can be built before RFC 0019 lands (see §9 dependency analysis):
 A goal is single-session, so it is keyed by `session_id` and persisted to
 `~/.flowforge/goals/<session_id>.json`.
 
+> **Design note (revised per the #74 discussion).** An earlier draft of this RFC
+> modeled per-iteration progress as a single prose `GoalCheckpoint { summary }`.
+> The #74 loop-durability thread — including external contributor @HarperZ9's
+> Project Telos experience — established a stronger primitive that this RFC now
+> adopts: an **evidence-first ledger**. A prose-only artifact lets a long loop
+> "optimize for sounding done"; a structured ledger with explicit
+> `MATCH / DRIFT / UNVERIFIABLE` verdicts keeps a fresh-context iteration honest
+> (it reconstructs state from evidence, not a trusted summary) and lets a human
+> see exactly where the loop switched from evidence to judgment. `GoalCheckpoint`
+> is therefore replaced by `Vec<GoalLedgerEntry>`; a "latest progress" view for
+> the prompt/UI is derived from the ledger rather than stored separately.
+
 ```rust
 /// A persistent autonomous objective bound to one session (#683).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
@@ -69,11 +81,13 @@ pub struct Goal {
     pub budget: GoalBudget,
     /// Cumulative usage across all iterations, checked against `budget`.
     pub spent: GoalSpend,
-    /// Last-completed-iteration checkpoint: the summary the resume path replays
-    /// from, plus the epoch-ms it was written. `None` before the first boundary.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
-    pub checkpoint: Option<GoalCheckpoint>,
+    /// The evidence-first ledger (#74). Each fresh-context iteration reads it,
+    /// advances one entry, and writes back result + evidence + verdict. This is
+    /// the durable, loop-state record the resume path reconstructs from — as
+    /// opposed to the ephemeral `todo` tool, which stays the current-turn
+    /// scratchpad (conversation state).
+    #[serde(default)]
+    pub ledger: Vec<GoalLedgerEntry>,
     /// Pending user steer to fold into the next iteration (§6). Cleared once consumed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
@@ -125,18 +139,31 @@ pub struct GoalSpend {
     pub wall_ms: i64,
 }
 
+/// One evidence-first step in the goal ledger (#74; shape adopted from the
+/// discussion, incl. @HarperZ9). A fresh iteration reconstructs progress from
+/// these entries rather than a prose summary, so the next run never inherits
+/// confidence without evidence.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export, export_to = "../../../apps/desktop/src/bindings/")]
-pub struct GoalCheckpoint {
-    /// Short natural-language progress note the loop writes at each boundary and
-    /// injects on resume, so a restarted loop reorients without re-reading the
-    /// whole transcript.
-    pub summary: String,
-    #[ts(type = "number")]
-    pub at_iteration: u32,
-    #[ts(type = "number")]
-    pub written_ms: i64,
+pub struct GoalLedgerEntry {
+    /// Stable id so a step can be updated in place across iterations.
+    pub id: String,
+    pub status: StepStatus,           // pending | active | blocked | done
+    /// What this step is supposed to prove or change.
+    pub claim: String,
+    /// What the agent attempted (`None` until acted on).
+    pub action: Option<String>,
+    /// Evidence pointers: command output, test path, diff, URL, artifact id.
+    pub evidence: Vec<String>,
+    /// Verdict once checked. An explicit `Unverifiable` is required rather than
+    /// omission — a step that could not be checked is recorded as such.
+    pub verdict: Option<Verdict>,     // match | drift | unverifiable
+    /// What to do next: `AskUser` is the sanctioned circuit breaker (§4) and the
+    /// join point with the headless `needs_attention` outcome (RFC 0017 §3.1/§8.4).
+    pub next: Option<NextAction>,     // resume | ask_user | retry | stop
+    pub created_ms: i64,
+    pub updated_ms: i64,
 }
 ```
 
@@ -183,8 +210,10 @@ One iteration = one `run_turn` to a terminal answer (which itself may span many
 tool-call sub-turns). At each boundary the loop, in order:
 
 1. Accumulates `spent` (tokens from the turn's stats; wall-clock delta).
-2. Writes a `GoalCheckpoint` (progress summary) and persists the `Goal` atomically
-   (temp-file + rename, like `default_mode` persistence).
+2. Appends/updates the iteration's `GoalLedgerEntry` (claim, action, evidence,
+   verdict, next) and persists the `Goal` atomically (temp-file + rename, like
+   `default_mode` persistence). The ledger — not a prose summary — is what resume
+   reconstructs from.
 3. Checks stop conditions: `iteration >= max_iterations`, `spent.tokens >= max_tokens`,
    `spent.wall_ms >= max_wall_ms`, an `Ask`/pause, cancel, or `goal_complete`.
 4. If none fire, folds any `pending_steer` into the next turn's context and
@@ -195,7 +224,7 @@ tool-call sub-turns). At each boundary the loop, in order:
 Per the open question resolution (§10): a goal is **interruptible mid-turn** (the
 in-flight LLM call is cancelled via `CancelToken`), but **resume replays from the
 last completed iteration** — a mid-turn interrupt discards only the partial turn, not
-the checkpoint. This keeps resume deterministic.
+the last persisted ledger state. This keeps resume deterministic.
 
 ## 6. Steering (user messages during a run)
 
@@ -230,7 +259,7 @@ When a goal is active, inject a volatile-tail block (after memory, near `mode_st
 ```
 ## Active goal (iteration N of MAX)
 Objective: <objective>
-Progress so far: <checkpoint.summary>
+Progress so far (from the ledger): <recent entries — claim · verdict · next>
 <pending steer, if any>
 Continue toward the objective. If it is fully met, call `goal_complete`.
 State your reasoning before each action.
