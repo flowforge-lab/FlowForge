@@ -22,14 +22,19 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use serde_json::Value;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 use tokio::time::timeout;
 
 use crate::registry::{Safety, Tool, ToolOutcome};
+use crate::sink::{OutputSink, OutputStream};
 
 const DEFAULT_TIMEOUT_SECS: u64 = 120;
 const MAX_TIMEOUT_SECS: u64 = 600;
+
+/// Live-stream byte cap per stream (#680 V2). Same semantics as bash: bounds the
+/// transient live output forwarded to the frontend, independent of the final capture.
+const MAX_STREAM_BYTES: usize = 256 * 1024;
 
 // Interpreter layout differs by platform. Unix venvs put the interpreter at
 // `bin/python` and the PATH fallback is `python3`; Windows venvs put it at
@@ -237,6 +242,123 @@ impl Tool for PythonTool {
             Err(_) => ToolOutcome::error(format!("python timed out after {}s", limit.as_secs())),
         }
     }
+
+    /// Streaming variant (#680 V2): when a sink is present, spawn the interpreter and
+    /// drain its pipes as they produce, emitting each chunk to the sink while still
+    /// building the full capture for the final outcome. Byte-for-byte identical result
+    /// to `run`; the live stream is purely additive.
+    async fn run_streaming(
+        &self,
+        args: Value,
+        root: &Path,
+        _session_id: &str,
+        sink: Option<OutputSink>,
+    ) -> ToolOutcome {
+        let Some(sink) = sink else {
+            return self.run(args, root).await;
+        };
+        let Some(code) = Self::code_arg(&args) else {
+            return ToolOutcome::error("missing required argument: code");
+        };
+        let dir = Self::resolve_dir(&args, root);
+        if !dir.is_dir() {
+            return ToolOutcome::error(format!(
+                "working_dir does not exist or is not a directory: {}",
+                dir.display()
+            ));
+        }
+        let interpreter = Self::interpreter(&dir);
+        let limit = Self::resolve_timeout(&args);
+
+        let mut child = match Command::new(&interpreter)
+            .arg("-")
+            .current_dir(&dir)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                return ToolOutcome::error(format!(
+                    "failed to spawn python interpreter ({}): {e}",
+                    interpreter.display()
+                ));
+            }
+        };
+
+        // Feed the snippet on stdin, then close it so the interpreter runs.
+        if let Some(mut stdin) = child.stdin.take() {
+            if let Err(e) = stdin.write_all(code.as_bytes()).await {
+                return ToolOutcome::error(format!("failed to write code to python stdin: {e}"));
+            }
+            drop(stdin);
+        }
+
+        let stdout = child.stdout.take().expect("stdout piped");
+        let stderr = child.stderr.take().expect("stderr piped");
+
+        match timeout(limit, async {
+            let (out_buf, err_buf) = tokio::join!(
+                drain_stream(stdout, OutputStream::Stdout, sink.clone()),
+                drain_stream(stderr, OutputStream::Stderr, sink),
+            );
+            child.wait().await.map(|status| (out_buf, err_buf, status))
+        })
+        .await
+        {
+            Ok(Ok((stdout_buf, stderr_buf, status))) => {
+                format_output(&stdout_buf, &stderr_buf, status)
+            }
+            Ok(Err(e)) => ToolOutcome::error(format!("failed to run python: {e}")),
+            Err(_) => ToolOutcome::error(format!("python timed out after {}s", limit.as_secs())),
+        }
+    }
+}
+
+/// Format captured stdout/stderr + exit status into the tool result body.
+fn format_output(stdout: &[u8], stderr: &[u8], status: std::process::ExitStatus) -> ToolOutcome {
+    let out = String::from_utf8_lossy(stdout);
+    let err = String::from_utf8_lossy(stderr);
+    let code = status.code().unwrap_or(-1);
+    let body = format!(
+        "exit_code: {code}\n--- stdout ---\n{}\n--- stderr ---\n{}",
+        out.trim_end(),
+        err.trim_end()
+    );
+    if status.success() {
+        ToolOutcome::ok(body)
+    } else {
+        ToolOutcome::error(body)
+    }
+}
+
+/// Read `reader` to EOF, accumulating the full bytes for the final capture while
+/// emitting each chunk to `sink` up to [`MAX_STREAM_BYTES`]. The returned buffer is
+/// complete regardless of the live cap.
+async fn drain_stream<R: AsyncRead + Unpin>(
+    mut reader: R,
+    stream: OutputStream,
+    sink: OutputSink,
+) -> Vec<u8> {
+    let mut full = Vec::new();
+    let mut emitted = 0usize;
+    let mut buf = [0u8; 4096];
+    loop {
+        match reader.read(&mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                full.extend_from_slice(&buf[..n]);
+                if emitted < MAX_STREAM_BYTES {
+                    let take = n.min(MAX_STREAM_BYTES - emitted);
+                    sink.emit(stream, String::from_utf8_lossy(&buf[..take]).into_owned());
+                    emitted += take;
+                }
+            }
+        }
+    }
+    full
 }
 
 #[cfg(test)]
@@ -378,6 +500,82 @@ mod tests {
             PythonTool::resolve_timeout(&serde_json::json!({"timeout_secs": 0})).as_secs(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn run_streaming_emits_progressive_chunks() {
+        if !skip_if_no_python() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let sink = OutputSink::new(tx);
+        let tool = PythonTool;
+        let out = tool
+            .run_streaming(
+                serde_json::json!({
+                    "code": "import sys\nfor i in range(3):\n    print(f'line{i}')\n    sys.stdout.flush()"
+                }),
+                dir.path(),
+                crate::registry::NO_SESSION,
+                Some(sink),
+            )
+            .await;
+
+        assert!(out.success);
+        assert!(out.content.contains("exit_code: 0"));
+        assert!(out.content.contains("line0"));
+        assert!(out.content.contains("line2"));
+
+        let mut streamed = String::new();
+        while let Ok((stream, delta)) = rx.try_recv() {
+            assert_eq!(stream, OutputStream::Stdout);
+            streamed.push_str(&delta);
+        }
+        assert!(streamed.contains("line0"), "stdout streamed: {streamed}");
+        assert!(streamed.contains("line2"), "stdout streamed: {streamed}");
+    }
+
+    #[tokio::test]
+    async fn run_streaming_without_sink_matches_run() {
+        if !skip_if_no_python() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let tool = PythonTool;
+        let cmd = serde_json::json!({"code": "print('hello')"});
+        let buffered = tool.run(cmd.clone(), dir.path()).await;
+        let streamed = tool
+            .run_streaming(cmd, dir.path(), crate::registry::NO_SESSION, None)
+            .await;
+        assert_eq!(buffered, streamed);
+    }
+
+    #[tokio::test]
+    async fn run_streaming_captures_stderr() {
+        if !skip_if_no_python() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let sink = OutputSink::new(tx);
+        let tool = PythonTool;
+        let out = tool
+            .run_streaming(
+                serde_json::json!({"code": "import sys; print('oops', file=sys.stderr)"}),
+                dir.path(),
+                crate::registry::NO_SESSION,
+                Some(sink),
+            )
+            .await;
+        assert!(out.content.contains("oops"));
+        let mut saw_stderr = false;
+        while let Ok((stream, delta)) = rx.try_recv() {
+            if stream == OutputStream::Stderr && delta.contains("oops") {
+                saw_stderr = true;
+            }
+        }
+        assert!(saw_stderr, "stderr chunks are tagged Stderr and streamed");
     }
 
     #[test]
