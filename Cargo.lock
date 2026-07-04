@@ -2076,6 +2076,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "chrono",
+ "dirs 5.0.1",
  "dom_smoothie",
  "fast_html2md",
  "ff-core",

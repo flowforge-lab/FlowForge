@@ -25,6 +25,7 @@ mod bash;
 mod compaction;
 mod diagnostics;
 mod edit;
+mod github;
 mod glob;
 mod grep;
 mod html_text;
