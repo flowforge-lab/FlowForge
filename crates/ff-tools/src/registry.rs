@@ -409,7 +409,15 @@ mod tests {
         let ro = reg.readonly_tool_names();
 
         // Every ReadOnly-ceiling default tool is present.
-        for name in ["view", "grep", "glob", "tree", "todo", "ask_user", "diagnostics"] {
+        for name in [
+            "view",
+            "grep",
+            "glob",
+            "tree",
+            "todo",
+            "ask_user",
+            "diagnostics",
+        ] {
             assert!(ro.contains(name), "{name} should be a read-only tool");
         }
         // Mutating tools and dynamically-classified tools (bash) are absent: in Plan
