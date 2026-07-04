@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 mod compaction;
 mod compaction_abstractive;
 mod compaction_extractive;
+mod goal_loop;
 mod system_prompt;
 pub use compaction::{
     flush_due, CompactionContext, CompactionOutcome, CompactionStrategy, ContextPressure,
@@ -34,6 +35,7 @@ pub use compaction_extractive::{
     classify, proxy_tokens, ColdCompaction, CompactionSavings, CompressOutcome, ContentKind,
     ExtractiveCompactor, ReversibleCache, COMPACTION_MARKER_PREFIX,
 };
+pub use goal_loop::{drive_goal, GateDecision, GoalIteration, IterationOutcome, LoopStop};
 pub use system_prompt::{build_flush_prompt, build_system_prompt, TimeOfDay, UserContext};
 
 /// Default tool-call iteration cap for a turn when a phenotype does not override
