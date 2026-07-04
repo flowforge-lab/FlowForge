@@ -50,7 +50,8 @@ impl Approver for ScheduledApprover {
             // approver; allow defensively in case a future caller does not.
             Safety::ReadOnly => true,
             // A write runs only when the task opted into the write ceiling.
-            Safety::Write => self.ceiling == SafetyCeiling::Write,
+            // Sensitive is gated identically to Write for now (#698).
+            Safety::Write | Safety::Sensitive => self.ceiling == SafetyCeiling::Write,
             // A dangerous call is never auto-approved in a headless fire,
             // regardless of the ceiling.
             Safety::Dangerous => false,
@@ -84,6 +85,8 @@ mod tests {
         let a = ScheduledApprover::new(SafetyCeiling::ReadOnly);
         assert!(a.approve("m", "c", "t", Safety::ReadOnly, &args()).await);
         assert!(!a.approve("m", "c", "t", Safety::Write, &args()).await);
+        // Sensitive is gated identically to Write (#698).
+        assert!(!a.approve("m", "c", "t", Safety::Sensitive, &args()).await);
         assert!(!a.approve("m", "c", "t", Safety::Dangerous, &args()).await);
     }
 
@@ -92,6 +95,8 @@ mod tests {
         let a = ScheduledApprover::new(SafetyCeiling::Write);
         assert!(a.approve("m", "c", "t", Safety::ReadOnly, &args()).await);
         assert!(a.approve("m", "c", "t", Safety::Write, &args()).await);
+        // Sensitive rides the write ceiling identically to Write (#698).
+        assert!(a.approve("m", "c", "t", Safety::Sensitive, &args()).await);
         assert!(!a.approve("m", "c", "t", Safety::Dangerous, &args()).await);
     }
 

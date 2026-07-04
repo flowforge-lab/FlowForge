@@ -82,7 +82,7 @@ impl CliApprover {
             ApprovalMode::Yes => ApprovalDecision::Allow,
             ApprovalMode::Deny => ApprovalDecision::Deny,
             ApprovalMode::Prompt => {
-                if agent_mode == Mode::Auto && safety == Safety::Write {
+                if agent_mode == Mode::Auto && matches!(safety, Safety::Write | Safety::Sensitive) {
                     ApprovalDecision::Allow
                 } else {
                     match input {
@@ -115,6 +115,7 @@ impl Approver for CliApprover {
     ) -> bool {
         let label = match safety {
             Safety::Write => "write",
+            Safety::Sensitive => "sensitive",
             Safety::Dangerous => "DANGEROUS",
             Safety::ReadOnly => "read-only",
         };
@@ -268,6 +269,30 @@ mod tests {
                 Safety::Dangerous
             ),
             ApprovalDecision::Deny
+        );
+    }
+
+    // Sensitive is treated identically to Write in the Auto carve-out (#698):
+    // auto-approved in Auto, still prompted/denied in the other modes.
+    #[test]
+    fn auto_mode_treats_sensitive_like_write() {
+        assert_eq!(
+            CliApprover::decide(
+                Mode::Auto,
+                ApprovalMode::Prompt,
+                InputMode::Tty,
+                Safety::Sensitive
+            ),
+            ApprovalDecision::Allow
+        );
+        assert_eq!(
+            CliApprover::decide(
+                Mode::Act,
+                ApprovalMode::Prompt,
+                InputMode::Tty,
+                Safety::Sensitive
+            ),
+            ApprovalDecision::Prompt
         );
     }
 
