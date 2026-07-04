@@ -53,4 +53,9 @@ cp -R "$BUILT_APP" "$INSTALL_DIR/"
 echo "==> Clearing quarantine attribute"
 xattr -dr com.apple.quarantine "$INSTALL_DIR/$APP_NAME" || true
 
+# Ad-hoc codesign with a stable identity so macOS Keychain recognizes the app
+# across rebuilds and stops prompting for keychain access on every launch.
+echo "==> Codesigning (ad-hoc)"
+codesign --force --deep --sign - "$INSTALL_DIR/$APP_NAME"
+
 echo "==> Done. Relaunch FlowForge from $INSTALL_DIR manually."
