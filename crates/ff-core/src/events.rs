@@ -48,6 +48,7 @@ pub struct ToolCallEvent {
 #[ts(export, export_to = "../../../apps/desktop/src/bindings/")]
 pub enum ApprovalSafety {
     Write,
+    Sensitive,
     Dangerous,
 }
 

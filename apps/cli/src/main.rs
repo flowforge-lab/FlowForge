@@ -14,7 +14,7 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use ff_agent::{run_turn, AgentEvent, CancelToken, ToolContext, UserContext};
-use ff_core::{Mode, ReasoningVisibility, Role};
+use ff_core::{Mode, PermissionMatrix, ReasoningVisibility, Role};
 
 use crate::approver::{ApprovalMode, CliApprover};
 
@@ -372,7 +372,14 @@ async fn run(
         mode,
     );
 
-    let mut tool_ctx = ToolContext::new(&registry, &workspace, &approver, inputs.max_iterations);
+    let matrix = PermissionMatrix::default();
+    let mut tool_ctx = ToolContext::new(
+        &registry,
+        &workspace,
+        &approver,
+        inputs.max_iterations,
+        &matrix,
+    );
     tool_ctx.mode = mode;
 
     let cancel = CancelToken::new();
@@ -455,11 +462,13 @@ async fn chat(json: bool, approval_mode: ApprovalMode, mode: Mode) -> ExitCode {
     let approver = CliApprover::new(approval_mode, mode);
     let session = store.create_session(None);
 
+    let matrix = PermissionMatrix::default();
     let mut tool_ctx = ToolContext::new(
         &registry,
         &workspace,
         &approver,
         ff_agent::DEFAULT_MAX_ITERATIONS,
+        &matrix,
     );
     tool_ctx.mode = mode;
 
@@ -665,7 +674,7 @@ mod tests {
     use clap::CommandFactory;
     use clap::Parser;
     use ff_agent::{run_turn, AgentEvent, Approver, CancelToken, ToolContext};
-    use ff_core::{Phenotype, ReasoningVisibility, Role};
+    use ff_core::{PermissionMatrix, Phenotype, ReasoningVisibility, Role};
     use ff_llm::{ChatRequest, Chunk, ChunkStream, LlmError, Provider};
     use ff_memory::{Memory, MemoryConfig};
     use ff_session::SessionStore;
@@ -791,7 +800,8 @@ mod tests {
         let registry = ToolRegistry::new();
         let root = std::env::current_dir().unwrap();
         let approver = TestApprover;
-        let tool_ctx = ToolContext::new(&registry, &root, &approver, 8);
+        let matrix = PermissionMatrix::default();
+        let tool_ctx = ToolContext::new(&registry, &root, &approver, 8, &matrix);
 
         let mut stdout = Vec::new();
         let msg = run_turn(
@@ -872,7 +882,8 @@ mod tests {
         let registry = ToolRegistry::new();
         let root = std::env::current_dir().unwrap();
         let approver = TestApprover;
-        let tool_ctx = ToolContext::new(&registry, &root, &approver, 8);
+        let matrix = PermissionMatrix::default();
+        let tool_ctx = ToolContext::new(&registry, &root, &approver, 8, &matrix);
 
         let memory_store = Arc::new(Memory::with_default_root(MemoryConfig::default()));
         let skills = SkillRegistry::new();
@@ -941,7 +952,8 @@ mod tests {
         let registry = ToolRegistry::new();
         let root = std::env::current_dir().unwrap();
         let approver = TestApprover;
-        let tool_ctx = ToolContext::new(&registry, &root, &approver, 8);
+        let matrix = PermissionMatrix::default();
+        let tool_ctx = ToolContext::new(&registry, &root, &approver, 8, &matrix);
 
         let memory_store = Arc::new(Memory::with_default_root(MemoryConfig::default()));
         let skills = SkillRegistry::new();
@@ -977,7 +989,8 @@ mod tests {
         let registry = ToolRegistry::new();
         let root = std::env::current_dir().unwrap();
         let approver = TestApprover;
-        let tool_ctx = ToolContext::new(&registry, &root, &approver, 8);
+        let matrix = PermissionMatrix::default();
+        let tool_ctx = ToolContext::new(&registry, &root, &approver, 8, &matrix);
 
         let memory_store = Arc::new(Memory::with_default_root(MemoryConfig::default()));
         let skills = SkillRegistry::new();

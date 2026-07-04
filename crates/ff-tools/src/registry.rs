@@ -6,23 +6,9 @@ use std::path::Path;
 use async_trait::async_trait;
 use serde_json::Value;
 
-/// How much trust a given invocation needs. The agent loop auto-runs
-/// [`Safety::ReadOnly`] and defers [`Safety::Write`] / [`Safety::Sensitive`] /
-/// [`Safety::Dangerous`] to an approval policy supplied by the host (UI confirm
-/// in the desktop shell).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Safety {
-    ReadOnly,
-    Write,
-    /// Externally-visible actions (network egress, sub-agent spawn) that warrant
-    /// a distinct trust tier between [`Write`](Self::Write) and
-    /// [`Dangerous`](Self::Dangerous) (#682). Data modeling only for now (#698):
-    /// treated identically to [`Write`](Self::Write) everywhere — auto-approved
-    /// in Auto, prompted in Act/Plan, hidden in Plan-mode advertisement — until a
-    /// follow-up PR differentiates its handling.
-    Sensitive,
-    Dangerous,
-}
+// Safety is defined in ff-core (needed by PermissionMatrix without circular deps)
+// and re-exported from this crate for backward compatibility.
+pub use ff_core::Safety;
 
 /// The result of running a tool. `content` is fed back to the model verbatim as the
 /// tool message; `success` lets the host render pass/fail without parsing `content`.
@@ -173,6 +159,15 @@ impl ToolRegistry {
 
     pub fn is_empty(&self) -> bool {
         self.tools.is_empty()
+    }
+
+    pub fn tool_count(&self) -> usize {
+        self.tools.len()
+    }
+
+    /// Iterate over all registered tools (for permission-matrix filtering).
+    pub fn iter_tools(&self) -> impl Iterator<Item = &dyn Tool> {
+        self.tools.values().map(|b| b.as_ref())
     }
 
     /// All tools as OpenAI `tools` request entries.

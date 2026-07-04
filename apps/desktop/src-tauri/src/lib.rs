@@ -152,20 +152,11 @@ impl TurnMetrics {
 /// Routes write/dangerous tool calls through a UI confirmation. Read-only calls
 /// never reach this approver — the agent loop short-circuits them.
 /// Whether the active autonomy mode auto-approves a call of this safety without a
-/// prompt. Only `Auto` + `Write`/`Sensitive` qualifies; `Dangerous` always prompts
-/// regardless of mode, preserving the #232 invariant that arbitrary code (python,
-/// `rm`) needs a deliberate yes. ReadOnly never reaches the approver. `Sensitive`
-/// is treated identically to `Write` here (#698) until a follow-up differentiates it.
-fn mode_auto_approves(mode: Mode, safety: Safety) -> bool {
-    mode == Mode::Auto && matches!(safety, Safety::Write | Safety::Sensitive)
-}
-
 struct UiApprover {
     app: tauri::AppHandle,
     state: Arc<AppState>,
     session_id: String,
-    /// The session's resolved autonomy mode for this turn (#265). In [`Mode::Auto`]
-    /// a `Write` call is auto-approved; `Dangerous` always prompts regardless of mode.
+    /// The session's resolved autonomy mode for this turn (#265).
     mode: Mode,
 }
 
@@ -185,24 +176,22 @@ impl Approver for UiApprover {
             return true;
         }
 
-        // Auto mode (#265) auto-approves Write without a prompt; Dangerous always
-        // falls through to the prompt below, so arbitrary code (python, `rm`) is
-        // never silently run. ReadOnly never reaches here (the loop short-circuits).
-        if mode_auto_approves(self.mode, safety) {
+        // Permission matrix (#699): Allow → auto-approve, Ask → prompt below,
+        // Deny → should never reach here (hidden from the model by advertised_tools).
+        // ReadOnly also never reaches here (the agent loop short-circuits it).
+        let cell = self.state.permission_matrix.cell(self.mode, safety);
+        if cell.is_allow() {
             return true;
         }
+        if cell.is_deny() {
+            // Defensive: a Deny tool should never have been callable; reject.
+            return false;
+        }
 
-        let safety = match safety {
+        let approval_safety = match safety {
             Safety::Write => ApprovalSafety::Write,
-            // Sensitive maps to the Write wire signal for now (#698) — the
-            // ApprovalSafety contract (and its TS binding) gains no variant this
-            // PR, so the FE renders it identically to a write until PR 2.
-            Safety::Sensitive => ApprovalSafety::Write,
+            Safety::Sensitive => ApprovalSafety::Sensitive,
             Safety::Dangerous => ApprovalSafety::Dangerous,
-            // The agent loop short-circuits ReadOnly before calling the approver,
-            // so it never reaches the approval contract.
-            // The agent loop short-circuits ReadOnly before approval; deny
-            // defensively rather than panic if a future caller violates that.
             Safety::ReadOnly => return false,
         };
         let rx = self.state.register_approval(&self.session_id, call_id);
@@ -214,7 +203,7 @@ impl Approver for UiApprover {
                 call_id: call_id.to_string(),
                 tool: name.to_string(),
                 args: args.clone(),
-                safety,
+                safety: approval_safety,
             },
         );
         // Sender dropped (cancel) -> RecvError -> deny.
@@ -935,7 +924,13 @@ fn spawn_assistant_turn(state: Arc<AppState>, app: tauri::AppHandle, session_id:
         state.align_git_watcher(&session_root);
         // Snapshot built-in + MCP-bridged tools for this turn (RFC 0003 §6).
         let registry = state.build_tool_registry(&session_root);
-        let mut tool_ctx = ToolContext::new(&registry, &session_root, &approver, max_iterations);
+        let mut tool_ctx = ToolContext::new(
+            &registry,
+            &session_root,
+            &approver,
+            max_iterations,
+            &state.permission_matrix,
+        );
         tool_ctx.mode = mode;
         tool_ctx.abstractive = crate::state::abstractive_config_from_env();
         // Skills + ambient context for this turn (RFC 0001 §4, RFC 0002 phase 1):
@@ -1301,7 +1296,13 @@ impl ff_scheduled::TaskRunner for DesktopTaskRunner {
         self.state.align_git_watcher(&session_root);
         let registry = self.state.build_tool_registry(&session_root);
         let approver = ScheduledApprover::new(task.safety_ceiling);
-        let mut tool_ctx = ToolContext::new(&registry, &session_root, &approver, max_iterations);
+        let mut tool_ctx = ToolContext::new(
+            &registry,
+            &session_root,
+            &approver,
+            max_iterations,
+            &self.state.permission_matrix,
+        );
         tool_ctx.mode = mode;
         tool_ctx.abstractive = crate::state::abstractive_config_from_env();
 
@@ -2791,9 +2792,9 @@ pub fn run() {
 mod tests {
     use super::state::AppState;
     use super::{
-        git_branch, is_app_ready, list_local_branches, mode_auto_approves, panic_message,
-        publish_app_ready, resolve_workspace_dir, should_warmup, switch_branch, BootFinalize,
-        TurnMetrics, UpdateStatus, APP_READY,
+        git_branch, is_app_ready, list_local_branches, panic_message, publish_app_ready,
+        resolve_workspace_dir, should_warmup, switch_branch, BootFinalize, TurnMetrics,
+        UpdateStatus, APP_READY,
     };
     use ff_core::{Mode, ProviderKind};
     use ff_tools::Safety;
@@ -2959,26 +2960,23 @@ mod tests {
         );
     }
 
-    // The one mode-driven auto-approve carve-out (#265): only Auto+Write is silent.
-    // Dangerous always prompts (any mode), and the other modes prompt every write.
+    // Permission matrix correctness is tested in ff-core::permission::tests.
+    // This spot-check confirms the matrix drives the approval path as expected.
     #[test]
-    fn mode_auto_approves_only_auto_write() {
-        assert!(mode_auto_approves(Mode::Auto, Safety::Write));
-        // Sensitive is treated identically to Write for now (#698): auto-approved
-        // in Auto, prompted in Act/Plan.
-        assert!(mode_auto_approves(Mode::Auto, Safety::Sensitive));
-        // Dangerous is never auto-approved by mode -- this is the #232 invariant
-        // that keeps python / `rm` behind a deliberate yes.
-        assert!(!mode_auto_approves(Mode::Auto, Safety::Dangerous));
-        // Act and Plan prompt for writes too.
-        assert!(!mode_auto_approves(Mode::Act, Safety::Write));
-        assert!(!mode_auto_approves(Mode::Plan, Safety::Write));
-        assert!(!mode_auto_approves(Mode::Act, Safety::Sensitive));
-        assert!(!mode_auto_approves(Mode::Plan, Safety::Sensitive));
-        assert!(!mode_auto_approves(Mode::Act, Safety::Dangerous));
-        assert!(!mode_auto_approves(Mode::Plan, Safety::Dangerous));
-        // ReadOnly never reaches the approver, but the helper is conservative.
-        assert!(!mode_auto_approves(Mode::Auto, Safety::ReadOnly));
+    fn permission_matrix_default_matches_expected() {
+        use ff_core::{PermissionCell, PermissionMatrix};
+        let m = PermissionMatrix::default();
+        // Auto: Write is auto-approved, Sensitive prompts, Dangerous denied.
+        assert_eq!(m.cell(Mode::Auto, Safety::Write), PermissionCell::Allow);
+        assert_eq!(m.cell(Mode::Auto, Safety::Sensitive), PermissionCell::Ask);
+        assert_eq!(m.cell(Mode::Auto, Safety::Dangerous), PermissionCell::Deny);
+        // Act: Write+Sensitive auto-approved, Dangerous prompts.
+        assert_eq!(m.cell(Mode::Act, Safety::Write), PermissionCell::Allow);
+        assert_eq!(m.cell(Mode::Act, Safety::Sensitive), PermissionCell::Allow);
+        assert_eq!(m.cell(Mode::Act, Safety::Dangerous), PermissionCell::Ask);
+        // Plan: only ReadOnly allowed.
+        assert_eq!(m.cell(Mode::Plan, Safety::ReadOnly), PermissionCell::Allow);
+        assert_eq!(m.cell(Mode::Plan, Safety::Write), PermissionCell::Deny);
     }
 
     #[test]

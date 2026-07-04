@@ -11,7 +11,9 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use ff_core::{AttachmentKind, Message, Mode, ReasoningVisibility, Role, StopReason};
+use ff_core::{
+    AttachmentKind, Message, Mode, PermissionMatrix, ReasoningVisibility, Role, StopReason,
+};
 use ff_llm::{ChatMessage, ChatRequest, FunctionCall, LlmError, Provider, ToolCall as LlmToolCall};
 use ff_session::SessionStore;
 use ff_tools::{Safety, ToolRegistry, COMPACTION_RETRIEVE_TOOL};
@@ -351,9 +353,12 @@ pub struct ToolContext<'a> {
     /// When `Some`, the only tool names this (sub-)agent may call or be advertised.
     /// `None` = the full registry. Used to scope a delegated subtask.
     pub allowed: Option<std::collections::HashSet<String>>,
-    /// Agent autonomy mode (RFC 0011). In [`Mode::Plan`] only ReadOnly tools are
-    /// advertised, so the model cannot see or call anything that mutates.
+    /// Agent autonomy mode (RFC 0011). Controls tool visibility and approval
+    /// via the [`PermissionMatrix`].
     pub mode: Mode,
+    /// Permission policy for this turn (#699). Determines which tools are
+    /// advertised (non-Deny) and which are auto-approved (Allow) vs prompted (Ask).
+    pub matrix: &'a PermissionMatrix,
     /// Tier-2 abstractive cold-tail summary config (RFC 0016 M7.0). Default-off;
     /// the host enables/tunes it. Sub-agents inherit the parent's setting.
     pub abstractive: AbstractiveConfig,
@@ -366,6 +371,7 @@ impl<'a> ToolContext<'a> {
         root: &'a Path,
         approve: &'a dyn Approver,
         max_iterations: usize,
+        matrix: &'a PermissionMatrix,
     ) -> Self {
         Self {
             registry,
@@ -376,6 +382,7 @@ impl<'a> ToolContext<'a> {
             max_depth: DEFAULT_MAX_DELEGATION_DEPTH,
             allowed: None,
             mode: Mode::default(),
+            matrix,
             abstractive: AbstractiveConfig::default(),
         }
     }
@@ -576,19 +583,25 @@ struct CallBuf {
 }
 
 /// The set of tool names to advertise to the model this turn.
+/// Filter the advertised tool set based on Mode (#699).
 ///
-/// In [`Mode::Plan`] (RFC 0011) only the registry's ReadOnly tools are advertised so
-/// the model cannot see — let alone call — anything that mutates; this is intersected
-/// with any sub-agent allowlist (fail safe). In Act/Auto the allowlist passes through
-/// unchanged (`None` = full registry).
+/// In [`Mode::Plan`] (RFC 0011) only ReadOnly tools are advertised so the model
+/// cannot call anything that mutates — determined by `matrix.cell(mode, max_safety)`
+/// being Deny for all non-ReadOnly tiers. In Act/Auto all tools remain visible;
+/// the matrix's Deny cells for those modes are enforced at **invocation time**
+/// (the approver rejects the call) rather than hiding the tool from the schema,
+/// because tools like `bash` have `max_safety = Dangerous` but produce ReadOnly/Write
+/// calls most of the time.
 fn advertised_tools(
     mode: Mode,
+    _matrix: &PermissionMatrix,
     allowed: Option<&std::collections::HashSet<String>>,
     registry: &ToolRegistry,
 ) -> Option<std::collections::HashSet<String>> {
     if !mode.is_plan() {
         return allowed.cloned();
     }
+    // Plan mode: only tools that can never exceed ReadOnly.
     let readonly = registry.readonly_tool_names();
     Some(match allowed {
         Some(set) => set.intersection(&readonly).cloned().collect(),
@@ -769,7 +782,12 @@ pub async fn run_turn(
     mut on_event: impl FnMut(AgentEvent),
 ) -> Result<Message, AgentError> {
     let allow_subagent = tools.depth < tools.max_depth;
-    let advertised = advertised_tools(tools.mode, tools.allowed.as_ref(), tools.registry);
+    let advertised = advertised_tools(
+        tools.mode,
+        tools.matrix,
+        tools.allowed.as_ref(),
+        tools.registry,
+    );
     let tool_schemas = tools
         .registry
         .openai_tools_for(advertised.as_ref(), allow_subagent);
@@ -1808,6 +1826,7 @@ async fn run_subagent(
         max_depth: parent.max_depth,
         allowed,
         mode: parent.mode,
+        matrix: parent.matrix,
         abstractive: parent.abstractive.clone(),
     };
 
@@ -1988,7 +2007,8 @@ mod tests {
     #[test]
     fn plan_mode_advertises_only_readonly_tools() {
         let reg = ToolRegistry::with_defaults();
-        let advertised = advertised_tools(Mode::Plan, None, &reg).expect("Plan restricts");
+        let matrix = PermissionMatrix::default();
+        let advertised = advertised_tools(Mode::Plan, &matrix, None, &reg).expect("Plan restricts");
         for name in ["view", "grep", "glob", "tree", "todo", "ask_user"] {
             assert!(advertised.contains(name), "Plan should advertise {name}");
         }
@@ -2008,22 +2028,24 @@ mod tests {
     #[test]
     fn plan_mode_intersects_with_subagent_allowlist() {
         let reg = ToolRegistry::with_defaults();
+        let matrix = PermissionMatrix::default();
         // A sub-agent scoped to {view, edit}: Plan further drops the mutating `edit`.
         let allowed: std::collections::HashSet<String> =
             ["view", "edit"].iter().map(|s| s.to_string()).collect();
-        let advertised = advertised_tools(Mode::Plan, Some(&allowed), &reg).unwrap();
+        let advertised = advertised_tools(Mode::Plan, &matrix, Some(&allowed), &reg).unwrap();
         assert_eq!(advertised, ["view".to_string()].into_iter().collect());
     }
 
     #[test]
     fn act_and_auto_pass_the_allowlist_through_unchanged() {
         let reg = ToolRegistry::with_defaults();
-        assert_eq!(advertised_tools(Mode::Act, None, &reg), None);
-        assert_eq!(advertised_tools(Mode::Auto, None, &reg), None);
+        let matrix = PermissionMatrix::default();
+        assert_eq!(advertised_tools(Mode::Act, &matrix, None, &reg), None);
+        assert_eq!(advertised_tools(Mode::Auto, &matrix, None, &reg), None);
         let allowed: std::collections::HashSet<String> =
             ["view", "edit"].iter().map(|s| s.to_string()).collect();
         assert_eq!(
-            advertised_tools(Mode::Auto, Some(&allowed), &reg),
+            advertised_tools(Mode::Auto, &matrix, Some(&allowed), &reg),
             Some(allowed)
         );
     }
@@ -2067,6 +2089,7 @@ mod tests {
             calls: AtomicUsize::new(0),
         };
 
+        let matrix = PermissionMatrix::default();
         let plan = ToolContext {
             registry: &registry,
             root: &root,
@@ -2076,6 +2099,7 @@ mod tests {
             max_depth: 1,
             allowed: None,
             mode: Mode::Plan,
+            matrix: &matrix,
             abstractive: AbstractiveConfig::default(),
         };
 
@@ -2210,12 +2234,15 @@ mod tests {
         }
     }
 
+    static TEST_MATRIX: std::sync::LazyLock<PermissionMatrix> =
+        std::sync::LazyLock::new(PermissionMatrix::default);
+
     fn ctx<'a>(
         registry: &'a ToolRegistry,
         root: &'a Path,
         approve: &'a dyn Approver,
     ) -> ToolContext<'a> {
-        ToolContext::new(registry, root, approve, 8)
+        ToolContext::new(registry, root, approve, 8, &TEST_MATRIX)
     }
 
     struct TextProvider;
@@ -4200,6 +4227,7 @@ mod tests {
             calls: AtomicUsize::new(0),
         };
 
+        let matrix = PermissionMatrix::default();
         // Simulate an agent already at the depth cap.
         let at_cap = ToolContext {
             registry: &registry,
@@ -4210,6 +4238,7 @@ mod tests {
             max_depth: 1,
             allowed: None,
             mode: Mode::default(),
+            matrix: &matrix,
             abstractive: AbstractiveConfig::default(),
         };
 
@@ -4255,6 +4284,7 @@ mod tests {
             calls: AtomicUsize::new(0),
         };
 
+        let matrix = PermissionMatrix::default();
         // A sub-agent scoped to read-only tools tries to call `bash`.
         let scoped = ToolContext {
             registry: &registry,
@@ -4265,6 +4295,7 @@ mod tests {
             max_depth: 1,
             allowed: Some(["view".to_string()].into_iter().collect()),
             mode: Mode::default(),
+            matrix: &matrix,
             abstractive: AbstractiveConfig::default(),
         };
 
@@ -4360,7 +4391,7 @@ mod tests {
             tools_withheld: tools_withheld.clone(),
         };
         // Cap 5 with WRAP_UP_AT_REMAINING == 3: remaining counts down 5,4,3,2,1.
-        let tools = ToolContext::new(&registry, dir.path(), &approve, 5);
+        let tools = ToolContext::new(&registry, dir.path(), &approve, 5, &TEST_MATRIX);
 
         run_turn(
             &provider,
@@ -4406,7 +4437,7 @@ mod tests {
             hard_copy_seen: Arc::new(std::sync::Mutex::new(Vec::new())),
             tools_withheld: Arc::new(std::sync::Mutex::new(Vec::new())),
         };
-        let tools = ToolContext::new(&registry, dir.path(), &approve, 1);
+        let tools = ToolContext::new(&registry, dir.path(), &approve, 1, &TEST_MATRIX);
 
         run_turn(
             &provider,
@@ -4468,7 +4499,7 @@ mod tests {
         // A model that never finishes on its own would previously loop to the cap
         // and yield "[stopped: reached tool-call limit]". Withholding tools on the
         // final iteration (RC3, #454) must instead force a real text answer.
-        let tools = ToolContext::new(&registry, dir.path(), &approve, 3);
+        let tools = ToolContext::new(&registry, dir.path(), &approve, 3, &TEST_MATRIX);
 
         let final_msg = run_turn(
             &FinalizesWhenToolsWithdrawn,
@@ -5079,7 +5110,7 @@ mod tests {
         let saw_nudge = Arc::new(std::sync::Mutex::new(Vec::new()));
 
         // A generous cap so the *guard* (not the cap) is what stops the turn.
-        let tools = ToolContext::new(&registry, &root, &approve, 20);
+        let tools = ToolContext::new(&registry, &root, &approve, 20, &TEST_MATRIX);
         let msg = run_turn(
             &RepeatProvider {
                 calls: calls.clone(),
@@ -5281,7 +5312,7 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let saw_nudge = Arc::new(std::sync::Mutex::new(Vec::new()));
 
-        let tools = ToolContext::new(&registry, &root, &approve, 20);
+        let tools = ToolContext::new(&registry, &root, &approve, 20, &TEST_MATRIX);
         run_turn(
             &RepeatProvider {
                 calls: calls.clone(),

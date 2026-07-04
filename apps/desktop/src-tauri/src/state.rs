@@ -729,6 +729,19 @@ fn save_default_mode(mode: Mode) {
     }
 }
 
+// ─── Permission matrix persistence (#699) ────────────────────────────────────
+
+fn permission_matrix_path() -> Option<PathBuf> {
+    dirs::config_dir().map(|d| d.join("flowforge").join("permissions.json"))
+}
+
+fn load_permission_matrix() -> ff_core::PermissionMatrix {
+    permission_matrix_path()
+        .and_then(|p| fs::read_to_string(p).ok())
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_default()
+}
+
 /// `~/.flowforge/phenos`, where phenotype definition TOML files live.
 fn phenotypes_root() -> PathBuf {
     dirs::home_dir()
@@ -1021,6 +1034,9 @@ pub struct AppState {
     /// The default agent autonomy mode (RFC 0011 P2, #265), loaded at startup from
     /// `mode.json`. A session with no explicit mode binding inherits this.
     default_mode: Mutex<Mode>,
+    /// Permission matrix (#699, RFC 0019 §3): Mode × Safety → Allow/Ask/Deny.
+    /// Persisted to `permissions.json`; falls back to Default on missing/corrupt file.
+    pub permission_matrix: ff_core::PermissionMatrix,
     /// Per-skill telemetry aggregates (RFC 0001 §8), persisted to
     /// `~/.flowforge/skill_signals.json`. Updated at each turn's start/end; read by
     /// the manual optimize flow's cost estimates.
@@ -1166,6 +1182,7 @@ impl AppState {
             active_skills: Mutex::new(BTreeSet::new()),
             active_phenotype: Mutex::new(default_phenotype()),
             default_mode: Mutex::new(load_default_mode()),
+            permission_matrix: load_permission_matrix(),
             signals: Mutex::new(load_signals()),
             _mcp_watcher: Mutex::new(None),
             _git_watcher: Mutex::new(None),
