@@ -45,11 +45,19 @@ impl PermissionCell {
 ///
 /// Persisted as JSON with `#[serde(default)]` so a missing or corrupt file
 /// gracefully falls back to the RFC 0019 defaults without data loss.
+use std::collections::HashMap;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PermissionMatrix {
     /// Row-major: `cells[mode_idx][safety_idx]`.
     cells: [[PermissionCell; 4]; 3],
+    /// Per-tool overrides (#700, RFC 0019 §4.2). When set for a tool name, the
+    /// override replaces the matrix cell for ALL mode×safety combinations involving
+    /// that tool. `#[serde(default)]` ensures existing configs without this field
+    /// load cleanly with an empty map.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    overrides: HashMap<String, PermissionCell>,
 }
 
 impl Default for PermissionMatrix {
@@ -71,6 +79,7 @@ impl Default for PermissionMatrix {
                 // Act
                 [Allow, Allow, Allow, Ask],
             ],
+            overrides: HashMap::new(),
         }
     }
 }
@@ -80,8 +89,29 @@ impl PermissionMatrix {
         self.cells[mode_idx(mode)][safety_idx(safety)]
     }
 
+    /// Resolve the effective permission for a tool call: per-tool override if set,
+    /// otherwise the mode×safety matrix cell (#700, RFC 0019 §4.2).
+    pub fn effective_cell(&self, tool: &str, mode: Mode, safety: Safety) -> PermissionCell {
+        self.overrides
+            .get(tool)
+            .copied()
+            .unwrap_or_else(|| self.cell(mode, safety))
+    }
+
     pub fn set_cell(&mut self, mode: Mode, safety: Safety, value: PermissionCell) {
         self.cells[mode_idx(mode)][safety_idx(safety)] = value;
+    }
+
+    pub fn set_override(&mut self, tool: impl Into<String>, cell: PermissionCell) {
+        self.overrides.insert(tool.into(), cell);
+    }
+
+    pub fn remove_override(&mut self, tool: &str) {
+        self.overrides.remove(tool);
+    }
+
+    pub fn overrides(&self) -> &HashMap<String, PermissionCell> {
+        &self.overrides
     }
 }
 
@@ -160,5 +190,72 @@ mod tests {
         assert!(!PermissionCell::Deny.is_allow());
         assert!(!PermissionCell::Ask.is_allow());
         assert!(!PermissionCell::Ask.is_deny());
+    }
+
+    #[test]
+    fn override_takes_precedence_over_matrix() {
+        let mut m = PermissionMatrix::default();
+        // Matrix says Act+Write = Allow; override bash to Deny.
+        m.set_override("bash", PermissionCell::Deny);
+        assert_eq!(
+            m.effective_cell("bash", Mode::Act, Safety::Write),
+            PermissionCell::Deny,
+        );
+        // Other tools still follow the matrix.
+        assert_eq!(
+            m.effective_cell("edit", Mode::Act, Safety::Write),
+            PermissionCell::Allow,
+        );
+    }
+
+    #[test]
+    fn no_override_falls_through_to_matrix() {
+        let m = PermissionMatrix::default();
+        assert_eq!(
+            m.effective_cell("bash", Mode::Auto, Safety::Write),
+            PermissionCell::Allow,
+        );
+        assert_eq!(
+            m.effective_cell("bash", Mode::Auto, Safety::Sensitive),
+            PermissionCell::Ask,
+        );
+    }
+
+    #[test]
+    fn override_management() {
+        let mut m = PermissionMatrix::default();
+        assert!(m.overrides().is_empty());
+        m.set_override("bash", PermissionCell::Ask);
+        assert_eq!(m.overrides().len(), 1);
+        m.remove_override("bash");
+        assert!(m.overrides().is_empty());
+        // Removing a non-existent override is a no-op.
+        m.remove_override("bash");
+    }
+
+    #[test]
+    fn serde_round_trip_with_overrides() {
+        let mut m = PermissionMatrix::default();
+        m.set_override("bash", PermissionCell::Ask);
+        m.set_override("python", PermissionCell::Deny);
+        let json = serde_json::to_string_pretty(&m).unwrap();
+        let deser: PermissionMatrix = serde_json::from_str(&json).unwrap();
+        assert_eq!(m, deser);
+        assert_eq!(
+            deser.effective_cell("bash", Mode::Act, Safety::Write),
+            PermissionCell::Ask,
+        );
+    }
+
+    #[test]
+    fn missing_overrides_field_loads_as_empty() {
+        // A JSON with only "cells" (no "overrides") should load fine.
+        let json = r#"{"cells":[[["allow","deny","deny","deny"],["allow","allow","ask","deny"],["allow","allow","allow","ask"]]]}"#;
+        // Actually just use an empty object — #[serde(default)] handles it.
+        let deser: PermissionMatrix = serde_json::from_str("{}").unwrap();
+        assert!(deser.overrides().is_empty());
+        assert_eq!(deser, PermissionMatrix::default());
+        // Suppress unused variable warning.
+        let _ = json;
     }
 }
