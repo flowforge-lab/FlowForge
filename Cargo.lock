@@ -1895,6 +1895,7 @@ dependencies = [
  "chrono",
  "ff-core",
  "ff-llm",
+ "ff-memory",
  "ff-session",
  "ff-skills",
  "ff-tools",
