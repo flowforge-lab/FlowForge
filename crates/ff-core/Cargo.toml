@@ -9,6 +9,8 @@ repository.workspace = true
 serde = { workspace = true }
 serde_json = { workspace = true }
 ts-rs = { workspace = true, features = ["serde-json-impl"] }
+regex = { workspace = true }
+globset = { workspace = true }
 # Resolve the user's home dir to rebuild the login-shell PATH a GUI-launched
 # process misses, so spawned tools (cargo/gh/git) resolve (#755).
 dirs = { workspace = true }

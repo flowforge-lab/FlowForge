@@ -160,6 +160,18 @@ struct UiApprover {
     mode: Mode,
 }
 
+/// Resolve the "relevant argument" for scoped permission rules (#712):
+/// path for filesystem tools, command for bash/python.
+fn resolve_tool_arg(name: &str, args: &serde_json::Value) -> Option<String> {
+    match name {
+        "bash" | "python" => args.get("command").and_then(|v| v.as_str()).map(Into::into),
+        "view" | "edit" | "write" | "glob" | "fd" | "rg" => {
+            args.get("path").and_then(|v| v.as_str()).map(Into::into)
+        }
+        _ => None,
+    }
+}
+
 #[async_trait]
 impl Approver for UiApprover {
     async fn approve(
@@ -174,6 +186,32 @@ impl Approver for UiApprover {
         // `AppState::allowlist_covers`).
         if self.state.allowlist_covers(&self.session_id, name, safety) {
             return true;
+        }
+
+        // Scoped rules (#712, RFC 0019 §9): resolve the tool's relevant argument
+        // and evaluate. Deny rules veto unconditionally; Allow rules auto-approve
+        // except for Dangerous (degrades to Ask).
+        let resolved_arg = resolve_tool_arg(name, args);
+        if let Some(effect) =
+            self.state
+                .permission_matrix
+                .evaluate_rules(name, resolved_arg.as_deref(), self.mode)
+        {
+            match effect {
+                ff_core::RuleEffect::Deny => return false,
+                ff_core::RuleEffect::Allow => {
+                    // Allow rule never auto-clears Dangerous (#712 §9.3).
+                    if safety != Safety::Dangerous {
+                        tracing::info!(
+                            tool = name,
+                            arg = ?resolved_arg,
+                            "scoped rule auto-approved"
+                        );
+                        return true;
+                    }
+                    // Dangerous: fall through to prompt.
+                }
+            }
         }
 
         // Permission matrix (#699): Allow → auto-approve, Ask → prompt below,

@@ -1935,6 +1935,8 @@ name = "ff-core"
 version = "0.1.0"
 dependencies = [
  "dirs 5.0.1",
+ "globset",
+ "regex",
  "serde",
  "serde_json",
  "tempfile",
