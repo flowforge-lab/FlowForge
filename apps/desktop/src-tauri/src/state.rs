@@ -6,8 +6,9 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use ff_agent::{
-    flush_due, AbstractiveConfig, CancelToken, CompactionContext, CompactionStrategy,
-    ContextPressureEstimator, MemoryFlush, ProxyTokenEstimator, DEFAULT_FLUSH_AT_FRACTION,
+    flush_due, AbstractiveConfig, CancelToken, CompactionCache, CompactionContext,
+    CompactionStrategy, ContextPressureEstimator, MemoryFlush, ProxyTokenEstimator,
+    DEFAULT_FLUSH_AT_FRACTION,
 };
 use ff_core::{
     model_supports_documents, model_supports_vision, BedrockAuth, ConnectionId, McpScope,
@@ -1077,6 +1078,10 @@ pub struct AppState {
     /// served window changes only when the model is (re)loaded, so a probe per
     /// resolve would spam `/api/ps`. Entries expire after [`SERVED_WINDOW_TTL`].
     served_window_cache: Mutex<HashMap<(ConnectionId, String), (Instant, ServedWindowProbe)>>,
+    /// Cross-turn abstractive summary cache (#757). Survives across turns so
+    /// the compaction summarizer can skip redundant work when only a few
+    /// messages were appended since the last summary.
+    pub compaction_cache: CompactionCache,
 }
 
 /// How long a probed served window stays fresh before the next resolve re-probes.
@@ -1196,6 +1201,7 @@ impl AppState {
             _memory_watcher: Mutex::new(memory_watcher),
             process_supervisor: Arc::new(ProcessSupervisor::new()),
             served_window_cache: Mutex::new(HashMap::new()),
+            compaction_cache: CompactionCache::new(),
         };
         // Restore the persisted phenotype so its active skills survive a restart.
         // With no persisted choice, prefer the out-of-box `codon` default (#298),
