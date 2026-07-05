@@ -699,7 +699,8 @@ fn enforce_tool_result_pairing(messages: Vec<Message>) -> Vec<Message> {
 /// Remove toolResult blocks from any user turn whose preceding assistant has no
 /// toolUse blocks. Such results are orphans from a parallel-loop race (#744) and
 /// would cause a Bedrock 400 ("toolResult count exceeds toolUse count"). Also
-/// drops user turns left empty after stripping.
+/// drops user turns left empty after stripping, and merges any adjacent same-role
+/// messages that result from the removal (Converse requires strict alternation).
 fn strip_orphaned_trailing_results(messages: &mut Vec<Message>) {
     let mut i = 1;
     while i < messages.len() {
@@ -716,6 +717,12 @@ fn strip_orphaned_trailing_results(messages: &mut Vec<Message>) {
                     .retain(|b| !matches!(b, ContentBlock::ToolResult(_)));
                 if messages[i].content.is_empty() {
                     messages.remove(i);
+                    // Removing a user turn may leave two adjacent assistants;
+                    // merge the second into the first to restore alternation.
+                    if i < messages.len() && i > 0 && messages[i].role == messages[i - 1].role {
+                        let absorbed = messages.remove(i);
+                        messages[i - 1].content.extend(absorbed.content);
+                    }
                     continue;
                 }
             }
@@ -2361,5 +2368,63 @@ mod tests {
         );
         // Last message should be the interrupted assistant
         assert_eq!(fixed[2].role, ConversationRole::Assistant);
+    }
+
+    /// Stripping an orphaned user turn between two text-only assistants must merge
+    /// the assistants to maintain strict alternation (#744 follow-up).
+    #[test]
+    fn enforce_merges_adjacent_assistants_after_orphan_removal() {
+        let messages = vec![
+            // Normal tool-call pair
+            msg(
+                ConversationRole::Assistant,
+                vec![tool_use_block("A", "bash")],
+            ),
+            msg(ConversationRole::User, vec![tool_result_block("A")]),
+            // Interrupted assistant (no toolUse)
+            msg(
+                ConversationRole::Assistant,
+                vec![ContentBlock::Text("[stopped: interrupted]".to_string())],
+            ),
+            // Orphaned result between two text-only assistants
+            msg(ConversationRole::User, vec![tool_result_block("B")]),
+            // Second text-only assistant
+            msg(
+                ConversationRole::Assistant,
+                vec![ContentBlock::Text("[stopped: interrupted]".to_string())],
+            ),
+            // Normal user continues
+            msg(
+                ConversationRole::User,
+                vec![ContentBlock::Text("continue".to_string())],
+            ),
+        ];
+
+        let fixed = enforce_tool_result_pairing(messages);
+
+        // Verify strict alternation
+        for i in 1..fixed.len() {
+            assert_ne!(
+                fixed[i].role,
+                fixed[i - 1].role,
+                "alternation violated at index {i}: {:?} == {:?}",
+                fixed[i].role,
+                fixed[i - 1].role
+            );
+        }
+        // The two interrupted assistants should be merged into one
+        let assistant_texts: Vec<&str> = fixed
+            .iter()
+            .flat_map(|m| m.content.iter())
+            .filter_map(|b| match b {
+                ContentBlock::Text(t) if t.contains("interrupted") => Some(t.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            assistant_texts.len(),
+            2,
+            "both interrupted texts should be in the merged assistant"
+        );
     }
 }

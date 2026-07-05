@@ -421,7 +421,8 @@ fn enforce_tool_result_pairing(messages: Vec<Value>) -> Vec<Value> {
 
 /// Remove tool_result blocks from any user turn whose preceding assistant has no
 /// tool_use blocks. Such results are orphans from a parallel-loop race (#744).
-/// Also drops user turns left empty after stripping.
+/// Also drops user turns left empty after stripping, and merges any adjacent
+/// same-role messages that result from the removal (strict alternation).
 fn strip_orphaned_trailing_results(messages: &mut Vec<Value>) {
     let mut i = 1;
     while i < messages.len() {
@@ -436,6 +437,19 @@ fn strip_orphaned_trailing_results(messages: &mut Vec<Value>) {
                     arr.retain(|b| b["type"] != "tool_result");
                     if arr.is_empty() {
                         messages.remove(i);
+                        // Merge adjacent same-role messages to restore alternation.
+                        if i < messages.len()
+                            && i > 0
+                            && messages[i]["role"] == messages[i - 1]["role"]
+                        {
+                            if let Some(absorbed) =
+                                messages.remove(i)["content"].as_array().cloned()
+                            {
+                                if let Some(target) = messages[i - 1]["content"].as_array_mut() {
+                                    target.extend(absorbed);
+                                }
+                            }
+                        }
                         continue;
                     }
                 }
