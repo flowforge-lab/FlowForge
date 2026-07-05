@@ -2157,10 +2157,8 @@ fn updater(app: &tauri::AppHandle) -> CmdResult<tauri_plugin_updater::Updater> {
             .build()
             .map_err(|e| e.to_string())
     } else if LOCAL_UPDATE_CHANNEL.load(std::sync::atomic::Ordering::Relaxed) {
-        let endpoint = url::Url::parse(&format!(
-            "http://localhost:{DEV_RELEASE_PORT}/latest.json"
-        ))
-        .map_err(|e| e.to_string())?;
+        let endpoint = url::Url::parse(&format!("http://localhost:{DEV_RELEASE_PORT}/latest.json"))
+            .map_err(|e| e.to_string())?;
         app.updater_builder()
             .endpoints(vec![endpoint])
             .map_err(|e| e.to_string())?
