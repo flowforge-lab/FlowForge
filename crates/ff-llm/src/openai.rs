@@ -650,6 +650,24 @@ mod tests {
         assert_eq!(chunk.cache_miss_tokens, 0);
     }
 
+    #[test]
+    fn trailing_usage_chunk_after_done_is_parseable() {
+        // Regression test for #766 blocker: the finish_reason chunk has done=true
+        // but cache_*=0; the usage arrives on a SEPARATE trailing chunk with
+        // choices:[]. Both must parse correctly so run_turn can drain the trailing.
+        let finish_line = br#"data: {"choices":[{"delta":{"content":""},"finish_reason":"stop"}]}"#;
+        let usage_line = br#"data: {"choices":[],"usage":{"prompt_tokens":730,"completion_tokens":20,"total_tokens":750,"prompt_tokens_details":{"cached_tokens":640}}}"#;
+
+        let finish_chunk = parse_sse_line(finish_line).unwrap().unwrap();
+        assert!(finish_chunk.done);
+        assert_eq!(finish_chunk.cache_hit_tokens, 0);
+
+        let usage_chunk = parse_sse_line(usage_line).unwrap().unwrap();
+        assert!(!usage_chunk.done); // choices is empty -> no finish_reason
+        assert_eq!(usage_chunk.cache_hit_tokens, 640);
+        assert_eq!(usage_chunk.cache_miss_tokens, 90); // 730 - 640
+    }
+
     /// Guard: the OpenAI wire protocol requires `tool_calls[].function.arguments`
     /// to be a JSON-encoded **string**. The Ollama-native provider converts this
     /// to an object at its own boundary; this provider must NOT -- an object here

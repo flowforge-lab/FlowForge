@@ -1307,6 +1307,15 @@ pub async fn run_turn(
                             buf.arguments.push_str(&frag.arguments);
                         }
                         if chunk.done {
+                            // Drain one trailing chunk for the usage frame (#766).
+                            // OpenAI/SiliconFlow send cache metrics on a separate
+                            // final chunk (choices:[], usage:{...}) AFTER the
+                            // finish_reason chunk. Without this, cache_hit_tokens
+                            // is always 0.
+                            if let Some(Ok(trailing)) = stream.next().await {
+                                cache_hit_tokens += trailing.cache_hit_tokens;
+                                cache_miss_tokens += trailing.cache_miss_tokens;
+                            }
                             break;
                         }
                     }
