@@ -379,31 +379,70 @@ fn enforce_tool_result_pairing(messages: Vec<Value>) -> Vec<Value> {
             _ => Vec::new(),
         };
         let synth: Vec<Value> = tool_use_ids
-            .into_iter()
+            .iter()
             .filter(|id| !covered.contains(id))
+            .cloned()
             .map(synthetic_tool_result)
             .collect();
-        if synth.is_empty() {
-            continue;
-        }
 
         match iter.peek_mut() {
-            // Prepend so tool results lead the following user turn.
             Some(next) if next["role"] == "user" => {
                 if let Some(arr) = next["content"].as_array_mut() {
-                    let existing = std::mem::take(arr);
-                    let mut content = synth;
-                    content.extend(existing);
-                    *arr = content;
+                    // Strip orphaned tool_result blocks whose IDs don't belong to
+                    // this assistant's tool_uses (#744). A cancel+resend race can
+                    // interleave results from a parallel loop into the wrong turn.
+                    arr.retain(|b| {
+                        b["type"] != "tool_result"
+                            || b["tool_use_id"]
+                                .as_str()
+                                .is_some_and(|id| tool_use_ids.contains(&id.to_string()))
+                    });
+                    if !synth.is_empty() {
+                        let existing = std::mem::take(arr);
+                        let mut content = synth;
+                        content.extend(existing);
+                        *arr = content;
+                    }
                 }
             }
-            // Trailing tool_use, or a non-user message follows: insert a fresh user
-            // message carrying the synthetic results.
-            _ => out.push(json!({ "role": "user", "content": synth })),
+            _ => {
+                if !synth.is_empty() {
+                    out.push(json!({ "role": "user", "content": synth }));
+                }
+            }
         }
     }
 
+    // Final sweep: strip orphaned tool_result blocks from user turns whose
+    // preceding assistant has no tool_use blocks (#744).
+    strip_orphaned_trailing_results(&mut out);
     out
+}
+
+/// Remove tool_result blocks from any user turn whose preceding assistant has no
+/// tool_use blocks. Such results are orphans from a parallel-loop race (#744).
+/// Also drops user turns left empty after stripping.
+fn strip_orphaned_trailing_results(messages: &mut Vec<Value>) {
+    let mut i = 1;
+    while i < messages.len() {
+        if messages[i]["role"] == "user" {
+            let prev_has_uses = i > 0
+                && messages[i - 1]["role"] == "assistant"
+                && messages[i - 1]["content"]
+                    .as_array()
+                    .is_some_and(|blocks| blocks.iter().any(|b| b["type"] == "tool_use"));
+            if !prev_has_uses {
+                if let Some(arr) = messages[i]["content"].as_array_mut() {
+                    arr.retain(|b| b["type"] != "tool_result");
+                    if arr.is_empty() {
+                        messages.remove(i);
+                        continue;
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
 }
 
 fn collect_block_ids(msg: &Value, block_type: &str, id_field: &str) -> Vec<String> {

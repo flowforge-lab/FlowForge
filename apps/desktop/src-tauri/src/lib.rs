@@ -854,6 +854,13 @@ fn send_message(
     // forwards them to vision-capable providers. `None` for a plain text turn.
     attachments: Option<Vec<Attachment>>,
 ) -> CmdResult<String> {
+    // Cancel any in-flight turn so a cancel+resend sequence never races two
+    // parallel agent loops into the same session (#744). Mirrors edit_message.
+    if let Some(token) = state.take_cancel(&session_id) {
+        token.cancel();
+    }
+    state.cancel_pending_approvals(&session_id);
+
     let user_msg =
         match attachments {
             Some(attachments) if !attachments.is_empty() => state
