@@ -445,9 +445,7 @@ fn strip_orphaned_trailing_results(messages: &mut Vec<Value>) {
                             if let Some(absorbed) =
                                 messages.remove(i)["content"].as_array().cloned()
                             {
-                                if let Some(target) =
-                                    messages[i - 1]["content"].as_array_mut()
-                                {
+                                if let Some(target) = messages[i - 1]["content"].as_array_mut() {
                                     target.extend(absorbed);
                                 }
                             }

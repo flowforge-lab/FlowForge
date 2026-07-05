@@ -719,10 +719,7 @@ fn strip_orphaned_trailing_results(messages: &mut Vec<Message>) {
                     messages.remove(i);
                     // Removing a user turn may leave two adjacent assistants;
                     // merge the second into the first to restore alternation.
-                    if i < messages.len()
-                        && i > 0
-                        && messages[i].role == messages[i - 1].role
-                    {
+                    if i < messages.len() && i > 0 && messages[i].role == messages[i - 1].role {
                         let absorbed = messages.remove(i);
                         messages[i - 1].content.extend(absorbed.content);
                     }
@@ -2408,9 +2405,11 @@ mod tests {
         // Verify strict alternation
         for i in 1..fixed.len() {
             assert_ne!(
-                fixed[i].role, fixed[i - 1].role,
+                fixed[i].role,
+                fixed[i - 1].role,
                 "alternation violated at index {i}: {:?} == {:?}",
-                fixed[i].role, fixed[i - 1].role
+                fixed[i].role,
+                fixed[i - 1].role
             );
         }
         // The two interrupted assistants should be merged into one
