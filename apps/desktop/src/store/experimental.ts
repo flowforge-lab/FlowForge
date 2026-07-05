@@ -20,11 +20,9 @@ export type FlagId =
   // StepGroup header. Unlike the others it gates a shipped FE behavior, not a
   // future backend.
   | "stepTimelineExport"
-  // FE-only dev affordance (#567, RFC 0014 §12.3, P5c): lets the background
-  // update poll run in a dev build so the global update bar picks up a local
-  // `dev-release.sh` feed. Pair with `FF_UPDATER_ENDPOINT`: with it unset the
-  // poll falls through to the default public feed, inert only while the dev
-  // version matches the latest release.
+  // Dev affordance (#567, #749): when ON the updater polls the local
+  // `dev-release.sh` feed (localhost:8787) instead of GitHub, enabling the
+  // seamless dogfood loop without any env-var setup.
   | "localUpdateChannel";
 
 export const FLAG_IDS: readonly FlagId[] = [
