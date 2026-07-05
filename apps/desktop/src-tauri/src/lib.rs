@@ -179,7 +179,10 @@ impl Approver for UiApprover {
         // Permission matrix (#699): Allow → auto-approve, Ask → prompt below,
         // Deny → should never reach here (hidden from the model by advertised_tools).
         // ReadOnly also never reaches here (the agent loop short-circuits it).
-        let cell = self.state.permission_matrix.cell(self.mode, safety);
+        let cell = self
+            .state
+            .permission_matrix
+            .effective_cell(name, self.mode, safety);
         if cell.is_allow() {
             return true;
         }
