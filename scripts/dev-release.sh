@@ -52,6 +52,8 @@ cp "$REPO_ROOT/target/release/flowforge" \
 
 echo "==> Building signed updater bundle, version $DEV_VERSION"
 cd "$REPO_ROOT/apps/desktop"
+# Remove stale artifacts so we never accidentally serve an old tarball with a new version.
+rm -f "$BUNDLE_DIR/FlowForge.app.tar.gz" "$BUNDLE_DIR/FlowForge.app.tar.gz.sig"
 pnpm tauri build --bundles updater --config "$LOCAL_CONF" --config "$BUNDLE_CONF" --config "{\"version\":\"$DEV_VERSION\"}"
 
 TARBALL="$BUNDLE_DIR/FlowForge.app.tar.gz"
