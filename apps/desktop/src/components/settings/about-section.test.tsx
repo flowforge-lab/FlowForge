@@ -5,6 +5,10 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AboutSection } from "@/components/settings/about-section";
 import { ipc } from "@/lib/ipc";
+import {
+  EXPERIMENTAL_DEFAULTS,
+  useExperimentalStore,
+} from "@/store/experimental";
 import { useSettingsStore } from "@/store/settings";
 import { useUpdateStore } from "@/store/update";
 
@@ -35,6 +39,7 @@ beforeEach(() => {
   });
   useSettingsStore.setState({ activeSection: "about", resetHandler: null });
   useUpdateStore.setState({ status: null, installing: false, progress: null });
+  useExperimentalStore.setState({ flags: { ...EXPERIMENTAL_DEFAULTS } });
 });
 
 afterEach(() => {
@@ -151,5 +156,32 @@ describe("AboutSection", () => {
     });
     render(<AboutSection />);
     expect(container.querySelector('[role="progressbar"]')).toBeNull();
+  });
+
+  it("hides the Developer group by default (devTools flag off)", () => {
+    render(<AboutSection />);
+    const btn = [...container.querySelectorAll("button")].find((el) =>
+      el.textContent?.includes("Run sidecar smoke-test"),
+    );
+    expect(btn).toBeUndefined();
+  });
+
+  it("'Run sidecar smoke-test' invokes runSidecarTurn and toasts the event count", async () => {
+    useExperimentalStore.getState().setFlag("devTools", true);
+    const spy = vi
+      .spyOn(ipc, "runSidecarTurn")
+      .mockResolvedValue({ session_id: "abc-123", events: 5 });
+    render(<AboutSection />);
+    const btn = [...container.querySelectorAll("button")].find((el) =>
+      el.textContent?.includes("Run sidecar smoke-test"),
+    );
+    expect(btn).toBeDefined();
+    await act(async () => {
+      btn?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    expect(spy).toHaveBeenCalledWith("hello");
+    expect(container.querySelector('[role="status"]')?.textContent).toContain(
+      "5 event(s)",
+    );
   });
 });

@@ -1268,7 +1268,7 @@ impl DesktopTaskRunner {
 #[async_trait]
 impl ff_scheduled::TaskRunner for DesktopTaskRunner {
     async fn fire(&self, task: &ScheduledTask) -> ff_scheduled::RunOutcome {
-        // A built-in runs its named action directly (no agent loop / session);
+        // A built-in runs it's named action directly (no agent loop / session);
         // a prompt task drives a headless `run_turn` below (#544).
         let prompt = match &task.kind {
             TaskKind::Prompt(text) => text.clone(),
@@ -2316,7 +2316,14 @@ fn start_dev_update_watcher(app: tauri::AppHandle) {
 /// Keeping both paths on one helper is exactly what the sidecar parity
 /// smoke-test (RFC 0004 §5) guards against drift: if the mapping changes, it
 /// changes in one place.
-fn emit_agent_event(app: &tauri::AppHandle, session_id: &str, event: AgentEvent) {
+///
+/// Generic over `R: tauri::Runtime` so the sidecar parity integration test can
+/// drive it through a `MockRuntime` app handle (see `tests::sidecar_turn_*`).
+fn emit_agent_event<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    session_id: &str,
+    event: AgentEvent,
+) {
     match event {
         AgentEvent::Token { message_id, delta } => {
             let _ = app.emit(
@@ -2448,8 +2455,8 @@ fn emit_agent_event(app: &tauri::AppHandle, session_id: &str, event: AgentEvent)
 /// `flowforge` on the command line must install it separately or symlink
 /// it manually — see the caveat doc in `docs/rfcs/0004-cli.md`.
 #[tauri::command]
-async fn run_sidecar_turn(
-    app: tauri::AppHandle,
+async fn run_sidecar_turn<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     prompt: String,
 ) -> Result<serde_json::Value, String> {
     let session_id = Uuid::new_v4().to_string();
@@ -2883,10 +2890,12 @@ pub fn run() {
 mod tests {
     use super::state::AppState;
     use super::{
-        git_branch, is_app_ready, list_local_branches, matrix_gate, panic_message,
-        publish_app_ready, resolve_workspace_dir, should_warmup, switch_branch, BootFinalize,
-        TurnMetrics, UpdateStatus, APP_READY,
+        emit_agent_event, git_branch, is_app_ready, list_local_branches, matrix_gate,
+        panic_message, publish_app_ready, resolve_workspace_dir, run_sidecar_turn, should_warmup,
+        switch_branch, BootFinalize, TurnMetrics, UpdateStatus, APP_READY,
     };
+    use ff_agent::AgentEvent;
+    use ff_core::events::TurnDoneEvent;
     use ff_core::{Mode, ProviderKind};
     use ff_tools::Safety;
     use std::sync::atomic::Ordering;
@@ -3022,7 +3031,7 @@ mod tests {
     }
 
     // `UpdateStatus` has no ts-rs binding -- it is cast on the FE side from the JSON
-    // this serializes to (`lib/about.ts`). Pin the wire shape so the hand-written FE
+    // this serializes to (`lib/about.ts`). Pin the wire shape so the handwritten FE
     // type and this enum cannot drift apart silently (#159).
     #[test]
     fn update_status_matches_fe_contract() {
@@ -3301,5 +3310,268 @@ mod tests {
         assert_eq!(m.prefill_estimates, vec![120, 340, 75]);
         assert_eq!(m.tier1_fires, 2);
         assert_eq!(m.tier2_fires, 1);
+    }
+
+    // ---- CLI.7 sidecar parity integration test (RFC 0004 §5) ----
+    //
+    // `run_sidecar_turn` is the Tauri command that spawns the bundled `flowforge`
+    // CLI as a sidecar, reads its `--json` stdout line-by-line, and re-emits every
+    // parsed `AgentEvent` through `emit_agent_event` — the same helper the
+    // in-process `run_turn` path uses. This test exercises the full
+    // spawn → stdout-parse → emit pipeline end-to-end:
+    //
+    //   1. Requires the sidecar binary at `target/<profile>/flowforge` (staged by
+    //      `scripts/stage-sidecar.sh` or a bare `cargo build -p ff-cli`). The
+    //      `tauri_plugin_shell` sidecar resolver looks for the binary relative to
+    //      `current_exe()`; under `cargo test` that resolves to the workspace
+    //      `target/<profile>/` directory.
+    //   2. Stands up a wiremock OpenAI-compatible endpoint so the CLI can actually
+    //      complete a turn (the `run` subcommand would otherwise fail to reach a
+    //      provider and exit non-zero before emitting `turn:done`).
+    //   3. Overrides `HOME` so the CLI reads a temp `provider.json` pointing at
+    //      the mock. A process-wide mutex serializes the override against parallel
+    //      tests that might also touch `HOME`.
+    //   4. Drives `run_sidecar_turn` through a `MockRuntime` Tauri app (the
+    //      command is generic over `R: tauri::Runtime` for exactly this reason)
+    //      and asserts the `turn:done` event fires.
+
+    /// `HOME` is a process-global env var; serialize tests that override it so
+    /// they don't race each other or other tests that read `HOME`.
+    ///
+    /// NOTE: `std::env::set_var` is deprecated as of Rust 1.80 on soundness
+    /// grounds — it's UB in multithreaded programs because another thread
+    /// can read `HOME` concurrently with the mutation. This mutex only
+    /// serializes *these tests*; it does not stop unrelated threads from
+    /// reading `HOME` mid-override. Acceptable today because each
+    /// `#[tokio::test]` here runs on a single task with no other threads
+    /// touching `HOME`, but a future edition is expected to make this a hard
+    /// error — at which point the override should move to per-spawn env
+    /// injection (e.g. `Command::env` on the sidecar subprocess) rather than
+    /// mutating the process-global `HOME`.
+    static SIDECAR_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Resolve the sidecar binary path that `tauri_plugin_shell`'s
+    /// `relative_command_path` will look for under `cargo test` — the workspace
+    /// `target/<profile>/flowforge` (no target-triple suffix at runtime; the
+    /// suffix is only used by the `tauri build` bundler).
+    fn sidecar_binary_path() -> std::path::PathBuf {
+        let mut path = std::env::current_exe().expect("current_exe");
+        // The test binary lives in `target/<profile>/deps/<name>-<hash>`. Pop
+        // `deps/<name>-<hash>` to land on `target/<profile>/`.
+        path.pop(); // <name>-<hash>
+        path.pop(); // deps
+        path.push("flowforge");
+        path
+    }
+
+    /// Write a `provider.json` that points the CLI's `CandleVllm` provider at the
+    /// mock server, under the temp `HOME`'s platform-specific config dir. Returns
+    /// the temp dir (kept alive for the test duration).
+    fn stage_provider_config(base_url: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let temp_home = tempfile::tempdir().expect("temp HOME");
+
+        // `dirs::config_dir()` respects `HOME` on Unix and macOS — so set it
+        // before computing the path.
+        let old_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", temp_home.path());
+
+        let config_dir = dirs::config_dir()
+            .expect("config dir resolves under temp HOME")
+            .join("flowforge");
+        std::fs::create_dir_all(&config_dir).expect("create flowforge config dir");
+
+        let provider_json = serde_json::json!({
+            "kind": "candleVllm",
+            "baseUrl": base_url,
+            "model": "test-sidecar-model",
+            "hasKey": false,
+            "thinking": false,
+        });
+        let provider_path = config_dir.join("provider.json");
+        std::fs::write(&provider_path, provider_json.to_string()).expect("write provider.json");
+
+        // Restore HOME — the override is re-applied for the actual sidecar spawn
+        // in the test body. We only needed it here to compute the platform path.
+        match old_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+
+        (temp_home, provider_path)
+    }
+
+    #[tokio::test]
+    #[ignore = "requires staged sidecar — run ./scripts/stage-sidecar.sh, then `cargo test ... -- --ignored`"]
+    #[allow(clippy::await_holding_lock)]
+    async fn sidecar_turn_emits_turn_done_event() {
+        // The `std::sync::Mutex` guard is held across `.await` points because
+        // the `HOME` override must stay in place for the entire sidecar spawn
+        // + turn duration. This is safe: the lock is only acquired by this one
+        // test, runs on a single tokio task, and guards a process-global env
+        // var — no other async task contends on it.
+        //
+        // `#[ignore]` makes this opt-in: `cargo test --workspace` reports it as
+        // ignored (not passed), so CI can't silently drop it behind a soft-skip
+        // `return` and advertise false confidence. Run it explicitly with
+        // `--ignored` after staging the sidecar.
+        let sidecar = sidecar_binary_path();
+        assert!(
+            sidecar.exists(),
+            "sidecar binary not found at {} — run `./scripts/stage-sidecar.sh` \
+             (or `cargo build -p ff-cli`) first",
+            sidecar.display(),
+        );
+
+        let _guard = SIDECAR_TEST_LOCK.lock().unwrap();
+
+        // Mock OpenAI-compatible endpoint: one content delta, then [DONE].
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/chat/completions"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_string(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":null}]}\n\n\
+                     data: [DONE]\n\n",
+            ))
+            .mount(&server)
+            .await;
+
+        // Stage provider.json under a temp HOME.
+        let (temp_home, _provider_path) = stage_provider_config(&server.uri());
+
+        // Override HOME for the sidecar subprocess (it inherits the parent's env).
+        let old_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", temp_home.path());
+
+        // Mock Tauri app with the shell plugin — `run_sidecar_turn` is generic
+        // over `R: tauri::Runtime` so it accepts the `MockRuntime` app handle.
+        let app = tauri::test::mock_builder()
+            .plugin(tauri_plugin_shell::init())
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .expect("mock app builds");
+
+        // Listen for the `turn:done` event that `emit_agent_event` emits.
+        use tauri::Listener;
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let done_clone = done.clone();
+        app.listen("turn:done", move |_| {
+            done_clone.store(true, Ordering::SeqCst);
+        });
+
+        // Also track the total event count for a richer assertion.
+        let token = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let token_clone = token.clone();
+        app.listen("turn:token", move |_| {
+            token_clone.fetch_add(1, Ordering::SeqCst);
+        });
+
+        let handle = app.handle().clone();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            run_sidecar_turn(handle, "hello".into()),
+        )
+        .await;
+
+        // Restore HOME before asserting so a panic doesn't leak the temp HOME.
+        match old_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+        drop(_guard);
+
+        let result = result.expect("run_sidecar_turn timed out after 30s");
+        assert!(
+            result.is_ok(),
+            "run_sidecar_turn failed: {:?}",
+            result.err()
+        );
+        assert!(
+            done.load(Ordering::SeqCst),
+            "turn:done event was not received — the sidecar spawned but the \
+             AgentEvent → Tauri event pipeline did not deliver the terminal event"
+        );
+        assert!(
+            token.load(Ordering::SeqCst) >= 1,
+            "expected at least one turn:token event from the sidecar"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires the sidecar NOT be staged — inverse of the happy-path test; run with `--ignored` only when target/flowforge is absent"]
+    async fn sidecar_turn_returns_error_without_sidecar_binary() {
+        // When the sidecar binary is absent, `run_sidecar_turn` must surface a
+        // clear error rather than panicking or hanging. This guards the resolver
+        // path (`app.shell().sidecar`) against silent failures.
+        //
+        // `#[ignore]` + a hard assert (not a soft-skip `return`) so CI can't
+        // silently drop it: it fails loudly if the binary is present. Mutually
+        // exclusive with `sidecar_turn_emits_turn_done_event` — don't run both
+        // via `--ignored` together (one needs the binary staged, the other absent).
+        let sidecar = sidecar_binary_path();
+        assert!(
+            !sidecar.exists(),
+            "sidecar binary found at {} — this test requires the sidecar NOT be \
+             staged (it is the inverse of `sidecar_turn_emits_turn_done_event`)",
+            sidecar.display(),
+        );
+
+        let app = tauri::test::mock_builder()
+            .plugin(tauri_plugin_shell::init())
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .expect("mock app builds");
+
+        let handle = app.handle().clone();
+        let result = run_sidecar_turn(handle, "hello".into()).await;
+        assert!(
+            result.is_err(),
+            "run_sidecar_turn should fail when the sidecar binary is missing, got: {:?}",
+            result
+        );
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("sidecar") || err.contains("failed to"),
+            "error should mention the sidecar resolution failure, got: {err}"
+        );
+    }
+
+    // `emit_agent_event` is generic over `R: tauri::Runtime`; the sidecar path
+    // and the in-process turn path both feed through it. A direct unit-level
+    // assertion that the `Done` variant maps to `turn:done` (not, say, silently
+    // dropped) catches a mapping regression without the subprocess overhead.
+    #[tokio::test]
+    async fn emit_agent_event_maps_done_to_turn_done_event() {
+        let app = tauri::test::mock_builder()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .expect("mock app builds");
+
+        use tauri::Listener;
+        let received = Arc::new(Mutex::new(None));
+        let received_clone = received.clone();
+        app.listen("turn:done", move |event| {
+            let payload: TurnDoneEvent =
+                serde_json::from_str(event.payload()).expect("payload deserializes");
+            *received_clone.lock().unwrap() = Some(payload);
+        });
+
+        let done_event = AgentEvent::Done {
+            message_id: "msg-1".into(),
+            final_message: Some("hello".into()),
+            stop_reason: None,
+            turns: Some(1),
+            token_count: Some(42),
+            prefill_estimates: None,
+            tier1_fires: None,
+            tier2_fires: None,
+            cache_hit_tokens: Some(10),
+            cache_miss_tokens: Some(32),
+        };
+        emit_agent_event(app.handle(), "session-1", done_event);
+
+        // The mock runtime may deliver events asynchronously; yield once.
+        tokio::task::yield_now().await;
+
+        let received = received.lock().unwrap().clone();
+        let payload = received.expect("turn:done event was not delivered");
+        assert_eq!(payload.session_id, "session-1");
+        assert_eq!(payload.message_id, "msg-1");
     }
 }

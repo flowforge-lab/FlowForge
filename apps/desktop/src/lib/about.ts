@@ -20,6 +20,17 @@ export interface BackupResult {
   path: string;
 }
 
+/** Result of the CLI.7 sidecar parity smoke-test (`run_sidecar_turn`). Mirrors
+ *  the `serde_json::Value` the Rust command returns: the synthetic session id
+ *  the sidecar events were emitted under, and the total event count received
+ *  from the CLI's `--json` stdout. FE-owned — no ts-rs binding. */
+export interface SidecarTurnResult {
+  /** Synthetic session id the re-emitted `turn:*` events are tagged with. */
+  session_id: string;
+  /** Total `AgentEvent` lines parsed from the sidecar's stdout. */
+  events: number;
+}
+
 /** FE-owned toast copy for an update-check result. */
 export function formatUpdateStatus(status: UpdateStatus): string {
   return status.kind === "available"
