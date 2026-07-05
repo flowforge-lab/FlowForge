@@ -224,6 +224,12 @@ pub struct Chunk {
     /// in-flight tool-call arguments may be cut off mid-JSON, so the agent
     /// should report truncation rather than "invalid JSON" (#528).
     pub truncated: bool,
+    /// Prompt prefix cache metrics from the provider (#766). Populated on the
+    /// final chunk of providers that report usage (OpenAI-compatible with
+    /// `stream_options.include_usage`, Anthropic `message_delta`). Zero when
+    /// the provider doesn't report or caching didn't fire.
+    pub cache_hit_tokens: u32,
+    pub cache_miss_tokens: u32,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -953,6 +959,7 @@ mod tests {
                         tool_calls: vec![],
                         done: false,
                         truncated: false,
+                        ..Chunk::default()
                     };
                     Some((Ok(chunk), i + 1))
                 }

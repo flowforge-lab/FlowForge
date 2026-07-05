@@ -734,6 +734,8 @@ mod tests {
                 prefill_estimates: None,
                 tier1_fires: None,
                 tier2_fires: None,
+                cache_hit_tokens: None,
+                cache_miss_tokens: None,
             },
             AgentEvent::MemoryFlushed {
                 message_id: "m1".into(),
