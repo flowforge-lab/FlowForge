@@ -55,6 +55,7 @@ import type {
 import type { Format } from "../bindings/Format";
 import type { SecretKind } from "../bindings/SecretKind";
 import type { BedrockAuth } from "../bindings/BedrockAuth";
+import type { SearchHit } from "../bindings/SearchHit";
 
 export type Unlisten = () => void;
 
@@ -213,6 +214,16 @@ export interface FfIpc {
   ): Promise<SearchConfig>;
   /** Best-effort nudge to wake the model server before the first turn. Never throws meaningfully. */
   warmup(): Promise<void>;
+
+  // Full-text message search (FTS5, #679/#707). Both back real Rust commands
+  // registered in `invoke_handler!`; the `SearchHit` binding is ts-rs generated.
+  // Empty/blank queries resolve to `[]`.
+  /** In-thread find (#679): matches within one session, seq-ordered so next/prev
+   *  steps through them in message order. Indexes tool-call args + tool-result
+   *  bodies too (v11 migration), not just visible message text. */
+  searchInSession(sessionId: string, query: string): Promise<SearchHit[]>;
+  /** Cross-session search (#710): BM25-ranked hits across every session. */
+  searchMessages(query: string, limit?: number): Promise<SearchHit[]>;
 
   // Memory (RFC 0006, M5.1e — frozen read-only surface for the Settings memory
   // pane, Issue #131). These three commands have real Rust impls + ts-rs bindings.
@@ -643,6 +654,11 @@ class TauriIpc implements FfIpc {
   setControlConfig = (config: ControlConfig) =>
     this.invoke<ControlConfig>("set_control_config", { config });
   warmup = () => this.invoke<void>("warmup");
+
+  searchInSession = (sessionId: string, query: string) =>
+    this.invoke<SearchHit[]>("search_in_session", { sessionId, query });
+  searchMessages = (query: string, limit?: number) =>
+    this.invoke<SearchHit[]>("search_messages", { query, limit });
 
   listSkills = () => this.invoke<SkillInfo[]>("list_skills");
   searchSkills = (query: string) =>

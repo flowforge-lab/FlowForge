@@ -15,6 +15,7 @@ import { useSplitStore } from "@/store/split";
 import { usePaletteStore } from "@/store/palette";
 import { useSettingsStore } from "@/store/settings";
 import { useShortcutsStore } from "@/store/shortcuts";
+import { useFindStore } from "@/store/find";
 import { useSessionModeStore } from "@/store/session-mode";
 import { modeForHotkey } from "@/lib/mode";
 
@@ -85,6 +86,17 @@ function useGlobalShortcuts() {
       const store = useChatStore.getState();
 
       const panes = usePanesStore.getState();
+
+      // ⌘/Ctrl+F: in-thread find (#679) for the focused pane's session (which
+      // mirrors the active session). Overrides the WebView's native find.
+      if (mod && e.key.toLowerCase() === "f") {
+        const sid = store.activeSessionId;
+        if (sid) {
+          e.preventDefault();
+          useFindStore.getState().toggleFind(sid);
+        }
+        return;
+      }
 
       if (mod && e.key.toLowerCase() === "n") {
         e.preventDefault();

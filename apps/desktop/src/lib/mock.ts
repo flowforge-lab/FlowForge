@@ -46,6 +46,7 @@ import type {
 import type { Format } from "../bindings/Format";
 import type { SecretKind } from "../bindings/SecretKind";
 import type { BedrockAuth } from "../bindings/BedrockAuth";
+import type { SearchHit } from "../bindings/SearchHit";
 import type { FfIpc, Unlisten } from "./ipc";
 import { mcpInstanceKey } from "./mcp";
 import type { MarketplaceSkill } from "./marketplace";
@@ -470,6 +471,41 @@ function renderSessionMarkdown(session: Session, messages: Message[]): string {
   return `${lines.join("\n").trimEnd()}\n`;
 }
 
+// Searchable text for a message (#679/#710): the body plus any tool-call args,
+// mirroring the fields the backend FTS5 index covers as of the v11 migration.
+function messageHaystack(m: Message): string {
+  const parts = [m.content];
+  for (const c of m.toolCalls ?? []) parts.push(c.name, c.arguments);
+  return parts.join(" ");
+}
+
+// A `<mark>`-highlighted, ellipsised snippet around the first match — matches the
+// backend's pre-highlighted `snippet` shape. Only #710's result rows render it;
+// the #679 find bar keys off `messageId` and highlights the live DOM instead.
+function searchHit(
+  m: Message,
+  sessionTitle: string | null,
+  query: string,
+): SearchHit {
+  const text = m.content;
+  const at = text.toLowerCase().indexOf(query.trim().toLowerCase());
+  let snippet = text.slice(0, 120);
+  if (at !== -1) {
+    const start = Math.max(0, at - 40);
+    const end = Math.min(text.length, at + query.length + 40);
+    const body = `${text.slice(start, at)}<mark>${text.slice(at, at + query.length)}</mark>${text.slice(at + query.length, end)}`;
+    snippet = `${start > 0 ? "…" : ""}${body}${end < text.length ? "…" : ""}`;
+  }
+  return {
+    sessionId: m.sessionId,
+    sessionTitle,
+    messageId: m.id,
+    role: m.role,
+    snippet,
+    createdAt: m.createdAt,
+  };
+}
+
 export class MockIpc implements FfIpc {
   private sessions = new Map<string, Session>();
   private messages = new Map<string, Message[]>();
@@ -868,6 +904,40 @@ export class MockIpc implements FfIpc {
 
   async getMessages(sessionId: string): Promise<Message[]> {
     return [...(this.messages.get(sessionId) ?? [])];
+  }
+
+  // Full-text search fakers (#679/#710). The real backend uses FTS5 over message
+  // text + tool-call args (v11); the mock does a case-insensitive substring scan
+  // over the same fields so the FE find bar behaves the same under the mock.
+  async searchInSession(
+    sessionId: string,
+    query: string,
+  ): Promise<SearchHit[]> {
+    const q = query.trim().toLowerCase();
+    if (!q) return [];
+    const session = this.sessions.get(sessionId);
+    // Message order (not relevance) so next/prev steps sequentially, like the
+    // backend's `search_in_session`.
+    return (this.messages.get(sessionId) ?? [])
+      .filter((m) => messageHaystack(m).toLowerCase().includes(q))
+      .map((m) => searchHit(m, session?.title ?? null, query));
+  }
+
+  async searchMessages(query: string, limit?: number): Promise<SearchHit[]> {
+    const q = query.trim().toLowerCase();
+    if (!q) return [];
+    const hits: SearchHit[] = [];
+    for (const [sid, msgs] of this.messages) {
+      const title = this.sessions.get(sid)?.title ?? null;
+      for (const m of msgs) {
+        if (messageHaystack(m).toLowerCase().includes(q)) {
+          hits.push(searchHit(m, title, query));
+        }
+      }
+    }
+    // Newest-first stand-in for BM25 so results look ranked in the mock.
+    hits.sort((a, b) => b.createdAt - a.createdAt);
+    return hits.slice(0, limit ?? 20);
   }
 
   // Export (#278). Mirrors the backend `export_session`: a lossless JSON envelope

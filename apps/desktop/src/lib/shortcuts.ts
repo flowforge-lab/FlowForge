@@ -29,6 +29,7 @@ export const SHORTCUTS: Shortcut[] = [
     keys: ["?", "or", "Mod", "/"],
     label: "Keyboard shortcuts (this list)",
   },
+  { group: "Navigation", keys: ["Mod", "F"], label: "Find in thread" },
   {
     group: "Navigation",
     keys: ["Esc"],
