@@ -904,6 +904,7 @@ fn spawn_assistant_turn(state: Arc<AppState>, app: tauri::AppHandle, session_id:
     let (mut provider, _) =
         state.build_provider_for(Some(&selection.connection), Some(&selection.model));
     let model = selection.model;
+    let conn_id = selection.connection;
     let persona = pheno.persona.clone();
     // Per-pane iteration cap (#244-R3 x #246): the resolved phenotype carries
     // `max_iterations`, so the bound Pheno governs the loop cap with no extra plumbing.
@@ -943,6 +944,8 @@ fn spawn_assistant_turn(state: Arc<AppState>, app: tauri::AppHandle, session_id:
         );
         tool_ctx.mode = mode;
         tool_ctx.abstractive = crate::state::abstractive_config_from_env();
+        tool_ctx.compaction_model = state.compaction_model(&conn_id);
+        tool_ctx.compaction_budget = state.compaction_budget(&conn_id);
         // Skills + ambient context for this turn (RFC 0001 §4, RFC 0002 phase 1):
         // the resolved persona, installed-skill descriptions, the bodies of the
         // active skills, and the current local time.
@@ -1315,6 +1318,8 @@ impl ff_scheduled::TaskRunner for DesktopTaskRunner {
         );
         tool_ctx.mode = mode;
         tool_ctx.abstractive = crate::state::abstractive_config_from_env();
+        tool_ctx.compaction_model = self.state.compaction_model(&selection.connection);
+        tool_ctx.compaction_budget = self.state.compaction_budget(&selection.connection);
 
         let skills = self.state.skills_snapshot();
         let user_ctx =

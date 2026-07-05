@@ -415,6 +415,18 @@ pub struct ProviderConnection {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub access_key_id: Option<String>,
+    /// Fast model for compaction/flush LLM calls (#756). When set, memory flush
+    /// and abstractive summarization use this model instead of the session model.
+    /// Example: `"global.anthropic.claude-haiku-4-5-20251001-v1:0"` (Bedrock), `"gpt-4o-mini"` (OpenAI).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub compaction_model: Option<String>,
+    /// Context budget (in tokens) at which compaction engages (#756). When set,
+    /// overrides the default `model_window * 0.8`. Maps to the UI's
+    /// "Summarization threshold" slider. `None` = use the computed default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional, type = "number")]
+    pub compaction_budget: Option<u64>,
 }
 
 impl ProviderConnection {
@@ -680,6 +692,8 @@ impl Default for ProviderRegistry {
             auth_mode: None,
             aws_profile: None,
             access_key_id: None,
+            compaction_model: None,
+            compaction_budget: None,
         };
         let ollama = ProviderConnection {
             id: "ollama".to_string(),
@@ -699,6 +713,8 @@ impl Default for ProviderRegistry {
             auth_mode: None,
             aws_profile: None,
             access_key_id: None,
+            compaction_model: None,
+            compaction_budget: None,
         };
         Self {
             active: candle.id.clone(),
@@ -900,6 +916,8 @@ mod tests {
             auth_mode: None,
             aws_profile: None,
             access_key_id: None,
+            compaction_model: None,
+            compaction_budget: None,
         }
     }
 
@@ -1018,6 +1036,8 @@ mod tests {
             auth_mode: None,
             aws_profile: None,
             access_key_id: None,
+            compaction_model: None,
+            compaction_budget: None,
         };
         assert_eq!(conn.resolved_base_url(), "http://localhost:11434");
         let overridden = ProviderConnection {
@@ -1245,6 +1265,8 @@ mod tests {
             region: Some("us-west-2".into()),
             auth_mode: Some(BedrockAuth::IamKeys),
             access_key_id: Some("AKIAEXAMPLE".into()),
+            compaction_model: None,
+            compaction_budget: None,
             ..blank_conn("Bedrock", Some("aws"), ProviderKind::Bedrock)
         };
         let json = serde_json::to_string(&conn).unwrap();
