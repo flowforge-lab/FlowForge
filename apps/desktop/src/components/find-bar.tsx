@@ -18,6 +18,7 @@ import {
   applyHighlights,
   clearHighlights,
   collectOccurrences,
+  indexOfMessage,
   scrollRangeIntoView,
 } from "@/lib/find-highlight";
 
@@ -31,9 +32,16 @@ export function FindBar({
   rootRef: React.RefObject<HTMLDivElement | null>;
 }) {
   const closeFind = useFindStore((s) => s.closeFind);
+  const consumeSeed = useFindStore((s) => s.consumeSeed);
   const inputRef = useRef<HTMLInputElement>(null);
 
-  const [query, setQuery] = useState("");
+  // Global search (#710) can open the bar pre-seeded: a query to run and a
+  // specific message to jump to. Captured once at mount (before the store seed is
+  // consumed) so the first search activates that hit instead of occurrence #1.
+  const [query, setQuery] = useState(
+    () => useFindStore.getState().seedQuery ?? "",
+  );
+  const seedMessageIdRef = useRef(useFindStore.getState().seedMessageId);
   const [count, setCount] = useState(0);
   const [active, setActive] = useState(0);
   // DOM Ranges + the current index kept in refs so next/prev read fresh values
@@ -41,11 +49,13 @@ export function FindBar({
   const rangesRef = useRef<Range[]>([]);
   const activeRef = useRef(0);
 
-  // Focus the input as soon as the bar opens.
+  // Focus the input as soon as the bar opens, and clear the store seed now that
+  // this instance has captured it.
   useEffect(() => {
     inputRef.current?.focus();
     inputRef.current?.select();
-  }, []);
+    consumeSeed();
+  }, [consumeSeed]);
 
   // Clear highlights when the bar unmounts (closed / session switch).
   useEffect(() => clearHighlights, []);
@@ -71,12 +81,22 @@ export function FindBar({
             if (cancelled) return;
           }
         }
+        // Jump to the seeded message's occurrence on the first search after a
+        // global-search click (#710); otherwise start at the first match. The
+        // seed is one-shot — cleared once consumed.
+        let idx = 0;
+        const seedId = seedMessageIdRef.current;
+        if (seedId && ranges.length > 0) {
+          const found = indexOfMessage(ranges, seedId);
+          if (found >= 0) idx = found;
+        }
+        seedMessageIdRef.current = null;
         rangesRef.current = ranges;
-        activeRef.current = 0;
+        activeRef.current = idx;
         setCount(ranges.length);
-        setActive(0);
-        applyHighlights(ranges, 0);
-        if (ranges[0]) scrollRangeIntoView(ranges[0]);
+        setActive(idx);
+        applyHighlights(ranges, idx);
+        if (ranges[idx]) scrollRangeIntoView(ranges[idx]);
       },
       q ? DEBOUNCE_MS : 0,
     );

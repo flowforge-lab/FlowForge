@@ -111,13 +111,15 @@ describe("SessionSidebar — header accent + collapsed rail (#670)", () => {
     expect(usePrefsStore.getState().sidebarCollapsed).toBe(false);
   });
 
-  it("rail search opens the placeholder popover", async () => {
+  it("rail search expands the sidebar and reveals the filter (#710)", async () => {
     const user = userEvent.setup();
     usePrefsStore.setState({ sidebarCollapsed: true });
     render(<SessionSidebar />);
 
     await user.click(screen.getByLabelText("Search sessions"));
-    expect(screen.getByText("Coming soon.")).not.toBeNull();
+    // Expands the sidebar and reveals the (now full-text) filter input.
+    expect(usePrefsStore.getState().sidebarCollapsed).toBe(false);
+    expect(screen.getByLabelText("Filter sessions")).not.toBeNull();
   });
 
   it("rail ＋ starts a new session and gear opens Settings", async () => {

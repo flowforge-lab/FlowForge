@@ -3,10 +3,13 @@ import {
   resolveLabel,
   filterSessions,
   arrangeSessions,
+  groupContentHits,
+  sanitizeSnippet,
   selectSessionOverflow,
   SESSION_REVEAL_BATCH,
 } from "@/lib/sessions";
 import type { Session } from "@/bindings";
+import type { SearchHit } from "@/bindings/SearchHit";
 
 function session(partial: Partial<Session> & { id: string }): Session {
   return {
@@ -17,6 +20,17 @@ function session(partial: Partial<Session> & { id: string }): Session {
     createdAt: 0,
     updatedAt: 0,
     ...partial,
+  };
+}
+
+function hit(sessionId: string, messageId: string): SearchHit {
+  return {
+    sessionId,
+    sessionTitle: null,
+    messageId,
+    role: "assistant",
+    snippet: `<mark>x</mark> in ${messageId}`,
+    createdAt: 0,
   };
 }
 
@@ -182,5 +196,68 @@ describe("selectSessionOverflow", () => {
     expect(visible).toHaveLength(SESSION_REVEAL_BATCH + 1);
     expect(visible.some((s) => s.id === activeId)).toBe(true);
     expect(hasMore).toBe(false);
+  });
+});
+
+describe("groupContentHits", () => {
+  const a = session({ id: "a" });
+  const b = session({ id: "b" });
+  const c = session({ id: "c" });
+  const byId = new Map([a, b, c].map((s) => [s.id, s]));
+
+  it("keeps one row per session, preserving BM25 (input) order", () => {
+    const rows = groupContentHits(
+      [hit("b", "b1"), hit("a", "a1"), hit("b", "b2"), hit("c", "c1")],
+      new Set(),
+      byId,
+    );
+    expect(rows.map((r) => r.session.id)).toEqual(["b", "a", "c"]);
+    // The first hit per session wins (best rank).
+    expect(rows[0].hit.messageId).toBe("b1");
+  });
+
+  it("excludes sessions already shown as title matches", () => {
+    const rows = groupContentHits(
+      [hit("a", "a1"), hit("b", "b1")],
+      new Set(["a"]),
+      byId,
+    );
+    expect(rows.map((r) => r.session.id)).toEqual(["b"]);
+  });
+
+  it("drops hits whose session isn't listed (e.g. a draft)", () => {
+    const rows = groupContentHits(
+      [hit("ghost", "g1"), hit("a", "a1")],
+      new Set(),
+      byId,
+    );
+    expect(rows.map((r) => r.session.id)).toEqual(["a"]);
+  });
+
+  it("returns an empty list for no hits", () => {
+    expect(groupContentHits([], new Set(), byId)).toEqual([]);
+  });
+});
+
+describe("sanitizeSnippet (#747 C1 — XSS)", () => {
+  it("keeps the backend's <mark> delimiters", () => {
+    expect(sanitizeSnippet("fix the <mark>parser</mark> bug")).toBe(
+      "fix the <mark>parser</mark> bug",
+    );
+  });
+
+  it("escapes raw HTML in the surrounding message text", () => {
+    // An agent message quoting `<img src=x onerror=alert(1)>`, matched on "img".
+    const raw = "<mark><img</mark> src=x onerror=alert(1)>";
+    const out = sanitizeSnippet(raw);
+    expect(out).toBe("<mark>&lt;img</mark> src=x onerror=alert(1)&gt;");
+    // No injectable tag survives outside the mark delimiters.
+    expect(out).not.toContain("<img");
+  });
+
+  it("escapes ampersands and angle brackets, and a bare </script>", () => {
+    expect(sanitizeSnippet("a & b <script>x</script>")).toBe(
+      "a &amp; b &lt;script&gt;x&lt;/script&gt;",
+    );
   });
 });
