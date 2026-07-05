@@ -22,6 +22,7 @@ use serde::{Deserialize, Serialize};
 
 mod compaction;
 mod compaction_abstractive;
+mod compaction_cache;
 mod compaction_extractive;
 mod goal_loop;
 mod system_prompt;
@@ -33,6 +34,7 @@ pub use compaction::{
 pub use compaction_abstractive::{
     build_summary_prompt, summary_due, AbstractiveConfig, AbstractiveSummarizer, SummaryResult,
 };
+pub use compaction_cache::CompactionCache;
 pub use compaction_extractive::{
     classify, proxy_tokens, ColdCompaction, CompactionSavings, CompressOutcome, ContentKind,
     ExtractiveCompactor, ReversibleCache, COMPACTION_MARKER_PREFIX,
@@ -373,6 +375,11 @@ pub struct ToolContext<'a> {
     /// default `model_window * CONTEXT_BUDGET_SAFETY`. Maps to the UI's
     /// "Summarization threshold" slider. `None` = use the computed default.
     pub compaction_budget: Option<u64>,
+    /// Cross-turn summary cache (#757). When provided, `run_turn` seeds its
+    /// local summary state from the previous turn's result and writes back on
+    /// update, eliminating redundant summarizer calls across turns. `None` =
+    /// no cross-turn caching (legacy / CLI / sub-agents).
+    pub compaction_cache: Option<&'a CompactionCache>,
 }
 
 impl<'a> ToolContext<'a> {
@@ -397,6 +404,7 @@ impl<'a> ToolContext<'a> {
             abstractive: AbstractiveConfig::default(),
             compaction_model: None,
             compaction_budget: None,
+            compaction_cache: None,
         }
     }
 }
@@ -839,8 +847,15 @@ pub async fn run_turn(
     // was produced. Reused across iterations until the transcript grows by the
     // re-flush interval, so a long turn pays for at most one summarizer call per
     // window instead of one per tool round.
-    let mut last_summary: Option<(usize, Message)> = None;
-    let mut last_summary_count: Option<u64> = None;
+    //
+    // Cross-turn seeding (#757): if a previous turn left a cached summary for
+    // this session, start from it instead of None so we skip the expensive
+    // re-summarization when only a few messages were appended.
+    let (mut last_summary, mut last_summary_count) = tools
+        .compaction_cache
+        .and_then(|c| c.get(session_id))
+        .map(|(b, msg, count)| (Some((b, msg)), Some(count)))
+        .unwrap_or((None, None));
     // F1b (#441) telemetry: the projected prefill estimate of each round-trip's
     // outgoing wire, plus how often each compaction tier engaged this turn. Folded
     // into the `Done` event so the desktop's `turn:stats` can report them. Purely
@@ -1000,6 +1015,15 @@ pub async fn run_turn(
                             }
                             last_summary = Some((result.boundary, result.messages[0].clone()));
                             last_summary_count = Some(message_count);
+                            // Write-through to cross-turn cache (#757).
+                            if let Some(cache) = tools.compaction_cache {
+                                cache.put(
+                                    session_id,
+                                    result.boundary,
+                                    result.messages[0].clone(),
+                                    message_count,
+                                );
+                            }
                             result.messages
                         }
                         _ => wire,
@@ -1853,6 +1877,7 @@ async fn run_subagent(
         abstractive: parent.abstractive.clone(),
         compaction_model: parent.compaction_model.clone(),
         compaction_budget: parent.compaction_budget,
+        compaction_cache: None, // Sub-agents are ephemeral; no cross-turn caching.
     };
 
     // Child events are swallowed: the parent receives only the summary, never the
@@ -2128,6 +2153,7 @@ mod tests {
             abstractive: AbstractiveConfig::default(),
             compaction_model: None,
             compaction_budget: None,
+            compaction_cache: None,
         };
 
         run_turn(
@@ -4269,6 +4295,7 @@ mod tests {
             abstractive: AbstractiveConfig::default(),
             compaction_model: None,
             compaction_budget: None,
+            compaction_cache: None,
         };
 
         run_turn(
@@ -4328,6 +4355,7 @@ mod tests {
             abstractive: AbstractiveConfig::default(),
             compaction_model: None,
             compaction_budget: None,
+            compaction_cache: None,
         };
 
         run_turn(
