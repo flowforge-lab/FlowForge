@@ -451,6 +451,7 @@ impl Provider for OpenAiProvider {
 
         // SSE frames are newline-delimited; reassemble lines across byte-chunk
         // boundaries, then decode each `data:` line into a Chunk.
+        let think_tags = dialect.think_tags;
         let stream = resp.bytes_stream().scan(Vec::<u8>::new(), |buf, item| {
             let out = match item {
                 Ok(bytes) => {
@@ -470,7 +471,43 @@ impl Provider for OpenAiProvider {
             std::future::ready(Some(futures_util::stream::iter(out)))
         });
 
-        Ok(stream.flatten().boxed())
+        // Layer 1+2: split <think> tags from content into reasoning_delta (#729).
+        // Layer 1 (forced): known think-tag models (MiniMax on SiliconFlow).
+        // Layer 2 (auto-detect): any model whose first content starts with <think>.
+        let mut scanner = if think_tags {
+            crate::think_scanner::ThinkScanner::forced()
+        } else {
+            crate::think_scanner::ThinkScanner::auto_detect()
+        };
+
+        let stream = stream.flatten().map(move |result| {
+            let mut chunk = result?;
+            if !chunk.delta.is_empty() {
+                let scan = scanner.push(&chunk.delta);
+                chunk.delta = scan.content;
+                if !scan.reasoning.is_empty() {
+                    // Append to any existing reasoning_delta (unlikely but safe).
+                    if chunk.reasoning_delta.is_empty() {
+                        chunk.reasoning_delta = scan.reasoning;
+                    } else {
+                        chunk.reasoning_delta.push_str(&scan.reasoning);
+                    }
+                }
+            }
+            // On stream end, flush the scanner buffer.
+            if chunk.done {
+                let flush = scanner.flush();
+                if !flush.content.is_empty() {
+                    chunk.delta.push_str(&flush.content);
+                }
+                if !flush.reasoning.is_empty() {
+                    chunk.reasoning_delta.push_str(&flush.reasoning);
+                }
+            }
+            Ok(chunk)
+        });
+
+        Ok(stream.boxed())
     }
 
     /// `GET {base_url}/models` -> `{ "data": [ { "id": ... } ] }`.
@@ -1139,6 +1176,7 @@ mod tests {
         let dialect = WireDialect {
             reasoning: ReasoningWire::ReasoningContent,
             tool_call_content: ToolCallContent::Omit,
+            think_tags: false,
         };
         let v = message_to_wire(&msg, dialect);
         assert_eq!(v["reasoning_content"], "because A then B");
@@ -1151,6 +1189,7 @@ mod tests {
         let dialect = WireDialect {
             reasoning: ReasoningWire::Reasoning,
             tool_call_content: ToolCallContent::Omit,
+            think_tags: false,
         };
         let v = message_to_wire(&msg, dialect);
         assert_eq!(v["reasoning"], "step");
@@ -1163,6 +1202,7 @@ mod tests {
         let dialect = WireDialect {
             reasoning: ReasoningWire::ReasoningContent,
             tool_call_content: ToolCallContent::Omit,
+            think_tags: false,
         };
         let v = message_to_wire(&msg, dialect);
         assert!(v.get("reasoning_content").is_none());
@@ -1178,6 +1218,7 @@ mod tests {
         let dialect = WireDialect {
             reasoning: ReasoningWire::ReasoningContent,
             tool_call_content: ToolCallContent::Omit,
+            think_tags: false,
         };
         let v = message_to_wire(&msg, dialect);
         assert!(v.get("reasoning_content").is_none());
@@ -1190,6 +1231,7 @@ mod tests {
         let dialect = WireDialect {
             reasoning: ReasoningWire::ReasoningContent,
             tool_call_content: ToolCallContent::EmptyString,
+            think_tags: false,
         };
         let v = message_to_wire(&msg, dialect);
         // GLM/MiniMax reject content: null with HTTP 400 code 20015; empty string is accepted.
@@ -1205,6 +1247,7 @@ mod tests {
         let dialect = WireDialect {
             reasoning: ReasoningWire::ReasoningContent,
             tool_call_content: ToolCallContent::EmptyString,
+            think_tags: false,
         };
         let v = message_to_wire(&msg, dialect);
         assert_eq!(v["content"], "let me search");
