@@ -17,6 +17,7 @@ mod scheduled;
 mod search;
 mod session;
 mod skill;
+mod spawn_env;
 
 pub use export::Format;
 pub use goal::{
@@ -46,3 +47,4 @@ pub use scheduled::{
 pub use search::{SearchBackend, SearchConfig};
 pub use session::{auto_title, Session, SessionStatus, SessionWorkspace};
 pub use skill::{Phenotype, Skill, SkillInfo, SkillManifest};
+pub use spawn_env::{augment_path, augmented_path, extra_path_dirs};

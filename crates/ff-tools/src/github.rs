@@ -100,6 +100,7 @@ fn gh_cmd(root: &Path) -> Command {
         cmd.env("GH_TOKEN", token);
     }
     cmd.current_dir(root)
+        .env("PATH", ff_core::augmented_path())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     cmd
@@ -314,6 +315,7 @@ async fn push(args: &Value, root: &Path) -> ToolOutcome {
         cmd.env("GH_TOKEN", token);
     }
     cmd.current_dir(root)
+        .env("PATH", ff_core::augmented_path())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
