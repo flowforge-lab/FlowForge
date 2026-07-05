@@ -28,6 +28,7 @@ function render(props: Partial<Parameters<typeof SessionItem>[0]> = {}) {
       index={0}
       active={false}
       streaming={false}
+      finished={false}
       pinned={false}
       dismissed={false}
       {...props}
@@ -63,6 +64,27 @@ describe("SessionItem", () => {
     expect(render({ selectMode: true, selected: false })).not.toContain(
       "checked",
     );
+  });
+
+  // Activity indicators (#703): streaming spinner > done checkmark > idle.
+  it("shows a spinner while streaming, not the pulsing dot", () => {
+    const html = render({ streaming: true });
+    expect(html).toContain("animate-spin");
+    expect(html).not.toContain("animate-pulse");
+    expect(html).not.toContain('aria-label="Finished"');
+  });
+
+  it("shows the done checkmark when finished (and only then)", () => {
+    expect(render({ finished: false })).not.toContain('aria-label="Finished"');
+    const html = render({ finished: true });
+    expect(html).toContain('aria-label="Finished"');
+    expect(html).toContain("ff-fade-in");
+  });
+
+  it("prioritizes the streaming spinner over the done checkmark", () => {
+    const html = render({ streaming: true, finished: true });
+    expect(html).toContain("animate-spin");
+    expect(html).not.toContain('aria-label="Finished"');
   });
 });
 

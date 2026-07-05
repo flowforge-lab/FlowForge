@@ -7,6 +7,7 @@ import { CommandPalette } from "@/components/palette";
 import { ShortcutsOverlay } from "@/components/shortcuts-overlay";
 import { SettingsPanel } from "@/components/settings-panel";
 import { PhenoMcpToast } from "@/components/pheno-mcp-toast";
+import { SessionDoneToast } from "@/components/session-done-toast";
 import { UpdateBar } from "@/components/update-bar";
 import { useChatStore } from "@/store/chat";
 import { usePrefsStore } from "@/store/prefs";
@@ -212,6 +213,7 @@ export function AppShell() {
       <ShortcutsOverlay />
       <SettingsPanel />
       <PhenoMcpToast />
+      <SessionDoneToast />
     </div>
   );
 }

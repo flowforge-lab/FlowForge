@@ -257,6 +257,29 @@ body {
   }
 }
 
+/* Soft fade-in for the sidebar "done" checkmark (#703) so it appears gently
+   rather than popping when a background session finishes. */
+@keyframes ff-fade-in {
+  0% {
+    opacity: 0;
+    transform: scale(0.8);
+  }
+  100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+.ff-fade-in {
+  animation: ff-fade-in 0.2s ease-out 1;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ff-fade-in {
+    animation: none;
+  }
+}
+
 /* --- Assistant Markdown prose (components/markdown.tsx) --- */
 
 .ff-prose {
