@@ -137,9 +137,13 @@ function MessageRowImpl({
   // The live timer / answer preview / export belong to the LAST steps group — it's
   // the one that precedes the final answer.
   const segments = segmentTurn(items);
+  let firstStepsIdx = -1;
   let lastStepsIdx = -1;
   segments.forEach((seg, i) => {
-    if (seg.kind === "steps") lastStepsIdx = i;
+    if (seg.kind === "steps") {
+      if (firstStepsIdx === -1) firstStepsIdx = i;
+      lastStepsIdx = i;
+    }
   });
 
   return (
@@ -203,7 +207,7 @@ function MessageRowImpl({
                       : undefined
                   }
                   onExportTimeline={
-                    i === lastStepsIdx && exportEnabled
+                    i === firstStepsIdx && exportEnabled
                       ? (format) =>
                           void downloadStepTimeline(
                             items,
