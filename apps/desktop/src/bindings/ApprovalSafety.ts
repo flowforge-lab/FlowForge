@@ -5,4 +5,4 @@
  * reach approval, so this enum carries only the two gated levels — it is the typed
  * contract for [`ToolApprovalRequestEvent::safety`].
  */
-export type ApprovalSafety = "write" | "dangerous";
+export type ApprovalSafety = "write" | "sensitive" | "dangerous";

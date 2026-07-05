@@ -11,6 +11,7 @@ mod memory;
 mod message;
 mod mode;
 mod model_specs;
+pub mod permission;
 mod provider;
 mod scheduled;
 mod search;
@@ -32,6 +33,7 @@ pub use model_specs::{
     bundled_rules, context_window_in, parse_specs, supports_vision_in, ModelSpec, ModelSpecs,
     DEFAULT_CONTEXT_WINDOW_TOKENS,
 };
+pub use permission::{PermissionCell, PermissionMatrix, Safety};
 pub use provider::{
     model_supports_documents, model_supports_vision, BedrockAuth, ConnectionId,
     ContextWindowSource, ModelSelection, ProviderConfig, ProviderConnection, ProviderKind,
