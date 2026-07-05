@@ -67,8 +67,17 @@ pub struct IterationOutcome {
     pub wall_ms: i64,
     /// The agent signalled the objective is met this turn (`goal_complete`).
     pub goal_complete: bool,
-    /// The turn failed unrecoverably (provider error, cancel); ends the loop.
+    /// The user interrupted the turn (Stop button). The loop halts and leaves the
+    /// goal **`Paused`** — resumable from the last checkpoint — not `Failed`.
+    /// Takes precedence over `failed` (a cancel often also surfaces as an error).
+    pub cancelled: bool,
+    /// The turn failed unrecoverably (provider error). Ends the loop as `Failed`.
     pub failed: bool,
+    /// The iteration consumed the goal's `pending_steer` (a mid-loop user
+    /// message). The loop clears `pending_steer` on the in-memory goal before it
+    /// checkpoints, so the steer is applied exactly once and not re-persisted on
+    /// the next boundary (#753 review nit 1).
+    pub steer_consumed: bool,
 }
 
 /// One iteration of the goal loop, abstracted so the loop mechanics are testable
@@ -108,7 +117,9 @@ pub trait GoalIteration: Send + Sync {
 /// 4. `run_once()` — one turn; a panic is caught and treated as `Failed` so a
 ///    single bad turn can never unwind the whole loop.
 /// 5. `checkpoint()` — accrue spend, bump the iteration count, persist.
-/// 6. If the turn signalled completion, mark `Completed` and stop; else loop.
+/// 6. Terminal precedence: `goal_complete` → `Completed` (wins even over a
+///    same-iteration budget overrun); else a user cancel → `Paused` (resumable);
+///    else an unrecoverable error → `Failed`; else loop.
 pub async fn drive_goal<I: GoalIteration>(goal: &mut Goal, iter: &I) -> LoopStop {
     loop {
         // (1) Only an Active goal continues; map the current terminal state.
@@ -157,24 +168,40 @@ pub async fn drive_goal<I: GoalIteration>(goal: &mut Goal, iter: &I) -> LoopStop
             },
         };
 
-        // (5) Close the boundary: accrue spend + bump the iteration, then persist.
-        goal.checkpoint(outcome.tokens, outcome.wall_ms, iter.now_ms());
-
-        if outcome.failed {
-            goal.status = GoalStatus::Failed;
-            goal.updated_ms = iter.now_ms();
-            iter.save(goal);
-            return LoopStop::Failed;
+        // Clear a consumed steer on the in-memory goal BEFORE checkpointing, so
+        // it is applied exactly once and the next boundary's save does not
+        // re-persist a stale `pending_steer` (#753 review nit 1).
+        if outcome.steer_consumed {
+            goal.pending_steer = None;
         }
 
-        // (6) Completion wins over a same-iteration budget overrun: if the agent
-        // met the objective this turn, honor it even if the checkpoint tipped a
-        // budget dimension over.
+        // (5) Close the boundary: accrue spend + bump the iteration, then persist.
+        // Even a cancelled turn spent (billed) tokens, so accruing them is honest;
+        // the iteration count is conservative (counts the interrupted attempt).
+        goal.checkpoint(outcome.tokens, outcome.wall_ms, iter.now_ms());
+
+        // (6) Terminal precedence: a genuine completion wins (even over a
+        // same-iteration budget overrun); otherwise a user cancel PAUSES the goal
+        // resumably (RFC 0020 §5.3 — resume replays from this last checkpoint),
+        // and only an unrecoverable error FAILS it. Cancel takes precedence over
+        // `failed` because an interrupted turn often also surfaces as an error.
         if outcome.goal_complete {
             goal.status = GoalStatus::Completed;
             goal.updated_ms = iter.now_ms();
             iter.save(goal);
             return LoopStop::Completed;
+        }
+        if outcome.cancelled {
+            goal.status = GoalStatus::Paused;
+            goal.updated_ms = iter.now_ms();
+            iter.save(goal);
+            return LoopStop::Paused;
+        }
+        if outcome.failed {
+            goal.status = GoalStatus::Failed;
+            goal.updated_ms = iter.now_ms();
+            iter.save(goal);
+            return LoopStop::Failed;
         }
 
         // Persist the mid-loop checkpoint before deciding to continue, so an
@@ -212,6 +239,8 @@ mod tests {
         gate: GateDecision,
         panic_on: Option<u32>,
         fail_on: Option<u32>,
+        cancel_on: Option<u32>,
+        steer_on: Option<u32>,
         calls: AtomicU32,
         now: AtomicU32,
         saves: Mutex<Vec<(GoalStatus, u32)>>,
@@ -224,6 +253,8 @@ mod tests {
                 gate: GateDecision::Proceed,
                 panic_on: None,
                 fail_on: None,
+                cancel_on: None,
+                steer_on: None,
                 calls: AtomicU32::new(0),
                 now: AtomicU32::new(0),
                 saves: Mutex::new(Vec::new()),
@@ -247,7 +278,9 @@ mod tests {
                 tokens: self.tokens_per_turn,
                 wall_ms: 10,
                 goal_complete: n >= self.complete_on,
+                cancelled: self.cancel_on == Some(n),
                 failed: self.fail_on == Some(n),
+                steer_consumed: self.steer_on == Some(n),
             }
         }
         fn save(&self, goal: &Goal) {
@@ -359,6 +392,73 @@ mod tests {
 
         assert_eq!(stop, LoopStop::Failed);
         assert_eq!(g.iteration, 2, "failed on the second turn");
+    }
+
+    #[tokio::test]
+    async fn user_cancel_pauses_the_goal_resumably() {
+        // A Stop-button cancel mid-turn must leave the goal Paused (resumable
+        // from the last checkpoint), NOT Failed (#753 review blocker 1).
+        let mut g = active_goal(25);
+        let mut iter = StubIter::completing(10, 100);
+        iter.cancel_on = Some(2);
+
+        let stop = drive_goal(&mut g, &iter).await;
+
+        assert_eq!(stop, LoopStop::Paused);
+        assert_eq!(g.status, GoalStatus::Paused);
+        assert_eq!(g.iteration, 2, "the interrupted turn is checkpointed");
+        // Resumable: a subsequent drive continues from here (completes at turn 10,
+        // i.e. 8 more turns) rather than being stuck Failed.
+        g.status = GoalStatus::Active;
+        let iter2 = StubIter::completing(1, 100); // completes immediately on resume
+        assert_eq!(drive_goal(&mut g, &iter2).await, LoopStop::Completed);
+    }
+
+    #[tokio::test]
+    async fn cancel_takes_precedence_over_failed() {
+        // An interrupted turn often also surfaces as an error; cancel wins so the
+        // goal stays resumable.
+        let mut g = active_goal(25);
+        let mut iter = StubIter::completing(10, 100);
+        iter.cancel_on = Some(1);
+        iter.fail_on = Some(1);
+
+        let stop = drive_goal(&mut g, &iter).await;
+
+        assert_eq!(stop, LoopStop::Paused);
+        assert_eq!(g.status, GoalStatus::Paused);
+    }
+
+    #[tokio::test]
+    async fn consumed_steer_is_cleared_on_the_goal() {
+        // A steer consumed on iteration 1 must be cleared on the in-memory goal
+        // before checkpoint, so it is applied once and not re-persisted (#753 nit
+        // 1). Goal completes on turn 2 so we can observe the post-turn-1 state via
+        // the persisted checkpoints.
+        let mut g = active_goal(25);
+        g.pending_steer = Some("focus on the API layer".to_string());
+        let mut iter = StubIter::completing(2, 100);
+        iter.steer_on = Some(1);
+
+        let stop = drive_goal(&mut g, &iter).await;
+
+        assert_eq!(stop, LoopStop::Completed);
+        assert!(
+            g.pending_steer.is_none(),
+            "consumed steer must be cleared, not left to re-apply"
+        );
+    }
+
+    #[tokio::test]
+    async fn unconsumed_steer_is_preserved() {
+        // If a turn does not consume the steer, it stays for a later iteration.
+        let mut g = active_goal(25);
+        g.pending_steer = Some("later".to_string());
+        let iter = StubIter::completing(1, 100); // steer_on = None
+
+        drive_goal(&mut g, &iter).await;
+
+        assert_eq!(g.pending_steer.as_deref(), Some("later"));
     }
 
     #[tokio::test]

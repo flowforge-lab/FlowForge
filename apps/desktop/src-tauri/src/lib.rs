@@ -439,7 +439,7 @@ fn set_scheduled_paused_all(
 /// loop (RFC 0020 §5.1). An empty objective is rejected. A pre-existing goal for
 /// the session is overwritten — starting a new objective is a deliberate reset.
 #[tauri::command]
-fn goal_set(
+async fn goal_set(
     state: State<'_, Arc<AppState>>,
     app: tauri::AppHandle,
     session_id: String,
@@ -452,6 +452,12 @@ fn goal_set(
     if objective.is_empty() {
         return Err("goal objective must not be empty".into());
     }
+    // Re-setting a goal is a deliberate reset, but a loop may still be driving the
+    // OLD goal on an in-memory copy (#753 review blocker 2). Stop it first — cancel
+    // the in-flight turn and wait (bounded) for the loop to release its slot — so
+    // its final checkpoint can't clobber the fresh goal we're about to write.
+    stop_goal_loop(state.inner(), &session_id).await;
+
     let mut goal = Goal::new(&session_id, objective, now_ms());
     if let Some(m) = max_iterations {
         goal.budget.max_iterations = m;
@@ -486,11 +492,17 @@ fn goal_status(
 /// observes the persisted `Paused` status at its next boundary check and stops
 /// resumably; this command also flips it eagerly so the FE reflects intent now.
 #[tauri::command]
-fn goal_pause(
+async fn goal_pause(
     state: State<'_, Arc<AppState>>,
     app: tauri::AppHandle,
     session_id: String,
 ) -> Result<Option<Goal>, String> {
+    // Stop the loop first (cancel the in-flight turn + wait for it to exit).
+    // The loop owns the goal in memory and never re-reads it, so writing Paused
+    // here while it runs would be clobbered by its next checkpoint save. A
+    // cancelled turn already transitions the goal to Paused (resumable) via
+    // drive_goal; we then ensure Paused for the no-loop-running case.
+    stop_goal_loop(state.inner(), &session_id).await;
     let Some(mut goal) = state
         .goals
         .load(&session_id)
@@ -540,21 +552,54 @@ fn goal_resume(
     Ok(Some(goal))
 }
 
-/// Delete the goal for a session entirely (RFC 0020 §7 — dismiss/clear). Removes
-/// the checkpoint file; a running loop stops at its next boundary when it finds
-/// no `Active` goal to load. Idempotent — clearing a nonexistent goal is fine.
+/// Delete the goal for a session entirely (RFC 0020 §7 — dismiss/clear). Stops
+/// any running loop first (so its next checkpoint can't recreate the file we're
+/// deleting), then removes the checkpoint file. Idempotent — clearing a
+/// nonexistent goal is fine.
 #[tauri::command]
-fn goal_clear(
+async fn goal_clear(
     state: State<'_, Arc<AppState>>,
     app: tauri::AppHandle,
     session_id: String,
 ) -> Result<(), String> {
+    stop_goal_loop(state.inner(), &session_id).await;
     state
         .goals
         .delete(&session_id)
         .map_err(|e| format!("failed to clear goal: {e}"))?;
     let _ = app.emit("goal:cleared", &session_id);
     Ok(())
+}
+
+/// Mark a session's goal complete from the FE (RFC 0020 §7 — dual-surface: this
+/// is the IPC half of the `goal_complete` capability the agent tool also
+/// exposes). Stops any running loop first, then transitions the goal to
+/// `Completed` and persists. Returns `None` if there is no goal. Idempotent on a
+/// terminal goal (returns it unchanged).
+#[tauri::command]
+async fn goal_complete(
+    state: State<'_, Arc<AppState>>,
+    app: tauri::AppHandle,
+    session_id: String,
+) -> Result<Option<Goal>, String> {
+    stop_goal_loop(state.inner(), &session_id).await;
+    let Some(mut goal) = state
+        .goals
+        .load(&session_id)
+        .map_err(|e| format!("failed to read goal: {e}"))?
+    else {
+        return Ok(None);
+    };
+    if !matches!(goal.status, GoalStatus::Completed) {
+        goal.status = GoalStatus::Completed;
+        goal.updated_ms = now_ms();
+        state
+            .goals
+            .save(&goal)
+            .map_err(|e| format!("failed to persist goal: {e}"))?;
+        let _ = app.emit("goal:updated", &goal);
+    }
+    Ok(Some(goal))
 }
 
 /// Fire a scheduled task immediately, off-schedule (RFC 0017 §8.3). Runs the
@@ -1344,13 +1389,15 @@ impl GoalIteration for GoalLoopIteration {
         // while the goal ran) takes priority; otherwise a neutral "continue"
         // nudge carrying the objective. The system-prompt goal block (#718) will
         // later carry the objective; until then we inline it in the user turn.
-        // The steer is one-shot: clear it after seeding so it is not re-applied
-        // on the next iteration (RFC 0020 §5 — a steer folds into one turn).
+        // The steer is one-shot: the loop clears `pending_steer` on the in-memory
+        // goal (via `steer_consumed`) before it checkpoints, so it is applied once
+        // and not re-persisted next boundary (#753 review nit 1).
         let steer = goal
             .pending_steer
             .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty());
+        let steer_consumed = steer.is_some();
         let prompt = match steer {
             Some(s) => s.to_string(),
             None => format!(
@@ -1360,13 +1407,6 @@ impl GoalIteration for GoalLoopIteration {
                 goal.objective
             ),
         };
-        if steer.is_some() {
-            if let Ok(Some(mut g)) = self.state.goals.load(&self.session_id) {
-                g.pending_steer = None;
-                g.updated_ms = now_ms();
-                let _ = self.state.goals.save(&g);
-            }
-        }
         self.state
             .store
             .add_message(&self.session_id, Role::User, prompt.clone());
@@ -1480,24 +1520,29 @@ impl GoalIteration for GoalLoopIteration {
             },
         );
         let result = tokio::time::timeout(GOAL_ITERATION_TIMEOUT, turn).await;
-        self.state.take_cancel(&sid);
+        self.state.take_cancel_if(&sid, &cancel);
 
-        let failed = match result {
+        // Distinguish a user Stop (cancel) — the goal should PAUSE resumably — from
+        // an unrecoverable failure (timeout / provider error) — which FAILS it.
+        // A timeout is not a user cancel: the user didn't stop it, so it fails.
+        let user_cancelled = cancel_probe.is_cancelled();
+        let (cancelled, failed) = match result {
+            _ if user_cancelled => (true, false),
             Err(_elapsed) => {
                 cancel.cancel();
-                true
+                (false, true)
             }
-            Ok(Err(_)) => true,
-            // A user cancel mid-turn ends the iteration without marking a hard
-            // failure; the loop's status check will keep the goal resumable.
-            Ok(Ok(_)) => cancel_probe.is_cancelled(),
+            Ok(Err(_)) => (false, true),
+            Ok(Ok(_)) => (false, false),
         };
 
         IterationOutcome {
             tokens: tokens.load(std::sync::atomic::Ordering::SeqCst),
             wall_ms: turn_start.elapsed().as_millis() as i64,
             goal_complete: completed.load(std::sync::atomic::Ordering::SeqCst),
+            cancelled,
             failed,
+            steer_consumed,
         }
     }
 
@@ -1513,14 +1558,58 @@ impl GoalIteration for GoalLoopIteration {
     }
 }
 
+/// Stop a running goal loop for a session and wait (bounded) for it to fully
+/// exit before returning (#753 review blocker 2). Cancels the in-flight turn so
+/// `drive_goal` breaks at its next boundary, then polls the single-flight slot
+/// until it clears (or a short timeout). Callers that overwrite goal state
+/// (`goal_set`) must await this first so the old loop's final checkpoint can't
+/// race the new goal. Safe to call when no loop is running (returns promptly).
+async fn stop_goal_loop(state: &Arc<AppState>, session_id: &str) {
+    if !state.goal_loop_running(session_id) {
+        return;
+    }
+    if let Some(token) = state.take_cancel(session_id) {
+        token.cancel();
+    }
+    state.cancel_pending_approvals(session_id);
+    // Bounded wait: the loop clears its slot on the next boundary after the
+    // cancelled turn returns. Cap so a wedged provider can't hang goal_set.
+    for _ in 0..600 {
+        if !state.goal_loop_running(session_id) {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    tracing::warn!(session = %session_id, "goal loop did not stop within timeout; proceeding");
+}
+
 /// Spawn the self-continue loop for a session's active goal (RFC 0020 §5). Loads
-/// the goal, folds any `pending_steer` into the first iteration, and drives
-/// [`drive_goal`] to a terminal state on a background task. Idempotent-ish: if a
-/// loop is already running for the session the new one is a near no-op (the
-/// first budget/status check ends it), but callers (`goal_set`/`goal_resume`)
-/// only spawn after transitioning the goal to `Active`.
+/// the goal and drives [`drive_goal`] to a terminal state on a background task.
+/// Single-flight (#753 review): claims the session's goal-loop slot first and
+/// refuses to spawn if a loop is already running, so `goal_set` / `goal_resume`
+/// can never stack two loops racing the same transcript. The slot is released on
+/// any terminal stop (including an early return / panic) via a drop guard.
 fn spawn_goal_loop(state: Arc<AppState>, app: tauri::AppHandle, session_id: String) {
+    if !state.try_start_goal_loop(&session_id) {
+        tracing::debug!(session = %session_id, "goal loop already running; not spawning another");
+        return;
+    }
     tauri::async_runtime::spawn(async move {
+        // Release the single-flight slot no matter how the task exits.
+        struct LoopGuard {
+            state: Arc<AppState>,
+            session_id: String,
+        }
+        impl Drop for LoopGuard {
+            fn drop(&mut self) {
+                self.state.end_goal_loop(&self.session_id);
+            }
+        }
+        let _guard = LoopGuard {
+            state: state.clone(),
+            session_id: session_id.clone(),
+        };
+
         let mut goal = match state.goals.load(&session_id) {
             Ok(Some(g)) => g,
             Ok(None) => return,
@@ -3079,6 +3168,7 @@ pub fn run() {
             goal_pause,
             goal_resume,
             goal_clear,
+            goal_complete,
             preview_cadence,
             get_session_workspace,
             set_session_workspace,

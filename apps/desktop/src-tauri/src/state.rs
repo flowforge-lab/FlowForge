@@ -1044,6 +1044,11 @@ pub struct AppState {
     /// Turn cancellation tokens + pending approvals under one lock (see
     /// [`ApprovalRegistry`]).
     approvals: Mutex<ApprovalRegistry>,
+    /// Session ids with a goal self-continue loop currently running (#716). A
+    /// single-flight guard: `try_start_goal_loop` refuses to spawn a second loop
+    /// for a session, so `goal_set`/`goal_resume` cannot stack overlapping loops
+    /// that would race on the transcript and double-checkpoint.
+    goal_loops: Mutex<HashSet<String>>,
     /// Globally active skills, whose bodies are injected into the system prompt
     /// (RFC 0001 §4). A `BTreeSet` keeps the set deduplicated and name-sorted.
     /// Replaced wholesale by `switch_phenotype`; tweaked individually by
@@ -1201,6 +1206,7 @@ impl AppState {
                 }
                 reg
             }),
+            goal_loops: Mutex::new(HashSet::new()),
             active_skills: Mutex::new(BTreeSet::new()),
             active_phenotype: Mutex::new(default_phenotype()),
             default_mode: Mutex::new(load_default_mode()),
@@ -2056,6 +2062,27 @@ impl AppState {
 
         resolved.retain(|s| !s.disabled);
         resolved
+    }
+
+    /// Try to claim the goal-loop slot for a session (#716). Returns `true` if
+    /// this caller acquired it (no loop was running), `false` if a loop is
+    /// already active — the caller must NOT spawn a second one. Single-flight so
+    /// overlapping loops can't race the transcript or double-checkpoint.
+    pub fn try_start_goal_loop(&self, session_id: &str) -> bool {
+        self.goal_loops
+            .lock()
+            .unwrap()
+            .insert(session_id.to_string())
+    }
+
+    /// Release the goal-loop slot when a loop finishes (any terminal stop).
+    pub fn end_goal_loop(&self, session_id: &str) {
+        self.goal_loops.lock().unwrap().remove(session_id);
+    }
+
+    /// Whether a goal loop is currently running for the session.
+    pub fn goal_loop_running(&self, session_id: &str) -> bool {
+        self.goal_loops.lock().unwrap().contains(session_id)
     }
 
     pub fn register_cancel(&self, session_id: &str, token: CancelToken) {
