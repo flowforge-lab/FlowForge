@@ -336,6 +336,8 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use ff_llm::{Chunk, ChunkStream, LlmError, ToolCallDelta};
+    use ff_memory::{FlushLedger, Fts5Index, Memory, MemoryConfig, MemoryIndex};
+    use ff_tools::memory::MemoryWriteTool;
     use ff_tools::{Safety, Tool};
     use std::path::Path;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -597,5 +599,259 @@ mod tests {
         assert!(!flush_due(over, 40, Some(30), 0.75, 40));
         // Over threshold, grew a full interval since the last flush: due again.
         assert!(flush_due(over, 70, Some(30), 0.75, 40));
+    }
+
+    // -----------------------------------------------------------------------
+    // End-to-end flush path (M5.2 pre-compaction memory-flush, #165).
+    //
+    // The component tests above prove the flush's tool-loop mechanics with a mock
+    // RecordingTool and a mock Provider. These tests drive the *real* path
+    // end-to-end: a real `MemoryWriteTool` against a temp-dir `Memory` and a real
+    // FTS5 index, so a durable fact is asserted on disk in the real
+    // `daily/YYYY-MM-DD.md` file — not just at the tool-call seam. They also cover
+    // the NO_REPLY path (no provider write -> no file mutation) and the
+    // once-per-cycle ledger gate (a second call in the same cycle does not
+    // re-flush), locking the compaction boundary against regressions.
+    // -----------------------------------------------------------------------
+
+    /// A real on-disk `Memory` (temp dir) backed by an in-memory FTS5 index — the
+    /// real pair production wires through `MemoryWriteTool`.
+    fn real_memory(dir: &Path) -> (Arc<Memory>, Arc<dyn MemoryIndex>) {
+        let memory = Arc::new(Memory::new(dir.to_path_buf(), MemoryConfig::default()));
+        let index: Arc<dyn MemoryIndex> = Arc::new(Fts5Index::open_in_memory().unwrap());
+        (memory, index)
+    }
+
+    /// Register only the real `MemoryWriteTool`, so the flush advertises exactly
+    // the memory tools (matching production, where the flush filters to
+    // `memory_*`).
+    fn real_memory_registry(memory: Arc<Memory>, index: Arc<dyn MemoryIndex>) -> ToolRegistry {
+        let mut reg = ToolRegistry::new();
+        reg.register(Box::new(MemoryWriteTool::new(memory, index)));
+        reg
+    }
+
+    #[tokio::test]
+    async fn e2e_flush_writes_durable_fact_to_real_daily_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let (memory, index) = real_memory(dir.path());
+        let registry = real_memory_registry(memory.clone(), index);
+        let (store, sid) = store_with_history();
+        let provider = WriteThenText {
+            calls: AtomicUsize::new(0),
+        };
+
+        let outcome = MemoryFlush
+            .compact(CompactionContext {
+                provider: &provider,
+                store: &store,
+                registry: &registry,
+                root: dir.path(),
+                session_id: &sid,
+                model: "mock",
+                cancel: CancelToken::new(),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, CompactionOutcome::Wrote { writes: 1 });
+
+        // The durable fact landed in the real on-disk daily log
+        // (`<root>/daily/YYYY-MM-DD.md`), written by the real MemoryWriteTool.
+        let today = chrono::Local::now().date_naive();
+        let daily = memory.daily_path(today);
+        let on_disk = std::fs::read_to_string(&daily).unwrap_or_else(|_| {
+            panic!(
+                "expected daily log at {} after a writing flush",
+                daily.display()
+            )
+        });
+        assert!(
+            on_disk.contains("user prefers dark mode"),
+            "durable fact missing from {}: {on_disk}",
+            daily.display()
+        );
+
+        // The flush is transcript-silent: the visible history is untouched.
+        assert_eq!(store.get_messages(&sid).len(), 2);
+    }
+
+    #[tokio::test]
+    async fn e2e_flush_no_reply_leaves_no_file_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let (memory, index) = real_memory(dir.path());
+        let registry = real_memory_registry(memory.clone(), index);
+        let (store, sid) = store_with_history();
+        let provider = NoReplyProvider;
+
+        // Snapshot the temp dir's file tree before the flush so the assertion is
+        // independent of any pre-existing scaffolding.
+        let before: std::collections::HashSet<_> = std::fs::read_dir(dir.path())
+            .into_iter()
+            .flatten()
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            .collect();
+
+        let outcome = MemoryFlush
+            .compact(CompactionContext {
+                provider: &provider,
+                store: &store,
+                registry: &registry,
+                root: dir.path(),
+                session_id: &sid,
+                model: "mock",
+                cancel: CancelToken::new(),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, CompactionOutcome::NoReply);
+
+        // No provider write -> no daily log file and no `daily/` directory
+        // created (Memory::write creates the parent dir only when it writes).
+        let today = chrono::Local::now().date_naive();
+        assert!(
+            !memory.daily_path(today).exists(),
+            "NO_REPLY flush must not create a daily log file"
+        );
+        assert!(
+            !memory.root().join("daily").exists(),
+            "NO_REPLY flush must not create the daily/ directory at all"
+        );
+        assert!(
+            !memory.curated_path().exists(),
+            "NO_REPLY flush must not touch curated memory"
+        );
+
+        // The temp dir's file tree is unchanged: zero file mutation.
+        let after: std::collections::HashSet<_> = std::fs::read_dir(dir.path())
+            .into_iter()
+            .flatten()
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            .collect();
+        assert_eq!(
+            before, after,
+            "NO_REPLY flush must not mutate the filesystem"
+        );
+
+        assert_eq!(store.get_messages(&sid).len(), 2);
+    }
+
+    #[tokio::test]
+    async fn e2e_ledger_gate_flushes_once_per_cycle() {
+        // Faithful replication of the host seam (`FlowForgeState::maybe_flush_memory`):
+        // a real `ProxyTokenEstimator` + real on-disk `FlushLedger` gate a real
+        // `MemoryFlush.compact()` driving the real `MemoryWriteTool`. The first
+        // over-budget call flushes and records the cycle marker; a second call in
+        // the same cycle (transcript unchanged) is blocked by `flush_due` and does
+        // not re-flush.
+        let dir = tempfile::tempdir().unwrap();
+        let (memory, index) = real_memory(dir.path());
+        let registry = real_memory_registry(memory.clone(), index);
+        let (store, sid) = store_with_history();
+        let provider = WriteThenText {
+            calls: AtomicUsize::new(0),
+        };
+
+        // A small budget so the short 2-message history is genuinely over budget,
+        // exercising the same `ProxyTokenEstimator` the host seam uses (the host
+        // owns the real value; the estimator type is the production type).
+        let estimator = ProxyTokenEstimator { budget_tokens: 4 };
+        let ledger = FlushLedger::open(dir.path().join("flush.db")).unwrap();
+        let cancel = CancelToken::new();
+        let model = "mock";
+        // Mirrors `REFLUSH_INTERVAL_MESSAGES` in the desktop host seam.
+        const REFLUSH_INTERVAL: u64 = 40;
+
+        // --- First call: over budget, never flushed -> the gate fires. ---
+        let history = store.get_messages(&sid);
+        let pressure = estimator.assess(&history, model);
+        let message_count = history.len() as u64;
+        let last = ledger.last_flush(&sid).unwrap().map(|r| r.message_count);
+        assert!(
+            flush_due(
+                pressure,
+                message_count,
+                last,
+                DEFAULT_FLUSH_AT_FRACTION,
+                REFLUSH_INTERVAL
+            ),
+            "first over-budget call must be due"
+        );
+
+        let outcome = MemoryFlush
+            .compact(CompactionContext {
+                provider: &provider,
+                store: &store,
+                registry: &registry,
+                root: dir.path(),
+                session_id: &sid,
+                model,
+                cancel: cancel.clone(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(outcome, CompactionOutcome::Wrote { writes: 1 });
+        // The host seam records the cycle marker after a successful flush.
+        ledger
+            .record_flush(&sid, message_count, chrono::Utc::now().timestamp_millis())
+            .unwrap();
+        let calls_after_first = provider.calls.load(Ordering::SeqCst);
+        assert!(
+            calls_after_first > 0,
+            "expected the provider to be driven by the first flush"
+        );
+
+        // --- Second call: same cycle (transcript unchanged) -> gate blocks. ---
+        let history = store.get_messages(&sid);
+        let pressure = estimator.assess(&history, model);
+        let message_count = history.len() as u64;
+        let last = ledger.last_flush(&sid).unwrap().map(|r| r.message_count);
+        assert!(
+            !flush_due(
+                pressure,
+                message_count,
+                last,
+                DEFAULT_FLUSH_AT_FRACTION,
+                REFLUSH_INTERVAL
+            ),
+            "a second call in the same cycle must not be due"
+        );
+        // The host seam returns here without invoking `compact()`. Assert the
+        // provider saw no additional calls (i.e. `compact()` was not re-run).
+        assert_eq!(
+            provider.calls.load(Ordering::SeqCst),
+            calls_after_first,
+            "compact() must not be re-invoked within the same cycle"
+        );
+
+        // The ledger records exactly one flush for this session, at this cycle
+        // marker — the durable bookkeeping that survives to block the next call.
+        let rec = ledger.last_flush(&sid).unwrap().unwrap();
+        assert_eq!(rec.message_count, message_count);
+
+        // And exactly one durable fact landed on disk (no duplicate write).
+        let today = chrono::Local::now().date_naive();
+        let on_disk = std::fs::read_to_string(memory.daily_path(today)).unwrap_or_default();
+        assert_eq!(
+            on_disk.matches("user prefers dark mode").count(),
+            1,
+            "expected exactly one durable fact on disk, got: {on_disk}"
+        );
+
+        // Growing past the reflush interval re-arms the gate (the cycle advances).
+        let grown = message_count + REFLUSH_INTERVAL;
+        assert!(
+            flush_due(
+                pressure,
+                grown,
+                Some(message_count),
+                DEFAULT_FLUSH_AT_FRACTION,
+                REFLUSH_INTERVAL
+            ),
+            "a full interval of growth must re-arm the gate for the next cycle"
+        );
     }
 }
