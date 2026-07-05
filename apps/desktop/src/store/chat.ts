@@ -6,6 +6,7 @@ import { create } from "zustand";
 import { ipc } from "@/lib/ipc";
 import { autoTitle } from "@/lib/auto-title";
 import { isResumableStopNotice } from "@/store/capped-turn";
+import { useSessionDoneToastStore } from "@/store/session-done-toast";
 import type {
   Attachment,
   ApprovalSafety,
@@ -98,6 +99,12 @@ interface ChatState {
    *  streamed no content and the refetched final message is a resumable stop notice;
    *  cleared the moment the next turn starts (send / edit / cancel). */
   resumableBySession: Record<string, boolean>;
+  /** sessionId -> wall-clock ms a turn finished on a session the user was NOT
+   *  viewing (#703). Drives the transient "done" checkmark on the sidebar row.
+   *  Auto-cleared after `FINISHED_TTL_MS`, or the moment the session is focused
+   *  (`clearSessionFinished`). Set only for non-active sessions — the active one
+   *  already shows its result in the transcript, so it gets no checkmark/toast. */
+  recentlyFinishedBySession: Record<string, number>;
   /** FE mirror of the backend's "Allow this session" sets, keyed by sessionId
    *  (#229). Drives the "session" badge on auto-approved follow-up calls; the
    *  backend stays the source of truth for the gate itself. */
@@ -167,6 +174,10 @@ interface ChatState {
    *  title is already persisted server-side — unlike `setSessionTitle`, which is a
    *  user rename that must write back through the backend. */
   patchSessionTitle: (sessionId: string, title: string) => void;
+  /** Clear the transient "done" checkmark for `sessionId` (#703): drops its
+   *  `recentlyFinishedBySession` entry and cancels the pending TTL timer.
+   *  Idempotent. Called on the TTL expiry and when the session is focused. */
+  clearSessionFinished: (sessionId: string) => void;
 
   // Driven by backend events (wired once in lib/events.ts).
   applyToken: (e: TokenEvent) => void;
@@ -284,6 +295,28 @@ const systemMessage = (sessionId: string, content: string): Message => ({
   createdAt: Date.now(),
 });
 
+// How long the transient "done" checkmark lingers on a session row before fading
+// back to idle (#703). Also the auto-clear window for its store entry.
+const FINISHED_TTL_MS = 8000;
+
+// Pending checkmark-clear timers, keyed by sessionId. Kept out of store state
+// (they're not render data) and re-armed on each finish so the newest completion
+// wins. `clearSessionFinished` cancels the timer; module scope survives the
+// store's lifetime (one store per app).
+const finishedTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+function scheduleFinishedClear(sessionId: string) {
+  const existing = finishedTimers.get(sessionId);
+  if (existing) clearTimeout(existing);
+  finishedTimers.set(
+    sessionId,
+    setTimeout(() => {
+      finishedTimers.delete(sessionId);
+      useChatStore.getState().clearSessionFinished(sessionId);
+    }, FINISHED_TTL_MS),
+  );
+}
+
 export const useChatStore = create<ChatState>((set, get) => ({
   sessions: [],
   activeSessionId: null,
@@ -296,6 +329,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   contextTokensBySession: {},
   contextBudgetBySession: {},
   resumableBySession: {},
+  recentlyFinishedBySession: {},
   sessionApprovedBySession: {},
   alwaysApproved: new Set<string>(),
   bootstrapError: null,
@@ -664,6 +698,20 @@ export const useChatStore = create<ChatState>((set, get) => ({
     }));
   },
 
+  clearSessionFinished: (sessionId) => {
+    const timer = finishedTimers.get(sessionId);
+    if (timer) {
+      clearTimeout(timer);
+      finishedTimers.delete(sessionId);
+    }
+    set((s) => {
+      if (!(sessionId in s.recentlyFinishedBySession)) return {};
+      const { [sessionId]: _done, ...recentlyFinishedBySession } =
+        s.recentlyFinishedBySession;
+      return { recentlyFinishedBySession };
+    });
+  },
+
   cancelTurn: async (sessionId) => {
     // Cancellable as soon as the turn is in flight, not only once it streams:
     // the backend registers the cancel token at send_message time, so a turn
@@ -767,11 +815,27 @@ export const useChatStore = create<ChatState>((set, get) => ({
     const budget = (e as TurnDoneEvent & { budgetTokens?: number | null })
       .budgetTokens;
 
+    // Activity signal (#703): flag completion + toast only when the finished
+    // session is NOT the one on screen — the active session already shows its
+    // result in the transcript. Capture before the set (title for the toast).
+    const isBackground = e.sessionId !== get().activeSessionId;
+    const finishedTitle =
+      get().sessions.find((sess) => sess.id === e.sessionId)?.title ||
+      "Session";
+
     set((s) => ({
       ...clearSessionTurnTiming(s, e.sessionId),
       sessions: s.sessions.map((sess) =>
         sess.id === e.sessionId ? { ...sess, updatedAt: Date.now() } : sess,
       ),
+      ...(isBackground
+        ? {
+            recentlyFinishedBySession: {
+              ...s.recentlyFinishedBySession,
+              [e.sessionId]: Date.now(),
+            },
+          }
+        : {}),
       // Record the backend's context-usage estimate so the FE can surface it
       // (#244 R6). Only overwrite when an estimate is present — a Done without
       // a count must not clobber the prior value.
@@ -786,6 +850,13 @@ export const useChatStore = create<ChatState>((set, get) => ({
           ? { ...s.contextBudgetBySession, [e.sessionId]: budget }
           : s.contextBudgetBySession,
     }));
+
+    // Arm the checkmark's fade timer and raise the completion toast (#703). Both
+    // are background-only; the active session gets neither.
+    if (isBackground) {
+      scheduleFinishedClear(e.sessionId);
+      useSessionDoneToastStore.getState().push(e.sessionId, finishedTitle);
+    }
 
     if (!endedEmpty) return;
     // Re-pull authoritative history (the stop reason + notice text live on the

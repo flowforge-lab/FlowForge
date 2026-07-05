@@ -1,6 +1,7 @@
 import type { ComponentType, ReactNode } from "react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
+  Check,
   Download,
   EyeOff,
   Folder,
@@ -20,6 +21,7 @@ import {
   X,
 } from "@/components/ui/icon";
 import { Button } from "@/components/ui/button";
+import { Spinner } from "@/components/ui/spinner";
 import {
   Popover,
   PopoverTrigger,
@@ -35,6 +37,7 @@ import { usePrefsStore, clampSidebarWidth } from "@/store/prefs";
 import { useSettingsStore } from "@/store/settings";
 import { useChatStore } from "@/store/chat";
 import { useSessionPrefsStore } from "@/store/session-prefs";
+import { useSessionDoneToastStore } from "@/store/session-done-toast";
 import { usePanesStore, MAX_PANES } from "@/store/panes";
 import {
   ContextMenu,
@@ -199,6 +202,7 @@ export function SessionItem({
   index,
   active,
   streaming,
+  finished,
   pinned,
   dismissed,
   selectMode = false,
@@ -209,6 +213,9 @@ export function SessionItem({
   index: number;
   active: boolean;
   streaming: boolean;
+  /** A turn just finished on this (background) session (#703): show the transient
+   *  "done" checkmark. Mutually exclusive with `streaming`. */
+  finished: boolean;
   pinned: boolean;
   dismissed: boolean;
   /** Multi-select mode (#643): show a checkbox and toggle selection on row click
@@ -380,14 +387,21 @@ export function SessionItem({
               {/* Right slot: pin glyph (when pinned) + streaming dot, or the
                   hover actions (pencil, ⋯) / kbd hint when idle. */}
               <span className="flex shrink-0 items-center gap-0.5">
-                {pinned && !streaming && (
+                {pinned && !streaming && !finished && (
                   <Pin
                     className="size-3 shrink-0 text-muted-foreground/70"
                     aria-label="Pinned"
                   />
                 )}
+                {/* Right-slot priority (#703): streaming spinner > done checkmark
+                    > idle (pin/hover actions). */}
                 {streaming ? (
-                  <span className="size-1.5 animate-pulse rounded-full bg-primary" />
+                  <Spinner size="sm" className="text-primary" />
+                ) : finished ? (
+                  <Check
+                    className="ff-fade-in size-3.5 shrink-0 text-emerald-500"
+                    aria-label="Finished"
+                  />
                 ) : selectMode ? null : (
                   <>
                     {/* Pencil + ⋯ shown on hover; kbd hint shown when idle. */}
@@ -504,7 +518,23 @@ export function SessionSidebar() {
   );
   const activeSessionId = useChatStore((s) => s.activeSessionId);
   const streamingBySession = useChatStore((s) => s.streamingBySession);
+  const recentlyFinishedBySession = useChatStore(
+    (s) => s.recentlyFinishedBySession,
+  );
+  const clearSessionFinished = useChatStore((s) => s.clearSessionFinished);
+  const dismissDoneToast = useSessionDoneToastStore((s) => s.dismissBySession);
   const newSession = useChatStore((s) => s.newSession);
+
+  // Focus clears a session's activity signals (#703): the moment a session
+  // becomes active — via a row click, the toast's "View", or any other path —
+  // drop its transient "done" checkmark and any standing completion toast, since
+  // the user is now looking at it. Centralized here so it fires regardless of
+  // which action set `activeSessionId`.
+  useEffect(() => {
+    if (!activeSessionId) return;
+    clearSessionFinished(activeSessionId);
+    dismissDoneToast(activeSessionId);
+  }, [activeSessionId, clearSessionFinished, dismissDoneToast]);
 
   const sidebarCollapsed = usePrefsStore((s) => s.sidebarCollapsed);
   const setSidebarCollapsed = usePrefsStore((s) => s.setSidebarCollapsed);
@@ -925,6 +955,7 @@ export function SessionSidebar() {
                     index={indexById.get(session.id) ?? 0}
                     active={session.id === activeSessionId}
                     streaming={Boolean(streamingBySession[session.id])}
+                    finished={Boolean(recentlyFinishedBySession[session.id])}
                     pinned={pinnedSet.has(session.id)}
                     dismissed={dismissedSet.has(session.id)}
                     selectMode={selectMode}
