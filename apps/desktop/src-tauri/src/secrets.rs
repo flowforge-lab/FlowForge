@@ -3,8 +3,9 @@
 //! Provider secrets (bearer API keys, AWS secret access keys, session tokens)
 //! live only on the backend — they never round-trip to the frontend, which sees
 //! a single coarse `has_key` flag per connection. Production builds persist to
-//! the OS keychain (macOS Keychain, Windows Credential Manager). Test builds use
-//! an in-process map so CI stays hermetic and never touches a real keychain.
+//! the OS keychain (macOS Data Protection Keychain, Windows Credential Manager,
+//! Linux Secret Service). Test builds use an in-process map so CI stays hermetic
+//! and never touches a real keychain.
 
 use ff_core::SecretKind;
 use std::sync::{Arc, OnceLock};
@@ -20,11 +21,70 @@ trait SecretStore: Send + Sync {
 #[cfg(not(test))]
 const SERVICE: &str = "flowforge";
 
-/// OS-keychain backend used in production builds.
+// ---------------------------------------------------------------------------
+// macOS: Data Protection Keychain via security-framework (#727).
+//
+// The Data Protection Keychain (kSecUseDataProtectionKeychain) does NOT prompt
+// the user for access — it grants access based on the app's code-signing team
+// rather than per-binary identity, so dev rebuilds and updates never trigger a
+// keychain password dialog. This replaces the previous `keyring` crate backend
+// which used the legacy login.keychain and prompted on every signature change.
+// ---------------------------------------------------------------------------
+
 #[cfg(not(test))]
+#[cfg(target_os = "macos")]
+struct DataProtectionStore;
+
+#[cfg(not(test))]
+#[cfg(target_os = "macos")]
+impl SecretStore for DataProtectionStore {
+    fn set(&self, account: &str, value: &str) -> Result<(), String> {
+        use security_framework::passwords::{
+            delete_generic_password_options, set_generic_password_options, PasswordOptions,
+        };
+        // Data Protection Keychain does not support "update in place" like the
+        // legacy keychain — SecItemAdd returns errSecDuplicateItem if the entry
+        // exists. Delete first (idempotent), then add.
+        let mut del_opts = PasswordOptions::new_generic_password(SERVICE, account);
+        del_opts.use_protected_keychain();
+        let _ = delete_generic_password_options(del_opts); // ignore NotFound
+
+        let mut opts = PasswordOptions::new_generic_password(SERVICE, account);
+        opts.use_protected_keychain();
+        set_generic_password_options(value.as_bytes(), opts).map_err(|e| e.to_string())
+    }
+
+    fn get(&self, account: &str) -> Option<String> {
+        use security_framework::passwords::{generic_password, PasswordOptions};
+        let mut opts = PasswordOptions::new_generic_password(SERVICE, account);
+        opts.use_protected_keychain();
+        generic_password(opts)
+            .ok()
+            .and_then(|bytes| String::from_utf8(bytes).ok())
+    }
+
+    fn delete(&self, account: &str) -> Result<(), String> {
+        use security_framework::passwords::{delete_generic_password_options, PasswordOptions};
+        let mut opts = PasswordOptions::new_generic_password(SERVICE, account);
+        opts.use_protected_keychain();
+        match delete_generic_password_options(opts) {
+            Ok(()) => Ok(()),
+            Err(e) if e.code() == -25300 => Ok(()), // errSecItemNotFound
+            Err(e) => Err(e.to_string()),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Windows / Linux: keyring crate (unchanged).
+// ---------------------------------------------------------------------------
+
+#[cfg(not(test))]
+#[cfg(not(target_os = "macos"))]
 struct KeyringStore;
 
 #[cfg(not(test))]
+#[cfg(not(target_os = "macos"))]
 impl SecretStore for KeyringStore {
     fn set(&self, account: &str, value: &str) -> Result<(), String> {
         keyring::Entry::new(SERVICE, account)
@@ -83,6 +143,12 @@ fn store() -> &'static Arc<dyn SecretStore> {
             Arc::new(MemStore::default())
         }
         #[cfg(not(test))]
+        #[cfg(target_os = "macos")]
+        {
+            Arc::new(DataProtectionStore)
+        }
+        #[cfg(not(test))]
+        #[cfg(not(target_os = "macos"))]
         {
             Arc::new(KeyringStore)
         }
