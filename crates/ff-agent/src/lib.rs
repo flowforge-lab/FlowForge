@@ -261,6 +261,13 @@ pub enum AgentEvent {
         /// cold-tail summary (RFC 0016 M7.0).
         #[serde(skip_serializing_if = "Option::is_none")]
         tier2_fires: Option<u32>,
+        /// Prefix cache hit tokens across all iterations this turn (#766).
+        /// Populated from the provider's usage response; 0 when not reported.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_hit_tokens: Option<u32>,
+        /// Prefix cache miss tokens across all iterations this turn (#766).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_miss_tokens: Option<u32>,
     },
     /// A silent context-pressure memory flush (#244 R5) wrote `writes` durable
     /// facts to the user's on-disk memory this turn (#283). Emitted only when
@@ -863,6 +870,10 @@ pub async fn run_turn(
     let mut prefill_estimates: Vec<u32> = Vec::new();
     let mut tier1_fires: u32 = 0;
     let mut tier2_fires: u32 = 0;
+    // Prefix cache observability (#766): accumulate provider-reported cache
+    // hit/miss tokens across all iterations this turn.
+    let mut cache_hit_tokens: u32 = 0;
+    let mut cache_miss_tokens: u32 = 0;
     for iter in 0..max_iter {
         turn_count += 1;
         if cancel.is_cancelled() {
@@ -1257,6 +1268,10 @@ pub async fn run_turn(
                         // provider's trailing terminal frame -- must not silently reset
                         // it and re-mislabel the cut-off tool call as invalid JSON (#528).
                         output_truncated |= chunk.truncated;
+                        // Prefix cache observability (#766): the final usage chunk
+                        // carries the totals; earlier chunks report 0.
+                        cache_hit_tokens += chunk.cache_hit_tokens;
+                        cache_miss_tokens += chunk.cache_miss_tokens;
                         if step_thinking && !chunk.reasoning_delta.is_empty() {
                             emitted_any = true;
                             reasoning_acc.push_str(&chunk.reasoning_delta);
@@ -1395,6 +1410,8 @@ pub async fn run_turn(
                 prefill_estimates: Some(prefill_estimates.clone()),
                 tier1_fires: Some(tier1_fires),
                 tier2_fires: Some(tier2_fires),
+                cache_hit_tokens: Some(cache_hit_tokens),
+                cache_miss_tokens: Some(cache_miss_tokens),
             });
             return Ok(finalized);
         }
@@ -1811,6 +1828,8 @@ pub async fn run_turn(
         prefill_estimates: Some(prefill_estimates),
         tier1_fires: Some(tier1_fires),
         tier2_fires: Some(tier2_fires),
+        cache_hit_tokens: Some(cache_hit_tokens),
+        cache_miss_tokens: Some(cache_miss_tokens),
     });
     Ok(msg)
 }

@@ -413,6 +413,7 @@ fn parse_ollama_line(line: &[u8], tool_idx: &mut u32) -> Option<Result<Chunk, Ll
                 tool_calls,
                 done: c.done,
                 truncated: c.done_reason.as_deref() == Some("length"),
+                ..Chunk::default()
             }))
         }
         Err(e) => Some(Err(LlmError::Decode(e.to_string()))),
