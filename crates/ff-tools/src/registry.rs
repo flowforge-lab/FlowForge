@@ -145,6 +145,7 @@ impl ToolRegistry {
         r.register(Box::new(crate::todo::TodoTool));
         r.register(Box::new(crate::web_fetch::WebFetchTool::new()));
         r.register(Box::new(crate::ask_user::AskUserTool));
+        r.register(Box::new(crate::diagnostics::DiagnosticsTool));
         r.register(Box::new(crate::agent_tool::AgentTool));
         r
     }
@@ -338,7 +339,7 @@ mod tests {
     fn advertises_default_schemas() {
         let reg = ToolRegistry::with_defaults();
         let tools = reg.openai_tools();
-        assert_eq!(tools.len(), 13);
+        assert_eq!(tools.len(), 14);
         let names: Vec<_> = tools
             .iter()
             .map(|t| t["function"]["name"].as_str().unwrap())
@@ -382,7 +383,7 @@ mod tests {
             .map(|t| t["function"]["name"].as_str().unwrap())
             .collect();
         assert!(!names.contains(&"agent"));
-        assert_eq!(no_subagent.len(), 12);
+        assert_eq!(no_subagent.len(), 13);
     }
 
     #[test]
@@ -403,7 +404,15 @@ mod tests {
         let ro = reg.readonly_tool_names();
 
         // Every ReadOnly-ceiling default tool is present.
-        for name in ["view", "grep", "glob", "tree", "todo", "ask_user"] {
+        for name in [
+            "view",
+            "grep",
+            "glob",
+            "tree",
+            "todo",
+            "ask_user",
+            "diagnostics",
+        ] {
             assert!(ro.contains(name), "{name} should be a read-only tool");
         }
         // Mutating tools and dynamically-classified tools (bash) are absent: in Plan

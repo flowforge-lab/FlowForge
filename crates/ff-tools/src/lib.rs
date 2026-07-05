@@ -23,6 +23,7 @@ mod apply_patch;
 mod ask_user;
 mod bash;
 mod compaction;
+mod diagnostics;
 mod edit;
 mod glob;
 mod grep;
