@@ -2137,13 +2137,32 @@ enum UpdateStatus {
 /// D1 dev/dogfood channel) it points at that feed instead and accepts any version
 /// that differs from the running one, so a locally-built artifact installs without a
 /// version bump. Inert in prod (env unset).
+/// Whether the `localUpdateChannel` experimental flag is active for this session.
+/// Set by [`start_dev_update_watcher`] (called by the FE exactly when the flag is on).
+static LOCAL_UPDATE_CHANNEL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Default port for the local dev-release HTTP server (matches `scripts/dev-release.sh`).
+const DEV_RELEASE_PORT: u16 = 8787;
+
 fn updater(app: &tauri::AppHandle) -> CmdResult<tauri_plugin_updater::Updater> {
     use tauri_plugin_updater::UpdaterExt;
+    // Priority: explicit env var > localUpdateChannel flag > compiled-in default.
     if let Ok(endpoint) = std::env::var("FF_UPDATER_ENDPOINT") {
         let endpoint = url::Url::parse(&endpoint).map_err(|e| e.to_string())?;
         app.updater_builder()
             .endpoints(vec![endpoint])
             .map_err(|e| e.to_string())?
+            .version_comparator(|current, update| update.version != current)
+            .build()
+            .map_err(|e| e.to_string())
+    } else if LOCAL_UPDATE_CHANNEL.load(std::sync::atomic::Ordering::Relaxed) {
+        let endpoint = url::Url::parse(&format!("http://localhost:{DEV_RELEASE_PORT}/latest.json"))
+            .map_err(|e| e.to_string())?;
+        app.updater_builder()
+            .endpoints(vec![endpoint])
+            .map_err(|e| e.to_string())?
+            // Any different version is an update (dev timestamps are always unique).
             .version_comparator(|current, update| update.version != current)
             .build()
             .map_err(|e| e.to_string())
@@ -2204,6 +2223,7 @@ async fn install_update(app: tauri::AppHandle) -> CmdResult<()> {
 #[tauri::command]
 fn start_dev_update_watcher(app: tauri::AppHandle) {
     use std::sync::Once;
+    LOCAL_UPDATE_CHANNEL.store(true, std::sync::atomic::Ordering::Relaxed);
     static STARTED: Once = Once::new();
     STARTED.call_once(|| {
         match dev_update_watcher::DevUpdateWatcher::spawn() {
