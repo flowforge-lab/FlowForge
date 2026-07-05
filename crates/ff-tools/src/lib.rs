@@ -27,6 +27,7 @@ mod diagnostics;
 mod edit;
 mod github;
 mod glob;
+mod goal_complete;
 mod grep;
 mod html_text;
 mod jail;
@@ -46,6 +47,7 @@ mod write;
 
 pub use agent_tool::{AgentTool, AGENT_TOOL_NAME};
 pub use compaction::{CompactionRetrieveTool, COMPACTION_RETRIEVE_TOOL};
+pub use goal_complete::{GoalCompleteTool, GOAL_COMPLETE_TOOL_NAME};
 pub use registry::{is_subagent, Safety, Tool, ToolOutcome, ToolRegistry};
 pub use sink::{OutputSink, OutputStream};
 pub use url_safety::SsrfPolicy;

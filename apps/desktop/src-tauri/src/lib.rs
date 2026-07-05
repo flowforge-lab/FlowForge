@@ -10,7 +10,10 @@ mod state;
 mod tools;
 
 use async_trait::async_trait;
-use ff_agent::{run_turn, AgentEvent, Approver, CancelToken, ToolContext};
+use ff_agent::{
+    drive_goal, run_turn, AgentEvent, Approver, CancelToken, GateDecision, GoalIteration,
+    IterationOutcome, ToolContext,
+};
 use ff_core::events::{
     ApprovalSafety, EvolveCostEstimate, IntentionSignal, McpStatusChangedEvent, MemoryFlushedEvent,
     OutputStreamKind, PhenotypeMcpUnavailableEvent, ReasoningEvent, SessionTitleUpdatedEvent,
@@ -20,10 +23,10 @@ use ff_core::events::{
     TurnErrorEvent, TurnStatsEvent, UpdateProgressEvent,
 };
 use ff_core::{
-    Attachment, BedrockAuth, CreateScheduledTaskInput, Format, McpServerConfig, McpServerStatus,
-    MemoryFileInfo, MemoryFileKind, MemoryOverview, Message, Mode, ModelSelection, Phenotype,
-    ProviderConfig, ProviderConnection, ProviderKind, ProviderRegistry, ResolvedModel, Role,
-    RunRecord, RunStatus, ScheduledTask, SearchConfig, SecretKind, Session, SessionWorkspace,
+    Attachment, BedrockAuth, CreateScheduledTaskInput, Format, Goal, GoalStatus, McpServerConfig,
+    McpServerStatus, MemoryFileInfo, MemoryFileKind, MemoryOverview, Message, Mode, ModelSelection,
+    Phenotype, ProviderConfig, ProviderConnection, ProviderKind, ProviderRegistry, ResolvedModel,
+    Role, RunRecord, RunStatus, ScheduledTask, SearchConfig, SecretKind, Session, SessionWorkspace,
     Skill, SkillInfo, SkillManifest, TaskKind,
 };
 use ff_scheduled::ScheduledApprover;
@@ -422,6 +425,136 @@ fn set_scheduled_paused_all(
     state.scheduled.set_all_paused(paused);
     let _ = app.emit("scheduled:changed", state.scheduled.list());
     paused
+}
+
+// ===== Goal mode (RFC 0020, #716) =====
+// The five `goal_*` IPC commands are the FE-facing half of the goal lifecycle;
+// the `goal_complete` capability is also an agent tool (dual-surface, §7). Each
+// mutation persists through the path-injected `GoalStore` and emits
+// `goal:updated` so the FE panel (#717) live-refreshes without polling. The
+// self-continue loop is spawned by `goal_set` / `goal_resume` — see
+// `spawn_goal_loop`.
+
+/// Begin (or replace) the active goal for a session and start the self-continue
+/// loop (RFC 0020 §5.1). An empty objective is rejected. A pre-existing goal for
+/// the session is overwritten — starting a new objective is a deliberate reset.
+#[tauri::command]
+fn goal_set(
+    state: State<'_, Arc<AppState>>,
+    app: tauri::AppHandle,
+    session_id: String,
+    objective: String,
+    max_iterations: Option<u32>,
+    max_tokens: Option<u64>,
+    max_wall_ms: Option<i64>,
+) -> Result<Goal, String> {
+    let objective = objective.trim();
+    if objective.is_empty() {
+        return Err("goal objective must not be empty".into());
+    }
+    let mut goal = Goal::new(&session_id, objective, now_ms());
+    if let Some(m) = max_iterations {
+        goal.budget.max_iterations = m;
+    }
+    goal.budget.max_tokens = max_tokens;
+    goal.budget.max_wall_ms = max_wall_ms;
+    state
+        .goals
+        .save(&goal)
+        .map_err(|e| format!("failed to persist goal: {e}"))?;
+    let _ = app.emit("goal:updated", &goal);
+    spawn_goal_loop(state.inner().clone(), app, session_id);
+    Ok(goal)
+}
+
+/// Snapshot the current goal for a session, or `None` if there is no goal
+/// checkpoint (RFC 0020 §7 — panel poll / event join). A corrupt checkpoint file
+/// surfaces as an error rather than a silent `None`.
+#[tauri::command]
+fn goal_status(
+    state: State<'_, Arc<AppState>>,
+    session_id: String,
+) -> Result<Option<Goal>, String> {
+    state
+        .goals
+        .load(&session_id)
+        .map_err(|e| format!("failed to read goal: {e}"))
+}
+
+/// Pause a running goal at the next boundary (RFC 0020 §5.3). Idempotent: pausing
+/// an already-paused/terminal goal just returns its current state. The loop
+/// observes the persisted `Paused` status at its next boundary check and stops
+/// resumably; this command also flips it eagerly so the FE reflects intent now.
+#[tauri::command]
+fn goal_pause(
+    state: State<'_, Arc<AppState>>,
+    app: tauri::AppHandle,
+    session_id: String,
+) -> Result<Option<Goal>, String> {
+    let Some(mut goal) = state
+        .goals
+        .load(&session_id)
+        .map_err(|e| format!("failed to read goal: {e}"))?
+    else {
+        return Ok(None);
+    };
+    if goal.status == GoalStatus::Active {
+        goal.status = GoalStatus::Paused;
+        goal.updated_ms = now_ms();
+        state
+            .goals
+            .save(&goal)
+            .map_err(|e| format!("failed to persist goal: {e}"))?;
+        let _ = app.emit("goal:updated", &goal);
+    }
+    Ok(Some(goal))
+}
+
+/// Resume a paused goal and restart the loop from the last persisted checkpoint
+/// (RFC 0020 §5.3 — resume replays from the last completed iteration, never a
+/// partial turn). Only a `Paused` goal resumes; a terminal goal is returned
+/// unchanged.
+#[tauri::command]
+fn goal_resume(
+    state: State<'_, Arc<AppState>>,
+    app: tauri::AppHandle,
+    session_id: String,
+) -> Result<Option<Goal>, String> {
+    let Some(mut goal) = state
+        .goals
+        .load(&session_id)
+        .map_err(|e| format!("failed to read goal: {e}"))?
+    else {
+        return Ok(None);
+    };
+    if goal.status == GoalStatus::Paused {
+        goal.status = GoalStatus::Active;
+        goal.updated_ms = now_ms();
+        state
+            .goals
+            .save(&goal)
+            .map_err(|e| format!("failed to persist goal: {e}"))?;
+        let _ = app.emit("goal:updated", &goal);
+        spawn_goal_loop(state.inner().clone(), app, session_id);
+    }
+    Ok(Some(goal))
+}
+
+/// Delete the goal for a session entirely (RFC 0020 §7 — dismiss/clear). Removes
+/// the checkpoint file; a running loop stops at its next boundary when it finds
+/// no `Active` goal to load. Idempotent — clearing a nonexistent goal is fine.
+#[tauri::command]
+fn goal_clear(
+    state: State<'_, Arc<AppState>>,
+    app: tauri::AppHandle,
+    session_id: String,
+) -> Result<(), String> {
+    state
+        .goals
+        .delete(&session_id)
+        .map_err(|e| format!("failed to clear goal: {e}"))?;
+    let _ = app.emit("goal:cleared", &session_id);
+    Ok(())
 }
 
 /// Fire a scheduled task immediately, off-schedule (RFC 0017 §8.3). Runs the
@@ -1178,7 +1311,237 @@ fn spawn_assistant_turn(state: Arc<AppState>, app: tauri::AppHandle, session_id:
     });
 }
 
-/// Per-fire wall-clock budget for a scheduled run (RFC 0017 §8.2). A fire is a
+/// Wall-clock ceiling on a single goal iteration's turn, mirroring
+/// `SCHEDULED_FIRE_TIMEOUT`: a stuck provider must not wedge the loop. On
+/// timeout the turn is cancelled and the iteration is recorded as failed.
+const GOAL_ITERATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// The host-side [`GoalIteration`] (RFC 0020 §5.2, #716): drives one headless
+/// agent turn toward the objective, mirroring the scheduled runner's `fire` but
+/// against the live session with the interactive [`UiApprover`] — so a mid-loop
+/// approval / `ask_user` still surfaces in the UI (the RFC 0017 join point).
+/// Per-tool safety gating already happens inside `run_turn` via the shared
+/// `permission_matrix`; the loop-level [`GoalIteration::gate`] only governs
+/// whether to continue (the #719 Ask→pause seam), so today it always proceeds.
+struct GoalLoopIteration {
+    state: Arc<AppState>,
+    app: tauri::AppHandle,
+    session_id: String,
+}
+
+#[async_trait::async_trait]
+impl GoalIteration for GoalLoopIteration {
+    fn gate(&self, _goal: &Goal) -> GateDecision {
+        // Loop-continuation gate. Per-tool matrix gating is enforced inside the
+        // turn; this seam is where #719/#682 will pause on an Ask verdict. The
+        // skeleton always proceeds — a paused goal is handled by the status
+        // check in `drive_goal`, not here.
+        GateDecision::Proceed
+    }
+
+    async fn run_once(&self, goal: &Goal) -> IterationOutcome {
+        // Seed the continuation turn: a pending steer (a message the user typed
+        // while the goal ran) takes priority; otherwise a neutral "continue"
+        // nudge carrying the objective. The system-prompt goal block (#718) will
+        // later carry the objective; until then we inline it in the user turn.
+        // The steer is one-shot: clear it after seeding so it is not re-applied
+        // on the next iteration (RFC 0020 §5 — a steer folds into one turn).
+        let steer = goal
+            .pending_steer
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let prompt = match steer {
+            Some(s) => s.to_string(),
+            None => format!(
+                "Continue working toward the goal: {}. If it is fully met and \
+                 verified, call the `goal_complete` tool; otherwise take the \
+                 next concrete step.",
+                goal.objective
+            ),
+        };
+        if steer.is_some() {
+            if let Ok(Some(mut g)) = self.state.goals.load(&self.session_id) {
+                g.pending_steer = None;
+                g.updated_ms = now_ms();
+                let _ = self.state.goals.save(&g);
+            }
+        }
+        self.state
+            .store
+            .add_message(&self.session_id, Role::User, prompt.clone());
+
+        let sid = self.session_id.clone();
+        let selection = self.state.resolve_model_selection(&sid);
+        let (mut provider, model) = self
+            .state
+            .build_provider_for(Some(&selection.connection), Some(&selection.model));
+        let pheno = self.state.session_phenotype(&sid);
+        let persona = pheno.persona.clone();
+        let mode = self.state.session_mode(&sid);
+        let max_iterations = pheno
+            .max_iterations
+            .unwrap_or(ff_agent::DEFAULT_MAX_ITERATIONS);
+
+        let session_root = self.state.session_root(&sid);
+        self.state.align_session_mcp(&sid, &session_root).await;
+        self.state.align_git_watcher(&session_root);
+        let registry = self.state.build_tool_registry(&session_root);
+
+        let approver = UiApprover {
+            app: self.app.clone(),
+            state: self.state.clone(),
+            session_id: sid.clone(),
+            mode,
+        };
+        let mut tool_ctx = ff_agent::ToolContext::new(
+            &registry,
+            &session_root,
+            &approver,
+            max_iterations,
+            &self.state.permission_matrix,
+        );
+        tool_ctx.mode = mode;
+        tool_ctx.abstractive = crate::state::abstractive_config_from_env();
+
+        let skills = self.state.skills_snapshot();
+        let user_ctx =
+            ff_agent::UserContext::now().with_working_dir(session_root.display().to_string());
+        let active: Vec<String> = self.state.turn_active_skills(&sid);
+        let (memory, _ambient_keys) = self
+            .state
+            .memory()
+            .ambient_block_filtered_keyed(self.state.index().as_ref());
+        let system_prompt = ff_agent::build_system_prompt(
+            persona.as_deref(),
+            &skills,
+            &active,
+            &user_ctx,
+            memory.as_deref(),
+            mode,
+        );
+
+        provider.set_context_budget(self.state.served_window(&sid).await.window);
+
+        let cancel = CancelToken::new();
+        self.state.register_cancel(&sid, cancel.clone());
+        let cancel_probe = cancel.clone();
+        let thinking = self.state.provider_config().thinking;
+        let reasoning_visibility = self.state.provider_config().reasoning_visibility;
+
+        // Capture per-turn tokens (from `AgentEvent::Done`) and whether the agent
+        // called `goal_complete` (from `AgentEvent::ToolCallFinished`) directly in
+        // the event closure, so the loop gets both without re-reading the store.
+        let tokens = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // `ToolCallFinished` carries only the call_id, so remember the call_id of
+        // a started `goal_complete` and confirm it on a successful finish.
+        let gc_call_id = Arc::new(std::sync::Mutex::new(Option::<String>::None));
+        let tokens_ev = tokens.clone();
+        let completed_ev = completed.clone();
+        let gc_call_ev = gc_call_id.clone();
+        let app_ev = self.app.clone();
+        let sid_ev = sid.clone();
+        let turn_start = std::time::Instant::now();
+
+        let turn = run_turn(
+            provider.as_ref(),
+            self.state.store.as_ref(),
+            &tool_ctx,
+            &sid,
+            &model,
+            Some(system_prompt.as_str()),
+            thinking,
+            reasoning_visibility,
+            cancel.clone(),
+            move |event| {
+                match &event {
+                    ff_agent::AgentEvent::Done {
+                        token_count: Some(t),
+                        ..
+                    } => {
+                        tokens_ev.store(*t as u64, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    ff_agent::AgentEvent::ToolCallStarted { call_id, name, .. }
+                        if name == ff_tools::GOAL_COMPLETE_TOOL_NAME =>
+                    {
+                        *gc_call_ev.lock().unwrap() = Some(call_id.clone());
+                    }
+                    ff_agent::AgentEvent::ToolCallFinished {
+                        call_id,
+                        success: true,
+                        ..
+                    } if gc_call_ev.lock().unwrap().as_deref() == Some(call_id.as_str()) => {
+                        completed_ev.store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    _ => {}
+                }
+                emit_agent_event(&app_ev, &sid_ev, event);
+            },
+        );
+        let result = tokio::time::timeout(GOAL_ITERATION_TIMEOUT, turn).await;
+        self.state.take_cancel(&sid);
+
+        let failed = match result {
+            Err(_elapsed) => {
+                cancel.cancel();
+                true
+            }
+            Ok(Err(_)) => true,
+            // A user cancel mid-turn ends the iteration without marking a hard
+            // failure; the loop's status check will keep the goal resumable.
+            Ok(Ok(_)) => cancel_probe.is_cancelled(),
+        };
+
+        IterationOutcome {
+            tokens: tokens.load(std::sync::atomic::Ordering::SeqCst),
+            wall_ms: turn_start.elapsed().as_millis() as i64,
+            goal_complete: completed.load(std::sync::atomic::Ordering::SeqCst),
+            failed,
+        }
+    }
+
+    fn save(&self, goal: &Goal) {
+        if let Err(e) = self.state.goals.save(goal) {
+            tracing::warn!(error = %e, session = %self.session_id, "failed to persist goal checkpoint");
+        }
+        let _ = self.app.emit("goal:updated", goal);
+    }
+
+    fn now_ms(&self) -> i64 {
+        now_ms()
+    }
+}
+
+/// Spawn the self-continue loop for a session's active goal (RFC 0020 §5). Loads
+/// the goal, folds any `pending_steer` into the first iteration, and drives
+/// [`drive_goal`] to a terminal state on a background task. Idempotent-ish: if a
+/// loop is already running for the session the new one is a near no-op (the
+/// first budget/status check ends it), but callers (`goal_set`/`goal_resume`)
+/// only spawn after transitioning the goal to `Active`.
+fn spawn_goal_loop(state: Arc<AppState>, app: tauri::AppHandle, session_id: String) {
+    tauri::async_runtime::spawn(async move {
+        let mut goal = match state.goals.load(&session_id) {
+            Ok(Some(g)) => g,
+            Ok(None) => return,
+            Err(e) => {
+                tracing::warn!(error = %e, session = %session_id, "goal loop: cannot load goal");
+                return;
+            }
+        };
+        if goal.status != GoalStatus::Active {
+            return;
+        }
+        let iter = GoalLoopIteration {
+            state: state.clone(),
+            app: app.clone(),
+            session_id: session_id.clone(),
+        };
+        let stop = drive_goal(&mut goal, &iter).await;
+        tracing::info!(session = %session_id, ?stop, "goal loop finished");
+    });
+}
+
 /// bounded single `run_turn`; if it overruns it is cancelled and recorded
 /// `cancelled`, so one hung fire cannot starve later due tasks.
 const SCHEDULED_FIRE_TIMEOUT: Duration = Duration::from_secs(600);
@@ -2711,6 +3074,11 @@ pub fn run() {
             run_scheduled_task_now,
             list_scheduled_runs,
             set_scheduled_paused_all,
+            goal_set,
+            goal_status,
+            goal_pause,
+            goal_resume,
+            goal_clear,
             preview_cadence,
             get_session_workspace,
             set_session_workspace,
