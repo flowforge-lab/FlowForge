@@ -180,6 +180,22 @@ body {
   color: #111827; /* slate-900 */
 }
 
+/* Global search (#710): the backend pre-highlights snippet matches with <mark>.
+   Style those marks for the sidebar's content-hit rows — a soft amber wash so the
+   matched term stands out in the muted snippet line, legible in both themes. */
+.ff-hit-snippet mark {
+  background-color: #fde68a; /* amber-200 */
+  color: #1f2937; /* slate-800 */
+  border-radius: 2px;
+  padding: 0 1px;
+}
+/* Dark mode: dim the wash so it isn't a loud amber block against dark surfaces,
+   and lift the text to a warm foreground instead of dark-on-amber (#747 C3). */
+.dark .ff-hit-snippet mark {
+  background-color: color-mix(in oklab, #f59e0b 30%, transparent);
+  color: #fde68a; /* amber-200 */
+}
+
 /* Quiet scrollbars, theme-aware. */
 ::-webkit-scrollbar {
   width: 8px;

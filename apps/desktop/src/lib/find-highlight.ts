@@ -97,6 +97,26 @@ export function clearHighlights(): void {
   CSS.highlights.delete(ACTIVE);
 }
 
+/**
+ * Index of the first range that falls inside the message `messageId` (its start
+ * node's closest `[data-message-id]` ancestor), or -1 if none. Lets a global-
+ * search hit (#710) activate the clicked message's occurrence rather than the
+ * first occurrence in the thread.
+ */
+export function indexOfMessage(ranges: Range[], messageId: string): number {
+  return ranges.findIndex((range) => {
+    const start = range.startContainer;
+    const el =
+      start.nodeType === Node.ELEMENT_NODE
+        ? (start as HTMLElement)
+        : start.parentElement;
+    return (
+      el?.closest("[data-message-id]")?.getAttribute("data-message-id") ===
+      messageId
+    );
+  });
+}
+
 /** Scroll the element containing `range` into the centre of its scroller. */
 export function scrollRangeIntoView(range: Range): void {
   const el =
