@@ -967,6 +967,7 @@ fn spawn_assistant_turn(state: Arc<AppState>, app: tauri::AppHandle, session_id:
             &active,
             &user_ctx,
             memory.as_deref(),
+            None,
             mode,
         );
 
@@ -1338,6 +1339,7 @@ impl ff_scheduled::TaskRunner for DesktopTaskRunner {
             &active,
             &user_ctx,
             memory.as_deref(),
+            None,
             mode,
         );
 

@@ -4210,7 +4210,7 @@ mod tests {
             time_of_day: TimeOfDay::Morning,
             working_dir: String::new(),
         };
-        let system = build_system_prompt(None, &skills, &[], &user, None, Mode::default());
+        let system = build_system_prompt(None, &skills, &[], &user, None, None, Mode::default());
 
         let store = SessionStore::new();
         let s = store.create_session(None);

@@ -369,6 +369,7 @@ async fn run(
         &inputs.active,
         &user_ctx,
         memory.as_deref(),
+        None,
         mode,
     );
 
@@ -547,8 +548,15 @@ async fn chat_repl(
             Some(idx) => memory_store.ambient_block_filtered_keyed(idx.as_ref()),
             None => (memory_store.ambient_block(), Vec::new()),
         };
-        let system_prompt =
-            ff_agent::build_system_prompt(None, skills, &[], &user_ctx, memory.as_deref(), mode);
+        let system_prompt = ff_agent::build_system_prompt(
+            None,
+            skills,
+            &[],
+            &user_ctx,
+            memory.as_deref(),
+            None,
+            mode,
+        );
 
         let cancel = CancelToken::new();
         let cancel_signal = cancel.clone();

@@ -13,7 +13,7 @@
 //! cache for the system prompt (and the tools block that follows it) on every
 //! turn after the first.
 
-use ff_core::Mode;
+use ff_core::{Goal, GoalStatus, Mode};
 use ff_skills::SkillRegistry;
 
 /// Coarse time-of-day band for the ambient context (RFC 0008 §6). A *band*, not a
@@ -118,6 +118,7 @@ pub fn build_system_prompt(
     active: &[String],
     user: &UserContext,
     memory: Option<&str>,
+    goal: Option<&Goal>,
     mode: Mode,
 ) -> String {
     let mut out = String::new();
@@ -261,12 +262,65 @@ pub fn build_system_prompt(
         }
     }
 
+    if let Some(block) = goal
+        .filter(|g| g.status == GoalStatus::Active)
+        .map(goal_block)
+    {
+        out.push('\n');
+        out.push_str(&block);
+    }
+
     if let Some(steer) = mode_steer(mode) {
         out.push('\n');
         out.push_str(steer);
         out.push('\n');
     }
 
+    out
+}
+
+/// Render the goal-injection block for the system prompt (RFC 0020 §8, #718).
+/// Shows the objective, iteration progress, recent ledger entries, and any
+/// pending user steer so the agent stays on track and knows when to call
+/// `goal_complete`.
+fn goal_block(goal: &Goal) -> String {
+    use ff_core::Verdict;
+    use std::fmt::Write;
+
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "## Active goal (iteration {} of {})",
+        goal.iteration + 1,
+        goal.budget.max_iterations
+    );
+    let _ = writeln!(out, "Objective: {}", goal.objective);
+
+    if !goal.ledger.is_empty() {
+        out.push_str("Progress so far:\n");
+        // Show last 5 ledger entries to keep the block bounded.
+        let start = goal.ledger.len().saturating_sub(5);
+        for entry in &goal.ledger[start..] {
+            let verdict = entry
+                .verdict
+                .as_ref()
+                .map(|v| match v {
+                    Verdict::Match => "done",
+                    Verdict::Drift => "drift",
+                    Verdict::Unverifiable => "unverifiable",
+                })
+                .unwrap_or("pending");
+            let _ = writeln!(out, "- {} [{}]", entry.claim, verdict);
+        }
+    }
+
+    if let Some(steer) = &goal.pending_steer {
+        let _ = writeln!(out, "\nUser steer: {}", steer);
+    }
+
+    out.push_str(
+        "\nContinue toward the objective. If it is fully met, call `goal_complete`.\n State your reasoning before each action.\n",
+    );
     out
 }
 
@@ -354,7 +408,7 @@ mod tests {
     #[test]
     fn plan_mode_appends_a_plan_steer() {
         let reg = SkillRegistry::new();
-        let out = build_system_prompt(None, &reg, &[], &ctx(), None, Mode::Plan);
+        let out = build_system_prompt(None, &reg, &[], &ctx(), None, None, Mode::Plan);
         assert!(out.contains("## Mode: Plan"), "{out}");
         assert!(out.contains("Only read-only tools"), "{out}");
     }
@@ -364,7 +418,7 @@ mod tests {
         // #550: steer large file creation toward chunked write / edit so a giant
         // single `write` argument is not truncated at the output cap.
         let reg = SkillRegistry::new();
-        let out = build_system_prompt(None, &reg, &[], &ctx(), None, Mode::default());
+        let out = build_system_prompt(None, &reg, &[], &ctx(), None, None, Mode::default());
         assert!(out.contains("## Large file writes"), "{out}");
         assert!(out.contains("append the rest in chunks"), "{out}");
     }
@@ -373,7 +427,7 @@ mod tests {
     fn act_and_auto_modes_add_no_steer() {
         let reg = SkillRegistry::new();
         for mode in [Mode::Act, Mode::Auto] {
-            let out = build_system_prompt(None, &reg, &[], &ctx(), None, mode);
+            let out = build_system_prompt(None, &reg, &[], &ctx(), None, None, mode);
             assert!(
                 !out.contains("## Mode:"),
                 "{mode:?} should add no mode steer: {out}"
@@ -384,7 +438,7 @@ mod tests {
     #[test]
     fn includes_user_context_from_supplied_clock() {
         let reg = SkillRegistry::new();
-        let out = build_system_prompt(None, &reg, &[], &ctx(), None, Mode::default());
+        let out = build_system_prompt(None, &reg, &[], &ctx(), None, None, Mode::default());
         assert!(out.contains("## User context"));
         assert!(
             out.contains("Current: 2026-06-13, evening (America/Chicago)."),
@@ -420,7 +474,7 @@ mod tests {
         let reg = SkillRegistry::new();
         let mut user = ctx();
         user.time_of_day = TimeOfDay::Morning;
-        let out = build_system_prompt(None, &reg, &[], &user, None, Mode::default());
+        let out = build_system_prompt(None, &reg, &[], &user, None, None, Mode::default());
         assert!(
             out.contains("Current: 2026-06-13, morning (America/Chicago)."),
             "{out}"
@@ -445,6 +499,7 @@ mod tests {
             &["alpha".into()],
             &ctx(),
             None,
+            None,
             Mode::default(),
         );
         let persona = out.find("You are a coding assistant.").unwrap();
@@ -466,10 +521,11 @@ mod tests {
             &[],
             &ctx(),
             None,
+            None,
             Mode::default(),
         );
         assert!(with.starts_with("You are a coding assistant.\n\n"));
-        let without = build_system_prompt(None, &reg, &[], &ctx(), None, Mode::default());
+        let without = build_system_prompt(None, &reg, &[], &ctx(), None, None, Mode::default());
         assert!(!without.starts_with("You are"));
         assert!(without.starts_with("## Compacted tool results"));
     }
@@ -477,7 +533,15 @@ mod tests {
     #[test]
     fn blank_persona_is_ignored() {
         let reg = SkillRegistry::new();
-        let out = build_system_prompt(Some("   \n  "), &reg, &[], &ctx(), None, Mode::default());
+        let out = build_system_prompt(
+            Some("   \n  "),
+            &reg,
+            &[],
+            &ctx(),
+            None,
+            None,
+            Mode::default(),
+        );
         assert!(out.starts_with("## Compacted tool results"), "{out}");
     }
 
@@ -487,7 +551,7 @@ mod tests {
             skill("zeta", "Z things", "zbody"),
             skill("alpha", "A things", "abody"),
         ]);
-        let out = build_system_prompt(None, &reg, &[], &ctx(), None, Mode::default());
+        let out = build_system_prompt(None, &reg, &[], &ctx(), None, None, Mode::default());
         assert!(out.contains("## Available skills"));
         let a = out.find("- alpha: A things").unwrap();
         let z = out.find("- zeta: Z things").unwrap();
@@ -505,6 +569,7 @@ mod tests {
             &reg,
             &["rust-debug".into()],
             &ctx(),
+            None,
             None,
             Mode::default(),
         );
@@ -528,27 +593,36 @@ mod tests {
             &[],
             &ctx().with_working_dir("/Users/me/projects/flowforge_abid"),
             None,
+            None,
             Mode::default(),
         );
         assert!(
             with.contains("Working directory: /Users/me/projects/flowforge_abid"),
             "{with}"
         );
-        let without = build_system_prompt(None, &reg, &[], &ctx(), None, Mode::default());
+        let without = build_system_prompt(None, &reg, &[], &ctx(), None, None, Mode::default());
         assert!(!without.contains("Working directory:"), "{without}");
     }
 
     #[test]
     fn no_active_section_when_none_active() {
         let reg = registry(vec![skill("a", "desc", "body")]);
-        let out = build_system_prompt(None, &reg, &[], &ctx(), None, Mode::default());
+        let out = build_system_prompt(None, &reg, &[], &ctx(), None, None, Mode::default());
         assert!(!out.contains("## Active skill instructions"), "{out}");
     }
 
     #[test]
     fn unknown_active_name_is_skipped() {
         let reg = registry(vec![skill("a", "desc", "body")]);
-        let out = build_system_prompt(None, &reg, &["ghost".into()], &ctx(), None, Mode::default());
+        let out = build_system_prompt(
+            None,
+            &reg,
+            &["ghost".into()],
+            &ctx(),
+            None,
+            None,
+            Mode::default(),
+        );
         assert!(!out.contains("## Active skill instructions"), "{out}");
     }
 
@@ -556,7 +630,7 @@ mod tests {
     fn memory_block_is_appended_after_user_context() {
         let reg = SkillRegistry::new();
         let mem = "## Memory\n\nUser prefers Rust.";
-        let out = build_system_prompt(None, &reg, &[], &ctx(), Some(mem), Mode::default());
+        let out = build_system_prompt(None, &reg, &[], &ctx(), Some(mem), None, Mode::default());
         let user = out.find("## User context").unwrap();
         let memory = out.find("## Memory").unwrap();
         assert!(user < memory, "memory must follow user context: {out}");
@@ -566,9 +640,17 @@ mod tests {
     #[test]
     fn none_or_blank_memory_adds_nothing() {
         let reg = SkillRegistry::new();
-        let without = build_system_prompt(None, &reg, &[], &ctx(), None, Mode::default());
+        let without = build_system_prompt(None, &reg, &[], &ctx(), None, None, Mode::default());
         assert!(!without.contains("## Memory"));
-        let blank = build_system_prompt(None, &reg, &[], &ctx(), Some("   \n  "), Mode::default());
+        let blank = build_system_prompt(
+            None,
+            &reg,
+            &[],
+            &ctx(),
+            Some("   \n  "),
+            None,
+            Mode::default(),
+        );
         assert!(!blank.contains("## Memory"));
     }
 
@@ -580,7 +662,7 @@ mod tests {
         // guidance and before the volatile User context -- so it is always present
         // and never falls out of the prompt.
         let reg = SkillRegistry::new();
-        let out = build_system_prompt(None, &reg, &[], &ctx(), None, Mode::default());
+        let out = build_system_prompt(None, &reg, &[], &ctx(), None, None, Mode::default());
         let shell = out.find("## Shell environment").unwrap();
         let review = out
             .find("## Reviewing pull requests")
@@ -625,10 +707,98 @@ mod tests {
         // compaction_retrieve (see #512). The guidance must explicitly forbid
         // copying the markers into the reply.
         let reg = SkillRegistry::new();
-        let out = build_system_prompt(None, &reg, &[], &ctx(), None, Mode::default());
+        let out = build_system_prompt(None, &reg, &[], &ctx(), None, None, Mode::default());
         assert!(
             out.contains("never copy them into your reply"),
             "must forbid reproducing compaction markers: {out}"
+        );
+    }
+
+    // ── Goal injection (#718) ────────────────────────────────────────────────
+
+    fn active_goal() -> Goal {
+        use ff_core::{GoalBudget, GoalLedgerEntry, GoalSpend, StepStatus};
+        Goal {
+            session_id: "s1".into(),
+            objective: "Ship the prefix cache PR".into(),
+            status: GoalStatus::Active,
+            iteration: 2,
+            budget: GoalBudget {
+                max_iterations: 25,
+                max_tokens: None,
+                max_wall_ms: None,
+            },
+            spent: GoalSpend::default(),
+            ledger: vec![
+                GoalLedgerEntry {
+                    id: "step-1".into(),
+                    status: StepStatus::Done,
+                    claim: "Add cache_messages field".into(),
+                    action: Some("edited lib.rs".into()),
+                    evidence: vec!["cargo check passed".into()],
+                    verdict: Some(ff_core::Verdict::Match),
+                    next: None,
+                    created_ms: 0,
+                    updated_ms: 0,
+                },
+                GoalLedgerEntry {
+                    id: "step-2".into(),
+                    status: StepStatus::Active,
+                    claim: "Wire breakpoints in anthropic.rs".into(),
+                    action: None,
+                    evidence: vec![],
+                    verdict: None,
+                    next: None,
+                    created_ms: 0,
+                    updated_ms: 0,
+                },
+            ],
+            pending_steer: None,
+            created_ms: 0,
+            updated_ms: 0,
+        }
+    }
+
+    #[test]
+    fn goal_block_present_when_active() {
+        let reg = SkillRegistry::new();
+        let goal = active_goal();
+        let out = build_system_prompt(None, &reg, &[], &ctx(), None, Some(&goal), Mode::default());
+        assert!(out.contains("## Active goal (iteration 3 of 25)"), "{out}");
+        assert!(out.contains("Objective: Ship the prefix cache PR"), "{out}");
+        assert!(out.contains("Add cache_messages field [done]"), "{out}");
+        assert!(
+            out.contains("Wire breakpoints in anthropic.rs [pending]"),
+            "{out}"
+        );
+        assert!(out.contains("call `goal_complete`"), "{out}");
+    }
+
+    #[test]
+    fn goal_block_absent_when_none() {
+        let reg = SkillRegistry::new();
+        let out = build_system_prompt(None, &reg, &[], &ctx(), None, None, Mode::default());
+        assert!(!out.contains("## Active goal"), "{out}");
+    }
+
+    #[test]
+    fn goal_block_absent_when_completed() {
+        let reg = SkillRegistry::new();
+        let mut goal = active_goal();
+        goal.status = GoalStatus::Completed;
+        let out = build_system_prompt(None, &reg, &[], &ctx(), None, Some(&goal), Mode::default());
+        assert!(!out.contains("## Active goal"), "{out}");
+    }
+
+    #[test]
+    fn goal_block_includes_pending_steer() {
+        let reg = SkillRegistry::new();
+        let mut goal = active_goal();
+        goal.pending_steer = Some("Focus on the Bedrock path first".into());
+        let out = build_system_prompt(None, &reg, &[], &ctx(), None, Some(&goal), Mode::default());
+        assert!(
+            out.contains("User steer: Focus on the Bedrock path first"),
+            "{out}"
         );
     }
 }
