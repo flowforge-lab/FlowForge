@@ -1212,6 +1212,7 @@ pub async fn run_turn(
                 },
                 thinking: step_thinking,
                 max_tokens: ff_llm::budgeted_max_output_tokens(model, input_tokens),
+                cache_messages: true,
             };
 
             let mut stream = match provider.chat_stream(req).await {

@@ -1439,6 +1439,7 @@ impl AppState {
             tools: Vec::new(),
             thinking: false,
             max_tokens: Some(TITLE_MAX_TOKENS),
+            cache_messages: false,
         };
 
         let raw =
@@ -4115,6 +4116,7 @@ mod tests {
             tools: Vec::new(),
             thinking,
             max_tokens: None,
+            cache_messages: false,
         };
         let _ = provider.chat_stream(req).await.expect("send succeeds");
         let reqs = server.received_requests().await.expect("requests recorded");

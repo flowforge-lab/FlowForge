@@ -968,6 +968,7 @@ mod tests {
             tools: vec![],
             thinking: false,
             max_tokens: None,
+            cache_messages: false,
         }
     }
 
@@ -1233,6 +1234,7 @@ mod tests {
             tools: Vec::new(),
             thinking: false,
             max_tokens: None,
+            cache_messages: false,
         };
         let provider = OllamaProvider::new(server.uri()).with_documents(true);
         let mut stream = provider.chat_stream(req).await.unwrap();
@@ -1323,6 +1325,7 @@ mod tests {
             tools: Vec::new(),
             thinking: false,
             max_tokens: None,
+            cache_messages: false,
         }
     }
 

@@ -127,6 +127,7 @@ impl AbstractiveSummarizer {
             thinking: false,
             // Bounded internal output; no large tool-call payload to protect.
             max_tokens: None,
+            cache_messages: false,
         };
         let summary = collect_text(provider, req, cancel).await?;
         let summary = summary.trim();
