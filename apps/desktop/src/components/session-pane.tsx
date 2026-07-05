@@ -1,11 +1,14 @@
-import { Columns2, Rows2, X } from "@/components/ui/icon";
+import { useRef } from "react";
+import { Columns2, Rows2, Search, X } from "@/components/ui/icon";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { ChatView } from "@/components/chat-view";
 import { ContextGauge } from "@/components/context-gauge";
+import { FindBar } from "@/components/find-bar";
 import { InputBar } from "@/components/input-bar";
 import { PhenoSelector } from "@/components/pheno-selector";
 import { useChatStore } from "@/store/chat";
+import { useFindStore } from "@/store/find";
 import { usePanesStore, MAX_PANES } from "@/store/panes";
 
 // A single tiling pane (#148): one independent session rendered as a full chat
@@ -29,6 +32,12 @@ export function SessionPane({
   const splitFork = usePanesStore((s) => s.splitFork);
   const closePane = usePanesStore((s) => s.closePane);
   const atCap = usePanesStore((s) => s.leafCount() >= MAX_PANES);
+
+  const toggleFind = useFindStore((s) => s.toggleFind);
+  const findOpen = useFindStore((s) => s.open && s.sessionId === sessionId);
+  // Scopes the find bar's occurrence search to this pane's transcript so
+  // highlights never leak across split panes (#679).
+  const contentRef = useRef<HTMLDivElement>(null);
 
   const title = useChatStore((s) => {
     const session = s.sessions.find((x) => x.id === sessionId);
@@ -58,6 +67,16 @@ export function SessionPane({
           {/* Estimated context usage for this session (#282). Self-hides until
               the first turn completes with an estimate. */}
           <ContextGauge sessionId={sessionId} />
+          {/* Find in thread (#679): Cmd/Ctrl+F also toggles this. */}
+          <Button
+            variant="ghost"
+            size="icon-xs"
+            aria-pressed={findOpen}
+            title="Find in thread (⌘F)"
+            onClick={() => toggleFind(sessionId)}
+          >
+            <Search className="size-3.5" />
+          </Button>
           {/* Fork: duplicate this pane's session into the new pane (#149). */}
           <Button
             variant="ghost"
@@ -90,7 +109,8 @@ export function SessionPane({
         </div>
       </div>
 
-      <div className="flex min-h-0 flex-1 flex-col">
+      <div ref={contentRef} className="relative flex min-h-0 flex-1 flex-col">
+        {findOpen && <FindBar sessionId={sessionId} rootRef={contentRef} />}
         <ChatView sessionId={sessionId} />
         <InputBar sessionId={sessionId} focused={focused} />
       </div>

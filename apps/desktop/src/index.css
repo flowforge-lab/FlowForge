@@ -165,6 +165,21 @@ body {
   user-select: text;
 }
 
+/* In-thread find (#679): CSS Custom Highlight API paints for the find bar. A
+   conventional amber wash for all matches, deeper amber for the active one —
+   both pin an explicit dark text colour so they stay legible on ANY surface,
+   including the primary-tinted user bubble (a theme-token wash would vanish
+   there). Unsupported WebViews ignore these rules — the find bar still counts
+   and scrolls to matches. */
+::highlight(ff-find) {
+  background-color: #fde68a; /* amber-200 */
+  color: #1f2937; /* slate-800 */
+}
+::highlight(ff-find-active) {
+  background-color: #f59e0b; /* amber-500 */
+  color: #111827; /* slate-900 */
+}
+
 /* Quiet scrollbars, theme-aware. */
 ::-webkit-scrollbar {
   width: 8px;
