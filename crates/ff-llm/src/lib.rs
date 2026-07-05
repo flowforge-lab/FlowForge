@@ -196,6 +196,10 @@ pub struct ChatRequest {
     /// of the Bedrock #529 pin). `None` leaves the provider default. Honored on the
     /// OpenAI/gateway path; Bedrock and Anthropic pin their own ceilings internally.
     pub max_tokens: Option<u32>,
+    /// When true, the provider places cache breakpoints on conversation messages
+    /// (penultimate + index 0) so the growing history prefix is cached across turns.
+    /// Only effective on Anthropic and Bedrock providers that support prompt caching.
+    pub cache_messages: bool,
 }
 
 /// One incremental tool-call fragment within a stream. Servers may split a single
@@ -704,6 +708,7 @@ pub trait Provider: Send + Sync {
             tools: Vec::new(),
             thinking: false,
             max_tokens: None,
+            cache_messages: false,
         };
         let mut stream = self.chat_stream(req).await?;
         // Drain the provider's ramp depth (`warmup_ramp_steps`), then drop the

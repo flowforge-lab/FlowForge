@@ -189,6 +189,7 @@ impl CompactionStrategy for MemoryFlush {
                 thinking: false,
                 // Bounded internal output; no large tool-call payload to protect.
                 max_tokens: None,
+                cache_messages: false,
             };
             let calls = collect_tool_calls(ctx.provider, req).await?;
 

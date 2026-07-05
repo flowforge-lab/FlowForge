@@ -435,7 +435,7 @@ impl Provider for BedrockProvider {
     async fn chat_stream(&self, req: ChatRequest) -> Result<ChunkStream, LlmError> {
         let wire =
             crate::messages_for_wire(&req.messages, self.supports_vision, self.supports_documents);
-        let (mut system, messages) = to_converse(&wire);
+        let (mut system, mut messages) = to_converse(&wire);
         let client = self.client().await;
 
         // Prompt caching (#437): on models that support it, mark the stable
@@ -447,6 +447,20 @@ impl Provider for BedrockProvider {
         if cache {
             if let (false, Some(point)) = (system.is_empty(), cache_point()) {
                 system.push(SystemContentBlock::CachePoint(point));
+            }
+        }
+        // Message-level cache breakpoints (#763): mark the penultimate message and
+        // (when long enough) index 0 so the conversation prefix is cached across
+        // turns. Uses at most 2 of the remaining cache-point budget.
+        if cache && req.cache_messages && messages.len() >= 2 {
+            if let Some(point) = cache_point() {
+                let pen = messages.len() - 2;
+                messages[pen].content.push(ContentBlock::CachePoint(point));
+            }
+            if messages.len() >= 4 {
+                if let Some(point) = cache_point() {
+                    messages[0].content.push(ContentBlock::CachePoint(point));
+                }
             }
         }
         let thinking_config = req.thinking.then(|| self.thinking_config_for(&req.model));
@@ -530,6 +544,7 @@ impl Provider for BedrockProvider {
             tools: Vec::new(),
             thinking: false,
             max_tokens: None,
+            cache_messages: false,
         };
         let mut stream = self.chat_stream(req).await?;
         match stream.next().await {

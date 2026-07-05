@@ -733,6 +733,7 @@ mod tests {
             tools: Vec::new(),
             thinking: false,
             max_tokens: None,
+            cache_messages: false,
         };
         let body = captured_body(&provider, &server, req).await;
         let content = body["messages"][0]["content"]
@@ -777,6 +778,7 @@ mod tests {
             tools: Vec::new(),
             thinking: false,
             max_tokens: None,
+            cache_messages: false,
         };
         let body = captured_body(&provider, &server, req).await;
         let content = body["messages"][0]["content"]
@@ -1112,6 +1114,7 @@ mod tests {
             tools: Vec::new(),
             thinking,
             max_tokens: None,
+            cache_messages: false,
         }
     }
 
@@ -1280,6 +1283,7 @@ mod tests {
             tools: Vec::new(),
             thinking: false,
             max_tokens: None,
+            cache_messages: false,
         };
 
         let mut stream = provider.chat_stream(req).await.expect("headers arrive");
@@ -1364,6 +1368,7 @@ mod tests {
             tools: Vec::new(),
             thinking: false,
             max_tokens: None,
+            cache_messages: false,
         };
 
         // The stall is before any response, so it surfaces from chat_stream itself
