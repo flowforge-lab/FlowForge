@@ -508,7 +508,12 @@ export const useChatStore = create<ChatState>((set, get) => ({
     sessionId = get().activeSessionId ?? undefined,
     attachments,
   ) => {
-    if (!sessionId || get().streamingBySession[sessionId]) return;
+    if (
+      !sessionId ||
+      get().streamingBySession[sessionId] ||
+      get().turnStartBySession[sessionId]
+    )
+      return;
 
     // Auto-title: the backend seeds the title from the first user message; mirror
     // it optimistically here so the sidebar updates without waiting for a refetch.

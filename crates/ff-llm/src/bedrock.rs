@@ -654,34 +654,74 @@ fn enforce_tool_result_pairing(messages: Vec<Message>) -> Vec<Message> {
             _ => Vec::new(),
         };
         let synth: Vec<ContentBlock> = tool_use_ids
-            .into_iter()
+            .iter()
             .filter(|id| !covered.contains(id))
+            .cloned()
             .map(synthetic_tool_result)
             .collect();
-        if synth.is_empty() {
-            continue;
-        }
 
         match iter.peek_mut() {
-            // Prepend so tool results lead the following user turn.
             Some(next) if next.role == ConversationRole::User => {
-                let mut content = synth;
-                content.append(&mut next.content);
-                next.content = content;
+                // Strip orphaned toolResult blocks whose IDs don't belong to this
+                // assistant's toolUses (#744). A cancel+resend race can interleave
+                // results from a parallel loop into the wrong user turn.
+                next.content.retain(|b| match b {
+                    ContentBlock::ToolResult(r) => tool_use_ids.contains(&r.tool_use_id),
+                    _ => true,
+                });
+                if !synth.is_empty() {
+                    let mut content = synth;
+                    content.append(&mut next.content);
+                    next.content = content;
+                }
             }
-            // Trailing assistant, or a non-user message follows: insert a fresh user
-            // message carrying the synthetic results.
-            _ => out.push(
-                Message::builder()
-                    .role(ConversationRole::User)
-                    .set_content(Some(synth))
-                    .build()
-                    .expect("role is always set"),
-            ),
+            _ => {
+                if !synth.is_empty() {
+                    out.push(
+                        Message::builder()
+                            .role(ConversationRole::User)
+                            .set_content(Some(synth))
+                            .build()
+                            .expect("role is always set"),
+                    );
+                }
+            }
         }
     }
 
+    // Final sweep: strip orphaned toolResult blocks from user turns whose
+    // preceding assistant has no toolUse blocks at all (e.g. a text-only
+    // interrupted assistant followed by a displaced result).
+    strip_orphaned_trailing_results(&mut out);
     out
+}
+
+/// Remove toolResult blocks from any user turn whose preceding assistant has no
+/// toolUse blocks. Such results are orphans from a parallel-loop race (#744) and
+/// would cause a Bedrock 400 ("toolResult count exceeds toolUse count"). Also
+/// drops user turns left empty after stripping.
+fn strip_orphaned_trailing_results(messages: &mut Vec<Message>) {
+    let mut i = 1;
+    while i < messages.len() {
+        if messages[i].role == ConversationRole::User {
+            let prev_has_uses = i > 0
+                && messages[i - 1].role == ConversationRole::Assistant
+                && messages[i - 1]
+                    .content
+                    .iter()
+                    .any(|b| matches!(b, ContentBlock::ToolUse(_)));
+            if !prev_has_uses {
+                messages[i]
+                    .content
+                    .retain(|b| !matches!(b, ContentBlock::ToolResult(_)));
+                if messages[i].content.is_empty() {
+                    messages.remove(i);
+                    continue;
+                }
+            }
+        }
+        i += 1;
+    }
 }
 
 fn collect_tool_use_ids(msg: &Message) -> Vec<String> {
@@ -2191,5 +2231,135 @@ mod tests {
                 .any(|b| matches!(b, ContentBlock::Image(_))),
             "vision on: the image block is emitted"
         );
+    }
+
+    // --- #744 regression: parallel-loop interleaved results ---
+
+    fn tool_use_block(id: &str, name: &str) -> ContentBlock {
+        ContentBlock::ToolUse(
+            ToolUseBlock::builder()
+                .tool_use_id(id)
+                .name(name)
+                .input(Document::Object(HashMap::new()))
+                .build()
+                .unwrap(),
+        )
+    }
+
+    fn tool_result_block(id: &str) -> ContentBlock {
+        ContentBlock::ToolResult(
+            ToolResultBlock::builder()
+                .tool_use_id(id)
+                .content(ToolResultContentBlock::Text("ok".to_string()))
+                .build()
+                .unwrap(),
+        )
+    }
+
+    fn msg(role: ConversationRole, blocks: Vec<ContentBlock>) -> Message {
+        Message::builder()
+            .role(role)
+            .set_content(Some(blocks))
+            .build()
+            .unwrap()
+    }
+
+    /// Parallel-loop race: two consecutive assistant turns with tool_uses whose
+    /// results are displaced into each other's user turns. Before #744, this
+    /// produced user turns with more toolResult blocks than the preceding
+    /// assistant's toolUse count, causing a Bedrock 400.
+    #[test]
+    fn enforce_strips_orphaned_results_from_parallel_loop() {
+        let messages = vec![
+            // Assistant with 2 toolUses (merged from consecutive assistant msgs)
+            msg(
+                ConversationRole::Assistant,
+                vec![tool_use_block("A", "bash"), tool_use_block("B", "bash")],
+            ),
+            // User turn: only has result for A (B's result is displaced)
+            msg(ConversationRole::User, vec![tool_result_block("A")]),
+            // Next assistant with 1 toolUse
+            msg(
+                ConversationRole::Assistant,
+                vec![tool_use_block("C", "bash")],
+            ),
+            // User turn: has displaced result for B (not C!)
+            msg(ConversationRole::User, vec![tool_result_block("B")]),
+            // Next assistant with no toolUses (interrupted)
+            msg(
+                ConversationRole::Assistant,
+                vec![ContentBlock::Text("[stopped]".to_string())],
+            ),
+            // User turn: has displaced result for C
+            msg(ConversationRole::User, vec![tool_result_block("C")]),
+        ];
+
+        let fixed = enforce_tool_result_pairing(messages);
+
+        // Verify no user turn has more toolResults than the preceding assistant's toolUses
+        for (i, m) in fixed.iter().enumerate() {
+            if m.role == ConversationRole::User && i > 0 {
+                let result_count = m
+                    .content
+                    .iter()
+                    .filter(|b| matches!(b, ContentBlock::ToolResult(_)))
+                    .count();
+                let prev_use_count = fixed[i - 1]
+                    .content
+                    .iter()
+                    .filter(|b| matches!(b, ContentBlock::ToolUse(_)))
+                    .count();
+                assert!(
+                    result_count <= prev_use_count,
+                    "turn {i}: {result_count} toolResults > {prev_use_count} toolUses"
+                );
+            }
+        }
+
+        // Specifically: assistant[A,B] must be followed by user with results for A and B
+        let first_user = &fixed[1];
+        let first_user_ids: Vec<&str> = first_user
+            .content
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::ToolResult(r) => Some(r.tool_use_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(first_user_ids.contains(&"A"));
+        assert!(first_user_ids.contains(&"B"));
+        assert_eq!(first_user_ids.len(), 2);
+    }
+
+    /// A user turn with toolResults after a no-toolUse assistant (interrupted)
+    /// must have those results stripped entirely.
+    #[test]
+    fn enforce_strips_results_after_no_tooluse_assistant() {
+        let messages = vec![
+            msg(
+                ConversationRole::Assistant,
+                vec![tool_use_block("X", "bash")],
+            ),
+            msg(ConversationRole::User, vec![tool_result_block("X")]),
+            // Interrupted assistant: text only, no toolUse
+            msg(
+                ConversationRole::Assistant,
+                vec![ContentBlock::Text("[stopped]".to_string())],
+            ),
+            // Orphaned result from a parallel loop
+            msg(ConversationRole::User, vec![tool_result_block("Y")]),
+        ];
+
+        let fixed = enforce_tool_result_pairing(messages);
+
+        // The orphaned user turn should be removed (empty after stripping)
+        assert_eq!(
+            fixed.len(),
+            3,
+            "orphaned user turn should be removed; got {:?}",
+            fixed.iter().map(|m| &m.role).collect::<Vec<_>>()
+        );
+        // Last message should be the interrupted assistant
+        assert_eq!(fixed[2].role, ConversationRole::Assistant);
     }
 }
