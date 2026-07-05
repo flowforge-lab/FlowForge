@@ -364,6 +364,15 @@ pub struct ToolContext<'a> {
     /// Tier-2 abstractive cold-tail summary config (RFC 0016 M7.0). Default-off;
     /// the host enables/tunes it. Sub-agents inherit the parent's setting.
     pub abstractive: AbstractiveConfig,
+    /// Fast model for compaction/flush LLM calls (#756). When set, memory flush
+    /// and abstractive summarization use this instead of the session model, so a
+    /// cheap model (Haiku, gpt-4o-mini) handles bookkeeping without blocking the
+    /// main turn with a slow Opus round-trip. `None` = use session model (legacy).
+    pub compaction_model: Option<String>,
+    /// Explicit compaction budget in tokens (#756). When set, overrides the
+    /// default `model_window * CONTEXT_BUDGET_SAFETY`. Maps to the UI's
+    /// "Summarization threshold" slider. `None` = use the computed default.
+    pub compaction_budget: Option<u64>,
 }
 
 impl<'a> ToolContext<'a> {
@@ -386,6 +395,8 @@ impl<'a> ToolContext<'a> {
             mode: Mode::default(),
             matrix,
             abstractive: AbstractiveConfig::default(),
+            compaction_model: None,
+            compaction_budget: None,
         }
     }
 }
@@ -800,7 +811,9 @@ pub async fn run_turn(
     // large-window model isn't force-compacted at a small fixed ceiling. Built
     // once per turn and reused for every pressure check below.
     let estimator = ProxyTokenEstimator {
-        budget_tokens: ((provider.context_window(model) as f64) * CONTEXT_BUDGET_SAFETY) as u64,
+        budget_tokens: tools.compaction_budget.unwrap_or_else(|| {
+            ((provider.context_window(model) as f64) * CONTEXT_BUDGET_SAFETY) as u64
+        }),
     };
     let mut turn_count: u32 = 0;
     // Repeated-call / no-progress guard (#244 R2): count identical `(tool, arguments)`
@@ -866,6 +879,7 @@ pub async fn run_turn(
             // Surface provenance (#283) when the flush actually wrote durable facts;
             // a no-op / NoReply / failure stays silent (best-effort — never aborts
             // the user's turn).
+            let flush_model = tools.compaction_model.as_deref().unwrap_or(model);
             if let Ok(CompactionOutcome::Wrote { writes }) = MemoryFlush
                 .compact(CompactionContext {
                     provider,
@@ -873,7 +887,7 @@ pub async fn run_turn(
                     registry: tools.registry,
                     root: tools.root,
                     session_id,
-                    model,
+                    model: flush_model,
                     cancel: cancel.clone(),
                 })
                 .await
@@ -969,8 +983,15 @@ pub async fn run_turn(
             match reuse {
                 Some(out) => out,
                 None => {
+                    let compact_model = tools.compaction_model.as_deref().unwrap_or(model);
                     match AbstractiveSummarizer::new(tools.abstractive.clone())
-                        .summarize_cold(provider, model, &wire, KEEP_RECENT_VERBATIM, &cancel)
+                        .summarize_cold(
+                            provider,
+                            compact_model,
+                            &wire,
+                            KEEP_RECENT_VERBATIM,
+                            &cancel,
+                        )
                         .await
                     {
                         Ok(Some(result)) => {
@@ -1830,6 +1851,8 @@ async fn run_subagent(
         mode: parent.mode,
         matrix: parent.matrix,
         abstractive: parent.abstractive.clone(),
+        compaction_model: parent.compaction_model.clone(),
+        compaction_budget: parent.compaction_budget,
     };
 
     // Child events are swallowed: the parent receives only the summary, never the
@@ -2103,6 +2126,8 @@ mod tests {
             mode: Mode::Plan,
             matrix: &matrix,
             abstractive: AbstractiveConfig::default(),
+            compaction_model: None,
+            compaction_budget: None,
         };
 
         run_turn(
@@ -4242,6 +4267,8 @@ mod tests {
             mode: Mode::default(),
             matrix: &matrix,
             abstractive: AbstractiveConfig::default(),
+            compaction_model: None,
+            compaction_budget: None,
         };
 
         run_turn(
@@ -4299,6 +4326,8 @@ mod tests {
             mode: Mode::default(),
             matrix: &matrix,
             abstractive: AbstractiveConfig::default(),
+            compaction_model: None,
+            compaction_budget: None,
         };
 
         run_turn(

@@ -2,7 +2,8 @@
 // The provider registry (connections + active pointer) is durable backend config,
 // loaded from / persisted via IPC; reasoning effort is now a per-connection field on
 // it (#395), set like `thinking` via `upsertConnection`. The summarization threshold
-// still has no backend field, so it persists locally under `ff-model`; `partialize`
+// persists locally AND writes to the backend's `compactionBudget` per-connection
+// (#756), so the slider actually controls when compaction fires; `partialize`
 // keeps the IPC-backed cache out of localStorage.
 
 import { create } from "zustand";
@@ -396,8 +397,22 @@ export const useModelConfigStore = create<ModelConfigState>()(
             set({ saving: false, error: errMsg(err) });
           }
         },
-        setSummarizationThreshold: (tokens) =>
-          set({ summarizationThreshold: clampThreshold(tokens) }),
+        setSummarizationThreshold: (tokens) => {
+          const clamped = clampThreshold(tokens);
+          set({ summarizationThreshold: clamped });
+          // Wire to backend (#756): persist as compactionBudget on the active
+          // connection so the agent uses it as the compaction trigger threshold.
+          const conn = get().registry?.connections.find(
+            (c) => c.id === get().registry?.active,
+          );
+          if (conn) {
+            ipc
+              .upsertConnection({ ...conn, compactionBudget: clamped })
+              .then(() => ipc.getProviderRegistry())
+              .then((registry) => set({ registry }))
+              .catch(() => {});
+          }
+        },
 
         resetModel: () => set({ ...LOCAL_REASONING_DEFAULTS }),
       };

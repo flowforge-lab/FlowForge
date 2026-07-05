@@ -93,4 +93,16 @@ awsProfile?: string,
  * AWS access key id for [`BedrockAuth::IamKeys`]. A non-secret identifier; the
  * paired secret access key and session token live in the keychain, never here.
  */
-accessKeyId?: string, };
+accessKeyId?: string, 
+/**
+ * Fast model for compaction/flush LLM calls (#756). When set, memory flush
+ * and abstractive summarization use this model instead of the session model.
+ * Example: `"global.anthropic.claude-haiku-4-5-20251001-v1:0"` (Bedrock), `"gpt-4o-mini"` (OpenAI).
+ */
+compactionModel?: string, 
+/**
+ * Context budget (in tokens) at which compaction engages (#756). When set,
+ * overrides the default `model_window * 0.8`. Maps to the UI's
+ * "Summarization threshold" slider. `None` = use the computed default.
+ */
+compactionBudget?: number, };

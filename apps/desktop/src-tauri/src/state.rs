@@ -390,6 +390,8 @@ fn config_to_connection(config: ProviderConfig) -> ProviderConnection {
         auth_mode: None,
         aws_profile: None,
         access_key_id: None,
+        compaction_model: None,
+        compaction_budget: None,
     }
 }
 
@@ -1709,6 +1711,37 @@ impl AppState {
     }
 
     /// The full connection registry (clone — callers never hold the lock).
+    /// Resolve the fast compaction model for a connection (#756).
+    /// Precedence: env `FF_COMPACTION_MODEL` > connection config > None.
+    pub fn compaction_model(&self, connection_id: &str) -> Option<String> {
+        compaction_model_for(
+            self.registry
+                .lock()
+                .unwrap()
+                .connections
+                .iter()
+                .find(|c| c.id == connection_id),
+        )
+    }
+
+    /// Resolve the compaction budget for a connection (#756).
+    /// Precedence: env `FF_COMPACTION_BUDGET` > connection config > None (= computed).
+    pub fn compaction_budget(&self, connection_id: &str) -> Option<u64> {
+        if let Some(v) = std::env::var("FF_COMPACTION_BUDGET")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+        {
+            return Some(v);
+        }
+        self.registry
+            .lock()
+            .unwrap()
+            .connections
+            .iter()
+            .find(|c| c.id == connection_id)
+            .and_then(|c| c.compaction_budget)
+    }
+
     pub fn provider_registry(&self) -> ProviderRegistry {
         let mut reg = self.registry.lock().unwrap().clone();
         // Cross-check `has_key` against the live OS keychain. An app rebuild can
@@ -2554,6 +2587,23 @@ pub(crate) fn abstractive_config_from_env() -> AbstractiveConfig {
         config.fire_at_fraction = at;
     }
     config
+}
+
+/// Fast model for compaction/flush LLM calls (#756). Precedence:
+/// 1. `FF_COMPACTION_MODEL` env var (highest — dev override)
+/// 2. `compaction_model` on the active `ProviderConnection` (user config)
+/// 3. `None` = use session model (legacy)
+pub(crate) fn compaction_model_for(
+    connection: Option<&ff_core::ProviderConnection>,
+) -> Option<String> {
+    if let Some(m) = std::env::var("FF_COMPACTION_MODEL")
+        .ok()
+        .map(|m| m.trim().to_string())
+        .filter(|m| !m.is_empty())
+    {
+        return Some(m);
+    }
+    connection.and_then(|c| c.compaction_model.clone())
 }
 
 /// The `(base_url, model, api_key)` for a local embedder, or `None` to stay on the
@@ -3925,6 +3975,8 @@ mod tests {
                 auth_mode: None,
                 aws_profile: None,
                 access_key_id: None,
+                compaction_model: None,
+                compaction_budget: None,
             }],
             schema_version: 0,
         };
@@ -4082,6 +4134,8 @@ mod tests {
             auth_mode: None,
             aws_profile: None,
             access_key_id: None,
+            compaction_model: None,
+            compaction_budget: None,
         }
     }
 
@@ -4141,6 +4195,8 @@ mod tests {
                     auth_mode: None,
                     aws_profile: None,
                     access_key_id: None,
+                    compaction_model: None,
+                    compaction_budget: None,
                 },
                 ProviderConnection {
                     id: "aws-bedrock".into(),
@@ -4160,6 +4216,8 @@ mod tests {
                     auth_mode: Some(BedrockAuth::Profile),
                     aws_profile: Some("bedrock-profile".into()),
                     access_key_id: None,
+                    compaction_model: None,
+                    compaction_budget: None,
                 },
             ],
             schema_version: 0,
@@ -4389,6 +4447,8 @@ mod tests {
             auth_mode: None,
             aws_profile: None,
             access_key_id: None,
+            compaction_model: None,
+            compaction_budget: None,
         });
         assert_eq!(stored.id, "openrouter");
         assert_eq!(state.provider_registry().connections.len(), 3);
@@ -4481,6 +4541,8 @@ mod tests {
             auth_mode: None,
             aws_profile: None,
             access_key_id: None,
+            compaction_model: None,
+            compaction_budget: None,
         }
     }
 
@@ -4544,6 +4606,8 @@ mod tests {
             auth_mode,
             aws_profile: None,
             access_key_id: None,
+            compaction_model: None,
+            compaction_budget: None,
         }
     }
 
