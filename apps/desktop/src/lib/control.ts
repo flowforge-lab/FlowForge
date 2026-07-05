@@ -6,6 +6,8 @@
 // Kept free of React/stores so the defaults + matrix derivation are unit-testable
 // in vitest's node env (mirrors lib/search.ts / lib/mcp.ts).
 
+import type { Safety, PermissionCell } from "@/bindings";
+
 export type DefaultMode = "plan" | "auto" | "act";
 
 export type PermissionRow =
@@ -117,6 +119,41 @@ export function cellToDecision(mark: CellMark): PermissionDecision {
   if (mark === "check") return "allow";
   if (mark === "cross") return "deny";
   return "ask";
+}
+
+// ─── Live permission-matrix mapping (#702) ──────────────────────────────────
+// Bridges the FE presentation vocabulary (rows/marks) to the real backend matrix
+// (`Safety`/`PermissionCell` from bindings). The matrix grid drives runtime
+// approval, unlike the presentation-only `MODE_CELLS` above.
+
+/** Presentation row → backend `Safety` tier. `DefaultMode` doubles as `Mode`
+ *  (identical string members), so no mode mapping is needed. */
+export const ROW_SAFETY: Record<PermissionRow, Safety> = {
+  read: "readonly",
+  localWrites: "write",
+  externalChanges: "sensitive",
+  dangerous: "dangerous",
+};
+
+/** Render a backend cell with the existing `CellMarkIcon` vocabulary. */
+export function cellToMark(cell: PermissionCell): CellMark {
+  if (cell === "allow") return "check";
+  if (cell === "deny") return "cross";
+  return "ask";
+}
+
+/** Next value when a matrix cell is clicked: Allow → Ask → Deny → Allow. */
+export function cycleCell(cell: PermissionCell): PermissionCell {
+  if (cell === "allow") return "ask";
+  if (cell === "ask") return "deny";
+  return "allow";
+}
+
+/** Human-readable label for a cell state (tooltips / aria). */
+export function cellLabel(cell: PermissionCell): string {
+  if (cell === "allow") return "Allowed";
+  if (cell === "ask") return "Ask first";
+  return "Denied";
 }
 
 /** The per-row policy implied by a mode's canonical cells. */

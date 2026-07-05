@@ -3,10 +3,16 @@
 
 use crate::Mode;
 use serde::{Deserialize, Serialize};
+use ts_rs::TS;
 
 /// How much trust a given tool invocation needs. The agent loop auto-runs
 /// [`Safety::ReadOnly`] and defers higher tiers to the [`PermissionMatrix`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+///
+/// Part of the IPC/settings surface (the Control-panel matrix, #702), exported to
+/// TypeScript via `ts-rs`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, TS)]
+#[serde(rename_all = "lowercase")]
+#[ts(export, export_to = "../../../apps/desktop/src/bindings/")]
 pub enum Safety {
     ReadOnly,
     Write,
@@ -20,8 +26,9 @@ pub enum Safety {
 
 /// What happens when a tool at a given [`Safety`] tier is invoked in a given
 /// [`Mode`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "lowercase")]
+#[ts(export, export_to = "../../../apps/desktop/src/bindings/")]
 pub enum PermissionCell {
     /// Execute without prompting.
     Allow,
@@ -113,6 +120,55 @@ impl PermissionMatrix {
     pub fn overrides(&self) -> &HashMap<String, PermissionCell> {
         &self.overrides
     }
+
+    /// Flatten the matrix into a self-describing list (Mode × Safety → cell), the
+    /// shape the Control panel consumes so the FE never depends on the private
+    /// index ordering (#702).
+    pub fn entries(&self) -> Vec<PermissionMatrixEntry> {
+        const MODES: [Mode; 3] = [Mode::Plan, Mode::Auto, Mode::Act];
+        const SAFETIES: [Safety; 4] = [
+            Safety::ReadOnly,
+            Safety::Write,
+            Safety::Sensitive,
+            Safety::Dangerous,
+        ];
+        let mut cells = Vec::with_capacity(MODES.len() * SAFETIES.len());
+        for mode in MODES {
+            for safety in SAFETIES {
+                cells.push(PermissionMatrixEntry {
+                    mode,
+                    safety,
+                    cell: self.cell(mode, safety),
+                });
+            }
+        }
+        cells
+    }
+
+    /// The wire view of the matrix, for `get_permission_matrix` (#702).
+    pub fn view(&self) -> PermissionMatrixView {
+        PermissionMatrixView {
+            cells: self.entries(),
+        }
+    }
+}
+
+/// One flattened matrix cell: which [`PermissionCell`] applies at a given
+/// [`Mode`] × [`Safety`]. Part of the IPC surface (#702).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../apps/desktop/src/bindings/")]
+pub struct PermissionMatrixEntry {
+    pub mode: Mode,
+    pub safety: Safety,
+    pub cell: PermissionCell,
+}
+
+/// The Control panel's view of the permission state (#702): the full matrix as a
+/// flat cell list. Per-tool overrides (#700) will be added here as a second field.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../apps/desktop/src/bindings/")]
+pub struct PermissionMatrixView {
+    pub cells: Vec<PermissionMatrixEntry>,
 }
 
 fn mode_idx(mode: Mode) -> usize {
@@ -180,6 +236,32 @@ mod tests {
         // An empty object should deserialize to the default matrix.
         let deser: PermissionMatrix = serde_json::from_str("{}").unwrap();
         assert_eq!(deser, PermissionMatrix::default());
+    }
+
+    #[test]
+    fn entries_cover_every_cell() {
+        let m = PermissionMatrix::default();
+        let entries = m.entries();
+        // 3 modes × 4 safety tiers.
+        assert_eq!(entries.len(), 12);
+        // Every listed cell matches the matrix lookup, and the flat list agrees
+        // with `view()`.
+        for e in &entries {
+            assert_eq!(m.cell(e.mode, e.safety), e.cell);
+        }
+        assert_eq!(m.view().cells, entries);
+    }
+
+    #[test]
+    fn view_round_trips_through_serde() {
+        // The wire view is what the Control panel consumes; make sure it survives
+        // JSON with the lowercase enum spellings the FE bindings expect.
+        let view = PermissionMatrix::default().view();
+        let json = serde_json::to_string(&view).unwrap();
+        assert!(json.contains("\"readonly\""));
+        assert!(json.contains("\"allow\""));
+        let deser: PermissionMatrixView = serde_json::from_str(&json).unwrap();
+        assert_eq!(view, deser);
     }
 
     #[test]

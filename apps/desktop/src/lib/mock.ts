@@ -42,6 +42,10 @@ import type {
   MemoryOverview,
   MemoryFlushedEvent,
   UpdateProgressEvent,
+  Mode,
+  Safety,
+  PermissionCell,
+  PermissionMatrixView,
 } from "../bindings";
 import type { Format } from "../bindings/Format";
 import type { SecretKind } from "../bindings/SecretKind";
@@ -506,6 +510,37 @@ function searchHit(
   };
 }
 
+/** The RFC 0019 §3 default permission matrix, mirroring Rust's
+ *  `PermissionMatrix::default()` (#702). Flattened Mode × Safety cell list. */
+function defaultPermissionMatrix(): PermissionMatrixView {
+  const rows: Record<Mode, Record<Safety, PermissionCell>> = {
+    plan: {
+      readonly: "allow",
+      write: "deny",
+      sensitive: "deny",
+      dangerous: "deny",
+    },
+    auto: {
+      readonly: "allow",
+      write: "allow",
+      sensitive: "ask",
+      dangerous: "deny",
+    },
+    act: {
+      readonly: "allow",
+      write: "allow",
+      sensitive: "allow",
+      dangerous: "ask",
+    },
+  };
+  const modes: Mode[] = ["plan", "auto", "act"];
+  const safeties: Safety[] = ["readonly", "write", "sensitive", "dangerous"];
+  const cells = modes.flatMap((mode) =>
+    safeties.map((safety) => ({ mode, safety, cell: rows[mode][safety] })),
+  );
+  return { cells };
+}
+
 export class MockIpc implements FfIpc {
   private sessions = new Map<string, Session>();
   private messages = new Map<string, Message[]>();
@@ -675,6 +710,10 @@ export class MockIpc implements FfIpc {
   // Control settings (Issue #127). In-memory for the mock session; structurally
   // cloned on read/write so callers can't mutate the stored copy.
   private controlConfig: ControlConfig = structuredClone(CONTROL_DEFAULTS);
+
+  // Permission matrix (#702). Seeded with the RFC 0019 §3 default, matching the
+  // Rust `PermissionMatrix::default()`; in-memory for the mock session.
+  private permissionMatrix: PermissionMatrixView = defaultPermissionMatrix();
 
   // Scheduled tasks (SET.9). In-memory for the mock session — created tasks survive
   // a section reopen but reset on app reload (no real scheduler).
@@ -1514,6 +1553,22 @@ export class MockIpc implements FfIpc {
   async setControlConfig(config: ControlConfig): Promise<ControlConfig> {
     this.controlConfig = structuredClone(config);
     return structuredClone(this.controlConfig);
+  }
+
+  async getPermissionMatrix(): Promise<PermissionMatrixView> {
+    return structuredClone(this.permissionMatrix);
+  }
+
+  async setPermissionCell(
+    mode: Mode,
+    safety: Safety,
+    cell: PermissionCell,
+  ): Promise<PermissionMatrixView> {
+    const entry = this.permissionMatrix.cells.find(
+      (c) => c.mode === mode && c.safety === safety,
+    );
+    if (entry) entry.cell = cell;
+    return structuredClone(this.permissionMatrix);
   }
 
   async listScheduledTasks(): Promise<ScheduledTask[]> {

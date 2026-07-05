@@ -745,6 +745,21 @@ fn load_permission_matrix() -> ff_core::PermissionMatrix {
         .unwrap_or_default()
 }
 
+/// Persist the permission matrix (#702). Best-effort and atomic, like
+/// `save_search_config`: a write failure leaves the in-memory matrix authoritative
+/// for this session rather than failing the edit.
+fn save_permission_matrix(matrix: &ff_core::PermissionMatrix) {
+    let Some(path) = permission_matrix_path() else {
+        return;
+    };
+    let Ok(json) = serde_json::to_string_pretty(matrix) else {
+        return;
+    };
+    if let Err(e) = write_atomic(&path, &json) {
+        eprintln!("failed to persist permission matrix: {e}");
+    }
+}
+
 /// `~/.flowforge/phenos`, where phenotype definition TOML files live.
 fn phenotypes_root() -> PathBuf {
     dirs::home_dir()
@@ -1039,7 +1054,8 @@ pub struct AppState {
     default_mode: Mutex<Mode>,
     /// Permission matrix (#699, RFC 0019 §3): Mode × Safety → Allow/Ask/Deny.
     /// Persisted to `permissions.json`; falls back to Default on missing/corrupt file.
-    pub permission_matrix: ff_core::PermissionMatrix,
+    /// Editable at runtime from the Control panel (#702) via [`set_permission_cell`].
+    permission_matrix: Mutex<ff_core::PermissionMatrix>,
     /// Per-skill telemetry aggregates (RFC 0001 §8), persisted to
     /// `~/.flowforge/skill_signals.json`. Updated at each turn's start/end; read by
     /// the manual optimize flow's cost estimates.
@@ -1189,7 +1205,7 @@ impl AppState {
             active_skills: Mutex::new(BTreeSet::new()),
             active_phenotype: Mutex::new(default_phenotype()),
             default_mode: Mutex::new(load_default_mode()),
-            permission_matrix: load_permission_matrix(),
+            permission_matrix: Mutex::new(load_permission_matrix()),
             signals: Mutex::new(load_signals()),
             _mcp_watcher: Mutex::new(None),
             _git_watcher: Mutex::new(None),
@@ -2297,6 +2313,35 @@ impl AppState {
     pub fn set_default_mode(&self, mode: Mode) {
         *self.default_mode.lock().unwrap() = mode;
         save_default_mode(mode);
+    }
+
+    /// A snapshot of the permission matrix (#699/#702). Cloned so callers can hold
+    /// it across an async turn without pinning the lock.
+    pub fn permission_matrix(&self) -> ff_core::PermissionMatrix {
+        self.permission_matrix.lock().unwrap().clone()
+    }
+
+    /// The Control-panel view of the matrix (#702).
+    pub fn permission_matrix_view(&self) -> ff_core::PermissionMatrixView {
+        self.permission_matrix.lock().unwrap().view()
+    }
+
+    /// Edit and persist a single matrix cell (#702), returning the updated view.
+    pub fn set_permission_cell(
+        &self,
+        mode: Mode,
+        safety: ff_core::Safety,
+        cell: ff_core::PermissionCell,
+    ) -> ff_core::PermissionMatrixView {
+        // Clone + drop the guard before the disk write so the hot read path
+        // (`permission_matrix()` on the live approval gate) doesn't block on I/O.
+        let (view, snapshot) = {
+            let mut guard = self.permission_matrix.lock().unwrap();
+            guard.set_cell(mode, safety, cell);
+            (guard.view(), guard.clone())
+        };
+        save_permission_matrix(&snapshot);
+        view
     }
 
     /// Resolve the mode a turn for `session_id` runs as (#265): an explicit per-pane
