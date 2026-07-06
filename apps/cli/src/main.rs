@@ -6,8 +6,14 @@
 //! assumes a POSIX shell).
 
 mod approver;
+mod config;
 mod host;
 mod json_events;
+mod registry;
+mod secrets;
+
+#[cfg(test)]
+mod test_support;
 
 use std::io::{BufRead, Write};
 use std::process::ExitCode;
@@ -17,6 +23,7 @@ use ff_agent::{run_turn, AgentEvent, CancelToken, ToolContext, UserContext};
 use ff_core::{Mode, PermissionMatrix, ReasoningVisibility, Role};
 
 use crate::approver::{ApprovalMode, CliApprover};
+use crate::config::ConfigCommand;
 
 /// FlowForge on the command line: run an agent turn, inspect skills, no GUI.
 /// With no subcommand, opens an interactive REPL (multi-turn chat).
@@ -52,7 +59,7 @@ impl From<ModeArg> for Mode {
     }
 }
 
-#[derive(Subcommand)]
+#[derive(Subcommand, Debug)]
 enum Command {
     /// Run a single agent turn against a prompt and stream the result.
     ///
@@ -107,9 +114,17 @@ enum Command {
         #[command(subcommand)]
         command: SkillsCommand,
     },
+    /// Inspect or modify provider credentials (#724). Reads/writes the same
+    /// `provider-registry.json` the desktop's settings panel uses, and stores
+    /// secrets in the OS keychain. See `flowforge config --help` for the
+    /// sub-subcommands (`list`, `<provider> <secret> <value|--stdin|--clear>`).
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommand,
+    },
 }
 
-#[derive(Subcommand)]
+#[derive(Subcommand, Debug)]
 enum SkillsCommand {
     /// List installed skills and their descriptions.
     List,
@@ -154,6 +169,7 @@ async fn main() -> ExitCode {
         Command::Skills { command } => match command {
             SkillsCommand::List => skills_list(),
         },
+        Command::Config { command } => config::run(command),
     }
 }
 
@@ -694,6 +710,18 @@ mod tests {
     #[test]
     fn cli_definition_is_valid() {
         Cli::command().debug_assert();
+    }
+
+    /// The `config` subcommand (issue #724) parses through the real clap tree
+    /// — guards against accidental rename or move of the `Config` variant.
+    #[test]
+    fn config_subcommand_parses() {
+        use clap::Parser;
+        let cli = Cli::try_parse_from(["flowforge", "config", "list"]).expect("config list");
+        match cli.command.expect("config present") {
+            super::Command::Config { .. } => {}
+            other => panic!("expected Config, got {other:?}"),
+        }
     }
 
     #[test]

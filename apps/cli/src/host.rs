@@ -15,6 +15,10 @@ use ff_skills::SkillRegistry;
 /// The provider + default model, honoring the same `~/.config/flowforge/provider.json`
 /// the desktop app persists, so a provider chosen in the GUI is respected here.
 /// Falls back to the default (local candle-vllm) when absent or unreadable.
+// TODO(#724 follow-up): adopt `provider-registry.json` (loaded via
+// `crate::registry::load_registry`) so the chat/run arms see the same
+// connections the new `flowforge config` subcommand edits. Kept on the
+// legacy singleton for now to keep the chat surface unchanged.
 pub fn load_provider() -> (Box<dyn Provider>, String) {
     let config = load_provider_config();
     let model = config.model.clone();

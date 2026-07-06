@@ -1934,6 +1934,8 @@ dependencies = [
  "ff-skills",
  "ff-tools",
  "futures-util",
+ "keyring",
+ "security-framework 3.7.0",
  "serde_json",
  "tempfile",
  "tokio",
