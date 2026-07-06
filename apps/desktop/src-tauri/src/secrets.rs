@@ -27,8 +27,13 @@ const SERVICE: &str = "flowforge";
 // The Data Protection Keychain (kSecUseDataProtectionKeychain) does NOT prompt
 // the user for access — it grants access based on the app's code-signing team
 // rather than per-binary identity, so dev rebuilds and updates never trigger a
-// keychain password dialog. This replaces the previous `keyring` crate backend
-// which used the legacy login.keychain and prompted on every signature change.
+// keychain password dialog.
+//
+// However, Data Protection requires a real Apple code-signing identity with
+// keychain-access-groups entitlement. Ad-hoc signed dev builds (dev-install.sh)
+// get errSecMissingEntitlement (-34018). FallbackStore (#791) tries Data
+// Protection first and falls back to the keyring crate (legacy login keychain)
+// which works for ad-hoc builds but may prompt once per rebuild.
 // ---------------------------------------------------------------------------
 
 #[cfg(not(test))]
@@ -76,15 +81,14 @@ impl SecretStore for DataProtectionStore {
 }
 
 // ---------------------------------------------------------------------------
-// Windows / Linux: keyring crate (unchanged).
+// keyring crate: legacy login keychain on macOS, Credential Manager on Windows,
+// Secret Service on Linux. Works with ad-hoc signed builds but may prompt.
 // ---------------------------------------------------------------------------
 
 #[cfg(not(test))]
-#[cfg(not(target_os = "macos"))]
 struct KeyringStore;
 
 #[cfg(not(test))]
-#[cfg(not(target_os = "macos"))]
 impl SecretStore for KeyringStore {
     fn set(&self, account: &str, value: &str) -> Result<(), String> {
         keyring::Entry::new(SERVICE, account)
@@ -105,6 +109,43 @@ impl SecretStore for KeyringStore {
             Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
             Err(e) => Err(e.to_string()),
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// macOS fallback: try Data Protection first, fall back to keyring (#791).
+// Production builds (Apple Developer cert) use Data Protection silently.
+// Dev builds (ad-hoc) automatically degrade to keyring (legacy login keychain).
+// ---------------------------------------------------------------------------
+
+#[cfg(not(test))]
+#[cfg(target_os = "macos")]
+struct FallbackStore {
+    primary: DataProtectionStore,
+    fallback: KeyringStore,
+}
+
+#[cfg(not(test))]
+#[cfg(target_os = "macos")]
+impl SecretStore for FallbackStore {
+    fn set(&self, account: &str, value: &str) -> Result<(), String> {
+        match self.primary.set(account, value) {
+            Ok(()) => Ok(()),
+            Err(_) => self.fallback.set(account, value),
+        }
+    }
+
+    fn get(&self, account: &str) -> Option<String> {
+        self.primary
+            .get(account)
+            .or_else(|| self.fallback.get(account))
+    }
+
+    fn delete(&self, account: &str) -> Result<(), String> {
+        // Best-effort cleanup from both backends.
+        let _ = self.primary.delete(account);
+        let _ = self.fallback.delete(account);
+        Ok(())
     }
 }
 
@@ -145,7 +186,10 @@ fn store() -> &'static Arc<dyn SecretStore> {
         #[cfg(not(test))]
         #[cfg(target_os = "macos")]
         {
-            Arc::new(DataProtectionStore)
+            Arc::new(FallbackStore {
+                primary: DataProtectionStore,
+                fallback: KeyringStore,
+            })
         }
         #[cfg(not(test))]
         #[cfg(not(target_os = "macos"))]
