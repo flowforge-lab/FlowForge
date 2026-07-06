@@ -11,8 +11,8 @@ use ff_agent::{
     DEFAULT_FLUSH_AT_FRACTION,
 };
 use ff_core::{
-    model_supports_documents, model_supports_vision, BedrockAuth, ConnectionId, McpScope,
-    McpServerConfig, McpServerState, McpServerStatus, Mode, ModelSelection, Phenotype,
+    model_supports_documents, model_supports_vision, BedrockAuth, ConnectionId, GoalStore,
+    McpScope, McpServerConfig, McpServerState, McpServerStatus, Mode, ModelSelection, Phenotype,
     ProviderConfig, ProviderConnection, ProviderKind, ProviderRegistry, ResolvedModel,
     SearchConfig, SecretKind, SessionWorkspace,
 };
@@ -635,6 +635,23 @@ fn scheduled_db_path() -> Option<PathBuf> {
     dirs::config_dir().map(|d| d.join("flowforge").join("scheduled.db"))
 }
 
+/// `~/.flowforge/goals/` — the directory of `<session_id>.json` goal checkpoints
+/// (RFC 0020 §5, #715/#716). In tests, a per-process temp dir so goal I/O never
+/// touches the real config dir or leaks between test runs.
+fn build_goal_store() -> GoalStore {
+    if cfg!(test) {
+        let dir = std::env::temp_dir().join(format!("ff-goals-test-{}", std::process::id()));
+        return GoalStore::new(dir);
+    }
+    match dirs::config_dir() {
+        Some(d) => GoalStore::new(d.join("flowforge").join("goals")),
+        None => {
+            tracing::warn!("no config dir; goals will not persist across restarts");
+            GoalStore::new(std::env::temp_dir().join("flowforge-goals"))
+        }
+    }
+}
+
 /// Open the scheduled-task store, falling back to an ephemeral in-memory store (with
 /// a warning) if the path is unavailable — same resilience as `build_session_store`.
 fn build_scheduled_store() -> ScheduledStore {
@@ -1018,6 +1035,10 @@ pub struct AppState {
     /// Durable scheduled-task store (RFC 0017, #539/#540). Shared (via `Arc`) so a
     /// later headless runner (#542) can read the due set without rebuilding state.
     pub scheduled: Arc<ScheduledStore>,
+    /// Durable goal-mode store (RFC 0020, #715/#716): a directory of
+    /// `<session_id>.json` checkpoints. `Clone` + cheap (holds only a path), so
+    /// the self-continue loop and the `goal_*` IPC commands share it directly.
+    pub goals: GoalStore,
     /// Persisted, non-secret LLM provider connection registry (RFC 0005 Phase A).
     /// The active connection drives each turn; snapshotted (never held across an
     /// await) per turn. Mutated by the connection commands and the legacy
@@ -1041,6 +1062,11 @@ pub struct AppState {
     /// Turn cancellation tokens + pending approvals under one lock (see
     /// [`ApprovalRegistry`]).
     approvals: Mutex<ApprovalRegistry>,
+    /// Session ids with a goal self-continue loop currently running (#716). A
+    /// single-flight guard: `try_start_goal_loop` refuses to spawn a second loop
+    /// for a session, so `goal_set`/`goal_resume` cannot stack overlapping loops
+    /// that would race on the transcript and double-checkpoint.
+    goal_loops: Mutex<HashSet<String>>,
     /// Globally active skills, whose bodies are injected into the system prompt
     /// (RFC 0001 §4). A `BTreeSet` keeps the set deduplicated and name-sorted.
     /// Replaced wholesale by `switch_phenotype`; tweaked individually by
@@ -1190,6 +1216,7 @@ impl AppState {
         let state = Self {
             store,
             scheduled,
+            goals: build_goal_store(),
             registry: Mutex::new(registry),
             search_config,
             workspace_root: default_workspace_root(),
@@ -1202,6 +1229,7 @@ impl AppState {
                 }
                 reg
             }),
+            goal_loops: Mutex::new(HashSet::new()),
             active_skills: Mutex::new(BTreeSet::new()),
             active_phenotype: Mutex::new(default_phenotype()),
             default_mode: Mutex::new(load_default_mode()),
@@ -1567,6 +1595,10 @@ impl AppState {
         reg.register(Box::new(ff_tools::CompactionRetrieveTool::new(
             self.store.clone(),
         )));
+        // Goal-mode completion signal (RFC 0020 §7, #716): a ReadOnly tool the
+        // agent calls when the objective is met. Always registered so a goal can
+        // complete regardless of which session drives it; a no-op outside a loop.
+        reg.register(Box::new(ff_tools::GoalCompleteTool));
         // Bridge MCP tools from the instances this session resolves to (M4.3): every
         // global instance plus the workspace instances rooted at `session_root` (RFC
         // 0018 §4.6). Routing is by instance key, so a concurrent turn on another
@@ -2086,6 +2118,27 @@ impl AppState {
 
         resolved.retain(|s| !s.disabled);
         resolved
+    }
+
+    /// Try to claim the goal-loop slot for a session (#716). Returns `true` if
+    /// this caller acquired it (no loop was running), `false` if a loop is
+    /// already active — the caller must NOT spawn a second one. Single-flight so
+    /// overlapping loops can't race the transcript or double-checkpoint.
+    pub fn try_start_goal_loop(&self, session_id: &str) -> bool {
+        self.goal_loops
+            .lock()
+            .unwrap()
+            .insert(session_id.to_string())
+    }
+
+    /// Release the goal-loop slot when a loop finishes (any terminal stop).
+    pub fn end_goal_loop(&self, session_id: &str) {
+        self.goal_loops.lock().unwrap().remove(session_id);
+    }
+
+    /// Whether a goal loop is currently running for the session.
+    pub fn goal_loop_running(&self, session_id: &str) -> bool {
+        self.goal_loops.lock().unwrap().contains(session_id)
     }
 
     pub fn register_cancel(&self, session_id: &str, token: CancelToken) {
@@ -5155,5 +5208,39 @@ mod tests {
             "unrelated entries untouched"
         );
         assert_eq!(servers.len(), 1);
+    }
+
+    // Goal store wiring (#716): `build_goal_store` yields a working directory
+    // store, and the goal lifecycle (set -> checkpoint -> load -> delete)
+    // round-trips through it. Under cfg(test) the store roots at a per-process
+    // temp dir, so this never touches the real config dir.
+    #[test]
+    fn build_goal_store_round_trips_a_goal() {
+        use ff_core::{Goal, GoalStatus};
+        let store = build_goal_store();
+        let sid = format!("goal-test-sess-{}", std::process::id());
+        // Clean any leftover from a prior run of this process.
+        let _ = store.delete(&sid);
+
+        assert!(store.load(&sid).unwrap().is_none(), "no goal initially");
+
+        let mut goal = Goal::new(&sid, "ship the thing", 1_000);
+        goal.status = GoalStatus::Active;
+        store.save(&goal).unwrap();
+
+        let loaded = store.load(&sid).unwrap().expect("goal persisted");
+        assert_eq!(loaded.objective, "ship the thing");
+        assert_eq!(loaded.status, GoalStatus::Active);
+
+        // A checkpoint accrues spend + bumps the iteration; persisted state
+        // reflects it (resume reads the last completed boundary).
+        goal.checkpoint(120, 50, 2_000);
+        store.save(&goal).unwrap();
+        let after = store.load(&sid).unwrap().unwrap();
+        assert_eq!(after.iteration, 1);
+        assert_eq!(after.spent.tokens, 120);
+
+        store.delete(&sid).unwrap();
+        assert!(store.load(&sid).unwrap().is_none(), "cleared");
     }
 }
