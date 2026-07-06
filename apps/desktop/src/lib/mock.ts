@@ -65,6 +65,7 @@ import {
   APP_VERSION_FALLBACK,
   type UpdateStatus,
   type BackupResult,
+  type SidecarTurnResult,
 } from "./about";
 import { autoTitle } from "./auto-title";
 import type { PhenotypeMcpUnavailableEvent } from "@/bindings";
@@ -2165,6 +2166,11 @@ Shipping the Settings redesign — currently the Memory browser (SET.8).
 
   async restoreBackup(): Promise<BackupResult> {
     return { path: "~/Downloads/flowforge-backup.json" };
+  }
+
+  async runSidecarTurn(_prompt: string): Promise<SidecarTurnResult> {
+    // No sidecar binary in mock mode; surface a stub so the button still toasts.
+    return { session_id: "mock-sidecar", events: 0 };
   }
 
   // --- internals ---

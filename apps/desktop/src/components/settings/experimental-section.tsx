@@ -64,6 +64,12 @@ const FLAGS: readonly FlagMeta[] = [
       "Enable the background update poll in a dev build so the global update bar picks up a local dev-release.sh feed (D1, local updater endpoint). Set FF_UPDATER_ENDPOINT when you turn this on: without it the poll falls through to the default public GitHub feed (inert only while your dev version matches the latest release). Not dev-install.sh (D2, direct file swap, no feed).",
     restartRequired: true,
   },
+  {
+    id: "devTools",
+    label: "Developer tools",
+    description:
+      'Show the "Developer" group in the About section (the sidecar smoke-test button). Off by default so dev-only surfaces stay off user installs.',
+  },
 ];
 
 /**

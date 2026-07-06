@@ -15,6 +15,11 @@ export default defineConfig({
   },
   test: {
     environment: "node",
+    // Polyfills an in-memory `localStorage` for Node v22+, whose experimental
+    // global `localStorage` is `undefined` without `--localstorage-file` and
+    // shadows jsdom's — breaking persisted zustand stores in tests. See
+    // vitest.setup.ts for the full diagnosis.
+    setupFiles: ["./vitest.setup.ts"],
     include: ["src/**/*.test.{ts,tsx}"],
   },
 });

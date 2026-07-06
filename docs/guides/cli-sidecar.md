@@ -148,3 +148,35 @@ sidecar with `flowforge run "<prompt>" --json` and re-emits every parsed
 (`turn:token`, `tool:call`, `turn:done`, …). This lets the frontend verify that
 the sidecar produces an event stream equivalent to the in-process path — the
 "parity smoke-test" required by CLI.7.
+
+The automated integration test lives in
+`apps/desktop/src-tauri/src/lib.rs` (`tests::sidecar_turn_emits_turn_done_event`)
+and exercises the full subprocess spawn → stdout-parse → emit pipeline:
+
+1. Stages the sidecar binary (`scripts/stage-sidecar.sh` or `cargo build -p ff-cli`)
+2. Stands up a wiremock OpenAI-compatible endpoint so the CLI can complete a turn
+3. Overrides `HOME` to point the CLI at a temp `provider.json`
+4. Drives `run_sidecar_turn` through a `MockRuntime` Tauri app
+5. Asserts `turn:done` (and at least one `turn:token`) is received
+
+Both sidecar tests are marked `#[ignore]` (the inverse case
+`sidecar_turn_returns_error_without_sidecar_binary` lives alongside): `cargo test
+--workspace` reports them as ignored rather than falsely passing. A soft-skip
+`return` would let CI advertise green while running no assertions, and a stale
+`rust-cache` `target/debug/flowforge` could non-deterministically flip that.
+Run them explicitly with `--ignored` after staging the sidecar.
+
+Run it with:
+
+```sh
+./scripts/stage-sidecar.sh   # build + stage the CLI binary
+cargo test -p flowforge-desktop sidecar_turn -- --nocapture --ignored
+```
+
+Note: the two sidecar tests are mutually exclusive (one needs the binary staged,
+the other requires it absent) — run them by name rather than together via
+`--ignored` if you've staged the binary.
+
+For manual QA, Settings → About → Developer → "Run sidecar smoke-test"
+calls `invoke('run_sidecar_turn', { prompt: 'hello' })` and toasts the
+event count.

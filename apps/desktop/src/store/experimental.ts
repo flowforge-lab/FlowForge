@@ -23,7 +23,12 @@ export type FlagId =
   // Dev affordance (#567, #749): when ON the updater polls the local
   // `dev-release.sh` feed (localhost:8787) instead of GitHub, enabling the
   // seamless dogfood loop without any env-var setup.
-  | "localUpdateChannel";
+  | "localUpdateChannel"
+  // Dev affordance: gates the "Developer" group in the About section
+  // (the sidecar smoke-test button). Defaults off so dev-only surfaces never
+  // reach end users; the ipc.ts "Dev-only — never shipped onto a user-visible
+  // surface" contract holds because nothing renders without this flag.
+  | "devTools";
 
 export const FLAG_IDS: readonly FlagId[] = [
   "ownApiKey",
@@ -34,6 +39,7 @@ export const FLAG_IDS: readonly FlagId[] = [
   "smartSkillSurfacing",
   "stepTimelineExport",
   "localUpdateChannel",
+  "devTools",
 ];
 
 export type ExperimentalFlags = Record<FlagId, boolean>;
@@ -48,6 +54,7 @@ export const EXPERIMENTAL_DEFAULTS: ExperimentalFlags = {
   smartSkillSurfacing: false,
   stepTimelineExport: false,
   localUpdateChannel: false,
+  devTools: false,
 };
 
 export interface ExperimentalState {
