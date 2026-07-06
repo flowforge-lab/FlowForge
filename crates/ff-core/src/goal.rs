@@ -365,6 +365,9 @@ impl GoalStore {
                 }
             }
         }
+        // `read_dir` yields entries in a filesystem-dependent order, so sort by
+        // session id for a deterministic resume order (and reproducible tests).
+        active.sort_by(|a, b| a.session_id.cmp(&b.session_id));
         active
     }
 }
@@ -551,12 +554,13 @@ mod tests {
         fs::write(root.join("half.json.tmp"), "{}").unwrap();
         fs::write(root.join("README.txt"), "notes").unwrap();
 
-        let mut active: Vec<String> = store
+        // list_active returns a deterministic (session-id-sorted) order, so no
+        // sort is needed here — assert the order directly.
+        let active: Vec<String> = store
             .list_active()
             .into_iter()
             .map(|g| g.session_id)
             .collect();
-        active.sort();
         assert_eq!(active, vec!["live-a".to_string(), "live-b".to_string()]);
     }
 
