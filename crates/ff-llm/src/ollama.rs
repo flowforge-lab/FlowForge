@@ -413,6 +413,7 @@ fn parse_ollama_line(line: &[u8], tool_idx: &mut u32) -> Option<Result<Chunk, Ll
                 tool_calls,
                 done: c.done,
                 truncated: c.done_reason.as_deref() == Some("length"),
+                ..Chunk::default()
             }))
         }
         Err(e) => Some(Err(LlmError::Decode(e.to_string()))),
@@ -968,6 +969,7 @@ mod tests {
             tools: vec![],
             thinking: false,
             max_tokens: None,
+            cache_messages: false,
         }
     }
 
@@ -1233,6 +1235,7 @@ mod tests {
             tools: Vec::new(),
             thinking: false,
             max_tokens: None,
+            cache_messages: false,
         };
         let provider = OllamaProvider::new(server.uri()).with_documents(true);
         let mut stream = provider.chat_stream(req).await.unwrap();
@@ -1323,6 +1326,7 @@ mod tests {
             tools: Vec::new(),
             thinking: false,
             max_tokens: None,
+            cache_messages: false,
         }
     }
 

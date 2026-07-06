@@ -4,10 +4,15 @@ import {
   MODE_CELLS,
   MODE_COLUMNS,
   PERMISSION_ROWS,
+  ROW_SAFETY,
+  cellLabel,
   cellToDecision,
+  cellToMark,
+  cycleCell,
   policyForMode,
   type DefaultMode,
 } from "./control";
+import type { PermissionCell } from "@/bindings";
 
 describe("control matrix metadata", () => {
   it("lists modes plan → auto → act and the four permission rows", () => {
@@ -52,6 +57,42 @@ describe("cellToDecision / policyForMode", () => {
     });
     expect(policyForMode("act").externalChanges).toBe("allow");
     expect(policyForMode("act").dangerous).toBe("ask");
+  });
+});
+
+describe("live matrix mapping (#702)", () => {
+  it("maps each presentation row to its backend Safety tier", () => {
+    expect(ROW_SAFETY).toEqual({
+      read: "readonly",
+      localWrites: "write",
+      externalChanges: "sensitive",
+      dangerous: "dangerous",
+    });
+    // Every rendered row has a Safety mapping.
+    for (const row of PERMISSION_ROWS) {
+      expect(ROW_SAFETY[row.key]).toBeDefined();
+    }
+  });
+
+  it("renders backend cells with the CellMarkIcon vocabulary", () => {
+    expect(cellToMark("allow")).toBe("check");
+    expect(cellToMark("ask")).toBe("ask");
+    expect(cellToMark("deny")).toBe("cross");
+  });
+
+  it("cycles Allow → Ask → Deny → Allow", () => {
+    expect(cycleCell("allow")).toBe("ask");
+    expect(cycleCell("ask")).toBe("deny");
+    expect(cycleCell("deny")).toBe("allow");
+    // Three clicks return to the start.
+    const start: PermissionCell = "allow";
+    expect(cycleCell(cycleCell(cycleCell(start)))).toBe(start);
+  });
+
+  it("labels every cell state", () => {
+    expect(cellLabel("allow")).toBe("Allowed");
+    expect(cellLabel("ask")).toBe("Ask first");
+    expect(cellLabel("deny")).toBe("Denied");
   });
 });
 

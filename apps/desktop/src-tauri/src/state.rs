@@ -6,8 +6,9 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use ff_agent::{
-    flush_due, AbstractiveConfig, CancelToken, CompactionContext, CompactionStrategy,
-    ContextPressureEstimator, MemoryFlush, ProxyTokenEstimator, DEFAULT_FLUSH_AT_FRACTION,
+    flush_due, AbstractiveConfig, CancelToken, CompactionCache, CompactionContext,
+    CompactionStrategy, ContextPressureEstimator, MemoryFlush, ProxyTokenEstimator,
+    DEFAULT_FLUSH_AT_FRACTION,
 };
 use ff_core::{
     model_supports_documents, model_supports_vision, BedrockAuth, ConnectionId, GoalStore,
@@ -390,6 +391,8 @@ fn config_to_connection(config: ProviderConfig) -> ProviderConnection {
         auth_mode: None,
         aws_profile: None,
         access_key_id: None,
+        compaction_model: None,
+        compaction_budget: None,
     }
 }
 
@@ -759,6 +762,21 @@ fn load_permission_matrix() -> ff_core::PermissionMatrix {
         .unwrap_or_default()
 }
 
+/// Persist the permission matrix (#702). Best-effort and atomic, like
+/// `save_search_config`: a write failure leaves the in-memory matrix authoritative
+/// for this session rather than failing the edit.
+fn save_permission_matrix(matrix: &ff_core::PermissionMatrix) {
+    let Some(path) = permission_matrix_path() else {
+        return;
+    };
+    let Ok(json) = serde_json::to_string_pretty(matrix) else {
+        return;
+    };
+    if let Err(e) = write_atomic(&path, &json) {
+        eprintln!("failed to persist permission matrix: {e}");
+    }
+}
+
 /// `~/.flowforge/phenos`, where phenotype definition TOML files live.
 fn phenotypes_root() -> PathBuf {
     dirs::home_dir()
@@ -1062,7 +1080,8 @@ pub struct AppState {
     default_mode: Mutex<Mode>,
     /// Permission matrix (#699, RFC 0019 §3): Mode × Safety → Allow/Ask/Deny.
     /// Persisted to `permissions.json`; falls back to Default on missing/corrupt file.
-    pub permission_matrix: ff_core::PermissionMatrix,
+    /// Editable at runtime from the Control panel (#702) via [`set_permission_cell`].
+    permission_matrix: Mutex<ff_core::PermissionMatrix>,
     /// Per-skill telemetry aggregates (RFC 0001 §8), persisted to
     /// `~/.flowforge/skill_signals.json`. Updated at each turn's start/end; read by
     /// the manual optimize flow's cost estimates.
@@ -1101,6 +1120,10 @@ pub struct AppState {
     /// served window changes only when the model is (re)loaded, so a probe per
     /// resolve would spam `/api/ps`. Entries expire after [`SERVED_WINDOW_TTL`].
     served_window_cache: Mutex<HashMap<(ConnectionId, String), (Instant, ServedWindowProbe)>>,
+    /// Cross-turn abstractive summary cache (#757). Survives across turns so
+    /// the compaction summarizer can skip redundant work when only a few
+    /// messages were appended since the last summary.
+    pub compaction_cache: CompactionCache,
 }
 
 /// How long a probed served window stays fresh before the next resolve re-probes.
@@ -1210,7 +1233,7 @@ impl AppState {
             active_skills: Mutex::new(BTreeSet::new()),
             active_phenotype: Mutex::new(default_phenotype()),
             default_mode: Mutex::new(load_default_mode()),
-            permission_matrix: load_permission_matrix(),
+            permission_matrix: Mutex::new(load_permission_matrix()),
             signals: Mutex::new(load_signals()),
             _mcp_watcher: Mutex::new(None),
             _git_watcher: Mutex::new(None),
@@ -1222,6 +1245,7 @@ impl AppState {
             _memory_watcher: Mutex::new(memory_watcher),
             process_supervisor: Arc::new(ProcessSupervisor::new()),
             served_window_cache: Mutex::new(HashMap::new()),
+            compaction_cache: CompactionCache::new(),
         };
         // Restore the persisted phenotype so its active skills survive a restart.
         // With no persisted choice, prefer the out-of-box `codon` default (#298),
@@ -1459,6 +1483,7 @@ impl AppState {
             tools: Vec::new(),
             thinking: false,
             max_tokens: Some(TITLE_MAX_TOKENS),
+            cache_messages: false,
         };
 
         let raw =
@@ -1741,6 +1766,37 @@ impl AppState {
     }
 
     /// The full connection registry (clone — callers never hold the lock).
+    /// Resolve the fast compaction model for a connection (#756).
+    /// Precedence: env `FF_COMPACTION_MODEL` > connection config > None.
+    pub fn compaction_model(&self, connection_id: &str) -> Option<String> {
+        compaction_model_for(
+            self.registry
+                .lock()
+                .unwrap()
+                .connections
+                .iter()
+                .find(|c| c.id == connection_id),
+        )
+    }
+
+    /// Resolve the compaction budget for a connection (#756).
+    /// Precedence: env `FF_COMPACTION_BUDGET` > connection config > None (= computed).
+    pub fn compaction_budget(&self, connection_id: &str) -> Option<u64> {
+        if let Some(v) = std::env::var("FF_COMPACTION_BUDGET")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+        {
+            return Some(v);
+        }
+        self.registry
+            .lock()
+            .unwrap()
+            .connections
+            .iter()
+            .find(|c| c.id == connection_id)
+            .and_then(|c| c.compaction_budget)
+    }
+
     pub fn provider_registry(&self) -> ProviderRegistry {
         let mut reg = self.registry.lock().unwrap().clone();
         // Cross-check `has_key` against the live OS keychain. An app rebuild can
@@ -2312,6 +2368,35 @@ impl AppState {
         save_default_mode(mode);
     }
 
+    /// A snapshot of the permission matrix (#699/#702). Cloned so callers can hold
+    /// it across an async turn without pinning the lock.
+    pub fn permission_matrix(&self) -> ff_core::PermissionMatrix {
+        self.permission_matrix.lock().unwrap().clone()
+    }
+
+    /// The Control-panel view of the matrix (#702).
+    pub fn permission_matrix_view(&self) -> ff_core::PermissionMatrixView {
+        self.permission_matrix.lock().unwrap().view()
+    }
+
+    /// Edit and persist a single matrix cell (#702), returning the updated view.
+    pub fn set_permission_cell(
+        &self,
+        mode: Mode,
+        safety: ff_core::Safety,
+        cell: ff_core::PermissionCell,
+    ) -> ff_core::PermissionMatrixView {
+        // Clone + drop the guard before the disk write so the hot read path
+        // (`permission_matrix()` on the live approval gate) doesn't block on I/O.
+        let (view, snapshot) = {
+            let mut guard = self.permission_matrix.lock().unwrap();
+            guard.set_cell(mode, safety, cell);
+            (guard.view(), guard.clone())
+        };
+        save_permission_matrix(&snapshot);
+        view
+    }
+
     /// Resolve the mode a turn for `session_id` runs as (#265): an explicit per-pane
     /// binding, else the global [`default_mode`](Self::default_mode). Mirrors
     /// [`session_phenotype`](Self::session_phenotype).
@@ -2607,6 +2692,23 @@ pub(crate) fn abstractive_config_from_env() -> AbstractiveConfig {
         config.fire_at_fraction = at;
     }
     config
+}
+
+/// Fast model for compaction/flush LLM calls (#756). Precedence:
+/// 1. `FF_COMPACTION_MODEL` env var (highest — dev override)
+/// 2. `compaction_model` on the active `ProviderConnection` (user config)
+/// 3. `None` = use session model (legacy)
+pub(crate) fn compaction_model_for(
+    connection: Option<&ff_core::ProviderConnection>,
+) -> Option<String> {
+    if let Some(m) = std::env::var("FF_COMPACTION_MODEL")
+        .ok()
+        .map(|m| m.trim().to_string())
+        .filter(|m| !m.is_empty())
+    {
+        return Some(m);
+    }
+    connection.and_then(|c| c.compaction_model.clone())
 }
 
 /// The `(base_url, model, api_key)` for a local embedder, or `None` to stay on the
@@ -3978,6 +4080,8 @@ mod tests {
                 auth_mode: None,
                 aws_profile: None,
                 access_key_id: None,
+                compaction_model: None,
+                compaction_budget: None,
             }],
             schema_version: 0,
         };
@@ -4110,6 +4214,7 @@ mod tests {
             tools: Vec::new(),
             thinking,
             max_tokens: None,
+            cache_messages: false,
         };
         let _ = provider.chat_stream(req).await.expect("send succeeds");
         let reqs = server.received_requests().await.expect("requests recorded");
@@ -4135,6 +4240,8 @@ mod tests {
             auth_mode: None,
             aws_profile: None,
             access_key_id: None,
+            compaction_model: None,
+            compaction_budget: None,
         }
     }
 
@@ -4194,6 +4301,8 @@ mod tests {
                     auth_mode: None,
                     aws_profile: None,
                     access_key_id: None,
+                    compaction_model: None,
+                    compaction_budget: None,
                 },
                 ProviderConnection {
                     id: "aws-bedrock".into(),
@@ -4213,6 +4322,8 @@ mod tests {
                     auth_mode: Some(BedrockAuth::Profile),
                     aws_profile: Some("bedrock-profile".into()),
                     access_key_id: None,
+                    compaction_model: None,
+                    compaction_budget: None,
                 },
             ],
             schema_version: 0,
@@ -4442,6 +4553,8 @@ mod tests {
             auth_mode: None,
             aws_profile: None,
             access_key_id: None,
+            compaction_model: None,
+            compaction_budget: None,
         });
         assert_eq!(stored.id, "openrouter");
         assert_eq!(state.provider_registry().connections.len(), 3);
@@ -4534,6 +4647,8 @@ mod tests {
             auth_mode: None,
             aws_profile: None,
             access_key_id: None,
+            compaction_model: None,
+            compaction_budget: None,
         }
     }
 
@@ -4597,6 +4712,8 @@ mod tests {
             auth_mode,
             aws_profile: None,
             access_key_id: None,
+            compaction_model: None,
+            compaction_budget: None,
         }
     }
 

@@ -4,6 +4,7 @@
 
 use std::path::Path;
 use std::process::Stdio;
+use std::sync::OnceLock;
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -80,17 +81,62 @@ impl Tool for GithubTool {
     }
 }
 
-/// Resolve the GH_TOKEN: check env, then try reading from ~/.config/flowforge/gh_token.
+/// Resolve the GitHub token once per process, then cache it.
+///
+/// Resolution order (first non-empty wins):
+/// 1. `GH_TOKEN` environment variable (CI / scripted usage).
+/// 2. `gh auth token` — the `gh` CLI's own credential store. Works for users
+///    who ran `gh auth login`; respects whatever auth method they configured.
+/// 3. Credential file at `~/.config/flowforge/gh_token` (the XDG-style path
+///    where FlowForge credentials live on all platforms).
+///
+/// Cached in a `OnceLock` so the ~50ms subprocess spawn only happens once.
 fn resolve_token() -> Option<String> {
-    if let Ok(tok) = std::env::var("GH_TOKEN") {
+    static TOKEN: OnceLock<Option<String>> = OnceLock::new();
+    TOKEN
+        .get_or_init(|| {
+            // 1. Env var (always wins — lets CI / power users override).
+            if let Ok(tok) = std::env::var("GH_TOKEN") {
+                if !tok.is_empty() {
+                    return Some(tok);
+                }
+            }
+            // 2. gh's own credential store (general, zero-config if authed).
+            if let Some(tok) = gh_auth_token() {
+                return Some(tok);
+            }
+            // 3. Credential file (~/.config/flowforge/gh_token).
+            if let Some(home) = dirs::home_dir() {
+                let path = home.join(".config/flowforge/gh_token");
+                if let Ok(contents) = std::fs::read_to_string(&path) {
+                    let tok = contents.trim().to_string();
+                    if !tok.is_empty() {
+                        return Some(tok);
+                    }
+                }
+            }
+            None
+        })
+        .clone()
+}
+
+/// Ask `gh auth token` for the active credential. Returns `None` if `gh` is
+/// not installed, not authenticated, or returns an error.
+fn gh_auth_token() -> Option<String> {
+    let out = std::process::Command::new("gh")
+        .args(["auth", "token"])
+        .env("PATH", ff_core::augmented_path())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if out.status.success() {
+        let tok = String::from_utf8_lossy(&out.stdout).trim().to_string();
         if !tok.is_empty() {
             return Some(tok);
         }
     }
-    let path = dirs::config_dir()?.join("flowforge").join("gh_token");
-    std::fs::read_to_string(path)
-        .ok()
-        .map(|s| s.trim().to_string())
+    None
 }
 
 /// Build a `gh` command with token and working directory set.
@@ -100,6 +146,7 @@ fn gh_cmd(root: &Path) -> Command {
         cmd.env("GH_TOKEN", token);
     }
     cmd.current_dir(root)
+        .env("PATH", ff_core::augmented_path())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     cmd
@@ -314,6 +361,7 @@ async fn push(args: &Value, root: &Path) -> ToolOutcome {
         cmd.env("GH_TOKEN", token);
     }
     cmd.current_dir(root)
+        .env("PATH", ff_core::augmented_path())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
@@ -376,12 +424,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn resolve_token_from_file_fallback() {
-        // We don't test env-var path (set_var races other tests in the same
-        // process). The file-fallback path is tested implicitly: if GH_TOKEN
-        // is unset and the file doesn't exist, resolve_token returns None on CI.
-        // On a dev machine with ~/.config/flowforge/gh_token, it returns Some.
-        // Either outcome is valid — we just verify it doesn't panic.
+    fn resolve_token_does_not_panic() {
+        // resolve_token() is cached in a OnceLock, so we can only test the
+        // first-call behavior once per process. On a dev machine with `gh`
+        // authenticated it returns Some; on CI (no gh auth) it returns None.
+        // Either outcome is valid — we verify it doesn't panic.
         let _ = resolve_token();
     }
 

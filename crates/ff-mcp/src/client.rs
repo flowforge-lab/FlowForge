@@ -55,28 +55,6 @@ impl ClientHandler for FfClientHandler {
     }
 }
 
-/// Common user-level bin directories a login shell puts on `PATH` but a GUI app
-/// launched from Finder/Dock/launchd does not inherit. Used to augment a child's
-/// `PATH` so a bare `command` resolves in a packaged build (#573). Unix-only; other
-/// platforms add nothing (Windows resolves via its own search rules).
-#[cfg(unix)]
-fn extra_path_dirs() -> Vec<PathBuf> {
-    let mut dirs = Vec::new();
-    if let Some(home) = dirs::home_dir() {
-        dirs.push(home.join(".local/bin"));
-        dirs.push(home.join(".cargo/bin"));
-    }
-    dirs.push(PathBuf::from("/opt/homebrew/bin"));
-    dirs.push(PathBuf::from("/opt/homebrew/sbin"));
-    dirs.push(PathBuf::from("/usr/local/bin"));
-    dirs
-}
-
-#[cfg(not(unix))]
-fn extra_path_dirs() -> Vec<PathBuf> {
-    Vec::new()
-}
-
 /// Resolve a bare MCP `command` to an absolute path honoring `PATHEXT`, so Windows cmd
 /// shims (`npx.cmd`, `uvx.exe`, `pnpm.cmd`) resolve. Rust's `Command` only appends
 /// `.exe` and never consults `PATHEXT`, so a bare `npx` fails "program not found" and
@@ -114,29 +92,6 @@ fn resolve_via_pathext(command: &str, path: &str, pathext: &str) -> Option<PathB
         }
     }
     None
-}
-
-/// Append `extra` directories to an inherited `PATH`, preserving order and dropping
-/// duplicates so the inherited entries keep priority and a dir already present is not
-/// repeated. Falls back to the inherited value unchanged if joining fails (e.g. a dir
-/// contains the platform path separator).
-fn augment_path(inherited: Option<OsString>, extra: &[PathBuf]) -> OsString {
-    use std::collections::HashSet;
-    let mut seen: HashSet<PathBuf> = HashSet::new();
-    let mut parts: Vec<PathBuf> = Vec::new();
-    if let Some(p) = &inherited {
-        for dir in std::env::split_paths(p) {
-            if seen.insert(dir.clone()) {
-                parts.push(dir);
-            }
-        }
-    }
-    for dir in extra {
-        if seen.insert(dir.clone()) {
-            parts.push(dir.clone());
-        }
-    }
-    std::env::join_paths(&parts).unwrap_or_else(|_| inherited.unwrap_or_default())
 }
 
 /// Map workspace root paths to MCP [`Root`]s with `file://` URIs (RFC 0018 §4.4),
@@ -212,10 +167,7 @@ impl McpClient {
                 // (/usr/bin:/bin:/usr/sbin:/sbin) rather than the user's login-shell
                 // PATH (#573). Additive: the inherited entries keep priority, and a
                 // config-declared `env` PATH below still overrides it wholesale.
-                cmd.env(
-                    "PATH",
-                    augment_path(std::env::var_os("PATH"), &extra_path_dirs()),
-                );
+                cmd.env("PATH", ff_core::augmented_path());
             } else if let Ok(value) = std::env::var(key) {
                 cmd.env(key, value);
             }
@@ -337,7 +289,7 @@ mod tests {
     #[test]
     fn augment_path_appends_extra_dirs_in_order() {
         let extra = vec![PathBuf::from("/x/bin"), PathBuf::from("/y/bin")];
-        let out = augment_path(Some(OsString::from("/usr/bin:/bin")), &extra);
+        let out = ff_core::augment_path(Some(OsString::from("/usr/bin:/bin")), &extra);
         let dirs: Vec<PathBuf> = std::env::split_paths(&out).collect();
         assert_eq!(
             dirs,
@@ -348,28 +300,6 @@ mod tests {
                 PathBuf::from("/y/bin"),
             ]
         );
-    }
-
-    #[test]
-    fn augment_path_dedups_dirs_already_inherited() {
-        let extra = vec![PathBuf::from("/usr/bin"), PathBuf::from("/x/bin")];
-        let out = augment_path(Some(OsString::from("/usr/bin:/bin")), &extra);
-        let dirs: Vec<PathBuf> = std::env::split_paths(&out).collect();
-        assert_eq!(
-            dirs,
-            vec![
-                PathBuf::from("/usr/bin"),
-                PathBuf::from("/bin"),
-                PathBuf::from("/x/bin"),
-            ]
-        );
-    }
-
-    #[test]
-    fn augment_path_handles_no_inherited_path() {
-        let out = augment_path(None, &[PathBuf::from("/x/bin")]);
-        let dirs: Vec<PathBuf> = std::env::split_paths(&out).collect();
-        assert_eq!(dirs, vec![PathBuf::from("/x/bin")]);
     }
 
     // The point of the augmentation: a child spawned with env_clear + a minimal PATH
@@ -386,7 +316,7 @@ mod tests {
         perms.set_mode(0o755);
         std::fs::set_permissions(&bin, perms).unwrap();
 
-        let path = augment_path(
+        let path = ff_core::augment_path(
             Some(OsString::from("/usr/bin:/bin")),
             &[tmp.path().to_path_buf()],
         );

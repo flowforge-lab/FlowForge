@@ -110,6 +110,30 @@ impl Default for OpenAiProvider {
 struct StreamChunk {
     #[serde(default)]
     choices: Vec<StreamChoice>,
+    /// Usage stats from the final stream chunk (requires `stream_options.include_usage`).
+    #[serde(default)]
+    usage: Option<StreamUsage>,
+}
+
+#[derive(Deserialize)]
+struct StreamUsage {
+    #[serde(default)]
+    prompt_tokens: u32,
+    /// Legacy SiliconFlow field for cache hit tokens.
+    #[serde(default)]
+    prompt_cache_hit_tokens: Option<u32>,
+    /// Legacy SiliconFlow field for cache miss tokens.
+    #[serde(default)]
+    prompt_cache_miss_tokens: Option<u32>,
+    /// OpenAI-standard nested details.
+    #[serde(default)]
+    prompt_tokens_details: Option<PromptTokensDetails>,
+}
+
+#[derive(Deserialize)]
+struct PromptTokensDetails {
+    #[serde(default)]
+    cached_tokens: Option<u32>,
 }
 
 #[derive(Deserialize)]
@@ -192,6 +216,25 @@ fn parse_sse_line(line: &[u8]) -> Option<Result<Chunk, LlmError>> {
 
     match serde_json::from_str::<StreamChunk>(payload) {
         Ok(parsed) => {
+            // Extract cache metrics from usage (final chunk or inline).
+            let (cache_hit, cache_miss) = parsed
+                .usage
+                .as_ref()
+                .map(|u| {
+                    // Prefer OpenAI-standard nested field; fall back to legacy SF fields.
+                    let hit = u
+                        .prompt_tokens_details
+                        .as_ref()
+                        .and_then(|d| d.cached_tokens)
+                        .or(u.prompt_cache_hit_tokens)
+                        .unwrap_or(0);
+                    let miss = u
+                        .prompt_cache_miss_tokens
+                        .unwrap_or(u.prompt_tokens.saturating_sub(hit));
+                    (hit, miss)
+                })
+                .unwrap_or((0, 0));
+
             let chunk = match parsed.choices.into_iter().next() {
                 Some(c) => Chunk {
                     delta: c.delta.content.unwrap_or_default(),
@@ -213,8 +256,14 @@ fn parse_sse_line(line: &[u8]) -> Option<Result<Chunk, LlmError>> {
                         .collect(),
                     done: c.finish_reason.is_some(),
                     truncated: c.finish_reason.as_deref() == Some("length"),
+                    cache_hit_tokens: cache_hit,
+                    cache_miss_tokens: cache_miss,
                 },
-                None => Chunk::default(),
+                None => Chunk {
+                    cache_hit_tokens: cache_hit,
+                    cache_miss_tokens: cache_miss,
+                    ..Chunk::default()
+                },
             };
             Some(Ok(chunk))
         }
@@ -359,6 +408,7 @@ impl Provider for OpenAiProvider {
             "model": req.model,
             "messages": wire_messages,
             "stream": true,
+            "stream_options": { "include_usage": true },
         });
         if !req.tools.is_empty() {
             body["tools"] = serde_json::Value::Array(req.tools.clone());
@@ -401,6 +451,7 @@ impl Provider for OpenAiProvider {
 
         // SSE frames are newline-delimited; reassemble lines across byte-chunk
         // boundaries, then decode each `data:` line into a Chunk.
+        let think_tags = dialect.think_tags;
         let stream = resp.bytes_stream().scan(Vec::<u8>::new(), |buf, item| {
             let out = match item {
                 Ok(bytes) => {
@@ -420,7 +471,43 @@ impl Provider for OpenAiProvider {
             std::future::ready(Some(futures_util::stream::iter(out)))
         });
 
-        Ok(stream.flatten().boxed())
+        // Layer 1+2: split <think> tags from content into reasoning_delta (#729).
+        // Layer 1 (forced): known think-tag models (MiniMax on SiliconFlow).
+        // Layer 2 (auto-detect): any model whose first content starts with <think>.
+        let mut scanner = if think_tags {
+            crate::think_scanner::ThinkScanner::forced()
+        } else {
+            crate::think_scanner::ThinkScanner::auto_detect()
+        };
+
+        let stream = stream.flatten().map(move |result| {
+            let mut chunk = result?;
+            if !chunk.delta.is_empty() {
+                let scan = scanner.push(&chunk.delta);
+                chunk.delta = scan.content;
+                if !scan.reasoning.is_empty() {
+                    // Append to any existing reasoning_delta (unlikely but safe).
+                    if chunk.reasoning_delta.is_empty() {
+                        chunk.reasoning_delta = scan.reasoning;
+                    } else {
+                        chunk.reasoning_delta.push_str(&scan.reasoning);
+                    }
+                }
+            }
+            // On stream end, flush the scanner buffer.
+            if chunk.done {
+                let flush = scanner.flush();
+                if !flush.content.is_empty() {
+                    chunk.delta.push_str(&flush.content);
+                }
+                if !flush.reasoning.is_empty() {
+                    chunk.reasoning_delta.push_str(&flush.reasoning);
+                }
+            }
+            Ok(chunk)
+        });
+
+        Ok(stream.boxed())
     }
 
     /// `GET {base_url}/models` -> `{ "data": [ { "id": ... } ] }`.
@@ -560,6 +647,62 @@ mod tests {
             br#"data: {"choices":[{"delta":{"content":null},"finish_reason":"tool_calls"}]}"#;
         let chunk = parse_sse_line(line).unwrap().unwrap();
         assert!(chunk.done);
+    }
+
+    // --- prefix cache observability (#766) -----------------------------------
+
+    #[test]
+    fn usage_chunk_parses_openai_cached_tokens() {
+        // OpenAI format: prompt_tokens_details.cached_tokens
+        let line = br#"data: {"choices":[],"usage":{"prompt_tokens":730,"completion_tokens":20,"total_tokens":750,"prompt_tokens_details":{"cached_tokens":640}}}"#;
+        let chunk = parse_sse_line(line).unwrap().unwrap();
+        assert_eq!(chunk.cache_hit_tokens, 640);
+        assert_eq!(chunk.cache_miss_tokens, 90); // 730 - 640
+    }
+
+    #[test]
+    fn usage_chunk_parses_siliconflow_legacy_fields() {
+        // SiliconFlow legacy: prompt_cache_hit_tokens / prompt_cache_miss_tokens
+        let line = br#"data: {"choices":[],"usage":{"prompt_tokens":568,"prompt_cache_hit_tokens":512,"prompt_cache_miss_tokens":56}}"#;
+        let chunk = parse_sse_line(line).unwrap().unwrap();
+        assert_eq!(chunk.cache_hit_tokens, 512);
+        assert_eq!(chunk.cache_miss_tokens, 56);
+    }
+
+    #[test]
+    fn usage_chunk_zero_when_no_cache() {
+        // DeepSeek-style: fields present but 0
+        let line = br#"data: {"choices":[],"usage":{"prompt_tokens":563,"prompt_cache_hit_tokens":0,"prompt_cache_miss_tokens":563}}"#;
+        let chunk = parse_sse_line(line).unwrap().unwrap();
+        assert_eq!(chunk.cache_hit_tokens, 0);
+        assert_eq!(chunk.cache_miss_tokens, 563);
+    }
+
+    #[test]
+    fn no_usage_yields_zero_cache_metrics() {
+        // Normal content chunk without usage
+        let line = br#"data: {"choices":[{"delta":{"content":"hi"},"finish_reason":null}]}"#;
+        let chunk = parse_sse_line(line).unwrap().unwrap();
+        assert_eq!(chunk.cache_hit_tokens, 0);
+        assert_eq!(chunk.cache_miss_tokens, 0);
+    }
+
+    #[test]
+    fn trailing_usage_chunk_after_done_is_parseable() {
+        // Regression test for #766 blocker: the finish_reason chunk has done=true
+        // but cache_*=0; the usage arrives on a SEPARATE trailing chunk with
+        // choices:[]. Both must parse correctly so run_turn can drain the trailing.
+        let finish_line = br#"data: {"choices":[{"delta":{"content":""},"finish_reason":"stop"}]}"#;
+        let usage_line = br#"data: {"choices":[],"usage":{"prompt_tokens":730,"completion_tokens":20,"total_tokens":750,"prompt_tokens_details":{"cached_tokens":640}}}"#;
+
+        let finish_chunk = parse_sse_line(finish_line).unwrap().unwrap();
+        assert!(finish_chunk.done);
+        assert_eq!(finish_chunk.cache_hit_tokens, 0);
+
+        let usage_chunk = parse_sse_line(usage_line).unwrap().unwrap();
+        assert!(!usage_chunk.done); // choices is empty -> no finish_reason
+        assert_eq!(usage_chunk.cache_hit_tokens, 640);
+        assert_eq!(usage_chunk.cache_miss_tokens, 90); // 730 - 640
     }
 
     /// Guard: the OpenAI wire protocol requires `tool_calls[].function.arguments`
@@ -733,6 +876,7 @@ mod tests {
             tools: Vec::new(),
             thinking: false,
             max_tokens: None,
+            cache_messages: false,
         };
         let body = captured_body(&provider, &server, req).await;
         let content = body["messages"][0]["content"]
@@ -777,6 +921,7 @@ mod tests {
             tools: Vec::new(),
             thinking: false,
             max_tokens: None,
+            cache_messages: false,
         };
         let body = captured_body(&provider, &server, req).await;
         let content = body["messages"][0]["content"]
@@ -1031,6 +1176,7 @@ mod tests {
         let dialect = WireDialect {
             reasoning: ReasoningWire::ReasoningContent,
             tool_call_content: ToolCallContent::Omit,
+            think_tags: false,
         };
         let v = message_to_wire(&msg, dialect);
         assert_eq!(v["reasoning_content"], "because A then B");
@@ -1043,6 +1189,7 @@ mod tests {
         let dialect = WireDialect {
             reasoning: ReasoningWire::Reasoning,
             tool_call_content: ToolCallContent::Omit,
+            think_tags: false,
         };
         let v = message_to_wire(&msg, dialect);
         assert_eq!(v["reasoning"], "step");
@@ -1055,6 +1202,7 @@ mod tests {
         let dialect = WireDialect {
             reasoning: ReasoningWire::ReasoningContent,
             tool_call_content: ToolCallContent::Omit,
+            think_tags: false,
         };
         let v = message_to_wire(&msg, dialect);
         assert!(v.get("reasoning_content").is_none());
@@ -1070,6 +1218,7 @@ mod tests {
         let dialect = WireDialect {
             reasoning: ReasoningWire::ReasoningContent,
             tool_call_content: ToolCallContent::Omit,
+            think_tags: false,
         };
         let v = message_to_wire(&msg, dialect);
         assert!(v.get("reasoning_content").is_none());
@@ -1082,6 +1231,7 @@ mod tests {
         let dialect = WireDialect {
             reasoning: ReasoningWire::ReasoningContent,
             tool_call_content: ToolCallContent::EmptyString,
+            think_tags: false,
         };
         let v = message_to_wire(&msg, dialect);
         // GLM/MiniMax reject content: null with HTTP 400 code 20015; empty string is accepted.
@@ -1097,6 +1247,7 @@ mod tests {
         let dialect = WireDialect {
             reasoning: ReasoningWire::ReasoningContent,
             tool_call_content: ToolCallContent::EmptyString,
+            think_tags: false,
         };
         let v = message_to_wire(&msg, dialect);
         assert_eq!(v["content"], "let me search");
@@ -1112,6 +1263,7 @@ mod tests {
             tools: Vec::new(),
             thinking,
             max_tokens: None,
+            cache_messages: false,
         }
     }
 
@@ -1280,6 +1432,7 @@ mod tests {
             tools: Vec::new(),
             thinking: false,
             max_tokens: None,
+            cache_messages: false,
         };
 
         let mut stream = provider.chat_stream(req).await.expect("headers arrive");
@@ -1364,6 +1517,7 @@ mod tests {
             tools: Vec::new(),
             thinking: false,
             max_tokens: None,
+            cache_messages: false,
         };
 
         // The stall is before any response, so it surfaces from chat_stream itself

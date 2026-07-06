@@ -9,7 +9,6 @@ repository.workspace = true
 serde = { workspace = true }
 serde_json = { workspace = true }
 async-trait = { workspace = true }
-dirs = { workspace = true }
 tokio = { workspace = true }
 thiserror = { workspace = true }
 grep-regex = { workspace = true }
@@ -22,6 +21,7 @@ url = { workspace = true }
 fast_html2md = { workspace = true }
 dom_smoothie = { workspace = true }
 ff-core = { workspace = true }
+dirs = { workspace = true }
 ff-memory = { workspace = true }
 ff-session = { workspace = true }
 chrono = { workspace = true }

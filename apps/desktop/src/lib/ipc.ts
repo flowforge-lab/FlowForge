@@ -51,10 +51,15 @@ import type {
   MemoryFileInfo,
   MemoryOverview,
   MemoryFlushedEvent,
+  Mode,
+  Safety,
+  PermissionCell,
+  PermissionMatrixView,
 } from "../bindings";
 import type { Format } from "../bindings/Format";
 import type { SecretKind } from "../bindings/SecretKind";
 import type { BedrockAuth } from "../bindings/BedrockAuth";
+import type { SearchHit } from "../bindings/SearchHit";
 
 export type Unlisten = () => void;
 
@@ -214,6 +219,16 @@ export interface FfIpc {
   /** Best-effort nudge to wake the model server before the first turn. Never throws meaningfully. */
   warmup(): Promise<void>;
 
+  // Full-text message search (FTS5, #679/#707). Both back real Rust commands
+  // registered in `invoke_handler!`; the `SearchHit` binding is ts-rs generated.
+  // Empty/blank queries resolve to `[]`.
+  /** In-thread find (#679): matches within one session, seq-ordered so next/prev
+   *  steps through them in message order. Indexes tool-call args + tool-result
+   *  bodies too (v11 migration), not just visible message text. */
+  searchInSession(sessionId: string, query: string): Promise<SearchHit[]>;
+  /** Cross-session search (#710): BM25-ranked hits across every session. */
+  searchMessages(query: string, limit?: number): Promise<SearchHit[]>;
+
   // Memory (RFC 0006, M5.1e — frozen read-only surface for the Settings memory
   // pane, Issue #131). These three commands have real Rust impls + ts-rs bindings.
   // Writes, the enable/disable toggle, and embeddings are deliberately out of scope.
@@ -251,6 +266,19 @@ export interface FfIpc {
   getControlConfig(): Promise<ControlConfig>;
   /** Persist control settings; resolves with the stored config. */
   setControlConfig(config: ControlConfig): Promise<ControlConfig>;
+
+  // Permission matrix (#702, RFC 0019 §3). Unlike `ControlConfig` above, this is
+  // the REAL backend matrix that drives runtime approval: `get` returns every
+  // Mode × Safety cell; `set` edits one cell, persists it to `permissions.json`,
+  // and returns the updated view. Effective on the next tool invocation.
+  /** The current permission matrix as a flat Mode × Safety cell list. */
+  getPermissionMatrix(): Promise<PermissionMatrixView>;
+  /** Edit one matrix cell; resolves with the updated view. */
+  setPermissionCell(
+    mode: Mode,
+    safety: Safety,
+    cell: PermissionCell,
+  ): Promise<PermissionMatrixView>;
 
   // Skills (Issue #27). Discovery + the global active set; backs the command palette.
   /** All installed skills, name-sorted, each flagged active; `score` is always 0. */
@@ -642,7 +670,20 @@ class TauriIpc implements FfIpc {
   getControlConfig = () => this.invoke<ControlConfig>("get_control_config");
   setControlConfig = (config: ControlConfig) =>
     this.invoke<ControlConfig>("set_control_config", { config });
+  getPermissionMatrix = () =>
+    this.invoke<PermissionMatrixView>("get_permission_matrix");
+  setPermissionCell = (mode: Mode, safety: Safety, cell: PermissionCell) =>
+    this.invoke<PermissionMatrixView>("set_permission_cell", {
+      mode,
+      safety,
+      cell,
+    });
   warmup = () => this.invoke<void>("warmup");
+
+  searchInSession = (sessionId: string, query: string) =>
+    this.invoke<SearchHit[]>("search_in_session", { sessionId, query });
+  searchMessages = (query: string, limit?: number) =>
+    this.invoke<SearchHit[]>("search_messages", { query, limit });
 
   listSkills = () => this.invoke<SkillInfo[]>("list_skills");
   searchSkills = (query: string) =>

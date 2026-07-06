@@ -3,6 +3,7 @@
 // its search — so what you type matches exactly what you see.
 
 import type { Session } from "@/bindings";
+import type { SearchHit } from "@/bindings/SearchHit";
 
 /**
  * The label a user sees for a session: persisted title > goal > fallback.
@@ -28,6 +29,63 @@ export function filterSessions(sessions: Session[], query: string): Session[] {
   return sessions.filter((session) =>
     resolveLabel(session).toLowerCase().includes(q),
   );
+}
+
+/**
+ * One content-search result to show as its own sidebar row (#710): the matched
+ * session paired with its best hit (for the snippet + jump-to-message).
+ */
+export interface ContentHitRow {
+  session: Session;
+  hit: SearchHit;
+}
+
+/**
+ * Reduce cross-session `searchMessages` hits (BM25 order, possibly several per
+ * session) to one row per session for the sidebar's content group (#710):
+ * - keep the first (best-ranked) hit per session, preserving BM25 order;
+ * - drop sessions already shown as title matches (`excludeSessionIds`);
+ * - drop hits whose session isn't in `sessionsById` (e.g. a not-yet-listed
+ *   draft), so every row resolves to a real, visible session.
+ */
+export function groupContentHits(
+  hits: SearchHit[],
+  excludeSessionIds: ReadonlySet<string>,
+  sessionsById: ReadonlyMap<string, Session>,
+): ContentHitRow[] {
+  const seen = new Set<string>();
+  const rows: ContentHitRow[] = [];
+  for (const hit of hits) {
+    if (seen.has(hit.sessionId) || excludeSessionIds.has(hit.sessionId)) {
+      continue;
+    }
+    const session = sessionsById.get(hit.sessionId);
+    if (!session) continue;
+    seen.add(hit.sessionId);
+    rows.push({ session, hit });
+  }
+  return rows;
+}
+
+/**
+ * Make an FTS5 `snippet()` string safe to inject as HTML (#710, PR #747 C1).
+ * The backend wraps matched terms in `<mark>` but does NOT escape the
+ * surrounding message text, which routinely contains raw HTML/JS (agents quote
+ * `<script>`, `<img onerror=…>`, etc.). Rendering it verbatim in the Tauri
+ * webview would be a live XSS with full IPC access. So we escape every text
+ * segment and re-emit only the backend's own `<mark>`/`</mark>` delimiters.
+ */
+export function sanitizeSnippet(raw: string): string {
+  return raw
+    .split(/(<\/?mark>)/g)
+    .map((part) =>
+      part === "<mark>" || part === "</mark>" ? part : escapeHtml(part),
+    )
+    .join("");
+}
+
+function escapeHtml(s: string): string {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
 /** How many rows the list grows by per "Show more" click, and the initial

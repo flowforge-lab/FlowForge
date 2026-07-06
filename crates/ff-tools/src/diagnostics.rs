@@ -77,6 +77,7 @@ async fn run_check(root: &Path, package: Option<&str>) -> Result<String, String>
     }
 
     cmd.current_dir(root)
+        .env("PATH", ff_core::augmented_path())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 

@@ -228,7 +228,18 @@ fn parse_anthropic_line(line: &[u8]) -> Option<Result<Chunk, LlmError>> {
 
 /// Build the `/v1/messages` request body from OpenAI-shaped history.
 fn to_anthropic_request(req: &ChatRequest, max_tokens: u32, effort: ReasoningEffort) -> Value {
-    let (system, messages) = to_anthropic_messages(&req.messages);
+    let (system, mut messages) = to_anthropic_messages(&req.messages);
+    // Message-level cache breakpoints (#763): mark the penultimate wire message
+    // and (when history is long enough) index 0 so the growing conversation prefix
+    // is cached across turns. Anthropic allows up to 4 breakpoints total; system
+    // and tools already use 2, so we add at most 2 more on messages.
+    if req.cache_messages && messages.len() >= 2 {
+        let len = messages.len();
+        mark_anthropic_cache_breakpoint(&mut messages, len - 2);
+        if len >= 4 {
+            mark_anthropic_cache_breakpoint(&mut messages, 0);
+        }
+    }
     let mut body = json!({
         "model": req.model,
         "max_tokens": max_tokens,
@@ -312,6 +323,19 @@ fn to_anthropic_messages(messages: &[ChatMessage]) -> (Option<String>, Vec<Value
 
     let system = (!system.is_empty()).then(|| system.join("\n"));
     (system, enforce_tool_result_pairing(out))
+}
+
+/// Add `cache_control: {type: "ephemeral"}` to the last content block of the
+/// message at `idx`. This tells Anthropic to cache all tokens up to (and
+/// including) this block, so subsequent turns that share the prefix skip prefill.
+fn mark_anthropic_cache_breakpoint(messages: &mut [Value], idx: usize) {
+    if let Some(msg) = messages.get_mut(idx) {
+        if let Some(blocks) = msg["content"].as_array_mut() {
+            if let Some(last_block) = blocks.last_mut() {
+                last_block["cache_control"] = json!({ "type": "ephemeral" });
+            }
+        }
+    }
 }
 
 fn text_blocks(msg: &ChatMessage) -> Vec<Value> {
@@ -421,7 +445,8 @@ fn enforce_tool_result_pairing(messages: Vec<Value>) -> Vec<Value> {
 
 /// Remove tool_result blocks from any user turn whose preceding assistant has no
 /// tool_use blocks. Such results are orphans from a parallel-loop race (#744).
-/// Also drops user turns left empty after stripping.
+/// Also drops user turns left empty after stripping, and merges any adjacent
+/// same-role messages that result from the removal (strict alternation).
 fn strip_orphaned_trailing_results(messages: &mut Vec<Value>) {
     let mut i = 1;
     while i < messages.len() {
@@ -436,6 +461,19 @@ fn strip_orphaned_trailing_results(messages: &mut Vec<Value>) {
                     arr.retain(|b| b["type"] != "tool_result");
                     if arr.is_empty() {
                         messages.remove(i);
+                        // Merge adjacent same-role messages to restore alternation.
+                        if i < messages.len()
+                            && i > 0
+                            && messages[i]["role"] == messages[i - 1]["role"]
+                        {
+                            if let Some(absorbed) =
+                                messages.remove(i)["content"].as_array().cloned()
+                            {
+                                if let Some(target) = messages[i - 1]["content"].as_array_mut() {
+                                    target.extend(absorbed);
+                                }
+                            }
+                        }
                         continue;
                     }
                 }
@@ -596,6 +634,7 @@ impl Provider for AnthropicProvider {
             tools: Vec::new(),
             thinking: false,
             max_tokens: None,
+            cache_messages: false,
         };
         let mut stream = self.chat_stream(req).await?;
         match stream.next().await {
@@ -1001,6 +1040,7 @@ mod tests {
             tools: vec![],
             thinking: false,
             max_tokens: None,
+            cache_messages: false,
         };
         let body = to_anthropic_request(&req, 4096, ReasoningEffort::Medium);
         assert_eq!(body["max_tokens"], 4096);
@@ -1018,6 +1058,7 @@ mod tests {
             tools: vec![],
             thinking: true,
             max_tokens: None,
+            cache_messages: false,
         };
         // Medium budget is 4096; with the default 4096 cap, max_tokens is bumped
         // so budget stays strictly below it (Anthropic requirement).
@@ -1040,6 +1081,7 @@ mod tests {
             tools: vec![],
             thinking: true,
             max_tokens: None,
+            cache_messages: false,
         };
         // Budgets are uniform and concrete regardless of max_tokens.
         let low = to_anthropic_request(&req, 32000, ReasoningEffort::Low);
@@ -1064,6 +1106,7 @@ mod tests {
             tools: vec![],
             thinking: true,
             max_tokens: None,
+            cache_messages: false,
         };
         let provider = AnthropicProvider::new("sk-ant-test")
             .with_max_tokens(32000)
@@ -1088,6 +1131,7 @@ mod tests {
             ],
             thinking: false,
             max_tokens: None,
+            cache_messages: false,
         };
         let body = to_anthropic_request(&req, 100, ReasoningEffort::Medium);
         // System is now a block array with a cache breakpoint (#437).
@@ -1109,6 +1153,7 @@ mod tests {
             ],
             thinking: false,
             max_tokens: None,
+            cache_messages: false,
         };
         let body = to_anthropic_request(&req, 100, ReasoningEffort::Medium);
         assert_eq!(body["system"][0]["cache_control"]["type"], "ephemeral");
@@ -1116,6 +1161,93 @@ mod tests {
         assert!(body["tools"][0].get("cache_control").is_none());
         assert_eq!(body["tools"][1]["name"], "b");
         assert_eq!(body["tools"][1]["cache_control"]["type"], "ephemeral");
+    }
+
+    // --- message-level caching (#763) ----------------------------------------
+
+    #[test]
+    fn cache_messages_marks_penultimate_and_first() {
+        let req = ChatRequest {
+            model: "claude-x".into(),
+            messages: vec![
+                ChatMessage::text("user", "turn 1"),
+                ChatMessage::text("assistant", "reply 1"),
+                ChatMessage::text("user", "turn 2"),
+                ChatMessage::text("assistant", "reply 2"),
+                ChatMessage::text("user", "turn 3"),
+            ],
+            tools: vec![],
+            thinking: false,
+            max_tokens: None,
+            cache_messages: true,
+        };
+        let body = to_anthropic_request(&req, 4096, ReasoningEffort::Medium);
+        let msgs = body["messages"].as_array().unwrap();
+        // 5 messages -> penultimate is index 3, and index 0 gets a breakpoint (len >= 4).
+        assert_eq!(
+            msgs[3]["content"][0]["cache_control"]["type"], "ephemeral",
+            "penultimate message should have cache_control"
+        );
+        assert_eq!(
+            msgs[0]["content"][0]["cache_control"]["type"], "ephemeral",
+            "first message should have cache_control when len >= 4"
+        );
+        // Middle messages should NOT have cache_control.
+        assert!(msgs[1]["content"][0].get("cache_control").is_none());
+        assert!(msgs[2]["content"][0].get("cache_control").is_none());
+    }
+
+    #[test]
+    fn cache_messages_short_history_only_marks_penultimate() {
+        let req = ChatRequest {
+            model: "claude-x".into(),
+            messages: vec![
+                ChatMessage::text("user", "turn 1"),
+                ChatMessage::text("assistant", "reply 1"),
+                ChatMessage::text("user", "turn 2"),
+            ],
+            tools: vec![],
+            thinking: false,
+            max_tokens: None,
+            cache_messages: true,
+        };
+        let body = to_anthropic_request(&req, 4096, ReasoningEffort::Medium);
+        let msgs = body["messages"].as_array().unwrap();
+        // 3 messages -> penultimate is index 1; index 0 NOT marked (len < 4).
+        assert_eq!(
+            msgs[1]["content"][0]["cache_control"]["type"], "ephemeral",
+            "penultimate message should have cache_control"
+        );
+        assert!(
+            msgs[0]["content"][0].get("cache_control").is_none(),
+            "first message should NOT have cache_control when len < 4"
+        );
+    }
+
+    #[test]
+    fn cache_messages_false_leaves_messages_unmarked() {
+        let req = ChatRequest {
+            model: "claude-x".into(),
+            messages: vec![
+                ChatMessage::text("user", "turn 1"),
+                ChatMessage::text("assistant", "reply 1"),
+                ChatMessage::text("user", "turn 2"),
+                ChatMessage::text("assistant", "reply 2"),
+                ChatMessage::text("user", "turn 3"),
+            ],
+            tools: vec![],
+            thinking: false,
+            max_tokens: None,
+            cache_messages: false,
+        };
+        let body = to_anthropic_request(&req, 4096, ReasoningEffort::Medium);
+        let msgs = body["messages"].as_array().unwrap();
+        for msg in msgs {
+            assert!(
+                msg["content"][0].get("cache_control").is_none(),
+                "no message should have cache_control when disabled"
+            );
+        }
     }
 
     // --- creds --------------------------------------------------------------

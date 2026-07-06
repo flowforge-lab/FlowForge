@@ -17,6 +17,7 @@ mod scheduled;
 mod search;
 mod session;
 mod skill;
+mod spawn_env;
 
 pub use export::Format;
 pub use goal::{
@@ -33,7 +34,9 @@ pub use model_specs::{
     bundled_rules, context_window_in, parse_specs, supports_vision_in, ModelSpec, ModelSpecs,
     DEFAULT_CONTEXT_WINDOW_TOKENS,
 };
-pub use permission::{PermissionCell, PermissionMatrix, Safety};
+pub use permission::{
+    PermissionCell, PermissionMatrix, PermissionMatrixEntry, PermissionMatrixView, Safety,
+};
 pub use provider::{
     model_supports_documents, model_supports_vision, BedrockAuth, ConnectionId,
     ContextWindowSource, ModelSelection, ProviderConfig, ProviderConnection, ProviderKind,
@@ -46,3 +49,4 @@ pub use scheduled::{
 pub use search::{SearchBackend, SearchConfig};
 pub use session::{auto_title, Session, SessionStatus, SessionWorkspace};
 pub use skill::{Phenotype, Skill, SkillInfo, SkillManifest};
+pub use spawn_env::{augment_path, augmented_path, extra_path_dirs};

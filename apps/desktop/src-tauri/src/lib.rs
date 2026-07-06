@@ -25,9 +25,9 @@ use ff_core::events::{
 use ff_core::{
     Attachment, BedrockAuth, CreateScheduledTaskInput, Format, Goal, GoalStatus, McpServerConfig,
     McpServerStatus, MemoryFileInfo, MemoryFileKind, MemoryOverview, Message, Mode, ModelSelection,
-    Phenotype, ProviderConfig, ProviderConnection, ProviderKind, ProviderRegistry, ResolvedModel,
-    Role, RunRecord, RunStatus, ScheduledTask, SearchConfig, SecretKind, Session, SessionWorkspace,
-    Skill, SkillInfo, SkillManifest, TaskKind,
+    PermissionCell, PermissionMatrixView, Phenotype, ProviderConfig, ProviderConnection,
+    ProviderKind, ProviderRegistry, ResolvedModel, Role, RunRecord, RunStatus, ScheduledTask,
+    SearchConfig, SecretKind, Session, SessionWorkspace, Skill, SkillInfo, SkillManifest, TaskKind,
 };
 use ff_scheduled::ScheduledApprover;
 use ff_signals::SkillAggregate;
@@ -152,6 +152,21 @@ impl TurnMetrics {
     }
 }
 
+/// The invocation-time gate for a resolved permission cell (#702): `Some(true)`
+/// auto-approves, `Some(false)` rejects, `None` means prompt the user (`Ask`).
+/// Takes the already-resolved cell — the caller applies per-tool overrides via
+/// [`PermissionMatrix::effective_cell`] (#742) first. Pure so the gating semantics
+/// are unit-testable without a Tauri `AppHandle` or a live model turn.
+fn matrix_gate(cell: PermissionCell) -> Option<bool> {
+    if cell.is_allow() {
+        Some(true)
+    } else if cell.is_deny() {
+        Some(false)
+    } else {
+        None
+    }
+}
+
 /// Routes write/dangerous tool calls through a UI confirmation. Read-only calls
 /// never reach this approver — the agent loop short-circuits them.
 /// Whether the active autonomy mode auto-approves a call of this safety without a
@@ -179,16 +194,17 @@ impl Approver for UiApprover {
             return true;
         }
 
-        // Permission matrix (#699): Allow → auto-approve, Ask → prompt below,
-        // Deny → should never reach here (hidden from the model by advertised_tools).
-        // ReadOnly also never reaches here (the agent loop short-circuits it).
-        let cell = self.state.permission_matrix.cell(self.mode, safety);
-        if cell.is_allow() {
-            return true;
-        }
-        if cell.is_deny() {
-            // Defensive: a Deny tool should never have been callable; reject.
-            return false;
+        // Permission matrix (#699/#702/#742): the per-tool override if set, else
+        // the mode×safety cell. Read live each call (`permission_matrix()`) so a
+        // Control-panel edit takes effect on the next tool invocation. ReadOnly
+        // never reaches here (the agent loop short-circuits it).
+        // `None` means Ask — fall through to the UI prompt below.
+        let cell = self
+            .state
+            .permission_matrix()
+            .effective_cell(name, self.mode, safety);
+        if let Some(decision) = matrix_gate(cell) {
+            return decision;
         }
 
         let approval_safety = match safety {
@@ -344,6 +360,7 @@ fn delete_session(state: State<'_, Arc<AppState>>, session_id: String) {
     }
     state.cancel_pending_approvals(&session_id);
     state.clear_session_approvals(&session_id);
+    state.compaction_cache.invalidate(&session_id);
     state.store.delete_session(&session_id);
     state.reap_session_processes(&session_id);
     // Release this session's per-workspace MCP instance refs, evicting any instance no
@@ -1079,6 +1096,7 @@ fn spawn_assistant_turn(state: Arc<AppState>, app: tauri::AppHandle, session_id:
     let (mut provider, _) =
         state.build_provider_for(Some(&selection.connection), Some(&selection.model));
     let model = selection.model;
+    let conn_id = selection.connection;
     let persona = pheno.persona.clone();
     // Per-pane iteration cap (#244-R3 x #246): the resolved phenotype carries
     // `max_iterations`, so the bound Pheno governs the loop cap with no extra plumbing.
@@ -1109,15 +1127,23 @@ fn spawn_assistant_turn(state: Arc<AppState>, app: tauri::AppHandle, session_id:
         state.align_git_watcher(&session_root);
         // Snapshot built-in + MCP-bridged tools for this turn (RFC 0003 §6).
         let registry = state.build_tool_registry(&session_root);
+        // Snapshot the advertised-tools matrix for this turn (#702) so the model
+        // sees a stable tool list. The approval gate reads the matrix live (see
+        // `UiApprover::approve`), so Control-panel edits still take effect on the
+        // next tool call — only the advertised set is turn-bounded.
+        let permission_matrix = state.permission_matrix();
         let mut tool_ctx = ToolContext::new(
             &registry,
             &session_root,
             &approver,
             max_iterations,
-            &state.permission_matrix,
+            &permission_matrix,
         );
         tool_ctx.mode = mode;
         tool_ctx.abstractive = crate::state::abstractive_config_from_env();
+        tool_ctx.compaction_model = state.compaction_model(&conn_id);
+        tool_ctx.compaction_budget = state.compaction_budget(&conn_id);
+        tool_ctx.compaction_cache = Some(&state.compaction_cache);
         // Skills + ambient context for this turn (RFC 0001 §4, RFC 0002 phase 1):
         // the resolved persona, installed-skill descriptions, the bodies of the
         // active skills, and the current local time.
@@ -1137,6 +1163,7 @@ fn spawn_assistant_turn(state: Arc<AppState>, app: tauri::AppHandle, session_id:
             &active,
             &user_ctx,
             memory.as_deref(),
+            None,
             mode,
         );
 
@@ -1434,12 +1461,14 @@ impl GoalIteration for GoalLoopIteration {
             session_id: sid.clone(),
             mode,
         };
+        // Snapshot the matrix for this turn (#702); see the other turn paths.
+        let permission_matrix = self.state.permission_matrix();
         let mut tool_ctx = ff_agent::ToolContext::new(
             &registry,
             &session_root,
             &approver,
             max_iterations,
-            &self.state.permission_matrix,
+            &permission_matrix,
         );
         tool_ctx.mode = mode;
         tool_ctx.abstractive = crate::state::abstractive_config_from_env();
@@ -1458,6 +1487,7 @@ impl GoalIteration for GoalLoopIteration {
             &active,
             &user_ctx,
             memory.as_deref(),
+            Some(goal),
             mode,
         );
 
@@ -1755,15 +1785,20 @@ impl ff_scheduled::TaskRunner for DesktopTaskRunner {
         self.state.align_git_watcher(&session_root);
         let registry = self.state.build_tool_registry(&session_root);
         let approver = ScheduledApprover::new(task.safety_ceiling);
+        // Snapshot the matrix for this turn (#702); see the interactive path above.
+        let permission_matrix = self.state.permission_matrix();
         let mut tool_ctx = ToolContext::new(
             &registry,
             &session_root,
             &approver,
             max_iterations,
-            &self.state.permission_matrix,
+            &permission_matrix,
         );
         tool_ctx.mode = mode;
         tool_ctx.abstractive = crate::state::abstractive_config_from_env();
+        tool_ctx.compaction_model = self.state.compaction_model(&selection.connection);
+        tool_ctx.compaction_budget = self.state.compaction_budget(&selection.connection);
+        tool_ctx.compaction_cache = Some(&self.state.compaction_cache);
 
         let skills = self.state.skills_snapshot();
         let user_ctx =
@@ -1779,6 +1814,7 @@ impl ff_scheduled::TaskRunner for DesktopTaskRunner {
             &active,
             &user_ctx,
             memory.as_deref(),
+            None,
             mode,
         );
 
@@ -1853,6 +1889,9 @@ fn edit_message(
         token.cancel();
     }
     state.cancel_pending_approvals(&session_id);
+    // Invalidate the cross-turn summary cache (#757): the transcript is being
+    // truncated, so the old boundary is no longer valid.
+    state.compaction_cache.invalidate(&session_id);
 
     let edited_id = state
         .store
@@ -1898,6 +1937,9 @@ fn set_provider_config(
         num_ctx: current.num_ctx,
     };
     state.set_provider_config(config.clone());
+    // Model/provider changed — invalidate all cached summaries (#757) since
+    // a summary generated by the old model may be incoherent for the new one.
+    state.compaction_cache.invalidate_all();
     config
 }
 
@@ -1920,7 +1962,10 @@ fn upsert_connection(
     state: State<'_, Arc<AppState>>,
     conn: ProviderConnection,
 ) -> CmdResult<ProviderConnection> {
-    Ok(state.upsert_connection(conn))
+    let result = state.upsert_connection(conn);
+    // Connection model/endpoint may have changed — invalidate summaries (#757).
+    state.compaction_cache.invalidate_all();
+    Ok(result)
 }
 
 /// Remove a connection by id. Errors when removing the last one.
@@ -2496,6 +2541,26 @@ fn set_default_mode(state: State<'_, Arc<AppState>>, mode: Mode) {
     state.set_default_mode(mode);
 }
 
+/// The Control-panel view of the permission matrix (#702, RFC 0019 §3): every
+/// Mode × Safety cell as a flat, self-describing list.
+#[tauri::command]
+fn get_permission_matrix(state: State<'_, Arc<AppState>>) -> PermissionMatrixView {
+    state.permission_matrix_view()
+}
+
+/// Edit and persist a single matrix cell (#702), returning the updated view. Takes
+/// effect on the next tool invocation: the approval gate reads the matrix live, and
+/// the advertised-tools gate picks it up on the next turn.
+#[tauri::command]
+fn set_permission_cell(
+    state: State<'_, Arc<AppState>>,
+    mode: Mode,
+    safety: Safety,
+    cell: PermissionCell,
+) -> PermissionMatrixView {
+    state.set_permission_cell(mode, safety, cell)
+}
+
 // ---- MCP server control (M4.4, RFC 0003 §3,5) ----
 //
 // Enable/disable/add/remove write `mcp.json` via `ff_mcp::config`; the existing config
@@ -2589,13 +2654,32 @@ enum UpdateStatus {
 /// D1 dev/dogfood channel) it points at that feed instead and accepts any version
 /// that differs from the running one, so a locally-built artifact installs without a
 /// version bump. Inert in prod (env unset).
+/// Whether the `localUpdateChannel` experimental flag is active for this session.
+/// Set by [`start_dev_update_watcher`] (called by the FE exactly when the flag is on).
+static LOCAL_UPDATE_CHANNEL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Default port for the local dev-release HTTP server (matches `scripts/dev-release.sh`).
+const DEV_RELEASE_PORT: u16 = 8787;
+
 fn updater(app: &tauri::AppHandle) -> CmdResult<tauri_plugin_updater::Updater> {
     use tauri_plugin_updater::UpdaterExt;
+    // Priority: explicit env var > localUpdateChannel flag > compiled-in default.
     if let Ok(endpoint) = std::env::var("FF_UPDATER_ENDPOINT") {
         let endpoint = url::Url::parse(&endpoint).map_err(|e| e.to_string())?;
         app.updater_builder()
             .endpoints(vec![endpoint])
             .map_err(|e| e.to_string())?
+            .version_comparator(|current, update| update.version != current)
+            .build()
+            .map_err(|e| e.to_string())
+    } else if LOCAL_UPDATE_CHANNEL.load(std::sync::atomic::Ordering::Relaxed) {
+        let endpoint = url::Url::parse(&format!("http://localhost:{DEV_RELEASE_PORT}/latest.json"))
+            .map_err(|e| e.to_string())?;
+        app.updater_builder()
+            .endpoints(vec![endpoint])
+            .map_err(|e| e.to_string())?
+            // Any different version is an update (dev timestamps are always unique).
             .version_comparator(|current, update| update.version != current)
             .build()
             .map_err(|e| e.to_string())
@@ -2656,6 +2740,7 @@ async fn install_update(app: tauri::AppHandle) -> CmdResult<()> {
 #[tauri::command]
 fn start_dev_update_watcher(app: tauri::AppHandle) {
     use std::sync::Once;
+    LOCAL_UPDATE_CHANNEL.store(true, std::sync::atomic::Ordering::Relaxed);
     static STARTED: Once = Once::new();
     STARTED.call_once(|| {
         match dev_update_watcher::DevUpdateWatcher::spawn() {
@@ -3226,6 +3311,8 @@ pub fn run() {
             resolve_model_selection,
             get_default_mode,
             set_default_mode,
+            get_permission_matrix,
+            set_permission_cell,
             list_mcp_servers,
             restart_mcp_server,
             set_mcp_server_enabled,
@@ -3257,9 +3344,9 @@ pub fn run() {
 mod tests {
     use super::state::AppState;
     use super::{
-        git_branch, is_app_ready, list_local_branches, panic_message, publish_app_ready,
-        resolve_workspace_dir, should_warmup, switch_branch, BootFinalize, TurnMetrics,
-        UpdateStatus, APP_READY,
+        git_branch, is_app_ready, list_local_branches, matrix_gate, panic_message,
+        publish_app_ready, resolve_workspace_dir, should_warmup, switch_branch, BootFinalize,
+        TurnMetrics, UpdateStatus, APP_READY,
     };
     use ff_core::{Mode, ProviderKind};
     use ff_tools::Safety;
@@ -3442,6 +3529,55 @@ mod tests {
         // Plan: only ReadOnly allowed.
         assert_eq!(m.cell(Mode::Plan, Safety::ReadOnly), PermissionCell::Allow);
         assert_eq!(m.cell(Mode::Plan, Safety::Write), PermissionCell::Deny);
+    }
+
+    // Acceptance (#702): editing a matrix cell changes the invocation-time gate
+    // decision that `UiApprover::approve` applies to the next tool call. Exercises
+    // the same pure `matrix_gate` the approver calls, so no AppHandle / live model
+    // turn is required.
+    #[test]
+    fn edited_cell_flips_the_invocation_gate() {
+        use ff_core::{PermissionCell, PermissionMatrix};
+        let mut m = PermissionMatrix::default();
+        // Mirror `UiApprover::approve`: resolve the effective cell (per-tool
+        // override else the mode×safety cell, #742) then gate on it.
+        let gate = |m: &PermissionMatrix, tool: &str, mode: Mode, safety: Safety| {
+            matrix_gate(m.effective_cell(tool, mode, safety))
+        };
+
+        // Default: a Dangerous call in Act prompts the user (Ask → None).
+        assert_eq!(gate(&m, "bash", Mode::Act, Safety::Dangerous), None);
+        // A Sensitive call in Auto also prompts by default.
+        assert_eq!(gate(&m, "web_fetch", Mode::Auto, Safety::Sensitive), None);
+
+        // Deny the dangerous cell → the next invocation is rejected outright.
+        m.set_cell(Mode::Act, Safety::Dangerous, PermissionCell::Deny);
+        assert_eq!(gate(&m, "bash", Mode::Act, Safety::Dangerous), Some(false));
+
+        // Allow the sensitive cell → the next invocation auto-approves (no prompt).
+        m.set_cell(Mode::Auto, Safety::Sensitive, PermissionCell::Allow);
+        assert_eq!(
+            gate(&m, "web_fetch", Mode::Auto, Safety::Sensitive),
+            Some(true)
+        );
+
+        // A per-tool override (#742) wins over the matrix cell for that tool only.
+        m.set_override("web_fetch", PermissionCell::Deny);
+        assert_eq!(
+            gate(&m, "web_fetch", Mode::Auto, Safety::Sensitive),
+            Some(false)
+        );
+        assert_eq!(
+            gate(&m, "web_search", Mode::Auto, Safety::Sensitive),
+            Some(true)
+        );
+
+        // Untouched cells keep their default decision.
+        assert_eq!(gate(&m, "read_file", Mode::Act, Safety::Write), Some(true));
+        assert_eq!(
+            gate(&m, "write_file", Mode::Plan, Safety::Write),
+            Some(false)
+        );
     }
 
     #[test]

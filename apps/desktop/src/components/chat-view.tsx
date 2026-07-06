@@ -3,6 +3,7 @@ import { ChevronDown } from "@/components/ui/icon";
 import { cn } from "@/lib/utils";
 import { useChatStore } from "@/store/chat";
 import type { ToolStep } from "@/store/chat";
+import { useFindStore } from "@/store/find";
 import { ToolStepBlock } from "@/components/tool-step";
 import { OutputBlock } from "@/components/output-block";
 import { StepGroup } from "@/components/step-group";
@@ -89,7 +90,10 @@ function MessageRowImpl({
     const hasAttachments =
       message.attachments && message.attachments.length > 0;
     return (
-      <div className="flex flex-col items-end gap-1.5">
+      <div
+        data-message-id={message.id}
+        className="flex flex-col items-end gap-1.5"
+      >
         <MessageHeader role="user" createdAt={message.createdAt} />
         {hasAttachments && (
           <div className="max-w-[80%]">
@@ -119,7 +123,10 @@ function MessageRowImpl({
   // path (where `status` exists).
   if (message.role === "system" || message.role === "tool") {
     return (
-      <div className="w-full max-w-[80%] rounded-md border bg-muted/40 px-2.5 py-1.5 font-mono text-[11px] leading-relaxed">
+      <div
+        data-message-id={message.id}
+        className="w-full max-w-[80%] rounded-md border bg-muted/40 px-2.5 py-1.5 font-mono text-[11px] leading-relaxed"
+      >
         <OutputBlock output={message.content} title="tool output" />
       </div>
     );
@@ -130,13 +137,20 @@ function MessageRowImpl({
   // The live timer / answer preview / export belong to the LAST steps group — it's
   // the one that precedes the final answer.
   const segments = segmentTurn(items);
+  let firstStepsIdx = -1;
   let lastStepsIdx = -1;
   segments.forEach((seg, i) => {
-    if (seg.kind === "steps") lastStepsIdx = i;
+    if (seg.kind === "steps") {
+      if (firstStepsIdx === -1) firstStepsIdx = i;
+      lastStepsIdx = i;
+    }
   });
 
   return (
-    <div className="flex flex-col items-start gap-1.5">
+    <div
+      data-message-id={message.id}
+      className="flex flex-col items-start gap-1.5"
+    >
       <MessageHeader
         role="assistant"
         createdAt={message.createdAt}
@@ -193,7 +207,7 @@ function MessageRowImpl({
                       : undefined
                   }
                   onExportTimeline={
-                    i === lastStepsIdx && exportEnabled
+                    i === firstStepsIdx && exportEnabled
                       ? (format) =>
                           void downloadStepTimeline(
                             items,
@@ -316,6 +330,18 @@ export function ChatView({ sessionId }: { sessionId?: string } = {}) {
     [messages, toolStepsByMessage, reasoningByMessage],
   );
 
+  // While the in-thread find bar (#679) is open for this session, stop forcing
+  // the transcript to the bottom so stepping through matches (scrollIntoView)
+  // isn't yanked back down by streaming autoscroll. Normal pinning resumes on
+  // close — this replaces having to reach into `pinnedToBottom` from the find UI.
+  //
+  // Tradeoff (PR #739 review): this suppresses stream-follow for the WHOLE time
+  // find is open, not just the single jump — so a turn streaming with find open
+  // won't auto-scroll to new tokens until the bar closes. Intentional for an
+  // IDE-style find (the user is reading a match, not the tail); revisit if we
+  // want to suppress only the one scroll-into-view instead of the whole stream.
+  const findOn = useFindStore((s) => s.open && s.sessionId === targetSessionId);
+
   const scrollRef = useRef<HTMLDivElement>(null);
   const pinnedToBottom = useRef(true);
   // Render-state mirror of `pinnedToBottom` so the floating "Jump to latest" button
@@ -325,10 +351,10 @@ export function ChatView({ sessionId }: { sessionId?: string } = {}) {
   // Stay pinned to the bottom while streaming, but respect manual scroll-up.
   useEffect(() => {
     const el = scrollRef.current;
-    if (el && pinnedToBottom.current) {
+    if (el && pinnedToBottom.current && !findOn) {
       el.scrollTop = el.scrollHeight;
     }
-  }, [messages, toolStepsByMessage, reasoningByMessage, pending]);
+  }, [messages, toolStepsByMessage, reasoningByMessage, pending, findOn]);
 
   useEffect(() => {
     pinnedToBottom.current = true;
