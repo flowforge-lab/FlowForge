@@ -34,7 +34,7 @@
 //! already-compact JSON) is returned unchanged with no cache entry -- the cache
 //! holds only what the model might need to pull back.
 
-use ff_core::Message;
+use ff_core::{Message, Role};
 use std::collections::BTreeMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
 
@@ -314,7 +314,7 @@ impl ExtractiveCompactor {
         let mut out = Vec::with_capacity(n);
         for (i, m) in messages.iter().enumerate() {
             before += proxy_tokens(&m.content);
-            if i < cold_end {
+            if i < cold_end && m.role != Role::Assistant {
                 let new_content = self.compress(&m.content, cache);
                 after += proxy_tokens(&new_content);
                 let mut clone = m.clone();
@@ -354,7 +354,10 @@ impl ExtractiveCompactor {
         let mut originals = Vec::new();
         for (i, m) in messages.iter().enumerate() {
             before += proxy_tokens(&m.content);
-            if i < cold_end && !m.content.contains(COMPACTION_MARKER_PREFIX) {
+            if i < cold_end
+                && m.role != Role::Assistant
+                && !m.content.contains(COMPACTION_MARKER_PREFIX)
+            {
                 let outcome = self.compress_one(&m.content);
                 after += proxy_tokens(&outcome.text);
                 if let Some((key, original)) = outcome.original {
@@ -584,29 +587,29 @@ mod tests {
         let small = "ok";
         let messages = vec![
             msg(Role::User, &big),      // cold (will compress)
-            msg(Role::Assistant, &big), // cold (will compress)
+            msg(Role::Assistant, &big), // cold (skipped — #813)
             msg(Role::User, small),     // recent (verbatim)
         ];
 
         let (out, savings) = comp.compact_cold(&messages, 1, &mut cache);
 
         assert_eq!(out.len(), 3);
-        // Cold messages were rewritten.
+        // Cold user message was compressed.
         assert_ne!(out[0].content, big);
-        assert_ne!(out[1].content, big);
         assert!(out[0].content.contains("[compacted; retrieve key="));
-        assert!(out[1].content.contains("[compacted; retrieve key="));
+        // Cold assistant message is NEVER compressed (#813): markers in
+        // assistant-role messages cause the model to mimic them.
+        assert_eq!(out[1].content, big);
         // Recent message is byte-identical.
         assert_eq!(out[2].content, small);
-        // Savings make sense.
+        // Savings reflect only the user message being compressed.
         assert!(savings.before_tokens > savings.after_tokens);
         assert!(savings.saved() > 0);
         assert!(savings.ratio() > 0.0);
-        // Cache deduped: both cold messages had identical content -> one entry.
         assert_eq!(savings.originals_cached, 1);
         assert_eq!(cache.len(), 1);
 
-        // And the retrieve key in either compressed message resolves to the
+        // And the retrieve key in the compressed user message resolves to the
         // verbatim original.
         let key = out[0]
             .content
@@ -756,9 +759,10 @@ mod tests {
         let cold = comp.compact_cold_collect(&messages, 1);
 
         assert_eq!(cold.messages.len(), 3);
-        // Cold prefix compacted.
+        // Cold user message compacted.
         assert!(cold.messages[0].content.contains(COMPACTION_MARKER_PREFIX));
-        assert!(cold.messages[1].content.contains(COMPACTION_MARKER_PREFIX));
+        // Cold assistant message is NEVER compacted (#813).
+        assert_eq!(cold.messages[1].content, cold_b);
         // Recent message is byte-identical.
         assert_eq!(cold.messages[2].content, recent);
         assert!(cold.savings.saved() > 0);
@@ -809,5 +813,59 @@ mod tests {
         // The collected key matches the marker emitted on the wire content.
         assert!(cold.messages[0].content.contains(&format!("key={key}]")));
         assert_eq!(cold.savings.originals_cached, 1);
+    }
+
+    /// #813: assistant-role messages must NEVER be compacted — markers in prior
+    /// assistant replies cause the model to mimic them in its own output (the
+    /// root cause that PR #784's format change did not fix).
+    #[test]
+    fn assistant_messages_are_never_compacted() {
+        let comp = ExtractiveCompactor {
+            keep_head_lines: 2,
+            keep_tail_lines: 2,
+            min_lines_to_elide: 6,
+            min_tokens_to_compact: 0,
+            ..ExtractiveCompactor::default()
+        };
+        let mut cache = ReversibleCache::new();
+        let big = (1..=50)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        // All messages are in the cold prefix (keep_recent=1, last is recent).
+        let messages = vec![
+            msg(Role::Tool, &big),      // cold tool — compacted
+            msg(Role::Assistant, &big), // cold assistant — SKIPPED
+            msg(Role::User, &big),      // cold user — compacted
+            msg(Role::User, "recent"),  // recent — verbatim
+        ];
+
+        let (out, _) = comp.compact_cold(&messages, 1, &mut cache);
+
+        // Tool message: compacted.
+        assert!(
+            out[0].content.contains(COMPACTION_MARKER_PREFIX),
+            "tool should be compacted"
+        );
+        // Assistant message: NEVER compacted, regardless of size.
+        assert_eq!(out[1].content, big, "assistant must stay verbatim (#813)");
+        assert!(
+            !out[1].content.contains(COMPACTION_MARKER_PREFIX),
+            "assistant must not contain compaction markers"
+        );
+        // User message: compacted.
+        assert!(
+            out[2].content.contains(COMPACTION_MARKER_PREFIX),
+            "user should be compacted"
+        );
+        // Recent: verbatim.
+        assert_eq!(out[3].content, "recent");
+
+        // Also verify compact_cold_collect (the store-agnostic variant).
+        let cold = comp.compact_cold_collect(&messages, 1);
+        assert_eq!(
+            cold.messages[1].content, big,
+            "compact_cold_collect must also skip assistant (#813)"
+        );
     }
 }
