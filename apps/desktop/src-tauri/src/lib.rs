@@ -160,16 +160,23 @@ struct UiApprover {
     mode: Mode,
 }
 
-/// Resolve the "relevant argument" for scoped permission rules (#712):
-/// path for filesystem tools, command for bash/python.
+/// Resolve the "relevant argument" for scoped permission rules (#712).
+///
+/// Each entry is verified against the real tool arg schema in `ff-tools`
+/// (#768 review B2): `bash` takes `command`, `python` takes `code`, and the
+/// filesystem mutators take `path`. Only tools that can actually reach the
+/// approval gate are listed — the read-only search tools (`glob`, `grep`)
+/// short-circuit as `Safety::ReadOnly` before `approve()`, so a rule on them
+/// would never fire; listing them (with the wrong key, as before) was dead,
+/// misleading code.
 fn resolve_tool_arg(name: &str, args: &serde_json::Value) -> Option<String> {
-    match name {
-        "bash" | "python" => args.get("command").and_then(|v| v.as_str()).map(Into::into),
-        "view" | "edit" | "write" | "glob" | "fd" | "rg" => {
-            args.get("path").and_then(|v| v.as_str()).map(Into::into)
-        }
-        _ => None,
-    }
+    let key = match name {
+        "bash" => "command",
+        "python" => "code",
+        "view" | "edit" | "write" => "path",
+        _ => return None,
+    };
+    args.get(key).and_then(|v| v.as_str()).map(Into::into)
 }
 
 #[async_trait]
@@ -2878,8 +2885,8 @@ mod tests {
     use super::state::AppState;
     use super::{
         git_branch, is_app_ready, list_local_branches, panic_message, publish_app_ready,
-        resolve_workspace_dir, should_warmup, switch_branch, BootFinalize, TurnMetrics,
-        UpdateStatus, APP_READY,
+        resolve_tool_arg, resolve_workspace_dir, should_warmup, switch_branch, BootFinalize,
+        TurnMetrics, UpdateStatus, APP_READY,
     };
     use ff_core::{Mode, ProviderKind};
     use ff_tools::Safety;
@@ -2890,6 +2897,36 @@ mod tests {
     // the only tests in the crate that touch it. Guard them with a mutex so the
     // two never race each other (parallel `cargo test` threads share the flag).
     static BOOT_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    // #768 review B2: the scoped-rule arg table must read each tool's REAL
+    // argument key, checked against the ff-tools schemas. A wrong key silently
+    // resolves to `None`, so the rule never fires (fail-open for deny backstops).
+    #[test]
+    fn resolve_tool_arg_reads_real_schema_keys() {
+        use serde_json::json;
+        assert_eq!(
+            resolve_tool_arg("bash", &json!({"command": "cargo build"})),
+            Some("cargo build".into())
+        );
+        // python's key is `code`, NOT `command`.
+        assert_eq!(
+            resolve_tool_arg("python", &json!({"code": "print(1)"})),
+            Some("print(1)".into())
+        );
+        assert_eq!(resolve_tool_arg("python", &json!({"command": "print(1)"})), None);
+        for tool in ["view", "edit", "write"] {
+            assert_eq!(
+                resolve_tool_arg(tool, &json!({"path": "src/main.rs"})),
+                Some("src/main.rs".into())
+            );
+        }
+        // Read-only search tools short-circuit before approve() — not listed.
+        assert_eq!(resolve_tool_arg("grep", &json!({"pattern": "x"})), None);
+        assert_eq!(resolve_tool_arg("glob", &json!({"pattern": "**/*.rs"})), None);
+        // Formerly-listed phantom keys resolve to nothing now.
+        assert_eq!(resolve_tool_arg("rg", &json!({"path": "."})), None);
+        assert_eq!(resolve_tool_arg("fd", &json!({"path": "."})), None);
+    }
 
     // Spy that asserts the `manage` → `store` → `emit` ordering at call time: a
     // reordered `publish_app_ready` (e.g. `store` hoisted above `manage`, or
