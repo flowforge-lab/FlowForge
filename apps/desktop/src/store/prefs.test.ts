@@ -10,6 +10,7 @@ import {
   SIDEBAR_WIDTH_MIN,
   SIDEBAR_WIDTH_MAX,
 } from "@/store/prefs";
+import { ipc } from "@/lib/ipc";
 
 describe("migrateLegacyTheme", () => {
   afterEach(() => {
@@ -192,6 +193,43 @@ describe("keyboard prefs (SET.6)", () => {
     usePrefsStore.setState({ defaultMode: "plan" });
     usePrefsStore.getState().resetKeyboard();
     expect(usePrefsStore.getState().defaultMode).toBe("auto");
+  });
+});
+
+describe("default mode ↔ backend mode.json (#798)", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+    usePrefsStore.setState({ defaultMode: "auto" });
+  });
+
+  it("setDefaultMode writes through to set_default_mode", () => {
+    const spy = vi.spyOn(ipc, "setDefaultMode").mockResolvedValue();
+    usePrefsStore.getState().setDefaultMode("plan");
+    // Store is authoritative for the UI…
+    expect(usePrefsStore.getState().defaultMode).toBe("plan");
+    // …and mirrored to the backend so it survives a relaunch.
+    expect(spy).toHaveBeenCalledWith("plan");
+  });
+
+  it("hydrateDefaultMode pulls the persisted value from get_default_mode", async () => {
+    vi.spyOn(ipc, "getDefaultMode").mockResolvedValue("act");
+    await usePrefsStore.getState().hydrateDefaultMode();
+    expect(usePrefsStore.getState().defaultMode).toBe("act");
+  });
+
+  it("hydrateDefaultMode keeps the current default when the backend rejects", async () => {
+    usePrefsStore.setState({ defaultMode: "plan" });
+    vi.spyOn(ipc, "getDefaultMode").mockRejectedValue(new Error("down"));
+    await usePrefsStore.getState().hydrateDefaultMode();
+    expect(usePrefsStore.getState().defaultMode).toBe("plan");
+  });
+
+  it("resetKeyboard writes the default-mode reset through to the backend", () => {
+    const spy = vi.spyOn(ipc, "setDefaultMode").mockResolvedValue();
+    usePrefsStore.setState({ defaultMode: "plan" });
+    usePrefsStore.getState().resetKeyboard();
+    expect(usePrefsStore.getState().defaultMode).toBe("auto");
+    expect(spy).toHaveBeenCalledWith("auto");
   });
 });
 

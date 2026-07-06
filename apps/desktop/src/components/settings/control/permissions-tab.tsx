@@ -14,7 +14,7 @@ import {
   cellLabel,
   type CellMark,
 } from "@/lib/control";
-import { useControlConfigStore } from "@/store/control-config";
+import { usePrefsStore } from "@/store/prefs";
 import {
   usePermissionMatrixStore,
   type MatrixLookup,
@@ -241,9 +241,11 @@ function OverrideBucket({
 
 /** Permissions sub-tab: the editable permission matrix + Custom Overrides. */
 export function PermissionsTab() {
-  const config = useControlConfigStore((s) => s.config);
-  const saving = useControlConfigStore((s) => s.saving);
-  const setDefaultMode = useControlConfigStore((s) => s.setDefaultMode);
+  // Default mode is the shared, backend-persisted value (#798) — same source the
+  // Keyboard-section picker drives — not a control-config field. Reading/writing it
+  // here keeps both pickers in lockstep and persists to `mode.json`.
+  const defaultMode = usePrefsStore((s) => s.defaultMode);
+  const setDefaultMode = usePrefsStore((s) => s.setDefaultMode);
 
   const matrix = usePermissionMatrixStore((s) => s.matrix);
   const overrides = usePermissionMatrixStore((s) => s.overrides);
@@ -258,8 +260,6 @@ export function PermissionsTab() {
   useEffect(() => {
     void loadMatrix();
   }, [loadMatrix]);
-
-  if (!config) return null;
 
   const grouped = groupOverridesByCell(overrides);
 
@@ -283,8 +283,8 @@ export function PermissionsTab() {
         ) : (
           <ModeMatrix
             matrix={matrix}
-            defaultMode={config.defaultMode}
-            onSelectMode={(mode) => void setDefaultMode(mode)}
+            defaultMode={defaultMode}
+            onSelectMode={(mode) => setDefaultMode(mode)}
             onCycleCell={(mode, row) =>
               void setCell(
                 mode,
@@ -292,7 +292,7 @@ export function PermissionsTab() {
                 cycleCell(matrix[mode][ROW_SAFETY[row]]),
               )
             }
-            disabled={saving || matrixSaving}
+            disabled={matrixSaving}
           />
         )}
       </section>
@@ -312,7 +312,7 @@ export function PermissionsTab() {
               label={bucket.label}
               placeholder={bucket.placeholder}
               items={grouped[bucket.cell]}
-              disabled={saving || matrixSaving}
+              disabled={matrixSaving}
               onAdd={(value) => void setOverride(value.trim(), bucket.cell)}
               onRemove={(value) => void removeOverride(value)}
             />

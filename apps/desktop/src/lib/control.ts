@@ -20,8 +20,6 @@ export type PermissionRow =
   | "externalChanges"
   | "dangerous";
 
-export type PermissionDecision = "allow" | "deny" | "ask";
-
 /** A teammate profile (SET.12). FE-only mock until real teammate spawning lands. */
 export interface Teammate {
   id: string;
@@ -42,10 +40,10 @@ export interface ControlUi {
   contextualGreeting: boolean;
 }
 
-/** The full control config, round-tripped via `getControlConfig`/`setControlConfig`. */
+/** The full control config, round-tripped via `getControlConfig`/`setControlConfig`.
+ *  NOTE: the global default mode is NOT here — it lives in the backend `mode.json`
+ *  (via `getDefaultMode`/`setDefaultMode`, surfaced through `usePrefsStore`, #798). */
 export interface ControlConfig {
-  defaultMode: DefaultMode;
-  permissionPolicy: Record<PermissionRow, PermissionDecision>;
   injectMemory: boolean;
   /** Backed by `user_instructions.md` once the backend lands. */
   userInstructions: string;
@@ -85,43 +83,9 @@ export const PERMISSION_ROWS: ReadonlyArray<PermissionRowMeta> = [
   { key: "dangerous", label: "Dangerous commands" },
 ];
 
-// Canonical cell marks per mode. Capability escalates plan → auto → act; dangerous
-// commands always require an explicit ask (never silently allowed).
-export const MODE_CELLS: Record<
-  DefaultMode,
-  Record<PermissionRow, CellMark>
-> = {
-  plan: {
-    read: "check",
-    localWrites: "cross",
-    externalChanges: "cross",
-    dangerous: "cross",
-  },
-  auto: {
-    read: "check",
-    localWrites: "check",
-    externalChanges: "ask",
-    dangerous: "ask",
-  },
-  act: {
-    read: "check",
-    localWrites: "check",
-    externalChanges: "check",
-    dangerous: "ask",
-  },
-};
-
-/** Map a presentation mark to the stored per-row decision. */
-export function cellToDecision(mark: CellMark): PermissionDecision {
-  if (mark === "check") return "allow";
-  if (mark === "cross") return "deny";
-  return "ask";
-}
-
 // ─── Live permission-matrix mapping (#702) ──────────────────────────────────
 // Bridges the FE presentation vocabulary (rows/marks) to the real backend matrix
-// (`Safety`/`PermissionCell` from bindings). The matrix grid drives runtime
-// approval, unlike the presentation-only `MODE_CELLS` above.
+// (`Safety`/`PermissionCell` from bindings). The matrix grid drives runtime approval.
 
 /** Presentation row → backend `Safety` tier. `DefaultMode` doubles as `Mode`
  *  (identical string members), so no mode mapping is needed. */
@@ -184,19 +148,6 @@ export function groupOverridesByCell(
   return grouped;
 }
 
-/** The per-row policy implied by a mode's canonical cells. */
-export function policyForMode(
-  mode: DefaultMode,
-): Record<PermissionRow, PermissionDecision> {
-  const cells = MODE_CELLS[mode];
-  return {
-    read: cellToDecision(cells.read),
-    localWrites: cellToDecision(cells.localWrites),
-    externalChanges: cellToDecision(cells.externalChanges),
-    dangerous: cellToDecision(cells.dangerous),
-  };
-}
-
 /** Normalize a free-text slug into a handle: lowercased, alphanumerics kept, every
  *  other run collapsed to a single dash, no leading/trailing dashes. Returns "" when
  *  the input has no usable characters (the slug is optional / display-only for now). */
@@ -209,8 +160,6 @@ export function slugify(raw: string): string {
 
 /** First-run defaults — shared by the store's initial load fallback and `resetControl`. */
 export const CONTROL_DEFAULTS: ControlConfig = {
-  defaultMode: "auto",
-  permissionPolicy: policyForMode("auto"),
   injectMemory: true,
   userInstructions: "",
   promptFiles: [],
