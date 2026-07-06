@@ -3331,6 +3331,21 @@ pub fn run() {
                         });
                     }
 
+                    // Resume any goal that was `Active` when the app last closed
+                    // (RFC 0020 §5.3, #802). `spawn_goal_loop` is single-flight
+                    // guarded and re-checks `status`, so a racing IPC `goal_resume`
+                    // can never double-spawn. This is best-effort and off the
+                    // first-paint path (post_init already runs after `app:ready` is
+                    // scheduled), so a slow or failed scan never blocks boot. The
+                    // loops spawn before `publish_app_ready` (they hold their own
+                    // `Arc<AppState>`, not the managed state), but the initial
+                    // `goal:updated` emit is deferred until after it so the FE panel
+                    // is already listening when the "running" snapshot arrives.
+                    let resumed = state.goals.list_active();
+                    for goal in &resumed {
+                        spawn_goal_loop(state.clone(), app_handle.clone(), goal.session_id.clone());
+                    }
+
                     // State is now usable: publish it to the command layer and notify
                     // the FE to drop its loading gate. Commands read
                     // `State<'_, Arc<AppState>>`, which only resolves once `manage` runs
@@ -3340,6 +3355,10 @@ pub fn run() {
                     // gate requires (see its invariant); doing it inline would let a
                     // future reorder break the gate silently.
                     publish_app_ready(&app_handle, state);
+
+                    for goal in &resumed {
+                        let _ = app_handle.emit("goal:updated", goal);
+                    }
                 };
                 if let Err(payload) = catch_unwind(AssertUnwindSafe(post_init)) {
                     let msg = panic_message("post-init", &payload);
