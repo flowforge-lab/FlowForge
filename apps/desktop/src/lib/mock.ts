@@ -814,6 +814,7 @@ export class MockIpc implements FfIpc {
   // Per-session model overrides (RFC 0005 §11.2, Phase D; #499). Absent → the
   // session inherits the phenotype/global tiers; see resolveModelSelection.
   private sessionModelSelections = new Map<string, ModelSelection>();
+  private sessionModes = new Map<string, Mode>();
 
   // MCP server statuses, keyed by per-instance key (id + workspace scope, RFC 0018)
   // so two workspace-scoped instances of one id don't collapse (#608). Mutated by
@@ -2149,6 +2150,16 @@ Shipping the Settings redesign — currently the Memory browser (SET.8).
   ): Promise<ModelSelection | null> {
     const sel = this.sessionModelSelections.get(sessionId);
     return sel ? { ...sel } : null;
+  }
+
+  // Per-session mode (#266, RFC 0011; #789). Mirrors the backend: store the
+  // explicit override, or drop it (null) so the session inherits the default.
+  async setSessionMode(sessionId: string, mode: Mode | null): Promise<void> {
+    if (mode !== null) {
+      this.sessionModes.set(sessionId, mode);
+    } else {
+      this.sessionModes.delete(sessionId);
+    }
   }
 
   // Mirror of the backend capability derivation (RFC 0005 §11.3): attachment caps

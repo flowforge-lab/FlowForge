@@ -647,6 +647,13 @@ export function ModePill({ sessionId }: { sessionId: string }) {
   const explicit = useSessionModeStore((s) => s.modeBySession[sessionId]);
   const setMode = useSessionModeStore((s) => s.setMode);
   const mode = explicit ?? defaultMode;
+  // Self-heal sessions persisted before mode was wired to the backend (#789):
+  // push the localStorage-cached override to SQLite on mount so an existing
+  // "Plan" session is honoured without a re-toggle. `null` clears the override
+  // (backend inherits its default). Idempotent — safe on every mount/change.
+  useEffect(() => {
+    void ipc.setSessionMode(sessionId, explicit ?? null);
+  }, [sessionId, explicit]);
   const meta = MODE_META[mode];
   return (
     <DropdownMenu>

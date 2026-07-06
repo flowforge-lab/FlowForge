@@ -362,6 +362,13 @@ export interface FfIpc {
    *  and the composer attach gate. */
   resolveModelSelection(sessionId: string): Promise<ResolvedModel>;
 
+  // Per-session agent mode (#266, RFC 0011; #789). The composer pill is
+  // authoritative and mirrors every change here so `spawn_assistant_turn` — which
+  // reads the persisted `sessions.mode` fresh each turn — actually honours Plan/Act.
+  /** Persist a session's explicit mode override, or clear it (`null`) so the
+   *  backend inherits `default_mode`. */
+  setSessionMode(sessionId: string, mode: Mode | null): Promise<void>;
+
   // CONTRACT NOTE (SET.7): FE-owned mock command — no backend/ts-rs binding for a
   // remote profile catalog exists yet. `MarketplaceProfile` lives in
   // `lib/profile-marketplace.ts` (mirroring SET.5's `MarketplaceSkill`);
@@ -793,6 +800,8 @@ class TauriIpc implements FfIpc {
     });
   resolveModelSelection = (sessionId: string) =>
     this.invoke<ResolvedModel>("resolve_model_selection", { sessionId });
+  setSessionMode = (sessionId: string, mode: Mode | null) =>
+    this.invoke<void>("set_session_mode", { sessionId, mode });
   searchProfileMarketplace = (query: string) =>
     this.invoke<MarketplaceProfile[]>("search_profile_marketplace", { query });
   listScheduledTasks = () =>
