@@ -10,7 +10,10 @@ mod state;
 mod tools;
 
 use async_trait::async_trait;
-use ff_agent::{run_turn, AgentEvent, Approver, CancelToken, ToolContext};
+use ff_agent::{
+    drive_goal, run_turn, AgentEvent, Approver, CancelToken, GateDecision, GoalIteration,
+    IterationOutcome, ToolContext,
+};
 use ff_core::events::{
     ApprovalSafety, EvolveCostEstimate, IntentionSignal, McpStatusChangedEvent, MemoryFlushedEvent,
     OutputStreamKind, PhenotypeMcpUnavailableEvent, ReasoningEvent, SessionTitleUpdatedEvent,
@@ -20,11 +23,11 @@ use ff_core::events::{
     TurnErrorEvent, TurnStatsEvent, UpdateProgressEvent,
 };
 use ff_core::{
-    Attachment, BedrockAuth, CreateScheduledTaskInput, Format, McpServerConfig, McpServerStatus,
-    MemoryFileInfo, MemoryFileKind, MemoryOverview, Message, Mode, ModelSelection, Phenotype,
-    ProviderConfig, ProviderConnection, ProviderKind, ProviderRegistry, ResolvedModel, Role,
-    RunRecord, RunStatus, ScheduledTask, SearchConfig, SecretKind, Session, SessionWorkspace,
-    Skill, SkillInfo, SkillManifest, TaskKind,
+    Attachment, BedrockAuth, CreateScheduledTaskInput, Format, Goal, GoalStatus, McpServerConfig,
+    McpServerStatus, MemoryFileInfo, MemoryFileKind, MemoryOverview, Message, Mode, ModelSelection,
+    PermissionCell, PermissionMatrixView, Phenotype, ProviderConfig, ProviderConnection,
+    ProviderKind, ProviderRegistry, ResolvedModel, Role, RunRecord, RunStatus, ScheduledTask,
+    SearchConfig, SecretKind, Session, SessionWorkspace, Skill, SkillInfo, SkillManifest, TaskKind,
 };
 use ff_scheduled::ScheduledApprover;
 use ff_signals::SkillAggregate;
@@ -149,6 +152,21 @@ impl TurnMetrics {
     }
 }
 
+/// The invocation-time gate for a resolved permission cell (#702): `Some(true)`
+/// auto-approves, `Some(false)` rejects, `None` means prompt the user (`Ask`).
+/// Takes the already-resolved cell — the caller applies per-tool overrides via
+/// [`PermissionMatrix::effective_cell`] (#742) first. Pure so the gating semantics
+/// are unit-testable without a Tauri `AppHandle` or a live model turn.
+fn matrix_gate(cell: PermissionCell) -> Option<bool> {
+    if cell.is_allow() {
+        Some(true)
+    } else if cell.is_deny() {
+        Some(false)
+    } else {
+        None
+    }
+}
+
 /// Routes write/dangerous tool calls through a UI confirmation. Read-only calls
 /// never reach this approver — the agent loop short-circuits them.
 /// Whether the active autonomy mode auto-approves a call of this safety without a
@@ -195,15 +213,15 @@ impl Approver for UiApprover {
             return true;
         }
 
+        // Snapshot the matrix once for this call, read live (#702/#742) so a
+        // Control-panel edit takes effect on the next tool invocation.
+        let matrix = self.state.permission_matrix();
+
         // Scoped rules (#712, RFC 0019 §9): resolve the tool's relevant argument
         // and evaluate. Deny rules veto unconditionally; Allow rules auto-approve
         // except for Dangerous (degrades to Ask).
         let resolved_arg = resolve_tool_arg(name, args);
-        if let Some(effect) =
-            self.state
-                .permission_matrix
-                .evaluate_rules(name, resolved_arg.as_deref(), self.mode)
-        {
+        if let Some(effect) = matrix.evaluate_rules(name, resolved_arg.as_deref(), self.mode) {
             match effect {
                 ff_core::RuleEffect::Deny => return false,
                 ff_core::RuleEffect::Allow => {
@@ -221,19 +239,12 @@ impl Approver for UiApprover {
             }
         }
 
-        // Permission matrix (#699): Allow → auto-approve, Ask → prompt below,
-        // Deny → should never reach here (hidden from the model by advertised_tools).
-        // ReadOnly also never reaches here (the agent loop short-circuits it).
-        let cell = self
-            .state
-            .permission_matrix
-            .effective_cell(name, self.mode, safety);
-        if cell.is_allow() {
-            return true;
-        }
-        if cell.is_deny() {
-            // Defensive: a Deny tool should never have been callable; reject.
-            return false;
+        // Permission matrix (#699/#702/#742): the per-tool override if set, else
+        // the mode×safety cell. Deny/ReadOnly never reach here (hidden or
+        // short-circuited); `None` means Ask — fall through to the UI prompt.
+        let cell = matrix.effective_cell(name, self.mode, safety);
+        if let Some(decision) = matrix_gate(cell) {
+            return decision;
         }
 
         let approval_safety = match safety {
@@ -471,6 +482,181 @@ fn set_scheduled_paused_all(
     state.scheduled.set_all_paused(paused);
     let _ = app.emit("scheduled:changed", state.scheduled.list());
     paused
+}
+
+// ===== Goal mode (RFC 0020, #716) =====
+// The five `goal_*` IPC commands are the FE-facing half of the goal lifecycle;
+// the `goal_complete` capability is also an agent tool (dual-surface, §7). Each
+// mutation persists through the path-injected `GoalStore` and emits
+// `goal:updated` so the FE panel (#717) live-refreshes without polling. The
+// self-continue loop is spawned by `goal_set` / `goal_resume` — see
+// `spawn_goal_loop`.
+
+/// Begin (or replace) the active goal for a session and start the self-continue
+/// loop (RFC 0020 §5.1). An empty objective is rejected. A pre-existing goal for
+/// the session is overwritten — starting a new objective is a deliberate reset.
+#[tauri::command]
+async fn goal_set(
+    state: State<'_, Arc<AppState>>,
+    app: tauri::AppHandle,
+    session_id: String,
+    objective: String,
+    max_iterations: Option<u32>,
+    max_tokens: Option<u64>,
+    max_wall_ms: Option<i64>,
+) -> Result<Goal, String> {
+    let objective = objective.trim();
+    if objective.is_empty() {
+        return Err("goal objective must not be empty".into());
+    }
+    // Re-setting a goal is a deliberate reset, but a loop may still be driving the
+    // OLD goal on an in-memory copy (#753 review blocker 2). Stop it first — cancel
+    // the in-flight turn and wait (bounded) for the loop to release its slot — so
+    // its final checkpoint can't clobber the fresh goal we're about to write.
+    stop_goal_loop(state.inner(), &session_id).await;
+
+    let mut goal = Goal::new(&session_id, objective, now_ms());
+    if let Some(m) = max_iterations {
+        goal.budget.max_iterations = m;
+    }
+    goal.budget.max_tokens = max_tokens;
+    goal.budget.max_wall_ms = max_wall_ms;
+    state
+        .goals
+        .save(&goal)
+        .map_err(|e| format!("failed to persist goal: {e}"))?;
+    let _ = app.emit("goal:updated", &goal);
+    spawn_goal_loop(state.inner().clone(), app, session_id);
+    Ok(goal)
+}
+
+/// Snapshot the current goal for a session, or `None` if there is no goal
+/// checkpoint (RFC 0020 §7 — panel poll / event join). A corrupt checkpoint file
+/// surfaces as an error rather than a silent `None`.
+#[tauri::command]
+fn goal_status(
+    state: State<'_, Arc<AppState>>,
+    session_id: String,
+) -> Result<Option<Goal>, String> {
+    state
+        .goals
+        .load(&session_id)
+        .map_err(|e| format!("failed to read goal: {e}"))
+}
+
+/// Pause a running goal at the next boundary (RFC 0020 §5.3). Idempotent: pausing
+/// an already-paused/terminal goal just returns its current state. The loop
+/// observes the persisted `Paused` status at its next boundary check and stops
+/// resumably; this command also flips it eagerly so the FE reflects intent now.
+#[tauri::command]
+async fn goal_pause(
+    state: State<'_, Arc<AppState>>,
+    app: tauri::AppHandle,
+    session_id: String,
+) -> Result<Option<Goal>, String> {
+    // Stop the loop first (cancel the in-flight turn + wait for it to exit).
+    // The loop owns the goal in memory and never re-reads it, so writing Paused
+    // here while it runs would be clobbered by its next checkpoint save. A
+    // cancelled turn already transitions the goal to Paused (resumable) via
+    // drive_goal; we then ensure Paused for the no-loop-running case.
+    stop_goal_loop(state.inner(), &session_id).await;
+    let Some(mut goal) = state
+        .goals
+        .load(&session_id)
+        .map_err(|e| format!("failed to read goal: {e}"))?
+    else {
+        return Ok(None);
+    };
+    if goal.status == GoalStatus::Active {
+        goal.status = GoalStatus::Paused;
+        goal.updated_ms = now_ms();
+        state
+            .goals
+            .save(&goal)
+            .map_err(|e| format!("failed to persist goal: {e}"))?;
+        let _ = app.emit("goal:updated", &goal);
+    }
+    Ok(Some(goal))
+}
+
+/// Resume a paused goal and restart the loop from the last persisted checkpoint
+/// (RFC 0020 §5.3 — resume replays from the last completed iteration, never a
+/// partial turn). Only a `Paused` goal resumes; a terminal goal is returned
+/// unchanged.
+#[tauri::command]
+fn goal_resume(
+    state: State<'_, Arc<AppState>>,
+    app: tauri::AppHandle,
+    session_id: String,
+) -> Result<Option<Goal>, String> {
+    let Some(mut goal) = state
+        .goals
+        .load(&session_id)
+        .map_err(|e| format!("failed to read goal: {e}"))?
+    else {
+        return Ok(None);
+    };
+    if goal.status == GoalStatus::Paused {
+        goal.status = GoalStatus::Active;
+        goal.updated_ms = now_ms();
+        state
+            .goals
+            .save(&goal)
+            .map_err(|e| format!("failed to persist goal: {e}"))?;
+        let _ = app.emit("goal:updated", &goal);
+        spawn_goal_loop(state.inner().clone(), app, session_id);
+    }
+    Ok(Some(goal))
+}
+
+/// Delete the goal for a session entirely (RFC 0020 §7 — dismiss/clear). Stops
+/// any running loop first (so its next checkpoint can't recreate the file we're
+/// deleting), then removes the checkpoint file. Idempotent — clearing a
+/// nonexistent goal is fine.
+#[tauri::command]
+async fn goal_clear(
+    state: State<'_, Arc<AppState>>,
+    app: tauri::AppHandle,
+    session_id: String,
+) -> Result<(), String> {
+    stop_goal_loop(state.inner(), &session_id).await;
+    state
+        .goals
+        .delete(&session_id)
+        .map_err(|e| format!("failed to clear goal: {e}"))?;
+    let _ = app.emit("goal:cleared", &session_id);
+    Ok(())
+}
+
+/// Mark a session's goal complete from the FE (RFC 0020 §7 — dual-surface: this
+/// is the IPC half of the `goal_complete` capability the agent tool also
+/// exposes). Stops any running loop first, then transitions the goal to
+/// `Completed` and persists. Returns `None` if there is no goal. Idempotent on a
+/// terminal goal (returns it unchanged).
+#[tauri::command]
+async fn goal_complete(
+    state: State<'_, Arc<AppState>>,
+    app: tauri::AppHandle,
+    session_id: String,
+) -> Result<Option<Goal>, String> {
+    stop_goal_loop(state.inner(), &session_id).await;
+    let Some(mut goal) = state
+        .goals
+        .load(&session_id)
+        .map_err(|e| format!("failed to read goal: {e}"))?
+    else {
+        return Ok(None);
+    };
+    if !matches!(goal.status, GoalStatus::Completed) {
+        goal.status = GoalStatus::Completed;
+        goal.updated_ms = now_ms();
+        state
+            .goals
+            .save(&goal)
+            .map_err(|e| format!("failed to persist goal: {e}"))?;
+        let _ = app.emit("goal:updated", &goal);
+    }
+    Ok(Some(goal))
 }
 
 /// Fire a scheduled task immediately, off-schedule (RFC 0017 §8.3). Runs the
@@ -981,12 +1167,17 @@ fn spawn_assistant_turn(state: Arc<AppState>, app: tauri::AppHandle, session_id:
         state.align_git_watcher(&session_root);
         // Snapshot built-in + MCP-bridged tools for this turn (RFC 0003 §6).
         let registry = state.build_tool_registry(&session_root);
+        // Snapshot the advertised-tools matrix for this turn (#702) so the model
+        // sees a stable tool list. The approval gate reads the matrix live (see
+        // `UiApprover::approve`), so Control-panel edits still take effect on the
+        // next tool call — only the advertised set is turn-bounded.
+        let permission_matrix = state.permission_matrix();
         let mut tool_ctx = ToolContext::new(
             &registry,
             &session_root,
             &approver,
             max_iterations,
-            &state.permission_matrix,
+            &permission_matrix,
         );
         tool_ctx.mode = mode;
         tool_ctx.abstractive = crate::state::abstractive_config_from_env();
@@ -1012,6 +1203,7 @@ fn spawn_assistant_turn(state: Arc<AppState>, app: tauri::AppHandle, session_id:
             &active,
             &user_ctx,
             memory.as_deref(),
+            None,
             mode,
         );
 
@@ -1231,7 +1423,284 @@ fn spawn_assistant_turn(state: Arc<AppState>, app: tauri::AppHandle, session_id:
     });
 }
 
-/// Per-fire wall-clock budget for a scheduled run (RFC 0017 §8.2). A fire is a
+/// Wall-clock ceiling on a single goal iteration's turn, mirroring
+/// `SCHEDULED_FIRE_TIMEOUT`: a stuck provider must not wedge the loop. On
+/// timeout the turn is cancelled and the iteration is recorded as failed.
+const GOAL_ITERATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// The host-side [`GoalIteration`] (RFC 0020 §5.2, #716): drives one headless
+/// agent turn toward the objective, mirroring the scheduled runner's `fire` but
+/// against the live session with the interactive [`UiApprover`] — so a mid-loop
+/// approval / `ask_user` still surfaces in the UI (the RFC 0017 join point).
+/// Per-tool safety gating already happens inside `run_turn` via the shared
+/// `permission_matrix`; the loop-level [`GoalIteration::gate`] only governs
+/// whether to continue (the #719 Ask→pause seam), so today it always proceeds.
+struct GoalLoopIteration {
+    state: Arc<AppState>,
+    app: tauri::AppHandle,
+    session_id: String,
+}
+
+#[async_trait::async_trait]
+impl GoalIteration for GoalLoopIteration {
+    fn gate(&self, _goal: &Goal) -> GateDecision {
+        // Loop-continuation gate. Per-tool matrix gating is enforced inside the
+        // turn; this seam is where #719/#682 will pause on an Ask verdict. The
+        // skeleton always proceeds — a paused goal is handled by the status
+        // check in `drive_goal`, not here.
+        GateDecision::Proceed
+    }
+
+    async fn run_once(&self, goal: &Goal) -> IterationOutcome {
+        // Seed the continuation turn: a pending steer (a message the user typed
+        // while the goal ran) takes priority; otherwise a neutral "continue"
+        // nudge carrying the objective. The system-prompt goal block (#718) will
+        // later carry the objective; until then we inline it in the user turn.
+        // The steer is one-shot: the loop clears `pending_steer` on the in-memory
+        // goal (via `steer_consumed`) before it checkpoints, so it is applied once
+        // and not re-persisted next boundary (#753 review nit 1).
+        let steer = goal
+            .pending_steer
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let steer_consumed = steer.is_some();
+        let prompt = match steer {
+            Some(s) => s.to_string(),
+            None => format!(
+                "Continue working toward the goal: {}. If it is fully met and \
+                 verified, call the `goal_complete` tool; otherwise take the \
+                 next concrete step.",
+                goal.objective
+            ),
+        };
+        self.state
+            .store
+            .add_message(&self.session_id, Role::User, prompt.clone());
+
+        let sid = self.session_id.clone();
+        let selection = self.state.resolve_model_selection(&sid);
+        let (mut provider, model) = self
+            .state
+            .build_provider_for(Some(&selection.connection), Some(&selection.model));
+        let pheno = self.state.session_phenotype(&sid);
+        let persona = pheno.persona.clone();
+        let mode = self.state.session_mode(&sid);
+        let max_iterations = pheno
+            .max_iterations
+            .unwrap_or(ff_agent::DEFAULT_MAX_ITERATIONS);
+
+        let session_root = self.state.session_root(&sid);
+        self.state.align_session_mcp(&sid, &session_root).await;
+        self.state.align_git_watcher(&session_root);
+        let registry = self.state.build_tool_registry(&session_root);
+
+        let approver = UiApprover {
+            app: self.app.clone(),
+            state: self.state.clone(),
+            session_id: sid.clone(),
+            mode,
+        };
+        // Snapshot the matrix for this turn (#702); see the other turn paths.
+        let permission_matrix = self.state.permission_matrix();
+        let mut tool_ctx = ff_agent::ToolContext::new(
+            &registry,
+            &session_root,
+            &approver,
+            max_iterations,
+            &permission_matrix,
+        );
+        tool_ctx.mode = mode;
+        tool_ctx.abstractive = crate::state::abstractive_config_from_env();
+
+        let skills = self.state.skills_snapshot();
+        let user_ctx =
+            ff_agent::UserContext::now().with_working_dir(session_root.display().to_string());
+        let active: Vec<String> = self.state.turn_active_skills(&sid);
+        let (memory, _ambient_keys) = self
+            .state
+            .memory()
+            .ambient_block_filtered_keyed(self.state.index().as_ref());
+        let system_prompt = ff_agent::build_system_prompt(
+            persona.as_deref(),
+            &skills,
+            &active,
+            &user_ctx,
+            memory.as_deref(),
+            Some(goal),
+            mode,
+        );
+
+        provider.set_context_budget(self.state.served_window(&sid).await.window);
+
+        let cancel = CancelToken::new();
+        self.state.register_cancel(&sid, cancel.clone());
+        let cancel_probe = cancel.clone();
+        let thinking = self.state.provider_config().thinking;
+        let reasoning_visibility = self.state.provider_config().reasoning_visibility;
+
+        // Capture per-turn tokens (from `AgentEvent::Done`) and whether the agent
+        // called `goal_complete` (from `AgentEvent::ToolCallFinished`) directly in
+        // the event closure, so the loop gets both without re-reading the store.
+        let tokens = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // `ToolCallFinished` carries only the call_id, so remember the call_id of
+        // a started `goal_complete` and confirm it on a successful finish.
+        let gc_call_id = Arc::new(std::sync::Mutex::new(Option::<String>::None));
+        let tokens_ev = tokens.clone();
+        let completed_ev = completed.clone();
+        let gc_call_ev = gc_call_id.clone();
+        let app_ev = self.app.clone();
+        let sid_ev = sid.clone();
+        let turn_start = std::time::Instant::now();
+
+        let turn = run_turn(
+            provider.as_ref(),
+            self.state.store.as_ref(),
+            &tool_ctx,
+            &sid,
+            &model,
+            Some(system_prompt.as_str()),
+            thinking,
+            reasoning_visibility,
+            cancel.clone(),
+            move |event| {
+                match &event {
+                    ff_agent::AgentEvent::Done {
+                        token_count: Some(t),
+                        ..
+                    } => {
+                        tokens_ev.store(*t as u64, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    ff_agent::AgentEvent::ToolCallStarted { call_id, name, .. }
+                        if name == ff_tools::GOAL_COMPLETE_TOOL_NAME =>
+                    {
+                        *gc_call_ev.lock().unwrap() = Some(call_id.clone());
+                    }
+                    ff_agent::AgentEvent::ToolCallFinished {
+                        call_id,
+                        success: true,
+                        ..
+                    } if gc_call_ev.lock().unwrap().as_deref() == Some(call_id.as_str()) => {
+                        completed_ev.store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    _ => {}
+                }
+                emit_agent_event(&app_ev, &sid_ev, event);
+            },
+        );
+        let result = tokio::time::timeout(GOAL_ITERATION_TIMEOUT, turn).await;
+        self.state.take_cancel_if(&sid, &cancel);
+
+        // Distinguish a user Stop (cancel) — the goal should PAUSE resumably — from
+        // an unrecoverable failure (timeout / provider error) — which FAILS it.
+        // A timeout is not a user cancel: the user didn't stop it, so it fails.
+        let user_cancelled = cancel_probe.is_cancelled();
+        let (cancelled, failed) = match result {
+            _ if user_cancelled => (true, false),
+            Err(_elapsed) => {
+                cancel.cancel();
+                (false, true)
+            }
+            Ok(Err(_)) => (false, true),
+            Ok(Ok(_)) => (false, false),
+        };
+
+        IterationOutcome {
+            tokens: tokens.load(std::sync::atomic::Ordering::SeqCst),
+            wall_ms: turn_start.elapsed().as_millis() as i64,
+            goal_complete: completed.load(std::sync::atomic::Ordering::SeqCst),
+            cancelled,
+            failed,
+            steer_consumed,
+        }
+    }
+
+    fn save(&self, goal: &Goal) {
+        if let Err(e) = self.state.goals.save(goal) {
+            tracing::warn!(error = %e, session = %self.session_id, "failed to persist goal checkpoint");
+        }
+        let _ = self.app.emit("goal:updated", goal);
+    }
+
+    fn now_ms(&self) -> i64 {
+        now_ms()
+    }
+}
+
+/// Stop a running goal loop for a session and wait (bounded) for it to fully
+/// exit before returning (#753 review blocker 2). Cancels the in-flight turn so
+/// `drive_goal` breaks at its next boundary, then polls the single-flight slot
+/// until it clears (or a short timeout). Callers that overwrite goal state
+/// (`goal_set`) must await this first so the old loop's final checkpoint can't
+/// race the new goal. Safe to call when no loop is running (returns promptly).
+async fn stop_goal_loop(state: &Arc<AppState>, session_id: &str) {
+    if !state.goal_loop_running(session_id) {
+        return;
+    }
+    if let Some(token) = state.take_cancel(session_id) {
+        token.cancel();
+    }
+    state.cancel_pending_approvals(session_id);
+    // Bounded wait: the loop clears its slot on the next boundary after the
+    // cancelled turn returns. Cap so a wedged provider can't hang goal_set.
+    for _ in 0..600 {
+        if !state.goal_loop_running(session_id) {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    tracing::warn!(session = %session_id, "goal loop did not stop within timeout; proceeding");
+}
+
+/// Spawn the self-continue loop for a session's active goal (RFC 0020 §5). Loads
+/// the goal and drives [`drive_goal`] to a terminal state on a background task.
+/// Single-flight (#753 review): claims the session's goal-loop slot first and
+/// refuses to spawn if a loop is already running, so `goal_set` / `goal_resume`
+/// can never stack two loops racing the same transcript. The slot is released on
+/// any terminal stop (including an early return / panic) via a drop guard.
+fn spawn_goal_loop(state: Arc<AppState>, app: tauri::AppHandle, session_id: String) {
+    if !state.try_start_goal_loop(&session_id) {
+        tracing::debug!(session = %session_id, "goal loop already running; not spawning another");
+        return;
+    }
+    tauri::async_runtime::spawn(async move {
+        // Release the single-flight slot no matter how the task exits.
+        struct LoopGuard {
+            state: Arc<AppState>,
+            session_id: String,
+        }
+        impl Drop for LoopGuard {
+            fn drop(&mut self) {
+                self.state.end_goal_loop(&self.session_id);
+            }
+        }
+        let _guard = LoopGuard {
+            state: state.clone(),
+            session_id: session_id.clone(),
+        };
+
+        let mut goal = match state.goals.load(&session_id) {
+            Ok(Some(g)) => g,
+            Ok(None) => return,
+            Err(e) => {
+                tracing::warn!(error = %e, session = %session_id, "goal loop: cannot load goal");
+                return;
+            }
+        };
+        if goal.status != GoalStatus::Active {
+            return;
+        }
+        let iter = GoalLoopIteration {
+            state: state.clone(),
+            app: app.clone(),
+            session_id: session_id.clone(),
+        };
+        let stop = drive_goal(&mut goal, &iter).await;
+        tracing::info!(session = %session_id, ?stop, "goal loop finished");
+    });
+}
+
 /// bounded single `run_turn`; if it overruns it is cancelled and recorded
 /// `cancelled`, so one hung fire cannot starve later due tasks.
 const SCHEDULED_FIRE_TIMEOUT: Duration = Duration::from_secs(600);
@@ -1294,7 +1763,7 @@ impl DesktopTaskRunner {
 #[async_trait]
 impl ff_scheduled::TaskRunner for DesktopTaskRunner {
     async fn fire(&self, task: &ScheduledTask) -> ff_scheduled::RunOutcome {
-        // A built-in runs its named action directly (no agent loop / session);
+        // A built-in runs it's named action directly (no agent loop / session);
         // a prompt task drives a headless `run_turn` below (#544).
         let prompt = match &task.kind {
             TaskKind::Prompt(text) => text.clone(),
@@ -1356,12 +1825,14 @@ impl ff_scheduled::TaskRunner for DesktopTaskRunner {
         self.state.align_git_watcher(&session_root);
         let registry = self.state.build_tool_registry(&session_root);
         let approver = ScheduledApprover::new(task.safety_ceiling);
+        // Snapshot the matrix for this turn (#702); see the interactive path above.
+        let permission_matrix = self.state.permission_matrix();
         let mut tool_ctx = ToolContext::new(
             &registry,
             &session_root,
             &approver,
             max_iterations,
-            &self.state.permission_matrix,
+            &permission_matrix,
         );
         tool_ctx.mode = mode;
         tool_ctx.abstractive = crate::state::abstractive_config_from_env();
@@ -1383,6 +1854,7 @@ impl ff_scheduled::TaskRunner for DesktopTaskRunner {
             &active,
             &user_ctx,
             memory.as_deref(),
+            None,
             mode,
         );
 
@@ -2109,6 +2581,26 @@ fn set_default_mode(state: State<'_, Arc<AppState>>, mode: Mode) {
     state.set_default_mode(mode);
 }
 
+/// The Control-panel view of the permission matrix (#702, RFC 0019 §3): every
+/// Mode × Safety cell as a flat, self-describing list.
+#[tauri::command]
+fn get_permission_matrix(state: State<'_, Arc<AppState>>) -> PermissionMatrixView {
+    state.permission_matrix_view()
+}
+
+/// Edit and persist a single matrix cell (#702), returning the updated view. Takes
+/// effect on the next tool invocation: the approval gate reads the matrix live, and
+/// the advertised-tools gate picks it up on the next turn.
+#[tauri::command]
+fn set_permission_cell(
+    state: State<'_, Arc<AppState>>,
+    mode: Mode,
+    safety: Safety,
+    cell: PermissionCell,
+) -> PermissionMatrixView {
+    state.set_permission_cell(mode, safety, cell)
+}
+
 // ---- MCP server control (M4.4, RFC 0003 §3,5) ----
 //
 // Enable/disable/add/remove write `mcp.json` via `ff_mcp::config`; the existing config
@@ -2319,7 +2811,14 @@ fn start_dev_update_watcher(app: tauri::AppHandle) {
 /// Keeping both paths on one helper is exactly what the sidecar parity
 /// smoke-test (RFC 0004 §5) guards against drift: if the mapping changes, it
 /// changes in one place.
-fn emit_agent_event(app: &tauri::AppHandle, session_id: &str, event: AgentEvent) {
+///
+/// Generic over `R: tauri::Runtime` so the sidecar parity integration test can
+/// drive it through a `MockRuntime` app handle (see `tests::sidecar_turn_*`).
+fn emit_agent_event<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    session_id: &str,
+    event: AgentEvent,
+) {
     match event {
         AgentEvent::Token { message_id, delta } => {
             let _ = app.emit(
@@ -2451,8 +2950,8 @@ fn emit_agent_event(app: &tauri::AppHandle, session_id: &str, event: AgentEvent)
 /// `flowforge` on the command line must install it separately or symlink
 /// it manually — see the caveat doc in `docs/rfcs/0004-cli.md`.
 #[tauri::command]
-async fn run_sidecar_turn(
-    app: tauri::AppHandle,
+async fn run_sidecar_turn<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     prompt: String,
 ) -> Result<serde_json::Value, String> {
     let session_id = Uuid::new_v4().to_string();
@@ -2796,6 +3295,12 @@ pub fn run() {
             run_scheduled_task_now,
             list_scheduled_runs,
             set_scheduled_paused_all,
+            goal_set,
+            goal_status,
+            goal_pause,
+            goal_resume,
+            goal_clear,
+            goal_complete,
             preview_cadence,
             get_session_workspace,
             set_session_workspace,
@@ -2853,6 +3358,8 @@ pub fn run() {
             resolve_model_selection,
             get_default_mode,
             set_default_mode,
+            get_permission_matrix,
+            set_permission_cell,
             list_mcp_servers,
             restart_mcp_server,
             set_mcp_server_enabled,
@@ -2884,10 +3391,13 @@ pub fn run() {
 mod tests {
     use super::state::AppState;
     use super::{
-        git_branch, is_app_ready, list_local_branches, panic_message, publish_app_ready,
-        resolve_tool_arg, resolve_workspace_dir, should_warmup, switch_branch, BootFinalize,
-        TurnMetrics, UpdateStatus, APP_READY,
+        emit_agent_event, git_branch, is_app_ready, list_local_branches, matrix_gate,
+        panic_message, publish_app_ready, resolve_tool_arg, resolve_workspace_dir,
+        run_sidecar_turn, should_warmup, switch_branch, BootFinalize, TurnMetrics, UpdateStatus,
+        APP_READY,
     };
+    use ff_agent::AgentEvent;
+    use ff_core::events::TurnDoneEvent;
     use ff_core::{Mode, ProviderKind};
     use ff_tools::Safety;
     use std::sync::atomic::Ordering;
@@ -2913,7 +3423,10 @@ mod tests {
             resolve_tool_arg("python", &json!({"code": "print(1)"})),
             Some("print(1)".into())
         );
-        assert_eq!(resolve_tool_arg("python", &json!({"command": "print(1)"})), None);
+        assert_eq!(
+            resolve_tool_arg("python", &json!({"command": "print(1)"})),
+            None
+        );
         for tool in ["view", "edit", "write"] {
             assert_eq!(
                 resolve_tool_arg(tool, &json!({"path": "src/main.rs"})),
@@ -2922,7 +3435,10 @@ mod tests {
         }
         // Read-only search tools short-circuit before approve() — not listed.
         assert_eq!(resolve_tool_arg("grep", &json!({"pattern": "x"})), None);
-        assert_eq!(resolve_tool_arg("glob", &json!({"pattern": "**/*.rs"})), None);
+        assert_eq!(
+            resolve_tool_arg("glob", &json!({"pattern": "**/*.rs"})),
+            None
+        );
         // Formerly-listed phantom keys resolve to nothing now.
         assert_eq!(resolve_tool_arg("rg", &json!({"path": "."})), None);
         assert_eq!(resolve_tool_arg("fd", &json!({"path": "."})), None);
@@ -3053,7 +3569,7 @@ mod tests {
     }
 
     // `UpdateStatus` has no ts-rs binding -- it is cast on the FE side from the JSON
-    // this serializes to (`lib/about.ts`). Pin the wire shape so the hand-written FE
+    // this serializes to (`lib/about.ts`). Pin the wire shape so the handwritten FE
     // type and this enum cannot drift apart silently (#159).
     #[test]
     fn update_status_matches_fe_contract() {
@@ -3099,6 +3615,55 @@ mod tests {
         // Plan: only ReadOnly allowed.
         assert_eq!(m.cell(Mode::Plan, Safety::ReadOnly), PermissionCell::Allow);
         assert_eq!(m.cell(Mode::Plan, Safety::Write), PermissionCell::Deny);
+    }
+
+    // Acceptance (#702): editing a matrix cell changes the invocation-time gate
+    // decision that `UiApprover::approve` applies to the next tool call. Exercises
+    // the same pure `matrix_gate` the approver calls, so no AppHandle / live model
+    // turn is required.
+    #[test]
+    fn edited_cell_flips_the_invocation_gate() {
+        use ff_core::{PermissionCell, PermissionMatrix};
+        let mut m = PermissionMatrix::default();
+        // Mirror `UiApprover::approve`: resolve the effective cell (per-tool
+        // override else the mode×safety cell, #742) then gate on it.
+        let gate = |m: &PermissionMatrix, tool: &str, mode: Mode, safety: Safety| {
+            matrix_gate(m.effective_cell(tool, mode, safety))
+        };
+
+        // Default: a Dangerous call in Act prompts the user (Ask → None).
+        assert_eq!(gate(&m, "bash", Mode::Act, Safety::Dangerous), None);
+        // A Sensitive call in Auto also prompts by default.
+        assert_eq!(gate(&m, "web_fetch", Mode::Auto, Safety::Sensitive), None);
+
+        // Deny the dangerous cell → the next invocation is rejected outright.
+        m.set_cell(Mode::Act, Safety::Dangerous, PermissionCell::Deny);
+        assert_eq!(gate(&m, "bash", Mode::Act, Safety::Dangerous), Some(false));
+
+        // Allow the sensitive cell → the next invocation auto-approves (no prompt).
+        m.set_cell(Mode::Auto, Safety::Sensitive, PermissionCell::Allow);
+        assert_eq!(
+            gate(&m, "web_fetch", Mode::Auto, Safety::Sensitive),
+            Some(true)
+        );
+
+        // A per-tool override (#742) wins over the matrix cell for that tool only.
+        m.set_override("web_fetch", PermissionCell::Deny);
+        assert_eq!(
+            gate(&m, "web_fetch", Mode::Auto, Safety::Sensitive),
+            Some(false)
+        );
+        assert_eq!(
+            gate(&m, "web_search", Mode::Auto, Safety::Sensitive),
+            Some(true)
+        );
+
+        // Untouched cells keep their default decision.
+        assert_eq!(gate(&m, "read_file", Mode::Act, Safety::Write), Some(true));
+        assert_eq!(
+            gate(&m, "write_file", Mode::Plan, Safety::Write),
+            Some(false)
+        );
     }
 
     #[test]
@@ -3283,5 +3848,268 @@ mod tests {
         assert_eq!(m.prefill_estimates, vec![120, 340, 75]);
         assert_eq!(m.tier1_fires, 2);
         assert_eq!(m.tier2_fires, 1);
+    }
+
+    // ---- CLI.7 sidecar parity integration test (RFC 0004 §5) ----
+    //
+    // `run_sidecar_turn` is the Tauri command that spawns the bundled `flowforge`
+    // CLI as a sidecar, reads its `--json` stdout line-by-line, and re-emits every
+    // parsed `AgentEvent` through `emit_agent_event` — the same helper the
+    // in-process `run_turn` path uses. This test exercises the full
+    // spawn → stdout-parse → emit pipeline end-to-end:
+    //
+    //   1. Requires the sidecar binary at `target/<profile>/flowforge` (staged by
+    //      `scripts/stage-sidecar.sh` or a bare `cargo build -p ff-cli`). The
+    //      `tauri_plugin_shell` sidecar resolver looks for the binary relative to
+    //      `current_exe()`; under `cargo test` that resolves to the workspace
+    //      `target/<profile>/` directory.
+    //   2. Stands up a wiremock OpenAI-compatible endpoint so the CLI can actually
+    //      complete a turn (the `run` subcommand would otherwise fail to reach a
+    //      provider and exit non-zero before emitting `turn:done`).
+    //   3. Overrides `HOME` so the CLI reads a temp `provider.json` pointing at
+    //      the mock. A process-wide mutex serializes the override against parallel
+    //      tests that might also touch `HOME`.
+    //   4. Drives `run_sidecar_turn` through a `MockRuntime` Tauri app (the
+    //      command is generic over `R: tauri::Runtime` for exactly this reason)
+    //      and asserts the `turn:done` event fires.
+
+    /// `HOME` is a process-global env var; serialize tests that override it so
+    /// they don't race each other or other tests that read `HOME`.
+    ///
+    /// NOTE: `std::env::set_var` is deprecated as of Rust 1.80 on soundness
+    /// grounds — it's UB in multithreaded programs because another thread
+    /// can read `HOME` concurrently with the mutation. This mutex only
+    /// serializes *these tests*; it does not stop unrelated threads from
+    /// reading `HOME` mid-override. Acceptable today because each
+    /// `#[tokio::test]` here runs on a single task with no other threads
+    /// touching `HOME`, but a future edition is expected to make this a hard
+    /// error — at which point the override should move to per-spawn env
+    /// injection (e.g. `Command::env` on the sidecar subprocess) rather than
+    /// mutating the process-global `HOME`.
+    static SIDECAR_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Resolve the sidecar binary path that `tauri_plugin_shell`'s
+    /// `relative_command_path` will look for under `cargo test` — the workspace
+    /// `target/<profile>/flowforge` (no target-triple suffix at runtime; the
+    /// suffix is only used by the `tauri build` bundler).
+    fn sidecar_binary_path() -> std::path::PathBuf {
+        let mut path = std::env::current_exe().expect("current_exe");
+        // The test binary lives in `target/<profile>/deps/<name>-<hash>`. Pop
+        // `deps/<name>-<hash>` to land on `target/<profile>/`.
+        path.pop(); // <name>-<hash>
+        path.pop(); // deps
+        path.push("flowforge");
+        path
+    }
+
+    /// Write a `provider.json` that points the CLI's `CandleVllm` provider at the
+    /// mock server, under the temp `HOME`'s platform-specific config dir. Returns
+    /// the temp dir (kept alive for the test duration).
+    fn stage_provider_config(base_url: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let temp_home = tempfile::tempdir().expect("temp HOME");
+
+        // `dirs::config_dir()` respects `HOME` on Unix and macOS — so set it
+        // before computing the path.
+        let old_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", temp_home.path());
+
+        let config_dir = dirs::config_dir()
+            .expect("config dir resolves under temp HOME")
+            .join("flowforge");
+        std::fs::create_dir_all(&config_dir).expect("create flowforge config dir");
+
+        let provider_json = serde_json::json!({
+            "kind": "candleVllm",
+            "baseUrl": base_url,
+            "model": "test-sidecar-model",
+            "hasKey": false,
+            "thinking": false,
+        });
+        let provider_path = config_dir.join("provider.json");
+        std::fs::write(&provider_path, provider_json.to_string()).expect("write provider.json");
+
+        // Restore HOME — the override is re-applied for the actual sidecar spawn
+        // in the test body. We only needed it here to compute the platform path.
+        match old_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+
+        (temp_home, provider_path)
+    }
+
+    #[tokio::test]
+    #[ignore = "requires staged sidecar — run ./scripts/stage-sidecar.sh, then `cargo test ... -- --ignored`"]
+    #[allow(clippy::await_holding_lock)]
+    async fn sidecar_turn_emits_turn_done_event() {
+        // The `std::sync::Mutex` guard is held across `.await` points because
+        // the `HOME` override must stay in place for the entire sidecar spawn
+        // + turn duration. This is safe: the lock is only acquired by this one
+        // test, runs on a single tokio task, and guards a process-global env
+        // var — no other async task contends on it.
+        //
+        // `#[ignore]` makes this opt-in: `cargo test --workspace` reports it as
+        // ignored (not passed), so CI can't silently drop it behind a soft-skip
+        // `return` and advertise false confidence. Run it explicitly with
+        // `--ignored` after staging the sidecar.
+        let sidecar = sidecar_binary_path();
+        assert!(
+            sidecar.exists(),
+            "sidecar binary not found at {} — run `./scripts/stage-sidecar.sh` \
+             (or `cargo build -p ff-cli`) first",
+            sidecar.display(),
+        );
+
+        let _guard = SIDECAR_TEST_LOCK.lock().unwrap();
+
+        // Mock OpenAI-compatible endpoint: one content delta, then [DONE].
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("POST"))
+            .and(wiremock::matchers::path("/chat/completions"))
+            .respond_with(wiremock::ResponseTemplate::new(200).set_body_string(
+                "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"finish_reason\":null}]}\n\n\
+                     data: [DONE]\n\n",
+            ))
+            .mount(&server)
+            .await;
+
+        // Stage provider.json under a temp HOME.
+        let (temp_home, _provider_path) = stage_provider_config(&server.uri());
+
+        // Override HOME for the sidecar subprocess (it inherits the parent's env).
+        let old_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", temp_home.path());
+
+        // Mock Tauri app with the shell plugin — `run_sidecar_turn` is generic
+        // over `R: tauri::Runtime` so it accepts the `MockRuntime` app handle.
+        let app = tauri::test::mock_builder()
+            .plugin(tauri_plugin_shell::init())
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .expect("mock app builds");
+
+        // Listen for the `turn:done` event that `emit_agent_event` emits.
+        use tauri::Listener;
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let done_clone = done.clone();
+        app.listen("turn:done", move |_| {
+            done_clone.store(true, Ordering::SeqCst);
+        });
+
+        // Also track the total event count for a richer assertion.
+        let token = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let token_clone = token.clone();
+        app.listen("turn:token", move |_| {
+            token_clone.fetch_add(1, Ordering::SeqCst);
+        });
+
+        let handle = app.handle().clone();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            run_sidecar_turn(handle, "hello".into()),
+        )
+        .await;
+
+        // Restore HOME before asserting so a panic doesn't leak the temp HOME.
+        match old_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+        drop(_guard);
+
+        let result = result.expect("run_sidecar_turn timed out after 30s");
+        assert!(
+            result.is_ok(),
+            "run_sidecar_turn failed: {:?}",
+            result.err()
+        );
+        assert!(
+            done.load(Ordering::SeqCst),
+            "turn:done event was not received — the sidecar spawned but the \
+             AgentEvent → Tauri event pipeline did not deliver the terminal event"
+        );
+        assert!(
+            token.load(Ordering::SeqCst) >= 1,
+            "expected at least one turn:token event from the sidecar"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires the sidecar NOT be staged — inverse of the happy-path test; run with `--ignored` only when target/flowforge is absent"]
+    async fn sidecar_turn_returns_error_without_sidecar_binary() {
+        // When the sidecar binary is absent, `run_sidecar_turn` must surface a
+        // clear error rather than panicking or hanging. This guards the resolver
+        // path (`app.shell().sidecar`) against silent failures.
+        //
+        // `#[ignore]` + a hard assert (not a soft-skip `return`) so CI can't
+        // silently drop it: it fails loudly if the binary is present. Mutually
+        // exclusive with `sidecar_turn_emits_turn_done_event` — don't run both
+        // via `--ignored` together (one needs the binary staged, the other absent).
+        let sidecar = sidecar_binary_path();
+        assert!(
+            !sidecar.exists(),
+            "sidecar binary found at {} — this test requires the sidecar NOT be \
+             staged (it is the inverse of `sidecar_turn_emits_turn_done_event`)",
+            sidecar.display(),
+        );
+
+        let app = tauri::test::mock_builder()
+            .plugin(tauri_plugin_shell::init())
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .expect("mock app builds");
+
+        let handle = app.handle().clone();
+        let result = run_sidecar_turn(handle, "hello".into()).await;
+        assert!(
+            result.is_err(),
+            "run_sidecar_turn should fail when the sidecar binary is missing, got: {:?}",
+            result
+        );
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("sidecar") || err.contains("failed to"),
+            "error should mention the sidecar resolution failure, got: {err}"
+        );
+    }
+
+    // `emit_agent_event` is generic over `R: tauri::Runtime`; the sidecar path
+    // and the in-process turn path both feed through it. A direct unit-level
+    // assertion that the `Done` variant maps to `turn:done` (not, say, silently
+    // dropped) catches a mapping regression without the subprocess overhead.
+    #[tokio::test]
+    async fn emit_agent_event_maps_done_to_turn_done_event() {
+        let app = tauri::test::mock_builder()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .expect("mock app builds");
+
+        use tauri::Listener;
+        let received = Arc::new(Mutex::new(None));
+        let received_clone = received.clone();
+        app.listen("turn:done", move |event| {
+            let payload: TurnDoneEvent =
+                serde_json::from_str(event.payload()).expect("payload deserializes");
+            *received_clone.lock().unwrap() = Some(payload);
+        });
+
+        let done_event = AgentEvent::Done {
+            message_id: "msg-1".into(),
+            final_message: Some("hello".into()),
+            stop_reason: None,
+            turns: Some(1),
+            token_count: Some(42),
+            prefill_estimates: None,
+            tier1_fires: None,
+            tier2_fires: None,
+            cache_hit_tokens: Some(10),
+            cache_miss_tokens: Some(32),
+        };
+        emit_agent_event(app.handle(), "session-1", done_event);
+
+        // The mock runtime may deliver events asynchronously; yield once.
+        tokio::task::yield_now().await;
+
+        let received = received.lock().unwrap().clone();
+        let payload = received.expect("turn:done event was not delivered");
+        assert_eq!(payload.session_id, "session-1");
+        assert_eq!(payload.message_id, "msg-1");
     }
 }

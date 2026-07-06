@@ -4,7 +4,11 @@
 // `bindings` types. Set `VITE_FF_MOCK=1` to run the frontend against an in-browser
 // mock that fulfils this exact contract, so UI work never blocks on the Rust side.
 
-import type { UpdateStatus, BackupResult } from "@/lib/about";
+import type {
+  UpdateStatus,
+  BackupResult,
+  SidecarTurnResult,
+} from "@/lib/about";
 import type { ControlConfig } from "@/lib/control";
 import type { MarketplaceSkill } from "@/lib/marketplace";
 import type { MarketplaceProfile } from "@/lib/profile-marketplace";
@@ -51,6 +55,10 @@ import type {
   MemoryFileInfo,
   MemoryOverview,
   MemoryFlushedEvent,
+  Mode,
+  Safety,
+  PermissionCell,
+  PermissionMatrixView,
 } from "../bindings";
 import type { Format } from "../bindings/Format";
 import type { SecretKind } from "../bindings/SecretKind";
@@ -263,6 +271,19 @@ export interface FfIpc {
   /** Persist control settings; resolves with the stored config. */
   setControlConfig(config: ControlConfig): Promise<ControlConfig>;
 
+  // Permission matrix (#702, RFC 0019 §3). Unlike `ControlConfig` above, this is
+  // the REAL backend matrix that drives runtime approval: `get` returns every
+  // Mode × Safety cell; `set` edits one cell, persists it to `permissions.json`,
+  // and returns the updated view. Effective on the next tool invocation.
+  /** The current permission matrix as a flat Mode × Safety cell list. */
+  getPermissionMatrix(): Promise<PermissionMatrixView>;
+  /** Edit one matrix cell; resolves with the updated view. */
+  setPermissionCell(
+    mode: Mode,
+    safety: Safety,
+    cell: PermissionCell,
+  ): Promise<PermissionMatrixView>;
+
   // Skills (Issue #27). Discovery + the global active set; backs the command palette.
   /** All installed skills, name-sorted, each flagged active; `score` is always 0. */
   listSkills(): Promise<SkillInfo[]>;
@@ -412,6 +433,15 @@ export interface FfIpc {
   exportBackup(): Promise<BackupResult>;
   /** Restore from a backup. */
   restoreBackup(): Promise<BackupResult>;
+  /** CLI.7 sidecar parity smoke-test (RFC 0004 §5): spawn the bundled
+   *  `flowforge` CLI as a Tauri sidecar, run one agent turn with `--json`,
+   *  and re-emit every parsed `AgentEvent` through the same `emit_agent_event`
+   *  helper the in-process turn path uses. Resolves with the synthetic
+   *  session id and the total event count so a manual QA button can toast the
+   *  result. Dev-only — never shipped onto a user-visible surface: the only
+   *  caller is the About-section "Run sidecar smoke-test" button, which is
+   *  gated behind the `devTools` experimental flag (default off). */
+  runSidecarTurn(prompt: string): Promise<SidecarTurnResult>;
 
   // Events (backend -> frontend)
   onToken(cb: (e: TokenEvent) => void): Promise<Unlisten>;
@@ -653,6 +683,14 @@ class TauriIpc implements FfIpc {
   getControlConfig = () => this.invoke<ControlConfig>("get_control_config");
   setControlConfig = (config: ControlConfig) =>
     this.invoke<ControlConfig>("set_control_config", { config });
+  getPermissionMatrix = () =>
+    this.invoke<PermissionMatrixView>("get_permission_matrix");
+  setPermissionCell = (mode: Mode, safety: Safety, cell: PermissionCell) =>
+    this.invoke<PermissionMatrixView>("set_permission_cell", {
+      mode,
+      safety,
+      cell,
+    });
   warmup = () => this.invoke<void>("warmup");
 
   searchInSession = (sessionId: string, query: string) =>
@@ -733,6 +771,8 @@ class TauriIpc implements FfIpc {
     this.listen<void>("update:local-feed-changed", cb);
   exportBackup = () => this.invoke<BackupResult>("export_backup");
   restoreBackup = () => this.invoke<BackupResult>("restore_backup");
+  runSidecarTurn = (prompt: string) =>
+    this.invoke<SidecarTurnResult>("run_sidecar_turn", { prompt });
 
   onToken = (cb: (e: TokenEvent) => void) =>
     this.listen<TokenEvent>("turn:token", cb);

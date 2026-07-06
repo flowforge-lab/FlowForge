@@ -11,6 +11,7 @@ import {
 } from "@/lib/about";
 import { ipc } from "@/lib/ipc";
 import { Progress } from "@/components/ui/progress";
+import { useExperimentalStore } from "@/store/experimental";
 import { useSettingsStore } from "@/store/settings";
 import { progressPercent, useUpdateStore } from "@/store/update";
 
@@ -23,6 +24,9 @@ const TOAST_MS = 3200;
  */
 export function AboutSection() {
   const setSection = useSettingsStore((s) => s.setSection);
+  // The "Developer" group (sidecar smoke-test) is a dev-only surface — gated
+  // behind the `devTools` experimental flag so it never reaches end users.
+  const devTools = useExperimentalStore((s) => s.flags.devTools);
   const [version, setVersion] = useState<string | null>(null);
   const [toast, setToast] = useState<string | null>(null);
 
@@ -152,6 +156,21 @@ export function AboutSection() {
           }
         />
       </AboutGroup>
+
+      {devTools ? (
+        <AboutGroup title="Developer">
+          <AboutRow
+            label="Run sidecar smoke-test"
+            onClick={() =>
+              void runIpcAction(
+                () => ipc.runSidecarTurn("hello"),
+                (r) =>
+                  `Sidecar turn completed: ${r.events} event(s) on session ${r.session_id.slice(0, 8)}.`,
+              )
+            }
+          />
+        </AboutGroup>
+      ) : null}
 
       <button
         type="button"

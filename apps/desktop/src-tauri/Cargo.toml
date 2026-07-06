@@ -61,3 +61,7 @@ keyring = { version = "3", features = ["sync-secret-service", "crypto-rust"] }
 [dev-dependencies]
 tempfile = { workspace = true }
 wiremock = { workspace = true }
+# Enable `tauri`'s unstable `test` module (mock_builder / mock_context) for the
+# sidecar parity integration test. Only active under `cargo test` — never in
+# production builds. See RFC 0004 §5.
+tauri = { version = "2", features = ["test"] }
