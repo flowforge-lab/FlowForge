@@ -112,23 +112,54 @@ fn should_reason_wrapup_only_on_planning_and_wrapup_steps() {
 }
 
 #[test]
-fn plan_mode_advertises_only_readonly_tools() {
+fn plan_mode_advertises_read_capable_and_sensitive_tools() {
+    // #793: Plan advertises tools with a read-only *floor* (bash, github — their
+    // list/read calls are ReadOnly) plus tools whose ceiling the Plan matrix row
+    // does not Deny. The default Plan row has Sensitive = Ask, so the read-shaped
+    // network tools (web_fetch) and the read-inheriting sub-agent are surfaced
+    // behind an approval prompt; the per-call safety gate rejects any mutating
+    // invocation of the visible tools.
     let reg = ToolRegistry::with_defaults();
     let matrix = PermissionMatrix::default();
     let advertised = advertised_tools(Mode::Plan, &matrix, None, &reg).expect("Plan restricts");
-    for name in ["view", "grep", "glob", "tree", "todo", "ask_user"] {
+    for name in [
+        "view",
+        "grep",
+        "glob",
+        "tree",
+        "todo",
+        "ask_user",
+        "diagnostics",
+        "bash",      // read-only floor (`bash ls`)
+        "github",    // read-only floor (`pr_list`)
+        "web_fetch", // Sensitive ceiling, Plan x Sensitive = Ask
+        "agent",     // Sensitive; child inherits Plan (read-only)
+    ] {
         assert!(advertised.contains(name), "Plan should advertise {name}");
     }
-    for name in [
-        "bash",
-        "python",
-        "edit",
-        "write",
-        "apply_patch",
-        "web_fetch",
-        "agent",
-    ] {
+    // Pure Write/Dangerous tools with no read floor stay hidden.
+    for name in ["python", "edit", "write", "apply_patch"] {
         assert!(!advertised.contains(name), "Plan must hide {name}");
+    }
+}
+
+#[test]
+fn plan_mode_hides_sensitive_tools_when_the_matrix_denies_sensitive() {
+    // The matrix is the switch (#793): denying Plan x Sensitive drops the network
+    // tools + sub-agent back out of the Plan schema, while the read-floor tools
+    // (bash, github) remain (they are advertised via their ReadOnly floor).
+    use ff_core::{PermissionCell, Safety};
+    let reg = ToolRegistry::with_defaults();
+    let mut matrix = PermissionMatrix::default();
+    matrix.set_cell(Mode::Plan, Safety::Sensitive, PermissionCell::Deny);
+    let advertised = advertised_tools(Mode::Plan, &matrix, None, &reg).expect("Plan restricts");
+    assert!(advertised.contains("bash"));
+    assert!(advertised.contains("github"));
+    for name in ["web_fetch", "agent"] {
+        assert!(
+            !advertised.contains(name),
+            "denying Sensitive must hide {name}"
+        );
     }
 }
 
@@ -177,11 +208,43 @@ impl Approver for RecordingApprover {
     }
 }
 
+/// Names `python` on the first turn (a tool with no read-only floor, so it stays
+/// hidden in Plan even after #793), then finishes with text.
+struct HiddenToolThenText {
+    calls: AtomicUsize,
+}
+#[async_trait]
+impl Provider for HiddenToolThenText {
+    async fn chat_stream(&self, _req: ChatRequest) -> Result<ChunkStream, LlmError> {
+        let n = self.calls.fetch_add(1, Ordering::SeqCst);
+        let chunks = if n == 0 {
+            vec![Ok(Chunk {
+                tool_calls: vec![ToolCallDelta {
+                    index: 0,
+                    id: Some("call_1".into()),
+                    name: Some("python".into()),
+                    arguments: r#"{"code":"print(1)"}"#.into(),
+                }],
+                done: true,
+                ..Chunk::default()
+            })]
+        } else {
+            vec![Ok(Chunk {
+                delta: "done".into(),
+                done: true,
+                ..Chunk::default()
+            })]
+        };
+        Ok(futures_util::stream::iter(chunks).boxed())
+    }
+}
+
 #[tokio::test]
 async fn plan_mode_hard_blocks_dispatch_of_a_hidden_tool() {
-    // A Plan-mode model that names a hidden mutating tool (`bash`) -- e.g. via
+    // A Plan-mode model that names a hidden mutating tool (`python`) -- e.g. via
     // prompt injection -- must be hard-blocked at dispatch, *before* the approval
-    // gate, not merely hidden from the schema (#264 review blocker).
+    // gate, not merely hidden from the schema (#264 review blocker). `python` has no
+    // read-only floor, so it stays hidden in Plan (unlike bash/github after #793).
     let dir = tempfile::tempdir().unwrap();
     let store = SessionStore::new();
     let s = store.create_session(None);
@@ -192,7 +255,7 @@ async fn plan_mode_hard_blocks_dispatch_of_a_hidden_tool() {
     let approve = RecordingApprover {
         consulted: consulted.clone(),
     };
-    let provider = ToolThenText {
+    let provider = HiddenToolThenText {
         calls: AtomicUsize::new(0),
     };
 

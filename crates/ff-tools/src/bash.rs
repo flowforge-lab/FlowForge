@@ -375,6 +375,13 @@ impl Tool for BashTool {
         Safety::Dangerous
     }
 
+    // Read-only floor: `classify` returns `ReadOnly` for read commands (`ls`,
+    // `cat`, ...), so bash is advertised in Plan even though its ceiling is
+    // Dangerous; the per-call `safety` gate rejects anything above ReadOnly there.
+    fn min_safety(&self) -> Safety {
+        Safety::ReadOnly
+    }
+
     async fn run(&self, args: Value, root: &Path) -> ToolOutcome {
         let (mut child, timeout_budget) = match Self::prepare(&args, root) {
             Ok(v) => v,

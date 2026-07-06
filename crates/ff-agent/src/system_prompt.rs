@@ -337,11 +337,14 @@ fn goal_block(goal: &Goal) -> String {
 fn mode_steer(mode: Mode) -> Option<&'static str> {
     match mode {
         Mode::Plan => Some(
-            "## Mode: Plan\n\nYou are in Plan mode. Only read-only tools are \
-             available to you; you cannot edit files, run commands, or otherwise \
-             change the world. Investigate the request and produce a clear, concrete \
-             plan the user can review. End your turn with that plan. Do not attempt \
-             to make changes -- the user will switch you to Act or Auto to execute.",
+            "## Mode: Plan\n\nYou are in Plan mode. Read-only tools run freely -- \
+             including read-only commands (`bash` to list/inspect), read-only \
+             `github` actions (listing PRs/issues), and web research (`web_fetch`/\
+             `web_search`), which prompt for confirmation. You cannot edit files, run \
+             mutating commands, or otherwise change the world -- those are denied in \
+             Plan. Investigate the request and produce a clear, concrete plan the user \
+             can review. End your turn with that plan; the user will switch you to Act \
+             or Auto to execute it.",
         ),
         Mode::Auto => Some(
             "## Mode: Auto\n\nYou are in Auto mode. Read-only and local write tools \
@@ -434,7 +437,7 @@ mod tests {
         let reg = SkillRegistry::new();
         let out = build_system_prompt(None, &reg, &[], &ctx(), None, None, Mode::Plan);
         assert!(out.contains("## Mode: Plan"), "{out}");
-        assert!(out.contains("Only read-only tools"), "{out}");
+        assert!(out.contains("Read-only tools run freely"), "{out}");
     }
 
     #[test]

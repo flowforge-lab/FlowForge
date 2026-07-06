@@ -202,16 +202,22 @@ impl Default for PermissionMatrix {
     /// RFC 0019 §3 default table:
     /// ```text
     ///          ReadOnly  Write  Sensitive  Dangerous
-    /// Plan     Allow     Deny   Deny       Deny
+    /// Plan     Allow     Deny   Ask        Deny
     /// Auto     Allow     Allow  Ask        Deny
     /// Act      Allow     Allow  Allow      Ask
     /// ```
+    ///
+    /// Plan is a read-only planning mode: ReadOnly flies, Write/Dangerous are
+    /// denied. Sensitive is `Ask` (not `Deny`) so read-shaped network tools
+    /// (`web_fetch`/`web_search`) can be used for research behind a one-time
+    /// approval — they carry no filesystem/repo mutation, only egress, which
+    /// keeps its own URL-safety gate (#793).
     fn default() -> Self {
         use PermissionCell::*;
         Self {
             cells: [
                 // Plan
-                [Allow, Deny, Deny, Deny],
+                [Allow, Deny, Ask, Deny],
                 // Auto
                 [Allow, Allow, Ask, Deny],
                 // Act
@@ -430,10 +436,11 @@ mod tests {
         let m = PermissionMatrix::default();
         use PermissionCell::*;
 
-        // Plan: only ReadOnly allowed.
+        // Plan: ReadOnly flies, Sensitive prompts (read-shaped egress tools),
+        // Write/Dangerous denied.
         assert_eq!(m.cell(Mode::Plan, Safety::ReadOnly), Allow);
         assert_eq!(m.cell(Mode::Plan, Safety::Write), Deny);
-        assert_eq!(m.cell(Mode::Plan, Safety::Sensitive), Deny);
+        assert_eq!(m.cell(Mode::Plan, Safety::Sensitive), Ask);
         assert_eq!(m.cell(Mode::Plan, Safety::Dangerous), Deny);
 
         // Auto: Write auto-approved, Sensitive prompts, Dangerous hidden.
