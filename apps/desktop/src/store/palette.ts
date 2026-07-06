@@ -36,6 +36,7 @@ export type PaletteCommand = CommandBase &
     | { kind: "toggle-split" }
     | { kind: "toggle-wrap" }
     | { kind: "focus-composer" }
+    | { kind: "start-goal" }
     | { kind: "activate-skill"; name: string }
     | { kind: "deactivate-skill"; name: string }
     | { kind: "switch-phenotype"; name: string }

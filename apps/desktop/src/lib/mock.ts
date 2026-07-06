@@ -106,7 +106,7 @@ const TOKEN_INTERVAL_MS = import.meta.env.VITE_FF_MOCK_SLOW === "1" ? 300 : 40;
 // fill live and eventually hit `exhausted` without any polling.
 const GOAL_TICK_MS = import.meta.env.VITE_FF_MOCK_SLOW === "1" ? 4000 : 1500;
 // RFC 0020 default when `goalSet` is called without an explicit budget.
-const GOAL_DEFAULT_MAX_ITERATIONS = 25;
+const GOAL_DEFAULT_MAX_ITERATIONS = 40;
 // Demo budget the seeded goal (createSession(goal)) runs under, small enough to
 // reach exhaustion in a short session and bounded on all three axes so every
 // gauge renders.

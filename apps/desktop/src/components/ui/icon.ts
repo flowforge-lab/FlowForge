@@ -80,6 +80,7 @@ export {
   SquareCheck,
   Star,
   Sun,
+  Target,
   TextCursorInput,
   Trash2,
   Upload,

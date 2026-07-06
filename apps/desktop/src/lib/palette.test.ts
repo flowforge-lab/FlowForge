@@ -100,6 +100,13 @@ describe("buildCommands", () => {
     expect(ids).not.toContain("action:split-pane-down");
   });
 
+  it("includes the start-goal action only when a session is active", () => {
+    const ids = built.map((c) => c.id);
+    expect(ids).toContain("action:start-goal");
+    const noActive = buildCommands({ sessions, activeSessionId: null });
+    expect(noActive.map((c) => c.id)).not.toContain("action:start-goal");
+  });
+
   it("shows ⌘9 for the 9th session and drops the hint past it", () => {
     const many = Array.from({ length: 11 }, (_, i) => session({ id: `s${i}` }));
     const builtMany = buildCommands({

@@ -15,6 +15,7 @@ import {
   Search,
   Server,
   Sparkles,
+  Target,
   SplitSquareHorizontal,
   SplitSquareVertical,
   TextCursorInput,
@@ -29,6 +30,7 @@ import { useSplitStore } from "@/store/split";
 import { useSkillsStore } from "@/store/skills";
 import { useMcpStore } from "@/store/mcp";
 import { useSettingsStore } from "@/store/settings";
+import { useGoalDialogStore } from "@/store/goal-dialog";
 import {
   usePaletteStore,
   type PaletteCommand,
@@ -56,6 +58,7 @@ const ICONS: Record<
   "toggle-split": PanelRight,
   "toggle-wrap": WrapText,
   "focus-composer": TextCursorInput,
+  "start-goal": Target,
   "activate-skill": Sparkles,
   "deactivate-skill": CircleOff,
   "switch-phenotype": Layers,
@@ -125,6 +128,14 @@ function runCommand(cmd: PaletteCommand): void {
     case "focus-composer":
       focusComposer();
       return;
+    case "start-goal": {
+      // A goal is session-scoped (RFC 0020 §3): open the dialog for the active
+      // session. The command is only built when a session is active, but re-check
+      // here since the palette can outlive that state.
+      const sid = useChatStore.getState().activeSessionId;
+      if (sid) useGoalDialogStore.getState().open(sid);
+      return;
+    }
     case "activate-skill":
       void ipc.activateSkill(cmd.name);
       return;

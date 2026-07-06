@@ -472,7 +472,7 @@ export interface FfIpc {
   // `active` becomes a steer (folded into `pendingSteer`), so it rides `sendMessage`.
   /** Begin (or replace) the session's goal and start the loop. Budget dimensions
    *  are flat optional args (matching `goal_set`); each `undefined` uses the
-   *  backend default (RFC 0020: 25 iterations, tokens/wall unbounded). Resolves the
+   *  backend default (RFC 0020: 40 iterations, tokens/wall unbounded). Resolves the
    *  new goal. */
   goalSet(
     sessionId: string,
