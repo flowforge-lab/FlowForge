@@ -32,15 +32,19 @@ impl Tool for GithubTool {
                 "action": {
                     "type": "string",
                     "description": "The operation to perform.",
-                    "enum": ["pr_create", "pr_list", "pr_merge", "pr_checks", "issue_create", "issue_edit", "issue_list", "push"]
+                    "enum": ["pr_create", "pr_list", "pr_merge", "pr_checks", "pr_review", "pr_comment", "pr_request_review", "pr_review_inline", "issue_create", "issue_edit", "issue_list", "issue_comment", "push"]
                 },
                 "title": { "type": "string", "description": "Title for PR or issue (pr_create, issue_create)." },
-                "body": { "type": "string", "description": "Body text for PR or issue (pr_create, issue_create, issue_edit). Markdown supported." },
+                "body": { "type": "string", "description": "Body text for a PR/issue or a review/comment (pr_create, issue_create, issue_edit, pr_review, pr_comment, issue_comment, pr_review_inline). Required for pr_review / pr_review_inline when event is COMMENT or REQUEST_CHANGES (GitHub 422s a bodiless one); optional for APPROVE. Markdown supported." },
                 "base": { "type": "string", "description": "Base branch for PR (pr_create). Defaults to 'main'." },
                 "head": { "type": "string", "description": "Head branch for PR (pr_create). Defaults to current branch." },
-                "number": { "type": "integer", "description": "PR or issue number (pr_merge, pr_checks, issue_edit)." },
+                "number": { "type": "integer", "description": "PR or issue number (pr_merge, pr_checks, pr_review, pr_comment, pr_request_review, pr_review_inline, issue_edit, issue_comment)." },
+                "event": { "type": "string", "enum": ["APPROVE", "REQUEST_CHANGES", "COMMENT"], "description": "Review verdict for pr_review / pr_review_inline. Note: APPROVE and REQUEST_CHANGES are rejected on your own PR (422) — use COMMENT for a self-review." },
+                "comments": { "type": "array", "description": "Inline review comments for pr_review_inline. Each anchors to a diff line.", "items": { "type": "object", "properties": { "path": { "type": "string", "description": "File path (repo-relative)." }, "line": { "type": "integer", "description": "Line number in the file's diff." }, "side": { "type": "string", "enum": ["LEFT", "RIGHT"], "description": "Diff side. Defaults to RIGHT." }, "start_line": { "type": "integer", "description": "Start line for a multi-line comment (optional)." }, "body": { "type": "string", "description": "Comment text." } }, "required": ["path", "line", "body"] } },
                 "squash": { "type": "boolean", "description": "Squash merge (pr_merge). Defaults to true." },
-                "label": { "type": "string", "description": "Filter by or assign label (pr_create, issue_create, issue_list)." },
+                "label": { "type": ["string", "array"], "items": { "type": "string" }, "description": "Label(s) to filter by or assign — a single string or an array. On issue_create/pr_create each is applied; on issue_edit each is added (--add-label); on issue_list/pr_list used as a filter." },
+                "assignee": { "type": ["string", "array"], "items": { "type": "string" }, "description": "GitHub username(s) to assign — a single string or an array (issue_create, pr_create; added on issue_edit)." },
+                "reviewer": { "type": ["string", "array"], "items": { "type": "string" }, "description": "Reviewer username(s) to request — a single string or an array (pr_create)." },
                 "author": { "type": "string", "description": "Filter by author (pr_list). Use '@me' for self." },
                 "limit": { "type": "integer", "description": "Max results to return (pr_list, issue_list). Defaults to 10." },
                 "force": { "type": "boolean", "description": "Force push (push). Defaults to false." },
@@ -72,9 +76,14 @@ impl Tool for GithubTool {
             "pr_list" => pr_list(&args, root).await,
             "pr_merge" => pr_merge(&args, root).await,
             "pr_checks" => pr_checks(&args, root).await,
+            "pr_review" => pr_review(&args, root).await,
+            "pr_comment" => pr_comment(&args, root).await,
+            "pr_request_review" => pr_request_review(&args, root).await,
+            "pr_review_inline" => pr_review_inline(&args, root).await,
             "issue_create" => issue_create(&args, root).await,
             "issue_edit" => issue_edit(&args, root).await,
             "issue_list" => issue_list(&args, root).await,
+            "issue_comment" => issue_comment(&args, root).await,
             "push" => push(&args, root).await,
             _ => ToolOutcome::error(format!("unknown action: {action}")),
         }
@@ -191,9 +200,7 @@ async fn pr_create(args: &Value, root: &Path) -> ToolOutcome {
     if let Some(head) = args.get("head").and_then(|v| v.as_str()) {
         cmd.args(["--head", head]);
     }
-    if let Some(label) = args.get("label").and_then(|v| v.as_str()) {
-        cmd.args(["--label", label]);
-    }
+    cmd.args(create_flag_args(args, true));
 
     match run_gh(cmd).await {
         Ok(url) => ToolOutcome::ok(format!("PR created: {}", url.trim())),
@@ -283,6 +290,227 @@ async fn pr_checks(args: &Value, root: &Path) -> ToolOutcome {
     }
 }
 
+/// Submit a review verdict on a PR: `gh pr review <n> --approve|--request-changes|--comment [--body]`.
+async fn pr_review(args: &Value, root: &Path) -> ToolOutcome {
+    let number = match args.get("number").and_then(|v| v.as_u64()) {
+        Some(n) => n,
+        None => return ToolOutcome::error("pr_review requires 'number'"),
+    };
+    let event = args
+        .get("event")
+        .and_then(|v| v.as_str())
+        .unwrap_or("COMMENT")
+        .to_uppercase();
+    let flag = match event.as_str() {
+        "APPROVE" => "--approve",
+        "REQUEST_CHANGES" => "--request-changes",
+        "COMMENT" => "--comment",
+        other => {
+            return ToolOutcome::error(format!(
+                "pr_review 'event' must be APPROVE, REQUEST_CHANGES, or COMMENT (got {other})"
+            ))
+        }
+    };
+    let body = args.get("body").and_then(|v| v.as_str());
+    // COMMENT and REQUEST_CHANGES both require a body: GitHub's API 422s a bodiless
+    // COMMENT/REQUEST_CHANGES review, and non-interactive `gh pr review
+    // --request-changes` errors without `--body`. APPROVE may omit it.
+    if matches!(flag, "--comment" | "--request-changes")
+        && body.map(str::trim).unwrap_or("").is_empty()
+    {
+        return ToolOutcome::error(format!(
+            "pr_review with event={event} requires a non-empty 'body'"
+        ));
+    }
+
+    let mut cmd = gh_cmd(root);
+    cmd.args(["pr", "review", &number.to_string(), flag]);
+    if let Some(b) = body {
+        cmd.args(["--body", b]);
+    }
+    match run_gh(cmd).await {
+        Ok(out) => ToolOutcome::ok(format!(
+            "Review ({event}) submitted on PR #{number}. {}",
+            out.trim()
+        )),
+        Err(e) => ToolOutcome::error(format!("pr_review failed: {e}")),
+    }
+}
+
+/// Post a top-level comment on a PR: `gh pr comment <n> --body`.
+async fn pr_comment(args: &Value, root: &Path) -> ToolOutcome {
+    comment_on("pr", args, root).await
+}
+
+/// Post a top-level comment on an issue: `gh issue comment <n> --body`.
+async fn issue_comment(args: &Value, root: &Path) -> ToolOutcome {
+    comment_on("issue", args, root).await
+}
+
+/// Shared body for `pr_comment` / `issue_comment` (only the `gh` subcommand differs).
+async fn comment_on(kind: &str, args: &Value, root: &Path) -> ToolOutcome {
+    let number = match args.get("number").and_then(|v| v.as_u64()) {
+        Some(n) => n,
+        None => return ToolOutcome::error(format!("{kind}_comment requires 'number'")),
+    };
+    let body = match args.get("body").and_then(|v| v.as_str()) {
+        Some(b) if !b.trim().is_empty() => b,
+        _ => return ToolOutcome::error(format!("{kind}_comment requires a non-empty 'body'")),
+    };
+    let mut cmd = gh_cmd(root);
+    cmd.args([kind, "comment", &number.to_string(), "--body", body]);
+    match run_gh(cmd).await {
+        Ok(out) => ToolOutcome::ok(format!(
+            "Comment posted on {kind} #{number}. {}",
+            out.trim()
+        )),
+        Err(e) => ToolOutcome::error(format!("{kind}_comment failed: {e}")),
+    }
+}
+
+/// Request review on an existing PR: `gh pr edit <n> --add-reviewer a,b`.
+/// Distinct from `pr_create --reviewer`, which requests at creation time.
+async fn pr_request_review(args: &Value, root: &Path) -> ToolOutcome {
+    let number = match args.get("number").and_then(|v| v.as_u64()) {
+        Some(n) => n,
+        None => return ToolOutcome::error("pr_request_review requires 'number'"),
+    };
+    let reviewers = str_or_list(args, "reviewer");
+    if reviewers.is_empty() {
+        return ToolOutcome::error("pr_request_review requires 'reviewer' (a string or array)");
+    }
+    let mut cmd = gh_cmd(root);
+    cmd.args(["pr", "edit", &number.to_string()]);
+    push_repeated_flag_cmd(&mut cmd, "--add-reviewer", &reviewers);
+    match run_gh(cmd).await {
+        Ok(out) => ToolOutcome::ok(format!(
+            "Requested review from {} on PR #{number}. {}",
+            reviewers.join(", "),
+            out.trim()
+        )),
+        Err(e) => ToolOutcome::error(format!("pr_request_review failed: {e}")),
+    }
+}
+
+/// Submit a review carrying inline comments. `gh` has no porcelain for inline
+/// review comments, so wrap `gh api POST repos/{owner}/{repo}/pulls/<n>/reviews`
+/// with a JSON payload passed via `--input` (a temp file — arrays of objects
+/// don't compose safely with `-f`).
+async fn pr_review_inline(args: &Value, root: &Path) -> ToolOutcome {
+    let number = match args.get("number").and_then(|v| v.as_u64()) {
+        Some(n) => n,
+        None => return ToolOutcome::error("pr_review_inline requires 'number'"),
+    };
+    let payload = match build_inline_review_payload(args) {
+        Ok(p) => p,
+        Err(e) => return ToolOutcome::error(e),
+    };
+
+    // A NamedTempFile creates the payload with a randomized name via O_EXCL, so it
+    // can't follow a pre-planted symlink at a predictable path, and it is removed on
+    // drop (including the early-return error paths below).
+    use std::io::Write;
+    let mut tmp = match tempfile::Builder::new()
+        .prefix(&format!("ff-gh-review-{number}-"))
+        .suffix(".json")
+        .tempfile()
+    {
+        Ok(f) => f,
+        Err(e) => {
+            return ToolOutcome::error(format!("pr_review_inline: could not stage payload: {e}"))
+        }
+    };
+    if let Err(e) = tmp.write_all(payload.to_string().as_bytes()) {
+        return ToolOutcome::error(format!("pr_review_inline: could not stage payload: {e}"));
+    }
+
+    let mut cmd = gh_cmd(root);
+    cmd.args([
+        "api",
+        "-X",
+        "POST",
+        &format!("repos/{{owner}}/{{repo}}/pulls/{number}/reviews"),
+        "--input",
+    ]);
+    cmd.arg(tmp.path());
+
+    let result = run_gh(cmd).await;
+    drop(tmp);
+    match result {
+        Ok(out) => ToolOutcome::ok(format!(
+            "Inline review submitted on PR #{number}. {}",
+            out.trim()
+        )),
+        Err(e) => ToolOutcome::error(format!("pr_review_inline failed: {e}")),
+    }
+}
+
+/// Build the `POST /pulls/{n}/reviews` JSON body from the tool args: an `event`,
+/// an optional review `body`, and a `comments` array of `{path, line, side, body}`
+/// (with optional `start_line`). Pure so it can be unit-tested.
+fn build_inline_review_payload(args: &Value) -> Result<Value, String> {
+    let event = args
+        .get("event")
+        .and_then(|v| v.as_str())
+        .unwrap_or("COMMENT")
+        .to_uppercase();
+    if !matches!(event.as_str(), "APPROVE" | "REQUEST_CHANGES" | "COMMENT") {
+        return Err(format!(
+            "pr_review_inline 'event' must be APPROVE, REQUEST_CHANGES, or COMMENT (got {event})"
+        ));
+    }
+    let raw = args
+        .get("comments")
+        .and_then(|v| v.as_array())
+        .filter(|a| !a.is_empty())
+        .ok_or("pr_review_inline requires a non-empty 'comments' array")?;
+
+    let mut comments = Vec::with_capacity(raw.len());
+    for (i, c) in raw.iter().enumerate() {
+        let path = c
+            .get("path")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| format!("comments[{i}] missing 'path'"))?;
+        let line = c
+            .get("line")
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| format!("comments[{i}] missing integer 'line'"))?;
+        let body = c
+            .get("body")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty())
+            .ok_or_else(|| format!("comments[{i}] missing 'body'"))?;
+        let side = c.get("side").and_then(|v| v.as_str()).unwrap_or("RIGHT");
+        let mut obj = serde_json::json!({
+            "path": path, "line": line, "side": side, "body": body,
+        });
+        if let Some(start) = c.get("start_line").and_then(|v| v.as_u64()) {
+            obj["start_line"] = serde_json::json!(start);
+        }
+        comments.push(obj);
+    }
+
+    let body = args
+        .get("body")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    // A top-level review body is mandatory for COMMENT / REQUEST_CHANGES (GitHub
+    // 422s otherwise) and optional for APPROVE. Mirrors the `pr_review` guard so
+    // the two review paths behave the same.
+    if body.is_none() && matches!(event.as_str(), "COMMENT" | "REQUEST_CHANGES") {
+        return Err(format!(
+            "pr_review_inline with event={event} requires a non-empty 'body'"
+        ));
+    }
+
+    let mut payload = serde_json::json!({ "event": event, "comments": comments });
+    if let Some(b) = body {
+        payload["body"] = serde_json::json!(b);
+    }
+    Ok(payload)
+}
+
 async fn issue_create(args: &Value, root: &Path) -> ToolOutcome {
     let title = match args.get("title").and_then(|v| v.as_str()) {
         Some(t) => t,
@@ -292,10 +520,7 @@ async fn issue_create(args: &Value, root: &Path) -> ToolOutcome {
 
     let mut cmd = gh_cmd(root);
     cmd.args(["issue", "create", "--title", title, "--body", body]);
-
-    if let Some(label) = args.get("label").and_then(|v| v.as_str()) {
-        cmd.args(["--label", label]);
-    }
+    cmd.args(create_flag_args(args, false));
 
     match run_gh(cmd).await {
         Ok(url) => ToolOutcome::ok(format!("Issue created: {}", url.trim())),
@@ -318,6 +543,8 @@ async fn issue_edit(args: &Value, root: &Path) -> ToolOutcome {
     if let Some(title) = args.get("title").and_then(|v| v.as_str()) {
         cmd.args(["--title", title]);
     }
+    push_repeated_flag_cmd(&mut cmd, "--add-label", &str_or_list(args, "label"));
+    push_repeated_flag_cmd(&mut cmd, "--add-assignee", &str_or_list(args, "assignee"));
 
     match run_gh(cmd).await {
         Ok(out) => ToolOutcome::ok(format!("Issue #{number} updated. {}", out.trim())),
@@ -337,9 +564,7 @@ async fn issue_list(args: &Value, root: &Path) -> ToolOutcome {
         &limit.to_string(),
     ]);
 
-    if let Some(label) = args.get("label").and_then(|v| v.as_str()) {
-        cmd.args(["--label", label]);
-    }
+    push_repeated_flag_cmd(&mut cmd, "--label", &str_or_list(args, "label"));
 
     match run_gh(cmd).await {
         Ok(json) => format_json_table(&json, &["number", "title", "state"]),
@@ -385,6 +610,52 @@ async fn push(args: &Value, root: &Path) -> ToolOutcome {
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// Parse an argument that accepts either a single string or an array of strings
+/// into a flat `Vec<String>`, dropping empties. Back-compatible: a bare
+/// `"bug"` and `["bug"]` both yield `["bug"]`; a missing key yields `[]`.
+fn str_or_list(args: &Value, key: &str) -> Vec<String> {
+    match args.get(key) {
+        Some(Value::String(s)) if !s.trim().is_empty() => vec![s.trim().to_string()],
+        Some(Value::Array(items)) => items
+            .iter()
+            .filter_map(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Append a repeated `gh` flag, once per value (e.g. `--label a --label b`).
+fn push_repeated_flag(out: &mut Vec<String>, flag: &str, values: &[String]) {
+    for v in values {
+        out.push(flag.to_string());
+        out.push(v.clone());
+    }
+}
+
+/// Same as [`push_repeated_flag`], but appends directly onto a `Command`
+/// (used by `issue_edit`, whose flag names differ: `--add-label` / `--add-assignee`).
+fn push_repeated_flag_cmd(cmd: &mut Command, flag: &str, values: &[String]) {
+    for v in values {
+        cmd.args([flag, v]);
+    }
+}
+
+/// Build the trailing `--label` / `--assignee` (and optional `--reviewer`) args
+/// for a create/edit command from the tool `args`. Kept as a pure function so it
+/// can be unit-tested without spawning `gh`.
+fn create_flag_args(args: &Value, include_reviewer: bool) -> Vec<String> {
+    let mut out = Vec::new();
+    push_repeated_flag(&mut out, "--label", &str_or_list(args, "label"));
+    push_repeated_flag(&mut out, "--assignee", &str_or_list(args, "assignee"));
+    if include_reviewer {
+        push_repeated_flag(&mut out, "--reviewer", &str_or_list(args, "reviewer"));
+    }
+    out
+}
+
 /// Format a JSON array into a readable table for the model.
 fn format_json_table(json: &str, columns: &[&str]) -> ToolOutcome {
     let rows: Vec<Value> = match serde_json::from_str(json) {
@@ -422,6 +693,7 @@ fn format_json_table(json: &str, columns: &[&str]) -> ToolOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn resolve_token_does_not_panic() {
@@ -503,5 +775,141 @@ mod tests {
         assert!(output.contains("✓ Rust (fmt, clippy, test): SUCCESS"));
         assert!(output.contains("✗ Windows (compile): FAILURE"));
         assert!(!output.contains("conclusion"), "no conclusion field used");
+    }
+
+    #[test]
+    fn str_or_list_accepts_string_array_and_missing() {
+        assert_eq!(str_or_list(&json!({"label": "bug"}), "label"), vec!["bug"]);
+        assert_eq!(
+            str_or_list(&json!({"label": ["bug", "frontend"]}), "label"),
+            vec!["bug", "frontend"]
+        );
+        assert!(str_or_list(&json!({}), "label").is_empty());
+        // empties and non-string items are dropped; whitespace trimmed.
+        assert_eq!(
+            str_or_list(&json!({"a": ["  x  ", "", 7, "y"]}), "a"),
+            vec!["x", "y"]
+        );
+        assert!(str_or_list(&json!({"a": "   "}), "a").is_empty());
+    }
+
+    #[test]
+    fn create_flag_args_single_label_backcompat() {
+        // A bare string label behaves exactly as before: one --label.
+        let out = create_flag_args(&json!({"label": "bug"}), false);
+        assert_eq!(out, vec!["--label", "bug"]);
+    }
+
+    #[test]
+    fn create_flag_args_multi_label_and_assignees() {
+        let out = create_flag_args(
+            &json!({"label": ["bug", "frontend"], "assignee": "abidkhan03"}),
+            false,
+        );
+        assert_eq!(
+            out,
+            vec![
+                "--label",
+                "bug",
+                "--label",
+                "frontend",
+                "--assignee",
+                "abidkhan03"
+            ]
+        );
+    }
+
+    #[test]
+    fn create_flag_args_reviewer_only_when_included() {
+        let args = json!({"assignee": ["a", "b"], "reviewer": "r"});
+        // pr_create includes reviewer; issue_create does not.
+        assert_eq!(
+            create_flag_args(&args, true),
+            vec!["--assignee", "a", "--assignee", "b", "--reviewer", "r"]
+        );
+        assert_eq!(
+            create_flag_args(&args, false),
+            vec!["--assignee", "a", "--assignee", "b"]
+        );
+    }
+
+    #[test]
+    fn create_flag_args_empty_when_no_fields() {
+        assert!(create_flag_args(&json!({"title": "x"}), true).is_empty());
+    }
+
+    #[test]
+    fn inline_review_payload_builds_comments_and_defaults_side() {
+        let args = json!({
+            "event": "comment",
+            "body": "overall looks good",
+            "comments": [
+                { "path": "src/a.rs", "line": 12, "body": "nit here" },
+                { "path": "src/b.rs", "line": 40, "side": "LEFT", "start_line": 38, "body": "range" }
+            ]
+        });
+        let p = build_inline_review_payload(&args).unwrap();
+        assert_eq!(p["event"], "COMMENT", "event upper-cased");
+        assert_eq!(p["body"], "overall looks good");
+        assert_eq!(p["comments"][0]["side"], "RIGHT", "side defaults to RIGHT");
+        assert_eq!(p["comments"][0]["path"], "src/a.rs");
+        assert_eq!(p["comments"][0]["line"], 12);
+        assert_eq!(p["comments"][1]["side"], "LEFT");
+        assert_eq!(p["comments"][1]["start_line"], 38);
+        assert!(p["comments"][0].get("start_line").is_none());
+    }
+
+    #[test]
+    fn inline_review_payload_rejects_bad_event_and_empty_comments() {
+        let bad_event = json!({"event": "LGTM", "comments": [{"path":"a","line":1,"body":"x"}]});
+        assert!(build_inline_review_payload(&bad_event).is_err());
+
+        let no_comments = json!({"event": "COMMENT", "comments": []});
+        assert!(build_inline_review_payload(&no_comments).is_err());
+
+        let missing = json!({"event": "COMMENT"});
+        assert!(build_inline_review_payload(&missing).is_err());
+    }
+
+    #[test]
+    fn inline_review_payload_rejects_incomplete_comment() {
+        // missing body
+        let a = json!({"comments": [{"path": "a.rs", "line": 3}]});
+        assert!(build_inline_review_payload(&a).is_err());
+        // missing line
+        let b = json!({"comments": [{"path": "a.rs", "body": "x"}]});
+        assert!(build_inline_review_payload(&b).is_err());
+        // missing path
+        let c = json!({"comments": [{"line": 3, "body": "x"}]});
+        assert!(build_inline_review_payload(&c).is_err());
+    }
+
+    #[test]
+    fn inline_review_comment_and_request_changes_require_body() {
+        // COMMENT / REQUEST_CHANGES 422 without a top-level body, so building the
+        // payload must fail up front (mirrors the pr_review guard). A blank body
+        // counts as missing.
+        for event in ["COMMENT", "REQUEST_CHANGES"] {
+            let blank = json!({"event": event, "body": "   ", "comments": [{"path":"a","line":1,"body":"y"}]});
+            assert!(
+                build_inline_review_payload(&blank).is_err(),
+                "{event} with a blank body should be rejected"
+            );
+
+            let missing = json!({"event": event, "comments": [{"path":"a","line":1,"body":"y"}]});
+            assert!(
+                build_inline_review_payload(&missing).is_err(),
+                "{event} with no body should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn inline_review_approve_may_omit_body() {
+        // APPROVE is the one event GitHub accepts without a top-level body.
+        let args = json!({"event":"APPROVE","comments":[{"path":"a","line":1,"body":"y"}]});
+        let p = build_inline_review_payload(&args).unwrap();
+        assert_eq!(p["event"], "APPROVE");
+        assert!(p.get("body").is_none(), "APPROVE omits an absent body");
     }
 }

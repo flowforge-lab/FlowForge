@@ -25,6 +25,7 @@ dirs = { workspace = true }
 ff-memory = { workspace = true }
 ff-session = { workspace = true }
 chrono = { workspace = true }
+tempfile = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -38,5 +39,4 @@ windows-sys = { version = "0.59", features = [
 ] }
 
 [dev-dependencies]
-tempfile = "3"
 wiremock = { workspace = true }
