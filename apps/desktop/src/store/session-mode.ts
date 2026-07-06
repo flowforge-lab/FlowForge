@@ -6,6 +6,7 @@
 
 import { create } from "zustand";
 import { persist } from "zustand/middleware";
+import { ipc } from "@/lib/ipc";
 import type { Mode } from "@/bindings";
 
 const STORAGE_KEY = "ff-session-mode";
@@ -36,20 +37,21 @@ export const useSessionModeStore = create<SessionModeState>()(
       modeBySession: {},
       resolve: (sessionId, fallback) =>
         get().modeBySession[sessionId] ?? fallback,
-      setMode: (sessionId, mode) =>
+      setMode: (sessionId, mode) => {
         set((s) => ({
           modeBySession: { ...s.modeBySession, [sessionId]: mode },
-        })),
-      cycleMode: (sessionId, fallback) =>
-        set((s) => {
-          const current = s.modeBySession[sessionId] ?? fallback;
-          return {
-            modeBySession: {
-              ...s.modeBySession,
-              [sessionId]: nextMode(current),
-            },
-          };
-        }),
+        }));
+        // Mirror to the backend so `spawn_assistant_turn` honours the mode (#789);
+        // the pill stays authoritative, this store is just its persistence.
+        void ipc.setSessionMode(sessionId, mode);
+      },
+      cycleMode: (sessionId, fallback) => {
+        const next = nextMode(get().modeBySession[sessionId] ?? fallback);
+        set((s) => ({
+          modeBySession: { ...s.modeBySession, [sessionId]: next },
+        }));
+        void ipc.setSessionMode(sessionId, next);
+      },
     }),
     // `version` establishes a migration baseline now, so a future shape change can
     // migrate rather than silently drop overrides (#287 review).

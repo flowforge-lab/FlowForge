@@ -1,7 +1,8 @@
 // @vitest-environment jsdom
 
-import { beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { ipc } from "@/lib/ipc";
 import {
   MODE_ORDER,
   nextMode,
@@ -51,5 +52,32 @@ describe("useSessionModeStore", () => {
     useSessionModeStore.getState().setMode("s1", "act");
     const blob = JSON.parse(localStorage.getItem("ff-session-mode") ?? "{}");
     expect(blob.state.modeBySession.s1).toBe("act");
+  });
+});
+
+// #789: the pill is authoritative but the running turn reads the persisted
+// backend mode, so every change must mirror to `set_session_mode`.
+describe("useSessionModeStore backend write-through", () => {
+  beforeEach(() => {
+    useSessionModeStore.setState({ modeBySession: {} });
+    localStorage.clear();
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("setMode mirrors the chosen mode to the backend", () => {
+    const spy = vi.spyOn(ipc, "setSessionMode").mockResolvedValue();
+    useSessionModeStore.getState().setMode("s1", "plan");
+    expect(spy).toHaveBeenCalledWith("s1", "plan");
+  });
+
+  it("cycleMode mirrors the resulting mode to the backend", () => {
+    const spy = vi.spyOn(ipc, "setSessionMode").mockResolvedValue();
+    useSessionModeStore.getState().cycleMode("s1", "auto"); // auto → plan
+    expect(spy).toHaveBeenLastCalledWith("s1", "plan");
+    useSessionModeStore.getState().cycleMode("s1", "auto"); // plan → act
+    expect(spy).toHaveBeenLastCalledWith("s1", "act");
   });
 });
