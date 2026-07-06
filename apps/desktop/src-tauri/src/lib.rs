@@ -1433,22 +1433,47 @@ const GOAL_ITERATION_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 /// against the live session with the interactive [`UiApprover`] — so a mid-loop
 /// approval / `ask_user` still surfaces in the UI (the RFC 0017 join point).
 /// Per-tool safety gating already happens inside `run_turn` via the shared
-/// `permission_matrix`; the loop-level [`GoalIteration::gate`] only governs
-/// whether to continue (the #719 Ask→pause seam), so today it always proceeds.
+/// `permission_matrix`; the loop-level [`GoalIteration::gate`] is a coarse
+/// per-iteration pre-flight (#719/#682) that halts the *whole* loop when the
+/// active mode's matrix posture says an autonomous iteration shouldn't run
+/// unattended.
 struct GoalLoopIteration {
     state: Arc<AppState>,
     app: tauri::AppHandle,
     session_id: String,
 }
 
+/// Coarse per-iteration goal gate (#719): decide whether to spend another
+/// unattended iteration given the active `mode`'s permission-matrix posture.
+///
+/// The loop is headless-autonomous, so we gate on the `Sensitive` tier — the
+/// representative "externally-visible autonomous work" a goal iteration is
+/// expected to do (network egress, sub-agent spawn; RFC 0019 §Safety). Per-tool
+/// gating (including `Dangerous`→deny and the Ask *prompt*) still runs inside the
+/// turn via the shared matrix; this pre-flight only governs loop continuation:
+/// - `Allow`  → [`GateDecision::Proceed`] (e.g. Act: run autonomously).
+/// - `Ask`    → [`GateDecision::Pause`]  (e.g. Auto: pause & surface, resumable —
+///   an unattended loop must not silently auto-approve a stream of Ask calls).
+/// - `Deny`   → [`GateDecision::Deny`]   (e.g. Plan: read-only, no autonomous run).
+fn goal_gate_for(mode: Mode, matrix: &ff_core::PermissionMatrix) -> GateDecision {
+    match matrix.cell(mode, ff_core::Safety::Sensitive) {
+        PermissionCell::Allow => GateDecision::Proceed,
+        PermissionCell::Ask => GateDecision::Pause,
+        PermissionCell::Deny => GateDecision::Deny,
+    }
+}
+
 #[async_trait::async_trait]
 impl GoalIteration for GoalLoopIteration {
     fn gate(&self, _goal: &Goal) -> GateDecision {
-        // Loop-continuation gate. Per-tool matrix gating is enforced inside the
-        // turn; this seam is where #719/#682 will pause on an Ask verdict. The
-        // skeleton always proceeds — a paused goal is handled by the status
-        // check in `drive_goal`, not here.
-        GateDecision::Proceed
+        // Coarse loop-continuation gate keyed on the active mode's matrix posture
+        // for the Sensitive tier (#719). Per-tool matrix gating — including the
+        // Ask *prompt* and Dangerous deny — is still enforced inside the turn via
+        // the shared `permission_matrix`; a paused/denied goal is checkpointed by
+        // `drive_goal` from the returned decision. Read live so a Control-panel
+        // matrix edit takes effect on the next boundary (#702/#742).
+        let mode = self.state.session_mode(&self.session_id);
+        goal_gate_for(mode, &self.state.permission_matrix())
     }
 
     async fn run_once(&self, goal: &Goal) -> IterationOutcome {
@@ -3431,12 +3456,12 @@ pub fn run() {
 mod tests {
     use super::state::AppState;
     use super::{
-        emit_agent_event, git_branch, is_app_ready, list_local_branches, matrix_gate,
-        panic_message, publish_app_ready, resolve_tool_arg, resolve_workspace_dir,
+        emit_agent_event, git_branch, goal_gate_for, is_app_ready, list_local_branches,
+        matrix_gate, panic_message, publish_app_ready, resolve_tool_arg, resolve_workspace_dir,
         run_sidecar_turn, should_warmup, switch_branch, BootFinalize, TurnMetrics, UpdateStatus,
         APP_READY,
     };
-    use ff_agent::AgentEvent;
+    use ff_agent::{AgentEvent, GateDecision};
     use ff_core::events::TurnDoneEvent;
     use ff_core::{Mode, ProviderKind};
     use ff_tools::Safety;
@@ -3655,6 +3680,39 @@ mod tests {
         // Plan: only ReadOnly allowed.
         assert_eq!(m.cell(Mode::Plan, Safety::ReadOnly), PermissionCell::Allow);
         assert_eq!(m.cell(Mode::Plan, Safety::Write), PermissionCell::Deny);
+    }
+
+    // #719: the coarse goal-loop gate keys on the Sensitive tier of the active
+    // mode's matrix posture — Auto pauses (Ask), Act proceeds (Allow), Plan
+    // denies (Deny). Locks the mapping against the default matrix so a matrix
+    // change that would let an unattended loop run in Plan (or auto-run Sensitive
+    // work in Auto) fails here.
+    #[test]
+    fn goal_gate_maps_matrix_posture_per_mode() {
+        use ff_core::PermissionMatrix;
+        let m = PermissionMatrix::default();
+        // Auto: Sensitive = Ask -> pause & surface, don't auto-run unattended.
+        assert_eq!(goal_gate_for(Mode::Auto, &m), GateDecision::Pause);
+        // Act: Sensitive = Allow -> run autonomously.
+        assert_eq!(goal_gate_for(Mode::Act, &m), GateDecision::Proceed);
+        // Plan: Sensitive = Deny -> no autonomous iteration.
+        assert_eq!(goal_gate_for(Mode::Plan, &m), GateDecision::Deny);
+    }
+
+    // #719: an edited matrix cell flips the goal gate on the next boundary (read
+    // live), mirroring the per-tool gate acceptance (#702) at the loop level.
+    #[test]
+    fn goal_gate_follows_an_edited_sensitive_cell() {
+        use ff_core::{PermissionCell, PermissionMatrix};
+        let mut m = PermissionMatrix::default();
+        // Default Auto+Sensitive is Ask -> Pause.
+        assert_eq!(goal_gate_for(Mode::Auto, &m), GateDecision::Pause);
+        // Operator allows Sensitive in Auto -> the loop may now proceed unattended.
+        m.set_cell(Mode::Auto, Safety::Sensitive, PermissionCell::Allow);
+        assert_eq!(goal_gate_for(Mode::Auto, &m), GateDecision::Proceed);
+        // Operator hard-denies it -> the loop halts.
+        m.set_cell(Mode::Auto, Safety::Sensitive, PermissionCell::Deny);
+        assert_eq!(goal_gate_for(Mode::Auto, &m), GateDecision::Deny);
     }
 
     // Acceptance (#702): editing a matrix cell changes the invocation-time gate
