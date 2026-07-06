@@ -67,6 +67,17 @@ pub trait Tool: Send + Sync {
     fn max_safety(&self) -> Safety {
         Safety::Write
     }
+    /// Best-case safety this tool can ever reach — the *floor*, independent of
+    /// arguments. A tool whose floor is [`Safety::ReadOnly`] has a genuine
+    /// read-only path (e.g. `bash ls`, `gh pr_list`) and is worth advertising in
+    /// capability-restricted modes (Plan, RFC 0011) even when its ceiling is
+    /// higher; the per-call [`Tool::safety`] then gates each concrete invocation.
+    /// Defaults to [`max_safety`](Self::max_safety) — a tool with a single fixed
+    /// safety has floor == ceiling; only tools with dynamic per-call safety
+    /// override this to their true floor.
+    fn min_safety(&self) -> Safety {
+        self.max_safety()
+    }
     /// Interactive tools don't execute against the workspace — they pause the turn to
     /// ask the user something and resume with the answer (e.g. `ask_user`, #44). The
     /// agent loop routes them through [`Approver::ask`] instead of [`Tool::run`].
@@ -202,14 +213,26 @@ impl ToolRegistry {
             .collect()
     }
 
-    /// Names of every tool whose worst-case safety is [`Safety::ReadOnly`]. This is
-    /// the set advertised in Plan mode (RFC 0011): mutating tools are absent from the
-    /// schema entirely, so the model cannot call them. Tools with an unknown/elevated
-    /// ceiling are excluded (fail safe).
+    /// Names of every tool whose worst-case safety is [`Safety::ReadOnly`] — tools
+    /// that can *never* mutate regardless of arguments.
     pub fn readonly_tool_names(&self) -> HashSet<String> {
         self.tools
             .values()
             .filter(|t| t.max_safety() == Safety::ReadOnly)
+            .map(|t| t.name().to_string())
+            .collect()
+    }
+
+    /// Names of every tool with a read-only *floor* ([`Tool::min_safety`] is
+    /// [`Safety::ReadOnly`]) — i.e. tools that have a genuine read-only path even
+    /// if their ceiling is higher (`bash ls`, `gh pr_list`). Superset of
+    /// [`readonly_tool_names`](Self::readonly_tool_names); the base of the Plan-mode
+    /// advertised set (#793). The per-call [`Tool::safety`] gate then rejects any
+    /// concrete invocation that exceeds what the Plan matrix row permits.
+    pub fn readonly_capable_names(&self) -> HashSet<String> {
+        self.tools
+            .values()
+            .filter(|t| t.min_safety() == Safety::ReadOnly)
             .map(|t| t.name().to_string())
             .collect()
     }
@@ -416,9 +439,9 @@ mod tests {
         ] {
             assert!(ro.contains(name), "{name} should be a read-only tool");
         }
-        // Mutating tools and dynamically-classified tools (bash) are absent: in Plan
-        // mode they must not even be advertised to the model. web_fetch is Write
-        // (network egress), so it is excluded too.
+        // Tools whose *ceiling* exceeds ReadOnly are absent — even bash/github,
+        // which have a read-only floor but can mutate (that read floor is exposed
+        // via `readonly_capable_names`, not here). web_fetch is Sensitive (egress).
         for name in [
             "bash",
             "python",
@@ -428,8 +451,48 @@ mod tests {
             "web_fetch",
             "agent",
         ] {
-            assert!(!ro.contains(name), "{name} must not be a read-only tool");
+            assert!(
+                !ro.contains(name),
+                "{name} must not be a read-only-ceiling tool"
+            );
         }
+    }
+
+    #[test]
+    fn readonly_capable_includes_read_floor_tools_but_not_pure_mutators() {
+        // #793: the Plan-advertised base is tools with a ReadOnly *floor* — the
+        // always-read tools plus bash/github (which have read-only calls).
+        let reg = ToolRegistry::with_defaults();
+        let cap = reg.readonly_capable_names();
+        for name in ["view", "grep", "glob", "tree", "todo", "bash", "github"] {
+            assert!(cap.contains(name), "{name} has a read-only floor");
+        }
+        // No read-only path -> not in the capable set.
+        for name in [
+            "python",
+            "edit",
+            "write",
+            "apply_patch",
+            "web_fetch",
+            "agent",
+        ] {
+            assert!(!cap.contains(name), "{name} has no read-only floor");
+        }
+    }
+
+    #[test]
+    fn min_safety_defaults_to_ceiling_and_is_overridden_for_dynamic_tools() {
+        // Fixed-safety tools have floor == ceiling; bash/github drop their floor to
+        // ReadOnly (their list/read calls) while keeping a higher ceiling.
+        assert_eq!(crate::bash::BashTool.min_safety(), Safety::ReadOnly);
+        assert_eq!(crate::bash::BashTool.max_safety(), Safety::Dangerous);
+        assert_eq!(crate::github::GithubTool.min_safety(), Safety::ReadOnly);
+        assert_eq!(crate::github::GithubTool.max_safety(), Safety::Write);
+        // web_fetch has no read-only path: floor == ceiling == Sensitive.
+        assert_eq!(
+            crate::web_fetch::WebFetchTool::new().min_safety(),
+            Safety::Sensitive
+        );
     }
 
     #[test]

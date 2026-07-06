@@ -12,7 +12,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use ff_core::{
-    AttachmentKind, Message, Mode, PermissionMatrix, ReasoningVisibility, Role, StopReason,
+    AttachmentKind, Message, Mode, PermissionCell, PermissionMatrix, ReasoningVisibility, Role,
+    StopReason,
 };
 use ff_llm::{ChatMessage, ChatRequest, FunctionCall, LlmError, Provider, ToolCall as LlmToolCall};
 use ff_session::SessionStore;
@@ -611,29 +612,39 @@ struct CallBuf {
 }
 
 /// The set of tool names to advertise to the model this turn.
-/// Filter the advertised tool set based on Mode (#699).
+/// Filter the advertised tool set based on Mode (#699, #793).
 ///
-/// In [`Mode::Plan`] (RFC 0011) only ReadOnly tools are advertised so the model
-/// cannot call anything that mutates — determined by `matrix.cell(mode, max_safety)`
-/// being Deny for all non-ReadOnly tiers. In Act/Auto all tools remain visible;
-/// the matrix's Deny cells for those modes are enforced at **invocation time**
-/// (the approver rejects the call) rather than hiding the tool from the schema,
-/// because tools like `bash` have `max_safety = Dangerous` but produce ReadOnly/Write
-/// calls most of the time.
+/// In [`Mode::Plan`] (RFC 0011) a tool is advertised when it has a genuine
+/// read-only path ([`ToolRegistry::readonly_capable_names`], e.g. `bash ls`,
+/// `gh pr_list`) **or** its worst-case tier is not `Deny` in the Plan matrix row
+/// (so opening `Plan x Sensitive` surfaces `web_fetch`/`web_search`). The per-call
+/// [`Tool::safety`] gate then rejects any concrete invocation that exceeds what the
+/// Plan row permits — `bash rm` (Dangerous) and `gh pr_create` (Write) are denied
+/// even though the tool is visible. Pure-mutation tools (`python`, `write`) whose
+/// floor is above ReadOnly stay hidden unless the matrix opens their tier.
+///
+/// In Act/Auto all tools remain visible; the matrix's Deny cells are enforced at
+/// **invocation time** (the approver rejects the call) rather than hiding the tool.
 fn advertised_tools(
     mode: Mode,
-    _matrix: &PermissionMatrix,
+    matrix: &PermissionMatrix,
     allowed: Option<&std::collections::HashSet<String>>,
     registry: &ToolRegistry,
 ) -> Option<std::collections::HashSet<String>> {
     if !mode.is_plan() {
         return allowed.cloned();
     }
-    // Plan mode: only tools that can never exceed ReadOnly.
-    let readonly = registry.readonly_tool_names();
+    // Plan mode: read-capable tools, plus any whose ceiling the Plan matrix row
+    // does not Deny. Invocation-time `safety` + matrix gate the concrete calls.
+    let mut visible = registry.readonly_capable_names();
+    for tool in registry.iter_tools() {
+        if matrix.cell(Mode::Plan, tool.max_safety()) != PermissionCell::Deny {
+            visible.insert(tool.name().to_string());
+        }
+    }
     Some(match allowed {
-        Some(set) => set.intersection(&readonly).cloned().collect(),
-        None => readonly,
+        Some(set) => set.intersection(&visible).cloned().collect(),
+        None => visible,
     })
 }
 

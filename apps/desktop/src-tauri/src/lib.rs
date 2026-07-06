@@ -1454,7 +1454,8 @@ struct GoalLoopIteration {
 /// - `Allow`  → [`GateDecision::Proceed`] (e.g. Act: run autonomously).
 /// - `Ask`    → [`GateDecision::Pause`]  (e.g. Auto: pause & surface, resumable —
 ///   an unattended loop must not silently auto-approve a stream of Ask calls).
-/// - `Deny`   → [`GateDecision::Deny`]   (e.g. Plan: read-only, no autonomous run).
+/// - `Deny`   → [`GateDecision::Deny`]   (a matrix edited to deny Sensitive in
+///   this mode -- no default mode does, post-#793 -- halts the loop).
 fn goal_gate_for(mode: Mode, matrix: &ff_core::PermissionMatrix) -> GateDecision {
     match matrix.cell(mode, ff_core::Safety::Sensitive) {
         PermissionCell::Allow => GateDecision::Proceed,
@@ -1825,9 +1826,10 @@ impl ff_scheduled::TaskRunner for DesktopTaskRunner {
         }
         self.state.store.add_message(&sid, Role::User, prompt);
 
-        // The safety ceiling maps to the advertised toolset: a read-only task runs
-        // in Plan (only read-only tools advertised), a write task in Act (write
-        // tools advertised; the approver allows Write and denies Dangerous).
+        // The safety ceiling maps to the run mode: a read-only task runs in Plan
+        // (read-capable tools advertised; the headless approver auto-runs ReadOnly
+        // and denies Write/Sensitive/Dangerous), a write task in Act (write tools
+        // advertised; the approver allows Write and denies Dangerous).
         let mode = match task.safety_ceiling {
             ff_core::SafetyCeiling::ReadOnly => Mode::Plan,
             ff_core::SafetyCeiling::Write => Mode::Act,
@@ -3695,8 +3697,10 @@ mod tests {
         assert_eq!(goal_gate_for(Mode::Auto, &m), GateDecision::Pause);
         // Act: Sensitive = Allow -> run autonomously.
         assert_eq!(goal_gate_for(Mode::Act, &m), GateDecision::Proceed);
-        // Plan: Sensitive = Deny -> no autonomous iteration.
-        assert_eq!(goal_gate_for(Mode::Plan, &m), GateDecision::Deny);
+        // Plan: Sensitive = Ask (#793) -> pause & surface; the goal asks the
+        // human before an externally-visible read (web_fetch) rather than
+        // hard-denying. Write/Dangerous stay denied inside the turn.
+        assert_eq!(goal_gate_for(Mode::Plan, &m), GateDecision::Pause);
     }
 
     // #719: an edited matrix cell flips the goal gate on the next boundary (read

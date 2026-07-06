@@ -65,6 +65,13 @@ impl Tool for GithubTool {
         Safety::Write
     }
 
+    // Read-only floor: the list/read actions (`pr_list`, `pr_checks`, `issue_list`)
+    // are `ReadOnly`, so gh is advertised in Plan; the per-call `safety` gate
+    // rejects the mutating actions there (Plan x Write = Deny).
+    fn min_safety(&self) -> Safety {
+        Safety::ReadOnly
+    }
+
     async fn run(&self, args: Value, root: &Path) -> ToolOutcome {
         let action = match args.get("action").and_then(|a| a.as_str()) {
             Some(a) => a,
