@@ -51,6 +51,10 @@ import type {
   MemoryFileInfo,
   MemoryOverview,
   MemoryFlushedEvent,
+  Mode,
+  Safety,
+  PermissionCell,
+  PermissionMatrixView,
 } from "../bindings";
 import type { Format } from "../bindings/Format";
 import type { SecretKind } from "../bindings/SecretKind";
@@ -262,6 +266,19 @@ export interface FfIpc {
   getControlConfig(): Promise<ControlConfig>;
   /** Persist control settings; resolves with the stored config. */
   setControlConfig(config: ControlConfig): Promise<ControlConfig>;
+
+  // Permission matrix (#702, RFC 0019 §3). Unlike `ControlConfig` above, this is
+  // the REAL backend matrix that drives runtime approval: `get` returns every
+  // Mode × Safety cell; `set` edits one cell, persists it to `permissions.json`,
+  // and returns the updated view. Effective on the next tool invocation.
+  /** The current permission matrix as a flat Mode × Safety cell list. */
+  getPermissionMatrix(): Promise<PermissionMatrixView>;
+  /** Edit one matrix cell; resolves with the updated view. */
+  setPermissionCell(
+    mode: Mode,
+    safety: Safety,
+    cell: PermissionCell,
+  ): Promise<PermissionMatrixView>;
 
   // Skills (Issue #27). Discovery + the global active set; backs the command palette.
   /** All installed skills, name-sorted, each flagged active; `score` is always 0. */
@@ -653,6 +670,14 @@ class TauriIpc implements FfIpc {
   getControlConfig = () => this.invoke<ControlConfig>("get_control_config");
   setControlConfig = (config: ControlConfig) =>
     this.invoke<ControlConfig>("set_control_config", { config });
+  getPermissionMatrix = () =>
+    this.invoke<PermissionMatrixView>("get_permission_matrix");
+  setPermissionCell = (mode: Mode, safety: Safety, cell: PermissionCell) =>
+    this.invoke<PermissionMatrixView>("set_permission_cell", {
+      mode,
+      safety,
+      cell,
+    });
   warmup = () => this.invoke<void>("warmup");
 
   searchInSession = (sessionId: string, query: string) =>

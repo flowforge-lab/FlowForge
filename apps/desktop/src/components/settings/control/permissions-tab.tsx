@@ -1,38 +1,61 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Check, ChevronRight, Plus, X } from "@/components/ui/icon";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import {
-  MODE_CELLS,
   MODE_COLUMNS,
   PERMISSION_ROWS,
+  ROW_SAFETY,
+  cellToMark,
+  cycleCell,
+  cellLabel,
   type CellMark,
   type ControlOverrides,
 } from "@/lib/control";
 import { useControlConfigStore } from "@/store/control-config";
+import {
+  usePermissionMatrixStore,
+  type MatrixLookup,
+} from "@/store/permission-matrix";
 import { AlwaysApprovedTools } from "@/components/settings/control/always-approved-tools";
 
+// Purely decorative inside the fully-labelled cell button (the button's
+// aria-label already announces the state), so the marks are aria-hidden to avoid
+// a double announcement.
 function CellMarkIcon({ mark }: { mark: CellMark }) {
   if (mark === "check") {
-    return <Check className="size-3.5 text-foreground" aria-label="Allowed" />;
+    return <Check className="size-3.5 text-foreground" aria-hidden="true" />;
   }
   if (mark === "cross") {
     return (
-      <X className="size-3.5 text-muted-foreground/40" aria-label="Blocked" />
+      <X className="size-3.5 text-muted-foreground/40" aria-hidden="true" />
     );
   }
-  return <span className="text-[11px] text-muted-foreground">Ask</span>;
+  return (
+    <span className="text-[11px] text-muted-foreground" aria-hidden="true">
+      Ask
+    </span>
+  );
 }
 
-/** The Default Mode matrix: selectable columns (modes) × permission rows. */
+/** The permission matrix: selectable mode columns × editable Safety-tier cells.
+ *  Each cell reflects the live backend matrix and cycles Allow → Ask → Deny on
+ *  click (#702). */
 function ModeMatrix({
+  matrix,
   defaultMode,
   onSelectMode,
+  onCycleCell,
   disabled,
 }: {
+  matrix: MatrixLookup;
   defaultMode: string;
   onSelectMode: (mode: (typeof MODE_COLUMNS)[number]["value"]) => void;
+  onCycleCell: (
+    mode: (typeof MODE_COLUMNS)[number]["value"],
+    row: (typeof PERMISSION_ROWS)[number]["key"],
+  ) => void;
   disabled: boolean;
 }) {
   return (
@@ -74,19 +97,32 @@ function ModeMatrix({
           {PERMISSION_ROWS.map((row) => (
             <tr key={row.key} className="border-t border-border">
               <td className="px-3 py-2 text-foreground">{row.label}</td>
-              {MODE_COLUMNS.map((col) => (
-                <td
-                  key={col.value}
-                  className={cn(
-                    "py-2 text-center align-middle",
-                    col.value === defaultMode && "bg-primary/5",
-                  )}
-                >
-                  <span className="inline-flex justify-center">
-                    <CellMarkIcon mark={MODE_CELLS[col.value][row.key]} />
-                  </span>
-                </td>
-              ))}
+              {MODE_COLUMNS.map((col) => {
+                const cell = matrix[col.value][ROW_SAFETY[row.key]];
+                return (
+                  <td
+                    key={col.value}
+                    className={cn(
+                      "p-1 text-center align-middle",
+                      col.value === defaultMode && "bg-primary/5",
+                    )}
+                  >
+                    <button
+                      type="button"
+                      disabled={disabled}
+                      onClick={() => onCycleCell(col.value, row.key)}
+                      title={`${row.label} · ${col.label}: ${cellLabel(cell)} — click to change`}
+                      aria-label={`${row.label} in ${col.label} mode: ${cellLabel(cell)}. Click to change.`}
+                      className={cn(
+                        "inline-flex min-w-8 items-center justify-center rounded-md px-2 py-1.5 transition-colors hover:bg-muted",
+                        disabled && "cursor-not-allowed opacity-50",
+                      )}
+                    >
+                      <CellMarkIcon mark={cellToMark(cell)} />
+                    </button>
+                  </td>
+                );
+              })}
             </tr>
           ))}
         </tbody>
@@ -216,7 +252,7 @@ function OverrideBucket({
   );
 }
 
-/** Permissions sub-tab: the Default Mode matrix + Custom Overrides. */
+/** Permissions sub-tab: the editable permission matrix + Custom Overrides. */
 export function PermissionsTab() {
   const config = useControlConfigStore((s) => s.config);
   const saving = useControlConfigStore((s) => s.saving);
@@ -224,23 +260,51 @@ export function PermissionsTab() {
   const addOverride = useControlConfigStore((s) => s.addOverride);
   const removeOverride = useControlConfigStore((s) => s.removeOverride);
 
+  const matrix = usePermissionMatrixStore((s) => s.matrix);
+  const matrixLoading = usePermissionMatrixStore((s) => s.loading);
+  const matrixSaving = usePermissionMatrixStore((s) => s.saving);
+  const matrixError = usePermissionMatrixStore((s) => s.error);
+  const loadMatrix = usePermissionMatrixStore((s) => s.load);
+  const setCell = usePermissionMatrixStore((s) => s.setCell);
+
+  useEffect(() => {
+    void loadMatrix();
+  }, [loadMatrix]);
+
   if (!config) return null;
 
   return (
     <div className="space-y-5">
       <section className="space-y-2">
-        <h3 className="text-[13px] font-medium text-foreground">
-          Default mode
-        </h3>
+        <h3 className="text-[13px] font-medium text-foreground">Permissions</h3>
         <p className="text-[12px] leading-relaxed text-muted-foreground">
-          Choose how much the agent can do without asking. (Presentation only
-          for now — does not yet drive runtime approval.)
+          What the agent may do at each safety tier, per mode. Click a cell to
+          cycle Allow → Ask → Deny; changes take effect on the next tool call.
         </p>
-        <ModeMatrix
-          defaultMode={config.defaultMode}
-          onSelectMode={(mode) => void setDefaultMode(mode)}
-          disabled={saving}
-        />
+        {matrixError && (
+          <p className="rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-[12px] text-destructive">
+            Couldn&apos;t update permissions: {matrixError}
+          </p>
+        )}
+        {!matrix ? (
+          <p className="px-1 py-2 text-[12px] text-muted-foreground">
+            {matrixLoading ? "Loading permissions…" : "No permissions to show."}
+          </p>
+        ) : (
+          <ModeMatrix
+            matrix={matrix}
+            defaultMode={config.defaultMode}
+            onSelectMode={(mode) => void setDefaultMode(mode)}
+            onCycleCell={(mode, row) =>
+              void setCell(
+                mode,
+                ROW_SAFETY[row],
+                cycleCell(matrix[mode][ROW_SAFETY[row]]),
+              )
+            }
+            disabled={saving || matrixSaving}
+          />
+        )}
       </section>
 
       <section className="space-y-2 border-t pt-5">

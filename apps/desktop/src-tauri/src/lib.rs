@@ -21,10 +21,10 @@ use ff_core::events::{
 };
 use ff_core::{
     Attachment, BedrockAuth, CreateScheduledTaskInput, Format, McpServerConfig, McpServerStatus,
-    MemoryFileInfo, MemoryFileKind, MemoryOverview, Message, Mode, ModelSelection, Phenotype,
-    ProviderConfig, ProviderConnection, ProviderKind, ProviderRegistry, ResolvedModel, Role,
-    RunRecord, RunStatus, ScheduledTask, SearchConfig, SecretKind, Session, SessionWorkspace,
-    Skill, SkillInfo, SkillManifest, TaskKind,
+    MemoryFileInfo, MemoryFileKind, MemoryOverview, Message, Mode, ModelSelection, PermissionCell,
+    PermissionMatrixView, Phenotype, ProviderConfig, ProviderConnection, ProviderKind,
+    ProviderRegistry, ResolvedModel, Role, RunRecord, RunStatus, ScheduledTask, SearchConfig,
+    SecretKind, Session, SessionWorkspace, Skill, SkillInfo, SkillManifest, TaskKind,
 };
 use ff_scheduled::ScheduledApprover;
 use ff_signals::SkillAggregate;
@@ -149,6 +149,21 @@ impl TurnMetrics {
     }
 }
 
+/// The invocation-time gate for a resolved permission cell (#702): `Some(true)`
+/// auto-approves, `Some(false)` rejects, `None` means prompt the user (`Ask`).
+/// Takes the already-resolved cell — the caller applies per-tool overrides via
+/// [`PermissionMatrix::effective_cell`] (#742) first. Pure so the gating semantics
+/// are unit-testable without a Tauri `AppHandle` or a live model turn.
+fn matrix_gate(cell: PermissionCell) -> Option<bool> {
+    if cell.is_allow() {
+        Some(true)
+    } else if cell.is_deny() {
+        Some(false)
+    } else {
+        None
+    }
+}
+
 /// Routes write/dangerous tool calls through a UI confirmation. Read-only calls
 /// never reach this approver — the agent loop short-circuits them.
 /// Whether the active autonomy mode auto-approves a call of this safety without a
@@ -176,19 +191,17 @@ impl Approver for UiApprover {
             return true;
         }
 
-        // Permission matrix (#699): Allow → auto-approve, Ask → prompt below,
-        // Deny → should never reach here (hidden from the model by advertised_tools).
-        // ReadOnly also never reaches here (the agent loop short-circuits it).
+        // Permission matrix (#699/#702/#742): the per-tool override if set, else
+        // the mode×safety cell. Read live each call (`permission_matrix()`) so a
+        // Control-panel edit takes effect on the next tool invocation. ReadOnly
+        // never reaches here (the agent loop short-circuits it).
+        // `None` means Ask — fall through to the UI prompt below.
         let cell = self
             .state
-            .permission_matrix
+            .permission_matrix()
             .effective_cell(name, self.mode, safety);
-        if cell.is_allow() {
-            return true;
-        }
-        if cell.is_deny() {
-            // Defensive: a Deny tool should never have been callable; reject.
-            return false;
+        if let Some(decision) = matrix_gate(cell) {
+            return decision;
         }
 
         let approval_safety = match safety {
@@ -936,12 +949,17 @@ fn spawn_assistant_turn(state: Arc<AppState>, app: tauri::AppHandle, session_id:
         state.align_git_watcher(&session_root);
         // Snapshot built-in + MCP-bridged tools for this turn (RFC 0003 §6).
         let registry = state.build_tool_registry(&session_root);
+        // Snapshot the advertised-tools matrix for this turn (#702) so the model
+        // sees a stable tool list. The approval gate reads the matrix live (see
+        // `UiApprover::approve`), so Control-panel edits still take effect on the
+        // next tool call — only the advertised set is turn-bounded.
+        let permission_matrix = state.permission_matrix();
         let mut tool_ctx = ToolContext::new(
             &registry,
             &session_root,
             &approver,
             max_iterations,
-            &state.permission_matrix,
+            &permission_matrix,
         );
         tool_ctx.mode = mode;
         tool_ctx.abstractive = crate::state::abstractive_config_from_env();
@@ -1311,12 +1329,14 @@ impl ff_scheduled::TaskRunner for DesktopTaskRunner {
         self.state.align_git_watcher(&session_root);
         let registry = self.state.build_tool_registry(&session_root);
         let approver = ScheduledApprover::new(task.safety_ceiling);
+        // Snapshot the matrix for this turn (#702); see the interactive path above.
+        let permission_matrix = self.state.permission_matrix();
         let mut tool_ctx = ToolContext::new(
             &registry,
             &session_root,
             &approver,
             max_iterations,
-            &self.state.permission_matrix,
+            &permission_matrix,
         );
         tool_ctx.mode = mode;
         tool_ctx.abstractive = crate::state::abstractive_config_from_env();
@@ -2064,6 +2084,26 @@ fn set_default_mode(state: State<'_, Arc<AppState>>, mode: Mode) {
     state.set_default_mode(mode);
 }
 
+/// The Control-panel view of the permission matrix (#702, RFC 0019 §3): every
+/// Mode × Safety cell as a flat, self-describing list.
+#[tauri::command]
+fn get_permission_matrix(state: State<'_, Arc<AppState>>) -> PermissionMatrixView {
+    state.permission_matrix_view()
+}
+
+/// Edit and persist a single matrix cell (#702), returning the updated view. Takes
+/// effect on the next tool invocation: the approval gate reads the matrix live, and
+/// the advertised-tools gate picks it up on the next turn.
+#[tauri::command]
+fn set_permission_cell(
+    state: State<'_, Arc<AppState>>,
+    mode: Mode,
+    safety: Safety,
+    cell: PermissionCell,
+) -> PermissionMatrixView {
+    state.set_permission_cell(mode, safety, cell)
+}
+
 // ---- MCP server control (M4.4, RFC 0003 §3,5) ----
 //
 // Enable/disable/add/remove write `mcp.json` via `ff_mcp::config`; the existing config
@@ -2808,6 +2848,8 @@ pub fn run() {
             resolve_model_selection,
             get_default_mode,
             set_default_mode,
+            get_permission_matrix,
+            set_permission_cell,
             list_mcp_servers,
             restart_mcp_server,
             set_mcp_server_enabled,
@@ -2839,9 +2881,9 @@ pub fn run() {
 mod tests {
     use super::state::AppState;
     use super::{
-        git_branch, is_app_ready, list_local_branches, panic_message, publish_app_ready,
-        resolve_workspace_dir, should_warmup, switch_branch, BootFinalize, TurnMetrics,
-        UpdateStatus, APP_READY,
+        git_branch, is_app_ready, list_local_branches, matrix_gate, panic_message,
+        publish_app_ready, resolve_workspace_dir, should_warmup, switch_branch, BootFinalize,
+        TurnMetrics, UpdateStatus, APP_READY,
     };
     use ff_core::{Mode, ProviderKind};
     use ff_tools::Safety;
@@ -3024,6 +3066,55 @@ mod tests {
         // Plan: only ReadOnly allowed.
         assert_eq!(m.cell(Mode::Plan, Safety::ReadOnly), PermissionCell::Allow);
         assert_eq!(m.cell(Mode::Plan, Safety::Write), PermissionCell::Deny);
+    }
+
+    // Acceptance (#702): editing a matrix cell changes the invocation-time gate
+    // decision that `UiApprover::approve` applies to the next tool call. Exercises
+    // the same pure `matrix_gate` the approver calls, so no AppHandle / live model
+    // turn is required.
+    #[test]
+    fn edited_cell_flips_the_invocation_gate() {
+        use ff_core::{PermissionCell, PermissionMatrix};
+        let mut m = PermissionMatrix::default();
+        // Mirror `UiApprover::approve`: resolve the effective cell (per-tool
+        // override else the mode×safety cell, #742) then gate on it.
+        let gate = |m: &PermissionMatrix, tool: &str, mode: Mode, safety: Safety| {
+            matrix_gate(m.effective_cell(tool, mode, safety))
+        };
+
+        // Default: a Dangerous call in Act prompts the user (Ask → None).
+        assert_eq!(gate(&m, "bash", Mode::Act, Safety::Dangerous), None);
+        // A Sensitive call in Auto also prompts by default.
+        assert_eq!(gate(&m, "web_fetch", Mode::Auto, Safety::Sensitive), None);
+
+        // Deny the dangerous cell → the next invocation is rejected outright.
+        m.set_cell(Mode::Act, Safety::Dangerous, PermissionCell::Deny);
+        assert_eq!(gate(&m, "bash", Mode::Act, Safety::Dangerous), Some(false));
+
+        // Allow the sensitive cell → the next invocation auto-approves (no prompt).
+        m.set_cell(Mode::Auto, Safety::Sensitive, PermissionCell::Allow);
+        assert_eq!(
+            gate(&m, "web_fetch", Mode::Auto, Safety::Sensitive),
+            Some(true)
+        );
+
+        // A per-tool override (#742) wins over the matrix cell for that tool only.
+        m.set_override("web_fetch", PermissionCell::Deny);
+        assert_eq!(
+            gate(&m, "web_fetch", Mode::Auto, Safety::Sensitive),
+            Some(false)
+        );
+        assert_eq!(
+            gate(&m, "web_search", Mode::Auto, Safety::Sensitive),
+            Some(true)
+        );
+
+        // Untouched cells keep their default decision.
+        assert_eq!(gate(&m, "read_file", Mode::Act, Safety::Write), Some(true));
+        assert_eq!(
+            gate(&m, "write_file", Mode::Plan, Safety::Write),
+            Some(false)
+        );
     }
 
     #[test]
