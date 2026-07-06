@@ -468,8 +468,6 @@ export const useChatStore = create<ChatState>((set, get) => ({
         activeSessionId: nextActive,
       };
     });
-    clearCache(sessionId);
-
     try {
       await ipc.deleteSession(sessionId);
     } catch {
@@ -482,6 +480,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       });
       return false;
     }
+    clearCache(sessionId);
 
     // Drop any lingering sidebar prefs (pin / dismiss) for the gone session.
     const { useSessionPrefsStore } = await import("@/store/session-prefs");

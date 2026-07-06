@@ -43,6 +43,7 @@ describe("chat store — deleteSession (#168)", () => {
 
   it("removes a non-active session and keeps the active one", async () => {
     seed([session("a"), session("b")], "a");
+    localStorage.setItem("ff-msg-cache:b", "[]");
     const spy = vi.spyOn(ipc, "deleteSession").mockResolvedValue();
 
     const ok = await useChatStore.getState().deleteSession("b");
@@ -52,6 +53,7 @@ describe("chat store — deleteSession (#168)", () => {
     expect(useChatStore.getState().sessions.map((s) => s.id)).toEqual(["a"]);
     expect(useChatStore.getState().activeSessionId).toBe("a");
     expect(useChatStore.getState().messagesBySession.b).toBeUndefined();
+    expect(localStorage.getItem("ff-msg-cache:b")).toBeNull();
   });
 
   it("reassigns the active session when the active one is deleted", async () => {
@@ -66,6 +68,7 @@ describe("chat store — deleteSession (#168)", () => {
 
   it("rolls back when the backend rejects", async () => {
     seed([session("a"), session("b")], "a");
+    localStorage.setItem("ff-msg-cache:b", "[]");
     vi.spyOn(ipc, "deleteSession").mockRejectedValue(new Error("io"));
 
     const ok = await useChatStore.getState().deleteSession("b");
@@ -76,6 +79,7 @@ describe("chat store — deleteSession (#168)", () => {
       "b",
     ]);
     expect(useChatStore.getState().activeSessionId).toBe("a");
+    expect(localStorage.getItem("ff-msg-cache:b")).toBe("[]");
   });
 
   it("is a no-op (false) for an unknown id and never calls the backend", async () => {
