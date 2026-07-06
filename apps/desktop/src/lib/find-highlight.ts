@@ -8,6 +8,8 @@
 // Occurrences inside collapsed sub-blocks aren't in the DOM yet — auto-expanding
 // those is a tracked follow-up.
 
+import { isWordChar, tokenizeQuery } from "@/lib/find-tokens";
+
 const ALL = "ff-find";
 const ACTIVE = "ff-find-active";
 
@@ -22,21 +24,19 @@ export function supportsHighlightApi(): boolean {
 }
 
 /**
- * Collect one Range per case-insensitive occurrence of `query` inside the
- * elements in `messageIds`, in document order. Elements are looked up by
- * `data-message-id` within `root` (the pane's content subtree) so highlights
- * never leak across split panes.
+ * Collect one Range per whole-token occurrence of `query` inside the elements in
+ * `messageIds`, in document order. Elements are looked up by `data-message-id`
+ * within `root` (the pane's content subtree) so highlights never leak across
+ * split panes.
  *
- * NOTE — two different match models (PR #739 review): `messageIds` is the
- * authoritative set from `searchInSession`, an FTS5 *tokenized* query (whole/
- * prefix tokens, any order/distance). This scan, by contrast, highlights a
- * *literal case-insensitive substring* of the whole query. So a multi-word
- * query can mark a message as matching (all tokens present) while this finds no
- * literal substring → the message is counted but has nothing to highlight/step
- * to; and an FTS token hit (`run`) won't highlight it inside a larger word
- * (`overrun`). Benign for the common single-word find, and "n of m" counts DOM
- * occurrences so the number stays self-consistent. Reconciling the two (e.g.
- * per-token DOM highlighting) is a tracked follow-up.
+ * Token-aware (#748): `messageIds` is the authoritative set from
+ * `searchInSession`, an FTS5 *tokenized* query — an AND of whole tokens, any
+ * order/distance, case-insensitive, no prefix. This scan mirrors that: it splits
+ * the query into tokens (`tokenizeQuery`) and highlights each token only at word
+ * boundaries. So a multi-word query like `run turn` highlights both tokens
+ * wherever they appear, and a token like `run` is *not* highlighted inside a
+ * larger word (`overrun`) — highlights and the "n of m" count stay aligned with
+ * the match set. (Deviations from FTS are documented in `find-tokens.ts`.)
  */
 export function collectOccurrences(
   root: HTMLElement,
@@ -44,8 +44,8 @@ export function collectOccurrences(
   query: string,
 ): Range[] {
   const ranges: Range[] = [];
-  if (!query) return ranges;
-  const needle = query.toLowerCase();
+  const tokens = tokenizeQuery(query);
+  if (tokens.length === 0) return ranges;
 
   // Preserve on-screen (document) order across messages for sane next/prev.
   const rows = Array.from(
@@ -58,15 +58,26 @@ export function collectOccurrences(
     while (node) {
       const text = node.nodeValue ?? "";
       const hay = text.toLowerCase();
-      let from = 0;
-      let at = hay.indexOf(needle, from);
-      while (at !== -1) {
+      // Gather every token's whole-word hits in this node, then order them by
+      // offset so multiple tokens in one node still step in document order.
+      const hits: { at: number; len: number }[] = [];
+      for (const token of tokens) {
+        let at = hay.indexOf(token, 0);
+        while (at !== -1) {
+          const end = at + token.length;
+          // Whole token only: neither neighbour may be a token character.
+          if (!isWordChar(hay[at - 1]) && !isWordChar(hay[end])) {
+            hits.push({ at, len: token.length });
+          }
+          at = hay.indexOf(token, at + token.length);
+        }
+      }
+      hits.sort((a, b) => a.at - b.at);
+      for (const { at, len } of hits) {
         const range = document.createRange();
         range.setStart(node, at);
-        range.setEnd(node, at + needle.length);
+        range.setEnd(node, at + len);
         ranges.push(range);
-        from = at + needle.length;
-        at = hay.indexOf(needle, from);
       }
       node = walker.nextNode();
     }
