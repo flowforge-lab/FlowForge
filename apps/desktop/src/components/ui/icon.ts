@@ -82,6 +82,7 @@ export {
   Sun,
   TextCursorInput,
   Trash2,
+  Upload,
   Users,
   WrapText,
   X,

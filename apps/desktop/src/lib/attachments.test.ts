@@ -1,7 +1,12 @@
 // @vitest-environment jsdom
 
 import { describe, expect, it } from "vitest";
-import { attachmentKindFor, fileToAttachment } from "./attachments";
+import {
+  attachmentKindFor,
+  classifyForStaging,
+  describeRejections,
+  fileToAttachment,
+} from "./attachments";
 
 function file(name: string, type: string): File {
   return new File(["x"], name, { type });
@@ -59,5 +64,87 @@ describe("fileToAttachment derives kind (#504)", () => {
     await expect(
       fileToAttachment(file("a.bin", "application/octet-stream")),
     ).rejects.toThrow(/unsupported attachment type/);
+  });
+});
+
+describe("classifyForStaging (#723)", () => {
+  const open = { visionGated: false, docGated: false };
+
+  it("returns the kind when the model accepts it", () => {
+    expect(classifyForStaging(file("a.png", "image/png"), open)).toBe("image");
+    expect(classifyForStaging(file("r.pdf", "application/pdf"), open)).toBe(
+      "document",
+    );
+  });
+
+  it("flags unsupported types", () => {
+    expect(classifyForStaging(file("clip.mp4", "video/mp4"), open)).toBe(
+      "unsupported",
+    );
+  });
+
+  it("flags a recognized kind the model can't accept", () => {
+    expect(
+      classifyForStaging(file("a.png", "image/png"), {
+        visionGated: true,
+        docGated: false,
+      }),
+    ).toBe("vision-gated");
+    expect(
+      classifyForStaging(file("r.pdf", "application/pdf"), {
+        visionGated: false,
+        docGated: true,
+      }),
+    ).toBe("doc-gated");
+  });
+
+  it("stages a document the model accepts (kind is not a rejection)", () => {
+    expect(
+      classifyForStaging(file("r.pdf", "application/pdf"), {
+        visionGated: true,
+        docGated: false,
+      }),
+    ).toBe("document");
+  });
+});
+
+describe("describeRejections (#723)", () => {
+  it("is null when nothing was rejected", () => {
+    expect(describeRejections([])).toBeNull();
+  });
+
+  it("counts and pluralizes unsupported files", () => {
+    expect(describeRejections(["unsupported"])).toBe(
+      "Skipped 1 file: unsupported type",
+    );
+    expect(describeRejections(["unsupported", "unsupported"])).toBe(
+      "Skipped 2 files: unsupported type",
+    );
+  });
+
+  it("states the capability reason for gated kinds", () => {
+    expect(describeRejections(["vision-gated"])).toBe(
+      "This model can't accept images",
+    );
+    expect(describeRejections(["doc-gated"])).toBe(
+      "This model can't accept documents",
+    );
+  });
+
+  it("combines mixed reasons into one notice", () => {
+    expect(describeRejections(["vision-gated", "unsupported"])).toBe(
+      "This model can't accept images; skipped 1 file: unsupported type",
+    );
+  });
+
+  it("collapses both gated kinds so 'this model' doesn't repeat", () => {
+    expect(describeRejections(["vision-gated", "doc-gated"])).toBe(
+      "This model can't accept images or documents",
+    );
+    expect(
+      describeRejections(["doc-gated", "vision-gated", "unsupported"]),
+    ).toBe(
+      "This model can't accept images or documents; skipped 1 file: unsupported type",
+    );
   });
 });

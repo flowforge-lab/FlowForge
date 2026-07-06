@@ -1,5 +1,12 @@
-import { useRef } from "react";
-import { Columns2, Rows2, Search, X } from "@/components/ui/icon";
+import { useRef, useState } from "react";
+import {
+  Columns2,
+  EyeOff,
+  Rows2,
+  Search,
+  Upload,
+  X,
+} from "@/components/ui/icon";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { ChatView } from "@/components/chat-view";
@@ -8,6 +15,8 @@ import { FindBar } from "@/components/find-bar";
 import { GoalStatusPanel } from "@/components/goal-status-panel";
 import { InputBar } from "@/components/input-bar";
 import { PhenoSelector } from "@/components/pheno-selector";
+import { useAttachGate } from "@/lib/attach-gate";
+import { stageFiles } from "@/lib/stage-files";
 import { useChatStore } from "@/store/chat";
 import { useFindStore } from "@/store/find";
 import { usePanesStore, MAX_PANES } from "@/store/panes";
@@ -44,6 +53,39 @@ export function SessionPane({
     const session = s.sessions.find((x) => x.id === sessionId);
     return session?.title || "New session";
   });
+
+  // Region-wide attachment drag-and-drop (#723). The whole pane content is the
+  // drop target — dropping anywhere here stages to THIS pane's composer, so split
+  // view resolves ownership by which pane the cursor is over (no global target).
+  // The gate is shared with the input bar; when it forbids all attachments the
+  // overlay shows a disabled state and nothing stages.
+  const gate = useAttachGate(sessionId);
+  const [dragOver, setDragOver] = useState(false);
+
+  // Only react to file drags, never text/element drags within the transcript.
+  const isFileDrag = (e: React.DragEvent) =>
+    Array.from(e.dataTransfer?.types ?? []).includes("Files");
+
+  const handleDragOver = (e: React.DragEvent) => {
+    if (!isFileDrag(e)) return;
+    e.preventDefault();
+    setDragOver(true);
+  };
+
+  const handleDragLeave = (e: React.DragEvent) => {
+    // Only clear when leaving the pane entirely, not when crossing a child.
+    if (!e.currentTarget.contains(e.relatedTarget as Node)) setDragOver(false);
+  };
+
+  const handleDrop = (e: React.DragEvent) => {
+    if (!isFileDrag(e)) return;
+    e.preventDefault();
+    setDragOver(false);
+    if (!focused) focusPane(paneId);
+    // stageFiles gates per file, so a fully-gated model simply stages nothing and
+    // surfaces the reason — the overlay's disabled state already signalled it.
+    stageFiles(sessionId, Array.from(e.dataTransfer.files), gate);
+  };
 
   return (
     <div
@@ -113,10 +155,54 @@ export function SessionPane({
       {/* Goal status panel (#717): self-hides unless this session has a goal. */}
       <GoalStatusPanel sessionId={sessionId} />
 
-      <div ref={contentRef} className="relative flex min-h-0 flex-1 flex-col">
+      <div
+        ref={contentRef}
+        data-testid="pane-dropzone"
+        className="relative flex min-h-0 flex-1 flex-col"
+        onDragOver={handleDragOver}
+        onDragLeave={handleDragLeave}
+        onDrop={handleDrop}
+      >
         {findOpen && <FindBar sessionId={sessionId} rootRef={contentRef} />}
         <ChatView sessionId={sessionId} />
         <InputBar sessionId={sessionId} focused={focused} />
+        {dragOver && <DropOverlay gated={gate.attachGated} />}
+      </div>
+    </div>
+  );
+}
+
+// The drag affordance shown while a file is dragged over the pane (#723).
+// `pointer-events-none` so drag events keep hitting the container underneath
+// (the drop target), not the overlay. Disabled variant when the model can't
+// accept any attachment kind.
+function DropOverlay({ gated }: { gated: boolean }) {
+  return (
+    <div
+      data-testid="drop-overlay"
+      className={cn(
+        "pointer-events-none absolute inset-0 z-30 flex items-center justify-center rounded-lg border-2 border-dashed backdrop-blur-sm",
+        gated
+          ? "border-muted-foreground/40 bg-muted/40"
+          : "border-primary bg-primary/10",
+      )}
+    >
+      <div className="flex flex-col items-center gap-2 text-center">
+        {gated ? (
+          <>
+            <EyeOff className="size-6 text-muted-foreground" />
+            <p className="max-w-56 text-sm font-medium text-muted-foreground">
+              This model can&apos;t accept attachments
+            </p>
+          </>
+        ) : (
+          <>
+            <Upload className="size-6 text-primary" />
+            <p className="text-sm font-medium text-foreground">
+              Drop files to attach
+            </p>
+          </>
+        )}
       </div>
     </div>
   );

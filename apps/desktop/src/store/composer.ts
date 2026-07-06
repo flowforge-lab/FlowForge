@@ -9,9 +9,15 @@
 
 import { create } from "zustand";
 
+import type { Attachment } from "@/bindings";
+
 interface ComposerState {
   /** Current composer text per session — the input bar reads this as its value. */
   textBySession: Record<string, string>;
+  /** Staged attachments per session (#723). Lifted out of the input bar's local
+   *  state so a region-wide, pane-level drop (session-pane.tsx) can stage into the
+   *  right composer; the input bar renders the chips and clears them on submit. */
+  attachmentsBySession: Record<string, Attachment[]>;
   /** Incremented on each prefill so a refocus fires even for identical text. */
   focusNonceBySession: Record<string, number>;
   /** Incremented when a prefill is refused so it didn't clobber a draft (#48),
@@ -22,6 +28,12 @@ interface ComposerState {
    *  and routes submit to `editMessage` instead of `send`. */
   editingBySession: Record<string, string | undefined>;
   setText: (sessionId: string, text: string) => void;
+  /** Append a staged attachment for a session (drop / paste / pick). */
+  stageAttachment: (sessionId: string, attachment: Attachment) => void;
+  /** Remove one staged attachment by index (chip ✕). */
+  removeAttachment: (sessionId: string, index: number) => void;
+  /** Drop all staged attachments for a session (on submit). */
+  clearAttachments: (sessionId: string) => void;
   /** Load `text` into a session's composer and request focus (edit & resend). */
   prefill: (sessionId: string, text: string) => void;
   /** Enter in-place edit mode for `messageId` (#463): bind the session to it and
@@ -35,12 +47,33 @@ interface ComposerState {
 
 export const useComposerStore = create<ComposerState>((set, get) => ({
   textBySession: {},
+  attachmentsBySession: {},
   focusNonceBySession: {},
   rejectNonceBySession: {},
   editingBySession: {},
   setText: (sessionId, text) =>
     set((s) => ({
       textBySession: { ...s.textBySession, [sessionId]: text },
+    })),
+  stageAttachment: (sessionId, attachment) =>
+    set((s) => ({
+      attachmentsBySession: {
+        ...s.attachmentsBySession,
+        [sessionId]: [...(s.attachmentsBySession[sessionId] ?? []), attachment],
+      },
+    })),
+  removeAttachment: (sessionId, index) =>
+    set((s) => ({
+      attachmentsBySession: {
+        ...s.attachmentsBySession,
+        [sessionId]: (s.attachmentsBySession[sessionId] ?? []).filter(
+          (_, i) => i !== index,
+        ),
+      },
+    })),
+  clearAttachments: (sessionId) =>
+    set((s) => ({
+      attachmentsBySession: { ...s.attachmentsBySession, [sessionId]: [] },
     })),
   prefill: (sessionId, text) => {
     // Don't silently clobber an in-progress draft (#48). If the composer already

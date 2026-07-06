@@ -29,7 +29,8 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import type { Attachment } from "@/bindings";
-import { attachmentKindFor, fileToAttachment } from "@/lib/attachments";
+import { useAttachGate } from "@/lib/attach-gate";
+import { stageFiles } from "@/lib/stage-files";
 import { cn } from "@/lib/utils";
 import {
   useModelConfigStore,
@@ -43,7 +44,6 @@ import { useComposerStore } from "@/store/composer";
 import { usePrefsStore } from "@/store/prefs";
 import { useSessionWorkspaceStore } from "@/store/session-workspace";
 import { useSessionModeStore, MODE_ORDER } from "@/store/session-mode";
-import { useSessionModelStore } from "@/store/session-model";
 import { MODE_META } from "@/lib/mode";
 
 // A local model server (candle-vllm, Ollama, …) goes cold when idle, so the first
@@ -62,6 +62,10 @@ const WARMUP_THROTTLE_MS = 5_000;
 // keystroke nudges are wasted work. Throttle hard so typing does not re-fire; the
 // occasional focus nudge is enough insurance against eviction (#61).
 const WARMUP_THROTTLE_RESIDENT_MS = 300_000;
+
+// Stable empty default for the staged-attachments selector: a fresh `[]` per
+// render would fail zustand's Object.is check and re-render forever.
+const EMPTY_ATTACHMENTS: Attachment[] = [];
 
 // `sessionId` scopes the composer to one session so split panes (#148) each keep
 // an independent draft and Stop/send target their own session. Defaults to the
@@ -106,6 +110,16 @@ export function InputBar({
     targetSessionId ? s.editingBySession[targetSessionId] : undefined,
   );
   const cancelEdit = useComposerStore((s) => s.cancelEdit);
+  // Staged attachments live in the per-session composer store (#723) so a region-
+  // wide, pane-level drop (session-pane.tsx) stages into the same list the input
+  // bar renders and clears on submit. Default OUTSIDE the selector — returning a
+  // fresh `[]` from the selector would fail Object.is every render and loop.
+  const stagedAttachments = useComposerStore((s) =>
+    targetSessionId ? s.attachmentsBySession[targetSessionId] : undefined,
+  );
+  const attachments = stagedAttachments ?? EMPTY_ATTACHMENTS;
+  const removeAttachment = useComposerStore((s) => s.removeAttachment);
+  const clearAttachments = useComposerStore((s) => s.clearAttachments);
   const setText = useCallback(
     (text: string) => {
       if (targetSessionId) setTextFor(targetSessionId, text);
@@ -131,46 +145,13 @@ export function InputBar({
   const editMessage = useChatStore((s) => s.editMessage);
   const cancelTurn = useChatStore((s) => s.cancelTurn);
   const sendMessageKey = usePrefsStore((s) => s.sendMessageKey);
-  const [attachments, setAttachments] = useState<Attachment[]>([]);
-  const [dragOver, setDragOver] = useState(false);
 
-  // Capability gates (#342/#504, RFC 0005 §11.3): the resolved model for THIS pane
-  // may accept images, documents, both, or neither. Caps are derived backend-side
-  // from the resolved `(kind, model)` and carried on `ResolvedModel` (the model chip
-  // loads it per session), so a per-session model override gates the composer by the
-  // model it actually runs — not the global active connection. Fail OPEN when unknown
-  // (not loaded yet / no session) so the composer is never falsely blocked. Vision
-  // and documents gate independently.
-  const resolved = useSessionModelStore((s) =>
-    targetSessionId ? s.resolvedBySession[targetSessionId] : undefined,
-  );
-  const supportsVision = resolved?.supportsVision;
-  const supportsDocuments = resolved?.supportsDocuments;
-  const visionGated = supportsVision === false;
-  const docGated = supportsDocuments === false;
-  // The attach button is only fully disabled when neither kind is allowed.
-  const attachGated = visionGated && docGated;
-  // Capability-aware affordance copy: name only the kinds the model can take.
-  const attachLabel =
-    !visionGated && !docGated
-      ? "Attach image or document"
-      : visionGated
-        ? "Attach document"
-        : "Attach image";
-
-  // Stage a file only if its kind is one the active model accepts (#504): images
-  // need vision, documents need document support. Unsupported file types are
-  // dropped. Mirrors the backend `messages_for_wire` strip so the composer never
-  // stages something the provider would silently discard.
-  const canStage = useCallback(
-    (file: File) => {
-      const kind = attachmentKindFor(file);
-      if (kind === "image") return !visionGated;
-      if (kind === "document") return !docGated;
-      return false;
-    },
-    [visionGated, docGated],
-  );
+  // Capability gate (#342/#504, RFC 0005 §11.3) — shared with the pane's drop
+  // overlay so both derive it identically (see lib/attach-gate.ts). The resolved
+  // model for THIS pane may accept images, documents, both, or neither; the gate
+  // fails OPEN when unknown so the composer is never falsely blocked.
+  const { visionGated, docGated, attachGated, attachLabel } =
+    useAttachGate(targetSessionId);
 
   // Resolved mode for this pane's session — drives the Plan-aware placeholder
   // (#267, RFC 0011 §8). Switching modes is done via the pill dropdown (#344).
@@ -186,67 +167,32 @@ export function InputBar({
   }, []);
 
   // --- Attach affordances (#339) ---
+  //
+  // Paste and the file picker funnel through the shared `stageFiles` path (#723)
+  // so the capability gate and rejection feedback match the pane's region drop.
+  // Region drag-and-drop itself is owned by the pane (session-pane.tsx), whose
+  // overlay covers the whole content area — not just this composer card.
 
   const handlePaste = useCallback(
     (e: React.ClipboardEvent<HTMLTextAreaElement>) => {
-      // Attach-gated (#342/#504): let the paste fall through as text; stage nothing.
-      if (attachGated) return;
-      const items = Array.from(e.clipboardData.items);
-      for (const item of items) {
-        if (item.kind !== "file") continue;
-        const file = item.getAsFile();
-        if (!file || !canStage(file)) continue;
-        e.preventDefault();
-        fileToAttachment(file).then((att) =>
-          setAttachments((prev) => [...prev, att]),
-        );
-      }
-    },
-    [attachGated, canStage],
-  );
-
-  const handleDragOver = useCallback(
-    (e: React.DragEvent) => {
-      if (attachGated) return;
+      if (!targetSessionId) return;
+      const files = Array.from(e.clipboardData.items)
+        .filter((item) => item.kind === "file")
+        .map((item) => item.getAsFile())
+        .filter((f): f is File => f !== null);
+      if (files.length === 0) return;
+      // A file paste is an attachment, not text: swallow it and stage (gated
+      // files fall through to a reason toast rather than pasting as text).
       e.preventDefault();
-      e.stopPropagation();
-      setDragOver(true);
+      stageFiles(targetSessionId, files, { visionGated, docGated });
     },
-    [attachGated],
-  );
-
-  const handleDragLeave = useCallback((e: React.DragEvent) => {
-    e.preventDefault();
-    e.stopPropagation();
-    // Only clear when leaving the container entirely, not when crossing a child.
-    if (!e.currentTarget.contains(e.relatedTarget as Node)) setDragOver(false);
-  }, []);
-
-  const handleDrop = useCallback(
-    (e: React.DragEvent) => {
-      e.preventDefault();
-      e.stopPropagation();
-      setDragOver(false);
-      if (attachGated) return;
-      const files = Array.from(e.dataTransfer.files);
-      for (const file of files) {
-        if (!canStage(file)) continue;
-        fileToAttachment(file).then((att) =>
-          setAttachments((prev) => [...prev, att]),
-        );
-      }
-    },
-    [attachGated, canStage],
+    [targetSessionId, visionGated, docGated],
   );
 
   function handleFilePick(e: React.ChangeEvent<HTMLInputElement>) {
     const files = e.target.files;
-    if (!files || attachGated) return;
-    for (const file of Array.from(files)) {
-      if (!canStage(file)) continue;
-      fileToAttachment(file).then((att) =>
-        setAttachments((prev) => [...prev, att]),
-      );
+    if (files && targetSessionId) {
+      stageFiles(targetSessionId, Array.from(files), { visionGated, docGated });
     }
     // Reset so the same file can be re-selected.
     e.target.value = "";
@@ -323,7 +269,7 @@ export function InputBar({
     )
       return;
     const attach = attachments;
-    setAttachments([]);
+    clearAttachments(targetSessionId);
     // Collapse the box back to one line (it may have grown for a resend draft).
     if (textareaRef.current) textareaRef.current.style.height = "auto";
     if (editingMessageId) {
@@ -344,13 +290,7 @@ export function InputBar({
             workspace + branch live in a separate bar below (#606). */}
         <div
           ref={boxRef}
-          className={cn(
-            "rounded-xl border bg-card p-1.5 shadow-sm transition-all focus-within:border-ring focus-within:shadow-md focus-within:ring-2 focus-within:ring-ring/25",
-            dragOver && "border-primary ring-2 ring-primary/30",
-          )}
-          onDragOver={handleDragOver}
-          onDragLeave={handleDragLeave}
-          onDrop={handleDrop}
+          className="rounded-xl border bg-card p-1.5 shadow-sm transition-all focus-within:border-ring focus-within:shadow-md focus-within:ring-2 focus-within:ring-ring/25"
         >
           {/* In-place edit banner (#463): submitting replaces the original message
               and re-runs from it; Cancel/Escape exits without mutating history. */}
@@ -415,12 +355,10 @@ export function InputBar({
 
           {/* Staged attachments (#340): one removable chip/thumbnail per file,
               between the textarea and the toolbar so it reads as part of the draft. */}
-          {attachments.length > 0 ? (
+          {attachments.length > 0 && targetSessionId ? (
             <AttachmentChips
               attachments={attachments}
-              onRemove={(idx) =>
-                setAttachments((prev) => prev.filter((_, i) => i !== idx))
-              }
+              onRemove={(idx) => removeAttachment(targetSessionId, idx)}
             />
           ) : null}
 

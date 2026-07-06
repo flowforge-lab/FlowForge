@@ -7,6 +7,7 @@ import { ipc } from "@/lib/ipc";
 import { useChatStore } from "@/store/chat";
 import { useComposerStore } from "@/store/composer";
 import { useSessionModelStore } from "@/store/session-model";
+import { useAttachRejectToastStore } from "@/store/attach-reject-toast";
 import type { ResolvedModel } from "@/bindings";
 
 const SID = "s1";
@@ -33,9 +34,11 @@ function seed(supportsVision: boolean, supportsDocuments = false) {
   });
   useComposerStore.setState({
     textBySession: {},
+    attachmentsBySession: {},
     focusNonceBySession: {},
     rejectNonceBySession: {},
   });
+  useAttachRejectToastStore.setState({ toasts: [] });
   useChatStore.setState({
     activeSessionId: SID,
     messagesBySession: {},
@@ -121,5 +124,43 @@ describe("InputBar attach capability gate (#342/#504)", () => {
     expect(
       screen.queryByRole("button", { name: /remove attachment/i }),
     ).toBeNull();
+  });
+
+  it("enqueues a reason-stating reject toast for a gated pick (#723)", () => {
+    seed(/* vision */ false, /* documents */ true);
+    const { container } = render(<InputBar sessionId={SID} />);
+
+    const input = container.querySelector(
+      'input[type="file"]',
+    ) as HTMLInputElement;
+    fireEvent.change(input, {
+      target: { files: [new File(["x"], "a.png", { type: "image/png" })] },
+    });
+
+    const toasts = useAttachRejectToastStore.getState().toasts;
+    expect(toasts).toHaveLength(1);
+    expect(toasts[0].message).toBe("This model can't accept images");
+  });
+
+  it("renders chips from the composer store (#723)", () => {
+    seed(/* vision */ true, /* documents */ true);
+    useComposerStore.setState({
+      attachmentsBySession: {
+        [SID]: [
+          {
+            kind: "document",
+            mediaType: "application/pdf",
+            source: { type: "inline", value: "eA==" },
+            name: "notes.pdf",
+            bytes: 3,
+          },
+        ],
+      },
+    });
+    render(<InputBar sessionId={SID} />);
+
+    expect(
+      screen.getByRole("button", { name: /remove attachment/i }),
+    ).toBeTruthy();
   });
 });
