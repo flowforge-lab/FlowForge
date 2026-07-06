@@ -389,7 +389,12 @@ export function ChatView({ sessionId }: { sessionId?: string } = {}) {
     setAtBottom(true);
   }
 
-  if (!messages || messages.length === 0) {
+  // Distinguish "not loaded yet" from "genuinely empty session" (#785):
+  // messagesBySession[id] is undefined until loadSession() completes, and []
+  // once it resolves (even for a fresh draft). Showing the empty-state prompt
+  // during the load window causes a ~0.5s flash on cold start (#599 regression).
+  if (messages === undefined) return null;
+  if (messages.length === 0) {
     return (
       <div className="flex flex-1 flex-col items-center justify-center gap-1.5">
         <p className="text-base font-medium text-foreground/80">
