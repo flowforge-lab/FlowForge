@@ -655,6 +655,49 @@ impl ProviderRegistry {
     /// never writes (a contract the load tests assert). Idempotent: a registry
     /// already at [`REGISTRY_SCHEMA_VERSION`] is left untouched, so a user who
     /// re-enables thinking after the migration is never re-flipped.
+    /// Parse a persisted registry, salvaging what we can rather than failing closed.
+    ///
+    /// A strict parse is tried first. If that fails (e.g. one connection carries a
+    /// field this build cannot deserialize, or a future variant was added), we fall
+    /// back to a per-connection salvage: parse the top level loosely, keep every
+    /// `connections[]` entry that still deserializes into a [`ProviderConnection`],
+    /// and preserve `active` (or the first surviving connection if the recorded
+    /// active id no longer resolves). Returns `None` only when *nothing* is
+    /// salvageable — the sole case where the caller falls back to the factory
+    /// default. This is what stops a single bad/forward-incompatible field from
+    /// wiping every configured connection back to the built-in Candle default.
+    pub fn parse_lenient(raw: &str) -> Option<Self> {
+        if let Ok(registry) = serde_json::from_str::<Self>(raw) {
+            return Some(registry);
+        }
+        let value: serde_json::Value = serde_json::from_str(raw).ok()?;
+        let connections: Vec<ProviderConnection> = value
+            .get("connections")?
+            .as_array()?
+            .iter()
+            .filter_map(|c| serde_json::from_value::<ProviderConnection>(c.clone()).ok())
+            .collect();
+        if connections.is_empty() {
+            return None;
+        }
+        let recorded_active = value
+            .get("active")
+            .and_then(|a| a.as_str())
+            .map(str::to_string);
+        let active = recorded_active
+            .filter(|id| connections.iter().any(|c| &c.id == id))
+            .unwrap_or_else(|| connections[0].id.clone());
+        let schema_version = value
+            .get("schemaVersion")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0) as u32;
+        Some(Self {
+            connections,
+            active,
+            schema_version,
+        })
+    }
+
     pub fn migrate(&mut self) {
         if self.schema_version < 1 {
             // #633: local reasoning defaults off. Flip existing local connections
@@ -895,6 +938,95 @@ mod tests {
             .connections
             .iter()
             .any(|c| c.kind == ProviderKind::Ollama));
+    }
+
+    // A frozen corpus of historically-persisted `provider-registry.json` shapes.
+    // Every one MUST strict-parse forever and keep its own `active` (never fall
+    // back to the Candle default). Adding a required field without `#[serde(default)]`
+    // breaks this test loudly at CI time -- the signal to add the default rather
+    // than silently reintroduce the wipe (#811).
+    const HISTORICAL_REGISTRIES: &[(&str, &str)] = &[
+        // Pre-versioning minimal shape: only the required fields, no schemaVersion.
+        (
+            "pre-versioning minimal Bedrock",
+            r#"{"connections":[{"id":"bedrock-opus","kind":"bedrock","displayName":"AWS Bedrock","model":"global.anthropic.claude-opus-4-8","hasKey":false}],"active":"bedrock-opus"}"#,
+        ),
+        // Fuller Bedrock shape with profile auth + region (the config that broke
+        // under an older build, sanitized).
+        (
+            "Bedrock with profile auth + region",
+            r#"{"schemaVersion":1,"active":"bedrock-opus","connections":[{"id":"bedrock-opus","kind":"bedrock","displayName":"AWS Bedrock","model":"global.anthropic.claude-opus-4-8","hasKey":false,"thinking":true,"region":"us-east-2","authMode":"profile","awsProfile":"bedrock-profile"}]}"#,
+        ),
+    ];
+
+    #[test]
+    fn historical_registry_shapes_still_strict_parse() {
+        for (label, raw) in HISTORICAL_REGISTRIES {
+            let reg: ProviderRegistry = serde_json::from_str(raw)
+                .unwrap_or_else(|e| panic!("{label} must still strict-parse: {e}"));
+            assert_eq!(
+                reg.active, "bedrock-opus",
+                "{label}: active must be preserved, not reset to the Candle default"
+            );
+            assert_eq!(reg.connections[0].kind, ProviderKind::Bedrock, "{label}");
+        }
+    }
+
+    #[test]
+    fn parse_lenient_accepts_valid_registry() {
+        for (label, raw) in HISTORICAL_REGISTRIES {
+            let reg = ProviderRegistry::parse_lenient(raw)
+                .unwrap_or_else(|| panic!("{label}: lenient parse should accept a valid registry"));
+            assert_eq!(reg.active, "bedrock-opus", "{label}");
+        }
+    }
+
+    #[test]
+    fn parse_lenient_salvages_good_connection_beside_bad() {
+        // Two connections; the first carries an unknown `kind` this build cannot
+        // deserialize. The good one survives, and the recorded active (the bad one)
+        // falls back to the surviving connection rather than wiping to default.
+        let raw = r#"{"active":"future-gemini","connections":[
+            {"id":"future-gemini","kind":"gemini","displayName":"Gemini","model":"g","hasKey":true},
+            {"id":"bedrock-opus","kind":"bedrock","displayName":"AWS Bedrock","model":"global.anthropic.claude-opus-4-8","hasKey":false}
+        ]}"#;
+        let reg =
+            ProviderRegistry::parse_lenient(raw).expect("one good connection must be salvaged");
+        assert_eq!(reg.connections.len(), 1);
+        assert_eq!(reg.connections[0].id, "bedrock-opus");
+        assert_eq!(
+            reg.active, "bedrock-opus",
+            "active must fall back to a surviving connection, not the Candle default"
+        );
+    }
+
+    #[test]
+    fn parse_lenient_preserves_recorded_active_when_it_survives() {
+        let raw = r#"{"active":"bedrock-opus","connections":[
+            {"id":"future-gemini","kind":"gemini","displayName":"Gemini","model":"g","hasKey":true},
+            {"id":"bedrock-opus","kind":"bedrock","displayName":"AWS Bedrock","model":"m","hasKey":false}
+        ]}"#;
+        let reg = ProviderRegistry::parse_lenient(raw).expect("salvage");
+        assert_eq!(reg.active, "bedrock-opus");
+    }
+
+    #[test]
+    fn parse_lenient_returns_none_when_nothing_salvageable() {
+        let raw = r#"{"active":"x","connections":[
+            {"id":"a","kind":"gemini","displayName":"A","model":"m","hasKey":false},
+            {"id":"b","kind":"mistral","displayName":"B","model":"m","hasKey":false}
+        ]}"#;
+        assert!(
+            ProviderRegistry::parse_lenient(raw).is_none(),
+            "no salvageable connection must yield None so the caller quarantines + defaults"
+        );
+    }
+
+    #[test]
+    fn parse_lenient_returns_none_on_garbage() {
+        assert!(ProviderRegistry::parse_lenient("not json at all").is_none());
+        assert!(ProviderRegistry::parse_lenient("[]").is_none());
+        assert!(ProviderRegistry::parse_lenient("{}").is_none());
     }
 
     fn blank_conn(display: &str, vendor: Option<&str>, kind: ProviderKind) -> ProviderConnection {

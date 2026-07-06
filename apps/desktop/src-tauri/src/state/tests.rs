@@ -1543,6 +1543,55 @@ fn corrupt_registry_does_not_trigger_legacy_migration() {
 }
 
 #[test]
+fn config_path_resolvers_are_isolated_under_test() {
+    // Every config-FILE resolver must resolve to None under `cfg!(test)` so the
+    // suite can never read or clobber the developer's real provider registry /
+    // phenotype / mode (the clobber half of #811). The store builders
+    // (`build_session_store` etc.) are isolated separately at the builder level.
+    assert!(config_path().is_none());
+    assert!(registry_path().is_none());
+    assert!(active_phenotype_path().is_none());
+    assert!(default_mode_path().is_none());
+    assert!(search_config_path().is_none());
+    assert!(control_config_path().is_none());
+    assert!(tool_permissions_path().is_none());
+    assert!(permission_matrix_path().is_none());
+    // The persistence round-trips are therefore no-ops in tests, not real writes.
+    assert!(load_active_phenotype_name().is_none());
+    assert_eq!(load_default_mode(), Mode::Auto);
+}
+
+#[test]
+fn partially_corrupt_registry_salvages_good_connection() {
+    let tmp = tempfile::tempdir().unwrap();
+    let reg_path = tmp.path().join("provider-registry.json");
+    // A registry whose active connection carries a future/unknown `kind` this
+    // build cannot deserialize, alongside a valid Bedrock connection. The user's
+    // Bedrock config must survive rather than the whole file wiping to Candle.
+    fs::write(
+        &reg_path,
+        r#"{"active":"future","connections":[
+            {"id":"future","kind":"gemini","displayName":"Gemini","model":"g","hasKey":true},
+            {"id":"bedrock-opus","kind":"bedrock","displayName":"AWS Bedrock","model":"m","hasKey":false}
+        ]}"#,
+    )
+    .unwrap();
+
+    let loaded = load_or_migrate_registry_at(Some(reg_path.clone()), None);
+
+    assert_ne!(
+        loaded,
+        ProviderRegistry::default(),
+        "a partially-bad registry must not wipe to the Candle default"
+    );
+    assert_eq!(loaded.connections.len(), 1);
+    assert_eq!(loaded.connections[0].id, "bedrock-opus");
+    assert_eq!(loaded.active, "bedrock-opus");
+    // A salvaged registry is a clean load, not a quarantine.
+    assert!(reg_path.exists());
+}
+
+#[test]
 fn write_atomic_replaces_existing_and_leaves_no_tmp() {
     let tmp = tempfile::tempdir().unwrap();
     let path = tmp.path().join("provider-registry.json");
