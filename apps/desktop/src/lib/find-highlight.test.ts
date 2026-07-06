@@ -48,3 +48,38 @@ describe("collectOccurrences + indexOfMessage (#679/#710)", () => {
     expect(indexOfMessage(ranges, "m1")).toBe(-1);
   });
 });
+
+describe("collectOccurrences token-awareness (#748)", () => {
+  it("highlights every token of a multi-word query in document order", () => {
+    const el = mount(`<div data-message-id="m1">run the turn then run</div>`);
+    // Two `run` + one `turn` = 3 whole-token hits, ordered by offset.
+    const ranges = collectOccurrences(el, new Set(["m1"]), "run turn");
+    expect(ranges.map((r) => r.toString())).toEqual(["run", "turn", "run"]);
+  });
+
+  it("does not highlight a token inside a larger word", () => {
+    const el = mount(`<div data-message-id="m1">overrun running run</div>`);
+    // Only the standalone `run` matches — not `overrun`/`running`.
+    const ranges = collectOccurrences(el, new Set(["m1"]), "run");
+    expect(ranges).toHaveLength(1);
+    expect(ranges[0].toString()).toBe("run");
+  });
+
+  it("matches tokens case-insensitively", () => {
+    const el = mount(`<div data-message-id="m1">RUN Turn</div>`);
+    const ranges = collectOccurrences(el, new Set(["m1"]), "run TURN");
+    expect(ranges.map((r) => r.toString())).toEqual(["RUN", "Turn"]);
+  });
+
+  it("de-duplicates repeated query tokens", () => {
+    const el = mount(`<div data-message-id="m1">run run</div>`);
+    const ranges = collectOccurrences(el, new Set(["m1"]), "run run");
+    expect(ranges).toHaveLength(2); // two occurrences, not four
+  });
+
+  it("returns [] for a blank or punctuation-only query", () => {
+    const el = mount(`<div data-message-id="m1">run turn</div>`);
+    expect(collectOccurrences(el, new Set(["m1"]), "   ")).toHaveLength(0);
+    expect(collectOccurrences(el, new Set(["m1"]), "-.")).toHaveLength(0);
+  });
+});

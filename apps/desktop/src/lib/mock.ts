@@ -71,6 +71,7 @@ import {
   type SidecarTurnResult,
 } from "./about";
 import { autoTitle } from "./auto-title";
+import { tokenizeQuery } from "./find-tokens";
 import type { PhenotypeMcpUnavailableEvent } from "@/bindings";
 
 type Listener<T> = (e: T) => void;
@@ -1012,19 +1013,24 @@ export class MockIpc implements FfIpc {
   }
 
   // Full-text search fakers (#679/#710). The real backend uses FTS5 over message
-  // text + tool-call args (v11); the mock does a case-insensitive substring scan
-  // over the same fields so the FE find bar behaves the same under the mock.
+  // text + tool-call args (v11). The in-thread find bar (#748) mirrors FTS's
+  // token model: a message matches iff *every* query token is present as a whole
+  // token in its haystack (AND, any order/distance, case-insensitive), so the
+  // mock's match set lines up with the token-aware DOM highlighter.
   async searchInSession(
     sessionId: string,
     query: string,
   ): Promise<SearchHit[]> {
-    const q = query.trim().toLowerCase();
-    if (!q) return [];
+    const tokens = tokenizeQuery(query);
+    if (tokens.length === 0) return [];
     const session = this.sessions.get(sessionId);
     // Message order (not relevance) so next/prev steps sequentially, like the
     // backend's `search_in_session`.
     return (this.messages.get(sessionId) ?? [])
-      .filter((m) => messageHaystack(m).toLowerCase().includes(q))
+      .filter((m) => {
+        const hay = new Set(tokenizeQuery(messageHaystack(m)));
+        return tokens.every((t) => hay.has(t));
+      })
       .map((m) => searchHit(m, session?.title ?? null, query));
   }
 
