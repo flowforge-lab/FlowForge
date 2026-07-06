@@ -324,8 +324,12 @@ fn goal_block(goal: &Goal) -> String {
     out
 }
 
-/// Per-mode behavioural steer appended to the prompt (RFC 0011). Only Plan adds
-/// text; Act and Auto rely on the default behaviour, so their prompt is unchanged.
+/// Per-mode behavioural steer appended to the prompt (RFC 0011, RFC 0019 §3).
+/// Every mode returns text so the agent knows which safety tiers auto-run, which
+/// prompt for confirmation, and which are denied outright -- letting it plan its
+/// approach instead of discovering the boundary by hitting a blocked tool call.
+/// "Sensitive" means externally-visible side effects (network fetches, spawning
+/// teammates, publishing) as opposed to purely local writes.
 fn mode_steer(mode: Mode) -> Option<&'static str> {
     match mode {
         Mode::Plan => Some(
@@ -335,7 +339,23 @@ fn mode_steer(mode: Mode) -> Option<&'static str> {
              plan the user can review. End your turn with that plan. Do not attempt \
              to make changes -- the user will switch you to Act or Auto to execute.",
         ),
-        Mode::Act | Mode::Auto => None,
+        Mode::Auto => Some(
+            "## Mode: Auto\n\nYou are in Auto mode. Read-only and local write tools \
+             (editing files, running local commands) are auto-approved -- use them \
+             freely. Sensitive actions with externally-visible side effects (network \
+             fetches, spawning teammates, publishing) require user confirmation, so \
+             expect a prompt before they run. Dangerous actions are denied in this \
+             mode: do not attempt them -- if the task genuinely needs one, explain \
+             why and ask the user to switch you to Act.",
+        ),
+        Mode::Act => Some(
+            "## Mode: Act\n\nYou are in Act mode with full access. Read-only, local \
+             write, and Sensitive actions (externally-visible side effects such as \
+             network fetches, spawning teammates, or publishing) are auto-approved -- \
+             use them as needed. Dangerous actions still require user confirmation, so \
+             expect a prompt before they run; proceed with the rest of the task while \
+             awaiting it where you can.",
+        ),
     }
 }
 
@@ -424,15 +444,38 @@ mod tests {
     }
 
     #[test]
-    fn act_and_auto_modes_add_no_steer() {
+    fn every_mode_appends_a_steer() {
         let reg = SkillRegistry::new();
-        for mode in [Mode::Act, Mode::Auto] {
+        for mode in [Mode::Plan, Mode::Auto, Mode::Act] {
             let out = build_system_prompt(None, &reg, &[], &ctx(), None, None, mode);
             assert!(
-                !out.contains("## Mode:"),
-                "{mode:?} should add no mode steer: {out}"
+                out.contains("## Mode:"),
+                "{mode:?} should add a mode steer: {out}"
             );
         }
+    }
+
+    #[test]
+    fn auto_mode_steer_states_the_tier_boundaries() {
+        let steer = mode_steer(Mode::Auto).expect("Auto has a steer");
+        assert!(steer.contains("## Mode: Auto"), "{steer}");
+        // Local writes auto-run, Sensitive prompts, Dangerous is denied.
+        assert!(steer.contains("auto-approved"), "{steer}");
+        assert!(steer.contains("confirmation"), "{steer}");
+        assert!(steer.contains("denied"), "{steer}");
+        // The Sensitive-tier definition is spelled out so the agent can classify.
+        assert!(steer.contains("externally-visible side effects"), "{steer}");
+    }
+
+    #[test]
+    fn act_mode_steer_confirms_only_dangerous() {
+        let steer = mode_steer(Mode::Act).expect("Act has a steer");
+        assert!(steer.contains("## Mode: Act"), "{steer}");
+        assert!(steer.contains("Sensitive"), "{steer}");
+        assert!(steer.contains("auto-approved"), "{steer}");
+        // Only Dangerous still needs confirmation in Act.
+        assert!(steer.contains("Dangerous"), "{steer}");
+        assert!(steer.contains("confirmation"), "{steer}");
     }
 
     #[test]

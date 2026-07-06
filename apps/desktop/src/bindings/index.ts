@@ -61,6 +61,7 @@ export type { Safety } from "./Safety";
 export type { PermissionCell } from "./PermissionCell";
 export type { PermissionMatrixEntry } from "./PermissionMatrixEntry";
 export type { PermissionMatrixView } from "./PermissionMatrixView";
+export type { PermissionOverrideEntry } from "./PermissionOverrideEntry";
 export type { ScheduledTask } from "./ScheduledTask";
 export type { CreateScheduledTaskInput } from "./CreateScheduledTaskInput";
 export type { TaskKind } from "./TaskKind";

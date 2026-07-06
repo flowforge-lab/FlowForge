@@ -283,6 +283,13 @@ export interface FfIpc {
     safety: Safety,
     cell: PermissionCell,
   ): Promise<PermissionMatrixView>;
+  /** Set a per-tool override (#700); resolves with the updated view. */
+  setToolOverride(
+    tool: string,
+    cell: PermissionCell,
+  ): Promise<PermissionMatrixView>;
+  /** Remove a per-tool override (#700); resolves with the updated view. */
+  removeToolOverride(tool: string): Promise<PermissionMatrixView>;
 
   // Skills (Issue #27). Discovery + the global active set; backs the command palette.
   /** All installed skills, name-sorted, each flagged active; `score` is always 0. */
@@ -691,6 +698,10 @@ class TauriIpc implements FfIpc {
       safety,
       cell,
     });
+  setToolOverride = (tool: string, cell: PermissionCell) =>
+    this.invoke<PermissionMatrixView>("set_tool_override", { tool, cell });
+  removeToolOverride = (tool: string) =>
+    this.invoke<PermissionMatrixView>("remove_tool_override", { tool });
   warmup = () => this.invoke<void>("warmup");
 
   searchInSession = (sessionId: string, query: string) =>

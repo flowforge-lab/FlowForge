@@ -23,16 +23,6 @@ describe("control-config store", () => {
     expect(cfg().permissionPolicy).toEqual(policyForMode("act"));
   });
 
-  it("adds and removes overrides, ignoring blanks and dupes", async () => {
-    await useControlConfigStore.getState().addOverride("denied", "rm -rf");
-    await useControlConfigStore.getState().addOverride("denied", "rm -rf"); // dupe
-    await useControlConfigStore.getState().addOverride("denied", "  "); // blank
-    expect(cfg().overrides.denied).toEqual(["rm -rf"]);
-
-    await useControlConfigStore.getState().removeOverride("denied", "rm -rf");
-    expect(cfg().overrides.denied).toEqual([]);
-  });
-
   it("manages prompt files and toggles injectMemory + userInstructions", async () => {
     await useControlConfigStore
       .getState()
@@ -61,10 +51,8 @@ describe("control-config store", () => {
 
   it("resetControl restores defaults", async () => {
     await useControlConfigStore.getState().setDefaultMode("act");
-    await useControlConfigStore.getState().addOverride("allowed", "ls");
     await useControlConfigStore.getState().resetControl();
     expect(cfg().defaultMode).toBe("auto");
-    expect(cfg().overrides.allowed).toEqual([]);
   });
 
   // ── SET.12: Team + UI ──────────────────────────────────────────────────────

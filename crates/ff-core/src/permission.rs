@@ -349,10 +349,27 @@ impl PermissionMatrix {
         cells
     }
 
-    /// The wire view of the matrix, for `get_permission_matrix` (#702).
+    /// The per-tool overrides (#700) as a self-describing, deterministically
+    /// ordered list — the shape the Control panel consumes.
+    pub fn override_entries(&self) -> Vec<PermissionOverrideEntry> {
+        let mut entries: Vec<PermissionOverrideEntry> = self
+            .overrides
+            .iter()
+            .map(|(tool, &cell)| PermissionOverrideEntry {
+                tool: tool.clone(),
+                cell,
+            })
+            .collect();
+        entries.sort_by(|a, b| a.tool.cmp(&b.tool));
+        entries
+    }
+
+    /// The wire view of the matrix, for `get_permission_matrix` (#702): the full
+    /// Mode × Safety grid plus the per-tool overrides (#700).
     pub fn view(&self) -> PermissionMatrixView {
         PermissionMatrixView {
             cells: self.entries(),
+            overrides: self.override_entries(),
         }
     }
 }
@@ -367,12 +384,24 @@ pub struct PermissionMatrixEntry {
     pub cell: PermissionCell,
 }
 
+/// One per-tool override (#700): the [`PermissionCell`] that replaces the matrix
+/// cell for a named tool across all Mode × Safety combinations. Part of the IPC
+/// surface (#702).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export, export_to = "../../../apps/desktop/src/bindings/")]
+pub struct PermissionOverrideEntry {
+    pub tool: String,
+    pub cell: PermissionCell,
+}
+
 /// The Control panel's view of the permission state (#702): the full matrix as a
-/// flat cell list. Per-tool overrides (#700) will be added here as a second field.
+/// flat cell list, plus the per-tool overrides (#700).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[ts(export, export_to = "../../../apps/desktop/src/bindings/")]
 pub struct PermissionMatrixView {
     pub cells: Vec<PermissionMatrixEntry>,
+    #[serde(default)]
+    pub overrides: Vec<PermissionOverrideEntry>,
 }
 
 fn mode_idx(mode: Mode) -> usize {
@@ -466,6 +495,35 @@ mod tests {
         assert!(json.contains("\"allow\""));
         let deser: PermissionMatrixView = serde_json::from_str(&json).unwrap();
         assert_eq!(view, deser);
+    }
+
+    #[test]
+    fn view_includes_sorted_overrides() {
+        let mut m = PermissionMatrix::default();
+        m.set_override("python", PermissionCell::Ask);
+        m.set_override("bash", PermissionCell::Deny);
+        let view = m.view();
+        assert_eq!(
+            view.overrides,
+            vec![
+                PermissionOverrideEntry {
+                    tool: "bash".into(),
+                    cell: PermissionCell::Deny,
+                },
+                PermissionOverrideEntry {
+                    tool: "python".into(),
+                    cell: PermissionCell::Ask,
+                },
+            ]
+        );
+        let json = serde_json::to_string(&view).unwrap();
+        let deser: PermissionMatrixView = serde_json::from_str(&json).unwrap();
+        assert_eq!(view, deser);
+    }
+
+    #[test]
+    fn view_overrides_empty_by_default() {
+        assert!(PermissionMatrix::default().view().overrides.is_empty());
     }
 
     #[test]

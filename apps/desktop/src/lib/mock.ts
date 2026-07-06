@@ -539,7 +539,7 @@ function defaultPermissionMatrix(): PermissionMatrixView {
   const cells = modes.flatMap((mode) =>
     safeties.map((safety) => ({ mode, safety, cell: rows[mode][safety] })),
   );
-  return { cells };
+  return { cells, overrides: [] };
 }
 
 export class MockIpc implements FfIpc {
@@ -1569,6 +1569,28 @@ export class MockIpc implements FfIpc {
       (c) => c.mode === mode && c.safety === safety,
     );
     if (entry) entry.cell = cell;
+    return structuredClone(this.permissionMatrix);
+  }
+
+  async setToolOverride(
+    tool: string,
+    cell: PermissionCell,
+  ): Promise<PermissionMatrixView> {
+    const existing = this.permissionMatrix.overrides.find(
+      (o) => o.tool === tool,
+    );
+    if (existing) existing.cell = cell;
+    else this.permissionMatrix.overrides.push({ tool, cell });
+    this.permissionMatrix.overrides.sort((a, b) =>
+      a.tool.localeCompare(b.tool),
+    );
+    return structuredClone(this.permissionMatrix);
+  }
+
+  async removeToolOverride(tool: string): Promise<PermissionMatrixView> {
+    this.permissionMatrix.overrides = this.permissionMatrix.overrides.filter(
+      (o) => o.tool !== tool,
+    );
     return structuredClone(this.permissionMatrix);
   }
 

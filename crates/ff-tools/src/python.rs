@@ -7,10 +7,10 @@
 //!
 //! Honesty note: like [`crate::bash`], Python is **not** sandboxed -- a snippet can
 //! reach any path the user can, open sockets, or spawn subprocesses. It is always
-//! classified [`Safety::Dangerous`] so it always reaches the approval prompt and is
-//! never auto-approved (#265). OS-level
-//! sandboxing (sandbox-exec / Landlock) is the same tracked follow-up that covers
-//! `bash`.
+//! classified [`Safety::Dangerous`], so the permission matrix (RFC 0019 §3) gates it:
+//! Act prompts for confirmation and Auto denies it -- it is never silently run.
+//! OS-level sandboxing (sandbox-exec / Landlock) is the same tracked follow-up that
+//! covers `bash`.
 //!
 //! The snippet is fed to the interpreter on **stdin** (`python3 -`): no temp file
 //! is written into the workspace, there is no argument-length limit, and tracebacks
@@ -169,8 +169,8 @@ impl Tool for PythonTool {
 
     fn safety(&self, _args: &Value) -> Safety {
         // Python runs arbitrary code (os.system, sockets, subprocesses) with no
-        // detectable safe subset, so it is always Dangerous: it must always reach the
-        // approval prompt and can never be auto-approved by Auto mode (#265).
+        // detectable safe subset, so it is always Dangerous: the permission matrix
+        // (RFC 0019 §3) then gates it -- Act prompts, Auto denies (never silent).
         Safety::Dangerous
     }
 

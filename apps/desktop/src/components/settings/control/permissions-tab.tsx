@@ -7,11 +7,12 @@ import {
   MODE_COLUMNS,
   PERMISSION_ROWS,
   ROW_SAFETY,
+  OVERRIDE_BUCKETS,
+  groupOverridesByCell,
   cellToMark,
   cycleCell,
   cellLabel,
   type CellMark,
-  type ControlOverrides,
 } from "@/lib/control";
 import { useControlConfigStore } from "@/store/control-config";
 import {
@@ -131,20 +132,6 @@ function ModeMatrix({
   );
 }
 
-const OVERRIDE_META: ReadonlyArray<{
-  key: keyof ControlOverrides;
-  label: string;
-  placeholder: string;
-}> = [
-  { key: "denied", label: "Denied", placeholder: "tool or pattern to deny" },
-  {
-    key: "requireApproval",
-    label: "Require approval",
-    placeholder: "tool or pattern to gate",
-  },
-  { key: "allowed", label: "Allowed", placeholder: "tool or pattern to allow" },
-];
-
 /** One collapsible override bucket with count, add input, and removable rows. */
 function OverrideBucket({
   label,
@@ -257,21 +244,24 @@ export function PermissionsTab() {
   const config = useControlConfigStore((s) => s.config);
   const saving = useControlConfigStore((s) => s.saving);
   const setDefaultMode = useControlConfigStore((s) => s.setDefaultMode);
-  const addOverride = useControlConfigStore((s) => s.addOverride);
-  const removeOverride = useControlConfigStore((s) => s.removeOverride);
 
   const matrix = usePermissionMatrixStore((s) => s.matrix);
+  const overrides = usePermissionMatrixStore((s) => s.overrides);
   const matrixLoading = usePermissionMatrixStore((s) => s.loading);
   const matrixSaving = usePermissionMatrixStore((s) => s.saving);
   const matrixError = usePermissionMatrixStore((s) => s.error);
   const loadMatrix = usePermissionMatrixStore((s) => s.load);
   const setCell = usePermissionMatrixStore((s) => s.setCell);
+  const setOverride = usePermissionMatrixStore((s) => s.setOverride);
+  const removeOverride = usePermissionMatrixStore((s) => s.removeOverride);
 
   useEffect(() => {
     void loadMatrix();
   }, [loadMatrix]);
 
   if (!config) return null;
+
+  const grouped = groupOverridesByCell(overrides);
 
   return (
     <div className="space-y-5">
@@ -311,16 +301,20 @@ export function PermissionsTab() {
         <h3 className="text-[13px] font-medium text-foreground">
           Custom overrides
         </h3>
+        <p className="text-[12px] leading-relaxed text-muted-foreground">
+          Pin a specific tool to Allow, Ask, or Deny. An override wins over the
+          matrix for that tool in every mode.
+        </p>
         <div className="space-y-2">
-          {OVERRIDE_META.map((meta) => (
+          {OVERRIDE_BUCKETS.map((bucket) => (
             <OverrideBucket
-              key={meta.key}
-              label={meta.label}
-              placeholder={meta.placeholder}
-              items={config.overrides[meta.key]}
-              disabled={saving}
-              onAdd={(value) => void addOverride(meta.key, value)}
-              onRemove={(value) => void removeOverride(meta.key, value)}
+              key={bucket.cell}
+              label={bucket.label}
+              placeholder={bucket.placeholder}
+              items={grouped[bucket.cell]}
+              disabled={saving || matrixSaving}
+              onAdd={(value) => void setOverride(value.trim(), bucket.cell)}
+              onRemove={(value) => void removeOverride(value)}
             />
           ))}
         </div>

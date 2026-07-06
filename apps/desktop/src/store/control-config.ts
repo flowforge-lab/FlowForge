@@ -10,14 +10,10 @@ import {
   policyForMode,
   slugify,
   type ControlConfig,
-  type ControlOverrides,
   type ControlUi,
   type DefaultMode,
   type Teammate,
 } from "@/lib/control";
-
-/** The string-list override buckets. */
-type OverrideList = keyof ControlOverrides;
 
 interface ControlConfigState {
   config: ControlConfig | null;
@@ -27,8 +23,6 @@ interface ControlConfigState {
 
   load: () => Promise<void>;
   setDefaultMode: (mode: DefaultMode) => Promise<void>;
-  addOverride: (list: OverrideList, value: string) => Promise<void>;
-  removeOverride: (list: OverrideList, value: string) => Promise<void>;
   setInjectMemory: (inject: boolean) => Promise<void>;
   setUserInstructions: (text: string) => Promise<void>;
   addPromptFile: (path: string) => Promise<void>;
@@ -68,31 +62,6 @@ export const useControlConfigStore = create<ControlConfigState>((set, get) => ({
       permissionPolicy: policyForMode(mode),
     })),
 
-  addOverride: (list, value) => {
-    const trimmed = value.trim();
-    if (trimmed === "") return Promise.resolve();
-    return persist(set, get, (c) =>
-      c.overrides[list].includes(trimmed)
-        ? c
-        : {
-            ...c,
-            overrides: {
-              ...c.overrides,
-              [list]: [...c.overrides[list], trimmed],
-            },
-          },
-    );
-  },
-
-  removeOverride: (list, value) =>
-    persist(set, get, (c) => ({
-      ...c,
-      overrides: {
-        ...c.overrides,
-        [list]: c.overrides[list].filter((v) => v !== value),
-      },
-    })),
-
   setInjectMemory: (inject) =>
     persist(set, get, (c) => ({ ...c, injectMemory: inject })),
 
@@ -126,7 +95,7 @@ export const useControlConfigStore = create<ControlConfigState>((set, get) => ({
       description: input.description.trim(),
     };
     return persist(set, get, (c) =>
-      // Dedupe on a non-empty handle (mirrors addOverride/addPromptFile); an empty
+      // Dedupe on a non-empty handle (mirrors addPromptFile); an empty
       // slug is optional and allowed to repeat.
       slug !== "" && c.teammates.some((t) => t.slug === slug)
         ? c

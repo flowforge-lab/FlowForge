@@ -47,7 +47,6 @@ describe("MockIpc control config", () => {
       injectMemory: false,
       userInstructions: "Be terse.",
       promptFiles: ["{workspace}/AGENTS.md"],
-      overrides: { denied: ["rm"], requireApproval: [], allowed: [] },
     };
     const stored = await ipc.setControlConfig(next);
     expect(stored.defaultMode).toBe("act");
@@ -55,7 +54,6 @@ describe("MockIpc control config", () => {
     const reread = await ipc.getControlConfig();
     expect(reread.userInstructions).toBe("Be terse.");
     expect(reread.promptFiles).toEqual(["{workspace}/AGENTS.md"]);
-    expect(reread.overrides.denied).toEqual(["rm"]);
     expect(reread.injectMemory).toBe(false);
   });
 

@@ -2404,6 +2404,32 @@ impl AppState {
         view
     }
 
+    /// Set and persist a per-tool override (#700/#702), returning the updated view.
+    pub fn set_tool_override(
+        &self,
+        tool: String,
+        cell: ff_core::PermissionCell,
+    ) -> ff_core::PermissionMatrixView {
+        let (view, snapshot) = {
+            let mut guard = self.permission_matrix.lock().unwrap();
+            guard.set_override(tool, cell);
+            (guard.view(), guard.clone())
+        };
+        save_permission_matrix(&snapshot);
+        view
+    }
+
+    /// Remove and persist a per-tool override (#700/#702), returning the updated view.
+    pub fn remove_tool_override(&self, tool: &str) -> ff_core::PermissionMatrixView {
+        let (view, snapshot) = {
+            let mut guard = self.permission_matrix.lock().unwrap();
+            guard.remove_override(tool);
+            (guard.view(), guard.clone())
+        };
+        save_permission_matrix(&snapshot);
+        view
+    }
+
     /// Resolve the mode a turn for `session_id` runs as (#265): an explicit per-pane
     /// binding, else the global [`default_mode`](Self::default_mode). Mirrors
     /// [`session_phenotype`](Self::session_phenotype).
