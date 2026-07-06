@@ -264,9 +264,9 @@ export interface FfIpc {
   // there is no backend/ts-rs type yet, and the permission matrix does NOT map to
   // `ApprovalSafety` ("write"|"dangerous"). For now this round-trips presentation
   // state + mock storage only; it does not drive runtime approval.
-  // TODO(#127 follow-up): once `ApprovalSafety` is extended to cover the
-  // 4-row × 3-column matrix, replace `ControlConfig` with a generated `bindings`
-  // type and wire `defaultMode`/`permissionPolicy` into runtime approval.
+  // The global default mode is NOT part of this config — it lives in the backend
+  // `mode.json` via `getDefaultMode`/`setDefaultMode` (#798). The real permission
+  // matrix that drives approval is `getPermissionMatrix` below (#702).
   /** Current persisted control settings (permissions presentation + prompts). */
   getControlConfig(): Promise<ControlConfig>;
   /** Persist control settings; resolves with the stored config. */
@@ -368,6 +368,17 @@ export interface FfIpc {
   /** Persist a session's explicit mode override, or clear it (`null`) so the
    *  backend inherits `default_mode`. */
   setSessionMode(sessionId: string, mode: Mode | null): Promise<void>;
+
+  // Global default mode (#266, #798). Bridges the already-registered backend
+  // commands `get_default_mode` / `set_default_mode`, whose source of truth is
+  // `mode.json` (`AppState.default_mode`; unbound sessions resolve to it). The FE
+  // hydrates from `getDefaultMode` at boot and writes every default-mode edit
+  // through `setDefaultMode`, so the choice survives a relaunch instead of living
+  // in a transient store. `Mode` is a generated binding; `bindings/` is untouched.
+  /** The persisted global default mode new sessions inherit. */
+  getDefaultMode(): Promise<Mode>;
+  /** Persist the global default mode (to `mode.json`). */
+  setDefaultMode(mode: Mode): Promise<void>;
 
   // CONTRACT NOTE (SET.7): FE-owned mock command — no backend/ts-rs binding for a
   // remote profile catalog exists yet. `MarketplaceProfile` lives in
@@ -802,6 +813,9 @@ class TauriIpc implements FfIpc {
     this.invoke<ResolvedModel>("resolve_model_selection", { sessionId });
   setSessionMode = (sessionId: string, mode: Mode | null) =>
     this.invoke<void>("set_session_mode", { sessionId, mode });
+  getDefaultMode = () => this.invoke<Mode>("get_default_mode");
+  setDefaultMode = (mode: Mode) =>
+    this.invoke<void>("set_default_mode", { mode });
   searchProfileMarketplace = (query: string) =>
     this.invoke<MarketplaceProfile[]>("search_profile_marketplace", { query });
   listScheduledTasks = () =>

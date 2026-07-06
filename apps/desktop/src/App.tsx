@@ -4,7 +4,7 @@ import { AppShell } from "@/components/app-shell";
 import { startIpcEvents } from "@/lib/events";
 import { reportFirstPaint } from "@/lib/boot-trace";
 import { ipc, type Unlisten } from "@/lib/ipc";
-import { initPrefs } from "@/store/prefs";
+import { initPrefs, usePrefsStore } from "@/store/prefs";
 import { useChatStore } from "@/store/chat";
 import { useModelConfigStore } from "@/store/model-config";
 import { shouldPollUpdate, useUpdateStore } from "@/store/update";
@@ -163,6 +163,10 @@ function App() {
     // Load the provider registry so the composer knows the active model's
     // vision capability app-wide (FE-4, #342) — not just after Settings opens.
     void useModelConfigStore.getState().load();
+    // Hydrate the global default mode from the backend `mode.json` (#798) so the
+    // user's chosen default survives a relaunch. Gated here (not in initPrefs)
+    // because it invokes a command that reads the managed AppState.
+    void usePrefsStore.getState().hydrateDefaultMode();
     // Background update check (#363). Prod always polls; in a dev build the
     // poll runs only when the `localUpdateChannel` experimental flag is on
     // (#567). When the flag is on, the backend polls localhost:8787 (the

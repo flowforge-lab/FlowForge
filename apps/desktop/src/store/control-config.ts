@@ -7,11 +7,9 @@ import { create } from "zustand";
 import { ipc } from "@/lib/ipc";
 import {
   CONTROL_DEFAULTS,
-  policyForMode,
   slugify,
   type ControlConfig,
   type ControlUi,
-  type DefaultMode,
   type Teammate,
 } from "@/lib/control";
 
@@ -22,7 +20,6 @@ interface ControlConfigState {
   error: string | null;
 
   load: () => Promise<void>;
-  setDefaultMode: (mode: DefaultMode) => Promise<void>;
   setInjectMemory: (inject: boolean) => Promise<void>;
   setUserInstructions: (text: string) => Promise<void>;
   addPromptFile: (path: string) => Promise<void>;
@@ -53,14 +50,6 @@ export const useControlConfigStore = create<ControlConfigState>((set, get) => ({
       });
     }
   },
-
-  setDefaultMode: (mode) =>
-    persist(set, get, (c) => ({
-      ...c,
-      defaultMode: mode,
-      // Selecting a column re-derives the per-row policy from that mode.
-      permissionPolicy: policyForMode(mode),
-    })),
 
   setInjectMemory: (inject) =>
     persist(set, get, (c) => ({ ...c, injectMemory: inject })),

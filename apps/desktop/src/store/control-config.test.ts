@@ -1,7 +1,6 @@
 import { beforeEach, describe, expect, it } from "vitest";
 
 import { useControlConfigStore } from "@/store/control-config";
-import { policyForMode } from "@/lib/control";
 
 // The store talks to the shared MockIpc singleton; load + reset to a clean
 // baseline before each test.
@@ -14,13 +13,10 @@ const cfg = () => useControlConfigStore.getState().config!;
 
 describe("control-config store", () => {
   it("loads the config from IPC", () => {
-    expect(cfg().defaultMode).toBe("auto");
-  });
-
-  it("setDefaultMode updates the mode and re-derives the policy", async () => {
-    await useControlConfigStore.getState().setDefaultMode("act");
-    expect(cfg().defaultMode).toBe("act");
-    expect(cfg().permissionPolicy).toEqual(policyForMode("act"));
+    // Default mode moved to the backend `mode.json` / prefs (#798); the control
+    // config no longer carries it.
+    expect(cfg().injectMemory).toBe(true);
+    expect("defaultMode" in cfg()).toBe(false);
   });
 
   it("manages prompt files and toggles injectMemory + userInstructions", async () => {
@@ -44,15 +40,15 @@ describe("control-config store", () => {
   });
 
   it("persists through IPC (a fresh load echoes the change)", async () => {
-    await useControlConfigStore.getState().setDefaultMode("plan");
+    await useControlConfigStore.getState().setInjectMemory(false);
     await useControlConfigStore.getState().load();
-    expect(cfg().defaultMode).toBe("plan");
+    expect(cfg().injectMemory).toBe(false);
   });
 
   it("resetControl restores defaults", async () => {
-    await useControlConfigStore.getState().setDefaultMode("act");
+    await useControlConfigStore.getState().setInjectMemory(false);
     await useControlConfigStore.getState().resetControl();
-    expect(cfg().defaultMode).toBe("auto");
+    expect(cfg().injectMemory).toBe(true);
   });
 
   // ── SET.12: Team + UI ──────────────────────────────────────────────────────

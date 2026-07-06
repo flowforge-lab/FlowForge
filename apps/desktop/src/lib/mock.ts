@@ -816,6 +816,10 @@ export class MockIpc implements FfIpc {
   // session inherits the phenotype/global tiers; see resolveModelSelection.
   private sessionModelSelections = new Map<string, ModelSelection>();
   private sessionModes = new Map<string, Mode>();
+  // Global default mode (#798). Mirrors the backend `mode.json`: unbound sessions
+  // resolve to it. In-memory only, so it resets each mock launch (unlike the real
+  // backend) — enough to exercise hydrate-on-boot + write-through + cross-picker sync.
+  private defaultMode: Mode = "auto";
 
   // MCP server statuses, keyed by per-instance key (id + workspace scope, RFC 0018)
   // so two workspace-scoped instances of one id don't collapse (#608). Mutated by
@@ -2166,6 +2170,14 @@ Shipping the Settings redesign — currently the Memory browser (SET.8).
     } else {
       this.sessionModes.delete(sessionId);
     }
+  }
+
+  async getDefaultMode(): Promise<Mode> {
+    return this.defaultMode;
+  }
+
+  async setDefaultMode(mode: Mode): Promise<void> {
+    this.defaultMode = mode;
   }
 
   // Mirror of the backend capability derivation (RFC 0005 §11.3): attachment caps

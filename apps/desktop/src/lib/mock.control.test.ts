@@ -4,12 +4,19 @@ import { MockIpc } from "./mock";
 import { CONTROL_DEFAULTS } from "./control";
 
 describe("MockIpc control config", () => {
-  it("defaults to auto mode with memory injection on", async () => {
+  it("defaults with memory injection on and no prompt files", async () => {
     const ipc = new MockIpc();
     const cfg = await ipc.getControlConfig();
-    expect(cfg.defaultMode).toBe("auto");
     expect(cfg.injectMemory).toBe(true);
     expect(cfg.promptFiles).toEqual([]);
+  });
+
+  // Default mode is owned by the backend `mode.json` (#798), not the control config.
+  it("exposes the global default mode separately, defaulting to auto", async () => {
+    const ipc = new MockIpc();
+    expect(await ipc.getDefaultMode()).toBe("auto");
+    await ipc.setDefaultMode("act");
+    expect(await ipc.getDefaultMode()).toBe("act");
   });
 
   it("seeds Team + UI defaults (SET.12)", async () => {
@@ -43,13 +50,12 @@ describe("MockIpc control config", () => {
     const ipc = new MockIpc();
     const next = {
       ...CONTROL_DEFAULTS,
-      defaultMode: "act" as const,
       injectMemory: false,
       userInstructions: "Be terse.",
       promptFiles: ["{workspace}/AGENTS.md"],
     };
     const stored = await ipc.setControlConfig(next);
-    expect(stored.defaultMode).toBe("act");
+    expect(stored.injectMemory).toBe(false);
 
     const reread = await ipc.getControlConfig();
     expect(reread.userInstructions).toBe("Be terse.");

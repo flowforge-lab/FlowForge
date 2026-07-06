@@ -16,6 +16,7 @@ import {
   setupSystemThemeListener,
   type Theme,
 } from "@/lib/theme";
+import { ipc } from "@/lib/ipc";
 import type { Mode } from "@/bindings";
 
 const STORAGE_KEY = "ff-prefs";
@@ -59,7 +60,10 @@ export interface PrefsState {
   openThreads: number;
   /** Composer send binding (Keyboard section, SET.6). */
   sendMessageKey: SendMessageKey;
-  /** Agent mode new sessions inherit when no explicit mode is set (#266, RFC 0011). */
+  /** Agent mode new sessions inherit when no explicit mode is set (#266, RFC 0011).
+   *  Source of truth is the backend `mode.json` (#798): hydrated from
+   *  `getDefaultMode` at boot and written through on every change. Kept transient
+   *  (not persisted) so the backend value always wins. */
   defaultMode: Mode;
   /** Session sidebar collapsed to width 0 (#185). */
   sidebarCollapsed: boolean;
@@ -72,7 +76,11 @@ export interface PrefsState {
   setNotifications: (partial: Partial<NotificationPrefs>) => void;
   setOpenThreads: (count: number) => void;
   setSendMessageKey: (key: SendMessageKey) => void;
+  /** Set the global default mode and write it through to the backend (`mode.json`). */
   setDefaultMode: (mode: Mode) => void;
+  /** Pull the persisted default mode from the backend. Call once, gated on
+   *  `app:ready`. Best-effort — leaves the `auto` default on failure. */
+  hydrateDefaultMode: () => Promise<void>;
   setSidebarCollapsed: (collapsed: boolean) => void;
   setSidebarWidth: (px: number) => void;
   /** Quick light/dark flip — leaves `"system"` by picking the opposite effective mode. */
@@ -154,7 +162,22 @@ export const usePrefsStore = create<PrefsState>()(
         set((s) => ({ notifications: { ...s.notifications, ...partial } })),
       setOpenThreads: (count) => set({ openThreads: clampOpenThreads(count) }),
       setSendMessageKey: (sendMessageKey) => set({ sendMessageKey }),
-      setDefaultMode: (defaultMode) => set({ defaultMode }),
+      setDefaultMode: (defaultMode) => {
+        set({ defaultMode });
+        // Write through so the choice persists to `mode.json` (#798). The store
+        // stays authoritative for the UI; this mirrors it to the backend, exactly
+        // like session-mode's setMode mirrors to setSessionMode.
+        void ipc.setDefaultMode(defaultMode);
+      },
+      hydrateDefaultMode: async () => {
+        try {
+          set({ defaultMode: await ipc.getDefaultMode() });
+        } catch (e) {
+          // Backend unreachable — keep the current (auto) default. Log so a real
+          // `get_default_mode` failure is debuggable rather than a silent wrong value.
+          console.warn("hydrateDefaultMode failed, keeping current default", e);
+        }
+      },
       setSidebarCollapsed: (sidebarCollapsed) => set({ sidebarCollapsed }),
       setSidebarWidth: (px) => set({ sidebarWidth: clampSidebarWidth(px) }),
       toggleTheme: () => {
@@ -163,11 +186,15 @@ export const usePrefsStore = create<PrefsState>()(
         set({ theme: effective === "light" ? "dark" : "light" });
       },
       resetAppearance: () => set({ ...APPEARANCE_DEFAULTS }),
-      resetKeyboard: () =>
+      resetKeyboard: () => {
         set({
           sendMessageKey: SEND_MESSAGE_KEY_DEFAULT,
           defaultMode: DEFAULT_MODE_DEFAULT,
-        }),
+        });
+        // Persist the default-mode reset to the backend too (#798), so it survives
+        // a relaunch rather than being reverted by the next hydrate.
+        void ipc.setDefaultMode(DEFAULT_MODE_DEFAULT);
+      },
     }),
     {
       name: STORAGE_KEY,
