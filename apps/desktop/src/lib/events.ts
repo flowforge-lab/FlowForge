@@ -12,6 +12,7 @@ import { usePhenoMcpNoticeStore } from "@/store/pheno-mcp-notice";
 import { useScheduledStore } from "@/store/scheduled";
 import { useUpdateStore } from "@/store/update";
 import { useSessionWorkspaceStore } from "@/store/session-workspace";
+import { useGoalStore } from "@/store/goal";
 
 let started = false;
 
@@ -116,5 +117,15 @@ export function startIpcEvents(): void {
   });
   void ipc.onUpdateDownloadFinished(() => {
     useUpdateStore.getState().setProgress(null);
+  });
+  // Goal mode (#717, RFC 0020 §7): each iteration boundary / set / pause / resume /
+  // complete emits the bare goal, so the status panel re-renders without polling.
+  void ipc.onGoalUpdated((goal) => {
+    useGoalStore.getState().applyGoalUpdated(goal);
+  });
+  // `goal_clear` emits `goal:cleared` (bare sessionId), not a terminal update —
+  // drop the session's goal so the panel unmounts.
+  void ipc.onGoalCleared((sessionId) => {
+    useGoalStore.getState().clear(sessionId);
   });
 }

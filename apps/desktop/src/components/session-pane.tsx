@@ -5,6 +5,7 @@ import { Button } from "@/components/ui/button";
 import { ChatView } from "@/components/chat-view";
 import { ContextGauge } from "@/components/context-gauge";
 import { FindBar } from "@/components/find-bar";
+import { GoalStatusPanel } from "@/components/goal-status-panel";
 import { InputBar } from "@/components/input-bar";
 import { PhenoSelector } from "@/components/pheno-selector";
 import { useChatStore } from "@/store/chat";
@@ -108,6 +109,9 @@ export function SessionPane({
           </Button>
         </div>
       </div>
+
+      {/* Goal status panel (#717): self-hides unless this session has a goal. */}
+      <GoalStatusPanel sessionId={sessionId} />
 
       <div ref={contentRef} className="relative flex min-h-0 flex-1 flex-col">
         {findOpen && <FindBar sessionId={sessionId} rootRef={contentRef} />}

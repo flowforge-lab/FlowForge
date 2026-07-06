@@ -60,6 +60,7 @@ import type {
   PermissionCell,
   PermissionMatrixView,
 } from "../bindings";
+import type { Goal } from "../bindings/Goal";
 import type { Format } from "../bindings/Format";
 import type { SecretKind } from "../bindings/SecretKind";
 import type { BedrockAuth } from "../bindings/BedrockAuth";
@@ -450,6 +451,43 @@ export interface FfIpc {
    *  gated behind the `devTools` experimental flag (default off). */
   runSidecarTurn(prompt: string): Promise<SidecarTurnResult>;
 
+  // Goal mode (RFC 0020, #683). A persistent autonomous objective bound to one
+  // session: the loop self-continues each turn toward `objective` until it
+  // completes, exhausts its budget, or the user intervenes. These mirror the
+  // SHIPPED backend commands (#716/#753) exactly, so signatures are ground truth:
+  //   goal_set(sessionId, objective, maxIterations?, maxTokens?, maxWallMs?) -> Goal
+  //   goal_status/goal_pause/goal_resume(sessionId) -> Option<Goal>  (== Goal | null)
+  //   goal_clear(sessionId) -> ()  and emits `goal:cleared` (bare sessionId)
+  // Reuses the generated `Goal` binding (Track B); `bindings/` is untouched. Mocked
+  // under `VITE_FF_MOCK=1` so the panel runs standalone. `goal_complete` exists on
+  // the backend too but is out of scope here (a "mark complete" affordance is a
+  // follow-up). "Steer" is NOT a command: per §6 a user message sent while a goal is
+  // `active` becomes a steer (folded into `pendingSteer`), so it rides `sendMessage`.
+  /** Begin (or replace) the session's goal and start the loop. Budget dimensions
+   *  are flat optional args (matching `goal_set`); each `undefined` uses the
+   *  backend default (RFC 0020: 25 iterations, tokens/wall unbounded). Resolves the
+   *  new goal. */
+  goalSet(
+    sessionId: string,
+    objective: string,
+    maxIterations?: number,
+    maxTokens?: number,
+    maxWallMs?: number,
+  ): Promise<Goal>;
+  /** Current goal snapshot for the panel to hydrate on mount, or `null` when the
+   *  session has no goal. Closes the race where a goal exists before the
+   *  `goal:updated` listener attached. */
+  goalStatus(sessionId: string): Promise<Goal | null>;
+  /** Pause an active goal at its next iteration boundary. Resolves the paused goal,
+   *  or `null` when the session has no goal (backend `Option<Goal>`). */
+  goalPause(sessionId: string): Promise<Goal | null>;
+  /** Resume a paused goal. Resolves the reactivated goal, or `null` when the session
+   *  has no goal (backend `Option<Goal>`). */
+  goalResume(sessionId: string): Promise<Goal | null>;
+  /** Abort the goal and delete its checkpoint. Idempotent. Emits `goal:cleared`
+   *  (not `goal:updated`); the panel unmounts when the store drops that session. */
+  goalClear(sessionId: string): Promise<void>;
+
   // Events (backend -> frontend)
   onToken(cb: (e: TokenEvent) => void): Promise<Unlisten>;
   onReasoning(cb: (e: ReasoningEvent) => void): Promise<Unlisten>;
@@ -548,6 +586,15 @@ export interface FfIpc {
   /** The background hydrate task failed; `reason` explains why. Never fires
    *  alongside `onAppReady`. */
   onAppInitError(cb: (reason: string) => void): Promise<Unlisten>;
+  /** A goal advanced a boundary or changed status (RFC 0020 §7, #717) — emitted at
+   *  each iteration boundary and on set/pause/resume/complete so the goal status
+   *  panel re-renders without polling (same pattern as `scheduled:changed`). The
+   *  payload is the bare `Goal` (backend `emit("goal:updated", &goal)`). */
+  onGoalUpdated(cb: (goal: Goal) => void): Promise<Unlisten>;
+  /** A goal was cleared/aborted (`goal_clear`) — carries the bare `sessionId`. The
+   *  panel drops that session's goal from the store and unmounts. Distinct from a
+   *  terminal `goal:updated`, which never fires on clear. */
+  onGoalCleared(cb: (sessionId: string) => void): Promise<Unlisten>;
 }
 
 // Explicit mock flag OR auto-fallback when not inside a Tauri window.
@@ -785,6 +832,29 @@ class TauriIpc implements FfIpc {
   runSidecarTurn = (prompt: string) =>
     this.invoke<SidecarTurnResult>("run_sidecar_turn", { prompt });
 
+  goalSet = (
+    sessionId: string,
+    objective: string,
+    maxIterations?: number,
+    maxTokens?: number,
+    maxWallMs?: number,
+  ) =>
+    this.invoke<Goal>("goal_set", {
+      sessionId,
+      objective,
+      maxIterations,
+      maxTokens,
+      maxWallMs,
+    });
+  goalStatus = (sessionId: string) =>
+    this.invoke<Goal | null>("goal_status", { sessionId });
+  goalPause = (sessionId: string) =>
+    this.invoke<Goal | null>("goal_pause", { sessionId });
+  goalResume = (sessionId: string) =>
+    this.invoke<Goal | null>("goal_resume", { sessionId });
+  goalClear = (sessionId: string) =>
+    this.invoke<void>("goal_clear", { sessionId });
+
   onToken = (cb: (e: TokenEvent) => void) =>
     this.listen<TokenEvent>("turn:token", cb);
   onReasoning = (cb: (e: ReasoningEvent) => void) =>
@@ -835,6 +905,10 @@ class TauriIpc implements FfIpc {
   onAppReady = (cb: () => void) => this.listen<void>("app:ready", () => cb());
   onAppInitError = (cb: (reason: string) => void) =>
     this.listen<string>("app:init-error", (reason) => cb(reason));
+  onGoalUpdated = (cb: (goal: Goal) => void) =>
+    this.listen<Goal>("goal:updated", cb);
+  onGoalCleared = (cb: (sessionId: string) => void) =>
+    this.listen<string>("goal:cleared", cb);
 }
 
 // `MockIpc` is pulled in with a dynamic import so the bundler gives it its own
