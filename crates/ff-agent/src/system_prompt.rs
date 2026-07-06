@@ -166,9 +166,13 @@ pub fn build_system_prompt(
          Large tool results are abbreviated to save context and end with a \
          `[compacted; retrieve key=<HEX>]` marker. When you need detail the \
          abbreviation dropped, call `compaction_retrieve` with that key to read \
-         the verbatim original. These markers and any `[N lines elided]` \
-         placeholders are scaffolding, not content -- never copy them into your \
-         reply. If your answer needs that detail, retrieve it first.\n\n",
+         the verbatim original. These markers and any `<compacted .../>` \
+         XML tags are system scaffolding, not content -- never copy them into \
+         your reply. If your answer needs that detail, retrieve it first.\n\
+         Your own replies must always be complete -- never abbreviate your \
+         output using compaction markers, `[N lines elided]`, or similar \
+         placeholder patterns. Output the full content or summarize in your \
+         own words.\n\n",
     );
 
     // Stable guidance (cache-stable prefix): batching independent tool calls into
@@ -704,13 +708,18 @@ mod tests {
     fn compaction_guidance_forbids_reproducing_markers() {
         // A weaker model regurgitated [N lines elided] / [compacted; retrieve
         // key=...] placeholders as its answer instead of calling
-        // compaction_retrieve (see #512). The guidance must explicitly forbid
-        // copying the markers into the reply.
+        // compaction_retrieve (see #512, #783). The guidance must explicitly
+        // forbid copying the markers into the reply AND prohibit the model from
+        // abbreviating its own output using similar patterns.
         let reg = SkillRegistry::new();
         let out = build_system_prompt(None, &reg, &[], &ctx(), None, None, Mode::default());
         assert!(
-            out.contains("never copy them into your reply"),
+            out.contains("never copy them into"),
             "must forbid reproducing compaction markers: {out}"
+        );
+        assert!(
+            out.contains("Your own replies must always be complete"),
+            "must prohibit model self-abbreviation (#783): {out}"
         );
     }
 
