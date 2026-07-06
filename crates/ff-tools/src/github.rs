@@ -35,7 +35,7 @@ impl Tool for GithubTool {
                     "enum": ["pr_create", "pr_list", "pr_merge", "pr_checks", "pr_review", "pr_comment", "pr_request_review", "pr_review_inline", "issue_create", "issue_edit", "issue_list", "issue_comment", "push"]
                 },
                 "title": { "type": "string", "description": "Title for PR or issue (pr_create, issue_create)." },
-                "body": { "type": "string", "description": "Body text for a PR/issue or a review/comment (pr_create, issue_create, issue_edit, pr_review, pr_comment, issue_comment, pr_review_inline). Markdown supported." },
+                "body": { "type": "string", "description": "Body text for a PR/issue or a review/comment (pr_create, issue_create, issue_edit, pr_review, pr_comment, issue_comment, pr_review_inline). Required for pr_review / pr_review_inline when event is COMMENT or REQUEST_CHANGES (GitHub 422s a bodiless one); optional for APPROVE. Markdown supported." },
                 "base": { "type": "string", "description": "Base branch for PR (pr_create). Defaults to 'main'." },
                 "head": { "type": "string", "description": "Head branch for PR (pr_create). Defaults to current branch." },
                 "number": { "type": "integer", "description": "PR or issue number (pr_merge, pr_checks, pr_review, pr_comment, pr_request_review, pr_review_inline, issue_edit, issue_comment)." },
@@ -312,8 +312,15 @@ async fn pr_review(args: &Value, root: &Path) -> ToolOutcome {
         }
     };
     let body = args.get("body").and_then(|v| v.as_str());
-    if flag == "--comment" && body.map(str::trim).unwrap_or("").is_empty() {
-        return ToolOutcome::error("pr_review with event=COMMENT requires a non-empty 'body'");
+    // COMMENT and REQUEST_CHANGES both require a body: GitHub's API 422s a bodiless
+    // COMMENT/REQUEST_CHANGES review, and non-interactive `gh pr review
+    // --request-changes` errors without `--body`. APPROVE may omit it.
+    if matches!(flag, "--comment" | "--request-changes")
+        && body.map(str::trim).unwrap_or("").is_empty()
+    {
+        return ToolOutcome::error(format!(
+            "pr_review with event={event} requires a non-empty 'body'"
+        ));
     }
 
     let mut cmd = gh_cmd(root);
@@ -399,9 +406,21 @@ async fn pr_review_inline(args: &Value, root: &Path) -> ToolOutcome {
         Err(e) => return ToolOutcome::error(e),
     };
 
-    let tmp =
-        std::env::temp_dir().join(format!("ff-gh-review-{number}-{}.json", std::process::id()));
-    if let Err(e) = std::fs::write(&tmp, payload.to_string()) {
+    // A NamedTempFile creates the payload with a randomized name via O_EXCL, so it
+    // can't follow a pre-planted symlink at a predictable path, and it is removed on
+    // drop (including the early-return error paths below).
+    use std::io::Write;
+    let mut tmp = match tempfile::Builder::new()
+        .prefix(&format!("ff-gh-review-{number}-"))
+        .suffix(".json")
+        .tempfile()
+    {
+        Ok(f) => f,
+        Err(e) => {
+            return ToolOutcome::error(format!("pr_review_inline: could not stage payload: {e}"))
+        }
+    };
+    if let Err(e) = tmp.write_all(payload.to_string().as_bytes()) {
         return ToolOutcome::error(format!("pr_review_inline: could not stage payload: {e}"));
     }
 
@@ -413,10 +432,10 @@ async fn pr_review_inline(args: &Value, root: &Path) -> ToolOutcome {
         &format!("repos/{{owner}}/{{repo}}/pulls/{number}/reviews"),
         "--input",
     ]);
-    cmd.arg(&tmp);
+    cmd.arg(tmp.path());
 
     let result = run_gh(cmd).await;
-    let _ = std::fs::remove_file(&tmp);
+    drop(tmp);
     match result {
         Ok(out) => ToolOutcome::ok(format!(
             "Inline review submitted on PR #{number}. {}",
@@ -471,11 +490,23 @@ fn build_inline_review_payload(args: &Value) -> Result<Value, String> {
         comments.push(obj);
     }
 
+    let body = args
+        .get("body")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    // A top-level review body is mandatory for COMMENT / REQUEST_CHANGES (GitHub
+    // 422s otherwise) and optional for APPROVE. Mirrors the `pr_review` guard so
+    // the two review paths behave the same.
+    if body.is_none() && matches!(event.as_str(), "COMMENT" | "REQUEST_CHANGES") {
+        return Err(format!(
+            "pr_review_inline with event={event} requires a non-empty 'body'"
+        ));
+    }
+
     let mut payload = serde_json::json!({ "event": event, "comments": comments });
-    if let Some(b) = args.get("body").and_then(|v| v.as_str()) {
-        if !b.trim().is_empty() {
-            payload["body"] = serde_json::json!(b);
-        }
+    if let Some(b) = body {
+        payload["body"] = serde_json::json!(b);
     }
     Ok(payload)
 }
@@ -854,10 +885,31 @@ mod tests {
     }
 
     #[test]
-    fn inline_review_payload_omits_empty_body() {
-        let args =
-            json!({"event":"COMMENT","body":"   ","comments":[{"path":"a","line":1,"body":"y"}]});
+    fn inline_review_comment_and_request_changes_require_body() {
+        // COMMENT / REQUEST_CHANGES 422 without a top-level body, so building the
+        // payload must fail up front (mirrors the pr_review guard). A blank body
+        // counts as missing.
+        for event in ["COMMENT", "REQUEST_CHANGES"] {
+            let blank = json!({"event": event, "body": "   ", "comments": [{"path":"a","line":1,"body":"y"}]});
+            assert!(
+                build_inline_review_payload(&blank).is_err(),
+                "{event} with a blank body should be rejected"
+            );
+
+            let missing = json!({"event": event, "comments": [{"path":"a","line":1,"body":"y"}]});
+            assert!(
+                build_inline_review_payload(&missing).is_err(),
+                "{event} with no body should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn inline_review_approve_may_omit_body() {
+        // APPROVE is the one event GitHub accepts without a top-level body.
+        let args = json!({"event":"APPROVE","comments":[{"path":"a","line":1,"body":"y"}]});
         let p = build_inline_review_payload(&args).unwrap();
-        assert!(p.get("body").is_none(), "blank review body is omitted");
+        assert_eq!(p["event"], "APPROVE");
+        assert!(p.get("body").is_none(), "APPROVE omits an absent body");
     }
 }
