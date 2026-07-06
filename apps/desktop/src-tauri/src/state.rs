@@ -599,6 +599,76 @@ fn save_search_config(config: &SearchConfig) {
     }
 }
 
+/// `<config dir>/flowforge/control.json` — the Control panel's settings blob
+/// (#147). `None` only when the OS exposes no config dir.
+fn control_config_path() -> Option<PathBuf> {
+    dirs::config_dir().map(|d| d.join("flowforge").join("control.json"))
+}
+
+/// The factory `ControlConfig`, returned on first load before the user has saved
+/// anything. The frontend (`lib/control.ts`) owns the config shape, so the backend
+/// persists it verbatim as an opaque JSON blob and only bakes in the default here;
+/// keeping the value untyped means the two can never drift. Mirrors
+/// `CONTROL_DEFAULTS` in `lib/control.ts`.
+fn default_control_config() -> serde_json::Value {
+    serde_json::json!({
+        "defaultMode": "auto",
+        "permissionPolicy": {
+            "read": "allow",
+            "localWrites": "allow",
+            "externalChanges": "ask",
+            "dangerous": "deny"
+        },
+        "injectMemory": true,
+        "userInstructions": "",
+        "promptFiles": [],
+        "teammates": [
+            {
+                "id": "reviewer",
+                "name": "Riley Reviewer",
+                "slug": "reviewer",
+                "description": "Scans diffs and flags risky changes before they land."
+            },
+            {
+                "id": "scribe",
+                "name": "Sam Scribe",
+                "slug": "scribe",
+                "description": "Drafts docs and changelogs from the session."
+            }
+        ],
+        "ui": {
+            "accentColor": "#6366f1",
+            "logoPath": "",
+            "faviconPath": "",
+            "contextualGreeting": true
+        }
+    })
+}
+
+/// Loads the persisted Control config, falling back to [`default_control_config`]
+/// when the file is missing or unparseable. Opaque blob (see the module note).
+fn load_control_config() -> serde_json::Value {
+    control_config_path()
+        .and_then(|p| fs::read_to_string(p).ok())
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(default_control_config)
+}
+
+/// Persists the Control config blob. Best-effort and atomic, like
+/// [`save_search_config`].
+fn save_control_config(config: &serde_json::Value) {
+    let Some(path) = control_config_path() else {
+        return;
+    };
+    let Ok(json) = serde_json::to_string_pretty(config) else {
+        return;
+    };
+    if let Err(e) = write_atomic(&path, &json) {
+        tracing::warn!(path = %path.display(), error = %e,
+            "control config save failed; in-memory state authoritative this session");
+    }
+}
+
 /// `~/.config/flowforge/tool_permissions.json` — the persistent tool allowlist (#229).
 /// `None` only when the OS exposes no config dir.
 fn tool_permissions_path() -> Option<PathBuf> {
@@ -1976,6 +2046,21 @@ impl AppState {
     pub fn set_search_config(&self, config: SearchConfig) {
         save_search_config(&config);
         *self.search_config.lock().unwrap() = config;
+    }
+
+    /// The persisted Control-panel config blob (#147), or the factory default on
+    /// first load. Opaque JSON: the frontend owns the shape (see
+    /// [`load_control_config`]).
+    pub fn control_config(&self) -> serde_json::Value {
+        load_control_config()
+    }
+
+    /// Persist the Control-panel config blob and echo it back. Read straight from
+    /// disk on the next `control_config()`, so no in-memory cache is needed for
+    /// this low-frequency settings surface.
+    pub fn set_control_config(&self, config: serde_json::Value) -> serde_json::Value {
+        save_control_config(&config);
+        config
     }
 
     /// Build a provider + model snapshot from the active connection for one turn.

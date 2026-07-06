@@ -2058,6 +2058,24 @@ fn resolved_bedrock_auth(
     state.resolved_bedrock_auth(&connection_id)
 }
 
+/// The Control-panel settings blob (#147). Opaque JSON round-tripped verbatim;
+/// the frontend (`lib/control.ts`) owns the shape. Returns the factory default on
+/// first load.
+#[tauri::command]
+fn get_control_config(state: State<'_, Arc<AppState>>) -> serde_json::Value {
+    state.control_config()
+}
+
+/// Persist the Control-panel settings blob and echo back the stored value so the
+/// UI can confirm the applied state (mirrors `set_search_config`).
+#[tauri::command]
+fn set_control_config(
+    state: State<'_, Arc<AppState>>,
+    config: serde_json::Value,
+) -> serde_json::Value {
+    state.set_control_config(config)
+}
+
 /// Current persisted web-search settings.
 #[tauri::command]
 fn get_search_config(state: State<'_, Arc<AppState>>) -> SearchConfig {
@@ -3350,6 +3368,8 @@ pub fn run() {
             clear_provider_secret,
             provider_secret_presence,
             resolved_bedrock_auth,
+            get_control_config,
+            set_control_config,
             get_search_config,
             set_search_config,
             list_models,
