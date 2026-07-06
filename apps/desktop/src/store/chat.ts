@@ -6,6 +6,7 @@ import { create } from "zustand";
 import { ipc } from "@/lib/ipc";
 import { autoTitle } from "@/lib/auto-title";
 import { isResumableStopNotice } from "@/store/capped-turn";
+import { readCache, writeCache, clearCache } from "@/lib/message-cache";
 import { useSessionDoneToastStore } from "@/store/session-done-toast";
 import type {
   Attachment,
@@ -320,7 +321,7 @@ function scheduleFinishedClear(sessionId: string) {
 export const useChatStore = create<ChatState>((set, get) => ({
   sessions: [],
   activeSessionId: null,
-  messagesBySession: {},
+  messagesBySession: readCache(),
   streamingBySession: {},
   turnStartBySession: {},
   turnStartByMessage: {},
@@ -415,6 +416,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       );
       return { messagesBySession, toolStepsByMessage };
     });
+    writeCache(sessionId, get().messagesBySession[sessionId] ?? []);
   },
 
   newSession: async (goal) => {
@@ -466,6 +468,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
         activeSessionId: nextActive,
       };
     });
+    clearCache(sessionId);
 
     try {
       await ipc.deleteSession(sessionId);
