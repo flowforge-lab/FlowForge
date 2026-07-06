@@ -402,7 +402,7 @@ impl ExtractiveCompactor {
             out.push_str(line);
             out.push('\n');
         }
-        out.push_str(&format!("... [{elided} lines elided]\n"));
+        out.push_str(&format!("<compacted lines=\"{elided}\"/>\n"));
         for line in &lines[lines.len() - self.keep_tail_lines..] {
             out.push_str(line);
             out.push('\n');
@@ -424,7 +424,7 @@ fn truncate_value(value: &mut serde_json::Value, max_value_chars: usize, max_arr
             if items.len() > max_array_items {
                 let dropped = items.len() - max_array_items;
                 items.truncate(max_array_items);
-                items.push(Value::String(format!("<...{dropped} items elided>")));
+                items.push(Value::String(format!("<compacted items=\"{dropped}\"/>")));
             }
             for item in items.iter_mut() {
                 truncate_value(item, max_value_chars, max_array_items);
@@ -562,7 +562,7 @@ mod tests {
         assert!(out.contains("line 2\n"));
         assert!(out.contains("line 19\n"));
         assert!(out.contains("line 20"));
-        assert!(out.contains("16 lines elided"));
+        assert!(out.contains("<compacted lines=\"16\"/>"));
         assert!(out.contains("[compacted; retrieve key="));
         assert_eq!(cache.len(), 1);
     }
