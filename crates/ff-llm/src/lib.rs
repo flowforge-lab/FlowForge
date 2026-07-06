@@ -10,6 +10,7 @@ mod extract;
 mod model_specs;
 mod ollama;
 mod openai;
+pub mod think_scanner;
 
 use async_trait::async_trait;
 use base64::Engine as _;
@@ -434,6 +435,10 @@ pub enum ToolCallContent {
 pub struct WireDialect {
     pub reasoning: ReasoningWire,
     pub tool_call_content: ToolCallContent,
+    /// If true, the model inlines chain-of-thought as `<think>...</think>` in the
+    /// content stream instead of using the `reasoning_content` field. The stream
+    /// parser will split these tags into the reasoning channel. (#729)
+    pub think_tags: bool,
 }
 
 /// Resolve a wire dialect from a connection's `(kind, vendor, model)`. Pure,
@@ -447,6 +452,8 @@ pub fn wire_dialect(kind: ff_core::ProviderKind, vendor: Option<&str>, model: &s
     let vendor_lc = vendor.map(|v| v.to_ascii_lowercase());
     let is_openrouter = vendor_lc.as_deref() == Some("openrouter");
 
+    let is_minimax = model_lc.contains("minimax");
+
     match kind {
         K::SiliconFlow => WireDialect {
             reasoning: ReasoningWire::ReasoningContent,
@@ -455,11 +462,15 @@ pub fn wire_dialect(kind: ff_core::ProviderKind, vendor: Option<&str>, model: &s
             } else {
                 ToolCallContent::Omit
             },
+            // MiniMax inlines reasoning as <think> tags in content (#729).
+            // GLM/Kimi/DeepSeek use reasoning_content correctly — no splitting.
+            think_tags: is_minimax,
         },
         // OpenRouter rides the OpenAi kind today; detect by vendor descriptor.
         K::OpenAi if is_openrouter => WireDialect {
             reasoning: ReasoningWire::Reasoning,
             tool_call_content: ToolCallContent::Omit,
+            think_tags: false,
         },
         K::CandleVllm | K::Ollama | K::Bedrock | K::OpenAi => WireDialect::default(),
     }
