@@ -756,10 +756,17 @@ fn permission_matrix_path() -> Option<PathBuf> {
 }
 
 fn load_permission_matrix() -> ff_core::PermissionMatrix {
-    permission_matrix_path()
+    let matrix: ff_core::PermissionMatrix = permission_matrix_path()
         .and_then(|p| fs::read_to_string(p).ok())
         .and_then(|raw| serde_json::from_str(&raw).ok())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    // Surface malformed rule patterns loudly (#768 review nit 2) instead of
+    // silently swallowing them — a typo'd deny backstop fails closed at
+    // evaluation, but the operator still needs to see why.
+    for (i, err) in matrix.validate_rules() {
+        tracing::warn!(rule = i, error = %err, "invalid permission rule pattern");
+    }
+    matrix
 }
 
 /// Persist the permission matrix (#702). Best-effort and atomic, like

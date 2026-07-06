@@ -178,6 +178,25 @@ struct UiApprover {
     mode: Mode,
 }
 
+/// Resolve the "relevant argument" for scoped permission rules (#712).
+///
+/// Each entry is verified against the real tool arg schema in `ff-tools`
+/// (#768 review B2): `bash` takes `command`, `python` takes `code`, and the
+/// filesystem mutators take `path`. Only tools that can actually reach the
+/// approval gate are listed — the read-only search tools (`glob`, `grep`)
+/// short-circuit as `Safety::ReadOnly` before `approve()`, so a rule on them
+/// would never fire; listing them (with the wrong key, as before) was dead,
+/// misleading code.
+fn resolve_tool_arg(name: &str, args: &serde_json::Value) -> Option<String> {
+    let key = match name {
+        "bash" => "command",
+        "python" => "code",
+        "view" | "edit" | "write" => "path",
+        _ => return None,
+    };
+    args.get(key).and_then(|v| v.as_str()).map(Into::into)
+}
+
 #[async_trait]
 impl Approver for UiApprover {
     async fn approve(
@@ -194,15 +213,36 @@ impl Approver for UiApprover {
             return true;
         }
 
+        // Snapshot the matrix once for this call, read live (#702/#742) so a
+        // Control-panel edit takes effect on the next tool invocation.
+        let matrix = self.state.permission_matrix();
+
+        // Scoped rules (#712, RFC 0019 §9): resolve the tool's relevant argument
+        // and evaluate. Deny rules veto unconditionally; Allow rules auto-approve
+        // except for Dangerous (degrades to Ask).
+        let resolved_arg = resolve_tool_arg(name, args);
+        if let Some(effect) = matrix.evaluate_rules(name, resolved_arg.as_deref(), self.mode) {
+            match effect {
+                ff_core::RuleEffect::Deny => return false,
+                ff_core::RuleEffect::Allow => {
+                    // Allow rule never auto-clears Dangerous (#712 §9.3).
+                    if safety != Safety::Dangerous {
+                        tracing::info!(
+                            tool = name,
+                            arg = ?resolved_arg,
+                            "scoped rule auto-approved"
+                        );
+                        return true;
+                    }
+                    // Dangerous: fall through to prompt.
+                }
+            }
+        }
+
         // Permission matrix (#699/#702/#742): the per-tool override if set, else
-        // the mode×safety cell. Read live each call (`permission_matrix()`) so a
-        // Control-panel edit takes effect on the next tool invocation. ReadOnly
-        // never reaches here (the agent loop short-circuits it).
-        // `None` means Ask — fall through to the UI prompt below.
-        let cell = self
-            .state
-            .permission_matrix()
-            .effective_cell(name, self.mode, safety);
+        // the mode×safety cell. Deny/ReadOnly never reach here (hidden or
+        // short-circuited); `None` means Ask — fall through to the UI prompt.
+        let cell = matrix.effective_cell(name, self.mode, safety);
         if let Some(decision) = matrix_gate(cell) {
             return decision;
         }
@@ -3352,8 +3392,9 @@ mod tests {
     use super::state::AppState;
     use super::{
         emit_agent_event, git_branch, is_app_ready, list_local_branches, matrix_gate,
-        panic_message, publish_app_ready, resolve_workspace_dir, run_sidecar_turn, should_warmup,
-        switch_branch, BootFinalize, TurnMetrics, UpdateStatus, APP_READY,
+        panic_message, publish_app_ready, resolve_tool_arg, resolve_workspace_dir,
+        run_sidecar_turn, should_warmup, switch_branch, BootFinalize, TurnMetrics, UpdateStatus,
+        APP_READY,
     };
     use ff_agent::AgentEvent;
     use ff_core::events::TurnDoneEvent;
@@ -3366,6 +3407,42 @@ mod tests {
     // the only tests in the crate that touch it. Guard them with a mutex so the
     // two never race each other (parallel `cargo test` threads share the flag).
     static BOOT_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    // #768 review B2: the scoped-rule arg table must read each tool's REAL
+    // argument key, checked against the ff-tools schemas. A wrong key silently
+    // resolves to `None`, so the rule never fires (fail-open for deny backstops).
+    #[test]
+    fn resolve_tool_arg_reads_real_schema_keys() {
+        use serde_json::json;
+        assert_eq!(
+            resolve_tool_arg("bash", &json!({"command": "cargo build"})),
+            Some("cargo build".into())
+        );
+        // python's key is `code`, NOT `command`.
+        assert_eq!(
+            resolve_tool_arg("python", &json!({"code": "print(1)"})),
+            Some("print(1)".into())
+        );
+        assert_eq!(
+            resolve_tool_arg("python", &json!({"command": "print(1)"})),
+            None
+        );
+        for tool in ["view", "edit", "write"] {
+            assert_eq!(
+                resolve_tool_arg(tool, &json!({"path": "src/main.rs"})),
+                Some("src/main.rs".into())
+            );
+        }
+        // Read-only search tools short-circuit before approve() — not listed.
+        assert_eq!(resolve_tool_arg("grep", &json!({"pattern": "x"})), None);
+        assert_eq!(
+            resolve_tool_arg("glob", &json!({"pattern": "**/*.rs"})),
+            None
+        );
+        // Formerly-listed phantom keys resolve to nothing now.
+        assert_eq!(resolve_tool_arg("rg", &json!({"path": "."})), None);
+        assert_eq!(resolve_tool_arg("fd", &json!({"path": "."})), None);
+    }
 
     // Spy that asserts the `manage` → `store` → `emit` ordering at call time: a
     // reordered `publish_app_ready` (e.g. `store` hoisted above `manage`, or
