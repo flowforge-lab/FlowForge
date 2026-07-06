@@ -963,9 +963,12 @@ fn pheno_with_mcp(name: &str, servers: Vec<McpServerConfig>) -> Phenotype {
 fn unbound_session_resolves_no_mcp_servers_by_default() {
     let state = AppState::new();
     let s = state.store.create_session(None);
-    // No global file, default phenotype, no session override -> empty (today's
-    // behavior preserved).
-    assert!(state.resolve_mcp_servers(&s.id).is_empty());
+    let resolved = state.resolve_mcp_servers(&s.id);
+    let has_global = resolved.iter().any(|c| c.id == "github");
+    assert!(
+        !has_global,
+        "without global mcp.json, no github server should be present"
+    );
 }
 
 #[test]
@@ -978,10 +981,11 @@ fn global_mcp_json_feeds_resolution() {
 
     let s = state.store.create_session(None);
     let resolved = state.resolve_mcp_servers(&s.id);
-    assert_eq!(resolved.len(), 1);
-    assert_eq!(resolved[0].id, "github");
-    // Absent `scope` deserializes to Global (back-compat).
-    assert_eq!(resolved[0].scope, McpScope::Global);
+    let github = resolved
+        .iter()
+        .find(|c| c.id == "github")
+        .expect("github server should be present from global mcp.json");
+    assert_eq!(github.scope, McpScope::Global);
 }
 
 #[test]

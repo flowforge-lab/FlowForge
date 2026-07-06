@@ -1,0 +1,795 @@
+use super::*;
+use crate::chunk_markdown;
+use crate::embed::{Embedder, NoopEmbedder};
+use std::path::Path;
+
+/// 3-axis [rust, python, sqlite] keyword vector — deterministic stand-in for
+/// a real embedder so fusion is unit-testable without a model.
+fn vectorize(text: &str) -> Vec<f32> {
+    let l = text.to_lowercase();
+    vec![
+        f32::from(l.contains("rust")),
+        f32::from(l.contains("python")),
+        f32::from(l.contains("sqlite")),
+    ]
+}
+
+/// Embeds chunks by keyword and returns a fixed query vector, so a test can
+/// aim the query at a chosen chunk regardless of the BM25 ordering.
+struct FakeEmbedder {
+    query: Vec<f32>,
+}
+impl Embedder for FakeEmbedder {
+    fn embed_query(&self, _query: &str) -> Result<Option<Vec<f32>>> {
+        Ok(Some(self.query.clone()))
+    }
+    fn embed_chunk(&self, text: &str) -> Result<Option<Vec<f32>>> {
+        Ok(Some(vectorize(text)))
+    }
+}
+
+fn chunks(md: &str, path: &str) -> Vec<MemoryChunk> {
+    chunk_markdown(md, MemorySource::Curated, Path::new(path))
+}
+
+#[test]
+fn search_ranks_and_returns_chunks() {
+    let idx = Fts5Index::open_in_memory().unwrap();
+    idx.reindex(&chunks(
+        "## Prefs\nuser prefers rust over python\n\n## Tools\nuse sqlite for storage",
+        "MEMORY.md",
+    ))
+    .unwrap();
+    let hits = idx.search("rust", 10).unwrap();
+    assert_eq!(hits.len(), 1);
+    assert!(hits[0].chunk.text.contains("rust"));
+    assert_eq!(hits[0].chunk.heading.as_deref(), Some("Prefs"));
+}
+
+#[test]
+fn empty_query_returns_nothing() {
+    let idx = Fts5Index::open_in_memory().unwrap();
+    idx.reindex(&chunks("## H\nbody", "MEMORY.md")).unwrap();
+    assert!(idx.search("   ", 10).unwrap().is_empty());
+}
+
+#[test]
+fn special_chars_do_not_error() {
+    let idx = Fts5Index::open_in_memory().unwrap();
+    idx.reindex(&chunks("## H\norigin address id join key", "MEMORY.md"))
+        .unwrap();
+    // Colons, hyphens, quotes — all would be FTS5 syntax without sanitizing.
+    let hits = idx.search("origin: \"address\" - id", 10).unwrap();
+    assert!(!hits.is_empty());
+}
+
+#[test]
+fn reindex_is_a_full_replace() {
+    let idx = Fts5Index::open_in_memory().unwrap();
+    idx.reindex(&chunks("## A\nalpha content", "MEMORY.md"))
+        .unwrap();
+    idx.reindex(&chunks("## B\nbeta content", "MEMORY.md"))
+        .unwrap();
+    assert!(idx.search("alpha", 10).unwrap().is_empty());
+    assert_eq!(idx.search("beta", 10).unwrap().len(), 1);
+}
+
+#[test]
+fn reindex_path_replaces_only_that_file() {
+    let idx = Fts5Index::open_in_memory().unwrap();
+    idx.reindex_path(Path::new("a.md"), &chunks("## A\napple", "a.md"))
+        .unwrap();
+    idx.reindex_path(Path::new("b.md"), &chunks("## B\nbanana", "b.md"))
+        .unwrap();
+    // Rewriting a.md must not touch b.md.
+    idx.reindex_path(Path::new("a.md"), &chunks("## A\navocado", "a.md"))
+        .unwrap();
+    assert!(idx.search("apple", 10).unwrap().is_empty());
+    assert_eq!(idx.search("avocado", 10).unwrap().len(), 1);
+    assert_eq!(idx.search("banana", 10).unwrap().len(), 1);
+}
+
+#[test]
+fn remove_path_drops_a_files_chunks() {
+    let idx = Fts5Index::open_in_memory().unwrap();
+    idx.reindex_path(Path::new("a.md"), &chunks("## A\napple", "a.md"))
+        .unwrap();
+    idx.remove_path(Path::new("a.md")).unwrap();
+    assert!(idx.search("apple", 10).unwrap().is_empty());
+}
+
+#[test]
+fn daily_source_round_trips_through_index() {
+    let idx = Fts5Index::open_in_memory().unwrap();
+    let date = NaiveDate::from_ymd_opt(2026, 6, 18).unwrap();
+    let cs = chunk_markdown(
+        "## Log\nshipped m5.1",
+        MemorySource::Daily { date },
+        Path::new("daily/2026-06-18.md"),
+    );
+    idx.reindex(&cs).unwrap();
+    let hits = idx.search("shipped", 10).unwrap();
+    assert_eq!(hits[0].chunk.source, MemorySource::Daily { date });
+}
+
+#[test]
+fn persists_to_disk_and_reopens() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("index.db");
+    {
+        let idx = Fts5Index::open(&db).unwrap();
+        idx.reindex(&chunks("## H\npersistent body", "MEMORY.md"))
+            .unwrap();
+    }
+    let idx = Fts5Index::open(&db).unwrap();
+    assert_eq!(idx.search("persistent", 10).unwrap().len(), 1);
+}
+
+#[test]
+fn blob_round_trips_an_embedding() {
+    let v = vec![0.5_f32, -1.25, 3.0, 0.0];
+    assert_eq!(blob_to_vec(&vec_to_blob(&v)), v);
+}
+
+#[test]
+fn cosine_is_one_for_parallel_zero_for_orthogonal() {
+    assert!((cosine(&[1.0, 0.0], &[2.0, 0.0]) - 1.0).abs() < 1e-6);
+    assert!(cosine(&[1.0, 0.0], &[0.0, 1.0]).abs() < 1e-6);
+    assert_eq!(cosine(&[0.0, 0.0], &[1.0, 1.0]), 0.0);
+    assert_eq!(cosine(&[1.0], &[1.0, 1.0]), 0.0);
+}
+
+#[test]
+fn hybrid_with_noop_is_byte_identical_to_fts5() {
+    let md = "## Prefs\nuser prefers rust over python\n\n## Tools\nuse sqlite for storage";
+    let bare = Fts5Index::open_in_memory().unwrap();
+    bare.reindex(&chunks(md, "MEMORY.md")).unwrap();
+
+    let hybrid = HybridIndex::new(Fts5Index::open_in_memory().unwrap(), NoopEmbedder);
+    hybrid.reindex(&chunks(md, "MEMORY.md")).unwrap();
+
+    for q in ["rust", "sqlite", "python prefers", "storage", "   "] {
+        assert_eq!(
+            hybrid.search(q, 10).unwrap(),
+            bare.search(q, 10).unwrap(),
+            "hybrid+noop must match bare BM25 for query {q:?}"
+        );
+    }
+}
+
+#[test]
+fn fusion_promotes_the_semantic_match_over_bm25_order() {
+    // Three chunks share the term "topic" so a "topic" query returns all
+    // three with (near-)tied BM25 — order falls to insert/id order, putting
+    // the python chunk first.
+    let md = "## P\npython topic\n\n## R\nrust topic\n\n## S\nsqlite topic";
+
+    let bm25_only = Fts5Index::open_in_memory().unwrap();
+    bm25_only.reindex(&chunks(md, "MEMORY.md")).unwrap();
+    let baseline = bm25_only.search("topic", 10).unwrap();
+    assert!(baseline.len() >= 3);
+    assert!(
+        baseline[0].chunk.text.contains("python"),
+        "baseline BM25 should lead with the python chunk, got {:?}",
+        baseline[0].chunk.text
+    );
+
+    // Aim the query vector at the rust axis: fusion must promote the rust
+    // chunk to the top even though BM25 alone ranks it lower.
+    let hybrid = HybridIndex::new(
+        Fts5Index::open_in_memory().unwrap(),
+        FakeEmbedder {
+            query: vec![1.0, 0.0, 0.0],
+        },
+    );
+    hybrid.reindex(&chunks(md, "MEMORY.md")).unwrap();
+    let fused = hybrid.search("topic", 10).unwrap();
+    assert!(
+        fused[0].chunk.text.contains("rust"),
+        "fusion should surface the rust chunk first, got {:?}",
+        fused[0].chunk.text
+    );
+}
+
+#[test]
+fn fusion_falls_back_to_bm25_when_query_vector_is_absent() {
+    // FakeEmbedder always yields a vector; NoopEmbedder yields none. With no
+    // query vector the hybrid path must be identical to BM25.
+    let md = "## A\nrust topic\n\n## B\npython topic";
+    let hybrid = HybridIndex::new(Fts5Index::open_in_memory().unwrap(), NoopEmbedder);
+    hybrid.reindex(&chunks(md, "MEMORY.md")).unwrap();
+    let bare = Fts5Index::open_in_memory().unwrap();
+    bare.reindex(&chunks(md, "MEMORY.md")).unwrap();
+    assert_eq!(
+        hybrid.search("topic", 10).unwrap(),
+        bare.search("topic", 10).unwrap()
+    );
+}
+
+#[test]
+fn open_migrates_pre_m530_schema_missing_embedding_column() {
+    // Simulate an M5.1 (#176) on-disk index whose `chunks` table predates the
+    // `embedding` column. `from_conn`'s `CREATE TABLE IF NOT EXISTS` is a
+    // no-op against it, so the migration must back-fill the column or every
+    // reindex insert fails (the bug the #196 review caught — unit tests missed
+    // it because they all start from a fresh `open_in_memory`).
+    let conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch(
+        "CREATE TABLE chunks (
+             id         INTEGER PRIMARY KEY,
+             source     TEXT NOT NULL,
+             path       TEXT NOT NULL,
+             heading    TEXT,
+             text       TEXT NOT NULL,
+             line_start INTEGER NOT NULL,
+             line_end   INTEGER NOT NULL
+         );
+         CREATE VIRTUAL TABLE chunks_fts
+             USING fts5(text, content='chunks', content_rowid='id');",
+    )
+    .unwrap();
+
+    let idx = Fts5Index::from_conn(conn).unwrap();
+    idx.reindex(&chunks("## Prefs\nuser prefers rust", "MEMORY.md"))
+        .unwrap();
+    let hits = idx.search("rust", 10).unwrap();
+    assert_eq!(hits.len(), 1);
+    assert!(hits[0].chunk.text.contains("rust"));
+}
+
+// ----- M6.0 chunk_stats foundation (RFC 0007) --------------------------
+
+use crate::DecayConfig;
+
+/// Read a `chunk_stats` row by key: `(weight, last_accessed, access_count)`.
+fn read_stat(idx: &Fts5Index, key: &str) -> Option<(f32, i64, i64)> {
+    let conn = idx.conn.lock().unwrap();
+    conn.query_row(
+        "SELECT weight, last_accessed, access_count FROM chunk_stats WHERE chunk_key = ?1",
+        params![key],
+        |r| Ok((r.get::<_, f64>(0)? as f32, r.get(1)?, r.get(2)?)),
+    )
+    .optional()
+    .unwrap()
+}
+
+fn scored(chunks: &[MemoryChunk]) -> Vec<ScoredChunk> {
+    chunks
+        .iter()
+        .map(|c| ScoredChunk {
+            chunk: c.clone(),
+            score: 0.0,
+            weight: 1.0,
+            last_accessed_ms: None,
+        })
+        .collect()
+}
+
+fn enabled_decay() -> DecayConfig {
+    DecayConfig {
+        enabled: true,
+        ..DecayConfig::default()
+    }
+}
+
+fn disabled_decay() -> DecayConfig {
+    DecayConfig {
+        enabled: false,
+        ..DecayConfig::default()
+    }
+}
+
+fn ambient_decay(gain: f32) -> DecayConfig {
+    DecayConfig {
+        enabled: true,
+        ambient_gain: gain,
+        ..DecayConfig::default()
+    }
+}
+
+#[test]
+fn decay_lazy_equals_repeated_daily() {
+    let f = 0.98_f32;
+    let day = ONE_DAY_MS as i64;
+    let lazy = decayed_weight(1.0, 0, day * 10, f);
+    let mut step = 1.0_f32;
+    for _ in 0..10 {
+        step = decayed_weight(step, 0, day, f);
+    }
+    assert!((lazy - step).abs() < 1e-4, "lazy {lazy} vs daily {step}");
+}
+
+#[test]
+fn reinforcement_clamps_at_one() {
+    let mut w = 0.2_f32;
+    for _ in 0..100 {
+        w = reinforced_weight(w, 0.3);
+        assert!(w <= 1.0 + f32::EPSILON, "weight escaped 1.0: {w}");
+    }
+    assert!((w - 1.0).abs() < 1e-3);
+    // A fresh fully-salient chunk stays put.
+    assert_eq!(reinforced_weight(1.0, 0.3), 1.0);
+}
+
+#[test]
+fn reinforce_records_new_chunk_at_full_weight() {
+    let idx = Fts5Index::open_in_memory()
+        .unwrap()
+        .with_decay(enabled_decay());
+    let cs = chunks("## H\nalpha body", "MEMORY.md");
+    idx.reindex(&cs).unwrap();
+    idx.reinforce(&scored(&cs)).unwrap();
+    let key = chunk_key(&cs[0]);
+    let (w, _, count) = read_stat(&idx, &key).expect("stat row created");
+    assert_eq!(w, 1.0);
+    assert_eq!(count, 1);
+}
+
+#[test]
+fn reinforce_decays_then_lifts_existing_weight() {
+    let decay = DecayConfig {
+        enabled: true,
+        factor: 0.5,
+        reinforce_gain: 0.3,
+        ..DecayConfig::default()
+    };
+    let idx = Fts5Index::open_in_memory().unwrap().with_decay(decay);
+    let cs = chunks("## H\nalpha body", "MEMORY.md");
+    idx.reindex(&cs).unwrap();
+    let hits = scored(&cs);
+    idx.reinforce_at(&hits, 0).unwrap();
+    // Two idle days later: decay 1.0 -> 0.25, reinforce -> 0.25 + 0.3*0.75 = 0.475.
+    let day = ONE_DAY_MS as i64;
+    idx.reinforce_at(&hits, day * 2).unwrap();
+    let key = chunk_key(&cs[0]);
+    let (w, last, count) = read_stat(&idx, &key).unwrap();
+    assert!((w - 0.475).abs() < 1e-4, "weight {w}");
+    assert_eq!(last, day * 2);
+    assert_eq!(count, 2);
+}
+
+#[test]
+fn disabled_records_stats_but_never_decays() {
+    // Decay explicitly disabled (the M5 rollback path): access is recorded but
+    // weight is frozen.
+    let idx = Fts5Index::open_in_memory()
+        .unwrap()
+        .with_decay(disabled_decay());
+    let cs = chunks("## H\nalpha body", "MEMORY.md");
+    idx.reindex(&cs).unwrap();
+    let hits = scored(&cs);
+    idx.reinforce_at(&hits, 0).unwrap();
+    let day = ONE_DAY_MS as i64;
+    idx.reinforce_at(&hits, day * 10).unwrap();
+    let key = chunk_key(&cs[0]);
+    let (w, last, count) = read_stat(&idx, &key).unwrap();
+    assert_eq!(w, 1.0, "weight must not decay when disabled");
+    assert_eq!(last, day * 10, "last_accessed is still recorded");
+    assert_eq!(count, 2, "access_count is still recorded");
+}
+
+#[test]
+fn stats_survive_edit_and_reindex_under_stable_key() {
+    let idx = Fts5Index::open_in_memory()
+        .unwrap()
+        .with_decay(enabled_decay());
+    let cs = chunks("## H\nalpha body", "MEMORY.md");
+    idx.reindex(&cs).unwrap();
+    idx.reinforce(&scored(&cs)).unwrap();
+    let key = chunk_key(&cs[0]);
+    assert_eq!(read_stat(&idx, &key).unwrap().2, 1);
+
+    // Re-author the same fact with whitespace / line shifts: chunk_key is
+    // stable (consolidate.rs), so the row must survive the orphan sweep.
+    let edited = chunks("\n\n## H\nalpha body   \n\n", "MEMORY.md");
+    assert_eq!(
+        chunk_key(&edited[0]),
+        key,
+        "key must be stable across edits"
+    );
+    idx.reindex(&edited).unwrap();
+    idx.reinforce(&scored(&edited)).unwrap();
+    let (_, _, count) = read_stat(&idx, &key).expect("stat row survived reindex");
+    assert_eq!(count, 2, "row persisted, so access_count accumulated");
+}
+
+#[test]
+fn reindex_sweeps_orphaned_stats() {
+    let idx = Fts5Index::open_in_memory()
+        .unwrap()
+        .with_decay(enabled_decay());
+    let cs = chunks("## H\nalpha body", "MEMORY.md");
+    idx.reindex(&cs).unwrap();
+    idx.reinforce(&scored(&cs)).unwrap();
+    let stale_key = chunk_key(&cs[0]);
+    assert!(read_stat(&idx, &stale_key).is_some());
+
+    // Replace with genuinely new content: the old key is orphaned and swept.
+    let fresh = chunks("## H\ncompletely different content", "MEMORY.md");
+    idx.reindex(&fresh).unwrap();
+    assert!(
+        read_stat(&idx, &stale_key).is_none(),
+        "orphan must be swept"
+    );
+}
+
+#[test]
+fn empty_reindex_sweeps_all_stats() {
+    let idx = Fts5Index::open_in_memory()
+        .unwrap()
+        .with_decay(enabled_decay());
+    let cs = chunks("## H\nalpha body", "MEMORY.md");
+    idx.reindex(&cs).unwrap();
+    idx.reinforce(&scored(&cs)).unwrap();
+    idx.reindex(&[]).unwrap();
+    assert!(read_stat(&idx, &chunk_key(&cs[0])).is_none());
+}
+
+// ----- M6.1 dormancy reads (RFC 0007 §3) -------------------------------
+
+#[test]
+fn search_then_reinforce_lands_on_indexed_key() {
+    // Guards the production invariant (PR #367 review): a chunk reconstructed
+    // by `search` must hash to the same `chunk_key` as the indexed chunk, so
+    // search-driven reinforcement updates the row the orphan sweep keeps. A
+    // future change to search's SELECT or to chunk_key's inputs would break
+    // this silently with every other test still green.
+    let idx = Fts5Index::open_in_memory()
+        .unwrap()
+        .with_decay(enabled_decay());
+    let cs = chunks("## Prefs\nuser prefers rust", "MEMORY.md");
+    idx.reindex(&cs).unwrap();
+
+    let hits = idx.search("rust", 10).unwrap();
+    assert_eq!(hits.len(), 1);
+    idx.reinforce(&hits).unwrap();
+
+    let indexed_key = chunk_key(&cs[0]);
+    let (_, _, count) = read_stat(&idx, &indexed_key)
+        .expect("reinforce(search hits) must update the indexed chunk stats row");
+    assert_eq!(count, 1);
+    assert_eq!(
+        chunk_key(&hits[0].chunk),
+        indexed_key,
+        "search-reconstructed key must match the indexed key"
+    );
+}
+
+#[test]
+fn effective_stats_decays_at_read_time_without_persisting() {
+    let decay = DecayConfig {
+        enabled: true,
+        factor: 0.5,
+        ..DecayConfig::default()
+    };
+    let idx = Fts5Index::open_in_memory().unwrap().with_decay(decay);
+    let cs = chunks("## H\nalpha body", "MEMORY.md");
+    idx.reindex(&cs).unwrap();
+    idx.reinforce_at(&scored(&cs), 0).unwrap();
+    let key = chunk_key(&cs[0]);
+
+    // Two idle days later (factor 0.5): effective weight = 1.0 * 0.5^2 = 0.25.
+    let day = ONE_DAY_MS as i64;
+    let stats = idx
+        .effective_stats(std::slice::from_ref(&key), day * 2)
+        .unwrap();
+    let es = stats.get(&key).expect("row present");
+    assert!((es.weight - 0.25).abs() < 1e-4, "weight {}", es.weight);
+    assert_eq!(es.last_accessed_ms, 0);
+    // Read-only: the persisted weight is untouched.
+    assert_eq!(read_stat(&idx, &key).unwrap().0, 1.0);
+}
+
+#[test]
+fn effective_stats_omits_unknown_keys() {
+    let idx = Fts5Index::open_in_memory()
+        .unwrap()
+        .with_decay(enabled_decay());
+    let stats = idx.effective_stats(&["nope".to_string()], 0).unwrap();
+    assert!(
+        stats.is_empty(),
+        "unknown key absent -> caller treats as 1.0"
+    );
+}
+
+#[test]
+fn effective_stats_empty_when_decay_disabled() {
+    let idx = Fts5Index::open_in_memory()
+        .unwrap()
+        .with_decay(disabled_decay());
+    let cs = chunks("## H\nalpha body", "MEMORY.md");
+    idx.reindex(&cs).unwrap();
+    idx.reinforce_at(&scored(&cs), 0).unwrap();
+    let stats = idx
+        .effective_stats(&[chunk_key(&cs[0])], ONE_DAY_MS as i64 * 100)
+        .unwrap();
+    assert!(
+        stats.is_empty(),
+        "disabled -> nothing dormant, identical to M5"
+    );
+}
+
+#[test]
+fn search_annotates_decayed_weight() {
+    let decay = DecayConfig {
+        enabled: true,
+        factor: 0.5,
+        ..DecayConfig::default()
+    };
+    let idx = Fts5Index::open_in_memory().unwrap().with_decay(decay);
+    let cs = chunks("## Prefs\nuser prefers rust", "MEMORY.md");
+    idx.reindex(&cs).unwrap();
+    // Last access at the epoch: read-time decay to "now" collapses the weight.
+    idx.reinforce_at(&scored(&cs), 0).unwrap();
+
+    let hits = idx.search("rust", 10).unwrap();
+    assert_eq!(hits.len(), 1);
+    assert!(hits[0].weight < 0.25, "decayed weight {}", hits[0].weight);
+    assert_eq!(hits[0].last_accessed_ms, Some(0));
+}
+
+#[test]
+fn search_weight_stays_one_when_decay_disabled() {
+    let idx = Fts5Index::open_in_memory()
+        .unwrap()
+        .with_decay(disabled_decay());
+    let cs = chunks("## Prefs\nuser prefers rust", "MEMORY.md");
+    idx.reindex(&cs).unwrap();
+    idx.reinforce_at(&scored(&cs), 0).unwrap();
+    let hits = idx.search("rust", 10).unwrap();
+    assert_eq!(hits[0].weight, 1.0, "disabled decay -> weight neutral");
+    assert_eq!(hits[0].last_accessed_ms, None);
+}
+const DAY_MS_I: i64 = ONE_DAY_MS as i64;
+
+#[test]
+fn reinforce_ambient_bumps_existing_row_weaker_than_recall() {
+    let idx = Fts5Index::open_in_memory()
+        .unwrap()
+        .with_decay(ambient_decay(0.1));
+    let cs = chunks("## H\nalpha body", "MEMORY.md");
+    idx.reindex(&cs).unwrap();
+    idx.reinforce_at(&scored(&cs), 0).unwrap(); // recall: weight 1.0 @ t=0
+
+    let later = DAY_MS_I * 100;
+    idx.reinforce_ambient_at(&[chunk_key(&cs[0])], later)
+        .unwrap();
+
+    let decayed = decayed_weight(1.0, 0, later, 0.98);
+    let recall_bump = reinforced_weight(decayed, 0.3); // reinforce_gain
+    let (w, last, count) = read_stat(&idx, &chunk_key(&cs[0])).unwrap();
+    assert!(w > decayed, "ambient gain must bump above pure decay");
+    assert!(
+        w < recall_bump,
+        "ambient bump must be weaker than a recall bump"
+    );
+    assert_eq!(last, later, "ambient touch refreshes last_accessed");
+    assert_eq!(count, 2, "ambient touch counts as an access");
+}
+
+#[test]
+fn reinforce_ambient_skips_never_recalled_chunk() {
+    let idx = Fts5Index::open_in_memory()
+        .unwrap()
+        .with_decay(ambient_decay(0.1));
+    let cs = chunks("## H\nalpha body", "MEMORY.md");
+    idx.reindex(&cs).unwrap();
+    // Never recalled -> no chunk_stats row. Ambient must NOT create one (RFC §3).
+    idx.reinforce_ambient_at(&[chunk_key(&cs[0])], DAY_MS_I)
+        .unwrap();
+    assert!(
+        read_stat(&idx, &chunk_key(&cs[0])).is_none(),
+        "ambient injection must not start the age clock for a never-recalled chunk"
+    );
+}
+
+#[test]
+fn reinforce_ambient_noop_when_gain_zero() {
+    let idx = Fts5Index::open_in_memory()
+        .unwrap()
+        .with_decay(ambient_decay(0.0));
+    let cs = chunks("## H\nalpha body", "MEMORY.md");
+    idx.reindex(&cs).unwrap();
+    idx.reinforce_at(&scored(&cs), 0).unwrap();
+    idx.reinforce_ambient_at(&[chunk_key(&cs[0])], DAY_MS_I * 100)
+        .unwrap();
+    let (w, last, count) = read_stat(&idx, &chunk_key(&cs[0])).unwrap();
+    assert_eq!((w, last, count), (1.0, 0, 1), "gain 0 => complete no-op");
+}
+
+#[test]
+fn reinforce_ambient_noop_when_decay_disabled() {
+    let idx = Fts5Index::open_in_memory()
+        .unwrap()
+        .with_decay(disabled_decay());
+    let cs = chunks("## H\nalpha body", "MEMORY.md");
+    idx.reindex(&cs).unwrap();
+    idx.reinforce_at(&scored(&cs), 0).unwrap();
+    idx.reinforce_ambient_at(&[chunk_key(&cs[0])], DAY_MS_I * 100)
+        .unwrap();
+    let (w, last, count) = read_stat(&idx, &chunk_key(&cs[0])).unwrap();
+    assert_eq!((w, last, count), (1.0, 0, 1), "decay off => complete no-op");
+}
+
+// ----- M6.2 snapshot + reset + pin (RFC 0007 §7, #293) -----------------
+
+fn read_pinned(idx: &Fts5Index, key: &str) -> Option<bool> {
+    let conn = idx.conn.lock().unwrap();
+    conn.query_row(
+        "SELECT pinned FROM chunk_stats WHERE chunk_key = ?1",
+        params![key],
+        |r| r.get::<_, i64>(0),
+    )
+    .optional()
+    .unwrap()
+    .map(|p| p != 0)
+}
+
+#[test]
+fn pin_holds_weight_at_one_across_a_decay_pass() {
+    // factor 0.5 would collapse an unpinned chunk to ~0 after 10 idle days;
+    // a pinned chunk reads 1.0 from BOTH the snapshot and effective_stats, so
+    // the ambient-injection skip path keeps it live (pinned facts never decay).
+    let decay = DecayConfig {
+        enabled: true,
+        factor: 0.5,
+        ..DecayConfig::default()
+    };
+    let idx = Fts5Index::open_in_memory().unwrap().with_decay(decay);
+    let cs = chunks("## H\nalpha body", "MEMORY.md");
+    idx.reindex(&cs).unwrap();
+    idx.reinforce_at(&scored(&cs), 0).unwrap();
+    let key = chunk_key(&cs[0]);
+    idx.set_chunk_pinned_at(&key, true, 0).unwrap();
+
+    let later = DAY_MS_I * 10;
+    let snap = idx
+        .chunk_stats_snapshot(std::slice::from_ref(&key), later)
+        .unwrap();
+    let s = snap.get(&key).expect("row present");
+    assert_eq!(s.weight, 1.0, "pinned weight held at 1.0");
+    assert!(!s.dormant, "pinned chunk is never dormant");
+    assert!(s.pinned);
+
+    let es = idx
+        .effective_stats(std::slice::from_ref(&key), later)
+        .unwrap();
+    assert_eq!(
+        es.get(&key).unwrap().weight,
+        1.0,
+        "effective_stats is pin-aware so curated_filter keeps the chunk live"
+    );
+}
+
+#[test]
+fn unpinned_chunk_below_threshold_is_dormant_in_snapshot() {
+    let decay = DecayConfig {
+        enabled: true,
+        factor: 0.5,
+        ..DecayConfig::default()
+    };
+    let idx = Fts5Index::open_in_memory().unwrap().with_decay(decay);
+    let cs = chunks("## H\nalpha body", "MEMORY.md");
+    idx.reindex(&cs).unwrap();
+    idx.reinforce_at(&scored(&cs), 0).unwrap();
+    let key = chunk_key(&cs[0]);
+
+    // 3 idle days: 1.0 * 0.5^3 = 0.125 < dormant_threshold (0.25).
+    let snap = idx
+        .chunk_stats_snapshot(std::slice::from_ref(&key), DAY_MS_I * 3)
+        .unwrap();
+    let s = snap.get(&key).unwrap();
+    assert!((s.weight - 0.125).abs() < 1e-4, "weight {}", s.weight);
+    assert!(s.dormant, "below threshold and unpinned => dormant");
+    assert_eq!(s.access_count, 1);
+    assert!(!s.pinned);
+}
+
+#[test]
+fn snapshot_emitted_even_when_decay_disabled() {
+    // Unlike effective_stats (empty when decay off), the snapshot still
+    // reports stored weight/access_count/pinned so the Salience panel is not
+    // all-or-nothing on the decay flag; nothing is ever dormant though.
+    let idx = Fts5Index::open_in_memory()
+        .unwrap()
+        .with_decay(disabled_decay());
+    let cs = chunks("## H\nalpha body", "MEMORY.md");
+    idx.reindex(&cs).unwrap();
+    idx.reinforce_at(&scored(&cs), 0).unwrap();
+    let key = chunk_key(&cs[0]);
+    let snap = idx
+        .chunk_stats_snapshot(std::slice::from_ref(&key), DAY_MS_I * 100)
+        .unwrap();
+    let s = snap.get(&key).expect("row present despite decay off");
+    assert_eq!(s.weight, 1.0, "decay off => stored weight, no decay");
+    assert!(!s.dormant, "decay off => never dormant");
+    assert_eq!(s.access_count, 1);
+}
+
+#[test]
+fn snapshot_omits_unknown_keys() {
+    let idx = Fts5Index::open_in_memory()
+        .unwrap()
+        .with_decay(enabled_decay());
+    let snap = idx.chunk_stats_snapshot(&["nope".to_string()], 0).unwrap();
+    assert!(
+        snap.is_empty(),
+        "no row => caller treats as never-recalled 1.0"
+    );
+}
+
+#[test]
+fn reset_restores_weight_and_creates_row_if_absent() {
+    let decay = DecayConfig {
+        enabled: true,
+        factor: 0.5,
+        ..DecayConfig::default()
+    };
+    let idx = Fts5Index::open_in_memory().unwrap().with_decay(decay);
+    let cs = chunks("## H\nalpha body", "MEMORY.md");
+    idx.reindex(&cs).unwrap();
+    let key = chunk_key(&cs[0]);
+
+    // Never recalled => no row. Reset must create it (wake) at weight 1.0.
+    assert!(read_stat(&idx, &key).is_none());
+    idx.reset_chunk_at(&key, 5_000).unwrap();
+    let (w, last, count) = read_stat(&idx, &key).expect("reset created the row");
+    assert_eq!((w, last, count), (1.0, 5_000, 0));
+
+    // Decay it, then reset again: weight back to 1.0, timestamp refreshed.
+    idx.reinforce_at(&scored(&cs), 0).unwrap(); // count -> 1, weight path
+    idx.reset_chunk_at(&key, DAY_MS_I).unwrap();
+    let (w, last, _) = read_stat(&idx, &key).unwrap();
+    assert_eq!(w, 1.0, "reset restores neutral weight");
+    assert_eq!(last, DAY_MS_I, "reset stamps last_accessed");
+}
+
+#[test]
+fn set_pinned_round_trips_and_creates_row_if_absent() {
+    let idx = Fts5Index::open_in_memory()
+        .unwrap()
+        .with_decay(enabled_decay());
+    let cs = chunks("## H\nalpha body", "MEMORY.md");
+    idx.reindex(&cs).unwrap();
+    let key = chunk_key(&cs[0]);
+
+    assert!(read_stat(&idx, &key).is_none());
+    idx.set_chunk_pinned_at(&key, true, 7_000).unwrap();
+    assert_eq!(read_pinned(&idx, &key), Some(true), "pin creates the row");
+    let (w, last, count) = read_stat(&idx, &key).unwrap();
+    assert_eq!(
+        (w, last, count),
+        (1.0, 7_000, 0),
+        "fresh pinned row defaults"
+    );
+
+    idx.set_chunk_pinned_at(&key, false, 9_000).unwrap();
+    assert_eq!(read_pinned(&idx, &key), Some(false), "unpin round-trips");
+}
+
+#[test]
+fn ensure_pinned_column_upgrades_a_columnless_db() {
+    // Simulate an M6.0 on-disk index: chunk_stats without the pinned column.
+    let conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch(
+        "CREATE TABLE chunk_stats (
+             chunk_key     TEXT PRIMARY KEY,
+             weight        REAL    NOT NULL DEFAULT 1.0,
+             last_accessed INTEGER NOT NULL,
+             access_count  INTEGER NOT NULL DEFAULT 0
+         );
+         INSERT INTO chunk_stats (chunk_key, weight, last_accessed, access_count)
+             VALUES ('old:key', 0.5, 0, 3);",
+    )
+    .unwrap();
+
+    // from_conn must ALTER-in-place so pin writes succeed on the upgraded DB.
+    let idx = Fts5Index::from_conn(conn).unwrap();
+    assert_eq!(
+        read_pinned(&idx, "old:key"),
+        Some(false),
+        "back-filled column defaults to 0 on the pre-existing row"
+    );
+    idx.set_chunk_pinned_at("old:key", true, 1_000).unwrap();
+    assert_eq!(read_pinned(&idx, "old:key"), Some(true));
+}
