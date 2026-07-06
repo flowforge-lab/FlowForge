@@ -51,6 +51,9 @@ import type { Format } from "../bindings/Format";
 import type { SecretKind } from "../bindings/SecretKind";
 import type { BedrockAuth } from "../bindings/BedrockAuth";
 import type { SearchHit } from "../bindings/SearchHit";
+import type { Goal } from "../bindings/Goal";
+import type { GoalBudget } from "../bindings/GoalBudget";
+import type { GoalLedgerEntry } from "../bindings/GoalLedgerEntry";
 import type { FfIpc, Unlisten } from "./ipc";
 import { mcpInstanceKey } from "./mcp";
 import type { MarketplaceSkill } from "./marketplace";
@@ -95,6 +98,53 @@ const SECRET_KIND_ALL: readonly SecretKind[] = [
 
 // 300 ms/word in slow mode — long enough to see the Stop button and click it.
 const TOKEN_INTERVAL_MS = import.meta.env.VITE_FF_MOCK_SLOW === "1" ? 300 : 40;
+
+// Goal mode (#717) faker tuning. The real backend's iteration boundary is one
+// `run_turn`; the mock stands in with a wall-clock tick that advances one
+// iteration, accrues spend, and appends a ledger entry — so the panel's gauges
+// fill live and eventually hit `exhausted` without any polling.
+const GOAL_TICK_MS = import.meta.env.VITE_FF_MOCK_SLOW === "1" ? 4000 : 1500;
+// RFC 0020 default when `goalSet` is called without an explicit budget.
+const GOAL_DEFAULT_MAX_ITERATIONS = 25;
+// Demo budget the seeded goal (createSession(goal)) runs under, small enough to
+// reach exhaustion in a short session and bounded on all three axes so every
+// gauge renders.
+const GOAL_DEMO_BUDGET: GoalBudget = {
+  maxIterations: 12,
+  maxTokens: 60_000,
+  maxWallMs: 5 * 60_000,
+};
+// Per-iteration spend the tick accrues (rough, just enough to move the gauges).
+const GOAL_TOKENS_PER_ITERATION = 3_600;
+
+// A tiny rotating script so successive ledger entries read like real work rather
+// than a repeated placeholder.
+const GOAL_STEP_SCRIPT: readonly {
+  claim: string;
+  action: string;
+  evidence: string;
+}[] = [
+  {
+    claim: "Repository builds cleanly from a fresh checkout.",
+    action: "Ran the workspace build.",
+    evidence: "cargo build --workspace → Finished in 41s",
+  },
+  {
+    claim: "The failing test is reproduced before any change.",
+    action: "Ran the targeted test.",
+    evidence: "cargo test goal_mode::exhaustion → 1 failed",
+  },
+  {
+    claim: "The fix compiles and the targeted test now passes.",
+    action: "Edited the loop boundary and re-ran the test.",
+    evidence: "cargo test goal_mode::exhaustion → ok",
+  },
+  {
+    claim: "No regression across the suite.",
+    action: "Ran the full test suite.",
+    evidence: "cargo test --workspace → 312 passed",
+  },
+];
 
 // Mirrors the backend `SECRET_ANSWER_PLACEHOLDER` (#562): a secret `ask_user`
 // answer is redacted at the source, so the `tool:result` the FE receives carries
@@ -790,6 +840,13 @@ export class MockIpc implements FfIpc {
   private updateProgressListeners = new Set<Listener<UpdateProgressEvent>>();
   private updateDownloadFinishedListeners = new Set<Listener<void>>();
   private workspaceBranchListeners = new Set<Listener<SessionWorkspace>>();
+  // Goal mode (#717). One goal per session (RFC 0020 §3), plus its auto-advance
+  // interval so the faked loop can be paused/resumed/cleared. The real backend
+  // persists to `<goals_dir>/<session_id>.json`; the mock just holds it in memory.
+  private goals = new Map<string, Goal>();
+  private goalTimers = new Map<string, ReturnType<typeof setInterval>>();
+  private goalUpdatedListeners = new Set<Listener<Goal>>();
+  private goalClearedListeners = new Set<Listener<string>>();
   // Paint-first boot (#599): the mock backend is "ready" immediately, so this is
   // never emitted — the FE's subscribe-then-check sees `isAppReady` -> true and
   // proceeds without waiting. Kept (not a no-op unlisten) so the surface mirrors
@@ -845,6 +902,11 @@ export class MockIpc implements FfIpc {
     if (goal) {
       this.sessions.set(session.id, session);
       this.emit(this.intentionListeners, { sessionId: session.id, goal });
+      // Goal mode (#717): a session created with an objective seeds an active goal
+      // so the status panel is exercisable through the normal "new session with a
+      // goal" flow, with no dedicated launch UI. Deferred a tick so the FE's
+      // `goal:updated` listener (wired at boot) is attached before the first emit.
+      setTimeout(() => this.startGoal(session.id, goal, GOAL_DEMO_BUDGET), 0);
     } else {
       this.pendingSessions.set(session.id, session);
     }
@@ -940,6 +1002,9 @@ export class MockIpc implements FfIpc {
     // Session-scoped approvals expire with the session (backend clears them in
     // `clear_session_approvals` on delete).
     this.sessionApproved.delete(sessionId);
+    // A goal is bound to its session (#717): drop it and stop its loop.
+    this.stopGoalTimer(sessionId);
+    this.goals.delete(sessionId);
   }
 
   async getMessages(sessionId: string): Promise<Message[]> {
@@ -1004,6 +1069,24 @@ export class MockIpc implements FfIpc {
     // the real backend flushing its INSERT on the first round.
     this.flushPending(sessionId);
     const user = this.append(sessionId, "user", content, attachments);
+    // Goal mode (#717, RFC 0020 §6): a message sent while a goal is `active` is
+    // NOT a normal turn — it becomes a steer, folded into `pendingSteer` for the
+    // next iteration. Record it, emit `goal:updated`, and close the turn against
+    // the (non-empty) user message so the composer clears without a `[stopped]`
+    // Continue affordance. The next auto-advance tick consumes the steer.
+    const activeGoal = this.goals.get(sessionId);
+    if (activeGoal && activeGoal.status === "active") {
+      activeGoal.pendingSteer = content;
+      activeGoal.updatedMs = now();
+      this.emitGoalUpdated(sessionId);
+      this.emit(this.doneListeners, {
+        sessionId,
+        messageId: user.id,
+        tokenCount: null,
+        stopReason: null,
+      });
+      return user.id;
+    }
     // Dev-only: `/cap` reproduces a turn that ends at the tool-call limit with no
     // streamed answer — the agent loop's empty-content finalizer writes a
     // `[stopped: …]` notice server-side without emitting tokens (#513). It's stored
@@ -2195,7 +2278,201 @@ Shipping the Settings redesign — currently the Memory browser (SET.8).
     return { session_id: "mock-sidecar", events: 0 };
   }
 
+  // Goal mode (#717, RFC 0020 §7). Mirrors the SHIPPED backend commands
+  // (#716/#753): the panel and this mock must speak the same contract — flat
+  // budget args on `goalSet`, `Goal | null` from status/pause/resume, a bare
+  // `Goal` on `goal:updated`, and a bare `sessionId` on `goal:cleared`. The mock
+  // stands in with an in-memory goal + a wall-clock tick so the panel is
+  // exercisable under `VITE_FF_MOCK=1`.
+  async goalSet(
+    sessionId: string,
+    objective: string,
+    maxIterations?: number,
+    maxTokens?: number,
+    maxWallMs?: number,
+  ): Promise<Goal> {
+    this.flushPending(sessionId);
+    const budget: GoalBudget = {
+      maxIterations: maxIterations ?? GOAL_DEFAULT_MAX_ITERATIONS,
+      maxTokens: maxTokens ?? undefined,
+      maxWallMs: maxWallMs ?? undefined,
+    };
+    return this.startGoal(sessionId, objective, budget);
+  }
+
+  async goalStatus(sessionId: string): Promise<Goal | null> {
+    const goal = this.goals.get(sessionId);
+    return goal ? this.snapshotGoal(goal) : null;
+  }
+
+  async goalPause(sessionId: string): Promise<Goal | null> {
+    const goal = this.goals.get(sessionId);
+    if (!goal) return null;
+    this.stopGoalTimer(sessionId);
+    if (goal.status === "active") {
+      goal.status = "paused";
+      goal.updatedMs = now();
+    }
+    this.emitGoalUpdated(sessionId);
+    return this.snapshotGoal(goal);
+  }
+
+  async goalResume(sessionId: string): Promise<Goal | null> {
+    const goal = this.goals.get(sessionId);
+    if (!goal) return null;
+    if (goal.status === "paused") {
+      goal.status = "active";
+      goal.updatedMs = now();
+      this.startGoalTimer(sessionId);
+    }
+    this.emitGoalUpdated(sessionId);
+    return this.snapshotGoal(goal);
+  }
+
+  async goalClear(sessionId: string): Promise<void> {
+    // Idempotent abort. Mirrors the backend `goal_clear`: stop the loop, delete
+    // the goal, then emit `goal:cleared` (bare `sessionId`) — NOT a terminal
+    // `goal:updated` — so the store drops the session and the panel unmounts.
+    this.stopGoalTimer(sessionId);
+    const existed = this.goals.delete(sessionId);
+    if (existed) this.emit(this.goalClearedListeners, sessionId);
+  }
+
+  onGoalUpdated(cb: Listener<Goal>): Promise<Unlisten> {
+    return this.subscribe(this.goalUpdatedListeners, cb);
+  }
+
+  onGoalCleared(cb: Listener<string>): Promise<Unlisten> {
+    return this.subscribe(this.goalClearedListeners, cb);
+  }
+
   // --- internals ---
+
+  // Goal-mode helpers (#717). `startGoal` (re)creates an active goal and kicks off
+  // the faked iteration loop; `tickGoal` advances one boundary.
+  private startGoal(
+    sessionId: string,
+    objective: string,
+    budget?: GoalBudget,
+  ): Goal {
+    this.stopGoalTimer(sessionId);
+    const ts = now();
+    const goal: Goal = {
+      sessionId,
+      objective,
+      status: "active",
+      iteration: 0,
+      budget: budget ?? { maxIterations: GOAL_DEFAULT_MAX_ITERATIONS },
+      spent: { tokens: 0, wallMs: 0 },
+      ledger: [],
+      createdMs: ts,
+      updatedMs: ts,
+    };
+    this.goals.set(sessionId, goal);
+    this.emitGoalUpdated(sessionId);
+    this.startGoalTimer(sessionId);
+    return this.snapshotGoal(goal);
+  }
+
+  private startGoalTimer(sessionId: string): void {
+    this.stopGoalTimer(sessionId);
+    const timer = setInterval(() => this.tickGoal(sessionId), GOAL_TICK_MS);
+    this.goalTimers.set(sessionId, timer);
+  }
+
+  private stopGoalTimer(sessionId: string): void {
+    const timer = this.goalTimers.get(sessionId);
+    if (timer) {
+      clearInterval(timer);
+      this.goalTimers.delete(sessionId);
+    }
+  }
+
+  // One iteration boundary (RFC 0020 §5.2): accrue spend, advance the ledger,
+  // fold any pending steer, then check stop conditions. Emits `goal:updated` so
+  // the panel re-renders without polling, and flips to `exhausted` on budget.
+  private tickGoal(sessionId: string): void {
+    const goal = this.goals.get(sessionId);
+    if (!goal || goal.status !== "active") {
+      this.stopGoalTimer(sessionId);
+      return;
+    }
+    const ts = now();
+    goal.iteration += 1;
+    goal.spent = {
+      tokens: goal.spent.tokens + GOAL_TOKENS_PER_ITERATION,
+      wallMs: goal.spent.wallMs + GOAL_TICK_MS,
+    };
+    this.advanceLedger(goal, ts);
+    // Demo path for the RFC 0020 §4 safety pause: an objective tagged "[ask]"
+    // halts at iteration 2 with the active step's `next: ask_user`, so the panel's
+    // "needs review" branch is exercisable under the mock. The real loop sets this
+    // when an Ask cell is hit mid-iteration (Track F).
+    if (
+      goal.objective.toLowerCase().includes("[ask]") &&
+      goal.iteration === 2
+    ) {
+      const activeEntry = goal.ledger[goal.ledger.length - 1];
+      if (activeEntry) {
+        activeEntry.next = "ask_user";
+        activeEntry.updatedMs = ts;
+      }
+      goal.status = "paused";
+      goal.updatedMs = ts;
+      this.stopGoalTimer(sessionId);
+      this.emitGoalUpdated(sessionId);
+      return;
+    }
+    // A steer sent during the run is consumed by this iteration (§6).
+    goal.pendingSteer = undefined;
+    goal.updatedMs = ts;
+
+    const b = goal.budget;
+    const exhausted =
+      goal.iteration >= b.maxIterations ||
+      (b.maxTokens != null && goal.spent.tokens >= b.maxTokens) ||
+      (b.maxWallMs != null && goal.spent.wallMs >= b.maxWallMs);
+    if (exhausted) {
+      goal.status = "exhausted";
+      this.stopGoalTimer(sessionId);
+    }
+    this.emitGoalUpdated(sessionId);
+  }
+
+  // Marks the current step `done` and opens the next one, cycling the script so
+  // the "last action" line reads like real evidence-first work (#74).
+  private advanceLedger(goal: Goal, ts: number): void {
+    const prev = goal.ledger[goal.ledger.length - 1];
+    if (prev && prev.status === "active") {
+      prev.status = "done";
+      prev.verdict = "match";
+      prev.next = "resume";
+      prev.updatedMs = ts;
+    }
+    const step = GOAL_STEP_SCRIPT[goal.ledger.length % GOAL_STEP_SCRIPT.length];
+    const entry: GoalLedgerEntry = {
+      id: uid(),
+      status: "active",
+      claim: step.claim,
+      action: step.action,
+      evidence: [step.evidence],
+      createdMs: ts,
+      updatedMs: ts,
+    };
+    goal.ledger.push(entry);
+  }
+
+  private emitGoalUpdated(sessionId: string): void {
+    const goal = this.goals.get(sessionId);
+    if (!goal) return;
+    // Bare `Goal` payload — matches the backend's `app.emit("goal:updated", &goal)`.
+    this.emit(this.goalUpdatedListeners, this.snapshotGoal(goal));
+  }
+
+  // Defensive copy (incl. the ledger array) so a listener can't mutate mock state.
+  private snapshotGoal(goal: Goal): Goal {
+    return { ...goal, ledger: [...goal.ledger] };
+  }
 
   private append(
     sessionId: string,
