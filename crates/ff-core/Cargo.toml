@@ -14,6 +14,7 @@ globset = { workspace = true }
 # Resolve the user's home dir to rebuild the login-shell PATH a GUI-launched
 # process misses, so spawned tools (cargo/gh/git) resolve (#755).
 dirs = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

@@ -2381,6 +2381,63 @@ fn build_goal_store_round_trips_a_goal() {
     assert!(store.load(&sid).unwrap().is_none(), "cleared");
 }
 
+// Single-flight guard (#716) is what makes boot rehydration (#802) safe against
+// a racing IPC `goal_resume`: the second claimant is refused, so only one loop
+// per session can ever run. The slot is reclaimable once the loop ends.
+#[test]
+fn goal_loop_single_flight_guard_refuses_a_second_start() {
+    let state = AppState::new();
+    let sid = "guard-sess";
+    assert!(
+        state.try_start_goal_loop(sid),
+        "first caller claims the slot"
+    );
+    assert!(
+        !state.try_start_goal_loop(sid),
+        "a racing second start is refused"
+    );
+    assert!(state.goal_loop_running(sid));
+    state.end_goal_loop(sid);
+    assert!(!state.goal_loop_running(sid));
+    assert!(
+        state.try_start_goal_loop(sid),
+        "slot is reclaimable after the loop ends"
+    );
+    state.end_goal_loop(sid);
+}
+
+// Boot resume-on-restart (#802) iterates `goals.list_active()` and respawns a
+// loop per session. This asserts the selection that drives it: only `Active`
+// goals come back; Paused/Completed/etc are left for a manual resume. Uses an
+// isolated tempdir (not the shared per-process `build_goal_store` dir) so the
+// assertion is an exact set, free of cross-test leakage.
+#[test]
+fn boot_rehydration_selects_only_active_goals() {
+    use ff_core::{Goal, GoalStatus};
+    let dir = tempfile::tempdir().unwrap();
+    let store = GoalStore::new(dir.path().join("goals"));
+    let save = |sid: &str, status: GoalStatus| {
+        let mut g = Goal::new(sid, "obj", 1);
+        g.status = status;
+        store.save(&g).unwrap();
+    };
+    save("resume-me", GoalStatus::Active);
+    save("was-paused", GoalStatus::Paused);
+    save("was-done", GoalStatus::Completed);
+    save("was-failed", GoalStatus::Failed);
+
+    let active: Vec<String> = store
+        .list_active()
+        .into_iter()
+        .map(|g| g.session_id)
+        .collect();
+    assert_eq!(
+        active,
+        vec!["resume-me".to_string()],
+        "only the Active goal is respawned on boot"
+    );
+}
+
 #[test]
 fn default_control_config_matches_the_frontend_defaults() {
     // The backend bakes in the same factory ControlConfig the frontend's

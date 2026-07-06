@@ -327,6 +327,46 @@ impl GoalStore {
             Err(e) => Err(e),
         }
     }
+
+    /// The `Active` goals persisted in this store, for resume-on-restart (#802).
+    ///
+    /// Best-effort by design: a missing or unreadable directory yields an empty
+    /// vec, and a single unreadable or unparseable checkpoint is logged and
+    /// skipped rather than failing the whole scan -- a corrupt file must never
+    /// block boot from resuming the healthy goals. The atomic-write sibling
+    /// (`*.json.tmp`) and any non-`.json` entry are ignored.
+    pub fn list_active(&self) -> Vec<Goal> {
+        let entries = match fs::read_dir(&self.dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Vec::new(),
+            Err(e) => {
+                tracing::warn!(dir = %self.dir.display(), error = %e, "goal store: cannot scan for active goals");
+                return Vec::new();
+            }
+        };
+        let mut active = Vec::new();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            let raw = match fs::read_to_string(&path) {
+                Ok(raw) => raw,
+                Err(e) => {
+                    tracing::warn!(path = %path.display(), error = %e, "goal store: skipping unreadable checkpoint");
+                    continue;
+                }
+            };
+            match serde_json::from_str::<Goal>(&raw) {
+                Ok(goal) if goal.status == GoalStatus::Active => active.push(goal),
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(path = %path.display(), error = %e, "goal store: skipping unparseable checkpoint");
+                }
+            }
+        }
+        active
+    }
 }
 
 /// Atomically write `contents` to `path`: write a sibling `.tmp`, then rename it
@@ -486,5 +526,45 @@ mod tests {
         fs::write(root.join("s.json"), "{ not valid json").unwrap();
         let store = GoalStore::new(&root);
         assert!(store.load("s").is_err(), "corrupt file is an error");
+    }
+
+    #[test]
+    fn list_active_returns_only_active_goals_and_tolerates_junk() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("goals");
+        let store = GoalStore::new(&root);
+
+        let save_with = |sid: &str, status: GoalStatus| {
+            let mut g = Goal::new(sid, "obj", 1);
+            g.status = status;
+            store.save(&g).unwrap();
+        };
+        save_with("live-a", GoalStatus::Active);
+        save_with("live-b", GoalStatus::Active);
+        save_with("paused", GoalStatus::Paused);
+        save_with("done", GoalStatus::Completed);
+        save_with("failed", GoalStatus::Failed);
+        save_with("spent", GoalStatus::Exhausted);
+        // A corrupt checkpoint and an atomic-write leftover must not derail the
+        // scan, and a non-checkpoint file is ignored.
+        fs::write(root.join("garbage.json"), "{ not valid json").unwrap();
+        fs::write(root.join("half.json.tmp"), "{}").unwrap();
+        fs::write(root.join("README.txt"), "notes").unwrap();
+
+        let mut active: Vec<String> = store
+            .list_active()
+            .into_iter()
+            .map(|g| g.session_id)
+            .collect();
+        active.sort();
+        assert_eq!(active, vec!["live-a".to_string(), "live-b".to_string()]);
+    }
+
+    #[test]
+    fn list_active_on_missing_dir_is_empty_not_fatal() {
+        let dir = tempfile::tempdir().unwrap();
+        // Point at a subdir that was never created (no goal ever saved).
+        let store = GoalStore::new(dir.path().join("never-created"));
+        assert!(store.list_active().is_empty());
     }
 }
