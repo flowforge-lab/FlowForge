@@ -10,9 +10,11 @@ import {
   cellToMark,
   cycleCell,
   policyForMode,
+  OVERRIDE_BUCKETS,
+  groupOverridesByCell,
   type DefaultMode,
 } from "./control";
-import type { PermissionCell } from "@/bindings";
+import type { PermissionCell, PermissionOverrideEntry } from "@/bindings";
 
 describe("control matrix metadata", () => {
   it("lists modes plan → auto → act and the four permission rows", () => {
@@ -103,10 +105,37 @@ describe("CONTROL_DEFAULTS", () => {
     expect(CONTROL_DEFAULTS.injectMemory).toBe(true);
     expect(CONTROL_DEFAULTS.userInstructions).toBe("");
     expect(CONTROL_DEFAULTS.promptFiles).toEqual([]);
-    expect(CONTROL_DEFAULTS.overrides).toEqual({
-      denied: [],
-      requireApproval: [],
-      allowed: [],
+  });
+});
+
+describe("override buckets", () => {
+  it("orders buckets Deny → Ask → Allow", () => {
+    expect(OVERRIDE_BUCKETS.map((b) => b.cell)).toEqual([
+      "deny",
+      "ask",
+      "allow",
+    ]);
+  });
+
+  it("groups the flat override list by cell", () => {
+    const overrides: PermissionOverrideEntry[] = [
+      { tool: "web_fetch", cell: "deny" },
+      { tool: "git_push", cell: "ask" },
+      { tool: "ls", cell: "allow" },
+      { tool: "rm", cell: "deny" },
+    ];
+    expect(groupOverridesByCell(overrides)).toEqual({
+      deny: ["web_fetch", "rm"],
+      ask: ["git_push"],
+      allow: ["ls"],
+    });
+  });
+
+  it("returns empty buckets for no overrides", () => {
+    expect(groupOverridesByCell([])).toEqual({
+      allow: [],
+      ask: [],
+      deny: [],
     });
   });
 });

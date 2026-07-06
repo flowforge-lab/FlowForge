@@ -2601,6 +2601,24 @@ fn set_permission_cell(
     state.set_permission_cell(mode, safety, cell)
 }
 
+/// Set and persist a per-tool override (#700/#702), returning the updated view.
+/// The override replaces the matrix cell for the named tool across every
+/// Mode × Safety combination; it is read live by the approval gate.
+#[tauri::command]
+fn set_tool_override(
+    state: State<'_, Arc<AppState>>,
+    tool: String,
+    cell: PermissionCell,
+) -> PermissionMatrixView {
+    state.set_tool_override(tool, cell)
+}
+
+/// Remove a per-tool override (#700/#702), returning the updated view.
+#[tauri::command]
+fn remove_tool_override(state: State<'_, Arc<AppState>>, tool: String) -> PermissionMatrixView {
+    state.remove_tool_override(&tool)
+}
+
 // ---- MCP server control (M4.4, RFC 0003 §3,5) ----
 //
 // Enable/disable/add/remove write `mcp.json` via `ff_mcp::config`; the existing config
@@ -3360,6 +3378,8 @@ pub fn run() {
             set_default_mode,
             get_permission_matrix,
             set_permission_cell,
+            set_tool_override,
+            remove_tool_override,
             list_mcp_servers,
             restart_mcp_server,
             set_mcp_server_enabled,

@@ -6,7 +6,11 @@
 // Kept free of React/stores so the defaults + matrix derivation are unit-testable
 // in vitest's node env (mirrors lib/search.ts / lib/mcp.ts).
 
-import type { Safety, PermissionCell } from "@/bindings";
+import type {
+  Safety,
+  PermissionCell,
+  PermissionOverrideEntry,
+} from "@/bindings";
 
 export type DefaultMode = "plan" | "auto" | "act";
 
@@ -17,12 +21,6 @@ export type PermissionRow =
   | "dangerous";
 
 export type PermissionDecision = "allow" | "deny" | "ask";
-
-export interface ControlOverrides {
-  denied: string[];
-  requireApproval: string[];
-  allowed: string[];
-}
 
 /** A teammate profile (SET.12). FE-only mock until real teammate spawning lands. */
 export interface Teammate {
@@ -48,7 +46,6 @@ export interface ControlUi {
 export interface ControlConfig {
   defaultMode: DefaultMode;
   permissionPolicy: Record<PermissionRow, PermissionDecision>;
-  overrides: ControlOverrides;
   injectMemory: boolean;
   /** Backed by `user_instructions.md` once the backend lands. */
   userInstructions: string;
@@ -156,6 +153,37 @@ export function cellLabel(cell: PermissionCell): string {
   return "Denied";
 }
 
+// ─── Per-tool override buckets (#700/#702) ──────────────────────────────────
+// The Custom Overrides UI groups the flat `PermissionMatrixView.overrides` list
+// into three buckets by cell. A tool listed here bypasses the safety matrix and
+// resolves to its bucket's cell across every mode.
+
+export interface OverrideBucketMeta {
+  cell: PermissionCell;
+  label: string;
+  placeholder: string;
+}
+
+/** Buckets in escalating-capability order (Denied → Ask → Allowed). */
+export const OVERRIDE_BUCKETS: ReadonlyArray<OverrideBucketMeta> = [
+  { cell: "deny", label: "Denied", placeholder: "tool to deny" },
+  { cell: "ask", label: "Require approval", placeholder: "tool to gate" },
+  { cell: "allow", label: "Allowed", placeholder: "tool to allow" },
+];
+
+/** Group the flat override list into `{ allow, ask, deny }` tool-name arrays. */
+export function groupOverridesByCell(
+  overrides: ReadonlyArray<PermissionOverrideEntry>,
+): Record<PermissionCell, string[]> {
+  const grouped: Record<PermissionCell, string[]> = {
+    allow: [],
+    ask: [],
+    deny: [],
+  };
+  for (const { tool, cell } of overrides) grouped[cell].push(tool);
+  return grouped;
+}
+
 /** The per-row policy implied by a mode's canonical cells. */
 export function policyForMode(
   mode: DefaultMode,
@@ -183,7 +211,6 @@ export function slugify(raw: string): string {
 export const CONTROL_DEFAULTS: ControlConfig = {
   defaultMode: "auto",
   permissionPolicy: policyForMode("auto"),
-  overrides: { denied: [], requireApproval: [], allowed: [] },
   injectMemory: true,
   userInstructions: "",
   promptFiles: [],

@@ -7,23 +7,26 @@
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
-/// How much autonomy the agent has before it touches the world.
+/// How much autonomy the agent has before it touches the world. The per-tier
+/// approval outcome is set by the permission matrix (RFC 0019 §3); the summaries
+/// below describe its default cells.
 ///
 /// - [`Mode::Plan`] advertises only `Safety::ReadOnly` tools, so the model cannot
 ///   even see — let alone call — anything that mutates. Safe by construction.
-/// - [`Mode::Act`] advertises the full registry; Write calls go through the approval
-///   gate and Dangerous calls always prompt. This is FlowForge's historical behaviour.
-/// - [`Mode::Auto`] advertises the full registry and auto-approves Write, but
-///   Dangerous calls still always prompt. The factory default.
+/// - [`Mode::Act`] advertises the full registry; ReadOnly, Write, and Sensitive
+///   are auto-approved and Dangerous prompts for confirmation. Full access.
+/// - [`Mode::Auto`] advertises the full registry; ReadOnly and Write are
+///   auto-approved, Sensitive prompts, and Dangerous is denied. The factory default.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export, export_to = "../../../apps/desktop/src/bindings/")]
 pub enum Mode {
     /// Read-and-think only: only ReadOnly tools are advertised; nothing can mutate.
     Plan,
-    /// Full registry; Write is approval-gated, Dangerous always prompts.
+    /// Full registry; ReadOnly/Write/Sensitive auto-approved, Dangerous prompts.
     Act,
-    /// Full registry; Write is auto-approved, Dangerous always prompts. Default.
+    /// Full registry; ReadOnly/Write auto-approved, Sensitive prompts, Dangerous
+    /// denied. Default.
     #[default]
     Auto,
 }
