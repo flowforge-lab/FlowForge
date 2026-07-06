@@ -2380,3 +2380,32 @@ fn build_goal_store_round_trips_a_goal() {
     store.delete(&sid).unwrap();
     assert!(store.load(&sid).unwrap().is_none(), "cleared");
 }
+
+#[test]
+fn default_control_config_matches_the_frontend_defaults() {
+    // The backend bakes in the same factory ControlConfig the frontend's
+    // CONTROL_DEFAULTS declares (lib/control.ts). If this drifts, the real
+    // installed app's Control panel loads a shape the UI can't render.
+    let d = default_control_config();
+    assert_eq!(d["defaultMode"], "auto");
+    assert!(d["injectMemory"].as_bool().unwrap());
+    assert_eq!(d["permissionPolicy"]["read"], "allow");
+    assert_eq!(d["permissionPolicy"]["localWrites"], "allow");
+    assert_eq!(d["permissionPolicy"]["externalChanges"], "ask");
+    assert_eq!(d["permissionPolicy"]["dangerous"], "deny");
+    assert_eq!(d["ui"]["accentColor"], "#6366f1");
+    assert!(d["ui"]["contextualGreeting"].as_bool().unwrap());
+    assert_eq!(d["teammates"].as_array().unwrap().len(), 2);
+    // Every field the frontend ControlConfig interface requires is present.
+    for key in [
+        "defaultMode",
+        "permissionPolicy",
+        "injectMemory",
+        "userInstructions",
+        "promptFiles",
+        "teammates",
+        "ui",
+    ] {
+        assert!(d.get(key).is_some(), "missing field: {key}");
+    }
+}
