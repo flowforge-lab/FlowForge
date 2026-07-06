@@ -412,19 +412,32 @@ fn connection_to_config(conn: &ProviderConnection) -> ProviderConfig {
     }
 }
 
+/// The root of FlowForge's persisted config: `<OS config dir>/flowforge`
+/// (`~/Library/Application Support/flowforge` on macOS, `~/.config/flowforge` on
+/// Linux). Returns `None` when the OS exposes no config dir — settings then stay
+/// in-memory for the session. Under `cfg!(test)` this always returns `None` so the
+/// test suite can never read or clobber the developer's real config (the same
+/// isolation `build_session_store` / `build_scheduled_store` apply to their stores).
+fn flowforge_config_dir() -> Option<PathBuf> {
+    if cfg!(test) {
+        return None;
+    }
+    dirs::config_dir().map(|d| d.join("flowforge"))
+}
+
 /// `<config dir>/flowforge/provider.json` — the legacy single-provider file
 /// (`~/Library/Application Support` on macOS, `~/.config` on Linux). Still
 /// read for one-time migration into the registry, and left in place afterward as a
 /// backup. `None` only when the OS exposes no config dir.
 fn config_path() -> Option<PathBuf> {
-    dirs::config_dir().map(|d| d.join("flowforge").join("provider.json"))
+    flowforge_config_dir().map(|d| d.join("provider.json"))
 }
 
 /// `<config dir>/flowforge/provider-registry.json` — the persisted connection registry
 /// (replaces `provider.json`). `None` only when the OS exposes no config dir, in
 /// which case settings stay in-memory for the session.
 fn registry_path() -> Option<PathBuf> {
-    dirs::config_dir().map(|d| d.join("flowforge").join("provider-registry.json"))
+    flowforge_config_dir().map(|d| d.join("provider-registry.json"))
 }
 
 /// Build the registry to start from: the saved registry if present, else a one-time
@@ -465,10 +478,13 @@ fn read_registry_file(path: Option<&Path>) -> RegistryRead {
             return RegistryRead::Corrupt;
         }
     };
-    match serde_json::from_str::<ProviderRegistry>(&raw) {
-        Ok(registry) => RegistryRead::Loaded(registry),
-        Err(e) => {
-            tracing::error!(path = %path.display(), error = %e,
+    // Lenient parse: salvage every connection that still deserializes rather than
+    // wiping the user back to the factory default over one bad/forward-incompatible
+    // field (#811). Only a payload with zero salvageable connections is quarantined.
+    match ProviderRegistry::parse_lenient(&raw) {
+        Some(registry) => RegistryRead::Loaded(registry),
+        None => {
+            tracing::error!(path = %path.display(),
                 "provider registry unparseable; quarantining and seeding default");
             quarantine_registry(path);
             RegistryRead::Corrupt
@@ -573,7 +589,7 @@ fn save_registry(registry: &ProviderRegistry) {
 /// `<config dir>/flowforge/search.json` — persisted, non-secret web-search settings.
 /// `None` only when the OS exposes no config dir (settings stay in-memory then).
 fn search_config_path() -> Option<PathBuf> {
-    dirs::config_dir().map(|d| d.join("flowforge").join("search.json"))
+    flowforge_config_dir().map(|d| d.join("search.json"))
 }
 
 /// Loads persisted web-search settings, falling back to the default (SearXNG, no
@@ -602,7 +618,7 @@ fn save_search_config(config: &SearchConfig) {
 /// `<config dir>/flowforge/control.json` — the Control panel's settings blob
 /// (#147). `None` only when the OS exposes no config dir.
 fn control_config_path() -> Option<PathBuf> {
-    dirs::config_dir().map(|d| d.join("flowforge").join("control.json"))
+    flowforge_config_dir().map(|d| d.join("control.json"))
 }
 
 /// The factory `ControlConfig`, returned on first load before the user has saved
@@ -672,7 +688,7 @@ fn save_control_config(config: &serde_json::Value) {
 /// `~/.config/flowforge/tool_permissions.json` — the persistent tool allowlist (#229).
 /// `None` only when the OS exposes no config dir.
 fn tool_permissions_path() -> Option<PathBuf> {
-    dirs::config_dir().map(|d| d.join("flowforge").join("tool_permissions.json"))
+    flowforge_config_dir().map(|d| d.join("tool_permissions.json"))
 }
 
 /// The on-disk session database (RFC 0012 / #277). `None` if no config dir resolves,
@@ -750,7 +766,7 @@ fn build_scheduled_store_inner() -> ScheduledStore {
 /// so a switch survives a restart (RFC 0001 §7). Separate from the phenotype
 /// *definitions* in `~/.flowforge/phenos/`; this only records which one is active.
 fn active_phenotype_path() -> Option<PathBuf> {
-    dirs::config_dir().map(|d| d.join("flowforge").join("phenotype.json"))
+    flowforge_config_dir().map(|d| d.join("phenotype.json"))
 }
 
 /// The persisted active phenotype name, or `None` if never set / unreadable. Falls
@@ -788,7 +804,7 @@ struct ActivePhenotypeFile {
 /// #265), persisted so the user's choice survives a restart. New sessions with no
 /// explicit binding inherit this; the factory value is [`Mode::Auto`].
 fn default_mode_path() -> Option<PathBuf> {
-    dirs::config_dir().map(|d| d.join("flowforge").join("mode.json"))
+    flowforge_config_dir().map(|d| d.join("mode.json"))
 }
 
 /// On-disk shape of `mode.json`.
@@ -822,7 +838,7 @@ fn save_default_mode(mode: Mode) {
 // ─── Permission matrix persistence (#699) ────────────────────────────────────
 
 fn permission_matrix_path() -> Option<PathBuf> {
-    dirs::config_dir().map(|d| d.join("flowforge").join("permissions.json"))
+    flowforge_config_dir().map(|d| d.join("permissions.json"))
 }
 
 fn load_permission_matrix() -> ff_core::PermissionMatrix {
@@ -854,8 +870,16 @@ fn save_permission_matrix(matrix: &ff_core::PermissionMatrix) {
     }
 }
 
-/// `~/.flowforge/phenos`, where phenotype definition TOML files live.
+/// `~/.flowforge/phenos`, where phenotype definition TOML files live. Under
+/// `cfg!(test)` this points at a per-process temp dir that is never created, so
+/// `resolve_phenotype` sees no installed definitions and falls back to the built-in
+/// `default` — the suite must never read the developer's real phenotypes (which
+/// carry their own model pins and would otherwise leak into resolution, e.g.
+/// `unbound_session_resolves_to_active_connection_and_its_model`) (#811).
 fn phenotypes_root() -> PathBuf {
+    if cfg!(test) {
+        return std::env::temp_dir().join(format!("ff-phenos-test-{}", std::process::id()));
+    }
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".flowforge")
