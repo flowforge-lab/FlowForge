@@ -1428,6 +1428,17 @@ fn spawn_assistant_turn(state: Arc<AppState>, app: tauri::AppHandle, session_id:
 /// timeout the turn is cancelled and the iteration is recorded as failed.
 const GOAL_ITERATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
 
+/// The neutral continuation nudge seeded as the user turn when a goal iteration
+/// has no pending steer (#778). It deliberately does NOT repeat the objective:
+/// the system-prompt goal block (#718, `ff_agent::system_prompt`) already carries
+/// the objective, progress ledger, and the `goal_complete` instruction, so
+/// inlining the objective here would duplicate it every iteration (and could
+/// drift from the sysprompt wording). Keep this generic — it only tells the agent
+/// to take the next step against the goal already described in its instructions.
+const GOAL_CONTINUE_NUDGE: &str =
+    "Continue toward the goal described in your instructions. Take the next \
+     concrete step, or call the `goal_complete` tool if it is fully met and verified.";
+
 /// The host-side [`GoalIteration`] (RFC 0020 §5.2, #716): drives one headless
 /// agent turn toward the objective, mirroring the scheduled runner's `fire` but
 /// against the live session with the interactive [`UiApprover`] — so a mid-loop
@@ -1477,13 +1488,15 @@ impl GoalIteration for GoalLoopIteration {
     }
 
     async fn run_once(&self, goal: &Goal) -> IterationOutcome {
-        // Seed the continuation turn: a pending steer (a message the user typed
-        // while the goal ran) takes priority; otherwise a neutral "continue"
-        // nudge carrying the objective. The system-prompt goal block (#718) will
-        // later carry the objective; until then we inline it in the user turn.
-        // The steer is one-shot: the loop clears `pending_steer` on the in-memory
-        // goal (via `steer_consumed`) before it checkpoints, so it is applied once
-        // and not re-persisted next boundary (#753 review nit 1).
+        // Seed the continuation turn. A pending steer (a message the user typed
+        // while the goal ran) takes priority as the turn content; otherwise a
+        // neutral "continue" nudge. The objective is NOT repeated here — the
+        // system-prompt goal block (#718) already carries the objective,
+        // progress, and the `goal_complete` instruction, so inlining it again
+        // duplicates it every iteration and drifts if it were ever reworded
+        // (#778). The steer is one-shot: the loop clears `pending_steer` on the
+        // in-memory goal (via `steer_consumed`) before it checkpoints, so it is
+        // applied once and not re-persisted next boundary (#753 review nit 1).
         let steer = goal
             .pending_steer
             .as_deref()
@@ -1492,12 +1505,7 @@ impl GoalIteration for GoalLoopIteration {
         let steer_consumed = steer.is_some();
         let prompt = match steer {
             Some(s) => s.to_string(),
-            None => format!(
-                "Continue working toward the goal: {}. If it is fully met and \
-                 verified, call the `goal_complete` tool; otherwise take the \
-                 next concrete step.",
-                goal.objective
-            ),
+            None => GOAL_CONTINUE_NUDGE.to_string(),
         };
         self.state
             .store
@@ -3713,6 +3721,33 @@ mod tests {
         // Operator hard-denies it -> the loop halts.
         m.set_cell(Mode::Auto, Safety::Sensitive, PermissionCell::Deny);
         assert_eq!(goal_gate_for(Mode::Auto, &m), GateDecision::Deny);
+    }
+
+    // #778: the neutral continuation nudge must NOT inline the objective — the
+    // system-prompt goal block (#718) is the single source for it, so repeating
+    // it here duplicated it every iteration. Guard that the nudge stays generic
+    // while still pointing at goal_complete.
+    #[test]
+    fn goal_continue_nudge_does_not_inline_the_objective() {
+        let n = super::GOAL_CONTINUE_NUDGE;
+        assert!(
+            n.contains("goal_complete"),
+            "nudge should still point at the completion tool"
+        );
+        assert!(
+            n.to_lowercase().contains("continue toward the goal"),
+            "nudge should be a neutral continue"
+        );
+        // It must reference the goal only by indirection ("in your instructions"),
+        // never carry an objective string or a format placeholder.
+        assert!(
+            n.contains("described in your instructions"),
+            "nudge must defer to the system-prompt goal block for the objective"
+        );
+        assert!(
+            !n.contains("{}") && !n.contains("{0}"),
+            "nudge must be a static string, not an objective-interpolating format"
+        );
     }
 
     // Acceptance (#702): editing a matrix cell changes the invocation-time gate
