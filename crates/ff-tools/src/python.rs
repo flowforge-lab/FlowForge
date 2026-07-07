@@ -104,13 +104,13 @@ impl PythonTool {
     /// Central-cache layouts (poetry/pipenv defaults, conda named envs) are not
     /// probed -- discovering those means invoking the tool, which is out of scope
     /// for a stateless snippet runner; they resolve via `python3`/PATH instead.
-    fn interpreter(dir: &Path) -> PathBuf {
+    pub(crate) fn interpreter(dir: &Path) -> PathBuf {
         Self::interpreter_with(std::env::var("VIRTUAL_ENV").ok(), dir)
     }
 
     /// Interpreter selection with `$VIRTUAL_ENV` injected, so the precedence is
     /// testable without mutating process-global environment state.
-    fn interpreter_with(virtual_env: Option<String>, dir: &Path) -> PathBuf {
+    pub(crate) fn interpreter_with(virtual_env: Option<String>, dir: &Path) -> PathBuf {
         if let Some(ve) = virtual_env.filter(|v| !v.trim().is_empty()) {
             let candidate = Path::new(&ve).join(VENV_PYTHON_SUBPATH);
             if candidate.is_file() {

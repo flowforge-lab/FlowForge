@@ -433,6 +433,7 @@ fn delete_session(state: State<'_, Arc<AppState>>, session_id: String) {
     state.compaction_cache.invalidate(&session_id);
     state.store.delete_session(&session_id);
     state.reap_session_processes(&session_id);
+    state.reap_session_kernels(&session_id);
     // Release this session's per-workspace MCP instance refs, evicting any instance no
     // live session references (RFC 0018 §4.3). Spawned (not awaited) like the process
     // reap above: `delete_session` is a sync Tauri command that runs off the reactor on

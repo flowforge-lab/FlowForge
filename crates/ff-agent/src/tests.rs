@@ -2170,6 +2170,112 @@ async fn parallel_readonly_calls_run_concurrently() {
     assert_eq!(msg.content, "done reading");
 }
 
+/// #863 regression: a ReadOnly tool run in the parallel batch must receive the
+/// turn's real `session_id` (via `run_with_session`), not the anonymous
+/// `NO_SESSION`. Session-scoped ReadOnly tools (notebook_runner `status`,
+/// ProcessManagerTool `poll`/`list`) otherwise query an empty bucket and never
+/// see state created by their serial `start`/`run_cell` siblings.
+#[tokio::test]
+async fn parallel_readonly_call_receives_session_id() {
+    use std::sync::Mutex;
+
+    struct SessionSpy {
+        seen: Arc<Mutex<Vec<String>>>,
+    }
+    #[async_trait]
+    impl ff_tools::Tool for SessionSpy {
+        fn name(&self) -> &str {
+            "session_spy"
+        }
+        fn description(&self) -> &str {
+            "records the session id it is called with"
+        }
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {}})
+        }
+        fn safety(&self, _args: &serde_json::Value) -> ff_core::Safety {
+            ff_core::Safety::ReadOnly
+        }
+        async fn run(&self, _args: serde_json::Value, _root: &Path) -> ff_tools::ToolOutcome {
+            // The base `run` (NO_SESSION) must NOT be the path taken.
+            self.seen.lock().unwrap().push("<no-session>".into());
+            ff_tools::ToolOutcome::ok("ran without session")
+        }
+        async fn run_with_session(
+            &self,
+            _args: serde_json::Value,
+            _root: &Path,
+            session_id: &str,
+        ) -> ff_tools::ToolOutcome {
+            self.seen.lock().unwrap().push(session_id.to_string());
+            ff_tools::ToolOutcome::ok("ran with session")
+        }
+    }
+
+    struct OneReadThenText {
+        calls: AtomicUsize,
+    }
+    #[async_trait]
+    impl Provider for OneReadThenText {
+        async fn chat_stream(&self, _req: ChatRequest) -> Result<ChunkStream, LlmError> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            let chunks = if n == 0 {
+                vec![Ok(Chunk {
+                    tool_calls: vec![ToolCallDelta {
+                        index: 0,
+                        id: Some("c1".into()),
+                        name: Some("session_spy".into()),
+                        arguments: "{}".into(),
+                    }],
+                    done: true,
+                    ..Chunk::default()
+                })]
+            } else {
+                vec![Ok(Chunk {
+                    delta: "done".into(),
+                    done: true,
+                    ..Chunk::default()
+                })]
+            };
+            Ok(futures_util::stream::iter(chunks).boxed())
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let store = SessionStore::new();
+    let s = store.create_session(None);
+    store.add_message(&s.id, Role::User, "spy".into());
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let mut registry = ToolRegistry::new();
+    registry.register(Box::new(SessionSpy { seen: seen.clone() }));
+    let approve = AlwaysApprove;
+    let provider = OneReadThenText {
+        calls: AtomicUsize::new(0),
+    };
+
+    run_turn(
+        &provider,
+        &store,
+        &ctx(&registry, dir.path(), &approve),
+        &s.id,
+        "mock",
+        None,
+        false,
+        ReasoningVisibility::All,
+        CancelToken::new(),
+        |_| {},
+    )
+    .await
+    .unwrap();
+
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 1, "spy called once: {seen:?}");
+    assert_eq!(
+        seen[0], s.id,
+        "parallel ReadOnly call must get the real session id, not NO_SESSION"
+    );
+}
+
 /// #A1: a turn mixing a read-only call and a write call keeps the write on the
 /// serial, approval-gated path; the read-only call never reaches the approver.
 #[tokio::test]
