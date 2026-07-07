@@ -96,6 +96,12 @@ pub struct McpToolInfo {
     pub description: String,
     #[ts(type = "unknown")]
     pub input_schema: serde_json::Value,
+    /// The server's `annotations.readOnlyHint` (MCP spec): the tool declares it
+    /// does not modify its environment. Absent hint defaults to `false` (treated
+    /// as write-capable), so the safety default stays conservative. Used to let a
+    /// read-only bridged tool run without an approval gate (e.g. codegraph queries).
+    #[serde(default)]
+    pub read_only_hint: bool,
 }
 
 #[cfg(test)]
@@ -188,6 +194,7 @@ mod tests {
                 "properties": { "path": { "type": "string" } },
                 "required": ["path"]
             }),
+            read_only_hint: true,
         };
         round_trip(&tool);
         // camelCase: the Rust `input_schema` field is `inputSchema` on the wire.

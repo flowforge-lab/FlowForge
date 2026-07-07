@@ -3,8 +3,10 @@
 //! Each running MCP server's tools are registered into the per-turn `ToolRegistry`
 //! under a namespaced id `mcp__<server>__<tool>` (double-underscore, matching the
 //! Claude convention) to prevent collisions with built-ins and across servers.
-//! Every bridged tool defaults to `Safety::Write` so it is approval-gated — external
-//! code touching the user's machine is never auto-run.
+//! A bridged tool defaults to `Safety::Write` so it is approval-gated — external
+//! code touching the user's machine is never auto-run — unless the server marks it
+//! `readOnlyHint` (MCP annotations), in which case it is `Safety::ReadOnly` (e.g.
+//! codegraph's local index queries, usable in Plan mode).
 //!
 //! # Turn lifecycle & instance routing
 //!
@@ -38,6 +40,7 @@ pub struct McpBridgedTool {
     full_name: String,
     description: String,
     input_schema: Value,
+    read_only_hint: bool,
 }
 
 impl McpBridgedTool {
@@ -55,7 +58,19 @@ impl McpBridgedTool {
             full_name,
             description: info.description.clone(),
             input_schema: info.input_schema.clone(),
+            read_only_hint: info.read_only_hint,
         }
+    }
+}
+
+/// Map a bridged tool's `readOnlyHint` to its [`Safety`]. Read-only tools run
+/// without an approval gate (usable in Plan mode); everything else stays `Write`
+/// so external-process calls remain approval-gated (RFC 0003 §9.4).
+fn safety_for(read_only_hint: bool) -> Safety {
+    if read_only_hint {
+        Safety::ReadOnly
+    } else {
+        Safety::Write
     }
 }
 
@@ -74,8 +89,11 @@ impl Tool for McpBridgedTool {
     }
 
     fn safety(&self, _args: &Value) -> Safety {
-        // All external-process tool calls are approval-gated (RFC 0003 §9.4).
-        Safety::Write
+        // A tool that advertises `readOnlyHint` (MCP annotations) doesn't modify its
+        // environment — e.g. codegraph's local index queries — so it can run without
+        // an approval gate (and stays usable in Plan mode). Everything else defaults
+        // to Write so external-process calls remain approval-gated (RFC 0003 §9.4).
+        safety_for(self.read_only_hint)
     }
 
     async fn run(&self, args: Value, _root: &Path) -> ToolOutcome {
@@ -120,5 +138,13 @@ mod tests {
             McpBridgedTool::namespaced_name("my-server", "do_thing"),
             "mcp__my-server__do_thing"
         );
+    }
+
+    #[test]
+    fn read_only_hint_maps_to_read_only_else_write() {
+        // A readOnlyHint tool (e.g. codegraph queries) is ReadOnly so it isn't
+        // approval-gated and stays usable in Plan mode; otherwise Write (gated).
+        assert_eq!(safety_for(true), Safety::ReadOnly);
+        assert_eq!(safety_for(false), Safety::Write);
     }
 }

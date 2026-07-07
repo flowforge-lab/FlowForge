@@ -13,4 +13,11 @@ server: string,
 /**
  * The bare tool name as the server reports it (before `mcp__<server>__` namespacing).
  */
-name: string, description: string, inputSchema: unknown, };
+name: string, description: string, inputSchema: unknown, 
+/**
+ * The server's `annotations.readOnlyHint` (MCP spec): the tool declares it
+ * does not modify its environment. Absent hint defaults to `false` (treated
+ * as write-capable), so the safety default stays conservative. Used to let a
+ * read-only bridged tool run without an approval gate (e.g. codegraph queries).
+ */
+readOnlyHint: boolean, };
