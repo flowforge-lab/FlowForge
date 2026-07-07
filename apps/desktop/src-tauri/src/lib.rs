@@ -154,9 +154,9 @@ impl TurnMetrics {
 
 /// The invocation-time gate for a resolved permission cell (#702): `Some(true)`
 /// auto-approves, `Some(false)` rejects, `None` means prompt the user (`Ask`).
-/// Takes the already-resolved cell — the caller applies per-tool overrides via
-/// [`PermissionMatrix::effective_cell`] (#742) first. Pure so the gating semantics
-/// are unit-testable without a Tauri `AppHandle` or a live model turn.
+/// Superseded by [`pre_prompt_decision`] in production, but kept for the
+/// `edited_cell_flips_the_invocation_gate` test which exercises the raw cell semantics.
+#[cfg(test)]
 fn matrix_gate(cell: PermissionCell) -> Option<bool> {
     if cell.is_allow() {
         Some(true)
@@ -197,6 +197,51 @@ fn resolve_tool_arg(name: &str, args: &serde_json::Value) -> Option<String> {
     args.get(key).and_then(|v| v.as_str()).map(Into::into)
 }
 
+/// The synchronous, pre-prompt decision for a tool call (#828 Part C, #829 review).
+/// Pure — no AppHandle, no async, no state beyond the inputs. Testable directly,
+/// so a regression that reorders the allowlist above the Deny gate is caught.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrePromptDecision {
+    /// The matrix denies this call outright (e.g. Plan x Write).
+    Deny,
+    /// Auto-approved (allowlist hit, scoped Allow rule, or matrix Allow cell).
+    Allow,
+    /// None of the sync gates resolved it — prompt the user asynchronously.
+    Prompt,
+}
+
+/// Evaluate the synchronous approval gates in their canonical order (#827):
+/// 1. Matrix Deny is absolute (no override).
+/// 2. Allowlist accelerates Ask cells.
+/// 3. Scoped rules (Deny vetoes; Allow approves unless Dangerous).
+/// 4. Matrix Allow auto-approves; Ask falls through to Prompt.
+fn pre_prompt_decision(
+    cell: ff_core::PermissionCell,
+    allowlisted: bool,
+    scoped_effect: Option<ff_core::RuleEffect>,
+    safety: Safety,
+) -> PrePromptDecision {
+    use ff_core::{PermissionCell, RuleEffect};
+    if cell.is_deny() {
+        return PrePromptDecision::Deny;
+    }
+    if allowlisted {
+        return PrePromptDecision::Allow;
+    }
+    match scoped_effect {
+        Some(RuleEffect::Deny) => return PrePromptDecision::Deny,
+        Some(RuleEffect::Allow) if safety != Safety::Dangerous => {
+            return PrePromptDecision::Allow;
+        }
+        _ => {}
+    }
+    match cell {
+        PermissionCell::Allow => PrePromptDecision::Allow,
+        PermissionCell::Deny => PrePromptDecision::Deny, // unreachable (handled above)
+        PermissionCell::Ask => PrePromptDecision::Prompt,
+    }
+}
+
 #[async_trait]
 impl Approver for UiApprover {
     async fn approve(
@@ -210,48 +255,26 @@ impl Approver for UiApprover {
         // Snapshot the matrix once for this call, read live (#702/#742) so a
         // Control-panel edit takes effect on the next tool invocation.
         let matrix = self.state.permission_matrix();
-
-        // Deny is absolute (#827): the matrix gate fires first so that a Plan-mode
-        // Deny cell cannot be overridden by the allowlist or scoped rules. A tool
-        // approved in Act ("Allow for session") must NOT bypass Plan x Write = Deny.
         let cell = matrix.effective_cell(name, self.mode, safety);
-        if cell.is_deny() {
-            return false;
-        }
-
-        // Short-circuit on the #229 allowlist (never covers Dangerous — see
-        // `AppState::allowlist_covers`). Placed after the Deny gate so the
-        // allowlist only accelerates Ask cells, never overrides a Deny.
-        if self.state.allowlist_covers(&self.session_id, name, safety) {
-            return true;
-        }
-
-        // Scoped rules (#712, RFC 0019 §9): resolve the tool's relevant argument
-        // and evaluate. Deny rules veto unconditionally; Allow rules auto-approve
-        // except for Dangerous (degrades to Ask).
+        let allowlisted = self.state.allowlist_covers(&self.session_id, name, safety);
         let resolved_arg = resolve_tool_arg(name, args);
-        if let Some(effect) = matrix.evaluate_rules(name, resolved_arg.as_deref(), self.mode) {
-            match effect {
-                ff_core::RuleEffect::Deny => return false,
-                ff_core::RuleEffect::Allow => {
-                    // Allow rule never auto-clears Dangerous (#712 §9.3).
-                    if safety != Safety::Dangerous {
-                        tracing::info!(
-                            tool = name,
-                            arg = ?resolved_arg,
-                            "scoped rule auto-approved"
-                        );
-                        return true;
-                    }
-                    // Dangerous: fall through to prompt.
-                }
-            }
-        }
+        let scoped_effect = matrix.evaluate_rules(name, resolved_arg.as_deref(), self.mode);
 
-        // Permission matrix (#699/#702/#742): Allow auto-approves; Ask falls
-        // through to the UI prompt. Deny was handled above.
-        if let Some(decision) = matrix_gate(cell) {
-            return decision;
+        // The synchronous pre-prompt decision encodes the canonical gate order
+        // (#827/#828 Part C). Extracted so it is unit-testable without an AppHandle.
+        match pre_prompt_decision(cell, allowlisted, scoped_effect, safety) {
+            PrePromptDecision::Deny => return false,
+            PrePromptDecision::Allow => {
+                if scoped_effect == Some(ff_core::RuleEffect::Allow) {
+                    tracing::info!(
+                        tool = name,
+                        arg = ?resolved_arg,
+                        "scoped rule auto-approved"
+                    );
+                }
+                return true;
+            }
+            PrePromptDecision::Prompt => {}
         }
 
         let approval_safety = match safety {
@@ -2569,10 +2592,27 @@ fn set_session_phenotype(
 }
 
 /// Bind a single session's autonomy mode, or clear it (`mode: None`) so it inherits
-/// the global default (#265). Per-pane, like `set_session_phenotype`.
+/// the global default (#265). Per-pane, like `set_session_phenotype`. When the
+/// resolved mode actually changes, a System-role message is injected into the
+/// transcript so the model sees an in-context signal (#828) — breaking behavioral
+/// inertia from prior assistant turns that referenced the old mode.
 #[tauri::command]
 fn set_session_mode(state: State<'_, Arc<AppState>>, session_id: String, mode: Option<Mode>) {
+    let old = state.session_mode(&session_id);
     state.set_session_mode(&session_id, mode);
+    let new = state.session_mode(&session_id);
+    if old != new {
+        let label = match new {
+            Mode::Plan => "Plan. Read-only tools only; writes are denied.",
+            Mode::Auto => "Auto. Writes auto-approved; sensitive actions prompt.",
+            Mode::Act => "Act. Full tool access enabled.",
+        };
+        state.store.add_message(
+            &session_id,
+            Role::System,
+            format!("[Mode switched to {label}]"),
+        );
+    }
 }
 
 /// Pin a single session's model, or clear it (`selection: None`) so it inherits its
@@ -3493,9 +3533,9 @@ mod tests {
     use super::state::AppState;
     use super::{
         emit_agent_event, git_branch, goal_gate_for, is_app_ready, list_local_branches,
-        matrix_gate, panic_message, publish_app_ready, resolve_tool_arg, resolve_workspace_dir,
-        run_sidecar_turn, should_warmup, switch_branch, BootFinalize, TurnMetrics, UpdateStatus,
-        APP_READY,
+        matrix_gate, panic_message, pre_prompt_decision, publish_app_ready, resolve_tool_arg,
+        resolve_workspace_dir, run_sidecar_turn, should_warmup, switch_branch, BootFinalize,
+        PrePromptDecision, TurnMetrics, UpdateStatus, APP_READY,
     };
     use ff_agent::{AgentEvent, GateDecision};
     use ff_core::events::TurnDoneEvent;
@@ -3829,37 +3869,94 @@ mod tests {
         );
     }
 
-    // #827: the allowlist must never override a Deny cell. This exercises the same
-    // approve() order of operations: Deny fires first, allowlist only applies to
-    // non-Deny cells. Without the fix the allowlist short-circuited above the matrix.
+    // #827/#828 Part C: pre_prompt_decision encodes the canonical gate order.
+    // A regression that reorders allowlist-first is caught here directly.
     #[test]
-    fn allowlist_does_not_override_matrix_deny() {
-        let state = AppState::new();
-        // Grant "github" for this session (simulates user clicking "Allow" in Act).
-        state.set_session_approve("s1", "github");
-        assert!(state.allowlist_covers("s1", "github", Safety::Write));
+    fn pre_prompt_deny_overrides_allowlist() {
+        use ff_core::PermissionCell;
+        assert_eq!(
+            pre_prompt_decision(PermissionCell::Deny, true, None, Safety::Write),
+            PrePromptDecision::Deny
+        );
+        assert_eq!(
+            pre_prompt_decision(PermissionCell::Deny, true, None, Safety::Sensitive),
+            PrePromptDecision::Deny
+        );
+    }
 
-        // The default matrix has Plan x Write = Deny.
+    #[test]
+    fn pre_prompt_allowlist_accelerates_ask() {
+        use ff_core::PermissionCell;
+        assert_eq!(
+            pre_prompt_decision(PermissionCell::Ask, true, None, Safety::Write),
+            PrePromptDecision::Allow
+        );
+        assert_eq!(
+            pre_prompt_decision(PermissionCell::Ask, false, None, Safety::Write),
+            PrePromptDecision::Prompt
+        );
+    }
+
+    #[test]
+    fn pre_prompt_scoped_deny_vetoes_when_not_allowlisted() {
+        use ff_core::{PermissionCell, RuleEffect};
+        // Scoped Deny vetoes when the tool is NOT on the allowlist.
+        assert_eq!(
+            pre_prompt_decision(
+                PermissionCell::Ask,
+                false,
+                Some(RuleEffect::Deny),
+                Safety::Write
+            ),
+            PrePromptDecision::Deny
+        );
+        // But the allowlist fires first — if allowlisted, scoped rules are skipped.
+        assert_eq!(
+            pre_prompt_decision(
+                PermissionCell::Ask,
+                true,
+                Some(RuleEffect::Deny),
+                Safety::Write
+            ),
+            PrePromptDecision::Allow
+        );
+    }
+
+    #[test]
+    fn pre_prompt_scoped_allow_does_not_clear_dangerous() {
+        use ff_core::{PermissionCell, RuleEffect};
+        assert_eq!(
+            pre_prompt_decision(
+                PermissionCell::Ask,
+                false,
+                Some(RuleEffect::Allow),
+                Safety::Dangerous
+            ),
+            PrePromptDecision::Prompt
+        );
+        assert_eq!(
+            pre_prompt_decision(
+                PermissionCell::Ask,
+                false,
+                Some(RuleEffect::Allow),
+                Safety::Write
+            ),
+            PrePromptDecision::Allow
+        );
+    }
+
+    #[test]
+    fn pre_prompt_plan_write_denied_despite_allowlist() {
+        let state = AppState::new();
+        state.set_session_approve("s1", "github");
         let matrix = state.permission_matrix();
         let cell = matrix.effective_cell("github", Mode::Plan, Safety::Write);
-        assert!(
-            cell.is_deny(),
-            "Plan x Write must be Deny in default matrix"
-        );
-
-        // The approve() logic: Deny fires first, so despite the allowlist covering
-        // the tool, the call is rejected.
-        let denied = cell.is_deny(); // true → return false before allowlist
-        assert!(
-            denied,
-            "matrix Deny must take precedence over the allowlist"
-        );
-
-        // In Act mode the same tool/safety is Allow → allowlist would fire.
-        let cell_act = matrix.effective_cell("github", Mode::Act, Safety::Write);
-        assert!(
-            cell_act.is_allow(),
-            "Act x Write = Allow; allowlist accelerates but is redundant"
+        let allowlisted = state.allowlist_covers("s1", "github", Safety::Write);
+        assert!(allowlisted);
+        assert_eq!(
+            pre_prompt_decision(cell, allowlisted, None, Safety::Write),
+            PrePromptDecision::Deny,
+            "Plan x Write = Deny must override the allowlist"
         );
     }
 
