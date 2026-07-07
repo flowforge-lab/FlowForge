@@ -9,8 +9,13 @@ import {
   cycleCell,
   OVERRIDE_BUCKETS,
   groupOverridesByCell,
+  bucketRowsByCell,
 } from "./control";
-import type { PermissionCell, PermissionOverrideEntry } from "@/bindings";
+import type {
+  PermissionCell,
+  PermissionOverrideEntry,
+  Safety,
+} from "@/bindings";
 
 describe("control matrix metadata", () => {
   it("lists modes plan → auto → act and the four permission rows", () => {
@@ -95,6 +100,64 @@ describe("override buckets", () => {
 
   it("returns empty buckets for no overrides", () => {
     expect(groupOverridesByCell([])).toEqual({
+      allow: [],
+      ask: [],
+      deny: [],
+    });
+  });
+});
+
+// The mode pill posture hint (#801): the matrix cell is the advertise switch since
+// #793/#795, so allow → auto-runs, ask → needs approval, deny → hidden.
+describe("bucketRowsByCell (#801)", () => {
+  // Row label lookup for readable expectations.
+  const labels = (rows: { label: string }[]) => rows.map((r) => r.label);
+
+  it("buckets Plan (read allow, sensitive ask, write/dangerous deny)", () => {
+    const plan: Record<Safety, PermissionCell> = {
+      readonly: "allow",
+      write: "deny",
+      sensitive: "ask",
+      dangerous: "deny",
+    };
+    const b = bucketRowsByCell(plan);
+    expect(labels(b.allow)).toEqual(["Read & browse"]);
+    expect(labels(b.ask)).toEqual(["External changes"]);
+    expect(labels(b.deny)).toEqual(["Local writes", "Dangerous commands"]);
+  });
+
+  it("buckets Act (all allow except dangerous ask) — nothing hidden", () => {
+    const act: Record<Safety, PermissionCell> = {
+      readonly: "allow",
+      write: "allow",
+      sensitive: "allow",
+      dangerous: "ask",
+    };
+    const b = bucketRowsByCell(act);
+    expect(labels(b.allow)).toEqual([
+      "Read & browse",
+      "Local writes",
+      "External changes",
+    ]);
+    expect(labels(b.ask)).toEqual(["Dangerous commands"]);
+    expect(b.deny).toEqual([]);
+  });
+
+  it("buckets Auto (sensitive ask, dangerous deny)", () => {
+    const auto: Record<Safety, PermissionCell> = {
+      readonly: "allow",
+      write: "allow",
+      sensitive: "ask",
+      dangerous: "deny",
+    };
+    const b = bucketRowsByCell(auto);
+    expect(labels(b.allow)).toEqual(["Read & browse", "Local writes"]);
+    expect(labels(b.ask)).toEqual(["External changes"]);
+    expect(labels(b.deny)).toEqual(["Dangerous commands"]);
+  });
+
+  it("returns empty buckets when the matrix row is undefined", () => {
+    expect(bucketRowsByCell(undefined)).toEqual({
       allow: [],
       ask: [],
       deny: [],

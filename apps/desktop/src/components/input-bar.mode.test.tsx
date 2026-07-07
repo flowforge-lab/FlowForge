@@ -17,16 +17,46 @@ import { useChatStore } from "@/store/chat";
 import { useComposerStore } from "@/store/composer";
 import { usePrefsStore } from "@/store/prefs";
 import { useSessionModeStore } from "@/store/session-mode";
+import { usePermissionMatrixStore } from "@/store/permission-matrix";
 import { useSessionWorkspaceStore } from "@/store/session-workspace";
-import type { Message } from "@/bindings";
+import type { Message, Mode, PermissionCell, Safety } from "@/bindings";
 
-// Radix DropdownMenu calls these pointer/scroll APIs that jsdom doesn't implement.
+// The default RFC 0019 matrix (mirrors lib/mock.ts) so the posture tooltip has data
+// and the pill's mount-effect load() is a no-op (#801).
+const DEFAULT_MATRIX: Record<Mode, Record<Safety, PermissionCell>> = {
+  plan: {
+    readonly: "allow",
+    write: "deny",
+    sensitive: "ask",
+    dangerous: "deny",
+  },
+  auto: {
+    readonly: "allow",
+    write: "allow",
+    sensitive: "ask",
+    dangerous: "deny",
+  },
+  act: {
+    readonly: "allow",
+    write: "allow",
+    sensitive: "allow",
+    dangerous: "ask",
+  },
+};
+
+// Radix DropdownMenu/Tooltip call these pointer/scroll/observer APIs that jsdom
+// doesn't implement (Tooltip's Popper needs ResizeObserver, #801).
 beforeAll(() => {
   const proto = Element.prototype as unknown as Record<string, unknown>;
   proto.hasPointerCapture ??= () => false;
   proto.setPointerCapture ??= () => {};
   proto.releasePointerCapture ??= () => {};
   proto.scrollIntoView ??= () => {};
+  globalThis.ResizeObserver ??= class {
+    observe() {}
+    unobserve() {}
+    disconnect() {}
+  };
 });
 
 // The pill trigger's text (dot is a span, so textContent is just the mode label).
@@ -59,6 +89,11 @@ describe("ModePill dropdown (#344)", () => {
     localStorage.clear();
     usePrefsStore.setState({ defaultMode: "auto" });
     useSessionModeStore.setState({ modeBySession: {} });
+    usePermissionMatrixStore.setState({
+      matrix: DEFAULT_MATRIX,
+      overrides: [],
+      loading: false,
+    });
     render(
       <>
         <div data-testid="a">
@@ -112,6 +147,29 @@ describe("ModePill dropdown (#344)", () => {
       name: /Reset to default/,
     });
     expect(reset.getAttribute("aria-disabled")).toBe("true");
+  });
+
+  it("surfaces the current mode's tool posture on hover (#801)", async () => {
+    // Fresh pane inherits Auto: read+write auto-run, sensitive asks, dangerous hidden.
+    within(screen.getByTestId("a")).getByRole("button").focus();
+    const tip = await screen.findByRole("tooltip");
+    expect(tip.textContent).toContain("Auto mode");
+    expect(tip.textContent).toMatch(/Auto-runs:.*Read & browse.*Local writes/);
+    expect(tip.textContent).toMatch(/Needs approval:.*External changes/);
+    expect(tip.textContent).toMatch(/Hidden:.*Dangerous commands/);
+  });
+
+  it("updates the posture buckets when the mode changes (#801)", async () => {
+    // Switch pane a to Act: everything auto-runs except Dangerous (ask); nothing hidden.
+    await selectMode("a", "Act");
+    within(screen.getByTestId("a")).getByRole("button").focus();
+    const tip = await screen.findByRole("tooltip");
+    expect(tip.textContent).toContain("Act mode");
+    expect(tip.textContent).toMatch(
+      /Auto-runs:.*Read & browse.*Local writes.*External changes/,
+    );
+    expect(tip.textContent).toMatch(/Needs approval:.*Dangerous commands/);
+    expect(tip.textContent).toMatch(/Hidden:.*None/);
   });
 });
 

@@ -10,6 +10,7 @@ import {
   Paperclip,
   PencilLine,
   Search,
+  ShieldAlert,
   Square,
   X,
 } from "@/components/ui/icon";
@@ -45,7 +46,9 @@ import { useComposerStore } from "@/store/composer";
 import { usePrefsStore } from "@/store/prefs";
 import { useSessionWorkspaceStore } from "@/store/session-workspace";
 import { useSessionModeStore, MODE_ORDER } from "@/store/session-mode";
+import { usePermissionMatrixStore } from "@/store/permission-matrix";
 import { MODE_META } from "@/lib/mode";
+import { bucketRowsByCell } from "@/lib/control";
 
 // A local model server (candle-vllm, Ollama, …) goes cold when idle, so the first
 // token after a pause crawls. We nudge it (`ipc.warmup`) while the user interacts
@@ -578,9 +581,35 @@ function AttachmentChip({
   );
 }
 
+// The three tool-posture buckets shown in the pill tooltip (#801), keyed by the
+// matrix cell that produces them: allow → auto-runs, ask → needs approval,
+// deny → hidden (not advertised). Colour-coded to match the semantics.
+const POSTURE_LINES = [
+  {
+    cell: "allow",
+    label: "Auto-runs",
+    Icon: Check,
+    tint: "text-emerald-600 dark:text-emerald-400",
+  },
+  {
+    cell: "ask",
+    label: "Needs approval",
+    Icon: ShieldAlert,
+    tint: "text-amber-600 dark:text-amber-400",
+  },
+  {
+    cell: "deny",
+    label: "Hidden",
+    Icon: EyeOff,
+    tint: "text-muted-foreground",
+  },
+] as const;
+
 // Agent-mode pill (#266, RFC 0011). Per-session (and so per split pane) + persisted,
 // colour-coded. Click cycles Plan → Act → Auto; ⌘. cycles the focused pane too
 // (app-shell). A session with no explicit mode shows the `defaultMode` preference.
+// Hovering surfaces the current mode's tool posture — which safety tiers auto-run,
+// need approval, or are hidden — read from the live permission matrix (#801).
 export function ModePill({ sessionId }: { sessionId: string }) {
   const defaultMode = usePrefsStore((s) => s.defaultMode);
   const explicit = useSessionModeStore((s) => s.modeBySession[sessionId]);
@@ -589,6 +618,10 @@ export function ModePill({ sessionId }: { sessionId: string }) {
   const mode = explicit ?? defaultMode;
   // No explicit override → this session inherits the default-mode pref (#800).
   const inherited = explicit === undefined;
+  // The current mode's matrix row drives the posture buckets (#801). The matrix is
+  // the same source that gates runtime approval, so the hint can't drift from reality.
+  const matrixRow = usePermissionMatrixStore((s) => s.matrix?.[mode]);
+  const matrixLoading = usePermissionMatrixStore((s) => s.loading);
   // Self-heal sessions persisted before mode was wired to the backend (#789):
   // push the localStorage-cached override to SQLite on mount so an existing
   // "Plan" session is honoured without a re-toggle. `null` clears the override
@@ -596,36 +629,78 @@ export function ModePill({ sessionId }: { sessionId: string }) {
   useEffect(() => {
     void ipc.setSessionMode(sessionId, explicit ?? null);
   }, [sessionId, explicit]);
+  // Load the permission matrix once so the posture tooltip has data. The pill is
+  // always mounted in the composer; the store starts `loading:true` but nothing has
+  // actually called load() yet, so gate purely on a null matrix. Concurrent pane
+  // mounts may double-load — harmless, it's an idempotent read.
+  useEffect(() => {
+    if (usePermissionMatrixStore.getState().matrix === null)
+      void usePermissionMatrixStore.getState().load();
+  }, []);
   const meta = MODE_META[mode];
+  const buckets = bucketRowsByCell(matrixRow);
   return (
     <DropdownMenu>
-      <DropdownMenuTrigger asChild>
-        <button
-          type="button"
-          title={`Mode: ${meta.label}${
-            inherited ? " (inherited from default)" : ""
-          } — ${meta.description}`}
-          aria-label={`Agent mode: ${meta.label}${
-            inherited ? " (inherited from default)" : ""
-          }`}
-          className={cn(
-            "inline-flex shrink-0 items-center gap-1.5 rounded-md border px-2 py-1.5 text-xs font-medium transition-colors",
-            meta.pillClass,
-          )}
-        >
-          {/* Filled dot = explicit override; hollow ring = inheriting the default
-              (#800). `border-current` picks up the pill's mode colour. */}
-          <span
-            className={cn(
-              "size-1.5 shrink-0 rounded-full",
-              inherited
-                ? "border border-current bg-transparent"
-                : meta.dotClass,
+      <TooltipProvider delayDuration={150}>
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <DropdownMenuTrigger asChild>
+              <button
+                type="button"
+                aria-label={`Agent mode: ${meta.label}${
+                  inherited ? " (inherited from default)" : ""
+                }`}
+                className={cn(
+                  "inline-flex shrink-0 items-center gap-1.5 rounded-md border px-2 py-1.5 text-xs font-medium transition-colors",
+                  meta.pillClass,
+                )}
+              >
+                {/* Filled dot = explicit override; hollow ring = inheriting the
+                    default (#800). `border-current` picks up the pill's mode colour. */}
+                <span
+                  className={cn(
+                    "size-1.5 shrink-0 rounded-full",
+                    inherited
+                      ? "border border-current bg-transparent"
+                      : meta.dotClass,
+                  )}
+                />
+                {meta.label}
+              </button>
+            </DropdownMenuTrigger>
+          </TooltipTrigger>
+          <TooltipContent side="top" align="start" className="max-w-64">
+            <p className="font-medium">
+              {meta.label} mode
+              {inherited ? " · inherited from default" : ""}
+            </p>
+            <p className="text-muted-foreground">{meta.description}</p>
+            {!matrixRow ? (
+              <p className="mt-1.5 text-muted-foreground">
+                {matrixLoading
+                  ? "Loading tool posture…"
+                  : "Tool posture unavailable."}
+              </p>
+            ) : (
+              <ul className="mt-1.5 flex flex-col gap-1">
+                {POSTURE_LINES.map(({ cell, label, Icon, tint }) => (
+                  <li key={cell} className="flex items-start gap-1.5">
+                    <Icon className={cn("mt-0.5 size-3 shrink-0", tint)} />
+                    <span>
+                      <span className={cn("font-medium", tint)}>{label}:</span>{" "}
+                      <span className="text-muted-foreground">
+                        {buckets[cell].length > 0
+                          ? buckets[cell].map((r) => r.label).join(", ")
+                          : "None"}
+                      </span>
+                    </span>
+                  </li>
+                ))}
+              </ul>
             )}
-          />
-          {meta.label}
-        </button>
-      </DropdownMenuTrigger>
+          </TooltipContent>
+        </Tooltip>
+      </TooltipProvider>
       <DropdownMenuContent align="start" className="w-64">
         {MODE_ORDER.map((m) => {
           const mMeta = MODE_META[m];
