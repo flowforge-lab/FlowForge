@@ -61,6 +61,21 @@ impl McpBridgedTool {
             read_only_hint: info.read_only_hint,
         }
     }
+
+    /// Build an inert instance for unit tests that only need to assert safety
+    /// classification from `read_only_hint` — the handle/key/schema don't affect it.
+    #[cfg(test)]
+    pub(crate) fn for_test(read_only_hint: bool) -> Self {
+        Self {
+            handle: crate::supervisor::SupervisorHandle::for_test(),
+            key: crate::key::InstanceKey::global("test"),
+            tool_name: "explore".into(),
+            full_name: "mcp__codegraph__explore".into(),
+            description: String::new(),
+            input_schema: serde_json::json!({"type": "object"}),
+            read_only_hint,
+        }
+    }
 }
 
 /// Map a bridged tool's `readOnlyHint` to its [`Safety`]. Read-only tools run
@@ -93,6 +108,21 @@ impl Tool for McpBridgedTool {
         // environment — e.g. codegraph's local index queries — so it can run without
         // an approval gate (and stays usable in Plan mode). Everything else defaults
         // to Write so external-process calls remain approval-gated (RFC 0003 §9.4).
+        safety_for(self.read_only_hint)
+    }
+
+    // A bridged tool's safety doesn't vary by args, so its floor and ceiling both
+    // equal `safety()`. These MUST be overridden, not left to the trait defaults
+    // (`min_safety` → `max_safety` → `Write`): Plan-mode advertisement is gated on
+    // `min_safety() == ReadOnly` (`ToolRegistry::readonly_capable_names`), so
+    // without this a `readOnlyHint` tool like codegraph would have `min_safety ==
+    // Write` and be excluded from Plan even though `safety()` is ReadOnly (#846,
+    // the gap left by #841 which only overrode `safety`).
+    fn min_safety(&self) -> Safety {
+        safety_for(self.read_only_hint)
+    }
+
+    fn max_safety(&self) -> Safety {
         safety_for(self.read_only_hint)
     }
 

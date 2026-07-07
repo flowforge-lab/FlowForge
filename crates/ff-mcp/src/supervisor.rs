@@ -150,6 +150,23 @@ pub struct SupervisorHandle {
 }
 
 impl SupervisorHandle {
+    /// A minimal, inert handle for unit tests that only need a `SupervisorHandle`
+    /// value (e.g. constructing a `McpBridgedTool` to assert its safety
+    /// classification). The channels/watches are live but never driven.
+    #[cfg(test)]
+    pub(crate) fn for_test() -> Self {
+        let (cmd_tx, _cmd_rx) = mpsc::channel(1);
+        let (_status_tx, status_rx) = watch::channel(());
+        let (cancel_tx, _cancel_rx) = watch::channel(false);
+        Self {
+            cmd_tx,
+            status: SharedStatus::default(),
+            tools: SharedTools::default(),
+            status_rx,
+            cancel_tx: Arc::new(cancel_tx),
+        }
+    }
+
     /// Ask the supervisor to re-snapshot the shared config and apply any deltas. The
     /// watcher already pings on file change; this is for callers that mutate
     /// `SharedConfig` programmatically (tests).
