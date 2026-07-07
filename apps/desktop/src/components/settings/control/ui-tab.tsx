@@ -7,12 +7,34 @@ import { useControlConfigStore } from "@/store/control-config";
 // A few brand-friendly presets next to the custom color input.
 const ACCENT_PRESETS = ["#6366f1", "#10b981", "#f59e0b", "#ef4444", "#ec4899"];
 
-// Real file dialogs are out of scope (#135); the picker stubs to a sample path so
-// the persist/clear flow is exercisable.
-const STUB_PATHS: Record<"logoPath" | "faviconPath", string> = {
-  logoPath: "~/Pictures/flowforge-logo.png",
-  faviconPath: "~/Pictures/flowforge-favicon.ico",
-};
+/** Evaluated per call (not a module constant) so tests can toggle the branch —
+ *  mirrors lib/save-file.ts. Absent under `VITE_FF_MOCK` in a plain browser tab. */
+function inTauri(): boolean {
+  return (
+    typeof globalThis.window !== "undefined" &&
+    "__TAURI_INTERNALS__" in globalThis.window
+  );
+}
+
+/** Open a native image picker (#803). In Tauri that's the OS file dialog filtered to
+ *  images; in the web/mock build (dev only — the shipped app is always Tauri) it falls
+ *  back to a hand-typed path so the persist/clear flow stays exercisable. Returns the
+ *  chosen path, or `null` when cancelled/empty. */
+async function pickImagePath(): Promise<string | null> {
+  if (inTauri()) {
+    const { open } = await import("@tauri-apps/plugin-dialog");
+    const picked = await open({
+      multiple: false,
+      filters: [
+        { name: "Image", extensions: ["png", "jpg", "jpeg", "svg", "ico"] },
+      ],
+    });
+    return typeof picked === "string" ? picked : null;
+  }
+  const typed = window.prompt("Path to image file");
+  const trimmed = typed?.trim();
+  return trimmed ? trimmed : null;
+}
 
 /** UI sub-tab (SET.12): per-profile accent, logo/favicon pickers, greeting toggle. */
 export function UiTab() {
@@ -67,14 +89,22 @@ export function UiTab() {
           label="Custom logo"
           path={ui.logoPath}
           disabled={saving}
-          onChoose={() => void setUi({ logoPath: STUB_PATHS.logoPath })}
+          onChoose={() =>
+            void pickImagePath().then((p) => {
+              if (p != null) void setUi({ logoPath: p });
+            })
+          }
           onClear={() => void setUi({ logoPath: "" })}
         />
         <FilePickerRow
           label="Custom favicon"
           path={ui.faviconPath}
           disabled={saving}
-          onChoose={() => void setUi({ faviconPath: STUB_PATHS.faviconPath })}
+          onChoose={() =>
+            void pickImagePath().then((p) => {
+              if (p != null) void setUi({ faviconPath: p });
+            })
+          }
           onClear={() => void setUi({ faviconPath: "" })}
         />
       </section>
