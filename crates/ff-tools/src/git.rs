@@ -15,6 +15,31 @@ const MAX_DIFF_LINES: usize = 500;
 /// Default number of log entries.
 const DEFAULT_LOG_LIMIT: u32 = 10;
 
+/// Validate a user-supplied revision before it is handed to git. A revision is
+/// never a legitimate option, so reject anything that could be parsed as one:
+/// this closes the injection where `ref="--output=<path>"` (or any `-…` flag)
+/// would turn a "read-only" query into an arbitrary-file **write** — which, since
+/// this tool is ReadOnly and auto-approved in Plan, would run with no gate (#857
+/// review). Call sites additionally pass the value after `--end-of-options` so
+/// git treats it as a rev even in the unlikely event validation is bypassed.
+fn validate_ref(r: &str) -> Result<(), ToolOutcome> {
+    if r.is_empty() {
+        return Err(ToolOutcome::error("`ref` must not be empty"));
+    }
+    if r.starts_with('-') {
+        return Err(ToolOutcome::error(format!(
+            "invalid `ref` {r:?}: a revision must not start with '-' (rejected so it \
+             can't be interpreted as a git option such as --output=…)"
+        )));
+    }
+    if r.chars().any(|c| c.is_control()) {
+        return Err(ToolOutcome::error(
+            "invalid `ref`: contains control characters".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 pub struct GitTool;
 
 #[async_trait]
@@ -210,6 +235,12 @@ async fn git_diff(args: &Value, root: &Path) -> ToolOutcome {
     }
 
     if let Some(r) = git_ref {
+        if let Err(e) = validate_ref(r) {
+            return e;
+        }
+        // `--end-of-options` forces git to treat the next arg as a revision, not
+        // an option, so a value like `--output=…` can't smuggle a write (#857).
+        cmd_args.push("--end-of-options");
         cmd_args.push(r);
     }
 
@@ -251,6 +282,7 @@ fn parse_numstat(output: &str) -> String {
     let mut result = String::from("File changes:\n");
     let mut total_added: u32 = 0;
     let mut total_removed: u32 = 0;
+    let mut file_count: u32 = 0;
 
     for line in output.lines() {
         let parts: Vec<&str> = line.split('\t').collect();
@@ -262,12 +294,12 @@ fn parse_numstat(output: &str) -> String {
             // binary files show "-" for counts
             total_added += added.parse::<u32>().unwrap_or(0);
             total_removed += removed.parse::<u32>().unwrap_or(0);
+            file_count += 1;
         }
     }
 
     result.push_str(&format!(
-        "\nTotal: +{total_added} -{total_removed} in {} file(s)",
-        output.lines().count()
+        "\nTotal: +{total_added} -{total_removed} in {file_count} file(s)"
     ));
     result
 }
@@ -319,10 +351,15 @@ async fn git_log(args: &Value, root: &Path) -> ToolOutcome {
 
 async fn git_show(args: &Value, root: &Path) -> ToolOutcome {
     let commit = args.get("ref").and_then(|v| v.as_str()).unwrap_or("HEAD");
+    // A user-supplied commit-ish must not be parseable as a git option (#857).
+    if let Err(e) = validate_ref(commit) {
+        return e;
+    }
 
-    // Get commit metadata
+    // Get commit metadata. `--end-of-options` guards each use so `commit` is
+    // always treated as a revision, never a flag.
     let fmt_arg = "--format=%H%x00%s%x00%aN%x00%aI%x00%b";
-    let meta_args = vec!["show", "--no-patch", fmt_arg, commit];
+    let meta_args = vec!["show", "--no-patch", fmt_arg, "--end-of-options", commit];
     let meta = match run_git(root, &meta_args).await {
         Ok(o) => o,
         Err(e) => return e,
@@ -343,7 +380,7 @@ async fn git_show(args: &Value, root: &Path) -> ToolOutcome {
     }
 
     // Get the diff stat
-    let stat_args = vec!["show", "--stat", "--format=", commit];
+    let stat_args = vec!["show", "--stat", "--format=", "--end-of-options", commit];
     if let Ok(stat) = run_git(root, &stat_args).await {
         if !stat.trim().is_empty() {
             result.push_str(&format!("\n{}", stat.trim()));
@@ -351,7 +388,7 @@ async fn git_show(args: &Value, root: &Path) -> ToolOutcome {
     }
 
     // Get unified diff (bounded)
-    let diff_args = vec!["show", "--format=", commit];
+    let diff_args = vec!["show", "--format=", "--end-of-options", commit];
     if let Ok(diff) = run_git(root, &diff_args).await {
         if !diff.trim().is_empty() {
             let lines: Vec<&str> = diff.lines().collect();
@@ -565,6 +602,54 @@ mod tests {
                 || result.content.contains("Not a git repository"),
             "unexpected error: {}",
             result.content
+        );
+    }
+
+    // ─── #857 review: argument-injection guard ─────────────────────────────────
+
+    #[test]
+    fn validate_ref_rejects_option_like_and_control() {
+        // The exploit: `ref` starting with '-' could be parsed as a git option
+        // (e.g. `--output=<path>`), turning a read-only query into a file write.
+        assert!(validate_ref("--output=/tmp/pwned").is_err());
+        assert!(validate_ref("-x").is_err());
+        assert!(validate_ref("--upload-pack=touch /tmp/x").is_err());
+        assert!(validate_ref("bad\nref").is_err()); // control char
+        assert!(validate_ref("").is_err());
+        // Legitimate revisions pass.
+        assert!(validate_ref("HEAD").is_ok());
+        assert!(validate_ref("HEAD~3").is_ok());
+        assert!(validate_ref("main").is_ok());
+        assert!(validate_ref("a1b2c3d").is_ok());
+        assert!(validate_ref("origin/main").is_ok());
+        assert!(validate_ref("v1.2.3").is_ok());
+    }
+
+    #[tokio::test]
+    async fn diff_rejects_option_injection_in_ref() {
+        let root = std::env::current_dir().unwrap();
+        let args = serde_json::json!({"action": "diff", "ref": "--output=/tmp/ff_git_pwn"});
+        let result = git_diff(&args, &root).await;
+        assert!(!result.success, "option-like ref must be rejected");
+        assert!(result.content.contains("must not start with '-'"));
+    }
+
+    #[tokio::test]
+    async fn show_rejects_option_injection_and_writes_nothing() {
+        // End-to-end proof the exploit is dead: try to make `git show` write a
+        // file via --output; assert it's rejected AND no file appears.
+        let marker = std::env::temp_dir().join("ff_git_show_pwn_857");
+        let _ = std::fs::remove_file(&marker);
+        let root = std::env::current_dir().unwrap();
+        let args = serde_json::json!({
+            "action": "show",
+            "ref": format!("--output={}", marker.display()),
+        });
+        let result = git_show(&args, &root).await;
+        assert!(!result.success, "option-like ref must be rejected");
+        assert!(
+            !marker.exists(),
+            "the rejected injection must not have written a file"
         );
     }
 }
