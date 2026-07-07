@@ -131,6 +131,16 @@ pub fn build_system_prompt(
         }
     }
 
+    // Mode steer placed early (after persona, before skills) so it is in the
+    // model's high-attention prefix — not buried after thousands of tokens of
+    // skill instructions and memory (#828). On mode-change the tool schema
+    // already busts the KV cache (Plan hides tools), so there is zero
+    // additional prefix-cache cost for positioning the steer here.
+    if let Some(steer) = mode_steer(mode) {
+        out.push_str(steer);
+        out.push_str("\n\n");
+    }
+
     let mut installed: Vec<_> = skills.list().collect();
     installed.sort_by(|a, b| a.manifest.name.cmp(&b.manifest.name));
     if !installed.is_empty() {
@@ -272,12 +282,6 @@ pub fn build_system_prompt(
     {
         out.push('\n');
         out.push_str(&block);
-    }
-
-    if let Some(steer) = mode_steer(mode) {
-        out.push('\n');
-        out.push_str(steer);
-        out.push('\n');
     }
 
     out
@@ -441,6 +445,22 @@ mod tests {
     }
 
     #[test]
+    fn mode_steer_precedes_skills_in_prompt() {
+        // #828: mode steer must be in the high-attention prefix (before skills),
+        // not buried after thousands of tokens of instructions and memory.
+        let reg = registry(vec![skill("test-skill", "A test", "body")]);
+        let out = build_system_prompt(None, &reg, &[], &ctx(), None, None, Mode::Plan);
+        let mode_pos = out.find("## Mode: Plan").expect("mode steer missing");
+        let skills_pos = out
+            .find("## Available skills")
+            .expect("skills section missing");
+        assert!(
+            mode_pos < skills_pos,
+            "mode steer must appear before skills; mode at {mode_pos}, skills at {skills_pos}"
+        );
+    }
+
+    #[test]
     fn includes_the_large_file_writes_steer() {
         // #550: steer large file creation toward chunked write / edit so a giant
         // single `write` argument is not truncated at the output cap.
@@ -576,8 +596,8 @@ mod tests {
         );
         assert!(with.starts_with("You are a coding assistant.\n\n"));
         let without = build_system_prompt(None, &reg, &[], &ctx(), None, None, Mode::default());
-        assert!(!without.starts_with("You are"));
-        assert!(without.starts_with("## Compacted tool results"));
+        assert!(!without.contains("You are a coding assistant"));
+        assert!(without.contains("## Compacted tool results"));
     }
 
     #[test]
@@ -592,7 +612,11 @@ mod tests {
             None,
             Mode::default(),
         );
-        assert!(out.starts_with("## Compacted tool results"), "{out}");
+        assert!(
+            !out.starts_with("You are"),
+            "blank persona should not appear"
+        );
+        assert!(out.contains("## Compacted tool results"));
     }
 
     #[test]
