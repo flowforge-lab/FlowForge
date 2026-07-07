@@ -2519,3 +2519,73 @@ fn default_control_config_matches_the_frontend_defaults() {
         assert!(d.get(key).is_some(), "missing field: {key}");
     }
 }
+
+// --- #509: timestamped registry backup before each save ---
+
+#[test]
+fn backup_preserves_prior_contents_before_overwrite() {
+    let tmp = tempfile::tempdir().unwrap();
+    let reg_path = tmp.path().join("provider-registry.json");
+    fs::write(&reg_path, "v1").unwrap();
+
+    // Simulate a save: backup then atomic-write.
+    backup_registry_at(&reg_path, 1000, 5);
+    write_atomic(&reg_path, "v2").unwrap();
+
+    // The live file has the new contents.
+    assert_eq!(fs::read_to_string(&reg_path).unwrap(), "v2");
+    // Exactly one .bak containing the prior contents.
+    let bak = tmp.path().join("provider-registry.1000.bak");
+    assert!(bak.exists(), "backup file must exist");
+    assert_eq!(fs::read_to_string(&bak).unwrap(), "v1");
+}
+
+#[test]
+fn backup_prunes_beyond_retention() {
+    let tmp = tempfile::tempdir().unwrap();
+    let reg_path = tmp.path().join("provider-registry.json");
+
+    // Create retention + 2 backups with distinct injected timestamps.
+    let retention = 3usize;
+    for ts in 100..107u64 {
+        fs::write(&reg_path, format!("v{ts}")).unwrap();
+        backup_registry_at(&reg_path, ts, retention);
+    }
+
+    // Only the newest `retention` survive.
+    let baks: Vec<_> = fs::read_dir(tmp.path())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            let n = e.file_name().to_string_lossy().to_string();
+            n.starts_with("provider-registry.") && n.ends_with(".bak")
+        })
+        .collect();
+    assert_eq!(
+        baks.len(),
+        retention,
+        "only the newest {retention} backups should remain"
+    );
+
+    // The oldest (100, 101, 102, 103) are gone; 104, 105, 106 survive.
+    assert!(!tmp.path().join("provider-registry.100.bak").exists());
+    assert!(!tmp.path().join("provider-registry.101.bak").exists());
+    assert!(!tmp.path().join("provider-registry.102.bak").exists());
+    assert!(!tmp.path().join("provider-registry.103.bak").exists());
+    assert!(tmp.path().join("provider-registry.104.bak").exists());
+    assert!(tmp.path().join("provider-registry.105.bak").exists());
+    assert!(tmp.path().join("provider-registry.106.bak").exists());
+}
+
+#[test]
+fn backup_is_noop_when_no_registry_yet() {
+    let tmp = tempfile::tempdir().unwrap();
+    let reg_path = tmp.path().join("provider-registry.json");
+    // File does not exist — backup must not panic or create anything.
+    backup_registry_at(&reg_path, 999, 5);
+    let entries: Vec<_> = fs::read_dir(tmp.path())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .collect();
+    assert!(entries.is_empty(), "no files should be created");
+}

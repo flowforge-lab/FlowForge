@@ -492,14 +492,75 @@ fn read_registry_file(path: Option<&Path>) -> RegistryRead {
     }
 }
 
+/// Current unix timestamp in seconds (shared by quarantine + backup filenames).
+fn now_unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// How many timestamped registry backups to retain before pruning the oldest.
+const REGISTRY_BACKUP_RETENTION: usize = 5;
+
+/// Copy the current on-disk registry to `provider-registry.<unix_secs>.bak` before
+/// it is overwritten, keeping the newest `retention` backups and pruning older
+/// ones. This is a deterministic, built-in recovery net (#509) independent of any
+/// leftover-file luck from older builds. Best-effort: any I/O error is logged,
+/// never fatal — a failed backup must not block the save it protects. Injectable
+/// `now_secs` / `retention` so the test suite (where `registry_path()` is `None`)
+/// can exercise the logic in a tempdir.
+fn backup_registry_at(path: &Path, now_secs: u64, retention: usize) {
+    if !path.exists() {
+        return;
+    }
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    // Copy (not rename) so the live file stays intact for the upcoming write_atomic.
+    let backup_name = format!("provider-registry.{now_secs}.bak");
+    let backup_path = parent.join(&backup_name);
+    if let Err(e) = fs::copy(path, &backup_path) {
+        tracing::warn!(path = %path.display(), error = %e,
+            "registry backup failed; proceeding with save");
+        return;
+    }
+
+    // Prune: keep only the newest `retention` .bak files.
+    let Ok(entries) = fs::read_dir(parent) else {
+        return;
+    };
+    let mut baks: Vec<(u64, std::path::PathBuf)> = entries
+        .filter_map(|e| e.ok())
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().to_string();
+            if !name.starts_with("provider-registry.") || !name.ends_with(".bak") {
+                return None;
+            }
+            // Extract the timestamp between the dots: "provider-registry.<ts>.bak"
+            let ts_str = name
+                .strip_prefix("provider-registry.")?
+                .strip_suffix(".bak")?;
+            let ts: u64 = ts_str.parse().ok()?;
+            Some((ts, e.path()))
+        })
+        .collect();
+
+    if baks.len() <= retention {
+        return;
+    }
+    // Sort descending by timestamp; remove everything past `retention`.
+    baks.sort_unstable_by_key(|entry| std::cmp::Reverse(entry.0));
+    for (_, stale) in baks.drain(retention..) {
+        let _ = fs::remove_file(&stale);
+    }
+}
+
 /// Preserve an unreadable registry file by renaming it alongside the original
 /// rather than letting the next save truncate it. Best-effort: a rename failure
 /// is logged but never fatal.
 fn quarantine_registry(path: &Path) {
-    let unix = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+    let unix = now_unix_secs();
     let preserved = path.with_extension(format!("corrupt-{unix}.json"));
     match fs::rename(path, &preserved) {
         Ok(()) => {
@@ -580,6 +641,7 @@ fn save_registry(registry: &ProviderRegistry) {
     let Ok(json) = serde_json::to_string_pretty(registry) else {
         return;
     };
+    backup_registry_at(&path, now_unix_secs(), REGISTRY_BACKUP_RETENTION);
     if let Err(e) = write_atomic(&path, &json) {
         tracing::warn!(path = %path.display(), error = %e,
             "provider registry save failed; in-memory state authoritative this session");
