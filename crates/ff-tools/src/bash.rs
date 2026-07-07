@@ -217,19 +217,32 @@ impl BashTool {
         if ["$(", "`", ">", ">>"].iter().any(|t| command.contains(t)) {
             return Safety::Write;
         }
-        // `find` is read-only for traversal/matching, but it can execute or delete.
-        // `-exec`/`-execdir`/`-ok` run arbitrary commands (treat as Dangerous); a bare
-        // `-delete` mutates the tree (treat as Write). Matched as whitespace-delimited
-        // tokens so a path that merely contains the word doesn't trip the guard.
-        if lower.split_whitespace().any(|t| t == "find") {
-            let tokens: Vec<&str> = lower.split_whitespace().collect();
+        // `find` is read-only for traversal/matching, but it has actions with
+        // side effects. `-exec`/`-execdir`/`-ok`/`-okdir` run arbitrary commands
+        // (Dangerous). `-delete` and the file-writing actions `-fprint`/`-fprint0`/
+        // `-fprintf`/`-fls` mutate the filesystem — the `-f*` forms create/truncate
+        // a NAMED FILE with no shell redirect, so they bypass the `>`/`>>` guard
+        // above and must be caught here (Write), else they'd be auto-run unprompted
+        // and permitted in Plan mode. (`-exec*`/`-ok*`, `-delete`, `-fprint*`/
+        // `-fprintf`/`-fls` are the complete set of GNU find actions with side
+        // effects; read-only `-print*`/`-ls`/`-prune`/`-quit` stay ReadOnly.)
+        //
+        // The `find`-anywhere trigger is intentionally conservative: it fires even
+        // when `find` is not the first token (e.g. `grep find …`), over-restricting
+        // rather than risking a missed side-effecting form. Do NOT "optimize" this
+        // to first-token-only — that reintroduces the classification gap.
+        let tokens: Vec<&str> = lower.split_whitespace().collect();
+        if tokens.contains(&"find") {
             if tokens
                 .iter()
                 .any(|t| matches!(*t, "-exec" | "-execdir" | "-ok" | "-okdir"))
             {
                 return Safety::Dangerous;
             }
-            if tokens.contains(&"-delete") {
+            if tokens
+                .iter()
+                .any(|t| matches!(*t, "-delete" | "-fprint" | "-fprint0" | "-fprintf" | "-fls"))
+            {
                 return Safety::Write;
             }
         }
@@ -538,6 +551,26 @@ mod tests {
             BashTool::classify("find . -execdir cat {} ;"),
             Safety::Dangerous
         );
+        assert_eq!(
+            BashTool::classify("find . -okdir rm {} ;"),
+            Safety::Dangerous
+        );
+        // #840 review: the file-writing actions create/truncate a NAMED file with
+        // no shell redirect, so they must be Write, not ReadOnly — e.g.
+        // `find . -fprint ~/.bashrc` truncates .bashrc. Regression guard.
+        assert_eq!(BashTool::classify("find . -fprint /tmp/out"), Safety::Write);
+        assert_eq!(
+            BashTool::classify("find . -fprint0 /tmp/out"),
+            Safety::Write
+        );
+        assert_eq!(
+            BashTool::classify("find . -fprintf /tmp/out '%p\\n'"),
+            Safety::Write
+        );
+        assert_eq!(BashTool::classify("find . -fls /tmp/out"), Safety::Write);
+        // Read-only find actions stay ReadOnly.
+        assert_eq!(BashTool::classify("find . -print"), Safety::ReadOnly);
+        assert_eq!(BashTool::classify("find . -ls"), Safety::ReadOnly);
     }
 
     #[test]
