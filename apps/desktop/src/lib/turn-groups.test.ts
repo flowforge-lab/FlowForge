@@ -579,3 +579,38 @@ describe("segmentTurn thought folding (#687)", () => {
     expect(kinds).toEqual(["steps", "prose", "steps"]);
   });
 });
+
+describe("foldTurns — mode-switch marker filtering (#848)", () => {
+  it("hides user-role mode-switch markers from the UI", () => {
+    const groups = foldTurns([
+      msg({ role: "user", content: "Plan this for me" }),
+      msg({
+        role: "assistant",
+        content: "I'm in Plan mode. Switch to Act to execute.",
+      }),
+      // Mode-switch marker injected by set_session_mode (#848)
+      msg({
+        role: "user",
+        content: "[system: Mode switched to Act. Full tool access enabled.]",
+      }),
+      msg({ role: "user", content: "Go" }),
+    ]);
+    // Only the real user messages appear; the marker is hidden.
+    const userGroups = groups.filter((g) => g.kind === "user");
+    expect(userGroups).toHaveLength(2); // "Plan this for me" + "Go"
+    expect(userGroups[0].kind === "user" && userGroups[0].message.content).toBe(
+      "Plan this for me",
+    );
+    expect(userGroups[1].kind === "user" && userGroups[1].message.content).toBe(
+      "Go",
+    );
+  });
+
+  it("does not filter regular user messages starting with [", () => {
+    const groups = foldTurns([
+      msg({ role: "user", content: "[code block] here is some text" }),
+    ]);
+    expect(groups).toHaveLength(1);
+    expect(groups[0].kind).toBe("user");
+  });
+});

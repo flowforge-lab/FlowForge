@@ -2607,10 +2607,16 @@ fn set_session_mode(state: State<'_, Arc<AppState>>, session_id: String, mode: O
             Mode::Auto => "Auto. Writes auto-approved; sensitive actions prompt.",
             Mode::Act => "Act. Full tool access enabled.",
         };
+        // Use Role::User so the message stays IN-POSITION in the conversation
+        // flow. Bedrock's `to_converse` lifts all Role::System messages out of
+        // sequence into a flat system parameter, losing the temporal signal that the
+        // mode changed between the assistant's prior response and the next user
+        // message (#848). A user-role marker stays in the conversation and breaks
+        // the model's self-consistency anchoring to its own prior "I'm in Plan" text.
         state.store.add_message(
             &session_id,
-            Role::System,
-            format!("[Mode switched to {label}]"),
+            Role::User,
+            format!("[system: Mode switched to {label}]"),
         );
     }
 }
