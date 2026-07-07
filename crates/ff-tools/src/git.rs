@@ -549,7 +549,8 @@ mod tests {
     #[tokio::test]
     async fn integration_diff_stat() {
         let root = std::env::current_dir().unwrap();
-        let args = serde_json::json!({"action": "diff", "stat": true, "ref": "HEAD~1"});
+        // Use HEAD (unstaged diff) rather than HEAD~1 which fails on shallow clones (CI).
+        let args = serde_json::json!({"action": "diff", "stat": true});
         let result = git_diff(&args, &root).await;
         assert!(result.success, "git diff --stat failed: {}", result.content);
     }
