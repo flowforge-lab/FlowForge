@@ -48,7 +48,7 @@ const MAX_SCRATCH_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 /// First tokens that are unambiguously read-only — auto-runnable without approval.
 const READ_ONLY_CMDS: &[&str] = &[
     "ls", "cat", "pwd", "echo", "head", "tail", "wc", "rg", "grep", "fd", "stat", "file", "tree",
-    "which", "whoami", "date", "printenv", "du", "df",
+    "find", "which", "whoami", "date", "printenv", "du", "df",
 ];
 
 /// Substrings that mark a command as destructive regardless of context.
@@ -216,6 +216,22 @@ impl BashTool {
         // hide writes or run arbitrary nested commands), so never auto-run them.
         if ["$(", "`", ">", ">>"].iter().any(|t| command.contains(t)) {
             return Safety::Write;
+        }
+        // `find` is read-only for traversal/matching, but it can execute or delete.
+        // `-exec`/`-execdir`/`-ok` run arbitrary commands (treat as Dangerous); a bare
+        // `-delete` mutates the tree (treat as Write). Matched as whitespace-delimited
+        // tokens so a path that merely contains the word doesn't trip the guard.
+        if lower.split_whitespace().any(|t| t == "find") {
+            let tokens: Vec<&str> = lower.split_whitespace().collect();
+            if tokens
+                .iter()
+                .any(|t| matches!(*t, "-exec" | "-execdir" | "-ok" | "-okdir"))
+            {
+                return Safety::Dangerous;
+            }
+            if tokens.contains(&"-delete") {
+                return Safety::Write;
+            }
         }
         // Read-only only when *every* segment (split on pipes/&&/;) starts with a
         // known read command. A single write segment downgrades the whole line.
@@ -506,9 +522,27 @@ mod tests {
     }
 
     #[test]
-    fn find_and_env_are_not_read_only() {
-        // `find -delete` writes; `env CMD` runs arbitrary programs.
-        assert_eq!(BashTool::classify("find . -name x"), Safety::Write);
+    fn find_is_read_only_unless_it_executes_or_deletes() {
+        // Traversal/matching is read-only; executing or deleting is not.
+        assert_eq!(BashTool::classify("find . -name x"), Safety::ReadOnly);
+        assert_eq!(
+            BashTool::classify("find . -type f -name '*.rs'"),
+            Safety::ReadOnly
+        );
+        assert_eq!(BashTool::classify("find . -delete"), Safety::Write);
+        assert_eq!(
+            BashTool::classify("find . -name x -exec cat {} ;"),
+            Safety::Dangerous
+        );
+        assert_eq!(
+            BashTool::classify("find . -execdir cat {} ;"),
+            Safety::Dangerous
+        );
+    }
+
+    #[test]
+    fn env_prefix_is_not_read_only() {
+        // `env CMD` runs arbitrary programs.
         assert_eq!(BashTool::classify("env FOO=1 ls"), Safety::Write);
     }
 
