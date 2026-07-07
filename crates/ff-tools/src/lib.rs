@@ -25,6 +25,7 @@ mod bash;
 mod compaction;
 mod diagnostics;
 mod edit;
+mod git;
 mod github;
 mod glob;
 mod goal_complete;
