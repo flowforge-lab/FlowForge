@@ -465,6 +465,9 @@ impl Provider for BedrockProvider {
         }
         let thinking_config = req.thinking.then(|| self.thinking_config_for(&req.model));
 
+        // Check before messages are moved into the request builder.
+        let has_tool_blocks = messages_have_tool_blocks(&messages);
+
         let mut call = client
             .converse_stream()
             .model_id(req.model)
@@ -474,6 +477,16 @@ impl Provider for BedrockProvider {
         }
         if let Some(cfg) = to_tool_config(&req.tools, cache) {
             call = call.tool_config(cfg);
+        } else if has_tool_blocks {
+            // Bedrock requires toolConfig when messages contain toolUse/toolResult
+            // blocks, even when the caller wants to withhold tools on this turn
+            // (e.g. the agent loop's last-iteration hard stop, #861). Bedrock has
+            // no ToolChoice::None, so we inject a minimal no-op tool that the model
+            // will never call (the wrap-up instruction already says "do not call
+            // tools"). This satisfies the API constraint without distorting behavior.
+            if let Some(cfg) = noop_tool_config() {
+                call = call.tool_config(cfg);
+            }
         }
         // Claude extended thinking (#394). Two wire shapes by model generation:
         //   - Adaptive (Opus 4.6+, Sonnet 4.6+): thinking.type = "adaptive" +
@@ -1013,6 +1026,37 @@ fn to_tool_config(tools: &[serde_json::Value], cache: bool) -> Option<ToolConfig
 fn cache_point() -> Option<CachePointBlock> {
     CachePointBlock::builder()
         .r#type(CachePointType::Default)
+        .build()
+        .ok()
+}
+
+/// Check whether any Converse message contains ToolUse or ToolResult blocks.
+/// Used to detect when `toolConfig` must be included even if the caller passed no
+/// tool schemas (Bedrock requires it whenever messages reference tools, #861).
+fn messages_have_tool_blocks(messages: &[Message]) -> bool {
+    messages.iter().any(|m| {
+        m.content
+            .iter()
+            .any(|b| matches!(b, ContentBlock::ToolUse(_) | ContentBlock::ToolResult(_)))
+    })
+}
+
+/// Build a minimal `ToolConfiguration` with a single no-op tool. The model will
+/// never call it (the wrap-up instruction forbids tool calls), but its presence
+/// satisfies Bedrock's requirement that `toolConfig` be defined whenever messages
+/// contain tool blocks.
+fn noop_tool_config() -> Option<ToolConfiguration> {
+    // Schema must be a valid JSON Schema with "type": "object" — Bedrock rejects
+    // a bare {}. Use the same shape normalize_object_schema produces for real tools.
+    let schema = json_to_doc(&serde_json::json!({"type": "object", "properties": {}}));
+    let spec = ToolSpecification::builder()
+        .name("_noop")
+        .description("Internal placeholder. Do not call.")
+        .input_schema(ToolInputSchema::Json(schema))
+        .build()
+        .ok()?;
+    ToolConfiguration::builder()
+        .tools(Tool::ToolSpec(spec))
         .build()
         .ok()
 }

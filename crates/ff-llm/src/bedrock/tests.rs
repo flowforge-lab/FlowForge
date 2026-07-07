@@ -1273,3 +1273,73 @@ fn user_role_mode_switch_stays_in_conversation_position() {
     assert!(user_content[0].contains("Mode switched to Act"));
     assert_eq!(user_content[1], "Go");
 }
+
+#[test]
+fn messages_have_tool_blocks_detects_tool_use() {
+    let messages = vec![
+        Message::builder()
+            .role(ConversationRole::User)
+            .content(ContentBlock::Text("hello".to_string()))
+            .build()
+            .unwrap(),
+        Message::builder()
+            .role(ConversationRole::Assistant)
+            .content(ContentBlock::ToolUse(
+                ToolUseBlock::builder()
+                    .tool_use_id("call_1")
+                    .name("bash")
+                    .input(Document::Object(std::collections::HashMap::new()))
+                    .build()
+                    .unwrap(),
+            ))
+            .build()
+            .unwrap(),
+    ];
+    assert!(messages_have_tool_blocks(&messages));
+}
+
+#[test]
+fn messages_have_tool_blocks_false_for_text_only() {
+    let messages = vec![
+        Message::builder()
+            .role(ConversationRole::User)
+            .content(ContentBlock::Text("hello".to_string()))
+            .build()
+            .unwrap(),
+        Message::builder()
+            .role(ConversationRole::Assistant)
+            .content(ContentBlock::Text("hi there".to_string()))
+            .build()
+            .unwrap(),
+    ];
+    assert!(!messages_have_tool_blocks(&messages));
+}
+
+#[test]
+fn noop_tool_config_builds_successfully() {
+    let cfg = noop_tool_config();
+    assert!(cfg.is_some(), "noop_tool_config should build");
+    let cfg = cfg.unwrap();
+    let tools = cfg.tools();
+    assert_eq!(tools.len(), 1);
+    match &tools[0] {
+        Tool::ToolSpec(spec) => {
+            assert_eq!(spec.name(), "_noop");
+            // Schema must be {"type":"object","properties":{}} — not bare {}.
+            // Bedrock rejects empty schemas (normalize_object_schema documents this).
+            if let Some(ToolInputSchema::Json(doc)) = spec.input_schema() {
+                if let Document::Object(map) = doc {
+                    assert!(
+                        map.contains_key("type"),
+                        "schema must contain 'type' key; got: {map:?}"
+                    );
+                } else {
+                    panic!("expected Object document");
+                }
+            } else {
+                panic!("expected Some(Json) input schema");
+            }
+        }
+        _ => panic!("expected ToolSpec"),
+    }
+}
