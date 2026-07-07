@@ -158,6 +158,7 @@ impl ToolRegistry {
         r.register(Box::new(crate::ask_user::AskUserTool));
         r.register(Box::new(crate::diagnostics::DiagnosticsTool));
         r.register(Box::new(crate::test_runner::TestRunnerTool));
+        r.register(Box::new(crate::git::GitTool));
         r.register(Box::new(crate::github::GithubTool));
         r.register(Box::new(crate::agent_tool::AgentTool));
         r
