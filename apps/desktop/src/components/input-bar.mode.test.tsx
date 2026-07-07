@@ -45,6 +45,15 @@ async function selectMode(testId: string, mode: string) {
   );
 }
 
+/** Open a pane's mode dropdown and click "Reset to default" (#800). */
+async function resetMode(testId: string) {
+  const user = userEvent.setup();
+  await user.click(within(screen.getByTestId(testId)).getByRole("button"));
+  await user.click(
+    await screen.findByRole("menuitem", { name: /Reset to default/ }),
+  );
+}
+
 describe("ModePill dropdown (#344)", () => {
   beforeEach(() => {
     localStorage.clear();
@@ -84,6 +93,25 @@ describe("ModePill dropdown (#344)", () => {
     await selectMode("a", "Plan");
     const blob = JSON.parse(localStorage.getItem("ff-session-mode") ?? "{}");
     expect(blob.state.modeBySession.a).toBe("plan");
+  });
+
+  it("resets an explicit override back to the inherited default (#800)", async () => {
+    await selectMode("a", "Plan");
+    expect(pillLabel("a")).toBe("Plan");
+
+    await resetMode("a");
+    expect(pillLabel("a")).toBe("Auto"); // back to inheriting defaultMode
+    const blob = JSON.parse(localStorage.getItem("ff-session-mode") ?? "{}");
+    expect(blob.state.modeBySession).not.toHaveProperty("a");
+  });
+
+  it("disables Reset to default while the session is inheriting", async () => {
+    const user = userEvent.setup();
+    await user.click(within(screen.getByTestId("a")).getByRole("button"));
+    const reset = await screen.findByRole("menuitem", {
+      name: /Reset to default/,
+    });
+    expect(reset.getAttribute("aria-disabled")).toBe("true");
   });
 });
 

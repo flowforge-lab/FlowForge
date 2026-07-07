@@ -21,6 +21,7 @@ import {
   DropdownMenuTrigger,
   DropdownMenuContent,
   DropdownMenuItem,
+  DropdownMenuSeparator,
 } from "@/components/ui/dropdown-menu";
 import {
   Tooltip,
@@ -584,7 +585,10 @@ export function ModePill({ sessionId }: { sessionId: string }) {
   const defaultMode = usePrefsStore((s) => s.defaultMode);
   const explicit = useSessionModeStore((s) => s.modeBySession[sessionId]);
   const setMode = useSessionModeStore((s) => s.setMode);
+  const clearMode = useSessionModeStore((s) => s.clearMode);
   const mode = explicit ?? defaultMode;
+  // No explicit override → this session inherits the default-mode pref (#800).
+  const inherited = explicit === undefined;
   // Self-heal sessions persisted before mode was wired to the backend (#789):
   // push the localStorage-cached override to SQLite on mount so an existing
   // "Plan" session is honoured without a re-toggle. `null` clears the override
@@ -598,15 +602,26 @@ export function ModePill({ sessionId }: { sessionId: string }) {
       <DropdownMenuTrigger asChild>
         <button
           type="button"
-          title={`Mode: ${meta.label} — ${meta.description}`}
-          aria-label={`Agent mode: ${meta.label}`}
+          title={`Mode: ${meta.label}${
+            inherited ? " (inherited from default)" : ""
+          } — ${meta.description}`}
+          aria-label={`Agent mode: ${meta.label}${
+            inherited ? " (inherited from default)" : ""
+          }`}
           className={cn(
             "inline-flex shrink-0 items-center gap-1.5 rounded-md border px-2 py-1.5 text-xs font-medium transition-colors",
             meta.pillClass,
           )}
         >
+          {/* Filled dot = explicit override; hollow ring = inheriting the default
+              (#800). `border-current` picks up the pill's mode colour. */}
           <span
-            className={cn("size-1.5 shrink-0 rounded-full", meta.dotClass)}
+            className={cn(
+              "size-1.5 shrink-0 rounded-full",
+              inherited
+                ? "border border-current bg-transparent"
+                : meta.dotClass,
+            )}
           />
           {meta.label}
         </button>
@@ -640,6 +655,15 @@ export function ModePill({ sessionId }: { sessionId: string }) {
             </DropdownMenuItem>
           );
         })}
+        {/* Clear the explicit override so the session inherits `defaultMode`
+            again (#800). Disabled when already inheriting — nothing to reset. */}
+        <DropdownMenuSeparator />
+        <DropdownMenuItem
+          disabled={inherited}
+          onSelect={() => clearMode(sessionId)}
+        >
+          Reset to default
+        </DropdownMenuItem>
       </DropdownMenuContent>
     </DropdownMenu>
   );
