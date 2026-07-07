@@ -3,6 +3,7 @@ import {
   ChevronDown,
   Plus,
   Check,
+  Info,
   RotateCcw,
   Trash2,
 } from "@/components/ui/icon";
@@ -10,6 +11,12 @@ import { cn } from "@/lib/utils";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
 import { SegmentedControl } from "@/components/settings/segmented-control";
 import {
   concreteAuthMode,
@@ -121,6 +128,10 @@ export function ProviderCard({ conn }: { conn: ProviderConnection }) {
   const [authMode, setAuthMode] = useState<BedrockAuth>(concreteAuthMode(conn));
   const [awsProfile, setAwsProfile] = useState(conn.awsProfile ?? "");
   const [accessKeyId, setAccessKeyId] = useState(conn.accessKeyId ?? "");
+  // Optional fast model for background compaction/flush (#761). Hosted-only.
+  const [compactionModel, setCompactionModel] = useState(
+    conn.compactionModel ?? "",
+  );
 
   // Re-sync the editable non-secret fields when the stored connection changes
   // in place (same id) -- e.g. region/profile populated by a load. The useState
@@ -135,6 +146,7 @@ export function ProviderCard({ conn }: { conn: ProviderConnection }) {
     conn.authMode,
     conn.awsProfile,
     conn.accessKeyId,
+    conn.compactionModel,
   ]);
   const [syncedSig, setSyncedSig] = useState(connFieldSig);
   if (syncedSig !== connFieldSig) {
@@ -144,6 +156,7 @@ export function ProviderCard({ conn }: { conn: ProviderConnection }) {
     setAuthMode(concreteAuthMode(conn));
     setAwsProfile(conn.awsProfile ?? "");
     setAccessKeyId(conn.accessKeyId ?? "");
+    setCompactionModel(conn.compactionModel ?? "");
   }
   // Write-only secret inputs — never seeded from the backend, cleared on save.
   const [secretAccessKey, setSecretAccessKey] = useState("");
@@ -205,6 +218,7 @@ export function ProviderCard({ conn }: { conn: ProviderConnection }) {
         authMode,
         awsProfile: awsProfile.trim() || undefined,
         accessKeyId: accessKeyId.trim() || undefined,
+        compactionModel: compactionModel.trim() || undefined,
       });
       // Persist any freshly-entered secrets (write-only), then drop them locally.
       // Only the selected mode's fields are visible; hidden ones stay empty and
@@ -221,7 +235,11 @@ export function ProviderCard({ conn }: { conn: ProviderConnection }) {
       // `…/chat/completions/models` on the model/probe call.
       const normalized = normalizeBaseUrl(baseUrl);
       setBaseUrl(normalized);
-      await saveConnection({ ...conn, baseUrl: normalized || undefined });
+      await saveConnection({
+        ...conn,
+        baseUrl: normalized || undefined,
+        compactionModel: compactionModel.trim() || undefined,
+      });
       // Persist a freshly-entered key (write-only), then drop it locally.
       if (apiKey) await setSecret(conn.id, "apiKey", apiKey);
       setApiKey("");
@@ -471,6 +489,47 @@ export function ProviderCard({ conn }: { conn: ProviderConnection }) {
                 </p>
               </div>
             )}
+
+            {/* Compaction model — hosted only; local kinds are already fast (#761). */}
+            {isBedrock || isHostedKey ? (
+              <div className="space-y-1.5">
+                <div className="flex items-center gap-1.5">
+                  <label
+                    htmlFor={`compaction-${conn.id}`}
+                    className={fieldLabelClass()}
+                  >
+                    Compaction model
+                  </label>
+                  <TooltipProvider delayDuration={150}>
+                    <Tooltip>
+                      <TooltipTrigger asChild>
+                        <button
+                          type="button"
+                          className="text-muted-foreground/70 hover:text-foreground"
+                          aria-label="About the compaction model"
+                        >
+                          <Info className="size-3.5" />
+                        </button>
+                      </TooltipTrigger>
+                      <TooltipContent className="max-w-64">
+                        A fast model used for background context summarization.
+                        Leave empty to use the session model. Examples:
+                        anthropic.claude-haiku-4-0, gpt-4o-mini
+                      </TooltipContent>
+                    </Tooltip>
+                  </TooltipProvider>
+                </div>
+                <Input
+                  id={`compaction-${conn.id}`}
+                  value={compactionModel}
+                  placeholder="Leave empty to use the session model"
+                  autoComplete="off"
+                  spellCheck={false}
+                  className="font-mono text-[12px]"
+                  onChange={(e) => setCompactionModel(e.target.value)}
+                />
+              </div>
+            ) : null}
 
             <div className="flex items-center gap-2 pt-0.5">
               <TestResult test={test} />

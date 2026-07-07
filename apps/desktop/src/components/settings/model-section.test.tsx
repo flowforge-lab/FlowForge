@@ -43,6 +43,20 @@ async function click(el: Element | null | undefined) {
   });
 }
 
+/** Set a controlled input's value the way React expects (native setter + input event). */
+async function type(el: Element | null, value: string) {
+  const input = el as HTMLInputElement;
+  const setter = Object.getOwnPropertyDescriptor(
+    HTMLInputElement.prototype,
+    "value",
+  )?.set;
+  await act(async () => {
+    setter?.call(input, value);
+    input.dispatchEvent(new Event("input", { bubbles: true }));
+    await flush();
+  });
+}
+
 /** First element under `scope` whose trimmed text equals `text`. */
 function byText(
   text: string,
@@ -197,6 +211,28 @@ describe("ModelSection provider accordion", () => {
     await click(byText("Test Connection", "button", openai));
     const alert = card("OpenAI").querySelector('[role="alert"]');
     expect(alert?.textContent).toMatch(/OpenAI API key/i);
+  });
+
+  it("shows the Compaction model field for hosted kinds, hides it for local, and persists on Save (#761)", async () => {
+    await renderSection();
+
+    // Local kinds are already fast -> no compaction field (candle-vLLM is the
+    // default-active card, rendered open).
+    expect(hasLabel("Compaction model", card("candle-vLLM"))).toBe(false);
+
+    // Hosted kind: the field is present and its value persists through Save.
+    await click(cardHeader("OpenAI"));
+    const openai = card("OpenAI");
+    expect(hasLabel("Compaction model", openai)).toBe(true);
+
+    await type(openai.querySelector("#compaction-openai"), "gpt-4o-mini");
+    await click(byText("Save", "button", openai));
+
+    expect(
+      useModelConfigStore
+        .getState()
+        .registry?.connections.find((c) => c.id === "openai")?.compactionModel,
+    ).toBe("gpt-4o-mini");
   });
 
   it("disables the Thinking switch when a hosted OpenAI-compatible connection is active", async () => {
