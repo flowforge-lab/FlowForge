@@ -837,6 +837,10 @@ fn document_format(media_type: &str, name: Option<&str>) -> Option<DocumentForma
         // Bedrock's DocumentFormat has no JSON variant; route it to Txt so JSON
         // attachments still reach the model as readable text (#504).
         "application/json" | "text/json" => Some(DocumentFormat::Txt),
+        // Python source (#842): no py variant either, so route to Txt. A `.ipynb`
+        // arrives already converted to `text/plain` from the FE, so it matches the
+        // `text/plain` arm above — no notebook branch needed here.
+        "text/x-python" | "application/x-python-code" => Some(DocumentFormat::Txt),
         _ => None,
     };
     by_media.or_else(|| {
@@ -852,6 +856,9 @@ fn document_format(media_type: &str, name: Option<&str>) -> Option<DocumentForma
             "xls" => Some(DocumentFormat::Xls),
             "xlsx" => Some(DocumentFormat::Xlsx),
             "json" => Some(DocumentFormat::Txt),
+            // Python source (#842) → Txt. `.ipynb` never reaches here raw — the
+            // FE converts it to `text/plain` before send.
+            "py" => Some(DocumentFormat::Txt),
             _ => None,
         }
     })
