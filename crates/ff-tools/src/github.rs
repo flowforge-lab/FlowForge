@@ -32,13 +32,13 @@ impl Tool for GithubTool {
                 "action": {
                     "type": "string",
                     "description": "The operation to perform.",
-                    "enum": ["pr_create", "pr_list", "pr_merge", "pr_checks", "pr_review", "pr_comment", "pr_request_review", "pr_review_inline", "issue_create", "issue_edit", "issue_list", "issue_comment", "push"]
+                    "enum": ["pr_create", "pr_list", "pr_view", "pr_merge", "pr_checks", "pr_review", "pr_comment", "pr_request_review", "pr_review_inline", "issue_create", "issue_edit", "issue_list", "issue_view", "issue_comment", "push"]
                 },
                 "title": { "type": "string", "description": "Title for PR or issue (pr_create, issue_create)." },
                 "body": { "type": "string", "description": "Body text for a PR/issue or a review/comment (pr_create, issue_create, issue_edit, pr_review, pr_comment, issue_comment, pr_review_inline). Required for pr_review / pr_review_inline when event is COMMENT or REQUEST_CHANGES (GitHub 422s a bodiless one); optional for APPROVE. Markdown supported." },
                 "base": { "type": "string", "description": "Base branch for PR (pr_create). Defaults to 'main'." },
                 "head": { "type": "string", "description": "Head branch for PR (pr_create). Defaults to current branch." },
-                "number": { "type": "integer", "description": "PR or issue number (pr_merge, pr_checks, pr_review, pr_comment, pr_request_review, pr_review_inline, issue_edit, issue_comment)." },
+                "number": { "type": "integer", "description": "PR or issue number (pr_view, pr_merge, pr_checks, pr_review, pr_comment, pr_request_review, pr_review_inline, issue_view, issue_edit, issue_comment)." },
                 "event": { "type": "string", "enum": ["APPROVE", "REQUEST_CHANGES", "COMMENT"], "description": "Review verdict for pr_review / pr_review_inline. Note: APPROVE and REQUEST_CHANGES are rejected on your own PR (422) — use COMMENT for a self-review." },
                 "comments": { "type": "array", "description": "Inline review comments for pr_review_inline. Each anchors to a diff line.", "items": { "type": "object", "properties": { "path": { "type": "string", "description": "File path (repo-relative)." }, "line": { "type": "integer", "description": "Line number in the file's diff." }, "side": { "type": "string", "enum": ["LEFT", "RIGHT"], "description": "Diff side. Defaults to RIGHT." }, "start_line": { "type": "integer", "description": "Start line for a multi-line comment (optional)." }, "body": { "type": "string", "description": "Comment text." } }, "required": ["path", "line", "body"] } },
                 "squash": { "type": "boolean", "description": "Squash merge (pr_merge). Defaults to true." },
@@ -48,6 +48,7 @@ impl Tool for GithubTool {
                 "author": { "type": "string", "description": "Filter by author (pr_list). Use '@me' for self." },
                 "limit": { "type": "integer", "description": "Max results to return (pr_list, issue_list). Defaults to 10." },
                 "force": { "type": "boolean", "description": "Force push (push). Defaults to false." },
+                "diff": { "type": "boolean", "description": "For pr_view: return the raw unified diff (gh pr diff) instead of the PR metadata + body. Defaults to false." },
                 "delete_branch": { "type": "boolean", "description": "Delete head branch after merge (pr_merge). Defaults to true." }
             },
             "required": ["action"]
@@ -56,7 +57,9 @@ impl Tool for GithubTool {
 
     fn safety(&self, args: &Value) -> Safety {
         match args.get("action").and_then(|a| a.as_str()) {
-            Some("pr_list" | "pr_checks" | "issue_list") => Safety::ReadOnly,
+            Some("pr_list" | "pr_view" | "pr_checks" | "issue_list" | "issue_view") => {
+                Safety::ReadOnly
+            }
             _ => Safety::Write,
         }
     }
@@ -65,9 +68,9 @@ impl Tool for GithubTool {
         Safety::Write
     }
 
-    // Read-only floor: the list/read actions (`pr_list`, `pr_checks`, `issue_list`)
-    // are `ReadOnly`, so gh is advertised in Plan; the per-call `safety` gate
-    // rejects the mutating actions there (Plan x Write = Deny).
+    // Read-only floor: the list/read actions (`pr_list`, `pr_view`, `pr_checks`,
+    // `issue_list`, `issue_view`) are `ReadOnly`, so gh is advertised in Plan; the
+    // per-call `safety` gate rejects the mutating actions there (Plan x Write = Deny).
     fn min_safety(&self) -> Safety {
         Safety::ReadOnly
     }
@@ -81,6 +84,7 @@ impl Tool for GithubTool {
         match action {
             "pr_create" => pr_create(&args, root).await,
             "pr_list" => pr_list(&args, root).await,
+            "pr_view" => pr_view(&args, root).await,
             "pr_merge" => pr_merge(&args, root).await,
             "pr_checks" => pr_checks(&args, root).await,
             "pr_review" => pr_review(&args, root).await,
@@ -90,6 +94,7 @@ impl Tool for GithubTool {
             "issue_create" => issue_create(&args, root).await,
             "issue_edit" => issue_edit(&args, root).await,
             "issue_list" => issue_list(&args, root).await,
+            "issue_view" => issue_view(&args, root).await,
             "issue_comment" => issue_comment(&args, root).await,
             "push" => push(&args, root).await,
             _ => ToolOutcome::error(format!("unknown action: {action}")),
@@ -579,6 +584,135 @@ async fn issue_list(args: &Value, root: &Path) -> ToolOutcome {
     }
 }
 
+/// Read one issue's full body + metadata (`gh issue view <n> --json …`). ReadOnly,
+/// so it is usable in Plan mode (#825) — closes the "can list but not read a single
+/// issue's body" gap that forced a `bash gh` fallback.
+async fn issue_view(args: &Value, root: &Path) -> ToolOutcome {
+    let number = match args.get("number").and_then(|v| v.as_u64()) {
+        Some(n) => n,
+        None => return ToolOutcome::error("issue_view requires 'number'"),
+    };
+    let mut cmd = gh_cmd(root);
+    cmd.args([
+        "issue",
+        "view",
+        &number.to_string(),
+        "--json",
+        "number,title,state,author,labels,assignees,body",
+    ]);
+    match run_gh(cmd).await {
+        Ok(json) => {
+            let v: Value = serde_json::from_str(&json).unwrap_or_default();
+            ToolOutcome::ok(render_record(&v, "issue"))
+        }
+        Err(e) => ToolOutcome::error(format!("issue_view failed: {e}")),
+    }
+}
+
+/// Read one PR: metadata + body by default, or the raw unified diff when
+/// `diff: true` (`gh pr diff <n>` — the compact form the review flow prefers over
+/// the file-listing JSON). ReadOnly, usable in Plan mode (#825).
+async fn pr_view(args: &Value, root: &Path) -> ToolOutcome {
+    let number = match args.get("number").and_then(|v| v.as_u64()) {
+        Some(n) => n,
+        None => return ToolOutcome::error("pr_view requires 'number'"),
+    };
+    let diff = args.get("diff").and_then(|v| v.as_bool()).unwrap_or(false);
+    let mut cmd = gh_cmd(root);
+    if diff {
+        cmd.args(["pr", "diff", &number.to_string()]);
+        return match run_gh(cmd).await {
+            Ok(out) if out.trim().is_empty() => {
+                ToolOutcome::ok(format!("PR #{number}: empty diff."))
+            }
+            Ok(out) => ToolOutcome::ok(out),
+            Err(e) => ToolOutcome::error(format!("pr_view (diff) failed: {e}")),
+        };
+    }
+    cmd.args([
+        "pr",
+        "view",
+        &number.to_string(),
+        "--json",
+        "number,title,state,author,baseRefName,headRefName,additions,deletions,changedFiles,body",
+    ]);
+    match run_gh(cmd).await {
+        Ok(json) => {
+            let v: Value = serde_json::from_str(&json).unwrap_or_default();
+            ToolOutcome::ok(render_record(&v, "pr"))
+        }
+        Err(e) => ToolOutcome::error(format!("pr_view failed: {e}")),
+    }
+}
+
+/// Render a single issue/PR JSON record as readable markdown (title, state, and
+/// the full body) rather than a one-row table. `login`-bearing sub-objects
+/// (author) and `name`-bearing arrays (labels) / `login` arrays (assignees) are
+/// flattened to comma lists.
+fn render_record(v: &Value, kind: &str) -> String {
+    let num = v.get("number").and_then(|x| x.as_u64());
+    let title = v.get("title").and_then(|x| x.as_str()).unwrap_or("");
+    let state = v.get("state").and_then(|x| x.as_str()).unwrap_or("?");
+    let sigil = if kind == "pr" { "PR #" } else { "#" };
+    let head = match num {
+        Some(n) => format!("{sigil}{n} [{state}] {title}"),
+        None => format!("[{state}] {title}"),
+    };
+    let mut out = vec![head];
+
+    if let Some(author) = v
+        .get("author")
+        .and_then(|a| a.get("login"))
+        .and_then(|l| l.as_str())
+    {
+        out.push(format!("author: {author}"));
+    }
+    let labels = join_field(v.get("labels"), "name");
+    if !labels.is_empty() {
+        out.push(format!("labels: {labels}"));
+    }
+    let assignees = join_field(v.get("assignees"), "login");
+    if !assignees.is_empty() {
+        out.push(format!("assignees: {assignees}"));
+    }
+    if kind == "pr" {
+        if let (Some(base), Some(head_ref)) = (
+            v.get("baseRefName").and_then(|x| x.as_str()),
+            v.get("headRefName").and_then(|x| x.as_str()),
+        ) {
+            let adds = v.get("additions").and_then(|x| x.as_u64()).unwrap_or(0);
+            let dels = v.get("deletions").and_then(|x| x.as_u64()).unwrap_or(0);
+            let files = v.get("changedFiles").and_then(|x| x.as_u64()).unwrap_or(0);
+            out.push(format!(
+                "{head_ref} → {base}  +{adds}/-{dels} across {files} files"
+            ));
+        }
+    }
+
+    let body = v.get("body").and_then(|x| x.as_str()).unwrap_or("").trim();
+    out.push(String::new());
+    out.push(if body.is_empty() {
+        "(no description)".to_string()
+    } else {
+        body.to_string()
+    });
+    out.join("\n")
+}
+
+/// Flatten a JSON array of objects to a comma-joined list of one string field
+/// (e.g. `labels[].name`, `assignees[].login`). Empty when absent/not an array.
+fn join_field(arr: Option<&Value>, key: &str) -> String {
+    arr.and_then(|a| a.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|it| it.get(key).and_then(|v| v.as_str()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .unwrap_or_default()
+}
+
 async fn push(args: &Value, root: &Path) -> ToolOutcome {
     let force = args.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
 
@@ -720,6 +854,72 @@ mod tests {
         assert_eq!(tool.safety(&args), Safety::ReadOnly);
         let args = serde_json::json!({"action": "issue_list"});
         assert_eq!(tool.safety(&args), Safety::ReadOnly);
+        // #825: the single-record read actions are ReadOnly too, so gh is usable
+        // in Plan mode to read one issue's / PR's body.
+        let args = serde_json::json!({"action": "issue_view"});
+        assert_eq!(tool.safety(&args), Safety::ReadOnly);
+        let args = serde_json::json!({"action": "pr_view"});
+        assert_eq!(tool.safety(&args), Safety::ReadOnly);
+    }
+
+    #[test]
+    fn render_record_shows_body_and_metadata() {
+        // issue_view: title/state/author/labels/assignees + full body.
+        let v = serde_json::json!({
+            "number": 42,
+            "title": "Fix the thing",
+            "state": "OPEN",
+            "author": { "login": "octocat" },
+            "labels": [{ "name": "bug" }, { "name": "backend" }],
+            "assignees": [{ "login": "abid" }],
+            "body": "First line.\n\nSecond paragraph."
+        });
+        let out = render_record(&v, "issue");
+        assert!(out.starts_with("#42 [OPEN] Fix the thing"));
+        assert!(out.contains("author: octocat"));
+        assert!(out.contains("labels: bug, backend"));
+        assert!(out.contains("assignees: abid"));
+        assert!(out.contains("First line.\n\nSecond paragraph."));
+    }
+
+    #[test]
+    fn render_record_pr_shows_branches_and_stats() {
+        let v = serde_json::json!({
+            "number": 7,
+            "title": "Add feature",
+            "state": "OPEN",
+            "author": { "login": "dev" },
+            "baseRefName": "main",
+            "headRefName": "feat/x",
+            "additions": 10,
+            "deletions": 2,
+            "changedFiles": 3,
+            "body": "PR body here."
+        });
+        let out = render_record(&v, "pr");
+        assert!(out.starts_with("PR #7 [OPEN] Add feature"));
+        assert!(out.contains("feat/x → main  +10/-2 across 3 files"));
+        assert!(out.contains("PR body here."));
+    }
+
+    #[test]
+    fn render_record_handles_empty_body_and_missing_fields() {
+        let v = serde_json::json!({ "title": "No body", "state": "CLOSED" });
+        let out = render_record(&v, "issue");
+        assert!(out.contains("[CLOSED] No body"));
+        assert!(out.contains("(no description)"));
+        // Missing author/labels/assignees don't emit stray lines.
+        assert!(!out.contains("author:"));
+        assert!(!out.contains("labels:"));
+    }
+
+    #[test]
+    fn join_field_flattens_and_tolerates_absence() {
+        let labels = serde_json::json!([{ "name": "a" }, { "name": "b" }]);
+        assert_eq!(join_field(Some(&labels), "name"), "a, b");
+        assert_eq!(join_field(None, "name"), "");
+        let empty = serde_json::json!([]);
+        assert_eq!(join_field(Some(&empty), "name"), "");
     }
 
     #[test]
