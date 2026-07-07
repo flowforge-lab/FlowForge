@@ -48,7 +48,7 @@ const MAX_SCRATCH_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 /// First tokens that are unambiguously read-only — auto-runnable without approval.
 const READ_ONLY_CMDS: &[&str] = &[
     "ls", "cat", "pwd", "echo", "head", "tail", "wc", "rg", "grep", "fd", "stat", "file", "tree",
-    "which", "whoami", "date", "printenv", "du", "df",
+    "find", "which", "whoami", "date", "printenv", "du", "df",
 ];
 
 /// Substrings that mark a command as destructive regardless of context.
@@ -216,6 +216,35 @@ impl BashTool {
         // hide writes or run arbitrary nested commands), so never auto-run them.
         if ["$(", "`", ">", ">>"].iter().any(|t| command.contains(t)) {
             return Safety::Write;
+        }
+        // `find` is read-only for traversal/matching, but it has actions with
+        // side effects. `-exec`/`-execdir`/`-ok`/`-okdir` run arbitrary commands
+        // (Dangerous). `-delete` and the file-writing actions `-fprint`/`-fprint0`/
+        // `-fprintf`/`-fls` mutate the filesystem — the `-f*` forms create/truncate
+        // a NAMED FILE with no shell redirect, so they bypass the `>`/`>>` guard
+        // above and must be caught here (Write), else they'd be auto-run unprompted
+        // and permitted in Plan mode. (`-exec*`/`-ok*`, `-delete`, `-fprint*`/
+        // `-fprintf`/`-fls` are the complete set of GNU find actions with side
+        // effects; read-only `-print*`/`-ls`/`-prune`/`-quit` stay ReadOnly.)
+        //
+        // The `find`-anywhere trigger is intentionally conservative: it fires even
+        // when `find` is not the first token (e.g. `grep find …`), over-restricting
+        // rather than risking a missed side-effecting form. Do NOT "optimize" this
+        // to first-token-only — that reintroduces the classification gap.
+        let tokens: Vec<&str> = lower.split_whitespace().collect();
+        if tokens.contains(&"find") {
+            if tokens
+                .iter()
+                .any(|t| matches!(*t, "-exec" | "-execdir" | "-ok" | "-okdir"))
+            {
+                return Safety::Dangerous;
+            }
+            if tokens
+                .iter()
+                .any(|t| matches!(*t, "-delete" | "-fprint" | "-fprint0" | "-fprintf" | "-fls"))
+            {
+                return Safety::Write;
+            }
         }
         // Read-only only when *every* segment (split on pipes/&&/;) starts with a
         // known read command. A single write segment downgrades the whole line.
@@ -506,9 +535,47 @@ mod tests {
     }
 
     #[test]
-    fn find_and_env_are_not_read_only() {
-        // `find -delete` writes; `env CMD` runs arbitrary programs.
-        assert_eq!(BashTool::classify("find . -name x"), Safety::Write);
+    fn find_is_read_only_unless_it_executes_or_deletes() {
+        // Traversal/matching is read-only; executing or deleting is not.
+        assert_eq!(BashTool::classify("find . -name x"), Safety::ReadOnly);
+        assert_eq!(
+            BashTool::classify("find . -type f -name '*.rs'"),
+            Safety::ReadOnly
+        );
+        assert_eq!(BashTool::classify("find . -delete"), Safety::Write);
+        assert_eq!(
+            BashTool::classify("find . -name x -exec cat {} ;"),
+            Safety::Dangerous
+        );
+        assert_eq!(
+            BashTool::classify("find . -execdir cat {} ;"),
+            Safety::Dangerous
+        );
+        assert_eq!(
+            BashTool::classify("find . -okdir rm {} ;"),
+            Safety::Dangerous
+        );
+        // #840 review: the file-writing actions create/truncate a NAMED file with
+        // no shell redirect, so they must be Write, not ReadOnly — e.g.
+        // `find . -fprint ~/.bashrc` truncates .bashrc. Regression guard.
+        assert_eq!(BashTool::classify("find . -fprint /tmp/out"), Safety::Write);
+        assert_eq!(
+            BashTool::classify("find . -fprint0 /tmp/out"),
+            Safety::Write
+        );
+        assert_eq!(
+            BashTool::classify("find . -fprintf /tmp/out '%p\\n'"),
+            Safety::Write
+        );
+        assert_eq!(BashTool::classify("find . -fls /tmp/out"), Safety::Write);
+        // Read-only find actions stay ReadOnly.
+        assert_eq!(BashTool::classify("find . -print"), Safety::ReadOnly);
+        assert_eq!(BashTool::classify("find . -ls"), Safety::ReadOnly);
+    }
+
+    #[test]
+    fn env_prefix_is_not_read_only() {
+        // `env CMD` runs arbitrary programs.
         assert_eq!(BashTool::classify("env FOO=1 ls"), Safety::Write);
     }
 
