@@ -97,3 +97,46 @@ fn concurrent_access_from_two_threads() {
     let (boundary, _, _) = cache.get("s1").unwrap();
     assert_eq!(boundary, 99);
 }
+
+#[test]
+fn evict_when_over_capacity() {
+    let cache = CompactionCache::new();
+    let msg = test_msg("summary");
+
+    // Beyond capacity, survivors get evicted in LRU order.
+    for i in 0..200 {
+        cache.put(&format!("s{i}"), i, msg.clone(), i as u64);
+    }
+    // All entries outside the last 128 should be gone — including s0.
+    assert!(cache.get("s0").is_none(), "s0 must be evicted by LRU cap");
+    assert!(cache.get("s199").is_some(), "s199 must survive as MRU");
+}
+
+#[test]
+fn get_promotes_to_most_recently_used() {
+    // Fill to capacity, touch the oldest, insert one more: the touched entry
+    // survives and the next-oldest gets evicted instead.
+    let cache = CompactionCache::new();
+    let msg = test_msg("summary");
+
+    for i in 0..128 {
+        cache.put(&format!("s{i}"), i, msg.clone(), i as u64);
+    }
+    // Touch s0 — this promotes it to MRU.
+    let _ = cache.get("s0").unwrap();
+
+    cache.put("s-new", 999, test_msg("new"), 999);
+
+    // s0 was promoted, so it survives.
+    assert!(
+        cache.get("s0").is_some(),
+        "touched s0 must survive eviction"
+    );
+    // s-new is present.
+    assert!(cache.get("s-new").is_some());
+    // s1 — the new least-recently-used entry after s0's promotion — is gone.
+    assert!(
+        cache.get("s1").is_none(),
+        "s1 is the new LRU and must be evicted"
+    );
+}

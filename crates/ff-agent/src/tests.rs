@@ -418,6 +418,310 @@ fn ctx<'a>(
     ToolContext::new(registry, root, approve, 8, &TEST_MATRIX)
 }
 
+/// Counts how many times the provider was hit *as the abstractive summarizer*
+/// (2-message requests with no tools). Used to distinguish a run_turn that
+/// reuses the cross-turn summary cache from one that re-summarizes first. The
+/// flush + main-turn calls are intentionally ignored — they always fire and
+/// are unrelated to the cache contract under test.
+struct CountingProvider {
+    summarizer_calls: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl Provider for CountingProvider {
+    async fn chat_stream(&self, req: ChatRequest) -> Result<ChunkStream, LlmError> {
+        // The Tier-2 summarizer sends a 2-message request (system prompt + the
+        // cold block) with no tools. Filter for that shape, ignore everything
+        // else (flush + main turn).
+        if req.tools.is_empty() && req.messages.len() == 2 {
+            self.summarizer_calls.fetch_add(1, Ordering::SeqCst);
+        }
+        Ok(futures_util::stream::iter(vec![Ok(Chunk {
+            delta: "ok".into(),
+            done: true,
+            ..Chunk::default()
+        })])
+        .boxed())
+    }
+}
+
+#[tokio::test]
+async fn cross_turn_cache_seeds_summary_and_invalidate_forces_resummary() {
+    // #764: the unit tests cover the map, but the wiring — that `run_turn`
+    // actually reads from and writes to the cache — was only covered by the
+    // desktop integration. Lock the contract at the agent layer.
+    //
+    // Phase 1 (cache primed): the seeded `last_summary` matches the wire's
+    // post-Tier-1 length, so Tier 2 reuses it instead of re-summarizing — one
+    // `chat_stream` call (main turn only).
+    //
+    // Phase 2 (after `invalidate`): the cache miss forces Tier 2 to call the
+    // summarizer first, then the main turn runs — two `chat_stream` calls.
+    let dir = tempfile::tempdir().unwrap();
+    let store = SessionStore::new();
+    let s = store.create_session(None);
+
+    // Long enough that the post-Tier-1 wire stays over the Tier-2 fraction,
+    // so the Tier-2 path is actually entered in both phases.
+    for i in 0..30 {
+        let line = format!("cold-{i} {}", "lorem ipsum dolor sit amet ".repeat(150));
+        let role = if i % 2 == 0 {
+            Role::User
+        } else {
+            Role::Assistant
+        };
+        store.add_message(&s.id, role, line);
+    }
+    let recents = ["r0", "r1", "r2", "r3", "r4", "r5"];
+    for (i, r) in recents.iter().enumerate() {
+        let role = if i % 2 == 0 {
+            Role::User
+        } else {
+            Role::Assistant
+        };
+        store.add_message(&s.id, role, (*r).to_string());
+    }
+    let history = store.get_messages(&s.id);
+    let wire_t1 =
+        ExtractiveCompactor::default().compact_cold_collect(&history, KEEP_RECENT_VERBATIM);
+    let pressure = ProxyTokenEstimator::default().assess(&wire_t1.messages, "mock");
+    assert!(
+        pressure.is_over(0.90),
+        "post-Tier-1 transcript must exceed the Tier-2 fraction: fraction={}",
+        pressure.fraction()
+    );
+    // `cold_end` is the wire index the summary would cover (everything before
+    // the kept-recent tail). Required so the seeded summary's boundary matches
+    // the actual cold-tail computation in `run_turn`.
+    let cold_end = wire_t1
+        .messages
+        .len()
+        .saturating_sub(KEEP_RECENT_VERBATIM + 1);
+
+    let registry = ToolRegistry::new();
+    let root = dir.path().to_path_buf();
+    let approve = AlwaysApprove;
+    let summarizer_calls = Arc::new(AtomicUsize::new(0));
+    let provider = CountingProvider {
+        summarizer_calls: summarizer_calls.clone(),
+    };
+
+    let cache = CompactionCache::new();
+    let mut tctx = ctx(&registry, &root, &approve);
+    tctx.abstractive = AbstractiveConfig {
+        enabled: true,
+        fire_at_fraction: 0.90,
+        ..AbstractiveConfig::default()
+    };
+    tctx.compaction_cache = Some(&cache);
+
+    // Phase 1: prime the cache so the seeded summary's boundary matches
+    // `cold_end`. The summarizer's `summary_due` allows reuse here because the
+    // transcript length has not grown since the cache was written.
+    let seeded = Message {
+        id: "seed".into(),
+        session_id: s.id.clone(),
+        role: Role::User,
+        content: "seeded cold-prefix summary".into(),
+        tool_calls: None,
+        tool_call_id: None,
+        attachments: None,
+        reasoning: None,
+        stop_reason: None,
+        author_name: None,
+        created_at: 0,
+    };
+    cache.put(&s.id, cold_end, seeded, history.len() as u64);
+
+    run_turn(
+        &provider,
+        &store,
+        &tctx,
+        &s.id,
+        "mock",
+        None,
+        false,
+        ReasoningVisibility::All,
+        CancelToken::new(),
+        |_| {},
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        summarizer_calls.load(Ordering::SeqCst),
+        0,
+        "cache-primed run must skip the summarizer"
+    );
+
+    // Phase 2: invalidate and re-run. The Tier-2 path now has no `last_summary`
+    // to reuse, so it must re-summarize, costing a summarizer call.
+    cache.invalidate(&s.id);
+    let before = summarizer_calls.load(Ordering::SeqCst);
+
+    run_turn(
+        &provider,
+        &store,
+        &tctx,
+        &s.id,
+        "mock",
+        None,
+        false,
+        ReasoningVisibility::All,
+        CancelToken::new(),
+        |_| {},
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        summarizer_calls.load(Ordering::SeqCst) - before,
+        1,
+        "post-invalidate run must call the summarizer once"
+    );
+    assert!(
+        cache.get(&s.id).is_some(),
+        "the fresh summary is written through to the cache"
+    );
+
+    // Mirror case: a `ToolContext` with no `compaction_cache` always
+    // re-summarizes, so the seeded entry's presence/absence stays irrelevant.
+    // Locks the None-branch of the seeding logic.
+    cache.invalidate(&s.id);
+    let before = summarizer_calls.load(Ordering::SeqCst);
+    let mut no_cache_tctx = ctx(&registry, &root, &approve);
+    no_cache_tctx.abstractive = tctx.abstractive.clone();
+    no_cache_tctx.compaction_cache = None;
+    run_turn(
+        &provider,
+        &store,
+        &no_cache_tctx,
+        &s.id,
+        "mock",
+        None,
+        false,
+        ReasoningVisibility::All,
+        CancelToken::new(),
+        |_| {},
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        summarizer_calls.load(Ordering::SeqCst) - before,
+        1,
+        "no-cache run must always re-summarize regardless of any stale entry"
+    );
+}
+
+#[tokio::test]
+async fn cross_turn_cache_invalidate_all_forces_resummary() {
+    // #764 mirror case: provider/model change wipes every session's summary.
+    let dir = tempfile::tempdir().unwrap();
+    let store = SessionStore::new();
+    let s = store.create_session(None);
+
+    for i in 0..30 {
+        let line = format!("cold-{i} {}", "lorem ipsum dolor sit amet ".repeat(150));
+        let role = if i % 2 == 0 {
+            Role::User
+        } else {
+            Role::Assistant
+        };
+        store.add_message(&s.id, role, line);
+    }
+    for (i, r) in ["r0", "r1", "r2", "r3", "r4", "r5"].iter().enumerate() {
+        let role = if i % 2 == 0 {
+            Role::User
+        } else {
+            Role::Assistant
+        };
+        store.add_message(&s.id, role, (*r).to_string());
+    }
+    let history = store.get_messages(&s.id);
+    let wire_t1 =
+        ExtractiveCompactor::default().compact_cold_collect(&history, KEEP_RECENT_VERBATIM);
+    let cold_end = wire_t1
+        .messages
+        .len()
+        .saturating_sub(KEEP_RECENT_VERBATIM + 1);
+
+    let registry = ToolRegistry::new();
+    let root = dir.path().to_path_buf();
+    let approve = AlwaysApprove;
+    let summarizer_calls = Arc::new(AtomicUsize::new(0));
+
+    let cache = CompactionCache::new();
+    let seeded = Message {
+        id: "seed".into(),
+        session_id: s.id.clone(),
+        role: Role::User,
+        content: "seeded cold-prefix summary".into(),
+        tool_calls: None,
+        tool_call_id: None,
+        attachments: None,
+        reasoning: None,
+        stop_reason: None,
+        author_name: None,
+        created_at: 0,
+    };
+    cache.put(&s.id, cold_end, seeded, history.len() as u64);
+
+    let mut tctx = ctx(&registry, &root, &approve);
+    tctx.abstractive = AbstractiveConfig {
+        enabled: true,
+        fire_at_fraction: 0.90,
+        ..AbstractiveConfig::default()
+    };
+    tctx.compaction_cache = Some(&cache);
+
+    // Confirm the cache path is taken — no summarizer call.
+    let provider = CountingProvider {
+        summarizer_calls: summarizer_calls.clone(),
+    };
+    run_turn(
+        &provider,
+        &store,
+        &tctx,
+        &s.id,
+        "mock",
+        None,
+        false,
+        ReasoningVisibility::All,
+        CancelToken::new(),
+        |_| {},
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        summarizer_calls.load(Ordering::SeqCst),
+        0,
+        "primed run reuses the cache"
+    );
+
+    // Wipe everything (`upsert_connection` / provider change path).
+    cache.invalidate_all();
+    assert!(cache.get(&s.id).is_none());
+
+    let before = summarizer_calls.load(Ordering::SeqCst);
+    run_turn(
+        &provider,
+        &store,
+        &tctx,
+        &s.id,
+        "mock",
+        None,
+        false,
+        ReasoningVisibility::All,
+        CancelToken::new(),
+        |_| {},
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        summarizer_calls.load(Ordering::SeqCst) - before,
+        1,
+        "post-invalidate_all run must re-summarize"
+    );
+}
+
 struct TextProvider;
 
 #[async_trait]
