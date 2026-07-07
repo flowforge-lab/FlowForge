@@ -4,6 +4,7 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import rehypeHighlight from "rehype-highlight";
 import { Check, Copy, PanelRight } from "@/components/ui/icon";
+import { splitBlocks } from "@/lib/markdown-blocks";
 import { cn } from "@/lib/utils";
 import { useSplitStore } from "@/store/split";
 
@@ -146,6 +147,18 @@ const COMPONENTS = {
   ),
 };
 
+// One markdown block, rendered through the same (highlight-free) pipeline as
+// the streaming path. Memoized so a closed block — whose text never changes
+// again once closed — is parsed exactly once, no matter how many more frames
+// the surrounding message keeps streaming.
+const MarkdownBlock = memo(function MarkdownBlock({ text }: { text: string }) {
+  return (
+    <ReactMarkdown remarkPlugins={[remarkGfm]} components={COMPONENTS}>
+      {text}
+    </ReactMarkdown>
+  );
+});
+
 // Renders assistant Markdown. `react-markdown` escapes raw HTML by default (no
 // rehype-raw here) and sanitizes URLs, so model output can't inject markup.
 //
@@ -155,6 +168,14 @@ const COMPONENTS = {
 // long replies (#104). We drop the highlight pass during streaming — markdown
 // structure still renders live — and run the full pipeline once when the turn
 // finishes (`streaming` flips to false), which highlights the final text.
+//
+// On top of that, while streaming we split `content` into closed blocks (won't
+// change again) and one open tail block (still growing) (#844). Each closed
+// block renders through its own memoized `MarkdownBlock`, so React skips
+// re-parsing it on every subsequent frame — only the small open tail gets
+// parsed each frame, bounding per-frame cost to roughly the last block's size
+// instead of the whole message. Once the turn finishes, `streaming` flips to
+// false and the full content re-parses once, unsplit, with highlighting.
 function MarkdownImpl({
   content,
   streaming = false,
@@ -162,11 +183,25 @@ function MarkdownImpl({
   content: string;
   streaming?: boolean;
 }) {
+  if (streaming) {
+    const { closed, open } = splitBlocks(content);
+    return (
+      <div className="ff-prose">
+        {closed.map((block, i) => (
+          <MarkdownBlock key={i} text={block} />
+        ))}
+        <ReactMarkdown remarkPlugins={[remarkGfm]} components={COMPONENTS}>
+          {open}
+        </ReactMarkdown>
+      </div>
+    );
+  }
+
   return (
     <div className="ff-prose">
       <ReactMarkdown
         remarkPlugins={[remarkGfm]}
-        rehypePlugins={streaming ? [] : [rehypeHighlight]}
+        rehypePlugins={[rehypeHighlight]}
         components={COMPONENTS}
       >
         {content}

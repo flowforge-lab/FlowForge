@@ -88,6 +88,36 @@ describe("TokenBatcher", () => {
     expect(order).toEqual(["token:final", "done"]);
   });
 
+  it("schedules a single tick for two concurrent messages (#844 C1)", () => {
+    // Two panes streaming concurrently push deltas for two different
+    // messageIds before the tick fires. This must still be exactly one
+    // scheduled callback — not one per pane — so two streaming panes never
+    // compound into extra flush/commit work within a single frame.
+    let scheduleCount = 0;
+    let tick: (() => void) | null = null;
+    const flushed: TokenEvent[] = [];
+    const b = new TokenBatcher(
+      (e) => flushed.push(e),
+      (cb) => {
+        scheduleCount += 1;
+        tick = cb;
+      },
+    );
+
+    b.push(tok("paneA-msg", "Hel"));
+    b.push(tok("paneB-msg", "Yo"));
+    b.push(tok("paneA-msg", "lo"));
+    b.push(tok("paneB-msg", "!"));
+    expect(scheduleCount).toBe(1);
+
+    tick!();
+    expect(flushed).toEqual([
+      tok("paneA-msg", "Hello"),
+      tok("paneB-msg", "Yo!"),
+    ]);
+    expect(scheduleCount).toBe(1);
+  });
+
   it("drain is a no-op when nothing is pending", () => {
     let flushes = 0;
     const b = new TokenBatcher(
