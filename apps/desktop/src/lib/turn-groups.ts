@@ -21,6 +21,12 @@ import type { ToolCall } from "@/bindings/ToolCall";
 import type { ToolStep } from "@/store/chat";
 import { groupDurationMs } from "@/lib/steps";
 
+/** Mode-switch markers are injected as Role::User for Bedrock positional reasons
+ *  (#848) but are model-facing signals, not user-authored text. Hide from UI. */
+function isModeSwitchMarker(m: Message): boolean {
+  return m.role === "user" && m.content.startsWith("[system:");
+}
+
 /** An ordered row inside an assistant turn: a tool step, a chunk of the model's
  *  intermediate prose ("Now let me check …") that preceded the next tool call (#415),
  *  that iteration's reasoning, sitting where the thinking happened — immediately
@@ -145,7 +151,11 @@ export function foldTurns(
   while (i < messages.length) {
     const m = messages[i];
     if (m.role === "user") {
-      groups.push({ kind: "user", message: m });
+      // Mode-switch markers are Role::User for Bedrock positional reasons (#848)
+      // but are model-facing, not user-authored — skip them from the UI.
+      if (!isModeSwitchMarker(m)) {
+        groups.push({ kind: "user", message: m });
+      }
       i++;
       continue;
     }

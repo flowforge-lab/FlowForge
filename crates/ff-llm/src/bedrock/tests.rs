@@ -1206,3 +1206,70 @@ fn enforce_merges_adjacent_assistants_after_orphan_removal() {
         "both interrupted texts should be in the merged assistant"
     );
 }
+
+/// A user-role mode-switch marker stays IN-POSITION in the Converse API
+/// conversation flow, unlike a system-role message which gets lifted into the
+/// flat system parameter (#848).
+#[test]
+fn user_role_mode_switch_stays_in_conversation_position() {
+    let wire = vec![
+        ChatMessage {
+            role: "system".into(),
+            content: Some("## Mode: Act\n\nYou are in Act mode.".into()),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+            attachments: Vec::new(),
+            reasoning: None,
+        },
+        ChatMessage {
+            role: "assistant".into(),
+            content: Some("I'm in Plan mode. Please switch to Act.".into()),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+            attachments: Vec::new(),
+            reasoning: None,
+        },
+        // This is the fix: Role::User instead of Role::System
+        ChatMessage {
+            role: "user".into(),
+            content: Some("[system: Mode switched to Act. Full tool access enabled.]".into()),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+            attachments: Vec::new(),
+            reasoning: None,
+        },
+        ChatMessage {
+            role: "user".into(),
+            content: Some("Go".into()),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+            attachments: Vec::new(),
+            reasoning: None,
+        },
+    ];
+
+    let (system_blocks, messages) = to_converse(&wire);
+
+    // Only the actual system prompt is in system blocks (not the mode-switch marker).
+    assert_eq!(system_blocks.len(), 1);
+
+    // The conversation has: assistant + merged-user (mode-switch + "Go").
+    // The mode-switch marker is IN the conversation flow, not lifted out.
+    assert_eq!(messages.len(), 2); // assistant, then merged user
+    let user_content: Vec<&str> = messages[1]
+        .content
+        .iter()
+        .filter_map(|b| match b {
+            ContentBlock::Text(t) => Some(t.as_str()),
+            _ => None,
+        })
+        .collect();
+    // Both user messages merged: mode-switch marker + "Go"
+    assert_eq!(user_content.len(), 2);
+    assert!(user_content[0].contains("Mode switched to Act"));
+    assert_eq!(user_content[1], "Go");
+}
