@@ -148,6 +148,28 @@ export function groupOverridesByCell(
   return grouped;
 }
 
+// ─── Mode tool-posture buckets (#801) ───────────────────────────────────────
+// Since #793/#795 the matrix cell is the advertise switch: for a given mode each
+// safety tier resolves to allow → auto-runs, ask → needs approval, deny → hidden
+// (not advertised). Group the presentation rows by that cell so the mode pill can
+// surface the current mode's posture at a glance.
+
+/** Bucket the presentation rows by their cell for one mode's matrix row
+ *  (`matrix[mode]`), in `PERMISSION_ROWS` order. Undefined row → empty buckets. */
+export function bucketRowsByCell(
+  row: Record<Safety, PermissionCell> | undefined,
+): Record<PermissionCell, PermissionRowMeta[]> {
+  const grouped: Record<PermissionCell, PermissionRowMeta[]> = {
+    allow: [],
+    ask: [],
+    deny: [],
+  };
+  if (!row) return grouped;
+  for (const meta of PERMISSION_ROWS)
+    grouped[row[ROW_SAFETY[meta.key]]].push(meta);
+  return grouped;
+}
+
 /** Normalize a free-text slug into a handle: lowercased, alphanumerics kept, every
  *  other run collapsed to a single dash, no leading/trailing dashes. Returns "" when
  *  the input has no usable characters (the slug is optional / display-only for now). */

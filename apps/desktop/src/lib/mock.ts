@@ -568,8 +568,10 @@ function defaultPermissionMatrix(): PermissionMatrixView {
   const rows: Record<Mode, Record<Safety, PermissionCell>> = {
     plan: {
       readonly: "allow",
+      // #795 made Plan advertise Ask-gated Sensitive tools (web_fetch/web_search),
+      // so the default Plan × Sensitive cell is Ask, not Deny.
       write: "deny",
-      sensitive: "deny",
+      sensitive: "ask",
       dangerous: "deny",
     },
     auto: {
