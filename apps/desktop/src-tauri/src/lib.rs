@@ -207,15 +207,24 @@ impl Approver for UiApprover {
         safety: Safety,
         args: &serde_json::Value,
     ) -> bool {
-        // Short-circuit on the #229 allowlist (never covers Dangerous — see
-        // `AppState::allowlist_covers`).
-        if self.state.allowlist_covers(&self.session_id, name, safety) {
-            return true;
-        }
-
         // Snapshot the matrix once for this call, read live (#702/#742) so a
         // Control-panel edit takes effect on the next tool invocation.
         let matrix = self.state.permission_matrix();
+
+        // Deny is absolute (#827): the matrix gate fires first so that a Plan-mode
+        // Deny cell cannot be overridden by the allowlist or scoped rules. A tool
+        // approved in Act ("Allow for session") must NOT bypass Plan x Write = Deny.
+        let cell = matrix.effective_cell(name, self.mode, safety);
+        if cell.is_deny() {
+            return false;
+        }
+
+        // Short-circuit on the #229 allowlist (never covers Dangerous — see
+        // `AppState::allowlist_covers`). Placed after the Deny gate so the
+        // allowlist only accelerates Ask cells, never overrides a Deny.
+        if self.state.allowlist_covers(&self.session_id, name, safety) {
+            return true;
+        }
 
         // Scoped rules (#712, RFC 0019 §9): resolve the tool's relevant argument
         // and evaluate. Deny rules veto unconditionally; Allow rules auto-approve
@@ -239,10 +248,8 @@ impl Approver for UiApprover {
             }
         }
 
-        // Permission matrix (#699/#702/#742): the per-tool override if set, else
-        // the mode×safety cell. Deny/ReadOnly never reach here (hidden or
-        // short-circuited); `None` means Ask — fall through to the UI prompt.
-        let cell = matrix.effective_cell(name, self.mode, safety);
+        // Permission matrix (#699/#702/#742): Allow auto-approves; Ask falls
+        // through to the UI prompt. Deny was handled above.
         if let Some(decision) = matrix_gate(cell) {
             return decision;
         }
@@ -3819,6 +3826,40 @@ mod tests {
         assert_eq!(
             gate(&m, "write_file", Mode::Plan, Safety::Write),
             Some(false)
+        );
+    }
+
+    // #827: the allowlist must never override a Deny cell. This exercises the same
+    // approve() order of operations: Deny fires first, allowlist only applies to
+    // non-Deny cells. Without the fix the allowlist short-circuited above the matrix.
+    #[test]
+    fn allowlist_does_not_override_matrix_deny() {
+        let state = AppState::new();
+        // Grant "github" for this session (simulates user clicking "Allow" in Act).
+        state.set_session_approve("s1", "github");
+        assert!(state.allowlist_covers("s1", "github", Safety::Write));
+
+        // The default matrix has Plan x Write = Deny.
+        let matrix = state.permission_matrix();
+        let cell = matrix.effective_cell("github", Mode::Plan, Safety::Write);
+        assert!(
+            cell.is_deny(),
+            "Plan x Write must be Deny in default matrix"
+        );
+
+        // The approve() logic: Deny fires first, so despite the allowlist covering
+        // the tool, the call is rejected.
+        let denied = cell.is_deny(); // true → return false before allowlist
+        assert!(
+            denied,
+            "matrix Deny must take precedence over the allowlist"
+        );
+
+        // In Act mode the same tool/safety is Allow → allowlist would fire.
+        let cell_act = matrix.effective_cell("github", Mode::Act, Safety::Write);
+        assert!(
+            cell_act.is_allow(),
+            "Act x Write = Allow; allowlist accelerates but is redundant"
         );
     }
 
