@@ -227,6 +227,11 @@ impl McpClient {
                 name: tool.name.to_string(),
                 description: tool.description.map(|d| d.to_string()).unwrap_or_default(),
                 input_schema: serde_json::Value::Object((*tool.input_schema).clone()),
+                read_only_hint: tool
+                    .annotations
+                    .as_ref()
+                    .and_then(|a| a.read_only_hint)
+                    .unwrap_or(false),
             })
             .collect())
     }
