@@ -80,6 +80,41 @@ describe("memory-view — parseCategories", () => {
     expect(cats.identity).toBe("a");
     expect(cats.patterns).toBe("b");
   });
+
+  it("keeps a note's own `## sub-heading` in the body, not as a boundary (#774)", () => {
+    // `memory_write` encourages `## Heading` inside a note. Such a heading is
+    // not one of the three strata, so it must NOT reset the section — its line
+    // and everything after it stays in the current card.
+    const cats = parseCategories(
+      "## Patterns\n## FlowForge tooling\n- use the diagnostics tool\n",
+    );
+    expect(cats.patterns).toBe(
+      "## FlowForge tooling\n- use the diagnostics tool",
+    );
+    expect(cats.identity).toBe("");
+    expect(cats.focus).toBe("");
+  });
+
+  it("retains content before and after a mid-body `## sub-heading`, and a following stratum still parses", () => {
+    const cats = parseCategories(
+      [
+        "## Focus",
+        "Shipping the memory panel.",
+        "## Roadmap",
+        "- editable strata next",
+        "## Identity",
+        "Abid, frontend owner",
+        "",
+      ].join("\n"),
+    );
+    // The whole Focus body — the prose, the sub-heading, and its bullet.
+    expect(cats.focus).toBe(
+      "Shipping the memory panel.\n## Roadmap\n- editable strata next",
+    );
+    // The real `## Identity` stratum after it is unaffected.
+    expect(cats.identity).toBe("Abid, frontend owner");
+    expect(cats.patterns).toBe("");
+  });
 });
 
 describe("memory-view — previews & journal", () => {
