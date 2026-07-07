@@ -36,6 +36,7 @@ use ff_skills::{
     SkillWatcher, DEFAULT_PHENOTYPE,
 };
 use ff_tools::memory::{MemoryConsolidateTool, MemoryGetTool, MemorySearchTool, MemoryWriteTool};
+use ff_tools::notebook::{KernelSupervisor, NotebookTool};
 use ff_tools::process::{ProcessManagerTool, ProcessSupervisor};
 use ff_tools::{Safety, ToolRegistry};
 use tokio::sync::oneshot;
@@ -1278,6 +1279,10 @@ pub struct AppState {
     /// one turn can be polled or stopped in a later one. Children are killed when
     /// the last `Arc` drops at app exit.
     process_supervisor: Arc<ProcessSupervisor>,
+    /// Persistent Python kernels for the `notebook_runner` tool (#859), one per
+    /// session. Long-lived child processes, so they are reaped on session end
+    /// (`reap_session_kernels`) and killed when the last `Arc` drops at app exit.
+    kernel_supervisor: Arc<KernelSupervisor>,
     /// Short-TTL cache for the Ollama served-window probe (#602), keyed by the
     /// resolved `(connection, model)`. The chip resolves on every render, but the
     /// served window changes only when the model is (re)loaded, so a probe per
@@ -1407,6 +1412,7 @@ impl AppState {
             flush_ledger,
             _memory_watcher: Mutex::new(memory_watcher),
             process_supervisor: Arc::new(ProcessSupervisor::new()),
+            kernel_supervisor: Arc::new(KernelSupervisor::new()),
             served_window_cache: Mutex::new(HashMap::new()),
             compaction_cache: CompactionCache::new(),
         };
@@ -1749,6 +1755,9 @@ impl AppState {
         reg.register(Box::new(ProcessManagerTool::new(
             self.process_supervisor.clone(),
         )));
+        // Stateful Python kernel (#859): variables persist across `run_cell`
+        // calls; scoped to the session and reaped on session end.
+        reg.register(Box::new(NotebookTool::new(self.kernel_supervisor.clone())));
         reg.register(Box::new(MemoryConsolidateTool::new(
             self.memory.clone(),
             self.memory_index.clone(),
@@ -1842,6 +1851,21 @@ impl AppState {
             let n = sup.reap_session(&id).await;
             if n > 0 {
                 tracing::info!(session_id = %id, reaped = n, "reaped session processes");
+            }
+        });
+    }
+
+    /// Stop and remove the persistent Python kernel owned by `session_id` (#859).
+    /// Same fire-and-forget, off-reactor-safe pattern as
+    /// [`reap_session_processes`](Self::reap_session_processes): a kernel is a
+    /// long-lived child process, so it must be killed when its session ends.
+    pub fn reap_session_kernels(&self, session_id: &str) {
+        let sup = self.kernel_supervisor.clone();
+        let id = session_id.to_owned();
+        tauri::async_runtime::spawn(async move {
+            let n = sup.reap_session(&id).await;
+            if n > 0 {
+                tracing::info!(session_id = %id, reaped = n, "reaped session kernel");
             }
         });
     }
