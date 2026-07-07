@@ -32,13 +32,13 @@ impl Tool for GithubTool {
                 "action": {
                     "type": "string",
                     "description": "The operation to perform.",
-                    "enum": ["pr_create", "pr_list", "pr_view", "pr_merge", "pr_checks", "pr_review", "pr_comment", "pr_request_review", "pr_review_inline", "issue_create", "issue_edit", "issue_list", "issue_view", "issue_comment", "push"]
+                    "enum": ["pr_create", "pr_list", "pr_view", "pr_reviews", "pr_review_comments", "pr_merge", "pr_checks", "pr_review", "pr_comment", "pr_request_review", "pr_review_inline", "issue_create", "issue_edit", "issue_list", "issue_view", "issue_comment", "push"]
                 },
                 "title": { "type": "string", "description": "Title for PR or issue (pr_create, issue_create)." },
                 "body": { "type": "string", "description": "Body text for a PR/issue or a review/comment (pr_create, issue_create, issue_edit, pr_review, pr_comment, issue_comment, pr_review_inline). Required for pr_review / pr_review_inline when event is COMMENT or REQUEST_CHANGES (GitHub 422s a bodiless one); optional for APPROVE. Markdown supported." },
                 "base": { "type": "string", "description": "Base branch for PR (pr_create). Defaults to 'main'." },
                 "head": { "type": "string", "description": "Head branch for PR (pr_create). Defaults to current branch." },
-                "number": { "type": "integer", "description": "PR or issue number (pr_view, pr_merge, pr_checks, pr_review, pr_comment, pr_request_review, pr_review_inline, issue_view, issue_edit, issue_comment)." },
+                "number": { "type": "integer", "description": "PR or issue number (pr_view, pr_reviews, pr_review_comments, pr_merge, pr_checks, pr_review, pr_comment, pr_request_review, pr_review_inline, issue_view, issue_edit, issue_comment)." },
                 "event": { "type": "string", "enum": ["APPROVE", "REQUEST_CHANGES", "COMMENT"], "description": "Review verdict for pr_review / pr_review_inline. Note: APPROVE and REQUEST_CHANGES are rejected on your own PR (422) — use COMMENT for a self-review." },
                 "comments": { "type": "array", "description": "Inline review comments for pr_review_inline. Each anchors to a diff line.", "items": { "type": "object", "properties": { "path": { "type": "string", "description": "File path (repo-relative)." }, "line": { "type": "integer", "description": "Line number in the file's diff." }, "side": { "type": "string", "enum": ["LEFT", "RIGHT"], "description": "Diff side. Defaults to RIGHT." }, "start_line": { "type": "integer", "description": "Start line for a multi-line comment (optional)." }, "body": { "type": "string", "description": "Comment text." } }, "required": ["path", "line", "body"] } },
                 "squash": { "type": "boolean", "description": "Squash merge (pr_merge). Defaults to true." },
@@ -57,9 +57,13 @@ impl Tool for GithubTool {
 
     fn safety(&self, args: &Value) -> Safety {
         match args.get("action").and_then(|a| a.as_str()) {
-            Some("pr_list" | "pr_view" | "pr_checks" | "issue_list" | "issue_view") => {
-                Safety::ReadOnly
-            }
+            // pr_reviews / pr_review_comments (#853) are pure reads — same
+            // class as pr_view / issue_view — so they inherit Plan-mode
+            // availability from #846 without a gating change.
+            Some(
+                "pr_list" | "pr_view" | "pr_reviews" | "pr_review_comments" | "pr_checks"
+                | "issue_list" | "issue_view",
+            ) => Safety::ReadOnly,
             _ => Safety::Write,
         }
     }
@@ -85,6 +89,8 @@ impl Tool for GithubTool {
             "pr_create" => pr_create(&args, root).await,
             "pr_list" => pr_list(&args, root).await,
             "pr_view" => pr_view(&args, root).await,
+            "pr_reviews" => pr_reviews(&args, root).await,
+            "pr_review_comments" => pr_review_comments(&args, root).await,
             "pr_merge" => pr_merge(&args, root).await,
             "pr_checks" => pr_checks(&args, root).await,
             "pr_review" => pr_review(&args, root).await,
@@ -523,6 +529,69 @@ fn build_inline_review_payload(args: &Value) -> Result<Value, String> {
     Ok(payload)
 }
 
+/// Read all reviews submitted on a PR (`gh api .../pulls/<n>/reviews`).
+/// ReadOnly, usable in Plan mode (#853) — closes the gap where reading
+/// existing review feedback required a `bash gh api` fallback.
+async fn pr_reviews(args: &Value, root: &Path) -> ToolOutcome {
+    let number = match args.get("number").and_then(|v| v.as_u64()) {
+        Some(n) => n,
+        None => return ToolOutcome::error("pr_reviews requires 'number'"),
+    };
+
+    let mut cmd = gh_cmd(root);
+    cmd.args([
+        "api",
+        &format!("repos/{{owner}}/{{repo}}/pulls/{number}/reviews"),
+    ]);
+
+    match run_gh(cmd).await {
+        Ok(json) => {
+            let reviews: Vec<Value> = serde_json::from_str(&json).unwrap_or_default();
+            ToolOutcome::ok(render_reviews(number, &reviews))
+        }
+        Err(e) => ToolOutcome::error(format!("pr_reviews failed: {e}")),
+    }
+}
+
+/// Read inline review comments on a PR (`gh api .../pulls/<n>/comments`),
+/// grouped by file then by reply thread. ReadOnly, usable in Plan mode
+/// (#853) — closes the gap where reading the comment thread an agent needs
+/// to respond to required a `bash gh api` fallback.
+async fn pr_review_comments(args: &Value, root: &Path) -> ToolOutcome {
+    let number = match args.get("number").and_then(|v| v.as_u64()) {
+        Some(n) => n,
+        None => return ToolOutcome::error("pr_review_comments requires 'number'"),
+    };
+
+    let mut cmd = gh_cmd(root);
+    cmd.args([
+        "api",
+        &format!("repos/{{owner}}/{{repo}}/pulls/{number}/comments"),
+        "--paginate",
+    ]);
+
+    match run_gh(cmd).await {
+        Ok(json) => {
+            // `--paginate` returns one JSON array per page separated by
+            // newlines; flatten to a single Vec before grouping.
+            let mut comments: Vec<Value> = Vec::new();
+            for page in json.split('\n') {
+                let trimmed = page.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                if let Ok(arr) = serde_json::from_str::<Vec<Value>>(trimmed) {
+                    comments.extend(arr);
+                } else if let Ok(one) = serde_json::from_str::<Value>(trimmed) {
+                    comments.push(one);
+                }
+            }
+            ToolOutcome::ok(render_review_comments(number, &comments))
+        }
+        Err(e) => ToolOutcome::error(format!("pr_review_comments failed: {e}")),
+    }
+}
+
 async fn issue_create(args: &Value, root: &Path) -> ToolOutcome {
     let title = match args.get("title").and_then(|v| v.as_str()) {
         Some(t) => t,
@@ -713,6 +782,366 @@ fn join_field(arr: Option<&Value>, key: &str) -> String {
         .unwrap_or_default()
 }
 
+/// Cap a `diff_hunk` string to a few lines / chars so one noisy file doesn't
+/// blow the model context window. Returns the input unchanged when it's
+/// already under the limit; otherwise truncates and appends a marker.
+fn trim_diff_hunk(hunk: &str) -> String {
+    const MAX_LINES: usize = 6;
+    const MAX_CHARS: usize = 400;
+    let trimmed = hunk.trim_end_matches('\n');
+    let lines: Vec<&str> = trimmed.split('\n').collect();
+    if lines.len() <= MAX_LINES && trimmed.chars().count() <= MAX_CHARS {
+        return trimmed.to_string();
+    }
+    let mut out: Vec<&str> = lines.into_iter().take(MAX_LINES).collect();
+    // Drop a trailing hunk-context line (one that starts with ' ' or is just
+    // '...') so we don't cut mid-context.
+    while out
+        .last()
+        .is_some_and(|l| l.trim().is_empty() || l.trim() == "...")
+    {
+        out.pop();
+    }
+    let joined = out.join("\n");
+    let truncated = joined.chars().take(MAX_CHARS).collect::<String>();
+    format!("{truncated}\n  …(diff hunk trimmed)")
+}
+
+/// Render a list of PR reviews as readable markdown. Newest first by
+/// `submittedAt` (then by `id` for stability). Tolerant of missing
+/// fields — an unknown state still renders, an absent body becomes
+/// `(no description)`. Empty input yields a friendly "no reviews" line.
+fn render_reviews(number: u64, reviews: &[Value]) -> String {
+    if reviews.is_empty() {
+        return format!("PR #{number} has no reviews yet.");
+    }
+
+    let mut sorted: Vec<&Value> = reviews.iter().collect();
+    sorted.sort_by(|a, b| {
+        let ta = a.get("submittedAt").and_then(|v| v.as_str()).unwrap_or("");
+        let tb = b.get("submittedAt").and_then(|v| v.as_str()).unwrap_or("");
+        tb.cmp(ta).then_with(|| {
+            let ia = a.get("id").and_then(|v| v.as_u64()).unwrap_or(0);
+            let ib = b.get("id").and_then(|v| v.as_u64()).unwrap_or(0);
+            ib.cmp(&ia)
+        })
+    });
+
+    let count = sorted.len();
+    let mut out = vec![format!("Reviews on PR #{number} ({count}):"), String::new()];
+
+    for r in &sorted {
+        let state = r.get("state").and_then(|v| v.as_str()).unwrap_or("?");
+        let author = r
+            .get("user")
+            .or_else(|| r.get("author"))
+            .and_then(|u| u.get("login"))
+            .and_then(|l| l.as_str())
+            .unwrap_or("?");
+        let ts = r.get("submittedAt").and_then(|v| v.as_str()).unwrap_or("");
+        let body = r.get("body").and_then(|v| v.as_str()).unwrap_or("").trim();
+        out.push(format!("[{state}] {author} — {ts}"));
+        if body.is_empty() {
+            out.push("(no description)".to_string());
+        } else {
+            out.push(body.to_string());
+        }
+        out.push(String::new());
+    }
+
+    // Drop the trailing blank line so callers can `format!` cleanly.
+    while out.last().is_some_and(String::is_empty) {
+        out.pop();
+    }
+    out.join("\n")
+}
+
+/// One thread inside one file: the first element is the root comment, the
+/// rest are replies in chronological order.
+type ReviewThread = Vec<Value>;
+type FileThreads = (String, Vec<ReviewThread>);
+
+/// Group inline review comments by file path, then thread them via
+/// `in_reply_to_id`. Within each file, root comments come first (sorted
+/// chronologically), and each root is followed by its replies in order.
+/// Orphan replies (whose parent isn't a root in the set) are bucketed under
+/// a synthetic root keyed on their `in_reply_to_id` so they aren't lost.
+///
+/// Note: GitHub's inline-review API flattens reply chains so every reply's
+/// `in_reply_to_id` points at the thread root, not the previous comment — so
+/// real chains are depth-2 relative to the root and attach in one pass. If a
+/// depth-3 chain ever shows up (each reply pointing at the previous one),
+/// only the root + first reply attach; any grandchild surfaces as its own
+/// synthetic thread. See `group_review_comments_depth_three_chain_stays_visible`.
+fn group_review_comments(comments: &[Value]) -> Vec<FileThreads> {
+    use std::collections::HashMap;
+
+    if comments.is_empty() {
+        return Vec::new();
+    }
+
+    // Bucket by file path first; preserve insertion order so files appear
+    // in the order their first comment was created.
+    let mut file_order: Vec<String> = Vec::new();
+    let mut by_path: HashMap<String, Vec<&Value>> = HashMap::new();
+    for c in comments {
+        let path = c
+            .get("path")
+            .and_then(|v| v.as_str())
+            .unwrap_or("?")
+            .to_string();
+        if !by_path.contains_key(&path) {
+            file_order.push(path.clone());
+        }
+        by_path.entry(path).or_default().push(c);
+    }
+
+    let mut out: Vec<FileThreads> = Vec::with_capacity(file_order.len());
+
+    for path in file_order {
+        let items = by_path.remove(&path).unwrap_or_default();
+
+        // Sort all comments in this file by createdAt asc, id asc as a tiebreaker.
+        let mut sorted = items;
+        sorted.sort_by(|a, b| {
+            let ta = a.get("createdAt").and_then(|v| v.as_str()).unwrap_or("");
+            let tb = b.get("createdAt").and_then(|v| v.as_str()).unwrap_or("");
+            ta.cmp(tb).then_with(|| {
+                let ia = a.get("id").and_then(|v| v.as_u64()).unwrap_or(0);
+                let ib = b.get("id").and_then(|v| v.as_u64()).unwrap_or(0);
+                ia.cmp(&ib)
+            })
+        });
+
+        // Index by id and by in_reply_to_id for parent lookup.
+        let by_id: HashMap<u64, &Value> = sorted
+            .iter()
+            .filter_map(|c| c.get("id").and_then(|v| v.as_u64()).map(|i| (i, *c)))
+            .collect();
+
+        // Roots are comments with no in_reply_to_id (or whose parent we
+        // can't find — we still want to surface them).
+        let mut roots: Vec<&Value> = sorted
+            .iter()
+            .copied()
+            .filter(|c| {
+                c.get("in_reply_to_id")
+                    .and_then(|v| v.as_u64())
+                    .map(|p| !by_id.contains_key(&p))
+                    .unwrap_or(true)
+            })
+            .collect();
+
+        // Each root is the start of a thread; build it by walking replies.
+        // Replies whose root is `roots[i]` follow that thread in order.
+        let mut threads: Vec<ReviewThread> = Vec::new();
+        let mut thread_for: HashMap<u64, usize> = HashMap::new();
+        for (i, root) in roots.iter().enumerate() {
+            if let Some(id) = root.get("id").and_then(|v| v.as_u64()) {
+                thread_for.insert(id, i);
+            }
+            threads.push(vec![(*root).clone()]);
+        }
+
+        for c in &sorted {
+            if let Some(parent) = c.get("in_reply_to_id").and_then(|v| v.as_u64()) {
+                if let Some(idx) = thread_for.get(&parent).copied() {
+                    threads[idx].push((*c).clone());
+                }
+                // Else: this is a reply whose parent was filtered out by
+                // the roots predicate because it IS a reply (chain > 1) —
+                // we'll catch it as a root below via the orphan pass.
+            }
+        }
+
+        // Orphan sweep: anything still not attached to a thread. Happens
+        // when a comment's parent itself is a reply (so the parent was
+        // excluded from `roots` and never entered `thread_for`). Group
+        // orphans by their `in_reply_to_id` so siblings of a missing parent
+        // share one synthetic thread; descendants of a missing parent end up
+        // as separate threads, but every comment still surfaces.
+        // Covered by `group_review_comments_depth_three_chain_stays_visible`.
+        let mut attached: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        for t in &threads {
+            for c in t {
+                if let Some(id) = c.get("id").and_then(|v| v.as_u64()) {
+                    attached.insert(id);
+                }
+            }
+        }
+        let orphans: Vec<&Value> = sorted
+            .iter()
+            .copied()
+            .filter(|c| {
+                c.get("id")
+                    .and_then(|v| v.as_u64())
+                    .map(|id| !attached.contains(&id))
+                    .unwrap_or(false)
+            })
+            .collect();
+        if !orphans.is_empty() {
+            // Group orphans by their in_reply_to_id so a chain collapses
+            // into one thread, then sort threads by earliest member.
+            let mut synth: HashMap<u64, ReviewThread> = HashMap::new();
+            for o in &orphans {
+                let key = o
+                    .get("in_reply_to_id")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                synth.entry(key).or_default().push((*o).clone());
+            }
+            let mut synth_threads: Vec<ReviewThread> = synth.into_values().collect();
+            for t in &mut synth_threads {
+                t.sort_by_key(|c| c.get("id").and_then(|v| v.as_u64()).unwrap_or(u64::MAX));
+            }
+            synth_threads.sort_by_key(|t| {
+                t.first()
+                    .and_then(|c| c.get("id").and_then(|v| v.as_u64()))
+                    .unwrap_or(u64::MAX)
+            });
+            threads.extend(synth_threads);
+            roots.extend(orphans);
+        }
+
+        // Stable, file-local root ordering by createdAt asc.
+        roots.sort_by(|a, b| {
+            let ta = a.get("createdAt").and_then(|v| v.as_str()).unwrap_or("");
+            let tb = b.get("createdAt").and_then(|v| v.as_str()).unwrap_or("");
+            ta.cmp(tb).then_with(|| {
+                let ia = a.get("id").and_then(|v| v.as_u64()).unwrap_or(0);
+                let ib = b.get("id").and_then(|v| v.as_u64()).unwrap_or(0);
+                ia.cmp(&ib)
+            })
+        });
+
+        // Re-key threads to the new root order.
+        let mut new_threads: Vec<ReviewThread> = Vec::with_capacity(roots.len());
+        for r in &roots {
+            let rid = r.get("id").and_then(|v| v.as_u64());
+            // Find the thread that currently starts with r; if none, find
+            // the orphan thread that contains r and re-root it.
+            let thread_idx = threads
+                .iter()
+                .position(|t| t.first().and_then(|c| c.get("id").and_then(|v| v.as_u64())) == rid);
+            if let Some(idx) = thread_idx {
+                let t = threads.remove(idx);
+                new_threads.push(t);
+            } else {
+                // Shouldn't happen with the orphan sweep above, but fall
+                // back to a single-element thread so the comment still
+                // surfaces.
+                new_threads.push(vec![(*r).clone()]);
+            }
+        }
+
+        out.push((path, new_threads));
+    }
+
+    out
+}
+
+/// Render grouped review comment threads as readable markdown. Each file is
+/// introduced by a `── path ──` banner; within a file, root comments
+/// introduce a new thread and replies are indented under their parent.
+fn render_review_comments(number: u64, comments: &[Value]) -> String {
+    if comments.is_empty() {
+        return format!("PR #{number} has no review comments.");
+    }
+
+    let grouped = group_review_comments(comments);
+    let count = comments.len();
+    let thread_count: usize = grouped.iter().map(|(_, t)| t.len()).sum();
+    let mut out = vec![format!(
+        "Review comments on PR #{number} ({count} comments in {thread_count} threads):"
+    )];
+    out.push(String::new());
+
+    for (path, threads) in &grouped {
+        out.push(format!("── {path} ──"));
+        out.push(String::new());
+        for (i, thread) in threads.iter().enumerate() {
+            if i > 0 {
+                out.push(String::new());
+            }
+            render_thread(&mut out, thread);
+        }
+        out.push(String::new());
+    }
+
+    while out.last().is_some_and(String::is_empty) {
+        out.pop();
+    }
+    out.join("\n")
+}
+
+/// Render one thread (root + replies) into `out`. The root is the first
+/// element; subsequent elements are replies, each indented under the root.
+fn render_thread(out: &mut Vec<String>, thread: &[Value]) {
+    if thread.is_empty() {
+        return;
+    }
+    let root = &thread[0];
+    push_comment(out, root, false);
+    for reply in &thread[1..] {
+        out.push(String::new());
+        let author = author_login(reply).unwrap_or("?");
+        out.push(format!("    ↳ {author} (reply)"));
+        let body = reply
+            .get("body")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+        if body.is_empty() {
+            out.push("      (no description)".to_string());
+        } else {
+            for line in body.lines() {
+                out.push(format!("      {line}"));
+            }
+        }
+    }
+}
+
+/// Render a single (root) inline comment: bullet, author @ line, trimmed
+/// diff hunk, then the body. `indented` is reserved for future use; today
+/// only the root call is `false`.
+fn push_comment(out: &mut Vec<String>, c: &Value, indented: bool) {
+    let _ = indented; // currently only used by the reply path above
+    let author = author_login(c).unwrap_or("?");
+    let line = c.get("line").and_then(|v| v.as_u64());
+    let original_line = c.get("original_line").and_then(|v| v.as_u64());
+    let side = c.get("side").and_then(|v| v.as_str()).unwrap_or("RIGHT");
+    let pos = match (line, original_line) {
+        (Some(l), _) => format!("line {l} ({side})"),
+        (None, Some(o)) => format!("original line {o} ({side})"),
+        (None, None) => "?".to_string(),
+    };
+    out.push(format!("  • {author} @ {pos}"));
+    if let Some(hunk) = c.get("diff_hunk").and_then(|v| v.as_str()) {
+        if !hunk.trim().is_empty() {
+            out.push("    ```diff".to_string());
+            for line in trim_diff_hunk(hunk).lines() {
+                out.push(format!("    {line}"));
+            }
+            out.push("    ```".to_string());
+        }
+    }
+    let body = c.get("body").and_then(|v| v.as_str()).unwrap_or("").trim();
+    if body.is_empty() {
+        out.push("    (no description)".to_string());
+    } else {
+        for line in body.lines() {
+            out.push(format!("    {line}"));
+        }
+    }
+}
+
+fn author_login(c: &Value) -> Option<&str> {
+    c.get("user")
+        .or_else(|| c.get("author"))
+        .and_then(|u| u.get("login"))
+        .and_then(|l| l.as_str())
+}
+
 async fn push(args: &Value, root: &Path) -> ToolOutcome {
     let force = args.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
 
@@ -832,291 +1261,4 @@ fn format_json_table(json: &str, columns: &[&str]) -> ToolOutcome {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
-
-    #[test]
-    fn resolve_token_does_not_panic() {
-        // resolve_token() is cached in a OnceLock, so we can only test the
-        // first-call behavior once per process. On a dev machine with `gh`
-        // authenticated it returns Some; on CI (no gh auth) it returns None.
-        // Either outcome is valid — we verify it doesn't panic.
-        let _ = resolve_token();
-    }
-
-    #[test]
-    fn safety_read_for_list_actions() {
-        let tool = GithubTool;
-        let args = serde_json::json!({"action": "pr_list"});
-        assert_eq!(tool.safety(&args), Safety::ReadOnly);
-        let args = serde_json::json!({"action": "pr_checks"});
-        assert_eq!(tool.safety(&args), Safety::ReadOnly);
-        let args = serde_json::json!({"action": "issue_list"});
-        assert_eq!(tool.safety(&args), Safety::ReadOnly);
-        // #825: the single-record read actions are ReadOnly too, so gh is usable
-        // in Plan mode to read one issue's / PR's body.
-        let args = serde_json::json!({"action": "issue_view"});
-        assert_eq!(tool.safety(&args), Safety::ReadOnly);
-        let args = serde_json::json!({"action": "pr_view"});
-        assert_eq!(tool.safety(&args), Safety::ReadOnly);
-    }
-
-    #[test]
-    fn render_record_shows_body_and_metadata() {
-        // issue_view: title/state/author/labels/assignees + full body.
-        let v = serde_json::json!({
-            "number": 42,
-            "title": "Fix the thing",
-            "state": "OPEN",
-            "author": { "login": "octocat" },
-            "labels": [{ "name": "bug" }, { "name": "backend" }],
-            "assignees": [{ "login": "abid" }],
-            "body": "First line.\n\nSecond paragraph."
-        });
-        let out = render_record(&v, "issue");
-        assert!(out.starts_with("#42 [OPEN] Fix the thing"));
-        assert!(out.contains("author: octocat"));
-        assert!(out.contains("labels: bug, backend"));
-        assert!(out.contains("assignees: abid"));
-        assert!(out.contains("First line.\n\nSecond paragraph."));
-    }
-
-    #[test]
-    fn render_record_pr_shows_branches_and_stats() {
-        let v = serde_json::json!({
-            "number": 7,
-            "title": "Add feature",
-            "state": "OPEN",
-            "author": { "login": "dev" },
-            "baseRefName": "main",
-            "headRefName": "feat/x",
-            "additions": 10,
-            "deletions": 2,
-            "changedFiles": 3,
-            "body": "PR body here."
-        });
-        let out = render_record(&v, "pr");
-        assert!(out.starts_with("PR #7 [OPEN] Add feature"));
-        assert!(out.contains("feat/x → main  +10/-2 across 3 files"));
-        assert!(out.contains("PR body here."));
-    }
-
-    #[test]
-    fn render_record_handles_empty_body_and_missing_fields() {
-        let v = serde_json::json!({ "title": "No body", "state": "CLOSED" });
-        let out = render_record(&v, "issue");
-        assert!(out.contains("[CLOSED] No body"));
-        assert!(out.contains("(no description)"));
-        // Missing author/labels/assignees don't emit stray lines.
-        assert!(!out.contains("author:"));
-        assert!(!out.contains("labels:"));
-    }
-
-    #[test]
-    fn join_field_flattens_and_tolerates_absence() {
-        let labels = serde_json::json!([{ "name": "a" }, { "name": "b" }]);
-        assert_eq!(join_field(Some(&labels), "name"), "a, b");
-        assert_eq!(join_field(None, "name"), "");
-        let empty = serde_json::json!([]);
-        assert_eq!(join_field(Some(&empty), "name"), "");
-    }
-
-    #[test]
-    fn safety_write_for_mutating_actions() {
-        let tool = GithubTool;
-        for action in [
-            "pr_create",
-            "pr_merge",
-            "issue_create",
-            "issue_edit",
-            "push",
-        ] {
-            let args = serde_json::json!({"action": action});
-            assert_eq!(
-                tool.safety(&args),
-                Safety::Write,
-                "{action} should be Write"
-            );
-        }
-    }
-
-    #[test]
-    fn format_json_table_empty() {
-        let result = format_json_table("[]", &["number", "title"]);
-        assert!(result.success);
-        assert_eq!(result.content, "No results.");
-    }
-
-    #[test]
-    fn format_json_table_rows() {
-        let json = r#"[{"number":42,"title":"Fix bug","state":"OPEN"},{"number":43,"title":"Add feature","state":"MERGED"}]"#;
-        let result = format_json_table(json, &["number", "title", "state"]);
-        assert!(result.success);
-        assert!(result.content.contains("42\tFix bug\tOPEN"));
-        assert!(result.content.contains("43\tAdd feature\tMERGED"));
-    }
-
-    /// Fixture test for pr_checks output parsing — guards against requesting
-    /// fields that gh doesn't support (the B1 bug that broke the initial PR).
-    #[test]
-    fn pr_checks_parse_fixture() {
-        // Simulates the JSON that `gh pr checks --json name,state` returns.
-        let fixture = r#"[{"name":"Rust (fmt, clippy, test)","state":"SUCCESS"},{"name":"Web (typecheck, lint)","state":"SUCCESS"},{"name":"Windows (compile)","state":"FAILURE"}]"#;
-        let checks: Vec<Value> = serde_json::from_str(fixture).unwrap();
-
-        let mut lines = vec!["PR #1 checks:".to_string()];
-        for check in &checks {
-            let name = check.get("name").and_then(|v| v.as_str()).unwrap_or("?");
-            let state = check.get("state").and_then(|v| v.as_str()).unwrap_or("?");
-            let icon = match state {
-                "SUCCESS" => "✓",
-                "FAILURE" => "✗",
-                "PENDING" | "IN_PROGRESS" => "◯",
-                _ => "?",
-            };
-            lines.push(format!("  {icon} {name}: {state}"));
-        }
-        let output = lines.join("\n");
-
-        assert!(output.contains("✓ Rust (fmt, clippy, test): SUCCESS"));
-        assert!(output.contains("✗ Windows (compile): FAILURE"));
-        assert!(!output.contains("conclusion"), "no conclusion field used");
-    }
-
-    #[test]
-    fn str_or_list_accepts_string_array_and_missing() {
-        assert_eq!(str_or_list(&json!({"label": "bug"}), "label"), vec!["bug"]);
-        assert_eq!(
-            str_or_list(&json!({"label": ["bug", "frontend"]}), "label"),
-            vec!["bug", "frontend"]
-        );
-        assert!(str_or_list(&json!({}), "label").is_empty());
-        // empties and non-string items are dropped; whitespace trimmed.
-        assert_eq!(
-            str_or_list(&json!({"a": ["  x  ", "", 7, "y"]}), "a"),
-            vec!["x", "y"]
-        );
-        assert!(str_or_list(&json!({"a": "   "}), "a").is_empty());
-    }
-
-    #[test]
-    fn create_flag_args_single_label_backcompat() {
-        // A bare string label behaves exactly as before: one --label.
-        let out = create_flag_args(&json!({"label": "bug"}), false);
-        assert_eq!(out, vec!["--label", "bug"]);
-    }
-
-    #[test]
-    fn create_flag_args_multi_label_and_assignees() {
-        let out = create_flag_args(
-            &json!({"label": ["bug", "frontend"], "assignee": "abidkhan03"}),
-            false,
-        );
-        assert_eq!(
-            out,
-            vec![
-                "--label",
-                "bug",
-                "--label",
-                "frontend",
-                "--assignee",
-                "abidkhan03"
-            ]
-        );
-    }
-
-    #[test]
-    fn create_flag_args_reviewer_only_when_included() {
-        let args = json!({"assignee": ["a", "b"], "reviewer": "r"});
-        // pr_create includes reviewer; issue_create does not.
-        assert_eq!(
-            create_flag_args(&args, true),
-            vec!["--assignee", "a", "--assignee", "b", "--reviewer", "r"]
-        );
-        assert_eq!(
-            create_flag_args(&args, false),
-            vec!["--assignee", "a", "--assignee", "b"]
-        );
-    }
-
-    #[test]
-    fn create_flag_args_empty_when_no_fields() {
-        assert!(create_flag_args(&json!({"title": "x"}), true).is_empty());
-    }
-
-    #[test]
-    fn inline_review_payload_builds_comments_and_defaults_side() {
-        let args = json!({
-            "event": "comment",
-            "body": "overall looks good",
-            "comments": [
-                { "path": "src/a.rs", "line": 12, "body": "nit here" },
-                { "path": "src/b.rs", "line": 40, "side": "LEFT", "start_line": 38, "body": "range" }
-            ]
-        });
-        let p = build_inline_review_payload(&args).unwrap();
-        assert_eq!(p["event"], "COMMENT", "event upper-cased");
-        assert_eq!(p["body"], "overall looks good");
-        assert_eq!(p["comments"][0]["side"], "RIGHT", "side defaults to RIGHT");
-        assert_eq!(p["comments"][0]["path"], "src/a.rs");
-        assert_eq!(p["comments"][0]["line"], 12);
-        assert_eq!(p["comments"][1]["side"], "LEFT");
-        assert_eq!(p["comments"][1]["start_line"], 38);
-        assert!(p["comments"][0].get("start_line").is_none());
-    }
-
-    #[test]
-    fn inline_review_payload_rejects_bad_event_and_empty_comments() {
-        let bad_event = json!({"event": "LGTM", "comments": [{"path":"a","line":1,"body":"x"}]});
-        assert!(build_inline_review_payload(&bad_event).is_err());
-
-        let no_comments = json!({"event": "COMMENT", "comments": []});
-        assert!(build_inline_review_payload(&no_comments).is_err());
-
-        let missing = json!({"event": "COMMENT"});
-        assert!(build_inline_review_payload(&missing).is_err());
-    }
-
-    #[test]
-    fn inline_review_payload_rejects_incomplete_comment() {
-        // missing body
-        let a = json!({"comments": [{"path": "a.rs", "line": 3}]});
-        assert!(build_inline_review_payload(&a).is_err());
-        // missing line
-        let b = json!({"comments": [{"path": "a.rs", "body": "x"}]});
-        assert!(build_inline_review_payload(&b).is_err());
-        // missing path
-        let c = json!({"comments": [{"line": 3, "body": "x"}]});
-        assert!(build_inline_review_payload(&c).is_err());
-    }
-
-    #[test]
-    fn inline_review_comment_and_request_changes_require_body() {
-        // COMMENT / REQUEST_CHANGES 422 without a top-level body, so building the
-        // payload must fail up front (mirrors the pr_review guard). A blank body
-        // counts as missing.
-        for event in ["COMMENT", "REQUEST_CHANGES"] {
-            let blank = json!({"event": event, "body": "   ", "comments": [{"path":"a","line":1,"body":"y"}]});
-            assert!(
-                build_inline_review_payload(&blank).is_err(),
-                "{event} with a blank body should be rejected"
-            );
-
-            let missing = json!({"event": event, "comments": [{"path":"a","line":1,"body":"y"}]});
-            assert!(
-                build_inline_review_payload(&missing).is_err(),
-                "{event} with no body should be rejected"
-            );
-        }
-    }
-
-    #[test]
-    fn inline_review_approve_may_omit_body() {
-        // APPROVE is the one event GitHub accepts without a top-level body.
-        let args = json!({"event":"APPROVE","comments":[{"path":"a","line":1,"body":"y"}]});
-        let p = build_inline_review_payload(&args).unwrap();
-        assert_eq!(p["event"], "APPROVE");
-        assert!(p.get("body").is_none(), "APPROVE omits an absent body");
-    }
-}
+mod tests;
