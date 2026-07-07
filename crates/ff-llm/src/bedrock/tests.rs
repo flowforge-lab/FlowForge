@@ -1325,6 +1325,20 @@ fn noop_tool_config_builds_successfully() {
     match &tools[0] {
         Tool::ToolSpec(spec) => {
             assert_eq!(spec.name(), "_noop");
+            // Schema must be {"type":"object","properties":{}} — not bare {}.
+            // Bedrock rejects empty schemas (normalize_object_schema documents this).
+            if let Some(ToolInputSchema::Json(doc)) = spec.input_schema() {
+                if let Document::Object(map) = doc {
+                    assert!(
+                        map.contains_key("type"),
+                        "schema must contain 'type' key; got: {map:?}"
+                    );
+                } else {
+                    panic!("expected Object document");
+                }
+            } else {
+                panic!("expected Some(Json) input schema");
+            }
         }
         _ => panic!("expected ToolSpec"),
     }

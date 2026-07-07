@@ -1046,12 +1046,13 @@ fn messages_have_tool_blocks(messages: &[Message]) -> bool {
 /// satisfies Bedrock's requirement that `toolConfig` be defined whenever messages
 /// contain tool blocks.
 fn noop_tool_config() -> Option<ToolConfiguration> {
+    // Schema must be a valid JSON Schema with "type": "object" — Bedrock rejects
+    // a bare {}. Use the same shape normalize_object_schema produces for real tools.
+    let schema = json_to_doc(&serde_json::json!({"type": "object", "properties": {}}));
     let spec = ToolSpecification::builder()
         .name("_noop")
         .description("Internal placeholder. Do not call.")
-        .input_schema(ToolInputSchema::Json(Document::Object(
-            std::collections::HashMap::new(),
-        )))
+        .input_schema(ToolInputSchema::Json(schema))
         .build()
         .ok()?;
     ToolConfiguration::builder()
