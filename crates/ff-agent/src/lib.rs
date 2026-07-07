@@ -1520,7 +1520,16 @@ pub async fn run_turn(
                 async move {
                     (
                         call.id.clone(),
-                        tools.registry.run(&name, args, tools.root).await,
+                        // Use the session-aware entry (not bare `run`, which passes
+                        // NO_SESSION): a ReadOnly tool run in the parallel batch may
+                        // still be session-scoped — e.g. notebook_runner `status`,
+                        // ProcessManagerTool `poll`/`list` — and must see the same
+                        // session_id the serial `run_streaming` path uses, or it
+                        // queries an empty anonymous bucket (#863).
+                        tools
+                            .registry
+                            .run_with_session(&name, args, tools.root, session_id)
+                            .await,
                     )
                 }
             });
