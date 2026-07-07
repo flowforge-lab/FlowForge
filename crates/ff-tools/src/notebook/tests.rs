@@ -170,3 +170,181 @@ async fn run_cell_times_out_and_interrupts() {
         }
     }
 }
+
+// --- ipynb parsing (Phase 2) ---
+
+use super::parse::{parse_notebook, NotebookCell};
+
+#[test]
+fn parse_notebook_extracts_code_cells_only() {
+    let ipynb = r##"{
+        "cells": [
+            {"cell_type": "markdown", "source": ["# Title"]},
+            {"cell_type": "code", "source": ["x = 1\n", "y = 2"]},
+            {"cell_type": "raw", "source": ["raw stuff"]},
+            {"cell_type": "code", "source": ["print(x + y)"]}
+        ],
+        "metadata": {},
+        "nbformat": 4,
+        "nbformat_minor": 5
+    }"##;
+    let cells = parse_notebook(ipynb).unwrap();
+    assert_eq!(cells.len(), 2);
+    assert_eq!(
+        cells[0],
+        NotebookCell {
+            index: 1,
+            source: "x = 1\ny = 2".to_string()
+        }
+    );
+    assert_eq!(
+        cells[1],
+        NotebookCell {
+            index: 3,
+            source: "print(x + y)".to_string()
+        }
+    );
+}
+
+#[test]
+fn parse_notebook_source_as_single_string() {
+    let ipynb = r##"{
+        "cells": [
+            {"cell_type": "code", "source": "print('hello')"}
+        ],
+        "nbformat": 4
+    }"##;
+    let cells = parse_notebook(ipynb).unwrap();
+    assert_eq!(cells.len(), 1);
+    assert_eq!(cells[0].source, "print('hello')");
+}
+
+#[test]
+fn parse_notebook_skips_empty_code_cells() {
+    let ipynb = r##"{
+        "cells": [
+            {"cell_type": "code", "source": []},
+            {"cell_type": "code", "source": "  \n  "},
+            {"cell_type": "code", "source": ["real code"]}
+        ],
+        "nbformat": 4
+    }"##;
+    let cells = parse_notebook(ipynb).unwrap();
+    assert_eq!(cells.len(), 1);
+    assert_eq!(cells[0].index, 2);
+}
+
+#[test]
+fn parse_notebook_invalid_json() {
+    let result = parse_notebook("not json at all");
+    assert!(result.is_err());
+    assert!(result.unwrap_err().contains("invalid JSON"));
+}
+
+#[test]
+fn parse_notebook_missing_cells() {
+    let result = parse_notebook(r##"{"metadata": {}}"##);
+    assert!(result.is_err());
+    assert!(result.unwrap_err().contains("cells"));
+}
+
+// --- run_all integration (Phase 2) ---
+
+#[tokio::test]
+async fn run_all_executes_cells_sequentially() {
+    if !python3_available() {
+        eprintln!("skipping: python3 not on PATH");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+
+    // Write a notebook with 3 code cells.
+    let ipynb = r##"{
+        "cells": [
+            {"cell_type": "code", "source": ["x = 10"]},
+            {"cell_type": "markdown", "source": ["# skip me"]},
+            {"cell_type": "code", "source": ["y = x * 2"]},
+            {"cell_type": "code", "source": ["print(y)"]}
+        ],
+        "nbformat": 4
+    }"##;
+    let nb_path = dir.path().join("test.ipynb");
+    std::fs::write(&nb_path, ipynb).unwrap();
+
+    let sup = Arc::new(KernelSupervisor::new());
+    let tool = NotebookTool::new(Arc::clone(&sup));
+    let sid = "run-all-test";
+
+    // Start kernel
+    let start_args = serde_json::json!({"action": "start"});
+    let res = tool.run_with_session(start_args, dir.path(), sid).await;
+    assert!(res.success, "start failed: {:?}", res);
+
+    // Run all
+    let args = serde_json::json!({
+        "action": "run_all",
+        "notebook": nb_path.to_str().unwrap()
+    });
+    let res = tool.run_with_session(args, dir.path(), sid).await;
+    assert!(res.success, "run_all failed: {:?}", res);
+    assert!(
+        res.content.contains("3/3"),
+        "should report 3/3 cells; got: {}",
+        res.content
+    );
+    assert!(
+        res.content.contains("20"),
+        "y=20 should appear in output; got: {}",
+        res.content
+    );
+
+    sup.stop(sid).await.unwrap();
+}
+
+#[tokio::test]
+async fn run_all_stops_on_error() {
+    if !python3_available() {
+        eprintln!("skipping: python3 not on PATH");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+
+    let ipynb = r##"{
+        "cells": [
+            {"cell_type": "code", "source": ["x = 1"]},
+            {"cell_type": "code", "source": ["raise ValueError('boom')"]},
+            {"cell_type": "code", "source": ["print('should not run')"]}
+        ],
+        "nbformat": 4
+    }"##;
+    let nb_path = dir.path().join("err.ipynb");
+    std::fs::write(&nb_path, ipynb).unwrap();
+
+    let sup = Arc::new(KernelSupervisor::new());
+    let tool = NotebookTool::new(Arc::clone(&sup));
+    let sid = "run-all-err";
+
+    let start_args = serde_json::json!({"action": "start"});
+    tool.run_with_session(start_args, dir.path(), sid).await;
+
+    let args = serde_json::json!({
+        "action": "run_all",
+        "notebook": nb_path.to_str().unwrap(),
+        "stop_on_error": true
+    });
+    let res = tool.run_with_session(args, dir.path(), sid).await;
+    assert!(res.success, "run_all itself should not error: {:?}", res);
+    // Only 2 of 3 cells ran (stopped at second).
+    assert!(res.content.contains("2/3"), "got: {}", res.content);
+    assert!(
+        res.content.contains("stopped on error"),
+        "got: {}",
+        res.content
+    );
+    assert!(
+        !res.content.contains("should not run"),
+        "third cell should not have run"
+    );
+
+    sup.stop(sid).await.unwrap();
+}

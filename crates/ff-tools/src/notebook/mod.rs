@@ -1,11 +1,12 @@
 //! `notebook_runner` tool — a session-scoped, stateful Python kernel (#859,
-//! epic #856). Phase 1: `start` / `run_cell` / `status` / `stop`, one kernel per
-//! session. The kernel (see [`kernel`]) is a persistent `python3` subprocess with
-//! module globals that survive across cells; the supervisor keys kernels by
-//! session id and is reaped when the session ends (host wiring), mirroring
-//! [`crate::process::ProcessSupervisor`].
+//! epic #856). Phase 1: `start` / `run_cell` / `status` / `stop`. Phase 2 adds
+//! `run_all` (ipynb file support). The kernel (see [`kernel`]) is a persistent
+//! `python3` subprocess with module globals that survive across cells; the
+//! supervisor keys kernels by session id and is reaped when the session ends
+//! (host wiring), mirroring [`crate::process::ProcessSupervisor`].
 
 mod kernel;
+pub(crate) mod parse;
 #[cfg(test)]
 mod tests;
 
@@ -19,6 +20,15 @@ use serde_json::Value;
 
 use crate::registry::{Safety, Tool, ToolOutcome, NO_SESSION};
 use kernel::{KernelState, DEFAULT_CELL_TIMEOUT_SECS, MAX_CELL_TIMEOUT_SECS};
+
+/// Per-cell result from a `run_all` invocation.
+#[derive(Debug, Clone)]
+struct CellRunResult {
+    cell_index: usize,
+    output: String,
+    errored: bool,
+    truncated: bool,
+}
 
 /// Manages one persistent Python kernel per session (Phase 1). Behind a `Mutex`
 /// so the single-threaded kernel stdin/stdout is never interleaved across cells.
@@ -92,6 +102,34 @@ impl KernelSupervisor {
         }
     }
 
+    /// Run all cells from a parsed notebook sequentially. Returns per-cell
+    /// results. If `stop_on_error` is true, execution halts at the first failure.
+    async fn run_all(
+        &self,
+        session_id: &str,
+        cells: &[parse::NotebookCell],
+        timeout_secs: u64,
+        stop_on_error: bool,
+    ) -> Result<Vec<CellRunResult>, String> {
+        let mut results = Vec::with_capacity(cells.len());
+        for cell in cells {
+            let res = self
+                .run_cell(session_id, &cell.source, timeout_secs)
+                .await?;
+            let stopped = stop_on_error && res.errored;
+            results.push(CellRunResult {
+                cell_index: cell.index,
+                output: res.output,
+                errored: res.errored,
+                truncated: res.truncated,
+            });
+            if stopped {
+                break;
+            }
+        }
+        Ok(results)
+    }
+
     /// Kill and drop every kernel for `session_id` (host calls this on session
     /// end so a long-lived kernel never leaks). Returns how many were reaped.
     pub async fn reap_session(&self, session_id: &str) -> usize {
@@ -152,7 +190,8 @@ impl Tool for NotebookTool {
          build up state incrementally: define something in one cell, use it in the \
          next. The kernel is scoped to this session and shares its `.venv`. \
          Actions: `start` (spawn the kernel), `run_cell` (run inline `code`, returns \
-         its stdout/stderr), `status` (kernel state + cells run), `stop` (kill it). \
+         its stdout/stderr), `run_all` (execute all code cells from a .ipynb file \
+         sequentially), `status` (kernel state + cells run), `stop` (kill it). \
          Each cell has a per-call timeout; a hung cell is interrupted then killed."
     }
 
@@ -162,22 +201,28 @@ impl Tool for NotebookTool {
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["start", "run_cell", "status", "stop"],
+                    "enum": ["start", "run_cell", "run_all", "status", "stop"],
                     "description": "What to do."
                 },
                 "code": {
                     "type": "string",
                     "description": "For `run_cell`: the Python source to execute in the kernel."
                 },
+                "notebook": {
+                    "type": "string",
+                    "description": "For `run_all`: path to a .ipynb file (relative to workspace root or absolute)."
+                },
+                "stop_on_error": {
+                    "type": "boolean",
+                    "description": "For `run_all`: stop on first cell error (default true)."
+                },
                 "working_dir": {
                     "type": "string",
-                    "description": "For `start`: directory to run in (venv discovery + cwd), \
-                                    relative to the workspace root or absolute. Defaults to root."
+                    "description": "For `start`: directory to run in (venv discovery + cwd),                                     relative to the workspace root or absolute. Defaults to root."
                 },
                 "timeout_secs": {
                     "type": "integer",
-                    "description": "For `run_cell`: per-cell wall-clock budget (default 60, \
-                                    max 600). A cell that overruns is interrupted, then killed."
+                    "description": "For `run_cell`/`run_all`: per-cell wall-clock budget (default 60,                                     max 600). A cell that overruns is interrupted, then killed."
                 }
             },
             "required": ["action"]
@@ -244,17 +289,58 @@ impl Tool for NotebookTool {
                     Err(e) => ToolOutcome::error(e),
                 }
             }
+            Some("run_all") => {
+                let Some(notebook_path) = args.get("notebook").and_then(Value::as_str) else {
+                    return ToolOutcome::error(
+                        "run_all requires a `notebook` path to a .ipynb file",
+                    );
+                };
+                let path = if Path::new(notebook_path).is_absolute() {
+                    PathBuf::from(notebook_path)
+                } else {
+                    root.join(notebook_path)
+                };
+                let content = match std::fs::read_to_string(&path) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        return ToolOutcome::error(format!(
+                            "cannot read notebook {}: {e}",
+                            path.display()
+                        ));
+                    }
+                };
+                let cells = match parse::parse_notebook(&content) {
+                    Ok(c) => c,
+                    Err(e) => return ToolOutcome::error(format!("failed to parse notebook: {e}")),
+                };
+                if cells.is_empty() {
+                    return ToolOutcome::ok("notebook contains no code cells".to_string());
+                }
+                let timeout = Self::resolve_timeout(&args);
+                let stop_on_error = args
+                    .get("stop_on_error")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(true);
+                match self
+                    .supervisor
+                    .run_all(session_id, &cells, timeout, stop_on_error)
+                    .await
+                {
+                    Ok(results) => ToolOutcome::ok(format_run_all(&results, &cells, notebook_path)),
+                    Err(e) => ToolOutcome::error(e),
+                }
+            }
             Some("status") => ToolOutcome::ok(self.supervisor.status(session_id).await),
             Some("stop") => match self.supervisor.stop(session_id).await {
                 Ok(body) => ToolOutcome::ok(body),
                 Err(e) => ToolOutcome::error(e),
             },
             Some(other) => ToolOutcome::error(format!(
-                "unknown action '{other}'; expected start|run_cell|status|stop"
+                "unknown action '{other}'; expected start|run_cell|run_all|status|stop"
             )),
-            None => {
-                ToolOutcome::error("missing required argument: action (start|run_cell|status|stop)")
-            }
+            None => ToolOutcome::error(
+                "missing required argument: action (start|run_cell|run_all|status|stop)",
+            ),
         }
     }
 
@@ -270,4 +356,45 @@ impl Tool for NotebookTool {
         // we override this method rather than relying on the base `run`.
         self.run_with_session(args, root, session_id).await
     }
+}
+
+/// Format the results of a `run_all` into a compact, human-readable summary.
+fn format_run_all(results: &[CellRunResult], cells: &[parse::NotebookCell], path: &str) -> String {
+    let total_code = cells.len();
+    let ran = results.len();
+    let mut out = format!("Ran {ran}/{total_code} code cells from {path}\n");
+
+    for r in results {
+        let status = if r.errored { "\u{2717}" } else { "\u{2713}" };
+        // Show a brief snippet of output (first line) for context.
+        let snippet = r
+            .output
+            .lines()
+            .next()
+            .unwrap_or("")
+            .chars()
+            .take(120)
+            .collect::<String>();
+        if snippet.is_empty() {
+            out.push_str(&format!("\n[cell {}] {status}", r.cell_index));
+        } else {
+            out.push_str(&format!("\n[cell {}] {status}  {snippet}", r.cell_index));
+        }
+        if r.truncated {
+            out.push_str(" [truncated]");
+        }
+    }
+
+    // If we stopped early, note it.
+    if ran < total_code {
+        if let Some(last) = results.last() {
+            if last.errored {
+                out.push_str(&format!(
+                    "\n\n[stopped on error at cell {}]",
+                    last.cell_index
+                ));
+            }
+        }
+    }
+    out
 }
