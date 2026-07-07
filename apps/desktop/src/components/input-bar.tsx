@@ -42,6 +42,9 @@ import { formatBytes } from "@/lib/memory-view";
 import { ipc } from "@/lib/ipc";
 import { useChatStore } from "@/store/chat";
 import { useComposerStore } from "@/store/composer";
+import { useGoalStore } from "@/store/goal";
+import { useGoalDialogStore } from "@/store/goal-dialog";
+import { parseGoalCommand } from "@/lib/goal-command";
 import { usePrefsStore } from "@/store/prefs";
 import { useSessionWorkspaceStore } from "@/store/session-workspace";
 import { useSessionModeStore, MODE_ORDER } from "@/store/session-mode";
@@ -145,6 +148,8 @@ export function InputBar({
   const send = useChatStore((s) => s.send);
   const editMessage = useChatStore((s) => s.editMessage);
   const cancelTurn = useChatStore((s) => s.cancelTurn);
+  const startGoal = useGoalStore((s) => s.start);
+  const openGoalDialog = useGoalDialogStore((s) => s.open);
   const sendMessageKey = usePrefsStore((s) => s.sendMessageKey);
 
   // Capability gate (#342/#504, RFC 0005 §11.3) — shared with the pane's drop
@@ -270,6 +275,25 @@ export function InputBar({
     )
       return;
     const attach = attachments;
+    // `/goal` composer slash command (#817): a fresh submission (not an in-place
+    // edit) starting with `/goal` enters Goal mode for the active session instead
+    // of sending a chat message. `/goal <objective>` starts immediately; a bare
+    // `/goal` opens the start-goal dialog (#816) so the command is discoverable.
+    // Attachments are irrelevant to a goal start and are simply dropped.
+    if (!editingMessageId) {
+      const cmd = parseGoalCommand(content);
+      if (cmd.kind !== "not-a-command") {
+        setText("");
+        clearAttachments(targetSessionId);
+        if (textareaRef.current) textareaRef.current.style.height = "auto";
+        if (cmd.kind === "start") {
+          void startGoal(targetSessionId, cmd.objective);
+        } else {
+          openGoalDialog(targetSessionId);
+        }
+        return;
+      }
+    }
     clearAttachments(targetSessionId);
     // Collapse the box back to one line (it may have grown for a resend draft).
     if (textareaRef.current) textareaRef.current.style.height = "auto";
