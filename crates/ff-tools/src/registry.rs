@@ -365,7 +365,7 @@ mod tests {
     fn advertises_default_schemas() {
         let reg = ToolRegistry::with_defaults();
         let tools = reg.openai_tools();
-        assert_eq!(tools.len(), 16);
+        assert_eq!(tools.len(), 17);
         let names: Vec<_> = tools
             .iter()
             .map(|t| t["function"]["name"].as_str().unwrap())
@@ -384,6 +384,7 @@ mod tests {
             "web_fetch",
             "ask_user",
             "agent",
+            "git",
         ] {
             assert!(names.contains(&expected), "missing tool: {expected}");
         }
@@ -409,7 +410,7 @@ mod tests {
             .map(|t| t["function"]["name"].as_str().unwrap())
             .collect();
         assert!(!names.contains(&"agent"));
-        assert_eq!(no_subagent.len(), 15);
+        assert_eq!(no_subagent.len(), 16);
     }
 
     #[test]
