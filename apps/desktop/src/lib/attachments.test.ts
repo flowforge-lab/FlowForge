@@ -6,6 +6,8 @@ import {
   classifyForStaging,
   describeRejections,
   fileToAttachment,
+  ipynbToText,
+  isNotebook,
 } from "./attachments";
 
 function file(name: string, type: string): File {
@@ -146,5 +148,126 @@ describe("describeRejections (#723)", () => {
     ).toBe(
       "This model can't accept images or documents; skipped 1 file: unsupported type",
     );
+  });
+});
+
+describe("source-code attachments (#842)", () => {
+  it("accepts .py by MIME and by extension fallback", () => {
+    expect(attachmentKindFor(file("s.py", "text/x-python"))).toBe("document");
+    expect(attachmentKindFor(file("s.py", "application/x-python-code"))).toBe(
+      "document",
+    );
+    // Browsers often report no MIME for .py — extension carries it.
+    expect(attachmentKindFor(file("s.py", ""))).toBe("document");
+    expect(attachmentKindFor(file("s.py", "application/octet-stream"))).toBe(
+      "document",
+    );
+  });
+
+  it("accepts .ipynb by extension", () => {
+    expect(attachmentKindFor(file("nb.ipynb", ""))).toBe("document");
+    expect(attachmentKindFor(file("nb.ipynb", "application/json"))).toBe(
+      "document",
+    );
+  });
+
+  it("classifyForStaging accepts .py and .ipynb when documents are allowed", () => {
+    const gate = { visionGated: false, docGated: false };
+    expect(classifyForStaging(file("s.py", "text/x-python"), gate)).toBe(
+      "document",
+    );
+    expect(classifyForStaging(file("nb.ipynb", ""), gate)).toBe("document");
+  });
+
+  it("still gates .py/.ipynb behind doc support (no silent drop)", () => {
+    const gate = { visionGated: false, docGated: true };
+    expect(classifyForStaging(file("s.py", "text/x-python"), gate)).toBe(
+      "doc-gated",
+    );
+    expect(classifyForStaging(file("nb.ipynb", ""), gate)).toBe("doc-gated");
+  });
+
+  it("isNotebook detects .ipynb only", () => {
+    expect(isNotebook(file("nb.ipynb", ""))).toBe(true);
+    expect(isNotebook(file("s.py", "text/x-python"))).toBe(false);
+    expect(isNotebook(file("d.csv", "text/csv"))).toBe(false);
+  });
+});
+
+describe("ipynbToText (#842)", () => {
+  it("extracts markdown cells as-is and fences code cells", () => {
+    const nb = JSON.stringify({
+      metadata: { kernelspec: { language: "python" } },
+      cells: [
+        { cell_type: "markdown", source: ["# Title\n", "intro"] },
+        { cell_type: "code", source: ["x = 1\n", "print(x)"] },
+      ],
+    });
+    expect(ipynbToText(nb)).toBe(
+      "# Title\nintro\n\n```python\nx = 1\nprint(x)\n```",
+    );
+  });
+
+  it("drops outputs (execution counts / stdout / base64 images)", () => {
+    const nb = JSON.stringify({
+      cells: [
+        {
+          cell_type: "code",
+          execution_count: 7,
+          source: "plot()",
+          outputs: [
+            { output_type: "stream", text: ["noisy stdout\n"] },
+            { output_type: "display_data", data: { "image/png": "AAAA…" } },
+          ],
+        },
+      ],
+    });
+    const out = ipynbToText(nb);
+    expect(out).toBe("```python\nplot()\n```");
+    expect(out).not.toContain("noisy stdout");
+    expect(out).not.toContain("AAAA");
+  });
+
+  it("skips empty cells and defaults language to python", () => {
+    const nb = JSON.stringify({
+      cells: [
+        { cell_type: "code", source: "" },
+        { cell_type: "code", source: "y = 2" },
+      ],
+    });
+    expect(ipynbToText(nb)).toBe("```python\ny = 2\n```");
+  });
+
+  it("honors a non-python kernel language", () => {
+    const nb = JSON.stringify({
+      metadata: { kernelspec: { language: "r" } },
+      cells: [{ cell_type: "code", source: "x <- 1" }],
+    });
+    expect(ipynbToText(nb)).toBe("```r\nx <- 1\n```");
+  });
+
+  it("returns the original text on malformed / non-notebook JSON", () => {
+    expect(ipynbToText("not json {{{")).toBe("not json {{{");
+    expect(ipynbToText(JSON.stringify({ nope: 1 }))).toBe('{"nope":1}');
+  });
+});
+
+describe("fileToAttachment .ipynb conversion (#842)", () => {
+  it("converts a notebook to an inline text/plain document", async () => {
+    const nb = JSON.stringify({
+      cells: [{ cell_type: "code", source: "print('hi')" }],
+    });
+    const att = await fileToAttachment(
+      new File([nb], "nb.ipynb", { type: "" }),
+    );
+    expect(att.kind).toBe("document");
+    expect(att.mediaType).toBe("text/plain");
+    expect(att.source.type).toBe("inline");
+    // Decodes back to the converted (fenced) text, not the raw notebook JSON.
+    const decoded = new TextDecoder().decode(
+      Uint8Array.from(atob(att.source.value), (c) => c.charCodeAt(0)),
+    );
+    expect(decoded).toBe("```python\nprint('hi')\n```");
+    expect(decoded).not.toContain("cell_type");
   });
 });

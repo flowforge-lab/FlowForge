@@ -946,6 +946,39 @@ fn json_document_maps_to_txt() {
 }
 
 #[test]
+fn python_document_maps_to_txt() {
+    // #842: `.py` has no Bedrock DocumentFormat variant, so it routes to Txt —
+    // whether the browser reported `text/x-python` or nothing (extension fallback).
+    for (media, name) in [
+        ("text/x-python", "script.py"),
+        ("application/x-python-code", "script.py"),
+        ("application/octet-stream", "script.py"),
+        ("", "script.py"),
+    ] {
+        let msg = ChatMessage::multimodal(
+            "user",
+            "",
+            vec![Attachment {
+                kind: ff_core::AttachmentKind::Document,
+                media_type: media.into(),
+                source: AttachmentSource::Inline(inline_b64(b"print('hi')\n")),
+                name: Some(name.into()),
+                bytes: 12,
+            }],
+        );
+        let (_, messages) = to_converse(&[msg]);
+        match &messages[0].content[0] {
+            ContentBlock::Document(d) => assert_eq!(
+                d.format,
+                DocumentFormat::Txt,
+                "py via media={media:?} should map to Txt"
+            ),
+            other => panic!("expected document block, got {other:?}"),
+        }
+    }
+}
+
+#[test]
 fn text_only_message_is_unchanged() {
     let (_, messages) = to_converse(&[ChatMessage::text("user", "plain turn")]);
     assert_eq!(messages.len(), 1);
