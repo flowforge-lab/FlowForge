@@ -19,6 +19,7 @@ tokio = { workspace = true }
 async-trait = { workspace = true }
 chrono = { workspace = true }
 iana-time-zone = { workspace = true }
+lru = { workspace = true }
 
 [dev-dependencies]
 ff-memory = { workspace = true }

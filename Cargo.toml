@@ -48,3 +48,5 @@ ff-signals = { path = "crates/ff-signals" }
 ff-skills = { path = "crates/ff-skills" }
 ff-tools = { path = "crates/ff-tools" }
 ff-workflow = { path = "crates/ff-workflow" }
+
+lru = "0.12"

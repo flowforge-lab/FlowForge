@@ -6,22 +6,35 @@
 //! turn re-summarized from scratch even when only 1-2 messages were appended.
 //!
 //! This module provides a shared, per-session cache that survives across turns
-//! so `run_turn` can seed its local state from the previous turn'\''s result.
+//! so `run_turn` can seed its local state from the previous turn's result.
+//!
+//! ## Bounded growth (#764)
+//!
+//! Entries are evicted on an LRU basis once the cache exceeds
+//! [`MAX_ENTRIES`] distinct session ids. Cross-turn caching is best-effort:
+//! when a session's summary is evicted, its next turn simply re-summarizes
+//! from scratch (graceful degradation — no correctness impact, just one extra
+//! summarizer round-trip on the cold path).
 
-use std::collections::HashMap;
+use std::num::NonZeroUsize;
 use std::sync::Mutex;
 
 use ff_core::Message;
+use lru::LruCache;
+
+/// Soft cap on the number of distinct sessions tracked. At ~2 KB / entry the
+/// worst-case footprint is ~256 KB; the value is comfortably above the number
+/// of concurrent sessions any realistic user runs.
+const MAX_ENTRIES: NonZeroUsize = NonZeroUsize::new(128).expect("non-zero");
 
 /// Per-session cross-turn compaction summary cache.
 ///
-/// Keyed by session_id. Thread-safe via interior `Mutex` — the lock is held
-/// only for the duration of a HashMap get/insert (nanoseconds), never across
-/// awaits. Only one `run_turn` per session runs at a time (enforced by the
-/// cancel-before-spawn invariant upstream), so contention is effectively zero.
-#[derive(Debug, Default)]
+/// Thread-safe via interior `Mutex` — the lock is held only for the duration
+/// of an LRU op (nanoseconds), never across awaits. Only one `run_turn` per
+/// session runs at a time (enforced by the cancel-before-spawn invariant
+/// upstream), so contention is effectively zero.
 pub struct CompactionCache {
-    inner: Mutex<HashMap<String, CachedSummary>>,
+    inner: Mutex<LruCache<String, CachedSummary>>,
 }
 
 /// The cached summary state for one session.
@@ -39,21 +52,25 @@ struct CachedSummary {
 
 impl CompactionCache {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            inner: Mutex::new(LruCache::new(MAX_ENTRIES)),
+        }
     }
 
-    /// Retrieve the cached summary for a session, if any.
+    /// Retrieve the cached summary for a session, if any. Promotes the entry
+    /// to most-recently-used.
     pub fn get(&self, session_id: &str) -> Option<(usize, Message, u64)> {
-        let guard = self.inner.lock().unwrap();
+        let mut guard = self.inner.lock().unwrap();
         guard
             .get(session_id)
             .map(|c| (c.boundary, c.summary.clone(), c.message_count))
     }
 
-    /// Store (or overwrite) the summary for a session.
+    /// Store (or overwrite) the summary for a session. When the cache is at
+    /// capacity, the least-recently-touched entry is silently dropped.
     pub fn put(&self, session_id: &str, boundary: usize, summary: Message, message_count: u64) {
         let mut guard = self.inner.lock().unwrap();
-        guard.insert(
+        guard.put(
             session_id.to_owned(),
             CachedSummary {
                 boundary,
@@ -67,7 +84,7 @@ impl CompactionCache {
     /// old boundary is no longer valid.
     pub fn invalidate(&self, session_id: &str) {
         let mut guard = self.inner.lock().unwrap();
-        guard.remove(session_id);
+        guard.pop(session_id);
     }
 
     /// Invalidate all sessions. Called on provider/model change where summaries
@@ -78,5 +95,13 @@ impl CompactionCache {
     }
 }
 
+impl Default for CompactionCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// `LruCache::iter_mut` would let consumers iterate, but the cache deliberately
+// exposes only the four mutating ops above so eviction stays encapsulated.
 #[cfg(test)]
 mod tests;
