@@ -24,8 +24,15 @@ interface ControlConfigState {
   setUserInstructions: (text: string) => Promise<void>;
   addPromptFile: (path: string) => Promise<void>;
   removePromptFile: (path: string) => Promise<void>;
-  /** Add a teammate (SET.12). Server assigns the id; no-op on a blank name. */
+  /** Add a teammate (SET.12). Server assigns the id; no-op on a blank name.
+   *  A blank slug auto-derives from the name (kebab-case). */
   addTeammate: (input: Omit<Teammate, "id">) => Promise<void>;
+  /** Patch an existing teammate (#805). No-op if the id is unknown, the resulting
+   *  name is blank, or the derived slug collides with a different teammate. */
+  updateTeammate: (
+    id: string,
+    patch: Partial<Omit<Teammate, "id">>,
+  ) => Promise<void>;
   removeTeammate: (id: string) => Promise<void>;
   /** Patch one or more UI-customization fields (SET.12). */
   setUi: (patch: Partial<ControlUi>) => Promise<void>;
@@ -76,7 +83,8 @@ export const useControlConfigStore = create<ControlConfigState>((set, get) => ({
   addTeammate: (input) => {
     const name = input.name.trim();
     if (name === "") return Promise.resolve();
-    const slug = slugify(input.slug);
+    // Blank slug auto-derives from the name (#805); slugify normalizes either way.
+    const slug = slugify(input.slug) || slugify(name);
     const teammate: Teammate = {
       id: crypto.randomUUID(),
       name,
@@ -84,13 +92,35 @@ export const useControlConfigStore = create<ControlConfigState>((set, get) => ({
       description: input.description.trim(),
     };
     return persist(set, get, (c) =>
-      // Dedupe on a non-empty handle (mirrors addPromptFile); an empty
-      // slug is optional and allowed to repeat.
+      // Dedupe on a non-empty handle (mirrors addPromptFile). A slug can still be
+      // empty when the name has no alphanumerics; those stay optional and may repeat.
       slug !== "" && c.teammates.some((t) => t.slug === slug)
         ? c
         : { ...c, teammates: [...c.teammates, teammate] },
     );
   },
+
+  updateTeammate: (id, patch) =>
+    persist(set, get, (c) => {
+      const existing = c.teammates.find((t) => t.id === id);
+      if (!existing) return c; // unknown id
+      const name = (patch.name ?? existing.name).trim();
+      if (name === "") return c; // don't allow clearing the name
+      const slug = slugify(patch.slug ?? existing.slug) || slugify(name);
+      // Dedupe against the *other* teammates (a teammate never collides with itself).
+      if (
+        slug !== "" &&
+        c.teammates.some((t) => t.id !== id && t.slug === slug)
+      )
+        return c;
+      const description = (patch.description ?? existing.description).trim();
+      return {
+        ...c,
+        teammates: c.teammates.map((t) =>
+          t.id === id ? { ...t, name, slug, description } : t,
+        ),
+      };
+    }),
 
   removeTeammate: (id) =>
     persist(set, get, (c) => ({

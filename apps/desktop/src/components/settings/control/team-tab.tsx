@@ -1,8 +1,9 @@
 import { useState } from "react";
-import { Plus, X } from "@/components/ui/icon";
+import { Pencil, Plus, X } from "@/components/ui/icon";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
+import { slugify } from "@/lib/control";
 import { useControlConfigStore } from "@/store/control-config";
 
 /** Initials for the avatar fallback (first letters of the first two words). */
@@ -15,27 +16,55 @@ function initials(name: string): string {
     .join("");
 }
 
-/** Team sub-tab (SET.12): teammate profiles list + a stub "Add teammate" form. */
+/** Team sub-tab (SET.12, #805): teammate profiles list + an add/edit form. */
 export function TeamTab() {
   const config = useControlConfigStore((s) => s.config);
   const saving = useControlConfigStore((s) => s.saving);
   const addTeammate = useControlConfigStore((s) => s.addTeammate);
+  const updateTeammate = useControlConfigStore((s) => s.updateTeammate);
   const removeTeammate = useControlConfigStore((s) => s.removeTeammate);
 
+  const [editingId, setEditingId] = useState<string | null>(null);
   const [name, setName] = useState("");
   const [slug, setSlug] = useState("");
   const [description, setDescription] = useState("");
+  const [attempted, setAttempted] = useState(false);
 
   if (!config) return null;
 
-  const canAdd = name.trim() !== "";
+  const isEditing = editingId !== null;
+  // The slug the store will persist: the typed handle, or one derived from the name.
+  const derivedSlug = slugify(slug) || slugify(name);
+  const nameEmpty = name.trim() === "";
+  const slugTaken =
+    derivedSlug !== "" &&
+    config.teammates.some((t) => t.slug === derivedSlug && t.id !== editingId);
+  const canSubmit = !nameEmpty && !slugTaken;
 
-  const submit = () => {
-    if (!canAdd) return;
-    void addTeammate({ name, slug, description });
+  const resetForm = () => {
+    setEditingId(null);
     setName("");
     setSlug("");
     setDescription("");
+    setAttempted(false);
+  };
+
+  const startEdit = (id: string) => {
+    const t = config.teammates.find((tm) => tm.id === id);
+    if (!t) return;
+    setEditingId(t.id);
+    setName(t.name);
+    setSlug(t.slug);
+    setDescription(t.description);
+    setAttempted(false);
+  };
+
+  const submit = () => {
+    setAttempted(true);
+    if (!canSubmit) return;
+    if (isEditing) void updateTeammate(editingId, { name, slug, description });
+    else void addTeammate({ name, slug, description });
+    resetForm();
   };
 
   return (
@@ -51,7 +80,11 @@ export function TeamTab() {
             {config.teammates.map((t) => (
               <li
                 key={t.id}
-                className="flex items-start gap-2.5 rounded-md bg-muted/40 px-2.5 py-2"
+                className={`flex items-start gap-2.5 rounded-md px-2.5 py-2 ${
+                  editingId === t.id
+                    ? "bg-muted/60 ring-1 ring-primary/40"
+                    : "bg-muted/40"
+                }`}
               >
                 <span
                   className="mt-0.5 flex size-7 shrink-0 items-center justify-center rounded-full bg-primary/10 text-[11px] font-semibold text-primary"
@@ -76,18 +109,35 @@ export function TeamTab() {
                     </p>
                   ) : null}
                 </div>
-                <Button
-                  type="button"
-                  variant="ghost"
-                  size="icon-xs"
-                  className="text-muted-foreground hover:text-destructive"
-                  disabled={saving}
-                  onClick={() => void removeTeammate(t.id)}
-                  title={`Remove ${t.name}`}
-                  aria-label={`Remove ${t.name}`}
-                >
-                  <X />
-                </Button>
+                <div className="flex shrink-0 items-center">
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="icon-xs"
+                    className="text-muted-foreground hover:text-foreground"
+                    disabled={saving}
+                    onClick={() => startEdit(t.id)}
+                    title={`Edit ${t.name}`}
+                    aria-label={`Edit ${t.name}`}
+                  >
+                    <Pencil />
+                  </Button>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="icon-xs"
+                    className="text-muted-foreground hover:text-destructive"
+                    disabled={saving}
+                    onClick={() => {
+                      if (editingId === t.id) resetForm();
+                      void removeTeammate(t.id);
+                    }}
+                    title={`Remove ${t.name}`}
+                    aria-label={`Remove ${t.name}`}
+                  >
+                    <X />
+                  </Button>
+                </div>
               </li>
             ))}
           </ul>
@@ -96,7 +146,7 @@ export function TeamTab() {
 
       <section className="space-y-3 border-t pt-5">
         <h3 className="text-[13px] font-medium text-foreground">
-          Add teammate
+          {isEditing ? "Edit teammate" : "Add teammate"}
         </h3>
         <div className="grid grid-cols-2 gap-2">
           <div className="space-y-1.5">
@@ -111,9 +161,13 @@ export function TeamTab() {
               value={name}
               placeholder="Riley Reviewer"
               autoComplete="off"
+              aria-invalid={attempted && nameEmpty}
               disabled={saving}
               onChange={(e) => setName(e.target.value)}
             />
+            {attempted && nameEmpty ? (
+              <p className="text-[11px] text-destructive">Name is required.</p>
+            ) : null}
           </div>
           <div className="space-y-1.5">
             <label
@@ -127,9 +181,19 @@ export function TeamTab() {
               value={slug}
               placeholder="reviewer"
               autoComplete="off"
+              aria-invalid={slugTaken}
               disabled={saving}
               onChange={(e) => setSlug(e.target.value)}
             />
+            {slugTaken ? (
+              <p className="text-[11px] text-destructive">
+                @{derivedSlug} is already taken.
+              </p>
+            ) : slug.trim() === "" && derivedSlug !== "" ? (
+              <p className="text-[11px] text-muted-foreground">
+                Will use @{derivedSlug}.
+              </p>
+            ) : null}
           </div>
         </div>
         <div className="space-y-1.5">
@@ -149,16 +213,29 @@ export function TeamTab() {
             onChange={(e) => setDescription(e.target.value)}
           />
         </div>
-        <Button
-          type="button"
-          variant="outline"
-          size="sm"
-          disabled={!canAdd || saving}
-          onClick={submit}
-        >
-          <Plus />
-          Add teammate
-        </Button>
+        <div className="flex items-center gap-1.5">
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            disabled={(attempted && !canSubmit) || saving}
+            onClick={submit}
+          >
+            {isEditing ? <Pencil /> : <Plus />}
+            {isEditing ? "Save" : "Add teammate"}
+          </Button>
+          {isEditing ? (
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              disabled={saving}
+              onClick={resetForm}
+            >
+              Cancel
+            </Button>
+          ) : null}
+        </div>
       </section>
     </div>
   );
