@@ -164,3 +164,32 @@ fn truncate_keeps_tail() {
     assert!(truncated.len() <= 100);
     assert!(truncated.ends_with("a\n"));
 }
+
+#[test]
+fn truncate_failure_message_on_multibyte_boundary() {
+    let mut msg = "a".repeat(1999);
+    msg.push('\u{4e16}'); // 3-byte char at bytes 1999..2002
+    msg.push_str(&"b".repeat(100));
+    assert!(msg.len() > 2000);
+
+    let result = TestResult {
+        passed: 0,
+        failed: 1,
+        skipped: 0,
+        failures: vec![Failure {
+            name: "test_utf8".to_string(),
+            message: msg,
+        }],
+        raw_tail: None,
+    };
+    let formatted = format_result(&result);
+    assert!(formatted.contains("...[truncated]"));
+}
+
+#[test]
+fn truncate_output_on_multibyte_boundary() {
+    let chunk = "\u{4e16}".repeat(6000); // 3 bytes each = 18000 bytes
+    let result = truncate_output(&chunk, 16_000);
+    assert!(result.len() <= 16_000);
+    assert!(result.len() < chunk.len());
+}

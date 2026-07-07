@@ -161,7 +161,11 @@ fn format_result(result: &TestResult) -> String {
         out.push_str(&format!("\n{}. {}\n", i + 1, f.name));
         // Truncate long failure messages
         let msg = if f.message.len() > 2000 {
-            format!("{}...[truncated]", &f.message[..2000])
+            let mut end = 2000;
+            while !f.message.is_char_boundary(end) {
+                end -= 1;
+            }
+            format!("{}...[truncated]", &f.message[..end])
         } else {
             f.message.clone()
         };
@@ -472,7 +476,11 @@ fn truncate_output(output: &str, max_bytes: usize) -> &str {
         return output;
     }
     // Take the tail (most recent output is most useful)
-    let start = output.len() - max_bytes;
+    let mut start = output.len() - max_bytes;
+    // Advance to the next char boundary to avoid panicking on multibyte UTF-8.
+    while !output.is_char_boundary(start) {
+        start += 1;
+    }
     // Find the next newline to avoid cutting mid-line
     match output[start..].find('\n') {
         Some(pos) => &output[start + pos + 1..],
