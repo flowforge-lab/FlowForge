@@ -25,8 +25,12 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
-/// Default iteration ceiling for a goal loop (RFC 0020 §3, §10).
-pub const DEFAULT_MAX_ITERATIONS: u32 = 25;
+/// Default iteration ceiling for a goal loop (RFC 0020 §3, §10). One iteration is a
+/// full `run_turn` to a terminal answer (itself many tool sub-turns), so this is a
+/// coarse safety cap, not a work estimate. It is also the *only* budget dimension
+/// bounded by default (`max_tokens` / `max_wall_ms` are optional and unbounded), so
+/// it doubles as the runaway-cost backstop; kept moderate and overridable per-goal.
+pub const DEFAULT_MAX_ITERATIONS: u32 = 40;
 
 /// A persistent autonomous objective bound to one session (#683, RFC 0020 §3).
 ///
@@ -400,10 +404,10 @@ mod tests {
     }
 
     #[test]
-    fn default_budget_caps_iterations_at_25() {
+    fn default_budget_caps_iterations_at_40() {
         let b = GoalBudget::default();
         assert_eq!(b.max_iterations, DEFAULT_MAX_ITERATIONS);
-        assert_eq!(b.max_iterations, 25);
+        assert_eq!(b.max_iterations, 40);
         assert!(b.max_tokens.is_none());
         assert!(b.max_wall_ms.is_none());
     }
@@ -442,7 +446,7 @@ mod tests {
         let raw = r#"{"sessionId":"s","objective":"do the thing","status":"active"}"#;
         let g: Goal = serde_json::from_str(raw).unwrap();
         assert_eq!(g.iteration, 0);
-        assert_eq!(g.budget.max_iterations, 25);
+        assert_eq!(g.budget.max_iterations, 40);
         assert_eq!(g.spent.tokens, 0);
         assert!(g.ledger.is_empty());
         assert!(g.pending_steer.is_none());

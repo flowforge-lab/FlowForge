@@ -290,6 +290,6 @@ else builds against stable seams and gets the matrix snapped in at one call site
   in-flight call), resume replays from the last completed iteration (§5.3).
 - **Token budget per-goal or per-iteration?** → **Per-goal cumulative** (`GoalSpend`).
 - **Can the user message during a run?** → **Yes** — it becomes a steer (§6).
-- **Default `max_iterations`?** → **25**, overridable at `goal_set` or in settings.
+- **Default `max_iterations`?** → **40**, overridable at `goal_set` or in settings.
 - **What does an `Ask` cell do inside a headless goal iteration?** → **Pause + surface**
   (status `Paused`), never auto-approve (§4).

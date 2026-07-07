@@ -4,6 +4,7 @@ import { SessionSidebar } from "@/components/session-sidebar";
 import { PaneTree } from "@/components/pane-tree";
 import { SplitPanel } from "@/components/split-panel";
 import { CommandPalette } from "@/components/palette";
+import { StartGoalDialog } from "@/components/start-goal-dialog";
 import { ShortcutsOverlay } from "@/components/shortcuts-overlay";
 import { SettingsPanel } from "@/components/settings-panel";
 import { PhenoMcpToast } from "@/components/pheno-mcp-toast";
@@ -223,6 +224,7 @@ export function AppShell() {
         </main>
       </div>
       <CommandPalette />
+      <StartGoalDialog />
       <ShortcutsOverlay />
       <SettingsPanel />
       <PhenoMcpToast />

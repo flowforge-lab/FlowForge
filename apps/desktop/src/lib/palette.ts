@@ -46,6 +46,17 @@ export function buildCommands(args: {
       title: "Focus composer",
       keywords: "message input write type reply prompt",
     },
+    ...(activeSessionId
+      ? ([
+          {
+            kind: "start-goal",
+            id: "action:start-goal",
+            title: "Start goal…",
+            keywords:
+              "goal autonomous objective loop agent run continue self-driving mode",
+          },
+        ] satisfies PaletteCommand[])
+      : []),
     ...(canSplit
       ? ([
           {

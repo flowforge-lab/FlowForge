@@ -94,11 +94,16 @@ function AlertDialogDescription({
 
 function AlertDialogAction({
   children,
+  // Confirmations are destructive by default (the primitive's only prior use);
+  // form-style dialogs pass e.g. `variant="default"` for a non-destructive action.
+  variant = "destructive",
   ...props
-}: React.ComponentProps<typeof AlertDialogPrimitive.Action>) {
+}: React.ComponentProps<typeof AlertDialogPrimitive.Action> & {
+  variant?: React.ComponentProps<typeof Button>["variant"];
+}) {
   return (
     <AlertDialogPrimitive.Action asChild>
-      <Button variant="destructive" size="sm" {...props}>
+      <Button variant={variant} size="sm" {...props}>
         {children}
       </Button>
     </AlertDialogPrimitive.Action>
