@@ -53,6 +53,18 @@ describe("useSessionModeStore", () => {
     const blob = JSON.parse(localStorage.getItem("ff-session-mode") ?? "{}");
     expect(blob.state.modeBySession.s1).toBe("act");
   });
+
+  it("clearMode drops the override so resolve falls back to the default (#800)", () => {
+    const store = useSessionModeStore.getState();
+    store.setMode("s1", "plan");
+    expect(store.resolve("s1", "auto")).toBe("plan");
+    store.clearMode("s1");
+    // The key is removed, not set to undefined, so the session re-inherits.
+    expect(useSessionModeStore.getState().modeBySession).not.toHaveProperty(
+      "s1",
+    );
+    expect(useSessionModeStore.getState().resolve("s1", "auto")).toBe("auto");
+  });
 });
 
 // #789: the pill is authoritative but the running turn reads the persisted
@@ -79,5 +91,19 @@ describe("useSessionModeStore backend write-through", () => {
     expect(spy).toHaveBeenLastCalledWith("s1", "plan");
     useSessionModeStore.getState().cycleMode("s1", "auto"); // plan → act
     expect(spy).toHaveBeenLastCalledWith("s1", "act");
+  });
+
+  it("clearMode mirrors null to the backend (inherit the default, #800)", () => {
+    const spy = vi.spyOn(ipc, "setSessionMode").mockResolvedValue();
+    useSessionModeStore.getState().setMode("s1", "plan");
+    useSessionModeStore.getState().clearMode("s1");
+    expect(spy).toHaveBeenLastCalledWith("s1", null);
+  });
+
+  it("clearMode on a session with no override is a safe no-op that still mirrors null", () => {
+    const spy = vi.spyOn(ipc, "setSessionMode").mockResolvedValue();
+    useSessionModeStore.getState().clearMode("nope");
+    expect(useSessionModeStore.getState().modeBySession).toEqual({});
+    expect(spy).toHaveBeenCalledWith("nope", null);
   });
 });

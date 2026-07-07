@@ -29,6 +29,8 @@ export interface SessionModeState {
   /** Advance one session's mode to the next in the cycle, seeding from `fallback`
    *  when it has no explicit override yet. */
   cycleMode: (sessionId: string, fallback: Mode) => void;
+  /** Drop a session's explicit override so it inherits `defaultMode` again (#800). */
+  clearMode: (sessionId: string) => void;
 }
 
 export const useSessionModeStore = create<SessionModeState>()(
@@ -51,6 +53,14 @@ export const useSessionModeStore = create<SessionModeState>()(
           modeBySession: { ...s.modeBySession, [sessionId]: next },
         }));
         void ipc.setSessionMode(sessionId, next);
+      },
+      clearMode: (sessionId) => {
+        set((s) => {
+          const { [sessionId]: _omit, ...rest } = s.modeBySession;
+          return { modeBySession: rest };
+        });
+        // Mirror the clear so the backend inherits its default again (#789/#800).
+        void ipc.setSessionMode(sessionId, null);
       },
     }),
     // `version` establishes a migration baseline now, so a future shape change can
