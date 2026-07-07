@@ -37,6 +37,7 @@ mod python;
 mod registry;
 mod shell;
 mod sink;
+mod test_runner;
 mod todo;
 mod tree;
 pub mod url_safety;
