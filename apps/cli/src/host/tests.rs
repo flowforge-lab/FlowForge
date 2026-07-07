@@ -1,0 +1,142 @@
+use super::resolve_phenotype_in;
+use ff_skills::DEFAULT_PHENOTYPE;
+use std::fs;
+
+#[test]
+fn default_phenotype_resolves_without_any_files() {
+    let tmp = tempfile::tempdir().unwrap();
+    let p = resolve_phenotype_in(DEFAULT_PHENOTYPE, tmp.path()).unwrap();
+    assert_eq!(p.name, "default");
+    assert!(p.skills.is_empty());
+    assert!(p.model.is_none());
+    assert!(p.persona.is_none());
+}
+
+#[test]
+fn resolves_named_phenotype_from_toml_by_stem() {
+    let tmp = tempfile::tempdir().unwrap();
+    fs::write(
+        tmp.path().join("rust.toml"),
+        "skills = [\"cargo-check\", \"clippy\"]\n\
+         model = \"qwen3-coder\"\n\
+         persona = \"You are a Rust expert.\"\n",
+    )
+    .unwrap();
+
+    let p = resolve_phenotype_in("rust", tmp.path()).unwrap();
+    assert_eq!(p.name, "rust");
+    assert_eq!(p.skills, vec!["cargo-check", "clippy"]);
+    assert_eq!(p.model.as_deref(), Some("qwen3-coder"));
+    assert_eq!(p.persona.as_deref(), Some("You are a Rust expert."));
+}
+
+#[test]
+fn unknown_name_returns_none() {
+    let tmp = tempfile::tempdir().unwrap();
+    assert!(resolve_phenotype_in("nope", tmp.path()).is_none());
+}
+
+#[test]
+fn api_key_from_env_reads_a_set_key() {
+    let var = "FF_TEST_OPENAI_KEY_SET";
+    std::env::set_var(var, "sk-abc123");
+    assert_eq!(super::api_key_from_env(var), Some("sk-abc123".to_string()));
+    std::env::remove_var(var);
+}
+
+#[test]
+fn api_key_from_env_treats_empty_as_keyless() {
+    let var = "FF_TEST_OPENAI_KEY_EMPTY";
+    std::env::set_var(var, "");
+    assert_eq!(super::api_key_from_env(var), None);
+    std::env::remove_var(var);
+}
+
+#[test]
+fn api_key_from_env_unset_is_none() {
+    assert_eq!(
+        super::api_key_from_env("FF_TEST_OPENAI_KEY_NEVER_SET"),
+        None
+    );
+}
+
+use ff_core::{ProviderConfig, ProviderKind, ReasoningEffort};
+use ff_llm::{ChatMessage, ChatRequest, Provider};
+use wiremock::matchers::{method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
+
+async fn siliconflow_body(thinking: bool, effort: ReasoningEffort) -> serde_json::Value {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("data: [DONE]\n\n"))
+        .mount(&server)
+        .await;
+
+    let config = ProviderConfig {
+        kind: ProviderKind::SiliconFlow,
+        base_url: Some(server.uri()),
+        model: "zai-org/GLM-5.2".into(),
+        reasoning_effort: effort,
+        ..Default::default()
+    };
+    let provider = super::build_provider(&config);
+    let req = ChatRequest {
+        model: config.model.clone(),
+        messages: vec![ChatMessage::text("user", "hi")],
+        tools: Vec::new(),
+        thinking,
+        max_tokens: None,
+        cache_messages: false,
+    };
+    let _ = provider.chat_stream(req).await.expect("send succeeds");
+    let reqs = server.received_requests().await.expect("requests recorded");
+    serde_json::from_slice(&reqs[0].body).expect("body is json")
+}
+
+#[tokio::test]
+async fn siliconflow_cli_provider_emits_thinking_budget() {
+    let body = siliconflow_body(true, ReasoningEffort::Medium).await;
+    assert_eq!(body["thinking_budget"], 4096);
+    assert!(body.get("enable_thinking").is_none());
+}
+
+#[tokio::test]
+async fn siliconflow_cli_provider_effort_dial_is_honored() {
+    let body = siliconflow_body(true, ReasoningEffort::Low).await;
+    assert_eq!(body["thinking_budget"], 1024);
+}
+
+#[tokio::test]
+async fn siliconflow_cli_provider_thinking_off_disables_reasoning() {
+    let body = siliconflow_body(false, ReasoningEffort::Medium).await;
+    assert_eq!(body["enable_thinking"], false);
+    assert!(body.get("thinking_budget").is_none());
+}
+
+#[test]
+fn bedrock_cli_provider_forwards_reasoning_effort() {
+    let config = ProviderConfig {
+        kind: ProviderKind::Bedrock,
+        model: "anthropic.claude-3-5-sonnet-20241022-v2:0".into(),
+        reasoning_effort: ReasoningEffort::High,
+        ..Default::default()
+    };
+    let provider = super::build_bedrock_provider(&config, true);
+    assert_eq!(provider.reasoning_effort(), ReasoningEffort::High);
+    assert!(
+        provider.supports_documents(),
+        "documents flag forwarded to the Bedrock provider"
+    );
+}
+
+#[test]
+fn bedrock_cli_provider_default_effort_is_medium() {
+    let config = ProviderConfig {
+        kind: ProviderKind::Bedrock,
+        model: "anthropic.claude-3-5-sonnet-20241022-v2:0".into(),
+        ..Default::default()
+    };
+    let provider = super::build_bedrock_provider(&config, true);
+    assert_eq!(provider.reasoning_effort(), ReasoningEffort::Medium);
+}
