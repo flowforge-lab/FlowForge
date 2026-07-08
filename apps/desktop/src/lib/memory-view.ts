@@ -72,9 +72,13 @@ const EMPTY_CATEGORIES: MemoryCategories = {
 
 /**
  * Parse the curated `MEMORY.md` body into the three categories. A section runs
- * from its `## <Heading>` line to the next `## ` heading (or end of file); the
- * heading line itself is dropped and the body is trimmed. Headings are matched
- * case-insensitively. Missing headings yield "".
+ * from its `## <Heading>` line to the next *known-stratum* `## ` heading (or end
+ * of file); the stratum heading line itself is dropped and the body is trimmed.
+ * Headings are matched case-insensitively. Missing headings yield "".
+ *
+ * A `## X` whose text is not one of the three strata is a note's own sub-heading
+ * (`memory_write` encourages these), not a section boundary — it stays with the
+ * current stratum's body rather than ending the section (#774).
  */
 export function parseCategories(body: string | null): MemoryCategories {
   if (!body) return { ...EMPTY_CATEGORIES };
@@ -95,8 +99,13 @@ export function parseCategories(body: string | null): MemoryCategories {
       const match = MEMORY_CATEGORY_META.find(
         (m) => m.heading.toLowerCase() === name,
       );
-      current = match ? match.id : null;
-      continue;
+      if (match) {
+        // Known stratum → start its section, dropping the heading line.
+        current = match.id;
+        continue;
+      }
+      // Unknown `## X` → a note's own sub-heading; fall through and keep it as
+      // body under the current stratum (don't reset `current`).
     }
     if (current) buffers[current].push(line);
   }
