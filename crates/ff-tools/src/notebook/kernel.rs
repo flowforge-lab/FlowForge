@@ -20,7 +20,7 @@
 //! SIGKILL after a grace window if the sentinel still does not arrive. Mirrors
 //! [`crate::process::ProcessSupervisor`]'s cross-platform kill patterns.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -41,23 +41,63 @@ const MAX_CELL_OUTPUT: usize = 16 * 1024;
 const SENTINEL_PREFIX: &str = "__FF_CELL_END_";
 const SENTINEL_SUFFIX: &str = "__";
 
+/// Marker line prefix the driver prints (one per saved figure) when a cell
+/// produced matplotlib output. The absolute PNG path follows. Stripped from the
+/// cell's visible output and surfaced as [`CellResult::images`] (Phase 3, #856).
+const IMAGE_MARKER: &str = "__FF_IMAGE__";
+/// Marker line prefix the `inspect` snippet prints, followed by a JSON array of
+/// `{name,type,repr}`. Stripped from visible output → [`CellResult::vars_json`].
+const VARS_MARKER: &str = "__FF_VARS__";
+
+/// Max chars kept of each variable's `repr` in the `inspect` dump, so a huge
+/// object (a big DataFrame) can't blow the result size.
+const MAX_REPR_LEN: usize = 200;
+
 /// The Python driver loop, formatted once per kernel with its nonce. Reads
 /// length-prefixed cells from stdin, `exec`s each into a persistent namespace,
-/// and emits the nonce sentinel (`ok`/`error`) after each. Runs unbuffered.
-fn driver_source(nonce: &str) -> String {
-    // {NONCE} is substituted; everything else is literal Python. Keep it small
-    // and dependency-free (stdlib only).
+/// and emits the nonce sentinel (`ok`/`error`) after each. After a successful
+/// cell, if matplotlib is loaded, open figures are saved under `img_dir_literal`
+/// (a JSON/Python string literal, already quoted) and announced with
+/// [`IMAGE_MARKER`] lines. Runs unbuffered.
+fn driver_source(nonce: &str, img_dir_literal: &str) -> String {
+    // {nonce}/{img_dir}/{image_marker} are substituted; everything else is
+    // literal Python. Keep it small and dependency-free (stdlib only; matplotlib
+    // is used only if the cell itself imported it).
     format!(
         r#"
-import sys, traceback
+import sys, traceback, os
 _ns = {{"__name__": "__cell__"}}
 # Funnel stderr into stdout so warnings / prints-to-stderr surface in the drained
 # stream (and can't deadlock on an undrained stderr pipe).
 sys.stderr = sys.stdout
 _end = "{prefix}{nonce}{suffix}"
+_img_dir = {img_dir}
+_img_seq = 0
 def _emit(status):
     sys.stdout.write("\n" + _end + status + "\n")
     sys.stdout.flush()
+def _save_figures():
+    # Only if the cell imported matplotlib; never import it ourselves.
+    global _img_seq
+    _mpl = sys.modules.get("matplotlib")
+    if _mpl is None:
+        return
+    try:
+        import matplotlib.pyplot as _plt
+        _nums = _plt.get_fignums()
+        if not _nums:
+            return
+        os.makedirs(_img_dir, exist_ok=True)
+        for _num in _nums:
+            _fig = _plt.figure(_num)
+            _p = os.path.join(_img_dir, "fig-" + str(_img_seq) + ".png")
+            _img_seq += 1
+            _fig.savefig(_p)
+            sys.stdout.write("\n{image_marker}" + _p + "\n")
+        _plt.close("all")
+    except Exception:
+        # Image saving is best-effort; a failure never fails the cell.
+        pass
 while True:
     _hdr = sys.stdin.readline()
     if not _hdr:
@@ -73,6 +113,7 @@ while True:
     _src = sys.stdin.read(_n)
     try:
         exec(compile(_src, "<cell>", "exec"), _ns)
+        _save_figures()
         sys.stdout.flush()
         sys.stderr.flush()
         _emit("ok")
@@ -84,6 +125,41 @@ while True:
         prefix = SENTINEL_PREFIX,
         nonce = nonce,
         suffix = SENTINEL_SUFFIX,
+        img_dir = img_dir_literal,
+        image_marker = IMAGE_MARKER,
+    )
+}
+/// Python snippet the `inspect` action feeds to the kernel. Walks the persistent
+/// namespace, skips underscore-private names / modules / callables / classes,
+/// and prints a single [`VARS_MARKER`] line with a JSON array of
+/// `{name,type,repr}` (each repr truncated). Runs in `_ns` like any cell, but is
+/// side-effect-free w.r.t. user data (it only reads), so `inspect` is ReadOnly.
+fn inspect_snippet() -> String {
+    format!(
+        r#"
+import json as _json, sys as _sys
+# This snippet is exec'd with the persistent namespace as its globals, so
+# globals() IS that namespace; introspect it directly.
+_g = dict(globals())
+_vars = []
+for _k in sorted(_g.keys()):
+    if _k.startswith("_"):
+        continue
+    _v = _g[_k]
+    _t = type(_v).__name__
+    if _t in ("module", "function", "builtin_function_or_method", "type", "method"):
+        continue
+    try:
+        _r = repr(_v)
+    except Exception:
+        _r = "<unrepresentable>"
+    if len(_r) > {max_repr}:
+        _r = _r[:{max_repr}] + "..."
+    _vars.append({{"name": _k, "type": _t, "repr": _r}})
+_sys.stdout.write("\n{vars_marker}" + _json.dumps(_vars) + "\n")
+"#,
+        max_repr = MAX_REPR_LEN,
+        vars_marker = VARS_MARKER,
     )
 }
 
@@ -99,6 +175,35 @@ pub struct CellResult {
     /// `true` when the cell raised (the driver reported `error`).
     pub errored: bool,
     pub truncated: bool,
+    /// Absolute paths of any figures the cell saved (matplotlib). Empty for a
+    /// cell that produced no images. The paths live under the kernel's temp dir
+    /// and are cleaned when the kernel stops (Phase 3, #856).
+    pub images: Vec<String>,
+    /// JSON array of `{name,type,repr}` when this cell was an `inspect` run;
+    /// `None` for an ordinary cell.
+    pub vars_json: Option<String>,
+}
+
+/// Strip [`IMAGE_MARKER`] / [`VARS_MARKER`] lines out of a drained cell body,
+/// returning `(clean_output, image_paths, vars_json)`. A marker is only honoured
+/// as a whole line (prefix at the start of a line), so ordinary text that merely
+/// contains the marker substring mid-line is left untouched.
+pub(super) fn extract_markers(buf: &str) -> (String, Vec<String>, Option<String>) {
+    let mut clean = String::with_capacity(buf.len());
+    let mut images = Vec::new();
+    let mut vars_json = None;
+    for line in buf.split_inclusive('\n') {
+        let trimmed = line.strip_suffix('\n').unwrap_or(line);
+        if let Some(path) = trimmed.strip_prefix(IMAGE_MARKER) {
+            images.push(path.to_string());
+        } else if let Some(json) = trimmed.strip_prefix(VARS_MARKER) {
+            // Last one wins (there is only ever one per inspect run).
+            vars_json = Some(json.to_string());
+        } else {
+            clean.push_str(line);
+        }
+    }
+    (clean.trim_end_matches('\n').to_string(), images, vars_json)
 }
 
 /// Split accumulated stdout at the first sentinel line for `nonce`. Returns the
@@ -142,6 +247,8 @@ pub struct KernelState {
     /// Set once the kernel is known unusable (died / killed after timeout).
     pub dead: bool,
     pub kernel_id: String,
+    /// Temp directory where this kernel's saved figures land; removed on stop.
+    img_dir: PathBuf,
 }
 
 impl KernelState {
@@ -152,10 +259,20 @@ impl KernelState {
         let kernel_id = format!("kernel-{}", &nonce[..8]);
         let python = crate::python::PythonTool::interpreter(dir);
 
+        // Per-kernel scratch dir for saved figures (matplotlib). Created lazily by
+        // the driver only if a cell actually saves an image; cleaned on stop.
+        let img_dir = std::env::temp_dir()
+            .join("flowforge-notebook")
+            .join(&kernel_id);
+        // JSON-encode the path so it's a safe Python string literal (handles
+        // quotes/backslashes/unicode identically in JSON and Python).
+        let img_dir_literal = serde_json::to_string(&img_dir.to_string_lossy())
+            .unwrap_or_else(|_| "\"\"".to_string());
+
         let mut cmd = Command::new(&python);
         cmd.arg("-u") // unbuffered stdio so sentinels arrive promptly
             .arg("-c")
-            .arg(driver_source(&nonce))
+            .arg(driver_source(&nonce, &img_dir_literal))
             .current_dir(dir)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -181,6 +298,7 @@ impl KernelState {
             execution_count: 0,
             dead: false,
             kernel_id,
+            img_dir,
         })
     }
 
@@ -204,14 +322,7 @@ impl KernelState {
         }
 
         match timeout(Duration::from_secs(timeout_secs), self.drain_to_sentinel()).await {
-            Ok(Ok((output, errored))) => {
-                let (output, truncated) = cap_output(output);
-                Ok(CellResult {
-                    output,
-                    errored,
-                    truncated,
-                })
-            }
+            Ok(Ok((output, errored))) => Ok(build_cell_result(output, errored)),
             Ok(Err(e)) => {
                 self.dead = true;
                 Err(e)
@@ -224,12 +335,7 @@ impl KernelState {
                     timeout(Duration::from_millis(200), self.drain_to_sentinel()).await
                 {
                     // KeyboardInterrupt landed and the driver recovered.
-                    let (output, truncated) = cap_output(output);
-                    return Ok(CellResult {
-                        output,
-                        errored: true,
-                        truncated,
-                    });
+                    return Ok(build_cell_result(output, true));
                 }
                 self.kill();
                 self.dead = true;
@@ -238,6 +344,22 @@ impl KernelState {
                 ))
             }
         }
+    }
+
+    /// Run the introspection snippet (`inspect` action) and return the JSON array
+    /// of `{name,type,repr}` the kernel emitted, or an error if it didn't. The
+    /// snippet only reads the namespace, so `inspect` stays ReadOnly.
+    pub async fn inspect(&mut self, timeout_secs: u64) -> Result<String, String> {
+        // Introspection is not a user cell; undo run_cell's counter bump so
+        // `execution_count` keeps meaning "cells the user ran".
+        let res = self.run_cell(&inspect_snippet(), timeout_secs).await?;
+        self.execution_count = self.execution_count.saturating_sub(1);
+        if res.errored {
+            return Err(format!("variable inspection failed:\n{}", res.output));
+        }
+        // The snippet prints a VARS_MARKER line, which `build_cell_result` peels
+        // off into `vars_json`. Absent (shouldn't happen on success) → empty set.
+        Ok(res.vars_json.unwrap_or_else(|| "[]".to_string()))
     }
 
     /// Read stdout lines, accumulating, until this kernel's sentinel appears.
@@ -297,10 +419,27 @@ impl KernelState {
         self.dead = true;
         // Reap so we don't leave a zombie; ignore the result.
         let _ = self.child.wait().await;
+        // Best-effort cleanup of this kernel's saved figures.
+        let _ = std::fs::remove_dir_all(&self.img_dir);
     }
 
     pub fn pid(&self) -> Option<u32> {
         self.pid
+    }
+}
+
+/// Build a [`CellResult`] from a drained cell body: strip image/vars markers,
+/// then cap the remaining visible output. Shared by the normal and
+/// interrupt-recovery paths of [`KernelState::run_cell`].
+fn build_cell_result(raw: String, errored: bool) -> CellResult {
+    let (clean, images, vars_json) = extract_markers(&raw);
+    let (output, truncated) = cap_output(clean);
+    CellResult {
+        output,
+        errored,
+        truncated,
+        images,
+        vars_json,
     }
 }
 

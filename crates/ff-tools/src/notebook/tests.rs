@@ -48,13 +48,75 @@ fn safety_matches_action() {
     let s = |action: &str| tool.safety(&serde_json::json!({ "action": action }));
     assert_eq!(s("start"), Safety::Dangerous);
     assert_eq!(s("run_cell"), Safety::Dangerous);
+    assert_eq!(s("run_all"), Safety::Dangerous);
+    assert_eq!(s("restart"), Safety::Dangerous);
     assert_eq!(s("status"), Safety::ReadOnly);
+    assert_eq!(s("inspect"), Safety::ReadOnly);
     assert_eq!(s("stop"), Safety::Write);
     // Unknown / missing action is conservatively Dangerous.
     assert_eq!(s("bogus"), Safety::Dangerous);
-    // min_safety is ReadOnly (status is advertised in Plan); max is Dangerous.
+    // min_safety is ReadOnly (status/inspect advertised in Plan); max is Dangerous.
     assert_eq!(tool.min_safety(), Safety::ReadOnly);
     assert_eq!(tool.max_safety(), Safety::Dangerous);
+}
+
+// --- Marker extraction + meta trailer (pure; no python) ---
+
+#[test]
+fn extract_markers_pulls_images_and_vars_out_of_output() {
+    use super::kernel::extract_markers;
+    let buf = "line one\n__FF_IMAGE__/tmp/k/fig-0.png\nline two\n__FF_VARS__[{\"name\":\"a\"}]\n";
+    let (clean, images, vars) = extract_markers(buf);
+    assert_eq!(clean, "line one\nline two");
+    assert_eq!(images, vec!["/tmp/k/fig-0.png".to_string()]);
+    assert_eq!(vars.as_deref(), Some("[{\"name\":\"a\"}]"));
+}
+
+#[test]
+fn extract_markers_ignores_midline_lookalikes() {
+    use super::kernel::extract_markers;
+    // A marker substring that is NOT at the start of a line stays in output.
+    let buf = "print this __FF_IMAGE__not-a-marker\n";
+    let (clean, images, vars) = extract_markers(buf);
+    assert_eq!(clean, "print this __FF_IMAGE__not-a-marker");
+    assert!(images.is_empty());
+    assert!(vars.is_none());
+}
+
+#[test]
+fn meta_trailer_absent_when_nothing_to_report() {
+    assert!(super::meta_trailer(&[], None).is_none());
+    assert!(super::meta_trailer(&[], Some("[]")).is_none());
+    assert!(super::meta_trailer(&[], Some("")).is_none());
+}
+
+#[test]
+fn meta_trailer_carries_images_and_vars_as_json() {
+    let images = vec!["/tmp/k/fig-0.png".to_string()];
+    let trailer = super::meta_trailer(
+        &images,
+        Some("[{\"name\":\"a\",\"type\":\"int\",\"repr\":\"1\"}]"),
+    )
+    .expect("trailer present");
+    assert!(trailer.contains("<<<FF_NB_META"));
+    assert!(trailer.trim_end().ends_with("FF_NB_META"));
+    // The JSON body is parseable and carries both arrays.
+    let body = trailer
+        .lines()
+        .find(|l| l.trim_start().starts_with('{'))
+        .expect("json line");
+    let v: serde_json::Value = serde_json::from_str(body).expect("valid JSON");
+    assert_eq!(v["images"][0]["path"], "/tmp/k/fig-0.png");
+    assert_eq!(v["images"][0]["mediaType"], "image/png");
+    assert_eq!(v["variables"][0]["name"], "a");
+}
+
+#[test]
+fn format_variables_renders_table_or_empty() {
+    assert!(super::format_variables("[]").contains("no user variables"));
+    let out = super::format_variables("[{\"name\":\"a\",\"type\":\"int\",\"repr\":\"5\"}]");
+    assert!(out.contains("1 variable(s)"));
+    assert!(out.contains("a: int = 5"));
 }
 
 // --- Kernel round-trip (real python3; skips gracefully when absent) ---
@@ -81,11 +143,14 @@ async fn kernel_round_trip_persists_state() {
     sup.start(sid, dir.path()).await.expect("kernel starts");
 
     // state persists across cells: define in one, use in the next.
-    let r1 = sup.run_cell(sid, "x = 41", 30).await.expect("cell 1 runs");
+    let r1 = sup
+        .run_cell(sid, None, "x = 41", 30)
+        .await
+        .expect("cell 1 runs");
     assert!(!r1.errored, "assignment shouldn't error: {r1:?}");
 
     let r2 = sup
-        .run_cell(sid, "print(x + 1)", 30)
+        .run_cell(sid, None, "print(x + 1)", 30)
         .await
         .expect("cell 2 runs");
     assert!(!r2.errored, "print shouldn't error: {r2:?}");
@@ -97,7 +162,7 @@ async fn kernel_round_trip_persists_state() {
 
     // an exception is reported as errored, kernel survives
     let r3 = sup
-        .run_cell(sid, "raise ValueError('boom')", 30)
+        .run_cell(sid, None, "raise ValueError('boom')", 30)
         .await
         .expect("cell 3 runs");
     assert!(r3.errored);
@@ -108,12 +173,87 @@ async fn kernel_round_trip_persists_state() {
     assert!(status.contains("running"), "status: {status}");
 
     // stop removes it
-    sup.stop(sid).await.expect("stop succeeds");
+    sup.stop(sid, None).await.expect("stop succeeds");
     assert!(sup.status(sid).await.contains("no kernel"));
 }
 
 #[tokio::test]
-async fn start_refuses_to_clobber_a_live_kernel() {
+async fn start_allows_up_to_three_then_caps() {
+    if !python3_available() {
+        eprintln!("skipping: python3 not on PATH");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let sup = KernelSupervisor::new();
+    // Three kernels per session are allowed.
+    let k1 = sup.start("s", dir.path()).await.expect("1st starts");
+    let k2 = sup.start("s", dir.path()).await.expect("2nd starts");
+    let k3 = sup.start("s", dir.path()).await.expect("3rd starts");
+    assert!(k1 != k2 && k2 != k3 && k1 != k3, "ids are distinct");
+    // The fourth is refused by the cap.
+    let err = sup.start("s", dir.path()).await.unwrap_err();
+    assert!(err.contains("cap"), "got: {err}");
+    assert_eq!(sup.reap_session("s").await, 3, "all three reaped");
+}
+
+#[tokio::test]
+async fn kernels_are_isolated_and_selected_by_id() {
+    if !python3_available() {
+        eprintln!("skipping: python3 not on PATH");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let sup = KernelSupervisor::new();
+    let a = sup.start("s", dir.path()).await.unwrap();
+    let b = sup.start("s", dir.path()).await.unwrap();
+
+    // Define a var only in kernel a.
+    sup.run_cell("s", Some(&a), "secret = 123", 30)
+        .await
+        .unwrap();
+    // b has no such var → NameError.
+    let rb = sup
+        .run_cell("s", Some(&b), "print(secret)", 30)
+        .await
+        .unwrap();
+    assert!(rb.errored && rb.output.contains("NameError"), "got: {rb:?}");
+    // a still has it.
+    let ra = sup
+        .run_cell("s", Some(&a), "print(secret)", 30)
+        .await
+        .unwrap();
+    assert!(ra.output.contains("123"), "got: {ra:?}");
+
+    // Omitting `kernel` with two live kernels is an ambiguity error.
+    let amb = sup.run_cell("s", None, "pass", 30).await.unwrap_err();
+    assert!(amb.contains("multiple kernels"), "got: {amb}");
+
+    sup.reap_session("s").await;
+}
+
+#[tokio::test]
+async fn restart_clears_state_and_changes_id() {
+    if !python3_available() {
+        eprintln!("skipping: python3 not on PATH");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let sup = KernelSupervisor::new();
+    let id1 = sup.start("s", dir.path()).await.unwrap();
+    sup.run_cell("s", None, "x = 1", 30).await.unwrap();
+
+    let id2 = sup.restart("s", None, dir.path()).await.expect("restart");
+    assert_ne!(id1, id2, "restart assigns a fresh kernel id");
+
+    // The old namespace is gone.
+    let r = sup.run_cell("s", None, "print(x)", 30).await.unwrap();
+    assert!(r.errored && r.output.contains("NameError"), "got: {r:?}");
+
+    sup.stop("s", None).await.unwrap();
+}
+
+#[tokio::test]
+async fn inspect_dumps_user_variables() {
     if !python3_available() {
         eprintln!("skipping: python3 not on PATH");
         return;
@@ -121,9 +261,81 @@ async fn start_refuses_to_clobber_a_live_kernel() {
     let dir = tempfile::tempdir().unwrap();
     let sup = KernelSupervisor::new();
     sup.start("s", dir.path()).await.unwrap();
-    let err = sup.start("s", dir.path()).await.unwrap_err();
-    assert!(err.contains("already running"), "got: {err}");
-    sup.stop("s").await.unwrap();
+    sup.run_cell("s", None, "a = 5\nb = 'hi'\nimport os", 30)
+        .await
+        .unwrap();
+
+    let vars_json = sup.inspect("s", None, 30).await.expect("inspect");
+    // Parse the dump (avoids brittle whitespace assumptions in json.dumps output).
+    let vars: Vec<serde_json::Value> = serde_json::from_str(&vars_json).expect("valid JSON dump");
+    let by_name = |n: &str| vars.iter().find(|v| v["name"] == n).cloned();
+    // User vars present with type; imported module and dunders excluded.
+    assert_eq!(by_name("a").unwrap()["type"], "int", "got: {vars_json}");
+    assert_eq!(by_name("b").unwrap()["type"], "str", "got: {vars_json}");
+    assert!(by_name("os").is_none(), "module excluded; got: {vars_json}");
+
+    // inspect must not count as a user cell.
+    let status = sup.status("s").await;
+    assert!(status.contains("cells executed=1"), "status: {status}");
+
+    sup.stop("s", None).await.unwrap();
+}
+
+fn matplotlib_available() -> bool {
+    std::process::Command::new("python3")
+        .args(["-c", "import matplotlib"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+#[tokio::test]
+async fn run_cell_detects_matplotlib_image() {
+    if !python3_available() || !matplotlib_available() {
+        eprintln!("skipping: python3 + matplotlib not available");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let sup = Arc::new(KernelSupervisor::new());
+    let tool = NotebookTool::new(Arc::clone(&sup));
+    let sid = "img";
+    tool.run_with_session(serde_json::json!({"action": "start"}), dir.path(), sid)
+        .await;
+
+    let code = "import matplotlib\nmatplotlib.use('Agg')\nimport matplotlib.pyplot as plt\nplt.plot([1,2,3])";
+    let res = tool
+        .run_with_session(
+            serde_json::json!({"action": "run_cell", "code": code}),
+            dir.path(),
+            sid,
+        )
+        .await;
+    assert!(res.success, "run_cell failed: {:?}", res);
+    // The result carries the FF_NB_META trailer with an image path.
+    assert!(
+        res.content.contains("<<<FF_NB_META"),
+        "got: {}",
+        res.content
+    );
+    assert!(res.content.contains("image/png"), "got: {}", res.content);
+    let path_line = res
+        .content
+        .lines()
+        .find(|l| l.trim_start().starts_with('{'))
+        .expect("meta json line");
+    let meta: serde_json::Value = serde_json::from_str(path_line).expect("valid meta JSON");
+    let img_path = meta["images"][0]["path"].as_str().expect("image path");
+    assert!(
+        std::path::Path::new(img_path).exists(),
+        "saved figure should exist on disk: {img_path}"
+    );
+
+    // Stopping the kernel cleans up its image temp dir.
+    sup.stop(sid, None).await.unwrap();
+    assert!(
+        !std::path::Path::new(img_path).exists(),
+        "image temp dir should be cleaned on stop: {img_path}"
+    );
 }
 
 #[tokio::test]
@@ -148,7 +360,7 @@ async fn run_cell_times_out_and_interrupts() {
     let dir = tempfile::tempdir().unwrap();
     let sup = KernelSupervisor::new();
     sup.start("s", dir.path()).await.unwrap();
-    let res = sup.run_cell("s", "while True: pass", 1).await;
+    let res = sup.run_cell("s", None, "while True: pass", 1).await;
     match res {
         // Preferred outcome: SIGINT raised KeyboardInterrupt, the driver caught it
         // and emitted the error sentinel, so the cell is reported errored and the
@@ -158,9 +370,9 @@ async fn run_cell_times_out_and_interrupts() {
             assert!(cell.output.contains("KeyboardInterrupt"), "got: {cell:?}");
             assert!(sup.status("s").await.contains("running"));
             // and it still works afterward
-            let r = sup.run_cell("s", "print(1+1)", 30).await.unwrap();
+            let r = sup.run_cell("s", None, "print(1+1)", 30).await.unwrap();
             assert!(r.output.contains("2"));
-            sup.stop("s").await.unwrap();
+            sup.stop("s", None).await.unwrap();
         }
         // Fallback: SIGINT didn't land in the grace window, so the kernel was
         // killed and the call reports a timeout.
@@ -298,7 +510,7 @@ async fn run_all_executes_cells_sequentially() {
         res.content
     );
 
-    sup.stop(sid).await.unwrap();
+    sup.stop(sid, None).await.unwrap();
 }
 
 #[tokio::test]
@@ -346,5 +558,5 @@ async fn run_all_stops_on_error() {
         "third cell should not have run"
     );
 
-    sup.stop(sid).await.unwrap();
+    sup.stop(sid, None).await.unwrap();
 }
