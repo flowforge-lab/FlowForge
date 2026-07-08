@@ -572,6 +572,49 @@ fn quarantine_registry(path: &Path) {
     }
 }
 
+/// When the live registry is corrupt or absent, try to recover from the newest
+/// parseable backup. Scans the registry's parent dir for `provider-registry.<ts>.bak`
+/// files (the same glob that [`backup_registry_at`] writes), tries each in
+/// timestamp-descending order, and returns the first one that parses successfully.
+/// Returns `None` if no valid backup is found, and the caller should fall through
+/// to legacy migration or the default registry.
+fn try_recover_from_backup(reg_path: &Path) -> Option<ProviderRegistry> {
+    let parent = reg_path.parent()?;
+    let entries = fs::read_dir(parent).ok()?;
+    let mut baks: Vec<(u64, std::path::PathBuf)> = entries
+        .filter_map(|e| e.ok())
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().to_string();
+            if !name.starts_with("provider-registry.") || !name.ends_with(".bak") {
+                return None;
+            }
+            let ts_str = name
+                .strip_prefix("provider-registry.")?
+                .strip_suffix(".bak")?;
+            let ts: u64 = ts_str.parse().ok()?;
+            Some((ts, e.path()))
+        })
+        .collect();
+
+    if baks.is_empty() {
+        return None;
+    }
+
+    baks.sort_unstable_by_key(|entry| std::cmp::Reverse(entry.0));
+
+    for (_, backup_path) in baks {
+        if let Ok(raw) = fs::read_to_string(&backup_path) {
+            if let Some(registry) = ProviderRegistry::parse_lenient(&raw) {
+                tracing::info!(backup = %backup_path.display(),
+                    "recovered provider registry from backup");
+                return Some(registry);
+            }
+        }
+    }
+
+    None
+}
+
 /// Path-injectable core of [`load_or_migrate_registry`] so tests can drive it with
 /// tempdir paths instead of the real config dir.
 fn load_or_migrate_registry_at(
@@ -579,21 +622,23 @@ fn load_or_migrate_registry_at(
     cfg_path: Option<PathBuf>,
 ) -> ProviderRegistry {
     let mut registry = match read_registry_file(reg_path.as_deref()) {
-        RegistryRead::Loaded(registry) => registry,
-        // Only a genuinely absent registry falls through to legacy migration; a
-        // quarantined (corrupt) one seeds a clean default so stale legacy state is
-        // never re-migrated over a registry the user was actively using.
-        RegistryRead::Absent => cfg_path
-            .as_ref()
-            .and_then(|p| fs::read_to_string(p).ok())
-            .and_then(|s| serde_json::from_str::<ProviderConfig>(&s).ok())
-            .map(build_migrated_registry)
+        RegistryRead::Loaded(r) => r,
+        RegistryRead::Absent => reg_path
+            .as_deref()
+            .and_then(try_recover_from_backup)
+            .unwrap_or_else(|| {
+                cfg_path
+                    .as_ref()
+                    .and_then(|p| fs::read_to_string(p).ok())
+                    .and_then(|s| serde_json::from_str::<ProviderConfig>(&s).ok())
+                    .map(build_migrated_registry)
+                    .unwrap_or_default()
+            }),
+        RegistryRead::Corrupt => reg_path
+            .as_deref()
+            .and_then(try_recover_from_backup)
             .unwrap_or_default(),
-        RegistryRead::Corrupt => ProviderRegistry::default(),
     };
-    // Run any pending one-time migrations in memory (#633 local-thinking flip);
-    // the bumped schema_version persists on the next mutation via lazy save, so
-    // construction stays write-free (asserted by the load tests below).
     registry.migrate();
     registry
 }
