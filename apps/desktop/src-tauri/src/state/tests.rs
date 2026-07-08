@@ -1596,6 +1596,83 @@ fn partially_corrupt_registry_salvages_good_connection() {
 }
 
 #[test]
+fn load_recovers_from_newest_valid_backup_among_corrupt_baks() {
+    let tmp = tempfile::tempdir().unwrap();
+    let reg_path = tmp.path().join("provider-registry.json");
+    fs::write(&reg_path, "corrupt json").unwrap();
+
+    fs::write(
+        tmp.path().join("provider-registry.1000.bak"),
+        r#"{"active":"future","connections":[
+            {"id":"future","kind":"gemini","displayName":"Gemini","model":"g","hasKey":true}
+        ]}"#,
+    )
+    .unwrap();
+
+    fs::write(
+        tmp.path().join("provider-registry.2000.bak"),
+        r#"{"active":"middle","connections":[
+            {"id":"middle","kind":"ollama","displayName":"Ollama","model":"llama3","hasKey":false}
+        ]}"#,
+    )
+    .unwrap();
+
+    fs::write(
+        tmp.path().join("provider-registry.3000.bak"),
+        "also corrupt",
+    )
+    .unwrap();
+
+    let loaded = load_or_migrate_registry_at(Some(reg_path.clone()), None);
+
+    assert_eq!(loaded.active, "middle");
+    assert_eq!(loaded.connections.len(), 1);
+    assert_eq!(loaded.connections[0].model, "llama3");
+}
+
+#[test]
+fn load_falls_back_to_default_when_all_baks_corrupt() {
+    let tmp = tempfile::tempdir().unwrap();
+    let reg_path = tmp.path().join("provider-registry.json");
+    fs::write(&reg_path, "corrupt json").unwrap();
+
+    fs::write(
+        tmp.path().join("provider-registry.1000.bak"),
+        "first corrupt",
+    )
+    .unwrap();
+    fs::write(
+        tmp.path().join("provider-registry.2000.bak"),
+        "second corrupt",
+    )
+    .unwrap();
+
+    let loaded = load_or_migrate_registry_at(Some(reg_path.clone()), None);
+
+    assert_eq!(loaded, ProviderRegistry::default());
+}
+
+#[test]
+fn load_recovers_from_backup_when_registry_completely_absent() {
+    let tmp = tempfile::tempdir().unwrap();
+    let reg_path = tmp.path().join("provider-registry.json");
+
+    fs::write(
+        tmp.path().join("provider-registry.1000.bak"),
+        r#"{"active":"backup","connections":[
+            {"id":"backup","kind":"openai","displayName":"OpenAI","model":"gpt-4","hasKey":true}
+        ]}"#,
+    )
+    .unwrap();
+
+    let loaded = load_or_migrate_registry_at(Some(reg_path), None);
+
+    assert_eq!(loaded.active, "backup");
+    assert_eq!(loaded.connections.len(), 1);
+    assert_eq!(loaded.connections[0].kind, ff_core::ProviderKind::OpenAi);
+}
+
+#[test]
 fn write_atomic_replaces_existing_and_leaves_no_tmp() {
     let tmp = tempfile::tempdir().unwrap();
     let path = tmp.path().join("provider-registry.json");
@@ -2314,7 +2391,7 @@ fn seed_gate_treats_corrupt_stamp_as_mismatch() {
 #[test]
 fn seed_gate_runs_when_stamp_path_is_none() {
     // No home dir → no stamp path → degrade to "always run" (pre-gate
-    // behaviour), never panicking.
+    // behavior), never panicking.
     let root = tempfile::tempdir().unwrap();
     let phenos = root.path().join("phenos");
     let skills = root.path().join("skills");
