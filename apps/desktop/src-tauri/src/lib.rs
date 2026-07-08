@@ -2,8 +2,8 @@
 //! all business logic lives in the `ff-*` crates. Each handler deserializes,
 //! calls into a crate, and returns. Streaming responses go out as Tauri events.
 
-mod dev_update_watcher;
 mod git_watch;
+mod observer_host;
 mod optimize;
 mod secrets;
 mod state;
@@ -434,6 +434,12 @@ fn delete_session(state: State<'_, Arc<AppState>>, session_id: String) {
     state.store.delete_session(&session_id);
     state.reap_session_processes(&session_id);
     state.reap_session_kernels(&session_id);
+    // Tear down any session-scoped observers (#709). Synchronous and cheap:
+    // the supervisor cancels each watcher's task and drops the broadcast
+    // sender, which wakes the per-session subscriber loop with a closed
+    // channel. The subscriber task itself is fire-and-forget and exits on
+    // its next iteration.
+    state.reap_session_observers(&session_id);
     // Release this session's per-workspace MCP instance refs, evicting any instance no
     // live session references (RFC 0018 §4.3). Spawned (not awaited) like the process
     // reap above: `delete_session` is a sync Tauri command that runs off the reactor on
@@ -2897,37 +2903,84 @@ async fn install_update(app: tauri::AppHandle) -> CmdResult<()> {
     app.restart();
 }
 
+/// The well-known dev-update directory the supervisor watches for the
+/// `localUpdateChannel` flag. The path lives here (instead of the deleted
+/// `dev_update_watcher` module) so the wiring below can build an
+/// [`ff_observer::ObserverSpec`] without a separate constant. Matches
+/// `scripts/dev-release.sh`.
+pub(crate) fn dev_update_dir() -> std::path::PathBuf {
+    dirs::config_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join("flowforge")
+        .join("dev-update")
+}
+
+/// Sentinel session id used to host the long-lived dev-update
+/// `FileSource` (#709). It is not a real session, so the supervisor will
+/// keep the source alive for the app's lifetime and never reap it on a
+/// `delete_session` call.
+const DEV_UPDATE_SESSION: &str = "__dev_update__";
+
 /// Start the local dev-update file watcher (#705, Phase 2). Called by the FE on
 /// boot when the `localUpdateChannel` experimental flag is on. The watcher observes
-/// `~/.config/flowforge/dev-update/latest.json` via kqueue/inotify and emits
+/// `~/.config/flowforge/dev-update/latest.json` and emits
 /// `update:local-feed-changed` instantly when the file is written, so the FE can
 /// trigger an immediate `refresh()` without waiting for the 15s poll tick.
 ///
-/// Idempotent: calling twice is a no-op (the watcher is stored in managed state and
-/// lives for the app lifetime; there is no stop — it is zero-cost when idle).
+/// Idempotent: calling twice is a no-op (the supervisor is stored in managed state
+/// and the sentinel session has a per-session cap we never reach with one observer).
 #[tauri::command]
-fn start_dev_update_watcher(app: tauri::AppHandle) {
+fn start_dev_update_watcher(state: State<'_, Arc<AppState>>, app: tauri::AppHandle) {
     use std::sync::Once;
     LOCAL_UPDATE_CHANNEL.store(true, std::sync::atomic::Ordering::Relaxed);
     static STARTED: Once = Once::new();
     STARTED.call_once(|| {
-        match dev_update_watcher::DevUpdateWatcher::spawn() {
-            Ok((_watcher, mut rx)) => {
-                // Leak the watcher so it lives for the process lifetime (zero-cost
-                // when idle; the OS kqueue fd stays open).
-                std::mem::forget(_watcher);
-                let emit_app = app.clone();
-                tauri::async_runtime::spawn(async move {
-                    while rx.recv().await.is_some() {
+        let dir = dev_update_dir();
+        // Ensure the directory exists so the watcher doesn't fail on first run.
+        let _ = std::fs::create_dir_all(&dir);
+        let target = dir.join("latest.json").display().to_string();
+        let spec = ff_observer::ObserverSpec {
+            kind: ff_observer::ObserverKind::File,
+            target,
+            filter: None,
+            interval: None,
+        };
+        let host = state.observer_host();
+        let emit_app = app.clone();
+        let state_for_sub = state.inner().clone();
+        tauri::async_runtime::spawn(async move {
+            // The host's `start` is `async` and the `start` call arms
+            // the per-session subscriber on the first invocation. The
+            // sentinel session id keeps the observer alive for the
+            // app's lifetime (no `delete_session` ever targets it).
+            match host
+                .start(
+                    DEV_UPDATE_SESSION,
+                    spec,
+                    emit_app.clone(),
+                    state_for_sub.clone(),
+                )
+                .await
+            {
+                Ok(_id) => {
+                    tracing::info!("dev-update observer started");
+                    // The host's subscriber task forwards fired events
+                    // through `dispatch_observer_event`, which would
+                    // spawn an assistant turn — the wrong behavior for
+                    // the dev-update channel. Instead, we subscribe
+                    // ourselves to the host's broadcast channel and
+                    // re-emit as a Tauri event, bypassing the
+                    // turn-spawn path.
+                    let mut rx = host.supervisor().subscribe(DEV_UPDATE_SESSION);
+                    while rx.recv().await.is_ok() {
                         let _ = emit_app.emit("update:local-feed-changed", ());
                     }
-                });
-                tracing::info!("dev-update watcher started");
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to start dev-update observer");
+                }
             }
-            Err(e) => {
-                tracing::warn!(error = %e, "failed to start dev-update watcher");
-            }
-        }
+        });
     });
 }
 

@@ -477,7 +477,12 @@ fn git_branch_is_none_for_detached_head() {
 
 #[test]
 fn git_branch_is_none_when_not_a_repo() {
-    let dir = tempfile::tempdir().unwrap();
+    // Anchor under `/tmp`: `tempdir()` honors $TMPDIR, which FlowForge sets to
+    // `<repo>/.ff-scratch/`, and git walks up parents looking for `.git`.
+    let dir = tempfile::Builder::new()
+        .prefix("ff-git-")
+        .tempdir_in("/tmp")
+        .unwrap();
     assert_eq!(git_branch(dir.path()), None);
 }
 
@@ -487,7 +492,12 @@ fn git_branch_is_none_when_not_a_repo() {
 /// a host without git installed.
 #[cfg(test)]
 fn temp_repo(branches: &[&str]) -> Option<tempfile::TempDir> {
-    let dir = tempfile::tempdir().unwrap();
+    // Same reasoning as `git_branch_is_none_when_not_a_repo`: anchor under
+    // `/tmp` so we don't inherit the workspace's `.git` ancestor.
+    let dir = tempfile::Builder::new()
+        .prefix("ff-git-")
+        .tempdir_in("/tmp")
+        .unwrap();
     let run = |args: &[&str]| -> bool {
         std::process::Command::new("git")
             .arg("-C")
@@ -523,7 +533,11 @@ fn list_local_branches_returns_all_local_branches_sorted() {
 
 #[test]
 fn list_local_branches_is_empty_when_not_a_repo() {
-    let dir = tempfile::tempdir().unwrap();
+    // Anchor under `/tmp`: see `git_branch_is_none_when_not_a_repo`.
+    let dir = tempfile::Builder::new()
+        .prefix("ff-git-")
+        .tempdir_in("/tmp")
+        .unwrap();
     assert_eq!(
         list_local_branches(dir.path()).unwrap(),
         Vec::<String>::new()

@@ -52,7 +52,7 @@ pub use agent_tool::{AgentTool, AGENT_TOOL_NAME};
 pub use compaction::{CompactionRetrieveTool, COMPACTION_RETRIEVE_TOOL};
 pub use goal_complete::{GoalCompleteTool, GOAL_COMPLETE_TOOL_NAME};
 pub use notebook::{KernelSupervisor, NotebookTool};
-pub use registry::{is_subagent, Safety, Tool, ToolOutcome, ToolRegistry};
+pub use registry::{is_subagent, Safety, Tool, ToolOutcome, ToolRegistry, NO_SESSION};
 pub use sink::{OutputSink, OutputStream};
 pub use url_safety::SsrfPolicy;
 pub use web_search::WebSearchTool;

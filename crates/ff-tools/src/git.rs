@@ -597,7 +597,13 @@ mod tests {
 
     #[tokio::test]
     async fn not_a_repo_returns_error() {
-        let tmp = tempfile::tempdir().unwrap();
+        // Anchor under `/tmp` so we don't accidentally land inside the
+        // workspace's `.git` chain (`tempdir()` honors $TMPDIR, which FlowForge
+        // sets to `<repo>/.ff-scratch/`).
+        let tmp = tempfile::Builder::new()
+            .prefix("ff-git-")
+            .tempdir_in("/tmp")
+            .unwrap();
         let result = git_status(tmp.path()).await;
         assert!(!result.success);
         assert!(

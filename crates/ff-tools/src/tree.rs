@@ -134,7 +134,13 @@ mod tests {
 
     #[tokio::test]
     async fn lists_basic_tree_deterministically() {
-        let dir = tempfile::tempdir().unwrap();
+        // Anchor under `/tmp` so the workspace's gitignore / `.git` chain (which
+        // would otherwise bleed in via `tempdir()` when TMPDIR points inside
+        // the repo, e.g. FlowForge's `.ff-scratch/`) doesn't hide fixtures.
+        let dir = tempfile::Builder::new()
+            .prefix("ff-tree-")
+            .tempdir_in("/tmp")
+            .unwrap();
         write(dir.path(), "src/main.rs", "");
         write(dir.path(), "README.md", "");
 
@@ -146,7 +152,12 @@ mod tests {
 
     #[tokio::test]
     async fn honors_max_depth_and_dirs_only() {
-        let dir = tempfile::tempdir().unwrap();
+        // See `lists_basic_tree_deterministically` for why these fixtures
+        // anchor under `/tmp`.
+        let dir = tempfile::Builder::new()
+            .prefix("ff-tree-")
+            .tempdir_in("/tmp")
+            .unwrap();
         write(dir.path(), "src/deep/main.rs", "");
         write(dir.path(), "src/lib.rs", "");
         write(dir.path(), "top.txt", "");
@@ -175,7 +186,12 @@ mod tests {
 
     #[tokio::test]
     async fn respects_gitignore() {
-        let dir = tempfile::tempdir().unwrap();
+        // See `lists_basic_tree_deterministically` for why these fixtures
+        // anchor under `/tmp`.
+        let dir = tempfile::Builder::new()
+            .prefix("ff-tree-")
+            .tempdir_in("/tmp")
+            .unwrap();
         write(dir.path(), ".gitignore", "target/\nignored.txt\n");
         write(dir.path(), "src/lib.rs", "");
         write(dir.path(), "target/debug.log", "");
@@ -215,7 +231,12 @@ mod tests {
 
     #[tokio::test]
     async fn truncates_large_output() {
-        let dir = tempfile::tempdir().unwrap();
+        // See `lists_basic_tree_deterministically` for why these fixtures
+        // anchor under `/tmp`.
+        let dir = tempfile::Builder::new()
+            .prefix("ff-tree-")
+            .tempdir_in("/tmp")
+            .unwrap();
         for i in 0..=MAX_ENTRIES {
             write(dir.path(), &format!("file-{i:04}.txt"), "");
         }

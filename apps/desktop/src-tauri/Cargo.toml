@@ -34,8 +34,12 @@ ff-scheduled = { workspace = true }
 ff-skills = { workspace = true }
 ff-signals = { workspace = true }
 ff-tools = { workspace = true }
+ff-observer = { workspace = true }
 ff-mcp = { workspace = true }
 dirs = "5"
+# `notify` is still used by `git_watch.rs` (the `.git/HEAD` live-sync watcher, #561).
+# `dev_update_watcher` was migrated to `ff_observer::FileSource` (#709) and no longer
+# uses `notify`; this dep is on its way out once `git_watch` is migrated too.
 notify = "7"
 tokio = { workspace = true }
 async-trait = { workspace = true }

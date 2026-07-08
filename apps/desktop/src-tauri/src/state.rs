@@ -1324,6 +1324,11 @@ pub struct AppState {
     /// one turn can be polled or stopped in a later one. Children are killed when
     /// the last `Arc` drops at app exit.
     process_supervisor: Arc<ProcessSupervisor>,
+    /// Per-session subscriber host wrapper. The wrapper tracks which
+    /// sessions have a live observer-event subscriber (so `start` arms
+    /// it exactly once, not on every call) and re-arms on
+    /// `reap_session`. See [`crate::observer_host::ObserverHost`].
+    observer_host: Arc<crate::observer_host::ObserverHost>,
     /// Persistent Python kernels for the `notebook_runner` tool (#859), one per
     /// session. Long-lived child processes, so they are reaped on session end
     /// (`reap_session_kernels`) and killed when the last `Arc` drops at app exit.
@@ -1457,6 +1462,18 @@ impl AppState {
             flush_ledger,
             _memory_watcher: Mutex::new(memory_watcher),
             process_supervisor: Arc::new(ProcessSupervisor::new()),
+            observer_host: {
+                // The host wraps the same `ProcessSupervisor` the host hands
+                // to the `process_manager` tool, so a process started in one
+                // turn can be observed in a later one. The stand-in here is
+                // replaced by the real `process_supervisor` clone at the end
+                // of `with_registry` (`set_process_supervisor`); before that
+                // runs, no `ObserverTool` call can succeed because the host
+                // hasn't been registered yet.
+                Arc::new(crate::observer_host::ObserverHost::new(Arc::new(
+                    ProcessSupervisor::new(),
+                )))
+            },
             kernel_supervisor: Arc::new(KernelSupervisor::new()),
             served_window_cache: Mutex::new(HashMap::new()),
             compaction_cache: CompactionCache::new(),
@@ -1466,6 +1483,12 @@ impl AppState {
         // falling back to the built-in `default` when codon isn't installed.
         let initial = initial_phenotype(state.persisted_phenotype_name(), resolve_phenotype);
         state.apply_phenotype(initial);
+        // Share the live `ProcessSupervisor` with the observer host so the
+        // `observer --source process` backend subscribes to the same line
+        // stream the `process_manager` tool populates (#709 Phase 3).
+        state
+            .observer_host
+            .set_process_supervisor(state.process_supervisor.clone());
         state
     }
 
@@ -1913,6 +1936,57 @@ impl AppState {
                 tracing::info!(session_id = %id, reaped = n, "reaped session kernel");
             }
         });
+    }
+
+    /// Stop and remove every observer owned by `session_id` (#709). Mirrors
+    /// [`reap_session_processes`](Self::reap_session_processes) and
+    /// [`reap_session_kernels`](Self::reap_session_kernels): a watcher
+    /// session-scoped to the deleted session must not outlive it. The
+    /// observer supervisor's own cancel tokens tear down the OS handles
+    /// (kqueue/inotify) and HTTP clients; the broadcast channel
+    /// disconnect wakes any subscriber task waiting for an event.
+    pub fn reap_session_observers(&self, session_id: &str) {
+        let n = self.observer_host.reap_session(session_id);
+        if n > 0 {
+            tracing::info!(session_id, reaped = n, "reaped session observers");
+        }
+    }
+
+    /// The session-scoped observer host (#709). The host wraps the
+    /// supervisor with a per-session subscriber-arming map: starting an
+    /// observer for a session that has no live subscriber spawns a
+    /// background task that converts fired events into assistant turns.
+    /// `reap_session` clears the armed flag so the next `start` re-arms.
+    pub fn observer_host(&self) -> Arc<crate::observer_host::ObserverHost> {
+        self.observer_host.clone()
+    }
+
+    /// Forward an `ObserverEvent` to a turn: persist a synthetic user
+    /// message, then spawn the assistant turn. Mirrors the FE composer
+    /// path in `send_message` so a wake-up is indistinguishable from a
+    /// human-driven user turn. Called by the per-session subscriber loop
+    /// when the supervisor reports a fire.
+    pub fn dispatch_observer_event(
+        self: &Arc<Self>,
+        app: &tauri::AppHandle,
+        session_id: &str,
+        event: &ff_observer::ObserverEvent,
+    ) {
+        use ff_core::Role;
+        // Cancel any in-flight turn so the wake-up doesn't race the
+        // current turn. Mirrors `send_message` / `edit_message`.
+        if let Some(token) = self.take_cancel(session_id) {
+            token.cancel();
+        }
+        self.cancel_pending_approvals(session_id);
+        // Persist the synthetic user message. Format matches the issue's
+        // `[Observer "key"]: summary` sketch.
+        let text = format!("[Observer \"{}\"]: {}", event.key, event.summary);
+        self.store.add_message(session_id, Role::User, text);
+        // Spawn the assistant turn through the same path
+        // `send_message` uses, so the FE sees an identical event stream
+        // (`turn:token` / `turn:done` / `turn:error`).
+        crate::spawn_assistant_turn(self.clone(), app.clone(), session_id.to_string());
     }
 
     /// Start a periodic background reaper that drives

@@ -1,6 +1,10 @@
 [workspace]
 resolver = "2"
-members = ["crates/*", "apps/desktop/src-tauri", "apps/cli"]
+members = [
+    "crates/*",
+    "apps/desktop/src-tauri",
+    "apps/cli",
+]
 
 [workspace.package]
 edition = "2021"
@@ -48,5 +52,6 @@ ff-signals = { path = "crates/ff-signals" }
 ff-skills = { path = "crates/ff-skills" }
 ff-tools = { path = "crates/ff-tools" }
 ff-workflow = { path = "crates/ff-workflow" }
+ff-observer = { path = "crates/ff-observer" }
 
 lru = "0.12"

@@ -38,6 +38,7 @@ use chrono::{DateTime, Utc};
 use serde_json::Value;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
+use tokio::sync::broadcast;
 
 use crate::registry::{Safety, Tool, ToolOutcome, NO_SESSION};
 use crate::sink::{OutputSink, OutputStream};
@@ -77,6 +78,10 @@ const MAX_CONCURRENT: usize = 16;
 const MAX_BUFFER_BYTES: usize = 64 * 1024;
 /// How long `stop` waits after SIGTERM before escalating to SIGKILL.
 const STOP_GRACE: Duration = Duration::from_millis(2000);
+/// Broadcast channel capacity for [`ProcessSupervisor::subscribe_lines`].
+/// Sized for a chatty dev server: 256 lines of headroom lets a fast producer
+/// burst without lagging a slow observer consumer.
+const LINE_CHANNEL_CAP: usize = 256;
 
 #[derive(Clone, Debug)]
 enum Status {
@@ -102,6 +107,7 @@ impl Status {
 
 /// A byte ring with a hard cap; once full, appending drops the oldest bytes and
 /// counts them so `snapshot` can flag the loss.
+#[derive(Debug)]
 struct RingBuffer {
     buf: VecDeque<u8>,
     cap: usize,
@@ -136,6 +142,7 @@ impl RingBuffer {
 
 /// Output buffers and live status shared between a process's detached reader/exit
 /// tasks and the supervisor map entry.
+#[derive(Debug)]
 struct Shared {
     stdout: Mutex<RingBuffer>,
     stderr: Mutex<RingBuffer>,
@@ -155,6 +162,7 @@ impl Shared {
     }
 }
 
+#[derive(Debug)]
 struct ManagedProcess {
     command: String,
     started_at: DateTime<Utc>,
@@ -171,6 +179,20 @@ struct ManagedProcess {
     /// Last time any session polled or listed this process. Used by
     /// [`ProcessSupervisor::reap_idle`] to detect abandoned processes.
     last_poll_at: Instant,
+    /// Per-process broadcast sink of captured lines (#709 Phase 3). The
+    /// `drain` task feeds new lines into this; observer sources subscribe
+    /// via [`ProcessSupervisor::subscribe_lines`].
+    line_tx: tokio::sync::broadcast::Sender<LineEvent>,
+}
+
+/// A line captured from a managed process's stdout/stderr (#709 Phase 3).
+/// Broadcast to any subscriber of [`ProcessSupervisor::subscribe_lines`].
+/// `is_stderr` lets observers filter by stream without re-running the regex
+/// on both halves.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LineEvent {
+    pub line: String,
+    pub is_stderr: bool,
 }
 
 /// App-global table of background processes. Cloneable handle is the `Arc` the
@@ -178,6 +200,15 @@ struct ManagedProcess {
 pub struct ProcessSupervisor {
     procs: Mutex<HashMap<u64, ManagedProcess>>,
     next_id: AtomicU64,
+}
+
+impl std::fmt::Debug for ProcessSupervisor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Don't lock the mutex in a Debug impl: a poisoned lock would
+        // panic the formatter, and the contents are not interesting at
+        // this level anyway.
+        f.debug_struct("ProcessSupervisor").finish_non_exhaustive()
+    }
 }
 
 impl Default for ProcessSupervisor {
@@ -192,6 +223,16 @@ impl ProcessSupervisor {
             procs: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(1),
         }
+    }
+
+    /// Subscribe to a managed process's line stream (#709 Phase 3). Returns
+    /// `None` when the process id is unknown. The receiver gets every line
+    /// the supervisor's `drain` task captures from this point forward —
+    /// lines produced before the subscription are not back-filled, so a
+    /// late subscriber never sees a flood of stale output.
+    pub fn subscribe_lines(&self, id: u64) -> Option<broadcast::Receiver<LineEvent>> {
+        let map = self.procs.lock().unwrap();
+        map.get(&id).map(|p| p.line_tx.subscribe())
     }
 
     /// Spawn `command` (via [`crate::shell::shell_invocation`]) in `dir`, capturing stdout and
@@ -236,12 +277,13 @@ impl ProcessSupervisor {
         #[cfg(windows)]
         let job = child.raw_handle().and_then(assign_to_new_job);
         let shared = Arc::new(Shared::new(MAX_BUFFER_BYTES));
+        let (line_tx, _) = broadcast::channel(LINE_CHANNEL_CAP);
 
         if let Some(out) = child.stdout.take() {
-            tokio::spawn(drain(out, shared.clone(), false));
+            tokio::spawn(drain(out, shared.clone(), false, line_tx.clone()));
         }
         if let Some(err) = child.stderr.take() {
-            tokio::spawn(drain(err, shared.clone(), true));
+            tokio::spawn(drain(err, shared.clone(), true, line_tx.clone()));
         }
         let watch = shared.clone();
         tokio::spawn(async move {
@@ -264,6 +306,7 @@ impl ProcessSupervisor {
                 shared,
                 session_id: session_id.to_string(),
                 last_poll_at: Instant::now(),
+                line_tx,
             },
         );
         Ok(id)
@@ -480,21 +523,59 @@ impl Drop for ProcessSupervisor {
     }
 }
 
-/// Drain a child pipe into the shared ring until EOF.
-async fn drain<R: AsyncRead + Unpin>(mut reader: R, shared: Arc<Shared>, is_err: bool) {
+/// Drain a child pipe into the shared ring until EOF. Each completed line is
+/// also published on `line_tx` so observer sources can react to new output
+/// without re-reading the ring buffer (#709 Phase 3).
+async fn drain<R: AsyncRead + Unpin>(
+    mut reader: R,
+    shared: Arc<Shared>,
+    is_err: bool,
+    line_tx: tokio::sync::broadcast::Sender<LineEvent>,
+) {
     let mut buf = [0u8; 4096];
+    let mut pending: Vec<u8> = Vec::new();
     loop {
         match reader.read(&mut buf).await {
             Ok(0) | Err(_) => break,
             Ok(n) => {
+                let bytes = &buf[..n];
                 let ring = if is_err {
                     &shared.stderr
                 } else {
                     &shared.stdout
                 };
-                ring.lock().unwrap().extend(&buf[..n]);
+                ring.lock().unwrap().extend(bytes);
+                // Line-split on `\n` so each new line is a discrete broadcast
+                // event. A partial trailing line is held in `pending` until
+                // the next read or EOF.
+                pending.extend_from_slice(bytes);
+                while let Some(idx) = pending.iter().position(|b| *b == b'\n') {
+                    let line_bytes: Vec<u8> = pending.drain(..=idx).collect();
+                    // Strip the trailing `\n`; keep `\r` if present (Windows
+                    // shells emit CRLF — `process_manager` users may grep for
+                    // it).
+                    let mut line = String::from_utf8_lossy(&line_bytes).into_owned();
+                    if line.ends_with('\n') {
+                        line.pop();
+                        if line.ends_with('\r') {
+                            line.pop();
+                        }
+                    }
+                    let _ = line_tx.send(LineEvent {
+                        line,
+                        is_stderr: is_err,
+                    });
+                }
             }
         }
+    }
+    // Flush any unterminated trailing line so a final message isn't lost.
+    if !pending.is_empty() {
+        let line = String::from_utf8_lossy(&pending).into_owned();
+        let _ = line_tx.send(LineEvent {
+            line,
+            is_stderr: is_err,
+        });
     }
 }
 

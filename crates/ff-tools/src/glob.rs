@@ -118,7 +118,13 @@ mod tests {
 
     #[tokio::test]
     async fn finds_by_pattern() {
-        let dir = tempfile::tempdir().unwrap();
+        // Anchor under `/tmp` so the workspace's gitignore / `.git` chain (which
+        // would otherwise bleed in via `tempdir()` when TMPDIR points inside
+        // the repo, e.g. FlowForge's `.ff-scratch/`) doesn't hide fixtures.
+        let dir = tempfile::Builder::new()
+            .prefix("ff-glob-")
+            .tempdir_in("/tmp")
+            .unwrap();
         write(dir.path(), "src/main.rs", "");
         write(dir.path(), "src/lib.rs", "");
         write(dir.path(), "README.md", "");
@@ -133,7 +139,11 @@ mod tests {
 
     #[tokio::test]
     async fn respects_gitignore() {
-        let dir = tempfile::tempdir().unwrap();
+        // See `finds_by_pattern` for why these fixtures anchor under `/tmp`.
+        let dir = tempfile::Builder::new()
+            .prefix("ff-glob-")
+            .tempdir_in("/tmp")
+            .unwrap();
         write(dir.path(), ".gitignore", "target/\n");
         write(dir.path(), "src/a.rs", "");
         write(dir.path(), "target/b.rs", "");

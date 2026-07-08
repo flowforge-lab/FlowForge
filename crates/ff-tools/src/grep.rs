@@ -167,7 +167,14 @@ mod tests {
 
     #[tokio::test]
     async fn finds_matches_with_path_and_line() {
-        let dir = tempfile::tempdir().unwrap();
+        // Anchor under `/tmp` so the workspace's gitignore / `.git` chain (which
+        // would otherwise bleed in via `tempdir()` when TMPDIR points inside
+        // the repo, e.g. FlowForge's `.ff-scratch/`) doesn't hide fixtures or
+        // make git look for a non-existent repo root inside them.
+        let dir = tempfile::Builder::new()
+            .prefix("ff-grep-")
+            .tempdir_in("/tmp")
+            .unwrap();
         write(dir.path(), "a.rs", "fn main() {}\nlet x = todo!();\n");
         let out = GrepTool
             .run(serde_json::json!({"pattern": "todo"}), dir.path())
@@ -183,7 +190,12 @@ mod tests {
 
     #[tokio::test]
     async fn respects_gitignore() {
-        let dir = tempfile::tempdir().unwrap();
+        // See `finds_matches_with_path_and_line` for why these fixtures anchor
+        // under `/tmp` instead of using `tempfile::tempdir()` directly.
+        let dir = tempfile::Builder::new()
+            .prefix("ff-grep-")
+            .tempdir_in("/tmp")
+            .unwrap();
         write(dir.path(), ".gitignore", "ignored.txt\n");
         write(dir.path(), "kept.txt", "needle here\n");
         write(dir.path(), "ignored.txt", "needle here\n");
@@ -196,7 +208,12 @@ mod tests {
 
     #[tokio::test]
     async fn case_insensitive_flag() {
-        let dir = tempfile::tempdir().unwrap();
+        // See `finds_matches_with_path_and_line` for why these fixtures anchor
+        // under `/tmp` instead of using `tempfile::tempdir()` directly.
+        let dir = tempfile::Builder::new()
+            .prefix("ff-grep-")
+            .tempdir_in("/tmp")
+            .unwrap();
         write(dir.path(), "a.txt", "Hello World\n");
         let sensitive = GrepTool
             .run(serde_json::json!({"pattern": "hello"}), dir.path())
@@ -228,10 +245,15 @@ mod tests {
 
     #[tokio::test]
     async fn glob_matches_nested_files() {
+        // See `finds_matches_with_path_and_line` for why these fixtures anchor
+        // under `/tmp` instead of using `tempfile::tempdir()` directly.
+        let dir = tempfile::Builder::new()
+            .prefix("ff-grep-")
+            .tempdir_in("/tmp")
+            .unwrap();
         // `*.rs` (no slash) must match at any depth, ripgrep-style — not just the
         // top level. This is the footgun the top-level-only `glob_filters_files`
         // test masked.
-        let dir = tempfile::tempdir().unwrap();
         write(dir.path(), "src/deep/foo.rs", "target\n");
         write(dir.path(), "src/bar.txt", "target\n");
         let out = GrepTool
