@@ -21,6 +21,8 @@ import { Spinner } from "@/components/ui/spinner";
 import { Textarea } from "@/components/ui/textarea";
 import type { ToolStep } from "@/store/chat";
 import { OutputBlock } from "@/components/output-block";
+import { NotebookCellOutput } from "@/components/notebook-cell-output";
+import { isNotebookRunnerStep } from "@/lib/notebook-output";
 
 function StatusIcon({ status }: { status: ToolStep["status"] }) {
   if (status === "running") {
@@ -311,15 +313,21 @@ export function ToolStepBlock({
           {/* Live output (#680): while the tool runs, show the streamed tail so
               slow builds/tests visibly progress. On completion `result` (the
               final, canonically-capped output) supersedes it below. */}
-          {step.status === "running" && step.output !== undefined && (
-            <OutputBlock output={step.output} title={step.tool} />
-          )}
-          {step.result !== undefined && (
-            <OutputBlock
-              output={step.result}
-              title={step.tool}
-              error={step.status === "error"}
-            />
+          {step.status === "running" &&
+            step.output !== undefined &&
+            !isNotebookRunnerStep(step.tool) && (
+              <OutputBlock output={step.output} title={step.tool} />
+            )}
+          {isNotebookRunnerStep(step.tool) ? (
+            <NotebookCellOutput step={step} />
+          ) : (
+            step.result !== undefined && (
+              <OutputBlock
+                output={step.result}
+                title={step.tool}
+                error={step.status === "error"}
+              />
+            )
           )}
         </div>
       )}
