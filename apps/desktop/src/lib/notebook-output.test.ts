@@ -66,6 +66,39 @@ describe("parseNotebookStep", () => {
     expect(parsed!.output).not.toContain("[cell raised an exception]");
   });
 
+  it("does NOT flag a successful cell whose stdout contains the trailer string in the middle", () => {
+    // `lastIndexOf` would false-positive here; the new heuristic only strips
+    // the trailer when it is the exact final non-whitespace line of the body
+    // (the shape the backend actually emits — `\n[cell raised an exception]`).
+    const parsed = parseNotebookStep(
+      "notebook_runner",
+      { action: "run_cell", code: "x = 1" },
+      "[cell raised an exception]\nthis happened earlier\n",
+      "done",
+    );
+    expect(parsed?.parsedExceptionTrailer).toBe(false);
+    expect(parsed?.errored).toBe(false);
+    // Output untouched — the printed string stays where the model put it.
+    expect(parsed?.output).toContain("[cell raised an exception]");
+    expect(parsed?.output).toContain("this happened earlier");
+  });
+
+  it("does NOT flag a successful cell that prints the trailer as its final line", () => {
+    // The reviewer's exact edge case: `print("[cell raised an exception]")`.
+    // The printed line has no preceding newline, whereas the backend always
+    // emits the real trailer as `\n[cell raised an exception]`, so requiring
+    // the leading newline leaves this successful cell alone.
+    const parsed = parseNotebookStep(
+      "notebook_runner",
+      { action: "run_cell", code: 'print("[cell raised an exception]")' },
+      "[cell raised an exception]\n",
+      "done",
+    );
+    expect(parsed?.parsedExceptionTrailer).toBe(false);
+    expect(parsed?.errored).toBe(false);
+    expect(parsed?.output).toBe("[cell raised an exception]");
+  });
+
   it("flags errored when the step status is error even without a trailer", () => {
     const parsed = parseNotebookStep(
       "notebook_runner",

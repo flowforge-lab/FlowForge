@@ -47,7 +47,7 @@ export interface NotebookStep {
   isStatusReport: boolean;
 }
 
-/** Matches a single notebook_runner step, regardless of the source field shape. */
+/** Matches a single notebook_runner step by tool name. */
 export function isNotebookRunnerStep(tool: string): boolean {
   return tool === "notebook_runner";
 }
@@ -114,18 +114,23 @@ export function parseNotebookStep(
 
   if (action === "run_cell") {
     const code = readCode(args);
-    // Strip the trailer before the cell render — we render the red ok/error
-    // badge separately so the user sees the exception banner above a clean
-    // output block, not an extra line at the end. Also drop any trailing
-    // whitespace so the cell view doesn't render a blank final line.
-    const trailerIdx = raw.lastIndexOf(EXCEPTION_TRAILER);
-    const parsedExceptionTrailer = trailerIdx >= 0;
-    const output = (
-      parsedExceptionTrailer ? raw.slice(0, trailerIdx) : raw
-    ).replace(/\n+$/, "");
+    // The backend appends this trailer only on an actual error, and always as
+    // `"\n" + EXCEPTION_TRAILER` on the end of the body (`body.push_str(...)`
+    // in the `run_cell` arm of `crates/ff-tools/src/notebook/mod.rs`). We match
+    // that exact shape — the trailer as the final line *preceded by a newline* —
+    // rather than a bare substring / `lastIndexOf`, so a *successful* cell that
+    // prints the string itself (e.g. `print("[cell raised an exception]")`,
+    // whose output has no preceding newline) is never mis-flagged as errored.
+    const trimmed = raw.replace(/\n+$/, "");
+    const parsedExceptionTrailer = trimmed.endsWith("\n" + EXCEPTION_TRAILER);
+    const output = parsedExceptionTrailer
+      ? trimmed.slice(0, -EXCEPTION_TRAILER.length).replace(/\n+$/, "")
+      : trimmed;
     // The backend reports success/failure in the ToolResultEvent; we cross-check
     // with the trailer so a stale "ok" status + an exception body still flags
-    // the cell as errored.
+    // the cell as errored. (The backend emits `ToolOutcome::ok` even when the
+    // cell raised — `success` is only false on a kernel-level failure, so
+    // the trailer is the only signal for a cell-level exception.)
     const errored = status === "error" || parsedExceptionTrailer;
     return {
       action,
