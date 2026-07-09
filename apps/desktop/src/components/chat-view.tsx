@@ -17,6 +17,7 @@ import { MessageAttachments } from "@/components/message-attachments";
 import { MessageHeader } from "@/components/message-header";
 import { ThinkingIndicator } from "@/components/thinking-indicator";
 import { CancelledNotice } from "@/components/cancelled-notice";
+import { ActiveProseBlock } from "@/components/active-prose-block";
 import { isResumableStopNotice } from "@/store/capped-turn";
 import { foldTurns, segmentTurn } from "@/lib/turn-groups";
 import type { TurnItem } from "@/lib/turn-groups";
@@ -139,12 +140,21 @@ function MessageRowImpl({
   const segments = segmentTurn(items);
   let firstStepsIdx = -1;
   let lastStepsIdx = -1;
+  let lastProseIdx = -1;
   segments.forEach((seg, i) => {
     if (seg.kind === "steps") {
       if (firstStepsIdx === -1) firstStepsIdx = i;
       lastStepsIdx = i;
+    } else {
+      lastProseIdx = i;
     }
   });
+  // The "active" prose is the prose segment the model is *currently* writing
+  // — i.e. the LAST segment overall. When prose is followed by more steps
+  // (a `prose → steps` order), the prose is already settled and the steps
+  // below are what's live; collapsing the prose to "On it" there would land
+  // the chip on a done segment (#864 review).
+  const lastProseIsActive = lastProseIdx > lastStepsIdx;
 
   return (
     <div
@@ -176,16 +186,21 @@ function MessageRowImpl({
           ) : (
             segments.map((seg, i) =>
               seg.kind === "prose" ? (
-                // Intermediate narration — a top-level, always-visible markdown block
-                // between the collapsed groups it sat between (#619). Muted vs. the
-                // final answer; settled, so never streamed.
-                <div
+                // Intermediate narration — a top-level, always-visible block
+                // between the collapsed groups it sat between (#619). Muted vs.
+                // the final answer. The currently-streaming one collapses to a
+                // compact "On it" chip so the user isn't forced to read it
+                // token by token (#864); earlier prose and settled turns stay
+                // full-width. Gated on the prose being the *last* segment so a
+                // `prose → steps` order (prose already settled, model on to
+                // tools) doesn't land a chip on a done segment.
+                <ActiveProseBlock
                   key={`prose:${seg.key}`}
-                  data-selectable
-                  className="px-0.5 py-1 text-sm leading-relaxed text-muted-foreground"
-                >
-                  <Markdown content={seg.text} />
-                </div>
+                  text={seg.text}
+                  streaming={
+                    i === lastProseIdx && lastProseIsActive && streaming
+                  }
+                />
               ) : (
                 <StepGroup
                   key={`steps:${seg.key}`}
