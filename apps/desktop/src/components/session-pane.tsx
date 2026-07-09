@@ -13,6 +13,7 @@ import { ChatView } from "@/components/chat-view";
 import { ContextGauge } from "@/components/context-gauge";
 import { FindBar } from "@/components/find-bar";
 import { GoalStatusPanel } from "@/components/goal-status-panel";
+import { NotebookStatusPanel } from "@/components/notebook-status-panel";
 import { InputBar } from "@/components/input-bar";
 import { PhenoSelector } from "@/components/pheno-selector";
 import { useAttachGate } from "@/lib/attach-gate";
@@ -151,6 +152,14 @@ export function SessionPane({
           </Button>
         </div>
       </div>
+
+      {/* Notebook kernel status panel (#871 FE-1): self-hides when the session
+          has no kernel snapshot yet, renders a quiet line for `null`, and a
+          live pill + Stop button while a kernel is `running`. Polls
+          `notebook_status` for the duration of the `running` state (cadence
+          tunable, see experimental store). Sits above the goal panel so
+          kernel + goal state both stay visible. */}
+      <NotebookStatusPanel sessionId={sessionId} />
 
       {/* Goal status panel (#717): self-hides unless this session has a goal. */}
       <GoalStatusPanel sessionId={sessionId} />

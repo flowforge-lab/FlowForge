@@ -12,19 +12,35 @@
 // the textual output, and an ok/error status. The detector is exported as
 // `isNotebookRunnerStep` so `tool-step.tsx` can branch once.
 //
-// Future Phase 3 (rich output — image path + variable dump) will extend
-// `NotebookOutput` with `images?: { mediaType: string; dataUrl: string }[]` and
-// `variables?: Array<{ name: string; type?: string; repr: string }>`. The
-// renderer (`notebook-cell-output.tsx`) already gates those blocks on presence,
-// so adding them later is an additive change to this parser + the renderer,
-// with no re-plumbing in `tool-step.tsx`. Per the issue's FE-0 contract note:
-// the FE does not invent the shape — it lands with the Phase 3 backend.
+// Future Phase 3 (rich output — image path + variable dump + the `restart` and
+// `inspect` actions) will extend `NotebookOutput` with `images?` and
+// `variables?`; the renderer (`notebook-cell-output.tsx`) already gates those
+// blocks on presence, so adding them later is an additive change to this
+// parser + the renderer, with no re-plumbing in `tool-step.tsx`. Per the
+// issue's FE-0 contract note: the FE does not invent the shape — it lands with
+// the Phase 3 backend.
 //
-// Kept React-free so the parse path is unit-testable in vitest's node env
-// (mirrors `lib/todo.ts`).
+// The union is forward-extensible: `start | run_cell | run_all | status |
+// stop | restart | inspect`. `run_all`, `restart`, `inspect` are pre-declared so
+// a future Phase 3 commit doesn't have to widen this union retroactively; the
+// renderer already maps every action into a layout group, and unknown / missing
+// actions currently collapse to the `status`-equivalent view, so a brand-new
+// action shows neutral rather than failing the parse.
+// React-free so the parse path is unit-testable in vitest's node env (mirrors
+// `lib/todo.ts`).
 
-/** The four `notebook_runner` actions the tool currently understands. */
-export type NotebookAction = "start" | "run_cell" | "status" | "stop";
+/** The `notebook_runner` actions the tool understands, including the
+ *  Phase 3 ones (`restart`, `inspect`) we pre-declare so the union doesn't need
+ *  widening mid-project (#871 FE-0). The parser treats unknown / missing
+ *  actions as a status report, so adding actions never breaks rendering. */
+export type NotebookAction =
+  | "start"
+  | "run_cell"
+  | "run_all"
+  | "status"
+  | "stop"
+  | "restart"
+  | "inspect";
 
 /** What the FE renders for a step. `null` = "this isn't a notebook call". */
 export interface NotebookStep {
@@ -60,8 +76,11 @@ function readAction(args: unknown): NotebookAction | null {
   switch (raw) {
     case "start":
     case "run_cell":
+    case "run_all":
     case "status":
     case "stop":
+    case "restart":
+    case "inspect":
       return raw;
     default:
       return null;
@@ -142,11 +161,13 @@ export function parseNotebookStep(
     };
   }
 
-  // `start` / `stop` — render the result text neutrally.
+  // `start` / `stop` / `run_all` / `restart` / `inspect` — render the result
+  // text neutrally. Trim trailing newlines to match the `run_cell` branch, so
+  // the cell view never renders a blank final line.
   return {
     action,
     code: null,
-    output: raw,
+    output: raw.replace(/\n+$/, ""),
     errored: status === "error",
     parsedExceptionTrailer: false,
     isStatusReport: false,

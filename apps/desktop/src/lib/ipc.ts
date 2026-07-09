@@ -65,6 +65,7 @@ import type { Format } from "../bindings/Format";
 import type { SecretKind } from "../bindings/SecretKind";
 import type { BedrockAuth } from "../bindings/BedrockAuth";
 import type { SearchHit } from "../bindings/SearchHit";
+import type { NotebookKernelState } from "./notebook-kernel-state";
 
 export type Unlisten = () => void;
 
@@ -506,6 +507,30 @@ export interface FfIpc {
    *  (not `goal:updated`); the panel unmounts when the store drops that session. */
   goalClear(sessionId: string): Promise<void>;
 
+  // CONTRACT CHANGE (#871 FE-1, kernel status affordance panel): NEW commands
+  // needing a real Rust emitter — please review @backend-owner. The store +
+  // panel (`store/notebook.ts`, `components/notebook-status-panel.tsx`) ship in
+  // this PR; the commands land in a follow-up BE PR (~40 LOC on top of the
+  // existing `KernelSupervisor`, `invoke_handler!` registration, and a real
+  // ts-rs `NotebookKernelState` binding — until then `NotebookKernelState` is
+  // a plain FE-owned type at `lib/notebook-kernel-state.ts`, not a generated
+  // binding (see that file's header for why). On a real (non-mock) build
+  // these currently reject — `notebookStatus` fails closed after the first
+  // rejection (see `store/notebook.ts`) so the panel silently no-ops instead
+  // of retrying every mount. Mocked under `VITE_FF_MOCK=1` so the panel runs
+  // standalone. No new events: a later `notebook:updated` push event can
+  // replace the polling that's currently the source of live signal —
+  // tracked in #871, not implemented here.
+  /** Per-session snapshot of the `notebook_runner` kernel (#871 FE-1). Returns
+   *  the current state without spinning up an agent turn — mirrors
+   *  `goalStatus`. When the session has no kernel, `hasKernel=false` and every
+   *  other field collapses to its null/zero default. */
+  notebookStatus(sessionId: string): Promise<NotebookKernelState>;
+  /** Stop the session's kernel (#871 FE-1). Mirrors `goalClear`'s void return;
+   *  the caller calls `notebookStatus` again to observe the post-stop
+   *  snapshot. Idempotent — no error when the session has no kernel. */
+  notebookStop(sessionId: string): Promise<void>;
+
   // Events (backend -> frontend)
   onToken(cb: (e: TokenEvent) => void): Promise<Unlisten>;
   onReasoning(cb: (e: ReasoningEvent) => void): Promise<Unlisten>;
@@ -877,6 +902,11 @@ class TauriIpc implements FfIpc {
     this.invoke<Goal | null>("goal_resume", { sessionId });
   goalClear = (sessionId: string) =>
     this.invoke<void>("goal_clear", { sessionId });
+
+  notebookStatus = (sessionId: string) =>
+    this.invoke<NotebookKernelState>("notebook_status", { sessionId });
+  notebookStop = (sessionId: string) =>
+    this.invoke<void>("notebook_stop", { sessionId });
 
   onToken = (cb: (e: TokenEvent) => void) =>
     this.listen<TokenEvent>("turn:token", cb);

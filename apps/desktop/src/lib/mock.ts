@@ -63,6 +63,7 @@ import type {
   CreateScheduledTaskInput,
   RunRecord,
 } from "@/bindings";
+import type { NotebookKernelState } from "./notebook-kernel-state";
 import { CONTROL_DEFAULTS, type ControlConfig } from "./control";
 import {
   APP_VERSION_FALLBACK,
@@ -78,6 +79,18 @@ type Listener<T> = (e: T) => void;
 
 const uid = () => crypto.randomUUID();
 const now = () => Date.now();
+
+/** Format the canonical `kernel <id> — <state>; pid=<pid>; cells executed=<n>`
+ *  line that the real backend emits (and `parseKernelStatus` parses in
+ *  `lib/notebook-output.ts`). Used by `mock.notebook.test.ts` so the test can
+ *  assert on the same string the FE would see on a real connection. */
+function formatNotebookStatusLine(s: NotebookKernelState): string {
+  if (!s.hasKernel || !s.state || !s.kernelId) return "";
+  const id = s.kernelId;
+  const state = s.state;
+  const pid = s.pid ?? 0;
+  return `kernel ${id} — ${state}; pid=${pid}; cells executed=${s.executionCount}`;
+}
 
 // Deterministic stand-in for the backend's LLM-summarized title (#671 item 2b):
 // the first few meaningful words of the prompt, title-cased and capped. The real
@@ -857,6 +870,12 @@ export class MockIpc implements FfIpc {
   // persists to `<goals_dir>/<session_id>.json`; the mock just holds it in memory.
   private goals = new Map<string, Goal>();
   private goalTimers = new Map<string, ReturnType<typeof setInterval>>();
+  // Notebook_runner kernel state (#871 FE-1). Per-session kernel — absent until
+  // something seeds it (the real backend spawns one on `notebook_runner start`;
+  // the mock seeds it through a private test hook in mock.notebook.test.ts so
+  // the UI + store can exercise every panel state without faking tool calls).
+  // Shape mirrors `NotebookKernelState` exactly — the panel never re-parses.
+  private notebookKernels = new Map<string, NotebookKernelState>();
   private goalUpdatedListeners = new Set<Listener<Goal>>();
   private goalClearedListeners = new Set<Listener<string>>();
   // Paint-first boot (#599): the mock backend is "ready" immediately, so this is
@@ -2372,6 +2391,65 @@ Shipping the Settings redesign — currently the Memory browser (SET.8).
     const existed = this.goals.delete(sessionId);
     if (existed) this.emit(this.goalClearedListeners, sessionId);
   }
+
+  // Notebook_runner (#871 FE-1). Tiny mock: absent -> null snapshot (no
+  // kernel); present -> return the existing snapshot. Mirrors the real
+  // backend's `notebook_status` / `notebook_stop` IPC commands so the panel +
+  // polling loop can run standalone under `VITE_FF_MOCK=1`.
+  //
+  // `notebookStop` removes the kernel entirely (`hasKernel: false`), NOT a
+  // `state: "dead"` tombstone: the real backend's `stop()` does
+  // `kernels.remove(session_id)` (`KernelSupervisor::stop`,
+  // `crates/ff-tools/src/notebook/mod.rs`), so a `status()` call after Stop
+  // returns "no kernel" for that session. `state: "dead"` is reserved for a
+  // kernel that died on its own (the tool sets `k.dead` on EOF-from-pipe
+  // detection) — still reachable in tests via `__seedNotebookKernel`, just
+  // never through this method.
+  async notebookStatus(sessionId: string): Promise<NotebookKernelState> {
+    const existing = this.notebookKernels.get(sessionId);
+    if (existing) return Promise.resolve({ ...existing });
+    return Promise.resolve({
+      sessionId,
+      hasKernel: false,
+      state: null,
+      kernelId: null,
+      pid: null,
+      executionCount: 0,
+      raw: "",
+    });
+  }
+
+  async notebookStop(sessionId: string): Promise<void> {
+    this.notebookKernels.delete(sessionId); // idempotent — same as the real backend
+  }
+
+  /** Test hook — lets mock.notebook.test.ts seed / advance a per-session
+   *  kernel without faking the entire `notebook_runner` tool-call pipeline.
+   *  The real backend spawns kernels via `notebook_runner start`; the mock
+   *  surface stays narrow because the panel only needs snapshot read/write.
+   *  Arrow field (not a prototype method) so a caller can destructure/alias
+   *  it without losing `this` — bare `const seed = ipc.__seedNotebookKernel;
+   *  seed(...)` still works, unlike a plain method reference. */
+  __seedNotebookKernel = (
+    sessionId: string,
+    patch: Partial<NotebookKernelState>,
+  ) => {
+    const current: NotebookKernelState = this.notebookKernels.get(
+      sessionId,
+    ) ?? {
+      sessionId,
+      hasKernel: false,
+      state: null,
+      kernelId: null,
+      pid: null,
+      executionCount: 0,
+      raw: "",
+    };
+    const next: NotebookKernelState = { ...current, ...patch };
+    next.raw = formatNotebookStatusLine(next);
+    this.notebookKernels.set(sessionId, next);
+    return { ...next };
+  };
 
   onGoalUpdated(cb: Listener<Goal>): Promise<Unlisten> {
     return this.subscribe(this.goalUpdatedListeners, cb);
