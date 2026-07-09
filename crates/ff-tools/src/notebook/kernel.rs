@@ -99,7 +99,11 @@ def _save_figures():
         # Image saving is best-effort; a failure never fails the cell.
         pass
 while True:
-    _hdr = sys.stdin.readline()
+    # Read the whole frame from the binary stream so the length is a byte
+    # count that matches what Rust wrote (#880). `sys.stdin.read(n)` reads
+    # characters, not bytes, so any non-ASCII cell source (em-dash, non-Latin
+    # identifier, etc.) would under-read and desync the stream.
+    _hdr = sys.stdin.buffer.readline()
     if not _hdr:
         break
     _hdr = _hdr.strip()
@@ -110,7 +114,7 @@ while True:
     except ValueError:
         _emit("error")
         continue
-    _src = sys.stdin.read(_n)
+    _src = sys.stdin.buffer.read(_n).decode("utf-8")
     try:
         exec(compile(_src, "<cell>", "exec"), _ns)
         _save_figures()
