@@ -401,11 +401,11 @@ fn active_skills_is_sorted_and_deduped() {
 }
 
 // First-run phenotype selection (#298). A fake resolver lets us cover the whole
-// branch matrix without touching `~/.flowforge`. `codon` and `default` resolve;
-// anything else is unknown.
+// branch matrix without touching `~/.flowforge`. `orchestrator` and `default`
+// resolve; anything else is unknown.
 fn fake_resolve(name: &str) -> Option<Phenotype> {
     match name {
-        "codon" | "default" | "rust" => Some(Phenotype {
+        "orchestrator" | "default" | "rust" => Some(Phenotype {
             name: name.to_string(),
             skills: vec![],
             model: None,
@@ -426,20 +426,20 @@ fn initial_phenotype_prefers_persisted_choice() {
 }
 
 #[test]
-fn initial_phenotype_defaults_to_codon_when_no_persisted_choice() {
+fn initial_phenotype_defaults_to_orchestrator_when_no_persisted_choice() {
     let pheno = initial_phenotype(None, fake_resolve);
-    assert_eq!(pheno.name, "codon");
+    assert_eq!(pheno.name, "orchestrator");
 }
 
 #[test]
-fn initial_phenotype_unknown_persisted_falls_through_to_codon() {
+fn initial_phenotype_unknown_persisted_falls_through_to_orchestrator() {
     let pheno = initial_phenotype(Some("ghost".to_string()), fake_resolve);
-    assert_eq!(pheno.name, "codon");
+    assert_eq!(pheno.name, "orchestrator");
 }
 
 #[test]
-fn initial_phenotype_falls_back_to_default_when_codon_absent() {
-    // Codon not installed (rare seed-failure): resolver only knows `default`.
+fn initial_phenotype_falls_back_to_default_when_orchestrator_absent() {
+    // Orchestrator not installed (rare seed-failure): resolver only knows `default`.
     let resolve = |name: &str| (name == "default").then(default_phenotype);
     let pheno = initial_phenotype(None, resolve);
     assert_eq!(pheno.name, DEFAULT_PHENOTYPE);
@@ -2277,6 +2277,45 @@ fn seed_builtin_content_writes_codon_and_codegraph_when_absent() {
 }
 
 #[test]
+fn seed_builtin_content_writes_rfc0013_phenotype_family() {
+    let phenos = tempfile::tempdir().unwrap();
+    let skills = tempfile::tempdir().unwrap();
+    seed_builtin_content_at(phenos.path(), skills.path(), None);
+
+    for name in ["orchestrator", "erudite", "enclave"] {
+        assert!(
+            phenos.path().join(format!("{name}.toml")).exists(),
+            "{name}.toml must be seeded"
+        );
+    }
+    let (map, errors) = load_phenotypes(phenos.path());
+    assert!(
+        errors.is_empty(),
+        "seeded phenotype family must parse: {errors:?}"
+    );
+    // The factory-active default resolves.
+    assert!(map.contains_key("orchestrator"), "orchestrator present");
+    // enclave carries the local-only egress policy (the P1/P2 payoff), proving the
+    // `egress = "local-only"` literal deserializes through the real loader.
+    assert_eq!(
+        map.get("enclave").expect("enclave present").egress,
+        ff_core::Egress::LocalOnly,
+        "enclave must be local-only"
+    );
+    // The other two default to Open (egress omitted).
+    assert_eq!(
+        map.get("erudite").expect("erudite present").egress,
+        ff_core::Egress::Open
+    );
+    assert_eq!(
+        map.get("orchestrator")
+            .expect("orchestrator present")
+            .egress,
+        ff_core::Egress::Open
+    );
+}
+
+#[test]
 fn seed_builtin_content_does_not_clobber_user_edits() {
     let phenos = tempfile::tempdir().unwrap();
     let skills = tempfile::tempdir().unwrap();
@@ -2292,6 +2331,28 @@ fn seed_builtin_content_does_not_clobber_user_edits() {
     );
     // The absent codegraph skill is still seeded alongside the kept edit.
     assert!(skills.path().join("codegraph").join("SKILL.md").exists());
+}
+
+#[test]
+fn seed_builtin_content_does_not_clobber_edited_orchestrator() {
+    // The RFC 0013 family is also write-if-absent: an edited orchestrator.toml
+    // (e.g. a user pinned a model) must survive a later seed pass.
+    let phenos = tempfile::tempdir().unwrap();
+    let skills = tempfile::tempdir().unwrap();
+    let orchestrator = phenos.path().join("orchestrator.toml");
+    let edited = "name = \"orchestrator\"\nskills = []\nmodel = \"my-pinned-model\"\n";
+    fs::write(&orchestrator, edited).unwrap();
+
+    seed_builtin_content_at(phenos.path(), skills.path(), None);
+
+    assert_eq!(
+        fs::read_to_string(&orchestrator).unwrap(),
+        edited,
+        "an edited orchestrator.toml must never be overwritten"
+    );
+    // The absent siblings still land.
+    assert!(phenos.path().join("erudite.toml").exists());
+    assert!(phenos.path().join("enclave.toml").exists());
 }
 
 #[test]

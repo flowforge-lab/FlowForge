@@ -999,6 +999,13 @@ fn phenotypes_root() -> PathBuf {
 /// example can never drift.
 const CODON_PHENOTYPE_TOML: &str =
     include_str!("../../../../docs/examples/codon/phenos/codon.toml");
+/// The RFC 0013 phenotype family, seeded write-if-absent alongside `codon`.
+/// `orchestrator` is the factory-active default (see [`initial_phenotype`]);
+/// `enclave` carries `egress = "local-only"`.
+const ORCHESTRATOR_PHENOTYPE_TOML: &str =
+    include_str!("../../../../docs/examples/phenos/orchestrator.toml");
+const ERUDITE_PHENOTYPE_TOML: &str = include_str!("../../../../docs/examples/phenos/erudite.toml");
+const ENCLAVE_PHENOTYPE_TOML: &str = include_str!("../../../../docs/examples/phenos/enclave.toml");
 /// The codegraph skill Codon depends on, bundled from the same example tree.
 const CODEGRAPH_SKILL_MD: &str =
     include_str!("../../../../docs/examples/codon/skills/codegraph/SKILL.md");
@@ -1134,6 +1141,19 @@ fn write_seed_stamp(path: &Path) {
 /// writes without the version-stamp short-circuit.
 fn seed_builtin_content_at(phenotypes_root: &Path, skills_root: &Path, mcp_path: Option<&Path>) {
     seed_if_absent(&phenotypes_root.join("codon.toml"), CODON_PHENOTYPE_TOML);
+    // RFC 0013 phenotype family (write-if-absent; user edits are never clobbered).
+    seed_if_absent(
+        &phenotypes_root.join("orchestrator.toml"),
+        ORCHESTRATOR_PHENOTYPE_TOML,
+    );
+    seed_if_absent(
+        &phenotypes_root.join("erudite.toml"),
+        ERUDITE_PHENOTYPE_TOML,
+    );
+    seed_if_absent(
+        &phenotypes_root.join("enclave.toml"),
+        ENCLAVE_PHENOTYPE_TOML,
+    );
     seed_if_absent(
         &skills_root.join("codegraph").join("SKILL.md"),
         CODEGRAPH_SKILL_MD,
@@ -1219,15 +1239,14 @@ fn resolve_phenotype(name: &str) -> Option<Phenotype> {
     map.remove(name)
 }
 
-/// The out-of-box default phenotype name (#298, a "for now" default until we revisit
-/// defaults). Seeded on first run by #304; a compiled-in, deletion-proof built-in is
-/// tracked as #306.
-const CODON_PHENOTYPE: &str = "codon";
+/// The factory-active phenotype (RFC 0013, revisiting #298): `orchestrator` is the
+/// out-of-box default working set, seeded into `~/.flowforge/phenos/` on first run.
+const FACTORY_ACTIVE_PHENOTYPE: &str = "orchestrator";
 
 /// First-run phenotype selection. A persisted user choice always wins; otherwise we
-/// prefer the out-of-box `codon` default (seeded into `~/.flowforge/phenos/` on first
-/// run), falling back to the built-in `default` when codon isn't installed (e.g. a
-/// read-only home where the seed couldn't land). Pure over its inputs so the branch
+/// prefer the factory-active `orchestrator` default (seeded into `~/.flowforge/phenos/`
+/// on first run), falling back to the built-in `default` when it isn't installed (e.g.
+/// a read-only home where the seed couldn't land). Pure over its inputs so the branch
 /// matrix is unit-testable without touching `~/.flowforge`.
 fn initial_phenotype(
     persisted: Option<String>,
@@ -1235,7 +1254,7 @@ fn initial_phenotype(
 ) -> Phenotype {
     persisted
         .and_then(|n| resolve(n.as_str()))
-        .or_else(|| resolve(CODON_PHENOTYPE))
+        .or_else(|| resolve(FACTORY_ACTIVE_PHENOTYPE))
         .unwrap_or_else(default_phenotype)
 }
 

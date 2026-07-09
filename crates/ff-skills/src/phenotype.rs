@@ -159,6 +159,13 @@ struct PhenotypeOut {
     provider: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     mcp_servers: Vec<McpServerConfig>,
+    /// Network-egress policy (RFC 0013). Omitted when `Open` (the default) so
+    /// existing saved files stay byte-identical; written as `egress = "localOnly"`
+    /// for a restricted phenotype. Without this, editing+saving a phenotype would
+    /// silently reset its egress to `Open` (the read path carries it, but the write
+    /// path dropped it before this fix).
+    #[serde(skip_serializing_if = "ff_core::Egress::is_open")]
+    egress: ff_core::Egress,
 }
 
 /// Whether `name` is safe to use as a single-segment file stem. Rejects empty
@@ -193,6 +200,7 @@ pub fn save_phenotype(root: &Path, pheno: &Phenotype) -> Result<(), PhenotypeErr
         max_iterations: pheno.max_iterations,
         provider: pheno.provider.clone(),
         mcp_servers: pheno.mcp_servers.clone(),
+        egress: pheno.egress,
     };
     let body = toml::to_string_pretty(&out).map_err(|source| PhenotypeError::Serialize {
         name: pheno.name.clone(),

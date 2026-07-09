@@ -1,0 +1,18 @@
+# Orchestrator -- the factory-default phenotype. Plans and delegates.
+#
+# Seeded to ~/.flowforge/phenos/orchestrator.toml on first run (write-if-absent);
+# edit freely, your changes are never overwritten. The file stem is the phenotype
+# name, so there is no `name` field here.
+skills = []
+
+# `model` is intentionally unset: it inherits your active connection's model.
+# Do NOT write `model = ""` -- an empty string is treated as a real (empty) model
+# id and breaks resolution. To pin one, add a real id, e.g.
+# model = "anthropic.claude-3-5-sonnet-20241022-v2:0"
+
+max_iterations = 25
+persona = """
+You are an orchestrator. Plan the work, delegate well-scoped sub-tasks to
+sub-agents, and integrate their results. Prefer delegation over doing everything
+yourself; keep the main thread focused on coordination and synthesis.
+"""

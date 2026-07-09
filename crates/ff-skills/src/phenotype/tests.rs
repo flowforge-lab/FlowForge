@@ -162,6 +162,41 @@ fn save_omits_name_and_none_fields() {
     assert!(!body.contains("name"), "name must not be written: {body:?}");
     assert!(!body.contains("model"), "None fields omitted: {body:?}");
     assert!(!body.contains("provider"), "None fields omitted: {body:?}");
+    assert!(
+        !body.contains("egress"),
+        "egress omitted when Open (default): {body:?}"
+    );
+}
+
+#[test]
+fn save_round_trips_local_only_egress() {
+    // Regression guard (RFC 0013 Phase 0): the write path used to drop `egress`,
+    // so editing+saving a LocalOnly phenotype silently reset it to Open. Round-trip
+    // a restricted phenotype and assert the policy survives save->load.
+    let dir = tempfile::tempdir().unwrap();
+    let enclave = Phenotype {
+        name: "enclave".into(),
+        skills: Vec::new(),
+        model: None,
+        persona: Some("local only".into()),
+        max_iterations: Some(25),
+        provider: None,
+        mcp_servers: Vec::new(),
+        egress: ff_core::Egress::LocalOnly,
+    };
+    save_phenotype(dir.path(), &enclave).unwrap();
+    let body = fs::read_to_string(dir.path().join("enclave.toml")).unwrap();
+    assert!(
+        body.contains("egress"),
+        "LocalOnly egress must be written: {body:?}"
+    );
+    let (map, errs) = load_phenotypes(dir.path());
+    assert!(errs.is_empty(), "{errs:?}");
+    assert_eq!(
+        map.get("enclave").expect("enclave phenotype").egress,
+        ff_core::Egress::LocalOnly,
+        "egress must survive the save->load round-trip"
+    );
 }
 
 #[test]
