@@ -232,6 +232,10 @@ impl McpClient {
                     .as_ref()
                     .and_then(|a| a.read_only_hint)
                     .unwrap_or(false),
+                // Fail-safe placeholder: the protocol can't declare network reach,
+                // so the supervisor overlays the server's config value at publish
+                // time (RFC 0013). Unset there stays `true` = network-capable.
+                reaches_network: true,
             })
             .collect())
     }

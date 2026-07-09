@@ -43,6 +43,15 @@ pub struct McpServerConfig {
     pub disabled: bool,
     #[serde(default, skip_serializing_if = "McpScope::is_global")]
     pub scope: McpScope,
+    /// Whether this server may reach the network (RFC 0013 egress policy). `None`
+    /// (unset) is fail-safe: the server is treated as network-capable, so a
+    /// `LocalOnly` phenotype strips its tools from the advertised set. Set `false`
+    /// for a vetted pure-local server (e.g. codegraph, a filesystem server) to keep
+    /// it available under local-only. The MCP protocol has no network annotation,
+    /// so this is an operator assertion in `mcp.json`, not a server-declared hint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub reaches_network: Option<bool>,
 }
 
 /// Lifecycle state of a supervised MCP server (RFC 0003 §5). The supervisor (M4.2)
@@ -102,6 +111,20 @@ pub struct McpToolInfo {
     /// read-only bridged tool run without an approval gate (e.g. codegraph queries).
     #[serde(default)]
     pub read_only_hint: bool,
+    /// Whether the serving server may reach the network (RFC 0013 egress). Resolved
+    /// at publish time from the server's [`McpServerConfig::reaches_network`] (the
+    /// MCP protocol has no network annotation, unlike `readOnlyHint`). Fail-safe
+    /// `true` when the config is unset, so a `LocalOnly` phenotype strips the tool
+    /// unless the operator vetted the server as local. Mirrors how `read_only_hint`
+    /// feeds the bridged tool's `Safety`.
+    #[serde(default = "default_reaches_network")]
+    pub reaches_network: bool,
+}
+
+/// Fail-safe default for [`McpToolInfo::reaches_network`]: treat a tool as
+/// network-capable unless proven otherwise (RFC 0013).
+fn default_reaches_network() -> bool {
+    true
 }
 
 #[cfg(test)]

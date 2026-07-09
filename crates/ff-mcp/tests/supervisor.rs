@@ -37,6 +37,7 @@ fn idle_exit_cfg() -> McpServerConfig {
         env: BTreeMap::new(),
         disabled: false,
         scope: McpScope::Global,
+        reaches_network: None,
     }
 }
 
@@ -48,6 +49,7 @@ fn echo_cfg() -> McpServerConfig {
         env: BTreeMap::new(),
         disabled: false,
         scope: McpScope::Global,
+        reaches_network: None,
     }
 }
 
@@ -59,6 +61,7 @@ fn exit_cfg() -> McpServerConfig {
         env: BTreeMap::new(),
         disabled: false,
         scope: McpScope::Global,
+        reaches_network: None,
     }
 }
 
@@ -70,6 +73,7 @@ fn slow_cfg() -> McpServerConfig {
         env: BTreeMap::new(),
         disabled: false,
         scope: McpScope::Global,
+        reaches_network: None,
     }
 }
 
@@ -305,6 +309,7 @@ fn cwd_cfg() -> McpServerConfig {
         disabled: false,
         // Workspace-scoped: one instance per session root (RFC 0018 §4.2).
         scope: McpScope::Workspace,
+        reaches_network: None,
     }
 }
 

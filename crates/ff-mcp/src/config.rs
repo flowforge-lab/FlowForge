@@ -46,6 +46,8 @@ struct RawServerEntry {
     disabled: bool,
     #[serde(default, skip_serializing_if = "McpScope::is_global")]
     scope: McpScope,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reaches_network: Option<bool>,
 }
 
 /// `skip_serializing_if` predicate: omit `disabled` when it is the default `false`.
@@ -117,6 +119,10 @@ pub fn upsert(path: &Path, def: &McpServerInput) -> Result<(), McpError> {
             env: def.env.clone(),
             disabled: def.disabled,
             scope: def.scope,
+            // McpServerInput (the add-server write-back path) does not carry an
+            // egress policy yet; a Settings UI to set it is future work. Written
+            // configs omit the field (fail-safe network-capable) until then.
+            reaches_network: None,
         },
     );
     write_raw(path, &raw)
@@ -193,6 +199,7 @@ fn parse(
             env,
             disabled: entry.disabled,
             scope: entry.scope,
+            reaches_network: entry.reaches_network,
         });
     }
     // BTreeMap iteration is already id-sorted; keep that contract explicit.

@@ -20,4 +20,13 @@ name: string, description: string, inputSchema: unknown,
  * as write-capable), so the safety default stays conservative. Used to let a
  * read-only bridged tool run without an approval gate (e.g. codegraph queries).
  */
-readOnlyHint: boolean, };
+readOnlyHint: boolean, 
+/**
+ * Whether the serving server may reach the network (RFC 0013 egress). Resolved
+ * at publish time from the server's [`McpServerConfig::reaches_network`] (the
+ * MCP protocol has no network annotation, unlike `readOnlyHint`). Fail-safe
+ * `true` when the config is unset, so a `LocalOnly` phenotype strips the tool
+ * unless the operator vetted the server as local. Mirrors how `read_only_hint`
+ * feeds the bridged tool's `Safety`.
+ */
+reachesNetwork: boolean, };

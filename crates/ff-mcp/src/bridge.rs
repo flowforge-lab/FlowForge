@@ -41,6 +41,7 @@ pub struct McpBridgedTool {
     description: String,
     input_schema: Value,
     read_only_hint: bool,
+    reaches_network: bool,
 }
 
 impl McpBridgedTool {
@@ -59,13 +60,15 @@ impl McpBridgedTool {
             description: info.description.clone(),
             input_schema: info.input_schema.clone(),
             read_only_hint: info.read_only_hint,
+            reaches_network: info.reaches_network,
         }
     }
 
-    /// Build an inert instance for unit tests that only need to assert safety
-    /// classification from `read_only_hint` — the handle/key/schema don't affect it.
+    /// Build an inert instance for unit tests that only need to assert
+    /// classification from `read_only_hint` / `reaches_network` — the
+    /// handle/key/schema don't affect it.
     #[cfg(test)]
-    pub(crate) fn for_test(read_only_hint: bool) -> Self {
+    pub(crate) fn for_test(read_only_hint: bool, reaches_network: bool) -> Self {
         Self {
             handle: crate::supervisor::SupervisorHandle::for_test(),
             key: crate::key::InstanceKey::global("test"),
@@ -74,6 +77,7 @@ impl McpBridgedTool {
             description: String::new(),
             input_schema: serde_json::json!({"type": "object"}),
             read_only_hint,
+            reaches_network,
         }
     }
 }
@@ -124,6 +128,13 @@ impl Tool for McpBridgedTool {
 
     fn max_safety(&self) -> Safety {
         safety_for(self.read_only_hint)
+    }
+
+    fn reaches_network(&self) -> bool {
+        // Resolved from the serving server's `reaches_network` config (RFC 0013).
+        // Fail-safe `true` when the operator hasn't vetted the server as local, so
+        // a LocalOnly phenotype strips it — mirrors how `read_only_hint` feeds safety.
+        self.reaches_network
     }
 
     async fn run(&self, args: Value, _root: &Path) -> ToolOutcome {

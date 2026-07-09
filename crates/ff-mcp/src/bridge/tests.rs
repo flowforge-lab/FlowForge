@@ -23,14 +23,27 @@ fn bridged_tool_safety_floor_and_ceiling_track_read_only_hint() {
     // (ToolRegistry::readonly_capable_names), so a readOnlyHint tool (codegraph)
     // must report ReadOnly for safety AND min_safety AND max_safety — not just
     // safety() (the gap #841 left, which kept codegraph gated out of Plan).
-    let ro = McpBridgedTool::for_test(true);
+    let ro = McpBridgedTool::for_test(true, true);
     assert_eq!(ro.safety(&serde_json::Value::Null), Safety::ReadOnly);
     assert_eq!(ro.min_safety(), Safety::ReadOnly);
     assert_eq!(ro.max_safety(), Safety::ReadOnly);
 
     // A tool without the hint stays Write at every level → still gated in Plan.
-    let rw = McpBridgedTool::for_test(false);
+    let rw = McpBridgedTool::for_test(false, true);
     assert_eq!(rw.safety(&serde_json::Value::Null), Safety::Write);
     assert_eq!(rw.min_safety(), Safety::Write);
     assert_eq!(rw.max_safety(), Safety::Write);
+}
+
+#[test]
+fn bridged_tool_reaches_network_tracks_the_resolved_hint() {
+    use ff_tools::Tool;
+    // RFC 0013 #884: reaches_network mirrors read_only_hint's plumbing. A server
+    // vetted as local (reaches_network=false) yields a bridged tool that survives
+    // a LocalOnly phenotype's advertised-set filter; the fail-safe default (true)
+    // is stripped. Orthogonal to readOnlyHint — a read-only tool can still egress.
+    assert!(!McpBridgedTool::for_test(true, false).reaches_network());
+    assert!(McpBridgedTool::for_test(true, true).reaches_network());
+    assert!(!McpBridgedTool::for_test(false, false).reaches_network());
+    assert!(McpBridgedTool::for_test(false, true).reaches_network());
 }

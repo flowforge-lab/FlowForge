@@ -840,6 +840,7 @@ fn ws_server(id: &str) -> McpServerConfig {
         env: Default::default(),
         disabled: false,
         scope: ff_core::McpScope::Workspace,
+        reaches_network: None,
     }
 }
 

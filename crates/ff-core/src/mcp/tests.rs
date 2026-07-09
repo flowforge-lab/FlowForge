@@ -23,6 +23,7 @@ fn server_config_round_trips_and_is_camel_case() {
         env: BTreeMap::from([("LOG_LEVEL".to_string(), "info".to_string())]),
         disabled: false,
         scope: McpScope::Global,
+        reaches_network: None,
     };
     round_trip(&cfg);
     // `disabled` defaults so a minimal config parses.
@@ -30,6 +31,17 @@ fn server_config_round_trips_and_is_camel_case() {
     assert!(minimal.args.is_empty() && !minimal.disabled);
     // An absent `scope` field defaults to Global (RFC 0018 back-compat).
     assert_eq!(minimal.scope, McpScope::Global);
+    // RFC 0013: `reaches_network` is fail-safe None when absent, so a LocalOnly
+    // phenotype strips the server unless the operator vetted it as local.
+    assert_eq!(minimal.reaches_network, None);
+    let local: McpServerConfig =
+        serde_json::from_str(r#"{"id":"cg","command":"codegraph","reachesNetwork":false}"#)
+            .unwrap();
+    assert_eq!(local.reaches_network, Some(false));
+    round_trip(&local);
+    assert!(serde_json::to_string(&local)
+        .unwrap()
+        .contains("\"reachesNetwork\":false"));
     // Global is skip-serialized, so existing configs round-trip without a
     // `scope` key on the wire.
     let json = serde_json::to_string(&minimal).unwrap();
@@ -88,9 +100,18 @@ fn tool_info_round_trips_with_schema() {
             "required": ["path"]
         }),
         read_only_hint: true,
+        reaches_network: true,
     };
     round_trip(&tool);
     // camelCase: the Rust `input_schema` field is `inputSchema` on the wire.
     let json = serde_json::to_string(&tool).unwrap();
     assert!(json.contains("\"inputSchema\""), "{json}");
+    // RFC 0013 #884: `reaches_network` is fail-safe true when absent from the wire
+    // (a tool the supervisor hasn't stamped is treated as network-capable).
+    let bare: McpToolInfo = serde_json::from_str(
+        r#"{"server":"s","name":"t","description":"","inputSchema":{"type":"object"}}"#,
+    )
+    .unwrap();
+    assert!(bare.reaches_network);
+    assert!(!bare.read_only_hint);
 }

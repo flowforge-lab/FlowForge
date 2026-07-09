@@ -128,6 +128,7 @@ fn pheno(name: &str) -> Phenotype {
             env: Default::default(),
             disabled: false,
             scope: ff_core::McpScope::Workspace,
+            reaches_network: None,
         }],
         egress: ff_core::Egress::Open,
     }
