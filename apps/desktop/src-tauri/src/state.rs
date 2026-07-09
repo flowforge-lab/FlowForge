@@ -1033,16 +1033,21 @@ const fn fnv1a_mix(mut h: u64, bytes: &[u8]) -> u64 {
     h
 }
 
-/// Compile-time fingerprint of the bundled seed content (Codon phenotype +
-/// codegraph skill) folded with [`SEED_LOGIC_VERSION`]. Persisted to
-/// `~/.flowforge/.seed_version` after a successful seed pass; a matching stamp
-/// on the next launch short-circuits the whole pass ([`seed_builtin_content`])
-/// — no `exists()`/stat calls, no `mcp.json` read, no dir-walks (#599 item 3).
-/// Editing either `include_str!` source, or bumping [`SEED_LOGIC_VERSION`],
-/// yields a new fingerprint and re-runs the pass exactly once.
+/// Compile-time fingerprint of the bundled seed content (Codon + the RFC 0013
+/// phenotype family + codegraph skill) folded with [`SEED_LOGIC_VERSION`].
+/// Persisted to `~/.flowforge/.seed_version` after a successful seed pass; a
+/// matching stamp on the next launch short-circuits the whole pass
+/// ([`seed_builtin_content`]) — no `exists()`/stat calls, no `mcp.json` read, no
+/// dir-walks (#599 item 3). Editing any bundled `include_str!` source, or bumping
+/// [`SEED_LOGIC_VERSION`], yields a new fingerprint and re-runs the pass exactly
+/// once. Every seeded file MUST be folded in here, or an already-stamped user
+/// never receives it on upgrade (the gate would short-circuit on the stale stamp).
 const SEED_FINGERPRINT: u64 = {
     let h = 0xcbf2_9ce4_8422_2325u64;
     let h = fnv1a_mix(h, CODON_PHENOTYPE_TOML.as_bytes());
+    let h = fnv1a_mix(h, ORCHESTRATOR_PHENOTYPE_TOML.as_bytes());
+    let h = fnv1a_mix(h, ERUDITE_PHENOTYPE_TOML.as_bytes());
+    let h = fnv1a_mix(h, ENCLAVE_PHENOTYPE_TOML.as_bytes());
     let h = fnv1a_mix(h, CODEGRAPH_SKILL_MD.as_bytes());
     let h = fnv1a_mix(h, SEED_LOGIC_VERSION.as_bytes());
     h

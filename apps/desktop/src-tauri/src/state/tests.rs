@@ -2445,6 +2445,52 @@ fn seed_gate_re_runs_when_stamp_is_stale() {
 }
 
 #[test]
+fn seed_gate_reseeds_rfc0013_family_for_upgraders() {
+    // Regression for the P2 blocker (#889 review): the RFC 0013 phenotype family
+    // must land for an EXISTING user upgrading, not just a fresh install. Such a
+    // user already has a stamp matching the PRE-family fingerprint (codon +
+    // codegraph + logic version, without the 3 new TOMLs). If those TOMLs aren't
+    // folded into SEED_FINGERPRINT, that stamp still matches and the gate skips the
+    // whole pass -> orchestrator/erudite/enclave never arrive. Reconstruct that
+    // pre-family fingerprint, stamp with it, and assert the gate re-runs and writes
+    // the family. (The existing suite only proved codon re-seeds on an arbitrary
+    // stale stamp, and the family test bypassed the gate via seed_builtin_content_at.)
+    let root = tempfile::tempdir().unwrap();
+    let phenos = root.path().join("phenos");
+    let skills = root.path().join("skills");
+    let stamp = root.path().join(".seed_version");
+
+    // The fingerprint as it was BEFORE the family was added: codon + codegraph +
+    // logic version only. Must differ from the current SEED_FINGERPRINT now that
+    // the three TOMLs are folded in.
+    let pre_family = {
+        let h = 0xcbf2_9ce4_8422_2325u64;
+        let h = fnv1a_mix(h, CODON_PHENOTYPE_TOML.as_bytes());
+        let h = fnv1a_mix(h, CODEGRAPH_SKILL_MD.as_bytes());
+        fnv1a_mix(h, SEED_LOGIC_VERSION.as_bytes())
+    };
+    assert_ne!(
+        pre_family, SEED_FINGERPRINT,
+        "the new TOMLs must change the fingerprint, or upgraders never re-seed"
+    );
+    fs::write(&stamp, format!("{pre_family:016x}\n")).unwrap();
+
+    seed_builtin_content_gated(Some(&stamp), &phenos, &skills, None);
+
+    for name in ["orchestrator", "erudite", "enclave"] {
+        assert!(
+            phenos.join(format!("{name}.toml")).exists(),
+            "{name}.toml must be seeded for an upgrading user (stale pre-family stamp)"
+        );
+    }
+    assert_eq!(
+        fs::read_to_string(&stamp).unwrap(),
+        format!("{:016x}\n", SEED_FINGERPRINT),
+        "the re-run must refresh the stamp to the current fingerprint"
+    );
+}
+
+#[test]
 fn seed_gate_treats_corrupt_stamp_as_mismatch() {
     let root = tempfile::tempdir().unwrap();
     let phenos = root.path().join("phenos");
