@@ -65,7 +65,7 @@ import type { Format } from "../bindings/Format";
 import type { SecretKind } from "../bindings/SecretKind";
 import type { BedrockAuth } from "../bindings/BedrockAuth";
 import type { SearchHit } from "../bindings/SearchHit";
-import type { NotebookKernelState } from "./notebook-kernel-state";
+import type { NotebookKernelState } from "../bindings/NotebookKernelState";
 
 export type Unlisten = () => void;
 
@@ -507,20 +507,14 @@ export interface FfIpc {
    *  (not `goal:updated`); the panel unmounts when the store drops that session. */
   goalClear(sessionId: string): Promise<void>;
 
-  // CONTRACT CHANGE (#871 FE-1, kernel status affordance panel): NEW commands
-  // needing a real Rust emitter — please review @backend-owner. The store +
-  // panel (`store/notebook.ts`, `components/notebook-status-panel.tsx`) ship in
-  // this PR; the commands land in a follow-up BE PR (~40 LOC on top of the
-  // existing `KernelSupervisor`, `invoke_handler!` registration, and a real
-  // ts-rs `NotebookKernelState` binding — until then `NotebookKernelState` is
-  // a plain FE-owned type at `lib/notebook-kernel-state.ts`, not a generated
-  // binding (see that file's header for why). On a real (non-mock) build
-  // these currently reject — `notebookStatus` fails closed after the first
-  // rejection (see `store/notebook.ts`) so the panel silently no-ops instead
-  // of retrying every mount. Mocked under `VITE_FF_MOCK=1` so the panel runs
-  // standalone. No new events: a later `notebook:updated` push event can
-  // replace the polling that's currently the source of live signal —
-  // tracked in #871, not implemented here.
+  // #871: the `notebook_status` / `notebook_stop` Tauri commands are backed by
+  // `KernelSupervisor` (`crates/ff-tools/src/notebook/mod.rs`) and registered in
+  // `invoke_handler!`; `NotebookKernelState` is the generated ts-rs binding.
+  // `notebookStatus` still fails closed after the first rejection (see
+  // `store/notebook.ts`) so an older build without the commands degrades
+  // gracefully instead of retrying every mount. Mocked under `VITE_FF_MOCK=1`.
+  // No new events yet: a later `notebook:updated` push event can replace the
+  // panel's polling as the source of live signal — tracked in #871.
   /** Per-session snapshot of the `notebook_runner` kernel (#871 FE-1). Returns
    *  the current state without spinning up an agent turn — mirrors
    *  `goalStatus`. When the session has no kernel, `hasKernel=false` and every

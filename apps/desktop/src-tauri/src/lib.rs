@@ -31,7 +31,7 @@ use ff_core::{
 };
 use ff_scheduled::ScheduledApprover;
 use ff_signals::SkillAggregate;
-use ff_tools::Safety;
+use ff_tools::{NotebookKernelState, Safety};
 use state::AppState;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -688,6 +688,26 @@ async fn goal_complete(
         let _ = app.emit("goal:updated", &goal);
     }
     Ok(Some(goal))
+}
+
+/// Snapshot a session's `notebook_runner` kernel for the status panel (#871).
+/// Read-only, so the panel can poll it while a kernel runs. Returns
+/// `has_kernel: false` when the session has no kernel.
+#[tauri::command]
+async fn notebook_status(
+    state: State<'_, Arc<AppState>>,
+    session_id: String,
+) -> Result<NotebookKernelState, String> {
+    Ok(state.notebook_snapshot(&session_id).await)
+}
+
+/// Stop the session's `notebook_runner` kernel(s) — the panel's Stop button
+/// (#871). Idempotent: a no-op when the session has no kernel. The FE follows
+/// up with `notebook_status` to render the post-stop ("no kernel") snapshot.
+#[tauri::command]
+async fn notebook_stop(state: State<'_, Arc<AppState>>, session_id: String) -> Result<(), String> {
+    state.notebook_stop(&session_id).await;
+    Ok(())
 }
 
 /// Fire a scheduled task immediately, off-schedule (RFC 0017 §8.3). Runs the
@@ -3448,6 +3468,8 @@ pub fn run() {
             goal_resume,
             goal_clear,
             goal_complete,
+            notebook_status,
+            notebook_stop,
             preview_cadence,
             get_session_workspace,
             set_session_workspace,

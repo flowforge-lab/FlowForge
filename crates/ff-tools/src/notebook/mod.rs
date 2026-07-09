@@ -16,7 +16,9 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use async_trait::async_trait;
+use serde::Serialize;
 use serde_json::Value;
+use ts_rs::TS;
 
 use crate::registry::{Safety, Tool, ToolOutcome, NO_SESSION};
 use kernel::{KernelState, DEFAULT_CELL_TIMEOUT_SECS, MAX_CELL_TIMEOUT_SECS};
@@ -24,6 +26,49 @@ use kernel::{KernelState, DEFAULT_CELL_TIMEOUT_SECS, MAX_CELL_TIMEOUT_SECS};
 /// Max live kernels per session (Phase 3, #856). Bounds resource use while still
 /// letting a workflow keep a couple of independent namespaces side by side.
 const MAX_KERNELS_PER_SESSION: usize = 3;
+
+/// Lifecycle of a single kernel as surfaced to the desktop status panel (#871).
+/// `"dead"` reflects a kernel that died on its own (EOF on its pipe); a user
+/// Stop reaps the session instead, so it never produces `Dead`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(export, export_to = "../../../apps/desktop/src/bindings/")]
+pub enum KernelLiveState {
+    Running,
+    Dead,
+}
+
+/// Single-kernel snapshot of a session's `notebook_runner` state for the desktop
+/// status panel (#871). This is the canonical ts-rs source for the shape the FE
+/// previously carried as a hand-written stub.
+///
+/// A session may hold up to [`MAX_KERNELS_PER_SESSION`] kernels (Phase 3), but
+/// the panel's contract is single-kernel: the typed fields describe a
+/// representative kernel (a live one if any, else the first by id), while
+/// [`raw`](Self::raw) carries the full canonical multi-line status text so no
+/// kernel is hidden when several are live.
+#[derive(Debug, Clone, PartialEq, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "../../../apps/desktop/src/bindings/")]
+pub struct NotebookKernelState {
+    pub session_id: String,
+    /// False when the session has no kernel; the remaining fields are then
+    /// null/zero. True means `state`, `kernel_id`, and `pid` describe the
+    /// representative kernel.
+    pub has_kernel: bool,
+    /// The representative kernel's lifecycle; null when there is no kernel.
+    pub state: Option<KernelLiveState>,
+    /// The representative kernel's id (e.g. `kernel-abcd1234`); null when none.
+    pub kernel_id: Option<String>,
+    /// The representative kernel's process id; null when none or unavailable.
+    pub pid: Option<u32>,
+    /// Cells executed by the representative kernel so far; zero when none.
+    #[ts(type = "number")]
+    pub execution_count: u64,
+    /// The full canonical status text (`kernel <id> — <state>; pid=…; cells
+    /// executed=…`, one line per kernel). Empty when there is no kernel.
+    pub raw: String,
+}
 
 /// Per-cell result from a `run_all` invocation.
 #[derive(Debug, Clone)]
@@ -157,26 +202,74 @@ impl KernelSupervisor {
         session.get_mut(&id).unwrap().inspect(timeout_secs).await
     }
 
+    /// Render the canonical multi-line status text for a session's kernels
+    /// (one line per kernel, sorted by id). Assumes a non-empty session; the
+    /// "no kernel" case is handled by callers.
+    fn render_status(session: &HashMap<String, KernelState>) -> String {
+        let mut ids: Vec<&String> = session.keys().collect();
+        ids.sort();
+        let mut lines = Vec::with_capacity(ids.len());
+        for id in ids {
+            let k = &session[id];
+            let state = if k.dead { "dead" } else { "running" };
+            lines.push(format!(
+                "kernel {} — {state}; pid={}; cells executed={}",
+                k.kernel_id,
+                k.pid().map(|p| p.to_string()).unwrap_or_else(|| "?".into()),
+                k.execution_count
+            ));
+        }
+        lines.join("\n")
+    }
+
     async fn status(&self, session_id: &str) -> String {
         let kernels = self.kernels.lock().await;
         match kernels.get(session_id) {
-            None => "no kernel running for this session".to_string(),
-            Some(session) if session.is_empty() => "no kernel running for this session".to_string(),
+            Some(session) if !session.is_empty() => Self::render_status(session),
+            _ => "no kernel running for this session".to_string(),
+        }
+    }
+
+    /// Structured snapshot of a session's kernel state for the desktop status
+    /// panel (#871). Projects the (possibly multi-kernel) session onto the
+    /// single-kernel [`NotebookKernelState`] contract: the typed fields describe
+    /// a representative kernel — a live one if any, else the first by id — while
+    /// `raw` lists every kernel. No kernel → `has_kernel: false`.
+    pub async fn snapshot(&self, session_id: &str) -> NotebookKernelState {
+        let kernels = self.kernels.lock().await;
+        match kernels.get(session_id).filter(|s| !s.is_empty()) {
+            None => NotebookKernelState {
+                session_id: session_id.to_string(),
+                has_kernel: false,
+                state: None,
+                kernel_id: None,
+                pid: None,
+                execution_count: 0,
+                raw: String::new(),
+            },
             Some(session) => {
-                let mut ids: Vec<&String> = session.keys().collect();
-                ids.sort();
-                let mut lines = Vec::with_capacity(ids.len());
-                for id in ids {
-                    let k = &session[id];
-                    let state = if k.dead { "dead" } else { "running" };
-                    lines.push(format!(
-                        "kernel {} — {state}; pid={}; cells executed={}",
-                        k.kernel_id,
-                        k.pid().map(|p| p.to_string()).unwrap_or_else(|| "?".into()),
-                        k.execution_count
-                    ));
+                let mut entries: Vec<&KernelState> = session.values().collect();
+                entries.sort_by(|a, b| a.kernel_id.cmp(&b.kernel_id));
+                // Prefer a live kernel as the panel's representative so its
+                // `running` poll keeps ticking even if a dead kernel sorts ahead.
+                let rep = entries
+                    .iter()
+                    .copied()
+                    .find(|k| !k.dead)
+                    .unwrap_or(entries[0]);
+                NotebookKernelState {
+                    session_id: session_id.to_string(),
+                    has_kernel: true,
+                    state: Some(if rep.dead {
+                        KernelLiveState::Dead
+                    } else {
+                        KernelLiveState::Running
+                    }),
+                    kernel_id: Some(rep.kernel_id.clone()),
+                    pid: rep.pid(),
+                    execution_count: rep.execution_count,
+                    raw: Self::render_status(session),
                 }
-                lines.join("\n")
             }
         }
     }

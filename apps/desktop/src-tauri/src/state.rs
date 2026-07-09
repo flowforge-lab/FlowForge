@@ -36,7 +36,7 @@ use ff_skills::{
     SkillWatcher, DEFAULT_PHENOTYPE,
 };
 use ff_tools::memory::{MemoryConsolidateTool, MemoryGetTool, MemorySearchTool, MemoryWriteTool};
-use ff_tools::notebook::{KernelSupervisor, NotebookTool};
+use ff_tools::notebook::{KernelSupervisor, NotebookKernelState, NotebookTool};
 use ff_tools::process::{ProcessManagerTool, ProcessSupervisor};
 use ff_tools::{Safety, ToolRegistry};
 use tokio::sync::oneshot;
@@ -1913,6 +1913,24 @@ impl AppState {
                 tracing::info!(session_id = %id, reaped = n, "reaped session kernel");
             }
         });
+    }
+
+    /// Snapshot a session's `notebook_runner` kernel for the desktop status
+    /// panel (#871). Read-only; safe for the panel to poll while a kernel runs.
+    pub async fn notebook_snapshot(&self, session_id: &str) -> NotebookKernelState {
+        self.kernel_supervisor.snapshot(session_id).await
+    }
+
+    /// Stop every kernel in a session (the panel's Stop button, #871).
+    /// Idempotent — a session with no kernel is a no-op. Unlike
+    /// [`reap_session_kernels`](Self::reap_session_kernels), this is awaited
+    /// inline: the caller is an async command already running on the reactor,
+    /// and the FE refreshes the snapshot once it resolves.
+    pub async fn notebook_stop(&self, session_id: &str) {
+        let n = self.kernel_supervisor.reap_session(session_id).await;
+        if n > 0 {
+            tracing::info!(session_id = %session_id, reaped = n, "stopped session kernels (panel)");
+        }
     }
 
     /// Start a periodic background reaper that drives

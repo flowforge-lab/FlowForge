@@ -51,7 +51,7 @@ mod write;
 pub use agent_tool::{AgentTool, AGENT_TOOL_NAME};
 pub use compaction::{CompactionRetrieveTool, COMPACTION_RETRIEVE_TOOL};
 pub use goal_complete::{GoalCompleteTool, GOAL_COMPLETE_TOOL_NAME};
-pub use notebook::{KernelSupervisor, NotebookTool};
+pub use notebook::{KernelLiveState, KernelSupervisor, NotebookKernelState, NotebookTool};
 pub use registry::{is_subagent, Safety, Tool, ToolOutcome, ToolRegistry};
 pub use sink::{OutputSink, OutputStream};
 pub use url_safety::SsrfPolicy;

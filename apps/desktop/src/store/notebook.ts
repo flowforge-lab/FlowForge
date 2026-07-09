@@ -5,11 +5,12 @@
 // replace polling — tracked in #871, not implemented here).
 //
 // Mocked under `VITE_FF_MOCK=1` so the panel runs standalone. The real
-// `notebook_status` / `notebook_stop` IPC commands land in a follow-up BE PR.
+// `notebook_status` / `notebook_stop` IPC commands are backed by
+// `KernelSupervisor` (`crates/ff-tools/src/notebook/mod.rs`).
 
 import { create } from "zustand";
 import { ipc } from "@/lib/ipc";
-import type { NotebookKernelState } from "@/lib/notebook-kernel-state";
+import type { NotebookKernelState } from "@/bindings/NotebookKernelState";
 
 /**
  * A session's snapshot, after the FE has decided whether to display the panel.
@@ -27,8 +28,8 @@ interface NotebookState {
   bySession: Record<string, MaybeKernel>;
 
   /** Set once `notebookStatus` rejects — meaning the `notebook_status` /
-   *  `notebook_stop` Tauri commands aren't registered on this build yet (see
-   *  the contract note in `lib/ipc.ts`; they land in a follow-up BE PR).
+   *  `notebook_stop` Tauri commands aren't registered on this build (an older
+   *  build predating the BE commands; see the contract note in `lib/ipc.ts`).
    *  Once tripped, `hydrate`/`refresh`/`stop` no-op instead of re-invoking a
    *  command that will never resolve — otherwise every session-pane
    *  mount would `console.error` against a real (non-mock) build. There's no

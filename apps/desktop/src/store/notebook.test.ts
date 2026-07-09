@@ -3,7 +3,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { ipc } from "@/lib/ipc";
-import type { NotebookKernelState } from "@/lib/notebook-kernel-state";
+import type { NotebookKernelState } from "@/bindings/NotebookKernelState";
 import { useNotebookStore } from "@/store/notebook";
 
 function snapshot(
