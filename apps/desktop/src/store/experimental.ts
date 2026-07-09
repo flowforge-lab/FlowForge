@@ -8,6 +8,23 @@ import { persist } from "zustand/middleware";
 
 const STORAGE_KEY = "ff-experimental";
 
+/** Default notebook_runner status poll interval (#871 FE-1). The panel reads this
+ *  and re-arms a `setInterval` while the kernel state is live. 5s gives a steady
+ *  "still running" signal without hammering the IPC; the lower bound (1s) keeps
+ *  a power user from accidentally pegging the loop. */
+export const NOTEBOOK_POLL_DEFAULT_MS = 5000;
+export const NOTEBOOK_POLL_MIN_MS = 1000;
+export const NOTEBOOK_POLL_MAX_MS = 60_000;
+
+/** Clamp into the legal range; out-of-range values fall to the default so an
+ *  invalid persisted value can't crash the poller. */
+export function clampNotebookPollInterval(ms: number): number {
+  if (!Number.isFinite(ms)) return NOTEBOOK_POLL_DEFAULT_MS;
+  if (ms < NOTEBOOK_POLL_MIN_MS) return NOTEBOOK_POLL_MIN_MS;
+  if (ms > NOTEBOOK_POLL_MAX_MS) return NOTEBOOK_POLL_MAX_MS;
+  return ms;
+}
+
 /** The opt-in flags. Keep in sync with the rows in experimental-section.tsx. */
 export type FlagId =
   | "ownApiKey"
@@ -59,7 +76,13 @@ export const EXPERIMENTAL_DEFAULTS: ExperimentalFlags = {
 
 export interface ExperimentalState {
   flags: ExperimentalFlags;
+  /** Notebook status panel poll interval (#871 FE-1), ms. Default
+   *  `NOTEBOOK_POLL_DEFAULT_MS`; setters clamp into the legal range so the
+   *  interval can never underflow or stall. */
+  notebookPollIntervalMs: number;
   setFlag: (id: FlagId, on: boolean) => void;
+  /** Clamped into `[NOTEBOOK_POLL_MIN_MS, NOTEBOOK_POLL_MAX_MS]`. */
+  setNotebookPollInterval: (ms: number) => void;
   resetExperimental: () => void;
 }
 
@@ -67,19 +90,30 @@ export const useExperimentalStore = create<ExperimentalState>()(
   persist(
     (set) => ({
       flags: { ...EXPERIMENTAL_DEFAULTS },
+      notebookPollIntervalMs: NOTEBOOK_POLL_DEFAULT_MS,
       setFlag: (id, on) => set((s) => ({ flags: { ...s.flags, [id]: on } })),
-      resetExperimental: () => set({ flags: { ...EXPERIMENTAL_DEFAULTS } }),
+      setNotebookPollInterval: (ms) =>
+        set({ notebookPollIntervalMs: clampNotebookPollInterval(ms) }),
+      resetExperimental: () =>
+        set({
+          flags: { ...EXPERIMENTAL_DEFAULTS },
+          notebookPollIntervalMs: NOTEBOOK_POLL_DEFAULT_MS,
+        }),
     }),
     {
       name: STORAGE_KEY,
-      // Defaults first so a blob persisted before a flag existed hydrates that
-      // flag to `false` rather than `undefined`.
+      // Defaults first so a blob persisted before a field existed hydrates that
+      // field to its default rather than `undefined` — see the same merge on
+      // `flags` for the original rationale; the interval is just the next row.
       merge: (persisted, current) => {
         const p = persisted as Partial<ExperimentalState> | undefined;
         return {
           ...current,
           ...p,
           flags: { ...EXPERIMENTAL_DEFAULTS, ...(p?.flags ?? {}) },
+          notebookPollIntervalMs: clampNotebookPollInterval(
+            p?.notebookPollIntervalMs ?? current.notebookPollIntervalMs,
+          ),
         };
       },
     },

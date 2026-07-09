@@ -69,3 +69,4 @@ export type { BuiltinAction } from "./BuiltinAction";
 export type { SafetyCeiling } from "./SafetyCeiling";
 export type { RunRecord } from "./RunRecord";
 export type { RunStatus } from "./RunStatus";
+export type { NotebookKernelState } from "./NotebookKernelState";

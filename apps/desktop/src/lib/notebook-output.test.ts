@@ -19,7 +19,15 @@ describe("isNotebookRunnerStep", () => {
 });
 
 describe("parseNotebookStep", () => {
-  const cases: NotebookAction[] = ["start", "run_cell", "status", "stop"];
+  const cases: NotebookAction[] = [
+    "start",
+    "run_cell",
+    "run_all",
+    "status",
+    "stop",
+    "restart",
+    "inspect",
+  ];
 
   it.each(cases)(
     "returns null for non-notebook tool names (action=%s)",
@@ -155,6 +163,43 @@ describe("parseNotebookStep", () => {
       "done",
     );
     expect(stop?.action).toBe("stop");
+  });
+
+  it("renders Phase-3 `restart` as plain result text (not a status report)", () => {
+    // Pre-declared in #871 FE-0 so Phase 3 doesn't widen the union retroactively.
+    // The current backend doesn't emit it yet, so the parser must accept it now
+    // and render it the same way as `stop` (neutral, non-status).
+    const parsed = parseNotebookStep(
+      "notebook_runner",
+      { action: "restart" },
+      "restarted kernel kernel-aaaaaaaa",
+      "done",
+    );
+    expect(parsed?.action).toBe("restart");
+    expect(parsed?.isStatusReport).toBe(false);
+    expect(parsed?.errored).toBe(false);
+    expect(parsed?.output).toBe("restarted kernel kernel-aaaaaaaa");
+  });
+
+  it("renders Phase-3 `run_all` / `inspect` with the same neutral layout as `stop`", () => {
+    const runAll = parseNotebookStep(
+      "notebook_runner",
+      { action: "run_all" },
+      "ran 3 cells\n",
+      "done",
+    );
+    expect(runAll?.action).toBe("run_all");
+    expect(runAll?.isStatusReport).toBe(false);
+    expect(runAll?.output).toBe("ran 3 cells");
+
+    const inspect = parseNotebookStep(
+      "notebook_runner",
+      { action: "inspect" },
+      "x: int = 5",
+      "done",
+    );
+    expect(inspect?.action).toBe("inspect");
+    expect(inspect?.isStatusReport).toBe(false);
   });
 
   it("treats a running step with no result as a live cell", () => {
