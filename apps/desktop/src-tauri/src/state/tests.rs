@@ -957,6 +957,7 @@ fn mcp_cfg(id: &str, command: &str, scope: McpScope) -> McpServerConfig {
         env: Default::default(),
         disabled: false,
         scope,
+        reaches_network: None,
     }
 }
 
