@@ -2644,7 +2644,7 @@ Shipping the Settings redesign — currently the Memory browser (SET.8).
     // and a couple of auto-resolving reads.
     const a1 = this.emitProse(
       sessionId,
-      "I'll read the README and find the FlowForge references, then update the title.",
+      "I'll read the README and find every FlowForge reference across the codebase, then figure out which file actually needs the title update before making any changes.",
     );
     turn.messageId = a1;
     this.emitAutoStep(
@@ -2680,7 +2680,7 @@ Shipping the Settings redesign — currently the Memory browser (SET.8).
     // and the approve round-trips under VITE_FF_MOCK=1.
     const a2 = this.emitProse(
       sessionId,
-      "Found 7 references across 3 files. I'll confirm the file, then make the edit.",
+      "Found 7 references across 3 different files, and the naming looks consistent so far. I'll confirm the right file, then make the edit.",
     );
     turn.messageId = a2;
     this.emitAskStep(sessionId, a2, turn, secret, () => {

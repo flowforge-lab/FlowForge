@@ -33,6 +33,7 @@ function MessageRowImpl({
   message,
   streaming,
   toolSteps,
+  hasOwnLiveSteps,
   items,
   turnStartMs,
   reasoning,
@@ -47,6 +48,12 @@ function MessageRowImpl({
   message: Message;
   streaming: boolean;
   toolSteps: ToolStep[];
+  /** True when `message` (the turn's current iteration) already has its own
+   *  tool call recorded — i.e. it's *guaranteed* not the final answer, even
+   *  though it's still the one streaming (#864). Gates the answer slot's
+   *  "On it" collapse: a genuine final answer (no tool call of its own) never
+   *  collapses, matching the issue's "final answer is never eligible" rule. */
+  hasOwnLiveSteps: boolean;
   items: TurnItem[];
   turnStartMs?: number | null;
   reasoning: string;
@@ -274,15 +281,38 @@ function MessageRowImpl({
           />
         ) : (
           <div className="group relative w-full">
-            <div
-              data-selectable
-              className={cn(
-                "px-0.5 py-1 text-sm leading-relaxed text-foreground",
-                streaming && "ff-streaming-caret",
-              )}
-            >
-              <Markdown content={message.content} streaming={streaming} />
-            </div>
+            {/* This iteration's own content, still streaming. Usually the
+                growing final answer (rendered bare, as always) — but if it
+                *already* has a tool call of its own recorded (`hasOwnLiveSteps`,
+                never true on reload — `toolStepsByMessage` is a live-session-only
+                map), it's guaranteed not the final answer, so it gets the same
+                "On it" collapse as a settled intermediate-prose segment, just
+                not-yet-settled (#864). A `prose` TurnItem for this same text
+                won't exist until the *next* iteration starts, by which point
+                it's already fully settled (see active-prose-block.tsx) — this
+                is the only place the *live* in-flight case is reachable.
+                Gated on `streaming` too: `toolStepsByMessage[m.id]` outlives
+                the stream (cleared only on reload/edit-truncation), so once
+                this message settles it must fall back to the plain branch
+                below like any other finished answer. */}
+            {hasOwnLiveSteps && streaming ? (
+              <ActiveProseBlock
+                text={message.content}
+                streaming={streaming}
+                tone="foreground"
+                caret={streaming}
+              />
+            ) : (
+              <div
+                data-selectable
+                className={cn(
+                  "px-0.5 py-1 text-sm leading-relaxed text-foreground",
+                  streaming && "ff-streaming-caret",
+                )}
+              >
+                <Markdown content={message.content} streaming={streaming} />
+              </div>
+            )}
             {/* Always-visible copy affordance under the response (#604). Hidden
                 mid-stream — copying a half-streamed answer is wrong. */}
             {!streaming && (
@@ -451,6 +481,7 @@ export function ChatView({ sessionId }: { sessionId?: string } = {}) {
                 message={m}
                 streaming={m.id === streamingId}
                 toolSteps={toolSteps}
+                hasOwnLiveSteps={liveTiming}
                 items={items}
                 turnStartMs={
                   turnStartByMessage[m.id] ?? turnStartBySession[m.sessionId]

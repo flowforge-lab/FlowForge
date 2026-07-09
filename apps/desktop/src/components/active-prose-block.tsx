@@ -29,12 +29,22 @@ export const ACTIVE_PROSE_COLLAPSE_THRESHOLD = 80;
 export function ActiveProseBlock({
   text,
   streaming,
+  tone = "muted",
+  caret = false,
 }: {
   text: string;
   /** True when the parent turn is in flight and this prose segment is the
    *  currently-streaming one. False once the turn settles — at which point the
    *  chip dissolves and the full prose is always visible. */
   streaming: boolean;
+  /** `"muted"` (default) for a settled intermediate-prose segment; `"foreground"`
+   *  for the live answer slot, which reads as a normal (not muted) reply once
+   *  expanded/settled — same brightness as today's final-answer text. */
+  tone?: "muted" | "foreground";
+  /** Appends the blinking `ff-streaming-caret` to the visible prose, matching
+   *  the answer slot's existing streaming-caret treatment. Only meaningful
+   *  while expanded — a collapsed chip shows its own `Spinner` instead. */
+  caret?: boolean;
 }) {
   // null = follow the auto-collapse. true/false = an explicit user choice that
   // sticks for the lifetime of this prose segment, so new tokens never
@@ -83,7 +93,11 @@ export function ActiveProseBlock({
           ref={contentRef}
           data-selectable
           data-prose-content
-          className="px-0.5 py-1 text-sm leading-relaxed text-muted-foreground"
+          className={cn(
+            "px-0.5 py-1 text-sm leading-relaxed",
+            tone === "foreground" ? "text-foreground" : "text-muted-foreground",
+            caret && "ff-streaming-caret",
+          )}
         >
           <Markdown content={text} streaming={streaming} />
         </div>
