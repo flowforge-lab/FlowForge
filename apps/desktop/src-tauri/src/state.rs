@@ -28,6 +28,7 @@ use ff_memory::{
     DecayConfig, EmbeddingProvider, FlushLedger, Fts5Index, HybridIndex, Memory, MemoryConfig,
     MemoryIndex, NoopEmbedder, OpenAiEmbedder,
 };
+use ff_observer::{ObserverEvent, ObserverSupervisor, ObserverTool};
 use ff_scheduled::ScheduledStore;
 use ff_session::SessionStore;
 use ff_signals::{SignalStore, SkillAggregate, SkillCompleted};
@@ -39,6 +40,7 @@ use ff_tools::memory::{MemoryConsolidateTool, MemoryGetTool, MemorySearchTool, M
 use ff_tools::notebook::{KernelSupervisor, NotebookKernelState, NotebookTool};
 use ff_tools::process::{ProcessManagerTool, ProcessSupervisor};
 use ff_tools::{Safety, ToolRegistry};
+use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::oneshot;
 
 /// Registry of in-flight turn cancellation tokens and tool-approval prompts, kept
@@ -1352,6 +1354,19 @@ pub struct AppState {
     /// session. Long-lived child processes, so they are reaped on session end
     /// (`reap_session_kernels`) and killed when the last `Arc` drops at app exit.
     kernel_supervisor: Arc<KernelSupervisor>,
+    /// Session-scoped supervisor of background observers (#891 Phase 1): a
+    /// `start / stop / list / reap_session` table that owns one
+    /// `ObserverSource` per live observer. The receiver of its
+    /// `mpsc::UnboundedReceiver<ObserverEvent>` is held in
+    /// [`observer_events_rx`](Self::observer_events_rx) and drained by
+    /// `start_observer_pump` on a single long-lived task.
+    observer_supervisor: Arc<ObserverSupervisor>,
+    /// The receive end of the observer event channel. Populated at
+    /// construction (so the supervisor's `Arc` can be shared with the
+    /// `observer` tool immediately); consumed once at
+    /// `start_observer_pump` time. The `Mutex<Option<…>>` is the same
+    /// idempotency shape `init_mcp_at` uses for its supervisor handle.
+    observer_events_rx: Mutex<Option<UnboundedReceiver<ObserverEvent>>>,
     /// Short-TTL cache for the Ollama served-window probe (#602), keyed by the
     /// resolved `(connection, model)`. The chip resolves on every render, but the
     /// served window changes only when the model is (re)loaded, so a probe per
@@ -1450,6 +1465,13 @@ impl AppState {
             },
         );
         crate::boot_trace_step("app_state.stores_parallel", t.elapsed());
+        // Build the observer supervisor and its event receiver
+        // together so the supervisor's sender side and the pump's
+        // receiver side are on the same channel (#891 Phase 1).
+        let (observer_supervisor, observer_events_rx) = {
+            let (sup, rx) = ObserverSupervisor::new();
+            (Arc::new(sup), rx)
+        };
         let state = Self {
             store,
             scheduled,
@@ -1482,6 +1504,8 @@ impl AppState {
             _memory_watcher: Mutex::new(memory_watcher),
             process_supervisor: Arc::new(ProcessSupervisor::new()),
             kernel_supervisor: Arc::new(KernelSupervisor::new()),
+            observer_supervisor,
+            observer_events_rx: Mutex::new(Some(observer_events_rx)),
             served_window_cache: Mutex::new(HashMap::new()),
             compaction_cache: CompactionCache::new(),
         };
@@ -1824,6 +1848,15 @@ impl AppState {
         reg.register(Box::new(ProcessManagerTool::new(
             self.process_supervisor.clone(),
         )));
+        // Background observers (#891 Phase 1): session-scoped
+        // file/dir watchers (Phase 2/3 add http/process). Registered
+        // next to `process_manager` because the two share the
+        // "long-lived background resource" shape — same supervisor
+        // discipline, same reap path, same id/discriminator tool
+        // surface.
+        reg.register(Box::new(ObserverTool::new(
+            self.observer_supervisor.clone(),
+        )));
         // Stateful Python kernel (#859): variables persist across `run_cell`
         // calls; scoped to the session and reaped on session end.
         reg.register(Box::new(NotebookTool::new(self.kernel_supervisor.clone())));
@@ -1955,6 +1988,68 @@ impl AppState {
         if n > 0 {
             tracing::info!(session_id = %session_id, reaped = n, "stopped session kernels (panel)");
         }
+    }
+
+    /// Stop and remove all background observers owned by `session_id` (#891
+    /// Phase 1). Same fire-and-forget, off-reactor-safe pattern as
+    /// [`reap_session_kernels`](Self::reap_session_kernels): a watcher is a
+    /// long-lived OS resource (kqueue/inotify fd), so it must be closed when
+    /// its session ends. Called from `delete_session` next to
+    /// `reap_session_kernels`.
+    pub fn reap_session_observers(&self, session_id: &str) {
+        let sup = self.observer_supervisor.clone();
+        let id = session_id.to_owned();
+        tauri::async_runtime::spawn(async move {
+            let n = sup.reap_session(&id).await;
+            if n > 0 {
+                tracing::info!(session_id = %id, reaped = n, "reaped session observers");
+            }
+        });
+    }
+
+    /// Start the single long-lived pump that drains the observer
+    /// event channel and turns each event into a wake for the
+    /// owning session. Mirrors `start_process_reaper`'s
+    /// runtime-enter pattern so it's safe to call from Tauri's
+    /// `setup` (which runs off-reactor on macOS, #117).
+    ///
+    /// Idempotent: the receiver is held in a `Mutex<Option<…>>`
+    /// and pulled out once; a second call is a logged no-op rather
+    /// than a double-pump. The wake helper lives in lib.rs
+    /// (next to `spawn_assistant_turn`).
+    pub fn start_observer_pump(self: &Arc<Self>, app: &tauri::AppHandle) {
+        let rx = match self.observer_events_rx.lock().unwrap().take() {
+            Some(rx) => rx,
+            None => {
+                tracing::warn!("start_observer_pump called twice; ignoring");
+                return;
+            }
+        };
+        let state = self.clone();
+        let app = app.clone();
+        let rt = tauri::async_runtime::handle();
+        let _guard = rt.inner().enter();
+        tokio::spawn(async move {
+            let mut rx = rx;
+            while let Some(event) = rx.recv().await {
+                crate::wake_session_for_observer(&state, event, &app).await;
+            }
+            tracing::info!("observer event channel closed; pump exiting");
+        });
+    }
+
+    /// Append an observer event to `session_id`'s deferral queue.
+    /// Public so the wake helper in `lib.rs` can push without
+    /// reaching into the private `observer_supervisor` field.
+    pub fn buffer_observer_event(&self, session_id: &str, event: ff_observer::ObserverEvent) {
+        self.observer_supervisor.buffer_event(session_id, event);
+    }
+
+    /// Take and clear every buffered observer event for
+    /// `session_id`. Public for the same reason as
+    /// [`buffer_observer_event`](Self::buffer_observer_event).
+    pub fn drain_observer_buffer(&self, session_id: &str) -> Vec<ff_observer::ObserverEvent> {
+        self.observer_supervisor.drain_buffer(session_id)
     }
 
     /// Start a periodic background reaper that drives

@@ -29,6 +29,7 @@ use ff_core::{
     ProviderKind, ProviderRegistry, ResolvedModel, Role, RunRecord, RunStatus, ScheduledTask,
     SearchConfig, SecretKind, Session, SessionWorkspace, Skill, SkillInfo, SkillManifest, TaskKind,
 };
+use ff_observer::ObserverEvent;
 use ff_scheduled::ScheduledApprover;
 use ff_signals::SkillAggregate;
 use ff_tools::{NotebookKernelState, Safety};
@@ -434,6 +435,9 @@ fn delete_session(state: State<'_, Arc<AppState>>, session_id: String) {
     state.store.delete_session(&session_id);
     state.reap_session_processes(&session_id);
     state.reap_session_kernels(&session_id);
+    // Stop and reap session-scoped background observers (#891 Phase 1).
+    // Same fire-and-forget, off-reactor pattern as the reaps above.
+    state.reap_session_observers(&session_id);
     // Release this session's per-workspace MCP instance refs, evicting any instance no
     // live session references (RFC 0018 §4.3). Spawned (not awaited) like the process
     // reap above: `delete_session` is a sync Tauri command that runs off the reactor on
@@ -1160,6 +1164,75 @@ fn send_message(
     Ok(user_msg.id)
 }
 
+/// Wake `session_id` because an observer fired (#891 Phase 1).
+///
+/// Two paths, picked atomically on the cancel token registered for
+/// the session:
+///
+/// - **Turn in flight** (`take_cancel` returns `Some`): the in-flight
+///   turn owns the cancel, so the event is deferred — appended to
+///   the supervisor's per-session queue. `spawn_assistant_turn`
+///   drains the queue on the next `send_message` / `edit_message` /
+///   observer wake. We DO NOT cancel the in-flight turn
+///   (`cancel_turn` would race the user's own cancel and could
+///   leave the transcript inconsistent) and we DO NOT drop the
+///   event (the user explicitly registered the observer to see
+///   this change).
+/// - **No turn in flight** (`take_cancel` returns `None`): we own
+///   the wake. Persist the event as a user message in the format
+///   `[Observer "<label>"]: <summary>` and spawn a fresh assistant
+///   turn. The next `spawn_assistant_turn` also drains the
+///   per-session buffer, so a burst of deferred events is folded in
+///   alongside the current one (one user message per event — the
+///   model gets the full causal history, not a lossy summary).
+///
+/// Liveness: `take_cancel` is the same gate `delete_session`,
+/// `send_message`, and `edit_message` use, so the wake can never
+/// race a user-driven turn cancel. If a turn completes between
+/// `take_cancel` returning `Some` and the buffer push, the next
+/// `spawn_assistant_turn` (from any source) will surface the event
+/// — the event is never lost.
+pub(crate) async fn wake_session_for_observer(
+    state: &Arc<AppState>,
+    event: ObserverEvent,
+    app: &tauri::AppHandle,
+) {
+    let session_id = event.session_id.clone();
+    let observer_id = event.id;
+    if state.take_cancel(&session_id).is_some() {
+        // Turn in flight: defer. `buffer_event` re-inserts into
+        // the same queue `drain_buffer` will pull from when the
+        // next turn starts.
+        state.buffer_observer_event(&session_id, event);
+        tracing::info!(
+            session_id = %session_id,
+            observer_id = observer_id,
+            "observer event deferred (turn in flight)"
+        );
+        return;
+    }
+
+    // No turn in flight: drain any deferred events first, then add
+    // the current one, then spawn a turn. Each event becomes its
+    // own user message — the model sees the full sequence rather
+    // than a coalesced "you missed N events" note.
+    let mut batch = state.drain_observer_buffer(&session_id);
+    batch.push(event);
+    for ev in &batch {
+        state.store.add_message(
+            &session_id,
+            Role::User,
+            format!("[Observer \"{}\"]: {}", ev.label, ev.summary),
+        );
+    }
+    tracing::info!(
+        session_id = %session_id,
+        count = batch.len(),
+        "observer wake spawning turn"
+    );
+    spawn_assistant_turn(state.clone(), app.clone(), session_id);
+}
+
 /// Set up and spawn the assistant turn for `session_id`: snapshots the provider,
 /// resolves the session's phenotype/mode, builds the tool registry + system
 /// prompt, runs the turn (streaming over `turn:*` / `tool:*`), and folds the
@@ -1167,6 +1240,32 @@ fn send_message(
 /// and `edit_message` (after editing + truncating), so both paths run identical
 /// turn semantics.
 fn spawn_assistant_turn(state: Arc<AppState>, app: tauri::AppHandle, session_id: String) {
+    // If any observer events were deferred while a turn was in
+    // flight, prepend them to the transcript now so this new turn
+    // sees them as already-acknowledged user context (rather than
+    // firing them after the user has already moved on). The
+    // `drain_observer_buffer` call is idempotent — an empty buffer
+    // is a no-op. `wake_session_for_observer` (the wake path)
+    // already drained the buffer in its own batch, so this is
+    // usually empty here; it only has content when a `send_message`
+    // or `edit_message` triggered this turn with deferred events
+    // still queued.
+    let buffered = state.drain_observer_buffer(&session_id);
+    for ev in &buffered {
+        state.store.add_message(
+            &session_id,
+            Role::User,
+            format!("[Observer \"{}\"]: {}", ev.label, ev.summary),
+        );
+    }
+    if !buffered.is_empty() {
+        tracing::info!(
+            session_id = %session_id,
+            count = buffered.len(),
+            "drained observer buffer into new turn"
+        );
+    }
+
     let cancel = CancelToken::new();
     state.register_cancel(&session_id, cancel.clone());
     // A clone kept by the host so the post-turn telemetry can tell a clean finish
@@ -3374,6 +3473,13 @@ pub fn run() {
                     // agent abandoned (started but never polled again) are cleaned up on
                     // a timer. Enters the runtime itself, so it's safe here too.
                     state.start_process_reaper();
+                    // Drive the observer event pump (#891 Phase 1): a single
+                    // long-lived task drains the supervisor's event channel
+                    // and turns each event into either a fresh turn (when the
+                    // session is idle) or a deferred wake queued for the
+                    // next turn. Enters the runtime itself, like
+                    // `start_process_reaper` — safe here.
+                    state.start_observer_pump(&app_handle);
                     // Drive the scheduled-task firing engine (RFC 0017 section 4, #542):
                     // a background sweep fires due tasks through the desktop runner. The
                     // tick is coarse; the due predicate is minute-granular, so a 30s sweep
