@@ -21,10 +21,13 @@ import {
 //
 // While `state == "running"` we poll `notebook_status` (cadence tunable from
 // `useExperimentalStore.notebookPollIntervalMs`, default 5s) so the panel
-// stays in sync with the cell execution counter and the post-Stop flip to
-// dead. A `dead` state stops polling — the user isn't pinged after they
-// pressed Stop. A pushed `notebook:updated` event can replace polling later
-// (tracked in #871).
+// stays in sync with the cell execution counter. Pressing Stop removes the
+// kernel outright (the real backend's `stop()` does `kernels.remove(...)`),
+// collapsing the session to the "no kernel" row, not a `dead` tombstone —
+// `dead` is reserved for a kernel that died on its own. Either way, leaving
+// `running` stops the poll loop — no more IPC traffic until the next mount.
+// A pushed `notebook:updated` event can replace polling later (tracked in
+// #871).
 //
 // The panel is intentionally calm: no animation, no auto-expand. The chevron
 // here only hides the (currently quiet) text block; the pill + Stop stay
@@ -50,8 +53,10 @@ export function NotebookStatusPanel({ sessionId }: { sessionId: string }) {
   }, [hydrate, sessionId]);
 
   // Poll while running. Cancels on unmount, on sessionId change, or when the
-  // kernel leaves the `running` state (so a `dead` snapshot stops the loop
-  // after the user pressed Stop — no more IPC traffic until the next mount).
+  // kernel leaves the `running` state — whether because it died on its own
+  // (`dead`) or the user pressed Stop, which collapses the session straight
+  // to "no kernel" (`snapshot` becomes `null`, so `hasKernel` is falsy and
+  // this effect's guard bails the same way).
   useEffect(() => {
     if (!snapshot?.hasKernel || snapshot.state !== "running") return;
     let cancelled = false;
@@ -67,13 +72,7 @@ export function NotebookStatusPanel({ sessionId }: { sessionId: string }) {
 
   if (snapshot === undefined) return null;
   if (snapshot === null || !snapshot.hasKernel) {
-    return (
-      <NoKernelRow
-        sessionId={sessionId}
-        expanded={expanded}
-        setExpanded={setExpanded}
-      />
-    );
+    return <NoKernelRow expanded={expanded} setExpanded={setExpanded} />;
   }
 
   const live = snapshot.state === "running";
@@ -166,14 +165,12 @@ export function NotebookStatusPanel({ sessionId }: { sessionId: string }) {
   );
 }
 
-// Quiet row for the "no kernel" state. Self-renders the same width as the
+// Quiet row for the "no kernel" state. Self-renders the same height as the
 // `live` row so the panel doesn't pop in/out as the kernel lifecycle turns.
 function NoKernelRow({
-  sessionId,
   expanded,
   setExpanded,
 }: {
-  sessionId: string;
   expanded: boolean;
   setExpanded: (v: boolean | ((s: boolean) => boolean)) => void;
 }) {
@@ -193,9 +190,6 @@ function NoKernelRow({
         />
         No kernel for this session
       </button>
-      <span className="ml-auto font-mono text-[10px] text-muted-foreground/50">
-        session {sessionId.slice(0, 8)}
-      </span>
     </div>
   );
 }

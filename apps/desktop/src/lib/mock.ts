@@ -62,8 +62,8 @@ import type {
   ScheduledTask,
   CreateScheduledTaskInput,
   RunRecord,
-  NotebookKernelState,
 } from "@/bindings";
+import type { NotebookKernelState } from "./notebook-kernel-state";
 import { CONTROL_DEFAULTS, type ControlConfig } from "./control";
 import {
   APP_VERSION_FALLBACK,
@@ -2389,10 +2389,18 @@ Shipping the Settings redesign — currently the Memory browser (SET.8).
   }
 
   // Notebook_runner (#871 FE-1). Tiny mock: absent -> null snapshot (no
-  // kernel); present -> return the existing snapshot. `notebookStop` flips
-  // state to "dead" if a kernel exists, idempotent otherwise. Mirrors the
-  // real backend's `notebook_status` / `notebook_stop` IPC commands exactly so
-  // the panel + polling loop can run standalone under `VITE_FF_MOCK=1`.
+  // kernel); present -> return the existing snapshot. Mirrors the real
+  // backend's `notebook_status` / `notebook_stop` IPC commands so the panel +
+  // polling loop can run standalone under `VITE_FF_MOCK=1`.
+  //
+  // `notebookStop` removes the kernel entirely (`hasKernel: false`), NOT a
+  // `state: "dead"` tombstone: the real backend's `stop()` does
+  // `kernels.remove(session_id)` (`KernelSupervisor::stop`,
+  // `crates/ff-tools/src/notebook/mod.rs`), so a `status()` call after Stop
+  // returns "no kernel" for that session. `state: "dead"` is reserved for a
+  // kernel that died on its own (the tool sets `k.dead` on EOF-from-pipe
+  // detection) — still reachable in tests via `__seedNotebookKernel`, just
+  // never through this method.
   async notebookStatus(sessionId: string): Promise<NotebookKernelState> {
     const existing = this.notebookKernels.get(sessionId);
     if (existing) return Promise.resolve({ ...existing });
@@ -2408,10 +2416,7 @@ Shipping the Settings redesign — currently the Memory browser (SET.8).
   }
 
   async notebookStop(sessionId: string): Promise<void> {
-    const existing = this.notebookKernels.get(sessionId);
-    if (!existing) return; // idempotent — same as the real backend
-    existing.state = "dead";
-    existing.raw = formatNotebookStatusLine(existing);
+    this.notebookKernels.delete(sessionId); // idempotent — same as the real backend
   }
 
   /** Test hook — lets mock.notebook.test.ts seed / advance a per-session

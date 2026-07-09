@@ -3,7 +3,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { ipc } from "@/lib/ipc";
-import type { NotebookKernelState } from "@/bindings";
+import type { NotebookKernelState } from "@/lib/notebook-kernel-state";
 import { useNotebookStore } from "@/store/notebook";
 
 function snapshot(
@@ -22,7 +22,7 @@ function snapshot(
 
 describe("useNotebookStore", () => {
   beforeEach(() => {
-    useNotebookStore.setState({ bySession: {} });
+    useNotebookStore.setState({ bySession: {}, ipcUnavailable: false });
   });
 
   afterEach(() => {
@@ -64,11 +64,37 @@ describe("useNotebookStore", () => {
       const spy = vi
         .spyOn(ipc, "notebookStatus")
         .mockRejectedValue(new Error("backend offline"));
-      const errSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      const debugSpy = vi.spyOn(console, "debug").mockImplementation(() => {});
       await useNotebookStore.getState().hydrate("s3");
       expect(spy).toHaveBeenCalled();
       expect(useNotebookStore.getState().bySession.s3).toBeUndefined();
-      expect(errSpy).toHaveBeenCalled();
+      expect(debugSpy).toHaveBeenCalled();
+    });
+
+    it("trips `ipcUnavailable` on the first rejection, short-circuiting later hydrate/refresh/stop calls", async () => {
+      // Mirrors a real (non-mock) build before the backend PR lands: every
+      // `notebook_status` invoke rejects. The first failure must stop the FE
+      // from re-invoking a command that will never resolve on every other
+      // session pane's mount.
+      const status = vi
+        .spyOn(ipc, "notebookStatus")
+        .mockRejectedValue(new Error("command notebook_status not found"));
+      const stopIpc = vi.spyOn(ipc, "notebookStop").mockResolvedValue();
+      vi.spyOn(console, "debug").mockImplementation(() => {});
+
+      await useNotebookStore.getState().hydrate("s1");
+      expect(useNotebookStore.getState().ipcUnavailable).toBe(true);
+      expect(status).toHaveBeenCalledTimes(1);
+
+      // A second session's mount short-circuits before ever calling ipc.
+      await useNotebookStore.getState().hydrate("s2");
+      expect(status).toHaveBeenCalledTimes(1);
+
+      await useNotebookStore.getState().refresh("s1");
+      expect(status).toHaveBeenCalledTimes(1);
+
+      await useNotebookStore.getState().stop("s1");
+      expect(stopIpc).not.toHaveBeenCalled();
     });
   });
 
@@ -111,13 +137,15 @@ describe("useNotebookStore", () => {
 
   describe("stop", () => {
     it("calls notebookStop then refreshes the snapshot", async () => {
+      // The real backend's `stop()` removes the kernel entirely, so the
+      // post-stop `notebookStatus` call reports "no kernel" — not a
+      // `state: "dead"` tombstone (that's reserved for a kernel that died on
+      // its own). The store just relays whatever `notebookStatus` returns.
       const stop = vi.spyOn(ipc, "notebookStop").mockResolvedValue();
       const status = vi.spyOn(ipc, "notebookStatus").mockResolvedValue(
         snapshot({
           sessionId: "s1",
-          hasKernel: true,
-          state: "dead",
-          kernelId: "kernel-aaaa",
+          hasKernel: false,
         }),
       );
 
@@ -125,7 +153,7 @@ describe("useNotebookStore", () => {
 
       expect(stop).toHaveBeenCalledWith("s1");
       expect(status).toHaveBeenCalledWith("s1");
-      expect(useNotebookStore.getState().bySession.s1?.state).toBe("dead");
+      expect(useNotebookStore.getState().bySession.s1?.hasKernel).toBe(false);
     });
 
     it("propagates the backend rejection", async () => {

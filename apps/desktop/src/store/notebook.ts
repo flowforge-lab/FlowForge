@@ -9,7 +9,7 @@
 
 import { create } from "zustand";
 import { ipc } from "@/lib/ipc";
-import type { NotebookKernelState } from "@/bindings";
+import type { NotebookKernelState } from "@/lib/notebook-kernel-state";
 
 /**
  * A session's snapshot, after the FE has decided whether to display the panel.
@@ -22,9 +22,19 @@ export type MaybeKernel = NotebookKernelState | null | undefined;
 
 interface NotebookState {
   /** sessionId -> latest kernel snapshot (`null` = "no kernel"; `undefined` =
-   *  not yet polled). The `undefined` case is encoded inside `undefined`-as-key
-   *  entries the natural way so we don't need a separate "hydrated" boolean. */
+   *  not yet polled). Absence of a key from the record is what "not yet
+   *  polled" means — no separate "hydrated" boolean needed. */
   bySession: Record<string, MaybeKernel>;
+
+  /** Set once `notebookStatus` rejects — meaning the `notebook_status` /
+   *  `notebook_stop` Tauri commands aren't registered on this build yet (see
+   *  the contract note in `lib/ipc.ts`; they land in a follow-up BE PR).
+   *  Once tripped, `hydrate`/`refresh`/`stop` no-op instead of re-invoking a
+   *  command that will never resolve — otherwise every session-pane
+   *  mount would `console.error` against a real (non-mock) build. There's no
+   *  legitimate way to "become available" again within one running app, so
+   *  this only ever flips false -> true (tests reset it explicitly). */
+  ipcUnavailable: boolean;
 
   /** Hydrate a session's kernel state (#871 FE-1). On mount the panel reads
    *  `bySession[sessionId]` and renders accordingly:
@@ -32,7 +42,8 @@ interface NotebookState {
    *   - null:      panel renders the "no kernel" row
    *   - {…}:       panel renders the live/dead row with a Stop button
    *  Best-effort: an IPC failure leaves the entry undefined so the next mount
-   *  retries — we never strand the panel on a hard error. */
+   *  retries — we never strand the panel on a hard error. The first failure
+   *  also trips `ipcUnavailable` (see above). */
   hydrate: (sessionId: string) => Promise<void>;
   /** Force a refresh — used by the panel's polling loop while a kernel is live.
    *  A failure (or a session that no longer exists) drops the cached entry so
@@ -50,28 +61,43 @@ interface NotebookState {
 
 export const useNotebookStore = create<NotebookState>((set, get) => ({
   bySession: {},
+  ipcUnavailable: false,
 
   hydrate: async (sessionId) => {
+    if (get().ipcUnavailable) return;
     try {
       const state = await ipc.notebookStatus(sessionId);
       set((s) => ({ bySession: { ...s.bySession, [sessionId]: state } }));
     } catch (err) {
-      // Best-effort: leave `bySession` empty so the next mount retries rather
-      // than pinning the panel on a stale error state. Logged once so an offline
-      // backend is visible during dev.
-      console.error("[notebook] hydrate failed:", err);
+      // This is the sole gatekeeper for whether the backend command surface
+      // exists at all: every session pane calls `hydrate` once on mount, so a
+      // rejection here — before any kernel has ever been confirmed live —
+      // means `notebook_status` isn't registered on this build, not a
+      // per-session issue. Trip the breaker so every other mount short-
+      // circuits instead of re-invoking a command that will never resolve.
+      // `debug`, not `error`: an expected, documented, temporary condition
+      // (see `ipcUnavailable`'s doc comment), not something to act on.
+      set({ ipcUnavailable: true });
+      console.debug(
+        "[notebook] notebook_status unavailable — disabling the panel for this app run:",
+        err,
+      );
     }
   },
 
   refresh: async (sessionId) => {
+    if (get().ipcUnavailable) return;
     try {
       const state = await ipc.notebookStatus(sessionId);
       set((s) => ({ bySession: { ...s.bySession, [sessionId]: state } }));
     } catch {
-      // Drop the cached snapshot rather than freeze the panel. A missing session
-      // (deleted) or a transient backend error should both fall back to "no
-      // kernel" — the polling loop's next tick will re-hydrate if the session
-      // is genuinely alive.
+      // Unlike `hydrate`, a `refresh` failure doesn't trip the breaker: by
+      // the time polling is running, `hydrate` already proved the command
+      // exists, so a rejection here is far more likely "this session's
+      // kernel/session is gone" than "the command doesn't exist" — scoped to
+      // this one session, not a reason to disable every other pane's panel.
+      // Drop the cached snapshot rather than freeze the panel; the polling
+      // loop's next tick re-hydrates if the session is genuinely still alive.
       set((s) => {
         if (!(sessionId in s.bySession)) return s;
         const { [sessionId]: _dropped, ...rest } = s.bySession;
@@ -81,6 +107,7 @@ export const useNotebookStore = create<NotebookState>((set, get) => ({
   },
 
   stop: async (sessionId) => {
+    if (get().ipcUnavailable) return;
     await ipc.notebookStop(sessionId);
     await get().refresh(sessionId);
   },

@@ -45,7 +45,10 @@ describe("MockIpc notebook (#871 FE-1)", () => {
     expect(again.executionCount).toBe(3);
   });
 
-  it("notebookStop flips a running kernel to dead and is idempotent when no kernel exists", async () => {
+  it("notebookStop removes the kernel (collapses to 'no kernel'), and is idempotent when none exists", async () => {
+    // Matches the real backend: `KernelSupervisor::stop` does
+    // `kernels.remove(session_id)`, so a `status()` call after Stop reports
+    // "no kernel" for that session, never a `state: "dead"` tombstone.
     const ipc = new MockIpc();
     const seed = (
       ipc as unknown as {
@@ -65,8 +68,8 @@ describe("MockIpc notebook (#871 FE-1)", () => {
 
     await ipc.notebookStop("s1");
     const after = await ipc.notebookStatus("s1");
-    expect(after.state).toBe("dead");
-    expect(after.raw).toContain("— dead");
+    expect(after.hasKernel).toBe(false);
+    expect(after.state).toBeNull();
 
     // Calling stop on a session with no kernel is a no-op (mirrors backend).
     await expect(ipc.notebookStop("ghost")).resolves.toBeUndefined();
@@ -90,7 +93,7 @@ describe("MockIpc notebook (#871 FE-1)", () => {
       executionCount: 4,
     });
     await ipc.notebookStop("s1");
-    expect((await ipc.notebookStatus("s1")).state).toBe("dead");
+    expect((await ipc.notebookStatus("s1")).hasKernel).toBe(false);
 
     seeder("s1", {
       hasKernel: true,
@@ -100,5 +103,29 @@ describe("MockIpc notebook (#871 FE-1)", () => {
       executionCount: 0,
     });
     expect((await ipc.notebookStatus("s1")).state).toBe("running");
+  });
+
+  it("a self-died kernel (seeded dead, not stopped) still reports state: 'dead'", async () => {
+    // `state: "dead"` is real backend behavior for a kernel that died on its
+    // own — exercised here via the seed hook directly, since `notebookStop`
+    // never produces it (see the test above).
+    const ipc = new MockIpc();
+    (
+      ipc as unknown as {
+        __seedNotebookKernel: (
+          sessionId: string,
+          patch: Record<string, unknown>,
+        ) => Record<string, unknown>;
+      }
+    ).__seedNotebookKernel("s1", {
+      hasKernel: true,
+      state: "dead",
+      kernelId: "kernel-dddd",
+      pid: 99,
+      executionCount: 1,
+    });
+    const s = await ipc.notebookStatus("s1");
+    expect(s.state).toBe("dead");
+    expect(s.raw).toContain("— dead");
   });
 });

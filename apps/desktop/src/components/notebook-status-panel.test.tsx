@@ -4,7 +4,7 @@ import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { NotebookStatusPanel } from "@/components/notebook-status-panel";
-import type { NotebookKernelState } from "@/bindings";
+import type { NotebookKernelState } from "@/lib/notebook-kernel-state";
 import {
   NOTEBOOK_POLL_DEFAULT_MS,
   useExperimentalStore,
@@ -44,7 +44,7 @@ beforeEach(() => {
   act(() => {
     root = createRoot(container);
   });
-  useNotebookStore.setState({ bySession: {} });
+  useNotebookStore.setState({ bySession: {}, ipcUnavailable: false });
   useExperimentalStore.setState({
     notebookPollIntervalMs: NOTEBOOK_POLL_DEFAULT_MS,
   });
@@ -159,17 +159,14 @@ describe("NotebookStatusPanel (#871 FE-1)", () => {
     // delegation without reaching into the real ipc (whose mock rejection
     // would break the test).
     const stopSpy = vi.fn(async () => {
-      // Simulate the post-stop flip the real implementation performs.
+      // Simulate the post-stop refresh: the real backend removes the kernel
+      // entirely on Stop, so the session collapses to "no kernel" — not a
+      // `state: "dead"` tombstone (that's reserved for a kernel that died on
+      // its own).
       act(() => {
         useNotebookStore.setState({
           bySession: {
-            s1: snapshot({
-              sessionId: "s1",
-              hasKernel: true,
-              state: "dead",
-              kernelId: "kernel-aaaa",
-              executionCount: 2,
-            }),
+            s1: snapshot({ sessionId: "s1", hasKernel: false }),
           },
         });
       });
