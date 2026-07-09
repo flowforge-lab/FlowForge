@@ -63,9 +63,17 @@ afterEach(() => {
 describe("InstalledTab default star", () => {
   it("stars Codon when it is installed (and not the built-in default)", () => {
     seed([
-      phenotypeToProfile({ name: "default", skills: [], mcpServers: [] }, 0),
       phenotypeToProfile(
-        { name: "codon", skills: ["codegraph"], mcpServers: [] },
+        { name: "default", skills: [], mcpServers: [], egress: "open" },
+        0,
+      ),
+      phenotypeToProfile(
+        {
+          name: "codon",
+          skills: ["codegraph"],
+          mcpServers: [],
+          egress: "open",
+        },
         1,
       ),
     ]);
@@ -76,8 +84,14 @@ describe("InstalledTab default star", () => {
 
   it("stars the built-in default when Codon is absent", () => {
     seed([
-      phenotypeToProfile({ name: "default", skills: [], mcpServers: [] }, 0),
-      phenotypeToProfile({ name: "rust", skills: [], mcpServers: [] }, 1),
+      phenotypeToProfile(
+        { name: "default", skills: [], mcpServers: [], egress: "open" },
+        0,
+      ),
+      phenotypeToProfile(
+        { name: "rust", skills: [], mcpServers: [], egress: "open" },
+        1,
+      ),
     ]);
     render(<InstalledTab />);
     expect(hasStar("Default")).toBe(true);

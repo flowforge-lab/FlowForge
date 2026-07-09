@@ -72,9 +72,12 @@ describe("PhenoSelector (#245 2b)", () => {
   });
 
   it("opens, lists phenotypes, and switching one calls switchPhenotype", async () => {
-    const spy = vi
-      .spyOn(ipc, "switchPhenotype")
-      .mockResolvedValue({ name: "rust", skills: [], mcpServers: [] });
+    const spy = vi.spyOn(ipc, "switchPhenotype").mockResolvedValue({
+      name: "rust",
+      skills: [],
+      mcpServers: [],
+      egress: "open",
+    });
     seed({ activeId: "default" });
     const user = userEvent.setup();
     render(<PhenoSelector />);

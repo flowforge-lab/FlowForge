@@ -969,6 +969,7 @@ fn pheno_with_mcp(name: &str, servers: Vec<McpServerConfig>) -> Phenotype {
         max_iterations: None,
         provider: None,
         mcp_servers: servers,
+        egress: ff_core::Egress::Open,
     }
 }
 

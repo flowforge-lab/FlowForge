@@ -292,6 +292,7 @@ const DEFAULT_PHENOTYPE: Phenotype = {
   name: "default",
   skills: [],
   mcpServers: [],
+  egress: "open",
 };
 
 // Canned phenotypes so the `pheno` palette (#28) is exercisable offline. `default`
@@ -318,12 +319,14 @@ const MOCK_PHENOTYPES: Phenotype[] = [
         scope: "workspace",
       },
     ],
+    egress: "open",
   },
   {
     name: "rust",
     skills: ["rust-debugging", "write-tests"],
     persona: "You are a meticulous Rust engineer.",
     mcpServers: [],
+    egress: "open",
   },
   {
     name: "reviewer",
@@ -334,6 +337,7 @@ const MOCK_PHENOTYPES: Phenotype[] = [
     provider: "openai",
     model: "gpt-4o",
     mcpServers: [],
+    egress: "open",
   },
 ];
 
