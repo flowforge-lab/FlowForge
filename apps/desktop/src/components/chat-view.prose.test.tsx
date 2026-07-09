@@ -58,6 +58,51 @@ function seedMultiIterationTurn() {
   });
 }
 
+// A streaming turn whose final live activity is a tool step (not prose) — the
+// `prose → steps` order. The pre-fix code marked the last prose as `streaming`,
+// which collapsed a settled prose to "On it" while the steps below were
+// actually live. The fix gates the streaming flag on prose being the last
+// segment overall (#864 review #1).
+function seedProseFollowedByLiveSteps() {
+  useChatStore.setState({
+    activeSessionId: SID,
+    messagesBySession: {
+      [SID]: [
+        msg({ id: "u1", role: "user", content: "go" }),
+        msg({
+          id: "a1",
+          role: "assistant",
+          content: PROSE_1,
+          toolCalls: [{ id: "c1", name: "view", arguments: "{}" }],
+        }),
+        msg({ id: "t1", role: "tool", toolCallId: "c1", content: "result 1" }),
+        msg({
+          id: "a2",
+          role: "assistant",
+          content: PROSE_2,
+        }),
+      ],
+    },
+    // a2 is in flight, with a live step pending. a2 has no prose item
+    // (finalAssistant), so the only prose is PROSE_1 (already settled).
+    streamingBySession: { [SID]: "a2" },
+    turnStartBySession: { [SID]: 1000 },
+    turnStartByMessage: { a2: 1000 },
+    toolStepsByMessage: {
+      a2: [
+        {
+          callId: "c2",
+          tool: "grep",
+          args: {},
+          status: "running",
+          startedAt: 1000,
+        },
+      ],
+    },
+    reasoningByMessage: {},
+  });
+}
+
 // Collapsed "N steps" group headers (StepGroup's toggle button).
 function stepHeaders(): HTMLElement[] {
   return screen
@@ -112,5 +157,56 @@ describe("ChatView intermediate prose (#619)", () => {
       expect(idx).toBeGreaterThan(cursor);
       cursor = idx;
     }
+  });
+
+  it("renders settled intermediate prose as full markdown with hidden chips (#864)", () => {
+    // The turn isn't streaming, so every ActiveProseBlock chip must be in the
+    // "expanded" (hidden) state and the full prose must remain visible.
+    // Regression guard for the #864 streaming-collapse work — settled turns
+    // must be unchanged.
+    render(<ChatView />);
+
+    expect(screen.getByText(PROSE_1)).toBeTruthy();
+    expect(screen.getByText(PROSE_2)).toBeTruthy();
+    // Two prose segments → two chip buttons, each in the hidden-expanded
+    // state. The chip is suppressed from the a11y tree in that state, so we
+    // look it up via the `data-on-it` attribute instead of the (now empty)
+    // accessible name.
+    const chips = Array.from(
+      document.querySelectorAll<HTMLElement>("button[data-on-it]"),
+    );
+    expect(chips.length).toBe(2);
+    for (const chip of chips) {
+      expect(chip.getAttribute("aria-expanded")).toBe("true");
+    }
+  });
+});
+
+describe("ChatView active prose (#864 streaming edge case)", () => {
+  afterEach(() => {
+    cleanup();
+    useChatStore.setState({ messagesBySession: {} });
+  });
+
+  it("does not collapse a settled prose to 'On it' when the final live activity is a step", () => {
+    // Turn shape: prose → steps → (streaming) prose? No — in this seed, a2 is
+    // the streaming message with a live step but no content. The only prose
+    // segment is PROSE_1, which is already settled (the model moved on to
+    // running a tool). The fix must NOT mark PROSE_1 as streaming, even
+    // though it's the last prose segment.
+    seedProseFollowedByLiveSteps();
+    render(<ChatView />);
+
+    // PROSE_1 should be fully visible (chip hidden), not collapsed to "On it".
+    const prose = screen.getByText(PROSE_1);
+    expect(prose.closest("[aria-hidden='true']")).toBeNull();
+    // Chip button is present in the DOM (so the layout doesn't reflow) but
+    // its a11y is fully suppressed: aria-expanded=true (prose shown) and
+    // aria-hidden=true (removed from the a11y tree, per #864 review #3).
+    // The chip is excluded from the a11y tree in that state, so its
+    // accessible name is empty — look it up via the `data-on-it` attribute.
+    const chip = document.querySelector<HTMLElement>("button[data-on-it]")!;
+    expect(chip.getAttribute("aria-expanded")).toBe("true");
+    expect(chip.getAttribute("aria-hidden")).toBe("true");
   });
 });
