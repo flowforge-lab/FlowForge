@@ -3,6 +3,7 @@
 //! These types ARE the IPC contract. Changing one is a breaking change for the frontend —
 //! regenerate bindings (`cargo test`) and update the mock in the same PR.
 
+mod egress;
 pub mod events;
 mod export;
 mod goal;
@@ -19,6 +20,7 @@ mod session;
 mod skill;
 mod spawn_env;
 
+pub use egress::Egress;
 pub use export::Format;
 pub use goal::{
     Goal, GoalBudget, GoalLedgerEntry, GoalSpend, GoalStatus, GoalStore, NextAction, StepStatus,

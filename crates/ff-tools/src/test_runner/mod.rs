@@ -21,6 +21,8 @@ pub struct TestRunnerTool;
 
 #[async_trait]
 impl Tool for TestRunnerTool {
+    // reaches_network: keeps the fail-safe `true` default (RFC 0013) — it
+    // runs an arbitrary test command that can hit the network (integration tests).
     fn name(&self) -> &str {
         "test_runner"
     }

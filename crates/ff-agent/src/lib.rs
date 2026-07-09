@@ -12,8 +12,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use ff_core::{
-    AttachmentKind, Message, Mode, PermissionCell, PermissionMatrix, ReasoningVisibility, Role,
-    StopReason,
+    AttachmentKind, Egress, Message, Mode, PermissionCell, PermissionMatrix, ReasoningVisibility,
+    Role, StopReason,
 };
 use ff_llm::{ChatMessage, ChatRequest, FunctionCall, LlmError, Provider, ToolCall as LlmToolCall};
 use ff_session::SessionStore;
@@ -368,6 +368,10 @@ pub struct ToolContext<'a> {
     /// Agent autonomy mode (RFC 0011). Controls tool visibility and approval
     /// via the [`PermissionMatrix`].
     pub mode: Mode,
+    /// Network-egress policy (RFC 0013). `LocalOnly` strips network-capable tools
+    /// from the advertised set (privacy analogue of Plan mode). Sub-agents inherit
+    /// the parent's policy, so an `enclave` delegation stays local end to end.
+    pub egress: Egress,
     /// Permission policy for this turn (#699). Determines which tools are
     /// advertised (non-Deny) and which are auto-approved (Allow) vs prompted (Ask).
     pub matrix: &'a PermissionMatrix,
@@ -408,6 +412,7 @@ impl<'a> ToolContext<'a> {
             max_depth: DEFAULT_MAX_DELEGATION_DEPTH,
             allowed: None,
             mode: Mode::default(),
+            egress: Egress::default(),
             matrix,
             abstractive: AbstractiveConfig::default(),
             compaction_model: None,
@@ -627,24 +632,43 @@ struct CallBuf {
 /// **invocation time** (the approver rejects the call) rather than hiding the tool.
 fn advertised_tools(
     mode: Mode,
+    egress: Egress,
     matrix: &PermissionMatrix,
     allowed: Option<&std::collections::HashSet<String>>,
     registry: &ToolRegistry,
 ) -> Option<std::collections::HashSet<String>> {
-    if !mode.is_plan() {
-        return allowed.cloned();
-    }
-    // Plan mode: read-capable tools, plus any whose ceiling the Plan matrix row
-    // does not Deny. Invocation-time `safety` + matrix gate the concrete calls.
-    let mut visible = registry.readonly_capable_names();
-    for tool in registry.iter_tools() {
-        if matrix.cell(Mode::Plan, tool.max_safety()) != PermissionCell::Deny {
-            visible.insert(tool.name().to_string());
+    // Mode pass: in Act/Auto all tools are visible (`allowed` may be None = all);
+    // in Plan, restrict to the read-capable + non-Denied-ceiling set.
+    let mode_visible: Option<std::collections::HashSet<String>> = if !mode.is_plan() {
+        allowed.cloned()
+    } else {
+        // Plan mode: read-capable tools, plus any whose ceiling the Plan matrix row
+        // does not Deny. Invocation-time `safety` + matrix gate the concrete calls.
+        let mut visible = registry.readonly_capable_names();
+        for tool in registry.iter_tools() {
+            if matrix.cell(Mode::Plan, tool.max_safety()) != PermissionCell::Deny {
+                visible.insert(tool.name().to_string());
+            }
         }
+        Some(match allowed {
+            Some(set) => set.intersection(&visible).cloned().collect(),
+            None => visible,
+        })
+    };
+
+    // Egress pass (RFC 0013): under LocalOnly, intersect with the local-only tool
+    // set — the privacy analogue of the mode pass. Composes with Plan (local ∩
+    // readonly) and with an explicit `allowed`. Open is a no-op, so behaviour is
+    // byte-identical to pre-RFC when every phenotype is Open.
+    if !egress.is_local_only() {
+        return mode_visible;
     }
-    Some(match allowed {
-        Some(set) => set.intersection(&visible).cloned().collect(),
-        None => visible,
+    let local = registry.local_tool_names();
+    Some(match mode_visible {
+        Some(set) => set.intersection(&local).cloned().collect(),
+        // Act/Auto + Open-would-be-None: the whole registry is visible, so the
+        // LocalOnly set is exactly the local tools.
+        None => local,
     })
 }
 
@@ -823,6 +847,7 @@ pub async fn run_turn(
     let allow_subagent = tools.depth < tools.max_depth;
     let advertised = advertised_tools(
         tools.mode,
+        tools.egress,
         tools.matrix,
         tools.allowed.as_ref(),
         tools.registry,
@@ -1922,6 +1947,9 @@ async fn run_subagent(
         max_depth: parent.max_depth,
         allowed,
         mode: parent.mode,
+        // Sub-agents inherit the parent's egress policy — an enclave delegation
+        // stays local end to end (RFC 0013).
+        egress: parent.egress,
         matrix: parent.matrix,
         abstractive: parent.abstractive.clone(),
         compaction_model: parent.compaction_model.clone(),

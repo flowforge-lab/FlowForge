@@ -131,6 +131,8 @@ impl PythonTool {
 
 #[async_trait]
 impl Tool for PythonTool {
+    // reaches_network: keeps the fail-safe `true` default (RFC 0013) — it
+    // arbitrary Python (`import urllib`, `requests`) — same egress threat as `bash`.
     fn name(&self) -> &str {
         "python"
     }

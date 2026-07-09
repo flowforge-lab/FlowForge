@@ -12,6 +12,9 @@ pub struct EditTool;
 
 #[async_trait]
 impl Tool for EditTool {
+    fn reaches_network(&self) -> bool {
+        false
+    }
     fn name(&self) -> &str {
         "edit"
     }

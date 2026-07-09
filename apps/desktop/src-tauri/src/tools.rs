@@ -95,6 +95,10 @@ impl UninstallSkillTool {
 
 #[async_trait]
 impl Tool for UninstallSkillTool {
+    fn reaches_network(&self) -> bool {
+        false
+    }
+
     fn name(&self) -> &str {
         "uninstall_skill"
     }
@@ -146,6 +150,10 @@ impl SkillsTool {
 
 #[async_trait]
 impl Tool for SkillsTool {
+    fn reaches_network(&self) -> bool {
+        false
+    }
+
     fn name(&self) -> &str {
         "skills"
     }
@@ -195,6 +203,10 @@ impl SearchSkillsTool {
 
 #[async_trait]
 impl Tool for SearchSkillsTool {
+    fn reaches_network(&self) -> bool {
+        false
+    }
+
     fn name(&self) -> &str {
         "search_skills"
     }

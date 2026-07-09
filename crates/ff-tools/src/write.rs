@@ -12,6 +12,9 @@ pub struct WriteTool;
 
 #[async_trait]
 impl Tool for WriteTool {
+    fn reaches_network(&self) -> bool {
+        false
+    }
     fn name(&self) -> &str {
         "write"
     }

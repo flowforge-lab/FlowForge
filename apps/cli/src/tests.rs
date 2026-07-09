@@ -384,6 +384,7 @@ fn test_phenotype(
         max_iterations: None,
         provider: None,
         mcp_servers: Vec::new(),
+        egress: ff_core::Egress::Open,
     }
 }
 

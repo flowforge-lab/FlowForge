@@ -44,6 +44,9 @@ pub struct GitTool;
 
 #[async_trait]
 impl Tool for GitTool {
+    fn reaches_network(&self) -> bool {
+        false
+    }
     fn name(&self) -> &str {
         "git"
     }

@@ -88,6 +88,20 @@ pub trait Tool: Send + Sync {
     fn interactive(&self) -> bool {
         false
     }
+    /// Whether this tool can send data over the network (RFC 0013 egress policy).
+    /// Used by the advertised-toolset filter to strip network-capable tools under
+    /// a `LocalOnly` phenotype (e.g. `enclave`), the privacy analogue of how Plan
+    /// mode strips non-ReadOnly tools.
+    ///
+    /// **Fail-safe default is `true`**: a tool is assumed network-capable unless it
+    /// proves otherwise. Only tools with no plausible egress path (pure local file
+    /// / process-introspection / interactive) override to `false`. A tool that
+    /// `exec`s arbitrary user code or shells out (`bash`, `python`, `process_manager`,
+    /// MCP-bridged tools) MUST keep the `true` default — it could `curl` regardless
+    /// of its nominal purpose.
+    fn reaches_network(&self) -> bool {
+        true
+    }
     /// A stable identity for a *content read*, used by the agent's per-turn semantic
     /// read-dedupe (#458 RC5). A read tool (e.g. `view`) returns a key — typically
     /// the path it reads — so the loop can detect a re-read of the same target this
@@ -235,6 +249,18 @@ impl ToolRegistry {
         self.tools
             .values()
             .filter(|t| t.min_safety() == Safety::ReadOnly)
+            .map(|t| t.name().to_string())
+            .collect()
+    }
+
+    /// Names of tools with no network-egress path ([`Tool::reaches_network`] is
+    /// `false`). The base of a `LocalOnly` phenotype's advertised set (RFC 0013):
+    /// the egress filter intersects the mode-visible set with this. Fail-safe —
+    /// anything not proven local (default `true`) is excluded.
+    pub fn local_tool_names(&self) -> HashSet<String> {
+        self.tools
+            .values()
+            .filter(|t| !t.reaches_network())
             .map(|t| t.name().to_string())
             .collect()
     }
@@ -481,6 +507,54 @@ mod tests {
         ] {
             assert!(!cap.contains(name), "{name} has no read-only floor");
         }
+    }
+
+    #[test]
+    fn local_tool_names_excludes_network_capable_and_is_fail_safe() {
+        // RFC 0013: the LocalOnly advertised base is tools with no egress path.
+        let reg = ToolRegistry::with_defaults();
+        let local = reg.local_tool_names();
+        // Proven-local built-ins are present.
+        for name in [
+            "view",
+            "edit",
+            "write",
+            "apply_patch",
+            "grep",
+            "glob",
+            "tree",
+            "todo",
+            "diagnostics",
+            "git",
+            "ask_user",
+            "agent",
+        ] {
+            assert!(local.contains(name), "{name} should be classified local");
+        }
+        // Network-capable / arbitrary-exec tools are excluded (fail-safe true default).
+        for name in [
+            "bash",
+            "python",
+            "web_fetch",
+            "web_search",
+            "github",
+            "test_runner",
+        ] {
+            assert!(
+                !local.contains(name),
+                "{name} must be treated as network-capable"
+            );
+        }
+    }
+
+    #[test]
+    fn reaches_network_default_is_fail_safe_true() {
+        // A tool that doesn't override reaches_network is treated as network-capable.
+        assert!(crate::bash::BashTool.reaches_network());
+        assert!(crate::web_fetch::WebFetchTool::new().reaches_network());
+        // Proven-local overrides return false.
+        assert!(!crate::view::ViewTool.reaches_network());
+        assert!(!crate::grep::GrepTool.reaches_network());
     }
 
     #[test]

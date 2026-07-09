@@ -582,6 +582,8 @@ impl ProcessManagerTool {
 
 #[async_trait]
 impl Tool for ProcessManagerTool {
+    // reaches_network: keeps the fail-safe `true` default (RFC 0013) — it
+    // launches arbitrary background processes (a dev server, `curl`, anything).
     fn name(&self) -> &str {
         "process_manager"
     }

@@ -109,6 +109,13 @@ pub struct Phenotype {
     /// per workspace root. Empty contributes nothing, identical to today.
     #[serde(default)]
     pub mcp_servers: Vec<McpServerConfig>,
+    /// Network-egress policy (RFC 0013). `Open` (the default) advertises all tools;
+    /// `LocalOnly` strips network-capable tools from the advertised set so a
+    /// privacy-restricted phenotype (e.g. `enclave`) cannot leak PII over the
+    /// network. `#[serde(default)]` keeps existing phenotypes / TOML that omit the
+    /// field on `Open`, i.e. unchanged.
+    #[serde(default)]
+    pub egress: crate::egress::Egress,
 }
 
 #[cfg(test)]

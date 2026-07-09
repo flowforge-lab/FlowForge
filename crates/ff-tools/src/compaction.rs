@@ -34,6 +34,9 @@ impl CompactionRetrieveTool {
 
 #[async_trait]
 impl Tool for CompactionRetrieveTool {
+    fn reaches_network(&self) -> bool {
+        false
+    }
     fn name(&self) -> &str {
         COMPACTION_RETRIEVE_TOOL
     }

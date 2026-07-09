@@ -25,6 +25,9 @@ pub struct GoalCompleteTool;
 
 #[async_trait]
 impl Tool for GoalCompleteTool {
+    fn reaches_network(&self) -> bool {
+        false
+    }
     fn name(&self) -> &str {
         GOAL_COMPLETE_TOOL_NAME
     }

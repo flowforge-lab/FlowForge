@@ -290,6 +290,8 @@ impl NotebookTool {
 
 #[async_trait]
 impl Tool for NotebookTool {
+    // reaches_network: keeps the fail-safe `true` default (RFC 0013) — it
+    // executes arbitrary Python cells — can `import urllib` / open sockets.
     fn name(&self) -> &str {
         "notebook_runner"
     }

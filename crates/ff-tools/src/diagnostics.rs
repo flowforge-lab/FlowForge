@@ -20,6 +20,9 @@ pub struct DiagnosticsTool;
 
 #[async_trait]
 impl Tool for DiagnosticsTool {
+    fn reaches_network(&self) -> bool {
+        false
+    }
     fn name(&self) -> &str {
         "diagnostics"
     }
