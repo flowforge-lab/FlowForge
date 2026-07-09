@@ -21,6 +21,10 @@ use serde_json::Value;
 use crate::registry::{Safety, Tool, ToolOutcome, NO_SESSION};
 use kernel::{KernelState, DEFAULT_CELL_TIMEOUT_SECS, MAX_CELL_TIMEOUT_SECS};
 
+/// Max live kernels per session (Phase 3, #856). Bounds resource use while still
+/// letting a workflow keep a couple of independent namespaces side by side.
+const MAX_KERNELS_PER_SESSION: usize = 3;
+
 /// Per-cell result from a `run_all` invocation.
 #[derive(Debug, Clone)]
 struct CellRunResult {
@@ -30,11 +34,12 @@ struct CellRunResult {
     truncated: bool,
 }
 
-/// Manages one persistent Python kernel per session (Phase 1). Behind a `Mutex`
-/// so the single-threaded kernel stdin/stdout is never interleaved across cells.
+/// Manages persistent Python kernels, keyed by session id then kernel id. Behind
+/// a `Mutex` so the single-threaded kernel stdin/stdout is never interleaved
+/// across cells. Phase 3 allows up to [`MAX_KERNELS_PER_SESSION`] per session.
 #[derive(Default)]
 pub struct KernelSupervisor {
-    kernels: Mutex<HashMap<String, KernelState>>,
+    kernels: Mutex<HashMap<String, HashMap<String, KernelState>>>,
 }
 
 impl KernelSupervisor {
@@ -42,71 +47,163 @@ impl KernelSupervisor {
         Self::default()
     }
 
-    /// Start (or replace a dead) kernel for `session_id`. Refuses to clobber a
-    /// live kernel — the caller should `stop` first, so state isn't lost by
-    /// accident.
+    /// Resolve the target kernel id within a session's map. Rules:
+    /// - explicit `wanted` → that id (error if unknown);
+    /// - omitted + exactly one → that one (back-compat with Phase 1/2 callers);
+    /// - omitted + none → error "start first";
+    /// - omitted + many → error listing the ids so the caller can disambiguate.
+    fn resolve_id(
+        session: &HashMap<String, KernelState>,
+        wanted: Option<&str>,
+    ) -> Result<String, String> {
+        if let Some(id) = wanted {
+            return if session.contains_key(id) {
+                Ok(id.to_string())
+            } else {
+                Err(format!("no kernel `{id}` in this session"))
+            };
+        }
+        match session.len() {
+            0 => Err("no kernel for this session; call action=start first".into()),
+            1 => Ok(session.keys().next().unwrap().clone()),
+            _ => {
+                let mut ids: Vec<&str> = session.keys().map(String::as_str).collect();
+                ids.sort_unstable();
+                Err(format!(
+                    "multiple kernels in this session; specify `kernel` (ids: {})",
+                    ids.join(", ")
+                ))
+            }
+        }
+    }
+
+    /// Start a new kernel for `session_id`, enforcing the per-session cap. Dead
+    /// kernels are pruned first so they don't count toward the cap. Returns the
+    /// new kernel id.
     async fn start(&self, session_id: &str, dir: &Path) -> Result<String, String> {
         let mut kernels = self.kernels.lock().await;
-        if let Some(k) = kernels.get(session_id) {
-            if !k.dead {
-                return Err(format!(
-                    "a kernel is already running for this session ({}); stop it first",
-                    k.kernel_id
-                ));
-            }
+        let session = kernels.entry(session_id.to_string()).or_default();
+        // Reap any dead kernels so they free a slot.
+        session.retain(|_, k| !k.dead);
+        if session.len() >= MAX_KERNELS_PER_SESSION {
+            return Err(format!(
+                "kernel cap ({MAX_KERNELS_PER_SESSION}) reached for this session; stop one first"
+            ));
         }
         let kernel = KernelState::spawn(dir).await?;
         let id = kernel.kernel_id.clone();
-        kernels.insert(session_id.to_string(), kernel);
+        session.insert(id.clone(), kernel);
         Ok(id)
     }
 
     async fn run_cell(
         &self,
         session_id: &str,
+        kernel_id: Option<&str>,
         code: &str,
         timeout_secs: u64,
     ) -> Result<kernel::CellResult, String> {
         let mut kernels = self.kernels.lock().await;
-        let kernel = kernels
+        let session = kernels
             .get_mut(session_id)
             .ok_or("no kernel for this session; call action=start first")?;
-        kernel.run_cell(code, timeout_secs).await
+        let id = Self::resolve_id(session, kernel_id)?;
+        session
+            .get_mut(&id)
+            .unwrap()
+            .run_cell(code, timeout_secs)
+            .await
+    }
+
+    /// Restart a kernel: stop the existing one and spawn a fresh replacement,
+    /// preserving the session mapping (a new kernel id is assigned). The old
+    /// namespace is gone by design — that is the point of a restart.
+    async fn restart(
+        &self,
+        session_id: &str,
+        kernel_id: Option<&str>,
+        dir: &Path,
+    ) -> Result<String, String> {
+        let mut kernels = self.kernels.lock().await;
+        let session = kernels.entry(session_id.to_string()).or_default();
+        // If a specific/only kernel exists, tear it down; otherwise just start.
+        if let Ok(id) = Self::resolve_id(session, kernel_id) {
+            if let Some(mut old) = session.remove(&id) {
+                old.stop().await;
+            }
+        } else if kernel_id.is_some() {
+            // Caller named a kernel that doesn't exist.
+            return Err(Self::resolve_id(session, kernel_id).unwrap_err());
+        }
+        let kernel = KernelState::spawn(dir).await?;
+        let id = kernel.kernel_id.clone();
+        session.insert(id.clone(), kernel);
+        Ok(id)
+    }
+
+    /// Inspect the variables in a kernel's namespace. Returns the JSON array of
+    /// `{name,type,repr}` the kernel emitted.
+    async fn inspect(
+        &self,
+        session_id: &str,
+        kernel_id: Option<&str>,
+        timeout_secs: u64,
+    ) -> Result<String, String> {
+        let mut kernels = self.kernels.lock().await;
+        let session = kernels
+            .get_mut(session_id)
+            .ok_or("no kernel for this session; call action=start first")?;
+        let id = Self::resolve_id(session, kernel_id)?;
+        session.get_mut(&id).unwrap().inspect(timeout_secs).await
     }
 
     async fn status(&self, session_id: &str) -> String {
         let kernels = self.kernels.lock().await;
         match kernels.get(session_id) {
             None => "no kernel running for this session".to_string(),
-            Some(k) => {
-                let state = if k.dead { "dead" } else { "running" };
-                format!(
-                    "kernel {} — {state}; pid={}; cells executed={}",
-                    k.kernel_id,
-                    k.pid().map(|p| p.to_string()).unwrap_or_else(|| "?".into()),
-                    k.execution_count
-                )
+            Some(session) if session.is_empty() => "no kernel running for this session".to_string(),
+            Some(session) => {
+                let mut ids: Vec<&String> = session.keys().collect();
+                ids.sort();
+                let mut lines = Vec::with_capacity(ids.len());
+                for id in ids {
+                    let k = &session[id];
+                    let state = if k.dead { "dead" } else { "running" };
+                    lines.push(format!(
+                        "kernel {} — {state}; pid={}; cells executed={}",
+                        k.kernel_id,
+                        k.pid().map(|p| p.to_string()).unwrap_or_else(|| "?".into()),
+                        k.execution_count
+                    ));
+                }
+                lines.join("\n")
             }
         }
     }
 
-    async fn stop(&self, session_id: &str) -> Result<String, String> {
+    /// Stop one kernel (resolved from `kernel_id`) in a session.
+    async fn stop(&self, session_id: &str, kernel_id: Option<&str>) -> Result<String, String> {
         let mut kernels = self.kernels.lock().await;
-        match kernels.remove(session_id) {
-            None => Err("no kernel running for this session".into()),
-            Some(mut k) => {
-                let id = k.kernel_id.clone();
-                k.stop().await;
-                Ok(format!("stopped kernel {id}"))
-            }
+        let session = kernels
+            .get_mut(session_id)
+            .ok_or("no kernel running for this session")?;
+        let id = Self::resolve_id(session, kernel_id)?;
+        let mut k = session.remove(&id).unwrap();
+        let kid = k.kernel_id.clone();
+        k.stop().await;
+        if session.is_empty() {
+            kernels.remove(session_id);
         }
+        Ok(format!("stopped kernel {kid}"))
     }
 
-    /// Run all cells from a parsed notebook sequentially. Returns per-cell
-    /// results. If `stop_on_error` is true, execution halts at the first failure.
+    /// Run all cells from a parsed notebook sequentially in the resolved kernel.
+    /// Returns per-cell results. If `stop_on_error` is true, execution halts at
+    /// the first failure.
     async fn run_all(
         &self,
         session_id: &str,
+        kernel_id: Option<&str>,
         cells: &[parse::NotebookCell],
         timeout_secs: u64,
         stop_on_error: bool,
@@ -114,7 +211,7 @@ impl KernelSupervisor {
         let mut results = Vec::with_capacity(cells.len());
         for cell in cells {
             let res = self
-                .run_cell(session_id, &cell.source, timeout_secs)
+                .run_cell(session_id, kernel_id, &cell.source, timeout_secs)
                 .await?;
             let stopped = stop_on_error && res.errored;
             results.push(CellRunResult {
@@ -135,9 +232,13 @@ impl KernelSupervisor {
     pub async fn reap_session(&self, session_id: &str) -> usize {
         let mut kernels = self.kernels.lock().await;
         match kernels.remove(session_id) {
-            Some(mut k) => {
-                k.stop().await;
-                1
+            Some(session) => {
+                let mut n = 0;
+                for (_, mut k) in session {
+                    k.stop().await;
+                    n += 1;
+                }
+                n
             }
             None => 0,
         }
@@ -176,6 +277,15 @@ impl NotebookTool {
             .map(|s| s.clamp(1, MAX_CELL_TIMEOUT_SECS))
             .unwrap_or(DEFAULT_CELL_TIMEOUT_SECS)
     }
+
+    /// The optional `kernel` arg (a kernel id) if the caller supplied a non-empty
+    /// string; `None` selects the session's sole kernel (see `resolve_id`).
+    fn resolve_kernel_id(args: &Value) -> Option<String> {
+        args.get("kernel")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    }
 }
 
 #[async_trait]
@@ -189,10 +299,14 @@ impl Tool for NotebookTool {
          across calls — unlike `python` (fresh interpreter each call). Use it to \
          build up state incrementally: define something in one cell, use it in the \
          next. The kernel is scoped to this session and shares its `.venv`. \
-         Actions: `start` (spawn the kernel), `run_cell` (run inline `code`, returns \
-         its stdout/stderr), `run_all` (execute all code cells from a .ipynb file \
-         sequentially), `status` (kernel state + cells run), `stop` (kill it). \
-         Each cell has a per-call timeout; a hung cell is interrupted then killed."
+         Actions: `start` (spawn a kernel, up to 3 per session; returns its id), \
+         `run_cell` (run inline `code`, returns its stdout/stderr), `run_all` \
+         (execute all code cells from a .ipynb file sequentially), `inspect` \
+         (dump the variables in scope), `restart` (kill + respawn a fresh kernel, \
+         keeping the session), `status` (kernel state + cells run), `stop` (kill \
+         a kernel). With multiple kernels in a session, pass `kernel` (the id) to \
+         pick one. Matplotlib figures are saved and their paths returned. Each \
+         cell has a per-call timeout; a hung cell is interrupted then killed."
     }
 
     fn parameters(&self) -> Value {
@@ -201,7 +315,7 @@ impl Tool for NotebookTool {
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["start", "run_cell", "run_all", "status", "stop"],
+                    "enum": ["start", "run_cell", "run_all", "inspect", "restart", "status", "stop"],
                     "description": "What to do."
                 },
                 "code": {
@@ -216,13 +330,17 @@ impl Tool for NotebookTool {
                     "type": "boolean",
                     "description": "For `run_all`: stop on first cell error (default true)."
                 },
+                "kernel": {
+                    "type": "string",
+                    "description": "Kernel id (from `start`) to target when the session has more than one kernel. Omit when there is exactly one."
+                },
                 "working_dir": {
                     "type": "string",
-                    "description": "For `start`: directory to run in (venv discovery + cwd),                                     relative to the workspace root or absolute. Defaults to root."
+                    "description": "For `start`/`restart`: directory to run in (venv discovery + cwd), relative to the workspace root or absolute. Defaults to root."
                 },
                 "timeout_secs": {
                     "type": "integer",
-                    "description": "For `run_cell`/`run_all`: per-cell wall-clock budget (default 60,                                     max 600). A cell that overruns is interrupted, then killed."
+                    "description": "For `run_cell`/`run_all`/`inspect`: per-cell wall-clock budget (default 60, max 600). A cell that overruns is interrupted, then killed."
                 }
             },
             "required": ["action"]
@@ -231,11 +349,11 @@ impl Tool for NotebookTool {
 
     fn safety(&self, args: &Value) -> Safety {
         match args.get("action").and_then(Value::as_str) {
-            // Reading kernel state mutates nothing → usable in Plan.
-            Some("status") => Safety::ReadOnly,
+            // Reading kernel state / variables mutates nothing → usable in Plan.
+            Some("status") | Some("inspect") => Safety::ReadOnly,
             // Stopping the kernel is a benign, reversible teardown.
             Some("stop") => Safety::Write,
-            // start / run_cell spawn and execute arbitrary Python.
+            // start / restart / run_cell / run_all spawn and execute arbitrary Python.
             _ => Safety::Dangerous,
         }
     }
@@ -255,6 +373,7 @@ impl Tool for NotebookTool {
     }
 
     async fn run_with_session(&self, args: Value, root: &Path, session_id: &str) -> ToolOutcome {
+        let kernel_id = Self::resolve_kernel_id(&args);
         match args.get("action").and_then(Value::as_str) {
             Some("start") => {
                 let dir = Self::resolve_dir(&args, root);
@@ -276,13 +395,22 @@ impl Tool for NotebookTool {
                     return ToolOutcome::error("run_cell requires a `code` string");
                 };
                 let timeout = Self::resolve_timeout(&args);
-                match self.supervisor.run_cell(session_id, code, timeout).await {
+                match self
+                    .supervisor
+                    .run_cell(session_id, kernel_id.as_deref(), code, timeout)
+                    .await
+                {
                     Ok(res) => {
                         // `cap_output` already prepends a truncation notice when
                         // needed, so `res.output` is display-ready.
                         let mut body = res.output;
                         if res.errored {
                             body.push_str("\n[cell raised an exception]");
+                        }
+                        // Append the FF_NB_META trailer if the cell produced images
+                        // (the FE strips it and renders the figures — see #879).
+                        if let Some(meta) = meta_trailer(&res.images, None) {
+                            body.push_str(&meta);
                         }
                         ToolOutcome::ok(body)
                     }
@@ -323,23 +451,59 @@ impl Tool for NotebookTool {
                     .unwrap_or(true);
                 match self
                     .supervisor
-                    .run_all(session_id, &cells, timeout, stop_on_error)
+                    .run_all(session_id, kernel_id.as_deref(), &cells, timeout, stop_on_error)
                     .await
                 {
                     Ok(results) => ToolOutcome::ok(format_run_all(&results, &cells, notebook_path)),
                     Err(e) => ToolOutcome::error(e),
                 }
             }
+            Some("inspect") => {
+                let timeout = Self::resolve_timeout(&args);
+                match self
+                    .supervisor
+                    .inspect(session_id, kernel_id.as_deref(), timeout)
+                    .await
+                {
+                    Ok(vars_json) => {
+                        let mut body = format_variables(&vars_json);
+                        if let Some(meta) = meta_trailer(&[], Some(&vars_json)) {
+                            body.push_str(&meta);
+                        }
+                        ToolOutcome::ok(body)
+                    }
+                    Err(e) => ToolOutcome::error(e),
+                }
+            }
+            Some("restart") => {
+                let dir = Self::resolve_dir(&args, root);
+                if !dir.is_dir() {
+                    return ToolOutcome::error(format!(
+                        "working_dir does not exist or is not a directory: {}",
+                        dir.display()
+                    ));
+                }
+                match self
+                    .supervisor
+                    .restart(session_id, kernel_id.as_deref(), &dir)
+                    .await
+                {
+                    Ok(id) => {
+                        ToolOutcome::ok(format!("restarted; fresh kernel {id} (previous state cleared)"))
+                    }
+                    Err(e) => ToolOutcome::error(e),
+                }
+            }
             Some("status") => ToolOutcome::ok(self.supervisor.status(session_id).await),
-            Some("stop") => match self.supervisor.stop(session_id).await {
+            Some("stop") => match self.supervisor.stop(session_id, kernel_id.as_deref()).await {
                 Ok(body) => ToolOutcome::ok(body),
                 Err(e) => ToolOutcome::error(e),
             },
             Some(other) => ToolOutcome::error(format!(
-                "unknown action '{other}'; expected start|run_cell|run_all|status|stop"
+                "unknown action '{other}'; expected start|run_cell|run_all|inspect|restart|status|stop"
             )),
             None => ToolOutcome::error(
-                "missing required argument: action (start|run_cell|run_all|status|stop)",
+                "missing required argument: action (start|run_cell|run_all|inspect|restart|status|stop)",
             ),
         }
     }
@@ -395,6 +559,59 @@ fn format_run_all(results: &[CellRunResult], cells: &[parse::NotebookCell], path
                 ));
             }
         }
+    }
+    out
+}
+
+/// Delimiters for the machine-readable Phase 3 trailer. The FE (#879) strips the
+/// block between these lines out of the visible output and JSON-parses the body
+/// to render images / variables. Emitted only when there is something to carry,
+/// so plain cells stay byte-identical to Phase 1/2.
+const META_OPEN: &str = "<<<FF_NB_META";
+const META_CLOSE: &str = "FF_NB_META";
+
+/// Build the `FF_NB_META` trailer carrying image paths and/or a variables dump,
+/// or `None` when both are empty. `vars_json` is a pre-serialized JSON array (as
+/// the kernel emitted it) spliced in verbatim.
+fn meta_trailer(images: &[String], vars_json: Option<&str>) -> Option<String> {
+    let has_images = !images.is_empty();
+    let has_vars = vars_json.is_some_and(|v| v.trim() != "[]" && !v.trim().is_empty());
+    if !has_images && !has_vars {
+        return None;
+    }
+    let images_arr = serde_json::to_string(
+        &images
+            .iter()
+            .map(|p| serde_json::json!({ "path": p, "mediaType": "image/png" }))
+            .collect::<Vec<_>>(),
+    )
+    .unwrap_or_else(|_| "[]".to_string());
+    let vars_arr = if has_vars {
+        vars_json.unwrap().trim().to_string()
+    } else {
+        "[]".to_string()
+    };
+    Some(format!(
+        "\n{META_OPEN}\n{{\"images\":{images_arr},\"variables\":{vars_arr}}}\n{META_CLOSE}\n"
+    ))
+}
+
+/// Render the `inspect` variables JSON into a compact human-readable table for
+/// the text result (the FE gets the structured data from the meta trailer).
+fn format_variables(vars_json: &str) -> String {
+    let parsed: Result<Vec<serde_json::Value>, _> = serde_json::from_str(vars_json);
+    let Ok(vars) = parsed else {
+        return "variables: (unparseable)".to_string();
+    };
+    if vars.is_empty() {
+        return "no user variables in scope".to_string();
+    }
+    let mut out = format!("{} variable(s) in scope:", vars.len());
+    for v in &vars {
+        let name = v.get("name").and_then(Value::as_str).unwrap_or("?");
+        let ty = v.get("type").and_then(Value::as_str).unwrap_or("?");
+        let repr = v.get("repr").and_then(Value::as_str).unwrap_or("");
+        out.push_str(&format!("\n  {name}: {ty} = {repr}"));
     }
     out
 }
