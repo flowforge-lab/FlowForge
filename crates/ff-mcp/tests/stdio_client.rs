@@ -17,6 +17,7 @@ fn echo_config() -> McpServerConfig {
         env: BTreeMap::new(),
         disabled: false,
         scope: McpScope::Global,
+        reaches_network: None,
     }
 }
 
@@ -68,6 +69,7 @@ fn cwd_config() -> McpServerConfig {
         env: BTreeMap::new(),
         disabled: false,
         scope: McpScope::Global,
+        reaches_network: None,
     }
 }
 

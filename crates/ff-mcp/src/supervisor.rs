@@ -911,9 +911,18 @@ impl Supervisor {
             .values()
             .filter(|h| h.state == McpServerState::Running)
             .flat_map(|h| {
-                h.tools.iter().cloned().map(|info| PublishedTool {
-                    key: h.key.clone(),
-                    info,
+                // Overlay the server's egress policy (RFC 0013) onto each published
+                // tool. The client can't know it (no protocol annotation), so the
+                // supervisor — which owns the config — resolves it here. Unset =
+                // fail-safe network-capable.
+                let reaches_network = h.config.reaches_network.unwrap_or(true);
+                let key = h.key.clone();
+                h.tools.iter().cloned().map(move |mut info| {
+                    info.reaches_network = reaches_network;
+                    PublishedTool {
+                        key: key.clone(),
+                        info,
+                    }
                 })
             })
             .collect();

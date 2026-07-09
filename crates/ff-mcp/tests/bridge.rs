@@ -35,6 +35,7 @@ fn echo_cfg() -> McpServerConfig {
         env: BTreeMap::new(),
         disabled: false,
         scope: McpScope::Global,
+        reaches_network: None,
     }
 }
 
@@ -46,6 +47,7 @@ fn cwd_cfg() -> McpServerConfig {
         env: BTreeMap::new(),
         // Workspace-scoped: one instance per session root (RFC 0018 §4.2).
         scope: McpScope::Workspace,
+        reaches_network: None,
         disabled: false,
     }
 }
@@ -82,6 +84,40 @@ async fn tools_snapshot_contains_running_server_tools() {
         tools.iter().map(|t| &t.info.name).collect::<Vec<_>>()
     );
     assert_eq!(echo_tool.unwrap().info.server, "echo");
+
+    sup.stop_all().await;
+}
+
+#[tokio::test]
+async fn reaches_network_config_is_overlaid_onto_published_tools() {
+    // RFC 0013 #884: a server vetted local (reaches_network=false) has that policy
+    // stamped onto every published tool by the supervisor rebuild; unset stays the
+    // fail-safe true. Also verify the bridged tool surfaces it via reaches_network().
+    let mut cfg = echo_cfg();
+    cfg.reaches_network = Some(false);
+    let shared: SharedConfig = Arc::new(RwLock::new(vec![cfg]));
+    let (_tx, change_rx) = mpsc::unbounded_channel::<()>();
+    let sup = spawn_supervisor(shared, change_rx, fast_config());
+
+    wait_running(&sup, Duration::from_secs(5)).await;
+
+    let tools = sup.tools_snapshot();
+    let echo_tool = tools.iter().find(|t| t.info.name == "echo").unwrap();
+    assert!(
+        !echo_tool.info.reaches_network,
+        "config reaches_network=Some(false) must be overlaid onto the published tool"
+    );
+
+    // The bridged tool exposes it through the Tool trait (feeds local_tool_names()).
+    let bridged = build_bridged_tools(&sup, std::path::Path::new("/"));
+    let echo_bridged = bridged
+        .iter()
+        .find(|t| t.name() == "mcp__echo__echo")
+        .expect("echo bridged tool present");
+    assert!(
+        !echo_bridged.reaches_network(),
+        "bridged tool must report the server's local egress policy"
+    );
 
     sup.stop_all().await;
 }

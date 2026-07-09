@@ -5,4 +5,13 @@ import type { McpScope } from "./McpScope";
  * One external MCP server definition, as it appears in `~/.flowforge/mcp.json`
  * (Claude/Cursor `mcpServers` shape).
  */
-export type McpServerConfig = { id: string, command: string, args: Array<string>, env: { [key in string]?: string }, disabled: boolean, scope: McpScope, };
+export type McpServerConfig = { id: string, command: string, args: Array<string>, env: { [key in string]?: string }, disabled: boolean, scope: McpScope, 
+/**
+ * Whether this server may reach the network (RFC 0013 egress policy). `None`
+ * (unset) is fail-safe: the server is treated as network-capable, so a
+ * `LocalOnly` phenotype strips its tools from the advertised set. Set `false`
+ * for a vetted pure-local server (e.g. codegraph, a filesystem server) to keep
+ * it available under local-only. The MCP protocol has no network annotation,
+ * so this is an operator assertion in `mcp.json`, not a server-declared hint.
+ */
+reachesNetwork?: boolean, };
