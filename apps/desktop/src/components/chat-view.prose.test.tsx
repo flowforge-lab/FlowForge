@@ -209,4 +209,29 @@ describe("ChatView active prose (#864 streaming edge case)", () => {
     expect(chip.getAttribute("aria-expanded")).toBe("true");
     expect(chip.getAttribute("aria-hidden")).toBe("true");
   });
+
+  it("collapses the live answer slot to 'On it' once it has its own recorded tool call", () => {
+    // a2 is this same seed's *streaming* message: its content (PROSE_2) is
+    // still growing in the answer slot, and it already has its own live step
+    // (the `grep` call) recorded — so it's guaranteed not the final answer,
+    // even though nothing has superseded it yet. This is the actual live,
+    // in-flight case the issue describes; unlike a promoted `prose` segment
+    // (always already-settled by the time it exists, see turn-groups.ts),
+    // this is the one place `streaming` can genuinely be true.
+    seedProseFollowedByLiveSteps();
+    render(<ChatView />);
+
+    const chips = Array.from(
+      document.querySelectorAll<HTMLElement>("button[data-on-it]"),
+    );
+    // PROSE_1's (settled, hidden) chip plus PROSE_2's (live, collapsed) chip.
+    expect(chips.length).toBe(2);
+    const liveChip = chips[1];
+    expect(liveChip.getAttribute("aria-expanded")).toBe("false");
+    expect(liveChip.getAttribute("aria-hidden")).toBe("false");
+    // PROSE_2's text is in the DOM (for the smooth expand) but clipped.
+    expect(
+      screen.getByText(PROSE_2).closest("[aria-hidden='true']"),
+    ).toBeTruthy();
+  });
 });

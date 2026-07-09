@@ -122,4 +122,29 @@ describe("ActiveProseBlock (#864)", () => {
     // No "1000" anywhere in the inline style — the cap must be data-driven.
     expect(styleAttr).not.toMatch(/1000/);
   });
+
+  it("defaults to muted tone with no caret (the settled intermediate-prose call site)", () => {
+    render(<ActiveProseBlock text={LONG_TEXT} streaming={false} />);
+
+    const content = screen.getByText(LONG_TEXT).closest("[data-prose-content]");
+    expect(content?.className).toMatch(/text-muted-foreground/);
+    expect(content?.className).not.toMatch(/text-foreground\b/);
+    expect(content?.className).not.toMatch(/ff-streaming-caret/);
+  });
+
+  it("switches to foreground tone with a caret when used for the live answer slot (#864)", () => {
+    render(
+      <ActiveProseBlock
+        text={LONG_TEXT}
+        streaming={true}
+        tone="foreground"
+        caret={true}
+      />,
+    );
+
+    const content = screen.getByText(LONG_TEXT).closest("[data-prose-content]");
+    expect(content?.className).toMatch(/text-foreground/);
+    expect(content?.className).not.toMatch(/text-muted-foreground/);
+    expect(content?.className).toMatch(/ff-streaming-caret/);
+  });
 });
