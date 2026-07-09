@@ -18,6 +18,9 @@ pub struct GlobTool;
 
 #[async_trait]
 impl Tool for GlobTool {
+    fn reaches_network(&self) -> bool {
+        false
+    }
     fn name(&self) -> &str {
         "glob"
     }

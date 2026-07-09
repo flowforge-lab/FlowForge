@@ -26,6 +26,9 @@ pub struct TodoTool;
 
 #[async_trait]
 impl Tool for TodoTool {
+    fn reaches_network(&self) -> bool {
+        false
+    }
     fn name(&self) -> &str {
         "todo"
     }

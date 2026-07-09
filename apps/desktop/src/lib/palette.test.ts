@@ -166,8 +166,13 @@ describe("buildSkillCommands", () => {
 
 describe("buildPhenotypeCommands", () => {
   const phenotypes: Phenotype[] = [
-    { name: "default", skills: [], mcpServers: [] },
-    { name: "rust", skills: ["rust-debugging"], mcpServers: [] },
+    { name: "default", skills: [], mcpServers: [], egress: "open" },
+    {
+      name: "rust",
+      skills: ["rust-debugging"],
+      mcpServers: [],
+      egress: "open",
+    },
   ];
 
   it("lists switch rows for non-active phenotypes", () => {

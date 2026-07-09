@@ -1211,6 +1211,7 @@ fn spawn_assistant_turn(state: Arc<AppState>, app: tauri::AppHandle, session_id:
             &permission_matrix,
         );
         tool_ctx.mode = mode;
+        tool_ctx.egress = state.session_phenotype(&session_id).egress;
         tool_ctx.abstractive = crate::state::abstractive_config_from_env();
         tool_ctx.compaction_model = state.compaction_model(&conn_id);
         tool_ctx.compaction_budget = state.compaction_budget(&conn_id);
@@ -1576,6 +1577,7 @@ impl GoalIteration for GoalLoopIteration {
             &permission_matrix,
         );
         tool_ctx.mode = mode;
+        tool_ctx.egress = pheno.egress;
         tool_ctx.abstractive = crate::state::abstractive_config_from_env();
 
         let skills = self.state.skills_snapshot();
@@ -1901,6 +1903,7 @@ impl ff_scheduled::TaskRunner for DesktopTaskRunner {
             &permission_matrix,
         );
         tool_ctx.mode = mode;
+        tool_ctx.egress = pheno.egress;
         tool_ctx.abstractive = crate::state::abstractive_config_from_env();
         tool_ctx.compaction_model = self.state.compaction_model(&selection.connection);
         tool_ctx.compaction_budget = self.state.compaction_budget(&selection.connection);

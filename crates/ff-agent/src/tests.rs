@@ -121,7 +121,8 @@ fn plan_mode_advertises_read_capable_and_sensitive_tools() {
     // invocation of the visible tools.
     let reg = ToolRegistry::with_defaults();
     let matrix = PermissionMatrix::default();
-    let advertised = advertised_tools(Mode::Plan, &matrix, None, &reg).expect("Plan restricts");
+    let advertised =
+        advertised_tools(Mode::Plan, Egress::Open, &matrix, None, &reg).expect("Plan restricts");
     for name in [
         "view",
         "grep",
@@ -152,7 +153,8 @@ fn plan_mode_hides_sensitive_tools_when_the_matrix_denies_sensitive() {
     let reg = ToolRegistry::with_defaults();
     let mut matrix = PermissionMatrix::default();
     matrix.set_cell(Mode::Plan, Safety::Sensitive, PermissionCell::Deny);
-    let advertised = advertised_tools(Mode::Plan, &matrix, None, &reg).expect("Plan restricts");
+    let advertised =
+        advertised_tools(Mode::Plan, Egress::Open, &matrix, None, &reg).expect("Plan restricts");
     assert!(advertised.contains("bash"));
     assert!(advertised.contains("github"));
     for name in ["web_fetch", "agent"] {
@@ -170,7 +172,8 @@ fn plan_mode_intersects_with_subagent_allowlist() {
     // A sub-agent scoped to {view, edit}: Plan further drops the mutating `edit`.
     let allowed: std::collections::HashSet<String> =
         ["view", "edit"].iter().map(|s| s.to_string()).collect();
-    let advertised = advertised_tools(Mode::Plan, &matrix, Some(&allowed), &reg).unwrap();
+    let advertised =
+        advertised_tools(Mode::Plan, Egress::Open, &matrix, Some(&allowed), &reg).unwrap();
     assert_eq!(advertised, ["view".to_string()].into_iter().collect());
 }
 
@@ -178,13 +181,86 @@ fn plan_mode_intersects_with_subagent_allowlist() {
 fn act_and_auto_pass_the_allowlist_through_unchanged() {
     let reg = ToolRegistry::with_defaults();
     let matrix = PermissionMatrix::default();
-    assert_eq!(advertised_tools(Mode::Act, &matrix, None, &reg), None);
-    assert_eq!(advertised_tools(Mode::Auto, &matrix, None, &reg), None);
+    assert_eq!(
+        advertised_tools(Mode::Act, Egress::Open, &matrix, None, &reg),
+        None
+    );
+    assert_eq!(
+        advertised_tools(Mode::Auto, Egress::Open, &matrix, None, &reg),
+        None
+    );
     let allowed: std::collections::HashSet<String> =
         ["view", "edit"].iter().map(|s| s.to_string()).collect();
     assert_eq!(
-        advertised_tools(Mode::Auto, &matrix, Some(&allowed), &reg),
+        advertised_tools(Mode::Auto, Egress::Open, &matrix, Some(&allowed), &reg),
         Some(allowed)
+    );
+}
+
+#[test]
+fn local_only_egress_strips_network_tools_in_act() {
+    // RFC 0013: under LocalOnly, Act/Auto (which would advertise all tools) is
+    // reduced to the local-only set — network tools are stripped.
+    let reg = ToolRegistry::with_defaults();
+    let matrix = PermissionMatrix::default();
+    let advertised = advertised_tools(Mode::Act, Egress::LocalOnly, &matrix, None, &reg)
+        .expect("LocalOnly restricts even in Act");
+    for name in ["view", "edit", "grep", "diagnostics", "agent"] {
+        assert!(
+            advertised.contains(name),
+            "LocalOnly should keep local {name}"
+        );
+    }
+    for name in ["bash", "python", "web_fetch", "web_search", "github"] {
+        assert!(
+            !advertised.contains(name),
+            "LocalOnly must strip network tool {name}"
+        );
+    }
+}
+
+#[test]
+fn local_only_composes_with_plan_mode() {
+    // enclave + Plan = local AND read-capable. `edit` (local but not read-capable)
+    // is dropped by the Plan pass; `web_fetch` (read-shaped but network) by egress.
+    let reg = ToolRegistry::with_defaults();
+    let matrix = PermissionMatrix::default();
+    let advertised = advertised_tools(Mode::Plan, Egress::LocalOnly, &matrix, None, &reg).unwrap();
+    assert!(advertised.contains("view"));
+    assert!(advertised.contains("grep"));
+    assert!(!advertised.contains("edit"), "Plan drops the mutating edit");
+    assert!(
+        !advertised.contains("web_fetch"),
+        "egress drops the network tool"
+    );
+    assert!(
+        !advertised.contains("bash"),
+        "egress drops bash even w/ read floor"
+    );
+}
+
+#[test]
+fn local_only_composes_with_subagent_allowlist() {
+    // allowlist ∩ local: a sub-agent scoped to {view, web_fetch} keeps only view.
+    let reg = ToolRegistry::with_defaults();
+    let matrix = PermissionMatrix::default();
+    let allowed: std::collections::HashSet<String> = ["view", "web_fetch"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let advertised =
+        advertised_tools(Mode::Auto, Egress::LocalOnly, &matrix, Some(&allowed), &reg).unwrap();
+    assert_eq!(advertised, ["view".to_string()].into_iter().collect());
+}
+
+#[test]
+fn open_egress_is_byte_identical_to_pre_rfc() {
+    // Regression guard: Open must not change today's behaviour.
+    let reg = ToolRegistry::with_defaults();
+    let matrix = PermissionMatrix::default();
+    assert_eq!(
+        advertised_tools(Mode::Act, Egress::Open, &matrix, None, &reg),
+        None
     );
 }
 
@@ -269,6 +345,7 @@ async fn plan_mode_hard_blocks_dispatch_of_a_hidden_tool() {
         max_depth: 1,
         allowed: None,
         mode: Mode::Plan,
+        egress: Egress::default(),
         matrix: &matrix,
         abstractive: AbstractiveConfig::default(),
         compaction_model: None,
@@ -2820,6 +2897,7 @@ async fn subagent_depth_guard_refuses_nested_spawn() {
         max_depth: 1,
         allowed: None,
         mode: Mode::default(),
+        egress: Egress::default(),
         matrix: &matrix,
         abstractive: AbstractiveConfig::default(),
         compaction_model: None,
@@ -2880,6 +2958,7 @@ async fn subagent_allowlist_blocks_disallowed_tool() {
         max_depth: 1,
         allowed: Some(["view".to_string()].into_iter().collect()),
         mode: Mode::default(),
+        egress: Egress::default(),
         matrix: &matrix,
         abstractive: AbstractiveConfig::default(),
         compaction_model: None,

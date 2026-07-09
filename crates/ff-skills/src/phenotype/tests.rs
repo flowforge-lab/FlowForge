@@ -129,6 +129,7 @@ fn pheno(name: &str) -> Phenotype {
             disabled: false,
             scope: ff_core::McpScope::Workspace,
         }],
+        egress: ff_core::Egress::Open,
     }
 }
 
@@ -153,6 +154,7 @@ fn save_omits_name_and_none_fields() {
         max_iterations: None,
         provider: None,
         mcp_servers: Vec::new(),
+        egress: ff_core::Egress::Open,
     };
     save_phenotype(dir.path(), &bare).unwrap();
     let body = fs::read_to_string(dir.path().join("bare.toml")).unwrap();

@@ -15,6 +15,9 @@ pub struct ViewTool;
 
 #[async_trait]
 impl Tool for ViewTool {
+    fn reaches_network(&self) -> bool {
+        false
+    }
     fn name(&self) -> &str {
         "view"
     }

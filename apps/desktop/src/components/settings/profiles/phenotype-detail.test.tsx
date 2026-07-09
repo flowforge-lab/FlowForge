@@ -43,9 +43,12 @@ afterEach(() => {
 describe("PhenotypeDetail (#530)", () => {
   it("renders the built-in default read-only with a working Duplicate action", async () => {
     // Mock (no call-through) so the shared mock's phenotype set isn't mutated.
-    const spy = vi
-      .spyOn(ipc, "updatePhenotype")
-      .mockResolvedValue({ name: "default-copy", skills: [], mcpServers: [] });
+    const spy = vi.spyOn(ipc, "updatePhenotype").mockResolvedValue({
+      name: "default-copy",
+      skills: [],
+      mcpServers: [],
+      egress: "open",
+    });
     render(<PhenotypeDetail phenotypeId="default" />);
 
     // No provider/model pickers — the rows are read-only.
@@ -62,6 +65,7 @@ describe("PhenotypeDetail (#530)", () => {
       name: "reviewer",
       skills: ["create-pr"],
       mcpServers: [],
+      egress: "open",
     });
     render(<PhenotypeDetail phenotypeId="reviewer" />);
 

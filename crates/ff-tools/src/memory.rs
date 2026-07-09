@@ -110,6 +110,9 @@ impl MemorySearchTool {
 
 #[async_trait]
 impl Tool for MemorySearchTool {
+    fn reaches_network(&self) -> bool {
+        false
+    }
     fn name(&self) -> &str {
         "memory_search"
     }
@@ -196,6 +199,9 @@ impl MemoryGetTool {
 
 #[async_trait]
 impl Tool for MemoryGetTool {
+    fn reaches_network(&self) -> bool {
+        false
+    }
     fn name(&self) -> &str {
         "memory_get"
     }
@@ -278,6 +284,9 @@ impl MemoryWriteTool {
 
 #[async_trait]
 impl Tool for MemoryWriteTool {
+    fn reaches_network(&self) -> bool {
+        false
+    }
     fn name(&self) -> &str {
         "memory_write"
     }
@@ -423,6 +432,9 @@ impl MemoryConsolidateTool {
 
 #[async_trait]
 impl Tool for MemoryConsolidateTool {
+    fn reaches_network(&self) -> bool {
+        false
+    }
     fn name(&self) -> &str {
         "memory_consolidate"
     }

@@ -71,10 +71,30 @@ fn phenotype_round_trips() {
         max_iterations: None,
         provider: None,
         mcp_servers: Vec::new(),
+        egress: crate::Egress::Open,
     };
     let json = serde_json::to_string(&p).unwrap();
     assert_eq!(p, serde_json::from_str(&json).unwrap());
     assert!(!json.contains("persona"));
+}
+
+#[test]
+fn phenotype_defaults_egress_to_open_when_absent() {
+    // TOML/JSON that omits `egress` must deserialize to Open (backward compat).
+    let p: Phenotype = serde_json::from_str(r#"{"name":"legacy"}"#).unwrap();
+    assert_eq!(p.egress, crate::Egress::Open);
+}
+
+#[test]
+fn phenotype_accepts_kebab_and_camel_egress() {
+    // RFC 0013 TOML literal `local-only` (alias) and the camelCase wire form both parse.
+    let a: Phenotype = serde_json::from_str(r#"{"name":"a","egress":"local-only"}"#).unwrap();
+    let b: Phenotype = serde_json::from_str(r#"{"name":"b","egress":"localOnly"}"#).unwrap();
+    assert_eq!(a.egress, crate::Egress::LocalOnly);
+    assert_eq!(b.egress, crate::Egress::LocalOnly);
+    // Serializes to the camelCase form for a consistent TS binding.
+    let json = serde_json::to_string(&b).unwrap();
+    assert!(json.contains("\"localOnly\""), "got: {json}");
 }
 
 #[test]

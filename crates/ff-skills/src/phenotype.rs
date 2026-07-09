@@ -54,6 +54,7 @@ pub fn default_phenotype() -> Phenotype {
         max_iterations: None,
         provider: None,
         mcp_servers: Vec::new(),
+        egress: ff_core::Egress::Open,
     }
 }
 
@@ -75,6 +76,8 @@ struct PhenotypeFile {
     provider: Option<String>,
     #[serde(default)]
     mcp_servers: Vec<McpServerConfig>,
+    #[serde(default)]
+    egress: ff_core::Egress,
 }
 
 impl PhenotypeFile {
@@ -87,6 +90,7 @@ impl PhenotypeFile {
             max_iterations: self.max_iterations,
             provider: self.provider,
             mcp_servers: self.mcp_servers,
+            egress: self.egress,
         }
     }
 }

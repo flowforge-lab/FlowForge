@@ -28,6 +28,15 @@ impl Tool for AgentTool {
         AGENT_TOOL_NAME
     }
 
+    /// The sub-agent is a *local dispatch* — it spawns an in-process child, it does
+    /// not itself reach the network. Egress is enforced by inheritance: the child's
+    /// `ToolContext.egress` is cloned from the parent, so a `LocalOnly` parent yields
+    /// a `LocalOnly` child whose own advertised set strips network tools (RFC 0013).
+    /// Classifying `agent` as network-capable would wrongly stop `enclave` delegating.
+    fn reaches_network(&self) -> bool {
+        false
+    }
+
     fn description(&self) -> &str {
         "Delegate a self-contained subtask to a fresh sub-agent that runs in its own \
          context and returns only a summary. Use this to keep your own context lean on \

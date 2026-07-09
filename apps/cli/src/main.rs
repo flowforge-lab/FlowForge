@@ -398,6 +398,8 @@ async fn run(
         &matrix,
     );
     tool_ctx.mode = mode;
+    // RFC 0013: apply the active phenotype's egress policy (Open when no --pheno).
+    tool_ctx.egress = active_pheno.as_ref().map(|p| p.egress).unwrap_or_default();
 
     let cancel = CancelToken::new();
     // Ctrl-C cancels the turn cooperatively. `ctrl_c()` is portable across Unix and

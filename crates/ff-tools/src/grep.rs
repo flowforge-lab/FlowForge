@@ -23,6 +23,9 @@ pub struct GrepTool;
 
 #[async_trait]
 impl Tool for GrepTool {
+    fn reaches_network(&self) -> bool {
+        false
+    }
     fn name(&self) -> &str {
         "grep"
     }

@@ -353,6 +353,8 @@ impl BashTool {
 
 #[async_trait]
 impl Tool for BashTool {
+    // reaches_network: keeps the fail-safe `true` default (RFC 0013) — it
+    // runs an arbitrary shell command — the canonical egress path (`curl`, `wget`).
     fn name(&self) -> &str {
         "bash"
     }

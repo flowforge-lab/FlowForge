@@ -16,6 +16,9 @@ pub struct AskUserTool;
 
 #[async_trait]
 impl Tool for AskUserTool {
+    fn reaches_network(&self) -> bool {
+        false
+    }
     fn name(&self) -> &str {
         "ask_user"
     }

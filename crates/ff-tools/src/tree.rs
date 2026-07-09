@@ -18,6 +18,9 @@ pub struct TreeTool;
 
 #[async_trait]
 impl Tool for TreeTool {
+    fn reaches_network(&self) -> bool {
+        false
+    }
     fn name(&self) -> &str {
         "tree"
     }
