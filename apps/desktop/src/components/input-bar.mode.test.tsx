@@ -21,8 +21,8 @@ import { usePermissionMatrixStore } from "@/store/permission-matrix";
 import { useSessionWorkspaceStore } from "@/store/session-workspace";
 import type { Message, Mode, PermissionCell, Safety } from "@/bindings";
 
-// The default RFC 0019 matrix (mirrors lib/mock.ts) so the posture tooltip has data
-// and the pill's mount-effect load() is a no-op (#801).
+// The default RFC 0019 matrix (mirrors lib/mock.ts) so the popover's posture
+// breakdown has data and the pill's mount-effect load() is a no-op (#801).
 const DEFAULT_MATRIX: Record<Mode, Record<Safety, PermissionCell>> = {
   plan: {
     readonly: "allow",
@@ -44,8 +44,8 @@ const DEFAULT_MATRIX: Record<Mode, Record<Safety, PermissionCell>> = {
   },
 };
 
-// Radix DropdownMenu/Tooltip call these pointer/scroll/observer APIs that jsdom
-// doesn't implement (Tooltip's Popper needs ResizeObserver, #801).
+// Radix DropdownMenu calls these pointer/scroll/observer APIs that jsdom
+// doesn't implement (its Popper positioning needs ResizeObserver, #801).
 beforeAll(() => {
   const proto = Element.prototype as unknown as Record<string, unknown>;
   proto.hasPointerCapture ??= () => false;
@@ -149,27 +149,31 @@ describe("ModePill dropdown (#344)", () => {
     expect(reset.getAttribute("aria-disabled")).toBe("true");
   });
 
-  it("surfaces the current mode's tool posture on hover (#801)", async () => {
+  it("surfaces the current mode's tool posture in the popover (#801, #865)", async () => {
     // Fresh pane inherits Auto: read+write auto-run, sensitive asks, dangerous hidden.
-    within(screen.getByTestId("a")).getByRole("button").focus();
-    const tip = await screen.findByRole("tooltip");
-    expect(tip.textContent).toContain("Auto mode");
-    expect(tip.textContent).toMatch(/Auto-runs:.*Read & browse.*Local writes/);
-    expect(tip.textContent).toMatch(/Needs approval:.*External changes/);
-    expect(tip.textContent).toMatch(/Hidden:.*Dangerous commands/);
+    // Moved from a hover tooltip (which blocked the composer textarea, #865) into
+    // the click popover itself, so open it the same way selectMode/resetMode do.
+    const user = userEvent.setup();
+    await user.click(within(screen.getByTestId("a")).getByRole("button"));
+    const menu = await screen.findByRole("menu");
+    expect(menu.textContent).toContain("Auto mode");
+    expect(menu.textContent).toMatch(/Auto-runs:.*Read & browse.*Local writes/);
+    expect(menu.textContent).toMatch(/Needs approval:.*External changes/);
+    expect(menu.textContent).toMatch(/Hidden:.*Dangerous commands/);
   });
 
-  it("updates the posture buckets when the mode changes (#801)", async () => {
+  it("updates the posture buckets when the mode changes (#801, #865)", async () => {
     // Switch pane a to Act: everything auto-runs except Dangerous (ask); nothing hidden.
     await selectMode("a", "Act");
-    within(screen.getByTestId("a")).getByRole("button").focus();
-    const tip = await screen.findByRole("tooltip");
-    expect(tip.textContent).toContain("Act mode");
-    expect(tip.textContent).toMatch(
+    const user = userEvent.setup();
+    await user.click(within(screen.getByTestId("a")).getByRole("button"));
+    const menu = await screen.findByRole("menu");
+    expect(menu.textContent).toContain("Act mode");
+    expect(menu.textContent).toMatch(
       /Auto-runs:.*Read & browse.*Local writes.*External changes/,
     );
-    expect(tip.textContent).toMatch(/Needs approval:.*Dangerous commands/);
-    expect(tip.textContent).toMatch(/Hidden:.*None/);
+    expect(menu.textContent).toMatch(/Needs approval:.*Dangerous commands/);
+    expect(menu.textContent).toMatch(/Hidden:.*None/);
   });
 });
 
