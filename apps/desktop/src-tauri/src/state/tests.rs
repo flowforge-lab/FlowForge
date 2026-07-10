@@ -401,11 +401,11 @@ fn active_skills_is_sorted_and_deduped() {
 }
 
 // First-run phenotype selection (#298). A fake resolver lets us cover the whole
-// branch matrix without touching `~/.flowforge`. `codon` and `default` resolve;
-// anything else is unknown.
+// branch matrix without touching `~/.flowforge`. `orchestrator` and `default`
+// resolve; anything else is unknown.
 fn fake_resolve(name: &str) -> Option<Phenotype> {
     match name {
-        "codon" | "default" | "rust" => Some(Phenotype {
+        "orchestrator" | "default" | "rust" => Some(Phenotype {
             name: name.to_string(),
             skills: vec![],
             model: None,
@@ -426,20 +426,20 @@ fn initial_phenotype_prefers_persisted_choice() {
 }
 
 #[test]
-fn initial_phenotype_defaults_to_codon_when_no_persisted_choice() {
+fn initial_phenotype_defaults_to_orchestrator_when_no_persisted_choice() {
     let pheno = initial_phenotype(None, fake_resolve);
-    assert_eq!(pheno.name, "codon");
+    assert_eq!(pheno.name, "orchestrator");
 }
 
 #[test]
-fn initial_phenotype_unknown_persisted_falls_through_to_codon() {
+fn initial_phenotype_unknown_persisted_falls_through_to_orchestrator() {
     let pheno = initial_phenotype(Some("ghost".to_string()), fake_resolve);
-    assert_eq!(pheno.name, "codon");
+    assert_eq!(pheno.name, "orchestrator");
 }
 
 #[test]
-fn initial_phenotype_falls_back_to_default_when_codon_absent() {
-    // Codon not installed (rare seed-failure): resolver only knows `default`.
+fn initial_phenotype_falls_back_to_default_when_orchestrator_absent() {
+    // Orchestrator not installed (rare seed-failure): resolver only knows `default`.
     let resolve = |name: &str| (name == "default").then(default_phenotype);
     let pheno = initial_phenotype(None, resolve);
     assert_eq!(pheno.name, DEFAULT_PHENOTYPE);
@@ -2277,6 +2277,45 @@ fn seed_builtin_content_writes_codon_and_codegraph_when_absent() {
 }
 
 #[test]
+fn seed_builtin_content_writes_rfc0013_phenotype_family() {
+    let phenos = tempfile::tempdir().unwrap();
+    let skills = tempfile::tempdir().unwrap();
+    seed_builtin_content_at(phenos.path(), skills.path(), None);
+
+    for name in ["orchestrator", "erudite", "enclave"] {
+        assert!(
+            phenos.path().join(format!("{name}.toml")).exists(),
+            "{name}.toml must be seeded"
+        );
+    }
+    let (map, errors) = load_phenotypes(phenos.path());
+    assert!(
+        errors.is_empty(),
+        "seeded phenotype family must parse: {errors:?}"
+    );
+    // The factory-active default resolves.
+    assert!(map.contains_key("orchestrator"), "orchestrator present");
+    // enclave carries the local-only egress policy (the P1/P2 payoff), proving the
+    // `egress = "local-only"` literal deserializes through the real loader.
+    assert_eq!(
+        map.get("enclave").expect("enclave present").egress,
+        ff_core::Egress::LocalOnly,
+        "enclave must be local-only"
+    );
+    // The other two default to Open (egress omitted).
+    assert_eq!(
+        map.get("erudite").expect("erudite present").egress,
+        ff_core::Egress::Open
+    );
+    assert_eq!(
+        map.get("orchestrator")
+            .expect("orchestrator present")
+            .egress,
+        ff_core::Egress::Open
+    );
+}
+
+#[test]
 fn seed_builtin_content_does_not_clobber_user_edits() {
     let phenos = tempfile::tempdir().unwrap();
     let skills = tempfile::tempdir().unwrap();
@@ -2292,6 +2331,28 @@ fn seed_builtin_content_does_not_clobber_user_edits() {
     );
     // The absent codegraph skill is still seeded alongside the kept edit.
     assert!(skills.path().join("codegraph").join("SKILL.md").exists());
+}
+
+#[test]
+fn seed_builtin_content_does_not_clobber_edited_orchestrator() {
+    // The RFC 0013 family is also write-if-absent: an edited orchestrator.toml
+    // (e.g. a user pinned a model) must survive a later seed pass.
+    let phenos = tempfile::tempdir().unwrap();
+    let skills = tempfile::tempdir().unwrap();
+    let orchestrator = phenos.path().join("orchestrator.toml");
+    let edited = "name = \"orchestrator\"\nskills = []\nmodel = \"my-pinned-model\"\n";
+    fs::write(&orchestrator, edited).unwrap();
+
+    seed_builtin_content_at(phenos.path(), skills.path(), None);
+
+    assert_eq!(
+        fs::read_to_string(&orchestrator).unwrap(),
+        edited,
+        "an edited orchestrator.toml must never be overwritten"
+    );
+    // The absent siblings still land.
+    assert!(phenos.path().join("erudite.toml").exists());
+    assert!(phenos.path().join("enclave.toml").exists());
 }
 
 #[test]
@@ -2380,6 +2441,52 @@ fn seed_gate_re_runs_when_stamp_is_stale() {
         fs::read_to_string(&stamp).unwrap(),
         format!("{:016x}\n", SEED_FINGERPRINT),
         "a re-run pass must refresh the stamp to the current fingerprint"
+    );
+}
+
+#[test]
+fn seed_gate_reseeds_rfc0013_family_for_upgraders() {
+    // Regression for the P2 blocker (#889 review): the RFC 0013 phenotype family
+    // must land for an EXISTING user upgrading, not just a fresh install. Such a
+    // user already has a stamp matching the PRE-family fingerprint (codon +
+    // codegraph + logic version, without the 3 new TOMLs). If those TOMLs aren't
+    // folded into SEED_FINGERPRINT, that stamp still matches and the gate skips the
+    // whole pass -> orchestrator/erudite/enclave never arrive. Reconstruct that
+    // pre-family fingerprint, stamp with it, and assert the gate re-runs and writes
+    // the family. (The existing suite only proved codon re-seeds on an arbitrary
+    // stale stamp, and the family test bypassed the gate via seed_builtin_content_at.)
+    let root = tempfile::tempdir().unwrap();
+    let phenos = root.path().join("phenos");
+    let skills = root.path().join("skills");
+    let stamp = root.path().join(".seed_version");
+
+    // The fingerprint as it was BEFORE the family was added: codon + codegraph +
+    // logic version only. Must differ from the current SEED_FINGERPRINT now that
+    // the three TOMLs are folded in.
+    let pre_family = {
+        let h = 0xcbf2_9ce4_8422_2325u64;
+        let h = fnv1a_mix(h, CODON_PHENOTYPE_TOML.as_bytes());
+        let h = fnv1a_mix(h, CODEGRAPH_SKILL_MD.as_bytes());
+        fnv1a_mix(h, SEED_LOGIC_VERSION.as_bytes())
+    };
+    assert_ne!(
+        pre_family, SEED_FINGERPRINT,
+        "the new TOMLs must change the fingerprint, or upgraders never re-seed"
+    );
+    fs::write(&stamp, format!("{pre_family:016x}\n")).unwrap();
+
+    seed_builtin_content_gated(Some(&stamp), &phenos, &skills, None);
+
+    for name in ["orchestrator", "erudite", "enclave"] {
+        assert!(
+            phenos.join(format!("{name}.toml")).exists(),
+            "{name}.toml must be seeded for an upgrading user (stale pre-family stamp)"
+        );
+    }
+    assert_eq!(
+        fs::read_to_string(&stamp).unwrap(),
+        format!("{:016x}\n", SEED_FINGERPRINT),
+        "the re-run must refresh the stamp to the current fingerprint"
     );
 }
 

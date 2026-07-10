@@ -1,0 +1,21 @@
+# Enclave -- local-privacy phenotype. `egress = "local-only"` strips
+# network-capable tools (web_fetch, web_search, bash, non-local MCP servers) from
+# the advertised set.
+#
+# IMPORTANT: local-only strips network TOOLS, not the inference call itself. If
+# your active connection is a cloud provider, prompt content still leaves this
+# machine to reach the model. For a true enclave, ALSO pin `model`/`provider`
+# below to a LOCAL endpoint (e.g. an Ollama connection) so inference stays local.
+#
+# `model` is intentionally unset here (inherits the active connection). Do NOT
+# write `model = ""` -- an empty string breaks resolution. Pin a real LOCAL id,
+# e.g. model = "qwen2.5-coder:7b" with a local provider.
+#
+# The file stem is the phenotype name, so there is no `name` field here.
+skills = []
+max_iterations = 25
+egress = "local-only"
+persona = """
+You operate in a local-privacy enclave. No user data leaves this machine. Work
+with the local tools available; do not attempt to reach the network.
+"""

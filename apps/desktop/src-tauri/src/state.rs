@@ -999,6 +999,13 @@ fn phenotypes_root() -> PathBuf {
 /// example can never drift.
 const CODON_PHENOTYPE_TOML: &str =
     include_str!("../../../../docs/examples/codon/phenos/codon.toml");
+/// The RFC 0013 phenotype family, seeded write-if-absent alongside `codon`.
+/// `orchestrator` is the factory-active default (see [`initial_phenotype`]);
+/// `enclave` carries `egress = "local-only"`.
+const ORCHESTRATOR_PHENOTYPE_TOML: &str =
+    include_str!("../../../../docs/examples/phenos/orchestrator.toml");
+const ERUDITE_PHENOTYPE_TOML: &str = include_str!("../../../../docs/examples/phenos/erudite.toml");
+const ENCLAVE_PHENOTYPE_TOML: &str = include_str!("../../../../docs/examples/phenos/enclave.toml");
 /// The codegraph skill Codon depends on, bundled from the same example tree.
 const CODEGRAPH_SKILL_MD: &str =
     include_str!("../../../../docs/examples/codon/skills/codegraph/SKILL.md");
@@ -1026,16 +1033,21 @@ const fn fnv1a_mix(mut h: u64, bytes: &[u8]) -> u64 {
     h
 }
 
-/// Compile-time fingerprint of the bundled seed content (Codon phenotype +
-/// codegraph skill) folded with [`SEED_LOGIC_VERSION`]. Persisted to
-/// `~/.flowforge/.seed_version` after a successful seed pass; a matching stamp
-/// on the next launch short-circuits the whole pass ([`seed_builtin_content`])
-/// — no `exists()`/stat calls, no `mcp.json` read, no dir-walks (#599 item 3).
-/// Editing either `include_str!` source, or bumping [`SEED_LOGIC_VERSION`],
-/// yields a new fingerprint and re-runs the pass exactly once.
+/// Compile-time fingerprint of the bundled seed content (Codon + the RFC 0013
+/// phenotype family + codegraph skill) folded with [`SEED_LOGIC_VERSION`].
+/// Persisted to `~/.flowforge/.seed_version` after a successful seed pass; a
+/// matching stamp on the next launch short-circuits the whole pass
+/// ([`seed_builtin_content`]) — no `exists()`/stat calls, no `mcp.json` read, no
+/// dir-walks (#599 item 3). Editing any bundled `include_str!` source, or bumping
+/// [`SEED_LOGIC_VERSION`], yields a new fingerprint and re-runs the pass exactly
+/// once. Every seeded file MUST be folded in here, or an already-stamped user
+/// never receives it on upgrade (the gate would short-circuit on the stale stamp).
 const SEED_FINGERPRINT: u64 = {
     let h = 0xcbf2_9ce4_8422_2325u64;
     let h = fnv1a_mix(h, CODON_PHENOTYPE_TOML.as_bytes());
+    let h = fnv1a_mix(h, ORCHESTRATOR_PHENOTYPE_TOML.as_bytes());
+    let h = fnv1a_mix(h, ERUDITE_PHENOTYPE_TOML.as_bytes());
+    let h = fnv1a_mix(h, ENCLAVE_PHENOTYPE_TOML.as_bytes());
     let h = fnv1a_mix(h, CODEGRAPH_SKILL_MD.as_bytes());
     let h = fnv1a_mix(h, SEED_LOGIC_VERSION.as_bytes());
     h
@@ -1134,6 +1146,19 @@ fn write_seed_stamp(path: &Path) {
 /// writes without the version-stamp short-circuit.
 fn seed_builtin_content_at(phenotypes_root: &Path, skills_root: &Path, mcp_path: Option<&Path>) {
     seed_if_absent(&phenotypes_root.join("codon.toml"), CODON_PHENOTYPE_TOML);
+    // RFC 0013 phenotype family (write-if-absent; user edits are never clobbered).
+    seed_if_absent(
+        &phenotypes_root.join("orchestrator.toml"),
+        ORCHESTRATOR_PHENOTYPE_TOML,
+    );
+    seed_if_absent(
+        &phenotypes_root.join("erudite.toml"),
+        ERUDITE_PHENOTYPE_TOML,
+    );
+    seed_if_absent(
+        &phenotypes_root.join("enclave.toml"),
+        ENCLAVE_PHENOTYPE_TOML,
+    );
     seed_if_absent(
         &skills_root.join("codegraph").join("SKILL.md"),
         CODEGRAPH_SKILL_MD,
@@ -1219,15 +1244,14 @@ fn resolve_phenotype(name: &str) -> Option<Phenotype> {
     map.remove(name)
 }
 
-/// The out-of-box default phenotype name (#298, a "for now" default until we revisit
-/// defaults). Seeded on first run by #304; a compiled-in, deletion-proof built-in is
-/// tracked as #306.
-const CODON_PHENOTYPE: &str = "codon";
+/// The factory-active phenotype (RFC 0013, revisiting #298): `orchestrator` is the
+/// out-of-box default working set, seeded into `~/.flowforge/phenos/` on first run.
+const FACTORY_ACTIVE_PHENOTYPE: &str = "orchestrator";
 
 /// First-run phenotype selection. A persisted user choice always wins; otherwise we
-/// prefer the out-of-box `codon` default (seeded into `~/.flowforge/phenos/` on first
-/// run), falling back to the built-in `default` when codon isn't installed (e.g. a
-/// read-only home where the seed couldn't land). Pure over its inputs so the branch
+/// prefer the factory-active `orchestrator` default (seeded into `~/.flowforge/phenos/`
+/// on first run), falling back to the built-in `default` when it isn't installed (e.g.
+/// a read-only home where the seed couldn't land). Pure over its inputs so the branch
 /// matrix is unit-testable without touching `~/.flowforge`.
 fn initial_phenotype(
     persisted: Option<String>,
@@ -1235,7 +1259,7 @@ fn initial_phenotype(
 ) -> Phenotype {
     persisted
         .and_then(|n| resolve(n.as_str()))
-        .or_else(|| resolve(CODON_PHENOTYPE))
+        .or_else(|| resolve(FACTORY_ACTIVE_PHENOTYPE))
         .unwrap_or_else(default_phenotype)
 }
 

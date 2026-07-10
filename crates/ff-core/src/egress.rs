@@ -39,4 +39,12 @@ impl Egress {
     pub fn is_local_only(self) -> bool {
         matches!(self, Egress::LocalOnly)
     }
+
+    /// Whether this is the default `Open` policy. Used as a `skip_serializing_if`
+    /// predicate so a saved phenotype omits `egress` when it's the default, keeping
+    /// existing on-disk TOML byte-identical. Takes `&self` for the serde predicate
+    /// signature.
+    pub fn is_open(&self) -> bool {
+        matches!(self, Egress::Open)
+    }
 }
