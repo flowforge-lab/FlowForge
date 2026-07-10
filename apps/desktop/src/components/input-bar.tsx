@@ -653,10 +653,11 @@ export function ModePill({ sessionId }: { sessionId: string }) {
   useEffect(() => {
     void ipc.setSessionMode(sessionId, explicit ?? null);
   }, [sessionId, explicit]);
-  // Load the permission matrix once so the posture tooltip has data. The pill is
-  // always mounted in the composer; the store starts `loading:true` but nothing has
-  // actually called load() yet, so gate purely on a null matrix. Concurrent pane
-  // mounts may double-load — harmless, it's an idempotent read.
+  // Load the permission matrix once so the popover's posture breakdown has data
+  // (#801, moved into the popover from the removed hover tooltip in #865). The
+  // pill is always mounted in the composer; the store starts `loading:true` but
+  // nothing has actually called load() yet, so gate purely on a null matrix.
+  // Concurrent pane mounts may double-load — harmless, it's an idempotent read.
   useEffect(() => {
     if (usePermissionMatrixStore.getState().matrix === null)
       void usePermissionMatrixStore.getState().load();
@@ -665,67 +666,66 @@ export function ModePill({ sessionId }: { sessionId: string }) {
   const buckets = bucketRowsByCell(matrixRow);
   return (
     <DropdownMenu>
-      <TooltipProvider delayDuration={150}>
-        <Tooltip>
-          <TooltipTrigger asChild>
-            <DropdownMenuTrigger asChild>
-              <button
-                type="button"
-                aria-label={`Agent mode: ${meta.label}${
-                  inherited ? " (inherited from default)" : ""
-                }`}
-                className={cn(
-                  "inline-flex shrink-0 items-center gap-1.5 rounded-md border px-2 py-1.5 text-xs font-medium transition-colors",
-                  meta.pillClass,
-                )}
-              >
-                {/* Filled dot = explicit override; hollow ring = inheriting the
-                    default (#800). `border-current` picks up the pill's mode colour. */}
-                <span
-                  className={cn(
-                    "size-1.5 shrink-0 rounded-full",
-                    inherited
-                      ? "border border-current bg-transparent"
-                      : meta.dotClass,
-                  )}
-                />
-                {meta.label}
-              </button>
-            </DropdownMenuTrigger>
-          </TooltipTrigger>
-          <TooltipContent side="top" align="start" className="max-w-64">
-            <p className="font-medium">
-              {meta.label} mode
-              {inherited ? " · inherited from default" : ""}
-            </p>
-            <p className="text-muted-foreground">{meta.description}</p>
-            {!matrixRow ? (
-              <p className="mt-1.5 text-muted-foreground">
-                {matrixLoading
-                  ? "Loading tool posture…"
-                  : "Tool posture unavailable."}
-              </p>
-            ) : (
-              <ul className="mt-1.5 flex flex-col gap-1">
-                {POSTURE_LINES.map(({ cell, label, Icon, tint }) => (
-                  <li key={cell} className="flex items-start gap-1.5">
-                    <Icon className={cn("mt-0.5 size-3 shrink-0", tint)} />
-                    <span>
-                      <span className={cn("font-medium", tint)}>{label}:</span>{" "}
-                      <span className="text-muted-foreground">
-                        {buckets[cell].length > 0
-                          ? buckets[cell].map((r) => r.label).join(", ")
-                          : "None"}
-                      </span>
-                    </span>
-                  </li>
-                ))}
-              </ul>
+      <DropdownMenuTrigger asChild>
+        <button
+          type="button"
+          aria-label={`Agent mode: ${meta.label}${
+            inherited ? " (inherited from default)" : ""
+          }`}
+          className={cn(
+            "inline-flex shrink-0 items-center gap-1.5 rounded-md border px-2 py-1.5 text-xs font-medium transition-colors",
+            meta.pillClass,
+          )}
+        >
+          {/* Filled dot = explicit override; hollow ring = inheriting the
+              default (#800). `border-current` picks up the pill's mode colour. */}
+          <span
+            className={cn(
+              "size-1.5 shrink-0 rounded-full",
+              inherited
+                ? "border border-current bg-transparent"
+                : meta.dotClass,
             )}
-          </TooltipContent>
-        </Tooltip>
-      </TooltipProvider>
+          />
+          {meta.label}
+        </button>
+      </DropdownMenuTrigger>
       <DropdownMenuContent align="start" className="w-64">
+        {/* Current mode's description + tool posture breakdown (#801), migrated
+            from the hover tooltip removed in #865 — that tooltip covered the
+            composer textarea. Static (non-interactive), so a plain div rather
+            than a DropdownMenuItem. */}
+        <div className="px-2 py-1.5 text-[11px]">
+          <p className="font-medium text-foreground">
+            {meta.label} mode
+            {inherited ? " · inherited from default" : ""}
+          </p>
+          <p className="text-muted-foreground">{meta.description}</p>
+          {!matrixRow ? (
+            <p className="mt-1.5 text-muted-foreground">
+              {matrixLoading
+                ? "Loading tool posture…"
+                : "Tool posture unavailable."}
+            </p>
+          ) : (
+            <ul className="mt-1.5 flex flex-col gap-1">
+              {POSTURE_LINES.map(({ cell, label, Icon, tint }) => (
+                <li key={cell} className="flex items-start gap-1.5">
+                  <Icon className={cn("mt-0.5 size-3 shrink-0", tint)} />
+                  <span>
+                    <span className={cn("font-medium", tint)}>{label}:</span>{" "}
+                    <span className="text-muted-foreground">
+                      {buckets[cell].length > 0
+                        ? buckets[cell].map((r) => r.label).join(", ")
+                        : "None"}
+                    </span>
+                  </span>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+        <DropdownMenuSeparator />
         {MODE_ORDER.map((m) => {
           const mMeta = MODE_META[m];
           return (
