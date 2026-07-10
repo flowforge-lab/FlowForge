@@ -395,6 +395,39 @@ async fn snapshot_projects_session_state_for_the_panel() {
 }
 
 #[tokio::test]
+async fn run_cell_handles_non_ascii_source() {
+    if !python3_available() {
+        eprintln!("skipping: python3 not on PATH");
+        return;
+    }
+    // Regression for #880: the driver used `sys.stdin.read(n)` which reads
+    // characters, but Rust frames cells with a UTF-8 byte count. Any non-ASCII
+    // source made the driver under-read, desync from the next length header,
+    // and hang until the per-cell timeout killed the kernel.
+    let dir = tempfile::tempdir().unwrap();
+    let sup = KernelSupervisor::new();
+    sup.start("unicode", dir.path()).await.unwrap();
+
+    let r = sup
+        .run_cell("unicode", None, "print(\"café\")", 5)
+        .await
+        .expect("non-ASCII cell should run before timeout");
+    assert!(!r.errored, "non-ASCII cell should not error: {r:?}");
+    assert!(r.output.contains("café"), "got: {:?}", r.output);
+
+    // A follow-up cell proves the framing stayed synchronized after the
+    // non-ASCII payload.
+    let r2 = sup
+        .run_cell("unicode", None, "print(\"still alive\")", 5)
+        .await
+        .expect("kernel remains synchronized after non-ASCII cell");
+    assert!(!r2.errored, "follow-up cell should not error: {r2:?}");
+    assert!(r2.output.contains("still alive"), "got: {:?}", r2.output);
+
+    sup.stop("unicode", None).await.unwrap();
+}
+
+#[tokio::test]
 #[ignore = "timing-sensitive; run locally with a python3 present"]
 async fn run_cell_times_out_and_interrupts() {
     if !python3_available() {

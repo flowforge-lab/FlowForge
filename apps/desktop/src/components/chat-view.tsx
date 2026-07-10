@@ -17,6 +17,7 @@ import { MessageAttachments } from "@/components/message-attachments";
 import { MessageHeader } from "@/components/message-header";
 import { ThinkingIndicator } from "@/components/thinking-indicator";
 import { CancelledNotice } from "@/components/cancelled-notice";
+import { ActiveProseBlock } from "@/components/active-prose-block";
 import { isResumableStopNotice } from "@/store/capped-turn";
 import { foldTurns, segmentTurn } from "@/lib/turn-groups";
 import type { TurnItem } from "@/lib/turn-groups";
@@ -32,6 +33,7 @@ function MessageRowImpl({
   message,
   streaming,
   toolSteps,
+  hasOwnLiveSteps,
   items,
   turnStartMs,
   reasoning,
@@ -46,6 +48,12 @@ function MessageRowImpl({
   message: Message;
   streaming: boolean;
   toolSteps: ToolStep[];
+  /** True when `message` (the turn's current iteration) already has its own
+   *  tool call recorded — i.e. it's *guaranteed* not the final answer, even
+   *  though it's still the one streaming (#864). Gates the answer slot's
+   *  "On it" collapse: a genuine final answer (no tool call of its own) never
+   *  collapses, matching the issue's "final answer is never eligible" rule. */
+  hasOwnLiveSteps: boolean;
   items: TurnItem[];
   turnStartMs?: number | null;
   reasoning: string;
@@ -139,12 +147,21 @@ function MessageRowImpl({
   const segments = segmentTurn(items);
   let firstStepsIdx = -1;
   let lastStepsIdx = -1;
+  let lastProseIdx = -1;
   segments.forEach((seg, i) => {
     if (seg.kind === "steps") {
       if (firstStepsIdx === -1) firstStepsIdx = i;
       lastStepsIdx = i;
+    } else {
+      lastProseIdx = i;
     }
   });
+  // The "active" prose is the prose segment the model is *currently* writing
+  // — i.e. the LAST segment overall. When prose is followed by more steps
+  // (a `prose → steps` order), the prose is already settled and the steps
+  // below are what's live; collapsing the prose to "On it" there would land
+  // the chip on a done segment (#864 review).
+  const lastProseIsActive = lastProseIdx > lastStepsIdx;
 
   return (
     <div
@@ -176,16 +193,21 @@ function MessageRowImpl({
           ) : (
             segments.map((seg, i) =>
               seg.kind === "prose" ? (
-                // Intermediate narration — a top-level, always-visible markdown block
-                // between the collapsed groups it sat between (#619). Muted vs. the
-                // final answer; settled, so never streamed.
-                <div
+                // Intermediate narration — a top-level, always-visible block
+                // between the collapsed groups it sat between (#619). Muted vs.
+                // the final answer. The currently-streaming one collapses to a
+                // compact "On it" chip so the user isn't forced to read it
+                // token by token (#864); earlier prose and settled turns stay
+                // full-width. Gated on the prose being the *last* segment so a
+                // `prose → steps` order (prose already settled, model on to
+                // tools) doesn't land a chip on a done segment.
+                <ActiveProseBlock
                   key={`prose:${seg.key}`}
-                  data-selectable
-                  className="px-0.5 py-1 text-sm leading-relaxed text-muted-foreground"
-                >
-                  <Markdown content={seg.text} />
-                </div>
+                  text={seg.text}
+                  streaming={
+                    i === lastProseIdx && lastProseIsActive && streaming
+                  }
+                />
               ) : (
                 <StepGroup
                   key={`steps:${seg.key}`}
@@ -259,15 +281,38 @@ function MessageRowImpl({
           />
         ) : (
           <div className="group relative w-full">
-            <div
-              data-selectable
-              className={cn(
-                "px-0.5 py-1 text-sm leading-relaxed text-foreground",
-                streaming && "ff-streaming-caret",
-              )}
-            >
-              <Markdown content={message.content} streaming={streaming} />
-            </div>
+            {/* This iteration's own content, still streaming. Usually the
+                growing final answer (rendered bare, as always) — but if it
+                *already* has a tool call of its own recorded (`hasOwnLiveSteps`,
+                never true on reload — `toolStepsByMessage` is a live-session-only
+                map), it's guaranteed not the final answer, so it gets the same
+                "On it" collapse as a settled intermediate-prose segment, just
+                not-yet-settled (#864). A `prose` TurnItem for this same text
+                won't exist until the *next* iteration starts, by which point
+                it's already fully settled (see active-prose-block.tsx) — this
+                is the only place the *live* in-flight case is reachable.
+                Gated on `streaming` too: `toolStepsByMessage[m.id]` outlives
+                the stream (cleared only on reload/edit-truncation), so once
+                this message settles it must fall back to the plain branch
+                below like any other finished answer. */}
+            {hasOwnLiveSteps && streaming ? (
+              <ActiveProseBlock
+                text={message.content}
+                streaming={streaming}
+                tone="foreground"
+                caret={streaming}
+              />
+            ) : (
+              <div
+                data-selectable
+                className={cn(
+                  "px-0.5 py-1 text-sm leading-relaxed text-foreground",
+                  streaming && "ff-streaming-caret",
+                )}
+              >
+                <Markdown content={message.content} streaming={streaming} />
+              </div>
+            )}
             {/* Always-visible copy affordance under the response (#604). Hidden
                 mid-stream — copying a half-streamed answer is wrong. */}
             {!streaming && (
@@ -436,6 +481,7 @@ export function ChatView({ sessionId }: { sessionId?: string } = {}) {
                 message={m}
                 streaming={m.id === streamingId}
                 toolSteps={toolSteps}
+                hasOwnLiveSteps={liveTiming}
                 items={items}
                 turnStartMs={
                   turnStartByMessage[m.id] ?? turnStartBySession[m.sessionId]
