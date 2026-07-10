@@ -37,6 +37,13 @@ export function supportsHighlightApi(): boolean {
  * wherever they appear, and a token like `run` is *not* highlighted inside a
  * larger word (`overrun`) — highlights and the "n of m" count stay aligned with
  * the match set. (Deviations from FTS are documented in `find-tokens.ts`.)
+ *
+ * Skip-aware (#875): any text node whose closest ancestor carries
+ * `data-skip-find` is excluded. Reasoning text (the folded Thinking block) carries
+ * the attribute so its surface (the 120-char preview line and the expanded body)
+ * doesn't contribute to the highlight set — the backend FTS5 index doesn't cover
+ * reasoning, and surfacing FE-only matches here would re-introduce the
+ * data-vs-DOM divergence the count was centralised to fix.
  */
 export function collectOccurrences(
   root: HTMLElement,
@@ -53,7 +60,24 @@ export function collectOccurrences(
   ).filter((el) => messageIds.has(el.dataset.messageId ?? ""));
 
   for (const row of rows) {
-    const walker = document.createTreeWalker(row, NodeFilter.SHOW_TEXT);
+    const walker = document.createTreeWalker(row, NodeFilter.SHOW_TEXT, {
+      acceptNode(node) {
+        // Reject text nodes inside any `data-skip-find` ancestor up to the
+        // `[data-message-id]` row. Walk up from `node` until we hit `row` (the
+        // iteration's root) or a skip marker; reject the latter, accept the former.
+        let el: Node | null = node.parentNode;
+        while (el && el !== row) {
+          if (
+            el.nodeType === Node.ELEMENT_NODE &&
+            (el as Element).hasAttribute("data-skip-find")
+          ) {
+            return NodeFilter.FILTER_REJECT;
+          }
+          el = el.parentNode;
+        }
+        return NodeFilter.FILTER_ACCEPT;
+      },
+    });
     let node = walker.nextNode();
     while (node) {
       const text = node.nodeValue ?? "";

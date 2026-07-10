@@ -6,6 +6,7 @@ import type { ToolStep } from "@/store/chat";
 import type { TurnItem } from "@/lib/turn-groups";
 import { ToolStepBlock } from "@/components/tool-step";
 import { ThinkingBlock } from "@/components/thinking-block";
+import { useFindExpansion } from "@/store/find-expansion";
 import {
   DropdownMenu,
   DropdownMenuTrigger,
@@ -76,6 +77,8 @@ export function StepGroup({
   turnStartMs,
   hasAnswer,
   answer,
+  messageId,
+  segmentKey,
   onExportTimeline,
   onRespond,
   onApproveSession,
@@ -96,6 +99,13 @@ export function StepGroup({
    *  preview of it shows under the header so the outcome is visible without
    *  expanding (#414). Raw content — no model-generated summary. */
   answer?: string;
+  /** Owning assistant message id, threaded in by `chat-view.tsx` so the find
+   *  bar can force-open THIS segment's step group without expanding unrelated
+   *  segments in the same turn (#875). */
+  messageId?: string;
+  /** `segmentTurn` key for this segment (stable across renders). Combined with
+   *  `messageId` to form the StepGroup's expandId. */
+  segmentKey?: string;
   /** Dev-only step-timeline export (#417). When provided, a Download control shows in
    *  the header; gated upstream by the `stepTimelineExport` experimental flag. */
   onExportTimeline?: (format: "json" | "csv") => void;
@@ -111,7 +121,28 @@ export function StepGroup({
   const [userOpen, setUserOpen] = useState<boolean | null>(null);
   const [peekExpanded, setPeekExpanded] = useState(false);
   const [now, setNow] = useState(() => Date.now());
-  const open = resolveGroupOpen({ awaiting, userOpen, streaming });
+  const expandId =
+    messageId && segmentKey
+      ? `step-group:${messageId}:${segmentKey}`
+      : undefined;
+  // Force-open resolves BOTH ways (#875): the segment itself can be the
+  // find target (group header), OR a child `tool-step:<callId>` can be
+  // targeted directly. In the second case the parent group is the gate —
+  // if it's folded, the child is not in the DOM, so we open it too. The bus
+  // is idempotent.
+  const forcedOpen = useFindExpansion((s) => {
+    if (expandId && s.forced.has(expandId)) return true;
+    for (const step of steps) {
+      if (s.forced.has(`tool-step:${step.callId}`)) return true;
+    }
+    return false;
+  });
+  // Find-driven force-open wins over both the default-by-status AND a manual
+  // collapse — otherwise the fold would hide the very match we want to scroll
+  // to (#875). The user's manual toggle persists in `userOpen`; once find
+  // closes, the original default restored.
+  const open =
+    forcedOpen || resolveGroupOpen({ awaiting, userOpen, streaming });
   const effectivePeekExpanded = streaming && peekExpanded;
 
   useEffect(() => {

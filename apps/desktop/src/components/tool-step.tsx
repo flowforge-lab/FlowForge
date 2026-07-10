@@ -23,6 +23,7 @@ import type { ToolStep } from "@/store/chat";
 import { OutputBlock } from "@/components/output-block";
 import { NotebookCellOutput } from "@/components/notebook-cell-output";
 import { isNotebookRunnerStep } from "@/lib/notebook-output";
+import { useFindExpansion } from "@/store/find-expansion";
 
 function StatusIcon({ status }: { status: ToolStep["status"] }) {
   if (status === "running") {
@@ -174,6 +175,13 @@ export function ToolStepBlock({
   const awaiting = step.status === "awaiting-approval";
   const asking = step.status === "awaiting-answer";
   const [userToggled, setUserToggled] = useState(false);
+  // Find-driven force-open bus (#875): the active find can demand this step
+  // open (its args or result carries a hit). Forced-open wins over the
+  // default-by-status and over a manual collapse so the highlight lands on the
+  // match, not the step header. Cleared when find closes — the user's manual
+  // toggle (`userToggled`) takes over again.
+  const expandId = `tool-step:${step.callId}`;
+  const forcedOpen = useFindExpansion((s) => s.forced.has(expandId));
   // The `todo` tool renders its checklist from the call args (Issue #42). null =
   // not a todo step → fall back to the generic args/result render.
   const todoItems = step.tool === "todo" ? parseTodo(step.args) : null;
@@ -183,7 +191,10 @@ export function ToolStepBlock({
   // be seen, so it defaults to open; other tools default to collapsed. Otherwise
   // honor the manual toggle.
   const open =
-    awaiting || asking || (todoItems !== null ? !userToggled : userToggled);
+    forcedOpen ||
+    awaiting ||
+    asking ||
+    (todoItems !== null ? !userToggled : userToggled);
   const args = formatArgs(step.args);
   const mcp = parseMcpToolName(step.tool);
   const description = describeStep(step);
@@ -316,7 +327,11 @@ export function ToolStepBlock({
           {step.status === "running" &&
             step.output !== undefined &&
             !isNotebookRunnerStep(step.tool) && (
-              <OutputBlock output={step.output} title={step.tool} />
+              <OutputBlock
+                output={step.output}
+                title={step.tool}
+                expandId={expandId}
+              />
             )}
           {isNotebookRunnerStep(step.tool) ? (
             <NotebookCellOutput step={step} />
@@ -326,6 +341,7 @@ export function ToolStepBlock({
                 output={step.result}
                 title={step.tool}
                 error={step.status === "error"}
+                expandId={expandId}
               />
             )
           )}
