@@ -47,6 +47,7 @@ ff-scheduled = { path = "crates/ff-scheduled" }
 ff-signals = { path = "crates/ff-signals" }
 ff-skills = { path = "crates/ff-skills" }
 ff-tools = { path = "crates/ff-tools" }
+ff-observer = { path = "crates/ff-observer" }
 ff-workflow = { path = "crates/ff-workflow" }
 
 lru = "0.12"
