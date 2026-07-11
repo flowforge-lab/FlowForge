@@ -4,6 +4,7 @@ import { SessionSidebar } from "@/components/session-sidebar";
 import { PaneTree } from "@/components/pane-tree";
 import { SplitPanel } from "@/components/split-panel";
 import { CommandPalette } from "@/components/palette";
+import { AllConversationsSearchModal } from "@/components/all-conversations-search";
 import { StartGoalDialog } from "@/components/start-goal-dialog";
 import { ShortcutsOverlay } from "@/components/shortcuts-overlay";
 import { SettingsPanel } from "@/components/settings-panel";
@@ -16,6 +17,7 @@ import { usePrefsStore } from "@/store/prefs";
 import { usePanesStore } from "@/store/panes";
 import { useSplitStore } from "@/store/split";
 import { usePaletteStore } from "@/store/palette";
+import { useAllConversationsSearchStore } from "@/store/all-conversations-search";
 import { useSettingsStore } from "@/store/settings";
 import { useShortcutsStore } from "@/store/shortcuts";
 import { useFindStore } from "@/store/find";
@@ -41,6 +43,7 @@ function useGlobalShortcuts() {
       const palette = usePaletteStore.getState();
       const shortcuts = useShortcutsStore.getState();
       const settings = useSettingsStore.getState();
+      const conversationsSearch = useAllConversationsSearchStore.getState();
       const mod = e.metaKey || e.ctrlKey;
 
       // ⌘/Ctrl+K is home: toggle the palette from anywhere. Close overlays
@@ -49,12 +52,24 @@ function useGlobalShortcuts() {
         e.preventDefault();
         shortcuts.closeShortcuts();
         settings.closeSettings();
+        conversationsSearch.closeSearch();
         palette.togglePalette();
         return;
       }
       // While the palette owns the keyboard, don't fire shell shortcuts behind
       // it — it handles its own arrows/Enter/Esc.
       if (palette.open) return;
+
+      // The all-conversations search modal (#876) owns the keyboard the same
+      // way, positioned before the session-scoped ⌘F handler below so ⌘F
+      // doesn't also toggle in-thread find while the modal is open.
+      if (conversationsSearch.open) {
+        if (e.key === "Escape") {
+          e.preventDefault();
+          conversationsSearch.closeSearch();
+        }
+        return;
+      }
 
       // Shortcuts help: ⌘/Ctrl+/ anywhere, or "?" when not typing in a field.
       if (mod && e.key === "/") {
@@ -224,6 +239,7 @@ export function AppShell() {
         </main>
       </div>
       <CommandPalette />
+      <AllConversationsSearchModal />
       <StartGoalDialog />
       <ShortcutsOverlay />
       <SettingsPanel />
