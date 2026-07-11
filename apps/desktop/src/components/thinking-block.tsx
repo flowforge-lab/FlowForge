@@ -43,14 +43,28 @@ export function ThinkingBlock({
         )}
         <span className="font-medium text-foreground/90">Thinking</span>
         {!open && (
-          <span className="truncate text-muted-foreground/70">
+          // `data-skip-find` (#875): the collapsed preview is a *sibling* of
+          // the expanded body below, not a descendant, so it needs its own
+          // skip marker — the highlighter's TreeWalker only rejects text
+          // under an ancestor that carries the attribute. Without this, the
+          // preview's truncated reasoning text is paintable (a visible
+          // highlight) while the data model still excludes reasoning from
+          // the count, reintroducing the divergence this block exists to
+          // prevent.
+          <span data-skip-find className="truncate text-muted-foreground/70">
             {reasoning.slice(0, 120)}
             {reasoning.length > 120 ? "…" : ""}
           </span>
         )}
       </button>
       {open && (
+        // `data-skip-find` (#875): the highlighter's TreeWalker rejects any
+        // text node under this attribute, so reasoning matches don't surface
+        // in the painted set — keeps the data-model `n of m` and the DOM
+        // highlights aligned with the backend FTS5 index (which doesn't cover
+        // reasoning).
         <div
+          data-skip-find
           data-selectable
           className="mt-1.5 max-h-48 overflow-y-auto whitespace-pre-wrap rounded-md border border-border/40 bg-muted/20 px-3 py-2 text-[11px] leading-relaxed text-muted-foreground"
         >

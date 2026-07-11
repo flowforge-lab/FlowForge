@@ -135,7 +135,15 @@ function MessageRowImpl({
         data-message-id={message.id}
         className="w-full max-w-[80%] rounded-md border bg-muted/40 px-2.5 py-1.5 font-mono text-[11px] leading-relaxed"
       >
-        <OutputBlock output={message.content} title="tool output" />
+        <OutputBlock
+          output={message.content}
+          title="tool output"
+          // Persisted tool row: its body can fold at OUTPUT_FOLD_THRESHOLD.
+          // `expandId` keyed by messageId so the find bar (#875) can force
+          // this block open when a match lives inside its body — same bus as
+          // the live step path uses, scoped here to the persisted row's id.
+          expandId={`output:${message.id}`}
+        />
       </div>
     );
   }
@@ -228,6 +236,12 @@ function MessageRowImpl({
                       ? message.content
                       : undefined
                   }
+                  // Per-segment expandId (#875): force-open THIS segment's
+                  // StepGroup when a match lives in its tool step, without
+                  // expanding unrelated segments of the same turn. `seg.key`
+                  // is stable across renders (see `lib/turn-groups.ts`).
+                  messageId={message.id}
+                  segmentKey={seg.key}
                   onExportTimeline={
                     i === firstStepsIdx && exportEnabled
                       ? (format) =>
@@ -394,6 +408,9 @@ export function ChatView({ sessionId }: { sessionId?: string } = {}) {
   const [atBottom, setAtBottom] = useState(true);
 
   // Stay pinned to the bottom while streaming, but respect manual scroll-up.
+  // `findOn` gates the bottom-pin on both effects so the in-thread find (#679) and
+  // its global-search seed (#710) aren't yanked back to the tail the moment
+  // a token arrives or the session switches (#875).
   useEffect(() => {
     const el = scrollRef.current;
     if (el && pinnedToBottom.current && !findOn) {
@@ -404,8 +421,8 @@ export function ChatView({ sessionId }: { sessionId?: string } = {}) {
   useEffect(() => {
     pinnedToBottom.current = true;
     const el = scrollRef.current;
-    if (el) el.scrollTop = el.scrollHeight;
-  }, [targetSessionId]);
+    if (el && !findOn) el.scrollTop = el.scrollHeight;
+  }, [targetSessionId, findOn]);
 
   // Reset the scroll affordance when the pane switches sessions. setState during
   // render is React's recommended reset-on-prop-change pattern — no effect, no

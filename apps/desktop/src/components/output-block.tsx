@@ -2,6 +2,7 @@ import { useState } from "react";
 import { Check, ChevronRight, Copy, PanelRight } from "@/components/ui/icon";
 import { cn } from "@/lib/utils";
 import { useSplitStore } from "@/store/split";
+import { useFindExpansion } from "@/store/find-expansion";
 
 /**
  * Tool output longer than this many characters starts folded (#331). Mirrors the
@@ -24,17 +25,29 @@ export function OutputBlock({
   title,
   error = false,
   label = "output",
+  expandId,
 }: {
   output: string;
   title: string;
   error?: boolean;
   /** Header label; defaults to "output". */
   label?: string;
+  /** Find-bar force-open handle (#875): when the active find's match lives
+   *  inside this block, the bar calls `forceOpenMany([expandId])` so the body
+   *  mounts and the DOM walker can highlight the actual span instead of the
+   *  fold header. Cleared on find close so the user's manual toggle wins again. */
+  expandId?: string;
 }) {
   const long = output.length > OUTPUT_FOLD_THRESHOLD;
+  const forcedOpen = useFindExpansion((s) =>
+    expandId ? s.forced.has(expandId) : false,
+  );
   const [userOpen, setUserOpen] = useState<boolean | null>(null);
-  // Short output is always shown; long output folds by default until toggled.
-  const open = long ? (userOpen ?? false) : true;
+  // Find-driven force-open wins over the default fold and over a manual close,
+  // so the match is reachable while find is in flight. The user's manual toggle
+  // is preserved in `userOpen`; once find clears, the original default
+  // restored.
+  const open = forcedOpen || (long ? (userOpen ?? false) : true);
 
   const openInSplit = useSplitStore((s) => s.openInSplit);
   const [copied, setCopied] = useState(false);
