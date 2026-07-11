@@ -83,3 +83,31 @@ describe("collectOccurrences token-awareness (#748)", () => {
     expect(collectOccurrences(el, new Set(["m1"]), "-.")).toHaveLength(0);
   });
 });
+
+describe("collectOccurrences data-skip-find (#875)", () => {
+  it("excludes a match whose only occurrence is under a data-skip-find sibling", () => {
+    // Mirrors ThinkingBlock's collapsed state (#901 review): the skip-marked
+    // text is a *sibling* of other content in the row, not nested inside a
+    // shared wrapper — the TreeWalker must still reject it on its own, not
+    // rely on some ancestor-level opt-out.
+    const el = mount(`
+      <div data-message-id="m1">
+        <span data-skip-find>alpha preview</span>
+        <span>beta body</span>
+      </div>
+    `);
+    const ranges = collectOccurrences(el, new Set(["m1"]), "alpha");
+    expect(ranges).toHaveLength(0);
+  });
+
+  it("still finds a match outside the data-skip-find sibling in the same row", () => {
+    const el = mount(`
+      <div data-message-id="m1">
+        <span data-skip-find>alpha preview</span>
+        <span>alpha body</span>
+      </div>
+    `);
+    const ranges = collectOccurrences(el, new Set(["m1"]), "alpha");
+    expect(ranges).toHaveLength(1);
+  });
+});
