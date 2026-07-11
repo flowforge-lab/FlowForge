@@ -27,6 +27,7 @@ ff-session = { workspace = true }
 chrono = { workspace = true }
 tempfile = { workspace = true }
 uuid = { workspace = true }
+ts-rs = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

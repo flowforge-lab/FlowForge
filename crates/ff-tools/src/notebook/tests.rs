@@ -352,6 +352,49 @@ async fn reap_session_kills_the_kernel() {
 }
 
 #[tokio::test]
+async fn snapshot_projects_session_state_for_the_panel() {
+    if !python3_available() {
+        eprintln!("skipping: python3 not on PATH");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let sup = KernelSupervisor::new();
+
+    // No kernel → empty snapshot.
+    let none = sup.snapshot("s").await;
+    assert!(!none.has_kernel);
+    assert_eq!(none.state, None);
+    assert_eq!(none.kernel_id, None);
+    assert_eq!(none.pid, None);
+    assert_eq!(none.execution_count, 0);
+    assert!(none.raw.is_empty());
+
+    // One live kernel → the representative describes it.
+    let id1 = sup.start("s", dir.path()).await.unwrap();
+    sup.run_cell("s", None, "x = 1", 30).await.unwrap();
+    let one = sup.snapshot("s").await;
+    assert!(one.has_kernel);
+    assert_eq!(one.state, Some(KernelLiveState::Running));
+    assert_eq!(one.kernel_id.as_deref(), Some(id1.as_str()));
+    assert!(one.pid.is_some());
+    assert_eq!(one.execution_count, 1);
+    assert!(
+        one.raw.contains(&id1),
+        "raw carries the canonical status line"
+    );
+
+    // A second kernel → raw lists both; representative stays a live kernel.
+    let id2 = sup.start("s", dir.path()).await.unwrap();
+    let multi = sup.snapshot("s").await;
+    assert!(multi.has_kernel);
+    assert_eq!(multi.state, Some(KernelLiveState::Running));
+    assert!(multi.raw.contains(&id1) && multi.raw.contains(&id2));
+    assert_eq!(multi.raw.lines().count(), 2, "one status line per kernel");
+
+    sup.reap_session("s").await;
+}
+
+#[tokio::test]
 async fn run_cell_handles_non_ascii_source() {
     if !python3_available() {
         eprintln!("skipping: python3 not on PATH");

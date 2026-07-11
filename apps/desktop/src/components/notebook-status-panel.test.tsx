@@ -4,7 +4,7 @@ import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { NotebookStatusPanel } from "@/components/notebook-status-panel";
-import type { NotebookKernelState } from "@/lib/notebook-kernel-state";
+import type { NotebookKernelState } from "@/bindings/NotebookKernelState";
 import {
   NOTEBOOK_POLL_DEFAULT_MS,
   useExperimentalStore,

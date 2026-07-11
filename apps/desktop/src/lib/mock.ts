@@ -63,7 +63,7 @@ import type {
   CreateScheduledTaskInput,
   RunRecord,
 } from "@/bindings";
-import type { NotebookKernelState } from "./notebook-kernel-state";
+import type { NotebookKernelState } from "../bindings/NotebookKernelState";
 import { CONTROL_DEFAULTS, type ControlConfig } from "./control";
 import {
   APP_VERSION_FALLBACK,
