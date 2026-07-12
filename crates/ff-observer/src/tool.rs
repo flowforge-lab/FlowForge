@@ -60,12 +60,14 @@ impl Tool for ObserverTool {
 
     fn description(&self) -> &str {
         "Start, list, and stop background observers that wake the agent when \
-         external state changes. Phase 1 supports the `file` source (a file or \
-         directory path with an optional glob filter); `http` and `process` \
-         sources ship in later releases. Observers are session-scoped: each one \
-         belongs to the session that started it and is reaped when that session \
-         is deleted. Actions: `start` (begin watching a target; returns \
-         observer_id), `list` (this session's observers), `stop` (end a watcher)."
+         external state changes. Sources: `file` (a file or directory path with \
+         an optional glob filter; uses kqueue/inotify) and `http` (a URL polled on \
+         an interval with an optional substring `filter`; wakes when the body \
+         changes — or, with `filter`, when the new body contains the substring). \
+         Observers are session-scoped: each one belongs to the session that started \
+         it and is reaped when that session is deleted. Actions: `start` (begin \
+         watching a target; returns observer_id), `list` (this session's observers), \
+         `stop` (end a watcher)."
     }
 
     fn parameters(&self) -> Value {
@@ -83,16 +85,21 @@ impl Tool for ObserverTool {
                 },
                 "kind": {
                     "type": "string",
-                    "enum": ["file"],
-                    "description": "start: source kind. Phase 1 only ships `file`; `http` and `process` will be added in subsequent releases."
+                    "enum": ["file", "http"],
+                    "description": "start: source kind. `file` watches a path; `http` polls a URL."
                 },
                 "target": {
                     "type": "string",
-                    "description": "start: file or directory path. Absolute, or relative to the workspace root."
+                    "description": "start: file/directory path (file) or http(s) URL (http). Absolute, or relative to the workspace root for file targets."
                 },
                 "filter": {
                     "type": "string",
-                    "description": "start (file, optional): glob that limits which children of a directory target trigger a wake."
+                    "description": "start: glob for file directory targets, or a plain substring the http body must contain to fire (http). Plain substring, not regex."
+                },
+                "interval_secs": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "start (http, optional): seconds between polls. Clamped to >= 30; defaults to 60 when omitted."
                 },
                 "observer_id": {
                     "type": "integer",
@@ -113,11 +120,11 @@ impl Tool for ObserverTool {
         }
     }
 
-    /// Fail-safe per RFC 0013: until Phase 2 lands and the
-    /// `reaches_network() = false` override is justified, the tool
-    /// stays on the network-capable set (LocalOnly phenotype hides
-    /// it). This matches the fail-safe default on
-    /// `ProcessManagerTool`.
+    /// Per RFC 0013: the `http` source reaches the network, so the
+    /// tool stays on the network-capable set. (`file` would be
+    /// `LocalOnly`, but the same tool surface starts both kinds, and
+    /// mixing per-kind phenotypes on a single tool isn't worth the
+    /// complexity for the user — keep the fail-safe default.)
     fn reaches_network(&self) -> bool {
         true
     }
@@ -144,28 +151,54 @@ impl Tool for ObserverTool {
                     "process" => ObserverKind::Process,
                     other => {
                         return ToolOutcome::error(format!(
-                            "unknown kind '{other}'; only 'file' is implemented in Phase 1"
+                            "unknown kind '{other}'; expected one of: file, http"
                         ));
                     }
                 };
-                let target = Self::resolve_target(&args, root);
-                let target_str = target.to_string_lossy().into_owned();
+                // `target` semantics differ per kind: file sources take
+                // a path that may be relative to the session root, while
+                // http sources take a URL that must already be absolute
+                // — passing an http URL through `resolve_target` would
+                // join it with the session root and silently corrupt it.
+                let target_str = if kind == ObserverKind::Http {
+                    let Some(t) = args
+                        .get("target")
+                        .and_then(Value::as_str)
+                        .map(|s| s.to_string())
+                    else {
+                        return ToolOutcome::error("start requires a `target` URL for kind=http");
+                    };
+                    t
+                } else {
+                    let target = Self::resolve_target(&args, root);
+                    target.to_string_lossy().into_owned()
+                };
                 let filter = args
                     .get("filter")
                     .and_then(Value::as_str)
                     .filter(|s| !s.trim().is_empty())
                     .map(|s| s.to_string());
+                let interval_secs = args.get("interval_secs").and_then(Value::as_u64);
                 let spec = ObserverSpec {
                     label: label.to_string(),
                     kind,
                     target: target_str,
                     filter,
+                    interval_secs,
                 };
                 match self.supervisor.start(spec, session_id) {
-                    Ok(id) => ToolOutcome::ok(format!(
-                        "started observer {id}: kind={kind_str}, label=\"{label}\"\n\
-                         stop with action=stop, observer_id={id}"
-                    )),
+                    Ok(id) => {
+                        let suffix = match kind {
+                            ObserverKind::Http => {
+                                "\n(first poll is silent; the next change wakes the agent.)"
+                            }
+                            _ => "",
+                        };
+                        ToolOutcome::ok(format!(
+                            "started observer {id}: kind={kind_str}, label=\"{label}\"{suffix}\n\
+                             stop with action=stop, observer_id={id}"
+                        ))
+                    }
                     Err(e) => ToolOutcome::error(e),
                 }
             }
@@ -314,17 +347,43 @@ mod tests {
                 json!({
                     "action": "start",
                     "label": "x",
-                    "kind": "http",
+                    "kind": "process",
                     "target": target,
                 }),
                 dir.path(),
             )
             .await;
         assert!(!res.success, "{}", res.content);
-        // The error message should mention Phase 2 so the model
+        // The error message should mention Phase 3 so the model
         // can self-correct.
         assert!(
-            res.content.contains("Phase 2") || res.content.contains("not yet implemented"),
+            res.content.contains("Phase 3") || res.content.contains("not yet implemented"),
+            "{}",
+            res.content
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn start_http_kind_is_accepted() {
+        // Phase 2: http is a real source. The supervisor's start will
+        // kick off polling against a (likely-unreachable) URL; the
+        // tool call itself must succeed and list the observer.
+        let (dir, tool) = tool_with_supervisor();
+        let res = tool
+            .run(
+                json!({
+                    "action": "start",
+                    "label": "poll",
+                    "kind": "http",
+                    "target": "https://example.com/",
+                    "interval_secs": 60,
+                }),
+                dir.path(),
+            )
+            .await;
+        assert!(res.success, "{}", res.content);
+        assert!(
+            res.content.contains("first poll is silent"),
             "{}",
             res.content
         );

@@ -26,6 +26,7 @@ pub mod tool;
 /// events routed to it.
 pub const NO_SESSION_TOOL: &str = "tool-no-session";
 
+pub use http::HttpSource;
 pub use source::{
     ObserverEvent, ObserverId, ObserverInfo, ObserverKind, ObserverSource, ObserverSpec,
 };
