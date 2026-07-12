@@ -33,9 +33,11 @@ import { useSettingsStore } from "@/store/settings";
 import { useChatStore } from "@/store/chat";
 import { useSessionPrefsStore } from "@/store/session-prefs";
 import { useSessionDoneToastStore } from "@/store/session-done-toast";
-import { useFindStore } from "@/store/find";
 import { usePanesStore, MAX_PANES } from "@/store/panes";
-import { ipc } from "@/lib/ipc";
+import { useAllConversationsSearchStore } from "@/store/all-conversations-search";
+import { useContentSearch } from "@/hooks/use-content-search";
+import { openContentHit } from "@/lib/open-content-hit";
+import { SearchHitList } from "@/components/search-hit-list";
 import {
   ContextMenu,
   ContextMenuTrigger,
@@ -71,12 +73,10 @@ import {
   filterSessions,
   groupContentHits,
   resolveLabel,
-  sanitizeSnippet,
   selectSessionOverflow,
   SESSION_REVEAL_BATCH,
 } from "@/lib/sessions";
 import type { Session } from "@/bindings";
-import type { SearchHit } from "@/bindings/SearchHit";
 
 // ── Shared menu body ─────────────────────────────────────────────────────────
 // The right-click ContextMenu and the ⋯ DropdownMenu render the identical item
@@ -115,11 +115,6 @@ const DROPDOWN_PARTS: MenuParts = {
 // Shared class for the flat ghost icon buttons in the sidebar header and
 // collapsed rail (#674): muted by default, foreground on hover.
 const RAIL_ICON_BTN = "size-7 text-muted-foreground hover:text-foreground";
-
-// Cross-session content search (#710): debounce keystrokes before hitting the
-// FTS backend, and cap how many hits we group into sidebar rows.
-const CONTENT_SEARCH_DEBOUNCE_MS = 200;
-const CONTENT_HIT_LIMIT = 30;
 
 interface SessionMenuItemsProps {
   parts: MenuParts;
@@ -197,47 +192,6 @@ export function SessionMenuItems({
         Delete
       </P.Item>
     </>
-  );
-}
-
-// ── Content search-hit row (#710) ────────────────────────────────────────────
-// A session surfaced by full-text search (not a title match): its label plus the
-// backend's `<mark>`-highlighted snippet. Clicking opens the session and jumps to
-// the matched message. Intentionally lean — no pin/menu/hover chrome.
-
-export function ContentHitRow({
-  session,
-  snippet,
-  onOpen,
-}: {
-  session: Session;
-  snippet: string;
-  onOpen: () => void;
-}) {
-  return (
-    <div
-      role="button"
-      tabIndex={0}
-      onClick={onOpen}
-      onKeyDown={(e) => {
-        if (e.key === "Enter" || e.key === " ") {
-          e.preventDefault();
-          onOpen();
-        }
-      }}
-      className="group flex cursor-pointer select-none flex-col gap-0.5 rounded-md px-2 py-1.5 text-left text-muted-foreground transition-colors hover:bg-sidebar-accent/50 hover:text-foreground"
-    >
-      <span className="min-w-0 truncate text-[13px] text-foreground/90">
-        {resolveLabel(session)}
-      </span>
-      {/* Snippet is pre-highlighted with <mark> by the backend; `ff-hit-snippet`
-          styles the marks (see index.css). Sanitized first — the backend does not
-          escape the surrounding message text, which can contain raw HTML (#747 C1). */}
-      <span
-        className="ff-hit-snippet min-w-0 truncate text-[11px] text-muted-foreground/80"
-        dangerouslySetInnerHTML={{ __html: sanitizeSnippet(snippet) }}
-      />
-    </div>
   );
 }
 
@@ -630,24 +584,6 @@ export function SessionSidebar() {
   }
   const openSettings = useSettingsStore((s) => s.openSettings);
 
-  // Open a content-search hit (#710): switch to its session (pane-aware, mirroring
-  // the row `open()`), then open the find bar seeded with the query + the hit's
-  // messageId so the thread scrolls to and highlights the matched message.
-  function openContentHit(hit: SearchHit) {
-    const panes = usePanesStore.getState();
-    const chat = useChatStore.getState();
-    if (panes.focusedPaneId) {
-      panes.setPaneSession(panes.focusedPaneId, hit.sessionId);
-      void chat.loadSession(hit.sessionId);
-    } else {
-      void chat.selectSession(hit.sessionId);
-    }
-    useFindStore.getState().openFind(hit.sessionId, {
-      query: filter.trim(),
-      messageId: hit.messageId,
-    });
-  }
-
   const pinnedIds = useSessionPrefsStore((s) => s.pinned);
   const dismissedIds = useSessionPrefsStore((s) => s.dismissed);
   const dismiss = useSessionPrefsStore((s) => s.dismiss);
@@ -661,6 +597,15 @@ export function SessionSidebar() {
   // + fixed cap (#667).
   const [revealCount, setRevealCount] = useState(SESSION_REVEAL_BATCH);
   const filterRef = useRef<HTMLInputElement>(null);
+
+  // Compact results dropdown (#876 surface A): the highlighted row for arrow-key
+  // nav, and whether the user has explicitly dismissed the dropdown for the
+  // current query (a lone Escape closes just the dropdown; the filter text and
+  // underlying title-filtered list are untouched — a second Escape falls
+  // through to `hideFilter`'s existing behavior).
+  const [activeHitIndex, setActiveHitIndex] = useState(0);
+  const [dropdownDismissed, setDropdownDismissed] = useState(false);
+  const dropdownListRef = useRef<HTMLDivElement>(null);
 
   // Multi-select mode (#643): bulk dismiss/delete across the visible list. State is
   // sidebar-local; bulk handlers reuse the existing per-session store actions.
@@ -708,6 +653,12 @@ export function SessionSidebar() {
     setFilter(next);
     setRevealCount(SESSION_REVEAL_BATCH);
     setSelected(new Set());
+    setDropdownDismissed(false);
+    // Typing always re-highlights the top result (mirrors the full-screen
+    // modal's setSelected(0) on typing, #902 review) — otherwise a stale
+    // index from a longer previous result set stays clamped onto whatever
+    // row now sits at that position instead of resetting to the top.
+    setActiveHitIndex(0);
   };
 
   const filtered = filterSessions(sessions, filter);
@@ -718,48 +669,11 @@ export function SessionSidebar() {
 
   // Cross-session full-text search (#710): the same filter box also runs
   // `searchMessages` so a session is findable by what was said in it, not just
-  // its title. Debounced, stale-guarded; results render as a separate content
-  // group below the title matches.
-  const [contentHits, setContentHits] = useState<SearchHit[]>([]);
-  // The trimmed query `contentHits` currently reflects — lets us tell "search in
-  // flight" from "search returned nothing" so the empty state doesn't flash
-  // during the debounce (#747 C2).
-  const [searchedFor, setSearchedFor] = useState("");
-  useEffect(() => {
-    const q = filter.trim();
-    let cancelled = false;
-    // All state writes stay inside the (async) timer so the effect body never
-    // sets state synchronously; an emptied query clears with no delay.
-    const timer = window.setTimeout(
-      async () => {
-        if (!q) {
-          setContentHits([]);
-          setSearchedFor("");
-          return;
-        }
-        try {
-          const hits = await ipc.searchMessages(q, CONTENT_HIT_LIMIT);
-          if (!cancelled) {
-            setContentHits(hits);
-            setSearchedFor(q);
-          }
-        } catch {
-          if (!cancelled) {
-            setContentHits([]);
-            setSearchedFor(q);
-          }
-        }
-      },
-      q ? CONTENT_SEARCH_DEBOUNCE_MS : 0,
-    );
-    return () => {
-      cancelled = true;
-      window.clearTimeout(timer);
-    };
-  }, [filter]);
-  // A content search is still resolving for the current query — hold the empty
-  // state until it settles.
-  const contentSearchPending = filtering && filter.trim() !== searchedFor;
+  // its title. Debounced, stale-guarded (hooks/use-content-search.ts, shared
+  // with the #876 full-screen modal); results render in the compact dropdown
+  // anchored below the input (#876), not folded into the title-matched list.
+  const { hits: contentHits, pending: contentSearchPending } =
+    useContentSearch(filter);
 
   // One row per session, BM25 order, excluding sessions already shown as title
   // matches (and any hit whose session isn't currently listed).
@@ -843,18 +757,17 @@ export function SessionSidebar() {
           >
             <PanelLeft className="size-4" />
           </Button>
-          {/* Search from the rail (#710): expand the sidebar and focus the filter,
-              which now also runs full-text search across sessions. */}
+          {/* Search from the rail (#876): opens the full-screen "All
+              Conversations" modal — the sidebar stays collapsed. */}
           <Button
             variant="ghost"
             size="icon"
             className={RAIL_ICON_BTN}
             title="Search sessions"
             aria-label="Search sessions"
-            onClick={() => {
-              setSidebarCollapsed(false);
-              revealFilter();
-            }}
+            onClick={() =>
+              useAllConversationsSearchStore.getState().openSearch()
+            }
           >
             <Search className="size-4" />
           </Button>
@@ -1026,7 +939,7 @@ export function SessionSidebar() {
           )}
 
           {showFilter && (
-            <div className="px-2 pb-2">
+            <div className="relative px-2 pb-2">
               <div className="flex items-center gap-1.5 rounded-md border bg-background/40 px-2 transition-colors focus-within:border-ring focus-within:ring-2 focus-within:ring-ring/25">
                 <Search className="size-3.5 shrink-0 text-muted-foreground/60" />
                 <input
@@ -1034,10 +947,45 @@ export function SessionSidebar() {
                   value={filter}
                   onChange={(e) => changeFilter(e.target.value)}
                   onKeyDown={(e) => {
+                    const dropdownVisible =
+                      filtering &&
+                      !selectMode &&
+                      !dropdownDismissed &&
+                      contentRows.length > 0;
                     if (e.key === "Escape") {
                       e.preventDefault();
                       e.stopPropagation();
-                      hideFilter();
+                      // Two-stage: a lone Escape closes just the dropdown (filter
+                      // text untouched); a second Escape (or no dropdown showing)
+                      // falls through to the existing hide-and-clear behavior.
+                      if (dropdownVisible) setDropdownDismissed(true);
+                      else hideFilter();
+                      return;
+                    }
+                    if (!dropdownVisible) return;
+                    if (e.key === "ArrowDown") {
+                      e.preventDefault();
+                      setActiveHitIndex(
+                        (i) =>
+                          (Math.min(i, contentRows.length - 1) + 1) %
+                          contentRows.length,
+                      );
+                    } else if (e.key === "ArrowUp") {
+                      e.preventDefault();
+                      setActiveHitIndex(
+                        (i) =>
+                          (Math.min(i, contentRows.length - 1) -
+                            1 +
+                            contentRows.length) %
+                          contentRows.length,
+                      );
+                    } else if (e.key === "Enter") {
+                      e.preventDefault();
+                      const row =
+                        contentRows[
+                          Math.min(activeHitIndex, contentRows.length - 1)
+                        ];
+                      if (row) openContentHit(row.hit, filter.trim());
                     }
                   }}
                   placeholder="Filter sessions…"
@@ -1056,6 +1004,32 @@ export function SessionSidebar() {
                   </button>
                 )}
               </div>
+
+              {/* Compact results dropdown (#876 surface A): content-search hits
+                  anchored below the filter input, replacing the old inline
+                  "In messages" group. The title-filtered list underneath is
+                  untouched — this only covers message-content matches. */}
+              {filtering &&
+                !selectMode &&
+                !dropdownDismissed &&
+                (contentSearchPending || contentRows.length > 0) && (
+                  <div className="absolute inset-x-2 top-full z-10 mt-1 flex max-h-80 flex-col overflow-hidden rounded-lg border bg-popover shadow-lg">
+                    <SearchHitList
+                      rows={contentRows}
+                      activeIndex={
+                        contentRows.length
+                          ? Math.min(activeHitIndex, contentRows.length - 1)
+                          : 0
+                      }
+                      onHover={setActiveHitIndex}
+                      onSelect={(row) => openContentHit(row.hit, filter.trim())}
+                      listRef={dropdownListRef}
+                      variant="dropdown"
+                      pending={contentSearchPending}
+                      emptyLabel="No matches in messages"
+                    />
+                  </div>
+                )}
             </div>
           )}
 
@@ -1098,25 +1072,6 @@ export function SessionSidebar() {
                 >
                   Show less
                 </button>
-              )}
-
-              {/* Content matches (#710): sessions found by full-text search, not
-                  by title. Separate, labeled group in BM25 order. Hidden in select
-                  mode (these rows aren't selectable). */}
-              {filtering && !selectMode && contentRows.length > 0 && (
-                <>
-                  <p className="mx-0.5 mt-2 mb-0.5 px-2 text-[10px] font-medium uppercase tracking-wide text-muted-foreground/50">
-                    In messages
-                  </p>
-                  {contentRows.map(({ session, hit }) => (
-                    <ContentHitRow
-                      key={hit.messageId}
-                      session={session}
-                      snippet={hit.snippet}
-                      onOpen={() => openContentHit(hit)}
-                    />
-                  ))}
-                </>
               )}
 
               {filtering &&

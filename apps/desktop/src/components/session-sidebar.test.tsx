@@ -2,11 +2,7 @@
 
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
-import {
-  ContentHitRow,
-  SessionItem,
-  SessionMenuItems,
-} from "@/components/session-sidebar";
+import { SessionItem, SessionMenuItems } from "@/components/session-sidebar";
 import type { Session } from "@/bindings";
 
 // SessionItem takes its row state (session/pinned/dismissed) as props, so static
@@ -134,23 +130,5 @@ describe("SessionMenuItems", () => {
     expect(html).toContain("Pin");
     expect(html).toContain("Dismiss");
     expect(html).toContain("Rename");
-  });
-});
-
-// Content search-hit row (#710): the session label plus the backend's
-// `<mark>`-highlighted snippet, rendered inline via dangerouslySetInnerHTML.
-describe("ContentHitRow", () => {
-  it("renders the session label and the highlighted snippet markup", () => {
-    const html = renderToStaticMarkup(
-      <ContentHitRow
-        session={session({ id: "a", title: "Parser cleanup" })}
-        snippet="…fix the <mark>parser</mark> bug…"
-        onOpen={() => {}}
-      />,
-    );
-    expect(html).toContain("Parser cleanup");
-    // The snippet's <mark> survives to the DOM (styled by .ff-hit-snippet mark).
-    expect(html).toContain("<mark>parser</mark>");
-    expect(html).toContain("ff-hit-snippet");
   });
 });

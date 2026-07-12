@@ -3,7 +3,7 @@
 // Sidebar header accent polish + collapsed icon rail (#670): the ＋ button is a
 // plain ghost by default, the ☑ select toggle takes the accent only while active,
 // and collapsing swaps the sidebar for a thin rail whose four controls each fire
-// their action (search opens a placeholder popover).
+// their action (search opens the full-screen "All Conversations" modal, #876).
 
 import { render, screen, cleanup } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
@@ -15,6 +15,7 @@ import { usePanesStore } from "@/store/panes";
 import { usePrefsStore } from "@/store/prefs";
 import { useSessionPrefsStore } from "@/store/session-prefs";
 import { useSettingsStore } from "@/store/settings";
+import { useAllConversationsSearchStore } from "@/store/all-conversations-search";
 import type { Session } from "@/bindings";
 
 // jsdom lacks ResizeObserver (radix ScrollArea) + pointer-capture (radix Popover).
@@ -54,6 +55,7 @@ describe("SessionSidebar — header accent + collapsed rail (#670)", () => {
     localStorage.clear();
     usePrefsStore.setState({ sidebarCollapsed: false });
     usePanesStore.setState({ root: null, focusedPaneId: null });
+    useAllConversationsSearchStore.setState({ open: false });
     useSessionPrefsStore.setState({ pinned: [], dismissed: [] });
     useChatStore.setState({
       sessions: [session("s1"), session("s2")],
@@ -111,15 +113,17 @@ describe("SessionSidebar — header accent + collapsed rail (#670)", () => {
     expect(usePrefsStore.getState().sidebarCollapsed).toBe(false);
   });
 
-  it("rail search expands the sidebar and reveals the filter (#710)", async () => {
+  it("rail search opens the all-conversations modal, leaving the sidebar collapsed (#876)", async () => {
     const user = userEvent.setup();
     usePrefsStore.setState({ sidebarCollapsed: true });
     render(<SessionSidebar />);
 
     await user.click(screen.getByLabelText("Search sessions"));
-    // Expands the sidebar and reveals the (now full-text) filter input.
-    expect(usePrefsStore.getState().sidebarCollapsed).toBe(false);
-    expect(screen.getByLabelText("Filter sessions")).not.toBeNull();
+    // Opens the full-screen modal in place — the sidebar itself, and its
+    // (unrelated) filter input, are untouched.
+    expect(usePrefsStore.getState().sidebarCollapsed).toBe(true);
+    expect(useAllConversationsSearchStore.getState().open).toBe(true);
+    expect(screen.queryByLabelText("Filter sessions")).toBeNull();
   });
 
   it("rail ＋ starts a new session and gear opens Settings", async () => {

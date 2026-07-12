@@ -6,6 +6,7 @@ import {
   groupContentHits,
   sanitizeSnippet,
   selectSessionOverflow,
+  formatHitDate,
   SESSION_REVEAL_BATCH,
 } from "@/lib/sessions";
 import type { Session } from "@/bindings";
@@ -259,5 +260,31 @@ describe("sanitizeSnippet (#747 C1 — XSS)", () => {
     expect(sanitizeSnippet("a & b <script>x</script>")).toBe(
       "a &amp; b &lt;script&gt;x&lt;/script&gt;",
     );
+  });
+});
+
+describe("formatHitDate", () => {
+  // Wed Jul 10 2026, 15:00 local.
+  const now = new Date(2026, 6, 10, 15, 0, 0).getTime();
+
+  it("labels the same calendar day as 'Today', regardless of time of day", () => {
+    const earlyThisMorning = new Date(2026, 6, 10, 0, 5, 0).getTime();
+    expect(formatHitDate(earlyThisMorning, now)).toBe("Today");
+    expect(formatHitDate(now, now)).toBe("Today");
+  });
+
+  it("labels the previous calendar day as 'Yesterday', even close to midnight", () => {
+    const lateLastNight = new Date(2026, 6, 9, 23, 55, 0).getTime();
+    expect(formatHitDate(lateLastNight, now)).toBe("Yesterday");
+  });
+
+  it("uses a short month/day date for this year, with no year suffix", () => {
+    const earlierThisYear = new Date(2026, 2, 3, 12, 0, 0).getTime();
+    expect(formatHitDate(earlierThisYear, now)).toBe("Mar 3");
+  });
+
+  it("appends the year when it differs from the current year", () => {
+    const lastYear = new Date(2024, 6, 3, 12, 0, 0).getTime();
+    expect(formatHitDate(lastYear, now)).toBe("Jul 3, 2024");
   });
 });

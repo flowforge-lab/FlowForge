@@ -88,6 +88,35 @@ function escapeHtml(s: string): string {
   return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
+/**
+ * A short, human relative date for a search-hit row (#876): "Today"/"Yesterday"
+ * for the last two calendar days (by local wall-clock day, not a rolling
+ * 24h/48h window), else a short date ("Jul 3"), with the year appended only
+ * when it differs from the current year ("Jul 3, 2024"). Distinct from
+ * memory-view.ts's `humanAge()` ("~3 days ago" style), which the mockups don't
+ * use. `Date.UTC` on each date's local Y/M/D is just an integer-day bucketing
+ * trick to avoid DST arithmetic bugs from a naive ms-diff divide.
+ */
+export function formatHitDate(
+  createdAtMs: number,
+  now: number = Date.now(),
+): string {
+  const day = (ms: number) => {
+    const d = new Date(ms);
+    return Date.UTC(d.getFullYear(), d.getMonth(), d.getDate());
+  };
+  const diffDays = Math.round((day(now) - day(createdAtMs)) / 86_400_000);
+  if (diffDays === 0) return "Today";
+  if (diffDays === 1) return "Yesterday";
+  const created = new Date(createdAtMs);
+  const sameYear = created.getFullYear() === new Date(now).getFullYear();
+  return created.toLocaleDateString("en-US", {
+    month: "short",
+    day: "numeric",
+    year: sameYear ? undefined : "numeric",
+  });
+}
+
 /** How many rows the list grows by per "Show more" click, and the initial
  *  batch size (#667). One endless, incremental reveal replaced the old
  *  All/Dismissed tabs + fixed cap. */
