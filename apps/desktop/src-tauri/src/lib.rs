@@ -714,6 +714,23 @@ async fn notebook_stop(state: State<'_, Arc<AppState>>, session_id: String) -> R
     Ok(())
 }
 
+/// Restart a session's `notebook_runner` kernel (the panel's Restart button,
+/// #871 FE-2 / #922): stop the current kernel and spawn a fresh one, discarding
+/// all in-kernel state (a new kernel id, execution count reset to 0). Returns
+/// the post-restart snapshot so the FE renders the fresh kernel without a
+/// follow-up `notebook_status`. `kernel_id` targets a specific kernel when
+/// given (forward-compat for Phase 3 multi-kernel), else the representative one.
+#[tauri::command]
+async fn notebook_restart(
+    state: State<'_, Arc<AppState>>,
+    session_id: String,
+    kernel_id: Option<String>,
+) -> Result<NotebookKernelState, String> {
+    state
+        .notebook_restart(&session_id, kernel_id.as_deref())
+        .await
+}
+
 /// Fire a scheduled task immediately, off-schedule (RFC 0017 §8.3). Runs the
 /// same bounded headless turn the scheduler would, records the run, and stamps
 /// `last_run` so the manual fire counts as the most recent run (and the
@@ -3576,6 +3593,7 @@ pub fn run() {
             goal_complete,
             notebook_status,
             notebook_stop,
+            notebook_restart,
             preview_cadence,
             get_session_workspace,
             set_session_workspace,

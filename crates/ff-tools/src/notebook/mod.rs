@@ -163,7 +163,10 @@ impl KernelSupervisor {
     /// Restart a kernel: stop the existing one and spawn a fresh replacement,
     /// preserving the session mapping (a new kernel id is assigned). The old
     /// namespace is gone by design — that is the point of a restart.
-    async fn restart(
+    ///
+    /// `pub` so the desktop `notebook_restart` command can drive it directly
+    /// (mirrors [`snapshot`](Self::snapshot)); also used by the tool dispatch.
+    pub async fn restart(
         &self,
         session_id: &str,
         kernel_id: Option<&str>,

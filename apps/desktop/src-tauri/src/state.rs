@@ -2011,6 +2011,27 @@ impl AppState {
         }
     }
 
+    /// Restart a session's kernel — stop it and spawn a fresh replacement,
+    /// preserving the session mapping with a new kernel id (the panel's Restart
+    /// button, #871 FE-2 / #922). `kernel_id` targets a specific kernel when
+    /// given, else the session's representative one (forward-compat for Phase 3
+    /// multi-kernel). Returns the post-restart snapshot directly so the FE can
+    /// render the fresh kernel without a follow-up `notebook_status` round-trip.
+    /// The fresh kernel is rooted at the session's workspace, mirroring how the
+    /// `notebook_runner` tool resolves its working directory.
+    pub async fn notebook_restart(
+        &self,
+        session_id: &str,
+        kernel_id: Option<&str>,
+    ) -> Result<NotebookKernelState, String> {
+        let dir = self.session_root(session_id);
+        self.kernel_supervisor
+            .restart(session_id, kernel_id, &dir)
+            .await?;
+        tracing::info!(session_id = %session_id, "restarted session kernel (panel)");
+        Ok(self.kernel_supervisor.snapshot(session_id).await)
+    }
+
     /// Stop and remove all background observers owned by `session_id` (#891
     /// Phase 1). Same fire-and-forget, off-reactor-safe pattern as
     /// [`reap_session_kernels`](Self::reap_session_kernels): a watcher is a
