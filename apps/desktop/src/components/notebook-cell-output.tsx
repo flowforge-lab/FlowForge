@@ -1,27 +1,27 @@
+import { useEffect, useState } from "react";
 import { Check, Loader2, X } from "@/components/ui/icon";
 import { Badge } from "@/components/ui/badge";
 import { HighlightedCode } from "@/components/markdown";
 import {
   parseNotebookStep,
   parseKernelStatus,
+  type NotebookImageRef,
   type NotebookStep,
+  type NotebookVariable,
 } from "@/lib/notebook-output";
 import { cn } from "@/lib/utils";
 import type { ToolStep } from "@/store/chat";
 
 /**
- * Notebook-styled cell renderer for the `notebook_runner` tool (#871 FE-2).
+ * Notebook-styled cell renderer for the `notebook_runner` tool (#871 FE-2,
+ * #879 for the Phase 3 images/variables blocks).
  *
  * Lays out a tool step as a notebook cell: an optional `code` block (for
- * `run_cell`), the textual output stream, and an ok/error badge. The
- * `status` action gets a small kernel-state pill derived from the canonical
- * `kernel <id> — <state>; pid=…; cells executed=…` line the backend emits.
- *
- * This renderer is intentionally tolerant of the current Phase 1/2 text
- * contract — the parser (`lib/notebook-output.ts`) already returns a stable
- * shape, and the optional `images` / `variables` blocks below are gated on
- * presence so Phase 3's structured payload can plug in without changing the
- * surrounding layout.
+ * `run_cell`), the textual output stream, an ok/error badge, and — when the
+ * backend's `FF_NB_META` trailer carried them — figures and a variables
+ * table. The `status` action gets a small kernel-state pill derived from the
+ * canonical `kernel <id> — <state>; pid=…; cells executed=…` line the
+ * backend emits.
  */
 export function NotebookCellOutput({ step }: { step: ToolStep }) {
   const parsed = parseNotebookStep(
@@ -88,13 +88,126 @@ function NotebookCellBody({
         </NotebookSection>
       )}
 
-      {/*
-        Phase 3 forward-compat:
-        - images:  images?.[i].dataUrl (a `data:` URI; we never set raw html src)
-        - variables:  table derived from the structured variable dump
-        The shape lands with the Phase 3 backend (FE-0 contract from the issue);
-        we add the rendering here only when `parsed` carries the new fields.
-       */}
+      {step.images && step.images.length > 0 ? (
+        <NotebookImages images={step.images} />
+      ) : null}
+
+      {step.variables && step.variables.length > 0 ? (
+        <NotebookVariablesTable variables={step.variables} />
+      ) : null}
+    </div>
+  );
+}
+
+/** Read one image file's bytes and build a `data:` URI. `null` on any
+ *  failure (no Tauri runtime, file gone, read error) — the caller skips it. */
+async function readImageAsDataUrl(
+  img: NotebookImageRef,
+): Promise<string | null> {
+  try {
+    const { readFile } = await import("@tauri-apps/plugin-fs");
+    const bytes = await readFile(img.path);
+    let binary = "";
+    for (const b of bytes) binary += String.fromCharCode(b);
+    return `data:${img.mediaType};base64,${btoa(binary)}`;
+  } catch {
+    return null;
+  }
+}
+
+/** Resolves each image path to a `data:` URI, keyed by path. Depends on the
+ *  path list (not the `images` array reference, which is a fresh array every
+ *  parse) so it only re-reads when the underlying step actually changes. */
+function useResolvedImages(images: NotebookImageRef[]): Record<string, string> {
+  const key = images.map((img) => `${img.path}|${img.mediaType}`).join("\n");
+  const [dataUrls, setDataUrls] = useState<Record<string, string>>({});
+
+  useEffect(() => {
+    if (images.length === 0) return;
+    let alive = true;
+    void Promise.all(
+      images.map(
+        async (img) => [img.path, await readImageAsDataUrl(img)] as const,
+      ),
+    ).then((results) => {
+      if (!alive) return;
+      const next: Record<string, string> = {};
+      for (const [path, dataUrl] of results) {
+        if (dataUrl) next[path] = dataUrl;
+      }
+      setDataUrls(next);
+    });
+    return () => {
+      alive = false;
+    };
+    // `key` is the real dependency (see doc comment above); `images` itself
+    // changes identity every render even when its contents don't.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [key]);
+
+  return dataUrls;
+}
+
+function NotebookImages({ images }: { images: NotebookImageRef[] }) {
+  const dataUrls = useResolvedImages(images);
+  const loaded = images.filter((img) => dataUrls[img.path]);
+  if (loaded.length === 0) return null;
+  return (
+    <div>
+      <span className="text-[10px] uppercase tracking-wide text-muted-foreground/60">
+        figures
+      </span>
+      <div className="mt-1 flex flex-wrap gap-2">
+        {loaded.map((img) => (
+          <img
+            key={img.path}
+            src={dataUrls[img.path]}
+            alt="Cell figure"
+            className="max-h-64 max-w-full rounded border border-border object-contain"
+          />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function NotebookVariablesTable({
+  variables,
+}: {
+  variables: NotebookVariable[];
+}) {
+  return (
+    <div>
+      <span className="text-[10px] uppercase tracking-wide text-muted-foreground/60">
+        variables
+      </span>
+      <table className="mt-1 w-full border-collapse text-[11px]">
+        <thead>
+          <tr className="text-left text-muted-foreground/70">
+            <th className="py-0.5 pr-2 font-medium">name</th>
+            <th className="py-0.5 pr-2 font-medium">type</th>
+            <th className="py-0.5 font-medium">repr</th>
+          </tr>
+        </thead>
+        <tbody>
+          {variables.map((v) => (
+            <tr key={v.name} className="border-t border-border">
+              <td className="py-0.5 pr-2 font-mono text-foreground">
+                {v.name}
+              </td>
+              <td className="py-0.5 pr-2 text-muted-foreground">
+                {v.type ?? "—"}
+              </td>
+              <td
+                className="max-w-0 truncate py-0.5 font-mono text-foreground/80"
+                title={v.repr}
+              >
+                {v.repr}
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
     </div>
   );
 }

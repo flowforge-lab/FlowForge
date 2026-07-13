@@ -12,13 +12,14 @@
 // the textual output, and an ok/error status. The detector is exported as
 // `isNotebookRunnerStep` so `tool-step.tsx` can branch once.
 //
-// Future Phase 3 (rich output — image path + variable dump + the `restart` and
-// `inspect` actions) will extend `NotebookOutput` with `images?` and
-// `variables?`; the renderer (`notebook-cell-output.tsx`) already gates those
-// blocks on presence, so adding them later is an additive change to this
-// parser + the renderer, with no re-plumbing in `tool-step.tsx`. Per the
-// issue's FE-0 contract note: the FE does not invent the shape — it lands with
-// the Phase 3 backend.
+// Phase 3 (#879, backend landed in #881) added rich output: `NotebookStep` now
+// carries optional `images?`/`variables?`, parsed from a `<<<FF_NB_META ...
+// FF_NB_META` fenced JSON trailer the backend appends to `run_cell`/`inspect`
+// output when there's something to report (see `meta_trailer` in
+// `crates/ff-tools/src/notebook/mod.rs`). The trailer is stripped from the
+// visible `output` text either way, so a plain cell with no images or
+// variables renders byte-identical to Phase 1/2. A malformed or absent
+// trailer degrades to plain-text output rather than throwing.
 //
 // The union is forward-extensible: `start | run_cell | run_all | status |
 // stop | restart | inspect`. `run_all`, `restart`, `inspect` are pre-declared so
@@ -42,6 +43,22 @@ export type NotebookAction =
   | "restart"
   | "inspect";
 
+/** One image the cell produced (currently always a PNG saved to a per-kernel
+ *  temp dir by the backend). `path` is an absolute filesystem path — the FE
+ *  reads the file and builds a `data:` URI; a raw path is never set as an
+ *  `<img src>` (see `NotebookImages` in `notebook-cell-output.tsx`). */
+export interface NotebookImageRef {
+  path: string;
+  mediaType: string;
+}
+
+/** One variable from an `action=inspect` dump. */
+export interface NotebookVariable {
+  name: string;
+  type?: string;
+  repr: string;
+}
+
 /** What the FE renders for a step. `null` = "this isn't a notebook call". */
 export interface NotebookStep {
   /** The action the agent invoked (drive different layouts). */
@@ -61,6 +78,15 @@ export interface NotebookStep {
   parsedExceptionTrailer: boolean;
   /** True when the action was `status` (drives the kernel-state pill). */
   isStatusReport: boolean;
+  /**
+   * Figures the cell produced and variables from an `inspect` dump, parsed
+   * from the Phase 3 `FF_NB_META` trailer. Both fields are populated together
+   * (the trailer JSON always carries both keys, so one may be `[]` while the
+   * other has entries) whenever a trailer was present and parsed; both are
+   * `undefined` when the trailer was missing or malformed.
+   */
+  images?: NotebookImageRef[];
+  variables?: NotebookVariable[];
 }
 
 /** Matches a single notebook_runner step by tool name. */
@@ -100,6 +126,74 @@ function readCode(args: unknown): string | null {
 // backend change to the trailer text only touches one place.
 const EXCEPTION_TRAILER = "[cell raised an exception]";
 
+// Delimiters for the Phase 3 machine-readable trailer (`meta_trailer` in
+// `crates/ff-tools/src/notebook/mod.rs`). Wire format, appended *after* the
+// exception trailer when both are present:
+//   "\n<<<FF_NB_META\n{\"images\":[...],\"variables\":[...]}\nFF_NB_META\n"
+// Only emitted when there's something to carry, so most results have no
+// trailer at all.
+const META_OPEN = "<<<FF_NB_META";
+const META_CLOSE = "FF_NB_META";
+const META_TRAILER_RE = new RegExp(
+  `\\n${META_OPEN}\\n([\\s\\S]*?)\\n${META_CLOSE}\\n?$`,
+);
+
+interface NotebookMeta {
+  images: NotebookImageRef[];
+  variables: NotebookVariable[];
+}
+
+function isNotebookImageRef(v: unknown): v is NotebookImageRef {
+  if (typeof v !== "object" || v === null) return false;
+  const o = v as { path?: unknown; mediaType?: unknown };
+  return typeof o.path === "string" && typeof o.mediaType === "string";
+}
+
+function isNotebookVariable(v: unknown): v is NotebookVariable {
+  if (typeof v !== "object" || v === null) return false;
+  const o = v as { name?: unknown; type?: unknown; repr?: unknown };
+  return (
+    typeof o.name === "string" &&
+    typeof o.repr === "string" &&
+    (o.type === undefined || typeof o.type === "string")
+  );
+}
+
+/**
+ * Strip a trailing `FF_NB_META` trailer (if present) from a step's raw result
+ * text and parse its payload. Anchored at the end of the string since the
+ * backend always appends it last (after any exception trailer) — stripping it
+ * first is what lets the existing exception-trailer detection below keep
+ * working unchanged. Any failure (no match, invalid JSON, wrong shape, or a
+ * trailer with nothing usable in it) degrades to the pre-Phase-3 behavior:
+ * the text is returned untouched and `meta` is `null`, never thrown.
+ */
+function stripMetaTrailer(raw: string): {
+  text: string;
+  meta: NotebookMeta | null;
+} {
+  const match = META_TRAILER_RE.exec(raw);
+  if (!match) return { text: raw, meta: null };
+  try {
+    const parsed = JSON.parse(match[1]) as {
+      images?: unknown;
+      variables?: unknown;
+    };
+    const images = Array.isArray(parsed.images)
+      ? parsed.images.filter(isNotebookImageRef)
+      : [];
+    const variables = Array.isArray(parsed.variables)
+      ? parsed.variables.filter(isNotebookVariable)
+      : [];
+    if (images.length === 0 && variables.length === 0) {
+      return { text: raw.slice(0, match.index), meta: null };
+    }
+    return { text: raw.slice(0, match.index), meta: { images, variables } };
+  } catch {
+    return { text: raw, meta: null };
+  }
+}
+
 /**
  * Normalize a notebook_runner step's args + result into a render model.
  * Returns `null` for anything that doesn't look like a notebook call so the
@@ -116,7 +210,13 @@ export function parseNotebookStep(
   // While the call is in flight we may not have a result yet; the step view
   // falls back to the live `output` stream. While idle, prefer the canonical
   // `result` (the tool-result event's body).
-  const raw = result ?? "";
+  const rawResult = result ?? "";
+  // Strip the Phase 3 meta trailer first — it's always the last thing the
+  // backend appends (after any exception trailer), so downstream parsing
+  // (e.g. the exception-trailer check below) sees the same text it would
+  // have seen pre-Phase-3.
+  const { text: raw, meta } = stripMetaTrailer(rawResult);
+  const extra = meta ? { images: meta.images, variables: meta.variables } : {};
 
   if (action === "status") {
     return {
@@ -128,6 +228,7 @@ export function parseNotebookStep(
       errored: status === "error",
       parsedExceptionTrailer: false,
       isStatusReport: true,
+      ...extra,
     };
   }
 
@@ -158,6 +259,7 @@ export function parseNotebookStep(
       errored,
       parsedExceptionTrailer,
       isStatusReport: false,
+      ...extra,
     };
   }
 
@@ -171,6 +273,7 @@ export function parseNotebookStep(
     errored: status === "error",
     parsedExceptionTrailer: false,
     isStatusReport: false,
+    ...extra,
   };
 }
 
