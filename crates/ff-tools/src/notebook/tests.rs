@@ -368,6 +368,7 @@ async fn snapshot_projects_session_state_for_the_panel() {
     assert_eq!(none.pid, None);
     assert_eq!(none.execution_count, 0);
     assert!(none.raw.is_empty());
+    assert!(none.kernels.is_none(), "no kernels → None");
 
     // One live kernel → the representative describes it.
     let id1 = sup.start("s", dir.path()).await.unwrap();
@@ -382,6 +383,12 @@ async fn snapshot_projects_session_state_for_the_panel() {
         one.raw.contains(&id1),
         "raw carries the canonical status line"
     );
+    // The structured list carries the one kernel (FE shows tabs only when > 1).
+    let one_kernels = one.kernels.expect("kernels present when a kernel exists");
+    assert_eq!(one_kernels.len(), 1);
+    assert_eq!(one_kernels[0].kernel_id, id1);
+    assert_eq!(one_kernels[0].state, KernelLiveState::Running);
+    assert_eq!(one_kernels[0].execution_count, 1);
 
     // A second kernel → raw lists both; representative stays a live kernel.
     let id2 = sup.start("s", dir.path()).await.unwrap();
@@ -390,8 +397,58 @@ async fn snapshot_projects_session_state_for_the_panel() {
     assert_eq!(multi.state, Some(KernelLiveState::Running));
     assert!(multi.raw.contains(&id1) && multi.raw.contains(&id2));
     assert_eq!(multi.raw.lines().count(), 2, "one status line per kernel");
+    // Structured list: both kernels, sorted by id (stable FE tab order), one
+    // KernelInfo per kernel.
+    let multi_kernels = multi.kernels.expect("kernels present");
+    assert_eq!(multi_kernels.len(), 2, "kernels[] lists every kernel");
+    let mut ids: Vec<&str> = multi_kernels.iter().map(|k| k.kernel_id.as_str()).collect();
+    let mut want = vec![id1.as_str(), id2.as_str()];
+    ids.sort_unstable();
+    want.sort_unstable();
+    assert_eq!(ids, want, "kernels[] carries both ids");
+    assert!(
+        multi_kernels
+            .iter()
+            .all(|k| k.state == KernelLiveState::Running),
+        "both kernels live"
+    );
 
     sup.reap_session("s").await;
+}
+
+#[tokio::test]
+async fn stop_removes_one_kernel_and_leaves_the_rest() {
+    if !python3_available() {
+        eprintln!("skipping: python3 not on PATH");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let sup = KernelSupervisor::new();
+    let a = sup.start("s", dir.path()).await.unwrap();
+    let b = sup.start("s", dir.path()).await.unwrap();
+    let c = sup.start("s", dir.path()).await.unwrap();
+    assert_eq!(sup.snapshot("s").await.kernels.unwrap().len(), 3);
+
+    // Per-kernel stop (switcher's per-tab Stop): remove just `b`.
+    sup.stop("s", Some(&b)).await.unwrap();
+    let after = sup.snapshot("s").await;
+    let after_kernels = after.kernels.expect("kernels remain");
+    assert_eq!(
+        after_kernels.len(),
+        2,
+        "only the targeted kernel is removed"
+    );
+    let ids: Vec<&str> = after_kernels.iter().map(|k| k.kernel_id.as_str()).collect();
+    assert!(ids.contains(&a.as_str()) && ids.contains(&c.as_str()));
+    assert!(!ids.contains(&b.as_str()), "stopped kernel is gone");
+    assert!(after.has_kernel, "session still has kernels");
+
+    // Stopping the remaining two empties the session.
+    sup.stop("s", Some(&a)).await.unwrap();
+    sup.stop("s", Some(&c)).await.unwrap();
+    let empty = sup.snapshot("s").await;
+    assert!(!empty.has_kernel, "no kernels left");
+    assert!(empty.kernels.is_none());
 }
 
 #[tokio::test]

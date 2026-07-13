@@ -2004,10 +2004,26 @@ impl AppState {
     /// [`reap_session_kernels`](Self::reap_session_kernels), this is awaited
     /// inline: the caller is an async command already running on the reactor,
     /// and the FE refreshes the snapshot once it resolves.
-    pub async fn notebook_stop(&self, session_id: &str) {
-        let n = self.kernel_supervisor.reap_session(session_id).await;
-        if n > 0 {
-            tracing::info!(session_id = %session_id, reaped = n, "stopped session kernels (panel)");
+    pub async fn notebook_stop(&self, session_id: &str, kernel_id: Option<&str>) {
+        match kernel_id {
+            // Session-wide teardown (FE-1 Stop, back-compat): reap every kernel.
+            None => {
+                let n = self.kernel_supervisor.reap_session(session_id).await;
+                if n > 0 {
+                    tracing::info!(session_id = %session_id, reaped = n, "stopped session kernels (panel)");
+                }
+            }
+            // Per-tab Stop (#871 FE-2 / #923): remove just the named kernel.
+            Some(id) => match self.kernel_supervisor.stop(session_id, Some(id)).await {
+                Ok(msg) => {
+                    tracing::info!(session_id = %session_id, kernel_id = %id, "{msg} (panel)")
+                }
+                // A stale tab (already-gone kernel) is not worth surfacing; the
+                // next snapshot simply won't list it.
+                Err(e) => {
+                    tracing::debug!(session_id = %session_id, kernel_id = %id, error = %e, "notebook_stop(one)")
+                }
+            },
         }
     }
 

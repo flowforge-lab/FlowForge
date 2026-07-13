@@ -706,11 +706,17 @@ async fn notebook_status(
 }
 
 /// Stop the session's `notebook_runner` kernel(s) — the panel's Stop button
-/// (#871). Idempotent: a no-op when the session has no kernel. The FE follows
-/// up with `notebook_status` to render the post-stop ("no kernel") snapshot.
+/// (#871). With no `kernel_id`, reaps the whole session (FE-1 Stop, back-compat);
+/// with a `kernel_id`, stops just that kernel — the multi-kernel switcher's
+/// per-tab Stop (#871 FE-2 / #923). Idempotent: a no-op when the target kernel is
+/// already gone. The FE follows up with `notebook_status` to render the result.
 #[tauri::command]
-async fn notebook_stop(state: State<'_, Arc<AppState>>, session_id: String) -> Result<(), String> {
-    state.notebook_stop(&session_id).await;
+async fn notebook_stop(
+    state: State<'_, Arc<AppState>>,
+    session_id: String,
+    kernel_id: Option<String>,
+) -> Result<(), String> {
+    state.notebook_stop(&session_id, kernel_id.as_deref()).await;
     Ok(())
 }
 
