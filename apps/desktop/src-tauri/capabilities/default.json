@@ -9,6 +9,7 @@
     "dialog:allow-open",
     "dialog:allow-save",
     "fs:allow-write-text-file",
+    "fs:allow-temp-read-recursive",
     {
       "identifier": "shell:allow-execute",
       "allow": [
