@@ -17,6 +17,7 @@ globset = { workspace = true }
 futures-util = { workspace = true }
 reqwest = { workspace = true, features = ["rustls-tls", "stream"] }
 url = { workspace = true }
+regex = { workspace = true }
 ff-core = { workspace = true }
 ff-tools = { workspace = true }
 

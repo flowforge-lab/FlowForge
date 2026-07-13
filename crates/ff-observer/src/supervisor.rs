@@ -18,10 +18,12 @@
 use super::cancel::Cancel;
 use super::file::FileSource;
 use super::http::HttpSource;
+use super::process::ProcessSource;
 use super::source::{
     ObserverContext, ObserverEvent, ObserverId, ObserverInfo, ObserverKind, ObserverSource,
     ObserverSpec,
 };
+use ff_tools::process::ProcessSupervisor;
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -58,6 +60,12 @@ pub struct ObserverSupervisor {
     /// Per-session queue of events that arrived while a turn was in
     /// flight. The pump `drain`s on the next idle wake.
     buffer: Mutex<HashMap<String, VecDeque<ObserverEvent>>>,
+    /// Phase 3 (#893): handle to the global `ProcessSupervisor` so the
+    /// `process` observer kind can subscribe to a running process.
+    /// `None` in tests / CLIs that don't manage background processes;
+    /// in that case `start` rejects `kind=process` with an actionable
+    /// error rather than a confusing "no such process".
+    process_supervisor: Option<Arc<ProcessSupervisor>>,
 }
 
 impl Default for ObserverSupervisor {
@@ -78,9 +86,19 @@ impl ObserverSupervisor {
                 next_id: AtomicU64::new(1),
                 events_tx: tx,
                 buffer: Mutex::new(HashMap::new()),
+                process_supervisor: None,
             },
             rx,
         )
+    }
+
+    /// Wire the process supervisor after construction. The host already
+    /// holds the same `Arc<ProcessSupervisor>` it passes to
+    /// `ProcessManagerTool`, so the observer supervisor borrows it
+    /// rather than re-owning the table. Phase 3 (#893).
+    pub fn with_process_supervisor(mut self, sup: Arc<ProcessSupervisor>) -> Self {
+        self.process_supervisor = Some(sup);
+        self
     }
 
     /// Start an observer owned by `session_id`. Returns the new id, or
@@ -146,7 +164,23 @@ impl ObserverSupervisor {
                     .map_err(|e| format!("http observer: {e}"))?,
             ),
             ObserverKind::Process => {
-                return Err("observer kind 'process' is not yet implemented (Phase 3, #893)".into())
+                // The spec's `target` is the *string* form of the
+                // u64 process id returned by `process_manager start`.
+                // Parse it here so a bad target is rejected with a
+                // clean error before we touch the process supervisor.
+                let pid: u64 = target.trim().parse().map_err(|_| {
+                    format!("process observer: target must be a numeric process id, got '{target}'")
+                })?;
+                let Some(proc_sup) = self.process_supervisor.as_ref() else {
+                    return Err(
+                        "process observer: no ProcessSupervisor is wired into the ObserverSupervisor"
+                            .into(),
+                    );
+                };
+                Box::new(
+                    ProcessSource::new(ctx, pid, filter.as_deref(), proc_sup, session_id)
+                        .map_err(|e| format!("process observer: {e}"))?,
+                )
             }
         };
 
@@ -326,7 +360,6 @@ async fn run_source(
 mod tests {
     use super::*;
     use std::path::PathBuf;
-
     fn tempdir_target() -> (tempfile::TempDir, String) {
         let dir = tempfile::tempdir().expect("tempdir");
         let target = dir.path().to_string_lossy().into_owned();
@@ -503,20 +536,52 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn start_rejects_process_kind_until_phase3() {
+    async fn start_rejects_process_kind_without_supervisor() {
+        // Phase 3 (#893): with no ProcessSupervisor wired, the
+        // supervisor can't subscribe to a process — reject up front
+        // with an actionable error instead of a confusing
+        // "no such process".
         let (sup, _rx) = ObserverSupervisor::new();
-        assert!(sup
+        let err = sup
             .start(
                 ObserverSpec {
                     label: "x".into(),
                     kind: ObserverKind::Process,
-                    target: "sleep 1".into(),
+                    target: "1".into(),
                     filter: None,
                     interval_secs: None,
                 },
-                "s1"
+                "s1",
             )
-            .is_err());
+            .expect_err("process kind must error without supervisor");
+        assert!(err.to_lowercase().contains("process"), "{err}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn start_rejects_process_kind_with_unknown_pid() {
+        // Phase 3: with a ProcessSupervisor wired but the pid
+        // unknown to it, the source's `is_alive` check returns false
+        // and the spec is rejected with the same wording class as
+        // `process_manager poll` to keep cross-session ids hidden.
+        let dir = tempfile::tempdir().unwrap();
+        let proc_sup = Arc::new(ProcessSupervisor::new());
+        let (observer_supervisor, _rx) = ObserverSupervisor::new();
+        let observer_supervisor =
+            Arc::new(observer_supervisor.with_process_supervisor(proc_sup.clone()));
+        let err = observer_supervisor
+            .start(
+                ObserverSpec {
+                    label: "x".into(),
+                    kind: ObserverKind::Process,
+                    target: "999".into(),
+                    filter: None,
+                    interval_secs: None,
+                },
+                "s1",
+            )
+            .expect_err("unknown pid must error");
+        assert!(err.contains("no such process"), "{err}");
+        let _ = dir;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

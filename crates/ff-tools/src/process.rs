@@ -34,10 +34,12 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
+use tokio::sync::broadcast;
 
 use crate::registry::{Safety, Tool, ToolOutcome, NO_SESSION};
 use crate::sink::{OutputSink, OutputStream};
@@ -77,6 +79,23 @@ const MAX_CONCURRENT: usize = 16;
 const MAX_BUFFER_BYTES: usize = 64 * 1024;
 /// How long `stop` waits after SIGTERM before escalating to SIGKILL.
 const STOP_GRACE: Duration = Duration::from_millis(2000);
+/// Capacity of the per-process broadcast channel observers (Phase 3, #893)
+/// subscribe to. Bounded so a chatty process can't grow the channel unbounded
+/// for slow subscribers; the oldest chunks get dropped on overflow. Chosen
+/// generously so a normal dev server is unlikely to lag, and a chatty one
+/// sees lagged (not closed) receivers — `ObserverTool`'s docstring warns
+/// about this.
+const SUBSCRIBER_CAPACITY: usize = 64;
+
+/// One chunk of process output delivered to a broadcast subscriber. Each
+/// `drain` task pushes one of these per `read()` so the receiver sees the
+/// same stream of bytes the ring buffer captures — the only difference is
+/// shape (`Bytes` instead of a UTF-8 lossy snapshot).
+#[derive(Clone, Debug)]
+pub struct ProcessChunk {
+    pub stream: OutputStream,
+    pub bytes: Bytes,
+}
 
 #[derive(Clone, Debug)]
 enum Status {
@@ -140,6 +159,11 @@ struct Shared {
     stdout: Mutex<RingBuffer>,
     stderr: Mutex<RingBuffer>,
     status: Mutex<Status>,
+    /// Phase 3 (#893): broadcast sender observers subscribe to. `None` until
+    /// the first `subscribe()` call (lazily created to avoid a channel per
+    /// unobserved process). Dropped by the exit-watcher when the process
+    /// terminates, so subscribers see `RecvError::Closed` and exit.
+    subscribers: Mutex<Option<broadcast::Sender<ProcessChunk>>>,
 }
 
 impl Shared {
@@ -148,6 +172,7 @@ impl Shared {
             stdout: Mutex::new(RingBuffer::new(cap)),
             stderr: Mutex::new(RingBuffer::new(cap)),
             status: Mutex::new(Status::Running),
+            subscribers: Mutex::new(None),
         }
     }
     fn status(&self) -> Status {
@@ -250,6 +275,10 @@ impl ProcessSupervisor {
                 Err(e) => Status::Failed(e.to_string()),
             };
             *watch.status.lock().unwrap() = status;
+            // Phase 3 (#893): drop the broadcast sender so any
+            // observers see `RecvError::Closed` and their `next_event`
+            // returns `None` (supervisor task ends, entry reaped).
+            *watch.subscribers.lock().unwrap() = None;
         });
 
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
@@ -408,6 +437,62 @@ impl ProcessSupervisor {
         count
     }
 
+    /// True iff `id` exists, is owned by `session_id`, and is still running.
+    /// Phase 3 (#893): the observer supervisor uses this to gate
+    /// `ProcessSource` construction — a process that already exited (or
+    /// belongs to a different session, or never existed) gets a clean
+    /// "no such process" error before any broadcast channel is created.
+    pub fn is_alive(&self, id: u64, session_id: &str) -> bool {
+        let map = self.procs.lock().unwrap();
+        match map.get(&id) {
+            Some(p) => p.session_id == session_id && p.shared.status().is_running(),
+            None => false,
+        }
+    }
+
+    /// Subscribe to appended bytes for a running process owned by `session_id`.
+    /// The receiver yields stdout and stderr chunks as they are appended to
+    /// the ring buffers. Returns `None` for an unknown id, an id owned by a
+    /// different session, or a process that has already exited. Phase 3
+    /// (#893): backs the `process` observer source.
+    ///
+    /// Lazily creates the per-process broadcast channel on the first
+    /// subscriber, so a process with no observers pays no cost beyond the
+    /// `Mutex<Option<...>>` lock check on every drain. The sender is
+    /// dropped by the exit-watcher task, so subscribers see
+    /// `RecvError::Closed` and their `next_event` returns `None` when the
+    /// process ends.
+    pub fn subscribe(
+        &self,
+        id: u64,
+        session_id: &str,
+    ) -> Option<tokio::sync::broadcast::Receiver<ProcessChunk>> {
+        let shared = {
+            let map = self.procs.lock().unwrap();
+            let p = map.get(&id)?;
+            if p.session_id != session_id || !p.shared.status().is_running() {
+                return None;
+            }
+            p.shared.clone()
+        };
+        // TOCTOU: the exit-watcher can run between releasing `procs`
+        // above and acquiring `subscribers` here, completing both
+        // `*status = Exited` and `*subscribers = None`. Re-check status
+        // *under the subscribers lock* — if the process has exited,
+        // bail before `get_or_insert_with` materializes a fresh
+        // `Sender` that nobody will ever drop, leaving the
+        // would-be subscriber's `rx.recv()` to hang forever.
+        let mut guard = shared.subscribers.lock().unwrap();
+        if !shared.status().is_running() {
+            return None;
+        }
+        let tx = guard
+            .get_or_insert_with(|| broadcast::channel(SUBSCRIBER_CAPACITY).0)
+            .clone();
+        drop(guard);
+        Some(tx.subscribe())
+    }
+
     /// Remove finished processes and stop running ones whose `last_poll_at` is
     /// older than `max_idle` — i.e. the agent started them but never came back.
     /// Scans all sessions; the desktop host drives this from a periodic timer
@@ -480,7 +565,11 @@ impl Drop for ProcessSupervisor {
     }
 }
 
-/// Drain a child pipe into the shared ring until EOF.
+/// Drain a child pipe into the shared ring until EOF. Each read is also
+/// pushed to the broadcast channel (Phase 3, #893) so subscribed observers
+/// see the same byte stream the ring buffer captures. Locking: take the
+/// ring lock just long enough to extend, then release; broadcast::send is
+/// non-blocking and only briefly grabs the subscribers mutex.
 async fn drain<R: AsyncRead + Unpin>(mut reader: R, shared: Arc<Shared>, is_err: bool) {
     let mut buf = [0u8; 4096];
     loop {
@@ -493,6 +582,20 @@ async fn drain<R: AsyncRead + Unpin>(mut reader: R, shared: Arc<Shared>, is_err:
                     &shared.stdout
                 };
                 ring.lock().unwrap().extend(&buf[..n]);
+                // Fire the broadcast after releasing the ring lock. A
+                // sender may be absent (no observers yet) or full (slow
+                // observer); both cases are `send` returning an error,
+                // which we ignore — lag drops chunks, not the process.
+                if let Some(tx) = shared.subscribers.lock().unwrap().as_ref() {
+                    let _ = tx.send(ProcessChunk {
+                        stream: if is_err {
+                            OutputStream::Stderr
+                        } else {
+                            OutputStream::Stdout
+                        },
+                        bytes: Bytes::copy_from_slice(&buf[..n]),
+                    });
+                }
             }
         }
     }
@@ -991,5 +1094,92 @@ mod tests {
             streamed.contains("hello_stream"),
             "sink should contain poll output: {streamed}"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn subscribe_yields_new_bytes_only() {
+        // Phase 3 (#893): a subscriber sees bytes appended after the
+        // `subscribe` call, never the bytes already in the ring buffer.
+        let dir = TempDir::new().unwrap();
+        let sup = ProcessSupervisor::new();
+        // `echo` is one-shot and finishes almost immediately, so any
+        // subscription we open afterwards would race the exit-watcher
+        // dropping the sender. Use a long-running process that emits a
+        // known string after a small delay, then subscribe first.
+        let id = sup
+            .start("sleep 0.2; echo hello-stream", dir.path(), "s1")
+            .unwrap();
+        // Subscribe before the `echo` fires; the bytes haven't been
+        // appended yet, so we should see them land in our receiver.
+        let mut rx = sup
+            .subscribe(id, "s1")
+            .expect("subscribe returns a receiver for a live process");
+        // Wait for the first chunk to arrive (or fail the test).
+        let chunk = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("chunk arrives within budget")
+            .expect("subscribe recv ok");
+        assert_eq!(chunk.stream, OutputStream::Stdout);
+        let text = std::str::from_utf8(&chunk.bytes).unwrap_or("");
+        assert!(
+            text.contains("hello-stream"),
+            "chunk should contain echoed text, got {text:?}"
+        );
+        // Tidy up so the supervisor can drop without SIGKILL-ing live
+        // children (no-op: the sleeper's wait is short and the
+        // supervisor's Drop will SIGKILL anyway).
+        let _ = sup.stop(id, "s1").await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn subscribe_cross_session_returns_none() {
+        let dir = TempDir::new().unwrap();
+        let sup = ProcessSupervisor::new();
+        let id = sup.start("sleep 30", dir.path(), "session-a").unwrap();
+        // Foreign session is invisible — same wording class as `poll`.
+        assert!(sup.subscribe(id, "session-b").is_none());
+        // Owning session can subscribe.
+        assert!(sup.subscribe(id, "session-a").is_some());
+        let _ = sup.stop(id, "session-a").await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn subscribe_unknown_id_returns_none() {
+        let sup = ProcessSupervisor::new();
+        assert!(sup.subscribe(999, "s1").is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn subscribe_after_exit_returns_none() {
+        let dir = TempDir::new().unwrap();
+        let sup = ProcessSupervisor::new();
+        let id = sup.start("true", dir.path(), "s1").unwrap();
+        // Wait for the process to actually exit before subscribing.
+        let _ = wait_done(&sup, id, 5).await;
+        assert!(
+            sup.subscribe(id, "s1").is_none(),
+            "subscribe after exit must return None"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn subscribe_recv_closed_after_exit() {
+        // The exit-watcher drops the broadcast sender, so an existing
+        // subscriber's next recv returns `RecvError::Closed`.
+        let dir = TempDir::new().unwrap();
+        let sup = ProcessSupervisor::new();
+        let id = sup.start("true", dir.path(), "s1").unwrap();
+        let mut rx = sup.subscribe(id, "s1").expect("subscribe while running");
+        // Wait for exit; the drain task and exit watcher are detached,
+        // so a small sleep is the pragmatic synchronization point.
+        let _ = wait_done(&sup, id, 5).await;
+        // Give the exit-watcher a moment to drop the sender.
+        for _ in 0..50 {
+            if matches!(rx.try_recv(), Err(broadcast::error::TryRecvError::Closed)) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("subscriber should observe RecvError::Closed after exit");
     }
 }
