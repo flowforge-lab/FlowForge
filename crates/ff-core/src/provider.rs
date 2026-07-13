@@ -129,6 +129,11 @@ pub enum ProviderKind {
     /// SiliconFlow. Hosted, OpenAI-compatible (`.com` global / `.cn` China); a
     /// bearer API key in the keychain. Served by the OpenAI-compatible provider.
     SiliconFlow,
+    /// OpenRouter. Hosted multi-provider gateway; bearer API key in the keychain.
+    /// Model IDs use `provider/model` format (e.g. `anthropic/claude-sonnet-4-20250514`).
+    /// Uses `ReasoningWire::Reasoning` (the `reasoning` field, not `reasoning_content`).
+    #[serde(rename = "openRouter")]
+    OpenRouter,
 }
 
 impl ProviderKind {
@@ -145,6 +150,7 @@ impl ProviderKind {
             // Global endpoint; `.cn` users override base_url with
             // https://api.siliconflow.cn/v1.
             ProviderKind::SiliconFlow => "https://api.siliconflow.com/v1",
+            ProviderKind::OpenRouter => "https://openrouter.ai/api/v1",
         }
     }
 
@@ -157,6 +163,7 @@ impl ProviderKind {
             ProviderKind::Bedrock => "bedrock",
             ProviderKind::OpenAi => "openai",
             ProviderKind::SiliconFlow => "siliconflow",
+            ProviderKind::OpenRouter => "openrouter",
         }
     }
 
@@ -646,7 +653,8 @@ fn slugify(s: &str) -> String {
 /// - `1` (#633): default reasoning/thinking **off** for local connections and
 ///   flip existing local connections once, so fresh installs are fast on local
 ///   models and pre-#633 connections stop behaving differently from new ones.
-pub const REGISTRY_SCHEMA_VERSION: u32 = 1;
+/// - `2` (#807): seed an OpenRouter connection for existing users.
+pub const REGISTRY_SCHEMA_VERSION: u32 = 2;
 
 impl ProviderRegistry {
     /// Apply any pending one-time migrations to a loaded registry, in memory. Called
@@ -708,13 +716,53 @@ impl ProviderRegistry {
                 }
             }
         }
+        if self.schema_version < 2 {
+            // #807: seed an OpenRouter connection for existing users who don't
+            // already have one (e.g. from a manual openai+vendor:openrouter setup
+            // that the lenient parser preserved as kind=OpenRouter).
+            if !self
+                .connections
+                .iter()
+                .any(|c| c.kind == ProviderKind::OpenRouter)
+            {
+                self.connections.push(Self::default_openrouter_connection());
+            }
+        }
         self.schema_version = REGISTRY_SCHEMA_VERSION;
     }
 }
 
-/// FlowForge's out-of-the-box registry: local candle-vLLM (active) plus a ready
-/// keyless Ollama, so the user can switch between the two local backends with no
-/// setup.
+impl ProviderRegistry {
+    /// The default OpenRouter connection, shared by `Default::default()` and the v2
+    /// migration so both produce the exact same shape.
+    fn default_openrouter_connection() -> ProviderConnection {
+        ProviderConnection {
+            id: "openrouter".to_string(),
+            kind: ProviderKind::OpenRouter,
+            display_name: "OpenRouter".to_string(),
+            vendor: None,
+            base_url: None,
+            model: "anthropic/claude-sonnet-4-20250514".to_string(),
+            has_key: false,
+            secret_missing: false,
+            thinking: ProviderKind::OpenRouter.default_thinking(),
+            reasoning_effort: ReasoningEffort::default(),
+            reasoning_visibility: ReasoningVisibility::default(),
+            warmup_enabled: true,
+            num_ctx: None,
+            region: None,
+            auth_mode: None,
+            aws_profile: None,
+            access_key_id: None,
+            compaction_model: None,
+            compaction_budget: None,
+        }
+    }
+}
+
+/// FlowForge's out-of-the-box registry: local candle-vLLM (active), a ready
+/// keyless Ollama, and a keyless OpenRouter — the user supplies an API key to
+/// activate the hosted providers.
 impl Default for ProviderRegistry {
     fn default() -> Self {
         let candle = ProviderConnection {
@@ -761,7 +809,7 @@ impl Default for ProviderRegistry {
         };
         Self {
             active: candle.id.clone(),
-            connections: vec![candle, ollama],
+            connections: vec![candle, ollama, Self::default_openrouter_connection()],
             schema_version: REGISTRY_SCHEMA_VERSION,
         }
     }

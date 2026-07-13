@@ -40,7 +40,7 @@ fn build_provider(config: &ProviderConfig) -> Box<dyn Provider> {
     let base_url = config.resolved_base_url().to_string();
     // CLI has no per-connection vendor descriptor (#375); the model name is the
     // only signal we have for SiliconFlow GLM/MiniMax detection.
-    let dialect = wire_dialect(config.kind, None, &config.model);
+    let dialect = wire_dialect(config.kind, &config.model);
     // OpenAI-wire reasoning controls (#394), mirroring the desktop's `build_provider`.
     // A no-op except on the SiliconFlow gateway; the effort dial comes from
     // `provider.json` (`reasoning_effort`), defaulting to Medium for legacy files.
@@ -83,6 +83,18 @@ fn build_provider(config: &ProviderConfig) -> Box<dyn Provider> {
         // hosted endpoint will reject -- the same env-var pattern as Bedrock above).
         ProviderKind::SiliconFlow => {
             let key = std::env::var("SILICONFLOW_API_KEY")
+                .ok()
+                .filter(|k| !k.is_empty());
+            Box::new(
+                OpenAiProvider::new(base_url, key)
+                    .with_documents(documents)
+                    .with_dialect(dialect)
+                    .with_reasoning_control(reasoning),
+            )
+        }
+        // OpenRouter is OpenAI-compatible. Bearer key from OPENROUTER_API_KEY.
+        ProviderKind::OpenRouter => {
+            let key = std::env::var("OPENROUTER_API_KEY")
                 .ok()
                 .filter(|k| !k.is_empty());
             Box::new(

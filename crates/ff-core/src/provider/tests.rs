@@ -15,6 +15,7 @@ fn is_local_true_for_local_kinds_only() {
     assert!(!ProviderKind::Bedrock.is_local());
     assert!(!ProviderKind::OpenAi.is_local());
     assert!(!ProviderKind::SiliconFlow.is_local());
+    assert!(!ProviderKind::OpenRouter.is_local());
 }
 
 #[test]
@@ -24,6 +25,7 @@ fn default_thinking_off_for_local_on_for_hosted() {
     assert!(ProviderKind::Bedrock.default_thinking());
     assert!(ProviderKind::OpenAi.default_thinking());
     assert!(ProviderKind::SiliconFlow.default_thinking());
+    assert!(ProviderKind::OpenRouter.default_thinking());
 }
 
 #[test]
@@ -32,16 +34,23 @@ fn default_config_thinking_off_for_local() {
 }
 
 #[test]
-fn default_registry_seeds_local_thinking_off() {
+fn default_registry_seeds_correct_thinking_defaults() {
     let reg = ProviderRegistry::default();
     assert_eq!(reg.schema_version, REGISTRY_SCHEMA_VERSION);
     for conn in &reg.connections {
-        assert!(conn.kind.is_local());
-        assert!(
-            !conn.thinking,
-            "seeded local connection {} should default thinking off",
-            conn.id
-        );
+        if conn.kind.is_local() {
+            assert!(
+                !conn.thinking,
+                "seeded local connection {} should default thinking off",
+                conn.id
+            );
+        } else {
+            assert!(
+                conn.thinking,
+                "seeded hosted connection {} should default thinking on",
+                conn.id
+            );
+        }
     }
 }
 
@@ -118,6 +127,61 @@ fn siliconflow_kind_serializes_camel_case() {
 }
 
 #[test]
+fn openrouter_kind_defaults_endpoint_and_slug() {
+    assert_eq!(
+        ProviderKind::OpenRouter.default_base_url(),
+        "https://openrouter.ai/api/v1"
+    );
+    assert_eq!(ProviderKind::OpenRouter.slug(), "openrouter");
+}
+
+#[test]
+fn openrouter_kind_serializes_camel_case() {
+    let json = serde_json::to_string(&ProviderKind::OpenRouter).unwrap();
+    assert_eq!(json, "\"openRouter\"");
+}
+
+#[test]
+fn migrate_v2_seeds_openrouter_for_existing_users() {
+    let mut reg = ProviderRegistry {
+        active: "ollama".to_string(),
+        connections: vec![blank_conn("Ollama", None, ProviderKind::Ollama)],
+        schema_version: 1,
+    };
+    assert!(!reg
+        .connections
+        .iter()
+        .any(|c| c.kind == ProviderKind::OpenRouter));
+    reg.migrate();
+    assert_eq!(reg.schema_version, REGISTRY_SCHEMA_VERSION);
+    assert!(
+        reg.connections
+            .iter()
+            .any(|c| c.kind == ProviderKind::OpenRouter),
+        "migration v2 must seed an OpenRouter connection"
+    );
+    assert_eq!(reg.connections.len(), 2);
+}
+
+#[test]
+fn migrate_v2_skips_if_openrouter_already_present() {
+    let mut reg = ProviderRegistry {
+        active: "openrouter".to_string(),
+        connections: vec![blank_conn("OpenRouter", None, ProviderKind::OpenRouter)],
+        schema_version: 1,
+    };
+    reg.migrate();
+    assert_eq!(
+        reg.connections
+            .iter()
+            .filter(|c| c.kind == ProviderKind::OpenRouter)
+            .count(),
+        1,
+        "must not duplicate OpenRouter if already present"
+    );
+}
+
+#[test]
 fn resolved_base_url_falls_back_to_kind_default() {
     let cfg = ProviderConfig {
         kind: ProviderKind::Ollama,
@@ -157,9 +221,9 @@ fn legacy_config_without_visibility_defaults_to_all() {
 }
 
 #[test]
-fn default_registry_has_two_local_connections_candle_active() {
+fn default_registry_has_three_connections_candle_active() {
     let reg = ProviderRegistry::default();
-    assert_eq!(reg.connections.len(), 2);
+    assert_eq!(reg.connections.len(), 3);
     assert_eq!(reg.active, "candle-vllm");
     let active = reg.active_connection().expect("active resolves");
     assert_eq!(active.kind, ProviderKind::CandleVllm);
@@ -167,6 +231,10 @@ fn default_registry_has_two_local_connections_candle_active() {
         .connections
         .iter()
         .any(|c| c.kind == ProviderKind::Ollama));
+    assert!(reg
+        .connections
+        .iter()
+        .any(|c| c.kind == ProviderKind::OpenRouter));
 }
 
 // A frozen corpus of historically-persisted `provider-registry.json` shapes.
@@ -319,23 +387,23 @@ fn derive_id_prefers_vendor_then_display_then_kind() {
 fn upsert_appends_with_derived_id_then_edits_in_place() {
     let mut reg = ProviderRegistry::default();
     let stored = reg.upsert(blank_conn(
-        "OpenRouter",
-        Some("openrouter"),
-        ProviderKind::CandleVllm,
+        "My Gateway",
+        Some("my-gateway"),
+        ProviderKind::OpenAi,
     ));
-    assert_eq!(stored.id, "openrouter");
-    assert_eq!(reg.connections.len(), 3);
+    assert_eq!(stored.id, "my-gateway");
+    assert_eq!(reg.connections.len(), 4);
     // Editing the same id replaces in place (no new entry).
     let edited = reg.upsert(ProviderConnection {
         model: "new-model".to_string(),
         ..stored.clone()
     });
     assert_eq!(edited.model, "new-model");
-    assert_eq!(reg.connections.len(), 3);
+    assert_eq!(reg.connections.len(), 4);
     assert_eq!(
         reg.connections
             .iter()
-            .find(|c| c.id == "openrouter")
+            .find(|c| c.id == "my-gateway")
             .unwrap()
             .model,
         "new-model"
@@ -347,8 +415,10 @@ fn remove_rejects_last_and_reassigns_active() {
     let mut reg = ProviderRegistry::default();
     reg.set_active("ollama").unwrap();
     reg.remove("ollama").unwrap();
-    assert_eq!(reg.connections.len(), 1);
+    assert_eq!(reg.connections.len(), 2);
     assert_eq!(reg.active, "candle-vllm");
+    reg.remove("openrouter").unwrap();
+    assert_eq!(reg.connections.len(), 1);
     // Now only one remains -> reject.
     assert!(reg.remove("candle-vllm").is_err());
 }
@@ -357,7 +427,7 @@ fn remove_rejects_last_and_reassigns_active() {
 fn remove_unknown_is_noop() {
     let mut reg = ProviderRegistry::default();
     reg.remove("does-not-exist").unwrap();
-    assert_eq!(reg.connections.len(), 2);
+    assert_eq!(reg.connections.len(), 3);
 }
 
 #[test]

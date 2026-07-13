@@ -304,12 +304,12 @@ fn client_and_decode_errors_are_fatal() {
 fn wire_dialect_defaults_for_local_and_vanilla_gateways() {
     use ff_core::ProviderKind as K;
     for kind in [K::CandleVllm, K::Ollama, K::Bedrock] {
-        let d = wire_dialect(kind, None, "any-model");
+        let d = wire_dialect(kind, "any-model");
         assert_eq!(d.reasoning, ReasoningWire::None, "{kind:?}");
         assert_eq!(d.tool_call_content, ToolCallContent::Omit, "{kind:?}");
     }
     // Vanilla OpenAI (no vendor descriptor) is also a no-op.
-    let d = wire_dialect(K::OpenAi, None, "gpt-4o-mini");
+    let d = wire_dialect(K::OpenAi, "gpt-4o-mini");
     assert_eq!(d.reasoning, ReasoningWire::None);
     assert_eq!(d.tool_call_content, ToolCallContent::Omit);
 }
@@ -320,7 +320,6 @@ fn wire_dialect_siliconflow_replays_reasoning_content() {
     // mode returns intermittent HTTP 400 (code 20015) without this echo.
     let d = wire_dialect(
         ff_core::ProviderKind::SiliconFlow,
-        None,
         "deepseek-ai/DeepSeek-V4-Pro",
     );
     assert_eq!(d.reasoning, ReasoningWire::ReasoningContent);
@@ -332,7 +331,7 @@ fn wire_dialect_siliconflow_glm_minimax_use_empty_string() {
     // Confirmed empirically: GLM-5.2 returns 20015 "content cannot be null"
     // when an assistant tool-call message omits content; "" is accepted.
     for model in ["zai-org/GLM-5.2", "MiniMax/MiniMax-M3"] {
-        let d = wire_dialect(ff_core::ProviderKind::SiliconFlow, None, model);
+        let d = wire_dialect(ff_core::ProviderKind::SiliconFlow, model);
         assert_eq!(d.reasoning, ReasoningWire::ReasoningContent, "{model}");
         assert_eq!(d.tool_call_content, ToolCallContent::EmptyString, "{model}");
     }
@@ -340,14 +339,14 @@ fn wire_dialect_siliconflow_glm_minimax_use_empty_string() {
 
 #[test]
 fn wire_dialect_openrouter_replays_reasoning_field() {
-    // OpenRouter rides the OpenAi kind today; vendor descriptor selects the dialect.
+    // OpenRouter is now a first-class ProviderKind (#807).
     let d = wire_dialect(
-        ff_core::ProviderKind::OpenAi,
-        Some("openrouter"),
-        "anthropic/claude-3.7-sonnet:thinking",
+        ff_core::ProviderKind::OpenRouter,
+        "anthropic/claude-sonnet-4-20250514",
     );
     assert_eq!(d.reasoning, ReasoningWire::Reasoning);
     assert_eq!(d.tool_call_content, ToolCallContent::Omit);
+    assert!(!d.think_tags);
 }
 
 #[test]

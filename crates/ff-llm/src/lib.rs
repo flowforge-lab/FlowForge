@@ -441,16 +441,13 @@ pub struct WireDialect {
     pub think_tags: bool,
 }
 
-/// Resolve a wire dialect from a connection's `(kind, vendor, model)`. Pure,
-/// table-driven; called once at provider build time so the per-turn hot path
-/// only sees a `Copy` struct. The mapping is documented in
-/// `docs/rfcs/0015-provider-wire-dialects.md` §4.
-pub fn wire_dialect(kind: ff_core::ProviderKind, vendor: Option<&str>, model: &str) -> WireDialect {
+/// Resolve a wire dialect from a connection's `(kind, model)`. Pure, table-driven;
+/// called once at provider build time so the per-turn hot path only sees a `Copy`
+/// struct. The mapping is documented in `docs/rfcs/0015-provider-wire-dialects.md` §4.
+pub fn wire_dialect(kind: ff_core::ProviderKind, model: &str) -> WireDialect {
     use ff_core::ProviderKind as K;
     let model_lc = model.to_ascii_lowercase();
     let is_glm_or_minimax = model_lc.contains("glm") || model_lc.contains("minimax");
-    let vendor_lc = vendor.map(|v| v.to_ascii_lowercase());
-    let is_openrouter = vendor_lc.as_deref() == Some("openrouter");
 
     let is_minimax = model_lc.contains("minimax");
 
@@ -466,8 +463,8 @@ pub fn wire_dialect(kind: ff_core::ProviderKind, vendor: Option<&str>, model: &s
             // GLM/Kimi/DeepSeek use reasoning_content correctly — no splitting.
             think_tags: is_minimax,
         },
-        // OpenRouter rides the OpenAi kind today; detect by vendor descriptor.
-        K::OpenAi if is_openrouter => WireDialect {
+        // OpenRouter: reasoning field (not reasoning_content), no think tags.
+        K::OpenRouter => WireDialect {
             reasoning: ReasoningWire::Reasoning,
             tool_call_content: ToolCallContent::Omit,
             think_tags: false,

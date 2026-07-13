@@ -39,6 +39,7 @@ const KIND_META: Record<
   bedrock: { badge: "B", color: "#ff9900", tier: "Hosted" },
   openai: { badge: "AI", color: "#10a37f", tier: "Hosted" },
   siliconFlow: { badge: "SF", color: "#6d28d9", tier: "Hosted" },
+  openRouter: { badge: "OR", color: "#6366f1", tier: "Hosted" },
 };
 
 /** Selectable Bedrock auth modes. `Auto` is intentionally absent — the backend

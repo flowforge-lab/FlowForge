@@ -233,7 +233,7 @@ fn build_provider(conn: &ProviderConnection, model: &str) -> Box<dyn Provider> {
     // Per-gateway wire-dialect choices (#375). Resolved once here so the per-turn
     // hot path only carries a `Copy` struct; defaults are no-ops for vanilla
     // OpenAI / candle-vllm / Ollama / LM Studio.
-    let dialect = wire_dialect(conn.kind, conn.vendor.as_deref(), model);
+    let dialect = wire_dialect(conn.kind, model);
     // Reasoning depth dial (#394/#395). The per-connection user override now
     // drives it: it both caps SiliconFlow's auto-`max` escalation and bounds
     // Bedrock/Anthropic extended thinking. Medium for pre-#395 registries.
@@ -327,6 +327,17 @@ fn build_provider(conn: &ProviderConnection, model: &str) -> Box<dyn Provider> {
                     .with_reasoning_control(reasoning),
             )
         }
+        // OpenRouter is OpenAI-compatible (#807); bearer key from the OS keychain.
+        ProviderKind::OpenRouter => {
+            let key = crate::secrets::get(conn.id.as_str(), SecretKind::ApiKey);
+            Box::new(
+                OpenAiProvider::new(base_url, key)
+                    .with_vision(vision)
+                    .with_documents(documents)
+                    .with_dialect(dialect)
+                    .with_reasoning_control(reasoning),
+            )
+        }
     }
 }
 
@@ -365,6 +376,7 @@ fn display_name_for(kind: ProviderKind) -> String {
         ProviderKind::Bedrock => "Amazon Bedrock",
         ProviderKind::OpenAi => "OpenAI",
         ProviderKind::SiliconFlow => "SiliconFlow",
+        ProviderKind::OpenRouter => "OpenRouter",
     }
     .to_string()
 }
