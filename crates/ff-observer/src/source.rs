@@ -40,13 +40,20 @@ pub struct ObserverSpec {
     pub label: String,
     pub kind: ObserverKind,
     /// Source-specific target. For `file` this is a path (absolute or
-    /// relative to the session root, resolved by the tool). For `http` /
-    /// `process` (Phase 2/3) the interpretation is theirs.
+    /// relative to the session root, resolved by the tool). For `http`
+    /// this is a URL. For `process` (Phase 3) the interpretation is
+    /// theirs.
     pub target: String,
     /// Source-specific filter. For `file` it's a glob that a directory
-    /// watcher uses to limit which children trigger an event. `None`
-    /// means "match everything". Reserved / ignored for other kinds.
+    /// watcher uses to limit which children trigger an event. For
+    /// `http` it's a plain substring the body must contain to fire.
+    /// `None` means "match everything" (for http: always fire on
+    /// change). Reserved / ignored for other kinds.
     pub filter: Option<String>,
+    /// Source-specific cadence. Currently only `http` consumes it:
+    /// `None` means the source picks its own default (60s for http);
+    /// `Some(n)` is clamped to the source's minimum.
+    pub interval_secs: Option<u64>,
 }
 
 /// What the supervisor returns from `list` — the durable, human-readable

@@ -17,6 +17,7 @@
 
 use super::cancel::Cancel;
 use super::file::FileSource;
+use super::http::HttpSource;
 use super::source::{
     ObserverContext, ObserverEvent, ObserverId, ObserverInfo, ObserverKind, ObserverSource,
     ObserverSpec,
@@ -91,6 +92,7 @@ impl ObserverSupervisor {
             kind,
             target,
             filter,
+            interval_secs,
         } = spec;
 
         // Spec validation. The tool does its own arg validation, but
@@ -132,16 +134,17 @@ impl ObserverSupervisor {
         let cancel = Cancel::new();
         let done = Arc::new(Notify::new());
 
-        // Build the source. The factory rejects Phase 2/3 kinds with
-        // an actionable error before any fd / process is opened.
+        // Build the source. The factory rejects unimplemented kinds
+        // with an actionable error before any fd / network call is opened.
         let source: Box<dyn ObserverSource> = match kind {
             ObserverKind::File => Box::new(
                 FileSource::new(ctx, std::path::Path::new(&target), compiled_filter)
                     .map_err(|e| format!("file observer: {e}"))?,
             ),
-            ObserverKind::Http => {
-                return Err("observer kind 'http' is not yet implemented (Phase 2, #892)".into())
-            }
+            ObserverKind::Http => Box::new(
+                HttpSource::new(ctx, &target, interval_secs, filter.clone())
+                    .map_err(|e| format!("http observer: {e}"))?,
+            ),
             ObserverKind::Process => {
                 return Err("observer kind 'process' is not yet implemented (Phase 3, #893)".into())
             }
@@ -336,6 +339,7 @@ mod tests {
             kind: ObserverKind::File,
             target: target.to_string(),
             filter: None,
+            interval_secs: None,
         }
     }
 
@@ -437,6 +441,7 @@ mod tests {
                     kind: ObserverKind::File,
                     target,
                     filter: None,
+                    interval_secs: None,
                 },
                 "s1"
             )
@@ -449,6 +454,7 @@ mod tests {
                     kind: ObserverKind::File,
                     target: "".into(),
                     filter: None,
+                    interval_secs: None,
                 },
                 "s1"
             )
@@ -456,19 +462,49 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn start_rejects_unknown_kind_in_phase1() {
+    async fn start_accepts_http_kind_with_valid_url() {
+        // Phase 2: constructing an http source no longer fails. The
+        // constructor only parses the URL — no network is opened, so
+        // any well-formed URL is enough to assert the supervisor's
+        // factory path no longer rejects.
         let (sup, _rx) = ObserverSupervisor::new();
-        assert!(sup
+        let id = sup
             .start(
                 ObserverSpec {
                     label: "x".into(),
                     kind: ObserverKind::Http,
-                    target: "https://example.com".into(),
+                    target: "https://example.com/".into(),
                     filter: None,
+                    interval_secs: None,
                 },
-                "s1"
+                "s1",
             )
-            .is_err());
+            .expect("http start accepts a parseable URL");
+        // The source is running; stop it to keep the test self-contained.
+        sup.stop(id, "s1").await.expect("stop");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn start_rejects_http_kind_with_invalid_url() {
+        let (sup, _rx) = ObserverSupervisor::new();
+        let err = sup
+            .start(
+                ObserverSpec {
+                    label: "x".into(),
+                    kind: ObserverKind::Http,
+                    target: "not a url".into(),
+                    filter: None,
+                    interval_secs: None,
+                },
+                "s1",
+            )
+            .expect_err("malformed URL must error");
+        assert!(err.to_lowercase().contains("http"), "{err}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn start_rejects_process_kind_until_phase3() {
+        let (sup, _rx) = ObserverSupervisor::new();
         assert!(sup
             .start(
                 ObserverSpec {
@@ -476,6 +512,7 @@ mod tests {
                     kind: ObserverKind::Process,
                     target: "sleep 1".into(),
                     filter: None,
+                    interval_secs: None,
                 },
                 "s1"
             )
@@ -493,6 +530,7 @@ mod tests {
                     kind: ObserverKind::File,
                     target: bogus.to_string_lossy().into_owned(),
                     filter: None,
+                    interval_secs: None,
                 },
                 "s1",
             )
@@ -519,6 +557,7 @@ mod tests {
                     kind: ObserverKind::File,
                     target,
                     filter: None,
+                    interval_secs: None,
                 },
                 "s1",
             )
