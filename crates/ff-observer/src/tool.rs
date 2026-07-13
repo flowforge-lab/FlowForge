@@ -61,13 +61,15 @@ impl Tool for ObserverTool {
     fn description(&self) -> &str {
         "Start, list, and stop background observers that wake the agent when \
          external state changes. Sources: `file` (a file or directory path with \
-         an optional glob filter; uses kqueue/inotify) and `http` (a URL polled on \
+         an optional glob filter; uses kqueue/inotify), `http` (a URL polled on \
          an interval with an optional substring `filter`; wakes when the body \
-         changes — or, with `filter`, when the new body contains the substring). \
-         Observers are session-scoped: each one belongs to the session that started \
-         it and is reaped when that session is deleted. Actions: `start` (begin \
-         watching a target; returns observer_id), `list` (this session's observers), \
-         `stop` (end a watcher)."
+         changes — or, with `filter`, when the new body contains the substring), \
+         and `process` (a numeric process_id returned by `process_manager start`; \
+         wakes when new stdout/stderr bytes match a regex `filter`, with the \
+         matched line in the wake). Observers are session-scoped: each one \
+         belongs to the session that started it and is reaped when that \
+         session is deleted. Actions: `start` (begin watching a target; returns \
+         observer_id), `list` (this session's observers), `stop` (end a watcher)."
     }
 
     fn parameters(&self) -> Value {
@@ -85,16 +87,16 @@ impl Tool for ObserverTool {
                 },
                 "kind": {
                     "type": "string",
-                    "enum": ["file", "http"],
-                    "description": "start: source kind. `file` watches a path; `http` polls a URL."
+                    "enum": ["file", "http", "process"],
+                    "description": "start: source kind. `file` watches a path; `http` polls a URL; `process` observes a running background process (see `process_manager`)."
                 },
                 "target": {
                     "type": "string",
-                    "description": "start: file/directory path (file) or http(s) URL (http). Absolute, or relative to the workspace root for file targets."
+                    "description": "start: file/directory path (file), http(s) URL (http), or numeric process_id (process). File targets are relative to the workspace root; http URLs must be absolute; process ids are integers returned by `process_manager start`."
                 },
                 "filter": {
                     "type": "string",
-                    "description": "start: glob for file directory targets, or a plain substring the http body must contain to fire (http). Plain substring, not regex."
+                    "description": "start: glob for file directory targets, a plain substring the http body must contain (http), or a regex applied to each new stdout/stderr chunk (process). Multi-line patterns should be passed without `(?m)` — the source enables it."
                 },
                 "interval_secs": {
                     "type": "integer",
@@ -151,15 +153,19 @@ impl Tool for ObserverTool {
                     "process" => ObserverKind::Process,
                     other => {
                         return ToolOutcome::error(format!(
-                            "unknown kind '{other}'; expected one of: file, http"
+                            "unknown kind '{other}'; expected one of: file, http, process"
                         ));
                     }
                 };
                 // `target` semantics differ per kind: file sources take
-                // a path that may be relative to the session root, while
+                // a path that may be relative to the session root,
                 // http sources take a URL that must already be absolute
                 // — passing an http URL through `resolve_target` would
                 // join it with the session root and silently corrupt it.
+                // `process` takes the *string* form of a u64 process id
+                // returned by `process_manager start`; passed through
+                // as-is so leading/trailing whitespace is preserved for
+                // the parse in the supervisor.
                 let target_str = if kind == ObserverKind::Http {
                     let Some(t) = args
                         .get("target")
@@ -167,6 +173,17 @@ impl Tool for ObserverTool {
                         .map(|s| s.to_string())
                     else {
                         return ToolOutcome::error("start requires a `target` URL for kind=http");
+                    };
+                    t
+                } else if kind == ObserverKind::Process {
+                    let Some(t) = args
+                        .get("target")
+                        .and_then(Value::as_str)
+                        .map(|s| s.to_string())
+                    else {
+                        return ToolOutcome::error(
+                            "start requires a numeric `target` process_id for kind=process",
+                        );
                     };
                     t
                 } else {
@@ -340,24 +357,23 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn start_unknown_source_errors() {
-        let (dir, tool) = tool_with_supervisor();
-        let target = dir.path().to_string_lossy().into_owned();
+        let (_dir, tool) = tool_with_supervisor();
         let res = tool
             .run(
                 json!({
                     "action": "start",
                     "label": "x",
-                    "kind": "process",
-                    "target": target,
+                    "kind": "totally-not-a-kind",
+                    "target": "1",
                 }),
-                dir.path(),
+                _dir.path(),
             )
             .await;
         assert!(!res.success, "{}", res.content);
-        // The error message should mention Phase 3 so the model
+        // The error message should mention the bad kind so the model
         // can self-correct.
         assert!(
-            res.content.contains("Phase 3") || res.content.contains("not yet implemented"),
+            res.content.contains("unknown kind") || res.content.contains("expected one of"),
             "{}",
             res.content
         );

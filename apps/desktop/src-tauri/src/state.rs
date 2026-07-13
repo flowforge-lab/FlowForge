@@ -1479,10 +1479,19 @@ impl AppState {
         crate::boot_trace_step("app_state.stores_parallel", t.elapsed());
         // Build the observer supervisor and its event receiver
         // together so the supervisor's sender side and the pump's
-        // receiver side are on the same channel (#891 Phase 1).
+        // receiver side are on the same channel (#891 Phase 1). The
+        // observer supervisor also borrows the same
+        // `ProcessSupervisor` `process_manager` uses, so the `process`
+        // observer kind (Phase 3, #893) can subscribe to a running
+        // process's bytes. Build the process supervisor first so the
+        // observer can be wired with it in one expression.
+        let process_supervisor = Arc::new(ProcessSupervisor::new());
         let (observer_supervisor, observer_events_rx) = {
             let (sup, rx) = ObserverSupervisor::new();
-            (Arc::new(sup), rx)
+            (
+                Arc::new(sup.with_process_supervisor(process_supervisor.clone())),
+                rx,
+            )
         };
         let state = Self {
             store,
@@ -1514,7 +1523,7 @@ impl AppState {
             memory_index,
             flush_ledger,
             _memory_watcher: Mutex::new(memory_watcher),
-            process_supervisor: Arc::new(ProcessSupervisor::new()),
+            process_supervisor,
             kernel_supervisor: Arc::new(KernelSupervisor::new()),
             observer_supervisor,
             observer_events_rx: Mutex::new(Some(observer_events_rx)),
