@@ -100,6 +100,16 @@ impl Status {
     }
 }
 
+/// A live event emitted by the broadcast channel on [`Shared`]. Subscribers
+/// receive one event per completed output line, plus a terminal event on exit.
+#[derive(Debug, Clone)]
+pub enum ProcessEvent {
+    /// A complete line of output (without the trailing newline).
+    Output { stream: OutputStream, line: String },
+    /// The process exited — no further events will be sent.
+    Exited { code: Option<i32> },
+}
+
 /// A byte ring with a hard cap; once full, appending drops the oldest bytes and
 /// counts them so `snapshot` can flag the loss.
 struct RingBuffer {
@@ -140,14 +150,19 @@ struct Shared {
     stdout: Mutex<RingBuffer>,
     stderr: Mutex<RingBuffer>,
     status: Mutex<Status>,
+    /// Live event broadcast. Subscribers receive output lines and a terminal
+    /// event on process exit. Zero subscribers is fine — sends are best-effort.
+    events: tokio::sync::broadcast::Sender<ProcessEvent>,
 }
 
 impl Shared {
     fn new(cap: usize) -> Self {
+        let (events, _) = tokio::sync::broadcast::channel(256);
         Self {
             stdout: Mutex::new(RingBuffer::new(cap)),
             stderr: Mutex::new(RingBuffer::new(cap)),
             status: Mutex::new(Status::Running),
+            events,
         }
     }
     fn status(&self) -> Status {
@@ -249,7 +264,12 @@ impl ProcessSupervisor {
                 Ok(es) => es.code().map(Status::Exited).unwrap_or(Status::Killed),
                 Err(e) => Status::Failed(e.to_string()),
             };
+            let code = match &status {
+                Status::Exited(c) => Some(*c),
+                _ => None,
+            };
             *watch.status.lock().unwrap() = status;
+            let _ = watch.events.send(ProcessEvent::Exited { code });
         });
 
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
@@ -291,6 +311,23 @@ impl ProcessSupervisor {
             out.trim_end(),
             err.trim_end()
         ))
+    }
+
+    /// Subscribe to live output events for a background process. Returns a
+    /// receiver that yields [`ProcessEvent`]s as the process emits output lines
+    /// and on exit. Returns `None` if the process doesn't exist or belongs to a
+    /// different session.
+    pub fn subscribe(
+        &self,
+        id: u64,
+        session_id: &str,
+    ) -> Option<tokio::sync::broadcast::Receiver<ProcessEvent>> {
+        let map = self.procs.lock().unwrap();
+        let p = map.get(&id)?;
+        if p.session_id != session_id {
+            return None;
+        }
+        Some(p.shared.events.subscribe())
     }
 
     /// One line per process in `session_id`, oldest id first.
@@ -483,6 +520,12 @@ impl Drop for ProcessSupervisor {
 /// Drain a child pipe into the shared ring until EOF.
 async fn drain<R: AsyncRead + Unpin>(mut reader: R, shared: Arc<Shared>, is_err: bool) {
     let mut buf = [0u8; 4096];
+    let stream = if is_err {
+        OutputStream::Stderr
+    } else {
+        OutputStream::Stdout
+    };
+    let mut line_buf = String::new();
     loop {
         match reader.read(&mut buf).await {
             Ok(0) | Err(_) => break,
@@ -493,8 +536,24 @@ async fn drain<R: AsyncRead + Unpin>(mut reader: R, shared: Arc<Shared>, is_err:
                     &shared.stdout
                 };
                 ring.lock().unwrap().extend(&buf[..n]);
+
+                // Line-split and broadcast to subscribers.
+                let chunk = String::from_utf8_lossy(&buf[..n]);
+                line_buf.push_str(&chunk);
+                while let Some(pos) = line_buf.find('\n') {
+                    let line = line_buf[..pos].to_string();
+                    let _ = shared.events.send(ProcessEvent::Output { stream, line });
+                    line_buf = line_buf[pos + 1..].to_string();
+                }
             }
         }
+    }
+    // Flush any trailing content without a final newline.
+    if !line_buf.is_empty() {
+        let _ = shared.events.send(ProcessEvent::Output {
+            stream,
+            line: line_buf,
+        });
     }
 }
 
@@ -991,5 +1050,90 @@ mod tests {
             streamed.contains("hello_stream"),
             "sink should contain poll output: {streamed}"
         );
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn subscribe_receives_lines_and_exit_event() {
+        use super::ProcessEvent;
+
+        let dir = TempDir::new().unwrap();
+        let sup = ProcessSupervisor::new();
+        let id = sup
+            .start("printf 'line1\nline2\nline3\n'", dir.path(), "s1")
+            .unwrap();
+
+        let mut rx = sup.subscribe(id, "s1").expect("subscribe should succeed");
+
+        let mut lines = Vec::new();
+        let mut got_exit = false;
+        let deadline = Instant::now() + Duration::from_secs(5);
+
+        loop {
+            if Instant::now() > deadline {
+                panic!("timed out waiting for events; got lines: {lines:?}");
+            }
+            match tokio::time::timeout(Duration::from_millis(200), rx.recv()).await {
+                Ok(Ok(ProcessEvent::Output { line, .. })) => lines.push(line),
+                Ok(Ok(ProcessEvent::Exited { .. })) => {
+                    got_exit = true;
+                    break;
+                }
+                Ok(Err(_)) => break, // channel closed
+                Err(_) => continue,  // timeout, retry
+            }
+        }
+
+        assert_eq!(lines, vec!["line1", "line2", "line3"]);
+        assert!(got_exit, "should have received Exited event");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn subscribe_cross_session_returns_none() {
+        let dir = TempDir::new().unwrap();
+        let sup = ProcessSupervisor::new();
+        let id = sup.start("sleep 30", dir.path(), "s1").unwrap();
+
+        assert!(
+            sup.subscribe(id, "s2").is_none(),
+            "cross-session subscribe should return None"
+        );
+        assert!(
+            sup.subscribe(999, "s1").is_none(),
+            "unknown id should return None"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn subscribe_channel_closes_on_stop() {
+        use super::ProcessEvent;
+
+        let dir = TempDir::new().unwrap();
+        let sup = ProcessSupervisor::new();
+        let id = sup.start("sleep 30", dir.path(), "s1").unwrap();
+
+        let mut rx = sup.subscribe(id, "s1").expect("subscribe should succeed");
+
+        // Give process a moment to start.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Stop the process — this should close the broadcast after Exited is sent.
+        let _ = sup.stop(id, "s1").await;
+
+        // Drain remaining events — we should get an Exited and then the channel closes.
+        let mut got_exit = false;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if Instant::now() > deadline {
+                break;
+            }
+            match tokio::time::timeout(Duration::from_millis(200), rx.recv()).await {
+                Ok(Ok(ProcessEvent::Exited { .. })) => {
+                    got_exit = true;
+                }
+                Ok(Err(_)) => break, // channel closed — expected
+                Ok(Ok(_)) => continue,
+                Err(_) => break, // timeout
+            }
+        }
+        assert!(got_exit, "should have received Exited event on stop");
     }
 }
