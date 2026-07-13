@@ -19,6 +19,7 @@ export {
   CalendarClock,
   Check,
   ChevronDown,
+  ChevronLeft,
   ChevronRight,
   ChevronUp,
   ChevronsUpDown,

@@ -6,6 +6,7 @@ import {
   buildFiles,
   buildJournal,
   categoryMatches,
+  clampCategoryBody,
   filterChunks,
   filterFiles,
   filterJournal,
@@ -13,9 +14,11 @@ import {
   formatBytes,
   formatMemoryFooter,
   humanAge,
+  matchingCategoryIds,
   parseCategories,
   sortChunks,
   weightPercent,
+  type MemoryCategories,
 } from "@/lib/memory-view";
 
 const CURATED = `# Memory
@@ -265,5 +268,61 @@ describe("memory-view — salience helpers (M6.2, #293)", () => {
     ]);
     expect(filterChunks(chunks, "")).toHaveLength(2);
     expect(filterChunks(chunks, "nope")).toHaveLength(0);
+  });
+});
+
+describe("clampCategoryBody", () => {
+  it("returns the body untouched when at or under the line limit", () => {
+    const body = Array.from({ length: 12 }, (_, i) => `line ${i}`).join("\n");
+    expect(clampCategoryBody(body)).toEqual({
+      preview: body,
+      truncated: false,
+    });
+  });
+
+  it("truncates to maxLines and flags it", () => {
+    const lines = Array.from({ length: 20 }, (_, i) => `line ${i}`);
+    const { preview, truncated } = clampCategoryBody(lines.join("\n"));
+    expect(truncated).toBe(true);
+    expect(preview).toBe(lines.slice(0, 12).join("\n"));
+  });
+
+  it("treats an empty body as not truncated", () => {
+    expect(clampCategoryBody("")).toEqual({ preview: "", truncated: false });
+  });
+
+  it("respects a custom maxLines", () => {
+    const lines = Array.from({ length: 5 }, (_, i) => `line ${i}`);
+    const { preview, truncated } = clampCategoryBody(lines.join("\n"), 3);
+    expect(truncated).toBe(true);
+    expect(preview).toBe(lines.slice(0, 3).join("\n"));
+  });
+});
+
+describe("matchingCategoryIds", () => {
+  const categories: MemoryCategories = {
+    identity: "alpha",
+    patterns: "beta keyword",
+    focus: "",
+  };
+
+  it("returns all ids for an empty query", () => {
+    expect(matchingCategoryIds(categories, "")).toEqual([
+      "identity",
+      "patterns",
+      "focus",
+    ]);
+  });
+
+  it("filters to categories whose body contains the query", () => {
+    expect(matchingCategoryIds(categories, "keyword")).toEqual(["patterns"]);
+  });
+
+  it("excludes an empty category from a non-empty query", () => {
+    expect(matchingCategoryIds(categories, "anything")).not.toContain("focus");
+  });
+
+  it("returns an empty array when nothing matches", () => {
+    expect(matchingCategoryIds(categories, "nope")).toEqual([]);
   });
 });
