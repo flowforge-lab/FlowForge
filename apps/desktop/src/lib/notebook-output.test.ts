@@ -214,6 +214,115 @@ describe("parseNotebookStep", () => {
   });
 });
 
+describe("parseNotebookStep — Phase 3 FF_NB_META trailer (#879)", () => {
+  it("strips the trailer and populates images for a run_cell figure", () => {
+    const trailer =
+      '\n<<<FF_NB_META\n{"images":[{"path":"/tmp/flowforge-notebook/kernel-ab12/fig1.png","mediaType":"image/png"}],"variables":[]}\nFF_NB_META\n';
+    const parsed = parseNotebookStep(
+      "notebook_runner",
+      { action: "run_cell", code: "plt.plot([1,2,3])" },
+      `plotted.${trailer}`,
+      "done",
+    );
+    expect(parsed?.output).toBe("plotted.");
+    expect(parsed?.errored).toBe(false);
+    expect(parsed?.images).toEqual([
+      {
+        path: "/tmp/flowforge-notebook/kernel-ab12/fig1.png",
+        mediaType: "image/png",
+      },
+    ]);
+    // The trailer JSON always carries both keys (one may be empty) — the
+    // parser attaches them together as one payload rather than omitting the
+    // empty side, so this is `[]`, not `undefined`.
+    expect(parsed?.variables).toEqual([]);
+  });
+
+  it("strips the trailer and populates variables for an inspect dump", () => {
+    const trailer =
+      '\n<<<FF_NB_META\n{"images":[],"variables":[{"name":"df","type":"DataFrame","repr":"<5 rows>"}]}\nFF_NB_META\n';
+    const parsed = parseNotebookStep(
+      "notebook_runner",
+      { action: "inspect" },
+      `1 variable(s) in scope:\n  df: DataFrame = <5 rows>${trailer}`,
+      "done",
+    );
+    expect(parsed?.action).toBe("inspect");
+    expect(parsed?.output).toBe(
+      "1 variable(s) in scope:\n  df: DataFrame = <5 rows>",
+    );
+    expect(parsed?.variables).toEqual([
+      { name: "df", type: "DataFrame", repr: "<5 rows>" },
+    ]);
+    // Same reasoning as above, mirrored: `images` is `[]`, not `undefined`.
+    expect(parsed?.images).toEqual([]);
+  });
+
+  it("populates both images and variables when a single trailer carries both", () => {
+    const trailer =
+      '\n<<<FF_NB_META\n{"images":[{"path":"/tmp/fig.png","mediaType":"image/png"}],"variables":[{"name":"x","repr":"5"}]}\nFF_NB_META\n';
+    const parsed = parseNotebookStep(
+      "notebook_runner",
+      { action: "run_cell", code: "x = 5; plt.plot([x])" },
+      `ok${trailer}`,
+      "done",
+    );
+    expect(parsed?.images).toEqual([
+      { path: "/tmp/fig.png", mediaType: "image/png" },
+    ]);
+    // `type` is optional on NotebookVariable — omitted here on purpose.
+    expect(parsed?.variables).toEqual([{ name: "x", repr: "5" }]);
+  });
+
+  it("leaves images/variables undefined when there is no trailer (regression)", () => {
+    const parsed = parseNotebookStep(
+      "notebook_runner",
+      { action: "run_cell", code: "print(1)" },
+      "1\n",
+      "done",
+    );
+    expect(parsed?.output).toBe("1");
+    expect(parsed?.images).toBeUndefined();
+    expect(parsed?.variables).toBeUndefined();
+  });
+
+  it("degrades to plain text when the FF_NB_META payload is malformed JSON", () => {
+    const badTrailer = "\n<<<FF_NB_META\n{not valid json\nFF_NB_META\n";
+    const parsed = parseNotebookStep(
+      "notebook_runner",
+      { action: "run_cell", code: "print(1)" },
+      `1${badTrailer}`,
+      "done",
+    );
+    expect(parsed?.images).toBeUndefined();
+    expect(parsed?.variables).toBeUndefined();
+    // Malformed trailer is left in place rather than silently eaten — the
+    // user can still read what the backend sent.
+    expect(parsed?.output).toContain("FF_NB_META");
+  });
+
+  it("strips the meta trailer before detecting the exception trailer (ordering)", () => {
+    // The backend appends the meta trailer *after* the exception trailer, so
+    // the parser must strip it first or the exception check never matches.
+    const trailer =
+      '\n<<<FF_NB_META\n{"images":[{"path":"/tmp/partial.png","mediaType":"image/png"}],"variables":[]}\nFF_NB_META\n';
+    const parsed = parseNotebookStep(
+      "notebook_runner",
+      { action: "run_cell", code: "plt.plot([1]); 1/0" },
+      `Traceback...\nZeroDivisionError: division by zero\n[cell raised an exception]${trailer}`,
+      "done",
+    );
+    expect(parsed?.errored).toBe(true);
+    expect(parsed?.parsedExceptionTrailer).toBe(true);
+    expect(parsed?.output).toContain("ZeroDivisionError");
+    expect(parsed?.output).not.toContain("[cell raised an exception]");
+    expect(parsed?.output).not.toContain("FF_NB_META");
+    expect(parsed?.images).toEqual([
+      { path: "/tmp/partial.png", mediaType: "image/png" },
+    ]);
+  });
+});
+
 describe("parseKernelStatus", () => {
   it("parses a live kernel line", () => {
     const s = parseKernelStatus(
