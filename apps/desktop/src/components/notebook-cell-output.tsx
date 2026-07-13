@@ -99,6 +99,19 @@ function NotebookCellBody({
   );
 }
 
+// Convert raw bytes to a base64 string. Chunked so we don't build the binary
+// string one char at a time (immutable-string concat is O(n²) and stutters on
+// a 500KB+ figure); each chunk is small enough to spread into
+// `String.fromCharCode` without blowing the argument-count limit.
+function bytesToBase64(bytes: Uint8Array): string {
+  const CHUNK = 8192;
+  const parts: string[] = [];
+  for (let i = 0; i < bytes.length; i += CHUNK) {
+    parts.push(String.fromCharCode(...bytes.subarray(i, i + CHUNK)));
+  }
+  return btoa(parts.join(""));
+}
+
 /** Read one image file's bytes and build a `data:` URI. `null` on any
  *  failure (no Tauri runtime, file gone, read error) — the caller skips it. */
 async function readImageAsDataUrl(
@@ -107,9 +120,7 @@ async function readImageAsDataUrl(
   try {
     const { readFile } = await import("@tauri-apps/plugin-fs");
     const bytes = await readFile(img.path);
-    let binary = "";
-    for (const b of bytes) binary += String.fromCharCode(b);
-    return `data:${img.mediaType};base64,${btoa(binary)}`;
+    return `data:${img.mediaType};base64,${bytesToBase64(bytes)}`;
   } catch {
     return null;
   }
