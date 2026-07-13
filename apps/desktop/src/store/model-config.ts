@@ -81,6 +81,8 @@ function defaultConnection(kind: ProviderKind): ProviderConnection {
       return { ...base, displayName: "OpenAI" };
     case "siliconFlow":
       return { ...base, displayName: "SiliconFlow" };
+    case "openRouter":
+      return { ...base, displayName: "OpenRouter" };
   }
 }
 

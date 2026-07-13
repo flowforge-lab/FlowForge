@@ -86,8 +86,9 @@ fn legacy_provider_json_is_migrated_into_registry() {
     .unwrap();
     let loaded = load_registry_at(None, Some(cfg_path));
     assert_eq!(loaded.active, "ollama");
-    // Migrated active plus the seeded non-ollama local backend (candle-vllm).
-    assert_eq!(loaded.connections.len(), 2);
+    // Migrated active (ollama) plus the seeded candle-vllm local backend and the
+    // seeded OpenRouter connection (v2 migration, #807).
+    assert_eq!(loaded.connections.len(), 3);
     // The active connection inherits the legacy model.
     let active = loaded
         .connections

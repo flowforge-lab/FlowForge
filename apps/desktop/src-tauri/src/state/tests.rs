@@ -1187,7 +1187,8 @@ fn migration_makes_saved_candle_provider_active_and_seeds_ollama_inactive() {
         .unwrap();
     assert_ne!(reg.active, ollama.id);
     assert!(!ollama.has_key);
-    assert_eq!(reg.connections.len(), 2);
+    // Migrated candle + seeded ollama + seeded OpenRouter (v2 migration, #807).
+    assert_eq!(reg.connections.len(), 3);
 }
 
 #[test]
@@ -1206,7 +1207,8 @@ fn migration_makes_saved_ollama_provider_active_and_seeds_candle_inactive() {
         .connections
         .iter()
         .any(|c| c.kind == ProviderKind::CandleVllm));
-    assert_eq!(reg.connections.len(), 2);
+    // Migrated ollama + seeded candle + seeded OpenRouter (v2 migration, #807).
+    assert_eq!(reg.connections.len(), 3);
 }
 
 #[test]
@@ -1331,8 +1333,8 @@ fn load_preserves_profile_auth_bedrock_connection_verbatim() {
     // Neither connection is dropped, and Bedrock stays active.
     assert_eq!(
         loaded.connections.len(),
-        2,
-        "both connections must survive load"
+        3,
+        "both connections survive load, plus the seeded OpenRouter (v2 migration, #807)"
     );
     assert_eq!(loaded.active, "aws-bedrock");
 
@@ -1603,7 +1605,8 @@ fn partially_corrupt_registry_salvages_good_connection() {
         ProviderRegistry::default(),
         "a partially-bad registry must not wipe to the Candle default"
     );
-    assert_eq!(loaded.connections.len(), 1);
+    // Salvaged bedrock + seeded OpenRouter (v2 migration, #807).
+    assert_eq!(loaded.connections.len(), 2);
     assert_eq!(loaded.connections[0].id, "bedrock-opus");
     assert_eq!(loaded.active, "bedrock-opus");
     // A salvaged registry is a clean load, not a quarantine.
@@ -1641,7 +1644,8 @@ fn load_recovers_from_newest_valid_backup_among_corrupt_baks() {
     let loaded = load_or_migrate_registry_at(Some(reg_path.clone()), None);
 
     assert_eq!(loaded.active, "middle");
-    assert_eq!(loaded.connections.len(), 1);
+    // Recovered backup + seeded OpenRouter (v2 migration, #807).
+    assert_eq!(loaded.connections.len(), 2);
     assert_eq!(loaded.connections[0].model, "llama3");
 }
 
@@ -1683,7 +1687,8 @@ fn load_recovers_from_backup_when_registry_completely_absent() {
     let loaded = load_or_migrate_registry_at(Some(reg_path), None);
 
     assert_eq!(loaded.active, "backup");
-    assert_eq!(loaded.connections.len(), 1);
+    // Recovered backup + seeded OpenRouter (v2 migration, #807).
+    assert_eq!(loaded.connections.len(), 2);
     assert_eq!(loaded.connections[0].kind, ff_core::ProviderKind::OpenAi);
 }
 
@@ -1731,8 +1736,8 @@ fn set_provider_config_shim_mutates_active_connection_in_place() {
         ..Default::default()
     });
     let reg = state.provider_registry();
-    // No new connection; the active one is edited in place.
-    assert_eq!(reg.connections.len(), 2);
+    // No new connection; the active one is edited in place (default seeds candle + ollama + OpenRouter).
+    assert_eq!(reg.connections.len(), 3);
     let active = reg.active_connection().unwrap();
     assert_eq!(active.id, "candle-vllm");
     assert_eq!(active.model, "edited");
@@ -1819,10 +1824,10 @@ fn upsert_and_remove_connection_round_trip() {
     let state = AppState::with_registry(ProviderRegistry::default());
     let stored = state.upsert_connection(ProviderConnection {
         id: String::new(),
-        kind: ProviderKind::CandleVllm,
-        display_name: "OpenRouter".into(),
-        vendor: Some("openrouter".into()),
-        base_url: Some("https://openrouter.ai/api/v1".into()),
+        kind: ProviderKind::OpenAi,
+        display_name: "My Gateway".into(),
+        vendor: Some("my-gateway".into()),
+        base_url: Some("https://gateway.example/v1".into()),
         model: "x".into(),
         has_key: false,
         secret_missing: false,
@@ -1838,10 +1843,10 @@ fn upsert_and_remove_connection_round_trip() {
         compaction_model: None,
         compaction_budget: None,
     });
-    assert_eq!(stored.id, "openrouter");
+    assert_eq!(stored.id, "my-gateway");
+    assert_eq!(state.provider_registry().connections.len(), 4);
+    state.remove_connection("my-gateway").unwrap();
     assert_eq!(state.provider_registry().connections.len(), 3);
-    state.remove_connection("openrouter").unwrap();
-    assert_eq!(state.provider_registry().connections.len(), 2);
 }
 
 fn has_key_of(state: &AppState, id: &str) -> bool {
