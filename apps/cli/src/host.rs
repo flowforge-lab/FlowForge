@@ -40,7 +40,7 @@ fn build_provider(config: &ProviderConfig) -> Box<dyn Provider> {
     let base_url = config.resolved_base_url().to_string();
     // CLI has no per-connection vendor descriptor (#375); the model name is the
     // only signal we have for SiliconFlow GLM/MiniMax detection.
-    let dialect = wire_dialect(config.kind, None, &config.model);
+    let dialect = wire_dialect(config.kind, &config.model);
     // OpenAI-wire reasoning controls (#394), mirroring the desktop's `build_provider`.
     // A no-op except on the SiliconFlow gateway; the effort dial comes from
     // `provider.json` (`reasoning_effort`), defaulting to Medium for legacy files.

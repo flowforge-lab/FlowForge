@@ -441,15 +441,10 @@ pub struct WireDialect {
     pub think_tags: bool,
 }
 
-/// Resolve a wire dialect from a connection's `(kind, vendor, model)`. Pure,
-/// table-driven; called once at provider build time so the per-turn hot path
-/// only sees a `Copy` struct. The mapping is documented in
-/// `docs/rfcs/0015-provider-wire-dialects.md` §4.
-pub fn wire_dialect(
-    kind: ff_core::ProviderKind,
-    _vendor: Option<&str>,
-    model: &str,
-) -> WireDialect {
+/// Resolve a wire dialect from a connection's `(kind, model)`. Pure, table-driven;
+/// called once at provider build time so the per-turn hot path only sees a `Copy`
+/// struct. The mapping is documented in `docs/rfcs/0015-provider-wire-dialects.md` §4.
+pub fn wire_dialect(kind: ff_core::ProviderKind, model: &str) -> WireDialect {
     use ff_core::ProviderKind as K;
     let model_lc = model.to_ascii_lowercase();
     let is_glm_or_minimax = model_lc.contains("glm") || model_lc.contains("minimax");

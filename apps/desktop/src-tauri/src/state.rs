@@ -233,7 +233,7 @@ fn build_provider(conn: &ProviderConnection, model: &str) -> Box<dyn Provider> {
     // Per-gateway wire-dialect choices (#375). Resolved once here so the per-turn
     // hot path only carries a `Copy` struct; defaults are no-ops for vanilla
     // OpenAI / candle-vllm / Ollama / LM Studio.
-    let dialect = wire_dialect(conn.kind, conn.vendor.as_deref(), model);
+    let dialect = wire_dialect(conn.kind, model);
     // Reasoning depth dial (#394/#395). The per-connection user override now
     // drives it: it both caps SiliconFlow's auto-`max` escalation and bounds
     // Bedrock/Anthropic extended thinking. Medium for pre-#395 registries.

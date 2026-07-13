@@ -74,6 +74,9 @@ pub enum ProviderKindArg {
     /// `siliconflow`: the kebab-case form matches the slug, the issue's
     /// examples, and the registry's `vendor` descriptor.
     Siliconflow,
+    /// `openrouter`: matches the slug and the registry's serde tag.
+    #[clap(name = "openrouter")]
+    Openrouter,
 }
 
 impl From<ProviderKindArg> for ProviderKind {
@@ -82,6 +85,7 @@ impl From<ProviderKindArg> for ProviderKind {
             ProviderKindArg::Bedrock => ProviderKind::Bedrock,
             ProviderKindArg::OpenAi => ProviderKind::OpenAi,
             ProviderKindArg::Siliconflow => ProviderKind::SiliconFlow,
+            ProviderKindArg::Openrouter => ProviderKind::OpenRouter,
         }
     }
 }
