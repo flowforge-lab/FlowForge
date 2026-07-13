@@ -4,6 +4,7 @@ import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { NotebookStatusPanel } from "@/components/notebook-status-panel";
+import { ipc } from "@/lib/ipc";
 import type { NotebookKernelState } from "@/bindings/NotebookKernelState";
 import {
   NOTEBOOK_POLL_DEFAULT_MS,
@@ -54,6 +55,7 @@ afterEach(() => {
   act(() => root.unmount());
   container.remove();
   vi.useRealTimers();
+  vi.restoreAllMocks();
 });
 
 describe("NotebookStatusPanel (#871 FE-1)", () => {
@@ -183,6 +185,122 @@ describe("NotebookStatusPanel (#871 FE-1)", () => {
       stopBtn?.click();
     });
     expect(stopSpy).toHaveBeenCalledWith("s1");
+  });
+
+  it("shows a Restart button while running and while dead (#871 FE-2)", () => {
+    act(() => {
+      useNotebookStore.setState({
+        bySession: {
+          s1: snapshot({
+            sessionId: "s1",
+            hasKernel: true,
+            state: "dead",
+            kernelId: "kernel-bbbb",
+            executionCount: 4,
+          }),
+        },
+      });
+    });
+    renderPanel("s1");
+    // A dead kernel still offers Restart (respawns), even though Stop is gone.
+    expect(
+      container.querySelector(
+        "button[title='Restart the kernel (discards its state)']",
+      ),
+    ).not.toBeNull();
+    expect(
+      container.querySelector("button[title='Stop the kernel']"),
+    ).toBeNull();
+  });
+
+  it("clicking Restart opens a confirm; confirming calls store.restart with the kernel id", async () => {
+    const live = snapshot({
+      sessionId: "s1",
+      hasKernel: true,
+      state: "running",
+      kernelId: "kernel-aaaa",
+      executionCount: 2,
+    });
+    // Keep the hydrate-on-mount from clobbering the seeded kernel back to
+    // "no kernel" (the default MockIpc answer for an unseeded session), which
+    // would collapse the panel to NoKernelRow and unmount the dialog.
+    vi.spyOn(ipc, "notebookStatus").mockResolvedValue(live);
+    act(() => {
+      useNotebookStore.setState({ bySession: { s1: live } });
+    });
+    renderPanel("s1");
+
+    const restartSpy = vi.fn(async () => {});
+    act(() => {
+      useNotebookStore.setState(
+        (s) => ({ ...s, restart: restartSpy }) as never,
+      );
+    });
+
+    // No confirm dialog until the header button is clicked.
+    expect(
+      document.querySelector("[data-slot='alert-dialog-content']"),
+    ).toBeNull();
+
+    const restartBtn = container.querySelector<HTMLButtonElement>(
+      "button[title='Restart the kernel (discards its state)']",
+    );
+    await act(async () => {
+      restartBtn?.click();
+    });
+
+    const dialog = document.querySelector("[data-slot='alert-dialog-content']");
+    expect(dialog).not.toBeNull();
+    expect(dialog?.textContent).toContain("Restart the kernel?");
+
+    // The dialog's confirm action (not the header trigger) drives the restart.
+    const confirm = Array.from(
+      dialog?.querySelectorAll<HTMLButtonElement>("button") ?? [],
+    ).find((b) => b.textContent?.trim() === "Restart");
+    expect(confirm).not.toBeUndefined();
+    await act(async () => {
+      confirm?.click();
+    });
+    expect(restartSpy).toHaveBeenCalledWith("s1", "kernel-aaaa");
+  });
+
+  it("canceling the confirm does not call restart", async () => {
+    const live = snapshot({
+      sessionId: "s1",
+      hasKernel: true,
+      state: "running",
+      kernelId: "kernel-aaaa",
+      executionCount: 2,
+    });
+    vi.spyOn(ipc, "notebookStatus").mockResolvedValue(live);
+    act(() => {
+      useNotebookStore.setState({ bySession: { s1: live } });
+    });
+    renderPanel("s1");
+
+    const restartSpy = vi.fn(async () => {});
+    act(() => {
+      useNotebookStore.setState(
+        (s) => ({ ...s, restart: restartSpy }) as never,
+      );
+    });
+
+    await act(async () => {
+      container
+        .querySelector<HTMLButtonElement>(
+          "button[title='Restart the kernel (discards its state)']",
+        )
+        ?.click();
+    });
+
+    const dialog = document.querySelector("[data-slot='alert-dialog-content']");
+    const cancel = Array.from(
+      dialog?.querySelectorAll<HTMLButtonElement>("button") ?? [],
+    ).find((b) => b.textContent?.trim() === "Cancel");
+    await act(async () => {
+      cancel?.click();
+    });
+    expect(restartSpy).not.toHaveBeenCalled();
   });
 
   it("polls notebook_status while running, using the experimental cadence", async () => {

@@ -95,6 +95,10 @@ describe("useNotebookStore", () => {
 
       await useNotebookStore.getState().stop("s1");
       expect(stopIpc).not.toHaveBeenCalled();
+
+      const restartIpc = vi.spyOn(ipc, "notebookRestart");
+      await useNotebookStore.getState().restart("s1");
+      expect(restartIpc).not.toHaveBeenCalled();
     });
   });
 
@@ -159,6 +163,37 @@ describe("useNotebookStore", () => {
     it("propagates the backend rejection", async () => {
       vi.spyOn(ipc, "notebookStop").mockRejectedValue(new Error("not allowed"));
       await expect(useNotebookStore.getState().stop("s1")).rejects.toThrow(
+        "not allowed",
+      );
+    });
+  });
+
+  describe("restart", () => {
+    it("writes the post-restart snapshot straight into bySession (no extra status call)", async () => {
+      // The command returns the fresh snapshot, so the store writes it directly
+      // rather than round-tripping through `notebookStatus`.
+      const fresh = snapshot({
+        sessionId: "s1",
+        hasKernel: true,
+        state: "running",
+        kernelId: "kernel-bbbb",
+        executionCount: 0,
+      });
+      const restart = vi.spyOn(ipc, "notebookRestart").mockResolvedValue(fresh);
+      const status = vi.spyOn(ipc, "notebookStatus");
+
+      await useNotebookStore.getState().restart("s1", "kernel-aaaa");
+
+      expect(restart).toHaveBeenCalledWith("s1", "kernel-aaaa");
+      expect(status).not.toHaveBeenCalled();
+      expect(useNotebookStore.getState().bySession.s1).toEqual(fresh);
+    });
+
+    it("propagates the backend rejection", async () => {
+      vi.spyOn(ipc, "notebookRestart").mockRejectedValue(
+        new Error("not allowed"),
+      );
+      await expect(useNotebookStore.getState().restart("s1")).rejects.toThrow(
         "not allowed",
       );
     });
