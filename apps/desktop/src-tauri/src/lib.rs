@@ -706,12 +706,35 @@ async fn notebook_status(
 }
 
 /// Stop the session's `notebook_runner` kernel(s) — the panel's Stop button
-/// (#871). Idempotent: a no-op when the session has no kernel. The FE follows
-/// up with `notebook_status` to render the post-stop ("no kernel") snapshot.
+/// (#871). With no `kernel_id`, reaps the whole session (FE-1 Stop, back-compat);
+/// with a `kernel_id`, stops just that kernel — the multi-kernel switcher's
+/// per-tab Stop (#871 FE-2 / #923). Idempotent: a no-op when the target kernel is
+/// already gone. The FE follows up with `notebook_status` to render the result.
 #[tauri::command]
-async fn notebook_stop(state: State<'_, Arc<AppState>>, session_id: String) -> Result<(), String> {
-    state.notebook_stop(&session_id).await;
+async fn notebook_stop(
+    state: State<'_, Arc<AppState>>,
+    session_id: String,
+    kernel_id: Option<String>,
+) -> Result<(), String> {
+    state.notebook_stop(&session_id, kernel_id.as_deref()).await;
     Ok(())
+}
+
+/// Restart a session's `notebook_runner` kernel (the panel's Restart button,
+/// #871 FE-2 / #922): stop the current kernel and spawn a fresh one, discarding
+/// all in-kernel state (a new kernel id, execution count reset to 0). Returns
+/// the post-restart snapshot so the FE renders the fresh kernel without a
+/// follow-up `notebook_status`. `kernel_id` targets a specific kernel when
+/// given (forward-compat for Phase 3 multi-kernel), else the representative one.
+#[tauri::command]
+async fn notebook_restart(
+    state: State<'_, Arc<AppState>>,
+    session_id: String,
+    kernel_id: Option<String>,
+) -> Result<NotebookKernelState, String> {
+    state
+        .notebook_restart(&session_id, kernel_id.as_deref())
+        .await
 }
 
 /// Fire a scheduled task immediately, off-schedule (RFC 0017 §8.3). Runs the
@@ -3576,6 +3599,7 @@ pub fn run() {
             goal_complete,
             notebook_status,
             notebook_stop,
+            notebook_restart,
             preview_cadence,
             get_session_workspace,
             set_session_workspace,

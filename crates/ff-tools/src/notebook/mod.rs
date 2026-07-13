@@ -68,6 +68,51 @@ pub struct NotebookKernelState {
     /// The full canonical status text (`kernel <id> — <state>; pid=…; cells
     /// executed=…`, one line per kernel). Empty when there is no kernel.
     pub raw: String,
+    /// Every kernel in the session, structured (Phase 3 multi-kernel switcher,
+    /// #871 FE-2 / #923). Sorted by kernel id, so the FE renders a stable tab
+    /// order. `None` when the session has no kernel; otherwise one entry per
+    /// kernel (the FE shows tabs only when there's more than one). The
+    /// representative fields above still describe one of these (a live kernel if
+    /// any) for the single-kernel panel contract; `kernels` is the superset for
+    /// the switcher. Optional on the wire so a consumer that only needs the
+    /// representative can ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub kernels: Option<Vec<KernelInfo>>,
+}
+
+/// One kernel's structured state within a session — the per-tab data for the
+/// multi-kernel switcher (#871 FE-2 / #923). Mirrors the per-kernel fields the
+/// representative exposes on [`NotebookKernelState`], but for every kernel.
+#[derive(Debug, Clone, PartialEq, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "../../../apps/desktop/src/bindings/")]
+pub struct KernelInfo {
+    /// The kernel's id (e.g. `kernel-abcd1234`).
+    pub kernel_id: String,
+    /// The kernel's lifecycle (`running` / `dead`).
+    pub state: KernelLiveState,
+    /// The kernel's process id; null when unavailable.
+    pub pid: Option<u32>,
+    /// Cells this kernel has executed so far.
+    #[ts(type = "number")]
+    pub execution_count: u64,
+}
+
+impl KernelInfo {
+    /// Project a live [`KernelState`] onto the FE-facing structured shape.
+    fn of(k: &KernelState) -> Self {
+        Self {
+            kernel_id: k.kernel_id.clone(),
+            state: if k.dead {
+                KernelLiveState::Dead
+            } else {
+                KernelLiveState::Running
+            },
+            pid: k.pid(),
+            execution_count: k.execution_count,
+        }
+    }
 }
 
 /// Per-cell result from a `run_all` invocation.
@@ -163,7 +208,10 @@ impl KernelSupervisor {
     /// Restart a kernel: stop the existing one and spawn a fresh replacement,
     /// preserving the session mapping (a new kernel id is assigned). The old
     /// namespace is gone by design — that is the point of a restart.
-    async fn restart(
+    ///
+    /// `pub` so the desktop `notebook_restart` command can drive it directly
+    /// (mirrors [`snapshot`](Self::snapshot)); also used by the tool dispatch.
+    pub async fn restart(
         &self,
         session_id: &str,
         kernel_id: Option<&str>,
@@ -246,6 +294,7 @@ impl KernelSupervisor {
                 pid: None,
                 execution_count: 0,
                 raw: String::new(),
+                kernels: None,
             },
             Some(session) => {
                 let mut entries: Vec<&KernelState> = session.values().collect();
@@ -257,6 +306,9 @@ impl KernelSupervisor {
                     .copied()
                     .find(|k| !k.dead)
                     .unwrap_or(entries[0]);
+                // Structured per-kernel list (switcher, #923), same sorted order
+                // as `raw`.
+                let kernels = Some(entries.iter().map(|k| KernelInfo::of(k)).collect());
                 NotebookKernelState {
                     session_id: session_id.to_string(),
                     has_kernel: true,
@@ -269,13 +321,17 @@ impl KernelSupervisor {
                     pid: rep.pid(),
                     execution_count: rep.execution_count,
                     raw: Self::render_status(session),
+                    kernels,
                 }
             }
         }
     }
 
-    /// Stop one kernel (resolved from `kernel_id`) in a session.
-    async fn stop(&self, session_id: &str, kernel_id: Option<&str>) -> Result<String, String> {
+    /// Stop one kernel (resolved from `kernel_id`) in a session. `pub` so the
+    /// desktop `notebook_stop` command can target a single kernel (the switcher's
+    /// per-tab Stop, #871 FE-2 / #923); session-wide teardown still goes through
+    /// [`reap_session`](Self::reap_session).
+    pub async fn stop(&self, session_id: &str, kernel_id: Option<&str>) -> Result<String, String> {
         let mut kernels = self.kernels.lock().await;
         let session = kernels
             .get_mut(session_id)
