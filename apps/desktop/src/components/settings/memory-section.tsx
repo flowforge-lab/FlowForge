@@ -62,7 +62,7 @@ function CategoryCard({
     <div className="rounded-md border border-border bg-muted/40 p-3">
       <div className="text-[12px] font-medium text-foreground">{label}</div>
       <div className="mt-0.5 text-[11px] text-muted-foreground">{subtitle}</div>
-      <div className="mt-2 whitespace-pre-wrap text-[12px] leading-relaxed text-foreground/90">
+      <div className="mt-2 max-h-48 overflow-y-auto whitespace-pre-wrap text-[12px] leading-relaxed text-foreground/90">
         {body === "" ? (
           <span className="text-muted-foreground/70">No entries yet</span>
         ) : hidden ? (
