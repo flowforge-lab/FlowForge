@@ -279,3 +279,33 @@ export function filterChunks(
       c.relPath.toLowerCase().includes(q),
   );
 }
+
+// ── Category tabs + reading view (#906) ─────────────────────────────────────
+
+/** Lines shown in a category tab's clamped preview before "See more".
+ *  A source-line heuristic, not a rendered-line guarantee (a long unwrapped
+ *  paragraph may still wrap to more visual lines) — deliberately not
+ *  scrollHeight-based so it stays testable under jsdom (no layout engine). */
+export const CATEGORY_PREVIEW_LINES = 12;
+
+/** Clamp a category body to `maxLines` source lines for the tab preview. */
+export function clampCategoryBody(
+  body: string,
+  maxLines: number = CATEGORY_PREVIEW_LINES,
+): { preview: string; truncated: boolean } {
+  if (body === "") return { preview: "", truncated: false };
+  const lines = body.split("\n");
+  if (lines.length <= maxLines) return { preview: body, truncated: false };
+  return { preview: lines.slice(0, maxLines).join("\n"), truncated: true };
+}
+
+/** Category ids whose body matches the query — drives the tab match-dots and
+ *  auto-select. Empty query matches everything (via `categoryMatches`). */
+export function matchingCategoryIds(
+  categories: MemoryCategories,
+  query: string,
+): MemoryCategoryId[] {
+  return MEMORY_CATEGORY_META.map((m) => m.id).filter((id) =>
+    categoryMatches(categories[id], query),
+  );
+}

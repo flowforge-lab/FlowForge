@@ -96,6 +96,41 @@ function seedChunks(chunks: MemoryChunkStat[]) {
   });
 }
 
+/** Seed a curated body so the category tabs render (one file keeps the
+ *  `loading && files.length === 0` gate from hiding the content). */
+function seedCurated(curatedBody: string) {
+  useMemoryStore.setState({
+    files: [
+      {
+        name: "MEMORY.md",
+        relPath: "MEMORY.md",
+        kind: "curated",
+        sizeBytes: 1,
+        modifiedMs: 1,
+      },
+    ],
+    curatedBody,
+    loading: false,
+    query: "",
+    load: async () => {},
+  });
+}
+
+const LONG_IDENTITY = Array.from(
+  { length: 14 },
+  (_, i) => `Identity line ${i + 1}`,
+).join("\n");
+const FIXTURE = `## Identity\n${LONG_IDENTITY}\n\n## Patterns\nShort pattern with keyword.\n\n## Focus\nShort focus text.\n`;
+
+/** Radix Tabs uses automatic activation: focusing a trigger selects it (see
+ *  the `SubTabs` tests in `primitives.test.tsx`) — a raw synthetic click
+ *  doesn't move focus under jsdom, so activate by focusing. */
+function activateTab(el: Element | null | undefined) {
+  act(() => {
+    (el as HTMLElement | null)?.focus();
+  });
+}
+
 beforeEach(() => {
   container = document.createElement("div");
   document.body.appendChild(container);
@@ -212,5 +247,101 @@ describe("MemorySection — Salience surface (M6.2, #293)", () => {
     seedChunks([]);
     render(<MemorySection />);
     expect(container.textContent).toContain("No memory chunks yet");
+  });
+});
+
+describe("MemorySection — category tabs + reading view (#906)", () => {
+  function tabs(): HTMLElement[] {
+    return [...container.querySelectorAll<HTMLElement>('[role="tab"]')];
+  }
+
+  function activeTab(): HTMLElement | undefined {
+    return tabs().find((t) => t.getAttribute("data-state") === "active");
+  }
+
+  beforeEach(() => {
+    seedCurated(FIXTURE);
+  });
+
+  it("defaults to the Identity tab", () => {
+    render(<MemorySection />);
+    expect(activeTab()?.textContent).toContain("Identity");
+    expect(container.textContent).toContain("Identity line 1");
+  });
+
+  it("switches the rendered body when another tab is activated", () => {
+    render(<MemorySection />);
+    activateTab(tabs().find((t) => t.textContent?.includes("Patterns")));
+    expect(activeTab()?.textContent).toContain("Patterns");
+    expect(container.textContent).toContain("Short pattern with keyword.");
+    expect(container.textContent).not.toContain("Identity line 1");
+  });
+
+  it("shows See more only for a body longer than the clamp", () => {
+    render(<MemorySection />);
+    const seeMore = () =>
+      [...container.querySelectorAll("button")].find(
+        (b) => b.textContent === "See more",
+      );
+    expect(seeMore()).toBeTruthy();
+
+    activateTab(tabs().find((t) => t.textContent?.includes("Patterns")));
+    expect(seeMore()).toBeUndefined();
+  });
+
+  it("opens the full reading view from See more, hiding the other sections", () => {
+    render(<MemorySection />);
+    click(
+      [...container.querySelectorAll("button")].find(
+        (b) => b.textContent === "See more",
+      ),
+    );
+    expect(container.textContent).toContain("Back");
+    expect(container.textContent).toContain("Identity line 14");
+    expect(container.textContent).not.toContain("Journal");
+    expect(container.textContent).not.toContain("Files");
+    expect(container.textContent).not.toContain("Salience");
+  });
+
+  it("returns from the reading view via Back", () => {
+    render(<MemorySection />);
+    click(
+      [...container.querySelectorAll("button")].find(
+        (b) => b.textContent === "See more",
+      ),
+    );
+    click(
+      [...container.querySelectorAll("button")].find((b) =>
+        b.textContent?.includes("Back"),
+      ),
+    );
+    expect(container.textContent).not.toContain("Back");
+    expect(container.textContent).toContain("Journal");
+    expect(container.textContent).toContain("Files");
+    expect(container.textContent).toContain("Salience");
+  });
+
+  it("auto-selects and badges the tab matching a search query", () => {
+    render(<MemorySection />);
+    act(() => useMemoryStore.getState().setQuery("keyword"));
+    expect(activeTab()?.textContent).toContain("Patterns");
+    const patternsTab = tabs().find((t) => t.textContent?.includes("Patterns"));
+    const identityTab = tabs().find((t) => t.textContent?.includes("Identity"));
+    expect(patternsTab?.querySelector("[aria-hidden]")).not.toBeNull();
+    expect(identityTab?.querySelector("[aria-hidden]")).toBeNull();
+  });
+
+  it("does not move off a tab that already matches the query", () => {
+    render(<MemorySection />);
+    activateTab(tabs().find((t) => t.textContent?.includes("Patterns")));
+    act(() => useMemoryStore.getState().setQuery("keyword"));
+    expect(activeTab()?.textContent).toContain("Patterns");
+  });
+
+  it("shows No match when the active tab's body doesn't match the query", () => {
+    render(<MemorySection />);
+    act(() => useMemoryStore.getState().setQuery("nope-not-found"));
+    expect(container.textContent).toContain("No match");
+    expect(tabs().some((t) => t.querySelector("[aria-hidden]"))).toBe(false);
   });
 });

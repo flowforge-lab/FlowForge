@@ -1,11 +1,19 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Pin, RotateCcw, Search, Sparkles, X } from "@/components/ui/icon";
+import {
+  ChevronLeft,
+  Pin,
+  RotateCcw,
+  Search,
+  Sparkles,
+  X,
+} from "@/components/ui/icon";
 import { cn } from "@/lib/utils";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Progress } from "@/components/ui/progress";
 import { Switch } from "@/components/ui/switch";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import {
   Tooltip,
   TooltipContent,
@@ -20,16 +28,19 @@ import {
   buildFiles,
   buildJournal,
   categoryMatches,
+  clampCategoryBody,
   filterChunks,
   filterFiles,
   filterJournal,
   formatBytes,
   formatMemoryFooter,
   humanAge,
+  matchingCategoryIds,
   parseCategories,
   sortChunks,
   weightPercent,
   type MemoryCategories,
+  type MemoryCategoryId,
   type MemoryFileRef,
   type MemoryJournalEntry,
 } from "@/lib/memory-view";
@@ -46,31 +57,46 @@ function prettyDate(iso: string): string {
   }).format(d);
 }
 
-function CategoryCard({
-  label,
+/**
+ * One category tab's pane (#906): a clamped preview of the curated body, with
+ * "See more" only when the body is actually truncated. No inner scrollbar —
+ * the Memory pane already lives inside the Settings dialog's one `ScrollArea`,
+ * so a second nested scroll region is exactly the bug this replaces (#903).
+ */
+function CategoryPane({
   subtitle,
   body,
   query,
+  onSeeMore,
 }: {
-  label: string;
   subtitle: string;
   body: string;
   query: string;
+  onSeeMore: () => void;
 }) {
   const hidden = query.trim() !== "" && !categoryMatches(body, query);
+  const { preview, truncated } = clampCategoryBody(body);
   return (
     <div className="rounded-md border border-border bg-muted/40 p-3">
-      <div className="text-[12px] font-medium text-foreground">{label}</div>
-      <div className="mt-0.5 text-[11px] text-muted-foreground">{subtitle}</div>
-      <div className="mt-2 max-h-48 overflow-y-auto whitespace-pre-wrap text-[12px] leading-relaxed text-foreground/90">
+      <div className="text-[11px] text-muted-foreground">{subtitle}</div>
+      <div className="mt-2 whitespace-pre-wrap text-[12px] leading-relaxed text-foreground/90">
         {body === "" ? (
           <span className="text-muted-foreground/70">No entries yet</span>
         ) : hidden ? (
           <span className="text-muted-foreground/70">No match</span>
         ) : (
-          body
+          preview
         )}
       </div>
+      {!hidden && truncated ? (
+        <button
+          type="button"
+          onClick={onSeeMore}
+          className="mt-2 text-[11px] font-medium text-primary hover:underline"
+        >
+          See more
+        </button>
+      ) : null}
     </div>
   );
 }
@@ -217,6 +243,12 @@ export function MemorySection() {
   const [dismissedFlush, setDismissedFlush] = useState(0);
   const showFlushBanner = flushCount > 0 && flushCount !== dismissedFlush;
 
+  // Category tabs + in-modal reading view (#906).
+  const [tab, setTab] = useState<MemoryCategoryId>("identity");
+  const [reading, setReading] = useState<MemoryCategoryId | null>(null);
+  const readingHeadingRef = useRef<HTMLHeadingElement>(null);
+  const activeTriggerRef = useRef<HTMLButtonElement>(null);
+
   useEffect(() => {
     void load();
   }, [load]);
@@ -235,7 +267,10 @@ export function MemorySection() {
   }, [flushCount, load]);
 
   useEffect(() => {
-    registerResetHandler(() => resetSearch());
+    registerResetHandler(() => {
+      resetSearch();
+      setReading(null);
+    });
     return () => registerResetHandler(null);
   }, [registerResetHandler, resetSearch]);
 
@@ -243,6 +278,37 @@ export function MemorySection() {
     () => parseCategories(curatedBody),
     [curatedBody],
   );
+  const matchingIds: MemoryCategoryId[] = useMemo(
+    () => matchingCategoryIds(categories, query),
+    [categories, query],
+  );
+
+  // Auto-select the first matching tab while searching, unless the active tab
+  // already matches. Done as a render-phase adjustment keyed on the memoized
+  // `matchingIds` reference (React's recommended alternative to a setState
+  // effect): it re-evaluates only when the query or curated bodies change, and
+  // converges in one pass since setting `tab` to a match doesn't change
+  // `matchingIds`. Leaves a manually-selected tab in place once it matches, and
+  // whenever the query is cleared or nothing matches.
+  const [prevMatchingIds, setPrevMatchingIds] = useState(matchingIds);
+  if (matchingIds !== prevMatchingIds) {
+    setPrevMatchingIds(matchingIds);
+    if (
+      query.trim() !== "" &&
+      matchingIds.length > 0 &&
+      !matchingIds.includes(tab)
+    ) {
+      setTab(matchingIds[0]);
+    }
+  }
+
+  // Move focus into the reading view on entry — nothing else does (the
+  // dialog's own focus effect only runs on mount/unmount) — which also
+  // scrolls it into view via the browser's native focus-scroll behavior.
+  useEffect(() => {
+    if (reading !== null) readingHeadingRef.current?.focus();
+  }, [reading]);
+
   const journal: MemoryJournalEntry[] = useMemo(
     () => filterJournal(buildJournal(files, journalBodies), query),
     [files, journalBodies, query],
@@ -255,6 +321,52 @@ export function MemorySection() {
     () => sortChunks(filterChunks(chunks, query)),
     [chunks, query],
   );
+
+  // "See more" swaps the whole pane into a full-height reading view — the
+  // Settings dialog has exactly one ScrollArea (owned by settings-shell, not
+  // per-section), so this is the only way to give long-form prose the whole
+  // max-h-[85vh] pane without a second, nested scrollbar (#903).
+  if (reading !== null) {
+    const meta = MEMORY_CATEGORY_META.find((m) => m.id === reading);
+    const body = categories[reading];
+    const hidden = query.trim() !== "" && !categoryMatches(body, query);
+    return (
+      <div className="space-y-3">
+        <button
+          type="button"
+          onClick={() => {
+            setReading(null);
+            requestAnimationFrame(() => activeTriggerRef.current?.focus());
+          }}
+          className="flex items-center gap-1 text-[12px] font-medium text-muted-foreground transition-colors hover:text-foreground"
+        >
+          <ChevronLeft className="size-3.5" />
+          Back
+        </button>
+        <div>
+          <h2
+            ref={readingHeadingRef}
+            tabIndex={-1}
+            className="text-[13px] font-medium text-foreground outline-none"
+          >
+            {meta?.label}
+          </h2>
+          <p className="mt-0.5 text-[11px] text-muted-foreground">
+            {meta?.subtitle}
+          </p>
+        </div>
+        <div className="whitespace-pre-wrap text-[13px] leading-relaxed text-foreground/90">
+          {body === "" ? (
+            <span className="text-muted-foreground/70">No entries yet</span>
+          ) : hidden ? (
+            <span className="text-muted-foreground/70">No match</span>
+          ) : (
+            body
+          )}
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="space-y-4">
@@ -314,17 +426,38 @@ export function MemorySection() {
         <p className="text-[12px] text-muted-foreground">Loading…</p>
       ) : (
         <>
-          <section className="grid grid-cols-1 gap-2 sm:grid-cols-3">
-            {MEMORY_CATEGORY_META.map((meta) => (
-              <CategoryCard
-                key={meta.id}
-                label={meta.label}
-                subtitle={meta.subtitle}
-                body={categories[meta.id]}
+          <Tabs
+            value={tab}
+            onValueChange={(v) => setTab(v as MemoryCategoryId)}
+          >
+            <TabsList aria-label="Memory categories">
+              {MEMORY_CATEGORY_META.map((meta) => (
+                <TabsTrigger
+                  key={meta.id}
+                  value={meta.id}
+                  ref={meta.id === tab ? activeTriggerRef : undefined}
+                >
+                  {meta.label}
+                  {query.trim() !== "" && matchingIds.includes(meta.id) ? (
+                    <span
+                      className="ml-1.5 inline-block size-1.5 rounded-full bg-primary"
+                      aria-hidden
+                    />
+                  ) : null}
+                </TabsTrigger>
+              ))}
+            </TabsList>
+            <TabsContent value={tab}>
+              <CategoryPane
+                subtitle={
+                  MEMORY_CATEGORY_META.find((m) => m.id === tab)?.subtitle ?? ""
+                }
+                body={categories[tab]}
                 query={query}
+                onSeeMore={() => setReading(tab)}
               />
-            ))}
-          </section>
+            </TabsContent>
+          </Tabs>
 
           <section className="space-y-2">
             <h3 className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
