@@ -18,7 +18,9 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
+import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { useNotebookStore } from "@/store/notebook";
+import type { KernelInfo } from "@/store/notebook";
 import {
   NOTEBOOK_POLL_DEFAULT_MS,
   useExperimentalStore,
@@ -47,6 +49,14 @@ import {
 // The panel is intentionally calm: no animation, no auto-expand. The chevron
 // here only hides the (currently quiet) text block; the pill + Stop stay
 // pinned on the header so a user always sees what's running.
+//
+// Multi-kernel (#871 FE-2): a session may hold up to 3 kernels. When more than
+// one is live the header grows a `KernelTabs` row; the selected tab is the
+// "active" kernel every control (pill, Stop, Restart) acts on. With ≤1 kernel
+// the panel is byte-for-byte the FE-1 single-kernel view. The switcher reads
+// the structured `kernels[]` on `NotebookKernelState` (ts-rs binding, #924) —
+// present for any live session, one entry per kernel; tabs show only when
+// there's more than one.
 
 export function NotebookStatusPanel({ sessionId }: { sessionId: string }) {
   const snapshot = useNotebookStore((s) => s.bySession[sessionId]);
@@ -65,6 +75,9 @@ export function NotebookStatusPanel({ sessionId }: { sessionId: string }) {
   // it goes behind a confirm — unlike Stop, which just ends a process the user
   // already meant to end.
   const [confirmRestart, setConfirmRestart] = useState(false);
+  // The tab the user picked in a multi-kernel session; `null` (or a stale id)
+  // falls back to the representative kernel below.
+  const [selectedKernelId, setSelectedKernelId] = useState<string | null>(null);
 
   // Hydrate on mount. The store handles IPC failure (leaves the entry
   // undefined) so a brief backend blip never strands the panel on an error
@@ -96,14 +109,41 @@ export function NotebookStatusPanel({ sessionId }: { sessionId: string }) {
     return <NoKernelRow expanded={expanded} setExpanded={setExpanded} />;
   }
 
-  const live = snapshot.state === "running";
+  // Multi-kernel enumeration (#871 FE-2), present only when a session holds >1
+  // kernel. `null` → the single-kernel view (identical to FE-1).
+  const kernels = snapshot.kernels ?? null;
+  const multi = kernels !== null && kernels.length > 1;
+  // The kernel every control acts on: the selected tab in multi mode (falling
+  // back to the representative if the selection is stale/absent), else the
+  // snapshot's representative fields.
+  const active = multi
+    ? (kernels.find((k) => k.kernelId === selectedKernelId) ??
+      // No (or stale) selection: default to the representative kernel — the
+      // live one the snapshot already surfaces — not just the first tab.
+      kernels.find((k) => k.kernelId === snapshot.kernelId) ??
+      kernels[0])
+    : {
+        kernelId: snapshot.kernelId,
+        state: snapshot.state,
+        pid: snapshot.pid,
+        executionCount: snapshot.executionCount,
+      };
+  const activeKernelId = active.kernelId;
+  const live = active.state === "running";
+  // The poll loop runs while *any* kernel is running; the representative is a
+  // running one whenever one exists, so `snapshot.state` tracks that.
+  const sessionLive = snapshot.state === "running";
   const dotTone = live ? "bg-emerald-500" : "bg-destructive";
   const label = live ? "kernel running" : "kernel dead";
 
   async function onStop() {
     setStopping(true);
     try {
-      await stop(sessionId);
+      // Single-kernel: stop the whole session (no id) — preserves FE-1 behavior.
+      // Multi-kernel: stop just the active tab's kernel.
+      await (multi && activeKernelId
+        ? stop(sessionId, activeKernelId)
+        : stop(sessionId));
     } finally {
       setStopping(false);
     }
@@ -113,7 +153,7 @@ export function NotebookStatusPanel({ sessionId }: { sessionId: string }) {
     setConfirmRestart(false);
     setRestarting(true);
     try {
-      await restart(sessionId, snapshot?.kernelId ?? undefined);
+      await restart(sessionId, activeKernelId ?? undefined);
     } catch (err) {
       // `notebook_restart` (backed by `KernelSupervisor::restart`, #924) can
       // still reject on a genuine backend error — e.g. a named-but-missing
@@ -146,17 +186,17 @@ export function NotebookStatusPanel({ sessionId }: { sessionId: string }) {
           <span className="text-[11px] font-medium text-foreground">
             {label}
           </span>
-          {snapshot.kernelId && (
+          {activeKernelId && (
             <span className="font-mono text-[11px] text-muted-foreground/70">
-              {snapshot.kernelId}
+              {activeKernelId}
             </span>
           )}
           <span className="text-[11px] text-muted-foreground/70">
-            {snapshot.executionCount} cell
-            {snapshot.executionCount === 1 ? "" : "s"} executed
+            {active.executionCount} cell
+            {active.executionCount === 1 ? "" : "s"} executed
           </span>
         </button>
-        {live && (
+        {sessionLive && (
           <span className="inline-flex items-center gap-1 text-[10px] text-muted-foreground/60">
             <Spinner className="size-3" />
             polling
@@ -187,13 +227,20 @@ export function NotebookStatusPanel({ sessionId }: { sessionId: string }) {
           </Button>
         )}
       </div>
+      {multi && (
+        <KernelTabs
+          kernels={kernels}
+          value={activeKernelId ?? undefined}
+          onSelect={setSelectedKernelId}
+        />
+      )}
       {expanded && (
         <div className="space-y-1 border-t px-2.5 py-2 text-[11px] leading-relaxed text-muted-foreground/70">
           <p className="flex flex-wrap items-center gap-1.5">
             <CircleDot className="size-3" />
             <span>
-              {snapshot.kernelId ?? "(no id)"}
-              {snapshot.pid != null ? ` · pid ${snapshot.pid}` : ""}
+              {activeKernelId ?? "(no id)"}
+              {active.pid != null ? ` · pid ${active.pid}` : ""}
             </span>
           </p>
           {snapshot.raw && (
@@ -237,6 +284,55 @@ export function NotebookStatusPanel({ sessionId }: { sessionId: string }) {
       </AlertDialog>
     </div>
   );
+}
+
+// Switcher for a multi-kernel session (#871 FE-2). One tab per kernel, keyed on
+// kernel id, each with a live/dead dot. Selecting a tab points every header
+// control (pill, Stop, Restart) at that kernel. Only rendered when a session
+// holds more than one kernel, so the common single-kernel path is untouched.
+function KernelTabs({
+  kernels,
+  value,
+  onSelect,
+}: {
+  kernels: KernelInfo[];
+  value: string | undefined;
+  onSelect: (id: string) => void;
+}) {
+  return (
+    <Tabs
+      value={value}
+      onValueChange={onSelect}
+      className="border-b bg-card/20 px-2.5"
+    >
+      <TabsList className="gap-0.5 border-b-0">
+        {kernels.map((k) => (
+          <TabsTrigger
+            key={k.kernelId}
+            value={k.kernelId}
+            className="gap-1.5 px-2 py-1 text-[11px]"
+            title={`${k.kernelId} — ${k.state}; ${k.executionCount} cell${
+              k.executionCount === 1 ? "" : "s"
+            } executed`}
+          >
+            <span
+              className={cn(
+                "size-1.5 shrink-0 rounded-full",
+                k.state === "running" ? "bg-emerald-500" : "bg-destructive",
+              )}
+            />
+            <span className="font-mono">{shortKernelId(k.kernelId)}</span>
+          </TabsTrigger>
+        ))}
+      </TabsList>
+    </Tabs>
+  );
+}
+
+// Compact tab label: drop the `kernel-` prefix the backend prepends, keeping the
+// distinguishing suffix. Falls back to the full id if the prefix is absent.
+function shortKernelId(id: string): string {
+  return id.startsWith("kernel-") ? id.slice("kernel-".length) : id;
 }
 
 // Quiet row for the "no kernel" state. Self-renders the same height as the

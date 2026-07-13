@@ -64,6 +64,7 @@ import type {
   RunRecord,
 } from "@/bindings";
 import type { NotebookKernelState } from "../bindings/NotebookKernelState";
+import type { KernelInfo } from "../bindings/KernelInfo";
 import { CONTROL_DEFAULTS, type ControlConfig } from "./control";
 import {
   APP_VERSION_FALLBACK,
@@ -80,16 +81,60 @@ type Listener<T> = (e: T) => void;
 const uid = () => crypto.randomUUID();
 const now = () => Date.now();
 
-/** Format the canonical `kernel <id> — <state>; pid=<pid>; cells executed=<n>`
- *  line that the real backend emits (and `parseKernelStatus` parses in
- *  `lib/notebook-output.ts`). Used by `mock.notebook.test.ts` so the test can
- *  assert on the same string the FE would see on a real connection. */
-function formatNotebookStatusLine(s: NotebookKernelState): string {
-  if (!s.hasKernel || !s.state || !s.kernelId) return "";
-  const id = s.kernelId;
-  const state = s.state;
-  const pid = s.pid ?? 0;
-  return `kernel ${id} — ${state}; pid=${pid}; cells executed=${s.executionCount}`;
+/** One kernel's canonical `kernel <id> — <state>; pid=<pid>; cells executed=<n>`
+ *  line (the same string the real backend emits and `parseKernelStatus` parses
+ *  in `lib/notebook-output.ts`). A session's `raw` is these joined with
+ *  newlines, mirroring the backend's per-kernel output. */
+function formatKernelLine(k: KernelInfo): string {
+  return `kernel ${k.kernelId} — ${k.state}; pid=${k.pid ?? 0}; cells executed=${k.executionCount}`;
+}
+
+/**
+ * Build a `NotebookKernelState` from a session's kernel list (#871 FE-2). The
+ * representative fields describe a live kernel if any, else the first — matching
+ * the real `KernelSupervisor::snapshot` (#924). `kernels[]` is attached whenever
+ * the session has at least one kernel (so a single-kernel session carries
+ * `kernels: [one]`, exactly like the wire); the switcher itself only shows tabs
+ * when there's more than one. A no-kernel snapshot omits `kernels` entirely,
+ * mirroring the backend's `Option::None` (serde-skipped).
+ */
+function buildNotebookSnapshot(
+  sessionId: string,
+  list: KernelInfo[],
+): NotebookKernelState {
+  if (list.length === 0) {
+    return {
+      sessionId,
+      hasKernel: false,
+      state: null,
+      kernelId: null,
+      pid: null,
+      executionCount: 0,
+      raw: "",
+    };
+  }
+  const rep = list.find((k) => k.state === "running") ?? list[0];
+  return {
+    sessionId,
+    hasKernel: true,
+    state: rep.state,
+    kernelId: rep.kernelId,
+    pid: rep.pid,
+    executionCount: rep.executionCount,
+    raw: list.map(formatKernelLine).join("\n"),
+    kernels: list.map((k) => ({ ...k })),
+  };
+}
+
+/** Spawn a fresh mock kernel (new id, reset execution count, running). */
+function freshMockKernel(): KernelInfo {
+  const nonce = Math.random().toString(16).slice(2, 10);
+  return {
+    kernelId: `kernel-${nonce}`,
+    state: "running",
+    pid: 40000 + Math.floor(Math.random() * 10000),
+    executionCount: 0,
+  };
 }
 
 // Deterministic stand-in for the backend's LLM-summarized title (#671 item 2b):
@@ -870,12 +915,14 @@ export class MockIpc implements FfIpc {
   // persists to `<goals_dir>/<session_id>.json`; the mock just holds it in memory.
   private goals = new Map<string, Goal>();
   private goalTimers = new Map<string, ReturnType<typeof setInterval>>();
-  // Notebook_runner kernel state (#871 FE-1). Per-session kernel — absent until
-  // something seeds it (the real backend spawns one on `notebook_runner start`;
-  // the mock seeds it through a private test hook in mock.notebook.test.ts so
-  // the UI + store can exercise every panel state without faking tool calls).
-  // Shape mirrors `NotebookKernelState` exactly — the panel never re-parses.
-  private notebookKernels = new Map<string, NotebookKernelState>();
+  // Notebook_runner kernel state (#871 FE-1/FE-2). Per-session kernel *list* —
+  // absent until something seeds it (the real backend spawns one on
+  // `notebook_runner start`; the mock seeds it through the private test hooks in
+  // mock.notebook.test.ts so the UI + store can exercise every panel state —
+  // including the ≤3 multi-kernel switcher — without faking tool calls). Stored
+  // as a list; `buildNotebookSnapshot` derives the `NotebookKernelState` the panel
+  // reads (representative fields + the proposed `kernels[]` when >1).
+  private notebookKernels = new Map<string, KernelInfo[]>();
   private goalUpdatedListeners = new Set<Listener<Goal>>();
   private goalClearedListeners = new Set<Listener<string>>();
   // Paint-first boot (#599): the mock backend is "ready" immediately, so this is
@@ -2406,66 +2453,100 @@ Shipping the Settings redesign — currently the Memory browser (SET.8).
   // detection) — still reachable in tests via `__seedNotebookKernel`, just
   // never through this method.
   async notebookStatus(sessionId: string): Promise<NotebookKernelState> {
-    const existing = this.notebookKernels.get(sessionId);
-    if (existing) return Promise.resolve({ ...existing });
-    return Promise.resolve({
-      sessionId,
-      hasKernel: false,
-      state: null,
-      kernelId: null,
-      pid: null,
-      executionCount: 0,
-      raw: "",
-    });
+    const list = this.notebookKernels.get(sessionId) ?? [];
+    return Promise.resolve(buildNotebookSnapshot(sessionId, list));
   }
 
-  async notebookStop(sessionId: string): Promise<void> {
-    this.notebookKernels.delete(sessionId); // idempotent — same as the real backend
+  async notebookStop(sessionId: string, kernelId?: string): Promise<void> {
+    if (!kernelId) {
+      this.notebookKernels.delete(sessionId); // stop-all — same as the real backend
+      return;
+    }
+    // Stop a single kernel: drop it from the list. An emptied session collapses
+    // to "no kernel" (the delete below), mirroring stop-all's end state.
+    const remaining = (this.notebookKernels.get(sessionId) ?? []).filter(
+      (k) => k.kernelId !== kernelId,
+    );
+    if (remaining.length === 0) this.notebookKernels.delete(sessionId);
+    else this.notebookKernels.set(sessionId, remaining);
   }
 
-  // Restart (#871 FE-2): mirror `KernelSupervisor::restart` — kill the current
-  // kernel and spawn a fresh one, so in-kernel state is discarded. The mock
-  // models that as a new kernel id, a reset execution count, and a `running`
-  // state, then returns the post-restart snapshot (matching the real command's
-  // return-the-snapshot contract). Restarting a session with no kernel spawns
-  // one — harmless and simplest; the real backend gates this per action safety.
-  async notebookRestart(sessionId: string): Promise<NotebookKernelState> {
-    const nonce = Math.random().toString(16).slice(2, 10);
-    return this.__seedNotebookKernel(sessionId, {
-      hasKernel: true,
-      state: "running",
-      kernelId: `kernel-${nonce}`,
-      pid: 40000 + Math.floor(Math.random() * 10000),
-      executionCount: 0,
-    });
+  // Restart (#871 FE-2): mirror `KernelSupervisor::restart` — kill a kernel and
+  // spawn a fresh one, so in-kernel state is discarded. Modeled as a new kernel
+  // id + reset execution count + `running` state, returning the post-restart
+  // snapshot (matching the real command's return-the-snapshot contract).
+  // `kernelId` restarts that one kernel in place; omitted, it restarts the
+  // representative (a live kernel if any, else the first) — or spawns one if the
+  // session has none (harmless; the real backend gates this per action safety).
+  async notebookRestart(
+    sessionId: string,
+    kernelId?: string,
+  ): Promise<NotebookKernelState> {
+    const list = this.notebookKernels.get(sessionId) ?? [];
+    const fresh = freshMockKernel();
+    let next: KernelInfo[];
+    if (list.length === 0) {
+      next = [fresh];
+    } else {
+      const targetId =
+        kernelId ??
+        (list.find((k) => k.state === "running") ?? list[0]).kernelId;
+      const idx = list.findIndex((k) => k.kernelId === targetId);
+      next = list.map((k) => ({ ...k }));
+      // Replace in place if found (keeps tab order stable); otherwise append.
+      if (idx >= 0) next[idx] = fresh;
+      else next.push(fresh);
+    }
+    this.notebookKernels.set(sessionId, next);
+    return buildNotebookSnapshot(sessionId, next);
   }
 
-  /** Test hook — lets mock.notebook.test.ts seed / advance a per-session
-   *  kernel without faking the entire `notebook_runner` tool-call pipeline.
-   *  The real backend spawns kernels via `notebook_runner start`; the mock
-   *  surface stays narrow because the panel only needs snapshot read/write.
-   *  Arrow field (not a prototype method) so a caller can destructure/alias
-   *  it without losing `this` — bare `const seed = ipc.__seedNotebookKernel;
-   *  seed(...)` still works, unlike a plain method reference. */
+  /** Test/dev hook — seed a single-kernel session (back-compat with the FE-1
+   *  tests). Accepts the same `Partial<NotebookKernelState>` patch as before;
+   *  `hasKernel: false` clears the session. Returns the derived snapshot.
+   *  Arrow field (not a prototype method) so a caller can destructure/alias it
+   *  without losing `this`. For multi-kernel scenarios use
+   *  `__seedNotebookKernels`. */
   __seedNotebookKernel = (
     sessionId: string,
     patch: Partial<NotebookKernelState>,
-  ) => {
-    const current: NotebookKernelState = this.notebookKernels.get(
+  ): NotebookKernelState => {
+    const current = this.notebookKernels.get(sessionId) ?? [];
+    const rep = current[0];
+    const merged: NotebookKernelState = {
       sessionId,
-    ) ?? {
-      sessionId,
-      hasKernel: false,
-      state: null,
-      kernelId: null,
-      pid: null,
-      executionCount: 0,
+      hasKernel: rep != null,
+      state: rep?.state ?? null,
+      kernelId: rep?.kernelId ?? null,
+      pid: rep?.pid ?? null,
+      executionCount: rep?.executionCount ?? 0,
       raw: "",
+      ...patch,
     };
-    const next: NotebookKernelState = { ...current, ...patch };
-    next.raw = formatNotebookStatusLine(next);
-    this.notebookKernels.set(sessionId, next);
-    return { ...next };
+    const list: KernelInfo[] =
+      merged.hasKernel && merged.state && merged.kernelId
+        ? [
+            {
+              kernelId: merged.kernelId,
+              state: merged.state,
+              pid: merged.pid,
+              executionCount: merged.executionCount,
+            },
+          ]
+        : [];
+    this.notebookKernels.set(sessionId, list);
+    return buildNotebookSnapshot(sessionId, list);
+  };
+
+  /** Test/dev hook — seed a multi-kernel session (#871 FE-2). Replaces the
+   *  session's kernel list wholesale so the switcher can be exercised. */
+  __seedNotebookKernels = (
+    sessionId: string,
+    kernels: KernelInfo[],
+  ): NotebookKernelState => {
+    const list = kernels.map((k) => ({ ...k }));
+    this.notebookKernels.set(sessionId, list);
+    return buildNotebookSnapshot(sessionId, list);
   };
 
   onGoalUpdated(cb: Listener<Goal>): Promise<Unlisten> {
