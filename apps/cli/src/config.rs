@@ -116,7 +116,9 @@ impl From<SecretKindArg> for SecretKind {
 fn accepted_secret_kinds(kind: ProviderKind) -> &'static [SecretKind] {
     match kind {
         ProviderKind::Bedrock => &SecretKind::ALL,
-        ProviderKind::OpenAi | ProviderKind::SiliconFlow => &[SecretKind::ApiKey],
+        ProviderKind::OpenAi | ProviderKind::SiliconFlow | ProviderKind::OpenRouter => {
+            &[SecretKind::ApiKey]
+        }
         ProviderKind::CandleVllm | ProviderKind::Ollama => &[],
     }
 }
@@ -376,6 +378,7 @@ fn default_model_for(kind: ProviderKind) -> String {
         ProviderKind::Bedrock => "anthropic.claude-3-5-sonnet-20241022-v2:0".to_string(),
         ProviderKind::OpenAi => "gpt-4o-mini".to_string(),
         ProviderKind::SiliconFlow => "Qwen/Qwen2.5-7B-Instruct".to_string(),
+        ProviderKind::OpenRouter => "anthropic/claude-sonnet-4-20250514".to_string(),
         // Local kinds are rejected upstream; unreachable in practice.
         ProviderKind::CandleVllm | ProviderKind::Ollama => String::new(),
     }

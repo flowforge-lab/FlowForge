@@ -340,14 +340,15 @@ fn wire_dialect_siliconflow_glm_minimax_use_empty_string() {
 
 #[test]
 fn wire_dialect_openrouter_replays_reasoning_field() {
-    // OpenRouter rides the OpenAi kind today; vendor descriptor selects the dialect.
+    // OpenRouter is now a first-class ProviderKind (#807).
     let d = wire_dialect(
-        ff_core::ProviderKind::OpenAi,
-        Some("openrouter"),
-        "anthropic/claude-3.7-sonnet:thinking",
+        ff_core::ProviderKind::OpenRouter,
+        None,
+        "anthropic/claude-sonnet-4-20250514",
     );
     assert_eq!(d.reasoning, ReasoningWire::Reasoning);
     assert_eq!(d.tool_call_content, ToolCallContent::Omit);
+    assert!(!d.think_tags);
 }
 
 #[test]

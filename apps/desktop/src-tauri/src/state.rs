@@ -327,6 +327,17 @@ fn build_provider(conn: &ProviderConnection, model: &str) -> Box<dyn Provider> {
                     .with_reasoning_control(reasoning),
             )
         }
+        // OpenRouter is OpenAI-compatible (#807); bearer key from the OS keychain.
+        ProviderKind::OpenRouter => {
+            let key = crate::secrets::get(conn.id.as_str(), SecretKind::ApiKey);
+            Box::new(
+                OpenAiProvider::new(base_url, key)
+                    .with_vision(vision)
+                    .with_documents(documents)
+                    .with_dialect(dialect)
+                    .with_reasoning_control(reasoning),
+            )
+        }
     }
 }
 
@@ -365,6 +376,7 @@ fn display_name_for(kind: ProviderKind) -> String {
         ProviderKind::Bedrock => "Amazon Bedrock",
         ProviderKind::OpenAi => "OpenAI",
         ProviderKind::SiliconFlow => "SiliconFlow",
+        ProviderKind::OpenRouter => "OpenRouter",
     }
     .to_string()
 }

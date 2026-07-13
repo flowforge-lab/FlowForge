@@ -92,6 +92,18 @@ fn build_provider(config: &ProviderConfig) -> Box<dyn Provider> {
                     .with_reasoning_control(reasoning),
             )
         }
+        // OpenRouter is OpenAI-compatible. Bearer key from OPENROUTER_API_KEY.
+        ProviderKind::OpenRouter => {
+            let key = std::env::var("OPENROUTER_API_KEY")
+                .ok()
+                .filter(|k| !k.is_empty());
+            Box::new(
+                OpenAiProvider::new(base_url, key)
+                    .with_documents(documents)
+                    .with_dialect(dialect)
+                    .with_reasoning_control(reasoning),
+            )
+        }
     }
 }
 

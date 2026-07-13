@@ -267,6 +267,8 @@ fn data_driven_matches_legacy_arms() {
                     || m.contains("qwen2-vl")
             }
             ProviderKind::SiliconFlow => m.contains("-vl") || m.contains("-4v"),
+            // No vision rules for OpenRouter in the bundled data (fail-closed).
+            ProviderKind::OpenRouter => false,
             ProviderKind::CandleVllm => false,
         }
     }
@@ -277,6 +279,7 @@ fn data_driven_matches_legacy_arms() {
         ProviderKind::Ollama,
         ProviderKind::SiliconFlow,
         ProviderKind::CandleVllm,
+        ProviderKind::OpenRouter,
     ];
     let models = [
         "gpt-4o",
