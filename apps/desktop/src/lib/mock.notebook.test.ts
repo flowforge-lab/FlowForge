@@ -1,5 +1,12 @@
 import { describe, expect, it } from "vitest";
 import { MockIpc } from "./mock";
+import type { KernelInfo } from "@/bindings/KernelInfo";
+import type { NotebookKernelState } from "@/bindings/NotebookKernelState";
+
+type MultiSeeder = (
+  sessionId: string,
+  kernels: KernelInfo[],
+) => NotebookKernelState;
 
 describe("MockIpc notebook (#871 FE-1)", () => {
   it("returns a fresh 'no kernel' snapshot for an unknown session", async () => {
@@ -134,6 +141,73 @@ describe("MockIpc notebook (#871 FE-1)", () => {
     // The snapshot the command returned is what a follow-up status reports.
     const observed = await ipc.notebookStatus("s1");
     expect(observed).toEqual(restarted);
+  });
+
+  it("seeds multiple kernels and exposes kernels[] with a representative (#871 FE-2)", async () => {
+    const ipc = new MockIpc();
+    const seedMany = (ipc as unknown as { __seedNotebookKernels: MultiSeeder })
+      .__seedNotebookKernels;
+    seedMany("s1", [
+      { kernelId: "kernel-a", state: "dead", pid: 1, executionCount: 5 },
+      { kernelId: "kernel-b", state: "running", pid: 2, executionCount: 3 },
+    ]);
+
+    const snap = (await ipc.notebookStatus("s1")) as NotebookKernelState;
+    // Representative is the live kernel (kernel-b), even though it's not first.
+    expect(snap.hasKernel).toBe(true);
+    expect(snap.kernelId).toBe("kernel-b");
+    expect(snap.state).toBe("running");
+    // kernels[] enumerates all, in seed order; raw has one line per kernel.
+    expect(snap.kernels?.map((k) => k.kernelId)).toEqual([
+      "kernel-a",
+      "kernel-b",
+    ]);
+    expect(snap.raw.split("\n")).toHaveLength(2);
+  });
+
+  it("stops a single kernel by id, collapsing to single-kernel when one remains", async () => {
+    const ipc = new MockIpc();
+    (
+      ipc as unknown as { __seedNotebookKernels: MultiSeeder }
+    ).__seedNotebookKernels("s1", [
+      { kernelId: "kernel-a", state: "running", pid: 1, executionCount: 0 },
+      { kernelId: "kernel-b", state: "running", pid: 2, executionCount: 0 },
+    ]);
+
+    await ipc.notebookStop("s1", "kernel-a");
+    const snap = (await ipc.notebookStatus("s1")) as NotebookKernelState;
+    // One kernel left: still carries `kernels: [one]` (the real wire), so the
+    // switcher hides its tabs (length 1) without the shape changing.
+    expect(snap.hasKernel).toBe(true);
+    expect(snap.kernelId).toBe("kernel-b");
+    expect(snap.kernels).toHaveLength(1);
+    expect(snap.kernels?.[0].kernelId).toBe("kernel-b");
+
+    // Stopping the last one collapses the session to "no kernel".
+    await ipc.notebookStop("s1", "kernel-b");
+    expect((await ipc.notebookStatus("s1")).hasKernel).toBe(false);
+  });
+
+  it("restarts a single kernel in place, leaving the others untouched", async () => {
+    const ipc = new MockIpc();
+    (
+      ipc as unknown as { __seedNotebookKernels: MultiSeeder }
+    ).__seedNotebookKernels("s1", [
+      { kernelId: "kernel-a", state: "running", pid: 1, executionCount: 9 },
+      { kernelId: "kernel-b", state: "dead", pid: 2, executionCount: 4 },
+    ]);
+
+    const snap = (await ipc.notebookRestart(
+      "s1",
+      "kernel-b",
+    )) as NotebookKernelState;
+    const ids = snap.kernels?.map((k) => k.kernelId) ?? [];
+    // kernel-a is untouched (same id, same count); kernel-b is replaced fresh.
+    expect(ids[0]).toBe("kernel-a");
+    expect(snap.kernels?.[0].executionCount).toBe(9);
+    expect(ids[1]).not.toBe("kernel-b");
+    expect(snap.kernels?.[1].executionCount).toBe(0);
+    expect(snap.kernels?.[1].state).toBe("running");
   });
 
   it("a self-died kernel (seeded dead, not stopped) still reports state: 'dead'", async () => {

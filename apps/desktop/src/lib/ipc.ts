@@ -522,8 +522,10 @@ export interface FfIpc {
   notebookStatus(sessionId: string): Promise<NotebookKernelState>;
   /** Stop the session's kernel (#871 FE-1). Mirrors `goalClear`'s void return;
    *  the caller calls `notebookStatus` again to observe the post-stop
-   *  snapshot. Idempotent — no error when the session has no kernel. */
-  notebookStop(sessionId: string): Promise<void>;
+   *  snapshot. Idempotent — no error when the session has no kernel. `kernelId`
+   *  stops a single kernel once a session holds more than one (Phase 3);
+   *  omitted, the backend stops every kernel in the session. */
+  notebookStop(sessionId: string, kernelId?: string): Promise<void>;
   /** Restart the session's kernel (#871 FE-2): kill the current subprocess and
    *  spawn a fresh one, discarding in-kernel state (globals, execution count).
    *  Backed by `KernelSupervisor::restart`. Resolves the post-restart snapshot
@@ -909,8 +911,8 @@ class TauriIpc implements FfIpc {
 
   notebookStatus = (sessionId: string) =>
     this.invoke<NotebookKernelState>("notebook_status", { sessionId });
-  notebookStop = (sessionId: string) =>
-    this.invoke<void>("notebook_stop", { sessionId });
+  notebookStop = (sessionId: string, kernelId?: string) =>
+    this.invoke<void>("notebook_stop", { sessionId, kernelId });
   notebookRestart = (sessionId: string, kernelId?: string) =>
     this.invoke<NotebookKernelState>("notebook_restart", {
       sessionId,

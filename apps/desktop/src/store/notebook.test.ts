@@ -155,9 +155,19 @@ describe("useNotebookStore", () => {
 
       await useNotebookStore.getState().stop("s1");
 
-      expect(stop).toHaveBeenCalledWith("s1");
+      // No kernelId forwarded when stopping the whole session.
+      expect(stop).toHaveBeenCalledWith("s1", undefined);
       expect(status).toHaveBeenCalledWith("s1");
       expect(useNotebookStore.getState().bySession.s1?.hasKernel).toBe(false);
+    });
+
+    it("forwards a kernelId to stop a single kernel (#871 FE-2)", async () => {
+      const stop = vi.spyOn(ipc, "notebookStop").mockResolvedValue();
+      vi.spyOn(ipc, "notebookStatus").mockResolvedValue(
+        snapshot({ sessionId: "s1", hasKernel: false }),
+      );
+      await useNotebookStore.getState().stop("s1", "kernel-bbbb");
+      expect(stop).toHaveBeenCalledWith("s1", "kernel-bbbb");
     });
 
     it("propagates the backend rejection", async () => {

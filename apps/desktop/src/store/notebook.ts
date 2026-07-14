@@ -12,6 +12,11 @@ import { create } from "zustand";
 import { ipc } from "@/lib/ipc";
 import type { NotebookKernelState } from "@/bindings/NotebookKernelState";
 
+// `KernelInfo` and the `kernels?` field on `NotebookKernelState` are part of the
+// generated ts-rs binding now (#924, backing the multi-kernel switcher). Re-
+// export `KernelInfo` so the panel imports it from one place.
+export type { KernelInfo } from "@/bindings/KernelInfo";
+
 /**
  * A session's snapshot, after the FE has decided whether to display the panel.
  * `null` means "we've heard back from the backend for this session" — useful so
@@ -52,8 +57,9 @@ interface NotebookState {
   refresh: (sessionId: string) => Promise<void>;
   /** Stop the session's kernel. Resolves once the backend has acked; the
    *  caller follows up with `refresh(sessionId)` so the panel re-renders with
-   *  the post-stop snapshot. Idempotent. */
-  stop: (sessionId: string) => Promise<void>;
+   *  the post-stop snapshot. Idempotent. `kernelId` stops a single kernel once
+   *  a session holds more than one (Phase 3); omitted, it stops them all. */
+  stop: (sessionId: string, kernelId?: string) => Promise<void>;
   /** Restart the session's kernel (#871 FE-2): discard the running subprocess
    *  and its in-kernel state, spawn a fresh one. The command returns the
    *  post-restart snapshot, which we write straight into `bySession` (no
@@ -113,9 +119,9 @@ export const useNotebookStore = create<NotebookState>((set, get) => ({
     }
   },
 
-  stop: async (sessionId) => {
+  stop: async (sessionId, kernelId) => {
     if (get().ipcUnavailable) return;
-    await ipc.notebookStop(sessionId);
+    await ipc.notebookStop(sessionId, kernelId);
     await get().refresh(sessionId);
   },
 

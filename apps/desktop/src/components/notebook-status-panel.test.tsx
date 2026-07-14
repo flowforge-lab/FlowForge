@@ -356,4 +356,118 @@ describe("NotebookStatusPanel (#871 FE-1)", () => {
     expect(refreshSpy).not.toHaveBeenCalled();
     vi.useRealTimers();
   });
+
+  it("renders a tab per kernel when a session holds more than one (#871 FE-2)", () => {
+    const snap = {
+      ...snapshot({
+        sessionId: "s1",
+        hasKernel: true,
+        state: "running",
+        kernelId: "kernel-aaaa",
+        executionCount: 2,
+        raw: "kernel kernel-aaaa — running; pid=1; cells executed=2\nkernel kernel-bbbb — running; pid=2; cells executed=0",
+      }),
+      kernels: [
+        {
+          kernelId: "kernel-aaaa",
+          state: "running",
+          pid: 1,
+          executionCount: 2,
+        },
+        {
+          kernelId: "kernel-bbbb",
+          state: "running",
+          pid: 2,
+          executionCount: 0,
+        },
+      ],
+    } as NotebookKernelState;
+    vi.spyOn(ipc, "notebookStatus").mockResolvedValue(snap);
+    act(() => {
+      useNotebookStore.setState({ bySession: { s1: snap } });
+    });
+    renderPanel("s1");
+
+    const tabs = container.querySelectorAll('[role="tab"]');
+    expect(tabs).toHaveLength(2);
+    // Tabs are keyed on kernel id (shown without the `kernel-` prefix).
+    const labels = Array.from(tabs).map((t) => t.textContent ?? "");
+    expect(labels.some((l) => l.includes("aaaa"))).toBe(true);
+    expect(labels.some((l) => l.includes("bbbb"))).toBe(true);
+  });
+
+  it("switching tabs points Stop at the selected kernel (#871 FE-2)", async () => {
+    const snap = {
+      ...snapshot({
+        sessionId: "s1",
+        hasKernel: true,
+        state: "running",
+        kernelId: "kernel-aaaa",
+        executionCount: 2,
+        raw: "kernel kernel-aaaa — running; pid=1; cells executed=2\nkernel kernel-bbbb — running; pid=2; cells executed=0",
+      }),
+      kernels: [
+        {
+          kernelId: "kernel-aaaa",
+          state: "running",
+          pid: 1,
+          executionCount: 2,
+        },
+        {
+          kernelId: "kernel-bbbb",
+          state: "running",
+          pid: 2,
+          executionCount: 0,
+        },
+      ],
+    } as NotebookKernelState;
+    vi.spyOn(ipc, "notebookStatus").mockResolvedValue(snap);
+    act(() => {
+      useNotebookStore.setState({ bySession: { s1: snap } });
+    });
+    renderPanel("s1");
+
+    const stopSpy = vi.fn(async () => {});
+    act(() => {
+      useNotebookStore.setState((s) => ({ ...s, stop: stopSpy }) as never);
+    });
+
+    // Click the second kernel's tab.
+    const bTab = Array.from(
+      container.querySelectorAll<HTMLElement>('[role="tab"]'),
+    ).find((t) => t.textContent?.includes("bbbb"));
+    expect(bTab).not.toBeUndefined();
+    // Radix Tabs use automatic activation (on focus); jsdom's .click() doesn't
+    // move focus, so focus the tab to select it the way keyboard users do.
+    await act(async () => {
+      bTab?.focus();
+      bTab?.click();
+    });
+
+    // Stop now targets the active (selected) kernel, not the representative.
+    await act(async () => {
+      container
+        .querySelector<HTMLButtonElement>("button[title='Stop the kernel']")
+        ?.click();
+    });
+    expect(stopSpy).toHaveBeenCalledWith("s1", "kernel-bbbb");
+  });
+
+  it("renders no tabs for a single-kernel session", () => {
+    act(() => {
+      useNotebookStore.setState({
+        bySession: {
+          s1: snapshot({
+            sessionId: "s1",
+            hasKernel: true,
+            state: "running",
+            kernelId: "kernel-aaaa",
+            executionCount: 1,
+          }),
+        },
+      });
+    });
+    renderPanel("s1");
+    expect(container.querySelectorAll('[role="tab"]')).toHaveLength(0);
+  });
 });
