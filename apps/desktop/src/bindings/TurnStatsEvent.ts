@@ -32,4 +32,13 @@ tier1Fires?: number,
  * F1b (#441): iterations that engaged the Tier-2 abstractive cold-tail summary.
  * Omitted by emitters that do not compute F1b telemetry.
  */
-tier2Fires?: number, };
+tier2Fires?: number, 
+/**
+ * TTFT: milliseconds from the moment the host handed the request to
+ * `run_turn` to the arrival of the first assistant token. Answers the
+ * dominant question the #427 baseline could not: "how long until the
+ * model starts talking?" — the sum of provider RTT + queue + prefill.
+ * `None` when the turn produced no assistant message (e.g. an early
+ * error or cancel before the first token streamed).
+ */
+firstTokenMs?: number, };

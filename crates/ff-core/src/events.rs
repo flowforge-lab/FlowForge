@@ -180,6 +180,15 @@ pub struct TurnStatsEvent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub tier2_fires: Option<u32>,
+    /// TTFT: milliseconds from the moment the host handed the request to
+    /// `run_turn` to the arrival of the first assistant token. Answers the
+    /// dominant question the #427 baseline could not: "how long until the
+    /// model starts talking?" — the sum of provider RTT + queue + prefill.
+    /// `None` when the turn produced no assistant message (e.g. an early
+    /// error or cancel before the first token streamed).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub first_token_ms: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
