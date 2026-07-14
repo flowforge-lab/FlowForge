@@ -1343,3 +1343,47 @@ fn noop_tool_config_builds_successfully() {
         _ => panic!("expected ToolSpec"),
     }
 }
+
+#[test]
+fn metadata_event_populates_usage_and_cache_tokens() {
+    use aws_sdk_bedrockruntime::types::{ConverseStreamMetadataEvent, TokenUsage};
+
+    let usage = TokenUsage::builder()
+        .input_tokens(1_200)
+        .output_tokens(340)
+        .total_tokens(1_540)
+        .cache_read_input_tokens(900)
+        .cache_write_input_tokens(300)
+        .build()
+        .expect("token usage builds");
+    let event =
+        ConverseStreamOutput::Metadata(ConverseStreamMetadataEvent::builder().usage(usage).build());
+
+    let chunk = event_to_chunk(event).expect("metadata event yields a chunk");
+    assert_eq!(chunk.input_tokens, 1_200);
+    assert_eq!(chunk.output_tokens, 340);
+    assert_eq!(chunk.cache_hit_tokens, 900);
+    assert_eq!(chunk.cache_miss_tokens, 300);
+    // The metadata frame must not re-signal turn completion; MessageStop owns that.
+    assert!(!chunk.done);
+}
+
+#[test]
+fn metadata_event_without_cache_fields_defaults_to_zero() {
+    use aws_sdk_bedrockruntime::types::{ConverseStreamMetadataEvent, TokenUsage};
+
+    let usage = TokenUsage::builder()
+        .input_tokens(500)
+        .output_tokens(50)
+        .total_tokens(550)
+        .build()
+        .expect("token usage builds");
+    let event =
+        ConverseStreamOutput::Metadata(ConverseStreamMetadataEvent::builder().usage(usage).build());
+
+    let chunk = event_to_chunk(event).expect("metadata event yields a chunk");
+    assert_eq!(chunk.input_tokens, 500);
+    assert_eq!(chunk.output_tokens, 50);
+    assert_eq!(chunk.cache_hit_tokens, 0);
+    assert_eq!(chunk.cache_miss_tokens, 0);
+}
