@@ -568,6 +568,7 @@ fn switch_branch_rejects_flag_like_branch_before_spawning_git() {
 #[test]
 fn turn_metrics_counts_round_trips_flushes_and_iterations() {
     let mut m = TurnMetrics::default();
+    let turn_start = std::time::Instant::now();
     // Two iterations (two distinct message ids); repeats are idempotent.
     m.note_turn("m1");
     m.note_turn("m1");
@@ -580,10 +581,15 @@ fn turn_metrics_counts_round_trips_flushes_and_iterations() {
     assert_eq!(chars, 5);
     assert_eq!(turns, 2, "two distinct assistant messages = two turns");
 
-    let (round_trips, iter_ms, flushes) = m.timing(std::time::Instant::now());
+    let (round_trips, iter_ms, flushes, first_token_ms) =
+        m.timing(turn_start, std::time::Instant::now());
     assert_eq!(round_trips, 2, "one round-trip per distinct message id");
     assert_eq!(iter_ms.len(), 2, "one wall-clock sample per iteration");
     assert_eq!(flushes, 1, "exactly one mid-turn flush counted");
+    assert!(
+        first_token_ms.is_some(),
+        "TTFT populated when at least one assistant message arrived"
+    );
 }
 
 // A turn that never reached the model (no assistant message) reports a clean
@@ -591,14 +597,52 @@ fn turn_metrics_counts_round_trips_flushes_and_iterations() {
 #[test]
 fn turn_metrics_empty_turn_is_zeroed() {
     let m = TurnMetrics::default();
-    let (round_trips, iter_ms, flushes) = m.timing(std::time::Instant::now());
+    let turn_start = std::time::Instant::now();
+    let (round_trips, iter_ms, flushes, first_token_ms) =
+        m.timing(turn_start, std::time::Instant::now());
     assert_eq!(round_trips, 0);
     assert!(iter_ms.is_empty());
     assert_eq!(flushes, 0);
+    assert!(
+        first_token_ms.is_none(),
+        "TTFT is None when the turn produced no assistant message"
+    );
     // F1b (#441): a turn whose Done carried no telemetry reports a clean zero.
     assert!(m.prefill_estimates.is_empty());
     assert_eq!(m.tier1_fires, 0);
     assert_eq!(m.tier2_fires, 0);
+}
+
+// TTFT (#427): the recorded first-token latency is the delta from `turn_start` to
+// the first `note_turn` -- not from the first `note_turn` to the second. This
+// pins the semantics so a future refactor can't silently drift to "time between
+// iterations" (which is `iter_ms[0]`, a different signal).
+#[test]
+fn turn_metrics_first_token_ms_measures_from_turn_start_not_between_iters() {
+    let mut m = TurnMetrics::default();
+    let turn_start = std::time::Instant::now();
+    // Simulate 20ms of "waiting for the model to start" before the first token
+    // arrives, then a second iteration close behind. The gap between iterations
+    // must not be counted as TTFT.
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    m.note_turn("m1");
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    m.note_turn("m2");
+
+    let (_, iter_ms, _, first_token_ms) = m.timing(turn_start, std::time::Instant::now());
+    let ttft = first_token_ms.expect("TTFT populated when a message arrived");
+    assert!(
+        ttft >= 20,
+        "TTFT must span turn_start -> first token (>= 20ms), got {ttft}"
+    );
+    // Sanity: iter_ms[0] measures the span between iterations, and is a
+    // separate signal from TTFT. The first-iter span is smaller here because
+    // the two `note_turn` calls are only ~5ms apart.
+    assert!(
+        iter_ms[0] < ttft,
+        "iter_ms[0] ({}) is between iters, distinct from TTFT ({ttft})",
+        iter_ms[0]
+    );
 }
 
 #[test]

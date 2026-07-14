@@ -137,8 +137,16 @@ impl TurnMetrics {
     }
 
     /// Per-turn timing breakdown for the #427 baseline: `(round_trips, per-iteration
-    /// ms in arrival order, flushes)`. `turn_end` closes the final iteration.
-    fn timing(&self, turn_end: std::time::Instant) -> (u32, Vec<u32>, u32) {
+    /// ms in arrival order, flushes, first_token_ms)`. `turn_start` anchors the
+    /// TTFT measurement (time from the moment we hand the request to `run_turn`
+    /// to the first assistant token arriving); `turn_end` closes the final
+    /// iteration. `first_token_ms` is `None` when the turn produced no assistant
+    /// message (e.g. an early error before any token streamed).
+    fn timing(
+        &self,
+        turn_start: std::time::Instant,
+        turn_end: std::time::Instant,
+    ) -> (u32, Vec<u32>, u32, Option<u32>) {
         let iter_ms = self
             .iter_marks
             .iter()
@@ -149,7 +157,11 @@ impl TurnMetrics {
             })
             .collect();
         let round_trips = u32::try_from(self.iter_marks.len()).unwrap_or(u32::MAX);
-        (round_trips, iter_ms, self.flushes)
+        let first_token_ms = self.iter_marks.first().map(|first| {
+            u32::try_from(first.saturating_duration_since(turn_start).as_millis())
+                .unwrap_or(u32::MAX)
+        });
+        (round_trips, iter_ms, self.flushes, first_token_ms)
     }
 }
 
@@ -1485,11 +1497,12 @@ fn spawn_assistant_turn(state: Arc<AppState>, app: tauri::AppHandle, session_id:
             prefill_estimates,
             tier1_fires,
             tier2_fires,
+            first_token_ms,
         ) = metrics
             .lock()
             .map(|m| {
                 let (c, t) = m.snapshot();
-                let (rt, ims, fl) = m.timing(turn_end);
+                let (rt, ims, fl, ttft) = m.timing(turn_start, turn_end);
                 (
                     c,
                     t,
@@ -1499,6 +1512,7 @@ fn spawn_assistant_turn(state: Arc<AppState>, app: tauri::AppHandle, session_id:
                     m.prefill_estimates.clone(),
                     m.tier1_fires,
                     m.tier2_fires,
+                    ttft,
                 )
             })
             .unwrap_or_default();
@@ -1523,12 +1537,18 @@ fn spawn_assistant_turn(state: Arc<AppState>, app: tauri::AppHandle, session_id:
             prefill_estimates: Some(prefill_estimates),
             tier1_fires: Some(tier1_fires),
             tier2_fires: Some(tier2_fires),
+            // TTFT: `None` when the turn produced no assistant message (early
+            // error / cancel before the first token streamed). Otherwise the ms
+            // from `run_turn` dispatch to the first assistant token arriving --
+            // the answer to "why is first-byte slow?".
+            first_token_ms,
         };
         tracing::info!(
             target: "turn_metrics",
             session_id = %sid,
             round_trips,
             total_ms = latency_ms,
+            first_token_ms = ?stats.first_token_ms,
             flushes,
             chars = stats.chars,
             iter_ms = ?stats.iter_ms,
