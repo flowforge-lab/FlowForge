@@ -613,7 +613,7 @@ fn turn_metrics_empty_turn_is_zeroed() {
     assert_eq!(m.tier2_fires, 0);
 }
 
-// TTFT (#): the recorded first-token latency is the delta from `turn_start` to
+// TTFT (#427): the recorded first-token latency is the delta from `turn_start` to
 // the first `note_turn` -- not from the first `note_turn` to the second. This
 // pins the semantics so a future refactor can't silently drift to "time between
 // iterations" (which is `iter_ms[0]`, a different signal).
