@@ -15,12 +15,12 @@ use ff_agent::{
     IterationOutcome, ToolContext,
 };
 use ff_core::events::{
-    ApprovalSafety, EvolveCostEstimate, IntentionSignal, McpStatusChangedEvent, MemoryFlushedEvent,
-    OutputStreamKind, PhenotypeMcpUnavailableEvent, ReasoningEvent, SessionTitleUpdatedEvent,
-    SkillActivated, SkillCompleted, SkillEvolveApprovalRequestEvent,
-    SkillInstallApprovalRequestEvent, SkillsChangedEvent, TokenEvent, ToolApprovalRequestEvent,
-    ToolAskRequestEvent, ToolCallEvent, ToolOutputChunkEvent, ToolResultEvent, TurnDoneEvent,
-    TurnErrorEvent, TurnStatsEvent, UpdateProgressEvent,
+    ApprovalSafety, ConnectionFailedEvent, EvolveCostEstimate, IntentionSignal,
+    McpStatusChangedEvent, MemoryFlushedEvent, OutputStreamKind, PhenotypeMcpUnavailableEvent,
+    ReasoningEvent, ReconnectingEvent, SessionTitleUpdatedEvent, SkillActivated, SkillCompleted,
+    SkillEvolveApprovalRequestEvent, SkillInstallApprovalRequestEvent, SkillsChangedEvent,
+    TokenEvent, ToolApprovalRequestEvent, ToolAskRequestEvent, ToolCallEvent, ToolOutputChunkEvent,
+    ToolResultEvent, TurnDoneEvent, TurnErrorEvent, TurnStatsEvent, UpdateProgressEvent,
 };
 use ff_core::{
     Attachment, BedrockAuth, CreateScheduledTaskInput, Format, Goal, GoalStatus, McpServerConfig,
@@ -3219,6 +3219,34 @@ fn emit_agent_event<R: tauri::Runtime>(
                 "turn:error",
                 TurnErrorEvent {
                     session_id: session_id.to_string(),
+                    message,
+                },
+            );
+        }
+        AgentEvent::Reconnecting {
+            message_id,
+            attempt,
+            max_attempts,
+        } => {
+            let _ = app.emit(
+                "turn:reconnecting",
+                ReconnectingEvent {
+                    session_id: session_id.to_string(),
+                    message_id,
+                    attempt,
+                    max_attempts,
+                },
+            );
+        }
+        AgentEvent::ConnectionFailed {
+            message_id,
+            message,
+        } => {
+            let _ = app.emit(
+                "turn:connection-failed",
+                ConnectionFailedEvent {
+                    session_id: session_id.to_string(),
+                    message_id,
                     message,
                 },
             );

@@ -60,14 +60,28 @@ pub const DEFAULT_MAX_ITERATIONS: usize = 8;
 /// mechanism (RC3, #454).
 const WRAP_UP_AT_REMAINING: usize = 3;
 
-/// A transient provider error (connection blip, 429/5xx) is retried up to this many
-/// total attempts before the turn surfaces the failure (#244 R1). Bounded so a hard
-/// outage fails in seconds rather than spinning.
+/// A clean-but-empty stream (neither text nor a tool call, #244 R7) is a provider
+/// anomaly, not a transport drop, so it retries on its own small budget rather than
+/// the wider transport budget below. Bounded so a persistently empty provider fails
+/// fast rather than spinning.
 const MAX_PROVIDER_ATTEMPTS: usize = 3;
 
-/// Base backoff between provider retries; attempt N waits `BASE << (N-1)` ms
-/// (~250ms, 500ms), capped well under a second so retries stay snappy.
+/// A transient *transport* drop (connection blip, reset, timeout, 5xx) retried up to
+/// this many total attempts before the turn surfaces `connection_failed` (#928). The
+/// budget is wider than the anomaly budget because a real network hiccup can take a
+/// few seconds to recover; combined with `RETRY_BACKOFF_CAP_MS` the whole window
+/// stays bounded (~18s) rather than ballooning with the raw exponential schedule.
+const MAX_TRANSPORT_ATTEMPTS: usize = 8;
+
+/// Base backoff between transport retries; attempt N waits `BASE << (N-1)` ms
+/// (~250ms, 500ms, 1s, 2s, ...), clamped by `RETRY_BACKOFF_CAP_MS`.
 const RETRY_BACKOFF_BASE_MS: u64 = 250;
+
+/// Per-attempt ceiling on the transport backoff (#928). Without it, raising the
+/// budget to 8 with the raw `BASE << (attempt-1)` schedule would balloon (attempt 8
+/// = 16s single gap). Clamped to 5s, the schedule is `250ms, 500ms, 1s, 2s, 4s, 5s,
+/// 5s` -- a predictable ~18s reconnect window with no dead-air gap.
+const RETRY_BACKOFF_CAP_MS: u64 = 5_000;
 
 /// A rate-limit (429/quota) window is a ~minute-scale TPM/RPM reset, not a
 /// transport blip, so it gets its own, larger retry budget (#571). Waiting out a
@@ -117,10 +131,10 @@ fn retry_backoff_ms(error: &LlmError, attempt: usize, rate_limit_attempt: usize)
             Some(rate_limit_delay(rate_limit_attempt, *retry_after))
         }
         _ => {
-            if attempt >= MAX_PROVIDER_ATTEMPTS {
+            if attempt >= MAX_TRANSPORT_ATTEMPTS {
                 return None;
             }
-            Some(RETRY_BACKOFF_BASE_MS << (attempt - 1))
+            Some((RETRY_BACKOFF_BASE_MS << (attempt - 1)).min(RETRY_BACKOFF_CAP_MS))
         }
     }
 }
@@ -303,6 +317,28 @@ pub enum AgentEvent {
         delta: String,
     },
     Error {
+        message: String,
+    },
+    /// A transient transport drop occurred before any token was emitted this turn;
+    /// the loop is auto-retrying (#928). Surfaced so the frontend can show
+    /// "Reconnecting... X/N" instead of a silent gap. `attempt` is the upcoming
+    /// retry number (1-based), `max_attempts` the transport budget. Recovery is
+    /// signalled implicitly by the next `Token`/`Done`; failure by
+    /// [`AgentEvent::ConnectionFailed`].
+    Reconnecting {
+        message_id: String,
+        attempt: u32,
+        max_attempts: u32,
+    },
+    /// A transient connection failure ended the turn (#928): either the transport
+    /// retry budget was exhausted, or the drop happened mid-stream (no resume --
+    /// the current contract cannot continue a generation at an offset). Distinct
+    /// from the generic [`AgentEvent::Error`] so the frontend can render a
+    /// connection-specific error + "Try again" (an honest re-run). `message`
+    /// carries the underlying error for detail/logging; the frontend owns the
+    /// user-facing, provider-neutral copy.
+    ConnectionFailed {
+        message_id: String,
         message: String,
     },
 }
@@ -1272,6 +1308,15 @@ pub async fn run_turn(
                             // just charged (#571).
                             attempt -= 1;
                             rate_limit_attempt += 1;
+                        } else {
+                            // A transport drop before any token: surface the retry so
+                            // the frontend shows "Reconnecting... X/N" (#928). Rate-limit
+                            // waits stay silent -- a quota window is not a reconnect.
+                            on_event(AgentEvent::Reconnecting {
+                                message_id: message_id.clone(),
+                                attempt: (attempt + 1) as u32,
+                                max_attempts: MAX_TRANSPORT_ATTEMPTS as u32,
+                            });
                         }
                         cancellable_backoff(&cancel, delay).await;
                         // Cancelled during the backoff -> stop now instead of issuing one
@@ -1281,12 +1326,21 @@ pub async fn run_turn(
                         }
                         continue;
                     }
-                    on_event(AgentEvent::Error {
-                        message: e.to_string(),
-                    });
-                    // Fatal provider error: the Error event above already tells the
-                    // user why the turn ended. Disarm so the guard does not overwrite
-                    // the reserved row with a redundant interrupted notice (#646).
+                    // Budget exhausted (or a fatal error): a transient *transport* drop
+                    // that never recovered -> connection_failed; a rate-limit window that
+                    // never cleared, or any non-transient fault, stays a generic error
+                    // (#928). Both disarm the guard so it does not overwrite the reserved
+                    // row with a redundant interrupted notice (#646).
+                    if e.is_transient() && !is_rate_limited(&e) {
+                        on_event(AgentEvent::ConnectionFailed {
+                            message_id: message_id.clone(),
+                            message: e.to_string(),
+                        });
+                    } else {
+                        on_event(AgentEvent::Error {
+                            message: e.to_string(),
+                        });
+                    }
                     row_guard.finalize();
                     return Err(e.into());
                 }
@@ -1372,6 +1426,13 @@ pub async fn run_turn(
                     if is_rate_limited(&e) {
                         attempt -= 1;
                         rate_limit_attempt += 1;
+                    } else {
+                        // A transport drop before any token: surface the retry (#928).
+                        on_event(AgentEvent::Reconnecting {
+                            message_id: message_id.clone(),
+                            attempt: (attempt + 1) as u32,
+                            max_attempts: MAX_TRANSPORT_ATTEMPTS as u32,
+                        });
                     }
                     cancellable_backoff(&cancel, delay).await;
                     // Cancelled during the backoff -> stop now instead of issuing one
@@ -1382,12 +1443,23 @@ pub async fn run_turn(
                     continue;
                 }
                 Some(e) => {
-                    on_event(AgentEvent::Error {
-                        message: e.to_string(),
-                    });
-                    // Fatal provider error: the Error event above already tells the
-                    // user why the turn ended. Disarm so the guard does not overwrite
-                    // the reserved row with a redundant interrupted notice (#646).
+                    // Lands here on a mid-stream drop (`emitted_any`, so the retry guard
+                    // above never matched) or once the transport budget is exhausted. A
+                    // transient transport drop -> connection_failed (no resume; "Try
+                    // again" is an honest re-run); a spent rate-limit window or any
+                    // non-transient fault -> a generic provider error (#928). Both disarm
+                    // the guard so it does not overwrite the reserved row with a redundant
+                    // interrupted notice (#646).
+                    if e.is_transient() && !is_rate_limited(&e) {
+                        on_event(AgentEvent::ConnectionFailed {
+                            message_id: message_id.clone(),
+                            message: e.to_string(),
+                        });
+                    } else {
+                        on_event(AgentEvent::Error {
+                            message: e.to_string(),
+                        });
+                    }
                     row_guard.finalize();
                     return Err(e.into());
                 }
