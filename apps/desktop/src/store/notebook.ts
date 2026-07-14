@@ -54,6 +54,12 @@ interface NotebookState {
    *  caller follows up with `refresh(sessionId)` so the panel re-renders with
    *  the post-stop snapshot. Idempotent. */
   stop: (sessionId: string) => Promise<void>;
+  /** Restart the session's kernel (#871 FE-2): discard the running subprocess
+   *  and its in-kernel state, spawn a fresh one. The command returns the
+   *  post-restart snapshot, which we write straight into `bySession` (no
+   *  separate `refresh` round-trip). No-ops when the command surface is
+   *  unavailable (same breaker as `stop`). */
+  restart: (sessionId: string, kernelId?: string) => Promise<void>;
   /** Drop a session's cached snapshot (no IPC). Used by the chat store's
    *  delete-session reconciliation path so a vanished session's kernel
    *  doesn't dangle in memory. */
@@ -111,6 +117,12 @@ export const useNotebookStore = create<NotebookState>((set, get) => ({
     if (get().ipcUnavailable) return;
     await ipc.notebookStop(sessionId);
     await get().refresh(sessionId);
+  },
+
+  restart: async (sessionId, kernelId) => {
+    if (get().ipcUnavailable) return;
+    const state = await ipc.notebookRestart(sessionId, kernelId);
+    set((s) => ({ bySession: { ...s.bySession, [sessionId]: state } }));
   },
 
   clear: (sessionId) =>

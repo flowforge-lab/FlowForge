@@ -105,6 +105,37 @@ describe("MockIpc notebook (#871 FE-1)", () => {
     expect((await ipc.notebookStatus("s1")).state).toBe("running");
   });
 
+  it("notebookRestart replaces the kernel with a fresh running one (new id, reset count)", async () => {
+    // Mirrors `KernelSupervisor::restart`: the process is killed and respawned,
+    // so in-kernel state (globals, execution count) is discarded. The command
+    // returns the post-restart snapshot directly.
+    const ipc = new MockIpc();
+    (
+      ipc as unknown as {
+        __seedNotebookKernel: (
+          sessionId: string,
+          patch: Record<string, unknown>,
+        ) => Record<string, unknown>;
+      }
+    ).__seedNotebookKernel("s1", {
+      hasKernel: true,
+      state: "running",
+      kernelId: "kernel-old0",
+      pid: 5,
+      executionCount: 9,
+    });
+
+    const restarted = await ipc.notebookRestart("s1");
+    expect(restarted.hasKernel).toBe(true);
+    expect(restarted.state).toBe("running");
+    expect(restarted.executionCount).toBe(0);
+    expect(restarted.kernelId).not.toBe("kernel-old0");
+
+    // The snapshot the command returned is what a follow-up status reports.
+    const observed = await ipc.notebookStatus("s1");
+    expect(observed).toEqual(restarted);
+  });
+
   it("a self-died kernel (seeded dead, not stopped) still reports state: 'dead'", async () => {
     // `state: "dead"` is real backend behavior for a kernel that died on its
     // own — exercised here via the seed hook directly, since `notebookStop`

@@ -2423,6 +2423,23 @@ Shipping the Settings redesign — currently the Memory browser (SET.8).
     this.notebookKernels.delete(sessionId); // idempotent — same as the real backend
   }
 
+  // Restart (#871 FE-2): mirror `KernelSupervisor::restart` — kill the current
+  // kernel and spawn a fresh one, so in-kernel state is discarded. The mock
+  // models that as a new kernel id, a reset execution count, and a `running`
+  // state, then returns the post-restart snapshot (matching the real command's
+  // return-the-snapshot contract). Restarting a session with no kernel spawns
+  // one — harmless and simplest; the real backend gates this per action safety.
+  async notebookRestart(sessionId: string): Promise<NotebookKernelState> {
+    const nonce = Math.random().toString(16).slice(2, 10);
+    return this.__seedNotebookKernel(sessionId, {
+      hasKernel: true,
+      state: "running",
+      kernelId: `kernel-${nonce}`,
+      pid: 40000 + Math.floor(Math.random() * 10000),
+      executionCount: 0,
+    });
+  }
+
   /** Test hook — lets mock.notebook.test.ts seed / advance a per-session
    *  kernel without faking the entire `notebook_runner` tool-call pipeline.
    *  The real backend spawns kernels via `notebook_runner start`; the mock

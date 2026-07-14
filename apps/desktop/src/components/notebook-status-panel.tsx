@@ -1,8 +1,23 @@
 import { useEffect, useState } from "react";
-import { ChevronRight, CircleDot, Square } from "@/components/ui/icon";
+import {
+  ChevronRight,
+  CircleDot,
+  RotateCcw,
+  Square,
+} from "@/components/ui/icon";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
 import { useNotebookStore } from "@/store/notebook";
 import {
   NOTEBOOK_POLL_DEFAULT_MS,
@@ -38,12 +53,18 @@ export function NotebookStatusPanel({ sessionId }: { sessionId: string }) {
   const hydrate = useNotebookStore((s) => s.hydrate);
   const refresh = useNotebookStore((s) => s.refresh);
   const stop = useNotebookStore((s) => s.stop);
+  const restart = useNotebookStore((s) => s.restart);
   const pollMs = useExperimentalStore(
     (s) => s.notebookPollIntervalMs ?? NOTEBOOK_POLL_DEFAULT_MS,
   );
 
   const [expanded, setExpanded] = useState(true);
   const [stopping, setStopping] = useState(false);
+  const [restarting, setRestarting] = useState(false);
+  // Restart discards the kernel's in-memory state (globals, execution count), so
+  // it goes behind a confirm — unlike Stop, which just ends a process the user
+  // already meant to end.
+  const [confirmRestart, setConfirmRestart] = useState(false);
 
   // Hydrate on mount. The store handles IPC failure (leaves the entry
   // undefined) so a brief backend blip never strands the panel on an error
@@ -88,54 +109,84 @@ export function NotebookStatusPanel({ sessionId }: { sessionId: string }) {
     }
   }
 
+  async function onRestart() {
+    setConfirmRestart(false);
+    setRestarting(true);
+    try {
+      await restart(sessionId, snapshot?.kernelId ?? undefined);
+    } catch (err) {
+      // `notebook_restart` (backed by `KernelSupervisor::restart`, #924) can
+      // still reject on a genuine backend error — e.g. a named-but-missing
+      // `kernel_id`. Degrade quietly (the panel keeps showing the live kernel,
+      // the next poll reconciles) rather than surfacing an unhandled rejection.
+      console.debug("[notebook] restart failed:", err);
+    } finally {
+      setRestarting(false);
+    }
+  }
+
   return (
     <div className="flex shrink-0 flex-col border-b bg-card/40">
-      <button
-        type="button"
-        onClick={() => setExpanded((v) => !v)}
-        aria-expanded={expanded}
-        className="flex items-center gap-1.5 px-2.5 py-1.5 text-left transition-colors hover:bg-foreground/5"
-      >
-        <ChevronRight
-          className={cn(
-            "size-3.5 shrink-0 text-muted-foreground transition-transform",
-            expanded && "rotate-90",
-          )}
-        />
-        <span className={cn("size-1.5 shrink-0 rounded-full", dotTone)} />
-        <span className="text-[11px] font-medium text-foreground">{label}</span>
-        {snapshot.kernelId && (
-          <span className="font-mono text-[11px] text-muted-foreground/70">
-            {snapshot.kernelId}
+      {/* Toggle + controls sit as siblings in one flex row — the controls are
+          real buttons, so they can't nest inside the toggle <button>. */}
+      <div className="flex items-center gap-1.5 px-2.5 py-1.5">
+        <button
+          type="button"
+          onClick={() => setExpanded((v) => !v)}
+          aria-expanded={expanded}
+          className="flex flex-1 items-center gap-1.5 text-left transition-colors hover:bg-foreground/5"
+        >
+          <ChevronRight
+            className={cn(
+              "size-3.5 shrink-0 text-muted-foreground transition-transform",
+              expanded && "rotate-90",
+            )}
+          />
+          <span className={cn("size-1.5 shrink-0 rounded-full", dotTone)} />
+          <span className="text-[11px] font-medium text-foreground">
+            {label}
           </span>
-        )}
-        <span className="text-[11px] text-muted-foreground/70">
-          {snapshot.executionCount} cell
-          {snapshot.executionCount === 1 ? "" : "s"} executed
-        </span>
+          {snapshot.kernelId && (
+            <span className="font-mono text-[11px] text-muted-foreground/70">
+              {snapshot.kernelId}
+            </span>
+          )}
+          <span className="text-[11px] text-muted-foreground/70">
+            {snapshot.executionCount} cell
+            {snapshot.executionCount === 1 ? "" : "s"} executed
+          </span>
+        </button>
         {live && (
-          <span className="ml-auto inline-flex items-center gap-1 text-[10px] text-muted-foreground/60">
+          <span className="inline-flex items-center gap-1 text-[10px] text-muted-foreground/60">
             <Spinner className="size-3" />
             polling
           </span>
         )}
+        <Button
+          variant="outline"
+          size="xs"
+          className="h-6 px-2 text-[11px]"
+          disabled={restarting}
+          onClick={() => setConfirmRestart(true)}
+          title="Restart the kernel (discards its state)"
+        >
+          <RotateCcw className="mr-1 size-3" />
+          {restarting ? "Restarting…" : "Restart"}
+        </Button>
         {live && (
           <Button
             variant="outline"
             size="xs"
-            className="ml-1 h-6 px-2 text-[11px]"
+            className="h-6 px-2 text-[11px]"
             disabled={stopping}
-            onClick={(e) => {
-              e.stopPropagation();
-              void onStop();
-            }}
+            onClick={() => void onStop()}
             title="Stop the kernel"
           >
             <Square className="mr-1 size-3" />
             {stopping ? "Stopping…" : "Stop"}
           </Button>
         )}
-      </button>
+      </div>
       {expanded && (
         <div className="space-y-1 border-t px-2.5 py-2 text-[11px] leading-relaxed text-muted-foreground/70">
           <p className="flex flex-wrap items-center gap-1.5">
@@ -152,15 +203,38 @@ export function NotebookStatusPanel({ sessionId }: { sessionId: string }) {
           )}
           {!live && (
             <p className="text-[10px]">
-              Kernel is dead. Ask the agent to call{" "}
+              Kernel is dead. Use <span className="font-medium">Restart</span>{" "}
+              to spawn a fresh one, or ask the agent to call{" "}
               <code className="rounded bg-muted px-1 py-px font-mono">
                 notebook_runner start
-              </code>{" "}
-              to spawn a new one.
+              </code>
+              .
             </p>
           )}
         </div>
       )}
+
+      <AlertDialog
+        open={confirmRestart}
+        onOpenChange={(next) => !next && setConfirmRestart(false)}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Restart the kernel?</AlertDialogTitle>
+            <AlertDialogDescription>
+              This kills the current Python process and starts a fresh one. All
+              in-kernel state — imported modules, variables, and the execution
+              count — is discarded. Files on disk are untouched.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>Cancel</AlertDialogCancel>
+            <AlertDialogAction onClick={() => void onRestart()}>
+              Restart
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   );
 }
