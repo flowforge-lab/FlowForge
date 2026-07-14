@@ -85,6 +85,12 @@ function hostedBaseUrlMeta(kind: ProviderConnection["kind"]): {
       hint: "Default is the global endpoint. Use https://api.siliconflow.cn/v1 for the China region.",
     };
   }
+  if (kind === "openRouter") {
+    return {
+      placeholder: "https://openrouter.ai/api/v1",
+      hint: "Default is the OpenRouter gateway. Model IDs use provider/model format (e.g. anthropic/claude-sonnet-4-20250514).",
+    };
+  }
   return {
     placeholder: "https://api.openai.com/v1",
     hint: "Leave blank for the default OpenAI endpoint, or set an OpenAI-compatible base URL (e.g. OpenRouter, Azure).",

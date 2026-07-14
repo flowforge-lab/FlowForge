@@ -476,7 +476,7 @@ export function concreteAuthMode(conn: ProviderConnection): BedrockAuth {
  *  over an editable base URL (vs. Bedrock's region/auth form or the local kinds'
  *  plain host field). Drives the provider-card credentials layout. */
 export function isHostedKeyKind(kind: ProviderKind): boolean {
-  return kind === "openai" || kind === "siliconFlow";
+  return kind === "openai" || kind === "siliconFlow" || kind === "openRouter";
 }
 
 /** Kinds whose backend chat request sends no reasoning-*enable* parameter, so the
@@ -485,7 +485,7 @@ export function isHostedKeyKind(kind: ProviderKind): boolean {
  *  `reasoning`). Kept distinct from [`isHostedKeyKind`] (credentials shape): the
  *  two sets coincide today but answer different questions. */
 export function reasoningToggleNoOp(kind: ProviderKind): boolean {
-  return kind === "openai" || kind === "siliconFlow";
+  return kind === "openai" || kind === "siliconFlow" || kind === "openRouter";
 }
 
 /** On-device provider kinds — run against a local server (Ollama / candle-vLLM)

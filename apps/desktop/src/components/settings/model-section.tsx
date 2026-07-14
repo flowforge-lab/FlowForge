@@ -39,6 +39,7 @@ const ADDABLE: ReadonlyArray<{ kind: ProviderKind; label: string }> = [
   { kind: "bedrock", label: "AWS Bedrock" },
   { kind: "openai", label: "OpenAI" },
   { kind: "siliconFlow", label: "SiliconFlow" },
+  { kind: "openRouter", label: "OpenRouter" },
 ];
 
 const EFFORT_OPTIONS: ReadonlyArray<{ value: Effort; label: string }> = [
