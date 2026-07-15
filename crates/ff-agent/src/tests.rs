@@ -5401,3 +5401,71 @@ async fn changed_file_is_not_deduped() {
         reread.content
     );
 }
+
+#[test]
+fn context_breakdown_splits_system_tools_and_messages() {
+    fn msg(role: Role, content: &str, reasoning: Option<&str>) -> Message {
+        Message {
+            id: "m".into(),
+            session_id: "s".into(),
+            role,
+            content: content.into(),
+            tool_calls: None,
+            tool_call_id: None,
+            attachments: None,
+            reasoning: reasoning.map(str::to_string),
+            stop_reason: None,
+            author_name: None,
+            created_at: 0,
+        }
+    }
+
+    let system = "x".repeat(40);
+    let tool_schemas = vec![
+        serde_json::json!({"type": "function", "function": {"name": "a"}}),
+        serde_json::json!({"type": "function", "function": {"name": "b"}}),
+    ];
+    let messages = vec![
+        msg(Role::User, &"y".repeat(20), None),
+        msg(Role::Assistant, &"z".repeat(16), Some(&"r".repeat(4))),
+    ];
+
+    let b = context_breakdown(Some(&system), &tool_schemas, &messages);
+
+    // Buckets use the same tokenx-rs estimator as ProxyTokenEstimator::assess.
+    assert!(
+        b.system_tokens > 0,
+        "non-empty system prompt -> non-zero tokens"
+    );
+    assert_eq!(b.tool_specs, 2);
+    assert_eq!(b.message_count, 2);
+    assert!(
+        b.tool_tokens > 0,
+        "non-empty tool schemas -> non-zero tokens"
+    );
+    assert!(
+        b.message_tokens > 0,
+        "non-empty messages -> non-zero tokens"
+    );
+
+    // Key invariant: message_tokens must equal what the estimator computes for
+    // the same messages (so the popover bar sums to token_count).
+    let estimator = ProxyTokenEstimator {
+        budget_tokens: 100_000,
+    };
+    let pressure = estimator.assess(&messages, "any");
+    assert_eq!(
+        b.message_tokens, pressure.estimated_tokens as u32,
+        "breakdown.message_tokens must equal estimator.assess() for same messages"
+    );
+}
+
+#[test]
+fn context_breakdown_handles_absent_system_prompt() {
+    let b = context_breakdown(None, &[], &[]);
+    assert_eq!(b.system_tokens, 0);
+    assert_eq!(b.tool_tokens, 0);
+    assert_eq!(b.tool_specs, 0);
+    assert_eq!(b.message_tokens, 0);
+    assert_eq!(b.message_count, 0);
+}

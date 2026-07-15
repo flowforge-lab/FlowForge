@@ -907,6 +907,8 @@ async fn emit_agent_event_maps_done_to_turn_done_event() {
         tier2_fires: None,
         cache_hit_tokens: Some(10),
         cache_miss_tokens: Some(32),
+        breakdown: None,
+        usage: None,
     };
     emit_agent_event(app.handle(), "session-1", done_event);
 

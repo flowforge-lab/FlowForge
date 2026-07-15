@@ -16,11 +16,11 @@ use ff_agent::{
 };
 use ff_core::events::{
     ApprovalSafety, EvolveCostEstimate, IntentionSignal, McpStatusChangedEvent, MemoryFlushedEvent,
-    OutputStreamKind, PhenotypeMcpUnavailableEvent, ReasoningEvent, SessionTitleUpdatedEvent,
-    SkillActivated, SkillCompleted, SkillEvolveApprovalRequestEvent,
-    SkillInstallApprovalRequestEvent, SkillsChangedEvent, TokenEvent, ToolApprovalRequestEvent,
-    ToolAskRequestEvent, ToolCallEvent, ToolOutputChunkEvent, ToolResultEvent, TurnDoneEvent,
-    TurnErrorEvent, TurnStatsEvent, UpdateProgressEvent,
+    OutputStreamKind, PhenotypeMcpUnavailableEvent, ProcessExitedEvent, ProcessOutputEvent,
+    ReasoningEvent, SessionTitleUpdatedEvent, SkillActivated, SkillCompleted,
+    SkillEvolveApprovalRequestEvent, SkillInstallApprovalRequestEvent, SkillsChangedEvent,
+    TokenEvent, ToolApprovalRequestEvent, ToolAskRequestEvent, ToolCallEvent, ToolOutputChunkEvent,
+    ToolResultEvent, TurnDoneEvent, TurnErrorEvent, TurnStatsEvent, UpdateProgressEvent,
 };
 use ff_core::{
     Attachment, BedrockAuth, CreateScheduledTaskInput, Format, Goal, GoalStatus, McpServerConfig,
@@ -1266,6 +1266,76 @@ pub(crate) async fn wake_session_for_observer(
         "observer wake spawning turn"
     );
     spawn_assistant_turn(state.clone(), app.clone(), session_id);
+}
+
+/// Bridge one background process's live output to the frontend (#873). Spawned
+/// by `start_process_output_pump` on each `process_manager start`, this task
+/// forwards every [`ProcessChunk`] the process emits as a `process:output`
+/// event — independently of any assistant turn, for the life of the process —
+/// then emits a terminal `process:exited` when the output broadcast closes
+/// (the exit-watcher drops the sender on exit/kill). `chunks` was subscribed
+/// inside `ProcessSupervisor::start` before the drain tasks spawned, so no
+/// output is missed.
+pub(crate) fn spawn_process_output_bridge(
+    app: tauri::AppHandle,
+    supervisor: Arc<ff_tools::process::ProcessSupervisor>,
+    id: u64,
+    session_id: String,
+    mut chunks: tokio::sync::broadcast::Receiver<ff_tools::process::ProcessChunk>,
+) {
+    use tokio::sync::broadcast::error::RecvError;
+    tokio::spawn(async move {
+        let process_id = id as u32;
+        loop {
+            match chunks.recv().await {
+                Ok(chunk) => {
+                    let stream = match chunk.stream {
+                        ff_tools::OutputStream::Stderr => OutputStreamKind::Stderr,
+                        ff_tools::OutputStream::Stdout => OutputStreamKind::Stdout,
+                    };
+                    let _ = app.emit(
+                        "process:output",
+                        ProcessOutputEvent {
+                            session_id: session_id.clone(),
+                            process_id,
+                            stream,
+                            delta: String::from_utf8_lossy(&chunk.bytes).into_owned(),
+                        },
+                    );
+                }
+                // The UI fell behind and the bounded broadcast dropped `n`
+                // chunks. Surface the gap as a stderr notice rather than
+                // silently losing output, and keep forwarding.
+                Err(RecvError::Lagged(n)) => {
+                    let _ = app.emit(
+                        "process:output",
+                        ProcessOutputEvent {
+                            session_id: session_id.clone(),
+                            process_id,
+                            stream: OutputStreamKind::Stderr,
+                            delta: format!(
+                                "\n[... {n} output chunk(s) dropped (UI fell behind) ...]\n"
+                            ),
+                        },
+                    );
+                }
+                Err(RecvError::Closed) => break,
+            }
+        }
+        // Process ended: the map entry lives until the reaper, so the status
+        // label is still readable here.
+        let status = supervisor
+            .status_label(id, &session_id)
+            .unwrap_or_else(|| "exited".to_string());
+        let _ = app.emit(
+            "process:exited",
+            ProcessExitedEvent {
+                session_id,
+                process_id,
+                status,
+            },
+        );
+    });
 }
 
 /// Set up and spawn the assistant turn for `session_id`: snapshots the provider,
@@ -3168,6 +3238,8 @@ fn emit_agent_event<R: tauri::Runtime>(
             message_id,
             token_count,
             stop_reason,
+            breakdown,
+            usage,
             ..
         } => {
             let _ = app.emit(
@@ -3177,6 +3249,8 @@ fn emit_agent_event<R: tauri::Runtime>(
                     message_id,
                     token_count,
                     stop_reason,
+                    breakdown,
+                    usage,
                 },
             );
         }
@@ -3523,6 +3597,11 @@ pub fn run() {
                     // next turn. Enters the runtime itself, like
                     // `start_process_reaper` — safe here.
                     state.start_observer_pump(&app_handle);
+                    // Drive the process-output pump (#873): a single long-lived
+                    // task bridges each background process's live stdout/stderr
+                    // to the frontend as `process:output` events across turns.
+                    // Enters the runtime itself, like the pumps above.
+                    state.start_process_output_pump(&app_handle);
                     // Drive the scheduled-task firing engine (RFC 0017 section 4, #542):
                     // a background sweep fires due tasks through the desktop runner. The
                     // tick is coarse; the due predicate is minute-granular, so a 30s sweep
