@@ -1,25 +1,72 @@
 // @vitest-environment jsdom
 
-import { render, screen, cleanup } from "@testing-library/react";
-import { afterEach, describe, expect, it } from "vitest";
+import {
+  render,
+  screen,
+  cleanup,
+  fireEvent,
+  act,
+} from "@testing-library/react";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { ContextGauge } from "@/components/context-gauge";
 import { useChatStore } from "@/store/chat";
+import { useSessionModelStore } from "@/store/session-model";
+import type { ContextBreakdown, ResolvedModel, TurnUsage } from "@/bindings";
 
 const SID = "s1";
 
-// Seed only the two slices the gauge reads; everything else keeps the store's
-// defaults. `tokens` of `null`/`undefined` models the no-estimate state; a `budget`
-// of `null`/`undefined` models the count-only fallback (no ratio denominator yet).
+// Reset every slice the gauge reads back to empty. `tokens`/`budget` cover the
+// legacy count + ratio paths; the popover slices default to empty unless a test
+// seeds them via `seedPopover`.
 function seed(tokens: number | null | undefined, budget?: number | null) {
   useChatStore.setState({
     contextTokensBySession: tokens == null ? {} : { [SID]: tokens },
     contextBudgetBySession: budget == null ? {} : { [SID]: budget },
+    contextInputTokensBySession: {},
+    contextBreakdownBySession: {},
+    sessionTotalsBySession: {},
   });
+  useSessionModelStore.setState({ resolvedBySession: {} });
+}
+
+function seedPopover(opts: {
+  inputTokens?: number;
+  breakdown?: ContextBreakdown;
+  totals?: TurnUsage;
+  model?: string;
+}) {
+  const inputs: Record<string, number> =
+    opts.inputTokens == null ? {} : { [SID]: opts.inputTokens };
+  const breakdowns: Record<string, ContextBreakdown> = opts.breakdown
+    ? { [SID]: opts.breakdown }
+    : {};
+  const totals: Record<string, TurnUsage> = opts.totals
+    ? { [SID]: opts.totals }
+    : {};
+  useChatStore.setState({
+    contextInputTokensBySession: inputs,
+    contextBreakdownBySession: breakdowns,
+    sessionTotalsBySession: totals,
+  });
+  if (opts.model) {
+    const resolved: ResolvedModel = {
+      connection: "c1",
+      model: opts.model,
+      supportsVision: false,
+      supportsDocuments: false,
+      contextWindow: null,
+      trainedContextWindow: null,
+      contextWindowSource: null,
+    };
+    useSessionModelStore.setState({ resolvedBySession: { [SID]: resolved } });
+  }
 }
 
 afterEach(() => {
   cleanup();
+  vi.restoreAllMocks();
+  vi.useRealTimers();
   seed(undefined);
 });
 
@@ -27,7 +74,7 @@ describe("ContextGauge (#282)", () => {
   it("renders the formatted estimate once a turn has reported a count", () => {
     seed(12_345);
     render(<ContextGauge sessionId={SID} />);
-    expect(screen.getByText("≈12.3k")).not.toBeNull();
+    expect(screen.getByText("12.3K")).not.toBeNull();
   });
 
   it("renders nothing when there is no estimate (undefined key)", () => {
@@ -37,10 +84,9 @@ describe("ContextGauge (#282)", () => {
   });
 
   it("renders nothing when the estimate is explicitly null", () => {
-    // The store type holds `number`, but a Done without a count must read as
-    // "no estimate" — guard the null case defensively all the same.
     useChatStore.setState({
       contextTokensBySession: { [SID]: null as unknown as number },
+      contextInputTokensBySession: {},
     });
     const { container } = render(<ContextGauge sessionId={SID} />);
     expect(container.firstChild).toBeNull();
@@ -55,49 +101,40 @@ describe("ContextGauge (#282)", () => {
   it("exposes the exact count via the title/aria-label", () => {
     seed(12_345);
     render(<ContextGauge sessionId={SID} />);
-    expect(
-      screen.getByTitle("Estimated context usage: 12,345 tokens"),
-    ).not.toBeNull();
+    expect(screen.getByTitle("Context usage: 12,345 tokens")).not.toBeNull();
   });
 
-  it("formats sub-1k counts exactly and ≥1M with an M suffix", () => {
+  it("formats sub-1k counts exactly and stays in K past a million", () => {
     seed(840);
     const { rerender } = render(<ContextGauge sessionId={SID} />);
-    expect(screen.getByText("≈840")).not.toBeNull();
+    expect(screen.getByText("840")).not.toBeNull();
 
     useChatStore.setState({ contextTokensBySession: { [SID]: 1_500_000 } });
     rerender(<ContextGauge sessionId={SID} />);
-    expect(screen.getByText("≈1.5M")).not.toBeNull();
+    expect(screen.getByText("1500K")).not.toBeNull();
   });
 });
 
 describe("ContextGauge — usage ratio (#598)", () => {
-  it("renders a Progress bar at tokens/budget once a budget is reported", () => {
+  it("renders a Progress bar at used/budget once a budget is reported", () => {
     seed(60_000, 120_000);
     render(<ContextGauge sessionId={SID} />);
     const bar = screen.getByRole("progressbar");
-    // 60k of a 120k budget → 50%.
     expect(bar.getAttribute("aria-valuenow")).toBe("50");
-    // The count text stays alongside the bar.
-    expect(screen.getByText("≈60.0k")).not.toBeNull();
+    expect(screen.getByText("60K")).not.toBeNull();
     expect(
-      screen.getByTitle(
-        "Estimated context usage: 60,000 of 120,000 tokens (50%)",
-      ),
+      screen.getByTitle("Context usage: 60,000 of 120,000 tokens (50%)"),
     ).not.toBeNull();
   });
 
   it("pegs the bar at 100% when usage exceeds the budget (title keeps the true %)", () => {
     seed(200_000, 120_000);
     render(<ContextGauge sessionId={SID} />);
-    // The bar clamps to 100 even though the raw ratio is 167%.
     expect(screen.getByRole("progressbar").getAttribute("aria-valuenow")).toBe(
       "100",
     );
     expect(
-      screen.getByTitle(
-        "Estimated context usage: 200,000 of 120,000 tokens (167%)",
-      ),
+      screen.getByTitle("Context usage: 200,000 of 120,000 tokens (167%)"),
     ).not.toBeNull();
   });
 
@@ -105,13 +142,111 @@ describe("ContextGauge — usage ratio (#598)", () => {
     seed(60_000);
     render(<ContextGauge sessionId={SID} />);
     expect(screen.queryByRole("progressbar")).toBeNull();
-    expect(screen.getByText("≈60.0k")).not.toBeNull();
+    expect(screen.getByText("60K")).not.toBeNull();
+  });
+});
+
+describe("ContextGauge — popover (#931)", () => {
+  const BREAKDOWN: ContextBreakdown = {
+    systemTokens: 12_000,
+    toolTokens: 2_900,
+    toolSpecs: 1,
+    messageTokens: 158_000,
+    messageCount: 122,
+  };
+  const TOTALS: TurnUsage = {
+    inputTokens: 5_760_000,
+    outputTokens: 45_000,
+    cacheReadTokens: 5_506_000,
+    cacheWriteTokens: 254_000,
+  };
+
+  it("prefers the authoritative inputTokens over the chars/4 proxy for the pill", () => {
+    seed(999_000, 150_000);
+    seedPopover({ inputTokens: 173_000 });
+    render(<ContextGauge sessionId={SID} />);
+    // The trigger shows the real used total, not the proxy.
+    expect(screen.getByText("173K")).not.toBeNull();
+    expect(screen.queryByText("999K")).toBeNull();
   });
 
-  it("falls back to count-only when the budget is zero (no divide-by-zero)", () => {
-    seed(60_000, 0);
+  it("opens on click and renders the breakdown rows, model, and session totals", () => {
+    seed(173_000, 150_000);
+    seedPopover({
+      inputTokens: 173_000,
+      breakdown: BREAKDOWN,
+      totals: TOTALS,
+      model: "claude-opus-4-8",
+    });
     render(<ContextGauge sessionId={SID} />);
-    expect(screen.queryByRole("progressbar")).toBeNull();
-    expect(screen.getByText("≈60.0k")).not.toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: /context usage/i }));
+
+    const panel = document.querySelector('[data-slot="popover-content"]');
+    expect(panel).not.toBeNull();
+    const text = panel?.textContent ?? "";
+    expect(text).toContain("before compaction");
+    expect(text).toContain("System prompt");
+    expect(text).toContain("1 specs");
+    expect(text).toContain("122 msgs");
+    expect(text).toContain("claude-opus-4-8");
+    // SESSION TOTALS block, formatted in K.
+    expect(text).toContain("5760K in / 45K out");
+    expect(text).toContain("5506K read / 254K written");
+  });
+
+  it("copies the full context-usage state as pretty JSON and flashes Copied", async () => {
+    vi.useFakeTimers();
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.assign(navigator, { clipboard: { writeText } });
+
+    seed(173_000, 150_000);
+    seedPopover({
+      inputTokens: 173_000,
+      breakdown: BREAKDOWN,
+      totals: TOTALS,
+      model: "claude-opus-4-8",
+    });
+    render(<ContextGauge sessionId={SID} />);
+
+    fireEvent.click(screen.getByRole("button", { name: /context usage/i }));
+    const copyBtn = screen.getByRole("button", { name: "Copy as JSON" });
+
+    await act(async () => {
+      fireEvent.click(copyBtn);
+    });
+
+    expect(writeText).toHaveBeenCalledTimes(1);
+    const payload = JSON.parse(writeText.mock.calls[0][0] as string);
+    expect(payload).toMatchObject({
+      sessionId: SID,
+      model: "claude-opus-4-8",
+      used: 173_000,
+      budget: 150_000,
+      pctUsed: 115,
+      breakdown: BREAKDOWN,
+      sessionTotals: TOTALS,
+    });
+    // Pretty-printed (2-space indent).
+    expect(writeText.mock.calls[0][0]).toContain('\n  "sessionId"');
+
+    // Transient "Copied" state, reverting after 1500ms.
+    expect(screen.getByRole("button", { name: "Copied" })).not.toBeNull();
+    act(() => {
+      vi.advanceTimersByTime(1500);
+    });
+    expect(screen.getByRole("button", { name: "Copy as JSON" })).not.toBeNull();
+  });
+
+  it("renders the header/pill but omits breakdown + totals when only a proxy count exists", () => {
+    seed(60_000, 120_000);
+    render(<ContextGauge sessionId={SID} />);
+    fireEvent.click(screen.getByRole("button", { name: /context usage/i }));
+    const text =
+      document.querySelector('[data-slot="popover-content"]')?.textContent ??
+      "";
+    expect(text).toContain("before compaction");
+    expect(text).not.toContain("System prompt");
+    expect(text).not.toContain("Session totals");
   });
 });

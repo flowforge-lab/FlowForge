@@ -1,4 +1,4 @@
-import { memo, useState, type ReactNode } from "react";
+import { memo, type ReactNode } from "react";
 import { isValidElement } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -6,6 +6,7 @@ import rehypeHighlight from "rehype-highlight";
 import { Check, Copy, PanelRight } from "@/components/ui/icon";
 import { splitBlocks } from "@/lib/markdown-blocks";
 import { cn } from "@/lib/utils";
+import { useCopied } from "@/lib/use-copied";
 import { useSplitStore } from "@/store/split";
 
 // Flatten React children (including the nested <span> tree rehype-highlight
@@ -25,22 +26,12 @@ function childrenToText(children: ReactNode): string {
 }
 
 function CopyButton({ value }: { value: string }) {
-  const [copied, setCopied] = useState(false);
-
-  async function copy() {
-    try {
-      await navigator.clipboard.writeText(value);
-      setCopied(true);
-      setTimeout(() => setCopied(false), 1500);
-    } catch {
-      // Clipboard can be unavailable (permissions / insecure context); fail quiet.
-    }
-  }
+  const { copied, copy } = useCopied();
 
   return (
     <button
       type="button"
-      onClick={copy}
+      onClick={() => void copy(value)}
       title={copied ? "Copied" : "Copy code"}
       className="flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px] text-muted-foreground/80 transition-colors hover:bg-foreground/10 hover:text-foreground"
     >

@@ -2990,14 +2990,20 @@ Shipping the Settings redesign — currently the Memory browser (SET.8).
             writes: 2,
           });
         }
-        // Whole-session estimate (~4 chars/token), so the count grows with the
+        // Transcript estimate (~4 chars/token), so the count grows with the
         // conversation like the real backend's context assessment does.
-        const sessionTokens = Math.ceil(
-          (this.messages.get(sessionId) ?? []).reduce(
-            (n, m) => n + m.content.length,
-            0,
-          ) / 4,
+        const msgs = this.messages.get(sessionId) ?? [];
+        const messageTokens = Math.ceil(
+          msgs.reduce((n, m) => n + m.content.length, 0) / 4,
         );
+        // Component breakdown for the context-usage popover (#931): a fixed system
+        // prompt + tool-schema base plus the transcript, mirroring how the real
+        // backend buckets its chars/4 estimate into System / Tools / Messages — the
+        // buckets sum to `tokenCount`. Per-turn `usage` gives the FE something to
+        // accumulate into the SESSION TOTALS block across turns.
+        const systemTokens = 1_200;
+        const toolTokens = 320;
+        const sessionTokens = systemTokens + toolTokens + messageTokens;
         this.emit(this.doneListeners, {
           sessionId,
           messageId: turn.messageId,
@@ -3008,6 +3014,19 @@ Shipping the Settings redesign — currently the Memory browser (SET.8).
           // the same field name the regenerated ts-rs binding will carry.
           budgetTokens: 8_000,
           stopReason: null,
+          breakdown: {
+            systemTokens,
+            toolTokens,
+            toolSpecs: 3,
+            messageTokens,
+            messageCount: msgs.length,
+          },
+          usage: {
+            inputTokens: sessionTokens,
+            outputTokens: Math.ceil((turn.messageId.length + 200) / 4),
+            cacheReadTokens: Math.max(sessionTokens - systemTokens, 0),
+            cacheWriteTokens: systemTokens,
+          },
         } as TurnDoneEvent & { budgetTokens: number });
         return;
       }
