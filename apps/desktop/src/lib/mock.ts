@@ -22,6 +22,7 @@ import type {
   ReasoningEvent,
   TurnDoneEvent,
   TurnErrorEvent,
+  TurnStatsEvent,
   ContextBreakdown,
   TurnUsage,
   IntentionSignal,
@@ -860,6 +861,7 @@ export class MockIpc implements FfIpc {
   private reasoningListeners = new Set<Listener<ReasoningEvent>>();
   private doneListeners = new Set<Listener<TurnDoneEvent>>();
   private errorListeners = new Set<Listener<TurnErrorEvent>>();
+  private turnStatsListeners = new Set<Listener<TurnStatsEvent>>();
   private intentionListeners = new Set<Listener<IntentionSignal>>();
   private sessionTitleListeners = new Set<Listener<SessionTitleUpdatedEvent>>();
   private toolCallListeners = new Set<Listener<ToolCallEvent>>();
@@ -1394,6 +1396,9 @@ export class MockIpc implements FfIpc {
   }
   onTurnError(cb: Listener<TurnErrorEvent>): Promise<Unlisten> {
     return this.subscribe(this.errorListeners, cb);
+  }
+  onTurnStats(cb: Listener<TurnStatsEvent>): Promise<Unlisten> {
+    return this.subscribe(this.turnStatsListeners, cb);
   }
   onIntention(cb: Listener<IntentionSignal>): Promise<Unlisten> {
     return this.subscribe(this.intentionListeners, cb);

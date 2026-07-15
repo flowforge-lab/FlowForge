@@ -70,20 +70,21 @@ function ComponentRow({
 
 export function ContextGauge({ sessionId }: { sessionId: string }) {
   const tokens = useChatStore((s) => s.contextTokensBySession[sessionId]);
-  const inputTokens = useChatStore(
-    (s) => s.contextInputTokensBySession[sessionId],
-  );
   const budget = useChatStore((s) => s.contextBudgetBySession[sessionId]);
   const breakdown = useChatStore((s) => s.contextBreakdownBySession[sessionId]);
   const totals = useChatStore((s) => s.sessionTotalsBySession[sessionId]);
+  const ttft = useChatStore((s) => s.ttftBySession[sessionId]);
   const model = useSessionModelStore(
     (s) => s.resolvedBySession[sessionId]?.model,
   );
   const { copied, copy } = useCopied();
 
-  // Authoritative provider "used" wins over the chars/4 proxy; fall back to it,
-  // then bail entirely when neither is known (before the first completed turn).
-  const used = inputTokens ?? tokens;
+  // Total context size from the component breakdown (provider-agnostic, correct
+  // for all providers including Bedrock where inputTokens excludes cached tokens).
+  // Falls back to the chars/4 proxy when no breakdown exists yet.
+  const used = breakdown
+    ? breakdown.systemTokens + breakdown.toolTokens + breakdown.messageTokens
+    : tokens;
   if (used == null) return null;
 
   // Ratio path (#598): only with a usable budget denominator. `Progress` clamps
@@ -109,6 +110,7 @@ export function ContextGauge({ sessionId }: { sessionId: string }) {
       used,
       budget,
       pctUsed: pct,
+      ttft,
       breakdown,
       sessionTotals: totals,
     };
@@ -215,12 +217,24 @@ export function ContextGauge({ sessionId }: { sessionId: string }) {
           </>
         ) : null}
 
-        {model ? (
-          <div className="mt-3 flex items-center gap-2 border-t pt-2 text-xs">
-            <span className="text-muted-foreground">Model</span>
-            <span className="ml-auto min-w-0 truncate tabular-nums">
-              {model}
-            </span>
+        {model || ttft != null ? (
+          <div className="mt-3 space-y-1 border-t pt-2 text-xs">
+            {model ? (
+              <div className="flex items-center gap-2">
+                <span className="text-muted-foreground">Model</span>
+                <span className="ml-auto min-w-0 truncate tabular-nums">
+                  {model}
+                </span>
+              </div>
+            ) : null}
+            {ttft != null ? (
+              <div className="flex items-center gap-2">
+                <span className="text-muted-foreground">TTFT</span>
+                <span className="ml-auto tabular-nums">
+                  {ttft >= 1000 ? `${(ttft / 1000).toFixed(1)}s` : `${ttft}ms`}
+                </span>
+              </div>
+            ) : null}
           </div>
         ) : null}
 

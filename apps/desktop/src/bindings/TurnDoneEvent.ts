@@ -24,4 +24,10 @@ breakdown?: ContextBreakdown,
  * Provider-reported token usage for this turn (#931). `None` when the
  * provider does not report usage (e.g. no metadata frame).
  */
-usage?: TurnUsage, };
+usage?: TurnUsage, 
+/**
+ * Effective compaction budget (context_window * safety_factor) the agent loop
+ * compacts against (#945). The denominator for the popover's usage-% bar.
+ * `None` only for events not originating from `run_turn`.
+ */
+budgetTokens?: number, };

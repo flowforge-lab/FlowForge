@@ -3357,6 +3357,7 @@ fn emit_agent_event<R: tauri::Runtime>(
             stop_reason,
             breakdown,
             usage,
+            budget_tokens,
             ..
         } => {
             let _ = app.emit(
@@ -3368,6 +3369,7 @@ fn emit_agent_event<R: tauri::Runtime>(
                     stop_reason,
                     breakdown,
                     usage,
+                    budget_tokens,
                 },
             );
         }

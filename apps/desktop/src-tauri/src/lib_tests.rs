@@ -909,6 +909,7 @@ async fn emit_agent_event_maps_done_to_turn_done_event() {
         cache_miss_tokens: Some(32),
         breakdown: None,
         usage: None,
+        budget_tokens: Some(160_000),
     };
     emit_agent_event(app.handle(), "session-1", done_event);
 

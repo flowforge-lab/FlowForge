@@ -189,6 +189,12 @@ pub struct TurnDoneEvent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub usage: Option<TurnUsage>,
+    /// Effective compaction budget (context_window * safety_factor) the agent loop
+    /// compacts against (#945). The denominator for the popover's usage-% bar.
+    /// `None` only for events not originating from `run_turn`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub budget_tokens: Option<u32>,
 }
 
 /// Per-turn timing baseline (F1, #427): the wall-clock breakdown the performance
