@@ -678,6 +678,9 @@ fn context_breakdown(
     tool_schemas: &[serde_json::Value],
     messages: &[Message],
 ) -> ContextBreakdown {
+    // NOTE: summing two independent count_tokens calls may differ from
+    // count_tokens(full()) by ±1 token at the split boundary (the tokenizer
+    // could merge the last/first chars differently). Negligible for telemetry.
     let system_tokens = system_prompt.map_or(0, |sp| {
         ff_llm::count_tokens(&sp.stable) + ff_llm::count_tokens(&sp.volatile)
     }) as u32;
