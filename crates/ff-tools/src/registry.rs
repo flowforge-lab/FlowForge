@@ -207,15 +207,31 @@ impl ToolRegistry {
     /// OpenAI `tools` entries, optionally restricted to a sub-agent's allowlist and
     /// with the `agent` delegation tool suppressed once the depth cap is reached
     /// (so a sub-agent at max depth is never even offered a spawn it cannot make).
+    ///
+    /// Tools are emitted in a **stable, name-sorted order**. The registry stores
+    /// tools in a `HashMap` (random per-instance iteration order) and is rebuilt
+    /// every turn, so an unsorted array would reorder the serialized `tools`
+    /// block each turn. Since that block sits in the provider's cached prompt
+    /// prefix (before messages), reordering busts the prefix on every turn —
+    /// Bedrock writes a fresh cache entry but never reads one back
+    /// (`cacheRead == 0`), forcing a full cold prefill and dominating TTBF
+    /// (#947). Sorting keeps the prefix byte-identical across turns so the cache
+    /// actually hits.
     pub fn openai_tools_for(
         &self,
         allowed: Option<&HashSet<String>>,
         allow_subagent: bool,
     ) -> Vec<Value> {
-        self.tools
+        let mut tools: Vec<&dyn Tool> = self
+            .tools
             .values()
+            .map(|t| t.as_ref())
             .filter(|t| allowed.is_none_or(|set| set.contains(t.name())))
             .filter(|t| allow_subagent || !is_subagent(t.name()))
+            .collect();
+        tools.sort_by(|a, b| a.name().cmp(b.name()));
+        tools
+            .into_iter()
             .map(|t| {
                 serde_json::json!({
                     "type": "function",
@@ -437,6 +453,46 @@ mod tests {
             .collect();
         assert!(!names.contains(&"agent"));
         assert_eq!(no_subagent.len(), 16);
+    }
+
+    // #947: the serialized tool order must be stable and name-sorted. The
+    // registry stores tools in a `HashMap` (random per-instance iteration
+    // order) and is rebuilt every turn, so an unsorted array would reorder the
+    // `tools` block each turn and bust the provider's cached prompt prefix
+    // (`cacheRead == 0`, full cold prefill every turn -> ~21s TTBF). Sorting
+    // keeps the prefix byte-identical across turns so the cache hits.
+    #[test]
+    fn openai_tools_order_is_stable_and_sorted() {
+        // Two independently-built registries (distinct HashMap seeds) must
+        // serialize tools in the same order.
+        let names_a: Vec<String> = ToolRegistry::with_defaults()
+            .openai_tools()
+            .iter()
+            .map(|t| t["function"]["name"].as_str().unwrap().to_string())
+            .collect();
+        let names_b: Vec<String> = ToolRegistry::with_defaults()
+            .openai_tools()
+            .iter()
+            .map(|t| t["function"]["name"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(names_a, names_b, "tool order must be stable across builds");
+
+        // ...and that stable order is name-sorted.
+        let mut sorted = names_a.clone();
+        sorted.sort();
+        assert_eq!(names_a, sorted, "tool order must be name-sorted");
+
+        // The allowlisted subset is sorted too (it feeds the same cached prefix).
+        let allowed: HashSet<String> = ["write", "grep", "bash", "view"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let restricted: Vec<String> = ToolRegistry::with_defaults()
+            .openai_tools_for(Some(&allowed), true)
+            .iter()
+            .map(|t| t["function"]["name"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(restricted, vec!["bash", "grep", "view", "write"]);
     }
 
     #[test]
