@@ -195,6 +195,11 @@ interface ChatState {
    *  title is already persisted server-side — unlike `setSessionTitle`, which is a
    *  user rename that must write back through the backend. */
   patchSessionTitle: (sessionId: string, title: string) => void;
+  /** Patch a cached session's bound phenotype locally (#935). The pheno-selector
+   *  writes the binding through `ipc.setSessionPhenotype` (which returns void) and
+   *  uses this to reflect the change immediately + revert on failure. `null`
+   *  clears the binding (the session inherits the global active phenotype). */
+  patchSessionPhenotype: (sessionId: string, name: string | null) => void;
   /** Clear the transient "done" checkmark for `sessionId` (#703): drops its
    *  `recentlyFinishedBySession` entry and cancels the pending TTL timer.
    *  Idempotent. Called on the TTL expiry and when the session is focused. */
@@ -737,6 +742,16 @@ export const useChatStore = create<ChatState>((set, get) => ({
     set((s) => ({
       sessions: s.sessions.map((sess) =>
         sess.id === sessionId ? { ...sess, title } : sess,
+      ),
+    }));
+  },
+
+  patchSessionPhenotype: (sessionId, name) => {
+    set((s) => ({
+      sessions: s.sessions.map((sess) =>
+        sess.id === sessionId
+          ? { ...sess, phenotype: name ?? undefined }
+          : sess,
       ),
     }));
   },

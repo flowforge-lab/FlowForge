@@ -102,9 +102,9 @@ export function SessionPane({
     >
       <div className="flex h-8 shrink-0 items-center justify-between gap-2 border-b bg-card/50 px-2">
         <div className="flex min-w-0 flex-1 items-center gap-1.5">
-          {/* Phenotype selector (#245 2b) — picks the working set this session
-              runs as. v1 switches the global active phenotype; see PhenoSelector. */}
-          <PhenoSelector />
+          {/* Phenotype selector (#245 2b, per-session #935) — picks the working
+              set this pane's session runs as, bound per session. */}
+          <PhenoSelector sessionId={sessionId} />
           <span className="min-w-0 truncate text-xs font-medium text-muted-foreground">
             {title}
           </span>
