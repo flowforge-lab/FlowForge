@@ -438,15 +438,20 @@ impl Provider for BedrockProvider {
         let (mut system, mut messages) = to_converse(&wire);
         let client = self.client().await;
 
-        // Prompt caching (#437): on models that support it, mark the stable
-        // system + tool-schema prefix with a cache point so prefill is near-free
-        // from turn 2. Gated to a known-supported allowlist -- an unsupported
-        // model 400s on a cachePoint block, and a validation error is not
-        // retried, so a false positive would break the turn.
+        // Prompt caching (#437, #933 A.1): on models that support it, place a
+        // cache point after the *stable* system prefix (before the volatile tail).
+        // The agent layer sends two system messages: [0] = stable prefix (persona,
+        // skills, guidance), [1] = volatile tail (date, memory, goal). Inserting the
+        // cache point at index 1 (between the two) means the stable prefix is cached
+        // and reused even when memory/date changes. When only one system block exists,
+        // falls back to appending at end (backward compat).
         let cache = model_supports_cache_point(&req.model);
         if cache {
             if let (false, Some(point)) = (system.is_empty(), cache_point()) {
-                system.push(SystemContentBlock::CachePoint(point));
+                // Insert between stable (index 0) and volatile (index 1) when both
+                // are present; otherwise append after the single block.
+                let pos = if system.len() >= 2 { 1 } else { system.len() };
+                system.insert(pos, SystemContentBlock::CachePoint(point));
             }
         }
         // Message-level cache breakpoints (#763): mark the penultimate message and

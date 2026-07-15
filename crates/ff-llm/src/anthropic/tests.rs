@@ -47,7 +47,7 @@ fn system_messages_become_system_string() {
         ChatMessage::text("user", "hi"),
     ];
     let (system, out) = to_anthropic_messages(&msgs);
-    assert_eq!(system.as_deref(), Some("be brief"));
+    assert_eq!(system, vec!["be brief"]);
     assert_eq!(out.len(), 1);
     assert_eq!(out[0]["role"], "user");
     assert_eq!(out[0]["content"][0]["text"], "hi");
@@ -64,7 +64,7 @@ fn user_summary_stays_in_messages_not_hoisted() {
         ChatMessage::text("assistant", "recent verbatim reply"),
     ];
     let (system, out) = to_anthropic_messages(&msgs);
-    assert_eq!(system.as_deref(), Some("be brief"));
+    assert_eq!(system, vec!["be brief"]);
     assert_eq!(out.len(), 2);
     assert_eq!(out[0]["role"], "user");
     assert_eq!(
@@ -83,7 +83,7 @@ fn multiple_system_messages_join() {
         ChatMessage::text("user", "hi"),
     ];
     let (system, _) = to_anthropic_messages(&msgs);
-    assert_eq!(system.as_deref(), Some("a\nb"));
+    assert_eq!(system, vec!["a", "b"]);
 }
 
 #[test]

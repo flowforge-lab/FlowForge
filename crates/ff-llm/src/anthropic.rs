@@ -246,16 +246,21 @@ fn to_anthropic_request(req: &ChatRequest, max_tokens: u32, effort: ReasoningEff
         "stream": true,
         "messages": messages,
     });
-    if let Some(system) = system {
-        // Prompt caching (#437): mark the stable system prefix as a cache
-        // breakpoint. Anthropic caches `tools` then `system` up to this point, so
-        // prefill is near-free from turn 2. Below the minimum cacheable size the
-        // breakpoint is silently ignored, so this is safe for every Claude model.
-        body["system"] = json!([{
-            "type": "text",
-            "text": system,
-            "cache_control": { "type": "ephemeral" },
-        }]);
+    if !system.is_empty() {
+        // Prompt caching (#437, #933 A.1): send system blocks as an array. The
+        // cache breakpoint goes on the FIRST block (the stable prefix) so its KV
+        // is reused even when the volatile tail (date/memory/goal in later blocks)
+        // changes. Anthropic caches everything up to the marked block.
+        let mut blocks: Vec<Value> = Vec::with_capacity(system.len());
+        for (i, text) in system.iter().enumerate() {
+            let mut block = json!({ "type": "text", "text": text });
+            // Mark the first block (stable prefix) as the cache breakpoint.
+            if i == 0 {
+                block["cache_control"] = json!({ "type": "ephemeral" });
+            }
+            blocks.push(block);
+        }
+        body["system"] = Value::Array(blocks);
     }
     if let Some(mut tools) = to_anthropic_tools(&req.tools) {
         // Second breakpoint on the last tool: the tool-schema block is the largest
@@ -285,7 +290,7 @@ fn to_anthropic_request(req: &ChatRequest, max_tokens: u32, effort: ReasoningEff
 /// `tool_use` blocks. Consecutive same-role messages merge their blocks, and dangling
 /// `tool_use` ids get a synthetic `tool_result` so an already-broken session still
 /// sends (mirrors the Bedrock provider's pairing repair).
-fn to_anthropic_messages(messages: &[ChatMessage]) -> (Option<String>, Vec<Value>) {
+fn to_anthropic_messages(messages: &[ChatMessage]) -> (Vec<String>, Vec<Value>) {
     let mut system: Vec<String> = Vec::new();
     let mut out: Vec<Value> = Vec::new();
 
@@ -321,7 +326,6 @@ fn to_anthropic_messages(messages: &[ChatMessage]) -> (Option<String>, Vec<Value
         }
     }
 
-    let system = (!system.is_empty()).then(|| system.join("\n"));
     (system, enforce_tool_result_pairing(out))
 }
 
