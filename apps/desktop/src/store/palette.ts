@@ -35,6 +35,7 @@ export type PaletteCommand = CommandBase &
     | { kind: "switch-session"; sessionId: string }
     | { kind: "toggle-split" }
     | { kind: "toggle-wrap" }
+    | { kind: "open-files" }
     | { kind: "focus-composer" }
     | { kind: "start-goal" }
     | { kind: "activate-skill"; name: string }

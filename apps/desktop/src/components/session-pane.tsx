@@ -2,6 +2,7 @@ import { useRef, useState } from "react";
 import {
   Columns2,
   EyeOff,
+  Folder,
   Rows2,
   Search,
   Upload,
@@ -19,6 +20,7 @@ import { PhenoSelector } from "@/components/pheno-selector";
 import { useAttachGate } from "@/lib/attach-gate";
 import { stageFiles } from "@/lib/stage-files";
 import { useChatStore } from "@/store/chat";
+import { useFilePanelStore } from "@/store/file-panel";
 import { useFindStore } from "@/store/find";
 import { usePanesStore, MAX_PANES } from "@/store/panes";
 
@@ -111,6 +113,16 @@ export function SessionPane({
           {/* Estimated context usage for this session (#282). Self-hides until
               the first turn completes with an estimate. */}
           <ContextGauge sessionId={sessionId} />
+          {/* Files panel (#872): a visible entry point besides the palette /
+              ⌘⇧E. Opens the workspace browser for the active session. */}
+          <Button
+            variant="ghost"
+            size="icon-xs"
+            title="Open Files (⌘⇧E)"
+            onClick={() => useFilePanelStore.getState().openFiles()}
+          >
+            <Folder className="size-3.5" />
+          </Button>
           {/* Find in thread (#679): Cmd/Ctrl+F also toggles this. */}
           <Button
             variant="ghost"

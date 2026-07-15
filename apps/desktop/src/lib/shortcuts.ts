@@ -32,6 +32,11 @@ export const SHORTCUTS: Shortcut[] = [
   { group: "Navigation", keys: ["Mod", "F"], label: "Find in thread" },
   {
     group: "Navigation",
+    keys: ["Mod", "Shift", "E"],
+    label: "Open Files panel",
+  },
+  {
+    group: "Navigation",
     keys: ["Esc"],
     label: "Close panel / overlay, or stop the turn",
   },

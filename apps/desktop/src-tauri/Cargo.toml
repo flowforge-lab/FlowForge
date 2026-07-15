@@ -37,6 +37,7 @@ ff-tools = { workspace = true }
 ff-mcp = { workspace = true }
 ff-observer = { workspace = true }
 dirs = "5"
+ignore = { workspace = true }
 notify = "7"
 tokio = { workspace = true }
 async-trait = { workspace = true }

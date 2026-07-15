@@ -1,9 +1,9 @@
 use super::state::AppState;
 use super::{
-    emit_agent_event, git_branch, goal_gate_for, is_app_ready, list_local_branches, matrix_gate,
-    panic_message, pre_prompt_decision, publish_app_ready, resolve_tool_arg, resolve_workspace_dir,
-    run_sidecar_turn, should_warmup, switch_branch, BootFinalize, PrePromptDecision, TurnMetrics,
-    UpdateStatus, APP_READY,
+    emit_agent_event, git_branch, goal_gate_for, is_app_ready, list_directory_in,
+    list_local_branches, matrix_gate, panic_message, pre_prompt_decision, publish_app_ready,
+    read_file_in, resolve_tool_arg, resolve_workspace_dir, run_sidecar_turn, should_warmup,
+    switch_branch, BootFinalize, PrePromptDecision, TurnMetrics, UpdateStatus, APP_READY,
 };
 use ff_agent::{AgentEvent, GateDecision};
 use ff_core::events::TurnDoneEvent;
@@ -919,4 +919,108 @@ async fn emit_agent_event_maps_done_to_turn_done_event() {
     let payload = received.expect("turn:done event was not delivered");
     assert_eq!(payload.session_id, "session-1");
     assert_eq!(payload.message_id, "msg-1");
+}
+
+// ── Files panel commands (#872) ──────────────────────────────────────────────
+
+fn write_file(dir: &std::path::Path, rel: &str, body: &[u8]) {
+    let p = dir.join(rel);
+    if let Some(parent) = p.parent() {
+        std::fs::create_dir_all(parent).unwrap();
+    }
+    std::fs::write(p, body).unwrap();
+}
+
+#[test]
+fn list_directory_sorts_dirs_first_then_alphabetical() {
+    let dir = tempfile::tempdir().unwrap();
+    write_file(dir.path(), "zebra.txt", b"z");
+    write_file(dir.path(), "Alpha.txt", b"a");
+    write_file(dir.path(), "src/main.rs", b"");
+    std::fs::create_dir_all(dir.path().join("assets")).unwrap();
+
+    let entries = list_directory_in(dir.path(), "").unwrap();
+    let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+    // Directories first (case-insensitive alphabetical), then files.
+    assert_eq!(names, vec!["assets", "src", "Alpha.txt", "zebra.txt"]);
+    assert!(entries[0].is_dir && entries[1].is_dir);
+    assert_eq!(entries[3].size, 1); // "z"
+}
+
+#[test]
+fn list_directory_respects_gitignore() {
+    let dir = tempfile::tempdir().unwrap();
+    write_file(dir.path(), ".gitignore", b"node_modules/\ntarget/\n");
+    write_file(dir.path(), "src/lib.rs", b"");
+    write_file(dir.path(), "node_modules/pkg/index.js", b"");
+    write_file(dir.path(), "target/debug.log", b"");
+
+    let names: Vec<String> = list_directory_in(dir.path(), "")
+        .unwrap()
+        .into_iter()
+        .map(|e| e.name)
+        .collect();
+    assert!(names.contains(&"src".to_string()));
+    assert!(!names.contains(&"node_modules".to_string()), "{names:?}");
+    assert!(!names.contains(&"target".to_string()), "{names:?}");
+}
+
+#[test]
+fn list_directory_rejects_jail_escape() {
+    let dir = tempfile::tempdir().unwrap();
+    let err = list_directory_in(dir.path(), "../").unwrap_err();
+    assert!(err.contains("access denied"), "{err}");
+}
+
+#[test]
+fn read_file_returns_utf8_text() {
+    let dir = tempfile::tempdir().unwrap();
+    write_file(dir.path(), "hello.txt", b"hello world");
+    let fc = read_file_in(dir.path(), "hello.txt", None).unwrap();
+    assert_eq!(fc.text.as_deref(), Some("hello world"));
+    assert!(!fc.is_binary);
+    assert!(!fc.truncated);
+    assert_eq!(fc.size, 11);
+}
+
+#[test]
+fn read_file_flags_binary() {
+    let dir = tempfile::tempdir().unwrap();
+    write_file(dir.path(), "blob.bin", &[0xff, 0xfe, 0x00, 0x01]);
+    let fc = read_file_in(dir.path(), "blob.bin", None).unwrap();
+    assert!(fc.is_binary);
+    assert!(fc.text.is_none());
+    assert_eq!(fc.size, 4);
+}
+
+#[test]
+fn read_file_truncates_to_cap() {
+    let dir = tempfile::tempdir().unwrap();
+    write_file(dir.path(), "big.txt", b"abcdefghij"); // 10 bytes
+    let fc = read_file_in(dir.path(), "big.txt", Some(4)).unwrap();
+    assert!(fc.truncated);
+    assert_eq!(fc.text.as_deref(), Some("abcd"));
+    assert_eq!(fc.size, 10);
+    assert!(!fc.is_binary);
+}
+
+#[test]
+fn read_file_truncation_mid_multibyte_char_stays_text() {
+    let dir = tempfile::tempdir().unwrap();
+    // "é" is 2 bytes (0xC3 0xA9); cap at 2 lands between "a" and the é bytes...
+    write_file(dir.path(), "accent.txt", "aé".as_bytes()); // 3 bytes total
+    let fc = read_file_in(dir.path(), "accent.txt", Some(2)).unwrap();
+    assert!(fc.truncated);
+    assert!(
+        !fc.is_binary,
+        "mid-char truncation must not be flagged binary"
+    );
+    assert_eq!(fc.text.as_deref(), Some("a"));
+}
+
+#[test]
+fn read_file_rejects_jail_escape() {
+    let dir = tempfile::tempdir().unwrap();
+    let err = read_file_in(dir.path(), "../secret.txt", None).unwrap_err();
+    assert!(err.contains("access denied"), "{err}");
 }

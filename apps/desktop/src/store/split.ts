@@ -9,7 +9,11 @@ import { create } from "zustand";
 // new kind without a matching case is a compile-time error (the TODO finds you).
 export type SplitContent =
   | { kind: "code"; lang: string; text: string; title?: string }
-  | { kind: "text"; text: string; title?: string };
+  | { kind: "text"; text: string; title?: string }
+  // The workspace file browser (#872). A payload-free marker: the tree/selection/
+  // viewer state lives in `store/file-panel.ts`, so large file bodies never get
+  // serialized into this store's localStorage blob on every mutation.
+  | { kind: "files" };
 
 export const MIN_SPLIT_WIDTH = 320;
 export const MAX_SPLIT_WIDTH = 960;

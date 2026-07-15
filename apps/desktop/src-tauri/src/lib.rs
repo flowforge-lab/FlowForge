@@ -24,11 +24,12 @@ use ff_core::events::{
     TurnErrorEvent, TurnStatsEvent, UpdateProgressEvent,
 };
 use ff_core::{
-    Attachment, BedrockAuth, CreateScheduledTaskInput, Format, Goal, GoalStatus, McpServerConfig,
-    McpServerStatus, MemoryFileInfo, MemoryFileKind, MemoryOverview, Message, Mode, ModelSelection,
-    PermissionCell, PermissionMatrixView, Phenotype, ProviderConfig, ProviderConnection,
-    ProviderKind, ProviderRegistry, ResolvedModel, Role, RunRecord, RunStatus, ScheduledTask,
-    SearchConfig, SecretKind, Session, SessionWorkspace, Skill, SkillInfo, SkillManifest, TaskKind,
+    Attachment, BedrockAuth, CreateScheduledTaskInput, DirEntry, FileContent, Format, Goal,
+    GoalStatus, McpServerConfig, McpServerStatus, MemoryFileInfo, MemoryFileKind, MemoryOverview,
+    Message, Mode, ModelSelection, PermissionCell, PermissionMatrixView, Phenotype, ProviderConfig,
+    ProviderConnection, ProviderKind, ProviderRegistry, ResolvedModel, Role, RunRecord, RunStatus,
+    ScheduledTask, SearchConfig, SecretKind, Session, SessionWorkspace, Skill, SkillInfo,
+    SkillManifest, TaskKind,
 };
 use ff_observer::ObserverEvent;
 use ff_scheduled::ScheduledApprover;
@@ -994,6 +995,121 @@ fn read_memory_file(state: State<'_, Arc<AppState>>, rel_path: String) -> Result
         .memory()
         .read_file(&rel_path)
         .ok_or_else(|| "invalid memory path".to_string())
+}
+
+/// Default cap for [`read_file`] when the caller passes no `max_bytes`: 512 KiB.
+/// Large files are truncated to this prefix so the viewer stays responsive.
+const DEFAULT_READ_FILE_BYTES: u64 = 512 * 1024;
+
+/// List one directory level under a session's workspace, for the Files panel
+/// (Issue #872). `path` is relative to the session workspace root (`""` or `"."`
+/// is the root). Jailed via [`ff_tools::resolve_in_root`] so `..`/symlink
+/// escapes are rejected, and `.gitignore`-aware (so `node_modules`, `target/`,
+/// etc. are omitted) via the same `ignore` walker the `tree` tool uses. Entries
+/// are sorted directories-first, then case-insensitively by name.
+#[tauri::command]
+fn list_directory(
+    state: State<'_, Arc<AppState>>,
+    session_id: String,
+    path: String,
+) -> Result<Vec<DirEntry>, String> {
+    list_directory_in(&state.session_root(&session_id), &path)
+}
+
+/// The listing logic behind [`list_directory`], split out so it is unit-testable
+/// against a temp workspace without a Tauri `State`.
+fn list_directory_in(root: &std::path::Path, path: &str) -> Result<Vec<DirEntry>, String> {
+    let rel = if path.is_empty() { "." } else { path };
+    let dir = ff_tools::resolve_in_root(root, rel)?;
+    if !dir.is_dir() {
+        return Err(format!("not a directory: {rel}"));
+    }
+
+    // `ignore` counts the walk root as depth 0; depth 1 is its direct children.
+    let mut walk = ignore::WalkBuilder::new(&dir);
+    walk.require_git(false).max_depth(Some(1));
+
+    let mut entries: Vec<DirEntry> = Vec::new();
+    for entry in walk.build().flatten() {
+        if entry.depth() == 0 {
+            continue;
+        }
+        let is_dir = entry.file_type().is_some_and(|t| t.is_dir());
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let size = if is_dir {
+            0
+        } else {
+            entry.metadata().map(|m| m.len()).unwrap_or(0)
+        };
+        entries.push(DirEntry { name, is_dir, size });
+    }
+
+    entries.sort_by(|a, b| {
+        b.is_dir
+            .cmp(&a.is_dir)
+            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+    });
+    Ok(entries)
+}
+
+/// Read one file's body under a session's workspace, for the Files panel viewer
+/// (Issue #872). `path` is relative to the session workspace root and jailed like
+/// [`list_directory`]. Reads at most `max_bytes` (default [`DEFAULT_READ_FILE_BYTES`]);
+/// `truncated` is set when the file is larger. Non-UTF-8 content returns
+/// `is_binary: true` with `text: None` so the viewer shows a placeholder instead
+/// of raw bytes.
+#[tauri::command]
+fn read_file(
+    state: State<'_, Arc<AppState>>,
+    session_id: String,
+    path: String,
+    max_bytes: Option<u64>,
+) -> Result<FileContent, String> {
+    read_file_in(&state.session_root(&session_id), &path, max_bytes)
+}
+
+/// The read logic behind [`read_file`], split out so it is unit-testable against a
+/// temp workspace without a Tauri `State`.
+fn read_file_in(
+    root: &std::path::Path,
+    path: &str,
+    max_bytes: Option<u64>,
+) -> Result<FileContent, String> {
+    use std::io::Read;
+
+    let file_path = ff_tools::resolve_in_root(root, path)?;
+    let meta = std::fs::metadata(&file_path).map_err(|e| format!("cannot read {path}: {e}"))?;
+    if !meta.is_file() {
+        return Err(format!("not a file: {path}"));
+    }
+    let size = meta.len();
+    let cap = max_bytes.unwrap_or(DEFAULT_READ_FILE_BYTES);
+    let truncated = size > cap;
+
+    let file = std::fs::File::open(&file_path).map_err(|e| format!("cannot open {path}: {e}"))?;
+    let mut bytes = Vec::new();
+    file.take(cap)
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("cannot read {path}: {e}"))?;
+
+    // Decode as UTF-8. When truncated, an "unexpected end of input" error
+    // (`error_len() == None`) just means the cap fell mid-multibyte-char, so we
+    // keep the valid prefix as text rather than mislabeling a text file binary.
+    let (text, is_binary) = match std::str::from_utf8(&bytes) {
+        Ok(s) => (Some(s.to_owned()), false),
+        Err(e) if truncated && e.error_len().is_none() => {
+            let valid = &bytes[..e.valid_up_to()];
+            (Some(String::from_utf8_lossy(valid).into_owned()), false)
+        }
+        Err(_) => (None, true),
+    };
+
+    Ok(FileContent {
+        text,
+        is_binary,
+        truncated,
+        size,
+    })
 }
 
 /// Summarize the memory store (file/byte counts, root, enabled flag) for the
@@ -3736,6 +3852,8 @@ pub fn run() {
             list_memory_files,
             read_memory_file,
             memory_overview,
+            list_directory,
+            read_file,
             list_memory_chunks,
             reset_memory_chunk,
             set_memory_chunk_pinned,

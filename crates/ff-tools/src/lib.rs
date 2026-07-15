@@ -51,6 +51,10 @@ mod write;
 pub use agent_tool::{AgentTool, AGENT_TOOL_NAME};
 pub use compaction::{CompactionRetrieveTool, COMPACTION_RETRIEVE_TOOL};
 pub use goal_complete::{GoalCompleteTool, GOAL_COMPLETE_TOOL_NAME};
+// The workspace path-jail entry point, surfaced to the desktop crate's file
+// commands (#872). Only `resolve_in_root` is re-exported — the module itself
+// stays private so its internals aren't part of the crate's public API.
+pub use jail::resolve_in_root;
 pub use notebook::{KernelLiveState, KernelSupervisor, NotebookKernelState, NotebookTool};
 pub use registry::{is_subagent, Safety, Tool, ToolOutcome, ToolRegistry};
 pub use sink::{OutputSink, OutputStream};

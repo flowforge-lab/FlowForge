@@ -61,6 +61,8 @@ import type {
   PermissionMatrixView,
 } from "../bindings";
 import type { Goal } from "../bindings/Goal";
+import type { DirEntry } from "../bindings/DirEntry";
+import type { FileContent } from "../bindings/FileContent";
 import type { Format } from "../bindings/Format";
 import type { SecretKind } from "../bindings/SecretKind";
 import type { BedrockAuth } from "../bindings/BedrockAuth";
@@ -114,6 +116,21 @@ export interface FfIpc {
    *  callers do not need to patch the workspace store themselves. Rejects on an
    *  unknown branch or a checkout git refuses (e.g. a dirty working tree). */
   checkoutBranch(sessionId: string, branch: string): Promise<SessionWorkspace>;
+  /** List one directory level under the session workspace, for the Files panel
+   *  (#872). `path` is relative to the workspace root (`""` is the root). Jailed
+   *  to the root and `.gitignore`-aware (no `node_modules`/`target`); entries are
+   *  sorted directories-first, then case-insensitively by name. Rejects a path
+   *  that escapes the root or is not a directory. */
+  listDirectory(sessionId: string, path: string): Promise<DirEntry[]>;
+  /** Read one file's body under the session workspace, for the Files panel viewer
+   *  (#872). Reads at most `maxBytes` (default 512KB); `truncated` marks a larger
+   *  file. Non-UTF-8 content returns `isBinary: true` with `text: null`. Rejects a
+   *  path that escapes the root or is not a file. */
+  readFile(
+    sessionId: string,
+    path: string,
+    maxBytes?: number,
+  ): Promise<FileContent>;
   /** Persists the user message and starts the assistant turn. Returns the user message id. */
   sendMessage(
     sessionId: string,
@@ -715,6 +732,10 @@ class TauriIpc implements FfIpc {
     this.invoke<string[]>("list_branches", { sessionId });
   checkoutBranch = (sessionId: string, branch: string) =>
     this.invoke<SessionWorkspace>("checkout_branch", { sessionId, branch });
+  listDirectory = (sessionId: string, path: string) =>
+    this.invoke<DirEntry[]>("list_directory", { sessionId, path });
+  readFile = (sessionId: string, path: string, maxBytes?: number) =>
+    this.invoke<FileContent>("read_file", { sessionId, path, maxBytes });
   sendMessage = (
     sessionId: string,
     content: string,

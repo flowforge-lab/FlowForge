@@ -2,6 +2,7 @@ import { useState } from "react";
 import { Check, Copy, WrapText, X } from "@/components/ui/icon";
 import { cn } from "@/lib/utils";
 import { HighlightedCode } from "@/components/markdown";
+import { FilePanel } from "@/components/file-panel";
 import {
   clampSplitWidth,
   useSplitStore,
@@ -65,6 +66,7 @@ function CopyIconButton({ value }: { value: string }) {
 // ── Body ─────────────────────────────────────────────────────────────────────
 
 function headerTitle(content: SplitContent): string {
+  if (content.kind === "files") return "Files";
   if (content.title) return content.title;
   return content.kind === "code" ? content.lang || "code" : "output";
 }
@@ -90,6 +92,9 @@ function SplitBody({
       );
     case "text":
       return <pre className={preClass}>{content.text}</pre>;
+    case "files":
+      // The file browser owns its own layout (tree + viewer) and scrolling.
+      return <FilePanel />;
     default: {
       // Exhaustiveness guard: adding a SplitContent kind without a case here
       // becomes a compile error (the TODO finds you). See store/split.ts.
@@ -112,6 +117,11 @@ export function SplitPanel() {
 
   // Closed → render nothing, so the chat column is full-width (unchanged UX).
   if (!open) return null;
+
+  // The file browser (#872) manages its own scrolling, wrap, and copy actions,
+  // so the generic text-oriented header controls don't apply to it.
+  const isFiles = content?.kind === "files";
+  const textValue = content && "text" in content ? content.text : undefined;
 
   // Drag-to-resize: the panel is flush to the window's right edge, so its width
   // is simply the distance from the cursor to that edge. During the drag the
@@ -156,21 +166,23 @@ export function SplitPanel() {
           {content ? headerTitle(content) : "Split"}
         </span>
         <div className="flex shrink-0 items-center gap-0.5">
-          <IconButton
-            title={wrap ? "Disable wrap" : "Enable wrap"}
-            active={wrap}
-            onClick={toggleWrap}
-          >
-            <WrapText className="size-3.5" />
-          </IconButton>
-          {content && <CopyIconButton value={content.text} />}
+          {!isFiles && (
+            <IconButton
+              title={wrap ? "Disable wrap" : "Enable wrap"}
+              active={wrap}
+              onClick={toggleWrap}
+            >
+              <WrapText className="size-3.5" />
+            </IconButton>
+          )}
+          {textValue !== undefined && <CopyIconButton value={textValue} />}
           <IconButton title="Close (Esc)" onClick={closeSplit}>
             <X className="size-3.5" />
           </IconButton>
         </div>
       </div>
 
-      <div className="min-h-0 flex-1 overflow-auto">
+      <div className={cn("min-h-0 flex-1", isFiles ? "flex" : "overflow-auto")}>
         {content ? (
           <SplitBody content={content} wrap={wrap} />
         ) : (

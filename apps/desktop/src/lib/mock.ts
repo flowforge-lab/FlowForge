@@ -50,6 +50,8 @@ import type {
   PermissionMatrixView,
 } from "../bindings";
 import type { Format } from "../bindings/Format";
+import type { DirEntry } from "../bindings/DirEntry";
+import type { FileContent } from "../bindings/FileContent";
 import type { SecretKind } from "../bindings/SecretKind";
 import type { BedrockAuth } from "../bindings/BedrockAuth";
 import type { SearchHit } from "../bindings/SearchHit";
@@ -671,6 +673,23 @@ export class MockIpc implements FfIpc {
   private mockBranches = new Map<string, string>();
   /** Local branches the mock offers in the switch picker (#628). */
   private readonly mockBranchList = ["main", "develop", "feature/demo"];
+  /** Seeded in-memory workspace tree for the Files panel (#872). Keys are
+   *  workspace-relative POSIX paths of *files*; directories are derived from the
+   *  path segments. A `null` value stands in for a binary file. `node_modules`
+   *  is deliberately absent — the real backend hides it via `.gitignore`. */
+  private readonly mockTree: Record<string, string | null> = {
+    "README.md":
+      "# FlowForge\n\nA local-first agent workspace.\n\n- Fast\n- Private\n\nSee [the guide](docs/guide.md).\n",
+    "package.json": '{\n  "name": "flowforge",\n  "version": "0.1.0"\n}\n',
+    "src/main.ts": 'import { start } from "./app";\n\nstart();\n',
+    "src/app.ts":
+      'export function start(): void {\n  console.log("hello from flowforge");\n}\n',
+    "src/lib/util.ts":
+      "export const clamp = (n: number, lo: number, hi: number): number =>\n  Math.max(lo, Math.min(hi, n));\n",
+    "assets/logo.png": null,
+    "docs/guide.md":
+      "## Guide\n\nSome **markdown** content with a [link](https://example.com) and a list:\n\n1. First\n2. Second\n",
+  };
   // One active timer per session so cancelTurn can stop it.
   private activeTimers = new Map<string, ActiveTurn>();
 
@@ -1038,6 +1057,76 @@ export class MockIpc implements FfIpc {
 
   async listBranches(_sessionId: string): Promise<string[]> {
     return [...this.mockBranchList];
+  }
+
+  /** Normalize a workspace-relative path (strip `./`, leading/trailing slashes;
+   *  `.`/`""` → root) and reject anything that escapes the root, mirroring the
+   *  backend jail's `access denied` contract. */
+  private resolveMockPath(path: string): string {
+    const rel = path.replace(/^\.?\/+/, "").replace(/\/+$/, "");
+    const norm = rel === "." ? "" : rel;
+    if (norm === ".." || norm.startsWith("../") || norm.includes("/../")) {
+      throw new Error(
+        `access denied: ${path} resolves outside the workspace root`,
+      );
+    }
+    return norm;
+  }
+
+  async listDirectory(_sessionId: string, path: string): Promise<DirEntry[]> {
+    const dir = this.resolveMockPath(path);
+    const prefix = dir ? `${dir}/` : "";
+    const dirs = new Set<string>();
+    const files: DirEntry[] = [];
+    for (const [p, content] of Object.entries(this.mockTree)) {
+      if (!p.startsWith(prefix)) continue;
+      const rest = p.slice(prefix.length);
+      const slash = rest.indexOf("/");
+      if (slash === -1) {
+        const size =
+          content === null ? 2048 : new TextEncoder().encode(content).length;
+        files.push({ name: rest, isDir: false, size });
+      } else {
+        dirs.add(rest.slice(0, slash));
+      }
+    }
+    const entries: DirEntry[] = [
+      ...[...dirs].map((name) => ({ name, isDir: true, size: 0 })),
+      ...files,
+    ];
+    // Directories first, then case-insensitive alphabetical — same as the backend.
+    entries.sort((a, b) =>
+      a.isDir === b.isDir
+        ? a.name.toLowerCase().localeCompare(b.name.toLowerCase())
+        : a.isDir
+          ? -1
+          : 1,
+    );
+    return entries;
+  }
+
+  async readFile(
+    _sessionId: string,
+    path: string,
+    maxBytes?: number,
+  ): Promise<FileContent> {
+    const rel = this.resolveMockPath(path);
+    if (!(rel in this.mockTree)) {
+      throw new Error(`cannot read ${path}: no such file`);
+    }
+    const content = this.mockTree[rel];
+    if (content === null) {
+      return { text: null, isBinary: true, truncated: false, size: 2048 };
+    }
+    const size = new TextEncoder().encode(content).length;
+    const cap = maxBytes ?? 512 * 1024;
+    const truncated = size > cap;
+    return {
+      text: truncated ? content.slice(0, cap) : content,
+      isBinary: false,
+      truncated,
+      size,
+    };
   }
 
   async checkoutBranch(
