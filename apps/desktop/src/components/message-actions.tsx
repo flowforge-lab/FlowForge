@@ -1,6 +1,7 @@
-import { useEffect, useRef, useState, type ReactNode } from "react";
+import { type ReactNode } from "react";
 import { Check, Copy, PencilLine } from "@/components/ui/icon";
 import { cn } from "@/lib/utils";
+import { useCopied } from "@/lib/use-copied";
 import { useComposerStore } from "@/store/composer";
 import type { Message } from "@/bindings";
 
@@ -26,28 +27,7 @@ function ActionButton({
   );
 }
 
-// Clipboard + transient-"Copied" (1500ms) state, shared by the copy affordances
-// here. Mirrors the same pattern in markdown.tsx's CopyButton: write to the
-// clipboard, flash "Copied", then revert. Fail-quiet — the clipboard can be
-// unavailable in an insecure context or without permission.
-function useCopied() {
-  const [copied, setCopied] = useState(false);
-  const timer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
-  useEffect(() => () => clearTimeout(timer.current), []);
-  const copy = async (text: string) => {
-    try {
-      await navigator.clipboard.writeText(text);
-      setCopied(true);
-      clearTimeout(timer.current);
-      timer.current = setTimeout(() => setCopied(false), 1500);
-    } catch {
-      // Clipboard unavailable (permissions / insecure context); fail quiet.
-    }
-  };
-  return { copied, copy };
-}
-
-// Mirrors the clipboard + transient-"Copied" pattern from markdown.tsx's CopyButton.
+// Mirrors the clipboard + transient-"Copied" pattern via the shared `useCopied`.
 function CopyAction({ text }: { text: string }) {
   const { copied, copy } = useCopied();
   return (

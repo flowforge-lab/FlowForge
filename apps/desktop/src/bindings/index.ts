@@ -29,6 +29,8 @@ export type { ToolResultEvent } from "./ToolResultEvent";
 export type { ToolOutputChunkEvent } from "./ToolOutputChunkEvent";
 export type { OutputStreamKind } from "./OutputStreamKind";
 export type { TurnDoneEvent } from "./TurnDoneEvent";
+export type { ContextBreakdown } from "./ContextBreakdown";
+export type { TurnUsage } from "./TurnUsage";
 export type { TurnErrorEvent } from "./TurnErrorEvent";
 export type { TurnStatsEvent } from "./TurnStatsEvent";
 export type { MemoryFlushedEvent } from "./MemoryFlushedEvent";

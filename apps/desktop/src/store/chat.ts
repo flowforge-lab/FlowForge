@@ -11,12 +11,14 @@ import { useSessionDoneToastStore } from "@/store/session-done-toast";
 import type {
   Attachment,
   ApprovalSafety,
+  ContextBreakdown,
   Message,
   Session,
   TokenEvent,
   ReasoningEvent,
   TurnDoneEvent,
   TurnErrorEvent,
+  TurnUsage,
   ToolApprovalRequestEvent,
   ToolAskRequestEvent,
   ToolCallEvent,
@@ -93,6 +95,20 @@ interface ChatState {
    *  Pairs with `contextTokensBySession` to render a usage ratio; undefined until a
    *  turn reports one (so the gauge falls back to count-only). */
   contextBudgetBySession: Record<string, number>;
+  /** sessionId -> component breakdown of the context estimate from the last
+   *  completed turn (#931). Populated from TurnDoneEvent.breakdown; drives the
+   *  context-usage popover's segmented System/Tools/Messages bar + rows. Undefined
+   *  until a telemetry-bearing turn completes. */
+  contextBreakdownBySession: Record<string, ContextBreakdown>;
+  /** sessionId -> authoritative provider-reported input ("used") tokens from the
+   *  last completed turn (#931). Populated from TurnDoneEvent.usage.inputTokens;
+   *  preferred over the `chars/4` proxy (`contextTokensBySession`) as the popover's
+   *  "used" numerator. Undefined until a provider reports usage. */
+  contextInputTokensBySession: Record<string, number>;
+  /** sessionId -> cumulative provider token usage summed across all turns (#931).
+   *  Each turn's TurnDoneEvent.usage is added into the running total; drives the
+   *  popover's SESSION TOTALS block. Undefined until a provider reports usage. */
+  sessionTotalsBySession: Record<string, TurnUsage>;
   /** sessionId -> the last turn ended without a usable answer the user can resume
    *  with one click — the agent loop hit the tool-call cap / stalled (`[stopped: …]`),
    *  or the user pressed Stop (a bare `[stopped]`, #636), so a one-click "Continue"
@@ -288,6 +304,17 @@ function clearResumable(
   return { resumableBySession };
 }
 
+/** Add one turn's provider usage into a session's running total (#931), field by
+ *  field. A first turn (no prior total) starts from the turn's own counts. */
+function addUsage(prev: TurnUsage | undefined, next: TurnUsage): TurnUsage {
+  return {
+    inputTokens: (prev?.inputTokens ?? 0) + next.inputTokens,
+    outputTokens: (prev?.outputTokens ?? 0) + next.outputTokens,
+    cacheReadTokens: (prev?.cacheReadTokens ?? 0) + next.cacheReadTokens,
+    cacheWriteTokens: (prev?.cacheWriteTokens ?? 0) + next.cacheWriteTokens,
+  };
+}
+
 const systemMessage = (sessionId: string, content: string): Message => ({
   id: crypto.randomUUID(),
   sessionId,
@@ -329,6 +356,9 @@ export const useChatStore = create<ChatState>((set, get) => ({
   reasoningByMessage: {},
   contextTokensBySession: {},
   contextBudgetBySession: {},
+  contextBreakdownBySession: {},
+  contextInputTokensBySession: {},
+  sessionTotalsBySession: {},
   resumableBySession: {},
   recentlyFinishedBySession: {},
   sessionApprovedBySession: {},
@@ -856,6 +886,32 @@ export const useChatStore = create<ChatState>((set, get) => ({
         budget != null
           ? { ...s.contextBudgetBySession, [e.sessionId]: budget }
           : s.contextBudgetBySession,
+      // Component breakdown for the context-usage popover (#931). Optional on the
+      // event — a turn without telemetry (non-Bedrock / no metadata) keeps the prior
+      // value so the popover doesn't lose its bar mid-session.
+      contextBreakdownBySession: e.breakdown
+        ? { ...s.contextBreakdownBySession, [e.sessionId]: e.breakdown }
+        : s.contextBreakdownBySession,
+      // Authoritative provider "used" total (#931), preferred over the chars/4 proxy
+      // as the popover's numerator. Only when the provider reported usage this turn.
+      contextInputTokensBySession: e.usage
+        ? {
+            ...s.contextInputTokensBySession,
+            [e.sessionId]: e.usage.inputTokens,
+          }
+        : s.contextInputTokensBySession,
+      // Cumulative session totals (#931): add this turn's usage into the running
+      // per-session total (SESSION TOTALS block). Accumulates in the FE store rather
+      // than AppState, matching how contextTokensBySession already works.
+      sessionTotalsBySession: e.usage
+        ? {
+            ...s.sessionTotalsBySession,
+            [e.sessionId]: addUsage(
+              s.sessionTotalsBySession[e.sessionId],
+              e.usage,
+            ),
+          }
+        : s.sessionTotalsBySession,
     }));
 
     // Arm the checkmark's fade timer and raise the completion toast (#703). Both
