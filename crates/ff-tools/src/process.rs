@@ -39,7 +39,7 @@ use chrono::{DateTime, Utc};
 use serde_json::Value;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, mpsc};
 
 use crate::registry::{Safety, Tool, ToolOutcome, NO_SESSION};
 use crate::sink::{OutputSink, OutputStream};
@@ -95,6 +95,26 @@ const SUBSCRIBER_CAPACITY: usize = 64;
 pub struct ProcessChunk {
     pub stream: OutputStream,
     pub bytes: Bytes,
+}
+
+/// A process-lifecycle notification the supervisor emits to an opt-in host
+/// listener (#873). The desktop installs one listener via
+/// [`ProcessSupervisor::lifecycle_channel`] and, on each `Started`, spawns a
+/// bridge task that forwards `rx` chunks to the frontend as `process:output`
+/// events — live output that outlives the `start` tool call and any single
+/// turn. Headless callers (tests, the CLI) never install a listener, so this
+/// costs nothing and process behavior is unchanged.
+///
+/// `rx` is subscribed *inside* `start`, before the drain tasks spawn, so the
+/// bridge receives output from the first byte with no head-of-stream gap.
+#[derive(Debug)]
+pub enum ProcessLifecycle {
+    Started {
+        id: u64,
+        session_id: String,
+        command: String,
+        rx: broadcast::Receiver<ProcessChunk>,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -203,6 +223,12 @@ struct ManagedProcess {
 pub struct ProcessSupervisor {
     procs: Mutex<HashMap<u64, ManagedProcess>>,
     next_id: AtomicU64,
+    /// Opt-in host listener for process lifecycle events (#873). `None` until
+    /// [`lifecycle_channel`](Self::lifecycle_channel) installs it. When present,
+    /// `start` arms the per-process broadcast eagerly and emits a
+    /// [`ProcessLifecycle::Started`]; when absent, `start` behaves exactly as
+    /// before (lazy broadcast, no notification).
+    lifecycle_tx: Mutex<Option<mpsc::UnboundedSender<ProcessLifecycle>>>,
 }
 
 impl Default for ProcessSupervisor {
@@ -216,7 +242,20 @@ impl ProcessSupervisor {
         Self {
             procs: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(1),
+            lifecycle_tx: Mutex::new(None),
         }
+    }
+
+    /// Install the (single) host lifecycle listener and return its receiver
+    /// (#873). Call once at startup — a second call replaces the sender and
+    /// returns a fresh receiver, orphaning the previous one (a misuse; the
+    /// desktop calls it exactly once when building [`AppState`]). While a
+    /// listener is installed, [`start`](Self::start) pre-arms each process's
+    /// output broadcast so the bridge sees output from the first byte.
+    pub fn lifecycle_channel(&self) -> mpsc::UnboundedReceiver<ProcessLifecycle> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        *self.lifecycle_tx.lock().unwrap() = Some(tx);
+        rx
     }
 
     /// Spawn `command` (via [`crate::shell::shell_invocation`]) in `dir`, capturing stdout and
@@ -262,6 +301,21 @@ impl ProcessSupervisor {
         let job = child.raw_handle().and_then(assign_to_new_job);
         let shared = Arc::new(Shared::new(MAX_BUFFER_BYTES));
 
+        // #873: if a host lifecycle listener is installed, pre-arm the output
+        // broadcast and subscribe *before* the drain tasks spawn, so the bridge
+        // receives output from the first byte (a lazily-created channel would
+        // miss everything written before the first `subscribe`). No listener ->
+        // `None`, and the broadcast stays lazy exactly as before.
+        let lifecycle = self.lifecycle_tx.lock().unwrap().clone();
+        let lifecycle_rx = lifecycle.as_ref().map(|_| {
+            shared
+                .subscribers
+                .lock()
+                .unwrap()
+                .get_or_insert_with(|| broadcast::channel(SUBSCRIBER_CAPACITY).0)
+                .subscribe()
+        });
+
         if let Some(out) = child.stdout.take() {
             tokio::spawn(drain(out, shared.clone(), false));
         }
@@ -295,6 +349,19 @@ impl ProcessSupervisor {
                 last_poll_at: Instant::now(),
             },
         );
+
+        // #873: notify the host so it can bridge this process's output to the
+        // frontend. `lifecycle_rx` is `Some` iff a listener was installed, in
+        // which case it was subscribed above (pre-drain), so no output is lost.
+        if let (Some(tx), Some(rx)) = (lifecycle, lifecycle_rx) {
+            let _ = tx.send(ProcessLifecycle::Started {
+                id,
+                session_id: session_id.to_string(),
+                command: command.to_string(),
+                rx,
+            });
+        }
+
         Ok(id)
     }
 
@@ -320,6 +387,20 @@ impl ProcessSupervisor {
             out.trim_end(),
             err.trim_end()
         ))
+    }
+
+    /// The current status label for a process owned by `session_id`
+    /// (`"running"`, `"exited(0)"`, `"killed"`, `"failed: ..."`), or `None`
+    /// for an unknown id or one owned by another session (#873). The desktop
+    /// bridge reads this when the output broadcast closes, to fill the
+    /// terminal `process:exited` event's `status`.
+    pub fn status_label(&self, id: u64, session_id: &str) -> Option<String> {
+        let map = self.procs.lock().unwrap();
+        let p = map.get(&id)?;
+        if p.session_id != session_id {
+            return None;
+        }
+        Some(p.shared.status().label())
     }
 
     /// One line per process in `session_id`, oldest id first.
@@ -1181,5 +1262,74 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         panic!("subscriber should observe RecvError::Closed after exit");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn lifecycle_started_carries_zero_loss_receiver() {
+        // #873: with a lifecycle listener installed, `start` emits a
+        // `Started` whose `rx` was subscribed *before* the drain tasks, so it
+        // sees output from the first byte — even output emitted before the
+        // host has a chance to observe the `Started` event.
+        let dir = TempDir::new().unwrap();
+        let sup = ProcessSupervisor::new();
+        let mut lc_rx = sup.lifecycle_channel();
+        // Emits immediately, then lingers so the exit-watcher does not drop the
+        // sender before we read the head chunk.
+        let id = sup
+            .start("echo head-line; sleep 30", dir.path(), "s1")
+            .unwrap();
+
+        let ev = tokio::time::timeout(Duration::from_secs(2), lc_rx.recv())
+            .await
+            .expect("Started arrives within budget")
+            .expect("lifecycle channel open");
+        let ProcessLifecycle::Started {
+            id: ev_id,
+            session_id,
+            command,
+            mut rx,
+        } = ev;
+        assert_eq!(ev_id, id);
+        assert_eq!(session_id, "s1");
+        assert_eq!(command, "echo head-line; sleep 30");
+
+        // The head line must be delivered even though it was echoed before we
+        // pulled the Started event off the channel.
+        let mut seen = String::new();
+        while let Ok(Ok(chunk)) = tokio::time::timeout(Duration::from_secs(2), rx.recv()).await {
+            seen.push_str(&String::from_utf8_lossy(&chunk.bytes));
+            if seen.contains("head-line") {
+                break;
+            }
+        }
+        assert!(
+            seen.contains("head-line"),
+            "pre-subscribed rx must capture head output, got {seen:?}"
+        );
+        let _ = sup.stop(id, "s1").await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn no_lifecycle_listener_is_noop() {
+        // Without a listener installed, `start` behaves exactly as before: no
+        // notification, broadcast stays lazy, poll still works.
+        let dir = TempDir::new().unwrap();
+        let sup = ProcessSupervisor::new();
+        let id = sup.start("echo hi", dir.path(), "s1").unwrap();
+        let st = wait_done(&sup, id, 5).await;
+        assert!(matches!(st, Status::Exited(0)), "status was {st:?}");
+        assert!(sup.poll(id, "s1").unwrap().contains("hi"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn status_label_reports_exit() {
+        let dir = TempDir::new().unwrap();
+        let sup = ProcessSupervisor::new();
+        let id = sup.start("exit 3", dir.path(), "s1").unwrap();
+        let _ = wait_done(&sup, id, 5).await;
+        assert_eq!(sup.status_label(id, "s1").as_deref(), Some("exited(3)"));
+        // Foreign session / unknown id are invisible.
+        assert!(sup.status_label(id, "other").is_none());
+        assert!(sup.status_label(9999, "s1").is_none());
     }
 }

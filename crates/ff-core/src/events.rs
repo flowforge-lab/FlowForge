@@ -375,5 +375,42 @@ pub struct UpdateProgressEvent {
     pub total: Option<u64>,
 }
 
+/// One chunk of live stdout/stderr from a background process started via
+/// `process_manager action=start` (#873). Emitted as `process:output`,
+/// independently of any assistant turn, by a desktop bridge task that
+/// subscribes to the process's output broadcast the moment it starts. The
+/// frontend appends `delta` to the process's output panel keyed by
+/// `process_id`. `stream` is `"stdout"` or `"stderr"`. Unlike the per-turn
+/// `token`/`tool:output` events, these keep flowing across turns for the
+/// life of the process.
+///
+/// `process_id` is the small sequential id `start` returns (fits a `u32`,
+/// so the frontend gets a plain `number`, not a `bigint`). `stream` reuses the
+/// same [`OutputStreamKind`] the per-turn `tool:output` chunks use.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "../../../apps/desktop/src/bindings/")]
+pub struct ProcessOutputEvent {
+    pub session_id: String,
+    pub process_id: u32,
+    pub stream: OutputStreamKind,
+    pub delta: String,
+}
+
+/// A background process ended (exited, was killed, or failed to run) (#873).
+/// Emitted once as `process:exited` after the last `process:output`, when the
+/// bridge task sees the output broadcast close. `status` is the supervisor's
+/// human-readable label -- `"exited(0)"`, `"exited(3)"`, `"killed"`, or
+/// `"failed: <reason>"` -- which the frontend renders as the process's
+/// terminal status badge.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "../../../apps/desktop/src/bindings/")]
+pub struct ProcessExitedEvent {
+    pub session_id: String,
+    pub process_id: u32,
+    pub status: String,
+}
+
 #[cfg(test)]
 mod tests;

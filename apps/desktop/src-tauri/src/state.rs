@@ -1362,6 +1362,13 @@ pub struct AppState {
     /// one turn can be polled or stopped in a later one. Children are killed when
     /// the last `Arc` drops at app exit.
     process_supervisor: Arc<ProcessSupervisor>,
+    /// Receive end of the process lifecycle channel (#873). Populated at
+    /// construction (so the supervisor's `Arc` can be shared with the
+    /// `process_manager` tool immediately) and consumed once by
+    /// `start_process_output_pump`, which spawns a per-process bridge that
+    /// forwards live output to the frontend as `process:output` events. Same
+    /// `Mutex<Option<…>>` take-once idempotency shape as `observer_events_rx`.
+    process_lifecycle_rx: Mutex<Option<UnboundedReceiver<ff_tools::process::ProcessLifecycle>>>,
     /// Persistent Python kernels for the `notebook_runner` tool (#859), one per
     /// session. Long-lived child processes, so they are reaped on session end
     /// (`reap_session_kernels`) and killed when the last `Arc` drops at app exit.
@@ -1486,6 +1493,10 @@ impl AppState {
         // process's bytes. Build the process supervisor first so the
         // observer can be wired with it in one expression.
         let process_supervisor = Arc::new(ProcessSupervisor::new());
+        // #873: install the lifecycle listener now, so every `process_manager`
+        // start (from any turn) is bridged to the frontend. Consumed once by
+        // `start_process_output_pump`.
+        let process_lifecycle_rx = process_supervisor.lifecycle_channel();
         let (observer_supervisor, observer_events_rx) = {
             let (sup, rx) = ObserverSupervisor::new();
             (
@@ -1524,6 +1535,7 @@ impl AppState {
             flush_ledger,
             _memory_watcher: Mutex::new(memory_watcher),
             process_supervisor,
+            process_lifecycle_rx: Mutex::new(Some(process_lifecycle_rx)),
             kernel_supervisor: Arc::new(KernelSupervisor::new()),
             observer_supervisor,
             observer_events_rx: Mutex::new(Some(observer_events_rx)),
@@ -2093,6 +2105,48 @@ impl AppState {
                 crate::wake_session_for_observer(&state, event, &app).await;
             }
             tracing::info!("observer event channel closed; pump exiting");
+        });
+    }
+
+    /// Start the process-output pump (#873): a single long-lived task that
+    /// receives a [`ProcessLifecycle::Started`] for every `process_manager`
+    /// start and spawns a per-process bridge
+    /// ([`crate::spawn_process_output_bridge`]) forwarding that process's live
+    /// output to the frontend as `process:output` events, independently of any
+    /// turn. Mirrors [`start_observer_pump`](Self::start_observer_pump):
+    /// take-once idempotent, enters the shared runtime itself so it is safe to
+    /// call from Tauri's off-reactor `setup` (#117).
+    pub fn start_process_output_pump(self: &Arc<Self>, app: &tauri::AppHandle) {
+        let rx = match self.process_lifecycle_rx.lock().unwrap().take() {
+            Some(rx) => rx,
+            None => {
+                tracing::warn!("start_process_output_pump called twice; ignoring");
+                return;
+            }
+        };
+        let sup = self.process_supervisor.clone();
+        let app = app.clone();
+        let rt = tauri::async_runtime::handle();
+        let _guard = rt.inner().enter();
+        tokio::spawn(async move {
+            let mut rx = rx;
+            while let Some(ff_tools::process::ProcessLifecycle::Started {
+                id,
+                session_id,
+                command,
+                rx: chunks,
+            }) = rx.recv().await
+            {
+                tracing::debug!(process_id = id, session_id = %session_id, command = %command, "bridging process output");
+                crate::spawn_process_output_bridge(
+                    app.clone(),
+                    sup.clone(),
+                    id,
+                    session_id,
+                    chunks,
+                );
+            }
+            tracing::info!("process lifecycle channel closed; pump exiting");
         });
     }
 
