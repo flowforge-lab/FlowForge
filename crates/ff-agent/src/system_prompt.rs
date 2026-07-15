@@ -104,14 +104,39 @@ impl UserContext {
     }
 }
 
+/// The two-part system prompt: a cache-stable prefix and a volatile tail.
+///
+/// Splitting at this boundary lets providers place a cache breakpoint between the
+/// two parts. The stable prefix (persona, mode steer, skills, guidance) is
+/// byte-identical across turns and sessions (assuming the same skill set), so the
+/// inference server's KV cache can reuse it without re-prefill. The volatile tail
+/// (date, working directory, memory, goal) changes between sessions or on memory
+/// updates and sits *after* the cache breakpoint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SystemPrompt {
+    /// Persona + mode steer + skill listings + active skill bodies + guidance
+    /// sections. Byte-identical across turns within a session.
+    pub stable: String,
+    /// User context (date, working dir) + durable memory + goal block. Changes
+    /// between sessions or on memory/goal updates.
+    pub volatile: String,
+}
+
+impl SystemPrompt {
+    /// Concatenate both parts into a single string (for providers that don't
+    /// support multi-block system prompts or for token counting).
+    pub fn full(&self) -> String {
+        let mut out = self.stable.clone();
+        out.push_str(&self.volatile);
+        out
+    }
+}
+
 /// Build the system prompt prepended to every turn's request.
 ///
-/// Sections, in order: optional `persona`, the `description` of every installed
-/// skill (for discovery), the full `body` of each skill named in `active`
-/// (resolved against `skills`), and finally the ambient [`UserContext`]. Skill
-/// listings are sorted by name so the output is deterministic. The ambient
-/// context is placed last so the stable prefix stays byte-identical across a
-/// session for prefix-cache reuse (see module docs).
+/// Returns a [`SystemPrompt`] with the split at the cache boundary: everything
+/// before "User context" is stable; everything from "User context" onward is
+/// volatile.
 pub fn build_system_prompt(
     persona: Option<&str>,
     skills: &SkillRegistry,
@@ -120,7 +145,7 @@ pub fn build_system_prompt(
     memory: Option<&str>,
     goal: Option<&Goal>,
     mode: Mode,
-) -> String {
+) -> SystemPrompt {
     let mut out = String::new();
 
     if let Some(persona) = persona {
@@ -248,15 +273,19 @@ pub fn build_system_prompt(
          \"understand the area\". A review verifies the change, not the codebase.\n\n",
     );
 
-    out.push_str("## User context\n");
-    out.push_str(&format!(
+    // --- Cache boundary: everything above is stable; below is volatile ---
+    let stable = out;
+
+    let mut volatile = String::new();
+    volatile.push_str("## User context\n");
+    volatile.push_str(&format!(
         "Current: {}, {} ({}).\n",
         user.local_date,
         user.time_of_day.label(),
         user.timezone
     ));
     if !user.working_dir.is_empty() {
-        out.push_str(&format!(
+        volatile.push_str(&format!(
             "Working directory: {}\n\
              Shell commands run here and file tools are rooted here; use paths \
              relative to it and do not prepend a  to another directory.\n",
@@ -270,9 +299,9 @@ pub fn build_system_prompt(
     if let Some(memory) = memory {
         let memory = memory.trim();
         if !memory.is_empty() {
-            out.push('\n');
-            out.push_str(memory);
-            out.push('\n');
+            volatile.push('\n');
+            volatile.push_str(memory);
+            volatile.push('\n');
         }
     }
 
@@ -280,11 +309,11 @@ pub fn build_system_prompt(
         .filter(|g| g.status == GoalStatus::Active)
         .map(goal_block)
     {
-        out.push('\n');
-        out.push_str(&block);
+        volatile.push('\n');
+        volatile.push_str(&block);
     }
 
-    out
+    SystemPrompt { stable, volatile }
 }
 
 /// Render the goal-injection block for the system prompt (RFC 0020 §8, #718).

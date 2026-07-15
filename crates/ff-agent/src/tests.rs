@@ -2826,14 +2826,17 @@ async fn system_prompt_is_injected_into_request_not_history() {
     .unwrap();
 
     let msgs = seen.lock().unwrap();
+    // Two system messages: stable prefix then volatile tail (#933 A.1).
     assert_eq!(msgs[0].role, "system");
-    let sys = msgs[0].content.as_deref().unwrap();
+    assert_eq!(msgs[1].role, "system");
+    let stable = msgs[0].content.as_deref().unwrap();
+    let volatile = msgs[1].content.as_deref().unwrap();
     assert!(
-        sys.contains("- rust-debug: Systematic Rust debugging"),
-        "{sys}"
+        stable.contains("- rust-debug: Systematic Rust debugging"),
+        "{stable}"
     );
-    assert!(sys.contains("Current: 2026-06-13, morning (America/Chicago)."));
-    assert_eq!(msgs[1].role, "user");
+    assert!(volatile.contains("Current: 2026-06-13, morning (America/Chicago)."));
+    assert_eq!(msgs[2].role, "user");
 
     // The system prompt must not be persisted: history is just [user, assistant].
     let history = store.get_messages(&s.id);
@@ -5563,7 +5566,10 @@ fn context_breakdown_splits_system_tools_and_messages() {
         }
     }
 
-    let system = "x".repeat(40);
+    let system = SystemPrompt {
+        stable: "x".repeat(40),
+        volatile: "v".repeat(20),
+    };
     let tool_schemas = vec![
         serde_json::json!({"type": "function", "function": {"name": "a"}}),
         serde_json::json!({"type": "function", "function": {"name": "b"}}),

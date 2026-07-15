@@ -42,7 +42,9 @@ pub use compaction_extractive::{
     ExtractiveCompactor, ReversibleCache, COMPACTION_MARKER_PREFIX,
 };
 pub use goal_loop::{drive_goal, GateDecision, GoalIteration, IterationOutcome, LoopStop};
-pub use system_prompt::{build_flush_prompt, build_system_prompt, TimeOfDay, UserContext};
+pub use system_prompt::{
+    build_flush_prompt, build_system_prompt, SystemPrompt, TimeOfDay, UserContext,
+};
 
 /// Default tool-call iteration cap for a turn when a phenotype does not override
 /// it (#244 R3). A turn runs at most this many model<->tool round-trips before
@@ -672,11 +674,13 @@ struct CallBuf {
 /// bucket equals `token_count` by construction and the bar always sums
 /// consistently.
 fn context_breakdown(
-    system_prompt: Option<&str>,
+    system_prompt: Option<&SystemPrompt>,
     tool_schemas: &[serde_json::Value],
     messages: &[Message],
 ) -> ContextBreakdown {
-    let system_tokens = system_prompt.map_or(0, ff_llm::count_tokens) as u32;
+    let system_tokens = system_prompt.map_or(0, |sp| {
+        ff_llm::count_tokens(&sp.stable) + ff_llm::count_tokens(&sp.volatile)
+    }) as u32;
     let tool_tokens = if tool_schemas.is_empty() {
         0u32
     } else {
@@ -920,8 +924,10 @@ pub async fn run_turn(
     session_id: &str,
     model: &str,
     // Optional system prompt prepended to every request this turn (skills + persona
-    // + ambient context). Built by the host via `build_system_prompt`.
-    system_prompt: Option<&str>,
+    // + ambient context). Built by the host via `build_system_prompt`. The two-part
+    // struct lets providers place a cache breakpoint between the stable prefix and
+    // the volatile tail (#933 A.1).
+    system_prompt: Option<&SystemPrompt>,
     enable_reasoning: bool,
     // Which loop steps request reasoning when `enable_reasoning` is true (#549).
     reasoning_visibility: ReasoningVisibility,
@@ -1058,16 +1064,28 @@ pub async fn run_turn(
         if let Some(system) = system_prompt {
             // Transient: the system prompt is injected into the request only, never
             // persisted to the store, so message history stays user/assistant/tool.
+            // Two separate system messages so providers can place a cache breakpoint
+            // between the stable prefix and the volatile tail (#933 A.1).
             messages.push(ChatMessage {
                 role: "system".to_string(),
-                content: Some(system.to_string()),
+                content: Some(system.stable.clone()),
                 tool_calls: None,
                 tool_call_id: None,
                 name: None,
-
                 attachments: Vec::new(),
                 reasoning: None,
             });
+            if !system.volatile.is_empty() {
+                messages.push(ChatMessage {
+                    role: "system".to_string(),
+                    content: Some(system.volatile.clone()),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    name: None,
+                    attachments: Vec::new(),
+                    reasoning: None,
+                });
+            }
         }
         // Cold-prefix extractive compaction (RFC 0016 M7.1b): once over the budget
         // fraction, compact the cold prefix of the transcript into a reversible,
@@ -2040,7 +2058,7 @@ async fn run_subagent(
     store: &SessionStore,
     parent: &ToolContext<'_>,
     model: &str,
-    system_prompt: Option<&str>,
+    system_prompt: Option<&SystemPrompt>,
     cancel: CancelToken,
     args: &serde_json::Value,
     parent_session_id: &str,
