@@ -206,7 +206,7 @@ const REASONING_REPLAY_KEEP: usize = 2;
 
 /// Fraction of a model's real context window used as the compaction budget. The
 /// headroom (the remaining ~20%) absorbs the model's own response and the
-/// coarseness of the chars/4 proxy estimate, so compaction engages before the
+/// coarseness of the token estimate, so compaction engages before the
 /// true window is hit rather than after. Combined with the per-model window from
 /// `Provider::context_window`, this stops a large-window model from being
 /// force-compacted at a small fixed ceiling (#B1).
@@ -625,28 +625,38 @@ struct CallBuf {
     arguments: String,
 }
 
-/// Split the `chars/4` context estimate into the three buckets the context-usage
+/// Split the context-size estimate into the three buckets the context-usage
 /// popover renders (#931): the transient system prompt, the advertised tool
-/// schemas, and the persisted transcript. Uses the same coarse `chars/4` proxy as
-/// [`ProxyTokenEstimator`] so the buckets sum consistently with `token_count`.
+/// schemas, and the persisted transcript. Routes each bucket through
+/// [`ff_llm::count_tokens`] (tokenx-rs) -- the same estimator that
+/// [`ProxyTokenEstimator::assess`] uses for `token_count` -- so the Messages
+/// bucket equals `token_count` by construction and the bar always sums
+/// consistently.
 fn context_breakdown(
     system_prompt: Option<&str>,
     tool_schemas: &[serde_json::Value],
     messages: &[Message],
 ) -> ContextBreakdown {
-    let system_chars = system_prompt.map_or(0, str::len);
-    let tool_chars = serde_json::to_string(tool_schemas).map_or(0, |s| s.len());
-    // Count reasoning too -- it is replayed on the wire for reasoning gateways,
-    // matching what the estimator sums into `token_count` (#378).
-    let message_chars: usize = messages
+    let system_tokens = system_prompt.map_or(0, ff_llm::count_tokens) as u32;
+    let tool_tokens = if tool_schemas.is_empty() {
+        0u32
+    } else {
+        serde_json::to_string(tool_schemas).map_or(0, |s| ff_llm::count_tokens(&s)) as u32
+    };
+    // Per-message count_tokens(content) + count_tokens(reasoning): mirrors
+    // ProxyTokenEstimator::assess exactly (#378 reasoning replay).
+    let message_tokens: u32 = messages
         .iter()
-        .map(|m| m.content.len() + m.reasoning.as_deref().map_or(0, str::len))
-        .sum();
+        .map(|m| {
+            ff_llm::count_tokens(&m.content)
+                + m.reasoning.as_deref().map_or(0, ff_llm::count_tokens)
+        })
+        .sum::<usize>() as u32;
     ContextBreakdown {
-        system_tokens: (system_chars / 4) as u32,
-        tool_tokens: (tool_chars / 4) as u32,
+        system_tokens,
+        tool_tokens,
         tool_specs: tool_schemas.len() as u32,
-        message_tokens: (message_chars / 4) as u32,
+        message_tokens,
         message_count: messages.len() as u32,
     }
 }
@@ -1486,8 +1496,8 @@ pub async fn run_turn(
                 break;
             }
             // Approximate context size at completion so the frontend can show a
-            // token gauge (#244 R6). The proxy estimator (chars/4) is intentionally
-            // coarse; per-model tokenizers plug in via ContextPressureEstimator later.
+            // token gauge (#244 R6). The estimator (tokenx-rs, ~96% accurate)
+            // is model-agnostic; per-model tokenizers can plug in later.
             let final_msgs = store.get_messages(session_id);
             let token_count = Some(estimator.assess(&final_msgs, model).estimated_tokens as u32);
             on_event(AgentEvent::Done {
