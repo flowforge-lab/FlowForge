@@ -13,6 +13,7 @@ import type {
 // provider usage into a running per-session total for the SESSION TOTALS block.
 
 const SID = "s1";
+const OTHER_SID = "s2";
 
 function session(id: string): Session {
   return {
@@ -53,7 +54,7 @@ const USAGE: TurnUsage = {
 beforeEach(() => {
   vi.useFakeTimers();
   useChatStore.setState({
-    sessions: [session(SID)],
+    sessions: [session(SID), session(OTHER_SID)],
     activeSessionId: SID,
     // Non-empty transcript so finishTurn skips the empty-turn refetch path.
     messagesBySession: {
@@ -66,8 +67,20 @@ beforeEach(() => {
           createdAt: 0,
         },
       ],
+      [OTHER_SID]: [
+        {
+          id: `${OTHER_SID}-m1`,
+          sessionId: OTHER_SID,
+          role: "assistant",
+          content: "done",
+          createdAt: 0,
+        },
+      ],
     },
-    streamingBySession: { [SID]: `${SID}-m1` },
+    streamingBySession: {
+      [SID]: `${SID}-m1`,
+      [OTHER_SID]: `${OTHER_SID}-m1`,
+    },
     contextBreakdownBySession: {},
     contextInputTokensBySession: {},
     sessionTotalsBySession: {},
@@ -109,6 +122,42 @@ describe("chat store — context telemetry (#931)", () => {
       outputTokens: 100,
       cacheReadTokens: 100,
       cacheWriteTokens: 20,
+    });
+  });
+
+  it("keys everything by session — a turn on S2 does not touch S1's telemetry", () => {
+    const store = useChatStore.getState();
+    store.finishTurn(done(SID, { breakdown: BREAKDOWN, usage: USAGE }));
+    store.finishTurn(
+      done(OTHER_SID, {
+        breakdown: {
+          systemTokens: 1,
+          toolTokens: 1,
+          toolSpecs: 1,
+          messageTokens: 1,
+          messageCount: 1,
+        },
+        usage: {
+          inputTokens: 1,
+          outputTokens: 1,
+          cacheReadTokens: 1,
+          cacheWriteTokens: 1,
+        },
+      }),
+    );
+
+    const s = useChatStore.getState();
+    // S1's telemetry is exactly what its own turn reported — untouched by S2's.
+    expect(s.contextBreakdownBySession[SID]).toEqual(BREAKDOWN);
+    expect(s.contextInputTokensBySession[SID]).toBe(100);
+    expect(s.sessionTotalsBySession[SID]).toEqual(USAGE);
+    // S2 has its own independent entries, not merged with S1's.
+    expect(s.contextInputTokensBySession[OTHER_SID]).toBe(1);
+    expect(s.sessionTotalsBySession[OTHER_SID]).toEqual({
+      inputTokens: 1,
+      outputTokens: 1,
+      cacheReadTokens: 1,
+      cacheWriteTokens: 1,
     });
   });
 

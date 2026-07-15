@@ -144,6 +144,14 @@ describe("ContextGauge — usage ratio (#598)", () => {
     expect(screen.queryByRole("progressbar")).toBeNull();
     expect(screen.getByText("60K")).not.toBeNull();
   });
+
+  it("falls back to count-only when the budget is zero (no divide-by-zero)", () => {
+    seed(60_000, 0);
+    render(<ContextGauge sessionId={SID} />);
+    expect(screen.queryByRole("progressbar")).toBeNull();
+    expect(screen.getByText("60K")).not.toBeNull();
+    expect(screen.getByTitle("Context usage: 60,000 tokens")).not.toBeNull();
+  });
 });
 
 describe("ContextGauge — popover (#931)", () => {
@@ -187,7 +195,8 @@ describe("ContextGauge — popover (#931)", () => {
     const text = panel?.textContent ?? "";
     expect(text).toContain("before compaction");
     expect(text).toContain("System prompt");
-    expect(text).toContain("1 specs");
+    expect(text).toContain("1 spec");
+    expect(text).not.toContain("1 specs");
     expect(text).toContain("122 msgs");
     expect(text).toContain("claude-opus-4-8");
     // SESSION TOTALS block, formatted in K.
@@ -236,6 +245,31 @@ describe("ContextGauge — popover (#931)", () => {
       vi.advanceTimersByTime(1500);
     });
     expect(screen.getByRole("button", { name: "Copy as JSON" })).not.toBeNull();
+  });
+
+  it("pluralizes the tool specs count (singular vs plural)", () => {
+    // Radix's Popover keeps its own open/closed state across a `rerender`, so a
+    // second click after new data would toggle it closed rather than open — mount
+    // fresh per case instead.
+    seed(173_000, 150_000);
+    seedPopover({ breakdown: { ...BREAKDOWN, toolSpecs: 1 } });
+    render(<ContextGauge sessionId={SID} />);
+    fireEvent.click(screen.getByRole("button", { name: /context usage/i }));
+    let text =
+      document.querySelector('[data-slot="popover-content"]')?.textContent ??
+      "";
+    expect(text).toContain("1 spec");
+    expect(text).not.toContain("1 specs");
+    cleanup();
+
+    seed(173_000, 150_000);
+    seedPopover({ breakdown: { ...BREAKDOWN, toolSpecs: 3 } });
+    render(<ContextGauge sessionId={SID} />);
+    fireEvent.click(screen.getByRole("button", { name: /context usage/i }));
+    text =
+      document.querySelector('[data-slot="popover-content"]')?.textContent ??
+      "";
+    expect(text).toContain("3 specs");
   });
 
   it("renders the header/pill but omits breakdown + totals when only a proxy count exists", () => {

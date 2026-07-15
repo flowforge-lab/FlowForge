@@ -22,6 +22,8 @@ import type {
   ReasoningEvent,
   TurnDoneEvent,
   TurnErrorEvent,
+  ContextBreakdown,
+  TurnUsage,
   IntentionSignal,
   SessionTitleUpdatedEvent,
   ToolApprovalRequestEvent,
@@ -3004,6 +3006,22 @@ Shipping the Settings redesign — currently the Memory browser (SET.8).
         const systemTokens = 1_200;
         const toolTokens = 320;
         const sessionTokens = systemTokens + toolTokens + messageTokens;
+        // Typed intermediates (not inlined into the emit cast below) so a rename of
+        // any `ContextBreakdown`/`TurnUsage` field is a compile error here, not a
+        // silently-dropped `undefined` in the emitted event.
+        const breakdown: ContextBreakdown = {
+          systemTokens,
+          toolTokens,
+          toolSpecs: 3,
+          messageTokens,
+          messageCount: msgs.length,
+        };
+        const usage: TurnUsage = {
+          inputTokens: sessionTokens,
+          outputTokens: Math.ceil((turn.messageId.length + 200) / 4),
+          cacheReadTokens: Math.max(sessionTokens - systemTokens, 0),
+          cacheWriteTokens: systemTokens,
+        };
         this.emit(this.doneListeners, {
           sessionId,
           messageId: turn.messageId,
@@ -3014,19 +3032,8 @@ Shipping the Settings redesign — currently the Memory browser (SET.8).
           // the same field name the regenerated ts-rs binding will carry.
           budgetTokens: 8_000,
           stopReason: null,
-          breakdown: {
-            systemTokens,
-            toolTokens,
-            toolSpecs: 3,
-            messageTokens,
-            messageCount: msgs.length,
-          },
-          usage: {
-            inputTokens: sessionTokens,
-            outputTokens: Math.ceil((turn.messageId.length + 200) / 4),
-            cacheReadTokens: Math.max(sessionTokens - systemTokens, 0),
-            cacheWriteTokens: systemTokens,
-          },
+          breakdown,
+          usage,
         } as TurnDoneEvent & { budgetTokens: number });
         return;
       }

@@ -200,7 +200,7 @@ export function ContextGauge({ sessionId }: { sessionId: string }) {
               <ComponentRow
                 swatch="bg-orange-500"
                 label="Tools"
-                count={`${breakdown.toolSpecs} specs`}
+                count={`${breakdown.toolSpecs} ${breakdown.toolSpecs === 1 ? "spec" : "specs"}`}
                 tokens={breakdown.toolTokens}
                 budget={budget}
               />
