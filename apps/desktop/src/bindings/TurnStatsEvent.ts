@@ -5,14 +5,14 @@
  * epic (#426) measures every later change against. `round_trips` is the number of
  * provider responses (agent loop iterations) this turn; `iter_ms` is the
  * per-iteration wall-clock in arrival order; `flushes` counts silent mid-turn
- * memory flushes (each an extra provider round-trip); `chars` is the streamed
- * assistant text, a coarse token-cost proxy; `prefill_estimates` is the per-
+ * memory flushes (each an extra provider round-trip); `output_tokens` is the
+ * estimated assistant output tokens (tokenx-rs); `prefill_estimates` is the per-
  * round-trip projected request size and `tier1_fires`/`tier2_fires` count how
  * often each compaction tier engaged (F1b, #441). The F1b fields are optional on
  * the wire -- the desktop always populates them, but a non-desktop emitter may
  * omit them cleanly (#475 follow-up). Emitted once at turn end.
  */
-export type TurnStatsEvent = { sessionId: string, roundTrips: number, totalMs: number, iterMs: Array<number>, flushes: number, chars: number, 
+export type TurnStatsEvent = { sessionId: string, roundTrips: number, totalMs: number, iterMs: Array<number>, flushes: number, outputTokens: number, 
 /**
  * F1b (#441): projected prefill-token estimate of each round-trip's outgoing
  * request (post-compaction wire), in iteration order. Omitted by emitters that

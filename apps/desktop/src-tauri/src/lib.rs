@@ -1718,7 +1718,7 @@ fn spawn_assistant_turn(state: Arc<AppState>, app: tauri::AppHandle, session_id:
             total_ms: latency_ms,
             iter_ms,
             flushes,
-            chars: u32::try_from(output_tokens).unwrap_or(u32::MAX),
+            output_tokens: u32::try_from(output_tokens).unwrap_or(u32::MAX),
             // F1b fields are Option on the wire (#475 follow-up); the desktop
             // always populates them.
             prefill_estimates: Some(prefill_estimates),
@@ -1737,7 +1737,7 @@ fn spawn_assistant_turn(state: Arc<AppState>, app: tauri::AppHandle, session_id:
             total_ms = latency_ms,
             first_token_ms = ?stats.first_token_ms,
             flushes,
-            chars = stats.chars,
+            output_tokens = stats.output_tokens,
             iter_ms = ?stats.iter_ms,
             tier1_fires = stats.tier1_fires,
             tier2_fires = stats.tier2_fires,
