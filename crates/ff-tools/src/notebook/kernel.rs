@@ -63,19 +63,89 @@ fn driver_source(nonce: &str, img_dir_literal: &str) -> String {
     // {nonce}/{img_dir}/{image_marker} are substituted; everything else is
     // literal Python. Keep it small and dependency-free (stdlib only; matplotlib
     // is used only if the cell itself imported it).
+    //
+    // ## Why we read/write the raw fd (not sys.stdin.buffer / sys.stdout)
+    // On Windows the C runtime opens child stdio in TEXT mode: stdin does
+    // `\r\n` -> `\n` translation and stdout does `\n` -> `\r\n`, AND stdout is
+    // encoded with the console code page (cp437/cp1252/etc.), not UTF-8. Both
+    // break the length-prefixed REPL framing — `read(n)` can over- or under-
+    // deliver, and non-ASCII bytes from the cell land in our UTF-8 reader as
+    // invalid. Going through `os.read(0, ...)` / `os.write(1, ...)` skips the
+    // text wrapper entirely; we do our own encoding (always UTF-8). On Unix
+    // this is equivalent to the buffered approach (no translation there), and
+    // it removes a `BufferedReader` layer that hid the `os.read` semantics.
     format!(
         r#"
-import sys, traceback, os
-_ns = {{"__name__": "__cell__"}}
-# Funnel stderr into stdout so warnings / prints-to-stderr surface in the drained
-# stream (and can't deadlock on an undrained stderr pipe).
+import os, sys, traceback
+
+# Read/write the kernel's stdio as raw byte streams. Encoding is always UTF-8.
+_in_fd = 0
+_out_fd = 1
+
+def _readline_bytes():
+    out = bytearray()
+    while True:
+        c = os.read(_in_fd, 1)
+        if not c:
+            return bytes(out)
+        if c == b"\n":
+            return bytes(out)
+        out += c
+
+def _read_n(n):
+    out = bytearray()
+    while len(out) < n:
+        chunk = os.read(_in_fd, n - len(out))
+        if not chunk:
+            break
+        out += chunk
+    return bytes(out)
+
+def _w(s):
+    # os.write() can short-write once a burst exceeds the host's pipe capacity
+    # (PIPE_BUF: 4 KiB on macOS, 64 KiB on Linux, plus the kernel's pipe
+    # sizing). Discarding the return value would silently drop the tail,
+    # corrupting cell output for any burst faster than the Rust reader drains.
+    # Loop on the return value, mirroring _read_n above, so every byte the
+    # kernel intends to emit actually reaches the pipe.
+    b = s.encode("utf-8")
+    while b:
+        n = os.write(_out_fd, b)
+        b = b[n:]
+
+# Funnel every textual write (user code, tracebacks, the protocol) through the
+# raw fd so there is one stream and one encoding. stderr routes to stdout so
+# warnings / prints-to-stderr surface in the drained stream (and can't
+# deadlock on an undrained stderr pipe).
+class _Std:
+    def write(self, s):
+        if s:
+            _w(s)
+        return len(s)
+    def flush(self):
+        pass
+    def isatty(self):
+        return False
+    # Restore `fileno()` so libraries that grab the underlying fd (tqdm,
+    # rich, click, pytest capture) don't AttributeError. The fd is the real
+    # raw stdout; user writes still funnel through `write()`/`_w` above.
+    def fileno(self):
+        return _out_fd
+sys.stdout = _Std()
+# We deliberately do NOT provide `sys.stdout.buffer`: the kernel frames
+# everything as UTF-8 over the raw fd, so a `BufferedWriter`/`TextIOWrapper`
+# layered on top would re-introduce text-mode translation (CR/LF on Windows)
+# and encoding drift (locale code page instead of UTF-8) — the very thing the
+# driver exists to avoid. Libraries that need a binary stream should `os.write`
+# to fd 1 directly.
 sys.stderr = sys.stdout
+
+_ns = {{"__name__": "__cell__"}}
 _end = "{prefix}{nonce}{suffix}"
 _img_dir = {img_dir}
 _img_seq = 0
 def _emit(status):
-    sys.stdout.write("\n" + _end + status + "\n")
-    sys.stdout.flush()
+    _w("\n" + _end + status + "\n")
 def _save_figures():
     # Only if the cell imported matplotlib; never import it ourselves.
     global _img_seq
@@ -93,17 +163,14 @@ def _save_figures():
             _p = os.path.join(_img_dir, "fig-" + str(_img_seq) + ".png")
             _img_seq += 1
             _fig.savefig(_p)
-            sys.stdout.write("\n{image_marker}" + _p + "\n")
+            _w("\n{image_marker}" + _p + "\n")
         _plt.close("all")
     except Exception:
         # Image saving is best-effort; a failure never fails the cell.
         pass
 while True:
-    # Read the whole frame from the binary stream so the length is a byte
-    # count that matches what Rust wrote (#880). `sys.stdin.read(n)` reads
-    # characters, not bytes, so any non-ASCII cell source (em-dash, non-Latin
-    # identifier, etc.) would under-read and desync the stream.
-    _hdr = sys.stdin.buffer.readline()
+    # Length-prefixed frame: Rust writes "<byte-len>\n<source bytes>".
+    _hdr = _readline_bytes()
     if not _hdr:
         break
     _hdr = _hdr.strip()
@@ -114,16 +181,13 @@ while True:
     except ValueError:
         _emit("error")
         continue
-    _src = sys.stdin.buffer.read(_n).decode("utf-8")
+    _src = _read_n(_n).decode("utf-8")
     try:
         exec(compile(_src, "<cell>", "exec"), _ns)
         _save_figures()
-        sys.stdout.flush()
-        sys.stderr.flush()
         _emit("ok")
     except BaseException:
         traceback.print_exc(file=sys.stdout)
-        sys.stdout.flush()
         _emit("error")
 "#,
         prefix = SENTINEL_PREFIX,
@@ -274,17 +338,37 @@ impl KernelState {
             .unwrap_or_else(|_| "\"\"".to_string());
 
         let mut cmd = Command::new(&python);
-        cmd.arg("-u") // unbuffered stdio so sentinels arrive promptly
+        // -u (unbuffered) and -X utf8 (force UTF-8 mode) make Python treat its
+        // stdio streams as binary UTF-8 regardless of the host's locale/console
+        // code page — critical on Windows, where the default code page is not
+        // UTF-8 and would mangle non-ASCII cell source (#880) and output.
+        cmd.arg("-u")
+            .arg("-X")
+            .arg("utf8")
             .arg("-c")
             .arg(driver_source(&nonce, &img_dir_literal))
             .current_dir(dir)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .kill_on_drop(true);
+            .kill_on_drop(true)
+            // Belt and suspenders for the env vars below: also flip the
+            // process-level UTF-8 mode (PEP 540) and the I/O encoding. These are
+            // no-ops on Unix (where UTF-8 is already the default) and let any
+            // sub-interpreter the cell spawns inherit the same encoding.
+            .env("PYTHONUTF8", "1")
+            .env("PYTHONIOENCODING", "utf-8")
+            .env("PYTHONUNBUFFERED", "1");
         // Own process group so a timeout can signal the whole group (unix).
         #[cfg(unix)]
         cmd.process_group(0);
+        // On Windows: without CREATE_NO_WINDOW, a console-subsystem Python
+        // attaches to (or allocates) a console, which can cause the child's
+        // stdio to be re-opened as console handles — undoing the UTF-8 mode
+        // above. CREATE_NO_WINDOW keeps the child detached. The kernel talks
+        // to the Rust side purely over piped stdio; it never needs a console.
+        #[cfg(windows)]
+        cmd.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
 
         let mut child = cmd
             .spawn()

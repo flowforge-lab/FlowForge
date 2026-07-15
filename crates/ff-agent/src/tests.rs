@@ -2391,6 +2391,8 @@ async fn parallel_readonly_call_receives_session_id() {
 
 /// #A1: a turn mixing a read-only call and a write call keeps the write on the
 /// serial, approval-gated path; the read-only call never reaches the approver.
+/// Uses Unix-specific `touch` command.
+#[cfg(unix)]
 #[tokio::test]
 async fn mixed_read_and_write_keeps_write_gated() {
     struct ReadAndWriteThenText {
@@ -5539,6 +5541,9 @@ async fn rereads_of_unchanged_file_collapse_to_sentinel() {
     );
 }
 
+/// Verifies changed files are re-read in full, not deduped. Uses Unix-specific
+/// `printf` command to modify the file.
+#[cfg(unix)]
 #[tokio::test]
 async fn changed_file_is_not_deduped() {
     let dir = tempfile::tempdir().unwrap();

@@ -1,5 +1,13 @@
 use super::*;
 
+// Unix-only: same shape as `ff_core::spawn_env::tests::augment_path_*` -- the
+// inputs use `:`-separated absolute Unix paths and `std::env::split_paths`
+// re-splits the joined result, which is platform-dependent (`:` on unix,
+// `;` on Windows). Function itself is cross-platform; this asserts the
+// unix shape. The following test in the same file
+// (`augmented_path_resolves_bare_command_under_env_clear`) is already
+// `#[cfg(unix)]`, confirming the intended pattern.
+#[cfg(unix)]
 #[test]
 fn augment_path_appends_extra_dirs_in_order() {
     let extra = vec![PathBuf::from("/x/bin"), PathBuf::from("/y/bin")];

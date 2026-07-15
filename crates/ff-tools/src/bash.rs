@@ -825,6 +825,11 @@ mod tests {
 
     // ---- #458 RC4c: workspace scratch dir + TMPDIR ----
 
+    // Unix-only: the test asserts `echo $TMPDIR` (POSIX shell `$VAR` syntax
+    // and a POSIX env var name) — neither `cmd.exe` nor PowerShell expands
+    // `$TMPDIR`. The scratch-dir / .gitignore behaviour is real on Windows
+    // too; this test just verifies the POSIX-shaped plumbing.
+    #[cfg(unix)]
     #[tokio::test]
     async fn creates_scratch_dir_and_points_tmpdir_at_it() {
         let dir = tempfile::tempdir().unwrap();
@@ -919,12 +924,17 @@ mod tests {
     // ---- #483: age-based scratch prune ----
 
     /// Backdate an entry's mtime so the age prune treats it as stale.
+    ///
+    /// Uses [`filetime::set_file_mtime`] rather than `File::set_modified` so
+    /// the helper works on **directories** as well as files: the prune test
+    /// (`prune_removes_stale_entries_and_keeps_recent_ones`) ages both a stale
+    /// file and a stale subdir, and the native syscalls that `set_modified`
+    /// wraps refuse to open a directory for writing on macOS (`EISDIR`,
+    /// errno 21) and refuse non-`FILE_WRITE_ATTRIBUTES` opens on Windows
+    /// (`ERROR_ACCESS_DENIED`, 5). `filetime` does the right thing on both.
     fn age_entry(path: &Path, age: Duration) {
         let when = SystemTime::now() - age;
-        std::fs::File::open(path)
-            .unwrap()
-            .set_modified(when)
-            .unwrap();
+        filetime::set_file_mtime(path, filetime::FileTime::from_system_time(when)).unwrap();
     }
 
     #[test]

@@ -706,23 +706,46 @@ fn signal_group(pid: u32, sig: i32) {
 /// Create a kill-on-close Job Object and assign `process` to it. Returns the
 /// owning handle, or `None` if any step fails (the caller falls back to
 /// `taskkill`). Closing the returned handle kills every job member.
+///
+/// Each failure branch emits a `tracing::warn!` with `last_os_error()` so a
+/// persistent failure (nested-job restrictions, sandboxed env, etc.) shows up
+/// in the host log instead of silently degrading to `taskkill` with no
+/// explanation. A `tracing` subscriber is not installed in this crate, so the
+/// warnings are a no-op until a host binary (`apps/cli`, `apps/desktop`) wires
+/// one up — same pattern as the rest of the workspace.
 #[cfg(windows)]
 fn assign_to_new_job(process: std::os::windows::io::RawHandle) -> Option<JobHandle> {
     unsafe {
         let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
         if job.is_null() {
+            tracing::warn!(
+                error = ?std::io::Error::last_os_error(),
+                "process: CreateJobObjectW failed; stop will fall back to taskkill"
+            );
             return None;
         }
         let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
         info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-        let ok = SetInformationJobObject(
+        if SetInformationJobObject(
             job,
             JobObjectExtendedLimitInformation,
             &info as *const _ as *const core::ffi::c_void,
             std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-        ) != 0
-            && AssignProcessToJobObject(job, process as HANDLE) != 0;
-        if !ok {
+        ) == 0
+        {
+            tracing::warn!(
+                error = ?std::io::Error::last_os_error(),
+                "process: SetInformationJobObject failed; stop will fall back to taskkill"
+            );
+            CloseHandle(job);
+            return None;
+        }
+        if AssignProcessToJobObject(job, process as HANDLE) == 0 {
+            tracing::warn!(
+                error = ?std::io::Error::last_os_error(),
+                "process: AssignProcessToJobObject failed (process may already be in a job); \
+                 stop will fall back to taskkill"
+            );
             CloseHandle(job);
             return None;
         }
@@ -1331,5 +1354,86 @@ mod tests {
         // Foreign session / unknown id are invisible.
         assert!(sup.status_label(id, "other").is_none());
         assert!(sup.status_label(9999, "s1").is_none());
+    }
+
+    // ----- Windows-only runtime coverage for the Job Object kill path (#607) -----
+    //
+    // The unix tests above use `echo` / `sleep` / `exit`, which aren't on
+    // stock Windows. `cmd /C` is, so we exercise the full `start` -> `stop`
+    // round-trip with a real cmd -> ping tree. The unix path is byte-for-byte
+    // unchanged; these tests are pure CI coverage for the `#605` Windows code
+    // path (and the `#607` `tracing::warn!` diagnostics, which fire if any
+    // step of `assign_to_new_job` fails on the runner image).
+    #[cfg(windows)]
+    mod windows {
+        use super::*;
+
+        /// Run `tasklist /FI "IMAGENAME eq <name>"` and return true if any
+        /// process with that image name is listed. Polls until the predicate
+        /// matches or the budget elapses, returning the final result. We
+        /// shell out rather than `OpenProcess`/`EnumProcesses` to keep the
+        /// test dependency-free.
+        async fn tasklist_has_image(name: &str, budget: Duration) -> bool {
+            let deadline = Instant::now() + budget;
+            loop {
+                let out = std::process::Command::new("tasklist")
+                    .args(["/FI", &format!("IMAGENAME eq {name}"), "/NH"])
+                    .output();
+                let has = matches!(out, Ok(o) if {
+                    let s = String::from_utf8_lossy(&o.stdout);
+                    // `tasklist` prints "INFO: No tasks are running..." when
+                    // the filter matches nothing, and a row with the image
+                    // name when something matches. Substring check is
+                    // sufficient and case-insensitive matches `tasklist`'s
+                    // canonical capitalisation.
+                    s.to_ascii_uppercase().contains(&name.to_ascii_uppercase())
+                });
+                if has || Instant::now() >= deadline {
+                    return has;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+
+        /// Run `cmd /C "ping -t 127.0.0.1 -n 60"`, verify both the cmd parent
+        /// and the ping child are alive via `tasklist`, call `stop`, and
+        /// assert the *whole tree* is gone (no `PING.EXE` left) within a
+        /// short window. This is the runtime proof that the Job Object
+        /// (`KILL_ON_JOB_CLOSE` + `TerminateJobObject`) terminates
+        /// descendants, not just the immediate child.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn stop_kills_a_cmd_spawned_ping_tree() {
+            let dir = TempDir::new().unwrap();
+            let sup = ProcessSupervisor::new();
+            // `ping -t` runs until told to stop; `-n 60` is a 60-packet
+            // ceiling (a safety net -- `stop` should beat it by minutes).
+            // `cmd /C` waits for the child, so we have a real cmd -> ping
+            // tree rather than a self-terminating shell.
+            let id = sup
+                .start("cmd /C \"ping -t 127.0.0.1 -n 60\"", dir.path(), "s1")
+                .expect("start should succeed");
+            // Give cmd a moment to spawn ping. If we stop before ping
+            // appears, the "tree is gone" assertion would pass trivially
+            // (there was never a tree), so we *first* assert ping is alive
+            // -- otherwise the test would silently test nothing.
+            assert!(
+                tasklist_has_image("PING.EXE", Duration::from_secs(5)).await,
+                "ping child never appeared; test cannot prove tree-kill"
+            );
+
+            let out = sup.stop(id, "s1").await.expect("stop should succeed");
+            assert!(out.contains("stopped"), "{out}");
+
+            // Give the kernel a moment to reap the tree; ping should be
+            // gone well within a couple of seconds.
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while tasklist_has_image("PING.EXE", Duration::from_millis(0)).await {
+                assert!(
+                    Instant::now() < deadline,
+                    "PING.EXE still running 5s after stop -- tree was not killed"
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
     }
 }

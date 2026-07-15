@@ -1,7 +1,14 @@
 use super::*;
+#[cfg(unix)]
 use std::ffi::OsString;
 use std::path::PathBuf;
 
+// Unix-only: the inputs use `:`-separated absolute Unix paths and the
+// `assert_eq!` re-splits the joined result with `std::env::split_paths`,
+// which is platform-dependent (`:` on unix, `;` on Windows). The function
+// itself is cross-platform; the test asserts the unix shape. Mirrored
+// exactly in `crates/ff-mcp/src/client/tests.rs` (kept in sync).
+#[cfg(unix)]
 #[test]
 fn augment_path_appends_extra_dirs_in_order() {
     let extra = vec![PathBuf::from("/x/bin"), PathBuf::from("/y/bin")];
@@ -18,6 +25,7 @@ fn augment_path_appends_extra_dirs_in_order() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn augment_path_dedups_dirs_already_inherited() {
     let extra = vec![PathBuf::from("/usr/bin"), PathBuf::from("/x/bin")];

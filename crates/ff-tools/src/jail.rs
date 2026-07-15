@@ -143,6 +143,7 @@ mod tests {
         assert!(err.contains("access denied"), "{err}");
     }
 
+    #[cfg(unix)]
     #[test]
     fn rejects_absolute_outside_root() {
         let dir = tempfile::tempdir().unwrap();

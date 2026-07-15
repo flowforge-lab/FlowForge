@@ -43,7 +43,7 @@ jobs:
         run: cargo test --workspace
 
   windows-check:
-    name: Windows (compile check)
+    name: Windows (compile check + test)
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -52,11 +52,21 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      # ff-tools and ff-mcp carry the #[cfg(windows)] code (process Job Object kill
-      # path; MCP PATHEXT shim resolution, #596). The Linux job never compiles it, so
-      # this guards against bit-rot.
+      # ff-tools and ff-mcp carry the #[cfg(windows)] code (process Job Object
+      # kill path + the `#607` `tracing::warn!` diagnostics; MCP PATHEXT shim
+      # resolution, #596). The Linux job never compiles it, so this guards
+      # against bit-rot.
       - name: cargo check (ff-tools + ff-mcp)
         run: cargo check -p ff-tools -p ff-mcp --all-targets
+
+      # Compile-only is not enough -- #605's Job-Object kill path is
+      # correct-by-inspection without runtime coverage, and unix tests
+      # (`echo`/`sleep`) don't run on Windows. Run the `#[cfg(windows)]`
+      # tests in `process::tests::windows` (tree-kill via
+      # `cmd /C ping -t`, #607) and the `jail::tests::windows_*` cases so
+      # both crates get real Windows coverage.
+      - name: cargo test (ff-tools + ff-mcp)
+        run: cargo test -p ff-tools -p ff-mcp --all-targets
 
   web:
     name: Web (typecheck, lint, format, build)
