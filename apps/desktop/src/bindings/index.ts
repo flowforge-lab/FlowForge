@@ -7,6 +7,8 @@ export type { AttachmentSource } from "./AttachmentSource";
 export type { Role } from "./Role";
 export type { Session } from "./Session";
 export type { SessionWorkspace } from "./SessionWorkspace";
+export type { DirEntry } from "./DirEntry";
+export type { FileContent } from "./FileContent";
 export type { Phenotype } from "./Phenotype";
 export type { ModelSelection } from "./ModelSelection";
 export type { ResolvedModel } from "./ResolvedModel";

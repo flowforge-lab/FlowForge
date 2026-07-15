@@ -16,6 +16,7 @@ import { useChatStore } from "@/store/chat";
 import { usePrefsStore } from "@/store/prefs";
 import { usePanesStore } from "@/store/panes";
 import { useSplitStore } from "@/store/split";
+import { useFilePanelStore } from "@/store/file-panel";
 import { usePaletteStore } from "@/store/palette";
 import { useAllConversationsSearchStore } from "@/store/all-conversations-search";
 import { useSettingsStore } from "@/store/settings";
@@ -113,6 +114,14 @@ function useGlobalShortcuts() {
           e.preventDefault();
           useFindStore.getState().toggleFind(sid);
         }
+        return;
+      }
+
+      // ⌘/Ctrl+⇧+E: open the workspace Files panel (#872). Checked before the
+      // direct-mode hotkeys below (which require !shiftKey), so Shift disambiguates.
+      if (mod && e.shiftKey && e.key.toLowerCase() === "e") {
+        e.preventDefault();
+        useFilePanelStore.getState().openFiles();
         return;
       }
 

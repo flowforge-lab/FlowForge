@@ -8,6 +8,7 @@ import {
 import {
   CircleOff,
   CornerDownLeft,
+  Folder,
   Layers,
   MessageSquare,
   PanelRight,
@@ -27,6 +28,7 @@ import type { SkillInfo } from "@/bindings";
 import { useChatStore } from "@/store/chat";
 import { usePanesStore, MAX_PANES } from "@/store/panes";
 import { useSplitStore } from "@/store/split";
+import { useFilePanelStore } from "@/store/file-panel";
 import { useSkillsStore } from "@/store/skills";
 import { useMcpStore } from "@/store/mcp";
 import { useSettingsStore } from "@/store/settings";
@@ -57,6 +59,7 @@ const ICONS: Record<
   "switch-session": MessageSquare,
   "toggle-split": PanelRight,
   "toggle-wrap": WrapText,
+  "open-files": Folder,
   "focus-composer": TextCursorInput,
   "start-goal": Target,
   "activate-skill": Sparkles,
@@ -124,6 +127,9 @@ function runCommand(cmd: PaletteCommand): void {
       return;
     case "toggle-wrap":
       useSplitStore.getState().toggleWrap();
+      return;
+    case "open-files":
+      useFilePanelStore.getState().openFiles();
       return;
     case "focus-composer":
       focusComposer();

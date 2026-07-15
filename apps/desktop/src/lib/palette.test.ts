@@ -57,11 +57,12 @@ describe("buildCommands", () => {
   });
   const byId = new Map(built.map((c) => [c.id, c] as const));
 
-  it("lists the four quick actions first, in order", () => {
-    expect(built.slice(0, 4).map((c) => c.id)).toEqual([
+  it("lists the quick actions first, in order", () => {
+    expect(built.slice(0, 5).map((c) => c.id)).toEqual([
       "action:new-session",
       "action:toggle-split",
       "action:toggle-wrap",
+      "action:open-files",
       "action:focus-composer",
     ]);
   });

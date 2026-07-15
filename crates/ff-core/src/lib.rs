@@ -6,6 +6,7 @@
 mod egress;
 pub mod events;
 mod export;
+mod files;
 mod goal;
 mod mcp;
 mod memory;
@@ -22,6 +23,7 @@ mod spawn_env;
 
 pub use egress::Egress;
 pub use export::Format;
+pub use files::{DirEntry, FileContent};
 pub use goal::{
     Goal, GoalBudget, GoalLedgerEntry, GoalSpend, GoalStatus, GoalStore, NextAction, StepStatus,
     Verdict, DEFAULT_MAX_ITERATIONS,

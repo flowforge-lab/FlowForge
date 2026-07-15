@@ -41,6 +41,13 @@ export function buildCommands(args: {
       keywords: "split panel lines soft wrap",
     },
     {
+      kind: "open-files",
+      id: "action:open-files",
+      title: "Open Files",
+      keywords: "file browser tree explorer viewer workspace directory",
+      hint: "⌘⇧E",
+    },
+    {
       kind: "focus-composer",
       id: "action:focus-composer",
       title: "Focus composer",

@@ -2209,6 +2209,7 @@ dependencies = [
  "ff-skills",
  "ff-tools",
  "futures-util",
+ "ignore",
  "keyring",
  "notify",
  "reqwest 0.12.28",

@@ -36,6 +36,7 @@ export {
   FileText,
   FlaskConical,
   Folder,
+  FolderOpen,
   FolderPlus,
   Gauge,
   GitBranch,
