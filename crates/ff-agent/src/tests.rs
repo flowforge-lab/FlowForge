@@ -1539,6 +1539,10 @@ async fn executes_tool_then_finishes() {
             AgentEvent::MemoryFlushed { .. } => {}
             AgentEvent::AttachmentsDropped { .. } => {}
             AgentEvent::ToolOutputChunk { .. } => {}
+            AgentEvent::Reconnecting { .. } => {}
+            AgentEvent::ConnectionFailed { message, .. } => {
+                panic!("connection failed: {message}")
+            }
         },
     )
     .await
@@ -1833,6 +1837,10 @@ async fn glm_empty_string_name_fragments_do_not_clobber_the_name() {
             AgentEvent::MemoryFlushed { .. } => {}
             AgentEvent::AttachmentsDropped { .. } => {}
             AgentEvent::ToolOutputChunk { .. } => {}
+            AgentEvent::Reconnecting { .. } => {}
+            AgentEvent::ConnectionFailed { message, .. } => {
+                panic!("connection failed: {message}")
+            }
         },
     )
     .await
@@ -1951,6 +1959,10 @@ async fn ask_user_round_trips_answer_as_tool_result() {
             AgentEvent::MemoryFlushed { .. } => {}
             AgentEvent::AttachmentsDropped { .. } => {}
             AgentEvent::ToolOutputChunk { .. } => {}
+            AgentEvent::Reconnecting { .. } => {}
+            AgentEvent::ConnectionFailed { message, .. } => {
+                panic!("connection failed: {message}")
+            }
         },
     )
     .await
@@ -3546,6 +3558,34 @@ async fn run_text_turn(provider: &dyn Provider) -> (Result<Message, AgentError>,
     (res, errored)
 }
 
+/// Like `run_text_turn` but captures every emitted event, for assertions on the
+/// `Reconnecting` / `ConnectionFailed` surface (#928).
+async fn collect_turn_events(
+    provider: &dyn Provider,
+) -> (Result<Message, AgentError>, Vec<AgentEvent>) {
+    let store = SessionStore::new();
+    let s = store.create_session(None);
+    store.add_message(&s.id, Role::User, "hi".into());
+    let registry = ToolRegistry::new();
+    let root = std::env::current_dir().unwrap();
+    let approve = AlwaysApprove;
+    let mut events: Vec<AgentEvent> = Vec::new();
+    let res = run_turn(
+        provider,
+        &store,
+        &ctx(&registry, &root, &approve),
+        &s.id,
+        "mock",
+        None,
+        false,
+        ReasoningVisibility::All,
+        CancelToken::new(),
+        |ev| events.push(ev),
+    )
+    .await;
+    (res, events)
+}
+
 #[tokio::test(start_paused = true)]
 async fn transient_setup_error_retries_then_succeeds() {
     let calls = Arc::new(AtomicUsize::new(0));
@@ -3633,9 +3673,20 @@ fn retry_backoff_routes_by_regime() {
     // Rate-limit uses its own budget + Retry-After (transport attempt irrelevant).
     assert_eq!(retry_backoff_ms(&rl, 99, 0), Some(5_000));
     assert_eq!(retry_backoff_ms(&rl, 0, MAX_RATE_LIMIT_ATTEMPTS), None);
-    // Transport blip uses the snappy schedule + transport budget.
+    // Transport blip uses the snappy schedule + wider transport budget (#928).
     assert_eq!(retry_backoff_ms(&blip, 1, 0), Some(RETRY_BACKOFF_BASE_MS));
-    assert_eq!(retry_backoff_ms(&blip, MAX_PROVIDER_ATTEMPTS, 0), None);
+    // The per-attempt backoff is clamped so a wider budget never balloons: the
+    // raw schedule would give 250 << 6 = 16s at attempt 7, but it caps at 5s.
+    assert_eq!(retry_backoff_ms(&blip, 7, 0), Some(RETRY_BACKOFF_CAP_MS));
+    assert!(
+        retry_backoff_ms(&blip, MAX_TRANSPORT_ATTEMPTS - 1, 0).unwrap() <= RETRY_BACKOFF_CAP_MS
+    );
+    // Budget exhausted at the transport cap, not the (smaller) anomaly cap.
+    assert_eq!(
+        retry_backoff_ms(&blip, MAX_PROVIDER_ATTEMPTS, 0),
+        Some(1_000)
+    );
+    assert_eq!(retry_backoff_ms(&blip, MAX_TRANSPORT_ATTEMPTS, 0), None);
     // Fatal is never retried.
     assert_eq!(retry_backoff_ms(&fatal, 1, 0), None);
 }
@@ -3719,16 +3770,108 @@ async fn mid_stream_error_after_emit_surfaces() {
         calls: calls.clone(),
         emit_first: true,
     };
-    let (res, errored) = run_text_turn(&provider).await;
+    let (res, events) = collect_turn_events(&provider).await;
     assert!(
         res.is_err(),
         "error after streamed output must surface, not replay"
     );
-    assert!(errored);
+    // A mid-stream transport drop ends the turn with a connection error, not the
+    // generic Error, and never a resume/retry (#928).
+    let connection_failed = events
+        .iter()
+        .filter(|e| matches!(e, AgentEvent::ConnectionFailed { .. }))
+        .count();
+    assert_eq!(connection_failed, 1, "one terminal connection_failed");
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::Reconnecting { .. })),
+        "a mid-stream drop does not reconnect -- it surfaces"
+    );
+    // The single "partial" token is emitted exactly once: no re-issue, no dup.
+    let partial_tokens = events
+        .iter()
+        .filter(|e| matches!(e, AgentEvent::Token { delta, .. } if delta == "partial"))
+        .count();
+    assert_eq!(partial_tokens, 1, "streamed content is not duplicated");
     assert_eq!(
         calls.load(Ordering::SeqCst),
         1,
         "no retry once tokens reached the UI"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn pre_stream_drop_emits_reconnecting_then_recovers() {
+    // Two pre-stream transport drops then success: each retry surfaces a
+    // Reconnecting event counting toward the transport budget, and the turn
+    // recovers cleanly with no connection_failed (#928).
+    let calls = Arc::new(AtomicUsize::new(0));
+    let provider = FlakySetup {
+        fails: 2,
+        calls: calls.clone(),
+    };
+    let (res, events) = collect_turn_events(&provider).await;
+    assert_eq!(res.unwrap().content, "recovered");
+
+    let reconnects: Vec<(u32, u32)> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::Reconnecting {
+                attempt,
+                max_attempts,
+                ..
+            } => Some((*attempt, *max_attempts)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        reconnects,
+        vec![
+            (2, MAX_TRANSPORT_ATTEMPTS as u32),
+            (3, MAX_TRANSPORT_ATTEMPTS as u32)
+        ],
+        "one reconnecting per retry, counting the upcoming attempt"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::ConnectionFailed { .. })),
+        "a recovered turn never surfaces connection_failed"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn transport_budget_exhaustion_emits_connection_failed() {
+    // A transport that never recovers: retries up to the transport budget, then
+    // surfaces connection_failed (not the generic Error), never spinning (#928).
+    let calls = Arc::new(AtomicUsize::new(0));
+    let provider = FlakySetup {
+        fails: 999,
+        calls: calls.clone(),
+    };
+    let (res, events) = collect_turn_events(&provider).await;
+    assert!(res.is_err(), "an unrecoverable transport drop must surface");
+
+    let reconnects = events
+        .iter()
+        .filter(|e| matches!(e, AgentEvent::Reconnecting { .. }))
+        .count();
+    // One Reconnecting per retry: MAX_TRANSPORT_ATTEMPTS calls -> N-1 retries.
+    assert_eq!(reconnects, MAX_TRANSPORT_ATTEMPTS - 1);
+    let connection_failed = events
+        .iter()
+        .filter(|e| matches!(e, AgentEvent::ConnectionFailed { .. }))
+        .count();
+    assert_eq!(connection_failed, 1, "one terminal connection_failed");
+    assert!(
+        !events.iter().any(|e| matches!(e, AgentEvent::Error { .. })),
+        "a transport failure is a connection error, not a generic Error"
+    );
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        MAX_TRANSPORT_ATTEMPTS,
+        "bounded by the transport budget"
     );
 }
 

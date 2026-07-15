@@ -250,6 +250,34 @@ pub struct TurnErrorEvent {
     pub message: String,
 }
 
+/// A transient transport drop before any token; the turn is auto-retrying (#928).
+/// The frontend renders "Reconnecting... {attempt}/{max_attempts}" on the in-progress
+/// turn and clears it on the next `TokenEvent`/`TurnDoneEvent`. `attempt` is the
+/// upcoming retry (1-based).
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "../../../apps/desktop/src/bindings/")]
+pub struct ReconnectingEvent {
+    pub session_id: String,
+    pub message_id: String,
+    pub attempt: u32,
+    pub max_attempts: u32,
+}
+
+/// A transient connection failure ended the turn -- budget exhausted or a mid-stream
+/// drop (no resume) (#928). Distinct from `TurnErrorEvent` so the frontend can render
+/// a connection-specific error + "Try again" (a re-run). `message` is the underlying
+/// error for detail; the user-facing headline copy is owned by the frontend and must
+/// stay provider-neutral (offline vs provider-down are indistinguishable here).
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "../../../apps/desktop/src/bindings/")]
+pub struct ConnectionFailedEvent {
+    pub session_id: String,
+    pub message_id: String,
+    pub message: String,
+}
+
 /// A silent context-pressure memory flush wrote durable facts to the user's
 /// on-disk memory mid-turn (#283, follow-up to #244 R5). Emitted only when the
 /// flush actually wrote something, so the memory browser can surface provenance

@@ -686,6 +686,16 @@ fn render_event_text(event: AgentEvent) {
         AgentEvent::Error { message } => {
             eprintln!("\n[error] {message}");
         }
+        AgentEvent::Reconnecting {
+            attempt,
+            max_attempts,
+            ..
+        } => {
+            eprintln!("\n[reconnecting] {attempt}/{max_attempts}");
+        }
+        AgentEvent::ConnectionFailed { message, .. } => {
+            eprintln!("\n[connection lost] {message}");
+        }
     }
 }
 
