@@ -53,6 +53,7 @@ export function startIpcEvents(): void {
   });
   void ipc.onToolOutput(store.applyToolOutputChunk);
   void ipc.onToolResult(store.applyToolResult);
+  void ipc.onTurnStats(store.applyTurnStats);
   void ipc.onApprovalRequest(store.applyApprovalRequest);
   void ipc.onAskRequest(store.applyAskRequest);
   void ipc.onSkillsChanged(() => {

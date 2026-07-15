@@ -169,12 +169,12 @@ describe("ContextGauge — popover (#931)", () => {
     cacheWriteTokens: 254_000,
   };
 
-  it("prefers the authoritative inputTokens over the chars/4 proxy for the pill", () => {
+  it("prefers breakdown sum over the chars/4 proxy for the pill (#945)", () => {
     seed(999_000, 150_000);
-    seedPopover({ inputTokens: 173_000 });
+    seedPopover({ inputTokens: 173_000, breakdown: BREAKDOWN });
     render(<ContextGauge sessionId={SID} />);
-    // The trigger shows the real used total, not the proxy.
-    expect(screen.getByText("173K")).not.toBeNull();
+    // breakdown sum = 12000+2900+158000 = 172900, displayed as 172.9K
+    expect(screen.getByText("172.9K")).not.toBeNull();
     expect(screen.queryByText("999K")).toBeNull();
   });
 
@@ -227,10 +227,11 @@ describe("ContextGauge — popover (#931)", () => {
 
     expect(writeText).toHaveBeenCalledTimes(1);
     const payload = JSON.parse(writeText.mock.calls[0][0] as string);
+    // used = breakdown sum (12000+2900+158000 = 172900), pct = round(172900/150000*100) = 115
     expect(payload).toMatchObject({
       sessionId: SID,
       model: "claude-opus-4-8",
-      used: 173_000,
+      used: 172_900,
       budget: 150_000,
       pctUsed: 115,
       breakdown: BREAKDOWN,

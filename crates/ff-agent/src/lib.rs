@@ -292,6 +292,9 @@ pub enum AgentEvent {
         /// provider reports no usage metadata.
         #[serde(skip_serializing_if = "Option::is_none")]
         usage: Option<TurnUsage>,
+        /// Effective compaction budget (#945). The denominator for pctUsed.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        budget_tokens: Option<u32>,
     },
     /// A silent context-pressure memory flush (#244 R5) wrote `writes` durable
     /// facts to the user's on-disk memory this turn (#283). Emitted only when
@@ -1590,6 +1593,7 @@ pub async fn run_turn(
                     cache_read_tokens: cache_hit_tokens,
                     cache_write_tokens: cache_miss_tokens,
                 }),
+                budget_tokens: Some(estimator.budget_tokens as u32),
             });
             return Ok(finalized);
         }
@@ -2021,6 +2025,7 @@ pub async fn run_turn(
             cache_read_tokens: cache_hit_tokens,
             cache_write_tokens: cache_miss_tokens,
         }),
+        budget_tokens: Some(estimator.budget_tokens as u32),
     });
     Ok(msg)
 }

@@ -18,6 +18,7 @@ import type {
   ReasoningEvent,
   TurnDoneEvent,
   TurnErrorEvent,
+  TurnStatsEvent,
   TurnUsage,
   ToolApprovalRequestEvent,
   ToolAskRequestEvent,
@@ -109,6 +110,9 @@ interface ChatState {
    *  Each turn's TurnDoneEvent.usage is added into the running total; drives the
    *  popover's SESSION TOTALS block. Undefined until a provider reports usage. */
   sessionTotalsBySession: Record<string, TurnUsage>;
+  /** sessionId -> last turn's time-to-first-token in ms (#945). Populated from
+   *  TurnStatsEvent.firstTokenMs; drives the popover's TTFT row. */
+  ttftBySession: Record<string, number>;
   /** sessionId -> the last turn ended without a usable answer the user can resume
    *  with one click — the agent loop hit the tool-call cap / stalled (`[stopped: …]`),
    *  or the user pressed Stop (a bare `[stopped]`, #636), so a one-click "Continue"
@@ -204,6 +208,7 @@ interface ChatState {
   applyToolCall: (e: ToolCallEvent) => void;
   applyToolOutputChunk: (e: ToolOutputChunkEvent) => void;
   applyToolResult: (e: ToolResultEvent) => void;
+  applyTurnStats: (e: TurnStatsEvent) => void;
   applyApprovalRequest: (e: ToolApprovalRequestEvent) => void;
   respondApproval: (
     sessionId: string,
@@ -359,6 +364,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   contextBreakdownBySession: {},
   contextInputTokensBySession: {},
   sessionTotalsBySession: {},
+  ttftBySession: {},
   resumableBySession: {},
   recentlyFinishedBySession: {},
   sessionApprovedBySession: {},
@@ -846,11 +852,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
     );
     const endedEmpty = !doneMsg || doneMsg.content.trim() === "";
 
-    // Effective compaction budget the loop compacts against (#598). Read through a
-    // local augmentation until the ts-rs binding regeneration lands the field on
-    // TurnDoneEvent (backend/contract change) — drop the cast once it does.
-    const budget = (e as TurnDoneEvent & { budgetTokens?: number | null })
-      .budgetTokens;
+    // Effective compaction budget the loop compacts against (#598, #945).
+    const budget = e.budgetTokens;
 
     // Activity signal (#703): flag completion + toast only when the finished
     // session is NOT the one on screen — the active session already shows its
@@ -1087,6 +1090,13 @@ export const useChatStore = create<ChatState>((set, get) => ({
         },
       };
     });
+  },
+
+  applyTurnStats: (e) => {
+    if (e.firstTokenMs == null) return;
+    set((s) => ({
+      ttftBySession: { ...s.ttftBySession, [e.sessionId]: e.firstTokenMs! },
+    }));
   },
 
   applyApprovalRequest: (e) => {
