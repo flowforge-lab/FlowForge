@@ -5,9 +5,10 @@
 //! place that gets compaction right. Two traits are kept deliberately separate so
 //! the policy and the mechanism evolve independently:
 //!
-//! - [`ContextPressureEstimator`] — *when*. v1 ships [`ProxyTokenEstimator`] (a
-//!   `chars/4` proxy vs a fixed budget). Per-model context-window metadata plugs in
-//!   here later without touching the trigger that consumes it.
+//! - [`ContextPressureEstimator`] — *when*. v1 ships [`ProxyTokenEstimator`]
+//!   (tokenx-rs heuristic, ~96% accurate, vs a fixed budget). Per-model
+//!   context-window metadata plugs in here later without touching the trigger
+//!   that consumes it.
 //! - [`CompactionStrategy`] — *how*. v1 ships [`MemoryFlush`] (a silent agentic turn
 //!   that persists durable facts to memory before they are summarized away). Future
 //!   strategies (knowledge-graph compression, hierarchical summarization, …) become
@@ -71,9 +72,9 @@ pub trait ContextPressureEstimator: Send + Sync {
     fn assess(&self, messages: &[Message], model: &str) -> ContextPressure;
 }
 
-/// v1 estimator: `chars/4` over the transcript vs a fixed budget. Cheap, model
-/// agnostic, and never wrong in a way that loses data — it only decides when to
-/// *offer* to persist memory. `model` is ignored until per-model windows exist.
+/// v1 estimator: `tokenx-rs` heuristic (~96% accurate against tiktoken cl100k_base)
+/// over the transcript vs a fixed budget. Model-agnostic, zero-cost, and never wrong
+/// in a way that loses data -- it only decides when to *offer* to persist memory.
 #[derive(Debug, Clone, Copy)]
 pub struct ProxyTokenEstimator {
     pub budget_tokens: u64,
@@ -93,12 +94,15 @@ impl ContextPressureEstimator for ProxyTokenEstimator {
         // gateways (#375 PR-2), so a turn's true cost includes its persisted CoT.
         // Without this, injected reasoning bloats the request without ever tripping
         // compaction -- the window blows before pressure is even noticed.
-        let chars: usize = messages
+        let tokens: usize = messages
             .iter()
-            .map(|m| m.content.len() + m.reasoning.as_deref().map_or(0, str::len))
+            .map(|m| {
+                ff_llm::count_tokens(&m.content)
+                    + m.reasoning.as_deref().map_or(0, ff_llm::count_tokens)
+            })
             .sum();
         ContextPressure {
-            estimated_tokens: (chars / 4) as u64,
+            estimated_tokens: tokens as u64,
             budget_tokens: self.budget_tokens,
         }
     }

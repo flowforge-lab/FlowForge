@@ -205,7 +205,7 @@ const REASONING_REPLAY_KEEP: usize = 2;
 
 /// Fraction of a model's real context window used as the compaction budget. The
 /// headroom (the remaining ~20%) absorbs the model's own response and the
-/// coarseness of the chars/4 proxy estimate, so compaction engages before the
+/// coarseness of the token estimate, so compaction engages before the
 /// true window is hit rather than after. Combined with the per-model window from
 /// `Provider::context_window`, this stops a large-window model from being
 /// force-compacted at a small fixed ceiling (#B1).
@@ -1439,8 +1439,8 @@ pub async fn run_turn(
                 break;
             }
             // Approximate context size at completion so the frontend can show a
-            // token gauge (#244 R6). The proxy estimator (chars/4) is intentionally
-            // coarse; per-model tokenizers plug in via ContextPressureEstimator later.
+            // token gauge (#244 R6). The estimator (tokenx-rs, ~96% accurate)
+            // is model-agnostic; per-model tokenizers can plug in later.
             let token_count = Some(
                 estimator
                     .assess(&store.get_messages(session_id), model)

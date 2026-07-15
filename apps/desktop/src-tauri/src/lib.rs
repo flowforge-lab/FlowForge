@@ -93,11 +93,11 @@ pub(crate) fn boot_trace_step(label: &str, dur: Duration) {
 
 /// Per-turn telemetry accumulator (RFC 0001 §8), filled by the agent-event closure
 /// and folded into per-skill aggregates when the turn ends. `message_ids` counts
-/// distinct assistant messages — one per agent loop iteration, i.e. the turn count;
-/// `chars` is the total streamed assistant text used as a coarse token-cost proxy.
+/// distinct assistant messages -- one per agent loop iteration, i.e. the turn count;
+/// `tokens` is the estimated assistant output tokens (via tokenx-rs, ~96% accurate).
 #[derive(Default)]
 struct TurnMetrics {
-    chars: usize,
+    tokens: usize,
     message_ids: std::collections::HashSet<String>,
     /// First-seen instant of each distinct assistant message, in arrival order.
     /// One per agent loop iteration (provider round-trip); consecutive deltas
@@ -131,9 +131,9 @@ impl TurnMetrics {
         self.tier2_fires = tier2_fires;
     }
 
-    /// `(streamed assistant chars, distinct turn count)`.
+    /// `(estimated assistant output tokens, distinct turn count)`.
     fn snapshot(&self) -> (usize, usize) {
-        (self.chars, self.message_ids.len())
+        (self.tokens, self.message_ids.len())
     }
 
     /// Per-turn timing breakdown for the #427 baseline: `(round_trips, per-iteration
@@ -1439,7 +1439,7 @@ fn spawn_assistant_turn(state: Arc<AppState>, app: tauri::AppHandle, session_id:
                     match &event {
                         AgentEvent::Token { message_id, delta } => {
                             m.note_turn(message_id);
-                            m.chars += delta.chars().count();
+                            m.tokens += ff_llm::count_tokens(delta);
                         }
                         AgentEvent::Reasoning { message_id, .. }
                         | AgentEvent::ToolCallStarted { message_id, .. } => {
@@ -1489,7 +1489,7 @@ fn spawn_assistant_turn(state: Arc<AppState>, app: tauri::AppHandle, session_id:
         // (run_turn returned Ok and the turn was not cancelled).
         let turn_end = std::time::Instant::now();
         let (
-            chars,
+            output_tokens,
             turn_count,
             round_trips,
             iter_ms,
@@ -1519,7 +1519,7 @@ fn spawn_assistant_turn(state: Arc<AppState>, app: tauri::AppHandle, session_id:
         let success = result.is_ok() && !cancel_probe.is_cancelled();
         let latency_ms = u32::try_from(turn_end.saturating_duration_since(turn_start).as_millis())
             .unwrap_or(u32::MAX);
-        let tokens = u32::try_from(chars / 4).unwrap_or(u32::MAX);
+        let tokens = u32::try_from(output_tokens).unwrap_or(u32::MAX);
         let turns = u32::try_from(turn_count).unwrap_or(u32::MAX);
 
         // F1 (#427): emit the per-turn timing baseline the performance epic (#426)
@@ -1531,7 +1531,7 @@ fn spawn_assistant_turn(state: Arc<AppState>, app: tauri::AppHandle, session_id:
             total_ms: latency_ms,
             iter_ms,
             flushes,
-            chars: u32::try_from(chars).unwrap_or(u32::MAX),
+            chars: u32::try_from(output_tokens).unwrap_or(u32::MAX),
             // F1b fields are Option on the wire (#475 follow-up); the desktop
             // always populates them.
             prefill_estimates: Some(prefill_estimates),

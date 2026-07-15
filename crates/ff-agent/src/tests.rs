@@ -541,7 +541,7 @@ async fn cross_turn_cache_seeds_summary_and_invalidate_forces_resummary() {
     // Long enough that the post-Tier-1 wire stays over the Tier-2 fraction,
     // so the Tier-2 path is actually entered in both phases.
     for i in 0..30 {
-        let line = format!("cold-{i} {}", "lorem ipsum dolor sit amet ".repeat(150));
+        let line = format!("cold-{i} {}", "lorem ipsum dolor sit amet ".repeat(300));
         let role = if i % 2 == 0 {
             Role::User
         } else {
@@ -696,7 +696,7 @@ async fn cross_turn_cache_invalidate_all_forces_resummary() {
     let s = store.create_session(None);
 
     for i in 0..30 {
-        let line = format!("cold-{i} {}", "lorem ipsum dolor sit amet ".repeat(150));
+        let line = format!("cold-{i} {}", "lorem ipsum dolor sit amet ".repeat(300));
         let role = if i % 2 == 0 {
             Role::User
         } else {
@@ -4768,9 +4768,9 @@ async fn context_pressure_under_budget_skips_flush() {
 async fn context_pressure_over_budget_triggers_flush() {
     let store = SessionStore::new();
     let s = store.create_session(None);
-    // Push the proxy estimate (chars/4) over 0.75 * DEFAULT_CONTEXT_BUDGET_TOKENS:
-    // 0.75 * 24_000 = 18_000 tokens -> 72_000 chars. 100k chars clears it.
-    let huge = "x".repeat(100_000);
+    // Push the token estimate over 0.75 * context_budget (0.8 * 32K = 25.6K;
+    // threshold = 0.75 * 25.6K = 19.2K). tokenx-rs: 200K "x" ~ 33K tokens.
+    let huge = "x".repeat(200_000);
     store.add_message(&s.id, Role::User, huge);
     let registry = ToolRegistry::new();
     let root = std::env::current_dir().unwrap();
@@ -4888,7 +4888,7 @@ impl Provider for FlushWriteThenText {
 async fn over_budget_flush_that_writes_emits_memory_flushed_event() {
     let store = SessionStore::new();
     let s = store.create_session(None);
-    store.add_message(&s.id, Role::User, "x".repeat(100_000));
+    store.add_message(&s.id, Role::User, "x".repeat(200_000));
     let writes = Arc::new(AtomicUsize::new(0));
     let mut registry = ToolRegistry::new();
     registry.register(Box::new(CountingMemoryWrite {
@@ -4962,7 +4962,7 @@ async fn over_pressure_compacts_wire_but_store_stays_verbatim() {
     for i in 0..10 {
         let blob = serde_json::to_string(&serde_json::json!({
             "idx": i,
-            "summary": "y".repeat(9000),
+            "summary": "y".repeat(15000),
             "items": (0..60).collect::<Vec<i32>>(),
         }))
         .unwrap();
@@ -5128,7 +5128,7 @@ async fn tier2_summarizes_cold_prefix_but_store_stays_verbatim() {
 
     let mut cold_contents = Vec::new();
     for i in 0..30 {
-        let line = format!("cold-{i} {}", "lorem ipsum dolor sit amet ".repeat(150));
+        let line = format!("cold-{i} {}", "lorem ipsum dolor sit amet ".repeat(300));
         let role = if i % 2 == 0 {
             Role::User
         } else {

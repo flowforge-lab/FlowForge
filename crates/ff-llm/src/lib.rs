@@ -4,6 +4,9 @@
 //! (AWS Converse) and [`AnthropicProvider`] (native Messages API) land behind the
 //! same trait.
 
+pub mod tokenizer;
+pub use tokenizer::count_tokens;
+
 mod anthropic;
 mod bedrock;
 mod extract;
