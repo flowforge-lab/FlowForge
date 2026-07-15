@@ -3238,6 +3238,8 @@ fn emit_agent_event<R: tauri::Runtime>(
             message_id,
             token_count,
             stop_reason,
+            breakdown,
+            usage,
             ..
         } => {
             let _ = app.emit(
@@ -3247,6 +3249,8 @@ fn emit_agent_event<R: tauri::Runtime>(
                     message_id,
                     token_count,
                     stop_reason,
+                    breakdown,
+                    usage,
                 },
             );
         }

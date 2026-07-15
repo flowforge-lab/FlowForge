@@ -227,10 +227,19 @@ pub struct Chunk {
     pub truncated: bool,
     /// Prompt prefix cache metrics from the provider (#766). Populated on the
     /// final chunk of providers that report usage (OpenAI-compatible with
-    /// `stream_options.include_usage`, Anthropic `message_delta`). Zero when
-    /// the provider doesn't report or caching didn't fire.
+    /// `stream_options.include_usage`, Bedrock `ConverseStream` metadata). Zero
+    /// when the provider doesn't report or caching didn't fire.
     pub cache_hit_tokens: u32,
     pub cache_miss_tokens: u32,
+    /// Provider-reported prompt token count for the round-trip (#931). The
+    /// authoritative "used" total when present -- more accurate than the
+    /// `chars/4` proxy. Populated on the usage chunk (Bedrock `ConverseStream`
+    /// metadata `inputTokens`, OpenAI `usage.prompt_tokens`). Zero when the
+    /// provider doesn't report usage.
+    pub input_tokens: u32,
+    /// Provider-reported completion token count for the round-trip (#931).
+    /// Populated alongside `input_tokens`. Zero when unreported.
+    pub output_tokens: u32,
 }
 
 #[derive(Debug, thiserror::Error)]

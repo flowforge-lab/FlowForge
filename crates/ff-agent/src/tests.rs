@@ -5401,3 +5401,53 @@ async fn changed_file_is_not_deduped() {
         reread.content
     );
 }
+
+#[test]
+fn context_breakdown_splits_system_tools_and_messages() {
+    fn msg(role: Role, content: &str, reasoning: Option<&str>) -> Message {
+        Message {
+            id: "m".into(),
+            session_id: "s".into(),
+            role,
+            content: content.into(),
+            tool_calls: None,
+            tool_call_id: None,
+            attachments: None,
+            reasoning: reasoning.map(str::to_string),
+            stop_reason: None,
+            author_name: None,
+            created_at: 0,
+        }
+    }
+
+    // 40 chars -> 10 tokens.
+    let system = "x".repeat(40);
+    let tool_schemas = vec![
+        serde_json::json!({"type": "function", "function": {"name": "a"}}),
+        serde_json::json!({"type": "function", "function": {"name": "b"}}),
+    ];
+    let messages = vec![
+        msg(Role::User, &"y".repeat(20), None),
+        msg(Role::Assistant, &"z".repeat(16), Some(&"r".repeat(4))),
+    ];
+
+    let b = context_breakdown(Some(&system), &tool_schemas, &messages);
+
+    assert_eq!(b.system_tokens, 10, "40 chars / 4");
+    assert_eq!(b.tool_specs, 2);
+    assert_eq!(b.message_count, 2);
+    // 20 + (16 + 4) = 40 chars -> 10 tokens; reasoning is counted (#378).
+    assert_eq!(b.message_tokens, 10);
+    // Tool schemas serialize to non-empty JSON.
+    assert!(b.tool_tokens > 0);
+}
+
+#[test]
+fn context_breakdown_handles_absent_system_prompt() {
+    let b = context_breakdown(None, &[], &[]);
+    assert_eq!(b.system_tokens, 0);
+    assert_eq!(b.tool_tokens, 0);
+    assert_eq!(b.tool_specs, 0);
+    assert_eq!(b.message_tokens, 0);
+    assert_eq!(b.message_count, 0);
+}

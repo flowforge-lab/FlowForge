@@ -11,6 +11,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+use ff_core::events::{ContextBreakdown, TurnUsage};
 use ff_core::{
     AttachmentKind, Egress, Message, Mode, PermissionCell, PermissionMatrix, ReasoningVisibility,
     Role, StopReason,
@@ -269,6 +270,14 @@ pub enum AgentEvent {
         /// Prefix cache miss tokens across all iterations this turn (#766).
         #[serde(skip_serializing_if = "Option::is_none")]
         cache_miss_tokens: Option<u32>,
+        /// Component breakdown of the context-size estimate (#931) for the
+        /// context-usage popover. `None` for events not from `run_turn`.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        breakdown: Option<ContextBreakdown>,
+        /// Provider-reported token usage this turn (#931). `None` when the
+        /// provider reports no usage metadata.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        usage: Option<TurnUsage>,
     },
     /// A silent context-pressure memory flush (#244 R5) wrote `writes` durable
     /// facts to the user's on-disk memory this turn (#283). Emitted only when
@@ -616,6 +625,32 @@ struct CallBuf {
     arguments: String,
 }
 
+/// Split the `chars/4` context estimate into the three buckets the context-usage
+/// popover renders (#931): the transient system prompt, the advertised tool
+/// schemas, and the persisted transcript. Uses the same coarse `chars/4` proxy as
+/// [`ProxyTokenEstimator`] so the buckets sum consistently with `token_count`.
+fn context_breakdown(
+    system_prompt: Option<&str>,
+    tool_schemas: &[serde_json::Value],
+    messages: &[Message],
+) -> ContextBreakdown {
+    let system_chars = system_prompt.map_or(0, str::len);
+    let tool_chars = serde_json::to_string(tool_schemas).map_or(0, |s| s.len());
+    // Count reasoning too -- it is replayed on the wire for reasoning gateways,
+    // matching what the estimator sums into `token_count` (#378).
+    let message_chars: usize = messages
+        .iter()
+        .map(|m| m.content.len() + m.reasoning.as_deref().map_or(0, str::len))
+        .sum();
+    ContextBreakdown {
+        system_tokens: (system_chars / 4) as u32,
+        tool_tokens: (tool_chars / 4) as u32,
+        tool_specs: tool_schemas.len() as u32,
+        message_tokens: (message_chars / 4) as u32,
+        message_count: messages.len() as u32,
+    }
+}
+
 /// The set of tool names to advertise to the model this turn.
 /// Filter the advertised tool set based on Mode (#699, #793).
 ///
@@ -910,6 +945,11 @@ pub async fn run_turn(
     // hit/miss tokens across all iterations this turn.
     let mut cache_hit_tokens: u32 = 0;
     let mut cache_miss_tokens: u32 = 0;
+    // Provider-reported prompt/completion tokens accumulated across this turn's
+    // round-trips (#931). Cumulative billed usage -- each round-trip re-sends the
+    // full prompt, so summing reflects total tokens processed this turn.
+    let mut input_tokens_total: u32 = 0;
+    let mut output_tokens_total: u32 = 0;
     for iter in 0..max_iter {
         turn_count += 1;
         if cancel.is_cancelled() {
@@ -1308,6 +1348,9 @@ pub async fn run_turn(
                         // carries the totals; earlier chunks report 0.
                         cache_hit_tokens += chunk.cache_hit_tokens;
                         cache_miss_tokens += chunk.cache_miss_tokens;
+                        input_tokens_total = input_tokens_total.saturating_add(chunk.input_tokens);
+                        output_tokens_total =
+                            output_tokens_total.saturating_add(chunk.output_tokens);
                         if step_thinking && !chunk.reasoning_delta.is_empty() {
                             emitted_any = true;
                             reasoning_acc.push_str(&chunk.reasoning_delta);
@@ -1351,6 +1394,10 @@ pub async fn run_turn(
                             if let Some(Ok(trailing)) = stream.next().await {
                                 cache_hit_tokens += trailing.cache_hit_tokens;
                                 cache_miss_tokens += trailing.cache_miss_tokens;
+                                input_tokens_total =
+                                    input_tokens_total.saturating_add(trailing.input_tokens);
+                                output_tokens_total =
+                                    output_tokens_total.saturating_add(trailing.output_tokens);
                             }
                             break;
                         }
@@ -1441,11 +1488,8 @@ pub async fn run_turn(
             // Approximate context size at completion so the frontend can show a
             // token gauge (#244 R6). The proxy estimator (chars/4) is intentionally
             // coarse; per-model tokenizers plug in via ContextPressureEstimator later.
-            let token_count = Some(
-                estimator
-                    .assess(&store.get_messages(session_id), model)
-                    .estimated_tokens as u32,
-            );
+            let final_msgs = store.get_messages(session_id);
+            let token_count = Some(estimator.assess(&final_msgs, model).estimated_tokens as u32);
             on_event(AgentEvent::Done {
                 message_id: message_id.clone(),
                 final_message: Some(final_text),
@@ -1457,6 +1501,13 @@ pub async fn run_turn(
                 tier2_fires: Some(tier2_fires),
                 cache_hit_tokens: Some(cache_hit_tokens),
                 cache_miss_tokens: Some(cache_miss_tokens),
+                breakdown: Some(context_breakdown(system_prompt, &tool_schemas, &final_msgs)),
+                usage: Some(TurnUsage {
+                    input_tokens: input_tokens_total,
+                    output_tokens: output_tokens_total,
+                    cache_read_tokens: cache_hit_tokens,
+                    cache_write_tokens: cache_miss_tokens,
+                }),
             });
             return Ok(finalized);
         }
@@ -1868,11 +1919,8 @@ pub async fn run_turn(
         None
     };
     // Same context-size estimate as the plain-text completion path (#244 R6).
-    let token_count = Some(
-        estimator
-            .assess(&store.get_messages(session_id), model)
-            .estimated_tokens as u32,
-    );
+    let final_msgs = store.get_messages(session_id);
+    let token_count = Some(estimator.assess(&final_msgs, model).estimated_tokens as u32);
     on_event(AgentEvent::Done {
         message_id: msg.id.clone(),
         final_message: Some(msg.content.clone()),
@@ -1884,6 +1932,13 @@ pub async fn run_turn(
         tier2_fires: Some(tier2_fires),
         cache_hit_tokens: Some(cache_hit_tokens),
         cache_miss_tokens: Some(cache_miss_tokens),
+        breakdown: Some(context_breakdown(system_prompt, &tool_schemas, &final_msgs)),
+        usage: Some(TurnUsage {
+            input_tokens: input_tokens_total,
+            output_tokens: output_tokens_total,
+            cache_read_tokens: cache_hit_tokens,
+            cache_write_tokens: cache_miss_tokens,
+        }),
     });
     Ok(msg)
 }

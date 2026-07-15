@@ -612,6 +612,22 @@ fn event_to_chunk(event: ConverseStreamOutput) -> Option<Chunk> {
             truncated: matches!(ev.stop_reason(), StopReason::MaxTokens),
             ..Chunk::default()
         }),
+        // The usage metadata trails `MessageStop`, carrying the authoritative
+        // prompt/completion token counts and prompt-prefix cache metrics (#931).
+        // Without this arm the counts are silently dropped, leaving the Bedrock
+        // provider's `Chunk` cache/usage fields permanently zero. `done` stays
+        // false so the accumulated usage rides a trailing chunk rather than
+        // re-signalling turn completion.
+        ConverseStreamOutput::Metadata(ev) => {
+            let usage = ev.usage()?;
+            Some(Chunk {
+                input_tokens: usage.input_tokens().max(0) as u32,
+                output_tokens: usage.output_tokens().max(0) as u32,
+                cache_hit_tokens: usage.cache_read_input_tokens().unwrap_or(0).max(0) as u32,
+                cache_miss_tokens: usage.cache_write_input_tokens().unwrap_or(0).max(0) as u32,
+                ..Chunk::default()
+            })
+        }
         _ => None,
     }
 }
