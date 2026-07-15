@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Check, ChevronDown, Dna } from "@/components/ui/icon";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
@@ -38,6 +38,16 @@ export function PhenoSelector({ sessionId }: { sessionId: string }) {
   const [switchError, setSwitchError] = useState<string | null>(null);
   const error = switchError ?? loadError;
 
+  // Guards the post-await state writes below: if the pane unmounts mid-switch
+  // (session closed, pane forked away) the IPC call still resolves/rejects, but
+  // there's no longer a component to reflect saving/error state onto.
+  const mountedRef = useRef(true);
+  useEffect(() => {
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
+
   // Lazily hydrate the list the first time a pane mounts (the Profiles settings
   // section also loads it, but the header shouldn't depend on Settings being
   // opened). The shared store means only the first pane triggers the fetch. The
@@ -62,11 +72,15 @@ export function PhenoSelector({ sessionId }: { sessionId: string }) {
     patchSessionPhenotype(sessionId, name);
     try {
       await ipc.setSessionPhenotype(sessionId, name);
-      setSaving(false);
+      if (mountedRef.current) setSaving(false);
     } catch (err) {
+      // The session patch stands regardless of mount state — it lives in the
+      // shared chat store, not this component.
       patchSessionPhenotype(sessionId, bound ?? null);
-      setSaving(false);
-      setSwitchError(err instanceof Error ? err.message : String(err));
+      if (mountedRef.current) {
+        setSaving(false);
+        setSwitchError(err instanceof Error ? err.message : String(err));
+      }
     }
   };
 
