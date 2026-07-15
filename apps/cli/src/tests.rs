@@ -81,6 +81,8 @@ fn json_mode_golden_lines() {
             tier2_fires: None,
             cache_hit_tokens: None,
             cache_miss_tokens: None,
+            breakdown: None,
+            usage: None,
         },
         AgentEvent::MemoryFlushed {
             message_id: "m1".into(),

@@ -541,7 +541,7 @@ async fn cross_turn_cache_seeds_summary_and_invalidate_forces_resummary() {
     // Long enough that the post-Tier-1 wire stays over the Tier-2 fraction,
     // so the Tier-2 path is actually entered in both phases.
     for i in 0..30 {
-        let line = format!("cold-{i} {}", "lorem ipsum dolor sit amet ".repeat(150));
+        let line = format!("cold-{i} {}", "lorem ipsum dolor sit amet ".repeat(300));
         let role = if i % 2 == 0 {
             Role::User
         } else {
@@ -696,7 +696,7 @@ async fn cross_turn_cache_invalidate_all_forces_resummary() {
     let s = store.create_session(None);
 
     for i in 0..30 {
-        let line = format!("cold-{i} {}", "lorem ipsum dolor sit amet ".repeat(150));
+        let line = format!("cold-{i} {}", "lorem ipsum dolor sit amet ".repeat(300));
         let role = if i % 2 == 0 {
             Role::User
         } else {
@@ -4911,9 +4911,9 @@ async fn context_pressure_under_budget_skips_flush() {
 async fn context_pressure_over_budget_triggers_flush() {
     let store = SessionStore::new();
     let s = store.create_session(None);
-    // Push the proxy estimate (chars/4) over 0.75 * DEFAULT_CONTEXT_BUDGET_TOKENS:
-    // 0.75 * 24_000 = 18_000 tokens -> 72_000 chars. 100k chars clears it.
-    let huge = "x".repeat(100_000);
+    // Push the token estimate over 0.75 * context_budget (0.8 * 32K = 25.6K;
+    // threshold = 0.75 * 25.6K = 19.2K). tokenx-rs: 200K "x" ~ 33K tokens.
+    let huge = "x".repeat(200_000);
     store.add_message(&s.id, Role::User, huge);
     let registry = ToolRegistry::new();
     let root = std::env::current_dir().unwrap();
@@ -5031,7 +5031,7 @@ impl Provider for FlushWriteThenText {
 async fn over_budget_flush_that_writes_emits_memory_flushed_event() {
     let store = SessionStore::new();
     let s = store.create_session(None);
-    store.add_message(&s.id, Role::User, "x".repeat(100_000));
+    store.add_message(&s.id, Role::User, "x".repeat(200_000));
     let writes = Arc::new(AtomicUsize::new(0));
     let mut registry = ToolRegistry::new();
     registry.register(Box::new(CountingMemoryWrite {
@@ -5105,7 +5105,7 @@ async fn over_pressure_compacts_wire_but_store_stays_verbatim() {
     for i in 0..10 {
         let blob = serde_json::to_string(&serde_json::json!({
             "idx": i,
-            "summary": "y".repeat(9000),
+            "summary": "y".repeat(15000),
             "items": (0..60).collect::<Vec<i32>>(),
         }))
         .unwrap();
@@ -5271,7 +5271,7 @@ async fn tier2_summarizes_cold_prefix_but_store_stays_verbatim() {
 
     let mut cold_contents = Vec::new();
     for i in 0..30 {
-        let line = format!("cold-{i} {}", "lorem ipsum dolor sit amet ".repeat(150));
+        let line = format!("cold-{i} {}", "lorem ipsum dolor sit amet ".repeat(300));
         let role = if i % 2 == 0 {
             Role::User
         } else {
@@ -5543,4 +5543,72 @@ async fn changed_file_is_not_deduped() {
         "a changed file must NOT be deduped: {}",
         reread.content
     );
+}
+
+#[test]
+fn context_breakdown_splits_system_tools_and_messages() {
+    fn msg(role: Role, content: &str, reasoning: Option<&str>) -> Message {
+        Message {
+            id: "m".into(),
+            session_id: "s".into(),
+            role,
+            content: content.into(),
+            tool_calls: None,
+            tool_call_id: None,
+            attachments: None,
+            reasoning: reasoning.map(str::to_string),
+            stop_reason: None,
+            author_name: None,
+            created_at: 0,
+        }
+    }
+
+    let system = "x".repeat(40);
+    let tool_schemas = vec![
+        serde_json::json!({"type": "function", "function": {"name": "a"}}),
+        serde_json::json!({"type": "function", "function": {"name": "b"}}),
+    ];
+    let messages = vec![
+        msg(Role::User, &"y".repeat(20), None),
+        msg(Role::Assistant, &"z".repeat(16), Some(&"r".repeat(4))),
+    ];
+
+    let b = context_breakdown(Some(&system), &tool_schemas, &messages);
+
+    // Buckets use the same tokenx-rs estimator as ProxyTokenEstimator::assess.
+    assert!(
+        b.system_tokens > 0,
+        "non-empty system prompt -> non-zero tokens"
+    );
+    assert_eq!(b.tool_specs, 2);
+    assert_eq!(b.message_count, 2);
+    assert!(
+        b.tool_tokens > 0,
+        "non-empty tool schemas -> non-zero tokens"
+    );
+    assert!(
+        b.message_tokens > 0,
+        "non-empty messages -> non-zero tokens"
+    );
+
+    // Key invariant: message_tokens must equal what the estimator computes for
+    // the same messages (so the popover bar sums to token_count).
+    let estimator = ProxyTokenEstimator {
+        budget_tokens: 100_000,
+    };
+    let pressure = estimator.assess(&messages, "any");
+    assert_eq!(
+        b.message_tokens, pressure.estimated_tokens as u32,
+        "breakdown.message_tokens must equal estimator.assess() for same messages"
+    );
+}
+
+#[test]
+fn context_breakdown_handles_absent_system_prompt() {
+    let b = context_breakdown(None, &[], &[]);
+    assert_eq!(b.system_tokens, 0);
+    assert_eq!(b.tool_tokens, 0);
+    assert_eq!(b.tool_specs, 0);
+    assert_eq!(b.message_tokens, 0);
+    assert_eq!(b.message_count, 0);
 }

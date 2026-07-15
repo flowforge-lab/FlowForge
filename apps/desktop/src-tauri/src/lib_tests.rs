@@ -572,7 +572,7 @@ fn turn_metrics_counts_round_trips_flushes_and_iterations() {
     // Two iterations (two distinct message ids); repeats are idempotent.
     m.note_turn("m1");
     m.note_turn("m1");
-    m.chars += 5;
+    m.tokens += 5;
     m.note_flush();
     m.note_turn("m2");
     m.note_turn("m2");
@@ -907,6 +907,8 @@ async fn emit_agent_event_maps_done_to_turn_done_event() {
         tier2_fires: None,
         cache_hit_tokens: Some(10),
         cache_miss_tokens: Some(32),
+        breakdown: None,
+        usage: None,
     };
     emit_agent_event(app.handle(), "session-1", done_event);
 

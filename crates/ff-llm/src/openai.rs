@@ -119,6 +119,9 @@ struct StreamChunk {
 struct StreamUsage {
     #[serde(default)]
     prompt_tokens: u32,
+    /// Completion (output) token count for the round-trip (#931).
+    #[serde(default)]
+    completion_tokens: u32,
     /// Legacy SiliconFlow field for cache hit tokens.
     #[serde(default)]
     prompt_cache_hit_tokens: Option<u32>,
@@ -235,6 +238,12 @@ fn parse_sse_line(line: &[u8]) -> Option<Result<Chunk, LlmError>> {
                 })
                 .unwrap_or((0, 0));
 
+            let (input_tokens, output_tokens) = parsed
+                .usage
+                .as_ref()
+                .map(|u| (u.prompt_tokens, u.completion_tokens))
+                .unwrap_or((0, 0));
+
             let chunk = match parsed.choices.into_iter().next() {
                 Some(c) => Chunk {
                     delta: c.delta.content.unwrap_or_default(),
@@ -258,10 +267,14 @@ fn parse_sse_line(line: &[u8]) -> Option<Result<Chunk, LlmError>> {
                     truncated: c.finish_reason.as_deref() == Some("length"),
                     cache_hit_tokens: cache_hit,
                     cache_miss_tokens: cache_miss,
+                    input_tokens,
+                    output_tokens,
                 },
                 None => Chunk {
                     cache_hit_tokens: cache_hit,
                     cache_miss_tokens: cache_miss,
+                    input_tokens,
+                    output_tokens,
                     ..Chunk::default()
                 },
             };

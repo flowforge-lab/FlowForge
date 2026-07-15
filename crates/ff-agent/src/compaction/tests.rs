@@ -25,27 +25,40 @@ fn msg(role: Role, content: &str) -> Message {
 }
 
 #[test]
-fn proxy_estimator_counts_chars_over_four() {
+fn proxy_estimator_counts_tokens() {
     let est = ProxyTokenEstimator { budget_tokens: 100 };
-    // 40 chars of content -> 10 proxy tokens.
+    // "x" repeated 40 times: tokenx-rs estimates ~7 tokens (a single long
+    // alphanumeric word scored by ceil(len / chars_per_token)).
     let history = vec![msg(Role::User, &"x".repeat(40))];
     let p = est.assess(&history, "any-model");
-    assert_eq!(p.estimated_tokens, 10);
+    assert!(
+        p.estimated_tokens > 0,
+        "non-empty content must produce tokens"
+    );
     assert_eq!(p.budget_tokens, 100);
-    assert!((p.fraction() - 0.1).abs() < 1e-9);
+    let frac = p.estimated_tokens as f64 / 100.0;
+    assert!(frac > 0.0 && frac < 0.75, "well under the flush threshold");
     assert!(!p.is_over(0.75));
 }
 
 #[test]
-fn proxy_estimator_counts_reasoning_bytes() {
+fn proxy_estimator_counts_reasoning() {
     // Persisted reasoning is replayed on the wire (#378), so it must count
     // toward context pressure alongside content.
     let est = ProxyTokenEstimator { budget_tokens: 100 };
-    let mut m = msg(Role::Assistant, &"x".repeat(40));
-    m.reasoning = Some("y".repeat(40));
-    // 40 content + 40 reasoning = 80 chars -> 20 proxy tokens.
-    let p = est.assess(&[m], "any-model");
-    assert_eq!(p.estimated_tokens, 20);
+    let content_only = msg(Role::Assistant, &"x".repeat(40));
+    let p_content = est.assess(&[content_only], "any-model");
+
+    let mut with_reasoning = msg(Role::Assistant, &"x".repeat(40));
+    with_reasoning.reasoning = Some("y".repeat(40));
+    let p_both = est.assess(&[with_reasoning], "any-model");
+
+    assert!(
+        p_both.estimated_tokens > p_content.estimated_tokens,
+        "reasoning must add to the estimate: content={} both={}",
+        p_content.estimated_tokens,
+        p_both.estimated_tokens
+    );
 }
 
 #[test]

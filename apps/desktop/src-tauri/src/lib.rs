@@ -17,10 +17,11 @@ use ff_agent::{
 use ff_core::events::{
     ApprovalSafety, ConnectionFailedEvent, EvolveCostEstimate, IntentionSignal,
     McpStatusChangedEvent, MemoryFlushedEvent, OutputStreamKind, PhenotypeMcpUnavailableEvent,
-    ReasoningEvent, ReconnectingEvent, SessionTitleUpdatedEvent, SkillActivated, SkillCompleted,
-    SkillEvolveApprovalRequestEvent, SkillInstallApprovalRequestEvent, SkillsChangedEvent,
-    TokenEvent, ToolApprovalRequestEvent, ToolAskRequestEvent, ToolCallEvent, ToolOutputChunkEvent,
-    ToolResultEvent, TurnDoneEvent, TurnErrorEvent, TurnStatsEvent, UpdateProgressEvent,
+    ProcessExitedEvent, ProcessOutputEvent, ReasoningEvent, ReconnectingEvent,
+    SessionTitleUpdatedEvent, SkillActivated, SkillCompleted, SkillEvolveApprovalRequestEvent,
+    SkillInstallApprovalRequestEvent, SkillsChangedEvent, TokenEvent, ToolApprovalRequestEvent,
+    ToolAskRequestEvent, ToolCallEvent, ToolOutputChunkEvent, ToolResultEvent, TurnDoneEvent,
+    TurnErrorEvent, TurnStatsEvent, UpdateProgressEvent,
 };
 use ff_core::{
     Attachment, BedrockAuth, CreateScheduledTaskInput, Format, Goal, GoalStatus, McpServerConfig,
@@ -93,11 +94,11 @@ pub(crate) fn boot_trace_step(label: &str, dur: Duration) {
 
 /// Per-turn telemetry accumulator (RFC 0001 §8), filled by the agent-event closure
 /// and folded into per-skill aggregates when the turn ends. `message_ids` counts
-/// distinct assistant messages — one per agent loop iteration, i.e. the turn count;
-/// `chars` is the total streamed assistant text used as a coarse token-cost proxy.
+/// distinct assistant messages -- one per agent loop iteration, i.e. the turn count;
+/// `tokens` is the estimated assistant output tokens (via tokenx-rs, ~96% accurate).
 #[derive(Default)]
 struct TurnMetrics {
-    chars: usize,
+    tokens: usize,
     message_ids: std::collections::HashSet<String>,
     /// First-seen instant of each distinct assistant message, in arrival order.
     /// One per agent loop iteration (provider round-trip); consecutive deltas
@@ -131,9 +132,9 @@ impl TurnMetrics {
         self.tier2_fires = tier2_fires;
     }
 
-    /// `(streamed assistant chars, distinct turn count)`.
+    /// `(estimated assistant output tokens, distinct turn count)`.
     fn snapshot(&self) -> (usize, usize) {
-        (self.chars, self.message_ids.len())
+        (self.tokens, self.message_ids.len())
     }
 
     /// Per-turn timing breakdown for the #427 baseline: `(round_trips, per-iteration
@@ -1268,6 +1269,76 @@ pub(crate) async fn wake_session_for_observer(
     spawn_assistant_turn(state.clone(), app.clone(), session_id);
 }
 
+/// Bridge one background process's live output to the frontend (#873). Spawned
+/// by `start_process_output_pump` on each `process_manager start`, this task
+/// forwards every [`ProcessChunk`] the process emits as a `process:output`
+/// event — independently of any assistant turn, for the life of the process —
+/// then emits a terminal `process:exited` when the output broadcast closes
+/// (the exit-watcher drops the sender on exit/kill). `chunks` was subscribed
+/// inside `ProcessSupervisor::start` before the drain tasks spawned, so no
+/// output is missed.
+pub(crate) fn spawn_process_output_bridge(
+    app: tauri::AppHandle,
+    supervisor: Arc<ff_tools::process::ProcessSupervisor>,
+    id: u64,
+    session_id: String,
+    mut chunks: tokio::sync::broadcast::Receiver<ff_tools::process::ProcessChunk>,
+) {
+    use tokio::sync::broadcast::error::RecvError;
+    tokio::spawn(async move {
+        let process_id = id as u32;
+        loop {
+            match chunks.recv().await {
+                Ok(chunk) => {
+                    let stream = match chunk.stream {
+                        ff_tools::OutputStream::Stderr => OutputStreamKind::Stderr,
+                        ff_tools::OutputStream::Stdout => OutputStreamKind::Stdout,
+                    };
+                    let _ = app.emit(
+                        "process:output",
+                        ProcessOutputEvent {
+                            session_id: session_id.clone(),
+                            process_id,
+                            stream,
+                            delta: String::from_utf8_lossy(&chunk.bytes).into_owned(),
+                        },
+                    );
+                }
+                // The UI fell behind and the bounded broadcast dropped `n`
+                // chunks. Surface the gap as a stderr notice rather than
+                // silently losing output, and keep forwarding.
+                Err(RecvError::Lagged(n)) => {
+                    let _ = app.emit(
+                        "process:output",
+                        ProcessOutputEvent {
+                            session_id: session_id.clone(),
+                            process_id,
+                            stream: OutputStreamKind::Stderr,
+                            delta: format!(
+                                "\n[... {n} output chunk(s) dropped (UI fell behind) ...]\n"
+                            ),
+                        },
+                    );
+                }
+                Err(RecvError::Closed) => break,
+            }
+        }
+        // Process ended: the map entry lives until the reaper, so the status
+        // label is still readable here.
+        let status = supervisor
+            .status_label(id, &session_id)
+            .unwrap_or_else(|| "exited".to_string());
+        let _ = app.emit(
+            "process:exited",
+            ProcessExitedEvent {
+                session_id,
+                process_id,
+                status,
+            },
+        );
+    });
+}
+
 /// Set up and spawn the assistant turn for `session_id`: snapshots the provider,
 /// resolves the session's phenotype/mode, builds the tool registry + system
 /// prompt, runs the turn (streaming over `turn:*` / `tool:*`), and folds the
@@ -1439,7 +1510,7 @@ fn spawn_assistant_turn(state: Arc<AppState>, app: tauri::AppHandle, session_id:
                     match &event {
                         AgentEvent::Token { message_id, delta } => {
                             m.note_turn(message_id);
-                            m.chars += delta.chars().count();
+                            m.tokens += ff_llm::count_tokens(delta);
                         }
                         AgentEvent::Reasoning { message_id, .. }
                         | AgentEvent::ToolCallStarted { message_id, .. } => {
@@ -1489,7 +1560,7 @@ fn spawn_assistant_turn(state: Arc<AppState>, app: tauri::AppHandle, session_id:
         // (run_turn returned Ok and the turn was not cancelled).
         let turn_end = std::time::Instant::now();
         let (
-            chars,
+            output_tokens,
             turn_count,
             round_trips,
             iter_ms,
@@ -1519,7 +1590,7 @@ fn spawn_assistant_turn(state: Arc<AppState>, app: tauri::AppHandle, session_id:
         let success = result.is_ok() && !cancel_probe.is_cancelled();
         let latency_ms = u32::try_from(turn_end.saturating_duration_since(turn_start).as_millis())
             .unwrap_or(u32::MAX);
-        let tokens = u32::try_from(chars / 4).unwrap_or(u32::MAX);
+        let tokens = u32::try_from(output_tokens).unwrap_or(u32::MAX);
         let turns = u32::try_from(turn_count).unwrap_or(u32::MAX);
 
         // F1 (#427): emit the per-turn timing baseline the performance epic (#426)
@@ -1531,7 +1602,7 @@ fn spawn_assistant_turn(state: Arc<AppState>, app: tauri::AppHandle, session_id:
             total_ms: latency_ms,
             iter_ms,
             flushes,
-            chars: u32::try_from(chars).unwrap_or(u32::MAX),
+            chars: u32::try_from(output_tokens).unwrap_or(u32::MAX),
             // F1b fields are Option on the wire (#475 follow-up); the desktop
             // always populates them.
             prefill_estimates: Some(prefill_estimates),
@@ -3168,6 +3239,8 @@ fn emit_agent_event<R: tauri::Runtime>(
             message_id,
             token_count,
             stop_reason,
+            breakdown,
+            usage,
             ..
         } => {
             let _ = app.emit(
@@ -3177,6 +3250,8 @@ fn emit_agent_event<R: tauri::Runtime>(
                     message_id,
                     token_count,
                     stop_reason,
+                    breakdown,
+                    usage,
                 },
             );
         }
@@ -3551,6 +3626,11 @@ pub fn run() {
                     // next turn. Enters the runtime itself, like
                     // `start_process_reaper` — safe here.
                     state.start_observer_pump(&app_handle);
+                    // Drive the process-output pump (#873): a single long-lived
+                    // task bridges each background process's live stdout/stderr
+                    // to the frontend as `process:output` events across turns.
+                    // Enters the runtime itself, like the pumps above.
+                    state.start_process_output_pump(&app_handle);
                     // Drive the scheduled-task firing engine (RFC 0017 section 4, #542):
                     // a background sweep fires due tasks through the desktop runner. The
                     // tick is coarse; the due predicate is minute-granular, so a 30s sweep
