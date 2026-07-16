@@ -86,9 +86,13 @@ fn normalize_text(text: &str) -> String {
 ///
 /// TODO(M6.3): Add an LLM-driven Salience impl that uses semantic similarity
 /// and importance scoring beyond mechanical heuristics.
-pub trait Salience: Send + Sync {
-    /// Score a chunk in `[0.0, 1.0]`. Higher = more salient = keep/promote.
-    fn score(&self, chunk: &MemoryChunk, occurrences: u32) -> f32;
+///
+/// Generic over the scored item `T` (RFC 0022 Step 2a): memory scores
+/// `MemoryChunk` for consolidation, while `ff-agent` scores `Message` for
+/// value-aware compaction band selection — one decay model, two call sites.
+pub trait Salience<T>: Send + Sync {
+    /// Score an item in `[0.0, 1.0]`. Higher = more salient = keep/promote.
+    fn score(&self, item: &T, occurrences: u32) -> f32;
 }
 
 /// Mechanical recency × frequency ranking (the P1 default).
@@ -115,7 +119,7 @@ impl Default for RecencyFrequencySalience {
     }
 }
 
-impl Salience for RecencyFrequencySalience {
+impl Salience<MemoryChunk> for RecencyFrequencySalience {
     fn score(&self, chunk: &MemoryChunk, occurrences: u32) -> f32 {
         let recency = match &chunk.source {
             MemorySource::Curated => 1.0_f32, // already promoted
@@ -326,7 +330,7 @@ impl crate::Memory {
     ///
     /// Does **not** reindex: the caller owns the index (and the blocking embed
     /// call it may make). See `MemoryConsolidateTool`.
-    pub fn consolidate(&self, salience: &dyn Salience) -> Result<ConsolidationReport> {
+    pub fn consolidate(&self, salience: &dyn Salience<MemoryChunk>) -> Result<ConsolidationReport> {
         let bytes_before = std::fs::metadata(self.curated_path())
             .map(|m| m.len())
             .unwrap_or(0) as usize;
