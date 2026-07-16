@@ -39,6 +39,28 @@ function pctOf(tokens: number, budget: number): string {
   return `${((tokens / budget) * 100).toFixed(1)}%`;
 }
 
+// Latency for the TTFT / prefill-share rows (#960): one-decimal seconds at ≥1s
+// (`6.0s`, `2.2s`), else raw milliseconds. Distinct from `formatDuration` in
+// steps.ts, which rounds to whole seconds.
+function formatLatencyMs(ms: number): string {
+  return ms >= 1000 ? `${(ms / 1000).toFixed(1)}s` : `${ms}ms`;
+}
+
+// Prefill-share breakdown: `prompt 6.0s (73%) · other 2.2s` (#960). `null` when
+// either latency is missing or TTFT is zero (guard divide-by-zero).
+function formatPrefillShare(
+  ttftMs: number,
+  promptLatencyMs: number,
+): string | null {
+  if (ttftMs <= 0) return null;
+  const share = Math.min(
+    100,
+    Math.max(0, Math.round((promptLatencyMs / ttftMs) * 100)),
+  );
+  const otherMs = Math.max(0, ttftMs - promptLatencyMs);
+  return `prompt ${formatLatencyMs(promptLatencyMs)} (${share}%) · other ${formatLatencyMs(otherMs)}`;
+}
+
 // One component row: label · optional count · token figure · %-of-budget.
 function ComponentRow({
   swatch,
@@ -74,10 +96,17 @@ export function ContextGauge({ sessionId }: { sessionId: string }) {
   const breakdown = useChatStore((s) => s.contextBreakdownBySession[sessionId]);
   const totals = useChatStore((s) => s.sessionTotalsBySession[sessionId]);
   const ttft = useChatStore((s) => s.ttftBySession[sessionId]);
+  const promptLatency = useChatStore(
+    (s) => s.promptLatencyBySession[sessionId],
+  );
   const model = useSessionModelStore(
     (s) => s.resolvedBySession[sessionId]?.model,
   );
   const { copied, copy } = useCopied();
+  const prefillShare =
+    ttft != null && promptLatency != null
+      ? formatPrefillShare(ttft, promptLatency)
+      : null;
 
   // Total context size from the component breakdown (provider-agnostic, correct
   // for all providers including Bedrock where inputTokens excludes cached tokens).
@@ -111,6 +140,7 @@ export function ContextGauge({ sessionId }: { sessionId: string }) {
       budget,
       pctUsed: pct,
       ttft,
+      promptLatencyMs: promptLatency,
       breakdown,
       sessionTotals: totals,
     };
@@ -228,11 +258,18 @@ export function ContextGauge({ sessionId }: { sessionId: string }) {
               </div>
             ) : null}
             {ttft != null ? (
-              <div className="flex items-center gap-2">
-                <span className="text-muted-foreground">TTFT</span>
-                <span className="ml-auto tabular-nums">
-                  {ttft >= 1000 ? `${(ttft / 1000).toFixed(1)}s` : `${ttft}ms`}
-                </span>
+              <div className="space-y-0.5">
+                <div className="flex items-center gap-2">
+                  <span className="text-muted-foreground">TTFT</span>
+                  <span className="ml-auto tabular-nums">
+                    {formatLatencyMs(ttft)}
+                  </span>
+                </div>
+                {prefillShare ? (
+                  <div className="text-right tabular-nums text-muted-foreground/70">
+                    {prefillShare}
+                  </div>
+                ) : null}
               </div>
             ) : null}
           </div>

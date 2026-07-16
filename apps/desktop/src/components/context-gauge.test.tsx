@@ -26,6 +26,8 @@ function seed(tokens: number | null | undefined, budget?: number | null) {
     contextInputTokensBySession: {},
     contextBreakdownBySession: {},
     sessionTotalsBySession: {},
+    ttftBySession: {},
+    promptLatencyBySession: {},
   });
   useSessionModelStore.setState({ resolvedBySession: {} });
 }
@@ -35,6 +37,8 @@ function seedPopover(opts: {
   breakdown?: ContextBreakdown;
   totals?: TurnUsage;
   model?: string;
+  ttft?: number;
+  promptLatencyMs?: number;
 }) {
   const inputs: Record<string, number> =
     opts.inputTokens == null ? {} : { [SID]: opts.inputTokens };
@@ -48,6 +52,9 @@ function seedPopover(opts: {
     contextInputTokensBySession: inputs,
     contextBreakdownBySession: breakdowns,
     sessionTotalsBySession: totals,
+    ttftBySession: opts.ttft == null ? {} : { [SID]: opts.ttft },
+    promptLatencyBySession:
+      opts.promptLatencyMs == null ? {} : { [SID]: opts.promptLatencyMs },
   });
   if (opts.model) {
     const resolved: ResolvedModel = {
@@ -215,6 +222,8 @@ describe("ContextGauge — popover (#931)", () => {
       breakdown: BREAKDOWN,
       totals: TOTALS,
       model: "claude-opus-4-8",
+      ttft: 8_200,
+      promptLatencyMs: 6_000,
     });
     render(<ContextGauge sessionId={SID} />);
 
@@ -234,6 +243,8 @@ describe("ContextGauge — popover (#931)", () => {
       used: 172_900,
       budget: 150_000,
       pctUsed: 115,
+      ttft: 8_200,
+      promptLatencyMs: 6_000,
       breakdown: BREAKDOWN,
       sessionTotals: TOTALS,
     });
@@ -283,5 +294,36 @@ describe("ContextGauge — popover (#931)", () => {
     expect(text).toContain("before compaction");
     expect(text).not.toContain("System prompt");
     expect(text).not.toContain("Session totals");
+  });
+
+  it("shows the prefill-share breakdown under TTFT when both latencies are present (#960)", () => {
+    seed(173_000, 150_000);
+    seedPopover({
+      breakdown: BREAKDOWN,
+      ttft: 8_200,
+      promptLatencyMs: 6_000,
+    });
+    render(<ContextGauge sessionId={SID} />);
+    fireEvent.click(screen.getByRole("button", { name: /context usage/i }));
+    const text =
+      document.querySelector('[data-slot="popover-content"]')?.textContent ??
+      "";
+    expect(text).toContain("TTFT");
+    expect(text).toContain("8.2s");
+    expect(text).toContain("prompt 6.0s (73%) · other 2.2s");
+  });
+
+  it("shows plain TTFT without a prefill-share line when promptLatencyMs is absent (#960)", () => {
+    seed(173_000, 150_000);
+    seedPopover({ breakdown: BREAKDOWN, ttft: 6_006 });
+    render(<ContextGauge sessionId={SID} />);
+    fireEvent.click(screen.getByRole("button", { name: /context usage/i }));
+    const text =
+      document.querySelector('[data-slot="popover-content"]')?.textContent ??
+      "";
+    expect(text).toContain("TTFT");
+    expect(text).toContain("6.0s");
+    expect(text).not.toContain("prompt ");
+    expect(text).not.toContain("other ");
   });
 });
