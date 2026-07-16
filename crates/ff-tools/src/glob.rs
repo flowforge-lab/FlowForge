@@ -78,11 +78,16 @@ impl Tool for GlobTool {
                 continue;
             }
             let path = entry.path();
+            // Render workspace-relative paths with forward slashes regardless of
+            // host OS — on Windows `to_string_lossy()` emits `\`, which breaks
+            // the glob matcher (compiled against `/`) and the model's path
+            // expectations. `MAIN_SEPARATOR` is `/` on Unix and `\` on Windows,
+            // so this is a no-op there.
             let display = path
                 .strip_prefix(&root_canon)
                 .unwrap_or(path)
                 .to_string_lossy()
-                .into_owned();
+                .replace(std::path::MAIN_SEPARATOR, "/");
             if matcher.is_match(&display) {
                 if paths.len() >= MAX_PATHS {
                     truncated = true;

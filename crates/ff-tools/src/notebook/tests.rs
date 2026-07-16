@@ -485,6 +485,91 @@ async fn run_cell_handles_non_ascii_source() {
 }
 
 #[tokio::test]
+async fn run_cell_handles_large_burst_without_truncation() {
+    if !python3_available() {
+        eprintln!("skipping: python3 not on PATH");
+        return;
+    }
+    // Regression for the partial-write bug: `_w` used to discard the return
+    // value of `os.write()`, so once a single burst exceeded the host's pipe
+    // capacity (PIPE_BUF ≈ 64 KiB on Linux, 4 KiB on macOS, plus the kernel's
+    // own pipe sizing) the tail was silently dropped — corrupting the cell
+    // output the model would later see. We emit a payload larger than the
+    // visible cap (16 KiB) carrying a unique marker at the very end; after
+    // truncation the visible tail must still contain the marker, proving
+    // every byte round-tripped through the pipe.
+    let dir = tempfile::tempdir().unwrap();
+    let sup = KernelSupervisor::new();
+    sup.start("burst", dir.path()).await.unwrap();
+
+    let r = sup
+        .run_cell(
+            "burst",
+            None,
+            r#"import sys
+payload = "x" * 100_000 + "TAIL_MARKER_ABCDEF"
+sys.stdout.write(payload + "\n")"#,
+            30,
+        )
+        .await
+        .expect("burst cell should run before timeout");
+    assert!(!r.errored, "burst cell should not error: {r:?}");
+    assert!(
+        r.truncated,
+        "burst should exceed MAX_CELL_OUTPUT and be truncated: len={}",
+        r.output.len()
+    );
+    assert!(
+        r.output.contains("TAIL_MARKER_ABCDEF"),
+        "tail marker must survive partial writes; got len={}",
+        r.output.len()
+    );
+
+    sup.stop("burst", None).await.unwrap();
+}
+
+#[tokio::test]
+async fn stdout_exposes_fileno_for_libraries_that_grab_it() {
+    if !python3_available() {
+        eprintln!("skipping: python3 not on PATH");
+        return;
+    }
+    // Regression: the driver's `_Std` proxy deliberately replaces
+    // `sys.stdout`, so without an explicit `fileno()` libraries that reach
+    // for the underlying fd (tqdm, rich, click, pytest capture) crash with
+    // AttributeError instead of falling back. Asserting fd 1 also pins the
+    // contract — `fileno()` MUST return the real stdout, not a fake.
+    let dir = tempfile::tempdir().unwrap();
+    let sup = KernelSupervisor::new();
+    sup.start("fileno", dir.path()).await.unwrap();
+
+    let r = sup
+        .run_cell(
+            "fileno",
+            None,
+            r#"import sys
+fd = sys.stdout.fileno()
+# Touch it through os.fstat to prove it's a real, valid fd (not a stub that
+# returns an int) — same call pattern tqdm/rich use when they decide
+# whether to bypass their own buffer.
+import os
+os.fstat(fd)
+print("FILENO_OK", fd)"#,
+            10,
+        )
+        .await
+        .expect("fileno cell should run before timeout");
+    assert!(!r.errored, "fileno cell should not error: {r:?}");
+    assert!(
+        r.output.contains("FILENO_OK 1"),
+        "stdout.fileno() must return 1 (real stdout fd); got: {:?}",
+        r.output
+    );
+
+    sup.stop("fileno", None).await.unwrap();
+}
+
+#[tokio::test]
 #[ignore = "timing-sensitive; run locally with a python3 present"]
 async fn run_cell_times_out_and_interrupts() {
     if !python3_available() {

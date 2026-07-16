@@ -99,11 +99,16 @@ impl Tool for TreeTool {
             }
 
             let path = entry.path();
+            // Render workspace-relative paths with forward slashes regardless of
+            // host OS — on Windows `to_string_lossy()` emits `\`, which breaks
+            // both the test assertions and the model's path expectations.
+            // `MAIN_SEPARATOR` is `/` on Unix and `\` on Windows, so this is a
+            // no-op there.
             let display = path
                 .strip_prefix(&root_canon)
                 .unwrap_or(path)
                 .to_string_lossy()
-                .into_owned();
+                .replace(std::path::MAIN_SEPARATOR, "/");
             let suffix = if is_dir { "/" } else { "" };
             let indent = "  ".repeat(entry.depth().saturating_sub(1));
             entries.push(format!("{indent}{display}{suffix}"));
