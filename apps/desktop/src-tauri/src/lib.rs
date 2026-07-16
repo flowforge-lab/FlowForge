@@ -117,6 +117,12 @@ struct TurnMetrics {
     /// anchored at `turn_start` and so also absorbs any pre-first-token memory
     /// flush / planning reasoning.
     prompt_latency_ms: Option<u32>,
+    /// #971: pre-main-call memory-flush wall-clock (ms) carried on `Done`. Part of
+    /// the "other" the host's `first_token_ms` absorbs; surfaced so an over-budget
+    /// spike can be attributed to the flush vs the Tier-2 summarizer.
+    flush_ms: Option<u32>,
+    /// #971: pre-main-call Tier-2 abstractive-summarize wall-clock (ms) carried on `Done`.
+    tier2_ms: Option<u32>,
 }
 
 impl TurnMetrics {
@@ -136,11 +142,15 @@ impl TurnMetrics {
         &mut self,
         prefill_estimates: &[u32],
         prompt_latency_ms: Option<u32>,
+        flush_ms: Option<u32>,
+        tier2_ms: Option<u32>,
         tier1_fires: u32,
         tier2_fires: u32,
     ) {
         self.prefill_estimates = prefill_estimates.to_vec();
         self.prompt_latency_ms = prompt_latency_ms;
+        self.flush_ms = flush_ms;
+        self.tier2_ms = tier2_ms;
         self.tier1_fires = tier1_fires;
         self.tier2_fires = tier2_fires;
     }
@@ -1648,6 +1658,8 @@ fn spawn_assistant_turn(state: Arc<AppState>, app: tauri::AppHandle, session_id:
                             message_id,
                             prefill_estimates,
                             prompt_latency_ms,
+                            flush_ms,
+                            tier2_ms,
                             tier1_fires,
                             tier2_fires,
                             ..
@@ -1656,6 +1668,8 @@ fn spawn_assistant_turn(state: Arc<AppState>, app: tauri::AppHandle, session_id:
                             m.note_done(
                                 prefill_estimates.as_deref().unwrap_or(&[]),
                                 *prompt_latency_ms,
+                                *flush_ms,
+                                *tier2_ms,
                                 tier1_fires.unwrap_or(0),
                                 tier2_fires.unwrap_or(0),
                             );
@@ -1700,6 +1714,8 @@ fn spawn_assistant_turn(state: Arc<AppState>, app: tauri::AppHandle, session_id:
             tier2_fires,
             first_token_ms,
             prompt_latency_ms,
+            flush_ms,
+            tier2_ms,
         ) = metrics
             .lock()
             .map(|m| {
@@ -1716,6 +1732,8 @@ fn spawn_assistant_turn(state: Arc<AppState>, app: tauri::AppHandle, session_id:
                     m.tier2_fires,
                     ttft,
                     m.prompt_latency_ms,
+                    m.flush_ms,
+                    m.tier2_ms,
                 )
             })
             .unwrap_or_default();
@@ -1749,6 +1767,9 @@ fn spawn_assistant_turn(state: Arc<AppState>, app: tauri::AppHandle, session_id:
             // firstTokenMs` is the prefill share -- how much of the wait was
             // prefill (cache-addressable) vs pre-first-token flush/reasoning.
             prompt_latency_ms,
+            // #971: per-phase compaction wall-clock split out of `first_token_ms`.
+            flush_ms,
+            tier2_ms,
         };
         tracing::info!(
             target: "turn_metrics",

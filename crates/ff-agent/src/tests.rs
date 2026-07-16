@@ -635,6 +635,8 @@ async fn cross_turn_cache_seeds_summary_and_invalidate_forces_resummary() {
     cache.invalidate(&s.id);
     let before = summarizer_calls.load(Ordering::SeqCst);
 
+    // #971: capture the Done event to assert the re-summarize is timed as tier2_ms.
+    let tier2_ms_seen = std::sync::Mutex::new(None);
     run_turn(
         &provider,
         &store,
@@ -645,7 +647,11 @@ async fn cross_turn_cache_seeds_summary_and_invalidate_forces_resummary() {
         false,
         ReasoningVisibility::All,
         CancelToken::new(),
-        |_| {},
+        |ev| {
+            if let AgentEvent::Done { tier2_ms, .. } = ev {
+                *tier2_ms_seen.lock().unwrap() = Some(tier2_ms);
+            }
+        },
     )
     .await
     .unwrap();
@@ -657,6 +663,11 @@ async fn cross_turn_cache_seeds_summary_and_invalidate_forces_resummary() {
     assert!(
         cache.get(&s.id).is_some(),
         "the fresh summary is written through to the cache"
+    );
+    // #971: a turn that actually re-summarized must report tier2_ms.
+    assert!(
+        matches!(*tier2_ms_seen.lock().unwrap(), Some(Some(_))),
+        "a re-summarize turn must populate tier2_ms"
     );
 
     // Mirror case: a `ToolContext` with no `compaction_cache` always
