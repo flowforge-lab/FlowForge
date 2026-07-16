@@ -273,6 +273,13 @@ pub fn build_system_prompt(
          \"understand the area\". A review verifies the change, not the codebase.\n\n",
     );
 
+    // Stable guidance (cache-stable prefix): observer patterns (#954 sub-1).
+    // Teaches the agent when to self-start background observers so it stops
+    // polling manually or missing reactive opportunities.
+    out.push_str(
+        "## Observers — reactive background monitoring\n          The `observer` tool starts background watchers that wake you when external           state changes — so you can fire-and-forget a long operation, then resume           when it matters. Use an observer when:\n          - You start a long-running build, test suite, or deploy: attach a `process`           observer with a regex filter for completion/error signals (e.g.           `\"BUILD (SUCCEEDED|FAILED)\"`, `\"error\\[\"`,           `\"Tests:.*failed\"`).\n          - You start a dev server: attach an `http` observer on the localhost health           endpoint (e.g. `http://localhost:3000/health`) to know when it's ready.\n          - The user says \"watch\", \"monitor\", \"let me know when\", or           \"notify me\": start a `file` or `http` observer on the relevant target.\n          - You run a watch-mode test runner: attach a `file` observer on the test           output path to wake when results change.\n          Do not poll manually in a loop — observers are cheaper, non-blocking, and           relinquish your turn so the user can interact while waiting.\n\n",
+    );
+
     // --- Cache boundary: everything above is stable; below is volatile ---
     let stable = out;
 
