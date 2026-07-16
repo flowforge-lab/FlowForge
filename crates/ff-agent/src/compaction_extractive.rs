@@ -511,6 +511,167 @@ impl ExtractiveCompactor {
     }
 }
 
+/// Depth-graded tier-1 compaction (#933 / RFC 0022 Step 1): older messages are
+/// compressed harder, newer ones gently, instead of one uniform strength across
+/// the whole cold prefix.
+///
+/// **Band membership is a pure function of a message's absolute index**, not its
+/// distance from the moving keep-recent frontier. This is the invariant that keeps
+/// the A.2 frozen-boundary optimization intact: because `compactor_for(index)`
+/// depends only on the index, a full compaction pass and an incremental
+/// (freeze-the-prefix, compact-only-the-new-slice) pass select the *same* compactor
+/// for the same message, so both produce byte-identical output and the cached
+/// prefix never drifts. Grading by distance-from-frontier would make the two paths
+/// disagree and bust the cache every turn.
+///
+/// The **last (highest-index) band equals the plain [`ExtractiveCompactor::default`]**,
+/// so newest-cold messages compress exactly as they do today — the change is a
+/// strict non-regression, only deepening compression for older messages.
+#[derive(Debug, Clone)]
+pub struct GradedBands {
+    /// `(start_index, compactor)` sorted ascending by `start_index`. A message at
+    /// index `i` uses the compactor of the band with the greatest `start_index <= i`.
+    /// The first band must start at 0 so every index is covered.
+    bands: Vec<(usize, ExtractiveCompactor)>,
+}
+
+impl Default for GradedBands {
+    /// A single band == today's behavior. This is the equivalence anchor: with the
+    /// default, `compact_graded_collect` is byte-identical to `compact_cold_collect`,
+    /// so grading is strictly opt-in.
+    fn default() -> Self {
+        Self {
+            bands: vec![(0, ExtractiveCompactor::default())],
+        }
+    }
+}
+
+impl GradedBands {
+    /// Build from explicit `(start_index, compactor)` bands. Normalizes by sorting
+    /// on `start_index` and ensuring the first band starts at 0 (a missing zero-band
+    /// is filled with [`ExtractiveCompactor::default`]).
+    #[must_use]
+    pub fn new(mut bands: Vec<(usize, ExtractiveCompactor)>) -> Self {
+        bands.sort_by_key(|(start, _)| *start);
+        if bands.first().is_none_or(|(start, _)| *start != 0) {
+            bands.insert(0, (0, ExtractiveCompactor::default()));
+        }
+        Self { bands }
+    }
+
+    /// The default v1 grading preset: three bands from aggressive (oldest) to
+    /// today's strength (newest-cold). The last band is exactly
+    /// [`ExtractiveCompactor::default`] so recent-cold messages are unchanged.
+    #[must_use]
+    pub fn graded_v1() -> Self {
+        Self::new(vec![
+            // Oldest messages: fold hard.
+            (
+                0,
+                ExtractiveCompactor {
+                    max_value_chars: 96,
+                    max_array_items: 3,
+                    keep_head_lines: 2,
+                    keep_tail_lines: 2,
+                    min_lines_to_elide: 8,
+                    min_tokens_to_compact: 64,
+                },
+            ),
+            // Mid-history: between aggressive and default.
+            (
+                40,
+                ExtractiveCompactor {
+                    max_value_chars: 160,
+                    max_array_items: 5,
+                    keep_head_lines: 3,
+                    keep_tail_lines: 3,
+                    min_lines_to_elide: 10,
+                    min_tokens_to_compact: 64,
+                },
+            ),
+            // Newest-cold: today's strength (non-regression anchor).
+            (100, ExtractiveCompactor::default()),
+        ])
+    }
+
+    /// The compactor governing a message at absolute `index`.
+    #[must_use]
+    pub fn compactor_for(&self, index: usize) -> &ExtractiveCompactor {
+        // `bands` is non-empty and starts at 0 (see `new`/`default`), so the search
+        // always finds a band.
+        let mut chosen = &self.bands[0].1;
+        for (start, compactor) in &self.bands {
+            if *start <= index {
+                chosen = compactor;
+            } else {
+                break;
+            }
+        }
+        chosen
+    }
+
+    /// Graded counterpart of [`ExtractiveCompactor::compact_cold_collect`]: compact
+    /// the cold prefix `messages[..len-keep_recent]`, choosing each message's
+    /// compression strength by its absolute index. Recent tail, assistant messages,
+    /// and already-compacted content are passed through unchanged.
+    #[must_use]
+    pub fn compact_graded_collect(
+        &self,
+        messages: &[Message],
+        keep_recent: usize,
+    ) -> ColdCompaction {
+        self.compact_graded_range(messages, 0, messages.len().saturating_sub(keep_recent))
+    }
+
+    /// Graded counterpart of [`ExtractiveCompactor::compact_range_collect`]: compact
+    /// `messages` treated as occupying absolute indices `base_index..`, used by the
+    /// frozen-boundary path to grade only the newly-cold slice while the cached
+    /// prefix stays frozen. `cold_end` is the absolute index (exclusive) past which
+    /// messages are kept verbatim.
+    #[must_use]
+    pub fn compact_graded_range(
+        &self,
+        messages: &[Message],
+        base_index: usize,
+        cold_end: usize,
+    ) -> ColdCompaction {
+        let mut before = 0usize;
+        let mut after = 0usize;
+        let mut out = Vec::with_capacity(messages.len());
+        let mut originals = Vec::new();
+        for (j, m) in messages.iter().enumerate() {
+            let index = base_index + j;
+            before += proxy_tokens(&m.content);
+            if index < cold_end
+                && m.role != Role::Assistant
+                && !m.content.contains(COMPACTION_MARKER_PREFIX)
+            {
+                let outcome = self.compactor_for(index).compress_one(&m.content);
+                after += proxy_tokens(&outcome.text);
+                if let Some((key, original)) = outcome.original {
+                    originals.push((m.id.clone(), key, original));
+                }
+                let mut clone = m.clone();
+                clone.content = outcome.text;
+                out.push(clone);
+            } else {
+                after += proxy_tokens(&m.content);
+                out.push(m.clone());
+            }
+        }
+        let originals_cached = originals.len();
+        ColdCompaction {
+            messages: out,
+            originals,
+            savings: CompactionSavings {
+                before_tokens: before,
+                after_tokens: after,
+                originals_cached,
+            },
+        }
+    }
+}
+
 fn truncate_value(value: &mut serde_json::Value, max_value_chars: usize, max_array_items: usize) {
     use serde_json::Value;
     match value {

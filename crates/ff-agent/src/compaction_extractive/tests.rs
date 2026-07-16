@@ -608,3 +608,125 @@ fn compact_tool_results_is_deterministic_across_calls() {
     let b_txt: Vec<_> = b.messages.iter().map(|m| m.content.clone()).collect();
     assert_eq!(a_txt, b_txt, "compaction must be deterministic");
 }
+
+// ----- #933 / RFC 0022 Step 1: graded extractive compaction -----
+
+/// A big JSON blob whose compressed size depends on `max_value_chars`, so we can
+/// observe deeper (harder) bands producing smaller output.
+fn big_json_blob() -> String {
+    serde_json::to_string(&serde_json::json!({ "field": "x".repeat(4000) })).unwrap()
+}
+
+#[test]
+fn graded_default_matches_legacy_cold_collect() {
+    // The equivalence anchor: GradedBands::default() (single legacy band) must be
+    // byte-identical to today's compact_cold_collect, so grading is strictly opt-in.
+    let blob = big_json_blob();
+    let messages = vec![
+        msg_with_id("m0", Role::Tool, &blob),
+        msg_with_id("m1", Role::User, "u"),
+        msg_with_id("m2", Role::Tool, &blob),
+        msg_with_id("m3", Role::User, "recent"),
+    ];
+    let legacy = ExtractiveCompactor::default().compact_cold_collect(&messages, 1);
+    let graded = GradedBands::default().compact_graded_collect(&messages, 1);
+    let l: Vec<_> = legacy.messages.iter().map(|m| &m.content).collect();
+    let g: Vec<_> = graded.messages.iter().map(|m| &m.content).collect();
+    assert_eq!(
+        l, g,
+        "default grading must equal legacy cold-collect byte-for-byte"
+    );
+    assert_eq!(legacy.originals.len(), graded.originals.len());
+}
+
+#[test]
+fn graded_compresses_older_indices_harder() {
+    // Two bands: index 0 aggressive, index 1+ default. The same blob at index 0
+    // must compress to fewer tokens than at index 1.
+    let bands = GradedBands::new(vec![
+        (
+            0,
+            ExtractiveCompactor {
+                max_value_chars: 32,
+                ..ExtractiveCompactor::default()
+            },
+        ),
+        (1, ExtractiveCompactor::default()),
+    ]);
+    let blob = big_json_blob();
+    let messages = vec![
+        msg_with_id("old", Role::Tool, &blob),
+        msg_with_id("new", Role::Tool, &blob),
+        msg_with_id("recent", Role::User, "recent"),
+    ];
+    let out = bands.compact_graded_collect(&messages, 1);
+    let old_len = out.messages[0].content.len();
+    let new_len = out.messages[1].content.len();
+    assert!(
+        old_len < new_len,
+        "older index (band 0, max_value_chars=32) must compress harder than newer \
+         (default=256): old={old_len} new={new_len}"
+    );
+    assert!(out.messages[0].content.contains(COMPACTION_MARKER_PREFIX));
+    assert!(out.messages[1].content.contains(COMPACTION_MARKER_PREFIX));
+    // Recent tail verbatim.
+    assert_eq!(out.messages[2].content, "recent");
+}
+
+#[test]
+fn graded_incremental_range_equals_full_pass() {
+    // The A.2-critical invariant under grading: compacting the newly-cold slice
+    // [boundary..cold_end] via compact_graded_range must be byte-identical to what
+    // a full compact_graded_collect assigns to those same absolute indices --
+    // because band membership is a pure function of index.
+    let bands = GradedBands::graded_v1();
+    let blob = big_json_blob();
+    // Build a long transcript so multiple bands are exercised.
+    let mut messages = Vec::new();
+    for i in 0..130 {
+        let role = if i % 2 == 0 { Role::Tool } else { Role::User };
+        messages.push(msg_with_id(&format!("m{i}"), role, &blob));
+    }
+    let keep_recent = 6;
+    let cold_end = messages.len() - keep_recent;
+
+    let full = bands.compact_graded_collect(&messages, keep_recent);
+
+    // Simulate the reuse path: freeze [0..boundary], recompute [boundary..cold_end].
+    let boundary = 50;
+    let fresh_cold = &messages[boundary..cold_end];
+    let fresh = bands.compact_graded_range(fresh_cold, boundary, cold_end);
+
+    for (k, fm) in fresh.messages.iter().enumerate() {
+        assert_eq!(
+            fm.content,
+            full.messages[boundary + k].content,
+            "graded range at abs index {} must match full pass",
+            boundary + k
+        );
+    }
+}
+
+#[test]
+fn graded_v1_last_band_is_default_strength() {
+    // Non-regression: the shallowest (highest-index) band equals the plain default,
+    // so newest-cold messages are unchanged vs today.
+    let bands = GradedBands::graded_v1();
+    let blob = big_json_blob();
+    let at_default = bands.compactor_for(100).compress_one(&blob);
+    let plain = ExtractiveCompactor::default().compress_one(&blob);
+    assert_eq!(
+        at_default.text, plain.text,
+        "last band must equal default strength"
+    );
+}
+
+#[test]
+fn graded_new_normalizes_missing_zero_band() {
+    // A band set that doesn't start at 0 gets a default zero-band prepended so every
+    // index is covered.
+    let bands = GradedBands::new(vec![(50, ExtractiveCompactor::default())]);
+    // index 0 resolves (to the injected default band) without panicking.
+    let _ = bands.compactor_for(0);
+    let _ = bands.compactor_for(1_000);
+}
