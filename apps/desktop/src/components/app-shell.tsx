@@ -117,11 +117,16 @@ function useGlobalShortcuts() {
         return;
       }
 
-      // ⌘/Ctrl+⇧+E: open the workspace Files panel (#872). Checked before the
-      // direct-mode hotkeys below (which require !shiftKey), so Shift disambiguates.
+      // ⌘/Ctrl+⇧+E: toggle the focused pane's workspace Files panel (#872,
+      // per-pane #944). The active session mirrors the focused pane, so this
+      // targets where the user is. Checked before the direct-mode hotkeys below
+      // (which require !shiftKey), so Shift disambiguates.
       if (mod && e.shiftKey && e.key.toLowerCase() === "e") {
-        e.preventDefault();
-        useFilePanelStore.getState().openFiles();
+        const sid = store.activeSessionId;
+        if (sid) {
+          e.preventDefault();
+          useFilePanelStore.getState().toggleFiles(sid);
+        }
         return;
       }
 

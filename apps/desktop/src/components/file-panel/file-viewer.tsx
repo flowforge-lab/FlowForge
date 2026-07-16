@@ -98,8 +98,18 @@ function CopyButton({ value, title }: { value: string; title: string }) {
   );
 }
 
-function Body({ path, content }: { path: string; content: FileContent }) {
-  const markdownRaw = useFilePanelStore((s) => s.markdownRaw);
+function Body({
+  sessionId,
+  path,
+  content,
+}: {
+  sessionId: string;
+  path: string;
+  content: FileContent;
+}) {
+  const markdownRaw = useFilePanelStore(
+    (s) => s.bySession[sessionId]?.markdownRaw ?? false,
+  );
 
   if (content.isBinary) {
     return (
@@ -144,12 +154,22 @@ function byteLength(s: string): number {
   return new TextEncoder().encode(s).length;
 }
 
-export function FileViewer() {
-  const selectedPath = useFilePanelStore((s) => s.selectedPath);
-  const content = useFilePanelStore((s) => s.content);
-  const loading = useFilePanelStore((s) => s.contentLoading);
-  const error = useFilePanelStore((s) => s.contentError);
-  const markdownRaw = useFilePanelStore((s) => s.markdownRaw);
+export function FileViewer({ sessionId }: { sessionId: string }) {
+  const selectedPath = useFilePanelStore(
+    (s) => s.bySession[sessionId]?.selectedPath ?? null,
+  );
+  const content = useFilePanelStore(
+    (s) => s.bySession[sessionId]?.content ?? null,
+  );
+  const loading = useFilePanelStore(
+    (s) => s.bySession[sessionId]?.contentLoading ?? false,
+  );
+  const error = useFilePanelStore(
+    (s) => s.bySession[sessionId]?.contentError ?? null,
+  );
+  const markdownRaw = useFilePanelStore(
+    (s) => s.bySession[sessionId]?.markdownRaw ?? false,
+  );
   const setMarkdownRaw = useFilePanelStore((s) => s.setMarkdownRaw);
   const toggleExpand = useFilePanelStore((s) => s.toggleExpand);
 
@@ -163,8 +183,11 @@ export function FileViewer() {
 
   // Breadcrumb dir clicks reveal the directory in the tree by expanding it.
   const revealDir = (dir: string) => {
-    if (dir && !useFilePanelStore.getState().expanded.has(dir)) {
-      void toggleExpand(dir);
+    if (
+      dir &&
+      !useFilePanelStore.getState().bySession[sessionId]?.expanded.has(dir)
+    ) {
+      void toggleExpand(sessionId, dir);
     }
   };
 
@@ -176,7 +199,7 @@ export function FileViewer() {
           {isMarkdown(selectedPath) && content && !content.isBinary && (
             <button
               type="button"
-              onClick={() => setMarkdownRaw(!markdownRaw)}
+              onClick={() => setMarkdownRaw(sessionId, !markdownRaw)}
               className={cn(
                 "rounded px-1.5 py-0.5 text-[11px] font-medium transition-colors",
                 "text-muted-foreground hover:bg-foreground/10 hover:text-foreground",
@@ -199,7 +222,7 @@ export function FileViewer() {
       ) : error ? (
         <p className="px-4 py-3 text-[12.5px] text-destructive">{error}</p>
       ) : content ? (
-        <Body path={selectedPath} content={content} />
+        <Body sessionId={sessionId} path={selectedPath} content={content} />
       ) : null}
     </div>
   );

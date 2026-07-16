@@ -48,25 +48,33 @@ function Row({
 }
 
 function TreeNode({
+  sessionId,
   entry,
   path,
   depth,
 }: {
+  sessionId: string;
   entry: DirEntry;
   path: string;
   depth: number;
 }) {
-  const expanded = useFilePanelStore((s) => s.expanded.has(path));
-  const selected = useFilePanelStore((s) => s.selectedPath === path);
-  const children = useFilePanelStore((s) => s.tree[path]);
-  const dirError = useFilePanelStore((s) => s.dirError[path]);
+  const expanded = useFilePanelStore(
+    (s) => s.bySession[sessionId]?.expanded.has(path) ?? false,
+  );
+  const selected = useFilePanelStore(
+    (s) => s.bySession[sessionId]?.selectedPath === path,
+  );
+  const children = useFilePanelStore((s) => s.bySession[sessionId]?.tree[path]);
+  const dirError = useFilePanelStore(
+    (s) => s.bySession[sessionId]?.dirError[path],
+  );
   const toggleExpand = useFilePanelStore((s) => s.toggleExpand);
   const selectFile = useFilePanelStore((s) => s.selectFile);
 
   if (entry.isDir) {
     return (
       <>
-        <Row depth={depth} onClick={() => void toggleExpand(path)}>
+        <Row depth={depth} onClick={() => void toggleExpand(sessionId, path)}>
           {expanded ? (
             <ChevronDown className="size-3.5 shrink-0 opacity-60" />
           ) : (
@@ -89,7 +97,12 @@ function TreeNode({
                 {dirError}
               </p>
             ) : (
-              <TreeLevel dir={path} depth={depth + 1} entries={children} />
+              <TreeLevel
+                sessionId={sessionId}
+                dir={path}
+                depth={depth + 1}
+                entries={children}
+              />
             )}
           </>
         )}
@@ -101,7 +114,7 @@ function TreeNode({
     <Row
       depth={depth}
       selected={selected}
-      onClick={() => void selectFile(path)}
+      onClick={() => void selectFile(sessionId, path)}
     >
       {/* Spacer aligning file icons under the folder chevron column. */}
       <span className="size-3.5 shrink-0" />
@@ -112,10 +125,12 @@ function TreeNode({
 }
 
 function TreeLevel({
+  sessionId,
   dir,
   depth,
   entries,
 }: {
+  sessionId: string;
   dir: string;
   depth: number;
   entries: DirEntry[] | undefined;
@@ -145,6 +160,7 @@ function TreeLevel({
       {entries.map((e) => (
         <TreeNode
           key={joinPath(dir, e.name)}
+          sessionId={sessionId}
           entry={e}
           path={joinPath(dir, e.name)}
           depth={depth}
@@ -154,9 +170,11 @@ function TreeLevel({
   );
 }
 
-export function FileTree() {
-  const root = useFilePanelStore((s) => s.tree[""]);
-  const rootError = useFilePanelStore((s) => s.dirError[""]);
+export function FileTree({ sessionId }: { sessionId: string }) {
+  const root = useFilePanelStore((s) => s.bySession[sessionId]?.tree[""]);
+  const rootError = useFilePanelStore(
+    (s) => s.bySession[sessionId]?.dirError[""],
+  );
 
   if (rootError) {
     return (
@@ -165,7 +183,7 @@ export function FileTree() {
   }
   return (
     <div className="py-1">
-      <TreeLevel dir="" depth={0} entries={root} />
+      <TreeLevel sessionId={sessionId} dir="" depth={0} entries={root} />
     </div>
   );
 }
