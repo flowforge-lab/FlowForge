@@ -201,8 +201,8 @@ pub struct TurnDoneEvent {
 /// epic (#426) measures every later change against. `round_trips` is the number of
 /// provider responses (agent loop iterations) this turn; `iter_ms` is the
 /// per-iteration wall-clock in arrival order; `flushes` counts silent mid-turn
-/// memory flushes (each an extra provider round-trip); `chars` is the streamed
-/// assistant text, a coarse token-cost proxy; `prefill_estimates` is the per-
+/// memory flushes (each an extra provider round-trip); `output_tokens` is the
+/// estimated assistant output tokens (tokenx-rs); `prefill_estimates` is the per-
 /// round-trip projected request size and `tier1_fires`/`tier2_fires` count how
 /// often each compaction tier engaged (F1b, #441). The F1b fields are optional on
 /// the wire -- the desktop always populates them, but a non-desktop emitter may
@@ -216,7 +216,7 @@ pub struct TurnStatsEvent {
     pub total_ms: u32,
     pub iter_ms: Vec<u32>,
     pub flushes: u32,
-    pub chars: u32,
+    pub output_tokens: u32,
     /// F1b (#441): projected prefill-token estimate of each round-trip's outgoing
     /// request (post-compaction wire), in iteration order. Omitted by emitters that
     /// do not compute F1b telemetry.
