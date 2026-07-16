@@ -412,6 +412,48 @@ impl ExtractiveCompactor {
         }
         out
     }
+
+    /// Compact an arbitrary slice of messages — all are treated as cold (eligible
+    /// for compression). Used by the frozen-boundary tier-1 path (#933 A.2) to
+    /// compress only *newly cold* messages beyond the cached boundary, without
+    /// reprocessing the already-frozen prefix.
+    ///
+    /// Returns a `ColdCompaction` with the compressed messages and any originals
+    /// that must be persisted. Semantics are identical to `compact_cold_collect`
+    /// applied to this slice with `keep_recent = 0`.
+    #[must_use]
+    pub fn compact_range_collect(&self, messages: &[Message]) -> ColdCompaction {
+        let mut before = 0usize;
+        let mut after = 0usize;
+        let mut out = Vec::with_capacity(messages.len());
+        let mut originals = Vec::new();
+        for m in messages {
+            before += proxy_tokens(&m.content);
+            if m.role != Role::Assistant && !m.content.contains(COMPACTION_MARKER_PREFIX) {
+                let outcome = self.compress_one(&m.content);
+                after += proxy_tokens(&outcome.text);
+                if let Some((key, original)) = outcome.original {
+                    originals.push((m.id.clone(), key, original));
+                }
+                let mut clone = m.clone();
+                clone.content = outcome.text;
+                out.push(clone);
+            } else {
+                after += proxy_tokens(&m.content);
+                out.push(m.clone());
+            }
+        }
+        let originals_cached = originals.len();
+        ColdCompaction {
+            messages: out,
+            originals,
+            savings: CompactionSavings {
+                before_tokens: before,
+                after_tokens: after,
+                originals_cached,
+            },
+        }
+    }
 }
 
 fn truncate_value(value: &mut serde_json::Value, max_value_chars: usize, max_array_items: usize) {

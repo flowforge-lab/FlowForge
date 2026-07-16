@@ -992,6 +992,12 @@ pub async fn run_turn(
         .and_then(|c| c.get(session_id))
         .map(|(b, msg, count)| (Some((b, msg)), Some(count)))
         .unwrap_or((None, None));
+    // Tier-1 frozen-boundary cache (#933 A.2): the compacted cold prefix from the
+    // previous iteration, keyed by the boundary index it covers. Reused on
+    // subsequent iterations so the cold prefix bytes are stable (cache-friendly)
+    // and only newly-cold messages are re-compacted.
+    let mut last_tier1: Option<(usize, Vec<Message>)> = None;
+
     // F1b (#441) telemetry: the projected prefill estimate of each round-trip's
     // outgoing wire, plus how often each compaction tier engaged this turn. Folded
     // into the `Done` event so the desktop's `turn:stats` can report them. Purely
@@ -1090,22 +1096,48 @@ pub async fn run_turn(
                 });
             }
         }
-        // Cold-prefix extractive compaction (RFC 0016 M7.1b): once over the budget
-        // fraction, compact the cold prefix of the transcript into a reversible,
-        // marker-tagged form *for this request only*. The store keeps the full
-        // verbatim transcript -- this is a deterministic pre-send wire transform,
-        // never a mutation of session state. Recent messages stay byte-identical;
-        // any blob that shrank has its verbatim original persisted so the
-        // `compaction_retrieve` tool can fetch it back. Messages already compacted
-        // at ingest (M7.1a tool results) are skipped to avoid double-compaction.
+        // Cold-prefix extractive compaction (RFC 0016 M7.1b, #933 A.2 frozen
+        // boundary): once over the budget fraction, compact the cold prefix into a
+        // reversible, marker-tagged form *for this request only*. The store keeps
+        // the full verbatim transcript -- this is a deterministic pre-send wire
+        // transform. The frozen-boundary optimization reuses the compacted prefix
+        // from the previous iteration: only messages that *newly* became cold
+        // (shifted out of the keep-recent window) are compressed, keeping the
+        // prefix bytes stable for the provider's KV cache.
         let wire = if pressure.is_over(EXTRACTIVE_COMPACT_AT_FRACTION) {
             tier1_fires += 1;
-            let cold =
-                ExtractiveCompactor::default().compact_cold_collect(&history, KEEP_RECENT_VERBATIM);
-            for (mid, key, original) in &cold.originals {
-                store.put_compaction_original(session_id, mid, key, original);
+            let compactor = ExtractiveCompactor::default();
+            let n = history.len();
+            let new_cold_end = n.saturating_sub(KEEP_RECENT_VERBATIM);
+
+            match last_tier1.as_ref() {
+                Some((boundary, cached_prefix)) if *boundary <= new_cold_end => {
+                    // Reuse: the frozen prefix covers [0..boundary]; compress only
+                    // the newly-cold slice [boundary..new_cold_end].
+                    let fresh_cold = &history[*boundary..new_cold_end];
+                    let fresh = compactor.compact_range_collect(fresh_cold);
+                    for (mid, key, original) in &fresh.originals {
+                        store.put_compaction_original(session_id, mid, key, original);
+                    }
+                    let mut out = Vec::with_capacity(n);
+                    out.extend_from_slice(cached_prefix);
+                    out.extend(fresh.messages);
+                    out.extend_from_slice(&history[new_cold_end..]);
+                    // Update the frozen boundary to include the newly-compacted range.
+                    last_tier1 = Some((new_cold_end, out[..new_cold_end].to_vec()));
+                    out
+                }
+                _ => {
+                    // First compaction this turn (or boundary invalidated): full pass.
+                    let cold = compactor.compact_cold_collect(&history, KEEP_RECENT_VERBATIM);
+                    for (mid, key, original) in &cold.originals {
+                        store.put_compaction_original(session_id, mid, key, original);
+                    }
+                    // Freeze the compacted cold prefix for subsequent iterations.
+                    last_tier1 = Some((new_cold_end, cold.messages[..new_cold_end].to_vec()));
+                    cold.messages
+                }
             }
-            cold.messages
         } else {
             history.clone()
         };

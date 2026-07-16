@@ -422,3 +422,87 @@ fn assistant_messages_are_never_compacted() {
         "compact_cold_collect must also skip assistant (#813)"
     );
 }
+
+// --- compact_range_collect (#933 A.2) ----------------------------------------
+
+#[test]
+fn compact_range_collect_compresses_all_messages_as_cold() {
+    let long_content = "x]x]x]x]x]\n".repeat(100); // 100 lines, >64 proxy tokens
+    let msgs = vec![
+        msg(Role::User, &long_content),
+        msg(Role::User, "short"),
+        msg(Role::Assistant, &long_content), // assistant = skipped
+    ];
+    let result = ExtractiveCompactor::default().compact_range_collect(&msgs);
+    // First message (long, user) should be compacted.
+    assert!(
+        result.messages[0].content.contains("<compacted"),
+        "long user message should be compacted"
+    );
+    // Short message stays unchanged.
+    assert_eq!(result.messages[1].content, "short");
+    // Assistant message stays unchanged (even though cold).
+    assert_eq!(result.messages[2].content, long_content);
+    // Originals collected for the compacted message.
+    assert_eq!(result.originals.len(), 1);
+}
+
+#[test]
+fn compact_range_matches_cold_collect_for_full_cold_slice() {
+    let long = "line\n".repeat(50);
+    let msgs = vec![
+        msg(Role::User, &long),
+        msg(Role::User, &long),
+        msg(Role::User, "tiny"),
+    ];
+    // compact_cold_collect with keep_recent=0 should equal compact_range_collect
+    let full = ExtractiveCompactor::default().compact_cold_collect(&msgs, 0);
+    let range = ExtractiveCompactor::default().compact_range_collect(&msgs);
+    assert_eq!(full.messages.len(), range.messages.len());
+    for (a, b) in full.messages.iter().zip(range.messages.iter()) {
+        assert_eq!(a.content, b.content);
+    }
+}
+
+#[test]
+fn frozen_boundary_produces_same_prefix_as_full_compaction() {
+    // Simulate the frozen-boundary pattern: compact [0..5], then on a later
+    // iteration compact [5..7] separately. The combined result must equal a
+    // single compact_cold_collect over [0..7] with keep_recent=3 (total=10).
+    let long = "data\n".repeat(60);
+    let short = "ok";
+    let messages: Vec<Message> = (0..10)
+        .map(|i| {
+            if i < 7 {
+                msg(Role::User, &long)
+            } else {
+                msg(Role::User, short)
+            }
+        })
+        .collect();
+
+    let compactor = ExtractiveCompactor::default();
+    let keep_recent = 3;
+    let cold_end = messages.len() - keep_recent; // 7
+
+    // Full single-pass compaction (the baseline).
+    let full = compactor.compact_cold_collect(&messages, keep_recent);
+
+    // Frozen-boundary simulation: first compact [0..5], then [5..7].
+    let first_boundary = 5;
+    let first_pass = compactor.compact_range_collect(&messages[..first_boundary]);
+    let second_pass = compactor.compact_range_collect(&messages[first_boundary..cold_end]);
+
+    let mut combined = Vec::new();
+    combined.extend(first_pass.messages);
+    combined.extend(second_pass.messages);
+    combined.extend_from_slice(&messages[cold_end..]);
+
+    assert_eq!(combined.len(), full.messages.len());
+    for (i, (a, b)) in combined.iter().zip(full.messages.iter()).enumerate() {
+        assert_eq!(
+            a.content, b.content,
+            "message {i} content mismatch between frozen-boundary and full pass"
+        );
+    }
+}
