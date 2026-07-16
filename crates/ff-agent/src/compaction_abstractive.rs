@@ -75,7 +75,11 @@ pub struct SummaryResult {
     /// Wire-ready transcript: `[summary message] + recent verbatim tail`.
     pub messages: Vec<Message>,
     /// `(message_id, key, original)` for the collapsed cold block, to persist so
-    /// `compaction_retrieve` can fetch the verbatim original back.
+    /// `compaction_retrieve` can fetch the verbatim original back. For a **resumed**
+    /// pass (#976) `original` also includes the prior summary's text (it is folded
+    /// into the summarizer input), so retrieving it returns summary-of-summary
+    /// content, not only raw messages — this is the accurate "what the model saw"
+    /// record for that pass.
     pub original: Option<(String, String, String)>,
     /// Index into the input transcript that the summary covers (`messages[..boundary]`
     /// were summarized). Lets the host reuse the summary while keeping everything
@@ -146,7 +150,11 @@ impl AbstractiveSummarizer {
         );
         let new_boundary = base + new_count;
         // No newly-cold messages to fold (transcript didn't grow past the prior
-        // boundary): nothing to do -- the reuse path keeps the prior summary.
+        // boundary): nothing to do -- the reuse path keeps the prior summary. This
+        // is reachable when `summary_due` re-fires (reflush interval elapsed) but
+        // the newly-cold slice `[base..cold_end]` is empty because `keep_recent`
+        // still shields everything past `base`; returning None avoids an empty
+        // re-summarize round-trip.
         if prev.is_some() && new_boundary <= base {
             return Ok(None);
         }
