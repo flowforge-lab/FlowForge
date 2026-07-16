@@ -3129,6 +3129,18 @@ Shipping the Settings redesign — currently the Memory browser (SET.8).
           breakdown,
           usage,
         } as TurnDoneEvent & { budgetTokens: number });
+        // Fixed latencies so the Context Usage popover's prefill-share row is
+        // exercisable under `dev:mock` (#960): 6000/8200 ≈ 73%.
+        this.emit(this.turnStatsListeners, {
+          sessionId,
+          roundTrips: 1,
+          totalMs: 9_000,
+          iterMs: [9_000],
+          flushes: 0,
+          outputTokens: usage.outputTokens,
+          firstTokenMs: 8_200,
+          promptLatencyMs: 6_000,
+        });
         return;
       }
       const delta = (i === 0 ? "" : " ") + words[i];

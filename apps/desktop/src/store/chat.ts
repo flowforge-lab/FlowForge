@@ -113,6 +113,10 @@ interface ChatState {
   /** sessionId -> last turn's time-to-first-token in ms (#945). Populated from
    *  TurnStatsEvent.firstTokenMs; drives the popover's TTFT row. */
   ttftBySession: Record<string, number>;
+  /** sessionId -> last turn's pure round-0 provider prefill latency in ms (#960).
+   *  Populated from TurnStatsEvent.promptLatencyMs; paired with `ttftBySession` to
+   *  render the popover's `prompt Xs (Y%) · other Zs` prefill-share line. */
+  promptLatencyBySession: Record<string, number>;
   /** sessionId -> the last turn ended without a usable answer the user can resume
    *  with one click — the agent loop hit the tool-call cap / stalled (`[stopped: …]`),
    *  or the user pressed Stop (a bare `[stopped]`, #636), so a one-click "Continue"
@@ -370,6 +374,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   contextInputTokensBySession: {},
   sessionTotalsBySession: {},
   ttftBySession: {},
+  promptLatencyBySession: {},
   resumableBySession: {},
   recentlyFinishedBySession: {},
   sessionApprovedBySession: {},
@@ -1108,10 +1113,27 @@ export const useChatStore = create<ChatState>((set, get) => ({
   },
 
   applyTurnStats: (e) => {
-    if (e.firstTokenMs == null) return;
-    set((s) => ({
-      ttftBySession: { ...s.ttftBySession, [e.sessionId]: e.firstTokenMs! },
-    }));
+    if (e.firstTokenMs == null && e.promptLatencyMs == null) return;
+    set((s) => {
+      const next: Partial<ChatState> = {};
+      if (e.firstTokenMs != null) {
+        next.ttftBySession = {
+          ...s.ttftBySession,
+          [e.sessionId]: e.firstTokenMs,
+        };
+      }
+      if (e.promptLatencyMs != null) {
+        next.promptLatencyBySession = {
+          ...s.promptLatencyBySession,
+          [e.sessionId]: e.promptLatencyMs,
+        };
+      } else if (e.firstTokenMs != null) {
+        // New TTFT without prompt latency — drop a stale share from a prior turn.
+        const { [e.sessionId]: _, ...rest } = s.promptLatencyBySession;
+        next.promptLatencyBySession = rest;
+      }
+      return next;
+    });
   },
 
   applyApprovalRequest: (e) => {
