@@ -24,6 +24,7 @@ use crate::{
     attachment_bytes, ChatMessage, ChatRequest, Chunk, ChunkStream, LlmError, Provider,
     ReasoningEffort, ToolCallDelta,
 };
+use ff_core::ProviderKind;
 
 /// Which credential source the provider uses to sign requests. Built by the
 /// desktop host from a `ProviderConnection` plus any keychain secrets.
@@ -88,6 +89,13 @@ pub struct BedrockProvider {
     /// `reasoning_config.budget_tokens` (Claude extended thinking) and the
     /// matching `maxTokens`. Defaults to [`ReasoningEffort::Medium`].
     reasoning_effort: ReasoningEffort,
+    /// Which kind of backend this provider talks to (#888). Always
+    /// [`ProviderKind::Bedrock`] for the native Converse adapter; exposed via
+    /// `with_kind` so the host doesn't need a special branch for the local
+    /// `Bedrock` check. The agent loop reads this to gate the
+    /// `egress=local-only`-but-cloud-model warning -- Bedrock is hosted, so the
+    /// warning fires correctly under `egress = local-only`.
+    kind: ProviderKind,
 }
 
 impl BedrockProvider {
@@ -98,7 +106,16 @@ impl BedrockProvider {
             supports_vision: false,
             supports_documents: false,
             reasoning_effort: ReasoningEffort::default(),
+            kind: ProviderKind::Bedrock,
         }
+    }
+
+    /// Override the backend kind (#888). The native Bedrock adapter always
+    /// talks to AWS, but the builder mirrors the other providers' `with_kind`
+    /// so the host's `build_provider` flow has a uniform shape.
+    pub fn with_kind(mut self, kind: ProviderKind) -> Self {
+        self.kind = kind;
+        self
     }
 
     /// Declare whether the target model can accept image attachments.
@@ -569,6 +586,10 @@ impl Provider for BedrockProvider {
             Some(Err(e)) => Err(e),
             _ => Ok(()),
         }
+    }
+
+    fn kind(&self) -> ProviderKind {
+        self.kind
     }
 }
 

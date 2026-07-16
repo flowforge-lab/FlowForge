@@ -1351,6 +1351,243 @@ async fn vision_model_does_not_emit_attachments_dropped() {
     );
 }
 
+/// Test provider that resolves to a *local* [`ProviderKind`] (Ollama) and
+/// returns a single text chunk. Used by the #888 tests to prove the
+/// `egress=local-only`-but-cloud notice stays silent when the inference path
+/// is genuinely local.
+struct LocalKindProvider;
+
+#[async_trait]
+impl Provider for LocalKindProvider {
+    fn kind(&self) -> ff_core::ProviderKind {
+        ff_core::ProviderKind::Ollama
+    }
+
+    async fn chat_stream(&self, _req: ChatRequest) -> Result<ChunkStream, LlmError> {
+        Ok(futures_util::stream::iter(vec![Ok(Chunk {
+            delta: "ok".into(),
+            done: true,
+            ..Chunk::default()
+        })])
+        .boxed())
+    }
+}
+
+/// Test provider that resolves to a *hosted* [`ProviderKind`] (SiliconFlow) and
+/// returns a single text chunk. Used by the #888 tests to prove the
+/// `egress=local-only`-but-cloud notice fires exactly once when the inference
+/// path is hosted while the egress policy is `LocalOnly`.
+struct CloudKindProvider;
+
+#[async_trait]
+impl Provider for CloudKindProvider {
+    fn kind(&self) -> ff_core::ProviderKind {
+        ff_core::ProviderKind::SiliconFlow
+    }
+
+    async fn chat_stream(&self, _req: ChatRequest) -> Result<ChunkStream, LlmError> {
+        Ok(futures_util::stream::iter(vec![Ok(Chunk {
+            delta: "ok".into(),
+            done: true,
+            ..Chunk::default()
+        })])
+        .boxed())
+    }
+}
+
+/// Build a [`ToolContext`] with the egress policy explicitly pinned. Mirrors the
+/// `ctx` helper but exposes `egress` so the #888 tests can exercise both
+/// `Egress::LocalOnly` and `Egress::Open` cleanly. Defaults `mode` and the
+/// other fields identically so behaviour other than the egress check is
+/// byte-identical to the `ctx` helper.
+fn ctx_with_egress<'a>(
+    registry: &'a ToolRegistry,
+    root: &'a Path,
+    approve: &'a dyn Approver,
+    egress: Egress,
+) -> ToolContext<'a> {
+    let mut c = ctx(registry, root, approve);
+    c.egress = egress;
+    c
+}
+
+#[tokio::test]
+async fn local_only_with_local_provider_does_not_emit_egress_mismatch() {
+    // #888 AC1: `egress=LocalOnly` + a local `ProviderKind` (Ollama) is the
+    // true-enclave case -- no warning fires.
+    let store = SessionStore::new();
+    let s = store.create_session(None);
+    store.add_message(&s.id, Role::User, "summarize this repo".into());
+    let registry = ToolRegistry::new();
+    let root = std::env::current_dir().unwrap();
+    let approve = AlwaysApprove;
+
+    let mut mismatch = false;
+    run_turn(
+        &LocalKindProvider,
+        &store,
+        &ctx_with_egress(&registry, &root, &approve, Egress::LocalOnly),
+        &s.id,
+        "qwen2.5-coder:7b",
+        None,
+        false,
+        ReasoningVisibility::All,
+        CancelToken::new(),
+        |ev| {
+            if matches!(ev, AgentEvent::EgressMismatch { .. }) {
+                mismatch = true;
+            }
+        },
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        !mismatch,
+        "local-only + Ollama is the true-enclave path; no warning should fire"
+    );
+}
+
+#[tokio::test]
+async fn local_only_with_cloud_provider_emits_egress_mismatch() {
+    // #888 AC2: `egress=LocalOnly` + a hosted `ProviderKind` (SiliconFlow) is
+    // the contradiction -- prompt content will still leave the machine to
+    // reach the model. Exactly one `EgressMismatch` event fires, keyed to the
+    // turn's assistant message, carrying the resolved `kind` and `model`.
+    let store = SessionStore::new();
+    let s = store.create_session(None);
+    store.add_message(&s.id, Role::User, "summarize this repo".into());
+    let registry = ToolRegistry::new();
+    let root = std::env::current_dir().unwrap();
+    let approve = AlwaysApprove;
+
+    let mut seen: Vec<(String, ff_core::ProviderKind)> = Vec::new();
+    run_turn(
+        &CloudKindProvider,
+        &store,
+        &ctx_with_egress(&registry, &root, &approve, Egress::LocalOnly),
+        &s.id,
+        "Qwen/Qwen3-Coder",
+        None,
+        false,
+        ReasoningVisibility::All,
+        CancelToken::new(),
+        |ev| {
+            if let AgentEvent::EgressMismatch {
+                message_id,
+                kind,
+                model,
+            } = &ev
+            {
+                seen.push((message_id.clone(), *kind));
+                assert_eq!(
+                    model, "Qwen/Qwen3-Coder",
+                    "the warning must name the model actually leaving the machine"
+                );
+            }
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        seen.len(),
+        1,
+        "exactly one EgressMismatch must fire on a LocalOnly + cloud turn"
+    );
+    assert_eq!(
+        seen[0].1,
+        ff_core::ProviderKind::SiliconFlow,
+        "the warning must carry the resolved hosted kind"
+    );
+    // `message_id` is the turn's assistant message id -- the same id used by
+    // every other event in the turn, so the FE can correlate the warning
+    // against the assistant bubble. We don't pin it exactly (it's a UUID), only
+    // check it's non-empty.
+    assert!(!seen[0].0.is_empty());
+}
+
+#[tokio::test]
+async fn open_egress_never_emits_egress_mismatch() {
+    // Regression guard mirroring #883's "Open is a no-op" guarantee: a hosted
+    // provider under `Egress::Open` must NOT fire the warning -- the user
+    // hasn't asked for local-only, so there's no contradiction to surface.
+    let store = SessionStore::new();
+    let s = store.create_session(None);
+    store.add_message(&s.id, Role::User, "summarize this repo".into());
+    let registry = ToolRegistry::new();
+    let root = std::env::current_dir().unwrap();
+    let approve = AlwaysApprove;
+
+    let mut mismatch = false;
+    run_turn(
+        &CloudKindProvider,
+        &store,
+        // Egress::Open -- the default and the pre-#883 baseline.
+        &ctx_with_egress(&registry, &root, &approve, Egress::Open),
+        &s.id,
+        "Qwen/Qwen3-Coder",
+        None,
+        false,
+        ReasoningVisibility::All,
+        CancelToken::new(),
+        |ev| {
+            if matches!(ev, AgentEvent::EgressMismatch { .. }) {
+                mismatch = true;
+            }
+        },
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        !mismatch,
+        "an Open phenotype must stay silent -- the warning is only meaningful \
+         when the user has opted into LocalOnly"
+    );
+}
+
+#[tokio::test]
+async fn egress_mismatch_only_emits_on_first_iteration() {
+    // #888 single-fire contract: the warning fires on iter==0 only, mirroring
+    // [`AttachmentsDropped`] (lib.rs). We can't easily drive a multi-iteration
+    // turn through `run_turn` with a vanilla provider, so this test pins the
+    // "exactly one" half by counting events on a normal single-iteration turn.
+    // The boundary is the `iter == 0` guard in `run_turn`, identical in shape
+    // to the existing `AttachmentsDropped` first-iteration check.
+    let store = SessionStore::new();
+    let s = store.create_session(None);
+    store.add_message(&s.id, Role::User, "summarize this repo".into());
+    let registry = ToolRegistry::new();
+    let root = std::env::current_dir().unwrap();
+    let approve = AlwaysApprove;
+
+    let mut count = 0usize;
+    run_turn(
+        &CloudKindProvider,
+        &store,
+        &ctx_with_egress(&registry, &root, &approve, Egress::LocalOnly),
+        &s.id,
+        "Qwen/Qwen3-Coder",
+        None,
+        false,
+        ReasoningVisibility::All,
+        CancelToken::new(),
+        |ev| {
+            if matches!(ev, AgentEvent::EgressMismatch { .. }) {
+                count += 1;
+            }
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        count, 1,
+        "the warning must fire exactly once per turn, on iter==0 only"
+    );
+}
+
 #[tokio::test]
 async fn persists_reasoning_onto_assistant_message() {
     let dir = tempfile::tempdir().unwrap();
@@ -1573,6 +1810,7 @@ async fn executes_tool_then_finishes() {
             AgentEvent::Done { .. } => {}
             AgentEvent::MemoryFlushed { .. } => {}
             AgentEvent::AttachmentsDropped { .. } => {}
+            AgentEvent::EgressMismatch { .. } => {}
             AgentEvent::ToolOutputChunk { .. } => {}
             AgentEvent::Reconnecting { .. } => {}
             AgentEvent::ConnectionFailed { message, .. } => {
@@ -1871,6 +2109,7 @@ async fn glm_empty_string_name_fragments_do_not_clobber_the_name() {
             AgentEvent::Done { .. } => {}
             AgentEvent::MemoryFlushed { .. } => {}
             AgentEvent::AttachmentsDropped { .. } => {}
+            AgentEvent::EgressMismatch { .. } => {}
             AgentEvent::ToolOutputChunk { .. } => {}
             AgentEvent::Reconnecting { .. } => {}
             AgentEvent::ConnectionFailed { message, .. } => {
@@ -1993,6 +2232,7 @@ async fn ask_user_round_trips_answer_as_tool_result() {
             AgentEvent::Done { .. } => {}
             AgentEvent::MemoryFlushed { .. } => {}
             AgentEvent::AttachmentsDropped { .. } => {}
+            AgentEvent::EgressMismatch { .. } => {}
             AgentEvent::ToolOutputChunk { .. } => {}
             AgentEvent::Reconnecting { .. } => {}
             AgentEvent::ConnectionFailed { message, .. } => {

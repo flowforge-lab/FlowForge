@@ -4,8 +4,11 @@
 #
 # IMPORTANT: local-only strips network TOOLS, not the inference call itself. If
 # your active connection is a cloud provider, prompt content still leaves this
-# machine to reach the model. For a true enclave, ALSO pin `model`/`provider`
-# below to a LOCAL endpoint (e.g. an Ollama connection) so inference stays local.
+# machine to reach the model, and the agent will surface an "inference egress is
+# open" warning on every turn (Tauri `egress:mismatch` event; CLI prints a
+# `[privacy]` line to stderr). For a true enclave, ALSO pin `model`/`provider`
+# below to a LOCAL endpoint (e.g. an Ollama or candle-vllm connection) so
+# inference stays local AND the warning stops firing.
 #
 # `model` is intentionally unset here (inherits the active connection). Do NOT
 # write `model = ""` -- an empty string breaks resolution. Pin a real LOCAL id,

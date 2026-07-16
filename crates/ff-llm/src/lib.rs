@@ -727,6 +727,19 @@ pub trait Provider: Send + Sync {
         32
     }
 
+    /// Which provider kind this provider actually talks to. Gates the
+    /// `egress=local-only`-but-cloud-model notice (#888): when the resolved
+    /// egress policy is `LocalOnly` but the kind is hosted, prompt content
+    /// still leaves this machine to reach the model. Defaults to
+    /// [`ProviderKind::OpenAi`] so an unknown impl is **fail-loud** (the
+    /// warning fires) rather than silent — a test or new backend that forgets
+    /// to override this attribute would otherwise hide its own privacy gap.
+    /// Concrete providers override via their `with_kind` builder so the host
+    /// threads the resolved connection kind through at construction time.
+    fn kind(&self) -> ff_core::ProviderKind {
+        ff_core::ProviderKind::OpenAi
+    }
+
     async fn warmup(&self, model: &str) -> Result<(), LlmError> {
         let req = ChatRequest {
             model: model.to_string(),

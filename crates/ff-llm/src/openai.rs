@@ -8,6 +8,7 @@ use crate::{
     ChatMessage, ChatRequest, Chunk, ChunkStream, LlmError, Provider, ReasoningControl,
     ReasoningWire, ToolCallContent, ToolCallDelta, WireDialect,
 };
+use ff_core::ProviderKind;
 
 /// Talks to any OpenAI-compatible `/v1/chat/completions` server over Server-Sent
 /// Events. candle-vllm, vLLM, LM Studio, Ollama's `/v1` shim, and OpenAI itself all
@@ -39,6 +40,13 @@ pub struct OpenAiProvider {
     /// SiliconFlow gateway caps reasoning tokens (per effort) / disables thinking.
     /// Resolved at build time via [`crate::reasoning_control`].
     reasoning: ReasoningControl,
+    /// Which kind of backend this provider talks to (#888). Used by the agent
+    /// loop to surface the `egress=local-only`-but-cloud-model warning when the
+    /// resolved phenotype is `LocalOnly` but this connection is hosted. Defaults
+    /// to [`ProviderKind::OpenAi`] (vanilla OpenAI / candle-vllm / LM Studio);
+    /// SiliconFlow and OpenRouter override via [`OpenAiProvider::with_kind`]
+    /// at construction time so the warning fires correctly.
+    kind: ProviderKind,
 }
 
 impl OpenAiProvider {
@@ -51,7 +59,19 @@ impl OpenAiProvider {
             supports_documents: false,
             dialect: WireDialect::default(),
             reasoning: ReasoningControl::default(),
+            kind: ProviderKind::OpenAi,
         }
+    }
+
+    /// Declare which backend this provider actually talks to (#888). The OpenAI-
+    /// compatible adapter serves every OpenAI-compatible endpoint — vanilla OpenAI,
+    /// candle-vLLM, LM Studio, SiliconFlow, OpenRouter — so the host must override
+    /// the default at construction. Local kinds (`CandleVllm`, `Ollama`) suppress
+    /// the egress-mismatch warning; hosted kinds (`OpenAi`, `SiliconFlow`,
+    /// `OpenRouter`) fire it under `egress = local-only`.
+    pub fn with_kind(mut self, kind: ProviderKind) -> Self {
+        self.kind = kind;
+        self
     }
 
     /// Declare whether the target model can accept image attachments.
@@ -521,6 +541,10 @@ impl Provider for OpenAiProvider {
 
     fn supports_documents(&self) -> bool {
         self.supports_documents
+    }
+
+    fn kind(&self) -> ff_core::ProviderKind {
+        self.kind
     }
 
     /// `GET {base_url}/models` -> `{ "data": [ { "id": ... } ] }`.
