@@ -128,9 +128,13 @@ function runCommand(cmd: PaletteCommand): void {
     case "toggle-wrap":
       useSplitStore.getState().toggleWrap();
       return;
-    case "open-files":
-      useFilePanelStore.getState().openFiles();
+    case "open-files": {
+      // Toggle the focused pane's file panel (#944): the active session mirrors
+      // the focused pane, so this opens Files where the user is.
+      const sid = useChatStore.getState().activeSessionId;
+      if (sid) useFilePanelStore.getState().toggleFiles(sid);
       return;
+    }
     case "focus-composer":
       focusComposer();
       return;

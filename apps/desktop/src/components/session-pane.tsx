@@ -12,6 +12,7 @@ import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { ChatView } from "@/components/chat-view";
 import { ContextGauge } from "@/components/context-gauge";
+import { FilePanel } from "@/components/file-panel";
 import { FindBar } from "@/components/find-bar";
 import { GoalStatusPanel } from "@/components/goal-status-panel";
 import { NotebookStatusPanel } from "@/components/notebook-status-panel";
@@ -20,7 +21,7 @@ import { PhenoSelector } from "@/components/pheno-selector";
 import { useAttachGate } from "@/lib/attach-gate";
 import { stageFiles } from "@/lib/stage-files";
 import { useChatStore } from "@/store/chat";
-import { useFilePanelStore } from "@/store/file-panel";
+import { clampPanelWidth, useFilePanelStore } from "@/store/file-panel";
 import { useFindStore } from "@/store/find";
 import { usePanesStore, MAX_PANES } from "@/store/panes";
 
@@ -51,6 +52,13 @@ export function SessionPane({
   // Scopes the find bar's occurrence search to this pane's transcript so
   // highlights never leak across split panes (#679).
   const contentRef = useRef<HTMLDivElement>(null);
+
+  // Per-pane file browser (#944): open state + divider width live in the
+  // file-panel store, keyed by this pane's session so panes stay independent.
+  const filesOpen = useFilePanelStore((s) => s.openSessions.has(sessionId));
+  const toggleFiles = useFilePanelStore((s) => s.toggleFiles);
+  const panelWidth = useFilePanelStore((s) => s.panelWidth);
+  const setPanelWidth = useFilePanelStore((s) => s.setPanelWidth);
 
   const title = useChatStore((s) => {
     const session = s.sessions.find((x) => x.id === sessionId);
@@ -90,6 +98,33 @@ export function SessionPane({
     stageFiles(sessionId, Array.from(e.dataTransfer.files), gate);
   };
 
+  // Drag-to-resize the chat|files divider. The file panel is flush to the pane's
+  // right edge, so its width is the distance from the cursor to that edge.
+  // Applied imperatively during the drag; committed once on mouseup (mirrors
+  // split-panel.tsx / pane-tree.tsx).
+  function startFilesResize(e: React.MouseEvent) {
+    e.preventDefault();
+    const panel = e.currentTarget.nextElementSibling as HTMLElement | null;
+    const paneRight =
+      e.currentTarget.parentElement?.getBoundingClientRect().right ?? 0;
+    let latest = panelWidth;
+    const onMove = (ev: MouseEvent) => {
+      latest = clampPanelWidth(paneRight - ev.clientX);
+      if (panel) panel.style.width = `${latest}px`;
+    };
+    const onUp = () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+      document.body.style.userSelect = "";
+      document.body.style.cursor = "";
+      setPanelWidth(latest);
+    };
+    document.body.style.userSelect = "none";
+    document.body.style.cursor = "col-resize";
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+  }
+
   return (
     <div
       onMouseDownCapture={() => {
@@ -113,13 +148,15 @@ export function SessionPane({
           {/* Estimated context usage for this session (#282). Self-hides until
               the first turn completes with an estimate. */}
           <ContextGauge sessionId={sessionId} />
-          {/* Files panel (#872): a visible entry point besides the palette /
-              ⌘⇧E. Opens the workspace browser for the active session. */}
+          {/* Files panel (#872, per-pane #944): a visible entry point besides
+              the palette / ⌘⇧E. Toggles the workspace browser for THIS pane's
+              session, scoped so other panes are unaffected. */}
           <Button
             variant="ghost"
             size="icon-xs"
-            title="Open Files (⌘⇧E)"
-            onClick={() => useFilePanelStore.getState().openFiles()}
+            aria-pressed={filesOpen}
+            title="Toggle Files (⌘⇧E)"
+            onClick={() => toggleFiles(sessionId)}
           >
             <Folder className="size-3.5" />
           </Button>
@@ -176,18 +213,39 @@ export function SessionPane({
       {/* Goal status panel (#717): self-hides unless this session has a goal. */}
       <GoalStatusPanel sessionId={sessionId} />
 
-      <div
-        ref={contentRef}
-        data-testid="pane-dropzone"
-        className="relative flex min-h-0 flex-1 flex-col"
-        onDragOver={handleDragOver}
-        onDragLeave={handleDragLeave}
-        onDrop={handleDrop}
-      >
-        {findOpen && <FindBar sessionId={sessionId} rootRef={contentRef} />}
-        <ChatView sessionId={sessionId} />
-        <InputBar sessionId={sessionId} focused={focused} />
-        {dragOver && <DropOverlay gated={gate.attachGated} />}
+      {/* Body: chat column, plus the per-pane file browser as an optional right
+          section (#944) with a drag handle between them. */}
+      <div className="flex min-h-0 min-w-0 flex-1">
+        <div
+          ref={contentRef}
+          data-testid="pane-dropzone"
+          className="relative flex min-h-0 min-w-0 flex-1 flex-col"
+          onDragOver={handleDragOver}
+          onDragLeave={handleDragLeave}
+          onDrop={handleDrop}
+        >
+          {findOpen && <FindBar sessionId={sessionId} rootRef={contentRef} />}
+          <ChatView sessionId={sessionId} />
+          <InputBar sessionId={sessionId} focused={focused} />
+          {dragOver && <DropOverlay gated={gate.attachGated} />}
+        </div>
+
+        {filesOpen && (
+          <>
+            {/* Resize handle between the chat column and the file panel. */}
+            <div
+              onMouseDown={startFilesResize}
+              title="Drag to resize"
+              className="w-1 shrink-0 cursor-col-resize rounded-full transition-colors hover:bg-primary/30"
+            />
+            <aside
+              style={{ width: panelWidth }}
+              className="flex min-h-0 shrink-0 flex-col border-l bg-card"
+            >
+              <FilePanel sessionId={sessionId} />
+            </aside>
+          </>
+        )}
       </div>
     </div>
   );
