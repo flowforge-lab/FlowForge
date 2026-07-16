@@ -695,7 +695,7 @@ fn graded_incremental_range_equals_full_pass() {
     // Simulate the reuse path: freeze [0..boundary], recompute [boundary..cold_end].
     let boundary = 50;
     let fresh_cold = &messages[boundary..cold_end];
-    let fresh = bands.compact_graded_range(fresh_cold, boundary, cold_end);
+    let fresh = bands.compact_graded_range(fresh_cold, boundary, cold_end, None);
 
     for (k, fm) in fresh.messages.iter().enumerate() {
         assert_eq!(
@@ -729,4 +729,91 @@ fn graded_new_normalizes_missing_zero_band() {
     // index 0 resolves (to the injected default band) without panicking.
     let _ = bands.compactor_for(0);
     let _ = bands.compactor_for(1_000);
+}
+
+// ----- #933 / RFC 0022 Step 2b: value-aware (salience) band selection -----
+
+use crate::MessageSalience;
+
+#[test]
+fn scored_incremental_range_equals_full_pass() {
+    // THE cache-stability invariant under salience (issue #982 Invariant #1):
+    // with a scorer, compacting the newly-cold slice [boundary..cold_end] must be
+    // byte-identical to what a full pass assigns those same absolute indices --
+    // because band choice is a pure function of (index, message content).
+    let bands = GradedBands::graded_v1();
+    let scorer = MessageSalience::default();
+    let blob = big_json_blob();
+    let mut messages = Vec::new();
+    for i in 0..130 {
+        // Mix roles/sizes so salience actually varies across messages.
+        let (role, content) = match i % 3 {
+            0 => (Role::Tool, blob.clone()),
+            1 => (Role::User, format!("directive {i}")),
+            _ => (Role::Tool, "small".to_string()),
+        };
+        messages.push(msg_with_id(&format!("m{i}"), role, &content));
+    }
+    let keep_recent = 6;
+    let cold_end = messages.len() - keep_recent;
+
+    let full = bands.compact_graded_range(&messages, 0, cold_end, Some(&scorer));
+
+    let boundary = 50;
+    let fresh_cold = &messages[boundary..cold_end];
+    let fresh = bands.compact_graded_range(fresh_cold, boundary, cold_end, Some(&scorer));
+
+    for (k, fm) in fresh.messages.iter().enumerate() {
+        assert_eq!(
+            fm.content,
+            full.messages[boundary + k].content,
+            "scored graded range at abs index {} must match full pass (cache stability)",
+            boundary + k
+        );
+    }
+}
+
+#[test]
+fn salience_keeps_high_value_message_gentler_than_low_value_at_same_index() {
+    // A high-value message (small user directive) at a given index must be
+    // compressed no harder than a low-value one (big tool dump) at the SAME index.
+    let bands = GradedBands::graded_v1();
+    let scorer = MessageSalience::default();
+    let big = big_json_blob();
+
+    // Same absolute index (0 = hardest depth band); salience is the only differ.
+    let user_score = scorer.score(&msg_with_id("u", Role::User, "keep this directive"), 0);
+    let tool_score = scorer.score(&msg_with_id("t", Role::Tool, &big), 0);
+    assert!(
+        user_score > tool_score,
+        "sanity: user directive outranks big tool dump"
+    );
+
+    let user_band = bands.compactor_for_scored(0, Some(user_score));
+    let tool_band = bands.compactor_for_scored(0, Some(tool_score));
+    // Gentler = larger max_value_chars (folds less).
+    assert!(
+        user_band.max_value_chars >= tool_band.max_value_chars,
+        "high-value message must land in a gentler-or-equal band than low-value at the same index"
+    );
+}
+
+#[test]
+fn scored_none_reproduces_pure_depth_grading() {
+    // Passing no scorer must be byte-identical to Step 1's depth-only grading.
+    let bands = GradedBands::graded_v1();
+    let blob = big_json_blob();
+    let messages: Vec<_> = (0..20)
+        .map(|i| msg_with_id(&format!("m{i}"), Role::Tool, &blob))
+        .collect();
+    let scored_none = bands.compact_graded_range(&messages, 0, 20, None);
+    // compactor_for (depth-only) must equal compactor_for_scored(_, None) per index.
+    for i in 0..20 {
+        assert_eq!(
+            bands.compactor_for(i).max_value_chars,
+            bands.compactor_for_scored(i, None).max_value_chars,
+            "None scorer must reproduce pure depth band at index {i}"
+        );
+    }
+    assert_eq!(scored_none.messages.len(), 20);
 }
