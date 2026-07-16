@@ -1183,20 +1183,23 @@ mod tests {
         // `subscribe` call, never the bytes already in the ring buffer.
         let dir = TempDir::new().unwrap();
         let sup = ProcessSupervisor::new();
-        // `echo` is one-shot and finishes almost immediately, so any
-        // subscription we open afterwards would race the exit-watcher
-        // dropping the sender. Use a long-running process that emits a
-        // known string after a small delay, then subscribe first.
-        let id = sup
-            .start("sleep 0.2; echo hello-stream", dir.path(), "s1")
-            .unwrap();
-        // Subscribe before the `echo` fires; the bytes haven't been
-        // appended yet, so we should see them land in our receiver.
+        // Use a file-gate so the process blocks until we explicitly release
+        // it — no timing assumptions. The process polls for a gate file
+        // before echoing, guaranteeing we can subscribe first (#958).
+        let gate = dir.path().join("gate");
+        let cmd = format!(
+            "while [ ! -f '{}' ]; do sleep 0.01; done; echo hello-stream",
+            gate.display()
+        );
+        let id = sup.start(&cmd, dir.path(), "s1").unwrap();
+        // Subscribe while process is blocked on the gate.
         let mut rx = sup
             .subscribe(id, "s1")
             .expect("subscribe returns a receiver for a live process");
+        // Release the gate — process will echo now.
+        std::fs::write(&gate, "go").unwrap();
         // Wait for the first chunk to arrive (or fail the test).
-        let chunk = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+        let chunk = tokio::time::timeout(Duration::from_secs(5), rx.recv())
             .await
             .expect("chunk arrives within budget")
             .expect("subscribe recv ok");
@@ -1206,9 +1209,6 @@ mod tests {
             text.contains("hello-stream"),
             "chunk should contain echoed text, got {text:?}"
         );
-        // Tidy up so the supervisor can drop without SIGKILL-ing live
-        // children (no-op: the sleeper's wait is short and the
-        // supervisor's Drop will SIGKILL anyway).
         let _ = sup.stop(id, "s1").await;
     }
 
