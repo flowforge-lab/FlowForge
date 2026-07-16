@@ -23,7 +23,7 @@ What remains is the **budget wall**: the message region keeps growing (~100K tok
 replaced by an LLM's paraphrase. B.2 (#964) pushes that onset out by compacting large
 tool-result blobs at ingest, but it does not change the *shape* of what we keep.
 
-This RFC proposes the shape change, in two steps, and its thesis is:
+This RFC proposes the shape change, in three steps, and its thesis is:
 
 > **A long session should remember like a person does: recent turns in full, older
 > turns progressively blurred, and *important* older turns kept sharp regardless of
@@ -42,10 +42,15 @@ Goals:
   both memory chunks and cold session messages.
 - **Marginalize Tier 2.** Make reversible extractive grading strong enough that the
   lossy abstractive summarizer becomes a rare last resort, not a routine step.
+- **Bound the wire (Step 3).** Make the compacted request a *hard-bounded* quantity:
+  `estimate(wire) ≤ T` every turn, by escalating compression strength until it fits —
+  so the sent context never exceeds the model window even as the verbatim store grows
+  past 100% of budget. Fixed-strength grading (Steps 1–2) reduces the slope; only
+  target-seeking compaction guarantees the ceiling.
 - **Cache-stable and additive.** Every grade boundary must be frozen exactly like A.2,
   so grading never busts the prefix cache; nothing changes behavior unless opted in.
 
-Non-goals in §7.
+Non-goals in §8.
 
 ## 2. Where we are (verified against `main`)
 
@@ -173,7 +178,101 @@ the **same upgrade**: when a semantic-similarity/LLM salience impl lands, both m
 consolidation and context compaction inherit it through the shared abstraction. One
 scorer, two timescales — the RFC 0016 §5 consilience made concrete.
 
-## 5. Consilience with RFC 0016 and RFC 0007
+## 5. Step 3 — Target-seeking, bounded-wire compaction (the actual over-budget fix)
+
+### 5.1 Why Steps 1–2 are not enough
+
+Steps 1 and 2 both compress at a **fixed strength** and accept whatever size results:
+Tier-1 fires on `is_over(EXTRACTIVE_COMPACT_AT_FRACTION)`, runs *one* `graded_v1()` pass,
+and sends the result — even if that result is still over budget (or over the model
+window). There is no step that asks *"how far must I compress to fit?"* and keeps going
+until it does. `budget_tokens` is a **soft "start relieving pressure" signal, not a hard
+ceiling** — `assess` only measures; nothing refuses or forces content down to a line.
+
+Measured consequence (session `dd55d6c4`, opus-4-8): `messageTokens` climbed
+130k → 186k (346 → 489 msgs), `pctUsed` 138%, with `used` (221k) **exceeding the model
+window entirely**. Steps 1/2 could not flatten a session that keeps ingesting large
+blobs, because their strength is fixed rather than *target-seeking*. Step 3 closes this.
+
+### 5.2 The one invariant that matters: bound the **wire**, not the store
+
+The number Step 3 guarantees is the size of the **request actually sent to the model**
+(the compacted "wire"), never the verbatim transcript. The store stays fully verbatim on
+disk (so `compaction_retrieve` still recovers everything — RFC 0006 reversibility); the
+`used` / `breakdown.messageTokens` figure is a *verbatim* estimate and **may and should
+remain > 100%**. Trying to force the verbatim number under budget would require deleting
+history, which breaks reversibility. So:
+
+> **Guarantee (Step 3):** for every turn, `estimate(wire) ≤ T`, where
+> `T = min(budget_tokens, model_window × SAFETY)` (e.g. `0.9`).
+
+"Never over budget" is only meaningful — and only achievable — as a statement about the
+wire. `pctUsed` (verbatim) can exceed 100% and that is fine; what must never exceed the
+window is what we transmit. This also fixes the scary-number reporting: the popover should
+expose **`wireTokens` vs `verbatimTokens`** so the % that must be ≤ 100 is the wire's, not
+the store's (ties into the #945/#946 popover-semantics work).
+
+### 5.3 The escalation ladder
+
+Replace "fire one fixed pass" with "escalate through cheaper→costlier levels, re-estimating
+after each, stopping the moment `estimate(wire) ≤ T`". Each level preserves the two standing
+invariants (frozen-boundary cache stability from Step 1; reversible originals for
+`compaction_retrieve`):
+
+1. **B.2 ingest-time tool-result compaction** (#964, shipped) — large blobs shrink on entry.
+2. **Graded extractive** (#970, shipped) — fixed depth bands by index.
+3. **Value-aware band selection** (Step 2 / #982) — low-value blobs pushed to deeper bands.
+4. **★ Adaptive deepening (new).** If (1)–(3) still leave `estimate(wire) > T`, keep
+   *increasing* compression strength (lower `max_value_chars`, fewer `keep_*_lines`, shift
+   the whole `graded_v1` band table deeper, shrink `KEEP_RECENT_VERBATIM` toward its floor)
+   until the estimate crosses under `T`. This turns "fixed strength" into "solve for the
+   shallowest strength that fits" — a bounded search, not a single guess.
+5. **Tier-2 abstractive summary** (shipped) — when mechanical pruning can't reach `T`, the
+   LLM condenses the cold prefix. Cost-bearing and uncached (the `flushMs`/`tier2Ms` blob),
+   so it is a *fallback*, engaged only after the free mechanical levels are exhausted.
+6. **Hard floor (guarantees the bound).** In the extreme, keep only `system + tools +
+   KEEP_RECENT_VERBATIM` verbatim and fold everything else to originals. Since that minimum
+   is by construction ≤ window, `estimate(wire) ≤ T` is always mathematically reachable —
+   the bound is a guarantee, not a hope.
+
+### 5.4 The hard part: adaptive deepening vs cache stability
+
+Level 4 is where the design earns its RFC. Choosing strength *dynamically per turn from the
+current pressure* would make the compacted prefix's bytes change every turn → bust the
+frozen-boundary cache → collapse the ~1000:1 read:write ratio (the exact trap #968 rejected
+when it discarded distance-from-frontier grading, and Step 2 §4.2 guards against). Two
+admissible resolutions, to be chosen during implementation:
+
+- **Monotic, position-keyed strength.** The deepening level applied to a prefix is a
+  non-decreasing function of message position (and/or the frozen boundary), never of the
+  live per-turn pressure. Once a prefix has been deepened to strength `S`, it stays at `S`
+  (or deeper) — so the full pass and the incremental-reuse pass still pick the same strength
+  for the same bytes.
+- **Freeze-on-deepen.** When a turn escalates a prefix to strength `S`, freeze that
+  `(boundary, S)` exactly as A.2 freezes the compacted prefix today; later turns reuse it and
+  only deepen *newly* cold slices.
+
+Either way, **stand up a `graded_incremental_range_equals_full_pass`-style regression under
+adaptive deepening before writing the search loop** — prove incremental-reuse == full-pass
+byte-for-byte at every strength level. This is non-negotiable; it's how we keep Step 3 from
+silently undoing #949/#951/#955.
+
+### 5.5 Acceptance (the load-bearing test)
+
+- **Bound property test:** construct an arbitrarily large verbatim history (many large
+  tool blobs); after compaction assert `estimate(wire) ≤ T` — the guarantee, mechanically
+  enforced, independent of how big the store grows.
+- **Cache stability under deepening:** incremental-reuse == full-pass byte-for-byte at each
+  deepening level (the A.2 invariant, extended to Level 4).
+- **Reversibility:** originals folded at every level recover via `compaction_retrieve`.
+- **Tier-2 is a fallback, not the workhorse:** on a blob-heavy session, Levels 1–4 reach
+  `T` on the large majority of turns; Tier-2 fires only when mechanical pruning genuinely
+  cannot (measured, so we don't trade prefill savings back for summarize latency — cf. the
+  219s turn in #960).
+- **Reporting:** `wireTokens` vs `verbatimTokens` both surfaced; the ≤100% claim is about
+  the wire.
+
+## 6. Consilience with RFC 0016 and RFC 0007
 
 - RFC 0016 already framed Tier 3 as "decay-as-compaction" reusing the RFC 0007 clock;
   this RFC is the concrete, shippable form of that thesis, sequenced after #933 proved
@@ -185,19 +284,23 @@ scorer, two timescales — the RFC 0016 §5 consilience made concrete.
   so `compaction_retrieve` remains the universal escape hatch. Grading is lossy *in
   context*, never lossy *on disk*.
 
-## 6. Phasing
+## 7. Phasing
 
-- **6.1 — Step 1 (graded extractive).** `compact_graded_collect` + `GradedBands` config,
+- **7.1 — Step 1 (graded extractive).** `compact_graded_collect` + `GradedBands` config,
   frozen-boundary stable, default bands = today's behavior (a single cold band) so it is
-  a no-op until tuned. Ships independently of Step 2. Depends only on #964 landing.
-- **6.2 — Step 2a (generalize `Salience`).** Extract the shared scoring core; memory
-  behavior unchanged (regression-locked by its existing tests).
-- **6.3 — Step 2b (`MessageSalience` → band selection).** Wire value-aware band choice;
-  measure; tune Tier-2 fire fraction downward as Tier-1 proves sufficient.
-- **6.4 — (shared, later) LLM-Salience.** The M6.3 memory TODO and compaction value
+  a no-op until tuned. Ships independently of Step 2. Depends only on #964 landing. (#968/#970, shipped.)
+- **7.2 — Step 2a (generalize `Salience`).** Extract the shared scoring core; memory
+  behavior unchanged (regression-locked by its existing tests). (#981.)
+- **7.3 — Step 2b (`MessageSalience` → band selection).** Wire value-aware band choice;
+  measure; tune Tier-2 fire fraction downward as Tier-1 proves sufficient. (#982.)
+- **7.4 — Step 3 (target-seeking, bounded wire).** The escalation ladder + adaptive
+  deepening + hard floor that make `estimate(wire) ≤ T` a guarantee. Depends on Steps 1–2
+  landing (it escalates *through* them) and reuses their cache-stability discipline for the
+  new Level-4 deepening. This is the step that actually eliminates over-window sends.
+- **7.5 — (shared, later) LLM-Salience.** The M6.3 memory TODO and compaction value
   scorer land together on the shared abstraction.
 
-## 7. Non-Goals
+## 8. Non-Goals
 
 - **RAG / external retrieval (#939).** This RFC deliberately does *not* add a retrieval
   layer. Graded reversible compaction is the near-term lever; RAG remains the eventual
@@ -209,7 +312,7 @@ scorer, two timescales — the RFC 0016 §5 consilience made concrete.
   wire transform.
 - **New pressure estimator.** Reuses the existing `ProxyTokenEstimator` / `ContextPressure`.
 
-## 8. Open Questions
+## 9. Open Questions
 
 1. **Band count & thresholds.** How many bands, and depth cutoffs? Start with 3–4,
    defaulted to today's single-band behavior, then tune against measured
@@ -217,17 +320,26 @@ scorer, two timescales — the RFC 0016 §5 consilience made concrete.
 2. **Frequency signal cost.** Detecting "referenced later" cheaply — scanning for a
    message's `retrieve key` reuse is O(n) per turn; is a maintained back-reference index
    worth it, or is depth+role+size enough for v1?
-3. **Salience extraction shape.** Generic `Salience<T>` trait vs a standalone
-   `ff-salience` crate vs a scoring struct passed both call sites — which minimizes churn
-   in `ff-memory` while giving `ff-agent` clean access?
+3. **Salience extraction shape.** (Resolved — #981: generic `Salience<T>` in `ff-memory`;
+   no new crate, since `ff-agent → ff-memory` is already a cycle-free dependency.)
 4. **Pin heuristic.** Is decision-class content ("we chose B", a user directive)
    detectable cheaply enough to auto-pin, or is pinning explicit-only for v1?
 5. **Measurement discipline.** All tuning must use a fresh, blob-heavy dev session with
    per-turn `prefill_estimates` / cacheWrite deltas — never a polluted meta-session, and
    never `breakdown.messageTokens` alone (it reflects the verbatim store, not the
    wire-only compacted size).
+6. **Step 3 — target `T`.** What fraction of the model window is safe? `T = min(budget,
+   window × SAFETY)` with `SAFETY ≈ 0.9` leaves headroom for the streamed response and
+   estimator error; is a single constant enough, or should `T` back off further on models
+   with small windows?
+7. **Step 3 — deepening strategy.** Monotonic position-keyed strength vs freeze-on-deepen
+   (§5.4): which keeps the frozen-boundary cache byte-stable with least complexity? Both
+   must pass the incremental==full regression at every strength level.
+8. **Step 3 — search granularity.** Adaptive deepening re-estimates after each level; how
+   coarse can the strength ladder be (few discrete presets) before the bound is reached in
+   one or two escalations, avoiding a per-turn search that itself costs latency?
 
-## 9. References
+## 10. References
 
 - RFC 0016 — Multi-Medium, Decay-Governed Context Compaction (Tiers 0–3; the parent vision).
 - RFC 0007 — Usage-driven decay & salience (`weight`, half-life, `reinforce`, `dormant`, `pinned`).
