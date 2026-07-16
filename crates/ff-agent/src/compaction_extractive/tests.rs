@@ -506,3 +506,105 @@ fn frozen_boundary_produces_same_prefix_as_full_compaction() {
         );
     }
 }
+
+// ----- #933 B.2: ingest-time tool-result compaction -----
+
+#[test]
+fn compact_tool_results_only_touches_tool_role() {
+    let comp = ExtractiveCompactor {
+        keep_head_lines: 2,
+        keep_tail_lines: 2,
+        min_lines_to_elide: 6,
+        min_tokens_to_compact: 0,
+        ..ExtractiveCompactor::default()
+    };
+    let big = (1..=40)
+        .map(|i| format!("l{i}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let messages = vec![
+        // A big USER blob and a big ASSISTANT blob must NOT be touched -- ingest
+        // only compacts tool results.
+        msg_with_id("u0", Role::User, &big),
+        msg_with_id("a0", Role::Assistant, &big),
+        // A big TOOL blob in the cold region IS compacted.
+        msg_with_id("t0", Role::Tool, &big),
+        // Recent tail stays verbatim.
+        msg_with_id("t1", Role::Tool, "recent tool result"),
+    ];
+
+    let out = comp.compact_tool_results_collect(&messages, 1);
+
+    assert_eq!(out.messages.len(), 4, "length preserved");
+    assert_eq!(out.messages[0].content, big, "user blob untouched");
+    assert_eq!(out.messages[1].content, big, "assistant blob untouched");
+    assert!(
+        out.messages[2].content.contains(COMPACTION_MARKER_PREFIX),
+        "cold tool result compacted"
+    );
+    assert_eq!(
+        out.messages[3].content, "recent tool result",
+        "recent tail verbatim"
+    );
+    // One original collected, bound to the tool message id.
+    assert_eq!(out.originals.len(), 1);
+    assert_eq!(out.originals[0].0, "t0");
+    assert!(out.savings.saved() > 0);
+}
+
+#[test]
+fn compact_tool_results_preserves_order_ids_and_roles() {
+    let comp = ExtractiveCompactor {
+        min_tokens_to_compact: 0,
+        ..ExtractiveCompactor::default()
+    };
+    let messages = vec![
+        msg_with_id("m0", Role::User, "hi"),
+        msg_with_id("m1", Role::Tool, "small"),
+        msg_with_id("m2", Role::Assistant, "ok"),
+    ];
+    let out = comp.compact_tool_results_collect(&messages, 0);
+    assert_eq!(out.messages.len(), 3);
+    for (i, m) in out.messages.iter().enumerate() {
+        assert_eq!(m.id, messages[i].id, "id preserved at {i}");
+        assert_eq!(m.role, messages[i].role, "role preserved at {i}");
+    }
+}
+
+#[test]
+fn compact_tool_results_skips_already_compacted() {
+    let comp = ExtractiveCompactor {
+        min_tokens_to_compact: 0,
+        ..ExtractiveCompactor::default()
+    };
+    let already = format!("summary\n{COMPACTION_MARKER_PREFIX}deadbeefdeadbeef]");
+    let messages = vec![
+        msg_with_id("t0", Role::Tool, &already),
+        msg_with_id("u0", Role::User, "recent"),
+    ];
+    let out = comp.compact_tool_results_collect(&messages, 1);
+    assert_eq!(out.messages[0].content, already, "no double-compaction");
+    assert!(out.originals.is_empty(), "no original re-collected");
+}
+
+#[test]
+fn compact_tool_results_is_deterministic_across_calls() {
+    // Cache stability: the same history compacts to byte-identical output on two
+    // consecutive calls, so the wire bytes are stable for the provider KV cache.
+    let comp = ExtractiveCompactor {
+        max_value_chars: 8,
+        min_tokens_to_compact: 0,
+        ..ExtractiveCompactor::default()
+    };
+    let blob = serde_json::to_string(&serde_json::json!({ "f": "x".repeat(2000) })).unwrap();
+    let messages = vec![
+        msg_with_id("t0", Role::Tool, &blob),
+        msg_with_id("t1", Role::Tool, &blob),
+        msg_with_id("u0", Role::User, "recent"),
+    ];
+    let a = comp.compact_tool_results_collect(&messages, 1);
+    let b = comp.compact_tool_results_collect(&messages, 1);
+    let a_txt: Vec<_> = a.messages.iter().map(|m| m.content.clone()).collect();
+    let b_txt: Vec<_> = b.messages.iter().map(|m| m.content.clone()).collect();
+    assert_eq!(a_txt, b_txt, "compaction must be deterministic");
+}
