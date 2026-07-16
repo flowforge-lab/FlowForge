@@ -2805,6 +2805,79 @@ impl Provider for RecordingProvider {
 }
 
 #[tokio::test]
+async fn ingest_compacts_large_tool_result_below_pressure_and_stores_original() {
+    // #933 B.2: a big tool-result blob in the cold region is compacted on the
+    // wire even with the transcript far under the pressure gate, and its verbatim
+    // original is persisted so `compaction_retrieve` can fetch it back.
+    let store = SessionStore::new();
+    let s = store.create_session(None);
+    // A large JSON-ish tool result (the kind codegraph_explore/pr diff produce).
+    let big = format!("[{}]", vec!["\"xxxxxxxxxxxxxxxx\""; 400].join(","));
+    store.add_message(&s.id, Role::User, "go".into());
+    store.add_tool_result_message(&s.id, "call-1".into(), big.clone());
+    // Pad the recent tail so the big tool result sits OUTSIDE the
+    // KEEP_RECENT_VERBATIM=6 window (which is kept byte-identical).
+    for i in 0..8 {
+        store.add_message(&s.id, Role::User, format!("follow-up {i}"));
+    }
+
+    let registry = ToolRegistry::new();
+    let root = std::env::current_dir().unwrap();
+    let approve = AlwaysApprove;
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let provider = RecordingProvider { seen: seen.clone() };
+
+    run_turn(
+        &provider,
+        &store,
+        &ctx(&registry, &root, &approve),
+        &s.id,
+        "mock",
+        None,
+        false,
+        ReasoningVisibility::All,
+        CancelToken::new(),
+        |_| {},
+    )
+    .await
+    .unwrap();
+
+    // The tool result on the wire carries the compaction marker...
+    let msgs = seen.lock().unwrap();
+    let tool_wire = msgs
+        .iter()
+        .find(|m| m.role == "tool")
+        .expect("tool message reached the provider");
+    let wire_content = tool_wire.content.as_deref().unwrap();
+    assert!(
+        wire_content.contains("[compacted; retrieve key="),
+        "large cold tool result must be ingest-compacted on the wire: {wire_content}"
+    );
+    assert!(
+        wire_content.len() < big.len(),
+        "compacted wire content must be smaller than the original blob"
+    );
+
+    // ...and the verbatim original is retrievable from the store.
+    let key = wire_content
+        .rsplit("retrieve key=")
+        .next()
+        .unwrap()
+        .trim_end_matches(']')
+        .trim();
+    assert_eq!(
+        store.compaction_original(key).as_deref(),
+        Some(big.as_str()),
+        "verbatim original persisted for compaction_retrieve"
+    );
+
+    // The store itself keeps the tool row fully verbatim (wire-only transform).
+    let stored = store.get_messages(&s.id);
+    let stored_tool = stored.iter().find(|m| m.role == Role::Tool).unwrap();
+    assert_eq!(stored_tool.content, big, "store stays verbatim (Option B)");
+}
+
+#[tokio::test]
 async fn system_prompt_is_injected_into_request_not_history() {
     use ff_skills::SkillRegistry;
 

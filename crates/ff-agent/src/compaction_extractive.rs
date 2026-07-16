@@ -413,6 +413,61 @@ impl ExtractiveCompactor {
         out
     }
 
+    /// Compact **only tool-result messages**, unconditionally (independent of any
+    /// pressure gate), leaving the most recent `keep_recent` messages verbatim.
+    /// This is the #933 B.2 ingest-time pass: big tool-result blobs
+    /// (`codegraph_explore`, diffs) are shrunk the moment they enter the wire so a
+    /// session stays under budget longer and the lossy Tier-2 summarizer engages
+    /// later — while the compacted bytes are stable (written once), so they enter
+    /// the provider's KV cache instead of being rewritten under pressure by Tier-1.
+    ///
+    /// Length- and order-preserving (one output per input, same ids/roles), so the
+    /// caller's count-based bookkeeping is unaffected. Non-tool messages and the
+    /// recent tail pass through untouched; already-compacted content
+    /// ([`COMPACTION_MARKER_PREFIX`]) is skipped so the later Tier-1/Tier-2 passes
+    /// never double-compact it. Returns the `(message_id, key, original)` triples
+    /// the caller must persist for `compaction_retrieve`.
+    #[must_use]
+    pub fn compact_tool_results_collect(
+        &self,
+        messages: &[Message],
+        keep_recent: usize,
+    ) -> ColdCompaction {
+        let n = messages.len();
+        let cold_end = n.saturating_sub(keep_recent);
+        let mut before = 0usize;
+        let mut after = 0usize;
+        let mut out = Vec::with_capacity(n);
+        let mut originals = Vec::new();
+        for (i, m) in messages.iter().enumerate() {
+            before += proxy_tokens(&m.content);
+            if i < cold_end && m.role == Role::Tool && !m.content.contains(COMPACTION_MARKER_PREFIX)
+            {
+                let outcome = self.compress_one(&m.content);
+                after += proxy_tokens(&outcome.text);
+                if let Some((key, original)) = outcome.original {
+                    originals.push((m.id.clone(), key, original));
+                }
+                let mut clone = m.clone();
+                clone.content = outcome.text;
+                out.push(clone);
+            } else {
+                after += proxy_tokens(&m.content);
+                out.push(m.clone());
+            }
+        }
+        let originals_cached = originals.len();
+        ColdCompaction {
+            messages: out,
+            originals,
+            savings: CompactionSavings {
+                before_tokens: before,
+                after_tokens: after,
+                originals_cached,
+            },
+        }
+    }
+
     /// Compact an arbitrary slice of messages — all are treated as cold (eligible
     /// for compression). Used by the frozen-boundary tier-1 path (#933 A.2) to
     /// compress only *newly cold* messages beyond the cached boundary, without

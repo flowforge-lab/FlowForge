@@ -1049,6 +1049,26 @@ pub async fn run_turn(
         // session's messages, so `messages` below is unaffected. Best-effort: a flush
         // failure must not abort the user's turn.
         let message_count = history.len() as u64;
+        // #933 B.2: ingest-time tool-result compaction. Unconditionally (no
+        // pressure gate) shrink large *tool-result* blobs before they hit the
+        // wire, keeping the recent tail verbatim. This is the budget-wall lever
+        // A.2 doesn't address: caching keeps repeat-prefill fast, but the message
+        // region still fills the budget and eventually trips the lossy Tier-2
+        // summarizer. Assessing pressure on the *post-ingest* history is what
+        // pushes that onset out -- flush and Tier-1/Tier-2 gate on the size we
+        // actually send. The pass is length- and order-preserving (same
+        // ids/roles), so every count-based check below (`message_count`, cache
+        // boundaries) is unaffected; the store keeps the full verbatim transcript
+        // and each original is persisted for `compaction_retrieve`.
+        // Already-marked content is skipped, so Tier-1/Tier-2 never double-compact.
+        let history = {
+            let ingest = ExtractiveCompactor::default()
+                .compact_tool_results_collect(&history, KEEP_RECENT_VERBATIM);
+            for (mid, key, original) in &ingest.originals {
+                store.put_compaction_original(session_id, mid, key, original);
+            }
+            ingest.messages
+        };
         let pressure = estimator.assess(&history, model);
         // Carries the flush's write count to the `MemoryFlushed` event below, once
         // this iteration's assistant message id exists to correlate it with.
