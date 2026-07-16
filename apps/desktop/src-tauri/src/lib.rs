@@ -112,6 +112,11 @@ struct TurnMetrics {
     prefill_estimates: Vec<u32>,
     tier1_fires: u32,
     tier2_fires: u32,
+    /// #960: pure provider round-0 prefill latency (ms) carried on the turn's
+    /// `Done` event. Distinct from the host-computed `first_token_ms`, which is
+    /// anchored at `turn_start` and so also absorbs any pre-first-token memory
+    /// flush / planning reasoning.
+    prompt_latency_ms: Option<u32>,
 }
 
 impl TurnMetrics {
@@ -127,8 +132,15 @@ impl TurnMetrics {
 
     /// Fold the agent-side F1b signal carried by the turn's `Done` event (#441).
     /// Fires once per turn, so a plain assign is correct.
-    fn note_done(&mut self, prefill_estimates: &[u32], tier1_fires: u32, tier2_fires: u32) {
+    fn note_done(
+        &mut self,
+        prefill_estimates: &[u32],
+        prompt_latency_ms: Option<u32>,
+        tier1_fires: u32,
+        tier2_fires: u32,
+    ) {
         self.prefill_estimates = prefill_estimates.to_vec();
+        self.prompt_latency_ms = prompt_latency_ms;
         self.tier1_fires = tier1_fires;
         self.tier2_fires = tier2_fires;
     }
@@ -1635,6 +1647,7 @@ fn spawn_assistant_turn(state: Arc<AppState>, app: tauri::AppHandle, session_id:
                         AgentEvent::Done {
                             message_id,
                             prefill_estimates,
+                            prompt_latency_ms,
                             tier1_fires,
                             tier2_fires,
                             ..
@@ -1642,6 +1655,7 @@ fn spawn_assistant_turn(state: Arc<AppState>, app: tauri::AppHandle, session_id:
                             m.note_turn(message_id);
                             m.note_done(
                                 prefill_estimates.as_deref().unwrap_or(&[]),
+                                *prompt_latency_ms,
                                 tier1_fires.unwrap_or(0),
                                 tier2_fires.unwrap_or(0),
                             );
@@ -1685,6 +1699,7 @@ fn spawn_assistant_turn(state: Arc<AppState>, app: tauri::AppHandle, session_id:
             tier1_fires,
             tier2_fires,
             first_token_ms,
+            prompt_latency_ms,
         ) = metrics
             .lock()
             .map(|m| {
@@ -1700,6 +1715,7 @@ fn spawn_assistant_turn(state: Arc<AppState>, app: tauri::AppHandle, session_id:
                     m.tier1_fires,
                     m.tier2_fires,
                     ttft,
+                    m.prompt_latency_ms,
                 )
             })
             .unwrap_or_default();
@@ -1729,6 +1745,10 @@ fn spawn_assistant_turn(state: Arc<AppState>, app: tauri::AppHandle, session_id:
             // from `run_turn` dispatch to the first assistant token arriving --
             // the answer to "why is first-byte slow?".
             first_token_ms,
+            // #960: pure provider round-0 prefill latency. `promptLatencyMs /
+            // firstTokenMs` is the prefill share -- how much of the wait was
+            // prefill (cache-addressable) vs pre-first-token flush/reasoning.
+            prompt_latency_ms,
         };
         tracing::info!(
             target: "turn_metrics",

@@ -799,6 +799,30 @@ async fn cross_turn_cache_invalidate_all_forces_resummary() {
     );
 }
 
+/// Delays before its first (and only) chunk, so a `run_turn` test can assert a
+/// measurable, non-zero round-0 prompt latency (#960). The delay lands *inside*
+/// the returned stream (before the first delta), which is exactly what
+/// `prompt_latency_ms` measures — stream-return to first output-carrying chunk.
+struct DelayedFirstToken {
+    delay_ms: u64,
+}
+
+#[async_trait]
+impl Provider for DelayedFirstToken {
+    async fn chat_stream(&self, _req: ChatRequest) -> Result<ChunkStream, LlmError> {
+        let delay = std::time::Duration::from_millis(self.delay_ms);
+        let fut = async move {
+            tokio::time::sleep(delay).await;
+            Ok(Chunk {
+                delta: "hi".into(),
+                done: true,
+                ..Chunk::default()
+            })
+        };
+        Ok(futures_util::stream::once(fut).boxed())
+    }
+}
+
 struct TextProvider;
 
 #[async_trait]
@@ -4251,6 +4275,59 @@ async fn done_event_reports_f1b_prefill_and_compaction_telemetry() {
     // Tier-2 is default-off regardless.
     assert_eq!(t1, Some(0), "Tier-1 must not fire under budget");
     assert_eq!(t2, Some(0), "Tier-2 must not fire (and is default-off)");
+}
+
+#[tokio::test]
+async fn done_event_reports_prompt_latency_for_round_zero() {
+    // #960: the Done event carries `prompt_latency_ms` -- the wall-clock from the
+    // provider stream being returned to its first output-carrying chunk. A
+    // provider that sleeps 40ms before its first chunk must produce a latency of
+    // at least ~40ms (and never exceed the whole turn's wall-clock).
+    let store = SessionStore::new();
+    let s = store.create_session(None);
+    store.add_message(&s.id, Role::User, "hi".into());
+    let registry = ToolRegistry::new();
+    let root = std::env::current_dir().unwrap();
+    let approve = AlwaysApprove;
+
+    let seen: std::sync::Mutex<Option<Option<u32>>> = std::sync::Mutex::new(None);
+    let turn_start = std::time::Instant::now();
+    run_turn(
+        &DelayedFirstToken { delay_ms: 40 },
+        &store,
+        &ctx(&registry, &root, &approve),
+        &s.id,
+        "mock",
+        None,
+        false,
+        ReasoningVisibility::All,
+        CancelToken::new(),
+        |ev| {
+            if let AgentEvent::Done {
+                prompt_latency_ms, ..
+            } = ev
+            {
+                *seen.lock().unwrap() = Some(prompt_latency_ms);
+            }
+        },
+    )
+    .await
+    .unwrap();
+    let turn_ms = turn_start.elapsed().as_millis() as u32;
+
+    let latency = seen
+        .lock()
+        .unwrap()
+        .expect("Done event was emitted")
+        .expect("prompt_latency_ms must be populated when a token streamed");
+    assert!(
+        latency >= 35,
+        "prompt latency should reflect the ~40ms pre-first-token delay, got {latency}"
+    );
+    assert!(
+        latency <= turn_ms,
+        "prompt latency ({latency}ms) must not exceed the whole turn ({turn_ms}ms)"
+    );
 }
 
 // ----- #244 R8: oversized tool-result history truncation -----
