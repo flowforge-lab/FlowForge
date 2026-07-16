@@ -81,7 +81,14 @@ async fn disabled_is_a_no_op() {
     let s = AbstractiveSummarizer::default();
     let msgs = long_transcript(10, 2);
     let out = s
-        .summarize_cold(&CannedSummary::new("x"), "m", &msgs, 2, &CancelToken::new())
+        .summarize_cold(
+            &CannedSummary::new("x"),
+            "m",
+            &msgs,
+            2,
+            None,
+            &CancelToken::new(),
+        )
         .await
         .unwrap();
     assert!(out.is_none(), "default config is disabled");
@@ -93,7 +100,14 @@ async fn short_cold_prefix_is_skipped() {
     // 3 cold + 2 recent: cold_end = 3 < min_cold_messages (4) -> skip.
     let msgs = long_transcript(3, 2);
     let out = s
-        .summarize_cold(&CannedSummary::new("x"), "m", &msgs, 2, &CancelToken::new())
+        .summarize_cold(
+            &CannedSummary::new("x"),
+            "m",
+            &msgs,
+            2,
+            None,
+            &CancelToken::new(),
+        )
         .await
         .unwrap();
     assert!(out.is_none());
@@ -105,7 +119,14 @@ async fn summarizes_cold_keeps_recent_and_is_retrievable() {
     let msgs = long_transcript(10, 2);
     let provider = CannedSummary::new("Condensed summary of the earlier work.");
     let result = s
-        .summarize_cold(&provider, "session-model", &msgs, 2, &CancelToken::new())
+        .summarize_cold(
+            &provider,
+            "session-model",
+            &msgs,
+            2,
+            None,
+            &CancelToken::new(),
+        )
         .await
         .unwrap()
         .expect("a long cold prefix must summarize");
@@ -140,6 +161,7 @@ async fn empty_model_override_uses_session_model() {
         "the-session-model",
         &msgs,
         2,
+        None,
         &CancelToken::new(),
     )
     .await
@@ -164,6 +186,7 @@ async fn model_override_is_used_when_set() {
         "the-session-model",
         &msgs,
         2,
+        None,
         &CancelToken::new(),
     )
     .await
@@ -182,7 +205,7 @@ async fn non_shrinking_summary_is_rejected() {
     let provider = CannedSummary::new(&huge);
     let msgs = long_transcript(6, 2);
     let out = s
-        .summarize_cold(&provider, "m", &msgs, 2, &CancelToken::new())
+        .summarize_cold(&provider, "m", &msgs, 2, None, &CancelToken::new())
         .await
         .unwrap();
     assert!(out.is_none(), "a summary that does not shrink is dropped");
@@ -194,7 +217,7 @@ async fn empty_summary_is_rejected() {
     let provider = CannedSummary::new("   ");
     let msgs = long_transcript(10, 2);
     let out = s
-        .summarize_cold(&provider, "m", &msgs, 2, &CancelToken::new())
+        .summarize_cold(&provider, "m", &msgs, 2, None, &CancelToken::new())
         .await
         .unwrap();
     assert!(out.is_none());
@@ -287,6 +310,7 @@ async fn cap_summarizes_only_oldest_slice_and_keeps_remainder_verbatim() {
             "m",
             &msgs,
             2,
+            None,
             &CancelToken::new(),
         )
         .await
@@ -330,9 +354,132 @@ async fn uncapped_summarizes_whole_cold_prefix() {
     let s = AbstractiveSummarizer::new(enabled_with_cap(0));
     let msgs = long_transcript(10, 2);
     let out = s
-        .summarize_cold(&CannedSummary::new("C"), "m", &msgs, 2, &CancelToken::new())
+        .summarize_cold(
+            &CannedSummary::new("C"),
+            "m",
+            &msgs,
+            2,
+            None,
+            &CancelToken::new(),
+        )
         .await
         .unwrap()
         .expect("summary produced");
     assert_eq!(out.boundary, 10, "uncapped covers the whole cold prefix");
+}
+
+// ----- #976 review: multi-pass forward progress (the central behavior) -----
+
+#[tokio::test]
+async fn second_pass_advances_boundary_and_condenses_new_messages() {
+    // Isaac's P1: with a cap, a re-summary must make forward progress -- fold the
+    // prior summary + the newly-cold messages beyond it, advancing the boundary --
+    // not re-condense the same oldest slice forever.
+    let s = AbstractiveSummarizer::new(enabled_with_cap(60));
+    let msgs = long_transcript(10, 2); // cold indices 0..10
+
+    // Pass 1: from scratch. Caps to the oldest slice.
+    let p1 = s
+        .summarize_cold(
+            &CannedSummary::new("SUM1"),
+            "m",
+            &msgs,
+            2,
+            None,
+            &CancelToken::new(),
+        )
+        .await
+        .unwrap()
+        .expect("pass 1 produces a summary");
+    let b1 = p1.boundary;
+    assert!((1..10).contains(&b1), "pass 1 capped: {b1}");
+
+    // Pass 2: resume from pass 1's boundary + summary message.
+    let p2 = s
+        .summarize_cold(
+            &CannedSummary::new("SUM2"),
+            "m",
+            &msgs,
+            2,
+            Some((b1, &p1.messages[0])),
+            &CancelToken::new(),
+        )
+        .await
+        .unwrap()
+        .expect("pass 2 produces a summary");
+
+    // Forward progress: the boundary strictly advances into new territory.
+    assert!(
+        p2.boundary > b1,
+        "pass 2 boundary ({}) must advance past pass 1 ({b1})",
+        p2.boundary
+    );
+    // And it actually condensed messages beyond b1: the persisted original must
+    // contain content from the newly-cold slice, not just the old summary.
+    let (_mid, _key, original) = p2.original.as_ref().unwrap();
+    assert!(
+        original.contains(&format!("cold message {b1}")),
+        "pass 2 must condense message at index {b1} (the first newly-cold one)"
+    );
+    // The prior summary is folded in (summary-of-summary), so its text appears.
+    assert!(original.contains("SUM1"), "pass 2 folds the prior summary");
+}
+
+#[tokio::test]
+async fn resume_with_no_new_messages_is_a_noop() {
+    // If the transcript hasn't grown past the prior boundary, a re-summary has
+    // nothing to fold and returns None (the reuse path keeps the prior summary).
+    let s = AbstractiveSummarizer::new(enabled_with_cap(0)); // unbounded
+    let msgs = long_transcript(6, 2); // cold_end = 6
+    let p1 = s
+        .summarize_cold(
+            &CannedSummary::new("S"),
+            "m",
+            &msgs,
+            2,
+            None,
+            &CancelToken::new(),
+        )
+        .await
+        .unwrap()
+        .expect("pass 1");
+    assert_eq!(
+        p1.boundary, 6,
+        "unbounded pass 1 covers the whole cold prefix"
+    );
+    // Resume at boundary 6 with the same transcript: no new cold messages.
+    let p2 = s
+        .summarize_cold(
+            &CannedSummary::new("S2"),
+            "m",
+            &msgs,
+            2,
+            Some((6, &p1.messages[0])),
+            &CancelToken::new(),
+        )
+        .await
+        .unwrap();
+    assert!(p2.is_none(), "no newly-cold messages -> no re-summary");
+}
+
+#[tokio::test]
+async fn stale_prev_boundary_falls_back_to_full_pass() {
+    // A prev boundary past the current cold region (e.g. after a truncate) must
+    // not panic or skip; it falls back to a full pass from 0.
+    let s = AbstractiveSummarizer::new(enabled_with_cap(0));
+    let msgs = long_transcript(6, 2); // cold_end = 6
+    let dummy = msg("stale-sum", Role::User, "stale summary");
+    let out = s
+        .summarize_cold(
+            &CannedSummary::new("S"),
+            "m",
+            &msgs,
+            2,
+            Some((999, &dummy)), // boundary > cold_end
+            &CancelToken::new(),
+        )
+        .await
+        .unwrap()
+        .expect("falls back to a full pass");
+    assert_eq!(out.boundary, 6, "stale prev ignored -> full pass from 0");
 }

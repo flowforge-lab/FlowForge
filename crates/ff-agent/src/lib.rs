@@ -1270,10 +1270,17 @@ pub async fn run_turn(
                 Some(out) => out,
                 None => {
                     let compact_model = tools.compaction_model.as_deref().unwrap_or(model);
-                    // #971: time the Tier-2 summarize -- one uncached LLM call over
-                    // the whole cold prefix, the dominant "other" latency on an
-                    // over-budget re-trigger turn. The reuse arm above is a memcpy,
-                    // so timing only this call attributes the real cost.
+                    // #976: resume from the prior summary's boundary so this pass
+                    // condenses the *newly cold* messages (folding the old summary
+                    // in) rather than re-summarizing the same oldest slice. `None`
+                    // on the first pass or after cache invalidation.
+                    let prev = last_summary
+                        .as_ref()
+                        .map(|(boundary, msg)| (*boundary, msg));
+                    // #971: time the Tier-2 summarize -- one uncached LLM call, the
+                    // dominant "other" latency on an over-budget re-trigger turn. The
+                    // reuse arm above is a memcpy, so timing only this call attributes
+                    // the real cost.
                     let tier2_clock = std::time::Instant::now();
                     let summarized = AbstractiveSummarizer::new(tools.abstractive.clone())
                         .summarize_cold(
@@ -1281,6 +1288,7 @@ pub async fn run_turn(
                             compact_model,
                             &wire,
                             KEEP_RECENT_VERBATIM,
+                            prev,
                             &cancel,
                         )
                         .await;
