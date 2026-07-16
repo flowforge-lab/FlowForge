@@ -45,6 +45,14 @@ pub struct AbstractiveConfig {
     /// Don't summarize a trivially short cold prefix -- the LLM round-trip would
     /// not pay for itself.
     pub min_cold_messages: usize,
+    /// Cap the summarizer's input: summarize at most this many *proxy tokens* of
+    /// the **oldest** cold messages per pass (#972). `0` = unbounded (legacy). When
+    /// the cold prefix exceeds the cap, only its oldest slice is condensed this
+    /// pass; the newer-cold remainder stays verbatim and is folded on a later pass,
+    /// so one catastrophic 100K+ summarize call becomes several bounded, cheap,
+    /// cache-reusable ones amortized across turns. Always includes at least one
+    /// message so a single oversized message still makes progress.
+    pub max_summary_input_tokens: usize,
 }
 
 impl Default for AbstractiveConfig {
@@ -54,6 +62,9 @@ impl Default for AbstractiveConfig {
             model: None,
             fire_at_fraction: 0.90,
             min_cold_messages: 4,
+            // ~24K proxy tokens: large enough to condense meaningfully in one pass,
+            // small enough that the uncached summarize call is seconds, not minutes.
+            max_summary_input_tokens: 24_000,
         }
     }
 }
@@ -64,7 +75,11 @@ pub struct SummaryResult {
     /// Wire-ready transcript: `[summary message] + recent verbatim tail`.
     pub messages: Vec<Message>,
     /// `(message_id, key, original)` for the collapsed cold block, to persist so
-    /// `compaction_retrieve` can fetch the verbatim original back.
+    /// `compaction_retrieve` can fetch the verbatim original back. For a **resumed**
+    /// pass (#976) `original` also includes the prior summary's text (it is folded
+    /// into the summarizer input), so retrieving it returns summary-of-summary
+    /// content, not only raw messages — this is the accurate "what the model saw"
+    /// record for that pass.
     pub original: Option<(String, String, String)>,
     /// Index into the input transcript that the summary covers (`messages[..boundary]`
     /// were summarized). Lets the host reuse the summary while keeping everything
@@ -92,12 +107,22 @@ impl AbstractiveSummarizer {
     /// disabled, when the cold prefix is too short, when the model returns an
     /// empty summary, or when the summary would not actually shrink the block --
     /// the same "only emit when it shrinks" discipline as the Tier-1 compactor.
+    ///
+    /// `prev` carries the previous pass's `(boundary, summary_message)` so a
+    /// re-summary **makes forward progress** instead of re-condensing the same
+    /// oldest slice every time (#976 review): the new pass folds the prior summary
+    /// together with the *newly cold* messages `[prev_boundary..]` (again capped by
+    /// [`AbstractiveConfig::max_summary_input_tokens`]) into one fresh summary whose
+    /// boundary advances monotonically. The prior summary is re-condensed
+    /// (summary-of-summary), so the oldest history grows progressively blurrier --
+    /// the graded decay RFC 0022 intends. Pass `None` for the first pass.
     pub async fn summarize_cold(
         &self,
         provider: &dyn Provider,
         session_model: &str,
         messages: &[Message],
         keep_recent: usize,
+        prev: Option<(usize, &Message)>,
         cancel: &CancelToken,
     ) -> Result<Option<SummaryResult>, AgentError> {
         if !self.config.enabled {
@@ -108,8 +133,41 @@ impl AbstractiveSummarizer {
         if cold_end < self.config.min_cold_messages {
             return Ok(None);
         }
-        let cold = &messages[..cold_end];
-        let source = render_cold(cold);
+        // #976: resume from the previous summary's boundary so each pass condenses
+        // *new* cold messages, not the same oldest slice. A stale `prev` (boundary
+        // past the current cold region, e.g. after an edit/truncate) falls back to a
+        // full pass from 0.
+        let prev = prev.filter(|(b, _)| *b <= cold_end);
+        let base = prev.map_or(0, |(b, _)| b);
+
+        // #972: cap the input to the oldest *new* slice `[base..cold_end]`. Always
+        // admits at least one message so a single oversized message still makes
+        // progress; `0` disables the cap (legacy: the whole remaining cold prefix).
+        let new_count = capped_cold_end(
+            &messages[base..cold_end],
+            cold_end - base,
+            self.config.max_summary_input_tokens,
+        );
+        let new_boundary = base + new_count;
+        // No newly-cold messages to fold (transcript didn't grow past the prior
+        // boundary): nothing to do -- the reuse path keeps the prior summary. This
+        // is reachable when `summary_due` re-fires (reflush interval elapsed) but
+        // the newly-cold slice `[base..cold_end]` is empty because `keep_recent`
+        // still shields everything past `base`; returning None avoids an empty
+        // re-summarize round-trip.
+        if prev.is_some() && new_boundary <= base {
+            return Ok(None);
+        }
+
+        // Build the summarizer input: the prior summary (if any) followed by the new
+        // cold slice, so the prior summary is re-condensed into the fresh one.
+        let new_slice = &messages[base..new_boundary];
+        let mut to_summarize: Vec<Message> = Vec::with_capacity(new_slice.len() + 1);
+        if let Some((_, pmsg)) = prev {
+            to_summarize.push(pmsg.clone());
+        }
+        to_summarize.extend_from_slice(new_slice);
+        let source = render_cold(&to_summarize);
         if source.trim().is_empty() {
             return Ok(None);
         }
@@ -137,26 +195,30 @@ impl AbstractiveSummarizer {
 
         let key = content_key(&source);
         let content = format!(
-            "Summary of {cold_end} earlier messages in this conversation:\n{summary}\n{COMPACTION_MARKER_PREFIX}{key}]"
+            "Summary of {new_boundary} earlier messages in this conversation:\n{summary}\n{COMPACTION_MARKER_PREFIX}{key}]"
         );
-        // Only substitute when the summary actually shrinks the cold block.
+        // Only substitute when the summary actually shrinks the folded block.
         if proxy_tokens(&content) >= before {
             return Ok(None);
         }
         let after = proxy_tokens(&content);
 
-        let mut out = Vec::with_capacity(keep_recent + 1);
-        out.push(summary_message(&content, cold));
-        out.extend_from_slice(&messages[cold_end..]);
-        // Key the persisted original under the last cold message id: retrieval is
-        // by content-hash (`key`), but the mid anchors cascade-on-session-delete.
-        // Tier 1 keys per-message because each tool result is its own retrievable
-        // unit; Tier 2 collapses the whole cold block into one stored original.
-        let mid = cold.last().map(|m| m.id.clone()).unwrap_or_default();
+        // Everything past the new boundary (uncapped-cold remainder + recent tail)
+        // stays byte-identical.
+        let mut out = Vec::with_capacity(n - new_boundary + 1);
+        out.push(summary_message(&content, &to_summarize));
+        out.extend_from_slice(&messages[new_boundary..]);
+        // Key the persisted original under the last summarized message id: retrieval
+        // is by content-hash (`key`), but the mid anchors cascade-on-session-delete.
+        // Prefer the last *real* (non-summary) message of the new slice.
+        let mid = new_slice
+            .last()
+            .map(|m| m.id.clone())
+            .unwrap_or_else(|| prev.map(|(_, m)| m.id.clone()).unwrap_or_default());
         Ok(Some(SummaryResult {
             messages: out,
             original: Some((mid, key, source)),
-            boundary: cold_end,
+            boundary: new_boundary,
             savings: CompactionSavings {
                 before_tokens: before,
                 after_tokens: after,
@@ -192,6 +254,32 @@ and any open questions or unfinished work. Omit pleasantries and redundant detai
 invent anything that is not present in the conversation. Output only the summary itself -- \
 tight prose or bullet points, no preamble."
         .to_string()
+}
+
+/// Compute the exclusive end index of the oldest slice to summarize this pass,
+/// bounded to `max_input_tokens` proxy tokens (#972). `max_input_tokens == 0`
+/// disables the cap and returns `cold_end` (legacy: the whole cold prefix).
+///
+/// Walks from the oldest message forward, accumulating `proxy_tokens`, and stops
+/// before adding a message would exceed the cap. Always returns at least 1 (given
+/// `cold_end >= 1`) so a single oversized message still makes progress rather than
+/// stalling the summarizer forever.
+fn capped_cold_end(messages: &[Message], cold_end: usize, max_input_tokens: usize) -> usize {
+    if max_input_tokens == 0 || cold_end == 0 {
+        return cold_end;
+    }
+    let mut acc = 0usize;
+    let mut end = 0usize;
+    for m in &messages[..cold_end] {
+        let t = proxy_tokens(&m.content);
+        // Stop before exceeding the cap, but never emit an empty slice.
+        if end > 0 && acc + t > max_input_tokens {
+            break;
+        }
+        acc += t;
+        end += 1;
+    }
+    end
 }
 
 /// Render the cold transcript into a single plain-text block for the summarizer.

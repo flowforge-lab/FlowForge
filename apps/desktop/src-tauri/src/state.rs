@@ -3217,6 +3217,13 @@ pub(crate) fn abstractive_config_from_env() -> AbstractiveConfig {
     {
         config.fire_at_fraction = at;
     }
+    // #972: override the Tier-2 input cap (proxy tokens; 0 = unbounded).
+    if let Some(cap) = std::env::var("FF_COMPACT_ABSTRACTIVE_INPUT_CAP")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+    {
+        config.max_summary_input_tokens = cap;
+    }
     config
 }
 

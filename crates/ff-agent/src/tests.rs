@@ -5478,6 +5478,9 @@ async fn tier2_summarizes_cold_prefix_but_store_stays_verbatim() {
     tctx.abstractive = AbstractiveConfig {
         enabled: true,
         fire_at_fraction: 0.90,
+        // This test validates whole-cold-prefix collapse (it predates #972's input
+        // cap); disable the cap so the single pass covers all cold messages.
+        max_summary_input_tokens: 0,
         ..AbstractiveConfig::default()
     };
 
