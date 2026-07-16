@@ -222,20 +222,53 @@ impl ThinkScanner {
         let mut content = String::new();
         let mut reasoning = String::new();
 
-        if let Some(pos) = self.buf.find(OPEN_TAG) {
-            // Found <think> — everything before it is content.
+        // While Outside we watch for two real tags: an opening `<think>` (re-enter
+        // reasoning) and a *stray* closing `</think>`. A close tag seen while
+        // already Outside has no matching open, so it can only be model noise —
+        // MiniMax reliably emits a surplus `</think>` after the real one (#978).
+        // Such a stray close is stripped, never emitted as visible content (which
+        // is what previously leaked raw `</think>` markup into the chat bubble).
+        // Whichever tag appears first in the buffer governs.
+        let open_pos = self.buf.find(OPEN_TAG);
+        let close_pos = self.buf.find(CLOSE_TAG);
+        let first = match (open_pos, close_pos) {
+            (Some(o), Some(c)) => Some((o.min(c), o <= c)),
+            (Some(o), None) => Some((o, true)),
+            (None, Some(c)) => Some((c, false)),
+            (None, None) => None,
+        };
+
+        if let Some((pos, is_open)) = first {
+            // Everything before the tag is visible content.
             content.push_str(&self.buf[..pos]);
-            let after = pos + OPEN_TAG.len();
-            let remainder = self.buf[after..].to_string();
-            self.buf.clear();
-            self.state = State::InsideThink;
-            if !remainder.is_empty() {
-                let r = self.handle_inside(&remainder);
-                content.push_str(&r.content);
-                reasoning.push_str(&r.reasoning);
+            if is_open {
+                let after = pos + OPEN_TAG.len();
+                let remainder = self.buf[after..].to_string();
+                self.buf.clear();
+                self.state = State::InsideThink;
+                if !remainder.is_empty() {
+                    let r = self.handle_inside(&remainder);
+                    content.push_str(&r.content);
+                    reasoning.push_str(&r.reasoning);
+                }
+            } else {
+                // Stray `</think>` — drop it. Mirror the inside->outside transition
+                // by also stripping leading newlines that trailed the tag, so a
+                // `</think>\n\n` noise run collapses to nothing rather than a blank
+                // line, then re-scan the remainder for further tags.
+                let after = pos + CLOSE_TAG.len();
+                let remainder = self.buf[after..].trim_start_matches('\n').to_string();
+                self.buf.clear();
+                if !remainder.is_empty() {
+                    let r = self.handle_outside(&remainder);
+                    content.push_str(&r.content);
+                    reasoning.push_str(&r.reasoning);
+                }
             }
-        } else if could_be_partial_open(&self.buf) {
-            let safe = safe_emit_len(&self.buf, OPEN_TAG);
+        } else if could_be_partial_open(&self.buf) || could_be_partial_close(&self.buf) {
+            // Buffer may end with a partial `<think>` or `</think>` split across
+            // deltas — hold back enough bytes to cover either tag before emitting.
+            let safe = safe_emit_len(&self.buf, OPEN_TAG).min(safe_emit_len(&self.buf, CLOSE_TAG));
             content.push_str(&self.buf[..safe]);
             let keep = self.buf[safe..].to_string();
             self.buf = keep;

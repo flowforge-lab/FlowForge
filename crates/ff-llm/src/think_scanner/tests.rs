@@ -142,3 +142,59 @@ fn forced_with_model_emitting_think_open() {
     assert_eq!(r2.reasoning, " think about this\n");
     assert_eq!(r2.content, "Here is my answer");
 }
+
+// ----- #978: MiniMax-M3 emits an unpaired trailing </think> that previously
+// leaked into visible content. Sequences below are real deltas captured from
+// the SiliconFlow API (`.ff-scratch/` in the investigation), replayed here.
+
+#[test]
+fn stray_close_tag_after_real_think_is_stripped() {
+    // The 8/8 light-repro shape: one real <think>...</think>, then a surplus
+    // </think> the model tacks on. The surplus close must be dropped, not shown.
+    let mut s = ThinkScanner::forced();
+    let r1 = s.push("The user wants me to run a git command. Let me do that.");
+    assert_eq!(r1.content, "");
+    assert_eq!(
+        r1.reasoning,
+        "The user wants me to run a git command. Let me do that."
+    );
+
+    let r2 = s.push("\n</think>\n\n</think>");
+    assert_eq!(
+        r2.content, "",
+        "surplus </think> must never surface as visible content"
+    );
+}
+
+#[test]
+fn stray_close_then_real_answer_keeps_the_answer() {
+    // A stray </think> immediately followed by genuine assistant prose: the tag
+    // is stripped, the prose is preserved.
+    let mut s = ThinkScanner::forced();
+    let _ = s.push("reasoning body");
+    let r = s.push("</think>\n\n</think>Here is the real answer.");
+    assert_eq!(r.content, "Here is the real answer.");
+}
+
+#[test]
+fn stray_close_tag_split_across_deltas() {
+    // The surplus close tag fragmented across SSE byte-chunks must still be
+    // recognized and stripped, not emitted piecemeal.
+    let mut s = ThinkScanner::forced();
+    let _ = s.push("thinking");
+    let r1 = s.push("</think>visible</thi");
+    assert_eq!(r1.content, "visible");
+    let r2 = s.push("nk>");
+    assert_eq!(r2.content, "", "fragmented stray </think> must be stripped");
+}
+
+#[test]
+fn well_behaved_stream_unaffected_by_stray_close_handling() {
+    // Guard: a provider that never opens a <think> stays in pass-through and its
+    // content is untouched, even if it happens to contain the substring.
+    let mut s = ThinkScanner::auto_detect();
+    let r = s.push("Here is plain content with no tags at all.");
+    assert_eq!(r.content, "Here is plain content with no tags at all.");
+    assert_eq!(r.reasoning, "");
+    assert!(s.is_pass_through());
+}
