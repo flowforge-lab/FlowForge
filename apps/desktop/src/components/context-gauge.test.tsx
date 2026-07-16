@@ -28,6 +28,8 @@ function seed(tokens: number | null | undefined, budget?: number | null) {
     sessionTotalsBySession: {},
     ttftBySession: {},
     promptLatencyBySession: {},
+    flushMsBySession: {},
+    tier2MsBySession: {},
   });
   useSessionModelStore.setState({ resolvedBySession: {} });
 }
@@ -39,6 +41,8 @@ function seedPopover(opts: {
   model?: string;
   ttft?: number;
   promptLatencyMs?: number;
+  flushMs?: number;
+  tier2Ms?: number;
 }) {
   const inputs: Record<string, number> =
     opts.inputTokens == null ? {} : { [SID]: opts.inputTokens };
@@ -55,6 +59,8 @@ function seedPopover(opts: {
     ttftBySession: opts.ttft == null ? {} : { [SID]: opts.ttft },
     promptLatencyBySession:
       opts.promptLatencyMs == null ? {} : { [SID]: opts.promptLatencyMs },
+    flushMsBySession: opts.flushMs == null ? {} : { [SID]: opts.flushMs },
+    tier2MsBySession: opts.tier2Ms == null ? {} : { [SID]: opts.tier2Ms },
   });
   if (opts.model) {
     const resolved: ResolvedModel = {
@@ -224,6 +230,8 @@ describe("ContextGauge — popover (#931)", () => {
       model: "claude-opus-4-8",
       ttft: 8_200,
       promptLatencyMs: 6_000,
+      flushMs: 1_400,
+      tier2Ms: 800,
     });
     render(<ContextGauge sessionId={SID} />);
 
@@ -245,6 +253,8 @@ describe("ContextGauge — popover (#931)", () => {
       pctUsed: 115,
       ttft: 8_200,
       promptLatencyMs: 6_000,
+      flushMs: 1_400,
+      tier2Ms: 800,
       breakdown: BREAKDOWN,
       sessionTotals: TOTALS,
     });
@@ -325,5 +335,53 @@ describe("ContextGauge — popover (#931)", () => {
     expect(text).toContain("6.0s");
     expect(text).not.toContain("prompt ");
     expect(text).not.toContain("other ");
+  });
+
+  it("shows the per-phase attribution row when a compaction phase fired (#971)", () => {
+    seed(173_000, 150_000);
+    seedPopover({
+      breakdown: BREAKDOWN,
+      ttft: 8_200,
+      promptLatencyMs: 6_000,
+      flushMs: 1_400,
+      tier2Ms: 800,
+    });
+    render(<ContextGauge sessionId={SID} />);
+    fireEvent.click(screen.getByRole("button", { name: /context usage/i }));
+    const text =
+      document.querySelector('[data-slot="popover-content"]')?.textContent ??
+      "";
+    expect(text).toContain("main 6.0s · flush 1.4s · summarize 800ms");
+  });
+
+  it("omits phases the turn did not run (#971)", () => {
+    seed(173_000, 150_000);
+    seedPopover({
+      breakdown: BREAKDOWN,
+      ttft: 12_000,
+      promptLatencyMs: 3,
+      tier2Ms: 9_000,
+    });
+    render(<ContextGauge sessionId={SID} />);
+    fireEvent.click(screen.getByRole("button", { name: /context usage/i }));
+    const text =
+      document.querySelector('[data-slot="popover-content"]')?.textContent ??
+      "";
+    expect(text).toContain("main 3ms · summarize 9.0s");
+    expect(text).not.toContain("flush ");
+  });
+
+  it("shows no per-phase row when neither compaction phase fired (#971)", () => {
+    seed(173_000, 150_000);
+    seedPopover({ breakdown: BREAKDOWN, ttft: 8_200, promptLatencyMs: 6_000 });
+    render(<ContextGauge sessionId={SID} />);
+    fireEvent.click(screen.getByRole("button", { name: /context usage/i }));
+    const text =
+      document.querySelector('[data-slot="popover-content"]')?.textContent ??
+      "";
+    expect(text).not.toContain("flush ");
+    expect(text).not.toContain("summarize ");
+    // The prefill-share line's "main" prefix must not leak in without a phase.
+    expect(text).not.toContain("main ");
   });
 });

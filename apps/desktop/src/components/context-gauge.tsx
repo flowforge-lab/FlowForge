@@ -61,6 +61,26 @@ function formatPrefillShare(
   return `prompt ${formatLatencyMs(promptLatencyMs)} (${share}%) · other ${formatLatencyMs(otherMs)}`;
 }
 
+// Per-phase attribution of the pre-first-token wait (#971): `main 3ms · flush
+// 1.4s · summarize 800ms`, splitting the prefill-share's opaque "other" into the
+// memory flush and the Tier-2 summarizer. `main` is the cache-warm prefill
+// (`promptLatencyMs`); only phases the turn actually ran are shown. Returns
+// `null` when neither compaction phase fired, so a plain turn keeps just the
+// prefill-share line above.
+function formatPhaseBreakdown(
+  promptLatencyMs: number | undefined,
+  flushMs: number | undefined,
+  tier2Ms: number | undefined,
+): string | null {
+  if (flushMs == null && tier2Ms == null) return null;
+  const parts: string[] = [];
+  if (promptLatencyMs != null)
+    parts.push(`main ${formatLatencyMs(promptLatencyMs)}`);
+  if (flushMs != null) parts.push(`flush ${formatLatencyMs(flushMs)}`);
+  if (tier2Ms != null) parts.push(`summarize ${formatLatencyMs(tier2Ms)}`);
+  return parts.join(" · ");
+}
+
 // One component row: label · optional count · token figure · %-of-budget.
 function ComponentRow({
   swatch,
@@ -99,6 +119,8 @@ export function ContextGauge({ sessionId }: { sessionId: string }) {
   const promptLatency = useChatStore(
     (s) => s.promptLatencyBySession[sessionId],
   );
+  const flushMs = useChatStore((s) => s.flushMsBySession[sessionId]);
+  const tier2Ms = useChatStore((s) => s.tier2MsBySession[sessionId]);
   const model = useSessionModelStore(
     (s) => s.resolvedBySession[sessionId]?.model,
   );
@@ -107,6 +129,7 @@ export function ContextGauge({ sessionId }: { sessionId: string }) {
     ttft != null && promptLatency != null
       ? formatPrefillShare(ttft, promptLatency)
       : null;
+  const phaseBreakdown = formatPhaseBreakdown(promptLatency, flushMs, tier2Ms);
 
   // Total context size from the component breakdown (provider-agnostic, correct
   // for all providers including Bedrock where inputTokens excludes cached tokens).
@@ -141,6 +164,8 @@ export function ContextGauge({ sessionId }: { sessionId: string }) {
       pctUsed: pct,
       ttft,
       promptLatencyMs: promptLatency,
+      flushMs,
+      tier2Ms,
       breakdown,
       sessionTotals: totals,
     };
@@ -268,6 +293,11 @@ export function ContextGauge({ sessionId }: { sessionId: string }) {
                 {prefillShare ? (
                   <div className="text-right tabular-nums text-muted-foreground/70">
                     {prefillShare}
+                  </div>
+                ) : null}
+                {phaseBreakdown ? (
+                  <div className="text-right tabular-nums text-muted-foreground/70">
+                    {phaseBreakdown}
                   </div>
                 ) : null}
               </div>

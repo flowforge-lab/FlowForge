@@ -3130,7 +3130,9 @@ Shipping the Settings redesign — currently the Memory browser (SET.8).
           usage,
         } as TurnDoneEvent & { budgetTokens: number });
         // Fixed latencies so the Context Usage popover's prefill-share row is
-        // exercisable under `dev:mock` (#960): 6000/8200 ≈ 73%.
+        // exercisable under `dev:mock` (#960): 6000/8200 ≈ 73%. The per-phase
+        // split (#971) attributes the ~2.2s "other" as flush + summarize; they
+        // sum with `main` to `firstTokenMs` so the identity holds on screen.
         this.emit(this.turnStatsListeners, {
           sessionId,
           roundTrips: 1,
@@ -3140,6 +3142,8 @@ Shipping the Settings redesign — currently the Memory browser (SET.8).
           outputTokens: usage.outputTokens,
           firstTokenMs: 8_200,
           promptLatencyMs: 6_000,
+          flushMs: 1_400,
+          tier2Ms: 800,
         });
         return;
       }
