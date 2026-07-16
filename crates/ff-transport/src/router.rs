@@ -30,7 +30,10 @@ pub struct RouterConfig {
     pub model: String,
     /// Optional system prompt prepended to every turn.
     pub system_prompt: Option<String>,
-    /// Enable extended thinking / reasoning.
+    /// Enable extended thinking / reasoning. Defaults to `false` for headless
+    /// transports since the router currently discards reasoning deltas (they are
+    /// not streamed to the transport). Set to `true` if reasoning improves quality
+    /// enough to justify the added latency.
     pub enable_reasoning: bool,
 }
 
@@ -43,7 +46,7 @@ impl Default for RouterConfig {
             workspace: PathBuf::from("."),
             model: String::from("claude-sonnet-4-20250514"),
             system_prompt: None,
-            enable_reasoning: true,
+            enable_reasoning: false,
         }
     }
 }
@@ -119,6 +122,10 @@ impl Router {
             tools.egress = self.config.egress;
 
             let cancel = CancelToken::new();
+            // NOTE: volatile tail (cwd, time, ambient context) is not populated
+            // here — matches CLI one-shot behavior. Long-lived messaging sessions
+            // won't see environment-aware prompts until a UserContext parameter is
+            // threaded through Router::run.
             let system_prompt = self.config.system_prompt.as_ref().map(|s| SystemPrompt {
                 stable: s.clone(),
                 volatile: String::new(),

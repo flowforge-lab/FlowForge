@@ -8,6 +8,11 @@ use crate::types::{ChannelId, InboundMessage, Notification};
 #[async_trait]
 pub trait ResponseStream: Send {
     /// Append a text chunk to the ongoing response.
+    ///
+    /// **Current behavior:** The router buffers all token deltas during a turn and
+    /// delivers them as a single chunk after the turn completes. Transports should
+    /// not assume per-token granularity; a future streaming-flush cadence (timer /
+    /// N-char threshold) may provide finer delivery.
     async fn chunk(&self, text: &str);
     /// Signal that the response is complete.
     async fn finish(&self);

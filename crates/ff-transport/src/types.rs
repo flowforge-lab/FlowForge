@@ -32,7 +32,12 @@ pub struct InboundMessage {
 #[derive(Debug, Clone)]
 pub enum Notification {
     TurnStarted,
-    ToolCall { name: String },
+    ToolCall {
+        name: String,
+    },
     TurnFinished,
+    /// Fatal turn-level failure (not recoverable by the agent). Tool-level and
+    /// loop-level errors that the model may retry are intentionally not surfaced
+    /// as notifications.
     Error(String),
 }
