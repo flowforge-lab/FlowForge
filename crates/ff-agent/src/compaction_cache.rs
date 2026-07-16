@@ -34,12 +34,23 @@ const MAX_ENTRIES: NonZeroUsize = NonZeroUsize::new(128).expect("non-zero");
 /// session runs at a time (enforced by the cancel-before-spawn invariant
 /// upstream), so contention is effectively zero.
 pub struct CompactionCache {
-    inner: Mutex<LruCache<String, CachedSummary>>,
+    inner: Mutex<LruCache<String, CachedEntry>>,
 }
 
-/// The cached summary state for one session.
+/// The cached compaction state for one session. Holds both tier-2 abstractive
+/// summary and tier-1 frozen prefix independently — both share the same LRU
+/// lifecycle (invalidated together on edit/truncate/model change).
 #[derive(Debug, Clone)]
-struct CachedSummary {
+struct CachedEntry {
+    /// Tier-2 abstractive summary (RFC 0016 M7.0, #757).
+    tier2: Option<Tier2Entry>,
+    /// Tier-1 frozen compacted prefix (#933 A.2 step 2).
+    tier1: Option<Tier1Entry>,
+}
+
+/// Tier-2 abstractive summary state.
+#[derive(Debug, Clone)]
+struct Tier2Entry {
     /// Index into the wire at which this summary ends (exclusive). Messages
     /// `[0..boundary]` are covered by the summary; `[boundary..]` are verbatim.
     boundary: usize,
@@ -50,6 +61,19 @@ struct CachedSummary {
     message_count: u64,
 }
 
+/// Tier-1 frozen compacted prefix (#933 A.2).
+#[derive(Debug, Clone)]
+struct Tier1Entry {
+    /// How many history messages this compacted prefix covers (`history[0..boundary]`).
+    boundary: usize,
+    /// The compacted messages for the cold prefix, byte-stable across turns.
+    prefix: Vec<Message>,
+    /// Transcript message count when this prefix was produced. Used as a
+    /// staleness guard: the caller rejects the seed if the transcript shrank
+    /// (edit/delete) since production, even if `invalidate` was missed.
+    message_count: u64,
+}
+
 impl CompactionCache {
     pub fn new() -> Self {
         Self {
@@ -57,38 +81,76 @@ impl CompactionCache {
         }
     }
 
-    /// Retrieve the cached summary for a session, if any. Promotes the entry
-    /// to most-recently-used.
+    // --- Tier-2 abstractive summary (#757) ---
+
+    /// Retrieve the cached tier-2 summary for a session, if any.
     pub fn get(&self, session_id: &str) -> Option<(usize, Message, u64)> {
         let mut guard = self.inner.lock().unwrap();
-        guard
-            .get(session_id)
-            .map(|c| (c.boundary, c.summary.clone(), c.message_count))
+        guard.get(session_id).and_then(|e| {
+            e.tier2
+                .as_ref()
+                .map(|t| (t.boundary, t.summary.clone(), t.message_count))
+        })
     }
 
-    /// Store (or overwrite) the summary for a session. When the cache is at
-    /// capacity, the least-recently-touched entry is silently dropped.
+    /// Store (or overwrite) the tier-2 summary for a session.
     pub fn put(&self, session_id: &str, boundary: usize, summary: Message, message_count: u64) {
         let mut guard = self.inner.lock().unwrap();
-        guard.put(
-            session_id.to_owned(),
-            CachedSummary {
-                boundary,
-                summary,
-                message_count,
-            },
-        );
+        let entry = guard.get_or_insert_mut(session_id.to_owned(), || CachedEntry {
+            tier2: None,
+            tier1: None,
+        });
+        entry.tier2 = Some(Tier2Entry {
+            boundary,
+            summary,
+            message_count,
+        });
     }
 
-    /// Invalidate the cache for a session. Called on edit/truncate where the
-    /// old boundary is no longer valid.
+    // --- Tier-1 frozen prefix (#933 A.2 step 2) ---
+
+    /// Retrieve the cached tier-1 frozen prefix for a session, if any.
+    /// Returns `(boundary, prefix, message_count)`.
+    pub fn get_tier1(&self, session_id: &str) -> Option<(usize, Vec<Message>, u64)> {
+        let mut guard = self.inner.lock().unwrap();
+        guard.get(session_id).and_then(|e| {
+            e.tier1
+                .as_ref()
+                .map(|t| (t.boundary, t.prefix.clone(), t.message_count))
+        })
+    }
+
+    /// Store (or overwrite) the tier-1 frozen prefix for a session.
+    pub fn put_tier1(
+        &self,
+        session_id: &str,
+        boundary: usize,
+        prefix: Vec<Message>,
+        message_count: u64,
+    ) {
+        let mut guard = self.inner.lock().unwrap();
+        let entry = guard.get_or_insert_mut(session_id.to_owned(), || CachedEntry {
+            tier2: None,
+            tier1: None,
+        });
+        entry.tier1 = Some(Tier1Entry {
+            boundary,
+            prefix,
+            message_count,
+        });
+    }
+
+    // --- Invalidation ---
+
+    /// Invalidate both tiers for a session. Called on edit/truncate where the
+    /// old boundaries are no longer valid.
     pub fn invalidate(&self, session_id: &str) {
         let mut guard = self.inner.lock().unwrap();
         guard.pop(session_id);
     }
 
-    /// Invalidate all sessions. Called on provider/model change where summaries
-    /// generated by the old model may not be coherent for the new one.
+    /// Invalidate all sessions. Called on provider/model change where cached
+    /// compaction state may no longer be coherent.
     pub fn invalidate_all(&self) {
         let mut guard = self.inner.lock().unwrap();
         guard.clear();

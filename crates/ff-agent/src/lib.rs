@@ -996,7 +996,13 @@ pub async fn run_turn(
     // previous iteration, keyed by the boundary index it covers. Reused on
     // subsequent iterations so the cold prefix bytes are stable (cache-friendly)
     // and only newly-cold messages are re-compacted.
-    let mut last_tier1: Option<(usize, Vec<Message>)> = None;
+    //
+    // Cross-turn seeding (#933 A.2 step 2): if a previous turn left a cached
+    // tier-1 prefix for this session, start from it so the very first iteration
+    // reuses the frozen prefix instead of recomputing from scratch.
+    // The tuple is (boundary, prefix, message_count_at_production).
+    let mut last_tier1: Option<(usize, Vec<Message>, u64)> =
+        tools.compaction_cache.and_then(|c| c.get_tier1(session_id));
 
     // F1b (#441) telemetry: the projected prefill estimate of each round-trip's
     // outgoing wire, plus how often each compaction tier engaged this turn. Folded
@@ -1111,9 +1117,13 @@ pub async fn run_turn(
             let new_cold_end = n.saturating_sub(KEEP_RECENT_VERBATIM);
 
             match last_tier1.as_ref() {
-                Some((boundary, cached_prefix)) if *boundary <= new_cold_end => {
+                Some((boundary, cached_prefix, cached_count))
+                    if *boundary <= new_cold_end && *cached_count <= message_count =>
+                {
                     // Reuse: the frozen prefix covers [0..boundary]; compress only
-                    // the newly-cold slice [boundary..new_cold_end].
+                    // the newly-cold slice [boundary..new_cold_end]. The cached_count
+                    // guard rejects stale entries from a transcript that shrank
+                    // (edit/delete) since the prefix was produced.
                     let fresh_cold = &history[*boundary..new_cold_end];
                     let fresh = compactor.compact_range_collect(fresh_cold);
                     for (mid, key, original) in &fresh.originals {
@@ -1124,23 +1134,33 @@ pub async fn run_turn(
                     out.extend(fresh.messages);
                     out.extend_from_slice(&history[new_cold_end..]);
                     // Update the frozen boundary to include the newly-compacted range.
-                    last_tier1 = Some((new_cold_end, out[..new_cold_end].to_vec()));
+                    last_tier1 = Some((new_cold_end, out[..new_cold_end].to_vec(), message_count));
                     out
                 }
                 _ => {
-                    // First compaction this turn (or boundary invalidated): full pass.
+                    // First compaction this turn (or boundary invalidated/stale): full pass.
                     let cold = compactor.compact_cold_collect(&history, KEEP_RECENT_VERBATIM);
                     for (mid, key, original) in &cold.originals {
                         store.put_compaction_original(session_id, mid, key, original);
                     }
                     // Freeze the compacted cold prefix for subsequent iterations.
-                    last_tier1 = Some((new_cold_end, cold.messages[..new_cold_end].to_vec()));
+                    last_tier1 = Some((
+                        new_cold_end,
+                        cold.messages[..new_cold_end].to_vec(),
+                        message_count,
+                    ));
                     cold.messages
                 }
             }
         } else {
             history.clone()
         };
+        // Write-through tier-1 frozen prefix to cross-turn cache (#933 A.2 step 2).
+        if let (Some(cache), Some((boundary, ref prefix, count))) =
+            (tools.compaction_cache, &last_tier1)
+        {
+            cache.put_tier1(session_id, *boundary, prefix.clone(), *count);
+        }
 
         // Tier-2 abstractive cold-tail summary (RFC 0016 M7.0): the fallback when
         // the mechanical, free Tier-1 pass above cannot relieve enough pressure.
