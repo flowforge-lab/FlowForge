@@ -34,11 +34,25 @@ tier1Fires?: number,
  */
 tier2Fires?: number, 
 /**
- * TTFT: milliseconds from the moment the host handed the request to
- * `run_turn` to the arrival of the first assistant token. Answers the
- * dominant question the #427 baseline could not: "how long until the
- * model starts talking?" — the sum of provider RTT + queue + prefill.
- * `None` when the turn produced no assistant message (e.g. an early
- * error or cancel before the first token streamed).
+ * TTFT (end-to-end): milliseconds from the moment the host handed the
+ * request to `run_turn` to the arrival of the first assistant token.
+ * Anchored at `turn_start`, so it *includes* any pre-first-token work the
+ * turn did before the model spoke — most notably a context-pressure memory
+ * flush (a full extra provider round-trip) and planning-step reasoning.
+ * Pair it with [`Self::prompt_latency_ms`] to separate prefill from that
+ * side work. `None` when the turn produced no assistant message (e.g. an
+ * early error or cancel before the first token streamed).
  */
-firstTokenMs?: number, };
+firstTokenMs?: number, 
+/**
+ * #960: pure provider prefill latency of round-trip 0, in milliseconds —
+ * measured inside `run_turn` from the instant the provider stream is
+ * returned to the first output-carrying chunk. Unlike
+ * [`Self::first_token_ms`], it excludes the pre-first-token memory flush and
+ * the `turn_start`→stream-start gap, so it isolates the cache-addressable
+ * prefill cost. `promptLatencyMs / firstTokenMs` is the "prefill share": a
+ * value near 100% means the wait was almost all prefill; a small value means
+ * it was dominated by flush/reasoning side work. `None` when the turn
+ * produced no token, or for emitters that do not compute it.
+ */
+promptLatencyMs?: number, };

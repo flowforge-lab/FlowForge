@@ -271,6 +271,13 @@ pub enum AgentEvent {
         /// that did not originate from `run_turn`.
         #[serde(skip_serializing_if = "Option::is_none")]
         prefill_estimates: Option<Vec<u32>>,
+        /// #960: pure provider prefill latency of round-trip 0 in ms -- from the
+        /// moment the stream was returned to the first output-carrying chunk.
+        /// Isolates prefill from the pre-first-token flush/reasoning that the
+        /// host-side `firstTokenMs` also absorbs. `None` when the turn produced no
+        /// token, or for events not from `run_turn`.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        prompt_latency_ms: Option<u32>,
         /// F1b (#441): how many iterations this turn engaged the Tier-1 extractive
         /// cold-prefix compaction pass (RFC 0016 M7.1b).
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -1009,6 +1016,13 @@ pub async fn run_turn(
     // into the `Done` event so the desktop's `turn:stats` can report them. Purely
     // observational -- never gates behavior.
     let mut prefill_estimates: Vec<u32> = Vec::new();
+    // #960: pure provider prefill latency of round-trip 0 -- wall-clock from the
+    // moment the provider's stream is returned to the first chunk that yields any
+    // delta (reasoning or content). Isolated from `firstTokenMs` (host-side,
+    // anchored at `turn_start`), which also absorbs the pre-first-token
+    // context-pressure memory flush and planning-step reasoning. Set once, on the
+    // first iteration only; `None` if the turn produced no token before ending.
+    let mut prompt_latency_ms: Option<u32> = None;
     let mut tier1_fires: u32 = 0;
     let mut tier2_fires: u32 = 0;
     // Prefix cache observability (#766): accumulate provider-reported cache
@@ -1472,6 +1486,13 @@ pub async fn run_turn(
                 }
             };
 
+            // #960: start the round-0 prompt-latency clock the instant the provider
+            // stream is in hand (prefill begins on the wire), stopping it at the first
+            // delta below. Only round-trip 0 (`iter == 0`) is the prompt latency; later
+            // round-trips are the tool loop, already visible via `iter_ms`.
+            let prompt_clock =
+                (iter == 0 && prompt_latency_ms.is_none()).then(std::time::Instant::now);
+
             let mut stream_err: Option<LlmError> = None;
             while let Some(item) = stream.next().await {
                 if cancel.is_cancelled() {
@@ -1484,6 +1505,21 @@ pub async fn run_turn(
                         // provider's trailing terminal frame -- must not silently reset
                         // it and re-mislabel the cut-off tool call as invalid JSON (#528).
                         output_truncated |= chunk.truncated;
+                        // #960: stop the round-0 prompt clock at the first chunk that
+                        // actually carries output (content, reasoning, or a tool-call
+                        // fragment) -- a usage-only/terminal frame with no delta does not
+                        // count as the first token. Set at most once.
+                        if let Some(clock) = prompt_clock {
+                            if prompt_latency_ms.is_none()
+                                && (!chunk.delta.is_empty()
+                                    || !chunk.reasoning_delta.is_empty()
+                                    || !chunk.tool_calls.is_empty())
+                            {
+                                prompt_latency_ms = Some(
+                                    u32::try_from(clock.elapsed().as_millis()).unwrap_or(u32::MAX),
+                                );
+                            }
+                        }
                         // Prefix cache observability (#766): the final usage chunk
                         // carries the totals; earlier chunks report 0.
                         cache_hit_tokens += chunk.cache_hit_tokens;
@@ -1655,6 +1691,7 @@ pub async fn run_turn(
                 turns: Some(turn_count),
                 token_count,
                 prefill_estimates: Some(prefill_estimates.clone()),
+                prompt_latency_ms,
                 tier1_fires: Some(tier1_fires),
                 tier2_fires: Some(tier2_fires),
                 cache_hit_tokens: Some(cache_hit_tokens),
@@ -2087,6 +2124,7 @@ pub async fn run_turn(
         turns: Some(turn_count),
         token_count,
         prefill_estimates: Some(prefill_estimates),
+        prompt_latency_ms,
         tier1_fires: Some(tier1_fires),
         tier2_fires: Some(tier2_fires),
         cache_hit_tokens: Some(cache_hit_tokens),

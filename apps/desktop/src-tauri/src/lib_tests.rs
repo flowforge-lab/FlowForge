@@ -611,6 +611,26 @@ fn turn_metrics_empty_turn_is_zeroed() {
     assert!(m.prefill_estimates.is_empty());
     assert_eq!(m.tier1_fires, 0);
     assert_eq!(m.tier2_fires, 0);
+    // #960: no Done telemetry -> no prompt latency.
+    assert_eq!(m.prompt_latency_ms, None);
+}
+
+// #960: `note_done` folds the agent-side round-0 prompt latency onto the metrics
+// so the host can emit it as `promptLatencyMs`. A plain assign (fires once/turn).
+#[test]
+fn turn_metrics_note_done_captures_prompt_latency() {
+    let mut m = TurnMetrics::default();
+    m.note_done(&[123], Some(42), 1, 0);
+    assert_eq!(
+        m.prompt_latency_ms,
+        Some(42),
+        "prompt latency stored verbatim"
+    );
+    assert_eq!(m.prefill_estimates, vec![123]);
+    assert_eq!(m.tier1_fires, 1);
+    // A None from an emitter that didn't compute it stays None.
+    m.note_done(&[], None, 0, 0);
+    assert_eq!(m.prompt_latency_ms, None);
 }
 
 // TTFT (#427): the recorded first-token latency is the delta from `turn_start` to
@@ -650,7 +670,7 @@ fn turn_metrics_note_done_folds_f1b_telemetry() {
     // #441: the per-round-trip prefill estimate and the two compaction-fire
     // counts from the turn's Done event are captured verbatim for `turn:stats`.
     let mut m = TurnMetrics::default();
-    m.note_done(&[120, 340, 75], 2, 1);
+    m.note_done(&[120, 340, 75], None, 2, 1);
     assert_eq!(m.prefill_estimates, vec![120, 340, 75]);
     assert_eq!(m.tier1_fires, 2);
     assert_eq!(m.tier2_fires, 1);
@@ -903,6 +923,7 @@ async fn emit_agent_event_maps_done_to_turn_done_event() {
         turns: Some(1),
         token_count: Some(42),
         prefill_estimates: None,
+        prompt_latency_ms: None,
         tier1_fires: None,
         tier2_fires: None,
         cache_hit_tokens: Some(10),
