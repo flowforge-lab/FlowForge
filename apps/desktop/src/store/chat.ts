@@ -117,6 +117,15 @@ interface ChatState {
    *  Populated from TurnStatsEvent.promptLatencyMs; paired with `ttftBySession` to
    *  render the popover's `prompt Xs (Y%) · other Zs` prefill-share line. */
   promptLatencyBySession: Record<string, number>;
+  /** sessionId -> last turn's pre-main-call memory-flush wall-clock in ms (#971).
+   *  Populated from TurnStatsEvent.flushMs; with `tier2MsBySession` it drives the
+   *  popover's per-phase `main · flush · summarize` attribution row, splitting the
+   *  "other" slice of TTFT. Undefined when no flush ran that turn. */
+  flushMsBySession: Record<string, number>;
+  /** sessionId -> last turn's pre-main-call Tier-2 abstractive-summarize
+   *  wall-clock in ms (#971). Populated from TurnStatsEvent.tier2Ms; feeds the same
+   *  per-phase attribution row. Undefined when no summarize ran that turn. */
+  tier2MsBySession: Record<string, number>;
   /** sessionId -> the last turn ended without a usable answer the user can resume
    *  with one click — the agent loop hit the tool-call cap / stalled (`[stopped: …]`),
    *  or the user pressed Stop (a bare `[stopped]`, #636), so a one-click "Continue"
@@ -375,6 +384,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
   sessionTotalsBySession: {},
   ttftBySession: {},
   promptLatencyBySession: {},
+  flushMsBySession: {},
+  tier2MsBySession: {},
   resumableBySession: {},
   recentlyFinishedBySession: {},
   sessionApprovedBySession: {},
@@ -1131,6 +1142,27 @@ export const useChatStore = create<ChatState>((set, get) => ({
         // New TTFT without prompt latency — drop a stale share from a prior turn.
         const { [e.sessionId]: _, ...rest } = s.promptLatencyBySession;
         next.promptLatencyBySession = rest;
+      }
+      // #971: per-phase compaction wall-clock. Store when the turn reported it;
+      // otherwise, on a fresh TTFT, drop a stale value from a prior turn so the
+      // attribution row never shows another turn's flush/summarize.
+      if (e.flushMs != null) {
+        next.flushMsBySession = {
+          ...s.flushMsBySession,
+          [e.sessionId]: e.flushMs,
+        };
+      } else if (e.firstTokenMs != null) {
+        const { [e.sessionId]: _, ...rest } = s.flushMsBySession;
+        next.flushMsBySession = rest;
+      }
+      if (e.tier2Ms != null) {
+        next.tier2MsBySession = {
+          ...s.tier2MsBySession,
+          [e.sessionId]: e.tier2Ms,
+        };
+      } else if (e.firstTokenMs != null) {
+        const { [e.sessionId]: _, ...rest } = s.tier2MsBySession;
+        next.tier2MsBySession = rest;
       }
       return next;
     });
