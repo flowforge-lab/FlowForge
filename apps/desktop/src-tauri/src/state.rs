@@ -1720,6 +1720,8 @@ impl AppState {
                 root: &session_root,
                 session_id,
                 model,
+                // #973: mirror run_turn — over budget, take the degraded flush path.
+                degraded: pressure.fraction() > 1.0,
                 cancel,
             })
             .await;

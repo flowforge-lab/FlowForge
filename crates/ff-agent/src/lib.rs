@@ -1117,6 +1117,10 @@ pub async fn run_turn(
                     root: tools.root,
                     session_id,
                     model: flush_model,
+                    // #973: over budget (>100%), take the cheaper degraded flush
+                    // path (single round-trip + bounded input) — the dominant
+                    // over-budget TTFT cost once tier-2 is marginalized.
+                    degraded: pressure.fraction() > 1.0,
                     cancel: cancel.clone(),
                 })
                 .await

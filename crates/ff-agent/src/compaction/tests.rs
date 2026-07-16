@@ -171,6 +171,45 @@ impl Provider for NoReplyProvider {
     }
 }
 
+/// Emits a `memory_write` on *every* iteration and records the total size of the
+/// transcript messages it received each call (user/assistant/tool roles, excluding
+/// the flush's own system/instruction framing). Lets a test assert both the
+/// round-trip count (#973 Lever 1) and the bounded input (#973 Lever 2).
+struct AlwaysWriteRecording {
+    calls: AtomicUsize,
+    /// Max transcript-content chars seen across calls (the flush input size).
+    max_input_chars: std::sync::Mutex<usize>,
+}
+#[async_trait]
+impl Provider for AlwaysWriteRecording {
+    async fn chat_stream(&self, req: ChatRequest) -> Result<ChunkStream, LlmError> {
+        let input_chars: usize = req
+            .messages
+            .iter()
+            .filter(|m| m.role == "user" || m.role == "assistant" || m.role == "tool")
+            .map(|m| m.content.as_deref().map_or(0, str::len))
+            .sum();
+        {
+            let mut mx = self.max_input_chars.lock().unwrap();
+            *mx = (*mx).max(input_chars);
+        }
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        // Always a fresh write, so a non-degraded flush runs the full loop.
+        let n = self.calls.load(Ordering::SeqCst);
+        Ok(futures_util::stream::iter(vec![Ok(Chunk {
+            tool_calls: vec![ToolCallDelta {
+                index: 0,
+                id: Some(format!("w{n}")),
+                name: Some("memory_write".into()),
+                arguments: format!(r#"{{"text":"fact {n}"}}"#),
+            }],
+            done: true,
+            ..Chunk::default()
+        })])
+        .boxed())
+    }
+}
+
 fn store_with_history() -> (SessionStore, String) {
     let store = SessionStore::new();
     let s = store.create_session(None);
@@ -197,6 +236,7 @@ async fn flush_writes_durable_fact_via_memory_write_only() {
             root: dir.path(),
             session_id: &sid,
             model: "mock",
+            degraded: false,
             cancel: CancelToken::new(),
         })
         .await
@@ -227,6 +267,7 @@ async fn flush_no_reply_writes_nothing() {
             root: dir.path(),
             session_id: &sid,
             model: "mock",
+            degraded: false,
             cancel: CancelToken::new(),
         })
         .await
@@ -253,6 +294,7 @@ async fn flush_on_empty_session_is_noreply() {
             root: dir.path(),
             session_id: &s.id,
             model: "mock",
+            degraded: false,
             cancel: CancelToken::new(),
         })
         .await
@@ -327,6 +369,7 @@ async fn e2e_flush_writes_durable_fact_to_real_daily_log() {
             root: dir.path(),
             session_id: &sid,
             model: "mock",
+            degraded: false,
             cancel: CancelToken::new(),
         })
         .await
@@ -379,6 +422,7 @@ async fn e2e_flush_no_reply_leaves_no_file_on_disk() {
             root: dir.path(),
             session_id: &sid,
             model: "mock",
+            degraded: false,
             cancel: CancelToken::new(),
         })
         .await
@@ -467,6 +511,7 @@ async fn e2e_ledger_gate_flushes_once_per_cycle() {
             root: dir.path(),
             session_id: &sid,
             model,
+            degraded: false,
             cancel: cancel.clone(),
         })
         .await
@@ -530,5 +575,210 @@ async fn e2e_ledger_gate_flushes_once_per_cycle() {
             REFLUSH_INTERVAL
         ),
         "a full interval of growth must re-arm the gate for the next cycle"
+    );
+}
+
+// ----- #973: over-budget degraded flush -----
+
+/// Build a session whose transcript is large enough that Lever 2's bounded input
+/// (24K proxy tokens ≈ 96K chars) can be observed to bite.
+fn store_with_large_history() -> (SessionStore, String) {
+    let store = SessionStore::new();
+    let s = store.create_session(None);
+    // ~40 messages of ~4K chars each ≈ 160K chars ≈ 40K proxy tokens > the 24K cap.
+    let blob = "x ".repeat(2000);
+    for i in 0..40 {
+        let role = if i % 2 == 0 {
+            Role::User
+        } else {
+            Role::Assistant
+        };
+        store.add_message(&s.id, role, format!("msg {i}: {blob}"));
+    }
+    (store, s.id)
+}
+
+#[tokio::test]
+async fn degraded_flush_caps_iterations_to_one() {
+    // A provider that writes on *every* iteration would run the full loop when not
+    // degraded; degraded must stop after a single round-trip.
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let registry = registry_with(seen.clone());
+    let (store, sid) = store_with_history();
+    let provider = AlwaysWriteRecording {
+        calls: AtomicUsize::new(0),
+        max_input_chars: std::sync::Mutex::new(0),
+    };
+    let dir = tempfile::tempdir().unwrap();
+
+    MemoryFlush
+        .compact(CompactionContext {
+            provider: &provider,
+            store: &store,
+            registry: &registry,
+            root: dir.path(),
+            session_id: &sid,
+            model: "mock",
+            degraded: true,
+            cancel: CancelToken::new(),
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        provider.calls.load(Ordering::SeqCst),
+        1,
+        "degraded flush must make exactly one round-trip"
+    );
+}
+
+#[tokio::test]
+async fn under_budget_flush_allows_multiple_iterations() {
+    // Same always-writing provider, not degraded: the loop runs more than once
+    // (up to MAX_FLUSH_ITERATIONS), proving the cap is what limits degraded mode.
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let registry = registry_with(seen.clone());
+    let (store, sid) = store_with_history();
+    let provider = AlwaysWriteRecording {
+        calls: AtomicUsize::new(0),
+        max_input_chars: std::sync::Mutex::new(0),
+    };
+    let dir = tempfile::tempdir().unwrap();
+
+    MemoryFlush
+        .compact(CompactionContext {
+            provider: &provider,
+            store: &store,
+            registry: &registry,
+            root: dir.path(),
+            session_id: &sid,
+            model: "mock",
+            degraded: false,
+            cancel: CancelToken::new(),
+        })
+        .await
+        .unwrap();
+
+    assert!(
+        provider.calls.load(Ordering::SeqCst) > 1,
+        "non-degraded flush runs the multi-step loop, got {}",
+        provider.calls.load(Ordering::SeqCst)
+    );
+}
+
+#[tokio::test]
+async fn degraded_flush_still_writes() {
+    // The cheaper path must still persist durable facts.
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let registry = registry_with(seen.clone());
+    let (store, sid) = store_with_history();
+    let provider = AlwaysWriteRecording {
+        calls: AtomicUsize::new(0),
+        max_input_chars: std::sync::Mutex::new(0),
+    };
+    let dir = tempfile::tempdir().unwrap();
+
+    let outcome = MemoryFlush
+        .compact(CompactionContext {
+            provider: &provider,
+            store: &store,
+            registry: &registry,
+            root: dir.path(),
+            session_id: &sid,
+            model: "mock",
+            degraded: true,
+            cancel: CancelToken::new(),
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(outcome, CompactionOutcome::Wrote { writes: 1 });
+    assert_eq!(
+        seen.lock().unwrap().len(),
+        1,
+        "the single write is persisted"
+    );
+}
+
+#[tokio::test]
+async fn degraded_flush_bounds_input_size() {
+    // Lever 2: the flush input is bounded to the recent tail (~24K proxy tokens ≈
+    // 96K chars) rather than the whole ~160K-char transcript.
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let registry = registry_with(seen.clone());
+    let (store, sid) = store_with_large_history();
+    let provider = AlwaysWriteRecording {
+        calls: AtomicUsize::new(0),
+        max_input_chars: std::sync::Mutex::new(0),
+    };
+    let dir = tempfile::tempdir().unwrap();
+
+    MemoryFlush
+        .compact(CompactionContext {
+            provider: &provider,
+            store: &store,
+            registry: &registry,
+            root: dir.path(),
+            session_id: &sid,
+            model: "mock",
+            degraded: true,
+            cancel: CancelToken::new(),
+        })
+        .await
+        .unwrap();
+
+    let full: usize = store
+        .get_messages(&sid)
+        .iter()
+        .map(|m| m.content.len())
+        .sum();
+    let seen_input = *provider.max_input_chars.lock().unwrap();
+    // Bounded well below the full transcript, and within the ~96K-char cap (+ one
+    // message of slack, since the newest message is always kept).
+    assert!(
+        seen_input < full,
+        "degraded input ({seen_input}) must be smaller than the full transcript ({full})"
+    );
+    assert!(
+        seen_input <= 96_000 + 8_000,
+        "degraded input ({seen_input}) must respect the ~24K-proxy-token (96K-char) cap"
+    );
+}
+
+#[tokio::test]
+async fn under_budget_flush_sends_full_history() {
+    // Not degraded: the flush still sees the whole transcript (no input bound).
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let registry = registry_with(seen.clone());
+    let (store, sid) = store_with_large_history();
+    let provider = AlwaysWriteRecording {
+        calls: AtomicUsize::new(0),
+        max_input_chars: std::sync::Mutex::new(0),
+    };
+    let dir = tempfile::tempdir().unwrap();
+
+    MemoryFlush
+        .compact(CompactionContext {
+            provider: &provider,
+            store: &store,
+            registry: &registry,
+            root: dir.path(),
+            session_id: &sid,
+            model: "mock",
+            degraded: false,
+            cancel: CancelToken::new(),
+        })
+        .await
+        .unwrap();
+
+    let full: usize = store
+        .get_messages(&sid)
+        .iter()
+        .map(|m| m.content.len())
+        .sum();
+    let seen_input = *provider.max_input_chars.lock().unwrap();
+    assert!(
+        seen_input >= full,
+        "non-degraded flush must send the full transcript: saw {seen_input}, full {full}"
     );
 }

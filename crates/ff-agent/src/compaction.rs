@@ -24,6 +24,7 @@ use ff_session::SessionStore;
 use ff_tools::{ToolOutcome, ToolRegistry};
 use futures_util::StreamExt;
 
+use crate::compaction_extractive::proxy_tokens;
 use crate::{to_chat, AgentError, CancelToken};
 
 /// Default per-session context budget, in proxy tokens. Conservative so the flush
@@ -37,6 +38,19 @@ pub const DEFAULT_FLUSH_AT_FRACTION: f64 = 0.75;
 /// A flush makes at most this many provider round-trips (e.g. search-to-dedupe, then
 /// write). Bounds the silent turn so a misbehaving model cannot spin.
 const MAX_FLUSH_ITERATIONS: usize = 3;
+
+/// Over-budget degraded flush (#973): a single round-trip. Over budget the flush is
+/// the dominant TTFT cost (a 45s spike observed at 168%), and the multi-step
+/// search-dedupe-write loop is a luxury the latency budget can't afford there. One
+/// shot to emit `memory_write`s still persists durable facts.
+const DEGRADED_FLUSH_ITERATIONS: usize = 1;
+
+/// Over-budget degraded flush input cap in proxy tokens (#973): feed the flush only
+/// the most recent slice of the transcript rather than the whole (huge) history each
+/// iteration. The freshest turns carry what's not-yet-persisted; over budget the cold
+/// region has already been tier-1/tier-2 compacted anyway, so bounding the tail loses
+/// little that wasn't already lossy. Mirrors #972's proxy-token cap discipline.
+const DEGRADED_FLUSH_INPUT_TOKENS: usize = 24_000;
 
 /// How close a session's transcript is to its context budget.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -118,6 +132,12 @@ pub struct CompactionContext<'a> {
     pub root: &'a std::path::Path,
     pub session_id: &'a str,
     pub model: &'a str,
+    /// Over-budget degraded mode (#973): when the transcript is past 100% of the
+    /// context budget, the flush takes a cheaper path — a single round-trip and a
+    /// bounded input tail — instead of up to `MAX_FLUSH_ITERATIONS` round-trips
+    /// each carrying the whole (huge) transcript. `flushMs` (#971) was the sole
+    /// remaining over-budget TTFT spike once tier-2 was marginalized; this caps it.
+    pub degraded: bool,
     pub cancel: CancelToken,
 }
 
@@ -178,10 +198,29 @@ impl CompactionStrategy for MemoryFlush {
             attachments: Vec::new(),
             reasoning: None,
         }];
-        messages.extend(to_chat(&history));
+        // #973: over budget, feed the flush only the most recent slice of the
+        // transcript (Lever 2). The freshest turns carry the not-yet-persisted
+        // material; the cold region has already been tier-1/tier-2 compacted, so a
+        // bounded tail loses little that wasn't already lossy — and it turns each
+        // iteration's cold prefill from ~whole-transcript to ~cap. Under budget the
+        // full history is used, unchanged.
+        let flush_input: &[Message] = if ctx.degraded {
+            recent_tail(&history, DEGRADED_FLUSH_INPUT_TOKENS)
+        } else {
+            &history
+        };
+        messages.extend(to_chat(flush_input));
+
+        // #973: over budget, a single round-trip (Lever 1) instead of the full
+        // search-dedupe-write loop — the dominant over-budget TTFT cost.
+        let max_iters = if ctx.degraded {
+            DEGRADED_FLUSH_ITERATIONS
+        } else {
+            MAX_FLUSH_ITERATIONS
+        };
 
         let mut writes = 0usize;
-        for _ in 0..MAX_FLUSH_ITERATIONS {
+        for _ in 0..max_iters {
             if ctx.cancel.is_cancelled() {
                 break;
             }
@@ -312,6 +351,28 @@ fn role_str(role: Role) -> &'static str {
         Role::Assistant => "assistant",
         Role::System => "system",
     }
+}
+
+/// The most recent slice of `messages` whose proxy-token size stays within
+/// `max_tokens`, walking backward from the newest (#973 Lever 2). Always returns at
+/// least the last message (given a non-empty input) so the flush never sees an empty
+/// transcript. `max_tokens == 0` returns the whole slice (no bound).
+fn recent_tail(messages: &[Message], max_tokens: usize) -> &[Message] {
+    if max_tokens == 0 || messages.is_empty() {
+        return messages;
+    }
+    let mut acc = 0usize;
+    let mut start = messages.len();
+    for (i, m) in messages.iter().enumerate().rev() {
+        let t = proxy_tokens(&m.content);
+        // Stop before exceeding the cap, but always keep the newest message.
+        if start < messages.len() && acc + t > max_tokens {
+            break;
+        }
+        acc += t;
+        start = i;
+    }
+    &messages[start..]
 }
 
 /// Decide whether a session is due for a pre-compaction flush. Pure so the trigger
