@@ -223,3 +223,116 @@ fn render_cold_skips_empty_and_labels_roles() {
     assert!(rendered.contains("Tool: tool out"));
     assert!(!rendered.contains("Assistant:"), "empty content is skipped");
 }
+
+// ----- #972: cap the summarizer input -----
+
+fn enabled_with_cap(cap: usize) -> AbstractiveConfig {
+    AbstractiveConfig {
+        enabled: true,
+        max_summary_input_tokens: cap,
+        ..AbstractiveConfig::default()
+    }
+}
+
+#[test]
+fn capped_cold_end_unbounded_returns_full_cold() {
+    let msgs = long_transcript(10, 2);
+    // cap 0 = legacy: the whole cold prefix (cold_end = 10).
+    assert_eq!(capped_cold_end(&msgs, 10, 0), 10);
+}
+
+#[test]
+fn capped_cold_end_bounds_to_oldest_slice() {
+    let msgs = long_transcript(10, 2);
+    // Each cold message is ~30 proxy tokens; a 60-token cap admits ~2 of them.
+    let end = capped_cold_end(&msgs, 10, 60);
+    assert!((1..10).contains(&end), "cap must bite: got {end}");
+    // The admitted slice must not exceed the cap (allowing the first, always-kept one).
+    let admitted: usize = msgs[..end].iter().map(|m| proxy_tokens(&m.content)).sum();
+    let one_more: usize = proxy_tokens(&msgs[end].content);
+    assert!(
+        admitted <= 60 || end == 1,
+        "admitted {admitted} exceeds cap without being the single-message floor"
+    );
+    assert!(
+        admitted + one_more > 60,
+        "should have stopped earlier if room remained"
+    );
+}
+
+#[test]
+fn capped_cold_end_always_makes_progress_on_oversized_message() {
+    // A single giant oldest message far exceeding the cap must still be admitted
+    // (end >= 1), or the summarizer would stall forever.
+    let big = "x".repeat(400_000); // ~100K proxy tokens
+    let msgs = vec![
+        msg("c0", Role::Tool, &big),
+        msg("c1", Role::User, "small"),
+        msg("r0", Role::User, "recent"),
+    ];
+    assert_eq!(
+        capped_cold_end(&msgs, 2, 24_000),
+        1,
+        "oversized oldest msg still admitted"
+    );
+}
+
+#[tokio::test]
+async fn cap_summarizes_only_oldest_slice_and_keeps_remainder_verbatim() {
+    let s = AbstractiveSummarizer::new(enabled_with_cap(60));
+    let msgs = long_transcript(10, 2); // 10 cold + 2 recent
+    let out = s
+        .summarize_cold(
+            &CannedSummary::new("CONDENSED"),
+            "m",
+            &msgs,
+            2,
+            &CancelToken::new(),
+        )
+        .await
+        .unwrap()
+        .expect("summary produced");
+
+    // Boundary is capped well below cold_end (10).
+    assert!(
+        (1..10).contains(&out.boundary),
+        "boundary capped: {}",
+        out.boundary
+    );
+    // Output = [summary] + everything from boundary onward, verbatim.
+    assert_eq!(out.messages.len(), 1 + (msgs.len() - out.boundary));
+    assert!(out.messages[0].content.contains("CONDENSED"));
+    assert!(out.messages[0].content.contains(COMPACTION_MARKER_PREFIX));
+    for (k, m) in msgs[out.boundary..].iter().enumerate() {
+        assert_eq!(
+            out.messages[1 + k].content,
+            m.content,
+            "remainder stays verbatim"
+        );
+    }
+    // Reversibility: the persisted original is exactly the capped slice rendered.
+    let (mid, _key, original) = out.original.expect("original persisted");
+    assert_eq!(
+        mid,
+        msgs[out.boundary - 1].id,
+        "keyed on last summarized msg id"
+    );
+    assert_eq!(original, render_cold(&msgs[..out.boundary]));
+    // Label reflects the actual (capped) count.
+    assert!(out.messages[0]
+        .content
+        .contains(&format!("Summary of {} earlier", out.boundary)));
+}
+
+#[tokio::test]
+async fn uncapped_summarizes_whole_cold_prefix() {
+    // cap 0 reproduces legacy behavior: boundary == cold_end.
+    let s = AbstractiveSummarizer::new(enabled_with_cap(0));
+    let msgs = long_transcript(10, 2);
+    let out = s
+        .summarize_cold(&CannedSummary::new("C"), "m", &msgs, 2, &CancelToken::new())
+        .await
+        .unwrap()
+        .expect("summary produced");
+    assert_eq!(out.boundary, 10, "uncapped covers the whole cold prefix");
+}
