@@ -1210,9 +1210,15 @@ mod tests {
         // it — no timing assumptions. The process polls for a gate file
         // before echoing, guaranteeing we can subscribe first (#958).
         let gate = dir.path().join("gate");
+        #[cfg(not(windows))]
         let cmd = format!(
             "while [ ! -f '{}' ]; do sleep 0.01; done; echo hello-stream",
             gate.display()
+        );
+        #[cfg(windows)]
+        let cmd = format!(
+            "while (-not (Test-Path '{}')) {{ Start-Sleep -Milliseconds 10 }}; Write-Output 'hello-stream'",
+            gate.display().to_string().replace('\\', "/")
         );
         let id = sup.start(&cmd, dir.path(), "s1").unwrap();
         // Subscribe while process is blocked on the gate.
