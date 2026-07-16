@@ -39,7 +39,7 @@ pub use compaction_abstractive::{
 pub use compaction_cache::CompactionCache;
 pub use compaction_extractive::{
     classify, proxy_tokens, ColdCompaction, CompactionSavings, CompressOutcome, ContentKind,
-    ExtractiveCompactor, ReversibleCache, COMPACTION_MARKER_PREFIX,
+    ExtractiveCompactor, GradedBands, ReversibleCache, COMPACTION_MARKER_PREFIX,
 };
 pub use goal_loop::{drive_goal, GateDecision, GoalIteration, IterationOutcome, LoopStop};
 pub use system_prompt::{
@@ -1146,7 +1146,7 @@ pub async fn run_turn(
         // prefix bytes stable for the provider's KV cache.
         let wire = if pressure.is_over(EXTRACTIVE_COMPACT_AT_FRACTION) {
             tier1_fires += 1;
-            let compactor = ExtractiveCompactor::default();
+            let graded = GradedBands::graded_v1();
             let n = history.len();
             let new_cold_end = n.saturating_sub(KEEP_RECENT_VERBATIM);
 
@@ -1157,9 +1157,12 @@ pub async fn run_turn(
                     // Reuse: the frozen prefix covers [0..boundary]; compress only
                     // the newly-cold slice [boundary..new_cold_end]. The cached_count
                     // guard rejects stale entries from a transcript that shrank
-                    // (edit/delete) since the prefix was produced.
+                    // (edit/delete) since the prefix was produced. Grading is by
+                    // absolute index, so the slice is graded as occupying
+                    // `boundary..` — identical to what a full pass would choose for
+                    // those same indices, preserving the frozen-boundary invariant.
                     let fresh_cold = &history[*boundary..new_cold_end];
-                    let fresh = compactor.compact_range_collect(fresh_cold);
+                    let fresh = graded.compact_graded_range(fresh_cold, *boundary, new_cold_end);
                     for (mid, key, original) in &fresh.originals {
                         store.put_compaction_original(session_id, mid, key, original);
                     }
@@ -1173,7 +1176,7 @@ pub async fn run_turn(
                 }
                 _ => {
                     // First compaction this turn (or boundary invalidated/stale): full pass.
-                    let cold = compactor.compact_cold_collect(&history, KEEP_RECENT_VERBATIM);
+                    let cold = graded.compact_graded_collect(&history, KEEP_RECENT_VERBATIM);
                     for (mid, key, original) in &cold.originals {
                         store.put_compaction_original(session_id, mid, key, original);
                     }
