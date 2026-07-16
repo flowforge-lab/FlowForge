@@ -15,13 +15,13 @@ use ff_agent::{
     IterationOutcome, ToolContext,
 };
 use ff_core::events::{
-    ApprovalSafety, ConnectionFailedEvent, EvolveCostEstimate, IntentionSignal,
-    McpStatusChangedEvent, MemoryFlushedEvent, OutputStreamKind, PhenotypeMcpUnavailableEvent,
-    ProcessExitedEvent, ProcessOutputEvent, ReasoningEvent, ReconnectingEvent,
-    SessionTitleUpdatedEvent, SkillActivated, SkillCompleted, SkillEvolveApprovalRequestEvent,
-    SkillInstallApprovalRequestEvent, SkillsChangedEvent, TokenEvent, ToolApprovalRequestEvent,
-    ToolAskRequestEvent, ToolCallEvent, ToolOutputChunkEvent, ToolResultEvent, TurnDoneEvent,
-    TurnErrorEvent, TurnStatsEvent, UpdateProgressEvent,
+    ApprovalSafety, ConnectionFailedEvent, EgressMismatchEvent, EvolveCostEstimate,
+    IntentionSignal, McpStatusChangedEvent, MemoryFlushedEvent, OutputStreamKind,
+    PhenotypeMcpUnavailableEvent, ProcessExitedEvent, ProcessOutputEvent, ReasoningEvent,
+    ReconnectingEvent, SessionTitleUpdatedEvent, SkillActivated, SkillCompleted,
+    SkillEvolveApprovalRequestEvent, SkillInstallApprovalRequestEvent, SkillsChangedEvent,
+    TokenEvent, ToolApprovalRequestEvent, ToolAskRequestEvent, ToolCallEvent, ToolOutputChunkEvent,
+    ToolResultEvent, TurnDoneEvent, TurnErrorEvent, TurnStatsEvent, UpdateProgressEvent,
 };
 use ff_core::{
     Attachment, BedrockAuth, CreateScheduledTaskInput, DirEntry, FileContent, Format, Goal,
@@ -3426,6 +3426,28 @@ fn emit_agent_event<R: tauri::Runtime>(
         }
         AgentEvent::AttachmentsDropped { .. } => {
             // User-facing notice deferred to PR-2 / #342 (transcript render).
+        }
+        AgentEvent::EgressMismatch {
+            message_id,
+            kind,
+            model,
+        } => {
+            // LocalOnly-but-cloud-inference notice (#888). The agent surfaces a
+            // typed event so the frontend can render a privacy badge / banner
+            // and so the host can record telemetry. No in-process consumer yet;
+            // the FE is the primary surface. Distinct from
+            // [`AttachmentsDropped`] because the gap here is policy-vs-reality
+            // (the user asked for local-only; the connection is hosted), not a
+            // capability strip.
+            let _ = app.emit(
+                "egress:mismatch",
+                EgressMismatchEvent {
+                    session_id: session_id.to_string(),
+                    message_id,
+                    kind,
+                    model,
+                },
+            );
         }
         AgentEvent::Error { message } => {
             let _ = app.emit(

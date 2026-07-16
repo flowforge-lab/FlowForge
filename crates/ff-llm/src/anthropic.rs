@@ -7,6 +7,7 @@ use crate::{
     ChatMessage, ChatRequest, Chunk, ChunkStream, LlmError, Provider, ReasoningEffort,
     ToolCallDelta,
 };
+use ff_core::ProviderKind;
 
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
@@ -32,6 +33,14 @@ pub struct AnthropicProvider {
     /// requests thinking; defaults to [`ReasoningEffort::Medium`].
     reasoning_effort: ReasoningEffort,
     client: reqwest::Client,
+    /// Which kind of backend this provider talks to (#888). The native Anthropic
+    /// adapter always talks to `api.anthropic.com`, so this is fixed to
+    /// `OpenAi` today only as a safe placeholder -- the host never sets it via
+    /// `with_kind` because no `ProviderKind` variant currently represents
+    /// "direct Anthropic Messages API". When the agent loop reads `kind()` and
+    /// sees a hosted non-local kind, it fires the egress-mismatch warning
+    /// correctly under `egress = local-only`.
+    kind: ProviderKind,
 }
 
 impl AnthropicProvider {
@@ -43,6 +52,12 @@ impl AnthropicProvider {
             max_tokens: DEFAULT_MAX_TOKENS,
             reasoning_effort: ReasoningEffort::default(),
             client: crate::build_streaming_http_client(),
+            // No dedicated Anthropic `ProviderKind` variant yet; OpenAi is a
+            // fail-loud "hosted" sentinel so the egress-mismatch warning fires
+            // correctly under `egress = local-only` (#888). A future Anthropic
+            // variant would override this with `OpenAi` here too, since both
+            // describe a non-local hosted API.
+            kind: ProviderKind::OpenAi,
         }
     }
 
@@ -645,6 +660,10 @@ impl Provider for AnthropicProvider {
             Some(Err(e)) => Err(e),
             _ => Ok(()),
         }
+    }
+
+    fn kind(&self) -> ProviderKind {
+        self.kind
     }
 }
 

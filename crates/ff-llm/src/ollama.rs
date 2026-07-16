@@ -4,6 +4,7 @@ use futures_util::StreamExt;
 use serde::Deserialize;
 
 use crate::{ChatMessage, ChatRequest, Chunk, ChunkStream, LlmError, Provider, ToolCallDelta};
+use ff_core::ProviderKind;
 
 /// Talks to a local Ollama server (`http://localhost:11434`) over its native
 /// NDJSON `/api/chat` stream.
@@ -59,6 +60,12 @@ pub struct OllamaProvider {
     /// `None` omits the field (Ollama's 5-minute default); see
     /// [`default_keep_alive`].
     keep_alive: Option<String>,
+    /// Which kind of backend this provider talks to (#888). Always
+    /// [`ProviderKind::Ollama`] for the native adapter; exposed via the
+    /// `with_kind` builder so the host doesn't have to special-case it. The
+    /// agent loop reads this to gate the `egress=local-only`-but-cloud-model
+    /// warning -- Ollama is local, so the warning stays silent.
+    kind: ProviderKind,
 }
 
 impl OllamaProvider {
@@ -71,7 +78,17 @@ impl OllamaProvider {
             num_ctx: None,
             budget_window: None,
             keep_alive: default_keep_alive(),
+            kind: ProviderKind::Ollama,
         }
+    }
+
+    /// Override the backend kind (#888). The native Ollama adapter always
+    /// talks to Ollama, but the builder stays symmetric with the other
+    /// providers' `with_kind` so the host's `build_provider` flow needs no
+    /// special branch for local kinds.
+    pub fn with_kind(mut self, kind: ProviderKind) -> Self {
+        self.kind = kind;
+        self
     }
 
     /// Declare whether the target model can accept image attachments.
@@ -622,6 +639,10 @@ impl Provider for OllamaProvider {
 
     fn supports_documents(&self) -> bool {
         self.supports_documents
+    }
+
+    fn kind(&self) -> ProviderKind {
+        self.kind
     }
 
     /// `GET {base_url}/api/tags` -> `{ "models": [ { "name": ... } ] }`.

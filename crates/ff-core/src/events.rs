@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
-use crate::{McpServerStatus, SessionStatus, StopReason};
+use crate::{McpServerStatus, ProviderKind, SessionStatus, StopReason};
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
@@ -310,6 +310,32 @@ pub struct MemoryFlushedEvent {
     pub message_id: String,
     /// Number of durable facts written this turn (always > 0 when emitted).
     pub writes: u32,
+}
+
+/// The active phenotype is `LocalOnly` but the resolved inference path is a
+/// hosted provider (#888). The egress policy strips network-capable *tools*
+/// (RFC 0013 / #883) but the inference call itself still leaves the machine
+/// when the model is hosted — prompt content (potentially PII) reaches the
+/// cloud regardless of the tool layer. The frontend renders this as a
+/// privacy warning (badge, banner, or inline notice) so the user can either
+/// switch to a local connection or accept the inference egress explicitly.
+/// Mirrors the `AttachmentsDropped` precedent: surfaced via a typed event so
+/// the silent capability gap doesn't go unnoticed. Emitted once per turn
+/// (first iteration only) on the `egress:mismatch` IPC channel.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "../../../apps/desktop/src/bindings/")]
+pub struct EgressMismatchEvent {
+    pub session_id: String,
+    pub message_id: String,
+    /// The resolved provider kind (e.g. `openAi`, `siliconFlow`, `bedrock`).
+    /// Frontends use this to render the warning with the right "hosted by"
+    /// label.
+    pub kind: ProviderKind,
+    /// The model id resolved at turn start. Useful when a phenotype override
+    /// swaps the model away from the global default, so the warning can name
+    /// the actual model leaving the machine.
+    pub model: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]

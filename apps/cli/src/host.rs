@@ -55,7 +55,10 @@ fn build_provider(config: &ProviderConfig) -> Box<dyn Provider> {
         ProviderKind::CandleVllm => Box::new(
             OpenAiProvider::new(base_url, None)
                 .with_documents(documents)
-                .with_dialect(dialect),
+                .with_dialect(dialect)
+                // CandleVllm is local (#888): the egress-mismatch warning stays
+                // silent even when the phenotype is `egress = local-only`.
+                .with_kind(config.kind),
         ),
         ProviderKind::Ollama => Box::new(
             OllamaProvider::new(base_url)
@@ -66,7 +69,9 @@ fn build_provider(config: &ProviderConfig) -> Box<dyn Provider> {
                         .num_ctx
                         .map(u64::from)
                         .or_else(ollama_num_ctx_from_env),
-                ),
+                )
+                // Ollama is local (#888); symmetric with the desktop's other arms.
+                .with_kind(config.kind),
         ),
         ProviderKind::Bedrock => Box::new(build_bedrock_provider(config, documents)),
         // The CLI has no keychain, so a hosted OpenAI key comes from the
@@ -76,7 +81,10 @@ fn build_provider(config: &ProviderConfig) -> Box<dyn Provider> {
             OpenAiProvider::new(base_url, api_key_from_env("OPENAI_API_KEY"))
                 .with_documents(documents)
                 .with_dialect(dialect)
-                .with_reasoning_control(reasoning),
+                .with_reasoning_control(reasoning)
+                // OpenAi is hosted (#888): the egress-mismatch warning fires
+                // correctly when the phenotype is `egress = local-only`.
+                .with_kind(config.kind),
         ),
         // SiliconFlow is OpenAI-compatible. The CLI has no keychain, so the bearer
         // key comes from SILICONFLOW_API_KEY (empty/unset = anonymous, which the
@@ -89,7 +97,10 @@ fn build_provider(config: &ProviderConfig) -> Box<dyn Provider> {
                 OpenAiProvider::new(base_url, key)
                     .with_documents(documents)
                     .with_dialect(dialect)
-                    .with_reasoning_control(reasoning),
+                    .with_reasoning_control(reasoning)
+                    // SiliconFlow is hosted (#888): the egress-mismatch warning
+                    // fires correctly when the phenotype is `egress = local-only`.
+                    .with_kind(config.kind),
             )
         }
         // OpenRouter is OpenAI-compatible. Bearer key from OPENROUTER_API_KEY.
@@ -101,7 +112,10 @@ fn build_provider(config: &ProviderConfig) -> Box<dyn Provider> {
                 OpenAiProvider::new(base_url, key)
                     .with_documents(documents)
                     .with_dialect(dialect)
-                    .with_reasoning_control(reasoning),
+                    .with_reasoning_control(reasoning)
+                    // OpenRouter is hosted (#888): the egress-mismatch warning
+                    // fires correctly when the phenotype is `egress = local-only`.
+                    .with_kind(config.kind),
             )
         }
     }
@@ -127,6 +141,9 @@ fn build_bedrock_provider(config: &ProviderConfig, documents: bool) -> BedrockPr
     BedrockProvider::new(region, creds)
         .with_documents(documents)
         .with_reasoning_effort(config.reasoning_effort)
+        // Bedrock is hosted (#888): the egress-mismatch warning fires correctly
+        // when the phenotype is `egress = local-only`.
+        .with_kind(config.kind)
 }
 
 /// A bearer key from `var`, or `None` when the variable is unset *or* empty.

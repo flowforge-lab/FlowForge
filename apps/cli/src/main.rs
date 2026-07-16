@@ -675,6 +675,22 @@ fn render_event_text(event: AgentEvent) {
                 if count == 1 { "" } else { "s" }
             );
         }
+        AgentEvent::EgressMismatch { kind, model, .. } => {
+            // LocalOnly-but-cloud-inference notice (#888). The user asked for a
+            // local-privacy phenotype but the resolved inference path is hosted,
+            // so prompt content still leaves this machine. Mirror the
+            // `AttachmentsDropped` render style — a single `[privacy]` line —
+            // and name both the kind and the model so the warning is
+            // unambiguous and the user can act on it (switch connection, or
+            // accept the egress with an explicit override if a future gate
+            // mode ships).
+            eprintln!(
+                "\n[privacy] egress=local-only but inference uses {} ({model}). \
+                 Prompt content still leaves this machine to reach the model -- \
+                 switch to a local connection (Ollama / candle-vllm) for a true enclave.",
+                kind.slug()
+            );
+        }
         AgentEvent::ToolOutputChunk { delta, .. } => {
             // Live command output (#680) streams to stderr so piping stdout still
             // yields only the model's text.

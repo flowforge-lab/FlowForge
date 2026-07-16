@@ -252,7 +252,10 @@ fn build_provider(conn: &ProviderConnection, model: &str) -> Box<dyn Provider> {
                 .with_vision(vision)
                 .with_documents(documents)
                 .with_dialect(dialect)
-                .with_reasoning_control(reasoning),
+                .with_reasoning_control(reasoning)
+                // CandleVllm is local (#888): the egress-mismatch warning stays
+                // silent even when the phenotype is `egress = local-only`.
+                .with_kind(conn.kind),
         ),
         ProviderKind::Ollama => Box::new(
             OllamaProvider::new(base_url)
@@ -260,7 +263,10 @@ fn build_provider(conn: &ProviderConnection, model: &str) -> Box<dyn Provider> {
                 .with_documents(documents)
                 // Per-connection window (#651) wins; the env var stays as a
                 // global override for connections that leave it unset.
-                .with_num_ctx(conn.num_ctx.map(u64::from).or_else(ollama_num_ctx_from_env)),
+                .with_num_ctx(conn.num_ctx.map(u64::from).or_else(ollama_num_ctx_from_env))
+                // Ollama is local (#888); the native adapter's `with_kind` is a
+                // no-op for correctness but kept symmetric with the other arms.
+                .with_kind(conn.kind),
         ),
         // Bedrock resolves credentials by auth mode, pulling secret material from the
         // OS keychain here so the provider crate stays keychain-free (#202 PR-2).
@@ -300,7 +306,10 @@ fn build_provider(conn: &ProviderConnection, model: &str) -> Box<dyn Provider> {
                 BedrockProvider::new(region, creds)
                     .with_vision(vision)
                     .with_documents(documents)
-                    .with_reasoning_effort(effort),
+                    .with_reasoning_effort(effort)
+                    // Bedrock is hosted (#888): the egress-mismatch warning
+                    // fires correctly when the phenotype is `egress = local-only`.
+                    .with_kind(conn.kind),
             )
         }
         // Hosted OpenAI (-compatible). Bearer key pulled from the keychain here so
@@ -312,7 +321,10 @@ fn build_provider(conn: &ProviderConnection, model: &str) -> Box<dyn Provider> {
                     .with_vision(vision)
                     .with_documents(documents)
                     .with_dialect(dialect)
-                    .with_reasoning_control(reasoning),
+                    .with_reasoning_control(reasoning)
+                    // OpenAi is hosted (#888): the egress-mismatch warning
+                    // fires correctly when the phenotype is `egress = local-only`.
+                    .with_kind(conn.kind),
             )
         }
         // SiliconFlow is OpenAI-compatible; the bearer key is pulled from the OS
@@ -324,7 +336,10 @@ fn build_provider(conn: &ProviderConnection, model: &str) -> Box<dyn Provider> {
                     .with_vision(vision)
                     .with_documents(documents)
                     .with_dialect(dialect)
-                    .with_reasoning_control(reasoning),
+                    .with_reasoning_control(reasoning)
+                    // SiliconFlow is hosted (#888): the egress-mismatch warning
+                    // fires correctly when the phenotype is `egress = local-only`.
+                    .with_kind(conn.kind),
             )
         }
         // OpenRouter is OpenAI-compatible (#807); bearer key from the OS keychain.
@@ -335,7 +350,10 @@ fn build_provider(conn: &ProviderConnection, model: &str) -> Box<dyn Provider> {
                     .with_vision(vision)
                     .with_documents(documents)
                     .with_dialect(dialect)
-                    .with_reasoning_control(reasoning),
+                    .with_reasoning_control(reasoning)
+                    // OpenRouter is hosted (#888): the egress-mismatch warning
+                    // fires correctly when the phenotype is `egress = local-only`.
+                    .with_kind(conn.kind),
             )
         }
     }

@@ -13,8 +13,8 @@ use std::sync::Arc;
 
 use ff_core::events::{ContextBreakdown, TurnUsage};
 use ff_core::{
-    AttachmentKind, Egress, Message, Mode, PermissionCell, PermissionMatrix, ReasoningVisibility,
-    Role, StopReason,
+    AttachmentKind, Egress, Message, Mode, PermissionCell, PermissionMatrix, ProviderKind,
+    ReasoningVisibility, Role, StopReason,
 };
 use ff_llm::{ChatMessage, ChatRequest, FunctionCall, LlmError, Provider, ToolCall as LlmToolCall};
 use ff_session::SessionStore;
@@ -336,6 +336,23 @@ pub enum AgentEvent {
         call_id: String,
         stream: ff_tools::OutputStream,
         delta: String,
+    },
+    /// The active phenotype is `LocalOnly` but the resolved inference path is a
+    /// hosted provider (#888). The egress policy strips *network-capable tools*
+    /// (RFC 0013 / #883) but the inference call itself still leaves the machine
+    /// when the model is hosted, so prompt content (potentially PII) reaches the
+    /// cloud regardless of the tool layer. This event turns that silent
+    /// capability gap into a visible notice -- mirrors [`AgentEvent::AttachmentsDropped`]
+    /// (`provider.supports_vision() == false` analogue) and follows the same
+    /// single-fire-per-turn (first iteration) convention. Emitted only when
+    /// `tools.egress.is_local_only()` AND `provider.kind().is_local() == false`,
+    /// keyed to that turn's assistant message. `kind` is the resolved
+    /// [`ProviderKind`]; `model` is the model id resolved at turn start (useful
+    /// when a phenotype override swaps the model away from the global default).
+    EgressMismatch {
+        message_id: String,
+        kind: ProviderKind,
+        model: String,
     },
     Error {
         message: String,
@@ -1409,6 +1426,24 @@ pub async fn run_turn(
                     });
                 }
             }
+        }
+
+        // LocalOnly-but-cloud notice (#888): the egress policy is local but the
+        // resolved inference path is hosted. The tool layer's network filter
+        // (RFC 0013 / #883) does not cover the model call -- prompt content
+        // (potentially PII) still leaves this machine to reach the model. Surface
+        // that once per turn so the gap isn't silent. First-iteration gating
+        // matches the [`AttachmentsDropped`] notice above; the check is purely
+        // from `(provider.kind(), tools.egress)` so no history scan is needed.
+        // Sub-agents inherit the parent's `tools.egress` (RFC 0013), so this
+        // covers delegated enclave runs as well. The host decides how to render
+        // it (Tauri IPC event + UI badge, CLI stderr line, or telemetry).
+        if iter == 0 && tools.egress.is_local_only() && !provider.kind().is_local() {
+            on_event(AgentEvent::EgressMismatch {
+                message_id: message_id.clone(),
+                kind: provider.kind(),
+                model: model.to_string(),
+            });
         }
 
         // Bounded retry for transient provider failures (#244 R1). A setup error
