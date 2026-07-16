@@ -278,6 +278,19 @@ pub enum AgentEvent {
         /// token, or for events not from `run_turn`.
         #[serde(skip_serializing_if = "Option::is_none")]
         prompt_latency_ms: Option<u32>,
+        /// #971: total wall-clock (ms) spent in the pre-main-call **memory flush**
+        /// this turn, summed across iterations. The flush is an agentic sub-loop of
+        /// up to `MAX_FLUSH_ITERATIONS` LLM round-trips; its cost is otherwise
+        /// invisible (folded into the host's `firstTokenMs` as "other", and its
+        /// tokens don't reach `TurnUsage`). `None` when no flush ran.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        flush_ms: Option<u32>,
+        /// #971: total wall-clock (ms) spent in the pre-main-call **Tier-2
+        /// abstractive summarize** this turn (the `summarize_cold` LLM call only;
+        /// the cross-turn-cache reuse path is excluded). The dominant "other"
+        /// latency on an over-budget re-trigger turn. `None` when no summarize ran.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        tier2_ms: Option<u32>,
         /// F1b (#441): how many iterations this turn engaged the Tier-1 extractive
         /// cold-prefix compaction pass (RFC 0016 M7.1b).
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -1023,6 +1036,13 @@ pub async fn run_turn(
     // context-pressure memory flush and planning-step reasoning. Set once, on the
     // first iteration only; `None` if the turn produced no token before ending.
     let mut prompt_latency_ms: Option<u32> = None;
+    // #971: per-phase pre-main-call compaction wall-clock, accumulated across
+    // iterations. `firstTokenMs` (host-side, anchored at turn_start) folds these in
+    // as opaque "other"; splitting them out tells an over-budget turn's spike apart
+    // (a memory flush vs the Tier-2 summarizer) since both are uncached LLM
+    // sub-calls the prompt/prefill telemetry can't see. `None` until a phase runs.
+    let mut flush_ms: Option<u32> = None;
+    let mut tier2_ms: Option<u32> = None;
     let mut tier1_fires: u32 = 0;
     let mut tier2_fires: u32 = 0;
     // Prefix cache observability (#766): accumulate provider-reported cache
@@ -1082,6 +1102,9 @@ pub async fn run_turn(
                 DEFAULT_REFLUSH_INTERVAL_MESSAGES,
             )
         {
+            // #971: time the flush -- an agentic sub-loop of up to MAX_FLUSH_ITERATIONS
+            // LLM round-trips, the dominant "other" latency on a memory-edit turn.
+            let flush_clock = std::time::Instant::now();
             // Surface provenance (#283) when the flush actually wrote durable facts;
             // a no-op / NoReply / failure stays silent (best-effort — never aborts
             // the user's turn).
@@ -1104,6 +1127,8 @@ pub async fn run_turn(
                     flushed_writes = u32::try_from(writes).ok();
                 }
             }
+            let elapsed = u32::try_from(flush_clock.elapsed().as_millis()).unwrap_or(u32::MAX);
+            flush_ms = Some(flush_ms.unwrap_or(0).saturating_add(elapsed));
             // Record the attempt regardless of outcome so a no-op or failing flush
             // does not re-fire every iteration.
             last_flush_count = Some(message_count);
@@ -1245,7 +1270,12 @@ pub async fn run_turn(
                 Some(out) => out,
                 None => {
                     let compact_model = tools.compaction_model.as_deref().unwrap_or(model);
-                    match AbstractiveSummarizer::new(tools.abstractive.clone())
+                    // #971: time the Tier-2 summarize -- one uncached LLM call over
+                    // the whole cold prefix, the dominant "other" latency on an
+                    // over-budget re-trigger turn. The reuse arm above is a memcpy,
+                    // so timing only this call attributes the real cost.
+                    let tier2_clock = std::time::Instant::now();
+                    let summarized = AbstractiveSummarizer::new(tools.abstractive.clone())
                         .summarize_cold(
                             provider,
                             compact_model,
@@ -1253,8 +1283,11 @@ pub async fn run_turn(
                             KEEP_RECENT_VERBATIM,
                             &cancel,
                         )
-                        .await
-                    {
+                        .await;
+                    let elapsed =
+                        u32::try_from(tier2_clock.elapsed().as_millis()).unwrap_or(u32::MAX);
+                    tier2_ms = Some(tier2_ms.unwrap_or(0).saturating_add(elapsed));
+                    match summarized {
                         Ok(Some(result)) => {
                             if let Some((mid, key, original)) = &result.original {
                                 store.put_compaction_original(session_id, mid, key, original);
@@ -1715,6 +1748,8 @@ pub async fn run_turn(
                 token_count,
                 prefill_estimates: Some(prefill_estimates.clone()),
                 prompt_latency_ms,
+                flush_ms,
+                tier2_ms,
                 tier1_fires: Some(tier1_fires),
                 tier2_fires: Some(tier2_fires),
                 cache_hit_tokens: Some(cache_hit_tokens),
@@ -2148,6 +2183,8 @@ pub async fn run_turn(
         token_count,
         prefill_estimates: Some(prefill_estimates),
         prompt_latency_ms,
+        flush_ms,
+        tier2_ms,
         tier1_fires: Some(tier1_fires),
         tier2_fires: Some(tier2_fires),
         cache_hit_tokens: Some(cache_hit_tokens),
