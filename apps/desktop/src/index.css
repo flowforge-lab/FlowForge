@@ -539,3 +539,145 @@ body {
 .dark .hljs-meta {
   color: oklch(0.62 0.02 200);
 }
+
+/* --- Shared Markdown editor (components/ui/markdown-editor.tsx, #952) --- */
+
+/* Themed surface that mirrors the input/textarea primitives so the WYSIWYG
+   editor never renders as a jarring white box in either theme. */
+.ff-md-editor {
+  border: 1px solid var(--input);
+  border-radius: var(--radius-lg);
+  background: color-mix(in oklab, var(--input) 30%, transparent);
+  transition:
+    color 0.15s,
+    border-color 0.15s,
+    box-shadow 0.15s;
+}
+.ff-md-editor:focus-within {
+  border-color: var(--ring);
+  box-shadow: 0 0 0 3px color-mix(in oklab, var(--ring) 50%, transparent);
+}
+.ff-md-editor[data-readonly] {
+  background: transparent;
+  border-color: transparent;
+}
+.ff-md-editor[data-readonly]:focus-within {
+  box-shadow: none;
+}
+
+/* ProseMirror content area — same typographic scale as the assistant prose. */
+.ff-md-editor .ProseMirror {
+  min-height: 6rem;
+  padding: 0.625rem 0.75rem;
+  outline: none;
+  font-size: 15px;
+  line-height: 1.6;
+  color: var(--foreground);
+  white-space: pre-wrap;
+  word-wrap: break-word;
+}
+.ff-md-editor[data-readonly] .ProseMirror {
+  padding: 0;
+  min-height: 0;
+}
+.ff-md-editor .ProseMirror > :first-child {
+  margin-top: 0;
+}
+.ff-md-editor .ProseMirror > :last-child {
+  margin-bottom: 0;
+}
+.ff-md-editor .ProseMirror p {
+  margin: 0.5em 0;
+}
+.ff-md-editor .ProseMirror h1,
+.ff-md-editor .ProseMirror h2,
+.ff-md-editor .ProseMirror h3,
+.ff-md-editor .ProseMirror h4 {
+  margin: 1em 0 0.5em;
+  font-weight: 600;
+  line-height: 1.3;
+}
+.ff-md-editor .ProseMirror h1 {
+  font-size: 1.3em;
+}
+.ff-md-editor .ProseMirror h2 {
+  font-size: 1.18em;
+}
+.ff-md-editor .ProseMirror h3 {
+  font-size: 1.06em;
+}
+.ff-md-editor .ProseMirror h4 {
+  font-size: 1em;
+}
+.ff-md-editor .ProseMirror ul,
+.ff-md-editor .ProseMirror ol {
+  margin: 0.5em 0;
+  padding-left: 1.4em;
+}
+.ff-md-editor .ProseMirror ul {
+  list-style: disc;
+}
+.ff-md-editor .ProseMirror ol {
+  list-style: decimal;
+}
+.ff-md-editor .ProseMirror li {
+  margin: 0.2em 0;
+}
+.ff-md-editor .ProseMirror li::marker {
+  color: var(--muted-foreground);
+}
+.ff-md-editor .ProseMirror a {
+  color: var(--primary);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.ff-md-editor .ProseMirror strong {
+  font-weight: 600;
+}
+.ff-md-editor .ProseMirror em {
+  font-style: italic;
+}
+.ff-md-editor .ProseMirror blockquote {
+  margin: 0.6em 0;
+  border-left: 2px solid var(--border);
+  padding-left: 0.8em;
+  color: var(--muted-foreground);
+}
+.ff-md-editor .ProseMirror hr {
+  margin: 1em 0;
+  border: 0;
+  border-top: 1px solid var(--border);
+}
+.ff-md-editor .ProseMirror code {
+  font-family: var(--font-code);
+  font-size: 0.86em;
+  background: color-mix(in oklab, var(--foreground) 10%, transparent);
+  padding: 0.1em 0.34em;
+  border-radius: 4px;
+}
+.ff-md-editor .ProseMirror pre {
+  margin: 0.6em 0;
+  padding: 0.65em 0.8em;
+  border-radius: var(--radius-md);
+  background: var(--card);
+  border: 1px solid var(--border);
+  overflow-x: auto;
+}
+.ff-md-editor .ProseMirror pre code {
+  background: transparent;
+  padding: 0;
+  font-size: 0.9em;
+}
+
+/* CSS-only placeholder: shown only when the whole document is a single empty
+   paragraph (ProseMirror marks the empty block with a trailing <br>). The text
+   comes from the `--ff-md-placeholder` custom property set by the component. */
+.ff-md-editor
+  .ProseMirror
+  > p:only-child:has(> .ProseMirror-trailingBreak:only-child)::before {
+  content: var(--ff-md-placeholder, "");
+  color: var(--muted-foreground);
+  pointer-events: none;
+  height: 0;
+  float: left;
+}
