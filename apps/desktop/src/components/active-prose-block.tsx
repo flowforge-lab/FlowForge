@@ -83,29 +83,11 @@ export function ActiveProseBlock({
       data-prose-expanded={!isCollapsed}
       className="flex flex-col"
     >
-      <div
-        // `overflow-hidden` is required so the clipped state is correct —
-        // without it the prose tail bleeds past max-h-0 into the chip below.
-        className="overflow-hidden transition-[max-height,opacity] duration-300 ease-out"
-        style={{
-          maxHeight: isCollapsed ? 0 : naturalHeight,
-          opacity: isCollapsed ? 0 : 1,
-        }}
-        aria-hidden={isCollapsed}
-      >
-        <div
-          ref={contentRef}
-          data-selectable
-          data-prose-content
-          className={cn(
-            "px-0.5 py-1 text-sm leading-relaxed",
-            tone === "foreground" ? "text-foreground" : "text-muted-foreground",
-            caret && "ff-streaming-caret",
-          )}
-        >
-          <Markdown content={text} streaming={streaming} />
-        </div>
-      </div>
+      {/* The chip renders *above* the prose so that, once expanded mid-stream,
+          it reads as the header/toggle for the content below it (#986 review) —
+          `🔄 On it ▾` on top, prose underneath — rather than a toggle buried
+          beneath the text. Collapsed looks identical (prose clips to height 0,
+          leaving just the chip). */}
       <button
         type="button"
         onClick={() => setUserExpanded((v) => (v === true ? false : true))}
@@ -136,6 +118,30 @@ export function ActiveProseBlock({
           )}
         />
       </button>
+      <div
+        // `overflow-hidden` is required so the collapsed state clips correctly —
+        // without it the prose tail bleeds past max-h-0 instead of animating to
+        // zero height.
+        className="overflow-hidden transition-[max-height,opacity] duration-300 ease-out"
+        style={{
+          maxHeight: isCollapsed ? 0 : naturalHeight,
+          opacity: isCollapsed ? 0 : 1,
+        }}
+        aria-hidden={isCollapsed}
+      >
+        <div
+          ref={contentRef}
+          data-selectable
+          data-prose-content
+          className={cn(
+            "px-0.5 py-1 text-sm leading-relaxed",
+            tone === "foreground" ? "text-foreground" : "text-muted-foreground",
+            caret && "ff-streaming-caret",
+          )}
+        >
+          <Markdown content={text} streaming={streaming} />
+        </div>
+      </div>
     </div>
   );
 }

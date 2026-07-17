@@ -127,6 +127,18 @@ describe("ActiveProseBlock (#864)", () => {
     ).toBeNull();
   });
 
+  it("renders the chip above the prose so it reads as the toggle header (#986 review)", () => {
+    render(<ActiveProseBlock text={LONG_TEXT} streaming={true} />);
+
+    const chip = chipButton();
+    const prose = document.querySelector<HTMLElement>("[data-prose-content]")!;
+    // The chip must precede the prose in DOM order — expanded, it sits on top as
+    // a header/toggle with the content below, not buried beneath the text.
+    expect(
+      chip.compareDocumentPosition(prose) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+  });
+
   it("dissolves the chip and shows the full prose when the turn settles", () => {
     const { rerender } = render(
       <ActiveProseBlock text={LONG_TEXT} streaming={true} />,
