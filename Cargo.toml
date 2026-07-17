@@ -53,3 +53,4 @@ ff-observer = { path = "crates/ff-observer" }
 ff-workflow = { path = "crates/ff-workflow" }
 
 lru = "0.12"
+minijinja = { version = "2", default-features = false, features = ["builtins", "std_collections", "macros", "adjacent_loop_items", "serde"] }

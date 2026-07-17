@@ -13,6 +13,7 @@ ff-session = { workspace = true }
 ff-skills = { workspace = true }
 ff-tools = { workspace = true }
 serde = { workspace = true }
+minijinja = { workspace = true }
 serde_json = { workspace = true }
 futures-util = { workspace = true }
 thiserror = { workspace = true }
