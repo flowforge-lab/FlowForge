@@ -1589,21 +1589,20 @@ fn spawn_assistant_turn(state: Arc<AppState>, app: tauri::AppHandle, session_id:
         // phenotype's declared skills; an unbound session keeps the global active
         // set so the command palette still affects turns. See `turn_active_skills`.
         let active: Vec<String> = state.turn_active_skills(&sid);
-        let (memory, ambient_keys) = state
-            .memory()
-            .ambient_block_filtered_keyed(state.index().as_ref());
-        let extra_instructions = state.resolve_extra_instructions();
-        let injected_memory = if state.inject_memory_enabled() {
-            memory.as_deref()
+        let (inject_mem, extra_instructions) = state.turn_prompt_injection();
+        let (memory, ambient_keys) = if inject_mem {
+            state
+                .memory()
+                .ambient_block_filtered_keyed(state.index().as_ref())
         } else {
-            None
+            (None, vec![])
         };
         let system_prompt = ff_agent::build_system_prompt(
             persona.as_deref(),
             &skills,
             &active,
             &user_ctx,
-            injected_memory,
+            memory.as_deref(),
             extra_instructions.as_deref(),
             None,
             mode,
@@ -1997,22 +1996,20 @@ impl GoalIteration for GoalLoopIteration {
         let user_ctx =
             ff_agent::UserContext::now().with_working_dir(session_root.display().to_string());
         let active: Vec<String> = self.state.turn_active_skills(&sid);
-        let (memory, _ambient_keys) = self
-            .state
-            .memory()
-            .ambient_block_filtered_keyed(self.state.index().as_ref());
-        let extra_instructions = self.state.resolve_extra_instructions();
-        let injected_memory = if self.state.inject_memory_enabled() {
-            memory.as_deref()
+        let (inject_mem, extra_instructions) = self.state.turn_prompt_injection();
+        let (memory, _ambient_keys) = if inject_mem {
+            self.state
+                .memory()
+                .ambient_block_filtered_keyed(self.state.index().as_ref())
         } else {
-            None
+            (None, vec![])
         };
         let system_prompt = ff_agent::build_system_prompt(
             persona.as_deref(),
             &skills,
             &active,
             &user_ctx,
-            injected_memory,
+            memory.as_deref(),
             extra_instructions.as_deref(),
             Some(goal),
             mode,
@@ -2346,22 +2343,20 @@ impl ff_scheduled::TaskRunner for DesktopTaskRunner {
         let user_ctx =
             ff_agent::UserContext::now().with_working_dir(session_root.display().to_string());
         let active: Vec<String> = self.state.turn_active_skills(&sid);
-        let (memory, _ambient_keys) = self
-            .state
-            .memory()
-            .ambient_block_filtered_keyed(self.state.index().as_ref());
-        let extra_instructions = self.state.resolve_extra_instructions();
-        let injected_memory = if self.state.inject_memory_enabled() {
-            memory.as_deref()
+        let (inject_mem, extra_instructions) = self.state.turn_prompt_injection();
+        let (memory, _ambient_keys) = if inject_mem {
+            self.state
+                .memory()
+                .ambient_block_filtered_keyed(self.state.index().as_ref())
         } else {
-            None
+            (None, vec![])
         };
         let system_prompt = ff_agent::build_system_prompt(
             pheno.persona.as_deref(),
             &skills,
             &active,
             &user_ctx,
-            injected_memory,
+            memory.as_deref(),
             extra_instructions.as_deref(),
             None,
             mode,

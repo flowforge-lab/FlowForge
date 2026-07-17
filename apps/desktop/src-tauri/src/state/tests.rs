@@ -2877,7 +2877,10 @@ fn extra_instructions_concatenates_readable_prompt_files() {
     }))
     .expect("some instructions");
 
-    assert_eq!(out, "Top instruction\n\nFile A body\n\nFile B body");
+    assert_eq!(
+        out,
+        "Top instruction\n\n### a.md\nFile A body\n\n### b.md\nFile B body"
+    );
 }
 
 #[test]
@@ -2891,7 +2894,7 @@ fn extra_instructions_skips_missing_or_unreadable_files() {
         "promptFiles": [missing.to_str().unwrap(), good.to_str().unwrap()],
     }))
     .expect("the readable file still resolves");
-    assert_eq!(out, "Good body");
+    assert_eq!(out, "### good.md\nGood body");
 }
 
 #[test]
@@ -2903,4 +2906,14 @@ fn extra_instructions_none_when_only_files_and_all_blank() {
         "promptFiles": [blank.to_str().unwrap()],
     }))
     .is_none());
+}
+
+#[test]
+fn extra_instructions_warns_but_still_injects_past_cap() {
+    let big = "x".repeat(MAX_EXTRA_INSTRUCTIONS_BYTES + 1);
+    let out = resolve_extra_instructions_from(&serde_json::json!({
+        "userInstructions": big,
+    }))
+    .expect("must still inject past cap");
+    assert_eq!(out.len(), MAX_EXTRA_INSTRUCTIONS_BYTES + 1);
 }

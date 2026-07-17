@@ -796,7 +796,11 @@ fn resolve_extra_instructions_from(cfg: &serde_json::Value) -> Option<String> {
                 Ok(body) => {
                     let body = body.trim();
                     if !body.is_empty() {
-                        parts.push(body.to_string());
+                        let label = std::path::Path::new(path)
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or(path);
+                        parts.push(format!("### {label}\n{body}"));
                     }
                 }
                 Err(e) => tracing::warn!(error = %e, path, "prompt file unreadable; skipping"),
@@ -2558,17 +2562,15 @@ impl AppState {
         config
     }
 
-    /// Whether durable memory should be injected into the system prompt (#1002).
-    /// Reads `injectMemory` from the Control config; defaults `true` to match
-    /// [`default_control_config`].
-    pub fn inject_memory_enabled(&self) -> bool {
-        inject_memory_enabled_from(&self.control_config())
-    }
-
-    /// Resolve the user's extra prompt content from the Control panel Prompts tab
-    /// (#1002). See [`resolve_extra_instructions_from`].
-    pub fn resolve_extra_instructions(&self) -> Option<String> {
-        resolve_extra_instructions_from(&self.control_config())
+    /// Load the Control config once and resolve both prompt-injection values for a
+    /// turn. Avoids the double disk-read of calling `inject_memory_enabled()` and
+    /// `resolve_extra_instructions()` separately.
+    pub fn turn_prompt_injection(&self) -> (bool, Option<String>) {
+        let cfg = self.control_config();
+        (
+            inject_memory_enabled_from(&cfg),
+            resolve_extra_instructions_from(&cfg),
+        )
     }
 
     /// Build a provider + model snapshot from the active connection for one turn.
