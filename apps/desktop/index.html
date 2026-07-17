@@ -5,6 +5,27 @@
     <link rel="icon" type="image/svg+xml" href="/vite.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>FlowForge</title>
+    <style>
+      /* Visible until React mounts. If this stays forever, JS never started;
+         if the window is blank with no text, the webview itself failed to paint. */
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        background: #141414;
+        color: #a3a3a3;
+        font: 14px/1.4 system-ui, sans-serif;
+      }
+      #root:empty {
+        display: flex;
+        height: 100%;
+        align-items: center;
+        justify-content: center;
+      }
+      #root:empty::before {
+        content: "Starting FlowForge…";
+      }
+    </style>
     <script>
       (function () {
         try {

@@ -9,6 +9,11 @@ const host = process.env.TAURI_DEV_HOST;
 export default defineConfig(async () => ({
   plugins: [react(), tailwindcss()],
 
+  // Relative asset URLs so the production webview (tauri://localhost) resolves
+  // JS/CSS correctly. Absolute `/assets/...` paths are a common blank-window
+  // cause in packaged Tauri builds even when `tauri dev` (http://localhost) works.
+  base: "./",
+
   resolve: {
     alias: {
       "@": path.resolve(__dirname, "./src"),
