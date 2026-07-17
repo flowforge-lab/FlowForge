@@ -13,7 +13,7 @@ use std::sync::{Arc, RwLock};
 use std::thread;
 use std::time::Duration;
 
-use notify::{RecommendedWatcher, RecursiveMode, Watcher};
+use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher};
 
 use crate::error::SkillError;
 use crate::registry::SkillRegistry;
@@ -24,9 +24,13 @@ pub type SharedRegistry = Arc<RwLock<SkillRegistry>>;
 const DEBOUNCE: Duration = Duration::from_millis(200);
 
 /// Owns the OS watcher. Dropping it stops watching: the watcher's event sender
-/// disconnects, and the debounce worker thread observes the disconnect and exits.
+/// disconnects, and the debounce worker thread observes the disconnect and exits. The
+/// watcher is boxed so tests can inject a [`notify::PollWatcher`] backend (which holds
+/// no persistent `ReadDirectoryChangesW` handle) in place of the OS-native
+/// `RecommendedWatcher` -- on Windows that async directory handle intermittently
+/// wedged a sibling test's filesystem syscall under concurrent test scheduling.
 pub struct SkillWatcher {
-    _watcher: RecommendedWatcher,
+    _watcher: Box<dyn Watcher + Send>,
 }
 
 impl SkillWatcher {
@@ -34,6 +38,16 @@ impl SkillWatcher {
     /// and the shared registry the watcher keeps up to date. Initial load errors
     /// are returned so the caller can surface them; later reload errors are logged.
     pub fn spawn(root: PathBuf) -> Result<(Self, SharedRegistry, Vec<SkillError>), SkillError> {
+        Self::spawn_with::<RecommendedWatcher>(root, Config::default())
+    }
+
+    /// [`spawn`](Self::spawn) parameterized over the `notify` watcher backend so tests
+    /// can substitute a [`notify::PollWatcher`]. `config` tunes the backend (e.g. the
+    /// poll interval for `PollWatcher`); production passes [`Config::default`].
+    fn spawn_with<W: Watcher + Send + 'static>(
+        root: PathBuf,
+        config: Config,
+    ) -> Result<(Self, SharedRegistry, Vec<SkillError>), SkillError> {
         let (initial, errors) = SkillRegistry::load_dir(&root);
         let shared: SharedRegistry = Arc::new(RwLock::new(initial));
 
@@ -57,22 +71,29 @@ impl SkillWatcher {
             }
         });
 
-        let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
-            match res {
+        let mut watcher = W::new(
+            move |res: notify::Result<notify::Event>| match res {
                 Ok(_) => {
                     // Worker only gone during teardown; a dropped send is harmless.
                     let _ = tx.send(());
                 }
                 Err(e) => tracing::warn!(error = %e, "skill watcher event error"),
-            }
-        })
+            },
+            config,
+        )
         .map_err(|e| notify_io(&root, e))?;
 
         watcher
             .watch(&root, RecursiveMode::Recursive)
             .map_err(|e| notify_io(&root, e))?;
 
-        Ok((Self { _watcher: watcher }, shared, errors))
+        Ok((
+            Self {
+                _watcher: Box::new(watcher),
+            },
+            shared,
+            errors,
+        ))
     }
 }
 

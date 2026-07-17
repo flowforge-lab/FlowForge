@@ -1,6 +1,16 @@
 use super::*;
+use notify::PollWatcher;
 use std::fs;
 use tempfile::tempdir;
+
+/// Tests inject a [`PollWatcher`] instead of the OS-native `RecommendedWatcher`:
+/// on Windows the latter's async `ReadDirectoryChangesW` handle intermittently
+/// wedged a sibling test's filesystem syscall under concurrent test scheduling
+/// (the `reload_swaps_in_new_config` >60s hang). PollWatcher holds no such handle
+/// and a short poll interval keeps the change-detection assertion fast.
+fn poll_config() -> notify::Config {
+    notify::Config::default().with_poll_interval(Duration::from_millis(50))
+}
 
 #[test]
 fn event_touches_matches_only_the_config_file() {
@@ -69,7 +79,8 @@ fn reload_keeps_last_good_on_parse_error() {
 fn spawn_missing_file_starts_empty() {
     let tmp = tempdir().unwrap();
     let path = tmp.path().join("mcp.json");
-    let (_w, shared, _rx) = McpConfigWatcher::spawn(path).unwrap();
+    let (_w, shared, _rx) =
+        McpConfigWatcher::spawn_with::<PollWatcher>(path, poll_config()).unwrap();
     assert!(shared.read().unwrap().is_empty());
 }
 
@@ -79,7 +90,8 @@ fn spawn_loads_initial_and_watches() {
     let path = tmp.path().join("mcp.json");
     fs::write(&path, ONE).unwrap();
 
-    let (_w, shared, _rx) = McpConfigWatcher::spawn(path.clone()).unwrap();
+    let (_w, shared, _rx) =
+        McpConfigWatcher::spawn_with::<PollWatcher>(path.clone(), poll_config()).unwrap();
     assert_eq!(shared.read().unwrap().len(), 1);
 
     fs::write(&path, TWO).unwrap();

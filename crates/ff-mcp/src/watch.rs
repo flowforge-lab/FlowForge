@@ -18,7 +18,7 @@ use std::time::Duration;
 use tokio::sync::mpsc as tokio_mpsc;
 
 use ff_core::McpServerConfig;
-use notify::{RecommendedWatcher, RecursiveMode, Watcher};
+use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher};
 
 use crate::config;
 use crate::error::McpError;
@@ -30,9 +30,13 @@ pub type SharedConfig = Arc<RwLock<Vec<McpServerConfig>>>;
 const DEBOUNCE: Duration = Duration::from_millis(200);
 
 /// Owns the OS watcher. Dropping it stops watching: the event sender disconnects and
-/// the debounce worker thread observes the disconnect and exits.
+/// the debounce worker thread observes the disconnect and exits. The watcher is boxed
+/// so tests can inject a [`notify::PollWatcher`] backend (which holds no persistent
+/// `ReadDirectoryChangesW` handle) in place of the OS-native `RecommendedWatcher` --
+/// on Windows that async directory handle intermittently wedged a sibling test's
+/// filesystem syscall when many tests ran concurrently.
 pub struct McpConfigWatcher {
-    _watcher: RecommendedWatcher,
+    _watcher: Box<dyn Watcher + Send>,
 }
 
 impl McpConfigWatcher {
@@ -49,6 +53,16 @@ impl McpConfigWatcher {
     /// turn — don't trigger a per-turn no-op reload.
     pub fn spawn(
         path: PathBuf,
+    ) -> Result<(Self, SharedConfig, tokio_mpsc::UnboundedReceiver<()>), McpError> {
+        Self::spawn_with::<RecommendedWatcher>(path, Config::default())
+    }
+
+    /// [`spawn`](Self::spawn) parameterized over the `notify` watcher backend so tests
+    /// can substitute a [`notify::PollWatcher`]. `config` tunes the backend (e.g. the
+    /// poll interval for `PollWatcher`); production passes [`Config::default`].
+    fn spawn_with<W: Watcher + Send + 'static>(
+        path: PathBuf,
+        config: Config,
     ) -> Result<(Self, SharedConfig, tokio_mpsc::UnboundedReceiver<()>), McpError> {
         let initial = config::load(&path)?;
         let shared: SharedConfig = Arc::new(RwLock::new(initial));
@@ -83,22 +97,30 @@ impl McpConfigWatcher {
         // The config file's own name, used to ignore sibling writes in the watched dir.
         let file_name = path.file_name().map(OsStr::to_os_string);
 
-        let mut watcher =
-            notify::recommended_watcher(move |res: notify::Result<notify::Event>| match res {
+        let mut watcher = W::new(
+            move |res: notify::Result<notify::Event>| match res {
                 Ok(event) => {
                     if event_touches(&event.paths, file_name.as_deref()) {
                         let _ = tx.send(());
                     }
                 }
                 Err(e) => tracing::warn!(error = %e, "mcp config watcher event error"),
-            })
-            .map_err(|e| notify_err(&path, e))?;
+            },
+            config,
+        )
+        .map_err(|e| notify_err(&path, e))?;
 
         watcher
             .watch(&watch_dir, RecursiveMode::NonRecursive)
             .map_err(|e| notify_err(&path, e))?;
 
-        Ok((Self { _watcher: watcher }, shared, change_rx))
+        Ok((
+            Self {
+                _watcher: Box::new(watcher),
+            },
+            shared,
+            change_rx,
+        ))
     }
 }
 

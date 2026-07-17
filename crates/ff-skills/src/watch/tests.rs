@@ -1,7 +1,17 @@
 use super::*;
+use notify::PollWatcher;
 use std::fs;
 use std::sync::Arc;
 use tempfile::tempdir;
+
+/// Tests inject a [`PollWatcher`] instead of the OS-native `RecommendedWatcher`:
+/// on Windows the latter's async `ReadDirectoryChangesW` handle intermittently
+/// wedged a sibling test's filesystem syscall under concurrent test scheduling.
+/// PollWatcher holds no such handle and a short poll interval keeps the
+/// change-detection assertion fast.
+fn poll_config() -> notify::Config {
+    notify::Config::default().with_poll_interval(Duration::from_millis(50))
+}
 
 fn write_skill(root: &std::path::Path, dir: &str, name: &str) {
     let d = root.join(dir);
@@ -32,7 +42,8 @@ fn spawn_loads_initial_and_watches() {
     let root = tmp.path().to_path_buf();
     write_skill(&root, "a", "alpha");
 
-    let (_w, shared, errs) = SkillWatcher::spawn(root.clone()).unwrap();
+    let (_w, shared, errs) =
+        SkillWatcher::spawn_with::<PollWatcher>(root.clone(), poll_config()).unwrap();
     assert!(errs.is_empty());
     assert_eq!(shared.read().unwrap().len(), 1);
 
