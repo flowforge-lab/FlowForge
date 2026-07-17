@@ -265,6 +265,11 @@ type SettingsSectionId =
   documents the `ApprovalSafety` caveat.
 - **Tests:** `store/control-config.test.ts`; `mock.control.test.ts` round-trip.
 - **Out of scope:** runtime permission enforcement (backend); Team + UI customization (`SET.12`).
+- **Prompts backend wiring (done, #1002):** the Prompts sub-tab now drives the system
+  prompt at runtime — `injectMemory` gates the memory block and `userInstructions` +
+  `promptFiles` are injected into the volatile tail via
+  `AppState::{inject_memory_enabled,resolve_extra_instructions}`. Runtime permission
+  enforcement remains out of scope here.
 
 ---
 

@@ -2821,3 +2821,99 @@ fn backup_is_noop_when_no_registry_yet() {
         .collect();
     assert!(entries.is_empty(), "no files should be created");
 }
+
+// ── Control panel Prompts tab -> system prompt (#1002) ───────────────────────
+
+#[test]
+fn inject_memory_defaults_true_when_absent_or_malformed() {
+    assert!(inject_memory_enabled_from(&serde_json::json!({})));
+    assert!(inject_memory_enabled_from(
+        &serde_json::json!({"injectMemory": "nonsense"})
+    ));
+    assert!(inject_memory_enabled_from(&default_control_config()));
+}
+
+#[test]
+fn inject_memory_honors_explicit_false() {
+    assert!(!inject_memory_enabled_from(
+        &serde_json::json!({"injectMemory": false})
+    ));
+    assert!(inject_memory_enabled_from(
+        &serde_json::json!({"injectMemory": true})
+    ));
+}
+
+#[test]
+fn extra_instructions_none_on_default_and_empty_config() {
+    assert!(resolve_extra_instructions_from(&default_control_config()).is_none());
+    assert!(resolve_extra_instructions_from(&serde_json::json!({})).is_none());
+    assert!(resolve_extra_instructions_from(&serde_json::json!({
+        "userInstructions": "   \n  ",
+        "promptFiles": []
+    }))
+    .is_none());
+}
+
+#[test]
+fn extra_instructions_returns_trimmed_user_instructions() {
+    let out = resolve_extra_instructions_from(&serde_json::json!({
+        "userInstructions": "  Always write doctests.  ",
+    }))
+    .expect("some instructions");
+    assert_eq!(out, "Always write doctests.");
+}
+
+#[test]
+fn extra_instructions_concatenates_readable_prompt_files() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.md");
+    let b = tmp.path().join("b.md");
+    fs::write(&a, "File A body\n").unwrap();
+    fs::write(&b, "File B body\n").unwrap();
+
+    let out = resolve_extra_instructions_from(&serde_json::json!({
+        "userInstructions": "Top instruction",
+        "promptFiles": [a.to_str().unwrap(), b.to_str().unwrap()],
+    }))
+    .expect("some instructions");
+
+    assert_eq!(
+        out,
+        "Top instruction\n\n### a.md\nFile A body\n\n### b.md\nFile B body"
+    );
+}
+
+#[test]
+fn extra_instructions_skips_missing_or_unreadable_files() {
+    let tmp = tempfile::tempdir().unwrap();
+    let good = tmp.path().join("good.md");
+    fs::write(&good, "Good body").unwrap();
+    let missing = tmp.path().join("does-not-exist.md");
+
+    let out = resolve_extra_instructions_from(&serde_json::json!({
+        "promptFiles": [missing.to_str().unwrap(), good.to_str().unwrap()],
+    }))
+    .expect("the readable file still resolves");
+    assert_eq!(out, "### good.md\nGood body");
+}
+
+#[test]
+fn extra_instructions_none_when_only_files_and_all_blank() {
+    let tmp = tempfile::tempdir().unwrap();
+    let blank = tmp.path().join("blank.md");
+    fs::write(&blank, "   \n\t\n").unwrap();
+    assert!(resolve_extra_instructions_from(&serde_json::json!({
+        "promptFiles": [blank.to_str().unwrap()],
+    }))
+    .is_none());
+}
+
+#[test]
+fn extra_instructions_warns_but_still_injects_past_cap() {
+    let big = "x".repeat(MAX_EXTRA_INSTRUCTIONS_BYTES + 1);
+    let out = resolve_extra_instructions_from(&serde_json::json!({
+        "userInstructions": big,
+    }))
+    .expect("must still inject past cap");
+    assert_eq!(out.len(), MAX_EXTRA_INSTRUCTIONS_BYTES + 1);
+}
