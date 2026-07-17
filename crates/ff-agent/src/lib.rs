@@ -1013,10 +1013,6 @@ pub async fn run_turn(
     // identical `(tool, args)` calls -- this fires on identical *content* regardless
     // of how the read was phrased (e.g. a different line range).
     let mut read_cache: HashMap<String, (u32, u64)> = HashMap::new();
-    // Context-pressure flush bookkeeping (#244 R5): the transcript length at the last
-    // flush, so we re-flush on growth rather than every iteration. `None` = never
-    // flushed this turn.
-    let mut last_flush_count: Option<u64> = None;
     // Tier-2 abstractive summary cache (RFC 0016 M7.0): the summary covering the
     // cold prefix and the boundary it covers, plus the transcript length when it
     // was produced. Reused across iterations until the transcript grows by the
@@ -1058,9 +1054,11 @@ pub async fn run_turn(
     // #971: per-phase pre-main-call compaction wall-clock, accumulated across
     // iterations. `firstTokenMs` (host-side, anchored at turn_start) folds these in
     // as opaque "other"; splitting them out tells an over-budget turn's spike apart
-    // (a memory flush vs the Tier-2 summarizer) since both are uncached LLM
-    // sub-calls the prompt/prefill telemetry can't see. `None` until a phase runs.
-    let mut flush_ms: Option<u32> = None;
+    // #991: the flush moved off the critical path (post-turn only), so `run_turn`
+    // no longer accumulates flush time — `flush_ms` is always `None` here. The
+    // field is retained on `Done` for the telemetry shape (a future async-flush
+    // path may repopulate it). `tier2_ms` still measures the Tier-2 summarize.
+    let flush_ms: Option<u32> = None;
     let mut tier2_ms: Option<u32> = None;
     let mut tier1_fires: u32 = 0;
     let mut tier2_fires: u32 = 0;
@@ -1109,49 +1107,6 @@ pub async fn run_turn(
             ingest.messages
         };
         let pressure = estimator.assess(&history, model);
-        // Carries the flush's write count to the `MemoryFlushed` event below, once
-        // this iteration's assistant message id exists to correlate it with.
-        let mut flushed_writes: Option<u32> = None;
-        if !cancel.is_cancelled()
-            && flush_due(
-                pressure,
-                message_count,
-                last_flush_count,
-                DEFAULT_FLUSH_AT_FRACTION,
-                DEFAULT_REFLUSH_INTERVAL_MESSAGES,
-            )
-        {
-            // #971: time the flush -- an agentic sub-loop of up to MAX_FLUSH_ITERATIONS
-            // LLM round-trips, the dominant "other" latency on a memory-edit turn.
-            let flush_clock = std::time::Instant::now();
-            // Surface provenance (#283) when the flush actually wrote durable facts;
-            // a no-op / NoReply / failure stays silent (best-effort — never aborts
-            // the user's turn).
-            let flush_model = tools.compaction_model.as_deref().unwrap_or(model);
-            if let Ok(CompactionOutcome::Wrote { writes }) = MemoryFlush
-                .compact(CompactionContext {
-                    provider,
-                    store,
-                    registry: tools.registry,
-                    root: tools.root,
-                    session_id,
-                    model: flush_model,
-                    cancel: cancel.clone(),
-                })
-                .await
-            {
-                if writes > 0 {
-                    // Explicit narrowing across the usize -> u32 contract boundary;
-                    // an implausible overflow degrades to "no event" rather than wrapping.
-                    flushed_writes = u32::try_from(writes).ok();
-                }
-            }
-            let elapsed = u32::try_from(flush_clock.elapsed().as_millis()).unwrap_or(u32::MAX);
-            flush_ms = Some(flush_ms.unwrap_or(0).saturating_add(elapsed));
-            // Record the attempt regardless of outcome so a no-op or failing flush
-            // does not re-fire every iteration.
-            last_flush_count = Some(message_count);
-        }
 
         let mut messages = Vec::new();
         if let Some(system) = system_prompt {
@@ -1439,15 +1394,6 @@ pub async fn run_turn(
         // backfills an interrupted notice on Drop so the row is never a silent
         // blank bubble. `finalize()` disarms it on every normal exit path.
         let mut row_guard = AssistantRowGuard::new(store, session_id, message_id.clone());
-
-        // Provenance for a flush that ran at the top of this iteration (#283): now
-        // that the turn's assistant message id exists, correlate the event with it.
-        if let Some(writes) = flushed_writes {
-            on_event(AgentEvent::MemoryFlushed {
-                message_id: message_id.clone(),
-                writes,
-            });
-        }
 
         // Graceful-degradation notice (#338): when the active model can't carry an
         // attachment kind, the per-provider capability strip silently drops it
