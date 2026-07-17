@@ -27,6 +27,7 @@ mod compaction_abstractive;
 mod compaction_cache;
 mod compaction_extractive;
 mod goal_loop;
+mod message_salience;
 mod system_prompt;
 pub use compaction::{
     flush_due, CompactionContext, CompactionOutcome, CompactionStrategy, ContextPressure,
@@ -42,6 +43,7 @@ pub use compaction_extractive::{
     ExtractiveCompactor, GradedBands, ReversibleCache, COMPACTION_MARKER_PREFIX,
 };
 pub use goal_loop::{drive_goal, GateDecision, GoalIteration, IterationOutcome, LoopStop};
+pub use message_salience::MessageSalience;
 pub use system_prompt::{
     build_flush_prompt, build_system_prompt, SystemPrompt, TimeOfDay, UserContext,
 };
@@ -1189,6 +1191,12 @@ pub async fn run_turn(
         let wire = if pressure.is_over(EXTRACTIVE_COMPACT_AT_FRACTION) {
             tier1_fires += 1;
             let graded = GradedBands::graded_v1();
+            // #933 / RFC 0022 Step 2b: value-aware band selection. Content-only
+            // salience (role, size) keeps important older messages sharp and folds
+            // low-value bulk harder — cache-stable because the score is a pure
+            // function of the message, so a given message resolves to the same band
+            // every turn (the frozen-boundary invariant).
+            let scorer = MessageSalience::default();
             let n = history.len();
             let new_cold_end = n.saturating_sub(KEEP_RECENT_VERBATIM);
 
@@ -1204,7 +1212,12 @@ pub async fn run_turn(
                     // `boundary..` — identical to what a full pass would choose for
                     // those same indices, preserving the frozen-boundary invariant.
                     let fresh_cold = &history[*boundary..new_cold_end];
-                    let fresh = graded.compact_graded_range(fresh_cold, *boundary, new_cold_end);
+                    let fresh = graded.compact_graded_range(
+                        fresh_cold,
+                        *boundary,
+                        new_cold_end,
+                        Some(&scorer),
+                    );
                     for (mid, key, original) in &fresh.originals {
                         store.put_compaction_original(session_id, mid, key, original);
                     }
@@ -1218,7 +1231,8 @@ pub async fn run_turn(
                 }
                 _ => {
                     // First compaction this turn (or boundary invalidated/stale): full pass.
-                    let cold = graded.compact_graded_collect(&history, KEEP_RECENT_VERBATIM);
+                    let cold =
+                        graded.compact_graded_range(&history, 0, new_cold_end, Some(&scorer));
                     for (mid, key, original) in &cold.originals {
                         store.put_compaction_original(session_id, mid, key, original);
                     }

@@ -35,6 +35,7 @@
 //! holds only what the model might need to pull back.
 
 use ff_core::{Message, Role};
+use ff_memory::Salience;
 use std::collections::BTreeMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
 
@@ -594,20 +595,48 @@ impl GradedBands {
         ])
     }
 
-    /// The compactor governing a message at absolute `index`.
-    #[must_use]
-    pub fn compactor_for(&self, index: usize) -> &ExtractiveCompactor {
-        // `bands` is non-empty and starts at 0 (see `new`/`default`), so the search
-        // always finds a band.
-        let mut chosen = &self.bands[0].1;
-        for (start, compactor) in &self.bands {
+    /// The band slot (index into `bands`) governing a message at absolute `index`,
+    /// by depth alone. `bands` is non-empty and starts at 0, so this always resolves.
+    fn band_slot_for(&self, index: usize) -> usize {
+        let mut slot = 0;
+        for (i, (start, _)) in self.bands.iter().enumerate() {
             if *start <= index {
-                chosen = compactor;
+                slot = i;
             } else {
                 break;
             }
         }
-        chosen
+        slot
+    }
+
+    /// The compactor governing a message at absolute `index` (depth only).
+    #[must_use]
+    pub fn compactor_for(&self, index: usize) -> &ExtractiveCompactor {
+        &self.bands[self.band_slot_for(index)].1
+    }
+
+    /// Salience-shifted band (#933 / RFC 0022 Step 2b): start from the depth-based
+    /// band, then shift by the message's value score so an *important* older message
+    /// stays in a gentler band (or verbatim-ish) while low-value bulk folds harder,
+    /// regardless of position. Bands are ordered gentlest-last, so a higher score
+    /// moves toward a later (gentler) slot.
+    ///
+    /// Cache-stable by construction: `index` is absolute and `score` is a pure
+    /// function of the message's content (see [`crate::MessageSalience`]), so the
+    /// resolved band is identical every turn — the frozen-boundary invariant #970
+    /// relies on. `score == None` reproduces pure depth grading (Step 1).
+    #[must_use]
+    pub fn compactor_for_scored(&self, index: usize, score: Option<f32>) -> &ExtractiveCompactor {
+        let base = self.band_slot_for(index) as isize;
+        let delta = match score {
+            // Gentler for high-value, harder for low-value; flat in the middle.
+            Some(s) if s >= 0.75 => 2,
+            Some(s) if s >= 0.55 => 1,
+            Some(s) if s <= 0.35 => -1,
+            _ => 0,
+        };
+        let slot = (base + delta).clamp(0, self.bands.len() as isize - 1) as usize;
+        &self.bands[slot].1
     }
 
     /// Graded counterpart of [`ExtractiveCompactor::compact_cold_collect`]: compact
@@ -620,7 +649,12 @@ impl GradedBands {
         messages: &[Message],
         keep_recent: usize,
     ) -> ColdCompaction {
-        self.compact_graded_range(messages, 0, messages.len().saturating_sub(keep_recent))
+        self.compact_graded_range(
+            messages,
+            0,
+            messages.len().saturating_sub(keep_recent),
+            None,
+        )
     }
 
     /// Graded counterpart of [`ExtractiveCompactor::compact_range_collect`]: compact
@@ -628,12 +662,19 @@ impl GradedBands {
     /// frozen-boundary path to grade only the newly-cold slice while the cached
     /// prefix stays frozen. `cold_end` is the absolute index (exclusive) past which
     /// messages are kept verbatim.
+    ///
+    /// `scorer` (#933 / RFC 0022 Step 2b) makes band choice value-aware: an
+    /// important older message stays in a gentler band, low-value bulk folds harder.
+    /// `None` reproduces pure depth grading (Step 1). Cache stability holds either
+    /// way because band choice is a pure function of (absolute index, message
+    /// content) — see [`Self::compactor_for_scored`].
     #[must_use]
     pub fn compact_graded_range(
         &self,
         messages: &[Message],
         base_index: usize,
         cold_end: usize,
+        scorer: Option<&dyn Salience<Message>>,
     ) -> ColdCompaction {
         let mut before = 0usize;
         let mut after = 0usize;
@@ -646,7 +687,10 @@ impl GradedBands {
                 && m.role != Role::Assistant
                 && !m.content.contains(COMPACTION_MARKER_PREFIX)
             {
-                let outcome = self.compactor_for(index).compress_one(&m.content);
+                let score = scorer.map(|s| s.score(m, 0));
+                let outcome = self
+                    .compactor_for_scored(index, score)
+                    .compress_one(&m.content);
                 after += proxy_tokens(&outcome.text);
                 if let Some((key, original)) = outcome.original {
                     originals.push((m.id.clone(), key, original));
