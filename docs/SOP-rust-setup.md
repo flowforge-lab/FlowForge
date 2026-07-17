@@ -304,7 +304,32 @@ The everyday loop: build locally and replace the installed app. No updater, no s
 ```
 
 It runs `pnpm tauri build`, replaces `/Applications/FlowForge.app` with the fresh bundle,
-clears the quarantine flag, and tells you to relaunch. Use this for almost all dogfooding.
+clears the quarantine flag, **ad-hoc codesigns** the app, and tells you to relaunch. Use
+this for almost all dogfooding.
+
+> **Do not stop at `pnpm build:local` alone** if you want a runnable installed app.
+> `build:local` produces the `.app`/`.dmg` and (on macOS) ad-hoc codesigns the bundle under
+> `target/release/bundle/macos/`. Opening an *unsigned* copy — or one still marked with
+> Gatekeeper quarantine — is a common cause of a blank charcoal window on macOS 26 even
+> though `pnpm tauri dev` works. Prefer `./scripts/dev-install.sh`, or after `build:local`:
+>
+> ```bash
+> rm -rf /Applications/FlowForge.app
+> cp -R target/release/bundle/macos/FlowForge.app /Applications/
+> xattr -dr com.apple.quarantine /Applications/FlowForge.app
+> codesign --force --deep --sign - /Applications/FlowForge.app
+> open /Applications/FlowForge.app
+> ```
+>
+> If the window is still blank, clear webview + app caches (state under `$HOME` is separate
+> from Tony’s Vite race advice — that only applies to `tauri dev`):
+>
+> ```bash
+> rm -rf ~/Library/WebKit/ai.flowforge.desktop
+> rm -rf ~/Library/Caches/ai.flowforge.desktop
+> # optional hard reset of session DB (destructive):
+> # rm -rf ~/Library/Application\ Support/flowforge/
+> ```
 
 ### 8.3 D1 — local update feed (optional, exercises "Update now")
 

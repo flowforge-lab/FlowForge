@@ -3731,10 +3731,15 @@ pub fn run() {
         // Boot trace (#599 item 0): stamp when the webview begins loading our
         // HTML (webview process up) and when the document finishes loading. These
         // now land BEFORE `app_state_new` — the win this reordering buys.
-        .on_page_load(|_webview, payload| match payload.event() {
-            tauri::webview::PageLoadEvent::Started => boot_trace("webview.page-load-started", None),
-            tauri::webview::PageLoadEvent::Finished => {
-                boot_trace("webview.page-load-finished", None)
+        .on_page_load(|_webview, payload| {
+            let url = payload.url().to_string();
+            match payload.event() {
+                tauri::webview::PageLoadEvent::Started => {
+                    boot_trace("webview.page-load-started", Some(&url))
+                }
+                tauri::webview::PageLoadEvent::Finished => {
+                    boot_trace("webview.page-load-finished", Some(&url))
+                }
             }
         })
         .setup(move |app| {
