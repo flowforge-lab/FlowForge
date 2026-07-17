@@ -280,13 +280,6 @@ pub enum AgentEvent {
         /// token, or for events not from `run_turn`.
         #[serde(skip_serializing_if = "Option::is_none")]
         prompt_latency_ms: Option<u32>,
-        /// #971: total wall-clock (ms) spent in the pre-main-call **memory flush**
-        /// this turn, summed across iterations. The flush is an agentic sub-loop of
-        /// up to `MAX_FLUSH_ITERATIONS` LLM round-trips; its cost is otherwise
-        /// invisible (folded into the host's `firstTokenMs` as "other", and its
-        /// tokens don't reach `TurnUsage`). `None` when no flush ran.
-        #[serde(skip_serializing_if = "Option::is_none")]
-        flush_ms: Option<u32>,
         /// #971: total wall-clock (ms) spent in the pre-main-call **Tier-2
         /// abstractive summarize** this turn (the `summarize_cold` LLM call only;
         /// the cross-turn-cache reuse path is excluded). The dominant "other"
@@ -716,6 +709,7 @@ fn context_breakdown(
     system_prompt: Option<&SystemPrompt>,
     tool_schemas: &[serde_json::Value],
     messages: &[Message],
+    wire_tokens: u32,
 ) -> ContextBreakdown {
     // NOTE: summing two independent count_tokens calls may differ from
     // count_tokens(full()) by ±1 token at the split boundary (the tokenizer
@@ -730,7 +724,7 @@ fn context_breakdown(
     };
     // Per-message count_tokens(content) + count_tokens(reasoning): mirrors
     // ProxyTokenEstimator::assess exactly (#378 reasoning replay).
-    let message_tokens: u32 = messages
+    let verbatim_tokens: u32 = messages
         .iter()
         .map(|m| {
             ff_llm::count_tokens(&m.content)
@@ -741,7 +735,8 @@ fn context_breakdown(
         system_tokens,
         tool_tokens,
         tool_specs: tool_schemas.len() as u32,
-        message_tokens,
+        verbatim_tokens,
+        wire_tokens,
         message_count: messages.len() as u32,
     }
 }
@@ -1054,11 +1049,6 @@ pub async fn run_turn(
     // #971: per-phase pre-main-call compaction wall-clock, accumulated across
     // iterations. `firstTokenMs` (host-side, anchored at turn_start) folds these in
     // as opaque "other"; splitting them out tells an over-budget turn's spike apart
-    // #991: the flush moved off the critical path (post-turn only), so `run_turn`
-    // no longer accumulates flush time — `flush_ms` is always `None` here. The
-    // field is retained on `Done` for the telemetry shape (a future async-flush
-    // path may repopulate it). `tier2_ms` still measures the Tier-2 summarize.
-    let flush_ms: Option<u32> = None;
     let mut tier2_ms: Option<u32> = None;
     let mut tier1_fires: u32 = 0;
     let mut tier2_fires: u32 = 0;
@@ -1751,13 +1741,17 @@ pub async fn run_turn(
                 token_count,
                 prefill_estimates: Some(prefill_estimates.clone()),
                 prompt_latency_ms,
-                flush_ms,
                 tier2_ms,
                 tier1_fires: Some(tier1_fires),
                 tier2_fires: Some(tier2_fires),
                 cache_hit_tokens: Some(cache_hit_tokens),
                 cache_miss_tokens: Some(cache_miss_tokens),
-                breakdown: Some(context_breakdown(system_prompt, &tool_schemas, &final_msgs)),
+                breakdown: Some(context_breakdown(
+                    system_prompt,
+                    &tool_schemas,
+                    &final_msgs,
+                    prefill_estimates.last().copied().unwrap_or(0),
+                )),
                 usage: Some(TurnUsage {
                     input_tokens: input_tokens_total,
                     output_tokens: output_tokens_total,
@@ -2178,6 +2172,7 @@ pub async fn run_turn(
     // Same context-size estimate as the plain-text completion path (#244 R6).
     let final_msgs = store.get_messages(session_id);
     let token_count = Some(estimator.assess(&final_msgs, model).estimated_tokens as u32);
+    let wire_tokens = prefill_estimates.last().copied().unwrap_or(0);
     on_event(AgentEvent::Done {
         message_id: msg.id.clone(),
         final_message: Some(msg.content.clone()),
@@ -2186,13 +2181,17 @@ pub async fn run_turn(
         token_count,
         prefill_estimates: Some(prefill_estimates),
         prompt_latency_ms,
-        flush_ms,
         tier2_ms,
         tier1_fires: Some(tier1_fires),
         tier2_fires: Some(tier2_fires),
         cache_hit_tokens: Some(cache_hit_tokens),
         cache_miss_tokens: Some(cache_miss_tokens),
-        breakdown: Some(context_breakdown(system_prompt, &tool_schemas, &final_msgs)),
+        breakdown: Some(context_breakdown(
+            system_prompt,
+            &tool_schemas,
+            &final_msgs,
+            wire_tokens,
+        )),
         usage: Some(TurnUsage {
             input_tokens: input_tokens_total,
             output_tokens: output_tokens_total,

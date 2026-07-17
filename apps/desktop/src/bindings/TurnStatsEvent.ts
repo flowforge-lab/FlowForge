@@ -57,15 +57,6 @@ firstTokenMs?: number,
  */
 promptLatencyMs?: number, 
 /**
- * #971: wall-clock (ms) spent in the pre-main-call **memory flush** this turn
- * (an agentic sub-loop of up to `MAX_FLUSH_ITERATIONS` LLM round-trips),
- * summed across iterations. Part of the "other" that [`Self::first_token_ms`]
- * absorbs and that caching cannot touch. Together with [`Self::tier2_ms`] it
- * attributes an over-budget latency spike to the flush vs the summarizer.
- * `None` when no flush ran this turn.
- */
-flushMs?: number, 
-/**
  * #971: wall-clock (ms) spent in the pre-main-call **Tier-2 abstractive
  * summarize** this turn (the uncached `summarize_cold` LLM call; the
  * cross-turn-cache reuse path is excluded). The dominant "other" latency on

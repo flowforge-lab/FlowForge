@@ -28,7 +28,6 @@ function seed(tokens: number | null | undefined, budget?: number | null) {
     sessionTotalsBySession: {},
     ttftBySession: {},
     promptLatencyBySession: {},
-    flushMsBySession: {},
     tier2MsBySession: {},
   });
   useSessionModelStore.setState({ resolvedBySession: {} });
@@ -41,7 +40,6 @@ function seedPopover(opts: {
   model?: string;
   ttft?: number;
   promptLatencyMs?: number;
-  flushMs?: number;
   tier2Ms?: number;
 }) {
   const inputs: Record<string, number> =
@@ -59,7 +57,6 @@ function seedPopover(opts: {
     ttftBySession: opts.ttft == null ? {} : { [SID]: opts.ttft },
     promptLatencyBySession:
       opts.promptLatencyMs == null ? {} : { [SID]: opts.promptLatencyMs },
-    flushMsBySession: opts.flushMs == null ? {} : { [SID]: opts.flushMs },
     tier2MsBySession: opts.tier2Ms == null ? {} : { [SID]: opts.tier2Ms },
   });
   if (opts.model) {
@@ -172,7 +169,8 @@ describe("ContextGauge — popover (#931)", () => {
     systemTokens: 12_000,
     toolTokens: 2_900,
     toolSpecs: 1,
-    messageTokens: 158_000,
+    verbatimTokens: 200_000,
+    wireTokens: 158_000,
     messageCount: 122,
   };
   const TOTALS: TurnUsage = {
@@ -230,7 +228,6 @@ describe("ContextGauge — popover (#931)", () => {
       model: "claude-opus-4-8",
       ttft: 8_200,
       promptLatencyMs: 6_000,
-      flushMs: 1_400,
       tier2Ms: 800,
     });
     render(<ContextGauge sessionId={SID} />);
@@ -253,7 +250,6 @@ describe("ContextGauge — popover (#931)", () => {
       pctUsed: 115,
       ttft: 8_200,
       promptLatencyMs: 6_000,
-      flushMs: 1_400,
       tier2Ms: 800,
       breakdown: BREAKDOWN,
       sessionTotals: TOTALS,
@@ -343,7 +339,6 @@ describe("ContextGauge — popover (#931)", () => {
       breakdown: BREAKDOWN,
       ttft: 8_200,
       promptLatencyMs: 6_000,
-      flushMs: 1_400,
       tier2Ms: 800,
     });
     render(<ContextGauge sessionId={SID} />);
@@ -351,7 +346,7 @@ describe("ContextGauge — popover (#931)", () => {
     const text =
       document.querySelector('[data-slot="popover-content"]')?.textContent ??
       "";
-    expect(text).toContain("main 6.0s · flush 1.4s · summarize 800ms");
+    expect(text).toContain("main 6.0s · summarize 800ms");
   });
 
   it("omits phases the turn did not run (#971)", () => {

@@ -21,10 +21,18 @@ toolTokens: number,
  */
 toolSpecs: number, 
 /**
- * Estimated tokens of the persisted message transcript (user/assistant/tool).
+ * Estimated tokens of the **verbatim** persisted message transcript
+ * (user/assistant/tool) — the store, before any compaction. Formerly
+ * `messageTokens`; renamed to distinguish from `wireTokens` (#997).
  */
-messageTokens: number, 
+verbatimTokens: number, 
 /**
- * Number of messages in the transcript.
+ * Estimated tokens of the **compacted wire** actually sent to the model this
+ * turn (post Tier-1 extractive + Tier-2 abstractive). This is what `pctUsed`
+ * should be computed from — it reflects prefill cost, not store size (#997).
+ */
+wireTokens: number, 
+/**
+ * Number of messages in the verbatim transcript.
  */
 messageCount: number, };

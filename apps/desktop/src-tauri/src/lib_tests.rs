@@ -620,20 +620,18 @@ fn turn_metrics_empty_turn_is_zeroed() {
 #[test]
 fn turn_metrics_note_done_captures_prompt_latency() {
     let mut m = TurnMetrics::default();
-    m.note_done(&[123], Some(42), Some(500), Some(9000), 1, 0);
+    m.note_done(&[123], Some(42), Some(9000), 1, 0);
     assert_eq!(
         m.prompt_latency_ms,
         Some(42),
         "prompt latency stored verbatim"
     );
-    assert_eq!(m.flush_ms, Some(500), "#971 flush_ms stored verbatim");
     assert_eq!(m.tier2_ms, Some(9000), "#971 tier2_ms stored verbatim");
     assert_eq!(m.prefill_estimates, vec![123]);
     assert_eq!(m.tier1_fires, 1);
     // A None from an emitter that didn't compute it stays None.
-    m.note_done(&[], None, None, None, 0, 0);
+    m.note_done(&[], None, None, 0, 0);
     assert_eq!(m.prompt_latency_ms, None);
-    assert_eq!(m.flush_ms, None);
     assert_eq!(m.tier2_ms, None);
 }
 
@@ -674,7 +672,7 @@ fn turn_metrics_note_done_folds_f1b_telemetry() {
     // #441: the per-round-trip prefill estimate and the two compaction-fire
     // counts from the turn's Done event are captured verbatim for `turn:stats`.
     let mut m = TurnMetrics::default();
-    m.note_done(&[120, 340, 75], None, None, None, 2, 1);
+    m.note_done(&[120, 340, 75], None, None, 2, 1);
     assert_eq!(m.prefill_estimates, vec![120, 340, 75]);
     assert_eq!(m.tier1_fires, 2);
     assert_eq!(m.tier2_fires, 1);
@@ -928,7 +926,6 @@ async fn emit_agent_event_maps_done_to_turn_done_event() {
         token_count: Some(42),
         prefill_estimates: None,
         prompt_latency_ms: None,
-        flush_ms: None,
         tier2_ms: None,
         tier1_fires: None,
         tier2_fires: None,

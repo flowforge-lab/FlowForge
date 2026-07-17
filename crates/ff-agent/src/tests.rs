@@ -5876,7 +5876,7 @@ fn context_breakdown_splits_system_tools_and_messages() {
         msg(Role::Assistant, &"z".repeat(16), Some(&"r".repeat(4))),
     ];
 
-    let b = context_breakdown(Some(&system), &tool_schemas, &messages);
+    let b = context_breakdown(Some(&system), &tool_schemas, &messages, 42);
 
     // Buckets use the same tokenx-rs estimator as ProxyTokenEstimator::assess.
     assert!(
@@ -5890,9 +5890,10 @@ fn context_breakdown_splits_system_tools_and_messages() {
         "non-empty tool schemas -> non-zero tokens"
     );
     assert!(
-        b.message_tokens > 0,
+        b.verbatim_tokens > 0,
         "non-empty messages -> non-zero tokens"
     );
+    assert_eq!(b.wire_tokens, 42, "wire_tokens passed through");
 
     // Key invariant: message_tokens must equal what the estimator computes for
     // the same messages (so the popover bar sums to token_count).
@@ -5901,17 +5902,18 @@ fn context_breakdown_splits_system_tools_and_messages() {
     };
     let pressure = estimator.assess(&messages, "any");
     assert_eq!(
-        b.message_tokens, pressure.estimated_tokens as u32,
-        "breakdown.message_tokens must equal estimator.assess() for same messages"
+        b.verbatim_tokens, pressure.estimated_tokens as u32,
+        "breakdown.verbatim_tokens must equal estimator.assess() for same messages"
     );
 }
 
 #[test]
 fn context_breakdown_handles_absent_system_prompt() {
-    let b = context_breakdown(None, &[], &[]);
+    let b = context_breakdown(None, &[], &[], 0);
     assert_eq!(b.system_tokens, 0);
     assert_eq!(b.tool_tokens, 0);
     assert_eq!(b.tool_specs, 0);
-    assert_eq!(b.message_tokens, 0);
+    assert_eq!(b.verbatim_tokens, 0);
+    assert_eq!(b.wire_tokens, 0);
     assert_eq!(b.message_count, 0);
 }
