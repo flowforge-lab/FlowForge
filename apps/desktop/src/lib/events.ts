@@ -13,6 +13,7 @@ import { useScheduledStore } from "@/store/scheduled";
 import { useUpdateStore } from "@/store/update";
 import { useSessionWorkspaceStore } from "@/store/session-workspace";
 import { useGoalStore } from "@/store/goal";
+import { useProcessesStore } from "@/store/processes";
 
 let started = false;
 
@@ -53,6 +54,12 @@ export function startIpcEvents(): void {
   });
   void ipc.onToolOutput(store.applyToolOutputChunk);
   void ipc.onToolResult(store.applyToolResult);
+  // Background-process output (#873/#987): a session-scoped, cross-turn sink,
+  // independent of the turn/message lifecycle above. Bound methods dispatch
+  // straight into the processes store — no token-batcher ordering to respect.
+  const procs = useProcessesStore.getState();
+  void ipc.onProcessOutput(procs.applyProcessOutput);
+  void ipc.onProcessExited(procs.applyProcessExited);
   void ipc.onTurnStats(store.applyTurnStats);
   void ipc.onApprovalRequest(store.applyApprovalRequest);
   void ipc.onAskRequest(store.applyAskRequest);

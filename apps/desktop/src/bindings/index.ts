@@ -29,6 +29,8 @@ export type { ApprovalSafety } from "./ApprovalSafety";
 export type { ToolCallEvent } from "./ToolCallEvent";
 export type { ToolResultEvent } from "./ToolResultEvent";
 export type { ToolOutputChunkEvent } from "./ToolOutputChunkEvent";
+export type { ProcessOutputEvent } from "./ProcessOutputEvent";
+export type { ProcessExitedEvent } from "./ProcessExitedEvent";
 export type { OutputStreamKind } from "./OutputStreamKind";
 export type { TurnDoneEvent } from "./TurnDoneEvent";
 export type { ContextBreakdown } from "./ContextBreakdown";

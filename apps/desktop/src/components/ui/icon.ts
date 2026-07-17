@@ -83,6 +83,7 @@ export {
   Star,
   Sun,
   Target,
+  Terminal,
   TextCursorInput,
   Trash2,
   Upload,
