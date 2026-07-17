@@ -61,11 +61,12 @@ function formatPrefillShare(
   return `prompt ${formatLatencyMs(promptLatencyMs)} (${share}%) · other ${formatLatencyMs(otherMs)}`;
 }
 
-// Per-phase attribution of the pre-first-token wait (#971): `main 3ms · flush
-// 1.4s · summarize 800ms`, splitting the prefill-share's opaque "other" into the
-// memory flush and the Tier-2 summarizer. `main` is the cache-warm prefill
+// Per-phase attribution of the pre-first-token wait (#971): `main 3ms ·
+// summarize 800ms`, splitting the prefill-share's opaque "other" into the Tier-2
+// summarizer. (The memory flush no longer runs on the critical path since #992,
+// so `flushMs` was retired in #997.) `main` is the cache-warm prefill
 // (`promptLatencyMs`); only phases the turn actually ran are shown. Returns
-// `null` when neither compaction phase fired, so a plain turn keeps just the
+// `null` when the Tier-2 phase didn't fire, so a plain turn keeps just the
 // prefill-share line above.
 function formatPhaseBreakdown(
   promptLatencyMs: number | undefined,

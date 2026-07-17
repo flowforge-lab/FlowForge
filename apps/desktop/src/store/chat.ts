@@ -1142,9 +1142,10 @@ export const useChatStore = create<ChatState>((set, get) => ({
         const { [e.sessionId]: _, ...rest } = s.promptLatencyBySession;
         next.promptLatencyBySession = rest;
       }
-      // #971: per-phase compaction wall-clock. Store when the turn reported it;
-      // otherwise, on a fresh TTFT, drop a stale value from a prior turn so the
-      // attribution row never shows another turn's flush/summarize.
+      // #971: per-phase compaction wall-clock (Tier-2 summarize; flush retired in
+      // #997). Store when the turn reported it; otherwise, on a fresh TTFT, drop a
+      // stale value from a prior turn so the attribution row never shows another
+      // turn's summarize.
       if (e.tier2Ms != null) {
         next.tier2MsBySession = {
           ...s.tier2MsBySession,
