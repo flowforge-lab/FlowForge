@@ -14,7 +14,7 @@ use ff_core::{
     model_supports_documents, model_supports_vision, BedrockAuth, ConnectionId, GoalStore,
     McpScope, McpServerConfig, McpServerState, McpServerStatus, Mode, ModelSelection, Phenotype,
     ProviderConfig, ProviderConnection, ProviderKind, ProviderRegistry, ResolvedModel,
-    SearchConfig, SecretKind, SessionWorkspace,
+    SearchBackend, SearchConfig, SecretKind, SessionWorkspace,
 };
 use ff_llm::{
     ollama_num_ctx_from_env, reasoning_control, wire_dialect, BedrockCreds, BedrockProvider,
@@ -752,6 +752,34 @@ fn save_search_config(config: &SearchConfig) {
     if let Err(e) = write_atomic(&path, &json) {
         tracing::warn!(path = %path.display(), error = %e,
             "search config save failed; in-memory state authoritative this session");
+    }
+}
+
+/// Synthetic keychain "connection id" for a search backend's API key (#1010).
+/// Search sources are not provider connections, so they get their own `search:*`
+/// account namespace, reusing [`SecretKind::ApiKey`] — no `SecretKind` change.
+fn search_secret_conn_id(backend: SearchBackend) -> &'static str {
+    match backend {
+        SearchBackend::Tavily => "search:tavily",
+        SearchBackend::SearxNg => "search:searxng",
+        SearchBackend::Brave => "search:brave",
+        SearchBackend::OpenAiCompatible => "search:openai-compatible",
+    }
+}
+
+/// Whether a search backend has an API key stored in the OS keychain (#1010).
+fn search_backend_has_key(backend: SearchBackend) -> bool {
+    crate::secrets::get(search_secret_conn_id(backend), SecretKind::ApiKey).is_some()
+}
+
+/// Host [`SearchKeyProvider`](ff_tools::SearchKeyProvider): resolves a search
+/// backend's API key from the OS keychain and injects it into the `web_search`
+/// tool (which cannot depend on the host `secrets` module). #1010.
+struct KeychainSearchKeys;
+
+impl ff_tools::SearchKeyProvider for KeychainSearchKeys {
+    fn key_for(&self, backend: SearchBackend) -> Option<String> {
+        crate::secrets::get(search_secret_conn_id(backend), SecretKind::ApiKey)
     }
 }
 
@@ -1947,8 +1975,9 @@ impl AppState {
     /// never races an in-flight tool call — same discipline as skill snapshots.
     pub fn build_tool_registry(&self, session_root: &Path) -> ToolRegistry {
         let mut reg = ToolRegistry::with_defaults();
-        reg.register(Box::new(ff_tools::WebSearchTool::new(
+        reg.register(Box::new(ff_tools::WebSearchTool::with_keys(
             self.search_config.clone(),
+            std::sync::Arc::new(KeychainSearchKeys),
         )));
         reg.register(Box::new(crate::tools::InstallSkillTool::new(
             skills_root(),
@@ -2539,7 +2568,11 @@ impl AppState {
 
     /// Current web-search settings (clone — callers never hold the lock).
     pub fn search_config(&self) -> SearchConfig {
-        self.search_config.lock().unwrap().clone()
+        let mut config = self.search_config.lock().unwrap().clone();
+        // `has_key` is derived from the keychain, never persisted (#1010): the FE
+        // shows key-set state without the secret ever entering the config blob.
+        config.has_key = search_backend_has_key(config.backend);
+        config
     }
 
     /// Replace and persist web-search settings. Visible to the `web_search` tool on
@@ -2547,6 +2580,17 @@ impl AppState {
     pub fn set_search_config(&self, config: SearchConfig) {
         save_search_config(&config);
         *self.search_config.lock().unwrap() = config;
+    }
+
+    /// Store an API key for a search backend in the OS keychain (#1010). The secret
+    /// never enters the persisted `SearchConfig`; `has_key` is derived from presence.
+    pub fn set_search_secret(&self, backend: SearchBackend, value: &str) -> Result<(), String> {
+        crate::secrets::set(search_secret_conn_id(backend), SecretKind::ApiKey, value)
+    }
+
+    /// Clear a search backend's stored API key (#1010).
+    pub fn clear_search_secret(&self, backend: SearchBackend) -> Result<(), String> {
+        crate::secrets::clear(search_secret_conn_id(backend), SecretKind::ApiKey)
     }
 
     /// The persisted Control-panel config blob (#147), or the factory default on
