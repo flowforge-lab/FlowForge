@@ -23,6 +23,9 @@ echo "==> Clearing quarantine on $APP"
 xattr -dr com.apple.quarantine "$APP" || true
 
 echo "==> Ad-hoc codesign"
+# `--deep` is deprecated by Apple (prefer signing each nested code item), but for
+# ad-hoc local/dev bundles with no embedded frameworks to walk, it remains fine
+# and matches scripts/dev-install.sh.
 codesign --force --deep --sign - "$APP"
 
 echo "==> Local bundle ready: $APP"

@@ -56,6 +56,8 @@ xattr -dr com.apple.quarantine "$INSTALL_DIR/$APP_NAME" || true
 
 # Ad-hoc codesign with a stable identity so macOS Keychain recognizes the app
 # across rebuilds and stops prompting for keychain access on every launch.
+# `--deep` is deprecated by Apple (prefer signing nested items individually);
+# fine for ad-hoc local/dev builds — same as scripts/codesign-local-macos.sh.
 echo "==> Codesigning (ad-hoc)"
 codesign --force --deep --sign - "$INSTALL_DIR/$APP_NAME"
 
