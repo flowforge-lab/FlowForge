@@ -51,10 +51,14 @@ export function ActiveProseBlock({
   // re-collapse an expanded view (same pattern as ThoughtRow and
   // ThinkingBlock).
   const [userExpanded, setUserExpanded] = useState<boolean | null>(null);
-  const isCollapsed =
-    streaming &&
-    text.length > ACTIVE_PROSE_COLLAPSE_THRESHOLD &&
-    userExpanded !== true;
+  // `collapsible` = this prose can toggle at all (long, still streaming);
+  // `isCollapsed` = it's toggleable AND currently folded. The chip's *presence*
+  // as an interactive control keys on `collapsible`, so a mid-stream expand
+  // keeps a working collapse affordance (#986). Retirement (settled/short prose)
+  // keys on `!collapsible`.
+  const collapsible =
+    streaming && text.length > ACTIVE_PROSE_COLLAPSE_THRESHOLD;
+  const isCollapsed = collapsible && userExpanded !== true;
 
   // Measure the prose content's natural height so the expand transition lands
   // on the real text height — long prose (the whole point of this feature)
@@ -79,9 +83,45 @@ export function ActiveProseBlock({
       data-prose-expanded={!isCollapsed}
       className="flex flex-col"
     >
+      {/* The chip renders *above* the prose so that, once expanded mid-stream,
+          it reads as the header/toggle for the content below it (#986 review) —
+          `🔄 On it ▾` on top, prose underneath — rather than a toggle buried
+          beneath the text. Collapsed looks identical (prose clips to height 0,
+          leaving just the chip). */}
+      <button
+        type="button"
+        onClick={() => setUserExpanded((v) => (v === true ? false : true))}
+        aria-expanded={!isCollapsed}
+        // Visible "On it" text is the accessible name (matches ThoughtRow and
+        // ThinkingBlock); aria-expanded carries the live state to AT.
+        // aria-hidden + tabIndex=-1 retire the button from the a11y tree once
+        // the prose can no longer toggle — settled turns and short prose —
+        // otherwise every such prose would announce a phantom "On it"
+        // affordance (#864 review). While streaming a long prose the chip stays
+        // interactive even when expanded, so it can be re-collapsed (#986).
+        aria-hidden={!collapsible}
+        tabIndex={!collapsible ? -1 : undefined}
+        data-on-it
+        className={cn(
+          "flex w-full items-center gap-1.5 self-start rounded-md px-2.5 py-1 text-left transition-[max-height,opacity] duration-200 ease-out",
+          collapsible
+            ? "max-h-12 text-muted-foreground hover:text-foreground"
+            : "pointer-events-none max-h-0 overflow-hidden opacity-0",
+        )}
+      >
+        <Spinner className="shrink-0 text-muted-foreground" />
+        <span className="font-medium text-foreground/90">On it</span>
+        <ChevronRight
+          className={cn(
+            "size-3.5 shrink-0 transition-transform",
+            !isCollapsed && "rotate-90",
+          )}
+        />
+      </button>
       <div
-        // `overflow-hidden` is required so the clipped state is correct —
-        // without it the prose tail bleeds past max-h-0 into the chip below.
+        // `overflow-hidden` is required so the collapsed state clips correctly —
+        // without it the prose tail bleeds past max-h-0 instead of animating to
+        // zero height.
         className="overflow-hidden transition-[max-height,opacity] duration-300 ease-out"
         style={{
           maxHeight: isCollapsed ? 0 : naturalHeight,
@@ -102,34 +142,6 @@ export function ActiveProseBlock({
           <Markdown content={text} streaming={streaming} />
         </div>
       </div>
-      <button
-        type="button"
-        onClick={() => setUserExpanded((v) => (v === true ? false : true))}
-        aria-expanded={!isCollapsed}
-        // Visible "On it" text is the accessible name (matches ThoughtRow and
-        // ThinkingBlock); aria-expanded carries the live state to AT.
-        // aria-hidden + tabIndex=-1 keep the button out of the a11y tree once
-        // the prose is shown — otherwise every settled/expanded prose would
-        // announce a hidden "On it, expanded" affordance (#864 review).
-        aria-hidden={!isCollapsed}
-        tabIndex={!isCollapsed ? -1 : undefined}
-        data-on-it
-        className={cn(
-          "flex w-full items-center gap-1.5 self-start rounded-md px-2.5 py-1 text-left transition-[max-height,opacity] duration-200 ease-out",
-          isCollapsed
-            ? "max-h-12 text-muted-foreground hover:text-foreground"
-            : "pointer-events-none max-h-0 overflow-hidden opacity-0",
-        )}
-      >
-        <Spinner className="shrink-0 text-muted-foreground" />
-        <span className="font-medium text-foreground/90">On it</span>
-        <ChevronRight
-          className={cn(
-            "size-3.5 shrink-0 transition-transform",
-            !isCollapsed && "rotate-90",
-          )}
-        />
-      </button>
     </div>
   );
 }
