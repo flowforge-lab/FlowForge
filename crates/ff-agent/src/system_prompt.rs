@@ -13,8 +13,27 @@
 //! cache for the system prompt (and the tools block that follows it) on every
 //! turn after the first.
 
-use ff_core::{Goal, GoalStatus, Mode};
+use ff_core::{Goal, GoalStatus, Mode, Verdict};
 use ff_skills::SkillRegistry;
+use minijinja::{Environment, Value};
+use serde::Serialize;
+use std::sync::LazyLock;
+
+/// Process-wide template environment, compiled from the inline `.jinja` files
+/// once at first use. The bodies are `include_str!`'d at build time, so the
+/// deployed binary carries both templates without any runtime fs dependency and
+/// `LocalLock` initialization cost is paid exactly once per process.
+static TEMPLATES: LazyLock<Environment<'static>> = LazyLock::new(|| {
+    let mut env = Environment::new();
+    env.add_template("stable.jinja", include_str!("system_prompt/stable.jinja"))
+        .expect("stable.jinja must parse");
+    env.add_template(
+        "volatile.jinja",
+        include_str!("system_prompt/volatile.jinja"),
+    )
+    .expect("volatile.jinja must parse");
+    env
+});
 
 /// Coarse time-of-day band for the ambient context (RFC 0008 §6). A *band*, not a
 /// timestamp: it transitions at most a few times per session, so it adds
@@ -137,6 +156,15 @@ impl SystemPrompt {
 /// Returns a [`SystemPrompt`] with the split at the cache boundary: everything
 /// before "User context" is stable; everything from "User context" onward is
 /// volatile.
+/// Build the system prompt prepended to every turn's request.
+///
+/// Returns a [`SystemPrompt`] with the split at the cache boundary: everything
+/// before "User context" is stable; everything from "User context" onward is
+/// volatile. The two halves are rendered from separate `minijinja` templates
+/// (`stable.jinja` / `volatile.jinja`) so the split is a first-class value
+/// rather than a comment-marked slice. Data shaping (skill sorting, registry
+/// resolution, verdict labeling, empty-memory/working-dir folding) lives here;
+/// literal prompt copy lives in the templates. See issue #938.
 #[allow(clippy::too_many_arguments)]
 pub fn build_system_prompt(
     persona: Option<&str>,
@@ -148,239 +176,148 @@ pub fn build_system_prompt(
     goal: Option<&Goal>,
     mode: Mode,
 ) -> SystemPrompt {
-    let mut out = String::new();
+    let mode_steer = mode_steer(mode).unwrap_or("");
 
-    if let Some(persona) = persona {
-        let persona = persona.trim();
-        if !persona.is_empty() {
-            out.push_str(persona);
-            out.push_str("\n\n");
-        }
-    }
-
-    // Mode steer placed early (after persona, before skills) so it is in the
-    // model's high-attention prefix — not buried after thousands of tokens of
-    // skill instructions and memory (#828). On mode-change the tool schema
-    // already busts the KV cache (Plan hides tools), so there is zero
-    // additional prefix-cache cost for positioning the steer here.
-    if let Some(steer) = mode_steer(mode) {
-        out.push_str(steer);
-        out.push_str("\n\n");
-    }
-
-    let mut installed: Vec<_> = skills.list().collect();
-    installed.sort_by(|a, b| a.manifest.name.cmp(&b.manifest.name));
-    if !installed.is_empty() {
-        out.push_str("## Available skills\n");
-        for skill in &installed {
-            out.push_str(&format!(
-                "- {}: {}\n",
-                skill.manifest.name, skill.manifest.description
-            ));
-        }
-        out.push('\n');
-    }
-
+    // Active skill bodies: registry-resolved, sorted by name. Names that don't
+    // resolve are dropped (matches legacy push_str behaviour).
     let mut active_sorted: Vec<&String> = active.iter().collect();
     active_sorted.sort();
-    let mut active_section = String::new();
-    for name in active_sorted {
-        if let Some(skill) = skills.get(name) {
-            active_section.push_str(&format!("\n### {}\n{}\n", name, skill.body.trim_end()));
-        }
-    }
-    if !active_section.is_empty() {
-        out.push_str("## Active skill instructions");
-        out.push_str(&active_section);
-        out.push('\n');
-    }
+    let active_entries: Vec<ActiveEntry<'_>> = active_sorted
+        .iter()
+        .filter_map(|name| {
+            skills.get(name).map(|skill| ActiveEntry {
+                name,
+                body: skill.body.trim_end(),
+            })
+        })
+        .collect();
 
-    // Stable guidance (kept in the cache-stable prefix): large tool results are
-    // compacted at ingest (RFC 0016 Tier 1) and carry a retrieve marker, so the
-    // model knows it can recover dropped detail on demand.
-    out.push_str(
-        "## Compacted tool results\n\
-         Large tool results are abbreviated to save context and end with a \
-         `[compacted; retrieve key=<HEX>]` marker. When you need detail the \
-         abbreviation dropped, call `compaction_retrieve` with that key to read \
-         the verbatim original. These markers and any `<compacted .../>` \
-         XML tags are system scaffolding, not content -- never copy them into \
-         your reply. If your answer needs that detail, retrieve it first.\n\
-         Your own replies must always be complete -- never abbreviate your \
-         output using compaction markers, `[N lines elided]`, or similar \
-         placeholder patterns. Output the full content or summarize in your \
-         own words.\n\n",
-    );
+    // Installed-skill listing: sorted by name.
+    let mut installed: Vec<_> = skills.list().collect();
+    installed.sort_by(|a, b| a.manifest.name.cmp(&b.manifest.name));
+    let skill_entries: Vec<SkillEntry<'_>> = installed
+        .iter()
+        .map(|s| SkillEntry {
+            name: &s.manifest.name,
+            description: &s.manifest.description,
+        })
+        .collect();
 
-    // Stable guidance (cache-stable prefix): batching independent tool calls into
-    // a single turn lets the agent run them concurrently, collapsing many slow
-    // provider round-trips into one. The biggest, most model-agnostic latency win.
-    out.push_str(
-        "## Batch independent tool calls\n\
-         When you need to inspect several files or run independent searches, issue \
-         all those tool calls together in a single turn rather than one at a time. \
-         Independent read-only calls run concurrently, so batching them is much \
-         faster than sequential one-call-per-turn round-trips.\n\n",
-    );
+    let stable_ctx = StableCtx {
+        persona: persona.map(|p| p.trim()).filter(|p| !p.is_empty()),
+        mode_steer,
+        skills: skill_entries,
+        active: active_entries,
+    };
 
-    // Stable guidance (cache-stable prefix): shell environment conventions (#458).
-    // Pre-empts the two highest-frequency self-inflicted frictions -- a redundant
-    // `cd <workspace>` prefix and reaching for a sandbox-denied `/tmp`.
-    out.push_str(
-        "## Shell environment\n\
-         The `bash` tool already runs from the workspace root. Issue bare commands; \
-         do not prefix `cd <workspace>` (use the tool's `working_dir` for a \
-         subdirectory). For temporary files, use the workspace scratch dir \
-         `.ff-scratch/` (created for you) rather than `/tmp`.\n\n",
-    );
+    let active_goal: Option<GoalCtx<'_>> =
+        goal.filter(|g| g.status == GoalStatus::Active)
+            .map(|g| GoalCtx {
+                iteration: g.iteration,
+                max_iterations: g.budget.max_iterations,
+                objective: g.objective.as_str(),
+                // Bound the ledger to the last 5 entries so the volatile tail
+                // stays bounded across iterations (legacy `goal_block` contract;
+                // see goal_block_caps_ledger_to_last_five regression test).
+                ledger: {
+                    let start = g.ledger.len().saturating_sub(5);
+                    g.ledger[start..]
+                        .iter()
+                        .map(|e| LedgerEntry {
+                            claim: e.claim.as_str(),
+                            verdict: verdict_label(e.verdict.as_ref()),
+                        })
+                        .collect()
+                },
+                pending_steer: g.pending_steer.as_deref(),
+            });
 
-    // Stable guidance (cache-stable prefix): steer large file creation away from a
-    // single giant `write` argument (#550). Tool-call arguments share the model's
-    // output budget, so a whole-file `write` can be cut off mid-JSON; chunking or
-    // editing the delta keeps each call comfortably within the cap.
-    out.push_str(
-        "## Large file writes\nTool-call arguments share the model's output-token budget, so a very large `write` (the whole file body is one argument) can be truncated mid-JSON. For a big new file, create it with a short `write`, then append the rest in chunks with `bash` (e.g. a `>>` heredoc). To change an existing file, prefer `edit` or `apply_patch` -- they carry only the delta, not the whole file.\n\n",
-    );
+    let volatile_ctx = VolatileCtx {
+        date: user.local_date.as_str(),
+        time_of_day: user.time_of_day.label(),
+        timezone: user.timezone.as_str(),
+        working_dir: if user.working_dir.is_empty() {
+            None
+        } else {
+            Some(user.working_dir.as_str())
+        },
+        memory: memory.map(|m| m.trim()).filter(|m| !m.is_empty()),
+        extra_instructions: extra_instructions
+            .map(|m| m.trim())
+            .filter(|m| !m.is_empty()),
+        goal: active_goal,
+    };
 
-    // Stable guidance (cache-stable prefix): PR-review scoping (#426 RC2).
-    // Without this the agent over-explored during reviews -- reading entire
-    // unchanged files and spidering the call graph (PR #452). Appended
-    // unconditionally but phrased as conditional ("When your task is to review
-    // ..."), so it is inert on implementation turns yet bounds a review to the
-    // changed hunks.
-    out.push_str(
-        "## Reviewing pull requests\n\
-         When your task is to review a pull request or a diff, stay scoped to the \
-         change:\n\
-         - Fetch what you need once, as compactly as possible:\n\
-           - The change itself as a unified diff: `Accept: application/vnd.github.diff` \
-         on `.../pulls/<n>` returns the raw diff text (not JSON). If the `gh` CLI is \
-         available, `gh pr diff` is equivalent.\n\
-           - Title/body and review comments: `.../pulls/<n>` (without the diff media \
-         type) and `.../issues/<n>/comments`, or `gh pr view --json title,body,comments` \
-         if `gh` is available.\n\
-         Reuse those single results for the whole review; do not re-read the same files \
-         or re-run the same diff piecemeal across turns.\n\
-         - Never request the JSON file listing (`.../pulls/<n>/files`): that payload is \
-         many times larger than the diff text, floods the context, and forces \
-         compaction that drops the very review you are writing. Use it only if you \
-         specifically need per-file metadata the diff cannot give.\n\
-         - Reason about the changed hunks first. The diff is the review's subject; \
-         everything else is supporting evidence, not the thing under review.\n\
-         - Read wider context only when a specific comment or suspected defect \
-         requires it -- to confirm a caller's behaviour, a type contract, or a test \
-         that should have changed. Before opening a file, name the hunk and the \
-         concern it serves.\n\
-         - Do not spider the call graph or read entire unchanged files to \
-         \"understand the area\". A review verifies the change, not the codebase.\n\n",
-    );
-
-    // Stable guidance (cache-stable prefix): observer patterns (#954 sub-1).
-    // Teaches the agent when to self-start background observers so it stops
-    // polling manually or missing reactive opportunities.
-    out.push_str(
-        "## Observers — reactive background monitoring\n          The `observer` tool starts background watchers that wake you when external           state changes — so you can fire-and-forget a long operation, then resume           when it matters. Use an observer when:\n          - You start a long-running build, test suite, or deploy: attach a `process`           observer with a regex filter for completion/error signals (e.g.           `\"BUILD (SUCCEEDED|FAILED)\"`, `\"error\\[\"`,           `\"Tests:.*failed\"`).\n          - You start a dev server: attach an `http` observer on the localhost health           endpoint (e.g. `http://localhost:3000/health`) to know when it's ready.\n          - The user says \"watch\", \"monitor\", \"let me know when\", or           \"notify me\": start a `file` or `http` observer on the relevant target.\n          - You run a watch-mode test runner: attach a `file` observer on the test           output path to wake when results change.\n          Do not poll manually in a loop — observers are cheaper, non-blocking, and           relinquish your turn so the user can interact while waiting.\n\n",
-    );
-
-    // --- Cache boundary: everything above is stable; below is volatile ---
-    let stable = out;
-
-    let mut volatile = String::new();
-    volatile.push_str("## User context\n");
-    volatile.push_str(&format!(
-        "Current: {}, {} ({}).\n",
-        user.local_date,
-        user.time_of_day.label(),
-        user.timezone
-    ));
-    if !user.working_dir.is_empty() {
-        volatile.push_str(&format!(
-            "Working directory: {}\n\
-             Shell commands run here and file tools are rooted here; use paths \
-             relative to it and do not prepend a  to another directory.\n",
-            user.working_dir
-        ));
-    }
-
-    // Durable memory (RFC 0006) sits in the volatile tail beside the user
-    // context: like the date, it changes between sessions, so keeping it after
-    // the stable persona/skill prefix preserves prefix-cache reuse for the rest.
-    if let Some(memory) = memory {
-        let memory = memory.trim();
-        if !memory.is_empty() {
-            volatile.push('\n');
-            volatile.push_str(memory);
-            volatile.push('\n');
-        }
-    }
-
-    // User-supplied instructions from the Control panel Prompts tab (#1002):
-    // trimmed `userInstructions` plus any readable prompt files, resolved by the
-    // host. Placed in the volatile tail after memory and before the goal block so
-    // the per-iteration goal stays last; changes only on a settings edit.
-    if let Some(extra) = extra_instructions {
-        let extra = extra.trim();
-        if !extra.is_empty() {
-            volatile.push_str("\n## Additional instructions\n");
-            volatile.push_str(extra);
-            volatile.push('\n');
-        }
-    }
-
-    if let Some(block) = goal
-        .filter(|g| g.status == GoalStatus::Active)
-        .map(goal_block)
-    {
-        volatile.push('\n');
-        volatile.push_str(&block);
-    }
+    let stable = render_or_panic("stable.jinja", &stable_ctx);
+    let volatile = render_or_panic("volatile.jinja", &volatile_ctx);
 
     SystemPrompt { stable, volatile }
 }
 
-/// Render the goal-injection block for the system prompt (RFC 0020 §8, #718).
-/// Shows the objective, iteration progress, recent ledger entries, and any
-/// pending user steer so the agent stays on track and knows when to call
-/// `goal_complete`.
-fn goal_block(goal: &Goal) -> String {
-    use ff_core::Verdict;
-    use std::fmt::Write;
+fn render_or_panic<T: Serialize>(name: &str, ctx: &T) -> String {
+    let tmpl = TEMPLATES
+        .get_template(name)
+        .unwrap_or_else(|_| panic!("template {name} not registered"));
+    let value = Value::from_serialize(ctx);
+    tmpl.render(value)
+        .unwrap_or_else(|e| panic!("rendering {name} failed: {e}"))
+}
 
-    let mut out = String::new();
-    let _ = writeln!(
-        out,
-        "## Active goal (iteration {} of {})",
-        goal.iteration + 1,
-        goal.budget.max_iterations
-    );
-    let _ = writeln!(out, "Objective: {}", goal.objective);
-
-    if !goal.ledger.is_empty() {
-        out.push_str("Progress so far:\n");
-        // Show last 5 ledger entries to keep the block bounded.
-        let start = goal.ledger.len().saturating_sub(5);
-        for entry in &goal.ledger[start..] {
-            let verdict = entry
-                .verdict
-                .as_ref()
-                .map(|v| match v {
-                    Verdict::Match => "done",
-                    Verdict::Drift => "drift",
-                    Verdict::Unverifiable => "unverifiable",
-                })
-                .unwrap_or("pending");
-            let _ = writeln!(out, "- {} [{}]", entry.claim, verdict);
-        }
+/// Map a ledger entry verdict to the label printed in the goal block. Mirrors
+/// the legacy `goal_block` helper 1:1 so the rendered prompt is byte-stable.
+fn verdict_label(verdict: Option<&Verdict>) -> &'static str {
+    match verdict {
+        Some(Verdict::Match) => "done",
+        Some(Verdict::Drift) => "drift",
+        Some(Verdict::Unverifiable) => "unverifiable",
+        None => "pending",
     }
+}
 
-    if let Some(steer) = &goal.pending_steer {
-        let _ = writeln!(out, "\nUser steer: {}", steer);
-    }
+#[derive(Serialize)]
+struct StableCtx<'a> {
+    persona: Option<&'a str>,
+    mode_steer: &'a str,
+    skills: Vec<SkillEntry<'a>>,
+    active: Vec<ActiveEntry<'a>>,
+}
 
-    out.push_str(
-        "\nContinue toward the objective. If it is fully met, call `goal_complete`.\n State your reasoning before each action.\n",
-    );
-    out
+#[derive(Serialize)]
+struct VolatileCtx<'a> {
+    date: &'a str,
+    time_of_day: &'a str,
+    timezone: &'a str,
+    working_dir: Option<&'a str>,
+    memory: Option<&'a str>,
+    extra_instructions: Option<&'a str>,
+    goal: Option<GoalCtx<'a>>,
+}
+
+#[derive(Serialize)]
+struct SkillEntry<'a> {
+    name: &'a str,
+    description: &'a str,
+}
+
+#[derive(Serialize)]
+struct ActiveEntry<'a> {
+    name: &'a str,
+    body: &'a str,
+}
+
+#[derive(Serialize)]
+struct GoalCtx<'a> {
+    iteration: u32,
+    max_iterations: u32,
+    objective: &'a str,
+    ledger: Vec<LedgerEntry<'a>>,
+    pending_steer: Option<&'a str>,
+}
+
+#[derive(Serialize)]
+struct LedgerEntry<'a> {
+    claim: &'a str,
+    verdict: &'a str,
 }
 
 /// Per-mode behavioural steer appended to the prompt (RFC 0011, RFC 0019 §3).

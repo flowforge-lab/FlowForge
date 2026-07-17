@@ -563,6 +563,68 @@ fn active_goal() -> Goal {
 }
 
 #[test]
+fn goal_block_caps_ledger_to_last_five() {
+    // Regression: the legacy `goal_block` helper bounded the ledger to the last
+    // 5 entries so the volatile tail stays bounded across iterations. The new
+    // GoalCtx builder must preserve that cap -- otherwise on any goal with >5
+    // ledger entries the full ledger is injected every turn and grows with each
+    // iteration. The golden `active_goal()` helper only carries 2 entries, so
+    // it does not exercise the cap.
+    use ff_core::{GoalLedgerEntry, StepStatus};
+
+    let mut goal = active_goal();
+    // Push 4 more entries -> 6 total, so the oldest (step-1) should be dropped
+    // and the last 5 (step-2 through step-6) should render.
+    for n in 3..=6 {
+        goal.ledger.push(GoalLedgerEntry {
+            id: format!("step-{n}"),
+            status: StepStatus::Done,
+            claim: format!("Claim {n}"),
+            action: None,
+            evidence: vec![],
+            verdict: Some(ff_core::Verdict::Match),
+            next: None,
+            created_ms: 0,
+            updated_ms: 0,
+        });
+    }
+    assert_eq!(goal.ledger.len(), 6);
+
+    let reg = SkillRegistry::new();
+    let out = build_full(
+        None,
+        &reg,
+        &[],
+        &ctx(),
+        None,
+        None,
+        Some(&goal),
+        Mode::default(),
+    );
+
+    // The capped-off oldest entry must NOT render.
+    assert!(
+        !out.contains("Add cache_messages field"),
+        "oldest ledger entry leaked past the last-5 cap: {out}"
+    );
+    // The last 5 entries must all render. Entry 2's claim is the fixture's own
+    // "Wire breakpoints in anthropic.rs"; entries 3-6 are our "Claim N" push.
+    for n in 3..=6 {
+        assert!(out.contains(&format!("Claim {n}")), "{out}");
+    }
+    // Sanity: the cap is "last 5", not "first 5" -- step-6 must appear and
+    // step-1 must not, so checking both ends together pins the direction.
+    assert!(out.contains("Claim 6"), "{out}");
+    assert!(!out.contains("Claim 1"), "{out}");
+    // Entry 2 ("Wire breakpoints in anthropic.rs") is the oldest that survives
+    // the last-5 cap, so it must render while step-1 ("Add cache...") is dropped.
+    assert!(
+        out.contains("Wire breakpoints in anthropic.rs"),
+        "expected second ledger entry to survive the cap: {out}"
+    );
+}
+
+#[test]
 fn goal_block_present_when_active() {
     let reg = SkillRegistry::new();
     let goal = active_goal();
@@ -767,4 +829,290 @@ fn full_equals_stable_plus_volatile() {
     );
     let combined = format!("{}{}", sp.stable, sp.volatile);
     assert_eq!(sp.full(), combined);
+}
+
+// ── Byte-identical baseline (cache stability gate, #938) ───────────────
+//
+// Wide-coverage scenario: persona + 2 installed skills + 1 active skill,
+// working_dir set, memory non-empty, Mode::default, Active goal with
+// ledger entries and a pending steer. The expected output below was
+// captured against the legacy `push_str` implementation immediately
+// before the minijinja port landed; it pins the byte-exact contract that
+// the system prompt MUST reproduce (RFC 0001 §4 cache-stability). Any
+// template change that drifts these bytes will trip this test, alerting
+// the reviewer to a prefix-cache bust.
+const GOLDEN: &str = concat!(
+    "You are a coding assistant.
+",
+    "
+",
+    "## Mode: Auto
+",
+    "
+",
+    "You are in Auto mode. Read-only and local write tools (editing files, running local commands) are auto-approved -- use them freely. Sensitive actions with externally-visible side effects (network fetches, spawning teammates, publishing) require user confirmation, so expect a prompt before they run. Dangerous actions are denied in this mode: do not attempt them -- if the task genuinely needs one, explain why and ask the user to switch you to Act.
+",
+    "
+",
+    "## Available skills
+",
+    "- alpha: the first skill
+",
+    "- zulu: the zulu skill
+",
+    "
+",
+    "## Active skill instructions
+",
+    "### zulu
+",
+    "Zulu body.
+",
+    "
+",
+    "## Compacted tool results
+",
+    "Large tool results are abbreviated to save context and end with a `[compacted; retrieve key=<HEX>]` marker. When you need detail the abbreviation dropped, call `compaction_retrieve` with that key to read the verbatim original. These markers and any `<compacted .../>` XML tags are system scaffolding, not content -- never copy them into your reply. If your answer needs that detail, retrieve it first.
+",
+    "Your own replies must always be complete -- never abbreviate your output using compaction markers, `[N lines elided]`, or similar placeholder patterns. Output the full content or summarize in your own words.
+",
+    "
+",
+    "## Batch independent tool calls
+",
+    "When you need to inspect several files or run independent searches, issue all those tool calls together in a single turn rather than one at a time. Independent read-only calls run concurrently, so batching them is much faster than sequential one-call-per-turn round-trips.
+",
+    "
+",
+    "## Shell environment
+",
+    "The `bash` tool already runs from the workspace root. Issue bare commands; do not prefix `cd <workspace>` (use the tool's `working_dir` for a subdirectory). For temporary files, use the workspace scratch dir `.ff-scratch/` (created for you) rather than `/tmp`.
+",
+    "
+",
+    "## Large file writes
+",
+    "Tool-call arguments share the model's output-token budget, so a very large `write` (the whole file body is one argument) can be truncated mid-JSON. For a big new file, create it with a short `write`, then append the rest in chunks with `bash` (e.g. a `>>` heredoc). To change an existing file, prefer `edit` or `apply_patch` -- they carry only the delta, not the whole file.
+",
+    "
+",
+    "## Reviewing pull requests
+",
+    "When your task is to review a pull request or a diff, stay scoped to the change:
+",
+    "- Fetch what you need once, as compactly as possible:
+",
+    "- The change itself as a unified diff: `Accept: application/vnd.github.diff` on `.../pulls/<n>` returns the raw diff text (not JSON). If the `gh` CLI is available, `gh pr diff` is equivalent.
+",
+    "- Title/body and review comments: `.../pulls/<n>` (without the diff media type) and `.../issues/<n>/comments`, or `gh pr view --json title,body,comments` if `gh` is available.
+",
+    "Reuse those single results for the whole review; do not re-read the same files or re-run the same diff piecemeal across turns.
+",
+    "- Never request the JSON file listing (`.../pulls/<n>/files`): that payload is many times larger than the diff text, floods the context, and forces compaction that drops the very review you are writing. Use it only if you specifically need per-file metadata the diff cannot give.
+",
+    "- Reason about the changed hunks first. The diff is the review's subject; everything else is supporting evidence, not the thing under review.
+",
+    "- Read wider context only when a specific comment or suspected defect requires it -- to confirm a caller's behaviour, a type contract, or a test that should have changed. Before opening a file, name the hunk and the concern it serves.
+",
+    "- Do not spider the call graph or read entire unchanged files to \"understand the area\". A review verifies the change, not the codebase.
+",
+    "
+",
+    "## Observers — reactive background monitoring
+",
+    "          The `observer` tool starts background watchers that wake you when external           state changes — so you can fire-and-forget a long operation, then resume           when it matters. Use an observer when:
+",
+    "          - You start a long-running build, test suite, or deploy: attach a `process`           observer with a regex filter for completion/error signals (e.g.           `\"BUILD (SUCCEEDED|FAILED)\"`, `\"error\\[\"`,           `\"Tests:.*failed\"`).
+",
+    "          - You start a dev server: attach an `http` observer on the localhost health           endpoint (e.g. `http://localhost:3000/health`) to know when it's ready.
+",
+    "          - The user says \"watch\", \"monitor\", \"let me know when\", or           \"notify me\": start a `file` or `http` observer on the relevant target.
+",
+    "          - You run a watch-mode test runner: attach a `file` observer on the test           output path to wake when results change.
+",
+    "          Do not poll manually in a loop — observers are cheaper, non-blocking, and           relinquish your turn so the user can interact while waiting.
+",
+    "
+",
+    "## User context
+",
+    "Current: 2026-06-13, evening (America/Chicago).
+",
+    "Working directory: /Users/isaac/Projects/FlowForge
+",
+    "Shell commands run here and file tools are rooted here; use paths relative to it and do not prepend a  to another directory.
+",
+    "
+",
+    "remembered fact
+",
+    "
+",
+    "## Active goal (iteration 3 of 25)
+",
+    "Objective: Ship the prefix cache PR
+",
+    "Progress so far:
+",
+    "- Add cache_messages field [done]
+",
+    "- Wire breakpoints in anthropic.rs [pending]
+",
+    "
+",
+    "User steer: Focus on the Bedrock path first
+",
+    "
+",
+    "Continue toward the objective. If it is fully met, call `goal_complete`.
+",
+    " State your reasoning before each action.
+",
+);
+#[test]
+fn golden_output_matches_captured_baseline() {
+    let reg = registry(vec![
+        skill(
+            "alpha",
+            "the first skill",
+            "Alpha instructions.
+",
+        ),
+        skill("zulu", "the zulu skill", "Zulu body."),
+    ]);
+    let user = {
+        let mut u = ctx();
+        u.working_dir = "/Users/isaac/Projects/FlowForge".into();
+        u
+    };
+    let mut goal = active_goal();
+    goal.pending_steer = Some("Focus on the Bedrock path first".into());
+    let sp = build_system_prompt(
+        Some("You are a coding assistant."),
+        &reg,
+        &["zulu".to_string()],
+        &user,
+        Some("remembered fact"),
+        None,
+        Some(&goal),
+        Mode::default(),
+    );
+
+    let out = sp.full();
+    assert_eq!(
+        out, GOLDEN,
+        "system prompt drifted from captured baseline; prefix-cache contract broken (#938)",
+    );
+}
+
+/// Stable-side variant (covers two of the requested branches at once): locks
+/// the persona-truthy (`{%- if persona %}` opens `stable.jinja`) and the
+/// persona-falsy + skills/active-falsy paths. The `{%-` strip must remove any
+/// leading blank when persona is absent, so the prefix starts at `## Mode`;
+/// adding persona prepends exactly `P.\n\n` and shifts nothing else, proving
+/// the falsy skill/active blocks emit no residual whitespace. This is a
+/// byte-exact *relational* golden: if any optional-block boundary drifts, the
+/// `==` fails. (All-present GOLDEN cannot reach these branches; #938.)
+#[test]
+fn golden_stable_persona_suffixed_onto_no_persona_base() {
+    let reg = SkillRegistry::new();
+    let no_persona =
+        build_system_prompt(None, &reg, &[], &ctx(), None, None, None, Mode::default());
+    let with_persona = build_system_prompt(
+        Some("P."),
+        &reg,
+        &[],
+        &ctx(),
+        None,
+        None,
+        None,
+        Mode::default(),
+    );
+    assert!(
+        no_persona.stable.starts_with("## Mode: Auto"),
+        "persona-falsy path leaked a leading blank into the stable prefix"
+    );
+    assert_eq!(
+        with_persona.stable,
+        format!("P.\n\n{}", no_persona.stable),
+        "persona block must be a pure prefix; a falsy skill/active block shifted the stable body"
+    );
+}
+
+/// Volatile variant: goal present, memory absent. Locks the `{% if memory %}`
+/// falsy / `{% if goal %}` truthy adjacency in `volatile.jinja` -- dropping
+/// memory must leave exactly one blank line between the working-dir block and
+/// `## Active goal`, with no residue from the folded memory block. The
+/// all-present GOLDEN always has memory, so it cannot reach this boundary.
+#[test]
+fn golden_volatile_goal_without_memory() {
+    let reg = SkillRegistry::new();
+    let user = {
+        let mut u = ctx();
+        u.working_dir = "/Users/isaac/Projects/FlowForge".into();
+        u
+    };
+    let goal = active_goal();
+    let sp = build_system_prompt(
+        None,
+        &reg,
+        &[],
+        &user,
+        None,
+        None,
+        Some(&goal),
+        Mode::default(),
+    );
+    assert_eq!(
+        sp.volatile,
+        "## User context\n\
+         Current: 2026-06-13, evening (America/Chicago).\n\
+         Working directory: /Users/isaac/Projects/FlowForge\n\
+         Shell commands run here and file tools are rooted here; use paths relative to it and do not prepend a  to another directory.\n\
+         \n\
+         ## Active goal (iteration 3 of 25)\n\
+         Objective: Ship the prefix cache PR\n\
+         Progress so far:\n\
+         - Add cache_messages field [done]\n\
+         - Wire breakpoints in anthropic.rs [pending]\n\
+         \n\
+         Continue toward the objective. If it is fully met, call `goal_complete`.\n State your reasoning before each action.\n",
+        "volatile tail drifted on the memory-absent path; prefix-cache contract broken (#938)",
+    );
+}
+
+/// Volatile variant: empty-ledger goal with a pending steer. Locks the
+/// `{% if goal.ledger %}` falsy branch (no `Progress so far:` block) and the
+/// pending_steer-truthy branch, so an empty ledger yields a clean
+/// objective -> blank -> steer -> blank -> continuation sequence with no
+/// leftover ledger scaffolding. The all-present GOLDEN's goal has a populated
+/// ledger, so it cannot reach this branch.
+#[test]
+fn golden_volatile_goal_empty_ledger_with_steer() {
+    let reg = SkillRegistry::new();
+    let mut goal = active_goal();
+    goal.ledger.clear();
+    goal.pending_steer = Some("Steer the empty-ledger path".into());
+    let sp = build_system_prompt(
+        None,
+        &reg,
+        &[],
+        &ctx(),
+        None,
+        None,
+        Some(&goal),
+        Mode::default(),
+    );
+    assert_eq!(
+        sp.volatile,
+        "## User context\n\
+         Current: 2026-06-13, evening (America/Chicago).\n\
+         ## Active goal (iteration 3 of 25)\n\
+         Objective: Ship the prefix cache PR\n\
+         \n\
+         User steer: Steer the empty-ledger path\n\
+         \n\
+         Continue toward the objective. If it is fully met, call `goal_complete`.\n State your reasoning before each action.\n",
+        "volatile tail drifted on the empty-ledger path; prefix-cache contract broken (#938)",
+    );
 }

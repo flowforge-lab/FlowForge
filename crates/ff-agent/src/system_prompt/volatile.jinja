@@ -1,0 +1,25 @@
+## User context
+Current: {{ date }}, {{ time_of_day }} ({{ timezone }}).
+{% if working_dir %}Working directory: {{ working_dir }}
+Shell commands run here and file tools are rooted here; use paths relative to it and do not prepend a  to another directory.
+
+{% endif %}{% if memory %}{{ memory }}
+
+{% endif %}{% if extra_instructions %}## Additional instructions
+
+{{ extra_instructions }}
+
+{% endif %}{% if goal %}## Active goal (iteration {{ goal.iteration + 1 }} of {{ goal.max_iterations }})
+Objective: {{ goal.objective }}
+{% if goal.ledger %}Progress so far:
+{% for e in goal.ledger -%}
+- {{ e.claim }} [{{ e.verdict }}]
+{% endfor -%}
+{% endif %}
+{% if goal.pending_steer %}User steer: {{ goal.pending_steer }}
+
+{% endif -%}
+
+Continue toward the objective. If it is fully met, call `goal_complete`.
+ State your reasoning before each action.
+{% endif -%}
