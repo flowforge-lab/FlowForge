@@ -3,6 +3,7 @@ import { AlertTriangle, Loader2 } from "@/components/ui/icon";
 import { AppShell } from "@/components/app-shell";
 import { startIpcEvents } from "@/lib/events";
 import { reportFirstPaint } from "@/lib/boot-trace";
+import { initTitleFlash } from "@/lib/title-flash";
 import { ipc, type Unlisten } from "@/lib/ipc";
 import { initPrefs, usePrefsStore } from "@/store/prefs";
 import { useChatStore } from "@/store/chat";
@@ -150,6 +151,7 @@ function App() {
   // measures exactly this loading frame — the win the reordering buys.
   useEffect(() => {
     initPrefs();
+    initTitleFlash();
     startIpcEvents();
     reportFirstPaint();
   }, []);

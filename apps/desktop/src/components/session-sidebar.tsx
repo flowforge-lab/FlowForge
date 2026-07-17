@@ -32,7 +32,7 @@ import { usePrefsStore, clampSidebarWidth } from "@/store/prefs";
 import { useSettingsStore } from "@/store/settings";
 import { useChatStore } from "@/store/chat";
 import { useSessionPrefsStore } from "@/store/session-prefs";
-import { useSessionDoneToastStore } from "@/store/session-done-toast";
+import { useSessionToastStore } from "@/store/session-toast";
 import { usePanesStore, MAX_PANES } from "@/store/panes";
 import { useAllConversationsSearchStore } from "@/store/all-conversations-search";
 import { useContentSearch } from "@/hooks/use-content-search";
@@ -522,19 +522,19 @@ export function SessionSidebar() {
     (s) => s.recentlyFinishedBySession,
   );
   const clearSessionFinished = useChatStore((s) => s.clearSessionFinished);
-  const dismissDoneToast = useSessionDoneToastStore((s) => s.dismissBySession);
+  const dismissSessionToasts = useSessionToastStore((s) => s.dismissBySession);
   const newSession = useChatStore((s) => s.newSession);
 
-  // Focus clears a session's activity signals (#703): the moment a session
-  // becomes active — via a row click, the toast's "View", or any other path —
-  // drop its transient "done" checkmark and any standing completion toast, since
-  // the user is now looking at it. Centralized here so it fires regardless of
-  // which action set `activeSessionId`.
+  // Focus clears a session's activity signals (#703, #994): the moment a session
+  // becomes active — via a row click, a toast's action, or any other path — drop
+  // its transient "done" checkmark and any standing toasts (done/error/approval/
+  // stopped), since the user is now looking at it. Centralized here so it fires
+  // regardless of which action set `activeSessionId`.
   useEffect(() => {
     if (!activeSessionId) return;
     clearSessionFinished(activeSessionId);
-    dismissDoneToast(activeSessionId);
-  }, [activeSessionId, clearSessionFinished, dismissDoneToast]);
+    dismissSessionToasts(activeSessionId);
+  }, [activeSessionId, clearSessionFinished, dismissSessionToasts]);
 
   const sidebarCollapsed = usePrefsStore((s) => s.sidebarCollapsed);
   const setSidebarCollapsed = usePrefsStore((s) => s.setSidebarCollapsed);
