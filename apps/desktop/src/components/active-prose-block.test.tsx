@@ -80,13 +80,51 @@ describe("ActiveProseBlock (#864)", () => {
       screen.getByText(LONG_TEXT).closest("[aria-hidden='true']"),
     ).toBeNull();
     expect(chipButton().getAttribute("aria-expanded")).toBe("true");
-    expect(chipButton().getAttribute("aria-hidden")).toBe("true");
+    // While streaming, the chip stays in the a11y tree and interactive so it
+    // can be re-collapsed (#986) — it is only retired once the turn settles.
+    expect(chipButton().getAttribute("aria-hidden")).toBe("false");
+    expect(chipButton().getAttribute("tabindex")).toBeNull();
 
     // New tokens arrive — the user's choice must stick (#864 edge case).
     const GROWN = LONG_TEXT + " more text from the model";
     rerender(<ActiveProseBlock text={GROWN} streaming={true} />);
     expect(screen.getByText(GROWN).closest("[aria-hidden='true']")).toBeNull();
     expect(chipButton().getAttribute("aria-expanded")).toBe("true");
+  });
+
+  it("re-collapses a mid-stream expanded prose, repeatably (#986)", async () => {
+    const user = userEvent.setup();
+    render(<ActiveProseBlock text={LONG_TEXT} streaming={true} />);
+
+    // Starts collapsed.
+    expect(chipButton().getAttribute("aria-expanded")).toBe("false");
+    expect(
+      screen.getByText(LONG_TEXT).closest("[aria-hidden='true']"),
+    ).toBeTruthy();
+
+    // Expand.
+    await user.click(chipButton());
+    expect(chipButton().getAttribute("aria-expanded")).toBe("true");
+    // The collapse control must remain live while streaming.
+    expect(chipButton().getAttribute("aria-hidden")).toBe("false");
+    expect(chipButton().getAttribute("tabindex")).toBeNull();
+    expect(
+      screen.getByText(LONG_TEXT).closest("[aria-hidden='true']"),
+    ).toBeNull();
+
+    // Collapse back — the bug was that this was impossible.
+    await user.click(chipButton());
+    expect(chipButton().getAttribute("aria-expanded")).toBe("false");
+    expect(
+      screen.getByText(LONG_TEXT).closest("[aria-hidden='true']"),
+    ).toBeTruthy();
+
+    // And expand again — the toggle is repeatable.
+    await user.click(chipButton());
+    expect(chipButton().getAttribute("aria-expanded")).toBe("true");
+    expect(
+      screen.getByText(LONG_TEXT).closest("[aria-hidden='true']"),
+    ).toBeNull();
   });
 
   it("dissolves the chip and shows the full prose when the turn settles", () => {

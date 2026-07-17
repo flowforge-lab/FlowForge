@@ -51,10 +51,14 @@ export function ActiveProseBlock({
   // re-collapse an expanded view (same pattern as ThoughtRow and
   // ThinkingBlock).
   const [userExpanded, setUserExpanded] = useState<boolean | null>(null);
-  const isCollapsed =
-    streaming &&
-    text.length > ACTIVE_PROSE_COLLAPSE_THRESHOLD &&
-    userExpanded !== true;
+  // `collapsible` = this prose can toggle at all (long, still streaming);
+  // `isCollapsed` = it's toggleable AND currently folded. The chip's *presence*
+  // as an interactive control keys on `collapsible`, so a mid-stream expand
+  // keeps a working collapse affordance (#986). Retirement (settled/short prose)
+  // keys on `!collapsible`.
+  const collapsible =
+    streaming && text.length > ACTIVE_PROSE_COLLAPSE_THRESHOLD;
+  const isCollapsed = collapsible && userExpanded !== true;
 
   // Measure the prose content's natural height so the expand transition lands
   // on the real text height — long prose (the whole point of this feature)
@@ -108,15 +112,17 @@ export function ActiveProseBlock({
         aria-expanded={!isCollapsed}
         // Visible "On it" text is the accessible name (matches ThoughtRow and
         // ThinkingBlock); aria-expanded carries the live state to AT.
-        // aria-hidden + tabIndex=-1 keep the button out of the a11y tree once
-        // the prose is shown — otherwise every settled/expanded prose would
-        // announce a hidden "On it, expanded" affordance (#864 review).
-        aria-hidden={!isCollapsed}
-        tabIndex={!isCollapsed ? -1 : undefined}
+        // aria-hidden + tabIndex=-1 retire the button from the a11y tree once
+        // the prose can no longer toggle — settled turns and short prose —
+        // otherwise every such prose would announce a phantom "On it"
+        // affordance (#864 review). While streaming a long prose the chip stays
+        // interactive even when expanded, so it can be re-collapsed (#986).
+        aria-hidden={!collapsible}
+        tabIndex={!collapsible ? -1 : undefined}
         data-on-it
         className={cn(
           "flex w-full items-center gap-1.5 self-start rounded-md px-2.5 py-1 text-left transition-[max-height,opacity] duration-200 ease-out",
-          isCollapsed
+          collapsible
             ? "max-h-12 text-muted-foreground hover:text-foreground"
             : "pointer-events-none max-h-0 overflow-hidden opacity-0",
         )}
