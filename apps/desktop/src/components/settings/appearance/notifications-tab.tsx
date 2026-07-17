@@ -2,8 +2,9 @@ import { SettingsSwitch } from "@/components/settings/switch";
 import { usePrefsStore } from "@/store/prefs";
 
 /**
- * Notifications sub-tab: a master switch gating three child toggles. FE-only
- * flags (SET.2) — no OS notifications are fired yet.
+ * Notifications sub-tab: a master switch gating the child toggles. Drives the
+ * background-session toasts, sound cue, and title flash (#994). Errors always
+ * surface under the master switch — they aren't gated by "Message complete".
  */
 export function NotificationsTab() {
   const notifications = usePrefsStore((s) => s.notifications);
@@ -14,7 +15,7 @@ export function NotificationsTab() {
     <div className="space-y-5">
       <SettingsSwitch
         label="Notifications"
-        description="Master switch for all in-app notifications."
+        description="Master switch for toasts, sound, and the title flash when the window is in the background. Errors always notify while this is on."
         checked={notifications.enabled}
         onCheckedChange={(enabled) => setNotifications({ enabled })}
       />
@@ -22,7 +23,7 @@ export function NotificationsTab() {
       <div className="space-y-4 border-t pt-5">
         <SettingsSwitch
           label="Message complete"
-          description="Notify when an assistant turn finishes."
+          description="Notify when a background turn finishes or stops without an answer."
           checked={notifications.messageComplete}
           disabled={childrenDisabled}
           onCheckedChange={(messageComplete) =>
@@ -31,7 +32,7 @@ export function NotificationsTab() {
         />
         <SettingsSwitch
           label="Approval requests"
-          description="Notify when a tool call needs your approval."
+          description="Notify when a background turn needs your approval or an answer."
           checked={notifications.approvalRequests}
           disabled={childrenDisabled}
           onCheckedChange={(approvalRequests) =>
@@ -40,7 +41,7 @@ export function NotificationsTab() {
         />
         <SettingsSwitch
           label="Sound"
-          description="Play a sound with notifications."
+          description="Play a short chime with each notification."
           checked={notifications.sound}
           disabled={childrenDisabled}
           onCheckedChange={(sound) => setNotifications({ sound })}

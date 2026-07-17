@@ -7,7 +7,7 @@ import { ipc } from "@/lib/ipc";
 import { autoTitle } from "@/lib/auto-title";
 import { isResumableStopNotice } from "@/store/capped-turn";
 import { readCache, writeCache, clearCache } from "@/lib/message-cache";
-import { useSessionDoneToastStore } from "@/store/session-done-toast";
+import { notify } from "@/lib/notify";
 import type {
   Attachment,
   ApprovalSafety,
@@ -361,6 +361,17 @@ function scheduleFinishedClear(sessionId: string) {
       useChatStore.getState().clearSessionFinished(sessionId);
     }, FINISHED_TTL_MS),
   );
+}
+
+/** Raise an "approval" toast for a backgrounded session — shared by the approval
+ *  and ask_user gates (#994), which are equivalent for notification purposes (the
+ *  turn is paused waiting on the user). notify() applies the "Approval requests"
+ *  gate; the active session gets nothing (its transcript already shows the prompt). */
+function maybeNotifyApproval(get: () => ChatState, sessionId: string) {
+  if (sessionId === get().activeSessionId) return;
+  const title =
+    get().sessions.find((sess) => sess.id === sessionId)?.title || "Session";
+  notify("approval", sessionId, title);
 }
 
 export const useChatStore = create<ChatState>((set, get) => ({
@@ -947,11 +958,12 @@ export const useChatStore = create<ChatState>((set, get) => ({
         : s.sessionTotalsBySession,
     }));
 
-    // Arm the checkmark's fade timer and raise the completion toast (#703). Both
-    // are background-only; the active session gets neither.
+    // Arm the checkmark's fade timer and raise the completion toast (#703, #994).
+    // Both are background-only; the active session gets neither. notify() applies
+    // the "Message complete" gate.
     if (isBackground) {
       scheduleFinishedClear(e.sessionId);
-      useSessionDoneToastStore.getState().push(e.sessionId, finishedTitle);
+      notify("done", e.sessionId, finishedTitle);
     }
 
     if (!endedEmpty) return;
@@ -994,6 +1006,11 @@ export const useChatStore = create<ChatState>((set, get) => ({
               [e.sessionId]: true,
             },
           }));
+          // A silent stop is invisible unless you're already looking at that
+          // session's transcript (#994): surface it for a backgrounded session
+          // alongside the inline <ContinueAffordance>. notify() applies the
+          // "Message complete" gate.
+          if (isBackground) notify("stopped", e.sessionId, finishedTitle);
         }
       })
       .catch(() => {
@@ -1003,6 +1020,11 @@ export const useChatStore = create<ChatState>((set, get) => ({
   },
 
   failTurn: (e) => {
+    // Raise an error toast for a backgrounded session (#994) so a failure isn't
+    // buried in a transcript the user isn't looking at. The system-message row is
+    // still appended for the on-screen case. notify() gates on the master switch
+    // only — an error surfaces whenever notifications are on.
+    const isBackground = e.sessionId !== get().activeSessionId;
     set((s) => ({
       ...clearSessionTurnTiming(s, e.sessionId),
       messagesBySession: {
@@ -1013,6 +1035,12 @@ export const useChatStore = create<ChatState>((set, get) => ({
         ],
       },
     }));
+    if (isBackground) {
+      const title =
+        get().sessions.find((sess) => sess.id === e.sessionId)?.title ||
+        "Session";
+      notify("error", e.sessionId, title);
+    }
   },
 
   applyToolCall: (e) => {
@@ -1160,6 +1188,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   },
 
   applyApprovalRequest: (e) => {
+    const known = Boolean(get().toolStepsByMessage[e.messageId]);
     set((s) => {
       const steps = s.toolStepsByMessage[e.messageId];
       if (!steps) return s;
@@ -1174,6 +1203,11 @@ export const useChatStore = create<ChatState>((set, get) => ({
         },
       };
     });
+    // A turn blocked on approval is invisible on a backgrounded session (#994):
+    // raise an amber toast so the user knows it's waiting on them. Only when the
+    // step is tracked (matches the set's no-op guard). notify() gates on
+    // "Approval requests".
+    if (known) maybeNotifyApproval(get, e.sessionId);
   },
 
   respondApproval: async (sessionId, messageId, callId, approved) => {
@@ -1208,6 +1242,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   },
 
   applyAskRequest: (e) => {
+    const known = Boolean(get().toolStepsByMessage[e.messageId]);
     set((s) => {
       const steps = s.toolStepsByMessage[e.messageId];
       if (!steps) return s;
@@ -1227,6 +1262,9 @@ export const useChatStore = create<ChatState>((set, get) => ({
         },
       };
     });
+    // Same as an approval gate for notification purposes (#994): the turn is
+    // paused waiting on the user. Shares the "approval" toast kind + gate.
+    if (known) maybeNotifyApproval(get, e.sessionId);
   },
 
   respondAsk: async (sessionId, messageId, callId, answer) => {
