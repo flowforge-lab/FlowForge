@@ -64,7 +64,7 @@ describe("panes store (#148)", () => {
     const r = root() as SplitNode;
     expect(r.type).toBe("split");
     expect(r.dir).toBe("vertical");
-    expect(r.ratio).toBe(0.5);
+    expect(r.ratios).toEqual([0.5, 0.5]);
     const all = leaves(r);
     expect(all).toHaveLength(2);
     const newLeaf = all.find((l) => l.sessionId === "s2")!;
@@ -76,6 +76,90 @@ describe("panes store (#148)", () => {
     usePanesStore.getState().init(["s1"], "s1");
     usePanesStore.getState().splitDown(leaves(root())[0].id, "s2");
     expect((root() as SplitNode).dir).toBe("horizontal");
+  });
+
+  it("same-axis splits build one flat N-way row, not a nested tree (#985)", () => {
+    usePanesStore.getState().init(["s1"], "s1");
+    usePanesStore.getState().splitRight(leaves(root())[0].id, "s2");
+    usePanesStore.getState().splitRight(leaves(root())[0].id, "s3");
+
+    const r = root() as SplitNode;
+    expect(r.type).toBe("split");
+    // A single split with three flat children — no nesting.
+    expect(r.children).toHaveLength(3);
+    expect(r.children.every((c) => c.type === "leaf")).toBe(true);
+    expect(r.ratios).toHaveLength(3);
+    expect(r.ratios.reduce((a, b) => a + b, 0)).toBeCloseTo(1);
+  });
+
+  it("a new split appears adjacent to the invoked pane (#985)", () => {
+    usePanesStore.getState().init(["s1"], "s1");
+    // Build a 3-column row: [s1, s2, s3].
+    usePanesStore.getState().splitRight(leaves(root())[0].id, "s2");
+    usePanesStore.getState().splitRight(leaves(root())[0].id, "s3");
+    // s1 is leftmost, s3 sits between s1 and s2.
+    expect(leaves(root()).map((l) => l.sessionId)).toEqual(["s1", "s3", "s2"]);
+
+    // Split the MIDDLE pane (s3): the new pane lands directly after it.
+    const middle = leaves(root()).find((l) => l.sessionId === "s3")!;
+    usePanesStore.getState().splitRight(middle.id, "s4");
+    expect(leaves(root()).map((l) => l.sessionId)).toEqual([
+      "s1",
+      "s3",
+      "s4",
+      "s2",
+    ]);
+  });
+
+  it("cross-axis split nests inside the row (#985)", () => {
+    usePanesStore.getState().init(["s1"], "s1");
+    usePanesStore.getState().splitRight(leaves(root())[0].id, "s2");
+    const first = leaves(root())[0].id;
+    // Split the first column DOWN — the other axis — so it nests.
+    usePanesStore.getState().splitDown(first, "s3");
+
+    const r = root() as SplitNode;
+    expect(r.dir).toBe("vertical");
+    expect(r.children).toHaveLength(2);
+    const nested = r.children[0] as SplitNode;
+    expect(nested.type).toBe("split");
+    expect(nested.dir).toBe("horizontal");
+    expect(leaves(nested).map((l) => l.sessionId)).toEqual(["s1", "s3"]);
+  });
+
+  it("migrates a legacy binary layout and flattens same-dir nesting on load (#985)", () => {
+    // Hand-write a pre-#985 left-nested binary tree to localStorage:
+    // split(split(P1,P2),P3), all vertical.
+    const legacy = {
+      root: {
+        type: "split",
+        id: "outer",
+        dir: "vertical",
+        ratio: 0.6,
+        a: {
+          type: "split",
+          id: "inner",
+          dir: "vertical",
+          ratio: 0.5,
+          a: { type: "leaf", id: "p1", sessionId: "s1" },
+          b: { type: "leaf", id: "p2", sessionId: "s2" },
+        },
+        b: { type: "leaf", id: "p3", sessionId: "s3" },
+      },
+      focusedPaneId: "p1",
+    };
+    localStorage.setItem("ff-panes", JSON.stringify(legacy));
+
+    usePanesStore.getState().init(["s1", "s2", "s3"], "s1");
+
+    const r = root() as SplitNode;
+    expect(r.type).toBe("split");
+    // Flattened into one vertical row of three leaves.
+    expect(r.children).toHaveLength(3);
+    expect(r.children.every((c) => c.type === "leaf")).toBe(true);
+    expect(leaves(r).map((l) => l.sessionId)).toEqual(["s1", "s2", "s3"]);
+    expect(r.ratios).toHaveLength(3);
+    expect(r.ratios.reduce((a, b) => a + b, 0)).toBeCloseTo(1);
   });
 
   it("splitFork clones the pane's session into a new focused pane (#149)", async () => {
@@ -162,17 +246,53 @@ describe("panes store (#148)", () => {
     expect(root().type).toBe("leaf");
   });
 
-  it("setRatio clamps to [MIN_RATIO, 1-MIN_RATIO]", () => {
+  it("closePane re-flattens a same-dir split exposed by a collapse (#985 review)", () => {
+    // Build: root V:[L1, H:[V:[L2,L4], L3]] — closing L3 collapses the H node
+    // into its sole surviving child V:[L2,L4], which then sits directly under
+    // the root V split: a same-dir nesting that must be flattened immediately,
+    // not left until the next reload.
+    usePanesStore.getState().init(["s1"], "s1");
+    usePanesStore.getState().splitRight(leaves(root())[0].id, "s2"); // root V:[s1,s2]
+    const l2 = leaves(root()).find((l) => l.sessionId === "s2")!;
+    usePanesStore.getState().splitDown(l2.id, "s3"); // s2 -> H:[s2,s3]
+    const l2Again = leaves(root()).find((l) => l.sessionId === "s2")!;
+    usePanesStore.getState().splitRight(l2Again.id, "s4"); // s2 -> V:[s2,s4] (nests inside H)
+    const l3 = leaves(root()).find((l) => l.sessionId === "s3")!;
+
+    usePanesStore.getState().closePane(l3.id);
+
+    const r = root() as SplitNode;
+    expect(r.type).toBe("split");
+    expect(r.dir).toBe("vertical");
+    // Flattened: one vertical row of three leaves, no nested V-in-V.
+    expect(r.children).toHaveLength(3);
+    expect(r.children.every((c) => c.type === "leaf")).toBe(true);
+    expect(
+      leaves(r)
+        .map((l) => l.sessionId)
+        .sort(),
+    ).toEqual(["s1", "s2", "s4"]);
+    expect(r.ratios.reduce((a, b) => a + b, 0)).toBeCloseTo(1);
+  });
+
+  it("setRatios normalizes a split's ratios to sum to 1", () => {
     usePanesStore.getState().init(["s1"], "s1");
     usePanesStore.getState().splitRight(leaves(root())[0].id, "s2");
     const splitId = (root() as SplitNode).id;
 
-    usePanesStore.getState().setRatio(splitId, 0.99);
-    expect((root() as SplitNode).ratio).toBeCloseTo(1 - MIN_RATIO);
-    usePanesStore.getState().setRatio(splitId, -1);
-    expect((root() as SplitNode).ratio).toBeCloseTo(MIN_RATIO);
-    usePanesStore.getState().setRatio(splitId, 0.4);
-    expect((root() as SplitNode).ratio).toBeCloseTo(0.4);
+    usePanesStore.getState().setRatios(splitId, [0.7, 0.3]);
+    expect((root() as SplitNode).ratios).toEqual([0.7, 0.3]);
+
+    // Non-normalized input is renormalized to sum to 1.
+    usePanesStore.getState().setRatios(splitId, [3, 1]);
+    const r = (root() as SplitNode).ratios;
+    expect(r[0]).toBeCloseTo(0.75);
+    expect(r[1]).toBeCloseTo(0.25);
+    expect(r[0] + r[1]).toBeCloseTo(1);
+
+    // Degenerate input falls back to an equal split.
+    usePanesStore.getState().setRatios(splitId, [0, 0]);
+    expect((root() as SplitNode).ratios).toEqual([0.5, 0.5]);
   });
 
   it("focusPane sets focus and syncs the active session", () => {
