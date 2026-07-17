@@ -23,7 +23,6 @@ beforeEach(() => {
   useChatStore.setState({
     ttftBySession: {},
     promptLatencyBySession: {},
-    flushMsBySession: {},
     tier2MsBySession: {},
   });
 });
@@ -32,7 +31,6 @@ afterEach(() => {
   useChatStore.setState({
     ttftBySession: {},
     promptLatencyBySession: {},
-    flushMsBySession: {},
     tier2MsBySession: {},
   });
 });
@@ -68,36 +66,31 @@ describe("applyTurnStats (#960)", () => {
 });
 
 describe("applyTurnStats — per-phase compaction timing (#971)", () => {
-  it("stores flushMs and tier2Ms when the turn reports them", () => {
+  it("stores tier2Ms when the turn reports it", () => {
     useChatStore.getState().applyTurnStats(
       stats({
         firstTokenMs: 8200,
         promptLatencyMs: 6000,
-        flushMs: 1400,
         tier2Ms: 800,
       }),
     );
-    expect(useChatStore.getState().flushMsBySession[SID]).toBe(1400);
     expect(useChatStore.getState().tier2MsBySession[SID]).toBe(800);
   });
 
-  it("clears prior flush/summarize when a new turn reports TTFT without them", () => {
+  it("clears prior summarize when a new turn reports TTFT without it", () => {
     useChatStore.setState({
       ttftBySession: { [SID]: 8000 },
-      flushMsBySession: { [SID]: 1400 },
       tier2MsBySession: { [SID]: 800 },
     });
     useChatStore.getState().applyTurnStats(stats({ firstTokenMs: 3000 }));
     expect(useChatStore.getState().ttftBySession[SID]).toBe(3000);
-    expect(useChatStore.getState().flushMsBySession[SID]).toBeUndefined();
     expect(useChatStore.getState().tier2MsBySession[SID]).toBeUndefined();
   });
 
-  it("stores one phase without inventing the other", () => {
+  it("stores tier2Ms without requiring other phase fields", () => {
     useChatStore
       .getState()
       .applyTurnStats(stats({ firstTokenMs: 12000, tier2Ms: 9000 }));
     expect(useChatStore.getState().tier2MsBySession[SID]).toBe(9000);
-    expect(useChatStore.getState().flushMsBySession[SID]).toBeUndefined();
   });
 });

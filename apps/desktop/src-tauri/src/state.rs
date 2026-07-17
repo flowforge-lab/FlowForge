@@ -1734,6 +1734,7 @@ impl AppState {
         }
 
         let session_root = self.session_root(session_id);
+        let flush_clock = std::time::Instant::now();
         let outcome = MemoryFlush
             .compact(CompactionContext {
                 provider,
@@ -1745,9 +1746,10 @@ impl AppState {
                 cancel,
             })
             .await;
+        let flush_elapsed_ms = flush_clock.elapsed().as_millis() as u64;
         match outcome {
             Ok(o) => {
-                tracing::info!(?o, session = %session_id, "pre-compaction memory flush");
+                tracing::info!(?o, flush_elapsed_ms, session = %session_id, "post-turn memory flush (#993 instrument)");
                 if let Err(e) = ledger.record_flush(session_id, message_count, now_ms()) {
                     tracing::warn!(error = %e, "flush ledger write failed");
                 }

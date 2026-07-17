@@ -40,7 +40,8 @@ const BREAKDOWN: ContextBreakdown = {
   systemTokens: 12_000,
   toolTokens: 2_900,
   toolSpecs: 1,
-  messageTokens: 158_000,
+  verbatimTokens: 200_000,
+  wireTokens: 158_000,
   messageCount: 122,
 };
 
@@ -134,7 +135,8 @@ describe("chat store — context telemetry (#931)", () => {
           systemTokens: 1,
           toolTokens: 1,
           toolSpecs: 1,
-          messageTokens: 1,
+          verbatimTokens: 1,
+          wireTokens: 1,
           messageCount: 1,
         },
         usage: {

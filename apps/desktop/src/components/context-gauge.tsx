@@ -69,14 +69,12 @@ function formatPrefillShare(
 // prefill-share line above.
 function formatPhaseBreakdown(
   promptLatencyMs: number | undefined,
-  flushMs: number | undefined,
   tier2Ms: number | undefined,
 ): string | null {
-  if (flushMs == null && tier2Ms == null) return null;
+  if (tier2Ms == null) return null;
   const parts: string[] = [];
   if (promptLatencyMs != null)
     parts.push(`main ${formatLatencyMs(promptLatencyMs)}`);
-  if (flushMs != null) parts.push(`flush ${formatLatencyMs(flushMs)}`);
   if (tier2Ms != null) parts.push(`summarize ${formatLatencyMs(tier2Ms)}`);
   return parts.join(" · ");
 }
@@ -119,7 +117,6 @@ export function ContextGauge({ sessionId }: { sessionId: string }) {
   const promptLatency = useChatStore(
     (s) => s.promptLatencyBySession[sessionId],
   );
-  const flushMs = useChatStore((s) => s.flushMsBySession[sessionId]);
   const tier2Ms = useChatStore((s) => s.tier2MsBySession[sessionId]);
   const model = useSessionModelStore(
     (s) => s.resolvedBySession[sessionId]?.model,
@@ -129,13 +126,13 @@ export function ContextGauge({ sessionId }: { sessionId: string }) {
     ttft != null && promptLatency != null
       ? formatPrefillShare(ttft, promptLatency)
       : null;
-  const phaseBreakdown = formatPhaseBreakdown(promptLatency, flushMs, tier2Ms);
+  const phaseBreakdown = formatPhaseBreakdown(promptLatency, tier2Ms);
 
   // Total context size from the component breakdown (provider-agnostic, correct
   // for all providers including Bedrock where inputTokens excludes cached tokens).
   // Falls back to the chars/4 proxy when no breakdown exists yet.
   const used = breakdown
-    ? breakdown.systemTokens + breakdown.toolTokens + breakdown.messageTokens
+    ? breakdown.systemTokens + breakdown.toolTokens + breakdown.wireTokens
     : tokens;
   if (used == null) return null;
 
@@ -151,7 +148,7 @@ export function ContextGauge({ sessionId }: { sessionId: string }) {
   // Segmented bar widths: the three components as shares of their own sum, so the
   // bar always fills even when Messages runs over the budget.
   const segSum = breakdown
-    ? breakdown.systemTokens + breakdown.toolTokens + breakdown.messageTokens
+    ? breakdown.systemTokens + breakdown.toolTokens + breakdown.wireTokens
     : 0;
   const segPct = (v: number) => (segSum > 0 ? (v / segSum) * 100 : 0);
 
@@ -164,7 +161,6 @@ export function ContextGauge({ sessionId }: { sessionId: string }) {
       pctUsed: pct,
       ttft,
       promptLatencyMs: promptLatency,
-      flushMs,
       tier2Ms,
       breakdown,
       sessionTotals: totals,
@@ -243,7 +239,7 @@ export function ContextGauge({ sessionId }: { sessionId: string }) {
               />
               <span
                 className="bg-emerald-500"
-                style={{ width: `${segPct(breakdown.messageTokens)}%` }}
+                style={{ width: `${segPct(breakdown.wireTokens)}%` }}
               />
             </div>
 
@@ -265,7 +261,7 @@ export function ContextGauge({ sessionId }: { sessionId: string }) {
                 swatch="bg-emerald-500"
                 label="Messages"
                 count={`${breakdown.messageCount} msgs`}
-                tokens={breakdown.messageTokens}
+                tokens={breakdown.wireTokens}
                 budget={budget}
               />
             </div>

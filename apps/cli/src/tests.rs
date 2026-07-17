@@ -78,7 +78,6 @@ fn json_mode_golden_lines() {
             token_count: None,
             prefill_estimates: None,
             prompt_latency_ms: None,
-            flush_ms: None,
             tier2_ms: None,
             tier1_fires: None,
             tier2_fires: None,

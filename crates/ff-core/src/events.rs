@@ -138,9 +138,15 @@ pub struct ContextBreakdown {
     pub tool_tokens: u32,
     /// Number of tool specs advertised this turn.
     pub tool_specs: u32,
-    /// Estimated tokens of the persisted message transcript (user/assistant/tool).
-    pub message_tokens: u32,
-    /// Number of messages in the transcript.
+    /// Estimated tokens of the **verbatim** persisted message transcript
+    /// (user/assistant/tool) — the store, before any compaction. Formerly
+    /// `messageTokens`; renamed to distinguish from `wireTokens` (#997).
+    pub verbatim_tokens: u32,
+    /// Estimated tokens of the **compacted wire** actually sent to the model this
+    /// turn (post Tier-1 extractive + Tier-2 abstractive). This is what `pctUsed`
+    /// should be computed from — it reflects prefill cost, not store size (#997).
+    pub wire_tokens: u32,
+    /// Number of messages in the verbatim transcript.
     pub message_count: u32,
 }
 
@@ -260,15 +266,6 @@ pub struct TurnStatsEvent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub prompt_latency_ms: Option<u32>,
-    /// #971: wall-clock (ms) spent in the pre-main-call **memory flush** this turn
-    /// (an agentic sub-loop of up to `MAX_FLUSH_ITERATIONS` LLM round-trips),
-    /// summed across iterations. Part of the "other" that [`Self::first_token_ms`]
-    /// absorbs and that caching cannot touch. Together with [`Self::tier2_ms`] it
-    /// attributes an over-budget latency spike to the flush vs the summarizer.
-    /// `None` when no flush ran this turn.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
-    pub flush_ms: Option<u32>,
     /// #971: wall-clock (ms) spent in the pre-main-call **Tier-2 abstractive
     /// summarize** this turn (the uncached `summarize_cold` LLM call; the
     /// cross-turn-cache reuse path is excluded). The dominant "other" latency on

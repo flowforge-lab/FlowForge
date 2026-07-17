@@ -3128,7 +3128,8 @@ Shipping the Settings redesign — currently the Memory browser (SET.8).
           systemTokens,
           toolTokens,
           toolSpecs: 3,
-          messageTokens,
+          verbatimTokens: messageTokens,
+          wireTokens: messageTokens,
           messageCount: msgs.length,
         };
         const usage: TurnUsage = {
@@ -3163,7 +3164,6 @@ Shipping the Settings redesign — currently the Memory browser (SET.8).
           outputTokens: usage.outputTokens,
           firstTokenMs: 8_200,
           promptLatencyMs: 6_000,
-          flushMs: 1_400,
           tier2Ms: 800,
         });
         return;
