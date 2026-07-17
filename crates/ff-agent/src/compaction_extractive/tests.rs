@@ -679,7 +679,7 @@ fn graded_incremental_range_equals_full_pass() {
     // [boundary..cold_end] via compact_graded_range must be byte-identical to what
     // a full compact_graded_collect assigns to those same absolute indices --
     // because band membership is a pure function of index.
-    let bands = GradedBands::graded_v1();
+    let bands = GradedBands::graded_v1(0);
     let blob = big_json_blob();
     // Build a long transcript so multiple bands are exercised.
     let mut messages = Vec::new();
@@ -711,7 +711,7 @@ fn graded_incremental_range_equals_full_pass() {
 fn graded_v1_last_band_is_default_strength() {
     // Non-regression: the shallowest (highest-index) band equals the plain default,
     // so newest-cold messages are unchanged vs today.
-    let bands = GradedBands::graded_v1();
+    let bands = GradedBands::graded_v1(0);
     let blob = big_json_blob();
     let at_default = bands.compactor_for(100).compress_one(&blob);
     let plain = ExtractiveCompactor::default().compress_one(&blob);
@@ -741,7 +741,7 @@ fn scored_incremental_range_equals_full_pass() {
     // with a scorer, compacting the newly-cold slice [boundary..cold_end] must be
     // byte-identical to what a full pass assigns those same absolute indices --
     // because band choice is a pure function of (index, message content).
-    let bands = GradedBands::graded_v1();
+    let bands = GradedBands::graded_v1(0);
     let scorer = MessageSalience::default();
     let blob = big_json_blob();
     let mut messages = Vec::new();
@@ -777,7 +777,7 @@ fn scored_incremental_range_equals_full_pass() {
 fn salience_keeps_high_value_message_gentler_than_low_value_at_same_index() {
     // A high-value message (small user directive) at a given index must be
     // compressed no harder than a low-value one (big tool dump) at the SAME index.
-    let bands = GradedBands::graded_v1();
+    let bands = GradedBands::graded_v1(0);
     let scorer = MessageSalience::default();
     let big = big_json_blob();
 
@@ -801,7 +801,7 @@ fn salience_keeps_high_value_message_gentler_than_low_value_at_same_index() {
 #[test]
 fn scored_none_reproduces_pure_depth_grading() {
     // Passing no scorer must be byte-identical to Step 1's depth-only grading.
-    let bands = GradedBands::graded_v1();
+    let bands = GradedBands::graded_v1(0);
     let blob = big_json_blob();
     let messages: Vec<_> = (0..20)
         .map(|i| msg_with_id(&format!("m{i}"), Role::Tool, &blob))
@@ -816,4 +816,86 @@ fn scored_none_reproduces_pure_depth_grading() {
         );
     }
     assert_eq!(scored_none.messages.len(), 20);
+}
+
+// ---- #989 target-seeking: deepening levels ----
+
+#[test]
+fn graded_v1_level_zero_matches_original_preset() {
+    // Non-regression anchor: graded_v1(0) must be byte-identical to the Step-1
+    // preset (the aggressive/mid/default triple), so introducing levels changes
+    // nothing until the target-seeking loop actually deepens.
+    let b0 = GradedBands::graded_v1(0);
+    // Oldest band = aggressive; newest-cold band = ExtractiveCompactor::default().
+    assert_eq!(b0.compactor_for(0).max_value_chars, 96);
+    assert_eq!(b0.compactor_for(40).max_value_chars, 160);
+    assert_eq!(
+        b0.compactor_for(100).max_value_chars,
+        ExtractiveCompactor::default().max_value_chars
+    );
+}
+
+#[test]
+fn deeper_level_compresses_monotonically_harder() {
+    // Each level must yield <= tokens than the previous (the loop's progress
+    // guarantee). Compare the compacted size of a fixed transcript across levels.
+    let blob = big_json_blob();
+    let messages: Vec<_> = (0..30)
+        .map(|i| msg_with_id(&format!("m{i}"), Role::Tool, &blob))
+        .collect();
+    let mut prev = usize::MAX;
+    for level in 0..=MAX_COMPACTION_LEVEL {
+        let out = GradedBands::graded_v1(level).compact_graded_range(&messages, 0, 30, None);
+        let after = out.savings.after_tokens;
+        assert!(
+            after <= prev,
+            "level {level} produced {after} tokens, more than the previous level's {prev}"
+        );
+        prev = after;
+    }
+    // The deepest level must actually shrink meaningfully vs level 0.
+    let l0 = GradedBands::graded_v1(0)
+        .compact_graded_range(&messages, 0, 30, None)
+        .savings
+        .after_tokens;
+    let lmax = GradedBands::graded_v1(MAX_COMPACTION_LEVEL)
+        .compact_graded_range(&messages, 0, 30, None)
+        .savings
+        .after_tokens;
+    assert!(lmax < l0, "deepest level ({lmax}) must beat level 0 ({l0})");
+}
+
+#[test]
+fn scored_range_stable_across_calls_at_a_fixed_level() {
+    // Cache-stability under a fixed level: a full pass and an incremental
+    // (frozen-prefix + fresh-slice) pass at the SAME level produce byte-identical
+    // output for the overlapping indices — the invariant reuse-at-level relies on.
+    let level = 2;
+    let bands = GradedBands::graded_v1(level);
+    let scorer = MessageSalience::default();
+    let blob = big_json_blob();
+    let messages: Vec<_> = (0..60)
+        .map(|i| {
+            let role = if i % 2 == 0 { Role::Tool } else { Role::User };
+            msg_with_id(&format!("m{i}"), role, &blob)
+        })
+        .collect();
+    let cold_end = 54;
+
+    let full = bands.compact_graded_range(&messages, 0, cold_end, Some(&scorer));
+    let boundary = 30;
+    let fresh = bands.compact_graded_range(
+        &messages[boundary..cold_end],
+        boundary,
+        cold_end,
+        Some(&scorer),
+    );
+    for (k, fm) in fresh.messages.iter().enumerate() {
+        assert_eq!(
+            fm.content,
+            full.messages[boundary + k].content,
+            "level-{level} incremental slice must match the full pass at abs index {}",
+            boundary + k
+        );
+    }
 }

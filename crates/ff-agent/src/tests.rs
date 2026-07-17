@@ -5595,6 +5595,122 @@ async fn over_pressure_compacts_wire_but_store_stays_verbatim() {
 }
 
 #[tokio::test]
+async fn target_seeking_deepens_until_wire_within_budget() {
+    // #989: when a single level-0 graded pass still leaves the wire over the
+    // Tier-1 target T (= compaction_budget × 0.75), the target-seeking loop must
+    // deepen the grading level until the sent wire's estimate is ≤ T — no LLM,
+    // purely mechanical. Assert against the wire the provider actually received.
+    let dir = tempfile::tempdir().unwrap();
+    let store = SessionStore::new();
+    let s = store.create_session(None);
+
+    // A long cold prefix of large compressible blobs — big enough that level-0
+    // grading alone won't reach a tight target.
+    for i in 0..24 {
+        let blob = serde_json::to_string(&serde_json::json!({
+            "idx": i,
+            "summary": "z".repeat(8000),
+            "items": (0..80).collect::<Vec<i32>>(),
+        }))
+        .unwrap();
+        let role = if i % 2 == 0 {
+            Role::User
+        } else {
+            Role::Assistant
+        };
+        store.add_message(&s.id, role, blob);
+    }
+    for i in 0..6 {
+        store.add_message(&s.id, Role::User, format!("recent {i}"));
+    }
+
+    let registry = ToolRegistry::new();
+    let root = dir.path().to_path_buf();
+    let approve = AlwaysApprove;
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let provider = RecordingProvider { seen: seen.clone() };
+
+    // Self-calibrate the budget so T is unreachable at level 0 but reachable before
+    // MAX: measure the graded wire at level 0 vs the deepest level, then place T
+    // between them. This guarantees the loop must deepen at least once and can stop.
+    let history = store.get_messages(&s.id);
+    let cold_end = history.len().saturating_sub(KEEP_RECENT_VERBATIM);
+    let scorer = MessageSalience::default();
+    let est_at = |level: usize| {
+        let out = GradedBands::graded_v1(level)
+            .compact_graded_range(&history, 0, cold_end, Some(&scorer))
+            .messages;
+        // Mirror run_turn: estimate the whole wire (compacted cold + verbatim tail).
+        let mut wire = out;
+        wire.extend_from_slice(&history[cold_end..]);
+        ProxyTokenEstimator::default()
+            .assess(&wire, "mock")
+            .estimated_tokens
+    };
+    let size_l0 = est_at(0);
+    let size_max = est_at(MAX_COMPACTION_LEVEL);
+    assert!(
+        size_max < size_l0,
+        "precondition: deepening must shrink the wire ({size_max} < {size_l0})"
+    );
+    // T strictly between deepest and level-0 sizes → level 0 overshoots, a deeper
+    // level reaches it. budget = T / 0.75.
+    let target = (size_max + size_l0) / 2;
+    let budget = ((target as f64) / EXTRACTIVE_COMPACT_AT_FRACTION) as u64;
+    let mut tctx = ctx(&registry, &root, &approve);
+    tctx.compaction_budget = Some(budget);
+
+    run_turn(
+        &provider,
+        &store,
+        &tctx,
+        &s.id,
+        "mock",
+        None,
+        false,
+        ReasoningVisibility::All,
+        CancelToken::new(),
+        |_| {},
+    )
+    .await
+    .unwrap();
+
+    // Reconstruct the messages the provider received (skip the system prompt) and
+    // estimate their tokens the same way run_turn does.
+    let wire = seen.lock().unwrap().clone();
+    let wire_msgs: Vec<Message> = wire
+        .iter()
+        .filter(|m| m.role != "system")
+        .map(|m| Message {
+            id: String::new(),
+            session_id: s.id.clone(),
+            role: match m.role.as_str() {
+                "assistant" => Role::Assistant,
+                "tool" => Role::Tool,
+                "system" => Role::System,
+                _ => Role::User,
+            },
+            content: m.content.clone().unwrap_or_default(),
+            tool_calls: None,
+            tool_call_id: None,
+            attachments: None,
+            reasoning: None,
+            stop_reason: None,
+            author_name: None,
+            created_at: 0,
+        })
+        .collect();
+    let sent = ProxyTokenEstimator::default()
+        .assess(&wire_msgs, "mock")
+        .estimated_tokens;
+
+    assert!(
+        sent <= target,
+        "target-seeking must hold the sent wire ({sent} tok) within T ({target} tok)"
+    );
+}
+
+#[tokio::test]
 async fn below_pressure_wire_is_unchanged() {
     let dir = tempfile::tempdir().unwrap();
     let store = SessionStore::new();

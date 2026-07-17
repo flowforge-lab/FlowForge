@@ -72,6 +72,10 @@ struct Tier1Entry {
     /// staleness guard: the caller rejects the seed if the transcript shrank
     /// (edit/delete) since production, even if `invalidate` was missed.
     message_count: u64,
+    /// Target-seeking deepening level this prefix was compacted at (#989). The
+    /// caller reuses the frozen prefix only when it still wants this same level;
+    /// if a deeper level is needed to hold `wire ≤ T`, it recompacts in full.
+    level: usize,
 }
 
 impl CompactionCache {
@@ -110,23 +114,26 @@ impl CompactionCache {
     // --- Tier-1 frozen prefix (#933 A.2 step 2) ---
 
     /// Retrieve the cached tier-1 frozen prefix for a session, if any.
-    /// Returns `(boundary, prefix, message_count)`.
-    pub fn get_tier1(&self, session_id: &str) -> Option<(usize, Vec<Message>, u64)> {
+    /// Returns `(boundary, prefix, message_count, level)`.
+    pub fn get_tier1(&self, session_id: &str) -> Option<(usize, Vec<Message>, u64, usize)> {
         let mut guard = self.inner.lock().unwrap();
         guard.get(session_id).and_then(|e| {
             e.tier1
                 .as_ref()
-                .map(|t| (t.boundary, t.prefix.clone(), t.message_count))
+                .map(|t| (t.boundary, t.prefix.clone(), t.message_count, t.level))
         })
     }
 
-    /// Store (or overwrite) the tier-1 frozen prefix for a session.
+    /// Store (or overwrite) the tier-1 frozen prefix for a session. `level` is the
+    /// target-seeking deepening level the prefix was compacted at (#989), so the
+    /// caller only reuses it when it still wants that same level.
     pub fn put_tier1(
         &self,
         session_id: &str,
         boundary: usize,
         prefix: Vec<Message>,
         message_count: u64,
+        level: usize,
     ) {
         let mut guard = self.inner.lock().unwrap();
         let entry = guard.get_or_insert_mut(session_id.to_owned(), || CachedEntry {
@@ -137,6 +144,7 @@ impl CompactionCache {
             boundary,
             prefix,
             message_count,
+            level,
         });
     }
 
