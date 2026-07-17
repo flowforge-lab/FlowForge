@@ -1,8 +1,11 @@
-// Tiling pane manager (Issue #148). The main chat area is a recursive binary tree
-// of panes; each leaf hosts a full, independent session (its own transcript,
-// streaming turn, and composer draft). Splitting a pane replaces that leaf with a
-// split node whose two children are the original leaf and a new one. Closing a
-// pane removes its leaf and collapses the parent split into the surviving sibling.
+// Tiling pane manager (Issue #148). The main chat area is a recursive tree of
+// panes; each leaf hosts a full, independent session (its own transcript,
+// streaming turn, and composer draft). A split node lays out an ordered list of
+// children along one axis (#985): splitting a pane along the same axis as its
+// parent inserts an adjacent sibling into that flat row, so N side-by-side session
+// columns are one split with N children and N-1 dividers. Splitting along the other
+// axis nests a new split. Closing a pane removes its leaf and, when a split falls to
+// a single child, collapses that split into the survivor.
 //
 // One pane is "focused" at a time (focus ring + keyboard/command target). The
 // focused pane's session is mirrored to the chat store's activeSessionId so the
@@ -27,13 +30,14 @@ export interface LeafNode {
 export interface SplitNode {
   type: "split";
   id: string;
-  /** "vertical" = side-by-side (the divider is a vertical line); "horizontal" =
-   *  stacked (the divider is a horizontal line). */
+  /** "vertical" = side-by-side (dividers are vertical lines); "horizontal" =
+   *  stacked (dividers are horizontal lines). */
   dir: SplitDir;
-  a: PaneNode;
-  b: PaneNode;
-  /** Fraction of the split's main axis given to child `a`, in [MIN_RATIO, 1-MIN_RATIO]. */
-  ratio: number;
+  /** Ordered children laid out along the split's main axis (length >= 2). */
+  children: PaneNode[];
+  /** Fraction of the split's main axis for each child, in [MIN_RATIO, 1-MIN_RATIO],
+   *  aligned with `children` and summing to 1. */
+  ratios: number[];
 }
 
 export type PaneNode = LeafNode | SplitNode;
@@ -53,19 +57,57 @@ export function clampRatio(r: number): number {
   return Math.max(MIN_RATIO, Math.min(1 - MIN_RATIO, r));
 }
 
+/** Coerce a ratios array to `count` finite, positive fractions summing to 1.
+ *  Falls back to an equal split when the input is missing or degenerate. */
+function normalizeRatios(
+  ratios: number[] | undefined,
+  count: number,
+): number[] {
+  const equal = Array.from({ length: count }, () => 1 / count);
+  if (!ratios || ratios.length !== count) return equal;
+  const clean = ratios.map((r) => (Number.isFinite(r) && r > 0 ? r : 0));
+  const sum = clean.reduce((acc, r) => acc + r, 0);
+  if (sum <= 0) return equal;
+  return clean.map((r) => r / sum);
+}
+
 // ── Pure tree helpers ────────────────────────────────────────────────────────
 
 export function leaves(node: PaneNode): LeafNode[] {
-  return node.type === "leaf" ? [node] : [...leaves(node.a), ...leaves(node.b)];
+  return node.type === "leaf" ? [node] : node.children.flatMap(leaves);
 }
 
 export function leafCountOf(node: PaneNode): number {
-  return node.type === "leaf" ? 1 : leafCountOf(node.a) + leafCountOf(node.b);
+  return node.type === "leaf"
+    ? 1
+    : node.children.reduce((n, c) => n + leafCountOf(c), 0);
 }
 
 function findLeaf(node: PaneNode, paneId: string): LeafNode | undefined {
   if (node.type === "leaf") return node.id === paneId ? node : undefined;
-  return findLeaf(node.a, paneId) ?? findLeaf(node.b, paneId);
+  for (const child of node.children) {
+    const hit = findLeaf(child, paneId);
+    if (hit) return hit;
+  }
+  return undefined;
+}
+
+/** Return the split that directly contains leaf `paneId`, and that child's index,
+ *  or null if the leaf is the root or unknown. */
+function findParent(
+  node: PaneNode,
+  paneId: string,
+): { parent: SplitNode; index: number } | null {
+  if (node.type === "leaf") return null;
+  const index = node.children.findIndex(
+    (c) => c.type === "leaf" && c.id === paneId,
+  );
+  if (index !== -1) return { parent: node, index };
+  for (const child of node.children) {
+    const hit = findParent(child, paneId);
+    if (hit) return hit;
+  }
+  return null;
 }
 
 /** Return a new tree with leaf `paneId` replaced by `replacement` subtree. */
@@ -77,20 +119,31 @@ function replaceLeaf(
   if (node.type === "leaf") return node.id === paneId ? replacement : node;
   return {
     ...node,
-    a: replaceLeaf(node.a, paneId, replacement),
-    b: replaceLeaf(node.b, paneId, replacement),
+    children: node.children.map((c) => replaceLeaf(c, paneId, replacement)),
   };
 }
 
-/** Return a new tree with leaf `paneId` removed (its parent split collapses into
- *  the sibling subtree), or null if `paneId` is the lone root leaf. */
+/** Return a new tree with leaf `paneId` removed. A split that falls to a single
+ *  child collapses into that child; a split's dropped child also drops its ratio
+ *  slot (remaining ratios renormalize). Returns null if `paneId` is the root leaf. */
 function removeLeaf(node: PaneNode, paneId: string): PaneNode | null {
   if (node.type === "leaf") return node.id === paneId ? null : node;
-  const a = removeLeaf(node.a, paneId);
-  if (a === null) return node.b; // a was (or contained only) the removed leaf
-  const b = removeLeaf(node.b, paneId);
-  if (b === null) return node.a;
-  return { ...node, a, b };
+  const kept: PaneNode[] = [];
+  const keptRatios: number[] = [];
+  node.children.forEach((child, i) => {
+    const next = removeLeaf(child, paneId);
+    if (next !== null) {
+      kept.push(next);
+      keptRatios.push(node.ratios[i]);
+    }
+  });
+  if (kept.length === 0) return null;
+  if (kept.length === 1) return kept[0];
+  return {
+    ...node,
+    children: kept,
+    ratios: normalizeRatios(keptRatios, kept.length),
+  };
 }
 
 /** Apply `fn` to leaf `paneId`, returning a new tree. */
@@ -102,18 +155,36 @@ function mapLeaf(
   if (node.type === "leaf") return node.id === paneId ? fn(node) : node;
   return {
     ...node,
-    a: mapLeaf(node.a, paneId, fn),
-    b: mapLeaf(node.b, paneId, fn),
+    children: node.children.map((c) => mapLeaf(c, paneId, fn)),
   };
 }
 
-function setRatioOf(node: PaneNode, splitId: string, ratio: number): PaneNode {
+/** Return a new tree with split `splitId` replaced by `updated`. */
+function replaceSplit(
+  node: PaneNode,
+  splitId: string,
+  updated: SplitNode,
+): PaneNode {
   if (node.type === "leaf") return node;
-  if (node.id === splitId) return { ...node, ratio: clampRatio(ratio) };
+  if (node.id === splitId) return updated;
   return {
     ...node,
-    a: setRatioOf(node.a, splitId, ratio),
-    b: setRatioOf(node.b, splitId, ratio),
+    children: node.children.map((c) => replaceSplit(c, splitId, updated)),
+  };
+}
+
+function setRatiosOf(
+  node: PaneNode,
+  splitId: string,
+  ratios: number[],
+): PaneNode {
+  if (node.type === "leaf") return node;
+  if (node.id === splitId) {
+    return { ...node, ratios: normalizeRatios(ratios, node.children.length) };
+  }
+  return {
+    ...node,
+    children: node.children.map((c) => setRatiosOf(c, splitId, ratios)),
   };
 }
 
@@ -134,22 +205,85 @@ function isLeaf(v: unknown): v is LeafNode {
   );
 }
 
-function isNode(v: unknown): v is PaneNode {
-  if (isLeaf(v)) return true;
-  if (
+/** Legacy binary split shape persisted before #985 (`{ a, b, ratio }`). */
+interface LegacySplit {
+  type: "split";
+  id: string;
+  dir: SplitDir;
+  a: PaneNode;
+  b: PaneNode;
+  ratio?: number;
+}
+
+function isSplitObject(
+  v: unknown,
+): v is { type: "split"; id: unknown; dir: unknown } {
+  return (
     typeof v === "object" &&
     v !== null &&
     (v as { type?: unknown }).type === "split"
-  ) {
-    const s = v as SplitNode;
-    return (
-      typeof s.id === "string" &&
-      (s.dir === "vertical" || s.dir === "horizontal") &&
-      isNode(s.a) &&
-      isNode(s.b)
-    );
+  );
+}
+
+function isNode(v: unknown): v is PaneNode {
+  if (isLeaf(v)) return true;
+  if (isSplitObject(v)) {
+    const s = v as Partial<SplitNode> & Partial<LegacySplit>;
+    if (typeof s.id !== "string") return false;
+    if (s.dir !== "vertical" && s.dir !== "horizontal") return false;
+    // N-way (post-#985) shape.
+    if (Array.isArray(s.children)) {
+      return s.children.length >= 2 && s.children.every(isNode);
+    }
+    // Legacy binary shape — still accepted so `normalizeNode` can migrate it.
+    return isNode(s.a) && isNode(s.b);
   }
   return false;
+}
+
+/** Migrate + flatten a validated node: convert legacy `{ a, b, ratio }` splits to
+ *  the N-way shape, and merge a child split into its parent when they share `dir`
+ *  (collapsing left-nested chains into one flat row, per #985). */
+function normalizeNode(node: PaneNode): PaneNode {
+  if (node.type === "leaf") return node;
+
+  const legacy = node as unknown as LegacySplit;
+  let children: PaneNode[];
+  let ratios: number[];
+  if (Array.isArray(node.children)) {
+    children = node.children;
+    ratios = normalizeRatios(node.ratios, node.children.length);
+  } else {
+    // Legacy binary split.
+    const r = clampRatio(legacy.ratio ?? 0.5);
+    children = [legacy.a, legacy.b];
+    ratios = [r, 1 - r];
+  }
+
+  const flatChildren: PaneNode[] = [];
+  const flatRatios: number[] = [];
+  children.forEach((child, i) => {
+    const norm = normalizeNode(child);
+    if (norm.type === "split" && norm.dir === node.dir) {
+      // Same-axis child split: splice its children in, scaling their ratios by
+      // this child's slot so the row's proportions are preserved.
+      norm.children.forEach((gc, j) => {
+        flatChildren.push(gc);
+        flatRatios.push(ratios[i] * norm.ratios[j]);
+      });
+    } else {
+      flatChildren.push(norm);
+      flatRatios.push(ratios[i]);
+    }
+  });
+
+  return {
+    type: "split",
+    id: node.id,
+    dir: node.dir,
+    children: flatChildren,
+    ratios: normalizeRatios(flatRatios, flatChildren.length),
+  };
 }
 
 function loadPersisted(): Persisted {
@@ -157,7 +291,7 @@ function loadPersisted(): Persisted {
     const raw = localStorage.getItem(STORAGE_KEY);
     if (!raw) return { root: null, focusedPaneId: null };
     const p = JSON.parse(raw) as Partial<Persisted>;
-    const root = isNode(p.root) ? p.root : null;
+    const root = isNode(p.root) ? normalizeNode(p.root) : null;
     return {
       root,
       focusedPaneId:
@@ -211,7 +345,8 @@ interface PanesState {
   splitFork: (paneId: string, dir: SplitDir) => Promise<void>;
   /** Remove a pane; no-op on the last one. Refocuses a surviving leaf. */
   closePane: (paneId: string) => void;
-  setRatio: (splitId: string, ratio: number) => void;
+  /** Commit a split's full ratios array (one fraction per child, summing to 1). */
+  setRatios: (splitId: string, ratios: number[]) => void;
   focusPane: (paneId: string) => void;
   setPaneSession: (paneId: string, sessionId: string) => void;
   toggleCollapse: (paneId: string) => void;
@@ -235,18 +370,34 @@ export const usePanesStore = create<PanesState>((set, get) => {
     const leaf = findLeaf(root, paneId);
     if (!leaf) return;
     const newLeaf: LeafNode = { type: "leaf", id: newId(), sessionId };
-    const splitNode: SplitNode = {
-      type: "split",
-      id: newId(),
-      dir,
-      a: { ...leaf, collapsed: false },
-      b: newLeaf,
-      ratio: 0.5,
-    };
-    set({
-      root: replaceLeaf(root, paneId, splitNode),
-      focusedPaneId: newLeaf.id,
-    });
+
+    const parent = findParent(root, paneId);
+    let nextRoot: PaneNode;
+    if (parent && parent.parent.dir === dir) {
+      // Same axis as the parent row: insert an adjacent sibling and split the
+      // target's ratio slot in half (keeps the row's other proportions intact).
+      const { parent: split, index } = parent;
+      const children = [...split.children];
+      children.splice(index + 1, 0, newLeaf);
+      const half = split.ratios[index] / 2;
+      const ratios = [...split.ratios];
+      ratios.splice(index, 1, half, half);
+      const updated: SplitNode = { ...split, children, ratios };
+      nextRoot =
+        root === split ? updated : replaceSplit(root, split.id, updated);
+    } else {
+      // Root leaf, or the other axis: wrap the target in a fresh 2-way split.
+      const splitNode: SplitNode = {
+        type: "split",
+        id: newId(),
+        dir,
+        children: [{ ...leaf, collapsed: false }, newLeaf],
+        ratios: [0.5, 0.5],
+      };
+      nextRoot = replaceLeaf(root, paneId, splitNode);
+    }
+
+    set({ root: nextRoot, focusedPaneId: newLeaf.id });
     syncActive(sessionId);
     save();
   };
@@ -320,8 +471,12 @@ export const usePanesStore = create<PanesState>((set, get) => {
     closePane: (paneId) => {
       const { root } = get();
       if (!root || leafCountOf(root) <= 1) return;
-      const next = removeLeaf(root, paneId);
-      if (!next) return;
+      const removed = removeLeaf(root, paneId);
+      if (!removed) return;
+      // A collapsed single-child split can leave its survivor adjacent to a
+      // same-dir grandparent — re-flatten so the "same-axis never nests"
+      // invariant holds immediately, not just after the next reload.
+      const next = normalizeNode(removed);
       const survivors = leaves(next);
       const focusedPaneId =
         get().focusedPaneId === paneId ||
@@ -334,10 +489,10 @@ export const usePanesStore = create<PanesState>((set, get) => {
       save();
     },
 
-    setRatio: (splitId, ratio) => {
+    setRatios: (splitId, ratios) => {
       const { root } = get();
       if (!root) return;
-      set({ root: setRatioOf(root, splitId, ratio) });
+      set({ root: setRatiosOf(root, splitId, ratios) });
       save();
     },
 
