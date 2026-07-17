@@ -67,7 +67,7 @@ async fn maybe_flush_memory_returns_none_when_not_over_budget() {
     let s = state.store.create_session(None);
     state.store.add_message(&s.id, Role::User, "hi".into());
     let registry = ToolRegistry::new();
-    // A provider that would panic if called — proves no flush round-trip happens.
+    // Under-budget → flush_due() returns false → provider is never called for flush.
     let provider = FixedTitleProvider("unused".into());
 
     let flushed = state

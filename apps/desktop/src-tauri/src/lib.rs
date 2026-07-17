@@ -2065,6 +2065,19 @@ impl GoalIteration for GoalLoopIteration {
         let result = tokio::time::timeout(GOAL_ITERATION_TIMEOUT, turn).await;
         self.state.take_cancel_if(&sid, &cancel);
 
+        // #991: post-turn memory flush (off critical path), matching spawn_assistant_turn.
+        if matches!(result, Ok(Ok(_))) {
+            self.state
+                .maybe_flush_memory(
+                    provider.as_ref(),
+                    &registry,
+                    &sid,
+                    &model,
+                    cancel_probe.clone(),
+                )
+                .await;
+        }
+
         // Distinguish a user Stop (cancel) — the goal should PAUSE resumably — from
         // an unrecoverable failure (timeout / provider error) — which FAILS it.
         // A timeout is not a user cancel: the user didn't stop it, so it fails.
@@ -2356,6 +2369,13 @@ impl ff_scheduled::TaskRunner for DesktopTaskRunner {
             move |event| emit_agent_event(&app, &sid_for_events, event),
         );
         let result = tokio::time::timeout(SCHEDULED_FIRE_TIMEOUT, turn).await;
+
+        // #991: post-turn memory flush (off critical path), matching spawn_assistant_turn.
+        if matches!(&result, Ok(Ok(_))) {
+            self.state
+                .maybe_flush_memory(provider.as_ref(), &registry, &sid, &model, cancel.clone())
+                .await;
+        }
 
         // Outcome precedence (RFC 0017 §8.4): an ask_user dismissal surfaces as
         // needs_attention regardless of how the rest of the turn ended; else a

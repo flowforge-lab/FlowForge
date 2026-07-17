@@ -1105,14 +1105,6 @@ pub async fn run_turn(
             ingest.messages
         };
         let pressure = estimator.assess(&history, model);
-        // #991: the memory flush no longer runs here, on the turn's critical path
-        // (it was the dominant pre-first-token latency — a 219s TTFT on a
-        // memory-edit turn). It now runs only *after* a successful turn, off the
-        // TTFT path, in the host's `maybe_flush_memory` (ledger-gated, durable).
-        // The store is the source of truth, so the post-turn flush sees the same
-        // facts; memory is already turn-lagged (the prompt is built before this
-        // turn), so an in-loop flush never helped the turn that paid for it.
-        let _ = pressure;
 
         let mut messages = Vec::new();
         if let Some(system) = system_prompt {
