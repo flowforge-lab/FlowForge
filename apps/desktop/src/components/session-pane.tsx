@@ -16,6 +16,7 @@ import { FilePanel } from "@/components/file-panel";
 import { FindBar } from "@/components/find-bar";
 import { GoalStatusPanel } from "@/components/goal-status-panel";
 import { NotebookStatusPanel } from "@/components/notebook-status-panel";
+import { ProcessStatusPanel } from "@/components/process-status-panel";
 import { InputBar } from "@/components/input-bar";
 import { PhenoSelector } from "@/components/pheno-selector";
 import { useAttachGate } from "@/lib/attach-gate";
@@ -208,6 +209,11 @@ export function SessionPane({
           `notebook_status` for the duration of the `running` state (cadence
           tunable, see experimental store). Sits above the goal panel so
           kernel + goal state both stay visible. */}
+      {/* Live background-process output (#873 FE / #987): self-hides unless this
+          session has a process started via `process_manager`. Sits above the
+          kernel/goal panels so long-running dev servers stay visible. */}
+      <ProcessStatusPanel sessionId={sessionId} />
+
       <NotebookStatusPanel sessionId={sessionId} />
 
       {/* Goal status panel (#717): self-hides unless this session has a goal. */}

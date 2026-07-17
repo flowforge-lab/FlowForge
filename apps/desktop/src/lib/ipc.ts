@@ -43,6 +43,8 @@ import type {
   ToolAskRequestEvent,
   ToolCallEvent,
   ToolOutputChunkEvent,
+  ProcessOutputEvent,
+  ProcessExitedEvent,
   ToolResultEvent,
   SkillInfo,
   SkillAggregate,
@@ -570,6 +572,13 @@ export interface FfIpc {
   onToolCall(cb: (e: ToolCallEvent) => void): Promise<Unlisten>;
   onToolOutput(cb: (e: ToolOutputChunkEvent) => void): Promise<Unlisten>;
   onToolResult(cb: (e: ToolResultEvent) => void): Promise<Unlisten>;
+  /** Live stdout/stderr from a background process started via `process_manager`
+   *  (#873). Flows across turns for the life of the process (unlike the per-turn
+   *  `tool:output`); keyed by `processId`, no `messageId`. */
+  onProcessOutput(cb: (e: ProcessOutputEvent) => void): Promise<Unlisten>;
+  /** A background process ended (exited / killed / failed) — terminal, emitted
+   *  once after its last `process:output`. */
+  onProcessExited(cb: (e: ProcessExitedEvent) => void): Promise<Unlisten>;
   onApprovalRequest(
     cb: (e: ToolApprovalRequestEvent) => void,
   ): Promise<Unlisten>;
@@ -962,6 +971,10 @@ class TauriIpc implements FfIpc {
     this.listen<ToolOutputChunkEvent>("tool:output", cb);
   onToolResult = (cb: (e: ToolResultEvent) => void) =>
     this.listen<ToolResultEvent>("tool:result", cb);
+  onProcessOutput = (cb: (e: ProcessOutputEvent) => void) =>
+    this.listen<ProcessOutputEvent>("process:output", cb);
+  onProcessExited = (cb: (e: ProcessExitedEvent) => void) =>
+    this.listen<ProcessExitedEvent>("process:exited", cb);
   onApprovalRequest = (cb: (e: ToolApprovalRequestEvent) => void) =>
     this.listen<ToolApprovalRequestEvent>("tool:approval-request", cb);
   onAskRequest = (cb: (e: ToolAskRequestEvent) => void) =>

@@ -31,6 +31,8 @@ import type {
   ToolAskRequestEvent,
   ToolCallEvent,
   ToolOutputChunkEvent,
+  ProcessOutputEvent,
+  ProcessExitedEvent,
   ToolResultEvent,
   SkillInfo,
   SkillAggregate,
@@ -866,6 +868,14 @@ export class MockIpc implements FfIpc {
   private sessionTitleListeners = new Set<Listener<SessionTitleUpdatedEvent>>();
   private toolCallListeners = new Set<Listener<ToolCallEvent>>();
   private toolOutputListeners = new Set<Listener<ToolOutputChunkEvent>>();
+  private processOutputListeners = new Set<Listener<ProcessOutputEvent>>();
+  private processExitedListeners = new Set<Listener<ProcessExitedEvent>>();
+  /** Small sequential ids for the demo background process, mirroring the real
+   *  supervisor's `u32`. */
+  private nextProcessId = 1;
+  /** Sessions that already have a demo background process running, so repeated
+   *  turns don't stack duplicate processes (#987). */
+  private demoProcessSessions = new Set<string>();
   private toolResultListeners = new Set<Listener<ToolResultEvent>>();
   private approvalRequestListeners = new Set<
     Listener<ToolApprovalRequestEvent>
@@ -1416,6 +1426,12 @@ export class MockIpc implements FfIpc {
   }
   onToolResult(cb: Listener<ToolResultEvent>): Promise<Unlisten> {
     return this.subscribe(this.toolResultListeners, cb);
+  }
+  onProcessOutput(cb: Listener<ProcessOutputEvent>): Promise<Unlisten> {
+    return this.subscribe(this.processOutputListeners, cb);
+  }
+  onProcessExited(cb: Listener<ProcessExitedEvent>): Promise<Unlisten> {
+    return this.subscribe(this.processExitedListeners, cb);
   }
   onApprovalRequest(cb: Listener<ToolApprovalRequestEvent>): Promise<Unlisten> {
     return this.subscribe(this.approvalRequestListeners, cb);
@@ -2829,6 +2845,11 @@ Shipping the Settings redesign — currently the Memory browser (SET.8).
     };
     this.activeTimers.set(sessionId, turn);
 
+    // Kick off a demo background process (#987): a dev-server-style stream that
+    // keeps emitting `process:output` across this and later turns, then exits.
+    // Guarded to one per session inside the helper.
+    this.emitDemoProcess(sessionId);
+
     // The backend mints one assistant message per tool-calling iteration, each
     // carrying its own prose; we mirror that so the turn exercises the StepGroup
     // fold (#17), cross-iteration step aggregation, and interleaved prose rows
@@ -3227,5 +3248,55 @@ Shipping the Settings redesign — currently the Memory browser (SET.8).
 
   private emit<T>(set: Set<Listener<T>>, payload: T): void {
     set.forEach((cb) => cb(payload));
+  }
+
+  // Stand in for a real `process_manager start` (#873/#987): a long-running dev
+  // server whose stdout keeps streaming *across turns* for the life of the
+  // process, then a terminal `process:exited`. Started once per session (guarded)
+  // so repeated turns don't stack duplicates. Chunks are emitted over
+  // `setTimeout` at a human cadence — spanning past the turn that launched it —
+  // so the cross-turn sink is observable in `pnpm dev:mock`. Dev/mock only;
+  // MockIpc is dead-code-eliminated in a production (Tauri) build.
+  private emitDemoProcess(sessionId: string): void {
+    if (this.demoProcessSessions.has(sessionId)) return;
+    this.demoProcessSessions.add(sessionId);
+    const processId = this.nextProcessId++;
+    const lines = [
+      "> vite dev\n",
+      "\n",
+      "  VITE ready in 312 ms\n",
+      "  ➜  Local:   http://localhost:5173/\n",
+      "  ➜  press h + enter to show help\n",
+      "\n",
+      "12:00:01 [vite] page reload src/main.tsx\n",
+      "12:00:03 [vite] hmr update src/app.css\n",
+      "12:00:05 [vite] server restarted\n",
+    ];
+    lines.forEach((delta, i) => {
+      setTimeout(
+        () => {
+          this.emit(this.processOutputListeners, {
+            sessionId,
+            processId,
+            stream: "stdout",
+            delta,
+          });
+        },
+        // First chunk lands ~600ms in (after the turn's first sync events),
+        // the rest ~900ms apart so the tail keeps arriving into later turns.
+        600 + i * 900,
+      );
+    });
+    setTimeout(
+      () => {
+        this.emit(this.processExitedListeners, {
+          sessionId,
+          processId,
+          status: "exited(0)",
+        });
+        this.demoProcessSessions.delete(sessionId);
+      },
+      600 + lines.length * 900 + 600,
+    );
   }
 }

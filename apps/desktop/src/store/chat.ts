@@ -543,6 +543,11 @@ export const useChatStore = create<ChatState>((set, get) => ({
     const { useSessionPrefsStore } = await import("@/store/session-prefs");
     useSessionPrefsStore.getState().purge(sessionId);
 
+    // Drop any buffered background-process output (#987) for the gone session so
+    // it doesn't dangle in memory.
+    const { useProcessesStore } = await import("@/store/processes");
+    useProcessesStore.getState().clear(sessionId);
+
     // Never leave the app session-less: recreate + select a fresh blank session.
     if (remaining.length === 0) {
       await get().newSession();
