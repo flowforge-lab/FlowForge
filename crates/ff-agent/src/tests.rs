@@ -700,6 +700,103 @@ async fn cross_turn_cache_seeds_summary_and_invalidate_forces_resummary() {
 }
 
 #[tokio::test]
+async fn tier1_fires_below_tier2_from_one_threshold() {
+    // #999 design (a): the "Summarization Threshold" slider (`compaction_budget`)
+    // drives BOTH tiers from one knob, in fraction order — Tier-1 (fast, reversible)
+    // triggers/targets at 0.75 of the threshold, Tier-2 (lossy) only at 0.90. So a
+    // transcript that clears Tier-1's 0.75 line gets extractively compacted first,
+    // and if that brings the wire under 0.90 the summarizer never runs.
+    let dir = tempfile::tempdir().unwrap();
+    let store = SessionStore::new();
+    let s = store.create_session(None);
+    // ~20 compressible cold lines: enough to clear Tier-1's 0.75×threshold, but
+    // Tier-1's reversible pass pulls the wire back under Tier-2's 0.90 line.
+    for i in 0..20 {
+        let line = format!("cold-{i} {}", "lorem ipsum dolor sit amet ".repeat(40));
+        let role = if i % 2 == 0 {
+            Role::User
+        } else {
+            Role::Assistant
+        };
+        store.add_message(&s.id, role, line);
+    }
+    store.add_message(&s.id, Role::User, "latest".into());
+
+    let registry = ToolRegistry::new();
+    let root = dir.path().to_path_buf();
+    let approve = AlwaysApprove;
+    let summarizer_calls = Arc::new(AtomicUsize::new(0));
+    let provider = CountingProvider {
+        summarizer_calls: summarizer_calls.clone(),
+    };
+
+    let mut tctx = ctx(&registry, &root, &approve);
+    tctx.abstractive = AbstractiveConfig {
+        enabled: true,
+        ..AbstractiveConfig::default()
+    };
+    // Threshold placed so the raw transcript sits at 0.80 of it — inside the
+    // [0.75, 0.90) band: past Tier-1's 0.75 line (fires) but below Tier-2's 0.90
+    // line (must not fire). This tests the one-knob fraction *ordering* directly,
+    // independent of how much Tier-1 happens to compress.
+    let history = store.get_messages(&s.id);
+    let raw = ProxyTokenEstimator::default()
+        .assess(&history, "mock")
+        .estimated_tokens;
+    let threshold = ((raw as f64) / 0.80) as u64;
+    tctx.compaction_budget = Some(threshold);
+
+    let at_threshold = ProxyTokenEstimator {
+        budget_tokens: threshold,
+    }
+    .assess(&history, "mock");
+    assert!(
+        at_threshold.is_over(EXTRACTIVE_COMPACT_AT_FRACTION),
+        "precondition: raw transcript must clear Tier-1's 0.75 line"
+    );
+    assert!(
+        !at_threshold.is_over(AbstractiveConfig::default().fire_at_fraction),
+        "precondition: raw transcript must sit below Tier-2's 0.90 line"
+    );
+
+    let tier1_fires_seen = std::sync::Mutex::new(None);
+    run_turn(
+        &provider,
+        &store,
+        &tctx,
+        &s.id,
+        "mock",
+        None,
+        false,
+        ReasoningVisibility::All,
+        CancelToken::new(),
+        |ev| {
+            if let AgentEvent::Done { tier1_fires, .. } = ev {
+                *tier1_fires_seen.lock().unwrap() = Some(tier1_fires);
+            }
+        },
+    )
+    .await
+    .unwrap();
+
+    // Tier-1 actually fired (the raw transcript cleared its 0.75 line). Without this
+    // the "Tier-2 stayed quiet" assertion below would pass even with Tier-1 disabled,
+    // since raw already sits under 0.90 — so this is what proves the ordering.
+    assert!(
+        matches!(*tier1_fires_seen.lock().unwrap(), Some(Some(n)) if n >= 1),
+        "Tier-1 must fire at the 0.75 line (got {:?})",
+        *tier1_fires_seen.lock().unwrap()
+    );
+    // ...and its reversible compaction kept the wire under Tier-2's higher line, so
+    // the lossy summarizer never ran — the whole point of the 0.75 < 0.90 ordering.
+    assert_eq!(
+        summarizer_calls.load(Ordering::SeqCst),
+        0,
+        "Tier-1 (0.75) must get a chance to compact before Tier-2 (0.90) fires (#999)"
+    );
+}
+
+#[tokio::test]
 async fn cross_turn_cache_invalidate_all_forces_resummary() {
     // #764 mirror case: provider/model change wipes every session's summary.
     let dir = tempfile::tempdir().unwrap();

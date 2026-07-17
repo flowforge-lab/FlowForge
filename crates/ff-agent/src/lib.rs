@@ -985,9 +985,20 @@ pub async fn run_turn(
     let mut last: Option<Message> = None;
 
     let max_iter = tools.max_iterations.max(1);
-    // Size the compaction budget to THIS model's real context window (#B1) so a
-    // large-window model isn't force-compacted at a small fixed ceiling. Built
-    // once per turn and reused for every pressure check below.
+    // Context budget = the user-facing **Summarization Threshold** slider
+    // (`compaction_budget`), falling back to this model's real context window
+    // (safety-factored) when unset. One knob drives both tiers, in fraction order
+    // (#999, RFC 0022):
+    //   * Tier-2 (lossy abstractive) triggers at `fire_at_fraction` (0.90) of the
+    //     threshold — the slider keeps its literal meaning: "when to summarize".
+    //   * Tier-1 (fast, reversible extractive) triggers *and* targets the lower
+    //     `EXTRACTIVE_COMPACT_AT_FRACTION` (0.75) of the same threshold, so it
+    //     compacts the wire back under `T` before the summarizer is ever reached.
+    // Because Tier-1 is a single cheap pass, its trigger point and its target are
+    // deliberately the same value `T` (design (a)) — no separate headroom constant.
+    // NOTE the unset-slider fallback compounds: budget = `model_window × 0.8`, so
+    // `T = model_window × 0.8 × 0.75 = × 0.6`. #989's target-seeking loop reads `T`
+    // (threshold × EXTRACTIVE_COMPACT_AT_FRACTION) as its `wireTokens <= T` target.
     let estimator = ProxyTokenEstimator {
         budget_tokens: tools.compaction_budget.unwrap_or_else(|| {
             ((provider.context_window(model) as f64) * CONTEXT_BUDGET_SAFETY) as u64
@@ -1212,11 +1223,11 @@ pub async fn run_turn(
         //
         // Tier 1 (above) assesses raw `history`; Tier 2 must gate on the projected
         // request size *after* extractive compression, i.e. the post-Tier-1 `wire`.
-        // It reuses the same model-aware `estimator` built at the top of the turn
-        // (#B1 / RFC 0016 6), so a large-window model is no longer force-summarized
-        // at the old fixed 24k ceiling -- only when `wire` genuinely nears its real
-        // window. The differing input (`wire`, not `history`) is the intended
-        // distinction between the two tiers, not the budget.
+        // It uses the same threshold `estimator` as Tier-1 but at the higher
+        // `fire_at_fraction` (0.90 vs Tier-1's 0.75) (#999): the slider is literally
+        // the "Summarization Threshold", so Tier-2 fires when the wire nears it and
+        // Tier-1 has already tried to compact under `T` (0.75). The differing input
+        // (`wire`, not `history`) is the other distinction between the two tiers.
         let wire = if tools.abstractive.enabled
             && estimator
                 .assess(&wire, model)
