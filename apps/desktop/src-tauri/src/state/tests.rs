@@ -56,6 +56,34 @@ fn sanitize_title_strips_quotes_punctuation_and_caps() {
 }
 
 #[tokio::test]
+async fn maybe_flush_memory_returns_none_when_not_over_budget() {
+    // #991: maybe_flush_memory now returns Option<u32> (the write count) so the
+    // host can emit MemoryFlushed off the critical path. A small, under-budget
+    // session is not flush-due, so it returns None (no flush, nothing to emit) —
+    // and importantly never touches the provider.
+    use ff_core::Role;
+    use ff_tools::ToolRegistry;
+    let state = AppState::new();
+    let s = state.store.create_session(None);
+    state.store.add_message(&s.id, Role::User, "hi".into());
+    let registry = ToolRegistry::new();
+    // A provider that would panic if called — proves no flush round-trip happens.
+    let provider = FixedTitleProvider("unused".into());
+
+    let flushed = state
+        .maybe_flush_memory(
+            &provider,
+            &registry,
+            &s.id,
+            "test-model",
+            CancelToken::new(),
+        )
+        .await;
+
+    assert_eq!(flushed, None, "an under-budget session must not flush");
+}
+
+#[tokio::test]
 async fn generate_title_summarizes_after_first_turn() {
     use ff_core::Role;
     let state = AppState::new();

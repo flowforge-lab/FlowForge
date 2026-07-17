@@ -5314,11 +5314,13 @@ async fn context_pressure_under_budget_skips_flush() {
 }
 
 #[tokio::test]
-async fn context_pressure_over_budget_triggers_flush() {
+async fn over_budget_does_not_flush_in_run_turn() {
+    // #991: the memory flush moved OFF run_turn's critical path (to the host's
+    // post-turn maybe_flush_memory). run_turn must no longer flush even when the
+    // transcript is over budget — so the provider is hit exactly once (the main
+    // turn), with no extra flush round-trips and no MemoryFlushed event.
     let store = SessionStore::new();
     let s = store.create_session(None);
-    // Push the token estimate over 0.75 * context_budget (0.8 * 32K = 25.6K;
-    // threshold = 0.75 * 25.6K = 19.2K). tokenx-rs: 200K "x" ~ 33K tokens.
     let huge = "x".repeat(200_000);
     store.add_message(&s.id, Role::User, huge);
     let registry = ToolRegistry::new();
@@ -5333,7 +5335,6 @@ async fn context_pressure_over_budget_triggers_flush() {
         "test precondition: transcript must exceed the flush threshold"
     );
 
-    // A NoReply flush writes nothing, so no provenance event must fire (#283).
     let mut flush_events = 0usize;
     run_turn(
         &CountingText {
@@ -5356,129 +5357,16 @@ async fn context_pressure_over_budget_triggers_flush() {
     .await
     .unwrap();
 
-    // Over budget on the first iteration -> a silent flush fires (one extra
-    // provider call that returns no tool calls -> NoReply) before the main turn.
     assert_eq!(
         calls.load(Ordering::SeqCst),
-        2,
-        "over-budget turn must run exactly one flush before the main turn"
+        1,
+        "run_turn must not flush on the critical path — exactly one (main) provider call"
     );
     assert_eq!(
         flush_events, 0,
-        "a flush that writes nothing (NoReply) must not emit MemoryFlushed"
+        "run_turn no longer emits MemoryFlushed (#991: post-turn host path owns it)"
     );
-    // The flush is silent: it must not add any message to the visible transcript
-    // (memory writes go to disk, not the session). Still just the one user msg
-    // plus the single assistant reply from the main turn.
-    let history = store.get_messages(&s.id);
-    assert_eq!(history.len(), 2, "flush must not mutate the transcript");
-}
-
-/// A `memory_write` tool that records how many times it ran, so an over-budget
-/// flush can actually persist a durable fact during the test (#283).
-struct CountingMemoryWrite {
-    writes: Arc<AtomicUsize>,
-}
-#[async_trait]
-impl ff_tools::Tool for CountingMemoryWrite {
-    fn name(&self) -> &str {
-        "memory_write"
-    }
-    fn description(&self) -> &str {
-        "persists a durable fact"
-    }
-    fn parameters(&self) -> serde_json::Value {
-        serde_json::json!({
-            "type": "object",
-            "properties": { "text": { "type": "string" } }
-        })
-    }
-    fn safety(&self, _args: &serde_json::Value) -> Safety {
-        Safety::Write
-    }
-    async fn run(&self, _args: serde_json::Value, _root: &Path) -> ff_tools::ToolOutcome {
-        self.writes.fetch_add(1, Ordering::SeqCst);
-        ff_tools::ToolOutcome::ok("saved")
-    }
-}
-
-/// Calls `memory_write` once (the flush's first request), then answers with
-/// plain text — which both terminates the flush loop and finishes the main turn.
-struct FlushWriteThenText {
-    calls: Arc<AtomicUsize>,
-}
-#[async_trait]
-impl Provider for FlushWriteThenText {
-    async fn chat_stream(&self, _req: ChatRequest) -> Result<ChunkStream, LlmError> {
-        let n = self.calls.fetch_add(1, Ordering::SeqCst);
-        let chunks = if n == 0 {
-            vec![Ok(Chunk {
-                tool_calls: vec![ToolCallDelta {
-                    index: 0,
-                    id: Some("w1".into()),
-                    name: Some("memory_write".into()),
-                    arguments: r#"{"text":"user prefers dark mode"}"#.into(),
-                }],
-                done: true,
-                ..Chunk::default()
-            })]
-        } else {
-            vec![Ok(Chunk {
-                delta: "ok".into(),
-                done: true,
-                ..Chunk::default()
-            })]
-        };
-        Ok(futures_util::stream::iter(chunks).boxed())
-    }
-}
-
-#[tokio::test]
-async fn over_budget_flush_that_writes_emits_memory_flushed_event() {
-    let store = SessionStore::new();
-    let s = store.create_session(None);
-    store.add_message(&s.id, Role::User, "x".repeat(200_000));
-    let writes = Arc::new(AtomicUsize::new(0));
-    let mut registry = ToolRegistry::new();
-    registry.register(Box::new(CountingMemoryWrite {
-        writes: writes.clone(),
-    }));
-    let root = std::env::current_dir().unwrap();
-    let approve = AlwaysApprove;
-
-    let mut flushed: Vec<u32> = Vec::new();
-    run_turn(
-        &FlushWriteThenText {
-            calls: Arc::new(AtomicUsize::new(0)),
-        },
-        &store,
-        &ctx(&registry, &root, &approve),
-        &s.id,
-        "mock",
-        None,
-        false,
-        ReasoningVisibility::All,
-        CancelToken::new(),
-        |ev| {
-            if let AgentEvent::MemoryFlushed { writes, .. } = ev {
-                flushed.push(writes);
-            }
-        },
-    )
-    .await
-    .unwrap();
-
-    assert_eq!(
-        flushed,
-        vec![1],
-        "a flush that wrote one fact emits one MemoryFlushed carrying writes=1"
-    );
-    assert_eq!(
-        writes.load(Ordering::SeqCst),
-        1,
-        "the flush ran memory_write exactly once"
-    );
-    // Provenance, not mutation: the visible transcript stays user + assistant.
+    // The turn is silent on the transcript: user + assistant reply only.
     assert_eq!(store.get_messages(&s.id).len(), 2);
 }
 

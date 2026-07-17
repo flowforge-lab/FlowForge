@@ -1838,9 +1838,25 @@ fn spawn_assistant_turn(state: Arc<AppState>, app: tauri::AppHandle, session_id:
                     },
                 );
             }
-            state
+            if let Some(writes) = state
                 .maybe_flush_memory(provider.as_ref(), &registry, &sid, &model, cancel_probe)
-                .await;
+                .await
+            {
+                // #991: the flush moved off run_turn's critical path, and with it the
+                // only MemoryFlushed emission. Re-emit here (same wire event) so the
+                // FE "memory auto-updated" provenance notice (#283) is preserved,
+                // correlated to the turn's final assistant message.
+                if let Ok(msg) = &result {
+                    emit_agent_event(
+                        &app,
+                        &sid,
+                        AgentEvent::MemoryFlushed {
+                            message_id: msg.id.clone(),
+                            writes,
+                        },
+                    );
+                }
+            }
         }
     });
 }

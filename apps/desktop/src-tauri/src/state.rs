@@ -7,8 +7,8 @@ use std::time::{Duration, Instant};
 
 use ff_agent::{
     flush_due, AbstractiveConfig, CancelToken, CompactionCache, CompactionContext,
-    CompactionStrategy, ContextPressureEstimator, MemoryFlush, ProxyTokenEstimator,
-    DEFAULT_FLUSH_AT_FRACTION,
+    CompactionOutcome, CompactionStrategy, ContextPressureEstimator, MemoryFlush,
+    ProxyTokenEstimator, DEFAULT_FLUSH_AT_FRACTION,
 };
 use ff_core::{
     model_supports_documents, model_supports_vision, BedrockAuth, ConnectionId, GoalStore,
@@ -1695,6 +1695,12 @@ impl AppState {
     /// budget. A real auto-compaction trigger (its own work) will later advance the
     /// cycle marker; the estimator/strategy seams in `ff-agent` already accommodate
     /// per-model windows and richer strategies.
+    /// Run the post-turn memory flush if the session is over budget and hasn't
+    /// flushed recently (ledger-gated). Returns `Some(writes)` when the flush wrote
+    /// `writes > 0` durable facts, so the caller can emit `MemoryFlushed` (#991 —
+    /// the flush moved off `run_turn`'s critical path, and with it the only
+    /// `MemoryFlushed` emission; the host now emits it from the returned count).
+    /// `None` when no flush ran, it wrote nothing, or it failed.
     pub async fn maybe_flush_memory(
         &self,
         provider: &dyn Provider,
@@ -1702,12 +1708,10 @@ impl AppState {
         session_id: &str,
         model: &str,
         cancel: CancelToken,
-    ) {
-        let Some(ledger) = self.flush_ledger.as_ref() else {
-            return;
-        };
+    ) -> Option<u32> {
+        let ledger = self.flush_ledger.as_ref()?;
         if !self.memory.is_enabled() {
-            return;
+            return None;
         }
         let history = self.store.get_messages(session_id);
         let pressure = ProxyTokenEstimator::default().assess(&history, model);
@@ -1716,7 +1720,7 @@ impl AppState {
             Ok(rec) => rec.map(|r| r.message_count),
             Err(e) => {
                 tracing::warn!(error = %e, "flush ledger read failed; skipping flush");
-                return;
+                return None;
             }
         };
         if !flush_due(
@@ -1726,7 +1730,7 @@ impl AppState {
             DEFAULT_FLUSH_AT_FRACTION,
             REFLUSH_INTERVAL_MESSAGES,
         ) {
-            return;
+            return None;
         }
 
         let session_root = self.session_root(session_id);
@@ -1747,8 +1751,16 @@ impl AppState {
                 if let Err(e) = ledger.record_flush(session_id, message_count, now_ms()) {
                     tracing::warn!(error = %e, "flush ledger write failed");
                 }
+                // Surface provenance (#283) only when facts were actually written.
+                match o {
+                    CompactionOutcome::Wrote { writes } if writes > 0 => u32::try_from(writes).ok(),
+                    _ => None,
+                }
             }
-            Err(e) => tracing::warn!(error = %e, "memory flush failed"),
+            Err(e) => {
+                tracing::warn!(error = %e, "memory flush failed");
+                None
+            }
         }
     }
 
