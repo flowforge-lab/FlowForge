@@ -1,0 +1,39 @@
+name: Flake Hunt (Windows watch tests)
+
+# Throwaway diagnostic workflow (fix/mcp-watch-windows-hang). Scoped to this branch
+# only, so it never runs on other PRs/branches. Runs the full ff-mcp test binary in
+# a wide matrix and loops it per shard to surface the intermittent Windows
+# watch::tests hang. Delete once the flake is confirmed fixed.
+on:
+  push:
+    branches:
+      - fix/mcp-watch-windows-hang
+  workflow_dispatch:
+    inputs:
+      iterations:
+        description: "Times to loop the ff-mcp suite per shard"
+        default: "15"
+
+jobs:
+  hunt:
+    name: hunt (shard ${{ matrix.shard }})
+    runs-on: windows-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Loop ff-mcp tests
+        shell: bash
+        run: |
+          for i in $(seq 1 "${{ github.event.inputs.iterations || '15' }}"); do
+            echo "=== shard ${{ matrix.shard }} iter $i ==="
+            cargo test -p ff-mcp --all-targets -- --nocapture
+          done
