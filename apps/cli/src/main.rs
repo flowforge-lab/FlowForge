@@ -386,6 +386,7 @@ async fn run(
         &user_ctx,
         memory.as_deref(),
         None,
+        None,
         mode,
     );
 
@@ -572,6 +573,7 @@ async fn chat_repl(
             &[],
             &user_ctx,
             memory.as_deref(),
+            None,
             None,
             mode,
         );

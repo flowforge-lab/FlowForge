@@ -757,6 +757,67 @@ fn save_search_config(config: &SearchConfig) {
 
 /// `<config dir>/flowforge/control.json` — the Control panel's settings blob
 /// (#147). `None` only when the OS exposes no config dir.
+/// Soft cap on the resolved extra-instructions blob (#1002). The block lands in
+/// the volatile system-prompt tail and is re-sent every turn, so an oversized
+/// value quietly inflates token cost; past this we warn but still inject.
+const MAX_EXTRA_INSTRUCTIONS_BYTES: usize = 32 * 1024;
+
+/// Whether `injectMemory` is enabled in the Control config; defaults `true` to
+/// match [`default_control_config`]. Pure over the config blob so it is unit
+/// testable without a config dir (which `flowforge_config_dir` denies under test).
+fn inject_memory_enabled_from(cfg: &serde_json::Value) -> bool {
+    cfg.get("injectMemory")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true)
+}
+
+/// Resolve the extra prompt content from a Control config blob (#1002): the
+/// trimmed `userInstructions` plus the contents of each readable `promptFiles`
+/// path. Missing or unreadable files are warned and skipped (never hard-fail),
+/// mirroring the other best-effort file reads in this module. Returns `None` when
+/// the combined result is empty. The block lands in the volatile system-prompt
+/// tail and is re-sent every turn, so past [`MAX_EXTRA_INSTRUCTIONS_BYTES`] we
+/// warn but still inject -- honoring the user's explicit instruction rather than
+/// truncating it mid-content.
+fn resolve_extra_instructions_from(cfg: &serde_json::Value) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+
+    if let Some(instr) = cfg.get("userInstructions").and_then(|v| v.as_str()) {
+        let instr = instr.trim();
+        if !instr.is_empty() {
+            parts.push(instr.to_string());
+        }
+    }
+
+    if let Some(files) = cfg.get("promptFiles").and_then(|v| v.as_array()) {
+        for entry in files {
+            let Some(path) = entry.as_str() else { continue };
+            match fs::read_to_string(path) {
+                Ok(body) => {
+                    let body = body.trim();
+                    if !body.is_empty() {
+                        parts.push(body.to_string());
+                    }
+                }
+                Err(e) => tracing::warn!(error = %e, path, "prompt file unreadable; skipping"),
+            }
+        }
+    }
+
+    if parts.is_empty() {
+        return None;
+    }
+    let joined = parts.join("\n\n");
+    if joined.len() > MAX_EXTRA_INSTRUCTIONS_BYTES {
+        tracing::warn!(
+            bytes = joined.len(),
+            cap = MAX_EXTRA_INSTRUCTIONS_BYTES,
+            "extra prompt instructions exceed cap; injecting anyway (inflates every turn)"
+        );
+    }
+    Some(joined)
+}
+
 fn control_config_path() -> Option<PathBuf> {
     flowforge_config_dir().map(|d| d.join("control.json"))
 }
@@ -2495,6 +2556,19 @@ impl AppState {
     pub fn set_control_config(&self, config: serde_json::Value) -> serde_json::Value {
         save_control_config(&config);
         config
+    }
+
+    /// Whether durable memory should be injected into the system prompt (#1002).
+    /// Reads `injectMemory` from the Control config; defaults `true` to match
+    /// [`default_control_config`].
+    pub fn inject_memory_enabled(&self) -> bool {
+        inject_memory_enabled_from(&self.control_config())
+    }
+
+    /// Resolve the user's extra prompt content from the Control panel Prompts tab
+    /// (#1002). See [`resolve_extra_instructions_from`].
+    pub fn resolve_extra_instructions(&self) -> Option<String> {
+        resolve_extra_instructions_from(&self.control_config())
     }
 
     /// Build a provider + model snapshot from the active connection for one turn.

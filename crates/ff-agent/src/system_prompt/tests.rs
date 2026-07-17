@@ -14,16 +14,28 @@ fn ctx() -> UserContext {
 /// Test helper: build the system prompt and concatenate both parts for assertion.
 /// Most existing tests check the combined output; cache-boundary-specific tests
 /// use `build_system_prompt` directly and inspect `.stable` / `.volatile`.
+#[allow(clippy::too_many_arguments)]
 fn build_full(
     persona: Option<&str>,
     skills: &ff_skills::SkillRegistry,
     active: &[String],
     user: &UserContext,
     memory: Option<&str>,
+    extra_instructions: Option<&str>,
     goal: Option<&ff_core::Goal>,
     mode: ff_core::Mode,
 ) -> String {
-    build_system_prompt(persona, skills, active, user, memory, goal, mode).full()
+    build_system_prompt(
+        persona,
+        skills,
+        active,
+        user,
+        memory,
+        extra_instructions,
+        goal,
+        mode,
+    )
+    .full()
 }
 
 fn skill(name: &str, desc: &str, body: &str) -> Skill {
@@ -64,7 +76,7 @@ fn registry(skills: Vec<Skill>) -> SkillRegistry {
 #[test]
 fn plan_mode_appends_a_plan_steer() {
     let reg = SkillRegistry::new();
-    let out = build_full(None, &reg, &[], &ctx(), None, None, Mode::Plan);
+    let out = build_full(None, &reg, &[], &ctx(), None, None, None, Mode::Plan);
     assert!(out.contains("## Mode: Plan"), "{out}");
     assert!(out.contains("Read-only tools run freely"), "{out}");
 }
@@ -74,7 +86,7 @@ fn mode_steer_precedes_skills_in_prompt() {
     // #828: mode steer must be in the high-attention prefix (before skills),
     // not buried after thousands of tokens of instructions and memory.
     let reg = registry(vec![skill("test-skill", "A test", "body")]);
-    let out = build_full(None, &reg, &[], &ctx(), None, None, Mode::Plan);
+    let out = build_full(None, &reg, &[], &ctx(), None, None, None, Mode::Plan);
     let mode_pos = out.find("## Mode: Plan").expect("mode steer missing");
     let skills_pos = out
         .find("## Available skills")
@@ -90,7 +102,7 @@ fn includes_the_large_file_writes_steer() {
     // #550: steer large file creation toward chunked write / edit so a giant
     // single `write` argument is not truncated at the output cap.
     let reg = SkillRegistry::new();
-    let out = build_full(None, &reg, &[], &ctx(), None, None, Mode::default());
+    let out = build_full(None, &reg, &[], &ctx(), None, None, None, Mode::default());
     assert!(out.contains("## Large file writes"), "{out}");
     assert!(out.contains("append the rest in chunks"), "{out}");
 }
@@ -99,7 +111,7 @@ fn includes_the_large_file_writes_steer() {
 fn every_mode_appends_a_steer() {
     let reg = SkillRegistry::new();
     for mode in [Mode::Plan, Mode::Auto, Mode::Act] {
-        let out = build_full(None, &reg, &[], &ctx(), None, None, mode);
+        let out = build_full(None, &reg, &[], &ctx(), None, None, None, mode);
         assert!(
             out.contains("## Mode:"),
             "{mode:?} should add a mode steer: {out}"
@@ -133,7 +145,7 @@ fn act_mode_steer_confirms_only_dangerous() {
 #[test]
 fn includes_user_context_from_supplied_clock() {
     let reg = SkillRegistry::new();
-    let out = build_full(None, &reg, &[], &ctx(), None, None, Mode::default());
+    let out = build_full(None, &reg, &[], &ctx(), None, None, None, Mode::default());
     assert!(out.contains("## User context"));
     assert!(
         out.contains("Current: 2026-06-13, evening (America/Chicago)."),
@@ -169,7 +181,7 @@ fn user_context_renders_time_of_day_band() {
     let reg = SkillRegistry::new();
     let mut user = ctx();
     user.time_of_day = TimeOfDay::Morning;
-    let out = build_full(None, &reg, &[], &user, None, None, Mode::default());
+    let out = build_full(None, &reg, &[], &user, None, None, None, Mode::default());
     assert!(
         out.contains("Current: 2026-06-13, morning (America/Chicago)."),
         "{out}"
@@ -195,6 +207,7 @@ fn user_context_is_placed_last() {
         &ctx(),
         None,
         None,
+        None,
         Mode::default(),
     );
     let persona = out.find("You are a coding assistant.").unwrap();
@@ -217,10 +230,11 @@ fn persona_is_prepended_when_set_and_absent_when_none() {
         &ctx(),
         None,
         None,
+        None,
         Mode::default(),
     );
     assert!(with.starts_with("You are a coding assistant.\n\n"));
-    let without = build_full(None, &reg, &[], &ctx(), None, None, Mode::default());
+    let without = build_full(None, &reg, &[], &ctx(), None, None, None, Mode::default());
     assert!(!without.contains("You are a coding assistant"));
     assert!(without.contains("## Compacted tool results"));
 }
@@ -233,6 +247,7 @@ fn blank_persona_is_ignored() {
         &reg,
         &[],
         &ctx(),
+        None,
         None,
         None,
         Mode::default(),
@@ -250,7 +265,7 @@ fn lists_installed_descriptions_sorted() {
         skill("zeta", "Z things", "zbody"),
         skill("alpha", "A things", "abody"),
     ]);
-    let out = build_full(None, &reg, &[], &ctx(), None, None, Mode::default());
+    let out = build_full(None, &reg, &[], &ctx(), None, None, None, Mode::default());
     assert!(out.contains("## Available skills"));
     let a = out.find("- alpha: A things").unwrap();
     let z = out.find("- zeta: Z things").unwrap();
@@ -268,6 +283,7 @@ fn active_bodies_only_for_active_skills() {
         &reg,
         &["rust-debug".into()],
         &ctx(),
+        None,
         None,
         None,
         Mode::default(),
@@ -293,20 +309,21 @@ fn working_dir_renders_when_set_and_is_absent_when_empty() {
         &ctx().with_working_dir("/Users/me/projects/flowforge_abid"),
         None,
         None,
+        None,
         Mode::default(),
     );
     assert!(
         with.contains("Working directory: /Users/me/projects/flowforge_abid"),
         "{with}"
     );
-    let without = build_full(None, &reg, &[], &ctx(), None, None, Mode::default());
+    let without = build_full(None, &reg, &[], &ctx(), None, None, None, Mode::default());
     assert!(!without.contains("Working directory:"), "{without}");
 }
 
 #[test]
 fn no_active_section_when_none_active() {
     let reg = registry(vec![skill("a", "desc", "body")]);
-    let out = build_full(None, &reg, &[], &ctx(), None, None, Mode::default());
+    let out = build_full(None, &reg, &[], &ctx(), None, None, None, Mode::default());
     assert!(!out.contains("## Active skill instructions"), "{out}");
 }
 
@@ -320,6 +337,7 @@ fn unknown_active_name_is_skipped() {
         &ctx(),
         None,
         None,
+        None,
         Mode::default(),
     );
     assert!(!out.contains("## Active skill instructions"), "{out}");
@@ -329,7 +347,16 @@ fn unknown_active_name_is_skipped() {
 fn memory_block_is_appended_after_user_context() {
     let reg = SkillRegistry::new();
     let mem = "## Memory\n\nUser prefers Rust.";
-    let out = build_full(None, &reg, &[], &ctx(), Some(mem), None, Mode::default());
+    let out = build_full(
+        None,
+        &reg,
+        &[],
+        &ctx(),
+        Some(mem),
+        None,
+        None,
+        Mode::default(),
+    );
     let user = out.find("## User context").unwrap();
     let memory = out.find("## Memory").unwrap();
     assert!(user < memory, "memory must follow user context: {out}");
@@ -339,7 +366,7 @@ fn memory_block_is_appended_after_user_context() {
 #[test]
 fn none_or_blank_memory_adds_nothing() {
     let reg = SkillRegistry::new();
-    let without = build_full(None, &reg, &[], &ctx(), None, None, Mode::default());
+    let without = build_full(None, &reg, &[], &ctx(), None, None, None, Mode::default());
     assert!(!without.contains("## Memory"));
     let blank = build_full(
         None,
@@ -348,9 +375,81 @@ fn none_or_blank_memory_adds_nothing() {
         &ctx(),
         Some("   \n  "),
         None,
+        None,
         Mode::default(),
     );
     assert!(!blank.contains("## Memory"));
+}
+
+#[test]
+fn extra_instructions_appended_after_memory_before_goal() {
+    // #1002: user instructions from the Control panel land in the volatile tail,
+    // after durable memory and before the per-iteration goal block.
+    let reg = SkillRegistry::new();
+    let goal = active_goal();
+    let out = build_full(
+        None,
+        &reg,
+        &[],
+        &ctx(),
+        Some("## Memory\n\nUser prefers Rust."),
+        Some("Always write doctests."),
+        Some(&goal),
+        Mode::default(),
+    );
+    let memory = out.find("## Memory").unwrap();
+    let extra = out.find("## Additional instructions").unwrap();
+    let goal_pos = out.find("## Active goal").unwrap();
+    assert!(
+        memory < extra,
+        "extra instructions must follow memory: {out}"
+    );
+    assert!(
+        extra < goal_pos,
+        "extra instructions must precede goal: {out}"
+    );
+    assert!(out.contains("Always write doctests."), "{out}");
+}
+
+#[test]
+fn none_or_blank_extra_instructions_adds_nothing() {
+    let reg = SkillRegistry::new();
+    let without = build_full(None, &reg, &[], &ctx(), None, None, None, Mode::default());
+    assert!(!without.contains("## Additional instructions"));
+    let blank = build_full(
+        None,
+        &reg,
+        &[],
+        &ctx(),
+        None,
+        Some("   \n  "),
+        None,
+        Mode::default(),
+    );
+    assert!(!blank.contains("## Additional instructions"));
+}
+
+#[test]
+fn extra_instructions_land_in_volatile_not_stable() {
+    let reg = SkillRegistry::new();
+    let sp = build_system_prompt(
+        None,
+        &reg,
+        &[],
+        &ctx(),
+        None,
+        Some("SENTINEL_EXTRA_INSTRUCTION"),
+        None,
+        Mode::default(),
+    );
+    assert!(
+        !sp.stable.contains("SENTINEL_EXTRA_INSTRUCTION"),
+        "extra instructions must not sit in the cache-stable prefix"
+    );
+    assert!(
+        sp.volatile.contains("SENTINEL_EXTRA_INSTRUCTION"),
+        "extra instructions must sit in the volatile tail"
+    );
 }
 
 #[test]
@@ -361,7 +460,7 @@ fn review_scoping_guidance_is_in_the_stable_prefix() {
     // guidance and before the volatile User context -- so it is always present
     // and never falls out of the prompt.
     let reg = SkillRegistry::new();
-    let out = build_full(None, &reg, &[], &ctx(), None, None, Mode::default());
+    let out = build_full(None, &reg, &[], &ctx(), None, None, None, Mode::default());
     let shell = out.find("## Shell environment").unwrap();
     let review = out
         .find("## Reviewing pull requests")
@@ -407,7 +506,7 @@ fn compaction_guidance_forbids_reproducing_markers() {
     // forbid copying the markers into the reply AND prohibit the model from
     // abbreviating its own output using similar patterns.
     let reg = SkillRegistry::new();
-    let out = build_full(None, &reg, &[], &ctx(), None, None, Mode::default());
+    let out = build_full(None, &reg, &[], &ctx(), None, None, None, Mode::default());
     assert!(
         out.contains("never copy them into"),
         "must forbid reproducing compaction markers: {out}"
@@ -467,7 +566,16 @@ fn active_goal() -> Goal {
 fn goal_block_present_when_active() {
     let reg = SkillRegistry::new();
     let goal = active_goal();
-    let out = build_full(None, &reg, &[], &ctx(), None, Some(&goal), Mode::default());
+    let out = build_full(
+        None,
+        &reg,
+        &[],
+        &ctx(),
+        None,
+        None,
+        Some(&goal),
+        Mode::default(),
+    );
     assert!(out.contains("## Active goal (iteration 3 of 25)"), "{out}");
     assert!(out.contains("Objective: Ship the prefix cache PR"), "{out}");
     assert!(out.contains("Add cache_messages field [done]"), "{out}");
@@ -481,7 +589,7 @@ fn goal_block_present_when_active() {
 #[test]
 fn goal_block_absent_when_none() {
     let reg = SkillRegistry::new();
-    let out = build_full(None, &reg, &[], &ctx(), None, None, Mode::default());
+    let out = build_full(None, &reg, &[], &ctx(), None, None, None, Mode::default());
     assert!(!out.contains("## Active goal"), "{out}");
 }
 
@@ -490,7 +598,16 @@ fn goal_block_absent_when_completed() {
     let reg = SkillRegistry::new();
     let mut goal = active_goal();
     goal.status = GoalStatus::Completed;
-    let out = build_full(None, &reg, &[], &ctx(), None, Some(&goal), Mode::default());
+    let out = build_full(
+        None,
+        &reg,
+        &[],
+        &ctx(),
+        None,
+        None,
+        Some(&goal),
+        Mode::default(),
+    );
     assert!(!out.contains("## Active goal"), "{out}");
 }
 
@@ -499,7 +616,16 @@ fn goal_block_includes_pending_steer() {
     let reg = SkillRegistry::new();
     let mut goal = active_goal();
     goal.pending_steer = Some("Focus on the Bedrock path first".into());
-    let out = build_full(None, &reg, &[], &ctx(), None, Some(&goal), Mode::default());
+    let out = build_full(
+        None,
+        &reg,
+        &[],
+        &ctx(),
+        None,
+        None,
+        Some(&goal),
+        Mode::default(),
+    );
     assert!(
         out.contains("User steer: Focus on the Bedrock path first"),
         "{out}"
@@ -517,6 +643,7 @@ fn stable_prefix_excludes_volatile_content() {
         &[],
         &ctx(),
         Some("my memory"),
+        None,
         None,
         Mode::default(),
     );
@@ -550,6 +677,7 @@ fn stable_prefix_contains_persona_and_guidance() {
         &ctx(),
         None,
         None,
+        None,
         Mode::Act,
     );
     assert!(sp.stable.contains("You are a helpful assistant."));
@@ -565,7 +693,16 @@ fn stable_prefix_contains_persona_and_guidance() {
 fn volatile_tail_contains_goal_block() {
     let reg = SkillRegistry::new();
     let goal = active_goal();
-    let sp = build_system_prompt(None, &reg, &[], &ctx(), None, Some(&goal), Mode::default());
+    let sp = build_system_prompt(
+        None,
+        &reg,
+        &[],
+        &ctx(),
+        None,
+        None,
+        Some(&goal),
+        Mode::default(),
+    );
     assert!(sp.volatile.contains("## Active goal"));
     assert!(sp.volatile.contains("Ship the prefix cache PR"));
 }
@@ -585,8 +722,26 @@ fn stable_is_identical_across_different_volatile_inputs() {
         time_of_day: TimeOfDay::Night,
         working_dir: "/b".into(),
     };
-    let sp1 = build_system_prompt(Some("p"), &reg, &[], &user1, Some("mem1"), None, Mode::Act);
-    let sp2 = build_system_prompt(Some("p"), &reg, &[], &user2, Some("mem2"), None, Mode::Act);
+    let sp1 = build_system_prompt(
+        Some("p"),
+        &reg,
+        &[],
+        &user1,
+        Some("mem1"),
+        None,
+        None,
+        Mode::Act,
+    );
+    let sp2 = build_system_prompt(
+        Some("p"),
+        &reg,
+        &[],
+        &user2,
+        Some("mem2"),
+        None,
+        None,
+        Mode::Act,
+    );
     assert_eq!(
         sp1.stable, sp2.stable,
         "stable prefix must not depend on user context or memory"
@@ -600,7 +755,16 @@ fn stable_is_identical_across_different_volatile_inputs() {
 #[test]
 fn full_equals_stable_plus_volatile() {
     let reg = SkillRegistry::new();
-    let sp = build_system_prompt(None, &reg, &[], &ctx(), Some("mem"), None, Mode::default());
+    let sp = build_system_prompt(
+        None,
+        &reg,
+        &[],
+        &ctx(),
+        Some("mem"),
+        None,
+        None,
+        Mode::default(),
+    );
     let combined = format!("{}{}", sp.stable, sp.volatile);
     assert_eq!(sp.full(), combined);
 }

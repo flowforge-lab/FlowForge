@@ -3149,7 +3149,7 @@ async fn system_prompt_is_injected_into_request_not_history() {
         time_of_day: TimeOfDay::Morning,
         working_dir: String::new(),
     };
-    let system = build_system_prompt(None, &skills, &[], &user, None, None, Mode::default());
+    let system = build_system_prompt(None, &skills, &[], &user, None, None, None, Mode::default());
 
     let store = SessionStore::new();
     let s = store.create_session(None);

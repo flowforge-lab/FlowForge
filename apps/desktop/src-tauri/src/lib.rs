@@ -1592,12 +1592,19 @@ fn spawn_assistant_turn(state: Arc<AppState>, app: tauri::AppHandle, session_id:
         let (memory, ambient_keys) = state
             .memory()
             .ambient_block_filtered_keyed(state.index().as_ref());
+        let extra_instructions = state.resolve_extra_instructions();
+        let injected_memory = if state.inject_memory_enabled() {
+            memory.as_deref()
+        } else {
+            None
+        };
         let system_prompt = ff_agent::build_system_prompt(
             persona.as_deref(),
             &skills,
             &active,
             &user_ctx,
-            memory.as_deref(),
+            injected_memory,
+            extra_instructions.as_deref(),
             None,
             mode,
         );
@@ -1994,12 +2001,19 @@ impl GoalIteration for GoalLoopIteration {
             .state
             .memory()
             .ambient_block_filtered_keyed(self.state.index().as_ref());
+        let extra_instructions = self.state.resolve_extra_instructions();
+        let injected_memory = if self.state.inject_memory_enabled() {
+            memory.as_deref()
+        } else {
+            None
+        };
         let system_prompt = ff_agent::build_system_prompt(
             persona.as_deref(),
             &skills,
             &active,
             &user_ctx,
-            memory.as_deref(),
+            injected_memory,
+            extra_instructions.as_deref(),
             Some(goal),
             mode,
         );
@@ -2336,12 +2350,19 @@ impl ff_scheduled::TaskRunner for DesktopTaskRunner {
             .state
             .memory()
             .ambient_block_filtered_keyed(self.state.index().as_ref());
+        let extra_instructions = self.state.resolve_extra_instructions();
+        let injected_memory = if self.state.inject_memory_enabled() {
+            memory.as_deref()
+        } else {
+            None
+        };
         let system_prompt = ff_agent::build_system_prompt(
             pheno.persona.as_deref(),
             &skills,
             &active,
             &user_ctx,
-            memory.as_deref(),
+            injected_memory,
+            extra_instructions.as_deref(),
             None,
             mode,
         );

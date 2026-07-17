@@ -137,12 +137,14 @@ impl SystemPrompt {
 /// Returns a [`SystemPrompt`] with the split at the cache boundary: everything
 /// before "User context" is stable; everything from "User context" onward is
 /// volatile.
+#[allow(clippy::too_many_arguments)]
 pub fn build_system_prompt(
     persona: Option<&str>,
     skills: &SkillRegistry,
     active: &[String],
     user: &UserContext,
     memory: Option<&str>,
+    extra_instructions: Option<&str>,
     goal: Option<&Goal>,
     mode: Mode,
 ) -> SystemPrompt {
@@ -308,6 +310,19 @@ pub fn build_system_prompt(
         if !memory.is_empty() {
             volatile.push('\n');
             volatile.push_str(memory);
+            volatile.push('\n');
+        }
+    }
+
+    // User-supplied instructions from the Control panel Prompts tab (#1002):
+    // trimmed `userInstructions` plus any readable prompt files, resolved by the
+    // host. Placed in the volatile tail after memory and before the goal block so
+    // the per-iteration goal stays last; changes only on a settings edit.
+    if let Some(extra) = extra_instructions {
+        let extra = extra.trim();
+        if !extra.is_empty() {
+            volatile.push_str("\n## Additional instructions\n");
+            volatile.push_str(extra);
             volatile.push('\n');
         }
     }

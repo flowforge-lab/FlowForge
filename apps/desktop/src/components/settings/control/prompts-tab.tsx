@@ -110,9 +110,10 @@ export function PromptsTab() {
         </label>
         <Textarea
           id="user-instructions"
-          // Commit on blur (not each keystroke) — this is file-backed
-          // (user_instructions.md) once the backend lands. `key` resyncs the
-          // field if the config is replaced externally (e.g. reset).
+          // Commit on blur (not each keystroke). The backend injects these
+          // instructions into the volatile tail of the system prompt every turn
+          // (#1002). `key` resyncs the field if the config is replaced
+          // externally (e.g. reset).
           key={config.userInstructions}
           rows={5}
           defaultValue={config.userInstructions}
