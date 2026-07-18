@@ -2537,6 +2537,26 @@ fn clear_provider_secret(
     state.clear_connection_secret(&connection_id, kind)
 }
 
+/// Store an API key for a search backend in the OS keychain (#1010). The value is
+/// never returned to the frontend; `getSearchConfig`'s `hasKey` reflects presence.
+#[tauri::command]
+fn set_search_secret(
+    state: State<'_, Arc<AppState>>,
+    backend: ff_core::SearchBackend,
+    value: String,
+) -> CmdResult<()> {
+    state.set_search_secret(backend, &value)
+}
+
+/// Clear a search backend's stored API key (#1010).
+#[tauri::command]
+fn clear_search_secret(
+    state: State<'_, Arc<AppState>>,
+    backend: ff_core::SearchBackend,
+) -> CmdResult<()> {
+    state.clear_search_secret(backend)
+}
+
 /// Which secret kinds are stored for a connection (#320), so each Bedrock secret
 /// field shows its own Stored/Clear state. Presence only — no value is returned.
 #[tauri::command]
@@ -3992,6 +4012,8 @@ pub fn run() {
             set_control_config,
             get_search_config,
             set_search_config,
+            set_search_secret,
+            clear_search_secret,
             list_models,
             test_connection,
             warmup,

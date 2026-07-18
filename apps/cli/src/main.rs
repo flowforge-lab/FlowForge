@@ -289,6 +289,27 @@ fn load_search_config() -> ff_core::SearchConfig {
         .unwrap_or_default()
 }
 
+/// Synthetic keychain account for a search backend's API key (#1010), matching the
+/// desktop host's `search:*` namespace so a key set in either surface is shared.
+fn search_secret_conn_id(backend: ff_core::SearchBackend) -> &'static str {
+    match backend {
+        ff_core::SearchBackend::Tavily => "search:tavily",
+        ff_core::SearchBackend::SearxNg => "search:searxng",
+        ff_core::SearchBackend::Brave => "search:brave",
+        ff_core::SearchBackend::OpenAiCompatible => "search:openai-compatible",
+    }
+}
+
+/// CLI [`SearchKeyProvider`](ff_tools::SearchKeyProvider): resolves search backend
+/// keys from the same OS keychain the desktop app uses (#1010).
+struct KeychainSearchKeys;
+
+impl ff_tools::SearchKeyProvider for KeychainSearchKeys {
+    fn key_for(&self, backend: ff_core::SearchBackend) -> Option<String> {
+        secrets::get(search_secret_conn_id(backend), ff_core::SecretKind::ApiKey)
+    }
+}
+
 /// Shared durable-memory setup (RFC 0006). Builds the store + FTS5 index, does a
 /// full reindex from disk, and registers the three memory tools. Best-effort: an
 /// index failure leaves the ambient block working but skips the recall tools.
@@ -298,9 +319,10 @@ fn build_registry_with_memory() -> (
     Option<std::sync::Arc<dyn ff_memory::MemoryIndex>>,
 ) {
     let mut registry = ff_tools::ToolRegistry::with_defaults();
-    registry.register(Box::new(ff_tools::WebSearchTool::new(std::sync::Arc::new(
-        std::sync::Mutex::new(load_search_config()),
-    ))));
+    registry.register(Box::new(ff_tools::WebSearchTool::with_keys(
+        std::sync::Arc::new(std::sync::Mutex::new(load_search_config())),
+        std::sync::Arc::new(KeychainSearchKeys),
+    )));
     let memory_store = std::sync::Arc::new(ff_memory::Memory::with_default_root(
         ff_memory::MemoryConfig::default(),
     ));

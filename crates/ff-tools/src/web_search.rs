@@ -118,13 +118,16 @@ impl SearchProvider for SearxngProvider {
 struct TavilyProvider {
     endpoint: String,
     policy: SsrfPolicy,
+    /// Optional API key (raises the rate limit). Keyless when `None`.
+    key: Option<String>,
 }
 
 impl TavilyProvider {
-    fn new() -> Self {
+    fn new(key: Option<String>) -> Self {
         Self {
             endpoint: TAVILY_ENDPOINT.to_string(),
             policy: SsrfPolicy::strict(),
+            key: key.filter(|k| !k.trim().is_empty()),
         }
     }
 }
@@ -142,13 +145,14 @@ impl SearchProvider for TavilyProvider {
             .build()
             .map_err(|e| format!("failed to build HTTP client: {e}"))?;
 
-        let resp = client
-            .post(checked)
-            .header(USER_AGENT, UA)
-            // Keyless access mode is mandatory when no API key is sent; without it
-            // Tavily returns 401. An optional key (later phase) replaces this header
-            // with `Authorization: Bearer <key>` to raise the rate limit.
-            .header("X-Tavily-Access-Mode", "keyless")
+        let mut req = client.post(checked).header(USER_AGENT, UA);
+        // An API key raises the rate limit via Bearer auth; without one, the keyless
+        // access-mode header is mandatory (Tavily returns 401 otherwise).
+        req = match &self.key {
+            Some(k) => req.bearer_auth(k),
+            None => req.header("X-Tavily-Access-Mode", "keyless"),
+        };
+        let resp = req
             .json(&serde_json::json!({ "query": query, "max_results": limit }))
             .send()
             .await
@@ -175,6 +179,165 @@ impl SearchProvider for TavilyProvider {
             .map_err(|e| format!("failed to read search response: {e}"))?;
         parse_results(&body, limit)
     }
+}
+
+/// Brave Search API (`GET /res/v1/web/search?q=`), authenticated with an
+/// `X-Subscription-Token` header (#1010). Fixed vetted HTTPS host, still SSRF-checked
+/// for defense in depth. Its response shape differs from Tavily/SearXNG
+/// (`web.results[]` with `title`/`url`/`description`), so it parses separately.
+struct BraveProvider {
+    key: String,
+    policy: SsrfPolicy,
+}
+
+impl BraveProvider {
+    fn new(key: String) -> Self {
+        Self {
+            key,
+            policy: SsrfPolicy::strict(),
+        }
+    }
+}
+
+#[async_trait]
+impl SearchProvider for BraveProvider {
+    async fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchResult>, String> {
+        let url = url::Url::parse_with_params(
+            "https://api.search.brave.com/res/v1/web/search",
+            &[("q", query), ("count", &limit.to_string())],
+        )
+        .map_err(|e| format!("failed to build Brave URL: {e}"))?;
+        let checked = self.policy.check_url(url.as_str())?;
+        self.policy.check_host(&checked).await?;
+
+        let client = reqwest::Client::builder()
+            .redirect(Policy::none())
+            .timeout(Duration::from_secs(TIMEOUT_SECS))
+            .build()
+            .map_err(|e| format!("failed to build HTTP client: {e}"))?;
+
+        let resp = client
+            .get(checked)
+            .header(USER_AGENT, UA)
+            .header("Accept", "application/json")
+            .header("X-Subscription-Token", &self.key)
+            .send()
+            .await
+            .map_err(|e| format!("search request failed: {e}"))?;
+
+        let status = resp.status();
+        if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            return Err("Brave Search rate limit reached. Wait and retry.".to_string());
+        }
+        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+            return Err(
+                "Brave Search rejected the API key (401/403). Check the key in \
+                 Settings → Search."
+                    .to_string(),
+            );
+        }
+        if !status.is_success() {
+            return Err(format!("search endpoint returned HTTP {status}"));
+        }
+
+        let body = resp
+            .text()
+            .await
+            .map_err(|e| format!("failed to read search response: {e}"))?;
+        parse_brave_results(&body, limit)
+    }
+}
+
+/// An OpenAI-compatible search endpoint (`POST {base_url}`), authenticated with a
+/// Bearer key (#1010). The `base_url` is user-supplied, so it is SSRF-checked like
+/// SearXNG. Assumes the common `results[]` (`title`/`url`/`content`) response shape.
+struct OpenAiCompatibleProvider {
+    base_url: String,
+    key: String,
+    policy: SsrfPolicy,
+}
+
+impl OpenAiCompatibleProvider {
+    fn new(base_url: String, key: String) -> Self {
+        Self {
+            base_url,
+            key,
+            policy: SsrfPolicy::strict(),
+        }
+    }
+}
+
+#[async_trait]
+impl SearchProvider for OpenAiCompatibleProvider {
+    async fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchResult>, String> {
+        let checked = self.policy.check_url(&self.base_url)?;
+        self.policy.check_host(&checked).await?;
+
+        let client = reqwest::Client::builder()
+            .redirect(Policy::none())
+            .timeout(Duration::from_secs(TIMEOUT_SECS))
+            .build()
+            .map_err(|e| format!("failed to build HTTP client: {e}"))?;
+
+        let resp = client
+            .post(checked)
+            .header(USER_AGENT, UA)
+            .bearer_auth(&self.key)
+            .json(&serde_json::json!({ "query": query, "max_results": limit }))
+            .send()
+            .await
+            .map_err(|e| format!("search request failed: {e}"))?;
+
+        let status = resp.status();
+        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+            return Err(
+                "The search endpoint rejected the API key (401/403). Check the key in \
+                 Settings → Search."
+                    .to_string(),
+            );
+        }
+        if !status.is_success() {
+            return Err(format!("search endpoint returned HTTP {status}"));
+        }
+
+        let body = resp
+            .text()
+            .await
+            .map_err(|e| format!("failed to read search response: {e}"))?;
+        parse_results(&body, limit)
+    }
+}
+
+/// Parse Brave's `web.results[]` (`title`/`url`/`description`) into capped results.
+fn parse_brave_results(body: &str, limit: usize) -> Result<Vec<SearchResult>, String> {
+    let json: Value =
+        serde_json::from_str(body).map_err(|e| format!("invalid search JSON: {e}"))?;
+    let results = json
+        .get("web")
+        .and_then(|w| w.get("results"))
+        .and_then(Value::as_array)
+        .ok_or_else(|| "Brave response has no `web.results` array".to_string())?;
+
+    let out = results
+        .iter()
+        .filter_map(|r| {
+            let url = r.get("url").and_then(Value::as_str)?.to_string();
+            let title = r
+                .get("title")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            let snippet = cap_snippet(r.get("description").and_then(Value::as_str).unwrap_or(""));
+            Some(SearchResult {
+                title,
+                url,
+                snippet,
+            })
+        })
+        .take(limit)
+        .collect();
+    Ok(out)
 }
 
 /// Parse a `results[]` JSON body (SearXNG `format=json` or Tavily — same field
@@ -237,39 +400,89 @@ fn format_results(query: &str, results: &[SearchResult]) -> String {
 
 /// Agent-callable web search. Reads the live [`SearchConfig`] (shared with the
 /// settings command) on each call so a runtime backend switch takes effect.
+/// Supplies API keys for key-gated search backends (#1010). Implemented by the host
+/// over its OS keychain (`SecretStore`); `ff-tools` cannot depend on the host's
+/// `secrets` module (wrong dependency direction), so the key is *injected* rather
+/// than fetched here. `backend` is the [`SearchBackend`] the key is wanted for;
+/// `None` means no key is stored (the tool then errors actionably for a required
+/// backend, or falls back to keyless mode for an optional one like Tavily).
+pub trait SearchKeyProvider: Send + Sync {
+    fn key_for(&self, backend: SearchBackend) -> Option<String>;
+}
+
+/// A [`SearchKeyProvider`] that never has a key — the default when no host keychain
+/// is wired (tests, or a keyless-only deployment). Keeps keyless backends working.
+pub struct NoSearchKeys;
+
+impl SearchKeyProvider for NoSearchKeys {
+    fn key_for(&self, _backend: SearchBackend) -> Option<String> {
+        None
+    }
+}
+
 pub struct WebSearchTool {
     config: Arc<Mutex<SearchConfig>>,
+    keys: Arc<dyn SearchKeyProvider>,
 }
 
 impl WebSearchTool {
+    /// Construct with no key provider — keyless backends only (tests, keyless deploys).
     pub fn new(config: Arc<Mutex<SearchConfig>>) -> Self {
-        Self { config }
+        Self {
+            config,
+            keys: Arc::new(NoSearchKeys),
+        }
+    }
+
+    /// Construct with a host-supplied key provider (#1010) so key-gated backends
+    /// (Brave, OpenAI-compatible) resolve their key from the OS keychain.
+    pub fn with_keys(config: Arc<Mutex<SearchConfig>>, keys: Arc<dyn SearchKeyProvider>) -> Self {
+        Self { config, keys }
     }
 
     /// Resolve the configured backend into a provider, or an error explaining why
-    /// search is unavailable (unconfigured endpoint, or a key-gated backend).
+    /// search is unavailable (unconfigured endpoint, or a missing API key).
     fn provider(&self) -> Result<Box<dyn SearchProvider>, String> {
         let config = self.config.lock().unwrap().clone();
-        if config.backend.requires_key() && !config.has_key {
+        // Treat an empty/whitespace stored key as absent, so the local gate fires an
+        // actionable "add a key in Settings" instead of sending a blank credential and
+        // surfacing the backend's remote 401/403 after a wasted round-trip (#1013).
+        let key = self
+            .keys
+            .key_for(config.backend)
+            .filter(|k| !k.trim().is_empty());
+        // A key-gated backend with no stored key errors *actionably* (#1010).
+        if config.backend.requires_key() && key.is_none() {
             return Err(format!(
-                "the {:?} search backend needs an API key, which isn't supported yet \
-                 (tracked with the keychain work, #8); switch to Tavily or SearXNG in Settings",
+                "the {:?} search backend needs an API key — add one in Settings → Search \
+                 (or switch to Tavily / SearXNG, which need no key)",
                 config.backend
             ));
         }
         match config.backend {
-            SearchBackend::Tavily => Ok(Box::new(TavilyProvider::new())),
+            // Tavily's key is optional (raises the rate limit); pass it when present.
+            SearchBackend::Tavily => Ok(Box::new(TavilyProvider::new(key))),
             SearchBackend::SearxNg => {
                 let base = config.resolved_base_url().ok_or_else(|| {
                     "no SearXNG endpoint configured — set one in Settings → Search".to_string()
                 })?;
                 Ok(Box::new(SearxngProvider::new(base.to_string())))
             }
-            // Recognized but gated above (requires_key + has_key=false always trips).
-            SearchBackend::Brave | SearchBackend::OpenAiCompatible => Err(format!(
-                "the {:?} search backend is not available yet (#8)",
-                config.backend
-            )),
+            SearchBackend::Brave => {
+                // `key` is Some here (the requires_key gate above guarantees it).
+                Ok(Box::new(BraveProvider::new(key.unwrap_or_default())))
+            }
+            SearchBackend::OpenAiCompatible => {
+                let base = config.resolved_base_url().ok_or_else(|| {
+                    "no OpenAI-compatible search endpoint configured — set one in \
+                     Settings → Search"
+                        .to_string()
+                })?;
+                Ok(Box::new(OpenAiCompatibleProvider::new(
+                    base.to_string(),
+                    key.unwrap_or_default(),
+                )))
+            }
         }
     }
 }
@@ -518,6 +731,7 @@ mod tests {
             policy: SsrfPolicy {
                 allow_loopback: true,
             },
+            key: None,
         };
         let results = provider.search("rust", 5).await.unwrap();
         assert_eq!(results.len(), 1);
@@ -542,6 +756,7 @@ mod tests {
             policy: SsrfPolicy {
                 allow_loopback: true,
             },
+            key: None,
         };
         let err = provider.search("rust", 5).await.unwrap_err();
         assert!(err.contains("rate limit"), "{err}");
@@ -553,6 +768,7 @@ mod tests {
         let provider = TavilyProvider {
             endpoint: "http://169.254.169.254/search".into(),
             policy: SsrfPolicy::strict(),
+            key: None,
         };
         let err = provider.search("rust", 5).await.unwrap_err();
         assert!(err.contains("SSRF guard"), "{err}");
@@ -563,5 +779,88 @@ mod tests {
         // Default (Tavily keyless) must yield a working provider with no config.
         let tool = WebSearchTool::new(shared(SearchConfig::default()));
         assert!(tool.provider().is_ok());
+    }
+
+    /// A stub key provider that returns a fixed key for every backend (#1010).
+    struct StubKeys(Option<String>);
+    impl SearchKeyProvider for StubKeys {
+        fn key_for(&self, _backend: SearchBackend) -> Option<String> {
+            self.0.clone()
+        }
+    }
+
+    #[test]
+    fn keyed_backend_without_key_errors_actionably() {
+        // Brave needs a key; with none, the tool must fail with a fix-it message,
+        // not silently or with the old "#8 not supported" stub.
+        let config = SearchConfig {
+            backend: SearchBackend::Brave,
+            ..SearchConfig::default()
+        };
+        let tool = WebSearchTool::with_keys(shared(config), Arc::new(NoSearchKeys));
+        let err = tool.provider().err().expect("must error without a key");
+        assert!(err.contains("API key"), "{err}");
+        assert!(
+            err.contains("Settings"),
+            "error should point to the fix: {err}"
+        );
+        assert!(!err.contains("#8"), "must not be the old stub error: {err}");
+    }
+
+    #[test]
+    fn keyed_backend_with_key_resolves_to_a_provider() {
+        let config = SearchConfig {
+            backend: SearchBackend::Brave,
+            ..SearchConfig::default()
+        };
+        let tool =
+            WebSearchTool::with_keys(shared(config), Arc::new(StubKeys(Some("brave-key".into()))));
+        assert!(tool.provider().is_ok(), "Brave with a key must resolve");
+    }
+
+    #[test]
+    fn keyed_backend_with_empty_key_errors_actionably() {
+        // A stored but empty/whitespace key must be treated as absent (#1013): the tool
+        // fails with the same local fix-it message instead of sending a blank credential
+        // and surfacing the backend's remote 401/403 after a wasted round-trip.
+        let config = SearchConfig {
+            backend: SearchBackend::Brave,
+            ..SearchConfig::default()
+        };
+        let tool = WebSearchTool::with_keys(shared(config), Arc::new(StubKeys(Some("   ".into()))));
+        let err = tool
+            .provider()
+            .err()
+            .expect("empty key must be treated as no key");
+        assert!(err.contains("API key"), "{err}");
+        assert!(
+            err.contains("Settings"),
+            "error should point to the fix: {err}"
+        );
+    }
+
+    #[test]
+    fn brave_provider_parses_web_results() {
+        // Brave's response shape differs from Tavily/SearXNG: web.results[] with
+        // title/url/description. The provider hits a fixed api.search.brave.com URL,
+        // so exercise the shape-specific parser directly.
+        let body = serde_json::json!({
+            "web": { "results": [
+                { "title": "Rust", "url": "https://rust-lang.org", "description": "A language." },
+                { "title": "Tokio", "url": "https://tokio.rs", "description": "Async runtime." }
+            ]}
+        })
+        .to_string();
+        let out = parse_brave_results(&body, 5).unwrap();
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].url, "https://rust-lang.org");
+        assert_eq!(out[0].title, "Rust");
+        assert!(out[0].snippet.contains("A language"));
+    }
+
+    #[test]
+    fn brave_parse_rejects_missing_web_results() {
+        let err = parse_brave_results("{\"foo\":1}", 5).unwrap_err();
+        assert!(err.contains("web.results"), "{err}");
     }
 }
