@@ -1162,16 +1162,17 @@ pub async fn run_turn(
             let target_tokens =
                 ((estimator.budget_tokens as f64) * EXTRACTIVE_COMPACT_AT_FRACTION) as u64;
 
-            // Full deepening pass over the whole cold prefix at `level`, persisting
-            // originals; returns (compacted messages, estimated wire tokens).
+            // Full deepening pass over the whole cold prefix at `level`. Returns the
+            // compacted messages, the estimated wire tokens, and the originals to
+            // persist — but does NOT persist here: only the *chosen* level's wire is
+            // sent, so persisting every intermediate level's originals (#1008 review)
+            // would write retrieve-keys that appear in no request. The caller
+            // persists the winner's originals once, below.
             let full_pass_at = |level: usize| {
                 let graded = GradedBands::graded_v1(level);
                 let cold = graded.compact_graded_range(&history, 0, new_cold_end, Some(&scorer));
-                for (mid, key, original) in &cold.originals {
-                    store.put_compaction_original(session_id, mid, key, original);
-                }
                 let est = estimator.assess(&cold.messages, model).estimated_tokens;
-                (cold.messages, est)
+                (cold.messages, est, cold.originals)
             };
 
             // Reuse the frozen prefix at its own level only when that still holds the
@@ -1229,7 +1230,13 @@ pub async fn run_turn(
                         level += 1;
                         chosen = full_pass_at(level);
                     }
-                    let (messages, _est) = chosen;
+                    let (messages, _est, originals) = chosen;
+                    // Persist only the chosen level's originals — the level actually
+                    // sent — so `compaction_retrieve` resolves without writing keys
+                    // for intermediate levels that never hit the wire (#1008 review).
+                    for (mid, key, original) in &originals {
+                        store.put_compaction_original(session_id, mid, key, original);
+                    }
                     last_tier1 = Some((
                         new_cold_end,
                         messages[..new_cold_end].to_vec(),

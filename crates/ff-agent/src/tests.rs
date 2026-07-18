@@ -5637,12 +5637,13 @@ async fn target_seeking_deepens_until_wire_within_budget() {
     let cold_end = history.len().saturating_sub(KEEP_RECENT_VERBATIM);
     let scorer = MessageSalience::default();
     let est_at = |level: usize| {
-        let out = GradedBands::graded_v1(level)
+        // `compact_graded_range(.., 0, cold_end, ..)` returns the WHOLE transcript —
+        // cold prefix compacted, the [cold_end..] tail passed through verbatim — so it
+        // is already the full wire. (Do NOT append the tail again; that double-counts
+        // it and loosens the derived target — #1008 review.)
+        let wire = GradedBands::graded_v1(level)
             .compact_graded_range(&history, 0, cold_end, Some(&scorer))
             .messages;
-        // Mirror run_turn: estimate the whole wire (compacted cold + verbatim tail).
-        let mut wire = out;
-        wire.extend_from_slice(&history[cold_end..]);
         ProxyTokenEstimator::default()
             .assess(&wire, "mock")
             .estimated_tokens
