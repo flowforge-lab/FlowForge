@@ -1,4 +1,5 @@
 import { memo, useEffect, useMemo, useRef, useState } from "react";
+import { useShallow } from "zustand/react/shallow";
 import { ChevronDown } from "@/components/ui/icon";
 import { cn } from "@/lib/utils";
 import { useChatStore } from "@/store/chat";
@@ -28,6 +29,22 @@ import type { Message } from "@/bindings";
 
 const NO_STEPS: ToolStep[] = [];
 const NO_ITEMS: TurnItem[] = [];
+
+// Narrow a message-id-keyed store record to just the entries belonging to one
+// pane's messages (#1009). These maps (`toolStepsByMessage` / `turnStartByMessage`
+// / `reasoningByMessage`) are shared across every session, so their top-level ref
+// changes on *any* session's token. Subscribing to the whole map re-renders this
+// `ChatView` on foreign panes' tokens; scoping to this session's ids first — then
+// comparing shallowly — keeps foreign keys out of the compared value so only this
+// session's own churn re-renders the pane.
+function scopeByIds<T>(
+  map: Record<string, T>,
+  msgs: Message[] | undefined,
+): Record<string, T> {
+  const out: Record<string, T> = {};
+  if (msgs) for (const m of msgs) if (m.id in map) out[m.id] = map[m.id];
+  return out;
+}
 
 function MessageRowImpl({
   message,
@@ -365,10 +382,39 @@ export function ChatView({ sessionId }: { sessionId?: string } = {}) {
         !s.streamingBySession[targetSessionId]
       : false,
   );
-  const toolStepsByMessage = useChatStore((s) => s.toolStepsByMessage);
-  const turnStartByMessage = useChatStore((s) => s.turnStartByMessage);
-  const turnStartBySession = useChatStore((s) => s.turnStartBySession);
-  const reasoningByMessage = useChatStore((s) => s.reasoningByMessage);
+  // Scope these shared, session-keyed maps to THIS pane's messages so pane B's
+  // ChatView doesn't re-render on every token pane A streams (#1009). `useShallow`
+  // absorbs the new-top-level-ref-same-own-content case; narrowing to this
+  // session's ids first keeps foreign keys out of the shallow comparison.
+  const toolStepsByMessage = useChatStore(
+    useShallow((s) =>
+      scopeByIds(
+        s.toolStepsByMessage,
+        targetSessionId ? s.messagesBySession[targetSessionId] : undefined,
+      ),
+    ),
+  );
+  const turnStartByMessage = useChatStore(
+    useShallow((s) =>
+      scopeByIds(
+        s.turnStartByMessage,
+        targetSessionId ? s.messagesBySession[targetSessionId] : undefined,
+      ),
+    ),
+  );
+  const reasoningByMessage = useChatStore(
+    useShallow((s) =>
+      scopeByIds(
+        s.reasoningByMessage,
+        targetSessionId ? s.messagesBySession[targetSessionId] : undefined,
+      ),
+    ),
+  );
+  // Only this session's turn-start is ever read; a scalar selector mirrors the
+  // `pending` one above and can't be perturbed by another pane's turn.
+  const turnStartForSession = useChatStore((s) =>
+    targetSessionId ? s.turnStartBySession[targetSessionId] : undefined,
+  );
   // Dev step-timeline export (#417): the affordance shows only with the flag on; the
   // active model id is stamped into the dump's meta.
   const exportEnabled = useExperimentalStore((s) => s.flags.stepTimelineExport);
@@ -500,9 +546,7 @@ export function ChatView({ sessionId }: { sessionId?: string } = {}) {
                 toolSteps={toolSteps}
                 hasOwnLiveSteps={liveTiming}
                 items={items}
-                turnStartMs={
-                  turnStartByMessage[m.id] ?? turnStartBySession[m.sessionId]
-                }
+                turnStartMs={turnStartByMessage[m.id] ?? turnStartForSession}
                 reasoning={reasoning}
                 exportEnabled={exportEnabled}
                 exportModel={exportModel}
