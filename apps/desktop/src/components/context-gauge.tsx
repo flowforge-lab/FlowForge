@@ -122,6 +122,13 @@ export function ContextGauge({ sessionId }: { sessionId: string }) {
   const model = useSessionModelStore(
     (s) => s.resolvedBySession[sessionId]?.model,
   );
+  // #1023: provider-truth headline — this turn's real prompt usage + the real model
+  // window. When both are present, the gauge is `realUsed/window` (never > 100%);
+  // otherwise it falls back to the estimate below.
+  const usage = useChatStore((s) => s.contextUsageBySession[sessionId]);
+  const contextWindow = useSessionModelStore(
+    (s) => s.resolvedBySession[sessionId]?.contextWindow,
+  );
   const { copied, copy } = useCopied();
   const prefillShare =
     ttft != null && promptLatency != null
@@ -129,21 +136,42 @@ export function ContextGauge({ sessionId }: { sessionId: string }) {
       : null;
   const phaseBreakdown = formatPhaseBreakdown(promptLatency, tier2Ms);
 
-  // Total context size from the component breakdown (provider-agnostic, correct
-  // for all providers including Bedrock where inputTokens excludes cached tokens).
-  // Falls back to the chars/4 proxy when no breakdown exists yet.
-  const used = breakdown
+  // #1023: prefer provider truth. Real prompt size this turn = uncached input +
+  // cache-read + cache-write (Bedrock's inputTokens excludes cached tokens, which
+  // are reported separately). Measured against the real model window, so `pctUsed`
+  // can't lie (a real over-window request would have been rejected by the provider).
+  const realUsed =
+    usage != null
+      ? usage.inputTokens + usage.cacheReadTokens + usage.cacheWriteTokens
+      : null;
+  const hasProviderTruth =
+    realUsed != null && contextWindow != null && contextWindow > 0;
+
+  // Estimate fallback (tokenx-rs proxy vs the soft compaction budget) when provider
+  // usage / a known window isn't available (cancel/error turn, non-reporting
+  // provider, or an unprobed window). Labeled so the two modes never get conflated.
+  const estUsed = breakdown
     ? breakdown.systemTokens + breakdown.toolTokens + breakdown.wireTokens
     : tokens;
+
+  const used = hasProviderTruth ? realUsed : estUsed;
   if (used == null) return null;
 
-  // Ratio path (#598): only with a usable budget denominator. `Progress` clamps
-  // 0–100, so an over-budget turn pegs at 100% rather than overflowing.
-  const hasRatio = budget != null && budget > 0;
-  const pct = hasRatio ? Math.round((used / budget) * 100) : null;
+  const denom = hasProviderTruth ? contextWindow : budget;
+  const hasRatio = denom != null && denom > 0;
+  // `Progress` clamps 0–100; in provider-truth mode the value is honest and ≤100.
+  const pct = hasRatio ? Math.round((used / denom) * 100) : null;
+  const isEstimate = !hasProviderTruth;
+
+  // Cache-hit share (#1023): makes "large wire, mostly cached → fast & cheap"
+  // explicit instead of a contradiction the reader has to reverse-engineer.
+  const cacheHitPct =
+    realUsed != null && realUsed > 0
+      ? Math.round((usage!.cacheReadTokens / realUsed) * 100)
+      : null;
 
   const detail = hasRatio
-    ? `Context usage: ${used.toLocaleString()} of ${budget.toLocaleString()} tokens (${pct}%)`
+    ? `Context usage: ${used.toLocaleString()} of ${denom!.toLocaleString()} tokens (${pct}%)`
     : `Context usage: ${used.toLocaleString()} tokens`;
 
   // Segmented bar widths: the three components as shares of their own sum, so the
@@ -158,8 +186,12 @@ export function ContextGauge({ sessionId }: { sessionId: string }) {
       sessionId,
       model,
       used,
-      budget,
+      denom,
       pctUsed: pct,
+      mode: isEstimate ? "estimate" : "provider",
+      contextWindow,
+      cacheHitPct,
+      usage,
       ttft,
       promptLatencyMs: promptLatency,
       tier2Ms,
@@ -200,13 +232,19 @@ export function ContextGauge({ sessionId }: { sessionId: string }) {
               {hasRatio ? (
                 <span className="text-muted-foreground">
                   {" / "}
-                  {formatK(budget)}
+                  {formatK(denom!)}
                 </span>
               ) : null}
             </div>
             {hasRatio ? (
               <div className="text-xs text-muted-foreground">
-                {pct}% before compaction
+                {pct}%{" "}
+                {isEstimate ? "of budget (estimate)" : "of context window"}
+              </div>
+            ) : null}
+            {cacheHitPct != null ? (
+              <div className="text-xs text-muted-foreground">
+                {cacheHitPct}% served from cache
               </div>
             ) : null}
           </div>
