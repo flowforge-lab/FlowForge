@@ -2557,6 +2557,13 @@ fn clear_search_secret(
     state.clear_search_secret(backend)
 }
 
+/// Per-backend key presence for the Settings Search key panel (#1015). Boolean
+/// only — no secret value crosses the wire.
+#[tauri::command]
+fn search_secret_presence(state: State<'_, Arc<AppState>>) -> Vec<ff_core::SearchSecretPresence> {
+    state.search_secret_presence()
+}
+
 /// Which secret kinds are stored for a connection (#320), so each Bedrock secret
 /// field shows its own Stored/Clear state. Presence only — no value is returned.
 #[tauri::command]
@@ -4014,6 +4021,7 @@ pub fn run() {
             set_search_config,
             set_search_secret,
             clear_search_secret,
+            search_secret_presence,
             list_models,
             test_connection,
             warmup,

@@ -323,6 +323,10 @@ fn build_registry_with_memory() -> (
         std::sync::Arc::new(std::sync::Mutex::new(load_search_config())),
         std::sync::Arc::new(KeychainSearchKeys),
     )));
+    // #1012: PubMed biomedical search (keyless), same seam as web.
+    registry.register(Box::new(ff_tools::SearchTool::new(std::sync::Arc::new(
+        ff_tools::PubMedSource::new(),
+    ))));
     let memory_store = std::sync::Arc::new(ff_memory::Memory::with_default_root(
         ff_memory::MemoryConfig::default(),
     ));

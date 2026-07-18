@@ -35,6 +35,14 @@ pub enum SearchBackend {
 }
 
 impl SearchBackend {
+    /// Every backend variant, for iterating presence/config over all of them.
+    pub const ALL: [SearchBackend; 4] = [
+        SearchBackend::Tavily,
+        SearchBackend::SearxNg,
+        SearchBackend::Brave,
+        SearchBackend::OpenAiCompatible,
+    ];
+
     /// Whether this backend needs an API key to function. Keyed backends are gated
     /// off until secret storage exists. Tavily accepts an *optional* key (raises the
     /// rate limit) but works keylessly, so it does not require one.
@@ -80,6 +88,17 @@ impl SearchConfig {
     pub fn resolved_base_url(&self) -> Option<&str> {
         self.base_url.as_deref().filter(|u| !u.trim().is_empty())
     }
+}
+
+/// Whether an API key is stored (OS keychain) for one search backend (#1015). The
+/// Settings key panel lists all backends; `present` is boolean-only — the secret
+/// value never crosses this contract.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "../../../apps/desktop/src/bindings/")]
+pub struct SearchSecretPresence {
+    pub backend: SearchBackend,
+    pub present: bool,
 }
 
 #[cfg(test)]

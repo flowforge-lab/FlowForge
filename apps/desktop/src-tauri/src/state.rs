@@ -1979,6 +1979,12 @@ impl AppState {
             self.search_config.clone(),
             std::sync::Arc::new(KeychainSearchKeys),
         )));
+        // #1012: PubMed biomedical search (keyless). Registered globally for now;
+        // persona-scoping it to Erudite is tracked separately (search_sources / 2b),
+        // since per-persona tool gating doesn't exist yet.
+        reg.register(Box::new(ff_tools::SearchTool::new(std::sync::Arc::new(
+            ff_tools::PubMedSource::new(),
+        ))));
         reg.register(Box::new(crate::tools::InstallSkillTool::new(
             skills_root(),
             self.skills.clone(),
@@ -2591,6 +2597,18 @@ impl AppState {
     /// Clear a search backend's stored API key (#1010).
     pub fn clear_search_secret(&self, backend: SearchBackend) -> Result<(), String> {
         crate::secrets::clear(search_secret_conn_id(backend), SecretKind::ApiKey)
+    }
+
+    /// Per-backend key presence for the Settings Search key panel (#1015). Boolean
+    /// only — the secret value never leaves the keychain.
+    pub fn search_secret_presence(&self) -> Vec<ff_core::SearchSecretPresence> {
+        SearchBackend::ALL
+            .iter()
+            .map(|&backend| ff_core::SearchSecretPresence {
+                backend,
+                present: search_backend_has_key(backend),
+            })
+            .collect()
     }
 
     /// The persisted Control-panel config blob (#147), or the factory default on
