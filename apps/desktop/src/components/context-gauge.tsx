@@ -137,37 +137,38 @@ export function ContextGauge({ sessionId }: { sessionId: string }) {
   const phaseBreakdown = formatPhaseBreakdown(promptLatency, tier2Ms);
 
   // #1023: prefer provider truth. Real prompt size this turn = uncached input +
-  // cache-read + cache-write (Bedrock's inputTokens excludes cached tokens, which
-  // are reported separately). Measured against the real model window, so `pctUsed`
-  // can't lie (a real over-window request would have been rejected by the provider).
-  const realUsed =
+  // #1023: "context fill" is the size of the *last request's* wire vs the real model
+  // window — NOT provider usage. Provider usage (input/cacheRead/cacheWrite) is
+  // per-turn CUMULATIVE cost throughput (summed over every tool-call round-trip;
+  // cacheRead can far exceed the window), so it answers "how much did this turn cost",
+  // not "how full is context". The fill numerator is the breakdown (system + tools +
+  // wireTokens, where wireTokens = the last request's estimate); the denominator is
+  // the real window (now populated for every provider via the model spec, #1023).
+  const fillUsed = breakdown
+    ? breakdown.systemTokens + breakdown.toolTokens + breakdown.wireTokens
+    : tokens;
+  if (fillUsed == null) return null;
+
+  // Prefer the real model window; fall back to the soft compaction budget only when
+  // no window is known (should be rare now that resolve seeds it from the spec).
+  const window =
+    contextWindow != null && contextWindow > 0 ? contextWindow : null;
+  const denom = window ?? budget;
+  const hasRatio = denom != null && denom > 0;
+  const isEstimate = window == null; // budget (soft target) rather than real window
+  const used = fillUsed;
+  // `Progress` clamps 0–100; against the real window it's honest and ≤100.
+  const pct = hasRatio ? Math.round((used / denom) * 100) : null;
+
+  // Cache-hit share (#1023): from provider usage (cost side) — makes "large wire,
+  // mostly cached → fast & cheap" explicit. Independent of the fill gauge.
+  const realThroughput =
     usage != null
       ? usage.inputTokens + usage.cacheReadTokens + usage.cacheWriteTokens
       : null;
-  const hasProviderTruth =
-    realUsed != null && contextWindow != null && contextWindow > 0;
-
-  // Estimate fallback (tokenx-rs proxy vs the soft compaction budget) when provider
-  // usage / a known window isn't available (cancel/error turn, non-reporting
-  // provider, or an unprobed window). Labeled so the two modes never get conflated.
-  const estUsed = breakdown
-    ? breakdown.systemTokens + breakdown.toolTokens + breakdown.wireTokens
-    : tokens;
-
-  const used = hasProviderTruth ? realUsed : estUsed;
-  if (used == null) return null;
-
-  const denom = hasProviderTruth ? contextWindow : budget;
-  const hasRatio = denom != null && denom > 0;
-  // `Progress` clamps 0–100; in provider-truth mode the value is honest and ≤100.
-  const pct = hasRatio ? Math.round((used / denom) * 100) : null;
-  const isEstimate = !hasProviderTruth;
-
-  // Cache-hit share (#1023): makes "large wire, mostly cached → fast & cheap"
-  // explicit instead of a contradiction the reader has to reverse-engineer.
   const cacheHitPct =
-    realUsed != null && realUsed > 0
-      ? Math.round((usage!.cacheReadTokens / realUsed) * 100)
+    usage != null && realThroughput != null && realThroughput > 0
+      ? Math.round((usage.cacheReadTokens / realThroughput) * 100)
       : null;
 
   const detail = hasRatio
