@@ -2418,7 +2418,8 @@ Shipping the Settings redesign — currently the Memory browser (SET.8).
     )?.kind;
     // The mock has no live Ollama to probe, so the served-window contract
     // (#602) carries nulls; the model-chip readout / amber dot stays hidden in
-    // mock mode by design.
+    // mock mode by design. (The real-provider spec-window fallback for the
+    // context gauge, #1023, lives in the Rust resolve path, not here.)
     return {
       connection,
       model,
