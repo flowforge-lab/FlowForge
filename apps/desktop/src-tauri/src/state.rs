@@ -11,11 +11,10 @@ use ff_agent::{
     ProxyTokenEstimator, DEFAULT_FLUSH_AT_FRACTION,
 };
 use ff_core::{
-    model_supports_documents, model_supports_vision, BedrockAuth, ConnectionId, GoalStore,
-    McpScope, McpServerConfig, McpServerState, McpServerStatus, Mode, ModelSelection, Phenotype,
-    ContextWindowSource, ProviderConfig, ProviderConnection, ProviderKind, ProviderRegistry,
-    ResolvedModel,
-    SearchBackend, SearchConfig, SecretKind, SessionWorkspace,
+    model_supports_documents, model_supports_vision, BedrockAuth, ConnectionId,
+    ContextWindowSource, GoalStore, McpScope, McpServerConfig, McpServerState, McpServerStatus,
+    Mode, ModelSelection, Phenotype, ProviderConfig, ProviderConnection, ProviderKind,
+    ProviderRegistry, ResolvedModel, SearchBackend, SearchConfig, SecretKind, SessionWorkspace,
 };
 use ff_llm::{
     model_context_window, ollama_num_ctx_from_env, reasoning_control, wire_dialect, BedrockCreds,
