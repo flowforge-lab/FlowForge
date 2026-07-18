@@ -512,6 +512,35 @@ impl ExtractiveCompactor {
     }
 }
 
+/// Maximum target-seeking deepening level (#989). Beyond this the extractive ladder
+/// has done all it can and the caller falls through to the Tier-2 fallback. Small:
+/// each level roughly halves the per-message caps, so 4 levels shrink caps ~16×.
+pub const MAX_COMPACTION_LEVEL: usize = 4;
+
+/// Deepen a compactor by `level` for target-seeking (#989): each level shrinks the
+/// per-message caps toward a hard floor, monotonically (a higher level never yields
+/// more tokens). `level == 0` returns the input unchanged (the non-regression
+/// anchor). Halving with a floor keeps the transform stable and reversible — the
+/// markers/originals machinery is untouched, only the caps tighten.
+#[must_use]
+fn deepen(c: ExtractiveCompactor, level: usize) -> ExtractiveCompactor {
+    if level == 0 {
+        return c;
+    }
+    // Halve per level, floored so a band never collapses to nothing.
+    let shrink = |v: usize, floor: usize| (v >> level).max(floor);
+    ExtractiveCompactor {
+        max_value_chars: shrink(c.max_value_chars, 16),
+        max_array_items: shrink(c.max_array_items, 1),
+        keep_head_lines: shrink(c.keep_head_lines, 1),
+        keep_tail_lines: shrink(c.keep_tail_lines, 1),
+        // Elide sooner at deeper levels, but never below a couple of lines.
+        min_lines_to_elide: shrink(c.min_lines_to_elide, 3),
+        // Compact smaller blobs too as we deepen (floor keeps tiny content alone).
+        min_tokens_to_compact: shrink(c.min_tokens_to_compact, 16),
+    }
+}
+
 /// Depth-graded tier-1 compaction (#933 / RFC 0022 Step 1): older messages are
 /// compressed harder, newer ones gently, instead of one uniform strength across
 /// the whole cold prefix.
@@ -560,38 +589,48 @@ impl GradedBands {
         Self { bands }
     }
 
-    /// The default v1 grading preset: three bands from aggressive (oldest) to
-    /// today's strength (newest-cold). The last band is exactly
-    /// [`ExtractiveCompactor::default`] so recent-cold messages are unchanged.
+    /// The default v1 grading preset at compaction `level` (#989 target-seeking):
+    /// three depth bands from aggressive (oldest) to today's strength (newest-cold),
+    /// each deepened by `level`. `graded_v1(0)` is **byte-identical to the original
+    /// Step-1 preset** (strict non-regression anchor); higher levels shrink every
+    /// band's caps monotonically so the target-seeking loop can drive `wire ≤ T`
+    /// without an LLM round-trip. `level` never touches `KEEP_RECENT_VERBATIM`
+    /// (reserved for the hard floor) — it only intensifies per-message compression.
     #[must_use]
-    pub fn graded_v1() -> Self {
+    pub fn graded_v1(level: usize) -> Self {
         Self::new(vec![
             // Oldest messages: fold hard.
             (
                 0,
-                ExtractiveCompactor {
-                    max_value_chars: 96,
-                    max_array_items: 3,
-                    keep_head_lines: 2,
-                    keep_tail_lines: 2,
-                    min_lines_to_elide: 8,
-                    min_tokens_to_compact: 64,
-                },
+                deepen(
+                    ExtractiveCompactor {
+                        max_value_chars: 96,
+                        max_array_items: 3,
+                        keep_head_lines: 2,
+                        keep_tail_lines: 2,
+                        min_lines_to_elide: 8,
+                        min_tokens_to_compact: 64,
+                    },
+                    level,
+                ),
             ),
             // Mid-history: between aggressive and default.
             (
                 40,
-                ExtractiveCompactor {
-                    max_value_chars: 160,
-                    max_array_items: 5,
-                    keep_head_lines: 3,
-                    keep_tail_lines: 3,
-                    min_lines_to_elide: 10,
-                    min_tokens_to_compact: 64,
-                },
+                deepen(
+                    ExtractiveCompactor {
+                        max_value_chars: 160,
+                        max_array_items: 5,
+                        keep_head_lines: 3,
+                        keep_tail_lines: 3,
+                        min_lines_to_elide: 10,
+                        min_tokens_to_compact: 64,
+                    },
+                    level,
+                ),
             ),
-            // Newest-cold: today's strength (non-regression anchor).
-            (100, ExtractiveCompactor::default()),
+            // Newest-cold: today's strength at level 0 (non-regression anchor).
+            (100, deepen(ExtractiveCompactor::default(), level)),
         ])
     }
 

@@ -153,9 +153,9 @@ fn tier1_get_returns_none_for_empty_cache() {
 fn tier1_put_then_get_roundtrips() {
     let cache = CompactionCache::new();
     let prefix = vec![test_msg("compacted-a"), test_msg("compacted-b")];
-    cache.put_tier1("s1", 5, prefix.clone(), 10);
+    cache.put_tier1("s1", 5, prefix.clone(), 10, 0);
 
-    let (boundary, retrieved, _count) = cache.get_tier1("s1").unwrap();
+    let (boundary, retrieved, _count, _level) = cache.get_tier1("s1").unwrap();
     assert_eq!(boundary, 5);
     assert_eq!(retrieved.len(), 2);
     assert_eq!(retrieved[0].content, "compacted-a");
@@ -166,11 +166,11 @@ fn tier1_put_then_get_roundtrips() {
 fn tier1_survives_tier2_put() {
     let cache = CompactionCache::new();
     let prefix = vec![test_msg("frozen-prefix")];
-    cache.put_tier1("s1", 3, prefix, 10);
+    cache.put_tier1("s1", 3, prefix, 10, 0);
     // Tier-2 put should not clobber tier-1.
     cache.put("s1", 10, test_msg("summary"), 50);
 
-    let (b, msgs, _count) = cache.get_tier1("s1").unwrap();
+    let (b, msgs, _count, _level) = cache.get_tier1("s1").unwrap();
     assert_eq!(b, 3);
     assert_eq!(msgs[0].content, "frozen-prefix");
     // Tier-2 still there too.
@@ -184,7 +184,7 @@ fn tier1_survives_tier2_put() {
 fn tier2_survives_tier1_put() {
     let cache = CompactionCache::new();
     cache.put("s1", 7, test_msg("summary"), 30);
-    cache.put_tier1("s1", 4, vec![test_msg("prefix")], 10);
+    cache.put_tier1("s1", 4, vec![test_msg("prefix")], 10, 0);
 
     // Both present.
     assert!(cache.get("s1").is_some());
@@ -195,7 +195,7 @@ fn tier2_survives_tier1_put() {
 fn invalidate_clears_both_tiers() {
     let cache = CompactionCache::new();
     cache.put("s1", 5, test_msg("sum"), 10);
-    cache.put_tier1("s1", 3, vec![test_msg("pfx")], 10);
+    cache.put_tier1("s1", 3, vec![test_msg("pfx")], 10, 0);
 
     cache.invalidate("s1");
     assert!(cache.get("s1").is_none());
@@ -205,8 +205,8 @@ fn invalidate_clears_both_tiers() {
 #[test]
 fn invalidate_all_clears_tier1_too() {
     let cache = CompactionCache::new();
-    cache.put_tier1("s1", 5, vec![test_msg("a")], 10);
-    cache.put_tier1("s2", 8, vec![test_msg("b")], 10);
+    cache.put_tier1("s1", 5, vec![test_msg("a")], 10, 0);
+    cache.put_tier1("s2", 8, vec![test_msg("b")], 10, 0);
 
     cache.invalidate_all();
     assert!(cache.get_tier1("s1").is_none());
@@ -216,10 +216,10 @@ fn invalidate_all_clears_tier1_too() {
 #[test]
 fn tier1_put_overwrites_existing() {
     let cache = CompactionCache::new();
-    cache.put_tier1("s1", 3, vec![test_msg("old")], 10);
-    cache.put_tier1("s1", 7, vec![test_msg("new-a"), test_msg("new-b")], 10);
+    cache.put_tier1("s1", 3, vec![test_msg("old")], 10, 0);
+    cache.put_tier1("s1", 7, vec![test_msg("new-a"), test_msg("new-b")], 10, 0);
 
-    let (boundary, msgs, _count) = cache.get_tier1("s1").unwrap();
+    let (boundary, msgs, _count, _level) = cache.get_tier1("s1").unwrap();
     assert_eq!(boundary, 7);
     assert_eq!(msgs.len(), 2);
     assert_eq!(msgs[0].content, "new-a");
@@ -228,9 +228,9 @@ fn tier1_put_overwrites_existing() {
 #[test]
 fn tier1_get_returns_message_count_for_staleness_check() {
     let cache = CompactionCache::new();
-    cache.put_tier1("s1", 5, vec![test_msg("pfx")], 42);
+    cache.put_tier1("s1", 5, vec![test_msg("pfx")], 42, 0);
 
-    let (boundary, _prefix, count) = cache.get_tier1("s1").unwrap();
+    let (boundary, _prefix, count, _level) = cache.get_tier1("s1").unwrap();
     assert_eq!(boundary, 5);
     assert_eq!(count, 42);
 }

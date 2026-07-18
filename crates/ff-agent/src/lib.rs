@@ -41,6 +41,7 @@ pub use compaction_cache::CompactionCache;
 pub use compaction_extractive::{
     classify, proxy_tokens, ColdCompaction, CompactionSavings, CompressOutcome, ContentKind,
     ExtractiveCompactor, GradedBands, ReversibleCache, COMPACTION_MARKER_PREFIX,
+    MAX_COMPACTION_LEVEL,
 };
 pub use goal_loop::{drive_goal, GateDecision, GoalIteration, IterationOutcome, LoopStop};
 pub use message_salience::MessageSalience;
@@ -1041,8 +1042,8 @@ pub async fn run_turn(
     // Cross-turn seeding (#933 A.2 step 2): if a previous turn left a cached
     // tier-1 prefix for this session, start from it so the very first iteration
     // reuses the frozen prefix instead of recomputing from scratch.
-    // The tuple is (boundary, prefix, message_count_at_production).
-    let mut last_tier1: Option<(usize, Vec<Message>, u64)> =
+    // The tuple is (boundary, prefix, message_count_at_production, level).
+    let mut last_tier1: Option<(usize, Vec<Message>, u64, usize)> =
         tools.compaction_cache.and_then(|c| c.get_tier1(session_id));
 
     // F1b (#441) telemetry: the projected prefill estimate of each round-trip's
@@ -1146,7 +1147,6 @@ pub async fn run_turn(
         // prefix bytes stable for the provider's KV cache.
         let wire = if pressure.is_over(EXTRACTIVE_COMPACT_AT_FRACTION) {
             tier1_fires += 1;
-            let graded = GradedBands::graded_v1();
             // #933 / RFC 0022 Step 2b: value-aware band selection. Content-only
             // salience (role, size) keeps important older messages sharp and folds
             // low-value bulk harder — cache-stable because the score is a pure
@@ -1155,18 +1155,34 @@ pub async fn run_turn(
             let scorer = MessageSalience::default();
             let n = history.len();
             let new_cold_end = n.saturating_sub(KEEP_RECENT_VERBATIM);
+            // #989 target-seeking: the wire-token target T = budget × 0.75 (#999).
+            // A full pass deepens the grading level until the estimated wire is ≤ T
+            // (or the ladder tops out), so a single mechanical pass — no LLM — holds
+            // the send under target. `estimator.budget_tokens` is already T's budget.
+            let target_tokens =
+                ((estimator.budget_tokens as f64) * EXTRACTIVE_COMPACT_AT_FRACTION) as u64;
 
-            match last_tier1.as_ref() {
-                Some((boundary, cached_prefix, cached_count))
+            // Full deepening pass over the whole cold prefix at `level`. Returns the
+            // compacted messages, the estimated wire tokens, and the originals to
+            // persist — but does NOT persist here: only the *chosen* level's wire is
+            // sent, so persisting every intermediate level's originals (#1008 review)
+            // would write retrieve-keys that appear in no request. The caller
+            // persists the winner's originals once, below.
+            let full_pass_at = |level: usize| {
+                let graded = GradedBands::graded_v1(level);
+                let cold = graded.compact_graded_range(&history, 0, new_cold_end, Some(&scorer));
+                let est = estimator.assess(&cold.messages, model).estimated_tokens;
+                (cold.messages, est, cold.originals)
+            };
+
+            // Reuse the frozen prefix at its own level only when that still holds the
+            // wire ≤ T; grading by absolute index means the fresh slice matches what a
+            // full pass at the same level would produce, preserving the cache.
+            let reuse = match last_tier1.as_ref() {
+                Some((boundary, cached_prefix, cached_count, cached_level))
                     if *boundary <= new_cold_end && *cached_count <= message_count =>
                 {
-                    // Reuse: the frozen prefix covers [0..boundary]; compress only
-                    // the newly-cold slice [boundary..new_cold_end]. The cached_count
-                    // guard rejects stale entries from a transcript that shrank
-                    // (edit/delete) since the prefix was produced. Grading is by
-                    // absolute index, so the slice is graded as occupying
-                    // `boundary..` — identical to what a full pass would choose for
-                    // those same indices, preserving the frozen-boundary invariant.
+                    let graded = GradedBands::graded_v1(*cached_level);
                     let fresh_cold = &history[*boundary..new_cold_end];
                     let fresh = graded.compact_graded_range(
                         fresh_cold,
@@ -1174,41 +1190,70 @@ pub async fn run_turn(
                         new_cold_end,
                         Some(&scorer),
                     );
-                    for (mid, key, original) in &fresh.originals {
-                        store.put_compaction_original(session_id, mid, key, original);
-                    }
                     let mut out = Vec::with_capacity(n);
                     out.extend_from_slice(cached_prefix);
                     out.extend(fresh.messages);
                     out.extend_from_slice(&history[new_cold_end..]);
-                    // Update the frozen boundary to include the newly-compacted range.
-                    last_tier1 = Some((new_cold_end, out[..new_cold_end].to_vec(), message_count));
-                    out
+                    let est = estimator.assess(&out, model).estimated_tokens;
+                    if est <= target_tokens {
+                        // Frozen level still holds the target: persist the fresh
+                        // originals and keep the boundary advancing at this level.
+                        for (mid, key, original) in &fresh.originals {
+                            store.put_compaction_original(session_id, mid, key, original);
+                        }
+                        last_tier1 = Some((
+                            new_cold_end,
+                            out[..new_cold_end].to_vec(),
+                            message_count,
+                            *cached_level,
+                        ));
+                        Some(out)
+                    } else {
+                        // Cached level no longer holds ≤ T (transcript grew): fall
+                        // through to a full deepening pass below.
+                        None
+                    }
                 }
-                _ => {
-                    // First compaction this turn (or boundary invalidated/stale): full pass.
-                    let cold =
-                        graded.compact_graded_range(&history, 0, new_cold_end, Some(&scorer));
-                    for (mid, key, original) in &cold.originals {
+                _ => None,
+            };
+
+            match reuse {
+                Some(out) => out,
+                None => {
+                    // Deepen level 0..=MAX until the estimated wire is ≤ T, then freeze
+                    // that level. Monotone: each level yields ≤ tokens, so this always
+                    // makes progress and stops at the shallowest level that holds T
+                    // (or MAX, where Tier-2 takes over as the lossy fallback).
+                    let mut chosen = full_pass_at(0);
+                    let mut level = 0;
+                    while chosen.1 > target_tokens && level < MAX_COMPACTION_LEVEL {
+                        level += 1;
+                        chosen = full_pass_at(level);
+                    }
+                    let (messages, _est, originals) = chosen;
+                    // Persist only the chosen level's originals — the level actually
+                    // sent — so `compaction_retrieve` resolves without writing keys
+                    // for intermediate levels that never hit the wire (#1008 review).
+                    for (mid, key, original) in &originals {
                         store.put_compaction_original(session_id, mid, key, original);
                     }
-                    // Freeze the compacted cold prefix for subsequent iterations.
                     last_tier1 = Some((
                         new_cold_end,
-                        cold.messages[..new_cold_end].to_vec(),
+                        messages[..new_cold_end].to_vec(),
                         message_count,
+                        level,
                     ));
-                    cold.messages
+                    messages
                 }
             }
         } else {
             history.clone()
         };
         // Write-through tier-1 frozen prefix to cross-turn cache (#933 A.2 step 2).
-        if let (Some(cache), Some((boundary, ref prefix, count))) =
+        if let (Some(cache), Some((boundary, ref prefix, count, level))) =
             (tools.compaction_cache, &last_tier1)
         {
-            cache.put_tier1(session_id, *boundary, prefix.clone(), *count);
+            cache.put_tier1(session_id, *boundary, prefix.clone(), *count, *level);
         }
 
         // Tier-2 abstractive cold-tail summary (RFC 0016 M7.0): the fallback when
