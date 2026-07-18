@@ -420,13 +420,35 @@ impl SearchKeyProvider for NoSearchKeys {
     }
 }
 
-pub struct WebSearchTool {
+/// A search **corpus** the agent can query (#552 / #1011). Each source becomes its
+/// own agent tool (`web_search`, later `pubmed_search`, …) so the model knows which
+/// index it is hitting. Adding a source = implement this trait + register a
+/// [`SearchTool`] over it — no agent-loop or registry-logic change.
+///
+/// A source may make multiple internal HTTP requests and return a flat result list
+/// (`search`'s signature), which fits multi-step APIs like PubMed's esearch→esummary.
+#[async_trait]
+pub trait SearchSource: Send + Sync {
+    /// Stable id (e.g. `"web"`, `"pubmed"`), for config/persona references.
+    fn id(&self) -> &str;
+    /// The agent tool name this source is exposed as (e.g. `"web_search"`).
+    fn tool_name(&self) -> &str;
+    /// The tool description shown to the model.
+    fn description(&self) -> &str;
+    /// Run the search, returning ranked results (or an actionable error).
+    async fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchResult>, String>;
+}
+
+/// The default web-search source (#552): one corpus, backed by an interchangeable
+/// web backend (Tavily / SearXNG / Brave / OpenAI-compatible) chosen from the live
+/// [`SearchConfig`]. The backend enum is an *implementation detail* of this source,
+/// not a separate source — they all query "the web".
+pub struct WebSource {
     config: Arc<Mutex<SearchConfig>>,
     keys: Arc<dyn SearchKeyProvider>,
 }
 
-impl WebSearchTool {
-    /// Construct with no key provider — keyless backends only (tests, keyless deploys).
+impl WebSource {
     pub fn new(config: Arc<Mutex<SearchConfig>>) -> Self {
         Self {
             config,
@@ -434,8 +456,6 @@ impl WebSearchTool {
         }
     }
 
-    /// Construct with a host-supplied key provider (#1010) so key-gated backends
-    /// (Brave, OpenAI-compatible) resolve their key from the OS keychain.
     pub fn with_keys(config: Arc<Mutex<SearchConfig>>, keys: Arc<dyn SearchKeyProvider>) -> Self {
         Self { config, keys }
     }
@@ -488,15 +508,68 @@ impl WebSearchTool {
 }
 
 #[async_trait]
-impl Tool for WebSearchTool {
-    fn name(&self) -> &str {
+impl SearchSource for WebSource {
+    fn id(&self) -> &str {
+        "web"
+    }
+    fn tool_name(&self) -> &str {
         "web_search"
     }
-
     fn description(&self) -> &str {
         "Search the web and return ranked results (title, URL, snippet). Uses the \
          configured search backend (Tavily by default). Requires approval (network \
          access)."
+    }
+    async fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchResult>, String> {
+        self.provider()?.search(query, limit).await
+    }
+}
+
+/// Generic agent tool over any [`SearchSource`] (#1011). One concrete tool type
+/// serves every corpus — the registry adds a new source with a single
+/// `SearchTool::new(Arc::new(MySource))` line, no bespoke tool per source.
+pub struct SearchTool {
+    source: Arc<dyn SearchSource>,
+}
+
+impl SearchTool {
+    pub fn new(source: Arc<dyn SearchSource>) -> Self {
+        Self { source }
+    }
+}
+
+/// Backward-compatible constructor namespace for the web-search tool. Existing host
+/// and CLI call sites (`WebSearchTool::new` / `::with_keys`) keep working; they now
+/// build a [`SearchTool`] over a [`WebSource`].
+pub struct WebSearchTool;
+
+// These intentionally return `SearchTool`, not `Self` — `WebSearchTool` is a
+// constructor namespace (kept so #1010's call sites don't churn), not a held type.
+#[allow(clippy::new_ret_no_self)]
+impl WebSearchTool {
+    /// Web search with no key provider — keyless backends only (tests, keyless deploys).
+    pub fn new(config: Arc<Mutex<SearchConfig>>) -> SearchTool {
+        SearchTool::new(Arc::new(WebSource::new(config)))
+    }
+
+    /// Web search with a host-supplied key provider (#1010) so key-gated backends
+    /// (Brave, OpenAI-compatible) resolve their key from the OS keychain.
+    pub fn with_keys(
+        config: Arc<Mutex<SearchConfig>>,
+        keys: Arc<dyn SearchKeyProvider>,
+    ) -> SearchTool {
+        SearchTool::new(Arc::new(WebSource::with_keys(config, keys)))
+    }
+}
+
+#[async_trait]
+impl Tool for SearchTool {
+    fn name(&self) -> &str {
+        self.source.tool_name()
+    }
+
+    fn description(&self) -> &str {
+        self.source.description()
     }
 
     fn parameters(&self) -> Value {
@@ -526,12 +599,13 @@ impl Tool for WebSearchTool {
     }
 
     async fn run(&self, args: Value, _root: &Path) -> ToolOutcome {
+        let name = self.source.tool_name();
         let Some(query) = args.get("query").and_then(Value::as_str) else {
-            return ToolOutcome::error("web_search requires a string `query`");
+            return ToolOutcome::error(format!("{name} requires a string `query`"));
         };
         let query = query.trim();
         if query.is_empty() {
-            return ToolOutcome::error("web_search requires a non-empty `query`");
+            return ToolOutcome::error(format!("{name} requires a non-empty `query`"));
         }
         let limit = args
             .get("limit")
@@ -539,11 +613,7 @@ impl Tool for WebSearchTool {
             .map(|n| (n as usize).clamp(1, MAX_LIMIT))
             .unwrap_or(DEFAULT_LIMIT);
 
-        let provider = match self.provider() {
-            Ok(p) => p,
-            Err(e) => return ToolOutcome::error(e),
-        };
-        match provider.search(query, limit).await {
+        match self.source.search(query, limit).await {
             Ok(results) => ToolOutcome::ok(format_results(query, &results)),
             Err(e) => ToolOutcome::error(e),
         }
@@ -777,8 +847,8 @@ mod tests {
     #[test]
     fn default_backend_resolves_to_a_provider() {
         // Default (Tavily keyless) must yield a working provider with no config.
-        let tool = WebSearchTool::new(shared(SearchConfig::default()));
-        assert!(tool.provider().is_ok());
+        let source = WebSource::new(shared(SearchConfig::default()));
+        assert!(source.provider().is_ok());
     }
 
     /// A stub key provider that returns a fixed key for every backend (#1010).
@@ -791,14 +861,14 @@ mod tests {
 
     #[test]
     fn keyed_backend_without_key_errors_actionably() {
-        // Brave needs a key; with none, the tool must fail with a fix-it message,
+        // Brave needs a key; with none, the source must fail with a fix-it message,
         // not silently or with the old "#8 not supported" stub.
         let config = SearchConfig {
             backend: SearchBackend::Brave,
             ..SearchConfig::default()
         };
-        let tool = WebSearchTool::with_keys(shared(config), Arc::new(NoSearchKeys));
-        let err = tool.provider().err().expect("must error without a key");
+        let source = WebSource::with_keys(shared(config), Arc::new(NoSearchKeys));
+        let err = source.provider().err().expect("must error without a key");
         assert!(err.contains("API key"), "{err}");
         assert!(
             err.contains("Settings"),
@@ -813,9 +883,9 @@ mod tests {
             backend: SearchBackend::Brave,
             ..SearchConfig::default()
         };
-        let tool =
-            WebSearchTool::with_keys(shared(config), Arc::new(StubKeys(Some("brave-key".into()))));
-        assert!(tool.provider().is_ok(), "Brave with a key must resolve");
+        let source =
+            WebSource::with_keys(shared(config), Arc::new(StubKeys(Some("brave-key".into()))));
+        assert!(source.provider().is_ok(), "Brave with a key must resolve");
     }
 
     #[test]
@@ -827,8 +897,8 @@ mod tests {
             backend: SearchBackend::Brave,
             ..SearchConfig::default()
         };
-        let tool = WebSearchTool::with_keys(shared(config), Arc::new(StubKeys(Some("   ".into()))));
-        let err = tool
+        let source = WebSource::with_keys(shared(config), Arc::new(StubKeys(Some("   ".into()))));
+        let err = source
             .provider()
             .err()
             .expect("empty key must be treated as no key");
@@ -862,5 +932,57 @@ mod tests {
     fn brave_parse_rejects_missing_web_results() {
         let err = parse_brave_results("{\"foo\":1}", 5).unwrap_err();
         assert!(err.contains("web.results"), "{err}");
+    }
+
+    /// A minimal stub source (#1011): proves `SearchTool` advertises the source's
+    /// own tool name/description and runs it end-to-end — the seam #1012 (PubMed)
+    /// plugs into with one `SearchTool::new(Arc::new(...))` registration.
+    struct StubSource;
+    #[async_trait]
+    impl SearchSource for StubSource {
+        fn id(&self) -> &str {
+            "stub"
+        }
+        fn tool_name(&self) -> &str {
+            "stub_search"
+        }
+        fn description(&self) -> &str {
+            "stub corpus"
+        }
+        async fn search(&self, query: &str, _limit: usize) -> Result<Vec<SearchResult>, String> {
+            Ok(vec![SearchResult {
+                title: format!("hit for {query}"),
+                url: "https://example.test/1".into(),
+                snippet: "snippet".into(),
+            }])
+        }
+    }
+
+    #[tokio::test]
+    async fn search_tool_exposes_source_identity_and_runs() {
+        let tool = SearchTool::new(Arc::new(StubSource));
+        assert_eq!(tool.name(), "stub_search");
+        assert_eq!(tool.description(), "stub corpus");
+        let out = tool
+            .run(
+                serde_json::json!({ "query": "rust" }),
+                std::path::Path::new("."),
+            )
+            .await;
+        let text = out.content.clone();
+        assert!(text.contains("hit for rust"), "{text}");
+        assert!(text.contains("example.test"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn search_tool_rejects_empty_query() {
+        let tool = SearchTool::new(Arc::new(StubSource));
+        let out = tool
+            .run(
+                serde_json::json!({ "query": "  " }),
+                std::path::Path::new("."),
+            )
+            .await;
+        assert!(!out.success, "empty query must error");
     }
 }
