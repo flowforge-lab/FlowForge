@@ -12,8 +12,9 @@ export type SearchConfig = { backend: SearchBackend,
  */
 baseUrl?: string, 
 /**
- * Whether an API key is stored for this backend (OS keychain). For Tavily this
- * means an optional key that raises the rate limit; for keyed backends it gates
- * availability. Always `false` until the keychain work lands.
+ * Whether an API key is stored for this backend (OS keychain). Derived from
+ * keychain presence by the host getter on every read (#1010) — never authoritative
+ * on disk, so `skip_deserializing` drops any persisted value and the getter
+ * recomputes it. Still serialized (disk + IPC) so the FE reads the live flag.
  */
 hasKey: boolean, };

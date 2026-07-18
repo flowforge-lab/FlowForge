@@ -444,7 +444,13 @@ impl WebSearchTool {
     /// search is unavailable (unconfigured endpoint, or a missing API key).
     fn provider(&self) -> Result<Box<dyn SearchProvider>, String> {
         let config = self.config.lock().unwrap().clone();
-        let key = self.keys.key_for(config.backend);
+        // Treat an empty/whitespace stored key as absent, so the local gate fires an
+        // actionable "add a key in Settings" instead of sending a blank credential and
+        // surfacing the backend's remote 401/403 after a wasted round-trip (#1013).
+        let key = self
+            .keys
+            .key_for(config.backend)
+            .filter(|k| !k.trim().is_empty());
         // A key-gated backend with no stored key errors *actionably* (#1010).
         if config.backend.requires_key() && key.is_none() {
             return Err(format!(
@@ -810,6 +816,27 @@ mod tests {
         let tool =
             WebSearchTool::with_keys(shared(config), Arc::new(StubKeys(Some("brave-key".into()))));
         assert!(tool.provider().is_ok(), "Brave with a key must resolve");
+    }
+
+    #[test]
+    fn keyed_backend_with_empty_key_errors_actionably() {
+        // A stored but empty/whitespace key must be treated as absent (#1013): the tool
+        // fails with the same local fix-it message instead of sending a blank credential
+        // and surfacing the backend's remote 401/403 after a wasted round-trip.
+        let config = SearchConfig {
+            backend: SearchBackend::Brave,
+            ..SearchConfig::default()
+        };
+        let tool = WebSearchTool::with_keys(shared(config), Arc::new(StubKeys(Some("   ".into()))));
+        let err = tool
+            .provider()
+            .err()
+            .expect("empty key must be treated as no key");
+        assert!(err.contains("API key"), "{err}");
+        assert!(
+            err.contains("Settings"),
+            "error should point to the fix: {err}"
+        );
     }
 
     #[test]
