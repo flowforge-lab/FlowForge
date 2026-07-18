@@ -1334,32 +1334,34 @@ fn send_message(
 
 /// Wake `session_id` because an observer fired (#891 Phase 1).
 ///
-/// Two paths, picked atomically on the cancel token registered for
-/// the session:
+/// Two paths, picked on a **non-destructive** liveness probe
+/// (`has_active_turn`) of the session's registered cancel token
+/// (#1018 Path A — the probe must never strip the live turn's token):
 ///
-/// - **Turn in flight** (`take_cancel` returns `Some`): the in-flight
-///   turn owns the cancel, so the event is deferred — appended to
-///   the supervisor's per-session queue. `spawn_assistant_turn`
-///   drains the queue on the next `send_message` / `edit_message` /
-///   observer wake. We DO NOT cancel the in-flight turn
-///   (`cancel_turn` would race the user's own cancel and could
-///   leave the transcript inconsistent) and we DO NOT drop the
-///   event (the user explicitly registered the observer to see
-///   this change).
-/// - **No turn in flight** (`take_cancel` returns `None`): we own
-///   the wake. Persist the event as a user message in the format
-///   `[Observer "<label>"]: <summary>` and spawn a fresh assistant
-///   turn. The next `spawn_assistant_turn` also drains the
-///   per-session buffer, so a burst of deferred events is folded in
-///   alongside the current one (one user message per event — the
-///   model gets the full causal history, not a lossy summary).
+/// - **Turn in flight** (`has_active_turn` is `true`): the in-flight
+///   turn owns the cancel, so the event is deferred — appended to the
+///   supervisor's per-session queue. `spawn_assistant_turn` drains the
+///   queue on the next `send_message` / `edit_message` / observer wake.
+///   We DO NOT cancel the in-flight turn (`cancel_turn` would race the
+///   user's own cancel and could leave the transcript inconsistent),
+///   we DO NOT touch its cancel token (probing with the destructive
+///   `take_cancel` used to strip it, corrupting the running tool call —
+///   `[no result recorded]`), and we DO NOT drop the event (the user
+///   explicitly registered the observer to see this change).
+/// - **No turn in flight** (`has_active_turn` is `false`): we own the
+///   wake. Buffer the event and spawn a fresh assistant turn.
+///   `spawn_assistant_turn` is the single drain point: it surfaces the
+///   buffered wakes to that turn as **transient, request-only context**
+///   (the volatile system block), never as a persisted `Role::User`
+///   message (#1018 Path B — persisting a wake pollutes history across
+///   relaunch and is semantically wrong: the app can't keep observing
+///   once closed).
 ///
-/// Liveness: `take_cancel` is the same gate `delete_session`,
-/// `send_message`, and `edit_message` use, so the wake can never
-/// race a user-driven turn cancel. If a turn completes between
-/// `take_cancel` returning `Some` and the buffer push, the next
-/// `spawn_assistant_turn` (from any source) will surface the event
-/// — the event is never lost.
+/// Liveness: `has_active_turn` reads the same cancel-token registry
+/// `delete_session`, `send_message`, and `edit_message` gate on, so the
+/// wake can never race a user-driven turn cancel. If a turn completes
+/// between the probe and the buffer push, the next `spawn_assistant_turn`
+/// (from any source) will surface the event — the event is never lost.
 pub(crate) async fn wake_session_for_observer(
     state: &Arc<AppState>,
     event: ObserverEvent,
@@ -1367,10 +1369,15 @@ pub(crate) async fn wake_session_for_observer(
 ) {
     let session_id = event.session_id.clone();
     let observer_id = event.id;
-    if state.take_cancel(&session_id).is_some() {
-        // Turn in flight: defer. `buffer_event` re-inserts into
-        // the same queue `drain_buffer` will pull from when the
-        // next turn starts.
+    if state.has_active_turn(&session_id) {
+        // Turn in flight: defer — but only *probe* liveness, never
+        // strip the live turn's cancel token (#1018 Path A). The old
+        // `take_cancel` probe removed the token as a side effect, which
+        // desynced the in-flight turn's completion bookkeeping and let a
+        // rapid follow-up wake spawn a competing turn, dropping the
+        // running tool call's result (`[no result recorded]`).
+        // `buffer_event` re-inserts into the same queue the next
+        // `spawn_assistant_turn` will drain.
         state.buffer_observer_event(&session_id, event);
         tracing::info!(
             session_id = %session_id,
