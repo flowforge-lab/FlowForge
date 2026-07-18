@@ -26,7 +26,7 @@ use crate::git_watch::GitHeadWatcher;
 use ff_memory::watch::MemoryWatcher;
 use ff_memory::{
     DecayConfig, EmbeddingProvider, FlushLedger, Fts5Index, HybridIndex, Memory, MemoryConfig,
-    MemoryIndex, NoopEmbedder, OpenAiEmbedder,
+    MemoryIndex, NoopEmbedder, OpenAiEmbedder, RecencyFrequencySalience,
 };
 use ff_observer::{ObserverEvent, ObserverSupervisor, ObserverTool};
 use ff_scheduled::ScheduledStore;
@@ -3475,6 +3475,27 @@ fn open_memory_index(
     let bg_index = index.clone();
     let bg_memory = memory.clone();
     std::thread::spawn(move || {
+        // #974 (B.1): opportunistically consolidate on startup when the curated
+        // MEMORY.md has grown past its injection budget — merge near-dupes, promote
+        // recurring daily facts, and demote low-salience curated entries back to the
+        // daily log (RFC 0007). Gated by `needs_consolidation()` so it's a no-op when
+        // already within budget; runs here (background, off the boot critical path)
+        // because consolidate rewrites files and the reindex below is blocking. The
+        // rewrite happens before `all_chunks()`, so the single reindex covers it.
+        if bg_memory.needs_consolidation() {
+            match bg_memory.consolidate(&RecencyFrequencySalience::default()) {
+                Ok(report) if report.ran => tracing::info!(
+                    merged = report.merged,
+                    promoted = report.promoted,
+                    demoted = report.demoted,
+                    bytes_before = report.bytes_before,
+                    bytes_after = report.bytes_after,
+                    "startup memory consolidation complete"
+                ),
+                Ok(_) => {}
+                Err(e) => tracing::warn!(error = %e, "startup memory consolidation failed"),
+            }
+        }
         let chunks = bg_memory.all_chunks();
         match bg_index.reindex(&chunks) {
             Ok(()) => tracing::info!("memory reindex complete"),
