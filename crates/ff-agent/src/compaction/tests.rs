@@ -532,3 +532,125 @@ async fn e2e_ledger_gate_flushes_once_per_cycle() {
         "a full interval of growth must re-arm the gate for the next cycle"
     );
 }
+
+// ---- #993: flush is fed the Tier-1 compacted wire, not verbatim history ----
+
+/// Captures the user-role content the flush actually sent, so a test can assert the
+/// history was compacted (big blobs truncated) before reaching the model. Replies
+/// once with a `memory_write`, then plain text (like `WriteThenText`).
+struct CapturingProvider {
+    calls: AtomicUsize,
+    seen_user_content: Arc<std::sync::Mutex<String>>,
+}
+#[async_trait]
+impl Provider for CapturingProvider {
+    async fn chat_stream(&self, req: ChatRequest) -> Result<ChunkStream, LlmError> {
+        // Record the concatenated user-role message content (the flush's view of
+        // history). Only capture on the first (history-bearing) call.
+        if self.calls.load(Ordering::SeqCst) == 0 {
+            let joined: String = req
+                .messages
+                .iter()
+                // The flush's system/instruction framing is small and fixed; capture
+                // the transcript-bearing roles (user/assistant/tool) — the blob is a
+                // tool result, so a user-only filter would miss it.
+                .filter(|m| m.role == "user" || m.role == "assistant" || m.role == "tool")
+                .map(|m| m.content.clone().unwrap_or_default())
+                .collect::<Vec<_>>()
+                .join("\n");
+            *self.seen_user_content.lock().unwrap() = joined;
+        }
+        let n = self.calls.fetch_add(1, Ordering::SeqCst);
+        let chunks = if n == 0 {
+            vec![Ok(Chunk {
+                tool_calls: vec![ToolCallDelta {
+                    index: 0,
+                    id: Some("w1".into()),
+                    name: Some("memory_write".into()),
+                    arguments: r#"{"text":"user prefers dark mode"}"#.into(),
+                }],
+                done: true,
+                ..Chunk::default()
+            })]
+        } else {
+            vec![Ok(Chunk {
+                delta: "done".into(),
+                done: true,
+                ..Chunk::default()
+            })]
+        };
+        Ok(futures_util::stream::iter(chunks).boxed())
+    }
+}
+
+#[tokio::test]
+async fn flush_input_is_tier1_compacted_not_verbatim() {
+    // A history with a large, low-signal tool-result blob plus conversational turns.
+    // The flush must see the blob TRUNCATED (Tier-1), while the conversational text
+    // survives — cutting background token cost without losing distillable facts.
+    let store = SessionStore::new();
+    let s = store.create_session(None);
+    // Enough leading turns that the blob lands OUTSIDE the KEEP_RECENT_VERBATIM (6)
+    // window, so it is eligible for compaction.
+    // A large, low-signal JSON tool result (what codegraph_explore / a diff dump
+    // looks like) — Tier-1's compress_json truncates long string values, which is
+    // the real compaction path for tool blobs.
+    let big_blob = serde_json::to_string(&serde_json::json!({
+        "note": "dark mode preference is unrelated noise",
+        "dump": "NEEDLE_BLOB ".repeat(4000),
+    }))
+    .unwrap();
+    store.add_message(&s.id, Role::User, "I prefer dark mode everywhere.".into());
+    store.add_tool_result_message(&s.id, "call-1".into(), big_blob.clone());
+    for i in 0..8 {
+        store.add_message(&s.id, Role::User, format!("follow-up question {i}"));
+    }
+
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let registry = registry_with(seen.clone());
+    let captured = Arc::new(std::sync::Mutex::new(String::new()));
+    let provider = CapturingProvider {
+        calls: AtomicUsize::new(0),
+        seen_user_content: captured.clone(),
+    };
+    let dir = tempfile::tempdir().unwrap();
+
+    let outcome = MemoryFlush
+        .compact(CompactionContext {
+            provider: &provider,
+            store: &store,
+            registry: &registry,
+            root: dir.path(),
+            session_id: &s.id,
+            model: "mock",
+            cancel: CancelToken::new(),
+        })
+        .await
+        .unwrap();
+
+    // Distillation still works over the compacted history.
+    assert_eq!(outcome, CompactionOutcome::Wrote { writes: 1 });
+
+    // The flush's view of the transcript is far smaller than the raw blob: the Tier-1
+    // pass truncated the ~48k-char noise. (The whole raw history is >48k chars; a
+    // compacted view must be a fraction of that.)
+    let sent = captured.lock().unwrap().clone();
+    assert!(
+        sent.len() < big_blob.len() / 2,
+        "flush input should be Tier-1 compacted, not verbatim: sent {} chars vs blob {} chars",
+        sent.len(),
+        big_blob.len()
+    );
+    // Conversational detail flush needs is preserved.
+    assert!(
+        sent.contains("dark mode"),
+        "conversational text must survive compaction"
+    );
+    // The store itself stays fully verbatim (flush is a wire-only transform).
+    let stored: usize = store
+        .get_messages(&s.id)
+        .iter()
+        .map(|m| m.content.len())
+        .sum();
+    assert!(stored >= big_blob.len(), "store must remain verbatim");
+}

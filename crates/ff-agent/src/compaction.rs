@@ -24,7 +24,8 @@ use ff_session::SessionStore;
 use ff_tools::{ToolOutcome, ToolRegistry};
 use futures_util::StreamExt;
 
-use crate::{to_chat, AgentError, CancelToken};
+use crate::compaction_extractive::GradedBands;
+use crate::{to_chat, AgentError, CancelToken, KEEP_RECENT_VERBATIM};
 
 /// Default per-session context budget, in proxy tokens. Conservative so the flush
 /// fires well before any real context limit. The host owns the real value; this is
@@ -178,7 +179,19 @@ impl CompactionStrategy for MemoryFlush {
             attachments: Vec::new(),
             reasoning: None,
         }];
-        messages.extend(to_chat(&history));
+        // #993: feed the flush the Tier-1 *compacted* wire, not the full verbatim
+        // history. The flush only needs to spot durable facts, and a big tool-result
+        // blob (codegraph dump, diff) carries almost none — so truncating them cuts
+        // background token cost with no loss of the conversational detail flush reads.
+        // `graded_v1(0)` is the reversible, lossless-enough depth-graded pass (NOT the
+        // Tier-2 abstractive summary); recent turns stay verbatim; already-compacted
+        // (ingest) blobs are skipped by the marker guard. Deterministic + mechanical,
+        // so re-deriving it here (rather than plumbing run_turn's wire through the
+        // post-turn flush) yields the same bytes at negligible cost.
+        let compacted = GradedBands::graded_v1(0)
+            .compact_graded_collect(&history, KEEP_RECENT_VERBATIM)
+            .messages;
+        messages.extend(to_chat(&compacted));
 
         let mut writes = 0usize;
         for _ in 0..MAX_FLUSH_ITERATIONS {
