@@ -2937,3 +2937,118 @@ fn extra_instructions_warns_but_still_injects_past_cap() {
     .expect("must still inject past cap");
     assert_eq!(out.len(), MAX_EXTRA_INSTRUCTIONS_BYTES + 1);
 }
+
+// ── Observer wake hardening (#1018) ───────────────────────────────────────
+//
+// Two coupled bugs the wake path used to have:
+//   Path A — the liveness probe used the destructive `take_cancel`, stripping
+//            the live turn's cancel token and corrupting the in-flight tool
+//            call (surfaced as `[no result recorded]`).
+//   Path B — a wake was persisted as a `Role::User` row, polluting history
+//            across relaunch.
+// These guard both, plus the intent (a woken turn still SEES its wakes).
+
+fn test_observer_event(session_id: &str, label: &str, summary: &str) -> ff_observer::ObserverEvent {
+    ff_observer::ObserverEvent {
+        session_id: session_id.to_string(),
+        id: 1,
+        label: label.to_string(),
+        summary: summary.to_string(),
+    }
+}
+
+#[test]
+fn observer_wake_probe_does_not_strip_live_turn_token() {
+    // Path A root cause: the wake path must probe liveness WITHOUT removing
+    // the live turn's cancel token. `has_active_turn` (the read-only probe the
+    // fix uses) must leave the token in place — unlike the old `take_cancel`.
+    let state = AppState::new();
+    let token = CancelToken::new();
+    state.register_cancel("sess", token.clone());
+
+    // The probe the fixed `wake_session_for_observer` performs.
+    assert!(state.has_active_turn("sess"), "turn is in flight");
+
+    // Crucially, probing must NOT have consumed the token: the live turn can
+    // still find and match it at turn end (`take_cancel_if`).
+    assert!(
+        state.has_active_turn("sess"),
+        "probe must be non-destructive — token still registered"
+    );
+    assert!(
+        state.take_cancel_if("sess", &token).is_some(),
+        "the in-flight turn's epilogue must still find its own live token"
+    );
+}
+
+#[test]
+fn observer_wake_during_in_flight_tool_call_preserves_result() {
+    // Path A manifestation: with the token intact, an approval registered by
+    // the in-flight tool call is NOT auto-denied. `register_approval` only
+    // returns a live (pending) receiver while a cancel token is present; if the
+    // wake had stripped it, the sender would be dropped => auto-deny =>
+    // `[no result recorded]`.
+    let state = AppState::new();
+    let token = CancelToken::new();
+    state.register_cancel("sess", token.clone());
+
+    // Wake arrives mid-turn: fixed path only probes, never strips.
+    assert!(state.has_active_turn("sess"));
+
+    // The tool call now registers its approval — must be live, not auto-denied.
+    let rx = state.register_approval("sess", "call-1");
+    state.resolve_approval("sess", "call-1", true);
+    assert_eq!(
+        rx.blocking_recv().ok(),
+        Some(true),
+        "approval must resolve normally — the live turn's token was preserved"
+    );
+}
+
+#[test]
+fn observer_wake_is_not_persisted_to_session_history() {
+    // Path B: a wake buffered while idle must NOT become a persisted message.
+    // The buffer is the transient home; nothing hits the `messages` table.
+    let state = AppState::new();
+    let s = state.store.create_session(None);
+
+    state.buffer_observer_event(&s.id, test_observer_event(&s.id, "repro", "file changed"));
+
+    assert!(
+        state.store.get_messages(&s.id).is_empty(),
+        "an observer wake must never be persisted to session history"
+    );
+
+    // Draining yields the event for transient surfacing — still no persistence.
+    let drained = state.drain_observer_buffer(&s.id);
+    assert_eq!(drained.len(), 1, "buffered wake is available to drain");
+    assert!(
+        state.store.get_messages(&s.id).is_empty(),
+        "draining a wake must not persist it either"
+    );
+}
+
+#[test]
+fn woken_agent_still_sees_the_wake_context() {
+    // Intent preserved: after moving wakes off the transcript, a woken turn
+    // must still RECEIVE them — as transient request-only context.
+    assert!(
+        crate::observer_wake_context(&[]).is_none(),
+        "no wakes => no context block"
+    );
+
+    let events = vec![
+        test_observer_event("sess", "repro", "file changed"),
+        test_observer_event("sess", "build", "BUILD SUCCEEDED"),
+    ];
+    let ctx = crate::observer_wake_context(&events).expect("wakes => a context block");
+    assert!(ctx.contains("Observer wakes"), "labeled block");
+    assert!(
+        ctx.contains("repro") && ctx.contains("file changed"),
+        "first wake present"
+    );
+    assert!(
+        ctx.contains("build") && ctx.contains("BUILD SUCCEEDED"),
+        "second wake present"
+    );
+}
