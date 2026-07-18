@@ -525,6 +525,177 @@ impl SearchSource for WebSource {
     }
 }
 
+/// Keyless PubMed / biomedical-literature search via NCBI E-utilities (#1012).
+/// A `search` is two serialized requests to `eutils.ncbi.nlm.nih.gov` (no key):
+/// `esearch` → PMIDs, then `esummary` → title / authors / journal / year. Fixed,
+/// vetted host, still SSRF-checked for defense in depth. Reversibility/format match
+/// the web sources so it plugs into [`SearchTool`] like any other corpus.
+///
+/// NCBI compliance: every request carries `tool=flowforge` and the keyless rate cap
+/// is 3 req/s — the two calls are issued serially, well within it.
+pub struct PubMedSource {
+    policy: SsrfPolicy,
+}
+
+impl Default for PubMedSource {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PubMedSource {
+    pub fn new() -> Self {
+        Self {
+            policy: SsrfPolicy::strict(),
+        }
+    }
+
+    async fn get_json(&self, url: &str) -> Result<Value, String> {
+        let checked = self.policy.check_url(url)?;
+        self.policy.check_host(&checked).await?;
+        let client = reqwest::Client::builder()
+            .redirect(Policy::none())
+            .timeout(Duration::from_secs(TIMEOUT_SECS))
+            .build()
+            .map_err(|e| format!("failed to build HTTP client: {e}"))?;
+        let resp = client
+            .get(checked)
+            .header(USER_AGENT, UA)
+            .header("Accept", "application/json")
+            .send()
+            .await
+            .map_err(|e| format!("PubMed request failed: {e}"))?;
+        let status = resp.status();
+        if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            return Err("PubMed (NCBI) rate limit reached. Wait a moment and retry.".to_string());
+        }
+        if !status.is_success() {
+            return Err(format!("PubMed endpoint returned HTTP {status}"));
+        }
+        let body = resp
+            .text()
+            .await
+            .map_err(|e| format!("failed to read PubMed response: {e}"))?;
+        serde_json::from_str(&body).map_err(|e| format!("invalid PubMed JSON: {e}"))
+    }
+}
+
+#[async_trait]
+impl SearchSource for PubMedSource {
+    fn id(&self) -> &str {
+        "pubmed"
+    }
+    fn tool_name(&self) -> &str {
+        "pubmed_search"
+    }
+    fn description(&self) -> &str {
+        "Search PubMed (NCBI) biomedical literature and return ranked articles \
+         (title, PubMed URL, authors · journal · year). No API key required. \
+         Requires approval (network access)."
+    }
+
+    async fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchResult>, String> {
+        // Step 1 — esearch: query → PMIDs (JSON).
+        let esearch = url::Url::parse_with_params(
+            "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi",
+            &[
+                ("db", "pubmed"),
+                ("term", query),
+                ("retmax", &limit.to_string()),
+                ("retmode", "json"),
+                ("tool", "flowforge"),
+            ],
+        )
+        .map_err(|e| format!("failed to build esearch URL: {e}"))?;
+        let search_json = self.get_json(esearch.as_str()).await?;
+        let ids: Vec<String> = search_json
+            .get("esearchresult")
+            .and_then(|r| r.get("idlist"))
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Step 2 — esummary: PMIDs → title / authors / journal / year (JSON).
+        let esummary = url::Url::parse_with_params(
+            "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi",
+            &[
+                ("db", "pubmed"),
+                ("id", &ids.join(",")),
+                ("retmode", "json"),
+                ("tool", "flowforge"),
+            ],
+        )
+        .map_err(|e| format!("failed to build esummary URL: {e}"))?;
+        let summary_json = self.get_json(esummary.as_str()).await?;
+        parse_pubmed_summary(&summary_json, &ids)
+    }
+}
+
+/// Map an NCBI esummary JSON response + the PMID order from esearch into ranked
+/// [`SearchResult`]s. Free function so it is unit-testable without network — the
+/// esearch→esummary orchestration is thin; the value is this shape mapping.
+fn parse_pubmed_summary(summary_json: &Value, ids: &[String]) -> Result<Vec<SearchResult>, String> {
+    let result_obj = summary_json
+        .get("result")
+        .and_then(Value::as_object)
+        .ok_or_else(|| "PubMed esummary has no `result` object".to_string())?;
+
+    // Preserve esearch's PMID order.
+    let out = ids
+        .iter()
+        .filter_map(|pmid| {
+            let doc = result_obj.get(pmid)?;
+            let title = doc
+                .get("title")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            let journal = doc
+                .get("fulljournalname")
+                .and_then(Value::as_str)
+                .or_else(|| doc.get("source").and_then(Value::as_str));
+            let year = doc
+                .get("pubdate")
+                .and_then(Value::as_str)
+                .and_then(|d| d.split_whitespace().next());
+            let authors: Vec<&str> = doc
+                .get("authors")
+                .and_then(Value::as_array)
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|au| au.get("name").and_then(Value::as_str))
+                        .take(3)
+                        .collect()
+                })
+                .unwrap_or_default();
+            let mut meta = Vec::new();
+            if !authors.is_empty() {
+                meta.push(authors.join(", "));
+            }
+            if let Some(j) = journal {
+                meta.push(j.to_string());
+            }
+            if let Some(y) = year {
+                meta.push(y.to_string());
+            }
+            Some(SearchResult {
+                title,
+                url: format!("https://pubmed.ncbi.nlm.nih.gov/{pmid}/"),
+                snippet: cap_snippet(&meta.join(" · ")),
+            })
+        })
+        .collect();
+    Ok(out)
+}
+
 /// Generic agent tool over any [`SearchSource`] (#1011). One concrete tool type
 /// serves every corpus — the registry adds a new source with a single
 /// `SearchTool::new(Arc::new(MySource))` line, no bespoke tool per source.
@@ -984,5 +1155,59 @@ mod tests {
             )
             .await;
         assert!(!out.success, "empty query must error");
+    }
+
+    // ---- #1012: PubMed source ----
+
+    #[test]
+    fn pubmed_source_identity() {
+        let src = PubMedSource::new();
+        assert_eq!(src.tool_name(), "pubmed_search");
+        assert_eq!(src.id(), "pubmed");
+    }
+
+    #[test]
+    fn pubmed_summary_maps_to_results_in_pmid_order() {
+        // esummary JSON shape → SearchResult, preserving esearch's PMID order.
+        let json = serde_json::json!({
+            "result": {
+                "uids": ["222", "111"],
+                "111": {
+                    "title": "CRISPR gene editing",
+                    "fulljournalname": "Nature",
+                    "pubdate": "2023 Jun 1",
+                    "authors": [ {"name": "Doe J"}, {"name": "Roe K"} ]
+                },
+                "222": {
+                    "title": "Base editing advances",
+                    "source": "Cell",
+                    "pubdate": "2024 Jan"
+                }
+            }
+        });
+        let ids = vec!["222".to_string(), "111".to_string()];
+        let out = parse_pubmed_summary(&json, &ids).unwrap();
+        assert_eq!(out.len(), 2);
+        // Order follows `ids` (222 first).
+        assert_eq!(out[0].title, "Base editing advances");
+        assert_eq!(out[0].url, "https://pubmed.ncbi.nlm.nih.gov/222/");
+        assert!(out[0].snippet.contains("Cell"), "{}", out[0].snippet);
+        assert!(out[0].snippet.contains("2024"), "{}", out[0].snippet);
+        assert_eq!(out[1].url, "https://pubmed.ncbi.nlm.nih.gov/111/");
+        assert!(out[1].snippet.contains("Doe J"), "{}", out[1].snippet);
+        assert!(out[1].snippet.contains("Nature"), "{}", out[1].snippet);
+    }
+
+    #[test]
+    fn pubmed_summary_missing_result_errors() {
+        let err = parse_pubmed_summary(&serde_json::json!({"foo": 1}), &["1".into()]).unwrap_err();
+        assert!(err.contains("result"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn pubmed_search_tool_advertises_pubmed_name() {
+        let tool = SearchTool::new(Arc::new(PubMedSource::new()));
+        assert_eq!(tool.name(), "pubmed_search");
+        assert!(tool.description().contains("PubMed"));
     }
 }

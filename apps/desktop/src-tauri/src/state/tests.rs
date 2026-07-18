@@ -83,6 +83,26 @@ async fn maybe_flush_memory_returns_none_when_not_over_budget() {
     assert_eq!(flushed, None, "an under-budget session must not flush");
 }
 
+#[test]
+fn search_secret_presence_covers_all_backends() {
+    // #1015: presence lists every SearchBackend, boolean-only. A fresh state has no
+    // keys stored, so all present=false — and the set matches SearchBackend::ALL.
+    use ff_core::SearchBackend;
+    let state = AppState::new();
+    let presence = state.search_secret_presence();
+    assert_eq!(presence.len(), SearchBackend::ALL.len());
+    for b in SearchBackend::ALL {
+        assert!(
+            presence.iter().any(|p| p.backend == b),
+            "presence must include {b:?}"
+        );
+    }
+    assert!(
+        presence.iter().all(|p| !p.present),
+        "a fresh state has no search keys stored"
+    );
+}
+
 #[tokio::test]
 async fn generate_title_summarizes_after_first_turn() {
     use ff_core::Role;

@@ -59,4 +59,6 @@ pub use notebook::{KernelLiveState, KernelSupervisor, NotebookKernelState, Noteb
 pub use registry::{is_subagent, Safety, Tool, ToolOutcome, ToolRegistry};
 pub use sink::{OutputSink, OutputStream};
 pub use url_safety::SsrfPolicy;
-pub use web_search::{SearchKeyProvider, SearchSource, SearchTool, WebSearchTool, WebSource};
+pub use web_search::{
+    PubMedSource, SearchKeyProvider, SearchSource, SearchTool, WebSearchTool, WebSource,
+};
