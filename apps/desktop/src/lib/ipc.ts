@@ -241,6 +241,7 @@ export interface FfIpc {
   setSearchConfig(
     backend: SearchBackend,
     baseUrl: string | undefined,
+    email?: string | undefined,
   ): Promise<SearchConfig>;
   /** Best-effort nudge to wake the model server before the first turn. Never throws meaningfully. */
   warmup(): Promise<void>;
@@ -812,8 +813,12 @@ class TauriIpc implements FfIpc {
     this.invoke<void>("test_connection", { id });
 
   getSearchConfig = () => this.invoke<SearchConfig>("get_search_config");
-  setSearchConfig = (backend: SearchBackend, baseUrl: string | undefined) =>
-    this.invoke<SearchConfig>("set_search_config", { backend, baseUrl });
+  setSearchConfig = (
+    backend: SearchBackend,
+    baseUrl: string | undefined,
+    email?: string | undefined,
+  ) =>
+    this.invoke<SearchConfig>("set_search_config", { backend, baseUrl, email });
 
   getControlConfig = () => this.invoke<ControlConfig>("get_control_config");
   setControlConfig = (config: ControlConfig) =>

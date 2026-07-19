@@ -2636,12 +2636,15 @@ fn set_search_config(
     state: State<'_, Arc<AppState>>,
     backend: ff_core::SearchBackend,
     base_url: Option<String>,
+    email: Option<String>,
 ) -> SearchConfig {
     let current = state.search_config();
     let config = SearchConfig {
         backend,
         // Treat an empty string from the UI the same as "no endpoint configured".
         base_url: base_url.filter(|u| !u.trim().is_empty()),
+        // User email for NCBI requests (#1021). Treat empty string as "not set".
+        email: email.filter(|e| !e.trim().is_empty()),
         // Secrets are a later phase; preserve whatever the backend already knows.
         has_key: current.has_key,
     };
