@@ -3125,9 +3125,20 @@ async fn resolve_model_selection(
     // safety net rather than a real constraint. The `Result` wrapper is required
     // for async tauri commands with reference inputs; we never actually err.
     let probe = state.served_window(&session_id).await;
-    resolved.context_window = probe.window.and_then(|n| u32::try_from(n).ok());
-    resolved.trained_context_window = probe.trained.and_then(|n| u32::try_from(n).ok());
-    resolved.context_window_source = probe.source;
+    // #1023: the probe only yields a window for Ollama; for every other provider it
+    // returns None. Preserve the sync resolver's model-spec fallback in that case
+    // (`.or(...)`) instead of clobbering it back to null — otherwise the FE context
+    // gauge has no real denominator and falls back to the misleading soft-budget
+    // estimate (the phantom pctUsed>100% on Bedrock/Anthropic/global).
+    resolved.context_window = probe
+        .window
+        .and_then(|n| u32::try_from(n).ok())
+        .or(resolved.context_window);
+    resolved.trained_context_window = probe
+        .trained
+        .and_then(|n| u32::try_from(n).ok())
+        .or(resolved.trained_context_window);
+    resolved.context_window_source = probe.source.or(resolved.context_window_source);
     // Ollama reports vision capability via `/api/show`; OR it onto the name-based
     // gate so a daemon-reported multimodal model (e.g. a qwen3-vl MoE) isn't
     // blocked by a stale name allow-list (#625). `None`/`Some(false)` leave the

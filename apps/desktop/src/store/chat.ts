@@ -106,6 +106,12 @@ interface ChatState {
    *  preferred over the `chars/4` proxy (`contextTokensBySession`) as the popover's
    *  "used" numerator. Undefined until a provider reports usage. */
   contextInputTokensBySession: Record<string, number>;
+  /** sessionId -> this turn's full provider usage (#1023). Unlike
+   *  `contextInputTokensBySession` (input only) and `sessionTotalsBySession`
+   *  (cumulative), this is the **last turn's** complete `TurnUsage`, so the gauge
+   *  can compute real prompt size = input + cacheRead + cacheWrite against the model
+   *  window. Undefined until a provider reports usage. */
+  contextUsageBySession: Record<string, TurnUsage>;
   /** sessionId -> cumulative provider token usage summed across all turns (#931).
    *  Each turn's TurnDoneEvent.usage is added into the running total; drives the
    *  popover's SESSION TOTALS block. Undefined until a provider reports usage. */
@@ -387,6 +393,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
   contextBudgetBySession: {},
   contextBreakdownBySession: {},
   contextInputTokensBySession: {},
+  contextUsageBySession: {},
   sessionTotalsBySession: {},
   ttftBySession: {},
   promptLatencyBySession: {},
@@ -944,6 +951,11 @@ export const useChatStore = create<ChatState>((set, get) => ({
             [e.sessionId]: e.usage.inputTokens,
           }
         : s.contextInputTokensBySession,
+      // This turn's full usage (#1023): drives the provider-truth gauge
+      // (input + cacheRead + cacheWrite vs the model window).
+      contextUsageBySession: e.usage
+        ? { ...s.contextUsageBySession, [e.sessionId]: e.usage }
+        : s.contextUsageBySession,
       // Cumulative session totals (#931): add this turn's usage into the running
       // per-session total (SESSION TOTALS block). Accumulates in the FE store rather
       // than AppState, matching how contextTokensBySession already works.

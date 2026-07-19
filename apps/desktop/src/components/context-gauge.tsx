@@ -122,6 +122,13 @@ export function ContextGauge({ sessionId }: { sessionId: string }) {
   const model = useSessionModelStore(
     (s) => s.resolvedBySession[sessionId]?.model,
   );
+  // #1023: provider-truth headline — this turn's real prompt usage + the real model
+  // window. When both are present, the gauge is `realUsed/window` (never > 100%);
+  // otherwise it falls back to the estimate below.
+  const usage = useChatStore((s) => s.contextUsageBySession[sessionId]);
+  const contextWindow = useSessionModelStore(
+    (s) => s.resolvedBySession[sessionId]?.contextWindow,
+  );
   const { copied, copy } = useCopied();
   const prefillShare =
     ttft != null && promptLatency != null
@@ -129,21 +136,43 @@ export function ContextGauge({ sessionId }: { sessionId: string }) {
       : null;
   const phaseBreakdown = formatPhaseBreakdown(promptLatency, tier2Ms);
 
-  // Total context size from the component breakdown (provider-agnostic, correct
-  // for all providers including Bedrock where inputTokens excludes cached tokens).
-  // Falls back to the chars/4 proxy when no breakdown exists yet.
-  const used = breakdown
+  // #1023: prefer provider truth. Real prompt size this turn = uncached input +
+  // #1023: "context fill" is the size of the *last request's* wire vs the real model
+  // window — NOT provider usage. Provider usage (input/cacheRead/cacheWrite) is
+  // per-turn CUMULATIVE cost throughput (summed over every tool-call round-trip;
+  // cacheRead can far exceed the window), so it answers "how much did this turn cost",
+  // not "how full is context". The fill numerator is the breakdown (system + tools +
+  // wireTokens, where wireTokens = the last request's estimate); the denominator is
+  // the real window (now populated for every provider via the model spec, #1023).
+  const fillUsed = breakdown
     ? breakdown.systemTokens + breakdown.toolTokens + breakdown.wireTokens
     : tokens;
-  if (used == null) return null;
+  if (fillUsed == null) return null;
 
-  // Ratio path (#598): only with a usable budget denominator. `Progress` clamps
-  // 0–100, so an over-budget turn pegs at 100% rather than overflowing.
-  const hasRatio = budget != null && budget > 0;
-  const pct = hasRatio ? Math.round((used / budget) * 100) : null;
+  // Prefer the real model window; fall back to the soft compaction budget only when
+  // no window is known (should be rare now that resolve seeds it from the spec).
+  const window =
+    contextWindow != null && contextWindow > 0 ? contextWindow : null;
+  const denom = window ?? budget;
+  const hasRatio = denom != null && denom > 0;
+  const isEstimate = window == null; // budget (soft target) rather than real window
+  const used = fillUsed;
+  // `Progress` clamps 0–100; against the real window it's honest and ≤100.
+  const pct = hasRatio ? Math.round((used / denom) * 100) : null;
+
+  // Cache-hit share (#1023): from provider usage (cost side) — makes "large wire,
+  // mostly cached → fast & cheap" explicit. Independent of the fill gauge.
+  const realThroughput =
+    usage != null
+      ? usage.inputTokens + usage.cacheReadTokens + usage.cacheWriteTokens
+      : null;
+  const cacheHitPct =
+    usage != null && realThroughput != null && realThroughput > 0
+      ? Math.round((usage.cacheReadTokens / realThroughput) * 100)
+      : null;
 
   const detail = hasRatio
-    ? `Context usage: ${used.toLocaleString()} of ${budget.toLocaleString()} tokens (${pct}%)`
+    ? `Context usage: ${used.toLocaleString()} of ${denom!.toLocaleString()} tokens (${pct}%)`
     : `Context usage: ${used.toLocaleString()} tokens`;
 
   // Segmented bar widths: the three components as shares of their own sum, so the
@@ -158,8 +187,12 @@ export function ContextGauge({ sessionId }: { sessionId: string }) {
       sessionId,
       model,
       used,
-      budget,
+      denom,
       pctUsed: pct,
+      mode: isEstimate ? "estimate" : "provider",
+      contextWindow,
+      cacheHitPct,
+      usage,
       ttft,
       promptLatencyMs: promptLatency,
       tier2Ms,
@@ -200,13 +233,19 @@ export function ContextGauge({ sessionId }: { sessionId: string }) {
               {hasRatio ? (
                 <span className="text-muted-foreground">
                   {" / "}
-                  {formatK(budget)}
+                  {formatK(denom!)}
                 </span>
               ) : null}
             </div>
             {hasRatio ? (
               <div className="text-xs text-muted-foreground">
-                {pct}% before compaction
+                {pct}%{" "}
+                {isEstimate ? "of budget (estimate)" : "of context window"}
+              </div>
+            ) : null}
+            {cacheHitPct != null ? (
+              <div className="text-xs text-muted-foreground">
+                {cacheHitPct}% served from cache
               </div>
             ) : null}
           </div>

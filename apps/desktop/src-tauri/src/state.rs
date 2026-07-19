@@ -11,14 +11,14 @@ use ff_agent::{
     ProxyTokenEstimator, DEFAULT_FLUSH_AT_FRACTION,
 };
 use ff_core::{
-    model_supports_documents, model_supports_vision, BedrockAuth, ConnectionId, GoalStore,
-    McpScope, McpServerConfig, McpServerState, McpServerStatus, Mode, ModelSelection, Phenotype,
-    ProviderConfig, ProviderConnection, ProviderKind, ProviderRegistry, ResolvedModel,
-    SearchBackend, SearchConfig, SecretKind, SessionWorkspace,
+    model_supports_documents, model_supports_vision, BedrockAuth, ConnectionId,
+    ContextWindowSource, GoalStore, McpScope, McpServerConfig, McpServerState, McpServerStatus,
+    Mode, ModelSelection, Phenotype, ProviderConfig, ProviderConnection, ProviderKind,
+    ProviderRegistry, ResolvedModel, SearchBackend, SearchConfig, SecretKind, SessionWorkspace,
 };
 use ff_llm::{
-    ollama_num_ctx_from_env, reasoning_control, wire_dialect, BedrockCreds, BedrockProvider,
-    OllamaProvider, OpenAiProvider, Provider, ServedWindowProbe,
+    model_context_window, ollama_num_ctx_from_env, reasoning_control, wire_dialect, BedrockCreds,
+    BedrockProvider, OllamaProvider, OpenAiProvider, Provider, ServedWindowProbe,
 };
 use ff_mcp::{McpConfigWatcher, SupervisorHandle};
 
@@ -2699,17 +2699,22 @@ impl AppState {
         };
         let supports_vision = kind.is_some_and(|k| model_supports_vision(k, &model));
         let supports_documents = kind.is_some_and(|k| model_supports_documents(k, &model));
+        // #1023: seed the context window from the model spec so the FE context gauge
+        // has a real denominator for *every* provider — not just Ollama. The async
+        // `served_window` IPC still overrides this with a probed value where it can
+        // (Ollama's `/api/ps`); non-probed providers (Bedrock/Anthropic/global) keep
+        // this spec default instead of `None` (which forced the gauge into its
+        // misleading estimate path). `model_context_window` is a pure table lookup,
+        // so the cheap sync path stays cheap.
+        let spec_window = u32::try_from(model_context_window(&model)).unwrap_or(u32::MAX);
         ResolvedModel {
             connection,
             model,
             supports_vision,
             supports_documents,
-            // Served-window fields populated in the async IPC command via
-            // [`served_window`](Self::served_window); the sync resolver leaves them
-            // None so internal callers (turn building, tests) keep the cheap path.
-            context_window: None,
+            context_window: Some(spec_window),
             trained_context_window: None,
-            context_window_source: None,
+            context_window_source: Some(ContextWindowSource::Default),
         }
     }
 

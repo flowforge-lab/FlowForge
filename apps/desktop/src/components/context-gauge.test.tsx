@@ -24,6 +24,7 @@ function seed(tokens: number | null | undefined, budget?: number | null) {
     contextTokensBySession: tokens == null ? {} : { [SID]: tokens },
     contextBudgetBySession: budget == null ? {} : { [SID]: budget },
     contextInputTokensBySession: {},
+    contextUsageBySession: {},
     contextBreakdownBySession: {},
     sessionTotalsBySession: {},
     ttftBySession: {},
@@ -37,6 +38,8 @@ function seedPopover(opts: {
   inputTokens?: number;
   breakdown?: ContextBreakdown;
   totals?: TurnUsage;
+  usage?: TurnUsage;
+  contextWindow?: number;
   model?: string;
   ttft?: number;
   promptLatencyMs?: number;
@@ -52,6 +55,7 @@ function seedPopover(opts: {
     : {};
   useChatStore.setState({
     contextInputTokensBySession: inputs,
+    contextUsageBySession: opts.usage ? { [SID]: opts.usage } : {},
     contextBreakdownBySession: breakdowns,
     sessionTotalsBySession: totals,
     ttftBySession: opts.ttft == null ? {} : { [SID]: opts.ttft },
@@ -65,7 +69,7 @@ function seedPopover(opts: {
       model: opts.model,
       supportsVision: false,
       supportsDocuments: false,
-      contextWindow: null,
+      contextWindow: opts.contextWindow ?? null,
       trainedContextWindow: null,
       contextWindowSource: null,
     };
@@ -204,7 +208,7 @@ describe("ContextGauge — popover (#931)", () => {
     const panel = document.querySelector('[data-slot="popover-content"]');
     expect(panel).not.toBeNull();
     const text = panel?.textContent ?? "";
-    expect(text).toContain("before compaction");
+    expect(text).toContain("estimate");
     expect(text).toContain("System prompt");
     expect(text).toContain("1 spec");
     expect(text).not.toContain("1 specs");
@@ -246,8 +250,9 @@ describe("ContextGauge — popover (#931)", () => {
       sessionId: SID,
       model: "claude-opus-4-8",
       used: 172_900,
-      budget: 150_000,
+      denom: 150_000,
       pctUsed: 115,
+      mode: "estimate",
       ttft: 8_200,
       promptLatencyMs: 6_000,
       tier2Ms: 800,
@@ -297,7 +302,7 @@ describe("ContextGauge — popover (#931)", () => {
     const text =
       document.querySelector('[data-slot="popover-content"]')?.textContent ??
       "";
-    expect(text).toContain("before compaction");
+    expect(text).toContain("of budget (estimate)");
     expect(text).not.toContain("System prompt");
     expect(text).not.toContain("Session totals");
   });
@@ -378,5 +383,47 @@ describe("ContextGauge — popover (#931)", () => {
     expect(text).not.toContain("summarize ");
     // The prefill-share line's "main" prefix must not leak in without a phase.
     expect(text).not.toContain("main ");
+  });
+
+  it("context fill = wire vs real window (not cumulative usage), ≤100% (#1023)", () => {
+    // Fill numerator is the breakdown's last-request wire (system+tools+wire =
+    // 12k+2.9k+158k = 172.9k) against the real window (200k) = 86%. Provider usage is
+    // cumulative cost throughput (cacheRead 150k can exceed a single request) and must
+    // NOT be the fill numerator — it only drives the separate cache-hit line.
+    seedPopover({
+      breakdown: BREAKDOWN,
+      usage: {
+        inputTokens: 20_000,
+        outputTokens: 1_000,
+        cacheReadTokens: 150_000,
+        cacheWriteTokens: 10_000,
+      },
+      contextWindow: 200_000,
+      model: "claude",
+    });
+    render(<ContextGauge sessionId={SID} />);
+    fireEvent.click(screen.getByRole("button", { name: /context/i }));
+    const text =
+      document.querySelector('[data-slot="popover-content"]')?.textContent ??
+      "";
+    expect(text).toContain("86%");
+    expect(text).toContain("of context window");
+    expect(text).not.toContain("estimate");
+    // cacheRead / (input+cacheRead+cacheWrite) = 150k/180k = 83%.
+    expect(text).toContain("83% served from cache");
+  });
+
+  it("falls back to the soft budget (labeled estimate) when no real window (#1023)", () => {
+    // No contextWindow → denominator falls back to the soft compaction budget,
+    // labeled estimate. No usage → no cache-hit line.
+    seed(null, 200_000);
+    seedPopover({ breakdown: BREAKDOWN });
+    render(<ContextGauge sessionId={SID} />);
+    fireEvent.click(screen.getByRole("button", { name: /context/i }));
+    const text =
+      document.querySelector('[data-slot="popover-content"]')?.textContent ??
+      "";
+    expect(text).toContain("estimate");
+    expect(text).not.toContain("served from cache");
   });
 });
