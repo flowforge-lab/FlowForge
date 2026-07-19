@@ -1217,6 +1217,35 @@ fn list_memory_chunks(state: State<'_, Arc<AppState>>) -> Vec<ff_core::MemoryChu
         .collect()
 }
 
+/// Replace the whole body of a curated `MEMORY.md` stratum (#969/#868): the
+/// Settings → Memory editor sends back the full `## Identity`/`## Patterns`/`## Focus`
+/// section content, and this overwrites it (siblings preserved, heading kept even
+/// when empty). Reindexes afterward so recall reflects the edit; the atomic
+/// single-writer rewrite lives in `ff-memory`.
+#[tauri::command]
+fn write_curated_memory(
+    state: State<'_, Arc<AppState>>,
+    stratum: ff_core::Stratum,
+    text: String,
+) -> CmdResult<()> {
+    let mem = state.memory();
+    // Wire enum → ff-memory domain enum (same split as MemoryFileKind above).
+    let domain = match stratum {
+        ff_core::Stratum::Identity => ff_memory::Stratum::Identity,
+        ff_core::Stratum::Patterns => ff_memory::Stratum::Patterns,
+        ff_core::Stratum::Focus => ff_memory::Stratum::Focus,
+    };
+    mem.replace_curated_stratum(&text, domain)
+        .map_err(|e| e.to_string())?;
+    // Best-effort reindex so search/ambient recall reflects the edit; a failure
+    // leaves the file written (the source of truth) — mirrors the consolidate path.
+    let chunks = mem.all_chunks();
+    if let Err(e) = state.index().reindex(&chunks) {
+        tracing::warn!(error = %e, "reindex after curated edit failed");
+    }
+    Ok(())
+}
+
 /// Reset (wake) a chunk: restore its weight to `1.0` and stamp `last_accessed`
 /// now, creating the stats row if absent (#293). Never edits Markdown.
 #[tauri::command]
@@ -3990,6 +4019,7 @@ pub fn run() {
             list_memory_files,
             read_memory_file,
             memory_overview,
+            write_curated_memory,
             list_directory,
             read_file,
             list_memory_chunks,

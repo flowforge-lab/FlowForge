@@ -665,3 +665,84 @@ fn keyed_ambient_keys_feed_reinforcement_end_to_end() {
         "ambient reinforcement of the injected key lifted its weight ({before} -> {after})"
     );
 }
+
+// ---- #969: replace_curated_stratum (whole-stratum overwrite) ----
+
+#[test]
+fn replace_curated_stratum_creates_when_absent() {
+    let dir = tempfile::tempdir().unwrap();
+    let m = mem(dir.path());
+    m.replace_curated_stratum("based in Austin", Stratum::Identity)
+        .unwrap();
+    assert_eq!(
+        read_lenient(&m.curated_path()),
+        "## Identity\nbased in Austin\n"
+    );
+}
+
+#[test]
+fn replace_curated_stratum_overwrites_body_not_appends() {
+    let dir = tempfile::tempdir().unwrap();
+    let m = mem(dir.path());
+    m.write_curated_stratum("old identity", Stratum::Identity)
+        .unwrap();
+    m.replace_curated_stratum("new identity", Stratum::Identity)
+        .unwrap();
+    // Overwrites (unlike write_curated_stratum which would append a second line).
+    assert_eq!(
+        read_lenient(&m.curated_path()),
+        "## Identity\nnew identity\n"
+    );
+}
+
+#[test]
+fn replace_curated_stratum_preserves_sibling_sections() {
+    let dir = tempfile::tempdir().unwrap();
+    let m = mem(dir.path());
+    m.write_curated_stratum("who I am", Stratum::Identity)
+        .unwrap();
+    m.write_curated_stratum("how I work", Stratum::Patterns)
+        .unwrap();
+    m.write_curated_stratum("current goal", Stratum::Focus)
+        .unwrap();
+    // Replace the middle section; Identity (before) and Focus (after) must survive.
+    m.replace_curated_stratum("prefers Rust now", Stratum::Patterns)
+        .unwrap();
+    assert_eq!(
+        read_lenient(&m.curated_path()),
+        "## Identity\nwho I am\n\n## Patterns\nprefers Rust now\n\n## Focus\ncurrent goal\n"
+    );
+}
+
+#[test]
+fn replace_curated_stratum_handles_eof_section() {
+    let dir = tempfile::tempdir().unwrap();
+    let m = mem(dir.path());
+    m.write_curated_stratum("who I am", Stratum::Identity)
+        .unwrap();
+    m.write_curated_stratum("current goal", Stratum::Focus)
+        .unwrap();
+    // Focus is the last section → replace must run to EOF, leaving Identity intact.
+    m.replace_curated_stratum("new goal", Stratum::Focus)
+        .unwrap();
+    assert_eq!(
+        read_lenient(&m.curated_path()),
+        "## Identity\nwho I am\n\n## Focus\nnew goal\n"
+    );
+}
+
+#[test]
+fn replace_curated_stratum_empty_text_clears_body_keeps_heading() {
+    let dir = tempfile::tempdir().unwrap();
+    let m = mem(dir.path());
+    m.write_curated_stratum("who I am", Stratum::Identity)
+        .unwrap();
+    m.write_curated_stratum("current goal", Stratum::Focus)
+        .unwrap();
+    m.replace_curated_stratum("", Stratum::Identity).unwrap();
+    // Identity body cleared, heading kept; Focus untouched.
+    assert_eq!(
+        read_lenient(&m.curated_path()),
+        "## Identity\n\n## Focus\ncurrent goal\n"
+    );
+}

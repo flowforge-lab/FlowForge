@@ -29,7 +29,7 @@ pub use goal::{
     Verdict, DEFAULT_MAX_ITERATIONS,
 };
 pub use mcp::{McpScope, McpServerConfig, McpServerState, McpServerStatus, McpToolInfo};
-pub use memory::{MemoryChunkStat, MemoryFileInfo, MemoryFileKind, MemoryOverview};
+pub use memory::{MemoryChunkStat, MemoryFileInfo, MemoryFileKind, MemoryOverview, Stratum};
 pub use message::{
     Attachment, AttachmentKind, AttachmentSource, Message, Role, StopReason, ToolCall,
 };
