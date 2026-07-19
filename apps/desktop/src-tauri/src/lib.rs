@@ -1334,32 +1334,34 @@ fn send_message(
 
 /// Wake `session_id` because an observer fired (#891 Phase 1).
 ///
-/// Two paths, picked atomically on the cancel token registered for
-/// the session:
+/// Two paths, picked on a **non-destructive** liveness probe
+/// (`has_active_turn`) of the session's registered cancel token
+/// (#1018 Path A — the probe must never strip the live turn's token):
 ///
-/// - **Turn in flight** (`take_cancel` returns `Some`): the in-flight
-///   turn owns the cancel, so the event is deferred — appended to
-///   the supervisor's per-session queue. `spawn_assistant_turn`
-///   drains the queue on the next `send_message` / `edit_message` /
-///   observer wake. We DO NOT cancel the in-flight turn
-///   (`cancel_turn` would race the user's own cancel and could
-///   leave the transcript inconsistent) and we DO NOT drop the
-///   event (the user explicitly registered the observer to see
-///   this change).
-/// - **No turn in flight** (`take_cancel` returns `None`): we own
-///   the wake. Persist the event as a user message in the format
-///   `[Observer "<label>"]: <summary>` and spawn a fresh assistant
-///   turn. The next `spawn_assistant_turn` also drains the
-///   per-session buffer, so a burst of deferred events is folded in
-///   alongside the current one (one user message per event — the
-///   model gets the full causal history, not a lossy summary).
+/// - **Turn in flight** (`has_active_turn` is `true`): the in-flight
+///   turn owns the cancel, so the event is deferred — appended to the
+///   supervisor's per-session queue. `spawn_assistant_turn` drains the
+///   queue on the next `send_message` / `edit_message` / observer wake.
+///   We DO NOT cancel the in-flight turn (`cancel_turn` would race the
+///   user's own cancel and could leave the transcript inconsistent),
+///   we DO NOT touch its cancel token (probing with the destructive
+///   `take_cancel` used to strip it, corrupting the running tool call —
+///   `[no result recorded]`), and we DO NOT drop the event (the user
+///   explicitly registered the observer to see this change).
+/// - **No turn in flight** (`has_active_turn` is `false`): we own the
+///   wake. Buffer the event and spawn a fresh assistant turn.
+///   `spawn_assistant_turn` is the single drain point: it surfaces the
+///   buffered wakes to that turn as **transient, request-only context**
+///   (the volatile system block), never as a persisted `Role::User`
+///   message (#1018 Path B — persisting a wake pollutes history across
+///   relaunch and is semantically wrong: the app can't keep observing
+///   once closed).
 ///
-/// Liveness: `take_cancel` is the same gate `delete_session`,
-/// `send_message`, and `edit_message` use, so the wake can never
-/// race a user-driven turn cancel. If a turn completes between
-/// `take_cancel` returning `Some` and the buffer push, the next
-/// `spawn_assistant_turn` (from any source) will surface the event
-/// — the event is never lost.
+/// Liveness: `has_active_turn` reads the same cancel-token registry
+/// `delete_session`, `send_message`, and `edit_message` gate on, so the
+/// wake can never race a user-driven turn cancel. If a turn completes
+/// between the probe and the buffer push, the next `spawn_assistant_turn`
+/// (from any source) will surface the event — the event is never lost.
 pub(crate) async fn wake_session_for_observer(
     state: &Arc<AppState>,
     event: ObserverEvent,
@@ -1367,10 +1369,15 @@ pub(crate) async fn wake_session_for_observer(
 ) {
     let session_id = event.session_id.clone();
     let observer_id = event.id;
-    if state.take_cancel(&session_id).is_some() {
-        // Turn in flight: defer. `buffer_event` re-inserts into
-        // the same queue `drain_buffer` will pull from when the
-        // next turn starts.
+    if state.has_active_turn(&session_id) {
+        // Turn in flight: defer — but only *probe* liveness, never
+        // strip the live turn's cancel token (#1018 Path A). The old
+        // `take_cancel` probe removed the token as a side effect, which
+        // desynced the in-flight turn's completion bookkeeping and let a
+        // rapid follow-up wake spawn a competing turn, dropping the
+        // running tool call's result (`[no result recorded]`).
+        // `buffer_event` re-inserts into the same queue the next
+        // `spawn_assistant_turn` will drain.
         state.buffer_observer_event(&session_id, event);
         tracing::info!(
             session_id = %session_id,
@@ -1380,22 +1387,16 @@ pub(crate) async fn wake_session_for_observer(
         return;
     }
 
-    // No turn in flight: drain any deferred events first, then add
-    // the current one, then spawn a turn. Each event becomes its
-    // own user message — the model sees the full sequence rather
-    // than a coalesced "you missed N events" note.
-    let mut batch = state.drain_observer_buffer(&session_id);
-    batch.push(event);
-    for ev in &batch {
-        state.store.add_message(
-            &session_id,
-            Role::User,
-            format!("[Observer \"{}\"]: {}", ev.label, ev.summary),
-        );
-    }
+    // No turn in flight: buffer the current event and spawn a turn.
+    // `spawn_assistant_turn` is the single point that drains the buffer
+    // and surfaces the wakes transiently (#1018 Path B) — request-only
+    // context, never persisted to the transcript. Buffering here (rather
+    // than persisting via `add_message`) keeps a wake ephemeral: it must
+    // not survive relaunch as a `Role::User` row polluting history.
+    state.buffer_observer_event(&session_id, event);
     tracing::info!(
         session_id = %session_id,
-        count = batch.len(),
+        observer_id = observer_id,
         "observer wake spawning turn"
     );
     spawn_assistant_turn(state.clone(), app.clone(), session_id);
@@ -1471,6 +1472,26 @@ pub(crate) fn spawn_process_output_bridge(
     });
 }
 
+/// Render deferred observer wakes into a single transient, request-only
+/// context block for a turn (#1018 Path B). Returns `None` when there are
+/// no wakes. The result is folded into the turn's `extra_instructions` (the
+/// volatile system block) — seen by the turn but never persisted, so wakes
+/// can't survive relaunch as `Role::User` rows polluting history.
+fn observer_wake_context(events: &[ff_observer::ObserverEvent]) -> Option<String> {
+    if events.is_empty() {
+        return None;
+    }
+    let lines: Vec<String> = events
+        .iter()
+        .map(|ev| format!("- [Observer \"{}\"]: {}", ev.label, ev.summary))
+        .collect();
+    Some(format!(
+        "## Observer wakes\nWhile you were busy, these watched targets changed. \
+         Treat as already-acknowledged background context — act on them only if relevant:\n{}",
+        lines.join("\n")
+    ))
+}
+
 /// Set up and spawn the assistant turn for `session_id`: snapshots the provider,
 /// resolves the session's phenotype/mode, builds the tool registry + system
 /// prompt, runs the turn (streaming over `turn:*` / `tool:*`), and folds the
@@ -1478,29 +1499,20 @@ pub(crate) fn spawn_process_output_bridge(
 /// and `edit_message` (after editing + truncating), so both paths run identical
 /// turn semantics.
 fn spawn_assistant_turn(state: Arc<AppState>, app: tauri::AppHandle, session_id: String) {
-    // If any observer events were deferred while a turn was in
-    // flight, prepend them to the transcript now so this new turn
-    // sees them as already-acknowledged user context (rather than
-    // firing them after the user has already moved on). The
-    // `drain_observer_buffer` call is idempotent — an empty buffer
-    // is a no-op. `wake_session_for_observer` (the wake path)
-    // already drained the buffer in its own batch, so this is
-    // usually empty here; it only has content when a `send_message`
-    // or `edit_message` triggered this turn with deferred events
-    // still queued.
+    // Drain any observer wakes deferred while a turn was in flight and
+    // surface them to THIS turn as transient, request-only context
+    // (#1018 Path B) — never as persisted `Role::User` rows. A wake is
+    // ephemeral ("state X changed while you were busy"); persisting it
+    // pollutes history across relaunch and is semantically wrong (the
+    // app can't keep observing once closed). This is the single drain
+    // point: the wake path buffers and delegates here.
     let buffered = state.drain_observer_buffer(&session_id);
-    for ev in &buffered {
-        state.store.add_message(
-            &session_id,
-            Role::User,
-            format!("[Observer \"{}\"]: {}", ev.label, ev.summary),
-        );
-    }
-    if !buffered.is_empty() {
+    let wake_context: Option<String> = observer_wake_context(&buffered);
+    if wake_context.is_some() {
         tracing::info!(
             session_id = %session_id,
             count = buffered.len(),
-            "drained observer buffer into new turn"
+            "surfacing observer wakes as transient turn context"
         );
     }
 
@@ -1584,6 +1596,14 @@ fn spawn_assistant_turn(state: Arc<AppState>, app: tauri::AppHandle, session_id:
         // set so the command palette still affects turns. See `turn_active_skills`.
         let active: Vec<String> = state.turn_active_skills(&sid);
         let (inject_mem, extra_instructions) = state.turn_prompt_injection();
+        // Fold any deferred observer wakes into the turn's request-only
+        // instructions (#1018 Path B): they ride in the volatile system
+        // block, seen by this turn but never persisted to the transcript.
+        let extra_instructions = match (extra_instructions, wake_context) {
+            (Some(base), Some(wake)) => Some(format!("{base}\n\n{wake}")),
+            (Some(base), None) => Some(base),
+            (None, wake) => wake,
+        };
         let (memory, ambient_keys) = if inject_mem {
             state
                 .memory()
