@@ -41,6 +41,17 @@ class ResizeObserverStub {
 (globalThis as { ResizeObserver?: unknown }).ResizeObserver =
   ResizeObserverStub;
 
+// The pin is coalesced through requestAnimationFrame; run it synchronously so a
+// fired observer callback commits its scrollTop write within the same act().
+(globalThis as { requestAnimationFrame?: unknown }).requestAnimationFrame = (
+  cb: FrameRequestCallback,
+) => {
+  cb(0);
+  return 0;
+};
+(globalThis as { cancelAnimationFrame?: unknown }).cancelAnimationFrame =
+  () => {};
+
 // Give the scroll container a scrollable geometry with a writable scrollTop.
 function mockGeometry(
   el: HTMLElement,
@@ -91,7 +102,7 @@ function seed() {
 function renderChat() {
   const { container } = render(<ChatView />);
   const scrollEl = container.querySelector(
-    ".overflow-y-auto",
+    '[data-testid="chat-scroll"]',
   ) as HTMLDivElement;
   // 1000px of content in a 200px viewport → scrollable.
   mockGeometry(scrollEl, 1000, 200);

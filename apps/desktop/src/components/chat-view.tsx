@@ -465,17 +465,30 @@ export function ChatView({ sessionId }: { sessionId?: string } = {}) {
   // image finishing load — and re-pins to the true bottom. Only follows while the
   // user is still pinned; `findOn` (#679) suppresses the yank while reading a
   // match. Writing `scrollTop` doesn't resize the content, so there's no loop.
+  //
+  // The observer can fire many times per frame during a fast stream (the #1022
+  // churn cluster), so the pin is coalesced into a single rAF-scheduled write per
+  // frame instead of a synchronous write per fire. The rAF also reads
+  // `scrollHeight` at paint time — the freshest post-layout height for that frame.
   useEffect(() => {
     const el = scrollRef.current;
     const content = contentRef.current;
     if (!el || !content) return;
+    let raf = 0;
     const ro = new ResizeObserver(() => {
-      if (pinnedToBottom.current && !findOn) {
-        el.scrollTop = el.scrollHeight;
-      }
+      if (raf) return; // a pin is already scheduled for this frame
+      raf = requestAnimationFrame(() => {
+        raf = 0;
+        if (pinnedToBottom.current && !findOn) {
+          el.scrollTop = el.scrollHeight;
+        }
+      });
     });
     ro.observe(content);
-    return () => ro.disconnect();
+    return () => {
+      ro.disconnect();
+      if (raf) cancelAnimationFrame(raf);
+    };
   }, [findOn]);
 
   // A session swap can land on a transcript of the same height (no ResizeObserver
@@ -539,6 +552,7 @@ export function ChatView({ sessionId }: { sessionId?: string } = {}) {
       <div
         ref={scrollRef}
         onScroll={handleScroll}
+        data-testid="chat-scroll"
         className="min-h-0 flex-1 overflow-y-auto"
       >
         <div

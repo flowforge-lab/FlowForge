@@ -81,7 +81,7 @@ describe("ChatView findOn gate (#875, #710 follow-up)", () => {
 
     const { container } = render(<ChatView />);
     const scrollEl = container.querySelector(
-      ".overflow-y-auto",
+      '[data-testid="chat-scroll"]',
     ) as HTMLDivElement | null;
     expect(scrollEl).not.toBeNull();
     const writer = vi.spyOn(scrollEl!, "scrollTop", "set");
