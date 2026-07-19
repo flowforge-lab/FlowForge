@@ -448,22 +448,40 @@ export function ChatView({ sessionId }: { sessionId?: string } = {}) {
   const findOn = useFindStore((s) => s.open && s.sessionId === targetSessionId);
 
   const scrollRef = useRef<HTMLDivElement>(null);
+  // The growing content wrapper, observed for post-layout height changes (#1025).
+  const contentRef = useRef<HTMLDivElement>(null);
   const pinnedToBottom = useRef(true);
   // Render-state mirror of `pinnedToBottom` so the floating "Jump to latest" button
   // (#206) shows only while scrolled up. Toggles at the same 40px threshold.
   const [atBottom, setAtBottom] = useState(true);
 
   // Stay pinned to the bottom while streaming, but respect manual scroll-up.
-  // `findOn` gates the bottom-pin on both effects so the in-thread find (#679) and
-  // its global-search seed (#710) aren't yanked back to the tail the moment
-  // a token arrives or the session switches (#875).
+  // Pinning has to happen *after* the browser lays out the new content, not at
+  // React commit time (#1025): a large markdown / <pre> / image block grows the
+  // scroll container's height *after* the token that inserted it commits, so a
+  // commit-time `scrollTop = scrollHeight` reads a pre-layout height and lands
+  // the view above the real tail. A ResizeObserver fires post-layout for every
+  // size change — each token, the pending indicator, late-settling blocks, an
+  // image finishing load — and re-pins to the true bottom. Only follows while the
+  // user is still pinned; `findOn` (#679) suppresses the yank while reading a
+  // match. Writing `scrollTop` doesn't resize the content, so there's no loop.
   useEffect(() => {
     const el = scrollRef.current;
-    if (el && pinnedToBottom.current && !findOn) {
-      el.scrollTop = el.scrollHeight;
-    }
-  }, [messages, toolStepsByMessage, reasoningByMessage, pending, findOn]);
+    const content = contentRef.current;
+    if (!el || !content) return;
+    const ro = new ResizeObserver(() => {
+      if (pinnedToBottom.current && !findOn) {
+        el.scrollTop = el.scrollHeight;
+      }
+    });
+    ro.observe(content);
+    return () => ro.disconnect();
+  }, [findOn]);
 
+  // A session swap can land on a transcript of the same height (no ResizeObserver
+  // fire), so re-arm the pin and jump to the tail explicitly here. `findOn` gates
+  // it so the in-thread find (#679) and its global-search seed (#710) aren't
+  // yanked back to the tail the moment the session switches (#875).
   useEffect(() => {
     pinnedToBottom.current = true;
     const el = scrollRef.current;
@@ -523,7 +541,10 @@ export function ChatView({ sessionId }: { sessionId?: string } = {}) {
         onScroll={handleScroll}
         className="min-h-0 flex-1 overflow-y-auto"
       >
-        <div className="mx-auto flex max-w-4xl flex-col gap-3 px-4 py-4">
+        <div
+          ref={contentRef}
+          className="mx-auto flex max-w-4xl flex-col gap-3 px-4 py-4"
+        >
           {groups.map((g) => {
             const m = g.message;
             // foldTurns already resolved each turn's steps (live or reconstructed)

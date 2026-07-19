@@ -41,3 +41,15 @@ if (
     configurable: true,
   });
 }
+
+// jsdom has no `ResizeObserver`. Components that observe layout (e.g. ChatView's
+// post-layout autoscroll, #1025) construct one on mount and would crash every
+// jsdom render without it. Provide a no-op default; tests that need to drive the
+// callback (chat-view.autoscroll.test.tsx) overwrite this with a capturing stub.
+if (typeof globalThis.ResizeObserver === "undefined") {
+  (globalThis as { ResizeObserver?: unknown }).ResizeObserver = class {
+    observe() {}
+    unobserve() {}
+    disconnect() {}
+  };
+}
