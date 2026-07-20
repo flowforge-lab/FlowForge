@@ -407,6 +407,19 @@ impl Memory {
         Ok(self.curated_path())
     }
 
+    /// Replace the **whole body** of a curated stratum with `text` (#969), for the
+    /// Settings → Memory editor (#868): the editable view sends back the full section
+    /// content, so this overwrites `## Identity` / `## Patterns` / `## Focus` rather
+    /// than appending like [`write_curated_stratum`]. Sibling sections are preserved;
+    /// a missing heading is created; empty `text` clears the stratum's body but keeps
+    /// the heading. Goes through [`rewrite_curated`] (atomic, single-writer).
+    pub fn replace_curated_stratum(&self, text: &str, stratum: Stratum) -> Result<PathBuf> {
+        let existing = read_lenient(&self.curated_path());
+        let updated = replace_under_heading(&existing, stratum.heading(), text);
+        self.rewrite_curated(&updated)?;
+        Ok(self.curated_path())
+    }
+
     /// The memory config.
     pub fn config(&self) -> &MemoryConfig {
         &self.config
@@ -1018,6 +1031,57 @@ fn insert_under_heading(content: &str, heading: &str, text: &str) -> String {
 
             let mut out: Vec<String> = lines[..body_end].iter().map(|l| l.to_string()).collect();
             out.push(text.to_string());
+            if end < lines.len() {
+                // Blank line before the next sibling heading.
+                out.push(String::new());
+                out.extend(lines[end..].iter().map(|l| l.to_string()));
+            }
+            let mut joined = out.join("\n");
+            joined.push('\n');
+            joined
+        }
+    }
+}
+
+/// Replace the entire body under `heading` with `text` (#969, whole-stratum replace),
+/// preserving the heading line and all sibling `## ` sections. When the heading is
+/// absent it is created at the end (same as [`insert_under_heading`]), so a
+/// first-time edit of an empty stratum works. Empty `text` leaves the heading with
+/// an empty body (the stratum is cleared, not removed).
+fn replace_under_heading(content: &str, heading: &str, text: &str) -> String {
+    let text = text.trim_end();
+    let lines: Vec<&str> = content.lines().collect();
+    let head_idx = lines.iter().position(|l| l.trim_end() == heading);
+
+    match head_idx {
+        None => {
+            // No such section yet — create it at the end (mirrors insert's append).
+            let mut out = content.trim_end().to_string();
+            if !out.is_empty() {
+                out.push_str("\n\n");
+            }
+            out.push_str(heading);
+            out.push('\n');
+            if !text.is_empty() {
+                out.push_str(text);
+                out.push('\n');
+            }
+            out
+        }
+        Some(h) => {
+            // Section ends at the next top-level `## ` heading, or EOF.
+            let end = lines[h + 1..]
+                .iter()
+                .position(|l| l.starts_with("## "))
+                .map(|rel| h + 1 + rel)
+                .unwrap_or(lines.len());
+
+            // Keep everything up to and including the heading line, drop the old
+            // body [h+1..end), splice in the new text, then re-emit any siblings.
+            let mut out: Vec<String> = lines[..=h].iter().map(|l| l.to_string()).collect();
+            if !text.is_empty() {
+                out.push(text.to_string());
+            }
             if end < lines.len() {
                 // Blank line before the next sibling heading.
                 out.push(String::new());

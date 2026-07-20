@@ -22,6 +22,22 @@ pub enum MemoryFileKind {
     Daily,
 }
 
+/// A curated-memory stratum (RFC 0008 §4) — the editable sections of `MEMORY.md`.
+/// Wire contract for the Settings → Memory editor (#868/#969); mirrors the ff-memory
+/// domain `Stratum`, kept separate so the wire type owns its own derives (same
+/// pattern as [`MemoryFileKind`]). The host maps this to the domain enum.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "../../../apps/desktop/src/bindings/")]
+pub enum Stratum {
+    /// Who the user is — `## Identity`.
+    Identity,
+    /// How the user works — `## Patterns`.
+    Patterns,
+    /// What the user is focused on now — `## Focus`.
+    Focus,
+}
+
 /// Metadata for a single memory file, listed by `list_memory_files`. The body is
 /// fetched separately via `read_memory_file` so listings stay cheap.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
