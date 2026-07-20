@@ -13,6 +13,7 @@ interface SearchConfigState {
   load: () => Promise<void>;
   setBackend: (backend: SearchBackend) => Promise<void>;
   setBaseUrl: (baseUrl: string) => Promise<void>;
+  setEmail: (email: string) => Promise<void>;
 }
 
 export const useSearchConfigStore = create<SearchConfigState>((set, get) => ({
@@ -40,7 +41,7 @@ export const useSearchConfigStore = create<SearchConfigState>((set, get) => ({
     set({ saving: true, error: null });
     try {
       const baseUrl = backend === "searxNg" ? config.baseUrl : undefined;
-      const stored = await ipc.setSearchConfig(backend, baseUrl);
+      const stored = await ipc.setSearchConfig(backend, baseUrl, config.email);
       set({ config: stored, saving: false });
     } catch (err) {
       set({
@@ -55,7 +56,30 @@ export const useSearchConfigStore = create<SearchConfigState>((set, get) => ({
     if (!config || config.backend !== "searxNg") return;
     set({ saving: true, error: null });
     try {
-      const stored = await ipc.setSearchConfig("searxNg", baseUrl);
+      const stored = await ipc.setSearchConfig(
+        "searxNg",
+        baseUrl,
+        config.email,
+      );
+      set({ config: stored, saving: false });
+    } catch (err) {
+      set({
+        saving: false,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  },
+
+  setEmail: async (email) => {
+    const { config } = get();
+    if (!config) return;
+    set({ saving: true, error: null });
+    try {
+      const stored = await ipc.setSearchConfig(
+        config.backend,
+        config.baseUrl,
+        email || undefined,
+      );
       set({ config: stored, saving: false });
     } catch (err) {
       set({

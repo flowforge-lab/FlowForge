@@ -54,6 +54,7 @@ export function SearchSettings() {
   const load = useSearchConfigStore((s) => s.load);
   const setBackend = useSearchConfigStore((s) => s.setBackend);
   const setBaseUrl = useSearchConfigStore((s) => s.setBaseUrl);
+  const setEmail = useSearchConfigStore((s) => s.setEmail);
 
   useEffect(() => {
     void load();
@@ -74,6 +75,14 @@ export function SearchSettings() {
     const current = config.baseUrl ?? "";
     if (trimmed === current) return;
     void setBaseUrl(trimmed);
+  };
+
+  const onEmailBlur = (value: string) => {
+    if (!config) return;
+    const trimmed = value.trim();
+    const current = config.email ?? "";
+    if (trimmed === current) return;
+    void setEmail(trimmed);
   };
 
   return (
@@ -143,6 +152,34 @@ export function SearchSettings() {
               </p>
             </div>
           ) : null}
+
+          <div className="space-y-1.5">
+            <label
+              htmlFor="search-email"
+              className="text-[12px] font-medium text-foreground"
+            >
+              PubMed email
+            </label>
+            <Input
+              id="search-email"
+              key={`email-${config.email ?? ""}`}
+              type="email"
+              placeholder="you@example.com"
+              defaultValue={config.email ?? ""}
+              disabled={saving}
+              onBlur={(e) => onEmailBlur(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  e.currentTarget.blur();
+                }
+              }}
+            />
+            <p className="text-[11px] leading-relaxed text-muted-foreground">
+              Optional. Sent to NCBI E-utilities for best-practice
+              identification (#1021). They email you before blocking an IP for
+              abuse.
+            </p>
+          </div>
 
           {activeMeta?.requiresKey ? (
             <p className="text-[11px] leading-relaxed text-muted-foreground">

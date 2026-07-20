@@ -783,6 +783,19 @@ impl ff_tools::SearchKeyProvider for KeychainSearchKeys {
     }
 }
 
+/// Host [`SearchUserInfoProvider`](ff_tools::SearchUserInfoProvider): resolves the
+/// user email from the search config and injects it into the `PubMedSource` tool
+/// (#1021). If no email is configured, anonymous (keyless) mode is used.
+struct ConfigUserInfo {
+    config: Arc<Mutex<SearchConfig>>,
+}
+
+impl ff_tools::SearchUserInfoProvider for ConfigUserInfo {
+    fn user_email(&self) -> Option<String> {
+        self.config.lock().unwrap().email.clone()
+    }
+}
+
 /// `<config dir>/flowforge/control.json` — the Control panel's settings blob
 /// (#147). `None` only when the OS exposes no config dir.
 /// Soft cap on the resolved extra-instructions blob (#1002). The block lands in
@@ -1981,9 +1994,12 @@ impl AppState {
         )));
         // #1012: PubMed biomedical search (keyless). Registered globally for now;
         // persona-scoping it to Erudite is tracked separately (search_sources / 2b),
-        // since per-persona tool gating doesn't exist yet.
+        // since per-persona tool gating doesn't exist yet. #1021: email injected from
+        // search config when set.
         reg.register(Box::new(ff_tools::SearchTool::new(std::sync::Arc::new(
-            ff_tools::PubMedSource::new(),
+            ff_tools::PubMedSource::with_user_info(std::sync::Arc::new(ConfigUserInfo {
+                config: self.search_config.clone(),
+            })),
         ))));
         reg.register(Box::new(crate::tools::InstallSkillTool::new(
             skills_root(),

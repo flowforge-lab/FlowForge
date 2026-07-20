@@ -420,6 +420,24 @@ impl SearchKeyProvider for NoSearchKeys {
     }
 }
 
+/// Injects user info (email) into search sources that need it (#1021). Implemented
+/// by the host over its user preferences; `ff-tools` cannot depend on the host's
+/// prefs module (wrong dependency direction), so the info is *injected* rather
+/// than fetched here.
+pub trait SearchUserInfoProvider: Send + Sync {
+    fn user_email(&self) -> Option<String>;
+}
+
+/// A [`SearchUserInfoProvider`] with no user info — the default when no host prefs
+/// are wired (tests, or user hasn't set an email). Keeps anonymous searches working.
+pub struct NoUserInfo;
+
+impl SearchUserInfoProvider for NoUserInfo {
+    fn user_email(&self) -> Option<String> {
+        None
+    }
+}
+
 /// A search **corpus** the agent can query (#552 / #1011). Each source becomes its
 /// own agent tool (`web_search`, later `pubmed_search`, …) so the model knows which
 /// index it is hitting. Adding a source = implement this trait + register a
@@ -532,9 +550,13 @@ impl SearchSource for WebSource {
 /// the web sources so it plugs into [`SearchTool`] like any other corpus.
 ///
 /// NCBI compliance: every request carries `tool=flowforge` and the keyless rate cap
-/// is 3 req/s — the two calls are issued serially, well within it.
+/// is 3 req/s — the two calls are issued serially, well within it. If the user has
+/// set an email in preferences, it is sent as `email` — this is optional but
+/// recommended (#1021), as NCBI contacts you by email before blocking an IP if
+/// your traffic pattern triggers their abuse detection.
 pub struct PubMedSource {
     policy: SsrfPolicy,
+    user_info: Arc<dyn SearchUserInfoProvider>,
 }
 
 impl Default for PubMedSource {
@@ -547,6 +569,14 @@ impl PubMedSource {
     pub fn new() -> Self {
         Self {
             policy: SsrfPolicy::strict(),
+            user_info: Arc::new(NoUserInfo),
+        }
+    }
+
+    pub fn with_user_info(user_info: Arc<dyn SearchUserInfoProvider>) -> Self {
+        Self {
+            policy: SsrfPolicy::strict(),
+            user_info,
         }
     }
 
@@ -595,18 +625,8 @@ impl SearchSource for PubMedSource {
     }
 
     async fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchResult>, String> {
-        // Step 1 — esearch: query → PMIDs (JSON).
-        let esearch = url::Url::parse_with_params(
-            "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi",
-            &[
-                ("db", "pubmed"),
-                ("term", query),
-                ("retmax", &limit.to_string()),
-                ("retmode", "json"),
-                ("tool", "flowforge"),
-            ],
-        )
-        .map_err(|e| format!("failed to build esearch URL: {e}"))?;
+        let email = self.user_info.user_email();
+        let esearch = pubmed_esearch_url(query, limit, email.as_deref())?;
         let search_json = self.get_json(esearch.as_str()).await?;
         let ids: Vec<String> = search_json
             .get("esearchresult")
@@ -622,20 +642,47 @@ impl SearchSource for PubMedSource {
             return Ok(Vec::new());
         }
 
-        // Step 2 — esummary: PMIDs → title / authors / journal / year (JSON).
-        let esummary = url::Url::parse_with_params(
-            "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi",
-            &[
-                ("db", "pubmed"),
-                ("id", &ids.join(",")),
-                ("retmode", "json"),
-                ("tool", "flowforge"),
-            ],
-        )
-        .map_err(|e| format!("failed to build esummary URL: {e}"))?;
+        let esummary = pubmed_esummary_url(&ids, email.as_deref())?;
         let summary_json = self.get_json(esummary.as_str()).await?;
         parse_pubmed_summary(&summary_json, &ids)
     }
+}
+
+fn pubmed_esearch_url(query: &str, limit: usize, email: Option<&str>) -> Result<url::Url, String> {
+    let limit_str = limit.to_string();
+    let mut params: Vec<(&str, &str)> = vec![
+        ("db", "pubmed"),
+        ("term", query),
+        ("retmax", &limit_str),
+        ("retmode", "json"),
+        ("tool", "flowforge"),
+    ];
+    if let Some(e) = email {
+        params.push(("email", e));
+    }
+    url::Url::parse_with_params(
+        "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi",
+        params,
+    )
+    .map_err(|e| format!("failed to build esearch URL: {e}"))
+}
+
+fn pubmed_esummary_url(ids: &[String], email: Option<&str>) -> Result<url::Url, String> {
+    let id_list = ids.join(",");
+    let mut params: Vec<(&str, &str)> = vec![
+        ("db", "pubmed"),
+        ("id", &id_list),
+        ("retmode", "json"),
+        ("tool", "flowforge"),
+    ];
+    if let Some(e) = email {
+        params.push(("email", e));
+    }
+    url::Url::parse_with_params(
+        "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi",
+        params,
+    )
+    .map_err(|e| format!("failed to build esummary URL: {e}"))
 }
 
 /// Map an NCBI esummary JSON response + the PMID order from esearch into ranked
@@ -857,6 +904,7 @@ mod tests {
         let tool = WebSearchTool::new(shared(SearchConfig {
             backend: SearchBackend::SearxNg,
             base_url: None,
+            email: None,
             has_key: false,
         }));
         let out = tool
@@ -875,6 +923,7 @@ mod tests {
         let tool = WebSearchTool::new(shared(SearchConfig {
             backend: SearchBackend::Brave,
             base_url: None,
+            email: None,
             has_key: false,
         }));
         let out = tool
@@ -1209,5 +1258,41 @@ mod tests {
         let tool = SearchTool::new(Arc::new(PubMedSource::new()));
         assert_eq!(tool.name(), "pubmed_search");
         assert!(tool.description().contains("PubMed"));
+    }
+
+    #[test]
+    fn pubmed_esearch_url_includes_email_when_set() {
+        let url = pubmed_esearch_url("cancer", 5, Some("a@b.org")).unwrap();
+        let pairs: std::collections::HashMap<_, _> = url.query_pairs().collect();
+        assert_eq!(pairs.get("email").map(|v| v.as_ref()), Some("a@b.org"));
+        assert_eq!(pairs.get("tool").map(|v| v.as_ref()), Some("flowforge"));
+        assert_eq!(pairs.get("db").map(|v| v.as_ref()), Some("pubmed"));
+        assert_eq!(pairs.get("term").map(|v| v.as_ref()), Some("cancer"));
+    }
+
+    #[test]
+    fn pubmed_esearch_url_omits_email_when_none() {
+        let url = pubmed_esearch_url("cancer", 5, None).unwrap();
+        let pairs: std::collections::HashMap<_, _> = url.query_pairs().collect();
+        assert_eq!(pairs.get("email"), None);
+        assert_eq!(pairs.get("tool").map(|v| v.as_ref()), Some("flowforge"));
+    }
+
+    #[test]
+    fn pubmed_esummary_url_includes_email_when_set() {
+        let ids = vec!["123".to_string(), "456".to_string()];
+        let url = pubmed_esummary_url(&ids, Some("a@b.org")).unwrap();
+        let pairs: std::collections::HashMap<_, _> = url.query_pairs().collect();
+        assert_eq!(pairs.get("email").map(|v| v.as_ref()), Some("a@b.org"));
+        assert_eq!(pairs.get("id").map(|v| v.as_ref()), Some("123,456"));
+    }
+
+    #[test]
+    fn pubmed_esummary_url_omits_email_when_none() {
+        let ids = vec!["789".to_string()];
+        let url = pubmed_esummary_url(&ids, None).unwrap();
+        let pairs: std::collections::HashMap<_, _> = url.query_pairs().collect();
+        assert_eq!(pairs.get("email"), None);
+        assert_eq!(pairs.get("id").map(|v| v.as_ref()), Some("789"));
     }
 }

@@ -60,5 +60,6 @@ pub use registry::{is_subagent, Safety, Tool, ToolOutcome, ToolRegistry};
 pub use sink::{OutputSink, OutputStream};
 pub use url_safety::SsrfPolicy;
 pub use web_search::{
-    PubMedSource, SearchKeyProvider, SearchSource, SearchTool, WebSearchTool, WebSource,
+    NoUserInfo, PubMedSource, SearchKeyProvider, SearchSource, SearchTool, SearchUserInfoProvider,
+    WebSearchTool, WebSource,
 };

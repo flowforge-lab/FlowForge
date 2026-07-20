@@ -12,6 +12,11 @@ export type SearchConfig = { backend: SearchBackend,
  */
 baseUrl?: string, 
 /**
+ * User email sent to NCBI E-utilities for best-practice identification (#1021).
+ * Optional — anonymous when unset.
+ */
+email?: string, 
+/**
  * Whether an API key is stored for this backend (OS keychain). Derived from
  * keychain presence by the host getter on every read (#1010) — never authoritative
  * on disk, so `skip_deserializing` drops any persisted value and the getter
