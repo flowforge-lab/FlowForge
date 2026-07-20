@@ -20,7 +20,7 @@ import { ThinkingIndicator } from "@/components/thinking-indicator";
 import { CancelledNotice } from "@/components/cancelled-notice";
 import { ActiveProseBlock } from "@/components/active-prose-block";
 import { isResumableStopNotice } from "@/store/capped-turn";
-import { foldTurns, segmentTurn } from "@/lib/turn-groups";
+import { foldTurns, lastTurnStart, segmentTurn } from "@/lib/turn-groups";
 import type { TurnItem } from "@/lib/turn-groups";
 import { useExperimentalStore } from "@/store/experimental";
 import { useModelConfigStore, activeConnection } from "@/store/model-config";
@@ -29,6 +29,8 @@ import type { Message } from "@/bindings";
 
 const NO_STEPS: ToolStep[] = [];
 const NO_ITEMS: TurnItem[] = [];
+// Stable empty transcript so a not-yet-loaded session keeps a constant `msgs` ref.
+const EMPTY_MESSAGES: Message[] = [];
 
 // Narrow a message-id-keyed store record to just the entries belonging to one
 // pane's messages (#1009). These maps (`toolStepsByMessage` / `turnStartByMessage`
@@ -430,9 +432,47 @@ export function ChatView({ sessionId }: { sessionId?: string } = {}) {
   // per assistant message: live `toolStepsByMessage` while streaming (aggregated
   // across every iteration of a multi-step turn), or reconstructed from the persisted
   // tool/system messages on reload. Intermediate prose interleaves as folded rows.
+  //
+  // Split at the active turn's boundary (#1022): a streamed token only mutates the
+  // final turn, so folding the whole transcript every frame is O(transcript) per
+  // frame → O(n²) over a turn, and the jank scales with length. Fold the immutable
+  // prefix once (`usePrefixFold`, invalidated only when its messages actually change)
+  // and re-fold just the tail — the active turn — each frame. `foldTurns` is
+  // turn-boundaried, so concatenating the halves is identical to folding the whole
+  // (asserted in turn-groups.test.ts).
+  const msgs = messages ?? EMPTY_MESSAGES;
+  const prefixEnd = useMemo(() => {
+    const boundary = lastTurnStart(msgs);
+    return boundary < 0 ? 0 : boundary;
+  }, [msgs]);
+  // The prefix is everything before the active turn; it is immutable while that turn
+  // streams, so key its fold on the prefix's *identity* — the last committed message
+  // ref (+ boundary + session) — not on `msgs` or the step/reasoning maps, all of
+  // which get a fresh ref on every streamed token. This is what skips the O(prefix)
+  // fold per frame. The key changes on exactly the cases that mutate the committed
+  // transcript: a history reload / edit / truncate (message objects replaced) or a
+  // session switch. A committed turn never gains new steps/reasoning — those flow only
+  // to the streaming message — so the maps read at fold time are always current for
+  // prefix ids even though they aren't in the dep list.
+  const lastPrefixMsg = prefixEnd > 0 ? msgs[prefixEnd - 1] : undefined;
+  const prefixGroups = useMemo(
+    () =>
+      foldTurns(
+        msgs.slice(0, prefixEnd),
+        toolStepsByMessage,
+        reasoningByMessage,
+      ),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [targetSessionId, prefixEnd, lastPrefixMsg],
+  );
+  const tailGroups = useMemo(
+    () =>
+      foldTurns(msgs.slice(prefixEnd), toolStepsByMessage, reasoningByMessage),
+    [msgs, prefixEnd, toolStepsByMessage, reasoningByMessage],
+  );
   const groups = useMemo(
-    () => foldTurns(messages ?? [], toolStepsByMessage, reasoningByMessage),
-    [messages, toolStepsByMessage, reasoningByMessage],
+    () => [...prefixGroups, ...tailGroups],
+    [prefixGroups, tailGroups],
   );
 
   // While the in-thread find bar (#679) is open for this session, stop forcing

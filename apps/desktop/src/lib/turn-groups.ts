@@ -141,6 +141,25 @@ function reconstructSteps(
  *                       reasoning persisted on a message so streaming order matches the
  *                       persisted order on reload (#574).
  */
+/**
+ * Index of the last turn boundary — the last `user` message (including mode-switch
+ * markers, which break a run even though they don't render; see the fold loop). The
+ * transcript up to this index is immutable while the final turn streams, so a caller
+ * can fold that prefix once and re-fold only `messages.slice(here)` per token commit.
+ * Returns `-1` when there is no user message (fold the whole transcript as the tail).
+ *
+ * Because a turn never spans a user boundary, splitting the fold here is exact:
+ * `[...foldTurns(msgs.slice(0, i)), ...foldTurns(msgs.slice(i))]` equals
+ * `foldTurns(msgs)` for any `i` returned here (see turn-groups.test.ts). Scans from
+ * the end, so the cost is O(active turn length), not O(transcript).
+ */
+export function lastTurnStart(messages: Message[]): number {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i].role === "user") return i;
+  }
+  return -1;
+}
+
 export function foldTurns(
   messages: Message[],
   liveSteps?: Record<string, ToolStep[]>,

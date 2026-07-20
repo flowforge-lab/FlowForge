@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import {
   foldTurns,
   isSubstantiveProse,
+  lastTurnStart,
   persistedStepToToolStep,
   segmentTurn,
 } from "@/lib/turn-groups";
@@ -612,5 +613,67 @@ describe("foldTurns — mode-switch marker filtering (#848)", () => {
     ]);
     expect(groups).toHaveLength(1);
     expect(groups[0].kind).toBe("user");
+  });
+});
+
+describe("lastTurnStart + split-fold equivalence (#1022)", () => {
+  // A transcript exercising every branch of the fold: multi-block turns with
+  // interleaved prose/reasoning/steps (#619), a mode-switch marker boundary (#848),
+  // leading orphan tool rows before an assistant, and a run with no assistant (#331).
+  const transcript: Message[] = [
+    msg({ role: "tool", content: "seeded orphan" }), // leading loose (#331)
+    msg({ role: "user", content: "first" }),
+    msg({
+      id: "a1",
+      role: "assistant",
+      content: "checking",
+      toolCalls: [call("c1", "view", { path: "x" })],
+    }),
+    msg({ role: "tool", toolCallId: "c1", content: "42 lines" }),
+    msg({
+      id: "a2",
+      role: "assistant",
+      content: "the answer",
+      reasoning: "hmm",
+    }),
+    msg({ role: "user", content: "[system: mode switch]" }), // marker boundary (#848)
+    msg({ role: "user", content: "second" }),
+    msg({ id: "a3", role: "assistant", content: "streaming tail" }),
+  ];
+  const liveSteps: Record<string, ToolStep[]> = {
+    a3: [
+      { callId: "c9", tool: "grep", args: {}, status: "running", result: "" },
+    ],
+  };
+  const liveReasoning: Record<string, string> = { a3: "live thinking" };
+
+  it("lastTurnStart returns the last user index (incl. mode-switch markers)", () => {
+    expect(lastTurnStart(transcript)).toBe(6); // the "second" user message
+    expect(lastTurnStart([])).toBe(-1);
+    expect(
+      lastTurnStart([msg({ role: "assistant", content: "no user" })]),
+    ).toBe(-1);
+  });
+
+  it("split fold equals whole fold at every user boundary", () => {
+    const whole = foldTurns(transcript, liveSteps, liveReasoning);
+    // Every user index is a valid split point; the render must be identical.
+    for (let i = 0; i < transcript.length; i++) {
+      if (transcript[i].role !== "user") continue;
+      const split = [
+        ...foldTurns(transcript.slice(0, i), liveSteps, liveReasoning),
+        ...foldTurns(transcript.slice(i), liveSteps, liveReasoning),
+      ];
+      expect(split).toEqual(whole);
+    }
+  });
+
+  it("splitting at lastTurnStart matches the whole fold (the prefix/tail seam)", () => {
+    const b = lastTurnStart(transcript);
+    const split = [
+      ...foldTurns(transcript.slice(0, b), liveSteps, liveReasoning),
+      ...foldTurns(transcript.slice(b), liveSteps, liveReasoning),
+    ];
+    expect(split).toEqual(foldTurns(transcript, liveSteps, liveReasoning));
   });
 });
