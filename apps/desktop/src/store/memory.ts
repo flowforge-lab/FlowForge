@@ -11,6 +11,7 @@ import { ipc } from "@/lib/ipc";
 import type { MemoryChunkStat } from "@/bindings/MemoryChunkStat";
 import type { MemoryFileInfo } from "@/bindings/MemoryFileInfo";
 import type { MemoryOverview } from "@/bindings/MemoryOverview";
+import type { Stratum } from "@/bindings/Stratum";
 
 interface MemoryState {
   files: MemoryFileInfo[];
@@ -23,6 +24,11 @@ interface MemoryState {
   chunks: MemoryChunkStat[];
   /** chunkKeys with an in-flight reset/pin mutation, for per-row busy state. */
   chunkBusy: Record<string, boolean>;
+  /** Stratum with an in-flight curated-edit save (Identity/Patterns/Focus), or
+   *  null. Drives the editor's saving/disabled state (#868). */
+  savingStratum: Stratum | null;
+  /** Error from the most recent curated-edit save, shown inline in the editor. */
+  saveError: string | null;
   query: string;
   loading: boolean;
   error: string | null;
@@ -41,6 +47,10 @@ interface MemoryState {
   resetChunk: (chunkKey: string) => Promise<void>;
   /** Pin/unpin a chunk: pinned holds weight at 1.0 and is never dormant. */
   setPinned: (chunkKey: string, pinned: boolean) => Promise<void>;
+  /** Persist an edited curated stratum body via the backend write seam (#1028),
+   *  then reload so the pane reflects the saved content and the agent sees it
+   *  next turn. Resolves true on success, false on failure (error in saveError). */
+  saveCuratedStratum: (stratum: Stratum, text: string) => Promise<boolean>;
   /** Record a `memory:flushed` event (wired in lib/events.ts). The Settings pane
    *  reloads on the bump so freshly-flushed content shows. */
   noteFlush: (writes: number) => void;
@@ -63,6 +73,8 @@ export const useMemoryStore = create<MemoryState>((set, get) => ({
   journalBodies: {},
   chunks: [],
   chunkBusy: {},
+  savingStratum: null,
+  saveError: null,
   query: "",
   loading: false,
   error: null,
@@ -155,6 +167,23 @@ export const useMemoryStore = create<MemoryState>((set, get) => ({
         chunkBusy: clearBusy(s.chunkBusy, chunkKey),
       }));
     }
+  },
+
+  saveCuratedStratum: async (stratum, text) => {
+    set({ savingStratum: stratum, saveError: null });
+    try {
+      await ipc.writeCuratedMemory(stratum, text);
+    } catch (e) {
+      set({
+        savingStratum: null,
+        saveError: e instanceof Error ? e.message : String(e),
+      });
+      return false;
+    }
+    // Reload so curatedBody (and the derived cards) reflect the saved content.
+    await get().load();
+    set({ savingStratum: null });
+    return true;
   },
 
   noteFlush: (writes) =>

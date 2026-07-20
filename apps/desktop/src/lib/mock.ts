@@ -49,6 +49,7 @@ import type {
   UpdateProgressEvent,
   Mode,
   Safety,
+  Stratum,
   PermissionCell,
   PermissionMatrixView,
 } from "../bindings";
@@ -2030,6 +2031,30 @@ Shipping the Settings redesign — currently the Memory browser (SET.8).
       totalBytes: this.memoryFiles.reduce((sum, f) => sum + f.sizeBytes, 0),
       rootPath: "/mock/memory",
     };
+  }
+
+  // Mirrors the backend whole-stratum replace (#1028): rewrites the body between
+  // `## <Heading>` and the next known-stratum heading (or EOF) in MEMORY.md, so
+  // the mock app round-trips edits through the same read path.
+  async writeCuratedMemory(stratum: Stratum, text: string): Promise<void> {
+    const mem = this.memoryFiles.find((m) => m.relPath === "MEMORY.md");
+    if (!mem) throw new Error("no curated memory file");
+    const heading: Record<Stratum, string> = {
+      identity: "Identity",
+      patterns: "Patterns",
+      focus: "Focus",
+    };
+    const others = (["Identity", "Patterns", "Focus"] as const)
+      .filter((h) => h !== heading[stratum])
+      .join("|");
+    const section = new RegExp(
+      `## ${heading[stratum]}\\n[\\s\\S]*?(?=\\n## (?:${others})\\n|\\s*$)`,
+    );
+    const block = `## ${heading[stratum]}\n${text.trim()}`;
+    mem.body = section.test(mem.body)
+      ? mem.body.replace(section, block)
+      : `${mem.body.replace(/\s*$/, "")}\n\n${block}\n`;
+    mem.sizeBytes = new TextEncoder().encode(mem.body).length;
   }
 
   // Salience surface (M6.2, #293). Seeds one live, one dormant, one pinned, and

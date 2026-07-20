@@ -60,6 +60,7 @@ import type {
   MemoryFlushedEvent,
   Mode,
   Safety,
+  Stratum,
   PermissionCell,
   PermissionMatrixView,
 } from "../bindings";
@@ -256,9 +257,15 @@ export interface FfIpc {
   /** Cross-session search (#710): BM25-ranked hits across every session. */
   searchMessages(query: string, limit?: number): Promise<SearchHit[]>;
 
-  // Memory (RFC 0006, M5.1e — frozen read-only surface for the Settings memory
-  // pane, Issue #131). These three commands have real Rust impls + ts-rs bindings.
-  // Writes, the enable/disable toggle, and embeddings are deliberately out of scope.
+  // Memory (RFC 0006, M5.1e — read surface for the Settings memory pane, Issue
+  // #131). These read commands have real Rust impls + ts-rs bindings.
+  //
+  // CONTRACT CHANGE (#868, curated-stratum edit): `writeCuratedMemory` is the
+  // first write on this surface. It rewrites a whole curated stratum
+  // (Identity/Patterns/Focus) via the backend `write_curated_memory` command
+  // (#1028) — the sole atomic curated-file writer. The daily journal, non-curated
+  // files, the enable/disable toggle, and embeddings remain out of scope.
+  // @backend-owner (@tonytan4ever) — please review this contract addition.
   //
   // CONTRACT NOTE: there is intentionally NO `searchMemory` here. Host-side memory
   // search is deferred to the HybridIndex work (#166) so we don't freeze a
@@ -271,6 +278,12 @@ export interface FfIpc {
   readMemoryFile(relPath: string): Promise<string>;
   /** Store summary (file/byte counts, root, enabled flag) for the pane header. */
   memoryOverview(): Promise<MemoryOverview>;
+  /** Replace one curated stratum's body (Identity/Patterns/Focus) in `MEMORY.md`.
+   *  Whole-section replace — `text` is the new body under the `## Stratum` heading.
+   *  Persists via the backend `write_curated_memory` command (not a direct FE
+   *  write); callers should reload the memory view afterward. Journal and
+   *  non-curated files are not writable through this surface. */
+  writeCuratedMemory(stratum: Stratum, text: string): Promise<void>;
   // Salience surface (RFC 0007 M6.2, #293). Per-chunk weight/dormant + reset/pin.
   // `weight`/`dormant` are computed authoritatively by the backend; the FE never
   // re-derives the dormancy threshold. Decay/dormancy/pin never edit Markdown —
@@ -722,6 +735,8 @@ class TauriIpc implements FfIpc {
   readMemoryFile = (relPath: string) =>
     this.invoke<string>("read_memory_file", { relPath });
   memoryOverview = () => this.invoke<MemoryOverview>("memory_overview");
+  writeCuratedMemory = (stratum: Stratum, text: string) =>
+    this.invoke<void>("write_curated_memory", { stratum, text });
   listMemoryChunks = () => this.invoke<MemoryChunkStat[]>("list_memory_chunks");
   resetMemoryChunk = (chunkKey: string) =>
     this.invoke<void>("reset_memory_chunk", { chunkKey });

@@ -1,6 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
+  Check,
   ChevronLeft,
+  Pencil,
   Pin,
   RotateCcw,
   Search,
@@ -22,6 +24,7 @@ import {
 } from "@/components/ui/tooltip";
 import { useSettingsStore } from "@/store/settings";
 import { useMemoryStore } from "@/store/memory";
+import { MarkdownEditor } from "@/components/ui/markdown-editor";
 import type { MemoryChunkStat } from "@/bindings/MemoryChunkStat";
 import {
   MEMORY_CATEGORY_META,
@@ -249,6 +252,13 @@ export function MemorySection() {
   const readingHeadingRef = useRef<HTMLHeadingElement>(null);
   const activeTriggerRef = useRef<HTMLButtonElement>(null);
 
+  // Curated-stratum editing (#868): WYSIWYG edit of the reading-view body via the
+  // merged <MarkdownEditor>. `draft` non-null means edit mode is active.
+  const [draft, setDraft] = useState<string | null>(null);
+  const saveCuratedStratum = useMemoryStore((s) => s.saveCuratedStratum);
+  const savingStratum = useMemoryStore((s) => s.savingStratum);
+  const saveError = useMemoryStore((s) => s.saveError);
+
   useEffect(() => {
     void load();
   }, [load]);
@@ -330,19 +340,68 @@ export function MemorySection() {
     const meta = MEMORY_CATEGORY_META.find((m) => m.id === reading);
     const body = categories[reading];
     const hidden = query.trim() !== "" && !categoryMatches(body, query);
+    const editing = draft !== null;
+    const saving = savingStratum === reading;
+    const dirty = editing && draft !== body;
+    const onCancel = () => {
+      setDraft(null);
+      useMemoryStore.setState({ saveError: null });
+    };
+    const onSave = async () => {
+      if (draft === null) return;
+      const ok = await saveCuratedStratum(reading, draft);
+      if (ok) setDraft(null);
+    };
     return (
       <div className="space-y-3">
-        <button
-          type="button"
-          onClick={() => {
-            setReading(null);
-            requestAnimationFrame(() => activeTriggerRef.current?.focus());
-          }}
-          className="flex items-center gap-1 text-[12px] font-medium text-muted-foreground transition-colors hover:text-foreground"
-        >
-          <ChevronLeft className="size-3.5" />
-          Back
-        </button>
+        <div className="flex items-center justify-between gap-2">
+          <button
+            type="button"
+            onClick={() => {
+              if (editing) onCancel();
+              setReading(null);
+              requestAnimationFrame(() => activeTriggerRef.current?.focus());
+            }}
+            className="flex items-center gap-1 text-[12px] font-medium text-muted-foreground transition-colors hover:text-foreground"
+          >
+            <ChevronLeft className="size-3.5" />
+            Back
+          </button>
+          {editing ? (
+            <div className="flex items-center gap-1.5">
+              <Button
+                size="xs"
+                variant="ghost"
+                onClick={onCancel}
+                disabled={saving}
+              >
+                <X className="size-3.5" />
+                Cancel
+              </Button>
+              <Button
+                size="xs"
+                onClick={() => void onSave()}
+                disabled={saving || !dirty}
+              >
+                <Check className="size-3.5" />
+                {saving ? "Saving…" : "Save"}
+              </Button>
+            </div>
+          ) : (
+            <Button
+              size="xs"
+              variant="ghost"
+              onClick={() => {
+                useMemoryStore.setState({ saveError: null });
+                setDraft(body);
+              }}
+              aria-label={`Edit ${meta?.label}`}
+            >
+              <Pencil className="size-3.5" />
+              Edit
+            </Button>
+          )}
+        </div>
         <div>
           <h2
             ref={readingHeadingRef}
@@ -355,15 +414,31 @@ export function MemorySection() {
             {meta?.subtitle}
           </p>
         </div>
-        <div className="whitespace-pre-wrap text-[13px] leading-relaxed text-foreground/90">
-          {body === "" ? (
-            <span className="text-muted-foreground/70">No entries yet</span>
-          ) : hidden ? (
-            <span className="text-muted-foreground/70">No match</span>
-          ) : (
-            body
-          )}
-        </div>
+        {saveError && (
+          <p
+            role="alert"
+            className="rounded-md border border-destructive/30 bg-destructive/10 px-2.5 py-1.5 text-[12px] text-destructive"
+          >
+            Couldn’t save: {saveError}
+          </p>
+        )}
+        {editing ? (
+          <MarkdownEditor
+            value={draft}
+            onChange={setDraft}
+            placeholder="Write this stratum in Markdown…"
+          />
+        ) : (
+          <div className="whitespace-pre-wrap text-[13px] leading-relaxed text-foreground/90">
+            {body === "" ? (
+              <span className="text-muted-foreground/70">No entries yet</span>
+            ) : hidden ? (
+              <span className="text-muted-foreground/70">No match</span>
+            ) : (
+              body
+            )}
+          </div>
+        )}
       </div>
     );
   }

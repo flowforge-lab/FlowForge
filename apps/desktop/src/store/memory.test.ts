@@ -17,6 +17,8 @@ function reset() {
     journalBodies: {},
     chunks: [],
     chunkBusy: {},
+    savingStratum: null,
+    saveError: null,
     query: "",
     loading: false,
     error: null,
@@ -171,5 +173,45 @@ describe("memory store (SET.8, #131)", () => {
     useMemoryStore.setState({ chunkBusy: { [key]: true } });
     await useMemoryStore.getState().setPinned(key, true);
     expect(spy).not.toHaveBeenCalled();
+  });
+
+  it("saveCuratedStratum writes via IPC then reloads with the new body (#868)", async () => {
+    await useMemoryStore.getState().load();
+    const spy = vi.spyOn(ipc, "writeCuratedMemory");
+
+    const ok = await useMemoryStore
+      .getState()
+      .saveCuratedStratum("focus", "Brand new focus body");
+
+    expect(ok).toBe(true);
+    expect(spy).toHaveBeenCalledWith("focus", "Brand new focus body");
+    const s = useMemoryStore.getState();
+    // Reloaded body reflects the write (mock mutates the fixture MEMORY.md).
+    expect(parseCategories(s.curatedBody).focus).toContain(
+      "Brand new focus body",
+    );
+    // Other strata are untouched by a whole-stratum replace.
+    expect(parseCategories(s.curatedBody).identity).not.toBe("");
+    expect(s.savingStratum).toBeNull();
+    expect(s.saveError).toBeNull();
+  });
+
+  it("saveCuratedStratum surfaces a write error and does not reload", async () => {
+    await useMemoryStore.getState().load();
+    const before = useMemoryStore.getState().curatedBody;
+    vi.spyOn(ipc, "writeCuratedMemory").mockRejectedValue(
+      new Error("disk full"),
+    );
+
+    const ok = await useMemoryStore
+      .getState()
+      .saveCuratedStratum("identity", "nope");
+
+    expect(ok).toBe(false);
+    const s = useMemoryStore.getState();
+    expect(s.saveError).toBe("disk full");
+    expect(s.savingStratum).toBeNull();
+    // Body unchanged — a failed write must not mutate the pane's view.
+    expect(s.curatedBody).toBe(before);
   });
 });

@@ -54,6 +54,8 @@ function seed(flushCount: number, lastFlushWrites = 0) {
     journalBodies: {},
     chunks: [],
     chunkBusy: {},
+    savingStratum: null,
+    saveError: null,
     query: "",
     loading: false,
     error: null,
@@ -319,6 +321,67 @@ describe("MemorySection — category tabs + reading view (#906)", () => {
     expect(container.textContent).toContain("Journal");
     expect(container.textContent).toContain("Files");
     expect(container.textContent).toContain("Salience");
+  });
+
+  // --- Curated-stratum editing via <MarkdownEditor> (#868) ---
+  function openReadingView() {
+    render(<MemorySection />);
+    click(
+      [...container.querySelectorAll("button")].find(
+        (b) => b.textContent === "See more",
+      ),
+    );
+  }
+  const btn = (text: string) =>
+    [...container.querySelectorAll("button")].find((b) =>
+      b.textContent?.includes(text),
+    );
+
+  it("reading view shows an Edit affordance; entering edit mode swaps to Save/Cancel", () => {
+    openReadingView();
+    expect(btn("Edit")).toBeTruthy();
+    expect(btn("Save")).toBeUndefined();
+
+    click(btn("Edit"));
+    expect(btn("Save")).toBeTruthy();
+    expect(btn("Cancel")).toBeTruthy();
+    // Edit affordance is gone while editing.
+    expect(
+      [...container.querySelectorAll("button")].find(
+        (b) => b.textContent?.trim() === "Edit",
+      ),
+    ).toBeUndefined();
+  });
+
+  it("Save starts disabled — a fresh draft equals the saved body", () => {
+    openReadingView();
+    click(btn("Edit"));
+    // draft === body on entry, so there's nothing to persist yet. The
+    // dirty→save round-trip (onChange → writeCuratedMemory → reload) is covered
+    // by store/memory.test.ts; the editor's onChange wiring by
+    // markdown-editor.test.tsx.
+    expect((btn("Save") as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it("Cancel exits edit mode without persisting", () => {
+    const spy = vi
+      .spyOn(useMemoryStore.getState(), "saveCuratedStratum")
+      .mockResolvedValue(true);
+    openReadingView();
+    click(btn("Edit"));
+    click(btn("Cancel"));
+    expect(btn("Save")).toBeUndefined();
+    expect(btn("Edit")).toBeTruthy();
+    expect(spy).not.toHaveBeenCalled();
+  });
+
+  it("surfaces a save error inline in the reading view", () => {
+    openReadingView();
+    click(btn("Edit"));
+    act(() => useMemoryStore.setState({ saveError: "disk full" }));
+    expect(container.querySelector('[role="alert"]')?.textContent).toContain(
+      "disk full",
+    );
   });
 
   it("auto-selects and badges the tab matching a search query", () => {
