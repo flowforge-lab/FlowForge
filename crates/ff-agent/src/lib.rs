@@ -39,9 +39,9 @@ pub use compaction_abstractive::{
 };
 pub use compaction_cache::CompactionCache;
 pub use compaction_extractive::{
-    classify, proxy_tokens, ColdCompaction, CompactionSavings, CompressOutcome, ContentKind,
-    ExtractiveCompactor, GradedBands, ReversibleCache, COMPACTION_MARKER_PREFIX,
-    MAX_COMPACTION_LEVEL,
+    classify, digest_block, proxy_tokens, ColdCompaction, CompactionSavings, CompressOutcome,
+    ContentKind, DigestResult, ExtractiveCompactor, GradedBands, ReversibleCache,
+    COMPACTION_MARKER_PREFIX, DIGEST_LEVEL, MAX_COMPACTION_LEVEL,
 };
 pub use goal_loop::{drive_goal, GateDecision, GoalIteration, IterationOutcome, LoopStop};
 pub use message_salience::MessageSalience;
@@ -190,6 +190,39 @@ const KEEP_RECENT_VERBATIM: usize = 6;
 /// (RFC 0016 M7.1b).
 const EXTRACTIVE_COMPACT_AT_FRACTION: f64 = 0.75;
 
+/// Default token budget for the Near layer -- the verbatim recent tail of the
+/// layered context (#1045). Older messages fold into the Mid layer once the
+/// tail outgrows this. Overridable per session via
+/// [`ToolContext::near_budget_tokens`]; always capped so Near + the Mid
+/// ceiling fit the wire target.
+pub const DEFAULT_NEAR_BUDGET_TOKENS: u64 = 24_000;
+
+/// Ceiling for the Mid layer (the folded cold prefix) in tokens (#1045). The
+/// graded fold has a nonzero per-message floor, so a long enough transcript
+/// outgrows any ceiling -- when even `MAX_COMPACTION_LEVEL` cannot hold this,
+/// the Mid layer collapses into a single timeline digest ([`digest_block`]).
+pub const DEFAULT_MID_CEILING_TOKENS: u64 = 8_000;
+
+/// Fold hysteresis (#1045): a fold *tick* fires when the verbatim tail exceeds
+/// `near_budget x HIGH`, and folds down to `near_budget x LOW`. The gap means
+/// a fold runs once per several turns instead of every turn, and between ticks
+/// the wire prefix is byte-identical (provider cache HIT).
+///
+/// The "once per several turns / byte-stable prefix" guarantee holds only when
+/// a cross-turn [`CompactionCache`] is wired ([`ToolContext::compaction_cache`],
+/// desktop today): the frozen prefix is seeded and written through it. Without a
+/// cache (CLI, sub-agents) each turn restarts at `boundary = 0` and re-folds
+/// from scratch -- correct output, just no cross-turn cache reuse.
+const NEAR_FOLD_HIGH: f64 = 1.25;
+const NEAR_FOLD_LOW: f64 = 0.75;
+
+/// Floor for the effective Near budget in tokens (#1045). A `0` (or tiny) knob
+/// -- e.g. `FF_NEAR_BUDGET=0` or a mis-set connection field -- would make
+/// `fold_due` true on every turn, folding each turn and busting exactly the
+/// prompt cache the hysteresis exists to protect. Clamped in the BE seam
+/// (`run_turn` and `AppState::near_budget`) so env/config cannot bypass it.
+pub const MIN_NEAR_BUDGET_TOKENS: u64 = 512;
+
 /// Tool results are appended verbatim to the session history and replayed on the
 /// next request, so one oversized result (a big file read, a long command dump) can
 /// dominate the context budget on its own. Cap what is *persisted to history* at
@@ -300,6 +333,11 @@ pub enum AgentEvent {
         /// cold-tail summary (RFC 0016 M7.0).
         #[serde(skip_serializing_if = "Option::is_none")]
         tier2_fires: Option<u32>,
+        /// #1045: how many `compaction_retrieve` calls the model made this turn.
+        /// The recall cost of the layered fold -- a rising rate means the Near
+        /// budget or Mid ceiling is folding context the model still needs.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        retrieve_calls: Option<u32>,
         /// Prefix cache hit tokens across all iterations this turn (#766).
         /// Populated from the provider's usage response; 0 when not reported.
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -480,6 +518,12 @@ pub struct ToolContext<'a> {
     /// update, eliminating redundant summarizer calls across turns. `None` =
     /// no cross-turn caching (legacy / CLI / sub-agents).
     pub compaction_cache: Option<&'a CompactionCache>,
+    /// Near-layer verbatim-tail budget in tokens (#1045). The layered-context
+    /// pass keeps the most recent messages verbatim up to roughly this many
+    /// tokens and folds older ones into the Mid layer. `None` = use
+    /// [`DEFAULT_NEAR_BUDGET_TOKENS`] (capped to the wire target). Host seam:
+    /// desktop reads the connection field / `FF_NEAR_BUDGET` env.
+    pub near_budget_tokens: Option<u64>,
 }
 
 impl<'a> ToolContext<'a> {
@@ -506,6 +550,7 @@ impl<'a> ToolContext<'a> {
             compaction_model: None,
             compaction_budget: None,
             compaction_cache: None,
+            near_budget_tokens: None,
         }
     }
 }
@@ -716,6 +761,7 @@ fn context_breakdown(
     tool_schemas: &[serde_json::Value],
     messages: &[Message],
     wire_tokens: u32,
+    mid_near: (Option<u32>, Option<u32>),
 ) -> ContextBreakdown {
     // NOTE: summing two independent count_tokens calls may differ from
     // count_tokens(full()) by ±1 token at the split boundary (the tokenizer
@@ -744,6 +790,8 @@ fn context_breakdown(
         verbatim_tokens,
         wire_tokens,
         message_count: messages.len() as u32,
+        mid_tokens: mid_near.0,
+        near_tokens: mid_near.1,
     }
 }
 
@@ -1069,6 +1117,13 @@ pub async fn run_turn(
     let mut tier2_ms: Option<u32> = None;
     let mut tier1_fires: u32 = 0;
     let mut tier2_fires: u32 = 0;
+    // #1045: the Mid/Near split of the last layered wire actually sent, captured
+    // at send time so the Done breakdown reports the wire that went out (not a
+    // post-turn recompute off the verbatim store). (None, Some) = no fold yet
+    // (all Near); (Some, Some) after the first fold.
+    let mut wire_split: (Option<u32>, Option<u32>) = (None, None);
+    // #1045: count of `compaction_retrieve` dispatches this turn (recall cost).
+    let mut retrieve_calls: u32 = 0;
     // Prefix cache observability (#766): accumulate provider-reported cache
     // hit/miss tokens across all iterations this turn.
     let mut cache_hit_tokens: u32 = 0;
@@ -1113,8 +1168,6 @@ pub async fn run_turn(
             }
             ingest.messages
         };
-        let pressure = estimator.assess(&history, model);
-
         let mut messages = Vec::new();
         if let Some(system) = system_prompt {
             // Transient: the system prompt is injected into the request only, never
@@ -1142,115 +1195,204 @@ pub async fn run_turn(
                 });
             }
         }
-        // Cold-prefix extractive compaction (RFC 0016 M7.1b, #933 A.2 frozen
-        // boundary): once over the budget fraction, compact the cold prefix into a
-        // reversible, marker-tagged form *for this request only*. The store keeps
-        // the full verbatim transcript -- this is a deterministic pre-send wire
-        // transform. The frozen-boundary optimization reuses the compacted prefix
-        // from the previous iteration: only messages that *newly* became cold
-        // (shifted out of the keep-recent window) are compressed, keeping the
-        // prefix bytes stable for the provider's KV cache.
-        let wire = if pressure.is_over(EXTRACTIVE_COMPACT_AT_FRACTION) {
+        // Layered context (#1045, supersedes the pressure-gated tier-1 pass): the
+        // wire is Mid (the folded cold prefix, held under a ceiling) + Near (the
+        // verbatim recent tail, sized by a token budget). A fold *tick* fires only
+        // when the Near tail outgrows its high-water mark (or the projected wire
+        // exceeds the target); between ticks the frozen Mid prefix is reused
+        // byte-identically and the tail rides verbatim, so the provider's prefix
+        // cache stays hot. Store semantics are unchanged: request-only transform,
+        // full transcript persisted, originals retrievable via
+        // `compaction_retrieve` (RFC 0016 M7.1b, #933 A.2 frozen boundary).
+        let n = history.len();
+        // #989 target-seeking: the wire-token target T = budget x 0.75 (#999).
+        let target_tokens =
+            ((estimator.budget_tokens as f64) * EXTRACTIVE_COMPACT_AT_FRACTION) as u64;
+        // Effective Near budget: the knob (or default), capped so Near plus the
+        // Mid ceiling fit under the wire target -- proportional for tiny
+        // (test-sized) budgets so the layered pass engages like the legacy one.
+        let near_budget = tools
+            .near_budget_tokens
+            .unwrap_or(DEFAULT_NEAR_BUDGET_TOKENS)
+            // Floor the knob before the cap so a 0/tiny value (env typo, bad
+            // config) cannot degenerate into a fold-every-turn cache-buster
+            // (#1045 finding 3). The cap below still scales Near down
+            // proportionally for genuinely small budgets.
+            .max(MIN_NEAR_BUDGET_TOKENS)
+            .min(
+                target_tokens
+                    .saturating_sub(DEFAULT_MID_CEILING_TOKENS)
+                    .max(target_tokens / 2),
+            );
+        let mid_ceiling = DEFAULT_MID_CEILING_TOKENS.min(target_tokens / 2).max(1);
+        // Drop a stale cross-turn prefix (session rewound / store replaced).
+        if let Some((boundary, _, cached_count, _)) = last_tier1.as_ref() {
+            if *boundary > n || *cached_count > message_count {
+                last_tier1 = None;
+            }
+        }
+        let frozen_boundary = last_tier1.as_ref().map_or(0, |(b, _, _, _)| *b);
+        let near_tokens_est = estimator
+            .assess(&history[frozen_boundary..], model)
+            .estimated_tokens;
+        let prefix_tokens_est = last_tier1.as_ref().map_or(0, |(_, p, _, _)| {
+            estimator.assess(p, model).estimated_tokens
+        });
+        let projected_wire = prefix_tokens_est + near_tokens_est;
+        // The second arm is the safety net for an oversized Near knob: the
+        // projected send (frozen prefix + verbatim tail) must never exceed the
+        // wire target. Deliberately NOT raw full-history pressure -- history
+        // keeps growing after folds, which would tick every turn.
+        let fold_due = (near_tokens_est as f64) > (near_budget as f64) * NEAR_FOLD_HIGH
+            || projected_wire > target_tokens;
+
+        // Advance the fold boundary only on a due tick: shed the oldest Near
+        // messages until the tail drops to the low-water mark (hysteresis), then
+        // extend to the next user message so a turn is never split, capped to
+        // keep the recent floor verbatim. Monotone -- never moves backward.
+        let mut new_cold_end = frozen_boundary;
+        if fold_due {
+            let cap = n.saturating_sub(KEEP_RECENT_VERBATIM);
+            let low_water = ((near_budget as f64) * NEAR_FOLD_LOW) as u64;
+            let mut tail = near_tokens_est;
+            while new_cold_end < cap && tail > low_water {
+                let t = estimator
+                    .assess(std::slice::from_ref(&history[new_cold_end]), model)
+                    .estimated_tokens;
+                tail = tail.saturating_sub(t);
+                new_cold_end += 1;
+            }
+            while new_cold_end < cap && history[new_cold_end].role != Role::User {
+                new_cold_end += 1;
+            }
+        }
+        // A due tick with nothing to fold and a projected wire already under
+        // target is a no-op: fall through to the byte-stable reuse path instead
+        // of burning a recompute.
+        let do_fold = fold_due
+            && new_cold_end > 0
+            && (new_cold_end > frozen_boundary || projected_wire > target_tokens);
+
+        let wire = if do_fold {
             tier1_fires += 1;
             // #933 / RFC 0022 Step 2b: value-aware band selection. Content-only
             // salience (role, size) keeps important older messages sharp and folds
-            // low-value bulk harder — cache-stable because the score is a pure
-            // function of the message, so a given message resolves to the same band
-            // every turn (the frozen-boundary invariant).
+            // low-value bulk harder -- cache-stable because the score is a pure
+            // function of the message (the frozen-boundary invariant).
             let scorer = MessageSalience::default();
-            let n = history.len();
-            let new_cold_end = n.saturating_sub(KEEP_RECENT_VERBATIM);
-            // #989 target-seeking: the wire-token target T = budget × 0.75 (#999).
-            // A full pass deepens the grading level until the estimated wire is ≤ T
-            // (or the ladder tops out), so a single mechanical pass — no LLM — holds
-            // the send under target. `estimator.budget_tokens` is already T's budget.
-            let target_tokens =
-                ((estimator.budget_tokens as f64) * EXTRACTIVE_COMPACT_AT_FRACTION) as u64;
+            let in_digest_mode =
+                matches!(last_tier1.as_ref(), Some((_, _, _, l)) if *l == DIGEST_LEVEL);
 
-            // Full deepening pass over the whole cold prefix at `level`. Returns the
-            // compacted messages, the estimated wire tokens, and the originals to
-            // persist — but does NOT persist here: only the *chosen* level's wire is
-            // sent, so persisting every intermediate level's originals (#1008 review)
-            // would write retrieve-keys that appear in no request. The caller
-            // persists the winner's originals once, below.
-            let full_pass_at = |level: usize| {
-                let graded = GradedBands::graded_v1(level);
-                let cold = graded.compact_graded_range(&history, 0, new_cold_end, Some(&scorer));
-                let est = estimator.assess(&cold.messages, model).estimated_tokens;
-                (cold.messages, est, cold.originals)
-            };
-
-            // Reuse the frozen prefix at its own level only when that still holds the
-            // wire ≤ T; grading by absolute index means the fresh slice matches what a
-            // full pass at the same level would produce, preserving the cache.
-            let reuse = match last_tier1.as_ref() {
-                Some((boundary, cached_prefix, cached_count, cached_level))
-                    if *boundary <= new_cold_end && *cached_count <= message_count =>
+            let mut result: Option<Vec<Message>> = None;
+            if !in_digest_mode {
+                // Reuse the frozen prefix at its own level when that still holds
+                // both bounds; grading by absolute index means the fresh slice
+                // matches what a full pass at the same level would produce.
+                if let Some((boundary, cached_prefix, cached_count, cached_level)) =
+                    last_tier1.as_ref()
                 {
-                    let graded = GradedBands::graded_v1(*cached_level);
-                    let fresh_cold = &history[*boundary..new_cold_end];
-                    let fresh = graded.compact_graded_range(
-                        fresh_cold,
-                        *boundary,
-                        new_cold_end,
-                        Some(&scorer),
-                    );
-                    let mut out = Vec::with_capacity(n);
-                    out.extend_from_slice(cached_prefix);
-                    out.extend(fresh.messages);
-                    out.extend_from_slice(&history[new_cold_end..]);
-                    let est = estimator.assess(&out, model).estimated_tokens;
-                    if est <= target_tokens {
-                        // Frozen level still holds the target: persist the fresh
-                        // originals and keep the boundary advancing at this level.
-                        for (mid, key, original) in &fresh.originals {
+                    if *boundary <= new_cold_end && *cached_count <= message_count {
+                        let graded = GradedBands::graded_v1(*cached_level);
+                        let fresh = graded.compact_graded_range(
+                            &history[*boundary..new_cold_end],
+                            *boundary,
+                            new_cold_end,
+                            Some(&scorer),
+                        );
+                        let mut out = Vec::with_capacity(n);
+                        out.extend_from_slice(cached_prefix);
+                        out.extend(fresh.messages);
+                        out.extend_from_slice(&history[new_cold_end..]);
+                        let wire_est = estimator.assess(&out, model).estimated_tokens;
+                        let mid_est = estimator
+                            .assess(&out[..new_cold_end], model)
+                            .estimated_tokens;
+                        if wire_est <= target_tokens && mid_est <= mid_ceiling {
+                            // Frozen level still holds both bounds: persist the
+                            // fresh originals and keep advancing at this level.
+                            for (mid, key, original) in &fresh.originals {
+                                store.put_compaction_original(session_id, mid, key, original);
+                            }
+                            last_tier1 = Some((
+                                new_cold_end,
+                                out[..new_cold_end].to_vec(),
+                                message_count,
+                                *cached_level,
+                            ));
+                            result = Some(out);
+                        }
+                    }
+                }
+                // Full deepening pass: level 0..=MAX until the estimated wire is
+                // <= T *and* the Mid layer fits its ceiling, then freeze that
+                // level. Persists only the chosen level's originals -- the level
+                // actually sent (#1008 review).
+                if result.is_none() {
+                    let full_pass_at = |level: usize| {
+                        let graded = GradedBands::graded_v1(level);
+                        let cold =
+                            graded.compact_graded_range(&history, 0, new_cold_end, Some(&scorer));
+                        let wire_est = estimator.assess(&cold.messages, model).estimated_tokens;
+                        let mid_est = estimator
+                            .assess(&cold.messages[..new_cold_end], model)
+                            .estimated_tokens;
+                        (cold.messages, wire_est, mid_est, cold.originals)
+                    };
+                    let mut level = 0;
+                    let mut chosen = full_pass_at(0);
+                    while (chosen.1 > target_tokens || chosen.2 > mid_ceiling)
+                        && level < MAX_COMPACTION_LEVEL
+                    {
+                        level += 1;
+                        chosen = full_pass_at(level);
+                    }
+                    // Accept when the Mid ceiling holds -- a wire overshoot at MAX
+                    // is Tier-2's job. A Mid overshoot falls through to the digest.
+                    if chosen.2 <= mid_ceiling {
+                        let (messages, _wire_est, _mid_est, originals) = chosen;
+                        for (mid, key, original) in &originals {
                             store.put_compaction_original(session_id, mid, key, original);
                         }
                         last_tier1 = Some((
                             new_cold_end,
-                            out[..new_cold_end].to_vec(),
+                            messages[..new_cold_end].to_vec(),
                             message_count,
-                            *cached_level,
+                            level,
                         ));
-                        Some(out)
-                    } else {
-                        // Cached level no longer holds ≤ T (transcript grew): fall
-                        // through to a full deepening pass below.
-                        None
+                        result = Some(messages);
                     }
-                }
-                _ => None,
-            };
-
-            match reuse {
-                Some(out) => out,
-                None => {
-                    // Deepen level 0..=MAX until the estimated wire is ≤ T, then freeze
-                    // that level. Monotone: each level yields ≤ tokens, so this always
-                    // makes progress and stops at the shallowest level that holds T
-                    // (or MAX, where Tier-2 takes over as the lossy fallback).
-                    let mut chosen = full_pass_at(0);
-                    let mut level = 0;
-                    while chosen.1 > target_tokens && level < MAX_COMPACTION_LEVEL {
-                        level += 1;
-                        chosen = full_pass_at(level);
-                    }
-                    let (messages, _est, originals) = chosen;
-                    // Persist only the chosen level's originals — the level actually
-                    // sent — so `compaction_retrieve` resolves without writing keys
-                    // for intermediate levels that never hit the wire (#1008 review).
-                    for (mid, key, original) in &originals {
-                        store.put_compaction_original(session_id, mid, key, original);
-                    }
-                    last_tier1 = Some((
-                        new_cold_end,
-                        messages[..new_cold_end].to_vec(),
-                        message_count,
-                        level,
-                    ));
-                    messages
                 }
             }
+            match result {
+                Some(out) => out,
+                // Digest mode (#1045): the graded ladder cannot hold the Mid
+                // ceiling (or a previous tick already collapsed -- sticky, since
+                // per-message grading can never re-fit). One synthetic timeline
+                // message replaces the whole cold prefix; its full rendering is
+                // persisted for `compaction_retrieve`.
+                None => match digest_block(&history[..new_cold_end], mid_ceiling as usize) {
+                    Some(d) => {
+                        let (mid, key, original) = &d.original;
+                        store.put_compaction_original(session_id, mid, key, original);
+                        let mut out = Vec::with_capacity(1 + n - new_cold_end);
+                        out.push(d.message);
+                        out.extend_from_slice(&history[new_cold_end..]);
+                        last_tier1 =
+                            Some((new_cold_end, out[..1].to_vec(), message_count, DIGEST_LEVEL));
+                        out
+                    }
+                    None => history.clone(),
+                },
+            }
+        } else if let Some((boundary, cached_prefix, _, _)) = last_tier1.as_ref() {
+            // Non-tick reuse (#1045): frozen Mid prefix + fully verbatim Near
+            // tail. Byte-stable across iterations and turns -- the cache-HIT
+            // path. Must run even at low pressure, or the wire would re-inflate
+            // to the full transcript right after a fold.
+            let mut out = Vec::with_capacity(cached_prefix.len() + (n - *boundary));
+            out.extend_from_slice(cached_prefix);
+            out.extend_from_slice(&history[*boundary..]);
+            out
         } else {
             history.clone()
         };
@@ -1260,6 +1402,36 @@ pub async fn run_turn(
         {
             cache.put_tier1(session_id, *boundary, prefix.clone(), *count, *level);
         }
+
+        // #1045 finding 2: capture the Mid/Near split off the *actual layered
+        // wire* at send time (not the post-turn verbatim store, which describes
+        // the next turn and skips ingest compaction). Mid = the frozen prefix as
+        // sent, Near = the verbatim tail, so the two reconcile with the message
+        // portion of this wire. `prefix.len()` is `boundary` for the graded path
+        // and `1` for a digest, so this is correct for both. If Tier-2 fires
+        // below it further condenses the Mid layer -- `tier2_fires > 0` signals
+        // that the finally-sent Mid is smaller than reported here.
+        let mid_len = last_tier1.as_ref().map_or(0, |(_, p, _, _)| p.len());
+        wire_split = if mid_len == 0 {
+            (
+                None,
+                Some(
+                    u32::try_from(estimator.assess(&wire, model).estimated_tokens)
+                        .unwrap_or(u32::MAX),
+                ),
+            )
+        } else {
+            (
+                Some(
+                    u32::try_from(estimator.assess(&wire[..mid_len], model).estimated_tokens)
+                        .unwrap_or(u32::MAX),
+                ),
+                Some(
+                    u32::try_from(estimator.assess(&wire[mid_len..], model).estimated_tokens)
+                        .unwrap_or(u32::MAX),
+                ),
+            )
+        };
 
         // Tier-2 abstractive cold-tail summary (RFC 0016 M7.0): the fallback when
         // the mechanical, free Tier-1 pass above cannot relieve enough pressure.
@@ -1805,6 +1977,7 @@ pub async fn run_turn(
                 tier2_ms,
                 tier1_fires: Some(tier1_fires),
                 tier2_fires: Some(tier2_fires),
+                retrieve_calls: Some(retrieve_calls),
                 cache_hit_tokens: Some(cache_hit_tokens),
                 cache_miss_tokens: Some(cache_miss_tokens),
                 breakdown: Some(context_breakdown(
@@ -1812,6 +1985,7 @@ pub async fn run_turn(
                     &tool_schemas,
                     &final_msgs,
                     prefill_estimates.last().copied().unwrap_or(0),
+                    wire_split,
                 )),
                 usage: Some(TurnUsage {
                     input_tokens: input_tokens_total,
@@ -2174,6 +2348,10 @@ pub async fn run_turn(
                 observer_intent: outcome.observer_intent.take(),
             });
 
+            // #1045 telemetry: the model pulled a folded original back.
+            if call.name == COMPACTION_RETRIEVE_TOOL {
+                retrieve_calls += 1;
+            }
             // Count identical calls to catch a no-progress stall (#244 R2).
             let count = call_counts
                 .entry((call.name.clone(), call.arguments.clone()))
@@ -2246,6 +2424,7 @@ pub async fn run_turn(
         tier2_ms,
         tier1_fires: Some(tier1_fires),
         tier2_fires: Some(tier2_fires),
+        retrieve_calls: Some(retrieve_calls),
         cache_hit_tokens: Some(cache_hit_tokens),
         cache_miss_tokens: Some(cache_miss_tokens),
         breakdown: Some(context_breakdown(
@@ -2253,6 +2432,7 @@ pub async fn run_turn(
             &tool_schemas,
             &final_msgs,
             wire_tokens,
+            wire_split,
         )),
         usage: Some(TurnUsage {
             input_tokens: input_tokens_total,
@@ -2332,6 +2512,7 @@ async fn run_subagent(
         compaction_model: parent.compaction_model.clone(),
         compaction_budget: parent.compaction_budget,
         compaction_cache: None, // Sub-agents are ephemeral; no cross-turn caching.
+        near_budget_tokens: parent.near_budget_tokens,
     };
 
     // Child events are swallowed: the parent receives only the summary, never the

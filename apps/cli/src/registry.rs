@@ -188,6 +188,7 @@ fn config_to_connection(config: ProviderConfig) -> ProviderConnection {
         access_key_id: None,
         compaction_model: None,
         compaction_budget: None,
+        near_budget: None,
     }
 }
 

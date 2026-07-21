@@ -82,6 +82,7 @@ fn json_mode_golden_lines() {
             tier2_ms: None,
             tier1_fires: None,
             tier2_fires: None,
+            retrieve_calls: None,
             cache_hit_tokens: None,
             cache_miss_tokens: None,
             breakdown: None,

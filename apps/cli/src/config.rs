@@ -372,6 +372,7 @@ fn new_default_connection(kind: ProviderKind, id: &str) -> ProviderConnection {
         access_key_id: None,
         compaction_model: None,
         compaction_budget: None,
+        near_budget: None,
     }
 }
 

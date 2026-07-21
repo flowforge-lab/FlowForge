@@ -105,4 +105,10 @@ compactionModel?: string,
  * overrides the default `model_window * 0.8`. Maps to the UI's
  * "Summarization threshold" slider. `None` = use the computed default.
  */
-compactionBudget?: number, };
+compactionBudget?: number, 
+/**
+ * Near-layer verbatim-tail budget in tokens (#1045). The layered-context
+ * pass keeps roughly this many tokens of recent messages verbatim and
+ * folds older ones into the Mid layer. `None` = built-in default.
+ */
+nearBudget?: number, };

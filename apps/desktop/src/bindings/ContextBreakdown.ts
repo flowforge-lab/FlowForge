@@ -35,4 +35,20 @@ wireTokens: number,
 /**
  * Number of messages in the verbatim transcript.
  */
-messageCount: number, };
+messageCount: number, 
+/**
+ * Estimated tokens of the **Mid** layer of the wire (#1045): the folded
+ * timeline covering everything older than the verbatim tail. `None` (not
+ * `0`) when no fold has happened yet -- the whole transcript is still Near,
+ * and the popover should render "no fold yet", distinct from "folded to
+ * nothing".
+ */
+midTokens?: number, 
+/**
+ * Estimated tokens of the **Near** layer of the wire (#1045): the
+ * token-budgeted verbatim tail actually sent. Measured on the wire at send
+ * time, so `mid_tokens + near_tokens` equals the message portion of the
+ * wire (`wire_tokens` minus the separate system/tool buckets). `None` when
+ * not assessed.
+ */
+nearTokens?: number, };

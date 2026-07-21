@@ -148,6 +148,22 @@ pub struct ContextBreakdown {
     pub wire_tokens: u32,
     /// Number of messages in the verbatim transcript.
     pub message_count: u32,
+    /// Estimated tokens of the **Mid** layer of the wire (#1045): the folded
+    /// timeline covering everything older than the verbatim tail. `None` (not
+    /// `0`) when no fold has happened yet -- the whole transcript is still Near,
+    /// and the popover should render "no fold yet", distinct from "folded to
+    /// nothing".
+    #[serde(default)]
+    #[ts(optional)]
+    pub mid_tokens: Option<u32>,
+    /// Estimated tokens of the **Near** layer of the wire (#1045): the
+    /// token-budgeted verbatim tail actually sent. Measured on the wire at send
+    /// time, so `mid_tokens + near_tokens` equals the message portion of the
+    /// wire (`wire_tokens` minus the separate system/tool buckets). `None` when
+    /// not assessed.
+    #[serde(default)]
+    #[ts(optional)]
+    pub near_tokens: Option<u32>,
 }
 
 /// Provider-reported token usage for a turn (#931), summed across the turn's
@@ -233,8 +249,11 @@ pub struct TurnStatsEvent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub prefill_estimates: Option<Vec<u32>>,
-    /// F1b (#441): iterations that engaged the Tier-1 extractive compaction pass.
-    /// Omitted by emitters that do not compute F1b telemetry.
+    /// F1b (#441) / #1045: number of fold **ticks** this turn -- times the
+    /// layered Tier-1 pass advanced the frozen boundary. With the Near-budget
+    /// hysteresis (#1045) this is `<= 1` for most turns; it is NOT a
+    /// per-iteration "the pass ran" count. Omitted by emitters that do not
+    /// compute F1b telemetry.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub tier1_fires: Option<u32>,
@@ -243,6 +262,11 @@ pub struct TurnStatsEvent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub tier2_fires: Option<u32>,
+    /// #1045: `compaction_retrieve` calls the model made this turn -- the recall
+    /// cost of the layered fold. Omitted by emitters that do not compute it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub retrieve_calls: Option<u32>,
     /// TTFT (end-to-end): milliseconds from the moment the host handed the
     /// request to `run_turn` to the arrival of the first assistant token.
     /// Anchored at `turn_start`, so it *includes* any pre-first-token work the

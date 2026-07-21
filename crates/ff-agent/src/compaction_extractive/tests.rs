@@ -899,3 +899,77 @@ fn scored_range_stable_across_calls_at_a_fixed_level() {
         );
     }
 }
+
+// ---- #1045 digest_block: single-message timeline digest of the Mid layer ----
+
+fn digest_fixture(n: usize) -> Vec<Message> {
+    (0..n)
+        .map(|i| {
+            let role = if i % 2 == 0 {
+                Role::User
+            } else {
+                Role::Assistant
+            };
+            let mut m = msg(role, &format!("topic-{i} {}", "detail words ".repeat(40)));
+            m.id = format!("m{i}");
+            m.session_id = "s1".into();
+            m
+        })
+        .collect()
+}
+
+#[test]
+fn digest_block_collapses_to_one_marked_message_under_cap() {
+    let messages = digest_fixture(12);
+    let d = digest_block(&messages, 10_000).expect("non-empty input digests");
+
+    assert_eq!(
+        d.message.role,
+        Role::User,
+        "position-stable role (like Tier-2)"
+    );
+    assert!(d.message.content.contains(COMPACTION_MARKER_PREFIX));
+    assert!(proxy_tokens(&d.message.content) <= 10_000);
+    // One line per message, newest last, none elided under a roomy cap.
+    for i in 0..12 {
+        assert!(
+            d.message.content.contains(&format!("topic-{i}")),
+            "line for message {i} must survive a roomy cap"
+        );
+    }
+    // The persisted original is the full rendering of every folded message.
+    let (anchor, _key, original) = &d.original;
+    assert_eq!(anchor, "m11", "anchored to the newest folded message");
+    for m in &messages {
+        assert!(
+            original.contains(&m.content),
+            "original keeps full contents"
+        );
+    }
+}
+
+#[test]
+fn digest_block_elides_oldest_lines_to_fit_cap() {
+    let messages = digest_fixture(40);
+    let d = digest_block(&messages, 220).expect("digest fits by eliding");
+
+    assert!(proxy_tokens(&d.message.content) <= 220, "cap enforced");
+    assert!(
+        d.message.content.contains("oldest elided"),
+        "over-cap digest declares the elision"
+    );
+    // Newest survives; oldest goes first.
+    assert!(d.message.content.contains("topic-39"));
+    assert!(!d.message.content.contains("topic-0 "));
+}
+
+#[test]
+fn digest_block_is_deterministic_and_empty_input_is_none() {
+    let messages = digest_fixture(9);
+    let a = digest_block(&messages, 500).unwrap();
+    let b = digest_block(&messages, 500).unwrap();
+    // Byte-stable: the frozen-boundary invariant (#1027) extends to digest mode.
+    assert_eq!(a.message.content, b.message.content);
+    assert_eq!(a.original, b.original);
+    assert!(digest_block(&[], 500).is_none());
+}

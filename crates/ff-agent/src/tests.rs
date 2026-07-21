@@ -351,6 +351,7 @@ async fn plan_mode_hard_blocks_dispatch_of_a_hidden_tool() {
         compaction_model: None,
         compaction_budget: None,
         compaction_cache: None,
+        near_budget_tokens: None,
     };
 
     run_turn(
@@ -549,31 +550,34 @@ async fn cross_turn_cache_seeds_summary_and_invalidate_forces_resummary() {
         };
         store.add_message(&s.id, role, line);
     }
-    let recents = ["r0", "r1", "r2", "r3", "r4", "r5"];
+    // #1045: the 6 kept-recent messages alone exceed the Tier-2 fraction of the
+    // pinned budget, so Tier-2 is reached no matter how hard the layered Tier-1
+    // pass folds the cold prefix (the recent floor is never folded).
+    let recents: Vec<String> = (0..6)
+        .map(|i| format!("r{i} {}", "recent detail words ".repeat(700)))
+        .collect();
     for (i, r) in recents.iter().enumerate() {
         let role = if i % 2 == 0 {
             Role::User
         } else {
             Role::Assistant
         };
-        store.add_message(&s.id, role, (*r).to_string());
+        store.add_message(&s.id, role, r.clone());
     }
     let history = store.get_messages(&s.id);
-    let wire_t1 =
-        ExtractiveCompactor::default().compact_cold_collect(&history, KEEP_RECENT_VERBATIM);
-    let pressure = ProxyTokenEstimator::default().assess(&wire_t1.messages, "mock");
+    let recent_pressure = ProxyTokenEstimator {
+        budget_tokens: 8_000,
+    }
+    .assess(&history[history.len() - KEEP_RECENT_VERBATIM..], "mock");
     assert!(
-        pressure.is_over(0.90),
-        "post-Tier-1 transcript must exceed the Tier-2 fraction: fraction={}",
-        pressure.fraction()
+        recent_pressure.is_over(0.90),
+        "the verbatim recent floor must exceed the Tier-2 fraction: fraction={}",
+        recent_pressure.fraction()
     );
-    // `cold_end` is the wire index the summary would cover (everything before
-    // the kept-recent tail). Required so the seeded summary's boundary matches
-    // the actual cold-tail computation in `run_turn`.
-    let cold_end = wire_t1
-        .messages
-        .len()
-        .saturating_sub(KEEP_RECENT_VERBATIM + 1);
+    // The seeded summary's boundary only needs `boundary <= wire.len()` for the
+    // reuse arm; `1` holds for any post-Tier-1 wire shape (graded keeps length,
+    // the digest fallback collapses the prefix to a single message).
+    let cold_end = 1;
 
     let registry = ToolRegistry::new();
     let root = dir.path().to_path_buf();
@@ -585,9 +589,13 @@ async fn cross_turn_cache_seeds_summary_and_invalidate_forces_resummary() {
 
     let cache = CompactionCache::new();
     let mut tctx = ctx(&registry, &root, &approve);
+    tctx.compaction_budget = Some(8_000);
     tctx.abstractive = AbstractiveConfig {
         enabled: true,
         fire_at_fraction: 0.90,
+        // #1045: the layered Tier-1 digest can collapse the whole cold prefix
+        // into ONE message; Tier-2 must still be able to summarize it.
+        min_cold_messages: 1,
         ..AbstractiveConfig::default()
     };
     tctx.compaction_cache = Some(&cache);
@@ -676,6 +684,7 @@ async fn cross_turn_cache_seeds_summary_and_invalidate_forces_resummary() {
     cache.invalidate(&s.id);
     let before = summarizer_calls.load(Ordering::SeqCst);
     let mut no_cache_tctx = ctx(&registry, &root, &approve);
+    no_cache_tctx.compaction_budget = tctx.compaction_budget;
     no_cache_tctx.abstractive = tctx.abstractive.clone();
     no_cache_tctx.compaction_cache = None;
     run_turn(
@@ -812,21 +821,24 @@ async fn cross_turn_cache_invalidate_all_forces_resummary() {
         };
         store.add_message(&s.id, role, line);
     }
-    for (i, r) in ["r0", "r1", "r2", "r3", "r4", "r5"].iter().enumerate() {
+    // #1045: big kept-recent messages keep the post-Tier-1 wire over the
+    // Tier-2 fraction of the pinned budget (the recent floor is never folded).
+    for i in 0..6 {
         let role = if i % 2 == 0 {
             Role::User
         } else {
             Role::Assistant
         };
-        store.add_message(&s.id, role, (*r).to_string());
+        store.add_message(
+            &s.id,
+            role,
+            format!("r{i} {}", "recent detail words ".repeat(700)),
+        );
     }
     let history = store.get_messages(&s.id);
-    let wire_t1 =
-        ExtractiveCompactor::default().compact_cold_collect(&history, KEEP_RECENT_VERBATIM);
-    let cold_end = wire_t1
-        .messages
-        .len()
-        .saturating_sub(KEEP_RECENT_VERBATIM + 1);
+    // Any `boundary <= wire.len()` allows the reuse arm; `1` holds for both
+    // post-Tier-1 wire shapes (graded keeps length, digest collapses to one).
+    let cold_end = 1;
 
     let registry = ToolRegistry::new();
     let root = dir.path().to_path_buf();
@@ -850,9 +862,13 @@ async fn cross_turn_cache_invalidate_all_forces_resummary() {
     cache.put(&s.id, cold_end, seeded, history.len() as u64);
 
     let mut tctx = ctx(&registry, &root, &approve);
+    tctx.compaction_budget = Some(8_000);
     tctx.abstractive = AbstractiveConfig {
         enabled: true,
         fire_at_fraction: 0.90,
+        // #1045: the layered Tier-1 digest can collapse the whole cold prefix
+        // into ONE message; Tier-2 must still be able to summarize it.
+        min_cold_messages: 1,
         ..AbstractiveConfig::default()
     };
     tctx.compaction_cache = Some(&cache);
@@ -3365,6 +3381,7 @@ async fn subagent_depth_guard_refuses_nested_spawn() {
         compaction_model: None,
         compaction_budget: None,
         compaction_cache: None,
+        near_budget_tokens: None,
     };
 
     run_turn(
@@ -3426,6 +3443,7 @@ async fn subagent_allowlist_blocks_disallowed_tool() {
         compaction_model: None,
         compaction_budget: None,
         compaction_cache: None,
+        near_budget_tokens: None,
     };
 
     run_turn(
@@ -5063,6 +5081,7 @@ async fn retrieve_output_is_not_recompacted_at_ingest() {
     let root = std::env::current_dir().unwrap();
     let approve = AlwaysApprove;
 
+    let retrieves_seen = std::sync::Mutex::new(None);
     run_turn(
         &JsonThenRetrieveThenText {
             calls: AtomicUsize::new(0),
@@ -5075,10 +5094,16 @@ async fn retrieve_output_is_not_recompacted_at_ingest() {
         false,
         ReasoningVisibility::All,
         CancelToken::new(),
-        |_| {},
+        |ev| {
+            if let AgentEvent::Done { retrieve_calls, .. } = ev {
+                *retrieves_seen.lock().unwrap() = retrieve_calls;
+            }
+        },
     )
     .await
     .unwrap();
+    // #1045 observability: the one compaction_retrieve round-trip is counted.
+    assert_eq!(*retrieves_seen.lock().unwrap(), Some(1));
 
     let history = store.get_messages(&s.id);
     let tool_msgs: Vec<_> = history.iter().filter(|m| m.role == Role::Tool).collect();
@@ -5492,6 +5517,8 @@ async fn over_pressure_compacts_wire_but_store_stays_verbatim() {
     let s = store.create_session(None);
 
     // 10 cold messages, each a large JSON blob that compresses decisively.
+    // All Role::User: the graded fold exempts assistant messages, and this test
+    // locks the graded (per-message marker) path, not the digest fallback.
     let mut cold_contents = Vec::new();
     for i in 0..10 {
         let blob = serde_json::to_string(&serde_json::json!({
@@ -5500,12 +5527,7 @@ async fn over_pressure_compacts_wire_but_store_stays_verbatim() {
             "items": (0..60).collect::<Vec<i32>>(),
         }))
         .unwrap();
-        let role = if i % 2 == 0 {
-            Role::User
-        } else {
-            Role::Assistant
-        };
-        store.add_message(&s.id, role, blob.clone());
+        store.add_message(&s.id, Role::User, blob.clone());
         cold_contents.push(blob);
     }
     // 6 small recent turns kept byte-identical on the wire.
@@ -5519,9 +5541,15 @@ async fn over_pressure_compacts_wire_but_store_stays_verbatim() {
         store.add_message(&s.id, role, (*r).to_string());
     }
 
-    // Sanity: we are actually over the extractive threshold.
+    // Sanity: we are actually over the extractive threshold. The budget is
+    // pinned (#1045) so the Mid ceiling (budget-proportional) stays above what
+    // the graded ladder can reach for these compressible blobs -- keeping this
+    // test on the graded (per-message marker) path, not the digest fallback.
     let history = store.get_messages(&s.id);
-    let pressure = ProxyTokenEstimator::default().assess(&history, "mock");
+    let pressure = ProxyTokenEstimator {
+        budget_tokens: 32_000,
+    }
+    .assess(&history, "mock");
     assert!(
         pressure.is_over(EXTRACTIVE_COMPACT_AT_FRACTION),
         "test transcript must exceed the extractive threshold: fraction={}",
@@ -5534,10 +5562,12 @@ async fn over_pressure_compacts_wire_but_store_stays_verbatim() {
     let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
     let provider = RecordingProvider { seen: seen.clone() };
 
+    let mut tctx = ctx(&registry, &root, &approve);
+    tctx.compaction_budget = Some(32_000);
     run_turn(
         &provider,
         &store,
-        &ctx(&registry, &root, &approve),
+        &tctx,
         &s.id,
         "mock",
         None,
@@ -5788,26 +5818,30 @@ async fn tier2_summarizes_cold_prefix_but_store_stays_verbatim() {
         store.add_message(&s.id, role, line.clone());
         cold_contents.push(line);
     }
-    let recents = ["r0", "r1", "r2", "r3", "r4", "r5"];
+    // #1045: the 6 kept-recent messages alone exceed the Tier-2 fraction of
+    // the pinned budget, so Tier-2 engages no matter how hard the layered
+    // Tier-1 pass folds the cold prefix (the recent floor is never folded).
+    let recents: Vec<String> = (0..6)
+        .map(|i| format!("r{i} {}", "recent detail words ".repeat(700)))
+        .collect();
     for (i, r) in recents.iter().enumerate() {
         let role = if i % 2 == 0 {
             Role::User
         } else {
             Role::Assistant
         };
-        store.add_message(&s.id, role, (*r).to_string());
+        store.add_message(&s.id, role, r.clone());
     }
 
-    // Sanity: even after Tier 1 would run, these single-line blobs do not
-    // shrink, so the wire stays over the Tier-2 fraction.
     let history = store.get_messages(&s.id);
-    let wire_t1 =
-        ExtractiveCompactor::default().compact_cold_collect(&history, KEEP_RECENT_VERBATIM);
-    let pressure = ProxyTokenEstimator::default().assess(&wire_t1.messages, "mock");
+    let recent_pressure = ProxyTokenEstimator {
+        budget_tokens: 8_000,
+    }
+    .assess(&history[history.len() - KEEP_RECENT_VERBATIM..], "mock");
     assert!(
-        pressure.is_over(0.90),
-        "post-Tier-1 transcript must exceed the Tier-2 fraction: fraction={}",
-        pressure.fraction()
+        recent_pressure.is_over(0.90),
+        "the verbatim recent floor must exceed the Tier-2 fraction: fraction={}",
+        recent_pressure.fraction()
     );
 
     let registry = ToolRegistry::new();
@@ -5817,12 +5851,15 @@ async fn tier2_summarizes_cold_prefix_but_store_stays_verbatim() {
     let provider = RecordingProvider { seen: seen.clone() };
 
     let mut tctx = ctx(&registry, &root, &approve);
+    tctx.compaction_budget = Some(8_000);
     tctx.abstractive = AbstractiveConfig {
         enabled: true,
         fire_at_fraction: 0.90,
         // This test validates whole-cold-prefix collapse (it predates #972's input
         // cap); disable the cap so the single pass covers all cold messages.
         max_summary_input_tokens: 0,
+        // #1045: the layered Tier-1 digest collapses the prefix to ONE message.
+        min_cold_messages: 1,
         ..AbstractiveConfig::default()
     };
 
@@ -5855,7 +5892,7 @@ async fn tier2_summarizes_cold_prefix_but_store_stays_verbatim() {
     for (i, r) in recents.iter().enumerate() {
         assert_eq!(
             wire[n - recents.len() + i].content.as_deref().unwrap(),
-            *r,
+            r.as_str(),
             "recent message {i} must be verbatim on the wire"
         );
     }
@@ -6090,7 +6127,7 @@ fn context_breakdown_splits_system_tools_and_messages() {
         msg(Role::Assistant, &"z".repeat(16), Some(&"r".repeat(4))),
     ];
 
-    let b = context_breakdown(Some(&system), &tool_schemas, &messages, 42);
+    let b = context_breakdown(Some(&system), &tool_schemas, &messages, 42, (None, None));
 
     // Buckets use the same tokenx-rs estimator as ProxyTokenEstimator::assess.
     assert!(
@@ -6123,11 +6160,440 @@ fn context_breakdown_splits_system_tools_and_messages() {
 
 #[test]
 fn context_breakdown_handles_absent_system_prompt() {
-    let b = context_breakdown(None, &[], &[], 0);
+    let b = context_breakdown(None, &[], &[], 0, (None, None));
     assert_eq!(b.system_tokens, 0);
     assert_eq!(b.tool_tokens, 0);
     assert_eq!(b.tool_specs, 0);
     assert_eq!(b.verbatim_tokens, 0);
     assert_eq!(b.wire_tokens, 0);
     assert_eq!(b.message_count, 0);
+}
+
+// -------------------- #1045 Near/Mid layered context --------------------
+
+#[tokio::test]
+async fn layered_fold_ticks_then_next_turn_reuses_byte_stable_prefix() {
+    // #1045 acceptance: a fold tick freezes the cold prefix; the following turn
+    // (transcript grown only by the assistant reply, well inside the hysteresis
+    // band) must NOT tick again, and must resend the frozen prefix
+    // byte-identically with a fully-verbatim tail -- the provider prompt cache
+    // hits on the whole previous wire.
+    let dir = tempfile::tempdir().unwrap();
+    let store = SessionStore::new();
+    let s = store.create_session(None);
+    // 20 large compressible User blobs (the graded path applies to User
+    // messages), then 6 tiny recent turns.
+    for i in 0..20 {
+        let blob = serde_json::to_string(&serde_json::json!({
+            "idx": i,
+            "summary": "y".repeat(15000),
+            "items": (0..60).collect::<Vec<i32>>(),
+        }))
+        .unwrap();
+        store.add_message(&s.id, Role::User, blob);
+    }
+    for (i, r) in ["r0", "r1", "r2", "r3", "r4", "r5"].iter().enumerate() {
+        let role = if i % 2 == 0 {
+            Role::User
+        } else {
+            Role::Assistant
+        };
+        store.add_message(&s.id, role, (*r).to_string());
+    }
+
+    let registry = ToolRegistry::new();
+    let root = dir.path().to_path_buf();
+    let approve = AlwaysApprove;
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let provider = RecordingProvider { seen: seen.clone() };
+    let cache = CompactionCache::new();
+    let mut tctx = ctx(&registry, &root, &approve);
+    tctx.compaction_budget = Some(32_000);
+    tctx.compaction_cache = Some(&cache);
+
+    let fires1 = std::sync::Mutex::new(None);
+    run_turn(
+        &provider,
+        &store,
+        &tctx,
+        &s.id,
+        "mock",
+        None,
+        false,
+        ReasoningVisibility::All,
+        CancelToken::new(),
+        |ev| {
+            if let AgentEvent::Done { tier1_fires, .. } = ev {
+                *fires1.lock().unwrap() = tier1_fires;
+            }
+        },
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(*fires1.lock().unwrap(), Some(n) if n >= 1),
+        "turn 1 must tick a fold (got {:?})",
+        *fires1.lock().unwrap()
+    );
+    let wire1: Vec<(String, Option<String>)> = seen
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|m| (m.role.clone(), m.content.clone()))
+        .collect();
+
+    // Turn 2: the transcript grew only by the tiny assistant "ok" reply.
+    let fires2 = std::sync::Mutex::new(None);
+    run_turn(
+        &provider,
+        &store,
+        &tctx,
+        &s.id,
+        "mock",
+        None,
+        false,
+        ReasoningVisibility::All,
+        CancelToken::new(),
+        |ev| {
+            if let AgentEvent::Done { tier1_fires, .. } = ev {
+                *fires2.lock().unwrap() = tier1_fires;
+            }
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        *fires2.lock().unwrap(),
+        Some(0),
+        "hysteresis: the next turn sits far under the high-water mark, no tick"
+    );
+    let wire2: Vec<(String, Option<String>)> = seen
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|m| (m.role.clone(), m.content.clone()))
+        .collect();
+    assert_eq!(
+        wire2.len(),
+        wire1.len() + 1,
+        "turn 2 wire = turn 1 wire + the persisted assistant reply"
+    );
+    assert_eq!(
+        &wire2[..wire1.len()],
+        &wire1[..],
+        "the whole previous wire must be a byte-stable prefix of the next turn's wire"
+    );
+    assert_eq!(wire2.last().unwrap().1.as_deref(), Some("ok"));
+}
+
+#[tokio::test]
+async fn near_budget_knob_folds_far_below_the_pressure_gate() {
+    // #1045: the Near budget -- not context pressure -- is the fold trigger. A
+    // transcript sitting under 10% of the compaction budget must still fold
+    // once its verbatim tail exceeds the configured Near budget.
+    let dir = tempfile::tempdir().unwrap();
+    let store = SessionStore::new();
+    let s = store.create_session(None);
+    for i in 0..10 {
+        store.add_message(
+            &s.id,
+            Role::User,
+            format!("cold-{i} {}", "lorem ipsum dolor sit amet ".repeat(300)),
+        );
+    }
+    let recents = ["r0", "r1", "r2", "r3", "r4", "r5"];
+    for (i, r) in recents.iter().enumerate() {
+        let role = if i % 2 == 0 {
+            Role::User
+        } else {
+            Role::Assistant
+        };
+        store.add_message(&s.id, role, (*r).to_string());
+    }
+
+    // Precondition: far below the legacy 0.75 pressure gate, which would never
+    // have compacted this transcript.
+    let history = store.get_messages(&s.id);
+    let pressure = ProxyTokenEstimator {
+        budget_tokens: 200_000,
+    }
+    .assess(&history, "mock");
+    assert!(
+        !pressure.is_over(EXTRACTIVE_COMPACT_AT_FRACTION),
+        "precondition: transcript must be under the pressure gate: fraction={}",
+        pressure.fraction()
+    );
+
+    let registry = ToolRegistry::new();
+    let root = dir.path().to_path_buf();
+    let approve = AlwaysApprove;
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let provider = RecordingProvider { seen: seen.clone() };
+    let mut tctx = ctx(&registry, &root, &approve);
+    tctx.compaction_budget = Some(200_000);
+    tctx.near_budget_tokens = Some(1_000);
+
+    let fires = std::sync::Mutex::new(None);
+    run_turn(
+        &provider,
+        &store,
+        &tctx,
+        &s.id,
+        "mock",
+        None,
+        false,
+        ReasoningVisibility::All,
+        CancelToken::new(),
+        |ev| {
+            if let AgentEvent::Done { tier1_fires, .. } = ev {
+                *fires.lock().unwrap() = tier1_fires;
+            }
+        },
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(*fires.lock().unwrap(), Some(n) if n >= 1),
+        "the knob must drive a fold below the pressure gate (got {:?})",
+        *fires.lock().unwrap()
+    );
+    let wire = seen.lock().unwrap().clone();
+    assert!(
+        wire.iter().any(|m| m
+            .content
+            .as_deref()
+            .unwrap_or("")
+            .contains(COMPACTION_MARKER_PREFIX)),
+        "folded wire must carry a compaction marker"
+    );
+    // The recent floor stays verbatim.
+    let n = wire.len();
+    for (i, r) in recents.iter().enumerate() {
+        assert_eq!(
+            wire[n - recents.len() + i].content.as_deref().unwrap(),
+            *r,
+            "recent message {i} must be verbatim on the wire"
+        );
+    }
+}
+
+#[tokio::test]
+async fn digest_fallback_caps_mid_and_reports_split_in_breakdown() {
+    // #1045: when the graded ladder cannot bring the Mid layer under its
+    // ceiling (assistant messages are exempt from the graded fold), the cold
+    // prefix collapses into ONE timeline-digest message, the verbatim original
+    // stays retrievable, and the Done breakdown reports the Mid/Near split.
+    let dir = tempfile::tempdir().unwrap();
+    let store = SessionStore::new();
+    let s = store.create_session(None);
+    // Alternating roles: half the cold bulk is assistant text the graded fold
+    // must keep, so no graded level can reach the Mid ceiling -> digest path.
+    for i in 0..8 {
+        let role = if i % 2 == 0 {
+            Role::User
+        } else {
+            Role::Assistant
+        };
+        store.add_message(
+            &s.id,
+            role,
+            format!("cold-{i} {}", "lorem ipsum dolor sit amet ".repeat(300)),
+        );
+    }
+    let recents = ["r0", "r1", "r2", "r3", "r4", "r5"];
+    for (i, r) in recents.iter().enumerate() {
+        let role = if i % 2 == 0 {
+            Role::User
+        } else {
+            Role::Assistant
+        };
+        store.add_message(&s.id, role, (*r).to_string());
+    }
+
+    let registry = ToolRegistry::new();
+    let root = dir.path().to_path_buf();
+    let approve = AlwaysApprove;
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let provider = RecordingProvider { seen: seen.clone() };
+    let mut tctx = ctx(&registry, &root, &approve);
+    // Budget 8k -> Mid ceiling 3k; the exempt assistant bulk alone (~6k tokens)
+    // can never fit, forcing the digest fallback deterministically.
+    tctx.compaction_budget = Some(8_000);
+
+    let done_seen = std::sync::Mutex::new(None);
+    run_turn(
+        &provider,
+        &store,
+        &tctx,
+        &s.id,
+        "mock",
+        None,
+        false,
+        ReasoningVisibility::All,
+        CancelToken::new(),
+        |ev| {
+            if let AgentEvent::Done {
+                tier1_fires,
+                breakdown,
+                ..
+            } = ev
+            {
+                *done_seen.lock().unwrap() = Some((tier1_fires, breakdown));
+            }
+        },
+    )
+    .await
+    .unwrap();
+
+    let wire = seen.lock().unwrap().clone();
+    let digest = wire[0].content.as_deref().unwrap();
+    assert!(
+        digest.contains("Timeline digest"),
+        "cold prefix must collapse into the timeline digest: {digest}"
+    );
+    assert!(
+        digest.contains(COMPACTION_MARKER_PREFIX),
+        "digest must carry a retrieve marker"
+    );
+    // The digest's verbatim original is retrievable.
+    let key = digest
+        .rsplit("retrieve key=")
+        .next()
+        .unwrap()
+        .trim_end_matches(']')
+        .trim();
+    let original = store
+        .compaction_original(key)
+        .expect("digest original persisted");
+    assert!(
+        original.contains("cold-0") && original.contains("cold-7"),
+        "original rendering must cover the whole folded range"
+    );
+
+    let (tier1_fires, breakdown) = done_seen.lock().unwrap().unwrap();
+    assert!(
+        matches!(tier1_fires, Some(n) if n >= 1),
+        "digest fold is a tick"
+    );
+    let b = breakdown.expect("run_turn always emits a breakdown");
+    let mid = b.mid_tokens.expect("mid reported after a fold") as u64;
+    let near = b.near_tokens.expect("near reported") as u64;
+    assert!(
+        mid <= 3_000,
+        "Mid layer must respect its ceiling (mid={mid})"
+    );
+    assert!(near > 0, "near covers the verbatim tail");
+}
+
+#[tokio::test]
+async fn breakdown_reports_near_only_split_and_zero_retrieves_when_nothing_folds() {
+    // #1045 observability baseline: a small transcript never folds, so the
+    // breakdown reports the whole wire as Near (mid=None) and the turn counts
+    // zero compaction_retrieve calls.
+    let dir = tempfile::tempdir().unwrap();
+    let store = SessionStore::new();
+    let s = store.create_session(None);
+    store.add_message(&s.id, Role::User, "hello there".into());
+
+    let registry = ToolRegistry::new();
+    let root = dir.path().to_path_buf();
+    let approve = AlwaysApprove;
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let provider = RecordingProvider { seen: seen.clone() };
+
+    let done_seen = std::sync::Mutex::new(None);
+    run_turn(
+        &provider,
+        &store,
+        &ctx(&registry, &root, &approve),
+        &s.id,
+        "mock",
+        None,
+        false,
+        ReasoningVisibility::All,
+        CancelToken::new(),
+        |ev| {
+            if let AgentEvent::Done {
+                tier1_fires,
+                retrieve_calls,
+                breakdown,
+                ..
+            } = ev
+            {
+                *done_seen.lock().unwrap() = Some((tier1_fires, retrieve_calls, breakdown));
+            }
+        },
+    )
+    .await
+    .unwrap();
+
+    let (tier1_fires, retrieve_calls, breakdown) = done_seen.lock().unwrap().unwrap();
+    assert_eq!(tier1_fires, Some(0));
+    assert_eq!(retrieve_calls, Some(0), "no retrieve tool ran this turn");
+    let b = breakdown.unwrap();
+    assert_eq!(b.mid_tokens, None, "no fold -> no Mid layer");
+    let near = b.near_tokens.expect("whole transcript is Near");
+    assert!(near > 0);
+    // #1045 finding 2: Near is measured off the *sent wire*, which is the
+    // transcript as it stood when the request went out -- before this turn's
+    // assistant reply was appended to the store. So Near is the pre-reply wire
+    // size and is <= verbatim_tokens (which counts the post-turn store,
+    // reply included), never more.
+    assert!(
+        near <= b.verbatim_tokens,
+        "sent-wire Near ({near}) must not exceed the post-turn store ({})",
+        b.verbatim_tokens
+    );
+}
+
+#[tokio::test]
+async fn zero_near_budget_is_floored_and_does_not_fold_every_turn() {
+    // #1045 finding 3: a 0 (or tiny) Near budget -- an env typo (FF_NEAR_BUDGET=0)
+    // or a mis-set connection field -- must NOT degenerate into a fold on every
+    // turn (which busts the very prompt cache the hysteresis protects). The floor
+    // (MIN_NEAR_BUDGET_TOKENS) clamps it, so a small transcript that sits under
+    // the floor does not fold at all.
+    let dir = tempfile::tempdir().unwrap();
+    let store = SessionStore::new();
+    let s = store.create_session(None);
+    // A handful of tiny messages -- a few dozen tokens total, far under the
+    // MIN_NEAR_BUDGET_TOKENS floor. With an unclamped 0 budget this would fold.
+    for i in 0..4 {
+        store.add_message(&s.id, Role::User, format!("short message {i}"));
+    }
+
+    let registry = ToolRegistry::new();
+    let root = dir.path().to_path_buf();
+    let approve = AlwaysApprove;
+    let provider = RecordingProvider {
+        seen: Arc::new(std::sync::Mutex::new(Vec::new())),
+    };
+    let mut tctx = ctx(&registry, &root, &approve);
+    tctx.compaction_budget = Some(100_000);
+    tctx.near_budget_tokens = Some(0);
+
+    let fires = std::sync::Mutex::new(None);
+    run_turn(
+        &provider,
+        &store,
+        &tctx,
+        &s.id,
+        "mock",
+        None,
+        false,
+        ReasoningVisibility::All,
+        CancelToken::new(),
+        |ev| {
+            if let AgentEvent::Done { tier1_fires, .. } = ev {
+                *fires.lock().unwrap() = tier1_fires;
+            }
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        *fires.lock().unwrap(),
+        Some(0),
+        "a 0 Near budget must be floored, not fold a tiny transcript every turn"
+    );
 }

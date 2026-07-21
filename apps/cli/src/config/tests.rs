@@ -277,5 +277,6 @@ fn blank_provider_connection(id: &str, kind: ProviderKind, model: &str) -> Provi
         access_key_id: None,
         compaction_model: None,
         compaction_budget: None,
+        near_budget: None,
     }
 }

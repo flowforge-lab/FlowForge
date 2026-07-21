@@ -755,6 +755,125 @@ impl GradedBands {
     }
 }
 
+/// Sentinel compaction level marking a prefix that was collapsed into a single
+/// timeline-digest message (#1045). One past [`MAX_COMPACTION_LEVEL`] so the
+/// frozen-boundary cache can carry it in the same `level` slot; the reuse path
+/// treats it as "no incremental extension possible — full digest pass on tick".
+pub const DIGEST_LEVEL: usize = MAX_COMPACTION_LEVEL + 1;
+
+/// Max chars of a message's first content line kept in its digest entry. Short
+/// enough that a digest line is ~15-25 proxy tokens; long enough to keep the
+/// gist ("what was asked / what was concluded") recognizable.
+const DIGEST_LINE_CHARS: usize = 96;
+
+/// A cold prefix collapsed into one deterministic timeline-digest message (#1045).
+pub struct DigestResult {
+    /// The single synthetic message replacing the folded range.
+    pub message: Message,
+    /// `(anchor_message_id, retrieve_key, original_rendering)` to persist so
+    /// `compaction_retrieve` can fetch the folded block back verbatim.
+    pub original: (String, String, String),
+}
+
+/// Mechanical fold-of-fold (#1045): collapse `messages` (the Mid layer) into a
+/// **single** timeline-digest message capped at `cap_tokens` proxy tokens. The
+/// per-message graded fold has a nonzero floor, so a long enough transcript
+/// outgrows any Mid ceiling — this is the deterministic, LLM-free ceiling
+/// enforcement. One chronological line per message (role + first content line);
+/// when over the cap, the **oldest** lines are elided behind a count so the
+/// digest stays a connected recent-history spine. Pure function of
+/// `(messages, cap_tokens)` — byte-stable between folds, per the frozen-boundary
+/// invariant (#1027).
+#[must_use]
+pub fn digest_block(messages: &[Message], cap_tokens: usize) -> Option<DigestResult> {
+    if messages.is_empty() {
+        return None;
+    }
+    let lines: Vec<String> = messages
+        .iter()
+        .enumerate()
+        .map(|(i, m)| {
+            let first = m
+                .content
+                .lines()
+                .map(str::trim)
+                .find(|l| !l.is_empty())
+                .unwrap_or("");
+            let mut snippet: String = first.chars().take(DIGEST_LINE_CHARS).collect();
+            if first.chars().count() > DIGEST_LINE_CHARS {
+                snippet.push_str("...");
+            }
+            // `i` is the message index within the folded range. The layered
+            // pass (#1045) always folds from conversation start (`history[..end]`),
+            // so this is the absolute conversation index and is stable across
+            // ticks -- a later, longer fold appends higher indices without
+            // renumbering earlier ones (#1045 finding 6).
+            format!("[{i}] {}: {snippet}", role_label(m.role))
+        })
+        .collect();
+
+    // The verbatim original for `compaction_retrieve`: every folded message,
+    // rendered whole. Persisted, never sent.
+    let original: String = messages
+        .iter()
+        .map(|m| format!("{}: {}\n\n", role_label(m.role), m.content))
+        .collect();
+    let key = content_key(&original);
+
+    // Assemble newest-last, dropping the oldest lines until the digest fits the
+    // cap. Header + marker are part of the budget.
+    let total = messages.len();
+    let mut kept = lines.len();
+    loop {
+        let elided = total - kept;
+        let header = if elided == 0 {
+            format!("Timeline digest of the {total} earliest messages in this conversation (one line each; originals retrievable):")
+        } else {
+            format!("Timeline digest of the {total} earliest messages in this conversation ({elided} oldest elided; one line each; originals retrievable):")
+        };
+        let body = lines[total - kept..].join("\n");
+        let content = format!("{header}\n{body}\n{COMPACTION_MARKER_PREFIX}{key}]");
+        if proxy_tokens(&content) <= cap_tokens || kept == 0 {
+            let anchor = messages.last().map(|m| m.id.clone()).unwrap_or_default();
+            let message = Message {
+                id: "compaction-digest".to_string(),
+                session_id: messages
+                    .first()
+                    .map(|m| m.session_id.clone())
+                    .unwrap_or_default(),
+                // User (not System) for the same reason as the Tier-2 summary:
+                // system-role messages get hoisted out of chronological position
+                // on Anthropic/Bedrock.
+                role: Role::User,
+                content,
+                tool_calls: None,
+                tool_call_id: None,
+                attachments: None,
+                reasoning: None,
+                stop_reason: None,
+                author_name: None,
+                created_at: messages.first().map(|m| m.created_at).unwrap_or(0),
+            };
+            return Some(DigestResult {
+                message,
+                original: (anchor, key, original),
+            });
+        }
+        // Drop the oldest ~10% per probe (at least 1) so the fit loop is O(10)
+        // rather than O(n) for a badly over-cap digest.
+        kept -= (kept / 10).max(1);
+    }
+}
+
+fn role_label(role: Role) -> &'static str {
+    match role {
+        Role::User => "User",
+        Role::Assistant => "Assistant",
+        Role::Tool => "Tool",
+        Role::System => "System",
+    }
+}
+
 fn truncate_value(value: &mut serde_json::Value, max_value_chars: usize, max_array_items: usize) {
     use serde_json::Value;
     match value {
