@@ -93,7 +93,11 @@ echo "==> Building signed updater bundle, version $DEV_VERSION"
 cd "$REPO_ROOT/apps/desktop"
 # Remove stale artifacts so we never accidentally serve an old tarball with a new version.
 rm -f "$BUNDLE_DIR/FlowForge.app.tar.gz" "$BUNDLE_DIR/FlowForge.app.tar.gz.sig"
-pnpm tauri build --bundles updater "${CONFIG_ARGS[@]}" --config "{\"version\":\"$DEV_VERSION\"}"
+# `--bundles app,updater`, not `--bundles updater`: on macOS the updater artifact is a
+# tarball OF the .app bundle, so asking for `updater` alone makes the current tauri CLI
+# compile the binary and skip bundling entirely — no .app, no .tar.gz, no .sig, and no
+# warning. That silently produced nothing until the artifact check below caught it.
+pnpm tauri build --bundles app,updater "${CONFIG_ARGS[@]}" --config "{\"version\":\"$DEV_VERSION\"}"
 
 TARBALL="$BUNDLE_DIR/FlowForge.app.tar.gz"
 SIG="$TARBALL.sig"
