@@ -76,6 +76,7 @@ import { CONTROL_DEFAULTS, type ControlConfig } from "./control";
 import {
   APP_VERSION_FALLBACK,
   type UpdateStatus,
+  type UpdateChannel,
   type BackupResult,
   type SidecarTurnResult,
 } from "./about";
@@ -2449,7 +2450,16 @@ Shipping the Settings redesign — currently the Memory browser (SET.8).
   }
 
   // About section (SET.11). Structured stubs — real updater/backup lands later.
-  async checkForUpdates(): Promise<UpdateStatus> {
+  async checkForUpdates(channel: UpdateChannel): Promise<UpdateStatus> {
+    // Local dogfood channel: pretend the dev-release feed has a newer build so the
+    // banner/About flow is exercisable under VITE_FF_MOCK=1. GitHub channel: up to date.
+    if (channel === "local") {
+      return {
+        kind: "available",
+        version: "0.0.0-dev.mock",
+        notes: "Local dev build (mock dev-release feed).",
+      };
+    }
     return { kind: "upToDate", version: APP_VERSION_FALLBACK };
   }
 
@@ -2464,7 +2474,7 @@ Shipping the Settings redesign — currently the Memory browser (SET.8).
   async onLocalFeedChanged(_cb: () => void): Promise<Unlisten> {
     return () => {};
   }
-  async installUpdate(): Promise<void> {
+  async installUpdate(_channel: UpdateChannel): Promise<void> {
     const total = 5 * 1024 * 1024; // 5 MiB
     const chunks = 5;
     const step = total / chunks;
