@@ -71,9 +71,30 @@ const EMPTY_CATEGORIES: MemoryCategories = {
 };
 
 /**
+ * Classify a Markdown line as a stratum heading, case-insensitively.
+ *
+ * **This is the section boundary, and it is deliberately the only one** — the
+ * TS mirror of Rust's `Stratum::from_heading_line`. Both the read side
+ * (`parseCategories`) and the write side (`replaceCategory`, and the real
+ * `replace_under_heading` it mirrors) route through it, so the two can't
+ * disagree about where a section ends. They used to: read kept a note's own
+ * `## X` sub-heading inside the body (#774) while write truncated at it, which
+ * made saving such a stratum duplicate and reorder `MEMORY.md` (#868).
+ */
+export function stratumFromHeadingLine(line: string): MemoryCategoryId | null {
+  const m = /^##\s+(.+?)\s*$/.exec(line);
+  if (!m) return null;
+  const name = m[1].toLowerCase();
+  return (
+    MEMORY_CATEGORY_META.find((c) => c.heading.toLowerCase() === name)?.id ??
+    null
+  );
+}
+
+/**
  * Parse the curated `MEMORY.md` body into the three categories. A section runs
- * from its `## <Heading>` line to the next *known-stratum* `## ` heading (or end
- * of file); the stratum heading line itself is dropped and the body is trimmed.
+ * from its `## <Heading>` line to the next *known-stratum* heading (or end of
+ * file); the stratum heading line itself is dropped and the body is trimmed.
  * Headings are matched case-insensitively. Missing headings yield "".
  *
  * A `## X` whose text is not one of the three strata is a note's own sub-heading
@@ -93,19 +114,12 @@ export function parseCategories(body: string | null): MemoryCategories {
   };
 
   for (const line of lines) {
-    const heading = /^##\s+(.+?)\s*$/.exec(line);
-    if (heading) {
-      const name = heading[1].toLowerCase();
-      const match = MEMORY_CATEGORY_META.find(
-        (m) => m.heading.toLowerCase() === name,
-      );
-      if (match) {
-        // Known stratum → start its section, dropping the heading line.
-        current = match.id;
-        continue;
-      }
-      // Unknown `## X` → a note's own sub-heading; fall through and keep it as
-      // body under the current stratum (don't reset `current`).
+    const stratum = stratumFromHeadingLine(line);
+    if (stratum) {
+      // Known stratum → start its section, dropping the heading line. Anything
+      // else (including an unknown `## X`) falls through as body.
+      current = stratum;
+      continue;
     }
     if (current) buffers[current].push(line);
   }
@@ -114,6 +128,61 @@ export function parseCategories(body: string | null): MemoryCategories {
     result[id] = buffers[id].join("\n").trim();
   }
   return result;
+}
+
+/**
+ * Replace one stratum's body in a curated `MEMORY.md`, returning the new file.
+ *
+ * This is the FE mirror of the Rust `replace_under_heading` that backs
+ * `write_curated_memory` (#969) — it exists so `MockIpc` fakes the write seam
+ * with the *same* semantics the real backend applies, rather than an idealized
+ * version. Siblings are preserved, a missing heading is appended, and empty
+ * `text` clears the body but keeps the heading.
+ *
+ * Section bounds go through `stratumFromHeadingLine`, the same predicate
+ * `parseCategories` uses, so `parse → edit → replace → parse` conserves the
+ * file: a stratum whose body carries a note's own `## sub-heading` (#774) is
+ * rewritten whole instead of truncated at the sub-heading with the tail
+ * re-appended as a sibling section (#868).
+ */
+export function replaceCategory(
+  body: string | null,
+  id: MemoryCategoryId,
+  text: string,
+): string {
+  const meta = MEMORY_CATEGORY_META.find((m) => m.id === id);
+  const heading = `## ${meta ? meta.heading : id}`;
+  const trimmed = text.replace(/\s+$/, "");
+  const content = body ?? "";
+  const lines = content.split("\n");
+  // `split` on a trailing newline yields a final "" that `String::lines` does
+  // not — drop it so heading/EOF indexing matches the Rust side.
+  if (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
+
+  // Case-insensitive, like the read side: a hand-written `## identity` is the
+  // Identity stratum and must be rewritten in place, not duplicated.
+  const head = lines.findIndex((l) => stratumFromHeadingLine(l) === id);
+  if (head === -1) {
+    let out = content.replace(/\s+$/, "");
+    if (out !== "") out += "\n\n";
+    out += `${heading}\n`;
+    if (trimmed !== "") out += `${trimmed}\n`;
+    return out;
+  }
+
+  // Ends at the next KNOWN stratum heading, never at a note's sub-heading.
+  const rel = lines
+    .slice(head + 1)
+    .findIndex((l) => stratumFromHeadingLine(l) !== null);
+  const end = rel === -1 ? lines.length : head + 1 + rel;
+
+  const out = lines.slice(0, head + 1);
+  if (trimmed !== "") out.push(trimmed);
+  if (end < lines.length) {
+    out.push(""); // blank line before the next sibling heading
+    out.push(...lines.slice(end));
+  }
+  return `${out.join("\n")}\n`;
 }
 
 /** Whether a category body should show under the current query (empty = always). */

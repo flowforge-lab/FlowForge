@@ -16,7 +16,9 @@ import {
   humanAge,
   matchingCategoryIds,
   parseCategories,
+  replaceCategory,
   sortChunks,
+  stratumFromHeadingLine,
   weightPercent,
   type MemoryCategories,
 } from "@/lib/memory-view";
@@ -324,5 +326,120 @@ describe("matchingCategoryIds", () => {
 
   it("returns an empty array when nothing matches", () => {
     expect(matchingCategoryIds(categories, "nope")).toEqual([]);
+  });
+});
+
+// #868 — the FE mirror of the backend's `replace_under_heading`. These cases
+// track the Rust tests in crates/ff-memory/src/tests.rs so the mock and the real
+// write seam agree.
+describe("replaceCategory", () => {
+  const file = `# Memory
+
+## Identity
+old identity
+
+## Patterns
+old patterns
+
+## Focus
+old focus
+`;
+
+  it("overwrites a section body instead of appending to it", () => {
+    const out = replaceCategory(file, "identity", "new identity");
+    expect(parseCategories(out).identity).toBe("new identity");
+    expect(out).not.toContain("old identity");
+  });
+
+  it("preserves sibling sections and the file title", () => {
+    const out = replaceCategory(file, "patterns", "new patterns");
+    const parsed = parseCategories(out);
+    expect(parsed.identity).toBe("old identity");
+    expect(parsed.focus).toBe("old focus");
+    expect(out.startsWith("# Memory")).toBe(true);
+  });
+
+  it("replaces a trailing (EOF) section", () => {
+    const out = replaceCategory(file, "focus", "new focus");
+    expect(parseCategories(out).focus).toBe("new focus");
+    expect(parseCategories(out).patterns).toBe("old patterns");
+  });
+
+  it("creates a missing heading at the end of the file", () => {
+    const out = replaceCategory("# Memory\n", "focus", "shipping #868");
+    expect(out).toContain("## Focus");
+    expect(parseCategories(out).focus).toBe("shipping #868");
+  });
+
+  it("clears the body but keeps the heading for empty text", () => {
+    const out = replaceCategory(file, "identity", "");
+    expect(out).toContain("## Identity");
+    expect(parseCategories(out).identity).toBe("");
+    expect(parseCategories(out).patterns).toBe("old patterns");
+  });
+
+  it("round-trips an unchanged body through parse → replace", () => {
+    const parsed = parseCategories(file);
+    const out = replaceCategory(file, "patterns", parsed.patterns);
+    expect(parseCategories(out)).toEqual(parsed);
+  });
+
+  it("handles a null body (no curated file yet)", () => {
+    const out = replaceCategory(null, "identity", "first fact");
+    expect(out).toBe("## Identity\nfirst fact\n");
+  });
+});
+
+// Read and write share one section boundary (`stratumFromHeadingLine`), so a
+// stratum carrying a note's own `## sub-heading` (#774) survives an edit. This
+// used to be the #868 data-loss path: read kept the sub-heading in the body,
+// write truncated at it and re-appended the tail as a sibling section.
+describe("replaceCategory — round-trip conservation (#868/#774)", () => {
+  const file = "## Identity\nfacts\n## Notes\ndetail\n\n## Focus\nnow\n";
+
+  it("is a no-op when an unchanged body containing a `## sub-heading` is saved", () => {
+    const parsed = parseCategories(file);
+    expect(parsed.identity).toBe("facts\n## Notes\ndetail");
+
+    const out = replaceCategory(file, "identity", parsed.identity);
+    expect(parseCategories(out)).toEqual(parsed);
+    expect(out.match(/## Notes/g)).toHaveLength(1);
+  });
+
+  it("conserves every stratum when each is saved back unchanged in turn", () => {
+    const parsed = parseCategories(file);
+    let out = file;
+    for (const id of ["identity", "patterns", "focus"] as const) {
+      out = replaceCategory(out, id, parsed[id]);
+    }
+    expect(parseCategories(out)).toEqual(parsed);
+  });
+
+  it("replaces the whole body, sub-heading included, on a real edit", () => {
+    const out = replaceCategory(file, "identity", "new identity");
+    expect(parseCategories(out).identity).toBe("new identity");
+    expect(out).not.toContain("## Notes");
+    // The sibling stratum is untouched.
+    expect(parseCategories(out).focus).toBe("now");
+  });
+
+  it("rewrites a lowercase heading in place rather than duplicating it", () => {
+    const out = replaceCategory("## identity\nold\n", "identity", "new");
+    expect(parseCategories(out).identity).toBe("new");
+    expect(out.toLowerCase().match(/## identity/g)).toHaveLength(1);
+  });
+});
+
+describe("stratumFromHeadingLine — the one shared boundary", () => {
+  it("matches the three strata case-insensitively", () => {
+    expect(stratumFromHeadingLine("## Identity")).toBe("identity");
+    expect(stratumFromHeadingLine("## focus  ")).toBe("focus");
+  });
+
+  it("treats a note's own sub-heading and non-headings as body", () => {
+    expect(stratumFromHeadingLine("## Roadmap")).toBeNull();
+    expect(stratumFromHeadingLine("### Identity")).toBeNull();
+    expect(stratumFromHeadingLine("##Identity")).toBeNull();
+    expect(stratumFromHeadingLine("Identity")).toBeNull();
   });
 });

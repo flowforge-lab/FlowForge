@@ -746,3 +746,94 @@ fn replace_curated_stratum_empty_text_clears_body_keeps_heading() {
         "## Identity\n\n## Focus\ncurrent goal\n"
     );
 }
+
+// ---- #868/#774: the section boundary is a KNOWN stratum heading, not any `## ` ----
+//
+// `memory_write` encourages a note to carry its own `## sub-heading`, and the read
+// side (the Settings pane's `parseCategories`) keeps such a heading inside the
+// stratum's body. If the write side truncated at the first `## ` instead, saving a
+// stratum would splice the new text and then re-append the old tail as a sibling
+// section — silent duplication and reordering of MEMORY.md. Both sides now route
+// through `Stratum::from_heading_line`, so that is unrepresentable.
+
+#[test]
+fn from_heading_line_matches_only_known_strata() {
+    assert_eq!(
+        Stratum::from_heading_line("## Identity"),
+        Some(Stratum::Identity)
+    );
+    // Case-insensitive, and tolerant of trailing whitespace.
+    assert_eq!(
+        Stratum::from_heading_line("## focus  "),
+        Some(Stratum::Focus)
+    );
+    // A note's own sub-heading is body, not a boundary.
+    assert_eq!(Stratum::from_heading_line("## Roadmap"), None);
+    // Wrong shape: deeper heading, no space, or not a heading at all.
+    assert_eq!(Stratum::from_heading_line("### Identity"), None);
+    assert_eq!(Stratum::from_heading_line("##Identity"), None);
+    assert_eq!(Stratum::from_heading_line("Identity"), None);
+}
+
+#[test]
+fn replace_curated_stratum_keeps_a_sub_heading_inside_the_body() {
+    let dir = tempfile::tempdir().unwrap();
+    let m = mem(dir.path());
+    std::fs::write(
+        m.curated_path(),
+        "## Patterns\nfacts\n## Roadmap\ndetail\n\n## Focus\nnow\n",
+    )
+    .unwrap();
+
+    // The pane renders the whole Patterns body — sub-heading included — so saving
+    // it back unchanged must be a no-op, not a duplication.
+    m.replace_curated_stratum("facts\n## Roadmap\ndetail", Stratum::Patterns)
+        .unwrap();
+
+    let after = read_lenient(&m.curated_path());
+    assert_eq!(
+        after, "## Patterns\nfacts\n## Roadmap\ndetail\n\n## Focus\nnow\n",
+        "an unchanged save must conserve the file"
+    );
+    assert_eq!(
+        after.matches("## Roadmap").count(),
+        1,
+        "the sub-heading must not be duplicated as a sibling section"
+    );
+}
+
+#[test]
+fn replace_curated_stratum_rewrites_a_body_containing_a_sub_heading() {
+    let dir = tempfile::tempdir().unwrap();
+    let m = mem(dir.path());
+    std::fs::write(
+        m.curated_path(),
+        "## Identity\nold\n## Notes\nkeep me\n\n## Focus\nnow\n",
+    )
+    .unwrap();
+
+    m.replace_curated_stratum("new identity", Stratum::Identity)
+        .unwrap();
+
+    // The whole old body — sub-heading and all — is replaced, and only Focus
+    // survives as a sibling.
+    assert_eq!(
+        read_lenient(&m.curated_path()),
+        "## Identity\nnew identity\n\n## Focus\nnow\n"
+    );
+}
+
+#[test]
+fn replace_curated_stratum_rewrites_a_lowercase_heading_in_place() {
+    let dir = tempfile::tempdir().unwrap();
+    let m = mem(dir.path());
+    // The read side matches headings case-insensitively; a case-sensitive write
+    // would miss this section and append a second `## Identity`.
+    std::fs::write(m.curated_path(), "## identity\nold\n").unwrap();
+
+    m.replace_curated_stratum("new", Stratum::Identity).unwrap();
+
+    let after = read_lenient(&m.curated_path());
+    assert_eq!(after, "## identity\nnew\n");
+    assert_eq!(after.to_lowercase().matches("## identity").count(), 1);
+}

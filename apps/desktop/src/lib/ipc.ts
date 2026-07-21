@@ -58,6 +58,7 @@ import type {
   MemoryFileInfo,
   MemoryOverview,
   MemoryFlushedEvent,
+  Stratum,
   Mode,
   Safety,
   PermissionCell,
@@ -256,9 +257,15 @@ export interface FfIpc {
   /** Cross-session search (#710): BM25-ranked hits across every session. */
   searchMessages(query: string, limit?: number): Promise<SearchHit[]>;
 
-  // Memory (RFC 0006, M5.1e — frozen read-only surface for the Settings memory
-  // pane, Issue #131). These three commands have real Rust impls + ts-rs bindings.
-  // Writes, the enable/disable toggle, and embeddings are deliberately out of scope.
+  // Memory (RFC 0006, M5.1e — the Settings memory pane's surface, Issue #131).
+  // Reads have real Rust impls + ts-rs bindings. The enable/disable toggle and
+  // embeddings are deliberately out of scope.
+  //
+  // CONTRACT CHANGE (#868, backend seam #969/#1028) — this block is no longer
+  // read-only: `writeCuratedMemory` below is the one write, and it is deliberately
+  // narrow (whole-stratum replace of the three curated `MEMORY.md` sections).
+  // Everything else — daily journal files, non-curated files — stays read-only.
+  // Please review @tonytan4ever.
   //
   // CONTRACT NOTE: there is intentionally NO `searchMemory` here. Host-side memory
   // search is deferred to the HybridIndex work (#166) so we don't freeze a
@@ -271,6 +278,12 @@ export interface FfIpc {
   readMemoryFile(relPath: string): Promise<string>;
   /** Store summary (file/byte counts, root, enabled flag) for the pane header. */
   memoryOverview(): Promise<MemoryOverview>;
+  /** Replace one curated stratum's body in `MEMORY.md` — whole-section replace,
+   *  not the append the agent's `memory_write` tool does. Sibling sections are
+   *  preserved, a missing heading is created, and empty `text` clears the body
+   *  while keeping the heading. Routed through the backend's atomic single-writer
+   *  path, so the FE never writes the file itself. */
+  writeCuratedMemory(stratum: Stratum, text: string): Promise<void>;
   // Salience surface (RFC 0007 M6.2, #293). Per-chunk weight/dormant + reset/pin.
   // `weight`/`dormant` are computed authoritatively by the backend; the FE never
   // re-derives the dormancy threshold. Decay/dormancy/pin never edit Markdown —
@@ -722,6 +735,8 @@ class TauriIpc implements FfIpc {
   readMemoryFile = (relPath: string) =>
     this.invoke<string>("read_memory_file", { relPath });
   memoryOverview = () => this.invoke<MemoryOverview>("memory_overview");
+  writeCuratedMemory = (stratum: Stratum, text: string) =>
+    this.invoke<void>("write_curated_memory", { stratum, text });
   listMemoryChunks = () => this.invoke<MemoryChunkStat[]>("list_memory_chunks");
   resetMemoryChunk = (chunkKey: string) =>
     this.invoke<void>("reset_memory_chunk", { chunkKey });
