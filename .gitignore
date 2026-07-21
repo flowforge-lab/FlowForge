@@ -38,3 +38,8 @@ design/
 # Bash-tool workspace scratch dir (#458 RC4c) — local-only, never commit
 .ff-scratch/
 .ff_msg
+
+# Per-developer updater PUBkey overlay for the D1 dogfood loop (#1047) — one
+# developer's dev key must never be baked into a committed config. Private keys
+# live outside the repo entirely (~/.tauri) and are never committed or shared.
+apps/desktop/src-tauri/tauri.dev-local.conf.json
