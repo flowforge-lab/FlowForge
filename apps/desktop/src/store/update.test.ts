@@ -6,22 +6,26 @@ import { ipc } from "@/lib/ipc";
 import {
   progressPercent,
   shouldPollUpdate,
+  activeUpdateChannel,
   useUpdateStore,
 } from "@/store/update";
+import { useExperimentalStore } from "@/store/experimental";
 
 afterEach(() => {
   useUpdateStore.setState({ status: null, installing: false, progress: null });
+  useExperimentalStore.getState().resetExperimental();
   vi.restoreAllMocks();
 });
 
 describe("useUpdateStore (#363)", () => {
   it("refresh() stores the check result", async () => {
-    vi.spyOn(ipc, "checkForUpdates").mockResolvedValue({
+    const spy = vi.spyOn(ipc, "checkForUpdates").mockResolvedValue({
       kind: "available",
       version: "9.9.9",
       notes: null,
     });
-    await useUpdateStore.getState().refresh();
+    await useUpdateStore.getState().refresh("github");
+    expect(spy).toHaveBeenCalledWith("github");
     expect(useUpdateStore.getState().status).toEqual({
       kind: "available",
       version: "9.9.9",
@@ -29,28 +33,48 @@ describe("useUpdateStore (#363)", () => {
     });
   });
 
-  it("refresh() swallows errors and leaves the previous status", async () => {
+  it("refresh('github') swallows errors and leaves the previous status", async () => {
     useUpdateStore.setState({
       status: { kind: "upToDate", version: "0.1.0" },
     });
     vi.spyOn(ipc, "checkForUpdates").mockRejectedValue(new Error("offline"));
-    await expect(useUpdateStore.getState().refresh()).resolves.toBeUndefined();
+    await expect(
+      useUpdateStore.getState().refresh("github"),
+    ).resolves.toBeUndefined();
     expect(useUpdateStore.getState().status).toEqual({
       kind: "upToDate",
       version: "0.1.0",
     });
   });
 
-  it("install() calls installUpdate once and clears the installing flag", async () => {
+  it("refresh('local') clears stale status when the dev feed is unreachable (#1033)", async () => {
+    // A prior GitHub result must NOT stay pinned when the local channel fails —
+    // this is the banner-stuck-on-0.1.0 bug.
+    useUpdateStore.setState({
+      status: { kind: "available", version: "0.1.0", notes: null },
+    });
+    vi.spyOn(ipc, "checkForUpdates").mockRejectedValue(
+      new Error("connection refused"),
+    );
+    await expect(
+      useUpdateStore.getState().refresh("local"),
+    ).resolves.toBeUndefined();
+    expect(useUpdateStore.getState().status).toBeNull();
+  });
+
+  it("install() calls installUpdate once with the channel and clears the flag", async () => {
     const spy = vi.spyOn(ipc, "installUpdate").mockResolvedValue();
-    await useUpdateStore.getState().install();
+    await useUpdateStore.getState().install("local");
     expect(spy).toHaveBeenCalledTimes(1);
+    expect(spy).toHaveBeenCalledWith("local");
     expect(useUpdateStore.getState().installing).toBe(false);
   });
 
   it("install() clears the installing flag even when the call rejects", async () => {
     vi.spyOn(ipc, "installUpdate").mockRejectedValue(new Error("boom"));
-    await expect(useUpdateStore.getState().install()).rejects.toThrow("boom");
+    await expect(useUpdateStore.getState().install("github")).rejects.toThrow(
+      "boom",
+    );
     expect(useUpdateStore.getState().installing).toBe(false);
   });
 
@@ -70,8 +94,24 @@ describe("useUpdateStore (#363)", () => {
       version: "9.9.9",
       notes: null,
     });
-    await useUpdateStore.getState().refresh();
+    await useUpdateStore.getState().refresh("github");
     expect(useUpdateStore.getState().dismissed).toBe(false);
+  });
+
+  describe("activeUpdateChannel (#1033)", () => {
+    it("is 'github' when the localUpdateChannel flag is off", () => {
+      useExperimentalStore.setState((s) => ({
+        flags: { ...s.flags, localUpdateChannel: false },
+      }));
+      expect(activeUpdateChannel()).toBe("github");
+    });
+
+    it("is 'local' when the localUpdateChannel flag is on", () => {
+      useExperimentalStore.setState((s) => ({
+        flags: { ...s.flags, localUpdateChannel: true },
+      }));
+      expect(activeUpdateChannel()).toBe("local");
+    });
   });
 
   describe("shouldPollUpdate (#567)", () => {
@@ -108,7 +148,7 @@ describe("download progress (#566)", () => {
   it("install() resets progress to null on start", async () => {
     useUpdateStore.setState({ progress: { downloaded: 1, total: 2 } });
     vi.spyOn(ipc, "installUpdate").mockResolvedValue();
-    await useUpdateStore.getState().install();
+    await useUpdateStore.getState().install("github");
     expect(useUpdateStore.getState().progress).toBeNull();
   });
 

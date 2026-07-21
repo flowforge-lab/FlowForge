@@ -1,7 +1,11 @@
 import { Download, Loader2, X } from "@/components/ui/icon";
 import { Button } from "@/components/ui/button";
 import { Progress } from "@/components/ui/progress";
-import { progressPercent, useUpdateStore } from "@/store/update";
+import {
+  progressPercent,
+  activeUpdateChannel,
+  useUpdateStore,
+} from "@/store/update";
 
 /**
  * Global update-available banner (#565, RFC 0014 §12.1, P5a). Renders a
@@ -48,7 +52,7 @@ export function UpdateBar() {
           <Button
             size="xs"
             variant="secondary"
-            onClick={() => void install()}
+            onClick={() => void install(activeUpdateChannel())}
             disabled={installing}
             data-icon="inline-end"
           >
