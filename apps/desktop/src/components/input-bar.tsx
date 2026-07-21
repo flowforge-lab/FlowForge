@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   ArrowUp,
   Check,
@@ -11,7 +11,10 @@ import {
   PencilLine,
   Search,
   ShieldAlert,
+  Sparkles,
   Square,
+  Target,
+  Zap,
   X,
 } from "@/components/ui/icon";
 import { Popover as PopoverPrimitive } from "radix-ui";
@@ -46,6 +49,15 @@ import { useComposerStore } from "@/store/composer";
 import { useGoalStore } from "@/store/goal";
 import { useGoalDialogStore } from "@/store/goal-dialog";
 import { parseGoalCommand } from "@/lib/goal-command";
+import {
+  buildSlashCommands,
+  matchSlash,
+  parseSlashQuery,
+  type SlashCommand,
+  type SlashKind,
+} from "@/lib/slash-command";
+import { useCommandShortcutsStore } from "@/store/command-shortcuts";
+import { useSkillsStore } from "@/store/skills";
 import { usePrefsStore } from "@/store/prefs";
 import { useSessionWorkspaceStore } from "@/store/session-workspace";
 import { useSessionModeStore, MODE_ORDER } from "@/store/session-mode";
@@ -174,6 +186,80 @@ export function InputBar({
     el.style.height = "auto";
     el.style.height = `${Math.min(el.scrollHeight, 160)}px`;
   }, []);
+
+  // --- Slash-command autocomplete (#1036) ---
+  //
+  // Three classes of `/command` in one dropdown: the builtin `/goal` (parsed by
+  // submit()), installed skills (activate, same call as ⌘K), and message
+  // shortcuts (expand a stored message). The registry + gating live in
+  // lib/slash-command.ts; this component owns only the open/highlight state.
+
+  const skills = useSkillsStore((s) => s.skills);
+  const shortcuts = useCommandShortcutsStore((s) => s.shortcuts);
+  // A phenotype-bound session resolves its skills from the phenotype and ignores
+  // the global active set (`turn_active_skills`), so activating a skill would not
+  // reach this session's prompt — surfaced rather than silently no-op'd.
+  const sessionPhenotype = useChatStore(
+    (s) => s.sessions.find((x) => x.id === targetSessionId)?.phenotype ?? null,
+  );
+
+  const [slashIndex, setSlashIndex] = useState(0);
+  // Esc closes the list without clearing the draft; typing re-opens it.
+  const [slashDismissed, setSlashDismissed] = useState(false);
+
+  const slashQuery = parseSlashQuery(value);
+  const slashMatches = useMemo(
+    () =>
+      slashQuery === null
+        ? []
+        : matchSlash(
+            buildSlashCommands({ skills, shortcuts, sessionPhenotype }),
+            slashQuery,
+          ),
+    [slashQuery, skills, shortcuts, sessionPhenotype],
+  );
+  // An in-place edit (#463) is a message rewrite, not a fresh command — no list.
+  const slashOpen =
+    !editingMessageId && !slashDismissed && slashMatches.length > 0;
+  // Clamp rather than reset in an effect: the list shrinks as the user types.
+  const slashActive = Math.min(
+    slashIndex,
+    Math.max(slashMatches.length - 1, 0),
+  );
+
+  function acceptSlash(cmd: SlashCommand) {
+    const el = textareaRef.current;
+    switch (cmd.kind) {
+      case "builtin":
+        // Hand back to the existing grammar: the user types the objective and
+        // submit()'s parseGoalCommand path handles it, unchanged.
+        setText(`/${cmd.name} `);
+        break;
+      case "skill":
+        // Activation is global and lands on the NEXT turn — the chip row below
+        // the textarea is what makes that visible. Already-active is a no-op.
+        // Swallow the rejection: the skill list can be a beat stale (uninstalled
+        // between refreshes), and a failed activation must not surface as an
+        // unhandled rejection — the chip row simply won't appear.
+        if (!cmd.active) void ipc.activateSkill(cmd.name).catch(() => {});
+        setText("");
+        break;
+      case "shortcut":
+        setText(cmd.payload ?? "");
+        break;
+    }
+    setSlashIndex(0);
+    setSlashDismissed(false);
+    // Caret to the end of the expanded text, and re-grow for a long shortcut.
+    requestAnimationFrame(() => {
+      const node = textareaRef.current;
+      if (!node) return;
+      node.focus();
+      node.setSelectionRange(node.value.length, node.value.length);
+      autoGrow(node);
+    });
+    if (el) autoGrow(el);
+  }
 
   // --- Attach affordances (#339) ---
   //
@@ -318,8 +404,20 @@ export function InputBar({
             workspace + branch live in a separate bar below (#606). */}
         <div
           ref={boxRef}
-          className="rounded-xl border bg-card p-1.5 shadow-sm transition-all focus-within:border-ring focus-within:shadow-md focus-within:ring-2 focus-within:ring-ring/25"
+          className="relative rounded-xl border bg-card p-1.5 shadow-sm transition-all focus-within:border-ring focus-within:shadow-md focus-within:ring-2 focus-within:ring-ring/25"
         >
+          {/* Slash-command suggestions (#1036). Absolutely positioned ABOVE the
+              card so opening the list never reflows the composer or covers the
+              send button, and each pane's dropdown stays inside its own box. */}
+          {slashOpen ? (
+            <SlashSuggestions
+              commands={slashMatches}
+              activeIndex={slashActive}
+              onHighlight={setSlashIndex}
+              onAccept={acceptSlash}
+            />
+          ) : null}
+
           {/* In-place edit banner (#463): submitting replaces the original message
               and re-runs from it; Cancel/Escape exits without mutating history. */}
           {editingMessageId && targetSessionId ? (
@@ -353,8 +451,16 @@ export function InputBar({
             onPaste={handlePaste}
             onChange={(e) => {
               warmup();
-              setText(e.currentTarget.value);
+              const next = e.currentTarget.value;
+              setText(next);
               autoGrow(e.currentTarget);
+              // Typing always re-highlights the top row (same as the palette).
+              setSlashIndex(0);
+              // An Esc-dismissal sticks for the token the user was typing —
+              // clearing it here (once the text is no longer a slash token)
+              // means a fresh `/` re-opens the list, but continuing to type the
+              // dismissed token does not fight the user by popping it back up.
+              if (parseSlashQuery(next) === null) setSlashDismissed(false);
             }}
             onKeyDown={(e) => {
               // Escape exits in-place edit mode without mutating the transcript.
@@ -366,6 +472,38 @@ export function InputBar({
                 e.stopPropagation();
                 cancelEdit(targetSessionId);
                 return;
+              }
+              // Slash-command dropdown (#1036) owns the arrows, Tab, Enter, and
+              // Esc — but ONLY while it is open. Once closed every key below
+              // behaves exactly as it did before, which is what keeps
+              // send-on-Enter / newline-on-Shift+Enter free of regressions.
+              if (slashOpen) {
+                if (e.key === "ArrowDown") {
+                  e.preventDefault();
+                  setSlashIndex((i) => (i + 1) % slashMatches.length);
+                  return;
+                }
+                if (e.key === "ArrowUp") {
+                  e.preventDefault();
+                  setSlashIndex(
+                    (i) => (i - 1 + slashMatches.length) % slashMatches.length,
+                  );
+                  return;
+                }
+                if (e.key === "Enter" || e.key === "Tab") {
+                  e.preventDefault();
+                  const cmd = slashMatches[slashActive];
+                  if (cmd) acceptSlash(cmd);
+                  return;
+                }
+                if (e.key === "Escape") {
+                  e.preventDefault();
+                  // The shell's global Esc cancels the running turn
+                  // (app-shell.tsx) — dismissing a dropdown must not kill it.
+                  e.stopPropagation();
+                  setSlashDismissed(true);
+                  return;
+                }
               }
               if (e.key !== "Enter") return;
               // Enter mode: plain Enter sends (Shift+Enter = new line, unchanged).
@@ -380,6 +518,13 @@ export function InputBar({
               }
             }}
           />
+
+          {/* Active skills (#1036). Activation only lands on the NEXT turn and
+              nothing else in the composer shows it, so without this a `/skill`
+              accept would be invisible. Sourced from the skills store, which
+              lib/events.ts refreshes on `skills:changed` — so a ⌘K activation
+              shows up here too. */}
+          <ActiveSkillChips sessionPhenotype={sessionPhenotype} />
 
           {/* Staged attachments (#340): one removable chip/thumbnail per file,
               between the textarea and the toolbar so it reads as part of the draft. */}
@@ -505,6 +650,137 @@ export function InputBar({
 // Staged-attachment strip (#340). Renders one removable chip per file the user has
 // staged in the composer: a thumbnail for images, a document icon otherwise, plus the
 // file name, humanized size, and type. Pure view over the composer's local state.
+/**
+ * The active-skill row under the textarea (#1036) — the composer's only signal
+ * that a skill is in play, since activation is invisible until the next turn.
+ *
+ * The active set is GLOBAL (`activate_skill` takes no session id), and a session
+ * bound to a phenotype resolves its skills from that phenotype instead
+ * (`turn_active_skills`), ignoring the global set entirely. So for a bound
+ * session the chips would be a lie — show the reason instead.
+ */
+function ActiveSkillChips({
+  sessionPhenotype,
+}: {
+  sessionPhenotype: string | null;
+}) {
+  // Filter OUTSIDE the selector: returning a fresh array from a zustand selector
+  // fails Object.is on every render and loops (same trap as `attachmentsBySession`).
+  const skills = useSkillsStore((s) => s.skills);
+  const active = useMemo(() => skills.filter((x) => x.active), [skills]);
+
+  if (sessionPhenotype) {
+    if (active.length === 0) return null;
+    return (
+      <div className="px-1.5 pt-1.5 text-[11px] text-muted-foreground">
+        This session runs the{" "}
+        <span className="font-medium text-foreground/80">
+          {sessionPhenotype}
+        </span>{" "}
+        phenotype, so activated skills don&rsquo;t apply to it.
+      </div>
+    );
+  }
+
+  if (active.length === 0) return null;
+
+  return (
+    <div className="flex flex-wrap gap-1.5 px-1.5 pt-1.5">
+      {active.map((skill) => (
+        <span
+          key={skill.name}
+          title={skill.description}
+          className="flex items-center gap-1 rounded-md bg-primary/10 py-0.5 pl-1.5 pr-1 text-[11px] text-primary"
+        >
+          <Sparkles className="size-3 shrink-0" />
+          <span className="max-w-40 truncate">{skill.name}</span>
+          <button
+            type="button"
+            aria-label={`Deactivate ${skill.name}`}
+            title={`Deactivate ${skill.name}`}
+            onClick={() => void ipc.deactivateSkill(skill.name).catch(() => {})}
+            className="rounded p-0.5 transition-colors hover:bg-primary/15 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/40"
+          >
+            <X className="size-3" />
+          </button>
+        </span>
+      ))}
+    </div>
+  );
+}
+
+const SLASH_ICONS: Record<SlashKind, typeof Target> = {
+  builtin: Target,
+  skill: Sparkles,
+  shortcut: Zap,
+};
+
+/**
+ * The slash-command dropdown (#1036). Presentational: the composer owns the
+ * open/highlight state and the keyboard, this renders the rows and forwards
+ * mouse intent — the same division the ⌘K palette uses.
+ *
+ * Rendered above the composer card (`bottom-full`) rather than inline, so the
+ * list never reflows the textarea or covers the send button. It scrolls
+ * internally at ~5 rows; the composer is not inside a scroll container of its
+ * own, so this is the only scroll region involved.
+ */
+function SlashSuggestions({
+  commands,
+  activeIndex,
+  onHighlight,
+  onAccept,
+}: {
+  commands: SlashCommand[];
+  activeIndex: number;
+  onHighlight: (index: number) => void;
+  onAccept: (cmd: SlashCommand) => void;
+}) {
+  return (
+    <div
+      role="listbox"
+      aria-label="Slash commands"
+      className="absolute bottom-full left-0 right-0 z-30 mb-1.5 max-h-56 overflow-y-auto rounded-xl border bg-popover p-1.5 shadow-lg"
+    >
+      {commands.map((cmd, i) => {
+        const Icon = SLASH_ICONS[cmd.kind];
+        const active = i === activeIndex;
+        return (
+          <div
+            key={cmd.id}
+            role="option"
+            aria-selected={active}
+            onMouseMove={() => onHighlight(i)}
+            // Mouse DOWN, not click: the textarea would otherwise lose focus
+            // (and the composer its caret) before the row's handler ran.
+            onMouseDown={(e) => {
+              e.preventDefault();
+              onAccept(cmd);
+            }}
+            className={cn(
+              "flex cursor-pointer select-none items-center gap-2.5 rounded-md px-2.5 py-1.5 text-[13px]",
+              active
+                ? "bg-accent text-accent-foreground"
+                : "text-foreground/90",
+            )}
+          >
+            <Icon className="size-3.5 shrink-0 text-muted-foreground" />
+            <span className="shrink-0 font-medium">/{cmd.name}</span>
+            <span className="min-w-0 flex-1 truncate text-[12px] text-muted-foreground">
+              {cmd.description}
+            </span>
+            {cmd.hint ? (
+              <kbd className="shrink-0 font-mono text-[10px] text-muted-foreground/60">
+                {cmd.hint}
+              </kbd>
+            ) : null}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
 function AttachmentChips({
   attachments,
   onRemove,

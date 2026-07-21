@@ -66,6 +66,11 @@ export function startIpcEvents(): void {
   void ipc.onSkillsChanged(() => {
     void useSkillsStore.getState().refresh();
   });
+  // Seed the skills cache once at startup. It used to be filled lazily on the
+  // first ⌘K open, which was fine when the palette was the only consumer — the
+  // composer's slash autocomplete (#1036) reads it too, and must not offer an
+  // empty skill list just because the palette has never been opened.
+  void useSkillsStore.getState().refresh();
   // MCP status snapshots replace the store wholesale (#91); mirrors skills:changed.
   void ipc.onMcpStatusChanged((e) => {
     useMcpStore.getState().setServers(e.servers);
