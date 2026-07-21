@@ -5,6 +5,7 @@ import { cleanup, render, screen } from "@testing-library/react";
 import { MessageHeader } from "@/components/message-header";
 import { usePrefsStore } from "@/store/prefs";
 import { useProfilesStore } from "@/store/profiles";
+import { useEditedMessagesStore } from "@/store/edited-messages";
 import { formatMessageTime } from "@/lib/format-message-time";
 import type { Profile } from "@/store/profiles";
 
@@ -24,6 +25,7 @@ afterEach(() => {
   cleanup();
   usePrefsStore.setState({ displayName: "" });
   useProfilesStore.setState({ profiles: [], activeId: "default" });
+  useEditedMessagesStore.setState({ editedIds: [] });
 });
 
 describe("MessageHeader", () => {
@@ -112,5 +114,37 @@ describe("MessageHeader", () => {
     expect(screen.getByText("Abid")).toBeTruthy();
     // Only the name span renders — no clock time.
     expect(screen.queryByText(/\d{1,2}:\d{2}/)).toBeNull();
+  });
+
+  describe('"edited" hint (#929 B)', () => {
+    it("renders nothing for a message that was never edited", () => {
+      render(
+        <MessageHeader role="user" createdAt={CREATED_AT} messageId="m1" />,
+      );
+      expect(screen.queryByText("edited")).toBeNull();
+    });
+
+    it("renders for a marked message", () => {
+      useEditedMessagesStore.getState().markEdited("m1");
+      render(
+        <MessageHeader role="user" createdAt={CREATED_AT} messageId="m1" />,
+      );
+      expect(screen.getByText("edited")).toBeTruthy();
+    });
+
+    it("is a static label, not an interactive affordance", () => {
+      // FlowForge truncates on edit, so there is no original to open. A clickable
+      // badge would promise a version history that does not exist.
+      useEditedMessagesStore.getState().markEdited("m1");
+      render(
+        <MessageHeader role="user" createdAt={CREATED_AT} messageId="m1" />,
+      );
+      const label = screen.getByText("edited");
+      expect(label.tagName).toBe("SPAN");
+      expect(screen.queryByRole("button", { name: /edited/i })).toBeNull();
+      expect(screen.queryByRole("link", { name: /edited/i })).toBeNull();
+      expect(label.getAttribute("role")).toBeNull();
+      expect(label.className).not.toMatch(/cursor-pointer|underline/);
+    });
   });
 });

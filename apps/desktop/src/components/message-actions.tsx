@@ -1,8 +1,8 @@
 import { type ReactNode } from "react";
-import { Check, Copy, PencilLine } from "@/components/ui/icon";
+import { Check, Copy, PencilLine, RotateCcw } from "@/components/ui/icon";
 import { cn } from "@/lib/utils";
 import { useCopied } from "@/lib/use-copied";
-import { useComposerStore } from "@/store/composer";
+import { useChatStore } from "@/store/chat";
 import type { Message } from "@/bindings";
 
 function ActionButton({
@@ -74,11 +74,18 @@ export function ResponseCopyButton({ text }: { text: string }) {
 export function MessageActions({
   message,
   side,
+  isLastUserMessage = false,
+  onBeginEdit,
 }: {
   message: Message;
   side: "left" | "right";
+  /** Gates Retry (#929 C): only the tail user message can re-run without
+   *  collateral, since the backend truncates everything after the target. */
+  isLastUserMessage?: boolean;
+  /** Opens the bubble-anchored edit box (#929 A). Owned by chat-view. */
+  onBeginEdit?: () => void;
 }) {
-  const beginEdit = useComposerStore((s) => s.beginEdit);
+  const editMessage = useChatStore((s) => s.editMessage);
   return (
     <div
       className={cn(
@@ -88,13 +95,29 @@ export function MessageActions({
     >
       <CopyAction text={message.content} />
       {message.role === "user" && (
+        <ActionButton title="Edit & resend" onClick={() => onBeginEdit?.()}>
+          <PencilLine className="size-3" />
+        </ActionButton>
+      )}
+      {/* Retry (#929 C) — tail user message only. Re-sends the same input through
+          the existing edit path, so the backend truncates and re-runs: the current
+          answer is REPLACED, not kept alongside. That's intentional (FlowForge has
+          no variant model), and the title says so rather than implying a <1/2>
+          switcher. Attachments pass through — the backend replaces the column
+          wholesale, so dropping them here would destroy them. */}
+      {message.role === "user" && isLastUserMessage && (
         <ActionButton
-          title="Edit & resend"
+          title="Retry — replaces the current answer"
           onClick={() =>
-            beginEdit(message.sessionId, message.id, message.content)
+            void editMessage(
+              message.sessionId,
+              message.id,
+              message.content,
+              message.attachments ?? undefined,
+            )
           }
         >
-          <PencilLine className="size-3" />
+          <RotateCcw className="size-3" />
         </ActionButton>
       )}
     </div>

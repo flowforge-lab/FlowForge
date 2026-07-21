@@ -126,7 +126,6 @@ beforeEach(() => {
   useComposerStore.setState({
     textBySession: {},
     attachmentsBySession: {},
-    editingBySession: {},
   });
   useSkillsStore.setState({
     skills: [skill({}), skill({ name: "tdd", description: "Test first" })],

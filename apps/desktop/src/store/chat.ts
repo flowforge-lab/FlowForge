@@ -6,6 +6,7 @@ import { create } from "zustand";
 import { ipc } from "@/lib/ipc";
 import { autoTitle } from "@/lib/auto-title";
 import { isResumableStopNotice } from "@/store/capped-turn";
+import { useEditedMessagesStore } from "@/store/edited-messages";
 import { readCache, writeCache, clearCache } from "@/lib/message-cache";
 import { notify } from "@/lib/notify";
 import type {
@@ -675,6 +676,9 @@ export const useChatStore = create<ChatState>((set, get) => ({
     const prior = get().messagesBySession[sessionId] ?? [];
     const idx = prior.findIndex((m) => m.id === messageId);
     if (idx < 0) return;
+    // Retry (#929 C) rides this same path with identical content — only a real
+    // text change earns the "edited" hint below.
+    const contentChanged = prior[idx].content !== content;
 
     // Optimistic: replace the edited message in place and truncate everything
     // after it (the old response + anything following), then mark the turn as
@@ -729,6 +733,11 @@ export const useChatStore = create<ChatState>((set, get) => ({
         content,
         attachments,
       );
+      // Success path only (#929 B): the backend returns the SAME id it UPDATEd, so
+      // this marker survives the re-run and a relaunch. Marking here — never in the
+      // catch — means a failed edit can't leave a badge that lies.
+      if (contentChanged)
+        useEditedMessagesStore.getState().markEdited(editedId);
       set((s) => ({
         messagesBySession: {
           ...s.messagesBySession,
