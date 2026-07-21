@@ -14,13 +14,6 @@ export type UpdateStatus =
   | { kind: "upToDate"; version: string }
   | { kind: "available"; version: string; notes: string | null };
 
-/** Which update feed a check/install targets (#1033). Passed explicitly on every
- *  call so the endpoint is never inferred from a global flag — the ordering bug
- *  that let a boot check race the dev-update watcher onto GitHub. `local` is the
- *  `dev-release.sh` server on localhost; `github` is the shipped release feed.
- *  Serializes to the Rust `UpdateChannel` enum (camelCase). */
-export type UpdateChannel = "github" | "local";
-
 /** Result of an export/restore backup action. */
 export interface BackupResult {
   /** Path the backup was written to (export) or read from (restore). */

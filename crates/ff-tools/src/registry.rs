@@ -10,12 +10,50 @@ use serde_json::Value;
 // and re-exported from this crate for backward compatibility.
 pub use ff_core::Safety;
 
+/// The wake source an [`ObserverIntent`] requests. M3 (#1039) only emits
+/// [`ObserverIntentKind::Process`]; `File`/`Http` are reserved so the shape is
+/// stable when future tools declare those. Mirrors `ff_observer::ObserverKind`
+/// as a plain enum so `ff-tools` need not depend on `ff-observer` (the dependency
+/// runs the other way — `ff-observer` uses `ff_tools::process`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObserverIntentKind {
+    File,
+    Http,
+    Process,
+}
+
+/// A tool's declaration that the host should attach a background observer after
+/// this call (#1039, epic #954 M3). The tool cannot start the observer itself —
+/// `ff-observer` depends on `ff-tools`, so a direct call would be circular — so it
+/// declares intent here and the host (which owns both supervisors) translates this
+/// into an `ObserverSpec` and calls `ObserverSupervisor::start`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObserverIntent {
+    pub kind: ObserverIntentKind,
+    /// Source-specific target. For `Process` this is the process id as a string
+    /// (the `process_manager` id the observer subscribes to).
+    pub target: String,
+    /// Human-readable name echoed in wake messages and shown by the observer list.
+    pub label: String,
+    /// Source-specific filter. For `Process` it is the stdout wake pattern (regex /
+    /// substring); `None` means wake on any output.
+    pub filter: Option<String>,
+    /// Source-specific cadence (http/file). `None` for `Process`.
+    pub interval_secs: Option<u64>,
+}
+
 /// The result of running a tool. `content` is fed back to the model verbatim as the
 /// tool message; `success` lets the host render pass/fail without parsing `content`.
+/// `observer_intent`, when set, asks the host to attach a background observer after
+/// the call returns (#1039) — used by long-running tools to wake the agent on
+/// ongoing output without a second `observer` tool call. It is `Box`ed because it is
+/// `None` on virtually every call and is large enough to otherwise bloat every
+/// `Result<_, ToolOutcome>` past clippy's `result_large_err` threshold.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolOutcome {
     pub success: bool,
     pub content: String,
+    pub observer_intent: Option<Box<ObserverIntent>>,
 }
 
 impl ToolOutcome {
@@ -23,6 +61,7 @@ impl ToolOutcome {
         Self {
             success: true,
             content: content.into(),
+            observer_intent: None,
         }
     }
 
@@ -30,7 +69,15 @@ impl ToolOutcome {
         Self {
             success: false,
             content: content.into(),
+            observer_intent: None,
         }
+    }
+
+    /// Attach an observer intent to this outcome (builder-style), so the host
+    /// starts a background observer after the tool returns.
+    pub fn with_observer(mut self, intent: ObserverIntent) -> Self {
+        self.observer_intent = Some(Box::new(intent));
+        self
     }
 }
 
@@ -171,7 +218,7 @@ impl ToolRegistry {
         r.register(Box::new(crate::web_fetch::WebFetchTool::new()));
         r.register(Box::new(crate::ask_user::AskUserTool));
         r.register(Box::new(crate::diagnostics::DiagnosticsTool));
-        r.register(Box::new(crate::test_runner::TestRunnerTool));
+        r.register(Box::new(crate::test_runner::TestRunnerTool::new()));
         r.register(Box::new(crate::git::GitTool));
         r.register(Box::new(crate::github::GithubTool));
         r.register(Box::new(crate::agent_tool::AgentTool));

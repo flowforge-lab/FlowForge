@@ -3338,29 +3338,22 @@ enum UpdateStatus {
     },
 }
 
+/// Build the updater. In prod it reads `plugins.updater` from `tauri.conf.json`
+/// (the GitHub `latest.json` feed). When `FF_UPDATER_ENDPOINT` is set (the RFC 0014
+/// D1 dev/dogfood channel) it points at that feed instead and accepts any version
+/// that differs from the running one, so a locally-built artifact installs without a
+/// version bump. Inert in prod (env unset).
+/// Whether the `localUpdateChannel` experimental flag is active for this session.
+/// Set by [`start_dev_update_watcher`] (called by the FE exactly when the flag is on).
+static LOCAL_UPDATE_CHANNEL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Default port for the local dev-release HTTP server (matches `scripts/dev-release.sh`).
 const DEV_RELEASE_PORT: u16 = 8787;
 
-/// Which update feed a check/install should target (#1033). Passed explicitly from
-/// the FE on every call so the endpoint is never decided by a global side-effect
-/// flag — that ordering-dependent atomic is what let the first boot check race the
-/// dev-update watcher and pin the GitHub release into the UI. `github` is the
-/// compiled-in default feed; `local` is the `dev-release.sh` server on localhost.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-enum UpdateChannel {
-    #[default]
-    Github,
-    Local,
-}
-
-fn updater(
-    app: &tauri::AppHandle,
-    channel: UpdateChannel,
-) -> CmdResult<tauri_plugin_updater::Updater> {
+fn updater(app: &tauri::AppHandle) -> CmdResult<tauri_plugin_updater::Updater> {
     use tauri_plugin_updater::UpdaterExt;
-    // An explicit `FF_UPDATER_ENDPOINT` still wins (RFC 0014 D1 override), then the
-    // caller-supplied channel — never an ambient flag.
+    // Priority: explicit env var > localUpdateChannel flag > compiled-in default.
     if let Ok(endpoint) = std::env::var("FF_UPDATER_ENDPOINT") {
         let endpoint = url::Url::parse(&endpoint).map_err(|e| e.to_string())?;
         app.updater_builder()
@@ -3369,7 +3362,7 @@ fn updater(
             .version_comparator(|current, update| update.version != current)
             .build()
             .map_err(|e| e.to_string())
-    } else if channel == UpdateChannel::Local {
+    } else if LOCAL_UPDATE_CHANNEL.load(std::sync::atomic::Ordering::Relaxed) {
         let endpoint = url::Url::parse(&format!("http://localhost:{DEV_RELEASE_PORT}/latest.json"))
             .map_err(|e| e.to_string())?;
         app.updater_builder()
@@ -3384,22 +3377,13 @@ fn updater(
     }
 }
 
-/// Check the given update feed. Returns the structured `UpdateStatus` so the UI
+/// Check the configured update feed. Returns the structured `UpdateStatus` so the UI
 /// can branch (offer "Update now" on `available`). Errors (offline, malformed
-/// manifest, local feed unreachable) surface as `Err(String)` for the FE to toast.
-/// The `channel` is explicit (#1033) — the endpoint is never inferred from a global
-/// flag, so a boot check can't race the dev-update watcher onto the wrong feed.
+/// manifest) surface as `Err(String)` for the FE to toast.
 #[tauri::command]
-async fn check_for_updates(
-    app: tauri::AppHandle,
-    channel: UpdateChannel,
-) -> CmdResult<UpdateStatus> {
+async fn check_for_updates(app: tauri::AppHandle) -> CmdResult<UpdateStatus> {
     let current = app.package_info().version.to_string();
-    match updater(&app, channel)?
-        .check()
-        .await
-        .map_err(|e| e.to_string())?
-    {
+    match updater(&app)?.check().await.map_err(|e| e.to_string())? {
         Some(update) => Ok(UpdateStatus::Available {
             version: update.version.clone(),
             notes: update.body.clone(),
@@ -3408,16 +3392,11 @@ async fn check_for_updates(
     }
 }
 
-/// Download and install the available update from `channel`, then relaunch. Re-checks
-/// rather than caching the `Update` handle across IPC calls. A no-op if nothing is
-/// available. `channel` must match the check that surfaced the update (#1033).
+/// Download and install the available update, then relaunch. Re-checks rather than
+/// caching the `Update` handle across IPC calls. A no-op if nothing is available.
 #[tauri::command]
-async fn install_update(app: tauri::AppHandle, channel: UpdateChannel) -> CmdResult<()> {
-    let Some(update) = updater(&app, channel)?
-        .check()
-        .await
-        .map_err(|e| e.to_string())?
-    else {
+async fn install_update(app: tauri::AppHandle) -> CmdResult<()> {
+    let Some(update) = updater(&app)?.check().await.map_err(|e| e.to_string())? else {
         return Ok(());
     };
     let progress_app = app.clone();
@@ -3445,15 +3424,12 @@ async fn install_update(app: tauri::AppHandle, channel: UpdateChannel) -> CmdRes
 /// `update:local-feed-changed` instantly when the file is written, so the FE can
 /// trigger an immediate `refresh()` without waiting for the 15s poll tick.
 ///
-/// This only starts the FS observer; it does NOT decide the update endpoint — that
-/// is chosen per-call via the explicit `UpdateChannel` (#1033). Decoupling the two
-/// removes the boot race where a check could fire before this ran.
-///
 /// Idempotent: calling twice is a no-op (the watcher is stored in managed state and
 /// lives for the app lifetime; there is no stop — it is zero-cost when idle).
 #[tauri::command]
 fn start_dev_update_watcher(app: tauri::AppHandle) {
     use std::sync::Once;
+    LOCAL_UPDATE_CHANNEL.store(true, std::sync::atomic::Ordering::Relaxed);
     static STARTED: Once = Once::new();
     STARTED.call_once(|| {
         match dev_update_watcher::DevUpdateWatcher::spawn() {
@@ -3535,7 +3511,17 @@ fn emit_agent_event<R: tauri::Runtime>(
             call_id,
             success,
             result,
+            observer_intent,
         } => {
+            // #1039: a long-running tool (process_manager wake_on / test_runner
+            // background) can declare a background observer. Attach it here — the
+            // host owns the ObserverSupervisor; the tool crate can't (ff-observer
+            // depends on ff-tools). Best-effort: a failure only logs.
+            if let Some(intent) = observer_intent {
+                if let Some(state) = app.try_state::<Arc<AppState>>() {
+                    state.attach_observer_intent(session_id, *intent);
+                }
+            }
             let _ = app.emit(
                 "tool:result",
                 ToolResultEvent {

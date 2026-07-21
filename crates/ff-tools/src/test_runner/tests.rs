@@ -193,3 +193,89 @@ fn truncate_output_on_multibyte_boundary() {
     assert!(result.len() <= 16_000);
     assert!(result.len() < chunk.len());
 }
+
+// ----- #1039 M3: background mode auto-attaches a Process observer -----
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn background_true_spawns_and_declares_process_observer_intent() {
+    use crate::process::ProcessSupervisor;
+    use crate::registry::ObserverIntentKind;
+    use std::sync::Arc;
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let tool = TestRunnerTool::with_supervisor(Arc::new(ProcessSupervisor::new()));
+    let out = tool
+        .run_with_session(
+            serde_json::json!({"command": "echo 1 passed", "background": true}),
+            dir.path(),
+            "s1",
+        )
+        .await;
+    assert!(out.success, "{}", out.content);
+    let intent = out
+        .observer_intent
+        .expect("background run should declare an observer intent");
+    assert_eq!(intent.kind, ObserverIntentKind::Process);
+    assert!(intent.target.parse::<u64>().is_ok(), "{}", intent.target);
+    // Default wake pattern matches a test-summary line.
+    assert!(intent.filter.is_some());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn background_wake_on_overrides_default_pattern() {
+    use crate::process::ProcessSupervisor;
+    use std::sync::Arc;
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let tool = TestRunnerTool::with_supervisor(Arc::new(ProcessSupervisor::new()));
+    let out = tool
+        .run_with_session(
+            serde_json::json!({
+                "command": "echo hi",
+                "background": true,
+                "wake_on": "CUSTOM-DONE",
+            }),
+            dir.path(),
+            "s1",
+        )
+        .await;
+    assert!(out.success, "{}", out.content);
+    assert_eq!(
+        out.observer_intent.unwrap().filter.as_deref(),
+        Some("CUSTOM-DONE")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn background_without_supervisor_falls_back_to_synchronous() {
+    let dir = tempfile::TempDir::new().unwrap();
+    // Unit constructor: no supervisor -> background unavailable.
+    let tool = TestRunnerTool::new();
+    let out = tool
+        .run_with_session(
+            serde_json::json!({"command": "echo 1 passed", "background": true}),
+            dir.path(),
+            "s1",
+        )
+        .await;
+    assert!(out.success, "{}", out.content);
+    assert!(
+        out.observer_intent.is_none(),
+        "no supervisor -> no observer intent"
+    );
+    assert!(
+        out.content.contains("ran synchronously"),
+        "should note the fallback: {}",
+        out.content
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn synchronous_mode_declares_no_intent() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let tool = TestRunnerTool::new();
+    let out = tool
+        .run(serde_json::json!({"command": "echo 1 passed"}), dir.path())
+        .await;
+    assert!(out.observer_intent.is_none());
+}

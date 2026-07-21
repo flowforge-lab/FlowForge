@@ -56,8 +56,11 @@ pub use goal_complete::{GoalCompleteTool, GOAL_COMPLETE_TOOL_NAME};
 // stays private so its internals aren't part of the crate's public API.
 pub use jail::resolve_in_root;
 pub use notebook::{KernelLiveState, KernelSupervisor, NotebookKernelState, NotebookTool};
-pub use registry::{is_subagent, Safety, Tool, ToolOutcome, ToolRegistry};
+pub use registry::{
+    is_subagent, ObserverIntent, ObserverIntentKind, Safety, Tool, ToolOutcome, ToolRegistry,
+};
 pub use sink::{OutputSink, OutputStream};
+pub use test_runner::TestRunnerTool;
 pub use url_safety::SsrfPolicy;
 pub use web_search::{
     NoUserInfo, PubMedSource, SearchKeyProvider, SearchSource, SearchTool, SearchUserInfoProvider,

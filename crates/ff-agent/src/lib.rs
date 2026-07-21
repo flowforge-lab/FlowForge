@@ -254,6 +254,11 @@ pub enum AgentEvent {
         call_id: String,
         success: bool,
         result: String,
+        /// Host-internal (#1039): when a tool declared a background observer, the
+        /// intent rides here so the desktop host can attach it after the call.
+        /// Never serialized to the FE — the observer surface is host-owned.
+        #[serde(skip)]
+        observer_intent: Option<Box<ff_tools::ObserverIntent>>,
     },
     Done {
         message_id: String,
@@ -2166,6 +2171,7 @@ pub async fn run_turn(
                 call_id: call.id.clone(),
                 success: outcome.success,
                 result: outcome.content,
+                observer_intent: outcome.observer_intent.take(),
             });
 
             // Count identical calls to catch a no-progress stall (#244 R2).

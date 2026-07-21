@@ -13,11 +13,7 @@ import { ipc } from "@/lib/ipc";
 import { Progress } from "@/components/ui/progress";
 import { useExperimentalStore } from "@/store/experimental";
 import { useSettingsStore } from "@/store/settings";
-import {
-  progressPercent,
-  activeUpdateChannel,
-  useUpdateStore,
-} from "@/store/update";
+import { progressPercent, useUpdateStore } from "@/store/update";
 
 const TOAST_MS = 3200;
 
@@ -76,8 +72,7 @@ export function AboutSection() {
   const onCheckForUpdates = useCallback(() => {
     void (async () => {
       try {
-        const channel = activeUpdateChannel();
-        const status = await ipc.checkForUpdates(channel);
+        const status = await ipc.checkForUpdates();
         useUpdateStore.setState({ status });
         showToast(formatUpdateStatus(status));
       } catch (err) {
@@ -104,7 +99,7 @@ export function AboutSection() {
           <>
             <AboutRow
               label={`Update now — version ${updateStatus.version}`}
-              onClick={() => void install(activeUpdateChannel())}
+              onClick={() => void install()}
               disabled={installing}
               trailing={
                 installing ? (

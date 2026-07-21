@@ -69,6 +69,7 @@ fn json_mode_golden_lines() {
             call_id: "c1".into(),
             success: true,
             result: "hi\n".into(),
+            observer_intent: None,
         },
         AgentEvent::Done {
             message_id: "m1".into(),
