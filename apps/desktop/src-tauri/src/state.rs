@@ -2029,6 +2029,12 @@ impl AppState {
         reg.register(Box::new(ProcessManagerTool::new(
             self.process_supervisor.clone(),
         )));
+        // #1039: give test_runner the same supervisor so `background: true` can spawn
+        // the suite as a background process and auto-attach a wake observer. Overrides
+        // the unit `TestRunnerTool` that `with_defaults` registered (synchronous-only).
+        reg.register(Box::new(ff_tools::TestRunnerTool::with_supervisor(
+            self.process_supervisor.clone(),
+        )));
         // Background observers (#891 Phase 1): session-scoped
         // file/dir watchers (Phase 2/3 add http/process). Registered
         // next to `process_manager` because the two share the
@@ -2310,6 +2316,50 @@ impl AppState {
     /// [`buffer_observer_event`](Self::buffer_observer_event).
     pub fn drain_observer_buffer(&self, session_id: &str) -> Vec<ff_observer::ObserverEvent> {
         self.observer_supervisor.drain_buffer(session_id)
+    }
+
+    /// Attach a background observer a tool declared via its `ToolOutcome` (#1039,
+    /// epic #954 M3). Tools can't call the supervisor directly (`ff-observer`
+    /// depends on `ff-tools`), so `process_manager`/`test_runner` return an
+    /// `ObserverIntent` and the host translates it here. Best-effort: an invalid
+    /// spec or a hit per-session cap logs a warning and is dropped — it never fails
+    /// the originating tool call.
+    ///
+    /// Attach-window caveat (C3): the process observer subscribes to the
+    /// supervisor's broadcast channel, which only delivers output produced *after*
+    /// the subscription. Output emitted between the tool returning the intent and
+    /// this attach — and any match within it — is not replayed (the ring buffer
+    /// backs `poll` snapshots, not late subscribers). This is acceptable for a
+    /// best-effort wake source: it watches long-running output where the events of
+    /// interest (build done, error, tests finished) land after attach, and a missed
+    /// match is followed by the next one. Do not rely on it to capture a match in
+    /// that startup window.
+    pub fn attach_observer_intent(&self, session_id: &str, intent: ff_tools::ObserverIntent) {
+        use ff_observer::source::{ObserverKind, ObserverSpec};
+        let kind = match intent.kind {
+            ff_tools::ObserverIntentKind::File => ObserverKind::File,
+            ff_tools::ObserverIntentKind::Http => ObserverKind::Http,
+            ff_tools::ObserverIntentKind::Process => ObserverKind::Process,
+        };
+        let spec = ObserverSpec {
+            label: intent.label,
+            kind,
+            target: intent.target,
+            filter: intent.filter,
+            interval_secs: intent.interval_secs,
+        };
+        match self.observer_supervisor.start(spec, session_id) {
+            Ok(id) => {
+                tracing::info!(
+                    observer_id = id,
+                    session = session_id,
+                    "tool auto-attached observer"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, session = session_id, "failed to auto-attach tool observer");
+            }
+        }
     }
 
     /// Start a periodic background reaper that drives

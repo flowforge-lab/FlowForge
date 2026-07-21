@@ -115,7 +115,7 @@ describe("UpdateBar (#565)", () => {
     // A fresh poll (`refresh`) clears `dismissed` so a still-available update
     // resurfaces the bar — the issue's "reappears on the next poll" requirement.
     await act(async () => {
-      await useUpdateStore.getState().refresh("github");
+      await useUpdateStore.getState().refresh();
     });
     expect(container.querySelector(".update-bar")).not.toBeNull();
   });

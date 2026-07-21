@@ -41,7 +41,7 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 use tokio::sync::{broadcast, mpsc};
 
-use crate::registry::{Safety, Tool, ToolOutcome, NO_SESSION};
+use crate::registry::{ObserverIntent, ObserverIntentKind, Safety, Tool, ToolOutcome, NO_SESSION};
 use crate::sink::{OutputSink, OutputStream};
 #[cfg(windows)]
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
@@ -827,6 +827,15 @@ impl Tool for ProcessManagerTool {
                 "process_id": {
                     "type": "integer",
                     "description": "For `poll`/`stop`: the id returned by `start`."
+                },
+                "wake_on": {
+                    "type": "string",
+                    "description": "For `start` (optional): a regex/substring. When set, a \
+                                    background observer is auto-attached to this process and \
+                                    wakes the agent when new stdout/stderr matches — no \
+                                    separate `observer` call needed. Use for long-running \
+                                    commands with a completion/error signal, e.g. \
+                                    \"Server ready|Build succeeded|error\\\\[\"."
                 }
             },
             "required": ["action"]
@@ -862,9 +871,29 @@ impl Tool for ProcessManagerTool {
                     ));
                 }
                 match self.supervisor.start(command, &dir, session_id) {
-                    Ok(id) => ToolOutcome::ok(format!(
-                        "started process {id}: {command}\npoll with action=poll, process_id={id}"
-                    )),
+                    Ok(id) => {
+                        let base = ToolOutcome::ok(format!(
+                            "started process {id}: {command}\npoll with action=poll, process_id={id}"
+                        ));
+                        // If the caller asked to be woken on a pattern, declare a
+                        // Process observer intent (#1039). The host attaches it after
+                        // dispatch — tools can't call the supervisor directly.
+                        match args
+                            .get("wake_on")
+                            .and_then(Value::as_str)
+                            .map(str::trim)
+                            .filter(|p| !p.is_empty())
+                        {
+                            Some(pattern) => base.with_observer(ObserverIntent {
+                                kind: ObserverIntentKind::Process,
+                                target: id.to_string(),
+                                label: format!("process {id}: {}", summarize_command(command)),
+                                filter: Some(pattern.to_string()),
+                                interval_secs: None,
+                            }),
+                            None => base,
+                        }
+                    }
                     Err(e) => ToolOutcome::error(e),
                 }
             }
@@ -914,6 +943,19 @@ impl Tool for ProcessManagerTool {
             }
         }
         outcome
+    }
+}
+
+/// A short, single-line command summary for an observer label (first ~48 chars,
+/// whitespace-collapsed) so wake messages read like `process 3: cargo test …`.
+fn summarize_command(command: &str) -> String {
+    let collapsed = command.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.chars().count() > 48 {
+        let mut s: String = collapsed.chars().take(47).collect();
+        s.push('…');
+        s
+    } else {
+        collapsed
     }
 }
 
@@ -1441,5 +1483,63 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
         }
+    }
+
+    // ----- #1039 M3: `wake_on` declares a Process observer intent -----
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn start_with_wake_on_declares_process_observer_intent() {
+        let dir = TempDir::new().unwrap();
+        let tool = ProcessManagerTool::new(Arc::new(ProcessSupervisor::new()));
+        let out = tool
+            .run_with_session(
+                json!({
+                    "action": "start",
+                    "command": "echo hi",
+                    "wake_on": "Server ready|error\\[",
+                }),
+                dir.path(),
+                "s1",
+            )
+            .await;
+        assert!(out.success, "{}", out.content);
+        let intent = out
+            .observer_intent
+            .expect("wake_on should declare an observer intent");
+        assert_eq!(intent.kind, ObserverIntentKind::Process);
+        assert_eq!(intent.filter.as_deref(), Some("Server ready|error\\["));
+        // target is the process id as a string.
+        assert!(intent.target.parse::<u64>().is_ok(), "{}", intent.target);
+        assert!(intent.interval_secs.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn start_without_wake_on_declares_no_intent() {
+        let dir = TempDir::new().unwrap();
+        let tool = ProcessManagerTool::new(Arc::new(ProcessSupervisor::new()));
+        let out = tool
+            .run_with_session(
+                json!({"action": "start", "command": "echo hi"}),
+                dir.path(),
+                "s1",
+            )
+            .await;
+        assert!(out.success, "{}", out.content);
+        assert!(out.observer_intent.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn start_with_blank_wake_on_declares_no_intent() {
+        let dir = TempDir::new().unwrap();
+        let tool = ProcessManagerTool::new(Arc::new(ProcessSupervisor::new()));
+        let out = tool
+            .run_with_session(
+                json!({"action": "start", "command": "echo hi", "wake_on": "   "}),
+                dir.path(),
+                "s1",
+            )
+            .await;
+        assert!(out.success);
+        assert!(out.observer_intent.is_none(), "blank wake_on is ignored");
     }
 }

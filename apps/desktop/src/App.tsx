@@ -8,11 +8,7 @@ import { ipc, type Unlisten } from "@/lib/ipc";
 import { initPrefs, usePrefsStore } from "@/store/prefs";
 import { useChatStore } from "@/store/chat";
 import { useModelConfigStore } from "@/store/model-config";
-import {
-  shouldPollUpdate,
-  activeUpdateChannel,
-  useUpdateStore,
-} from "@/store/update";
+import { shouldPollUpdate, useUpdateStore } from "@/store/update";
 import { useExperimentalStore } from "@/store/experimental";
 
 // How often the production build re-checks for an update in the background.
@@ -175,9 +171,9 @@ function App() {
     void usePrefsStore.getState().hydrateDefaultMode();
     // Background update check (#363). Prod always polls; in a dev build the
     // poll runs only when the `localUpdateChannel` experimental flag is on
-    // (#567). The channel is passed explicitly to every check/install (#1033) —
-    // the endpoint is never inferred from a backend flag, so the first check
-    // can't race the dev-update watcher onto GitHub.
+    // (#567). When the flag is on, the backend polls localhost:8787 (the
+    // dev-release.sh feed) instead of GitHub (#749).
+    // Initial check on launch, then every few hours; cleared on teardown.
     const localUpdateChannel =
       useExperimentalStore.getState().flags.localUpdateChannel;
     if (
@@ -187,54 +183,37 @@ function App() {
         localUpdateChannel,
       )
     ) {
-      const channel = activeUpdateChannel();
       // In dogfood mode, auto-install detected updates without user
       // intervention (#705). The refresh+install cycle is fire-and-forget.
       const poll = async () => {
         const store = useUpdateStore.getState();
-        await store.refresh(channel);
+        await store.refresh();
         if (
           localUpdateChannel &&
           !store.installing &&
           useUpdateStore.getState().status?.kind === "available"
         ) {
-          void store.install(channel);
+          void store.install();
         }
       };
+      void poll();
+      const pollMs = localUpdateChannel ? DEV_POLL_MS : UPDATE_POLL_MS;
+      const id = setInterval(() => void poll(), pollMs);
 
+      // Phase 2 (#705): file-system watcher for instant detection. Start the
+      // backend watcher and listen for its event to trigger an immediate poll,
+      // skipping the 15s wait. Zero-cost when idle (OS kqueue/inotify).
       let feedUnsub: (() => void) | undefined;
-      let id: ReturnType<typeof setInterval> | undefined;
-      let cancelled = false;
-      // Phase 2 (#705): file-system watcher for instant detection. On the local
-      // channel, start the backend watcher and wire its event BEFORE the first
-      // poll (#1033) — the watcher only observes the feed file; it no longer
-      // gates the endpoint, so the ordering can't corrupt the check.
-      const startPolling = () => {
-        if (cancelled) return;
-        void poll();
-        const pollMs = localUpdateChannel ? DEV_POLL_MS : UPDATE_POLL_MS;
-        id = setInterval(() => void poll(), pollMs);
-      };
-
       if (localUpdateChannel) {
+        void ipc.startDevUpdateWatcher();
         void ipc
-          .startDevUpdateWatcher()
-          .then(() => ipc.onLocalFeedChanged(() => void poll()))
+          .onLocalFeedChanged(() => void poll())
           .then((unsub) => {
-            if (cancelled) {
-              unsub();
-              return;
-            }
             feedUnsub = unsub;
-          })
-          .finally(startPolling);
-      } else {
-        startPolling();
+          });
       }
-
       return () => {
-        cancelled = true;
-        if (id !== undefined) clearInterval(id);
+        clearInterval(id);
         feedUnsub?.();
       };
     }

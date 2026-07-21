@@ -4,20 +4,53 @@
 //! location for each failing test.
 
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use serde_json::Value;
 use tokio::process::Command;
 
-use crate::registry::{Safety, Tool, ToolOutcome};
+use crate::process::ProcessSupervisor;
+use crate::registry::{ObserverIntent, ObserverIntentKind, Safety, Tool, ToolOutcome, NO_SESSION};
 
 /// Hard cap on output to avoid flooding model context.
 const MAX_OUTPUT_BYTES: usize = 16_000;
 /// Default timeout for test commands.
 const DEFAULT_TIMEOUT_SECS: u64 = 120;
+/// Default wake pattern for a background run (#1039): a test-summary or exit line
+/// across cargo / pytest / vitest / jest. Overridable via `wake_on`.
+const DEFAULT_TEST_WAKE: &str =
+    r"(?i)\b\d+ (passed|failed|error)|Tests:|test result:|passed,|failed,";
 
-pub struct TestRunnerTool;
+/// Structured test runner (#852). Synchronous by default; when a `ProcessSupervisor`
+/// is injected (desktop), a `background: true` run spawns the command as a background
+/// process and auto-attaches a Process observer that wakes the agent on the result
+/// line (#1039). Constructed as a unit (`new`) for the CLI/default registry where
+/// background is unavailable, or `with_supervisor` on the desktop host.
+pub struct TestRunnerTool {
+    supervisor: Option<Arc<ProcessSupervisor>>,
+}
+
+impl TestRunnerTool {
+    /// Synchronous-only runner (no background support) — for `with_defaults` / CLI.
+    pub fn new() -> Self {
+        Self { supervisor: None }
+    }
+
+    /// Runner with a `ProcessSupervisor`, enabling `background: true` (#1039).
+    pub fn with_supervisor(supervisor: Arc<ProcessSupervisor>) -> Self {
+        Self {
+            supervisor: Some(supervisor),
+        }
+    }
+}
+
+impl Default for TestRunnerTool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 #[async_trait]
 impl Tool for TestRunnerTool {
@@ -31,7 +64,11 @@ impl Tool for TestRunnerTool {
         "Run a test command and return structured results. On success: a compact \
          summary (e.g. '162 passed'). On failure: summary + each failure's name, \
          message, and location. Supports cargo test, pytest, vitest/jest. Falls \
-         back to raw output for unrecognized frameworks."
+         back to raw output for unrecognized frameworks. Set `background: true` for \
+         a slow suite: it runs in the background and wakes you when results are \
+         ready (via an auto-attached observer), instead of blocking — then `poll` \
+         the process for detail. Background mode returns the raw result stream, not \
+         the structured parse."
     }
 
     fn parameters(&self) -> Value {
@@ -44,7 +81,15 @@ impl Tool for TestRunnerTool {
                 },
                 "timeout": {
                     "type": "integer",
-                    "description": "Timeout in seconds (default 120)."
+                    "description": "Timeout in seconds (default 120). Synchronous mode only."
+                },
+                "background": {
+                    "type": "boolean",
+                    "description": "Run the suite in the background and wake the agent when results are ready, instead of blocking (default false). Use for slow suites. An observer is auto-attached to the process — no separate `observer` call needed. Trades the structured pass/fail parse for a non-blocking wake."
+                },
+                "wake_on": {
+                    "type": "string",
+                    "description": "For `background`: override the wake pattern (regex/substring on stdout). Defaults to a cross-framework test-summary/exit line."
                 }
             },
             "required": ["command"]
@@ -64,20 +109,70 @@ impl Tool for TestRunnerTool {
     }
 
     async fn run(&self, args: Value, root: &Path) -> ToolOutcome {
+        self.run_with_session(args, root, NO_SESSION).await
+    }
+
+    async fn run_with_session(&self, args: Value, root: &Path, session_id: &str) -> ToolOutcome {
         let command = match args.get("command").and_then(|v| v.as_str()) {
             Some(cmd) => cmd.to_string(),
             None => return ToolOutcome::error("missing required parameter: command"),
         };
-        let timeout = args
-            .get("timeout")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(DEFAULT_TIMEOUT_SECS);
 
-        match run_tests(root, &command, timeout).await {
+        let background = args
+            .get("background")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        if background {
+            // Background mode: spawn via the ProcessSupervisor and declare a Process
+            // observer intent so the host wakes the agent on the result line (#1039).
+            let Some(sup) = self.supervisor.as_ref() else {
+                // No supervisor (CLI/default registry) — fall back to synchronous so
+                // the tool still works, with a note.
+                return match run_tests(root, &command, timeout_of(&args)).await {
+                    Ok(output) => ToolOutcome::ok(format!(
+                        "(background unavailable here — ran synchronously)\n\n{output}"
+                    )),
+                    Err(e) => ToolOutcome::error(format!("test_runner failed: {e}")),
+                };
+            };
+            let id = match sup.start(&command, root, session_id) {
+                Ok(id) => id,
+                Err(e) => return ToolOutcome::error(e),
+            };
+            let pattern = args
+                .get("wake_on")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|p| !p.is_empty())
+                .unwrap_or(DEFAULT_TEST_WAKE)
+                .to_string();
+            return ToolOutcome::ok(format!(
+                "started test run in background as process {id}: {command}\n\
+                 An observer will wake me when results are ready; \
+                 poll with action=poll, process_id={id} for detail."
+            ))
+            .with_observer(ObserverIntent {
+                kind: ObserverIntentKind::Process,
+                target: id.to_string(),
+                label: format!("test run {id}"),
+                filter: Some(pattern),
+                interval_secs: None,
+            });
+        }
+
+        // Synchronous mode: unchanged — run, parse, return structured result.
+        match run_tests(root, &command, timeout_of(&args)).await {
             Ok(output) => ToolOutcome::ok(output),
             Err(e) => ToolOutcome::error(format!("test_runner failed: {e}")),
         }
     }
+}
+
+fn timeout_of(args: &Value) -> u64 {
+    args.get("timeout")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(DEFAULT_TIMEOUT_SECS)
 }
 
 async fn run_tests(root: &Path, command: &str, timeout_secs: u64) -> Result<String, String> {
