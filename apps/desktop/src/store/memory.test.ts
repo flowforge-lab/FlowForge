@@ -17,6 +17,7 @@ function reset() {
     journalBodies: {},
     chunks: [],
     chunkBusy: {},
+    writeBusy: false,
     query: "",
     loading: false,
     error: null,
@@ -170,6 +171,65 @@ describe("memory store (SET.8, #131)", () => {
     // Mark the row busy, then a second call should no-op (not hit the IPC).
     useMemoryStore.setState({ chunkBusy: { [key]: true } });
     await useMemoryStore.getState().setPinned(key, true);
+    expect(spy).not.toHaveBeenCalled();
+  });
+});
+
+describe("memory store — writeStratum (#868)", () => {
+  beforeEach(reset);
+  afterEach(() => vi.restoreAllMocks());
+
+  it("routes the edit through the backend command and reloads the snapshot", async () => {
+    const spy = vi.spyOn(ipc, "writeCuratedMemory");
+    await useMemoryStore.getState().load();
+
+    const ok = await useMemoryStore
+      .getState()
+      .writeStratum("focus", "new focus");
+
+    expect(ok).toBe(true);
+    expect(spy).toHaveBeenCalledWith("focus", "new focus");
+    // The reload is what makes the panel reflect the write — not a local patch.
+    const s = useMemoryStore.getState();
+    expect(parseCategories(s.curatedBody).focus).toBe("new focus");
+    expect(s.writeBusy).toBe(false);
+    expect(s.error).toBeNull();
+  });
+
+  it("leaves sibling strata untouched", async () => {
+    await useMemoryStore.getState().load();
+    const before = parseCategories(useMemoryStore.getState().curatedBody);
+
+    await useMemoryStore.getState().writeStratum("identity", "rewritten");
+
+    const after = parseCategories(useMemoryStore.getState().curatedBody);
+    expect(after.identity).toBe("rewritten");
+    expect(after.patterns).toBe(before.patterns);
+    expect(after.focus).toBe(before.focus);
+  });
+
+  it("surfaces a failure as `error` and resolves false so the buffer survives", async () => {
+    vi.spyOn(ipc, "writeCuratedMemory").mockRejectedValue(
+      new Error("disk full"),
+    );
+    await useMemoryStore.getState().load();
+    const before = useMemoryStore.getState().curatedBody;
+
+    const ok = await useMemoryStore.getState().writeStratum("focus", "nope");
+
+    expect(ok).toBe(false);
+    expect(useMemoryStore.getState().error).toBe("disk full");
+    expect(useMemoryStore.getState().writeBusy).toBe(false);
+    expect(useMemoryStore.getState().curatedBody).toBe(before);
+  });
+
+  it("guards re-entrancy: a second save while one is in flight is a no-op", async () => {
+    const spy = vi.spyOn(ipc, "writeCuratedMemory");
+    useMemoryStore.setState({ writeBusy: true });
+
+    await expect(
+      useMemoryStore.getState().writeStratum("focus", "ignored"),
+    ).resolves.toBe(false);
     expect(spy).not.toHaveBeenCalled();
   });
 });

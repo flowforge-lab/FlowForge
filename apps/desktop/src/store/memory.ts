@@ -1,18 +1,20 @@
-// Read-only cache for the Settings → Memory section (SET.8, #131). Mirrors
-// store/mcp.ts's load pattern: fetch the frozen RFC 0006 memory IPC on panel
-// mount and hold it for the component, which derives the WHO-less Identity /
-// Patterns / Focus cards, JOURNAL, and FILES surfaces via lib/memory-view.ts.
+// Cache for the Settings → Memory section (SET.8, #131). Mirrors store/mcp.ts's
+// load pattern: fetch the RFC 0006 memory IPC on panel mount and hold it for the
+// component, which derives the WHO-less Identity / Patterns / Focus cards,
+// JOURNAL, and FILES surfaces via lib/memory-view.ts.
 //
-// Read-only by design: there are no write commands in the contract (the memory
-// model is captured by the agent; the enable toggle + search land with #166).
+// Almost read-only: the sole write is `writeStratum` (#868), a whole-stratum
+// replace on the three curated `MEMORY.md` sections. Everything else the pane
+// shows is captured by the agent (the enable toggle + search land with #166).
 
 import { create } from "zustand";
 import { ipc } from "@/lib/ipc";
+import type { MemoryCategoryId } from "@/lib/memory-view";
 import type { MemoryChunkStat } from "@/bindings/MemoryChunkStat";
 import type { MemoryFileInfo } from "@/bindings/MemoryFileInfo";
 import type { MemoryOverview } from "@/bindings/MemoryOverview";
 
-interface MemoryState {
+export interface MemoryState {
   files: MemoryFileInfo[];
   overview: MemoryOverview | null;
   /** Body of the curated `MEMORY.md`, parsed into the category cards. */
@@ -23,6 +25,8 @@ interface MemoryState {
   chunks: MemoryChunkStat[];
   /** chunkKeys with an in-flight reset/pin mutation, for per-row busy state. */
   chunkBusy: Record<string, boolean>;
+  /** True while a curated-stratum write is in flight (disables Save). */
+  writeBusy: boolean;
   query: string;
   loading: boolean;
   error: string | null;
@@ -41,6 +45,10 @@ interface MemoryState {
   resetChunk: (chunkKey: string) => Promise<void>;
   /** Pin/unpin a chunk: pinned holds weight at 1.0 and is never dormant. */
   setPinned: (chunkKey: string, pinned: boolean) => Promise<void>;
+  /** Replace one curated stratum's body, then re-pull the snapshot (#868).
+   *  Resolves `true` on success; `false` leaves `error` set so the editor can
+   *  keep the user's buffer instead of discarding it. */
+  writeStratum: (stratum: MemoryCategoryId, text: string) => Promise<boolean>;
   /** Record a `memory:flushed` event (wired in lib/events.ts). The Settings pane
    *  reloads on the bump so freshly-flushed content shows. */
   noteFlush: (writes: number) => void;
@@ -63,6 +71,7 @@ export const useMemoryStore = create<MemoryState>((set, get) => ({
   journalBodies: {},
   chunks: [],
   chunkBusy: {},
+  writeBusy: false,
   query: "",
   loading: false,
   error: null,
@@ -154,6 +163,28 @@ export const useMemoryStore = create<MemoryState>((set, get) => ({
         error: e instanceof Error ? e.message : String(e),
         chunkBusy: clearBusy(s.chunkBusy, chunkKey),
       }));
+    }
+  },
+
+  // The write seam is deliberately narrow (#868/#969): the backend owns the
+  // atomic rewrite of MEMORY.md, so we hand it the new section body and then
+  // re-`load()` rather than patching `curatedBody` locally — the reload also
+  // picks up the reindexed chunk stats the command produces as a side effect.
+  // `writeBusy` doubles as a re-entrancy guard for a double-fired Save.
+  writeStratum: async (stratum, text) => {
+    if (get().writeBusy) return false;
+    set({ writeBusy: true, error: null });
+    try {
+      await ipc.writeCuratedMemory(stratum, text);
+      await get().load();
+      set({ writeBusy: false });
+      return true;
+    } catch (e) {
+      set({
+        writeBusy: false,
+        error: e instanceof Error ? e.message : String(e),
+      });
+      return false;
     }
   },
 

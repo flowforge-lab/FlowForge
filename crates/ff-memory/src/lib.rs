@@ -78,6 +78,9 @@ impl Stratum {
         }
     }
 
+    /// Every stratum, in canonical render order.
+    pub const ALL: [Stratum; 3] = [Stratum::Identity, Stratum::Patterns, Stratum::Focus];
+
     /// Parse the lowercase tool-facing name (`identity` / `patterns` / `focus`).
     pub fn parse(s: &str) -> Option<Self> {
         match s {
@@ -86,6 +89,33 @@ impl Stratum {
             "focus" => Some(Stratum::Focus),
             _ => None,
         }
+    }
+
+    /// Classify a Markdown line as a stratum heading, case-insensitively.
+    ///
+    /// **This is the section boundary, and it is deliberately the only one.** A
+    /// `## X` that is not one of the three strata is a note's own sub-heading —
+    /// `memory_write` encourages those — so it belongs to the current stratum's
+    /// body rather than ending the section (#774).
+    ///
+    /// The read side (the frontend's `parseCategories`, mirrored by
+    /// `lib/memory-view.ts`) and the write side ([`replace_under_heading`]) must
+    /// agree on this rule or a stratum containing a sub-heading round-trips
+    /// lossily: read renders the whole body, write truncates at the sub-heading
+    /// and re-appends the tail as a sibling section. Routing both through this
+    /// one predicate makes that class of bug unrepresentable.
+    pub fn from_heading_line(line: &str) -> Option<Self> {
+        let text = line.trim_end();
+        let rest = text.strip_prefix("##")?;
+        // Exactly the `## <Name>` shape — `###` and `##Name` are not stratum
+        // headings, matching the read side's `^##\s+(.+?)\s*$`.
+        if !rest.starts_with(char::is_whitespace) {
+            return None;
+        }
+        let name = rest.trim();
+        Stratum::ALL
+            .into_iter()
+            .find(|s| s.heading()[3..].eq_ignore_ascii_case(name))
     }
 }
 
@@ -415,7 +445,7 @@ impl Memory {
     /// the heading. Goes through [`rewrite_curated`] (atomic, single-writer).
     pub fn replace_curated_stratum(&self, text: &str, stratum: Stratum) -> Result<PathBuf> {
         let existing = read_lenient(&self.curated_path());
-        let updated = replace_under_heading(&existing, stratum.heading(), text);
+        let updated = replace_under_heading(&existing, stratum, text);
         self.rewrite_curated(&updated)?;
         Ok(self.curated_path())
     }
@@ -1043,15 +1073,27 @@ fn insert_under_heading(content: &str, heading: &str, text: &str) -> String {
     }
 }
 
-/// Replace the entire body under `heading` with `text` (#969, whole-stratum replace),
-/// preserving the heading line and all sibling `## ` sections. When the heading is
-/// absent it is created at the end (same as [`insert_under_heading`]), so a
-/// first-time edit of an empty stratum works. Empty `text` leaves the heading with
-/// an empty body (the stratum is cleared, not removed).
-fn replace_under_heading(content: &str, heading: &str, text: &str) -> String {
+/// Replace the entire body under `stratum`'s heading with `text` (#969,
+/// whole-stratum replace), preserving the heading line and all sibling stratum
+/// sections. When the heading is absent it is created at the end (same as
+/// [`insert_under_heading`]), so a first-time edit of an empty stratum works.
+/// Empty `text` leaves the heading with an empty body (the stratum is cleared,
+/// not removed).
+///
+/// Section bounds — both the heading match and the end — go through
+/// [`Stratum::from_heading_line`], the single rule the read side also uses. A
+/// user's own `## sub-heading` inside a stratum is body, not a boundary, so
+/// editing such a stratum round-trips conservatively instead of truncating at
+/// the sub-heading and re-appending the tail as a sibling section (#774/#868).
+fn replace_under_heading(content: &str, stratum: Stratum, text: &str) -> String {
+    let heading = stratum.heading();
     let text = text.trim_end();
     let lines: Vec<&str> = content.lines().collect();
-    let head_idx = lines.iter().position(|l| l.trim_end() == heading);
+    // Case-insensitive, like the read side: a hand-written `## identity` is the
+    // Identity stratum, and must be rewritten in place rather than duplicated.
+    let head_idx = lines
+        .iter()
+        .position(|l| Stratum::from_heading_line(l) == Some(stratum));
 
     match head_idx {
         None => {
@@ -1069,10 +1111,11 @@ fn replace_under_heading(content: &str, heading: &str, text: &str) -> String {
             out
         }
         Some(h) => {
-            // Section ends at the next top-level `## ` heading, or EOF.
+            // Section ends at the next *known stratum* heading, or EOF — NOT at
+            // any `## `, which would swallow a note's own sub-heading boundary.
             let end = lines[h + 1..]
                 .iter()
-                .position(|l| l.starts_with("## "))
+                .position(|l| Stratum::from_heading_line(l).is_some())
                 .map(|rel| h + 1 + rel)
                 .unwrap_or(lines.len());
 

@@ -59,6 +59,7 @@ export type { MemoryChunkStat } from "./MemoryChunkStat";
 export type { MemoryFileInfo } from "./MemoryFileInfo";
 export type { MemoryFileKind } from "./MemoryFileKind";
 export type { MemoryOverview } from "./MemoryOverview";
+export type { Stratum } from "./Stratum";
 export type { MemoryConfig } from "./MemoryConfig";
 export type { EmbeddingsConfig } from "./EmbeddingsConfig";
 export type { EmbeddingProvider } from "./EmbeddingProvider";

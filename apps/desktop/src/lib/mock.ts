@@ -46,6 +46,7 @@ import type {
   MemoryFileInfo,
   MemoryOverview,
   MemoryFlushedEvent,
+  Stratum,
   UpdateProgressEvent,
   Mode,
   Safety,
@@ -73,6 +74,7 @@ import type {
 import type { NotebookKernelState } from "../bindings/NotebookKernelState";
 import type { KernelInfo } from "../bindings/KernelInfo";
 import { CONTROL_DEFAULTS, type ControlConfig } from "./control";
+import { replaceCategory } from "./memory-view";
 import {
   APP_VERSION_FALLBACK,
   type UpdateStatus,
@@ -2021,6 +2023,17 @@ Shipping the Settings redesign — currently the Memory browser (SET.8).
     const f = this.memoryFiles.find((m) => m.relPath === relPath);
     if (!f) throw new Error("invalid memory path");
     return f.body;
+  }
+
+  // The one write in the memory surface (#868): whole-stratum replace on the
+  // curated file, via the same helper the real backend's `replace_under_heading`
+  // is mirrored by — so mock edits round-trip exactly like the Rust seam does.
+  async writeCuratedMemory(stratum: Stratum, text: string): Promise<void> {
+    const curated = this.memoryFiles.find((m) => m.kind === "curated");
+    if (!curated) throw new Error("no curated memory file");
+    curated.body = replaceCategory(curated.body, stratum, text);
+    curated.sizeBytes = new TextEncoder().encode(curated.body).length;
+    curated.modifiedMs = Date.now();
   }
 
   async memoryOverview(): Promise<MemoryOverview> {

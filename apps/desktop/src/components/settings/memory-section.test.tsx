@@ -2,11 +2,39 @@
 
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  afterEach,
+  beforeEach,
+  describe,
+  expect,
+  it,
+  vi,
+  type MockedFunction,
+} from "vitest";
 import { MemorySection } from "@/components/settings/memory-section";
-import { useMemoryStore } from "@/store/memory";
+import { useMemoryStore, type MemoryState } from "@/store/memory";
 import { useSettingsStore } from "@/store/settings";
 import type { MemoryChunkStat } from "@/bindings/MemoryChunkStat";
+
+// Milkdown builds its ProseMirror view asynchronously and needs a real layout,
+// so stand in a plain textarea with the same value/onChange contract. The real
+// editor is covered by `components/ui/markdown-editor.test.tsx`; what matters
+// here is the surrounding Edit → Save/Cancel wiring.
+vi.mock("@/components/ui/markdown-editor", () => ({
+  MarkdownEditor: ({
+    value,
+    onChange,
+  }: {
+    value: string;
+    onChange: (md: string) => void;
+  }) => (
+    <textarea
+      data-testid="md-editor"
+      defaultValue={value}
+      onChange={(e) => onChange(e.target.value)}
+    />
+  ),
+}));
 
 // Minimal shims so radix primitives (Switch/Tooltip) mount under jsdom.
 (
@@ -54,6 +82,7 @@ function seed(flushCount: number, lastFlushWrites = 0) {
     journalBodies: {},
     chunks: [],
     chunkBusy: {},
+    writeBusy: false,
     query: "",
     loading: false,
     error: null,
@@ -343,5 +372,207 @@ describe("MemorySection — category tabs + reading view (#906)", () => {
     act(() => useMemoryStore.getState().setQuery("nope-not-found"));
     expect(container.textContent).toContain("No match");
     expect(tabs().some((t) => t.querySelector("[aria-hidden]"))).toBe(false);
+  });
+});
+
+describe("MemorySection — editable curated strata (#868)", () => {
+  function buttonNamed(name: string): HTMLButtonElement | undefined {
+    return [...container.querySelectorAll("button")].find(
+      (b) => b.textContent?.trim() === name,
+    );
+  }
+
+  function editor(): HTMLTextAreaElement | null {
+    return container.querySelector<HTMLTextAreaElement>(
+      '[data-testid="md-editor"]',
+    );
+  }
+
+  /** React tracks the DOM value internally, so a bare `el.value = …` is
+   *  swallowed as a no-op change — go through the native setter first. */
+  function type(text: string) {
+    const el = editor()!;
+    act(() => {
+      Object.getOwnPropertyDescriptor(
+        HTMLTextAreaElement.prototype,
+        "value",
+      )?.set?.call(el, text);
+      el.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+  }
+
+  /** The discard confirm renders in a Radix portal, outside `container`. */
+  function dialog(): HTMLElement | null {
+    return document.body.querySelector('[role="alertdialog"]');
+  }
+
+  let writeStratum: MockedFunction<MemoryState["writeStratum"]>;
+
+  beforeEach(() => {
+    seedCurated(FIXTURE);
+    writeStratum = vi.fn(async () => true);
+    useMemoryStore.setState({ writeStratum });
+  });
+
+  it("offers Edit on every stratum tab, including a short un-truncated one", () => {
+    render(<MemorySection />);
+    // Identity is long enough to truncate; Focus is not — both still get Edit.
+    expect(buttonNamed("Edit")).toBeTruthy();
+
+    const focusTab = [
+      ...container.querySelectorAll<HTMLElement>('[role="tab"]'),
+    ].find((t) => t.textContent?.includes("Focus"));
+    act(() => focusTab?.focus());
+    expect(container.textContent).not.toContain("See more");
+    expect(buttonNamed("Edit")).toBeTruthy();
+  });
+
+  it("Edit opens the reading view already in edit mode, seeded with the body", () => {
+    render(<MemorySection />);
+    click(buttonNamed("Edit"));
+
+    expect(container.textContent).toContain("Back");
+    expect(editor()).not.toBeNull();
+    expect(editor()?.value).toContain("Identity line 14");
+    // The other panel surfaces are replaced, not stacked (no nested scroll).
+    expect(container.textContent).not.toContain("Journal");
+  });
+
+  it("Save is disabled until the body actually changes", () => {
+    render(<MemorySection />);
+    click(buttonNamed("Edit"));
+    expect(buttonNamed("Save")?.disabled).toBe(true);
+
+    type("edited identity");
+    expect(buttonNamed("Save")?.disabled).toBe(false);
+  });
+
+  it("Save writes the edited body for the open stratum and leaves edit mode", async () => {
+    render(<MemorySection />);
+    click(buttonNamed("Edit"));
+    type("edited identity");
+
+    await act(async () => {
+      buttonNamed("Save")?.dispatchEvent(
+        new MouseEvent("click", { bubbles: true }),
+      );
+    });
+
+    expect(writeStratum).toHaveBeenCalledWith("identity", "edited identity");
+    expect(editor()).toBeNull();
+  });
+
+  it("keeps the buffer and stays in edit mode when the write fails", async () => {
+    writeStratum.mockResolvedValue(false);
+    render(<MemorySection />);
+    click(buttonNamed("Edit"));
+    type("edited identity");
+
+    await act(async () => {
+      buttonNamed("Save")?.dispatchEvent(
+        new MouseEvent("click", { bubbles: true }),
+      );
+    });
+
+    expect(editor()).not.toBeNull();
+    expect(buttonNamed("Save")?.disabled).toBe(false);
+  });
+
+  it("Cancel with no changes exits straight to the reading view", () => {
+    render(<MemorySection />);
+    click(buttonNamed("Edit"));
+    click(buttonNamed("Cancel"));
+
+    expect(dialog()).toBeNull();
+    expect(editor()).toBeNull();
+    expect(container.textContent).toContain("Identity line 14");
+  });
+
+  it("Cancel with unsaved changes asks before discarding", () => {
+    render(<MemorySection />);
+    click(buttonNamed("Edit"));
+    type("edited identity");
+    click(buttonNamed("Cancel"));
+
+    expect(dialog()).not.toBeNull();
+    expect(dialog()?.textContent).toContain("Discard unsaved changes?");
+    // Still editing until the user confirms.
+    expect(editor()).not.toBeNull();
+
+    click(
+      [...document.body.querySelectorAll("button")].find(
+        (b) => b.textContent?.trim() === "Discard",
+      ),
+    );
+    expect(editor()).toBeNull();
+    expect(writeStratum).not.toHaveBeenCalled();
+  });
+
+  it("asks before a Save that would clear the section", async () => {
+    // An empty save clears the stratum (the backend keeps only the heading), so
+    // select-all + delete + Save must not wipe it silently.
+    render(<MemorySection />);
+    click(buttonNamed("Edit"));
+    type("   ");
+
+    click(buttonNamed("Save"));
+    expect(dialog()?.textContent).toContain("Clear the Identity section?");
+    expect(writeStratum).not.toHaveBeenCalled();
+
+    await act(async () => {
+      [...document.body.querySelectorAll("button")]
+        .find((b) => b.textContent?.trim() === "Clear section")
+        ?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    expect(writeStratum).toHaveBeenCalledWith("identity", "   ");
+  });
+
+  it("saves a non-empty body without any confirmation", async () => {
+    render(<MemorySection />);
+    click(buttonNamed("Edit"));
+    type("still has content");
+
+    await act(async () => {
+      buttonNamed("Save")?.dispatchEvent(
+        new MouseEvent("click", { bubbles: true }),
+      );
+    });
+    expect(dialog()).toBeNull();
+    expect(writeStratum).toHaveBeenCalledWith("identity", "still has content");
+  });
+
+  it("does not ask when clearing a stratum that is already empty", async () => {
+    seedCurated("## Identity\n\n## Patterns\nSomething.\n");
+    render(<MemorySection />);
+    click(buttonNamed("Edit"));
+    type("  ");
+
+    // Nothing to lose — Save stays disabled because the draft isn't dirty.
+    expect(buttonNamed("Save")?.disabled).toBe(true);
+    expect(dialog()).toBeNull();
+  });
+
+  it("Back with unsaved changes asks before leaving the reading view", () => {
+    render(<MemorySection />);
+    click(buttonNamed("Edit"));
+    type("edited identity");
+    click(
+      [...container.querySelectorAll("button")].find((b) =>
+        b.textContent?.includes("Back"),
+      ),
+    );
+
+    expect(dialog()).not.toBeNull();
+    expect(container.textContent).not.toContain("Journal");
+  });
+
+  it("leaves the journal and files surfaces read-only", () => {
+    render(<MemorySection />);
+    // The one Edit control belongs to the category pane; nothing below it.
+    expect(
+      [...container.querySelectorAll("button")].filter(
+        (b) => b.textContent?.trim() === "Edit",
+      ),
+    ).toHaveLength(1);
   });
 });

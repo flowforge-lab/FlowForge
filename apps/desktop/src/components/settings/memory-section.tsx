@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
   ChevronLeft,
+  Pencil,
   Pin,
   RotateCcw,
   Search,
@@ -8,9 +9,20 @@ import {
   X,
 } from "@/components/ui/icon";
 import { cn } from "@/lib/utils";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { MarkdownEditor } from "@/components/ui/markdown-editor";
 import { Progress } from "@/components/ui/progress";
 import { Switch } from "@/components/ui/switch";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
@@ -62,17 +74,23 @@ function prettyDate(iso: string): string {
  * "See more" only when the body is actually truncated. No inner scrollbar —
  * the Memory pane already lives inside the Settings dialog's one `ScrollArea`,
  * so a second nested scroll region is exactly the bug this replaces (#903).
+ *
+ * Edit (#868) is always offered, including for a short body that never
+ * truncates; it opens the same reading view "See more" does, already in edit
+ * mode, so the editor gets the full pane rather than growing this card.
  */
 function CategoryPane({
   subtitle,
   body,
   query,
   onSeeMore,
+  onEdit,
 }: {
   subtitle: string;
   body: string;
   query: string;
   onSeeMore: () => void;
+  onEdit: () => void;
 }) {
   const hidden = query.trim() !== "" && !categoryMatches(body, query);
   const { preview, truncated } = clampCategoryBody(body);
@@ -88,15 +106,27 @@ function CategoryPane({
           preview
         )}
       </div>
-      {!hidden && truncated ? (
-        <button
-          type="button"
-          onClick={onSeeMore}
-          className="mt-2 text-[11px] font-medium text-primary hover:underline"
+      <div className="mt-2 flex items-center gap-3">
+        {!hidden && truncated ? (
+          <button
+            type="button"
+            onClick={onSeeMore}
+            className="text-[11px] font-medium text-primary hover:underline"
+          >
+            See more
+          </button>
+        ) : null}
+        <Button
+          size="xs"
+          variant="ghost"
+          className="ml-auto"
+          disabled={hidden}
+          onClick={onEdit}
         >
-          See more
-        </button>
-      ) : null}
+          <Pencil />
+          Edit
+        </Button>
+      </div>
     </div>
   );
 }
@@ -214,11 +244,15 @@ function ChunkRow({
 }
 
 /**
- * Memory section (SET.8, #131): a read-only browser over the RFC 0006 memory
- * store. Curated `MEMORY.md` parses into the Identity / Patterns / Focus cards
+ * Memory section (SET.8, #131): a browser over the RFC 0006 memory store.
+ * Curated `MEMORY.md` parses into the Identity / Patterns / Focus cards
  * (RFC 0008 §3); `daily/*` files become the JOURNAL; every file is listed under
  * FILES with a count/size footer. Search filters all surfaces client-side; the
  * footer "Reset to defaults" clears it.
+ *
+ * The three curated strata are editable (#868) — Edit opens the reading view in
+ * edit mode, and Save routes through the backend's whole-stratum replace command
+ * rather than writing the file from the frontend. Everything else is read-only.
  */
 export function MemorySection() {
   const overview = useMemoryStore((s) => s.overview);
@@ -249,6 +283,22 @@ export function MemorySection() {
   const readingHeadingRef = useRef<HTMLHeadingElement>(null);
   const activeTriggerRef = useRef<HTMLButtonElement>(null);
 
+  // Editing (#868). `draft` is the MarkdownEditor's buffer — the editor is
+  // uncontrolled (it seeds `value` once on mount), so this holds the text to
+  // save rather than driving the editor. `null` means "untouched since Edit".
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState<string | null>(null);
+  // Both destructive edits route through one confirm dialog: `discard` throws
+  // away an unsaved buffer, `clear` writes an empty body (the backend keeps the
+  // heading and drops the content), which select-all + delete + Save would
+  // otherwise do silently.
+  const [confirm, setConfirm] = useState<null | {
+    kind: "discard" | "clear";
+    action: () => void;
+  }>(null);
+  const writeBusy = useMemoryStore((s) => s.writeBusy);
+  const writeStratum = useMemoryStore((s) => s.writeStratum);
+
   useEffect(() => {
     void load();
   }, [load]);
@@ -270,6 +320,9 @@ export function MemorySection() {
     registerResetHandler(() => {
       resetSearch();
       setReading(null);
+      setEditing(false);
+      setDraft(null);
+      setConfirm(null);
     });
     return () => registerResetHandler(null);
   }, [registerResetHandler, resetSearch]);
@@ -306,8 +359,30 @@ export function MemorySection() {
   // dialog's own focus effect only runs on mount/unmount) — which also
   // scrolls it into view via the browser's native focus-scroll behavior.
   useEffect(() => {
-    if (reading !== null) readingHeadingRef.current?.focus();
-  }, [reading]);
+    if (reading !== null && !editing) readingHeadingRef.current?.focus();
+  }, [reading, editing]);
+
+  // Entering edit mode, focus the editor itself. Milkdown creates its view a
+  // few microtasks after render, so poll for the ProseMirror surface over a
+  // bounded number of frames rather than assuming it is there on commit.
+  const editorHostRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!editing) return;
+    let frames = 0;
+    let raf = 0;
+    const tryFocus = () => {
+      const el = editorHostRef.current?.querySelector<HTMLElement>(
+        "[contenteditable='true']",
+      );
+      if (el) {
+        el.focus();
+        return;
+      }
+      if (frames++ < 30) raf = requestAnimationFrame(tryFocus);
+    };
+    raf = requestAnimationFrame(tryFocus);
+    return () => cancelAnimationFrame(raf);
+  }, [editing]);
 
   const journal: MemoryJournalEntry[] = useMemo(
     () => filterJournal(buildJournal(files, journalBodies), query),
@@ -330,40 +405,154 @@ export function MemorySection() {
     const meta = MEMORY_CATEGORY_META.find((m) => m.id === reading);
     const body = categories[reading];
     const hidden = query.trim() !== "" && !categoryMatches(body, query);
+
+    // Milkdown re-serializes the Markdown it parsed (list markers, escapes,
+    // trailing newline), so compare trimmed — opening and closing the editor
+    // without typing must not register as an edit.
+    const dirty = draft !== null && draft.trim() !== body.trim();
+
+    const leaveEditor = () => {
+      setEditing(false);
+      setDraft(null);
+    };
+    const guard = (action: () => void) =>
+      dirty ? setConfirm({ kind: "discard", action }) : action();
+
+    const exitReading = () => {
+      leaveEditor();
+      setReading(null);
+      requestAnimationFrame(() => activeTriggerRef.current?.focus());
+    };
+
+    const write = async () => {
+      if (draft === null) return leaveEditor();
+      const ok = await writeStratum(reading, draft);
+      // On failure keep the buffer and stay in edit mode — the store's `error`
+      // is already rendered above the pane, and the user's text is unsaved.
+      if (ok) leaveEditor();
+    };
+
+    // Saving an empty body clears the stratum (the backend keeps only the
+    // heading). That is a legitimate action, but it's one keystroke away from
+    // select-all + delete, so confirm it — symmetric with the discard guard.
+    // Only when there was something to lose: clearing an already-empty stratum
+    // needs no ceremony.
+    const save = () => {
+      if (draft !== null && draft.trim() === "" && body.trim() !== "") {
+        setConfirm({ kind: "clear", action: () => void write() });
+        return;
+      }
+      void write();
+    };
+
     return (
       <div className="space-y-3">
         <button
           type="button"
-          onClick={() => {
-            setReading(null);
-            requestAnimationFrame(() => activeTriggerRef.current?.focus());
-          }}
+          onClick={() => guard(exitReading)}
           className="flex items-center gap-1 text-[12px] font-medium text-muted-foreground transition-colors hover:text-foreground"
         >
           <ChevronLeft className="size-3.5" />
           Back
         </button>
-        <div>
-          <h2
-            ref={readingHeadingRef}
-            tabIndex={-1}
-            className="text-[13px] font-medium text-foreground outline-none"
-          >
-            {meta?.label}
-          </h2>
-          <p className="mt-0.5 text-[11px] text-muted-foreground">
-            {meta?.subtitle}
-          </p>
-        </div>
-        <div className="whitespace-pre-wrap text-[13px] leading-relaxed text-foreground/90">
-          {body === "" ? (
-            <span className="text-muted-foreground/70">No entries yet</span>
-          ) : hidden ? (
-            <span className="text-muted-foreground/70">No match</span>
-          ) : (
-            body
+        <div className="flex items-start gap-2">
+          <div className="min-w-0 flex-1">
+            <h2
+              ref={readingHeadingRef}
+              tabIndex={-1}
+              className="text-[13px] font-medium text-foreground outline-none"
+            >
+              {meta?.label}
+            </h2>
+            <p className="mt-0.5 text-[11px] text-muted-foreground">
+              {meta?.subtitle}
+            </p>
+          </div>
+          {editing ? null : (
+            <Button size="xs" variant="ghost" onClick={() => setEditing(true)}>
+              <Pencil />
+              Edit
+            </Button>
           )}
         </div>
+
+        {error ? (
+          <p className="text-[12px] text-destructive" role="alert">
+            {error}
+          </p>
+        ) : null}
+
+        {editing ? (
+          <>
+            <div ref={editorHostRef}>
+              <MarkdownEditor
+                // Uncontrolled: `value` seeds the document once on mount, so the
+                // key remounts the editor when a different stratum is opened.
+                key={reading}
+                value={body}
+                onChange={setDraft}
+                placeholder="Nothing here yet — write what the agent should remember."
+              />
+            </div>
+            <div className="flex items-center gap-2">
+              <Button size="sm" disabled={!dirty || writeBusy} onClick={save}>
+                {writeBusy ? "Saving…" : "Save"}
+              </Button>
+              <Button
+                size="sm"
+                variant="ghost"
+                disabled={writeBusy}
+                onClick={() => guard(leaveEditor)}
+              >
+                Cancel
+              </Button>
+              <span className="text-[11px] text-muted-foreground">
+                Replaces the whole {meta?.label} section of MEMORY.md.
+              </span>
+            </div>
+          </>
+        ) : (
+          <div className="whitespace-pre-wrap text-[13px] leading-relaxed text-foreground/90">
+            {body === "" ? (
+              <span className="text-muted-foreground/70">No entries yet</span>
+            ) : hidden ? (
+              <span className="text-muted-foreground/70">No match</span>
+            ) : (
+              body
+            )}
+          </div>
+        )}
+
+        <AlertDialog
+          open={confirm !== null}
+          onOpenChange={(next) => !next && setConfirm(null)}
+        >
+          <AlertDialogContent>
+            <AlertDialogHeader>
+              <AlertDialogTitle>
+                {confirm?.kind === "clear"
+                  ? `Clear the ${meta?.label} section?`
+                  : "Discard unsaved changes?"}
+              </AlertDialogTitle>
+              <AlertDialogDescription>
+                {confirm?.kind === "clear"
+                  ? `Saving an empty editor removes everything under ${meta?.label} in MEMORY.md, keeping only the heading. The agent will no longer recall it.`
+                  : `Your edits to ${meta?.label} have not been written to MEMORY.md. Discarding restores the version currently on disk.`}
+              </AlertDialogDescription>
+            </AlertDialogHeader>
+            <AlertDialogFooter>
+              <AlertDialogCancel>Keep editing</AlertDialogCancel>
+              <AlertDialogAction
+                onClick={() => {
+                  confirm?.action();
+                  setConfirm(null);
+                }}
+              >
+                {confirm?.kind === "clear" ? "Clear section" : "Discard"}
+              </AlertDialogAction>
+            </AlertDialogFooter>
+          </AlertDialogContent>
+        </AlertDialog>
       </div>
     );
   }
@@ -371,14 +560,15 @@ export function MemorySection() {
   return (
     <div className="space-y-4">
       <p className="text-[12px] leading-relaxed text-muted-foreground">
-        Read-only view of the Markdown memory on disk
+        The Markdown memory on disk
         {overview ? (
           <>
             {" at "}
             <code className="text-[11px]">{overview.rootPath}</code>
           </>
         ) : null}
-        . Captured automatically; edit the files directly to change it.
+        . Captured automatically — Identity, Patterns, and Focus can be edited
+        here; the journal and other files are read-only.
       </p>
 
       {showFlushBanner ? (
@@ -455,6 +645,11 @@ export function MemorySection() {
                 body={categories[tab]}
                 query={query}
                 onSeeMore={() => setReading(tab)}
+                onEdit={() => {
+                  setDraft(null);
+                  setEditing(true);
+                  setReading(tab);
+                }}
               />
             </TabsContent>
           </Tabs>

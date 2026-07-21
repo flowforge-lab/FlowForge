@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import { MockIpc } from "./mock";
+import { parseCategories } from "./memory-view";
 
 describe("MockIpc memory (M5.1e, #131)", () => {
   it("lists curated first, then daily newest-first, with no body leaked", async () => {
@@ -43,6 +44,49 @@ describe("MockIpc memory (M5.1e, #131)", () => {
 
     await expect(ipc.readMemoryFile("daily/ghost.md")).rejects.toThrow(
       "invalid memory path",
+    );
+  });
+});
+
+describe("MockIpc — curated write seam (#868)", () => {
+  it("replaces a stratum body in place and re-reads it", async () => {
+    const ipc = new MockIpc();
+    await ipc.writeCuratedMemory("focus", "Editable memory strata.");
+
+    const body = await ipc.readMemoryFile("MEMORY.md");
+    const cats = parseCategories(body);
+    expect(cats.focus).toBe("Editable memory strata.");
+    // Siblings and the file title survive the write.
+    expect(cats.identity).toContain("frontend");
+    expect(body.startsWith("# Memory")).toBe(true);
+  });
+
+  it("creates a missing heading rather than dropping the write", async () => {
+    // Mirrors the backend's `replace_curated_stratum_creates_when_absent`: the
+    // mock's fixture has all three strata, so drop one first.
+    const ipc = new MockIpc();
+    await ipc.writeCuratedMemory("focus", "");
+    const cleared = parseCategories(await ipc.readMemoryFile("MEMORY.md"));
+    expect(cleared.focus).toBe("");
+
+    await ipc.writeCuratedMemory("focus", "Shipping #868.");
+    const body = await ipc.readMemoryFile("MEMORY.md");
+    expect(parseCategories(body).focus).toBe("Shipping #868.");
+    expect(body.match(/## Focus/g)).toHaveLength(1);
+  });
+
+  it("keeps the listing metadata consistent with the new body", async () => {
+    const ipc = new MockIpc();
+    await ipc.writeCuratedMemory("identity", "short");
+
+    const files = await ipc.listMemoryFiles();
+    const curated = files.find((f) => f.kind === "curated");
+    const body = await ipc.readMemoryFile("MEMORY.md");
+    expect(curated?.sizeBytes).toBe(new TextEncoder().encode(body).length);
+
+    const overview = await ipc.memoryOverview();
+    expect(overview.totalBytes).toBe(
+      files.reduce((sum, f) => sum + f.sizeBytes, 0),
     );
   });
 });
