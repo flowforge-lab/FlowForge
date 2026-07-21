@@ -12,9 +12,23 @@ import {
 import { ipc } from "@/lib/ipc";
 import { Progress } from "@/components/ui/progress";
 import { Toast, ToastViewport } from "@/components/ui/toast";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
 import { useExperimentalStore } from "@/store/experimental";
 import { useSettingsStore } from "@/store/settings";
-import { progressPercent, useUpdateStore } from "@/store/update";
+import {
+  progressPercent,
+  activeUpdateChannel,
+  useUpdateStore,
+} from "@/store/update";
 
 const TOAST_MS = 3200;
 
@@ -30,6 +44,8 @@ export function AboutSection() {
   const devTools = useExperimentalStore((s) => s.flags.devTools);
   const [version, setVersion] = useState<string | null>(null);
   const [toast, setToast] = useState<string | null>(null);
+  // Downgrade confirmation (#1034) — an older local build only installs from here.
+  const [confirmingDowngrade, setConfirmingDowngrade] = useState(false);
 
   // Update state lives in a shared store (#363) so a future background indicator
   // can reuse it; the manual check below also feeds it so "Update now" appears.
@@ -68,12 +84,29 @@ export function AboutSection() {
     [showToast],
   );
 
+  // Install the exact version this section is showing. The backend re-checks the feed
+  // and refuses anything else (#1034) — the store then re-checks, so the row/dialog
+  // re-prompts with the build that is really on the feed and the toast says why.
+  const runInstall = useCallback(
+    (expectedVersion: string, allowDowngrade = false) => {
+      void install(
+        activeUpdateChannel(),
+        expectedVersion,
+        allowDowngrade,
+      ).catch((err) =>
+        showToast(err instanceof Error ? err.message : String(err)),
+      );
+    },
+    [install, showToast],
+  );
+
   // Manual check: store the result (so the "Update now" row can appear) and toast
   // the FE-owned copy. Distinct from the store's silent background `refresh`.
   const onCheckForUpdates = useCallback(() => {
     void (async () => {
       try {
-        const status = await ipc.checkForUpdates();
+        const channel = activeUpdateChannel();
+        const status = await ipc.checkForUpdates(channel);
         useUpdateStore.setState({ status });
         showToast(formatUpdateStatus(status));
       } catch (err) {
@@ -81,6 +114,17 @@ export function AboutSection() {
       }
     })();
   }, [showToast]);
+
+  // Real download progress (#566): determinate when a content length is known,
+  // indeterminate (pulsing) track otherwise. Shared by the newer and older paths.
+  const progressRow = (
+    <div className="border-b px-3 py-2.5 last:border-b-0">
+      <Progress
+        value={percent}
+        className={percent == null ? "animate-pulse" : undefined}
+      />
+    </div>
+  );
 
   return (
     <div className="space-y-6">
@@ -100,7 +144,7 @@ export function AboutSection() {
           <>
             <AboutRow
               label={`Update now — version ${updateStatus.version}`}
-              onClick={() => void install()}
+              onClick={() => runInstall(updateStatus.version)}
               disabled={installing}
               trailing={
                 installing ? (
@@ -111,16 +155,33 @@ export function AboutSection() {
                 ) : undefined
               }
             />
-            {installing ? (
-              // Real download progress (#566): determinate when a content length is
-              // known, indeterminate (pulsing) track otherwise.
-              <div className="border-b px-3 py-2.5 last:border-b-0">
-                <Progress
-                  value={percent}
-                  className={percent == null ? "animate-pulse" : undefined}
-                />
-              </div>
-            ) : null}
+            {installing ? progressRow : null}
+          </>
+        ) : null}
+        {/* An older local build (#1034) is never bannered and never one-click: it
+            shows here with its build identity and installs only after the user
+            confirms the downgrade — the path that makes bisecting a dogfood
+            regression possible. */}
+        {updateStatus?.kind === "olderAvailable" ? (
+          <>
+            <AboutRow
+              label={`Install older build — version ${updateStatus.version}`}
+              onClick={() => setConfirmingDowngrade(true)}
+              disabled={installing}
+              trailing={
+                installing ? (
+                  <Loader2
+                    className="size-4 shrink-0 animate-spin text-muted-foreground"
+                    aria-hidden
+                  />
+                ) : undefined
+              }
+            />
+            <p className="border-b px-3 py-2 text-[12px] text-muted-foreground last:border-b-0">
+              Older than the running build
+              {updateStatus.notes ? ` — ${updateStatus.notes}` : "."}
+            </p>
+            {installing ? progressRow : null}
           </>
         ) : null}
         <AboutRow
@@ -193,11 +254,47 @@ export function AboutSection() {
         />
       </AboutGroup>
 
+      <AlertDialog
+        open={confirmingDowngrade}
+        onOpenChange={setConfirmingDowngrade}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Install an older build?</AlertDialogTitle>
+            <AlertDialogDescription>
+              {updateStatus?.kind === "olderAvailable" ? (
+                <>
+                  Version {updateStatus.version} is older than the build you're
+                  running. This is a downgrade — FlowForge will install it and
+                  relaunch.
+                  {updateStatus.notes ? ` ${updateStatus.notes}` : ""}
+                </>
+              ) : null}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>Cancel</AlertDialogCancel>
+            <AlertDialogAction
+              onClick={() => {
+                setConfirmingDowngrade(false);
+                if (updateStatus?.kind !== "olderAvailable") return;
+                // The version the user just confirmed, plus the explicit downgrade
+                // opt-in — the backend refuses an older build without the opt-in,
+                // and refuses any *other* version than this one (#1034).
+                runInstall(updateStatus.version, true);
+              }}
+            >
+              Install older build
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
       {/* Fixed viewport, not an inline block at the end of the section: About lives
           inside the settings ScrollArea, so an inline toast lands below the fold and
           is clipped — every action here (Check for updates, What's New, Quick Setup,
           the backup rows) looked dead because its only feedback was off-screen. This
-          is the same anchor the app's other toasts use. */}
+          is the same anchor the app's other toasts use (#1054). */}
       {toast ? (
         <ToastViewport className="z-[60]">
           <Toast className="text-[12px]">{toast}</Toast>

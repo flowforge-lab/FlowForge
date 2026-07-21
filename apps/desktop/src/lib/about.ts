@@ -12,7 +12,19 @@ export const APP_VERSION_FALLBACK = "0.1.0";
  *  `formatUpdateStatus`); the backend reports only the structured outcome. */
 export type UpdateStatus =
   | { kind: "upToDate"; version: string }
-  | { kind: "available"; version: string; notes: string | null };
+  | { kind: "available"; version: string; notes: string | null }
+  /** The feed's build is OLDER than the running one (#1034) — only reachable on the
+   *  local dogfood channel, where rebuilding an earlier commit is a legitimate move
+   *  while bisecting. Never bannered; Settings → About offers it behind an explicit
+   *  downgrade confirmation. */
+  | { kind: "olderAvailable"; version: string; notes: string | null };
+
+/** Which update feed a check/install targets (#1033). Passed explicitly on every
+ *  call so the endpoint is never inferred from a global flag — the ordering bug
+ *  that let a boot check race the dev-update watcher onto GitHub. `local` is the
+ *  `dev-release.sh` server on localhost; `github` is the shipped release feed.
+ *  Serializes to the Rust `UpdateChannel` enum (camelCase). */
+export type UpdateChannel = "github" | "local";
 
 /** Result of an export/restore backup action. */
 export interface BackupResult {
@@ -33,9 +45,15 @@ export interface SidecarTurnResult {
 
 /** FE-owned toast copy for an update-check result. */
 export function formatUpdateStatus(status: UpdateStatus): string {
-  return status.kind === "available"
-    ? `Version ${status.version} is available.`
-    : "You're on the latest version.";
+  switch (status.kind) {
+    case "available":
+      return `Version ${status.version} is available.`;
+    // Named as a downgrade so a manual check can't be mistaken for an update (#1034).
+    case "olderAvailable":
+      return `Local build ${status.version} is older than the running build.`;
+    default:
+      return "You're on the latest version.";
+  }
 }
 
 export const ABOUT_BUG_REPORT_URL =

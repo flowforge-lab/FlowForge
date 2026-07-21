@@ -180,6 +180,94 @@ describe("AboutSection", () => {
     expect(container.querySelector('[role="progressbar"]')).toBeNull();
   });
 
+  // Tiered install UX (#1034): an older local build is offered here and ONLY here,
+  // and only after an explicit downgrade confirmation.
+  describe("older build (#1034)", () => {
+    const OLDER = {
+      kind: "olderAvailable",
+      version: "0.0.0-dev.1700000000",
+      notes: "Local dev build abc1234 (2023-11-14T22:13:20+00:00).",
+    } as const;
+
+    // The dialog renders in a portal, outside the component's container.
+    function dialogButton(label: string): HTMLButtonElement | undefined {
+      return [...document.body.querySelectorAll("button")].find(
+        (el) => el.textContent?.trim() === label,
+      ) as HTMLButtonElement | undefined;
+    }
+
+    function installOlderRow(): HTMLButtonElement | undefined {
+      return [...container.querySelectorAll("button")].find((el) =>
+        el.textContent?.includes("Install older build"),
+      ) as HTMLButtonElement | undefined;
+    }
+
+    it("shows the older build with its identity instead of 'Update now'", () => {
+      useUpdateStore.setState({ status: OLDER });
+      render(<AboutSection />);
+      expect(updateNowButton()).toBeUndefined();
+      expect(installOlderRow()?.textContent).toContain("0.0.0-dev.1700000000");
+      // The build identity from the feed lets a dev see which commit this is.
+      expect(container.textContent).toContain("abc1234");
+      expect(container.textContent).toContain("Older than the running build");
+    });
+
+    it("clicking the row asks for confirmation instead of installing", () => {
+      const spy = vi.spyOn(ipc, "installUpdate").mockResolvedValue();
+      useUpdateStore.setState({ status: OLDER });
+      render(<AboutSection />);
+      click(installOlderRow() ?? null);
+      expect(document.body.textContent).toContain("Install an older build?");
+      expect(spy).not.toHaveBeenCalled();
+    });
+
+    it("cancelling installs nothing", () => {
+      const spy = vi.spyOn(ipc, "installUpdate").mockResolvedValue();
+      useUpdateStore.setState({ status: OLDER });
+      render(<AboutSection />);
+      click(installOlderRow() ?? null);
+      click(dialogButton("Cancel") ?? null);
+      expect(spy).not.toHaveBeenCalled();
+    });
+
+    it("confirming installs with the downgrade opt-in", async () => {
+      const spy = vi.spyOn(ipc, "installUpdate").mockResolvedValue();
+      useExperimentalStore.getState().setFlag("localUpdateChannel", true);
+      useUpdateStore.setState({ status: OLDER });
+      render(<AboutSection />);
+      click(installOlderRow() ?? null);
+      await act(async () => {
+        dialogButton("Install older build")?.dispatchEvent(
+          new MouseEvent("click", { bubbles: true }),
+        );
+      });
+      // The confirmed version travels with the install, so a feed that moved after
+      // the dialog opened is refused by the backend rather than installed (#1034).
+      expect(spy).toHaveBeenCalledWith("local", OLDER.version, true);
+    });
+
+    it("surfaces the backend's refusal when the feed moved (#1034)", async () => {
+      vi.spyOn(ipc, "installUpdate").mockRejectedValue(
+        new Error("update feed moved: you confirmed 0.0.0-dev.1700000000"),
+      );
+      vi.spyOn(ipc, "checkForUpdates").mockResolvedValue({
+        kind: "upToDate",
+        version: "0.1.0",
+      });
+      useUpdateStore.setState({ status: OLDER });
+      render(<AboutSection />);
+      click(installOlderRow() ?? null);
+      await act(async () => {
+        dialogButton("Install older build")?.dispatchEvent(
+          new MouseEvent("click", { bubbles: true }),
+        );
+      });
+      expect(container.querySelector('[role="status"]')?.textContent).toContain(
+        "feed moved",
+      );
+    });
+  });
+
   it("hides the Developer group by default (devTools flag off)", () => {
     render(<AboutSection />);
     const btn = [...container.querySelectorAll("button")].find((el) =>

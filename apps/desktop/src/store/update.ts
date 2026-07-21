@@ -5,7 +5,8 @@
 
 import { create } from "zustand";
 import { ipc } from "@/lib/ipc";
-import type { UpdateStatus } from "@/lib/about";
+import { useExperimentalStore } from "@/store/experimental";
+import type { UpdateStatus, UpdateChannel } from "@/lib/about";
 
 /** In-flight self-update download progress (#566). Cumulative bytes downloaded and
  *  the content length; `total` is `null` when the feed omits it (indeterminate bar).
@@ -35,14 +36,28 @@ interface UpdateState {
    *  bar reappears on the next poll/launch while the update is still available:
    *  `refresh()` clears this on a fresh `available` status. */
   dismissed: boolean;
-  /** Check for updates and store the result. Errors are swallowed so the silent
-   *  background poll never surfaces noise; the manual path reads `status` itself.
-   *  Clears `dismissed` so a still-available update resurfaces the bar. */
-  refresh: () => Promise<void>;
-  /** Download + install the available update. On real success the backend relaunches
-   *  the app, so this never resolves — `installing` stays true until restart. The
-   *  `finally` clears it for the mock path (which resolves immediately) and on error. */
-  install: () => Promise<void>;
+  /** Check `channel` for updates and store the result. On the `github` channel a
+   *  failed check is swallowed (keep prior status) so the silent background poll
+   *  never surfaces noise. On the `local` channel a failure means the dev-release
+   *  feed is unreachable — we clear any stale status instead of leaving a GitHub
+   *  result pinned in the UI (#1033). Clears `dismissed` so a still-available update
+   *  resurfaces the bar. */
+  refresh: (channel: UpdateChannel) => Promise<void>;
+  /** Download + install the available update from `channel`. On real success the
+   *  backend relaunches the app, so this never resolves — `installing` stays true
+   *  until restart. The `finally` clears it for the mock path and on error.
+   *
+   *  `expectedVersion` is the version the UI showed the user. The backend re-checks
+   *  the feed, so it refuses to install anything else (#1034) — on that refusal we
+   *  re-`refresh()` so the UI re-prompts with the build that is actually on the feed.
+   *  `allowDowngrade` carries the user's explicit confirmation for an OLDER build;
+   *  the backend rejects one without it, so it defaults to false and only the About
+   *  confirmation dialog passes true. */
+  install: (
+    channel: UpdateChannel,
+    expectedVersion: string,
+    allowDowngrade?: boolean,
+  ) => Promise<void>;
   /** Set (or clear) the live download progress. Fed by the `update:progress` /
    *  `update:download-finished` listeners wired in lib/events.ts (#566). */
   setProgress: (progress: UpdateProgress | null) => void;
@@ -66,26 +81,51 @@ export function shouldPollUpdate(
   return prod || (dev && localUpdateChannel);
 }
 
-export const useUpdateStore = create<UpdateState>((set) => ({
+/**
+ * The active update channel for this session (#1033). `local` when the
+ * `localUpdateChannel` experimental flag is on (dev dogfood feed), else `github`.
+ * Single source of truth so the boot poll, the About "Check for updates" row, and
+ * the update banner all target the same feed. Reads the experimental store lazily
+ * to avoid a static import cycle.
+ */
+export function activeUpdateChannel(): UpdateChannel {
+  return useExperimentalStore.getState().flags.localUpdateChannel
+    ? "local"
+    : "github";
+}
+
+export const useUpdateStore = create<UpdateState>((set, get) => ({
   status: null,
   installing: false,
   progress: null,
   dismissed: false,
 
-  refresh: async () => {
+  refresh: async (channel) => {
     try {
-      const status = await ipc.checkForUpdates();
+      const status = await ipc.checkForUpdates(channel);
       // Clear dismiss on every fresh poll so a still-available update resurfaces.
       set({ status, dismissed: false });
     } catch {
-      // Best-effort: a failed check leaves the previous status untouched.
+      // On the local dogfood channel a failure means the dev-release feed is
+      // unreachable — clear any stale status so a previous GitHub result isn't left
+      // pinned in the banner (#1033). On the github channel, stay best-effort and
+      // keep the previous status so the silent background poll never flickers.
+      if (channel === "local") set({ status: null });
     }
   },
 
-  install: async () => {
+  install: async (channel, expectedVersion, allowDowngrade = false) => {
     set({ installing: true, progress: null });
     try {
-      await ipc.installUpdate();
+      await ipc.installUpdate(channel, expectedVersion, allowDowngrade);
+    } catch (err) {
+      // The install was refused (most interestingly: the feed moved between the
+      // check the user acted on and this install). Re-check so the UI re-prompts
+      // with the build that is actually there instead of holding a version the
+      // backend just rejected (#1034 review). Best-effort — the caller still sees
+      // the original error.
+      await get().refresh(channel);
+      throw err;
     } finally {
       set({ installing: false, progress: null });
     }

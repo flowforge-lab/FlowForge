@@ -3347,8 +3347,8 @@ fn remove_mcp_server(state: State<'_, Arc<AppState>>, id: String) -> CmdResult<(
 
 /// Outcome of an update check, serialized to the FE-owned `UpdateStatus` contract
 /// in `lib/about.ts` (`{ kind: "upToDate", version }` | `{ kind: "available",
-/// version, notes }`). The FE owns the toast copy; the backend reports only the
-/// structured outcome (#159, RFC 0014).
+/// version, notes }` | `{ kind: "olderAvailable", version, notes }`). The FE owns
+/// the toast copy; the backend reports only the structured outcome (#159, RFC 0014).
 #[derive(serde::Serialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 enum UpdateStatus {
@@ -3359,39 +3359,104 @@ enum UpdateStatus {
         version: String,
         notes: Option<String>,
     },
+    /// The feed's build is **older** than the running one (#1034). Only reachable on
+    /// the local dogfood channel, where rebuilding an earlier commit is a legitimate
+    /// thing to do while bisecting. Deliberately distinct from `Available` so the FE
+    /// never banners it and requires an explicit downgrade confirmation first.
+    OlderAvailable {
+        version: String,
+        notes: Option<String>,
+    },
 }
-
-/// Build the updater. In prod it reads `plugins.updater` from `tauri.conf.json`
-/// (the GitHub `latest.json` feed). When `FF_UPDATER_ENDPOINT` is set (the RFC 0014
-/// D1 dev/dogfood channel) it points at that feed instead and accepts any version
-/// that differs from the running one, so a locally-built artifact installs without a
-/// version bump. Inert in prod (env unset).
-/// Whether the `localUpdateChannel` experimental flag is active for this session.
-/// Set by [`start_dev_update_watcher`] (called by the FE exactly when the flag is on).
-static LOCAL_UPDATE_CHANNEL: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
 
 /// Default port for the local dev-release HTTP server (matches `scripts/dev-release.sh`).
 const DEV_RELEASE_PORT: u16 = 8787;
 
-fn updater(app: &tauri::AppHandle) -> CmdResult<tauri_plugin_updater::Updater> {
+/// Which update feed a check/install should target (#1033). Passed explicitly from
+/// the FE on every call so the endpoint is never decided by a global side-effect
+/// flag — that ordering-dependent atomic is what let the first boot check race the
+/// dev-update watcher and pin the GitHub release into the UI. `github` is the
+/// compiled-in default feed; `local` is the `dev-release.sh` server on localhost.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+enum UpdateChannel {
+    #[default]
+    Github,
+    Local,
+}
+
+/// Where a feed's build sits relative to the running one (#1034).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VersionDirection {
+    /// Install it frictionlessly — this is the normal update.
+    Newer,
+    /// A deliberate downgrade; never bannered, needs explicit confirmation.
+    Older,
+    Same,
+}
+
+/// Classify `remote` against `current`.
+///
+/// With `dev-release.sh` versioning builds as `0.0.0-dev.<committer epoch>` (#1034),
+/// semver ordering of the prerelease is exactly commit recency, so plain `Version`
+/// comparison answers the question for two dogfood builds.
+///
+/// The one deliberate exception is the **dev lineage**: semver ranks every
+/// `0.0.0-dev.*` *below* a released `0.1.0`, so a dev running a release build would
+/// be asked to confirm a "downgrade" on every single dogfood install. When the feed
+/// offers a dev build and the running app is not one, treat it as `Newer` — entering
+/// the dev lineage is the point of turning the channel on, not a downgrade.
+///
+/// An unparseable version counts as `Newer`: fail toward the pre-#1034 frictionless
+/// behavior rather than silently hiding a build the dev asked for.
+pub(crate) fn compare_build(current: &str, remote: &str) -> VersionDirection {
+    if current == remote {
+        return VersionDirection::Same;
+    }
+    let (Ok(current), Ok(remote)) = (
+        semver::Version::parse(current),
+        semver::Version::parse(remote),
+    ) else {
+        return VersionDirection::Newer;
+    };
+    let is_dev = |v: &semver::Version| v.pre.as_str().starts_with("dev");
+    if is_dev(&remote) && !is_dev(&current) {
+        return VersionDirection::Newer;
+    }
+    match remote.cmp(&current) {
+        std::cmp::Ordering::Greater => VersionDirection::Newer,
+        std::cmp::Ordering::Less => VersionDirection::Older,
+        std::cmp::Ordering::Equal => VersionDirection::Same,
+    }
+}
+
+fn updater(
+    app: &tauri::AppHandle,
+    channel: UpdateChannel,
+) -> CmdResult<tauri_plugin_updater::Updater> {
     use tauri_plugin_updater::UpdaterExt;
-    // Priority: explicit env var > localUpdateChannel flag > compiled-in default.
+    // An explicit `FF_UPDATER_ENDPOINT` still wins (RFC 0014 D1 override), then the
+    // caller-supplied channel — never an ambient flag.
     if let Ok(endpoint) = std::env::var("FF_UPDATER_ENDPOINT") {
         let endpoint = url::Url::parse(&endpoint).map_err(|e| e.to_string())?;
         app.updater_builder()
             .endpoints(vec![endpoint])
             .map_err(|e| e.to_string())?
+            // Permissive on purpose (#1034): the comparator is the plugin's only gate,
+            // so accepting either direction is what lets `check()` hand us an older
+            // build at all. Direction is classified by `compare_build` below.
             .version_comparator(|current, update| update.version != current)
             .build()
             .map_err(|e| e.to_string())
-    } else if LOCAL_UPDATE_CHANNEL.load(std::sync::atomic::Ordering::Relaxed) {
+    } else if channel == UpdateChannel::Local {
         let endpoint = url::Url::parse(&format!("http://localhost:{DEV_RELEASE_PORT}/latest.json"))
             .map_err(|e| e.to_string())?;
         app.updater_builder()
             .endpoints(vec![endpoint])
             .map_err(|e| e.to_string())?
-            // Any different version is an update (dev timestamps are always unique).
+            // Any different version reaches us in either direction (#1034); whether it
+            // is an upgrade or a downgrade is decided by `compare_build`, and a
+            // downgrade additionally needs the caller's explicit opt-in.
             .version_comparator(|current, update| update.version != current)
             .build()
             .map_err(|e| e.to_string())
@@ -3400,28 +3465,101 @@ fn updater(app: &tauri::AppHandle) -> CmdResult<tauri_plugin_updater::Updater> {
     }
 }
 
-/// Check the configured update feed. Returns the structured `UpdateStatus` so the UI
+/// Check the given update feed. Returns the structured `UpdateStatus` so the UI
 /// can branch (offer "Update now" on `available`). Errors (offline, malformed
-/// manifest) surface as `Err(String)` for the FE to toast.
+/// manifest, local feed unreachable) surface as `Err(String)` for the FE to toast.
+/// The `channel` is explicit (#1033) — the endpoint is never inferred from a global
+/// flag, so a boot check can't race the dev-update watcher onto the wrong feed.
+///
+/// The feed's build is classified by direction (#1034): only a genuinely newer build
+/// is `Available` (bannered, one-click); an older one is `OlderAvailable`, which the
+/// FE shows only in Settings → About behind a downgrade confirmation.
 #[tauri::command]
-async fn check_for_updates(app: tauri::AppHandle) -> CmdResult<UpdateStatus> {
+async fn check_for_updates(
+    app: tauri::AppHandle,
+    channel: UpdateChannel,
+) -> CmdResult<UpdateStatus> {
     let current = app.package_info().version.to_string();
-    match updater(&app)?.check().await.map_err(|e| e.to_string())? {
-        Some(update) => Ok(UpdateStatus::Available {
-            version: update.version.clone(),
-            notes: update.body.clone(),
+    match updater(&app, channel)?
+        .check()
+        .await
+        .map_err(|e| e.to_string())?
+    {
+        Some(update) => Ok(match compare_build(&current, &update.version) {
+            VersionDirection::Newer => UpdateStatus::Available {
+                version: update.version.clone(),
+                notes: update.body.clone(),
+            },
+            VersionDirection::Older => UpdateStatus::OlderAvailable {
+                version: update.version.clone(),
+                notes: update.body.clone(),
+            },
+            VersionDirection::Same => UpdateStatus::UpToDate { version: current },
         }),
         None => Ok(UpdateStatus::UpToDate { version: current }),
     }
 }
 
-/// Download and install the available update, then relaunch. Re-checks rather than
-/// caching the `Update` handle across IPC calls. A no-op if nothing is available.
+/// Whether the re-checked feed may be installed, given what the user actually agreed to.
+///
+/// `install_update` re-checks the feed rather than caching an `Update` handle across IPC
+/// calls, which opens a check→install window: the version the user saw (and, for a
+/// downgrade, explicitly confirmed) came from an *earlier* `check_for_updates`, and
+/// another `dev-release.sh` run can move the feed in between. So consent is checked
+/// against `expected` — the exact version the FE displayed — not merely against the
+/// direction (#1034 review). A moved feed is refused so the FE can re-prompt with the
+/// build that is actually there, instead of installing something the user never saw.
+///
+/// Pure so both guards are unit-testable without an `AppHandle`.
+pub(crate) fn install_guard(
+    current: &str,
+    remote: &str,
+    expected: &str,
+    allow_downgrade: bool,
+) -> Result<(), String> {
+    if remote != expected {
+        return Err(format!(
+            "update feed moved: you confirmed {expected}, but the feed now offers {remote}; re-check before installing"
+        ));
+    }
+    if !allow_downgrade && compare_build(current, remote) == VersionDirection::Older {
+        return Err(format!(
+            "refusing to install {remote} — it is older than the running {current}; confirm the downgrade first"
+        ));
+    }
+    Ok(())
+}
+
+/// Download and install the available update from `channel`, then relaunch. Re-checks
+/// rather than caching the `Update` handle across IPC calls. A no-op if nothing is
+/// available. `channel` must match the check that surfaced the update (#1033).
+///
+/// `expected_version` is the version the FE showed the user, and installing an **older**
+/// build additionally requires `allow_downgrade` (#1034) — the FE only passes it after
+/// the user confirms the dialog in Settings → About. Both are enforced by
+/// [`install_guard`], so no code path (banner, dogfood auto-install, a feed that moved
+/// mid-confirmation) can install a build the user did not agree to.
 #[tauri::command]
-async fn install_update(app: tauri::AppHandle) -> CmdResult<()> {
-    let Some(update) = updater(&app)?.check().await.map_err(|e| e.to_string())? else {
+async fn install_update(
+    app: tauri::AppHandle,
+    channel: UpdateChannel,
+    expected_version: String,
+    allow_downgrade: bool,
+) -> CmdResult<()> {
+    let Some(update) = updater(&app, channel)?
+        .check()
+        .await
+        .map_err(|e| e.to_string())?
+    else {
         return Ok(());
     };
+    let current = app.package_info().version.to_string();
+    install_guard(
+        &current,
+        &update.version,
+        &expected_version,
+        allow_downgrade,
+    )?;
     let progress_app = app.clone();
     let finish_app = app.clone();
     let mut downloaded: u64 = 0;
@@ -3447,12 +3585,15 @@ async fn install_update(app: tauri::AppHandle) -> CmdResult<()> {
 /// `update:local-feed-changed` instantly when the file is written, so the FE can
 /// trigger an immediate `refresh()` without waiting for the 15s poll tick.
 ///
+/// This only starts the FS observer; it does NOT decide the update endpoint — that
+/// is chosen per-call via the explicit `UpdateChannel` (#1033). Decoupling the two
+/// removes the boot race where a check could fire before this ran.
+///
 /// Idempotent: calling twice is a no-op (the watcher is stored in managed state and
 /// lives for the app lifetime; there is no stop — it is zero-cost when idle).
 #[tauri::command]
 fn start_dev_update_watcher(app: tauri::AppHandle) {
     use std::sync::Once;
-    LOCAL_UPDATE_CHANNEL.store(true, std::sync::atomic::Ordering::Relaxed);
     static STARTED: Once = Once::new();
     STARTED.call_once(|| {
         match dev_update_watcher::DevUpdateWatcher::spawn() {

@@ -101,6 +101,26 @@ These are separate concerns and are often confused:
 Losing the private key means the existing installed base can no longer be updated (a new
 key requires a manual reinstall), so it is backed up out-of-band.
 
+**Per-developer dev signing (#1047).** The release private key is held by one maintainer
+and is deliberately not shared, but the D1 dogfood loop (§12.3, `dev-release.sh`) needs a
+*signed* artifact — the updater refuses an unsigned update, and that requirement stays.
+The resolution is a second, throwaway key per developer:
+
+1. Each developer generates their own keypair, kept outside the repo:
+   `pnpm -C apps/desktop tauri signer generate -w ~/.tauri/flowforge-dev.key`.
+2. Because the updater only trusts the pubkey **compiled into the app**, a dev-key-signed
+   bundle installs only if the app was built with that dev **pub**key. So the developer
+   writes their pubkey into a **git-ignored** overlay,
+   `apps/desktop/src-tauri/tauri.dev-local.conf.json`, which `dev-release.sh` layers over
+   the committed configs when present (and only then).
+3. The overlay is per-person and never committed, so no individual's key is baked into a
+   shared config and the loop works for every developer rather than only the key holder.
+   Private keys never enter the repo, CI, or any shared channel.
+
+This is strictly a **local dogfood** mechanism: released artifacts are still signed with
+the single production key whose pubkey ships in `tauri.conf.json`, and an app built from a
+dev overlay must never be distributed — it trusts a personal key.
+
 ## 5. IPC contract
 
 The existing `UpdateStatus` is unchanged. One command is **added** to make "Update now"
