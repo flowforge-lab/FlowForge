@@ -60,6 +60,21 @@ describe("parseSlashQuery — the dropdown's open/closed gate", () => {
   it("treats a newline as whitespace (a multi-line draft isn't a command)", () => {
     expect(parseSlashQuery("/goal\nmore")).toBeNull();
   });
+
+  it("closes on ANY whitespace, not just a single space (#1043 review)", () => {
+    // The rule is `/\s/`, and every form of it is load-bearing: whichever
+    // whitespace ends the name, the list must close so Enter falls back to
+    // submit() and `/goal <objective>` reaches parseGoalCommand untouched. Pinned
+    // explicitly so a refactor of parseSlashQuery can't narrow this to `" "`.
+    expect(parseSlashQuery("/goal\tship it")).toBeNull();
+    expect(parseSlashQuery("/goal\t")).toBeNull();
+    expect(parseSlashQuery("/goal  ship it")).toBeNull();
+    expect(parseSlashQuery("/goal   ")).toBeNull();
+    // Leading whitespace is still tolerated — it's trimmed before the check, so
+    // only whitespace INSIDE the token closes the list.
+    expect(parseSlashQuery("\t/goal")).toBe("goal");
+    expect(parseSlashQuery("  /goal\tship it")).toBeNull();
+  });
 });
 
 describe("buildSlashCommands — merging the three sources", () => {
