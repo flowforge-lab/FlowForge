@@ -90,6 +90,7 @@ export {
   Users,
   WrapText,
   X,
+  Zap,
 } from "lucide-react";
 
 export type { LucideIcon } from "lucide-react";
