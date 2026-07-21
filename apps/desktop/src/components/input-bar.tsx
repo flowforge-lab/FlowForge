@@ -8,7 +8,6 @@ import {
   Folder,
   GitBranch,
   Paperclip,
-  PencilLine,
   Search,
   ShieldAlert,
   Sparkles,
@@ -123,12 +122,6 @@ export function InputBar({
   const rejectNonce = useComposerStore((s) =>
     targetSessionId ? (s.rejectNonceBySession[targetSessionId] ?? 0) : 0,
   );
-  // In-place edit mode (#463): the user message id being edited in this pane, or
-  // undefined when composing fresh. Routes submit to `editMessage` and shows a banner.
-  const editingMessageId = useComposerStore((s) =>
-    targetSessionId ? s.editingBySession[targetSessionId] : undefined,
-  );
-  const cancelEdit = useComposerStore((s) => s.cancelEdit);
   // Staged attachments live in the per-session composer store (#723) so a region-
   // wide, pane-level drop (session-pane.tsx) stages into the same list the input
   // bar renders and clears on submit. Default OUTSIDE the selector — returning a
@@ -161,7 +154,6 @@ export function InputBar({
       : false,
   );
   const send = useChatStore((s) => s.send);
-  const editMessage = useChatStore((s) => s.editMessage);
   const cancelTurn = useChatStore((s) => s.cancelTurn);
   const startGoal = useGoalStore((s) => s.start);
   const openGoalDialog = useGoalDialogStore((s) => s.open);
@@ -218,9 +210,7 @@ export function InputBar({
           ),
     [slashQuery, skills, shortcuts, sessionPhenotype],
   );
-  // An in-place edit (#463) is a message rewrite, not a fresh command — no list.
-  const slashOpen =
-    !editingMessageId && !slashDismissed && slashMatches.length > 0;
+  const slashOpen = !slashDismissed && slashMatches.length > 0;
   // Clamp rather than reset in an effect: the list shrinks as the user types.
   const slashActive = Math.min(
     slashIndex,
@@ -357,44 +347,34 @@ export function InputBar({
     const content = value.trim();
     if (
       (!content && attachments.length === 0) ||
-      // A fresh send waits for the turn to settle, but an in-place edit (#463) may
-      // be submitted mid-turn — the backend cancels the running turn and re-runs.
-      ((streaming || pending) && !editingMessageId) ||
+      streaming ||
+      pending ||
       !targetSessionId
     )
       return;
     const attach = attachments;
-    // `/goal` composer slash command (#817): a fresh submission (not an in-place
-    // edit) starting with `/goal` enters Goal mode for the active session instead
-    // of sending a chat message. `/goal <objective>` starts immediately; a bare
-    // `/goal` opens the start-goal dialog (#816) so the command is discoverable.
-    // Attachments are irrelevant to a goal start and are simply dropped.
-    if (!editingMessageId) {
-      const cmd = parseGoalCommand(content);
-      if (cmd.kind !== "not-a-command") {
-        setText("");
-        clearAttachments(targetSessionId);
-        if (textareaRef.current) textareaRef.current.style.height = "auto";
-        if (cmd.kind === "start") {
-          void startGoal(targetSessionId, cmd.objective);
-        } else {
-          openGoalDialog(targetSessionId);
-        }
-        return;
+    // `/goal` composer slash command (#817): a submission starting with `/goal`
+    // enters Goal mode for the active session instead of sending a chat message.
+    // `/goal <objective>` starts immediately; a bare `/goal` opens the start-goal
+    // dialog (#816) so the command is discoverable. Attachments are irrelevant to
+    // a goal start and are simply dropped.
+    const cmd = parseGoalCommand(content);
+    if (cmd.kind !== "not-a-command") {
+      setText("");
+      clearAttachments(targetSessionId);
+      if (textareaRef.current) textareaRef.current.style.height = "auto";
+      if (cmd.kind === "start") {
+        void startGoal(targetSessionId, cmd.objective);
+      } else {
+        openGoalDialog(targetSessionId);
       }
+      return;
     }
     clearAttachments(targetSessionId);
     // Collapse the box back to one line (it may have grown for a resend draft).
     if (textareaRef.current) textareaRef.current.style.height = "auto";
-    if (editingMessageId) {
-      // In-place edit (#463): replace + re-run from the edited message. cancelEdit
-      // clears both the editing binding and the composer text.
-      cancelEdit(targetSessionId);
-      void editMessage(targetSessionId, editingMessageId, content, attach);
-    } else {
-      setText("");
-      void send(content, targetSessionId, attach);
-    }
+    setText("");
+    void send(content, targetSessionId, attach);
   }
 
   return (
@@ -418,23 +398,6 @@ export function InputBar({
             />
           ) : null}
 
-          {/* In-place edit banner (#463): submitting replaces the original message
-              and re-runs from it; Cancel/Escape exits without mutating history. */}
-          {editingMessageId && targetSessionId ? (
-            <div className="mb-1 flex items-center gap-1.5 rounded-lg bg-muted/50 px-2.5 py-1.5 text-[11px] text-muted-foreground">
-              <PencilLine className="size-3 shrink-0" />
-              <span className="flex-1">
-                Editing message — submitting replaces it and re-runs.
-              </span>
-              <button
-                type="button"
-                onClick={() => cancelEdit(targetSessionId)}
-                className="flex items-center gap-0.5 rounded px-1 py-0.5 font-medium hover:bg-foreground/10 hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/40"
-              >
-                <X className="size-3" /> Cancel
-              </button>
-            </div>
-          ) : null}
           <textarea
             ref={textareaRef}
             data-composer
@@ -463,16 +426,6 @@ export function InputBar({
               if (parseSlashQuery(next) === null) setSlashDismissed(false);
             }}
             onKeyDown={(e) => {
-              // Escape exits in-place edit mode without mutating the transcript.
-              // Stop propagation so the shell's global Esc (cancel active turn,
-              // app-shell.tsx) doesn't also fire — abandoning the edit must not
-              // also kill an in-flight turn.
-              if (e.key === "Escape" && editingMessageId && targetSessionId) {
-                e.preventDefault();
-                e.stopPropagation();
-                cancelEdit(targetSessionId);
-                return;
-              }
               // Slash-command dropdown (#1036) owns the arrows, Tab, Enter, and
               // Esc — but ONLY while it is open. Once closed every key below
               // behaves exactly as it did before, which is what keeps
@@ -598,7 +551,7 @@ export function InputBar({
                 <span />
               )}
             </div>
-            {(streaming || pending) && !editingMessageId ? (
+            {streaming || pending ? (
               <Button
                 variant="outline"
                 size="icon"

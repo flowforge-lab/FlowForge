@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { ipc } from "@/lib/ipc";
 import { useChatStore } from "@/store/chat";
+import { useEditedMessagesStore } from "@/store/edited-messages";
 import type { Message } from "@/bindings";
 
 const S = "session-edit";
@@ -123,5 +124,29 @@ describe("chat store — in-place editMessage (#463)", () => {
     expect(msgs[msgs.length - 1].role).toBe("system");
     expect(msgs[msgs.length - 1].content).toContain("Failed to edit");
     expect(useChatStore.getState().turnStartBySession[S]).toBeUndefined();
+  });
+
+  describe('"edited" marker (#929 B)', () => {
+    beforeEach(() => {
+      useEditedMessagesStore.setState({ editedIds: [] });
+    });
+
+    it("marks the id the backend returned once the edit resolves", async () => {
+      vi.spyOn(ipc, "editMessage").mockResolvedValue("u1");
+      await useChatStore.getState().editMessage(S, "u1", "edited prompt");
+      expect(useEditedMessagesStore.getState().isEdited("u1")).toBe(true);
+    });
+
+    it("never marks a failed edit — the badge can't lie", async () => {
+      vi.spyOn(ipc, "editMessage").mockRejectedValue(new Error("boom"));
+      await useChatStore.getState().editMessage(S, "u1", "edited prompt");
+      expect(useEditedMessagesStore.getState().editedIds).toEqual([]);
+    });
+
+    it("does not mark an unchanged re-send — that's Retry, not an edit (#929 C)", async () => {
+      vi.spyOn(ipc, "editMessage").mockResolvedValue("u2");
+      await useChatStore.getState().editMessage(S, "u2", "second prompt");
+      expect(useEditedMessagesStore.getState().editedIds).toEqual([]);
+    });
   });
 });

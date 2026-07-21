@@ -1,4 +1,4 @@
-import { memo, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useShallow } from "zustand/react/shallow";
 import { ChevronDown } from "@/components/ui/icon";
 import { cn } from "@/lib/utils";
@@ -16,6 +16,7 @@ import {
 } from "@/components/message-actions";
 import { MessageAttachments } from "@/components/message-attachments";
 import { MessageHeader } from "@/components/message-header";
+import { MessageEditBox } from "@/components/message-edit-box";
 import { ThinkingIndicator } from "@/components/thinking-indicator";
 import { CancelledNotice } from "@/components/cancelled-notice";
 import { ActiveProseBlock } from "@/components/active-prose-block";
@@ -59,6 +60,10 @@ function MessageRowImpl({
   exportEnabled,
   exportModel,
   exportTiming,
+  isEditing,
+  isLastUserMessage,
+  beginEdit,
+  endEdit,
   respondApproval,
   approveSession,
   approveAlways,
@@ -80,6 +85,13 @@ function MessageRowImpl({
   exportEnabled: boolean;
   exportModel: string | null;
   exportTiming: "exact" | "approx-created-at";
+  /** This user message is open in the bubble-anchored edit box (#929 A). */
+  isEditing: boolean;
+  /** This is the tail user message — the only one that offers Retry (#929 C). */
+  isLastUserMessage: boolean;
+  /** Stable callbacks owned by ChatView; stable so `memo` still holds. */
+  beginEdit: (messageId: string) => void;
+  endEdit: () => void;
   respondApproval: (
     sessionId: string,
     messageId: string,
@@ -105,6 +117,9 @@ function MessageRowImpl({
     answer: string,
   ) => Promise<void>;
 }) {
+  // Save from the inline edit box routes through the existing truncate-and-rerun
+  // path (#929 A) — same call the composer used to make.
+  const editMessage = useChatStore((s) => s.editMessage);
   const onRespond = (callId: string, approved: boolean) =>
     void respondApproval(message.sessionId, message.id, callId, approved);
   const onApproveSession = (callId: string, tool: string) =>
@@ -121,23 +136,55 @@ function MessageRowImpl({
         data-message-id={message.id}
         className="flex flex-col items-end gap-1.5"
       >
-        <MessageHeader role="user" createdAt={message.createdAt} />
+        <MessageHeader
+          role="user"
+          createdAt={message.createdAt}
+          messageId={message.id}
+        />
         {hasAttachments && (
           <div className="max-w-[80%]">
             <MessageAttachments attachments={message.attachments!} />
           </div>
         )}
-        {/* Skip the bubble entirely for an image-only message (no text). */}
-        {message.content && (
-          <div className="group relative max-w-[80%]">
-            <div
-              data-selectable
-              className="whitespace-pre-wrap rounded-2xl rounded-br-md bg-primary px-3.5 py-2 text-[15px] leading-relaxed text-primary-foreground shadow-sm"
-            >
-              {message.content}
-            </div>
-            <MessageActions message={message} side="left" />
+        {/* Edit opens a contained box anchored to THIS bubble (#929 A) rather than
+            routing the text into the shared composer — the old flow left the user
+            unsure whether they were editing or composing. Attachments pass straight
+            through: the backend replaces that column wholesale, so omitting them on
+            save would silently destroy them. */}
+        {isEditing ? (
+          <div className="w-[80%]">
+            <MessageEditBox
+              initialText={message.content}
+              onSave={(text) => {
+                endEdit();
+                void editMessage(
+                  message.sessionId,
+                  message.id,
+                  text,
+                  message.attachments ?? undefined,
+                );
+              }}
+              onCancel={endEdit}
+            />
           </div>
+        ) : (
+          /* Skip the bubble entirely for an image-only message (no text). */
+          message.content && (
+            <div className="group relative max-w-[80%]">
+              <div
+                data-selectable
+                className="whitespace-pre-wrap rounded-2xl rounded-br-md bg-primary px-3.5 py-2 text-[15px] leading-relaxed text-primary-foreground shadow-sm"
+              >
+                {message.content}
+              </div>
+              <MessageActions
+                message={message}
+                side="left"
+                isLastUserMessage={isLastUserMessage}
+                onBeginEdit={() => beginEdit(message.id)}
+              />
+            </div>
+          )
         )}
       </div>
     );
@@ -423,6 +470,23 @@ export function ChatView({ sessionId }: { sessionId?: string } = {}) {
   const exportModel = useModelConfigStore(
     (s) => activeConnection(s.registry)?.model ?? null,
   );
+  // Which user message (if any) is open in its bubble-anchored edit box (#929 A).
+  // Pane-local: each ChatView edits at most one message at a time. The session id
+  // is stored alongside so switching sessions *derives* a closed box rather than
+  // resetting it from an effect — a stale id can never leak into another session.
+  const [editing, setEditing] = useState<{
+    sessionId: string | undefined;
+    messageId: string;
+  } | null>(null);
+  const editingId =
+    editing && editing.sessionId === targetSessionId ? editing.messageId : null;
+  const beginEdit = useCallback(
+    (messageId: string) =>
+      setEditing({ sessionId: targetSessionId, messageId }),
+    [targetSessionId],
+  );
+  const endEdit = useCallback(() => setEditing(null), []);
+
   const respondApproval = useChatStore((s) => s.respondApproval);
   const approveSession = useChatStore((s) => s.approveSession);
   const approveAlways = useChatStore((s) => s.approveAlways);
@@ -474,6 +538,16 @@ export function ChatView({ sessionId }: { sessionId?: string } = {}) {
     () => [...prefixGroups, ...tailGroups],
     [prefixGroups, tailGroups],
   );
+
+  // Retry is confined to the tail user message (#929 C): the backend truncates
+  // everything after its target, so a mid-conversation retry would silently nuke
+  // the rest of the thread. Earlier messages stay editable, just not retryable.
+  const lastUserMessageId = useMemo(() => {
+    for (let i = msgs.length - 1; i >= 0; i--) {
+      if (msgs[i].role === "user") return msgs[i].id;
+    }
+    return null;
+  }, [msgs]);
 
   // While the in-thread find bar (#679) is open for this session, stop forcing
   // the transcript to the bottom so stepping through matches (scrollIntoView)
@@ -626,6 +700,10 @@ export function ChatView({ sessionId }: { sessionId?: string } = {}) {
                 exportEnabled={exportEnabled}
                 exportModel={exportModel}
                 exportTiming={liveTiming ? "exact" : "approx-created-at"}
+                isEditing={m.id === editingId}
+                isLastUserMessage={m.id === lastUserMessageId}
+                beginEdit={beginEdit}
+                endEdit={endEdit}
                 respondApproval={respondApproval}
                 approveSession={approveSession}
                 approveAlways={approveAlways}

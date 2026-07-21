@@ -1,10 +1,14 @@
-// Per-session composer state (Issue #18, re-keyed for split panes #148). Lets a
-// message row's "edit & resend" prefill the input bar and refocus it without
-// prop-drilling. With split panes each session has its own draft, so the text /
-// focus / reject nonces are keyed by sessionId — typing in one pane never leaks
-// into another. The composer text is the single source of truth here;
-// `focusNonce` bumps on every prefill so the input bar can imperatively focus +
-// grow the textarea even when the text is unchanged.
+// Per-session composer state (Issue #18, re-keyed for split panes #148). Holds each
+// session's draft text and staged attachments without prop-drilling. With split panes
+// each session has its own draft, so the text / focus / reject nonces are keyed by
+// sessionId — typing in one pane never leaks into another. The composer text is the
+// single source of truth here; `focusNonce` bumps on every prefill so the input bar
+// can imperatively focus + grow the textarea even when the text is unchanged.
+//
+// Editing a past message no longer routes through here (#929): it happens in a
+// bubble-anchored box on the message itself (`message-edit-box.tsx`), which is what
+// removed the old `editingBySession` / `beginEdit` / `cancelEdit` seam. The composer
+// is send-only again.
 // Mirrors the small single-purpose stores in store/split.ts and store/palette.ts.
 
 import { create } from "zustand";
@@ -23,10 +27,6 @@ interface ComposerState {
   /** Incremented when a prefill is refused so it didn't clobber a draft (#48),
    *  so the input bar can flash the preserved draft. */
   rejectNonceBySession: Record<string, number>;
-  /** The user message id a session is currently editing in place (#463), or
-   *  undefined when composing a fresh message. Drives the input bar's edit banner
-   *  and routes submit to `editMessage` instead of `send`. */
-  editingBySession: Record<string, string | undefined>;
   setText: (sessionId: string, text: string) => void;
   /** Append a staged attachment for a session (drop / paste / pick). */
   stageAttachment: (sessionId: string, attachment: Attachment) => void;
@@ -36,13 +36,6 @@ interface ComposerState {
   clearAttachments: (sessionId: string) => void;
   /** Load `text` into a session's composer and request focus (edit & resend). */
   prefill: (sessionId: string, text: string) => void;
-  /** Enter in-place edit mode for `messageId` (#463): bind the session to it and
-   *  load its `text` into the composer with focus. Unlike `prefill`, this is a
-   *  targeted action so it sets the text directly (no #48 draft guard). */
-  beginEdit: (sessionId: string, messageId: string, text: string) => void;
-  /** Exit edit mode for a session and clear its composer (Cancel / Escape / after
-   *  a submitted edit). */
-  cancelEdit: (sessionId: string) => void;
 }
 
 export const useComposerStore = create<ComposerState>((set, get) => ({
@@ -50,7 +43,6 @@ export const useComposerStore = create<ComposerState>((set, get) => ({
   attachmentsBySession: {},
   focusNonceBySession: {},
   rejectNonceBySession: {},
-  editingBySession: {},
   setText: (sessionId, text) =>
     set((s) => ({
       textBySession: { ...s.textBySession, [sessionId]: text },
@@ -98,18 +90,4 @@ export const useComposerStore = create<ComposerState>((set, get) => ({
       },
     }));
   },
-  beginEdit: (sessionId, messageId, text) =>
-    set((s) => ({
-      editingBySession: { ...s.editingBySession, [sessionId]: messageId },
-      textBySession: { ...s.textBySession, [sessionId]: text },
-      focusNonceBySession: {
-        ...s.focusNonceBySession,
-        [sessionId]: (s.focusNonceBySession[sessionId] ?? 0) + 1,
-      },
-    })),
-  cancelEdit: (sessionId) =>
-    set((s) => ({
-      editingBySession: { ...s.editingBySession, [sessionId]: undefined },
-      textBySession: { ...s.textBySession, [sessionId]: "" },
-    })),
 }));
