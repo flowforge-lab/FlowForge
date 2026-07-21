@@ -24,8 +24,11 @@ export type TurnStatsEvent = { sessionId: string, roundTrips: number, totalMs: n
  */
 prefillEstimates?: Array<number>, 
 /**
- * F1b (#441): iterations that engaged the Tier-1 extractive compaction pass.
- * Omitted by emitters that do not compute F1b telemetry.
+ * F1b (#441) / #1045: number of fold **ticks** this turn -- times the
+ * layered Tier-1 pass advanced the frozen boundary. With the Near-budget
+ * hysteresis (#1045) this is `<= 1` for most turns; it is NOT a
+ * per-iteration "the pass ran" count. Omitted by emitters that do not
+ * compute F1b telemetry.
  */
 tier1Fires?: number, 
 /**

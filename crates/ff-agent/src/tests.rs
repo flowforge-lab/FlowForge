@@ -6534,8 +6534,66 @@ async fn breakdown_reports_near_only_split_and_zero_retrieves_when_nothing_folds
     assert_eq!(b.mid_tokens, None, "no fold -> no Mid layer");
     let near = b.near_tokens.expect("whole transcript is Near");
     assert!(near > 0);
+    // #1045 finding 2: Near is measured off the *sent wire*, which is the
+    // transcript as it stood when the request went out -- before this turn's
+    // assistant reply was appended to the store. So Near is the pre-reply wire
+    // size and is <= verbatim_tokens (which counts the post-turn store,
+    // reply included), never more.
+    assert!(
+        near <= b.verbatim_tokens,
+        "sent-wire Near ({near}) must not exceed the post-turn store ({})",
+        b.verbatim_tokens
+    );
+}
+
+#[tokio::test]
+async fn zero_near_budget_is_floored_and_does_not_fold_every_turn() {
+    // #1045 finding 3: a 0 (or tiny) Near budget -- an env typo (FF_NEAR_BUDGET=0)
+    // or a mis-set connection field -- must NOT degenerate into a fold on every
+    // turn (which busts the very prompt cache the hysteresis protects). The floor
+    // (MIN_NEAR_BUDGET_TOKENS) clamps it, so a small transcript that sits under
+    // the floor does not fold at all.
+    let dir = tempfile::tempdir().unwrap();
+    let store = SessionStore::new();
+    let s = store.create_session(None);
+    // A handful of tiny messages -- a few dozen tokens total, far under the
+    // MIN_NEAR_BUDGET_TOKENS floor. With an unclamped 0 budget this would fold.
+    for i in 0..4 {
+        store.add_message(&s.id, Role::User, format!("short message {i}"));
+    }
+
+    let registry = ToolRegistry::new();
+    let root = dir.path().to_path_buf();
+    let approve = AlwaysApprove;
+    let provider = RecordingProvider {
+        seen: Arc::new(std::sync::Mutex::new(Vec::new())),
+    };
+    let mut tctx = ctx(&registry, &root, &approve);
+    tctx.compaction_budget = Some(100_000);
+    tctx.near_budget_tokens = Some(0);
+
+    let fires = std::sync::Mutex::new(None);
+    run_turn(
+        &provider,
+        &store,
+        &tctx,
+        &s.id,
+        "mock",
+        None,
+        false,
+        ReasoningVisibility::All,
+        CancelToken::new(),
+        |ev| {
+            if let AgentEvent::Done { tier1_fires, .. } = ev {
+                *fires.lock().unwrap() = tier1_fires;
+            }
+        },
+    )
+    .await
+    .unwrap();
     assert_eq!(
-        near, b.verbatim_tokens,
-        "with no fold the Near split equals the message total"
+        *fires.lock().unwrap(),
+        Some(0),
+        "a 0 Near budget must be floored, not fold a tiny transcript every turn"
     );
 }

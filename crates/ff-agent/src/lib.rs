@@ -207,8 +207,21 @@ pub const DEFAULT_MID_CEILING_TOKENS: u64 = 8_000;
 /// `near_budget x HIGH`, and folds down to `near_budget x LOW`. The gap means
 /// a fold runs once per several turns instead of every turn, and between ticks
 /// the wire prefix is byte-identical (provider cache HIT).
+///
+/// The "once per several turns / byte-stable prefix" guarantee holds only when
+/// a cross-turn [`CompactionCache`] is wired ([`ToolContext::compaction_cache`],
+/// desktop today): the frozen prefix is seeded and written through it. Without a
+/// cache (CLI, sub-agents) each turn restarts at `boundary = 0` and re-folds
+/// from scratch -- correct output, just no cross-turn cache reuse.
 const NEAR_FOLD_HIGH: f64 = 1.25;
 const NEAR_FOLD_LOW: f64 = 0.75;
+
+/// Floor for the effective Near budget in tokens (#1045). A `0` (or tiny) knob
+/// -- e.g. `FF_NEAR_BUDGET=0` or a mis-set connection field -- would make
+/// `fold_due` true on every turn, folding each turn and busting exactly the
+/// prompt cache the hysteresis exists to protect. Clamped in the BE seam
+/// (`run_turn` and `AppState::near_budget`) so env/config cannot bypass it.
+pub const MIN_NEAR_BUDGET_TOKENS: u64 = 512;
 
 /// Tool results are appended verbatim to the session history and replayed on the
 /// next request, so one oversized result (a big file read, a long command dump) can
@@ -782,30 +795,6 @@ fn context_breakdown(
     }
 }
 
-/// #1045 budget observability: split the transcript estimate into the Mid layer
-/// (the frozen folded prefix actually sent) and the Near layer (the verbatim
-/// tail past the fold boundary). Before any fold, everything is Near and Mid is
-/// `None` -- the popover can then show "no fold yet".
-fn mid_near_split(
-    last_tier1: Option<&(usize, Vec<Message>, u64, usize)>,
-    messages: &[Message],
-    estimator: &ProxyTokenEstimator,
-    model: &str,
-) -> (Option<u32>, Option<u32>) {
-    match last_tier1 {
-        Some((boundary, prefix, _, _)) => {
-            let b = (*boundary).min(messages.len());
-            let mid = estimator.assess(prefix, model).estimated_tokens as u32;
-            let near = estimator.assess(&messages[b..], model).estimated_tokens as u32;
-            (Some(mid), Some(near))
-        }
-        None => (
-            None,
-            Some(estimator.assess(messages, model).estimated_tokens as u32),
-        ),
-    }
-}
-
 /// The set of tool names to advertise to the model this turn.
 /// Filter the advertised tool set based on Mode (#699, #793).
 ///
@@ -1128,6 +1117,11 @@ pub async fn run_turn(
     let mut tier2_ms: Option<u32> = None;
     let mut tier1_fires: u32 = 0;
     let mut tier2_fires: u32 = 0;
+    // #1045: the Mid/Near split of the last layered wire actually sent, captured
+    // at send time so the Done breakdown reports the wire that went out (not a
+    // post-turn recompute off the verbatim store). (None, Some) = no fold yet
+    // (all Near); (Some, Some) after the first fold.
+    let mut wire_split: (Option<u32>, Option<u32>) = (None, None);
     // #1045: count of `compaction_retrieve` dispatches this turn (recall cost).
     let mut retrieve_calls: u32 = 0;
     // Prefix cache observability (#766): accumulate provider-reported cache
@@ -1220,6 +1214,11 @@ pub async fn run_turn(
         let near_budget = tools
             .near_budget_tokens
             .unwrap_or(DEFAULT_NEAR_BUDGET_TOKENS)
+            // Floor the knob before the cap so a 0/tiny value (env typo, bad
+            // config) cannot degenerate into a fold-every-turn cache-buster
+            // (#1045 finding 3). The cap below still scales Near down
+            // proportionally for genuinely small budgets.
+            .max(MIN_NEAR_BUDGET_TOKENS)
             .min(
                 target_tokens
                     .saturating_sub(DEFAULT_MID_CEILING_TOKENS)
@@ -1403,6 +1402,36 @@ pub async fn run_turn(
         {
             cache.put_tier1(session_id, *boundary, prefix.clone(), *count, *level);
         }
+
+        // #1045 finding 2: capture the Mid/Near split off the *actual layered
+        // wire* at send time (not the post-turn verbatim store, which describes
+        // the next turn and skips ingest compaction). Mid = the frozen prefix as
+        // sent, Near = the verbatim tail, so the two reconcile with the message
+        // portion of this wire. `prefix.len()` is `boundary` for the graded path
+        // and `1` for a digest, so this is correct for both. If Tier-2 fires
+        // below it further condenses the Mid layer -- `tier2_fires > 0` signals
+        // that the finally-sent Mid is smaller than reported here.
+        let mid_len = last_tier1.as_ref().map_or(0, |(_, p, _, _)| p.len());
+        wire_split = if mid_len == 0 {
+            (
+                None,
+                Some(
+                    u32::try_from(estimator.assess(&wire, model).estimated_tokens)
+                        .unwrap_or(u32::MAX),
+                ),
+            )
+        } else {
+            (
+                Some(
+                    u32::try_from(estimator.assess(&wire[..mid_len], model).estimated_tokens)
+                        .unwrap_or(u32::MAX),
+                ),
+                Some(
+                    u32::try_from(estimator.assess(&wire[mid_len..], model).estimated_tokens)
+                        .unwrap_or(u32::MAX),
+                ),
+            )
+        };
 
         // Tier-2 abstractive cold-tail summary (RFC 0016 M7.0): the fallback when
         // the mechanical, free Tier-1 pass above cannot relieve enough pressure.
@@ -1956,7 +1985,7 @@ pub async fn run_turn(
                     &tool_schemas,
                     &final_msgs,
                     prefill_estimates.last().copied().unwrap_or(0),
-                    mid_near_split(last_tier1.as_ref(), &final_msgs, &estimator, model),
+                    wire_split,
                 )),
                 usage: Some(TurnUsage {
                     input_tokens: input_tokens_total,
@@ -2403,7 +2432,7 @@ pub async fn run_turn(
             &tool_schemas,
             &final_msgs,
             wire_tokens,
-            mid_near_split(last_tier1.as_ref(), &final_msgs, &estimator, model),
+            wire_split,
         )),
         usage: Some(TurnUsage {
             input_tokens: input_tokens_total,

@@ -3059,3 +3059,26 @@ fn woken_agent_still_sees_the_wake_context() {
         "second wake present"
     );
 }
+
+#[test]
+fn near_budget_clamps_tiny_connection_value_to_floor() {
+    // #1045 finding 3: a mis-set connection field (or env) must be clamped to the
+    // Near-budget floor in the BE seam, so the UI is not the only line of defense
+    // -- env and stored config bypass the widget entirely.
+    let state = AppState::with_registry(ProviderRegistry::default());
+    let id = "near-budget-clamp";
+    let mut conn = bedrock_conn(id, None);
+    conn.near_budget = Some(1);
+    state.upsert_connection(conn);
+    assert_eq!(
+        state.near_budget(id),
+        Some(ff_agent::MIN_NEAR_BUDGET_TOKENS),
+        "a below-floor connection value is clamped up to the floor"
+    );
+
+    // A healthy value passes through untouched.
+    let mut conn2 = bedrock_conn("near-budget-ok", None);
+    conn2.near_budget = Some(20_000);
+    state.upsert_connection(conn2);
+    assert_eq!(state.near_budget("near-budget-ok"), Some(20_000));
+}

@@ -803,6 +803,11 @@ pub fn digest_block(messages: &[Message], cap_tokens: usize) -> Option<DigestRes
             if first.chars().count() > DIGEST_LINE_CHARS {
                 snippet.push_str("...");
             }
+            // `i` is the message index within the folded range. The layered
+            // pass (#1045) always folds from conversation start (`history[..end]`),
+            // so this is the absolute conversation index and is stable across
+            // ticks -- a later, longer fold appends higher indices without
+            // renumbering earlier ones (#1045 finding 6).
             format!("[{i}] {}: {snippet}", role_label(m.role))
         })
         .collect();

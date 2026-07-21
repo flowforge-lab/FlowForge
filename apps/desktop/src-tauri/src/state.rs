@@ -2480,11 +2480,15 @@ impl AppState {
     /// Resolve the Near-layer verbatim-tail budget for a connection (#1045).
     /// Precedence: env `FF_NEAR_BUDGET` > connection config > None (= default).
     pub fn near_budget(&self, connection_id: &str) -> Option<u64> {
+        // Clamp env/config to the floor here too (#1045 finding 3): the settings
+        // UI can validate its own input, but env and stored config bypass the UI
+        // entirely, so the seam is the only place that catches every path.
+        let clamp = |v: u64| v.max(ff_agent::MIN_NEAR_BUDGET_TOKENS);
         if let Some(v) = std::env::var("FF_NEAR_BUDGET")
             .ok()
             .and_then(|s| s.trim().parse::<u64>().ok())
         {
-            return Some(v);
+            return Some(clamp(v));
         }
         self.registry
             .lock()
@@ -2493,6 +2497,7 @@ impl AppState {
             .iter()
             .find(|c| c.id == connection_id)
             .and_then(|c| c.near_budget)
+            .map(clamp)
     }
 
     pub fn provider_registry(&self) -> ProviderRegistry {
