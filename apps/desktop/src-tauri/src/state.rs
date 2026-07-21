@@ -426,6 +426,7 @@ fn config_to_connection(config: ProviderConfig) -> ProviderConnection {
         access_key_id: None,
         compaction_model: None,
         compaction_budget: None,
+        near_budget: None,
     }
 }
 
@@ -2474,6 +2475,24 @@ impl AppState {
             .iter()
             .find(|c| c.id == connection_id)
             .and_then(|c| c.compaction_budget)
+    }
+
+    /// Resolve the Near-layer verbatim-tail budget for a connection (#1045).
+    /// Precedence: env `FF_NEAR_BUDGET` > connection config > None (= default).
+    pub fn near_budget(&self, connection_id: &str) -> Option<u64> {
+        if let Some(v) = std::env::var("FF_NEAR_BUDGET")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+        {
+            return Some(v);
+        }
+        self.registry
+            .lock()
+            .unwrap()
+            .connections
+            .iter()
+            .find(|c| c.id == connection_id)
+            .and_then(|c| c.near_budget)
     }
 
     pub fn provider_registry(&self) -> ProviderRegistry {

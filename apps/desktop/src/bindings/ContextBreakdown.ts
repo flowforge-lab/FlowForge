@@ -35,4 +35,16 @@ wireTokens: number,
 /**
  * Number of messages in the verbatim transcript.
  */
-messageCount: number, };
+messageCount: number, 
+/**
+ * Estimated tokens of the **Mid** layer of the wire (#1045): the folded
+ * timeline covering everything older than the verbatim tail. `0` when no
+ * fold has happened yet (the whole transcript is still Near).
+ */
+midTokens?: number, 
+/**
+ * Estimated tokens of the **Near** layer of the wire (#1045): the
+ * token-budgeted verbatim tail. Equals `wire_tokens` minus the Mid layer
+ * (system/tools are separate buckets). `None` when not assessed.
+ */
+nearTokens?: number, };

@@ -346,6 +346,7 @@ fn blank_conn(display: &str, vendor: Option<&str>, kind: ProviderKind) -> Provid
         access_key_id: None,
         compaction_model: None,
         compaction_budget: None,
+        near_budget: None,
     }
 }
 
@@ -468,6 +469,7 @@ fn connection_resolved_base_url_falls_back_to_kind_default() {
         access_key_id: None,
         compaction_model: None,
         compaction_budget: None,
+        near_budget: None,
     };
     assert_eq!(conn.resolved_base_url(), "http://localhost:11434");
     let overridden = ProviderConnection {
@@ -697,6 +699,7 @@ fn connection_with_bedrock_fields_round_trips() {
         access_key_id: Some("AKIAEXAMPLE".into()),
         compaction_model: None,
         compaction_budget: None,
+        near_budget: None,
         ..blank_conn("Bedrock", Some("aws"), ProviderKind::Bedrock)
     };
     let json = serde_json::to_string(&conn).unwrap();

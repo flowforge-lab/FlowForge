@@ -112,6 +112,9 @@ struct TurnMetrics {
     prefill_estimates: Vec<u32>,
     tier1_fires: u32,
     tier2_fires: u32,
+    /// #1045: `compaction_retrieve` calls the model made this turn, carried on
+    /// `Done` -- the recall cost of the layered fold.
+    retrieve_calls: u32,
     /// #960: pure provider round-0 prefill latency (ms) carried on the turn's
     /// `Done` event. Distinct from the host-computed `first_token_ms`, which is
     /// anchored at `turn_start` and so also absorbs any pre-first-token memory
@@ -141,12 +144,14 @@ impl TurnMetrics {
         tier2_ms: Option<u32>,
         tier1_fires: u32,
         tier2_fires: u32,
+        retrieve_calls: u32,
     ) {
         self.prefill_estimates = prefill_estimates.to_vec();
         self.prompt_latency_ms = prompt_latency_ms;
         self.tier2_ms = tier2_ms;
         self.tier1_fires = tier1_fires;
         self.tier2_fires = tier2_fires;
+        self.retrieve_calls = retrieve_calls;
     }
 
     /// `(estimated assistant output tokens, distinct turn count)`.
@@ -1613,6 +1618,7 @@ fn spawn_assistant_turn(state: Arc<AppState>, app: tauri::AppHandle, session_id:
         tool_ctx.abstractive = crate::state::abstractive_config_from_env();
         tool_ctx.compaction_model = state.compaction_model(&conn_id);
         tool_ctx.compaction_budget = state.compaction_budget(&conn_id);
+        tool_ctx.near_budget_tokens = state.near_budget(&conn_id);
         tool_ctx.compaction_cache = Some(&state.compaction_cache);
         // Skills + ambient context for this turn (RFC 0001 §4, RFC 0002 phase 1):
         // the resolved persona, installed-skill descriptions, the bodies of the
@@ -1710,6 +1716,7 @@ fn spawn_assistant_turn(state: Arc<AppState>, app: tauri::AppHandle, session_id:
                             tier2_ms,
                             tier1_fires,
                             tier2_fires,
+                            retrieve_calls,
                             ..
                         } => {
                             m.note_turn(message_id);
@@ -1719,6 +1726,7 @@ fn spawn_assistant_turn(state: Arc<AppState>, app: tauri::AppHandle, session_id:
                                 *tier2_ms,
                                 tier1_fires.unwrap_or(0),
                                 tier2_fires.unwrap_or(0),
+                                retrieve_calls.unwrap_or(0),
                             );
                         }
                         AgentEvent::MemoryFlushed { message_id, .. } => {
@@ -1759,6 +1767,7 @@ fn spawn_assistant_turn(state: Arc<AppState>, app: tauri::AppHandle, session_id:
             prefill_estimates,
             tier1_fires,
             tier2_fires,
+            retrieve_calls,
             first_token_ms,
             prompt_latency_ms,
             tier2_ms,
@@ -1776,6 +1785,7 @@ fn spawn_assistant_turn(state: Arc<AppState>, app: tauri::AppHandle, session_id:
                     m.prefill_estimates.clone(),
                     m.tier1_fires,
                     m.tier2_fires,
+                    m.retrieve_calls,
                     ttft,
                     m.prompt_latency_ms,
                     m.tier2_ms,
@@ -1803,6 +1813,8 @@ fn spawn_assistant_turn(state: Arc<AppState>, app: tauri::AppHandle, session_id:
             prefill_estimates: Some(prefill_estimates),
             tier1_fires: Some(tier1_fires),
             tier2_fires: Some(tier2_fires),
+            // #1045: recall cost of the layered fold.
+            retrieve_calls: Some(retrieve_calls),
             // TTFT: `None` when the turn produced no assistant message (early
             // error / cancel before the first token streamed). Otherwise the ms
             // from `run_turn` dispatch to the first assistant token arriving --
@@ -2375,6 +2387,7 @@ impl ff_scheduled::TaskRunner for DesktopTaskRunner {
         tool_ctx.abstractive = crate::state::abstractive_config_from_env();
         tool_ctx.compaction_model = self.state.compaction_model(&selection.connection);
         tool_ctx.compaction_budget = self.state.compaction_budget(&selection.connection);
+        tool_ctx.near_budget_tokens = self.state.near_budget(&selection.connection);
         tool_ctx.compaction_cache = Some(&self.state.compaction_cache);
 
         let skills = self.state.skills_snapshot();

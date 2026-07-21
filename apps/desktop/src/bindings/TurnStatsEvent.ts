@@ -34,6 +34,11 @@ tier1Fires?: number,
  */
 tier2Fires?: number, 
 /**
+ * #1045: `compaction_retrieve` calls the model made this turn -- the recall
+ * cost of the layered fold. Omitted by emitters that do not compute it.
+ */
+retrieveCalls?: number, 
+/**
  * TTFT (end-to-end): milliseconds from the moment the host handed the
  * request to `run_turn` to the arrival of the first assistant token.
  * Anchored at `turn_start`, so it *includes* any pre-first-token work the

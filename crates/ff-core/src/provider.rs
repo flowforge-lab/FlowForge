@@ -434,6 +434,12 @@ pub struct ProviderConnection {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional, type = "number")]
     pub compaction_budget: Option<u64>,
+    /// Near-layer verbatim-tail budget in tokens (#1045). The layered-context
+    /// pass keeps roughly this many tokens of recent messages verbatim and
+    /// folds older ones into the Mid layer. `None` = built-in default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional, type = "number")]
+    pub near_budget: Option<u64>,
 }
 
 impl ProviderConnection {
@@ -756,6 +762,7 @@ impl ProviderRegistry {
             access_key_id: None,
             compaction_model: None,
             compaction_budget: None,
+            near_budget: None,
         }
     }
 }
@@ -785,6 +792,7 @@ impl Default for ProviderRegistry {
             access_key_id: None,
             compaction_model: None,
             compaction_budget: None,
+            near_budget: None,
         };
         let ollama = ProviderConnection {
             id: "ollama".to_string(),
@@ -806,6 +814,7 @@ impl Default for ProviderRegistry {
             access_key_id: None,
             compaction_model: None,
             compaction_budget: None,
+            near_budget: None,
         };
         Self {
             active: candle.id.clone(),

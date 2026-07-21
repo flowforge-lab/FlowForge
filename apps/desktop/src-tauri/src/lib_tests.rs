@@ -620,7 +620,7 @@ fn turn_metrics_empty_turn_is_zeroed() {
 #[test]
 fn turn_metrics_note_done_captures_prompt_latency() {
     let mut m = TurnMetrics::default();
-    m.note_done(&[123], Some(42), Some(9000), 1, 0);
+    m.note_done(&[123], Some(42), Some(9000), 1, 0, 0);
     assert_eq!(
         m.prompt_latency_ms,
         Some(42),
@@ -630,7 +630,7 @@ fn turn_metrics_note_done_captures_prompt_latency() {
     assert_eq!(m.prefill_estimates, vec![123]);
     assert_eq!(m.tier1_fires, 1);
     // A None from an emitter that didn't compute it stays None.
-    m.note_done(&[], None, None, 0, 0);
+    m.note_done(&[], None, None, 0, 0, 0);
     assert_eq!(m.prompt_latency_ms, None);
     assert_eq!(m.tier2_ms, None);
 }
@@ -672,10 +672,11 @@ fn turn_metrics_note_done_folds_f1b_telemetry() {
     // #441: the per-round-trip prefill estimate and the two compaction-fire
     // counts from the turn's Done event are captured verbatim for `turn:stats`.
     let mut m = TurnMetrics::default();
-    m.note_done(&[120, 340, 75], None, None, 2, 1);
+    m.note_done(&[120, 340, 75], None, None, 2, 1, 3);
     assert_eq!(m.prefill_estimates, vec![120, 340, 75]);
     assert_eq!(m.tier1_fires, 2);
     assert_eq!(m.tier2_fires, 1);
+    assert_eq!(m.retrieve_calls, 3, "#1045 recall cost captured verbatim");
 }
 
 // ---- CLI.7 sidecar parity integration test (RFC 0004 §5) ----
@@ -928,6 +929,7 @@ async fn emit_agent_event_maps_done_to_turn_done_event() {
         prompt_latency_ms: None,
         tier2_ms: None,
         tier1_fires: None,
+        retrieve_calls: None,
         tier2_fires: None,
         cache_hit_tokens: Some(10),
         cache_miss_tokens: Some(32),

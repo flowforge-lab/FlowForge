@@ -1288,6 +1288,7 @@ fn load_uses_existing_registry_file_over_legacy_config() {
             access_key_id: None,
             compaction_model: None,
             compaction_budget: None,
+            near_budget: None,
         }],
         schema_version: 0,
     };
@@ -1448,6 +1449,7 @@ fn siliconflow_conn(id: &str, effort: ReasoningEffort) -> ProviderConnection {
         access_key_id: None,
         compaction_model: None,
         compaction_budget: None,
+        near_budget: None,
     }
 }
 
@@ -1509,6 +1511,7 @@ fn editing_one_connection_preserves_siblings() {
                 access_key_id: None,
                 compaction_model: None,
                 compaction_budget: None,
+                near_budget: None,
             },
             ProviderConnection {
                 id: "aws-bedrock".into(),
@@ -1530,6 +1533,7 @@ fn editing_one_connection_preserves_siblings() {
                 access_key_id: None,
                 compaction_model: None,
                 compaction_budget: None,
+                near_budget: None,
             },
         ],
         schema_version: 0,
@@ -1890,6 +1894,7 @@ fn upsert_and_remove_connection_round_trip() {
         access_key_id: None,
         compaction_model: None,
         compaction_budget: None,
+        near_budget: None,
     });
     assert_eq!(stored.id, "my-gateway");
     assert_eq!(state.provider_registry().connections.len(), 4);
@@ -1984,6 +1989,7 @@ fn openai_conn(id: &str) -> ProviderConnection {
         access_key_id: None,
         compaction_model: None,
         compaction_budget: None,
+        near_budget: None,
     }
 }
 
@@ -2049,6 +2055,7 @@ fn bedrock_conn(id: &str, auth_mode: Option<BedrockAuth>) -> ProviderConnection 
         access_key_id: None,
         compaction_model: None,
         compaction_budget: None,
+        near_budget: None,
     }
 }
 
