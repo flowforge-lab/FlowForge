@@ -69,6 +69,55 @@ const DANGEROUS_PATTERNS: &[&str] = &[
     "wget",
 ];
 
+/// Scan a lowercased command for shell redirects, separating file-writing
+/// redirects (`> f`, `>> f`, `2> f`, `&> f`) from benign stream
+/// silencing/duplication (`2>/dev/null`, `2>&1`, `&>/dev/null`, `>&2`) (#1050).
+///
+/// Returns the command with every *benign* redirect operator+target removed
+/// (so the caller's `&`-based segment split isn't fooled by `2>&1`), plus a
+/// flag that is `true` when at least one redirect writes a named file.
+///
+/// Heuristic, not a shell parser: after a `>`/`>>`/`&>` operator (optionally
+/// preceded by an fd number), the target is benign only if it is a fd
+/// duplication (`&N`/`&-`) or a `/dev/` sink; anything else (a filename) is a
+/// file write. Command substitution is handled by the caller before this runs.
+fn scan_redirects(command: &str) -> (String, bool) {
+    let chars: Vec<char> = command.chars().collect();
+    let mut out = String::with_capacity(command.len());
+    let mut has_file_redirect = false;
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '>' {
+            // Consume `>` or `>>`.
+            i += 1;
+            if i < chars.len() && chars[i] == '>' {
+                i += 1;
+            }
+            // Skip spaces between operator and target.
+            while i < chars.len() && chars[i] == ' ' {
+                i += 1;
+            }
+            // Read the target token (up to whitespace or the next operator).
+            let start = i;
+            while i < chars.len() && !matches!(chars[i], ' ' | '|' | ';' | '>' | '<') {
+                i += 1;
+            }
+            let target: String = chars[start..i].iter().collect();
+            let benign = target.starts_with('&') || target.starts_with("/dev/");
+            if !benign {
+                has_file_redirect = true;
+            }
+            // Drop the redirect (operator + target) from the sanitized output
+            // regardless; a file redirect already flipped the flag, and a benign
+            // one must not survive into the segment split.
+        } else {
+            out.push(chars[i]);
+            i += 1;
+        }
+    }
+    (out, has_file_redirect)
+}
+
 /// Best-effort age prune of the scratch dir (#483): remove entries whose mtime is older
 /// than `max_age`, preserving the dir itself and its `.gitignore`. All errors are
 /// swallowed -- a prune failure must never fail the tool call (same discipline as the
@@ -212,9 +261,19 @@ impl BashTool {
         if DANGEROUS_PATTERNS.iter().any(|p| lower.contains(p)) {
             return Safety::Dangerous;
         }
-        // Command substitution and redirects bypass the segment split below (they can
-        // hide writes or run arbitrary nested commands), so never auto-run them.
-        if ["$(", "`", ">", ">>"].iter().any(|t| command.contains(t)) {
+        // Command substitution can hide arbitrary nested writes/exec, so never
+        // auto-run it.
+        if command.contains("$(") || command.contains('`') {
+            return Safety::Write;
+        }
+        // Distinguish redirects that WRITE A NAMED FILE (`> f`, `>> f`,
+        // `2>errors.log`) -- a filesystem mutation, so Write -- from stream
+        // silencing/duplication (`2>/dev/null`, `2>&1`, `&>/dev/null`, `>&2`),
+        // which has no filesystem effect and must not downgrade an otherwise
+        // read-only command (#1050). The benign forms are stripped here so the
+        // segment split below (which splits on `&`) isn't fooled by `2>&1`.
+        let (lower, has_file_redirect) = scan_redirects(&lower);
+        if has_file_redirect {
             return Safety::Write;
         }
         // `find` is read-only for traversal/matching, but it has actions with
@@ -625,6 +684,40 @@ mod tests {
             BashTool::classify("cd apps && git push --force"),
             Safety::Dangerous
         );
+    }
+
+    #[test]
+    fn stderr_redirects_do_not_force_write() {
+        // #1050: stream silencing/duplication has no filesystem effect, so it
+        // must not downgrade an otherwise read-only command.
+        assert_eq!(BashTool::classify("rg foo 2>/dev/null"), Safety::ReadOnly);
+        assert_eq!(BashTool::classify("ls 2>&1"), Safety::ReadOnly);
+        assert_eq!(BashTool::classify("cat x 2>/dev/null"), Safety::ReadOnly);
+        assert_eq!(
+            BashTool::classify("grep x file &>/dev/null"),
+            Safety::ReadOnly
+        );
+        // A benign redirect must not rescue a genuinely writing command.
+        assert_eq!(BashTool::classify("mv a b 2>/dev/null"), Safety::Write);
+
+        // File-writing redirects (named target) remain Write.
+        assert_eq!(BashTool::classify("echo x > f"), Safety::Write);
+        assert_eq!(BashTool::classify("echo x >> f"), Safety::Write);
+        assert_eq!(BashTool::classify("cat x 2>errors.log"), Safety::Write);
+        // A read-only command that redirects stdout to a file is still writing.
+        assert_eq!(BashTool::classify("ls > out.txt"), Safety::Write);
+
+        // Command substitution can hide nested writes -> always Write.
+        assert_eq!(BashTool::classify("cat $(cmd)"), Safety::Write);
+        assert_eq!(BashTool::classify("echo `whoami`"), Safety::Write);
+
+        // Dangerous patterns still win over redirect analysis.
+        assert_eq!(
+            BashTool::classify("curl example.com 2>/dev/null"),
+            Safety::Dangerous
+        );
+        assert_eq!(BashTool::classify("git push --force"), Safety::Dangerous);
+    }
     }
 
     #[tokio::test]
