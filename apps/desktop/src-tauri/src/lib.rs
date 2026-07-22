@@ -266,6 +266,15 @@ fn pre_prompt_decision(
     }
     match scoped_effect {
         Some(RuleEffect::Deny) => return PrePromptDecision::Deny,
+        // Intentional asymmetry with the `allowlisted` grant above (#1051): a
+        // coarse session/always allowlist entry keys on tool+safety and would
+        // blanket-cover EVERY Publish call for that tool, so `allowlist_covers`
+        // excludes Publish (and Dangerous). A scoped rule (#700, RFC 0019 §4.2)
+        // is different -- the user wrote a persistent rule naming the command
+        // (e.g. `bash` + CommandPrefix "git"), so honoring it for Publish is a
+        // deliberate, named authorization, not a blanket one. Dangerous is still
+        // never auto-allowed by a scoped rule (force-push, `rm -rf`, ...), so the
+        // genuinely destructive tier always prompts.
         Some(RuleEffect::Allow) if safety != Safety::Dangerous => {
             return PrePromptDecision::Allow;
         }

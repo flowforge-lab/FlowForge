@@ -246,15 +246,6 @@ impl BashTool {
                 return Safety::Write;
             }
         }
-        // `git push` egresses to a remote, so it carries the Publish tier
-        // (Plan denies, Auto prompts, Act allows) rather than plain Write
-        // (#1051). `git push --force`/`-f` matched DANGEROUS_PATTERNS above, so
-        // only non-force pushes reach here. Keyed on the first token being `git`
-        // so `grep push …` is unaffected; local git writes (`commit`, `add`)
-        // fall through to Write below.
-        if tokens.first() == Some(&"git") && tokens.contains(&"push") {
-            return Safety::Publish;
-        }
         // Read-only only when *every* segment (split on pipes/&&/;) starts with a
         // known read command. A single write segment downgrades the whole line.
         let segments: Vec<&str> = lower
@@ -262,6 +253,22 @@ impl BashTool {
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .collect();
+        // `git push` egresses to a remote, so it carries the Publish tier
+        // (Plan denies, Auto prompts, Act allows) rather than plain Write
+        // (#1051). `git push --force`/`-f` matched DANGEROUS_PATTERNS above, so
+        // only non-force pushes reach here. Checked PER SEGMENT (not on the whole
+        // line's first token) so a push anywhere in a compound command is still
+        // caught -- `cd apps && git push`, `pnpm build && git push origin main`,
+        // `cd /tmp; git push`. Keyed on each segment's first token being `git` so
+        // `grep push …` is unaffected; local git writes (`commit`, `add`) fall
+        // through to Write below. Same conservative discipline as the `find`
+        // block above -- do NOT collapse this back to first-token-only.
+        if segments.iter().any(|seg| {
+            let t: Vec<&str> = seg.split_whitespace().collect();
+            t.first() == Some(&"git") && t.contains(&"push")
+        }) {
+            return Safety::Publish;
+        }
         let all_read_only = !segments.is_empty()
             && segments.iter().all(|seg| {
                 seg.split_whitespace()
@@ -603,6 +610,21 @@ mod tests {
         assert_eq!(BashTool::classify("git commit -m x"), Safety::Write);
         // First-token guard: `push` as an argument to another command is not a push.
         assert_eq!(BashTool::classify("grep push file"), Safety::ReadOnly);
+        // A push ANYWHERE in a compound command is still Publish -- the check is
+        // per-segment, not anchored to the whole line's first token. `cd x &&
+        // git push` is the shape agents emit most (strip_redundant_cd only peels
+        // a leading `cd <workspace-root>`, so a subdir/build-then-push survives).
+        assert_eq!(BashTool::classify("cd apps && git push"), Safety::Publish);
+        assert_eq!(
+            BashTool::classify("pnpm build && git push origin main"),
+            Safety::Publish
+        );
+        assert_eq!(BashTool::classify("cd /tmp; git push"), Safety::Publish);
+        // Force-push stays Dangerous even in a compound command.
+        assert_eq!(
+            BashTool::classify("cd apps && git push --force"),
+            Safety::Dangerous
+        );
     }
 
     #[tokio::test]
