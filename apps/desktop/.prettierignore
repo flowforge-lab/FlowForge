@@ -3,3 +3,6 @@ src/bindings
 src-tauri/target
 src-tauri/gen
 pnpm-lock.yaml
+# Per-developer updater pubkey overlay (#1047) — git-ignored and hand-written, so
+# format:check must not fail on a file that only exists on one dev's machine.
+src-tauri/tauri.dev-local.conf.json
