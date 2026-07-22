@@ -23,6 +23,12 @@ fn default_matches_rfc0019() {
     assert_eq!(m.cell(Mode::Act, Safety::Write), Allow);
     assert_eq!(m.cell(Mode::Act, Safety::Sensitive), Allow);
     assert_eq!(m.cell(Mode::Act, Safety::Dangerous), Ask);
+
+    // Publish (`git push`, `gh pr merge`): `[Deny, Ask, Allow]` — Plan denies a
+    // remote mutation, Auto prompts, Act auto-approves (#1051).
+    assert_eq!(m.cell(Mode::Plan, Safety::Publish), Deny);
+    assert_eq!(m.cell(Mode::Auto, Safety::Publish), Ask);
+    assert_eq!(m.cell(Mode::Act, Safety::Publish), Allow);
 }
 
 #[test]
@@ -48,11 +54,46 @@ fn serde_default_on_missing_fields() {
 }
 
 #[test]
+fn migrates_pre_publish_four_wide_matrix() {
+    // #1051: a matrix persisted before the Publish tier has 4-wide rows
+    // (ReadOnly, Write, Sensitive, Dangerous). It must load without resetting
+    // the user's four columns, padding the new Publish column with its default.
+    // Here the user customized Auto/Write to "ask" (a non-default value).
+    let legacy = r#"{
+        "cells": [
+            ["allow", "deny", "ask", "deny"],
+            ["allow", "ask", "ask", "deny"],
+            ["allow", "allow", "allow", "ask"]
+        ]
+    }"#;
+    let m: PermissionMatrix = serde_json::from_str(legacy).unwrap();
+    // Preserved: the user's customized Auto/Write cell survives migration.
+    assert_eq!(m.cell(Mode::Auto, Safety::Write), PermissionCell::Ask);
+    // Preserved: the other three columns keep their persisted values.
+    assert_eq!(m.cell(Mode::Plan, Safety::Write), PermissionCell::Deny);
+    assert_eq!(m.cell(Mode::Act, Safety::Dangerous), PermissionCell::Ask);
+    // Appended: the Publish column gets its default `[Deny, Ask, Allow]`.
+    assert_eq!(m.cell(Mode::Plan, Safety::Publish), PermissionCell::Deny);
+    assert_eq!(m.cell(Mode::Auto, Safety::Publish), PermissionCell::Ask);
+    assert_eq!(m.cell(Mode::Act, Safety::Publish), PermissionCell::Allow);
+}
+
+#[test]
+fn rejects_wrong_shaped_matrix() {
+    // A row that is neither 4- nor 5-wide is a corrupt config, not a migration.
+    let bad_width = r#"{"cells": [["allow","deny"],["allow","ask"],["allow","allow"]]}"#;
+    assert!(serde_json::from_str::<PermissionMatrix>(bad_width).is_err());
+    // Wrong number of mode rows is likewise rejected.
+    let bad_rows = r#"{"cells": [["allow","deny","ask","deny","deny"]]}"#;
+    assert!(serde_json::from_str::<PermissionMatrix>(bad_rows).is_err());
+}
+
+#[test]
 fn entries_cover_every_cell() {
     let m = PermissionMatrix::default();
     let entries = m.entries();
-    // 3 modes × 4 safety tiers.
-    assert_eq!(entries.len(), 12);
+    // 3 modes × 5 safety tiers.
+    assert_eq!(entries.len(), 15);
     // Every listed cell matches the matrix lookup, and the flat list agrees
     // with `view()`.
     for e in &entries {

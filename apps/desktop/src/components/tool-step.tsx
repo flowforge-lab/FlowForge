@@ -280,12 +280,14 @@ export function ToolStepBlock({
                 >
                   Allow once
                 </Button>
-                {/* Dangerous tools are never covered by the session/always
-                    allowlist (#232: `allowlist_covers` excludes Dangerous), so
-                    only offer the persistent tiers for non-dangerous calls —
-                    otherwise the grant would be written but the backend would
-                    keep prompting. Dangerous steps get Allow once / Deny only. */}
-                {step.safety !== "dangerous" && (
+                {/* Dangerous and Publish tools are never covered by the
+                    session/always allowlist (#232/#1051: `allowlist_covers`
+                    excludes both), so only offer the persistent tiers for the
+                    other tiers — otherwise the grant would be written but the
+                    backend would keep prompting. Those steps get Allow once /
+                    Deny only; a remote publish must be confirmed each time in
+                    Auto (use Act to run it unattended). */}
+                {step.safety !== "dangerous" && step.safety !== "publish" && (
                   <>
                     <Button
                       size="sm"
@@ -317,7 +319,9 @@ export function ToolStepBlock({
               <span className="text-[11px] text-muted-foreground/70">
                 {step.safety === "dangerous"
                   ? "Destructive — review carefully."
-                  : "This tool will modify your workspace."}
+                  : step.safety === "publish"
+                    ? "Publishes to a remote (push / PR) — review carefully."
+                    : "This tool will modify your workspace."}
               </span>
             </div>
           )}

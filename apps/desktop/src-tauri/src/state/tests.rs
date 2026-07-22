@@ -2255,18 +2255,21 @@ fn turn_cancel_keeps_session_approved_but_delete_clears_it() {
 }
 
 #[test]
-fn allowlist_never_covers_dangerous() {
+fn allowlist_never_covers_dangerous_or_publish() {
     let state = AppState::new();
     arm(&state, "s1");
     // Session grant (in-memory only; avoids touching the real persisted file).
     state.set_session_approve("s1", "bash");
 
-    // Write / ReadOnly: the grant pre-approves.
+    // Write / ReadOnly / Sensitive: the grant pre-approves.
     assert!(state.allowlist_covers("s1", "bash", Safety::Write));
     assert!(state.allowlist_covers("s1", "bash", Safety::ReadOnly));
+    assert!(state.allowlist_covers("s1", "bash", Safety::Sensitive));
 
-    // Dangerous: always re-prompts despite the grant.
+    // Dangerous and Publish: always re-prompt despite the grant. A remote
+    // publish must never fire silently from a session allowlist in Auto (#1051).
     assert!(!state.allowlist_covers("s1", "bash", Safety::Dangerous));
+    assert!(!state.allowlist_covers("s1", "bash", Safety::Publish));
 
     // An ungranted tool is never covered regardless of safety.
     assert!(!state.allowlist_covers("s1", "ungranted_tool_xyz", Safety::Write));

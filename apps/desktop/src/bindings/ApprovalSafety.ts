@@ -2,7 +2,7 @@
 
 /**
  * Trust level of a tool call that requires user approval. Read-only calls never
- * reach approval, so this enum carries only the two gated levels — it is the typed
+ * reach approval, so this enum carries only the gated levels — it is the typed
  * contract for [`ToolApprovalRequestEvent::safety`].
  */
-export type ApprovalSafety = "write" | "sensitive" | "dangerous";
+export type ApprovalSafety = "write" | "sensitive" | "dangerous" | "publish";

@@ -90,13 +90,8 @@ fn join_field_flattens_and_tolerates_absence() {
 #[test]
 fn safety_write_for_mutating_actions() {
     let tool = GithubTool;
-    for action in [
-        "pr_create",
-        "pr_merge",
-        "issue_create",
-        "issue_edit",
-        "push",
-    ] {
+    // Chatty repo writes stay Write so Auto remains usable for them.
+    for action in ["issue_create", "issue_edit", "issue_comment", "pr_comment"] {
         let args = serde_json::json!({"action": action});
         assert_eq!(
             tool.safety(&args),
@@ -104,6 +99,22 @@ fn safety_write_for_mutating_actions() {
             "{action} should be Write"
         );
     }
+}
+
+#[test]
+fn safety_publish_for_remote_mutations() {
+    // #1051: creating/merging a PR and pushing a branch write to the remote,
+    // so they carry the Publish tier (Plan denies, Auto prompts, Act allows).
+    let tool = GithubTool;
+    for action in ["pr_create", "pr_merge", "push"] {
+        let args = serde_json::json!({"action": action});
+        assert_eq!(
+            tool.safety(&args),
+            Safety::Publish,
+            "{action} should be Publish"
+        );
+    }
+    assert_eq!(tool.max_safety(), Safety::Publish);
 }
 
 #[test]

@@ -391,8 +391,9 @@ fn pre_prompt_scoped_deny_vetoes_when_not_allowlisted() {
 }
 
 #[test]
-fn pre_prompt_scoped_allow_does_not_clear_dangerous() {
+fn pre_prompt_scoped_allow_clears_publish_but_not_dangerous() {
     use ff_core::{PermissionCell, RuleEffect};
+    // Dangerous is never auto-allowed by a scoped rule -- always prompts.
     assert_eq!(
         pre_prompt_decision(
             PermissionCell::Ask,
@@ -410,6 +411,26 @@ fn pre_prompt_scoped_allow_does_not_clear_dangerous() {
             Safety::Write
         ),
         PrePromptDecision::Allow
+    );
+    // #1051 intentional asymmetry: a scoped rule DOES clear Publish (the user
+    // wrote a persistent rule naming the command), unlike the coarse tool-wide
+    // allowlist, which never covers Publish. Only the destructive Dangerous
+    // tier is withheld from scoped Allow.
+    assert_eq!(
+        pre_prompt_decision(
+            PermissionCell::Ask,
+            false,
+            Some(RuleEffect::Allow),
+            Safety::Publish
+        ),
+        PrePromptDecision::Allow
+    );
+    // The coarse allowlist, by contrast, must NOT accelerate a Publish call --
+    // allowlist_covers excludes it, so `allowlisted` is false here and the cell
+    // (Ask) still prompts.
+    assert_eq!(
+        pre_prompt_decision(PermissionCell::Ask, false, None, Safety::Publish),
+        PrePromptDecision::Prompt
     );
 }
 

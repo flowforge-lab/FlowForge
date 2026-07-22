@@ -20,12 +20,21 @@ use ts_rs::TS;
 pub enum Safety {
     ReadOnly,
     Write,
-    /// Externally-visible actions (network egress, git push, sub-agent spawn)
-    /// that warrant a distinct trust tier between [`Write`] and [`Dangerous`]
-    /// (#682). In the default matrix: auto-approved in Act, prompted in Auto,
-    /// denied (hidden) in Plan.
+    /// Read-ward externally-visible actions — network egress (`web_fetch`,
+    /// `web_search`) and sub-agent spawn — that warrant a distinct trust tier
+    /// between [`Write`] and [`Dangerous`] (#682). They read the outside world
+    /// but do not publish to a remote system, so the default matrix prompts
+    /// once in Plan and Auto and auto-approves in Act. (Contrast [`Publish`],
+    /// which mutates a remote and is denied in Plan.)
     Sensitive,
     Dangerous,
+    /// Remote-write / publish actions: `git push`, `gh pr merge`/`pr create`.
+    /// A superset-risk of [`Sensitive`] — the egress *mutates* a remote system,
+    /// so it must be hard-denied in an unattended/read-only context. Default
+    /// matrix column is `[Deny, Ask, Allow]`: Plan denies, Auto prompts, Act
+    /// auto-approves (#1051). Appended last so the safety index of the other
+    /// tiers — and any persisted matrix — is unchanged.
+    Publish,
 }
 
 /// What happens when a tool at a given [`Safety`] tier is invoked in a given
@@ -180,11 +189,10 @@ pub struct PermissionRule {
 /// gracefully falls back to the RFC 0019 defaults without data loss.
 use std::collections::HashMap;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PermissionMatrix {
     /// Row-major: `cells[mode_idx][safety_idx]`.
-    cells: [[PermissionCell; 4]; 3],
+    cells: [[PermissionCell; 5]; 3],
     /// Per-tool overrides (#700, RFC 0019 §4.2). When set for a tool name, the
     /// override replaces the matrix cell for ALL mode×safety combinations involving
     /// that tool. `#[serde(default)]` ensures existing configs without this field
@@ -201,31 +209,97 @@ pub struct PermissionMatrix {
 impl Default for PermissionMatrix {
     /// RFC 0019 §3 default table:
     /// ```text
-    ///          ReadOnly  Write  Sensitive  Dangerous
-    /// Plan     Allow     Deny   Ask        Deny
-    /// Auto     Allow     Allow  Ask        Deny
-    /// Act      Allow     Allow  Allow      Ask
+    ///          ReadOnly  Write  Sensitive  Dangerous  Publish
+    /// Plan     Allow     Deny   Ask        Deny       Deny
+    /// Auto     Allow     Allow  Ask        Deny       Ask
+    /// Act      Allow     Allow  Allow      Ask        Allow
     /// ```
     ///
     /// Plan is a read-only planning mode: ReadOnly flies, Write/Dangerous are
     /// denied. Sensitive is `Ask` (not `Deny`) so read-shaped network tools
     /// (`web_fetch`/`web_search`) can be used for research behind a one-time
     /// approval — they carry no filesystem/repo mutation, only egress, which
-    /// keeps its own URL-safety gate (#793).
+    /// keeps its own URL-safety gate (#793). Publish (`git push`, `gh pr merge`)
+    /// mutates a remote, so it is denied in Plan, prompted in Auto, and allowed
+    /// in Act — `[Deny, Ask, Allow]`, a column no other tier provides (#1051).
+    /// Note the cell array is ordered by [`safety_idx`]
+    /// (`ReadOnly, Write, Sensitive, Dangerous, Publish`); Publish is appended
+    /// last so a persisted `[_; 4]` matrix migrates by a pure append.
     fn default() -> Self {
         use PermissionCell::*;
         Self {
             cells: [
                 // Plan
-                [Allow, Deny, Ask, Deny],
+                [Allow, Deny, Ask, Deny, Deny],
                 // Auto
-                [Allow, Allow, Ask, Deny],
+                [Allow, Allow, Ask, Deny, Ask],
                 // Act
-                [Allow, Allow, Allow, Ask],
+                [Allow, Allow, Allow, Ask, Allow],
             ],
             overrides: HashMap::new(),
             rules: Vec::new(),
         }
+    }
+}
+
+/// Custom deserialization with a 4→5 column migration (#1051). The `Publish`
+/// tier was appended after `Dangerous`, so a matrix persisted before it existed
+/// has 4-wide rows. Rather than let `serde` reject the shape — which, via the
+/// loader's `.ok().unwrap_or_default()`, would silently reset a user's
+/// customized matrix — pad each 4-wide row with the default `Publish` cell,
+/// preserving the four columns the user did set. 5-wide rows load unchanged.
+impl<'de> Deserialize<'de> for PermissionMatrix {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(default)]
+        struct Raw {
+            cells: Vec<Vec<PermissionCell>>,
+            overrides: HashMap<String, PermissionCell>,
+            rules: Vec<PermissionRule>,
+        }
+        impl Default for Raw {
+            fn default() -> Self {
+                let d = PermissionMatrix::default();
+                Raw {
+                    cells: d.cells.iter().map(|row| row.to_vec()).collect(),
+                    overrides: d.overrides,
+                    rules: d.rules,
+                }
+            }
+        }
+
+        let raw = Raw::deserialize(deserializer)?;
+        let default = PermissionMatrix::default();
+        if raw.cells.len() != default.cells.len() {
+            return Err(serde::de::Error::invalid_length(
+                raw.cells.len(),
+                &"3 permission-matrix rows (Plan, Auto, Act)",
+            ));
+        }
+        let mut cells = default.cells;
+        for (i, row) in raw.cells.into_iter().enumerate() {
+            match row.len() {
+                // Current shape: take verbatim.
+                5 => cells[i].copy_from_slice(&row),
+                // Pre-Publish shape: keep the four persisted cells, append the
+                // default Publish column (already in `cells[i][4]`).
+                4 => cells[i][..4].copy_from_slice(&row),
+                other => {
+                    return Err(serde::de::Error::invalid_length(
+                        other,
+                        &"4 (pre-Publish) or 5 permission-tier cells per row",
+                    ));
+                }
+            }
+        }
+        Ok(PermissionMatrix {
+            cells,
+            overrides: raw.overrides,
+            rules: raw.rules,
+        })
     }
 }
 
@@ -336,11 +410,12 @@ impl PermissionMatrix {
     /// index ordering (#702).
     pub fn entries(&self) -> Vec<PermissionMatrixEntry> {
         const MODES: [Mode; 3] = [Mode::Plan, Mode::Auto, Mode::Act];
-        const SAFETIES: [Safety; 4] = [
+        const SAFETIES: [Safety; 5] = [
             Safety::ReadOnly,
             Safety::Write,
             Safety::Sensitive,
             Safety::Dangerous,
+            Safety::Publish,
         ];
         let mut cells = Vec::with_capacity(MODES.len() * SAFETIES.len());
         for mode in MODES {
@@ -424,6 +499,7 @@ fn safety_idx(safety: Safety) -> usize {
         Safety::Write => 1,
         Safety::Sensitive => 2,
         Safety::Dangerous => 3,
+        Safety::Publish => 4,
     }
 }
 

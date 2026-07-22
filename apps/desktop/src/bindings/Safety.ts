@@ -7,4 +7,4 @@
  * Part of the IPC/settings surface (the Control-panel matrix, #702), exported to
  * TypeScript via `ts-rs`.
  */
-export type Safety = "readonly" | "write" | "sensitive" | "dangerous";
+export type Safety = "readonly" | "write" | "sensitive" | "dangerous" | "publish";

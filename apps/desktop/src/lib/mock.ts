@@ -644,22 +644,32 @@ function defaultPermissionMatrix(): PermissionMatrixView {
       write: "deny",
       sensitive: "ask",
       dangerous: "deny",
+      // #1051: remote publish (git push / gh pr merge) — [Deny, Ask, Allow].
+      publish: "deny",
     },
     auto: {
       readonly: "allow",
       write: "allow",
       sensitive: "ask",
       dangerous: "deny",
+      publish: "ask",
     },
     act: {
       readonly: "allow",
       write: "allow",
       sensitive: "allow",
       dangerous: "ask",
+      publish: "allow",
     },
   };
   const modes: Mode[] = ["plan", "auto", "act"];
-  const safeties: Safety[] = ["readonly", "write", "sensitive", "dangerous"];
+  const safeties: Safety[] = [
+    "readonly",
+    "write",
+    "sensitive",
+    "dangerous",
+    "publish",
+  ];
   const cells = modes.flatMap((mode) =>
     safeties.map((safety) => ({ mode, safety, cell: rows[mode][safety] })),
   );

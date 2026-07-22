@@ -667,7 +667,7 @@ mod tests {
         assert_eq!(crate::bash::BashTool.min_safety(), Safety::ReadOnly);
         assert_eq!(crate::bash::BashTool.max_safety(), Safety::Dangerous);
         assert_eq!(crate::github::GithubTool.min_safety(), Safety::ReadOnly);
-        assert_eq!(crate::github::GithubTool.max_safety(), Safety::Write);
+        assert_eq!(crate::github::GithubTool.max_safety(), Safety::Publish);
         // web_fetch has no read-only path: floor == ceiling == Sensitive.
         assert_eq!(
             crate::web_fetch::WebFetchTool::new().min_safety(),

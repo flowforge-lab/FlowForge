@@ -253,6 +253,22 @@ impl BashTool {
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .collect();
+        // `git push` egresses to a remote, so it carries the Publish tier
+        // (Plan denies, Auto prompts, Act allows) rather than plain Write
+        // (#1051). `git push --force`/`-f` matched DANGEROUS_PATTERNS above, so
+        // only non-force pushes reach here. Checked PER SEGMENT (not on the whole
+        // line's first token) so a push anywhere in a compound command is still
+        // caught -- `cd apps && git push`, `pnpm build && git push origin main`,
+        // `cd /tmp; git push`. Keyed on each segment's first token being `git` so
+        // `grep push …` is unaffected; local git writes (`commit`, `add`) fall
+        // through to Write below. Same conservative discipline as the `find`
+        // block above -- do NOT collapse this back to first-token-only.
+        if segments.iter().any(|seg| {
+            let t: Vec<&str> = seg.split_whitespace().collect();
+            t.first() == Some(&"git") && t.contains(&"push")
+        }) {
+            return Safety::Publish;
+        }
         let all_read_only = !segments.is_empty()
             && segments.iter().all(|seg| {
                 seg.split_whitespace()
@@ -579,6 +595,36 @@ mod tests {
     fn env_prefix_is_not_read_only() {
         // `env CMD` runs arbitrary programs.
         assert_eq!(BashTool::classify("env FOO=1 ls"), Safety::Write);
+    }
+
+    #[test]
+    fn git_push_is_publish() {
+        // #1051: `git push` egresses to a remote -> Publish (Plan denies, Auto
+        // prompts, Act allows), distinct from a plain local write.
+        assert_eq!(BashTool::classify("git push"), Safety::Publish);
+        assert_eq!(BashTool::classify("git push origin main"), Safety::Publish);
+        // Force-push is Dangerous (DANGEROUS_PATTERNS matches first).
+        assert_eq!(BashTool::classify("git push --force"), Safety::Dangerous);
+        assert_eq!(BashTool::classify("git push -f"), Safety::Dangerous);
+        // Local git writes stay Write.
+        assert_eq!(BashTool::classify("git commit -m x"), Safety::Write);
+        // First-token guard: `push` as an argument to another command is not a push.
+        assert_eq!(BashTool::classify("grep push file"), Safety::ReadOnly);
+        // A push ANYWHERE in a compound command is still Publish -- the check is
+        // per-segment, not anchored to the whole line's first token. `cd x &&
+        // git push` is the shape agents emit most (strip_redundant_cd only peels
+        // a leading `cd <workspace-root>`, so a subdir/build-then-push survives).
+        assert_eq!(BashTool::classify("cd apps && git push"), Safety::Publish);
+        assert_eq!(
+            BashTool::classify("pnpm build && git push origin main"),
+            Safety::Publish
+        );
+        assert_eq!(BashTool::classify("cd /tmp; git push"), Safety::Publish);
+        // Force-push stays Dangerous even in a compound command.
+        assert_eq!(
+            BashTool::classify("cd apps && git push --force"),
+            Safety::Dangerous
+        );
     }
 
     #[tokio::test]

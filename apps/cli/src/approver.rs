@@ -82,6 +82,10 @@ impl CliApprover {
             ApprovalMode::Yes => ApprovalDecision::Allow,
             ApprovalMode::Deny => ApprovalDecision::Deny,
             ApprovalMode::Prompt => {
+                // Auto silently auto-approves Write/Sensitive but NOT Publish
+                // (`git push`, `gh pr merge`): a remote mutation must prompt (or
+                // be denied when piped), matching the desktop Auto/Publish=Ask
+                // cell (#1051). Do NOT add `Safety::Publish` to this `matches!`.
                 if agent_mode == Mode::Auto && matches!(safety, Safety::Write | Safety::Sensitive) {
                     ApprovalDecision::Allow
                 } else {
@@ -117,6 +121,7 @@ impl Approver for CliApprover {
             Safety::Write => "write",
             Safety::Sensitive => "sensitive",
             Safety::Dangerous => "DANGEROUS",
+            Safety::Publish => "publish",
             Safety::ReadOnly => "read-only",
         };
         eprintln!("\n[approval] {name} ({label})");

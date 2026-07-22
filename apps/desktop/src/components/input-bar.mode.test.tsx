@@ -29,18 +29,21 @@ const DEFAULT_MATRIX: Record<Mode, Record<Safety, PermissionCell>> = {
     write: "deny",
     sensitive: "ask",
     dangerous: "deny",
+    publish: "deny",
   },
   auto: {
     readonly: "allow",
     write: "allow",
     sensitive: "ask",
     dangerous: "deny",
+    publish: "ask",
   },
   act: {
     readonly: "allow",
     write: "allow",
     sensitive: "allow",
     dangerous: "ask",
+    publish: "allow",
   },
 };
 
@@ -158,7 +161,9 @@ describe("ModePill dropdown (#344)", () => {
     const menu = await screen.findByRole("menu");
     expect(menu.textContent).toContain("Auto mode");
     expect(menu.textContent).toMatch(/Auto-runs:.*Read & browse.*Local writes/);
-    expect(menu.textContent).toMatch(/Needs approval:.*External changes/);
+    expect(menu.textContent).toMatch(
+      /Needs approval:.*External reads.*Publish \/ remote writes/,
+    );
     expect(menu.textContent).toMatch(/Hidden:.*Dangerous commands/);
   });
 
@@ -170,7 +175,7 @@ describe("ModePill dropdown (#344)", () => {
     const menu = await screen.findByRole("menu");
     expect(menu.textContent).toContain("Act mode");
     expect(menu.textContent).toMatch(
-      /Auto-runs:.*Read & browse.*Local writes.*External changes/,
+      /Auto-runs:.*Read & browse.*Local writes.*External reads.*Publish \/ remote writes/,
     );
     expect(menu.textContent).toMatch(/Needs approval:.*Dangerous commands/);
     expect(menu.textContent).toMatch(/Hidden:.*None/);
