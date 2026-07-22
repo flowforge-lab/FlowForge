@@ -73,6 +73,28 @@ describe("AboutSection", () => {
     );
   });
 
+  // About renders inside the settings ScrollArea, so a toast placed inline at the end
+  // of the section is clipped below the fold — which made every action here look dead
+  // (nothing visibly happened on Check for updates / What's New / Quick Setup). The
+  // toast must sit in the app's fixed viewport, not in the scrolling flow.
+  it("renders toasts in the fixed viewport, not inline below the fold", async () => {
+    render(<AboutSection />);
+    const btn = [...container.querySelectorAll("button")].find((el) =>
+      el.textContent?.includes("Quick Setup"),
+    );
+    await act(async () => {
+      btn?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+    const toast = container.querySelector('[data-slot="toast"]');
+    expect(toast?.textContent).toContain("Quick Setup wizard");
+    const viewport = container.querySelector('[data-slot="toast-viewport"]');
+    expect(viewport).not.toBeNull();
+    expect(toast?.closest('[data-slot="toast-viewport"]')).toBe(viewport);
+    // `fixed` is what escapes the scroll container; a regression to a static/inline
+    // element would put it back under the fold.
+    expect(viewport?.className).toContain("fixed");
+  });
+
   function updateNowButton(): HTMLButtonElement | undefined {
     return [...container.querySelectorAll("button")].find((el) =>
       el.textContent?.includes("Update now"),
