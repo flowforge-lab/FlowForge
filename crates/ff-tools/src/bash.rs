@@ -61,13 +61,110 @@ const DANGEROUS_PATTERNS: &[&str] = &[
     ":(){",
     "shutdown",
     "reboot",
-    "> /dev/",
+    // Note: writes to a device file (`> /dev/sda`, `2>/dev/tty`) are caught by
+    // `scan_redirects`, which is target-aware and space-insensitive — the old
+    // `"> /dev/"` substring here only matched the spaced form and let
+    // `>/dev/sda` slip through as ReadOnly (#1050 follow-up).
     "chmod -r 777",
     "git push --force",
     "git push -f",
     "curl",
     "wget",
 ];
+
+/// The highest-severity redirect target seen while scanning a command
+/// (#1050 follow-up). Ordered so the scanner can keep the worst it has seen.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RedirectClass {
+    /// No file-writing redirect (only fd duplication / a benign `/dev/` sink).
+    None,
+    /// Writes a named file (`> out.txt`, `2>errors.log`) — a filesystem mutation.
+    File,
+    /// Writes a device that is NOT a known-benign sink (`> /dev/sda`,
+    /// `2>/dev/tty`) — potentially destructive, on par with `dd`/`mkfs`.
+    Device,
+}
+
+/// Redirect targets under `/dev/` that only discard or duplicate a stream and
+/// so have no destructive effect. Anything else under `/dev/` (a disk, a tty,
+/// `/dev/mem`, ...) is treated as a device write.
+const BENIGN_DEV_SINKS: &[&str] = &["/dev/null", "/dev/zero", "/dev/stdout", "/dev/stderr"];
+
+/// Scan a lowercased command for shell redirects, separating file-writing
+/// redirects (`> f`, `>> f`, `2> f`, `&> f`) from benign stream
+/// silencing/duplication (`2>/dev/null`, `2>&1`, `&>/dev/null`, `>&2`) and from
+/// device writes (`>/dev/sda`) (#1050).
+///
+/// Returns the command with every *benign* redirect operator+target removed (so
+/// the caller's `&`-based segment split isn't fooled by `2>&1`), plus the
+/// highest-severity [`RedirectClass`] seen.
+///
+/// Heuristic, not a shell parser: after a `>`/`>>`/`&>` operator (optionally
+/// preceded by an fd number), the target is
+///   - benign (stripped) if it is an fd duplication (`&N`/`&-`), a known
+///     `/dev/` sink ([`BENIGN_DEV_SINKS`]), or an `/dev/fd/N` fd path;
+///   - a [`RedirectClass::Device`] write if it is any other `/dev/*`;
+///   - a [`RedirectClass::File`] write otherwise (a filename).
+///
+/// Command substitution is handled by the caller before this runs.
+fn scan_redirects(command: &str) -> (String, RedirectClass) {
+    let chars: Vec<char> = command.chars().collect();
+    let mut out = String::with_capacity(command.len());
+    let mut worst = RedirectClass::None;
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '>' {
+            // Consume `>` or `>>`.
+            i += 1;
+            if i < chars.len() && chars[i] == '>' {
+                i += 1;
+            }
+            // Skip spaces between operator and target.
+            while i < chars.len() && chars[i] == ' ' {
+                i += 1;
+            }
+            // Read the target token (up to whitespace or the next operator).
+            let start = i;
+            while i < chars.len() && !matches!(chars[i], ' ' | '|' | ';' | '>' | '<') {
+                i += 1;
+            }
+            let target: String = chars[start..i].iter().collect();
+            let class = classify_redirect_target(&target);
+            // An fd duplication / benign sink leaves `worst` untouched; a device
+            // write outranks a file write.
+            worst = match (worst, class) {
+                (RedirectClass::Device, _) | (_, RedirectClass::Device) => RedirectClass::Device,
+                (RedirectClass::File, _) | (_, RedirectClass::File) => RedirectClass::File,
+                _ => RedirectClass::None,
+            };
+            // Drop the redirect (operator + target) from the sanitized output
+            // regardless; a benign one must not survive into the segment split,
+            // and a file/device write already updated `worst`.
+        } else {
+            out.push(chars[i]);
+            i += 1;
+        }
+    }
+    (out, worst)
+}
+
+/// Classify a single redirect target token (already lowercased by the caller).
+fn classify_redirect_target(target: &str) -> RedirectClass {
+    // fd duplication (`&1`, `&-`) or an empty target (`>|`, trailing operator).
+    if target.is_empty() || target.starts_with('&') {
+        return RedirectClass::None;
+    }
+    if let Some(rest) = target.strip_prefix("/dev/") {
+        // `/dev/fd/N` duplicates an existing fd — benign, like `&N`.
+        if rest.starts_with("fd/") || BENIGN_DEV_SINKS.contains(&target) {
+            return RedirectClass::None;
+        }
+        // Any other device (disk, tty, mem, ...) is a potentially destructive
+        // write, not a mere silencing sink.
+        return RedirectClass::Device;
+    }
+    RedirectClass::File
+}
 
 /// Best-effort age prune of the scratch dir (#483): remove entries whose mtime is older
 /// than `max_age`, preserving the dir itself and its `.gitignore`. All errors are
@@ -212,10 +309,24 @@ impl BashTool {
         if DANGEROUS_PATTERNS.iter().any(|p| lower.contains(p)) {
             return Safety::Dangerous;
         }
-        // Command substitution and redirects bypass the segment split below (they can
-        // hide writes or run arbitrary nested commands), so never auto-run them.
-        if ["$(", "`", ">", ">>"].iter().any(|t| command.contains(t)) {
+        // Command substitution can hide arbitrary nested writes/exec, so never
+        // auto-run it.
+        if command.contains("$(") || command.contains('`') {
             return Safety::Write;
+        }
+        // Distinguish redirects that WRITE A NAMED FILE (`> f`, `>> f`,
+        // `2>errors.log`) -- a filesystem mutation, so Write -- and redirects
+        // that WRITE A DEVICE (`> /dev/sda`, `2>/dev/tty`) -- potentially
+        // destructive, so Dangerous -- from stream silencing/duplication
+        // (`2>/dev/null`, `2>&1`, `&>/dev/null`, `>&2`), which has no filesystem
+        // effect and must not downgrade an otherwise read-only command (#1050).
+        // The benign forms are stripped here so the segment split below (which
+        // splits on `&`) isn't fooled by `2>&1`.
+        let (lower, redirect) = scan_redirects(&lower);
+        match redirect {
+            RedirectClass::Device => return Safety::Dangerous,
+            RedirectClass::File => return Safety::Write,
+            RedirectClass::None => {}
         }
         // `find` is read-only for traversal/matching, but it has actions with
         // side effects. `-exec`/`-execdir`/`-ok`/`-okdir` run arbitrary commands
@@ -623,6 +734,85 @@ mod tests {
         // Force-push stays Dangerous even in a compound command.
         assert_eq!(
             BashTool::classify("cd apps && git push --force"),
+            Safety::Dangerous
+        );
+    }
+
+    #[test]
+    fn stderr_redirects_do_not_force_write() {
+        // #1050: stream silencing/duplication has no filesystem effect, so it
+        // must not downgrade an otherwise read-only command.
+        assert_eq!(BashTool::classify("rg foo 2>/dev/null"), Safety::ReadOnly);
+        assert_eq!(BashTool::classify("ls 2>&1"), Safety::ReadOnly);
+        assert_eq!(BashTool::classify("cat x 2>/dev/null"), Safety::ReadOnly);
+        assert_eq!(
+            BashTool::classify("grep x file &>/dev/null"),
+            Safety::ReadOnly
+        );
+        // A benign redirect must not rescue a genuinely writing command.
+        assert_eq!(BashTool::classify("mv a b 2>/dev/null"), Safety::Write);
+
+        // File-writing redirects (named target) remain Write.
+        assert_eq!(BashTool::classify("echo x > f"), Safety::Write);
+        assert_eq!(BashTool::classify("echo x >> f"), Safety::Write);
+        assert_eq!(BashTool::classify("cat x 2>errors.log"), Safety::Write);
+        // A read-only command that redirects stdout to a file is still writing.
+        assert_eq!(BashTool::classify("ls > out.txt"), Safety::Write);
+
+        // Command substitution can hide nested writes -> always Write.
+        assert_eq!(BashTool::classify("cat $(cmd)"), Safety::Write);
+        assert_eq!(BashTool::classify("echo `whoami`"), Safety::Write);
+
+        // Dangerous patterns still win over redirect analysis.
+        assert_eq!(
+            BashTool::classify("curl example.com 2>/dev/null"),
+            Safety::Dangerous
+        );
+        assert_eq!(BashTool::classify("git push --force"), Safety::Dangerous);
+    }
+
+    #[test]
+    fn dev_redirect_targets_classified_by_sink() {
+        // #1050 follow-up: a redirect target under /dev/ is benign ONLY for the
+        // known silencing/duplication sinks. Any other device is a write to a
+        // device and must be Dangerous — the old code (and the spaced-only
+        // `"> /dev/"` dangerous pattern) let `>/dev/sda` slip through as
+        // ReadOnly and clobber a raw disk.
+
+        // Benign sinks — no-space and spaced forms alike are ReadOnly.
+        for cmd in [
+            "ls >/dev/null",
+            "ls 2>/dev/null",
+            "echo x > /dev/null",
+            "grep x f &>/dev/null",
+            "ls >/dev/zero",
+            "ls >/dev/stdout",
+            "cat x 2>/dev/stderr",
+            "ls >/dev/fd/3",
+        ] {
+            assert_eq!(BashTool::classify(cmd), Safety::ReadOnly, "{cmd}");
+        }
+
+        // Non-sink devices — writing a disk / tty / kernel memory is Dangerous,
+        // whether or not there is a space after the operator.
+        for cmd in [
+            "ls >/dev/sda",
+            "ls > /dev/sda",
+            "cat x 2>/dev/sda",
+            "echo boom >/dev/tty",
+            "echo boom >>/dev/mem",
+            "printf x &>/dev/nvme0n1",
+        ] {
+            assert_eq!(BashTool::classify(cmd), Safety::Dangerous, "{cmd}");
+        }
+
+        // A device write outranks a co-occurring benign sink / named file.
+        assert_eq!(
+            BashTool::classify("ls >/dev/null 2>/dev/sda"),
+            Safety::Dangerous
+        );
+        assert_eq!(
+            BashTool::classify("ls >out.txt 2>/dev/sda"),
             Safety::Dangerous
         );
     }
