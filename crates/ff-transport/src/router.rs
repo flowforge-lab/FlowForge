@@ -1,18 +1,16 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use ff_agent::{run_turn, AgentEvent, CancelToken, SystemPrompt, ToolContext};
+use crate::channel_map::ChannelMap;
+use crate::transport::MessageTransport;
+use crate::types::{ChannelId, Notification};
+use ff_agent::{run_turn, AgentEvent, Approver, CancelToken, SystemPrompt, ToolContext};
 use ff_core::ReasoningVisibility;
 use ff_core::{Egress, Mode, PermissionMatrix, Role};
 use ff_llm::Provider;
 use ff_session::SessionStore;
 use ff_tools::ToolRegistry;
 use tracing::{debug, info, warn};
-
-use crate::approver::MessagingApprover;
-use crate::channel_map::ChannelMap;
-use crate::transport::MessageTransport;
-use crate::types::{ChannelId, Notification};
 
 /// Configuration for the headless router.
 pub struct RouterConfig {
@@ -84,7 +82,12 @@ impl Router {
     /// Run the router loop: receive messages from the transport, route them to
     /// sessions, run turns, and stream responses back. Runs until the transport
     /// returns `None` (closed).
-    pub async fn run(&mut self, transport: &mut dyn MessageTransport) {
+    ///
+    /// The `approver` is injected rather than built here so an interactive
+    /// approver (e.g. Slack buttons, #912 T4) can share the transport's
+    /// connection: both are constructed per-connection by the host and passed
+    /// in together. Headless callers pass a `MessagingApprover`.
+    pub async fn run(&mut self, transport: &mut dyn MessageTransport, approver: &dyn Approver) {
         info!(transport = transport.name(), "router started");
 
         while let Some(msg) = transport.recv().await {
@@ -110,11 +113,12 @@ impl Router {
             let stream = transport.begin_response(&channel);
 
             // Build tool context with mode + egress from config (#2 fix).
-            let approver = MessagingApprover::new(self.config.mode);
+            // The approver is injected via `run` (#1056) so interactive
+            // approvers can share the transport connection.
             let mut tools = ToolContext::new(
                 &self.registry,
                 &self.config.workspace,
-                &approver,
+                approver,
                 self.config.max_iterations,
                 &self.matrix,
             );
