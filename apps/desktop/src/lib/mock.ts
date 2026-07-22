@@ -78,6 +78,7 @@ import { replaceCategory } from "./memory-view";
 import {
   APP_VERSION_FALLBACK,
   type UpdateStatus,
+  type UpdateChannel,
   type BackupResult,
   type SidecarTurnResult,
 } from "./about";
@@ -166,6 +167,12 @@ const SECRET_KIND_ALL: readonly SecretKind[] = [
 
 // 300 ms/word in slow mode — long enough to see the Stop button and click it.
 const TOKEN_INTERVAL_MS = import.meta.env.VITE_FF_MOCK_SLOW === "1" ? 300 : 40;
+
+// Which direction the mock local dev-release feed offers (#1034). `older` serves a
+// build behind the running one so the downgrade path (no banner, About row, confirm
+// dialog) is exercisable without rebuilding an earlier commit for real.
+const MOCK_UPDATE_DIRECTION =
+  import.meta.env.VITE_FF_MOCK_UPDATE === "older" ? "older" : "newer";
 
 // Goal mode (#717) faker tuning. The real backend's iteration boundary is one
 // `run_turn`; the mock stands in with a wall-clock tick that advances one
@@ -954,6 +961,9 @@ export class MockIpc implements FfIpc {
   >();
   private updateProgressListeners = new Set<Listener<UpdateProgressEvent>>();
   private updateDownloadFinishedListeners = new Set<Listener<void>>();
+  // Last result handed out by `checkForUpdates`, so `installUpdate` can mirror the
+  // backend's downgrade guard (#1034) — the real one re-checks the feed instead.
+  private lastUpdateStatus: UpdateStatus | null = null;
   private workspaceBranchListeners = new Set<Listener<SessionWorkspace>>();
   // Goal mode (#717). One goal per session (RFC 0020 §3), plus its auto-advance
   // interval so the faked loop can be paused/resumed/cleared. The real backend
@@ -2472,8 +2482,32 @@ Shipping the Settings redesign — currently the Memory browser (SET.8).
   }
 
   // About section (SET.11). Structured stubs — real updater/backup lands later.
-  async checkForUpdates(): Promise<UpdateStatus> {
-    return { kind: "upToDate", version: APP_VERSION_FALLBACK };
+  async checkForUpdates(channel: UpdateChannel): Promise<UpdateStatus> {
+    // Local dogfood channel: pretend the dev-release feed has a newer build so the
+    // banner/About flow is exercisable under VITE_FF_MOCK=1. GitHub channel: up to date.
+    if (channel === "local") {
+      // `VITE_FF_MOCK_UPDATE=older` serves an OLDER build instead, so the tiered
+      // downgrade path (#1034) — no banner, About row, confirm dialog — is
+      // exercisable without a real dev-release rebuild of an earlier commit.
+      this.lastUpdateStatus =
+        MOCK_UPDATE_DIRECTION === "older"
+          ? {
+              kind: "olderAvailable",
+              version: "0.0.0-dev.1700000000",
+              notes: "Local dev build abc1234 (2023-11-14T22:13:20+00:00).",
+            }
+          : {
+              kind: "available",
+              version: "0.0.0-dev.mock",
+              notes: "Local dev build (mock dev-release feed).",
+            };
+      return this.lastUpdateStatus;
+    }
+    this.lastUpdateStatus = {
+      kind: "upToDate",
+      version: APP_VERSION_FALLBACK,
+    };
+    return this.lastUpdateStatus;
   }
 
   // The real backend streams `update:progress` per downloaded chunk then relaunches
@@ -2487,7 +2521,27 @@ Shipping the Settings redesign — currently the Memory browser (SET.8).
   async onLocalFeedChanged(_cb: () => void): Promise<Unlisten> {
     return () => {};
   }
-  async installUpdate(): Promise<void> {
+  async installUpdate(
+    _channel: UpdateChannel,
+    expectedVersion: string,
+    allowDowngrade = false,
+  ): Promise<void> {
+    // Mirror the backend guards (#1034) rather than faking them: the feed must still
+    // offer the version the UI showed, and an older build needs the explicit opt-in.
+    const offered =
+      this.lastUpdateStatus && this.lastUpdateStatus.kind !== "upToDate"
+        ? this.lastUpdateStatus.version
+        : null;
+    if (offered !== null && offered !== expectedVersion) {
+      throw new Error(
+        `update feed moved: you confirmed ${expectedVersion}, but the feed now offers ${offered}; re-check before installing`,
+      );
+    }
+    if (this.lastUpdateStatus?.kind === "olderAvailable" && !allowDowngrade) {
+      throw new Error(
+        `refusing to install ${this.lastUpdateStatus.version} — it is older than the running build; confirm the downgrade first`,
+      );
+    }
     const total = 5 * 1024 * 1024; // 5 MiB
     const chunks = 5;
     const step = total / chunks;

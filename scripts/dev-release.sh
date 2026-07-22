@@ -5,8 +5,9 @@
 # dev-flavored install can pull the build through the in-app "Update now" button.
 #
 # Pairs with apps/desktop/src-tauri/tauri.local.conf.json (localhost endpoint +
-# dangerousInsecureTransportProtocol) and the FF_UPDATER_ENDPOINT / lenient
-# version_comparator hooks in the backend. Prod/CI config stays strict-HTTPS.
+# dangerousInsecureTransportProtocol) and the FF_UPDATER_ENDPOINT / permissive
+# version_comparator hooks in the backend, which surfaces builds in BOTH directions
+# and classifies newer vs older itself (#1034). Prod/CI config stays strict-HTTPS.
 #
 # Usage:  ./scripts/dev-release.sh [PORT]   (default 8787)
 #
@@ -81,7 +82,23 @@ case "$(uname -m)" in
   *) echo "unsupported arch $(uname -m)" >&2; exit 1 ;;
 esac
 
-DEV_VERSION="0.0.0-dev.$(date +%s)"
+# Version by the COMMITTER DATE of the built commit, not the build moment (#1034).
+# `date +%s` made every rebuild look newer — even a rebuild of an older commit — so
+# the app could never tell a genuinely newer build from a downgrade. Committer time
+# is monotonic along history, so semver ordering of the `0.0.0-dev.<epoch>`
+# prerelease is exactly commit recency, which is what the backend compares.
+COMMIT_EPOCH="$(git -C "$REPO_ROOT" show -s --format=%ct HEAD)"
+COMMIT_SHA="$(git -C "$REPO_ROOT" rev-parse --short HEAD)"
+COMMIT_DATE="$(git -C "$REPO_ROOT" show -s --format=%cI HEAD)"
+DEV_VERSION="0.0.0-dev.$COMMIT_EPOCH"
+# The sha stays OUT of the version string (macOS bundle-version parsing is fussy and
+# build metadata is semver-ignored anyway); it travels in the manifest notes instead,
+# which the app surfaces so a dev can see exactly which commit they're installing.
+if [[ -n "$(git -C "$REPO_ROOT" status --porcelain)" ]]; then
+  echo "warning: working tree is dirty — the version describes commit $COMMIT_SHA," >&2
+  echo "         not the tree actually built. Commit first for a truthful version." >&2
+fi
+
 echo "==> Building CLI sidecar binary (CLI.7)"
 TRIPLE=$(rustc -vV | sed -n 's/^host: //p')
 mkdir -p "$REPO_ROOT/apps/desktop/src-tauri/binaries"
@@ -89,7 +106,7 @@ cargo build -p ff-cli --release
 cp "$REPO_ROOT/target/release/flowforge" \
    "$REPO_ROOT/apps/desktop/src-tauri/binaries/flowforge-$TRIPLE"
 
-echo "==> Building signed updater bundle, version $DEV_VERSION"
+echo "==> Building signed updater bundle, version $DEV_VERSION ($COMMIT_SHA, $COMMIT_DATE)"
 cd "$REPO_ROOT/apps/desktop"
 # Remove stale artifacts so we never accidentally serve an old tarball with a new version.
 rm -f "$BUNDLE_DIR/FlowForge.app.tar.gz" "$BUNDLE_DIR/FlowForge.app.tar.gz.sig"
@@ -109,6 +126,8 @@ fi
 echo "==> Writing latest.json"
 SIGNATURE="$(cat "$SIG")" \
 DEV_VERSION="$DEV_VERSION" \
+COMMIT_SHA="$COMMIT_SHA" \
+COMMIT_DATE="$COMMIT_DATE" \
 PLATFORM="$PLATFORM" \
 PORT="$PORT" \
 python3 - "$BUNDLE_DIR/latest.json" <<'PY'
@@ -116,7 +135,11 @@ import json, os, sys, datetime
 out = sys.argv[1]
 manifest = {
     "version": os.environ["DEV_VERSION"],
-    "notes": "Local dev build (dev-release.sh).",
+    # Build identity (#1034): the app shows this so a dev can tell exactly which
+    # commit a build is before installing it — especially for a deliberate downgrade.
+    "notes": "Local dev build {} ({}).".format(
+        os.environ["COMMIT_SHA"], os.environ["COMMIT_DATE"]
+    ),
     "pub_date": datetime.datetime.now(datetime.timezone.utc)
         .strftime("%Y-%m-%dT%H:%M:%SZ"),
     "platforms": {

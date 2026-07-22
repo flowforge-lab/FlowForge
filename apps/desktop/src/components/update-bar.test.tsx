@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { UpdateBar } from "@/components/update-bar";
 import { ipc } from "@/lib/ipc";
 import { useUpdateStore } from "@/store/update";
+import { useExperimentalStore } from "@/store/experimental";
 
 (
   globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }
@@ -43,6 +44,7 @@ beforeEach(() => {
 afterEach(() => {
   act(() => root.unmount());
   container.remove();
+  useExperimentalStore.getState().resetExperimental();
   vi.restoreAllMocks();
 });
 
@@ -66,6 +68,43 @@ describe("UpdateBar (#565)", () => {
   it("does not show when status is null", () => {
     render(<UpdateBar />);
     expect(container.querySelector(".update-bar")).toBeNull();
+  });
+
+  it("never banners an older build (#1034)", () => {
+    // A downgrade must not interrupt: it belongs in Settings → About, behind a
+    // confirmation. This is the whole "no proactive banner" acceptance criterion.
+    useUpdateStore.setState({
+      status: {
+        kind: "olderAvailable",
+        version: "0.0.0-dev.1700000000",
+        notes: "Local dev build abc1234.",
+      },
+    });
+    render(<UpdateBar />);
+    expect(container.querySelector(".update-bar")).toBeNull();
+  });
+
+  it("names the active channel on the local dogfood feed (#1034)", () => {
+    useExperimentalStore.setState((s) => ({
+      flags: { ...s.flags, localUpdateChannel: true },
+    }));
+    useUpdateStore.setState({
+      status: {
+        kind: "available",
+        version: "0.0.0-dev.1800000000",
+        notes: null,
+      },
+    });
+    render(<UpdateBar />);
+    expect(container.textContent).toContain("local dev channel");
+  });
+
+  it("omits the channel tag on the github feed (#1034)", () => {
+    useUpdateStore.setState({
+      status: { kind: "available", version: "9.9.9", notes: null },
+    });
+    render(<UpdateBar />);
+    expect(container.textContent).not.toContain("local dev channel");
   });
 
   it("Update button calls install() once", async () => {
@@ -115,7 +154,7 @@ describe("UpdateBar (#565)", () => {
     // A fresh poll (`refresh`) clears `dismissed` so a still-available update
     // resurfaces the bar — the issue's "reappears on the next poll" requirement.
     await act(async () => {
-      await useUpdateStore.getState().refresh();
+      await useUpdateStore.getState().refresh("github");
     });
     expect(container.querySelector(".update-bar")).not.toBeNull();
   });

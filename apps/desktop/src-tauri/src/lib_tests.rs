@@ -1,9 +1,10 @@
 use super::state::AppState;
 use super::{
-    emit_agent_event, git_branch, goal_gate_for, is_app_ready, list_directory_in,
-    list_local_branches, matrix_gate, panic_message, pre_prompt_decision, publish_app_ready,
-    read_file_in, resolve_tool_arg, resolve_workspace_dir, run_sidecar_turn, should_warmup,
-    switch_branch, BootFinalize, PrePromptDecision, TurnMetrics, UpdateStatus, APP_READY,
+    compare_build, emit_agent_event, git_branch, goal_gate_for, install_guard, is_app_ready,
+    list_directory_in, list_local_branches, matrix_gate, panic_message, pre_prompt_decision,
+    publish_app_ready, read_file_in, resolve_tool_arg, resolve_workspace_dir, run_sidecar_turn,
+    should_warmup, switch_branch, BootFinalize, PrePromptDecision, TurnMetrics, UpdateStatus,
+    VersionDirection, APP_READY,
 };
 use ff_agent::{AgentEvent, GateDecision};
 use ff_core::events::TurnDoneEvent;
@@ -205,6 +206,111 @@ fn update_status_matches_fe_contract() {
         .unwrap(),
         serde_json::json!({ "kind": "available", "version": "0.2.0", "notes": null })
     );
+    assert_eq!(
+        serde_json::to_value(UpdateStatus::OlderAvailable {
+            version: "0.0.0-dev.100".into(),
+            notes: Some("Local dev build abc1234 (2026-07-01T00:00:00+00:00).".into()),
+        })
+        .unwrap(),
+        serde_json::json!({
+            "kind": "olderAvailable",
+            "version": "0.0.0-dev.100",
+            "notes": "Local dev build abc1234 (2026-07-01T00:00:00+00:00).",
+        })
+    );
+}
+
+// Direction of a feed's build vs the running one (#1034). This is the whole basis of
+// "banner it" vs "ask before downgrading", so pin every branch.
+#[test]
+fn compare_build_orders_dogfood_builds_by_commit_time() {
+    // `dev-release.sh` stamps the committer epoch, so a later commit sorts higher.
+    assert_eq!(
+        compare_build("0.0.0-dev.1700", "0.0.0-dev.1800"),
+        VersionDirection::Newer
+    );
+    assert_eq!(
+        compare_build("0.0.0-dev.1800", "0.0.0-dev.1700"),
+        VersionDirection::Older
+    );
+    assert_eq!(
+        compare_build("0.0.0-dev.1800", "0.0.0-dev.1800"),
+        VersionDirection::Same
+    );
+}
+
+#[test]
+fn compare_build_orders_releases() {
+    assert_eq!(compare_build("0.1.0", "0.2.0"), VersionDirection::Newer);
+    assert_eq!(compare_build("0.2.0", "0.1.0"), VersionDirection::Older);
+    assert_eq!(compare_build("0.1.0", "0.1.0"), VersionDirection::Same);
+}
+
+#[test]
+fn compare_build_treats_entering_the_dev_lineage_as_newer() {
+    // Semver ranks every `0.0.0-dev.*` below `0.1.0`, which would make each dogfood
+    // install a "downgrade" for anyone running a release build. Entering the dev
+    // lineage is the point of the channel, so it is Newer.
+    assert_eq!(
+        compare_build("0.1.0", "0.0.0-dev.1800"),
+        VersionDirection::Newer
+    );
+    // The reverse (a release offered to a dev build) stays plain semver: still newer.
+    assert_eq!(
+        compare_build("0.0.0-dev.1800", "0.1.0"),
+        VersionDirection::Newer
+    );
+}
+
+// `install_update` re-checks the feed, so what the user confirmed and what is about to
+// be installed are two different reads. These pin that consent is checked against the
+// exact version the FE displayed, not just the direction (#1034 review).
+#[test]
+fn install_guard_allows_the_confirmed_build() {
+    // Newer, and the feed still offers what the banner showed.
+    assert_eq!(
+        install_guard("0.0.0-dev.1700", "0.0.0-dev.1800", "0.0.0-dev.1800", false),
+        Ok(())
+    );
+    // Older, but explicitly confirmed.
+    assert_eq!(
+        install_guard("0.0.0-dev.1800", "0.0.0-dev.1700", "0.0.0-dev.1700", true),
+        Ok(())
+    );
+}
+
+#[test]
+fn install_guard_refuses_an_unconfirmed_downgrade() {
+    let err = install_guard("0.0.0-dev.1800", "0.0.0-dev.1700", "0.0.0-dev.1700", false)
+        .expect_err("an older build must not install without the opt-in");
+    assert!(err.contains("older than the running"), "{err}");
+}
+
+#[test]
+fn install_guard_refuses_a_feed_that_moved_after_confirmation() {
+    // Another dev-release.sh run landed between the check and the install: the user
+    // confirmed .1700 but the feed now serves .1900. Even though .1900 is a NEWER build
+    // (which would otherwise sail through), it is not what was agreed to.
+    let err = install_guard("0.0.0-dev.1800", "0.0.0-dev.1900", "0.0.0-dev.1700", true)
+        .expect_err("installing a version the user never saw must be refused");
+    assert!(err.contains("feed moved"), "{err}");
+    // ...and the mismatch is caught before the downgrade check, so the message names the
+    // real problem rather than blaming the direction.
+    let err = install_guard("0.0.0-dev.1800", "0.0.0-dev.1600", "0.0.0-dev.1700", false)
+        .expect_err("a moved feed is refused regardless of direction");
+    assert!(err.contains("feed moved"), "{err}");
+}
+
+#[test]
+fn compare_build_falls_back_to_newer_on_unparseable_versions() {
+    // Fail toward the pre-#1034 frictionless behavior rather than hiding a build.
+    assert_eq!(
+        compare_build("0.1.0", "not-a-version"),
+        VersionDirection::Newer
+    );
+    assert_eq!(compare_build("nightly", "0.1.0"), VersionDirection::Newer);
+    // ...but an identical unparseable string is still the same build.
+    assert_eq!(compare_build("nightly", "nightly"), VersionDirection::Same);
 }
 
 // Permission matrix correctness is tested in ff-core::permission::tests.

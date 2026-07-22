@@ -6,6 +6,7 @@
 
 import type {
   UpdateStatus,
+  UpdateChannel,
   BackupResult,
   SidecarTurnResult,
 } from "@/lib/about";
@@ -479,11 +480,23 @@ export interface FfIpc {
   // (mirroring the SET.5/7 marketplace contracts). The FE owns the user-facing
   // copy; these report only the structured outcome. Replace with generated
   // bindings + a real updater/backup backend when they land (#159).
-  /** Check for app updates. */
-  checkForUpdates(): Promise<UpdateStatus>;
-  /** Download and install the available update; the backend relaunches the app on
-   *  success (so this never resolves in the real app — see #363 / #362). */
-  installUpdate(): Promise<void>;
+  /** Check the given update feed. `channel` is explicit (#1033) so the endpoint is
+   *  never inferred from a global flag; a `local` check that can't reach the
+   *  dev-release server rejects rather than silently falling back. */
+  checkForUpdates(channel: UpdateChannel): Promise<UpdateStatus>;
+  /** Download and install the available update from `channel`; the backend relaunches
+   *  the app on success (so this never resolves in the real app — see #363 / #362).
+   *  `channel` must match the check that surfaced the update. `expectedVersion` is the
+   *  version this UI showed the user — the backend re-checks the feed, so it refuses the
+   *  install when the feed moved in between rather than installing a build the user never
+   *  saw (#1034). `allowDowngrade` is the user's explicit confirmation that an OLDER build
+   *  may be installed; without it the backend refuses one, so no code path can silently
+   *  roll the app backwards. */
+  installUpdate(
+    channel: UpdateChannel,
+    expectedVersion: string,
+    allowDowngrade?: boolean,
+  ): Promise<void>;
   /** Start the dev-update file-system watcher (#705). Idempotent; the watcher
    *  observes `~/.config/flowforge/dev-update/latest.json` and emits
    *  `update:local-feed-changed` instantly on write. */
@@ -928,8 +941,18 @@ class TauriIpc implements FfIpc {
   removeMcpServer = (id: string) =>
     this.invoke<void>("remove_mcp_server", { id });
 
-  checkForUpdates = () => this.invoke<UpdateStatus>("check_for_updates");
-  installUpdate = () => this.invoke<void>("install_update");
+  checkForUpdates = (channel: UpdateChannel) =>
+    this.invoke<UpdateStatus>("check_for_updates", { channel });
+  installUpdate = (
+    channel: UpdateChannel,
+    expectedVersion: string,
+    allowDowngrade = false,
+  ) =>
+    this.invoke<void>("install_update", {
+      channel,
+      expectedVersion,
+      allowDowngrade,
+    });
   startDevUpdateWatcher = () => this.invoke<void>("start_dev_update_watcher");
   onLocalFeedChanged = (cb: () => void) =>
     this.listen<void>("update:local-feed-changed", cb);

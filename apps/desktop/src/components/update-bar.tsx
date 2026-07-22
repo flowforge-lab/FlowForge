@@ -1,7 +1,11 @@
 import { Download, Loader2, X } from "@/components/ui/icon";
 import { Button } from "@/components/ui/button";
 import { Progress } from "@/components/ui/progress";
-import { progressPercent, useUpdateStore } from "@/store/update";
+import {
+  progressPercent,
+  activeUpdateChannel,
+  useUpdateStore,
+} from "@/store/update";
 
 /**
  * Global update-available banner (#565, RFC 0014 §12.1, P5a). Renders a
@@ -24,10 +28,16 @@ export function UpdateBar() {
   const install = useUpdateStore((s) => s.install);
   const dismiss = useUpdateStore((s) => s.dismiss);
 
+  // Only a genuinely NEWER build banners (#1034). An `olderAvailable` status is a
+  // deliberate downgrade — it lives in Settings → About behind a confirmation and
+  // must never interrupt with a proactive prompt.
   const available = status?.kind === "available";
   const show = available && !dismissed;
   const version = available ? status.version : "";
   const percent = progressPercent(progress);
+  // Which feed this build came from — on the local dogfood channel the version alone
+  // doesn't say what you're about to install, so name the channel (#1034).
+  const channel = activeUpdateChannel();
 
   if (!show) return null;
 
@@ -43,12 +53,23 @@ export function UpdateBar() {
           <span>
             <strong>FlowForge {version}</strong> is available
           </span>
+          {channel === "local" ? (
+            <span className="rounded-sm border border-current/25 px-1.5 py-px text-[11px] text-current/70">
+              local dev channel
+            </span>
+          ) : null}
         </span>
         <div className="flex items-center gap-2">
           <Button
             size="xs"
             variant="secondary"
-            onClick={() => void install()}
+            onClick={() => {
+              // `version` is what this bar is showing: the backend refuses the
+              // install if the feed moved to something else in between (#1034).
+              // The store re-checks on refusal, so the bar re-prompts with the
+              // real build — this catch just keeps the rejection from escaping.
+              void install(channel, version).catch(() => {});
+            }}
             disabled={installing}
             data-icon="inline-end"
           >

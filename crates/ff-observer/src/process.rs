@@ -184,10 +184,9 @@ mod tests {
         }
     }
 
-    /// Start a long-running process that emits a known string after a
-    /// short delay, returning (supervisor, pid). Subscribe-based tests
-    /// must `subscribe` before the sleep elapses to avoid the
-    /// exit-watcher dropping the sender first.
+    /// Start a long-running process under `cmd`, returning (supervisor, pid).
+    /// Callers that need output after subscribe must gate the process themselves
+    /// (file-gate) so CI load can't race bytes past the broadcast receiver.
     async fn live_proc(dir: &TempDir, cmd: &str) -> (Arc<ProcessSupervisor>, u64) {
         let sup = Arc::new(ProcessSupervisor::new());
         let id = sup.start(cmd, dir.path(), "s1").expect("start process");
@@ -197,11 +196,24 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn match_emits_with_summary() {
         let dir = TempDir::new().unwrap();
-        let (sup, id) = live_proc(&dir, "sleep 0.2; echo error detected").await;
-        // Subscribe immediately so the bytes appended *after* this
-        // point are the ones we see.
+        // File-gate (same idea as #958): block the process until after we
+        // subscribe, so CI load can't race the echo past the broadcast
+        // receiver and leave `next_event` with a Closed channel.
+        let gate = dir.path().join("gate");
+        #[cfg(not(windows))]
+        let cmd = format!(
+            "while [ ! -f '{}' ]; do sleep 0.01; done; echo error detected",
+            gate.display()
+        );
+        #[cfg(windows)]
+        let cmd = format!(
+            "while (-not (Test-Path '{}')) {{ Start-Sleep -Milliseconds 10 }}; Write-Output 'error detected'",
+            gate.display().to_string().replace('\\', "/")
+        );
+        let (sup, id) = live_proc(&dir, &cmd).await;
         let mut src = ProcessSource::new(ctx(1), id, Some("error detected"), &sup, "s1")
             .expect("source builds");
+        std::fs::write(&gate, "go").unwrap();
         let cancel = Arc::new(Notify::new());
         let ev = tokio::time::timeout(Duration::from_secs(3), src.next_event(cancel.clone()))
             .await
@@ -303,21 +315,35 @@ mod tests {
         // The regex with `(?m)` (set by the source) matches any line;
         // two separate `echo`s produce two chunks. Each chunk is its
         // own event because each call to `next_event` only consumes
-        // one chunk before returning.
+        // one chunk before returning. Two file-gates keep the echoes
+        // in separate chunks without relying on wall-clock sleeps (#958).
         let dir = TempDir::new().unwrap();
-        let (sup, id) = live_proc(
-            &dir,
-            "sleep 0.2; echo first-error; sleep 0.2; echo second-error",
-        )
-        .await;
+        let gate1 = dir.path().join("gate1");
+        let gate2 = dir.path().join("gate2");
+        #[cfg(not(windows))]
+        let cmd = format!(
+            "while [ ! -f '{g1}' ]; do sleep 0.01; done; echo first-error; \
+             while [ ! -f '{g2}' ]; do sleep 0.01; done; echo second-error",
+            g1 = gate1.display(),
+            g2 = gate2.display()
+        );
+        #[cfg(windows)]
+        let cmd = format!(
+            "while (-not (Test-Path '{g1}')) {{ Start-Sleep -Milliseconds 10 }}; Write-Output 'first-error'; \
+             while (-not (Test-Path '{g2}')) {{ Start-Sleep -Milliseconds 10 }}; Write-Output 'second-error'",
+            g1 = gate1.display().to_string().replace('\\', "/"),
+            g2 = gate2.display().to_string().replace('\\', "/")
+        );
+        let (sup, id) = live_proc(&dir, &cmd).await;
         let mut src =
             ProcessSource::new(ctx(1), id, Some(".*-error"), &sup, "s1").expect("source builds");
         let cancel = Arc::new(Notify::new());
-        // Read the first event, then the second.
+        std::fs::write(&gate1, "go").unwrap();
         let ev1 = tokio::time::timeout(Duration::from_secs(3), src.next_event(cancel.clone()))
             .await
             .expect("first event arrives within budget")
             .expect("source returns an event");
+        std::fs::write(&gate2, "go").unwrap();
         let ev2 = tokio::time::timeout(Duration::from_secs(3), src.next_event(cancel.clone()))
             .await
             .expect("second event arrives within budget")
