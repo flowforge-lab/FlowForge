@@ -11,6 +11,7 @@ import {
 } from "@/lib/about";
 import { ipc } from "@/lib/ipc";
 import { Progress } from "@/components/ui/progress";
+import { Toast, ToastViewport } from "@/components/ui/toast";
 import { useExperimentalStore } from "@/store/experimental";
 import { useSettingsStore } from "@/store/settings";
 import { progressPercent, useUpdateStore } from "@/store/update";
@@ -192,14 +193,15 @@ export function AboutSection() {
         />
       </AboutGroup>
 
+      {/* Fixed viewport, not an inline block at the end of the section: About lives
+          inside the settings ScrollArea, so an inline toast lands below the fold and
+          is clipped — every action here (Check for updates, What's New, Quick Setup,
+          the backup rows) looked dead because its only feedback was off-screen. This
+          is the same anchor the app's other toasts use. */}
       {toast ? (
-        <p
-          role="status"
-          aria-live="polite"
-          className="rounded-md border bg-muted/40 px-3 py-2 text-[12px] text-foreground"
-        >
-          {toast}
-        </p>
+        <ToastViewport className="z-[60]">
+          <Toast className="text-[12px]">{toast}</Toast>
+        </ToastViewport>
       ) : null}
     </div>
   );
