@@ -336,9 +336,40 @@ this for almost all dogfooding.
 Use this only when you want to test the in-app **Settings → About → Update now** button
 against a local build instead of a real GitHub release.
 
+#### One-time setup: your own dev signing key (#1047)
+
+The updater refuses an unsigned update, and the **production** signing key is held by one
+maintainer and not shared — so every other developer signs with their own throwaway key.
+The catch is that the updater trusts only the pubkey **compiled into the app**, so you
+also have to build the app with your dev **pub**key, or your own bundle fails verification.
+
 ```bash
-export TAURI_SIGNING_PRIVATE_KEY="$(cat ~/.tauri/flowforge.key)"
-export TAURI_SIGNING_PRIVATE_KEY_PASSWORD="…"   # the key's password
+# 1. Generate a personal keypair (private key stays in ~/.tauri, never committed).
+pnpm -C apps/desktop tauri signer generate -w ~/.tauri/flowforge-dev.key
+
+# 2. Tell the local build to trust it. This file is git-ignored on purpose — no one
+#    developer's key belongs in a committed config.
+cat > apps/desktop/src-tauri/tauri.dev-local.conf.json <<JSON
+{
+  "\$schema": "https://schema.tauri.app/config/2",
+  "plugins": { "updater": { "pubkey": "$(cat ~/.tauri/flowforge-dev.key.pub)" } }
+}
+JSON
+```
+
+`dev-release.sh` layers that overlay automatically when it exists, and warns when it
+doesn't (in which case the build keeps the production pubkey and will reject your bundle).
+
+Because the running app must already trust your dev key, **install a build made with the
+overlay first** (D2, §8.2, or the first `dev-release.sh` bundle copied into
+`/Applications`) — an app installed from a production-pubkey build will refuse every
+dev-signed update no matter how the feed is configured.
+
+#### Running the loop
+
+```bash
+export TAURI_SIGNING_PRIVATE_KEY="$(cat ~/.tauri/flowforge-dev.key)"
+export TAURI_SIGNING_PRIVATE_KEY_PASSWORD="…"   # empty string if you set no password
 ./scripts/dev-release.sh 8787
 ```
 
@@ -356,7 +387,17 @@ Then click **Settings → About → Check for updates → Update now**. The dev-
 patch (`apps/desktop/src-tauri/tauri.local.conf.json`) supplies the localhost endpoint and
 `dangerousInsecureTransportProtocol: true` so the dev build trusts a plain-HTTP feed. It is
 applied only via `tauri build --config` and is **never shipped** — `tauri.conf.json` stays
-strict-HTTPS for prod/CI.
+strict-HTTPS for prod/CI. The same is true of your `tauri.dev-local.conf.json` pubkey
+overlay: it is local, git-ignored, and an app built with it must never be distributed,
+since it trusts your personal key.
+
+#### Troubleshooting
+
+| Symptom | Cause |
+|---|---|
+| `TAURI_SIGNING_PRIVATE_KEY is not set` | Export it (see above) — a dev key is fine, you don't need the production key. |
+| Update downloads, then fails to install | The running app was built with a **different** pubkey than the one that signed the bundle. Reinstall an app built with your overlay. |
+| Banner never appears | Feed unreachable (is `dev-release.sh` still serving?) or the `localUpdateChannel` experimental flag is off. |
 
 ### 8.4 Which loop?
 
