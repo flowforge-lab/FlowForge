@@ -3361,15 +3361,18 @@ impl AppState {
     }
 
     /// Whether the #229 allowlist pre-approves this call without a prompt. The
-    /// allowlist is keyed by tool name only, so it never covers `Dangerous`
-    /// invocations -- those always re-prompt regardless of any "Always Allow" or
-    /// "Allow this session" grant on the tool.
-    /// Whether the allowlist pre-approves this tool call. The caller (`UiApprover`)
-    /// MUST check `matrix.effective_cell(...).is_deny()` first — a Deny cell is
-    /// absolute and cannot be overridden by the allowlist (#827). This function
-    /// only answers "is the tool on the list?"; mode-awareness lives in the caller.
+    /// allowlist is keyed by tool name only, so it never covers `Dangerous` or
+    /// `Publish` invocations -- those always re-prompt regardless of any "Always
+    /// Allow" or "Allow this session" grant on the tool. Publish (`git push`,
+    /// `gh pr merge`) is a remote side-effect: Auto must confirm every one, and
+    /// Act auto-allows it via the matrix — a session grant must never let a
+    /// remote publish fire silently in Auto (#1051).
+    /// The caller (`UiApprover`) MUST check `matrix.effective_cell(...).is_deny()`
+    /// first — a Deny cell is absolute and cannot be overridden by the allowlist
+    /// (#827). This function only answers "is the tool on the list?";
+    /// mode-awareness lives in the caller.
     pub fn allowlist_covers(&self, session_id: &str, tool: &str, safety: Safety) -> bool {
-        safety != Safety::Dangerous
+        !matches!(safety, Safety::Dangerous | Safety::Publish)
             && (self.is_always_approved(tool) || self.is_session_approved(session_id, tool))
     }
 }

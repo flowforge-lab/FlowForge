@@ -17,7 +17,8 @@ export type DefaultMode = "plan" | "auto" | "act";
 export type PermissionRow =
   | "read"
   | "localWrites"
-  | "externalChanges"
+  | "externalReads"
+  | "publish"
   | "dangerous";
 
 /** A teammate profile (SET.12). FE-only mock until real teammate spawning lands. */
@@ -75,11 +76,15 @@ export interface PermissionRowMeta {
   label: string;
 }
 
-/** Matrix rows, top → bottom (increasing risk). */
+/** Matrix rows, top → bottom (increasing risk). Row order is presentation-only
+ *  and independent of the backend `Safety` index: Publish is shown between local
+ *  writes and dangerous (where it reads best) even though it is the last enum
+ *  variant (#1051). */
 export const PERMISSION_ROWS: ReadonlyArray<PermissionRowMeta> = [
   { key: "read", label: "Read & browse" },
   { key: "localWrites", label: "Local writes" },
-  { key: "externalChanges", label: "External changes" },
+  { key: "externalReads", label: "External reads" },
+  { key: "publish", label: "Publish / remote writes" },
   { key: "dangerous", label: "Dangerous commands" },
 ];
 
@@ -92,7 +97,8 @@ export const PERMISSION_ROWS: ReadonlyArray<PermissionRowMeta> = [
 export const ROW_SAFETY: Record<PermissionRow, Safety> = {
   read: "readonly",
   localWrites: "write",
-  externalChanges: "sensitive",
+  externalReads: "sensitive",
+  publish: "publish",
   dangerous: "dangerous",
 };
 

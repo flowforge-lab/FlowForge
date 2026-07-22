@@ -75,6 +75,41 @@ fn auto_mode_auto_approves_write_but_still_gates_dangerous() {
 }
 
 #[test]
+fn auto_mode_prompts_publish_not_auto_approve() {
+    // #1051: unlike Write/Sensitive, a remote publish (`git push`, `gh pr
+    // merge`) is NOT silently auto-approved in Auto — it prompts on a TTY and
+    // is denied when piped, matching the desktop Auto/Publish=Ask cell.
+    assert_eq!(
+        CliApprover::decide(
+            Mode::Auto,
+            ApprovalMode::Prompt,
+            InputMode::Tty,
+            Safety::Publish
+        ),
+        ApprovalDecision::Prompt
+    );
+    assert_eq!(
+        CliApprover::decide(
+            Mode::Auto,
+            ApprovalMode::Prompt,
+            InputMode::Piped,
+            Safety::Publish
+        ),
+        ApprovalDecision::Deny
+    );
+    // An explicit `Yes` policy still wins over the carve-out, as for any tier.
+    assert_eq!(
+        CliApprover::decide(
+            Mode::Act,
+            ApprovalMode::Yes,
+            InputMode::Piped,
+            Safety::Publish
+        ),
+        ApprovalDecision::Allow
+    );
+}
+
+#[test]
 fn auto_mode_treats_sensitive_like_write() {
     assert_eq!(
         CliApprover::decide(

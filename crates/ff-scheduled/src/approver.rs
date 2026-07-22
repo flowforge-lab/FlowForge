@@ -52,9 +52,10 @@ impl Approver for ScheduledApprover {
             // A write runs only when the task opted into the write ceiling.
             // Sensitive is gated identically to Write for now (#698).
             Safety::Write | Safety::Sensitive => self.ceiling == SafetyCeiling::Write,
-            // A dangerous call is never auto-approved in a headless fire,
-            // regardless of the ceiling.
-            Safety::Dangerous => false,
+            // A remote publish (`git push`, `gh pr merge`) or a dangerous call
+            // is never auto-approved in an unattended scheduled fire, regardless
+            // of the ceiling (#1051). Do NOT fold Publish into Write/Sensitive.
+            Safety::Publish | Safety::Dangerous => false,
         }
     }
 
@@ -98,6 +99,16 @@ mod tests {
         // Sensitive rides the write ceiling identically to Write (#698).
         assert!(a.approve("m", "c", "t", Safety::Sensitive, &args()).await);
         assert!(!a.approve("m", "c", "t", Safety::Dangerous, &args()).await);
+    }
+
+    #[tokio::test]
+    async fn publish_is_never_approved_at_any_ceiling() {
+        // #1051: an unattended scheduled fire must never `git push` / `gh pr
+        // merge` to a remote, even under the write ceiling — like Dangerous.
+        for ceiling in [SafetyCeiling::ReadOnly, SafetyCeiling::Write] {
+            let a = ScheduledApprover::new(ceiling);
+            assert!(!a.approve("m", "c", "t", Safety::Publish, &args()).await);
+        }
     }
 
     #[tokio::test]

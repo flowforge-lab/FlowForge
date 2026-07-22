@@ -41,7 +41,7 @@ pub struct ToolCallEvent {
 }
 
 /// Trust level of a tool call that requires user approval. Read-only calls never
-/// reach approval, so this enum carries only the two gated levels — it is the typed
+/// reach approval, so this enum carries only the gated levels — it is the typed
 /// contract for [`ToolApprovalRequestEvent::safety`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
@@ -50,6 +50,7 @@ pub enum ApprovalSafety {
     Write,
     Sensitive,
     Dangerous,
+    Publish,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]

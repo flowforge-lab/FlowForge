@@ -1319,13 +1319,14 @@ export const useChatStore = create<ChatState>((set, get) => ({
   },
 
   approveSession: async (sessionId, messageId, callId, tool) => {
-    // Contract guard (#232): the allowlist never covers Dangerous calls, so a
-    // session grant would be written yet the backend would keep prompting. Refuse
-    // it here too (defense in depth — the UI already hides the button).
+    // Contract guard (#232, #1051): the allowlist never covers Dangerous or
+    // Publish calls, so a session grant would be written yet the backend would
+    // keep prompting. Refuse it here too (defense in depth — the UI already
+    // hides the button).
     const safety = get().toolStepsByMessage[messageId]?.find(
       (s) => s.callId === callId,
     )?.safety;
-    if (safety === "dangerous") return;
+    if (safety === "dangerous" || safety === "publish") return;
     const had = get().sessionApprovedBySession[sessionId]?.has(tool) ?? false;
     // Optimistic: flip to running (the round-trip + tool exec are in flight),
     // tag the step's badge, and add the tool to the session mirror.
@@ -1368,12 +1369,12 @@ export const useChatStore = create<ChatState>((set, get) => ({
   },
 
   approveAlways: async (sessionId, messageId, callId, tool) => {
-    // Contract guard (#232): Dangerous calls are never allowlist-covered — see
-    // `approveSession`.
+    // Contract guard (#232, #1051): Dangerous and Publish calls are never
+    // allowlist-covered — see `approveSession`.
     const safety = get().toolStepsByMessage[messageId]?.find(
       (s) => s.callId === callId,
     )?.safety;
-    if (safety === "dangerous") return;
+    if (safety === "dangerous" || safety === "publish") return;
     const had = get().alwaysApproved.has(tool);
     set((s) => {
       const next = new Set(s.alwaysApproved);

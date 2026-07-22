@@ -64,12 +64,18 @@ impl Tool for GithubTool {
                 "pr_list" | "pr_view" | "pr_reviews" | "pr_review_comments" | "pr_checks"
                 | "issue_list" | "issue_view",
             ) => Safety::ReadOnly,
+            // Remote-publishing mutations: creating/merging a PR and pushing a
+            // branch write to the remote repo, so they carry the Publish tier
+            // (Plan denies, Auto prompts, Act allows) rather than plain Write
+            // (#1051). Chatty review/issue writes stay Write so Auto stays
+            // usable for them.
+            Some("pr_create" | "pr_merge" | "push") => Safety::Publish,
             _ => Safety::Write,
         }
     }
 
     fn max_safety(&self) -> Safety {
-        Safety::Write
+        Safety::Publish
     }
 
     // Read-only floor: the list/read actions (`pr_list`, `pr_view`, `pr_checks`,

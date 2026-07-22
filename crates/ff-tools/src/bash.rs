@@ -246,6 +246,15 @@ impl BashTool {
                 return Safety::Write;
             }
         }
+        // `git push` egresses to a remote, so it carries the Publish tier
+        // (Plan denies, Auto prompts, Act allows) rather than plain Write
+        // (#1051). `git push --force`/`-f` matched DANGEROUS_PATTERNS above, so
+        // only non-force pushes reach here. Keyed on the first token being `git`
+        // so `grep push …` is unaffected; local git writes (`commit`, `add`)
+        // fall through to Write below.
+        if tokens.first() == Some(&"git") && tokens.contains(&"push") {
+            return Safety::Publish;
+        }
         // Read-only only when *every* segment (split on pipes/&&/;) starts with a
         // known read command. A single write segment downgrades the whole line.
         let segments: Vec<&str> = lower
@@ -579,6 +588,21 @@ mod tests {
     fn env_prefix_is_not_read_only() {
         // `env CMD` runs arbitrary programs.
         assert_eq!(BashTool::classify("env FOO=1 ls"), Safety::Write);
+    }
+
+    #[test]
+    fn git_push_is_publish() {
+        // #1051: `git push` egresses to a remote -> Publish (Plan denies, Auto
+        // prompts, Act allows), distinct from a plain local write.
+        assert_eq!(BashTool::classify("git push"), Safety::Publish);
+        assert_eq!(BashTool::classify("git push origin main"), Safety::Publish);
+        // Force-push is Dangerous (DANGEROUS_PATTERNS matches first).
+        assert_eq!(BashTool::classify("git push --force"), Safety::Dangerous);
+        assert_eq!(BashTool::classify("git push -f"), Safety::Dangerous);
+        // Local git writes stay Write.
+        assert_eq!(BashTool::classify("git commit -m x"), Safety::Write);
+        // First-token guard: `push` as an argument to another command is not a push.
+        assert_eq!(BashTool::classify("grep push file"), Safety::ReadOnly);
     }
 
     #[tokio::test]

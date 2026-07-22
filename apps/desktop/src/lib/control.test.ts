@@ -18,12 +18,13 @@ import type {
 } from "@/bindings";
 
 describe("control matrix metadata", () => {
-  it("lists modes plan → auto → act and the four permission rows", () => {
+  it("lists modes plan → auto → act and the five permission rows", () => {
     expect(MODE_COLUMNS.map((m) => m.value)).toEqual(["plan", "auto", "act"]);
     expect(PERMISSION_ROWS.map((r) => r.key)).toEqual([
       "read",
       "localWrites",
-      "externalChanges",
+      "externalReads",
+      "publish",
       "dangerous",
     ]);
   });
@@ -34,7 +35,8 @@ describe("live matrix mapping (#702)", () => {
     expect(ROW_SAFETY).toEqual({
       read: "readonly",
       localWrites: "write",
-      externalChanges: "sensitive",
+      externalReads: "sensitive",
+      publish: "publish",
       dangerous: "dangerous",
     });
     // Every rendered row has a Safety mapping.
@@ -113,17 +115,22 @@ describe("bucketRowsByCell (#801)", () => {
   // Row label lookup for readable expectations.
   const labels = (rows: { label: string }[]) => rows.map((r) => r.label);
 
-  it("buckets Plan (read allow, sensitive ask, write/dangerous deny)", () => {
+  it("buckets Plan (read allow, sensitive ask, write/publish/dangerous deny)", () => {
     const plan: Record<Safety, PermissionCell> = {
       readonly: "allow",
       write: "deny",
       sensitive: "ask",
       dangerous: "deny",
+      publish: "deny",
     };
     const b = bucketRowsByCell(plan);
     expect(labels(b.allow)).toEqual(["Read & browse"]);
-    expect(labels(b.ask)).toEqual(["External changes"]);
-    expect(labels(b.deny)).toEqual(["Local writes", "Dangerous commands"]);
+    expect(labels(b.ask)).toEqual(["External reads"]);
+    expect(labels(b.deny)).toEqual([
+      "Local writes",
+      "Publish / remote writes",
+      "Dangerous commands",
+    ]);
   });
 
   it("buckets Act (all allow except dangerous ask) — nothing hidden", () => {
@@ -132,27 +139,33 @@ describe("bucketRowsByCell (#801)", () => {
       write: "allow",
       sensitive: "allow",
       dangerous: "ask",
+      publish: "allow",
     };
     const b = bucketRowsByCell(act);
     expect(labels(b.allow)).toEqual([
       "Read & browse",
       "Local writes",
-      "External changes",
+      "External reads",
+      "Publish / remote writes",
     ]);
     expect(labels(b.ask)).toEqual(["Dangerous commands"]);
     expect(b.deny).toEqual([]);
   });
 
-  it("buckets Auto (sensitive ask, dangerous deny)", () => {
+  it("buckets Auto (sensitive/publish ask, dangerous deny)", () => {
     const auto: Record<Safety, PermissionCell> = {
       readonly: "allow",
       write: "allow",
       sensitive: "ask",
       dangerous: "deny",
+      publish: "ask",
     };
     const b = bucketRowsByCell(auto);
     expect(labels(b.allow)).toEqual(["Read & browse", "Local writes"]);
-    expect(labels(b.ask)).toEqual(["External changes"]);
+    expect(labels(b.ask)).toEqual([
+      "External reads",
+      "Publish / remote writes",
+    ]);
     expect(labels(b.deny)).toEqual(["Dangerous commands"]);
   });
 

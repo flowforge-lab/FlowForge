@@ -317,6 +317,7 @@ impl Approver for UiApprover {
             Safety::Write => ApprovalSafety::Write,
             Safety::Sensitive => ApprovalSafety::Sensitive,
             Safety::Dangerous => ApprovalSafety::Dangerous,
+            Safety::Publish => ApprovalSafety::Publish,
             Safety::ReadOnly => return false,
         };
         let rx = self.state.register_approval(&self.session_id, call_id);

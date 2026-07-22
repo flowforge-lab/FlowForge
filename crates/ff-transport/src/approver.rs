@@ -41,8 +41,10 @@ impl Approver for MessagingApprover {
                 Safety::ReadOnly => true,
                 Safety::Write => true,
                 Safety::Sensitive => true,
-                // No interactive surface to confirm dangerous operations.
-                Safety::Dangerous => false,
+                // No interactive surface to confirm a remote publish or a
+                // dangerous operation, so a messaging-triggered agent must not
+                // push/merge to a remote unattended (#1051).
+                Safety::Publish | Safety::Dangerous => false,
             },
         }
     }

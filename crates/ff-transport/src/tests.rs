@@ -15,6 +15,9 @@ async fn act_mode_approves_write_and_sensitive() {
     assert!(a.approve("m", "c", "bash", Safety::Write, &v).await);
     assert!(a.approve("m", "c", "bash", Safety::Sensitive, &v).await);
     assert!(!a.approve("m", "c", "bash", Safety::Dangerous, &v).await);
+    // #1051: a messaging-triggered agent has no interactive surface to confirm
+    // a remote publish, so Publish is blocked unattended — like Dangerous.
+    assert!(!a.approve("m", "c", "bash", Safety::Publish, &v).await);
 }
 
 #[tokio::test]
