@@ -46,6 +46,8 @@ import type {
   ToolOutputChunkEvent,
   ProcessOutputEvent,
   ProcessExitedEvent,
+  ObserverInfo,
+  ObserverChangedEvent,
   ToolResultEvent,
   SkillInfo,
   SkillAggregate,
@@ -584,6 +586,13 @@ export interface FfIpc {
     kernelId?: string,
   ): Promise<NotebookKernelState>;
 
+  /** A session's active background observers (#1038, epic #954 M2) — backs the
+   *  `👁 Observers` panel. Oldest id first; only this session's observers. */
+  listObservers(sessionId: string): Promise<ObserverInfo[]>;
+  /** Stop one observer by id (the panel's `[×]`). The backend emits
+   *  `observer:changed` so the panel re-lists. */
+  stopObserver(id: number, sessionId: string): Promise<void>;
+
   // Events (backend -> frontend)
   onToken(cb: (e: TokenEvent) => void): Promise<Unlisten>;
   onReasoning(cb: (e: ReasoningEvent) => void): Promise<Unlisten>;
@@ -606,6 +615,9 @@ export interface FfIpc {
   /** A background process ended (exited / killed / failed) — terminal, emitted
    *  once after its last `process:output`. */
   onProcessExited(cb: (e: ProcessExitedEvent) => void): Promise<Unlisten>;
+  /** A session's active observer set changed — one started, stopped, or fired
+   *  (#1038). Coarse: the handler re-runs `listObservers(sessionId)`. */
+  onObserverChanged(cb: (e: ObserverChangedEvent) => void): Promise<Unlisten>;
   onApprovalRequest(
     cb: (e: ToolApprovalRequestEvent) => void,
   ): Promise<Unlisten>;
@@ -994,6 +1006,11 @@ class TauriIpc implements FfIpc {
       kernelId,
     });
 
+  listObservers = (sessionId: string) =>
+    this.invoke<ObserverInfo[]>("list_observers", { sessionId });
+  stopObserver = (id: number, sessionId: string) =>
+    this.invoke<void>("stop_observer", { id, sessionId });
+
   onToken = (cb: (e: TokenEvent) => void) =>
     this.listen<TokenEvent>("turn:token", cb);
   onReasoning = (cb: (e: ReasoningEvent) => void) =>
@@ -1018,6 +1035,8 @@ class TauriIpc implements FfIpc {
     this.listen<ProcessOutputEvent>("process:output", cb);
   onProcessExited = (cb: (e: ProcessExitedEvent) => void) =>
     this.listen<ProcessExitedEvent>("process:exited", cb);
+  onObserverChanged = (cb: (e: ObserverChangedEvent) => void) =>
+    this.listen<ObserverChangedEvent>("observer:changed", cb);
   onApprovalRequest = (cb: (e: ToolApprovalRequestEvent) => void) =>
     this.listen<ToolApprovalRequestEvent>("tool:approval-request", cb);
   onAskRequest = (cb: (e: ToolAskRequestEvent) => void) =>

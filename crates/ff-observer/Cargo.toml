@@ -8,11 +8,15 @@ repository.workspace = true
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
+ts-rs = { workspace = true, features = ["serde-json-impl"] }
 async-trait = { workspace = true }
 tokio = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
-chrono = { workspace = true }
+# `serde` so `ObserverInfo.started_at: DateTime<Utc>` can derive Serialize for
+# the `list_observers` command / ts-rs bindings (#1038). Cargo merges features
+# additively, so this only extends the workspace chrono.
+chrono = { workspace = true, features = ["serde"] }
 globset = { workspace = true }
 futures-util = { workspace = true }
 reqwest = { workspace = true, features = ["rustls-tls", "stream"] }

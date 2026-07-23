@@ -14,6 +14,7 @@ import { useUpdateStore } from "@/store/update";
 import { useSessionWorkspaceStore } from "@/store/session-workspace";
 import { useGoalStore } from "@/store/goal";
 import { useProcessesStore } from "@/store/processes";
+import { useObserversStore } from "@/store/observers";
 
 let started = false;
 
@@ -60,6 +61,12 @@ export function startIpcEvents(): void {
   const procs = useProcessesStore.getState();
   void ipc.onProcessOutput(procs.applyProcessOutput);
   void ipc.onProcessExited(procs.applyProcessExited);
+  // Observer panel (#1038, epic #954 M2): coarse `observer:changed` (start /
+  // stop / fire) → re-list that session's observers. The panel also loads once
+  // on mount; this keeps it live thereafter.
+  void ipc.onObserverChanged((e) => {
+    void useObserversStore.getState().refresh(e.sessionId);
+  });
   void ipc.onTurnStats(store.applyTurnStats);
   void ipc.onApprovalRequest(store.applyApprovalRequest);
   void ipc.onAskRequest(store.applyAskRequest);

@@ -561,6 +561,11 @@ export const useChatStore = create<ChatState>((set, get) => ({
     const { useProcessesStore } = await import("@/store/processes");
     useProcessesStore.getState().clear(sessionId);
 
+    // Drop the gone session's cached observers (#1038); the backend reaps the
+    // observers themselves via `reap_session`.
+    const { useObserversStore } = await import("@/store/observers");
+    useObserversStore.getState().clear(sessionId);
+
     // Never leave the app session-less: recreate + select a fresh blank session.
     if (remaining.length === 0) {
       await get().newSession();

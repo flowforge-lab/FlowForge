@@ -575,5 +575,17 @@ pub struct ProcessExitedEvent {
     pub status: String,
 }
 
+/// The set of active observers for a session changed (#1038, epic #954 M2):
+/// one started, was stopped, or fired. Coarse by design -- the frontend
+/// re-runs `list_observers(sessionId)` on receipt rather than diffing. A
+/// finer started/fired/stopped event is deferred (would be needed for a
+/// fired-observer highlight).
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "../../../apps/desktop/src/bindings/")]
+pub struct ObserverChangedEvent {
+    pub session_id: String,
+}
+
 #[cfg(test)]
 mod tests;
