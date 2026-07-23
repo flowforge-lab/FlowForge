@@ -1,9 +1,6 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::channel_map::ChannelMap;
-use crate::transport::MessageTransport;
-use crate::types::{ChannelId, Notification};
 use ff_agent::{run_turn, AgentEvent, Approver, CancelToken, SystemPrompt, ToolContext};
 use ff_core::ReasoningVisibility;
 use ff_core::{Egress, Mode, PermissionMatrix, Role};
@@ -11,6 +8,10 @@ use ff_llm::Provider;
 use ff_session::SessionStore;
 use ff_tools::ToolRegistry;
 use tracing::{debug, info, warn};
+
+use crate::channel_map::ChannelMap;
+use crate::transport::MessageTransport;
+use crate::types::{ChannelId, Notification};
 
 /// Configuration for the headless router.
 pub struct RouterConfig {

@@ -65,15 +65,15 @@ fn channel_map_in_memory() {
 
 // ── Router::run approver injection (#1056) ───────────────────────────────────
 
-/// Emits one `python` (Write) tool call on the first turn, then plain text on
-/// the second so the loop terminates. The Write call forces the loop to consult
-/// the approver (read-only calls bypass it).
-struct WriteToolThenText {
+/// Emits one `python` (Dangerous) tool call on the first turn, then plain text
+/// on the second so the loop terminates. The Dangerous call forces the loop to
+/// consult the approver (read-only calls bypass it).
+struct DangerousToolThenText {
     calls: AtomicUsize,
 }
 
 #[async_trait::async_trait]
-impl Provider for WriteToolThenText {
+impl Provider for DangerousToolThenText {
     async fn chat_stream(&self, _req: ChatRequest) -> Result<ChunkStream, LlmError> {
         let n = self.calls.fetch_add(1, Ordering::SeqCst);
         let chunk = if n == 0 {
@@ -129,7 +129,7 @@ async fn run_consults_the_injected_approver() {
     };
     let store = Arc::new(SessionStore::new());
     let registry = Arc::new(ToolRegistry::with_defaults());
-    let provider = Arc::new(WriteToolThenText {
+    let provider = Arc::new(DangerousToolThenText {
         calls: AtomicUsize::new(0),
     });
     let mut router = Router::new(config, ChannelMap::new(), store, registry, provider);
@@ -152,7 +152,7 @@ async fn run_consults_the_injected_approver() {
 
     // MockTransport never closes its channel, so `run` idles after the message;
     // bound it with a timeout — the mock turn is I/O-free, so 2s is ample for the
-    // Write call to reach the approval gate.
+    // Dangerous call to reach the approval gate.
     let _ = tokio::time::timeout(
         std::time::Duration::from_secs(2),
         router.run(&mut transport, &approver),
