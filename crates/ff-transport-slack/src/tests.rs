@@ -258,3 +258,52 @@ fn unknown_top_level_type_is_unsupported() {
         other => panic!("expected Unsupported, got {other:?}"),
     }
 }
+
+const EMPTY_TEXT_MESSAGE: &str = r#"{
+  "envelope_id": "abc-envelope-empty",
+  "type": "events_api",
+  "payload": {
+    "type": "event_callback",
+    "event": {
+      "type": "message",
+      "channel": "C01234567",
+      "user": "U99999999",
+      "text": "   ",
+      "ts": "1548261231.000500"
+    }
+  }
+}"#;
+
+const BLOCK_ACTIONS_NO_USER: &str = r#"{
+  "envelope_id": "abc-envelope-nouser",
+  "type": "interactive",
+  "payload": {
+    "type": "block_actions",
+    "channel": { "id": "C01234567", "name": "dev" },
+    "actions": [
+      { "type": "button", "action_id": "approve", "block_id": "gate", "value": "v" }
+    ]
+  }
+}"#;
+
+// A message whose text is empty/whitespace carries nothing actionable, so the
+// parser rejects it as Unsupported rather than handing the Router an empty turn.
+#[test]
+fn empty_text_message_is_unsupported() {
+    match parse_envelope(EMPTY_TEXT_MESSAGE) {
+        Err(ParseError::Unsupported(kind)) => assert_eq!(kind, "events_api:message(empty)"),
+        other => panic!("expected Unsupported, got {other:?}"),
+    }
+}
+
+// A block_actions payload missing the required nested `user` field fails during
+// `serde_json::from_value`, so it surfaces as `Json` (the catch-all for missing
+// nested required fields) rather than `Malformed`. Pins the error-model split
+// documented on `ParseError::Json`.
+#[test]
+fn block_actions_missing_user_is_json_error() {
+    assert!(matches!(
+        parse_envelope(BLOCK_ACTIONS_NO_USER),
+        Err(ParseError::Json(_))
+    ));
+}

@@ -56,6 +56,14 @@ pub struct SlackInteraction {
 #[derive(Debug, thiserror::Error)]
 pub enum ParseError {
     /// The frame was not valid JSON.
+    ///
+    /// Also the catch-all for a modelled frame whose *nested required* fields
+    /// are missing: `serde_json::from_value` fails while deserializing (e.g. a
+    /// `block_actions` payload without `user.id`, or an action without
+    /// `action_id`), so those surface as `Json` rather than `Malformed`.
+    /// `Malformed` is reserved for fields validated by hand *after* a
+    /// successful `from_value` (`event.channel`/`user`/`ts`, `actions[0]`,
+    /// top-level `channel`). Unifying the two is a T3 concern (#1058).
     #[error("invalid JSON envelope: {0}")]
     Json(#[from] serde_json::Error),
     /// A frame type T2 does not model (e.g. `slash_commands`, `events_api`
@@ -162,7 +170,7 @@ fn envelope_id(outer: &Outer, kind: &'static str) -> Result<String, ParseError> 
 
 fn parse_events_api(outer: Outer) -> Result<SlackEnvelope, ParseError> {
     let id = envelope_id(&outer, "events_api")?;
-    let payload = outer.payload.clone().ok_or(ParseError::Malformed {
+    let payload = outer.payload.ok_or(ParseError::Malformed {
         kind: "events_api",
         field: "payload",
     })?;
@@ -201,9 +209,24 @@ fn parse_events_api(outer: Outer) -> Result<SlackEnvelope, ParseError> {
         field: "event.ts",
     })?;
 
+    // A message with no text carries nothing for the agent to act on (empty
+    // `text` is what Slack sends for e.g. a pure file-share or an app_mention
+    // stripped to whitespace). Don't hand the Router an empty turn.
+    let text = event.text.unwrap_or_default();
+    if text.trim().is_empty() {
+        return Err(ParseError::Unsupported(
+            "events_api:message(empty)".to_string(),
+        ));
+    }
+
+    // NOTE: `event.thread_ts` is intentionally not captured here. Threading a
+    // reply back to its parent needs a thread slot on `InboundMessage` (an
+    // `ff-transport` core change) plus a routing decision — a same-channel
+    // threaded reply must not collapse into the channel's root session. That
+    // is a T3 concern (#1058); T2 parses the flat message only.
     let message = InboundMessage {
         channel: ChannelId::new("slack", channel),
-        text: event.text.unwrap_or_default(),
+        text,
         sender_id,
         timestamp: parse_slack_ts(&ts),
     };
@@ -215,7 +238,7 @@ fn parse_events_api(outer: Outer) -> Result<SlackEnvelope, ParseError> {
 
 fn parse_interactive(outer: Outer) -> Result<SlackEnvelope, ParseError> {
     let id = envelope_id(&outer, "interactive")?;
-    let payload = outer.payload.clone().ok_or(ParseError::Malformed {
+    let payload = outer.payload.ok_or(ParseError::Malformed {
         kind: "interactive",
         field: "payload",
     })?;
