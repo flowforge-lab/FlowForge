@@ -64,6 +64,63 @@ fn disambiguated_name_suffixes_on_collision() {
 }
 
 #[test]
+fn build_bridged_tools_disambiguates_names_that_collide_after_sanitization() {
+    // #1070 end-to-end: two distinct bare tool names from the same server that
+    // collapse to the *same* minted id after sanitization ("search.query" and
+    // "search_query" both → "mcp__mem__search_query") must yield two tools with
+    // DISTINCT `.name()`s, so `ToolRegistry::register` doesn't silently drop one.
+    //
+    // This pins the de-dup *branch in `build_bridged_tools`* (not just the
+    // `disambiguated_name` helper in isolation): remove or break that branch and
+    // this test goes red.
+    use crate::supervisor::PublishedTool;
+    use ff_core::McpToolInfo;
+
+    fn info(server: &str, name: &str) -> McpToolInfo {
+        McpToolInfo {
+            server: server.to_string(),
+            name: name.to_string(),
+            description: String::new(),
+            input_schema: serde_json::json!({}),
+            read_only_hint: false,
+            reaches_network: false,
+        }
+    }
+
+    let handle = SupervisorHandle::for_test();
+    {
+        let mut tools = handle.tools.write().unwrap();
+        // Global instances are always in scope for any session_root, so these
+        // pass the scope filter without depending on the temp path.
+        tools.push(PublishedTool {
+            key: InstanceKey::global("mem"),
+            info: info("mem", "search.query"),
+        });
+        tools.push(PublishedTool {
+            key: InstanceKey::global("mem"),
+            info: info("mem", "search_query"),
+        });
+    }
+
+    let built = build_bridged_tools(&handle, std::path::Path::new("/tmp/ff-test-collide"));
+    let names: Vec<&str> = built.iter().map(|t| t.name()).collect();
+
+    assert_eq!(names.len(), 2, "both colliding tools must be bridged");
+    assert_ne!(
+        names[0], names[1],
+        "colliding tools must get distinct minted names, got {names:?}"
+    );
+    assert!(
+        names.contains(&"mcp__mem__search_query"),
+        "first tool keeps the bare minted name: {names:?}"
+    );
+    assert!(
+        names.contains(&"mcp__mem__search_query_2"),
+        "second tool is disambiguated with a _2 suffix: {names:?}"
+    );
+}
+
+#[test]
 fn read_only_hint_maps_to_read_only_else_write() {
     // A readOnlyHint tool (e.g. codegraph queries) is ReadOnly so it isn't
     // approval-gated and stays usable in Plan mode; otherwise Write (gated).
