@@ -3663,7 +3663,8 @@ fn open_memory_index(
         // because consolidate rewrites files and the reindex below is blocking. The
         // rewrite happens before `all_chunks()`, so the single reindex covers it.
         if bg_memory.needs_consolidation() {
-            match bg_memory.consolidate(&RecencyFrequencySalience::default()) {
+            let salience = bg_memory.chunk_stats_salience(bg_index.as_ref(), now_ms());
+            match bg_memory.consolidate(&salience) {
                 Ok(report) if report.ran => tracing::info!(
                     merged = report.merged,
                     promoted = report.promoted,

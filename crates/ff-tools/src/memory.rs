@@ -13,7 +13,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use chrono::Utc;
 use ff_memory::{
-    chunk_markdown, Memory, MemoryIndex, MemorySource, RecencyFrequencySalience, ScoredChunk,
+    chunk_markdown, Memory, MemoryIndex, MemorySource, ScoredChunk,
     Stratum, WriteTarget,
 };
 use serde_json::Value;
@@ -469,10 +469,10 @@ impl Tool for MemoryConsolidateTool {
             return ToolOutcome::ok("Consolidation not needed: curated file is within budget.");
         }
 
-        let report = match self
+        let salience = self
             .memory
-            .consolidate(&RecencyFrequencySalience::default())
-        {
+            .chunk_stats_salience(self.index.as_ref(), Utc::now().timestamp_millis());
+        let report = match self.memory.consolidate(&salience) {
             Ok(r) => r,
             Err(e) => return ToolOutcome::error(format!("consolidation failed: {e}")),
         };
