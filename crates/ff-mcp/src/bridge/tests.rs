@@ -9,6 +9,61 @@ fn namespaced_name_format() {
 }
 
 #[test]
+fn namespaced_name_sanitizes_dotted_tool_segment() {
+    // #1070: Obsidian CLI reports dotted names like `base.query`; a raw `.` in the
+    // minted id fails the provider tool-name regex `[a-zA-Z0-9_-]+` and 400s the
+    // whole request. The `.` collapses to `_`; the `mcp__`/`server` structure and
+    // legal chars (`_`, `-`, alphanumerics) are untouched.
+    assert_eq!(
+        McpBridgedTool::namespaced_name("obsidian", "base.query"),
+        "mcp__obsidian__base_query"
+    );
+    assert_eq!(
+        McpBridgedTool::namespaced_name("obsidian", "daily.append"),
+        "mcp__obsidian__daily_append"
+    );
+    assert_eq!(sanitize_tool_segment("search.context"), "search_context");
+    assert_eq!(sanitize_tool_segment("ok_name-1"), "ok_name-1");
+    assert_eq!(sanitize_tool_segment("a b/c"), "a_b_c");
+}
+
+#[test]
+fn sanitized_names_match_provider_charset() {
+    // Every minted id from a dotted-name server must satisfy the provider regex.
+    for tool in [
+        "base.query",
+        "base.views",
+        "daily.append",
+        "daily.path",
+        "property.read",
+        "search.context",
+        "template.read",
+    ] {
+        let name = McpBridgedTool::namespaced_name("obsidian", tool);
+        assert!(
+            name.chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-')),
+            "minted name {name:?} must match [a-zA-Z0-9_-]+"
+        );
+    }
+}
+
+#[test]
+fn disambiguated_name_suffixes_on_collision() {
+    use std::collections::HashSet;
+    // #1070: when two server names collapse to the same minted id after
+    // sanitization, the second (and third) get `_2`/`_3` so the registry key
+    // stays unique instead of silently overwriting.
+    let mut seen: HashSet<String> = HashSet::new();
+    seen.insert("mcp__obsidian__base_query".to_string());
+    let second = disambiguated_name(&seen, "mcp__obsidian__base_query");
+    assert_eq!(second, "mcp__obsidian__base_query_2");
+    seen.insert(second);
+    let third = disambiguated_name(&seen, "mcp__obsidian__base_query");
+    assert_eq!(third, "mcp__obsidian__base_query_3");
+}
+
+#[test]
 fn read_only_hint_maps_to_read_only_else_write() {
     // A readOnlyHint tool (e.g. codegraph queries) is ReadOnly so it isn't
     // approval-gated and stays usable in Plan mode; otherwise Write (gated).
