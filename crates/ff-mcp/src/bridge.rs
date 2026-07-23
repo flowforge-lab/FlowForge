@@ -46,8 +46,17 @@ pub struct McpBridgedTool {
 
 impl McpBridgedTool {
     /// The `mcp__<server>__<tool>` namespaced name this tool is registered under.
+    ///
+    /// The `tool` segment is sanitized to the provider-legal charset
+    /// (`[a-zA-Z0-9_-]`, required by both Bedrock and Anthropic on tool names):
+    /// a server may report dotted names like Obsidian's `base.query`, and a raw
+    /// `.` in the minted id 400s the whole Converse request (#1070). The
+    /// `mcp__` prefix, the `__` separator, and the `server` segment are left
+    /// untouched — they are already legal, and rewriting them would corrupt the
+    /// segment structure. The real (unsanitized) tool name is kept in
+    /// `tool_name` for routing, so this only changes the model-facing id.
     pub fn namespaced_name(server: &str, tool: &str) -> String {
-        format!("mcp__{server}__{tool}")
+        format!("mcp__{server}__{}", sanitize_tool_segment(tool))
     }
 
     fn new(handle: SupervisorHandle, key: InstanceKey, info: &ff_core::McpToolInfo) -> Self {
@@ -80,6 +89,25 @@ impl McpBridgedTool {
             reaches_network,
         }
     }
+}
+
+/// Map any character outside the provider-legal tool-name charset
+/// (`[a-zA-Z0-9_-]`) to `_`. Applied only to the `tool` segment of a bridged
+/// name (#1070) — the `mcp__`/`__`/`server` structure is already legal and must
+/// stay byte-for-byte so the segments remain parseable. This is intentionally
+/// simpler than `bedrock::sanitize_document_name` (which targets a different,
+/// wider charset for document names); here the target is the tool-name regex
+/// shared by Bedrock and Anthropic.
+fn sanitize_tool_segment(tool: &str) -> String {
+    tool.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '_' | '-') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 /// Map a bridged tool's `readOnlyHint` to its [`Safety`]. Read-only tools run
@@ -156,17 +184,44 @@ impl Tool for McpBridgedTool {
 /// live at turn start (same discipline as skill snapshots).
 pub fn build_bridged_tools(handle: &SupervisorHandle, session_root: &Path) -> Vec<Box<dyn Tool>> {
     let session_scope = ScopeKey::workspace(session_root);
-    handle
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut out: Vec<Box<dyn Tool>> = Vec::new();
+    for t in handle
         .tools_snapshot()
         .into_iter()
         .filter(|t| match &t.key.scope {
             ScopeKey::Global => true,
             ScopeKey::Workspace(_) => t.key.scope == session_scope,
         })
-        .map(|t| {
-            Box::new(McpBridgedTool::new(handle.clone(), t.key.clone(), &t.info)) as Box<dyn Tool>
-        })
-        .collect()
+    {
+        let mut tool = McpBridgedTool::new(handle.clone(), t.key.clone(), &t.info);
+        // Sanitizing the tool segment can collapse two distinct server names to
+        // the same minted id (e.g. `base.query` and `base_query` both → `base_query`).
+        // The registry keys on this name, so a collision would silently drop a tool.
+        // Suffix `_2`/`_3`… until unique — same discipline as `unique_document_name`,
+        // but scoped to the whole turn's tool set. Only `full_name` (the model-facing
+        // id) changes; `tool_name` keeps the real name for routing (#1070).
+        if seen.contains(&tool.full_name) {
+            tool.full_name = disambiguated_name(&seen, &tool.full_name);
+        }
+        seen.insert(tool.full_name.clone());
+        out.push(Box::new(tool) as Box<dyn Tool>);
+    }
+    out
+}
+
+/// Return the first `"{name}_{n}"` (n from 2) not already in `seen`, so a minted
+/// id that collided after tool-segment sanitization gets a unique suffix (#1070).
+/// Only the model-facing id changes; routing still uses the real `tool_name`.
+fn disambiguated_name(seen: &std::collections::HashSet<String>, name: &str) -> String {
+    let mut n = 2;
+    loop {
+        let candidate = format!("{name}_{n}");
+        if !seen.contains(&candidate) {
+            return candidate;
+        }
+        n += 1;
+    }
 }
 
 #[cfg(test)]
