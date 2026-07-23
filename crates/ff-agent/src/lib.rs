@@ -675,8 +675,88 @@ pub(crate) fn to_chat(messages: &[Message]) -> Vec<ChatMessage> {
         })
         .collect();
     repair_empty_tool_call_ids(&mut chat);
+    hoist_interposed_tool_results(&mut chat);
     cap_reasoning_replay(&mut chat, REASONING_REPLAY_KEEP);
     chat
+}
+
+/// Restore `tool_use → tool_result` adjacency when a non-tool message got
+/// persisted *between* an assistant `tool_use` and its result(s) (#1067).
+///
+/// How that happens: a turn is in flight (assistant `tool_use` persisted, the
+/// `tool_result` not back yet) and something appends a row — e.g. a mode-switch
+/// marker (#1066) — landing it mid-pair. Anthropic requires each `tool_use` to
+/// be *immediately* followed by its `tool_result`, so the stored order 422s the
+/// request on every subsequent turn and the session stays wedged. This pass
+/// runs on the wire messages (so it also revives sessions whose store already
+/// holds the bad order, which the write-side gate in #1066 cannot) and hoists
+/// the interposed message(s) to *after* the batch's result(s).
+///
+/// Edge cases:
+/// - **Parallel tool_use**: one assistant turn can carry N ids → N results. The
+///   window closes once all N results are seen; hoisted messages land after the
+///   last result, never between two results.
+/// - **Multiple interposed messages**: all are moved as a group, preserving
+///   their relative order (and the results keep their relative order too).
+/// - **Dangling tool_use** (result never persisted): left untouched — there is
+///   no result to become adjacent to, and that is a separate malformation
+///   handled by the dropped-future backfill (#316).
+fn hoist_interposed_tool_results(messages: &mut Vec<ChatMessage>) {
+    let mut i = 0;
+    while i < messages.len() {
+        let expected: std::collections::HashSet<String> = messages[i]
+            .tool_calls
+            .as_ref()
+            .map(|calls| {
+                calls
+                    .iter()
+                    .map(|c| c.id.clone())
+                    .filter(|id| !id.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
+        if expected.is_empty() {
+            i += 1;
+            continue;
+        }
+        // Scan forward over the result window: consume until every expected
+        // result is seen, a new tool-call turn begins, or the transcript ends.
+        let mut j = i + 1;
+        let mut seen = 0usize;
+        let mut any_interposed = false;
+        while j < messages.len() && seen < expected.len() {
+            let m = &messages[j];
+            let is_result = m.role == "tool"
+                && m.tool_call_id
+                    .as_deref()
+                    .is_some_and(|id| expected.contains(id));
+            if is_result {
+                seen += 1;
+            } else if m.role == "assistant" && m.tool_calls.is_some() {
+                break;
+            } else {
+                any_interposed = true;
+            }
+            j += 1;
+        }
+        // Only reorder when an interposed row actually broke adjacency AND at
+        // least one result exists to be made adjacent (guards the dangling case).
+        if any_interposed && seen > 0 {
+            let window: Vec<ChatMessage> = messages.splice(i + 1..j, std::iter::empty()).collect();
+            let n = window.len();
+            let (results, others): (Vec<ChatMessage>, Vec<ChatMessage>) =
+                window.into_iter().partition(|m| {
+                    m.role == "tool"
+                        && m.tool_call_id
+                            .as_deref()
+                            .is_some_and(|id| expected.contains(id))
+                });
+            messages.splice(i + 1..i + 1, results.into_iter().chain(others));
+            i = i + 1 + n;
+        } else {
+            i = j.max(i + 1);
+        }
+    }
 }
 
 /// Repair tool-call ids that a gateway persisted empty because it omitted the id

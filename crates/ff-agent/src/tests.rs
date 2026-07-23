@@ -95,6 +95,164 @@ fn to_chat_caps_reasoning_replay_to_last_n_tool_turns() {
     assert_eq!(out[2].reasoning.as_deref(), Some("newest"));
 }
 
+// ---- #1067: to_chat self-heals a message interposed between tool_use/tool_result ----
+
+fn asst_tool_calls(id: &str, call_ids: &[&str]) -> ff_core::Message {
+    ff_core::Message {
+        id: id.into(),
+        session_id: "s1".into(),
+        role: Role::Assistant,
+        content: String::new(),
+        tool_calls: Some(
+            call_ids
+                .iter()
+                .map(|c| ff_core::ToolCall {
+                    id: (*c).into(),
+                    name: "bash".into(),
+                    arguments: "{}".into(),
+                })
+                .collect(),
+        ),
+        tool_call_id: None,
+        attachments: None,
+        reasoning: None,
+        stop_reason: None,
+        author_name: None,
+        created_at: 0,
+    }
+}
+
+fn tool_result(id: &str, call_id: &str) -> ff_core::Message {
+    ff_core::Message {
+        id: id.into(),
+        session_id: "s1".into(),
+        role: Role::Tool,
+        content: "ok".into(),
+        tool_calls: None,
+        tool_call_id: Some(call_id.into()),
+        attachments: None,
+        reasoning: None,
+        stop_reason: None,
+        author_name: None,
+        created_at: 0,
+    }
+}
+
+fn plain(id: &str, role: Role, content: &str) -> ff_core::Message {
+    ff_core::Message {
+        id: id.into(),
+        session_id: "s1".into(),
+        role,
+        content: content.into(),
+        tool_calls: None,
+        tool_call_id: None,
+        attachments: None,
+        reasoning: None,
+        stop_reason: None,
+        author_name: None,
+        created_at: 0,
+    }
+}
+
+/// Assert `tool_use → tool_result` adjacency: every assistant message bearing
+/// tool_calls must be immediately followed by that batch's tool results, with
+/// no non-tool message interposed until all ids are matched.
+fn assert_tool_pairs_adjacent(chat: &[ChatMessage]) {
+    let mut i = 0;
+    while i < chat.len() {
+        if let Some(calls) = &chat[i].tool_calls {
+            let want = calls.len();
+            for k in 1..=want {
+                assert_eq!(
+                    chat[i + k].role,
+                    "tool",
+                    "expected tool_result at offset {k} after tool_use at {i}, got {:?}",
+                    chat[i + k].role
+                );
+            }
+        }
+        i += 1;
+    }
+}
+
+#[test]
+fn to_chat_heals_d3e26b28_mode_switch_wedge() {
+    // The exact observed shape: a mode-switch marker persisted between the
+    // assistant tool_use and its result, followed by the [stopped] row.
+    let history = vec![
+        asst_tool_calls("a1", &["tooluse_FUxY"]),
+        plain("u1", Role::User, "[system: Mode switched to Auto ...]"),
+        tool_result("t1", "tooluse_FUxY"),
+        plain("a2", Role::Assistant, "[stopped]"),
+    ];
+    let out = to_chat(&history);
+    assert_tool_pairs_adjacent(&out);
+    // tool_use immediately followed by its result; the marker hoisted after it.
+    assert_eq!(out[0].tool_calls.as_ref().unwrap()[0].id, "tooluse_FUxY");
+    assert_eq!(out[1].role, "tool");
+    assert_eq!(out[1].tool_call_id.as_deref(), Some("tooluse_FUxY"));
+    assert_eq!(out[2].role, "user");
+    assert_eq!(out[3].content.as_deref(), Some("[stopped]"));
+}
+
+#[test]
+fn to_chat_hoist_parallel_tool_use_puts_marker_after_last_result() {
+    // Two ids in one assistant turn; a marker wedged before both results must
+    // land after the LAST result, never between the two results.
+    let history = vec![
+        asst_tool_calls("a1", &["c1", "c2"]),
+        plain("u1", Role::User, "[system: Mode switched]"),
+        tool_result("t1", "c1"),
+        tool_result("t2", "c2"),
+    ];
+    let out = to_chat(&history);
+    assert_tool_pairs_adjacent(&out);
+    assert_eq!(out[1].role, "tool");
+    assert_eq!(out[2].role, "tool");
+    assert_eq!(out[3].role, "user", "marker after the last result");
+}
+
+#[test]
+fn to_chat_hoist_moves_multiple_interposed_preserving_order() {
+    let history = vec![
+        asst_tool_calls("a1", &["c1"]),
+        plain("u1", Role::User, "first"),
+        plain("u2", Role::User, "second"),
+        tool_result("t1", "c1"),
+    ];
+    let out = to_chat(&history);
+    assert_tool_pairs_adjacent(&out);
+    assert_eq!(out[1].role, "tool");
+    assert_eq!(out[2].content.as_deref(), Some("first"));
+    assert_eq!(out[3].content.as_deref(), Some("second"));
+}
+
+#[test]
+fn to_chat_hoist_leaves_dangling_tool_use_untouched() {
+    // No result ever landed: nothing to become adjacent to, so the trailing
+    // message stays put (dangling tool_use is a separate concern, #316).
+    let history = vec![
+        asst_tool_calls("a1", &["c1"]),
+        plain("u1", Role::User, "later"),
+    ];
+    let out = to_chat(&history);
+    assert_eq!(out.len(), 2);
+    assert_eq!(out[1].content.as_deref(), Some("later"));
+}
+
+#[test]
+fn to_chat_hoist_noop_on_well_formed_transcript() {
+    let history = vec![
+        asst_tool_calls("a1", &["c1"]),
+        tool_result("t1", "c1"),
+        plain("u1", Role::User, "next question"),
+    ];
+    let out = to_chat(&history);
+    assert_tool_pairs_adjacent(&out);
+    assert_eq!(out[1].role, "tool");
+    assert_eq!(out[2].content.as_deref(), Some("next question"));
+}
+
 #[test]
 fn should_reason_wrapup_only_on_planning_and_wrapup_steps() {
     use ReasoningVisibility::{All, WrapUp};
