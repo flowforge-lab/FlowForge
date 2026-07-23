@@ -26,7 +26,7 @@ use crate::git_watch::GitHeadWatcher;
 use ff_memory::watch::MemoryWatcher;
 use ff_memory::{
     DecayConfig, EmbeddingProvider, FlushLedger, Fts5Index, HybridIndex, Memory, MemoryConfig,
-    MemoryIndex, NoopEmbedder, OpenAiEmbedder, RecencyFrequencySalience,
+    MemoryIndex, NoopEmbedder, OpenAiEmbedder,
 };
 use ff_observer::{ObserverEvent, ObserverSupervisor, ObserverTool};
 use ff_scheduled::ScheduledStore;
