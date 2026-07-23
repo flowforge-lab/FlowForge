@@ -1520,6 +1520,13 @@ pub struct AppState {
     /// the compaction summarizer can skip redundant work when only a few
     /// messages were appended since the last summary.
     pub compaction_cache: CompactionCache,
+    /// Mode-switch markers deferred because a turn was in flight when the user
+    /// switched autonomy mode (#1066). Appending the `[system: Mode switched …]`
+    /// row directly (#828) mid-turn would interpose it between an assistant
+    /// `tool_use` and its `tool_result`, wedging the session (Anthropic 422s a
+    /// non-adjacent pair). Keyed by session; drained and persisted once the turn
+    /// settles so the marker lands after the completed tool batch.
+    deferred_mode_markers: Mutex<HashMap<String, Vec<String>>>,
 }
 
 /// How long a probed served window stays fresh before the next resolve re-probes.
@@ -1666,6 +1673,7 @@ impl AppState {
             observer_events_rx: Mutex::new(Some(observer_events_rx)),
             served_window_cache: Mutex::new(HashMap::new()),
             compaction_cache: CompactionCache::new(),
+            deferred_mode_markers: Mutex::new(HashMap::new()),
         };
         // Restore the persisted phenotype so its active skills survive a restart.
         // With no persisted choice, prefer the out-of-box `codon` default (#298),
@@ -2900,6 +2908,34 @@ impl AppState {
     /// Whether a goal loop is currently running for the session.
     pub fn goal_loop_running(&self, session_id: &str) -> bool {
         self.goal_loops.lock().unwrap().contains(session_id)
+    }
+
+    /// Queue a mode-switch marker for `session_id` to be persisted once the
+    /// in-flight turn settles (#1066). See `deferred_mode_markers`.
+    pub fn defer_mode_marker(&self, session_id: &str, marker: String) {
+        self.deferred_mode_markers
+            .lock()
+            .unwrap()
+            .entry(session_id.to_string())
+            .or_default()
+            .push(marker);
+    }
+
+    /// Persist and clear any mode-switch markers deferred while a turn was in
+    /// flight (#1066). Called at turn settle, after the tool batch is complete,
+    /// so the marker lands as a well-formed trailing `Role::User` row rather than
+    /// interposed in a `tool_use`/`tool_result` pair. In insertion order.
+    pub fn flush_deferred_mode_markers(&self, session_id: &str) {
+        let markers = self
+            .deferred_mode_markers
+            .lock()
+            .unwrap()
+            .remove(session_id)
+            .unwrap_or_default();
+        for marker in markers {
+            self.store
+                .add_message(session_id, ff_core::Role::User, marker);
+        }
     }
 
     pub fn register_cancel(&self, session_id: &str, token: CancelToken) {
