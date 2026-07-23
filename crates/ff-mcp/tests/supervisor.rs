@@ -258,10 +258,10 @@ async fn stop_all_preempts_in_flight_tool_call() {
     let (_change_tx, change_rx) = mpsc::unbounded_channel::<()>();
     let sup = spawn_supervisor(shared, change_rx, fast_config());
 
-    wait_for(&sup, Duration::from_secs(5), |snap| {
+    let pid = wait_for(&sup, Duration::from_secs(5), |snap| {
         snap.iter()
             .find(|s| s.id == "slow" && s.state == McpServerState::Running)
-            .map(|_| ())
+            .and_then(|s| s.pid)
     })
     .await
     .expect("slow server reaches Running");
@@ -297,6 +297,20 @@ async fn stop_all_preempts_in_flight_tool_call() {
     assert!(
         result.is_err(),
         "preempted call should return an error, got {result:?}"
+    );
+
+    // `stop_all` drops the client and relies on kill-on-drop to reap the child;
+    // that reap is async, so wait for the slow server to actually exit before
+    // returning. Without this the `mcp_slow` child (mid-60s `sleep`) outlives
+    // the test process and nextest's process-per-test leak detection flags it
+    // (#1072). Mirrors `no_orphan_processes_after_stop_all`.
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while pid_alive(pid) && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        !pid_alive(pid),
+        "slow server pid {pid} still alive after stop_all"
     );
 }
 

@@ -569,29 +569,62 @@ mod tests {
         assert_eq!(untracked, vec!["new_file.txt"]);
     }
 
+    /// Bootstraps a hermetic throwaway git repo in a tempdir for the
+    /// integration tests below. Returns the tempdir (kept alive for the test's
+    /// duration so `.git` isn't deleted mid-test). Replaces the old reliance on
+    /// `std::env::current_dir()` being a real repo: that broke under CI's
+    /// default shallow checkout (`fetch-depth: 1`), where `log -n 3` had only
+    /// one commit and the workspace's own status differed per branch (#1072).
+    fn init_temp_repo() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let run = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir.path())
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .env("LC_ALL", "C")
+                .output()
+                .expect("git bootstrap command runs");
+            assert!(
+                out.status.success(),
+                "git {} failed: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&out.stderr),
+            );
+        };
+        run(&["init", "--quiet"]);
+        run(&["config", "user.name", "FF Test"]);
+        run(&["config", "user.email", "test@flowforge.local"]);
+        std::fs::write(dir.path().join("README.md"), "hello\n").unwrap();
+        run(&["add", "README.md"]);
+        run(&["commit", "--quiet", "-m", "initial commit"]);
+        dir
+    }
+
     #[tokio::test]
     async fn integration_status_in_repo() {
-        let root = std::env::current_dir().unwrap();
-        let result = git_status(&root).await;
+        let repo = init_temp_repo();
+        let result = git_status(repo.path()).await;
         assert!(result.success, "git status failed: {}", result.content);
         assert!(result.content.contains("branch:"));
     }
 
     #[tokio::test]
     async fn integration_log_in_repo() {
-        let root = std::env::current_dir().unwrap();
+        let repo = init_temp_repo();
         let args = serde_json::json!({"action": "log", "n": 3});
-        let result = git_log(&args, &root).await;
+        let result = git_log(&args, repo.path()).await;
         assert!(result.success, "git log failed: {}", result.content);
         assert!(!result.content.is_empty());
     }
 
     #[tokio::test]
     async fn integration_diff_stat() {
-        let root = std::env::current_dir().unwrap();
-        // Use HEAD (unstaged diff) rather than HEAD~1 which fails on shallow clones (CI).
+        let repo = init_temp_repo();
+        // Clean-tree `git diff --numstat` exits 0 with empty output; git_diff
+        // normalizes that to "No differences." -- success either way.
         let args = serde_json::json!({"action": "diff", "stat": true});
-        let result = git_diff(&args, &root).await;
+        let result = git_diff(&args, repo.path()).await;
         assert!(result.success, "git diff --stat failed: {}", result.content);
     }
 
@@ -630,9 +663,12 @@ mod tests {
 
     #[tokio::test]
     async fn diff_rejects_option_injection_in_ref() {
-        let root = std::env::current_dir().unwrap();
+        // `validate_ref` rejects the option-like ref before git ever runs, so
+        // the repo need not be real -- a tempdir is enough. Drop the old
+        // `current_dir()` dependence so the test is hermetic (#1072).
+        let dir = tempfile::tempdir().unwrap();
         let args = serde_json::json!({"action": "diff", "ref": "--output=/tmp/ff_git_pwn"});
-        let result = git_diff(&args, &root).await;
+        let result = git_diff(&args, dir.path()).await;
         assert!(!result.success, "option-like ref must be rejected");
         assert!(result.content.contains("must not start with '-'"));
     }
@@ -641,14 +677,18 @@ mod tests {
     async fn show_rejects_option_injection_and_writes_nothing() {
         // End-to-end proof the exploit is dead: try to make `git show` write a
         // file via --output; assert it's rejected AND no file appears.
-        let marker = std::env::temp_dir().join("ff_git_show_pwn_857");
+        // `validate_ref` short-circuits before git runs, so a tempdir suffices.
+        // The marker lives under the tempdir (per-test) instead of the old
+        // machine-global `std::env::temp_dir()` path, so parallel test
+        // processes can't race on it under nextest (#1072).
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("ff_git_show_pwn_857");
         let _ = std::fs::remove_file(&marker);
-        let root = std::env::current_dir().unwrap();
         let args = serde_json::json!({
             "action": "show",
             "ref": format!("--output={}", marker.display()),
         });
-        let result = git_show(&args, &root).await;
+        let result = git_show(&args, dir.path()).await;
         assert!(!result.success, "option-like ref must be rejected");
         assert!(
             !marker.exists(),

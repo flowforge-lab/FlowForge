@@ -831,13 +831,43 @@ async fn default_provider_emits_no_reasoning_params() {
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+/// Guard for a detached test server. Dropping it signals the server to exit
+/// its stall and aborts the task as a backstop, releasing the bound listener
+/// and any accepted socket (closing their fds). Without this, the spawned
+/// task outlives the test body, holding an open socket for the full
+/// `sleep(3600)` duration; nextest's process-per-test model then surfaces it
+/// as a leak (issue #1072 side-finding).
+struct ServerGuard {
+    handle: Option<tokio::task::JoinHandle<()>>,
+    shutdown: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+impl Drop for ServerGuard {
+    fn drop(&mut self) {
+        // Signal the server to exit its stall so the task ends naturally and
+        // drops the held listener + socket. This handles the common case
+        // where the server has already accepted and is parked on the stall.
+        if let Some(shutdown) = self.shutdown.take() {
+            let _ = shutdown.send(());
+        }
+        // Abort as a backstop for the case where the server hasn't accepted
+        // yet (still parked on `accept()`). Dropping the aborted future
+        // releases the listener.
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
+        }
+    }
+}
+
 /// Accepts one connection, sends HTTP headers + a single SSE `data:` chunk,
 /// then holds the socket open without ever sending more bytes or closing --
-/// the exact "headers sent, then silence" failure mode. Returns the base URL.
-async fn spawn_stalling_sse_server() -> String {
+/// the exact "headers sent, then silence" failure mode. Returns the base URL
+/// and a guard whose `Drop` ends the stall and releases the socket.
+async fn spawn_stalling_sse_server() -> (String, ServerGuard) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let handle = tokio::spawn(async move {
         if let Ok((mut sock, _)) = listener.accept().await {
             let mut buf = [0u8; 2048];
             let _ = sock.read(&mut buf).await;
@@ -849,16 +879,28 @@ async fn spawn_stalling_sse_server() -> String {
             );
             let _ = sock.write_all(resp.as_bytes()).await;
             let _ = sock.flush().await;
-            // Never send the terminating chunk; stall well past the read timeout.
-            tokio::time::sleep(Duration::from_secs(3600)).await;
+            // Hold the socket open without the terminating chunk so the client
+            // hits its read timeout (the failure mode under test). Bound the
+            // stall on a shutdown signal (test done) with a long backstop so a
+            // bug that drops the guard wouldn't hang the suite forever.
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_secs(3600)) => {}
+                _ = &mut shutdown_rx => {}
+            }
         }
     });
-    format!("http://{addr}")
+    (
+        format!("http://{addr}"),
+        ServerGuard {
+            handle: Some(handle),
+            shutdown: Some(shutdown_tx),
+        },
+    )
 }
 
 #[tokio::test]
 async fn mid_stream_stall_surfaces_transient_transport_error() {
-    let base = spawn_stalling_sse_server().await;
+    let (base, _guard) = spawn_stalling_sse_server().await;
     let mut provider = OpenAiProvider::new(base, None);
     // Production read_timeout is 60s; use a short one so the test is fast.
     // The behavior under test (idle silence -> Transport error) is identical.
@@ -927,23 +969,33 @@ async fn mid_stream_stall_surfaces_transient_transport_error() {
 /// without ever sending a response -- no status line, no headers. This is the
 /// "connected, request sent, server silent before responding" stall, distinct
 /// from a mid-body stall: it must trip during chat_stream's `.send()` await,
-/// not hang.
-async fn spawn_no_response_server() -> String {
+/// not hang. Returns the base URL and a guard whose `Drop` ends the stall.
+async fn spawn_no_response_server() -> (String, ServerGuard) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let handle = tokio::spawn(async move {
         if let Ok((mut sock, _)) = listener.accept().await {
             let mut buf = [0u8; 4096];
             let _ = sock.read(&mut buf).await;
-            tokio::time::sleep(Duration::from_secs(3600)).await;
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_secs(3600)) => {}
+                _ = &mut shutdown_rx => {}
+            }
         }
     });
-    format!("http://{addr}")
+    (
+        format!("http://{addr}"),
+        ServerGuard {
+            handle: Some(handle),
+            shutdown: Some(shutdown_tx),
+        },
+    )
 }
 
 #[tokio::test]
 async fn header_wait_stall_surfaces_transient_transport_error() {
-    let base = spawn_no_response_server().await;
+    let (base, _guard) = spawn_no_response_server().await;
     let mut provider = OpenAiProvider::new(base, None);
     // Production read_timeout is 60s; a short one keeps the test fast. The
     // behavior under test (no response bytes -> Transport error) is identical.
