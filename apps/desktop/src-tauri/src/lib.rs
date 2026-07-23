@@ -16,9 +16,9 @@ use ff_agent::{
 };
 use ff_core::events::{
     ApprovalSafety, ConnectionFailedEvent, EgressMismatchEvent, EvolveCostEstimate,
-    IntentionSignal, McpStatusChangedEvent, MemoryFlushedEvent, OutputStreamKind,
-    PhenotypeMcpUnavailableEvent, ProcessExitedEvent, ProcessOutputEvent, ReasoningEvent,
-    ReconnectingEvent, SessionTitleUpdatedEvent, SkillActivated, SkillCompleted,
+    IntentionSignal, McpStatusChangedEvent, MemoryFlushedEvent, ObserverChangedEvent,
+    OutputStreamKind, PhenotypeMcpUnavailableEvent, ProcessExitedEvent, ProcessOutputEvent,
+    ReasoningEvent, ReconnectingEvent, SessionTitleUpdatedEvent, SkillActivated, SkillCompleted,
     SkillEvolveApprovalRequestEvent, SkillInstallApprovalRequestEvent, SkillsChangedEvent,
     TokenEvent, ToolApprovalRequestEvent, ToolAskRequestEvent, ToolCallEvent, ToolOutputChunkEvent,
     ToolResultEvent, TurnDoneEvent, TurnErrorEvent, TurnStatsEvent, UpdateProgressEvent,
@@ -31,7 +31,7 @@ use ff_core::{
     ScheduledTask, SearchConfig, SecretKind, Session, SessionWorkspace, Skill, SkillInfo,
     SkillManifest, TaskKind,
 };
-use ff_observer::ObserverEvent;
+use ff_observer::{ObserverEvent, ObserverInfo};
 use ff_scheduled::ScheduledApprover;
 use ff_signals::SkillAggregate;
 use ff_tools::{NotebookKernelState, Safety};
@@ -782,6 +782,31 @@ async fn notebook_restart(
         .await
 }
 
+/// List a session's active background observers (#1038, epic #954 M2) — backs
+/// the `👁 Observers` panel. Oldest id first; only the caller's session.
+#[tauri::command]
+async fn list_observers(
+    state: State<'_, Arc<AppState>>,
+    session_id: String,
+) -> Result<Vec<ObserverInfo>, String> {
+    Ok(state.list_observers(&session_id))
+}
+
+/// Stop one observer by id (#1038 M2) — the panel's `[×]`. Only the owning
+/// session may stop it; an unknown/foreign id is a no-op error. Emits
+/// `observer:changed` so the panel (and any other view) re-lists.
+#[tauri::command]
+async fn stop_observer(
+    state: State<'_, Arc<AppState>>,
+    app: tauri::AppHandle,
+    id: u64,
+    session_id: String,
+) -> Result<(), String> {
+    state.stop_observer(id, &session_id).await?;
+    let _ = app.emit("observer:changed", ObserverChangedEvent { session_id });
+    Ok(())
+}
+
 /// Fire a scheduled task immediately, off-schedule (RFC 0017 §8.3). Runs the
 /// same bounded headless turn the scheduler would, records the run, and stamps
 /// `last_run` so the manual fire counts as the most recent run (and the
@@ -1413,6 +1438,14 @@ pub(crate) async fn wake_session_for_observer(
 ) {
     let session_id = event.session_id.clone();
     let observer_id = event.id;
+    // #1038 M2: an observer firing is a change the panel wants to reflect
+    // (coarse — the FE re-lists). Emit regardless of the defer/spawn branch below.
+    let _ = app.emit(
+        "observer:changed",
+        ObserverChangedEvent {
+            session_id: session_id.clone(),
+        },
+    );
     if state.has_active_turn(&session_id) {
         // Turn in flight: defer — but only *probe* liveness, never
         // strip the live turn's cancel token (#1018 Path A). The old
@@ -1763,6 +1796,22 @@ fn spawn_assistant_turn(state: Arc<AppState>, app: tauri::AppHandle, session_id:
                 },
             );
         }
+
+        // #1038 M2: the `observer` tool's start/stop run inside `ff-observer`,
+        // which has no `AppHandle` and so cannot emit — meaning the panel would
+        // never learn about observers the agent attached or stopped *via the
+        // tool* this turn (its only other refresh signals are an observer
+        // *firing* and a panel-driven `stop_observer`). Emit one coarse
+        // `observer:changed` at turn end so the panel re-lists whatever the turn
+        // changed. Cheap and idempotent: a session with no observers just
+        // re-reads an empty list (panel stays hidden). Fires on both Ok and Err
+        // since a start can precede a later turn error.
+        let _ = app.emit(
+            "observer:changed",
+            ObserverChangedEvent {
+                session_id: sid.clone(),
+            },
+        );
 
         // Telemetry (RFC 0001 §8): fold this turn's metrics into each active skill's
         // aggregate and emit a SkillCompleted per skill. Success = a clean finish
@@ -3684,6 +3733,14 @@ fn emit_agent_event<R: tauri::Runtime>(
             if let Some(intent) = observer_intent {
                 if let Some(state) = app.try_state::<Arc<AppState>>() {
                     state.attach_observer_intent(session_id, *intent);
+                    // #1038 M2: a newly attached observer is a change the panel
+                    // wants to show without the user asking (coarse — FE re-lists).
+                    let _ = app.emit(
+                        "observer:changed",
+                        ObserverChangedEvent {
+                            session_id: session_id.to_string(),
+                        },
+                    );
                 }
             }
             let _ = app.emit(
@@ -4219,6 +4276,8 @@ pub fn run() {
             notebook_status,
             notebook_stop,
             notebook_restart,
+            list_observers,
+            stop_observer,
             preview_cadence,
             get_session_workspace,
             set_session_workspace,

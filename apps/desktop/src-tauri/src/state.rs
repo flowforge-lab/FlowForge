@@ -2319,6 +2319,22 @@ impl AppState {
         self.observer_supervisor.drain_buffer(session_id)
     }
 
+    /// The active observers for `session_id`, oldest id first (#1038 M2).
+    /// Backs the `list_observers` command / the observer panel.
+    pub fn list_observers(&self, session_id: &str) -> Vec<ff_observer::ObserverInfo> {
+        self.observer_supervisor.list(session_id)
+    }
+
+    /// Stop and remove observer `id` if it belongs to `session_id` (#1038 M2).
+    /// Backs the `stop_observer` command (the panel's `[×]`).
+    pub async fn stop_observer(
+        &self,
+        id: ff_observer::ObserverId,
+        session_id: &str,
+    ) -> Result<String, String> {
+        self.observer_supervisor.stop(id, session_id).await
+    }
+
     /// Attach a background observer a tool declared via its `ToolOutcome` (#1039,
     /// epic #954 M3). Tools can't call the supervisor directly (`ff-observer`
     /// depends on `ff-tools`), so `process_manager`/`test_runner` return an

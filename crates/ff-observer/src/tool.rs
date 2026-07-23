@@ -356,6 +356,41 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tool_start_is_listed_under_the_callers_session() {
+        // Regression (#1038 M2): the `👁 Observers` panel reads
+        // `list_observers(session_id)` with the FE session id, and the agent
+        // runs the `observer` tool with that same id via `run_with_session`.
+        // Guard the contract the panel depends on — an observer started under a
+        // session id is visible in *that* session's list and invisible to
+        // others. (A `tool.run`/`NO_SESSION_TOOL` start, as the other tests use,
+        // would land in the anonymous bucket the panel never queries — which is
+        // exactly the mismatch class this asserts against.)
+        let (dir, tool) = tool_with_supervisor();
+        let target = dir.path().to_string_lossy().into_owned();
+        let started = tool
+            .run_with_session(
+                json!({"action": "start", "label": "watch", "kind": "file", "target": target}),
+                dir.path(),
+                "session-a",
+            )
+            .await;
+        assert!(started.success, "{}", started.content);
+
+        // Visible in its own session — this is the exact call the desktop
+        // `list_observers` command forwards to, so a non-empty result here is
+        // what makes the panel render.
+        let mine = tool.supervisor.list("session-a");
+        assert_eq!(mine.len(), 1, "observer must be listed for its own session");
+        assert_eq!(mine[0].label, "watch");
+
+        // Isolated: another session sees nothing (no cross-session leakage).
+        assert!(
+            tool.supervisor.list("session-b").is_empty(),
+            "observer must not leak into another session's list"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn start_unknown_source_errors() {
         let (_dir, tool) = tool_with_supervisor();
         let res = tool

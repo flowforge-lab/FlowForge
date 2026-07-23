@@ -12,6 +12,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::Notify;
+use ts_rs::TS;
 
 /// A monotonic, session-global observer id. Allocated by
 /// [`crate::supervisor::ObserverSupervisor::start`] and used by the agent to
@@ -22,8 +23,9 @@ pub type ObserverId = u64;
 /// [`ObserverKind::File`]; the other variants are placeholders so
 /// `ObserverSpec` already has the right shape and Phase 2/3 can fill them in
 /// without an API break.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "lowercase")]
+#[ts(export, export_to = "../../../apps/desktop/src/bindings/")]
 pub enum ObserverKind {
     File,
     Http,
@@ -59,12 +61,21 @@ pub struct ObserverSpec {
 /// What the supervisor returns from `list` — the durable, human-readable
 /// record of an observer. Distinct from the `ManagedObserver` internals
 /// (which hold the live `JoinHandle` + cancel signal + event sender).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "../../../apps/desktop/src/bindings/")]
 pub struct ObserverInfo {
+    /// `number` on the FE, not `bigint`: observer ids are small monotonic
+    /// counters, so a JS `number` is exact (mirrors the `u32` process-event
+    /// ids). Avoids `bigint` friction at the `stop_observer` invoke boundary.
+    #[ts(type = "number")]
     pub id: ObserverId,
     pub label: String,
     pub kind: ObserverKind,
     pub target: String,
+    /// RFC 3339 timestamp (chrono serializes to a string); typed as `string` on
+    /// the FE so we don't need the ts-rs `chrono-impl` feature.
+    #[ts(type = "string")]
     pub started_at: DateTime<Utc>,
 }
 
@@ -110,4 +121,32 @@ pub trait ObserverSource: Send {
     /// call is a fresh await point so the source can be cancelled between
     /// events.
     async fn next_event(&mut self, cancel: Arc<Notify>) -> Option<ObserverEvent>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    // The `list_observers` command returns `ObserverInfo` straight to the FE,
+    // so its JSON is a contract the ts-rs bindings mirror (#1038): camelCase
+    // keys, a lowercased `kind`, and an RFC 3339 string `startedAt`.
+    #[test]
+    fn observer_info_serializes_to_the_fe_wire_shape() {
+        let info = ObserverInfo {
+            id: 7,
+            label: "lib.rs".into(),
+            kind: ObserverKind::Http,
+            target: "localhost:3000/health".into(),
+            started_at: Utc.with_ymd_and_hms(2026, 7, 23, 1, 2, 3).unwrap(),
+        };
+        let v = serde_json::to_value(&info).unwrap();
+        assert_eq!(v["id"], 7);
+        assert_eq!(v["label"], "lib.rs");
+        assert_eq!(v["kind"], "http");
+        assert_eq!(v["target"], "localhost:3000/health");
+        assert_eq!(v["startedAt"], "2026-07-23T01:02:03Z");
+        // No snake_case leak from the rename.
+        assert!(v.get("started_at").is_none());
+    }
 }

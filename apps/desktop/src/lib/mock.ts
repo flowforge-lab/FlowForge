@@ -33,6 +33,8 @@ import type {
   ToolOutputChunkEvent,
   ProcessOutputEvent,
   ProcessExitedEvent,
+  ObserverInfo,
+  ObserverChangedEvent,
   ToolResultEvent,
   SkillInfo,
   SkillAggregate,
@@ -889,6 +891,15 @@ export class MockIpc implements FfIpc {
   private toolOutputListeners = new Set<Listener<ToolOutputChunkEvent>>();
   private processOutputListeners = new Set<Listener<ProcessOutputEvent>>();
   private processExitedListeners = new Set<Listener<ProcessExitedEvent>>();
+  private observerChangedListeners = new Set<Listener<ObserverChangedEvent>>();
+  /** In-memory active observers per session, so the `👁 Observers` panel
+   *  round-trips `list_observers` / `stop_observer` under the mock (#1038). */
+  private observersBySession = new Map<string, ObserverInfo[]>();
+  /** Small sequential ids, mirroring the real supervisor's monotonic counter. */
+  private nextObserverId = 1;
+  /** Sessions already seeded with demo observers, so repeated turns don't stack
+   *  duplicates (mirrors `demoProcessSessions`). */
+  private demoObserverSessions = new Set<string>();
   /** Small sequential ids for the demo background process, mirroring the real
    *  supervisor's `u32`. */
   private nextProcessId = 1;
@@ -1454,6 +1465,26 @@ export class MockIpc implements FfIpc {
   }
   onProcessExited(cb: Listener<ProcessExitedEvent>): Promise<Unlisten> {
     return this.subscribe(this.processExitedListeners, cb);
+  }
+  onObserverChanged(cb: Listener<ObserverChangedEvent>): Promise<Unlisten> {
+    return this.subscribe(this.observerChangedListeners, cb);
+  }
+
+  // Observer panel (#1038): the in-memory analog of `list_observers` /
+  // `stop_observer`. `stop` removes the row then emits `observer:changed`, the
+  // same coarse signal the real backend sends, so the panel re-lists.
+  async listObservers(sessionId: string): Promise<ObserverInfo[]> {
+    return this.observersBySession.get(sessionId) ?? [];
+  }
+  async stopObserver(id: number, sessionId: string): Promise<void> {
+    const list = this.observersBySession.get(sessionId);
+    if (list) {
+      this.observersBySession.set(
+        sessionId,
+        list.filter((o) => o.id !== id),
+      );
+    }
+    this.emit(this.observerChangedListeners, { sessionId });
   }
   onApprovalRequest(cb: Listener<ToolApprovalRequestEvent>): Promise<Unlisten> {
     return this.subscribe(this.approvalRequestListeners, cb);
@@ -2928,6 +2959,10 @@ Shipping the Settings redesign — currently the Memory browser (SET.8).
     // Guarded to one per session inside the helper.
     this.emitDemoProcess(sessionId);
 
+    // Seed a couple of demo observers (#1038) so the `👁 Observers` panel
+    // round-trips under the mock. Guarded to one seed per session.
+    this.emitDemoObservers(sessionId);
+
     // The backend mints one assistant message per tool-calling iteration, each
     // carrying its own prose; we mirror that so the turn exercises the StepGroup
     // fold (#17), cross-iteration step aggregation, and interleaved prose rows
@@ -3376,5 +3411,36 @@ Shipping the Settings redesign — currently the Memory browser (SET.8).
       },
       600 + lines.length * 900 + 600,
     );
+  }
+
+  // Stand in for the agent attaching background observers (#1038): seed one file
+  // and one http observer for the session, then emit `observer:changed` so the
+  // panel lists them. Guarded to one seed per session so repeated turns don't
+  // stack duplicates. Dev/mock only.
+  private emitDemoObservers(sessionId: string): void {
+    if (this.demoObserverSessions.has(sessionId)) return;
+    this.demoObserverSessions.add(sessionId);
+    const startedAt = new Date().toISOString();
+    const seeded: ObserverInfo[] = [
+      {
+        id: this.nextObserverId++,
+        label: "lib.rs",
+        kind: "file",
+        target: "src/lib.rs",
+        startedAt,
+      },
+      {
+        id: this.nextObserverId++,
+        label: "health",
+        kind: "http",
+        target: "localhost:3000/health",
+        startedAt,
+      },
+    ];
+    // Land shortly after the turn's first sync events, like the demo process.
+    setTimeout(() => {
+      this.observersBySession.set(sessionId, seeded);
+      this.emit(this.observerChangedListeners, { sessionId });
+    }, 600);
   }
 }
