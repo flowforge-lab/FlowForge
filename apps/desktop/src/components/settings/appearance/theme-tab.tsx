@@ -1,7 +1,14 @@
-import { cn } from "@/lib/utils";
 import { FONTS, FONT_SCALE_MAX, FONT_SCALE_MIN } from "@/lib/fonts";
+import type { Font } from "@/lib/fonts";
 import type { Theme } from "@/lib/theme";
 import { Input } from "@/components/ui/input";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { SegmentedControl } from "@/components/settings/segmented-control";
 import { SettingsSlider } from "@/components/settings/slider";
 import { usePrefsStore } from "@/store/prefs";
@@ -23,6 +30,8 @@ export function ThemeTab() {
   const setFontScale = usePrefsStore((s) => s.setFontScale);
   const setDisplayName = usePrefsStore((s) => s.setDisplayName);
 
+  const currentFont = FONTS.find((f) => f.id === font);
+
   return (
     <div className="space-y-6">
       <section className="space-y-2">
@@ -37,33 +46,30 @@ export function ThemeTab() {
 
       <section className="space-y-2">
         <h3 className="text-[13px] font-medium text-foreground">Font</h3>
-        <div className="flex flex-col gap-2">
-          {FONTS.map((f) => (
-            <button
-              key={f.id}
-              type="button"
-              aria-pressed={font === f.id}
-              onClick={() => setFont(f.id)}
-              className={cn(
-                "flex items-center justify-between gap-3 rounded-lg border px-3 py-2.5 transition-colors",
-                font === f.id
-                  ? "border-primary bg-primary/5 ring-2 ring-primary/30"
-                  : "border-border bg-card hover:bg-muted/50",
-              )}
-            >
-              <span className="text-[12px] font-medium text-foreground">
-                {f.label}
+        <Select value={font} onValueChange={(v) => setFont(v as Font)}>
+          <SelectTrigger aria-label="Font">
+            <SelectValue placeholder="Select a font">
+              <span style={{ fontFamily: currentFont?.cssValue }}>
+                {currentFont?.label}
               </span>
-              <span
-                className="text-lg leading-none text-muted-foreground"
-                style={{ fontFamily: f.cssValue }}
-                aria-hidden
-              >
-                Aa
-              </span>
-            </button>
-          ))}
-        </div>
+            </SelectValue>
+          </SelectTrigger>
+          <SelectContent>
+            {FONTS.map((f) => (
+              <SelectItem key={f.id} value={f.id}>
+                <span
+                  className="flex items-center justify-between gap-6"
+                  style={{ fontFamily: f.cssValue }}
+                >
+                  <span>{f.label}</span>
+                  <span className="text-muted-foreground" aria-hidden>
+                    Aa
+                  </span>
+                </span>
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
       </section>
 
       <section>
