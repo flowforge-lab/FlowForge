@@ -316,12 +316,14 @@ impl ProcessSupervisor {
                 .subscribe()
         });
 
-        if let Some(out) = child.stdout.take() {
-            tokio::spawn(drain(out, shared.clone(), false));
-        }
-        if let Some(err) = child.stderr.take() {
-            tokio::spawn(drain(err, shared.clone(), true));
-        }
+        let drain_out = child
+            .stdout
+            .take()
+            .map(|out| tokio::spawn(drain(out, shared.clone(), false)));
+        let drain_err = child
+            .stderr
+            .take()
+            .map(|err| tokio::spawn(drain(err, shared.clone(), true)));
         let watch = shared.clone();
         tokio::spawn(async move {
             let status = match child.wait().await {
@@ -329,6 +331,19 @@ impl ProcessSupervisor {
                 Err(e) => Status::Failed(e.to_string()),
             };
             *watch.status.lock().unwrap() = status;
+            // Drain the pipes to EOF *before* closing the broadcast. `wait()`
+            // returning only means the process exited -- the reader tasks may
+            // still hold the last chunk of stdout/stderr. Dropping the sender
+            // here would race them and lose the final line, which is exactly
+            // the byte a short-lived `wake_on` process cares about (e.g. it
+            // prints "Build succeeded" then exits). Awaiting the readers is
+            // bounded: both break on EOF once every write end is closed.
+            if let Some(h) = drain_out {
+                let _ = h.await;
+            }
+            if let Some(h) = drain_err {
+                let _ = h.await;
+            }
             // Phase 3 (#893): drop the broadcast sender so any
             // observers see `RecvError::Closed` and their `next_event`
             // returns `None` (supervisor task ends, entry reaped).
