@@ -744,6 +744,12 @@ fn hoist_interposed_tool_results(messages: &mut Vec<ChatMessage>) {
         if any_interposed && seen > 0 {
             let window: Vec<ChatMessage> = messages.splice(i + 1..j, std::iter::empty()).collect();
             let n = window.len();
+            // Partition the window: results for THIS tool_use go adjacent, the
+            // interposed rows follow. This assumes any `role == "tool"` row in
+            // the window whose id is NOT in `expected` is a genuine interposed
+            // row (it lands in `others`), not a result for some *other* pending
+            // tool_use — which holds because a new tool-call turn breaks the scan
+            // (line 735), so the window only spans this turn's result region.
             let (results, others): (Vec<ChatMessage>, Vec<ChatMessage>) =
                 window.into_iter().partition(|m| {
                     m.role == "tool"

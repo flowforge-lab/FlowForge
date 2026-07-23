@@ -2925,7 +2925,19 @@ impl AppState {
     /// flight (#1066). Called at turn settle, after the tool batch is complete,
     /// so the marker lands as a well-formed trailing `Role::User` row rather than
     /// interposed in a `tool_use`/`tool_result` pair. In insertion order.
+    /// See [`Self::defer_mode_marker`] and the `deferred_mode_markers` field.
+    ///
+    /// Gated on [`Self::has_active_turn`]: `edit_message` cancels the running
+    /// turn and immediately spawns a successor (re-registering a fresh cancel
+    /// token) *before* the cancelled turn reaches its flush. Draining here while
+    /// that successor is in flight would re-interpose the marker into the new
+    /// turn's `tool_use`/`tool_result` window — exactly the wedge this fix
+    /// prevents (#1068). When a turn is active we leave the queue intact so the
+    /// successor flushes it at its own settle; the marker is never lost.
     pub fn flush_deferred_mode_markers(&self, session_id: &str) {
+        if self.has_active_turn(session_id) {
+            return;
+        }
         let markers = self
             .deferred_mode_markers
             .lock()

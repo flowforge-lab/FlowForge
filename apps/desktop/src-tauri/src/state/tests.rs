@@ -3105,7 +3105,9 @@ fn defer_then_flush_appends_marker_after_turn_settles() {
         "marker must NOT be persisted while the turn is in flight"
     );
 
-    // Turn settles → flush persists the marker as a trailing row.
+    // Turn settles → the cancel token is dropped (as turn teardown does at
+    // lib.rs:1880), then flush persists the marker as a trailing row.
+    state.take_cancel(&s.id);
     state.flush_deferred_mode_markers(&s.id);
     let after = state.store.get_messages(&s.id);
     assert_eq!(
@@ -3122,6 +3124,8 @@ fn flush_preserves_order_of_multiple_deferred_markers() {
     arm(&state, &s.id);
     state.defer_mode_marker(&s.id, "[system: Mode switched to Plan]".into());
     state.defer_mode_marker(&s.id, "[system: Mode switched to Act]".into());
+    // Turn settles before the flush (token dropped first, per lib.rs:1880).
+    state.take_cancel(&s.id);
     state.flush_deferred_mode_markers(&s.id);
     let msgs = state.store.get_messages(&s.id);
     let markers: Vec<_> = msgs
@@ -3148,4 +3152,58 @@ fn flush_is_a_noop_when_nothing_deferred() {
     state.flush_deferred_mode_markers(&s.id);
     let msgs = state.store.get_messages(&s.id);
     assert_eq!(msgs.len(), 1, "flush with an empty queue must not add rows");
+}
+
+#[test]
+fn flush_after_a_direct_mode_switch_is_a_noop() {
+    // Mirror of the empty-queue case for the other path: a mode switch that went
+    // direct (no defer, because no turn was in flight) leaves nothing queued, so
+    // a later flush must not double-write a marker (#1068 review nit).
+    let state = AppState::new();
+    let s = state.store.create_session(None);
+    state
+        .store
+        .add_message(&s.id, ff_core::Role::User, "hi".into());
+    // No defer_mode_marker call — the switch was persisted directly elsewhere.
+    state.flush_deferred_mode_markers(&s.id);
+    let msgs = state.store.get_messages(&s.id);
+    assert_eq!(
+        msgs.len(),
+        1,
+        "flush after a direct (non-deferred) switch must not add rows"
+    );
+}
+
+#[test]
+fn flush_is_gated_while_a_successor_turn_is_active() {
+    // #1068 re-wedge race: `edit_message` cancels the running turn and spawns a
+    // successor (arming a fresh cancel token) BEFORE the cancelled turn reaches
+    // its flush. If flush drained here it would re-interpose the marker into the
+    // successor's tool_use/tool_result window. The queue must stay intact until
+    // no turn is active, then flush normally.
+    let state = AppState::new();
+    let s = state.store.create_session(None);
+    state.defer_mode_marker(&s.id, "[system: Mode switched to Act]".into());
+
+    // Successor turn is in flight (edit_message re-armed the cancel token).
+    arm(&state, &s.id);
+    state.flush_deferred_mode_markers(&s.id);
+    assert!(
+        state
+            .store
+            .get_messages(&s.id)
+            .iter()
+            .all(|m| !m.content.starts_with("[system: Mode switched")),
+        "marker must NOT be flushed while a successor turn is active"
+    );
+
+    // Successor settles → its own flush drains the still-queued marker.
+    state.take_cancel(&s.id);
+    state.flush_deferred_mode_markers(&s.id);
+    let msgs = state.store.get_messages(&s.id);
+    assert_eq!(
+        msgs.last().unwrap().content,
+        "[system: Mode switched to Act]",
+        "marker must persist once no turn is active"
+    );
 }

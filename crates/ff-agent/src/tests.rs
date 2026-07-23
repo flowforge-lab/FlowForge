@@ -163,11 +163,17 @@ fn assert_tool_pairs_adjacent(chat: &[ChatMessage]) {
         if let Some(calls) = &chat[i].tool_calls {
             let want = calls.len();
             for k in 1..=want {
+                let got = chat.get(i + k).unwrap_or_else(|| {
+                    panic!(
+                        "expected tool_result at offset {k} after tool_use at {i}, \
+                         but the transcript ends at len {} (dangling tool_use)",
+                        chat.len()
+                    )
+                });
                 assert_eq!(
-                    chat[i + k].role,
-                    "tool",
+                    got.role, "tool",
                     "expected tool_result at offset {k} after tool_use at {i}, got {:?}",
-                    chat[i + k].role
+                    got.role
                 );
             }
         }
