@@ -1928,6 +1928,14 @@ fn spawn_assistant_turn(state: Arc<AppState>, app: tauri::AppHandle, session_id:
         // the next turn registers during this turn's multi-second silent flush.
         state.take_cancel_if(&session_id, &cancel_probe);
 
+        // Persist any mode-switch marker deferred because the user switched
+        // autonomy mode while THIS turn was in flight (#1066). The turn has
+        // settled and its tool batch is complete, so the marker now lands as a
+        // well-formed trailing row rather than interposed in a tool_use/
+        // tool_result pair. Runs on every terminal path (success, error, cancel)
+        // so the signal is never silently lost.
+        state.flush_deferred_mode_markers(&session_id);
+
         // Pre-compaction memory flush (RFC 0006 §7.2): once the visible turn has
         // finished cleanly, persist any durable facts before context pressure forces
         // a summarization that would drop them. Silent — never adds to the transcript.
@@ -3199,11 +3207,18 @@ fn set_session_mode(state: State<'_, Arc<AppState>>, session_id: String, mode: O
         // mode changed between the assistant's prior response and the next user
         // message (#848). A user-role marker stays in the conversation and breaks
         // the model's self-consistency anchoring to its own prior "I'm in Plan" text.
-        state.store.add_message(
-            &session_id,
-            Role::User,
-            format!("[system: Mode switched to {label}]"),
-        );
+        let marker = format!("[system: Mode switched to {label}]");
+        // But if a turn is IN FLIGHT, appending now would land the marker between
+        // an assistant `tool_use` and its not-yet-persisted `tool_result`,
+        // wedging the session with an Anthropic 422 (#1066). Defer it: it is
+        // drained and persisted once the turn settles, landing after the tool
+        // batch. The read-side self-heal (#1067) is the safety net for any bad
+        // order that still reaches the wire.
+        if state.has_active_turn(&session_id) {
+            state.defer_mode_marker(&session_id, marker);
+        } else {
+            state.store.add_message(&session_id, Role::User, marker);
+        }
     }
 }
 
