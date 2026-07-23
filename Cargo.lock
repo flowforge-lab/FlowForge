@@ -2158,6 +2158,7 @@ dependencies = [
  "ff-llm",
  "ff-session",
  "ff-tools",
+ "futures-util",
  "serde",
  "serde_json",
  "tempfile",
