@@ -752,11 +752,7 @@ impl Memory {
     /// Curated keys with no `chunk_stats` row are simply absent from the map;
     /// [`ChunkStatsSalience`] reads an absent key as full weight `1.0` (RFC 0007
     /// §3: never-recalled ⇒ not dormant).
-    pub fn chunk_stats_salience(
-        &self,
-        index: &dyn MemoryIndex,
-        now_ms: i64,
-    ) -> ChunkStatsSalience {
+    pub fn chunk_stats_salience(&self, index: &dyn MemoryIndex, now_ms: i64) -> ChunkStatsSalience {
         let raw = read_lenient(&self.curated_path());
         if raw.trim().is_empty() {
             return ChunkStatsSalience::new(std::collections::HashMap::new());
