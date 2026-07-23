@@ -1,7 +1,7 @@
 // Font registry — swap `--font-sans` at runtime. Geist ships in index.css;
 // other faces lazy-load on first selection so the default bundle stays lean.
 
-export type Font = "geist" | "inter";
+export type Font = "geist" | "inter" | "nunito" | "manrope" | "jetbrains-mono";
 
 export type FontDefinition = {
   id: Font;
@@ -22,6 +22,21 @@ export const FONTS: FontDefinition[] = [
     label: "Inter",
     cssValue: '"Inter Variable", sans-serif',
   },
+  {
+    id: "nunito",
+    label: "Nunito",
+    cssValue: '"Nunito Variable", sans-serif',
+  },
+  {
+    id: "manrope",
+    label: "Manrope",
+    cssValue: '"Manrope Variable", sans-serif',
+  },
+  {
+    id: "jetbrains-mono",
+    label: "JetBrains Mono",
+    cssValue: '"JetBrains Mono Variable", monospace',
+  },
 ];
 
 const loaded = new Set<Font>(["geist"]);
@@ -35,6 +50,12 @@ export function applyFont(font: Font): void {
     loaded.add(font);
     if (font === "inter") {
       void import("@fontsource-variable/inter");
+    } else if (font === "nunito") {
+      void import("@fontsource-variable/nunito");
+    } else if (font === "manrope") {
+      void import("@fontsource-variable/manrope");
+    } else if (font === "jetbrains-mono") {
+      void import("@fontsource-variable/jetbrains-mono");
     }
   }
 }

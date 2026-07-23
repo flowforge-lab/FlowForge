@@ -13,10 +13,29 @@ import {
 } from "./fonts";
 
 describe("font registry", () => {
-  it("lists geist and inter with css values", () => {
-    expect(FONTS.map((f) => f.id)).toEqual(["geist", "inter"]);
+  it("lists all five typefaces with css values", () => {
+    expect(FONTS.map((f) => f.id)).toEqual([
+      "geist",
+      "inter",
+      "nunito",
+      "manrope",
+      "jetbrains-mono",
+    ]);
     expect(fontCssValue("geist")).toContain("Geist");
     expect(fontCssValue("inter")).toContain("Inter");
+    expect(fontCssValue("nunito")).toContain("Nunito");
+    expect(fontCssValue("manrope")).toContain("Manrope");
+    expect(fontCssValue("jetbrains-mono")).toContain("JetBrains Mono");
+  });
+
+  it("gives JetBrains Mono a monospace fallback", () => {
+    expect(fontCssValue("jetbrains-mono")).toContain("monospace");
+  });
+
+  it("gives every font a non-empty label", () => {
+    for (const f of FONTS) {
+      expect(f.label.length).toBeGreaterThan(0);
+    }
   });
 });
 
@@ -38,6 +57,15 @@ describe("applyFont", () => {
     expect(document.documentElement.style.getPropertyValue("--font-sans")).toBe(
       '"Geist Variable", sans-serif',
     );
+  });
+
+  it("applies each lazy-loaded face's css value", () => {
+    for (const id of ["nunito", "manrope", "jetbrains-mono"] as const) {
+      applyFont(id);
+      expect(
+        document.documentElement.style.getPropertyValue("--font-sans"),
+      ).toBe(fontCssValue(id));
+    }
   });
 });
 
