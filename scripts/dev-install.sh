@@ -27,7 +27,14 @@ cargo build -p ff-cli --release
 cp "$REPO_ROOT/target/release/flowforge" \
    "$REPO_ROOT/apps/desktop/src-tauri/binaries/flowforge-$TRIPLE"
 
-echo "==> Building release bundle (pnpm tauri build)"
+# Version by the COMMITTER DATE of the built commit, not a fixed value or the
+# build moment (#1034), matching scripts/dev-release.sh. A hardcoded 0.0.0-dev.0
+# made every dev-install look identical, so the updater's downgrade guard could
+# not order two local builds; committer time is monotonic along history, so the
+# semver ordering of the 0.0.0-dev.<epoch> prerelease is exactly commit recency.
+DEV_VERSION="0.0.0-dev.$(git -C "$REPO_ROOT" show -s --format=%ct HEAD)"
+
+echo "==> Building release bundle (pnpm tauri build) as $DEV_VERSION"
 # pnpm/tauri scripts live in apps/desktop; the cargo workspace target is at the
 # repo root. Build the app bundle only -- no .dmg (flaky bundle_dmg.sh) and no
 # updater artifact (D2 has no updater, so signing keys are not required).
@@ -36,7 +43,7 @@ pnpm install --frozen-lockfile
 pnpm tauri build --bundles app \
   --config src-tauri/tauri.bundle.conf.json \
   --config src-tauri/tauri.no-updater-sign.conf.json \
-  --config '{"version":"0.0.0-dev.0"}'
+  --config "{\"version\":\"$DEV_VERSION\"}"
 
 BUILT_APP="$BUNDLE_DIR/$APP_NAME"
 if [[ ! -d "$BUILT_APP" ]]; then
