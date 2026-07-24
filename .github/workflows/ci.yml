@@ -33,14 +33,23 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # nextest's global process-per-test scheduler runs all 1818 tests in
+      # parallel and to completion (no per-binary fail-fast masking). It is
+      # ~80% of incremental CI wall-clock (#1072). It does not run doctests,
+      # so those get a separate `cargo test --doc` step below.
+      - uses: taiki-e/install-action@nextest
+
       - name: cargo fmt
         run: cargo fmt --all --check
 
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
-      - name: cargo test
-        run: cargo test --workspace
+      - name: cargo nextest
+        run: cargo nextest run --workspace
+
+      - name: cargo doctests
+        run: cargo test --workspace --doc
 
   windows-check:
     name: Windows (compile check + test)
@@ -51,6 +60,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
+
+      # nextest for the Windows runtime coverage too (mirrors the Linux job
+      # in #1072): process-per-test so the #[cfg(windows)] tree-kill / jail
+      # tests get real coverage without fail-fast masking. Doctests get a
+      # separate `cargo test --doc` step (nextest doesn't run them).
+      - uses: taiki-e/install-action@nextest
 
       # ff-tools and ff-mcp carry the #[cfg(windows)] code (process Job Object
       # kill path + the `#607` `tracing::warn!` diagnostics; MCP PATHEXT shim
@@ -65,8 +80,11 @@ jobs:
       # tests in `process::tests::windows` (tree-kill via
       # `cmd /C ping -t`, #607) and the `jail::tests::windows_*` cases so
       # both crates get real Windows coverage.
-      - name: cargo test (ff-tools + ff-mcp)
-        run: cargo test -p ff-tools -p ff-mcp --all-targets
+      - name: cargo nextest (ff-tools + ff-mcp)
+        run: cargo nextest run -p ff-tools -p ff-mcp --all-targets
+
+      - name: cargo doctests (ff-tools + ff-mcp)
+        run: cargo test -p ff-tools -p ff-mcp --doc
 
   web:
     name: Web (typecheck, lint, format, build)

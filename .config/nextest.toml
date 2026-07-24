@@ -1,0 +1,28 @@
+# cargo-nextest configuration for the FlowForge workspace.
+#
+# Rationale (issue #1072): CI's wall-clock is ~80% test *execution*, not
+# compilation, so the lever is nextest's global process-per-test scheduler.
+# The settings below are intentionally conservative (Step 1 scope — no
+# sharding, no sccache). Revisit only with profiling data that justifies it.
+
+[profile.default]
+# A test that hasn't produced output in 60s is stuck. Two slow-timeout strikes
+# (120s hard cap) covers the worst legitimate case while ensuring the two
+# known stalling-server tests in `ff-llm` (which intentionally sleep 3600s)
+# terminate deterministically instead of hanging the per-test process.
+slow-timeout = { period = "60s", terminate-after = 2 }
+
+# Leak detection: if a child process / handle is still alive 1s after the test
+# function returns, fail the test. This surfaces the "leaky test" class that
+# only process-per-test isolation exposes (#1072 side-finding). 1s tolerates
+# the `ProcessSupervisor::drop` SIGKILL teardown path in `ff-tools::process`
+# while still catching detached servers that never shut down.
+leak-timeout = "1s"
+
+# Cold-runner determinism over flake-masking. Do not retry; surface flakes as
+# failures so they get fixed at the source. Revisit if CI-specific flakiness
+# appears and is backed by numbers.
+retries = 0
+
+# Print failing test output inline (default) — essential for triage on CI.
+failure-output = "immediate"
