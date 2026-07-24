@@ -76,6 +76,18 @@ jobs:
         with:
           prefix-key: release-cli-${{ matrix.target }}
 
+      # On Linux the CLI links libdbus via keyring's sync-secret-service backend
+      # (apps/cli/Cargo.toml), so libdbus-sys's build script needs dbus-1 from
+      # pkg-config. ci.yml and the desktop job already install this; the CLI job
+      # was the one place it was missing. runner.os keeps the guard off macOS.
+      - name: Install Linux dbus deps (cached)
+        if: runner.os == 'Linux'
+        uses: awalsh128/cache-apt-pkgs-action@v1
+        timeout-minutes: 5
+        with:
+          packages: libdbus-1-dev pkg-config
+          version: 1.1
+
       - name: Build release binary
         run: cargo build --release -p ff-cli --target ${{ matrix.target }}
 
