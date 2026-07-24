@@ -5,6 +5,7 @@ import {
   Download,
   EyeOff,
   Folder,
+  GitFork,
   MoreHorizontal,
   PanelLeft,
   Pencil,
@@ -72,6 +73,7 @@ import {
   arrangeSessions,
   filterSessions,
   groupContentHits,
+  nextForkTitle,
   resolveLabel,
   selectSessionOverflow,
   SESSION_REVEAL_BATCH,
@@ -125,6 +127,7 @@ interface SessionMenuItemsProps {
   onOpenSplit: (dir: "vertical" | "horizontal") => void;
   onTogglePin: () => void;
   onDismissToggle: () => void;
+  onFork: () => void;
   onRename: () => void;
   onExport: (format: Format) => void;
   onDelete: () => void;
@@ -139,6 +142,7 @@ export function SessionMenuItems({
   onOpenSplit,
   onTogglePin,
   onDismissToggle,
+  onFork,
   onRename,
   onExport,
   onDelete,
@@ -169,6 +173,10 @@ export function SessionMenuItems({
         {dismissed ? "Restore" : "Dismiss"}
       </P.Item>
       <P.Separator />
+      <P.Item onSelect={onFork}>
+        <GitFork />
+        Fork
+      </P.Item>
       <P.Item onSelect={onRename}>
         <Pencil />
         Rename
@@ -233,6 +241,7 @@ export function SessionItem({
   const selectSession = useChatStore((s) => s.selectSession);
   const loadSession = useChatStore((s) => s.loadSession);
   const setSessionTitle = useChatStore((s) => s.setSessionTitle);
+  const forkSession = useChatStore((s) => s.forkSession);
   const deleteSession = useChatStore((s) => s.deleteSession);
   const atCap = usePanesStore((s) => s.leafCount() >= MAX_PANES);
   const togglePin = useSessionPrefsStore((s) => s.togglePin);
@@ -285,6 +294,28 @@ export function SessionItem({
       void loadSession(session.id);
     } else {
       void selectSession(session.id);
+    }
+  }
+
+  // Fork this session (#1069, the sidebar is the only fork entry point) and
+  // switch focus to the new one — same drop-into-focused-pane mechanism as
+  // open(), since forkSession itself deliberately doesn't steal focus (it's
+  // also used by the "Open in split" path, which focuses differently).
+  async function onFork() {
+    const newId = await forkSession(session.id);
+    if (!newId) return;
+    if (session.title) {
+      const existingTitles = useChatStore
+        .getState()
+        .sessions.map((s) => s.title);
+      setSessionTitle(newId, nextForkTitle(session.title, existingTitles));
+    }
+    const focused = usePanesStore.getState().focusedPaneId;
+    if (focused) {
+      usePanesStore.getState().setPaneSession(focused, newId);
+      void loadSession(newId);
+    } else {
+      void selectSession(newId);
     }
   }
 
@@ -440,6 +471,7 @@ export function SessionItem({
                           onOpenSplit={openInSplit}
                           onTogglePin={onTogglePin}
                           onDismissToggle={onDismissToggle}
+                          onFork={() => void onFork()}
                           onRename={onRename}
                           onExport={onExport}
                           onDelete={onDelete}
@@ -468,6 +500,7 @@ export function SessionItem({
           onOpenSplit={openInSplit}
           onTogglePin={onTogglePin}
           onDismissToggle={onDismissToggle}
+          onFork={() => void onFork()}
           onRename={onRename}
           onExport={onExport}
           onDelete={onDelete}

@@ -81,8 +81,9 @@ fn normalize_text(text: &str) -> String {
 /// demotion out of curated Markdown).
 ///
 /// **Default impl**: [`RecencyFrequencySalience`] — mechanical recency × frequency.
-/// **M6.3 upgrade path** (RFC 0007 §6): swap in a `chunk_stats`-backed impl that
-/// uses `access_count` + `weight` with zero rewrite of consolidation logic.
+/// **M6.3** (RFC 0007 §6, issue #294): [`ChunkStatsSalience`] is the promised
+/// `chunk_stats`-backed impl — real decayed `weight` ranks demotion, with zero
+/// change to the consolidation loops (swap the trait object at the call site).
 ///
 /// TODO(M6.3): Add an LLM-driven Salience impl that uses semantic similarity
 /// and importance scoring beyond mechanical heuristics.
@@ -132,6 +133,61 @@ impl Salience<MemoryChunk> for RecencyFrequencySalience {
         };
         let freq = (occurrences as f32 / self.saturation as f32).min(1.0);
         recency * freq
+    }
+}
+
+/// M6.3: retrieval-reinforced salience (RFC 0007 §6). The `chunk_stats`-backed
+/// impl the [`Salience`] doc-comment promised — feeds the real, lazily-decayed
+/// `weight` accrued by `reinforce` (every `memory_search` hit) and ambient
+/// injection into the **demote** decision, so a sustained-*dormant* curated fact
+/// is evicted before a recently-recalled one.
+///
+/// **Source-aware split** (issue #294). The two consolidation loops feed
+/// disjoint sources: *promote* only ever scores `Daily` chunks, *demote* only
+/// `Curated` chunks. So this type routes by [`MemorySource`]:
+///
+/// - **Curated** (the demote side): score by the chunk's decayed `weight`. Real
+///   usage now ranks eviction. Before this, every curated chunk scored an
+///   identical `recency(1.0) × freq(0) = 0` — `occurrences` counts *distinct
+///   daily-log days* and a curated key is never in that map — so demotion evicted
+///   by array index, not importance.
+/// - **Daily** (the promote side): delegate verbatim to
+///   [`RecencyFrequencySalience`]. Promote candidates are never-recalled by
+///   construction (`reinforce` only creates a `chunk_stats` row on a search hit),
+///   so `access_count`/`weight` is ~always absent there and must not drag
+///   promotion down. Promotion stays on recency × frequency.
+///
+/// A curated key absent from the weight map reads `1.0` (never-recalled ⇒ not
+/// dormant), matching the `chunk_stats_snapshot` / `effective_stats` invariant
+/// (RFC 0007 §3): an absent row is treated as full weight, never as zero.
+pub struct ChunkStatsSalience {
+    /// `chunk_key` → lazily-decayed, pin-aware effective weight at pass time.
+    /// Absent key ⇒ treated as `1.0`.
+    weights: HashMap<String, f32>,
+    /// Delegate for `Daily` (promote-side) scoring.
+    daily: RecencyFrequencySalience,
+}
+
+impl ChunkStatsSalience {
+    /// Build from a `chunk_key → effective weight` map (curated keys only need
+    /// be present; absent ⇒ `1.0`). See [`Memory::chunk_stats_salience`] for the
+    /// production constructor that gathers the snapshot from a live index.
+    pub fn new(weights: HashMap<String, f32>) -> Self {
+        Self {
+            weights,
+            daily: RecencyFrequencySalience::default(),
+        }
+    }
+}
+
+impl Salience<MemoryChunk> for ChunkStatsSalience {
+    fn score(&self, chunk: &MemoryChunk, occurrences: u32) -> f32 {
+        match &chunk.source {
+            // Demote side: rank by real, decayed usage weight.
+            MemorySource::Curated => *self.weights.get(&chunk_key(chunk)).unwrap_or(&1.0),
+            // Promote side: unchanged recency × frequency.
+            MemorySource::Daily { .. } => self.daily.score(chunk, occurrences),
+        }
     }
 }
 

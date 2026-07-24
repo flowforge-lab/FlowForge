@@ -2348,8 +2348,8 @@ impl DesktopTaskRunner {
                 // blocking embed HTTP call) are sync/blocking, so run them off the
                 // async worker — mirrors `MemoryConsolidateTool::run`.
                 let result = tokio::task::spawn_blocking(move || {
-                    let report =
-                        memory.consolidate(&ff_memory::RecencyFrequencySalience::default())?;
+                    let salience = memory.chunk_stats_salience(index.as_ref(), now_ms());
+                    let report = memory.consolidate(&salience)?;
                     if report.ran {
                         // Best-effort reindex; a recall-cache failure must not fail
                         // the consolidation pass itself.

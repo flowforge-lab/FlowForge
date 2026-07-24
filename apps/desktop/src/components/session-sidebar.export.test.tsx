@@ -57,6 +57,7 @@ function renderMenu(onExport: (f: "markdown" | "json") => void) {
         onOpenSplit={noop}
         onTogglePin={noop}
         onDismissToggle={noop}
+        onFork={noop}
         onRename={noop}
         onExport={onExport}
         onDelete={noop}

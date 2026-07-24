@@ -25,7 +25,9 @@ pub mod flush;
 pub mod index;
 pub mod watch;
 
-pub use consolidate::{chunk_key, ConsolidationReport, RecencyFrequencySalience, Salience};
+pub use consolidate::{
+    chunk_key, ChunkStatsSalience, ConsolidationReport, RecencyFrequencySalience, Salience,
+};
 pub use embed::{Embedder, NoopEmbedder, OpenAiEmbedder};
 pub use error::{MemoryError, Result};
 pub use flush::{FlushLedger, FlushRecord};
@@ -741,6 +743,27 @@ impl Memory {
     /// (`chunk_markdown` over the raw file) so `chunk_key` correlation holds. With
     /// no dormant chunks the raw text is passed through unchanged, giving the
     /// byte-identical guarantee.
+    /// Build a [`ChunkStatsSalience`] for a consolidation pass from a live index
+    /// (M6.3, issue #294). Gathers the pin-aware, lazily-decayed effective
+    /// `weight` of every curated chunk at `now_ms` so demotion ranks by real
+    /// retrieval usage. Daily (promote-side) chunks need no stats — the salience
+    /// scores them by recency × frequency regardless.
+    ///
+    /// Curated keys with no `chunk_stats` row are simply absent from the map;
+    /// [`ChunkStatsSalience`] reads an absent key as full weight `1.0` (RFC 0007
+    /// §3: never-recalled ⇒ not dormant).
+    pub fn chunk_stats_salience(&self, index: &dyn MemoryIndex, now_ms: i64) -> ChunkStatsSalience {
+        let raw = read_lenient(&self.curated_path());
+        if raw.trim().is_empty() {
+            return ChunkStatsSalience::new(std::collections::HashMap::new());
+        }
+        let chunks = chunk_markdown(&raw, MemorySource::Curated, &self.curated_path());
+        let keys: Vec<String> = chunks.iter().map(chunk_key).collect();
+        let stats = index.effective_stats(&keys, now_ms).unwrap_or_default();
+        let weights = stats.into_iter().map(|(k, s)| (k, s.weight)).collect();
+        ChunkStatsSalience::new(weights)
+    }
+
     fn curated_filter(
         &self,
         index: &dyn MemoryIndex,

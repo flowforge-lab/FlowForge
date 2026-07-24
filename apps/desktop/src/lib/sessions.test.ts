@@ -8,6 +8,8 @@ import {
   selectSessionOverflow,
   formatHitDate,
   SESSION_REVEAL_BATCH,
+  stripForkSuffix,
+  nextForkTitle,
 } from "@/lib/sessions";
 import type { Session } from "@/bindings";
 import type { SearchHit } from "@/bindings/SearchHit";
@@ -52,6 +54,63 @@ describe("resolveLabel", () => {
 
   it("falls back to the 'New session' string when there is neither", () => {
     expect(resolveLabel(session({ id: "1" }))).toBe("New session");
+  });
+});
+
+describe("stripForkSuffix", () => {
+  it("strips a trailing (Fork k) suffix", () => {
+    expect(stripForkSuffix("Refactor auth (Fork 2)")).toBe("Refactor auth");
+  });
+
+  it("leaves a title with no fork suffix unchanged", () => {
+    expect(stripForkSuffix("Refactor auth")).toBe("Refactor auth");
+  });
+
+  it("does not strip a parenthesized suffix that isn't a fork marker", () => {
+    expect(stripForkSuffix("Refactor auth (draft)")).toBe(
+      "Refactor auth (draft)",
+    );
+  });
+});
+
+describe("nextForkTitle", () => {
+  it("starts at (Fork 1) when no forks exist yet", () => {
+    expect(nextForkTitle("Refactor auth", ["Refactor auth", "Other"])).toBe(
+      "Refactor auth (Fork 1)",
+    );
+  });
+
+  it("increments past the highest existing (Fork N) sharing the base", () => {
+    const existing = ["Refactor auth", "Refactor auth (Fork 1)"];
+    expect(nextForkTitle("Refactor auth", existing)).toBe(
+      "Refactor auth (Fork 2)",
+    );
+  });
+
+  it("forking a fork renumbers from the base instead of stacking suffixes", () => {
+    const existing = [
+      "Refactor auth",
+      "Refactor auth (Fork 1)",
+      "Refactor auth (Fork 2)",
+    ];
+    // Forking "Refactor auth (Fork 2)" itself.
+    expect(nextForkTitle("Refactor auth (Fork 2)", existing)).toBe(
+      "Refactor auth (Fork 3)",
+    );
+  });
+
+  it("ignores null titles and titles with a different base", () => {
+    const existing = [null, "Unrelated (Fork 5)", "Refactor auth (Fork 1)"];
+    expect(nextForkTitle("Refactor auth", existing)).toBe(
+      "Refactor auth (Fork 2)",
+    );
+  });
+
+  it("escapes regex-special characters in the base title", () => {
+    const existing = ["Fix (a+b)*c [urgent]", "Fix (a+b)*c [urgent] (Fork 1)"];
+    expect(nextForkTitle("Fix (a+b)*c [urgent]", existing)).toBe(
+      "Fix (a+b)*c [urgent] (Fork 2)",
+    );
   });
 });
 

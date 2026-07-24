@@ -399,3 +399,88 @@ fn consolidate_coalesces_windowed_section_without_duplication() {
     );
     assert_eq!(std::fs::read_to_string(m.curated_path()).unwrap(), curated);
 }
+
+// --- #294: retrieval-reinforced demotion (ChunkStatsSalience) --------------
+
+use crate::index::{Fts5Index, MemoryIndex, ScoredChunk};
+use crate::DecayConfig;
+
+/// Reindex the curated file into `idx` and reinforce a single chunk (by content
+/// substring) at `at_ms`, so decay can drive it dormant relative to `now_ms`.
+fn reinforce_curated_chunk(idx: &Fts5Index, m: &Memory, needle: &str, at_ms: i64) {
+    let raw = std::fs::read_to_string(m.curated_path()).unwrap();
+    let chunks = crate::chunk_markdown(&raw, MemorySource::Curated, &m.curated_path());
+    idx.reindex(&chunks).unwrap();
+    let hit = chunks
+        .into_iter()
+        .find(|c| c.text.contains(needle))
+        .map(|chunk| ScoredChunk {
+            chunk,
+            score: 1.0,
+            weight: 1.0,
+            last_accessed_ms: None,
+        })
+        .expect("needle not found among curated chunks");
+    idx.reinforce_at(&[hit], at_ms).unwrap();
+}
+
+fn decay_on() -> DecayConfig {
+    DecayConfig {
+        enabled: true,
+        ..Default::default()
+    }
+}
+
+/// Three curated facts A, B, C over budget by one. C has been dormant for ~150
+/// idle days (weight decayed well below the dormant threshold); A and B were
+/// never recalled (absent stats row ⇒ weight 1.0). `ChunkStatsSalience` must
+/// evict **C** (the genuinely stale fact), not the array-first chunk.
+#[test]
+fn demote_evicts_dormant_curated_with_chunk_stats_salience() {
+    let dir = tempfile::tempdir().unwrap();
+    // Budget fits two of the three ~15-byte curated bodies, forcing one eviction.
+    let m = mem_with(dir.path(), 44, true);
+    m.rewrite_curated("# A\nalpha fact\n\n# B\nbeta fact\n\n# C\ngamma fact\n")
+        .unwrap();
+
+    let now_ms: i64 = 10_000_000_000_000;
+    let idx = Fts5Index::open_in_memory().unwrap().with_decay(decay_on());
+    // Reinforce C 150 days in the past: 0.98^150 ≈ 0.048 << 0.25 threshold.
+    let past = now_ms - 150 * 86_400_000;
+    reinforce_curated_chunk(&idx, &m, "gamma fact", past);
+
+    let salience = m.chunk_stats_salience(&idx, now_ms);
+    let report = m.consolidate(&salience).unwrap();
+
+    assert_eq!(report.demoted, 1, "exactly one over-budget chunk demoted");
+    let curated = std::fs::read_to_string(m.curated_path()).unwrap();
+    assert!(
+        !curated.contains("gamma fact"),
+        "dormant C must be evicted, got:\n{curated}"
+    );
+    assert!(
+        curated.contains("alpha fact") && curated.contains("beta fact"),
+        "recently-relevant A and B must be retained, got:\n{curated}"
+    );
+}
+
+/// Companion: the mechanical default (`RecencyFrequencySalience`) scores every
+/// curated chunk an identical `1.0 × 0 = 0` (curated keys are never in the
+/// daily-day map), so it evicts the **array-first** chunk (A) regardless of real
+/// usage. This pins the pre-#294 behaviour the new salience corrects.
+#[test]
+fn demote_with_mechanical_salience_evicts_array_first_not_dormant() {
+    let dir = tempfile::tempdir().unwrap();
+    let m = mem_with(dir.path(), 44, true);
+    m.rewrite_curated("# A\nalpha fact\n\n# B\nbeta fact\n\n# C\ngamma fact\n")
+        .unwrap();
+
+    let report = m.consolidate(&RecencyFrequencySalience::default()).unwrap();
+
+    assert_eq!(report.demoted, 1);
+    let curated = std::fs::read_to_string(m.curated_path()).unwrap();
+    assert!(
+        !curated.contains("alpha fact"),
+        "mechanical salience evicts the array-first chunk A, got:\n{curated}"
+    );
+}
