@@ -18,6 +18,40 @@ export function resolveLabel(session: Session): string {
   return "New session";
 }
 
+const FORK_SUFFIX_RE = / \(Fork (\d+)\)$/;
+
+/** Strip a trailing " (Fork <k>)" suffix (#1069) so forking a fork renumbers
+ *  from the original base title instead of stacking suffixes. */
+export function stripForkSuffix(title: string): string {
+  return title.replace(FORK_SUFFIX_RE, "");
+}
+
+function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/**
+ * Compute the next "<base> (Fork N)" title for a session forked from
+ * `sourceTitle` (#1069). `base` strips any existing "(Fork k)" suffix from the
+ * source so forking a fork stays on the same base and keeps numbering
+ * contiguous; `N` is one past the highest existing "(Fork N)" sharing that
+ * base among `existingTitles` (the in-memory session list), or 1 if none.
+ */
+export function nextForkTitle(
+  sourceTitle: string,
+  existingTitles: (string | null)[],
+): string {
+  const base = stripForkSuffix(sourceTitle);
+  const re = new RegExp(`^${escapeRegExp(base)} \\(Fork (\\d+)\\)$`);
+  let max = 0;
+  for (const title of existingTitles) {
+    if (!title) continue;
+    const m = re.exec(title);
+    if (m) max = Math.max(max, Number(m[1]));
+  }
+  return `${base} (Fork ${max + 1})`;
+}
+
 /**
  * Client-side filter: case-insensitive substring over the *resolved* label, so a
  * renamed title and a goal both match what the user actually sees. An empty or

@@ -12,6 +12,7 @@ import { useChatStore } from "@/store/chat";
 import { usePanesStore, leaves, MAX_PANES } from "@/store/panes";
 import { usePrefsStore } from "@/store/prefs";
 import { useSessionPrefsStore } from "@/store/session-prefs";
+import { ipc } from "@/lib/ipc";
 import type { Session } from "@/bindings";
 
 function session(id: string, partial: Partial<Session> = {}): Session {
@@ -296,6 +297,67 @@ describe("SessionSidebar integration (#185)", () => {
     click(btn()); // Show less → back to first 25
     expect(container.textContent).not.toContain("Chat 29");
     cleanup();
+  });
+
+  it("forks a titled session via the ⋯ menu, names it (Fork N), and focuses it (#1069)", async () => {
+    // forkSession clones server-side (MockIpc), so the source must be a real
+    // mock session, not just a store fixture (mirrors panes.test.ts).
+    const src = await ipc.createSession();
+    useChatStore.setState({
+      sessions: [src],
+      activeSessionId: src.id,
+    });
+    useChatStore.getState().setSessionTitle(src.id, "Refactor auth");
+    usePanesStore.setState({ root: null, focusedPaneId: null });
+    usePanesStore.getState().init([src.id], src.id);
+    const focusedPane = usePanesStore.getState().focusedPaneId as string;
+
+    const user = userEvent.setup();
+    rtlRender(<SessionSidebar />);
+
+    await user.click(screen.getByLabelText("Session actions"));
+    await user.click(screen.getByRole("menuitem", { name: /fork/i }));
+
+    await waitFor(() =>
+      expect(useChatStore.getState().sessions).toHaveLength(2),
+    );
+    const forked = useChatStore
+      .getState()
+      .sessions.find((s) => s.id !== src.id)!;
+    expect(forked.title).toBe("Refactor auth (Fork 1)");
+
+    // Fork-and-focus: the focused pane switches to the new session.
+    await waitFor(() => {
+      const leaf = leaves(usePanesStore.getState().root!).find(
+        (l) => l.id === focusedPane,
+      );
+      expect(leaf?.sessionId).toBe(forked.id);
+    });
+  });
+
+  it("forking an untitled session leaves it untitled, matching today's (copy) behavior", async () => {
+    const src = await ipc.createSession();
+    expect(src.title).toBeNull(); // sanity: a fresh mock session starts untitled
+    useChatStore.setState({
+      sessions: [src],
+      activeSessionId: src.id,
+    });
+    usePanesStore.setState({ root: null, focusedPaneId: null });
+    usePanesStore.getState().init([src.id], src.id);
+
+    const user = userEvent.setup();
+    rtlRender(<SessionSidebar />);
+
+    await user.click(screen.getByLabelText("Session actions"));
+    await user.click(screen.getByRole("menuitem", { name: /fork/i }));
+
+    await waitFor(() =>
+      expect(useChatStore.getState().sessions).toHaveLength(2),
+    );
+    const forked = useChatStore
+      .getState()
+      .sessions.find((s) => s.id !== src.id)!;
+    expect(forked.title).toBeNull();
   });
 
   it("header has no FlowForge title or theme toggle; keeps select, +, and options", () => {

@@ -28,9 +28,10 @@ import { useFindStore } from "@/store/find";
 import { usePanesStore, MAX_PANES } from "@/store/panes";
 
 // A single tiling pane (#148): one independent session rendered as a full chat
-// column with its own header controls. The header carries fork (duplicate) / close
-// actions (#204 dropped the redundant Split buttons); the whole pane is
-// click-to-focus and shows a focus ring when it's the active pane. Forking/closing
+// column with its own header controls. The header carries open-new-session-split /
+// close actions (#1069 repurposed the split buttons from fork to plain new-session,
+// since the sidebar is now the single fork entry point); the whole pane is
+// click-to-focus and shows a focus ring when it's the active pane. Splitting/closing
 // routes through the panes store; the session content is just <ChatView sessionId>
 // + <InputBar sessionId>, both already session-scoped.
 export function SessionPane({
@@ -45,7 +46,7 @@ export function SessionPane({
   canClose: boolean;
 }) {
   const focusPane = usePanesStore((s) => s.focusPane);
-  const splitFork = usePanesStore((s) => s.splitFork);
+  const splitNew = usePanesStore((s) => s.splitNew);
   const closePane = usePanesStore((s) => s.closePane);
   const atCap = usePanesStore((s) => s.leafCount() >= MAX_PANES);
 
@@ -172,13 +173,14 @@ export function SessionPane({
           >
             <Search className="size-3.5" />
           </Button>
-          {/* Fork: duplicate this pane's session into the new pane (#149). */}
+          {/* Open a new (empty) session in a split (#1069: split is a layout
+              gesture, not a fork — fork lives only in the sidebar now). */}
           <Button
             variant="ghost"
             size="icon-xs"
             disabled={atCap}
-            title="Duplicate right (fork session)"
-            onClick={() => void splitFork(paneId, "vertical")}
+            title="Open new session right"
+            onClick={() => void splitNew(paneId, "vertical")}
           >
             <Columns2 className="size-3.5" />
           </Button>
@@ -186,8 +188,8 @@ export function SessionPane({
             variant="ghost"
             size="icon-xs"
             disabled={atCap}
-            title="Duplicate down (fork session)"
-            onClick={() => void splitFork(paneId, "horizontal")}
+            title="Open new session down"
+            onClick={() => void splitNew(paneId, "horizontal")}
           >
             <Rows2 className="size-3.5" />
           </Button>

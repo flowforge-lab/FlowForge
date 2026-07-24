@@ -162,29 +162,6 @@ describe("panes store (#148)", () => {
     expect(r.ratios.reduce((a, b) => a + b, 0)).toBeCloseTo(1);
   });
 
-  it("splitFork clones the pane's session into a new focused pane (#149)", async () => {
-    // Use a real mock session so chat.forkSession can clone it server-side.
-    const src = await ipc.createSession();
-    usePanesStore.getState().init([src.id], src.id);
-    const leafId = leaves(root())[0].id;
-
-    await usePanesStore.getState().splitFork(leafId, "vertical");
-
-    const all = leaves(root());
-    expect(all).toHaveLength(2);
-    const forkedLeaf = all.find((l) => l.sessionId !== src.id)!;
-    expect(forkedLeaf.sessionId).not.toBe(src.id);
-    expect(focused()).toBe(forkedLeaf.id);
-    expect((root() as SplitNode).dir).toBe("vertical");
-  });
-
-  it("splitFork is a no-op for an unknown source session", async () => {
-    usePanesStore.getState().init(["nope"], "nope");
-    await usePanesStore.getState().splitFork(leaves(root())[0].id, "vertical");
-    // forkSession rejects the unknown id → store returns null → no split.
-    expect(usePanesStore.getState().leafCount()).toBe(1);
-  });
-
   it("splitNew opens a fresh blank session in a focused right split (#245 2a)", async () => {
     const src = await ipc.createSession();
     usePanesStore.getState().init([src.id], src.id);
