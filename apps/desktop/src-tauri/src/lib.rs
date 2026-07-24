@@ -1926,7 +1926,13 @@ fn spawn_assistant_turn(state: Arc<AppState>, app: tauri::AppHandle, session_id:
         // on cancel_probe (the task-local clone this turn owns) leaves a
         // successor's token intact and also subsumes the single-turn case where
         // the next turn registers during this turn's multi-second silent flush.
-        state.take_cancel_if(&session_id, &cancel_probe);
+        //
+        // `Some` here is the precise "this turn landed and no successor replaced
+        // it" signal — i.e. the session just went genuinely idle. We use it
+        // below to drain any observer wakes that were buffered while this turn
+        // ran (#1095): without it, a wake that fires during a turn with no
+        // following user input sits in the buffer indefinitely.
+        let went_idle = state.take_cancel_if(&session_id, &cancel_probe).is_some();
 
         // Persist any mode-switch marker deferred because the user switched
         // autonomy mode while THIS turn was in flight (#1066). The turn has
@@ -1980,6 +1986,27 @@ fn spawn_assistant_turn(state: Arc<AppState>, app: tauri::AppHandle, session_id:
                     );
                 }
             }
+        }
+
+        // #1095: if this turn just took the session to genuinely idle (we
+        // reclaimed our own cancel token above — no successor turn replaced
+        // us) and observer wakes were buffered while we ran, nothing else will
+        // deliver them: the buffer's only drain point is a *new*
+        // `spawn_assistant_turn`, and none is coming without user input. Spawn
+        // one now so the buffered wakes surface as a fresh turn.
+        //
+        // Safe w.r.t. #1018: gated on `went_idle`, so if a successor turn is
+        // already live we don't spawn a competitor — that successor will drain
+        // the buffer on its own start. Terminates: the spawned turn drains
+        // (empties) the buffer at its entry, so it only re-spawns again if a
+        // *new* wake fires during it, which is exactly when another report is
+        // warranted.
+        if went_idle && state.has_buffered_observer_events(&sid) {
+            tracing::info!(
+                session_id = %sid,
+                "turn idle with buffered observer wakes; spawning drain turn (#1095)"
+            );
+            spawn_assistant_turn(state.clone(), app.clone(), sid.clone());
         }
     });
 }

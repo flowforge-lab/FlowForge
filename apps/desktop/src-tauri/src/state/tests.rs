@@ -3039,6 +3039,32 @@ fn observer_wake_is_not_persisted_to_session_history() {
 }
 
 #[test]
+fn has_buffered_observer_events_tracks_buffer_state() {
+    // #1095: the turn-completion tail uses this read-only probe to decide
+    // whether to spawn a drain turn. It must be false before any push, true
+    // while a wake sits buffered, and false again once drained.
+    let state = AppState::new();
+    let s = state.store.create_session(None);
+
+    assert!(
+        !state.has_buffered_observer_events(&s.id),
+        "no wakes buffered initially"
+    );
+
+    state.buffer_observer_event(&s.id, test_observer_event(&s.id, "ci", "CHECKS_DONE"));
+    assert!(
+        state.has_buffered_observer_events(&s.id),
+        "true while a wake is buffered — the tail would spawn a drain turn"
+    );
+
+    let _ = state.drain_observer_buffer(&s.id);
+    assert!(
+        !state.has_buffered_observer_events(&s.id),
+        "false after drain — no re-spawn, so the drain turn terminates"
+    );
+}
+
+#[test]
 fn woken_agent_still_sees_the_wake_context() {
     // Intent preserved: after moving wakes off the transcript, a woken turn
     // must still RECEIVE them — as transient request-only context.
