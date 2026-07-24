@@ -114,6 +114,7 @@ describe("SessionMenuItems", () => {
         onOpenSplit={() => {}}
         onTogglePin={() => {}}
         onDismissToggle={() => {}}
+        onFork={() => {}}
         onRename={() => {}}
         onExport={() => {}}
         onDelete={() => {}}
@@ -130,5 +131,12 @@ describe("SessionMenuItems", () => {
     expect(html).toContain("Pin");
     expect(html).toContain("Dismiss");
     expect(html).toContain("Rename");
+  });
+
+  // #1069: the sidebar is the single fork entry point, so Fork lives here
+  // (near Rename) and nowhere else in the app.
+  it("includes a Fork item alongside Rename", () => {
+    const html = menu();
+    expect(html).toContain("Fork");
   });
 });
