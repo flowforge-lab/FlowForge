@@ -6,7 +6,7 @@
 //! model that already knows `process_manager` immediately knows
 //! `observer`.
 
-use super::source::{ObserverInfo, ObserverKind, ObserverSpec};
+use super::source::{HttpMode, ObserverInfo, ObserverKind, ObserverSpec};
 use super::supervisor::ObserverSupervisor;
 use ff_tools::{Safety, Tool, ToolOutcome};
 use serde_json::Value;
@@ -96,12 +96,17 @@ impl Tool for ObserverTool {
                 },
                 "filter": {
                     "type": "string",
-                    "description": "start: glob for file directory targets, a plain substring the http body must contain (http), or a regex applied to each new stdout/stderr chunk (process). Multi-line patterns should be passed without `(?m)` — the source enables it."
+                    "description": "start: glob for file directory targets, a plain substring the http body must contain (http, `change` mode only — ignored in `ready` mode), or a regex applied to each new stdout/stderr chunk (process). Multi-line patterns should be passed without `(?m)` — the source enables it."
+                },
+                "mode": {
+                    "type": "string",
+                    "enum": ["change", "ready"],
+                    "description": "start (http, optional): `change` (default) wakes whenever the response body changes; `ready` wakes ONCE the moment the URL first responds 2xx, then completes — the dev-server readiness probe (start a server, then `observer --kind http --target http://localhost:3000/health --mode ready`). Point `ready` at a dedicated health endpoint (e.g. `/health`), not the root URL: a root or catch-all route often returns 200 with a landing or framework error page before the app is truly serving, which would fire a false 'ready'. Ignored for file/process."
                 },
                 "interval_secs": {
                     "type": "integer",
                     "minimum": 1,
-                    "description": "start (http, optional): seconds between polls. Clamped to >= 30; defaults to 60 when omitted."
+                    "description": "start (http, optional): seconds between polls. In `change` mode, clamped to >= 30 and defaults to 60. In `ready` mode, clamped to >= 1 and defaults to 2 (a readiness probe must poll near-instantly)."
                 },
                 "observer_id": {
                     "type": "integer",
@@ -196,17 +201,27 @@ impl Tool for ObserverTool {
                     .filter(|s| !s.trim().is_empty())
                     .map(|s| s.to_string());
                 let interval_secs = args.get("interval_secs").and_then(Value::as_u64);
+                // `mode` applies to http only: "ready" (fire once on first 2xx)
+                // vs "change" (default, diff the body). #954 item 4.
+                let http_mode = match args.get("mode").and_then(Value::as_str) {
+                    Some("ready") => HttpMode::Ready,
+                    _ => HttpMode::Change,
+                };
                 let spec = ObserverSpec {
                     label: label.to_string(),
                     kind,
                     target: target_str,
                     filter,
                     interval_secs,
+                    http_mode,
                 };
                 match self.supervisor.start(spec, session_id) {
                     Ok(id) => {
-                        let suffix = match kind {
-                            ObserverKind::Http => {
+                        let suffix = match (kind, http_mode) {
+                            (ObserverKind::Http, HttpMode::Ready) => {
+                                "\n(fires once when the target first responds 2xx, then completes.)"
+                            }
+                            (ObserverKind::Http, HttpMode::Change) => {
                                 "\n(first poll is silent; the next change wakes the agent.)"
                             }
                             _ => "",

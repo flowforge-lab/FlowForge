@@ -2382,6 +2382,10 @@ impl AppState {
             target: intent.target,
             filter: intent.filter,
             interval_secs: intent.interval_secs,
+            // Host-declared observers (tool `wake_on`) are change/process
+            // watchers; readiness mode is only reachable via the `observer`
+            // tool's explicit `mode: "ready"`. #954 item 4.
+            http_mode: ff_observer::source::HttpMode::Change,
         };
         match self.observer_supervisor.start(spec, session_id) {
             Ok(id) => {

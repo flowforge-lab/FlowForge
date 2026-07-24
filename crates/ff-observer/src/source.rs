@@ -32,6 +32,26 @@ pub enum ObserverKind {
     Process,
 }
 
+/// How an `http` observer decides when to fire.
+///
+/// `HttpSource` began as a pure change detector, which cannot express the most
+/// common reactive need — "wake me when this server comes up" — because the
+/// first successful poll only records a baseline and an unchanged body never
+/// fires again (#954 item 4). `Ready` mode adds that missing semantic.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "lowercase")]
+#[ts(export, export_to = "../../../apps/desktop/src/bindings/")]
+pub enum HttpMode {
+    /// Fire whenever the response body changes from the previous poll (the
+    /// original behavior). The first poll is silent (records a baseline).
+    #[default]
+    Change,
+    /// Fire once on the first successful (2xx) response, then complete. This is
+    /// the "readiness probe": start a dev server, then wake as soon as it
+    /// answers. `filter` is ignored in this mode — any 2xx means ready.
+    Ready,
+}
+
 /// The user-facing description of an observer. Constructed by the
 /// `observer` tool from its `start` action's args and passed to
 /// [`crate::supervisor::ObserverSupervisor::start`].
@@ -56,6 +76,9 @@ pub struct ObserverSpec {
     /// `None` means the source picks its own default (60s for http);
     /// `Some(n)` is clamped to the source's minimum.
     pub interval_secs: Option<u64>,
+    /// For `http`, how the observer decides to fire (change vs readiness).
+    /// Defaults to [`HttpMode::Change`]. Ignored for other kinds.
+    pub http_mode: HttpMode,
 }
 
 /// What the supervisor returns from `list` — the durable, human-readable
