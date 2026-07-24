@@ -1899,7 +1899,7 @@ dependencies = [
 
 [[package]]
 name = "ff-agent"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1922,7 +1922,7 @@ dependencies = [
 
 [[package]]
 name = "ff-cli"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1946,7 +1946,7 @@ dependencies = [
 
 [[package]]
 name = "ff-core"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "dirs 5.0.1",
  "globset",
@@ -1960,7 +1960,7 @@ dependencies = [
 
 [[package]]
 name = "ff-llm"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -1990,7 +1990,7 @@ dependencies = [
 
 [[package]]
 name = "ff-mcp"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2010,7 +2010,7 @@ dependencies = [
 
 [[package]]
 name = "ff-memory"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "chrono",
  "dirs 5.0.1",
@@ -2030,7 +2030,7 @@ dependencies = [
 
 [[package]]
 name = "ff-observer"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2055,7 +2055,7 @@ dependencies = [
 
 [[package]]
 name = "ff-scheduled"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2075,7 +2075,7 @@ dependencies = [
 
 [[package]]
 name = "ff-session"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "chrono",
  "ff-core",
@@ -2090,7 +2090,7 @@ dependencies = [
 
 [[package]]
 name = "ff-signals"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "ff-core",
  "serde",
@@ -2101,7 +2101,7 @@ dependencies = [
 
 [[package]]
 name = "ff-skills"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "ff-core",
  "notify",
@@ -2117,7 +2117,7 @@ dependencies = [
 
 [[package]]
 name = "ff-tools"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -2151,7 +2151,7 @@ dependencies = [
 
 [[package]]
 name = "ff-transport"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "async-trait",
  "ff-agent",
@@ -2170,7 +2170,7 @@ dependencies = [
 
 [[package]]
 name = "ff-transport-slack"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "ff-transport",
  "serde",
@@ -2180,7 +2180,7 @@ dependencies = [
 
 [[package]]
 name = "ff-workflow"
-version = "0.1.0"
+version = "1.0.0"
 
 [[package]]
 name = "field-offset"
@@ -2227,7 +2227,7 @@ dependencies = [
 
 [[package]]
 name = "flowforge-desktop"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "async-trait",
  "dirs 5.0.1",

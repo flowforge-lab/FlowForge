@@ -1,6 +1,6 @@
 [package]
 name = "flowforge-desktop"
-version = "0.1.0"
+version = "1.0.0"
 description = "FlowForge desktop app"
 authors = ["FlowForge contributors"]
 edition.workspace = true
