@@ -336,13 +336,22 @@ impl ProcessSupervisor {
             // still hold the last chunk of stdout/stderr. Dropping the sender
             // here would race them and lose the final line, which is exactly
             // the byte a short-lived `wake_on` process cares about (e.g. it
-            // prints "Build succeeded" then exits). Awaiting the readers is
-            // bounded: both break on EOF once every write end is closed.
+            // prints "Build succeeded" then exits).
+            //
+            // A well-behaved child closes its pipe write ends on exit, so both
+            // drains hit EOF promptly. But `drain` only breaks on EOF, and an
+            // orphan that inherited the write end (e.g. `sh -c 'echo done;
+            // sleep 30 &'`) keeps it open -- an unbounded await would pin this
+            // task, and the observer's open channel, to the orphan's lifetime.
+            // Bound it: the final line is already in the ring/receiver buffer,
+            // so a short grace suffices; past it we close the broadcast anyway
+            // and the straggling drain leaks exactly as it did before this fix.
+            const DRAIN_GRACE: Duration = Duration::from_millis(500);
             if let Some(h) = drain_out {
-                let _ = h.await;
+                let _ = tokio::time::timeout(DRAIN_GRACE, h).await;
             }
             if let Some(h) = drain_err {
-                let _ = h.await;
+                let _ = tokio::time::timeout(DRAIN_GRACE, h).await;
             }
             // Phase 3 (#893): drop the broadcast sender so any
             // observers see `RecvError::Closed` and their `next_event`
@@ -1348,6 +1357,56 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         panic!("subscriber should observe RecvError::Closed after exit");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn broadcast_closes_within_grace_when_an_orphan_holds_the_pipe() {
+        // Regression for the fix that drains pipes before closing the
+        // broadcast (final-line survival): `drain` only breaks on EOF, which
+        // needs *every* write end of the pipe closed. A child that spawns a
+        // background orphan inheriting stdout (`echo done; sleep 30 &`) exits
+        // immediately, but the orphan keeps the write end open, so drain never
+        // hits EOF. The await must be bounded (DRAIN_GRACE) or this task — and
+        // the observer's channel — would be pinned to the orphan's 30s life.
+        let dir = TempDir::new().unwrap();
+        let sup = ProcessSupervisor::new();
+        let id = sup
+            .start("echo hello-stream; sleep 30 &", dir.path(), "s1")
+            .unwrap();
+        let mut rx = sup.subscribe(id, "s1").expect("subscribe while running");
+
+        // (a) The final line still survives the drain-before-close fix.
+        let chunk = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("final line arrives before the orphan would ever exit")
+            .expect("subscribe recv ok");
+        assert!(
+            std::str::from_utf8(&chunk.bytes)
+                .unwrap_or("")
+                .contains("hello-stream"),
+            "the last line must survive: {chunk:?}"
+        );
+
+        // (b) The broadcast closes within the grace despite the orphan holding
+        // the pipe — well under the orphan's 30s lifetime. Bound the wait with
+        // a hard 2s ceiling so a regression fails fast instead of hanging: if
+        // the await were unbounded, `recv` would block until the orphan dies.
+        let closed = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match rx.recv().await {
+                    Err(broadcast::error::RecvError::Closed) => break true,
+                    Err(broadcast::error::RecvError::Lagged(_)) | Ok(_) => continue,
+                }
+            }
+        })
+        .await;
+        let _ = sup.stop(id, "s1").await;
+        assert_eq!(
+            closed,
+            Ok(true),
+            "broadcast must close within DRAIN_GRACE even with an orphan holding the pipe"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
