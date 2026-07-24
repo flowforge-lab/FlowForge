@@ -16,9 +16,14 @@
 //! for a wake source, where one ring per change is the spec's contract.
 //!
 //! On process exit the supervisor's exit-watcher drops the broadcast
-//! sender, so `rx.recv()` returns `RecvError::Closed` and `next_event`
-//! returns `None`; the supervisor's task observes the `None` and reaps
-//! the entry. No zombie observers.
+//! sender, so `rx.recv()` returns `RecvError::Closed`. Rather than vanish
+//! silently, `next_event` emits ONE terminal `ObserverEvent` ("process
+//! {pid} ended ...") to wake the agent — process end is the most
+//! wake-worthy moment, and a watch that finishes without waking anyone is
+//! the whole bug #1090 fixed. The next `next_event` call then returns
+//! `None` (gated by `terminated`) so the supervisor reaps the entry. No
+//! zombie observers. A user-initiated cancel still returns `None`
+//! immediately and stays silent — only *process end* wakes.
 
 use super::source::{ObserverContext, ObserverEvent, ObserverSource};
 use async_trait::async_trait;
@@ -45,6 +50,19 @@ pub struct ProcessSource {
     /// with the http/file sources.
     regex: Option<Regex>,
     rx: tokio::sync::broadcast::Receiver<ProcessChunk>,
+    /// The observed `process_manager` id, used only to word the terminal
+    /// wake ("process {pid} ended ...").
+    pid: u64,
+    /// The original (pre-`(?m)`) filter pattern, kept verbatim so the
+    /// terminal wake can name it when the process ended without a match.
+    pattern: Option<String>,
+    /// Whether any chunk ever matched. Decides the terminal wake wording:
+    /// a plain "ended" vs. "ended -- pattern never matched".
+    matched_any: bool,
+    /// Set once the observed process has ended (broadcast `Closed`) and we
+    /// have emitted the single terminal wake. A second `Closed` then
+    /// returns `None` so the supervisor reaps us instead of looping.
+    terminated: bool,
 }
 
 impl std::fmt::Debug for ProcessSource {
@@ -90,7 +108,15 @@ impl ProcessSource {
         let rx = supervisor
             .subscribe(pid, session_id)
             .ok_or_else(|| format!("no such process: {pid}"))?;
-        Ok(Self { ctx, regex, rx })
+        Ok(Self {
+            ctx,
+            regex,
+            rx,
+            pid,
+            pattern: filter.map(str::to_owned),
+            matched_any: false,
+            terminated: false,
+        })
     }
 
     /// One-line, char-clamped summary of the regex match. Internal
@@ -132,15 +158,51 @@ impl ObserverSource for ProcessSource {
     }
 
     async fn next_event(&mut self, cancel: Arc<Notify>) -> Option<ObserverEvent> {
+        // The observed process already ended and we emitted its single
+        // terminal wake on the previous call; retire now so the supervisor
+        // reaps us instead of looping on a closed channel.
+        if self.terminated {
+            return None;
+        }
         loop {
             // `biased` so a cancel that arrives during a chunk-recv
             // is observed before the next chunk; same shape as the
             // http source.
             tokio::select! {
                 biased;
+                // User/agent stopped this observer: stay silent (no wake),
+                // matching the http/file cancel contract.
                 _ = cancel.notified() => return None,
                 res = self.rx.recv() => match res {
-                    Err(RecvError::Closed) => return None,
+                    // The observed process ended (broadcast sender dropped).
+                    // This is the most wake-worthy moment, so emit ONE
+                    // terminal event before retiring (#1090) rather than
+                    // vanishing silently. `terminated` gates the next call
+                    // to `None` so the supervisor reaps us.
+                    Err(RecvError::Closed) => {
+                        self.terminated = true;
+                        let pid = self.pid;
+                        let summary = match (&self.pattern, self.matched_any) {
+                            // Ended after at least one match: neutral close.
+                            (_, true) => format!("process {pid} ended"),
+                            // Had a filter but it never matched before the
+                            // process ended (killed, crashed, or the match
+                            // was lost to a lagged broadcast): say so and
+                            // point at `poll` for the full output.
+                            (Some(pat), false) => format!(
+                                "process {pid} ended -- wake pattern \"{pat}\" never matched; poll for full output"
+                            ),
+                            // No filter: every chunk would have matched, so
+                            // "no match" is meaningless; just report the end.
+                            (None, false) => format!("process {pid} ended"),
+                        };
+                        return Some(ObserverEvent {
+                            session_id: self.ctx.session_id.clone(),
+                            id: self.ctx.id,
+                            label: self.ctx.label.clone(),
+                            summary,
+                        });
+                    }
                     // A lagged receiver means the broadcast dropped
                     // chunks on overflow; loop and try the next one
                     // (the agent will see a single event for the
@@ -154,6 +216,7 @@ impl ObserverSource for ProcessSource {
                             // has a filter set). Keep draining.
                             continue;
                         }
+                        self.matched_any = true;
                         return Some(ObserverEvent {
                             session_id: self.ctx.session_id.clone(),
                             id: self.ctx.id,
@@ -229,29 +292,90 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn no_match_no_event() {
+    async fn ends_without_match_wakes_then_reaps() {
+        // #1090: a process that exits WITHOUT ever matching the filter
+        // must still wake the agent exactly once (a terminal event naming
+        // the unmatched pattern), then return `None` so the supervisor
+        // reaps it. This is the killed-mid-release scenario.
         let dir = TempDir::new().unwrap();
-        let (sup, id) = live_proc(&dir, "sleep 0.5; echo all good").await;
+        let (sup, id) = live_proc(&dir, "sleep 0.3; echo all good").await;
         let mut src = ProcessSource::new(ctx(1), id, Some("error detected"), &sup, "s1")
             .expect("source builds");
         let cancel = Arc::new(Notify::new());
-        // The regex never matches, the process eventually exits and
-        // the source returns `None`. We give the test 2 s — well over
-        // the 0.5 s sleep — so it should always complete.
-        let res =
-            tokio::time::timeout(Duration::from_secs(2), src.next_event(cancel.clone())).await;
-        match res {
-            // Expected: process exits, sender drops, source returns None.
-            Ok(None) => {}
-            // Defensive: if scheduling is slow, explicitly cancel and
-            // assert `None`.
-            Ok(Some(_)) => {
-                cancel.notify_waiters();
-                let second = src.next_event(cancel.clone()).await;
-                assert!(second.is_none(), "unexpected extra event");
-            }
-            Err(_) => panic!("source did not return within budget"),
-        }
+        // First call: the regex never matches; the process exits, the
+        // sender drops, and we get the single terminal wake.
+        let ev = tokio::time::timeout(Duration::from_secs(3), src.next_event(cancel.clone()))
+            .await
+            .expect("terminal event arrives within budget")
+            .expect("process end must wake, not vanish");
+        assert_eq!(ev.session_id, "s1");
+        assert_eq!(ev.id, 1);
+        assert!(ev.summary.contains("ended"), "{}", ev.summary);
+        assert!(
+            ev.summary.contains("never matched"),
+            "must name the unmatched pattern: {}",
+            ev.summary
+        );
+        assert!(
+            ev.summary.contains("error detected"),
+            "must quote the pattern: {}",
+            ev.summary
+        );
+        // Second call: nothing left to say, so the source retires.
+        let second = tokio::time::timeout(Duration::from_secs(1), src.next_event(cancel.clone()))
+            .await
+            .expect("second call returns within budget");
+        assert!(second.is_none(), "expected reap after terminal wake");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ends_after_match_wakes_neutrally_then_reaps() {
+        // #1090: a process that matched at least once, then ends, still
+        // emits a terminal wake — but a neutral "ended" (no "never
+        // matched" wording, since it did match).
+        let dir = TempDir::new().unwrap();
+        let gate = dir.path().join("gate");
+        #[cfg(not(windows))]
+        let cmd = format!(
+            "while [ ! -f '{}' ]; do sleep 0.01; done; echo error detected",
+            gate.display()
+        );
+        #[cfg(windows)]
+        let cmd = format!(
+            "while (-not (Test-Path '{}')) {{ Start-Sleep -Milliseconds 10 }}; Write-Output 'error detected'",
+            gate.display().to_string().replace('\\', "/")
+        );
+        let (sup, id) = live_proc(&dir, &cmd).await;
+        let mut src = ProcessSource::new(ctx(1), id, Some("error detected"), &sup, "s1")
+            .expect("source builds");
+        std::fs::write(&gate, "go").unwrap();
+        let cancel = Arc::new(Notify::new());
+        // First: the match.
+        let matched = tokio::time::timeout(Duration::from_secs(3), src.next_event(cancel.clone()))
+            .await
+            .expect("match arrives")
+            .expect("match event");
+        assert!(
+            matched.summary.starts_with("matched:"),
+            "{}",
+            matched.summary
+        );
+        // Then: the process ends -> terminal wake, neutral wording.
+        let terminal = tokio::time::timeout(Duration::from_secs(3), src.next_event(cancel.clone()))
+            .await
+            .expect("terminal event arrives")
+            .expect("process end must wake");
+        assert!(terminal.summary.contains("ended"), "{}", terminal.summary);
+        assert!(
+            !terminal.summary.contains("never matched"),
+            "matched run must not claim 'never matched': {}",
+            terminal.summary
+        );
+        // Then: reaped.
+        let third = tokio::time::timeout(Duration::from_secs(1), src.next_event(cancel.clone()))
+            .await
+            .expect("third call returns within budget");
+        assert!(third.is_none(), "expected reap after terminal wake");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
