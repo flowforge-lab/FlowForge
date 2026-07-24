@@ -26,6 +26,7 @@ grep-searcher = "0.1"
 ignore = "0.4"
 globset = "0.4"
 reqwest = { version = "0.12", default-features = false }
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 url = "2"
 fast_html2md = "0.0.62"
 dom_smoothie = "0.18"
