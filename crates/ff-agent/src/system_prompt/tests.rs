@@ -924,7 +924,7 @@ const GOLDEN: &str = concat!(
 ",
     "          - You start a long-running build, test suite, or deploy: attach a `process`           observer with a regex filter for completion/error signals (e.g.           `\"BUILD (SUCCEEDED|FAILED)\"`, `\"error\\[\"`,           `\"Tests:.*failed\"`).
 ",
-    "          - You start a dev server: attach an `http` observer on the localhost health           endpoint (e.g. `http://localhost:3000/health`) to know when it's ready.
+    "          - You start a dev server: attach an `http` observer with `--mode ready`           on a dedicated health endpoint the server answers (e.g. `observer --kind http --target http://localhost:3000/health --mode ready`)           — it wakes the moment the server first responds 2xx, then completes. Prefer a real health path over the root URL, which can 200 on a landing or framework error page before the app is truly serving.
 ",
     "          - The user says \"watch\", \"monitor\", \"let me know when\", or           \"notify me\": start a `file` or `http` observer on the relevant target.
 ",

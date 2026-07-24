@@ -15,12 +15,16 @@
 //! - `reqwest::Error` and non-2xx responses are silent (a `tracing::warn!`,
 //!   no event): a 5xx or DNS blip must not become an event storm.
 //!
-//! Cadence:
-//! - `interval_secs = None` → defaults to 60 s.
-//! - `interval_secs = Some(n)` with `n < 30` → warn and clamp to 30 s. Below
-//!   30 s the per-tick cost on the user (and on whatever we're watching)
-//!   crosses the line from "background" to "busy loop" — `#709` documents 30
-//!   s as the floor.
+//! Cadence (mode-dependent):
+//! - **Change mode** — `interval_secs = None` → 60 s; `Some(n)` with `n < 30`
+//!   → warn and clamp to 30 s. Below 30 s the per-tick cost on the user (and on
+//!   whatever we're watching) crosses the line from "background" to "busy loop"
+//!   — `#709` documents 30 s as the floor. The first poll is silent (baseline),
+//!   so first-change latency is ~2x the interval.
+//! - **Ready mode** — `interval_secs = None` → 2 s; `Some(n)` with `n < 1` →
+//!   clamp to 1 s. A readiness probe answers "is it up *yet*?", so it polls the
+//!   *first* tick with no sleep and retries near-instantly; the 30s change
+//!   floor would make a service that starts in 3 s look down for 30.
 //!
 //! Filter:
 //! - When `filter` is `Some(s)`, the body is decoded lossy and the source
@@ -39,7 +43,7 @@
 //!   `ff_tools::url_safety::SsrfPolicy` over (the host list is `ff-tools`
 //!   already a workspace dep).
 
-use super::source::{ObserverContext, ObserverEvent, ObserverSource};
+use super::source::{HttpMode, ObserverContext, ObserverEvent, ObserverSource};
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use std::hash::{DefaultHasher, Hash, Hasher};
@@ -53,6 +57,15 @@ pub const DEFAULT_INTERVAL_SECS: u64 = 60;
 /// Minimum allowed `interval_secs`; below this the source warns and clamps.
 /// Documented in the issue as the floor from `#709`.
 pub const MIN_INTERVAL_SECS: u64 = 30;
+/// Interval floor for [`HttpMode::Ready`]. A readiness probe answers the
+/// question "is the server up *yet*?", so it must poll far more often than the
+/// change-mode floor — the 30s anti-noise floor would make a service that
+/// starts in 3s look unavailable for 30. One second is frequent enough to feel
+/// instant without hammering.
+pub const MIN_READY_INTERVAL_SECS: u64 = 1;
+/// Default interval for [`HttpMode::Ready`] when the caller doesn't specify
+/// one. Change mode defaults to [`DEFAULT_INTERVAL_SECS`].
+pub const DEFAULT_READY_INTERVAL_SECS: u64 = 2;
 /// Hard body cap per poll. A larger body is silently truncated — the
 /// hash and (when set) substring check are run on the truncated bytes.
 const MAX_BODY_BYTES: usize = 1 << 20;
@@ -70,6 +83,12 @@ pub struct HttpSource {
     /// first-tick silent path doesn't accidentally compare against `0`
     /// and fire.
     last_hash: Option<u64>,
+    /// How this observer decides to fire. `Change` (default) diffs the body;
+    /// `Ready` fires once on the first 2xx and then completes (#954 item 4).
+    mode: HttpMode,
+    /// `Ready` mode only: set once the readiness event has fired so the next
+    /// `next_event` returns `None` and the supervisor reaps the observer.
+    fired_ready: bool,
     /// Cached on construction. `reqwest::Client` is `Arc`-internal and
     /// cheap to clone, but holding one here is enough for the source's
     /// whole lifetime.
@@ -84,6 +103,7 @@ impl std::fmt::Debug for HttpSource {
             .field("interval", &self.interval)
             .field("filter", &self.filter)
             .field("last_hash", &self.last_hash)
+            .field("mode", &self.mode)
             // Skip `client` — reqwest::Client's Debug prints the
             // internal config and a connection pool address; not
             // useful in test output and noisy on every assertion.
@@ -108,6 +128,7 @@ impl HttpSource {
         target: &str,
         interval_secs: Option<u64>,
         filter: Option<String>,
+        mode: HttpMode,
     ) -> Result<Self, String> {
         let url = url::Url::parse(target).map_err(|e| format!("invalid URL `{target}`: {e}"))?;
         match url.scheme() {
@@ -122,19 +143,7 @@ impl HttpSource {
             return Err(format!("URL has no host: `{target}`"));
         }
 
-        let interval = match interval_secs {
-            None => Duration::from_secs(DEFAULT_INTERVAL_SECS),
-            Some(s) if s < MIN_INTERVAL_SECS => {
-                tracing::warn!(
-                    requested_secs = s,
-                    clamped_to_secs = MIN_INTERVAL_SECS,
-                    "http observer interval below minimum; clamping to {}s",
-                    MIN_INTERVAL_SECS,
-                );
-                Duration::from_secs(MIN_INTERVAL_SECS)
-            }
-            Some(s) => Duration::from_secs(s),
-        };
+        let interval = Self::resolve_interval(interval_secs, mode);
 
         Ok(Self {
             ctx,
@@ -142,6 +151,8 @@ impl HttpSource {
             interval,
             filter,
             last_hash: None,
+            mode,
+            fired_ready: false,
             client: reqwest::Client::builder()
                 // No redirect policy: the safety gate is upstream and
                 // we want the strict "1xx/2xx only" semantics. A
@@ -154,7 +165,29 @@ impl HttpSource {
         })
     }
 
-    /// Bypass parsing + interval clamping. Used by tests that want
+    /// Resolve the poll interval from the caller's request and the mode,
+    /// applying the mode-specific default and floor. `Ready` polls near-instant
+    /// (readiness is time-critical); `Change` keeps the 30s anti-noise floor.
+    fn resolve_interval(interval_secs: Option<u64>, mode: HttpMode) -> Duration {
+        let (default_secs, min_secs) = match mode {
+            HttpMode::Ready => (DEFAULT_READY_INTERVAL_SECS, MIN_READY_INTERVAL_SECS),
+            HttpMode::Change => (DEFAULT_INTERVAL_SECS, MIN_INTERVAL_SECS),
+        };
+        match interval_secs {
+            None => Duration::from_secs(default_secs),
+            Some(s) if s < min_secs => {
+                tracing::warn!(
+                    requested_secs = s,
+                    clamped_to_secs = min_secs,
+                    "http observer interval below minimum for this mode; clamping to {}s",
+                    min_secs,
+                );
+                Duration::from_secs(min_secs)
+            }
+            Some(s) => Duration::from_secs(s),
+        }
+    }
+
     /// sub-second intervals and a wiremock-controlled URL.
     #[cfg(test)]
     pub(crate) fn new_unchecked(
@@ -162,6 +195,7 @@ impl HttpSource {
         target: url::Url,
         interval: Duration,
         filter: Option<String>,
+        mode: HttpMode,
     ) -> Self {
         Self {
             ctx,
@@ -169,6 +203,8 @@ impl HttpSource {
             interval,
             filter,
             last_hash: None,
+            mode,
+            fired_ready: false,
             client: reqwest::Client::new(),
         }
     }
@@ -197,6 +233,14 @@ impl HttpSource {
                 "http observer: non-2xx response, skipping tick"
             );
             return None;
+        }
+
+        // Readiness mode: the first 2xx means "up". Fire once and mark done so
+        // `next_event` completes on the next iteration — no body read, no diff,
+        // filter ignored (any 2xx is ready). #954 item 4.
+        if self.mode == HttpMode::Ready {
+            self.fired_ready = true;
+            return Some(self.event(format!("server ready (HTTP {})", status.as_u16())));
         }
 
         // Cap the body read at 1 MiB. `Stream::take` counts chunks,
@@ -274,6 +318,18 @@ impl ObserverSource for HttpSource {
     }
 
     async fn next_event(&mut self, cancel: Arc<Notify>) -> Option<ObserverEvent> {
+        // Ready mode is one-shot: once the readiness event has fired, the
+        // observer is done and the supervisor reaps it. #954 item 4.
+        if self.fired_ready {
+            return None;
+        }
+        // Ready mode is time-critical: poll immediately on the first
+        // iteration so a server that comes up in a few seconds is reported in
+        // a few seconds, not after a full interval. Change mode keeps its
+        // sleep-first baseline (the first poll only sets the body hash, so a
+        // pre-baseline fire would be a "the server happened to be returning
+        // this content the moment we started" false positive).
+        let mut first_poll = self.mode == HttpMode::Ready;
         loop {
             // Sleep one interval, but wake early on cancel. The
             // `select!` is `biased` so a cancel that arrives during a
@@ -281,17 +337,19 @@ impl ObserverSource for HttpSource {
             // sleep) wins on the next iteration rather than waiting
             // out the sleep.
             //
-            // First-change latency is ~2x the interval: this sleep
-            // elapses before the first poll, and the first poll is
-            // silent (sets the body hash baseline). So with the 60s
-            // default the earliest wake after `start` is ~120s. The
-            // supervisor never short-circuits the baseline, since a
-            // pre-baseline fire would be a "the server happened to be
-            // returning content the moment we started" false positive.
-            tokio::select! {
-                biased;
-                _ = cancel.notified() => return None,
-                _ = tokio::time::sleep(self.interval) => {}
+            // For change mode, first-change latency is ~2x the interval:
+            // this sleep elapses before the first poll, and the first poll
+            // is silent (sets the body hash baseline). The supervisor never
+            // short-circuits the baseline.
+            if first_poll {
+                // Ready mode's first tick: probe now, no sleep.
+                first_poll = false;
+            } else {
+                tokio::select! {
+                    biased;
+                    _ = cancel.notified() => return None,
+                    _ = tokio::time::sleep(self.interval) => {}
+                }
             }
             // Race the request itself against cancel too. If the
             // supervisor signals stop while we're mid-fetch, the
@@ -381,29 +439,42 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn new_rejects_non_http_schemes() {
-        let err = HttpSource::new(ctx(), "file:///etc/passwd", None, None)
+        let err = HttpSource::new(ctx(), "file:///etc/passwd", None, None, HttpMode::Change)
             .expect_err("file:// must be rejected");
         assert!(err.contains("scheme"), "{err}");
-        let err = HttpSource::new(ctx(), "ftp://example.com/", None, None)
+        let err = HttpSource::new(ctx(), "ftp://example.com/", None, None, HttpMode::Change)
             .expect_err("ftp:// must be rejected");
         assert!(err.contains("scheme"), "{err}");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn new_rejects_unparseable_urls() {
-        assert!(HttpSource::new(ctx(), "not a url", None, None).is_err());
-        assert!(HttpSource::new(ctx(), "", None, None).is_err());
+        assert!(HttpSource::new(ctx(), "not a url", None, None, HttpMode::Change).is_err());
+        assert!(HttpSource::new(ctx(), "", None, None, HttpMode::Change).is_err());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn new_clamps_sub_minimum_interval_and_defaults() {
-        let below =
-            HttpSource::new(ctx(), "https://example.com/", Some(5), None).expect("construct");
+        let below = HttpSource::new(
+            ctx(),
+            "https://example.com/",
+            Some(5),
+            None,
+            HttpMode::Change,
+        )
+        .expect("construct");
         assert_eq!(below.interval, Duration::from_secs(MIN_INTERVAL_SECS));
-        let none = HttpSource::new(ctx(), "https://example.com/", None, None).expect("construct");
+        let none = HttpSource::new(ctx(), "https://example.com/", None, None, HttpMode::Change)
+            .expect("construct");
         assert_eq!(none.interval, Duration::from_secs(DEFAULT_INTERVAL_SECS));
-        let exact =
-            HttpSource::new(ctx(), "https://example.com/", Some(45), None).expect("construct");
+        let exact = HttpSource::new(
+            ctx(),
+            "https://example.com/",
+            Some(45),
+            None,
+            HttpMode::Change,
+        )
+        .expect("construct");
         assert_eq!(exact.interval, Duration::from_secs(45));
     }
 
@@ -417,7 +488,13 @@ mod tests {
             .await;
 
         let url: url::Url = server.uri().parse().unwrap();
-        let src = HttpSource::new_unchecked(ctx(), url, Duration::from_millis(50), None);
+        let src = HttpSource::new_unchecked(
+            ctx(),
+            url,
+            Duration::from_millis(50),
+            None,
+            HttpMode::Change,
+        );
         // 3 polls: tick 1 sets the silent baseline, ticks 2–3 see
         // the same body. The wiremock `expect(3..)` proves the source
         // actually polled 3 times — so "no event" isn't "test never
@@ -441,7 +518,13 @@ mod tests {
             .await;
 
         let url: url::Url = server.uri().parse().unwrap();
-        let src = HttpSource::new_unchecked(ctx(), url, Duration::from_millis(50), None);
+        let src = HttpSource::new_unchecked(
+            ctx(),
+            url,
+            Duration::from_millis(50),
+            None,
+            HttpMode::Change,
+        );
         // 3 polls: tick 1 silent (v1), tick 2 fires (v1→v2),
         // tick 3 silent (still v2). Exactly one event.
         let events = run_n_polls(src, 3).await;
@@ -475,11 +558,157 @@ mod tests {
             .await;
 
         let url: url::Url = server.uri().parse().unwrap();
-        let src =
-            HttpSource::new_unchecked(ctx(), url, Duration::from_millis(50), Some("ready".into()));
+        let src = HttpSource::new_unchecked(
+            ctx(),
+            url,
+            Duration::from_millis(50),
+            Some("ready".into()),
+            HttpMode::Change,
+        );
         let events = run_n_polls(src, 3).await;
         assert_eq!(events.len(), 1, "expected exactly one event: {events:?}");
         assert_eq!(events[0].summary, "filtered match: \"ready\"");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ready_mode_fires_on_first_success() {
+        // The dev-server readiness scenario: the target is up and answers
+        // 200. `ready` mode must fire ONCE on that first success — no baseline
+        // silence, no body diff — and then complete. #954 item 4.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("<html>up</html>"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let url: url::Url = server.uri().parse().unwrap();
+        let src =
+            HttpSource::new_unchecked(ctx(), url, Duration::from_millis(50), None, HttpMode::Ready);
+        // Even across 3 ticks the source polls exactly once (`expect(1)`) and
+        // emits a single readiness event, then completes.
+        let events = run_n_polls(src, 3).await;
+        assert_eq!(events.len(), 1, "expected one readiness event: {events:?}");
+        assert_eq!(events[0].summary, "server ready (HTTP 200)");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ready_mode_waits_through_downtime_then_fires() {
+        // While the server is down (5xx), `ready` mode stays silent. When it
+        // finally answers 2xx, it fires once. This is the realistic sequence:
+        // start server → connection errors / 503s → first 200.
+        let server = MockServer::start().await;
+        // First two polls: 503 (still starting up).
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(503))
+            .up_to_n_times(2)
+            .mount(&server)
+            .await;
+        // Then 200 (ready).
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("ok"))
+            .mount(&server)
+            .await;
+
+        let url: url::Url = server.uri().parse().unwrap();
+        let src =
+            HttpSource::new_unchecked(ctx(), url, Duration::from_millis(50), None, HttpMode::Ready);
+        let events = run_n_polls(src, 5).await;
+        assert_eq!(events.len(), 1, "expected one readiness event: {events:?}");
+        assert_eq!(events[0].summary, "server ready (HTTP 200)");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ready_mode_ignores_filter() {
+        // In `ready` mode the filter is irrelevant — any 2xx means ready, even
+        // if the body would not contain the (change-mode) substring.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("nothing matching here"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let url: url::Url = server.uri().parse().unwrap();
+        let src = HttpSource::new_unchecked(
+            ctx(),
+            url,
+            Duration::from_millis(50),
+            Some("this-substring-is-absent".into()),
+            HttpMode::Ready,
+        );
+        let events = run_n_polls(src, 3).await;
+        assert_eq!(
+            events.len(),
+            1,
+            "filter must be ignored in ready mode: {events:?}"
+        );
+        assert_eq!(events[0].summary, "server ready (HTTP 200)");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ready_mode_uses_second_scale_default_and_floor() {
+        // Isaac review: the 30s change-mode floor made ready mode useless — a
+        // service up in 3s looked down for 30. Ready mode has its own, much
+        // lower default and floor.
+        let default_ready =
+            HttpSource::new(ctx(), "https://example.com/", None, None, HttpMode::Ready)
+                .expect("construct");
+        assert_eq!(
+            default_ready.interval,
+            Duration::from_secs(DEFAULT_READY_INTERVAL_SECS),
+            "ready mode must NOT inherit the 60s change default"
+        );
+
+        let clamped_ready = HttpSource::new(
+            ctx(),
+            "https://example.com/",
+            Some(0),
+            None,
+            HttpMode::Ready,
+        )
+        .expect("construct");
+        assert_eq!(
+            clamped_ready.interval,
+            Duration::from_secs(MIN_READY_INTERVAL_SECS),
+            "ready mode floor is 1s, NOT the 30s change floor"
+        );
+
+        // A sub-30s interval that change mode would clamp to 30s is honored
+        // verbatim in ready mode.
+        let honored = HttpSource::new(
+            ctx(),
+            "https://example.com/",
+            Some(3),
+            None,
+            HttpMode::Ready,
+        )
+        .expect("construct");
+        assert_eq!(honored.interval, Duration::from_secs(3));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ready_mode_polls_the_first_tick_without_sleeping() {
+        // The core regression: ready mode must probe immediately, not sleep a
+        // full interval first. With a 10s interval, a sleep-first loop couldn't
+        // fire inside 1s; the immediate first poll makes it near-instant.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("up"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let url: url::Url = server.uri().parse().unwrap();
+        let mut src =
+            HttpSource::new_unchecked(ctx(), url, Duration::from_secs(10), None, HttpMode::Ready);
+        let cancel = Arc::new(Notify::new());
+        // The whole probe must complete well inside one interval.
+        let ev = tokio::time::timeout(Duration::from_secs(1), src.next_event(cancel))
+            .await
+            .expect("ready mode must fire on the first tick, not after a 10s sleep")
+            .expect("a 200 must produce a readiness event");
+        assert_eq!(ev.summary, "server ready (HTTP 200)");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -491,7 +720,13 @@ mod tests {
             .mount(&server)
             .await;
         let url: url::Url = server.uri().parse().unwrap();
-        let src = HttpSource::new_unchecked(ctx(), url, Duration::from_millis(50), None);
+        let src = HttpSource::new_unchecked(
+            ctx(),
+            url,
+            Duration::from_millis(50),
+            None,
+            HttpMode::Change,
+        );
         // 3 polls, every one a 500. The `expect(3..)` confirms we
         // actually polled; the empty events vec confirms we never
         // fired. (The 500 has no body, but more importantly, the
@@ -514,7 +749,8 @@ mod tests {
             .await;
 
         let url: url::Url = server.uri().parse().unwrap();
-        let src = HttpSource::new_unchecked(ctx(), url, Duration::from_secs(1), None);
+        let src =
+            HttpSource::new_unchecked(ctx(), url, Duration::from_secs(1), None, HttpMode::Change);
         // If cancel-during-fetch works, the loop exits within ~1
         // interval. If it didn't, the test would hang on the 30s
         // mock delay.
@@ -555,7 +791,13 @@ mod tests {
             .await;
 
         let url: url::Url = server.uri().parse().unwrap();
-        let src = HttpSource::new_unchecked(ctx(), url, Duration::from_millis(80), None);
+        let src = HttpSource::new_unchecked(
+            ctx(),
+            url,
+            Duration::from_millis(80),
+            None,
+            HttpMode::Change,
+        );
         let events = run_n_polls(src, 3).await;
         // Exactly one event: the truncation-equality poll must NOT
         // fire, and the genuine-change poll MUST.

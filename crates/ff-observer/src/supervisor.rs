@@ -111,6 +111,7 @@ impl ObserverSupervisor {
             target,
             filter,
             interval_secs,
+            http_mode,
         } = spec;
 
         // Spec validation. The tool does its own arg validation, but
@@ -160,7 +161,7 @@ impl ObserverSupervisor {
                     .map_err(|e| format!("file observer: {e}"))?,
             ),
             ObserverKind::Http => Box::new(
-                HttpSource::new(ctx, &target, interval_secs, filter.clone())
+                HttpSource::new(ctx, &target, interval_secs, filter.clone(), http_mode)
                     .map_err(|e| format!("http observer: {e}"))?,
             ),
             ObserverKind::Process => {
@@ -370,6 +371,7 @@ async fn run_source(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::source::HttpMode;
     use std::path::PathBuf;
     fn tempdir_target() -> (tempfile::TempDir, String) {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -384,6 +386,7 @@ mod tests {
             target: target.to_string(),
             filter: None,
             interval_secs: None,
+            http_mode: HttpMode::Change,
         }
     }
 
@@ -496,6 +499,7 @@ mod tests {
                     target,
                     filter: None,
                     interval_secs: None,
+                    http_mode: HttpMode::Change,
                 },
                 "s1"
             )
@@ -509,6 +513,7 @@ mod tests {
                     target: "".into(),
                     filter: None,
                     interval_secs: None,
+                    http_mode: HttpMode::Change,
                 },
                 "s1"
             )
@@ -530,6 +535,7 @@ mod tests {
                     target: "https://example.com/".into(),
                     filter: None,
                     interval_secs: None,
+                    http_mode: HttpMode::Change,
                 },
                 "s1",
             )
@@ -549,6 +555,7 @@ mod tests {
                     target: "not a url".into(),
                     filter: None,
                     interval_secs: None,
+                    http_mode: HttpMode::Change,
                 },
                 "s1",
             )
@@ -571,6 +578,7 @@ mod tests {
                     target: "1".into(),
                     filter: None,
                     interval_secs: None,
+                    http_mode: HttpMode::Change,
                 },
                 "s1",
             )
@@ -597,6 +605,7 @@ mod tests {
                     target: "999".into(),
                     filter: None,
                     interval_secs: None,
+                    http_mode: HttpMode::Change,
                 },
                 "s1",
             )
@@ -617,6 +626,7 @@ mod tests {
                     target: bogus.to_string_lossy().into_owned(),
                     filter: None,
                     interval_secs: None,
+                    http_mode: HttpMode::Change,
                 },
                 "s1",
             )
@@ -644,6 +654,7 @@ mod tests {
                     target,
                     filter: None,
                     interval_secs: None,
+                    http_mode: HttpMode::Change,
                 },
                 "s1",
             )
