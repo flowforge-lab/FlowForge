@@ -12,6 +12,20 @@
 
 ---
 
+## Philosophy
+
+FlowForge harnesses AI's **uniform capability** in service of humanity's
+**non-uniform agency** — while resisting the **uniform politeness** baked in by
+AI training. Three verbs, three layers:
+
+- **Harness** the *structural* layer — an LLM's uniform, tireless attention, as raw material.
+- **Serve** the *user* layer — spiky, personal, non-uniform agency; everything bends to it.
+- **Resist** the *training* layer — RLHF's pull toward deference. An honest partner beats a polite one.
+
+See [`PRINCIPLES.md`](PRINCIPLES.md) for how this becomes the Four Pillars we build by.
+
+---
+
 ## Features
 
 - **Multi-provider LLM** — OpenAI-compatible (Ollama, LM Studio, SiliconFlow, OpenRouter), Anthropic (native Messages API), AWS Bedrock (Converse API)
