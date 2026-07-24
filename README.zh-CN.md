@@ -12,6 +12,19 @@
 
 ---
 
+## 产品哲学
+
+FlowForge 利用 AI 的**均匀 capability**，服务人类的**非均匀 agency**——同时抵抗 AI
+训练里被塞进来的 **uniform politeness** 偏见。三个动词，三层：
+
+- **利用** *结构层*——LLM 均匀、不知疲倦的 attention，作为可锻造的原材料。
+- **服务** *用户层*——人的注意力、意图与意志是尖锐、个人化、非均匀的；一切为个体的 agency 让路，绝不把它抹平。
+- **抵抗** *训练层*——RLHF 把模型推向千篇一律的顺从与谄媚。我们反其道而行：一个诚实的伙伴，胜过一个礼貌的伙伴。
+
+这套哲学如何落成我们据以构建的「四根支柱」，见 [`PRINCIPLES.md`](PRINCIPLES.md)。
+
+---
+
 ## 功能特性
 
 - **多模型支持** — OpenAI 兼容（Ollama、LM Studio、SiliconFlow、OpenRouter）、Anthropic（原生 Messages API）、AWS Bedrock（Converse API）

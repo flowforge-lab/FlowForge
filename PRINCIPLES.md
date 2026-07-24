@@ -11,6 +11,27 @@
 
 ---
 
+## Why FlowForge Exists — The Philosophy
+
+FlowForge harnesses AI's **uniform capability** in service of humanity's
+**non-uniform agency** — while resisting the **uniform politeness** baked in by
+AI training.
+
+Three verbs, three layers:
+
+| Verb | Layer | Meaning |
+|------|-------|---------|
+| **Harness** | Structural — *uniform attention* | An LLM attends evenly across its context window: tireless, even, impersonal. We treat that uniform capability as raw material to be forged into something useful. |
+| **Serve** | User — *non-uniform agency* | Humans are not uniform. Attention, intent, and will are spiky, personal, and shifting. Everything bends to the individual's agency; nothing flattens it. |
+| **Resist** | Training — *RLHF politeness* | RLHF presses models toward uniform deference and sycophancy. We push back — an honest partner is worth more than a polite one. |
+
+The Four Pillars below are this philosophy made concrete. **Pillar 1 (Flow for
+the User)** is the *serve* verb in practice; **Pillar 2 (Efficiency)** is how we
+*harness* capability without waste. *Resist* is the newest and least-encoded of
+the three — it earns its own principles as the product matures.
+
+---
+
 ## The Four Pillars
 
 1. **Flow for the User, First** — the user's flow state is sacred.
