@@ -55,7 +55,7 @@ Goals:
   RFC 0016/0022's *reversible* compaction (verbatim original retained), not a
   one-shot lossy squash.
 
-Non-goals in §8.
+Non-goals in §9.
 
 ## 2. Neuroscience frame
 
@@ -169,7 +169,41 @@ Known hard case, deferred within V2: if a user edited a message inside the share
 prefix, the branches' P diverge. V2 de-dups only up to the first divergence
 point; everything after is kept per-branch.
 
-## 8. Non-goals
+## 8. Frontend surface (V1)
+
+Confluence is not a backend-only feature: like fork (RFC 0006 local-first —
+lineage should be user-visible, not a hidden SQLite edge), it is only usable
+through UI. The inverse of a user-facing gesture is itself a user-facing
+gesture. The following are **in scope for V1** as concrete FE work; only their
+visual form is open (§10), not whether they exist.
+
+- **Selection.** The user must be able to pick the ≥2 same-lineage sessions to
+  conflue. This reuses the shipped fork UI's home — the session sidebar (see the
+  merged single-fork-exit work, #1069) — extended with a multi-select gesture
+  gated on same-lineage eligibility (§5.1). Ineligible (cross-lineage) sessions
+  are non-selectable, which is *how* the same-lineage constraint becomes visible
+  rather than a silent backend rejection.
+- **Trigger + mental model.** Confluence must not read as `git merge`. The
+  trigger affordance and its confirmation copy state plainly that confluence
+  **projects a new derived session and leaves the parents untouched** (§1). This
+  is a UX requirement, not flavor text: without it users will expect their
+  source sessions to be consumed/rewritten.
+- **Lineage visibility.** The same-lineage constraint (§5.1) is meaningless to a
+  user who can't see the fork tree — they won't know which sessions are eligible
+  to conflue. V1 must expose lineage enough to make eligibility legible; the
+  richer fork-tree visualization is the open question in §10, but *some*
+  eligibility cue is V1, not deferred.
+- **Visible V1 consequence (the redundant prefix).** Because V1 appends without
+  de-dup (§7, §9), the confluence transcript contains the shared prefix P once
+  per branch — the user will *see* the repetition in the transcript, not just
+  pay for it in tokens. V1 UX must set this expectation (e.g. a note that
+  de-dup lands in V2) so the repetition reads as a known limitation, not a bug.
+
+None of these require new backend surface beyond what §5 already specifies; they
+are the FE half of the same V1. The visual/interaction design is deliberately
+left to implementation tickets under the epic (#1073) and refined in §10.
+
+## 9. Non-goals
 
 - **Any-session confluence.** Cross-lineage transcript merge is explicitly out.
   Cross-session *semantic* convergence is memory `consolidate`'s job (§3).
@@ -180,9 +214,11 @@ point; everything after is kept per-branch.
 - **Interleaving by timestamp.** Prohibited (§1, tool-pair integrity).
 - **Multi-phenotype runtime.** A confluence binds exactly one phenotype (§5.4).
 
-## 9. Open questions
+## 10. Open questions
 
 - Edited-shared-prefix divergence detection (§7) — heuristic vs. exact.
-- Whether the confluence UI should visualize the fork tree (RFC 0006 local-first:
-  lineage should be user-visible, not a hidden SQLite edge).
+- How the confluence UI visualizes the fork tree (§8 makes lineage *visibility*
+  V1; the richer tree visualization — full graph vs. a lightweight eligibility
+  cue — is the open part). RFC 0006 local-first: lineage should be user-visible,
+  not a hidden SQLite edge.
 - Post-confluence summary threshold defaults (§5.5).
