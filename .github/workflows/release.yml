@@ -153,7 +153,11 @@ jobs:
         timeout-minutes: 5
         with:
           packages: libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev libdbus-1-dev patchelf xdg-utils
-          version: 1.1
+          # Bumped 1.1 -> 1.2 to bust a poisoned apt cache: the 1.1 key for this
+          # package set had a "0 packages" manifest, so cache hits restored nothing
+          # and dbus-1.pc was missing at build time (libdbus-sys panicked). The
+          # version input is part of the cache key, so bumping forces a real install.
+          version: 1.2
 
       - uses: dtolnay/rust-toolchain@stable
         with:
