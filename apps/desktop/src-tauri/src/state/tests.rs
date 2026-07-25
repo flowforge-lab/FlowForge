@@ -3039,6 +3039,32 @@ fn observer_wake_is_not_persisted_to_session_history() {
 }
 
 #[test]
+fn has_buffered_observer_events_tracks_buffer_state() {
+    // #1095: the turn-completion tail uses this read-only probe to decide
+    // whether to spawn a drain turn. It must be false before any push, true
+    // while a wake sits buffered, and false again once drained.
+    let state = AppState::new();
+    let s = state.store.create_session(None);
+
+    assert!(
+        !state.has_buffered_observer_events(&s.id),
+        "no wakes buffered initially"
+    );
+
+    state.buffer_observer_event(&s.id, test_observer_event(&s.id, "ci", "CHECKS_DONE"));
+    assert!(
+        state.has_buffered_observer_events(&s.id),
+        "true while a wake is buffered — the tail would spawn a drain turn"
+    );
+
+    let _ = state.drain_observer_buffer(&s.id);
+    assert!(
+        !state.has_buffered_observer_events(&s.id),
+        "false after drain — no re-spawn, so the drain turn terminates"
+    );
+}
+
+#[test]
 fn woken_agent_still_sees_the_wake_context() {
     // Intent preserved: after moving wakes off the transcript, a woken turn
     // must still RECEIVE them — as transient request-only context.
@@ -3061,6 +3087,27 @@ fn woken_agent_still_sees_the_wake_context() {
         ctx.contains("build") && ctx.contains("BUILD SUCCEEDED"),
         "second wake present"
     );
+}
+
+#[test]
+fn should_spawn_drain_gates_on_idle_buffered_and_cap() {
+    use crate::{should_spawn_drain, MAX_DRAIN_TURNS};
+
+    // Happy path: idle, wakes buffered, under the cap -> spawn a drain turn.
+    assert!(should_spawn_drain(true, true, 0));
+    assert!(should_spawn_drain(true, true, MAX_DRAIN_TURNS - 1));
+
+    // Cap reached (#1096): stop spawning even though idle + buffered still hold,
+    // so a wake a drain turn re-triggers can't loop unbounded.
+    assert!(!should_spawn_drain(true, true, MAX_DRAIN_TURNS));
+    assert!(!should_spawn_drain(true, true, MAX_DRAIN_TURNS + 5));
+
+    // Not idle (a successor turn is already live, #1018): never spawn a competitor.
+    assert!(!should_spawn_drain(false, true, 0));
+
+    // Nothing buffered: nothing to drain.
+    assert!(!should_spawn_drain(true, false, 0));
+    assert!(!should_spawn_drain(false, false, 0));
 }
 
 #[test]

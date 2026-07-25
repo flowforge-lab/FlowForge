@@ -303,6 +303,17 @@ impl ObserverSupervisor {
             .map(|q| q.into_iter().collect())
             .unwrap_or_default()
     }
+
+    /// Whether `session_id` has any buffered (deferred) events awaiting a
+    /// drain. Read-only — does not clear. The pump checks this when a turn
+    /// completes to decide whether to spawn a drain turn (#1095).
+    pub fn has_buffered(&self, session_id: &str) -> bool {
+        self.buffer
+            .lock()
+            .unwrap()
+            .get(session_id)
+            .is_some_and(|q| !q.is_empty())
+    }
 }
 
 impl Drop for ObserverSupervisor {
@@ -440,6 +451,7 @@ mod tests {
             summary: "modified foo".into(),
         };
         sup.buffer_event("s1", ev.clone());
+        assert!(sup.has_buffered("s1"), "has_buffered true after first push");
         sup.buffer_event(
             "s1",
             ObserverEvent {
@@ -455,6 +467,15 @@ mod tests {
         assert_eq!(drained[1].id, 43);
         // Subsequent drain is empty.
         assert!(sup.drain_buffer("s1").is_empty());
+        // ...and has_buffered reflects the now-empty buffer (#1095).
+        assert!(!sup.has_buffered("s1"), "has_buffered false after drain");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn has_buffered_false_for_unknown_or_empty_session() {
+        let (sup, _rx) = ObserverSupervisor::new();
+        // Never-seen session: no entry at all.
+        assert!(!sup.has_buffered("nobody"));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
