@@ -3090,6 +3090,27 @@ fn woken_agent_still_sees_the_wake_context() {
 }
 
 #[test]
+fn should_spawn_drain_gates_on_idle_buffered_and_cap() {
+    use crate::{should_spawn_drain, MAX_DRAIN_TURNS};
+
+    // Happy path: idle, wakes buffered, under the cap -> spawn a drain turn.
+    assert!(should_spawn_drain(true, true, 0));
+    assert!(should_spawn_drain(true, true, MAX_DRAIN_TURNS - 1));
+
+    // Cap reached (#1096): stop spawning even though idle + buffered still hold,
+    // so a wake a drain turn re-triggers can't loop unbounded.
+    assert!(!should_spawn_drain(true, true, MAX_DRAIN_TURNS));
+    assert!(!should_spawn_drain(true, true, MAX_DRAIN_TURNS + 5));
+
+    // Not idle (a successor turn is already live, #1018): never spawn a competitor.
+    assert!(!should_spawn_drain(false, true, 0));
+
+    // Nothing buffered: nothing to drain.
+    assert!(!should_spawn_drain(true, false, 0));
+    assert!(!should_spawn_drain(false, false, 0));
+}
+
+#[test]
 fn near_budget_clamps_tiny_connection_value_to_floor() {
     // #1045 finding 3: a mis-set connection field (or env) must be clamped to the
     // Near-budget floor in the BE seam, so the UI is not the only line of defense

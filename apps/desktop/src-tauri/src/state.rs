@@ -2327,10 +2327,12 @@ impl AppState {
         self.observer_supervisor.drain_buffer(session_id)
     }
 
-    /// Whether `session_id` has observer wakes buffered while a turn was in
-    /// flight. Read-only. The turn-completion tail checks this to decide
-    /// whether to spawn a drain turn so buffered wakes are not stranded
-    /// when no further input follows (#1095).
+    /// Whether `session_id` has any buffered observer wakes — events deferred
+    /// because they fired while a turn was in flight, *or* buffered while no
+    /// turn was running (e.g. right after an observer registers). Read-only.
+    /// The turn-completion tail checks this to decide whether to spawn a drain
+    /// turn so buffered wakes are not stranded when no further input follows
+    /// (#1095).
     pub fn has_buffered_observer_events(&self, session_id: &str) -> bool {
         self.observer_supervisor.has_buffered(session_id)
     }

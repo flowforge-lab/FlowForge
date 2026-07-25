@@ -1396,7 +1396,7 @@ fn send_message(
             _ => state.store.add_message(&session_id, Role::User, content),
         };
 
-    spawn_assistant_turn(state.inner().clone(), app, session_id);
+    spawn_assistant_turn(state.inner().clone(), app, session_id, 0);
 
     Ok(user_msg.id)
 }
@@ -1476,7 +1476,7 @@ pub(crate) async fn wake_session_for_observer(
         observer_id = observer_id,
         "observer wake spawning turn"
     );
-    spawn_assistant_turn(state.clone(), app.clone(), session_id);
+    spawn_assistant_turn(state.clone(), app.clone(), session_id, 0);
 }
 
 /// Bridge one background process's live output to the frontend (#873). Spawned
@@ -1569,13 +1569,40 @@ fn observer_wake_context(events: &[ff_observer::ObserverEvent]) -> Option<String
     ))
 }
 
+/// Max consecutive observer-driven drain turns before we stop auto-spawning
+/// successors (#1096). Bounds the self-sustaining loop where a drain turn writes
+/// a file that an observer watches, which re-buffers a wake, which would spawn
+/// another drain turn, and so on. On cap the buffer is *retained* (not spawned,
+/// not cleared) so the next real user turn drains it — no silent wake drop.
+const MAX_DRAIN_TURNS: u32 = 3;
+
+/// Decide whether the post-turn tail should spawn a successor "drain" turn to
+/// surface observer wakes buffered during the turn (#1095). Pure so the cap
+/// boundary is unit-testable without driving `run_turn`. Spawn only when the
+/// session went genuinely idle (#1018), wakes are actually buffered, and we
+/// haven't hit the consecutive-drain cap (#1096).
+fn should_spawn_drain(went_idle: bool, has_buffered: bool, drain_count: u32) -> bool {
+    went_idle && has_buffered && drain_count < MAX_DRAIN_TURNS
+}
+
 /// Set up and spawn the assistant turn for `session_id`: snapshots the provider,
 /// resolves the session's phenotype/mode, builds the tool registry + system
 /// prompt, runs the turn (streaming over `turn:*` / `tool:*`), and folds the
 /// per-turn telemetry. Shared by `send_message` (after persisting the user turn)
 /// and `edit_message` (after editing + truncating), so both paths run identical
 /// turn semantics.
-fn spawn_assistant_turn(state: Arc<AppState>, app: tauri::AppHandle, session_id: String) {
+///
+/// `drain_count` is the number of consecutive observer-driven "drain" turns that
+/// led here (#1096): `0` for a normal user- or observer-initiated turn, and
+/// `n+1` when the post-turn tail spawns a successor to surface wakes buffered
+/// during a turn that went idle. Bounded by [`MAX_DRAIN_TURNS`] via
+/// [`should_spawn_drain`] so a self-sustaining wake loop can't run unbounded.
+fn spawn_assistant_turn(
+    state: Arc<AppState>,
+    app: tauri::AppHandle,
+    session_id: String,
+    drain_count: u32,
+) {
     // Drain any observer wakes deferred while a turn was in flight and
     // surface them to THIS turn as transient, request-only context
     // (#1018 Path B) — never as persisted `Role::User` rows. A wake is
@@ -2000,13 +2027,28 @@ fn spawn_assistant_turn(state: Arc<AppState>, app: tauri::AppHandle, session_id:
         // the buffer on its own start. Terminates: the spawned turn drains
         // (empties) the buffer at its entry, so it only re-spawns again if a
         // *new* wake fires during it, which is exactly when another report is
-        // warranted.
-        if went_idle && state.has_buffered_observer_events(&sid) {
+        // warranted — and even then `MAX_DRAIN_TURNS` (#1096) caps consecutive
+        // drain turns so a wake that a drain turn itself re-triggers (e.g. it
+        // writes a watched file) can't loop unbounded.
+        let has_buffered = state.has_buffered_observer_events(&sid);
+        if should_spawn_drain(went_idle, has_buffered, drain_count) {
             tracing::info!(
                 session_id = %sid,
+                drain_count,
                 "turn idle with buffered observer wakes; spawning drain turn (#1095)"
             );
-            spawn_assistant_turn(state.clone(), app.clone(), sid.clone());
+            spawn_assistant_turn(state.clone(), app.clone(), sid.clone(), drain_count + 1);
+        } else if went_idle && has_buffered {
+            // Cap reached: stop spawning, but do NOT drain/clear the buffer.
+            // Leaving it intact means the next real user turn surfaces these
+            // wakes on its own entry — so we bound the loop without recreating
+            // the silent-wake-drop this whole bug class (#1090/#1095) is about.
+            tracing::warn!(
+                session_id = %sid,
+                drain_count,
+                "observer drain-turn cap (MAX_DRAIN_TURNS) reached; \
+                 buffered wakes retained for the next user turn (#1096)"
+            );
         }
     });
 }
@@ -2594,7 +2636,7 @@ fn edit_message(
         .edit_user_message(&session_id, &message_id, content, attachments)
         .map_err(|e| e.to_string())?;
 
-    spawn_assistant_turn(state.inner().clone(), app, session_id);
+    spawn_assistant_turn(state.inner().clone(), app, session_id, 0);
 
     Ok(edited_id)
 }
