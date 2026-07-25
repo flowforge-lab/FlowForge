@@ -166,6 +166,13 @@ flowforge run --deny "audit src/ for unused dependencies"
 
 # Interactive REPL (default when no subcommand is given)
 flowforge
+
+# Inspect or write durable memory directly (RFC 0006) — same store the agent's
+# memory_* tools use, no agent turn required
+flowforge memory search "rust preferences"
+flowforge memory get MEMORY.md --lines 1:20
+flowforge memory write "shipped m5.1"
+flowforge memory write "L5 SDE on Maps" --curated --stratum identity
 ```
 
 ### Exit codes

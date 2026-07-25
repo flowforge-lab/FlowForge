@@ -26,6 +26,7 @@ async-trait = { workspace = true }
 futures-util = { workspace = true }
 serde_json = { workspace = true }
 dirs = { workspace = true }
+chrono = { workspace = true }
 # OS keychain backends, per-target like the desktop (#724). The CLI is its own
 # binary and has no shared keychain crate, so each platform links the backend
 # it needs. macOS also links security-framework for the Data Protection
