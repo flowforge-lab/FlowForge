@@ -19,12 +19,9 @@
 //! task that owns the write half. No `&mut` to the socket is ever shared.
 
 use async_trait::async_trait;
-use futures_util::stream::SplitStream;
 use futures_util::StreamExt;
-use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 use ff_transport::{ChannelId, InboundMessage, Notification};
 use ff_transport::{MessageTransport, ResponseStream};
@@ -36,9 +33,6 @@ use crate::writer::{spawn_writer, OutboundOp, WriterHandle};
 
 /// The transport name reported to the Router and stamped on every [`ChannelId`].
 pub const TRANSPORT_NAME: &str = "slack";
-
-/// The WebSocket read half owned by the reader task.
-type WsStream = SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>;
 
 /// A Slack Socket Mode transport.
 ///
@@ -97,6 +91,7 @@ impl SlackTransport {
     /// Ask Slack for a single-use WSS URL via `apps.connections.open`.
     async fn open_connection_url(
         &self,
+        http: &reqwest::Client,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         #[derive(serde::Deserialize)]
         struct OpenResp {
@@ -104,7 +99,7 @@ impl SlackTransport {
             url: Option<String>,
             error: Option<String>,
         }
-        let resp: OpenResp = reqwest::Client::new()
+        let resp: OpenResp = http
             .post(&self.connections_open_url)
             .bearer_auth(&self.app_token)
             .send()
@@ -124,12 +119,19 @@ impl SlackTransport {
 
     /// Spawn the reader task: parse frames and fan out to inbound / interaction
     /// queues, acking through the shared writer. Ends when the socket closes.
-    fn spawn_reader(
-        mut ws_stream: WsStream,
+    ///
+    /// Generic over the frame stream so tests can drive it with a scripted
+    /// in-memory stream instead of a live TLS socket; production passes the
+    /// split WebSocket read half.
+    pub(crate) fn spawn_reader<S, E>(
+        mut ws_stream: S,
         writer: WriterHandle,
         inbound_tx: mpsc::Sender<InboundMessage>,
         interaction_tx: mpsc::Sender<SlackInteraction>,
-    ) {
+    ) where
+        S: futures_util::Stream<Item = Result<Message, E>> + Unpin + Send + 'static,
+        E: Send + 'static,
+    {
         tokio::spawn(async move {
             while let Some(frame) = ws_stream.next().await {
                 let text = match frame {
@@ -182,17 +184,21 @@ impl MessageTransport for SlackTransport {
     }
 
     async fn connect(&mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let url = self.open_connection_url().await?;
+        // One HTTP client, shared by the connect handshake and every Web API
+        // call, so they pool connections instead of each building their own.
+        let http = reqwest::Client::new();
+
+        let url = self.open_connection_url(&http).await?;
         let (ws, _resp) = tokio_tungstenite::connect_async(&url).await?;
         let (sink, stream) = ws.split();
 
-        let mut api = SlackApi::new(self.bot_token.clone());
+        let mut api = SlackApi::new(self.bot_token.clone()).with_client(http);
         if let Some(base) = &self.api_base {
             api = api.with_base(base.clone());
         }
 
         // Writer owns the sink; reader owns the stream. Both share the handle.
-        let writer = spawn_writer(sink, api, None);
+        let writer = spawn_writer(sink, api);
 
         let (inbound_tx, inbound_rx) = mpsc::channel::<InboundMessage>(64);
         let (interaction_tx, interaction_rx) = mpsc::channel::<SlackInteraction>(64);

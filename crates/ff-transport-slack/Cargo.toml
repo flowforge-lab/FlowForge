@@ -14,7 +14,8 @@ async-trait.workspace = true
 tokio = { workspace = true }
 tokio-tungstenite = { workspace = true }
 futures-util.workspace = true
-reqwest = { workspace = true, features = ["json", "rustls-tls"] }
+reqwest = { workspace = true, features = ["json", "rustls-tls-webpki-roots"] }
+tracing.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

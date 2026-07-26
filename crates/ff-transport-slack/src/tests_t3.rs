@@ -9,15 +9,75 @@
 use std::time::Duration;
 
 use ff_transport::ResponseStream;
+use tokio::sync::mpsc;
 use wiremock::matchers::{body_string_contains, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use crate::api::SlackApi;
-use crate::response::{SlackResponseStream, SLACK_TEXT_LIMIT};
+use crate::response::{SlackResponseStream, EDIT_THROTTLE, SLACK_TEXT_LIMIT};
 use crate::writer::{OutboundOp, WriterHandle};
 
-/// Drain every op currently queued without blocking.
-fn drain(rx: &mut tokio::sync::mpsc::Receiver<OutboundOp>) -> Vec<OutboundOp> {
+/// A writer-task stand-in for the stream tests.
+///
+/// The real writer, on a `Post`, calls `chat.postMessage`, gets a `ts`, and
+/// reports it back through the op's `ts_tx`. `SlackResponseStream::flush` now
+/// *awaits* that `ts` before returning (so the next flush edits in place rather
+/// than posting a duplicate — the bug this all guards). A test that fed a bare
+/// receiver would therefore deadlock. This double closes the loop: it answers
+/// every `Post` with a synthetic, monotonically increasing `ts` and mirrors each
+/// op — as an inspectable [`SentOp`] with the `ts` it assigned — onto a channel
+/// the test drains.
+#[derive(Debug, Clone, PartialEq)]
+enum SentOp {
+    Ack {
+        envelope_id: String,
+    },
+    Post {
+        channel: String,
+        text: String,
+        ts: String,
+    },
+    Update {
+        channel: String,
+        ts: String,
+        text: String,
+    },
+}
+
+/// Spawn the double. Returns the [`WriterHandle`] the stream posts through and a
+/// receiver of the mirrored [`SentOp`]s, in the order the double handled them.
+fn auto_answer_writer() -> (WriterHandle, mpsc::Receiver<SentOp>) {
+    let (writer, mut raw_rx) = WriterHandle::channel_for_test();
+    let (obs_tx, obs_rx) = mpsc::channel::<SentOp>(256);
+    tokio::spawn(async move {
+        let mut next_ts = 100u64;
+        while let Some(op) = raw_rx.recv().await {
+            let sent = match op {
+                OutboundOp::Ack { envelope_id } => SentOp::Ack { envelope_id },
+                OutboundOp::Post {
+                    channel,
+                    text,
+                    ts_tx,
+                } => {
+                    next_ts += 1;
+                    let ts = format!("{next_ts}.000");
+                    // Mirror the real writer: report the assigned ts back so the
+                    // stream records it. Ignore send errors (stream gone).
+                    let _ = ts_tx.send(ts.clone());
+                    SentOp::Post { channel, text, ts }
+                }
+                OutboundOp::Update { channel, ts, text } => SentOp::Update { channel, ts, text },
+            };
+            if obs_tx.send(sent).await.is_err() {
+                break;
+            }
+        }
+    });
+    (writer, obs_rx)
+}
+
+/// Drain every mirrored op the double has handled so far, without blocking.
+fn drain(rx: &mut mpsc::Receiver<SentOp>) -> Vec<SentOp> {
     let mut out = Vec::new();
     while let Ok(op) = rx.try_recv() {
         out.push(op);
@@ -25,26 +85,38 @@ fn drain(rx: &mut tokio::sync::mpsc::Receiver<OutboundOp>) -> Vec<OutboundOp> {
     out
 }
 
+/// Block until at least `n` ops have been mirrored, then return all drained so
+/// far. Because `flush` awaits each `Post`'s `ts`, once the stream call returns
+/// the double has already handled and mirrored that op — so a bounded wait is a
+/// deterministic sync point, not a race.
+async fn recv_at_least(rx: &mut mpsc::Receiver<SentOp>, n: usize) -> Vec<SentOp> {
+    let mut out = Vec::new();
+    while out.len() < n {
+        match rx.recv().await {
+            Some(op) => out.push(op),
+            None => break,
+        }
+    }
+    out.extend(drain(rx));
+    out
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn short_reply_posts_one_message() {
-    let (writer, mut rx) = WriterHandle::channel_for_test();
+    let (writer, mut rx) = auto_answer_writer();
     let stream = SlackResponseStream::new("C123", writer);
 
     stream.chunk("hello world").await;
     stream.finish().await;
 
-    let ops = drain(&mut rx);
-    // One part → one Post, no overflow.
+    let ops = recv_at_least(&mut rx, 1).await;
+    // One part → one Post; finish re-flushes the same body, which is a no-op
+    // (nothing changed), so no duplicate Post and no spurious Update.
     assert_eq!(ops.len(), 1, "expected a single post, got {ops:?}");
     match &ops[0] {
-        OutboundOp::Post {
-            channel,
-            text,
-            part_index,
-        } => {
+        SentOp::Post { channel, text, .. } => {
             assert_eq!(channel, "C123");
             assert_eq!(text, "hello world");
-            assert_eq!(*part_index, 0);
         }
         other => panic!("expected Post, got {other:?}"),
     }
@@ -52,7 +124,7 @@ async fn short_reply_posts_one_message() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reply_over_limit_splits_into_parts() {
-    let (writer, mut rx) = WriterHandle::channel_for_test();
+    let (writer, mut rx) = auto_answer_writer();
     let stream = SlackResponseStream::new("C1", writer);
 
     // 3000 + 500 chars → two parts (first exactly at the limit, second the rest).
@@ -60,14 +132,14 @@ async fn reply_over_limit_splits_into_parts() {
     stream.chunk(&body).await;
     stream.finish().await;
 
-    let ops = drain(&mut rx);
-    let posts: Vec<&OutboundOp> = ops
+    let ops = recv_at_least(&mut rx, 2).await;
+    let posts: Vec<&SentOp> = ops
         .iter()
-        .filter(|o| matches!(o, OutboundOp::Post { .. }))
+        .filter(|o| matches!(o, SentOp::Post { .. }))
         .collect();
     assert_eq!(posts.len(), 2, "expected 2 continuation parts, got {ops:?}");
     for op in &posts {
-        if let OutboundOp::Post { text, .. } = op {
+        if let SentOp::Post { text, .. } = op {
             assert!(
                 text.len() <= SLACK_TEXT_LIMIT,
                 "each part must respect the 3000-char limit, got {}",
@@ -75,20 +147,11 @@ async fn reply_over_limit_splits_into_parts() {
             );
         }
     }
-    // Parts are ordered 0,1.
-    let indices: Vec<usize> = posts
-        .iter()
-        .filter_map(|o| match o {
-            OutboundOp::Post { part_index, .. } => Some(*part_index),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(indices, vec![0, 1]);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn multibyte_split_never_breaks_a_char() {
-    let (writer, mut rx) = WriterHandle::channel_for_test();
+    let (writer, mut rx) = auto_answer_writer();
     let stream = SlackResponseStream::new("C1", writer);
 
     // '€' is 3 bytes; a body of them forces a split that must land on a char
@@ -97,11 +160,11 @@ async fn multibyte_split_never_breaks_a_char() {
     stream.chunk(&body).await;
     stream.finish().await;
 
-    let ops = drain(&mut rx);
+    let ops = recv_at_least(&mut rx, 3).await;
     let total: String = ops
         .iter()
         .filter_map(|o| match o {
-            OutboundOp::Post { text, .. } => Some(text.clone()),
+            SentOp::Post { text, .. } => Some(text.clone()),
             _ => None,
         })
         .collect();
@@ -113,13 +176,18 @@ async fn multibyte_split_never_breaks_a_char() {
 async fn rapid_chunks_coalesce_then_finish_flushes() {
     // With time paused, successive `chunk`s inside the throttle window must
     // coalesce to a single edit; `finish` then forces the final body out.
-    let (writer, mut rx) = WriterHandle::channel_for_test();
+    let (writer, mut rx) = auto_answer_writer();
     let stream = SlackResponseStream::new("C1", writer);
 
-    // First chunk flushes immediately (no prior flush) → one Post(part 0).
+    // First chunk flushes immediately (no prior flush) → one Post(part 0). The
+    // double answers its ts, so the stream now knows to edit rather than re-post.
     stream.chunk("v1").await;
-    // Simulate the writer assigning a ts so later flushes edit in place.
-    stream.record_ts(0, "111.000".to_string());
+    let first = recv_at_least(&mut rx, 1).await;
+    assert_eq!(first.len(), 1);
+    let posted_ts = match &first[0] {
+        SentOp::Post { ts, .. } => ts.clone(),
+        other => panic!("expected initial Post, got {other:?}"),
+    };
 
     // These arrive within EDIT_THROTTLE (time is paused, 0 elapsed) → coalesced,
     // no new ops emitted.
@@ -127,24 +195,22 @@ async fn rapid_chunks_coalesce_then_finish_flushes() {
     stream.chunk("v1 v2 v3").await;
 
     let after_rapid = drain(&mut rx);
-    assert_eq!(
-        after_rapid.len(),
-        1,
-        "first chunk posts once; the two rapid follow-ups coalesce: {after_rapid:?}"
+    assert!(
+        after_rapid.is_empty(),
+        "rapid follow-ups within the window coalesce, emitting nothing: {after_rapid:?}"
     );
-    assert!(matches!(after_rapid[0], OutboundOp::Post { .. }));
 
     // finish() bypasses the throttle and flushes the latest body as an edit.
     stream.finish().await;
-    let after_finish = drain(&mut rx);
+    let after_finish = recv_at_least(&mut rx, 1).await;
     assert_eq!(
         after_finish.len(),
         1,
         "finish flushes once: {after_finish:?}"
     );
     match &after_finish[0] {
-        OutboundOp::Update { ts, text, .. } => {
-            assert_eq!(ts, "111.000", "edit targets the posted message");
+        SentOp::Update { ts, text, .. } => {
+            assert_eq!(*ts, posted_ts, "edit targets the posted message");
             assert_eq!(text, "v1 v2 v3", "final coalesced body wins");
         }
         other => panic!("expected an Update on finish, got {other:?}"),
@@ -153,22 +219,25 @@ async fn rapid_chunks_coalesce_then_finish_flushes() {
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn edit_after_throttle_window_flushes() {
-    let (writer, mut rx) = WriterHandle::channel_for_test();
+    let (writer, mut rx) = auto_answer_writer();
     let stream = SlackResponseStream::new("C1", writer);
 
     stream.chunk("first").await; // immediate post
-    stream.record_ts(0, "222.000".to_string());
-    let _ = drain(&mut rx);
+    let first = recv_at_least(&mut rx, 1).await;
+    let posted_ts = match &first[0] {
+        SentOp::Post { ts, .. } => ts.clone(),
+        other => panic!("expected initial Post, got {other:?}"),
+    };
 
     // Advance past the throttle window; the next chunk should flush as an edit.
     tokio::time::advance(Duration::from_millis(600)).await;
     stream.chunk("first second").await;
 
-    let ops = drain(&mut rx);
+    let ops = recv_at_least(&mut rx, 1).await;
     assert_eq!(ops.len(), 1, "a chunk past the window flushes: {ops:?}");
     match &ops[0] {
-        OutboundOp::Update { ts, text, .. } => {
-            assert_eq!(ts, "222.000");
+        SentOp::Update { ts, text, .. } => {
+            assert_eq!(*ts, posted_ts);
             assert_eq!(text, "first second");
         }
         other => panic!("expected Update, got {other:?}"),
@@ -234,4 +303,208 @@ async fn web_api_surfaces_slack_error() {
         err.to_string().contains("channel_not_found"),
         "error should surface Slack's reason: {err}"
     );
+}
+
+/// End-to-end regression lock for the `ts` round-trip (Isaac review #1/#2): the
+/// **real** writer task + **real** `SlackApi` (pointed at a wiremock) + **real**
+/// `SlackResponseStream`. A first flush posts; a later flush must *edit that same
+/// message* — i.e. exactly one `chat.postMessage` then one `chat.update`.
+///
+/// Before the fix, the writer never reported the assigned `ts` back to the
+/// stream, so the second flush posted a *duplicate* instead of editing. That
+/// bug produced two `chat.postMessage` calls and zero `chat.update` — which this
+/// test's `.expect(1)` mounts would fail on. (Verified by mutation: dropping the
+/// `ts_tx.send` in the writer turns this red.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn end_to_end_post_then_edit_through_real_writer() {
+    use futures_util::sink::drain;
+    use tokio_tungstenite::tungstenite::Message;
+
+    let server = MockServer::start().await;
+
+    // postMessage returns a ts; assert it's called exactly once.
+    Mock::given(method("POST"))
+        .and(path("/chat.postMessage"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({ "ok": true, "ts": "1700000000.000100" })),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    // The edit must target the ts postMessage returned, and fire exactly once.
+    Mock::given(method("POST"))
+        .and(path("/chat.update"))
+        .and(body_string_contains("1700000000.000100"))
+        .and(body_string_contains("hello world"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({ "ok": true, "ts": "1700000000.000100" })),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    // Real writer over a no-op socket sink; real API at the mock server.
+    let api = SlackApi::new("xoxb-test").with_base(server.uri());
+    let writer = crate::writer::spawn_writer(drain::<Message>(), api);
+    let stream = SlackResponseStream::new("C1", writer);
+
+    // First flush → postMessage; the writer reports the ts back and the stream
+    // records it (flush awaits that before returning).
+    stream.chunk("hello").await;
+    // A later, changed body must edit the same message, not post a new one.
+    tokio::time::sleep(Duration::from_millis(EDIT_THROTTLE.as_millis() as u64 + 50)).await;
+    stream.chunk("hello world").await;
+    stream.finish().await;
+
+    // Give the async writer task a beat to drive the chat.update call before the
+    // server's `.expect(1)` verification on drop.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    // MockServer verifies the `.expect(1)` counts on drop: exactly one post,
+    // exactly one update. Two posts (the old bug) or zero updates fails here.
+}
+
+// ── reader demux (#912 T3 acceptance: envelopes fan out; interactions split
+// off the Router path; every inbound frame is acked) ──────────────────────────
+//
+// `spawn_reader` is generic over the frame stream, so these drive it with a
+// scripted in-memory stream instead of a live TLS socket — the reader path the
+// PR claims to deliver but previously had zero coverage.
+mod reader {
+    use super::*;
+    use crate::envelope::SlackInteraction;
+    use crate::transport::SlackTransport;
+    use ff_transport::InboundMessage;
+    use tokio_tungstenite::tungstenite::Message;
+
+    const USER_MESSAGE: &str = r#"{
+      "envelope_id": "env-msg-1",
+      "type": "events_api",
+      "payload": {
+        "type": "event_callback",
+        "event": {
+          "type": "message",
+          "channel": "C01234567",
+          "user": "U99999999",
+          "text": "deploy the thing",
+          "ts": "1548261231.000200"
+        }
+      }
+    }"#;
+
+    const BLOCK_ACTIONS: &str = r#"{
+      "envelope_id": "env-int-1",
+      "type": "interactive",
+      "payload": {
+        "type": "block_actions",
+        "user": { "id": "U99999999", "username": "tony" },
+        "channel": { "id": "C01234567", "name": "dev" },
+        "message": { "ts": "1548261231.000200", "text": "Approve deploy?" },
+        "response_url": "https://hooks.slack.com/actions/T0/1/xyz",
+        "actions": [
+          { "type": "button", "action_id": "approve", "block_id": "gate", "value": "decision-42" }
+        ]
+      }
+    }"#;
+
+    /// Feed a scripted list of text frames through `spawn_reader` and return the
+    /// three receivers: inbound messages, interactions, and the writer's ops
+    /// (where acks land). `Never` is an error type the stream never produces.
+    enum Never {}
+    fn run_reader(
+        frames: Vec<Message>,
+    ) -> (
+        mpsc::Receiver<InboundMessage>,
+        mpsc::Receiver<SlackInteraction>,
+        mpsc::Receiver<SentOp>,
+    ) {
+        let stream = futures_util::stream::iter(
+            frames
+                .into_iter()
+                .map(Ok::<Message, Never>)
+                .collect::<Vec<_>>(),
+        );
+        let (writer, ops_rx) = auto_answer_writer();
+        let (inbound_tx, inbound_rx) = mpsc::channel::<InboundMessage>(64);
+        let (interaction_tx, interaction_rx) = mpsc::channel::<SlackInteraction>(64);
+        SlackTransport::spawn_reader(stream, writer, inbound_tx, interaction_tx);
+        (inbound_rx, interaction_rx, ops_rx)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn message_envelope_fans_out_and_is_acked() {
+        let (mut inbound_rx, _int_rx, mut ops_rx) =
+            run_reader(vec![Message::Text(USER_MESSAGE.to_string())]);
+
+        let msg = inbound_rx
+            .recv()
+            .await
+            .expect("a message on the inbound path");
+        assert_eq!(msg.text, "deploy the thing");
+        assert_eq!(msg.channel.platform_id, "C01234567");
+        assert_eq!(msg.sender_id, "U99999999");
+
+        // Every inbound envelope must be acked on the socket.
+        let ops = recv_at_least(&mut ops_rx, 1).await;
+        assert!(
+            ops.iter()
+                .any(|o| matches!(o, SentOp::Ack { envelope_id } if envelope_id == "env-msg-1")),
+            "message envelope must be acked: {ops:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn interaction_splits_off_router_path_and_is_acked() {
+        let (mut inbound_rx, mut int_rx, mut ops_rx) =
+            run_reader(vec![Message::Text(BLOCK_ACTIONS.to_string())]);
+
+        let int = int_rx
+            .recv()
+            .await
+            .expect("an interaction on the side path");
+        assert_eq!(int.action_id, "approve");
+        assert_eq!(int.value.as_deref(), Some("decision-42"));
+        assert_eq!(int.channel.platform_id, "C01234567");
+
+        let ops = recv_at_least(&mut ops_rx, 1).await;
+        assert!(
+            ops.iter()
+                .any(|o| matches!(o, SentOp::Ack { envelope_id } if envelope_id == "env-int-1")),
+            "interaction envelope must be acked: {ops:?}"
+        );
+
+        // Interactions must NOT reach the Router's inbound queue.
+        assert!(
+            inbound_rx.try_recv().is_err(),
+            "interaction must not land on the inbound (Router) path"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn hello_has_no_side_effects() {
+        let hello = r#"{ "type": "hello" }"#;
+        let (mut inbound_rx, mut int_rx, mut ops_rx) =
+            run_reader(vec![Message::Text(hello.to_string())]);
+
+        // Nothing fanned out, nothing acked; the stream then ends.
+        assert!(inbound_rx.recv().await.is_none());
+        assert!(int_rx.try_recv().is_err());
+        assert!(drain(&mut ops_rx).is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn disconnect_ends_the_reader_loop() {
+        // A disconnect before a second message means the second is never seen.
+        let disconnect = r#"{ "type": "disconnect", "reason": "refresh" }"#;
+        let (mut inbound_rx, _int_rx, _ops_rx) = run_reader(vec![
+            Message::Text(disconnect.to_string()),
+            Message::Text(USER_MESSAGE.to_string()),
+        ]);
+        assert!(
+            inbound_rx.recv().await.is_none(),
+            "reader stops at disconnect; the trailing message is never delivered"
+        );
+    }
 }
