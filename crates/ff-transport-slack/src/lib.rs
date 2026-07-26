@@ -21,7 +21,7 @@ pub use api::{ApiError, SlackApi};
 pub use envelope::{parse_envelope, ParseError, SlackEnvelope, SlackInteraction};
 pub use response::{SlackResponseStream, EDIT_THROTTLE, SLACK_TEXT_LIMIT};
 pub use transport::{SlackTransport, TRANSPORT_NAME};
-pub use writer::{OutboundOp, TsSink, WriterHandle};
+pub use writer::{OutboundOp, WriterHandle};
 
 #[cfg(test)]
 mod tests;

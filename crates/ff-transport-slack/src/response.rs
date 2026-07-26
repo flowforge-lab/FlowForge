@@ -24,12 +24,27 @@
 //! interactive approver both drive one connection without contending for a
 //! mutable borrow. `chunk`/`finish` take `&self`; all mutable state lives behind
 //! a `Mutex` (interior mutability), satisfying the `ResponseStream` contract.
+//!
+//! ## Known limitations (T3 scope; RFC 0021 §9 defers)
+//! - **Ordering assumption.** `chunk`/`finish` are expected to be called
+//!   sequentially for a given stream, as the Router does (one turn drives one
+//!   response to completion). The throttle decision reads `last_flush` under the
+//!   lock, but the post/edit awaits happen after the lock is dropped; truly
+//!   concurrent callers on the *same* stream could therefore interleave a
+//!   post-vs-edit. That does not arise on the single sequential Router path.
+//! - **`thread_ts` not wired.** Replies post to the channel, not into the
+//!   triggering message's thread. Threading needs `thread_ts` to flow from the
+//!   inbound envelope (T2) through to `chat.postMessage`; tracked as #1098.
+//! - **No client-side rate limiting.** Slack's ~1 msg/sec-per-channel (burst)
+//!   guidance is not enforced here; the [`EDIT_THROTTLE`] coalescing bounds edit
+//!   churn but does not cap posts. Global rate limiting is deferred to Phase 2.
 
 use std::sync::Mutex;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use ff_transport::ResponseStream;
+use tokio::sync::oneshot;
 
 use crate::writer::{OutboundOp, WriterHandle};
 
@@ -110,7 +125,16 @@ impl SlackResponseStream {
     async fn flush(&self, force: bool) {
         // Decide what to send and update bookkeeping under the lock; do the
         // awaits (channel sends) after dropping it — the guard is not Send.
-        let ops: Vec<OutboundOp> = {
+        //
+        // A `Post` step carries its part index so that, once the writer reports
+        // the `ts` Slack assigned, we can record it against the right part and
+        // edit that message in place on the next flush instead of posting a
+        // duplicate.
+        enum Step {
+            Update { ts: String, text: String },
+            Post { part_index: usize, text: String },
+        }
+        let steps: Vec<Step> = {
             let mut st = self.state.lock().unwrap();
             let Some(body) = st.pending.take() else {
                 return;
@@ -130,37 +154,68 @@ impl SlackResponseStream {
             }
 
             let parts = Self::split_parts(&body);
-            let mut ops = Vec::with_capacity(parts.len());
+            let mut steps = Vec::with_capacity(parts.len());
             for (i, part) in parts.iter().enumerate() {
                 match st.posted.ts.get(i) {
                     // A message already exists for this part → edit it.
-                    Some(ts) => ops.push(OutboundOp::Update {
-                        channel: self.channel.clone(),
+                    Some(ts) => steps.push(Step::Update {
                         ts: ts.clone(),
                         text: part.clone(),
                     }),
-                    // New part → post a continuation. The writer task fills in
-                    // the resulting `ts` and reports it back via `ts_sink`.
-                    None => ops.push(OutboundOp::Post {
-                        channel: self.channel.clone(),
-                        text: part.clone(),
+                    // New part → post a continuation and learn its `ts`.
+                    None => steps.push(Step::Post {
                         part_index: i,
+                        text: part.clone(),
                     }),
                 }
             }
             st.flushed = body;
             st.last_flush = Some(tokio::time::Instant::now());
-            ops
+            steps
         };
 
-        for op in ops {
-            self.writer.send(op).await;
+        for step in steps {
+            match step {
+                Step::Update { ts, text } => {
+                    self.writer
+                        .send(OutboundOp::Update {
+                            channel: self.channel.clone(),
+                            ts,
+                            text,
+                        })
+                        .await;
+                }
+                Step::Post { part_index, text } => {
+                    // Await the assigned `ts` before the next flush so we edit
+                    // this part in place rather than posting a duplicate.
+                    let (ts_tx, ts_rx) = oneshot::channel();
+                    self.writer
+                        .send(OutboundOp::Post {
+                            channel: self.channel.clone(),
+                            text,
+                            ts_tx,
+                        })
+                        .await;
+                    match ts_rx.await {
+                        Ok(ts) => self.record_ts(part_index, ts),
+                        // Writer dropped the sender: the post failed or the
+                        // socket is gone. Nothing to record; the next flush will
+                        // retry a post for this part.
+                        Err(_) => tracing::warn!(
+                            channel = %self.channel,
+                            part_index,
+                            "slack post produced no ts (socket closed or post failed); \
+                             part will re-post on the next flush"
+                        ),
+                    }
+                }
+            }
         }
     }
 
     /// Record a `ts` the writer assigned to a freshly posted part, so the next
     /// flush edits it in place instead of posting a duplicate.
-    pub fn record_ts(&self, part_index: usize, ts: String) {
+    fn record_ts(&self, part_index: usize, ts: String) {
         let mut st = self.state.lock().unwrap();
         if st.posted.ts.len() == part_index {
             st.posted.ts.push(ts);

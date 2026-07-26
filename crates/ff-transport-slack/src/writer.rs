@@ -15,20 +15,14 @@
 //! - **message posts/edits** ([`OutboundOp::Post`] / [`OutboundOp::Update`]) →
 //!   `chat.postMessage` / `chat.update` via [`SlackApi`].
 
-use futures_util::stream::SplitSink;
 use futures_util::SinkExt;
-use tokio::net::TcpStream;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 use crate::api::SlackApi;
 
-/// The WebSocket write half owned solely by the writer task.
-type WsSink = SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>;
-
 /// One unit of outbound work for the writer task.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum OutboundOp {
     /// Acknowledge a Socket Mode envelope (must be sent on the socket, quickly,
     /// or Slack redelivers and eventually disconnects).
@@ -37,9 +31,11 @@ pub enum OutboundOp {
     Post {
         channel: String,
         text: String,
-        /// Which part of the logical reply this is, echoed back with the
-        /// assigned `ts` so the response stream can edit it next flush.
-        part_index: usize,
+        /// The writer sends the `ts` Slack assigned back through this channel so
+        /// the posting response stream can edit the message in place next flush
+        /// instead of posting a duplicate. Dropped (never sent) if the post
+        /// fails — the receiver observes that as a closed channel.
+        ts_tx: oneshot::Sender<String>,
     },
     /// Edit an existing message in place.
     Update {
@@ -81,26 +77,16 @@ impl WriterHandle {
     }
 }
 
-/// Reports the `ts` Slack assigned to a freshly posted part back to whichever
-/// response stream posted it, so the next flush edits rather than re-posts.
-///
-/// T3 wires this to the active [`crate::response::SlackResponseStream`]. Kept as
-/// a trait object so the writer task has no back-reference to the stream map.
-pub trait TsSink: Send + Sync {
-    /// Record that `part_index` of the current reply now lives at `ts`.
-    fn record(&self, part_index: usize, ts: String);
-}
-
 /// Spawn the writer task and return a clonable handle onto it.
 ///
 /// The task runs until its queue is closed (all handles dropped) or a socket
-/// write fails. `api` performs the HTTPS Web API calls; `ts_sink`, when present,
-/// receives the `ts` of each posted part.
-pub fn spawn_writer(
-    mut ws_sink: WsSink,
-    api: SlackApi,
-    ts_sink: Option<Box<dyn TsSink>>,
-) -> WriterHandle {
+/// write fails. `api` performs the HTTPS Web API calls; the `ts` each post
+/// returns is sent back through that op's `ts_tx` so the posting stream can edit
+/// in place next flush.
+pub fn spawn_writer<S>(mut ws_sink: S, api: SlackApi) -> WriterHandle
+where
+    S: futures_util::Sink<Message> + Unpin + Send + 'static,
+{
     // A small buffer: acks and edits are low-volume; back-pressure here just
     // means a sender awaits briefly, which is fine.
     let (tx, mut rx) = mpsc::channel::<OutboundOp>(64);
@@ -121,12 +107,13 @@ pub fn spawn_writer(
                 OutboundOp::Post {
                     channel,
                     text,
-                    part_index,
+                    ts_tx,
                 } => {
                     if let Ok(ts) = api.post_message(&channel, &text).await {
-                        if let Some(sink) = &ts_sink {
-                            sink.record(part_index, ts);
-                        }
+                        // Report the assigned `ts` back to the posting stream. A
+                        // send error means the stream is gone (nothing to edit);
+                        // ignore it.
+                        let _ = ts_tx.send(ts);
                     }
                 }
                 OutboundOp::Update { channel, ts, text } => {

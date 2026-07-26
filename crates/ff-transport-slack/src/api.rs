@@ -55,6 +55,16 @@ impl SlackApi {
         self
     }
 
+    /// Reuse an existing HTTP client instead of the one built by [`new`]. Lets a
+    /// caller share a single connection pool across the connect handshake and
+    /// the Web API calls.
+    ///
+    /// [`new`]: SlackApi::new
+    pub fn with_client(mut self, http: reqwest::Client) -> Self {
+        self.http = http;
+        self
+    }
+
     /// Post a new message to `channel`; returns its `ts` on success.
     pub async fn post_message(&self, channel: &str, text: &str) -> Result<String, ApiError> {
         let body = serde_json::json!({ "channel": channel, "text": text });
