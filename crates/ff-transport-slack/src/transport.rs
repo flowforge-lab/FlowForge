@@ -164,8 +164,21 @@ impl SlackTransport {
                         interaction,
                     } => {
                         writer.send(OutboundOp::Ack { envelope_id }).await;
-                        // No approver draining yet (T4) → drop is fine.
-                        let _ = interaction_tx.send(interaction).await;
+                        // Non-blocking hand-off: no approver drains this yet
+                        // (T4). A blocking `send().await` would wedge the whole
+                        // reader — and with it the inbound path — once the
+                        // bounded queue filled with undrained interactions. Drop
+                        // (with a warn) instead; the ack above already told Slack
+                        // we received it.
+                        match interaction_tx.try_send(interaction) {
+                            Ok(()) => {}
+                            Err(mpsc::error::TrySendError::Full(i)) => tracing::warn!(
+                                action_id = %i.action_id,
+                                "slack interaction dropped: no approver draining the queue (T4)"
+                            ),
+                            // Receiver gone (shutting down): stop reading.
+                            Err(mpsc::error::TrySendError::Closed(_)) => break,
+                        }
                     }
                     // Control frames: hello needs nothing; a disconnect means
                     // Slack is closing this socket (reconnect is Phase 2).

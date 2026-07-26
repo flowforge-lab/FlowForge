@@ -507,4 +507,26 @@ mod reader {
             "reader stops at disconnect; the trailing message is never delivered"
         );
     }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn undrained_interactions_never_wedge_the_reader() {
+        // Regression (Isaac review): interactions fan out on a bounded queue that
+        // no one drains until T4. A blocking `send().await` would wedge the
+        // reader once that queue filled (64), starving the *inbound* path too.
+        // Feed well over capacity, then a user message, and assert the message
+        // still arrives — the reader must drop-and-continue, not block.
+        let mut frames: Vec<Message> = (0..200)
+            .map(|_| Message::Text(BLOCK_ACTIONS.to_string()))
+            .collect();
+        frames.push(Message::Text(USER_MESSAGE.to_string()));
+
+        // Note: `_int_rx` is intentionally never drained here.
+        let (mut inbound_rx, _int_rx, _ops_rx) = run_reader(frames);
+
+        let msg = tokio::time::timeout(Duration::from_secs(5), inbound_rx.recv())
+            .await
+            .expect("reader must not wedge on a full interaction queue")
+            .expect("the user message must still reach the inbound path");
+        assert_eq!(msg.text, "deploy the thing");
+    }
 }
