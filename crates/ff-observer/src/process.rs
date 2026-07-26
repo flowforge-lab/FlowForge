@@ -135,20 +135,26 @@ impl ProcessSource {
             None => return text.to_string(),
         };
         let line = mat.as_str();
-        // Collapse internal newlines to spaces so a multi-line match
-        // never produces a multi-line summary (which would render
-        // oddly in the wake block).
-        let flat: String = line
-            .chars()
-            .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
-            .collect();
-        if flat.chars().count() <= SUMMARY_MAX_CHARS {
-            return flat;
-        }
-        let mut out: String = flat.chars().take(SUMMARY_MAX_CHARS).collect();
-        out.push_str("...");
-        out
+        flatten_and_clamp(line)
     }
+}
+
+/// Collapse internal newlines to spaces and clamp to [`SUMMARY_MAX_CHARS`]
+/// (appending `...` on overflow). A wake summary is a single bounded line —
+/// multi-line or unbounded text renders oddly in the wake block. Shared by the
+/// per-chunk match summary and the terminal-wake message, both of which embed
+/// caller-controlled text (the matched output, and the raw wake pattern).
+fn flatten_and_clamp(text: &str) -> String {
+    let flat: String = text
+        .chars()
+        .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
+        .collect();
+    if flat.chars().count() <= SUMMARY_MAX_CHARS {
+        return flat;
+    }
+    let mut out: String = flat.chars().take(SUMMARY_MAX_CHARS).collect();
+    out.push_str("...");
+    out
 }
 
 #[async_trait]
@@ -190,7 +196,8 @@ impl ObserverSource for ProcessSource {
                             // was lost to a lagged broadcast): say so and
                             // point at `poll` for the full output.
                             (Some(pat), false) => format!(
-                                "process {pid} ended -- wake pattern \"{pat}\" never matched; poll for full output"
+                                "process {pid} ended -- wake pattern \"{}\" never matched; poll for full output",
+                                flatten_and_clamp(pat)
                             ),
                             // No filter: every chunk would have matched, so
                             // "no match" is meaningless; just report the end.
@@ -376,6 +383,58 @@ mod tests {
             .await
             .expect("third call returns within budget");
         assert!(third.is_none(), "expected reap after terminal wake");
+    }
+
+    #[test]
+    fn flatten_and_clamp_bounds_and_flattens() {
+        // Newlines collapse to spaces.
+        assert_eq!(flatten_and_clamp("a\nb\r\nc"), "a b  c");
+        // Short text is returned as-is.
+        assert_eq!(flatten_and_clamp("short"), "short");
+        // Overflow is clamped to SUMMARY_MAX_CHARS + "...".
+        let long = "x".repeat(SUMMARY_MAX_CHARS + 50);
+        let out = flatten_and_clamp(&long);
+        assert_eq!(out.chars().count(), SUMMARY_MAX_CHARS + 3);
+        assert!(out.ends_with("..."));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn terminal_summary_clamps_a_huge_multiline_pattern() {
+        // Regression (Isaac review): the terminal "never matched" wake embedded
+        // the raw wake pattern, bypassing the flatten+clamp every other summary
+        // goes through. A long or multi-line pattern produced an unbounded,
+        // multi-line wake message. It must now be a single bounded line.
+        let dir = TempDir::new().unwrap();
+        // A process that exits (without ever emitting the pattern) after a
+        // brief delay, so the source's broadcast subscription is established
+        // before exit — mirrors the `never matched` terminal test's timing.
+        let (sup, id) = live_proc(&dir, "sleep 0.3; echo done").await;
+        let huge_pattern = format!("LINE1\nLINE2\n{}", "z".repeat(SUMMARY_MAX_CHARS + 100));
+        let mut src =
+            ProcessSource::new(ctx(1), id, Some(&huge_pattern), &sup, "s1").expect("source builds");
+        let cancel = Arc::new(Notify::new());
+        let terminal = tokio::time::timeout(Duration::from_secs(3), src.next_event(cancel.clone()))
+            .await
+            .expect("terminal event arrives")
+            .expect("process end must wake");
+        assert!(
+            terminal.summary.contains("never matched"),
+            "{}",
+            terminal.summary
+        );
+        // The embedded pattern must have been flattened (no newlines) and the
+        // whole summary kept to a sane bound (clamped pattern + fixed wrapper).
+        let embedded = terminal.summary.trim_start_matches(|c| c != '"');
+        assert!(
+            !embedded.contains('\n'),
+            "terminal summary must be single-line: {:?}",
+            terminal.summary
+        );
+        assert!(
+            terminal.summary.chars().count() < SUMMARY_MAX_CHARS + 100,
+            "terminal summary must be bounded, got {} chars",
+            terminal.summary.chars().count()
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
