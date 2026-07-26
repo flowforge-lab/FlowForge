@@ -1468,3 +1468,61 @@ fn search_finds_tool_call_arguments() {
     assert_eq!(scoped[0].message_id, msg.id);
     assert!(scoped[0].snippet.contains("<mark>"));
 }
+
+// -- cross-process SQLITE_BUSY regression guard (#1080) -----------------
+//
+// The CLI now shares the GUI's db file, so two processes can hold open
+// connections to the same store simultaneously. WAL allows concurrent readers
+// but only one writer at a time; without a busy_timeout, the loser's write
+// returns SQLITE_BUSY immediately, and `insert_session` ends in
+// `.expect("insert session")` — panicking the losing process. This was
+// unreachable when the CLI ran an ephemeral in-memory store; it is now the
+// default path (`ff chat` with the desktop app open).
+//
+// `from_conn` pins `conn.busy_timeout(5s)` explicitly so the contract is
+// self-documenting and independent of rusqlite's default (rusqlite 0.32 ships
+// a 5s default today, but relying on that undocumented default is fragile).
+// This test reproduces the contention deterministically by holding the WAL
+// write lock on a raw connection (`BEGIN IMMEDIATE`) while the store writes,
+// and asserts the store's write waits (not panics). It guards the behavior:
+// if a future rusqlite drops its default AND our explicit call were removed,
+// this test would panic.
+
+#[test]
+fn busy_timeout_lets_concurrent_writer_serialize() {
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("sessions.db");
+
+    // Open the store first (no contention yet) so its connection's busy_timeout
+    // is in place and its schema migration completes before the lock is held.
+    let store = SessionStore::open(&path).unwrap();
+
+    // A second connection acquires the WAL write lock (`BEGIN IMMEDIATE`) and
+    // holds it briefly, simulating a concurrent writer (the desktop GUI, or a
+    // second CLI process) mid-write.
+    let (ready_snd, ready_rcv) = mpsc::channel();
+    let blocker_path = path.clone();
+    let blocker = thread::spawn(move || {
+        let conn = rusqlite::Connection::open(&blocker_path).unwrap();
+        conn.execute_batch("BEGIN IMMEDIATE;").unwrap();
+        ready_snd.send(()).unwrap(); // write lock now held
+        thread::sleep(Duration::from_millis(200));
+        conn.execute_batch("ROLLBACK;").unwrap();
+    });
+
+    ready_rcv.recv().unwrap(); // wait until the blocker holds the write lock
+
+    // The store's create_session does an INSERT, which needs the write lock the
+    // blocker holds. Without a busy_timeout this returns SQLITE_BUSY and panics
+    // inside `insert_session` (`.expect("insert session")`). With the timeout
+    // it waits for the blocker's ROLLBACK (~200ms), then succeeds.
+    let session = store.create_session(Some("hello".into()));
+
+    blocker.join().unwrap();
+    assert!(store.get_session(&session.id).is_some());
+    assert_eq!(session.goal.as_deref(), Some("hello"));
+}

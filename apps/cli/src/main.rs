@@ -12,6 +12,7 @@ mod json_events;
 mod memory;
 mod registry;
 mod secrets;
+mod sessions;
 
 #[cfg(test)]
 mod test_support;
@@ -93,9 +94,17 @@ enum Command {
         /// `plan` also hides write/dangerous tools. Dangerous calls always prompt.
         #[arg(long, value_enum, default_value = "auto")]
         mode: ModeArg,
+        /// Use an in-memory (ephemeral) session store: nothing is written to disk
+        /// and the turn won't appear in `ff sessions list`. Default is persistent
+        /// (the turn is saved and resumable). Escape hatch for one-shot `run`.
+        #[arg(long)]
+        ephemeral: bool,
     },
-    /// Open an interactive REPL (multi-turn, in-process session). Default when
+    /// Open an interactive REPL (multi-turn, one session). Default when
     /// no subcommand is given. Type `exit` or press Ctrl-D to quit.
+    ///
+    /// By default the session persists to disk (`ff sessions list` / `ff chat
+    /// --resume`); pass `--ephemeral` to keep it in-memory only.
     Chat {
         /// Emit each event as one JSON line to stdout; no human-only text is printed.
         #[arg(long)]
@@ -110,6 +119,27 @@ enum Command {
         /// `plan` also hides write/dangerous tools. Dangerous calls always prompt.
         #[arg(long, value_enum, default_value = "auto")]
         mode: ModeArg,
+        /// Use an in-memory (ephemeral) session store: nothing is written to disk.
+        #[arg(long)]
+        ephemeral: bool,
+        /// Reopen a persisted session by id and continue it. Use `ff sessions
+        /// list` to find the id. Errors if the session does not exist.
+        #[arg(long, value_name = "ID")]
+        resume: Option<String>,
+    },
+    /// List persisted sessions (`ff sessions list`) — id, label, updated-at.
+    /// The store is the same on-disk db the desktop app uses, so every session
+    /// from either surface appears here (#1080).
+    Sessions {
+        #[command(subcommand)]
+        command: SessionsCommand,
+    },
+    /// Fork a session at its tip into a new session, reusing the store's
+    /// `fork_session`. The fork gets a `(Fork N)` title for parity with the
+    /// desktop's sidebar Fork entry (#1069). Prints the new session id + title.
+    Fork {
+        /// The session id to fork (see `ff sessions list`).
+        id: String,
     },
     /// Inspect installed skills (shared with the desktop app).
     Skills {
@@ -141,6 +171,16 @@ enum SkillsCommand {
     List,
 }
 
+/// `ff sessions <SUBCOMMAND>` — inspect the persisted session store (#1080).
+#[derive(Subcommand, Debug)]
+enum SessionsCommand {
+    /// List persisted sessions: id, label, status, updated-at. TSV to stdout
+    /// (machine-parseable, matching `ff config list`), one session per line,
+    /// most-recently-updated first. Drafts (never-messaged) are not persisted
+    /// and do not appear.
+    List,
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     let cli = Cli::parse();
@@ -149,6 +189,8 @@ async fn main() -> ExitCode {
         yes: false,
         deny: false,
         mode: ModeArg::Auto,
+        ephemeral: false,
+        resume: None,
     }) {
         Command::Run {
             prompt,
@@ -159,6 +201,7 @@ async fn main() -> ExitCode {
             skill,
             pheno,
             mode,
+            ephemeral,
         } => {
             run(
                 prompt,
@@ -168,6 +211,7 @@ async fn main() -> ExitCode {
                 model,
                 skill,
                 pheno,
+                ephemeral,
             )
             .await
         }
@@ -176,10 +220,25 @@ async fn main() -> ExitCode {
             yes,
             deny,
             mode,
-        } => chat(json, approval_mode(yes, deny), mode.into()).await,
+            ephemeral,
+            resume,
+        } => {
+            chat(
+                json,
+                approval_mode(yes, deny),
+                mode.into(),
+                ephemeral,
+                resume,
+            )
+            .await
+        }
         Command::Skills { command } => match command {
             SkillsCommand::List => skills_list(),
         },
+        Command::Sessions { command } => match command {
+            SessionsCommand::List => sessions_list(),
+        },
+        Command::Fork { id } => fork_session_cmd(&id),
         Command::Config { command } => config::run(command),
         Command::Memory { command } => memory::run(command).await,
     }
@@ -200,6 +259,59 @@ fn skills_list() -> ExitCode {
             Some(skill) => println!("{name}\t{}", skill.manifest.description),
             None => println!("{name}"),
         }
+    }
+    ExitCode::SUCCESS
+}
+
+/// `ff sessions list` — print persisted sessions as TSV (id, label, status,
+/// updated-at), most-recently-updated first. Mirrors `ff config list`'s
+/// machine-parseable convention. Drafts (never-messaged) are not persisted by
+/// the store and so do not appear.
+fn sessions_list() -> ExitCode {
+    let store = host::build_session_store(false);
+    let sessions = store.list_sessions();
+    if let Err(e) = sessions::render_list(&sessions, &mut std::io::stdout()) {
+        eprintln!("error writing session list: {e}");
+        return ExitCode::FAILURE;
+    }
+    if sessions.is_empty() {
+        eprintln!("No persisted sessions yet. Use `ff chat` to start one.");
+    }
+    ExitCode::SUCCESS
+}
+
+/// `ff fork <id>` — fork a session at its tip into a new session with a
+/// `(Fork N)` title for parity with the desktop's sidebar Fork entry (#1069).
+/// Prints the new session id + title to stdout (TSV) so the user can
+/// immediately `ff chat --resume <new_id>`.
+fn fork_session_cmd(id: &str) -> ExitCode {
+    let store = host::build_session_store(false);
+    let source = match store.get_session(id) {
+        Some(s) => s,
+        None => {
+            eprintln!("error: no session with id {id}");
+            return ExitCode::FAILURE;
+        }
+    };
+    // `fork_session` clones the session + transcript and stamps a generic
+    // "<title> (copy)"; we override with the desktop-parity "(Fork N)" naming
+    // when the source has a title (#1069). An untitled source keeps the store's
+    // copy (or None), matching the desktop's `if (session.title)` guard.
+    let forked = match store.fork_session(id) {
+        Some(f) => f,
+        None => {
+            eprintln!("error: could not fork session {id}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if let Some(source_title) = &source.title {
+        let all = store.list_sessions();
+        let existing: Vec<Option<&str>> = all.iter().map(|s| s.title.as_deref()).collect();
+        let new_title = sessions::next_fork_title(source_title, &existing);
+        store.set_title(&forked.id, new_title.clone());
+        println!("{}\t{}", forked.id, new_title);
+    } else {
+        println!("{}\t{}", forked.id, sessions::resolve_label(&forked));
     }
     ExitCode::SUCCESS
 }
@@ -379,6 +491,7 @@ fn build_memory_store() -> (
     (memory_store, memory_index)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run(
     prompt: String,
     json: bool,
@@ -387,11 +500,12 @@ async fn run(
     model: Option<String>,
     skill: Vec<String>,
     pheno: Option<String>,
+    ephemeral: bool,
 ) -> ExitCode {
     let (provider, default_model) = host::load_provider();
     let skills = host::load_skills();
     let workspace = host::workspace_root();
-    let store = std::sync::Arc::new(ff_session::SessionStore::new());
+    let store = std::sync::Arc::new(host::build_session_store(ephemeral));
     let (mut registry, memory_store, memory_index) = build_registry_with_memory();
     registry.register(Box::new(ff_tools::CompactionRetrieveTool::new(
         store.clone(),
@@ -522,20 +636,50 @@ async fn run(
     }
 }
 
-/// Interactive REPL (multi-turn, one in-process session). Keeps a single
+/// Interactive REPL (multi-turn, one session). Keeps a single
 /// [`ff_session::SessionStore`] alive for the life of the process so each turn
 /// sees the full accumulated history. Loops until EOF, `exit`, or `quit`.
-async fn chat(json: bool, approval_mode: ApprovalMode, mode: Mode) -> ExitCode {
+///
+/// When `ephemeral` is false (default), the store is on-disk and the session
+/// persists for `ff sessions list` / `ff chat --resume`. When `resume` is
+/// `Some(id)`, reopens that session instead of creating a new one — errors if
+/// the id is unknown.
+async fn chat(
+    json: bool,
+    approval_mode: ApprovalMode,
+    mode: Mode,
+    ephemeral: bool,
+    resume: Option<String>,
+) -> ExitCode {
     let (provider, model) = host::load_provider();
     let skills = host::load_skills();
     let workspace = host::workspace_root();
-    let store = std::sync::Arc::new(ff_session::SessionStore::new());
+    let store = std::sync::Arc::new(host::build_session_store(ephemeral));
     let (mut registry, memory_store, memory_index) = build_registry_with_memory();
     registry.register(Box::new(ff_tools::CompactionRetrieveTool::new(
         store.clone(),
     )));
     let approver = CliApprover::new(approval_mode, mode);
-    let session = store.create_session(None);
+    // Resume an existing session or create a new one. A bogus resume id is a
+    // hard error (don't silently start a fresh session — the user asked for a
+    // specific one). The store's `get_session` surfaces pending drafts too,
+    // but those never round-trip across restarts (drafts are in-memory only),
+    // so a resumed id from `sessions list` is always a persisted row.
+    let session_id = match resume {
+        Some(id) => match store.get_session(&id) {
+            Some(s) => {
+                if !json {
+                    eprintln!("Resumed: {}", sessions::resolve_label(&s));
+                }
+                s.id
+            }
+            None => {
+                eprintln!("error: no session with id {id}");
+                return ExitCode::FAILURE;
+            }
+        },
+        None => store.create_session(None).id,
+    };
 
     let matrix = PermissionMatrix::default();
     let mut tool_ctx = ToolContext::new(
@@ -556,7 +700,7 @@ async fn chat(json: bool, approval_mode: ApprovalMode, mode: Mode) -> ExitCode {
         &memory_store,
         memory_index.as_ref(),
         &tool_ctx,
-        &session.id,
+        &session_id,
         json,
         mode,
         stdin.lock(),
