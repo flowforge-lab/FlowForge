@@ -383,7 +383,7 @@ fn migration_v3_to_v4_preserves_messages_and_adds_reasoning() {
         .unwrap()
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 11);
+    assert_eq!(version, 12);
 }
 
 #[test]
@@ -504,7 +504,7 @@ fn migration_v4_to_v5_preserves_messages_and_creates_table() {
         .unwrap()
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 11);
+    assert_eq!(version, 12);
 }
 
 #[test]
@@ -555,7 +555,7 @@ fn migration_v5_to_v6_preserves_session_and_adds_model() {
         .unwrap()
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 11);
+    assert_eq!(version, 12);
 }
 
 #[test]
@@ -934,7 +934,7 @@ fn migration_v6_to_v7_preserves_session_and_adds_mcp_servers() {
         .unwrap()
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 11);
+    assert_eq!(version, 12);
 }
 
 #[test]
@@ -996,7 +996,7 @@ fn migration_v7_to_v9_preserves_messages_and_adds_stop_reason() {
         .unwrap()
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 11);
+    assert_eq!(version, 12);
 }
 
 #[test]
@@ -1158,7 +1158,7 @@ fn migration_is_idempotent_across_reopens() {
         .unwrap()
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 11);
+    assert_eq!(version, 12);
 }
 
 #[test]
@@ -1526,4 +1526,210 @@ fn busy_timeout_lets_concurrent_writer_serialize() {
     blocker.join().unwrap();
     assert!(store.get_session(&session.id).is_some());
     assert_eq!(session.goal.as_deref(), Some("hello"));
+}
+
+#[test]
+fn fork_records_lineage_and_fork_point() {
+    let store = SessionStore::new();
+    let s = store.create_session(None);
+    store.add_message(&s.id, Role::User, "one".into());
+    store.add_message(&s.id, Role::Assistant, "two".into());
+
+    let forked = store.fork_session(&s.id).unwrap();
+    assert_eq!(forked.parent_session_id.as_deref(), Some(s.id.as_str()));
+    // Two messages at seq 0 and 1, so the last copied seq is 1.
+    assert_eq!(forked.fork_point_seq, Some(1));
+    // The returned value must match what was persisted, not just the in-memory copy.
+    let reloaded = store.get_session(&forked.id).unwrap();
+    assert_eq!(reloaded.parent_session_id.as_deref(), Some(s.id.as_str()));
+    assert_eq!(reloaded.fork_point_seq, Some(1));
+}
+
+#[test]
+fn fork_point_is_a_coordinate_shared_by_both_sessions() {
+    // The whole premise of `fork_point_seq`: forking preserves `seq`, so the
+    // shared prefix is `seq <= fork_point_seq` in *either* session, and both
+    // sides diverge above it. Confluence depends on this symmetry.
+    let store = SessionStore::new();
+    let s = store.create_session(None);
+    store.add_message(&s.id, Role::User, "shared".into());
+    let forked = store.fork_session(&s.id).unwrap();
+    let point = forked.fork_point_seq.unwrap();
+
+    store.add_message(&s.id, Role::User, "parent only".into());
+    store.add_message(&forked.id, Role::User, "fork only".into());
+
+    // `seq` is deliberately not on `Message` (it is a storage detail), so query
+    // it directly -- the point of this test is the on-disk coordinate space.
+    let contents = |id: &str, cmp: &str| -> Vec<String> {
+        let conn = store.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT content FROM messages WHERE session_id = ?1 AND seq {cmp} ?2 ORDER BY seq"
+            ))
+            .unwrap();
+        let rows: Vec<String> = stmt
+            .query_map(params![id, point], |r| r.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        rows
+    };
+    let shared_in_parent = contents(&s.id, "<=");
+    let shared_in_fork = contents(&forked.id, "<=");
+    assert_eq!(shared_in_parent, vec!["shared".to_string()]);
+    assert_eq!(shared_in_fork, shared_in_parent);
+
+    // Divergence sits strictly above the fork point on both sides.
+    assert_eq!(contents(&s.id, ">"), vec!["parent only".to_string()]);
+    assert_eq!(contents(&forked.id, ">"), vec!["fork only".to_string()]);
+}
+
+#[test]
+fn deleting_parent_orphans_fork_but_keeps_its_transcript() {
+    let store = SessionStore::new();
+    let s = store.create_session(None);
+    store.add_message(&s.id, Role::User, "one".into());
+    store.add_message(&s.id, Role::Assistant, "two".into());
+    let forked = store.fork_session(&s.id).unwrap();
+
+    assert!(store.delete_session(&s.id));
+
+    // The fork owns a full copy and is a session in its own right: it must
+    // survive the parent's deletion (ON DELETE SET NULL, never CASCADE).
+    let orphan = store
+        .get_session(&forked.id)
+        .expect("fork must outlive its parent");
+    assert_eq!(orphan.parent_session_id, None);
+    // The fork point survives: it still describes the transcript this session holds.
+    assert_eq!(orphan.fork_point_seq, Some(1));
+    let msgs = store.get_messages(&forked.id);
+    assert_eq!(msgs.len(), 2);
+    assert_eq!(msgs[0].content, "one");
+    assert_eq!(msgs[1].content, "two");
+}
+
+#[test]
+fn fork_of_a_fork_records_the_immediate_parent() {
+    let store = SessionStore::new();
+    let root = store.create_session(None);
+    store.add_message(&root.id, Role::User, "one".into());
+    let child = store.fork_session(&root.id).unwrap();
+    store.add_message(&child.id, Role::User, "two".into());
+    let grandchild = store.fork_session(&child.id).unwrap();
+
+    // The chain is walked, not flattened to the root.
+    assert_eq!(
+        grandchild.parent_session_id.as_deref(),
+        Some(child.id.as_str())
+    );
+    assert_eq!(child.parent_session_id.as_deref(), Some(root.id.as_str()));
+    assert_eq!(root.parent_session_id, None);
+    // Each generation's fork point reflects its own parent's length at fork time.
+    assert_eq!(child.fork_point_seq, Some(0));
+    assert_eq!(grandchild.fork_point_seq, Some(1));
+}
+
+#[test]
+fn fork_of_empty_parent_has_parent_but_no_fork_point() {
+    // The two NULL cases must stay distinguishable: no parent means "lineage
+    // root", whereas a parent with no fork point means an empty shared prefix.
+    let store = SessionStore::new();
+    let s = store.create_session(None);
+    let forked = store.fork_session(&s.id).unwrap();
+
+    assert_eq!(forked.parent_session_id.as_deref(), Some(s.id.as_str()));
+    assert_eq!(forked.fork_point_seq, None);
+    assert!(store.get_messages(&forked.id).is_empty());
+}
+
+#[test]
+fn unforked_sessions_are_lineage_roots() {
+    let store = SessionStore::new();
+    let s = store.create_session(None);
+    assert_eq!(s.parent_session_id, None);
+    assert_eq!(s.fork_point_seq, None);
+    // Also on the read paths, so a pre-existing row (all-NULL lineage) loads
+    // exactly as before.
+    assert_eq!(store.get_session(&s.id).unwrap().parent_session_id, None);
+    let listed = store.list_sessions().into_iter().next().unwrap();
+    assert_eq!(listed.parent_session_id, None);
+    assert_eq!(listed.fork_point_seq, None);
+}
+
+#[test]
+fn lineage_index_exists_and_serves_the_delete_reverse_lookup() {
+    // The index is not decoration: `ON DELETE SET NULL` makes every session
+    // delete look up children by `parent_session_id`, which is a full scan of
+    // `sessions` without it. Pinned so a later migration cannot quietly drop it.
+    let store = SessionStore::new();
+    let conn = store.conn.lock().unwrap();
+
+    let indexed: Option<String> = conn
+        .query_row(
+            "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_sessions_parent'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()
+        .unwrap();
+    assert_eq!(indexed.as_deref(), Some("idx_sessions_parent"));
+
+    let plan: Vec<String> = conn
+        .prepare("EXPLAIN QUERY PLAN DELETE FROM sessions WHERE id = ?1")
+        .unwrap()
+        .query_map(params!["whatever"], |r| r.get::<_, String>(3))
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
+    let plan = plan.join(" | ");
+    assert!(
+        plan.contains("idx_sessions_parent"),
+        "delete must use the lineage index, got: {plan}"
+    );
+    assert!(
+        !plan.contains("SCAN sessions"),
+        "delete must not full-scan sessions, got: {plan}"
+    );
+}
+
+#[test]
+fn pre_existing_v11_database_upgrades_to_lineage() {
+    // A real v11 database (lineage columns absent) must gain them without losing
+    // data, and its existing rows must read back as lineage roots.
+    let conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+    migrate(&conn).unwrap();
+    conn.execute_batch(
+        "DROP INDEX idx_sessions_parent;
+         ALTER TABLE sessions DROP COLUMN parent_session_id;
+         ALTER TABLE sessions DROP COLUMN fork_point_seq;",
+    )
+    .unwrap();
+    conn.pragma_update(None, "user_version", 11).unwrap();
+    conn.execute(
+        "INSERT INTO sessions (id, status, created_at, updated_at) VALUES ('old', 'active', 1, 1)",
+        [],
+    )
+    .unwrap();
+
+    migrate(&conn).unwrap();
+
+    let version: i64 = conn
+        .query_row("SELECT * FROM pragma_user_version", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(version, 12);
+
+    let store = SessionStore {
+        conn: Mutex::new(conn),
+        pending: Mutex::new(HashMap::new()),
+    };
+    let old = store.get_session("old").expect("v11 row must survive");
+    assert_eq!(old.parent_session_id, None);
+    assert_eq!(old.fork_point_seq, None);
+    // And the upgraded database supports forking with lineage.
+    store.add_message("old", Role::User, "one".into());
+    let forked = store.fork_session("old").unwrap();
+    assert_eq!(forked.parent_session_id.as_deref(), Some("old"));
+    assert_eq!(forked.fork_point_seq, Some(0));
 }

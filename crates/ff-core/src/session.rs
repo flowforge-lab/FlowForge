@@ -68,6 +68,28 @@ pub struct Session {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub mcp_servers: Option<Vec<McpServerConfig>>,
+    /// The session this one was forked from (#1074, RFC 0023 §4). `None` means
+    /// "lineage root" -- either never forked, or forked before lineage was
+    /// recorded (pre-existing history cannot be back-filled). Cleared to `None`
+    /// if the parent is deleted, so a fork outlives its source.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub parent_session_id: Option<String>,
+    /// The last parent `seq` this session's transcript copied at fork time
+    /// (#1074). Because forking preserves `seq` verbatim, this is a coordinate
+    /// valid in *both* sessions: `seq <= fork_point_seq` is the shared prefix,
+    /// `seq > fork_point_seq` is post-fork divergence on either side.
+    ///
+    /// Two distinct `None` cases, told apart by [`parent_session_id`](Self::parent_session_id):
+    /// with no parent it means "lineage root"; with a parent it means the parent
+    /// was empty at fork time, i.e. an empty shared prefix.
+    ///
+    /// An **upper bound**, not a density guarantee: editing a message truncates
+    /// later ones without renumbering, so a `seq` at or below this point may no
+    /// longer exist on one side. Readers must intersect on actual rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional, type = "number")]
+    pub fork_point_seq: Option<i64>,
 }
 
 /// A session's working directory as surfaced to the frontend selector (#200,
