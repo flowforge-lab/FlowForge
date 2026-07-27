@@ -42,6 +42,7 @@ pub struct McpBridgedTool {
     input_schema: Value,
     read_only_hint: bool,
     reaches_network: bool,
+    defer: bool,
 }
 
 impl McpBridgedTool {
@@ -70,6 +71,7 @@ impl McpBridgedTool {
             input_schema: info.input_schema.clone(),
             read_only_hint: info.read_only_hint,
             reaches_network: info.reaches_network,
+            defer: info.defer,
         }
     }
 
@@ -87,6 +89,9 @@ impl McpBridgedTool {
             input_schema: serde_json::json!({"type": "object"}),
             read_only_hint,
             reaches_network,
+            // Production default; `defer` doesn't affect the classification these
+            // tests assert.
+            defer: true,
         }
     }
 }
@@ -163,6 +168,15 @@ impl Tool for McpBridgedTool {
         // Fail-safe `true` when the operator hasn't vetted the server as local, so
         // a LocalOnly phenotype strips it — mirrors how `read_only_hint` feeds safety.
         self.reaches_network
+    }
+
+    fn defer(&self) -> bool {
+        // Resolved from the serving server's `defer` config, defaulting to deferred
+        // (RFC 0024 Layer 1): bridged tools are 81% of the standing tools-block cost,
+        // so they are reached through `tool_search` unless a server opts out. Unlike
+        // `reaches_network` this is purely a context-budget flag — the wrong value
+        // costs a search round-trip, never a capability leak.
+        self.defer
     }
 
     async fn run(&self, args: Value, _root: &Path) -> ToolOutcome {

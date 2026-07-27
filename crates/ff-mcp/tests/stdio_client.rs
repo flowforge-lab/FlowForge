@@ -18,6 +18,7 @@ fn echo_config() -> McpServerConfig {
         disabled: false,
         scope: McpScope::Global,
         reaches_network: None,
+        defer: None,
     }
 }
 
@@ -70,6 +71,7 @@ fn cwd_config() -> McpServerConfig {
         disabled: false,
         scope: McpScope::Global,
         reaches_network: None,
+        defer: None,
     }
 }
 

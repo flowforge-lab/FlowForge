@@ -1006,6 +1006,7 @@ fn mcp_cfg(id: &str, command: &str, scope: McpScope) -> McpServerConfig {
         disabled: false,
         scope,
         reaches_network: None,
+        defer: None,
     }
 }
 

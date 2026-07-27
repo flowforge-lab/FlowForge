@@ -236,6 +236,7 @@ impl McpClient {
                 // so the supervisor overlays the server's config value at publish
                 // time (RFC 0013). Unset there stays `true` = network-capable.
                 reaches_network: true,
+                defer: true,
             })
             .collect())
     }

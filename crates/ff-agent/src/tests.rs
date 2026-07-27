@@ -285,8 +285,8 @@ fn plan_mode_advertises_read_capable_and_sensitive_tools() {
     // invocation of the visible tools.
     let reg = ToolRegistry::with_defaults();
     let matrix = PermissionMatrix::default();
-    let advertised =
-        advertised_tools(Mode::Plan, Egress::Open, &matrix, None, &reg).expect("Plan restricts");
+    let advertised = advertised_tools(Mode::Plan, Egress::Open, &matrix, None, &reg, None)
+        .expect("Plan restricts");
     for name in [
         "view",
         "grep",
@@ -317,8 +317,8 @@ fn plan_mode_hides_sensitive_tools_when_the_matrix_denies_sensitive() {
     let reg = ToolRegistry::with_defaults();
     let mut matrix = PermissionMatrix::default();
     matrix.set_cell(Mode::Plan, Safety::Sensitive, PermissionCell::Deny);
-    let advertised =
-        advertised_tools(Mode::Plan, Egress::Open, &matrix, None, &reg).expect("Plan restricts");
+    let advertised = advertised_tools(Mode::Plan, Egress::Open, &matrix, None, &reg, None)
+        .expect("Plan restricts");
     assert!(advertised.contains("bash"));
     assert!(advertised.contains("github"));
     for name in ["web_fetch", "agent"] {
@@ -336,8 +336,15 @@ fn plan_mode_intersects_with_subagent_allowlist() {
     // A sub-agent scoped to {view, edit}: Plan further drops the mutating `edit`.
     let allowed: std::collections::HashSet<String> =
         ["view", "edit"].iter().map(|s| s.to_string()).collect();
-    let advertised =
-        advertised_tools(Mode::Plan, Egress::Open, &matrix, Some(&allowed), &reg).unwrap();
+    let advertised = advertised_tools(
+        Mode::Plan,
+        Egress::Open,
+        &matrix,
+        Some(&allowed),
+        &reg,
+        None,
+    )
+    .unwrap();
     assert_eq!(advertised, ["view".to_string()].into_iter().collect());
 }
 
@@ -346,17 +353,24 @@ fn act_and_auto_pass_the_allowlist_through_unchanged() {
     let reg = ToolRegistry::with_defaults();
     let matrix = PermissionMatrix::default();
     assert_eq!(
-        advertised_tools(Mode::Act, Egress::Open, &matrix, None, &reg),
+        advertised_tools(Mode::Act, Egress::Open, &matrix, None, &reg, None),
         None
     );
     assert_eq!(
-        advertised_tools(Mode::Auto, Egress::Open, &matrix, None, &reg),
+        advertised_tools(Mode::Auto, Egress::Open, &matrix, None, &reg, None),
         None
     );
     let allowed: std::collections::HashSet<String> =
         ["view", "edit"].iter().map(|s| s.to_string()).collect();
     assert_eq!(
-        advertised_tools(Mode::Auto, Egress::Open, &matrix, Some(&allowed), &reg),
+        advertised_tools(
+            Mode::Auto,
+            Egress::Open,
+            &matrix,
+            Some(&allowed),
+            &reg,
+            None
+        ),
         Some(allowed)
     );
 }
@@ -367,7 +381,7 @@ fn local_only_egress_strips_network_tools_in_act() {
     // reduced to the local-only set — network tools are stripped.
     let reg = ToolRegistry::with_defaults();
     let matrix = PermissionMatrix::default();
-    let advertised = advertised_tools(Mode::Act, Egress::LocalOnly, &matrix, None, &reg)
+    let advertised = advertised_tools(Mode::Act, Egress::LocalOnly, &matrix, None, &reg, None)
         .expect("LocalOnly restricts even in Act");
     for name in ["view", "edit", "grep", "diagnostics", "agent"] {
         assert!(
@@ -389,7 +403,8 @@ fn local_only_composes_with_plan_mode() {
     // is dropped by the Plan pass; `web_fetch` (read-shaped but network) by egress.
     let reg = ToolRegistry::with_defaults();
     let matrix = PermissionMatrix::default();
-    let advertised = advertised_tools(Mode::Plan, Egress::LocalOnly, &matrix, None, &reg).unwrap();
+    let advertised =
+        advertised_tools(Mode::Plan, Egress::LocalOnly, &matrix, None, &reg, None).unwrap();
     assert!(advertised.contains("view"));
     assert!(advertised.contains("grep"));
     assert!(!advertised.contains("edit"), "Plan drops the mutating edit");
@@ -412,8 +427,15 @@ fn local_only_composes_with_subagent_allowlist() {
         .iter()
         .map(|s| s.to_string())
         .collect();
-    let advertised =
-        advertised_tools(Mode::Auto, Egress::LocalOnly, &matrix, Some(&allowed), &reg).unwrap();
+    let advertised = advertised_tools(
+        Mode::Auto,
+        Egress::LocalOnly,
+        &matrix,
+        Some(&allowed),
+        &reg,
+        None,
+    )
+    .unwrap();
     assert_eq!(advertised, ["view".to_string()].into_iter().collect());
 }
 
@@ -423,7 +445,7 @@ fn open_egress_is_byte_identical_to_pre_rfc() {
     let reg = ToolRegistry::with_defaults();
     let matrix = PermissionMatrix::default();
     assert_eq!(
-        advertised_tools(Mode::Act, Egress::Open, &matrix, None, &reg),
+        advertised_tools(Mode::Act, Egress::Open, &matrix, None, &reg, None),
         None
     );
 }
@@ -516,6 +538,7 @@ async fn plan_mode_hard_blocks_dispatch_of_a_hidden_tool() {
         compaction_budget: None,
         compaction_cache: None,
         near_budget_tokens: None,
+        tool_search: None,
     };
 
     run_turn(
@@ -3546,6 +3569,7 @@ async fn subagent_depth_guard_refuses_nested_spawn() {
         compaction_budget: None,
         compaction_cache: None,
         near_budget_tokens: None,
+        tool_search: None,
     };
 
     run_turn(
@@ -3608,6 +3632,7 @@ async fn subagent_allowlist_blocks_disallowed_tool() {
         compaction_budget: None,
         compaction_cache: None,
         near_budget_tokens: None,
+        tool_search: None,
     };
 
     run_turn(
@@ -6760,4 +6785,233 @@ async fn zero_near_budget_is_floored_and_does_not_fold_every_turn() {
         Some(0),
         "a 0 Near budget must be floored, not fold a tiny transcript every turn"
     );
+}
+
+// ---------------------------------------------------------------------------
+// RFC 0024 — just-in-time tool loading
+// ---------------------------------------------------------------------------
+
+/// A deferred stub whose safety/egress profile is controllable, so the deferral
+/// pass can be tested against each earlier pass in the pipeline.
+struct DeferredStub {
+    name: &'static str,
+    max: Safety,
+    network: bool,
+}
+
+#[async_trait::async_trait]
+impl ff_tools::Tool for DeferredStub {
+    fn name(&self) -> &str {
+        self.name
+    }
+    fn description(&self) -> &str {
+        "deferred stub"
+    }
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({"type": "object", "properties": {}})
+    }
+    fn max_safety(&self) -> Safety {
+        self.max
+    }
+    fn reaches_network(&self) -> bool {
+        self.network
+    }
+    fn defer(&self) -> bool {
+        true
+    }
+    async fn run(
+        &self,
+        _args: serde_json::Value,
+        _root: &std::path::Path,
+    ) -> ff_tools::ToolOutcome {
+        ff_tools::ToolOutcome::ok("ran")
+    }
+}
+
+fn deferred_stub(name: &'static str, max: Safety, network: bool) -> Box<dyn ff_tools::Tool> {
+    Box::new(DeferredStub { name, max, network })
+}
+
+fn admitted(names: &[&str]) -> std::collections::HashSet<String> {
+    names.iter().map(|s| s.to_string()).collect()
+}
+
+#[test]
+fn deferred_tools_are_withheld_until_searched_for() {
+    let mut reg = ToolRegistry::with_defaults();
+    reg.register(deferred_stub("mcp_thing", Safety::ReadOnly, false));
+    let matrix = PermissionMatrix::default();
+
+    let without = advertised_tools(Mode::Act, Egress::Open, &matrix, None, &reg, None)
+        .expect("deferral materialises the set");
+    assert!(
+        !without.contains("mcp_thing"),
+        "a deferred tool must not be advertised before a search"
+    );
+    assert!(without.contains("view"), "resident tools stay advertised");
+
+    let with = advertised_tools(
+        Mode::Act,
+        Egress::Open,
+        &matrix,
+        None,
+        &reg,
+        Some(&admitted(&["mcp_thing"])),
+    )
+    .expect("still an explicit set");
+    assert!(
+        with.contains("mcp_thing"),
+        "a searched-for tool must become advertised"
+    );
+}
+
+#[test]
+fn a_registry_with_nothing_deferred_is_byte_identical_to_before() {
+    // The `None` return means "advertise everything"; deferral must not perturb it,
+    // or every existing caller changes behaviour.
+    let reg = ToolRegistry::with_defaults();
+    let matrix = PermissionMatrix::default();
+    assert!(
+        advertised_tools(Mode::Act, Egress::Open, &matrix, None, &reg, None).is_none(),
+        "no deferred tools => unchanged 'everything is visible' contract"
+    );
+}
+
+#[test]
+fn searched_for_tool_still_cannot_escape_plan_mode() {
+    // The security property: `tool_search` is a context-budget mechanism, never a
+    // capability grant. A Dangerous tool re-admitted by a search must stay hidden in
+    // Plan mode exactly as a resident Dangerous tool would be.
+    let mut reg = ToolRegistry::with_defaults();
+    reg.register(deferred_stub("mcp_deploy", Safety::Dangerous, false));
+    let matrix = PermissionMatrix::default();
+
+    let advertised = advertised_tools(
+        Mode::Plan,
+        Egress::Open,
+        &matrix,
+        None,
+        &reg,
+        Some(&admitted(&["mcp_deploy"])),
+    )
+    .expect("Plan restricts");
+    assert!(
+        !advertised.contains("mcp_deploy"),
+        "deferral must not become a privilege-escalation bypass"
+    );
+}
+
+#[test]
+fn searched_for_tool_still_cannot_escape_local_only_egress() {
+    // The same property against the egress pass (RFC 0013).
+    let mut reg = ToolRegistry::with_defaults();
+    reg.register(deferred_stub("mcp_remote", Safety::ReadOnly, true));
+    let matrix = PermissionMatrix::default();
+
+    let advertised = advertised_tools(
+        Mode::Act,
+        Egress::LocalOnly,
+        &matrix,
+        None,
+        &reg,
+        Some(&admitted(&["mcp_remote"])),
+    )
+    .expect("LocalOnly restricts");
+    assert!(
+        !advertised.contains("mcp_remote"),
+        "a network-reaching tool must stay hidden under LocalOnly even once searched"
+    );
+}
+
+#[test]
+fn searched_for_tool_still_cannot_escape_a_subagent_allowlist() {
+    // `allowed` narrows; the deferral pass widens. The narrowing must win, or a
+    // delegated child could search its way out of its grant.
+    let mut reg = ToolRegistry::with_defaults();
+    reg.register(deferred_stub("mcp_thing", Safety::ReadOnly, false));
+    let matrix = PermissionMatrix::default();
+    let allowed: std::collections::HashSet<String> = admitted(&["view", "grep"]);
+
+    let advertised = advertised_tools(
+        Mode::Act,
+        Egress::Open,
+        &matrix,
+        Some(&allowed),
+        &reg,
+        Some(&admitted(&["mcp_thing"])),
+    )
+    .expect("an explicit allowlist");
+    assert!(
+        !advertised.contains("mcp_thing"),
+        "a search must not widen a sub-agent beyond its allowlist"
+    );
+    assert!(advertised.contains("view"));
+}
+
+#[test]
+fn admitting_an_unknown_name_is_harmless() {
+    let mut reg = ToolRegistry::with_defaults();
+    reg.register(deferred_stub("mcp_thing", Safety::ReadOnly, false));
+    let matrix = PermissionMatrix::default();
+    let advertised = advertised_tools(
+        Mode::Act,
+        Egress::Open,
+        &matrix,
+        None,
+        &reg,
+        Some(&admitted(&["no_such_tool"])),
+    )
+    .expect("explicit set");
+    assert!(!advertised.contains("no_such_tool"));
+    assert!(!advertised.contains("mcp_thing"));
+}
+
+#[test]
+fn appended_schemas_leave_the_stable_prefix_byte_identical() {
+    // RFC 0024 §6, the cache invariant: mid-turn growth must be strictly append-only.
+    // If a widened `openai_tools_for` were used instead, the new tool would sort into
+    // the middle and shift every byte after it, busting the provider's cached prefix.
+    let mut reg = ToolRegistry::with_defaults();
+    reg.register(deferred_stub("aaa_sorts_first", Safety::ReadOnly, false));
+    let matrix = PermissionMatrix::default();
+
+    let stable_set = advertised_tools(Mode::Act, Egress::Open, &matrix, None, &reg, None).unwrap();
+    let stable = reg.openai_tools_for(Some(&stable_set), true);
+
+    // The stub's name sorts before every built-in, so a naive re-sort would put it at
+    // index 0 — the worst case for prefix stability.
+    let appended = reg.openai_tools_named(&admitted(&["aaa_sorts_first"]));
+    let mut grown = stable.clone();
+    grown.extend(appended);
+
+    assert_eq!(
+        serde_json::to_string(&stable).unwrap(),
+        serde_json::to_string(&grown[..stable.len()]).unwrap(),
+        "the stable region must be byte-identical after appending"
+    );
+    assert_eq!(grown.len(), stable.len() + 1, "growth is append-only");
+    assert_eq!(
+        grown[stable.len()]["function"]["name"],
+        "aaa_sorts_first",
+        "the new definition lands at the tail, not sorted into the middle"
+    );
+}
+
+#[test]
+fn appending_is_deterministic_within_a_batch() {
+    // Within one appended batch the order is name-sorted, so an identical search
+    // yields an identical suffix and the next turn can still cache it.
+    let mut reg = ToolRegistry::with_defaults();
+    reg.register(deferred_stub("zzz_tool", Safety::ReadOnly, false));
+    reg.register(deferred_stub("mmm_tool", Safety::ReadOnly, false));
+    let batch = admitted(&["zzz_tool", "mmm_tool"]);
+
+    let a = reg.openai_tools_named(&batch);
+    let b = reg.openai_tools_named(&batch);
+    assert_eq!(
+        serde_json::to_string(&a).unwrap(),
+        serde_json::to_string(&b).unwrap()
+    );
+    assert_eq!(a[0]["function"]["name"], "mmm_tool");
+    assert_eq!(a[1]["function"]["name"], "zzz_tool");
 }

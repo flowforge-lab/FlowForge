@@ -41,6 +41,7 @@ mod shell;
 mod sink;
 mod test_runner;
 mod todo;
+mod tool_search;
 mod tree;
 pub mod url_safety;
 mod view;
@@ -58,9 +59,13 @@ pub use jail::resolve_in_root;
 pub use notebook::{KernelLiveState, KernelSupervisor, NotebookKernelState, NotebookTool};
 pub use registry::{
     is_subagent, ObserverIntent, ObserverIntentKind, Safety, Tool, ToolOutcome, ToolRegistry,
+    NO_SESSION,
 };
 pub use sink::{OutputSink, OutputStream};
 pub use test_runner::TestRunnerTool;
+pub use tool_search::{
+    ToolSearchIndex, ToolSearchState, ToolSearchTool, MAX_HITS as TOOL_SEARCH_MAX_HITS,
+};
 pub use url_safety::SsrfPolicy;
 pub use web_search::{
     NoUserInfo, PubMedSource, SearchKeyProvider, SearchSource, SearchTool, SearchUserInfoProvider,
