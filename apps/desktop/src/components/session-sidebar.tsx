@@ -619,6 +619,12 @@ export function SessionSidebar() {
 
   const pinnedIds = useSessionPrefsStore((s) => s.pinned);
   const dismissedIds = useSessionPrefsStore((s) => s.dismissed);
+  // `durableStorage` is always async, so `pinned` reads as `[]` for a beat on
+  // first mount even when sessions ARE pinned — arranging against that would
+  // paint the pinned group in plain recency order, then reorder once
+  // hydration lands. That's the exact user-visible symptom #1110 fixed, so
+  // rows stay unrendered until hydration resolves (near-instant in practice).
+  const prefsHydrated = useSessionPrefsStore((s) => s.hasHydrated);
   const dismiss = useSessionPrefsStore((s) => s.dismiss);
   const restore = useSessionPrefsStore((s) => s.restore);
   const deleteSession = useChatStore((s) => s.deleteSession);
@@ -724,7 +730,9 @@ export function SessionSidebar() {
 
   // Ordered list: pinned → other live → dismissed (dismissed sink to the bottom),
   // then revealed incrementally (#667). The active session is always kept visible.
-  const arranged = arrangeSessions(filtered, pinnedSet, dismissedSet);
+  // `pinnedIds`, not `pinnedSet`: the pinned group is ordered by pin recency, so
+  // arrangeSessions needs the store's insertion order, not just membership (#1110).
+  const arranged = arrangeSessions(filtered, pinnedIds, dismissedSet);
   const { visible, hasMore } = selectSessionOverflow(
     arranged,
     activeSessionId,
@@ -1068,21 +1076,27 @@ export function SessionSidebar() {
 
           <ScrollArea className="min-h-0 flex-1">
             <nav className="flex flex-col gap-px p-1.5">
-              {rows.map((session) => (
-                <SessionItem
-                  key={session.id}
-                  session={session}
-                  index={indexById.get(session.id) ?? 0}
-                  active={session.id === activeSessionId}
-                  streaming={Boolean(streamingBySession[session.id])}
-                  finished={Boolean(recentlyFinishedBySession[session.id])}
-                  pinned={pinnedSet.has(session.id)}
-                  dismissed={dismissedSet.has(session.id)}
-                  selectMode={selectMode}
-                  selected={selected.has(session.id)}
-                  onToggleSelect={() => toggleSelect(session.id)}
-                />
-              ))}
+              {/* Withheld until session-prefs hydrates (#1110): rendering rows
+              against the default `pinned: []` would paint the pinned group in
+              plain recency order for one frame, then reorder once the
+              (always-async, since it moved off localStorage) read lands —
+              the exact "pin looked like it did nothing" symptom this fixed. */}
+              {prefsHydrated &&
+                rows.map((session) => (
+                  <SessionItem
+                    key={session.id}
+                    session={session}
+                    index={indexById.get(session.id) ?? 0}
+                    active={session.id === activeSessionId}
+                    streaming={Boolean(streamingBySession[session.id])}
+                    finished={Boolean(recentlyFinishedBySession[session.id])}
+                    pinned={pinnedSet.has(session.id)}
+                    dismissed={dismissedSet.has(session.id)}
+                    selectMode={selectMode}
+                    selected={selected.has(session.id)}
+                    onToggleSelect={() => toggleSelect(session.id)}
+                  />
+                ))}
               {/* One endless, incremental reveal (#667): +25 rows per click, walking
               non-dismissed then dismissed. "Show less" re-compacts to the first
               batch once expanded. */}

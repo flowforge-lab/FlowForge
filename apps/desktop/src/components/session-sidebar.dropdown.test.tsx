@@ -76,7 +76,12 @@ describe("SessionSidebar — compact dropdown keyboard nav (#876/#902)", () => {
     usePrefsStore.setState({ sidebarCollapsed: false });
     usePanesStore.setState({ root: null, focusedPaneId: null });
     useAllConversationsSearchStore.setState({ open: false });
-    useSessionPrefsStore.setState({ pinned: [], dismissed: [] });
+    // hasHydrated: true — see session-sidebar.integration.test.tsx (#1110 follow-up).
+    useSessionPrefsStore.setState({
+      pinned: [],
+      dismissed: [],
+      hasHydrated: true,
+    });
     // None of the titles contain "bug" — every result comes from the content
     // dropdown, not the title-filtered list, so there's no exclusion overlap.
     useChatStore.setState({

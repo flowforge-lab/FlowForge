@@ -64,7 +64,17 @@ describe("SessionSidebar integration (#185)", () => {
     });
     localStorage.clear();
     usePrefsStore.setState({ sidebarCollapsed: false });
-    useSessionPrefsStore.setState({ pinned: [], dismissed: [] });
+    // `hasHydrated: true` — steady state for every test here except the one
+    // specifically exercising the pre-hydration window (#1110 follow-up),
+    // which overrides it. Without this, rows wouldn't render at all: real
+    // hydration timing (an async durableStorage read, even in its
+    // localStorage fallback branch) isn't something these tests should have
+    // to race against.
+    useSessionPrefsStore.setState({
+      pinned: [],
+      dismissed: [],
+      hasHydrated: true,
+    });
     useChatStore.setState({
       sessions: [session("s1"), session("s2")],
       activeSessionId: "s1",
@@ -210,6 +220,48 @@ describe("SessionSidebar integration (#185)", () => {
     const activeIdx = (container.textContent ?? "").indexOf("Active one");
     const dismissedIdx = (container.textContent ?? "").indexOf("Dismissed one");
     expect(activeIdx).toBeLessThan(dismissedIdx);
+    cleanup();
+  });
+
+  // #1110 follow-up: `durableStorage` is always async, so `pinned` reads as
+  // `[]` for a beat on mount even when sessions ARE pinned. Rendering against
+  // that stale default would paint the pinned group in plain recency order,
+  // then reorder once hydration lands — the exact "pin looked like it did
+  // nothing" symptom the fix addressed, just moved to app-launch time instead
+  // of an in-session pin click.
+  it("withholds session rows until session-prefs hydrates, then paints pinned order", () => {
+    useChatStore.setState({
+      sessions: [
+        session("a", { title: "Newest" }),
+        session("b", { title: "Middle" }),
+        session("c", { title: "Oldest" }),
+      ],
+      activeSessionId: null,
+    });
+    // Simulate the pre-hydration window: `pinned` already holds the real
+    // value (set directly here, bypassing the async read this test isn't
+    // exercising), but `hasHydrated` hasn't flipped yet — matching the state
+    // durableStorage's default leaves the store in before its read lands.
+    useSessionPrefsStore.setState({ pinned: ["c"], hasHydrated: false });
+
+    const { container, cleanup } = render(<SessionSidebar />);
+
+    // No rows at all pre-hydration — not even in the wrong order. A flash of
+    // plain-recency order here would be indistinguishable from the pin
+    // simply not having taken effect.
+    expect(container.textContent).not.toContain("Newest");
+    expect(container.textContent).not.toContain("Middle");
+    expect(container.textContent).not.toContain("Oldest");
+
+    act(() => {
+      useSessionPrefsStore.setState({ hasHydrated: true });
+    });
+
+    // Once hydrated, the pinned session (oldest by recency) renders on top —
+    // never visible in any other order.
+    const text = container.textContent ?? "";
+    expect(text).toContain("Oldest");
+    expect(text.indexOf("Oldest")).toBeLessThan(text.indexOf("Newest"));
     cleanup();
   });
 

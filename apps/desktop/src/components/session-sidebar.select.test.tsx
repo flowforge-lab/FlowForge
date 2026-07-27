@@ -57,7 +57,12 @@ describe("SessionSidebar — multi-select (#643)", () => {
     localStorage.clear();
     usePrefsStore.setState({ sidebarCollapsed: false });
     usePanesStore.setState({ root: null, focusedPaneId: null });
-    useSessionPrefsStore.setState({ pinned: [], dismissed: [] });
+    // hasHydrated: true — see session-sidebar.integration.test.tsx (#1110 follow-up).
+    useSessionPrefsStore.setState({
+      pinned: [],
+      dismissed: [],
+      hasHydrated: true,
+    });
     useChatStore.setState({
       sessions: [session("s1"), session("s2"), session("s3")],
       activeSessionId: "s1",
