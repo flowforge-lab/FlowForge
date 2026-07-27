@@ -8,7 +8,7 @@ fn log_dir_sits_under_data_dir() {
 }
 
 /// The default (no env var) must stay a no-op: a normal launch installs no
-/// subscriber and writes nothing, exactly as before #1117.
+/// subscriber and writes nothing, exactly as before #1118.
 #[test]
 fn init_is_disabled_without_the_env_var() {
     // Guard against a polluted environment rather than mutating it: these tests

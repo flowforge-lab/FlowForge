@@ -1,4 +1,4 @@
-//! Tracing subscriber installation (#1117).
+//! Tracing subscriber installation (#1118).
 //!
 //! The workspace is thoroughly instrumented with `tracing` macros — the
 //! observer wake path alone emits "observer wake spawning turn", "observer
@@ -97,7 +97,7 @@ pub fn init(data_dir: &std::path::Path) -> Option<WorkerGuard> {
     tracing::info!(
         directive = %directive,
         log_dir = %dir.display(),
-        "tracing subscriber installed (#1117)"
+        "tracing subscriber installed (#1118)"
     );
     Some(guard)
 }

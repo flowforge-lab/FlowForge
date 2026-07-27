@@ -1613,6 +1613,9 @@ fn spawn_assistant_turn(
     // point: the wake path buffers and delegates here.
     let buffered = state.drain_observer_buffer(&session_id);
     let wake_context: Option<String> = observer_wake_context(&buffered);
+    // Captured before `wake_context` is moved into `extra_instructions` below, so
+    // the turn's outcome log can say whether this was an observer-initiated turn.
+    let is_observer_wake = wake_context.is_some();
     if wake_context.is_some() {
         tracing::info!(
             session_id = %session_id,
@@ -1817,12 +1820,46 @@ fn spawn_assistant_turn(
         .await;
 
         if let Err(ref e) = result {
+            // The blind spot that stalled the #1117 diagnosis: this path emitted
+            // `turn:error` to the FE and logged NOTHING. A user-initiated turn
+            // still shows the error in the transcript, but an observer-initiated
+            // turn has no one watching — it failed, wrote no row, and left no
+            // trace, so the log could not say whether the wake turn ran and
+            // failed or never ran at all. Log every turn failure, tagged with
+            // whether a wake initiated it.
+            tracing::error!(
+                session_id = %session_id,
+                observer_wake = is_observer_wake,
+                drain_count,
+                error = %e,
+                "turn failed"
+            );
             let _ = app.emit(
                 "turn:error",
                 TurnErrorEvent {
                     session_id: session_id.clone(),
                     message: e.to_string(),
                 },
+            );
+        } else if is_observer_wake {
+            // The other half of the ambiguity: prove a wake turn that produced no
+            // visible output actually *succeeded*, rather than failing silently.
+            tracing::info!(
+                session_id = %session_id,
+                drain_count,
+                // The wake turn under investigation left NO transcript row at all,
+                // which a plain success cannot explain — so record the shape of the
+                // message it returned. `content_len = 0` with no tool calls means
+                // the turn completed yet said nothing (an empty/NO_REPLY reply),
+                // which is a different bug from a rejected request.
+                message_id = result.as_ref().map(|m| m.id.as_str()).unwrap_or(""),
+                content_len = result.as_ref().map(|m| m.content.len()).unwrap_or(0),
+                tool_calls = result
+                    .as_ref()
+                    .ok()
+                    .and_then(|m| m.tool_calls.as_ref())
+                    .map_or(0, |c| c.len()),
+                "observer wake turn completed without error"
             );
         }
 
@@ -4124,7 +4161,7 @@ pub fn run() {
     // unmeasurable from here (the platform floor the issue calls out); the FE's
     // `performance.now()` in `mark_fe_ready` gives the closest proxy for that.
     let _ = BOOT_T0.set(std::time::Instant::now());
-    // #1117: install the tracing subscriber FIRST, before any instrumented code
+    // #1118: install the tracing subscriber FIRST, before any instrumented code
     // runs — the observer pump, process reaper and scheduler all emit on paths
     // reached during `setup`, and events emitted before this line are lost.
     // Opt-in via `FF_LOG`; unset means no subscriber, exactly as before. The
