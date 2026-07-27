@@ -52,6 +52,22 @@ pub struct McpServerConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub reaches_network: Option<bool>,
+    /// Whether this server's tools are *deferred*: discoverable via `tool_search`
+    /// rather than listed in every request's tools block (RFC 0024 Layer 1).
+    ///
+    /// `None` (unset) means **deferred**, which is the point: measured on a live
+    /// workstation, 77 bridged tools cost 33,890 tokens — 81% of a ~41,400-token
+    /// standing block — and past ~30-50 offered tools selection accuracy degrades.
+    /// A server whose tools should always be resident (a small, hot, general-purpose
+    /// one) sets `false`.
+    ///
+    /// Deferral only affects *advertising*. A deferred tool is still registered and
+    /// still dispatchable, and re-admitting it via `tool_search` does not bypass the
+    /// mode or egress passes — so this is a context-budget knob, never a capability
+    /// one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub defer: Option<bool>,
 }
 
 /// Lifecycle state of a supervised MCP server (RFC 0003 §5). The supervisor (M4.2)
@@ -119,6 +135,18 @@ pub struct McpToolInfo {
     /// feeds the bridged tool's `Safety`.
     #[serde(default = "default_reaches_network")]
     pub reaches_network: bool,
+    /// Whether this tool is deferred out of the standing tools block (RFC 0024).
+    /// Overlaid at publish time from the server's [`McpServerConfig::defer`], the
+    /// same way `reaches_network` is. Defaults to `true`: bridged tools are the bulk
+    /// of the standing cost, so they are deferred unless a server opts out.
+    #[serde(default = "default_defer")]
+    pub defer: bool,
+}
+
+/// Default for [`McpToolInfo::defer`]: bridged tools are deferred unless their
+/// server opts out. Costs a `tool_search` round-trip, never correctness.
+fn default_defer() -> bool {
+    true
 }
 
 /// Fail-safe default for [`McpToolInfo::reaches_network`]: treat a tool as

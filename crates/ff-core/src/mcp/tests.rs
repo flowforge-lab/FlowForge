@@ -24,6 +24,7 @@ fn server_config_round_trips_and_is_camel_case() {
         disabled: false,
         scope: McpScope::Global,
         reaches_network: None,
+        defer: None,
     };
     round_trip(&cfg);
     // `disabled` defaults so a minimal config parses.
@@ -101,6 +102,7 @@ fn tool_info_round_trips_with_schema() {
         }),
         read_only_hint: true,
         reaches_network: true,
+        defer: true,
     };
     round_trip(&tool);
     // camelCase: the Rust `input_schema` field is `inputSchema` on the wire.
@@ -114,4 +116,8 @@ fn tool_info_round_trips_with_schema() {
     .unwrap();
     assert!(bare.reaches_network);
     assert!(!bare.read_only_hint);
+    // RFC 0024: `defer` likewise defaults on when absent, so a tool the supervisor
+    // hasn't stamped stays out of the standing tools block rather than silently
+    // enlarging it.
+    assert!(bare.defer);
 }

@@ -14,4 +14,20 @@ export type McpServerConfig = { id: string, command: string, args: Array<string>
  * it available under local-only. The MCP protocol has no network annotation,
  * so this is an operator assertion in `mcp.json`, not a server-declared hint.
  */
-reachesNetwork?: boolean, };
+reachesNetwork?: boolean, 
+/**
+ * Whether this server's tools are *deferred*: discoverable via `tool_search`
+ * rather than listed in every request's tools block (RFC 0024 Layer 1).
+ *
+ * `None` (unset) means **deferred**, which is the point: measured on a live
+ * workstation, 77 bridged tools cost 33,890 tokens — 81% of a ~41,400-token
+ * standing block — and past ~30-50 offered tools selection accuracy degrades.
+ * A server whose tools should always be resident (a small, hot, general-purpose
+ * one) sets `false`.
+ *
+ * Deferral only affects *advertising*. A deferred tool is still registered and
+ * still dispatchable, and re-admitting it via `tool_search` does not bypass the
+ * mode or egress passes — so this is a context-budget knob, never a capability
+ * one.
+ */
+defer?: boolean, };

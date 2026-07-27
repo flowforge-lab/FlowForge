@@ -18,7 +18,7 @@ use ff_core::{
 };
 use ff_llm::{ChatMessage, ChatRequest, FunctionCall, LlmError, Provider, ToolCall as LlmToolCall};
 use ff_session::SessionStore;
-use ff_tools::{Safety, ToolRegistry, COMPACTION_RETRIEVE_TOOL};
+use ff_tools::{Safety, ToolRegistry, ToolSearchState, COMPACTION_RETRIEVE_TOOL};
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 
@@ -524,6 +524,19 @@ pub struct ToolContext<'a> {
     /// [`DEFAULT_NEAR_BUDGET_TOKENS`] (capped to the wire target). Host seam:
     /// desktop reads the connection field / `FF_NEAR_BUDGET` env.
     pub near_budget_tokens: Option<u64>,
+    /// Just-in-time tool discovery state (RFC 0024 Layer 1). When provided, tools
+    /// that opt out of the standing block via [`Tool::defer`] are withheld from the
+    /// advertised set until `tool_search` finds them for this session, and the
+    /// resulting definitions are appended to the tools block mid-turn.
+    ///
+    /// Distinct from [`allowed`](Self::allowed) and deliberately not folded into it:
+    /// `allowed` *narrows* the surface to a fixed list (sub-agent delegation),
+    /// whereas this *re-widens* it as the model discovers what it needs. Opposite
+    /// directions, so conflating them would let a search escape a sub-agent's
+    /// allowlist.
+    ///
+    /// `None` = no deferral; every registered tool is advertised as before.
+    pub tool_search: Option<&'a ToolSearchState>,
 }
 
 impl<'a> ToolContext<'a> {
@@ -551,6 +564,7 @@ impl<'a> ToolContext<'a> {
             compaction_budget: None,
             compaction_cache: None,
             near_budget_tokens: None,
+            tool_search: None,
         }
     }
 }
@@ -895,12 +909,21 @@ fn context_breakdown(
 ///
 /// In Act/Auto all tools remain visible; the matrix's Deny cells are enforced at
 /// **invocation time** (the approver rejects the call) rather than hiding the tool.
+///
+/// Finally the **deferral pass** (RFC 0024 Layer 1) drops tools that opted out of the
+/// standing block via [`Tool::defer`] and re-admits the ones `tool_search` has found
+/// for this session. Crucially the re-admitted names are intersected back through the
+/// mode and egress results rather than unioned onto them: deferral is a context-budget
+/// mechanism, and a tool that Plan mode or LocalOnly would hide must stay hidden even
+/// after a search finds it. Otherwise `tool_search` would be a capability-escalation
+/// bypass.
 fn advertised_tools(
     mode: Mode,
     egress: Egress,
     matrix: &PermissionMatrix,
     allowed: Option<&std::collections::HashSet<String>>,
     registry: &ToolRegistry,
+    admitted: Option<&std::collections::HashSet<String>>,
 ) -> Option<std::collections::HashSet<String>> {
     // Mode pass: in Act/Auto all tools are visible (`allowed` may be None = all);
     // in Plan, restrict to the read-capable + non-Denied-ceiling set.
@@ -925,16 +948,54 @@ fn advertised_tools(
     // set — the privacy analogue of the mode pass. Composes with Plan (local ∩
     // readonly) and with an explicit `allowed`. Open is a no-op, so behaviour is
     // byte-identical to pre-RFC when every phenotype is Open.
-    if !egress.is_local_only() {
-        return mode_visible;
+    let permitted = if !egress.is_local_only() {
+        mode_visible
+    } else {
+        let local = registry.local_tool_names();
+        Some(match mode_visible {
+            Some(set) => set.intersection(&local).cloned().collect(),
+            // Act/Auto + Open-would-be-None: the whole registry is visible, so the
+            // LocalOnly set is exactly the local tools.
+            None => local,
+        })
+    };
+
+    deferral_pass(registry, permitted, admitted)
+}
+
+/// Remove deferred tools from `permitted` and re-admit the searched-for ones
+/// (RFC 0024 Layer 1).
+///
+/// `permitted` carries the mode/egress verdict, where `None` means "the whole
+/// registry". Deferral has to materialise that `None` into an explicit set, because
+/// "everything except the deferred ones" is no longer expressible as "everything".
+///
+/// The re-admitted set is intersected with `permitted`, never unioned onto it — see
+/// the note on [`advertised_tools`]. When nothing is deferred this returns `permitted`
+/// untouched, so a workspace with no deferring tools keeps its previous behaviour
+/// (including the `None`, which callers rely on to mean "advertise everything").
+fn deferral_pass(
+    registry: &ToolRegistry,
+    permitted: Option<std::collections::HashSet<String>>,
+    admitted: Option<&std::collections::HashSet<String>>,
+) -> Option<std::collections::HashSet<String>> {
+    let deferred = registry.deferred_tool_names();
+    if deferred.is_empty() {
+        return permitted;
     }
-    let local = registry.local_tool_names();
-    Some(match mode_visible {
-        Some(set) => set.intersection(&local).cloned().collect(),
-        // Act/Auto + Open-would-be-None: the whole registry is visible, so the
-        // LocalOnly set is exactly the local tools.
-        None => local,
-    })
+    let mut visible = match permitted {
+        Some(set) => set,
+        // Materialise "everything" so the deferred names can be subtracted from it.
+        None => registry
+            .iter_tools()
+            .map(|t| t.name().to_string())
+            .collect(),
+    };
+    // Re-admit first, then subtract what is still deferred: a searched-for tool is
+    // simply no longer treated as deferred for this session.
+    visible
+        .retain(|name| !deferred.contains(name) || admitted.is_some_and(|set| set.contains(name)));
+    Some(visible)
 }
 
 /// RAII guard that guarantees every assistant `tool_use` gets a matching tool
@@ -1112,16 +1173,28 @@ pub async fn run_turn(
     mut on_event: impl FnMut(AgentEvent),
 ) -> Result<Message, AgentError> {
     let allow_subagent = tools.depth < tools.max_depth;
+    // RFC 0024: tools this session has already unlocked. Read once up front; the
+    // turn loop re-reads it after a `tool_search` call to append the new definitions.
+    let admitted = tools
+        .tool_search
+        .map(|s| s.admitted(session_id))
+        .unwrap_or_default();
     let advertised = advertised_tools(
         tools.mode,
         tools.egress,
         tools.matrix,
         tools.allowed.as_ref(),
         tools.registry,
+        Some(&admitted),
     );
-    let tool_schemas = tools
+    let mut tool_schemas = tools
         .registry
         .openai_tools_for(advertised.as_ref(), allow_subagent);
+    // RFC 0024 §6: everything advertised up front forms the *stable region* of the
+    // tools block. Definitions unlocked mid-turn by `tool_search` are appended after
+    // it and never merged back in, so the provider's cached prefix keeps matching
+    // byte-for-byte and only ever grows.
+    let mut appended: std::collections::HashSet<String> = admitted;
     let mut last: Option<Message> = None;
 
     let max_iter = tools.max_iterations.max(1);
@@ -2460,6 +2533,39 @@ pub async fn run_turn(
         // can't diverge into malformed history.
         drop(backfill);
 
+        // RFC 0024 §6: a `tool_search` call this iteration may have unlocked new
+        // tools. Append their definitions so the next request can actually call
+        // them. Appending after the stable region — rather than recomputing the
+        // whole array — is what keeps the cached prompt prefix byte-identical; see
+        // `openai_tools_named`.
+        if let Some(search) = tools.tool_search {
+            let unlocked = search.admitted(session_id);
+            // Cheap guard: on the overwhelmingly common iteration nothing was
+            // searched for, so skip recomputing the advertise pipeline entirely.
+            if unlocked.len() > appended.len() {
+                // Re-admission still passes through mode/egress: a search must not
+                // surface a tool the turn's permissions would hide. Computed once for
+                // the batch, not per candidate.
+                let permitted = advertised_tools(
+                    tools.mode,
+                    tools.egress,
+                    tools.matrix,
+                    tools.allowed.as_ref(),
+                    tools.registry,
+                    Some(&unlocked),
+                );
+                let fresh: std::collections::HashSet<String> = unlocked
+                    .difference(&appended)
+                    .filter(|name| permitted.as_ref().is_none_or(|set| set.contains(*name)))
+                    .cloned()
+                    .collect();
+                if !fresh.is_empty() {
+                    tool_schemas.extend(tools.registry.openai_tools_named(&fresh));
+                    appended.extend(fresh);
+                }
+            }
+        }
+
         last = Some(finalized);
 
         // A persistent repeated-call stall ends the turn here, before burning the
@@ -2599,6 +2705,12 @@ async fn run_subagent(
         compaction_budget: parent.compaction_budget,
         compaction_cache: None, // Sub-agents are ephemeral; no cross-turn caching.
         near_budget_tokens: parent.near_budget_tokens,
+        // RFC 0024: the child shares the discovery index but gets its own session
+        // key (`run_turn` is called with the child's own session id below), so it
+        // searches for what *it* needs rather than inheriting the parent's unlocked
+        // set. Its `allowed` list still narrows the result, so a search can never
+        // widen a delegation beyond what the parent granted.
+        tool_search: parent.tool_search,
     };
 
     // Child events are swallowed: the parent receives only the summary, never the

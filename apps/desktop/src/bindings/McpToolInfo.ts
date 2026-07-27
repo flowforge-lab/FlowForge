@@ -29,4 +29,11 @@ readOnlyHint: boolean,
  * unless the operator vetted the server as local. Mirrors how `read_only_hint`
  * feeds the bridged tool's `Safety`.
  */
-reachesNetwork: boolean, };
+reachesNetwork: boolean, 
+/**
+ * Whether this tool is deferred out of the standing tools block (RFC 0024).
+ * Overlaid at publish time from the server's [`McpServerConfig::defer`], the
+ * same way `reaches_network` is. Defaults to `true`: bridged tools are the bulk
+ * of the standing cost, so they are deferred unless a server opts out.
+ */
+defer: boolean, };

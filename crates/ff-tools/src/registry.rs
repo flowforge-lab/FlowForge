@@ -158,6 +158,31 @@ pub trait Tool: Send + Sync {
     fn dedupe_key(&self, _args: &Value) -> Option<String> {
         None
     }
+    /// Whether this tool is *deferred*: discoverable via `tool_search` but kept out
+    /// of the standing `tools` block (RFC 0024 Layer 1).
+    ///
+    /// Every advertised tool's full definition — name, description and complete
+    /// parameter schema — sits in the provider's cached prompt prefix on *every*
+    /// turn, whether or not the task needs it. Measured on a live workstation, the
+    /// 31 built-ins cost 7,503 tokens while 77 MCP-bridged tools cost 33,890 — 81%
+    /// of a ~41,400-token standing block spent keeping tools on standby. Beyond
+    /// ~30-50 simultaneously-offered tools, selection accuracy also degrades.
+    ///
+    /// A deferred tool is still registered and still dispatchable; it is simply not
+    /// advertised until `tool_search` re-admits it into the turn's allow-set.
+    ///
+    /// **Default is `false`** — a tool is advertised every turn unless it opts out.
+    /// The built-in distribution is healthy (median 121 tokens) and these are
+    /// high-frequency general-purpose tools, so they stay resident; MCP-bridged
+    /// tools (long descriptions, narrow applicability, unbounded count) are the
+    /// ones that opt in.
+    ///
+    /// Deferral is a *context-budget* mechanism, never a security one: re-admitted
+    /// tools are still filtered by the mode/egress passes, so deferring a tool
+    /// cannot be used to sneak it past a capability restriction.
+    fn defer(&self) -> bool {
+        false
+    }
     async fn run(&self, args: Value, root: &Path) -> ToolOutcome;
 
     /// Session-aware dispatch point. Tools that need per-session affinity
@@ -292,6 +317,39 @@ impl ToolRegistry {
             .collect()
     }
 
+    /// OpenAI `tools` entries for exactly `names`, name-sorted among themselves.
+    ///
+    /// Used to append just-in-time discovered tools to a turn's tools block
+    /// (RFC 0024 §6). The append has to be a separate call rather than a widened
+    /// [`openai_tools_for`] because that method sorts the *whole* array: re-running it
+    /// with extra names would interleave them into the middle of the block, shifting
+    /// the bytes that the provider's cached prefix depends on and triggering exactly
+    /// the full cold prefill #947 exists to avoid. Sorting only within the appended
+    /// batch keeps the block deterministic while leaving everything before it
+    /// byte-identical, so growth is strictly append-only.
+    pub fn openai_tools_named(&self, names: &HashSet<String>) -> Vec<Value> {
+        let mut tools: Vec<&dyn Tool> = self
+            .tools
+            .values()
+            .map(|t| t.as_ref())
+            .filter(|t| names.contains(t.name()))
+            .collect();
+        tools.sort_by(|a, b| a.name().cmp(b.name()));
+        tools
+            .into_iter()
+            .map(|t| {
+                serde_json::json!({
+                    "type": "function",
+                    "function": {
+                        "name": t.name(),
+                        "description": t.description(),
+                        "parameters": t.parameters(),
+                    }
+                })
+            })
+            .collect()
+    }
+
     /// Names of every tool whose worst-case safety is [`Safety::ReadOnly`] — tools
     /// that can *never* mutate regardless of arguments.
     pub fn readonly_tool_names(&self) -> HashSet<String> {
@@ -324,6 +382,18 @@ impl ToolRegistry {
         self.tools
             .values()
             .filter(|t| !t.reaches_network())
+            .map(|t| t.name().to_string())
+            .collect()
+    }
+
+    /// Names of tools that opt out of the standing `tools` block
+    /// ([`Tool::defer`] is `true`). Subtracted from the advertised set and used as
+    /// the corpus `tool_search` indexes (RFC 0024 Layer 1). Fail-open in the
+    /// budget sense — anything not explicitly deferred stays advertised.
+    pub fn deferred_tool_names(&self) -> HashSet<String> {
+        self.tools
+            .values()
+            .filter(|t| t.defer())
             .map(|t| t.name().to_string())
             .collect()
     }

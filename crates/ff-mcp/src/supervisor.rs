@@ -916,9 +916,13 @@ impl Supervisor {
                 // supervisor — which owns the config — resolves it here. Unset =
                 // fail-safe network-capable.
                 let reaches_network = h.config.reaches_network.unwrap_or(true);
+                // RFC 0024: unset means deferred — bridged tools are the bulk of the
+                // standing tools-block cost.
+                let defer = h.config.defer.unwrap_or(true);
                 let key = h.key.clone();
                 h.tools.iter().cloned().map(move |mut info| {
                     info.reaches_network = reaches_network;
+                    info.defer = defer;
                     PublishedTool {
                         key: key.clone(),
                         info,

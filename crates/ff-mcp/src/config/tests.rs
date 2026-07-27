@@ -68,6 +68,7 @@ fn substitute_workspace_resolves_placeholders_in_command_args_env() {
         disabled: false,
         scope: McpScope::Workspace,
         reaches_network: None,
+        defer: None,
     };
     let out = substitute_workspace(cfg, Some(Path::new("/Users/me/projects/repo")));
     assert_eq!(out.command, "/Users/me/projects/repo/bin/cg");
@@ -85,6 +86,7 @@ fn substitute_workspace_is_noop_and_keeps_placeholder_without_root() {
         disabled: false,
         scope: McpScope::Global,
         reaches_network: None,
+        defer: None,
     };
     let out = substitute_workspace(cfg, None);
     assert_eq!(out.args[1], "${workspace}");

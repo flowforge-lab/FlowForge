@@ -48,6 +48,10 @@ struct RawServerEntry {
     scope: McpScope,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     reaches_network: Option<bool>,
+    /// Unset means deferred (RFC 0024): the server's tools are reached through
+    /// `tool_search` instead of sitting in every request's tools block.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    defer: Option<bool>,
 }
 
 /// `skip_serializing_if` predicate: omit `disabled` when it is the default `false`.
@@ -123,6 +127,9 @@ pub fn upsert(path: &Path, def: &McpServerInput) -> Result<(), McpError> {
             // egress policy yet; a Settings UI to set it is future work. Written
             // configs omit the field (fail-safe network-capable) until then.
             reaches_network: None,
+            // Likewise omitted, so a newly-added server takes the deferred default
+            // (RFC 0024) rather than silently enlarging every request's tools block.
+            defer: None,
         },
     );
     write_raw(path, &raw)
@@ -200,6 +207,7 @@ fn parse(
             disabled: entry.disabled,
             scope: entry.scope,
             reaches_network: entry.reaches_network,
+            defer: entry.defer,
         });
     }
     // BTreeMap iteration is already id-sorted; keep that contract explicit.

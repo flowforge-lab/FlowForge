@@ -1690,6 +1690,7 @@ fn spawn_assistant_turn(
         tool_ctx.compaction_budget = state.compaction_budget(&conn_id);
         tool_ctx.near_budget_tokens = state.near_budget(&conn_id);
         tool_ctx.compaction_cache = Some(&state.compaction_cache);
+        tool_ctx.tool_search = Some(state.tool_search());
         // Skills + ambient context for this turn (RFC 0001 §4, RFC 0002 phase 1):
         // the resolved persona, installed-skill descriptions, the bodies of the
         // active skills, and the current local time.
@@ -2177,6 +2178,7 @@ impl GoalIteration for GoalLoopIteration {
         tool_ctx.mode = mode;
         tool_ctx.egress = pheno.egress;
         tool_ctx.abstractive = crate::state::abstractive_config_from_env();
+        tool_ctx.tool_search = Some(self.state.tool_search());
 
         let skills = self.state.skills_snapshot();
         let user_ctx =
@@ -2525,6 +2527,7 @@ impl ff_scheduled::TaskRunner for DesktopTaskRunner {
         tool_ctx.compaction_budget = self.state.compaction_budget(&selection.connection);
         tool_ctx.near_budget_tokens = self.state.near_budget(&selection.connection);
         tool_ctx.compaction_cache = Some(&self.state.compaction_cache);
+        tool_ctx.tool_search = Some(self.state.tool_search());
 
         let skills = self.state.skills_snapshot();
         let user_ctx =

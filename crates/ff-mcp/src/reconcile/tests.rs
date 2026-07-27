@@ -11,6 +11,7 @@ fn cfg(id: &str, command: &str) -> McpServerConfig {
         disabled: false,
         scope: McpScope::Global,
         reaches_network: None,
+        defer: None,
     }
 }
 

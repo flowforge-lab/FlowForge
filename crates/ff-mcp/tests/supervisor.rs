@@ -38,6 +38,7 @@ fn idle_exit_cfg() -> McpServerConfig {
         disabled: false,
         scope: McpScope::Global,
         reaches_network: None,
+        defer: None,
     }
 }
 
@@ -50,6 +51,7 @@ fn echo_cfg() -> McpServerConfig {
         disabled: false,
         scope: McpScope::Global,
         reaches_network: None,
+        defer: None,
     }
 }
 
@@ -62,6 +64,7 @@ fn exit_cfg() -> McpServerConfig {
         disabled: false,
         scope: McpScope::Global,
         reaches_network: None,
+        defer: None,
     }
 }
 
@@ -74,6 +77,7 @@ fn slow_cfg() -> McpServerConfig {
         disabled: false,
         scope: McpScope::Global,
         reaches_network: None,
+        defer: None,
     }
 }
 
@@ -324,6 +328,7 @@ fn cwd_cfg() -> McpServerConfig {
         // Workspace-scoped: one instance per session root (RFC 0018 §4.2).
         scope: McpScope::Workspace,
         reaches_network: None,
+        defer: None,
     }
 }
 

@@ -84,6 +84,7 @@ fn build_bridged_tools_disambiguates_names_that_collide_after_sanitization() {
             input_schema: serde_json::json!({}),
             read_only_hint: false,
             reaches_network: false,
+            defer: true,
         }
     }
 
@@ -158,4 +159,32 @@ fn bridged_tool_reaches_network_tracks_the_resolved_hint() {
     assert!(McpBridgedTool::for_test(true, true).reaches_network());
     assert!(!McpBridgedTool::for_test(false, false).reaches_network());
     assert!(McpBridgedTool::for_test(false, true).reaches_network());
+}
+
+#[test]
+fn bridged_tool_defers_by_default_and_honours_an_opt_out() {
+    // RFC 0024 Layer 1: bridged tools are ~81% of the standing tools-block cost, so
+    // they stay out of it unless their server opts out. Unlike `reaches_network`,
+    // getting this wrong costs a `tool_search` round-trip, never a capability leak —
+    // hence "default on" rather than "fail-safe".
+    let mut info = ff_core::McpToolInfo {
+        server: "s".into(),
+        name: "t".into(),
+        description: String::new(),
+        input_schema: serde_json::json!({}),
+        read_only_hint: false,
+        reaches_network: false,
+        defer: true,
+    };
+    let handle = SupervisorHandle::for_test();
+    assert!(
+        McpBridgedTool::new(handle.clone(), InstanceKey::global("s"), &info).defer(),
+        "a bridged tool is deferred unless its server says otherwise"
+    );
+
+    info.defer = false;
+    assert!(
+        !McpBridgedTool::new(handle, InstanceKey::global("s"), &info).defer(),
+        "a server marked defer=false keeps its tools resident"
+    );
 }

@@ -1499,6 +1499,14 @@ pub struct AppState {
     /// [`observer_events_rx`](Self::observer_events_rx) and drained by
     /// `start_observer_pump` on a single long-lived task.
     observer_supervisor: Arc<ObserverSupervisor>,
+    /// Per-session set of deferred tools unlocked by `tool_search` (RFC 0024 Layer 1).
+    ///
+    /// Held on `AppState` rather than rebuilt per turn because admissions must
+    /// **outlive the turn**: a tool the model searched for in one turn stays callable
+    /// in the next, which is also what keeps the tools block append-only across a
+    /// session (§6). Shared as an `Arc` with the `tool_search` tool instance the same
+    /// way `observer_supervisor` is shared with the `observer` tool.
+    tool_search: Arc<ff_tools::ToolSearchState>,
     /// The receive end of the observer event channel. Populated at
     /// construction (so the supervisor's `Arc` can be shared with the
     /// `observer` tool immediately); consumed once at
@@ -1664,6 +1672,7 @@ impl AppState {
             process_lifecycle_rx: Mutex::new(Some(process_lifecycle_rx)),
             kernel_supervisor: Arc::new(KernelSupervisor::new()),
             observer_supervisor,
+            tool_search: Arc::new(ff_tools::ToolSearchState::new()),
             observer_events_rx: Mutex::new(Some(observer_events_rx)),
             served_window_cache: Mutex::new(HashMap::new()),
             compaction_cache: CompactionCache::new(),
@@ -2072,6 +2081,18 @@ impl AppState {
                 reg.register(tool);
             }
         }
+        // RFC 0024 Layer 1, and necessarily last: the index snapshots whichever tools
+        // opted into deferral, so it has to be built after every other registration.
+        // `tool_search` is only registered when something is actually deferred —
+        // otherwise it would be a tool that can never return a hit, paying prompt
+        // tokens to advertise nothing.
+        let index = ff_tools::ToolSearchIndex::from_registry(&reg);
+        if !index.is_empty() {
+            reg.register(Box::new(ff_tools::ToolSearchTool::new(
+                self.tool_search.clone(),
+                index,
+            )));
+        }
         reg
     }
 
@@ -2312,6 +2333,13 @@ impl AppState {
     /// reaching into the private `observer_supervisor` field.
     pub fn buffer_observer_event(&self, session_id: &str, event: ff_observer::ObserverEvent) {
         self.observer_supervisor.buffer_event(session_id, event);
+    }
+
+    /// The just-in-time tool-discovery allow-set (RFC 0024 Layer 1), for handing to a
+    /// turn's `ToolContext`. Public for the same reason as
+    /// [`buffer_observer_event`](Self::buffer_observer_event).
+    pub fn tool_search(&self) -> &Arc<ff_tools::ToolSearchState> {
+        &self.tool_search
     }
 
     /// Take and clear every buffered observer event for

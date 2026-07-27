@@ -841,6 +841,7 @@ fn ws_server(id: &str) -> McpServerConfig {
         disabled: false,
         scope: ff_core::McpScope::Workspace,
         reaches_network: None,
+        defer: None,
     }
 }
 
