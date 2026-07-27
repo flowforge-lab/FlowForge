@@ -302,3 +302,61 @@ async fn the_admitted_set_only_ever_grows() {
     }
     assert_eq!(seen, 2);
 }
+
+/// A registry holding only `tool_search`, to exercise the two visibility
+/// predicates that gate advertisement in restricted phenotypes.
+fn registry_with_tool_search() -> ToolRegistry {
+    let mut reg = ToolRegistry::default();
+    let index = ToolSearchIndex::from_registry(&reg);
+    reg.register(Box::new(ToolSearchTool::new(
+        Arc::new(ToolSearchState::new()),
+        index,
+    )));
+    reg
+}
+
+#[test]
+fn tool_search_survives_the_plan_capability_filter() {
+    // Plan advertises only tools whose *floor* is ReadOnly. `tool_search` is the
+    // sole gateway to the deferred registry, so losing it in Plan would seal off
+    // every deferred tool with no way to unlock them.
+    let reg = registry_with_tool_search();
+    assert!(
+        reg.readonly_capable_names().contains("tool_search"),
+        "tool_search must stay visible in Plan"
+    );
+    // Advertised *and* invocable: a ReadOnly ceiling with a Write per-call safety
+    // would pass the filter, then be rejected by the approver.
+    assert_eq!(reg.safety("tool_search", &json!({})), Safety::ReadOnly);
+}
+
+#[test]
+fn tool_search_survives_the_local_only_filter() {
+    // A LocalOnly phenotype keeps only `!reaches_network()` tools; the trait
+    // default is a fail-safe `true`, which would drop `tool_search`.
+    let reg = registry_with_tool_search();
+    assert!(
+        reg.local_tool_names().contains("tool_search"),
+        "tool_search must stay visible under LocalOnly"
+    );
+}
+
+#[test]
+fn first_sentence_truncates_on_a_char_boundary() {
+    // Descriptions are arbitrary third-party MCP metadata. A multi-byte codepoint
+    // straddling the 160-byte cap used to panic on a non-boundary slice.
+    let desc = "毫".repeat(200);
+    let out = first_sentence(&desc);
+    assert!(out.ends_with('…'), "expected truncation marker: {out}");
+    assert!(out.len() <= 164, "cap overshot: {} bytes", out.len());
+    assert!(out.trim_end_matches('…').chars().all(|c| c == '毫'));
+
+    // A boundary landing exactly mid-codepoint: 'é' is 2 bytes, so byte 160 falls
+    // inside one char.
+    let mixed = format!("{}{}", "a".repeat(159), "é".repeat(20));
+    let out = first_sentence(&mixed);
+    assert!(out.starts_with(&"a".repeat(159)), "got: {out}");
+
+    // Short input is returned whole, with no marker.
+    assert_eq!(first_sentence("Short one."), "Short one.");
+}

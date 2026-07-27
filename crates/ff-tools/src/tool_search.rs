@@ -25,7 +25,7 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
-use crate::registry::{Tool, ToolOutcome, ToolRegistry};
+use crate::registry::{Safety, Tool, ToolOutcome, ToolRegistry};
 
 /// Hard cap on definitions injected per search, independent of the model's `limit`.
 ///
@@ -264,17 +264,36 @@ fn collect_keywords(v: &Value, out: &mut String, depth: usize) {
 }
 
 /// First sentence of `desc`, capped, for a one-line result summary.
+///
+/// The cap is byte-based but descriptions are arbitrary third-party MCP metadata,
+/// so a fixed 160 can land inside a multi-byte codepoint — slicing `&str` there
+/// panics. Walk `char_indices` to the last boundary at or before the cap instead.
 fn first_sentence(desc: &str) -> String {
     let flat = desc.split_whitespace().collect::<Vec<_>>().join(" ");
-    let cut = flat
-        .find(". ")
-        .map(|i| i + 1)
-        .unwrap_or_else(|| flat.len().min(160));
-    let mut s = flat[..cut.min(flat.len())].to_string();
+    let cut = match flat.find(". ") {
+        // The byte after '.' is a boundary, since '.' is single-byte ASCII.
+        Some(i) => i + 1,
+        None => floor_char_boundary(&flat, 160),
+    };
+    let mut s = flat[..cut].to_string();
     if s.len() < flat.len() {
         s.push('…');
     }
     s
+}
+
+/// Largest index `<= max` that is a char boundary of `s` (clamped to `s.len()`).
+///
+/// `str::floor_char_boundary` is still unstable, so derive it from `char_indices`.
+fn floor_char_boundary(s: &str, max: usize) -> usize {
+    if max >= s.len() {
+        return s.len();
+    }
+    s.char_indices()
+        .map(|(i, _)| i)
+        .take_while(|&i| i <= max)
+        .last()
+        .unwrap_or(0)
 }
 
 #[async_trait]
@@ -296,6 +315,30 @@ impl Tool for ToolSearchTool {
          in words (\"file a ticket\", \"check pipeline status\", \"search my notes\"); \
          matching tools are added to your available set and stay callable for the \
          rest of the session."
+    }
+
+    /// Scoring reads an in-memory index snapshot and admitting a name mutates only
+    /// this session's admitted set — harness bookkeeping, never the workspace, the
+    /// filesystem, or a remote. That holds for every argument shape, so the ceiling
+    /// is `ReadOnly` and `min_safety` inherits it (floor == ceiling).
+    ///
+    /// This is load-bearing, not cosmetic: `tool_search` is the *only* gateway to
+    /// the deferred registry, so a `Write` ceiling would strip it from Plan (the
+    /// Plan matrix Denies `Write`) and make every deferred tool permanently
+    /// unreachable there.
+    fn safety(&self, _args: &Value) -> Safety {
+        Safety::ReadOnly
+    }
+
+    fn max_safety(&self) -> Safety {
+        Safety::ReadOnly
+    }
+
+    /// Searching consults a local index only. Without this the `true` fail-safe
+    /// default would drop `tool_search` under a `LocalOnly` phenotype, again
+    /// sealing off every deferred tool.
+    fn reaches_network(&self) -> bool {
+        false
     }
 
     fn parameters(&self) -> Value {
