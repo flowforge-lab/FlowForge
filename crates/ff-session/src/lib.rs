@@ -193,6 +193,18 @@ impl SessionStore {
     }
 
     fn from_conn(conn: Connection) -> rusqlite::Result<Self> {
+        // Pin a 5s busy_timeout explicitly. WAL allows concurrent readers but
+        // only one writer at a time; without a wait, a contending write returns
+        // SQLITE_BUSY instantly and `insert_session`'s `.expect("insert
+        // session")` would panic the losing process. Now that the CLI shares
+        // the GUI's db file (#1080), this is the default path (`ff chat` with
+        // the desktop app open). rusqlite 0.32 happens to ship a 5s default
+        // itself, but relying on an undocumented library default for a
+        // cross-process durability invariant is fragile — set it here so the
+        // contract is self-documenting and version-proof. Set BEFORE any
+        // operation that could contend (the `journal_mode = WAL` PRAGMA below
+        // is itself a write).
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
         // Per-connection: foreign keys are off by default in SQLite.
         conn.execute_batch(
             "PRAGMA foreign_keys = ON;

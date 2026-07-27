@@ -3,6 +3,7 @@ use std::process::ExitCode;
 use super::json_events;
 use super::{approval_mode, build_registry_with_memory, resolve_turn_inputs, Cli};
 use crate::approver::ApprovalMode;
+use crate::test_support::TestEnv;
 use async_trait::async_trait;
 use clap::CommandFactory;
 use clap::Parser;
@@ -527,7 +528,6 @@ fn cli_registry_includes_web_search() {
 }
 
 // -- memory subcommand tests (issue #1081) --------------------------------
-
 /// `memory` parses through the real clap tree — guards against accidental
 /// rename or move of the `Memory` variant, mirroring `config_subcommand_parses`.
 #[test]
@@ -585,4 +585,375 @@ fn memory_write_daily_and_curated_conflict() {
             Err(err) => err,
         };
     assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+}
+
+// -- #1080: session persistence ------------------------------------------
+
+/// The `--ephemeral` flag parses on `run` (the escape hatch for one-shot runs).
+#[test]
+fn run_accepts_ephemeral_flag() {
+    let cli = Cli::try_parse_from(["flowforge", "run", "hi", "--ephemeral"]).expect("parses");
+    match cli.command.expect("run present") {
+        super::Command::Run { ephemeral, .. } => assert!(ephemeral),
+        other => panic!("expected Run, got {other:?}"),
+    }
+}
+
+/// The `--ephemeral` flag parses on `chat`.
+#[test]
+fn chat_accepts_ephemeral_flag() {
+    let cli = Cli::try_parse_from(["flowforge", "chat", "--ephemeral"]).expect("parses");
+    match cli.command.expect("chat present") {
+        super::Command::Chat { ephemeral, .. } => assert!(ephemeral),
+        other => panic!("expected Chat, got {other:?}"),
+    }
+}
+
+/// The `--resume <ID>` flag parses on `chat`.
+#[test]
+fn chat_accepts_resume_flag() {
+    let cli = Cli::try_parse_from(["flowforge", "chat", "--resume", "abc-123"]).expect("parses");
+    match cli.command.expect("chat present") {
+        super::Command::Chat { resume, .. } => {
+            assert_eq!(resume.as_deref(), Some("abc-123"));
+        }
+        other => panic!("expected Chat, got {other:?}"),
+    }
+}
+
+/// `ff sessions list` parses through the real clap tree.
+#[test]
+fn sessions_list_subcommand_parses() {
+    let cli = Cli::try_parse_from(["flowforge", "sessions", "list"]).expect("parses");
+    match cli.command.expect("sessions present") {
+        super::Command::Sessions { command } => {
+            assert!(matches!(command, super::SessionsCommand::List));
+        }
+        other => panic!("expected Sessions, got {other:?}"),
+    }
+}
+
+/// `ff fork <id>` parses through the real clap tree.
+#[test]
+fn fork_subcommand_parses() {
+    let cli = Cli::try_parse_from(["flowforge", "fork", "src-id"]).expect("parses");
+    match cli.command.expect("fork present") {
+        super::Command::Fork { id } => assert_eq!(id, "src-id"),
+        other => panic!("expected Fork, got {other:?}"),
+    }
+}
+
+/// Default `chat` (no subcommand) yields `None` — the persistent default is
+/// applied in `main()`. Explicitly invoking `chat` (no flags) defaults to
+/// persistent + no resume, the acceptance contract from #1080.
+#[test]
+fn default_chat_is_persistent_no_resume() {
+    // No subcommand: clap yields `command: None`; main() unwraps to the Chat
+    // default. Verify the explicit `chat` invocation instead.
+    let cli = Cli::try_parse_from(["flowforge", "chat"]).expect("parses");
+    match cli.command.expect("chat present") {
+        super::Command::Chat {
+            ephemeral, resume, ..
+        } => {
+            assert!(!ephemeral, "default must be persistent");
+            assert!(resume.is_none(), "default has no resume id");
+        }
+        other => panic!("expected Chat, got {other:?}"),
+    }
+}
+
+/// An on-disk session store survives a reopen — the foundation of #1080.
+/// Mirrors `session_db_survives_restart` in the desktop's `state/tests.rs` and
+/// `edit_user_message_truncation_survives_reopen` in `ff-session/src/tests.rs`.
+#[test]
+fn session_db_survives_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("sessions.db");
+    let session_id;
+    {
+        let store = SessionStore::open(&path).unwrap();
+        let s = store.create_session(None);
+        session_id = s.id.clone();
+        store.add_message(&s.id, Role::User, "hello".into());
+        store.add_message(&s.id, Role::Assistant, "world".into());
+    }
+    // Reopen and assert the transcript survived.
+    let store = SessionStore::open(&path).unwrap();
+    let msgs = store.get_messages(&session_id);
+    assert_eq!(msgs.len(), 2, "both messages should survive reopen");
+    assert_eq!(msgs[0].role, Role::User);
+    assert_eq!(msgs[0].content, "hello");
+    assert_eq!(msgs[1].role, Role::Assistant);
+    assert_eq!(msgs[1].content, "world");
+    // The session row itself survived too.
+    assert!(store.get_session(&session_id).is_some());
+}
+
+/// The acceptance round-trip from #1080: run `chat` → exit → reopen → resume
+/// and assert the message history survives. Uses `chat_repl` with an injected
+/// on-disk store so the test doesn't touch the real config dir. Mirrors
+/// `chat_multi_turn_context_persists` but split across two process-equivalent
+/// sessions (drop + reopen the store between them).
+#[tokio::test]
+async fn chat_persists_across_reopen_and_resume() {
+    use std::io::Cursor;
+    use std::sync::{Arc, Mutex};
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("sessions.db");
+    let session_id;
+
+    // Turn 1: open the store, create a session, send one message, exit.
+    {
+        let store = SessionStore::open(&path).unwrap();
+        let s = store.create_session(None);
+        session_id = s.id.clone();
+        let registry = ToolRegistry::new();
+        let root = std::env::current_dir().unwrap();
+        let approver = TestApprover;
+        let matrix = PermissionMatrix::default();
+        let tool_ctx = ToolContext::new(&registry, &root, &approver, 8, &matrix);
+        let memory_store = Arc::new(Memory::with_default_root(MemoryConfig::default()));
+        let skills = SkillRegistry::new();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let provider = RecordingProvider { seen: seen.clone() };
+
+        let code = super::chat_repl(
+            &provider,
+            "mock",
+            &skills,
+            &store,
+            &memory_store,
+            None,
+            &tool_ctx,
+            &session_id,
+            false,
+            ff_core::Mode::Auto,
+            Cursor::new(b"first question\nexit\n"),
+        )
+        .await;
+        assert_eq!(code, ExitCode::SUCCESS);
+
+        // The first turn's messages must be in the store before we drop it.
+        let msgs = store.get_messages(&session_id);
+        assert_eq!(msgs.len(), 2, "user + assistant after one turn");
+        assert_eq!(msgs[0].content, "first question");
+    }
+
+    // Store handle dropped here; the db file persists on disk.
+
+    // Turn 2: reopen the store, resume the same session, send a second message.
+    let store = SessionStore::open(&path).unwrap();
+    // The resumed session's history must be intact.
+    let history = store.get_messages(&session_id);
+    assert_eq!(
+        history.len(),
+        2,
+        "resumed session must see the first turn's history"
+    );
+    assert_eq!(history[0].content, "first question");
+
+    let registry = ToolRegistry::new();
+    let root = std::env::current_dir().unwrap();
+    let approver = TestApprover;
+    let matrix = PermissionMatrix::default();
+    let tool_ctx = ToolContext::new(&registry, &root, &approver, 8, &matrix);
+    let memory_store = Arc::new(Memory::with_default_root(MemoryConfig::default()));
+    let skills = SkillRegistry::new();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let provider = RecordingProvider { seen: seen.clone() };
+
+    let code = super::chat_repl(
+        &provider,
+        "mock",
+        &skills,
+        &store,
+        &memory_store,
+        None,
+        &tool_ctx,
+        &session_id, // resume the same session
+        false,
+        ff_core::Mode::Auto,
+        Cursor::new(b"second question\nexit\n"),
+    )
+    .await;
+    assert_eq!(code, ExitCode::SUCCESS);
+
+    // The second turn's provider request must include the first turn's
+    // messages — proving resumed context.
+    let msgs = seen.lock().unwrap();
+    let contents: Vec<Option<&str>> = msgs.iter().map(|m| m.content.as_deref()).collect();
+    assert!(
+        contents.contains(&Some("first question")),
+        "resumed turn must see first question: {contents:?}"
+    );
+    assert!(
+        contents.contains(&Some("second question")),
+        "resumed turn must see second question: {contents:?}"
+    );
+
+    // And the store now has all 4 messages.
+    let all = store.get_messages(&session_id);
+    assert_eq!(all.len(), 4, "two user + two assistant after two turns");
+}
+
+/// `ff fork <id>` with a `TestEnv`-isolated store: forks a titled session and
+/// stamps the `(Fork 1)` title for desktop parity (#1069).
+#[test]
+fn fork_assigns_fork_1_title_to_persisted_store() {
+    let _env = TestEnv::new();
+    let store = crate::host::build_session_store(false);
+    let s = store.create_session(None);
+    store.set_title(&s.id, "Refactor auth".into());
+    store.add_message(&s.id, Role::User, "let's go".into());
+
+    let code = super::fork_session_cmd(&s.id);
+    assert_eq!(code, ExitCode::SUCCESS);
+
+    let all = store.list_sessions();
+    let forked = all
+        .iter()
+        .find(|x| x.id != s.id)
+        .expect("forked session exists");
+    assert_eq!(
+        forked.title.as_deref(),
+        Some("Refactor auth (Fork 1)"),
+        "forked title must be (Fork 1) for desktop parity"
+    );
+    // The forked transcript carries the source's messages.
+    let msgs = store.get_messages(&forked.id);
+    assert_eq!(msgs.len(), 1);
+    assert_eq!(msgs[0].content, "let's go");
+}
+
+/// `ff fork` on an untitled session (no messages → no auto-title) still
+/// succeeds and keeps the store's copy naming (no `(Fork N)` since there's no
+/// title to base it on — mirroring the desktop's `if (session.title)` guard).
+#[test]
+fn fork_untitled_session_succeeds_without_fork_n_title() {
+    let _env = TestEnv::new();
+    let store = crate::host::build_session_store(false);
+    let s = store.create_session(None);
+    // No messages → no auto-title → source.title stays None.
+
+    let code = super::fork_session_cmd(&s.id);
+    assert_eq!(code, ExitCode::SUCCESS);
+
+    let all = store.list_sessions();
+    let forked = all.iter().find(|x| x.id != s.id).expect("forked exists");
+    // Untitled source → fork_session stamps None for the title; no (Fork N).
+    assert!(
+        forked.title.is_none(),
+        "untitled fork must not get a title: {:?}",
+        forked.title
+    );
+}
+
+/// `ff fork` on a second fork of the same base gets `(Fork 2)`.
+#[test]
+fn fork_increments_to_fork_2() {
+    let _env = TestEnv::new();
+    let store = crate::host::build_session_store(false);
+    let s = store.create_session(None);
+    store.set_title(&s.id, "Refactor auth".into());
+    store.add_message(&s.id, Role::User, "msg".into());
+
+    // First fork → (Fork 1)
+    super::fork_session_cmd(&s.id);
+    // Second fork from the same source → (Fork 2)
+    let code = super::fork_session_cmd(&s.id);
+    assert_eq!(code, ExitCode::SUCCESS);
+
+    let all = store.list_sessions();
+    let forks: Vec<_> = all
+        .iter()
+        .filter(|x| {
+            x.title
+                .as_deref()
+                .unwrap_or("")
+                .starts_with("Refactor auth (Fork")
+        })
+        .collect();
+    assert_eq!(forks.len(), 2, "two forks should exist");
+    let titles: Vec<&str> = forks.iter().map(|f| f.title.as_deref().unwrap()).collect();
+    assert!(titles.contains(&"Refactor auth (Fork 1)"), "{titles:?}");
+    assert!(titles.contains(&"Refactor auth (Fork 2)"), "{titles:?}");
+}
+
+/// `ff fork <bogus-id>` errors cleanly.
+#[test]
+fn fork_unknown_id_errors() {
+    let _env = TestEnv::new();
+    let code = super::fork_session_cmd("no-such-session");
+    assert_eq!(code, ExitCode::FAILURE);
+}
+
+/// `ff sessions list` prints persisted sessions from the store. Uses `TestEnv`
+/// to isolate the store so the test doesn't touch the real config dir.
+#[test]
+fn sessions_list_prints_persisted_sessions() {
+    let _env = TestEnv::new();
+    let store = crate::host::build_session_store(false);
+    let s1 = store.create_session(None);
+    store.set_title(&s1.id, "First session".into());
+    store.add_message(&s1.id, Role::User, "hi".into());
+    let s2 = store.create_session(None);
+    store.add_message(&s2.id, Role::User, "yo".into()); // auto-titled from first msg
+
+    let code = super::sessions_list();
+    assert_eq!(code, ExitCode::SUCCESS);
+    // The store-side assertion that both sessions are listed (the rendering
+    // itself is unit-tested in sessions/tests.rs::render_list_*).
+    let all = store.list_sessions();
+    assert_eq!(all.len(), 2, "both sessions persisted");
+}
+
+/// `ff sessions list` on an empty store exits 0 (with a stderr hint).
+#[test]
+fn sessions_list_empty_exits_success() {
+    let _env = TestEnv::new();
+    let code = super::sessions_list();
+    assert_eq!(code, ExitCode::SUCCESS);
+}
+
+/// `host::build_session_store(false)` uses the `TestEnv`-isolated config dir,
+/// so two calls within the same `TestEnv` share one on-disk db.
+#[test]
+fn build_session_store_persists_within_test_env() {
+    let _env = TestEnv::new();
+    let id;
+    {
+        let store = crate::host::build_session_store(false);
+        let s = store.create_session(None);
+        id = s.id.clone();
+        store.add_message(&s.id, Role::User, "persisted".into());
+    }
+    // A second build reopens the same on-disk db (TestEnv isolates the path).
+    let store = crate::host::build_session_store(false);
+    assert!(
+        store.get_session(&id).is_some(),
+        "session must survive reopen"
+    );
+    let msgs = store.get_messages(&id);
+    assert_eq!(msgs.len(), 1);
+    assert_eq!(msgs[0].content, "persisted");
+}
+
+/// `host::build_session_store(true)` is always in-memory regardless of `TestEnv`.
+#[test]
+fn build_session_store_ephemeral_is_in_memory() {
+    let _env = TestEnv::new();
+    let id;
+    {
+        let store = crate::host::build_session_store(true);
+        let s = store.create_session(None);
+        id = s.id.clone();
+        store.add_message(&s.id, Role::User, "ephemeral".into());
+    }
+    // A second ephemeral build gets a fresh in-memory db — nothing persists.
+    let store = crate::host::build_session_store(true);
+    assert!(
+        store.get_session(&id).is_none(),
+        "ephemeral must not persist"
+    );
 }

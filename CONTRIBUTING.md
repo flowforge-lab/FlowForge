@@ -156,10 +156,13 @@ printed inline.
 
 ### Code map
 
-- `main.rs` — clap CLI, subcommand dispatch, `run` / `chat` entry points
+- `main.rs` — clap CLI, subcommand dispatch, `run` / `chat` / `sessions list` / `fork` entry points
 - `approver.rs` — `CliApprover`: approval policy (`--yes` / `--deny` / prompt),
   denial tracking (`was_denied()`), piped-no-policy loud-deny rule
-- `host.rs` — provider loading, workspace setup, tool registry construction
+- `host.rs` — provider loading, workspace setup, tool registry construction,
+  session store path resolution (`build_session_store`)
+- `sessions.rs` — pure helpers for session label resolution, `(Fork N)` naming,
+  and `sessions list` rendering (mirrors `apps/desktop/src/lib/sessions.ts`)
 - `json_events.rs` — `--json` event serialization for machine-readable output
 
 When adding a new flag or subcommand, update the doc comments (they drive

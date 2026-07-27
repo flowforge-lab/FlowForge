@@ -154,6 +154,61 @@ fn api_key_from_env(var: &str) -> Option<String> {
     std::env::var(var).ok().filter(|k| !k.is_empty())
 }
 
+/// The on-disk session database (RFC 0012 / #277), mirroring the desktop's
+/// `sessions_db_path` so the CLI and GUI share one store — no divergent
+/// histories. `None` if the OS exposes no config dir, in which case the store
+/// falls back to `:memory:` (sessions are lost on exit). Same path the desktop
+/// resolves in `apps/desktop/src-tauri/src/state.rs`.
+pub fn session_db_path() -> Option<PathBuf> {
+    config_dir().map(|d| d.join("flowforge").join("sessions.db"))
+}
+
+/// Resolved config dir: the test override (a thread-local set by
+/// `test_support::TestEnv`) when active, else the OS default. Mirrors
+/// `registry::config_dir` so session-store tests can point at a tempdir without
+/// touching the user's real `~/.config/flowforge/sessions.db`.
+fn config_dir() -> Option<PathBuf> {
+    #[cfg(test)]
+    {
+        if let Some(override_dir) = crate::test_support::config_dir_override() {
+            return Some(override_dir);
+        }
+    }
+    dirs::config_dir()
+}
+
+/// Open the session store. When `ephemeral` is true (the `--ephemeral` escape
+/// hatch for one-shot `run`), an in-memory store is used so nothing is written
+/// to disk — matching the pre-#1080 CLI behavior. When false (the default),
+/// the store is backed by [`session_db_path`] so conversations survive a
+/// restart and show up in `ff sessions list` / `ff chat --resume`. Falls back
+/// to in-memory with a warning if the path is unavailable or the file cannot
+/// be opened — same resilience as the desktop's `build_session_store`.
+pub fn build_session_store(ephemeral: bool) -> ff_session::SessionStore {
+    if ephemeral {
+        return ff_session::SessionStore::new();
+    }
+    let Some(path) = session_db_path() else {
+        eprintln!("warning: no config dir; sessions will not persist across restarts");
+        return ff_session::SessionStore::new();
+    };
+    ff_session::SessionStore::open(&path).unwrap_or_else(|e| {
+        eprintln!(
+            "warning: session db unavailable at {} ({}); sessions will not persist",
+            path.display(),
+            e
+        );
+        ff_session::SessionStore::new()
+    })
+    // Note: this fallback covers open-time failures only. Write-time
+    // contention (SQLITE_BUSY when the desktop GUI holds the WAL write lock)
+    // is mitigated by the busy_timeout(5s) set in SessionStore::from_conn
+    // (#1080 follow-up). Short contentions wait; a write blocked for >5s
+    // would still hit .expect("insert session") in ff-session and panic.
+    // Full graceful degradation would require ff-session to return Result
+    // instead of panicking on write errors — out of scope for #1080.
+}
+
 /// `~/.flowforge/skills` — the installed-skills directory shared with the desktop
 /// app. Loaded read-only here; install/uninstall stay desktop-side for now.
 pub fn skills_root() -> PathBuf {
