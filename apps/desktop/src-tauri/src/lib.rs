@@ -4,6 +4,7 @@
 
 mod dev_update_watcher;
 mod git_watch;
+mod logging;
 mod optimize;
 mod secrets;
 mod state;
@@ -4123,6 +4124,13 @@ pub fn run() {
     // unmeasurable from here (the platform floor the issue calls out); the FE's
     // `performance.now()` in `mark_fe_ready` gives the closest proxy for that.
     let _ = BOOT_T0.set(std::time::Instant::now());
+    // #1117: install the tracing subscriber FIRST, before any instrumented code
+    // runs — the observer pump, process reaper and scheduler all emit on paths
+    // reached during `setup`, and events emitted before this line are lost.
+    // Opt-in via `FF_LOG`; unset means no subscriber, exactly as before. The
+    // guard must outlive the app, so it's bound for the whole of `run()`:
+    // dropping it flushes and stops the writer thread.
+    let _log_guard = state::flowforge_config_dir().and_then(|dir| logging::init(&dir));
     // Paint-first boot (#599): `AppState::new()` and the supervisor / watcher /
     // reaper / scheduler wiring are deferred to a background hydrate task (spawned
     // from `setup` below) so the window is created and painted FIRST — the FE

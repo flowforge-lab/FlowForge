@@ -452,7 +452,7 @@ fn connection_to_config(conn: &ProviderConnection) -> ProviderConfig {
 /// in-memory for the session. Under `cfg!(test)` this always returns `None` so the
 /// test suite can never read or clobber the developer's real config (the same
 /// isolation `build_session_store` / `build_scheduled_store` apply to their stores).
-fn flowforge_config_dir() -> Option<PathBuf> {
+pub(crate) fn flowforge_config_dir() -> Option<PathBuf> {
     if cfg!(test) {
         return None;
     }
