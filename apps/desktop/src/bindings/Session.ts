@@ -62,4 +62,26 @@ model?: ModelSelection,
  * MCP set while untouched sessions follow their phenotype. Persisted as JSON,
  * exactly like [`model`](Self::model).
  */
-mcpServers?: Array<McpServerConfig>, };
+mcpServers?: Array<McpServerConfig>, 
+/**
+ * The session this one was forked from (#1074, RFC 0023 §4). `None` means
+ * "lineage root" -- either never forked, or forked before lineage was
+ * recorded (pre-existing history cannot be back-filled). Cleared to `None`
+ * if the parent is deleted, so a fork outlives its source.
+ */
+parentSessionId?: string, 
+/**
+ * The last parent `seq` this session's transcript copied at fork time
+ * (#1074). Because forking preserves `seq` verbatim, this is a coordinate
+ * valid in *both* sessions: `seq <= fork_point_seq` is the shared prefix,
+ * `seq > fork_point_seq` is post-fork divergence on either side.
+ *
+ * Two distinct `None` cases, told apart by [`parent_session_id`](Self::parent_session_id):
+ * with no parent it means "lineage root"; with a parent it means the parent
+ * was empty at fork time, i.e. an empty shared prefix.
+ *
+ * An **upper bound**, not a density guarantee: editing a message truncates
+ * later ones without renumbering, so a `seq` at or below this point may no
+ * longer exist on one side. Readers must intersect on actual rows.
+ */
+forkPointSeq?: number, };

@@ -18,6 +18,8 @@ fn test_session(id: &str, title: Option<&str>, goal: Option<&str>, updated_at: i
         workspace: None,
         model: None,
         mcp_servers: None,
+        parent_session_id: None,
+        fork_point_seq: None,
     }
 }
 

@@ -50,6 +50,8 @@ fn new_session(goal: Option<String>) -> Session {
         workspace: None,
         model: None,
         mcp_servers: None,
+        parent_session_id: None,
+        fork_point_seq: None,
     }
 }
 
@@ -58,8 +60,9 @@ fn new_session(goal: Option<String>) -> Session {
 fn insert_session(conn: &Connection, session: &Session) {
     let inserted = conn.execute(
         "INSERT INTO sessions
-             (id, goal, title, summary, status, created_at, updated_at, phenotype, mode, workspace, model, mcp_servers)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+             (id, goal, title, summary, status, created_at, updated_at, phenotype, mode, workspace, model, mcp_servers,
+              parent_session_id, fork_point_seq)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
         params![
             session.id,
             session.goal,
@@ -76,6 +79,8 @@ fn insert_session(conn: &Connection, session: &Session) {
                 .mcp_servers
                 .as_ref()
                 .and_then(|m| serde_json::to_string(m).ok()),
+            session.parent_session_id,
+            session.fork_point_seq,
         ],
     );
     if let Err(error) = &inserted {
@@ -255,7 +260,8 @@ impl SessionStore {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
             .prepare(
-                "SELECT id, goal, title, summary, status, created_at, updated_at, phenotype, mode, workspace, model, mcp_servers
+                "SELECT id, goal, title, summary, status, created_at, updated_at, phenotype, mode, workspace, model, mcp_servers,
+                        parent_session_id, fork_point_seq
                  FROM sessions
                  ORDER BY updated_at DESC",
             )
@@ -947,12 +953,20 @@ impl SessionStore {
     /// Clone a session and its full transcript into a new session. The copy gets
     /// fresh ids and timestamps; messages are re-keyed to the new session id and
     /// a titled source becomes "<title> (copy)". Returns `None` for an unknown id.
+    ///
+    /// Records lineage (#1074): the copy points at its source via
+    /// [`parent_session_id`](Session::parent_session_id), and
+    /// [`fork_point_seq`](Session::fork_point_seq) marks the last parent `seq`
+    /// copied. Because `seq` is preserved verbatim rather than reallocated, that
+    /// point is a coordinate valid in both sessions -- which is what lets
+    /// confluence bound the shared prefix instead of guessing it (RFC 0023 §4).
     pub fn fork_session(&self, session_id: &str) -> Option<Session> {
         let ts = now_ms();
         let conn = self.conn.lock().unwrap();
         let source = conn
             .query_row(
-                "SELECT id, goal, title, summary, status, created_at, updated_at, phenotype, mode, workspace, model, mcp_servers
+                "SELECT id, goal, title, summary, status, created_at, updated_at, phenotype, mode, workspace, model, mcp_servers,
+                        parent_session_id, fork_point_seq
                  FROM sessions WHERE id = ?1",
                 params![session_id],
                 row_to_session,
@@ -960,7 +974,7 @@ impl SessionStore {
             .optional()
             .ok()
             .flatten()?;
-        let forked = Session {
+        let mut forked = Session {
             id: new_id(),
             goal: source.goal.clone(),
             title: source.title.as_ref().map(|t| format!("{t} (copy)")),
@@ -979,6 +993,11 @@ impl SessionStore {
             model: source.model.clone(),
             // ...and its MCP server overrides (RFC 0018 session tier).
             mcp_servers: source.mcp_servers.clone(),
+            // Lineage: this fork's parent is the session it was copied from, not
+            // the parent's own parent -- the chain is walked, not flattened.
+            parent_session_id: Some(source.id.clone()),
+            // Not known until the transcript is copied below.
+            fork_point_seq: None,
         };
         let tx = match conn.unchecked_transaction() {
             Ok(tx) => tx,
@@ -987,34 +1006,16 @@ impl SessionStore {
                 panic!("start fork transaction: {error}");
             }
         };
-        let inserted = tx.execute(
-            "INSERT INTO sessions
-                 (id, goal, title, summary, status, created_at, updated_at, phenotype, mode, workspace, model, mcp_servers)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-            params![
-                forked.id,
-                forked.goal,
-                forked.title,
-                forked.summary,
-                enum_to_text(&forked.status),
-                forked.created_at,
-                forked.updated_at,
-                forked.phenotype,
-                forked.mode.as_ref().map(enum_to_text),
-                forked.workspace,
-                forked.model.as_ref().and_then(|m| serde_json::to_string(m).ok()),
-                forked
-                    .mcp_servers
-                    .as_ref()
-                    .and_then(|m| serde_json::to_string(m).ok()),
-            ],
-        );
-        if let Err(error) = &inserted {
-            tracing::error!(%error, "session write failed");
-        }
-        inserted.expect("insert forked session");
+        // Shares the one INSERT with normal creation so the column list has a
+        // single definition -- a second copy here silently dropped any newly
+        // added column (such as lineage) from forks only.
+        insert_session(&tx, &forked);
 
         // Re-key the transcript to the new session, preserving `seq` order.
+        // The highest `seq` written is the fork point; deriving it from the rows
+        // actually copied keeps it consistent by construction, with no second
+        // query to race against a concurrent append.
+        let mut fork_point_seq: Option<i64> = None;
         {
             let mut stmt = tx
                 .prepare(
@@ -1053,6 +1054,7 @@ impl SessionStore {
                     author_name,
                     created_at,
                 ) = row.expect("read forked message");
+                fork_point_seq = Some(seq);
                 let inserted = tx.execute(
                     "INSERT INTO messages
                          (id, session_id, seq, role, content, tool_calls, tool_call_id, attachments, reasoning, stop_reason, author_name, created_at)
@@ -1078,6 +1080,19 @@ impl SessionStore {
                 inserted.expect("clone forked message");
             }
         }
+        // A parent that was empty at fork time leaves this NULL: an empty shared
+        // prefix, distinguished from "lineage root" by `parent_session_id` being set.
+        if let Some(seq) = fork_point_seq {
+            let updated = tx.execute(
+                "UPDATE sessions SET fork_point_seq = ?1 WHERE id = ?2",
+                params![seq, forked.id],
+            );
+            if let Err(error) = &updated {
+                tracing::error!(%error, "session write failed");
+            }
+            updated.expect("record fork point");
+            forked.fork_point_seq = Some(seq);
+        }
         let committed = tx.commit();
         if let Err(error) = &committed {
             tracing::error!(%error, "session write failed");
@@ -1091,7 +1106,8 @@ impl SessionStore {
         let conn = self.conn.lock().unwrap();
         let persisted = conn
             .query_row(
-                "SELECT id, goal, title, summary, status, created_at, updated_at, phenotype, mode, workspace, model, mcp_servers
+                "SELECT id, goal, title, summary, status, created_at, updated_at, phenotype, mode, workspace, model, mcp_servers,
+                        parent_session_id, fork_point_seq
                  FROM sessions WHERE id = ?1",
                 params![session_id],
                 row_to_session,
@@ -1393,6 +1409,29 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
         )?;
         conn.pragma_update(None, "user_version", 11)?;
     }
+    if version < 12 {
+        // #1074 (RFC 0023 §4): persist fork lineage so confluence can locate the
+        // shared prefix precisely instead of guessing it from a content hash.
+        // Both columns NULL means "lineage root" -- which is every pre-existing
+        // session, since forked history cannot be back-filled with lineage.
+        //
+        // `ON DELETE SET NULL` (not CASCADE) is load-bearing: deleting a parent
+        // must orphan the fork, never delete it -- the fork owns a full copy of
+        // the transcript and is a session in its own right.
+        //
+        // The index serves two readers: the FK's own reverse lookup on every
+        // session delete (without it, `ON DELETE SET NULL` forces a full scan of
+        // `sessions`), and the "list a session's forks" query that merge-sessions
+        // needs. Do not drop it as unused.
+        conn.execute_batch(
+            "ALTER TABLE sessions ADD COLUMN parent_session_id TEXT NULL
+                 REFERENCES sessions(id) ON DELETE SET NULL;
+             ALTER TABLE sessions ADD COLUMN fork_point_seq INTEGER NULL;
+             CREATE INDEX IF NOT EXISTS idx_sessions_parent
+                 ON sessions(parent_session_id);",
+        )?;
+        conn.pragma_update(None, "user_version", 12)?;
+    }
     Ok(())
 }
 
@@ -1414,6 +1453,8 @@ fn row_to_session(row: &rusqlite::Row) -> rusqlite::Result<Session> {
         workspace: row.get("workspace")?,
         model: model.and_then(|s| serde_json::from_str(&s).ok()),
         mcp_servers: mcp_servers.and_then(|s| serde_json::from_str(&s).ok()),
+        parent_session_id: row.get("parent_session_id")?,
+        fork_point_seq: row.get("fork_point_seq")?,
     })
 }
 
