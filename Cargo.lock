@@ -1932,6 +1932,7 @@ version = "1.0.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "chrono",
  "clap",
  "dirs 5.0.1",
  "ff-agent",

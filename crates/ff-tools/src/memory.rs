@@ -39,7 +39,10 @@ fn resolve(memory: &Memory, raw: &str) -> PathBuf {
     memory.root().join(raw)
 }
 
-fn format_hits(memory: &Memory, hits: &[ScoredChunk]) -> String {
+/// Render ranked search hits for display. Shared by `memory_search` (model-
+/// facing) and the CLI `memory search` subcommand (human-facing) so both
+/// surfaces emit the same path / heading / line-range / dormant-tag shape.
+pub fn format_hits(memory: &Memory, hits: &[ScoredChunk]) -> String {
     let threshold = memory.config().decay.dormant_threshold;
     let now_ms = Utc::now().timestamp_millis();
     let mut out = String::new();

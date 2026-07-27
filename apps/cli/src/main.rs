@@ -9,6 +9,7 @@ mod approver;
 mod config;
 mod host;
 mod json_events;
+mod memory;
 mod registry;
 mod secrets;
 
@@ -24,6 +25,7 @@ use ff_core::{Mode, PermissionMatrix, ReasoningVisibility, Role};
 
 use crate::approver::{ApprovalMode, CliApprover};
 use crate::config::ConfigCommand;
+use crate::memory::MemoryCommand;
 
 /// FlowForge on the command line: run an agent turn, inspect skills, no GUI.
 /// With no subcommand, opens an interactive REPL (multi-turn chat).
@@ -122,6 +124,15 @@ enum Command {
         #[command(subcommand)]
         command: ConfigCommand,
     },
+    /// Inspect or write durable memory (RFC 0006) directly: search the FTS5
+    /// index, read a file by path, or append a note. These share the exact
+    /// store + index the agent's `memory_*` tools use (#1081), so a human at
+    /// the terminal can recall or jot a memory note without spending an agent
+    /// turn. See `flowforge memory --help` for the sub-subcommands.
+    Memory {
+        #[command(subcommand)]
+        command: MemoryCommand,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -170,6 +181,7 @@ async fn main() -> ExitCode {
             SkillsCommand::List => skills_list(),
         },
         Command::Config { command } => config::run(command),
+        Command::Memory { command } => memory::run(command).await,
     }
 }
 
@@ -327,13 +339,8 @@ fn build_registry_with_memory() -> (
     registry.register(Box::new(ff_tools::SearchTool::new(std::sync::Arc::new(
         ff_tools::PubMedSource::new(),
     ))));
-    let memory_store = std::sync::Arc::new(ff_memory::Memory::with_default_root(
-        ff_memory::MemoryConfig::default(),
-    ));
-    let mut memory_index: Option<std::sync::Arc<dyn ff_memory::MemoryIndex>> = None;
-    if let Ok(index) = ff_memory::Fts5Index::open(memory_store.index_path()) {
-        let index: std::sync::Arc<dyn ff_memory::MemoryIndex> = std::sync::Arc::new(index);
-        let _ = ff_memory::MemoryIndex::reindex(index.as_ref(), &memory_store.all_chunks());
+    let (memory_store, memory_index) = build_memory_store();
+    if let Some(index) = &memory_index {
         registry.register(Box::new(ff_tools::memory::MemorySearchTool::new(
             memory_store.clone(),
             index.clone(),
@@ -345,9 +352,31 @@ fn build_registry_with_memory() -> (
             memory_store.clone(),
             index.clone(),
         )));
-        memory_index = Some(index);
     }
     (registry, memory_store, memory_index)
+}
+
+/// Build the durable-memory store + FTS5 index the way the agent tools do
+/// (RFC 0006): `Memory::with_default_root`, open the on-disk FTS5 index, then
+/// reindex from disk so recall sees the current files. Best-effort: an index
+/// open failure returns `None` for the index (the store still works for `get`,
+/// and the ambient block degrades to unfiltered). Shared by
+/// [`build_registry_with_memory`] and the `ff memory` subcommands (#1081) so
+/// there is exactly one store+index construction seam in the CLI.
+fn build_memory_store() -> (
+    std::sync::Arc<ff_memory::Memory>,
+    Option<std::sync::Arc<dyn ff_memory::MemoryIndex>>,
+) {
+    let memory_store = std::sync::Arc::new(ff_memory::Memory::with_default_root(
+        ff_memory::MemoryConfig::default(),
+    ));
+    let mut memory_index: Option<std::sync::Arc<dyn ff_memory::MemoryIndex>> = None;
+    if let Ok(index) = ff_memory::Fts5Index::open(memory_store.index_path()) {
+        let index: std::sync::Arc<dyn ff_memory::MemoryIndex> = std::sync::Arc::new(index);
+        let _ = ff_memory::MemoryIndex::reindex(index.as_ref(), &memory_store.all_chunks());
+        memory_index = Some(index);
+    }
+    (memory_store, memory_index)
 }
 
 async fn run(

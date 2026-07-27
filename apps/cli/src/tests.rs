@@ -525,3 +525,64 @@ fn cli_registry_includes_web_search() {
         "web_search must be registered in the CLI tool registry (#241)"
     );
 }
+
+// -- memory subcommand tests (issue #1081) --------------------------------
+
+/// `memory` parses through the real clap tree — guards against accidental
+/// rename or move of the `Memory` variant, mirroring `config_subcommand_parses`.
+#[test]
+fn memory_subcommand_parses() {
+    fn expect_memory(argv: &[&str]) {
+        let cli = Cli::try_parse_from(argv.to_vec())
+            .unwrap_or_else(|e| panic!("parse failed for {argv:?}: {e}"));
+        match cli.command.expect("memory present") {
+            super::Command::Memory { .. } => {}
+            other => panic!("expected Memory, got {other:?}"),
+        }
+    }
+    expect_memory(&["flowforge", "memory", "search", "rust preferences"]);
+    expect_memory(&["flowforge", "memory", "search", "x", "--limit", "3"]);
+    expect_memory(&["flowforge", "memory", "get", "MEMORY.md"]);
+    expect_memory(&["flowforge", "memory", "get", "MEMORY.md", "--lines", "1:20"]);
+    expect_memory(&["flowforge", "memory", "write", "shipped m5.1"]);
+    expect_memory(&[
+        "flowforge",
+        "memory",
+        "write",
+        "L5 SDE",
+        "--curated",
+        "--stratum",
+        "identity",
+    ]);
+}
+
+/// `--stratum` and `--daily` are mutually exclusive (stratum implies curated),
+/// mirroring the runtime conflict check in `MemoryWriteTool::run`. Clap rejects
+/// the combination at parse time with `ArgumentConflict`.
+#[test]
+fn memory_write_stratum_and_daily_conflict() {
+    let err = match Cli::try_parse_from([
+        "flowforge",
+        "memory",
+        "write",
+        "x",
+        "--daily",
+        "--stratum",
+        "identity",
+    ]) {
+        Ok(_) => panic!("--stratum and --daily must be mutually exclusive"),
+        Err(err) => err,
+    };
+    assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+}
+
+/// `--daily` and `--curated` are mutually exclusive targets.
+#[test]
+fn memory_write_daily_and_curated_conflict() {
+    let err =
+        match Cli::try_parse_from(["flowforge", "memory", "write", "x", "--daily", "--curated"]) {
+            Ok(_) => panic!("--daily and --curated must be mutually exclusive"),
+            Err(err) => err,
+        };
+    assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+}
