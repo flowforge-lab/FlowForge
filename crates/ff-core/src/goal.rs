@@ -280,11 +280,21 @@ impl Goal {
     }
 }
 
+/// The canonical goals directory: `dirs::config_dir()/flowforge/goals` (RFC
+/// 0020 §5). Shared by the desktop and the CLI so a goal created in either
+/// surface is visible to the other.
+pub fn goal_store_dir() -> PathBuf {
+    dirs::config_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("flowforge")
+        .join("goals")
+}
+
 /// Durable per-session goal store (RFC 0020 §3). Path-injected — the caller
-/// supplies the directory (the desktop layer passes `~/.flowforge/goals/`), so
-/// the store carries no home-dir dependency and is fully testable with a
-/// tempdir. Mirrors the atomic temp-file + rename write used for the other
-/// `~/.flowforge` config files.
+/// supplies the directory (the desktop layer passes `~/.flowforge/goals/` via
+/// [`goal_store_dir`]), so the store carries no home-dir dependency and is
+/// fully testable with a tempdir. Mirrors the atomic temp-file + rename write
+/// used for the other `~/.flowforge` config files.
 #[derive(Debug, Clone)]
 pub struct GoalStore {
     dir: PathBuf,
@@ -295,6 +305,11 @@ impl GoalStore {
     /// The directory is created lazily on the first save.
     pub fn new(dir: impl Into<PathBuf>) -> Self {
         Self { dir: dir.into() }
+    }
+
+    /// The directory this store reads from / writes to.
+    pub fn dir(&self) -> &Path {
+        &self.dir
     }
 
     fn path_for(&self, session_id: &str) -> PathBuf {

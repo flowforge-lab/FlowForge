@@ -187,3 +187,14 @@ fn list_active_on_missing_dir_is_empty_not_fatal() {
     let store = GoalStore::new(dir.path().join("never-created"));
     assert!(store.list_active().is_empty());
 }
+
+/// Both the desktop and the CLI must resolve the same goals directory so a
+/// goal created in one surface is visible to the other (RFC 0020 §5).
+#[test]
+fn goal_store_dir_matches_desktop_convention() {
+    let expected = dirs::config_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join("flowforge")
+        .join("goals");
+    assert_eq!(goal_store_dir(), expected);
+}

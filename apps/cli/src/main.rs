@@ -7,12 +7,16 @@
 
 mod approver;
 mod config;
+mod goal;
+mod goal_loop;
 mod host;
 mod json_events;
 mod memory;
 mod registry;
 mod secrets;
 mod sessions;
+mod task;
+mod task_runner;
 
 #[cfg(test)]
 mod test_support;
@@ -163,6 +167,13 @@ enum Command {
         #[command(subcommand)]
         command: MemoryCommand,
     },
+    /// Run autonomous goal loop headless (#1082).
+    Goal(goal::GoalArgs),
+    /// Manage scheduled tasks (#1082).
+    Task {
+        #[command(subcommand)]
+        command: task::TaskCommand,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -241,6 +252,8 @@ async fn main() -> ExitCode {
         Command::Fork { id } => fork_session_cmd(&id),
         Command::Config { command } => config::run(command),
         Command::Memory { command } => memory::run(command).await,
+        Command::Goal(args) => goal::run(args).await,
+        Command::Task { command } => task::run(command).await,
     }
 }
 

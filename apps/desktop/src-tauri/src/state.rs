@@ -976,13 +976,7 @@ fn build_goal_store() -> GoalStore {
         let dir = std::env::temp_dir().join(format!("ff-goals-test-{}", std::process::id()));
         return GoalStore::new(dir);
     }
-    match dirs::config_dir() {
-        Some(d) => GoalStore::new(d.join("flowforge").join("goals")),
-        None => {
-            tracing::warn!("no config dir; goals will not persist across restarts");
-            GoalStore::new(std::env::temp_dir().join("flowforge-goals"))
-        }
-    }
+    GoalStore::new(ff_core::goal_store_dir())
 }
 
 /// Open the scheduled-task store, falling back to an ephemeral in-memory store (with

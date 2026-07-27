@@ -587,6 +587,82 @@ fn memory_write_daily_and_curated_conflict() {
     assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
 }
 
+// -- goal subcommand parsing (issue #1082) --------------------------------
+
+#[test]
+fn goal_objective_parses() {
+    let cli = Cli::try_parse_from(["flowforge", "goal", "ship the feature"]).unwrap();
+    match cli.command.expect("goal present") {
+        super::Command::Goal(args) => {
+            assert_eq!(args.objective.as_deref(), Some("ship the feature"));
+            assert!(args.command.is_none());
+        }
+        other => panic!("expected Goal, got {other:?}"),
+    }
+}
+
+#[test]
+fn goal_with_session_flag_parses() {
+    let cli =
+        Cli::try_parse_from(["flowforge", "goal", "do thing", "--session", "sess-1"]).unwrap();
+    match cli.command.expect("goal present") {
+        super::Command::Goal(args) => {
+            assert_eq!(args.objective.as_deref(), Some("do thing"));
+            assert_eq!(args.session.as_deref(), Some("sess-1"));
+        }
+        other => panic!("expected Goal, got {other:?}"),
+    }
+}
+
+#[test]
+fn goal_list_subcommand_parses() {
+    let cli = Cli::try_parse_from(["flowforge", "goal", "list"]).unwrap();
+    match cli.command.expect("goal present") {
+        super::Command::Goal(args) => {
+            assert!(args.objective.is_none());
+            match args.command {
+                Some(super::goal::GoalSubCommand::List) => {}
+                other => panic!("expected List, got {other:?}"),
+            }
+        }
+        other => panic!("expected Goal, got {other:?}"),
+    }
+}
+
+#[test]
+fn goal_resume_subcommand_parses() {
+    let cli = Cli::try_parse_from(["flowforge", "goal", "resume", "sess-1"]).unwrap();
+    match cli.command.expect("goal present") {
+        super::Command::Goal(args) => {
+            assert!(args.objective.is_none());
+            match args.command {
+                Some(super::goal::GoalSubCommand::Resume { session }) => {
+                    assert_eq!(session, "sess-1");
+                }
+                other => panic!("expected Resume, got {other:?}"),
+            }
+        }
+        other => panic!("expected Goal, got {other:?}"),
+    }
+}
+
+#[test]
+fn goal_cancel_subcommand_parses() {
+    let cli = Cli::try_parse_from(["flowforge", "goal", "cancel", "sess-1"]).unwrap();
+    match cli.command.expect("goal present") {
+        super::Command::Goal(args) => {
+            assert!(args.objective.is_none());
+            match args.command {
+                Some(super::goal::GoalSubCommand::Cancel { session }) => {
+                    assert_eq!(session, "sess-1");
+                }
+                other => panic!("expected Cancel, got {other:?}"),
+            }
+        }
+        other => panic!("expected Goal, got {other:?}"),
+    }
+}
+
 // -- #1080: session persistence ------------------------------------------
 
 /// The `--ephemeral` flag parses on `run` (the escape hatch for one-shot runs).
