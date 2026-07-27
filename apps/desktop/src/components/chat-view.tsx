@@ -561,9 +561,16 @@ export function ChatView({ sessionId }: { sessionId?: string } = {}) {
   // want to suppress only the one scroll-into-view instead of the whole stream.
   const findOn = useFindStore((s) => s.open && s.sessionId === targetSessionId);
 
-  const scrollRef = useRef<HTMLDivElement>(null);
+  // Element *state*, not refs (#866): the transcript renders `null` until
+  // `loadSession` resolves for a session with no localStorage cache, so the
+  // scroll container mounts on a later commit than the one these effects first
+  // ran on. A ref mutation doesn't re-run an effect, so with `useRef` the
+  // observer below was never attached on that mount — no initial pin, and no
+  // streaming follow either. A callback ref re-renders when the node appears,
+  // which puts the mount itself in the dep list.
+  const [scrollEl, setScrollEl] = useState<HTMLDivElement | null>(null);
   // The growing content wrapper, observed for post-layout height changes (#1025).
-  const contentRef = useRef<HTMLDivElement>(null);
+  const [contentEl, setContentEl] = useState<HTMLDivElement | null>(null);
   const pinnedToBottom = useRef(true);
   // Render-state mirror of `pinnedToBottom` so the floating "Jump to latest" button
   // (#206) shows only while scrolled up. Toggles at the same 40px threshold.
@@ -585,35 +592,58 @@ export function ChatView({ sessionId }: { sessionId?: string } = {}) {
   // frame instead of a synchronous write per fire. The rAF also reads
   // `scrollHeight` at paint time — the freshest post-layout height for that frame.
   useEffect(() => {
-    const el = scrollRef.current;
-    const content = contentRef.current;
-    if (!el || !content) return;
+    if (!scrollEl || !contentEl) return;
     let raf = 0;
     const ro = new ResizeObserver(() => {
       if (raf) return; // a pin is already scheduled for this frame
       raf = requestAnimationFrame(() => {
         raf = 0;
         if (pinnedToBottom.current && !findOn) {
-          el.scrollTop = el.scrollHeight;
+          scrollEl.scrollTop = scrollEl.scrollHeight;
         }
       });
     });
-    ro.observe(content);
+    ro.observe(contentEl);
     return () => {
       ro.disconnect();
       if (raf) cancelAnimationFrame(raf);
     };
-  }, [findOn]);
+  }, [scrollEl, contentEl, findOn]);
 
   // A session swap can land on a transcript of the same height (no ResizeObserver
   // fire), so re-arm the pin and jump to the tail explicitly here. `findOn` gates
   // it so the in-thread find (#679) and its global-search seed (#710) aren't
   // yanked back to the tail the moment the session switches (#875).
+  //
+  // The pin is deferred to a rAF for the same post-layout reason as the observer
+  // (#1025): at commit time the freshly mounted rows haven't laid out, so a
+  // synchronous `scrollTop = scrollHeight` reads a short height and lands above
+  // the tail.
   useEffect(() => {
     pinnedToBottom.current = true;
-    const el = scrollRef.current;
-    if (el && !findOn) el.scrollTop = el.scrollHeight;
-  }, [targetSessionId, findOn]);
+    if (!scrollEl || findOn) return;
+    const raf = requestAnimationFrame(() => {
+      scrollEl.scrollTop = scrollEl.scrollHeight;
+    });
+    return () => cancelAnimationFrame(raf);
+  }, [targetSessionId, scrollEl, findOn]);
+
+  // The relaunch swap (#866): `loadSession` replaces the store's <=50-message
+  // localStorage tail with the backend's full history, which can render at the
+  // *same* height (a session of <=50 messages) — so no ResizeObserver fire —
+  // while `targetSessionId` never changed, so the effect above doesn't re-run
+  // either. Pin on the transcript's identity changing as well, under exactly the
+  // observer's conditions: only while the user is still pinned (a scroll-up has
+  // already cleared `pinnedToBottom`, so this can't fight someone reading
+  // history) and never while find is open. Content-driven rather than
+  // size-driven, which is what covers the equal-height swap.
+  useEffect(() => {
+    if (!scrollEl || findOn) return;
+    const raf = requestAnimationFrame(() => {
+      if (pinnedToBottom.current) scrollEl.scrollTop = scrollEl.scrollHeight;
+    });
+    return () => cancelAnimationFrame(raf);
+  }, [messages, scrollEl, findOn]);
 
   // Reset the scroll affordance when the pane switches sessions. setState during
   // render is React's recommended reset-on-prop-change pattern — no effect, no
@@ -626,7 +656,7 @@ export function ChatView({ sessionId }: { sessionId?: string } = {}) {
   }
 
   function handleScroll() {
-    const el = scrollRef.current;
+    const el = scrollEl;
     if (!el) return;
     const pinned = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
     pinnedToBottom.current = pinned;
@@ -635,7 +665,7 @@ export function ChatView({ sessionId }: { sessionId?: string } = {}) {
 
   // Smooth-scroll to the newest content and re-arm sticky autoscroll (#206).
   function jumpToLatest() {
-    const el = scrollRef.current;
+    const el = scrollEl;
     if (!el) return;
     el.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
     pinnedToBottom.current = true;
@@ -664,13 +694,13 @@ export function ChatView({ sessionId }: { sessionId?: string } = {}) {
   return (
     <div className="relative flex min-h-0 flex-1 flex-col">
       <div
-        ref={scrollRef}
+        ref={setScrollEl}
         onScroll={handleScroll}
         data-testid="chat-scroll"
         className="min-h-0 flex-1 overflow-y-auto"
       >
         <div
-          ref={contentRef}
+          ref={setContentEl}
           className="mx-auto flex max-w-4xl flex-col gap-3 px-4 py-4"
         >
           {groups.map((g) => {
