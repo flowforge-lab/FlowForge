@@ -1,6 +1,12 @@
 // @vitest-environment jsdom
 
-import { act, cleanup, render } from "@testing-library/react";
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+} from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { ProcessStatusPanel } from "@/components/process-status-panel";
 import { useProcessesStore } from "@/store/processes";
@@ -99,5 +105,79 @@ describe("ProcessStatusPanel (#987)", () => {
     const { container } = render(<ProcessStatusPanel sessionId="s1" />);
     const text = container.textContent ?? "";
     expect(text.indexOf("Process #3")).toBeLessThan(text.indexOf("Process #1"));
+  });
+});
+
+// Dismissing finished rows (#1089). A running process must keep its output on
+// screen, so the affordances are offered on terminal rows only.
+describe("ProcessStatusPanel dismiss affordances (#1089)", () => {
+  it("offers [×] on a finished row but not on a running one", () => {
+    seed("s1", {
+      1: proc({ processId: 1, output: "still going" }),
+      2: proc({ processId: 2, output: "done", status: "exited(0)" }),
+    });
+    render(<ProcessStatusPanel sessionId="s1" />);
+
+    expect(screen.queryByLabelText("Dismiss process 1")).toBeNull();
+    expect(screen.getByLabelText("Dismiss process 2")).toBeTruthy();
+  });
+
+  it("removes just that row when [×] is clicked", () => {
+    seed("s1", {
+      1: proc({ processId: 1, output: "still going" }),
+      2: proc({ processId: 2, output: "done", status: "exited(0)" }),
+    });
+    const { container } = render(<ProcessStatusPanel sessionId="s1" />);
+
+    fireEvent.click(screen.getByLabelText("Dismiss process 2"));
+
+    expect(container.textContent).not.toContain("Process #2");
+    expect(container.textContent).toContain("Process #1");
+  });
+
+  it("self-hides once the last process is dismissed", () => {
+    seed("s1", {
+      1: proc({ processId: 1, output: "done", status: "exited(0)" }),
+    });
+    const { container } = render(<ProcessStatusPanel sessionId="s1" />);
+
+    fireEvent.click(screen.getByLabelText("Dismiss process 1"));
+
+    expect(container.textContent ?? "").toBe("");
+  });
+
+  it("counts the finished rows in the header button", () => {
+    seed("s1", {
+      1: proc({ processId: 1, output: "still going" }),
+      2: proc({ processId: 2, status: "exited(0)" }),
+      3: proc({ processId: 3, status: "failed: boom" }),
+    });
+    render(<ProcessStatusPanel sessionId="s1" />);
+
+    expect(screen.getByText("Clear finished (2)")).toBeTruthy();
+  });
+
+  it("hides the header entirely while everything is still running", () => {
+    seed("s1", { 1: proc({ processId: 1, output: "still going" }) });
+    render(<ProcessStatusPanel sessionId="s1" />);
+
+    expect(screen.queryByText(/Clear finished/)).toBeNull();
+  });
+
+  it("clears every finished row at once, leaving running ones", () => {
+    seed("s1", {
+      1: proc({ processId: 1, output: "still going" }),
+      2: proc({ processId: 2, status: "exited(0)" }),
+      3: proc({ processId: 3, status: "killed" }),
+    });
+    const { container } = render(<ProcessStatusPanel sessionId="s1" />);
+
+    fireEvent.click(screen.getByText("Clear finished (2)"));
+
+    expect(container.textContent).toContain("Process #1");
+    expect(container.textContent).not.toContain("Process #2");
+    expect(container.textContent).not.toContain("Process #3");
+    // Nothing terminal left, so the header goes with them.
+    expect(screen.queryByText(/Clear finished/)).toBeNull();
   });
 });

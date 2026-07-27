@@ -101,3 +101,88 @@ describe("useProcessesStore (#987)", () => {
     expect(useProcessesStore.getState().bySession["sess-b"]).toBeDefined();
   });
 });
+
+// Dismissing finished processes (#1089). Both actions are pure view cleanup —
+// the process has already exited, so there's nothing to stop backend-side.
+describe("dismissing finished processes (#1089)", () => {
+  it("dismiss() drops one process and leaves its siblings", () => {
+    const s = useProcessesStore.getState();
+    s.applyProcessOutput(out("sess-a", 1, "one"));
+    s.applyProcessOutput(out("sess-a", 2, "two"));
+    s.applyProcessExited(exited("sess-a", 1, "exited(0)"));
+
+    s.dismiss("sess-a", 1);
+
+    const byId = useProcessesStore.getState().bySession["sess-a"]!;
+    expect(byId[1]).toBeUndefined();
+    expect(byId[2]!.output).toBe("two");
+  });
+
+  it("dismiss() of the last process drops the session key so the panel self-hides", () => {
+    const s = useProcessesStore.getState();
+    s.applyProcessOutput(out("sess-a", 1, "only"));
+    s.applyProcessExited(exited("sess-a", 1, "exited(0)"));
+
+    s.dismiss("sess-a", 1);
+
+    expect(useProcessesStore.getState().bySession["sess-a"]).toBeUndefined();
+  });
+
+  it("dismiss() never reaches into another session", () => {
+    const s = useProcessesStore.getState();
+    s.applyProcessExited(exited("sess-a", 1, "exited(0)"));
+    s.applyProcessExited(exited("sess-b", 1, "exited(0)"));
+
+    s.dismiss("sess-a", 1);
+
+    expect(useProcessesStore.getState().bySession["sess-b"]![1]).toBeDefined();
+  });
+
+  it("dismiss() of an unknown process is a no-op", () => {
+    const s = useProcessesStore.getState();
+    s.applyProcessOutput(out("sess-a", 1, "one"));
+    const before = useProcessesStore.getState().bySession;
+
+    s.dismiss("sess-a", 99);
+    s.dismiss("sess-missing", 1);
+
+    expect(useProcessesStore.getState().bySession).toBe(before);
+  });
+
+  it("clearFinished() removes every terminal process and keeps the running ones", () => {
+    const s = useProcessesStore.getState();
+    s.applyProcessOutput(out("sess-a", 1, "still going"));
+    s.applyProcessOutput(out("sess-a", 2, "done"));
+    s.applyProcessExited(exited("sess-a", 2, "exited(0)"));
+    s.applyProcessExited(exited("sess-a", 3, "failed: boom"));
+
+    s.clearFinished("sess-a");
+
+    const byId = useProcessesStore.getState().bySession["sess-a"]!;
+    expect(Object.keys(byId)).toEqual(["1"]);
+    expect(byId[1]!.status).toBeNull();
+  });
+
+  it("clearFinished() drops the session key when nothing was running", () => {
+    const s = useProcessesStore.getState();
+    s.applyProcessExited(exited("sess-a", 1, "exited(0)"));
+    s.applyProcessExited(exited("sess-a", 2, "killed"));
+
+    s.clearFinished("sess-a");
+
+    expect(useProcessesStore.getState().bySession["sess-a"]).toBeUndefined();
+  });
+
+  it("clearFinished() with nothing terminal leaves the state object untouched", () => {
+    const s = useProcessesStore.getState();
+    s.applyProcessOutput(out("sess-a", 1, "running"));
+    const before = useProcessesStore.getState().bySession;
+
+    s.clearFinished("sess-a");
+    s.clearFinished("sess-missing");
+
+    // Referential equality, not just deep equality: the early return is what
+    // keeps a no-op call from re-rendering the panel.
+    expect(useProcessesStore.getState().bySession).toBe(before);
+  });
+});
