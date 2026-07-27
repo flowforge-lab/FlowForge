@@ -471,20 +471,7 @@ impl Provider for BedrockProvider {
                 system.insert(pos, SystemContentBlock::CachePoint(point));
             }
         }
-        // Message-level cache breakpoints (#763): mark the penultimate message and
-        // (when long enough) index 0 so the conversation prefix is cached across
-        // turns. Uses at most 2 of the remaining cache-point budget.
-        if cache && req.cache_messages && messages.len() >= 2 {
-            if let Some(point) = cache_point() {
-                let pen = messages.len() - 2;
-                messages[pen].content.push(ContentBlock::CachePoint(point));
-            }
-            if messages.len() >= 4 {
-                if let Some(point) = cache_point() {
-                    messages[0].content.push(ContentBlock::CachePoint(point));
-                }
-            }
-        }
+        messages = prepare_wire_messages(messages, cache && req.cache_messages);
         let thinking_config = req.thinking.then(|| self.thinking_config_for(&req.model));
 
         // Check before messages are moved into the request builder.
@@ -697,6 +684,100 @@ fn to_converse(messages: &[ChatMessage]) -> (Vec<SystemContentBlock>, Vec<Messag
     }
 
     (system, enforce_tool_result_pairing(out))
+}
+
+/// Text of the synthetic closing turn injected by [`enforce_user_terminated`].
+/// Deliberately terse and instruction-free: it exists to satisfy a provider
+/// contract, not to steer the model, which is already directed by the system
+/// prompt (for an observer wake, that's the wake context itself).
+const CONTINUE_NUDGE: &str = "Continue.";
+
+/// Bedrock treats a trailing assistant message as an *assistant prefill* request
+/// ("continue this partial reply"), and several models reject it outright:
+///
+/// ```text
+/// ValidationException: This model does not support assistant message prefill.
+/// The conversation must end with a user message.
+/// ```
+///
+/// Interactive turns always end user-side, so this never fires for them. It fires
+/// for **background-initiated turns**, which run against the stored transcript
+/// without appending a user message of their own (#1117):
+///
+/// - an observer wake, which injects its context into the *system prompt* and then
+///   replays history that ends with the assistant's last reply;
+/// - `MemoryFlush` (`ff-agent/src/compaction.rs`), which replays raw transcript
+///   roles for tool-call extraction.
+///
+/// Both died here before emitting a token — the observer wake silently, which is
+/// why a file edit never woke the agent despite the wake arriving correctly.
+///
+/// Repair rather than reject: append a minimal `user` turn so the request is
+/// well-formed. This mirrors [`enforce_tool_result_pairing`] — the provider layer
+/// owns provider contracts, so every caller is fixed at once instead of each
+/// background subsystem re-learning the rule.
+fn enforce_user_terminated(mut messages: Vec<Message>) -> Vec<Message> {
+    // An empty conversation is left alone: it's a caller bug the provider should
+    // report plainly, not something to paper over with a lone "Continue.".
+    let ends_assistant = messages
+        .last()
+        .is_some_and(|m| m.role == ConversationRole::Assistant);
+    if !ends_assistant {
+        return messages;
+    }
+    messages.push(
+        Message::builder()
+            .role(ConversationRole::User)
+            .content(ContentBlock::Text(CONTINUE_NUDGE.to_string()))
+            .build()
+            .expect("static user message is always valid"),
+    );
+    messages
+}
+
+/// The message-shape steps `chat_stream` applies between `to_converse` and the wire,
+/// as one function so their order is a property of the code rather than of two
+/// adjacent statements.
+///
+/// The order is load-bearing for cost. `enforce_user_terminated` (#1117) appends a
+/// volatile nudge — a fresh one per background wake — and the cache breakpoint
+/// indexes off `messages.len()`. Repairing first leaves the breakpoint *before* the
+/// nudge, so the cached prefix excludes it and stays byte-stable across wakes.
+/// Marking first would drift the breakpoint and fold a per-turn message into the
+/// prefix, invalidating the cache on every background turn.
+fn prepare_wire_messages(messages: Vec<Message>, cache_messages: bool) -> Vec<Message> {
+    // Measured before the repair: a lone assistant turn becomes two messages, and
+    // marking that would place a breakpoint on a prefix consisting of one volatile
+    // turn — worthless to cache, and a behaviour change from before #1117.
+    let markable = messages.len() >= 2;
+    let mut messages = enforce_user_terminated(messages);
+    if cache_messages && markable {
+        mark_message_cache_breakpoints(&mut messages);
+    }
+    messages
+}
+
+/// Message-level cache breakpoints (#763): mark the penultimate message and (when
+/// long enough) index 0 so the conversation prefix is cached across turns. Uses at
+/// most 2 of the remaining cache-point budget.
+///
+/// Extracted from `chat_stream` so the ordering contract against
+/// [`enforce_user_terminated`] is testable: `pen` indexes off `messages.len()`, so a
+/// message appended *after* this runs would shift the breakpoint and fold a
+/// per-turn message into the cached prefix, invalidating it every turn.
+fn mark_message_cache_breakpoints(messages: &mut [Message]) {
+    if messages.len() < 2 {
+        return;
+    }
+    if let Some(point) = cache_point() {
+        let pen = messages.len() - 2;
+        messages[pen].content.push(ContentBlock::CachePoint(point));
+    }
+    if messages.len() >= 4 {
+        if let Some(point) = cache_point() {
+            messages[0].content.push(ContentBlock::CachePoint(point));
+        }
+    }
 }
 
 /// Bedrock rejects any assistant `tool_use` block whose id lacks a `tool_result`

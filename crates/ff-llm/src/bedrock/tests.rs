@@ -1387,3 +1387,202 @@ fn metadata_event_without_cache_fields_defaults_to_zero() {
     assert_eq!(chunk.cache_hit_tokens, 0);
     assert_eq!(chunk.cache_miss_tokens, 0);
 }
+
+/// #1117: an observer wake replays a transcript that ends with the assistant's
+/// last reply (its own context rides in the system prompt, not a user turn).
+/// Bedrock reads that as an assistant-prefill request and several models reject
+/// it, killing the turn before a token — the reason a watched-file edit never
+/// woke the agent. The provider layer must repair it.
+#[test]
+fn assistant_terminated_history_gets_a_synthetic_user_turn() {
+    let messages = vec![
+        msg(
+            ConversationRole::User,
+            vec![ContentBlock::Text("watch that file".to_string())],
+        ),
+        msg(
+            ConversationRole::Assistant,
+            vec![ContentBlock::Text("observer started".to_string())],
+        ),
+    ];
+
+    let fixed = enforce_user_terminated(messages);
+
+    assert_eq!(fixed.len(), 3, "one synthetic turn appended");
+    assert_eq!(
+        fixed.last().unwrap().role,
+        ConversationRole::User,
+        "conversation must end user-side"
+    );
+    match &fixed.last().unwrap().content[0] {
+        ContentBlock::Text(t) => assert_eq!(t, CONTINUE_NUDGE),
+        other => panic!("expected text block, got {other:?}"),
+    }
+}
+
+/// The interactive path must be untouched: a normal turn already ends with the
+/// user's message, so the guard is a no-op and no phantom turn appears.
+#[test]
+fn user_terminated_history_is_left_alone() {
+    let messages = vec![
+        msg(
+            ConversationRole::Assistant,
+            vec![ContentBlock::Text("done".to_string())],
+        ),
+        msg(
+            ConversationRole::User,
+            vec![ContentBlock::Text("next task".to_string())],
+        ),
+    ];
+    let before = messages.len();
+
+    let fixed = enforce_user_terminated(messages);
+
+    assert_eq!(fixed.len(), before, "no turn appended");
+    assert_eq!(fixed.last().unwrap().role, ConversationRole::User);
+    match &fixed.last().unwrap().content[0] {
+        ContentBlock::Text(t) => assert_eq!(t, "next task", "user's own text preserved"),
+        other => panic!("expected text block, got {other:?}"),
+    }
+}
+
+/// A tool-result turn is a `User` message, so a mid-tool-loop request is already
+/// well-formed and must not gain a "Continue." that would break the pairing
+/// `enforce_tool_result_pairing` just established.
+#[test]
+fn tool_result_turn_counts_as_user_terminated() {
+    let messages = vec![
+        msg(
+            ConversationRole::Assistant,
+            vec![tool_use_block("A", "bash")],
+        ),
+        msg(ConversationRole::User, vec![tool_result_block("A")]),
+    ];
+
+    let fixed = enforce_user_terminated(messages);
+
+    assert_eq!(fixed.len(), 2, "tool result already ends user-side");
+    assert!(
+        matches!(
+            &fixed.last().unwrap().content[0],
+            ContentBlock::ToolResult(_)
+        ),
+        "tool result must remain the final block"
+    );
+}
+
+/// An empty conversation is a caller bug; the provider should report it plainly
+/// rather than have us paper over it with a lone "Continue.".
+#[test]
+fn empty_history_is_not_given_a_synthetic_turn() {
+    assert!(enforce_user_terminated(Vec::new()).is_empty());
+}
+
+/// #1117 end-to-end shape: the real observer-wake conversation, composed the way
+/// `chat_stream` composes it — `to_converse` first, then the guard.
+///
+/// This is the case the unit tests above can't express: the wake's context arrives
+/// as a *system* message (not a user turn), and the transcript tail is
+/// `assistant → tool → assistant`, which is what the live failure showed at
+/// seq=4702..4704 — simplified from that live transcript to the shortest tail that
+/// still reproduces the rejection, so the literal seq numbers are provenance, not
+/// a message-for-message copy. Asserting the composed pipeline guards against a
+/// future refactor that reorders the two steps or drops the guard from `chat_stream`.
+#[test]
+fn observer_wake_conversation_is_repaired_end_to_end() {
+    let (system, messages) = to_converse(&[
+        // The wake context rides here, in the system prompt (lib.rs:1708).
+        ChatMessage::text("system", "[Observer \"watched-txt\"]: file changed"),
+        ChatMessage::text("user", "watch that file"),
+        ChatMessage::text("assistant", "observer started"),
+        ChatMessage::text("assistant", "checking the log"),
+    ]);
+    assert_eq!(system.len(), 1, "wake context hoisted to a system block");
+    assert_eq!(
+        messages.last().unwrap().role,
+        ConversationRole::Assistant,
+        "precondition: transcript ends assistant-side, as in the live failure"
+    );
+
+    let fixed = enforce_user_terminated(messages);
+
+    assert_eq!(
+        fixed.last().unwrap().role,
+        ConversationRole::User,
+        "request must be well-formed before it reaches the wire"
+    );
+    // The wake context must stay in the system block -- the synthetic turn is a
+    // contract filler and must not become the thing that steers the model.
+    match &fixed.last().unwrap().content[0] {
+        ContentBlock::Text(t) => assert_eq!(t, CONTINUE_NUDGE),
+        other => panic!("expected text block, got {other:?}"),
+    }
+}
+
+/// #1117 ordering contract, pinned through the real composition point.
+/// `prepare_wire_messages` repairs *then* marks cache breakpoints, and this asserts
+/// the cost consequence rather than the call order: the synthesized nudge is volatile
+/// -- a fresh one per background wake -- so it must stay outside the cached prefix.
+/// The breakpoint indexes off `messages.len()`, so marking before repairing would fold
+/// a per-turn message into the prefix and invalidate the cache on every wake.
+#[test]
+fn cache_prefix_excludes_the_synthesized_nudge() {
+    let text = |t: &str| vec![ContentBlock::Text(t.to_string())];
+    let convo = vec![
+        msg(ConversationRole::User, text("watch that file")),
+        msg(ConversationRole::Assistant, text("observer started")),
+        msg(ConversationRole::User, text("and report")),
+        msg(ConversationRole::Assistant, text("will do")),
+    ];
+    let has_point = |m: &Message| {
+        m.content()
+            .iter()
+            .any(|b| matches!(b, ContentBlock::CachePoint(_)))
+    };
+
+    let out = prepare_wire_messages(convo.clone(), true);
+
+    // The guard appended a synthetic user nudge at the tail.
+    let nudge = out.len() - 1;
+    assert_eq!(*out[nudge].role(), ConversationRole::User);
+    assert!(
+        !has_point(&out[nudge]),
+        "the volatile nudge must never carry a cache point"
+    );
+
+    // The breakpoint landed before it, so the cached prefix stops short of the nudge.
+    assert!(
+        has_point(&out[nudge - 1]),
+        "breakpoint should sit on the message before the nudge"
+    );
+
+    // Cache disabled: repair still happens, no breakpoints anywhere.
+    let plain = prepare_wire_messages(convo, false);
+    assert_eq!(*plain[plain.len() - 1].role(), ConversationRole::User);
+    assert!(
+        !plain.iter().any(has_point),
+        "no cache points when caching is off"
+    );
+}
+
+/// A lone assistant message is repaired to two, which crosses the cache breakpoint's
+/// `len() >= 2` threshold. Marking it would put a breakpoint on a 2-message
+/// conversation whose prefix is a single volatile turn -- worthless to cache and a
+/// behaviour change from before the repair existed. Guard against re-introducing it.
+#[test]
+fn single_assistant_message_is_repaired_but_not_cache_marked() {
+    let convo = vec![msg(
+        ConversationRole::Assistant,
+        vec![ContentBlock::Text("orphaned".to_string())],
+    )];
+    let out = prepare_wire_messages(convo, true);
+
+    assert_eq!(out.len(), 2, "repair appends the nudge");
+    assert!(
+        !out.iter().any(|m| m
+            .content()
+            .iter()
+            .any(|b| matches!(b, ContentBlock::CachePoint(_)))),
+        "a repaired 2-message conversation must not be cache-marked"
+    );
+}
