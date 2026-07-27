@@ -408,6 +408,23 @@ body {
   font-weight: 600;
 }
 
+/* KaTeX math (#1102). The vendor stylesheet (imported in main.tsx) sizes the
+   glyphs; these rules only bind it to the active theme and stop a wide formula
+   from pushing the message bubble sideways — same overflow pattern as tables. */
+.ff-prose .katex {
+  color: var(--foreground);
+}
+.ff-prose .katex-display {
+  overflow-x: auto;
+  overflow-y: hidden;
+  margin: 0.6em 0;
+  padding: 0.15em 0;
+}
+/* `throwOnError: false` leaves malformed LaTeX as literal red source text. */
+.ff-prose .katex-error {
+  color: var(--destructive);
+}
+
 /* Inline code */
 .ff-inline-code {
   font-family: var(--font-code);

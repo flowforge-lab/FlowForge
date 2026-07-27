@@ -112,3 +112,92 @@ describe("Markdown streaming vs final equivalence (#844)", () => {
     expect(final.querySelector('span[class*="hljs-"]')).not.toBeNull();
   });
 });
+
+// KaTeX typesetting (#1102). Both delimiter families must work: models in the
+// OpenAI family emit `\(…\)` / `\[…\]` rather than `$…$`, so dollar-only
+// support would leave math broken across a large share of providers.
+describe("Markdown math rendering (#1102)", () => {
+  function render1(content: string, streaming = false) {
+    return render(<Markdown content={content} streaming={streaming} />)
+      .container;
+  }
+
+  it("typesets $$…$$ as display math", () => {
+    const container = render1("$$\\frac{a}{b}$$");
+
+    expect(container.querySelector(".katex-display")).not.toBeNull();
+    expect(container.textContent).not.toContain("$$");
+  });
+
+  it("typesets $…$ as inline math", () => {
+    const container = render1("Attraction $A$ holds.");
+
+    expect(container.querySelector(".katex")).not.toBeNull();
+    expect(container.querySelector(".katex-display")).toBeNull();
+    expect(container.textContent).not.toContain("$");
+  });
+
+  it("typesets \\(…\\) as inline math", () => {
+    const container = render1("Inline \\(A \\Rightarrow R\\) and done.");
+
+    expect(container.querySelector(".katex")).not.toBeNull();
+    expect(container.querySelector(".katex-display")).toBeNull();
+    expect(container.textContent).toContain("done.");
+  });
+
+  it("typesets \\[…\\] as display math", () => {
+    const container = render1("\\[ A \\implies R \\]");
+
+    expect(container.querySelector(".katex-display")).not.toBeNull();
+  });
+
+  // Load-bearing: this is what the "text nodes only" rule in
+  // remark-backslash-math.ts exists to protect. A naive string replace on the
+  // raw markdown would corrupt every regex/C/LaTeX snippet a model writes.
+  it("leaves backslash delimiters inside a fenced code block verbatim", () => {
+    const container = render1(
+      "```c\nint a[] = {1};\n// see \\(ref\\) and \\[eq\\]\n```",
+    );
+
+    const code = container.querySelector("pre code");
+    expect(code).not.toBeNull();
+    expect(code!.textContent).toContain("\\(ref\\)");
+    expect(code!.textContent).toContain("\\[eq\\]");
+    expect(container.querySelector(".katex")).toBeNull();
+  });
+
+  it("leaves backslash delimiters inside inline code verbatim", () => {
+    const container = render1("Match `\\(x\\)` with `\\[y\\]`.");
+
+    expect(container.querySelector(".katex")).toBeNull();
+    expect(container.textContent).toContain("\\(x\\)");
+    expect(container.textContent).toContain("\\[y\\]");
+  });
+
+  // remark-math rejects a `$…$` span whose content starts or ends with a space,
+  // which is what keeps ordinary currency prose from being swallowed as math.
+  it("does not treat currency amounts as math", () => {
+    const container = render1("It costs $5 to $10 today.");
+
+    expect(container.querySelector(".katex")).toBeNull();
+    expect(container.textContent).toContain("$5 to $10");
+  });
+
+  it("renders math identically while streaming and once settled", () => {
+    const content =
+      "Given \\(A \\Rightarrow R\\), we get $x^2$.\n\n$$\\frac{a}{b}$$";
+
+    const streamed = renderStreamedIncrementally(content, 6);
+    const { container: final } = render(
+      <Markdown content={content} streaming={false} />,
+    );
+
+    expect(streamed.querySelectorAll(".katex").length).toBe(
+      final.querySelectorAll(".katex").length,
+    );
+    expect(streamed.querySelectorAll(".katex-display").length).toBe(
+      final.querySelectorAll(".katex-display").length,
+    );
+    expect(blockTexts(streamed)).toEqual(blockTexts(final));
+  });
+});
