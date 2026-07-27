@@ -9,7 +9,7 @@
   working set — the natural home for a task-type prior), RFC 0007 (usage-driven decay &
   salience — reused for Layer 3 consolidation), RFC 0016/0022 (context compaction — same
   cache-stable-prefix discipline, applied to the tools block instead of the message region)
-- **Tracking issue:** _TBD_
+- **Tracking issue:** #1107 (epic); Phase 1: #1108
 - **Prior art:** Anthropic's "Tool Search Tool" + `defer loading` (2026-07). This RFC
   adopts its Layer 1 wholesale and extends it with two layers that a purely
   engineering-framed design does not reach.
@@ -286,3 +286,63 @@ approximate. The exact per-tool distribution (min ~86, median ~200, max ~2,300 t
 confirms a heavy long tail concentrated in one server — the profile just-in-time loading
 is designed for. Re-run before Phase 1 to set a precise baseline and after to verify the
 reduction target.
+
+## Appendix B — Code survey: the seams already exist
+
+A survey of the current implementation found that most of what Layer 1 needs is already
+present, which is what makes Phase 1 cheap. Exact sites:
+
+| Capability needed | Already present | Site |
+|---|---|---|
+| Default-provided trait methods for tool classification | 5 of them (`max_safety`, `min_safety`, `interactive`, `reaches_network`, `dedupe_key`) — adding `defer()` fits the established pattern | `crates/ff-tools/src/registry.rs:99-190` |
+| Centralized allowlist computation (layered intersection) | `advertised_tools(mode, egress, matrix, allowed, registry)` — a pure `mode` ∩ `egress` ∩ `allowed` pipeline; the defer pass is one more layer | `crates/ff-agent/src/lib.rs:898` |
+| **Single** production injection point | `openai_tools_for(advertised.as_ref(), allow_subagent)` — the only production caller in the repo | `crates/ff-agent/src/lib.rs:1124` |
+| Precedent for mutating the tools block mid-turn | `withhold_tools` already empties it on the final iteration, and each iteration rebuilds `ChatRequest` with `tools: tool_schemas.clone()` | `crates/ff-agent/src/lib.rs:1799-1803` |
+| Session-aware tool dispatch (needed so `tool_search` can scope its allow-set) | `Tool::run_with_session(args, root, session_id)`; the `observer` tool is a working precedent — holds an `Arc<Supervisor>` and isolates by session | `registry.rs:169`, `crates/ff-observer/src/tool.rs:144` |
+| Tools-block token instrumentation | `tool_tokens` + `tool_specs` in `context_breakdown` | `crates/ff-agent/src/lib.rs:858-875` |
+| Cache hit/miss telemetry (to prove the prefix invariant empirically) | `cache_hit_tokens` / `cache_miss_tokens` on `AgentEvent::Done` | `crates/ff-agent/src/lib.rs:2067` |
+
+Two consequences worth stating explicitly:
+
+1. **`Tool::defer()` with a `false` default means none of the 33 `impl Tool` sites change.**
+   Deferral is opt-in, so the blast radius is the MCP bridge plus the advertise pipeline.
+2. **Mid-turn injection is architecturally already possible.** `tool_schemas` is computed
+   once (`lib.rs:1122`) and cloned per iteration; `withhold_tools` proves the tools block
+   can legitimately differ between iterations of the same turn. Phase 1 needs
+   `let mut tool_schemas` and an append, not a redesign of the loop.
+3. **No new measurement infrastructure.** `tool_tokens`/`tool_specs` give the before/after
+   token delta and `cache_hit_tokens`/`cache_miss_tokens` verify that append-at-end really
+   does preserve (and improve) cache hits, rather than assuming it.
+
+One design risk this survey also surfaced: `advertised_tools` is where the **permission
+matrix** (mode/egress) is enforced. The defer pass must compose as an *additional*
+restriction plus a re-admission of allow-listed names — a deferred tool re-admitted by
+`tool_search` must still be filtered by mode/egress. Deferral must never become a
+privilege-escalation bypass; §7 Phase 1 carries an explicit test for this.
+
+## Appendix C — LOE
+
+Grounded in Appendix B (all Phase 1 work is an extension of an existing pattern; no new
+subsystem).
+
+| Phase | LOE | Risk |
+|---|---|---|
+| 1 — Layer 1, server-granularity defer | **3–4 days** | Low |
+| 2 — Layer 1, semantic + action-level retrieval | **4–6 days** | Medium (retrieval quality needs evaluation) |
+| 3 — Layer 2, predictive pre-activation | **3–5 days** | Medium (task-type signal is an open design question) |
+| 4 — Layer 3, consolidation | **5–8 days** | High (implementation only; excludes calendar time to accrue data and tune) |
+
+**Total ≈ 15–23 days**, but Phase 1 stands alone and pays for itself immediately.
+
+Phase 1 breakdown:
+
+| Work | Est. | Risk |
+|---|---|---|
+| `Tool::defer()`, bridge flag, defer pass in `advertised_tools` | 0.5 day | Low — mechanical |
+| `tool_search` meta-tool + keyword index | 1.5–2 days | Medium — recall against doc-length descriptions |
+| Mid-turn injection + append-at-end invariant | 1 day | Medium — the cache invariant is the sharp edge |
+| Tests (incl. golden prefix-stability test) + regression | 0.5–1 day | Low |
+
+The dominant Phase 1 risk is **keyword recall against polymorphic tools** whose real
+capability is buried in a long description. If evaluation shows poor recall, Phase 2 is
+promoted from optimization to prerequisite and pulls forward.
