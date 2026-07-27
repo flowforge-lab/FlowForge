@@ -40,6 +40,18 @@ interface ProcessesState {
   /** Drop a session's processes (no IPC). Used by the chat store's delete-session
    *  reconciliation so a vanished session's buffers don't dangle in memory. */
   clear: (sessionId: string) => void;
+  /** Drop one *finished* process's buffer (#1089). No IPC: the process has
+   *  already exited, so this is pure view cleanup — nothing to stop backend-side
+   *  (contrast the observer panel's `[×]`, which calls `stop_observer`). The UI
+   *  only offers this on terminal rows; dropping a running process's buffer
+   *  would orphan output that is still arriving. Empties the session key when it
+   *  removes the last entry, so the panel self-hides exactly as after `clear`. */
+  dismiss: (sessionId: string, processId: number) => void;
+  /** Drop every terminal process for a session in one go (#1089) — the bulk form
+   *  of `dismiss`, for when a long session has accumulated a stack of exited
+   *  rows. Running processes are left alone. Same no-IPC and drop-empty-session
+   *  rules as `dismiss`. */
+  clearFinished: (sessionId: string) => void;
 }
 
 export const useProcessesStore = create<ProcessesState>((set) => ({
@@ -90,5 +102,41 @@ export const useProcessesStore = create<ProcessesState>((set) => ({
       if (!(sessionId in s.bySession)) return s;
       const { [sessionId]: _dropped, ...rest } = s.bySession;
       return { bySession: rest };
+    }),
+
+  dismiss: (sessionId, processId) =>
+    set((s) => {
+      const forSession = s.bySession[sessionId];
+      if (!forSession || !(processId in forSession)) return s;
+      const { [processId]: _dropped, ...remaining } = forSession;
+      // Last one out drops the session key, which is what the panel's
+      // `if (!byId) return null` self-hide keys on.
+      if (Object.keys(remaining).length === 0) {
+        const { [sessionId]: _empty, ...rest } = s.bySession;
+        return { bySession: rest };
+      }
+      return { bySession: { ...s.bySession, [sessionId]: remaining } };
+    }),
+
+  clearFinished: (sessionId) =>
+    set((s) => {
+      const forSession = s.bySession[sessionId];
+      if (!forSession) return s;
+      const running = Object.entries(forSession).filter(
+        ([, p]) => p.status === null,
+      );
+      // Nothing terminal — return the state untouched rather than a new object,
+      // so a no-op call can't re-render the panel.
+      if (running.length === Object.keys(forSession).length) return s;
+      if (running.length === 0) {
+        const { [sessionId]: _empty, ...rest } = s.bySession;
+        return { bySession: rest };
+      }
+      return {
+        bySession: {
+          ...s.bySession,
+          [sessionId]: Object.fromEntries(running),
+        },
+      };
     }),
 }));

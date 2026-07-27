@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { Check, ChevronRight, Terminal, X } from "@/components/ui/icon";
+import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { Spinner } from "@/components/ui/spinner";
 import { useProcessesStore } from "@/store/processes";
@@ -18,6 +19,11 @@ import type { ProcessState } from "@/store/processes";
 //
 // Self-hides when the session has no background processes (store entry absent or
 // empty), so a session that never starts one shows nothing at all.
+//
+// Finished processes can be dismissed individually or in bulk (#1089). Both are
+// frontend-only buffer drops — the process has already exited — and both leave
+// running processes untouched; killing a live one would need a backend IPC and
+// is deliberately not offered here.
 
 export function ProcessStatusPanel({ sessionId }: { sessionId: string }) {
   const byId = useProcessesStore((s) => s.bySession[sessionId]);
@@ -29,10 +35,30 @@ export function ProcessStatusPanel({ sessionId }: { sessionId: string }) {
   );
   if (processes.length === 0) return null;
 
+  // Terminal rows are the ones the bulk action clears (#1089). The header exists
+  // only to hold that button, so it appears only once there's something to
+  // clear — a session with one running dev server keeps the strip chrome-free.
+  const finishedCount = processes.filter((p) => p.status !== null).length;
+
   return (
     <div className="flex shrink-0 flex-col border-b bg-card/40">
+      {finishedCount > 0 && (
+        <div className="flex items-center justify-end px-2.5 py-1">
+          <Button
+            variant="ghost"
+            size="xs"
+            onClick={() =>
+              useProcessesStore.getState().clearFinished(sessionId)
+            }
+            title="Remove all finished processes from this panel"
+            className="text-[11px] text-muted-foreground hover:text-foreground"
+          >
+            Clear finished ({finishedCount})
+          </Button>
+        </div>
+      )}
       {processes.map((p) => (
-        <ProcessRow key={p.processId} process={p} />
+        <ProcessRow key={p.processId} process={p} sessionId={sessionId} />
       ))}
     </div>
   );
@@ -42,7 +68,13 @@ export function ProcessStatusPanel({ sessionId }: { sessionId: string }) {
 // expanded (the user just started them and wants to watch); exited ones default
 // to collapsed (the run is over, keep the strip compact) — but either can be
 // toggled.
-function ProcessRow({ process }: { process: ProcessState }) {
+function ProcessRow({
+  process,
+  sessionId,
+}: {
+  process: ProcessState;
+  sessionId: string;
+}) {
   const running = process.status === null;
   const [expanded, setExpanded] = useState(running);
 
@@ -76,6 +108,23 @@ function ProcessRow({ process }: { process: ProcessState }) {
           <span className={cn("size-1.5 shrink-0 rounded-full", dotTone)} />
           <ProcessStatusBadge status={process.status} />
         </button>
+        {/* Dismiss (#1089) — finished rows only. The process is already dead, so
+            this just drops its buffer; a running row gets no button, since
+            hiding live output would orphan it. Mirrors the observer panel's
+            `[×]`, which is the same affordance one IPC call heavier. */}
+        {!running && (
+          <button
+            type="button"
+            onClick={() =>
+              useProcessesStore.getState().dismiss(sessionId, process.processId)
+            }
+            aria-label={`Dismiss process ${process.processId}`}
+            title="Dismiss"
+            className="shrink-0 rounded p-0.5 text-muted-foreground transition-colors hover:bg-foreground/5 hover:text-foreground"
+          >
+            <X className="size-3.5" />
+          </button>
+        )}
       </div>
       {expanded && <ProcessOutput output={process.output} />}
     </div>
