@@ -30,6 +30,24 @@ import type { Message } from "@/bindings";
 
 const NO_STEPS: ToolStep[] = [];
 const NO_ITEMS: TurnItem[] = [];
+// #866: how long a session switch's forced bottom-pin stays armed, bridging
+// the async gap until loadSession()'s full-history swap-in settles.
+//
+// 4s is ~40x the observed local round trip (one `get_messages` IPC plus a
+// SQLite read of a few hundred rows, single-digit-to-tens of ms warm; the
+// slowest cold relaunch measured against a 734-message session was still well
+// under 100ms), so it is headroom, not a deadline anyone is expected to
+// approach. A bound is needed at all because the arm's proof — the transcript's
+// first message id changing — stays true *forever* after the swap: the armed
+// baseline is the cached head, so without an expiry a swap that resizes nothing
+// (a session at or under the 50-message cache cap, where cached tail and full
+// history render identically) would leave the arm live until some unrelated
+// later resize, and force-pin *that* over a deliberate scroll-up. The two
+// failure modes are therefore symmetric and unavoidable in this shape: too
+// short silently degrades to today's behavior (#866 returns for that load), too
+// long yanks a reading user once. This errs toward the yank being impossible
+// and the miss being implausible.
+const FORCE_PIN_WINDOW_MS = 4000; // generous margin over a local IPC round trip
 // Stable empty transcript so a not-yet-loaded session keeps a constant `msgs` ref.
 const EMPTY_MESSAGES: Message[] = [];
 
@@ -575,6 +593,69 @@ export function ChatView({ sessionId }: { sessionId?: string } = {}) {
   // Render-state mirror of `pinnedToBottom` so the floating "Jump to latest" button
   // (#206) shows only while scrolled up. Toggles at the same 40px threshold.
   const [atBottom, setAtBottom] = useState(true);
+  // Bridges the async gap between the session-switch effect's pin to the cached
+  // tail and loadSession()'s later swap-in of the full history
+  // (chat.ts:457-490). During that gap, the browser's default CSS scroll
+  // anchoring (no overflow-anchor:none in this app) can fire a `scroll` event
+  // while older messages are inserted above the preserved tail, flipping
+  // `pinnedToBottom.current` to false before either pin path below checks
+  // it (#866) — both of them gate on that flag, so both consult the arm.
+  //
+  // A bare time window isn't enough to gate the override: ordinary streaming
+  // (new tokens, a late-settling markdown block) also fires the same
+  // ResizeObserver shortly after a switch, and forcing *that* through would
+  // override a genuine manual scroll-up — regressing the "scroll-up detaches
+  // autoscroll" behavior for several seconds after every switch. So the
+  // override additionally requires proof that a history swap-in actually
+  // happened: `loadSession` *prepends* older messages above the preserved
+  // tail, changing the transcript's first message id — something ordinary
+  // streaming (which only appends or mutates the last message) never does.
+  // `latestMessagesRef` mirrors the current transcript every render so the
+  // ResizeObserver closure (deliberately NOT re-created per message, to avoid
+  // recreating the observer per streamed token, #1022) can read it without
+  // being in the effect's dependency array.
+  const forcePinUntil = useRef(0);
+  const armedFirstMessageId = useRef<string | undefined>(undefined);
+  const latestMessagesRef = useRef(messages);
+  useEffect(() => {
+    latestMessagesRef.current = messages;
+  }, [messages]);
+
+  // THE pin decision — the single implementation every trigger funnels through
+  // (the ResizeObserver settle, the session switch, and the transcript swap), so
+  // there is one gate and one place the arm is read and consumed, not a copy per
+  // trigger. Returns whether the caller should pin; the caller does its own
+  // one-line `scrollTop = scrollHeight` (writing to the container from in here
+  // would be mutating a `useState` value inside a callback, which the compiler
+  // lint rejects). Always call it from inside a rAF: every caller needs the
+  // post-layout height, for the reasons #1025 documents on the observer.
+  //
+  // `authoritative` marks the ResizeObserver settle — the only caller that can
+  // know layout finished for this frame, and therefore the only one allowed to
+  // consume the arm. The other callers must NOT consume: they run on the commit
+  // that swaps the history in, which is *before* scroll anchoring fires its
+  // intermediate `scroll` event, so consuming there would spend the arm on the
+  // pre-race pin and leave the post-race settle ungated — verified by flipping
+  // this one flag, which reproduces the swap test's 2000-instead-of-4000.
+  const shouldPinToTail = useCallback(
+    (authoritative: boolean) => {
+      if (findOn) return false;
+      // The arm only overrides a *transient* false, and only on proof that the
+      // armed switch's history swap-in actually landed (first message id
+      // changed) — never on ordinary streaming growth.
+      const historySwapped =
+        forcePinUntil.current > Date.now() &&
+        latestMessagesRef.current?.[0]?.id !== armedFirstMessageId.current;
+      if (!pinnedToBottom.current && !historySwapped) return false;
+      if (historySwapped && authoritative) {
+        forcePinUntil.current = 0; // consume: one forced settle per arm
+        pinnedToBottom.current = true;
+        setAtBottom(true);
+      }
+      return true;
+    },
+    [findOn],
+  );
 
   // Stay pinned to the bottom while streaming, but respect manual scroll-up.
   // Pinning has to happen *after* the browser lays out the new content, not at
@@ -598,9 +679,8 @@ export function ChatView({ sessionId }: { sessionId?: string } = {}) {
       if (raf) return; // a pin is already scheduled for this frame
       raf = requestAnimationFrame(() => {
         raf = 0;
-        if (pinnedToBottom.current && !findOn) {
-          scrollEl.scrollTop = scrollEl.scrollHeight;
-        }
+        // The authoritative post-layout settle — the one caller that consumes.
+        if (shouldPinToTail(true)) scrollEl.scrollTop = scrollEl.scrollHeight;
       });
     });
     ro.observe(contentEl);
@@ -608,7 +688,7 @@ export function ChatView({ sessionId }: { sessionId?: string } = {}) {
       ro.disconnect();
       if (raf) cancelAnimationFrame(raf);
     };
-  }, [scrollEl, contentEl, findOn]);
+  }, [scrollEl, contentEl, shouldPinToTail]);
 
   // A session swap can land on a transcript of the same height (no ResizeObserver
   // fire), so re-arm the pin and jump to the tail explicitly here. `findOn` gates
@@ -619,31 +699,42 @@ export function ChatView({ sessionId }: { sessionId?: string } = {}) {
   // (#1025): at commit time the freshly mounted rows haven't laid out, so a
   // synchronous `scrollTop = scrollHeight` reads a short height and lands above
   // the tail.
+  //
+  // It also only pins to whatever is rendered *right now* — on a cold session
+  // switch that's the short localStorage-cached tail (message-cache.ts), not
+  // the full history loadSession() swaps in moments later (#866). Arm
+  // `forcePinUntil`/`armedFirstMessageId` here so `shouldPinToTail` can force
+  // the eventual full-history settle to the true bottom, even if a transient
+  // scroll event flips `pinnedToBottom.current` to false in between.
   useEffect(() => {
     pinnedToBottom.current = true;
-    if (!scrollEl || findOn) return;
+    forcePinUntil.current = Date.now() + FORCE_PIN_WINDOW_MS;
+    armedFirstMessageId.current = messages?.[0]?.id;
+    if (!scrollEl) return;
     const raf = requestAnimationFrame(() => {
-      scrollEl.scrollTop = scrollEl.scrollHeight;
+      if (shouldPinToTail(false)) scrollEl.scrollTop = scrollEl.scrollHeight;
     });
     return () => cancelAnimationFrame(raf);
-  }, [targetSessionId, scrollEl, findOn]);
+    // `messages` is deliberately NOT a dependency: the arm must capture
+    // whatever is rendered at the moment of the switch (the cache), not re-arm
+    // on every later token — `latestMessagesRef` is what `shouldPinToTail`
+    // reads live, for exactly that reason.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [targetSessionId, scrollEl, shouldPinToTail]);
 
   // The relaunch swap (#866): `loadSession` replaces the store's <=50-message
   // localStorage tail with the backend's full history, which can render at the
   // *same* height (a session of <=50 messages) — so no ResizeObserver fire —
   // while `targetSessionId` never changed, so the effect above doesn't re-run
-  // either. Pin on the transcript's identity changing as well, under exactly the
-  // observer's conditions: only while the user is still pinned (a scroll-up has
-  // already cleared `pinnedToBottom`, so this can't fight someone reading
-  // history) and never while find is open. Content-driven rather than
-  // size-driven, which is what covers the equal-height swap.
+  // either. Pin on the transcript's identity changing as well, through the same
+  // `shouldPinToTail` gate; non-authoritative, so it never consumes the arm.
   useEffect(() => {
-    if (!scrollEl || findOn) return;
+    if (!scrollEl) return;
     const raf = requestAnimationFrame(() => {
-      if (pinnedToBottom.current) scrollEl.scrollTop = scrollEl.scrollHeight;
+      if (shouldPinToTail(false)) scrollEl.scrollTop = scrollEl.scrollHeight;
     });
     return () => cancelAnimationFrame(raf);
-  }, [messages, scrollEl, findOn]);
+  }, [messages, scrollEl, shouldPinToTail]);
 
   // Reset the scroll affordance when the pane switches sessions. setState during
   // render is React's recommended reset-on-prop-change pattern — no effect, no
