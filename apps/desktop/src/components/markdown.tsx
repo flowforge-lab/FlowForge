@@ -2,8 +2,11 @@ import { memo, type ReactNode } from "react";
 import { isValidElement } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import remarkMath from "remark-math";
 import rehypeHighlight from "rehype-highlight";
+import rehypeKatex from "rehype-katex";
 import { Check, Copy, PanelRight } from "@/components/ui/icon";
+import { remarkBackslashMath } from "@/lib/remark-backslash-math";
 import { splitBlocks } from "@/lib/markdown-blocks";
 import { cn } from "@/lib/utils";
 import { useCopied } from "@/lib/use-copied";
@@ -138,13 +141,33 @@ const COMPONENTS = {
   ),
 };
 
+// Math support (#1102). `remarkMath` handles `$…$`/`$$…$$`; `remarkBackslashMath`
+// handles the `\(…\)`/`\[…\]` forms OpenAI-family models emit. Both lower to
+// `<code class="language-math …">`, which `COMPONENTS.code` would otherwise
+// render as a code block complete with copy/split chrome — so `rehypeKatex`
+// (which splices those elements out entirely) must accompany them on every
+// instance, streaming included. Shared consts so the three prose instances
+// below cannot drift apart and render the same message two different ways.
+const REMARK_PLUGINS = [remarkGfm, remarkBackslashMath, remarkMath];
+// A malformed formula renders as inline `.katex-error` text instead of throwing
+// and blanking the whole message.
+const KATEX: [typeof rehypeKatex, { throwOnError: boolean }] = [
+  rehypeKatex,
+  { throwOnError: false },
+];
+const KATEX_PLUGINS = [KATEX];
+
 // One markdown block, rendered through the same (highlight-free) pipeline as
 // the streaming path. Memoized so a closed block — whose text never changes
 // again once closed — is parsed exactly once, no matter how many more frames
 // the surrounding message keeps streaming.
 const MarkdownBlock = memo(function MarkdownBlock({ text }: { text: string }) {
   return (
-    <ReactMarkdown remarkPlugins={[remarkGfm]} components={COMPONENTS}>
+    <ReactMarkdown
+      remarkPlugins={REMARK_PLUGINS}
+      rehypePlugins={KATEX_PLUGINS}
+      components={COMPONENTS}
+    >
       {text}
     </ReactMarkdown>
   );
@@ -167,6 +190,11 @@ const MarkdownBlock = memo(function MarkdownBlock({ text }: { text: string }) {
 // parsed each frame, bounding per-frame cost to roughly the last block's size
 // instead of the whole message. Once the turn finishes, `streaming` flips to
 // false and the full content re-parses once, unsplit, with highlighting.
+//
+// KaTeX, unlike highlighting, does run while streaming (#1102): it is cheap next
+// to highlight.js, only touches the math nodes, and leaving it off would render
+// formulas as code blocks mid-stream and then swap them for typeset math when
+// the turn settles — exactly the inconsistency #844's equivalence test guards.
 function MarkdownImpl({
   content,
   streaming = false,
@@ -181,7 +209,11 @@ function MarkdownImpl({
         {closed.map((block, i) => (
           <MarkdownBlock key={i} text={block} />
         ))}
-        <ReactMarkdown remarkPlugins={[remarkGfm]} components={COMPONENTS}>
+        <ReactMarkdown
+          remarkPlugins={REMARK_PLUGINS}
+          rehypePlugins={KATEX_PLUGINS}
+          components={COMPONENTS}
+        >
           {open}
         </ReactMarkdown>
       </div>
@@ -191,8 +223,8 @@ function MarkdownImpl({
   return (
     <div className="ff-prose">
       <ReactMarkdown
-        remarkPlugins={[remarkGfm]}
-        rehypePlugins={[rehypeHighlight]}
+        remarkPlugins={REMARK_PLUGINS}
+        rehypePlugins={[...KATEX_PLUGINS, rehypeHighlight]}
         components={COMPONENTS}
       >
         {content}
@@ -233,6 +265,8 @@ const HIGHLIGHT_COMPONENTS = {
 // Syntax-highlights a raw code string, reusing #7's rehype-highlight pipeline
 // and the shared `.hljs` theme in index.css. Returns the bare highlighted
 // <code> (no <pre>) so callers control wrapping/scroll. Used by the split panel.
+// No remark plugins here: the document is nothing but one fence, so gfm and the
+// math plugins would have nothing outside it to act on.
 function HighlightedCodeImpl({ lang, text }: { lang: string; text: string }) {
   const fence = safeFence(text);
   return (

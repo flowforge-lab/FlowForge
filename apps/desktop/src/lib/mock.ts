@@ -229,9 +229,10 @@ const GOAL_STEP_SCRIPT: readonly {
 const SECRET_ANSWER_PLACEHOLDER = "[secret provided by user]";
 
 // A small Markdown document so the renderer's features (headings, lists,
-// emphasis, inline code, a fenced + highlighted code block, a table, a link)
-// are all exercised under `VITE_FF_MOCK=1`. Uses single spaces between words so
-// the word-by-word fake stream reconstructs it faithfully.
+// emphasis, inline code, a fenced + highlighted code block, a table, a link,
+// math in both delimiter families) are all exercised under `VITE_FF_MOCK=1`.
+// Uses single spaces between words so the word-by-word fake stream reconstructs
+// it faithfully.
 const MOCK_REPLY = `### Mocked assistant reply
 
 This is a **mocked assistant reply** streamed token by token so the UI can be built without a running backend. It now renders _Markdown_ — including inline \`code\` and the block below.
@@ -250,7 +251,13 @@ export function greet(name: string): string {
 | Feature | Status |
 | --- | --- |
 | Headings | done |
-| Code blocks | done |`;
+| Code blocks | done |
+
+Math (#1102): attraction $A$ satisfies \\(A \\Rightarrow R\\), but $R \\not\\Rightarrow A$.
+
+$$P(R \\mid A) = \\frac{P(A \\mid R)\\,P(R)}{P(A)} = \\int_0^1 \\frac{\\alpha}{\\beta}\\,dx$$
+
+\\[ A \\implies R \\quad\\text{and}\\quad R \\nRightarrow A \\]`;
 
 const MOCK_REASONING =
   "Let me scan the README for FlowForge references before suggesting an edit.";
