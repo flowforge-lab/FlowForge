@@ -48,6 +48,8 @@ futures-util = { workspace = true }
 reqwest = { workspace = true, features = ["rustls-tls"] }
 url = { workspace = true }
 tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tracing-appender = { workspace = true }
 uuid = { workspace = true }
 # OS keychain backends, split by target so each platform compiles only its own.
 # secrets.rs is provider-agnostic, so this backs every secret-holding provider
