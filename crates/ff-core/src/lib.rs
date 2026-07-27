@@ -25,8 +25,8 @@ pub use egress::Egress;
 pub use export::Format;
 pub use files::{DirEntry, FileContent};
 pub use goal::{
-    Goal, GoalBudget, GoalLedgerEntry, GoalSpend, GoalStatus, GoalStore, NextAction, StepStatus,
-    Verdict, DEFAULT_MAX_ITERATIONS,
+    goal_store_dir, Goal, GoalBudget, GoalLedgerEntry, GoalSpend, GoalStatus, GoalStore,
+    NextAction, StepStatus, Verdict, DEFAULT_MAX_ITERATIONS,
 };
 pub use mcp::{McpScope, McpServerConfig, McpServerState, McpServerStatus, McpToolInfo};
 pub use memory::{MemoryChunkStat, MemoryFileInfo, MemoryFileKind, MemoryOverview, Stratum};

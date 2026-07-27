@@ -1939,6 +1939,7 @@ dependencies = [
  "ff-core",
  "ff-llm",
  "ff-memory",
+ "ff-scheduled",
  "ff-session",
  "ff-skills",
  "ff-tools",
@@ -1948,6 +1949,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "uuid",
  "wiremock",
 ]
 
