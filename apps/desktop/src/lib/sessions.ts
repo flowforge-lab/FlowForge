@@ -158,23 +158,37 @@ export const SESSION_REVEAL_BATCH = 25;
 
 /**
  * Order the full session list for display (#667): pinned first, then the rest of
- * the non-dismissed sessions, then dismissed sessions last. Order within each of
- * the three groups is preserved (stable). Dismissed always sink to the bottom
- * regardless of pin, so a dismissed session never floats above a live one.
+ * the non-dismissed sessions, then dismissed sessions last. Dismissed always sink
+ * to the bottom regardless of pin, so a dismissed session never floats above a
+ * live one.
+ *
+ * `pinned` is the pin order itself (session-prefs' `pinned` array, appended to on
+ * each pin), not a membership set — the pinned group is sorted by it, newest pin
+ * first, so a freshly pinned session jumps to the very top (#1110). Taking the
+ * array rather than a set alongside it means a caller can't pass membership and
+ * order that disagree. The live and dismissed groups keep the incoming order
+ * (backend recency), which the stable sort preserves.
  */
 export function arrangeSessions(
   sessions: Session[],
-  pinned: ReadonlySet<string>,
+  pinned: readonly string[],
   dismissed: ReadonlySet<string>,
 ): Session[] {
+  const pinOrder = new Map(pinned.map((id, i) => [id, i]));
   const rank = (s: Session): number => {
     if (dismissed.has(s.id)) return 2; // dismissed: always last
-    if (pinned.has(s.id)) return 0; // pinned live: first
+    if (pinOrder.has(s.id)) return 0; // pinned live: first
     return 1; // other live
   };
-  // Stable sort by group rank (Array.prototype.sort is stable), so insertion
-  // order is kept within each group.
-  return [...sessions].sort((a, b) => rank(a) - rank(b));
+  return [...sessions].sort((a, b) => {
+    const ra = rank(a);
+    const rb = rank(b);
+    if (ra !== rb) return ra - rb;
+    // Pinned group only: newest pin first. Returning 0 for the live and dismissed
+    // groups leaves them to the stable sort, preserving incoming order.
+    if (ra !== 0) return 0;
+    return pinOrder.get(b.id)! - pinOrder.get(a.id)!;
+  });
 }
 
 /**

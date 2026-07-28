@@ -10,6 +10,7 @@
     "dialog:allow-save",
     "fs:allow-write-text-file",
     "fs:allow-temp-read-recursive",
+    "store:default",
     {
       "identifier": "shell:allow-execute",
       "allow": [

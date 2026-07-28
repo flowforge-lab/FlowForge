@@ -154,22 +154,24 @@ describe("filterSessions", () => {
 });
 
 describe("arrangeSessions", () => {
+  // Incoming order is backend recency (newest session first).
   const sessions = [
     session({ id: "a" }),
     session({ id: "b" }),
     session({ id: "c" }),
     session({ id: "d" }),
   ];
+  const noPins: string[] = [];
   const empty = new Set<string>();
 
   it("orders pinned first, then live, then dismissed — stable within each group", () => {
     // pinned: d; dismissed: a. Expect d (pinned) → b, c (live) → a (dismissed).
-    const out = arrangeSessions(sessions, new Set(["d"]), new Set(["a"]));
+    const out = arrangeSessions(sessions, ["d"], new Set(["a"]));
     expect(out.map((s) => s.id)).toEqual(["d", "b", "c", "a"]);
   });
 
   it("keeps the original order when nothing is pinned or dismissed", () => {
-    expect(arrangeSessions(sessions, empty, empty).map((s) => s.id)).toEqual([
+    expect(arrangeSessions(sessions, noPins, empty).map((s) => s.id)).toEqual([
       "a",
       "b",
       "c",
@@ -179,14 +181,48 @@ describe("arrangeSessions", () => {
 
   it("sinks dismissed sessions to the bottom, even when pinned", () => {
     // A dismissed session never floats above a live one, pin notwithstanding.
-    const out = arrangeSessions(sessions, new Set(["a"]), new Set(["a"]));
+    const out = arrangeSessions(sessions, ["a"], new Set(["a"]));
     expect(out.map((s) => s.id)).toEqual(["b", "c", "d", "a"]);
   });
 
   it("does not mutate the input array", () => {
     const input = [...sessions];
-    arrangeSessions(input, new Set(["d"]), new Set(["a"]));
+    arrangeSessions(input, ["d"], new Set(["a"]));
     expect(input.map((s) => s.id)).toEqual(["a", "b", "c", "d"]);
+  });
+
+  // #1110: the pinned group used to fall back to incoming recency, so pinning an
+  // older session dropped it to the BOTTOM of the pinned group and the Pin click
+  // looked like it did nothing.
+  it("moves a newly pinned older session to the top of the pinned group", () => {
+    // `a` (newest by recency) was pinned first, then `d` (the oldest). Ordering
+    // the pinned group by recency would leave `d` at the BOTTOM of it — the bug.
+    const out = arrangeSessions(sessions, ["a", "d"], empty);
+    expect(out.map((s) => s.id)).toEqual(["d", "a", "b", "c"]);
+  });
+
+  it("orders the pinned group newest pin first, not by recency", () => {
+    // Pin order a → b → c is the exact reverse of what recency would give.
+    expect(arrangeSessions(sessions, ["a", "b", "c"], empty).map((s) => s.id))
+      // c pinned last, so it sits on top.
+      .toEqual(["c", "b", "a", "d"]);
+  });
+
+  it("drops an unpinned session back into the live group, others keep order", () => {
+    const before = arrangeSessions(sessions, ["a", "b", "c"], empty);
+    expect(before.map((s) => s.id)).toEqual(["c", "b", "a", "d"]);
+
+    // Unpin `b` (session-prefs filters it out of the array).
+    const after = arrangeSessions(sessions, ["a", "c"], empty);
+    // c still above a; b rejoins the live group in recency position.
+    expect(after.map((s) => s.id)).toEqual(["c", "a", "b", "d"]);
+  });
+
+  it("ignores pinned ids that aren't in the list", () => {
+    // An orphaned pin (session deleted, `purge` not yet run) must not disturb
+    // the ordering of the sessions that are present.
+    const out = arrangeSessions(sessions, ["gone", "b"], empty);
+    expect(out.map((s) => s.id)).toEqual(["b", "a", "c", "d"]);
   });
 });
 

@@ -56,7 +56,12 @@ describe("SessionSidebar — header accent + collapsed rail (#670)", () => {
     usePrefsStore.setState({ sidebarCollapsed: false });
     usePanesStore.setState({ root: null, focusedPaneId: null });
     useAllConversationsSearchStore.setState({ open: false });
-    useSessionPrefsStore.setState({ pinned: [], dismissed: [] });
+    // hasHydrated: true — see session-sidebar.integration.test.tsx (#1110 follow-up).
+    useSessionPrefsStore.setState({
+      pinned: [],
+      dismissed: [],
+      hasHydrated: true,
+    });
     useChatStore.setState({
       sessions: [session("s1"), session("s2")],
       activeSessionId: "s1",
