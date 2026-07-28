@@ -43,3 +43,4 @@ design/
 # developer's dev key must never be baked into a committed config. Private keys
 # live outside the repo entirely (~/.tauri) and are never committed or shared.
 apps/desktop/src-tauri/tauri.dev-local.conf.json
+.tmp

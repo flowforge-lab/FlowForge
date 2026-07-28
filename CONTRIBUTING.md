@@ -21,7 +21,7 @@ its four pillars:
 3. **Implement** — match existing patterns, keep modules flat, handle errors explicitly.
 4. **Verify** before opening a PR:
    - `cargo fmt --check` and `cargo clippy --all-targets -- -D warnings`
-   - `cargo test --workspace`
+   - `./scripts/test.sh` (blessed wrapper: `cargo nextest run --workspace --no-fail-fast` + doctests)
    - `pnpm typecheck && pnpm lint && pnpm test`
 5. **Squash to a single commit** before opening (or updating) a PR. Every PR
    must contain exactly **one** well-described commit — squash with
@@ -111,8 +111,14 @@ Every tool must have:
 Run tests locally with:
 
 ```bash
-cargo test --workspace
+./scripts/test.sh
 ```
+
+> **Note:** Do not rely on `cargo test --workspace` for final verification.
+> The `flowforge-desktop` crate declares `crate-type = ["staticlib", "cdylib", "rlib"]`,
+> which prevents `cargo test` from building a test harness for it on some Cargo
+> versions. `cargo nextest` (used by the script above) correctly covers all
+> workspace members and matches CI behavior exactly (#1124).
 
 ### 8. Template to copy
 
@@ -126,7 +132,7 @@ The canonical reference implementation is [glob.rs](crates/ff-tools/src/glob.rs)
 - [ ] Output is capped and deterministically ordered
 - [ ] Unit tests + jail-escape test present
 - [ ] Module exposed in `lib.rs`, registered in `registry.rs` (or `tools.rs` if Tauri-backed)
-- [ ] `cargo fmt --check`, `clippy --all-targets -- -D warnings`, and `cargo test --workspace` all pass
+- [ ] `cargo fmt --check`, `clippy --all-targets -- -D warnings`, and `./scripts/test.sh` all pass
 
 ---
 
