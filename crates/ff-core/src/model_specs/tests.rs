@@ -370,3 +370,157 @@ fn match_kind_contains_and_prefix() {
     assert_eq!(context_window_in(r, "bar-1"), 222);
     assert_eq!(context_window_in(r, "x-bar"), DEFAULT_CONTEXT_WINDOW_TOKENS);
 }
+
+#[test]
+fn user_rule_revokes_vision_the_defaults_grant() {
+    // Two-way override (#1137): the layered set is first-match-wins, so a prepended
+    // user rule carrying `supports_vision: false` must *block* a model the bundled
+    // defaults grant. Without this, an override could only ever add vision, leaving
+    // a wrong `true` uncorrectable without a release.
+    let user = parse_specs(
+        r#"{ "rules": [
+            { "match": "Qwen/Qwen3-VL-8B-Instruct", "provider": "siliconFlow", "supports_vision": false }
+        ] }"#,
+    )
+    .unwrap();
+    let bundled = bundled_rules();
+    assert!(
+        supports_vision_in(
+            bundled,
+            ProviderKind::SiliconFlow,
+            "Qwen/Qwen3-VL-8B-Instruct"
+        ),
+        "precondition: the defaults grant this model"
+    );
+
+    let mut merged = user.rules.clone();
+    merged.extend(bundled.iter().cloned());
+    assert!(
+        !supports_vision_in(
+            &merged,
+            ProviderKind::SiliconFlow,
+            "Qwen/Qwen3-VL-8B-Instruct"
+        ),
+        "a prepended `supports_vision: false` must win over the bundled `true`"
+    );
+    // Sibling models keep the bundled verdict: revoking is surgical, not a blanket off.
+    assert!(supports_vision_in(
+        &merged,
+        ProviderKind::SiliconFlow,
+        "Qwen/Qwen3-VL-32B-Instruct"
+    ));
+}
+
+#[test]
+fn user_rule_grants_vision_the_defaults_miss() {
+    // The other direction, and the reported symptom (#1137): a capable model the
+    // bundled name matching cannot express must be reachable via the override.
+    let user = parse_specs(
+        r#"{ "rules": [
+            { "match": "some-unreleased-flagship", "provider": "siliconFlow", "supports_vision": true }
+        ] }"#,
+    )
+    .unwrap();
+    let bundled = bundled_rules();
+    let model = "vendor/some-unreleased-flagship-v1";
+    assert!(
+        !supports_vision_in(bundled, ProviderKind::SiliconFlow, model),
+        "precondition: the defaults do not know this model"
+    );
+
+    let mut merged = user.rules.clone();
+    merged.extend(bundled.iter().cloned());
+    assert!(supports_vision_in(
+        &merged,
+        ProviderKind::SiliconFlow,
+        model
+    ));
+    // Still provider-scoped: the same id on another provider is unaffected.
+    assert!(!supports_vision_in(&merged, ProviderKind::OpenAi, model));
+}
+
+#[test]
+fn window_only_user_rule_does_not_shadow_a_bundled_vision_verdict() {
+    // First-match-wins skips rules that carry no `supports_vision`, so overriding a
+    // model's *context window* must not silently strip its vision capability.
+    let user = parse_specs(
+        r#"{ "rules": [
+            { "match": "Qwen/Qwen3-VL-8B-Instruct", "context_window": 12345 }
+        ] }"#,
+    )
+    .unwrap();
+    let mut merged = user.rules.clone();
+    merged.extend(bundled_rules().iter().cloned());
+
+    assert_eq!(
+        context_window_in(&merged, "Qwen/Qwen3-VL-8B-Instruct"),
+        12345
+    );
+    assert!(
+        supports_vision_in(
+            &merged,
+            ProviderKind::SiliconFlow,
+            "Qwen/Qwen3-VL-8B-Instruct"
+        ),
+        "a window-only override must leave the vision verdict intact"
+    );
+}
+
+/// Empirically verified SiliconFlow vision data (#1137).
+///
+/// Every id below was probed against the live API with a real image and asked to
+/// report its content; the two groups are the models that answered correctly and
+/// the models that rejected image input outright. Name matching is a stopgap, so
+/// this guard exists to make a future data edit that regresses a known family fail
+/// loudly -- particularly the two cases that defeat name matching entirely.
+#[test]
+fn siliconflow_vision_data_matches_probed_capability() {
+    let r = bundled_rules();
+
+    // Verified image-capable. `Kimi-K3` carries no visual marker at all, and
+    // `GLM-5V-Turbo` is the version drift that broke the original `-4v` rule --
+    // between them they are the reason the override has to be reachable.
+    for m in [
+        "moonshotai/Kimi-K3",
+        "moonshotai/Kimi-K2.5",
+        "moonshotai/Kimi-K2.6",
+        "moonshotai/Kimi-K2.7-Code",
+        "zai-org/GLM-5V-Turbo",
+        "Qwen/Qwen3.5-9B",
+        "Qwen/Qwen3.5-397B-A17B",
+        "Qwen/Qwen3.6-27B",
+        "Qwen/Qwen3.6-35B-A3B",
+        "google/gemma-4-12B-it",
+        "google/gemma-4-31B-it",
+        "google/gemma-4-26B-A4B-it",
+        "MiniMaxAI/MiniMax-M3",
+        "nex-agi/Nex-N2-Pro",
+        "Qwen/Qwen3-VL-8B-Instruct",
+        "Qwen/Qwen3-VL-32B-Thinking",
+    ] {
+        assert!(
+            supports_vision_in(r, ProviderKind::SiliconFlow, m),
+            "probed image-capable, must be granted: {m}"
+        );
+    }
+
+    // Verified text-only: these reject image input, so the patterns above must not
+    // over-match them. Adjacent naming makes this the real risk -- `GLM-5.2` sits
+    // beside `GLM-5V-Turbo`, and `Qwen3-32B` beside `Qwen3.5-*`.
+    for m in [
+        "zai-org/GLM-5",
+        "zai-org/GLM-5.1",
+        "zai-org/GLM-5.2",
+        "Qwen/Qwen3-8B",
+        "Qwen/Qwen3-32B",
+        "Qwen/Qwen3-Coder-480B-A35B-Instruct",
+        "deepseek-ai/DeepSeek-V3.2",
+        "deepseek-ai/DeepSeek-V4-Pro",
+        "ByteDance-Seed/Seed-OSS-36B-Instruct",
+    ] {
+        assert!(
+            !supports_vision_in(r, ProviderKind::SiliconFlow, m),
+            "probed text-only, must stay blocked: {m}"
+        );
+    }
+}

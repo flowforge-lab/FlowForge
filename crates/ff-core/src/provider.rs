@@ -451,21 +451,26 @@ impl ProviderConnection {
     }
 }
 
-/// Whether `(kind, model)` is known to accept image/document attachments. Pure
-/// capability lookup, conservative by design: returning `false` only means we
-/// don't know -- the FE gate (#408 / FE-4) and provider safety strip both fail
-/// closed on unknowns, so a wrong `false` only forces the user to rely on an
-/// explicit override.
+/// Whether `(kind, model)` is known to accept image attachments according to the
+/// **bundled defaults alone**. Pure capability lookup, conservative by design:
+/// returning `false` only means we don't know -- the FE gate (#408 / FE-4) and
+/// provider safety strip both fail closed on unknowns.
 ///
-/// Keep the map narrow. Adding a model here un-gates attachments app-wide for
-/// every connection on that model, so favor known-good families over loose
-/// substring matches.
+/// Prefer [`ff_llm::model_supports_vision`] on any application path. This crate is
+/// deliberately I/O-free, so it cannot read the user's `model-specs.json`; the
+/// override-aware lookup therefore lives one layer up, mirroring how
+/// [`ff_llm::model_context_window`] wraps `context_window_in`. Calling *this*
+/// function from an app path silently ignores the user's override (#1137).
+///
+/// Keep the bundled map narrow. Adding a model here un-gates attachments app-wide
+/// for every connection on that model, so favor known-good families over loose
+/// substring matches -- and remember the user can always correct a wrong verdict in
+/// either direction via the override file.
 pub fn model_supports_vision(kind: ProviderKind, model: &str) -> bool {
     // Data-driven (#466): the per-provider vision families now live in
     // `model-specs.default.json` as rules carrying `provider` + `supports_vision`,
     // and the provider-scoped, fail-closed lookup lives in `model_specs`. Keeping
-    // this thin wrapper preserves the call sites (`normalize_capabilities`, upsert)
-    // and the public signature.
+    // this thin wrapper preserves the I/O-free call sites and the public signature.
     crate::model_specs::supports_vision_in(crate::model_specs::bundled_rules(), kind, model)
 }
 

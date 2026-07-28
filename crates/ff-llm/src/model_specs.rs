@@ -1,4 +1,4 @@
-//! User-override layer for the model context-window lookup (#457).
+//! User-override layer for the data-driven model capability lookups (#457, #1137).
 //!
 //! The schema, bundled defaults, and pure lookups live in [`ff_core::model_specs`]
 //! (I/O-free, so capability lookups in other crates can share them). This module
@@ -6,6 +6,10 @@
 //! `<config dir>/flowforge/model-specs.json` whose rules are *prepended* to the
 //! bundled rules, so a user can both override (a more-specific match wins) and
 //! extend (new families) the defaults without a code change.
+//!
+//! Both the context window and the vision capability resolve through the same
+//! merged set, so one override file corrects either verdict -- in *either*
+//! direction, since the first matching rule wins (#1137).
 //!
 //! The merged rule set is read once and cached. A file that exists but cannot be
 //! read or parsed is preserved (renamed to a `*.corrupt-<unix>.json` sibling) and
@@ -17,7 +21,10 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-use ff_core::{bundled_rules, context_window_in, parse_specs, ModelSpec, ModelSpecs};
+use ff_core::{
+    bundled_rules, context_window_in, parse_specs, supports_vision_in, ModelSpec, ModelSpecs,
+    ProviderKind,
+};
 
 /// Outcome of reading the user override file. Distinguishing `Corrupt` from
 /// `Absent` is what keeps a damaged file from silently masquerading as "no
@@ -91,12 +98,38 @@ fn merged_rules(user_path: Option<&Path>) -> Vec<ModelSpec> {
     rules
 }
 
+/// Run `f` against the merged rule set. The single rule source for *every* public
+/// capability lookup here, so the override file is read (and a corrupt one
+/// quarantined) exactly once, and no lookup can accidentally consult a different
+/// set -- the #1137 bug was precisely one lookup reading the bundled defaults while
+/// its sibling read the merged ones.
+fn with_merged_rules<T>(f: impl FnOnce(&[ModelSpec]) -> T) -> T {
+    // Tests point the loader at a temporary file. Thread-local, so cases running in
+    // parallel cannot observe each other's override, and the production path below
+    // keeps its process-wide cache.
+    #[cfg(test)]
+    if let Some(path) = tests::override_path() {
+        return f(&merged_rules(Some(&path)));
+    }
+    static MERGED: OnceLock<Vec<ModelSpec>> = OnceLock::new();
+    f(MERGED.get_or_init(|| merged_rules(user_specs_path().as_deref())))
+}
+
 /// Context window for a model id, read from the merged (user + bundled) rules.
 /// The merged set is cached after the first call.
 pub(crate) fn lookup(model: &str) -> u64 {
-    static MERGED: OnceLock<Vec<ModelSpec>> = OnceLock::new();
-    let rules = MERGED.get_or_init(|| merged_rules(user_specs_path().as_deref()));
-    context_window_in(rules, model)
+    with_merged_rules(|rules| context_window_in(rules, model))
+}
+
+/// Vision capability for `(kind, model)`, read from the merged (user + bundled)
+/// rules -- the override-aware counterpart to [`ff_core::model_supports_vision`],
+/// which sees only the bundled defaults (#1137).
+///
+/// Name matching alone cannot classify a modern flagship that ships vision without
+/// advertising it in its id, so reaching the user's override is what keeps a wrong
+/// bundled verdict correctable without a release.
+pub(crate) fn supports_vision(kind: ProviderKind, model: &str) -> bool {
+    with_merged_rules(|rules| supports_vision_in(rules, kind, model))
 }
 
 #[cfg(test)]

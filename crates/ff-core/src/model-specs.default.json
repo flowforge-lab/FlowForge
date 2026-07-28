@@ -40,6 +40,16 @@
     { "match": "bakllava", "provider": "ollama", "supports_vision": true },
     { "match": "qwen2-vl", "provider": "ollama", "supports_vision": true },
     { "match": "-vl", "provider": "siliconFlow", "supports_vision": true },
-    { "match": "-4v", "provider": "siliconFlow", "supports_vision": true }
+    { "match": "-4v", "provider": "siliconFlow", "supports_vision": true },
+    { "match": "-5v", "provider": "siliconFlow", "supports_vision": true },
+    { "match": "qwen3.5", "provider": "siliconFlow", "supports_vision": true },
+    { "match": "qwen3.6", "provider": "siliconFlow", "supports_vision": true },
+    { "match": "gemma-4", "provider": "siliconFlow", "supports_vision": true },
+    { "match": "kimi-k2.5", "provider": "siliconFlow", "supports_vision": true },
+    { "match": "kimi-k2.6", "provider": "siliconFlow", "supports_vision": true },
+    { "match": "kimi-k2.7", "provider": "siliconFlow", "supports_vision": true },
+    { "match": "kimi-k3", "provider": "siliconFlow", "supports_vision": true },
+    { "match": "minimax-m3", "provider": "siliconFlow", "supports_vision": true },
+    { "match": "nex-n2", "provider": "siliconFlow", "supports_vision": true }
   ]
 }
