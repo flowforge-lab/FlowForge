@@ -20,6 +20,7 @@
 
 use async_trait::async_trait;
 use futures_util::StreamExt;
+use std::collections::HashSet;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 
@@ -49,6 +50,14 @@ pub struct SlackTransport {
     api_base: Option<String>,
     /// `apps.connections.open` endpoint, overridable for tests.
     connections_open_url: String,
+    /// Slack user ids permitted to drive the agent (RFC 0021 §10). A sender
+    /// outside this set never becomes an [`InboundMessage`].
+    ///
+    /// Deliberately not an `Option`: an empty set denies everyone. A deploy that
+    /// forgets to configure the allowlist must fail closed, because the opposite
+    /// default silently exposes the agent to every member of every channel the
+    /// bot can see.
+    allowed_user_ids: HashSet<String>,
     /// Inbound user messages, produced by the reader task. `None` until connect.
     inbound_rx: Option<mpsc::Receiver<InboundMessage>>,
     /// Interactions (button clicks) for the approver (T4). `None` until connect.
@@ -67,10 +76,25 @@ impl SlackTransport {
             bot_token: bot_token.into(),
             api_base: None,
             connections_open_url: "https://slack.com/api/apps.connections.open".to_string(),
+            allowed_user_ids: HashSet::new(),
             inbound_rx: None,
             interaction_rx: None,
             writer: None,
         }
+    }
+
+    /// Permit `ids` to drive the agent (RFC 0021 §10). Until T5 (#1060) reads
+    /// this from a config file, `flowforge serve` will populate it here.
+    ///
+    /// Replaces any previously configured set rather than extending it, so a
+    /// caller building from config can't accidentally accumulate stale ids.
+    pub fn with_allowed_user_ids<I, S>(mut self, ids: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.allowed_user_ids = ids.into_iter().map(Into::into).collect();
+        self
     }
 
     /// Point the Web API and `apps.connections.open` at `base` (for tests).
@@ -128,6 +152,7 @@ impl SlackTransport {
         writer: WriterHandle,
         inbound_tx: mpsc::Sender<InboundMessage>,
         interaction_tx: mpsc::Sender<SlackInteraction>,
+        allowed_user_ids: HashSet<String>,
     ) where
         S: futures_util::Stream<Item = Result<Message, E>> + Unpin + Send + 'static,
         E: Send + 'static,
@@ -153,6 +178,18 @@ impl SlackTransport {
                         message,
                     } => {
                         writer.send(OutboundOp::Ack { envelope_id }).await;
+                        // RFC 0021 §10: only allowlisted users may drive the
+                        // agent. Checked here, before the message can become a
+                        // turn. The ack above still fires — Slack retries an
+                        // unacked envelope, so refusing to ack would make it
+                        // arrive again rather than go away.
+                        if !allowed_user_ids.contains(&message.sender_id) {
+                            tracing::warn!(
+                                sender_id = %message.sender_id,
+                                "slack message rejected: sender not in the configured user allowlist"
+                            );
+                            continue;
+                        }
                         // If the Router dropped the receiver, we're shutting
                         // down; stop reading.
                         if inbound_tx.send(message).await.is_err() {
@@ -215,7 +252,13 @@ impl MessageTransport for SlackTransport {
 
         let (inbound_tx, inbound_rx) = mpsc::channel::<InboundMessage>(64);
         let (interaction_tx, interaction_rx) = mpsc::channel::<SlackInteraction>(64);
-        Self::spawn_reader(stream, writer.clone(), inbound_tx, interaction_tx);
+        Self::spawn_reader(
+            stream,
+            writer.clone(),
+            inbound_tx,
+            interaction_tx,
+            self.allowed_user_ids.clone(),
+        );
 
         self.writer = Some(writer);
         self.inbound_rx = Some(inbound_rx);

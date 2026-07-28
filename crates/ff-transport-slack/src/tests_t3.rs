@@ -412,6 +412,9 @@ mod reader {
     /// Feed a scripted list of text frames through `spawn_reader` and return the
     /// three receivers: inbound messages, interactions, and the writer's ops
     /// (where acks land). `Never` is an error type the stream never produces.
+    ///
+    /// Allowlists the scripted sender (`U99999999`) so these demux tests exercise
+    /// the fan-out, not the §10 gate; [`allowlist`] covers the gate itself.
     enum Never {}
     fn run_reader(
         frames: Vec<Message>,
@@ -420,6 +423,21 @@ mod reader {
         mpsc::Receiver<SlackInteraction>,
         mpsc::Receiver<SentOp>,
     ) {
+        run_reader_with_allowlist(frames, ["U99999999"])
+    }
+
+    fn run_reader_with_allowlist<I, S>(
+        frames: Vec<Message>,
+        allowed: I,
+    ) -> (
+        mpsc::Receiver<InboundMessage>,
+        mpsc::Receiver<SlackInteraction>,
+        mpsc::Receiver<SentOp>,
+    )
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
         let stream = futures_util::stream::iter(
             frames
                 .into_iter()
@@ -429,7 +447,13 @@ mod reader {
         let (writer, ops_rx) = auto_answer_writer();
         let (inbound_tx, inbound_rx) = mpsc::channel::<InboundMessage>(64);
         let (interaction_tx, interaction_rx) = mpsc::channel::<SlackInteraction>(64);
-        SlackTransport::spawn_reader(stream, writer, inbound_tx, interaction_tx);
+        SlackTransport::spawn_reader(
+            stream,
+            writer,
+            inbound_tx,
+            interaction_tx,
+            allowed.into_iter().map(Into::into).collect(),
+        );
         (inbound_rx, interaction_rx, ops_rx)
     }
 
@@ -528,5 +552,53 @@ mod reader {
             .expect("reader must not wedge on a full interaction queue")
             .expect("the user message must still reach the inbound path");
         assert_eq!(msg.text, "deploy the thing");
+    }
+    /// RFC 0021 §10: only allowlisted users may drive the agent. Missed by T2/T3
+    /// (#1144) — `sender_id` was parsed and then never checked, so anyone in a
+    /// channel the bot could see could start a turn.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_sender_outside_the_allowlist_never_becomes_a_turn() {
+        // Scripted sender is U99999999; allowlist holds someone else.
+        let (mut inbound_rx, _int_rx, _ops_rx) =
+            run_reader_with_allowlist(vec![Message::Text(USER_MESSAGE.to_string())], ["USOMEONE"]);
+
+        // The channel closes when the reader finishes the scripted frames, so a
+        // `None` here means "no message was ever forwarded" rather than a stall.
+        assert!(
+            inbound_rx.recv().await.is_none(),
+            "a non-allowlisted sender must not reach the Router"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_rejected_sender_is_still_acked() {
+        // Slack redelivers an unacked envelope, so dropping the ack would make a
+        // rejected message arrive again in a loop rather than go away.
+        let (_inbound_rx, _int_rx, mut ops_rx) =
+            run_reader_with_allowlist(vec![Message::Text(USER_MESSAGE.to_string())], ["USOMEONE"]);
+
+        let op = tokio::time::timeout(Duration::from_secs(5), ops_rx.recv())
+            .await
+            .expect("the reader must ack even when it rejects the sender")
+            .expect("an ack op must be sent");
+        assert!(
+            matches!(op, SentOp::Ack { .. }),
+            "expected an ack for the rejected envelope, got {op:?}"
+        );
+    }
+
+    /// The empty allowlist is the misconfigured-deploy case: it must deny
+    /// everyone, not fall open to everyone.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_empty_allowlist_denies_everyone() {
+        let (mut inbound_rx, _int_rx, _ops_rx) = run_reader_with_allowlist(
+            vec![Message::Text(USER_MESSAGE.to_string())],
+            Vec::<String>::new(),
+        );
+
+        assert!(
+            inbound_rx.recv().await.is_none(),
+            "an empty allowlist must fail closed"
+        );
     }
 }
