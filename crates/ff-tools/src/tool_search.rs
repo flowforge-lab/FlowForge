@@ -591,8 +591,13 @@ impl Tool for ToolSearchTool {
         let hits = self.search(query, limit);
         if hits.is_empty() {
             return ToolOutcome::ok(format!(
-                "No additional tools matched \"{query}\". Try different words, or \
-                 proceed with the tools you already have."
+                "No tools matched \"{query}\". {total} deferred tool{plural} remain unloaded — \
+                 this does NOT mean the capability is missing, only that these words did not \
+                 match. Retrieval is lexical, so it needs the vocabulary the tool itself uses. \
+                 Search again with a synonym, the underlying concept, or a broader single word \
+                 (e.g. \"deployment\" rather than \"roll back a bad release\").",
+                total = self.index.len(),
+                plural = if self.index.len() == 1 { "" } else { "s" },
             ));
         }
 

@@ -306,26 +306,91 @@ const QUERIES: &[(&str, &str)] = &[
     ("understand how a function works", "symbol_explore"),
 ];
 
-/// Minimum share of queries whose correct tool must appear in the returned list.
+/// Queries written *after* the scorer was tuned, and never used to tune it.
+///
+/// [`QUERIES`] was written before any result was seen, but it was then looked at
+/// repeatedly while iterating on the scorer, the stop-word list and especially the
+/// synonym table — several synonym entries exist precisely because a query in that
+/// set missed. It is therefore an open-book exam, and its scores are an upper
+/// bound, not an estimate of field behaviour.
+///
+/// This set is the closed-book control. Same corpus, same wording style, but no
+/// mechanism was added or adjusted in response to it. The gap between the two is
+/// the honest measure of how much of the headline number is fitting:
+///
+/// | set | top-1 | top-5 |
+/// |---|---|---|
+/// | [`QUERIES`] (open book) | 90.4% | 100% |
+/// | [`HELD_OUT`] (closed book) | 25.0% | 46.4% |
+///
+/// Both are asserted, separately, so the gap stays visible instead of being
+/// averaged away. A future change that lifts the held-out floor is real progress;
+/// one that only lifts the tuned floor is more fitting.
+///
+/// Three of the held-out misses (`escalate an incident`, `approve a promotion`,
+/// `ssh into a box`) return *nothing at all*, and are unreachable by construction:
+/// they share no token with their target's text, so no lexical scorer — BM25,
+/// substring, or otherwise — can connect them. They are kept in the set precisely
+/// because they quantify the ceiling of the lexical approach, which is the
+/// evidence needed to judge whether a semantic layer earns its cost.
+const HELD_OUT: &[(&str, &str)] = &[
+    ("roll back a bad release", "deploy_read"),
+    ("what version is deployed", "deploy_read"),
+    ("show me the stage config", "deploy_read"),
+    ("escalate an incident", "tracker_write"),
+    ("assign this to someone else", "tracker_write"),
+    ("close out a bug report", "tracker_write"),
+    ("did the release go out", "pipeline_health"),
+    ("approve a promotion", "pipeline_health"),
+    ("grep the repo", "code_search"),
+    ("where is this class defined", "code_search"),
+    ("who reviewed my change", "review_comment"),
+    ("merge my change", "review_create"),
+    ("compile errors", "local_build"),
+    ("lint my package", "local_build"),
+    ("flaky test", "test_run_read"),
+    ("stack trace from a failed run", "test_run_read"),
+    ("page the on call engineer", "oncall_read"),
+    ("swap shifts with a teammate", "oncall_read"),
+    ("vulnerabilities in my service", "risk_read"),
+    ("ssh into a box", "fleet_run"),
+    ("restart a container", "fleet_run"),
+    ("take meeting notes", "doc_editor"),
+    ("what am I working on", "task_list"),
+    ("look up a term", "acronym_lookup"),
+    ("how many words did I write", "word_count"),
+    ("what links to this page", "backlink_list"),
+    ("open my todo list", "task_vault_list"),
+    ("trace a call path", "symbol_explore"),
+];
+
+/// Minimum share of [`QUERIES`] whose correct tool must appear in the returned list.
 ///
 /// This is the metric that matters for the model's *outcome* — see the module
-/// docs — but it turns out to be a weak guard on the *scorer*: with BM25F
-/// disabled entirely, top-5 stays at 100% because the substring fallback still
-/// surfaces the right tool somewhere in five slots. Verified by mutation.
+/// docs — but it is a weak guard on the *scorer*: with BM25F disabled entirely,
+/// top-5 stays at 100% because the substring fallback still fills five slots.
+/// Verified by mutation.
 const TOP5_FLOOR: f64 = 0.96;
 
-/// Minimum share of queries whose correct tool must rank *first*.
+/// Minimum share of [`QUERIES`] whose correct tool must rank *first*.
 ///
-/// Kept as a second, deliberately lower gate because top-5 alone cannot detect
-/// the ranking quality BM25F exists to provide: removing BM25F costs 12 points of
-/// top-1 (88.5% → 76.9%) while leaving top-5 untouched. Without this assertion
-/// the suite would happily pass on a scorer that had been gutted.
+/// Kept as a second, lower gate because top-5 alone cannot detect the ranking
+/// quality BM25F exists to provide: removing BM25F costs 12 points of top-1
+/// (88.5% → 76.9%) while leaving top-5 untouched. Without this assertion the
+/// suite would pass on a scorer that had been gutted.
 ///
 /// Set below the measured 88.5% because several queries are defensibly ambiguous
 /// (either build tool for "run unit tests", either pipeline tool for "pending
-/// approvals"), so a small top-1 movement is annotation noise rather than
-/// regression. A 12-point drop is not.
+/// approvals"), so small movement is annotation noise. A 12-point drop is not.
 const TOP1_FLOOR: f64 = 0.84;
+
+/// Floors for [`HELD_OUT`], set just under the measured 46.4% / 25.0%.
+///
+/// Deliberately recorded as low numbers rather than quietly omitted. They are
+/// what lexical retrieval actually achieves on wording it was not fitted to, and
+/// the honest baseline for judging whether a semantic layer is worth its cost.
+const HELD_OUT_TOP5_FLOOR: f64 = 0.42;
+const HELD_OUT_TOP1_FLOOR: f64 = 0.21;
 
 struct Fixture(&'static str, &'static str, Value);
 
@@ -393,54 +458,92 @@ async fn ranked(tool: &ToolSearchTool, query: &str) -> Vec<String> {
         .collect()
 }
 
-#[tokio::test]
-async fn top5_recall_stays_above_the_floor() {
+/// `(top-1 rate, top-5 rate, misses)` for a query set.
+async fn measure(set: &[(&str, &str)]) -> (f64, f64, Vec<String>) {
     let tool = corpus_index();
-    let mut hits = 0usize;
+    let mut first = 0usize;
+    let mut within = 0usize;
     let mut missed = Vec::new();
 
-    for (query, expected) in QUERIES {
+    for (query, expected) in set {
         let ranked = ranked(&tool, query).await;
+        if ranked.first().is_some_and(|n| n == expected) {
+            first += 1;
+        }
         if ranked.iter().take(MAX_HITS).any(|n| n == expected) {
-            hits += 1;
+            within += 1;
         } else {
-            missed.push((query, expected, ranked.first().cloned()));
+            missed.push(format!(
+                "{query:?} wanted {expected} got {:?}",
+                ranked.first().map(String::as_str).unwrap_or("<nothing>")
+            ));
         }
     }
 
-    let rate = hits as f64 / QUERIES.len() as f64;
+    let n = set.len() as f64;
+    (first as f64 / n, within as f64 / n, missed)
+}
+
+#[tokio::test]
+async fn tuned_set_top5_recall_stays_above_the_floor() {
+    let (_, top5, missed) = measure(QUERIES).await;
     assert!(
-        rate >= TOP5_FLOOR,
-        "top-5 recall {:.1}% ({hits}/{}) fell below the {:.0}% floor; misses: {missed:#?}",
-        rate * 100.0,
-        QUERIES.len(),
+        top5 >= TOP5_FLOOR,
+        "tuned-set top-5 {:.1}% fell below the {:.0}% floor; misses: {missed:#?}",
+        top5 * 100.0,
         TOP5_FLOOR * 100.0
     );
 }
 
 /// Guards the ranking quality that top-5 cannot see.
 #[tokio::test]
-async fn top1_precision_stays_above_the_floor() {
-    let tool = corpus_index();
-    let mut hits = 0usize;
-    let mut missed = Vec::new();
-
-    for (query, expected) in QUERIES {
-        let ranked = ranked(&tool, query).await;
-        if ranked.first().is_some_and(|n| n == expected) {
-            hits += 1;
-        } else {
-            missed.push((query, expected, ranked.first().cloned()));
-        }
-    }
-
-    let rate = hits as f64 / QUERIES.len() as f64;
+async fn tuned_set_top1_precision_stays_above_the_floor() {
+    let (top1, _, missed) = measure(QUERIES).await;
     assert!(
-        rate >= TOP1_FLOOR,
-        "top-1 precision {:.1}% ({hits}/{}) fell below the {:.0}% floor; misses: {missed:#?}",
-        rate * 100.0,
-        QUERIES.len(),
+        top1 >= TOP1_FLOOR,
+        "tuned-set top-1 {:.1}% fell below the {:.0}% floor; misses: {missed:#?}",
+        top1 * 100.0,
         TOP1_FLOOR * 100.0
+    );
+}
+
+/// The honest number: wording the scorer was never fitted to.
+///
+/// Asserted separately from the tuned set so the gap between them stays on the
+/// record. A change that lifts this floor is real; one that lifts only the tuned
+/// floor is more overfitting.
+#[tokio::test]
+async fn held_out_set_stays_above_its_floor() {
+    let (top1, top5, missed) = measure(HELD_OUT).await;
+    assert!(
+        top5 >= HELD_OUT_TOP5_FLOOR && top1 >= HELD_OUT_TOP1_FLOOR,
+        "held-out top-1 {:.1}% / top-5 {:.1}% fell below the {:.0}% / {:.0}% floors; \
+         misses: {missed:#?}",
+        top1 * 100.0,
+        top5 * 100.0,
+        HELD_OUT_TOP1_FLOOR * 100.0,
+        HELD_OUT_TOP5_FLOOR * 100.0
+    );
+}
+
+/// Pins the *gap* between the two sets.
+///
+/// The tuned set scoring far above the held-out set is expected and documented;
+/// what must not happen silently is the gap widening, which is what fitting a new
+/// mechanism to the tuned queries looks like from the outside. Generous ceiling —
+/// this is a smoke alarm, not a thermostat.
+#[tokio::test]
+async fn overfitting_gap_does_not_widen() {
+    let (_, tuned, _) = measure(QUERIES).await;
+    let (_, held, _) = measure(HELD_OUT).await;
+    let gap = tuned - held;
+    assert!(
+        gap <= 0.60,
+        "tuned top-5 {:.1}% vs held-out {:.1}% is a {:.1}-point gap; a widening gap means \
+         the mechanism is being fitted to the tuned queries rather than generalising",
+        tuned * 100.0,
+        held * 100.0,
+        gap * 100.0
     );
 }
 
@@ -670,4 +773,49 @@ async fn an_exact_tool_name_finds_that_tool() {
             "searching the exact name {name:?} must rank it first; got {hits:?}"
         );
     }
+}
+
+/// The empty-result message must not talk the model out of searching again.
+///
+/// `tool_search` is the only gateway to a deferred tool, and the tool itself is
+/// always resident, so a miss costs a turn rather than the capability — *provided*
+/// the model tries again. The previous wording ("proceed with the tools you
+/// already have") worked directly against that: it is concrete, in-turn advice to
+/// give up, competing with the tool description's general instruction not to
+/// assume a capability is absent. Held-out measurement makes this load-bearing —
+/// several queries return nothing at all, so this message is what the model sees
+/// for a capability that is in fact present.
+#[tokio::test]
+async fn the_empty_result_message_pushes_the_model_to_retry() {
+    let tool = corpus_index();
+    let text = tool
+        .run_with_session(
+            json!({ "query": "zzzz nonexistent capability" }),
+            Path::new("."),
+            "s",
+        )
+        .await;
+
+    assert!(
+        text.success,
+        "a miss must not be reported as a tool failure"
+    );
+    let body = text.content.to_lowercase();
+
+    assert!(
+        !body.contains("proceed with the tools you already have"),
+        "must not advise giving up: {body}"
+    );
+    assert!(
+        body.contains("does not mean the capability is missing"),
+        "must state that a miss is not an absence: {body}"
+    );
+    assert!(
+        body.contains("search again"),
+        "must ask for another attempt: {body}"
+    );
+    assert!(
+        body.contains(&CORPUS.len().to_string()),
+        "must report how many tools remain unloaded, so 'try again' has a reason: {body}"
+    );
 }
