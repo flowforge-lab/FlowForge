@@ -201,18 +201,22 @@ function useGlobalShortcuts() {
 
 // Build the initial pane layout once sessions are loaded (after bootstrap), or
 // rebuild it from persisted state — dropping any panes whose session is gone.
+// Subscribes to "have sessions loaded yet", not to the session list or the active
+// session: AppShell renders the sidebar, the pane tree and every modal/toast, so
+// re-rendering it on each active-session flip (which happens on every pane focus) was
+// pure waste (#1122). The values are read at fire time via getState(), the same idiom
+// as useGlobalShortcuts above; the firing condition is unchanged.
 function usePaneInit() {
-  const sessions = useChatStore((s) => s.sessions);
-  const activeSessionId = useChatStore((s) => s.activeSessionId);
+  const hasSessions = useChatStore((s) => s.sessions.length > 0);
   const root = usePanesStore((s) => s.root);
   useEffect(() => {
-    if (!root && sessions.length > 0) {
-      usePanesStore.getState().init(
-        sessions.map((x) => x.id),
-        activeSessionId,
-      );
-    }
-  }, [root, sessions, activeSessionId]);
+    if (root || !hasSessions) return;
+    const { sessions, activeSessionId } = useChatStore.getState();
+    usePanesStore.getState().init(
+      sessions.map((x) => x.id),
+      activeSessionId,
+    );
+  }, [root, hasSessions]);
 }
 
 export function AppShell() {

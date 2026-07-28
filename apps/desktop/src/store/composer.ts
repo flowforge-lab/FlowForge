@@ -36,7 +36,21 @@ interface ComposerState {
   clearAttachments: (sessionId: string) => void;
   /** Load `text` into a session's composer and request focus (edit & resend). */
   prefill: (sessionId: string, text: string) => void;
+  /** Put the caret in a session's composer without touching its draft (#1122):
+   *  clicking into a background pane focuses that pane, so its composer — not the
+   *  previously focused pane's — should take the keystrokes that follow. */
+  requestFocus: (sessionId: string) => void;
 }
+
+const bumpFocusNonce = (
+  s: Pick<ComposerState, "focusNonceBySession">,
+  sessionId: string,
+) => ({
+  focusNonceBySession: {
+    ...s.focusNonceBySession,
+    [sessionId]: (s.focusNonceBySession[sessionId] ?? 0) + 1,
+  },
+});
 
 export const useComposerStore = create<ComposerState>((set, get) => ({
   textBySession: {},
@@ -84,10 +98,8 @@ export const useComposerStore = create<ComposerState>((set, get) => ({
     }
     set((s) => ({
       textBySession: { ...s.textBySession, [sessionId]: text },
-      focusNonceBySession: {
-        ...s.focusNonceBySession,
-        [sessionId]: (s.focusNonceBySession[sessionId] ?? 0) + 1,
-      },
+      ...bumpFocusNonce(s, sessionId),
     }));
   },
+  requestFocus: (sessionId) => set((s) => bumpFocusNonce(s, sessionId)),
 }));

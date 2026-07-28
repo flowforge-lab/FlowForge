@@ -289,7 +289,14 @@ function patchStep(
   };
 }
 
-/** Wall-clock turn start when streaming begins (#180). */
+/** Wall-clock turn start when streaming begins (#180).
+ *
+ *  Runs on EVERY token, so both maps are returned by reference when the entry is
+ *  already correct (#1122). Reallocating them per token gave every subscriber of the
+ *  whole map a fresh reference on each delta — the sidebar re-rendered once per
+ *  background token, stealing frames from the pane the user is actually typing in.
+ *  Values are unchanged either way: a session streams one message at a time, and the
+ *  `?? wall` below already made second-and-later writes value-identical. */
 function streamingPatch(
   s: Pick<
     ChatState,
@@ -298,13 +305,18 @@ function streamingPatch(
   sessionId: string,
   messageId: string,
 ) {
-  const wall = s.turnStartBySession[sessionId] ?? Date.now();
   return {
-    streamingBySession: { ...s.streamingBySession, [sessionId]: messageId },
-    turnStartByMessage: {
-      ...s.turnStartByMessage,
-      [messageId]: s.turnStartByMessage[messageId] ?? wall,
-    },
+    streamingBySession:
+      s.streamingBySession[sessionId] === messageId
+        ? s.streamingBySession
+        : { ...s.streamingBySession, [sessionId]: messageId },
+    turnStartByMessage:
+      messageId in s.turnStartByMessage
+        ? s.turnStartByMessage
+        : {
+            ...s.turnStartByMessage,
+            [messageId]: s.turnStartBySession[sessionId] ?? Date.now(),
+          },
   };
 }
 

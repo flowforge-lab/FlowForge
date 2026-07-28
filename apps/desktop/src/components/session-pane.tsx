@@ -23,6 +23,7 @@ import { PhenoSelector } from "@/components/pheno-selector";
 import { useAttachGate } from "@/lib/attach-gate";
 import { stageFiles } from "@/lib/stage-files";
 import { useChatStore } from "@/store/chat";
+import { useComposerStore } from "@/store/composer";
 import { clampPanelWidth, useFilePanelStore } from "@/store/file-panel";
 import { useFindStore } from "@/store/find";
 import { usePanesStore, MAX_PANES } from "@/store/panes";
@@ -101,6 +102,35 @@ export function SessionPane({
     stageFiles(sessionId, Array.from(e.dataTransfer.files), gate);
   };
 
+  // Clicking a background pane used to move the focus ring but drop keyboard focus to
+  // <body>, so the next keystroke went nowhere and the user had to click the composer
+  // as a second click (#1122). Hand the caret to this pane's composer once the click
+  // completes, via the existing focus-nonce bridge the input bar already listens on.
+  //
+  // On `click` (mouseup), not the mousedown that moves the ring: only by then is a
+  // text selection materialized, so dragging to select transcript text can be excluded
+  // — input-bar.tsx keeps the rule that merely focusing a pane must not yank the caret.
+  const wasFocusedOnDownRef = useRef(focused);
+  const requestFocus = useComposerStore((s) => s.requestFocus);
+  const handleClick = (e: React.MouseEvent) => {
+    // Already the focused pane: the user is interacting inside it, not switching.
+    if (wasFocusedOnDownRef.current) return;
+    // Interactive targets keep their native behavior — clicking a background pane's
+    // button, link, or its own composer must not be overridden.
+    const target = e.target as HTMLElement | null;
+    if (
+      target?.closest(
+        "input, textarea, button, a, [role='button'], [contenteditable='true']",
+      )
+    ) {
+      return;
+    }
+    // The click ended a drag-selection of transcript text; leave that selection alone.
+    const selection = target?.ownerDocument.defaultView?.getSelection();
+    if (selection && !selection.isCollapsed) return;
+    requestFocus(sessionId);
+  };
+
   // Drag-to-resize the chat|files divider. The file panel is flush to the pane's
   // right edge, so its width is the distance from the cursor to that edge.
   // Applied imperatively during the drag; committed once on mouseup (mirrors
@@ -131,8 +161,10 @@ export function SessionPane({
   return (
     <div
       onMouseDownCapture={() => {
+        wasFocusedOnDownRef.current = focused;
         if (!focused) focusPane(paneId);
       }}
+      onClick={handleClick}
       className={cn(
         "flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden rounded-lg border bg-background transition-colors",
         focused ? "ring-2 ring-ring" : "border-border",
