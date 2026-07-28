@@ -538,6 +538,11 @@ fn list_local_branches_returns_all_local_branches_sorted() {
 #[test]
 fn list_local_branches_is_empty_when_not_a_repo() {
     let dir = tempfile::tempdir().unwrap();
+    // When TMPDIR is inside a git repo, `git for-each-ref` walks up and
+    // finds the parent `.git`, returning branches instead of empty. A
+    // `.git` file pointing to a non-existent repo blocks the walk-up
+    // without making the tempdir a valid repository.
+    std::fs::write(dir.path().join(".git"), "gitdir: /nonexistent/.git\n").unwrap();
     assert_eq!(
         list_local_branches(dir.path()).unwrap(),
         Vec::<String>::new()

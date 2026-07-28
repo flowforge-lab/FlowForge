@@ -26,3 +26,8 @@ retries = 0
 
 # Print failing test output inline (default) — essential for triage on CI.
 failure-output = "immediate"
+
+# Do not stop on first failure. A clean local run should surface every broken
+# test, not hide them behind fail-fast. Matches the --no-fail-fast behavior
+# recommended in CONTRIBUTING.md (#1124).
+fail-fast = false

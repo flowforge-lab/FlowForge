@@ -631,6 +631,11 @@ mod tests {
     #[tokio::test]
     async fn not_a_repo_returns_error() {
         let tmp = tempfile::tempdir().unwrap();
+        // When TMPDIR is inside a git repo (e.g. a workspace sub-directory),
+        // `git` walks up and finds the parent `.git`, causing this test to
+        // falsely pass. A `.git` file pointing to a non-existent repo blocks
+        // the walk-up without making the tempdir a valid repository.
+        std::fs::write(tmp.path().join(".git"), "gitdir: /nonexistent/.git\n").unwrap();
         let result = git_status(tmp.path()).await;
         assert!(!result.success);
         assert!(
