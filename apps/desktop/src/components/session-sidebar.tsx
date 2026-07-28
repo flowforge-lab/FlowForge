@@ -1,5 +1,6 @@
 import type { ComponentType, ReactNode } from "react";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useShallow } from "zustand/react/shallow";
 import {
   Check,
   Download,
@@ -205,7 +206,7 @@ export function SessionMenuItems({
 
 // ── Inline-rename session item ───────────────────────────────────────────────
 
-export function SessionItem({
+function SessionItemImpl({
   session,
   index,
   active,
@@ -230,7 +231,9 @@ export function SessionItem({
    *  instead of opening the session. */
   selectMode?: boolean;
   selected?: boolean;
-  onToggleSelect?: () => void;
+  /** Takes the session id rather than closing over it, so the sidebar can pass one
+   *  stable callback to every row and the memo below actually skips (#1122). */
+  onToggleSelect?: (id: string) => void;
 }) {
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState("");
@@ -358,13 +361,13 @@ export function SessionItem({
           tabIndex={0}
           onClick={() => {
             if (editing) return;
-            if (selectMode) onToggleSelect?.();
+            if (selectMode) onToggleSelect?.(session.id);
             else open();
           }}
           onKeyDown={(e) => {
             if (!editing && (e.key === "Enter" || e.key === " ")) {
               e.preventDefault();
-              if (selectMode) onToggleSelect?.();
+              if (selectMode) onToggleSelect?.(session.id);
               else open();
             }
           }}
@@ -380,7 +383,7 @@ export function SessionItem({
             <input
               type="checkbox"
               checked={selected}
-              onChange={() => onToggleSelect?.()}
+              onChange={() => onToggleSelect?.(session.id)}
               // Stop the click from also reaching the row handler (which would
               // toggle a second time and cancel this one out).
               onClick={(e) => e.stopPropagation()}
@@ -538,6 +541,11 @@ export function SessionItem({
   );
 }
 
+// Memoized like MessageRow (chat-view.tsx): every prop is a primitive or a stable
+// reference, so a sidebar re-render for an unrelated reason — a filter keystroke, a
+// pin, another session's stream — no longer re-renders every row (#1122).
+export const SessionItem = memo(SessionItemImpl);
+
 // ── Sidebar ──────────────────────────────────────────────────────────────────
 
 export function SessionSidebar() {
@@ -550,9 +558,16 @@ export function SessionSidebar() {
     [allSessions, draftSessionIds],
   );
   const activeSessionId = useChatStore((s) => s.activeSessionId);
-  const streamingBySession = useChatStore((s) => s.streamingBySession);
+  // The sidebar renders every row, so it genuinely needs both whole maps — but a
+  // reference compare would re-render it on any churn of those references. Shallow
+  // compare so it re-renders only when a session actually enters/leaves streaming or
+  // its "done" flag flips, never on a background token (#1122). Same rule as
+  // chat-view.tsx's scoped `useShallow` selectors.
+  const streamingBySession = useChatStore(
+    useShallow((s) => s.streamingBySession),
+  );
   const recentlyFinishedBySession = useChatStore(
-    (s) => s.recentlyFinishedBySession,
+    useShallow((s) => s.recentlyFinishedBySession),
   );
   const clearSessionFinished = useChatStore((s) => s.clearSessionFinished);
   const dismissSessionToasts = useSessionToastStore((s) => s.dismissBySession);
@@ -656,13 +671,17 @@ export function SessionSidebar() {
     setSelectMode(false);
     setSelected(new Set());
   };
-  const toggleSelect = (id: string) =>
-    setSelected((prev) => {
-      const next = new Set(prev);
-      if (next.has(id)) next.delete(id);
-      else next.add(id);
-      return next;
-    });
+  // Stable across renders so every memoized row can share the one callback (#1122).
+  const toggleSelect = useCallback(
+    (id: string) =>
+      setSelected((prev) => {
+        const next = new Set(prev);
+        if (next.has(id)) next.delete(id);
+        else next.add(id);
+        return next;
+      }),
+    [],
+  );
 
   function revealFilter() {
     setShowFilter(true);
@@ -1094,7 +1113,7 @@ export function SessionSidebar() {
                     dismissed={dismissedSet.has(session.id)}
                     selectMode={selectMode}
                     selected={selected.has(session.id)}
-                    onToggleSelect={() => toggleSelect(session.id)}
+                    onToggleSelect={toggleSelect}
                   />
                 ))}
               {/* One endless, incremental reveal (#667): +25 rows per click, walking
