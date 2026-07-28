@@ -667,6 +667,32 @@ fn cache_prefix_excludes_the_synthesized_nudge() {
     );
 }
 
+/// `to_anthropic_request` computes `markable` **before** repair. Swapping the
+/// two lines so it is computed post-repair makes a 1-message conversation look
+/// like 2 and marks it, folding the volatile nudge into the cache prefix.
+/// This test calls the exact path `chat_stream` uses, so it fails on that swap.
+#[test]
+fn single_assistant_repair_excludes_cache_point_in_anthropic_path() {
+    let req = ChatRequest {
+        model: "claude-sonnet-4-20250514".into(),
+        messages: vec![ChatMessage::text("assistant", "orphaned")],
+        cache_messages: true,
+        ..ChatRequest::default()
+    };
+    let body = to_anthropic_request(&req, 4096, ReasoningEffort::Medium);
+    let messages = body.get("messages").unwrap().as_array().unwrap();
+    assert_eq!(messages.len(), 2, "repair appends the nudge");
+    for m in messages {
+        let content = m.get("content").unwrap().as_array().unwrap();
+        for block in content {
+            assert!(
+                block.get("cache_control").is_none(),
+                "a repaired 1-message conversation must not be cache-marked"
+            );
+        }
+    }
+}
+
 // --- creds --------------------------------------------------------------
 
 #[test]

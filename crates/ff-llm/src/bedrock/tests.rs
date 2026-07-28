@@ -1502,3 +1502,26 @@ fn single_assistant_message_is_not_cache_marked_after_repair() {
         "a repaired 2-message conversation must not be cache-marked"
     );
 }
+
+/// `prepare_bedrock_messages` computes `markable` **before** repair. Swapping the
+/// two lines so it is computed post-repair makes a 1-message conversation look
+/// like 2 and marks it, folding the volatile nudge into the cache prefix.
+/// This test calls the exact path `chat_stream` uses, so it fails on that swap.
+#[test]
+fn single_assistant_repair_excludes_cache_point_in_bedrock_path() {
+    let req = ChatRequest {
+        model: "claude-3-5-sonnet-20241022".into(),
+        messages: vec![ChatMessage::text("assistant", "orphaned")],
+        cache_messages: true,
+        ..ChatRequest::default()
+    };
+    let (_system, messages) = prepare_bedrock_messages(&req, false, false);
+    assert_eq!(messages.len(), 2, "repair appends the nudge");
+    assert!(
+        !messages.iter().any(|m| m
+            .content()
+            .iter()
+            .any(|b| matches!(b, ContentBlock::CachePoint(_)))),
+        "a repaired 1-message conversation must not be cache-marked"
+    );
+}
