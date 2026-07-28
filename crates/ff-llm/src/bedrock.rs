@@ -449,8 +449,10 @@ fn prepare_bedrock_messages(
     req: &ChatRequest,
     supports_vision: bool,
     supports_documents: bool,
+    limits: crate::AttachmentByteLimits,
 ) -> (Vec<SystemContentBlock>, Vec<Message>) {
     let wire = crate::messages_for_wire(&req.messages, supports_vision, supports_documents);
+    let (wire, _stripped) = crate::strip_oversized_attachments(&wire, limits);
     // Measured before the repair: a lone assistant turn becomes two messages, and
     // marking that would place a breakpoint on a prefix consisting of one volatile
     // turn — worthless to cache, and a behaviour change from before #1117.
@@ -483,9 +485,20 @@ impl Provider for BedrockProvider {
         self.supports_documents
     }
 
+    fn attachment_byte_limits(&self) -> crate::AttachmentByteLimits {
+        crate::AttachmentByteLimits {
+            document: Some(4_500_000), // 4.5 MB per Bedrock Converse limit
+            image: Some(5_000_000),    // 5 MB per Bedrock Converse limit
+        }
+    }
+
     async fn chat_stream(&self, req: ChatRequest) -> Result<ChunkStream, LlmError> {
-        let (system, messages) =
-            prepare_bedrock_messages(&req, self.supports_vision, self.supports_documents);
+        let (system, messages) = prepare_bedrock_messages(
+            &req,
+            self.supports_vision,
+            self.supports_documents,
+            self.attachment_byte_limits(),
+        );
         let client = self.client().await;
         let cache = model_supports_cache_point(&req.model);
         let thinking_config = req.thinking.then(|| self.thinking_config_for(&req.model));

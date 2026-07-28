@@ -537,6 +537,23 @@ pub fn reasoning_control(
     }
 }
 
+/// Per-provider byte limits for attachments of each kind (#1116). A `None`
+/// limit means "no restriction" for that kind. Concrete providers override
+/// [`Provider::attachment_byte_limits`] to advertise their caps; the default
+/// (all `None`) imposes no guard.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AttachmentByteLimits {
+    pub image: Option<u64>,
+    pub document: Option<u64>,
+}
+
+impl AttachmentByteLimits {
+    /// Whether *any* limit is configured (i.e. the guard is active).
+    pub fn is_active(self) -> bool {
+        self.image.is_some() || self.document.is_some()
+    }
+}
+
 /// Drop attachments a provider cannot carry (the capability strip, #332/#334,
 /// #504). Vision and documents gate independently: a `Document` survives only
 /// when `supports_documents`, an `Image` only when `supports_vision`, so a
@@ -573,6 +590,61 @@ pub(crate) fn messages_for_wire(
                 .collect(),
         )
     }
+}
+
+/// Strip attachments whose byte size exceeds a provider's per-document or
+/// per-image hard limit (#1116). Replaces each stripped attachment with a
+/// placeholder line in the message `content` so the text conversation continues.
+/// Returns the (possibly modified) messages and the count of stripped
+/// attachments. Borrows on the common path (no oversized attachments) and only
+/// clones when a strip is needed.
+pub fn strip_oversized_attachments(
+    messages: &[ChatMessage],
+    limits: AttachmentByteLimits,
+) -> (std::borrow::Cow<'_, [ChatMessage]>, usize) {
+    if !limits.is_active() {
+        return (std::borrow::Cow::Borrowed(messages), 0);
+    }
+    let limit_for = |a: &ff_core::Attachment| -> Option<u64> {
+        match a.kind {
+            ff_core::AttachmentKind::Image => limits.image,
+            ff_core::AttachmentKind::Document => limits.document,
+        }
+    };
+    let mut stripped_total = 0usize;
+    let mut out: Vec<ChatMessage> = Vec::with_capacity(messages.len());
+    for m in messages {
+        let mut stripped_here: Vec<String> = Vec::new();
+        let mut attachments: Vec<ff_core::Attachment> = Vec::with_capacity(m.attachments.len());
+        for a in &m.attachments {
+            if let Some(limit) = limit_for(a) {
+                if a.bytes > limit {
+                    let mb = a.bytes as f64 / 1_048_576.0;
+                    let limit_mb = limit as f64 / 1_048_576.0;
+                    let name = a.name.as_deref().unwrap_or("unnamed");
+                    stripped_here.push(format!(
+                        "[attachment \"{name}\" ({mb:.1} MB) omitted: exceeds provider {limit_mb:.1} MB limit]"
+                    ));
+                    stripped_total += 1;
+                    continue;
+                }
+            }
+            attachments.push(a.clone());
+        }
+        if stripped_here.is_empty() {
+            out.push(m.clone());
+            continue;
+        }
+        let mut m = m.clone();
+        m.attachments = attachments;
+        let notice = stripped_here.join("\n");
+        m.content = Some(match m.content {
+            Some(ref text) if !text.is_empty() => format!("{text}\n{notice}"),
+            _ => notice,
+        });
+        out.push(m);
+    }
+    (std::borrow::Cow::Owned(out), stripped_total)
 }
 
 /// Text of the synthetic closing turn injected by [`enforce_user_terminated`].
@@ -719,6 +791,15 @@ pub trait Provider: Send + Sync {
     /// providers override to report their connection's configured flag.
     fn supports_documents(&self) -> bool {
         false
+    }
+
+    /// Per-kind byte limits for attachments (#1116). The provider layer strips
+    /// attachments that exceed these limits before the request is built, replacing
+    /// them with a placeholder text line so the conversation continues. Defaults
+    /// to [`AttachmentByteLimits::default()`] (no limits), so providers without
+    /// a known cap are unaffected.
+    fn attachment_byte_limits(&self) -> AttachmentByteLimits {
+        AttachmentByteLimits::default()
     }
 
     /// Best-effort list of model ids the server currently has loaded. Used by the
