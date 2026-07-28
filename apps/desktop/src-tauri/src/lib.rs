@@ -360,17 +360,17 @@ fn list_sessions(state: State<'_, Arc<AppState>>) -> Vec<Session> {
 }
 
 #[tauri::command]
-fn get_messages(state: State<'_, Arc<AppState>>, session_id: String) -> Vec<Message> {
-    // Reconcile orphaned empty assistant rows left by a hard kill (SIGKILL /
-    // panic=abort), which runs no Drop guard (#646). Skip while a turn is live:
-    // that session's reserved tail row is a legitimate transient, and the
-    // AssistantRowGuard covers its graceful drop.
-    if !state.has_active_turn(&session_id) {
-        state
-            .store
-            .reconcile_orphaned_assistant_rows(&session_id, ff_agent::INTERRUPTED_NOTICE);
+fn get_messages(
+    state: State<'_, Arc<AppState>>,
+    session_id: String,
+    limit: Option<usize>,
+) -> Vec<Message> {
+    // #1142: read-only. Orphaned rows are reconciled once at app startup
+    // (see AppState::with_registry), not on every session switch.
+    match limit {
+        Some(n) => state.store.get_messages_tail(&session_id, n),
+        None => state.store.get_messages(&session_id),
     }
-    state.store.get_messages(&session_id)
 }
 
 /// Full-text search across all sessions (#679). Returns ranked hits with snippets.
@@ -3010,9 +3010,9 @@ fn get_skill_telemetry(state: State<'_, Arc<AppState>>, skill: String) -> Option
 /// of the session, each as `role: content` with the body truncated. Current-session
 /// only for M3 (durable cross-session transcripts are deferred to M5).
 fn recent_transcript(state: &AppState, session_id: &str, n: usize) -> Vec<String> {
-    let messages = state.store.get_messages(session_id);
-    let start = messages.len().saturating_sub(n);
-    messages[start..]
+    // #1142 P1: use tail query so long sessions don't pay for full-history fetch.
+    let messages = state.store.get_messages_tail(session_id, n);
+    messages
         .iter()
         .map(|m| {
             let role = match m.role {

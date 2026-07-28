@@ -273,10 +273,10 @@ fn has_active_turn_tracks_registered_cancel() {
     assert!(!state.has_active_turn("sess"), "turn finished");
 }
 
-#[tokio::test]
-async fn get_messages_reconciles_orphan_only_when_no_active_turn() {
-    // End-to-end guard behavior: an orphaned empty assistant row is relabeled
-    // on load, but not while a turn is live for that session (#646).
+#[test]
+fn get_messages_is_read_only() {
+    // #1142: get_messages must not write. Orphaned rows are reconciled once at
+    // app startup, not on every session switch.
     use ff_core::Role;
     let state = AppState::new();
     let s = state.store.create_session(None);
@@ -285,30 +285,18 @@ async fn get_messages_reconciles_orphan_only_when_no_active_turn() {
         .store
         .add_message(&s.id, Role::Assistant, String::new());
 
-    // Live turn: the reserved tail row must be left untouched.
-    state.register_cancel(&s.id, CancelToken::new());
-    if !state.has_active_turn(&s.id) {
-        state
-            .store
-            .reconcile_orphaned_assistant_rows(&s.id, ff_agent::INTERRUPTED_NOTICE);
-    }
-    assert_eq!(
-        state.store.get_messages(&s.id)[1].content,
-        "",
-        "live turn's reserved row must not be reconciled"
-    );
+    // get_messages should leave the orphan untouched.
+    let msgs = state.store.get_messages(&s.id);
+    assert_eq!(msgs[1].content, "", "get_messages must be read-only");
 
-    // Turn ends: now the orphan is relabeled on the next load.
-    state.take_cancel(&s.id);
-    if !state.has_active_turn(&s.id) {
-        state
-            .store
-            .reconcile_orphaned_assistant_rows(&s.id, ff_agent::INTERRUPTED_NOTICE);
-    }
+    // Explicit reconcile still works when called directly.
+    state
+        .store
+        .reconcile_orphaned_assistant_rows(&s.id, ff_agent::INTERRUPTED_NOTICE);
     assert_eq!(
         state.store.get_messages(&s.id)[1].content,
         ff_agent::INTERRUPTED_NOTICE,
-        "orphan is relabeled once no turn is live"
+        "explicit reconcile relabels the orphan"
     );
 }
 
