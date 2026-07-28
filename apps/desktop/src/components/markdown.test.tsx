@@ -8,8 +8,8 @@
 // fully delivered — streaming must never leave the user with a different
 // final rendering than before this change.
 
-import { cleanup, render } from "@testing-library/react";
-import { afterEach, describe, expect, it } from "vitest";
+import { cleanup, fireEvent, render } from "@testing-library/react";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { Markdown } from "@/components/markdown";
 
@@ -199,5 +199,78 @@ describe("Markdown math rendering (#1102)", () => {
       final.querySelectorAll(".katex-display").length,
     );
     expect(blockTexts(streamed)).toEqual(blockTexts(final));
+  });
+});
+
+// Markdown link click handling (#1129). In packaged Tauri the bare
+// `target="_blank"` anchor stays inside the webview; the renderer now routes
+// http(s)/mailto clicks through `openExternalUrl` (mock path → `window.open`).
+// Relative/anchor links must pass through untouched.
+describe("Markdown anchor clicks (#1129)", () => {
+  it("routes http(s)/mailto clicks through openExternalUrl", () => {
+    const openSpy = vi.spyOn(globalThis, "open").mockImplementation(() => null);
+
+    const { container } = render(
+      <Markdown content="See [docs](https://example.com/docs) and [mail](mailto:hi@example.com)." />,
+    );
+
+    const links = Array.from(
+      container.querySelectorAll(".ff-prose a"),
+    ) as HTMLAnchorElement[];
+    expect(links).toHaveLength(2);
+
+    const [httpsLink, mailtoLink] = links;
+    expect(httpsLink.getAttribute("href")).toBe("https://example.com/docs");
+    expect(mailtoLink.getAttribute("href")).toBe("mailto:hi@example.com");
+
+    fireEvent.click(httpsLink);
+    fireEvent.click(mailtoLink);
+
+    expect(openSpy).toHaveBeenCalledTimes(2);
+    expect(openSpy).toHaveBeenNthCalledWith(
+      1,
+      "https://example.com/docs",
+      "_blank",
+      expect.stringContaining("noopener"),
+    );
+    expect(openSpy).toHaveBeenNthCalledWith(
+      2,
+      "mailto:hi@example.com",
+      "_blank",
+      expect.stringContaining("noopener"),
+    );
+
+    openSpy.mockRestore();
+  });
+
+  it("does not intercept relative or anchor links", () => {
+    const openSpy = vi.spyOn(globalThis, "open").mockImplementation(() => null);
+
+    const { container } = render(
+      <Markdown content="See [/path](/path) and [section](#section)." />,
+    );
+
+    const links = Array.from(
+      container.querySelectorAll(".ff-prose a"),
+    ) as HTMLAnchorElement[];
+    expect(links).toHaveLength(2);
+
+    const click = (el: HTMLAnchorElement) => {
+      const event = new MouseEvent("click", {
+        bubbles: true,
+        cancelable: true,
+      });
+      el.dispatchEvent(event);
+      return event;
+    };
+
+    const relativeEvent = click(links[0]);
+    const anchorEvent = click(links[1]);
+
+    expect(openSpy).not.toHaveBeenCalled();
+    expect(relativeEvent.defaultPrevented).toBe(false);
+    expect(anchorEvent.defaultPrevented).toBe(false);
+
+    openSpy.mockRestore();
   });
 });

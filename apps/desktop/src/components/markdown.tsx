@@ -10,6 +10,7 @@ import { remarkBackslashMath } from "@/lib/remark-backslash-math";
 import { splitBlocks } from "@/lib/markdown-blocks";
 import { cn } from "@/lib/utils";
 import { useCopied } from "@/lib/use-copied";
+import { openExternalUrl } from "@/lib/about";
 import { useSplitStore } from "@/store/split";
 
 // Flatten React children (including the nested <span> tree rehype-highlight
@@ -133,12 +134,38 @@ const COMPONENTS = {
       </CodeBlock>
     );
   },
-  // Links open in the OS browser; never same-window navigate the Tauri shell.
-  a: ({ children, ...props }: { children?: ReactNode; href?: string }) => (
-    <a target="_blank" rel="noreferrer noopener" {...props}>
-      {children}
-    </a>
-  ),
+  // Links open in the OS browser — never same-window navigate the Tauri shell.
+  // In packaged Tauri the previous `target="_blank"` was a no-op (there are no
+  // tabs) and clicks stayed inside the webview; here http(s)/mailto clicks route
+  // through `openExternalUrl` so they hit the system browser (#1129). Relative
+  // and anchor links fall through to natural browser navigation. The scheme
+  // allowlist also keeps untrusted LLM-supplied URLs (e.g. `javascript:`) from
+  // ever reaching `openExternalUrl`.
+  a: ({ children, ...props }: { children?: ReactNode; href?: string }) => {
+    const href = typeof props.href === "string" ? props.href : "";
+    const isExternal = /^(https?:|mailto:)/i.test(href);
+
+    if (!isExternal) {
+      return (
+        <a rel="noreferrer noopener" {...props}>
+          {children}
+        </a>
+      );
+    }
+
+    return (
+      <a
+        rel="noreferrer noopener"
+        {...props}
+        onClick={(e) => {
+          e.preventDefault();
+          void openExternalUrl(href);
+        }}
+      >
+        {children}
+      </a>
+    );
+  },
 };
 
 // Math support (#1102). `remarkMath` handles `$…$`/`$$…$$`; `remarkBackslashMath`
