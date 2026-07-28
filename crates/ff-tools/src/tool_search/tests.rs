@@ -283,7 +283,7 @@ fn an_empty_index_is_searchable_and_yields_nothing() {
     let idx = ToolSearchIndex::from_registry(&reg);
     assert!(idx.is_empty());
     let t = ToolSearchTool::new(Arc::new(ToolSearchState::new()), idx);
-    assert!(t.search("anything", 5).is_empty());
+    assert!(t.search_fused("anything", 5, None).is_empty());
 }
 
 #[tokio::test]

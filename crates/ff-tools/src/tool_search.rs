@@ -446,16 +446,12 @@ impl ToolSearchTool {
     /// prompts another search whereas nothing at all invites it to give up on a
     /// capability that is in fact available. That is the "invisible tool" failure
     /// this whole mechanism exists to avoid.
-    fn search(&self, query: &str, limit: usize) -> Vec<Hit> {
-        self.search_fused(query, limit, None)
-    }
-
-    /// [`search`](Self::search), optionally fused with a semantic recall path.
     ///
-    /// `semantic` is the vector path's ranking, already ordered best-first. `None`
-    /// means no embedder, a cold cache, or a failed embed — all of which must leave
-    /// the Phase 2A ordering byte-for-byte unchanged, since embeddings are opt-in
-    /// and absent is the common case.
+    /// 3. **Semantic recall**, when `semantic` is `Some`: the vector path's
+    ///    ranking, already ordered best-first, fused with the lexical ranking by
+    ///    RRF. `None` means no embedder, a cold cache, or a failed embed — all of
+    ///    which must leave the Phase 2A ordering byte-for-byte unchanged, since
+    ///    embeddings are opt-in and absent is the common case.
     fn search_fused(&self, query: &str, limit: usize, semantic: Option<&[&str]>) -> Vec<Hit> {
         let terms = expand_query(query);
 
