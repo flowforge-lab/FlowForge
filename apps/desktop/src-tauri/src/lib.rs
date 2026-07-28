@@ -1842,16 +1842,17 @@ fn spawn_assistant_turn(
                 },
             );
         } else if is_observer_wake {
-            // The other half of the ambiguity: prove a wake turn that produced no
-            // visible output actually *succeeded*, rather than failing silently.
+            // Prove a wake turn that produced no visible output actually *succeeded*,
+            // rather than failing silently.
             tracing::info!(
                 session_id = %session_id,
                 drain_count,
-                // The wake turn under investigation left NO transcript row at all,
-                // which a plain success cannot explain — so record the shape of the
-                // message it returned. `content_len = 0` with no tool calls means
-                // the turn completed yet said nothing (an empty/NO_REPLY reply),
-                // which is a different bug from a rejected request.
+                // Record the shape of the returned message. The original silent wake
+                // (#1117) is fixed — it was a Bedrock 400 on an assistant-terminated
+                // request, which now lands in the `turn failed` branch above rather
+                // than here. So `content_len = 0` with no tool calls no longer means
+                // "unexplained"; it means the turn genuinely completed and chose to
+                // say nothing (an empty/NO_REPLY reply), which is its own bug class.
                 message_id = result.as_ref().map(|m| m.id.as_str()).unwrap_or(""),
                 content_len = result.as_ref().map(|m| m.content.len()).unwrap_or(0),
                 tool_calls = result

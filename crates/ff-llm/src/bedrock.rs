@@ -745,6 +745,12 @@ fn enforce_user_terminated(mut messages: Vec<Message>) -> Vec<Message> {
 /// nudge, so the cached prefix excludes it and stays byte-stable across wakes.
 /// Marking first would drift the breakpoint and fold a per-turn message into the
 /// prefix, invalidating the cache on every background turn.
+///
+/// For the same reason the returned list is **final**: the breakpoint is positional,
+/// so any later step that appends to it shifts the cached prefix and invalidates the
+/// cache every turn. `chat_stream` only reads `messages` afterwards. A new shaping
+/// step belongs *inside* this function, ahead of the marking, not after the call.
+/// `cache_prefix_excludes_the_synthesized_nudge` fails if that rule is broken.
 fn prepare_wire_messages(messages: Vec<Message>, cache_messages: bool) -> Vec<Message> {
     // Measured before the repair: a lone assistant turn becomes two messages, and
     // marking that would place a breakpoint on a prefix consisting of one volatile
