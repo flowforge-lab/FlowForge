@@ -562,3 +562,96 @@ fn validate_rules_reports_clean_ruleset() {
     ));
     assert!(m.validate_rules().is_empty());
 }
+
+// #827/#828 Part C: pre_prompt_decision encodes the canonical gate order.
+// A regression that reorders allowlist-first is caught here directly.
+#[test]
+fn pre_prompt_deny_overrides_allowlist() {
+    assert_eq!(
+        pre_prompt_decision(PermissionCell::Deny, true, None, Safety::Write),
+        PrePromptDecision::Deny
+    );
+    assert_eq!(
+        pre_prompt_decision(PermissionCell::Deny, true, None, Safety::Sensitive),
+        PrePromptDecision::Deny
+    );
+}
+
+#[test]
+fn pre_prompt_allowlist_accelerates_ask() {
+    assert_eq!(
+        pre_prompt_decision(PermissionCell::Ask, true, None, Safety::Write),
+        PrePromptDecision::Allow
+    );
+    assert_eq!(
+        pre_prompt_decision(PermissionCell::Ask, false, None, Safety::Write),
+        PrePromptDecision::Prompt
+    );
+}
+
+#[test]
+fn pre_prompt_scoped_deny_vetoes_when_not_allowlisted() {
+    // Scoped Deny vetoes when the tool is NOT on the allowlist.
+    assert_eq!(
+        pre_prompt_decision(
+            PermissionCell::Ask,
+            false,
+            Some(RuleEffect::Deny),
+            Safety::Write
+        ),
+        PrePromptDecision::Deny
+    );
+    // But the allowlist fires first — if allowlisted, scoped rules are skipped.
+    assert_eq!(
+        pre_prompt_decision(
+            PermissionCell::Ask,
+            true,
+            Some(RuleEffect::Deny),
+            Safety::Write
+        ),
+        PrePromptDecision::Allow
+    );
+}
+
+#[test]
+fn pre_prompt_scoped_allow_clears_publish_but_not_dangerous() {
+    // Dangerous is never auto-allowed by a scoped rule -- always prompts.
+    assert_eq!(
+        pre_prompt_decision(
+            PermissionCell::Ask,
+            false,
+            Some(RuleEffect::Allow),
+            Safety::Dangerous
+        ),
+        PrePromptDecision::Prompt
+    );
+    assert_eq!(
+        pre_prompt_decision(
+            PermissionCell::Ask,
+            false,
+            Some(RuleEffect::Allow),
+            Safety::Write
+        ),
+        PrePromptDecision::Allow
+    );
+    // #1051 intentional asymmetry: a scoped rule DOES clear Publish (the user
+    // wrote a persistent rule naming the command), unlike the coarse tool-wide
+    // allowlist, which never covers Publish. Only the destructive Dangerous
+    // tier is withheld from scoped Allow.
+    assert_eq!(
+        pre_prompt_decision(
+            PermissionCell::Ask,
+            false,
+            Some(RuleEffect::Allow),
+            Safety::Publish
+        ),
+        PrePromptDecision::Allow
+    );
+    // The coarse allowlist, by contrast, must NOT accelerate a Publish call --
+    // allowlist_covers excludes it, so `allowlisted` is false here and the cell
+    // (Ask) still prompts.
+    assert_eq!(
+        pre_prompt_decision(PermissionCell::Ask, false, None, Safety::Publish),
+        PrePromptDecision::Prompt
+    );
+}

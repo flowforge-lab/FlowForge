@@ -503,5 +503,58 @@ fn safety_idx(safety: Safety) -> usize {
     }
 }
 
+/// The synchronous, pre-prompt decision for a tool call (#828 Part C, #829 review).
+/// Pure — no AppHandle, no async, no state beyond the inputs. Testable directly,
+/// so a regression that reorders the allowlist above the Deny gate is caught.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrePromptDecision {
+    /// The matrix denies this call outright (e.g. Plan x Write).
+    Deny,
+    /// Auto-approved (allowlist hit, scoped Allow rule, or matrix Allow cell).
+    Allow,
+    /// None of the sync gates resolved it — prompt the user asynchronously.
+    Prompt,
+}
+
+/// Evaluate the synchronous approval gates in their canonical order (#827):
+/// 1. Matrix Deny is absolute (no override).
+/// 2. Allowlist accelerates Ask cells.
+/// 3. Scoped rules (Deny vetoes; Allow approves unless Dangerous).
+/// 4. Matrix Allow auto-approves; Ask falls through to Prompt.
+pub fn pre_prompt_decision(
+    cell: PermissionCell,
+    allowlisted: bool,
+    scoped_effect: Option<RuleEffect>,
+    safety: Safety,
+) -> PrePromptDecision {
+    if cell.is_deny() {
+        return PrePromptDecision::Deny;
+    }
+    if allowlisted {
+        return PrePromptDecision::Allow;
+    }
+    match scoped_effect {
+        Some(RuleEffect::Deny) => return PrePromptDecision::Deny,
+        // Intentional asymmetry with the `allowlisted` grant above (#1051): a
+        // coarse session/always allowlist entry keys on tool+safety and would
+        // blanket-cover EVERY Publish call for that tool, so `allowlist_covers`
+        // excludes Publish (and Dangerous). A scoped rule (#700, RFC 0019 §4.2)
+        // is different -- the user wrote a persistent rule naming the command
+        // (e.g. `bash` + CommandPrefix "git"), so honoring it for Publish is a
+        // deliberate, named authorization, not a blanket one. Dangerous is still
+        // never auto-allowed by a scoped rule (force-push, `rm -rf`, ...), so the
+        // genuinely destructive tier always prompts.
+        Some(RuleEffect::Allow) if safety != Safety::Dangerous => {
+            return PrePromptDecision::Allow;
+        }
+        _ => {}
+    }
+    match cell {
+        PermissionCell::Allow => PrePromptDecision::Allow,
+        PermissionCell::Deny => PrePromptDecision::Deny, // unreachable (handled above)
+        PermissionCell::Ask => PrePromptDecision::Prompt,
+    }
+}
+
 #[cfg(test)]
 mod tests;

@@ -1,14 +1,13 @@
 use super::state::AppState;
 use super::{
     compare_build, emit_agent_event, git_branch, goal_gate_for, install_guard, is_app_ready,
-    list_directory_in, list_local_branches, matrix_gate, panic_message, pre_prompt_decision,
-    publish_app_ready, read_file_in, resolve_tool_arg, resolve_workspace_dir, run_sidecar_turn,
-    should_warmup, switch_branch, BootFinalize, PrePromptDecision, TurnMetrics, UpdateStatus,
-    VersionDirection, APP_READY,
+    list_directory_in, list_local_branches, matrix_gate, panic_message, publish_app_ready,
+    read_file_in, resolve_tool_arg, resolve_workspace_dir, run_sidecar_turn, should_warmup,
+    switch_branch, BootFinalize, TurnMetrics, UpdateStatus, VersionDirection, APP_READY,
 };
 use ff_agent::{AgentEvent, GateDecision};
 use ff_core::events::TurnDoneEvent;
-use ff_core::{Mode, ProviderKind};
+use ff_core::{pre_prompt_decision, Mode, PrePromptDecision, ProviderKind};
 use ff_tools::Safety;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
@@ -440,118 +439,6 @@ fn edited_cell_flips_the_invocation_gate() {
     assert_eq!(
         gate(&m, "write_file", Mode::Plan, Safety::Write),
         Some(false)
-    );
-}
-
-// #827/#828 Part C: pre_prompt_decision encodes the canonical gate order.
-// A regression that reorders allowlist-first is caught here directly.
-#[test]
-fn pre_prompt_deny_overrides_allowlist() {
-    use ff_core::PermissionCell;
-    assert_eq!(
-        pre_prompt_decision(PermissionCell::Deny, true, None, Safety::Write),
-        PrePromptDecision::Deny
-    );
-    assert_eq!(
-        pre_prompt_decision(PermissionCell::Deny, true, None, Safety::Sensitive),
-        PrePromptDecision::Deny
-    );
-}
-
-#[test]
-fn pre_prompt_allowlist_accelerates_ask() {
-    use ff_core::PermissionCell;
-    assert_eq!(
-        pre_prompt_decision(PermissionCell::Ask, true, None, Safety::Write),
-        PrePromptDecision::Allow
-    );
-    assert_eq!(
-        pre_prompt_decision(PermissionCell::Ask, false, None, Safety::Write),
-        PrePromptDecision::Prompt
-    );
-}
-
-#[test]
-fn pre_prompt_scoped_deny_vetoes_when_not_allowlisted() {
-    use ff_core::{PermissionCell, RuleEffect};
-    // Scoped Deny vetoes when the tool is NOT on the allowlist.
-    assert_eq!(
-        pre_prompt_decision(
-            PermissionCell::Ask,
-            false,
-            Some(RuleEffect::Deny),
-            Safety::Write
-        ),
-        PrePromptDecision::Deny
-    );
-    // But the allowlist fires first — if allowlisted, scoped rules are skipped.
-    assert_eq!(
-        pre_prompt_decision(
-            PermissionCell::Ask,
-            true,
-            Some(RuleEffect::Deny),
-            Safety::Write
-        ),
-        PrePromptDecision::Allow
-    );
-}
-
-#[test]
-fn pre_prompt_scoped_allow_clears_publish_but_not_dangerous() {
-    use ff_core::{PermissionCell, RuleEffect};
-    // Dangerous is never auto-allowed by a scoped rule -- always prompts.
-    assert_eq!(
-        pre_prompt_decision(
-            PermissionCell::Ask,
-            false,
-            Some(RuleEffect::Allow),
-            Safety::Dangerous
-        ),
-        PrePromptDecision::Prompt
-    );
-    assert_eq!(
-        pre_prompt_decision(
-            PermissionCell::Ask,
-            false,
-            Some(RuleEffect::Allow),
-            Safety::Write
-        ),
-        PrePromptDecision::Allow
-    );
-    // #1051 intentional asymmetry: a scoped rule DOES clear Publish (the user
-    // wrote a persistent rule naming the command), unlike the coarse tool-wide
-    // allowlist, which never covers Publish. Only the destructive Dangerous
-    // tier is withheld from scoped Allow.
-    assert_eq!(
-        pre_prompt_decision(
-            PermissionCell::Ask,
-            false,
-            Some(RuleEffect::Allow),
-            Safety::Publish
-        ),
-        PrePromptDecision::Allow
-    );
-    // The coarse allowlist, by contrast, must NOT accelerate a Publish call --
-    // allowlist_covers excludes it, so `allowlisted` is false here and the cell
-    // (Ask) still prompts.
-    assert_eq!(
-        pre_prompt_decision(PermissionCell::Ask, false, None, Safety::Publish),
-        PrePromptDecision::Prompt
-    );
-}
-
-#[test]
-fn pre_prompt_plan_write_denied_despite_allowlist() {
-    let state = AppState::new();
-    state.set_session_approve("s1", "github");
-    let matrix = state.permission_matrix();
-    let cell = matrix.effective_cell("github", Mode::Plan, Safety::Write);
-    let allowlisted = state.allowlist_covers("s1", "github", Safety::Write);
-    assert!(allowlisted);
-    assert_eq!(
-        pre_prompt_decision(cell, allowlisted, None, Safety::Write),
-        PrePromptDecision::Deny,
-        "Plan x Write = Deny must override the allowlist"
     );
 }
 
@@ -1177,4 +1064,23 @@ fn read_file_rejects_jail_escape() {
     let dir = tempfile::tempdir().unwrap();
     let err = read_file_in(dir.path(), "../secret.txt", None).unwrap_err();
     assert!(err.contains("access denied"), "{err}");
+}
+
+// Stays here rather than moving to ff-core with the rest: this one is an
+// integration test over the desktop `AppState` (session allowlist + matrix
+// wiring), not over the pure gate. The pure-gate cases live in
+// ff-core/src/permission/tests.rs alongside `pre_prompt_decision`.
+#[test]
+fn pre_prompt_plan_write_denied_despite_allowlist() {
+    let state = AppState::new();
+    state.set_session_approve("s1", "github");
+    let matrix = state.permission_matrix();
+    let cell = matrix.effective_cell("github", Mode::Plan, Safety::Write);
+    let allowlisted = state.allowlist_covers("s1", "github", Safety::Write);
+    assert!(allowlisted);
+    assert_eq!(
+        pre_prompt_decision(cell, allowlisted, None, Safety::Write),
+        PrePromptDecision::Deny,
+        "Plan x Write = Deny must override the allowlist"
+    );
 }
