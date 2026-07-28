@@ -188,6 +188,48 @@ fn messages_for_wire_gates_image_and_document_independently() {
     ));
 }
 
+// --- #1123: provider-agnostic enforce_user_terminated --------------------
+
+#[test]
+fn assistant_terminated_history_gets_a_synthetic_user_turn() {
+    let messages = vec![
+        ChatMessage::text("user", "watch that file"),
+        ChatMessage::text("assistant", "observer started"),
+    ];
+    let fixed = enforce_user_terminated(messages);
+    assert_eq!(fixed.len(), 3, "one synthetic turn appended");
+    assert_eq!(fixed.last().unwrap().role, "user");
+    assert_eq!(fixed.last().unwrap().content.as_deref(), Some("Continue."));
+}
+
+#[test]
+fn user_terminated_history_is_left_alone() {
+    let messages = vec![
+        ChatMessage::text("assistant", "done"),
+        ChatMessage::text("user", "next task"),
+    ];
+    let before = messages.len();
+    let fixed = enforce_user_terminated(messages);
+    assert_eq!(fixed.len(), before, "no turn appended");
+    assert_eq!(fixed.last().unwrap().role, "user");
+    assert_eq!(fixed.last().unwrap().content.as_deref(), Some("next task"));
+}
+
+#[test]
+fn tool_result_turn_counts_as_user_terminated() {
+    let mut tool_result = ChatMessage::text("tool", "output");
+    tool_result.tool_call_id = Some("A".into());
+    let messages = vec![ChatMessage::text("assistant", "call"), tool_result];
+    let fixed = enforce_user_terminated(messages);
+    assert_eq!(fixed.len(), 2, "tool result already ends user-side");
+    assert_eq!(fixed.last().unwrap().role, "tool");
+}
+
+#[test]
+fn empty_history_is_not_given_a_synthetic_turn() {
+    assert!(enforce_user_terminated(Vec::new()).is_empty());
+}
+
 struct EndlessProvider {
     polled: Arc<AtomicUsize>,
     first_role: Mutex<Option<String>>,

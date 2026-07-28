@@ -575,6 +575,28 @@ pub(crate) fn messages_for_wire(
     }
 }
 
+/// Text of the synthetic closing turn injected by [`enforce_user_terminated`].
+/// Deliberately terse and instruction-free: it exists to satisfy a provider
+/// contract, not to steer the model, which is already directed by the system
+/// prompt (for an observer wake, that's the wake context itself).
+const CONTINUE_NUDGE: &str = "Continue.";
+
+/// Background-initiated turns (observer wake, memory flush) replay history
+/// without appending a user message. Several providers reject or mis-handle
+/// a conversation that ends on an assistant message. Repair by appending a
+/// minimal user turn so the request is well-formed.
+///
+/// An empty conversation is left alone: it's a caller bug the provider should
+/// report plainly, not something to paper over with a lone "Continue.".
+pub(crate) fn enforce_user_terminated(mut messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
+    let ends_assistant = messages.last().is_some_and(|m| m.role == "assistant");
+    if !ends_assistant {
+        return messages;
+    }
+    messages.push(ChatMessage::text("user", CONTINUE_NUDGE));
+    messages
+}
+
 /// Materialize an attachment as raw bytes: read a `Path` from disk, or base64-decode
 /// an `Inline` payload. Shared by the per-provider adapters (#335/#336/#337) -- Bedrock
 /// sends these raw, the OpenAI-compatible adapter re-encodes them into a data URI.

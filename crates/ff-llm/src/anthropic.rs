@@ -243,12 +243,17 @@ fn parse_anthropic_line(line: &[u8]) -> Option<Result<Chunk, LlmError>> {
 
 /// Build the `/v1/messages` request body from OpenAI-shaped history.
 fn to_anthropic_request(req: &ChatRequest, max_tokens: u32, effort: ReasoningEffort) -> Value {
-    let (system, mut messages) = to_anthropic_messages(&req.messages);
+    // Measured before the repair: a lone assistant turn becomes two messages, and
+    // marking that would place a breakpoint on a prefix consisting of one volatile
+    // turn — worthless to cache, and a behaviour change from before #1117.
+    let markable = req.messages.len() >= 2;
+    let messages = crate::enforce_user_terminated(req.messages.clone());
+    let (system, mut messages) = to_anthropic_messages(&messages);
     // Message-level cache breakpoints (#763): mark the penultimate wire message
     // and (when history is long enough) index 0 so the growing conversation prefix
     // is cached across turns. Anthropic allows up to 4 breakpoints total; system
     // and tools already use 2, so we add at most 2 more on messages.
-    if req.cache_messages && messages.len() >= 2 {
+    if req.cache_messages && markable && messages.len() >= 2 {
         let len = messages.len();
         mark_anthropic_cache_breakpoint(&mut messages, len - 2);
         if len >= 4 {

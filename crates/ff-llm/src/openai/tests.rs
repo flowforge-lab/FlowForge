@@ -1038,3 +1038,17 @@ async fn header_wait_stall_surfaces_transient_transport_error() {
         Ok(_) => panic!("expected an error from a server that never responds"),
     }
 }
+
+// --- #1123: assistant-terminated conversation repair ---------------------
+
+#[test]
+fn assistant_terminated_history_gets_a_synthetic_user_turn() {
+    let messages = vec![
+        ChatMessage::text("user", "watch that file"),
+        ChatMessage::text("assistant", "observer started"),
+    ];
+    let fixed = crate::enforce_user_terminated(messages);
+    assert_eq!(fixed.len(), 3, "one synthetic turn appended");
+    assert_eq!(fixed.last().unwrap().role, "user");
+    assert_eq!(fixed.last().unwrap().content.as_deref(), Some("Continue."));
+}
