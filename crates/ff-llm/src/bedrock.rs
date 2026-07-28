@@ -439,6 +439,40 @@ fn uses_adaptive_thinking(model: &str) -> bool {
     false
 }
 
+/// Prepare system + wire messages for Bedrock, including capability strip,
+/// assistant-termination repair, conversion, and cache marking.
+///
+/// Extracted from `chat_stream` so the repair-then-mark ordering is testable
+/// without a live client. `markable` is computed **before** repair inside this
+/// function; a test calls this directly and fails if the two lines are swapped.
+fn prepare_bedrock_messages(
+    req: &ChatRequest,
+    supports_vision: bool,
+    supports_documents: bool,
+) -> (Vec<SystemContentBlock>, Vec<Message>) {
+    let wire = crate::messages_for_wire(&req.messages, supports_vision, supports_documents);
+    // Measured before the repair: a lone assistant turn becomes two messages, and
+    // marking that would place a breakpoint on a prefix consisting of one volatile
+    // turn — worthless to cache, and a behaviour change from before #1117.
+    let markable = wire.len() >= 2;
+    let wire = crate::enforce_user_terminated(wire.into_owned());
+    let (mut system, mut messages) = to_converse(&wire);
+
+    // Prompt caching (#437, #933 A.1): on models that support it, place a
+    // cache point after the *stable* system prefix (before the volatile tail).
+    let cache = model_supports_cache_point(&req.model);
+    if cache {
+        if let (false, Some(point)) = (system.is_empty(), cache_point()) {
+            let pos = if system.len() >= 2 { 1 } else { system.len() };
+            system.insert(pos, SystemContentBlock::CachePoint(point));
+        }
+    }
+    if cache && req.cache_messages && markable {
+        mark_message_cache_breakpoints(&mut messages);
+    }
+    (system, messages)
+}
+
 #[async_trait]
 impl Provider for BedrockProvider {
     fn supports_vision(&self) -> bool {
@@ -450,33 +484,13 @@ impl Provider for BedrockProvider {
     }
 
     async fn chat_stream(&self, req: ChatRequest) -> Result<ChunkStream, LlmError> {
-        let wire =
-            crate::messages_for_wire(&req.messages, self.supports_vision, self.supports_documents);
-        // Measured before the repair: a lone assistant turn becomes two messages, and
-        // marking that would place a breakpoint on a prefix consisting of one volatile
-        // turn — worthless to cache, and a behaviour change from before #1117.
-        let markable = wire.len() >= 2;
-        let wire = crate::enforce_user_terminated(wire.into_owned());
-        let (mut system, mut messages) = to_converse(&wire);
+        let (mut system, mut messages) = prepare_bedrock_messages(
+            &req,
+            self.supports_vision,
+            self.supports_documents,
+        );
         let client = self.client().await;
-
-        // Prompt caching (#437, #933 A.1): on models that support it, place a
-        // cache point after the *stable* system prefix (before the volatile tail).
-        // The agent layer sends two system messages: [0] = stable prefix (persona,
-        // skills, guidance), [1] = volatile tail (date, memory, goal). Inserting the
-        // cache point at index 1 (between the two) means the stable prefix is cached
-        // and reused even when memory/date changes. When only one system block exists,
-        // falls back to appending at end (backward compat).
         let cache = model_supports_cache_point(&req.model);
-        if cache {
-            if let (false, Some(point)) = (system.is_empty(), cache_point()) {
-                // Insert between stable (index 0) and volatile (index 1) when both
-                // are present; otherwise append after the single block.
-                let pos = if system.len() >= 2 { 1 } else { system.len() };
-                system.insert(pos, SystemContentBlock::CachePoint(point));
-            }
-        }
-        messages = prepare_wire_messages(messages, cache && req.cache_messages, markable);
         let thinking_config = req.thinking.then(|| self.thinking_config_for(&req.model));
 
         // Check before messages are moved into the request builder.
