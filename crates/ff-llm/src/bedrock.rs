@@ -484,11 +484,8 @@ impl Provider for BedrockProvider {
     }
 
     async fn chat_stream(&self, req: ChatRequest) -> Result<ChunkStream, LlmError> {
-        let (mut system, mut messages) = prepare_bedrock_messages(
-            &req,
-            self.supports_vision,
-            self.supports_documents,
-        );
+        let (system, messages) =
+            prepare_bedrock_messages(&req, self.supports_vision, self.supports_documents);
         let client = self.client().await;
         let cache = model_supports_cache_point(&req.model);
         let thinking_config = req.thinking.then(|| self.thinking_config_for(&req.model));
@@ -721,6 +718,7 @@ fn to_converse(messages: &[ChatMessage]) -> (Vec<SystemContentBlock>, Vec<Messag
 /// cache every turn. `chat_stream` only reads `messages` afterwards. A new shaping
 /// step belongs *inside* this function, ahead of the marking, not after the call.
 /// `cache_prefix_excludes_the_synthesized_nudge` fails if that rule is broken.
+#[cfg(test)]
 fn prepare_wire_messages(
     messages: Vec<Message>,
     cache_messages: bool,
