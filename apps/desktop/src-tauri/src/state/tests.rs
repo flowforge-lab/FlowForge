@@ -3243,3 +3243,72 @@ fn flush_is_gated_while_a_successor_turn_is_active() {
         "marker must persist once no turn is active"
     );
 }
+
+/// `FF_MEMORY_EMBEDDINGS_MODEL` and `_BASE_URL` are process-wide, so the
+/// defaulting tests below serialize against each other.
+static EMBED_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn embeddings_on() -> MemoryConfig {
+    let mut c = MemoryConfig::default();
+    c.embeddings.enabled = true;
+    c.embeddings.provider = EmbeddingProvider::Local;
+    c
+}
+
+/// Enabling embeddings without naming a model must still produce an embedder.
+///
+/// The model previously had no default, so this configuration returned `None` and
+/// the feature was silently inert — indistinguishable, from the outside, from not
+/// having shipped it (#1138).
+#[test]
+fn embeddings_enabled_without_a_model_still_yields_an_embedder() {
+    let _guard = EMBED_ENV_LOCK.lock().unwrap();
+    std::env::remove_var("FF_MEMORY_EMBEDDINGS_MODEL");
+    std::env::remove_var("FF_MEMORY_EMBEDDINGS_BASE_URL");
+
+    let got = local_embedder_from_env(&embeddings_on());
+
+    let (base, model, key) = got.expect("enabled embeddings must not be silently inert");
+    assert_eq!(model, DEFAULT_EMBEDDING_MODEL);
+    assert_eq!(base, DEFAULT_EMBEDDING_BASE_URL);
+    assert!(key.is_none(), "no API key is needed for a local endpoint");
+}
+
+/// The default points at Ollama's OpenAI-compatible route, not candle-vLLM.
+#[test]
+fn default_embedding_endpoint_is_ollama() {
+    assert!(
+        DEFAULT_EMBEDDING_BASE_URL.contains("11434"),
+        "expected Ollama's port, got {DEFAULT_EMBEDDING_BASE_URL}"
+    );
+    assert!(
+        DEFAULT_EMBEDDING_BASE_URL.ends_with("/v1"),
+        "OpenAiEmbedder appends /embeddings, so the base must be the /v1 root"
+    );
+}
+
+/// Both defaults stay overridable, so a self-hosted or cloud endpoint still works.
+#[test]
+fn env_overrides_win_over_the_defaults() {
+    let _guard = EMBED_ENV_LOCK.lock().unwrap();
+    std::env::set_var("FF_MEMORY_EMBEDDINGS_MODEL", "bge-m3");
+    std::env::set_var("FF_MEMORY_EMBEDDINGS_BASE_URL", "http://example.test/v1");
+
+    let (base, model, _) = local_embedder_from_env(&embeddings_on()).expect("embedder");
+
+    std::env::remove_var("FF_MEMORY_EMBEDDINGS_MODEL");
+    std::env::remove_var("FF_MEMORY_EMBEDDINGS_BASE_URL");
+
+    assert_eq!(model, "bge-m3");
+    assert_eq!(base, "http://example.test/v1");
+}
+
+/// Disabled embeddings stay disabled — the defaults must not switch it on.
+#[test]
+fn defaults_do_not_enable_embeddings_by_themselves() {
+    let _guard = EMBED_ENV_LOCK.lock().unwrap();
+    assert!(
+        local_embedder_from_env(&MemoryConfig::default()).is_none(),
+        "embeddings are opt-in (RFC 0006 §8); a default model must not opt the user in"
+    );
+}
