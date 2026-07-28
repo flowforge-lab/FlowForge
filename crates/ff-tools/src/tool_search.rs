@@ -23,6 +23,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use ff_memory::Embedder;
 use serde_json::{json, Value};
 
 use crate::registry::{Safety, Tool, ToolOutcome, ToolRegistry};
@@ -327,11 +328,106 @@ struct Hit {
 pub struct ToolSearchTool {
     state: Arc<ToolSearchState>,
     index: ToolSearchIndex,
+    /// Semantic recall, or `None` to stay purely lexical (Phase 2A behaviour).
+    ///
+    /// Optional because embeddings are opt-in (RFC 0006 §8): the default build has
+    /// no embedder, so the vector path must be absent rather than merely inactive.
+    embedder: Option<Arc<dyn Embedder>>,
+    /// Which model `vectors` were produced by. Part of the cache key — vectors
+    /// from different models are not comparable (see [`semantic::CorpusVectors`]).
+    embed_model: String,
+    /// Corpus vectors, warmed once per process.
+    vectors: Arc<Mutex<semantic::CorpusVectors>>,
 }
 
 impl ToolSearchTool {
     pub fn new(state: Arc<ToolSearchState>, index: ToolSearchIndex) -> Self {
-        Self { state, index }
+        Self {
+            state,
+            index,
+            embedder: None,
+            embed_model: String::new(),
+            vectors: Arc::new(Mutex::new(semantic::CorpusVectors::new(""))),
+        }
+    }
+
+    /// Enable semantic recall, fused with BM25F (#1138).
+    pub fn with_embedder(mut self, embedder: Arc<dyn Embedder>, model: impl Into<String>) -> Self {
+        let model = model.into();
+        self.vectors = Arc::new(Mutex::new(semantic::CorpusVectors::new(&model)));
+        self.embed_model = model;
+        self.embedder = Some(embedder);
+        self
+    }
+
+    /// Each tool's index text, paired with its name — the same text the lexical
+    /// bag is built from, so both paths see one corpus.
+    fn corpus_texts(&self) -> Vec<(&str, String)> {
+        self.index
+            .tools
+            .iter()
+            .map(|t| {
+                (
+                    t.name.as_str(),
+                    format!("{} {} {}", t.name, t.description, t.schema_keywords),
+                )
+            })
+            .collect()
+    }
+
+    /// The semantic ranking for `query`, or `None` to fall through to BM25F alone.
+    ///
+    /// The [`Embedder`] contract is synchronous and `OpenAiEmbedder` is built on
+    /// `reqwest::blocking`, whose client must not be constructed, called, or
+    /// dropped inside an async context. So *all* embedder work — warming the
+    /// corpus and embedding the query — happens inside one `spawn_blocking`, and
+    /// the mutex is never held across an await.
+    ///
+    /// Every failure — no embedder, dead server, empty cache — returns `None`, and
+    /// fusing with `None` is the identity.
+    async fn semantic_ranking(&self, query: &str) -> Option<Vec<String>> {
+        let embedder = self.embedder.as_ref()?.clone();
+        let model = self.embed_model.clone();
+
+        let texts: Vec<(String, String)> = self
+            .corpus_texts()
+            .into_iter()
+            .map(|(n, t)| (n.to_string(), t))
+            .collect();
+
+        let cached = Arc::clone(&self.vectors);
+        let q = query.to_string();
+        let m = model.clone();
+
+        tokio::task::spawn_blocking(move || {
+            let borrowed: Vec<(&str, String)> =
+                texts.iter().map(|(n, t)| (n.as_str(), t.clone())).collect();
+
+            let mut vectors = cached.lock().ok()?;
+            if vectors.is_empty() {
+                semantic::warm(&embedder, &m, &borrowed, &mut vectors);
+            }
+
+            // The vector path needs the *whole* corpus, not whatever embedded
+            // successfully. With a partial cache the few embedded tools would be
+            // the only semantic candidates and would crowd out better lexical
+            // hits — a ranking decided by which embeds happened to succeed. Better
+            // to fall back to BM25F, which at least ranks every tool.
+            if vectors.len() < borrowed.len() {
+                return None;
+            }
+
+            let qv = embedder.embed_query(&q).ok()??;
+            let ranked = semantic::semantic_ranking(&qv, &borrowed, &vectors, &m);
+            (!ranked.is_empty()).then(|| {
+                ranked
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect::<Vec<String>>()
+            })
+        })
+        .await
+        .ok()?
     }
 
     /// Rank the deferred corpus against `query`, best first.
@@ -351,6 +447,16 @@ impl ToolSearchTool {
     /// capability that is in fact available. That is the "invisible tool" failure
     /// this whole mechanism exists to avoid.
     fn search(&self, query: &str, limit: usize) -> Vec<Hit> {
+        self.search_fused(query, limit, None)
+    }
+
+    /// [`search`](Self::search), optionally fused with a semantic recall path.
+    ///
+    /// `semantic` is the vector path's ranking, already ordered best-first. `None`
+    /// means no embedder, a cold cache, or a failed embed — all of which must leave
+    /// the Phase 2A ordering byte-for-byte unchanged, since embeddings are opt-in
+    /// and absent is the common case.
+    fn search_fused(&self, query: &str, limit: usize, semantic: Option<&[&str]>) -> Vec<Hit> {
         let terms = expand_query(query);
 
         let mut hits: Vec<Hit> = self
@@ -389,8 +495,38 @@ impl ToolSearchTool {
                 .unwrap_or(std::cmp::Ordering::Equal)
                 .then_with(|| a.name.cmp(&b.name))
         });
+
+        if let Some(semantic) = semantic.filter(|s| !s.is_empty()) {
+            return self.fuse(&hits, semantic, limit);
+        }
+
         hits.truncate(limit.min(MAX_HITS));
         hits
+    }
+
+    /// Fuse the lexical and semantic rankings, then rebuild hits in fused order.
+    ///
+    /// A tool only the vector path found has no BM25F score, so it enters with the
+    /// fused rank as its score — the score field exists to order the list, and
+    /// after fusion the fused order *is* the answer.
+    fn fuse(&self, lexical: &[Hit], semantic: &[&str], limit: usize) -> Vec<Hit> {
+        let lex: Vec<&str> = lexical.iter().map(|h| h.name.as_str()).collect();
+        let fused = semantic::rrf_fuse(&lex, &semantic.to_vec());
+
+        let total = fused.len() as f64;
+        fused
+            .iter()
+            .enumerate()
+            .filter_map(|(rank, name)| {
+                let tool = self.index.tools.iter().find(|t| &t.name == name)?;
+                Some(Hit {
+                    name: tool.name.clone(),
+                    description: tool.summary.clone(),
+                    score: total - rank as f64,
+                })
+            })
+            .take(limit.min(MAX_HITS))
+            .collect()
     }
 }
 
@@ -588,7 +724,11 @@ impl Tool for ToolSearchTool {
             .map(|n| n as usize)
             .unwrap_or(MAX_HITS);
 
-        let hits = self.search(query, limit);
+        let semantic = self.semantic_ranking(query).await;
+        let semantic_refs: Option<Vec<&str>> = semantic
+            .as_ref()
+            .map(|v| v.iter().map(String::as_str).collect());
+        let hits = self.search_fused(query, limit, semantic_refs.as_deref());
         if hits.is_empty() {
             return ToolOutcome::ok(format!(
                 "No tools matched \"{query}\". {total} deferred tool{plural} remain unloaded — \
@@ -615,6 +755,8 @@ impl Tool for ToolSearchTool {
         ToolOutcome::ok(out)
     }
 }
+
+pub mod semantic;
 
 #[cfg(test)]
 mod retrieval_tests;

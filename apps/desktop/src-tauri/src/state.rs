@@ -2096,10 +2096,20 @@ impl AppState {
         // tokens to advertise nothing.
         let index = ff_tools::ToolSearchIndex::from_registry(&reg);
         if !index.is_empty() {
-            reg.register(Box::new(ff_tools::ToolSearchTool::new(
-                self.tool_search.clone(),
-                index,
-            )));
+            let mut tool = ff_tools::ToolSearchTool::new(self.tool_search.clone(), index);
+            // Phase 2B (#1138): semantic recall, fused with BM25F. Opt-in with the
+            // rest of embeddings, and fail-soft — an unreachable server leaves the
+            // Phase 2A lexical ranking untouched.
+            if let Some((base, model, key)) = local_embedder_from_env(&memory_config_from_env()) {
+                let embedder = std::sync::Arc::new(ff_memory::OpenAiEmbedder::with_timeout(
+                    base,
+                    model.clone(),
+                    key,
+                    ff_memory::INTERACTIVE_EMBED_TIMEOUT,
+                ));
+                tool = tool.with_embedder(embedder, model);
+            }
+            reg.register(Box::new(tool));
         }
         reg
     }

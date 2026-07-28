@@ -364,3 +364,134 @@ fn first_sentence_truncates_on_a_char_boundary() {
     // Short input is returned whole, with no marker.
     assert_eq!(first_sentence("Short one."), "Short one.");
 }
+
+/// A failing embedder must produce *byte-identical* results to no embedder at all.
+///
+/// The weaker assertion — that results are merely non-empty — would pass even if
+/// the semantic path silently reordered or dropped candidates on failure. Since
+/// embeddings are opt-in, "embedder absent or broken" is the common case, and it
+/// has to be indistinguishable from Phase 2A rather than approximately equal to it.
+#[tokio::test]
+async fn a_broken_embedder_yields_exactly_the_lexical_ranking() {
+    /// Fully dead: neither corpus nor query embeds succeed.
+    struct Dead;
+    impl ff_memory::Embedder for Dead {
+        fn embed_query(&self, _: &str) -> ff_memory::Result<Option<Vec<f32>>> {
+            Ok(None)
+        }
+        fn embed_chunk(&self, _: &str) -> ff_memory::Result<Option<Vec<f32>>> {
+            Ok(None)
+        }
+    }
+
+    /// The nastier case: the corpus warms, then query embeds start failing (the
+    /// server died mid-session, or rate-limited just this call). A half-warm cache
+    /// must not be allowed to rank on its own.
+    struct QueryOnlyFailure;
+    impl ff_memory::Embedder for QueryOnlyFailure {
+        fn embed_query(&self, _: &str) -> ff_memory::Result<Option<Vec<f32>>> {
+            Ok(None)
+        }
+        fn embed_chunk(&self, text: &str) -> ff_memory::Result<Option<Vec<f32>>> {
+            Ok(Some(vec![text.len() as f32, 1.0]))
+        }
+    }
+
+    fn boom() -> ff_memory::MemoryError {
+        ff_memory::MemoryError::Io {
+            path: std::path::PathBuf::from("embed"),
+            source: std::io::Error::other("boom"),
+        }
+    }
+
+    /// An embedder that errors rather than returning `None`.
+    struct Erroring;
+    impl ff_memory::Embedder for Erroring {
+        fn embed_query(&self, _: &str) -> ff_memory::Result<Option<Vec<f32>>> {
+            Err(boom())
+        }
+        fn embed_chunk(&self, _: &str) -> ff_memory::Result<Option<Vec<f32>>> {
+            Err(boom())
+        }
+    }
+
+    let queries = [
+        "deploy",
+        "search code",
+        "run the tests",
+        "read a file",
+        "roll back a bad release",
+    ];
+
+    for q in queries {
+        let baseline = search(&fixture(), "s0", json!({ "query": q })).await;
+
+        for (label, tool) in [
+            ("dead", fixture().with_embedder(Arc::new(Dead), "m")),
+            (
+                "query-only failure",
+                fixture().with_embedder(Arc::new(QueryOnlyFailure), "m"),
+            ),
+            ("erroring", fixture().with_embedder(Arc::new(Erroring), "m")),
+        ] {
+            let got = search(&tool, "s1", json!({ "query": q })).await;
+            assert_eq!(
+                baseline, got,
+                "a {label} embedder must not perturb the lexical ranking for {q:?}"
+            );
+        }
+    }
+}
+
+/// The interactive timeout is short enough that a hung server cannot stall a turn.
+///
+/// Pinned as a bound rather than an exact value: the number may be tuned, but a
+/// regression back to the indexing-path patience would be a real defect, since the
+/// embed sits on the model's critical path.
+#[test]
+fn interactive_embeds_give_up_quickly() {
+    assert!(
+        ff_memory::INTERACTIVE_EMBED_TIMEOUT <= std::time::Duration::from_secs(5),
+        "an interactive embed must not out-wait the user's patience, got {:?}",
+        ff_memory::INTERACTIVE_EMBED_TIMEOUT
+    );
+}
+
+/// A corpus that fails to embed must abandon the semantic path, not rank on a
+/// partial cache.
+///
+/// The dangerous shape is a *partially* warm corpus: if warming half the tools
+/// still enabled the vector path, those few would be the only semantic candidates
+/// and would crowd out better lexical hits — a ranking decided by whichever embeds
+/// happened to succeed. Asserted against the semantic path directly rather than
+/// through the rendered output, because with a small corpus fusion can absorb the
+/// difference and hide the defect.
+#[tokio::test]
+async fn a_corpus_that_will_not_embed_abandons_the_semantic_path() {
+    /// Embeds exactly one tool, then refuses. Mimics a server dying mid-warm.
+    struct OneThenDead(std::sync::atomic::AtomicUsize);
+    impl ff_memory::Embedder for OneThenDead {
+        fn embed_query(&self, _: &str) -> ff_memory::Result<Option<Vec<f32>>> {
+            Ok(Some(vec![1.0, 0.0]))
+        }
+        fn embed_chunk(&self, _: &str) -> ff_memory::Result<Option<Vec<f32>>> {
+            if self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                Ok(Some(vec![1.0, 0.0]))
+            } else {
+                Ok(None)
+            }
+        }
+    }
+
+    let partial = fixture().with_embedder(
+        Arc::new(OneThenDead(std::sync::atomic::AtomicUsize::new(0))),
+        "m",
+    );
+
+    let ranking = partial.semantic_ranking("notes").await;
+
+    assert!(
+        ranking.is_none(),
+        "one embedded tool must not become the whole semantic candidate set, got {ranking:?}"
+    );
+}
