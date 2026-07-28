@@ -182,7 +182,11 @@ async fn no_match_is_a_success_not_an_error() {
         .run_with_session(json!({"query": "zzzz nonexistent"}), Path::new("."), "s1")
         .await;
     assert!(outcome.success, "a miss must not read as a failure");
-    assert!(outcome.content.contains("No additional tools matched"));
+    assert!(outcome.content.contains("No tools matched"));
+    // The message must send the model back for another attempt rather than
+    // settling for what it already has — see
+    // `retrieval_tests::the_empty_result_message_pushes_the_model_to_retry`.
+    assert!(outcome.content.contains("Search again"));
 }
 
 #[tokio::test]

@@ -33,6 +33,125 @@ use crate::registry::{Safety, Tool, ToolOutcome, ToolRegistry};
 /// would let the model undo that in one call. RFC 0024 §5.1 fixes this at 5.
 pub const MAX_HITS: usize = 5;
 
+/// Words carrying no retrieval signal in a tool query.
+///
+/// Without this list a phrase like "why did my build fail" scores tools on
+/// "why"/"did"/"my", and because a long description is mechanically more likely
+/// to contain a common word, verbose tools surface for queries they have nothing
+/// to do with. Measured symptom: a query matched an unrelated tool purely on the
+/// phrase "for a list of".
+const STOP_WORDS: &[&str] = &[
+    "a", "an", "and", "are", "as", "at", "be", "by", "did", "do", "does", "for", "from", "get",
+    "here", "how", "i", "if", "in", "is", "it", "me", "my", "of", "on", "or", "so", "that", "the",
+    "then", "than", "there", "this", "to", "was", "what", "which", "why", "with",
+];
+
+/// Query-side vocabulary bridges.
+///
+/// BM25 can only rank documents containing the query's words, so a query whose
+/// vocabulary appears in no tool's text is unreachable by *any* lexical scorer —
+/// measured cases include "understand how a function works" and "what did I write
+/// today". A table is the cheapest fix available: no dependency, inspectable, and
+/// extendable one line at a time as real misses appear.
+///
+/// Expansion is additive — the original term is always kept — so an entry can
+/// only add recall, never remove it.
+const SYNONYMS: &[(&str, &[&str])] = &[
+    ("understand", &["explore", "explain"]),
+    ("explain", &["explore", "understand"]),
+    ("journal", &["daily", "note"]),
+    ("today", &["daily"]),
+    ("yesterday", &["daily"]),
+    ("notes", &["note", "vault"]),
+    ("docs", &["document", "documentation"]),
+    ("doc", &["document"]),
+    ("repo", &["repository"]),
+    ("repos", &["repository"]),
+    ("codebase", &["code", "source", "repository"]),
+    ("function", &["symbol", "code"]),
+    ("broken", &["failed", "failure"]),
+    ("fail", &["failed", "failure"]),
+    ("fails", &["failed", "failure"]),
+    ("failing", &["failed", "failure"]),
+    ("write", &["append", "create"]),
+    ("wrote", &["append", "create"]),
+    ("make", &["create"]),
+    ("delete", &["remove"]),
+    ("find", &["search"]),
+    ("look", &["search"]),
+    ("logs", &["log"]),
+    ("tests", &["test"]),
+    ("builds", &["build"]),
+    ("tickets", &["ticket"]),
+    ("deploy", &["deployment"]),
+    ("deployments", &["deployment"]),
+];
+
+/// Field weights.
+///
+/// Preserve the original scorer's ordering — a name match beats a description
+/// match beats a schema match — but as *frequency* contributions that IDF and
+/// length normalisation then damp. That damping is the point of the change:
+/// previously a name hit won outright even when the term was too common to mean
+/// anything, so every search-shaped query landed on the one tool whose name
+/// contains "search".
+const W_NAME: f64 = 2.5;
+const W_DESC: f64 = 1.0;
+const W_SCHEMA: f64 = 0.6;
+
+/// BM25 term-frequency saturation and length-normalisation constants. Standard
+/// defaults, deliberately untuned: the corpus is whatever third-party servers
+/// happen to expose, so fitting these to one sample would not generalise.
+const BM25_K1: f64 = 1.2;
+const BM25_B: f64 = 0.75;
+
+/// Split text into scoreable terms: lowercased alphanumeric runs, with stop words
+/// and single characters dropped.
+///
+/// Every non-alphanumeric character separates, so `daily_append`,
+/// `search-tickets` and `daily:append` all yield their parts — a tool's real
+/// capability often lives only in a compound name or an `action` enum value.
+fn terms_of(text: &str) -> Vec<String> {
+    text.split(|c: char| !c.is_alphanumeric())
+        .filter(|t| t.len() > 1)
+        .map(str::to_lowercase)
+        .filter(|t| !STOP_WORDS.contains(&t.as_str()))
+        .collect()
+}
+
+/// Query terms plus their synonym expansions, deduplicated.
+fn expand_query(query: &str) -> Vec<String> {
+    let mut terms = terms_of(query);
+    let mut extra = Vec::new();
+    for term in &terms {
+        if let Some((_, synonyms)) = SYNONYMS.iter().find(|(key, _)| key == term) {
+            extra.extend(synonyms.iter().map(|s| (*s).to_string()));
+        }
+    }
+    for candidate in extra {
+        if !terms.contains(&candidate) {
+            terms.push(candidate);
+        }
+    }
+    terms
+}
+
+/// Build a tool's field-weighted term bag and its weighted length.
+fn build_bag(name: &str, description: &str, schema_keywords: &str) -> (HashMap<String, f64>, f64) {
+    let mut bag: HashMap<String, f64> = HashMap::new();
+    for (text, weight) in [
+        (name, W_NAME),
+        (description, W_DESC),
+        (schema_keywords, W_SCHEMA),
+    ] {
+        for term in terms_of(text) {
+            *bag.entry(term).or_default() += weight;
+        }
+    }
+    let len = bag.values().sum();
+    (bag, len)
+}
+
 /// Per-session set of deferred tools re-admitted by [`ToolSearchTool`].
 ///
 /// Lives in `ff-tools` rather than `ff-agent` because the dependency runs
@@ -93,12 +212,23 @@ pub struct IndexedTool {
     description: String,
     summary: String,
     schema_keywords: String,
+    /// Field-weighted term frequencies, precomputed at index time so a query
+    /// never re-tokenizes the corpus. This is the BM25F pseudo-document: one bag
+    /// whose frequencies already carry the name > description > schema preference
+    /// that IDF and length normalisation then damp.
+    bag: HashMap<String, f64>,
+    /// Sum of `bag`'s weights — this document's length for normalisation.
+    len: f64,
 }
 
 /// The searchable corpus of deferred tools.
 #[derive(Debug, Clone, Default)]
 pub struct ToolSearchIndex {
     tools: Vec<IndexedTool>,
+    /// Per-term document frequency across the corpus, for IDF.
+    doc_freq: HashMap<String, usize>,
+    /// Mean weighted document length, for length normalisation.
+    avg_len: f64,
 }
 
 impl ToolSearchIndex {
@@ -111,14 +241,66 @@ impl ToolSearchIndex {
         let tools = registry
             .iter_tools()
             .filter(|t| t.defer())
-            .map(|t| IndexedTool {
-                name: t.name().to_string(),
-                description: t.description().to_lowercase(),
-                summary: first_sentence(t.description()),
-                schema_keywords: schema_keywords(&t.parameters()),
+            .map(|t| {
+                let name = t.name().to_string();
+                let description = t.description().to_lowercase();
+                let schema_keywords = schema_keywords(&t.parameters());
+                let (bag, len) = build_bag(&name, &description, &schema_keywords);
+                IndexedTool {
+                    name,
+                    description,
+                    summary: first_sentence(t.description()),
+                    schema_keywords,
+                    bag,
+                    len,
+                }
             })
             .collect();
-        Self { tools }
+        Self::from_tools(tools)
+    }
+
+    /// Finish an index by deriving the corpus-wide statistics BM25F needs.
+    fn from_tools(tools: Vec<IndexedTool>) -> Self {
+        let mut doc_freq: HashMap<String, usize> = HashMap::new();
+        for tool in &tools {
+            for term in tool.bag.keys() {
+                *doc_freq.entry(term.clone()).or_default() += 1;
+            }
+        }
+        let avg_len = if tools.is_empty() {
+            0.0
+        } else {
+            tools.iter().map(|t| t.len).sum::<f64>() / tools.len() as f64
+        };
+        Self {
+            tools,
+            doc_freq,
+            avg_len,
+        }
+    }
+
+    /// BM25F relevance of one tool to already-expanded query terms. `0.0` means no
+    /// term matched.
+    fn bm25f(&self, tool: &IndexedTool, terms: &[String]) -> f64 {
+        if terms.is_empty() || self.tools.is_empty() {
+            return 0.0;
+        }
+        let corpus = self.tools.len() as f64;
+        let mut score = 0.0;
+        for term in terms {
+            let freq = tool.bag.get(term).copied().unwrap_or(0.0);
+            if freq <= 0.0 {
+                continue;
+            }
+            let df = self.doc_freq.get(term).copied().unwrap_or(1) as f64;
+            // Probabilistic IDF, +1 smoothed so a term present in every document
+            // contributes a small positive weight rather than zero or negative.
+            let idf = (1.0 + (corpus - df + 0.5) / (df + 0.5)).ln();
+            let norm =
+                BM25_K1 * (1.0 - BM25_B + BM25_B * tool.len / self.avg_len.max(f64::EPSILON));
+            score += idf * (freq * (BM25_K1 + 1.0)) / (freq + norm);
+        }
+        score
     }
 
     pub fn is_empty(&self) -> bool {
@@ -134,7 +316,7 @@ impl ToolSearchIndex {
 struct Hit {
     name: String,
     description: String,
-    score: u32,
+    score: f64,
 }
 
 /// The `tool_search` meta-tool: the only way a deferred tool becomes reachable.
@@ -153,28 +335,60 @@ impl ToolSearchTool {
     }
 
     /// Rank the deferred corpus against `query`, best first.
+    ///
+    /// Two recall paths, in order:
+    ///
+    /// 1. **BM25F** — the primary ranking. IDF stops a term appearing in nearly
+    ///    every tool from deciding the winner, and length normalisation stops a
+    ///    verbose description from out-scoring a precise one.
+    /// 2. **Substring fallback**, run *only* when BM25F matched nothing at all.
+    ///
+    /// The fallback is a floor, not a tie-breaker. BM25F needs a whole-token
+    /// match, so a query whose vocabulary is absent from every tool scores zero
+    /// everywhere and would return an empty list — and empty is the one outcome
+    /// worse than imprecise, because a wrong hit is visible to the model and
+    /// prompts another search whereas nothing at all invites it to give up on a
+    /// capability that is in fact available. That is the "invisible tool" failure
+    /// this whole mechanism exists to avoid.
     fn search(&self, query: &str, limit: usize) -> Vec<Hit> {
-        let terms: Vec<String> = query
-            .to_lowercase()
-            .split(|c: char| !c.is_alphanumeric() && c != '_')
-            .filter(|t| t.len() > 1)
-            .map(str::to_string)
-            .collect();
+        let terms = expand_query(query);
 
         let mut hits: Vec<Hit> = self
             .index
             .tools
             .iter()
             .filter_map(|t| {
-                let score = score_indexed(t, &terms);
-                (score > 0).then(|| Hit {
+                let score = self.index.bm25f(t, &terms);
+                (score > 0.0).then(|| Hit {
                     name: t.name.clone(),
                     description: t.summary.clone(),
                     score,
                 })
             })
             .collect();
-        hits.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| a.name.cmp(&b.name)));
+
+        if hits.is_empty() {
+            hits = self
+                .index
+                .tools
+                .iter()
+                .filter_map(|t| {
+                    let score = score_indexed(t, &terms);
+                    (score > 0).then(|| Hit {
+                        name: t.name.clone(),
+                        description: t.summary.clone(),
+                        score: f64::from(score),
+                    })
+                })
+                .collect();
+        }
+
+        hits.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.name.cmp(&b.name))
+        });
         hits.truncate(limit.min(MAX_HITS));
         hits
     }
@@ -377,8 +591,13 @@ impl Tool for ToolSearchTool {
         let hits = self.search(query, limit);
         if hits.is_empty() {
             return ToolOutcome::ok(format!(
-                "No additional tools matched \"{query}\". Try different words, or \
-                 proceed with the tools you already have."
+                "No tools matched \"{query}\". {total} deferred tool{plural} remain unloaded — \
+                 this does NOT mean the capability is missing, only that these words did not \
+                 match. Retrieval is lexical, so it needs the vocabulary the tool itself uses. \
+                 Search again with a synonym, the underlying concept, or a broader single word \
+                 (e.g. \"deployment\" rather than \"roll back a bad release\").",
+                total = self.index.len(),
+                plural = if self.index.len() == 1 { "" } else { "s" },
             ));
         }
 
@@ -397,5 +616,7 @@ impl Tool for ToolSearchTool {
     }
 }
 
+#[cfg(test)]
+mod retrieval_tests;
 #[cfg(test)]
 mod tests;
