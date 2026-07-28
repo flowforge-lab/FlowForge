@@ -1048,6 +1048,70 @@ fn vision_on_keeps_image_block() {
     );
 }
 
+#[test]
+fn bedrock_attachment_byte_limits_are_pinned() {
+    let provider = BedrockProvider::new(
+        "us-east-2",
+        BedrockCreds::ApiKey {
+            token: "secret".into(),
+        },
+    );
+    let limits = provider.attachment_byte_limits();
+    assert_eq!(limits.document, Some(4_500_000));
+    assert_eq!(limits.image, Some(5_000_000));
+}
+
+#[test]
+fn oversized_document_is_stripped_with_placeholder() {
+    // Regression for #1116: a >4.5 MB document must not reach the Converse
+    // wire as a DocumentBlock (it would 400 every turn). This tests the exact
+    // path chat_stream takes (prepare_bedrock_messages) with the real provider
+    // limits, so neutering the strip in that function turns this test red.
+    let provider = BedrockProvider::new(
+        "us-east-2",
+        BedrockCreds::ApiKey {
+            token: "secret".into(),
+        },
+    )
+    .with_vision(true)
+    .with_documents(true);
+
+    let big = ff_core::Attachment {
+        kind: ff_core::AttachmentKind::Document,
+        media_type: "application/pdf".into(),
+        source: ff_core::AttachmentSource::Inline("aGk=".into()),
+        name: Some("huge.pdf".into()),
+        bytes: 10_800_000, // > 4.5 MB
+    };
+    let req = ChatRequest {
+        messages: vec![ChatMessage::multimodal("user", "analyze this", vec![big])],
+        ..ChatRequest::default()
+    };
+    let (_, messages) = prepare_bedrock_messages(
+        &req,
+        provider.supports_vision(),
+        provider.supports_documents(),
+        provider.attachment_byte_limits(),
+    );
+    assert_eq!(messages.len(), 1);
+    // No DocumentBlock reaches Converse.
+    assert!(
+        messages[0]
+            .content
+            .iter()
+            .all(|b| !matches!(b, ContentBlock::Document(_))),
+        "oversized document must not be a DocumentBlock"
+    );
+    // A text placeholder is present instead.
+    assert!(
+        messages[0]
+            .content
+            .iter()
+            .any(|b| matches!(b, ContentBlock::Text(t) if t.contains("huge.pdf"))),
+        "placeholder text should name the stripped file"
+    );
+}
+
 fn tool_use_block(id: &str, name: &str) -> ContentBlock {
     ContentBlock::ToolUse(
         ToolUseBlock::builder()
@@ -1515,7 +1579,15 @@ fn single_assistant_repair_excludes_cache_point_in_bedrock_path() {
         cache_messages: true,
         ..ChatRequest::default()
     };
-    let (_system, messages) = prepare_bedrock_messages(&req, false, false);
+    let (_system, messages) = prepare_bedrock_messages(
+        &req,
+        false,
+        false,
+        crate::AttachmentByteLimits {
+            image: None,
+            document: None,
+        },
+    );
     assert_eq!(messages.len(), 2, "repair appends the nudge");
     assert!(
         !messages.iter().any(|m| m

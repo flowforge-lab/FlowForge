@@ -1651,6 +1651,98 @@ async fn vision_model_does_not_emit_attachments_dropped() {
     );
 }
 
+/// A provider that advertises a 100-byte attachment limit, for the #1116 byte-guard
+/// notice test. Declares full vision+document support so the *capability* strip
+/// never fires; only the byte-limit guard should emit.
+struct ByteLimitProvider;
+
+#[async_trait]
+impl Provider for ByteLimitProvider {
+    fn supports_vision(&self) -> bool {
+        true
+    }
+
+    fn supports_documents(&self) -> bool {
+        true
+    }
+
+    fn attachment_byte_limits(&self) -> ff_llm::AttachmentByteLimits {
+        ff_llm::AttachmentByteLimits {
+            document: Some(100),
+            image: Some(100),
+        }
+    }
+
+    async fn chat_stream(&self, _req: ChatRequest) -> Result<ChunkStream, LlmError> {
+        Ok(futures_util::stream::iter(vec![Ok(Chunk {
+            delta: "ok".into(),
+            done: true,
+            ..Chunk::default()
+        })])
+        .boxed())
+    }
+}
+
+fn oversized_attachment() -> Vec<ff_core::Attachment> {
+    vec![ff_core::Attachment {
+        kind: ff_core::AttachmentKind::Document,
+        media_type: "application/pdf".into(),
+        source: ff_core::AttachmentSource::Inline("aGk=".into()),
+        name: Some("big.pdf".into()),
+        bytes: 1_000_000, // > 100-byte limit
+    }]
+}
+
+#[tokio::test]
+async fn oversized_attachment_emits_attachments_dropped_with_reason() {
+    let store = SessionStore::new();
+    let s = store.create_session(None);
+    store.add_message_with_attachments(
+        &s.id,
+        Role::User,
+        "read this".into(),
+        oversized_attachment(),
+    );
+    let registry = ToolRegistry::new();
+    let root = std::env::current_dir().unwrap();
+    let approve = AlwaysApprove;
+
+    let mut events: Vec<AgentEvent> = Vec::new();
+    run_turn(
+        &ByteLimitProvider,
+        &store,
+        &ctx(&registry, &root, &approve),
+        &s.id,
+        "mock",
+        None,
+        false,
+        ReasoningVisibility::All,
+        CancelToken::new(),
+        |ev| {
+            if matches!(ev, AgentEvent::AttachmentsDropped { .. }) {
+                events.push(ev);
+            }
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        events.len(),
+        1,
+        "exactly one AttachmentsDropped event should fire on first iteration"
+    );
+    if let AgentEvent::AttachmentsDropped { count, reason, .. } = &events[0] {
+        assert_eq!(*count, 1);
+        assert!(
+            reason.as_ref().is_some_and(|r| r.contains("size limit")),
+            "reason should mention size limit: {reason:?}"
+        );
+    } else {
+        panic!("expected AttachmentsDropped, got {:?}", events[0]);
+    }
+}
+
 /// Test provider that resolves to a *local* [`ProviderKind`] (Ollama) and
 /// returns a single text chunk. Used by the #888 tests to prove the
 /// `egress=local-only`-but-cloud notice stays silent when the inference path

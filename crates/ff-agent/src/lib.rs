@@ -367,17 +367,22 @@ pub enum AgentEvent {
         writes: u32,
     },
     /// One or more attachments on the user's turn were dropped before the request
-    /// because the active model can't carry their kind (#338). The per-provider
-    /// capability strip is otherwise silent; this turns the drop into a visible
-    /// notice. Emitted once per turn (first iteration only), keyed to that turn's
-    /// assistant message. As of the #338 follow-up documents are universally
-    /// supported (Bedrock `DocumentBlock` + OpenAI/Ollama extraction fallback), so
-    /// in the host path the only kind that can drop is images — a non-vision
-    /// model. The agent logic stays general (counts per unsupported kind) so a
-    /// future provider that drops documents needs no change here.
+    /// because the active model can't carry their kind (#338) or because they
+    /// exceed the provider's byte limit (#1116). The per-provider strip is
+    /// otherwise silent; this turns the drop into a visible notice. Emitted once
+    /// per turn (first iteration only), keyed to that turn's assistant message.
+    /// As of the #338 follow-up documents are universally supported (Bedrock
+    /// `DocumentBlock` + OpenAI/Ollama extraction fallback), so in the host path
+    /// the only kind that can drop is images — a non-vision model. The agent
+    /// logic stays general (counts per unsupported kind) so a future provider
+    /// that drops documents needs no change here.
     AttachmentsDropped {
         message_id: String,
         count: u32,
+        /// When present, names the reason (e.g. "exceeds provider 4.5 MB limit")
+        /// so the host can render a more specific notice (#1116).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
     },
     /// A live chunk of a running tool's output (#680), emitted as it is produced —
     /// before (and additive to) the final [`AgentEvent::ToolCallFinished`]. Only
@@ -1809,7 +1814,43 @@ pub async fn run_turn(
                     on_event(AgentEvent::AttachmentsDropped {
                         message_id: message_id.clone(),
                         count,
+                        reason: None,
                     });
+                }
+            }
+        }
+
+        // Byte-limit guard notice (#1116): attachments that exceed the provider's
+        // per-document or per-image cap are stripped by the provider layer, but
+        // the agent emits a visible event so the user knows why. Scanned across
+        // the full history so already-stuck sessions (the offending attachment
+        // replayed every turn) also get notified. First-iteration gating matches
+        // the [`AttachmentsDropped`] convention above.
+        if iter == 0 {
+            let limits = provider.attachment_byte_limits();
+            if limits.is_active() {
+                let mut oversized = 0usize;
+                for m in &history {
+                    if let Some(ref atts) = m.attachments {
+                        for a in atts {
+                            let limit = match a.kind {
+                                AttachmentKind::Image => limits.image,
+                                AttachmentKind::Document => limits.document,
+                            };
+                            if limit.is_some_and(|l| a.bytes > l) {
+                                oversized += 1;
+                            }
+                        }
+                    }
+                }
+                if let Ok(count) = u32::try_from(oversized) {
+                    if count > 0 {
+                        on_event(AgentEvent::AttachmentsDropped {
+                            message_id: message_id.clone(),
+                            count,
+                            reason: Some("exceeds provider size limit".into()),
+                        });
+                    }
                 }
             }
         }

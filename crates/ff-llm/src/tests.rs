@@ -653,3 +653,142 @@ async fn error_for_status_with_body_truncates_oversized_body() {
         other => panic!("expected Api 400, got {other:?}"),
     }
 }
+
+// --- strip_oversized_attachments (#1116) ---
+
+#[test]
+fn strip_oversized_attachments_borrows_when_no_limits() {
+    let msg = ChatMessage::multimodal("user", "hi", vec![img_attachment()]);
+    let (out, count) =
+        strip_oversized_attachments(std::slice::from_ref(&msg), AttachmentByteLimits::default());
+    assert_eq!(count, 0);
+    assert!(matches!(out, std::borrow::Cow::Borrowed(_)));
+    assert_eq!(out[0].attachments.len(), 1);
+}
+
+#[test]
+fn strip_oversized_attachments_removes_oversized_doc() {
+    let big = ff_core::Attachment {
+        kind: ff_core::AttachmentKind::Document,
+        media_type: "application/pdf".into(),
+        source: ff_core::AttachmentSource::Inline("aGk=".into()),
+        name: Some("big.pdf".into()),
+        bytes: 10_000_000, // > 4.5 MB
+    };
+    let msg = ChatMessage::multimodal("user", "see this", vec![big]);
+    let (out, count) = strip_oversized_attachments(
+        std::slice::from_ref(&msg),
+        AttachmentByteLimits {
+            document: Some(4_500_000),
+            image: None,
+        },
+    );
+    assert_eq!(count, 1);
+    assert!(out[0].attachments.is_empty());
+    let content = out[0].content.as_ref().unwrap();
+    assert!(
+        content.contains("big.pdf"),
+        "placeholder should name the file: {content}"
+    );
+    assert!(
+        content.contains("exceeds provider"),
+        "placeholder should cite the limit: {content}"
+    );
+}
+
+#[test]
+fn strip_oversized_attachments_leaves_small_attachments() {
+    let small = ff_core::Attachment {
+        kind: ff_core::AttachmentKind::Image,
+        media_type: "image/png".into(),
+        source: ff_core::AttachmentSource::Inline("aGk=".into()),
+        name: Some("small.png".into()),
+        bytes: 100,
+    };
+    let msg = ChatMessage::multimodal("user", "hi", vec![small]);
+    let (out, count) = strip_oversized_attachments(
+        std::slice::from_ref(&msg),
+        AttachmentByteLimits {
+            document: None,
+            image: Some(5_000_000),
+        },
+    );
+    assert_eq!(count, 0);
+    assert_eq!(out[0].attachments.len(), 1);
+}
+
+#[test]
+fn strip_oversized_attachments_mixed_partial_strip() {
+    let big = ff_core::Attachment {
+        kind: ff_core::AttachmentKind::Document,
+        media_type: "application/pdf".into(),
+        source: ff_core::AttachmentSource::Inline("aGk=".into()),
+        name: Some("big.pdf".into()),
+        bytes: 10_000_000,
+    };
+    let small = ff_core::Attachment {
+        kind: ff_core::AttachmentKind::Image,
+        media_type: "image/png".into(),
+        source: ff_core::AttachmentSource::Inline("aGk=".into()),
+        name: Some("small.png".into()),
+        bytes: 100,
+    };
+    let msg = ChatMessage::multimodal("user", "see these", vec![big, small]);
+    let (out, count) = strip_oversized_attachments(
+        std::slice::from_ref(&msg),
+        AttachmentByteLimits {
+            document: Some(4_500_000),
+            image: Some(5_000_000),
+        },
+    );
+    assert_eq!(count, 1);
+    assert_eq!(out[0].attachments.len(), 1);
+    assert_eq!(out[0].attachments[0].name, Some("small.png".into()));
+}
+
+#[test]
+fn strip_oversized_attachments_appends_to_existing_content() {
+    let big = ff_core::Attachment {
+        kind: ff_core::AttachmentKind::Document,
+        media_type: "application/pdf".into(),
+        source: ff_core::AttachmentSource::Inline("aGk=".into()),
+        name: Some("big.pdf".into()),
+        bytes: 10_000_000,
+    };
+    let msg = ChatMessage::multimodal("user", "original text", vec![big]);
+    let (out, _count) = strip_oversized_attachments(
+        std::slice::from_ref(&msg),
+        AttachmentByteLimits {
+            document: Some(4_500_000),
+            image: None,
+        },
+    );
+    let content = out[0].content.as_ref().unwrap();
+    assert!(content.starts_with("original text\n"));
+    assert!(content.contains("big.pdf"));
+}
+
+#[test]
+fn strip_oversized_attachments_placeholder_when_empty_content() {
+    let big = ff_core::Attachment {
+        kind: ff_core::AttachmentKind::Document,
+        media_type: "application/pdf".into(),
+        source: ff_core::AttachmentSource::Inline("aGk=".into()),
+        name: Some("big.pdf".into()),
+        bytes: 10_000_000,
+    };
+    let mut msg = ChatMessage::multimodal("user", "", vec![big]);
+    msg.content = None;
+    let (out, _count) = strip_oversized_attachments(
+        std::slice::from_ref(&msg),
+        AttachmentByteLimits {
+            document: Some(4_500_000),
+            image: None,
+        },
+    );
+    let content = out[0].content.as_ref().unwrap();
+    assert!(
+        content.starts_with("[attachment"),
+        "placeholder should be the entire content when original is empty: {content}"
+    );
+}

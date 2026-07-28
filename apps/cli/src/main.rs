@@ -879,15 +879,22 @@ fn render_event_text(event: AgentEvent) {
                 if writes == 1 { "" } else { "s" }
             );
         }
-        AgentEvent::AttachmentsDropped { count, .. } => {
-            // Documents are universally supported as of the #338 follow-up
-            // (Bedrock `DocumentBlock`; OpenAI/Ollama extraction fallback), so
-            // the only kind that can be dropped in the host path is images —
-            // name it specifically rather than the opaque "that attachment kind".
-            eprintln!(
-                "\n[attachments] {count} image{} not sent -- this model cannot see images.",
-                if count == 1 { "" } else { "s" }
-            );
+        AgentEvent::AttachmentsDropped { count, reason, .. } => {
+            if let Some(reason) = reason {
+                eprintln!(
+                    "\n[attachments] {count} attachment{} omitted: {reason}.",
+                    if count == 1 { "" } else { "s" }
+                );
+            } else {
+                // Documents are universally supported as of the #338 follow-up
+                // (Bedrock `DocumentBlock`; OpenAI/Ollama extraction fallback), so
+                // the only kind that can be dropped in the host path is images —
+                // name it specifically rather than the opaque "that attachment kind".
+                eprintln!(
+                    "\n[attachments] {count} image{} not sent -- this model cannot see images.",
+                    if count == 1 { "" } else { "s" }
+                );
+            }
         }
         AgentEvent::EgressMismatch { kind, model, .. } => {
             // LocalOnly-but-cloud-inference notice (#888). The user asked for a
