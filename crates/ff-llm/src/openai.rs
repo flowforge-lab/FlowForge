@@ -424,6 +424,7 @@ impl Provider for OpenAiProvider {
         } else {
             stripped.into_owned()
         };
+        let messages = crate::enforce_user_terminated(messages);
         let dialect = self.dialect;
         let wire_messages: Vec<serde_json::Value> = messages
             .iter()

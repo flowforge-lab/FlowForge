@@ -600,6 +600,73 @@ fn cache_messages_false_leaves_messages_unmarked() {
     }
 }
 
+// --- #1123: assistant-terminated conversation repair ---------------------
+
+#[test]
+fn observer_wake_conversation_is_repaired_end_to_end() {
+    let req = ChatRequest {
+        model: "claude-test".into(),
+        messages: vec![
+            ChatMessage::text("system", "[Observer \"watched-txt\"]: file changed"),
+            ChatMessage::text("user", "watch that file"),
+            ChatMessage::text("assistant", "observer started"),
+            ChatMessage::text("assistant", "checking the log"),
+        ],
+        tools: vec![],
+        thinking: false,
+        max_tokens: None,
+        cache_messages: false,
+    };
+    let body = to_anthropic_request(&req, 4096, ReasoningEffort::Medium);
+    let messages = body.get("messages").unwrap().as_array().unwrap();
+    assert_eq!(messages.last().unwrap().get("role").unwrap(), "user");
+    let content = messages
+        .last()
+        .unwrap()
+        .get("content")
+        .unwrap()
+        .as_array()
+        .unwrap();
+    assert_eq!(content[0].get("text").unwrap(), "Continue.");
+}
+
+#[test]
+fn cache_prefix_excludes_the_synthesized_nudge() {
+    let req = ChatRequest {
+        model: "claude-test".into(),
+        messages: vec![
+            ChatMessage::text("user", "watch that file"),
+            ChatMessage::text("assistant", "observer started"),
+            ChatMessage::text("user", "and report"),
+            ChatMessage::text("assistant", "will do"),
+        ],
+        tools: vec![],
+        thinking: false,
+        max_tokens: None,
+        cache_messages: true,
+    };
+    let body = to_anthropic_request(&req, 4096, ReasoningEffort::Medium);
+    let messages = body.get("messages").unwrap().as_array().unwrap();
+    let nudge = messages.len() - 1;
+    assert_eq!(messages[nudge].get("role").unwrap(), "user");
+    let nudge_content = messages[nudge].get("content").unwrap().as_array().unwrap();
+    assert_eq!(nudge_content[0].get("text").unwrap(), "Continue.");
+    assert!(
+        nudge_content[0].get("cache_control").is_none(),
+        "volatile nudge must not carry cache point"
+    );
+
+    let before = messages[nudge - 1]
+        .get("content")
+        .unwrap()
+        .as_array()
+        .unwrap();
+    assert!(
+        before.last().unwrap().get("cache_control").is_some(),
+        "breakpoint should sit on message before nudge"
+    );
+}
+
 // --- creds --------------------------------------------------------------
 
 #[test]

@@ -542,6 +542,7 @@ impl Provider for OllamaProvider {
         } else {
             stripped.into_owned()
         };
+        let messages = crate::enforce_user_terminated(messages);
         let mut body = serde_json::json!({
             "model": req.model,
             "messages": ollama_messages(&messages)?,
