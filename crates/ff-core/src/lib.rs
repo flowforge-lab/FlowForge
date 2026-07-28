@@ -39,8 +39,9 @@ pub use model_specs::{
     DEFAULT_CONTEXT_WINDOW_TOKENS,
 };
 pub use permission::{
-    PermissionCell, PermissionMatrix, PermissionMatrixEntry, PermissionMatrixView,
-    PermissionOverrideEntry, PermissionRule, RuleEffect, Safety,
+    pre_prompt_decision, PermissionCell, PermissionMatrix, PermissionMatrixEntry,
+    PermissionMatrixView, PermissionOverrideEntry, PermissionRule, PrePromptDecision, RuleEffect,
+    Safety,
 };
 pub use provider::{
     model_supports_documents, model_supports_vision, BedrockAuth, ConnectionId,

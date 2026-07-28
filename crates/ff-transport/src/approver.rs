@@ -15,6 +15,25 @@ use ff_tools::Safety;
 ///   messaging is unattended, we auto-approve Sensitive (the user opted in by
 ///   sending a message). This is intentional.
 /// - **Plan mode**: only Read is allowed (everything else denied).
+///
+/// # This policy ignores the permission matrix
+///
+/// The decision above is derived from `mode` and `safety` alone. It never calls
+/// [`ff_core::PermissionMatrix::effective_cell`], so for a messaging-triggered
+/// agent the user's configured Deny cells, allowlist, and scoped rules have **no
+/// effect**. A tool the user explicitly denied in the control panel still runs
+/// here if this policy's coarse `mode`/`safety` check happens to allow it.
+///
+/// That is safe only because the policy is strictly more conservative than the
+/// matrix in the tiers that matter (Plan allows nothing but reads; Publish and
+/// Dangerous are always denied) — it under-approves rather than over-approves.
+/// It is still a divergence, and a Deny cell that silently does nothing is the
+/// kind of gap that reads as a bug when someone finds it from the other side.
+///
+/// #1059 replaces this for Slack with an interactive approver that runs the real
+/// gate ([`ff_core::pre_prompt_decision`]) and asks the channel on an `Ask` cell.
+/// Transports without an interactive surface keep using this type; anything that
+/// grows one should prefer the shared gate over extending this match.
 pub struct MessagingApprover {
     mode: Mode,
 }
