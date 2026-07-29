@@ -738,3 +738,281 @@ async fn a_hopeless_corpus_stops_retrying_after_the_budget() {
         super::MAX_WARM_ATTEMPTS + 3
     );
 }
+
+/// A counting embedder over a shared tally, so a test can assert how much embedding
+/// a launch paid for.
+struct CountingEmbedder(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+impl ff_memory::Embedder for CountingEmbedder {
+    fn embed_query(&self, _: &str) -> ff_memory::Result<Option<Vec<f32>>> {
+        Ok(Some(vec![1.0, 0.0]))
+    }
+    fn embed_chunk(&self, _: &str) -> ff_memory::Result<Option<Vec<f32>>> {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(Some(vec![1.0, 0.0]))
+    }
+}
+
+fn counting() -> (
+    std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    impl Fn() -> Arc<dyn ff_memory::Embedder>,
+) {
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let c = std::sync::Arc::clone(&calls);
+    (calls, move || {
+        Arc::new(CountingEmbedder(std::sync::Arc::clone(&c))) as Arc<dyn ff_memory::Embedder>
+    })
+}
+
+/// Simulate a process restart: a brand-new state, same cache file.
+fn relaunch(path: &Path) -> Arc<ToolSearchState> {
+    Arc::new(ToolSearchState::new().with_cache_path(path))
+}
+
+/// The point of #1138 step 5: an embed computed once survives a restart.
+///
+/// Without persistence every launch re-embeds the whole deferred corpus before
+/// semantic recall contributes anything, so this asserts the second launch spends
+/// *nothing* — not merely less.
+#[tokio::test]
+async fn a_relaunch_rides_the_persisted_cache() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("tool_embeddings.json");
+    let (calls, embedder) = counting();
+
+    let first = fixture_sharing(relaunch(&path)).with_embedder(embedder(), "m");
+    assert!(first.semantic_ranking("notes").await.is_some());
+    let warmed = calls.load(std::sync::atomic::Ordering::SeqCst);
+    assert!(warmed > 0, "the first launch must warm the corpus");
+    assert!(path.exists(), "a warm must leave a cache file behind");
+
+    let second = fixture_sharing(relaunch(&path)).with_embedder(embedder(), "m");
+    assert!(second.semantic_ranking("notes").await.is_some());
+
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        warmed,
+        "the corpus was re-embedded after a relaunch: the persisted cache bought nothing"
+    );
+}
+
+/// A snapshot from another model must be discarded wholesale, not adopted in part.
+///
+/// This is the most important test in step 5. `CorpusVectors::len` counts entries
+/// regardless of model while `get` filters by it, so a corpus holding the *previous*
+/// model's vectors satisfies the warm gate — "complete, do not re-embed" — while
+/// every lookup misses. Semantic ranking then returns nothing, silently, and looks
+/// exactly like a healthy setup from outside.
+#[tokio::test]
+async fn a_model_switch_discards_the_persisted_cache() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("tool_embeddings.json");
+    let (calls, embedder) = counting();
+
+    let first = fixture_sharing(relaunch(&path)).with_embedder(embedder(), "old-model");
+    assert!(first.semantic_ranking("notes").await.is_some());
+    let warmed = calls.load(std::sync::atomic::Ordering::SeqCst);
+    assert!(warmed > 0);
+
+    // Relaunch under a different embedding model against the same file.
+    let second = fixture_sharing(relaunch(&path)).with_embedder(embedder(), "new-model");
+    assert!(
+        second.semantic_ranking("notes").await.is_some(),
+        "a model switch must re-embed and still rank, not silently return nothing"
+    );
+
+    assert!(
+        calls.load(std::sync::atomic::Ordering::SeqCst) >= warmed * 2,
+        "the new model reused the old model's vectors: {} calls for two full corpora of \
+         {warmed}. Vectors from different models are not comparable, and a corpus that \
+         claims to be complete while every lookup misses kills semantic recall silently",
+        calls.load(std::sync::atomic::Ordering::SeqCst)
+    );
+}
+
+/// A corrupt cache must be indistinguishable from a cold start.
+///
+/// The file is derived data, so the only correct response to garbage is to drop it
+/// and re-embed. Panicking here would take down a launch over a throwaway cache.
+#[tokio::test]
+async fn a_corrupt_cache_starts_cold_instead_of_failing() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("tool_embeddings.json");
+    std::fs::write(&path, b"{\"model\": \"m\", \"vectors\": {tru").unwrap();
+    let (calls, embedder) = counting();
+
+    let tool = fixture_sharing(relaunch(&path)).with_embedder(embedder(), "m");
+    assert!(
+        tool.semantic_ranking("notes").await.is_some(),
+        "a corrupt cache must degrade to a cold start, not disable semantic recall"
+    );
+    assert!(
+        calls.load(std::sync::atomic::Ordering::SeqCst) > 0,
+        "a corrupt cache must be re-embedded"
+    );
+}
+
+/// Deleting the file is a supported operation — it *is* the cache-clear gesture —
+/// and must cost only the re-embed, never correctness.
+#[tokio::test]
+async fn deleting_the_cache_is_safe() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("tool_embeddings.json");
+    let (calls, embedder) = counting();
+
+    let first = fixture_sharing(relaunch(&path)).with_embedder(embedder(), "m");
+    assert!(first.semantic_ranking("notes").await.is_some());
+    let warmed = calls.load(std::sync::atomic::Ordering::SeqCst);
+
+    std::fs::remove_file(&path).unwrap();
+
+    let second = fixture_sharing(relaunch(&path)).with_embedder(embedder(), "m");
+    assert!(
+        second.semantic_ranking("notes").await.is_some(),
+        "a deleted cache must rebuild, not break recall"
+    );
+    assert!(
+        calls.load(std::sync::atomic::Ordering::SeqCst) > warmed,
+        "a deleted cache must be re-embedded"
+    );
+}
+
+/// The whole semantic layer is additive: with no cache path configured, behaviour is
+/// byte-for-byte what it was before step 5 existed.
+#[tokio::test]
+async fn no_cache_path_keeps_the_in_process_behaviour() {
+    let (calls, embedder) = counting();
+    let state = Arc::new(ToolSearchState::new());
+
+    let first = fixture_sharing(Arc::clone(&state)).with_embedder(embedder(), "m");
+    let ranked = first.semantic_ranking("notes").await;
+    assert!(ranked.is_some());
+    let warmed = calls.load(std::sync::atomic::Ordering::SeqCst);
+
+    let second = fixture_sharing(Arc::clone(&state)).with_embedder(embedder(), "m");
+    assert_eq!(
+        second.semantic_ranking("notes").await,
+        ranked,
+        "ranking must not depend on whether a cache file is configured"
+    );
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        warmed,
+        "the in-process cache must still work without a path"
+    );
+}
+
+/// A warm that embedded nothing must not rewrite the file.
+///
+/// A dead embedder still enters the warm branch until the budget runs out, so
+/// without the "did this warm produce anything" guard each launch rewrites an
+/// identical snapshot `MAX_WARM_ATTEMPTS` times — disk writes on the model's
+/// critical path that cannot, by construction, have changed the contents.
+#[tokio::test]
+async fn a_fruitless_warm_leaves_the_file_alone() {
+    struct Dead;
+    impl ff_memory::Embedder for Dead {
+        fn embed_query(&self, _: &str) -> ff_memory::Result<Option<Vec<f32>>> {
+            Ok(Some(vec![1.0, 0.0]))
+        }
+        fn embed_chunk(&self, _: &str) -> ff_memory::Result<Option<Vec<f32>>> {
+            Ok(None)
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("tool_embeddings.json");
+    // A pre-existing snapshot for this model. Its *contents* after a fruitless warm
+    // would be byte-identical, so assert on the write itself via mtime — content
+    // equality cannot distinguish "left alone" from "rewritten with the same bytes".
+    std::fs::write(&path, br#"{"model":"m","vectors":{"deadbeef":[1.0,0.0]}}"#).unwrap();
+    // Pin mtime to the past: coarse filesystem timestamps would otherwise hide a
+    // rewrite that lands within the same tick as the setup write.
+    filetime::set_file_mtime(&path, filetime::FileTime::from_unix_time(1_000_000, 0)).unwrap();
+    let before = std::fs::metadata(&path).unwrap().modified().unwrap();
+
+    let state = Arc::new(ToolSearchState::new().with_cache_path(&path));
+    for _ in 0..super::MAX_WARM_ATTEMPTS + 2 {
+        let tool = fixture_sharing(Arc::clone(&state)).with_embedder(Arc::new(Dead), "m");
+        let _ = tool.semantic_ranking("notes").await;
+    }
+
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().modified().unwrap(),
+        before,
+        "a warm that embedded nothing rewrote the cache file"
+    );
+}
+
+/// The durable cache is read once per process, not once per turn.
+///
+/// `with_embedder` runs on every registry rebuild, so re-reading there would trade
+/// the per-turn embed tax #1140 removed for a per-turn disk read — and worse, it
+/// would *overwrite* the in-process corpus with the file's contents. If the file is
+/// gone or stale relative to memory, that discards vectors this process already
+/// paid for and re-embeds the corpus on every single turn.
+#[tokio::test]
+async fn the_durable_cache_is_read_once_per_process() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("tool_embeddings.json");
+    let (calls, embedder) = counting();
+    let state = Arc::new(ToolSearchState::new().with_cache_path(&path));
+
+    let first = fixture_sharing(Arc::clone(&state)).with_embedder(embedder(), "m");
+    assert!(first.semantic_ranking("notes").await.is_some());
+    let warmed = calls.load(std::sync::atomic::Ordering::SeqCst);
+    assert!(warmed > 0);
+
+    // The file vanishes under a live process (a user clearing the cache, say). The
+    // in-process corpus is still valid and must keep serving it.
+    std::fs::remove_file(&path).unwrap();
+
+    for _ in 0..3 {
+        let next = fixture_sharing(Arc::clone(&state)).with_embedder(embedder(), "m");
+        assert!(next.semantic_ranking("notes").await.is_some());
+    }
+
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        warmed,
+        "the corpus was re-embedded after the cache file disappeared: re-reading the \
+         file per turn discards vectors this process already paid for"
+    );
+}
+
+/// Switching models mid-process must re-consult the file, not stay cold.
+///
+/// The read-once guard is keyed to the process, but a model switch invalidates what
+/// was read. If an earlier process persisted vectors for the model being switched
+/// *to*, they are usable and must be picked up; leaving the guard set would re-embed
+/// a corpus that is already on disk.
+#[tokio::test]
+async fn switching_models_reconsults_the_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("tool_embeddings.json");
+    let (calls, embedder) = counting();
+
+    // An earlier process warmed model "b" and left its snapshot behind.
+    let earlier = fixture_sharing(relaunch(&path)).with_embedder(embedder(), "b");
+    assert!(earlier.semantic_ranking("notes").await.is_some());
+    let warmed = calls.load(std::sync::atomic::Ordering::SeqCst);
+    assert!(warmed > 0);
+
+    // A new process starts on "a", which mismatches the file and so loads nothing.
+    // No search runs here on purpose: a warm under "a" would persist "a" and clobber
+    // "b"'s snapshot, which is correct for a single-slot cache but would make the
+    // switch unobservable.
+    let state = Arc::new(ToolSearchState::new().with_cache_path(&path));
+    let _on_a = fixture_sharing(Arc::clone(&state)).with_embedder(embedder(), "a");
+    let after_a = calls.load(std::sync::atomic::Ordering::SeqCst);
+
+    let on_b = fixture_sharing(Arc::clone(&state)).with_embedder(embedder(), "b");
+    assert!(on_b.semantic_ranking("notes").await.is_some());
+
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        after_a,
+        "switching back to a model whose vectors are already on disk re-embedded the \
+         corpus: the read-once guard was not reset by the model switch"
+    );
+}

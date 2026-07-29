@@ -68,7 +68,7 @@ pub struct CorpusVectors {
     /// Which model produced these vectors. A change invalidates all of them.
     model: String,
     /// `content_hash -> vector`.
-    by_hash: HashMap<u64, Vec<f32>>,
+    by_hash: HashMap<String, Vec<f32>>,
 }
 
 impl CorpusVectors {
@@ -88,6 +88,20 @@ impl CorpusVectors {
 
     pub fn insert(&mut self, text: &str, vector: Vec<f32>) {
         self.by_hash.insert(content_hash(text), vector);
+    }
+
+    /// Rebuild from a persisted snapshot (#1138 step 5).
+    ///
+    /// The model travels with the vectors, so a snapshot written by a different
+    /// model stays distinguishable: `get` filters on it and the next
+    /// [`retarget`](Self::retarget) drops it wholesale.
+    pub(crate) fn from_parts(model: String, by_hash: HashMap<String, Vec<f32>>) -> Self {
+        Self { model, by_hash }
+    }
+
+    /// The model these vectors were produced by, and the vectors themselves.
+    pub(crate) fn parts(&self) -> (&str, &HashMap<String, Vec<f32>>) {
+        (&self.model, &self.by_hash)
     }
 
     /// Point the cache at `model`, dropping every vector if it changed.
@@ -125,14 +139,15 @@ impl CorpusVectors {
     }
 }
 
-/// Stable content hash. `DefaultHasher` is not portable across releases, which is
-/// fine while the cache is in-process; the durable form (#1138 step 5) needs a
-/// fixed hash instead.
-fn content_hash(text: &str) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    text.hash(&mut h);
-    h.finish()
+/// Stable content hash, as lowercase hex.
+///
+/// SHA-256 rather than `DefaultHasher` because the cache is persisted (#1138
+/// step 5): `DefaultHasher` carries no cross-release stability guarantee, so a
+/// durable cache keyed on it would silently miss on every entry after a Rust
+/// upgrade — a cold corpus that looks like a warm one.
+fn content_hash(text: &str) -> String {
+    use sha2::{Digest, Sha256};
+    format!("{:x}", Sha256::digest(text.as_bytes()))
 }
 
 /// One ranked list, as `(name, rank)` with rank 0 being best.
