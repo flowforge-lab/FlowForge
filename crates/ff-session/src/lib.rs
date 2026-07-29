@@ -391,6 +391,75 @@ impl SessionStore {
         msgs
     }
 
+    /// Messages surrounding `message_id` in chronological order: up to `before`
+    /// older ones, the anchor itself, then up to `after` newer ones (#1143).
+    ///
+    /// Serves both scrollback (`after = 0`, walking backwards from the oldest
+    /// message currently held) and jumping to a search hit outside the loaded
+    /// window (both bounds non-zero). The anchor is addressed by id rather than
+    /// by `seq` deliberately: `seq` is an internal ordering detail and stays off
+    /// the IPC wire, so it is resolved here. An unknown id yields no rows rather
+    /// than an error — a message deleted between search and navigation is a
+    /// benign race, not a failure.
+    pub fn get_messages_around(
+        &self,
+        session_id: &str,
+        message_id: &str,
+        before: usize,
+        after: usize,
+    ) -> Vec<Message> {
+        let conn = self.conn.lock().unwrap();
+
+        let anchor_seq: Option<i64> = conn
+            .query_row(
+                "SELECT seq FROM messages WHERE id = ?1 AND session_id = ?2",
+                params![message_id, session_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .expect("query anchor seq");
+        let Some(anchor_seq) = anchor_seq else {
+            return Vec::new();
+        };
+
+        // Older half walks backwards off the index, so it must be re-sorted.
+        let mut msgs = if before > 0 {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, session_id, role, content, tool_calls, tool_call_id, attachments, reasoning, stop_reason, author_name, created_at
+                     FROM messages
+                     WHERE session_id = ?1 AND seq < ?2
+                     ORDER BY seq DESC
+                     LIMIT ?3",
+                )
+                .expect("prepare get_messages_around before");
+            let rows = stmt
+                .query_map(params![session_id, anchor_seq, before], row_to_message)
+                .expect("query get_messages_around before");
+            let mut older: Vec<Message> = rows.filter_map(Result::ok).collect();
+            older.reverse();
+            older
+        } else {
+            Vec::new()
+        };
+
+        // The anchor and everything after it are already chronological.
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, session_id, role, content, tool_calls, tool_call_id, attachments, reasoning, stop_reason, author_name, created_at
+                 FROM messages
+                 WHERE session_id = ?1 AND seq >= ?2
+                 ORDER BY seq
+                 LIMIT ?3",
+            )
+            .expect("prepare get_messages_around after");
+        let rows = stmt
+            .query_map(params![session_id, anchor_seq, after + 1], row_to_message)
+            .expect("query get_messages_around after");
+        msgs.extend(rows.filter_map(Result::ok));
+        msgs
+    }
+
     pub fn add_message(&self, session_id: &str, role: Role, content: String) -> Message {
         self.push_message(Message {
             id: new_id(),

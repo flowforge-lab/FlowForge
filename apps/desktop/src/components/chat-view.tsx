@@ -1,4 +1,12 @@
-import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  memo,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { useShallow } from "zustand/react/shallow";
 import { ChevronDown } from "@/components/ui/icon";
 import { cn } from "@/lib/utils";
@@ -48,6 +56,12 @@ const NO_ITEMS: TurnItem[] = [];
 // long yanks a reading user once. This errs toward the yank being impossible
 // and the miss being implausible.
 const FORCE_PIN_WINDOW_MS = 4000; // generous margin over a local IPC round trip
+// Fire the older-history fetch well before the user reaches the top, so the page
+// arrives and is compensated while the join is still off-screen (#1143). Roughly
+// two viewports of runway at typical scroll speeds — close enough to the top that
+// we are not fetching history nobody will look at, far enough that the insertion
+// never happens at the visible edge.
+export const LOAD_OLDER_THRESHOLD_PX = 1200;
 // Stable empty transcript so a not-yet-loaded session keeps a constant `msgs` ref.
 const EMPTY_MESSAGES: Message[] = [];
 
@@ -441,6 +455,15 @@ export function ChatView({ sessionId }: { sessionId?: string } = {}) {
   const streamingId = useChatStore((s) =>
     targetSessionId ? s.streamingBySession[targetSessionId] : undefined,
   );
+  const loadOlderMessages = useChatStore((s) => s.loadOlderMessages);
+  const loadingOlder = useChatStore((s) =>
+    targetSessionId ? s.loadingOlderBySession[targetSessionId] === true : false,
+  );
+  // Absent means "not yet asked", which must not read as "nothing above" or the
+  // very first scroll to the top would be ignored (#1143).
+  const hasMoreOlder = useChatStore((s) =>
+    targetSessionId ? s.hasMoreBySession[targetSessionId] !== false : false,
+  );
   // Pending = the turn is in flight but nothing has streamed yet; show a
   // "thinking" indicator until the first token/tool-call materializes a row.
   const pending = useChatStore((s) =>
@@ -616,6 +639,19 @@ export function ChatView({ sessionId }: { sessionId?: string } = {}) {
   // being in the effect's dependency array.
   const forcePinUntil = useRef(0);
   const armedFirstMessageId = useRef<string | undefined>(undefined);
+  // Message ids we have deliberately prepended past, so the #866 swap detector can
+  // tell "user read upward" from "history was replaced under us".
+  const prependedFirstIds = useRef<Set<string>>(new Set());
+  // Set when a scrollback fetch starts, consumed by the layout effect that
+  // restores the reading position once the older rows commit (#1143).
+  const pendingPrepend = useRef<{
+    anchorId: string;
+    distanceFromBottom: number;
+  } | null>(null);
+  // The scroll node as a ref as well as state: the prepend compensation runs in a
+  // layout effect, and mutating a `useState` value there is (rightly) rejected by
+  // the React Compiler lint — a ref is the sanctioned mutable handle.
+  const scrollElRef = useRef<HTMLDivElement | null>(null);
   const latestMessagesRef = useRef(messages);
   useEffect(() => {
     latestMessagesRef.current = messages;
@@ -645,7 +681,11 @@ export function ChatView({ sessionId }: { sessionId?: string } = {}) {
       // changed) — never on ordinary streaming growth.
       const historySwapped =
         forcePinUntil.current > Date.now() &&
-        latestMessagesRef.current?.[0]?.id !== armedFirstMessageId.current;
+        latestMessagesRef.current?.[0]?.id !== armedFirstMessageId.current &&
+        // A scrollback prepend also changes the first message id, but it is the
+        // opposite intent: the user is reading upward and must not be yanked to
+        // the tail. Only an id we did *not* prepend past counts as a real swap.
+        !prependedFirstIds.current.has(armedFirstMessageId.current ?? "");
       if (!pinnedToBottom.current && !historySwapped) return false;
       if (historySwapped && authoritative) {
         forcePinUntil.current = 0; // consume: one forced settle per arm
@@ -728,6 +768,23 @@ export function ChatView({ sessionId }: { sessionId?: string } = {}) {
   // while `targetSessionId` never changed, so the effect above doesn't re-run
   // either. Pin on the transcript's identity changing as well, through the same
   // `shouldPinToTail` gate; non-authoritative, so it never consumes the arm.
+  //
+  // Restore the reading position after a scrollback prepend, synchronously
+  // between React's DOM commit and the browser's paint. This has to be a layout
+  // effect: doing it in `requestAnimationFrame` lets one uncompensated frame
+  // reach the screen, which is visible as a judder on every page load.
+  useLayoutEffect(() => {
+    const pending = pendingPrepend.current;
+    if (!pending) return;
+    // Only act once the prepended rows are actually in the DOM. Compare against
+    // this render's `messages` rather than `latestMessagesRef`, which is updated
+    // in a passive effect and so still holds the pre-prepend value here.
+    if (messages?.[0]?.id === pending.anchorId) return;
+    pendingPrepend.current = null;
+    const el = scrollElRef.current;
+    if (el) el.scrollTop = el.scrollHeight - pending.distanceFromBottom;
+  }, [messages, scrollEl]);
+
   useEffect(() => {
     if (!scrollEl) return;
     const raf = requestAnimationFrame(() => {
@@ -752,6 +809,30 @@ export function ChatView({ sessionId }: { sessionId?: string } = {}) {
     const pinned = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
     pinnedToBottom.current = pinned;
     setAtBottom(pinned);
+
+    // Approaching the top: pull the page above (#1143). The store guards against
+    // concurrent and past-the-start requests, so this can fire freely on scroll.
+    if (
+      el.scrollTop < LOAD_OLDER_THRESHOLD_PX &&
+      targetSessionId &&
+      hasMoreOlder
+    ) {
+      const anchorId = latestMessagesRef.current?.[0]?.id;
+      if (!anchorId) return;
+      // Suppress the #866 forced pin: prepending changes the first message id,
+      // which `historySwapped` would otherwise read as an armed history swap-in
+      // and yank the view to the bottom — the opposite of reading older history.
+      prependedFirstIds.current.add(anchorId);
+      // Record the distance from the bottom for the layout effect below to
+      // restore. Anchoring on `scrollHeight - scrollTop` rather than `scrollTop`
+      // because the browser's own scroll anchoring may already have moved
+      // scrollTop by the time the new rows commit.
+      pendingPrepend.current = {
+        anchorId,
+        distanceFromBottom: el.scrollHeight - el.scrollTop,
+      };
+      void loadOlderMessages(targetSessionId);
+    }
   }
 
   // Smooth-scroll to the newest content and re-arm sticky autoscroll (#206).
@@ -785,7 +866,10 @@ export function ChatView({ sessionId }: { sessionId?: string } = {}) {
   return (
     <div className="relative flex min-h-0 flex-1 flex-col">
       <div
-        ref={setScrollEl}
+        ref={(node) => {
+          scrollElRef.current = node;
+          setScrollEl(node);
+        }}
         onScroll={handleScroll}
         data-testid="chat-scroll"
         className="min-h-0 flex-1 overflow-y-auto"
@@ -794,6 +878,21 @@ export function ChatView({ sessionId }: { sessionId?: string } = {}) {
           ref={setContentEl}
           className="mx-auto flex max-w-4xl flex-col gap-3 px-4 py-4"
         >
+          {/* Always mounted while more history exists, so appearing and
+              disappearing never changes layout height — a conditional render here
+              shifts the transcript twice per page load, which reads as judder.
+              Only the label's opacity changes. */}
+          {hasMoreOlder && (
+            <div
+              data-testid="loading-older"
+              aria-live="polite"
+              className={`py-2 text-center text-xs text-muted-foreground transition-opacity ${
+                loadingOlder ? "opacity-100" : "opacity-0"
+              }`}
+            >
+              Loading earlier messages…
+            </div>
+          )}
           {groups.map((g) => {
             const m = g.message;
             // foldTurns already resolved each turn's steps (live or reconstructed)

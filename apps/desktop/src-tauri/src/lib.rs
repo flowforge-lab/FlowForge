@@ -373,6 +373,21 @@ fn get_messages(
     }
 }
 
+/// Messages around `message_id` (#1143). Backs scrollback past the loaded window
+/// (`after = 0`) and jumping to a search hit outside it (both bounds non-zero).
+#[tauri::command]
+fn get_messages_around(
+    state: State<'_, Arc<AppState>>,
+    session_id: String,
+    message_id: String,
+    before: usize,
+    after: usize,
+) -> Vec<Message> {
+    state
+        .store
+        .get_messages_around(&session_id, &message_id, before, after)
+}
+
 /// Full-text search across all sessions (#679). Returns ranked hits with snippets.
 #[tauri::command]
 fn search_messages(
@@ -4335,6 +4350,7 @@ pub fn run() {
             create_session,
             list_sessions,
             get_messages,
+            get_messages_around,
             search_messages,
             search_in_session,
             export_session,

@@ -107,6 +107,28 @@ export function FindBar({
         } catch {
           if (cancelled) return;
         }
+        // The hits come from the backend's full FTS index, but occurrences are
+        // built from the loaded array — and #1147 bounded that to the tail. Pull
+        // any hit that falls outside the window first, or it would be silently
+        // dropped here and the user could not navigate to a match the search bar
+        // had just counted (#1143, folding in #1148).
+        {
+          const ensure = useChatStore.getState().ensureMessageLoaded;
+          const held = new Set(
+            (useChatStore.getState().messagesBySession[sessionId] ?? []).map(
+              (m) => m.id,
+            ),
+          );
+          const missing = [
+            ...new Set(
+              hits.map((h) => h.messageId).filter((id) => !held.has(id)),
+            ),
+          ];
+          for (const id of missing) {
+            await ensure(sessionId, id);
+            if (cancelled) return;
+          }
+        }
         const messages =
           useChatStore.getState().messagesBySession[sessionId] ?? [];
         const liveSteps = useChatStore.getState().toolStepsByMessage;

@@ -1733,3 +1733,82 @@ fn pre_existing_v11_database_upgrades_to_lineage() {
     assert_eq!(forked.parent_session_id.as_deref(), Some("old"));
     assert_eq!(forked.fork_point_seq, Some(0));
 }
+
+#[test]
+fn get_messages_around_returns_the_neighbourhood_of_the_anchor() {
+    let store = SessionStore::new();
+    let s = store.create_session(None);
+    let ids: Vec<String> = (0..20)
+        .map(|i| store.add_message(&s.id, Role::User, format!("msg {i}")).id)
+        .collect();
+
+    let around = store.get_messages_around(&s.id, &ids[10], 3, 2);
+    let contents: Vec<&str> = around.iter().map(|m| m.content.as_str()).collect();
+    // Chronological, anchor included exactly once, both bounds honoured.
+    assert_eq!(
+        contents,
+        ["msg 7", "msg 8", "msg 9", "msg 10", "msg 11", "msg 12"]
+    );
+}
+
+#[test]
+fn get_messages_around_is_bounded_and_never_returns_full_history() {
+    let store = SessionStore::new();
+    let s = store.create_session(None);
+    let ids: Vec<String> = (0..500)
+        .map(|i| store.add_message(&s.id, Role::User, format!("msg {i}")).id)
+        .collect();
+
+    let around = store.get_messages_around(&s.id, &ids[400], 50, 10);
+    // The whole point of the primitive: cost independent of history length.
+    assert_eq!(around.len(), 61, "must be before + anchor + after, not 500");
+    assert_eq!(around.first().unwrap().content, "msg 350");
+    assert_eq!(around.last().unwrap().content, "msg 410");
+}
+
+#[test]
+fn get_messages_around_with_after_zero_is_pure_scrollback() {
+    let store = SessionStore::new();
+    let s = store.create_session(None);
+    let ids: Vec<String> = (0..10)
+        .map(|i| store.add_message(&s.id, Role::User, format!("msg {i}")).id)
+        .collect();
+
+    // How the scroll trigger calls it: anchor on the oldest message held.
+    let older = store.get_messages_around(&s.id, &ids[5], 3, 0);
+    let contents: Vec<&str> = older.iter().map(|m| m.content.as_str()).collect();
+    assert_eq!(contents, ["msg 2", "msg 3", "msg 4", "msg 5"]);
+}
+
+#[test]
+fn get_messages_around_clamps_at_the_start_of_history() {
+    let store = SessionStore::new();
+    let s = store.create_session(None);
+    let ids: Vec<String> = (0..5)
+        .map(|i| store.add_message(&s.id, Role::User, format!("msg {i}")).id)
+        .collect();
+
+    // Asking for more than exists must not error or wrap — this is how the
+    // frontend learns it has reached the beginning and stops requesting.
+    let older = store.get_messages_around(&s.id, &ids[1], 99, 0);
+    let contents: Vec<&str> = older.iter().map(|m| m.content.as_str()).collect();
+    assert_eq!(contents, ["msg 0", "msg 1"]);
+}
+
+#[test]
+fn get_messages_around_scopes_the_anchor_to_its_session() {
+    let store = SessionStore::new();
+    let a = store.create_session(None);
+    let b = store.create_session(None);
+    store.add_message(&a.id, Role::User, "in a".into());
+    let in_b = store.add_message(&b.id, Role::User, "in b".into());
+
+    // A real id, but not in this session: must yield nothing rather than leak
+    // another session's transcript.
+    assert!(store
+        .get_messages_around(&a.id, &in_b.id, 10, 10)
+        .is_empty());
+    assert!(store
+        .get_messages_around(&a.id, "no-such-id", 10, 10)
+        .is_empty());
+}

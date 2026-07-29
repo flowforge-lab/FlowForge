@@ -77,6 +77,13 @@ interface ChatState {
   activeSessionId: string | null;
   /** Transcript per session. Only sessions we've opened are populated. */
   messagesBySession: Record<string, Message[]>;
+  /** Whether older history exists above what's loaded (#1143). Absent means
+   *  "unknown, worth asking"; false means the transcript's true start is held, so
+   *  the scroll trigger stops firing. */
+  hasMoreBySession: Record<string, boolean>;
+  /** Sessions with an older-history fetch in flight, so a fast scroll to the top
+   *  can't stack duplicate requests. */
+  loadingOlderBySession: Record<string, boolean>;
   /** sessionId -> assistant messageId currently streaming in that session. */
   streamingBySession: Record<string, string>;
   /** sessionId -> wall-clock ms when the user sent the in-flight turn (#180). */
@@ -169,6 +176,17 @@ interface ChatState {
    *  session. Used by split panes, which each show an independent session while
    *  only one is the global "active" (sidebar highlight, keyboard targets). */
   loadSession: (sessionId: string) => Promise<void>;
+  /** Prepend the page of history immediately above what's already held (#1143).
+   *  No-ops when a fetch is in flight or the start of history is known to be
+   *  loaded. Resolves once the store is updated so callers can restore scroll. */
+  loadOlderMessages: (sessionId: string) => Promise<void>;
+  /** Ensure `messageId` is present, pulling its neighbourhood if it sits outside
+   *  the loaded window (#1143) — the find bar's path to an out-of-window hit.
+   *  Resolves true if the message is available afterwards. */
+  ensureMessageLoaded: (
+    sessionId: string,
+    messageId: string,
+  ) => Promise<boolean>;
   /** Pure setter for the globally-active session (sidebar highlight + shortcuts).
    *  Does not pull history — pair with loadSession when opening a fresh session. */
   setActiveSession: (sessionId: string) => void;
@@ -364,6 +382,14 @@ const systemMessage = (sessionId: string, content: string): Message => ({
 // back to idle (#703). Also the auto-clear window for its store entry.
 const FINISHED_TTL_MS = 8000;
 
+// How many trailing messages a switch loads and renders. The transcript is not
+// virtualised, so this directly bounds React's mount work: measured ~79ms at 200
+// versus ~2000ms for a full 7000-message history, with the curve flat enough
+// between 50 and 200 that there is no reason to go lower. Older history is still
+// in the database and reachable via search; only the initially mounted window is
+// bounded.
+const HISTORY_WINDOW = 200;
+
 // Pending checkmark-clear timers, keyed by sessionId. Kept out of store state
 // (they're not render data) and re-armed on each finish so the newest completion
 // wins. `clearSessionFinished` cancels the timer; module scope survives the
@@ -397,6 +423,8 @@ export const useChatStore = create<ChatState>((set, get) => ({
   sessions: [],
   activeSessionId: null,
   messagesBySession: readCache(),
+  hasMoreBySession: {},
+  loadingOlderBySession: {},
   streamingBySession: {},
   turnStartBySession: {},
   turnStartByMessage: {},
@@ -469,7 +497,14 @@ export const useChatStore = create<ChatState>((set, get) => ({
   loadSession: async (sessionId) => {
     // Always re-pull history so a switch shows the backend's truth, including
     // turns that streamed while the session was in the background.
-    const messages = await ipc.getMessages(sessionId);
+    //
+    // Only the tail: the transcript is not virtualised, so React mounts every
+    // message it is given, and measured mount cost is ~0.3ms each — a
+    // 7000-message session spent ~2s of a ~2.05s switch purely on mounting
+    // rows nobody had scrolled to yet. Bounding the window makes switch cost
+    // independent of history length. Search still covers everything, since
+    // `search_in_session` queries the backend FTS index rather than this array.
+    const messages = await ipc.getMessages(sessionId, HISTORY_WINDOW);
     set((s) => {
       const streamingId = s.streamingBySession[sessionId];
       const local = s.messagesBySession[sessionId] ?? [];
@@ -496,9 +531,102 @@ export const useChatStore = create<ChatState>((set, get) => ({
       const toolStepsByMessage = Object.fromEntries(
         Object.entries(s.toolStepsByMessage).filter(([id]) => liveIds.has(id)),
       );
-      return { messagesBySession, toolStepsByMessage };
+      return {
+        messagesBySession,
+        toolStepsByMessage,
+        // This re-pull replaces the window, so any previously discovered
+        // start-of-history no longer describes what's held (#1143). A short
+        // transcript that fit entirely in the window has nothing above it.
+        hasMoreBySession: {
+          ...s.hasMoreBySession,
+          [sessionId]: merged.length >= HISTORY_WINDOW,
+        },
+      };
     });
     writeCache(sessionId, get().messagesBySession[sessionId] ?? []);
+  },
+
+  loadOlderMessages: async (sessionId) => {
+    const state = get();
+    if (state.loadingOlderBySession[sessionId]) return;
+    if (state.hasMoreBySession[sessionId] === false) return;
+    const held = state.messagesBySession[sessionId] ?? [];
+    const oldest = held[0];
+    // Nothing to anchor on yet; `loadSession` has to run first.
+    if (!oldest) return;
+
+    set((s) => ({
+      loadingOlderBySession: { ...s.loadingOlderBySession, [sessionId]: true },
+    }));
+    try {
+      const older = await ipc.getMessagesAround(
+        sessionId,
+        oldest.id,
+        HISTORY_WINDOW,
+        0,
+      );
+      // The anchor comes back as the last element. The dedupe below would drop it
+      // anyway, but the page-exhausted decision counts what was *requested*, so it
+      // has to be excluded here rather than relying on that.
+      const prepend = older.slice(0, -1);
+      set((s) => {
+        const current = s.messagesBySession[sessionId] ?? [];
+        // Re-check against the live array: `loadSession` may have replaced the
+        // window while this was in flight, in which case these ids no longer
+        // belong above it and prepending them would duplicate rows.
+        const currentIds = new Set(current.map((m) => m.id));
+        const fresh = prepend.filter((m) => !currentIds.has(m.id));
+        return {
+          messagesBySession: {
+            ...s.messagesBySession,
+            [sessionId]: [...fresh, ...current],
+          },
+          // A short page means the backend had nothing more to give.
+          hasMoreBySession: {
+            ...s.hasMoreBySession,
+            [sessionId]: prepend.length >= HISTORY_WINDOW,
+          },
+        };
+      });
+    } finally {
+      set((s) => {
+        const next = { ...s.loadingOlderBySession };
+        delete next[sessionId];
+        return { loadingOlderBySession: next };
+      });
+    }
+  },
+
+  ensureMessageLoaded: async (sessionId, messageId) => {
+    const held = get().messagesBySession[sessionId] ?? [];
+    if (held.some((m) => m.id === messageId)) return true;
+
+    // Pull a window centred on the target so there's context either side of it
+    // rather than the hit stranded at an edge.
+    const half = Math.floor(HISTORY_WINDOW / 2);
+    const around = await ipc.getMessagesAround(
+      sessionId,
+      messageId,
+      half,
+      half,
+    );
+    if (around.length === 0) return false;
+
+    set((s) => {
+      const current = s.messagesBySession[sessionId] ?? [];
+      const byId = new Map(current.map((m) => [m.id, m]));
+      for (const m of around) byId.set(m.id, m);
+      // The backend is authoritative on order, but this merge can interleave two
+      // disjoint ranges, so re-sort by the one ordering both share: creation time,
+      // tie-broken by id for stability.
+      const merged = [...byId.values()].sort(
+        (a, b) => a.createdAt - b.createdAt || a.id.localeCompare(b.id),
+      );
+      return {
+        messagesBySession: { ...s.messagesBySession, [sessionId]: merged },
+      };
+    });
+    return true;
   },
 
   newSession: async (goal) => {

@@ -1236,6 +1236,21 @@ export class MockIpc implements FfIpc {
     return [...msgs];
   }
 
+  // Mirrors the backend's `seq`-based window (#1143): an unknown anchor yields
+  // nothing rather than throwing, since a message deleted between search and
+  // navigation is a benign race.
+  async getMessagesAround(
+    sessionId: string,
+    messageId: string,
+    before: number,
+    after: number,
+  ): Promise<Message[]> {
+    const msgs = this.messages.get(sessionId) ?? [];
+    const i = msgs.findIndex((m) => m.id === messageId);
+    if (i < 0) return [];
+    return msgs.slice(Math.max(0, i - before), i + after + 1);
+  }
+
   // Full-text search fakers (#679/#710). The real backend uses FTS5 over message
   // text + tool-call args (v11). The in-thread find bar (#748) mirrors FTS's
   // token model: a message matches iff *every* query token is present as a whole

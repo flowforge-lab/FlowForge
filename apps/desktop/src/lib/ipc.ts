@@ -98,6 +98,16 @@ export interface FfIpc {
   forkSession(sessionId: string): Promise<Session>;
   listSessions(): Promise<Session[]>;
   getMessages(sessionId: string, limit?: number): Promise<Message[]>;
+  /** Messages around `messageId` (#1143): up to `before` older, the anchor, then
+   *  up to `after` newer. Backs scrollback past the loaded window (`after: 0`)
+   *  and jumping to a search hit outside it. The anchor is addressed by id — the
+   *  backend resolves ordering internally. An unknown id resolves to `[]`. */
+  getMessagesAround(
+    sessionId: string,
+    messageId: string,
+    before: number,
+    after: number,
+  ): Promise<Message[]>;
   /** Serialize a session for export (#278): lossless `json` ({session, messages})
    *  or human-readable `markdown`. Rejects an unknown id. The FE writes the
    *  returned string to a user-chosen path; no file IO crosses this seam. */
@@ -770,6 +780,18 @@ class TauriIpc implements FfIpc {
   listSessions = () => this.invoke<Session[]>("list_sessions");
   getMessages = (sessionId: string, limit?: number) =>
     this.invoke<Message[]>("get_messages", { sessionId, limit });
+  getMessagesAround = (
+    sessionId: string,
+    messageId: string,
+    before: number,
+    after: number,
+  ) =>
+    this.invoke<Message[]>("get_messages_around", {
+      sessionId,
+      messageId,
+      before,
+      after,
+    });
   exportSession = (sessionId: string, format: Format) =>
     this.invoke<string>("export_session", { sessionId, format });
   renameSession = (sessionId: string, title: string) =>
