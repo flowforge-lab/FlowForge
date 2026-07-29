@@ -20,6 +20,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -336,9 +337,22 @@ pub struct ToolSearchTool {
     /// Which model `vectors` were produced by. Part of the cache key — vectors
     /// from different models are not comparable (see [`semantic::CorpusVectors`]).
     embed_model: String,
-    /// Corpus vectors, warmed once per process.
+    /// Corpus vectors, warmed lazily and reused for the life of the tool.
     vectors: Arc<Mutex<semantic::CorpusVectors>>,
+    /// Warm attempts spent on an incomplete corpus. A transient embedder failure
+    /// leaves the cache partial, and the vector path needs it whole, so a later
+    /// call must be free to try again -- gating the retry on "is the cache empty"
+    /// would strand the corpus half-warmed for the rest of the process. Bounded so
+    /// a corpus that genuinely cannot embed (an entry the server always rejects)
+    /// stops paying for a doomed warm on every search.
+    warm_attempts: Arc<AtomicUsize>,
 }
+
+/// Warm attempts allowed on an incomplete corpus before the semantic path gives up
+/// for good. A transient failure deserves a retry; an entry the embedder always
+/// rejects should not cost a full warm on every single search. Three is enough to
+/// ride out a blip without turning a permanent failure into a permanent tax.
+const MAX_WARM_ATTEMPTS: usize = 3;
 
 impl ToolSearchTool {
     pub fn new(state: Arc<ToolSearchState>, index: ToolSearchIndex) -> Self {
@@ -348,6 +362,7 @@ impl ToolSearchTool {
             embedder: None,
             embed_model: String::new(),
             vectors: Arc::new(Mutex::new(semantic::CorpusVectors::new(""))),
+            warm_attempts: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -355,6 +370,9 @@ impl ToolSearchTool {
     pub fn with_embedder(mut self, embedder: Arc<dyn Embedder>, model: impl Into<String>) -> Self {
         let model = model.into();
         self.vectors = Arc::new(Mutex::new(semantic::CorpusVectors::new(&model)));
+        // A new model means a new corpus: vectors from different models are not
+        // comparable, so the retry budget starts over with them.
+        self.warm_attempts = Arc::new(AtomicUsize::new(0));
         self.embed_model = model;
         self.embedder = Some(embedder);
         self
@@ -396,6 +414,7 @@ impl ToolSearchTool {
             .collect();
 
         let cached = Arc::clone(&self.vectors);
+        let attempts = Arc::clone(&self.warm_attempts);
         let q = query.to_string();
         let m = model.clone();
 
@@ -403,21 +422,35 @@ impl ToolSearchTool {
             let borrowed: Vec<(&str, String)> =
                 texts.iter().map(|(n, t)| (n.as_str(), t.clone())).collect();
 
-            let mut vectors = cached.lock().ok()?;
-            if vectors.is_empty() {
-                semantic::warm(&embedder, &m, &borrowed, &mut vectors);
+            {
+                let mut vectors = cached.lock().ok()?;
+                // Warm whenever the cache is short of the corpus, not merely when
+                // it is empty: a transient embedder failure leaves it partial, and
+                // an `is_empty` gate would then never warm again, silently pinning
+                // the search to BM25F for the rest of the process (#1140 review).
+                // `warm` skips entries it already holds, so a retry only pays for
+                // what is missing.
+                if vectors.len() < borrowed.len()
+                    && attempts.fetch_add(1, Ordering::Relaxed) < MAX_WARM_ATTEMPTS
+                {
+                    semantic::warm(&embedder, &m, &borrowed, &mut vectors);
+                }
+
+                // The vector path needs the *whole* corpus, not whatever embedded
+                // successfully. With a partial cache the few embedded tools would be
+                // the only semantic candidates and would crowd out better lexical
+                // hits — a ranking decided by which embeds happened to succeed. Better
+                // to fall back to BM25F, which at least ranks every tool.
+                if vectors.len() < borrowed.len() {
+                    return None;
+                }
             }
 
-            // The vector path needs the *whole* corpus, not whatever embedded
-            // successfully. With a partial cache the few embedded tools would be
-            // the only semantic candidates and would crowd out better lexical
-            // hits — a ranking decided by which embeds happened to succeed. Better
-            // to fall back to BM25F, which at least ranks every tool.
-            if vectors.len() < borrowed.len() {
-                return None;
-            }
-
+            // Embed the query with the lock released: it is a network round-trip,
+            // and holding the corpus mutex across it serialises concurrent searches
+            // behind one another for no benefit — the cache is already complete.
             let qv = embedder.embed_query(&q).ok()??;
+            let vectors = cached.lock().ok()?;
             let ranked = semantic::semantic_ranking(&qv, &borrowed, &vectors, &m);
             (!ranked.is_empty()).then(|| {
                 ranked

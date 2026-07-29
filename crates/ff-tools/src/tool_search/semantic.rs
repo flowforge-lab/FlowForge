@@ -87,6 +87,12 @@ impl CorpusVectors {
         self.by_hash.len()
     }
 
+    /// Tests only. Production compares `len()` against the corpus size instead: an
+    /// `is_empty` gate on warming is what stranded a partially-embedded corpus for
+    /// the life of the process (#1140 review), so the callers that mattered were
+    /// deliberately moved off it. Kept because "a failed warm leaves the cache
+    /// untouched" is worth asserting directly.
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.by_hash.is_empty()
     }

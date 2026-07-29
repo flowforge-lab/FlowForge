@@ -495,3 +495,105 @@ async fn a_corpus_that_will_not_embed_abandons_the_semantic_path() {
         "one embedded tool must not become the whole semantic candidate set, got {ranking:?}"
     );
 }
+
+/// A blip during the first warm must not disable semantic recall for good.
+///
+/// The sibling test above pins "a partial cache does not rank". The trap is
+/// implementing that as *permanent* surrender: gate the warm on `is_empty()` and a
+/// single embed failure leaves the cache non-empty but short, so it is never warmed
+/// again and every later search silently returns `None` — Phase 2B degrades to
+/// BM25F for the rest of the process because of one dropped connection. Nothing
+/// surfaces; the user has a healthy embedder and no recall.
+///
+/// Two calls on the *same* tool, because the bug lives in the state carried
+/// between them. The first-call assertion is the sibling's contract; the second is
+/// this one's.
+#[tokio::test]
+async fn a_transient_warm_failure_is_retried_on_the_next_search() {
+    /// Fails every chunk on the first warm pass, then embeds normally. Mimics a
+    /// server that was briefly unreachable.
+    struct BlipThenHealthy {
+        calls: std::sync::atomic::AtomicUsize,
+        corpus: usize,
+    }
+    impl ff_memory::Embedder for BlipThenHealthy {
+        fn embed_query(&self, _: &str) -> ff_memory::Result<Option<Vec<f32>>> {
+            Ok(Some(vec![1.0, 0.0]))
+        }
+        fn embed_chunk(&self, _: &str) -> ff_memory::Result<Option<Vec<f32>>> {
+            // One tool lands, the rest of the first pass fails: a *partial* cache,
+            // which is the state that used to be terminal. Later passes succeed.
+            let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n == 0 || n >= self.corpus {
+                Ok(Some(vec![1.0, 0.0]))
+            } else {
+                Ok(None)
+            }
+        }
+    }
+
+    let corpus = fixture().index.tools.len();
+    let tool = fixture().with_embedder(
+        Arc::new(BlipThenHealthy {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            corpus,
+        }),
+        "m",
+    );
+
+    assert!(
+        tool.semantic_ranking("notes").await.is_none(),
+        "a partial cache must not rank"
+    );
+
+    let recovered = tool.semantic_ranking("notes").await;
+
+    assert!(
+        recovered.is_some(),
+        "the second search must re-warm the corpus and recover the semantic path; \
+         got None, so a transient failure disabled semantic recall permanently"
+    );
+    assert_eq!(
+        recovered.as_ref().map(Vec::len),
+        Some(corpus),
+        "a recovered ranking must cover the whole corpus"
+    );
+}
+
+/// The retry budget is finite: a corpus that can *never* embed must stop paying for
+/// a doomed warm on every search.
+///
+/// Without a cap, the fix above turns a permanent embedder failure into a permanent
+/// tax — every `tool_search` would re-attempt the full corpus on the model's
+/// critical path, forever. Counts embed calls across more searches than the budget
+/// allows and asserts they stop.
+#[tokio::test]
+async fn a_hopeless_corpus_stops_retrying_after_the_budget() {
+    struct NeverEmbeds(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+    impl ff_memory::Embedder for NeverEmbeds {
+        fn embed_query(&self, _: &str) -> ff_memory::Result<Option<Vec<f32>>> {
+            Ok(Some(vec![1.0, 0.0]))
+        }
+        fn embed_chunk(&self, _: &str) -> ff_memory::Result<Option<Vec<f32>>> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(None)
+        }
+    }
+
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let tool = fixture().with_embedder(Arc::new(NeverEmbeds(std::sync::Arc::clone(&calls))), "m");
+
+    for _ in 0..(super::MAX_WARM_ATTEMPTS + 3) {
+        assert!(tool.semantic_ranking("notes").await.is_none());
+    }
+
+    let spent = calls.load(std::sync::atomic::Ordering::SeqCst);
+    let corpus = fixture().index.tools.len();
+    assert!(
+        spent <= corpus * super::MAX_WARM_ATTEMPTS,
+        "a hopeless corpus must stop warming after {} attempts, but spent {spent} embed calls \
+         over {} searches (corpus {corpus})",
+        super::MAX_WARM_ATTEMPTS,
+        super::MAX_WARM_ATTEMPTS + 3
+    );
+}
