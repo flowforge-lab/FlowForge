@@ -1228,8 +1228,12 @@ export class MockIpc implements FfIpc {
     this.goals.delete(sessionId);
   }
 
-  async getMessages(sessionId: string): Promise<Message[]> {
-    return [...(this.messages.get(sessionId) ?? [])];
+  async getMessages(sessionId: string, limit?: number): Promise<Message[]> {
+    const msgs = this.messages.get(sessionId) ?? [];
+    if (limit != null && msgs.length > limit) {
+      return msgs.slice(-limit);
+    }
+    return [...msgs];
   }
 
   // Full-text search fakers (#679/#710). The real backend uses FTS5 over message

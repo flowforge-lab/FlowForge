@@ -97,7 +97,7 @@ export interface FfIpc {
    *  messages/context. Rejects an unknown id. */
   forkSession(sessionId: string): Promise<Session>;
   listSessions(): Promise<Session[]>;
-  getMessages(sessionId: string): Promise<Message[]>;
+  getMessages(sessionId: string, limit?: number): Promise<Message[]>;
   /** Serialize a session for export (#278): lossless `json` ({session, messages})
    *  or human-readable `markdown`. Rejects an unknown id. The FE writes the
    *  returned string to a user-chosen path; no file IO crosses this seam. */
@@ -768,8 +768,8 @@ class TauriIpc implements FfIpc {
   setMemoryChunkPinned = (chunkKey: string, pinned: boolean) =>
     this.invoke<void>("set_memory_chunk_pinned", { chunkKey, pinned });
   listSessions = () => this.invoke<Session[]>("list_sessions");
-  getMessages = (sessionId: string) =>
-    this.invoke<Message[]>("get_messages", { sessionId });
+  getMessages = (sessionId: string, limit?: number) =>
+    this.invoke<Message[]>("get_messages", { sessionId, limit });
   exportSession = (sessionId: string, format: Format) =>
     this.invoke<string>("export_session", { sessionId, format });
   renameSession = (sessionId: string, title: string) =>

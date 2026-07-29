@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use ff_agent::{
     flush_due, AbstractiveConfig, CancelToken, CompactionCache, CompactionContext,
     CompactionOutcome, CompactionStrategy, ContextPressureEstimator, MemoryFlush,
-    ProxyTokenEstimator, DEFAULT_FLUSH_AT_FRACTION,
+    ProxyTokenEstimator, DEFAULT_FLUSH_AT_FRACTION, INTERRUPTED_NOTICE,
 };
 use ff_core::{
     model_supports_documents, BedrockAuth, ConnectionId, ContextWindowSource, GoalStore, McpScope,
@@ -1620,6 +1620,11 @@ impl AppState {
                 )
             },
         );
+        // #1142: reconcile orphaned rows once at startup, not on every session switch.
+        // At this point no turns are in flight, so the sweep is safe for all sessions.
+        for s in store.list_sessions() {
+            store.reconcile_orphaned_assistant_rows(&s.id, INTERRUPTED_NOTICE);
+        }
         crate::boot_trace_step("app_state.stores_parallel", t.elapsed());
         // Build the observer supervisor and its event receiver
         // together so the supervisor's sender side and the pump's

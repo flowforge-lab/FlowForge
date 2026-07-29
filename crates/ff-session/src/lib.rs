@@ -370,6 +370,27 @@ impl SessionStore {
         rows.filter_map(Result::ok).collect()
     }
 
+    /// Like [`get_messages`](Self::get_messages) but returns only the most recent
+    /// `limit` messages in chronological order (#1142 P1).
+    pub fn get_messages_tail(&self, session_id: &str, limit: usize) -> Vec<Message> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, session_id, role, content, tool_calls, tool_call_id, attachments, reasoning, stop_reason, author_name, created_at
+                 FROM messages
+                 WHERE session_id = ?1
+                 ORDER BY seq DESC
+                 LIMIT ?2",
+            )
+            .expect("prepare get_messages_tail");
+        let rows = stmt
+            .query_map(params![session_id, limit], row_to_message)
+            .expect("query get_messages_tail");
+        let mut msgs: Vec<Message> = rows.filter_map(Result::ok).collect();
+        msgs.reverse();
+        msgs
+    }
+
     pub fn add_message(&self, session_id: &str, role: Role, content: String) -> Message {
         self.push_message(Message {
             id: new_id(),
