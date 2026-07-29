@@ -462,6 +462,12 @@ impl ProviderConnection {
 /// [`ff_llm::model_context_window`] wraps `context_window_in`. Calling *this*
 /// function from an app path silently ignores the user's override (#1137).
 ///
+/// That rule is enforced, not merely advised: the
+/// `the_bundled_only_vision_lookup_has_no_callers_outside_ff_core` test fails the
+/// build if an `apps/` or sibling-crate path reaches for this function. The
+/// failure mode it guards is silent -- the override just stops taking effect --
+/// so a doc comment alone was not enough to keep #1137 from happening once.
+///
 /// Keep the bundled map narrow. Adding a model here un-gates attachments app-wide
 /// for every connection on that model, so favor known-good families over loose
 /// substring matches -- and remember the user can always correct a wrong verdict in
