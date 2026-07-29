@@ -300,6 +300,58 @@ fn get_messages_is_read_only() {
     );
 }
 
+// Serialize tests that mutate FF_TEST_SESSION_DB_PATH so parallel runs don't
+// race on the process-global env var.
+static STARTUP_SWEEP_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[test]
+fn startup_reconciles_orphans_across_all_sessions() {
+    // #1149: AppState::with_registry must sweep orphaned assistant rows for
+    // every session at startup. Two sessions, not one — with one session the
+    // test passes even if the sweep only ever touches the first entry.
+    use ff_core::Role;
+    use ff_session::SessionStore;
+
+    let _guard = STARTUP_SWEEP_TEST_LOCK.lock().unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("sessions.db");
+
+    // Pre-seed two sessions with one orphan assistant row each.
+    let (id_a, id_b) = {
+        let store = SessionStore::open(&path).unwrap();
+        let s1 = store.create_session(None);
+        store.add_message(&s1.id, Role::User, "hi".into());
+        store.add_message(&s1.id, Role::Assistant, String::new());
+        let s2 = store.create_session(None);
+        store.add_message(&s2.id, Role::User, "hello".into());
+        store.add_message(&s2.id, Role::Assistant, String::new());
+        (s1.id, s2.id)
+    };
+
+    // Point AppState::with_registry at the pre-populated db so the startup
+    // sweep sees the orphans.
+    std::env::set_var("FF_TEST_SESSION_DB_PATH", &path);
+    let state = AppState::with_registry(ProviderRegistry::default());
+    std::env::remove_var("FF_TEST_SESSION_DB_PATH");
+
+    let msgs_a = state.store.get_messages(&id_a);
+    assert_eq!(msgs_a[1].role, Role::Assistant);
+    assert_eq!(
+        msgs_a[1].content,
+        ff_agent::INTERRUPTED_NOTICE,
+        "session A orphan must be relabelled with INTERRUPTED_NOTICE at startup"
+    );
+
+    let msgs_b = state.store.get_messages(&id_b);
+    assert_eq!(msgs_b[1].role, Role::Assistant);
+    assert_eq!(
+        msgs_b[1].content,
+        ff_agent::INTERRUPTED_NOTICE,
+        "session B orphan must be relabelled with INTERRUPTED_NOTICE at startup"
+    );
+}
+
 #[test]
 fn take_cancel_if_removes_only_its_own_token() {
     // The clean single-turn finish: the token a turn registered is still the
