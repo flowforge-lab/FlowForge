@@ -1,10 +1,16 @@
 // Experimental opt-in flags for the Experimental section (#133, SET.10). All flags
 // are FE-only today — each gates a future backend behavior (documented next to the
-// switch in experimental-section.tsx). Persisted to localStorage under
-// `"ff-experimental"`; mirrors `store/command-shortcuts.ts`. Default all off.
+// switch in experimental-section.tsx). Persisted under `"ff-experimental"` via
+// `durableStorage` (#1121); mirrors `store/command-shortcuts.ts`. Default all off.
+//
+// Hydration is async, and unlike the other flag-ish stores this one IS read
+// imperatively at boot (`App.tsx` picks the update channel from
+// `flags.localUpdateChannel`), so that read waits on `persist.onFinishHydration`
+// rather than racing it — see `whenExperimentalHydrated` below.
 
 import { create } from "zustand";
-import { persist } from "zustand/middleware";
+import { createJSONStorage, persist } from "zustand/middleware";
+import { durableStorage } from "@/lib/durable-storage";
 
 const STORAGE_KEY = "ff-experimental";
 
@@ -102,6 +108,7 @@ export const useExperimentalStore = create<ExperimentalState>()(
     }),
     {
       name: STORAGE_KEY,
+      storage: createJSONStorage(() => durableStorage),
       // Defaults first so a blob persisted before a field existed hydrates that
       // field to its default rather than `undefined` — see the same merge on
       // `flags` for the original rationale; the interval is just the next row.
@@ -119,3 +126,18 @@ export const useExperimentalStore = create<ExperimentalState>()(
     },
   ),
 );
+
+/** Resolves once the persisted flags have landed (immediately if they already
+ *  have). Imperative boot-time readers must await this: `durableStorage` hydrates
+ *  asynchronously, so a bare `getState()` at startup can see the all-off defaults
+ *  and act on a flag the user actually turned on — e.g. polling the wrong update
+ *  channel (#1121). Components don't need it; they re-render on hydration. */
+export function whenExperimentalHydrated(): Promise<void> {
+  if (useExperimentalStore.persist.hasHydrated()) return Promise.resolve();
+  return new Promise((resolve) => {
+    const unsub = useExperimentalStore.persist.onFinishHydration(() => {
+      unsub();
+      resolve();
+    });
+  });
+}

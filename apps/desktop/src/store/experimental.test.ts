@@ -121,3 +121,36 @@ describe("useExperimentalStore", () => {
     );
   });
 });
+
+// #1121: flags moved to `durableStorage`, which hydrates asynchronously. Boot
+// code that reads a flag imperatively (App.tsx picks the update channel from
+// `localUpdateChannel`) must wait, or it acts on the all-off defaults.
+describe("whenExperimentalHydrated (#1121)", () => {
+  afterEach(() => {
+    localStorage.clear();
+  });
+
+  it("resolves only after the persisted flags have landed", async () => {
+    localStorage.setItem(
+      "ff-experimental",
+      JSON.stringify({
+        state: { flags: { localUpdateChannel: true } },
+        version: 0,
+      }),
+    );
+    vi.resetModules();
+    const { useExperimentalStore: fresh, whenExperimentalHydrated } =
+      await import("@/store/experimental");
+
+    await whenExperimentalHydrated();
+    expect(fresh.getState().flags.localUpdateChannel).toBe(true);
+  });
+
+  it("resolves immediately once hydration has already finished", async () => {
+    vi.resetModules();
+    const { whenExperimentalHydrated } = await import("@/store/experimental");
+    await whenExperimentalHydrated();
+    // A second await must not hang waiting for an event that already fired.
+    await whenExperimentalHydrated();
+  });
+});

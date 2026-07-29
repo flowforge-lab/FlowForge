@@ -3,8 +3,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
+  BOOT_PREFS_KEY,
   clampSidebarWidth,
+  initPrefs,
   migrateLegacyTheme,
+  mirrorBootPrefs,
   usePrefsStore,
   SIDEBAR_WIDTH_DEFAULT,
   SIDEBAR_WIDTH_MIN,
@@ -296,5 +299,64 @@ describe("sidebar width preference (#204)", () => {
     expect(
       JSON.parse(localStorage.getItem("ff-prefs") ?? "{}").state.sidebarWidth,
     ).toBe(SIDEBAR_WIDTH_MAX);
+  });
+});
+
+// Prefs moved off plain localStorage in #1121, but the pre-paint script in
+// index.html can only read something synchronous — so the store keeps a
+// theme+font copy in localStorage purely for that script. These tests pin the
+// contract that script depends on: the key, and the shape it parses.
+describe("pre-paint boot mirror (#1121)", () => {
+  afterEach(() => {
+    localStorage.clear();
+  });
+
+  it("mirrors theme and font under BOOT_PREFS_KEY in the shape index.html parses", () => {
+    mirrorBootPrefs("dark", "nunito");
+    const raw = localStorage.getItem(BOOT_PREFS_KEY);
+    expect(raw).not.toBeNull();
+    // The boot script does `parsed.state || parsed`, then reads .theme/.font.
+    const parsed = JSON.parse(raw ?? "{}");
+    expect(parsed.state ?? parsed).toEqual({ theme: "dark", font: "nunito" });
+  });
+
+  it("is written under its own key, never the store's — durableStorage adopts and clears ff-prefs", () => {
+    mirrorBootPrefs("light", "geist");
+    expect(BOOT_PREFS_KEY).not.toBe("ff-prefs");
+    expect(localStorage.getItem("ff-prefs")).toBeNull();
+  });
+
+  it("refreshes on every prefs change so the next launch paints the latest theme", () => {
+    initPrefs();
+    usePrefsStore.getState().setTheme("dark");
+    expect(JSON.parse(localStorage.getItem(BOOT_PREFS_KEY) ?? "{}").theme).toBe(
+      "dark",
+    );
+
+    usePrefsStore.getState().setTheme("light");
+    expect(JSON.parse(localStorage.getItem(BOOT_PREFS_KEY) ?? "{}").theme).toBe(
+      "light",
+    );
+  });
+});
+
+describe("async hydration signal (#1121)", () => {
+  it("flips hasHydrated once the (async) read lands, and never persists it", async () => {
+    localStorage.setItem(
+      "ff-prefs",
+      JSON.stringify({ state: { theme: "dark" }, version: 0 }),
+    );
+    vi.resetModules();
+    const { usePrefsStore: fresh } = await import("@/store/prefs");
+
+    await fresh.persist.rehydrate();
+    expect(fresh.getState().hasHydrated).toBe(true);
+    expect(fresh.getState().theme).toBe("dark");
+    // Runtime-only: a persisted `true` must not survive into the next launch's
+    // blob, or the gate it guards would open before the read has landed.
+    expect(
+      JSON.parse(localStorage.getItem("ff-prefs") ?? "{}").state.hasHydrated,
+    ).toBeUndefined();
+    localStorage.clear();
   });
 });

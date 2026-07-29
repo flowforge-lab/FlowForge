@@ -1,5 +1,6 @@
-// Which user messages the user has edited (#929 part B). FE-only and persisted to
-// localStorage under `"ff-edited-messages"`; no IPC, no `Message.edited` field.
+// Which user messages the user has edited (#929 part B). FE-only and persisted
+// under `"ff-edited-messages"` via `durableStorage` (#1121); no IPC, no
+// `Message.edited` field.
 //
 // This works because `edit_user_message` UPDATEs the message row in place and hands
 // back the SAME id, so a marker keyed by message id survives both the re-run and a
@@ -11,11 +12,17 @@
 // renders it as static text rather than a button.
 //
 // Markers are only ever written on a *successful* edit (see `chat.ts::editMessage`),
-// so the hint can never lie. The one drift is markers disappearing if localStorage is
+// so the hint can never lie. The one drift is markers disappearing if the store is
 // cleared while the DB survives — the safe direction.
+//
+// Hydration is async (`durableStorage` always is), so markers can be absent for a
+// frame after mount. Not gated: the hint is decorative, it renders inside message
+// rows that only appear once a session has loaded over IPC, and the worst case is
+// a late-appearing label rather than a wrong one.
 
 import { create } from "zustand";
-import { persist } from "zustand/middleware";
+import { createJSONStorage, persist } from "zustand/middleware";
+import { durableStorage } from "@/lib/durable-storage";
 
 const STORAGE_KEY = "ff-edited-messages";
 
@@ -44,6 +51,6 @@ export const useEditedMessagesStore = create<EditedMessagesState>()(
 
       clearEdited: () => set({ editedIds: [] }),
     }),
-    { name: STORAGE_KEY },
+    { name: STORAGE_KEY, storage: createJSONStorage(() => durableStorage) },
   ),
 );

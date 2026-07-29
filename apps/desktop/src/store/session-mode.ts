@@ -2,10 +2,18 @@
 // per split pane (#148), since each pane hosts its own session — exactly like the
 // workspace (#200). This store holds only *explicit* overrides; a session with no
 // override inherits `usePrefsStore.defaultMode` (resolved at the call site, so the
-// two stores stay decoupled). Persisted to localStorage under `"ff-session-mode"`.
+// two stores stay decoupled). Persisted under `"ff-session-mode"` via
+// `durableStorage` (#1121).
+//
+// Hydration is async (`durableStorage` always is), so `modeBySession` is empty for
+// a frame after mount and the pill can briefly show the inherited default. Not
+// gated: the backend holds its own per-session mode (`ipc.setSessionMode`, #789)
+// and is what `spawn_assistant_turn` actually reads, so a not-yet-hydrated store
+// can mislabel the pill for a frame but can never send a turn in the wrong mode.
 
 import { create } from "zustand";
-import { persist } from "zustand/middleware";
+import { createJSONStorage, persist } from "zustand/middleware";
+import { durableStorage } from "@/lib/durable-storage";
 import { ipc } from "@/lib/ipc";
 import type { Mode } from "@/bindings";
 
@@ -65,6 +73,10 @@ export const useSessionModeStore = create<SessionModeState>()(
     }),
     // `version` establishes a migration baseline now, so a future shape change can
     // migrate rather than silently drop overrides (#287 review).
-    { name: STORAGE_KEY, version: 0 },
+    {
+      name: STORAGE_KEY,
+      version: 0,
+      storage: createJSONStorage(() => durableStorage),
+    },
   ),
 );
