@@ -281,6 +281,41 @@ impl LlmError {
             LlmError::Decode(_) => false,
         }
     }
+
+    /// A bounded, provider-agnostic label for logs.
+    ///
+    /// `Display` on this type deliberately carries the provider's response body,
+    /// which is what makes a 400 diagnosable — but that body is attacker- and
+    /// provider-controlled free text that can quote the request, so it must not
+    /// reach a log file that persists by default (#1118). Use this at any
+    /// `tracing` site; keep `Display` for what the user sees in the UI, where the
+    /// detail is the point and nothing is retained.
+    ///
+    /// Concretely: `Api` and `RateLimited` carry up to 2 KB of provider body via
+    /// [`error_for_status_with_body`], and a provider is free to echo request
+    /// fragments back in a 400 — so rendering the full error at `warn` would put
+    /// slices of user conversations into a file nobody asked for.
+    ///
+    /// Only the HTTP status and a rate-limit delay are preserved. A status is a
+    /// closed set of values and a delay is an integer, so neither can carry a
+    /// payload, while both are the part that tells you whether to back off, fix
+    /// the payload, or retry. The body remains available one level down at
+    /// `debug`, which is opt-in.
+    ///
+    /// This is deliberately *not* a redaction pass over the message. Scrubbing
+    /// arbitrary provider prose for anything conversation-shaped is a guess that
+    /// fails silently and invisibly; naming the safe fields explicitly cannot.
+    pub fn log_kind(&self) -> std::borrow::Cow<'static, str> {
+        match self {
+            LlmError::Transport(_) => "transport error".into(),
+            LlmError::Api { status, .. } => format!("api error (status {status})").into(),
+            LlmError::RateLimited { retry_after, .. } => match retry_after {
+                Some(d) => format!("rate limited (retry after {}s)", d.as_secs()).into(),
+                None => "rate limited".into(),
+            },
+            LlmError::Decode(_) => "decode error".into(),
+        }
+    }
 }
 
 /// Upper bound on how many bytes of an error body are read off the wire before

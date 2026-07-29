@@ -13,6 +13,17 @@ use crate::channel_map::ChannelMap;
 use crate::transport::MessageTransport;
 use crate::types::{ChannelId, Notification};
 
+/// A coarse label for a failed turn, safe to record without being asked.
+///
+/// Delegates to [`ff_llm::LlmError::log_kind`], which owns the reasoning about
+/// which fields of an `LlmError` may be persisted. The desktop app needs the same
+/// guarantee at its own `tracing` sites (#1118), and keeping one implementation on
+/// the error type means the two cannot drift into disagreeing about what is safe.
+pub(crate) fn turn_failure_kind(error: &ff_agent::AgentError) -> String {
+    let ff_agent::AgentError::Llm(llm) = error;
+    llm.log_kind().into_owned()
+}
+
 /// Configuration for the headless router.
 pub struct RouterConfig {
     /// Agent autonomy mode for messaging sessions.
@@ -181,7 +192,14 @@ impl Router {
                     debug!(session_id = %session_id, "turn completed");
                 }
                 Err(e) => {
-                    warn!(session_id = %session_id, error = %e, "turn failed");
+                    // Classified summary at `warn`, full error only at `debug`.
+                    // See `turn_failure_kind` for why the two are split.
+                    warn!(
+                        session_id = %session_id,
+                        kind = turn_failure_kind(&e),
+                        "turn failed"
+                    );
+                    debug!(session_id = %session_id, error = %e, "turn failure detail");
                     transport.notify(&channel, Notification::Error(e.to_string()));
                 }
             }

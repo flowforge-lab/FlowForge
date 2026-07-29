@@ -181,7 +181,10 @@ async fn collect_stream_text(
     let mut stream = match provider.chat_stream(req).await {
         Ok(s) => s,
         Err(e) => {
-            tracing::warn!(error = %e, "title generation stream failed");
+            // `log_kind` rather than `%e`: the full error carries the provider's
+            // response body, and this file is written by default (#1118).
+            tracing::warn!(error = %e.log_kind(), "title generation stream failed");
+            tracing::debug!(error = %e, "title generation stream failed (detail)");
             return None;
         }
     };
@@ -193,7 +196,8 @@ async fn collect_stream_text(
         match item {
             Ok(chunk) => text.push_str(&chunk.delta),
             Err(e) => {
-                tracing::warn!(error = %e, "title generation chunk failed");
+                tracing::warn!(error = %e.log_kind(), "title generation chunk failed");
+                tracing::debug!(error = %e, "title generation chunk failed (detail)");
                 return None;
             }
         }

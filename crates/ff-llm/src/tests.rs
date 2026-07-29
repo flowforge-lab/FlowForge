@@ -792,3 +792,92 @@ fn strip_oversized_attachments_placeholder_when_empty_content() {
         "placeholder should be the entire content when original is empty: {content}"
     );
 }
+
+/// The point of `log_kind`: logging is on by default (#1118), and `Display` on this
+/// type carries the provider's response body — up to 2 KB of free text that a
+/// provider is free to fill with echoed request fragments. Anything written to a
+/// file that persists without being asked for must go through `log_kind` instead.
+#[test]
+fn log_kind_never_leaks_the_provider_body() {
+    // Shaped like the leak that matters: a provider quoting the user's prompt back.
+    let secret = "user asked: my api key is sk-live-4f9a and my address is";
+    let cases = vec![
+        LlmError::Api {
+            status: 400,
+            message: secret.into(),
+        },
+        LlmError::RateLimited {
+            retry_after: None,
+            message: secret.into(),
+        },
+        LlmError::RateLimited {
+            retry_after: Some(std::time::Duration::from_secs(30)),
+            message: secret.into(),
+        },
+        LlmError::Transport(secret.into()),
+        LlmError::Decode(secret.into()),
+    ];
+
+    for error in &cases {
+        let logged = error.log_kind();
+        assert!(
+            !logged.contains("sk-live-4f9a"),
+            "log_kind leaked the body: {logged}"
+        );
+        assert!(
+            !logged.contains(secret),
+            "log_kind leaked the body: {logged}"
+        );
+        // Display is expected to carry it — that is why log_kind has to exist. If
+        // this ever stops holding, the redaction above has become vacuous and this
+        // test would otherwise keep passing while proving nothing.
+        assert!(
+            error.to_string().contains(secret) || matches!(error, LlmError::RateLimited { .. }),
+            "Display should carry the detail, else this test is vacuous"
+        );
+    }
+}
+
+/// Redaction is only worth having if what survives is still diagnosable. Status
+/// distinguishes "back off" from "fix the payload", and `retry_after` is an integer,
+/// so both are safe and both are the actionable part.
+#[test]
+fn log_kind_keeps_the_actionable_signal() {
+    assert_eq!(
+        LlmError::Api {
+            status: 429,
+            message: "slow down".into()
+        }
+        .log_kind(),
+        "api error (status 429)"
+    );
+    assert_eq!(
+        LlmError::Api {
+            status: 400,
+            message: "bad".into()
+        }
+        .log_kind(),
+        "api error (status 400)"
+    );
+    assert_eq!(
+        LlmError::RateLimited {
+            retry_after: Some(std::time::Duration::from_secs(30)),
+            message: "x".into()
+        }
+        .log_kind(),
+        "rate limited (retry after 30s)"
+    );
+    assert_eq!(
+        LlmError::RateLimited {
+            retry_after: None,
+            message: "x".into()
+        }
+        .log_kind(),
+        "rate limited"
+    );
+    assert_eq!(
+        LlmError::Transport("dns".into()).log_kind(),
+        "transport error"
+    );
+    assert_eq!(LlmError::Decode("json".into()).log_kind(), "decode error");
+}
