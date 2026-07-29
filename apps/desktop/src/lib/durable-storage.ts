@@ -26,7 +26,21 @@ const STORE_FILE = "prefs.json";
 /** Shape version of `prefs.json` itself — the file, not any one store's blob
  *  (those keep their own zustand `version`). Stamped on first successful load
  *  so a future layout change (re-keying, splitting the file) can migrate rather
- *  than guess what it's looking at. Bump + extend `migrateFile` together. */
+ *  than guess what it's looking at. Bump + extend `migrateFile` together.
+ *
+ *  Why this exists when #1134 declined a schema version (#1121 review): that
+ *  objection was to writing a `migrate()` against a single known version — a
+ *  guess about a shape nobody has seen. It applies to the migration, not to the
+ *  stamp, and only the stamp is built here; `migrateFile` deliberately has no
+ *  per-version branch yet.
+ *
+ *  The stamp has to be early to be worth anything. It's written on load, so by
+ *  the time a second shape exists every running install is already stamped and
+ *  the first real migration can dispatch on a number. Add it *with* that
+ *  migration instead and the migration still faces a population of unstamped
+ *  files it has to sniff — exactly the guessing #1134 wanted to avoid. So:
+ *  cheap now (one key, one write per load), removes the guess later. Don't
+ *  delete it as dead weight — it is doing its job precisely by being inert. */
 const SCHEMA_VERSION = 1;
 const SCHEMA_KEY = "__ff_schema";
 
