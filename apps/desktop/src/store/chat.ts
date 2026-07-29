@@ -364,6 +364,14 @@ const systemMessage = (sessionId: string, content: string): Message => ({
 // back to idle (#703). Also the auto-clear window for its store entry.
 const FINISHED_TTL_MS = 8000;
 
+// How many trailing messages a switch loads and renders. The transcript is not
+// virtualised, so this directly bounds React's mount work: measured ~79ms at 200
+// versus ~2000ms for a full 7000-message history, with the curve flat enough
+// between 50 and 200 that there is no reason to go lower. Older history is still
+// in the database and reachable via search; only the initially mounted window is
+// bounded.
+const HISTORY_WINDOW = 200;
+
 // Pending checkmark-clear timers, keyed by sessionId. Kept out of store state
 // (they're not render data) and re-armed on each finish so the newest completion
 // wins. `clearSessionFinished` cancels the timer; module scope survives the
@@ -469,7 +477,14 @@ export const useChatStore = create<ChatState>((set, get) => ({
   loadSession: async (sessionId) => {
     // Always re-pull history so a switch shows the backend's truth, including
     // turns that streamed while the session was in the background.
-    const messages = await ipc.getMessages(sessionId);
+    //
+    // Only the tail: the transcript is not virtualised, so React mounts every
+    // message it is given, and measured mount cost is ~0.3ms each — a
+    // 7000-message session spent ~2s of a ~2.05s switch purely on mounting
+    // rows nobody had scrolled to yet. Bounding the window makes switch cost
+    // independent of history length. Search still covers everything, since
+    // `search_in_session` queries the backend FTS index rather than this array.
+    const messages = await ipc.getMessages(sessionId, HISTORY_WINDOW);
     set((s) => {
       const streamingId = s.streamingBySession[sessionId];
       const local = s.messagesBySession[sessionId] ?? [];

@@ -111,7 +111,9 @@ describe("chat store — session-scoped send/cancel (#148)", () => {
       },
     ]);
     await useChatStore.getState().loadSession(BG);
-    expect(spy).toHaveBeenCalledWith(BG);
+    // Bounded window, not the full history: switch cost must not scale with
+    // transcript length (the unvirtualised list mounts everything it is given).
+    expect(spy).toHaveBeenCalledWith(BG, expect.any(Number));
     expect(useChatStore.getState().activeSessionId).toBe(ACTIVE);
     expect(useChatStore.getState().messagesBySession[BG]).toHaveLength(1);
   });
