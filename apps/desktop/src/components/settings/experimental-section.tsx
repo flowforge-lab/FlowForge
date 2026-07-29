@@ -70,6 +70,12 @@ const FLAGS: readonly FlagMeta[] = [
     description:
       'Show the "Developer" group in the About section (the sidecar smoke-test button). Off by default so dev-only surfaces stay off user installs.',
   },
+  {
+    id: "virtualizedTranscript",
+    label: "Virtualized transcript",
+    description:
+      "Render only the visible part of a conversation, so opening a long session costs the same as a short one. Turn this on if large sessions feel slow to open; scrolling, streaming and find are still being hardened against it.",
+  },
 ];
 
 /**

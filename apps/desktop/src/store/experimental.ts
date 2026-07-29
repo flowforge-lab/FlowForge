@@ -51,7 +51,13 @@ export type FlagId =
   // (the sidecar smoke-test button). Defaults off so dev-only surfaces never
   // reach end users; the ipc.ts "Dev-only — never shipped onto a user-visible
   // surface" contract holds because nothing renders without this flag.
-  | "devTools";
+  | "devTools"
+  // Renders the transcript through a windowing virtualizer so only the visible
+  // rows mount (#1143). Temporary: this gates a migration, not a feature — it
+  // exists so the scroll machinery (#206/#866/#1025) can be dogfooded on a real
+  // large database before it becomes the only path, and it goes away with the
+  // non-virtual branch once it has.
+  | "virtualizedTranscript";
 
 export const FLAG_IDS: readonly FlagId[] = [
   "ownApiKey",
@@ -63,6 +69,7 @@ export const FLAG_IDS: readonly FlagId[] = [
   "stepTimelineExport",
   "localUpdateChannel",
   "devTools",
+  "virtualizedTranscript",
 ];
 
 export type ExperimentalFlags = Record<FlagId, boolean>;
@@ -78,6 +85,7 @@ export const EXPERIMENTAL_DEFAULTS: ExperimentalFlags = {
   stepTimelineExport: false,
   localUpdateChannel: false,
   devTools: false,
+  virtualizedTranscript: false,
 };
 
 export interface ExperimentalState {
