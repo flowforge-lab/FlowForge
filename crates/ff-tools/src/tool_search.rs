@@ -170,6 +170,20 @@ fn build_bag(name: &str, description: &str, schema_keywords: &str) -> (HashMap<S
 #[derive(Debug, Default)]
 pub struct ToolSearchState {
     admitted: Mutex<HashMap<String, HashSet<String>>>,
+    /// Corpus vectors for semantic recall, cached across turns.
+    ///
+    /// This lives on the shared state rather than on `ToolSearchTool` because
+    /// `build_tool_registry` mints a fresh tool on *every* turn — each `ask`, each
+    /// goal-loop iteration, each scheduled run — while cloning this one `Arc`. Held
+    /// on the tool, the warmed corpus died with it and embedding the whole corpus
+    /// became a per-turn tax on the model's critical path (#1140 review).
+    vectors: Mutex<semantic::CorpusVectors>,
+    /// Warm attempts spent on an incomplete corpus, bounded by `MAX_WARM_ATTEMPTS`.
+    ///
+    /// Shares the lifetime of `vectors` for the same reason, and must: a per-tool
+    /// counter reset every turn, which silently turned "give up on a hopeless
+    /// corpus" into "retry three times, forever".
+    warm_attempts: AtomicUsize,
 }
 
 impl ToolSearchState {
@@ -334,18 +348,10 @@ pub struct ToolSearchTool {
     /// Optional because embeddings are opt-in (RFC 0006 §8): the default build has
     /// no embedder, so the vector path must be absent rather than merely inactive.
     embedder: Option<Arc<dyn Embedder>>,
-    /// Which model `vectors` were produced by. Part of the cache key — vectors
-    /// from different models are not comparable (see [`semantic::CorpusVectors`]).
+    /// Which model this turn's embedder speaks. The shared cache is keyed by it, so
+    /// a mismatch retargets (and clears) the corpus rather than fusing vectors from
+    /// different models, which are not comparable (see [`semantic::CorpusVectors`]).
     embed_model: String,
-    /// Corpus vectors, warmed lazily and reused for the life of the tool.
-    vectors: Arc<Mutex<semantic::CorpusVectors>>,
-    /// Warm attempts spent on an incomplete corpus. A transient embedder failure
-    /// leaves the cache partial, and the vector path needs it whole, so a later
-    /// call must be free to try again -- gating the retry on "is the cache empty"
-    /// would strand the corpus half-warmed for the rest of the process. Bounded so
-    /// a corpus that genuinely cannot embed (an entry the server always rejects)
-    /// stops paying for a doomed warm on every search.
-    warm_attempts: Arc<AtomicUsize>,
 }
 
 /// Warm attempts allowed on an incomplete corpus before the semantic path gives up
@@ -361,18 +367,21 @@ impl ToolSearchTool {
             index,
             embedder: None,
             embed_model: String::new(),
-            vectors: Arc::new(Mutex::new(semantic::CorpusVectors::new(""))),
-            warm_attempts: Arc::new(AtomicUsize::new(0)),
         }
     }
 
     /// Enable semantic recall, fused with BM25F (#1138).
+    ///
+    /// The corpus cache lives on the shared state, so switching models retargets it
+    /// there — dropping vectors that are no longer comparable and restarting the
+    /// warm budget for the new corpus.
     pub fn with_embedder(mut self, embedder: Arc<dyn Embedder>, model: impl Into<String>) -> Self {
         let model = model.into();
-        self.vectors = Arc::new(Mutex::new(semantic::CorpusVectors::new(&model)));
-        // A new model means a new corpus: vectors from different models are not
-        // comparable, so the retry budget starts over with them.
-        self.warm_attempts = Arc::new(AtomicUsize::new(0));
+        if let Ok(mut vectors) = self.state.vectors.lock() {
+            if vectors.retarget(&model) {
+                self.state.warm_attempts.store(0, Ordering::Relaxed);
+            }
+        }
         self.embed_model = model;
         self.embedder = Some(embedder);
         self
@@ -403,6 +412,12 @@ impl ToolSearchTool {
     ///
     /// Every failure — no embedder, dead server, empty cache — returns `None`, and
     /// fusing with `None` is the identity.
+    ///
+    /// Silent degradation is the point: recall must never come out *worse* than
+    /// BM25F because an embedder is down. It does mean a misconfigured setup looks
+    /// exactly like a working one from the outside, so every abandonment logs its
+    /// reason at debug — enough to answer "why is semantic recall doing nothing"
+    /// without inventing a metrics surface for it (#1140 review).
     async fn semantic_ranking(&self, query: &str) -> Option<Vec<String>> {
         let embedder = self.embedder.as_ref()?.clone();
         let model = self.embed_model.clone();
@@ -413,8 +428,9 @@ impl ToolSearchTool {
             .map(|(n, t)| (n.to_string(), t))
             .collect();
 
-        let cached = Arc::clone(&self.vectors);
-        let attempts = Arc::clone(&self.warm_attempts);
+        // The cache is shared state, not the tool's: it has to outlive this turn's
+        // registry (see `ToolSearchState::vectors`).
+        let shared = Arc::clone(&self.state);
         let q = query.to_string();
         let m = model.clone();
 
@@ -423,7 +439,7 @@ impl ToolSearchTool {
                 texts.iter().map(|(n, t)| (n.as_str(), t.clone())).collect();
 
             {
-                let mut vectors = cached.lock().ok()?;
+                let mut vectors = shared.vectors.lock().ok()?;
                 // Warm whenever the cache is short of the corpus, not merely when
                 // it is empty: a transient embedder failure leaves it partial, and
                 // an `is_empty` gate would then never warm again, silently pinning
@@ -431,7 +447,7 @@ impl ToolSearchTool {
                 // `warm` skips entries it already holds, so a retry only pays for
                 // what is missing.
                 if vectors.len() < borrowed.len()
-                    && attempts.fetch_add(1, Ordering::Relaxed) < MAX_WARM_ATTEMPTS
+                    && shared.warm_attempts.fetch_add(1, Ordering::Relaxed) < MAX_WARM_ATTEMPTS
                 {
                     semantic::warm(&embedder, &m, &borrowed, &mut vectors);
                 }
@@ -442,6 +458,13 @@ impl ToolSearchTool {
                 // hits — a ranking decided by which embeds happened to succeed. Better
                 // to fall back to BM25F, which at least ranks every tool.
                 if vectors.len() < borrowed.len() {
+                    tracing::debug!(
+                        model = %m,
+                        cached = vectors.len(),
+                        corpus = borrowed.len(),
+                        attempts = shared.warm_attempts.load(Ordering::Relaxed),
+                        "tool_search: semantic path idle, corpus is not fully embedded"
+                    );
                     return None;
                 }
             }
@@ -449,8 +472,18 @@ impl ToolSearchTool {
             // Embed the query with the lock released: it is a network round-trip,
             // and holding the corpus mutex across it serialises concurrent searches
             // behind one another for no benefit — the cache is already complete.
-            let qv = embedder.embed_query(&q).ok()??;
-            let vectors = cached.lock().ok()?;
+            let qv = match embedder.embed_query(&q) {
+                Ok(Some(v)) => v,
+                other => {
+                    tracing::debug!(
+                        model = %m,
+                        failed = other.is_err(),
+                        "tool_search: semantic path idle, the query did not embed"
+                    );
+                    return None;
+                }
+            };
+            let vectors = shared.vectors.lock().ok()?;
             let ranked = semantic::semantic_ranking(&qv, &borrowed, &vectors, &m);
             (!ranked.is_empty()).then(|| {
                 ranked

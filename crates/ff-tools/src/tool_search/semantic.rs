@@ -33,6 +33,13 @@ use ff_memory::Embedder;
 /// RRF's rank-smoothing constant, matching `ff-memory` (RFC 0006 §6) so the two
 /// fusions stay comparable. Large enough that a top-1 hit does not dominate a
 /// well-placed hit from the other path.
+///
+/// Deliberately a constant, not a setting. It has no user-legible meaning — the
+/// honest way to change it is a held-out evaluation showing a better value, not a
+/// knob in a config file that nobody can reason about. Lowering it sharpens the
+/// weight of rank 1 (fusion approaches "whichever path is most confident wins");
+/// raising it flattens the curve until fusion degenerates towards a plain average
+/// of positions. Change it here, with eval numbers in the commit.
 const RRF_C: f64 = 60.0;
 
 /// How many candidates each path contributes to the fusion.
@@ -56,7 +63,7 @@ const RECALL_DEPTH: usize = 20;
 ///
 /// Keying by content hash (not tool name) means an edited description
 /// invalidates only its own entry.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct CorpusVectors {
     /// Which model produced these vectors. A change invalidates all of them.
     model: String,
@@ -81,6 +88,26 @@ impl CorpusVectors {
 
     pub fn insert(&mut self, text: &str, vector: Vec<f32>) {
         self.by_hash.insert(content_hash(text), vector);
+    }
+
+    /// Point the cache at `model`, dropping every vector if it changed.
+    ///
+    /// Vectors from different models are not comparable, and the cache now outlives
+    /// any single `ToolSearchTool` (it hangs off the shared `ToolSearchState`), so a
+    /// model switch has to be handled here rather than by dropping the owner. Note
+    /// `len()` counts entries regardless of model while `get` filters by it: leaving
+    /// stale vectors in place would let `len()` claim a complete corpus whose every
+    /// lookup then misses.
+    ///
+    /// Returns whether the model changed, so the caller can reset anything else
+    /// keyed to the old corpus (the warm budget).
+    pub fn retarget(&mut self, model: &str) -> bool {
+        if self.model == model {
+            return false;
+        }
+        self.by_hash.clear();
+        self.model = model.to_string();
+        true
     }
 
     pub fn len(&self) -> usize {
