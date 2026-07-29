@@ -13,7 +13,10 @@ import {
   activeUpdateChannel,
   useUpdateStore,
 } from "@/store/update";
-import { useExperimentalStore } from "@/store/experimental";
+import {
+  useExperimentalStore,
+  whenExperimentalHydrated,
+} from "@/store/experimental";
 
 // How often the production build re-checks for an update in the background.
 const UPDATE_POLL_MS = 6 * 60 * 60 * 1000;
@@ -178,15 +181,27 @@ function App() {
     // (#567). The channel is passed explicitly to every check/install (#1033) —
     // the endpoint is never inferred from a backend flag, so the first check
     // can't race the dev-update watcher onto GitHub.
-    const localUpdateChannel =
-      useExperimentalStore.getState().flags.localUpdateChannel;
-    if (
-      shouldPollUpdate(
-        import.meta.env.PROD,
-        import.meta.env.DEV,
-        localUpdateChannel,
-      )
-    ) {
+    let feedUnsub: (() => void) | undefined;
+    let id: ReturnType<typeof setInterval> | undefined;
+    let cancelled = false;
+
+    void (async () => {
+      // The flag is persisted, and `durableStorage` hydrates asynchronously
+      // (#1121) — reading it eagerly would show a dogfooder the all-off default
+      // and quietly poll the GitHub feed instead of their local one.
+      await whenExperimentalHydrated();
+      if (cancelled) return;
+      const localUpdateChannel =
+        useExperimentalStore.getState().flags.localUpdateChannel;
+      if (
+        !shouldPollUpdate(
+          import.meta.env.PROD,
+          import.meta.env.DEV,
+          localUpdateChannel,
+        )
+      ) {
+        return;
+      }
       const channel = activeUpdateChannel();
       // In dogfood mode, auto-install detected updates without user
       // intervention (#705). The refresh+install cycle is fire-and-forget.
@@ -206,9 +221,6 @@ function App() {
         }
       };
 
-      let feedUnsub: (() => void) | undefined;
-      let id: ReturnType<typeof setInterval> | undefined;
-      let cancelled = false;
       // Phase 2 (#705): file-system watcher for instant detection. On the local
       // channel, start the backend watcher and wire its event BEFORE the first
       // poll (#1033) — the watcher only observes the feed file; it no longer
@@ -235,13 +247,13 @@ function App() {
       } else {
         startPolling();
       }
+    })();
 
-      return () => {
-        cancelled = true;
-        if (id !== undefined) clearInterval(id);
-        feedUnsub?.();
-      };
-    }
+    return () => {
+      cancelled = true;
+      if (id !== undefined) clearInterval(id);
+      feedUnsub?.();
+    };
   }, [ready]);
 
   if (error) return <BootError reason={error} />;

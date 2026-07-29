@@ -4,10 +4,16 @@
 // it (#395), set like `thinking` via `upsertConnection`. The summarization threshold
 // persists locally AND writes to the backend's `compactionBudget` per-connection
 // (#756), so the slider actually controls when compaction fires; `partialize`
-// keeps the IPC-backed cache out of localStorage.
+// keeps the IPC-backed cache out of the persisted blob.
+//
+// That local slice persists via `durableStorage` (#1121), whose hydration is
+// async — the threshold reads as its default for a frame after mount. Not gated:
+// it's only rendered by the Settings → Model slider, which opens long after boot,
+// and the backend's `compactionBudget` (not this value) is what compaction reads.
 
 import { create } from "zustand";
-import { persist } from "zustand/middleware";
+import { createJSONStorage, persist } from "zustand/middleware";
+import { durableStorage } from "@/lib/durable-storage";
 import { ipc } from "@/lib/ipc";
 import type { ProviderConnection } from "@/bindings/ProviderConnection";
 import type { ProviderRegistry } from "@/bindings/ProviderRegistry";
@@ -421,6 +427,7 @@ export const useModelConfigStore = create<ModelConfigState>()(
     },
     {
       name: "ff-model",
+      storage: createJSONStorage(() => durableStorage),
       // Only the summarization threshold persists locally; the registry (incl.
       // per-connection effort, #395) is backend-owned.
       partialize: (s) => ({

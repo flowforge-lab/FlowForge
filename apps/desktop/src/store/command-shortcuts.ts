@@ -1,10 +1,16 @@
 // Message shortcuts for the Skills → Shortcuts sub-tab (SET.5). A shortcut maps a
 // `/name` token to a canned message that's sent verbatim — this is NOT system-prompt
 // injection and is distinct from the GLOBAL "Keyboard" section's key bindings.
-// FE-only and persisted to localStorage under `"ff-command-shortcuts"`; no IPC.
+// FE-only and persisted under `"ff-command-shortcuts"` via `durableStorage`
+// (#1121); no IPC.
+//
+// Hydration is async (`durableStorage` always is). Not gated on it: the list is
+// read when the composer resolves a typed `/name`, which is many frames after
+// mount, and an unhydrated store just means the token isn't recognised yet.
 
 import { create } from "zustand";
-import { persist } from "zustand/middleware";
+import { createJSONStorage, persist } from "zustand/middleware";
+import { durableStorage } from "@/lib/durable-storage";
 
 const STORAGE_KEY = "ff-command-shortcuts";
 
@@ -61,6 +67,6 @@ export const useCommandShortcutsStore = create<CommandShortcutsState>()(
 
       resetShortcuts: () => set({ shortcuts: [] }),
     }),
-    { name: STORAGE_KEY },
+    { name: STORAGE_KEY, storage: createJSONStorage(() => durableStorage) },
   ),
 );

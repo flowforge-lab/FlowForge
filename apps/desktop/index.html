@@ -40,7 +40,16 @@
           };
           var theme = "system";
           var font = "geist";
-          var raw = localStorage.getItem("ff-prefs");
+          // Prefs themselves now live in the Tauri store file (#1121) because a
+          // WKWebView can drop a localStorage flush on quit. That store is only
+          // readable asynchronously, which is no use before first paint — so the
+          // store mirrors theme+font into `ff-boot-prefs` purely for this script.
+          // It's a cache: a stale one costs a single wrong-theme frame, nothing
+          // more. `ff-prefs` / `ff-theme` remain as fallbacks for the first launch
+          // after upgrading, before the mirror has been written once.
+          var raw =
+            localStorage.getItem("ff-boot-prefs") ||
+            localStorage.getItem("ff-prefs");
           if (raw) {
             var parsed = JSON.parse(raw);
             var state = parsed.state || parsed;

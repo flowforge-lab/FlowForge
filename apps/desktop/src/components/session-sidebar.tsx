@@ -588,6 +588,12 @@ export function SessionSidebar() {
   const setSidebarCollapsed = usePrefsStore((s) => s.setSidebarCollapsed);
   const sidebarWidth = usePrefsStore((s) => s.sidebarWidth);
   const setSidebarWidth = usePrefsStore((s) => s.setSidebarWidth);
+  // Prefs hydrate asynchronously (#1121), so the first frame paints the default
+  // 240px / expanded shell even when the user left the sidebar narrow or
+  // collapsed. The correction is one frame later — but the width *transition*
+  // would turn it into a visible 200ms slide, so it stays off until hydration
+  // lands and the sidebar simply starts at the right size.
+  const layoutHydrated = usePrefsStore((s) => s.hasHydrated);
   const asideRef = useRef<HTMLElement>(null);
 
   // Drag-to-resize the sidebar↔chat boundary (#204). The sidebar is flush to the
@@ -798,7 +804,8 @@ export function SessionSidebar() {
       // inline style (inline wins, so the width class is dropped when expanded).
       style={sidebarCollapsed ? undefined : { width: sidebarWidth }}
       className={cn(
-        "relative flex h-full shrink-0 flex-col border-r bg-sidebar text-sidebar-foreground transition-[width,border] duration-200",
+        "relative flex h-full shrink-0 flex-col border-r bg-sidebar text-sidebar-foreground",
+        layoutHydrated && "transition-[width,border] duration-200",
         sidebarCollapsed ? "w-12 overflow-hidden" : "overflow-hidden",
       )}
     >

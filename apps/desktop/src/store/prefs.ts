@@ -1,9 +1,18 @@
 // Unified display preferences — theme, font, font scale, display name,
-// notifications, open-thread budget. Persisted to localStorage under `"ff-prefs"`
-// via zustand/middleware; `subscribe` applies side-effects on change.
+// notifications, open-thread budget. Persisted under `"ff-prefs"` via
+// `durableStorage` (#1121, was plain localStorage); `subscribe` applies
+// side-effects on change.
+//
+// `durableStorage` hydrates asynchronously, which would cost us the pre-paint
+// theme/font script in `index.html` — it runs before any module loads and can
+// only read something synchronous. `mirrorBootPrefs` therefore keeps a
+// localStorage COPY of just theme+font for that script to read. The copy is a
+// cache, never a source of truth: if a WKWebView drops its flush the worst case
+// is one wrong-theme frame that hydration immediately corrects, not a lost pref.
 
 import { create } from "zustand";
-import { persist } from "zustand/middleware";
+import { createJSONStorage, persist } from "zustand/middleware";
+import { durableStorage } from "@/lib/durable-storage";
 import {
   applyFont,
   applyFontScale,
@@ -21,6 +30,12 @@ import type { Mode } from "@/bindings";
 
 const STORAGE_KEY = "ff-prefs";
 const LEGACY_THEME_KEY = "ff-theme";
+
+/** localStorage key holding the pre-paint theme/font cache read by the boot
+ *  script in `index.html`. Deliberately NOT `STORAGE_KEY`: `durableStorage`
+ *  adopts and clears any legacy localStorage value under a store's own key, so
+ *  reusing it would make the cache look like real persisted state. */
+export const BOOT_PREFS_KEY = "ff-boot-prefs";
 
 /** FE-only notification flags (SET.2). No OS notifications fired yet. */
 export interface NotificationPrefs {
@@ -69,6 +84,11 @@ export interface PrefsState {
   sidebarCollapsed: boolean;
   /** Session sidebar width in px when expanded (#204); clamped to SIDEBAR_WIDTH_MIN/MAX. */
   sidebarWidth: number;
+  /** False until `durableStorage`'s (always-async) read has landed. Layout that
+   *  would visibly jump when the persisted value arrives — the sidebar's width
+   *  and collapsed state — waits on this instead of painting the default first.
+   *  Runtime-only, never persisted. */
+  hasHydrated: boolean;
   setTheme: (theme: Theme) => void;
   setFont: (font: Font) => void;
   setFontScale: (scale: number) => void;
@@ -130,6 +150,16 @@ export function clampSidebarWidth(px: number): number {
   );
 }
 
+/** Refresh the pre-paint theme/font cache the `index.html` boot script reads.
+ *  Best-effort and non-authoritative — see the module header. Exported for tests. */
+export function mirrorBootPrefs(theme: Theme, font: Font): void {
+  try {
+    localStorage.setItem(BOOT_PREFS_KEY, JSON.stringify({ theme, font }));
+  } catch {
+    // localStorage unavailable (SSR/tests) — the app just starts on CSS defaults.
+  }
+}
+
 /** Lift a pre-#62 `ff-theme` value into prefs on first rehydrate. Exported for tests. */
 export function migrateLegacyTheme(): Partial<Pick<PrefsState, "theme">> {
   try {
@@ -154,6 +184,7 @@ export const usePrefsStore = create<PrefsState>()(
       defaultMode: DEFAULT_MODE_DEFAULT,
       sidebarCollapsed: false,
       sidebarWidth: SIDEBAR_WIDTH_DEFAULT,
+      hasHydrated: false,
       setTheme: (theme) => set({ theme }),
       setFont: (font) => set({ font }),
       setFontScale: (scale) => set({ fontScale: clampFontScale(scale) }),
@@ -198,12 +229,16 @@ export const usePrefsStore = create<PrefsState>()(
     }),
     {
       name: STORAGE_KEY,
+      storage: createJSONStorage(() => durableStorage),
       // `defaultMode` is deliberately NOT persisted (#287 review): P2 made the
       // backend `mode.json` the source of truth (`get_default_mode`). Persisting it
       // here too would let the stale localStorage value win on rehydration once the
       // IPC seam lands. It stays transient (Auto each launch) until that seam reads
       // it. Everything else persists as before.
-      partialize: ({ defaultMode: _drop, ...rest }) => rest,
+      // `hasHydrated` is a runtime signal, not a preference — it always starts
+      // `false` in memory each launch regardless of what was persisted.
+      partialize: ({ defaultMode: _drop, hasHydrated: _drop2, ...rest }) =>
+        rest,
       // `current` (defaults) first so blobs persisted before SET.2 — which lack
       // the new keys — hydrate with sensible defaults rather than `undefined`.
       merge: (persisted, current) => ({
@@ -211,12 +246,18 @@ export const usePrefsStore = create<PrefsState>()(
         ...(persisted as Partial<PrefsState>),
         ...migrateLegacyTheme(),
       }),
+      // Fires once the (async) read lands, whether it resolved to a real value,
+      // `null` (fresh install), or failed (logged in `durable-storage.ts`).
+      // `hasHydrated` must flip in every one of those cases, or the sidebar
+      // would never paint.
       onRehydrateStorage: () => (state) => {
         if (state) {
           applyTheme(state.theme);
           applyFont(state.font);
           applyFontScale(state.fontScale);
+          mirrorBootPrefs(state.theme, state.font);
         }
+        usePrefsStore.setState({ hasHydrated: true });
       },
     },
   ),
@@ -239,6 +280,9 @@ export function initPrefs(): void {
     applyTheme(state.theme);
     applyFont(state.font);
     applyFontScale(state.fontScale);
+    // Keep the pre-paint cache in step with every change, so the next launch
+    // paints the theme the user last chose rather than the one before it.
+    mirrorBootPrefs(state.theme, state.font);
   });
 }
 
