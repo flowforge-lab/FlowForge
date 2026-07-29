@@ -4112,9 +4112,10 @@ pub fn run() {
     // #1118: install the tracing subscriber FIRST, before any instrumented code
     // runs — the observer pump, process reaper and scheduler all emit on paths
     // reached during `setup`, and events emitted before this line are lost.
-    // Opt-in via `FF_LOG`; unset means no subscriber, exactly as before. The
-    // guard must outlive the app, so it's bound for the whole of `run()`:
-    // dropping it flushes and stops the writer thread.
+    // On by default at the warn floor (#1118); `FF_LOG` raises or lowers it and
+    // `FF_LOG=off` opts out entirely. The guard must outlive the app, so it's
+    // bound for the whole of `run()`: dropping it flushes and stops the writer
+    // thread.
     let _log_guard = state::flowforge_config_dir().and_then(|dir| logging::init(&dir));
     // Paint-first boot (#599): `AppState::new()` and the supervisor / watcher /
     // reaper / scheduler wiring are deferred to a background hydrate task (spawned

@@ -164,3 +164,75 @@ async fn run_consults_the_injected_approver() {
         "Router::run must consult the approver passed to it, proving injection replaced the hardcoded MessagingApprover"
     );
 }
+
+// ── turn-failure logging (#1118 problem 3) ───────────────────────────────────
+
+/// The contract that makes always-on logging safe: what goes into the `warn` line
+/// must never carry the provider's response body.
+///
+/// `LlmError::Api` and `LlmError::RateLimited` hold up to 2 KB of provider prose
+/// (`ff_llm::error_for_status_with_body`), and a provider may echo request
+/// fragments back in a 400. Logging is on by default now, so rendering that at
+/// `warn` would write slices of user conversations to disk unasked. The body stays
+/// at `debug`, which is opt-in.
+#[test]
+fn turn_failure_kind_never_leaks_the_provider_body() {
+    let secret = "user asked about ACME Corp merger, ssn 123-45-6789";
+    let cases = vec![
+        LlmError::Api {
+            status: 400,
+            message: secret.to_string(),
+        },
+        LlmError::RateLimited {
+            retry_after: Some(std::time::Duration::from_secs(30)),
+            message: secret.to_string(),
+        },
+        LlmError::RateLimited {
+            retry_after: None,
+            message: secret.to_string(),
+        },
+        LlmError::Transport(secret.to_string()),
+        LlmError::Decode(secret.to_string()),
+    ];
+
+    for err in cases {
+        let rendered = crate::router::turn_failure_kind(&ff_agent::AgentError::Llm(err));
+        assert!(
+            !rendered.contains("ACME") && !rendered.contains("123-45-6789"),
+            "leaked provider body: {rendered:?}"
+        );
+        assert!(!rendered.is_empty(), "a failure must still be identifiable");
+    }
+}
+
+/// Redacting everything would be safe and useless. The status code is what tells
+/// you whether to back off, fix the payload, or retry — and it cannot contain user
+/// data, so it must survive.
+#[test]
+fn turn_failure_kind_keeps_the_diagnostic_signal() {
+    let kind = |e: LlmError| crate::router::turn_failure_kind(&ff_agent::AgentError::Llm(e));
+
+    assert!(
+        kind(LlmError::Api {
+            status: 429,
+            message: "slow down".into(),
+        })
+        .contains("429"),
+        "the status code carries the diagnosis"
+    );
+    assert!(
+        kind(LlmError::RateLimited {
+            retry_after: Some(std::time::Duration::from_secs(30)),
+            message: "x".into(),
+        })
+        .contains("30"),
+        "retry-after is actionable and safe"
+    );
+    // Local failures are distinguishable from provider failures, which is the
+    // first fork when reading a log.
+    assert_ne!(
+        kind(LlmError::Transport("x".into())),
+        kind(LlmError::Decode("x".into())),
+        "local failure modes must stay distinct"
+    );
+}

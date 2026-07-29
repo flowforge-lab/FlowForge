@@ -3312,3 +3312,118 @@ fn defaults_do_not_enable_embeddings_by_themselves() {
         "embeddings are opt-in (RFC 0006 §8); a default model must not opt the user in"
     );
 }
+
+// ---- Log redaction at the title-generation warn sites (#1118) ----
+
+/// Fails the way that matters: an `Api` error whose message is the provider echoing
+/// the user's prompt back, which is exactly what a 400 often contains.
+struct LeakyProvider {
+    /// When true the failure arrives mid-stream rather than at open, exercising the
+    /// second of the two warn sites.
+    fail_mid_stream: bool,
+}
+
+const LEAKED_SECRET: &str = "user said: my key is sk-live-abc123";
+
+#[async_trait::async_trait]
+impl Provider for LeakyProvider {
+    async fn chat_stream(
+        &self,
+        _req: ff_llm::ChatRequest,
+    ) -> Result<ff_llm::ChunkStream, ff_llm::LlmError> {
+        let err = || ff_llm::LlmError::Api {
+            status: 400,
+            message: LEAKED_SECRET.to_string(),
+        };
+        if self.fail_mid_stream {
+            use futures_util::StreamExt;
+            Ok(futures_util::stream::iter(vec![Err(err())]).boxed())
+        } else {
+            Err(err())
+        }
+    }
+}
+
+/// Captures everything written at `warn` while `f` runs.
+///
+/// Asserting on real subscriber output rather than on `log_kind`'s return value is
+/// the point: `log_kind` being correct does not stop a call site from using `%e`,
+/// and the call site is where the leak happens. The warn floor (#1118) means these
+/// lines land in a file by default, so this is the layer worth pinning.
+fn captured_warnings<F: std::future::Future<Output = ()>>(f: impl FnOnce() -> F) -> String {
+    use std::sync::{Arc, Mutex};
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::Layer;
+
+    #[derive(Clone)]
+    struct Sink(Arc<Mutex<Vec<u8>>>);
+    impl std::io::Write for Sink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Sink {
+        type Writer = Sink;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    let buf: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    {
+        let layer = tracing_subscriber::fmt::layer()
+            .with_writer(Sink(Arc::clone(&buf)))
+            .with_ansi(false)
+            .with_filter(tracing_subscriber::filter::LevelFilter::WARN);
+        let subscriber = tracing_subscriber::registry().with(layer);
+
+        tracing::subscriber::with_default(subscriber, || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .unwrap()
+                .block_on(f());
+        });
+    }
+
+    let bytes = buf.lock().unwrap().clone();
+    String::from_utf8(bytes).unwrap()
+}
+
+#[test]
+fn title_generation_failure_does_not_log_the_provider_body() {
+    for fail_mid_stream in [false, true] {
+        let logs = captured_warnings(|| async move {
+            let provider = LeakyProvider { fail_mid_stream };
+            let req = ChatRequest {
+                model: "m".into(),
+                messages: vec![ChatMessage::text("user", "hi")],
+                ..Default::default()
+            };
+            let out = collect_stream_text(&provider, req, &CancelToken::default()).await;
+            assert!(out.is_none(), "the provider failed, so there is no title");
+        });
+
+        assert!(
+            logs.contains("title generation"),
+            "expected the warn line to have been emitted (mid_stream={fail_mid_stream}); got: {logs}"
+        );
+        assert!(
+            !logs.contains("sk-live-abc123"),
+            "the provider body reached the log (mid_stream={fail_mid_stream}): {logs}"
+        );
+        assert!(
+            !logs.contains(LEAKED_SECRET),
+            "the provider body reached the log (mid_stream={fail_mid_stream}): {logs}"
+        );
+        // The status must survive, or the redaction has thrown away the diagnosis.
+        assert!(
+            logs.contains("status 400"),
+            "the status is safe and actionable, so it must be kept: {logs}"
+        );
+    }
+}
