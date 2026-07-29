@@ -23,6 +23,13 @@ export function clampSplitWidth(px: number): number {
 
 // ── Persistence ──────────────────────────────────────────────────────────────
 // open/width/wrap/content all survive reload so an open panel comes back intact.
+//
+// Stored through `durableStorage` (#1134) — a WKWebView doesn't reliably flush
+// localStorage before the process exits, so a panel opened or resized late in a
+// session could otherwise come back closed. The on-disk shape is unchanged, so
+// an existing `ff-split` value is adopted as-is; see lib/durable-json.ts.
+
+import { readDurable, writeDurable } from "@/lib/durable-json";
 
 const STORAGE_KEY = "ff-split";
 
@@ -33,39 +40,33 @@ interface Persisted {
   content: SplitContent | null;
 }
 
-function loadPersisted(): Persisted {
-  const fallback: Persisted = {
-    open: false,
-    width: DEFAULT_WIDTH,
-    wrap: true,
-    content: null,
-  };
-  try {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    if (!raw) return fallback;
-    const p = JSON.parse(raw) as Partial<Persisted>;
-    return {
-      open: Boolean(p.open),
-      width: clampSplitWidth(p.width ?? DEFAULT_WIDTH),
-      wrap: p.wrap ?? true,
-      content: p.content ?? null,
-    };
-  } catch {
-    return fallback;
-  }
-}
+const FALLBACK: Persisted = {
+  open: false,
+  width: DEFAULT_WIDTH,
+  wrap: true,
+  content: null,
+};
 
-function persist(p: Persisted): void {
-  try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(p));
-  } catch {
-    // Quota / private mode — non-fatal; panel just won't survive reload.
-  }
+function parsePersisted(raw: unknown): Persisted {
+  const p = (raw ?? {}) as Partial<Persisted>;
+  return {
+    open: Boolean(p.open),
+    width: clampSplitWidth(p.width ?? DEFAULT_WIDTH),
+    wrap: p.wrap ?? true,
+    content: p.content ?? null,
+  };
 }
 
 // ── Store ────────────────────────────────────────────────────────────────────
 
 interface SplitState extends Persisted {
+  /** False until the (always-async) durable read has landed. Nothing gates
+   *  render on it — `split-panel.tsx` returns null while closed and has no width
+   *  transition, so a panel restored open simply paints a tick later rather than
+   *  animating in — but a write before it flips would persist a closed panel
+   *  over the open one on disk, so `save` waits for it. Runtime-only. */
+  hasHydrated: boolean;
+
   openInSplit: (content: SplitContent) => void;
   closeSplit: () => void;
   /** Flip the panel open/closed without changing its content (⌘K palette). When
@@ -73,16 +74,23 @@ interface SplitState extends Persisted {
   toggleSplit: () => void;
   setWidth: (px: number) => void;
   toggleWrap: () => void;
+  /** Adopt the persisted panel state. Fired once on module load; exported on the
+   *  store so tests can re-run it after seeding storage. */
+  hydrate: () => Promise<void>;
 }
 
 export const useSplitStore = create<SplitState>((set, get) => {
   const save = () => {
+    // Before hydration the state is still defaults; writing them would clobber
+    // the panel the user actually left open.
+    if (!get().hasHydrated) return;
     const { open, width, wrap, content } = get();
-    persist({ open, width, wrap, content });
+    writeDurable(STORAGE_KEY, { open, width, wrap, content });
   };
 
   return {
-    ...loadPersisted(),
+    ...FALLBACK,
+    hasHydrated: false,
 
     openInSplit: (content) => {
       set({ open: true, content });
@@ -106,5 +114,16 @@ export const useSplitStore = create<SplitState>((set, get) => {
       set((s) => ({ wrap: !s.wrap }));
       save();
     },
+
+    hydrate: async () => {
+      const stored = await readDurable(STORAGE_KEY, parsePersisted, FALLBACK);
+      // A panel opened while the read was in flight is newer than what's on
+      // disk — keep it rather than yanking it shut under the user.
+      set((s) =>
+        s.open ? { hasHydrated: true } : { ...stored, hasHydrated: true },
+      );
+    },
   };
 });
+
+void useSplitStore.getState().hydrate();

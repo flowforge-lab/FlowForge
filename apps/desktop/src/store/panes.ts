@@ -11,10 +11,20 @@
 // focused pane's session is mirrored to the chat store's activeSessionId so the
 // sidebar highlight and ⌘1-9 / ⌘K shortcuts stay coherent with the single-pane UX.
 //
-// Pure tree state persists to localStorage (mirrors store/split.ts). The chat
-// store is the only outward dependency (focus -> setActiveSession bridge).
+// Pure tree state persists through `durableStorage` (#1134, mirrors
+// store/split.ts) — a WKWebView doesn't reliably flush localStorage before the
+// process exits, so a layout arranged late in a session could otherwise be lost
+// on quit. The on-disk shape is unchanged, so an existing `ff-panes` value is
+// adopted as-is; see lib/durable-json.ts. The chat store is the only outward
+// dependency (focus -> setActiveSession bridge).
+//
+// The async read costs nothing here: this store never read at creation time.
+// `root` starts null, `init` does the read as part of reconciling the persisted
+// tree against live session ids, and `pane-tree.tsx` already renders nothing
+// while root is null — so `init` simply became async.
 
 import { create } from "zustand";
+import { readDurable, writeDurable } from "@/lib/durable-json";
 import { useChatStore } from "@/store/chat";
 
 export type SplitDir = "vertical" | "horizontal";
@@ -286,28 +296,22 @@ function normalizeNode(node: PaneNode): PaneNode {
   };
 }
 
-function loadPersisted(): Persisted {
-  try {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    if (!raw) return { root: null, focusedPaneId: null };
-    const p = JSON.parse(raw) as Partial<Persisted>;
-    const root = isNode(p.root) ? normalizeNode(p.root) : null;
-    return {
-      root,
-      focusedPaneId:
-        typeof p.focusedPaneId === "string" ? p.focusedPaneId : null,
-    };
-  } catch {
-    return { root: null, focusedPaneId: null };
-  }
+const EMPTY: Persisted = { root: null, focusedPaneId: null };
+
+function parsePersisted(raw: unknown): Persisted {
+  const p = (raw ?? {}) as Partial<Persisted>;
+  return {
+    root: isNode(p.root) ? normalizeNode(p.root) : null,
+    focusedPaneId: typeof p.focusedPaneId === "string" ? p.focusedPaneId : null,
+  };
+}
+
+function loadPersisted(): Promise<Persisted> {
+  return readDurable(STORAGE_KEY, parsePersisted, EMPTY);
 }
 
 function persist(p: Persisted): void {
-  try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(p));
-  } catch {
-    // Quota / private mode — non-fatal; layout just won't survive reload.
-  }
+  writeDurable(STORAGE_KEY, p);
 }
 
 /** Drop leaves whose session no longer exists, collapsing their parent splits.
@@ -331,8 +335,14 @@ interface PanesState {
   focusedPaneId: string | null;
 
   /** Build/repair the tree from live sessions. Drops dangling leaves; if nothing
-   *  survives, starts a single leaf on `activeSessionId`. */
-  init: (liveSessionIds: string[], activeSessionId: string | null) => void;
+   *  survives, starts a single leaf on `activeSessionId`. Async since #1134: the
+   *  persisted tree is read from durable storage. Concurrent calls are collapsed
+   *  onto the first, so the caller's effect can't start a second one while the
+   *  read is in flight (`root` stays null until it lands). */
+  init: (
+    liveSessionIds: string[],
+    activeSessionId: string | null,
+  ) => Promise<void>;
   leafCount: () => number;
   /** Split `paneId` side-by-side, putting `sessionId` in the new (focused) leaf. */
   splitRight: (paneId: string, sessionId: string) => void;
@@ -348,6 +358,9 @@ interface PanesState {
   setPaneSession: (paneId: string, sessionId: string) => void;
   toggleCollapse: (paneId: string) => void;
 }
+
+/** In-flight `init`, so concurrent callers collapse onto one read. See `init`. */
+let initInFlight: Promise<void> | null = null;
 
 export const usePanesStore = create<PanesState>((set, get) => {
   const save = () => {
@@ -399,42 +412,59 @@ export const usePanesStore = create<PanesState>((set, get) => {
     save();
   };
 
+  /** The body of `init`, minus the concurrency guard. */
+  const runInit = async (
+    liveSessionIds: string[],
+    activeSessionId: string | null,
+  ) => {
+    const live = new Set(liveSessionIds);
+    const persisted = await loadPersisted();
+    let root = reconcile(persisted.root, live);
+    if (!root) {
+      if (!activeSessionId) {
+        set({ root: null, focusedPaneId: null });
+        return;
+      }
+      root = { type: "leaf", id: newId(), sessionId: activeSessionId };
+    }
+    const allLeaves = leaves(root);
+    const ids = new Set(allLeaves.map((l) => l.id));
+    const focusedPaneId =
+      persisted.focusedPaneId && ids.has(persisted.focusedPaneId)
+        ? persisted.focusedPaneId
+        : (allLeaves[0]?.id ?? null);
+    set({ root, focusedPaneId });
+    save();
+
+    // Reload bootstrap: pull every restored pane's transcript (not just the
+    // active one) so background panes aren't blank until clicked, and align
+    // the chat store's active session with the restored focus ring.
+    const chat = useChatStore.getState();
+    const seen = new Set<string>();
+    for (const leaf of allLeaves) {
+      if (seen.has(leaf.sessionId)) continue;
+      seen.add(leaf.sessionId);
+      void chat.loadSession(leaf.sessionId);
+    }
+    const focusedLeaf = allLeaves.find((l) => l.id === focusedPaneId);
+    if (focusedLeaf) chat.setActiveSession(focusedLeaf.sessionId);
+  };
+
   return {
     root: null,
     focusedPaneId: null,
 
     init: (liveSessionIds, activeSessionId) => {
-      const live = new Set(liveSessionIds);
-      const persisted = loadPersisted();
-      let root = reconcile(persisted.root, live);
-      if (!root) {
-        if (!activeSessionId) {
-          set({ root: null, focusedPaneId: null });
-          return;
-        }
-        root = { type: "leaf", id: newId(), sessionId: activeSessionId };
-      }
-      const allLeaves = leaves(root);
-      const ids = new Set(allLeaves.map((l) => l.id));
-      const focusedPaneId =
-        persisted.focusedPaneId && ids.has(persisted.focusedPaneId)
-          ? persisted.focusedPaneId
-          : (allLeaves[0]?.id ?? null);
-      set({ root, focusedPaneId });
-      save();
-
-      // Reload bootstrap: pull every restored pane's transcript (not just the
-      // active one) so background panes aren't blank until clicked, and align
-      // the chat store's active session with the restored focus ring.
-      const chat = useChatStore.getState();
-      const seen = new Set<string>();
-      for (const leaf of allLeaves) {
-        if (seen.has(leaf.sessionId)) continue;
-        seen.add(leaf.sessionId);
-        void chat.loadSession(leaf.sessionId);
-      }
-      const focusedLeaf = allLeaves.find((l) => l.id === focusedPaneId);
-      if (focusedLeaf) chat.setActiveSession(focusedLeaf.sessionId);
+      // `usePaneInit`'s effect re-fires while `root` is still null, which it is
+      // for the whole durable read — so collapse concurrent calls onto one
+      // promise. Without this the layout is built twice, the second run
+      // persisting over the first.
+      initInFlight ??= runInit(liveSessionIds, activeSessionId).finally(() => {
+        // Cleared so a later rebuild can run (callers guard on `root` being
+        // null, i.e. the layout was torn down).
+        initInFlight = null;
+      });
+      return initInFlight;
     },
 
     leafCount: () => {

@@ -51,28 +51,21 @@ export type PaletteCommandKind = PaletteCommand["kind"];
 // Only recents persist: the last few command ids, most-recent first, so an empty
 // query surfaces what you reach for. `open` is ephemeral (never restore a modal
 // across reloads). Mirrors the load/persist helpers in store/split.ts.
+//
+// Stored through `durableStorage` (#1134) — a WKWebView doesn't reliably flush
+// localStorage before the process exits, so a command run late in a session
+// could otherwise vanish from recents on quit. The on-disk shape is unchanged,
+// so an existing `ff-palette` value is adopted as-is; see lib/durable-json.ts.
+
+import { readDurable, writeDurable } from "@/lib/durable-json";
 
 const STORAGE_KEY = "ff-palette";
 const MAX_RECENT = 6;
 
-function loadRecent(): string[] {
-  try {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    if (!raw) return [];
-    const p = JSON.parse(raw) as { recent?: unknown };
-    if (!Array.isArray(p.recent)) return [];
-    return p.recent.filter((id): id is string => typeof id === "string");
-  } catch {
-    return [];
-  }
-}
-
-function persistRecent(recent: string[]): void {
-  try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify({ recent }));
-  } catch {
-    // Quota / private mode — non-fatal; recents just won't survive reload.
-  }
+function parseRecent(raw: unknown): string[] {
+  const recent = (raw as { recent?: unknown } | null)?.recent;
+  if (!Array.isArray(recent)) return [];
+  return recent.filter((id): id is string => typeof id === "string");
 }
 
 // ── Store ────────────────────────────────────────────────────────────────────
@@ -81,17 +74,26 @@ interface PaletteState {
   open: boolean;
   /** Recently run command ids, most-recent first (deduped, capped). */
   recent: string[];
+  /** False until the (always-async) durable read has landed. Nothing gates
+   *  render on this — recents are only read once ⌘K opens the palette, long
+   *  after mount — but a write before it flips would persist an empty list over
+   *  what's on disk, so `pushRecent` waits for it. Runtime-only. */
+  hasHydrated: boolean;
 
   openPalette: () => void;
   closePalette: () => void;
   togglePalette: () => void;
   /** Record that a command ran; bumps it to the front of `recent`. */
   pushRecent: (id: string) => void;
+  /** Adopt the persisted recents. Fired once on module load; exported on the
+   *  store so tests can re-run it after seeding storage. */
+  hydrate: () => Promise<void>;
 }
 
 export const usePaletteStore = create<PaletteState>((set, get) => ({
   open: false,
-  recent: loadRecent(),
+  recent: [],
+  hasHydrated: false,
 
   openPalette: () => set({ open: true }),
   closePalette: () => set({ open: false }),
@@ -102,7 +104,22 @@ export const usePaletteStore = create<PaletteState>((set, get) => ({
       0,
       MAX_RECENT,
     );
-    persistRecent(recent);
     set({ recent });
+    if (get().hasHydrated) writeDurable(STORAGE_KEY, { recent });
+  },
+
+  hydrate: async () => {
+    const stored = await readDurable(STORAGE_KEY, parseRecent, []);
+    // Anything pushed while the read was in flight is newer than what was on
+    // disk, so it wins — merge rather than clobber.
+    set((s) => ({
+      recent: [
+        ...s.recent,
+        ...stored.filter((id) => !s.recent.includes(id)),
+      ].slice(0, MAX_RECENT),
+      hasHydrated: true,
+    }));
   },
 }));
+
+void usePaletteStore.getState().hydrate();
