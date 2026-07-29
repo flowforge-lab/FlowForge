@@ -1652,7 +1652,7 @@ fn spawn_assistant_turn(
         // phenotype's declared skills; an unbound session keeps the global active
         // set so the command palette still affects turns. See `turn_active_skills`.
         let active: Vec<String> = state.turn_active_skills(&sid);
-        let (inject_mem, extra_instructions) = state.turn_prompt_injection();
+        let (inject_mem, extra_instructions) = state.turn_prompt_injection(&session_root);
         // Fold any deferred observer wakes into the turn's request-only
         // instructions (#1018 Path B): they ride in the volatile system
         // block, seen by this turn but never persisted to the transcript.
@@ -2170,7 +2170,7 @@ impl GoalIteration for GoalLoopIteration {
         let user_ctx =
             ff_agent::UserContext::now().with_working_dir(session_root.display().to_string());
         let active: Vec<String> = self.state.turn_active_skills(&sid);
-        let (inject_mem, extra_instructions) = self.state.turn_prompt_injection();
+        let (inject_mem, extra_instructions) = self.state.turn_prompt_injection(&session_root);
         let (memory, _ambient_keys) = if inject_mem {
             self.state
                 .memory()
@@ -2519,7 +2519,7 @@ impl ff_scheduled::TaskRunner for DesktopTaskRunner {
         let user_ctx =
             ff_agent::UserContext::now().with_working_dir(session_root.display().to_string());
         let active: Vec<String> = self.state.turn_active_skills(&sid);
-        let (inject_mem, extra_instructions) = self.state.turn_prompt_injection();
+        let (inject_mem, extra_instructions) = self.state.turn_prompt_injection(&session_root);
         let (memory, _ambient_keys) = if inject_mem {
             self.state
                 .memory()
