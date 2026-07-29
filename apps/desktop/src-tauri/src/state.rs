@@ -968,6 +968,14 @@ fn build_session_store() -> SessionStore {
     // Tests must never write to the real config dir (see load_or_migrate_registry).
     // An on-disk session db is exercised directly in `session_db_survives_restart`.
     if cfg!(test) {
+        // Allow restart-scenario tests to point AppState::with_registry at a
+        // pre-populated file-backed db without touching the real config dir.
+        if let Ok(path) = std::env::var("FF_TEST_SESSION_DB_PATH") {
+            return SessionStore::open(&path).unwrap_or_else(|e| {
+                tracing::warn!(error = %e, path = %path, "test session db unavailable; falling back to in-memory");
+                SessionStore::new()
+            });
+        }
         return SessionStore::new();
     }
     let Some(path) = sessions_db_path() else {
