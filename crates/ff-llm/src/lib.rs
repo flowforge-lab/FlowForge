@@ -724,6 +724,26 @@ pub fn model_context_window(model: &str) -> u64 {
     model_specs::lookup(model)
 }
 
+/// Whether `(kind, model)` accepts image attachments, resolved from the same
+/// layered rule set as [`model_context_window`]: the bundled defaults overlaid by
+/// the user's optional `model-specs.json`.
+///
+/// Prefer this over [`ff_core::model_supports_vision`] on every application path.
+/// `ff-core` is I/O-free and therefore sees only the bundled defaults, so calling it
+/// directly silently ignores the user's override (#1137). Because the first matching
+/// rule wins, a user rule can both un-gate a capable model the defaults miss and
+/// revoke vision from one they wrongly grant.
+///
+/// The bundled verdict is a substring match on the model id, which cannot express a
+/// flagship that ships vision without advertising it in its name
+/// (`moonshotai/Kimi-K3`), nor survive a version bump that moves the marker
+/// (`GLM-4V` -> `GLM-5V-Turbo`). Keeping the override reachable is what makes those
+/// cases fixable without a release; a runtime capability probe (as the Ollama path
+/// already does via `show`) is the longer-term answer.
+pub fn model_supports_vision(kind: ff_core::ProviderKind, model: &str) -> bool {
+    model_specs::supports_vision(kind, model)
+}
+
 /// Output-token ceiling for a turn, sized to the model's context window minus the
 /// estimated input and a safety buffer, capped at a generous ceiling. Pinning this
 /// on the gateway path keeps a large tool-call payload (plus any thinking) from

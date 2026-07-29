@@ -11,10 +11,10 @@ use ff_agent::{
     ProxyTokenEstimator, DEFAULT_FLUSH_AT_FRACTION,
 };
 use ff_core::{
-    model_supports_documents, model_supports_vision, BedrockAuth, ConnectionId,
-    ContextWindowSource, GoalStore, McpScope, McpServerConfig, McpServerState, McpServerStatus,
-    Mode, ModelSelection, Phenotype, ProviderConfig, ProviderConnection, ProviderKind,
-    ProviderRegistry, ResolvedModel, SearchBackend, SearchConfig, SecretKind, SessionWorkspace,
+    model_supports_documents, BedrockAuth, ConnectionId, ContextWindowSource, GoalStore, McpScope,
+    McpServerConfig, McpServerState, McpServerStatus, Mode, ModelSelection, Phenotype,
+    ProviderConfig, ProviderConnection, ProviderKind, ProviderRegistry, ResolvedModel,
+    SearchBackend, SearchConfig, SecretKind, SessionWorkspace,
 };
 use ff_llm::{
     model_context_window, ollama_num_ctx_from_env, reasoning_control, wire_dialect, BedrockCreds,
@@ -244,7 +244,10 @@ fn build_provider(conn: &ProviderConnection, model: &str) -> Box<dyn Provider> {
     // Attachment capabilities are derived from the resolved `(kind, model)` (RFC
     // 0005 §11.3), never a stored connection flag, so a per-session model override
     // is gated by the model actually running. Fail-closed on unknown models.
-    let vision = model_supports_vision(conn.kind, model);
+    // `ff_llm`'s lookup (not `ff_core`'s) so the user's `model-specs.json` override
+    // is honoured -- the bundled name matching alone misclassifies flagships that
+    // ship vision without advertising it in their id (#1137).
+    let vision = ff_llm::model_supports_vision(conn.kind, model);
     let documents = model_supports_documents(conn.kind, model);
     match conn.kind {
         ProviderKind::CandleVllm => Box::new(
@@ -2847,7 +2850,8 @@ impl AppState {
                 .find(|c| c.id == connection)
                 .map(|c| c.kind)
         };
-        let supports_vision = kind.is_some_and(|k| model_supports_vision(k, &model));
+        // Override-aware lookup, matching `build_provider` above (#1137).
+        let supports_vision = kind.is_some_and(|k| ff_llm::model_supports_vision(k, &model));
         let supports_documents = kind.is_some_and(|k| model_supports_documents(k, &model));
         // #1023: seed the context window from the model spec so the FE context gauge
         // has a real denominator for *every* provider — not just Ollama. The async

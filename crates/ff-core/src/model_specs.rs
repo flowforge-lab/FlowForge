@@ -10,10 +10,15 @@
 //! This module owns the **schema, the bundled defaults, and the pure lookups**.
 //! It does no I/O: the optional user-override layer (reading a config-dir file
 //! and merging it ahead of the bundled rules) lives in `ff-llm`, which feeds the
-//! merged rule slice back into [`context_window_in`]. Keeping the pure layer here
+//! merged rule slice back into [`context_window_in`] and [`supports_vision_in`]
+//! alike, so one override file corrects either verdict. Keeping the pure layer here
 //! lets capability lookups in *other* crates (e.g. the vision gate in
 //! [`crate::provider`]) share one schema and one bundled file without a reverse
 //! dependency on `ff-llm`.
+//!
+//! Application paths must therefore call `ff_llm::model_supports_vision` rather
+//! than [`crate::model_supports_vision`]; the latter sees only the bundled
+//! defaults, which silently ignored the user's override before #1137.
 //!
 //! ## Matching
 //! `match` is tested against the model id per the rule's `match_kind`
@@ -29,8 +34,20 @@
 //!   property of the model, not the transport, so `provider` is ignored here.
 //! - [`supports_vision_in`]: provider-scoped (the `provider` field is consulted;
 //!   `None` matches any) and fail-closed -- `false` unless some matching rule
-//!   carries `supports_vision: true`. Unlike the window lookup it is an OR over
-//!   all matching rules, not first-match-wins (#466).
+//!   carries an explicit verdict. Also first-match-wins (#1137): the first matching
+//!   rule that carries a `supports_vision` decides, so a prepended user rule can
+//!   both grant vision the defaults miss and revoke vision they wrongly grant.
+//!   Window-only rules carry no verdict and are skipped, so they never interfere.
+//!
+//! ## Vision-rule provenance
+//! The SiliconFlow vision rules are empirically verified, not inferred from names
+//! (#1137): each listed family was probed with a real image and asked to report its
+//! content, and the patterns were checked to grant all 22 models that genuinely
+//! accept images while matching none of the 32 that reject them. Name matching is a
+//! stopgap -- it cannot express a flagship that ships vision without saying so in
+//! its id (`moonshotai/Kimi-K3`) and breaks when a version bump moves the marker
+//! (`GLM-4V` -> `GLM-5V-Turbo`), so expect to correct this data, and prefer a
+//! runtime capability probe (as the Ollama path already does) where available.
 
 use serde::Deserialize;
 
@@ -145,18 +162,27 @@ pub fn context_window_in(rules: &[ModelSpec], model: &str) -> u64 {
 }
 
 /// Provider-scoped, fail-closed vision capability lookup over a rule slice (#466).
-/// Returns `true` only when some rule matches *and* carries `supports_vision:
-/// true`; a rule's `provider` must be `None` (any) or equal `kind`. This is an OR
-/// over all matching rules (not first-match-wins): the question is whether *any*
-/// rule grants vision for `(kind, model)`. Window-only rules (`supports_vision:
-/// None`) never grant or block vision, so they cannot interfere. Conservative by
-/// design -- an unknown model returns `false`, and the FE attach gate and provider
-/// safety strip both fail closed on `false`.
+/// A rule's `provider` must be `None` (any) or equal `kind`, and window-only rules
+/// (`supports_vision: None`) never grant or block vision, so they cannot interfere.
+///
+/// **First-match-wins over the opinionated rules**, so the layered rule set is a
+/// genuine two-way override (#1137): the user's `model-specs.json` is prepended to
+/// the bundled defaults, so a user rule carrying `supports_vision: false` *blocks* a
+/// model the defaults would grant, exactly as `supports_vision: true` un-gates one
+/// the defaults miss. Matching `context_window_in`'s precedence here is what makes
+/// "more-specific match wins" mean the same thing on both capability paths.
+///
+/// Conservative by design -- a model no rule matches returns `false`, and the FE
+/// attach gate and provider safety strip both fail closed on `false`. Name matching
+/// cannot express a modern flagship that ships vision without saying so in its id
+/// (`moonshotai/Kimi-K3`), which is precisely why the override must be reachable.
 pub fn supports_vision_in(rules: &[ModelSpec], kind: ProviderKind, model: &str) -> bool {
     let m = model.to_lowercase();
-    rules.iter().any(|r| {
-        r.supports_vision == Some(true) && r.provider.is_none_or(|p| p == kind) && r.matches(&m)
-    })
+    rules
+        .iter()
+        .filter(|r| r.provider.is_none_or(|p| p == kind) && r.matches(&m))
+        .find_map(|r| r.supports_vision)
+        .unwrap_or(false)
 }
 
 #[cfg(test)]

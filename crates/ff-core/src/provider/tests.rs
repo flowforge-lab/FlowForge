@@ -709,3 +709,73 @@ fn connection_with_bedrock_fields_round_trips() {
     let back: ProviderConnection = serde_json::from_str(&json).unwrap();
     assert_eq!(conn, back);
 }
+
+/// #1137 guard. [`model_supports_vision`] reads the **bundled** rules only; this
+/// crate is I/O-free and cannot see the user's `model-specs.json`. Every
+/// application path must therefore go through `ff_llm::model_supports_vision`,
+/// which consults the merged (user + bundled) set.
+///
+/// The doc comment says so, but a doc comment can't fail a build. This test pins
+/// the invariant the fix rests on: nothing outside `ff-core` calls the
+/// bundled-only lookup. Re-wiring an app path back to it is exactly how #1137
+/// happened, and it is silent -- the override simply stops working, with no error
+/// anywhere. Scanning source is crude, but it is the only mechanism that catches
+/// a *new* call site; a type-level guard would need a newtype churn across every
+/// capability lookup for one function's sake.
+#[test]
+fn the_bundled_only_vision_lookup_has_no_callers_outside_ff_core() {
+    // tests.rs (this file) lives under crates/ff-core, so walk up to the root.
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|p| p.parent())
+        .expect("crates/ff-core -> workspace root");
+
+    let mut offenders = Vec::new();
+    let mut stack = vec![root.join("crates"), root.join("apps")];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                // Skip build artefacts and vendored deps; they aren't our source.
+                let name = path.file_name().unwrap_or_default().to_string_lossy();
+                if name != "target" && name != "node_modules" {
+                    stack.push(path);
+                }
+                continue;
+            }
+            if path.extension().is_none_or(|e| e != "rs") {
+                continue;
+            }
+            // ff-core owns the function: its own definition, re-export, and tests
+            // legitimately name it. ff-llm names it only in doc links pointing
+            // callers away from it, which `///` filtering below tolerates.
+            if path.starts_with(root.join("crates/ff-core")) {
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            for (i, line) in text.lines().enumerate() {
+                let trimmed = line.trim_start();
+                // Doc links (`[\`ff_core::model_supports_vision\`]`) are how we
+                // steer people away; they are not call sites.
+                if trimmed.starts_with("//") {
+                    continue;
+                }
+                if line.contains("ff_core::model_supports_vision") {
+                    offenders.push(format!("{}:{}", path.display(), i + 1));
+                }
+            }
+        }
+    }
+
+    assert!(
+        offenders.is_empty(),
+        "these call the bundled-only vision lookup and so ignore the user's \
+         model-specs.json override (#1137); use `ff_llm::model_supports_vision` \
+         instead: {offenders:?}"
+    );
+}
