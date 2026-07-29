@@ -2864,20 +2864,27 @@ fn inject_memory_honors_explicit_false() {
 
 #[test]
 fn extra_instructions_none_on_default_and_empty_config() {
-    assert!(resolve_extra_instructions_from(&default_control_config()).is_none());
-    assert!(resolve_extra_instructions_from(&serde_json::json!({})).is_none());
-    assert!(resolve_extra_instructions_from(&serde_json::json!({
-        "userInstructions": "   \n  ",
-        "promptFiles": []
-    }))
+    let root = Path::new("/ws");
+    assert!(resolve_extra_instructions_from(&default_control_config(), root).is_none());
+    assert!(resolve_extra_instructions_from(&serde_json::json!({}), root).is_none());
+    assert!(resolve_extra_instructions_from(
+        &serde_json::json!({
+            "userInstructions": "   \n  ",
+            "promptFiles": []
+        }),
+        root
+    )
     .is_none());
 }
 
 #[test]
 fn extra_instructions_returns_trimmed_user_instructions() {
-    let out = resolve_extra_instructions_from(&serde_json::json!({
-        "userInstructions": "  Always write doctests.  ",
-    }))
+    let out = resolve_extra_instructions_from(
+        &serde_json::json!({
+            "userInstructions": "  Always write doctests.  ",
+        }),
+        Path::new("/ws"),
+    )
     .expect("some instructions");
     assert_eq!(out, "Always write doctests.");
 }
@@ -2890,10 +2897,13 @@ fn extra_instructions_concatenates_readable_prompt_files() {
     fs::write(&a, "File A body\n").unwrap();
     fs::write(&b, "File B body\n").unwrap();
 
-    let out = resolve_extra_instructions_from(&serde_json::json!({
-        "userInstructions": "Top instruction",
-        "promptFiles": [a.to_str().unwrap(), b.to_str().unwrap()],
-    }))
+    let out = resolve_extra_instructions_from(
+        &serde_json::json!({
+            "userInstructions": "Top instruction",
+            "promptFiles": [a.to_str().unwrap(), b.to_str().unwrap()],
+        }),
+        Path::new("/ws"),
+    )
     .expect("some instructions");
 
     assert_eq!(
@@ -2909,9 +2919,12 @@ fn extra_instructions_skips_missing_or_unreadable_files() {
     fs::write(&good, "Good body").unwrap();
     let missing = tmp.path().join("does-not-exist.md");
 
-    let out = resolve_extra_instructions_from(&serde_json::json!({
-        "promptFiles": [missing.to_str().unwrap(), good.to_str().unwrap()],
-    }))
+    let out = resolve_extra_instructions_from(
+        &serde_json::json!({
+            "promptFiles": [missing.to_str().unwrap(), good.to_str().unwrap()],
+        }),
+        Path::new("/ws"),
+    )
     .expect("the readable file still resolves");
     assert_eq!(out, "### good.md\nGood body");
 }
@@ -2921,20 +2934,55 @@ fn extra_instructions_none_when_only_files_and_all_blank() {
     let tmp = tempfile::tempdir().unwrap();
     let blank = tmp.path().join("blank.md");
     fs::write(&blank, "   \n\t\n").unwrap();
-    assert!(resolve_extra_instructions_from(&serde_json::json!({
-        "promptFiles": [blank.to_str().unwrap()],
-    }))
+    assert!(resolve_extra_instructions_from(
+        &serde_json::json!({
+            "promptFiles": [blank.to_str().unwrap()],
+        }),
+        Path::new("/ws")
+    )
     .is_none());
 }
 
 #[test]
 fn extra_instructions_warns_but_still_injects_past_cap() {
     let big = "x".repeat(MAX_EXTRA_INSTRUCTIONS_BYTES + 1);
-    let out = resolve_extra_instructions_from(&serde_json::json!({
-        "userInstructions": big,
-    }))
+    let out = resolve_extra_instructions_from(
+        &serde_json::json!({
+            "userInstructions": big,
+        }),
+        Path::new("/ws"),
+    )
     .expect("must still inject past cap");
     assert_eq!(out.len(), MAX_EXTRA_INSTRUCTIONS_BYTES + 1);
+}
+
+#[test]
+fn extra_instructions_expands_workspace_placeholder() {
+    let tmp = tempfile::tempdir().unwrap();
+    fs::write(tmp.path().join("AGENTS.md"), "Agent rules").unwrap();
+
+    // Both the UI-suggested `{workspace}` and the ff-mcp-style `${workspace}`
+    // form expand against the session root.
+    for token in ["{workspace}/AGENTS.md", "${workspace}/AGENTS.md"] {
+        let out = resolve_extra_instructions_from(
+            &serde_json::json!({ "promptFiles": [token] }),
+            tmp.path(),
+        )
+        .unwrap_or_else(|| panic!("placeholder {token} should expand and resolve"));
+        assert_eq!(out, "### AGENTS.md\nAgent rules");
+    }
+}
+
+#[test]
+fn extra_instructions_unexpanded_placeholder_is_skipped_not_fatal() {
+    // A literal `{workspace}` that never gets expanded (no matching dir) must
+    // warn-and-skip, never panic — the same best-effort contract as any other
+    // unreadable path.
+    assert!(resolve_extra_instructions_from(
+        &serde_json::json!({ "promptFiles": ["{workspace}/AGENTS.md"] }),
+        Path::new("/no/such/session/root")
+    )
+    .is_none());
 }
 
 // ── Observer wake hardening (#1018) ───────────────────────────────────────

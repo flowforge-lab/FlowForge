@@ -828,7 +828,13 @@ fn inject_memory_enabled_from(cfg: &serde_json::Value) -> bool {
 /// tail and is re-sent every turn, so past [`MAX_EXTRA_INSTRUCTIONS_BYTES`] we
 /// warn but still inject -- honoring the user's explicit instruction rather than
 /// truncating it mid-content.
-fn resolve_extra_instructions_from(cfg: &serde_json::Value) -> Option<String> {
+///
+/// `promptFiles` entries may use a `{workspace}`/`${workspace}` placeholder
+/// (the UI suggests `{workspace}/AGENTS.md`), expanded here against
+/// `session_root` — the same substitution ff-mcp applies to server configs
+/// (#544). Storing the placeholder rather than an absolute path keeps a synced
+/// Control config portable across machines and per-session checkouts.
+fn resolve_extra_instructions_from(cfg: &serde_json::Value, session_root: &Path) -> Option<String> {
     let mut parts: Vec<String> = Vec::new();
 
     if let Some(instr) = cfg.get("userInstructions").and_then(|v| v.as_str()) {
@@ -839,16 +845,20 @@ fn resolve_extra_instructions_from(cfg: &serde_json::Value) -> Option<String> {
     }
 
     if let Some(files) = cfg.get("promptFiles").and_then(|v| v.as_array()) {
+        let root = session_root.to_string_lossy();
         for entry in files {
-            let Some(path) = entry.as_str() else { continue };
-            match fs::read_to_string(path) {
+            let Some(raw) = entry.as_str() else { continue };
+            let path = raw
+                .replace("${workspace}", &root)
+                .replace("{workspace}", &root);
+            match fs::read_to_string(&path) {
                 Ok(body) => {
                     let body = body.trim();
                     if !body.is_empty() {
-                        let label = std::path::Path::new(path)
+                        let label = Path::new(&path)
                             .file_name()
                             .and_then(|n| n.to_str())
-                            .unwrap_or(path);
+                            .unwrap_or(&path);
                         parts.push(format!("### {label}\n{body}"));
                     }
                 }
@@ -2800,12 +2810,13 @@ impl AppState {
 
     /// Load the Control config once and resolve both prompt-injection values for a
     /// turn. Avoids the double disk-read of calling `inject_memory_enabled()` and
-    /// `resolve_extra_instructions()` separately.
-    pub fn turn_prompt_injection(&self) -> (bool, Option<String>) {
+    /// `resolve_extra_instructions()` separately. `session_root` expands the
+    /// `{workspace}` placeholder in any `promptFiles` path.
+    pub fn turn_prompt_injection(&self, session_root: &Path) -> (bool, Option<String>) {
         let cfg = self.control_config();
         (
             inject_memory_enabled_from(&cfg),
-            resolve_extra_instructions_from(&cfg),
+            resolve_extra_instructions_from(&cfg, session_root),
         )
     }
 
