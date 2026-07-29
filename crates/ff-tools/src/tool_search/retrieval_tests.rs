@@ -321,18 +321,26 @@ const QUERIES: &[(&str, &str)] = &[
 /// | set | top-1 | top-5 |
 /// |---|---|---|
 /// | [`QUERIES`] (open book) | 90.4% | 100% |
-/// | [`HELD_OUT`] (closed book) | 25.0% | 46.4% |
+/// | [`HELD_OUT`] (closed book) | 32.8% | 51.6% |
 ///
 /// Both are asserted, separately, so the gap stays visible instead of being
 /// averaged away. A future change that lifts the held-out floor is real progress;
 /// one that only lifts the tuned floor is more fitting.
 ///
-/// Three of the held-out misses (`escalate an incident`, `approve a promotion`,
-/// `ssh into a box`) return *nothing at all*, and are unreachable by construction:
-/// they share no token with their target's text, so no lexical scorer — BM25,
-/// substring, or otherwise — can connect them. They are kept in the set precisely
-/// because they quantify the ceiling of the lexical approach, which is the
-/// evidence needed to judge whether a semantic layer earns its cost.
+/// Widened from 28 to 64 queries for Phase 2B (#1138), before any semantic
+/// retrieval code existed — at 28, a single query moved the score by 3.6 points,
+/// which is enough for noise to impersonate a result. The added queries also
+/// cover the 14 corpus tools the original set never asked for, so the measurement
+/// is no longer concentrated on half the corpus. Held-out moved 25.0% → 32.8%
+/// top-1 on the wider set, which is a better estimate of the same behaviour
+/// rather than an improvement: nothing about the scorer changed here.
+///
+/// Seven of the held-out misses return *nothing at all* and are unreachable by
+/// construction: they share no token with their target's text, so no lexical
+/// scorer — BM25, substring, or otherwise — can connect them.
+/// They are kept in the set precisely because they quantify the ceiling of the
+/// lexical approach, which is the evidence needed to judge whether a semantic
+/// layer earns its cost.
 const HELD_OUT: &[(&str, &str)] = &[
     ("roll back a bad release", "deploy_read"),
     ("what version is deployed", "deploy_read"),
@@ -362,6 +370,63 @@ const HELD_OUT: &[(&str, &str)] = &[
     ("what links to this page", "backlink_list"),
     ("open my todo list", "task_vault_list"),
     ("trace a call path", "symbol_explore"),
+    // --- widened for Phase 2B (#1138), written before any semantic code existed ---
+    // Added to reach ~64 so one query stops being worth 3.6 points, and to cover
+    // the 14 corpus tools the original 28 never touched.
+    ("what tickets are assigned to my group", "tracker_read"),
+    ("show the stages of a release pipeline", "pipeline_details"),
+    ("kick off a build on the build fleet", "remote_build"),
+    ("set up a fresh dev environment", "workspace_create"),
+    (
+        "pull someone else's patch onto my machine",
+        "review_checkout",
+    ),
+    ("add a todo item for later", "task_create"),
+    ("look something up in the company wiki", "wiki_search"),
+    ("open an internal documentation page", "intranet_read"),
+    ("find a note I wrote", "vault_search"),
+    (
+        "show the surrounding lines of a note match",
+        "vault_search_context",
+    ),
+    ("jot something into today's journal", "daily_append"),
+    ("what did I write yesterday", "daily_read"),
+    ("start a new markdown file", "file_create"),
+    ("what labels exist in my notes", "tag_list"),
+    // Vocabulary-gap probes: phrasings a person would use whose target shares
+    // little or no wording with the tool's text. These are the cases 2A proved
+    // lexical retrieval cannot reach.
+    ("undo the last deployment", "deploy_read"),
+    ("who broke the build", "pipeline_health"),
+    ("find where a symbol comes from", "code_search"),
+    ("get eyes on my patch", "review_create"),
+    ("my change needs sign off", "review_create"),
+    ("something is wrong in production right now", "oncall_read"),
+    ("nobody answered the alert", "oncall_read"),
+    ("is this service exposed", "risk_read"),
+    ("restart a machine in the fleet", "fleet_run"),
+    ("tests pass locally but not in ci", "test_run_read"),
+    ("collaborate on a design document", "doc_editor"),
+    (
+        "what does this internal abbreviation stand for",
+        "acronym_lookup",
+    ),
+    ("how long is this document", "word_count"),
+    ("which pages reference this note", "backlink_list"),
+    ("what work is on my plate", "task_vault_list"),
+    ("where does this function get called from", "symbol_explore"),
+    ("look inside a running container", "fleet_run"),
+    (
+        "show me the diff someone sent for review",
+        "review_checkout",
+    ),
+    ("check out a colleague's branch locally", "review_checkout"),
+    (
+        "grep my notes and show me the matching lines",
+        "vault_search_context",
+    ),
+    ("what did the reviewer say on my patch", "review_comment"),
+    ("did my last commit break anything", "test_run_read"),
 ];
 
 /// Minimum share of [`QUERIES`] whose correct tool must appear in the returned list.
@@ -384,13 +449,17 @@ const TOP5_FLOOR: f64 = 0.96;
 /// approvals"), so small movement is annotation noise. A 12-point drop is not.
 const TOP1_FLOOR: f64 = 0.84;
 
-/// Floors for [`HELD_OUT`], set just under the measured 46.4% / 25.0%.
+/// Floors for [`HELD_OUT`], set just under the measured 51.6% / 32.8%.
 ///
 /// Deliberately recorded as low numbers rather than quietly omitted. They are
 /// what lexical retrieval actually achieves on wording it was not fitted to, and
 /// the honest baseline for judging whether a semantic layer is worth its cost.
-const HELD_OUT_TOP5_FLOOR: f64 = 0.42;
-const HELD_OUT_TOP1_FLOOR: f64 = 0.21;
+///
+/// Raised from 0.42 / 0.21 when the set was widened to 64 queries (#1138). The
+/// underlying scorer did not change; the wider sample simply measures it more
+/// precisely, so the floors follow the measurement rather than the reverse.
+const HELD_OUT_TOP5_FLOOR: f64 = 0.48;
+const HELD_OUT_TOP1_FLOOR: f64 = 0.29;
 
 struct Fixture(&'static str, &'static str, Value);
 

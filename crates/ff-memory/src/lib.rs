@@ -28,7 +28,7 @@ pub mod watch;
 pub use consolidate::{
     chunk_key, ChunkStatsSalience, ConsolidationReport, RecencyFrequencySalience, Salience,
 };
-pub use embed::{Embedder, NoopEmbedder, OpenAiEmbedder};
+pub use embed::{Embedder, NoopEmbedder, OpenAiEmbedder, INTERACTIVE_EMBED_TIMEOUT};
 pub use error::{MemoryError, Result};
 pub use flush::{FlushLedger, FlushRecord};
 pub use index::{ChunkStatSnapshot, Fts5Index, HybridIndex, MemoryIndex, ScoredChunk};

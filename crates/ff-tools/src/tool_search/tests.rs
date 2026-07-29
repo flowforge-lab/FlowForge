@@ -50,6 +50,15 @@ fn deferred(name: &'static str, desc: &'static str, schema: Value) -> Box<dyn To
 }
 
 fn fixture() -> ToolSearchTool {
+    fixture_sharing(Arc::new(ToolSearchState::new()))
+}
+
+/// A fixture over a caller-supplied `ToolSearchState`, so a test can build several
+/// tools that share it. That is what production does: `build_tool_registry` clones
+/// one long-lived `Arc<ToolSearchState>` into a fresh `ToolSearchTool` on every
+/// turn, so state that must outlive a turn has to live on the *state*, not on the
+/// tool.
+fn fixture_sharing(state: Arc<ToolSearchState>) -> ToolSearchTool {
     let mut reg = ToolRegistry::default();
     reg.register(deferred(
         "ticketing_write",
@@ -69,10 +78,7 @@ fn fixture() -> ToolSearchTool {
         json!({"type": "object", "properties": {}}),
     ));
     reg.register(Box::new(Resident));
-    ToolSearchTool::new(
-        Arc::new(ToolSearchState::new()),
-        ToolSearchIndex::from_registry(&reg),
-    )
+    ToolSearchTool::new(state, ToolSearchIndex::from_registry(&reg))
 }
 
 async fn search(tool: &ToolSearchTool, session: &str, args: Value) -> String {
@@ -283,7 +289,7 @@ fn an_empty_index_is_searchable_and_yields_nothing() {
     let idx = ToolSearchIndex::from_registry(&reg);
     assert!(idx.is_empty());
     let t = ToolSearchTool::new(Arc::new(ToolSearchState::new()), idx);
-    assert!(t.search("anything", 5).is_empty());
+    assert!(t.search_fused("anything", 5, None).is_empty());
 }
 
 #[tokio::test]
@@ -363,4 +369,372 @@ fn first_sentence_truncates_on_a_char_boundary() {
 
     // Short input is returned whole, with no marker.
     assert_eq!(first_sentence("Short one."), "Short one.");
+}
+
+/// A failing embedder must produce *byte-identical* results to no embedder at all.
+///
+/// The weaker assertion — that results are merely non-empty — would pass even if
+/// the semantic path silently reordered or dropped candidates on failure. Since
+/// embeddings are opt-in, "embedder absent or broken" is the common case, and it
+/// has to be indistinguishable from Phase 2A rather than approximately equal to it.
+#[tokio::test]
+async fn a_broken_embedder_yields_exactly_the_lexical_ranking() {
+    /// Fully dead: neither corpus nor query embeds succeed.
+    struct Dead;
+    impl ff_memory::Embedder for Dead {
+        fn embed_query(&self, _: &str) -> ff_memory::Result<Option<Vec<f32>>> {
+            Ok(None)
+        }
+        fn embed_chunk(&self, _: &str) -> ff_memory::Result<Option<Vec<f32>>> {
+            Ok(None)
+        }
+    }
+
+    /// The nastier case: the corpus warms, then query embeds start failing (the
+    /// server died mid-session, or rate-limited just this call). A half-warm cache
+    /// must not be allowed to rank on its own.
+    struct QueryOnlyFailure;
+    impl ff_memory::Embedder for QueryOnlyFailure {
+        fn embed_query(&self, _: &str) -> ff_memory::Result<Option<Vec<f32>>> {
+            Ok(None)
+        }
+        fn embed_chunk(&self, text: &str) -> ff_memory::Result<Option<Vec<f32>>> {
+            Ok(Some(vec![text.len() as f32, 1.0]))
+        }
+    }
+
+    fn boom() -> ff_memory::MemoryError {
+        ff_memory::MemoryError::Io {
+            path: std::path::PathBuf::from("embed"),
+            source: std::io::Error::other("boom"),
+        }
+    }
+
+    /// An embedder that errors rather than returning `None`.
+    struct Erroring;
+    impl ff_memory::Embedder for Erroring {
+        fn embed_query(&self, _: &str) -> ff_memory::Result<Option<Vec<f32>>> {
+            Err(boom())
+        }
+        fn embed_chunk(&self, _: &str) -> ff_memory::Result<Option<Vec<f32>>> {
+            Err(boom())
+        }
+    }
+
+    let queries = [
+        "deploy",
+        "search code",
+        "run the tests",
+        "read a file",
+        "roll back a bad release",
+    ];
+
+    for q in queries {
+        let baseline = search(&fixture(), "s0", json!({ "query": q })).await;
+
+        for (label, tool) in [
+            ("dead", fixture().with_embedder(Arc::new(Dead), "m")),
+            (
+                "query-only failure",
+                fixture().with_embedder(Arc::new(QueryOnlyFailure), "m"),
+            ),
+            ("erroring", fixture().with_embedder(Arc::new(Erroring), "m")),
+        ] {
+            let got = search(&tool, "s1", json!({ "query": q })).await;
+            assert_eq!(
+                baseline, got,
+                "a {label} embedder must not perturb the lexical ranking for {q:?}"
+            );
+        }
+    }
+}
+
+/// The interactive timeout is short enough that a hung server cannot stall a turn.
+///
+/// Pinned as a bound rather than an exact value: the number may be tuned, but a
+/// regression back to the indexing-path patience would be a real defect, since the
+/// embed sits on the model's critical path.
+#[test]
+fn interactive_embeds_give_up_quickly() {
+    assert!(
+        ff_memory::INTERACTIVE_EMBED_TIMEOUT <= std::time::Duration::from_secs(5),
+        "an interactive embed must not out-wait the user's patience, got {:?}",
+        ff_memory::INTERACTIVE_EMBED_TIMEOUT
+    );
+}
+
+/// A corpus that fails to embed must abandon the semantic path, not rank on a
+/// partial cache.
+///
+/// The dangerous shape is a *partially* warm corpus: if warming half the tools
+/// still enabled the vector path, those few would be the only semantic candidates
+/// and would crowd out better lexical hits — a ranking decided by whichever embeds
+/// happened to succeed. Asserted against the semantic path directly rather than
+/// through the rendered output, because with a small corpus fusion can absorb the
+/// difference and hide the defect.
+#[tokio::test]
+async fn a_corpus_that_will_not_embed_abandons_the_semantic_path() {
+    /// Embeds exactly one tool, then refuses. Mimics a server dying mid-warm.
+    struct OneThenDead(std::sync::atomic::AtomicUsize);
+    impl ff_memory::Embedder for OneThenDead {
+        fn embed_query(&self, _: &str) -> ff_memory::Result<Option<Vec<f32>>> {
+            Ok(Some(vec![1.0, 0.0]))
+        }
+        fn embed_chunk(&self, _: &str) -> ff_memory::Result<Option<Vec<f32>>> {
+            if self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                Ok(Some(vec![1.0, 0.0]))
+            } else {
+                Ok(None)
+            }
+        }
+    }
+
+    let partial = fixture().with_embedder(
+        Arc::new(OneThenDead(std::sync::atomic::AtomicUsize::new(0))),
+        "m",
+    );
+
+    let ranking = partial.semantic_ranking("notes").await;
+
+    assert!(
+        ranking.is_none(),
+        "one embedded tool must not become the whole semantic candidate set, got {ranking:?}"
+    );
+}
+
+/// A blip during the first warm must not disable semantic recall for good.
+///
+/// The sibling test above pins "a partial cache does not rank". The trap is
+/// implementing that as *permanent* surrender: gate the warm on `is_empty()` and a
+/// single embed failure leaves the cache non-empty but short, so it is never warmed
+/// again and every later search silently returns `None` — Phase 2B degrades to
+/// BM25F for the rest of the process because of one dropped connection. Nothing
+/// surfaces; the user has a healthy embedder and no recall.
+///
+/// Two calls on the *same* tool, because the bug lives in the state carried
+/// between them. The first-call assertion is the sibling's contract; the second is
+/// this one's.
+#[tokio::test]
+async fn a_transient_warm_failure_is_retried_on_the_next_search() {
+    /// Fails every chunk on the first warm pass, then embeds normally. Mimics a
+    /// server that was briefly unreachable.
+    struct BlipThenHealthy {
+        calls: std::sync::atomic::AtomicUsize,
+        corpus: usize,
+    }
+    impl ff_memory::Embedder for BlipThenHealthy {
+        fn embed_query(&self, _: &str) -> ff_memory::Result<Option<Vec<f32>>> {
+            Ok(Some(vec![1.0, 0.0]))
+        }
+        fn embed_chunk(&self, _: &str) -> ff_memory::Result<Option<Vec<f32>>> {
+            // One tool lands, the rest of the first pass fails: a *partial* cache,
+            // which is the state that used to be terminal. Later passes succeed.
+            let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n == 0 || n >= self.corpus {
+                Ok(Some(vec![1.0, 0.0]))
+            } else {
+                Ok(None)
+            }
+        }
+    }
+
+    let corpus = fixture().index.tools.len();
+    let tool = fixture().with_embedder(
+        Arc::new(BlipThenHealthy {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            corpus,
+        }),
+        "m",
+    );
+
+    assert!(
+        tool.semantic_ranking("notes").await.is_none(),
+        "a partial cache must not rank"
+    );
+
+    let recovered = tool.semantic_ranking("notes").await;
+
+    assert!(
+        recovered.is_some(),
+        "the second search must re-warm the corpus and recover the semantic path; \
+         got None, so a transient failure disabled semantic recall permanently"
+    );
+    assert_eq!(
+        recovered.as_ref().map(Vec::len),
+        Some(corpus),
+        "a recovered ranking must cover the whole corpus"
+    );
+}
+
+/// The warmed corpus must survive a turn.
+///
+/// `build_tool_registry` runs on *every* turn — `ask`, each `run_once` iteration of
+/// a goal loop, each scheduled `fire` — and each run clones the shared
+/// `Arc<ToolSearchState>` into a brand-new `ToolSearchTool`. Anything cached on the
+/// tool is therefore thrown away between turns. When the corpus vectors lived
+/// there, embedding the whole corpus was not a one-off warm cost but a per-turn tax
+/// on the model's critical path, re-paid on every iteration.
+///
+/// Counts embed calls across two tools sharing one state: the second must ride the
+/// first one's vectors and spend nothing.
+#[tokio::test]
+async fn the_warmed_corpus_outlives_a_registry_rebuild() {
+    struct Counting(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+    impl ff_memory::Embedder for Counting {
+        fn embed_query(&self, _: &str) -> ff_memory::Result<Option<Vec<f32>>> {
+            Ok(Some(vec![1.0, 0.0]))
+        }
+        fn embed_chunk(&self, _: &str) -> ff_memory::Result<Option<Vec<f32>>> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Some(vec![1.0, 0.0]))
+        }
+    }
+
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let state = Arc::new(ToolSearchState::new());
+    let embedder = |c: &std::sync::Arc<std::sync::atomic::AtomicUsize>| {
+        Arc::new(Counting(std::sync::Arc::clone(c))) as Arc<dyn ff_memory::Embedder>
+    };
+
+    // Turn one: a cold corpus, so this one pays to warm it.
+    let first = fixture_sharing(Arc::clone(&state)).with_embedder(embedder(&calls), "m");
+    assert!(first.semantic_ranking("notes").await.is_some());
+    let warmed = calls.load(std::sync::atomic::Ordering::SeqCst);
+    assert!(warmed > 0, "the first turn must warm the corpus");
+
+    // Turn two: the registry is rebuilt, the state is the same.
+    let second = fixture_sharing(Arc::clone(&state)).with_embedder(embedder(&calls), "m");
+    assert!(second.semantic_ranking("notes").await.is_some());
+
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::SeqCst),
+        warmed,
+        "the corpus was re-embedded after a registry rebuild: warming {warmed} chunks is a \
+         per-turn cost, not a one-off"
+    );
+}
+
+/// Switching embedding models must drop the old vectors, not just relabel them.
+///
+/// The cache outlives any one tool now, so a model switch is handled in place by
+/// `retarget`. Relabelling without clearing is the subtle failure: `len()` counts
+/// entries regardless of model while `get` filters by it, so a stale-but-full cache
+/// reports a complete corpus whose every lookup then misses — the warm gate is
+/// satisfied, no re-embed happens, and semantic ranking silently returns nothing
+/// for the rest of the process.
+#[tokio::test]
+async fn switching_models_reembeds_the_corpus() {
+    struct Tagged(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+    impl ff_memory::Embedder for Tagged {
+        fn embed_query(&self, _: &str) -> ff_memory::Result<Option<Vec<f32>>> {
+            Ok(Some(vec![1.0, 0.0]))
+        }
+        fn embed_chunk(&self, _: &str) -> ff_memory::Result<Option<Vec<f32>>> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Some(vec![1.0, 0.0]))
+        }
+    }
+
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let state = Arc::new(ToolSearchState::new());
+    let make = |model: &str| {
+        fixture_sharing(Arc::clone(&state))
+            .with_embedder(Arc::new(Tagged(std::sync::Arc::clone(&calls))), model)
+    };
+
+    assert!(make("model-a").semantic_ranking("notes").await.is_some());
+    let after_a = calls.load(std::sync::atomic::Ordering::SeqCst);
+    assert!(after_a > 0, "the first model must warm the corpus");
+
+    // A different model: the cached vectors are not comparable and must be redone.
+    let ranking = make("model-b").semantic_ranking("notes").await;
+
+    assert!(
+        ranking.is_some(),
+        "a model switch must leave a usable corpus; got None, so the cache reported \
+         itself full while every lookup missed"
+    );
+    assert!(
+        calls.load(std::sync::atomic::Ordering::SeqCst) > after_a,
+        "switching models must re-embed the corpus, but no new embed calls were made"
+    );
+}
+
+/// The retry budget must survive a registry rebuild too.
+///
+/// Sibling `a_hopeless_corpus_stops_retrying_after_the_budget` drives one tool, so
+/// it cannot see a budget that resets per turn — and production never reuses a tool
+/// across turns. A per-turn counter turns "give up on a corpus that cannot embed"
+/// into "retry three times, every single turn, forever": the cap reads as a
+/// safeguard while costing a full doomed warm on the model's critical path each
+/// iteration. Rebuilds the tool between searches, as `build_tool_registry` does.
+#[tokio::test]
+async fn the_retry_budget_outlives_a_registry_rebuild() {
+    struct NeverEmbeds(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+    impl ff_memory::Embedder for NeverEmbeds {
+        fn embed_query(&self, _: &str) -> ff_memory::Result<Option<Vec<f32>>> {
+            Ok(Some(vec![1.0, 0.0]))
+        }
+        fn embed_chunk(&self, _: &str) -> ff_memory::Result<Option<Vec<f32>>> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(None)
+        }
+    }
+
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let state = Arc::new(ToolSearchState::new());
+    let turns = super::MAX_WARM_ATTEMPTS + 3;
+
+    for _ in 0..turns {
+        let tool = fixture_sharing(Arc::clone(&state))
+            .with_embedder(Arc::new(NeverEmbeds(std::sync::Arc::clone(&calls))), "m");
+        assert!(tool.semantic_ranking("notes").await.is_none());
+    }
+
+    let spent = calls.load(std::sync::atomic::Ordering::SeqCst);
+    let corpus = fixture().index.tools.len();
+    assert!(
+        spent <= corpus * super::MAX_WARM_ATTEMPTS,
+        "the warm budget reset with the registry: {spent} embed calls over {turns} turns \
+         (corpus {corpus}, budget {})",
+        super::MAX_WARM_ATTEMPTS
+    );
+}
+
+/// The retry budget is finite: a corpus that can *never* embed must stop paying for
+/// a doomed warm on every search.
+///
+/// Without a cap, the fix above turns a permanent embedder failure into a permanent
+/// tax — every `tool_search` would re-attempt the full corpus on the model's
+/// critical path, forever. Counts embed calls across more searches than the budget
+/// allows and asserts they stop.
+#[tokio::test]
+async fn a_hopeless_corpus_stops_retrying_after_the_budget() {
+    struct NeverEmbeds(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+    impl ff_memory::Embedder for NeverEmbeds {
+        fn embed_query(&self, _: &str) -> ff_memory::Result<Option<Vec<f32>>> {
+            Ok(Some(vec![1.0, 0.0]))
+        }
+        fn embed_chunk(&self, _: &str) -> ff_memory::Result<Option<Vec<f32>>> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(None)
+        }
+    }
+
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let tool = fixture().with_embedder(Arc::new(NeverEmbeds(std::sync::Arc::clone(&calls))), "m");
+
+    for _ in 0..(super::MAX_WARM_ATTEMPTS + 3) {
+        assert!(tool.semantic_ranking("notes").await.is_none());
+    }
+
+    let spent = calls.load(std::sync::atomic::Ordering::SeqCst);
+    let corpus = fixture().index.tools.len();
+    assert!(
+        spent <= corpus * super::MAX_WARM_ATTEMPTS,
+        "a hopeless corpus must stop warming after {} attempts, but spent {spent} embed calls \
+         over {} searches (corpus {corpus})",
+        super::MAX_WARM_ATTEMPTS,
+        super::MAX_WARM_ATTEMPTS + 3
+    );
 }

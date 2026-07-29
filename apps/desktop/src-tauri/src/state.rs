@@ -2096,10 +2096,20 @@ impl AppState {
         // tokens to advertise nothing.
         let index = ff_tools::ToolSearchIndex::from_registry(&reg);
         if !index.is_empty() {
-            reg.register(Box::new(ff_tools::ToolSearchTool::new(
-                self.tool_search.clone(),
-                index,
-            )));
+            let mut tool = ff_tools::ToolSearchTool::new(self.tool_search.clone(), index);
+            // Phase 2B (#1138): semantic recall, fused with BM25F. Opt-in with the
+            // rest of embeddings, and fail-soft — an unreachable server leaves the
+            // Phase 2A lexical ranking untouched.
+            if let Some((base, model, key)) = local_embedder_from_env(&memory_config_from_env()) {
+                let embedder = std::sync::Arc::new(ff_memory::OpenAiEmbedder::with_timeout(
+                    base,
+                    model.clone(),
+                    key,
+                    ff_memory::INTERACTIVE_EMBED_TIMEOUT,
+                ));
+                tool = tool.with_embedder(embedder, model);
+            }
+            reg.register(Box::new(tool));
         }
         reg
     }
@@ -3621,29 +3631,45 @@ pub(crate) fn compaction_model_for(
     connection.and_then(|c| c.compaction_model.clone())
 }
 
+/// Default local embedding endpoint: Ollama's OpenAI-compatible route.
+///
+/// Ollama is the pragmatic default because it is the most common way a developer
+/// already has a local embedding model running, and it needs no new dependency --
+/// [`OpenAiEmbedder`](ff_memory::OpenAiEmbedder) is a protocol client, so the same
+/// code path serves Ollama, a self-hosted server, or a cloud endpoint.
+const DEFAULT_EMBEDDING_BASE_URL: &str = "http://localhost:11434/v1";
+
+/// Default embedding model. See [`local_embedder_from_env`] for why the context
+/// window, not the benchmark rank, decides this.
+const DEFAULT_EMBEDDING_MODEL: &str = "nomic-embed-text";
+
 /// The `(base_url, model, api_key)` for a local embedder, or `None` to stay on the
 /// BM25 floor. Returns `Some` only when embeddings are enabled, the provider is
-/// `Local`, and a model is configured (`FF_MEMORY_EMBEDDINGS_MODEL`) -- an
-/// embedding endpoint needs a real embedding model, so without one we log once and
-/// fall back rather than spamming a chat-only server. Base URL defaults to the
-/// local candle-vLLM endpoint; the API key is reserved for the M5.3.2 cloud path.
+/// `Local`. Base URL and model both default to Ollama (`nomic-embed-text` on
+/// `localhost:11434`), which speaks the same OpenAI-compatible `/v1/embeddings`
+/// route; the API key is reserved for the M5.3.2 cloud path.
+///
+/// The model used to have no default, so enabling embeddings without also setting
+/// `FF_MEMORY_EMBEDDINGS_MODEL` left the feature silently inert (#1138). A default
+/// makes "enabled" mean enabled; a wrong or absent server still degrades to BM25
+/// through the [`Embedder`](ff_memory::Embedder) contract rather than failing.
+///
+/// `nomic-embed-text` is the default for its 8K context window: the longest tool
+/// and memory texts we embed run past 700 tokens, and shorter-window models
+/// (`mxbai-embed-large` at 512, `all-minilm` at 256) would truncate them
+/// silently, dropping exactly the tail that carries the discriminating detail.
 fn local_embedder_from_env(config: &MemoryConfig) -> Option<(String, String, Option<String>)> {
     if !config.embeddings.enabled || config.embeddings.provider != EmbeddingProvider::Local {
         return None;
     }
     let model = std::env::var("FF_MEMORY_EMBEDDINGS_MODEL")
         .ok()
-        .filter(|m| !m.trim().is_empty());
-    let Some(model) = model else {
-        tracing::warn!(
-            "memory embeddings enabled but FF_MEMORY_EMBEDDINGS_MODEL is unset; staying on BM25"
-        );
-        return None;
-    };
+        .filter(|m| !m.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_EMBEDDING_MODEL.to_string());
     let base = std::env::var("FF_MEMORY_EMBEDDINGS_BASE_URL")
         .ok()
         .filter(|u| !u.trim().is_empty())
-        .unwrap_or_else(|| "http://localhost:8000/v1".to_string());
+        .unwrap_or_else(|| DEFAULT_EMBEDDING_BASE_URL.to_string());
     let key = std::env::var("FF_MEMORY_EMBEDDINGS_API_KEY")
         .ok()
         .filter(|k| !k.trim().is_empty());

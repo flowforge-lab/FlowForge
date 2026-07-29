@@ -57,6 +57,16 @@ impl Embedder for NoopEmbedder {
 ///
 /// The same client serves the M5.3.2 cloud path: pass an `api_key` and an
 /// `https` base URL. Embeddings remain opt-in and off by default (RFC 0006 §8).
+/// Request timeout for indexing-path embeds, where a slow server delays a
+/// background job rather than a conversation.
+const DEFAULT_EMBED_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Request timeout for interactive embeds, on the model's critical path.
+///
+/// Deliberately short: a query embed that has not returned in this long is not
+/// worth waiting for, because the BM25 fallback is already a usable answer.
+pub const INTERACTIVE_EMBED_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
 #[derive(Debug)]
 pub struct OpenAiEmbedder {
     client: reqwest::blocking::Client,
@@ -79,9 +89,26 @@ impl OpenAiEmbedder {
         model: impl Into<String>,
         api_key: Option<String>,
     ) -> Self {
+        Self::with_timeout(base_url, model, api_key, DEFAULT_EMBED_TIMEOUT)
+    }
+
+    /// [`new`](Self::new) with an explicit request timeout.
+    ///
+    /// The default suits indexing, where a slow embed delays a background job.
+    /// Interactive callers need far less patience: `tool_search` embeds a query on
+    /// the model's critical path, so a hung server would stall the turn, and a
+    /// degraded ranking beats a blocked conversation. The [`Embedder`] contract
+    /// already turns a timeout into `Ok(None)`, so a tighter bound simply reaches
+    /// the BM25 fallback sooner (#1138).
+    pub fn with_timeout(
+        base_url: impl AsRef<str>,
+        model: impl Into<String>,
+        api_key: Option<String>,
+        timeout: std::time::Duration,
+    ) -> Self {
         let endpoint = format!("{}/embeddings", base_url.as_ref().trim_end_matches('/'));
         let client = reqwest::blocking::Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
+            .timeout(timeout)
             .build()
             .unwrap_or_else(|e| {
                 // A misbuilt client (e.g. a broken TLS stack) falls back to the
