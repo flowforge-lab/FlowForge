@@ -1702,7 +1702,17 @@ impl AppState {
             process_lifecycle_rx: Mutex::new(Some(process_lifecycle_rx)),
             kernel_supervisor: Arc::new(KernelSupervisor::new()),
             observer_supervisor,
-            tool_search: Arc::new(ff_tools::ToolSearchState::new()),
+            tool_search: Arc::new({
+                // Persist the embedding cache so an embed computed once survives a
+                // restart (#1138 step 5). `ff-tools` does not choose its own data
+                // path, and under `cfg!(test)` there is no path at all, so the cache
+                // stays in-process and no test can clobber the real one.
+                let state = ff_tools::ToolSearchState::new();
+                match flowforge_config_dir() {
+                    Some(dir) => state.with_cache_path(dir.join("tool_embeddings.json")),
+                    None => state,
+                }
+            }),
             observer_events_rx: Mutex::new(Some(observer_events_rx)),
             served_window_cache: Mutex::new(HashMap::new()),
             compaction_cache: CompactionCache::new(),

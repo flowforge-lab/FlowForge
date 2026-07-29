@@ -19,8 +19,8 @@
 //! everything. Semantic and action-level retrieval are RFC 0024 Phase 2.
 
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -184,11 +184,30 @@ pub struct ToolSearchState {
     /// counter reset every turn, which silently turned "give up on a hopeless
     /// corpus" into "retry three times, forever".
     warm_attempts: AtomicUsize,
+    /// Where to persist `vectors`, if anywhere (#1138 step 5).
+    ///
+    /// Injected by the caller rather than derived here: `ff-tools` does not get to
+    /// decide where application data lives, the same way it does not construct its
+    /// own embedder. `None` keeps the cache purely in-process.
+    cache_path: Option<PathBuf>,
+    /// Whether the durable cache has been read into `vectors` yet.
+    ///
+    /// `with_embedder` runs on every registry rebuild, so without this the file
+    /// would be re-read every turn — trading the per-turn embed tax #1140 removed
+    /// for a per-turn disk read.
+    hydrated: AtomicBool,
 }
 
 impl ToolSearchState {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Persist the corpus cache at `path`, so an embed computed once survives a
+    /// restart (#1138 step 5).
+    pub fn with_cache_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.cache_path = Some(path.into());
+        self
     }
 
     /// Tools `session_id` has unlocked so far. Empty for an unknown session.
@@ -380,6 +399,18 @@ impl ToolSearchTool {
         if let Ok(mut vectors) = self.state.vectors.lock() {
             if vectors.retarget(&model) {
                 self.state.warm_attempts.store(0, Ordering::Relaxed);
+                // The persisted snapshot for the *new* model may still be usable, so
+                // let the next turn read it rather than staying cold until a warm.
+                self.state.hydrated.store(false, Ordering::Relaxed);
+            }
+            // Read the durable cache once per process (#1138 step 5), not per turn:
+            // `with_embedder` runs on every registry rebuild. Done under the same
+            // lock as `retarget` so a concurrent search cannot observe a corpus that
+            // is neither the old model's nor the new one's.
+            if let Some(path) = self.state.cache_path.as_deref() {
+                if !self.state.hydrated.swap(true, Ordering::Relaxed) {
+                    *vectors = cache::load(path, &model);
+                }
             }
         }
         self.embed_model = model;
@@ -449,7 +480,17 @@ impl ToolSearchTool {
                 if vectors.len() < borrowed.len()
                     && shared.warm_attempts.fetch_add(1, Ordering::Relaxed) < MAX_WARM_ATTEMPTS
                 {
-                    semantic::warm(&embedder, &m, &borrowed, &mut vectors);
+                    let added = semantic::warm(&embedder, &m, &borrowed, &mut vectors);
+                    // Persist only when this warm actually produced something, so a
+                    // dead embedder does not rewrite an unchanged file three times
+                    // per launch. Still inside the lock: `vectors` is what we are
+                    // serialising, and releasing first would let a concurrent
+                    // `retarget` swap the model out from under the snapshot.
+                    if added > 0 {
+                        if let Some(path) = shared.cache_path.as_deref() {
+                            cache::store(path, &vectors);
+                        }
+                    }
                 }
 
                 // The vector path needs the *whole* corpus, not whatever embedded
@@ -818,6 +859,7 @@ impl Tool for ToolSearchTool {
     }
 }
 
+mod cache;
 pub mod semantic;
 
 #[cfg(test)]
