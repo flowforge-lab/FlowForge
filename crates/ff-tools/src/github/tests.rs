@@ -222,6 +222,68 @@ fn create_flag_args_empty_when_no_fields() {
 }
 
 #[test]
+fn issue_edit_flags_includes_title() {
+    let out = issue_edit_flags(&json!({"title": "Renamed"}));
+    assert_eq!(out, vec!["--title", "Renamed"]);
+}
+
+#[test]
+fn issue_edit_flags_includes_body_and_labels() {
+    let out = issue_edit_flags(&json!({
+        "body": "New body",
+        "label": ["bug", "backend"],
+        "assignee": "alice"
+    }));
+    assert_eq!(
+        out,
+        vec![
+            "--body",
+            "New body",
+            "--add-label",
+            "bug",
+            "--add-label",
+            "backend",
+            "--add-assignee",
+            "alice"
+        ]
+    );
+}
+
+#[test]
+fn issue_edit_flags_empty_when_no_fields() {
+    assert!(issue_edit_flags(&json!({"number": 42})).is_empty());
+}
+
+#[test]
+fn pr_request_review_flags_requires_reviewer() {
+    let err = pr_request_review_flags(&json!({"number": 1})).unwrap_err();
+    assert!(err.contains("requires 'reviewer'"));
+}
+
+#[test]
+fn pr_request_review_flags_builds_add_reviewer() {
+    let out = pr_request_review_flags(&json!({"reviewer": ["alice", "bob"]})).unwrap();
+    assert_eq!(
+        out,
+        vec!["--add-reviewer", "alice", "--add-reviewer", "bob"]
+    );
+}
+
+#[test]
+fn pr_list_flags_includes_author_and_label() {
+    let out = pr_list_flags(&json!({"author": "@me", "label": ["bug", "urgent"]}));
+    assert_eq!(
+        out,
+        vec!["--author", "@me", "--label", "bug", "--label", "urgent"]
+    );
+}
+
+#[test]
+fn pr_list_flags_empty_when_no_fields() {
+    assert!(pr_list_flags(&json!({"limit": 10})).is_empty());
+}
+
+#[test]
 fn inline_review_payload_builds_comments_and_defaults_side() {
     let args = json!({
         "event": "comment",
