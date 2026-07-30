@@ -203,22 +203,12 @@ function App() {
         return;
       }
       const channel = activeUpdateChannel();
-      // In dogfood mode, auto-install detected updates without user
-      // intervention (#705). The refresh+install cycle is fire-and-forget.
+      // Detection only. Installing restarts the app, so it stays a deliberate
+      // click on the `UpdateBar` / Settings → About surface even on the local
+      // dogfood channel (#1158) — an unprompted relaunch mid-turn loses the
+      // user's train of thought, which costs more than the saved click.
       const poll = async () => {
-        const store = useUpdateStore.getState();
-        await store.refresh(channel);
-        const fresh = useUpdateStore.getState().status;
-        if (
-          localUpdateChannel &&
-          !store.installing &&
-          fresh?.kind === "available"
-        ) {
-          // Install exactly the build this poll just saw: the backend refuses
-          // anything else, so a feed that moves mid-install re-prompts on the
-          // next tick rather than installing an unseen build (#1034).
-          void store.install(channel, fresh.version).catch(() => {});
-        }
+        await useUpdateStore.getState().refresh(channel);
       };
 
       // Phase 2 (#705): file-system watcher for instant detection. On the local
