@@ -1,5 +1,6 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useShallow } from "zustand/react/shallow";
+import { useVirtualizer } from "@tanstack/react-virtual";
 import { ChevronDown } from "@/components/ui/icon";
 import { cn } from "@/lib/utils";
 import { useChatStore } from "@/store/chat";
@@ -22,8 +23,9 @@ import { CancelledNotice } from "@/components/cancelled-notice";
 import { ActiveProseBlock } from "@/components/active-prose-block";
 import { isResumableStopNotice } from "@/store/capped-turn";
 import { foldTurns, lastTurnStart, segmentTurn } from "@/lib/turn-groups";
-import type { TurnItem } from "@/lib/turn-groups";
+import type { RenderGroup, TurnItem } from "@/lib/turn-groups";
 import { useExperimentalStore } from "@/store/experimental";
+import { useTranscriptScroll } from "@/store/transcript-scroll";
 import { useModelConfigStore, activeConnection } from "@/store/model-config";
 import { downloadStepTimeline } from "@/lib/export-step-timeline";
 import type { Message } from "@/bindings";
@@ -50,6 +52,27 @@ const NO_ITEMS: TurnItem[] = [];
 const FORCE_PIN_WINDOW_MS = 4000; // generous margin over a local IPC round trip
 // Stable empty transcript so a not-yet-loaded session keeps a constant `msgs` ref.
 const EMPTY_MESSAGES: Message[] = [];
+
+// --- Virtualized transcript (#1143) ------------------------------------------
+// Every row's real height is measured (`measureElement`); this is only the
+// first-paint guess for rows that haven't mounted yet, and it decides how far
+// the scrollbar lies before they do. Roughly a short user bubble plus its
+// header — deliberately on the low side, since underestimating renders a few
+// extra rows (cheap) while overestimating leaves a gap at the tail (visible).
+const ROW_ESTIMATE_PX = 140;
+// Rows kept mounted beyond each edge of the viewport. Enough that a flick-scroll
+// doesn't expose unmeasured space, small enough that the DOM stays bounded —
+// this constant is what the node-count invariant in
+// `chat-view.virtualization.test.tsx` is really asserting about.
+const OVERSCAN = 6;
+// Viewport assumed for the frame between mount and the virtualizer's first
+// measurement, so the initial window isn't computed against a 0×0 box. The real
+// size replaces it as soon as the scroll element is observed — this only has to
+// be the right order of magnitude. (It does NOT rescue jsdom, which reports
+// `offsetHeight: 0`: that measurement lands immediately and wins. Tests that
+// need a viewport stub `offsetWidth`/`offsetHeight` — see
+// `chat-view.virtualization.test.tsx`.)
+const INITIAL_RECT = { width: 800, height: 1000 };
 
 // Narrow a message-id-keyed store record to just the entries belonging to one
 // pane's messages (#1009). These maps (`toolStepsByMessage` / `turnStartByMessage`
@@ -746,6 +769,74 @@ export function ChatView({ sessionId }: { sessionId?: string } = {}) {
     setAtBottom(true);
   }
 
+  // Windowed rendering (#1143). Mounting every row costs ~0.3ms each, which on a
+  // long session dominates everything else by two orders of magnitude (2153ms of
+  // a ~2.2s session open, against ~43ms for the entire load path). The full
+  // session stays in the store — only the DOM is windowed — so nothing that
+  // reads `messages` changes.
+  //
+  // What that does NOT buy: anything that reads the rendered DOM. The in-thread
+  // find bar walks `[data-message-id]` nodes to build paintable ranges, so a
+  // complete store is not enough — it has to ask for a row to be mounted before
+  // it can range over it (`store/transcript-scroll.ts`, registered below).
+  //
+  // Behind a flag while the scroll machinery (#206/#866/#1025) is dogfooded
+  // against it on a real large database; `virtualItems` is empty when off and
+  // the plain list renders instead.
+  const virtualized = useExperimentalStore(
+    (s) => s.flags.virtualizedTranscript,
+  );
+  // The virtualizer hands back fresh closures every render, so the React
+  // compiler skips memoizing this component. Accepted: it manages its own
+  // subscriptions, nothing here holds one of those functions across renders, and
+  // the per-row `MessageRow` memo — which is what actually keeps a streamed
+  // token from re-rendering the transcript — is unaffected.
+  // eslint-disable-next-line react-hooks/incompatible-library
+  const virtualizer = useVirtualizer({
+    count: virtualized ? groups.length : 0,
+    getScrollElement: () => scrollEl,
+    estimateSize: () => ROW_ESTIMATE_PX,
+    // Key by message id, not index: rows are inserted at the *front* by the
+    // #866 history swap, and an index key would remap every measured height to
+    // the wrong row when that lands.
+    getItemKey: (i) => groups[i].message.id,
+    overscan: OVERSCAN,
+    initialRect: INITIAL_RECT,
+  });
+  const virtualItems = virtualizer.getVirtualItems();
+
+  // Publish a reveal for this session while windowing is on (#1143). Anything
+  // that needs to look at a specific message — the find bar stepping onto a hit
+  // far above the viewport — can only do so once the row is mounted, and a
+  // windowed list is the only thing that can mount it. Registered ONLY on the
+  // virtual path: on the plain path every row is already in the DOM, and
+  // `reveal()` returning false is the correct "nothing to do" answer there.
+  //
+  // `groups` is read through a ref rather than captured, so the registration
+  // doesn't churn on every streamed token (the same reason `latestMessagesRef`
+  // exists for the pin).
+  const groupsRef = useRef(groups);
+  useEffect(() => {
+    groupsRef.current = groups;
+  }, [groups]);
+  const register = useTranscriptScroll((s) => s.register);
+  useEffect(() => {
+    if (!virtualized || !targetSessionId) return;
+    return register(targetSessionId, (messageId) => {
+      const index = groupsRef.current.findIndex(
+        (g) => g.message.id === messageId,
+      );
+      if (index < 0) return false;
+      // `center` so a hit lands mid-viewport with context either side, matching
+      // what `scrollRangeIntoView` does on the non-virtual path.
+      virtualizer.scrollToIndex(index, { align: "center" });
+      return true;
+    });
+    // `virtualizer` is a stable instance for the life of the component; adding it
+    // would re-register on every render for no gain.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [virtualized, targetSessionId, register]);
+
   function handleScroll() {
     const el = scrollEl;
     if (!el) return;
@@ -762,6 +853,47 @@ export function ChatView({ sessionId }: { sessionId?: string } = {}) {
     pinnedToBottom.current = true;
     setAtBottom(true);
   }
+
+  // One row, rendered identically by both the plain and the virtualized list —
+  // the two paths differ only in *which* rows they ask for and how they're
+  // positioned, never in what a row is.
+  const renderGroup = (g: RenderGroup) => {
+    const m = g.message;
+    // foldTurns already resolved each turn's steps (live or reconstructed)
+    // and interleaved prose items (#415).
+    const toolSteps = g.kind === "assistant" ? g.steps : NO_STEPS;
+    const items = g.kind === "assistant" ? g.items : NO_ITEMS;
+    // Prefer live reasoning when present; fall back to the reasoning
+    // persisted on the assistant message for a reloaded turn (#375).
+    const reasoning =
+      reasoningByMessage[m.id] ?? (g.kind === "assistant" ? g.reasoning : "");
+    // Live steps (this session) carry exact wall-clock timing; a reloaded
+    // turn's steps are reconstructed from `createdAt`, so tag it approx (#417).
+    const liveTiming = (toolStepsByMessage[m.id]?.length ?? 0) > 0;
+    return (
+      <MessageRow
+        key={m.id}
+        message={m}
+        streaming={m.id === streamingId}
+        toolSteps={toolSteps}
+        hasOwnLiveSteps={liveTiming}
+        items={items}
+        turnStartMs={turnStartByMessage[m.id] ?? turnStartForSession}
+        reasoning={reasoning}
+        exportEnabled={exportEnabled}
+        exportModel={exportModel}
+        exportTiming={liveTiming ? "exact" : "approx-created-at"}
+        isEditing={m.id === editingId}
+        isLastUserMessage={m.id === lastUserMessageId}
+        beginEdit={beginEdit}
+        endEdit={endEdit}
+        respondApproval={respondApproval}
+        approveSession={approveSession}
+        approveAlways={approveAlways}
+        respondAsk={respondAsk}
+      />
+    );
+  };
 
   // Distinguish "not loaded yet" from "genuinely empty session" (#785):
   // messagesBySession[id] is undefined until loadSession() completes, and []
@@ -792,46 +924,36 @@ export function ChatView({ sessionId }: { sessionId?: string } = {}) {
       >
         <div
           ref={setContentEl}
-          className="mx-auto flex max-w-4xl flex-col gap-3 px-4 py-4"
+          className={cn(
+            "mx-auto w-full max-w-4xl px-4 py-4",
+            !virtualized && "flex flex-col gap-3",
+          )}
         >
-          {groups.map((g) => {
-            const m = g.message;
-            // foldTurns already resolved each turn's steps (live or reconstructed)
-            // and interleaved prose items (#415).
-            const toolSteps = g.kind === "assistant" ? g.steps : NO_STEPS;
-            const items = g.kind === "assistant" ? g.items : NO_ITEMS;
-            // Prefer live reasoning when present; fall back to the reasoning
-            // persisted on the assistant message for a reloaded turn (#375).
-            const reasoning =
-              reasoningByMessage[m.id] ??
-              (g.kind === "assistant" ? g.reasoning : "");
-            // Live steps (this session) carry exact wall-clock timing; a reloaded
-            // turn's steps are reconstructed from `createdAt`, so tag it approx (#417).
-            const liveTiming = (toolStepsByMessage[m.id]?.length ?? 0) > 0;
-            return (
-              <MessageRow
-                key={m.id}
-                message={m}
-                streaming={m.id === streamingId}
-                toolSteps={toolSteps}
-                hasOwnLiveSteps={liveTiming}
-                items={items}
-                turnStartMs={turnStartByMessage[m.id] ?? turnStartForSession}
-                reasoning={reasoning}
-                exportEnabled={exportEnabled}
-                exportModel={exportModel}
-                exportTiming={liveTiming ? "exact" : "approx-created-at"}
-                isEditing={m.id === editingId}
-                isLastUserMessage={m.id === lastUserMessageId}
-                beginEdit={beginEdit}
-                endEdit={endEdit}
-                respondApproval={respondApproval}
-                approveSession={approveSession}
-                approveAlways={approveAlways}
-                respondAsk={respondAsk}
-              />
-            );
-          })}
+          {virtualized ? (
+            // The spacer carries the full measured height so the scrollbar is
+            // honest about the whole session; rows are absolutely positioned
+            // inside it. `gap-3` can't survive absolute positioning, so the
+            // per-row `pb-3` reproduces it — measured as part of the row, which
+            // is what keeps the offsets consistent.
+            <div
+              className="relative w-full"
+              style={{ height: virtualizer.getTotalSize() }}
+            >
+              {virtualItems.map((vi) => (
+                <div
+                  key={vi.key}
+                  data-index={vi.index}
+                  ref={virtualizer.measureElement}
+                  className="absolute left-0 top-0 w-full pb-3"
+                  style={{ transform: `translateY(${vi.start}px)` }}
+                >
+                  {renderGroup(groups[vi.index])}
+                </div>
+              ))}
+            </div>
+          ) : (
+            groups.map((g) => renderGroup(g))
+          )}
           {pending && <ThinkingIndicator />}
         </div>
       </div>

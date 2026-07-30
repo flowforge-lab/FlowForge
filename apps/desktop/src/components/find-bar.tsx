@@ -21,11 +21,12 @@ import { useFindStore } from "@/store/find";
 import { useFindExpansion } from "@/store/find-expansion";
 import { useChatStore } from "@/store/chat";
 import {
-  applyHighlights,
   clearHighlights,
   collectOccurrences,
+  paintHighlights,
   scrollRangeIntoView,
 } from "@/lib/find-highlight";
+import { useTranscriptScroll } from "@/store/transcript-scroll";
 import {
   buildSessionOccurrences,
   uniqueExpandIds,
@@ -33,6 +34,25 @@ import {
 } from "@/lib/find-occurrences";
 
 const DEBOUNCE_MS = 150;
+// How many frames to wait for a revealed row to mount. The virtualizer may need
+// more than one pass for a far jump (it re-measures and corrects), so this polls
+// rather than assuming a fixed number of frames — but it is bounded, because a
+// stale occurrence whose message is genuinely gone must not hang the step.
+const REVEAL_FRAME_BUDGET = 20;
+
+const nextFrame = () =>
+  new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+
+/** How many earlier occurrences share `occurrences[i]`'s message. Identifies the
+ *  active match within its own row, which is what makes it addressable when the
+ *  painted set covers only the mounted subset. */
+function ordinalWithinMessage(occurrences: Occurrence[], i: number): number {
+  let n = 0;
+  for (let k = 0; k < i; k++) {
+    if (occurrences[k].messageId === occurrences[i].messageId) n++;
+  }
+  return n;
+}
 
 export function FindBar({
   sessionId,
@@ -78,6 +98,75 @@ export function FindBar({
       clearHighlights();
     };
   }, [consumeSeed, clearExpansion]);
+
+  /** Wait for `messageId`'s row to be in the DOM, up to a frame budget. Returns
+   *  null if it never appears — a windowed list that can't reach the row, or an
+   *  occurrence whose message is gone. The caller still paints what it can. */
+  async function waitForRow(
+    messageId: string,
+    isCancelled?: () => boolean,
+  ): Promise<HTMLElement | null> {
+    const selector = `[data-message-id="${messageId}"]`;
+    for (let i = 0; i < REVEAL_FRAME_BUDGET; i++) {
+      const el = rootRef.current?.querySelector<HTMLElement>(selector);
+      if (el) return el;
+      if (isCancelled?.()) return null;
+      await nextFrame();
+    }
+    return rootRef.current?.querySelector<HTMLElement>(selector) ?? null;
+  }
+
+  // Reveal and paint occurrence `idx` — the single path used by the initial
+  // search, the #710 seed jump, and every Enter/Shift+Enter step.
+  //
+  // Two things make this more than "walk the DOM":
+  //
+  // 1. **The row may not be mounted.** With the transcript windowed (#1143) only
+  //    the visible rows exist, so a hit 3000 rows up has no node to range over
+  //    until the list is asked to mount it. `reveal` does that; without it the
+  //    counter reads "1 of 500" off the data model while Enter can only reach the
+  //    handful of hits on screen. On the non-virtual path `reveal` returns false
+  //    and nothing is needed — every row is already there.
+  // 2. **The active range can't be an index into the painted set.** The painted
+  //    set covers mounted rows only, so it is a *subset* of `occurrences` whose
+  //    indices don't line up. The active range is instead resolved by identity:
+  //    this occurrence's message, and its ordinal within that message.
+  async function activate(idx: number, isCancelled?: () => boolean) {
+    const occurrences = occurrencesRef.current;
+    const occ = occurrences[idx];
+    if (!occ) {
+      rangesRef.current = [];
+      clearHighlights();
+      return;
+    }
+    // Re-force-open the containing collapser if the user folded it mid-search.
+    // Idempotent.
+    if (occ.expandId) forceOpenMany([occ.expandId]);
+    useTranscriptScroll.getState().reveal(sessionId, occ.messageId);
+
+    const row = await waitForRow(occ.messageId, isCancelled);
+    if (isCancelled?.()) return;
+    const root = rootRef.current;
+    if (!root) return;
+    const q = query.trim();
+    if (!q) return;
+    // One more frame once the row exists, so a force-opened body inside it has
+    // committed before its text is walked (#875's "scrolls to the top of the
+    // first response" symptom was exactly this walk running too early).
+    if (row) await nextFrame();
+    if (isCancelled?.()) return;
+
+    const all = collectOccurrences(
+      root,
+      new Set(occurrences.map((o) => o.messageId)),
+      q,
+    );
+    const inMessage = collectOccurrences(root, new Set([occ.messageId]), q);
+    const activeRange = inMessage[ordinalWithinMessage(occurrences, idx)];
+    rangesRef.current = all;
+    paintHighlights(all, activeRange);
+    if (activeRange) scrollRangeIntoView(activeRange);
+  }
 
   // Debounced search: resolve matching messages from the backend, derive the
   // occurrence list from the data model, force-open the containing collapsers,
@@ -127,44 +216,20 @@ export function FindBar({
         const expandIds = uniqueExpandIds(occurrences);
         setForced(expandIds);
 
-        const paint = () => {
-          if (cancelled) return;
-          const root = rootRef.current;
-          const ranges = root ? collectOccurrences(root, ids, q) : [];
-          // Source-of-truth count: the data-model list (#875). The DOM range
-          // count is a sanity check — if it disagrees, paint what we have and
-          // log in dev only.
-          if (
-            occurrences.length > 0 &&
-            ranges.length !== occurrences.length &&
-            typeof console !== "undefined" &&
-            import.meta.env?.DEV
-          ) {
-            console.warn(
-              `[find] DOM ranges (${ranges.length}) != data-model occurrences (${occurrences.length}); possibly missed expandId.`,
-            );
-          }
-          // Seed jump (#710): land on the first occurrence in the seeded
-          // messageId, not just the first in the thread.
-          const seedId = seedMessageIdRef.current;
-          let idx = 0;
-          if (seedId) {
-            const target = occurrences.findIndex((o) => o.messageId === seedId);
-            if (target >= 0) idx = target;
-          }
-          seedMessageIdRef.current = null;
-          occurrencesRef.current = occurrences;
-          rangesRef.current = ranges;
-          activeRef.current = idx;
-          setCount(occurrences.length);
-          setActive(idx);
-          applyHighlights(ranges, idx);
-          if (ranges[idx]) scrollRangeIntoView(ranges[idx]);
-        };
-        requestAnimationFrame(() => {
-          if (cancelled) return;
-          requestAnimationFrame(paint);
-        });
+        // Seed jump (#710): land on the first occurrence in the seeded
+        // messageId, not just the first in the thread.
+        const seedId = seedMessageIdRef.current;
+        let idx = 0;
+        if (seedId) {
+          const target = occurrences.findIndex((o) => o.messageId === seedId);
+          if (target >= 0) idx = target;
+        }
+        seedMessageIdRef.current = null;
+        occurrencesRef.current = occurrences;
+        activeRef.current = idx;
+        setCount(occurrences.length);
+        setActive(idx);
+        await activate(idx, () => cancelled);
       },
       q ? DEBOUNCE_MS : 0,
     );
@@ -172,6 +237,11 @@ export function FindBar({
       cancelled = true;
       window.clearTimeout(timer);
     };
+    // `activate` is re-created every render (it closes over `query` and the
+    // refs); listing it would re-run the search — and re-hit the backend — on
+    // every keystroke's render rather than once per debounced query. The refs it
+    // reads are always current by construction.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [query, sessionId, rootRef, setForced]);
 
   function step(dir: 1 | -1) {
@@ -179,41 +249,9 @@ export function FindBar({
     if (occurrences.length === 0) return;
     const next =
       (activeRef.current + dir + occurrences.length) % occurrences.length;
-    const occ = occurrences[next];
-    // Re-force-open the next occurrence's collapser if it isn't (might have
-    // been manually folded mid-search). Idempotent.
-    if (occ?.expandId) forceOpenMany([occ.expandId]);
     activeRef.current = next;
     setActive(next);
-    const ranges = rangesRef.current;
-    if (ranges[next]) {
-      applyHighlights(ranges, next);
-      scrollRangeIntoView(ranges[next]);
-      return;
-    }
-    // No DOM range for `next` yet (force-open mid-step): wait two frames, then
-    // walk the DOM with the same token rules. Keeps the counter and the
-    // highlighted span synchronized even after a manual fold.
-    const cancelled = { v: false };
-    requestAnimationFrame(() => {
-      if (cancelled.v) return;
-      requestAnimationFrame(() => {
-        if (cancelled.v) return;
-        const root = rootRef.current;
-        if (!root) return;
-        const ids = new Set(occurrences.map((o) => o.messageId));
-        const q = query.trim();
-        const fresh = collectOccurrences(root, ids, q);
-        const clampedNext = Math.min(next, fresh.length - 1);
-        rangesRef.current = fresh;
-        activeRef.current = clampedNext >= 0 ? clampedNext : 0;
-        applyHighlights(fresh, clampedNext);
-        if (fresh[clampedNext]) scrollRangeIntoView(fresh[clampedNext]);
-      });
-    });
-    return () => {
-      cancelled.v = true;
-    };
+    void activate(next);
   }
 
   function close() {
@@ -250,7 +288,10 @@ export function FindBar({
         aria-label="Find in thread"
         className="h-6 w-44 border-0 bg-transparent px-1 text-xs focus-visible:ring-0"
       />
-      <span className="w-16 shrink-0 select-none text-right text-[11px] tabular-nums text-muted-foreground">
+      <span
+        data-testid="find-counter"
+        className="w-16 shrink-0 select-none text-right text-[11px] tabular-nums text-muted-foreground"
+      >
         {counter}
       </span>
       <Button
