@@ -13,13 +13,17 @@
 
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-const { set, save, backing } = vi.hoisted(() => {
+const { set, save, get, backing } = vi.hoisted(() => {
   const backing = new Map<string, unknown>();
   return {
     set: vi.fn(async (key: string, value: unknown) => {
       backing.set(key, value);
     }),
     save: vi.fn(async () => {}),
+    // Hoisted (rather than inline in the factory below) so a test can stall a
+    // read and observe the pre-hydration window — see the write-suppression
+    // block at the bottom.
+    get: vi.fn(async (key: string) => backing.get(key)),
     backing,
   };
 });
@@ -29,7 +33,7 @@ vi.mock("@tauri-apps/plugin-store", () => ({
     load: vi.fn(async () => ({
       set,
       save,
-      get: vi.fn(async (key: string) => backing.get(key)),
+      get,
       delete: vi.fn(async () => true),
     })),
   },
@@ -44,6 +48,10 @@ beforeEach(() => {
   backing.clear();
   set.mockClear();
   save.mockClear();
+  // `mockReset`, not `mockClear`: the write-suppression tests install a keyed
+  // stalling implementation that must not leak into the next test.
+  get.mockReset();
+  get.mockImplementation(async (key: string) => backing.get(key));
   localStorage.clear();
   vi.resetModules();
   (globalThis.window as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__ =
@@ -254,6 +262,107 @@ describe("hand-rolled persisted stores write through durableStorage (#1134)", ()
     expect(set.mock.calls.some(([k]) => k === "ff-panes")).toBe(true);
     expect(save).toHaveBeenCalled();
     expect(localStorage.getItem("ff-panes")).toBeNull();
+  });
+
+  // The write-suppression guard, which is the actual data-loss barrier in this
+  // change and was unpinned in the first cut of these tests (#1157 review).
+  //
+  // Every one of these stores hydrates asynchronously, so there's a window after
+  // module load where state is still defaults. A mutation landing in that window
+  // must NOT reach disk: the write would serialize the whole store, so defaults
+  // for the fields the user hasn't touched would overwrite the real values
+  // sitting on disk — and hydration then pulls those same real values back into
+  // memory, leaving disk and memory diverged. That is the shape of #1110.
+  //
+  // Removing any of the three guards leaves the rest of this file green, which
+  // is why these exist. They stall the plugin read to hold the window open.
+  it.each([
+    {
+      key: "ff-palette",
+      module: "@/store/palette",
+      hook: "usePaletteStore",
+      onDisk: { recent: ["toggle-split"] },
+      // A command run before the read settles.
+      mutate: (s: Record<string, (...a: unknown[]) => unknown>) =>
+        s.pushRecent("open-files"),
+      // Union, by design: the pre-hydrate command genuinely ran, so it's kept —
+      // what matters is that the persisted id survived rather than being erased.
+      afterHydration: (s: Record<string, unknown>) =>
+        expect(s.recent).toEqual(["open-files", "toggle-split"]),
+    },
+    {
+      key: "ff-split",
+      module: "@/store/split",
+      hook: "useSplitStore",
+      onDisk: { open: true, width: 640, wrap: false, content: null },
+      // The reviewer's probe: the user drags the splitter mid-read. Without the
+      // guard this persists `{open: false, width: 960, wrap: true}` — wiping
+      // both the open state and the wrap preference.
+      mutate: (s: Record<string, (...a: unknown[]) => unknown>) =>
+        s.setWidth(960),
+      // Panel was closed in memory, so hydration adopts disk wholesale.
+      afterHydration: (s: Record<string, unknown>) => {
+        expect(s.open).toBe(true);
+        expect(s.width).toBe(640);
+        expect(s.wrap).toBe(false);
+      },
+    },
+    {
+      key: "ff-file-panel",
+      module: "@/store/file-panel",
+      hook: "useFilePanelStore",
+      onDisk: {
+        openSessions: ["s1"],
+        panelWidth: 500,
+        treeWidth: 300,
+        view: {},
+      },
+      mutate: (s: Record<string, (...a: unknown[]) => unknown>) =>
+        s.openFiles("s2"),
+      afterHydration: (s: Record<string, unknown>) => {
+        // s1 came off disk, s2 from the pre-hydrate open — neither is lost.
+        expect([...(s.openSessions as Set<string>)].sort()).toEqual([
+          "s1",
+          "s2",
+        ]);
+        // Widths the user never touched keep their persisted values rather than
+        // being reset to defaults.
+        expect(s.panelWidth).toBe(500);
+        expect(s.treeWidth).toBe(300);
+      },
+    },
+  ])("$key suppresses writes until hydration lands", async (store) => {
+    backing.set(store.key, JSON.stringify(store.onDisk));
+
+    // Stall this store's own read so the pre-hydration window stays open under
+    // our control. Keyed, NOT `mockImplementationOnce`: the first `get` to
+    // arrive is `migrateFile`'s `__ff_schema` probe inside `loadStore` (#1121),
+    // and stalling that hangs `getStore()` itself — which blocks writes too, so
+    // the guard under test would never be reached and this would pass whether
+    // or not it exists.
+    let release!: () => void;
+    const gate = new Promise<void>((r) => {
+      release = r;
+    });
+    get.mockImplementation(async (key: string) => {
+      if (key === store.key) await gate;
+      return backing.get(key);
+    });
+
+    const mod = (await import(store.module)) as Record<string, HydratingStore>;
+    const hook = mod[store.hook];
+    expect(hook.getState().hasHydrated).toBe(false);
+
+    store.mutate(hook.getState());
+    await flush();
+
+    // Nothing reached disk, and what's there is byte-for-byte untouched.
+    expect(set.mock.calls.some(([k]) => k === store.key)).toBe(false);
+    expect(backing.get(store.key)).toBe(JSON.stringify(store.onDisk));
+
+    release();
+    await waitForHydration(hook);
+    store.afterHydration(hook.getState() as Record<string, unknown>);
   });
 
   it("ff-panes adopts a legacy localStorage layout through init", async () => {
