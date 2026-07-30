@@ -53,3 +53,39 @@ if (typeof globalThis.ResizeObserver === "undefined") {
     disconnect() {}
   };
 }
+
+// jsdom has no layout, so every element reports `offsetWidth`/`offsetHeight: 0`
+// — and those two properties in particular are how `@tanstack/react-virtual`
+// sizes its viewport (not `getBoundingClientRect`, and `initialRect` doesn't
+// rescue it: the zero measurement lands immediately and wins).
+//
+// A zero-height viewport windows the transcript down to *no rows*, so with
+// virtualization the only render path (#1143) every suite that mounts ChatView
+// would assert against an empty transcript. The dangerous half of that isn't the
+// failures — it's the suites that would keep passing while testing nothing.
+// Give jsdom a nominal desktop viewport globally.
+//
+// It's `HTMLElement.prototype`, so it applies to every element rather than just
+// the scroller; nothing in this app branches on those two properties except the
+// virtualizer. A test needing a different size can redefine them for its own
+// duration (both are `configurable`).
+//
+// Second, less obvious effect: virtual-core's `measureElement` falls back to
+// `element.offsetHeight` when a ResizeObserver entry has no `borderBoxSize`
+// (always, in jsdom), so every *row* also measures 1000px here — well above the
+// 140px `ROW_ESTIMATE_PX`. That is realistic rather than accidental: real rows
+// exceed the estimate too, which is what makes `getTotalSize()` under-state a
+// session and is the bug `chat-view.jump-to-latest.test.tsx` reproduces.
+// Guarded on `HTMLElement` because this file also runs for node-environment
+// suites, where it doesn't exist.
+if (typeof HTMLElement !== "undefined") {
+  for (const [prop, value] of [
+    ["offsetWidth", 800],
+    ["offsetHeight", 1000],
+  ] as const) {
+    Object.defineProperty(HTMLElement.prototype, prop, {
+      configurable: true,
+      get: () => value,
+    });
+  }
+}

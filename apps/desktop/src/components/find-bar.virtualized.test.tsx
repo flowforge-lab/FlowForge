@@ -8,34 +8,21 @@
 // hit, so stepping parked there instead of failing loudly.
 //
 // The premise ("the store keeps every message") was tested; the wiring was not.
-// This file tests the wiring: with the flag ON and every hit placed near the top
-// of a transcript many viewports tall, the count must match the flag-off count
-// and stepping must actually reach a hit that started outside the window.
+// This file tests the wiring: with every hit placed near the top of a transcript
+// many viewports tall, the count must match what the store holds and stepping
+// must actually reach a hit that started outside the window.
 //
 // Mutation bar: neuter the reveal (drop the `register` call in chat-view, or make
 // `reveal` a no-op) and `reaches a hit far above the initial viewport` goes red.
 
 import { act, render } from "@testing-library/react";
-import {
-  afterAll,
-  afterEach,
-  beforeAll,
-  beforeEach,
-  describe,
-  expect,
-  it,
-  vi,
-} from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { ChatView } from "@/components/chat-view";
 import { FindBar } from "@/components/find-bar";
 import { ipc } from "@/lib/ipc";
 import { collectOccurrences } from "@/lib/find-highlight";
 import { useChatStore } from "@/store/chat";
-import {
-  EXPERIMENTAL_DEFAULTS,
-  useExperimentalStore,
-} from "@/store/experimental";
 import { useFindStore } from "@/store/find";
 import { useFindExpansion } from "@/store/find-expansion";
 import { useTranscriptScroll } from "@/store/transcript-scroll";
@@ -45,33 +32,13 @@ import { useRef } from "react";
 const SID = "s1";
 const TOTAL = 120;
 // Matches live in the first few messages — ~17 viewports above where a freshly
-// opened session sits, since ChatView pins to the tail on mount. 120 rows keeps
-// the flag-off control (which mounts all of them) affordable under a parallel
-// run while still being far more than one window.
+// opened session sits, since ChatView pins to the tail on mount.
 const MATCHING_IDS = ["m0", "m1", "m2", "m3", "m4"];
 const NEEDLE = "needle";
+// Must match the viewport `vitest.setup.ts` gives every jsdom element: this
+// file's scroller geometry is computed against it.
 const VIEWPORT = { width: 800, height: 1000 };
 const ROW_PX = 140; // ROW_ESTIMATE_PX in chat-view.tsx
-
-// The virtualizer reads its viewport from offsetWidth/offsetHeight, which jsdom
-// reports as 0 — a zero-height viewport windows to no rows and would make this
-// suite pass vacuously.
-beforeAll(() => {
-  for (const [prop, value] of [
-    ["offsetWidth", VIEWPORT.width],
-    ["offsetHeight", VIEWPORT.height],
-  ] as const) {
-    Object.defineProperty(HTMLElement.prototype, prop, {
-      configurable: true,
-      get: () => value,
-    });
-  }
-});
-afterAll(() => {
-  for (const prop of ["offsetWidth", "offsetHeight"]) {
-    delete (HTMLElement.prototype as unknown as Record<string, unknown>)[prop];
-  }
-});
 
 // Frames run synchronously so a step's await chain settles inside one act().
 (globalThis as { requestAnimationFrame?: unknown }).requestAnimationFrame = (
@@ -149,12 +116,6 @@ function seed() {
   });
 }
 
-function setVirtualized(on: boolean) {
-  useExperimentalStore.setState({
-    flags: { ...EXPERIMENTAL_DEFAULTS, virtualizedTranscript: on },
-  });
-}
-
 /** Mirrors session-pane.tsx: the find bar mounts beside the transcript only while
  *  find is open, and `rootRef` is the wrapper the DOM walk searches. */
 function Pane() {
@@ -226,7 +187,6 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.restoreAllMocks();
-  setVirtualized(false);
   useChatStore.setState({ messagesBySession: {}, toolStepsByMessage: {} });
   useFindStore.setState({ open: false, sessionId: null, seedQuery: null });
   useFindExpansion.getState().clear();
@@ -234,26 +194,35 @@ afterEach(() => {
 });
 
 describe("find with the transcript windowed (#1143)", () => {
-  it("counts every hit, the same as with the flag off", async () => {
-    setVirtualized(false);
-    const off = await renderParkedAtTail();
-    await openFindAndSettle();
-    const offCount = counter(off.container);
-    off.unmount();
-    useFindStore.setState({ open: false, sessionId: null });
+  // This used to compare the count against a flag-off render. #1143's PR3
+  // deleted the flag, so the control is now the data model: the counter must
+  // equal the number of messages in the *store* that contain the needle, which
+  // is the property the flag-off run was standing in for. The windowed
+  // precondition below is what stops it passing vacuously in its place.
+  it("counts every hit in the session, not just the mounted ones", async () => {
+    const { container } = await renderParkedAtTail();
 
-    setVirtualized(true);
-    const on = await renderParkedAtTail();
+    // Preconditions, checked before find opens: the DOM is a window over the
+    // session, and the hits are outside it. A fully-mounted transcript would
+    // satisfy the count assertion below for entirely the wrong reason.
+    expect(container.querySelectorAll("[data-message-id]").length).toBeLessThan(
+      TOTAL,
+    );
+    expect(MATCHING_IDS.some((id) => mounted(container, id))).toBe(false);
+
     await openFindAndSettle();
 
-    // Not a hardcoded number: the windowed count must equal the un-windowed
-    // count, which is the property that actually matters.
-    expect(counter(on.container)).toBe(offCount);
-    expect(counter(on.container)).toBe(`1 of ${MATCHING_IDS.length}`);
+    // The control is the data model: how many messages in the store actually
+    // contain the needle. Derived, not hardcoded — and the counter has to agree
+    // with it even though the DOM never held more than a window's worth.
+    const inStore = (
+      useChatStore.getState().messagesBySession[SID] ?? []
+    ).filter((m) => m.content.includes(NEEDLE)).length;
+    expect(inStore).toBe(MATCHING_IDS.length);
+    expect(counter(container)).toBe(`1 of ${inStore}`);
   }, 20_000);
 
   it("reaches a hit far above the initial viewport", async () => {
-    setVirtualized(true);
     const { container } = await renderParkedAtTail();
 
     // Preconditions, or this test proves nothing: the transcript is windowed,
@@ -278,7 +247,6 @@ describe("find with the transcript windowed (#1143)", () => {
   }, 20_000);
 
   it("reaches every hit as it steps, not just the ones on screen", async () => {
-    setVirtualized(true);
     const { container } = await renderParkedAtTail();
     await openFindAndSettle();
 

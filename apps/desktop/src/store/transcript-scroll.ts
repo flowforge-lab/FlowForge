@@ -28,9 +28,10 @@ interface TranscriptScrollState {
    *  re-registers before the old cleanup runs can't blank itself out. */
   register: (sessionId: string, reveal: Revealer) => () => void;
   /** Ask `sessionId`'s transcript to reveal `messageId`. False when no
-   *  virtualized transcript is mounted for that session — which is the normal,
-   *  correct answer on the non-virtual path, where every row is already in the
-   *  DOM and the caller needs to do nothing. */
+   *  transcript is mounted for that session (a pane that has since closed, a
+   *  reveal aimed at a session this pane no longer shows) or when the id isn't
+   *  in it — the caller should paint what it can rather than treat it as an
+   *  error. */
   reveal: (sessionId: string, messageId: string) => boolean;
 }
 

@@ -109,16 +109,11 @@ export function collectOccurrences(
   return ranges;
 }
 
-/** Paint all occurrences, marking `activeIndex` (if any) as the active match. */
-export function applyHighlights(ranges: Range[], activeIndex: number): void {
-  paintHighlights(ranges, ranges[activeIndex]);
-}
-
 /**
  * Paint `all` and mark `active` — which does NOT have to be a member of `all`.
  *
- * Needed once the transcript is windowed (#1143): `all` can only ever cover the
- * rows currently mounted, so the active occurrence can't be addressed as an index
+ * The transcript is windowed (#1143), so `all` can only ever cover the rows
+ * currently mounted and the active occurrence can't be addressed as an index
  * into it. The caller resolves the active range from the data model (message +
  * ordinal within that message) and passes it directly.
  */
