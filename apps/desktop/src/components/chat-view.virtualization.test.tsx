@@ -234,8 +234,16 @@ describe("ChatView virtualization (#1143)", () => {
   it("windows the transcript without dropping it from the store", () => {
     seed(500);
     render(<ChatView />);
-    // Only the DOM is windowed (#1143): the full session stays in the store, so
-    // find, export and jump-to-anywhere keep working off complete data.
+    // Only the DOM is windowed (#1143) — the full session stays in the store.
+    //
+    // This asserts the *premise* and nothing more. An earlier version of this
+    // comment went on to conclude that find therefore "keeps working off
+    // complete data", which was wrong and hid a real defect (#1143 review):
+    // find's count comes from the data model but its navigation walks the DOM,
+    // so a windowed transcript left most hits unreachable. Complete data in the
+    // store does not imply a feature reads it — anything that needs a specific
+    // row must ask for it to be mounted (`store/transcript-scroll.ts`), and that
+    // wiring is tested in `find-bar.virtualized.test.tsx`.
     expect(useChatStore.getState().messagesBySession[SID]).toHaveLength(500);
   });
 });

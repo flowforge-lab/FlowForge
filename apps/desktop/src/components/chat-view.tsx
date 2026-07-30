@@ -25,6 +25,7 @@ import { isResumableStopNotice } from "@/store/capped-turn";
 import { foldTurns, lastTurnStart, segmentTurn } from "@/lib/turn-groups";
 import type { RenderGroup, TurnItem } from "@/lib/turn-groups";
 import { useExperimentalStore } from "@/store/experimental";
+import { useTranscriptScroll } from "@/store/transcript-scroll";
 import { useModelConfigStore, activeConnection } from "@/store/model-config";
 import { downloadStepTimeline } from "@/lib/export-step-timeline";
 import type { Message } from "@/bindings";
@@ -772,8 +773,12 @@ export function ChatView({ sessionId }: { sessionId?: string } = {}) {
   // long session dominates everything else by two orders of magnitude (2153ms of
   // a ~2.2s session open, against ~43ms for the entire load path). The full
   // session stays in the store — only the DOM is windowed — so nothing that
-  // reads `messages` changes, and jump-to-anywhere stays possible without
-  // re-fetching.
+  // reads `messages` changes.
+  //
+  // What that does NOT buy: anything that reads the rendered DOM. The in-thread
+  // find bar walks `[data-message-id]` nodes to build paintable ranges, so a
+  // complete store is not enough — it has to ask for a row to be mounted before
+  // it can range over it (`store/transcript-scroll.ts`, registered below).
   //
   // Behind a flag while the scroll machinery (#206/#866/#1025) is dogfooded
   // against it on a real large database; `virtualItems` is empty when off and
@@ -799,6 +804,38 @@ export function ChatView({ sessionId }: { sessionId?: string } = {}) {
     initialRect: INITIAL_RECT,
   });
   const virtualItems = virtualizer.getVirtualItems();
+
+  // Publish a reveal for this session while windowing is on (#1143). Anything
+  // that needs to look at a specific message — the find bar stepping onto a hit
+  // far above the viewport — can only do so once the row is mounted, and a
+  // windowed list is the only thing that can mount it. Registered ONLY on the
+  // virtual path: on the plain path every row is already in the DOM, and
+  // `reveal()` returning false is the correct "nothing to do" answer there.
+  //
+  // `groups` is read through a ref rather than captured, so the registration
+  // doesn't churn on every streamed token (the same reason `latestMessagesRef`
+  // exists for the pin).
+  const groupsRef = useRef(groups);
+  useEffect(() => {
+    groupsRef.current = groups;
+  }, [groups]);
+  const register = useTranscriptScroll((s) => s.register);
+  useEffect(() => {
+    if (!virtualized || !targetSessionId) return;
+    return register(targetSessionId, (messageId) => {
+      const index = groupsRef.current.findIndex(
+        (g) => g.message.id === messageId,
+      );
+      if (index < 0) return false;
+      // `center` so a hit lands mid-viewport with context either side, matching
+      // what `scrollRangeIntoView` does on the non-virtual path.
+      virtualizer.scrollToIndex(index, { align: "center" });
+      return true;
+    });
+    // `virtualizer` is a stable instance for the life of the component; adding it
+    // would re-register on every render for no gain.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [virtualized, targetSessionId, register]);
 
   function handleScroll() {
     const el = scrollEl;
