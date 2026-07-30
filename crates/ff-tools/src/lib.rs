@@ -58,8 +58,8 @@ pub use goal_complete::{GoalCompleteTool, GOAL_COMPLETE_TOOL_NAME};
 pub use jail::resolve_in_root;
 pub use notebook::{KernelLiveState, KernelSupervisor, NotebookKernelState, NotebookTool};
 pub use registry::{
-    is_subagent, ObserverIntent, ObserverIntentKind, Safety, Tool, ToolOutcome, ToolRegistry,
-    NO_SESSION,
+    action_scope_for_mode, is_subagent, ActionScope, ObserverIntent, ObserverIntentKind, Safety,
+    Tool, ToolOutcome, ToolRegistry, NO_SESSION,
 };
 pub use sink::{OutputSink, OutputStream};
 pub use test_runner::TestRunnerTool;

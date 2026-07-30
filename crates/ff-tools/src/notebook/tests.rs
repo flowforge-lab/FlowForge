@@ -778,3 +778,59 @@ async fn run_all_stops_on_error() {
 
     sup.stop(sid, None).await.unwrap();
 }
+
+#[test]
+fn action_params_coherent_with_schema() {
+    // RFC 0024 Phase 2B (#1162): adding an action to the enum without declaring
+    // its parameters fails here.
+    let tool = NotebookTool::new(std::sync::Arc::new(KernelSupervisor::new()));
+    crate::registry::assert_action_params_coherent(&tool);
+}
+
+#[test]
+fn action_params_cover_known_dispatch_reads() {
+    // The widest blind spot of the coherence check in this crate: `kernel` is
+    // claimed by five actions, `timeout_secs` by three, `working_dir` by two.
+    // Dropping any single one leaves the property claimed elsewhere, so the
+    // orphan check stays silent while that action loses the parameter.
+    let tool = NotebookTool::new(std::sync::Arc::new(KernelSupervisor::new()));
+    let declared = tool.action_params().expect("declares action_params");
+    let required: &[(&str, &str)] = &[
+        ("run_cell", "code"),
+        ("run_cell", "kernel"),
+        ("run_cell", "timeout_secs"),
+        ("run_all", "notebook"),
+        ("run_all", "stop_on_error"),
+        ("run_all", "kernel"),
+        ("run_all", "timeout_secs"),
+        ("inspect", "kernel"),
+        ("inspect", "timeout_secs"),
+        ("restart", "kernel"),
+        ("restart", "working_dir"),
+        ("stop", "kernel"),
+        ("start", "working_dir"),
+    ];
+    for (action, param) in required {
+        let params = declared
+            .get(action)
+            .unwrap_or_else(|| panic!("action {action:?} missing from action_params"));
+        assert!(
+            params.contains(param),
+            "action {action:?} reads {param:?} in its dispatch path but does not declare it"
+        );
+    }
+    // Attribution is by use, not by evaluation: resolve_kernel_id runs at :527
+    // before the match, but start calls supervisor.start(session_id, &dir) and
+    // status calls supervisor.status(session_id) — neither passes the kernel id on.
+    assert!(
+        !declared
+            .get("start")
+            .expect("start declared")
+            .contains(&"kernel"),
+        "start evaluates the kernel id but never uses it; declaring it would advertise a no-op"
+    );
+    assert!(
+        declared.get("status").expect("status declared").is_empty(),
+        "status ignores every argument including kernel"
+    );
+}

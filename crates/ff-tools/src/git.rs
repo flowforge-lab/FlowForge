@@ -2,6 +2,7 @@
 //! and `show` as structured, token-efficient results. All actions are ReadOnly,
 //! so this tool is available in Plan mode.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use async_trait::async_trait;
@@ -90,6 +91,24 @@ impl Tool for GitTool {
             },
             "required": ["action"]
         })
+    }
+
+    /// Per-action parameter attribution for Phase 2B pruning (#1162).
+    ///
+    /// Read off the dispatch code. Note `status` takes **no** arguments at all —
+    /// `git_status(root)` does not even receive `args` — so `git status` prunes
+    /// down to the bare `action` discriminant.
+    ///
+    /// `git_log` reads `n` through a multi-line `.get()` at `:313-317`; a
+    /// single-line scan of the source misses it. That is why this map is
+    /// hand-verified rather than generated.
+    fn action_params(&self) -> Option<BTreeMap<&'static str, &'static [&'static str]>> {
+        Some(BTreeMap::from([
+            ("status", &[][..]),
+            ("diff", &["ref", "staged", "stat", "path"][..]),
+            ("log", &["n", "path"][..]),
+            ("show", &["ref"][..]),
+        ]))
     }
 
     fn safety(&self, _args: &Value) -> Safety {
@@ -698,6 +717,47 @@ mod tests {
         assert!(
             !marker.exists(),
             "the rejected injection must not have written a file"
+        );
+    }
+
+    #[test]
+    fn action_params_coherent_with_schema() {
+        // RFC 0024 Phase 2B (#1162): adding an action to the enum without
+        // declaring its parameters fails here.
+        crate::registry::assert_action_params_coherent(&GitTool);
+    }
+
+    #[test]
+    fn action_params_cover_known_dispatch_reads() {
+        // Closes what the orphan check cannot see: `ref` and `path` are each
+        // claimed by two actions, so dropping one still leaves the property
+        // claimed and the coherence check silent.
+        let declared = GitTool.action_params().expect("git declares action_params");
+        let required: &[(&str, &str)] = &[
+            // git_show reads `ref` at :356.
+            ("show", "ref"),
+            // git_diff reads all four; `staged` at :224.
+            ("diff", "ref"),
+            ("diff", "staged"),
+            ("diff", "stat"),
+            ("diff", "path"),
+            // git_log reads `n` via a multi-line .get() at :313-317.
+            ("log", "n"),
+            ("log", "path"),
+        ];
+        for (action, param) in required {
+            let params = declared
+                .get(action)
+                .unwrap_or_else(|| panic!("action {action:?} missing from action_params"));
+            assert!(
+                params.contains(param),
+                "action {action:?} reads {param:?} in its dispatch path but does not declare it"
+            );
+        }
+        // git_status(root) never receives `args`, so it must claim nothing.
+        assert!(
+            declared.get("status").expect("status declared").is_empty(),
+            "git status takes no arguments; declaring any would keep dead properties in its schema"
         );
     }
 }

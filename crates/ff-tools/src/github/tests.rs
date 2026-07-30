@@ -666,3 +666,63 @@ fn render_review_comments_falls_back_to_original_line() {
     let out = render_review_comments(1, &comments);
     assert!(out.contains("original line 17 (LEFT)"));
 }
+
+#[test]
+fn github_action_params_coherent_with_schema() {
+    // RFC 0024 Phase 2B (#1162): the declaration must match the schema it prunes.
+    // Adding an action to the enum without declaring its parameters fails here.
+    crate::registry::assert_action_params_coherent(&GithubTool);
+}
+
+#[test]
+fn github_action_params_cover_known_dispatch_reads() {
+    // Closes the gap `assert_action_params_coherent` cannot see: a property
+    // omitted from one action while another still claims it. The orphan check
+    // stays silent there, because the ground truth is in the dispatch code.
+    //
+    // Each pair below is a parameter the dispatch path provably reads — verified
+    // against the code, not against the property descriptions. Three of these are
+    // cases where the descriptions are wrong today (#1161), so a future author who
+    // "fixes" the declaration to match the prose breaks this test instead of
+    // silently deleting a capability.
+    let declared = GithubTool
+        .action_params()
+        .expect("github declares action_params");
+    let required: &[(&str, &str)] = &[
+        // issue_edit reads `title` at github.rs:630 and passes --title, but the
+        // description for `title` names only (pr_create, issue_create). #1161.
+        ("issue_edit", "title"),
+        // pr_request_review reads `reviewer` at :402 and errors without it; the
+        // description names only (pr_create). #1161.
+        ("pr_request_review", "reviewer"),
+        // pr_merge reads `delete_branch` at :264-271 via a multi-line .get(),
+        // which single-line source scanning misses. #1161.
+        ("pr_merge", "delete_branch"),
+        // Posting a comment forwards to comment_on, which reads `body`. An early
+        // single-level probe reported pr_comment as needing no parameters at all.
+        ("pr_comment", "body"),
+        ("issue_comment", "body"),
+        // pr_review_inline forwards to build_inline_review_payload, which reads
+        // `comments` — a second-level forward.
+        ("pr_review_inline", "comments"),
+        ("pr_review_inline", "event"),
+        // create_flag_args(args, true) supplies reviewer only for pr_create.
+        ("pr_create", "reviewer"),
+        ("pr_create", "label"),
+        ("issue_create", "label"),
+        // Every numbered action needs the number it acts on.
+        ("pr_view", "number"),
+        ("pr_checks", "number"),
+        ("push", "force"),
+    ];
+    for (action, param) in required {
+        let params = declared
+            .get(action)
+            .unwrap_or_else(|| panic!("action {action:?} missing from action_params"));
+        assert!(
+            params.contains(param),
+            "action {action:?} reads {param:?} in its dispatch path but does not declare it — \
+             pruning would remove it from the schema and the capability would vanish silently"
+        );
+    }
+}
