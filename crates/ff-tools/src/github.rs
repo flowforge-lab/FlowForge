@@ -75,7 +75,7 @@ impl Tool for GithubTool {
                     "title", "body", "base", "head", "label", "assignee", "reviewer",
                 ][..],
             ),
-            ("pr_list", &["author", "limit"][..]),
+            ("pr_list", &["author", "label", "limit"][..]),
             ("pr_view", &["number", "diff"][..]),
             ("pr_reviews", &["number"][..]),
             ("pr_review_comments", &["number"][..]),

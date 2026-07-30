@@ -726,3 +726,75 @@ fn github_action_params_cover_known_dispatch_reads() {
         );
     }
 }
+
+#[test]
+fn github_action_params_match_the_dispatch_code_exactly() {
+    // The sampled test above only asserts that specific pairs are *present*, so it
+    // cannot see a parameter a handler starts reading later. #1163 did exactly that:
+    // `pr_list` gained `--label` (bringing it in line with `issue_list`, whose
+    // description had always claimed the filter) while this declaration still said
+    // `["author", "limit"]`. Pruning would then have dropped `label` from the
+    // advertised schema and the filter would have become unreachable — no error, the
+    // model simply never passes it.
+    //
+    // `assert_action_params_coherent` is structurally blind to that: it checks
+    // declared-⊆-schema and no-orphans, and `label` stays non-orphaned via four other
+    // actions. So the only defence is an exact set per action, transcribed from the
+    // dispatch code. Adding a read without updating this fails here.
+    let declared = GithubTool
+        .action_params()
+        .expect("github declares action_params");
+    let expected: &[(&str, &[&str])] = &[
+        (
+            "pr_create",
+            &[
+                "title", "body", "base", "head", "label", "assignee", "reviewer",
+            ],
+        ),
+        ("pr_list", &["author", "label", "limit"]),
+        ("pr_view", &["number", "diff"]),
+        ("pr_reviews", &["number"]),
+        ("pr_review_comments", &["number"]),
+        ("pr_merge", &["number", "squash", "delete_branch"]),
+        ("pr_checks", &["number"]),
+        ("pr_review", &["number", "body", "event"]),
+        ("pr_comment", &["number", "body"]),
+        ("pr_request_review", &["number", "reviewer"]),
+        ("pr_review_inline", &["number", "body", "event", "comments"]),
+        ("issue_create", &["title", "body", "label", "assignee"]),
+        (
+            "issue_edit",
+            &["number", "title", "body", "label", "assignee"],
+        ),
+        ("issue_list", &["label", "limit"]),
+        ("issue_view", &["number"]),
+        ("issue_comment", &["number", "body"]),
+        ("push", &["force"]),
+    ];
+
+    let mut declared_names: Vec<&str> = declared.keys().copied().collect();
+    let mut expected_names: Vec<&str> = expected.iter().map(|(a, _)| *a).collect();
+    declared_names.sort_unstable();
+    expected_names.sort_unstable();
+    assert_eq!(
+        declared_names, expected_names,
+        "the set of declared actions changed; transcribe the new action's reads from \
+         its dispatch code rather than from the parameter descriptions (#1161)"
+    );
+
+    for (action, want) in expected {
+        let mut got: Vec<&str> = declared
+            .get(action)
+            .unwrap_or_else(|| panic!("action {action:?} missing from action_params"))
+            .to_vec();
+        let mut want = want.to_vec();
+        got.sort_unstable();
+        want.sort_unstable();
+        assert_eq!(
+            got, want,
+            "action {action:?} declares a different parameter set than its dispatch \
+             code reads; a missing entry is pruned away silently, an extra one wastes \
+             the bytes this phase exists to save"
+        );
+    }
+}
