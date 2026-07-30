@@ -34,7 +34,7 @@ impl Tool for GithubTool {
                     "description": "The operation to perform.",
                     "enum": ["pr_create", "pr_list", "pr_view", "pr_reviews", "pr_review_comments", "pr_merge", "pr_checks", "pr_review", "pr_comment", "pr_request_review", "pr_review_inline", "issue_create", "issue_edit", "issue_list", "issue_view", "issue_comment", "push"]
                 },
-                "title": { "type": "string", "description": "Title for PR or issue (pr_create, issue_create)." },
+                "title": { "type": "string", "description": "Title for PR or issue (pr_create, issue_create, issue_edit)." },
                 "body": { "type": "string", "description": "Body text for a PR/issue or a review/comment (pr_create, issue_create, issue_edit, pr_review, pr_comment, issue_comment, pr_review_inline). Required for pr_review / pr_review_inline when event is COMMENT or REQUEST_CHANGES (GitHub 422s a bodiless one); optional for APPROVE. Markdown supported." },
                 "base": { "type": "string", "description": "Base branch for PR (pr_create). Defaults to 'main'." },
                 "head": { "type": "string", "description": "Head branch for PR (pr_create). Defaults to current branch." },
@@ -44,7 +44,7 @@ impl Tool for GithubTool {
                 "squash": { "type": "boolean", "description": "Squash merge (pr_merge). Defaults to true." },
                 "label": { "type": ["string", "array"], "items": { "type": "string" }, "description": "Label(s) to filter by or assign — a single string or an array. On issue_create/pr_create each is applied; on issue_edit each is added (--add-label); on issue_list/pr_list used as a filter." },
                 "assignee": { "type": ["string", "array"], "items": { "type": "string" }, "description": "GitHub username(s) to assign — a single string or an array (issue_create, pr_create; added on issue_edit)." },
-                "reviewer": { "type": ["string", "array"], "items": { "type": "string" }, "description": "Reviewer username(s) to request — a single string or an array (pr_create)." },
+                "reviewer": { "type": ["string", "array"], "items": { "type": "string" }, "description": "Reviewer username(s) to request — a single string or an array (pr_create, pr_request_review)." },
                 "author": { "type": "string", "description": "Filter by author (pr_list). Use '@me' for self." },
                 "limit": { "type": "integer", "description": "Max results to return (pr_list, issue_list). Defaults to 10." },
                 "force": { "type": "boolean", "description": "Force push (push). Defaults to false." },
@@ -244,9 +244,7 @@ async fn pr_list(args: &Value, root: &Path) -> ToolOutcome {
         &limit.to_string(),
     ]);
 
-    if let Some(author) = args.get("author").and_then(|v| v.as_str()) {
-        cmd.args(["--author", author]);
-    }
+    cmd.args(pr_list_flags(args));
 
     match run_gh(cmd).await {
         Ok(json) => format_json_table(&json, &["number", "title", "headRefName", "state"]),
@@ -399,17 +397,17 @@ async fn pr_request_review(args: &Value, root: &Path) -> ToolOutcome {
         Some(n) => n,
         None => return ToolOutcome::error("pr_request_review requires 'number'"),
     };
-    let reviewers = str_or_list(args, "reviewer");
-    if reviewers.is_empty() {
-        return ToolOutcome::error("pr_request_review requires 'reviewer' (a string or array)");
-    }
+    let flags = match pr_request_review_flags(args) {
+        Ok(f) => f,
+        Err(e) => return ToolOutcome::error(e),
+    };
     let mut cmd = gh_cmd(root);
     cmd.args(["pr", "edit", &number.to_string()]);
-    push_repeated_flag_cmd(&mut cmd, "--add-reviewer", &reviewers);
+    cmd.args(flags);
     match run_gh(cmd).await {
         Ok(out) => ToolOutcome::ok(format!(
             "Requested review from {} on PR #{number}. {}",
-            reviewers.join(", "),
+            str_or_list(args, "reviewer").join(", "),
             out.trim()
         )),
         Err(e) => ToolOutcome::error(format!("pr_request_review failed: {e}")),
@@ -623,15 +621,7 @@ async fn issue_edit(args: &Value, root: &Path) -> ToolOutcome {
 
     let mut cmd = gh_cmd(root);
     cmd.args(["issue", "edit", &number.to_string()]);
-
-    if let Some(body) = args.get("body").and_then(|v| v.as_str()) {
-        cmd.args(["--body", body]);
-    }
-    if let Some(title) = args.get("title").and_then(|v| v.as_str()) {
-        cmd.args(["--title", title]);
-    }
-    push_repeated_flag_cmd(&mut cmd, "--add-label", &str_or_list(args, "label"));
-    push_repeated_flag_cmd(&mut cmd, "--add-assignee", &str_or_list(args, "assignee"));
+    cmd.args(issue_edit_flags(args));
 
     match run_gh(cmd).await {
         Ok(out) => ToolOutcome::ok(format!("Issue #{number} updated. {}", out.trim())),
@@ -1217,6 +1207,45 @@ fn push_repeated_flag_cmd(cmd: &mut Command, flag: &str, values: &[String]) {
     for v in values {
         cmd.args([flag, v]);
     }
+}
+
+/// Build the argument flags for `issue_edit` from the tool `args`.
+/// Pure so it can be unit-tested without spawning `gh`.
+fn issue_edit_flags(args: &Value) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(body) = args.get("body").and_then(|v| v.as_str()) {
+        push_repeated_flag(&mut out, "--body", &[body.to_string()]);
+    }
+    if let Some(title) = args.get("title").and_then(|v| v.as_str()) {
+        push_repeated_flag(&mut out, "--title", &[title.to_string()]);
+    }
+    push_repeated_flag(&mut out, "--add-label", &str_or_list(args, "label"));
+    push_repeated_flag(&mut out, "--add-assignee", &str_or_list(args, "assignee"));
+    out
+}
+
+/// Build the argument flags for `pr_request_review` from the tool `args`.
+/// Returns an error if `reviewer` is missing or empty.
+/// Pure so it can be unit-tested without spawning `gh`.
+fn pr_request_review_flags(args: &Value) -> Result<Vec<String>, String> {
+    let reviewers = str_or_list(args, "reviewer");
+    if reviewers.is_empty() {
+        return Err("pr_request_review requires 'reviewer' (a string or array)".to_string());
+    }
+    let mut out = Vec::new();
+    push_repeated_flag(&mut out, "--add-reviewer", &reviewers);
+    Ok(out)
+}
+
+/// Build the argument flags for `pr_list` from the tool `args`.
+/// Pure so it can be unit-tested without spawning `gh`.
+fn pr_list_flags(args: &Value) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(author) = args.get("author").and_then(|v| v.as_str()) {
+        push_repeated_flag(&mut out, "--author", &[author.to_string()]);
+    }
+    push_repeated_flag(&mut out, "--label", &str_or_list(args, "label"));
+    out
 }
 
 /// Build the trailing `--label` / `--assignee` (and optional `--reviewer`) args
