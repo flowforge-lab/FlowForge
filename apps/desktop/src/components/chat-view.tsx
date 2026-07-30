@@ -59,6 +59,11 @@ const EMPTY_MESSAGES: Message[] = [];
 // the scrollbar lies before they do. Roughly a short user bubble plus its
 // header — deliberately on the low side, since underestimating renders a few
 // extra rows (cheap) while overestimating leaves a gap at the tail (visible).
+//
+// Because it is low, `getTotalSize()` (and therefore the container's
+// `scrollHeight`) under-states a session whose rows haven't been visited yet.
+// Anything aiming at the bottom must go through the virtualizer rather than
+// `scrollHeight` — see `jumpToLatest`.
 const ROW_ESTIMATE_PX = 140;
 // Rows kept mounted beyond each edge of the viewport. Enough that a flick-scroll
 // doesn't expose unmeasured space, small enough that the DOM stays bounded —
@@ -69,9 +74,10 @@ const OVERSCAN = 6;
 // measurement, so the initial window isn't computed against a 0×0 box. The real
 // size replaces it as soon as the scroll element is observed — this only has to
 // be the right order of magnitude. (It does NOT rescue jsdom, which reports
-// `offsetHeight: 0`: that measurement lands immediately and wins. Tests that
-// need a viewport stub `offsetWidth`/`offsetHeight` — see
-// `chat-view.virtualization.test.tsx`.)
+// `offsetHeight: 0`: that measurement lands immediately and wins. Now that this
+// is the only transcript path, every jsdom suite needs a real viewport or it
+// renders zero rows — `vitest.setup.ts` stubs `offsetWidth`/`offsetHeight`
+// globally for that reason.)
 const INITIAL_RECT = { width: 800, height: 1000 };
 
 // Narrow a message-id-keyed store record to just the entries belonging to one
@@ -780,12 +786,17 @@ export function ChatView({ sessionId }: { sessionId?: string } = {}) {
   // complete store is not enough — it has to ask for a row to be mounted before
   // it can range over it (`store/transcript-scroll.ts`, registered below).
   //
-  // Behind a flag while the scroll machinery (#206/#866/#1025) is dogfooded
-  // against it on a real large database; `virtualItems` is empty when off and
-  // the plain list renders instead.
-  const virtualized = useExperimentalStore(
-    (s) => s.flags.virtualizedTranscript,
-  );
+  // This is now the only transcript path. It shipped behind the
+  // `virtualizedTranscript` flag in #1155 so the scroll machinery
+  // (#206/#866/#1025) could be dogfooded on a real large database first; that
+  // pass is done, so the flag and the plain list are gone.
+  //
+  // The consequence to keep in mind when touching anything that scrolls: the
+  // container's `scrollHeight` is `getTotalSize()` — real heights for measured
+  // rows plus `ROW_ESTIMATE_PX` for every row that has never mounted — so it is
+  // an *under-estimate* whose error grows with the number of unmeasured rows.
+  // Never treat it as the true bottom (see `jumpToLatest`).
+  //
   // The virtualizer hands back fresh closures every render, so the React
   // compiler skips memoizing this component. Accepted: it manages its own
   // subscriptions, nothing here holds one of those functions across renders, and
@@ -793,7 +804,7 @@ export function ChatView({ sessionId }: { sessionId?: string } = {}) {
   // token from re-rendering the transcript — is unaffected.
   // eslint-disable-next-line react-hooks/incompatible-library
   const virtualizer = useVirtualizer({
-    count: virtualized ? groups.length : 0,
+    count: groups.length,
     getScrollElement: () => scrollEl,
     estimateSize: () => ROW_ESTIMATE_PX,
     // Key by message id, not index: rows are inserted at the *front* by the
@@ -805,12 +816,10 @@ export function ChatView({ sessionId }: { sessionId?: string } = {}) {
   });
   const virtualItems = virtualizer.getVirtualItems();
 
-  // Publish a reveal for this session while windowing is on (#1143). Anything
-  // that needs to look at a specific message — the find bar stepping onto a hit
-  // far above the viewport — can only do so once the row is mounted, and a
-  // windowed list is the only thing that can mount it. Registered ONLY on the
-  // virtual path: on the plain path every row is already in the DOM, and
-  // `reveal()` returning false is the correct "nothing to do" answer there.
+  // Publish a reveal for this session (#1143). Anything that needs to look at a
+  // specific message — the find bar stepping onto a hit far above the viewport —
+  // can only do so once the row is mounted, and the windowed list is the only
+  // thing that can mount it.
   //
   // `groups` is read through a ref rather than captured, so the registration
   // doesn't churn on every streamed token (the same reason `latestMessagesRef`
@@ -821,21 +830,21 @@ export function ChatView({ sessionId }: { sessionId?: string } = {}) {
   }, [groups]);
   const register = useTranscriptScroll((s) => s.register);
   useEffect(() => {
-    if (!virtualized || !targetSessionId) return;
+    if (!targetSessionId) return;
     return register(targetSessionId, (messageId) => {
       const index = groupsRef.current.findIndex(
         (g) => g.message.id === messageId,
       );
       if (index < 0) return false;
-      // `center` so a hit lands mid-viewport with context either side, matching
-      // what `scrollRangeIntoView` does on the non-virtual path.
+      // `center` so a hit lands mid-viewport with context either side, which is
+      // what `scrollRangeIntoView` then refines to the matched span itself.
       virtualizer.scrollToIndex(index, { align: "center" });
       return true;
     });
     // `virtualizer` is a stable instance for the life of the component; adding it
     // would re-register on every render for no gain.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [virtualized, targetSessionId, register]);
+  }, [targetSessionId, register]);
 
   function handleScroll() {
     const el = scrollEl;
@@ -845,18 +854,48 @@ export function ChatView({ sessionId }: { sessionId?: string } = {}) {
     setAtBottom(pinned);
   }
 
-  // Smooth-scroll to the newest content and re-arm sticky autoscroll (#206).
+  // Scroll to the newest content and re-arm sticky autoscroll (#206).
+  //
+  // This goes through the virtualizer rather than writing
+  // `scrollTo({ top: el.scrollHeight })`, which could not reach the bottom of a
+  // long session (#1143 review). Two compounding reasons, both worth keeping
+  // written down because the naive version looks obviously correct:
+  //
+  //  1. `scrollHeight` is the spacer, i.e. `getTotalSize()` — measured heights
+  //     for mounted rows plus a 140px estimate for every row that has never
+  //     mounted. On a 7900-row session almost everything is unmeasured and the
+  //     estimate is low, so the target is a large under-estimate. Scrolling
+  //     toward it mounts rows, `measureElement` reports their real heights, the
+  //     total grows, and the bottom moves further away. The error is
+  //     proportional to the rows below the current position, so it descends
+  //     roughly a screenful per click and never arrives.
+  //  2. The smooth animation's intermediate `scroll` events run `handleScroll`,
+  //     which flips `pinnedToBottom.current` to false mid-flight — so the
+  //     ResizeObserver settle that re-pins the other scroll paths is gated off
+  //     for exactly this one, and it stays detached where it landed.
+  //
+  // `scrollToIndex` fixes both: virtual-core records the target index and runs a
+  // rAF reconcile loop that recomputes the offset each frame as rows measure and
+  // re-scrolls when it moves, settling once stable. The final write lands at the
+  // true tail, so the last `scroll` event leaves `pinnedToBottom` true.
   function jumpToLatest() {
     const el = scrollEl;
     if (!el) return;
-    el.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
+    if (groups.length > 0) {
+      virtualizer.scrollToIndex(groups.length - 1, {
+        align: "end",
+        behavior: "smooth",
+      });
+    } else {
+      el.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
+    }
     pinnedToBottom.current = true;
     setAtBottom(true);
   }
 
-  // One row, rendered identically by both the plain and the virtualized list —
-  // the two paths differ only in *which* rows they ask for and how they're
-  // positioned, never in what a row is.
+  // One row. Kept as a named function rather than inlined into the map so the
+  // windowing above stays legible as *which* rows are asked for, separate from
+  // what a row is.
   const renderGroup = (g: RenderGroup) => {
     const m = g.message;
     // foldTurns already resolved each turn's steps (live or reconstructed)
@@ -922,38 +961,28 @@ export function ChatView({ sessionId }: { sessionId?: string } = {}) {
         data-testid="chat-scroll"
         className="min-h-0 flex-1 overflow-y-auto"
       >
-        <div
-          ref={setContentEl}
-          className={cn(
-            "mx-auto w-full max-w-4xl px-4 py-4",
-            !virtualized && "flex flex-col gap-3",
-          )}
-        >
-          {virtualized ? (
-            // The spacer carries the full measured height so the scrollbar is
-            // honest about the whole session; rows are absolutely positioned
-            // inside it. `gap-3` can't survive absolute positioning, so the
-            // per-row `pb-3` reproduces it — measured as part of the row, which
-            // is what keeps the offsets consistent.
-            <div
-              className="relative w-full"
-              style={{ height: virtualizer.getTotalSize() }}
-            >
-              {virtualItems.map((vi) => (
-                <div
-                  key={vi.key}
-                  data-index={vi.index}
-                  ref={virtualizer.measureElement}
-                  className="absolute left-0 top-0 w-full pb-3"
-                  style={{ transform: `translateY(${vi.start}px)` }}
-                >
-                  {renderGroup(groups[vi.index])}
-                </div>
-              ))}
-            </div>
-          ) : (
-            groups.map((g) => renderGroup(g))
-          )}
+        <div ref={setContentEl} className="mx-auto w-full max-w-4xl px-4 py-4">
+          {/* The spacer carries the full measured height so the scrollbar is
+              honest about the whole session; rows are absolutely positioned
+              inside it. `gap-3` can't survive absolute positioning, so the
+              per-row `pb-3` reproduces it — measured as part of the row, which
+              is what keeps the offsets consistent. */}
+          <div
+            className="relative w-full"
+            style={{ height: virtualizer.getTotalSize() }}
+          >
+            {virtualItems.map((vi) => (
+              <div
+                key={vi.key}
+                data-index={vi.index}
+                ref={virtualizer.measureElement}
+                className="absolute left-0 top-0 w-full pb-3"
+                style={{ transform: `translateY(${vi.start}px)` }}
+              >
+                {renderGroup(groups[vi.index])}
+              </div>
+            ))}
+          </div>
           {pending && <ThinkingIndicator />}
         </div>
       </div>

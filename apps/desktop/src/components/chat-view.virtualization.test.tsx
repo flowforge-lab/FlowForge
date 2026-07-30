@@ -11,53 +11,19 @@
 // the test that fails the moment someone deletes the virtualizer.
 //
 // jsdom has no layout, so rows never measure and the virtualizer works purely
-// from the stubbed viewport below and the estimated row height. That's
-// deterministic, which is exactly what makes the bound assertable without
+// from the viewport `vitest.setup.ts` stubs (800×1000 — jsdom would otherwise
+// report 0×0 and window down to no rows at all) and the estimated row height.
+// That's deterministic, which is exactly what makes the bound assertable without
 // timing.
 
 import { act, render } from "@testing-library/react";
-import {
-  afterAll,
-  afterEach,
-  beforeAll,
-  beforeEach,
-  describe,
-  expect,
-  it,
-} from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { ChatView } from "@/components/chat-view";
 import { useChatStore } from "@/store/chat";
-import {
-  EXPERIMENTAL_DEFAULTS,
-  useExperimentalStore,
-} from "@/store/experimental";
 import type { Message } from "@/bindings";
 
 const SID = "s1";
-
-// The virtualizer sizes its viewport from the scroll element's
-// `offsetWidth`/`offsetHeight` (not `getBoundingClientRect`), and jsdom reports
-// 0 for both — a zero-height viewport windows down to *no* rows, which would
-// make this whole suite pass vacuously. Give elements a nominal viewport for the
-// duration of this file. (When virtualization becomes the only path, this moves
-// to vitest.setup.ts so the other ChatView suites get a viewport too.)
-const VIEWPORT = { width: 800, height: 1000 };
-beforeAll(() => {
-  Object.defineProperty(HTMLElement.prototype, "offsetWidth", {
-    configurable: true,
-    get: () => VIEWPORT.width,
-  });
-  Object.defineProperty(HTMLElement.prototype, "offsetHeight", {
-    configurable: true,
-    get: () => VIEWPORT.height,
-  });
-});
-afterAll(() => {
-  for (const prop of ["offsetWidth", "offsetHeight"]) {
-    delete (HTMLElement.prototype as unknown as Record<string, unknown>)[prop];
-  }
-});
 
 function seed(count: number) {
   const messages: Message[] = [];
@@ -78,12 +44,6 @@ function seed(count: number) {
     turnStartByMessage: {},
     toolStepsByMessage: {},
     reasoningByMessage: {},
-  });
-}
-
-function setVirtualized(on: boolean) {
-  useExperimentalStore.setState({
-    flags: { ...EXPERIMENTAL_DEFAULTS, virtualizedTranscript: on },
   });
 }
 
@@ -161,10 +121,8 @@ function renderRows(count: number): number {
 
 beforeEach(() => {
   observers = [];
-  setVirtualized(true);
 });
 afterEach(() => {
-  setVirtualized(false);
   useChatStore.setState({ messagesBySession: {}, toolStepsByMessage: {} });
 });
 
@@ -182,11 +140,6 @@ describe("ChatView virtualization (#1143)", () => {
     // Sanity: the window is actually populated, so a virtualizer that rendered
     // *nothing* (the jsdom zero-rect failure mode) can't pass this test.
     expect(long).toBeGreaterThan(0);
-  });
-
-  it("renders every row when the flag is off, so the fallback path is intact", () => {
-    setVirtualized(false);
-    expect(renderRows(30)).toBe(30);
   });
 
   // The scroll machinery (#206 pin-to-bottom, #866 relaunch restore, #1025

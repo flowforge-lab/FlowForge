@@ -121,12 +121,11 @@ export function FindBar({
   //
   // Two things make this more than "walk the DOM":
   //
-  // 1. **The row may not be mounted.** With the transcript windowed (#1143) only
-  //    the visible rows exist, so a hit 3000 rows up has no node to range over
-  //    until the list is asked to mount it. `reveal` does that; without it the
-  //    counter reads "1 of 500" off the data model while Enter can only reach the
-  //    handful of hits on screen. On the non-virtual path `reveal` returns false
-  //    and nothing is needed — every row is already there.
+  // 1. **The row may not be mounted.** The transcript is windowed (#1143), so
+  //    only the visible rows exist and a hit 3000 rows up has no node to range
+  //    over until the list is asked to mount it. `reveal` does that; without it
+  //    the counter reads "1 of 500" off the data model while Enter can only
+  //    reach the handful of hits on screen.
   // 2. **The active range can't be an index into the painted set.** The painted
   //    set covers mounted rows only, so it is a *subset* of `occurrences` whose
   //    indices don't line up. The active range is instead resolved by identity:
