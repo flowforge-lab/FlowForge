@@ -12,12 +12,14 @@
 //! `recv`, which the Router treats as a clean stop.
 
 mod api;
+mod approver;
 mod envelope;
 mod response;
 mod transport;
 mod writer;
 
 pub use api::{ApiError, SlackApi};
+pub use approver::{SlackApprover, ACTION_APPROVE, ACTION_DENY, DEFAULT_TIMEOUT};
 pub use envelope::{parse_envelope, ParseError, SlackEnvelope, SlackInteraction};
 pub use response::{SlackResponseStream, EDIT_THROTTLE, SLACK_TEXT_LIMIT};
 pub use transport::{SlackTransport, TRANSPORT_NAME};
@@ -27,3 +29,5 @@ pub use writer::{OutboundOp, WriterHandle};
 mod tests;
 #[cfg(test)]
 mod tests_t3;
+#[cfg(test)]
+mod tests_t4;

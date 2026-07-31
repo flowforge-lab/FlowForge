@@ -516,6 +516,33 @@ pub enum PrePromptDecision {
     Prompt,
 }
 
+/// Resolve the "relevant argument" a scoped permission rule matches on (#712).
+///
+/// Each entry is verified against the real tool arg schema in `ff-tools`
+/// (#768 review B2): `bash` takes `command`, `python` takes `code`, and the
+/// filesystem mutators take `path`. Only tools that can actually reach the
+/// approval gate are listed — the read-only search tools (`glob`, `grep`)
+/// short-circuit as `Safety::ReadOnly` before `approve()`, so a rule on them
+/// would never fire; listing them (with the wrong key) was dead, misleading
+/// code.
+///
+/// This lives beside [`pre_prompt_decision`] rather than inside any one
+/// `Approver` because every approver must resolve the same key for the same
+/// tool. Feeding [`PermissionMatrix::evaluate_rules`] a `None` it did not earn
+/// makes that function return early, which skips **every** scoped rule
+/// including `Deny` — fail-open. #768 warned about it for a *wrong* key; #1059
+/// T4's Slack approver hit the same hole by passing `None` outright, which is
+/// why this is shared code now (#1168 review, finding 1).
+pub fn resolve_tool_arg(name: &str, args: &serde_json::Value) -> Option<String> {
+    let key = match name {
+        "bash" => "command",
+        "python" => "code",
+        "view" | "edit" | "write" => "path",
+        _ => return None,
+    };
+    args.get(key).and_then(|v| v.as_str()).map(Into::into)
+}
+
 /// Evaluate the synchronous approval gates in their canonical order (#827):
 /// 1. Matrix Deny is absolute (no override).
 /// 2. Allowlist accelerates Ask cells.

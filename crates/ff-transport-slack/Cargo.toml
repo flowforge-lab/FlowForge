@@ -7,6 +7,8 @@ repository.workspace = true
 
 [dependencies]
 ff-transport = { path = "../ff-transport" }
+ff-agent = { workspace = true }
+ff-core = { workspace = true }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

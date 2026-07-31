@@ -39,7 +39,7 @@ pub use model_specs::{
     DEFAULT_CONTEXT_WINDOW_TOKENS,
 };
 pub use permission::{
-    pre_prompt_decision, PermissionCell, PermissionMatrix, PermissionMatrixEntry,
+    pre_prompt_decision, resolve_tool_arg, PermissionCell, PermissionMatrix, PermissionMatrixEntry,
     PermissionMatrixView, PermissionOverrideEntry, PermissionRule, PrePromptDecision, RuleEffect,
     Safety,
 };
