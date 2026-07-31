@@ -77,13 +77,10 @@ start, or no graph is indexed), do NOT regress to one grep at a time.
 Reconstruct the same answer with BATCHED `grep`/`glob`/`view` calls in a single
 turn — see below — so one turn covers what one `explore` would have.
 
-## Batch independent work into one turn
-When you need to inspect several files or run independent searches, issue all
-those tool calls together in a single turn rather than one at a time. Independent
-read-only calls run concurrently, so batching them collapses many slow round-trips
-into one and is dramatically faster — especially on hosted models.
-
-For example, to understand a function and its callers, issue in ONE turn: a
+## Batching, concretely
+The base prompt already tells you to batch independent tool calls. Two worked
+examples, since this is where agents regress first: to understand a function and
+its callers, issue in ONE turn: a
 `grep` for its definition, a `grep` for its call sites, and a `view` on the file
 you already know you need — not three sequential turns. After editing, run the
 independent verify checks (fmt, lint, a targeted test) together the same way.
