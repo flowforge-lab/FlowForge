@@ -2555,6 +2555,66 @@ impl AppState {
         self.mcp.lock().unwrap().clone()
     }
 
+    /// MCP `initialize` guidance for servers that currently have at least one tool
+    /// admitted for `session_id`, capped for injection (#1173).
+    ///
+    /// Gated on *reachability*, because guidance for a server the model cannot call
+    /// is pure cost. A server is reachable either way round:
+    ///
+    /// - **Deferred** (the default -- [`McpServerConfig::defer`](ff_core::McpServerConfig)
+    ///   is `Option<bool>` where `None` means deferred): its tools only enter the
+    ///   block once `tool_search` admits them, so admission is the signal.
+    /// - **Not deferred** (`defer = false`): its tools stand in the block from turn
+    ///   one and `admit` is never called for them -- [`ToolSearchState::admit`] has a
+    ///   single caller, the `tool_search` hit path. Gating on admission alone would
+    ///   therefore suppress the guidance of exactly those servers the operator opted
+    ///   into keeping resident, permanently and silently.
+    ///
+    /// Matching is by [`InstanceKey`] id, never by splitting the bridged
+    /// `mcp__<server>__<tool>` name: the bridge sanitises only the tool segment and
+    /// leaves the server id verbatim, so an id containing `__` makes that split
+    /// ambiguous. Here the server id is compared against the `mcp__<id>__` prefix,
+    /// which is exact in the direction that matters.
+    ///
+    /// Sorted by server id so the stable prompt prefix stays byte-identical across
+    /// turns (RFC 0024 §276) regardless of supervisor iteration order.
+    pub fn mcp_guidance(&self, session_id: &str) -> Vec<ff_agent::McpGuidance> {
+        let Some(handle) = self.mcp_handle() else {
+            return Vec::new();
+        };
+        let admitted = self.tool_search.admitted(session_id);
+        // Servers with at least one standing (non-deferred) tool are reachable
+        // without admission. Same snapshot the bridge builds the registry from, so
+        // this cannot disagree with what the model actually sees.
+        let standing: std::collections::HashSet<String> = handle
+            .tools_snapshot()
+            .into_iter()
+            .filter(|t| !t.info.defer)
+            .map(|t| t.key.id.clone())
+            .collect();
+        let mut guidance: Vec<ff_agent::McpGuidance> = handle
+            .instructions_snapshot()
+            .into_iter()
+            .filter(|(key, _)| {
+                ff_agent::server_guidance_is_reachable(&key.id, &standing, &admitted)
+            })
+            .map(|(key, text)| ff_agent::McpGuidance {
+                server: key.id.clone(),
+                text,
+            })
+            .collect();
+        guidance.sort_by(|a, b| a.server.cmp(&b.server));
+        let (fitted, dropped) = ff_agent::fit_mcp_guidance(&guidance);
+        if dropped > 0 {
+            tracing::warn!(
+                dropped,
+                "MCP server guidance exceeded the injection budget; some servers' \
+                 guidance was omitted"
+            );
+        }
+        fitted
+    }
+
     /// The full connection registry (clone — callers never hold the lock).
     /// Resolve the fast compaction model for a connection (#756).
     /// Precedence: env `FF_COMPACTION_MODEL` > connection config > None.

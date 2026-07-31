@@ -46,7 +46,9 @@ pub use compaction_extractive::{
 pub use goal_loop::{drive_goal, GateDecision, GoalIteration, IterationOutcome, LoopStop};
 pub use message_salience::MessageSalience;
 pub use system_prompt::{
-    build_flush_prompt, build_system_prompt, SystemPrompt, TimeOfDay, UserContext,
+    build_flush_prompt, build_system_prompt, fit_mcp_guidance, server_guidance_is_reachable,
+    McpGuidance, SystemPrompt, SystemPromptInputs, TimeOfDay, UserContext,
+    MAX_MCP_INSTRUCTIONS_BYTES, MAX_MCP_INSTRUCTIONS_TOTAL_BYTES,
 };
 
 /// Default tool-call iteration cap for a turn when a phenotype does not override
