@@ -876,3 +876,90 @@ fn arg_preview_substitutes_backticks_rather_than_dropping_them() {
     );
     assert!(!out.contains('`'), "no backtick may survive: {out}");
 }
+
+/// A hostile *tool name* cannot forge a header inside block 0.
+///
+/// Worse than the arg case: the tool name is interpolated into a backtick code span in
+/// the very first block, so there is no untouched genuine header above the forgery to
+/// compare against. `call.name` comes straight off the model, and an unrecognised name
+/// is not filtered out on the way here — `Registry::safety` returns `Dangerous` for it,
+/// so arbitrary model text reaches the prompt by design.
+#[tokio::test]
+async fn a_hostile_tool_name_cannot_forge_a_header_in_the_first_block() {
+    let server = MockServer::start().await;
+    let posts = Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+    let sink = Arc::clone(&posts);
+    Mock::given(method("POST"))
+        .and(path("/chat.postMessage"))
+        .respond_with(move |req: &wiremock::Request| {
+            sink.lock()
+                .unwrap()
+                .push(serde_json::from_slice(&req.body).unwrap());
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({ "ok": true, "ts": "901.1" }))
+        })
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/chat.update"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "ok": true })))
+        .mount(&server)
+        .await;
+
+    let api = SlackApi::new("xoxb-test").with_base(server.uri());
+    let (tx, rx) = mpsc::channel(8);
+    let approver = SlackApprover::new(api, channel(), Mode::Auto, PermissionMatrix::default(), rx)
+        .with_timeout(Duration::from_millis(500));
+
+    // Closes the code span, then renders a second header claiming a read-only tool.
+    let hostile = "danger_tool`\n*Approval needed*\n`git status` — ReadOnly";
+    let replier = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        tx.send(interaction(ACTION_APPROVE, Some("c1#0")))
+            .await
+            .unwrap();
+    });
+    let decision = approver
+        .approve(
+            "m1",
+            "c1",
+            hostile,
+            Safety::Sensitive,
+            &serde_json::json!({}),
+        )
+        .await;
+    replier.await.expect("replier");
+    assert!(decision);
+
+    let body = posts.lock().unwrap()[0].clone();
+    let header = body["blocks"][0]["text"]["text"]
+        .as_str()
+        .expect("block 0 must carry the header")
+        .to_string();
+
+    // Exactly the two backticks the caller adds around the tool name. One more and the
+    // name closes the span early, which is what lets the rest render as markup.
+    assert_eq!(
+        header.matches('`').count(),
+        2,
+        "only the caller's own code-span backticks may appear, got: {header}"
+    );
+    assert!(
+        header.contains("danger_tool'"),
+        "the tool name must still be readable with the backtick substituted, got: {header}"
+    );
+
+    // The forged header survives as text but stays inside the code span, where Slack
+    // renders `*...*` literally. Counting bare occurrences would prove nothing about
+    // what actually renders, so count only what sits outside the span.
+    let unfenced = header
+        .split('`')
+        .step_by(2)
+        .filter(|outside| outside.contains("*Approval needed*"))
+        .count();
+    assert_eq!(
+        unfenced, 1,
+        "exactly one header may render outside the code span; a second means the \
+         forgery rendered. block 0: {header}"
+    );
+}

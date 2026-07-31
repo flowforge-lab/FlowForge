@@ -124,22 +124,38 @@ impl SlackApprover {
     /// 3000 chars; this is far tighter because an approver skims a channel, and
     /// a wall of text is its own kind of blind approval.
     ///
-    /// Backticks are neutralised, not just newlines. The caller wraps this in a
-    /// ``` fence inside a `mrkdwn` section, so an arg containing its own ``` closes
-    /// the fence early and everything after it renders as markup — enough to forge a
-    /// second "*Approval needed*" card naming a harmless tool while the real call is
-    /// something else. The genuine header and the button's token live in their own
-    /// blocks and stay intact, but the human is the thing being gated here, and a
-    /// reader cannot see where one block ends and the next begins. Substituting
-    /// rather than stripping keeps the arg readable: backticks are ordinary in shell
-    /// arguments, and a silently shortened command is its own misreading risk.
+    /// Backticks are neutralised via [`Self::inert`], not just newlines: the caller
+    /// wraps this in a ``` fence, which an arg carrying its own ``` would close early.
     pub(crate) fn arg_preview(arg: &str) -> String {
         const MAX: usize = 300;
-        let one_line = arg.replace('\n', " ⏎ ").replace('`', "'");
+        let one_line = Self::inert(&arg.replace('\n', " ⏎ "));
         match one_line.char_indices().nth(MAX) {
             None => one_line,
             Some((cut, _)) => format!("{}…", &one_line[..cut]),
         }
+    }
+
+    /// Strip the one character that lets model-controlled text escape its container.
+    ///
+    /// Every string this module interpolates into a `mrkdwn` block sits inside a
+    /// backtick container — a code span for the tool name, a ``` fence for the arg —
+    /// and both the tool name (`call.name`, straight off the model) and the arg are
+    /// model-controlled. A backtick closes that container early, after which the rest
+    /// renders as markup: enough to draw a second "*Approval needed*" card naming a
+    /// read-only tool while the real call is something else.
+    ///
+    /// The tool name is the worse of the two, because it forges *inside block 0* —
+    /// there is no untouched genuine header above it to compare against. An unknown
+    /// name does not get filtered out on the way here either: `Registry::safety`
+    /// returns `Dangerous` for a name it does not recognise, precisely so an unknown
+    /// tool cannot slip the gate, which means arbitrary model text reaches this
+    /// function by design.
+    ///
+    /// Substituting rather than deleting keeps the text honest. Backticks are ordinary
+    /// in shell arguments, and `echo \`date\`` silently becoming `echo date` changes
+    /// what the approver is agreeing to — a quieter failure than the one being fixed.
+    fn inert(s: &str) -> String {
+        s.replace('`', "'")
     }
 
     /// `arg` is the *resolved* argument — the same string the scoped rules match
@@ -157,7 +173,7 @@ impl SlackApprover {
             "type": "section",
             "text": {
                 "type": "mrkdwn",
-                "text": format!("*Approval needed*\n`{tool}` — {safety:?}")
+                "text": format!("*Approval needed*\n`{}` — {safety:?}", Self::inert(tool))
             }
         })];
         if let Some(arg) = arg {
