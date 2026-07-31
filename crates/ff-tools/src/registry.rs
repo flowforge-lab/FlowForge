@@ -1,6 +1,6 @@
 //! The tool abstraction and the registry the agent loop dispatches through.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 
 use async_trait::async_trait;
@@ -9,6 +9,7 @@ use serde_json::Value;
 // Safety is defined in ff-core (needed by PermissionMatrix without circular deps)
 // and re-exported from this crate for backward compatibility.
 pub use ff_core::Safety;
+use ff_core::{Mode, PermissionMatrix};
 
 /// The wake source an [`ObserverIntent`] requests. M3 (#1039) only emits
 /// [`ObserverIntentKind::Process`]; `File`/`Http` are reserved so the shape is
@@ -183,6 +184,38 @@ pub trait Tool: Send + Sync {
     fn defer(&self) -> bool {
         false
     }
+    /// Which argument properties each `action` of a dispatch-style tool actually
+    /// reads (RFC 0024 Phase 2B, #1162).
+    ///
+    /// A dispatch tool (`github`, `git`, `process_manager`, `notebook_runner`)
+    /// takes a required `action` discriminant and a union of every property any
+    /// action might need. `github` advertises 17 properties for 17 actions, but
+    /// `push` reads exactly one of them. Admission is keyed by tool name and
+    /// injects [`Tool::parameters`] wholesale, so every turn pays for all 17.
+    ///
+    /// Returning `Some` lets the registry emit a per-action-scoped schema instead.
+    /// Measured across the four dispatch tools: 5,896 → 1,753 bytes (70.3%), and
+    /// because none of them defer, that is a cut to the *resident* prefix paid on
+    /// every request.
+    ///
+    /// **Default is `None`** — no scoping, the full schema is emitted. Non-dispatch
+    /// tools and un-migrated dispatch tools are unaffected.
+    ///
+    /// # Contract
+    ///
+    /// The returned map MUST list, for every action, every property that action's
+    /// dispatch path reads — including properties read by helpers it forwards to.
+    /// A missing entry is not a cosmetic error: the property is removed from the
+    /// schema the model sees, so the capability silently disappears. No error, no
+    /// warning, a normal-looking transcript. `assert_action_params_cover_dispatch`
+    /// pins this per tool.
+    ///
+    /// Derive the map by reading the dispatch code, **never** by copying the
+    /// action names mentioned in property descriptions — those are prose and are
+    /// wrong in at least four places today (#1161).
+    fn action_params(&self) -> Option<BTreeMap<&'static str, &'static [&'static str]>> {
+        None
+    }
     async fn run(&self, args: Value, root: &Path) -> ToolOutcome;
 
     /// Session-aware dispatch point. Tools that need per-session affinity
@@ -273,7 +306,7 @@ impl ToolRegistry {
 
     /// All tools as OpenAI `tools` request entries.
     pub fn openai_tools(&self) -> Vec<Value> {
-        self.openai_tools_for(None, true)
+        self.openai_tools_for(None, true, None)
     }
 
     /// OpenAI `tools` entries, optionally restricted to a sub-agent's allowlist and
@@ -293,6 +326,7 @@ impl ToolRegistry {
         &self,
         allowed: Option<&HashSet<String>>,
         allow_subagent: bool,
+        scope: Option<&ActionScope>,
     ) -> Vec<Value> {
         let mut tools: Vec<&dyn Tool> = self
             .tools
@@ -310,7 +344,7 @@ impl ToolRegistry {
                     "function": {
                         "name": t.name(),
                         "description": t.description(),
-                        "parameters": t.parameters(),
+                        "parameters": scoped_parameters(t, scope.and_then(|m| m.get(t.name()))),
                     }
                 })
             })
@@ -327,7 +361,11 @@ impl ToolRegistry {
     /// the full cold prefill #947 exists to avoid. Sorting only within the appended
     /// batch keeps the block deterministic while leaving everything before it
     /// byte-identical, so growth is strictly append-only.
-    pub fn openai_tools_named(&self, names: &HashSet<String>) -> Vec<Value> {
+    pub fn openai_tools_named(
+        &self,
+        names: &HashSet<String>,
+        scope: Option<&ActionScope>,
+    ) -> Vec<Value> {
         let mut tools: Vec<&dyn Tool> = self
             .tools
             .values()
@@ -343,7 +381,7 @@ impl ToolRegistry {
                     "function": {
                         "name": t.name(),
                         "description": t.description(),
-                        "parameters": t.parameters(),
+                        "parameters": scoped_parameters(t, scope.and_then(|m| m.get(t.name()))),
                     }
                 })
             })
@@ -484,6 +522,189 @@ pub fn is_subagent(name: &str) -> bool {
     name == crate::agent_tool::AGENT_TOOL_NAME
 }
 
+/// Per-tool action allow-lists for Phase 2B spec pruning (#1162), keyed by tool name.
+///
+/// Passed per call rather than stored on the registry, because the registry is
+/// shared immutably through `ToolContext` and rebuilt every turn.
+pub type ActionScope = HashMap<String, BTreeSet<String>>;
+
+/// The actions of each dispatch tool that `mode` can actually invoke, for Phase 2B
+/// spec pruning (#1162).
+///
+/// Derived from [`Tool::safety`] per action and the permission matrix — the same two
+/// inputs the per-call gate uses — so a new action is classified automatically
+/// instead of drifting against a hand-kept list.
+///
+/// # Why this does not break #947
+///
+/// The result varies with `mode`, so a mode switch changes a tool's advertised
+/// bytes. That is safe because a mode switch **already** re-forms the tools block:
+/// `advertised_tools` drops write-only tools entirely in Plan, so the block's
+/// membership changes and the prefix is invalidated regardless. Pruning rides an
+/// existing invalidation boundary rather than introducing a new one. Within a fixed
+/// mode the output is deterministic and byte-stable.
+///
+/// Today a tool survives Plan on its read-only *floor* — `github` stays visible
+/// because `pr_list` is ReadOnly — and its ten mutating actions are advertised
+/// anyway, refused only when called. Pruning stops advertising what the mode cannot
+/// run, which is a correctness gain on top of the byte saving.
+pub fn action_scope_for_mode(
+    registry: &ToolRegistry,
+    mode: Mode,
+    matrix: &PermissionMatrix,
+) -> ActionScope {
+    let mut scope = ActionScope::new();
+    for t in registry.iter_tools() {
+        let Some(declared) = t.action_params() else {
+            continue;
+        };
+        let kept: BTreeSet<String> = declared
+            .keys()
+            .filter(|a| {
+                let args = serde_json::json!({ "action": a });
+                !matrix
+                    .effective_cell(t.name(), mode, t.safety(&args))
+                    .is_deny()
+            })
+            .map(|a| (*a).to_string())
+            .collect();
+        if !kept.is_empty() && kept.len() < declared.len() {
+            scope.insert(t.name().to_string(), kept);
+        }
+    }
+    scope
+}
+
+/// A tool's schema with its `action` enum and properties narrowed to `actions`
+/// (RFC 0024 Phase 2B, #1162), or the full schema unchanged when the tool declares
+/// no [`Tool::action_params`] or `actions` is `None`.
+///
+/// The output is a pure function of (`tool`, `actions`). `preserve_order` is **not**
+/// enabled on `serde_json` in this workspace (verified: it pulls no `indexmap`), so
+/// `Map` is a `BTreeMap` and object keys serialize in sorted order regardless of
+/// insertion or removal order. Two calls with an equal `actions` set therefore
+/// serialize byte-identically — the property #947 depends on, asserted by
+/// `pruned_schema_is_byte_stable_across_calls`.
+///
+/// Unknown names in `actions` are ignored rather than rejected: the caller derives
+/// them from mode/egress policy, and a policy naming an action a tool no longer has
+/// should not break the turn.
+pub fn scoped_parameters(tool: &dyn Tool, actions: Option<&BTreeSet<String>>) -> Value {
+    let full = tool.parameters();
+    let (Some(actions), Some(declared)) = (actions, tool.action_params()) else {
+        return full;
+    };
+
+    let kept: BTreeSet<&str> = declared
+        .keys()
+        .copied()
+        .filter(|a| actions.contains(*a))
+        .collect();
+    if kept.is_empty() || kept.len() == declared.len() {
+        return full;
+    }
+
+    let mut keep_props: BTreeSet<&str> = BTreeSet::from(["action"]);
+    for a in &kept {
+        keep_props.extend(declared[*a].iter().copied());
+    }
+
+    let mut out = full.clone();
+    let Some(props) = out.get_mut("properties").and_then(Value::as_object_mut) else {
+        return full;
+    };
+    props.retain(|k, _| keep_props.contains(k.as_str()));
+    if let Some(e) = props
+        .get_mut("action")
+        .and_then(|a| a.get_mut("enum"))
+        .and_then(Value::as_array_mut)
+    {
+        e.retain(|v| v.as_str().is_some_and(|s| kept.contains(s)));
+    }
+    out
+}
+
+/// Assert that `tool`'s [`Tool::action_params`] declaration is coherent with its
+/// own schema (RFC 0024 Phase 2B, #1162).
+///
+/// Three invariants, each a pure data comparison against [`Tool::parameters`] —
+/// no source parsing, so there is nothing here that can silently mis-read the
+/// dispatch code the way an ad-hoc probe does:
+///
+/// 1. The declared action set equals the schema's `action` enum. Adding an action
+///    without declaring its parameters fails here rather than shipping a tool
+///    whose new action advertises no arguments.
+/// 2. Every declared property exists in the schema. Catches typos and properties
+///    renamed in the schema but not in the declaration.
+/// 3. No schema property is orphaned — every one is claimed by at least one
+///    action. This is the check that catches a property dropped from *all*
+///    declarations, which is the shape that silently removes a capability.
+///
+/// **What this cannot catch:** property `X` omitted from action `A` while another
+/// action still claims it. Invariant 3 sees `X` as used and says nothing. No
+/// data-only check can see that, because the ground truth lives in the dispatch
+/// code. That gap is covered per tool by asserting the scoped schema for a
+/// specific action contains the properties that action's documented behaviour
+/// requires — see `github_action_params_cover_known_dispatch_reads`.
+#[cfg(test)]
+pub fn assert_action_params_coherent(tool: &dyn Tool) {
+    let Some(declared) = tool.action_params() else {
+        return;
+    };
+    let schema = tool.parameters();
+    let props = schema
+        .get("properties")
+        .and_then(Value::as_object)
+        .unwrap_or_else(|| panic!("{}: parameters() has no properties object", tool.name()));
+
+    let enum_actions: BTreeSet<&str> = props
+        .get("action")
+        .and_then(|a| a.get("enum"))
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| {
+            panic!(
+                "{}: declares action_params but has no action enum",
+                tool.name()
+            )
+        })
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    let declared_actions: BTreeSet<&str> = declared.keys().copied().collect();
+    assert_eq!(
+        declared_actions,
+        enum_actions,
+        "{}: action_params keys must match the schema's action enum exactly",
+        tool.name()
+    );
+
+    let mut claimed: BTreeSet<&str> = BTreeSet::new();
+    for (action, params) in &declared {
+        for p in *params {
+            assert!(
+                props.contains_key(*p),
+                "{}: action {action:?} declares property {p:?}, which is not in the schema",
+                tool.name()
+            );
+            claimed.insert(p);
+        }
+    }
+
+    let orphans: Vec<&str> = props
+        .keys()
+        .map(String::as_str)
+        .filter(|p| *p != "action" && !claimed.contains(p))
+        .collect();
+    assert!(
+        orphans.is_empty(),
+        "{}: schema advertises {orphans:?}, which no action claims — either wire them \
+         into the action that reads them, or drop them from the schema. A property no \
+         action claims is pruned out of every scoped schema, so the capability \
+         disappears silently.",
+        tool.name()
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -554,7 +775,7 @@ mod tests {
         let reg = ToolRegistry::with_defaults();
 
         let allowed: HashSet<String> = ["view", "grep"].iter().map(|s| s.to_string()).collect();
-        let restricted = reg.openai_tools_for(Some(&allowed), true);
+        let restricted = reg.openai_tools_for(Some(&allowed), true, None);
         let names: Vec<_> = restricted
             .iter()
             .map(|t| t["function"]["name"].as_str().unwrap())
@@ -563,7 +784,7 @@ mod tests {
         assert!(names.contains(&"view") && names.contains(&"grep"));
 
         // At the depth cap the delegation tool is not advertised at all.
-        let no_subagent = reg.openai_tools_for(None, false);
+        let no_subagent = reg.openai_tools_for(None, false, None);
         let names: Vec<_> = no_subagent
             .iter()
             .map(|t| t["function"]["name"].as_str().unwrap())
@@ -605,7 +826,7 @@ mod tests {
             .map(|s| s.to_string())
             .collect();
         let restricted: Vec<String> = ToolRegistry::with_defaults()
-            .openai_tools_for(Some(&allowed), true)
+            .openai_tools_for(Some(&allowed), true, None)
             .iter()
             .map(|t| t["function"]["name"].as_str().unwrap().to_string())
             .collect();
@@ -768,5 +989,245 @@ mod tests {
             None
         );
         assert_eq!(reg.dedupe_key("nope", &serde_json::json!({})), None);
+    }
+
+    fn scope_of<const N: usize>(tool: &str, actions: [&str; N]) -> ActionScope {
+        ActionScope::from([(
+            tool.to_string(),
+            actions.iter().map(|a| (*a).to_string()).collect(),
+        )])
+    }
+
+    fn github_entry(reg: &ToolRegistry, scope: Option<&ActionScope>) -> Value {
+        reg.openai_tools_for(None, true, scope)
+            .into_iter()
+            .find(|t| t["function"]["name"] == "github")
+            .expect("github is registered")
+    }
+
+    fn github_schema_bytes(reg: &ToolRegistry, scope: Option<&ActionScope>) -> usize {
+        serde_json::to_string(&github_entry(reg, scope)["function"]["parameters"])
+            .expect("schema serializes")
+            .len()
+    }
+
+    #[test]
+    fn scoping_actions_prunes_the_advertised_schema() {
+        let reg = ToolRegistry::with_defaults();
+        let full = github_schema_bytes(&reg, None);
+
+        let scope = scope_of("github", ["pr_view", "pr_checks"]);
+        let pruned = github_schema_bytes(&reg, Some(&scope));
+
+        assert!(
+            pruned < full / 2,
+            "scoping github to two read actions should cut the schema by more than half, \
+             got {pruned} from {full}"
+        );
+
+        let entry = github_entry(&reg, Some(&scope));
+        let props = entry["function"]["parameters"]["properties"]
+            .as_object()
+            .expect("properties object");
+        assert!(
+            props.contains_key("diff"),
+            "pr_view reads diff; it must survive pruning"
+        );
+        assert!(
+            props.contains_key("number"),
+            "both kept actions read number"
+        );
+        assert!(
+            !props.contains_key("force"),
+            "force belongs only to push, which was scoped out"
+        );
+
+        let actions = entry["function"]["parameters"]["properties"]["action"]["enum"]
+            .as_array()
+            .expect("action enum");
+        assert_eq!(
+            actions.len(),
+            2,
+            "the enum must narrow to the scoped actions"
+        );
+    }
+
+    #[test]
+    fn pruned_schema_is_byte_stable_across_calls() {
+        // The #947 contract: a tool's advertised bytes must not move between turns.
+        let reg = ToolRegistry::with_defaults();
+        let scope = scope_of("github", ["pr_view", "pr_merge"]);
+
+        let a = serde_json::to_string(&reg.openai_tools_for(None, true, Some(&scope)))
+            .expect("serializes");
+        let b = serde_json::to_string(&reg.openai_tools_for(None, true, Some(&scope)))
+            .expect("serializes");
+        assert_eq!(a, b, "the tools block must be byte-identical across turns");
+    }
+
+    #[test]
+    fn scoping_does_not_reorder_or_drop_tools() {
+        // Pruning changes one tool's schema; it must not perturb the block's
+        // membership or order, which is what #947's append-only guarantee rests on.
+        let reg = ToolRegistry::with_defaults();
+        let names = |scope: Option<&ActionScope>| -> Vec<String> {
+            reg.openai_tools_for(None, true, scope)
+                .iter()
+                .map(|t| t["function"]["name"].as_str().unwrap().to_string())
+                .collect()
+        };
+        let scope = scope_of("github", ["pr_view"]);
+        assert_eq!(
+            names(None),
+            names(Some(&scope)),
+            "scoping must not add, drop, or reorder tools"
+        );
+    }
+
+    #[test]
+    fn unscoped_tools_are_untouched() {
+        let reg = ToolRegistry::with_defaults();
+        let full = github_schema_bytes(&reg, None);
+        let scope = scope_of("git", ["status"]);
+        assert_eq!(
+            github_schema_bytes(&reg, Some(&scope)),
+            full,
+            "scoping git must not change what github advertises"
+        );
+    }
+
+    #[test]
+    fn scoping_every_action_is_a_no_op() {
+        // Guards a subtle regression: if pruning rebuilt the schema instead of
+        // filtering it, an all-actions scope would still shift bytes.
+        let reg = ToolRegistry::with_defaults();
+        let full = github_schema_bytes(&reg, None);
+        let all: BTreeSet<String> = crate::github::GithubTool
+            .action_params()
+            .expect("github declares action_params")
+            .keys()
+            .map(|s| (*s).to_string())
+            .collect();
+        let scope = ActionScope::from([("github".to_string(), all)]);
+        assert_eq!(github_schema_bytes(&reg, Some(&scope)), full);
+    }
+
+    #[test]
+    fn scoping_an_unknown_action_leaves_the_schema_whole() {
+        // A stale policy naming an action github no longer has must not silently
+        // strip the tool down to nothing mid-session.
+        let reg = ToolRegistry::with_defaults();
+        let full = github_schema_bytes(&reg, None);
+        let scope = scope_of("github", ["pr_teleport"]);
+        assert_eq!(
+            github_schema_bytes(&reg, Some(&scope)),
+            full,
+            "an all-unknown scope must fall back to the full schema, not an empty one"
+        );
+    }
+
+    #[test]
+    fn plan_mode_scope_drops_mutating_actions_and_keeps_reads() {
+        // The production derivation: same two inputs as the per-call gate.
+        let reg = ToolRegistry::with_defaults();
+        let matrix = PermissionMatrix::default();
+        let scope = action_scope_for_mode(&reg, Mode::Plan, &matrix);
+
+        let gh = scope.get("github").expect("github is scoped in Plan");
+        for kept in [
+            "pr_view",
+            "pr_list",
+            "pr_checks",
+            "issue_view",
+            "issue_list",
+        ] {
+            assert!(gh.contains(kept), "Plan must keep the read action {kept:?}");
+        }
+        for dropped in ["push", "pr_merge", "pr_create", "issue_edit", "pr_comment"] {
+            assert!(
+                !gh.contains(dropped),
+                "Plan refuses {dropped:?} when called, so it must not be advertised"
+            );
+        }
+
+        // git is all-read, so every action survives and no entry is emitted at all —
+        // an unpruned tool must not pay a pruning code path.
+        assert!(
+            !scope.contains_key("git"),
+            "git's four actions are all ReadOnly; it needs no scope entry"
+        );
+    }
+
+    #[test]
+    fn act_mode_scope_prunes_nothing() {
+        let reg = ToolRegistry::with_defaults();
+        let matrix = PermissionMatrix::default();
+        let scope = action_scope_for_mode(&reg, Mode::Act, &matrix);
+        assert!(
+            scope.is_empty(),
+            "Act denies no action of a dispatch tool, so there is nothing to prune: {scope:?}"
+        );
+    }
+
+    #[test]
+    fn plan_scope_cuts_real_bytes() {
+        let reg = ToolRegistry::with_defaults();
+        let matrix = PermissionMatrix::default();
+        let scope = action_scope_for_mode(&reg, Mode::Plan, &matrix);
+        let full = github_schema_bytes(&reg, None);
+        let pruned = github_schema_bytes(&reg, Some(&scope));
+        assert!(
+            pruned * 2 < full,
+            "Plan keeps 7 of github's 17 actions; expected well under half the bytes, \
+             got {pruned} from {full}"
+        );
+    }
+
+    /// The four dispatch tools as the desktop app registers them: `with_defaults`
+    /// supplies `github` and `git`; `process_manager` and `notebook_runner` are added
+    /// by `AppState::build_tool_registry` because they need live supervisors.
+    fn desktop_like_registry() -> ToolRegistry {
+        use std::sync::Arc;
+        let mut reg = ToolRegistry::with_defaults();
+        reg.register(Box::new(crate::process::ProcessManagerTool::new(Arc::new(
+            crate::process::ProcessSupervisor::new(),
+        ))));
+        reg.register(Box::new(crate::notebook::NotebookTool::new(Arc::new(
+            crate::notebook::KernelSupervisor::new(),
+        ))));
+        reg
+    }
+
+    #[test]
+    fn plan_mode_pruning_cuts_the_whole_tools_block() {
+        // Pins the saving this phase exists for, measured on the tool set the app
+        // actually ships. Without this the number lives only in a PR description and
+        // silently rots — the mistake called out on #1107's semantic-recall figures.
+        let reg = desktop_like_registry();
+        let matrix = PermissionMatrix::default();
+        let scope = action_scope_for_mode(&reg, Mode::Plan, &matrix);
+
+        let full = serde_json::to_string(&reg.openai_tools_for(None, true, None))
+            .expect("serializes")
+            .len();
+        let pruned = serde_json::to_string(&reg.openai_tools_for(None, true, Some(&scope)))
+            .expect("serializes")
+            .len();
+
+        // Measured 20213 -> 16820 B (16.8%). Asserting a floor of 12% leaves room for
+        // tools to be added or reworded without churn, while still failing outright if
+        // pruning stops happening.
+        let saved_pct = 100.0 * (1.0 - pruned as f64 / full as f64);
+        assert!(
+            saved_pct > 12.0,
+            "Plan-mode pruning should cut the tools block by >12%, got {saved_pct:.1}% \
+             ({full} -> {pruned} B)"
+        );
+
+        // Three of the four are scoped in Plan; git is all-ReadOnly so it keeps
+        // everything and must not appear.
+        let mut scoped: Vec<&str> = scope.keys().map(String::as_str).collect();
+        scoped.sort_unstable();
+        assert_eq!(scoped, ["github", "notebook_runner", "process_manager"]);
     }
 }

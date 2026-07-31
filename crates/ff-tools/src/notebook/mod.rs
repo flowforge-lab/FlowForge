@@ -10,6 +10,7 @@ pub(crate) mod parse;
 #[cfg(test)]
 mod tests;
 
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -496,6 +497,29 @@ impl Tool for NotebookTool {
             },
             "required": ["action"]
         })
+    }
+
+    /// Per-action parameter attribution for Phase 2B pruning (#1162).
+    ///
+    /// Attribution is by *use*, not by evaluation. `resolve_kernel_id(&args)`
+    /// (reading `kernel`) runs at `:527`, **before** the action match, but `start`
+    /// and `status` never pass the result on — `start` calls
+    /// `supervisor.start(session_id, &dir)` and `status` calls
+    /// `supervisor.status(session_id)`. Declaring `kernel` for them would keep a
+    /// property in the schema that the action cannot act on.
+    fn action_params(&self) -> Option<BTreeMap<&'static str, &'static [&'static str]>> {
+        Some(BTreeMap::from([
+            ("start", &["working_dir"][..]),
+            ("run_cell", &["code", "kernel", "timeout_secs"][..]),
+            (
+                "run_all",
+                &["notebook", "stop_on_error", "kernel", "timeout_secs"][..],
+            ),
+            ("inspect", &["kernel", "timeout_secs"][..]),
+            ("restart", &["working_dir", "kernel"][..]),
+            ("status", &[][..]),
+            ("stop", &["kernel"][..]),
+        ]))
     }
 
     fn safety(&self, args: &Value) -> Safety {

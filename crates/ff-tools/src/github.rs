@@ -2,6 +2,7 @@
 //! output parsing so the agent gets clean, structured PR/issue/CI data without
 //! shell escaping or token management headaches.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::OnceLock;
@@ -53,6 +54,50 @@ impl Tool for GithubTool {
             },
             "required": ["action"]
         })
+    }
+
+    /// Per-action parameter attribution for Phase 2B pruning (#1162).
+    ///
+    /// Every entry was read off the dispatch code, following forwards
+    /// (`pr_comment`/`issue_comment` → `comment_on`, `pr_create`/`issue_create`
+    /// → `create_flag_args`, `pr_review_inline` → `build_inline_review_payload`)
+    /// — **not** copied from the property descriptions above, which disagree with
+    /// the code in four places (#1161).
+    ///
+    /// Only top-level argument keys belong here. `build_inline_review_payload`
+    /// also reads `path`/`line`/`side`/`start_line`, but those are fields of the
+    /// `comments` array elements, not properties of this schema.
+    fn action_params(&self) -> Option<BTreeMap<&'static str, &'static [&'static str]>> {
+        Some(BTreeMap::from([
+            (
+                "pr_create",
+                &[
+                    "title", "body", "base", "head", "label", "assignee", "reviewer",
+                ][..],
+            ),
+            ("pr_list", &["author", "label", "limit"][..]),
+            ("pr_view", &["number", "diff"][..]),
+            ("pr_reviews", &["number"][..]),
+            ("pr_review_comments", &["number"][..]),
+            ("pr_merge", &["number", "squash", "delete_branch"][..]),
+            ("pr_checks", &["number"][..]),
+            ("pr_review", &["number", "event", "body"][..]),
+            ("pr_comment", &["number", "body"][..]),
+            ("pr_request_review", &["number", "reviewer"][..]),
+            (
+                "pr_review_inline",
+                &["number", "event", "body", "comments"][..],
+            ),
+            ("issue_create", &["title", "body", "label", "assignee"][..]),
+            (
+                "issue_edit",
+                &["number", "title", "body", "label", "assignee"][..],
+            ),
+            ("issue_list", &["label", "limit"][..]),
+            ("issue_view", &["number"][..]),
+            ("issue_comment", &["number", "body"][..]),
+            ("push", &["force"][..]),
+        ]))
     }
 
     fn safety(&self, args: &Value) -> Safety {

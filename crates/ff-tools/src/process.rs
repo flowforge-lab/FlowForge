@@ -26,6 +26,7 @@
 //!   fallback if job assignment fails. Only other (non-unix, non-windows)
 //!   platforms can start/poll/list but not stop.
 
+use std::collections::BTreeMap;
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -866,6 +867,19 @@ impl Tool for ProcessManagerTool {
         })
     }
 
+    /// Per-action parameter attribution for Phase 2B pruning (#1162).
+    ///
+    /// Read off the `run_with_session` dispatch, following `resolve_dir`
+    /// (`working_dir`) and `id_arg` (`process_id`).
+    fn action_params(&self) -> Option<BTreeMap<&'static str, &'static [&'static str]>> {
+        Some(BTreeMap::from([
+            ("start", &["command", "working_dir", "wake_on"][..]),
+            ("poll", &["process_id"][..]),
+            ("list", &[][..]),
+            ("stop", &["process_id"][..]),
+        ]))
+    }
+
     fn safety(&self, args: &Value) -> Safety {
         match args.get("action").and_then(Value::as_str) {
             Some("poll") | Some("list") => Safety::ReadOnly,
@@ -1615,5 +1629,43 @@ mod tests {
             .await;
         assert!(out.success);
         assert!(out.observer_intent.is_none(), "blank wake_on is ignored");
+    }
+
+    #[test]
+    fn action_params_coherent_with_schema() {
+        // RFC 0024 Phase 2B (#1162): adding an action to the enum without
+        // declaring its parameters fails here.
+        crate::registry::assert_action_params_coherent(&ProcessManagerTool::new(Arc::new(
+            ProcessSupervisor::new(),
+        )));
+    }
+
+    #[test]
+    fn action_params_cover_known_dispatch_reads() {
+        // `process_id` is claimed by both poll and stop, so the orphan check
+        // cannot see it dropped from one of them.
+        let tool = ProcessManagerTool::new(Arc::new(ProcessSupervisor::new()));
+        let declared = tool.action_params().expect("declares action_params");
+        let required: &[(&str, &str)] = &[
+            ("start", "command"),
+            ("start", "working_dir"),
+            ("start", "wake_on"),
+            // Both read process_id through id_arg().
+            ("poll", "process_id"),
+            ("stop", "process_id"),
+        ];
+        for (action, param) in required {
+            let params = declared
+                .get(action)
+                .unwrap_or_else(|| panic!("action {action:?} missing from action_params"));
+            assert!(
+                params.contains(param),
+                "action {action:?} reads {param:?} in its dispatch path but does not declare it"
+            );
+        }
+        assert!(
+            declared.get("list").expect("list declared").is_empty(),
+            "list takes no arguments beyond action"
+        );
     }
 }

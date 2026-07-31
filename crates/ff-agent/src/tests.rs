@@ -7068,11 +7068,11 @@ fn appended_schemas_leave_the_stable_prefix_byte_identical() {
     let matrix = PermissionMatrix::default();
 
     let stable_set = advertised_tools(Mode::Act, Egress::Open, &matrix, None, &reg, None).unwrap();
-    let stable = reg.openai_tools_for(Some(&stable_set), true);
+    let stable = reg.openai_tools_for(Some(&stable_set), true, None);
 
     // The stub's name sorts before every built-in, so a naive re-sort would put it at
     // index 0 — the worst case for prefix stability.
-    let appended = reg.openai_tools_named(&admitted(&["aaa_sorts_first"]));
+    let appended = reg.openai_tools_named(&admitted(&["aaa_sorts_first"]), None);
     let mut grown = stable.clone();
     grown.extend(appended);
 
@@ -7098,12 +7098,194 @@ fn appending_is_deterministic_within_a_batch() {
     reg.register(deferred_stub("mmm_tool", Safety::ReadOnly, false));
     let batch = admitted(&["zzz_tool", "mmm_tool"]);
 
-    let a = reg.openai_tools_named(&batch);
-    let b = reg.openai_tools_named(&batch);
+    let a = reg.openai_tools_named(&batch, None);
+    let b = reg.openai_tools_named(&batch, None);
     assert_eq!(
         serde_json::to_string(&a).unwrap(),
         serde_json::to_string(&b).unwrap()
     );
     assert_eq!(a[0]["function"]["name"], "mmm_tool");
     assert_eq!(a[1]["function"]["name"], "zzz_tool");
+}
+
+/// RFC 0024 Phase 2B (#1162): the wiring in `run_turn` must pass the mode's action
+/// scope, not `None`. `ff-tools` proves `scoped_parameters` prunes correctly; this
+/// proves the loop actually asks it to — the "tested the helper, not the wiring"
+/// gap that let a neutered call site stay green on #1136 and #1155.
+#[test]
+fn plan_mode_does_not_advertise_actions_it_would_refuse() {
+    let reg = ToolRegistry::with_defaults();
+    let matrix = PermissionMatrix::default();
+    let advertised = advertised_tools(Mode::Plan, Egress::Open, &matrix, None, &reg, None)
+        .expect("Plan restricts");
+    let scope = ff_tools::action_scope_for_mode(&reg, Mode::Plan, &matrix);
+    let schemas = reg.openai_tools_for(Some(&advertised), false, Some(&scope));
+
+    let github = schemas
+        .iter()
+        .find(|t| t["function"]["name"] == "github")
+        .expect("github survives Plan on its read-only floor (`pr_list`)");
+    let actions: Vec<&str> = github["function"]["parameters"]["properties"]["action"]["enum"]
+        .as_array()
+        .expect("action enum")
+        .iter()
+        .map(|v| v.as_str().expect("enum entries are strings"))
+        .collect();
+
+    for refused in ["push", "pr_merge", "pr_create", "issue_edit"] {
+        assert!(
+            !actions.contains(&refused),
+            "Plan x Write is Deny, so {refused:?} must not be advertised; got {actions:?}"
+        );
+    }
+    for kept in ["pr_view", "pr_list", "issue_view"] {
+        assert!(actions.contains(&kept), "Plan must keep {kept:?}");
+    }
+
+    // The parameters that belong only to refused actions must go with them.
+    let props = github["function"]["parameters"]["properties"]
+        .as_object()
+        .expect("properties object");
+    assert!(
+        !props.contains_key("force"),
+        "`force` is read only by push, which Plan refuses"
+    );
+    assert!(
+        !props.contains_key("squash"),
+        "`squash` is read only by pr_merge, which Plan refuses"
+    );
+}
+
+/// In Act nothing is denied, so the block must be byte-identical to the unpruned one.
+/// Guards against pruning that fires when it should not.
+#[test]
+fn act_mode_advertises_every_action() {
+    let reg = ToolRegistry::with_defaults();
+    let matrix = PermissionMatrix::default();
+    let scope = ff_tools::action_scope_for_mode(&reg, Mode::Act, &matrix);
+    let pruned = reg.openai_tools_for(None, false, Some(&scope));
+    let whole = reg.openai_tools_for(None, false, None);
+    assert_eq!(
+        serde_json::to_string(&pruned).unwrap(),
+        serde_json::to_string(&whole).unwrap(),
+        "Act denies no action, so pruning must be a byte-level no-op"
+    );
+}
+
+/// Captures the `tools` block of every request the loop sends, so a test can assert
+/// on what the model was *actually* offered rather than on what a helper would build.
+struct ToolBlockRecorder {
+    seen: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+}
+
+#[async_trait]
+impl Provider for ToolBlockRecorder {
+    async fn chat_stream(&self, req: ChatRequest) -> Result<ChunkStream, LlmError> {
+        self.seen.lock().unwrap().push(serde_json::json!(req.tools));
+        Ok(futures_util::stream::iter([Ok(Chunk {
+            delta: "ok".into(),
+            done: true,
+            ..Chunk::default()
+        })])
+        .boxed())
+    }
+}
+
+/// RFC 0024 Phase 2B (#1162): `run_turn` must pass the mode's action scope into
+/// `openai_tools_for`. Asserting on a scope the test builds itself proves only that
+/// pruning *works*; it stays green when the call site drops back to `None` — the
+/// "tested the helper, not the wiring" gap that survived on #1136 and #1155. This
+/// reads the block the provider actually received.
+#[tokio::test]
+async fn run_turn_advertises_only_the_actions_the_mode_permits() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = SessionStore::new();
+    let s = store.create_session(None);
+    store.add_message(&s.id, Role::User, "look around".into());
+    let registry = ToolRegistry::with_defaults();
+    let root = dir.path().to_path_buf();
+    let consulted = Arc::new(AtomicBool::new(false));
+    let approve = RecordingApprover {
+        consulted: consulted.clone(),
+    };
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let provider = ToolBlockRecorder { seen: seen.clone() };
+    let matrix = PermissionMatrix::default();
+
+    let github_actions = |mode: Mode| {
+        let ctx = ToolContext {
+            registry: &registry,
+            root: &root,
+            approve: &approve,
+            max_iterations: 2,
+            depth: 0,
+            max_depth: 1,
+            allowed: None,
+            mode,
+            egress: Egress::default(),
+            matrix: &matrix,
+            abstractive: AbstractiveConfig::default(),
+            compaction_model: None,
+            compaction_budget: None,
+            compaction_cache: None,
+            near_budget_tokens: None,
+            tool_search: None,
+        };
+        (ctx, seen.clone())
+    };
+
+    for (mode, must_absent, must_present) in [
+        (
+            Mode::Plan,
+            vec!["push", "pr_merge", "pr_create", "issue_edit"],
+            vec!["pr_view", "pr_list"],
+        ),
+        (Mode::Act, vec![], vec!["push", "pr_merge", "pr_view"]),
+    ] {
+        seen.lock().unwrap().clear();
+        let (ctx, _) = github_actions(mode);
+        run_turn(
+            &provider,
+            &store,
+            &ctx,
+            &s.id,
+            "mock",
+            None,
+            false,
+            ReasoningVisibility::All,
+            CancelToken::new(),
+            |_| {},
+        )
+        .await
+        .unwrap();
+
+        let blocks = seen.lock().unwrap().clone();
+        let first = blocks.first().expect("the loop issued a request");
+        let github = first
+            .as_array()
+            .expect("tools is an array")
+            .iter()
+            .find(|t| t["function"]["name"] == "github")
+            .expect("github is advertised (read-only floor survives Plan)");
+        let actions: Vec<String> = github["function"]["parameters"]["properties"]["action"]["enum"]
+            .as_array()
+            .expect("action enum")
+            .iter()
+            .map(|v| v.as_str().expect("strings").to_string())
+            .collect();
+
+        for a in must_absent {
+            assert!(
+                !actions.iter().any(|x| x == a),
+                "{mode:?} refuses {a:?} when called, so run_turn must not advertise it; \
+                 got {actions:?}"
+            );
+        }
+        for a in must_present {
+            assert!(
+                actions.iter().any(|x| x == a),
+                "{mode:?} permits {a:?}; it must stay advertised, got {actions:?}"
+            );
+        }
+    }
 }

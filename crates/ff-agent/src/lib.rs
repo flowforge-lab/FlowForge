@@ -1192,9 +1192,21 @@ pub async fn run_turn(
         tools.registry,
         Some(&admitted),
     );
-    let mut tool_schemas = tools
-        .registry
-        .openai_tools_for(advertised.as_ref(), allow_subagent);
+    // RFC 0024 Phase 2B (#1162): narrow each dispatch tool's schema to the actions
+    // this mode can actually invoke. Today `github` survives Plan on its read-only
+    // floor (`pr_list`) and advertises all ten of its mutating actions anyway, to be
+    // refused only when called.
+    //
+    // Derived from the same (safety, matrix) pair as the per-call gate, so the two
+    // cannot disagree. Mode already re-forms the tools block — Plan drops write-only
+    // tools outright — so varying with mode rides an existing prefix-invalidation
+    // boundary rather than adding one. Within a mode it is byte-stable, which is the
+    // #947 contract.
+    let action_scope = ff_tools::action_scope_for_mode(tools.registry, tools.mode, tools.matrix);
+    let mut tool_schemas =
+        tools
+            .registry
+            .openai_tools_for(advertised.as_ref(), allow_subagent, Some(&action_scope));
     // RFC 0024 §6: everything advertised up front forms the *stable region* of the
     // tools block. Definitions unlocked mid-turn by `tool_search` are appended after
     // it and never merged back in, so the provider's cached prefix keeps matching
@@ -2601,7 +2613,18 @@ pub async fn run_turn(
                     .cloned()
                     .collect();
                 if !fresh.is_empty() {
-                    tool_schemas.extend(tools.registry.openai_tools_named(&fresh));
+                    // Unreachable for the four dispatch tools today: `tool_search`'s
+                    // index only holds tools with `defer() == true` (tool_search.rs),
+                    // and all four are standing. Scoped anyway so the two advertise
+                    // paths cannot diverge the day one of them opts into deferral —
+                    // `action_scope_for_mode` is a pure function of (registry, mode,
+                    // matrix), unchanged within a turn, so a tool appended here gets
+                    // byte-identical bytes to the ones it would have had up front.
+                    // Advertising two different schemas for one name is exactly the
+                    // mid-block change #947 forbids.
+                    let scope =
+                        ff_tools::action_scope_for_mode(tools.registry, tools.mode, tools.matrix);
+                    tool_schemas.extend(tools.registry.openai_tools_named(&fresh, Some(&scope)));
                     appended.extend(fresh);
                 }
             }
