@@ -123,9 +123,19 @@ impl SlackApprover {
     /// Truncate a resolved arg for display. Slack's `mrkdwn` section caps at
     /// 3000 chars; this is far tighter because an approver skims a channel, and
     /// a wall of text is its own kind of blind approval.
+    ///
+    /// Backticks are neutralised, not just newlines. The caller wraps this in a
+    /// ``` fence inside a `mrkdwn` section, so an arg containing its own ``` closes
+    /// the fence early and everything after it renders as markup — enough to forge a
+    /// second "*Approval needed*" card naming a harmless tool while the real call is
+    /// something else. The genuine header and the button's token live in their own
+    /// blocks and stay intact, but the human is the thing being gated here, and a
+    /// reader cannot see where one block ends and the next begins. Substituting
+    /// rather than stripping keeps the arg readable: backticks are ordinary in shell
+    /// arguments, and a silently shortened command is its own misreading risk.
     pub(crate) fn arg_preview(arg: &str) -> String {
         const MAX: usize = 300;
-        let one_line = arg.replace('\n', " ⏎ ");
+        let one_line = arg.replace('\n', " ⏎ ").replace('`', "'");
         match one_line.char_indices().nth(MAX) {
             None => one_line,
             Some((cut, _)) => format!("{}…", &one_line[..cut]),
