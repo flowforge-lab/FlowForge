@@ -83,6 +83,21 @@ impl SlackApi {
         self.call("chat.update", &body).await.map(|_| ())
     }
 
+    /// Post an interactive message built from Block Kit `blocks`; returns its `ts`.
+    ///
+    /// `text` is still sent as the notification fallback — Slack uses it for push
+    /// notifications and accessibility, where blocks are not rendered.
+    pub async fn post_blocks(
+        &self,
+        channel: &str,
+        text: &str,
+        blocks: serde_json::Value,
+    ) -> Result<String, ApiError> {
+        let body = serde_json::json!({ "channel": channel, "text": text, "blocks": blocks });
+        let resp = self.call("chat.postMessage", &body).await?;
+        resp.ts.ok_or(ApiError::Malformed("ts"))
+    }
+
     async fn call(&self, method: &str, body: &serde_json::Value) -> Result<ChatResponse, ApiError> {
         let url = format!("{}/{}", self.base, method);
         let resp = self
