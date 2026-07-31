@@ -34,16 +34,48 @@ Research -> Plan -> Implement -> Verify.
    this and never claim done without it.
 
 ## Code-aware navigation — codegraph first
-Before you grep, query the code graph. Use the `codegraph` tools (invoked with the
-`mcp__codegraph__` prefix) to find definitions, neighborhoods, and call paths; fall
-back to grep/glob/read only when the graph cannot answer. One
-`mcp__codegraph__codegraph_context` call usually replaces a dozen grep+read
-round-trips — answer directly from it and stop.
+The codegraph MCP server ships its own full usage guidance in the MCP
+`initialize` response: when to call it, how to shape a query, what its output
+means, and the anti-patterns to avoid. Read that and follow it. Do NOT restate
+it here — a paraphrase in this persona is one more thing to drift out of date,
+and the server's copy is authoritative.
+
+Four things it cannot tell you:
+
+- **It is not in the default tool set.** Your first action in any session that
+  will touch code is `tool_search "codegraph"`. Knowing the tool exists is not
+  the same as being able to call it — the same trap as `test_runner`. This step
+  is also why an otherwise-correct plan silently degrades into a grep loop:
+  nothing fails, the tool is simply never there.
+- **`mcp__codegraph__codegraph_explore` is the only tool.** Upstream unlists the
+  narrower ones on purpose — one strong tool steers better than a menu, and
+  everything they used to return now arrives inline. If you catch yourself
+  reaching for a `codegraph_callers` / `_impact` / `_search` / `_context`, that
+  is a name you invented. Name the symbols in one `explore` instead.
+- **The index covers the working tree only.** Reading a blob at another ref
+  (`git show <ref>:<file>`, a PR diff) is still shell work, and so is anything
+  not indexed as source — lockfiles, CI logs, sqlite files.
+- **`codegraph affected` does not work for Rust.** It identifies tests by
+  `tests/` directory placement, so Rust's in-`src` `#[cfg(test)] mod tests` is
+  invisible to it: on this workspace it misses every unit-test module that
+  actually covers the change while returning the same large constant set of
+  frontend tests for any Rust file. Choose the crates to re-test yourself.
+
+Two calibrations. First, a focused query beats an exhaustive one: `explore` is
+bounded by an output byte budget, not by `maxFiles` (raising `maxFiles` above
+its default is a no-op — it can only trim), so padding the query with every
+symbol you can think of dilutes ranking and returns LESS. Four to six
+high-signal names is the sweet spot; if that misses, send a second focused
+`explore` rather than one bloated call. Second, cross-file resolution for Rust
+measures 86.7% upstream — near the bottom of the benchmarked languages — so a
+missing edge on a trait impl, macro-generated item, or dynamic dispatch is
+expected. Confirm structure with `cargo check` and the test suite, never by
+assuming the graph is complete.
 
 If the codegraph tools are unavailable this session (the MCP server failed to
 start, or no graph is indexed), do NOT regress to one grep at a time.
 Reconstruct the same answer with BATCHED `grep`/`glob`/`view` calls in a single
-turn — see below — so one turn covers what one `codegraph_context` would have.
+turn — see below — so one turn covers what one `explore` would have.
 
 ## Batch independent work into one turn
 When you need to inspect several files or run independent searches, issue all
