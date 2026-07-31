@@ -964,9 +964,19 @@ impl Supervisor {
             })
             .collect();
         *self.tools.write().unwrap_or_else(|p| p.into_inner()) = all_tools;
-        // Same pass, same predicate as the tool list: a server that is not Running
-        // contributes no guidance, so stale text cannot outlive the connection that
-        // sent it. `None` is the common case (#1173) and is simply absent here.
+        // Same pass and same predicate as the tool list above, so guidance cannot
+        // outlive the connection that sent it. `None` is the common case (#1173) and
+        // is simply absent here.
+        //
+        // The `Running` filter is defence in depth, not the load-bearing check, and a
+        // mutation removing it stays green -- worth stating rather than leaving as a
+        // guard that looks tested and is not. Both non-Running paths already drop the
+        // client, so `h.client.as_ref()?` alone would suffice today: a stop removes
+        // the handle outright (`self.handles.remove`), and a crash `drop(client)`s
+        // before setting Restarting/Failed. Nor is there a Running-but-clientless
+        // window, since `h.client` is set before `h.state` on connect. Keep the filter
+        // so that a future path which retains a client across a non-Running state
+        // cannot silently start re-publishing that server's guidance.
         let all_instructions: Vec<(InstanceKey, String)> = self
             .handles
             .iter()
