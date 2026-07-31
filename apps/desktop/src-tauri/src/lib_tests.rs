@@ -2,8 +2,8 @@ use super::state::AppState;
 use super::{
     compare_build, emit_agent_event, git_branch, goal_gate_for, install_guard, is_app_ready,
     list_directory_in, list_local_branches, matrix_gate, panic_message, publish_app_ready,
-    read_file_in, resolve_tool_arg, resolve_workspace_dir, run_sidecar_turn, should_warmup,
-    switch_branch, BootFinalize, TurnMetrics, UpdateStatus, VersionDirection, APP_READY,
+    read_file_in, resolve_workspace_dir, run_sidecar_turn, should_warmup, switch_branch,
+    BootFinalize, TurnMetrics, UpdateStatus, VersionDirection, APP_READY,
 };
 use ff_agent::{AgentEvent, GateDecision};
 use ff_core::events::TurnDoneEvent;
@@ -17,41 +17,11 @@ use std::sync::{Arc, Mutex};
 // two never race each other (parallel `cargo test` threads share the flag).
 static BOOT_TEST_LOCK: Mutex<()> = Mutex::new(());
 
-// #768 review B2: the scoped-rule arg table must read each tool's REAL
-// argument key, checked against the ff-tools schemas. A wrong key silently
-// resolves to `None`, so the rule never fires (fail-open for deny backstops).
-#[test]
-fn resolve_tool_arg_reads_real_schema_keys() {
-    use serde_json::json;
-    assert_eq!(
-        resolve_tool_arg("bash", &json!({"command": "cargo build"})),
-        Some("cargo build".into())
-    );
-    // python's key is `code`, NOT `command`.
-    assert_eq!(
-        resolve_tool_arg("python", &json!({"code": "print(1)"})),
-        Some("print(1)".into())
-    );
-    assert_eq!(
-        resolve_tool_arg("python", &json!({"command": "print(1)"})),
-        None
-    );
-    for tool in ["view", "edit", "write"] {
-        assert_eq!(
-            resolve_tool_arg(tool, &json!({"path": "src/main.rs"})),
-            Some("src/main.rs".into())
-        );
-    }
-    // Read-only search tools short-circuit before approve() — not listed.
-    assert_eq!(resolve_tool_arg("grep", &json!({"pattern": "x"})), None);
-    assert_eq!(
-        resolve_tool_arg("glob", &json!({"pattern": "**/*.rs"})),
-        None
-    );
-    // Formerly-listed phantom keys resolve to nothing now.
-    assert_eq!(resolve_tool_arg("rg", &json!({"path": "."})), None);
-    assert_eq!(resolve_tool_arg("fd", &json!({"path": "."})), None);
-}
+// #768 review B2 moved to `ff-core::permission::tests` with the function it
+// guards (#1168 review, finding 1). Nothing is asserted here any more: desktop
+// re-exports `ff_core::resolve_tool_arg` directly, so a local-copy-drift test
+// would compare the function to itself and pass vacuously. The real guard is
+// that there is no second definition to drift — enforced by the compiler.
 
 // Spy that asserts the `manage` → `store` → `emit` ordering at call time: a
 // reordered `publish_app_ready` (e.g. `store` hoisted above `manage`, or

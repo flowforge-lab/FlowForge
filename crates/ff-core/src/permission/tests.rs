@@ -655,3 +655,43 @@ fn pre_prompt_scoped_allow_clears_publish_but_not_dangerous() {
         PrePromptDecision::Prompt
     );
 }
+
+// #768 review B2 (lifted from the desktop crate by #1168 review, finding 1):
+// the scoped-rule arg table must read each tool's REAL argument key. A wrong key
+// silently resolves to `None`, so the rule never fires — fail-open for deny
+// backstops. It now guards both approvers, not just the desktop one.
+#[test]
+fn resolve_tool_arg_reads_each_tools_real_key() {
+    use serde_json::json;
+
+    assert_eq!(
+        resolve_tool_arg("bash", &json!({"command": "cargo build"})),
+        Some("cargo build".into())
+    );
+    assert_eq!(
+        resolve_tool_arg("python", &json!({"code": "print(1)"})),
+        Some("print(1)".into())
+    );
+    for tool in ["view", "edit", "write"] {
+        assert_eq!(
+            resolve_tool_arg(tool, &json!({"path": "src/lib.rs"})),
+            Some("src/lib.rs".into()),
+            "{tool} resolves on `path`"
+        );
+    }
+
+    // A wrong key must resolve to None rather than to some other field's value.
+    assert_eq!(resolve_tool_arg("bash", &json!({"cmd": "rm -rf /"})), None);
+    assert_eq!(resolve_tool_arg("python", &json!({"command": "x"})), None);
+
+    // Read-only search tools never reach the gate, so they are deliberately
+    // absent rather than listed with a guessed key.
+    assert_eq!(resolve_tool_arg("grep", &json!({"pattern": "x"})), None);
+    assert_eq!(
+        resolve_tool_arg("glob", &json!({"pattern": "**/*.rs"})),
+        None
+    );
+
+    // An unknown tool is not an error, just unscoped.
+    assert_eq!(resolve_tool_arg("nope", &json!({"path": "x"})), None);
+}

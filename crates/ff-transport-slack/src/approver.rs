@@ -18,6 +18,19 @@
 //! Interactions arrive on the dedicated channel T3 set up
 //! (`SlackTransport::take_interaction_rx`), never through a Router turn, so
 //! draining them here cannot steal a user message from the Router.
+//!
+//! # Stated properties of this surface
+//!
+//! These are deliberate for T4, not oversights (#1168 review, findings 3 and 5):
+//!
+//! - **Any channel member may answer any prompt.** There is no allowlist and no
+//!   check that the clicker owns the session; whose session a channel belongs to
+//!   is a T5/#1060 question. The `{Publish, Dangerous}` clamp above is justified
+//!   by exactly this weakness. The answering `user_id` *is* logged on every
+//!   resolved decision, so a shared approval is at least attributable.
+//! - **Prompts are answered one at a time.** See [`SlackApprover::await_decision`]
+//!   for why concurrent prompts are unreachable today and what would have to
+//!   change to make them safe.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -26,7 +39,7 @@ use ff_agent::Approver;
 use ff_core::{Mode, PermissionMatrix, Safety};
 use ff_transport::ChannelId;
 use tokio::sync::{mpsc, Mutex};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::api::SlackApi;
 use crate::envelope::SlackInteraction;
@@ -107,15 +120,46 @@ impl SlackApprover {
         format!("{call_id}#{n}")
     }
 
-    fn prompt_blocks(tool: &str, safety: Safety, token: &str) -> serde_json::Value {
-        serde_json::json!([
-            {
+    /// Truncate a resolved arg for display. Slack's `mrkdwn` section caps at
+    /// 3000 chars; this is far tighter because an approver skims a channel, and
+    /// a wall of text is its own kind of blind approval.
+    pub(crate) fn arg_preview(arg: &str) -> String {
+        const MAX: usize = 300;
+        let one_line = arg.replace('\n', " ⏎ ");
+        match one_line.char_indices().nth(MAX) {
+            None => one_line,
+            Some((cut, _)) => format!("{}…", &one_line[..cut]),
+        }
+    }
+
+    /// `arg` is the *resolved* argument — the same string the scoped rules match
+    /// on. Showing it is not cosmetic (#1168 review, finding 2): without it a
+    /// channel member approving `bash — Write` cannot tell `cargo test` from
+    /// `rm -rf ~`, which is blind approval on a surface where the PR's own
+    /// framing says a mis-click is indistinguishable from intent.
+    fn prompt_blocks(
+        tool: &str,
+        safety: Safety,
+        arg: Option<&str>,
+        token: &str,
+    ) -> serde_json::Value {
+        let mut blocks = vec![serde_json::json!({
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": format!("*Approval needed*\n`{tool}` — {safety:?}")
+            }
+        })];
+        if let Some(arg) = arg {
+            blocks.push(serde_json::json!({
                 "type": "section",
                 "text": {
                     "type": "mrkdwn",
-                    "text": format!("*Approval needed*\n`{tool}` — {safety:?}")
+                    "text": format!("```{}```", Self::arg_preview(arg))
                 }
-            },
+            }));
+        }
+        blocks.push(serde_json::json!(
             {
                 "type": "actions",
                 "elements": [
@@ -135,7 +179,8 @@ impl SlackApprover {
                     }
                 ]
             }
-        ])
+        ));
+        serde_json::Value::Array(blocks)
     }
 
     /// Await the click carrying `token`, discarding anything else.
@@ -144,7 +189,33 @@ impl SlackApprover {
     /// previous prompt must not answer the current one. Returns `None` on
     /// timeout or if the interaction channel closed (transport disconnected) —
     /// both fail closed at the call site.
-    async fn await_decision(&self, token: &str) -> Option<bool> {
+    /// Wait for the click that carries `token`, returning the verdict **and who
+    /// clicked it**.
+    ///
+    /// Any channel member may answer any prompt — that is a deliberate property
+    /// of a shared surface, and it is the whole reason `{Publish, Dangerous}` is
+    /// clamped to Deny rather than merely prompted (#1168 review, finding 3).
+    /// T4 does not gate on identity (whose session a channel belongs to is a T5
+    /// / #1060 question), but it does *record* it: an unattributable approval is
+    /// the difference between an audit trail and none.
+    ///
+    /// # Why holding the receiver lock across the timeout is safe today
+    ///
+    /// This holds the `Mutex` for the full timeout and *discards* non-matching
+    /// interactions. Those compose badly if two prompts are ever outstanding at
+    /// once: a click for the second would be eaten by the first's loop, and both
+    /// would then time out. It is unreachable today, and both reasons live in
+    /// *other* files — hence this note (#1168 review, finding 5):
+    ///
+    /// 1. `ff-agent` runs its parallel batch for `Safety::ReadOnly` only, so
+    ///    every call that reaches an approver is on the serial path — `approve`
+    ///    is strictly sequential per turn.
+    /// 2. `SlackTransport::take_interaction_rx` hands out the receiver via
+    ///    `Option::take`, so at most one approver can exist per transport.
+    ///
+    /// If either changes, this needs a per-token registry (a `HashMap<String,
+    /// oneshot::Sender<_>>` fed by one demux task) rather than a shared lock.
+    async fn await_decision(&self, token: &str) -> Option<(bool, String)> {
         let deadline = tokio::time::Instant::now() + self.timeout;
         let mut rx = self.interactions.lock().await;
         loop {
@@ -168,8 +239,8 @@ impl SlackApprover {
                         continue;
                     }
                     match interaction.action_id.as_str() {
-                        ACTION_APPROVE => return Some(true),
-                        ACTION_DENY => return Some(false),
+                        ACTION_APPROVE => return Some((true, interaction.user_id)),
+                        ACTION_DENY => return Some((false, interaction.user_id)),
                         other => {
                             debug!(action_id = %other, "unknown slack action_id; ignoring");
                             continue;
@@ -189,7 +260,7 @@ impl Approver for SlackApprover {
         call_id: &str,
         name: &str,
         safety: Safety,
-        _args: &serde_json::Value,
+        args: &serde_json::Value,
     ) -> bool {
         if Self::button_can_never_authorize(safety) {
             warn!(
@@ -201,26 +272,86 @@ impl Approver for SlackApprover {
         }
 
         let cell = self.matrix.effective_cell(name, self.mode, safety);
-        match ff_core::pre_prompt_decision(cell, false, None, safety) {
+        // `resolved_arg` must be computed the same way every approver computes
+        // it (#1168 review, finding 1). Feeding `evaluate_rules` a `None` it did
+        // not earn makes it return early, so **every** scoped rule is skipped —
+        // including `Deny`. That is fail-open, and it is the same hole #768
+        // warned about for a *wrong* key; T4 shipped it by passing `None`
+        // outright, which is why `resolve_tool_arg` is shared code now.
+        //
+        // `is_allowlisted` stays `false`: the allowlist is session state that a
+        // shared Slack channel has no equivalent of, and `false` is the
+        // conservative direction (it can only add a prompt, never skip one).
+        let resolved_arg = ff_core::resolve_tool_arg(name, args);
+        let scoped_effect = self
+            .matrix
+            .evaluate_rules(name, resolved_arg.as_deref(), self.mode);
+        match ff_core::pre_prompt_decision(cell, false, scoped_effect, safety) {
             ff_core::PrePromptDecision::Deny => false,
             ff_core::PrePromptDecision::Allow => true,
             ff_core::PrePromptDecision::Prompt => {
                 let token = self.next_token(call_id);
-                let text = format!("Approval needed: `{name}` ({safety:?})");
-                if let Err(e) = self
+                // The fallback text is what a push notification shows, so the
+                // arg belongs here too, not just in the blocks (finding 2).
+                let text = match resolved_arg.as_deref() {
+                    Some(arg) => format!(
+                        "Approval needed: `{name}` ({safety:?}) — {}",
+                        Self::arg_preview(arg)
+                    ),
+                    None => format!("Approval needed: `{name}` ({safety:?})"),
+                };
+                let ts = match self
                     .api
                     .post_blocks(
                         &self.channel.platform_id,
                         &text,
-                        Self::prompt_blocks(name, safety, &token),
+                        Self::prompt_blocks(name, safety, resolved_arg.as_deref(), &token),
                     )
                     .await
                 {
-                    warn!(tool = %name, error = %e, "failed to post slack approval prompt; denying");
-                    return false;
+                    Ok(ts) => ts,
+                    Err(e) => {
+                        warn!(tool = %name, error = %e, "failed to post slack approval prompt; denying");
+                        return false;
+                    }
+                };
+                let outcome = self.await_decision(&token).await;
+
+                // Retire the prompt so the channel does not keep live buttons on
+                // a settled request (#1168 review, finding 4). The `ts` from the
+                // post is the only handle for this, which is why it is no longer
+                // discarded. Best-effort: the decision is already made, so a
+                // failed edit must not change it.
+                let epilogue = match &outcome {
+                    Some((true, user)) => format!("✅ `{name}` approved by <@{user}>"),
+                    Some((false, user)) => format!("🚫 `{name}` denied by <@{user}>"),
+                    None => format!(
+                        "⏱️ `{name}` timed out after {}s — denied",
+                        self.timeout.as_secs()
+                    ),
+                };
+                if let Err(e) = self
+                    .api
+                    .update_message(&self.channel.platform_id, &ts, &epilogue)
+                    .await
+                {
+                    debug!(tool = %name, error = %e, "could not retire the slack prompt");
                 }
-                match self.await_decision(&token).await {
-                    Some(decision) => decision,
+
+                match outcome {
+                    // Record who answered. T4 does not gate on identity, but an
+                    // approval nobody can be attributed to is not an audit trail
+                    // (#1168 review, finding 3).
+                    Some((decision, user_id)) => {
+                        info!(
+                            tool = %name,
+                            ?safety,
+                            decision,
+                            slack_user = %user_id,
+                            "slack approval answered"
+                        );
+                        decision
+                    }
                     None => {
                         warn!(
                             tool = %name,

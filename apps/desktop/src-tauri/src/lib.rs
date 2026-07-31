@@ -24,7 +24,7 @@ use ff_core::events::{
     TokenEvent, ToolApprovalRequestEvent, ToolAskRequestEvent, ToolCallEvent, ToolOutputChunkEvent,
     ToolResultEvent, TurnDoneEvent, TurnErrorEvent, TurnStatsEvent, UpdateProgressEvent,
 };
-use ff_core::pre_prompt_decision;
+use ff_core::{pre_prompt_decision, resolve_tool_arg};
 use ff_core::{
     Attachment, BedrockAuth, CreateScheduledTaskInput, DirEntry, FileContent, Format, Goal,
     GoalStatus, McpServerConfig, McpServerStatus, MemoryFileInfo, MemoryFileKind, MemoryOverview,
@@ -214,25 +214,6 @@ struct UiApprover {
     session_id: String,
     /// The session's resolved autonomy mode for this turn (#265).
     mode: Mode,
-}
-
-/// Resolve the "relevant argument" for scoped permission rules (#712).
-///
-/// Each entry is verified against the real tool arg schema in `ff-tools`
-/// (#768 review B2): `bash` takes `command`, `python` takes `code`, and the
-/// filesystem mutators take `path`. Only tools that can actually reach the
-/// approval gate are listed — the read-only search tools (`glob`, `grep`)
-/// short-circuit as `Safety::ReadOnly` before `approve()`, so a rule on them
-/// would never fire; listing them (with the wrong key, as before) was dead,
-/// misleading code.
-fn resolve_tool_arg(name: &str, args: &serde_json::Value) -> Option<String> {
-    let key = match name {
-        "bash" => "command",
-        "python" => "code",
-        "view" | "edit" | "write" => "path",
-        _ => return None,
-    };
-    args.get(key).and_then(|v| v.as_str()).map(Into::into)
 }
 
 #[async_trait]

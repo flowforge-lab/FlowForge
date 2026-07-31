@@ -17,7 +17,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ff_agent::Approver;
-use ff_core::{Mode, PermissionCell, PermissionMatrix, Safety};
+use ff_core::permission::ArgMatcher;
+use ff_core::{Mode, PermissionCell, PermissionMatrix, PermissionRule, RuleEffect, Safety};
 use ff_transport::ChannelId;
 use tokio::sync::mpsc;
 use wiremock::matchers::{body_string_contains, method, path};
@@ -464,5 +465,275 @@ async fn each_prompt_gets_a_distinct_token_so_a_retry_cannot_be_answered_by_an_o
             )
             .await,
         "the retry must not be authorized by a replay of the first prompt's token"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Tier 4: scoped rules (#1168 review, finding 1)
+// ---------------------------------------------------------------------------
+
+/// A `bash` deny backstop, the shape a real config uses.
+fn deny_rm_rf() -> Vec<PermissionRule> {
+    vec![PermissionRule {
+        effect: RuleEffect::Deny,
+        tool: "bash".into(),
+        matcher: ArgMatcher::CommandPrefix {
+            prefix: "rm -rf".into(),
+        },
+    }]
+}
+
+/// The approver must feed `evaluate_rules` a *resolved* arg, or every scoped
+/// rule — `Deny` included — is silently skipped. T4 shipped `None` outright,
+/// which is fail-open: the deny backstop below simply never fired.
+///
+/// `.expect(0)` is what separates "denied" from "prompted and answered no".
+#[tokio::test]
+async fn a_scoped_deny_rule_vetoes_without_prompting() {
+    let mut matrix = PermissionMatrix::default();
+    matrix.rules = deny_rm_rf();
+
+    // Premise, asserted rather than remembered: without the rule this cell
+    // prompts, so a `false` below can only have come from the rule.
+    assert_eq!(
+        matrix.effective_cell("bash", Mode::Auto, Safety::Sensitive),
+        PermissionCell::Ask,
+        "premise: Auto/Sensitive prompts, so a Deny verdict must come from the rule"
+    );
+
+    let server = prompt_server(0).await;
+    let api = SlackApi::new("xoxb-test").with_base(server.uri());
+    let (_tx, rx) = mpsc::channel(8);
+    let approver = SlackApprover::new(api, channel(), Mode::Auto, matrix, rx)
+        .with_timeout(Duration::from_millis(500));
+
+    let decision = approver
+        .approve(
+            "m1",
+            "c1",
+            "bash",
+            Safety::Sensitive,
+            &serde_json::json!({ "command": "rm -rf /tmp/x" }),
+        )
+        .await;
+
+    assert!(!decision, "a scoped Deny rule must veto");
+}
+
+/// The Allow direction, so the fix cannot be faked by hard-coding a Deny.
+#[tokio::test]
+async fn a_scoped_allow_rule_auto_approves_without_prompting() {
+    let mut matrix = PermissionMatrix::default();
+    matrix.rules = vec![PermissionRule {
+        effect: RuleEffect::Allow,
+        tool: "bash".into(),
+        matcher: ArgMatcher::CommandPrefix {
+            prefix: "cargo test".into(),
+        },
+    }];
+    assert_eq!(
+        matrix.effective_cell("bash", Mode::Auto, Safety::Sensitive),
+        PermissionCell::Ask,
+        "premise: Auto/Sensitive prompts, so an Allow verdict must come from the rule"
+    );
+
+    let server = prompt_server(0).await;
+    let api = SlackApi::new("xoxb-test").with_base(server.uri());
+    let (_tx, rx) = mpsc::channel(8);
+    let approver = SlackApprover::new(api, channel(), Mode::Auto, matrix, rx)
+        .with_timeout(Duration::from_millis(500));
+
+    let decision = approver
+        .approve(
+            "m1",
+            "c1",
+            "bash",
+            Safety::Sensitive,
+            &serde_json::json!({ "command": "cargo test -p ff-core" }),
+        )
+        .await;
+
+    assert!(decision, "a scoped Allow rule must auto-approve");
+}
+
+/// A rule whose matcher does not match must change nothing — otherwise the two
+/// tests above could pass while ignoring the matcher entirely.
+#[tokio::test]
+async fn a_non_matching_scoped_rule_still_prompts() {
+    let mut matrix = PermissionMatrix::default();
+    matrix.rules = deny_rm_rf();
+
+    let server = prompt_server(1).await;
+    let api = SlackApi::new("xoxb-test").with_base(server.uri());
+    let (tx, rx) = mpsc::channel(8);
+    let approver = SlackApprover::new(api, channel(), Mode::Auto, matrix, rx)
+        .with_timeout(Duration::from_millis(500));
+
+    let replier = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        tx.send(interaction(ACTION_APPROVE, Some("c1#0")))
+            .await
+            .unwrap();
+    });
+
+    let decision = approver
+        .approve(
+            "m1",
+            "c1",
+            "bash",
+            Safety::Sensitive,
+            &serde_json::json!({ "command": "ls -la" }),
+        )
+        .await;
+    replier.await.expect("replier");
+
+    assert!(
+        decision,
+        "a non-matching rule must fall through to the prompt"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Tier 5: prompt content and cleanup (#1168 review, findings 2 and 4)
+// ---------------------------------------------------------------------------
+
+/// The prompt must show the *resolved* argument, not just the tool name.
+///
+/// Without it a channel member approving `bash — Write` cannot tell `cargo test`
+/// from `rm -rf ~`. Asserted on the request body rather than on a helper's
+/// return value, so it fails if the block is built but never sent.
+#[tokio::test]
+async fn the_prompt_shows_the_resolved_argument() {
+    let server = MockServer::start().await;
+    let posts = Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+    let sink = Arc::clone(&posts);
+    Mock::given(method("POST"))
+        .and(path("/chat.postMessage"))
+        .respond_with(move |req: &wiremock::Request| {
+            sink.lock()
+                .unwrap()
+                .push(serde_json::from_slice(&req.body).unwrap());
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({ "ok": true, "ts": "900.1" }))
+        })
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/chat.update"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "ok": true })))
+        .mount(&server)
+        .await;
+
+    let api = SlackApi::new("xoxb-test").with_base(server.uri());
+    let (tx, rx) = mpsc::channel(8);
+    let approver = SlackApprover::new(api, channel(), Mode::Auto, PermissionMatrix::default(), rx)
+        .with_timeout(Duration::from_millis(500));
+
+    let replier = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        tx.send(interaction(ACTION_APPROVE, Some("c1#0")))
+            .await
+            .unwrap();
+    });
+    let decision = approver
+        .approve(
+            "m1",
+            "c1",
+            "bash",
+            Safety::Sensitive,
+            &serde_json::json!({ "command": "rm -rf /tmp/x" }),
+        )
+        .await;
+    replier.await.expect("replier");
+    assert!(decision);
+
+    let body = posts.lock().unwrap()[0].clone();
+
+    // Assert on the *blocks* specifically. Checking the whole payload would let
+    // the `text` fallback alone satisfy this, which a mutation proved: dropping
+    // the arg block kept the test green because `text` still carried it.
+    let blocks = body["blocks"].to_string();
+    assert!(
+        blocks.contains("rm -rf /tmp/x"),
+        "the resolved arg must be rendered in the blocks, got: {blocks}"
+    );
+    assert!(
+        body["text"].as_str().unwrap().contains("rm -rf /tmp/x"),
+        "the notification fallback must carry it too, got: {}",
+        body["text"]
+    );
+}
+
+/// A settled prompt must be retired, or the channel keeps live buttons on a
+/// request that already resolved. `.expect(1)` on `chat.update` is the
+/// assertion — the `ts` plumbed out of `post_blocks` is what makes it possible.
+#[tokio::test]
+async fn a_settled_prompt_is_retired_with_the_posted_ts() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat.postMessage"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({ "ok": true, "ts": "900.1" })),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/chat.update"))
+        .and(body_string_contains("900.1"))
+        .and(body_string_contains("approved by"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({ "ok": true })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let api = SlackApi::new("xoxb-test").with_base(server.uri());
+    let (tx, rx) = mpsc::channel(8);
+    let approver = SlackApprover::new(api, channel(), Mode::Auto, PermissionMatrix::default(), rx)
+        .with_timeout(Duration::from_millis(500));
+
+    let replier = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        tx.send(interaction(ACTION_APPROVE, Some("c1#0")))
+            .await
+            .unwrap();
+    });
+    let decision = approver
+        .approve(
+            "m1",
+            "c1",
+            "view",
+            Safety::Sensitive,
+            &serde_json::json!({}),
+        )
+        .await;
+    replier.await.expect("replier");
+    assert!(decision);
+    // `.expect(1)` on the update mock is verified on drop.
+}
+
+/// `arg_preview` truncates by character, not byte, so a multi-byte arg cannot
+/// panic on a split UTF-8 boundary — the failure mode would be a panic inside an
+/// approval prompt, which denies nothing and hangs the turn.
+#[test]
+fn arg_preview_truncates_on_char_boundaries() {
+    let short = SlackApprover::arg_preview("cargo test");
+    assert_eq!(short, "cargo test", "a short arg passes through unchanged");
+
+    let newlines = SlackApprover::arg_preview("a\nb");
+    assert_eq!(
+        newlines, "a ⏎ b",
+        "newlines are flattened for a one-line block"
+    );
+
+    // 400 multi-byte chars: byte-slicing at 300 would land mid-character.
+    let cjk: String = "命".repeat(400);
+    let cut = SlackApprover::arg_preview(&cjk);
+    assert!(cut.ends_with('…'), "an over-long arg is elided");
+    assert_eq!(
+        cut.chars().count(),
+        301,
+        "301 = 300 chars plus the ellipsis, counted in chars not bytes"
     );
 }
