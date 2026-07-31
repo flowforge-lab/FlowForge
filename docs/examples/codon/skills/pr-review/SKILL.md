@@ -41,9 +41,16 @@ read to a specific hunk, do not make it.
 
 ## Do not spider the call graph
 
-This is the key override: do NOT use `codegraph_explore`, `codegraph_node`, or
-`codegraph_trace` to map the area around the change. Call-graph traversal turns a
-scoped review into an open-ended survey and reads far past the change under
-review. A single targeted `codegraph_node` on one changed symbol -- it returns
-that symbol's caller/callee trail -- is acceptable only when a specific hunk makes
-you suspect a caller broke; a blanket "let me explore the impact" is not.
+This is the key override: do NOT use `codegraph_explore` to map the area around
+the change. Call-graph traversal turns a scoped review into an open-ended survey
+and reads far past the change under review. `explore` is codegraph's only tool
+and it is built to widen -- it returns whole symbols plus the call path among
+them -- which is exactly the wrong shape for a review. (Earlier versions of this
+skill pointed at a narrower `codegraph_node` for this; that name does not exist.)
+
+One `explore` naming a single changed symbol is acceptable when a specific hunk
+makes you suspect a caller broke -- ask for that symbol alone, not the flow
+around it. A blanket "let me explore the impact" is not. Remember the review's
+subject is the diff: the graph can only tell you where to look, and Rust edges
+are incomplete anyway, so a suspected breakage gets confirmed by `cargo check`
+and the tests, not by a wider traversal.
