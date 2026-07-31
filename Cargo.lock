@@ -1943,6 +1943,8 @@ dependencies = [
  "ff-session",
  "ff-skills",
  "ff-tools",
+ "ff-transport",
+ "ff-transport-slack",
  "futures-util",
  "keyring",
  "security-framework 3.7.0",

@@ -1,4 +1,4 @@
-use super::resolve_phenotype_in;
+use super::{channel_map_path, resolve_phenotype_in, session_db_path};
 use ff_skills::DEFAULT_PHENOTYPE;
 use std::fs;
 
@@ -139,4 +139,26 @@ fn bedrock_cli_provider_default_effort_is_medium() {
     };
     let provider = super::build_bedrock_provider(&config, true);
     assert_eq!(provider.reasoning_effort(), ReasoningEffort::Medium);
+}
+
+/// The channel→session map must live beside the session DB (#1060).
+///
+/// `serve` shares its store with the desktop app so a Slack conversation shows up
+/// in the UI; if the map resolved to a different root, the mapping and the
+/// sessions it names would drift apart and every restart would strand the
+/// channel's history. Deriving both from `config_dir` is what prevents that, and
+/// this asserts it rather than trusting the two call sites to stay in step.
+#[test]
+fn channel_map_sits_beside_the_session_db() {
+    let _env = crate::test_support::TestEnv::new();
+
+    let map = channel_map_path().expect("override provides a config dir");
+    let db = session_db_path().expect("override provides a config dir");
+
+    assert_eq!(
+        map.parent(),
+        db.parent(),
+        "channel map and session DB must share a directory"
+    );
+    assert_eq!(map.file_name().unwrap(), "channel-map.json");
 }

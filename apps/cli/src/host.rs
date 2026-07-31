@@ -163,6 +163,13 @@ pub fn session_db_path() -> Option<PathBuf> {
     config_dir().map(|d| d.join("flowforge").join("sessions.db"))
 }
 
+/// Resolved path of the transport channel→session map (#1060). Shares
+/// [`config_dir`] with [`session_db_path`] so the test override redirects it too
+/// — otherwise `serve` tests would write into the real `~/.config/flowforge`.
+pub fn channel_map_path() -> Option<PathBuf> {
+    config_dir().map(|d| d.join("flowforge").join("channel-map.json"))
+}
+
 /// Resolved config dir: the test override (a thread-local set by
 /// `test_support::TestEnv`) when active, else the OS default. Mirrors
 /// `registry::config_dir` so session-store tests can point at a tempdir without

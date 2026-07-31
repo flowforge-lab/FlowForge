@@ -14,6 +14,7 @@ mod json_events;
 mod memory;
 mod registry;
 mod secrets;
+mod serve;
 mod sessions;
 mod task;
 mod task_runner;
@@ -169,6 +170,9 @@ enum Command {
     },
     /// Run autonomous goal loop headless (#1082).
     Goal(goal::GoalArgs),
+    /// Serve a Slack channel: routes messages into agent turns and asks for
+    /// approval over Block Kit buttons (#1060).
+    Serve(serve::ServeArgs),
     /// Manage scheduled tasks (#1082).
     Task {
         #[command(subcommand)]
@@ -253,6 +257,7 @@ async fn main() -> ExitCode {
         Command::Config { command } => config::run(command),
         Command::Memory { command } => memory::run(command).await,
         Command::Goal(args) => goal::run(args).await,
+        Command::Serve(args) => serve::run(args).await,
         Command::Task { command } => task::run(command).await,
     }
 }
