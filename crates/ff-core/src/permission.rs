@@ -171,6 +171,15 @@ impl ArgMatcher {
                 .unwrap_or(false),
         }
     }
+
+    /// Human-readable description of this matcher for denial messages (#1176).
+    pub fn description(&self) -> String {
+        match self {
+            Self::PathGlob { pattern } => format!("path glob '{pattern}'"),
+            Self::CommandPrefix { prefix } => format!("command prefix '{prefix}'"),
+            Self::CommandRegex { pattern } => format!("command regex '{pattern}'"),
+        }
+    }
 }
 
 /// A scoped permission rule: tool + argument matcher → effect.
@@ -385,6 +394,22 @@ impl PermissionMatrix {
         }
 
         None
+    }
+
+    /// Return the first matching deny rule for a tool/argument pair (#1176).
+    /// Used to surface the rule name in denial messages so the model knows
+    /// *which* scoped rule blocked the call.
+    pub fn matching_deny_rule(
+        &self,
+        tool: &str,
+        resolved_arg: Option<&str>,
+    ) -> Option<&PermissionRule> {
+        let resolved = resolved_arg?;
+        self.rules.iter().find(|rule| {
+            rule.tool == tool
+                && rule.effect == RuleEffect::Deny
+                && (!rule.matcher.is_valid() || rule.matcher.matches(resolved))
+        })
     }
 
     /// Validate every rule's matcher pattern, returning `(index, error)` for

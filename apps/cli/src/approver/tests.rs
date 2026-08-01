@@ -1,5 +1,5 @@
 use super::{ApprovalDecision, ApprovalMode, CliApprover, InputMode};
-use ff_agent::Approver;
+use ff_agent::{ApprovalOutcome, Approver, DenyReason};
 use ff_core::Mode;
 use ff_tools::Safety;
 
@@ -202,7 +202,7 @@ fn dangerous_calls_are_never_auto_allowed_without_an_explicit_flag() {
 #[tokio::test]
 async fn was_denied_is_set_when_a_call_is_denied_by_policy() {
     let approver = CliApprover::new(ApprovalMode::Deny, Mode::Act);
-    let approved = approver
+    let outcome = approver
         .approve(
             "msg",
             "call",
@@ -211,7 +211,13 @@ async fn was_denied_is_set_when_a_call_is_denied_by_policy() {
             &serde_json::json!({}),
         )
         .await;
-    assert!(!approved, "a dangerous call under --deny should be denied");
+    assert!(
+        matches!(
+            outcome,
+            ApprovalOutcome::Denied(DenyReason::NoInteractiveTerminal)
+        ),
+        "a dangerous call under --deny should be denied"
+    );
     assert!(
         approver.was_denied(),
         "was_denied() must be true after a --deny denial"
@@ -221,7 +227,7 @@ async fn was_denied_is_set_when_a_call_is_denied_by_policy() {
 #[tokio::test]
 async fn was_denied_stays_false_when_a_call_is_allowed_by_yes() {
     let approver = CliApprover::new(ApprovalMode::Yes, Mode::Act);
-    let approved = approver
+    let outcome = approver
         .approve(
             "msg",
             "call",
@@ -230,7 +236,10 @@ async fn was_denied_stays_false_when_a_call_is_allowed_by_yes() {
             &serde_json::json!({}),
         )
         .await;
-    assert!(approved, "a dangerous call under --yes should be allowed");
+    assert!(
+        matches!(outcome, ApprovalOutcome::Allowed),
+        "a dangerous call under --yes should be allowed"
+    );
     assert!(
         !approver.was_denied(),
         "was_denied() must stay false when the call is allowed"

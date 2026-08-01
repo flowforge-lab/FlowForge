@@ -35,7 +35,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use ff_agent::Approver;
+use ff_agent::{ApprovalOutcome, Approver, DenyReason};
 use ff_core::{Mode, PermissionMatrix, Safety};
 use ff_transport::ChannelId;
 use tokio::sync::{mpsc, Mutex};
@@ -287,14 +287,17 @@ impl Approver for SlackApprover {
         name: &str,
         safety: Safety,
         args: &serde_json::Value,
-    ) -> bool {
+    ) -> ApprovalOutcome {
         if Self::button_can_never_authorize(safety) {
             warn!(
                 tool = %name,
                 ?safety,
                 "denied over slack: a shared channel button may not authorize this"
             );
-            return false;
+            return ApprovalOutcome::Denied(DenyReason::Mode {
+                mode: self.mode,
+                safety,
+            });
         }
 
         let cell = self.matrix.effective_cell(name, self.mode, safety);
@@ -312,81 +315,117 @@ impl Approver for SlackApprover {
         let scoped_effect = self
             .matrix
             .evaluate_rules(name, resolved_arg.as_deref(), self.mode);
-        match ff_core::pre_prompt_decision(cell, false, scoped_effect, safety) {
-            ff_core::PrePromptDecision::Deny => false,
-            ff_core::PrePromptDecision::Allow => true,
-            ff_core::PrePromptDecision::Prompt => {
-                let token = self.next_token(call_id);
-                // The fallback text is what a push notification shows, so the
-                // arg belongs here too, not just in the blocks (finding 2).
-                let text = match resolved_arg.as_deref() {
-                    Some(arg) => format!(
-                        "Approval needed: `{name}` ({safety:?}) — {}",
-                        Self::arg_preview(arg)
-                    ),
-                    None => format!("Approval needed: `{name}` ({safety:?})"),
-                };
-                let ts = match self
-                    .api
-                    .post_blocks(
-                        &self.channel.platform_id,
-                        &text,
-                        Self::prompt_blocks(name, safety, resolved_arg.as_deref(), &token),
-                    )
-                    .await
-                {
-                    Ok(ts) => ts,
-                    Err(e) => {
-                        warn!(tool = %name, error = %e, "failed to post slack approval prompt; denying");
-                        return false;
-                    }
-                };
-                let outcome = self.await_decision(&token).await;
 
-                // Retire the prompt so the channel does not keep live buttons on
-                // a settled request (#1168 review, finding 4). The `ts` from the
-                // post is the only handle for this, which is why it is no longer
-                // discarded. Best-effort: the decision is already made, so a
-                // failed edit must not change it.
-                let epilogue = match &outcome {
-                    Some((true, user)) => format!("✅ `{name}` approved by <@{user}>"),
-                    Some((false, user)) => format!("🚫 `{name}` denied by <@{user}>"),
-                    None => format!(
-                        "⏱️ `{name}` timed out after {}s — denied",
-                        self.timeout.as_secs()
-                    ),
-                };
-                if let Err(e) = self
-                    .api
-                    .update_message(&self.channel.platform_id, &ts, &epilogue)
-                    .await
-                {
-                    debug!(tool = %name, error = %e, "could not retire the slack prompt");
-                }
+        // Inline the canonical gate order so we can return distinct DenyReasons
+        // (#1176).
+        if cell.is_deny() {
+            return ApprovalOutcome::Denied(DenyReason::Mode {
+                mode: self.mode,
+                safety,
+            });
+        }
+        if let Some(rule) = self
+            .matrix
+            .matching_deny_rule(name, resolved_arg.as_deref())
+        {
+            return ApprovalOutcome::Denied(DenyReason::ScopedRule {
+                rule: format!("{} ({})", rule.tool, rule.matcher.description()),
+            });
+        }
+        match scoped_effect {
+            Some(ff_core::RuleEffect::Allow) if safety != Safety::Dangerous => {
+                return ApprovalOutcome::Allowed;
+            }
+            _ => {}
+        }
+        match cell {
+            ff_core::PermissionCell::Allow => return ApprovalOutcome::Allowed,
+            ff_core::PermissionCell::Deny => {
+                return ApprovalOutcome::Denied(DenyReason::Mode {
+                    mode: self.mode,
+                    safety,
+                });
+            }
+            ff_core::PermissionCell::Ask => {}
+        }
 
-                match outcome {
-                    // Record who answered. T4 does not gate on identity, but an
-                    // approval nobody can be attributed to is not an audit trail
-                    // (#1168 review, finding 3).
-                    Some((decision, user_id)) => {
-                        info!(
-                            tool = %name,
-                            ?safety,
-                            decision,
-                            slack_user = %user_id,
-                            "slack approval answered"
-                        );
-                        decision
-                    }
-                    None => {
-                        warn!(
-                            tool = %name,
-                            timeout_secs = self.timeout.as_secs(),
-                            "no slack approval within the timeout; denying"
-                        );
-                        false
-                    }
-                }
+        let token = self.next_token(call_id);
+        // The fallback text is what a push notification shows, so the
+        // arg belongs here too, not just in the blocks (finding 2).
+        let text = match resolved_arg.as_deref() {
+            Some(arg) => format!(
+                "Approval needed: `{name}` ({safety:?}) — {}",
+                Self::arg_preview(arg)
+            ),
+            None => format!("Approval needed: `{name}` ({safety:?})"),
+        };
+        let ts = match self
+            .api
+            .post_blocks(
+                &self.channel.platform_id,
+                &text,
+                Self::prompt_blocks(name, safety, resolved_arg.as_deref(), &token),
+            )
+            .await
+        {
+            Ok(ts) => ts,
+            Err(e) => {
+                warn!(tool = %name, error = %e, "failed to post slack approval prompt; denying");
+                return ApprovalOutcome::Denied(DenyReason::NoInteractiveTerminal);
+            }
+        };
+        let outcome = self.await_decision(&token).await;
+
+        // Retire the prompt so the channel does not keep live buttons on
+        // a settled request (#1168 review, finding 4). The `ts` from the
+        // post is the only handle for this, which is why it is no longer
+        // discarded. Best-effort: the decision is already made, so a
+        // failed edit must not change it.
+        let epilogue = match &outcome {
+            Some((true, user)) => format!("✅ `{name}` approved by <@{user}>"),
+            Some((false, user)) => format!("🚫 `{name}` denied by <@{user}>"),
+            None => format!(
+                "⏱️ `{name}` timed out after {}s — denied",
+                self.timeout.as_secs()
+            ),
+        };
+        if let Err(e) = self
+            .api
+            .update_message(&self.channel.platform_id, &ts, &epilogue)
+            .await
+        {
+            debug!(tool = %name, error = %e, "could not retire the slack prompt");
+        }
+
+        match outcome {
+            // Record who answered. T4 does not gate on identity, but an
+            // approval nobody can be attributed to is not an audit trail
+            // (#1168 review, finding 3).
+            Some((true, user_id)) => {
+                info!(
+                    tool = %name,
+                    ?safety,
+                    slack_user = %user_id,
+                    "slack approval answered"
+                );
+                ApprovalOutcome::Allowed
+            }
+            Some((false, user_id)) => {
+                info!(
+                    tool = %name,
+                    ?safety,
+                    slack_user = %user_id,
+                    "slack approval denied"
+                );
+                ApprovalOutcome::Denied(DenyReason::User)
+            }
+            None => {
+                warn!(
+                    tool = %name,
+                    timeout_secs = self.timeout.as_secs(),
+                    "no slack approval within the timeout; denying"
+                );
+                ApprovalOutcome::Denied(DenyReason::NoInteractiveTerminal)
             }
         }
     }

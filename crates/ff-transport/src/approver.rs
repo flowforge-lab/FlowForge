@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use ff_agent::Approver;
+use ff_agent::{ApprovalOutcome, Approver, DenyReason};
 use ff_core::Mode;
 use ff_tools::Safety;
 
@@ -53,17 +53,29 @@ impl Approver for MessagingApprover {
         _name: &str,
         safety: Safety,
         _args: &serde_json::Value,
-    ) -> bool {
+    ) -> ApprovalOutcome {
         match self.mode {
-            Mode::Plan => false, // Only read-only passes (bypasses Approver entirely).
+            Mode::Plan => {
+                if safety == Safety::ReadOnly {
+                    ApprovalOutcome::Allowed
+                } else {
+                    ApprovalOutcome::Denied(DenyReason::Mode {
+                        mode: self.mode,
+                        safety,
+                    })
+                }
+            }
             Mode::Auto | Mode::Act => match safety {
-                Safety::ReadOnly => true,
-                Safety::Write => true,
-                Safety::Sensitive => true,
+                Safety::ReadOnly => ApprovalOutcome::Allowed,
+                Safety::Write => ApprovalOutcome::Allowed,
+                Safety::Sensitive => ApprovalOutcome::Allowed,
                 // No interactive surface to confirm a remote publish or a
                 // dangerous operation, so a messaging-triggered agent must not
                 // push/merge to a remote unattended (#1051).
-                Safety::Publish | Safety::Dangerous => false,
+                Safety::Publish | Safety::Dangerous => ApprovalOutcome::Denied(DenyReason::Mode {
+                    mode: self.mode,
+                    safety,
+                }),
             },
         }
     }

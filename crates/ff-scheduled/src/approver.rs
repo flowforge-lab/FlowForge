@@ -8,7 +8,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
-use ff_agent::Approver;
+use ff_agent::{ApprovalOutcome, Approver, DenyReason};
 use ff_core::SafetyCeiling;
 use ff_tools::Safety;
 
@@ -44,18 +44,26 @@ impl Approver for ScheduledApprover {
         _name: &str,
         safety: Safety,
         _args: &serde_json::Value,
-    ) -> bool {
+    ) -> ApprovalOutcome {
         match safety {
             // The loop short-circuits read-only calls before consulting the
             // approver; allow defensively in case a future caller does not.
-            Safety::ReadOnly => true,
+            Safety::ReadOnly => ApprovalOutcome::Allowed,
             // A write runs only when the task opted into the write ceiling.
             // Sensitive is gated identically to Write for now (#698).
-            Safety::Write | Safety::Sensitive => self.ceiling == SafetyCeiling::Write,
+            Safety::Write | Safety::Sensitive => {
+                if self.ceiling == SafetyCeiling::Write {
+                    ApprovalOutcome::Allowed
+                } else {
+                    ApprovalOutcome::Denied(DenyReason::NoInteractiveTerminal)
+                }
+            }
             // A remote publish (`git push`, `gh pr merge`) or a dangerous call
             // is never auto-approved in an unattended scheduled fire, regardless
             // of the ceiling (#1051). Do NOT fold Publish into Write/Sensitive.
-            Safety::Publish | Safety::Dangerous => false,
+            Safety::Publish | Safety::Dangerous => {
+                ApprovalOutcome::Denied(DenyReason::NoInteractiveTerminal)
+            }
         }
     }
 
@@ -84,21 +92,45 @@ mod tests {
     #[tokio::test]
     async fn read_only_ceiling_allows_read_only_only() {
         let a = ScheduledApprover::new(SafetyCeiling::ReadOnly);
-        assert!(a.approve("m", "c", "t", Safety::ReadOnly, &args()).await);
-        assert!(!a.approve("m", "c", "t", Safety::Write, &args()).await);
+        assert!(matches!(
+            a.approve("m", "c", "t", Safety::ReadOnly, &args()).await,
+            ApprovalOutcome::Allowed
+        ));
+        assert!(matches!(
+            a.approve("m", "c", "t", Safety::Write, &args()).await,
+            ApprovalOutcome::Denied(DenyReason::NoInteractiveTerminal)
+        ));
         // Sensitive is gated identically to Write (#698).
-        assert!(!a.approve("m", "c", "t", Safety::Sensitive, &args()).await);
-        assert!(!a.approve("m", "c", "t", Safety::Dangerous, &args()).await);
+        assert!(matches!(
+            a.approve("m", "c", "t", Safety::Sensitive, &args()).await,
+            ApprovalOutcome::Denied(DenyReason::NoInteractiveTerminal)
+        ));
+        assert!(matches!(
+            a.approve("m", "c", "t", Safety::Dangerous, &args()).await,
+            ApprovalOutcome::Denied(DenyReason::NoInteractiveTerminal)
+        ));
     }
 
     #[tokio::test]
     async fn write_ceiling_allows_write_but_not_dangerous() {
         let a = ScheduledApprover::new(SafetyCeiling::Write);
-        assert!(a.approve("m", "c", "t", Safety::ReadOnly, &args()).await);
-        assert!(a.approve("m", "c", "t", Safety::Write, &args()).await);
+        assert!(matches!(
+            a.approve("m", "c", "t", Safety::ReadOnly, &args()).await,
+            ApprovalOutcome::Allowed
+        ));
+        assert!(matches!(
+            a.approve("m", "c", "t", Safety::Write, &args()).await,
+            ApprovalOutcome::Allowed
+        ));
         // Sensitive rides the write ceiling identically to Write (#698).
-        assert!(a.approve("m", "c", "t", Safety::Sensitive, &args()).await);
-        assert!(!a.approve("m", "c", "t", Safety::Dangerous, &args()).await);
+        assert!(matches!(
+            a.approve("m", "c", "t", Safety::Sensitive, &args()).await,
+            ApprovalOutcome::Allowed
+        ));
+        assert!(matches!(
+            a.approve("m", "c", "t", Safety::Dangerous, &args()).await,
+            ApprovalOutcome::Denied(DenyReason::NoInteractiveTerminal)
+        ));
     }
 
     #[tokio::test]
@@ -107,7 +139,10 @@ mod tests {
         // merge` to a remote, even under the write ceiling — like Dangerous.
         for ceiling in [SafetyCeiling::ReadOnly, SafetyCeiling::Write] {
             let a = ScheduledApprover::new(ceiling);
-            assert!(!a.approve("m", "c", "t", Safety::Publish, &args()).await);
+            assert!(matches!(
+                a.approve("m", "c", "t", Safety::Publish, &args()).await,
+                ApprovalOutcome::Denied(DenyReason::NoInteractiveTerminal)
+            ));
         }
     }
 
@@ -115,7 +150,10 @@ mod tests {
     async fn dangerous_is_never_approved_at_any_ceiling() {
         for ceiling in [SafetyCeiling::ReadOnly, SafetyCeiling::Write] {
             let a = ScheduledApprover::new(ceiling);
-            assert!(!a.approve("m", "c", "t", Safety::Dangerous, &args()).await);
+            assert!(matches!(
+                a.approve("m", "c", "t", Safety::Dangerous, &args()).await,
+                ApprovalOutcome::Denied(DenyReason::NoInteractiveTerminal)
+            ));
         }
     }
 

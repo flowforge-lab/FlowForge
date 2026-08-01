@@ -12,8 +12,8 @@ mod tools;
 
 use async_trait::async_trait;
 use ff_agent::{
-    drive_goal, run_turn, AgentEvent, Approver, CancelToken, GateDecision, GoalIteration,
-    IterationOutcome, ToolContext,
+    drive_goal, run_turn, AgentEvent, ApprovalOutcome, Approver, CancelToken, DenyReason,
+    GateDecision, GoalIteration, IterationOutcome, ToolContext,
 };
 use ff_core::events::{
     ApprovalSafety, ConnectionFailedEvent, EgressMismatchEvent, EvolveCostEstimate,
@@ -24,14 +24,14 @@ use ff_core::events::{
     TokenEvent, ToolApprovalRequestEvent, ToolAskRequestEvent, ToolCallEvent, ToolOutputChunkEvent,
     ToolResultEvent, TurnDoneEvent, TurnErrorEvent, TurnStatsEvent, UpdateProgressEvent,
 };
-use ff_core::{pre_prompt_decision, resolve_tool_arg};
+use ff_core::resolve_tool_arg;
 use ff_core::{
     Attachment, BedrockAuth, CreateScheduledTaskInput, DirEntry, FileContent, Format, Goal,
     GoalStatus, McpServerConfig, McpServerStatus, MemoryFileInfo, MemoryFileKind, MemoryOverview,
-    Message, Mode, ModelSelection, PermissionCell, PermissionMatrixView, Phenotype,
-    PrePromptDecision, ProviderConfig, ProviderConnection, ProviderKind, ProviderRegistry,
-    ResolvedModel, Role, RunRecord, RunStatus, ScheduledTask, SearchConfig, SecretKind, Session,
-    SessionWorkspace, Skill, SkillInfo, SkillManifest, TaskKind,
+    Message, Mode, ModelSelection, PermissionCell, PermissionMatrixView, Phenotype, ProviderConfig,
+    ProviderConnection, ProviderKind, ProviderRegistry, ResolvedModel, Role, RunRecord, RunStatus,
+    ScheduledTask, SearchConfig, SecretKind, Session, SessionWorkspace, Skill, SkillInfo,
+    SkillManifest, TaskKind,
 };
 use ff_observer::{ObserverEvent, ObserverInfo};
 use ff_scheduled::ScheduledApprover;
@@ -225,7 +225,7 @@ impl Approver for UiApprover {
         name: &str,
         safety: Safety,
         args: &serde_json::Value,
-    ) -> bool {
+    ) -> ApprovalOutcome {
         // Snapshot the matrix once for this call, read live (#702/#742) so a
         // Control-panel edit takes effect on the next tool invocation.
         let matrix = self.state.permission_matrix();
@@ -236,19 +236,49 @@ impl Approver for UiApprover {
 
         // The synchronous pre-prompt decision encodes the canonical gate order
         // (#827/#828 Part C). Extracted so it is unit-testable without an AppHandle.
-        match pre_prompt_decision(cell, allowlisted, scoped_effect, safety) {
-            PrePromptDecision::Deny => return false,
-            PrePromptDecision::Allow => {
-                if scoped_effect == Some(ff_core::RuleEffect::Allow) {
-                    tracing::info!(
-                        tool = name,
-                        arg = ?resolved_arg,
-                        "scoped rule auto-approved"
-                    );
-                }
-                return true;
+        // We replicate the logic here so we can return a distinct DenyReason for
+        // each gate (#1176).
+        if cell.is_deny() {
+            tracing::info!(
+                tool = name,
+                mode = ?self.mode,
+                ?safety,
+                "matrix cell denied tool call"
+            );
+            return ApprovalOutcome::Denied(DenyReason::Mode {
+                mode: self.mode,
+                safety,
+            });
+        }
+        if allowlisted {
+            return ApprovalOutcome::Allowed;
+        }
+        if let Some(rule) = matrix.matching_deny_rule(name, resolved_arg.as_deref()) {
+            return ApprovalOutcome::Denied(DenyReason::ScopedRule {
+                rule: format!("{} ({})", rule.tool, rule.matcher.description()),
+            });
+        }
+        match scoped_effect {
+            Some(ff_core::RuleEffect::Allow) if safety != Safety::Dangerous => {
+                tracing::info!(
+                    tool = name,
+                    arg = ?resolved_arg,
+                    "scoped rule auto-approved"
+                );
+                return ApprovalOutcome::Allowed;
             }
-            PrePromptDecision::Prompt => {}
+            _ => {}
+        }
+        match cell {
+            PermissionCell::Allow => return ApprovalOutcome::Allowed,
+            PermissionCell::Deny => {
+                // unreachable — handled above
+                return ApprovalOutcome::Denied(DenyReason::Mode {
+                    mode: self.mode,
+                    safety,
+                });
+            }
+            PermissionCell::Ask => {}
         }
 
         let approval_safety = match safety {
@@ -256,7 +286,7 @@ impl Approver for UiApprover {
             Safety::Sensitive => ApprovalSafety::Sensitive,
             Safety::Dangerous => ApprovalSafety::Dangerous,
             Safety::Publish => ApprovalSafety::Publish,
-            Safety::ReadOnly => return false,
+            Safety::ReadOnly => return ApprovalOutcome::Allowed,
         };
         let rx = self.state.register_approval(&self.session_id, call_id);
         let _ = self.app.emit(
@@ -271,7 +301,11 @@ impl Approver for UiApprover {
             },
         );
         // Sender dropped (cancel) -> RecvError -> deny.
-        rx.await.unwrap_or(false)
+        if rx.await.unwrap_or(false) {
+            ApprovalOutcome::Allowed
+        } else {
+            ApprovalOutcome::Denied(DenyReason::User)
+        }
     }
 
     async fn ask(

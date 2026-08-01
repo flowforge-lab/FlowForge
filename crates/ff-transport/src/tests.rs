@@ -2,7 +2,7 @@ use crate::approver::MessagingApprover;
 use crate::channel_map::ChannelMap;
 use crate::router::{Router, RouterConfig};
 use crate::types::{ChannelId, InboundMessage};
-use ff_agent::Approver;
+use ff_agent::{ApprovalOutcome, Approver};
 use ff_core::{Egress, Mode};
 use ff_llm::{ChatRequest, Chunk, ChunkStream, LlmError, Provider, ToolCallDelta};
 use ff_session::SessionStore;
@@ -18,21 +18,42 @@ use tempfile::TempDir;
 async fn act_mode_approves_write_and_sensitive() {
     let a = MessagingApprover::new(Mode::Act);
     let v = serde_json::json!({});
-    assert!(a.approve("m", "c", "bash", Safety::Write, &v).await);
-    assert!(a.approve("m", "c", "bash", Safety::Sensitive, &v).await);
-    assert!(!a.approve("m", "c", "bash", Safety::Dangerous, &v).await);
+    assert!(matches!(
+        a.approve("m", "c", "bash", Safety::Write, &v).await,
+        ApprovalOutcome::Allowed
+    ));
+    assert!(matches!(
+        a.approve("m", "c", "bash", Safety::Sensitive, &v).await,
+        ApprovalOutcome::Allowed
+    ));
+    assert!(matches!(
+        a.approve("m", "c", "bash", Safety::Dangerous, &v).await,
+        ApprovalOutcome::Denied(_)
+    ));
     // #1051: a messaging-triggered agent has no interactive surface to confirm
     // a remote publish, so Publish is blocked unattended — like Dangerous.
-    assert!(!a.approve("m", "c", "bash", Safety::Publish, &v).await);
+    assert!(matches!(
+        a.approve("m", "c", "bash", Safety::Publish, &v).await,
+        ApprovalOutcome::Denied(_)
+    ));
 }
 
 #[tokio::test]
 async fn plan_mode_denies_all() {
     let a = MessagingApprover::new(Mode::Plan);
     let v = serde_json::json!({});
-    assert!(!a.approve("m", "c", "bash", Safety::Write, &v).await);
-    assert!(!a.approve("m", "c", "bash", Safety::Sensitive, &v).await);
-    assert!(!a.approve("m", "c", "bash", Safety::Dangerous, &v).await);
+    assert!(matches!(
+        a.approve("m", "c", "bash", Safety::Write, &v).await,
+        ApprovalOutcome::Denied(_)
+    ));
+    assert!(matches!(
+        a.approve("m", "c", "bash", Safety::Sensitive, &v).await,
+        ApprovalOutcome::Denied(_)
+    ));
+    assert!(matches!(
+        a.approve("m", "c", "bash", Safety::Dangerous, &v).await,
+        ApprovalOutcome::Denied(_)
+    ));
 }
 
 // ── ChannelMap ───────────────────────────────────────────────────────────────
@@ -112,9 +133,13 @@ impl Approver for RecordingApprover {
         _tool: &str,
         _safety: Safety,
         _args: &serde_json::Value,
-    ) -> bool {
+    ) -> ApprovalOutcome {
         self.consulted.store(true, Ordering::SeqCst);
-        self.decision
+        if self.decision {
+            ApprovalOutcome::Allowed
+        } else {
+            ApprovalOutcome::Denied(ff_agent::DenyReason::User)
+        }
     }
 }
 

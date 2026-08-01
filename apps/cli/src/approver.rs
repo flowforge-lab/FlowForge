@@ -8,7 +8,7 @@ use std::io::{self, IsTerminal, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
-use ff_agent::Approver;
+use ff_agent::{ApprovalOutcome, Approver, DenyReason};
 use ff_core::Mode;
 use ff_tools::Safety;
 
@@ -116,7 +116,7 @@ impl Approver for CliApprover {
         name: &str,
         safety: Safety,
         args: &serde_json::Value,
-    ) -> bool {
+    ) -> ApprovalOutcome {
         let label = match safety {
             Safety::Write => "write",
             Safety::Sensitive => "sensitive",
@@ -128,44 +128,51 @@ impl Approver for CliApprover {
         let pretty = serde_json::to_string_pretty(args).unwrap_or_else(|_| args.to_string());
         eprintln!("{pretty}");
 
-        let approved = match Self::decide(self.agent_mode, self.policy, Self::input_mode(), safety)
-        {
+        let outcome = match Self::decide(self.agent_mode, self.policy, Self::input_mode(), safety) {
             ApprovalDecision::Allow => {
                 if self.policy == ApprovalMode::Yes {
                     eprintln!("[approval] auto-approved by --yes");
                 } else {
                     eprintln!("[approval] auto-approved (auto mode)");
                 }
-                true
+                ApprovalOutcome::Allowed
             }
-            ApprovalDecision::Deny => {
-                match self.policy {
-                    ApprovalMode::Deny => eprintln!("[approval] auto-denied by --deny"),
-                    ApprovalMode::Prompt => {
-                        eprintln!(
-                            "[approval] no interactive terminal and no --yes/--deny flag; denying"
-                        );
-                    }
-                    ApprovalMode::Yes => {}
+            ApprovalDecision::Deny => match self.policy {
+                ApprovalMode::Deny => {
+                    eprintln!("[approval] auto-denied by --deny");
+                    ApprovalOutcome::Denied(DenyReason::NoInteractiveTerminal)
                 }
-                false
-            }
+                ApprovalMode::Prompt => {
+                    eprintln!(
+                        "[approval] no interactive terminal and no --yes/--deny flag; denying"
+                    );
+                    ApprovalOutcome::Denied(DenyReason::NoInteractiveTerminal)
+                }
+                ApprovalMode::Yes => {
+                    unreachable!("--yes always allows")
+                }
+            },
             ApprovalDecision::Prompt => {
                 eprint!("[approval] allow this call? [y/N] ");
                 let _ = io::stderr().flush();
                 let mut line = String::new();
-                if io::stdin().read_line(&mut line).is_err() {
+                let approved = if io::stdin().read_line(&mut line).is_err() {
                     false
                 } else {
                     matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+                };
+                if approved {
+                    ApprovalOutcome::Allowed
+                } else {
+                    ApprovalOutcome::Denied(DenyReason::User)
                 }
             }
         };
 
-        if !approved {
+        if !matches!(outcome, ApprovalOutcome::Allowed) {
             self.denied.store(true, Ordering::Relaxed);
         }
-        approved
+        outcome
     }
 
     async fn ask(

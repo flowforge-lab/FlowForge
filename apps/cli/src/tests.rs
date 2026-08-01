@@ -7,7 +7,7 @@ use crate::test_support::TestEnv;
 use async_trait::async_trait;
 use clap::CommandFactory;
 use clap::Parser;
-use ff_agent::{run_turn, AgentEvent, Approver, CancelToken, ToolContext};
+use ff_agent::{run_turn, AgentEvent, ApprovalOutcome, Approver, CancelToken, ToolContext};
 use ff_core::{PermissionMatrix, Phenotype, ReasoningVisibility, Role};
 use ff_llm::{ChatRequest, Chunk, ChunkStream, LlmError, Provider};
 use ff_memory::{Memory, MemoryConfig};
@@ -122,8 +122,8 @@ impl Approver for TestApprover {
         _name: &str,
         _safety: Safety,
         _args: &serde_json::Value,
-    ) -> bool {
-        true
+    ) -> ApprovalOutcome {
+        ApprovalOutcome::Allowed
     }
 }
 

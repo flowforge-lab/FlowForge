@@ -16,7 +16,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use ff_agent::Approver;
+use ff_agent::{ApprovalOutcome, Approver};
 use ff_core::permission::ArgMatcher;
 use ff_core::{Mode, PermissionCell, PermissionMatrix, PermissionRule, RuleEffect, Safety};
 use ff_transport::ChannelId;
@@ -103,7 +103,7 @@ async fn act_mode_publish_is_denied_even_though_the_matrix_allows_it() {
         .await;
 
     assert!(
-        !decision,
+        matches!(decision, ApprovalOutcome::Denied(_)),
         "a shared channel button must not authorize Publish"
     );
     // `.expect(0)` verifies on drop that we did not even ask.
@@ -131,7 +131,7 @@ async fn act_mode_dangerous_is_denied_without_prompting() {
         )
         .await;
 
-    assert!(!decision);
+    assert!(matches!(decision, ApprovalOutcome::Denied(_)));
 }
 
 #[tokio::test]
@@ -144,7 +144,7 @@ async fn the_override_holds_in_every_mode() {
                 .approve("t", "c", "tool", safety, &serde_json::json!({}))
                 .await;
             assert!(
-                !decision,
+                matches!(decision, ApprovalOutcome::Denied(_)),
                 "{mode:?}/{safety:?} must be denied over a channel button"
             );
         }
@@ -164,7 +164,7 @@ async fn readonly_is_allowed_without_prompting() {
         .approve("m1", "c1", "view", Safety::ReadOnly, &serde_json::json!({}))
         .await;
 
-    assert!(decision);
+    assert!(matches!(decision, ApprovalOutcome::Allowed));
 }
 
 #[tokio::test]
@@ -183,7 +183,7 @@ async fn plan_mode_write_is_denied_without_prompting() {
         .approve("m1", "c1", "write", Safety::Write, &serde_json::json!({}))
         .await;
 
-    assert!(!decision);
+    assert!(matches!(decision, ApprovalOutcome::Denied(_)));
 }
 
 #[tokio::test]
@@ -203,7 +203,7 @@ async fn auto_mode_write_stays_autonomous() {
         .approve("m1", "c1", "write", Safety::Write, &serde_json::json!({}))
         .await;
 
-    assert!(decision);
+    assert!(matches!(decision, ApprovalOutcome::Allowed));
 }
 
 // ---------------------------------------------------------------------------
@@ -219,7 +219,7 @@ async fn approve_with_reply(
         mpsc::Sender<SlackInteraction>,
         String,
     ) -> futures_util::future::BoxFuture<'static, ()>,
-) -> bool {
+) -> ApprovalOutcome {
     // Premise, asserted rather than remembered: this mode/safety pair must land on
     // an `Ask` cell, otherwise the prompt path is never taken and every assertion
     // below passes for the wrong reason. `Act/Sensitive` is `Allow`, not `Ask` —
@@ -277,7 +277,7 @@ async fn prompt_renders_buttons_and_an_approve_click_resolves_true() {
         },
     )
     .await;
-    assert!(decision);
+    assert!(matches!(decision, ApprovalOutcome::Allowed));
 }
 
 #[tokio::test]
@@ -296,7 +296,7 @@ async fn a_deny_click_resolves_false() {
         },
     )
     .await;
-    assert!(!decision);
+    assert!(matches!(decision, ApprovalOutcome::Denied(_)));
 }
 
 #[tokio::test]
@@ -328,7 +328,7 @@ async fn a_stale_click_is_discarded_and_does_not_answer_the_current_prompt() {
     )
     .await;
     assert!(
-        !decision,
+        matches!(decision, ApprovalOutcome::Denied(_)),
         "the awaited prompt said Deny; a stale Approve must not have answered for it"
     );
 }
@@ -350,7 +350,10 @@ async fn no_click_within_the_timeout_denies() {
         )
         .await;
 
-    assert!(!decision, "an unanswered prompt must fail closed");
+    assert!(
+        matches!(decision, ApprovalOutcome::Denied(_)),
+        "an unanswered prompt must fail closed"
+    );
 }
 
 #[tokio::test]
@@ -372,7 +375,7 @@ async fn a_closed_interaction_channel_denies() {
         )
         .await;
 
-    assert!(!decision);
+    assert!(matches!(decision, ApprovalOutcome::Denied(_)));
     assert!(
         started.elapsed() < Duration::from_millis(190),
         "a closed channel should deny immediately, not wait out the timeout"
@@ -405,7 +408,7 @@ async fn a_failed_prompt_post_denies() {
         .await;
 
     assert!(
-        !decision,
+        matches!(decision, ApprovalOutcome::Denied(_)),
         "a prompt that never reached Slack must not allow"
     );
 }
@@ -436,15 +439,18 @@ async fn each_prompt_gets_a_distinct_token_so_a_retry_cannot_be_answered_by_an_o
         let _ = t1.send(interaction(ACTION_APPROVE, Some("c1#0"))).await;
     });
     assert!(
-        approver
-            .approve(
-                "m1",
-                "c1",
-                "tool",
-                Safety::Sensitive,
-                &serde_json::json!({})
-            )
-            .await,
+        matches!(
+            approver
+                .approve(
+                    "m1",
+                    "c1",
+                    "tool",
+                    Safety::Sensitive,
+                    &serde_json::json!({})
+                )
+                .await,
+            ApprovalOutcome::Allowed
+        ),
         "first prompt is answered by its own token"
     );
 
@@ -455,15 +461,18 @@ async fn each_prompt_gets_a_distinct_token_so_a_retry_cannot_be_answered_by_an_o
         let _ = t2.send(interaction(ACTION_APPROVE, Some("c1#0"))).await;
     });
     assert!(
-        !approver
-            .approve(
-                "m1",
-                "c1",
-                "tool",
-                Safety::Sensitive,
-                &serde_json::json!({})
-            )
-            .await,
+        matches!(
+            approver
+                .approve(
+                    "m1",
+                    "c1",
+                    "tool",
+                    Safety::Sensitive,
+                    &serde_json::json!({})
+                )
+                .await,
+            ApprovalOutcome::Denied(_)
+        ),
         "the retry must not be authorized by a replay of the first prompt's token"
     );
 }
@@ -517,7 +526,10 @@ async fn a_scoped_deny_rule_vetoes_without_prompting() {
         )
         .await;
 
-    assert!(!decision, "a scoped Deny rule must veto");
+    assert!(
+        matches!(decision, ApprovalOutcome::Denied(_)),
+        "a scoped Deny rule must veto"
+    );
 }
 
 /// The Allow direction, so the fix cannot be faked by hard-coding a Deny.
@@ -553,7 +565,10 @@ async fn a_scoped_allow_rule_auto_approves_without_prompting() {
         )
         .await;
 
-    assert!(decision, "a scoped Allow rule must auto-approve");
+    assert!(
+        matches!(decision, ApprovalOutcome::Allowed),
+        "a scoped Allow rule must auto-approve"
+    );
 }
 
 /// A rule whose matcher does not match must change nothing — otherwise the two
@@ -588,7 +603,7 @@ async fn a_non_matching_scoped_rule_still_prompts() {
     replier.await.expect("replier");
 
     assert!(
-        decision,
+        matches!(decision, ApprovalOutcome::Allowed),
         "a non-matching rule must fall through to the prompt"
     );
 }
@@ -645,7 +660,7 @@ async fn the_prompt_shows_the_resolved_argument() {
         )
         .await;
     replier.await.expect("replier");
-    assert!(decision);
+    assert!(matches!(decision, ApprovalOutcome::Allowed));
 
     let body = posts.lock().unwrap()[0].clone();
 
@@ -709,7 +724,7 @@ async fn a_settled_prompt_is_retired_with_the_posted_ts() {
         )
         .await;
     replier.await.expect("replier");
-    assert!(decision);
+    assert!(matches!(decision, ApprovalOutcome::Allowed));
     // `.expect(1)` on the update mock is verified on drop.
 }
 
@@ -795,7 +810,7 @@ async fn a_hostile_arg_cannot_forge_a_second_approval_card() {
         )
         .await;
     replier.await.expect("replier");
-    assert!(decision);
+    assert!(matches!(decision, ApprovalOutcome::Allowed));
 
     let body = posts.lock().unwrap()[0].clone();
 
@@ -929,7 +944,7 @@ async fn a_hostile_tool_name_cannot_forge_a_header_in_the_first_block() {
         )
         .await;
     replier.await.expect("replier");
-    assert!(decision);
+    assert!(matches!(decision, ApprovalOutcome::Allowed));
 
     let body = posts.lock().unwrap()[0].clone();
     let header = body["blocks"][0]["text"]["text"]
