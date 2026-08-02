@@ -561,16 +561,17 @@ async fn run(
         Some(idx) => memory_store.ambient_block_filtered_keyed(idx.as_ref()),
         None => (memory_store.ambient_block(), Vec::new()),
     };
-    let system_prompt = ff_agent::build_system_prompt(
-        inputs.persona.as_deref(),
-        &skills,
-        &inputs.active,
-        &user_ctx,
-        memory.as_deref(),
-        None,
-        None,
+    let system_prompt = ff_agent::build_system_prompt(&ff_agent::SystemPromptInputs {
+        persona: inputs.persona.as_deref(),
+        skills: &skills,
+        active: &inputs.active,
+        user: &user_ctx,
+        memory: memory.as_deref(),
+        extra_instructions: None,
+        goal: None,
         mode,
-    );
+        mcp_guidance: &[],
+    });
 
     let matrix = PermissionMatrix::default();
     let mut tool_ctx = ToolContext::new(
@@ -779,16 +780,17 @@ async fn chat_repl(
             Some(idx) => memory_store.ambient_block_filtered_keyed(idx.as_ref()),
             None => (memory_store.ambient_block(), Vec::new()),
         };
-        let system_prompt = ff_agent::build_system_prompt(
-            None,
+        let system_prompt = ff_agent::build_system_prompt(&ff_agent::SystemPromptInputs {
+            persona: None,
             skills,
-            &[],
-            &user_ctx,
-            memory.as_deref(),
-            None,
-            None,
+            active: &[],
+            user: &user_ctx,
+            memory: memory.as_deref(),
+            extra_instructions: None,
+            goal: None,
             mode,
-        );
+            mcp_guidance: &[],
+        });
 
         let cancel = CancelToken::new();
         let cancel_signal = cancel.clone();

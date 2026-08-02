@@ -16,8 +16,13 @@ the fallback, not the default.
   pr_request_review, issue_view, issue_list, issue_create, issue_edit,
   issue_comment, push). Not `bash gh ...`.
 - **Git queries → the `git` tool** (status, diff, log, show). Not `bash git ...`.
-- **Reading code → codegraph** (codegraph_explore / callers / callees / impact)
-  before grep/glob/read.
+- **Reading code → `codegraph_explore`** before grep/glob/read (run `tool_search`
+  first — like `test_runner` it is not in the default set). It is the only tool
+  codegraph advertises: upstream deliberately unlists the narrower ones
+  (`codegraph_callers`, `_callees`, `_impact`, `_search`, `_node`, `_files`,
+  `_status`) unless `CODEGRAPH_MCP_TOOLS` re-enables them, because what they
+  returned now arrives inline. Do not call one you have not seen in your own tool
+  list — send a second focused `explore` instead of falling back to grep.
 - **Running tests → `test_runner`** (run `tool_search` first — it is not in the
   default tool set). **Compile-checking → `diagnostics`** (`cargo check`).
 - **Files → view / edit / apply_patch / write**, and grep / glob / tree — not

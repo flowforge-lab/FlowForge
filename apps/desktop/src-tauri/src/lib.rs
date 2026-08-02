@@ -1633,6 +1633,7 @@ fn spawn_assistant_turn(
         // phenotype's declared skills; an unbound session keeps the global active
         // set so the command palette still affects turns. See `turn_active_skills`.
         let active: Vec<String> = state.turn_active_skills(&sid);
+        let mcp_guidance = state.mcp_guidance(&sid);
         let (inject_mem, extra_instructions) = state.turn_prompt_injection(&session_root);
         // Fold any deferred observer wakes into the turn's request-only
         // instructions (#1018 Path B): they ride in the volatile system
@@ -1649,16 +1650,17 @@ fn spawn_assistant_turn(
         } else {
             (None, vec![])
         };
-        let system_prompt = ff_agent::build_system_prompt(
-            persona.as_deref(),
-            &skills,
-            &active,
-            &user_ctx,
-            memory.as_deref(),
-            extra_instructions.as_deref(),
-            None,
+        let system_prompt = ff_agent::build_system_prompt(&ff_agent::SystemPromptInputs {
+            persona: persona.as_deref(),
+            skills: &skills,
+            active: &active,
+            user: &user_ctx,
+            memory: memory.as_deref(),
+            extra_instructions: extra_instructions.as_deref(),
+            goal: None,
             mode,
-        );
+            mcp_guidance: &mcp_guidance,
+        });
 
         // Telemetry (RFC 0001 §8): one SkillActivated per active skill, plus a
         // wall-clock start and a per-turn metrics accumulator the event closure
@@ -2151,6 +2153,7 @@ impl GoalIteration for GoalLoopIteration {
         let user_ctx =
             ff_agent::UserContext::now().with_working_dir(session_root.display().to_string());
         let active: Vec<String> = self.state.turn_active_skills(&sid);
+        let mcp_guidance = self.state.mcp_guidance(&sid);
         let (inject_mem, extra_instructions) = self.state.turn_prompt_injection(&session_root);
         let (memory, _ambient_keys) = if inject_mem {
             self.state
@@ -2159,16 +2162,17 @@ impl GoalIteration for GoalLoopIteration {
         } else {
             (None, vec![])
         };
-        let system_prompt = ff_agent::build_system_prompt(
-            persona.as_deref(),
-            &skills,
-            &active,
-            &user_ctx,
-            memory.as_deref(),
-            extra_instructions.as_deref(),
-            Some(goal),
+        let system_prompt = ff_agent::build_system_prompt(&ff_agent::SystemPromptInputs {
+            persona: persona.as_deref(),
+            skills: &skills,
+            active: &active,
+            user: &user_ctx,
+            memory: memory.as_deref(),
+            extra_instructions: extra_instructions.as_deref(),
+            goal: Some(goal),
             mode,
-        );
+            mcp_guidance: &mcp_guidance,
+        });
 
         provider.set_context_budget(self.state.served_window(&sid).await.window);
 
@@ -2500,6 +2504,7 @@ impl ff_scheduled::TaskRunner for DesktopTaskRunner {
         let user_ctx =
             ff_agent::UserContext::now().with_working_dir(session_root.display().to_string());
         let active: Vec<String> = self.state.turn_active_skills(&sid);
+        let mcp_guidance = self.state.mcp_guidance(&sid);
         let (inject_mem, extra_instructions) = self.state.turn_prompt_injection(&session_root);
         let (memory, _ambient_keys) = if inject_mem {
             self.state
@@ -2508,16 +2513,17 @@ impl ff_scheduled::TaskRunner for DesktopTaskRunner {
         } else {
             (None, vec![])
         };
-        let system_prompt = ff_agent::build_system_prompt(
-            pheno.persona.as_deref(),
-            &skills,
-            &active,
-            &user_ctx,
-            memory.as_deref(),
-            extra_instructions.as_deref(),
-            None,
+        let system_prompt = ff_agent::build_system_prompt(&ff_agent::SystemPromptInputs {
+            persona: pheno.persona.as_deref(),
+            skills: &skills,
+            active: &active,
+            user: &user_ctx,
+            memory: memory.as_deref(),
+            extra_instructions: extra_instructions.as_deref(),
+            goal: None,
             mode,
-        );
+            mcp_guidance: &mcp_guidance,
+        });
 
         // Prime the compaction budget against the served context window (#612),
         // mirroring the interactive `send_message` path; Ollama uses the cached

@@ -144,16 +144,17 @@ impl GoalIteration for CliGoalIteration {
             None => (memory_store.ambient_block(), Vec::new()),
         };
 
-        let system_prompt = ff_agent::build_system_prompt(
-            None,
-            &load_skills(),
-            &[],
-            &user_ctx,
-            memory.as_deref(),
-            None,
-            Some(goal),
-            Mode::Auto,
-        );
+        let system_prompt = ff_agent::build_system_prompt(&ff_agent::SystemPromptInputs {
+            persona: None,
+            skills: &load_skills(),
+            active: &[],
+            user: &user_ctx,
+            memory: memory.as_deref(),
+            extra_instructions: None,
+            goal: Some(goal),
+            mode: Mode::Auto,
+            mcp_guidance: &[],
+        });
 
         let cancel = self.cancel_token.clone().unwrap_or_default();
 

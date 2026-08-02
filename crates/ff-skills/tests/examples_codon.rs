@@ -16,6 +16,41 @@ fn examples_dir() -> PathBuf {
         .join("docs/examples/codon")
 }
 
+fn repo_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
+}
+
+/// Every file that steers an agent toward codegraph, whatever tree it lives in.
+///
+/// This list is the guard's *scope*, and the scope is the part that failed. #1170
+/// corrected `docs/examples/codon` and left `AGENTS.md:19` advertising
+/// `callers`/`callees`/`impact`, because the phantom scan only ever walked
+/// `examples_dir()` -- so the stale copy was not wrong-but-caught, it was
+/// structurally invisible (#1173). `AGENTS.md` is the worse place to miss: it
+/// rides the volatile prompt tail and is re-sent every turn, while the codon
+/// persona sits in the cached stable prefix.
+///
+/// Add a file here whenever it starts naming codegraph tools; a doc outside this
+/// list is a doc the guard cannot see.
+fn codegraph_steering_docs() -> Vec<(&'static str, PathBuf)> {
+    vec![
+        (
+            "docs/examples/codon/skills/codegraph/SKILL.md",
+            examples_dir().join("skills/codegraph/SKILL.md"),
+        ),
+        (
+            "docs/examples/codon/skills/pr-review/SKILL.md",
+            examples_dir().join("skills/pr-review/SKILL.md"),
+        ),
+        (
+            "docs/examples/codon/phenos/codon.toml",
+            examples_dir().join("phenos/codon.toml"),
+        ),
+        ("AGENTS.md", repo_root().join("AGENTS.md")),
+        ("CONTRIBUTING.md", repo_root().join("CONTRIBUTING.md")),
+    ]
+}
+
 #[test]
 fn codon_phenotype_loads_and_declares_codegraph() {
     let (phenos, errors) = load_phenotypes(&examples_dir().join("phenos"));
@@ -260,13 +295,8 @@ fn phantom_names_only_appear_as_warnings() {
     // bytes and a mutation that stripped the warning still passed, because a marker
     // in the neighbouring bullet fell inside the window. A phantom is only safe when
     // the prose *around it* rejects it, so the unit has to be the paragraph.
-    for rel in [
-        "skills/codegraph/SKILL.md",
-        "skills/pr-review/SKILL.md",
-        "phenos/codon.toml",
-    ] {
-        let text = std::fs::read_to_string(examples_dir().join(rel))
-            .unwrap_or_else(|e| panic!("read {rel}: {e}"));
+    for (rel, path) in codegraph_steering_docs() {
+        let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {rel}: {e}"));
         for stem in PHANTOM_TOOLS_NAMED_AS_WARNINGS {
             let needle = format!("codegraph_{stem}");
             for para in warning_scopes(&text) {
@@ -297,6 +327,33 @@ fn phantom_names_only_appear_as_warnings() {
                     "{rel} lists phantom shorthand {needle} in a paragraph that does not \
                      mark it unavailable; the paragraph must contain one of \
                      {WARNING_MARKERS:?}.\n--- paragraph ---\n{para}"
+                );
+            }
+        }
+
+        // Third form, and the one that actually shipped: a bare word in a
+        // slash-separated list keyed off a nearby "codegraph", as in #1173's
+        // `codegraph (codegraph_explore / callers / callees / impact)`. Neither the
+        // `codegraph_` scanner nor the `` `_stem` `` scanner matches "callers" there,
+        // so the real regression sat in `AGENTS.md` fully green -- widening the file
+        // list alone would not have caught it. Only inspect paragraphs that mention
+        // codegraph, so ordinary English ("the callers of this function") stays legal.
+        for stem in PHANTOM_TOOLS_NAMED_AS_WARNINGS {
+            for para in warning_scopes(&text) {
+                if !para.contains("codegraph") {
+                    continue;
+                }
+                let bare_listed = para.contains(&format!("/ {stem}"))
+                    || para.contains(&format!("{stem} /"))
+                    || para.contains(&format!("/ {stem})"));
+                if !bare_listed {
+                    continue;
+                }
+                assert!(
+                    WARNING_MARKERS.iter().any(|m| para.contains(m)),
+                    "{rel} lists bare `{stem}` alongside codegraph as if it were \
+                     callable; the paragraph must contain one of {WARNING_MARKERS:?}.\n\
+                     --- paragraph ---\n{para}"
                 );
             }
         }

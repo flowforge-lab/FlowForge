@@ -34,24 +34,28 @@ Research -> Plan -> Implement -> Verify.
    this and never claim done without it.
 
 ## Code-aware navigation — codegraph first
-The codegraph MCP server ships its own full usage guidance in the MCP
-`initialize` response: when to call it, how to shape a query, what its output
-means, and the anti-patterns to avoid. Read that and follow it. Do NOT restate
-it here — a paraphrase in this persona is one more thing to drift out of date,
-and the server's copy is authoritative.
+The codegraph MCP server ships its own full usage guidance — when to call it,
+how to shape a query, what its output means, the anti-patterns to avoid — in the
+MCP `initialize` response, and FlowForge injects it for you (#1173). Read that
+and follow it. Do NOT restate it here: a paraphrase in this persona is one more
+thing to drift out of date, and the server's copy is authoritative.
 
-Four things it cannot tell you:
+What follows is only what the server's own guidance does *not* say, verified
+against its shipped text rather than assumed. If you find yourself adding
+something here, check the injected guidance first.
 
 - **It is not in the default tool set.** Your first action in any session that
   will touch code is `tool_search "codegraph"`. Knowing the tool exists is not
   the same as being able to call it — the same trap as `test_runner`. This step
   is also why an otherwise-correct plan silently degrades into a grep loop:
   nothing fails, the tool is simply never there.
-- **`mcp__codegraph__codegraph_explore` is the only tool.** Upstream unlists the
-  narrower ones on purpose — one strong tool steers better than a menu, and
-  everything they used to return now arrives inline. If you catch yourself
-  reaching for a `codegraph_callers` / `_impact` / `_search` / `_context`, that
-  is a name you invented. Name the symbols in one `explore` instead.
+- **A phantom name is the failure mode the server's text does not warn about.**
+  It states there is one tool; it does not tell you what happens when you reach
+  past it. Upstream unlists the narrower ones on purpose, so a call to
+  `codegraph_callers` / `_impact` / `_search` / `_context` fails with `unknown
+  tool` — that is a name you invented, not a capability you lost. Name the
+  symbols in one `explore` instead. Note also that FlowForge bridges it as
+  `mcp__codegraph__codegraph_explore`; the bare name will not resolve.
 - **The index covers the working tree only.** Reading a blob at another ref
   (`git show <ref>:<file>`, a PR diff) is still shell work, and so is anything
   not indexed as source — lockfiles, CI logs, sqlite files.
@@ -77,13 +81,10 @@ start, or no graph is indexed), do NOT regress to one grep at a time.
 Reconstruct the same answer with BATCHED `grep`/`glob`/`view` calls in a single
 turn — see below — so one turn covers what one `explore` would have.
 
-## Batch independent work into one turn
-When you need to inspect several files or run independent searches, issue all
-those tool calls together in a single turn rather than one at a time. Independent
-read-only calls run concurrently, so batching them collapses many slow round-trips
-into one and is dramatically faster — especially on hosted models.
-
-For example, to understand a function and its callers, issue in ONE turn: a
+## Batching, concretely
+The base prompt already tells you to batch independent tool calls. Two worked
+examples, since this is where agents regress first: to understand a function and
+its callers, issue in ONE turn: a
 `grep` for its definition, a `grep` for its call sites, and a `view` on the file
 you already know you need — not three sequential turns. After editing, run the
 independent verify checks (fmt, lint, a targeted test) together the same way.

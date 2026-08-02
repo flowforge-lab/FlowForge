@@ -72,6 +72,17 @@ pub struct PublishedTool {
 /// Rebuilt by the actor whenever the running tool set changes; readers never block.
 pub type SharedTools = Arc<RwLock<Vec<PublishedTool>>>;
 
+/// The `instructions` each Running server sent in its `initialize` response,
+/// keyed by the instance that sent it (#1173).
+///
+/// Deliberately its own channel rather than a field on [`McpServerStatus`]: that
+/// type is UI state exported to TS bindings, and prompt text is not UI state.
+/// Deliberately keyed by [`InstanceKey`] rather than by the bridged tool name,
+/// because the bridge sanitises only the *tool* segment of
+/// `mcp__<server>__<tool>` and leaves the server id verbatim -- an id containing
+/// `__` makes that name ambiguous to split.
+pub type SharedInstructions = Arc<RwLock<Vec<(InstanceKey, String)>>>;
+
 /// How long a single graceful `shutdown` may take before we give up and drop the
 /// client, letting `process_wrap`'s kill-on-drop reap the child. Bounds app-exit
 /// latency so one wedged server can't stall the whole quit.
@@ -139,6 +150,9 @@ pub struct SupervisorHandle {
     pub status: SharedStatus,
     /// The flat tool list across all `Running` servers, kept current by the actor.
     pub tools: SharedTools,
+    /// Per-server `initialize` instructions across all `Running` servers, kept
+    /// current by the actor (#1173).
+    pub instructions: SharedInstructions,
     /// Ticked (coalescing) by the actor on every `publish`, so the desktop shell can
     /// forward a `mcp:status-changed` event without polling. Carries no data — readers
     /// re-snapshot via [`status_snapshot`](Self::status_snapshot).
@@ -162,6 +176,7 @@ impl SupervisorHandle {
             cmd_tx,
             status: SharedStatus::default(),
             tools: SharedTools::default(),
+            instructions: SharedInstructions::default(),
             status_rx,
             cancel_tx: Arc::new(cancel_tx),
         }
@@ -178,6 +193,20 @@ impl SupervisorHandle {
     /// Cheap read (clone of the shared vec under a read lock).
     pub fn tools_snapshot(&self) -> Vec<PublishedTool> {
         self.tools.read().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
+    /// A snapshot of the `initialize` instructions of every `Running` server that
+    /// sent any (#1173). Cheap read, like [`tools_snapshot`](Self::tools_snapshot).
+    ///
+    /// The text is **untrusted** -- a third-party process wrote it to steer the
+    /// model -- so a caller that injects it owes the reader a provenance marker and
+    /// a byte cap. Servers that send nothing are simply absent; that is the common
+    /// case, not an error.
+    pub fn instructions_snapshot(&self) -> Vec<(InstanceKey, String)> {
+        self.instructions
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
     }
 
     /// A snapshot of every server's status, id-sorted. Cheap read (clone of the shared
@@ -396,6 +425,7 @@ pub fn spawn(
 ) -> SupervisorHandle {
     let status: SharedStatus = Arc::new(RwLock::new(Vec::new()));
     let tools: SharedTools = Arc::new(RwLock::new(Vec::new()));
+    let instructions: SharedInstructions = Arc::new(RwLock::new(Vec::new()));
     let (cmd_tx, cmd_rx) = mpsc::channel::<Cmd>(16);
     let (status_tx, status_rx) = watch::channel(());
     let (cancel_tx, cancel_rx) = watch::channel(false);
@@ -406,6 +436,7 @@ pub fn spawn(
         shared_config,
         status: Arc::clone(&status),
         tools: Arc::clone(&tools),
+        instructions: Arc::clone(&instructions),
         status_tx,
         cmd_rx,
         change_rx,
@@ -416,6 +447,7 @@ pub fn spawn(
         cmd_tx,
         status,
         tools,
+        instructions,
         status_rx,
         cancel_tx: Arc::new(cancel_tx),
     }
@@ -431,6 +463,7 @@ struct Supervisor {
     shared_config: SharedConfig,
     status: SharedStatus,
     tools: SharedTools,
+    instructions: SharedInstructions,
     /// Coalescing change tick: sent on every `publish` so the desktop shell can forward
     /// a `mcp:status-changed` event without polling.
     status_tx: watch::Sender<()>,
@@ -931,6 +964,29 @@ impl Supervisor {
             })
             .collect();
         *self.tools.write().unwrap_or_else(|p| p.into_inner()) = all_tools;
+        // Same pass and same predicate as the tool list above, so guidance cannot
+        // outlive the connection that sent it. `None` is the common case (#1173) and
+        // is simply absent here.
+        //
+        // The `Running` filter is defence in depth, not the load-bearing check, and a
+        // mutation removing it stays green -- worth stating rather than leaving as a
+        // guard that looks tested and is not. Both non-Running paths already drop the
+        // client, so `h.client.as_ref()?` alone would suffice today: a stop removes
+        // the handle outright (`self.handles.remove`), and a crash `drop(client)`s
+        // before setting Restarting/Failed. Nor is there a Running-but-clientless
+        // window, since `h.client` is set before `h.state` on connect. Keep the filter
+        // so that a future path which retains a client across a non-Running state
+        // cannot silently start re-publishing that server's guidance.
+        let all_instructions: Vec<(InstanceKey, String)> = self
+            .handles
+            .iter()
+            .filter(|(_, h)| h.state == McpServerState::Running)
+            .filter_map(|(key, h)| {
+                let text = h.client.as_ref()?.instructions()?;
+                Some((key.clone(), text.to_string()))
+            })
+            .collect();
+        *self.instructions.write().unwrap_or_else(|p| p.into_inner()) = all_instructions;
         // Wake any status subscriber (the desktop shell's event forwarder). Coalescing
         // and lossless of intent: subscribers re-snapshot, so a missed intermediate
         // tick never matters. Ignore send errors (no subscribers is fine).

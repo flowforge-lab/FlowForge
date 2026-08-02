@@ -210,6 +210,27 @@ impl McpClient {
         &self.server_id
     }
 
+    /// The server's own usage guidance from the `initialize` response, if it sent
+    /// any.
+    ///
+    /// This is the server's authoritative account of when to reach for it and how
+    /// to read its output -- distinct from a tool's `description`, which only
+    /// covers one call. `rmcp` keeps the whole `InitializeResult` on the peer, so
+    /// this is a read of data already in hand, not another round-trip.
+    ///
+    /// `None` is ordinary, not a fault: of the three servers measured in #1173
+    /// (codegraph 4653 B, builder-mcp 918 B, obsidian none) one sends nothing at
+    /// all. Callers must treat absence as the common case.
+    ///
+    /// The text is **untrusted**: it comes from a third-party process and is
+    /// written to steer the model. Anything injecting it owes the reader a
+    /// provenance marker and a byte cap.
+    pub fn instructions(&self) -> Option<&str> {
+        self.service
+            .peer_info()
+            .and_then(|info| info.instructions.as_deref())
+    }
+
     /// Enumerate the server's tools, stamped with this server's id. Mapped into
     /// `ff-core::McpToolInfo` so callers never touch `rmcp` types.
     pub async fn list_tools(&self) -> Result<Vec<McpToolInfo>, McpError> {

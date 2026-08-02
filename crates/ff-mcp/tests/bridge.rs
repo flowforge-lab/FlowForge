@@ -288,3 +288,53 @@ fn namespaced_name_format() {
         "mcp__fs__read_file"
     );
 }
+
+/// Kept in sync with `bin/mcp_echo.rs`'s `ECHO_INSTRUCTIONS`. A bin target cannot
+/// be imported, so the literal is duplicated -- the assertion below fails loudly
+/// if they diverge, which is the point.
+const ECHO_INSTRUCTIONS: &str = "Echo server guidance: call `echo` to test the bridge.";
+
+#[tokio::test]
+async fn instructions_snapshot_carries_the_servers_initialize_text() {
+    // The end-to-end path this change exists for: a real child process sends
+    // `instructions` in its `initialize` response, and it survives the handshake,
+    // `rmcp`'s peer_info, the supervisor's publish, and the snapshot (#1173).
+    let shared: SharedConfig = Arc::new(RwLock::new(vec![echo_cfg()]));
+    let (_tx, change_rx) = mpsc::unbounded_channel::<()>();
+    let sup = spawn_supervisor(shared, change_rx, fast_config());
+
+    wait_running(&sup, Duration::from_secs(5)).await;
+
+    let snap = sup.instructions_snapshot();
+    assert_eq!(
+        snap.len(),
+        1,
+        "the one running server sent instructions: {snap:?}"
+    );
+    assert_eq!(snap[0].0.id, "echo", "keyed by the sending instance");
+    assert_eq!(
+        snap[0].1, ECHO_INSTRUCTIONS,
+        "the server's text must survive verbatim"
+    );
+
+    sup.stop_all().await;
+}
+
+#[tokio::test]
+async fn instructions_snapshot_empty_after_stop() {
+    // Guidance must not outlive the connection that sent it. It is filled in the
+    // same `publish` pass and behind the same `Running` predicate as the tool list,
+    // so a stopped server cannot leave stale text in the prompt prefix.
+    let shared: SharedConfig = Arc::new(RwLock::new(vec![echo_cfg()]));
+    let (_tx, change_rx) = mpsc::unbounded_channel::<()>();
+    let sup = spawn_supervisor(shared, change_rx, fast_config());
+
+    wait_running(&sup, Duration::from_secs(5)).await;
+    assert!(!sup.instructions_snapshot().is_empty());
+
+    sup.stop_all().await;
+    assert!(
+        sup.instructions_snapshot().is_empty(),
+        "guidance must not outlive the connection"
+    );
+}

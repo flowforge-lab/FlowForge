@@ -19,6 +19,136 @@ use minijinja::{Environment, Value};
 use serde::Serialize;
 use std::sync::LazyLock;
 
+/// Per-server cap on injected MCP `initialize` guidance (#1173).
+///
+/// 1.76x the largest value measured across the three configured servers
+/// (codegraph 4653 B, builder-mcp 918 B, obsidian none), so real guidance fits
+/// and a runaway server does not.
+pub const MAX_MCP_INSTRUCTIONS_BYTES: usize = 8 * 1024;
+
+/// Cap across *all* servers' guidance combined.
+///
+/// A per-server cap alone does not bound server *count*: three servers at the
+/// per-server cap would already be ~6700 tokens of stable prefix.
+pub const MAX_MCP_INSTRUCTIONS_TOTAL_BYTES: usize = 16 * 1024;
+
+const MCP_TRUNCATION_MARKER: &str =
+    "\n[... truncated: server guidance exceeded the injection budget]";
+
+/// Fit one server's guidance to `budget` bytes, truncating on a char boundary.
+///
+/// Truncates rather than dropping because the highest-value content is up front:
+/// codegraph's "there is a single tool" sits in its opening section, and dropping
+/// the whole block to save its tail loses the part that mattered. Callers get a
+/// visible marker so the model can tell "the server said this much" from "the
+/// server stopped mid-sentence".
+///
+/// This deliberately does **not** follow `MAX_EXTRA_INSTRUCTIONS_BYTES`, which
+/// warns and injects anyway. That policy's stated reason is honoring *the user's*
+/// explicit instruction; MCP guidance is text from a third-party process the user
+/// never read, so the premise does not transfer.
+fn fit_mcp_instructions(text: &str, budget: usize) -> Option<String> {
+    let text = text.trim();
+    if text.is_empty() || budget == 0 {
+        return None;
+    }
+    if text.len() <= budget {
+        return Some(text.to_string());
+    }
+    // Reserve room for the marker. If the budget cannot hold the marker plus at
+    // least one byte of body, drop the whole block instead of emitting a bare
+    // prefix: an unmarked fragment reads to the model as the server's complete
+    // instructions, which is worse than absent guidance -- it would act on a
+    // sentence that stops mid-clause believing it saw the whole contract. The
+    // caller counts these as `dropped`, so the loss is still reported.
+    let body_budget = budget.saturating_sub(MCP_TRUNCATION_MARKER.len());
+    if body_budget == 0 {
+        return None;
+    }
+    // Byte slicing must land on a char boundary or this panics on any
+    // multi-byte character. Backing up to a boundary can consume the entire
+    // body budget (a single wide char wider than the budget), which is the
+    // second way this returns `None` for the same reason as above.
+    let mut end = body_budget.min(text.len());
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    if end == 0 {
+        return None;
+    }
+    Some(format!("{}{}", &text[..end], MCP_TRUNCATION_MARKER))
+}
+
+/// One server's guidance, already admitted and ready to inject.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpGuidance {
+    /// The server id, shown to the model so it can attribute the advice.
+    pub server: String,
+    /// The server's `instructions`, as sent.
+    pub text: String,
+}
+
+/// Whether a server's guidance is worth injecting: can the model reach its tools
+/// this turn?
+///
+/// Two independent ways in, and missing either one is a silent bug:
+///
+/// - `standing` -- the server has at least one non-deferred tool, so its tools are
+///   in the block from turn one and no admission ever happens for them.
+/// - `admitted` -- a deferred server whose tools `tool_search` has since admitted.
+///
+/// Gating on `admitted` alone permanently suppresses the guidance of every
+/// `defer = false` server, which is precisely the set an operator opted into
+/// keeping resident. Gating on neither injects advice for tools the model cannot
+/// call.
+///
+/// `admitted` holds bridged names (`mcp__<server>__<tool>`); the match is by
+/// prefix from a known server id, never by splitting a name, because the bridge
+/// leaves the server segment verbatim and an id containing `__` has no
+/// unambiguous split.
+pub fn server_guidance_is_reachable(
+    server_id: &str,
+    standing_server_ids: &std::collections::HashSet<String>,
+    admitted_tool_names: &std::collections::HashSet<String>,
+) -> bool {
+    if standing_server_ids.contains(server_id) {
+        return true;
+    }
+    let prefix = format!("mcp__{server_id}__");
+    admitted_tool_names.iter().any(|n| n.starts_with(&prefix))
+}
+
+/// Apply both caps to the admitted servers' guidance, in the order given.
+///
+/// Order is the caller's: it must be deterministic for the stable prefix to stay
+/// byte-identical across turns (RFC 0024 §276). Servers are consumed in order
+/// until the total budget is exhausted, so a stable input order yields stable
+/// output bytes.
+///
+/// Returns the fitted list plus the number of servers dropped entirely, which the
+/// caller should surface -- silent omission gives no signal that the model is
+/// missing a server's guidance.
+pub fn fit_mcp_guidance(guidance: &[McpGuidance]) -> (Vec<McpGuidance>, usize) {
+    let mut out: Vec<McpGuidance> = Vec::new();
+    let mut spent = 0usize;
+    let mut dropped = 0usize;
+    for g in guidance {
+        let remaining = MAX_MCP_INSTRUCTIONS_TOTAL_BYTES.saturating_sub(spent);
+        let budget = MAX_MCP_INSTRUCTIONS_BYTES.min(remaining);
+        match fit_mcp_instructions(&g.text, budget) {
+            Some(text) => {
+                spent += text.len();
+                out.push(McpGuidance {
+                    server: g.server.clone(),
+                    text,
+                });
+            }
+            None => dropped += 1,
+        }
+    }
+    (out, dropped)
+}
+
 /// Process-wide template environment, compiled from the inline `.jinja` files
 /// once at first use. The bodies are `include_str!`'d at build time, so the
 /// deployed binary carries both templates without any runtime fs dependency and
@@ -151,11 +281,61 @@ impl SystemPrompt {
     }
 }
 
-/// Build the system prompt prepended to every turn's request.
+/// Everything the system prompt is built from.
 ///
-/// Returns a [`SystemPrompt`] with the split at the cache boundary: everything
-/// before "User context" is stable; everything from "User context" onward is
-/// volatile.
+/// A struct rather than a positional argument list because the list had reached
+/// eight, three of which are `Option<&str>`: at that point a caller can transpose
+/// two arguments and still compile, and #1173 was about to add a fourth
+/// `Option<&str>`. Named fields make that class of mistake impossible instead of
+/// merely unlikely.
+///
+/// Construct with [`SystemPromptInputs::new`] and set the optional fields you
+/// need, so adding a field later does not touch every call site.
+pub struct SystemPromptInputs<'a> {
+    /// Phenotype persona text, injected at the top of the stable prefix.
+    pub persona: Option<&'a str>,
+    /// Installed skills, listed for discovery.
+    pub skills: &'a SkillRegistry,
+    /// Names of skills whose bodies are injected in full.
+    pub active: &'a [String],
+    /// Date, working directory, and shell hints for the volatile tail.
+    pub user: &'a UserContext,
+    /// Durable memory, already selected and formatted.
+    pub memory: Option<&'a str>,
+    /// Project instructions (`AGENTS.md` and friends), volatile tail.
+    pub extra_instructions: Option<&'a str>,
+    /// The active goal, if a goal loop is running.
+    pub goal: Option<&'a Goal>,
+    /// Permission mode, which selects the mode-steer paragraph.
+    pub mode: Mode,
+    /// Per-server MCP `initialize` guidance for servers whose tools are admitted
+    /// (#1173). Already capped by [`fit_mcp_guidance`]; order must be
+    /// deterministic to keep the stable prefix byte-identical.
+    pub mcp_guidance: &'a [McpGuidance],
+}
+
+impl<'a> SystemPromptInputs<'a> {
+    /// The always-required fields; optional ones default to absent.
+    pub fn new(
+        skills: &'a SkillRegistry,
+        active: &'a [String],
+        user: &'a UserContext,
+        mode: Mode,
+    ) -> Self {
+        Self {
+            persona: None,
+            skills,
+            active,
+            user,
+            memory: None,
+            extra_instructions: None,
+            goal: None,
+            mode,
+            mcp_guidance: &[],
+        }
+    }
+}
+
 /// Build the system prompt prepended to every turn's request.
 ///
 /// Returns a [`SystemPrompt`] with the split at the cache boundary: everything
@@ -165,17 +345,18 @@ impl SystemPrompt {
 /// rather than a comment-marked slice. Data shaping (skill sorting, registry
 /// resolution, verdict labeling, empty-memory/working-dir folding) lives here;
 /// literal prompt copy lives in the templates. See issue #938.
-#[allow(clippy::too_many_arguments)]
-pub fn build_system_prompt(
-    persona: Option<&str>,
-    skills: &SkillRegistry,
-    active: &[String],
-    user: &UserContext,
-    memory: Option<&str>,
-    extra_instructions: Option<&str>,
-    goal: Option<&Goal>,
-    mode: Mode,
-) -> SystemPrompt {
+pub fn build_system_prompt(inputs: &SystemPromptInputs<'_>) -> SystemPrompt {
+    let &SystemPromptInputs {
+        persona,
+        skills,
+        active,
+        user,
+        memory,
+        extra_instructions,
+        goal,
+        mode,
+        mcp_guidance,
+    } = inputs;
     let mode_steer = mode_steer(mode).unwrap_or("");
 
     // Active skill bodies: registry-resolved, sorted by name. Names that don't
@@ -205,6 +386,13 @@ pub fn build_system_prompt(
 
     let stable_ctx = StableCtx {
         persona: persona.map(|p| p.trim()).filter(|p| !p.is_empty()),
+        mcp_guidance: mcp_guidance
+            .iter()
+            .map(|g| McpGuidanceEntry {
+                server: &g.server,
+                text: g.text.trim_end(),
+            })
+            .collect(),
         mode_steer,
         skills: skill_entries,
         active: active_entries,
@@ -280,6 +468,13 @@ struct StableCtx<'a> {
     mode_steer: &'a str,
     skills: Vec<SkillEntry<'a>>,
     active: Vec<ActiveEntry<'a>>,
+    mcp_guidance: Vec<McpGuidanceEntry<'a>>,
+}
+
+#[derive(Serialize)]
+struct McpGuidanceEntry<'a> {
+    server: &'a str,
+    text: &'a str,
 }
 
 #[derive(Serialize)]

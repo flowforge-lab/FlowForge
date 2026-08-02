@@ -73,16 +73,17 @@ impl TaskRunner for CliTaskRunner {
             None => (memory_store.ambient_block(), Vec::new()),
         };
 
-        let system_prompt = ff_agent::build_system_prompt(
-            None,
-            &host::load_skills(),
-            &[],
-            &user_ctx,
-            memory.as_deref(),
-            None,
-            None,
-            ff_core::Mode::Auto,
-        );
+        let system_prompt = ff_agent::build_system_prompt(&ff_agent::SystemPromptInputs {
+            persona: None,
+            skills: &host::load_skills(),
+            active: &[],
+            user: &user_ctx,
+            memory: memory.as_deref(),
+            extra_instructions: None,
+            goal: None,
+            mode: ff_core::Mode::Auto,
+            mcp_guidance: &[],
+        });
 
         let cancel = CancelToken::new();
 
