@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-use notify::{RecommendedWatcher, RecursiveMode, Watcher};
+use notify::{RecursiveMode, Watcher};
 
 use crate::index::MemoryIndex;
 use crate::Memory;
@@ -23,7 +23,7 @@ const DEBOUNCE: Duration = Duration::from_millis(200);
 /// Owns the OS watcher. Dropping it stops watching: the event sender disconnects
 /// and the debounce worker thread observes the disconnect and exits.
 pub struct MemoryWatcher {
-    _watcher: RecommendedWatcher,
+    _watcher: Box<dyn Watcher + Send>,
 }
 
 impl MemoryWatcher {
@@ -66,7 +66,44 @@ impl MemoryWatcher {
         let _ = std::fs::create_dir_all(&root);
         watcher.watch(&root, RecursiveMode::Recursive)?;
 
-        Ok(Self { _watcher: watcher })
+        Ok(Self {
+            _watcher: Box::new(watcher),
+        })
+    }
+
+    /// Test-only: return a no-op watcher handle without starting a filesystem
+    /// watcher or a background reindex thread. Not available to the crate's own
+    /// unit tests — they still exercise a real [`RecommendedWatcher`] via
+    /// [`spawn`].
+    #[cfg(feature = "test-utils")]
+    pub fn spawn_without_watcher() -> Self {
+        Self {
+            _watcher: Box::new(NoopWatcher),
+        }
+    }
+}
+
+/// No-op watcher for test builds: satisfies the [`Watcher`] trait without
+/// touching the filesystem.
+#[cfg(feature = "test-utils")]
+struct NoopWatcher;
+
+#[cfg(feature = "test-utils")]
+impl Watcher for NoopWatcher {
+    fn new<F: notify::EventHandler>(
+        _event_handler: F,
+        _config: notify::Config,
+    ) -> notify::Result<Self> {
+        Ok(Self)
+    }
+    fn watch(&mut self, _path: &Path, _recursive_mode: RecursiveMode) -> notify::Result<()> {
+        Ok(())
+    }
+    fn unwatch(&mut self, _path: &Path) -> notify::Result<()> {
+        Ok(())
+    }
+    fn kind() -> notify::WatcherKind {
+        notify::WatcherKind::NullWatcher
     }
 }
 

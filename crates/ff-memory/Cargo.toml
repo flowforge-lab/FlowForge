@@ -19,6 +19,9 @@ reqwest = { workspace = true, features = ["blocking", "json", "rustls-tls"] }
 sha2 = { workspace = true }
 tempfile = { workspace = true }
 
+[features]
+test-utils = []
+
 [dev-dependencies]
 wiremock = { workspace = true }
 tokio = { workspace = true }
