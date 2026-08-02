@@ -55,14 +55,20 @@ fn fit_mcp_instructions(text: &str, budget: usize) -> Option<String> {
     if text.len() <= budget {
         return Some(text.to_string());
     }
-    // Reserve room for the marker; if the budget cannot even hold the marker,
-    // keep the prefix and let the marker be what gets dropped.
+    // Reserve room for the marker. If the budget cannot hold the marker plus at
+    // least one byte of body, drop the whole block instead of emitting a bare
+    // prefix: an unmarked fragment reads to the model as the server's complete
+    // instructions, which is worse than absent guidance -- it would act on a
+    // sentence that stops mid-clause believing it saw the whole contract. The
+    // caller counts these as `dropped`, so the loss is still reported.
     let body_budget = budget.saturating_sub(MCP_TRUNCATION_MARKER.len());
     if body_budget == 0 {
         return None;
     }
     // Byte slicing must land on a char boundary or this panics on any
-    // multi-byte character.
+    // multi-byte character. Backing up to a boundary can consume the entire
+    // body budget (a single wide char wider than the budget), which is the
+    // second way this returns `None` for the same reason as above.
     let mut end = body_budget.min(text.len());
     while end > 0 && !text.is_char_boundary(end) {
         end -= 1;

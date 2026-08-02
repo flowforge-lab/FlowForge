@@ -1400,3 +1400,71 @@ fn a_server_directing_the_model_away_from_our_tools_is_still_marked_as_advice() 
          mitigation, not redaction"
     );
 }
+
+// ---------------------------------------------------------------------------
+// `fit_mcp_instructions` budget boundaries (#1175 review, isaacm nit 1).
+//
+// These pin the branch where the budget cannot hold the truncation marker.
+// It is reachable in production, not a theoretical edge: with the shipped
+// 8 KiB per-server / 16 KiB total caps, two servers emitting ~8190 B each
+// leave `remaining = 4`, so the third server enters here with `budget = 4`.
+// The branch had no coverage, which meant the doc comment describing the
+// opposite behaviour ("keep the prefix") could be "restored" in code and
+// every test would still pass.
+
+#[test]
+fn guidance_is_dropped_when_budget_cannot_hold_the_marker() {
+    let text = "a".repeat(500);
+    for budget in 1..=MCP_TRUNCATION_MARKER.len() {
+        assert_eq!(
+            fit_mcp_instructions(&text, budget),
+            None,
+            "budget {budget} is too small for the marker, so the whole block \
+             must be dropped rather than emitted as an unmarked prefix"
+        );
+    }
+}
+
+#[test]
+fn guidance_is_truncated_once_budget_exceeds_the_marker() {
+    let text = "a".repeat(500);
+    let budget = MCP_TRUNCATION_MARKER.len() + 1;
+    let out = fit_mcp_instructions(&text, budget)
+        .expect("one byte of body room is enough to truncate rather than drop");
+    assert_eq!(
+        out,
+        format!("a{}", MCP_TRUNCATION_MARKER),
+        "the body must be exactly the one byte that fit, and the marker must \
+         be present so the model can tell this is not the full text"
+    );
+    assert!(out.ends_with(MCP_TRUNCATION_MARKER));
+}
+
+#[test]
+fn a_wide_char_that_cannot_fit_is_dropped_not_split() {
+    // A 4-byte char with a 1-byte body budget: backing up to a char boundary
+    // consumes the whole budget, which is the second `None` path. Slicing
+    // without the boundary walk would panic here.
+    let text = "\u{1F600}".repeat(20);
+    let budget = MCP_TRUNCATION_MARKER.len() + 1;
+    assert_eq!(fit_mcp_instructions(&text, budget), None);
+}
+
+#[test]
+fn total_budget_exhaustion_reaches_the_marker_boundary_end_to_end() {
+    // The production path that makes the above reachable: two near-full
+    // servers leave the third with a sub-marker budget.
+    let big = "x".repeat(MAX_MCP_INSTRUCTIONS_BYTES - 2);
+    let g = vec![
+        guidance("a", &big),
+        guidance("b", &big),
+        guidance("c", "third server's guidance"),
+    ];
+    let (kept, dropped) = fit_mcp_guidance(&g);
+    assert_eq!(
+        kept.len(),
+        2,
+        "the third server cannot fit within the total budget"
+    );
+    assert_eq!(dropped, 1, "and its loss must be reported, not silent");
+}
