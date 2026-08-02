@@ -36,7 +36,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use ff_agent::{ApprovalOutcome, Approver, DenyReason};
-use ff_core::{Mode, PermissionMatrix, Safety};
+use ff_core::{pre_prompt_decision, Mode, PermissionMatrix, PrePromptDecision, Safety};
 use ff_transport::ChannelId;
 use tokio::sync::{mpsc, Mutex};
 use tracing::{debug, info, warn};
@@ -316,37 +316,26 @@ impl Approver for SlackApprover {
             .matrix
             .evaluate_rules(name, resolved_arg.as_deref(), self.mode);
 
-        // Inline the canonical gate order so we can return distinct DenyReasons
-        // (#1176).
-        if cell.is_deny() {
-            return ApprovalOutcome::Denied(DenyReason::Mode {
-                mode: self.mode,
-                safety,
-            });
-        }
-        if let Some(rule) = self
+        let scoped_deny_rule = self
             .matrix
-            .matching_deny_rule(name, resolved_arg.as_deref())
-        {
-            return ApprovalOutcome::Denied(DenyReason::ScopedRule {
-                rule: format!("{} ({})", rule.tool, rule.matcher.description()),
-            });
-        }
-        match scoped_effect {
-            Some(ff_core::RuleEffect::Allow) if safety != Safety::Dangerous => {
+            .matching_deny_rule(name, resolved_arg.as_deref());
+        let scoped_deny_rule_desc =
+            scoped_deny_rule.map(|r| format!("{} ({})", r.tool, r.matcher.description()));
+        match pre_prompt_decision(
+            cell,
+            false,
+            scoped_effect,
+            safety,
+            self.mode,
+            scoped_deny_rule_desc,
+        ) {
+            PrePromptDecision::Deny(reason) => {
+                return ApprovalOutcome::Denied(reason);
+            }
+            PrePromptDecision::Allow => {
                 return ApprovalOutcome::Allowed;
             }
-            _ => {}
-        }
-        match cell {
-            ff_core::PermissionCell::Allow => return ApprovalOutcome::Allowed,
-            ff_core::PermissionCell::Deny => {
-                return ApprovalOutcome::Denied(DenyReason::Mode {
-                    mode: self.mode,
-                    safety,
-                });
-            }
-            ff_core::PermissionCell::Ask => {}
+            PrePromptDecision::Prompt => {}
         }
 
         let token = self.next_token(call_id);

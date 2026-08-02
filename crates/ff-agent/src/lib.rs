@@ -453,25 +453,10 @@ pub enum AgentError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ApprovalOutcome {
     Allowed,
-    Denied(DenyReason),
+    Denied(ff_core::DenyReason),
 }
 
-/// Why a tool call was denied. Part of [`ApprovalOutcome`] so the model receives
-/// the reason in the same value it already inspects.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DenyReason {
-    /// The permission-matrix cell for this (mode, safety) pair is `Deny`.
-    /// The model should suggest switching to Act mode.
-    Mode { mode: Mode, safety: Safety },
-    /// The user explicitly declined an `Ask` prompt.
-    User,
-    /// A scoped permission rule denied this call by name.
-    ScopedRule { rule: String },
-    /// No interactive terminal was available and no `--yes`/`--deny` flag was set.
-    /// Also used for unattended contexts (scheduled fires, messaging transports)
-    /// where there is simply no approval surface.
-    NoInteractiveTerminal,
-}
+pub use ff_core::DenyReason;
 
 /// Decides whether a non-read-only tool call may run. The host supplies this; the
 /// desktop shell routes it to a UI confirmation (an async round-trip), so the call

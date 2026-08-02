@@ -528,13 +528,30 @@ fn safety_idx(safety: Safety) -> usize {
     }
 }
 
+/// Why a tool call was denied. Part of the synchronous pre-prompt decision so
+/// the shared gate can attribute the block to its source (#1176).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DenyReason {
+    /// The permission-matrix cell for this (mode, safety) pair is `Deny`.
+    /// The model should suggest switching to Act mode.
+    Mode { mode: Mode, safety: Safety },
+    /// The user explicitly declined an `Ask` prompt.
+    User,
+    /// A scoped permission rule denied this call by name.
+    ScopedRule { rule: String },
+    /// No interactive terminal was available and no `--yes`/`--deny` flag was set.
+    /// Also used for unattended contexts (scheduled fires, messaging transports)
+    /// where there is simply no approval surface.
+    NoInteractiveTerminal,
+}
+
 /// The synchronous, pre-prompt decision for a tool call (#828 Part C, #829 review).
 /// Pure — no AppHandle, no async, no state beyond the inputs. Testable directly,
 /// so a regression that reorders the allowlist above the Deny gate is caught.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PrePromptDecision {
     /// The matrix denies this call outright (e.g. Plan x Write).
-    Deny,
+    Deny(DenyReason),
     /// Auto-approved (allowlist hit, scoped Allow rule, or matrix Allow cell).
     Allow,
     /// None of the sync gates resolved it — prompt the user asynchronously.
@@ -573,20 +590,29 @@ pub fn resolve_tool_arg(name: &str, args: &serde_json::Value) -> Option<String> 
 /// 2. Allowlist accelerates Ask cells.
 /// 3. Scoped rules (Deny vetoes; Allow approves unless Dangerous).
 /// 4. Matrix Allow auto-approves; Ask falls through to Prompt.
+///
+/// `mode` and `scoped_deny_rule_desc` are needed only when the result is
+/// `Deny` so the reason can be attributed precisely (#1176).
 pub fn pre_prompt_decision(
     cell: PermissionCell,
     allowlisted: bool,
     scoped_effect: Option<RuleEffect>,
     safety: Safety,
+    mode: Mode,
+    scoped_deny_rule_desc: Option<String>,
 ) -> PrePromptDecision {
     if cell.is_deny() {
-        return PrePromptDecision::Deny;
+        return PrePromptDecision::Deny(DenyReason::Mode { mode, safety });
     }
     if allowlisted {
         return PrePromptDecision::Allow;
     }
     match scoped_effect {
-        Some(RuleEffect::Deny) => return PrePromptDecision::Deny,
+        Some(RuleEffect::Deny) => {
+            return PrePromptDecision::Deny(DenyReason::ScopedRule {
+                rule: scoped_deny_rule_desc.unwrap_or_else(|| "scoped rule".into()),
+            });
+        }
         // Intentional asymmetry with the `allowlisted` grant above (#1051): a
         // coarse session/always allowlist entry keys on tool+safety and would
         // blanket-cover EVERY Publish call for that tool, so `allowlist_covers`
@@ -603,7 +629,9 @@ pub fn pre_prompt_decision(
     }
     match cell {
         PermissionCell::Allow => PrePromptDecision::Allow,
-        PermissionCell::Deny => PrePromptDecision::Deny, // unreachable (handled above)
+        PermissionCell::Deny => {
+            PrePromptDecision::Deny(DenyReason::Mode { mode, safety }) // unreachable (handled above)
+        }
         PermissionCell::Ask => PrePromptDecision::Prompt,
     }
 }
