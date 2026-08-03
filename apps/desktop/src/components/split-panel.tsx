@@ -93,8 +93,19 @@ function SplitBody({
     default: {
       // Exhaustiveness guard: adding a SplitContent kind without a case here
       // becomes a compile error (the TODO finds you). See store/split.ts.
+      //
+      // Returning the value itself would be the natural way to write that, and
+      // it is a trap: at runtime `content` can be a shape this build has never
+      // heard of (a `{ kind: "files" }` blob persisted before #944), and React
+      // renders an object child by throwing — which took the whole window down
+      // to the error boundary, not just this panel. `parseContent` now drops
+      // those on the way in; this returns null so the same class of mistake can
+      // never again cost more than an empty panel. `split-panel.test.tsx`
+      // drives this branch with a cast-in payload, because the compiler by
+      // construction cannot.
       const unreachable: never = content;
-      return unreachable;
+      void unreachable;
+      return null;
     }
   }
 }
