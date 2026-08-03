@@ -17,8 +17,5 @@ notify = "7"
 reqwest = { workspace = true, features = ["blocking", "rustls-tls"] }
 tempfile = { workspace = true }
 
-[features]
-test-utils = []
-
 [dev-dependencies]
 tempfile = { workspace = true }

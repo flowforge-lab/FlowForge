@@ -74,7 +74,3 @@ wiremock = { workspace = true }
 # sidecar parity integration test. Only active under `cargo test` — never in
 # production builds. See RFC 0004 §5.
 tauri = { version = "2", features = ["test"] }
-# Enable watcher stubs so AppState construction in tests skips the ~1.3s
-# FSEvents setup per test (#1178).
-ff-skills = { workspace = true, features = ["test-utils"] }
-ff-memory = { workspace = true, features = ["test-utils"] }

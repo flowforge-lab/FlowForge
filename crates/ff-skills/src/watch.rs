@@ -43,9 +43,10 @@ impl SkillWatcher {
 
     /// Test-only: load `root` once without starting a filesystem watcher.
     /// Returns a no-op watcher handle so the rest of the state machinery is
-    /// unchanged. Not available to the crate's own unit tests — they still
-    /// exercise a real [`PollWatcher`] via [`spawn_with`].
-    #[cfg(feature = "test-utils")]
+    /// unchanged. Gated by `#[cfg(not(test))]` so it is invisible when this
+    /// crate is compiled in its own test build — the leaf-crate watcher tests
+    /// keep exercising a real [`PollWatcher`] via [`spawn_with`].
+    #[cfg(not(test))]
     pub fn spawn_without_watcher(
         root: PathBuf,
     ) -> Result<(Self, SharedRegistry, Vec<SkillError>), SkillError> {
@@ -118,10 +119,10 @@ impl SkillWatcher {
 
 /// No-op watcher for test builds: satisfies the [`Watcher`] trait without
 /// touching the filesystem.
-#[cfg(feature = "test-utils")]
+#[cfg(not(test))]
 struct NoopWatcher;
 
-#[cfg(feature = "test-utils")]
+#[cfg(not(test))]
 impl Watcher for NoopWatcher {
     fn new<F: notify::EventHandler>(
         _event_handler: F,

@@ -3604,9 +3604,10 @@ fn skills_root() -> PathBuf {
 /// depend on the developer's real `~/.flowforge/skills` (#1178).
 #[cfg(test)]
 fn skills_root() -> PathBuf {
-    std::env::temp_dir()
-        .join("flowforge")
-        .join(format!("test-skills-{}", std::process::id()))
+    static DIR: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| tempfile::tempdir().expect("temp dir"))
+        .path()
+        .to_path_buf()
 }
 
 /// `~/.flowforge/skill_history`, the retained-version tree for skill evolution (RFC
