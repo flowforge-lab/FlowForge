@@ -41,6 +41,26 @@ impl SkillWatcher {
         Self::spawn_with::<RecommendedWatcher>(root, Config::default())
     }
 
+    /// Test-only: load `root` once without starting a filesystem watcher.
+    /// Returns a no-op watcher handle so the rest of the state machinery is
+    /// unchanged. Gated by `#[cfg(not(test))]` so it is invisible when this
+    /// crate is compiled in its own test build — the leaf-crate watcher tests
+    /// keep exercising a real [`PollWatcher`] via [`spawn_with`].
+    #[cfg(not(test))]
+    pub fn spawn_without_watcher(
+        root: PathBuf,
+    ) -> Result<(Self, SharedRegistry, Vec<SkillError>), SkillError> {
+        let (initial, errors) = SkillRegistry::load_dir(&root);
+        let shared: SharedRegistry = Arc::new(RwLock::new(initial));
+        Ok((
+            Self {
+                _watcher: Box::new(NoopWatcher),
+            },
+            shared,
+            errors,
+        ))
+    }
+
     /// [`spawn`](Self::spawn) parameterized over the `notify` watcher backend so tests
     /// can substitute a [`notify::PollWatcher`]. `config` tunes the backend (e.g. the
     /// poll interval for `PollWatcher`); production passes [`Config::default`].
@@ -94,6 +114,30 @@ impl SkillWatcher {
             shared,
             errors,
         ))
+    }
+}
+
+/// No-op watcher for test builds: satisfies the [`Watcher`] trait without
+/// touching the filesystem.
+#[cfg(not(test))]
+struct NoopWatcher;
+
+#[cfg(not(test))]
+impl Watcher for NoopWatcher {
+    fn new<F: notify::EventHandler>(
+        _event_handler: F,
+        _config: notify::Config,
+    ) -> notify::Result<Self> {
+        Ok(Self)
+    }
+    fn watch(&mut self, _path: &Path, _recursive_mode: RecursiveMode) -> notify::Result<()> {
+        Ok(())
+    }
+    fn unwatch(&mut self, _path: &Path) -> notify::Result<()> {
+        Ok(())
+    }
+    fn kind() -> notify::WatcherKind {
+        notify::WatcherKind::NullWatcher
     }
 }
 

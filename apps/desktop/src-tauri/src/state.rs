@@ -2,7 +2,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use ff_agent::{
@@ -3592,11 +3592,22 @@ impl AppState {
 /// The default workspace root for M2: the user's home directory, falling back to the
 /// process CWD. Replaced by a per-session, user-chosen folder in M3.
 /// `~/.flowforge/skills`, the directory the skill watcher loads and watches.
+#[cfg(not(test))]
 fn skills_root() -> PathBuf {
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".flowforge")
         .join("skills")
+}
+
+/// Test-only: point at a per-process temp directory so test runtime does not
+/// depend on the developer's real `~/.flowforge/skills` (#1178).
+#[cfg(test)]
+fn skills_root() -> PathBuf {
+    static DIR: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| tempfile::tempdir().expect("temp dir"))
+        .path()
+        .to_path_buf()
 }
 
 /// `~/.flowforge/skill_history`, the retained-version tree for skill evolution (RFC
@@ -3627,6 +3638,7 @@ fn load_signals() -> SignalStore {
 
 /// Start the skill watcher, falling back to a one-shot load (no hot-reload) if the
 /// OS watcher cannot start (e.g. the skills dir does not exist yet).
+#[cfg(not(test))]
 fn load_skills() -> (Option<SkillWatcher>, SharedRegistry) {
     let root = skills_root();
     match SkillWatcher::spawn(root.clone()) {
@@ -3639,9 +3651,21 @@ fn load_skills() -> (Option<SkillWatcher>, SharedRegistry) {
         Err(e) => {
             tracing::warn!(error = %e, "skill watcher unavailable; loading once");
             let (reg, _) = SkillRegistry::load_dir(&root);
-            (None, Arc::new(RwLock::new(reg)))
+            (None, Arc::new(std::sync::RwLock::new(reg)))
         }
     }
+}
+
+/// Test-only: skip the ~1.3s FSEvents watcher startup (#1178).
+#[cfg(test)]
+fn load_skills() -> (Option<SkillWatcher>, SharedRegistry) {
+    let root = skills_root();
+    let (watcher, shared, errors) =
+        SkillWatcher::spawn_without_watcher(root).expect("skill load must succeed in tests");
+    for e in &errors {
+        tracing::warn!(error = %e, "skill load");
+    }
+    (Some(watcher), shared)
 }
 
 /// How much the transcript must grow (in messages) before a session that is still
@@ -3847,9 +3871,12 @@ fn open_memory_index(
             Err(e) => tracing::warn!(error = %e, "background memory reindex failed"),
         }
     });
+    #[cfg(not(test))]
     let watcher = MemoryWatcher::spawn(memory.clone(), index.clone())
         .map_err(|e| tracing::warn!(error = %e, "memory watcher unavailable"))
         .ok();
+    #[cfg(test)]
+    let watcher = Some(MemoryWatcher::spawn_without_watcher());
     (index, watcher)
 }
 
