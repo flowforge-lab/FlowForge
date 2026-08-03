@@ -95,6 +95,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Repo-wide, and deliberately before the pnpm install: a stray control
+      # byte makes git treat the file as binary, which hides the change from
+      # review entirely (#1185), so fail in seconds rather than after a build.
+      # Overrides the job's working-directory because this covers Rust too.
+      - name: Control characters
+        working-directory: .
+        run: |
+          python3 scripts/check-control-chars.py --self-test
+          python3 scripts/check-control-chars.py
+
       - uses: pnpm/action-setup@v4
         with:
           version: 10.33.2
