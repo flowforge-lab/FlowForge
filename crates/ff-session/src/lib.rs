@@ -161,6 +161,17 @@ pub struct SearchHit {
     pub created_at: i64,
 }
 
+/// One turn's preheat attribution, as persisted by the v13 migration (#1107).
+/// No TS binding: nothing on the frontend reads this yet -- it backs
+/// cross-session analysis, and the live per-turn numbers already reach the UI on
+/// `ContextBreakdown`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TurnPreheat {
+    pub preheated_count: usize,
+    pub preheated_used: usize,
+    pub preheated_bytes: usize,
+}
+
 pub struct SessionStore {
     conn: Mutex<Connection>,
     /// Sessions created but not yet persisted (#671 item 2a): a bare `＋` in the
@@ -500,6 +511,61 @@ impl SessionStore {
             "SELECT content FROM compaction_originals WHERE key = ?1",
             params![key],
             |row| row.get(0),
+        )
+        .optional()
+        .ok()
+        .flatten()
+    }
+
+    /// Persist one turn's preheat attribution (#1107). No-op when the turn
+    /// preheated nothing: a zero row would both pad the table -- most turns
+    /// declare no preheat -- and inflate the denominator of any later hit-rate
+    /// read with turns that never placed a bet. Idempotent per message.
+    pub fn put_turn_preheat(
+        &self,
+        session_id: &str,
+        message_id: &str,
+        preheated_count: usize,
+        preheated_used: usize,
+        preheated_bytes: usize,
+    ) {
+        if preheated_count == 0 {
+            return;
+        }
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO turn_preheat
+                 (message_id, session_id, preheated_count, preheated_used,
+                  preheated_bytes, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                message_id,
+                session_id,
+                preheated_count as i64,
+                preheated_used as i64,
+                preheated_bytes as i64,
+                now_ms()
+            ],
+        )
+        .ok();
+    }
+
+    /// Read back one turn's preheat attribution. `None` when the turn preheated
+    /// nothing, predates the v13 migration, or its session was deleted.
+    #[must_use]
+    pub fn turn_preheat(&self, message_id: &str) -> Option<TurnPreheat> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT preheated_count, preheated_used, preheated_bytes
+             FROM turn_preheat WHERE message_id = ?1",
+            params![message_id],
+            |row| {
+                Ok(TurnPreheat {
+                    preheated_count: row.get::<_, i64>(0)? as usize,
+                    preheated_used: row.get::<_, i64>(1)? as usize,
+                    preheated_bytes: row.get::<_, i64>(2)? as usize,
+                })
+            },
         )
         .optional()
         .ok()
@@ -1452,6 +1518,37 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
                  ON sessions(parent_session_id);",
         )?;
         conn.pragma_update(None, "user_version", 12)?;
+    }
+    if version < 13 {
+        // #1107 (RFC 0024 Phase 3 follow-up): persist preheat attribution. The
+        // three counters ship on `ContextBreakdown`, but that rides a `turn:done`
+        // event the UI overwrites next turn -- an oscilloscope, not a flight
+        // recorder -- so nothing could answer whether the 2500 B preheat budget
+        // was earning its keep across sessions.
+        //
+        // A table rather than columns on `messages`: this is a fact about a turn,
+        // not message content, and most turns declare no preheat, so ALTERing
+        // `messages` would add three columns that are NULL on nearly every row.
+        // Keyed by `message_id` (the id `AgentEvent::Done` carries) following
+        // `compaction_originals`, since there is no `turn_id` concept.
+        //
+        // ON DELETE CASCADE via session_id so attribution cannot outlive the
+        // transcript it describes. The index serves the per-session hit-rate
+        // rollup; without it that read degrades to a full scan as the table grows.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS turn_preheat (
+                 message_id      TEXT PRIMARY KEY,
+                 session_id      TEXT NOT NULL,
+                 preheated_count INTEGER NOT NULL,
+                 preheated_used  INTEGER NOT NULL,
+                 preheated_bytes INTEGER NOT NULL,
+                 created_at      INTEGER NOT NULL,
+                 FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
+             );
+             CREATE INDEX IF NOT EXISTS idx_turn_preheat_session
+                 ON turn_preheat(session_id);",
+        )?;
+        conn.pragma_update(None, "user_version", 13)?;
     }
     Ok(())
 }
