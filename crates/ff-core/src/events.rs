@@ -139,6 +139,31 @@ pub struct ContextBreakdown {
     pub tool_tokens: u32,
     /// Number of tool specs advertised this turn.
     pub tool_specs: u32,
+    /// #1179 3A: how many of this turn's advertised specs were admitted up front
+    /// by declaration rather than found by `tool_search`. The size of the bet --
+    /// on its own it says nothing about whether the bet paid, which is why it is
+    /// never reported without `preheated_used`. `None` when nothing was preheated,
+    /// distinct from `Some(0)`, which would mean a preheat list resolved to
+    /// nothing (every name unknown).
+    #[serde(default)]
+    #[ts(optional)]
+    pub preheated_count: Option<u32>,
+    /// #1179 3A: how many preheated tools the model actually called this turn.
+    /// The number that makes a bad preheat list falsifiable: well below
+    /// `preheated_count` means the resident block is carrying schemas nobody
+    /// wants -- exactly what Phase 2 (RFC 0024) spent 16.8% of the prompt to
+    /// avoid. Must be an intersection with the called set; deriving it from
+    /// `preheated_count` would leave it unable to ever report a miss.
+    #[serde(default)]
+    #[ts(optional)]
+    pub preheated_used: Option<u32>,
+    /// #1179 3A: bytes of advertised schema the preheat added. Bytes rather than a
+    /// tool count because specs differ by more than an order of magnitude
+    /// (codegraph's single tool is 1726 B, `glob` a few hundred), so a count
+    /// cannot be checked against a prompt budget.
+    #[serde(default)]
+    #[ts(optional)]
+    pub preheated_bytes: Option<u32>,
     /// Estimated tokens of the **verbatim** persisted message transcript
     /// (user/assistant/tool) — the store, before any compaction. Formerly
     /// `messageTokens`; renamed to distinguish from `wireTokens` (#997).

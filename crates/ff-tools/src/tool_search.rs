@@ -170,6 +170,18 @@ fn build_bag(name: &str, description: &str, schema_keywords: &str) -> (HashMap<S
 #[derive(Debug, Default)]
 pub struct ToolSearchState {
     admitted: Mutex<HashMap<String, HashSet<String>>>,
+    /// Tools admitted up front by declaration rather than by search (#1179 3A).
+    ///
+    /// A second set rather than a flag folded into `admitted` because the whole
+    /// point is provenance: a tool the model *found* proves the search earned its
+    /// keep, while a tool a phenotype *declared* is a bet whose payoff has to be
+    /// measured separately. Merging them makes `preheated_used` uncomputable, and
+    /// that number is the only thing standing between a preheat list and an
+    /// unfalsifiable guess.
+    ///
+    /// Callers that ask "is this tool reachable" must consult both; see
+    /// [`Self::unlocked`].
+    preheated: Mutex<HashMap<String, HashSet<String>>>,
     /// Corpus vectors for semantic recall, cached across turns.
     ///
     /// This lives on the shared state rather than on `ToolSearchTool` because
@@ -218,6 +230,32 @@ impl ToolSearchState {
             .unwrap_or_default()
     }
 
+    /// Tools preheated for `session_id` by declaration (#1179 3A).
+    ///
+    /// Deliberately a parallel reader rather than a wider return type on
+    /// [`Self::admitted`]: `ff-agent`'s per-iteration guard compares
+    /// `unlocked.len() > appended.len()`, so changing that signature would drag a
+    /// hot-path check and the MCP guidance gate into a telemetry change.
+    pub fn preheated(&self, session_id: &str) -> HashSet<String> {
+        self.preheated
+            .lock()
+            .map(|m| m.get(session_id).cloned().unwrap_or_default())
+            .unwrap_or_default()
+    }
+
+    /// Every tool `session_id` can call, whatever admitted it.
+    ///
+    /// Reachability has exactly one answer, so it gets exactly one accessor. The
+    /// alternative — each call site unioning the two sets itself — is how the two
+    /// provenances drift apart, and a caller that forgets the union does not fail
+    /// loudly: it silently hides a preheated tool (or its server's guidance) from
+    /// the model while every test still passes.
+    pub fn unlocked(&self, session_id: &str) -> HashSet<String> {
+        let mut all = self.admitted(session_id);
+        all.extend(self.preheated(session_id));
+        all
+    }
+
     /// Re-admit `names` for `session_id`. Idempotent.
     pub fn admit(&self, session_id: &str, names: impl IntoIterator<Item = String>) {
         if let Ok(mut m) = self.admitted.lock() {
@@ -225,13 +263,28 @@ impl ToolSearchState {
         }
     }
 
+    /// Preheat `names` for `session_id`. Idempotent.
+    ///
+    /// Must be called before the first turn builds the tool schemas, or the names
+    /// land outside the stable prompt prefix and quietly cost a re-prefill instead
+    /// of saving a round-trip (#1179 3B).
+    pub fn preheat(&self, session_id: &str, names: impl IntoIterator<Item = String>) {
+        if let Ok(mut m) = self.preheated.lock() {
+            m.entry(session_id.to_string()).or_default().extend(names);
+        }
+    }
+
     /// Whether `session_id` has unlocked anything yet. Lets the caller skip
     /// rebuilding the schema list when nothing has changed.
     pub fn is_empty(&self, session_id: &str) -> bool {
-        self.admitted
-            .lock()
-            .map(|m| m.get(session_id).is_none_or(HashSet::is_empty))
-            .unwrap_or(true)
+        // Checks both provenances without materialising either set: this answers
+        // the same question as `unlocked()` and must not disagree with it.
+        let empty_in = |m: &Mutex<HashMap<String, HashSet<String>>>| {
+            m.lock()
+                .map(|m| m.get(session_id).is_none_or(HashSet::is_empty))
+                .unwrap_or(true)
+        };
+        empty_in(&self.admitted) && empty_in(&self.preheated)
     }
 }
 
