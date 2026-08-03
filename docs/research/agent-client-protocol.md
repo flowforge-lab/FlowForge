@@ -249,7 +249,7 @@ The `agentclientprotocol` GitHub organization contains **14 public repositories*
 6. **`java-sdk`** — Official Java SDK.
 7. **`registry`** — Curated registry of ACP-compatible agents.
 8. **`codex-acp`** — ACP adapter for OpenAI Codex CLI.
-9. **`claude-agent-acp`** — ACP adapter for Claude Agent SDK.
+9. **`claude-agent-acp`** — ACP adapter for the Claude Agent SDK.
 10. **`meetings`** — Meeting notes from ACP group members.
 
 (Plus additional repos not detailed in this summary.)
@@ -278,51 +278,11 @@ This means two JSON Schema releases can describe the same wire-compatible protoc
 
 ---
 
-## Inline Citations
-
-[^org-readme]: `https://github.com/agentclientprotocol` — Organization profile README. States: "The Agent Client Protocol (ACP) standardizes communication between code editors (interactive programs for viewing and editing source code) and coding agents (programs that use generative AI to autonomously modify code)."
-
-[^main-repo-readme]: `https://github.com/agentclientprotocol/agent-client-protocol/blob/main/README.md` — Main repository README. Details protocol version, crate/schema artifacts, versioning policy, and integrations.
-
-[^website-intro]: `https://agentclientprotocol.com/` — Official website introduction. Explains the problem ACP solves (integration overhead, limited compatibility, developer lock-in), local vs remote agent support, and Markdown as the default text format.
-
-[^protocol-overview]: `https://agentclientprotocol.com/protocol/v1/overview.md` — Protocol v1 Overview. Defines Agents, Clients, message flow (initialize → authenticate → session/new → prompt turn), methods, notifications, and extensibility.
-
-[^architecture-doc]: `https://agentclientprotocol.com/get-started/architecture.md` — Architecture page. Describes MCP-friendly design, UX-first principles, stdio setup, concurrent sessions, JSON-RPC streaming, and MCP server/proxy patterns.
-
-[^initialization-doc]: `https://agentclientprotocol.com/protocol/v1/initialization.md` — Initialization documentation. Covers protocol version negotiation, client capabilities (fs, terminal, elicitation, boolean config), agent capabilities (loadSession, promptCapabilities, auth, MCP), and implementation info.
-
-[^schema-json]: `https://github.com/agentclientprotocol/agent-client-protocol/blob/main/schema/v1/schema.json` — Canonical JSON Schema v1 (~5,749 lines). Defines all requests, responses, notifications, content blocks, tool calls, sessions, and types.
-
-[^rust-sdk-readme]: `https://github.com/agentclientprotocol/rust-sdk/blob/main/README.md` — Rust SDK README. Lists crates (agent-client-protocol, HTTP, rmcp, derive, conductor, polyfill, trace-viewer, cookbook, test, yopo), documentation links, and integration details.
-
-[^ts-sdk-readme]: `https://github.com/agentclientprotocol/typescript-sdk/blob/main/README.md` — TypeScript SDK README. Describes installation, experimental v2 support, agent/client builder APIs, and links to examples and production implementations (Gemini CLI).
-
-[^python-sdk-readme]: `https://github.com/agentclientprotocol/python-sdk/blob/main/README.md` — Python SDK README. Describes Pydantic models, asyncio transports, helper builders, examples, and community channels.
-
-[^kotlin-sdk-readme]: `https://github.com/agentclientprotocol/kotlin-sdk/blob/master/README.md` — Kotlin SDK README. Describes modules (acp-model, acp, acp-ktor, acp-ktor-client, acp-ktor-server, acp-ktor-test), architecture diagram, and sample projects.
-
-[^codex-acp-readme]: `https://github.com/agentclientprotocol/codex-acp/blob/main/README.md` — Codex ACP adapter README. Describes features, authentication methods, runtime options, and development commands.
-
-[^claude-agent-acp-readme]: `https://github.com/agentclientprotocol/claude-agent-acp/blob/main/README.md` — Claude Agent ACP adapter README. Describes supported features including nested subagent transcripts, tool calls, terminals, slash commands, and client MCP servers.
-
-[^registry-readme]: `https://github.com/agentclientprotocol/registry/blob/main/README.md` — Registry README. Defines the registry's purpose, authentication requirement, registry index URL, automatic version updates, and agent list.
-
-[^contributing-doc]: `https://github.com/agentclientprotocol/agent-client-protocol/blob/main/CONTRIBUTING.md` — Contributing guide. Describes ways to contribute, coding standards (rustfmt, clippy, prettier), RFD process, pull request process, and community channels (Zulip).
-
-[^governance-doc]: `https://github.com/agentclientprotocol/agent-client-protocol/blob/main/GOVERNANCE.md` — Governance file. Points to `https://agentclientprotocol.com/community/governance`.
-
-[^llms-txt]: `https://agentclientprotocol.com/llms.txt` — Complete documentation index. Lists all announcements, protocol docs, RFDs, and library pages.
-
-[^org-page]: `https://github.com/agentclientprotocol` — Organization page showing 14 repositories, pinned repos, and follower count (531).
-
----
-
 ## 11. FlowForge Integration Analysis (Q1–Q4)
 
 **Date:** 2026-08-03
 **Analyst:** OpenCode
-**Schema source:** `https://raw.githubusercontent.com/agentclientprotocol/agent-client-protocol/main/schema/v1/schema.json` (5,749 lines, fetched 2026-08-03)
+**Schema source:** [^schema-json-v1] (5,749 lines, fetched 2026-08-03)
 
 ---
 
@@ -332,26 +292,26 @@ This means two JSON Schema releases can describe the same wire-compatible protoc
 
 The permission mechanism in ACP v1 is a single JSON-RPC request/response pair:
 
-- **Method name:** `session/request_permission` — sent by the **Agent** to the **Client** [schema.json line 378].
+- **Method name:** `session/request_permission` — sent by the **Agent** to the **Client** [^schema-json-v1] (line 378).
 - **Request payload (`RequestPermissionRequest`):**
   - `sessionId`: string
-  - `toolCall`: `ToolCallUpdate` object (contains `toolCallId`, `kind`, `status`, `title`, `content`, `locations`, `rawInput`, `rawOutput`) [schema.json lines 342–379]
-  - `options`: array of `PermissionOption` [schema.json line 363]
+  - `toolCall`: `ToolCallUpdate` object (contains `toolCallId`, `kind`, `status`, `title`, `content`, `locations`, `rawInput`, `rawOutput`) [^schema-json-v1] (lines 342–379)
+  - `options`: array of `PermissionOption` [^schema-json-v1] (line 363)
 - **Response payload (`RequestPermissionResponse`):**
-  - `outcome`: `RequestPermissionOutcome` [schema.json lines 5295–5316]
+  - `outcome`: `RequestPermissionOutcome` [^schema-json-v1] (lines 5295–5316)
 
-The `PermissionOption` shape is [schema.json lines 1089–1120]:
+The `PermissionOption` shape is [^schema-json-v1] (lines 1089–1120):
 - `optionId`: string (opaque ID)
 - `name`: human-readable label
-- `kind`: `PermissionOptionKind` — one of `allow_once`, `allow_always`, `reject_once`, `reject_always` [schema.json lines 1122–1138]
+- `kind`: `PermissionOptionKind` — one of `allow_once`, `allow_always`, `reject_once`, `reject_always` [^schema-json-v1] (lines 1122–1138)
 
-The response `RequestPermissionOutcome` is a tagged union [schema.json lines 5318–5351]:
+The response `RequestPermissionOutcome` is a tagged union [^schema-json-v1] (lines 5318–5351):
 - `{ "outcome": "cancelled" }` — when the client sent `session/cancel`
 - `{ "outcome": "selected", "optionId": "..." }` — user picked one of the options
 
 #### What ACP does **not** define
 
-- **No safety tier.** The `ToolCallUpdate` carries a `kind` enum (`read`, `edit`, `delete`, `move`, `search`, `execute`, `think`, `fetch`, `switch_mode`, `other`) [schema.json lines 460–513], but this is purely a UI hint ("helps clients choose appropriate icons"). It does **not** drive any permission semantics.
+- **No safety tier.** The `ToolCallUpdate` carries a `kind` enum (`read`, `edit`, `delete`, `move`, `search`, `execute`, `think`, `fetch`, `switch_mode`, `other`) [^schema-json-v1] (lines 460–513), but this is purely a UI hint ("helps clients choose appropriate icons"). It does **not** drive any permission semantics.
 - **No permission matrix.** There is no concept of a 2-D or N-D grid mapping mode × safety → decision.
 - **No `Deny` equivalent.** ACP has no mechanism to hide a tool from the model entirely. The protocol assumes the agent already decided to invoke the tool and is now asking the user for approval. The worst outcome is `reject_always` for that specific call.
 
@@ -375,14 +335,14 @@ ACP can express **at most 4 of FlowForge's 15 cells**, and even then only at the
 
 #### ACP filesystem methods
 
-ACP v1 defines **exactly two** filesystem methods, both served by the **Client** (the editor/IDE, e.g. Zed) [schema.json lines 266–340]:
+ACP v1 defines **exactly two** filesystem methods, both served by the **Client** (the editor/IDE, e.g. Zed) [^schema-json-v1] (lines 266–340):
 
 | Method | Direction | Capability gate |
 |---|---|---|
 | `fs/read_text_file` | Agent → Client | `fs.readTextFile` |
 | `fs/write_text_file` | Agent → Client | `fs.writeTextFile` |
 
-There is **no** `fs/readDirectory`, `fs/glob`, `fs/stat`, or any other filesystem method in the v1 schema. The `FileSystemCapabilities` object only has `readTextFile` and `writeTextFile` booleans [schema.json lines 4457–4472].
+There is **no** `fs/readDirectory`, `fs/glob`, `fs/stat`, or any other filesystem method in the v1 schema. The `FileSystemCapabilities` object only has `readTextFile` and `writeTextFile` booleans [^schema-json-v1] (lines 4457–4472).
 
 #### When FlowForge acts as an ACP agent (Zed calls us)
 
@@ -398,6 +358,15 @@ In this direction, Zed is the Client and FlowForge is the Agent. If Zed advertis
 - **If the agent uses its own tools:** FlowForge owns the permission check via `PermissionMatrix`.
 - **There is no conflict resolution rule in ACP.** The two paths are independent. An agent could theoretically read a file via `fs/read_text_file` (client-served) and then write it via its own `write` tool (agent-served), with permission checks split across two systems.
 
+#### Boundary recommendation
+
+The architecture boundary should sit **above the ACP filesystem layer**, not inside it:
+
+- **FlowForge as agent (Zed calls us):** Use FlowForge's own `view`/`edit`/`write` tools for all local workspace operations. Do **not** call ACP `fs/read_text_file` or `fs/write_text_file` for files that `ff-tools` can already reach. The only legitimate use of ACP filesystem methods is for resources the client owns and the agent does not (e.g., unsaved editor buffers, remote files mounted by the client).
+- **FlowForge as client (we call Codex/Gemini):** Implement `fs/read_text_file` and `fs/write_text_file` as thin wrappers around our existing `view`/`edit`/`write` tools, so the agent sees ACP-standard methods but the permission check still flows through `PermissionMatrix::effective_cell`.
+
+This keeps the single source of truth for permission gating in FlowForge's `PermissionMatrix` and avoids the split-gate failure mode. It also means the tool registry does not need a "bridging" decision at call time — the boundary is fixed at initialization.
+
 **Open question:** Does ACP v2 add `fs/readDirectory` or similar? The v1 schema does not contain it, and the v2 draft is noted as unstable. This would be settled by reading the v2 schema or RFDs.
 
 ---
@@ -408,7 +377,7 @@ In this direction, Zed is the Client and FlowForge is the Agent. If Zed advertis
 
 FlowForge must implement the **Agent** side of the protocol — i.e., respond to client requests and send agent notifications. The v1 schema enumerates these explicitly:
 
-**Agent requests we must respond to** [schema.json lines 122–243]:
+**Requests we must respond to** (client → agent) [^schema-json-v1] (lines 122–243):
 1. `initialize`
 2. `authenticate`
 3. `session/new`
@@ -422,12 +391,12 @@ FlowForge must implement the **Agent** side of the protocol — i.e., respond to
 11. `session/set_config_option` (optional, gated by `session.configOptions.boolean`)
 12. `session/prompt` (the core turn handler)
 
-**Agent notifications we must send** [schema.json lines 3502–3700]:
+**Notifications we must send** (agent → client) [^schema-json-v1] (lines 3502–3700):
 - `session/update` (streams progress, tool calls, message chunks, plans)
 - `elicitation/complete` (for URL-based elicitation)
 - `$/cancel_request` (protocol-level)
 
-Additionally, when acting as an agent, FlowForge **may call** client methods:
+Additionally, when acting as an agent, FlowForge **may call** client methods (agent → client):
 - `fs/read_text_file`
 - `fs/write_text_file`
 - `session/request_permission`
@@ -438,7 +407,7 @@ Additionally, when acting as an agent, FlowForge **may call** client methods:
 
 FlowForge must implement the **Client** side — i.e., send client requests and respond to agent requests/notifications. The v1 schema enumerates:
 
-**Client requests we must send** [schema.json lines 4206–4405]:
+**Requests we must send** (client → agent) [^schema-json-v1] (lines 4206–4405):
 - `initialize`
 - `authenticate`
 - `session/new`
@@ -452,10 +421,10 @@ FlowForge must implement the **Client** side — i.e., send client requests and 
 - `session/set_config_option`
 - `session/prompt`
 
-**Client notifications we must send** [schema.json lines 5659–5749]:
+**Notifications we must send** (client → agent) [^schema-json-v1] (lines 5659–5749):
 - `session/cancel`
 
-**Client requests we must respond to** (when the agent calls us) [schema.json lines 5121–5320]:
+**Requests we must respond to** (agent → client) [^schema-json-v1] (lines 5121–5320):
 1. `fs/read_text_file`
 2. `fs/write_text_file`
 3. `session/request_permission`
@@ -470,16 +439,16 @@ FlowForge must implement the **Client** side — i.e., send client requests and 
 
 The two method sets are **almost completely disjoint**:
 
-- **Agent-only methods:** `initialize`, `authenticate`, `session/new`, `session/prompt`, `session/load`, `logout`, `session/set_mode`, `session/list`, `session/delete`, `session/resume`, `session/close`, `session/set_config_option`
-- **Client-only methods:** `fs/read_text_file`, `fs/write_text_file`, `session/request_permission`, `terminal/*`, `elicitation/create`
+- **client → agent** (we implement, they call): `initialize`, `authenticate`, `session/new`, `session/prompt`, `session/load`, `logout`, `session/set_mode`, `session/list`, `session/delete`, `session/resume`, `session/close`, `session/set_config_option` — **12 requests**
+- **agent → client** (we call, they implement): `fs/read_text_file`, `fs/write_text_file`, `session/request_permission`, `terminal/create`, `terminal/output`, `terminal/release`, `terminal/wait_for_exit`, `terminal/kill`, `elicitation/create` — **9 requests**
 - **Shared:** `session/cancel` (notification, client → agent), `session/update` (notification, agent → client)
 
 Because the lists are disjoint and both require full JSON-RPC plumbing, the implementation naturally splits into **two tickets minimum**, but likely **three to five** when considering:
-1. **Agent-side server** (handle all agent requests, emit `session/update`)
-2. **Client-side caller** (send all client requests, handle all client responses)
-3. **Client-side handler** (respond to `fs/*`, `terminal/*`, `elicitation/*`, `session/request_permission`)
+1. **Agent-side server** (handle all client → agent requests, emit `session/update`)
+2. **Client-side caller** (send all client → agent requests, consume `session/update`)
+3. **Client-side handler** (respond to agent → client requests: `fs/*`, `terminal/*`, `elicitation/*`, `session/request_permission`)
 4. **Permission mapping layer** (FlowForge `PermissionMatrix` ↔ ACP `session/request_permission`)
-5. **Tool registry bridging** (decide when to use ACP client fs methods vs. FlowForge's own `ff-tools`)
+5. **Tool registry boundary** (enact the Q2 boundary recommendation: ACP fs methods are wrappers around `ff-tools`, not an alternative path)
 
 Note: `ff-mcp` already has JSON-RPC plumbing (`crates/ff-mcp/`, client/supervisor, with `bridge.rs` at 242 lines bridging external tools into our registry). This plumbing can likely be reused for the JSON-RPC transport layer, but the ACP message types are different from MCP and must be handled separately.
 
@@ -531,3 +500,45 @@ Rationale:
 2. **Permission granularity in practice:** When a real ACP client (e.g. Zed) receives `session/request_permission`, does it implement any persistent allow-listing, or is it strictly per-call? Settled by inspecting Zed's ACP client source or testing against it.
 3. **Tool call vs. MCP tool bridging:** If FlowForge acts as an ACP agent and receives a `session/prompt` that triggers an MCP tool call, should the tool execution be reported as an ACP `tool_call_update` or as a native MCP result forwarded through ACP? Settled by reading the `agent-client-protocol-rmcp` integration crate or the ACP spec's MCP-over-ACP section.
 4. **Session mode mapping:** ACP has `session/set_mode` and `availableModes`. FlowForge's `Mode` is {Plan, Act, Auto}. Is there a standard ACP mode vocabulary, or is it agent-defined? Settled by reading the session-modes protocol doc.
+
+---
+
+## Inline Citations
+
+[^org-readme]: `https://github.com/agentclientprotocol` — Organization profile README. States: "The Agent Client Protocol (ACP) standardizes communication between code editors (interactive programs for viewing and editing source code) and coding agents (programs that use generative AI to autonomously modify code)."
+
+[^main-repo-readme]: `https://github.com/agentclientprotocol/agent-client-protocol/blob/main/README.md` — Main repository README. Details protocol version, crate/schema artifacts, versioning policy, and integrations.
+
+[^website-intro]: `https://agentclientprotocol.com/` — Official website introduction. Explains the problem ACP solves (integration overhead, limited compatibility, developer lock-in), local vs remote agent support, and Markdown as the default text format.
+
+[^protocol-overview]: `https://agentclientprotocol.com/protocol/v1/overview.md` — Protocol v1 Overview. Defines Agents, Clients, message flow (initialize → authenticate → session/new → prompt turn), methods, notifications, and extensibility.
+
+[^architecture-doc]: `https://agentclientprotocol.com/get-started/architecture.md` — Architecture page. Describes MCP-friendly design, UX-first principles, stdio setup, concurrent sessions, JSON-RPC streaming, and MCP server/proxy patterns.
+
+[^initialization-doc]: `https://agentclientprotocol.com/protocol/v1/initialization.md` — Initialization documentation. Covers protocol version negotiation, client capabilities (fs, terminal, elicitation, boolean config), agent capabilities (loadSession, promptCapabilities, auth, MCP), and implementation info.
+
+[^schema-json]: `https://github.com/agentclientprotocol/agent-client-protocol/blob/main/schema/v1/schema.json` — Canonical JSON Schema v1 (~5,749 lines). Defines all requests, responses, notifications, content blocks, tool calls, sessions, and types.
+
+[^schema-json-v1]: `https://raw.githubusercontent.com/agentclientprotocol/agent-client-protocol/main/schema/v1/schema.json` — Canonical JSON Schema v1 (raw, ~5,749 lines). Fetched 2026-08-03.
+
+[^rust-sdk-readme]: `https://github.com/agentclientprotocol/rust-sdk/blob/main/README.md` — Rust SDK README. Lists crates (agent-client-protocol, HTTP, rmcp, derive, conductor, polyfill, trace-viewer, cookbook, test, yopo), documentation links, and integration details.
+
+[^ts-sdk-readme]: `https://github.com/agentclientprotocol/typescript-sdk/blob/main/README.md` — TypeScript SDK README. Describes installation, experimental v2 support, agent/client builder APIs, and links to examples and production implementations (Gemini CLI).
+
+[^python-sdk-readme]: `https://github.com/agentclientprotocol/python-sdk/blob/main/README.md` — Python SDK README. Describes Pydantic models, asyncio transports, helper builders, examples, and community channels.
+
+[^kotlin-sdk-readme]: `https://github.com/agentclientprotocol/kotlin-sdk/blob/master/README.md` — Kotlin SDK README. Describes modules (acp-model, acp, acp-ktor, acp-ktor-client, acp-ktor-server, acp-ktor-test), architecture diagram, and sample projects.
+
+[^codex-acp-readme]: `https://github.com/agentclientprotocol/codex-acp/blob/main/README.md` — Codex ACP adapter README. Describes features, authentication methods, runtime options, and development commands.
+
+[^claude-agent-acp-readme]: `https://github.com/agentclientprotocol/claude-agent-acp/blob/main/README.md` — Claude ACP adapter README. Describes supported features including nested subagent transcripts, tool calls, terminals, slash commands, and client MCP servers.
+
+[^registry-readme]: `https://github.com/agentclientprotocol/registry/blob/main/README.md` — Registry README. Defines the registry's purpose, authentication requirement, registry index URL, automatic version updates, and agent list.
+
+[^contributing-doc]: `https://github.com/agentclientprotocol/agent-client-protocol/blob/main/CONTRIBUTING.md` — Contributing guide. Describes ways to contribute, coding standards (rustfmt, clippy, prettier), RFD process, pull request process, and community channels (Zulip).
+
+[^governance-doc]: `https://github.com/agentclientprotocol/agent-client-protocol/blob/main/GOVERNANCE.md` — Governance file. Points to `https://agentclientprotocol.com/community/governance`.
+
+[^llms-txt]: `https://agentclientprotocol.com/llms.txt` — Complete documentation index. Lists all announcements, protocol docs, RFDs, and library pages.
+
+[^org-page]: `https://github.com/agentclientprotocol` — Organization page showing 14 repositories, pinned repos, and follower count (531).
