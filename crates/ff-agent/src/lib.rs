@@ -446,6 +446,18 @@ pub enum AgentError {
     Llm(#[from] ff_llm::LlmError),
 }
 
+/// The result of an approval request. Carrying the reason on denial lets the
+/// model distinguish a mode block (should suggest Act) from a user decline
+/// (should propose an alternative) from a scoped-rule hit (should stop touching
+/// that target) — rather than seeing a single indistinguishable string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApprovalOutcome {
+    Allowed,
+    Denied(ff_core::DenyReason),
+}
+
+pub use ff_core::DenyReason;
+
 /// Decides whether a non-read-only tool call may run. The host supplies this; the
 /// desktop shell routes it to a UI confirmation (an async round-trip), so the call
 /// is `async`. Read-only calls bypass it entirely. `message_id` + `call_id` let the
@@ -459,7 +471,7 @@ pub trait Approver: Send + Sync {
         name: &str,
         safety: Safety,
         args: &serde_json::Value,
-    ) -> bool;
+    ) -> ApprovalOutcome;
 
     /// Pause the turn and put a question to the user (the `ask_user` tool, #44),
     /// resuming with their answer. `args` carries the tool call's arguments (the
@@ -2412,39 +2424,53 @@ pub async fn run_turn(
                             .await
                         } else {
                             let safety = tools.registry.safety(&call.name, &args);
-                            let approved = safety == Safety::ReadOnly
-                                || tools
+                            let outcome = if safety == Safety::ReadOnly {
+                                ApprovalOutcome::Allowed
+                            } else {
+                                tools
                                     .approve
                                     .approve(&message_id, &call.id, &call.name, safety, &args)
-                                    .await;
-                            if approved {
-                                // Stream live output (#680): pass a sink into the
-                                // streaming dispatch and drive the tool future
-                                // concurrently with a drain loop that forwards each
-                                // chunk via `on_event`. `on_event` is owned by this
-                                // loop and the tool `await` would otherwise block it,
-                                // so the concurrent drive is required. Non-streaming
-                                // tools ignore the sink and this reduces to a plain
-                                // await. The final outcome is unchanged.
-                                let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(
-                                    ff_tools::OutputStream,
-                                    String,
-                                )>();
-                                let sink = ff_tools::OutputSink::new(tx);
-                                let fut = tools.registry.run_streaming(
-                                    &call.name,
-                                    args,
-                                    tools.root,
-                                    session_id,
-                                    Some(sink),
-                                );
-                                tokio::pin!(fut);
-                                loop {
-                                    tokio::select! {
-                                        outcome = &mut fut => {
-                                            // Forward any chunks buffered before the
-                                            // future resolved and dropped its sender.
-                                            while let Ok((stream, delta)) = rx.try_recv() {
+                                    .await
+                            };
+                            match outcome {
+                                ApprovalOutcome::Allowed => {
+                                    // Stream live output (#680): pass a sink into the
+                                    // streaming dispatch and drive the tool future
+                                    // concurrently with a drain loop that forwards each
+                                    // chunk via `on_event`. `on_event` is owned by this
+                                    // loop and the tool `await` would otherwise block it,
+                                    // so the concurrent drive is required. Non-streaming
+                                    // tools ignore the sink and this reduces to a plain
+                                    // await. The final outcome is unchanged.
+                                    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(
+                                        ff_tools::OutputStream,
+                                        String,
+                                    )>();
+                                    let sink = ff_tools::OutputSink::new(tx);
+                                    let fut = tools.registry.run_streaming(
+                                        &call.name,
+                                        args,
+                                        tools.root,
+                                        session_id,
+                                        Some(sink),
+                                    );
+                                    tokio::pin!(fut);
+                                    loop {
+                                        tokio::select! {
+                                            outcome = &mut fut => {
+                                                // Forward any chunks buffered before the
+                                                // future resolved and dropped its sender.
+                                                while let Ok((stream, delta)) = rx.try_recv() {
+                                                    on_event(AgentEvent::ToolOutputChunk {
+                                                        message_id: message_id.clone(),
+                                                        call_id: call.id.clone(),
+                                                        stream,
+                                                        delta,
+                                                    });
+                                                }
+                                                break outcome;
+                                            }
+                                            Some((stream, delta)) = rx.recv() => {
                                                 on_event(AgentEvent::ToolOutputChunk {
                                                     message_id: message_id.clone(),
                                                     call_id: call.id.clone(),
@@ -2452,23 +2478,30 @@ pub async fn run_turn(
                                                     delta,
                                                 });
                                             }
-                                            break outcome;
-                                        }
-                                        Some((stream, delta)) = rx.recv() => {
-                                            on_event(AgentEvent::ToolOutputChunk {
-                                                message_id: message_id.clone(),
-                                                call_id: call.id.clone(),
-                                                stream,
-                                                delta,
-                                            });
                                         }
                                     }
                                 }
-                            } else {
-                                ff_tools::ToolOutcome::error(format!(
-                                    "call to `{}` was not approved",
-                                    call.name
-                                ))
+                                ApprovalOutcome::Denied(reason) => {
+                                    let msg = match reason {
+                                        DenyReason::Mode { mode, safety } => format!(
+                                            "call to `{}` was denied: {:?} mode does not allow {:?} tools. Switch to Act mode to run this.",
+                                            call.name, mode, safety
+                                        ),
+                                        DenyReason::User => format!(
+                                            "call to `{}` was denied: user declined the approval prompt.",
+                                            call.name
+                                        ),
+                                        DenyReason::ScopedRule { rule } => format!(
+                                            "call to `{}` was denied by scoped permission rule: {}.",
+                                            call.name, rule
+                                        ),
+                                        DenyReason::NoInteractiveTerminal => format!(
+                                            "call to `{}` was denied: no interactive approval surface available.",
+                                            call.name
+                                        ),
+                                    };
+                                    ff_tools::ToolOutcome::error(msg)
+                                }
                             }
                         }
                     }

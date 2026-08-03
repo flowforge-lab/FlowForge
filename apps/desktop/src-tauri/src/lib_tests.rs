@@ -1053,9 +1053,11 @@ fn pre_prompt_plan_write_denied_despite_allowlist() {
     let cell = matrix.effective_cell("github", Mode::Plan, Safety::Write);
     let allowlisted = state.allowlist_covers("s1", "github", Safety::Write);
     assert!(allowlisted);
-    assert_eq!(
-        pre_prompt_decision(cell, allowlisted, None, Safety::Write),
-        PrePromptDecision::Deny,
+    assert!(
+        matches!(
+            pre_prompt_decision(cell, allowlisted, None, Safety::Write, Mode::Plan, None),
+            PrePromptDecision::Deny(ff_core::DenyReason::Mode { .. })
+        ),
         "Plan x Write = Deny must override the allowlist"
     );
 }

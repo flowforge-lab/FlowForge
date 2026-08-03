@@ -567,24 +567,52 @@ fn validate_rules_reports_clean_ruleset() {
 // A regression that reorders allowlist-first is caught here directly.
 #[test]
 fn pre_prompt_deny_overrides_allowlist() {
-    assert_eq!(
-        pre_prompt_decision(PermissionCell::Deny, true, None, Safety::Write),
-        PrePromptDecision::Deny
-    );
-    assert_eq!(
-        pre_prompt_decision(PermissionCell::Deny, true, None, Safety::Sensitive),
-        PrePromptDecision::Deny
-    );
+    assert!(matches!(
+        pre_prompt_decision(
+            PermissionCell::Deny,
+            true,
+            None,
+            Safety::Write,
+            Mode::Auto,
+            None
+        ),
+        PrePromptDecision::Deny(_)
+    ));
+    assert!(matches!(
+        pre_prompt_decision(
+            PermissionCell::Deny,
+            true,
+            None,
+            Safety::Sensitive,
+            Mode::Auto,
+            None
+        ),
+        PrePromptDecision::Deny(_)
+    ));
 }
 
 #[test]
 fn pre_prompt_allowlist_accelerates_ask() {
     assert_eq!(
-        pre_prompt_decision(PermissionCell::Ask, true, None, Safety::Write),
+        pre_prompt_decision(
+            PermissionCell::Ask,
+            true,
+            None,
+            Safety::Write,
+            Mode::Auto,
+            None
+        ),
         PrePromptDecision::Allow
     );
     assert_eq!(
-        pre_prompt_decision(PermissionCell::Ask, false, None, Safety::Write),
+        pre_prompt_decision(
+            PermissionCell::Ask,
+            false,
+            None,
+            Safety::Write,
+            Mode::Auto,
+            None
+        ),
         PrePromptDecision::Prompt
     );
 }
@@ -592,22 +620,26 @@ fn pre_prompt_allowlist_accelerates_ask() {
 #[test]
 fn pre_prompt_scoped_deny_vetoes_when_not_allowlisted() {
     // Scoped Deny vetoes when the tool is NOT on the allowlist.
-    assert_eq!(
+    assert!(matches!(
         pre_prompt_decision(
             PermissionCell::Ask,
             false,
             Some(RuleEffect::Deny),
-            Safety::Write
+            Safety::Write,
+            Mode::Auto,
+            Some("test-rule".into())
         ),
-        PrePromptDecision::Deny
-    );
+        PrePromptDecision::Deny(DenyReason::ScopedRule { .. })
+    ));
     // But the allowlist fires first — if allowlisted, scoped rules are skipped.
     assert_eq!(
         pre_prompt_decision(
             PermissionCell::Ask,
             true,
             Some(RuleEffect::Deny),
-            Safety::Write
+            Safety::Write,
+            Mode::Auto,
+            None
         ),
         PrePromptDecision::Allow
     );
@@ -621,7 +653,9 @@ fn pre_prompt_scoped_allow_clears_publish_but_not_dangerous() {
             PermissionCell::Ask,
             false,
             Some(RuleEffect::Allow),
-            Safety::Dangerous
+            Safety::Dangerous,
+            Mode::Auto,
+            None
         ),
         PrePromptDecision::Prompt
     );
@@ -630,7 +664,9 @@ fn pre_prompt_scoped_allow_clears_publish_but_not_dangerous() {
             PermissionCell::Ask,
             false,
             Some(RuleEffect::Allow),
-            Safety::Write
+            Safety::Write,
+            Mode::Auto,
+            None
         ),
         PrePromptDecision::Allow
     );
@@ -643,7 +679,9 @@ fn pre_prompt_scoped_allow_clears_publish_but_not_dangerous() {
             PermissionCell::Ask,
             false,
             Some(RuleEffect::Allow),
-            Safety::Publish
+            Safety::Publish,
+            Mode::Auto,
+            None
         ),
         PrePromptDecision::Allow
     );
@@ -651,7 +689,14 @@ fn pre_prompt_scoped_allow_clears_publish_but_not_dangerous() {
     // allowlist_covers excludes it, so `allowlisted` is false here and the cell
     // (Ask) still prompts.
     assert_eq!(
-        pre_prompt_decision(PermissionCell::Ask, false, None, Safety::Publish),
+        pre_prompt_decision(
+            PermissionCell::Ask,
+            false,
+            None,
+            Safety::Publish,
+            Mode::Auto,
+            None
+        ),
         PrePromptDecision::Prompt
     );
 }

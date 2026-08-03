@@ -464,9 +464,9 @@ impl Approver for RecordingApprover {
         _name: &str,
         _safety: Safety,
         _args: &serde_json::Value,
-    ) -> bool {
+    ) -> ApprovalOutcome {
         self.consulted.store(true, Ordering::SeqCst);
-        true
+        ApprovalOutcome::Allowed
     }
 }
 
@@ -591,8 +591,8 @@ impl Approver for AlwaysApprove {
         _name: &str,
         _safety: Safety,
         _args: &serde_json::Value,
-    ) -> bool {
-        true
+    ) -> ApprovalOutcome {
+        ApprovalOutcome::Allowed
     }
 }
 
@@ -606,8 +606,8 @@ impl Approver for AlwaysDeny {
         _name: &str,
         _safety: Safety,
         _args: &serde_json::Value,
-    ) -> bool {
-        false
+    ) -> ApprovalOutcome {
+        ApprovalOutcome::Denied(DenyReason::User)
     }
 }
 
@@ -649,9 +649,9 @@ impl Approver for CancelOnApprove {
         _name: &str,
         _safety: Safety,
         _args: &serde_json::Value,
-    ) -> bool {
+    ) -> ApprovalOutcome {
         self.0.cancel();
-        true
+        ApprovalOutcome::Allowed
     }
 }
 
@@ -666,9 +666,9 @@ impl Approver for YieldThenApprove {
         _name: &str,
         _safety: Safety,
         _args: &serde_json::Value,
-    ) -> bool {
+    ) -> ApprovalOutcome {
         tokio::task::yield_now().await;
-        true
+        ApprovalOutcome::Allowed
     }
 }
 
@@ -1446,8 +1446,8 @@ impl Approver for CannedAnswer {
         _name: &str,
         _safety: Safety,
         _args: &serde_json::Value,
-    ) -> bool {
-        false
+    ) -> ApprovalOutcome {
+        ApprovalOutcome::Denied(DenyReason::User)
     }
     async fn ask(
         &self,
@@ -1502,8 +1502,8 @@ impl Approver for CannedSecret {
         _name: &str,
         _safety: Safety,
         _args: &serde_json::Value,
-    ) -> bool {
-        false
+    ) -> ApprovalOutcome {
+        ApprovalOutcome::Denied(DenyReason::User)
     }
     async fn ask(
         &self,
@@ -3180,7 +3180,7 @@ async fn dropped_future_backfills_tool_results() {
             _name: &str,
             _safety: Safety,
             _args: &serde_json::Value,
-        ) -> bool {
+        ) -> ApprovalOutcome {
             std::future::pending::<()>().await;
             unreachable!("pending() never resolves")
         }
@@ -3375,7 +3375,7 @@ async fn denied_write_tool_reports_failure() {
                 success, result, ..
             } = ev
             {
-                if !success && result.contains("not approved") {
+                if !success && result.contains("user declined the approval prompt") {
                     denied_reported = true;
                 }
             }
@@ -3384,11 +3384,174 @@ async fn denied_write_tool_reports_failure() {
     .await
     .unwrap();
 
-    assert!(denied_reported);
+    assert!(
+        denied_reported,
+        "denial message should contain 'user declined the approval prompt'"
+    );
     // The file must be untouched because the edit was denied.
     assert_eq!(
         std::fs::read_to_string(dir.path().join("f.txt")).unwrap(),
         "old\n"
+    );
+}
+
+/// A mode deny (matrix cell = Deny) must name the mode and suggest Act (#1176).
+/// Mutation target: if this message is collapsed with any other reason, the test
+/// goes red.
+#[tokio::test]
+async fn mode_deny_names_the_mode_and_suggests_act() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = SessionStore::new();
+    let s = store.create_session(None);
+    store.add_message(&s.id, Role::User, "run it".into());
+    let registry = ToolRegistry::with_defaults();
+
+    struct ModeDenyApprover;
+    #[async_trait]
+    impl Approver for ModeDenyApprover {
+        async fn approve(
+            &self,
+            _message_id: &str,
+            _call_id: &str,
+            _name: &str,
+            _safety: Safety,
+            _args: &serde_json::Value,
+        ) -> ApprovalOutcome {
+            ApprovalOutcome::Denied(DenyReason::Mode {
+                mode: Mode::Auto,
+                safety: Safety::Dangerous,
+            })
+        }
+    }
+
+    struct DangerousToolProvider;
+    #[async_trait]
+    impl Provider for DangerousToolProvider {
+        async fn chat_stream(&self, _req: ChatRequest) -> Result<ChunkStream, LlmError> {
+            Ok(futures_util::stream::iter(vec![Ok(Chunk {
+                tool_calls: vec![ToolCallDelta {
+                    index: 0,
+                    id: Some("call_d".into()),
+                    name: Some("python".into()),
+                    arguments: r#"{"code":"1+1"}"#.into(),
+                }],
+                done: true,
+                ..Chunk::default()
+            })])
+            .boxed())
+        }
+    }
+
+    let mut found = None;
+    run_turn(
+        &DangerousToolProvider,
+        &store,
+        &ctx(&registry, dir.path(), &ModeDenyApprover),
+        &s.id,
+        "mock",
+        None,
+        false,
+        ReasoningVisibility::All,
+        CancelToken::new(),
+        |ev| {
+            if let AgentEvent::ToolCallFinished {
+                success, result, ..
+            } = ev
+            {
+                if !success {
+                    found = Some(result.clone());
+                }
+            }
+        },
+    )
+    .await
+    .unwrap();
+
+    let msg = found.expect("a mode-denied tool must produce a failure result");
+    assert!(
+        msg.contains("Auto mode does not allow Dangerous tools"),
+        "mode deny must name the mode and safety in the message: got {msg}"
+    );
+    assert!(
+        msg.contains("Switch to Act mode to run this"),
+        "mode deny must name Act as the escape hatch: got {msg}"
+    );
+}
+
+/// A scoped-rule deny must name the rule that blocked the call (#1176).
+/// Mutation target: collapsing this with Mode or User must turn a test red.
+#[tokio::test]
+async fn scoped_rule_deny_names_the_rule() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = SessionStore::new();
+    let s = store.create_session(None);
+    store.add_message(&s.id, Role::User, "run it".into());
+    let registry = ToolRegistry::with_defaults();
+
+    struct ScopedRuleDenyApprover;
+    #[async_trait]
+    impl Approver for ScopedRuleDenyApprover {
+        async fn approve(
+            &self,
+            _message_id: &str,
+            _call_id: &str,
+            _name: &str,
+            _safety: Safety,
+            _args: &serde_json::Value,
+        ) -> ApprovalOutcome {
+            ApprovalOutcome::Denied(DenyReason::ScopedRule {
+                rule: "bash (command prefix 'rm')".into(),
+            })
+        }
+    }
+
+    struct BashProvider;
+    #[async_trait]
+    impl Provider for BashProvider {
+        async fn chat_stream(&self, _req: ChatRequest) -> Result<ChunkStream, LlmError> {
+            Ok(futures_util::stream::iter(vec![Ok(Chunk {
+                tool_calls: vec![ToolCallDelta {
+                    index: 0,
+                    id: Some("call_b".into()),
+                    name: Some("bash".into()),
+                    arguments: r#"{"command":"rm -rf x"}"#.into(),
+                }],
+                done: true,
+                ..Chunk::default()
+            })])
+            .boxed())
+        }
+    }
+
+    let mut found = None;
+    run_turn(
+        &BashProvider,
+        &store,
+        &ctx(&registry, dir.path(), &ScopedRuleDenyApprover),
+        &s.id,
+        "mock",
+        None,
+        false,
+        ReasoningVisibility::All,
+        CancelToken::new(),
+        |ev| {
+            if let AgentEvent::ToolCallFinished {
+                success, result, ..
+            } = ev
+            {
+                if !success {
+                    found = Some(result.clone());
+                }
+            }
+        },
+    )
+    .await
+    .unwrap();
+
+    let msg = found.expect("a scoped-rule-denied tool must produce a failure result");
+    assert!(
+        msg.contains("denied by scoped permission rule: bash (command prefix 'rm')"),
+        "scoped rule deny must name the rule: got {msg}"
     );
 }
 
