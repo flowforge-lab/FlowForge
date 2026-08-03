@@ -58,6 +58,12 @@ const FLAGS: readonly FlagMeta[] = [
       "Show a developer download on each step group to export its per-step timing (JSON/CSV) for diagnosing slow runs.",
   },
   {
+    id: "transcriptOutline",
+    label: "Transcript outline",
+    description:
+      "Show a clickable outline beside the transcript scrollbar, one marker per turn, for jumping around a long session.",
+  },
+  {
     id: "localUpdateChannel",
     label: "Local update channel",
     description:

@@ -26,12 +26,20 @@ import { foldTurns, lastTurnStart, segmentTurn } from "@/lib/turn-groups";
 import type { RenderGroup, TurnItem } from "@/lib/turn-groups";
 import { useExperimentalStore } from "@/store/experimental";
 import { useTranscriptScroll } from "@/store/transcript-scroll";
+import { TranscriptOutline } from "@/components/transcript-outline";
+import {
+  OUTLINE_MIN_GROUPS,
+  buildOutline,
+  outlineKey,
+} from "@/lib/transcript-outline";
+import type { OutlineMarker } from "@/lib/transcript-outline";
 import { useModelConfigStore, activeConnection } from "@/store/model-config";
 import { downloadStepTimeline } from "@/lib/export-step-timeline";
 import type { Message } from "@/bindings";
 
 const NO_STEPS: ToolStep[] = [];
 const NO_ITEMS: TurnItem[] = [];
+const NO_MARKERS: OutlineMarker[] = [];
 // #866: how long a session switch's forced bottom-pin stays armed, bridging
 // the async gap until loadSession()'s full-history swap-in settles.
 //
@@ -521,6 +529,9 @@ export function ChatView({ sessionId }: { sessionId?: string } = {}) {
   // Dev step-timeline export (#417): the affordance shows only with the flag on; the
   // active model id is stamped into the dump's meta.
   const exportEnabled = useExperimentalStore((s) => s.flags.stepTimelineExport);
+  // Transcript scroll outline (#1165), dogfooded behind a flag first the way
+  // virtualization (#1143) was.
+  const outlineOn = useExperimentalStore((s) => s.flags.transcriptOutline);
   const exportModel = useModelConfigStore(
     (s) => activeConnection(s.registry)?.model ?? null,
   );
@@ -896,6 +907,24 @@ export function ChatView({ sessionId }: { sessionId?: string } = {}) {
   useEffect(() => {
     groupsRef.current = groups;
   }, [groups]);
+
+  // Outline markers (#1165), rebuilt only when a group is added or removed —
+  // not on every streamed token, which hands back a fresh `groups` array as the
+  // tail re-folds. The memo is therefore keyed on `outlineKey` rather than on
+  // `groups` identity, the same shape `prefixGroups` uses to keep the fold
+  // itself off the hot path (#1022).
+  //
+  // The body reads `groups` and NOT `groupsRef`: the ref is synced in an effect,
+  // so during the commit that swaps sessions it still holds the *previous*
+  // transcript — markers for the session you just navigated away from, and no
+  // later key change to correct them.
+  const outlineGroupsKey = outlineOn ? outlineKey(groups) : "";
+  const outlineMarkers = useMemo(
+    () => (outlineOn ? buildOutline(groups) : NO_MARKERS),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [outlineOn, outlineGroupsKey],
+  );
+
   const register = useTranscriptScroll((s) => s.register);
   useEffect(() => {
     if (!targetSessionId) return;
@@ -904,6 +933,24 @@ export function ChatView({ sessionId }: { sessionId?: string } = {}) {
         (g) => g.message.id === messageId,
       );
       if (index < 0) return false;
+      // A reveal is a deliberate navigation, so retire the #866 swap-in arm and
+      // detach the pin before scrolling. Without this the outline (#1165) can
+      // be undone by the pin it has no idea exists: the arm lasts 4s from a
+      // session switch and is consumed only by an *authoritative* settle, which
+      // never arrives when the swap-in renders at the same height (the <=50
+      // message case). Click a marker inside that window and the rows the jump
+      // mounts resize the spacer, the ResizeObserver settle finds the arm still
+      // live, and it force-pins back to the tail — exactly the "open a session
+      // and immediately navigate" gesture an outline invites. The arm exists to
+      // bridge the swap-in for a user who has *not* navigated; a reveal is
+      // proof that they have.
+      //
+      // Here rather than in the outline's click handler so the next consumer of
+      // the bus can't forget it. It is a no-op improvement for the find bar,
+      // which `findOn` already gates.
+      forcePinUntil.current = 0;
+      pinnedToBottom.current = false;
+      setAtBottom(false);
       // `center` so a hit lands mid-viewport with context either side, which is
       // what `scrollRangeIntoView` then refines to the matched span itself.
       virtualizer.scrollToIndex(index, { align: "center" });
@@ -1023,7 +1070,11 @@ export function ChatView({ sessionId }: { sessionId?: string } = {}) {
         ref={attachScroll}
         onScroll={handleScroll}
         data-testid="chat-scroll"
-        className="min-h-0 flex-1 overflow-y-auto"
+        // `scrollbar-gutter: stable` reserves the scrollbar's width even where
+        // the platform overlays it, so the outline (#1165) sits in the same
+        // place on macOS as on a classic-scrollbar platform, and toggling the
+        // flag doesn't reflow the transcript.
+        className="min-h-0 flex-1 overflow-y-auto [scrollbar-gutter:stable]"
       >
         <div ref={setContentEl} className="mx-auto w-full max-w-4xl px-4 py-4">
           {/* The spacer carries the full measured height so the scrollbar is
@@ -1050,6 +1101,20 @@ export function ChatView({ sessionId }: { sessionId?: string } = {}) {
           {pending && <ThinkingIndicator />}
         </div>
       </div>
+
+      {/* The scroll outline (#1165). Below the minimum it is clutter: a session
+          that fits in a viewport or two has nothing to navigate. `firstIndex` /
+          `lastIndex` are passed as numbers, not `virtualItems`, so the memo
+          holds across a streamed token. */}
+      {outlineOn && targetSessionId && groups.length >= OUTLINE_MIN_GROUPS && (
+        <TranscriptOutline
+          sessionId={targetSessionId}
+          markers={outlineMarkers}
+          total={groups.length}
+          firstIndex={virtualItems[0]?.index ?? 0}
+          lastIndex={virtualItems[virtualItems.length - 1]?.index ?? 0}
+        />
+      )}
 
       {/* Floating "Jump to latest" — only while scrolled up (#206). A primary dot
           flags new content arriving below during an active stream. */}
