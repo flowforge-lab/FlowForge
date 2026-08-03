@@ -572,6 +572,51 @@ impl SessionStore {
         .flatten()
     }
 
+    /// Count how often each pair of *different* tools was called in the same
+    /// assistant batch, across every session (#1107). The co-invocation signal
+    /// RFC 0024 Layer 3 wants was already on disk: one `messages.tool_calls` row
+    /// is one concurrent batch, so "invoked together" needs no invented window.
+    ///
+    /// Pairs are keyed with the lexicographically smaller name first, so a pair
+    /// is counted once rather than once per direction. A tool repeated inside one
+    /// batch pairs once with each batch-mate and never with itself: two greps are
+    /// not evidence that two *different* tools belong together.
+    ///
+    /// Read-only and unweighted -- deliberately not a prior. Folding this into
+    /// preheat selection needs a decay policy and a guard against the
+    /// self-reinforcement it would otherwise create, neither of which is settled.
+    #[must_use]
+    pub fn tool_co_invocations(&self) -> HashMap<(String, String), u32> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt =
+            match conn.prepare("SELECT tool_calls FROM messages WHERE tool_calls IS NOT NULL") {
+                Ok(s) => s,
+                Err(_) => return HashMap::new(),
+            };
+        let rows = match stmt.query_map([], |row| row.get::<_, String>(0)) {
+            Ok(r) => r,
+            Err(_) => return HashMap::new(),
+        };
+
+        let mut counts: HashMap<(String, String), u32> = HashMap::new();
+        for json in rows.flatten() {
+            let Ok(calls) = serde_json::from_str::<Vec<ToolCall>>(&json) else {
+                continue;
+            };
+            let mut names: Vec<&str> = calls.iter().map(|c| c.name.as_str()).collect();
+            names.sort_unstable();
+            names.dedup();
+            for (i, a) in names.iter().enumerate() {
+                for b in &names[i + 1..] {
+                    *counts
+                        .entry(((*a).to_string(), (*b).to_string()))
+                        .or_insert(0) += 1;
+                }
+            }
+        }
+        counts
+    }
+
     fn push_message(&self, mut msg: Message) -> Message {
         let conn = self.conn.lock().unwrap();
         // Persist a deferred draft (#671 item 2a) before its first message: the

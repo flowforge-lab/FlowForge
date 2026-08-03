@@ -1825,3 +1825,92 @@ fn migration_v12_to_v13_preserves_messages_and_adds_turn_preheat() {
         .unwrap();
     assert_eq!(version, 13);
 }
+
+// ---- Tool co-invocation rollup (#1107) ----
+//
+// The co-invocation signal RFC 0024 Layer 3 needs was already being persisted:
+// `messages.tool_calls` holds one JSON array per assistant row, and a row is one
+// concurrent batch. That makes "invoked together" a fact already on disk rather
+// than a window length someone has to invent. This is the read side only -- no
+// prior, no decay, no task type.
+
+fn batch(store: &SessionStore, session_id: &str, names: &[&str]) {
+    let m = store.add_message(session_id, Role::Assistant, String::new());
+    let calls = names
+        .iter()
+        .enumerate()
+        .map(|(i, n)| ToolCall {
+            id: format!("call_{i}"),
+            name: (*n).to_string(),
+            arguments: "{}".into(),
+        })
+        .collect();
+    store.attach_tool_calls(&m.id, session_id, calls);
+}
+
+#[test]
+fn co_invocation_counts_pairs_within_a_batch() {
+    let store = SessionStore::new();
+    let s = store.create_session(None);
+    batch(&store, &s.id, &["grep", "view"]);
+    batch(&store, &s.id, &["grep", "view"]);
+    batch(&store, &s.id, &["grep", "glob"]);
+
+    let pairs = store.tool_co_invocations();
+    assert_eq!(pairs.get(&("grep".into(), "view".into())), Some(&2));
+    assert_eq!(pairs.get(&("glob".into(), "grep".into())), Some(&1));
+    assert_eq!(
+        pairs.get(&("view".into(), "grep".into())),
+        None,
+        "a pair must be keyed one way only, or every count is doubled"
+    );
+}
+
+#[test]
+fn a_lone_tool_call_is_not_a_co_invocation() {
+    // Sequential single calls are the common case; counting them as co-invocation
+    // would make every tool look correlated with whatever ran next.
+    let store = SessionStore::new();
+    let s = store.create_session(None);
+    batch(&store, &s.id, &["grep"]);
+    batch(&store, &s.id, &["view"]);
+
+    assert!(
+        store.tool_co_invocations().is_empty(),
+        "one call per batch is not co-invocation"
+    );
+}
+
+#[test]
+fn co_invocation_ignores_a_tool_paired_with_itself() {
+    // A batch may call the same tool twice (two greps, different patterns). That
+    // is not evidence two *different* tools belong together.
+    let store = SessionStore::new();
+    let s = store.create_session(None);
+    batch(&store, &s.id, &["grep", "grep", "view"]);
+
+    let pairs = store.tool_co_invocations();
+    assert_eq!(pairs.get(&("grep".into(), "grep".into())), None);
+    assert_eq!(
+        pairs.get(&("grep".into(), "view".into())),
+        Some(&1),
+        "a duplicated tool must still pair once with its batch-mates"
+    );
+}
+
+#[test]
+fn co_invocation_aggregates_across_sessions() {
+    let store = SessionStore::new();
+    let a = store.create_session(None);
+    let b = store.create_session(None);
+    batch(&store, &a.id, &["grep", "view"]);
+    batch(&store, &b.id, &["grep", "view"]);
+
+    assert_eq!(
+        store
+            .tool_co_invocations()
+            .get(&("grep".into(), "view".into())),
+        Some(&2),
+        "the prior is cross-session; per-session counts would be too sparse to use"
+    );
+}
