@@ -70,6 +70,13 @@ const ROW_ESTIMATE_PX = 140;
 // this constant is what the node-count invariant in
 // `chat-view.virtualization.test.tsx` is really asserting about.
 const OVERSCAN = 6;
+// The content wrapper's `py-4` bottom padding, which lives *outside* the
+// virtualizer's spacer and therefore outside its coordinate space. Told to the
+// virtualizer as `scrollPaddingEnd` so an `align: "end"` scroll targets the
+// same offset the raw clamp in `pinToTail` lands on; without it the two
+// disagree by 16px and the reconcile loop never reaches `approxEqual`, spinning
+// write-free frames until its 5s bail-out after every idle pin.
+const TAIL_PADDING_PX = 16;
 // Viewport assumed for the frame between mount and the virtualizer's first
 // measurement, so the initial window isn't computed against a 0×0 box. The real
 // size replaces it as soon as the scroll element is observed — this only has to
@@ -615,7 +622,18 @@ export function ChatView({ sessionId }: { sessionId?: string } = {}) {
   // observer below was never attached on that mount — no initial pin, and no
   // streaming follow either. A callback ref re-renders when the node appears,
   // which puts the mount itself in the dep list.
+  //
+  // A ref mirrors the same node, because `pinToTail` — the one place that writes
+  // `scrollTop` — is a `useCallback`, and reading the `useState` value from
+  // inside one is what the compiler lint rejects (see `shouldPinToTail`). The
+  // ref is written from the callback ref itself rather than an effect, so it is
+  // populated on the commit the node appears, not one commit later.
   const [scrollEl, setScrollEl] = useState<HTMLDivElement | null>(null);
+  const scrollElRef = useRef<HTMLDivElement | null>(null);
+  const attachScroll = useCallback((el: HTMLDivElement | null) => {
+    scrollElRef.current = el;
+    setScrollEl(el);
+  }, []);
   // The growing content wrapper, observed for post-layout height changes (#1025).
   const [contentEl, setContentEl] = useState<HTMLDivElement | null>(null);
   const pinnedToBottom = useRef(true);
@@ -653,11 +671,12 @@ export function ChatView({ sessionId }: { sessionId?: string } = {}) {
   // THE pin decision — the single implementation every trigger funnels through
   // (the ResizeObserver settle, the session switch, and the transcript swap), so
   // there is one gate and one place the arm is read and consumed, not a copy per
-  // trigger. Returns whether the caller should pin; the caller does its own
-  // one-line `scrollTop = scrollHeight` (writing to the container from in here
-  // would be mutating a `useState` value inside a callback, which the compiler
-  // lint rejects). Always call it from inside a rAF: every caller needs the
-  // post-layout height, for the reasons #1025 documents on the observer.
+  // trigger. Returns whether the caller should pin; the caller is `pinToTail`,
+  // the single writer, defined below the virtualizer (this stays a pure decision
+  // because writing to the container from in here would be mutating a `useState`
+  // value inside a callback, which the compiler lint rejects). Always call it
+  // from inside a rAF: every caller needs the post-layout height, for the
+  // reasons #1025 documents on the observer.
   //
   // `authoritative` marks the ResizeObserver settle — the only caller that can
   // know layout finished for this frame, and therefore the only one allowed to
@@ -686,89 +705,10 @@ export function ChatView({ sessionId }: { sessionId?: string } = {}) {
     [findOn],
   );
 
-  // Stay pinned to the bottom while streaming, but respect manual scroll-up.
-  // Pinning has to happen *after* the browser lays out the new content, not at
-  // React commit time (#1025): a large markdown / <pre> / image block grows the
-  // scroll container's height *after* the token that inserted it commits, so a
-  // commit-time `scrollTop = scrollHeight` reads a pre-layout height and lands
-  // the view above the real tail. A ResizeObserver fires post-layout for every
-  // size change — each token, the pending indicator, late-settling blocks, an
-  // image finishing load — and re-pins to the true bottom. Only follows while the
-  // user is still pinned; `findOn` (#679) suppresses the yank while reading a
-  // match. Writing `scrollTop` doesn't resize the content, so there's no loop.
-  //
-  // The observer can fire many times per frame during a fast stream (the #1022
-  // churn cluster), so the pin is coalesced into a single rAF-scheduled write per
-  // frame instead of a synchronous write per fire. The rAF also reads
-  // `scrollHeight` at paint time — the freshest post-layout height for that frame.
-  useEffect(() => {
-    if (!scrollEl || !contentEl) return;
-    let raf = 0;
-    const ro = new ResizeObserver(() => {
-      if (raf) return; // a pin is already scheduled for this frame
-      raf = requestAnimationFrame(() => {
-        raf = 0;
-        // The authoritative post-layout settle — the one caller that consumes.
-        if (shouldPinToTail(true)) scrollEl.scrollTop = scrollEl.scrollHeight;
-      });
-    });
-    ro.observe(contentEl);
-    return () => {
-      ro.disconnect();
-      if (raf) cancelAnimationFrame(raf);
-    };
-  }, [scrollEl, contentEl, shouldPinToTail]);
-
-  // A session swap can land on a transcript of the same height (no ResizeObserver
-  // fire), so re-arm the pin and jump to the tail explicitly here. `findOn` gates
-  // it so the in-thread find (#679) and its global-search seed (#710) aren't
-  // yanked back to the tail the moment the session switches (#875).
-  //
-  // The pin is deferred to a rAF for the same post-layout reason as the observer
-  // (#1025): at commit time the freshly mounted rows haven't laid out, so a
-  // synchronous `scrollTop = scrollHeight` reads a short height and lands above
-  // the tail.
-  //
-  // It also only pins to whatever is rendered *right now* — on a cold session
-  // switch that's the short localStorage-cached tail (message-cache.ts), not
-  // the full history loadSession() swaps in moments later (#866). Arm
-  // `forcePinUntil`/`armedFirstMessageId` here so `shouldPinToTail` can force
-  // the eventual full-history settle to the true bottom, even if a transient
-  // scroll event flips `pinnedToBottom.current` to false in between.
-  useEffect(() => {
-    pinnedToBottom.current = true;
-    forcePinUntil.current = Date.now() + FORCE_PIN_WINDOW_MS;
-    armedFirstMessageId.current = messages?.[0]?.id;
-    if (!scrollEl) return;
-    const raf = requestAnimationFrame(() => {
-      if (shouldPinToTail(false)) scrollEl.scrollTop = scrollEl.scrollHeight;
-    });
-    return () => cancelAnimationFrame(raf);
-    // `messages` is deliberately NOT a dependency: the arm must capture
-    // whatever is rendered at the moment of the switch (the cache), not re-arm
-    // on every later token — `latestMessagesRef` is what `shouldPinToTail`
-    // reads live, for exactly that reason.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [targetSessionId, scrollEl, shouldPinToTail]);
-
-  // The relaunch swap (#866): `loadSession` replaces the store's <=50-message
-  // localStorage tail with the backend's full history, which can render at the
-  // *same* height (a session of <=50 messages) — so no ResizeObserver fire —
-  // while `targetSessionId` never changed, so the effect above doesn't re-run
-  // either. Pin on the transcript's identity changing as well, through the same
-  // `shouldPinToTail` gate; non-authoritative, so it never consumes the arm.
-  useEffect(() => {
-    if (!scrollEl) return;
-    const raf = requestAnimationFrame(() => {
-      if (shouldPinToTail(false)) scrollEl.scrollTop = scrollEl.scrollHeight;
-    });
-    return () => cancelAnimationFrame(raf);
-  }, [messages, scrollEl, shouldPinToTail]);
-
   // Reset the scroll affordance when the pane switches sessions. setState during
   // render is React's recommended reset-on-prop-change pattern — no effect, no
   // flash of the button before a scroll event would otherwise clear it. (The
-  // `pinnedToBottom` ref is re-armed by the session-switch effect above.)
+  // `pinnedToBottom` ref is re-armed by the session-switch effect below.)
   const [renderedSession, setRenderedSession] = useState(targetSessionId);
   if (renderedSession !== targetSessionId) {
     setRenderedSession(targetSessionId);
@@ -813,8 +753,136 @@ export function ChatView({ sessionId }: { sessionId?: string } = {}) {
     getItemKey: (i) => groups[i].message.id,
     overscan: OVERSCAN,
     initialRect: INITIAL_RECT,
+    scrollPaddingEnd: TAIL_PADDING_PX,
   });
   const virtualItems = virtualizer.getVirtualItems();
+
+  // THE pin write — the one place `scrollTop` is moved toward the tail, for all
+  // three triggers below. `shouldPinToTail` decides; this executes.
+  //
+  // Two writes, because neither alone lands at the bottom of a long session:
+  //
+  //  1. `scrollToEnd()` is the half that *converges*. It is
+  //     `scrollToIndex(count - 1, { align: "end" })`, and virtual-core records
+  //     the target index and runs a rAF reconcile loop that recomputes the
+  //     offset each frame as rows measure, re-scrolling when it moves. A bare
+  //     `scrollTop = scrollHeight` cannot do this: `scrollHeight` is
+  //     `getTotalSize()`, i.e. measured heights plus a 140px estimate for every
+  //     row that has never mounted, so on a cold session open it under-states
+  //     the session badly (#1165). Scrolling toward it mounts rows, they measure
+  //     taller, the total grows, and the bottom moves further away — the view
+  //     lands short, `handleScroll` flips `pinnedToBottom` false, and since the
+  //     arm is consumed by that same settle nothing re-pins. That was #1165's
+  //     "opening a session doesn't land on the latest message", and it is the
+  //     same defect `jumpToLatest` was fixed for in #1143 review.
+  //  2. The raw write covers what the virtualizer's coordinate space does not
+  //     contain: the wrapper's `py-4` and the `<ThinkingIndicator />`, both
+  //     rendered outside the spacer. `scrollPaddingEnd` reconciles the padding,
+  //     but the indicator's height exceeds `handleScroll`'s 40px threshold, so
+  //     without this the arrow would sit on screen for the whole of a stream.
+  //     It is always >= the virtualizer's target and browser-clamped to the real
+  //     maximum, so it cannot overshoot, and reconcile only re-scrolls when its
+  //     *target* moves — it never drags back up to undo this.
+  //
+  // Always `behavior: "auto"`, never smooth: a smooth animation's intermediate
+  // `scroll` events run `handleScroll`, which reads each one as "not at the
+  // bottom" and detaches the very pin being applied. Only `jumpToLatest`, a
+  // deliberate one-off, is smooth.
+  //
+  // Repeated calls are cheap enough for the per-frame streaming settle:
+  // `scrollToIndex` is O(1) on a cached measurement and performs exactly one
+  // synchronous scroll write, and N calls in one frame schedule one reconcile
+  // rAF (`scheduleScrollReconcile` is rAF-guarded), so nothing accumulates.
+  //
+  // What must NOT be added: a "only converge when far from the bottom" guard.
+  // The distance would be computed from the same under-stated `scrollHeight`,
+  // so it reports "near" exactly in the case this exists for.
+  const pinToTail = useCallback(
+    (authoritative: boolean) => {
+      const el = scrollElRef.current;
+      if (!el || !shouldPinToTail(authoritative)) return;
+      virtualizer.scrollToEnd();
+      el.scrollTop = el.scrollHeight;
+    },
+    [shouldPinToTail, virtualizer],
+  );
+
+  // Stay pinned to the bottom while streaming, but respect manual scroll-up.
+  // Pinning has to happen *after* the browser lays out the new content, not at
+  // React commit time (#1025): a large markdown / <pre> / image block grows the
+  // scroll container's height *after* the token that inserted it commits, so a
+  // commit-time pin reads a pre-layout height and lands the view above the real
+  // tail. A ResizeObserver fires post-layout for every size change — each token,
+  // the pending indicator, late-settling blocks, an image finishing load — and
+  // re-pins to the true bottom. Only follows while the user is still pinned;
+  // `findOn` (#679) suppresses the yank while reading a match. Writing
+  // `scrollTop` doesn't resize the content, so there's no loop.
+  //
+  // The observer can fire many times per frame during a fast stream (the #1022
+  // churn cluster), so the pin is coalesced into a single rAF-scheduled write per
+  // frame instead of a synchronous write per fire. The rAF also reads
+  // `scrollHeight` at paint time — the freshest post-layout height for that frame.
+  useEffect(() => {
+    if (!contentEl) return;
+    let raf = 0;
+    const ro = new ResizeObserver(() => {
+      if (raf) return; // a pin is already scheduled for this frame
+      raf = requestAnimationFrame(() => {
+        raf = 0;
+        // The authoritative post-layout settle — the one caller that consumes.
+        pinToTail(true);
+      });
+    });
+    ro.observe(contentEl);
+    return () => {
+      ro.disconnect();
+      if (raf) cancelAnimationFrame(raf);
+    };
+  }, [contentEl, pinToTail]);
+
+  // A session swap can land on a transcript of the same height (no ResizeObserver
+  // fire), so re-arm the pin and jump to the tail explicitly here. `findOn` gates
+  // it so the in-thread find (#679) and its global-search seed (#710) aren't
+  // yanked back to the tail the moment the session switches (#875).
+  //
+  // The pin is deferred to a rAF for the same post-layout reason as the observer
+  // (#1025): at commit time the freshly mounted rows haven't laid out, so a
+  // synchronous pin reads a short height and lands above the tail. It is also
+  // the trigger that most depends on `pinToTail` converging rather than aiming
+  // at `scrollHeight` — on a cold open almost every row is unmeasured, so the
+  // estimate is at its most wrong precisely here (#1165).
+  //
+  // It also only pins to whatever is rendered *right now* — on a cold session
+  // switch that's the short localStorage-cached tail (message-cache.ts), not
+  // the full history loadSession() swaps in moments later (#866). Arm
+  // `forcePinUntil`/`armedFirstMessageId` here so `shouldPinToTail` can force
+  // the eventual full-history settle to the true bottom, even if a transient
+  // scroll event flips `pinnedToBottom.current` to false in between.
+  useEffect(() => {
+    pinnedToBottom.current = true;
+    forcePinUntil.current = Date.now() + FORCE_PIN_WINDOW_MS;
+    armedFirstMessageId.current = messages?.[0]?.id;
+    if (!scrollEl) return;
+    const raf = requestAnimationFrame(() => pinToTail(false));
+    return () => cancelAnimationFrame(raf);
+    // `messages` is deliberately NOT a dependency: the arm must capture
+    // whatever is rendered at the moment of the switch (the cache), not re-arm
+    // on every later token — `latestMessagesRef` is what `shouldPinToTail`
+    // reads live, for exactly that reason.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [targetSessionId, scrollEl, pinToTail]);
+
+  // The relaunch swap (#866): `loadSession` replaces the store's <=50-message
+  // localStorage tail with the backend's full history, which can render at the
+  // *same* height (a session of <=50 messages) — so no ResizeObserver fire —
+  // while `targetSessionId` never changed, so the effect above doesn't re-run
+  // either. Pin on the transcript's identity changing as well, through the same
+  // `shouldPinToTail` gate; non-authoritative, so it never consumes the arm.
+  useEffect(() => {
+    if (!scrollEl) return;
+    const raf = requestAnimationFrame(() => pinToTail(false));
+    return () => cancelAnimationFrame(raf);
+  }, [messages, scrollEl, pinToTail]);
 
   // Publish a reveal for this session (#1143). Anything that needs to look at a
   // specific message — the find bar stepping onto a hit far above the viewport —
@@ -881,14 +949,10 @@ export function ChatView({ sessionId }: { sessionId?: string } = {}) {
   function jumpToLatest() {
     const el = scrollEl;
     if (!el) return;
-    if (groups.length > 0) {
-      virtualizer.scrollToIndex(groups.length - 1, {
-        align: "end",
-        behavior: "smooth",
-      });
-    } else {
-      el.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
-    }
+    // `scrollToEnd` is `scrollToIndex(count - 1, { align: "end" })` with the
+    // empty-list fallback folded in — the same convergence `pinToTail` relies
+    // on, and this comment is the long-form version of why both need it.
+    virtualizer.scrollToEnd({ behavior: "smooth" });
     pinnedToBottom.current = true;
     setAtBottom(true);
   }
@@ -956,7 +1020,7 @@ export function ChatView({ sessionId }: { sessionId?: string } = {}) {
   return (
     <div className="relative flex min-h-0 flex-1 flex-col">
       <div
-        ref={setScrollEl}
+        ref={attachScroll}
         onScroll={handleScroll}
         data-testid="chat-scroll"
         className="min-h-0 flex-1 overflow-y-auto"

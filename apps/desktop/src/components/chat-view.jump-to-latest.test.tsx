@@ -76,9 +76,16 @@ async function renderScrolledToTop() {
     '[data-testid="chat-scroll"]',
   ) as HTMLDivElement;
   makeScrollable(scrollEl);
-  await flushFrames();
   // Park at the top and let the scroll handler detach the pin, which is what
   // puts the arrow on screen in the first place.
+  //
+  // This has to happen *before* the session-open pin's frames run. Since #1165
+  // that pin converges to the true tail like the arrow does, so flushing first
+  // would measure every tail row and leave `scrollHeight` honest — and the
+  // whole subject of this suite is what the arrow does against a spacer that is
+  // still mostly estimates. Detaching first is also the only state in which the
+  // arrow appears at all: a user who scrolled up while the session was still
+  // opening.
   await act(async () => {
     scrollEl.scrollTop = 0;
   });
