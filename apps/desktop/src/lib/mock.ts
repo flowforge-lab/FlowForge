@@ -87,6 +87,7 @@ import {
 import { autoTitle } from "./auto-title";
 import { tokenizeQuery } from "./find-tokens";
 import type { PhenotypeMcpUnavailableEvent } from "@/bindings";
+import type { PhenotypePreheatDroppedEvent } from "@/bindings";
 
 type Listener<T> = (e: T) => void;
 
@@ -981,6 +982,9 @@ export class MockIpc implements FfIpc {
   private phenoMcpUnavailableListeners = new Set<
     Listener<PhenotypeMcpUnavailableEvent>
   >();
+  private preheatDroppedListeners = new Set<
+    Listener<PhenotypePreheatDroppedEvent>
+  >();
   private updateProgressListeners = new Set<Listener<UpdateProgressEvent>>();
   private updateDownloadFinishedListeners = new Set<Listener<void>>();
   // Last result handed out by `checkForUpdates`, so `installUpdate` can mirror the
@@ -1535,6 +1539,11 @@ export class MockIpc implements FfIpc {
     cb: Listener<PhenotypeMcpUnavailableEvent>,
   ): Promise<Unlisten> {
     return this.subscribe(this.phenoMcpUnavailableListeners, cb);
+  }
+  onPhenotypePreheatDropped(
+    cb: Listener<PhenotypePreheatDroppedEvent>,
+  ): Promise<Unlisten> {
+    return this.subscribe(this.preheatDroppedListeners, cb);
   }
   onWorkspaceBranchChanged(cb: Listener<SessionWorkspace>): Promise<Unlisten> {
     return this.subscribe(this.workspaceBranchListeners, cb);

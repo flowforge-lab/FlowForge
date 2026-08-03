@@ -57,6 +57,7 @@ export type { McpServerStatus } from "./McpServerStatus";
 export type { McpToolInfo } from "./McpToolInfo";
 export type { McpStatusChangedEvent } from "./McpStatusChangedEvent";
 export type { PhenotypeMcpUnavailableEvent } from "./PhenotypeMcpUnavailableEvent";
+export type { PhenotypePreheatDroppedEvent } from "./PhenotypePreheatDroppedEvent";
 export type { UpdateProgressEvent } from "./UpdateProgressEvent";
 export type { MemoryChunkStat } from "./MemoryChunkStat";
 export type { MemoryFileInfo } from "./MemoryFileInfo";

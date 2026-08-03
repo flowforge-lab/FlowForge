@@ -172,6 +172,62 @@ fn save_omits_name_and_none_fields() {
 }
 
 #[test]
+fn save_round_trips_preheat() {
+    // Regression guard (#1179): the write path dropped `preheat` exactly the way it
+    // once dropped `egress`, so editing+saving a phenotype in the UI silently erased
+    // its preheat list. Round-trip a populated list and assert it survives save->load.
+    let dir = tempfile::tempdir().unwrap();
+    let warm = Phenotype {
+        name: "warm".into(),
+        skills: Vec::new(),
+        model: None,
+        persona: None,
+        max_iterations: None,
+        provider: None,
+        mcp_servers: Vec::new(),
+        egress: ff_core::Egress::Open,
+        preheat: vec!["memory_search".into(), "web_fetch".into()],
+    };
+    save_phenotype(dir.path(), &warm).unwrap();
+    let body = fs::read_to_string(dir.path().join("warm.toml")).unwrap();
+    assert!(
+        body.contains("preheat"),
+        "a non-empty preheat list must be written: {body:?}"
+    );
+    let (map, errs) = load_phenotypes(dir.path());
+    assert!(errs.is_empty(), "{errs:?}");
+    assert_eq!(
+        map.get("warm").expect("warm phenotype").preheat,
+        vec!["memory_search".to_string(), "web_fetch".to_string()],
+        "preheat must survive the save->load round-trip"
+    );
+}
+
+#[test]
+fn save_omits_empty_preheat() {
+    // The common case is no preheat at all; writing `preheat = []` into every file
+    // would be pure noise. Sibling empty/None fields are omitted, so this one is too.
+    let dir = tempfile::tempdir().unwrap();
+    let cold = Phenotype {
+        name: "cold".into(),
+        skills: Vec::new(),
+        model: None,
+        persona: None,
+        max_iterations: None,
+        provider: None,
+        mcp_servers: Vec::new(),
+        egress: ff_core::Egress::Open,
+        preheat: Vec::new(),
+    };
+    save_phenotype(dir.path(), &cold).unwrap();
+    let body = fs::read_to_string(dir.path().join("cold.toml")).unwrap();
+    assert!(
+        !body.contains("preheat"),
+        "an empty preheat list must not be written: {body:?}"
+    );
+}
+
+#[test]
 fn save_round_trips_local_only_egress() {
     // Regression guard (RFC 0013 Phase 0): the write path used to drop `egress`,
     // so editing+saving a LocalOnly phenotype silently reset it to Open. Round-trip

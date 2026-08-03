@@ -19,6 +19,7 @@ import type {
   RunRecord,
 } from "@/bindings";
 import type { PhenotypeMcpUnavailableEvent } from "@/bindings";
+import type { PhenotypePreheatDroppedEvent } from "@/bindings";
 import type { UpdateProgressEvent } from "@/bindings";
 import type {
   Attachment,
@@ -662,6 +663,13 @@ export interface FfIpc {
   onPhenotypeMcpUnavailable(
     cb: (e: PhenotypeMcpUnavailableEvent) => void,
   ): Promise<Unlisten>;
+  /** A just-activated phenotype declares `preheat` tools that could not all be
+   *  admitted to the resident block — unknown names, or the byte budget ran out.
+   *  Non-fatal: the turn proceeds, the dropped tools stay behind `tool_search`.
+   *  Fires only when something was actually dropped (#1179). */
+  onPhenotypePreheatDropped(
+    cb: (e: PhenotypePreheatDroppedEvent) => void,
+  ): Promise<Unlisten>;
   // FE completion of the already-merged backend emit (#566, #568). `install_update`
   // emits `update:progress` per downloaded chunk (cumulative bytes; `total` is the
   // content length, `null` -> indeterminate bar), then a terminal
@@ -1060,6 +1068,8 @@ class TauriIpc implements FfIpc {
     this.listen<ScheduledTask[]>("scheduled:changed", cb);
   onPhenotypeMcpUnavailable = (cb: (e: PhenotypeMcpUnavailableEvent) => void) =>
     this.listen<PhenotypeMcpUnavailableEvent>("phenotype:mcp-unavailable", cb);
+  onPhenotypePreheatDropped = (cb: (e: PhenotypePreheatDroppedEvent) => void) =>
+    this.listen<PhenotypePreheatDroppedEvent>("phenotype:preheat-dropped", cb);
   onUpdateProgress = (cb: (e: UpdateProgressEvent) => void) =>
     this.listen<UpdateProgressEvent>("update:progress", cb);
   onUpdateDownloadFinished = (cb: () => void) =>

@@ -9,6 +9,7 @@ import { StartGoalDialog } from "@/components/start-goal-dialog";
 import { ShortcutsOverlay } from "@/components/shortcuts-overlay";
 import { SettingsPanel } from "@/components/settings-panel";
 import { PhenoMcpToast } from "@/components/pheno-mcp-toast";
+import { PreheatDroppedToast } from "@/components/preheat-dropped-toast";
 import { SessionToasts } from "@/components/session-toast";
 import { AttachRejectToast } from "@/components/attach-reject-toast";
 import { UpdateBar } from "@/components/update-bar";
@@ -265,6 +266,7 @@ export function AppShell() {
       <ShortcutsOverlay />
       <SettingsPanel />
       <PhenoMcpToast />
+      <PreheatDroppedToast />
       <SessionToasts />
       <AttachRejectToast />
     </div>
