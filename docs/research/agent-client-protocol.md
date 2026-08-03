@@ -315,3 +315,219 @@ This means two JSON Schema releases can describe the same wire-compatible protoc
 [^llms-txt]: `https://agentclientprotocol.com/llms.txt` — Complete documentation index. Lists all announcements, protocol docs, RFDs, and library pages.
 
 [^org-page]: `https://github.com/agentclientprotocol` — Organization page showing 14 repositories, pinned repos, and follower count (531).
+
+---
+
+## 11. FlowForge Integration Analysis (Q1–Q4)
+
+**Date:** 2026-08-03
+**Analyst:** OpenCode
+**Schema source:** `https://raw.githubusercontent.com/agentclientprotocol/agent-client-protocol/main/schema/v1/schema.json` (5,749 lines, fetched 2026-08-03)
+
+---
+
+### Q1 — Permission round-trip → PermissionMatrix
+
+#### What ACP defines
+
+The permission mechanism in ACP v1 is a single JSON-RPC request/response pair:
+
+- **Method name:** `session/request_permission` — sent by the **Agent** to the **Client** [schema.json line 378].
+- **Request payload (`RequestPermissionRequest`):**
+  - `sessionId`: string
+  - `toolCall`: `ToolCallUpdate` object (contains `toolCallId`, `kind`, `status`, `title`, `content`, `locations`, `rawInput`, `rawOutput`) [schema.json lines 342–379]
+  - `options`: array of `PermissionOption` [schema.json line 363]
+- **Response payload (`RequestPermissionResponse`):**
+  - `outcome`: `RequestPermissionOutcome` [schema.json lines 5295–5316]
+
+The `PermissionOption` shape is [schema.json lines 1089–1120]:
+- `optionId`: string (opaque ID)
+- `name`: human-readable label
+- `kind`: `PermissionOptionKind` — one of `allow_once`, `allow_always`, `reject_once`, `reject_always` [schema.json lines 1122–1138]
+
+The response `RequestPermissionOutcome` is a tagged union [schema.json lines 5318–5351]:
+- `{ "outcome": "cancelled" }` — when the client sent `session/cancel`
+- `{ "outcome": "selected", "optionId": "..." }` — user picked one of the options
+
+#### What ACP does **not** define
+
+- **No safety tier.** The `ToolCallUpdate` carries a `kind` enum (`read`, `edit`, `delete`, `move`, `search`, `execute`, `think`, `fetch`, `switch_mode`, `other`) [schema.json lines 460–513], but this is purely a UI hint ("helps clients choose appropriate icons"). It does **not** drive any permission semantics.
+- **No permission matrix.** There is no concept of a 2-D or N-D grid mapping mode × safety → decision.
+- **No `Deny` equivalent.** ACP has no mechanism to hide a tool from the model entirely. The protocol assumes the agent already decided to invoke the tool and is now asking the user for approval. The worst outcome is `reject_always` for that specific call.
+
+#### Expressiveness gap against FlowForge
+
+FlowForge's [`PermissionMatrix`](crates/ff-core/src/permission.rs:201) resolves `Mode` {Plan, Act, Auto} × `Safety` {ReadOnly, Write, Sensitive, Dangerous, Publish} → `PermissionCell` {Allow, Ask, Deny} — 15 distinct cells. FlowForge's [`Deny`](crates/ff-core/src/permission.rs:51) means the tool is **hidden from the model entirely** (the tool is not advertised in the registry), not "prompt and refuse."
+
+ACP can express **at most 4 of FlowForge's 15 cells**, and even then only at the granularity of a single tool call:
+
+| FlowForge cell | ACP equivalent |
+|---|---|
+| `Allow` | `allow_once` / `allow_always` |
+| `Ask` | The entire `session/request_permission` round-trip |
+| `Deny` | **None** — ACP has no pre-call filtering concept |
+
+**Conclusion:** ACP's permission model is an opaque per-call "approve this?" with four answer variants. It cannot represent FlowForge's multi-dimensional matrix, and it has no equivalent to `Deny` (tool hidden from model). If FlowForge advertises an ACP `session/request_permission` capability, it would need to map its internal `Ask` cells to ACP permission requests, while its `Deny` cells would simply be implemented by *not advertising* the tool to the ACP agent — a behavior outside the ACP spec.
+
+---
+
+### Q2 — Filesystem capability vs ff-tools
+
+#### ACP filesystem methods
+
+ACP v1 defines **exactly two** filesystem methods, both served by the **Client** (the editor/IDE, e.g. Zed) [schema.json lines 266–340]:
+
+| Method | Direction | Capability gate |
+|---|---|---|
+| `fs/read_text_file` | Agent → Client | `fs.readTextFile` |
+| `fs/write_text_file` | Agent → Client | `fs.writeTextFile` |
+
+There is **no** `fs/readDirectory`, `fs/glob`, `fs/stat`, or any other filesystem method in the v1 schema. The `FileSystemCapabilities` object only has `readTextFile` and `writeTextFile` booleans [schema.json lines 4457–4472].
+
+#### When FlowForge acts as an ACP agent (Zed calls us)
+
+In this direction, Zed is the Client and FlowForge is the Agent. If Zed advertises `fs.readTextFile: true`, the FlowForge agent **may** call `fs/read_text_file` on Zed instead of using its own `view` tool. This means:
+
+- FlowForge's built-in `view`/`edit`/`write` tools (in `ff-tools`) could be bypassed for file operations.
+- The permission check for those file operations would move from FlowForge's [`PermissionMatrix::effective_cell`](crates/ff-core/src/permission.rs:322) to Zed's own UI/policy.
+- However, ACP does **not** require the agent to use client filesystem methods. The agent can use its own internal tools and only access the client filesystem if it chooses to. The capability is optional on both sides.
+
+#### Which path owns the permission check?
+
+- **If the agent uses ACP `fs/*` methods:** The **Client** (Zed) owns the permission check. FlowForge's `PermissionMatrix` is irrelevant for that call.
+- **If the agent uses its own tools:** FlowForge owns the permission check via `PermissionMatrix`.
+- **There is no conflict resolution rule in ACP.** The two paths are independent. An agent could theoretically read a file via `fs/read_text_file` (client-served) and then write it via its own `write` tool (agent-served), with permission checks split across two systems.
+
+**Open question:** Does ACP v2 add `fs/readDirectory` or similar? The v1 schema does not contain it, and the v2 draft is noted as unstable. This would be settled by reading the v2 schema or RFDs.
+
+---
+
+### Q3 — The asymmetry between the two directions
+
+#### FlowForge **as agent** (Zed calls us)
+
+FlowForge must implement the **Agent** side of the protocol — i.e., respond to client requests and send agent notifications. The v1 schema enumerates these explicitly:
+
+**Agent requests we must respond to** [schema.json lines 122–243]:
+1. `initialize`
+2. `authenticate`
+3. `session/new`
+4. `session/load` (optional, gated by `loadSession` capability)
+5. `logout` (optional, gated by `auth.logout` capability)
+6. `session/set_mode` (optional)
+7. `session/list` (optional, gated by `sessionCapabilities.list`)
+8. `session/delete` (optional, gated by `sessionCapabilities.delete`)
+9. `session/resume` (optional, gated by `sessionCapabilities.resume`)
+10. `session/close` (optional, gated by `sessionCapabilities.close`)
+11. `session/set_config_option` (optional, gated by `session.configOptions.boolean`)
+12. `session/prompt` (the core turn handler)
+
+**Agent notifications we must send** [schema.json lines 3502–3700]:
+- `session/update` (streams progress, tool calls, message chunks, plans)
+- `elicitation/complete` (for URL-based elicitation)
+- `$/cancel_request` (protocol-level)
+
+Additionally, when acting as an agent, FlowForge **may call** client methods:
+- `fs/read_text_file`
+- `fs/write_text_file`
+- `session/request_permission`
+- `terminal/create`, `terminal/output`, `terminal/release`, `terminal/wait_for_exit`, `terminal/kill`
+- `elicitation/create`
+
+#### FlowForge **as client** (we call Codex/Gemini/other ACP agents)
+
+FlowForge must implement the **Client** side — i.e., send client requests and respond to agent requests/notifications. The v1 schema enumerates:
+
+**Client requests we must send** [schema.json lines 4206–4405]:
+- `initialize`
+- `authenticate`
+- `session/new`
+- `session/load`
+- `logout`
+- `session/set_mode`
+- `session/list`
+- `session/delete`
+- `session/resume`
+- `session/close`
+- `session/set_config_option`
+- `session/prompt`
+
+**Client notifications we must send** [schema.json lines 5659–5749]:
+- `session/cancel`
+
+**Client requests we must respond to** (when the agent calls us) [schema.json lines 5121–5320]:
+1. `fs/read_text_file`
+2. `fs/write_text_file`
+3. `session/request_permission`
+4. `terminal/create`
+5. `terminal/output`
+6. `terminal/release`
+7. `terminal/wait_for_exit`
+8. `terminal/kill`
+9. `elicitation/create`
+
+#### Distance between the two lists
+
+The two method sets are **almost completely disjoint**:
+
+- **Agent-only methods:** `initialize`, `authenticate`, `session/new`, `session/prompt`, `session/load`, `logout`, `session/set_mode`, `session/list`, `session/delete`, `session/resume`, `session/close`, `session/set_config_option`
+- **Client-only methods:** `fs/read_text_file`, `fs/write_text_file`, `session/request_permission`, `terminal/*`, `elicitation/create`
+- **Shared:** `session/cancel` (notification, client → agent), `session/update` (notification, agent → client)
+
+Because the lists are disjoint and both require full JSON-RPC plumbing, the implementation naturally splits into **two tickets minimum**, but likely **three to five** when considering:
+1. **Agent-side server** (handle all agent requests, emit `session/update`)
+2. **Client-side caller** (send all client requests, handle all client responses)
+3. **Client-side handler** (respond to `fs/*`, `terminal/*`, `elicitation/*`, `session/request_permission`)
+4. **Permission mapping layer** (FlowForge `PermissionMatrix` ↔ ACP `session/request_permission`)
+5. **Tool registry bridging** (decide when to use ACP client fs methods vs. FlowForge's own `ff-tools`)
+
+Note: `ff-mcp` already has JSON-RPC plumbing (`crates/ff-mcp/`, client/supervisor, with `bridge.rs` at 242 lines bridging external tools into our registry). This plumbing can likely be reused for the JSON-RPC transport layer, but the ACP message types are different from MCP and must be handled separately.
+
+---
+
+### Q4 — Vendor the Rust crate, or hand-write the types?
+
+#### Maturity signals
+
+| Signal | Observation |
+|---|---|
+| **Runtime crate** | `agent-client-protocol` = `2.0.0` on crates.io [fetched 2026-08-03] |
+| **Schema crate** | `agent-client-protocol-schema` = `1.6.0` on crates.io [fetched 2026-08-03] |
+| **Version drift** | Runtime (2.0.0) and schema (1.6.0) are on different version tracks, suggesting the schema artifact and runtime artifact evolve independently. The README notes that "Artifact versions … follow semantic compatibility for downstream code generators" while the "ACP wire protocol version (`protocolVersion`) … determines actual message compatibility." |
+| **Unstable features** | The Rust SDK README explicitly documents `unstable_mcp_over_acp`, `unstable_protocol_v2`, and draft v2 session builders. Stable features are introduced behind feature flags before stabilization. |
+| **Breaking-change history** | The protocol itself is at v1 (wire-stable), but the crate has reached v2.0.0, implying at least one major breaking change in the Rust API surface since the protocol stabilized. |
+| **Downstream dependents** | `cargo search` shows a small but growing ecosystem (~20+ crates mentioning ACP), including adapters like `deepseek-acp-adapter` and `acp-llm-adapter`. The core crate is the official SDK. |
+
+#### Type surface fit
+
+The schema JSON contains extensive custom serde attributes that the generated Rust types preserve:
+- `x-deserialize-default-on-error: true`
+- `x-deserialize-skip-invalid-items: true`
+- `x-side`, `x-method` metadata fields
+- Complex tagged unions with `discriminator` fields
+
+FlowForge's existing serde shapes are comparatively simple (e.g., `PermissionMatrix` uses standard `#[serde(default, skip_serializing_if = ...)]`). The ACP crate types would require conversion at every boundary — especially for the permission system, where ACP's `PermissionOptionKind` (4 variants) maps poorly onto FlowForge's `PermissionCell` (3 variants) and `PermissionMatrix` (15 cells).
+
+#### Version-pinning risk
+
+Because the crate version is decoupled from the wire protocol version, pinning the crate does not pin the protocol. An upstream `agent-client-protocol` v2.1.0 could change generated struct field names or add new mandatory fields while still targeting ACP wire v1. This creates a maintenance burden: we would need to track both crate changelog and wire spec.
+
+#### Recommendation: **Hand-write the types for the subset we need.**
+
+Rationale:
+1. **Control over serde boundaries.** FlowForge already has strong conventions for IPC types (`ts-rs` exports, `PermissionMatrix` custom deserialization with 4→5 column migration). Hand-writing lets us keep those conventions without fighting the crate's generated attributes.
+2. **Compile-time cost.** The AGENTS.md guidelines explicitly warn against adding dependencies that trigger full desktop rebuilds. The `agent-client-protocol` crate is a large, multi-feature runtime. Even the schema crate pulls in a non-trivial type tree.
+3. **Subset sufficiency.** We do not need all 5,749 lines of schema. FlowForge's ACP integration will likely start with a small surface (e.g., `initialize`, `session/new`, `session/prompt`, `session/update`, `session/request_permission`). Hand-writing ~20–30 structs is less work than vendoring a crate and writing conversion layers.
+4. **Maturity uncertainty.** The version drift (2.0.0 runtime vs. 1.6.0 schema) and prominent unstable features suggest the Rust API is still settling. Hand-writing insulates us from upstream churn.
+5. **Existing plumbing.** `ff-mcp` already has JSON-RPC client/supervisor plumbing. We can reuse that transport layer and only add ACP-specific message routing.
+
+**Escape hatch:** If the ACP surface grows beyond ~50 structs, or if v2 introduces complex session lifecycle types, re-evaluate vendoring `agent-client-protocol-schema` (the types-only crate) and writing our own runtime. Do **not** vendor the full runtime crate until the version drift stabilizes and the unstable features graduate.
+
+---
+
+## 12. Open Questions
+
+1. **ACP v2 filesystem methods:** Does the draft v2 protocol add `fs/readDirectory` or binary file operations? Settled by reading `schema/v2/schema.json` or the relevant RFD.
+2. **Permission granularity in practice:** When a real ACP client (e.g. Zed) receives `session/request_permission`, does it implement any persistent allow-listing, or is it strictly per-call? Settled by inspecting Zed's ACP client source or testing against it.
+3. **Tool call vs. MCP tool bridging:** If FlowForge acts as an ACP agent and receives a `session/prompt` that triggers an MCP tool call, should the tool execution be reported as an ACP `tool_call_update` or as a native MCP result forwarded through ACP? Settled by reading the `agent-client-protocol-rmcp` integration crate or the ACP spec's MCP-over-ACP section.
+4. **Session mode mapping:** ACP has `session/set_mode` and `availableModes`. FlowForge's `Mode` is {Plan, Act, Auto}. Is there a standard ACP mode vocabulary, or is it agent-defined? Settled by reading the session-modes protocol doc.
