@@ -72,6 +72,7 @@ fn phenotype_round_trips() {
         provider: None,
         mcp_servers: Vec::new(),
         egress: crate::Egress::Open,
+        preheat: Vec::new(),
     };
     let json = serde_json::to_string(&p).unwrap();
     assert_eq!(p, serde_json::from_str(&json).unwrap());

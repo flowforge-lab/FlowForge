@@ -1282,9 +1282,16 @@ pub async fn run_turn(
     let allow_subagent = tools.depth < tools.max_depth;
     // RFC 0024: tools this session has already unlocked. Read once up front; the
     // turn loop re-reads it after a `tool_search` call to append the new definitions.
+    //
+    // `unlocked` rather than `admitted` so #1179 3B's preheated names are here too.
+    // This single read is what puts them in the *stable region*: `advertised` below
+    // and `appended` at the end of this block both derive from it, so the two
+    // cannot disagree about what was resident before the first turn. Preheating
+    // after this point would instead look like a mid-turn unlock and cost a
+    // re-prefill -- the exact opposite of the round-trip it is meant to save.
     let admitted = tools
         .tool_search
-        .map(|s| s.admitted(session_id))
+        .map(|s| s.unlocked(session_id))
         .unwrap_or_default();
     let advertised = advertised_tools(
         tools.mode,
@@ -2716,7 +2723,11 @@ pub async fn run_turn(
         // whole array — is what keeps the cached prompt prefix byte-identical; see
         // `openai_tools_named`.
         if let Some(search) = tools.tool_search {
-            let unlocked = search.admitted(session_id);
+            // `unlocked`, not `admitted`: `appended` was seeded from the union
+            // (preheat included), so comparing against the search-only set would
+            // make this guard permanently false once anything is preheated -- and
+            // tools found mid-turn would silently stop being appended (#1179 3B).
+            let unlocked = search.unlocked(session_id);
             // Cheap guard: on the overwhelmingly common iteration nothing was
             // searched for, so skip recomputing the advertise pipeline entirely.
             if unlocked.len() > appended.len() {

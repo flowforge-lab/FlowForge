@@ -116,6 +116,22 @@ pub struct Phenotype {
     /// field on `Open`, i.e. unchanged.
     #[serde(default)]
     pub egress: crate::egress::Egress,
+    /// Deferred tools to admit up front, before the first turn (#1179 3B, RFC 0024
+    /// §264). Phase 2 made non-default tools reachable only after a `tool_search`
+    /// round-trip; a tool needed on nearly every task in this phenotype (codegraph
+    /// for a coding phenotype) pays that round-trip every session for a hit that
+    /// was never in doubt. Naming it here spends resident bytes to skip the trip.
+    ///
+    /// Full tool names, not server names or categories -- categories need the
+    /// classification vocabulary that does not exist until Phase 4.
+    ///
+    /// Order is significant: it is the declared priority, and the byte budget
+    /// truncates from the end rather than dropping the largest spec, so a
+    /// phenotype's first choice survives a budget squeeze.
+    ///
+    /// Empty contributes nothing, identical to today.
+    #[serde(default)]
+    pub preheat: Vec<String>,
 }
 
 #[cfg(test)]

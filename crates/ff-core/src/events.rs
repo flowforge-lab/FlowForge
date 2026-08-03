@@ -484,6 +484,31 @@ pub struct PhenotypeMcpUnavailableEvent {
     pub servers: Vec<String>,
 }
 
+/// Backend -> frontend notice that entries in an active phenotype's `preheat` list
+/// were dropped (#1179 3B) -- an unknown/non-deferrable tool name, or a name that
+/// did not fit [`MAX_PREHEAT_BYTES`](ff_tools::MAX_PREHEAT_BYTES).
+///
+/// Exists because the alternative is indistinguishable from success: a phenotype
+/// with a typo'd tool name preheats nothing, behaves exactly like one with no
+/// preheat list, and gives its author no reason to look. Non-fatal -- the tool is
+/// still reachable the ordinary way, via `tool_search`.
+///
+/// Emitted only when something was actually dropped, so the frontend can toast
+/// unconditionally on receipt.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "../../../apps/desktop/src/bindings/")]
+pub struct PhenotypePreheatDroppedEvent {
+    pub phenotype: String,
+    pub session_id: String,
+    /// Names no registered deferred tool matched.
+    pub unknown: Vec<String>,
+    /// Names dropped for exceeding the byte budget, in declaration order.
+    pub over_budget: Vec<String>,
+    /// Bytes the surviving entries cost, for comparison against the budget.
+    pub admitted_bytes: u32,
+}
+
 /// Backend -> frontend telemetry: a skill became active for a turn (M3.5, RFC 0001
 /// §8). Emitted once per active skill at the start of each agent turn. `ff-signals`
 /// folds these into per-skill aggregates (activation counts); the frontend may also

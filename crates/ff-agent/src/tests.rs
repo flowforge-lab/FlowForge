@@ -7615,3 +7615,46 @@ fn breakdown_omits_attribution_when_nothing_preheated() {
     assert_eq!(b.preheated_used, None);
     assert_eq!(b.preheated_bytes, None);
 }
+
+/// #1179 3B: a preheated deferred tool must be advertised on turn 1.
+///
+/// This is the mutation with no failure signal without a test: preheating *after*
+/// the turn's unlocked-set read still works -- the tool becomes callable, nothing
+/// errors -- it just arrives as a mid-turn append, invalidating the cached prefix
+/// and costing a full re-prefill. That is strictly worse than the `tool_search`
+/// round-trip preheat exists to avoid, and behaviourally identical, so only an
+/// assertion on the turn-1 advertised set can catch it.
+///
+/// Sibling of `deferred_tools_are_withheld_until_searched_for`: same withholding,
+/// reached by declaration instead of by search.
+#[test]
+fn a_preheated_deferred_tool_is_advertised_on_turn_one() {
+    let mut reg = ToolRegistry::with_defaults();
+    reg.register(deferred_stub("mcp_thing", Safety::ReadOnly, false));
+    let matrix = PermissionMatrix::default();
+
+    let state = ff_tools::ToolSearchState::default();
+    state.preheat("s1", ["mcp_thing".to_string()]);
+    // The union read `run_turn` performs before it builds the turn's schemas.
+    let unlocked = state.unlocked("s1");
+    assert!(
+        state.admitted("s1").is_empty(),
+        "nothing was searched for -- this must come from the preheat set alone"
+    );
+
+    let with = advertised_tools(
+        Mode::Act,
+        Egress::Open,
+        &matrix,
+        None,
+        &reg,
+        Some(&unlocked),
+    )
+    .expect("an explicit unlocked set materialises the advertised set");
+    assert!(
+        with.contains("mcp_thing"),
+        "a preheated tool was not advertised on turn 1, so it could only arrive as \
+         a mid-turn append -- invalidating the cached prefix instead of saving a \
+         round-trip"
+    );
+}

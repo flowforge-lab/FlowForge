@@ -167,12 +167,19 @@ describe("buildSkillCommands", () => {
 
 describe("buildPhenotypeCommands", () => {
   const phenotypes: Phenotype[] = [
-    { name: "default", skills: [], mcpServers: [], egress: "open" },
+    {
+      name: "default",
+      skills: [],
+      mcpServers: [],
+      egress: "open",
+      preheat: [],
+    },
     {
       name: "rust",
       skills: ["rust-debugging"],
       mcpServers: [],
       egress: "open",
+      preheat: [],
     },
   ];
 

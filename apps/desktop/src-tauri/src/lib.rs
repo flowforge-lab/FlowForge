@@ -2151,6 +2151,11 @@ impl GoalIteration for GoalLoopIteration {
         self.state.align_session_mcp(&sid, &session_root).await;
         self.state.align_git_watcher(&session_root);
         let registry = self.state.build_tool_registry(&session_root);
+        // #1179 3B: before the agent reads the unlocked set, so declared tools land
+        // in the stable prompt region rather than looking like a mid-turn unlock.
+        if let Some(dropped) = self.state.align_session_preheat(&sid, &registry) {
+            let _ = self.app.emit("phenotype:preheat-dropped", dropped);
+        }
 
         let approver = UiApprover {
             app: self.app.clone(),
@@ -2504,6 +2509,17 @@ impl ff_scheduled::TaskRunner for DesktopTaskRunner {
         // a scheduled-task turn that switches branches live-updates the FE chip.
         self.state.align_git_watcher(&session_root);
         let registry = self.state.build_tool_registry(&session_root);
+        // #1179 3B; see the interactive path. A scheduled turn has no UI to toast,
+        // so the drop notice is warn-only there.
+        if let Some(dropped) = self.state.align_session_preheat(&sid, &registry) {
+            tracing::warn!(
+                session_id = %dropped.session_id,
+                phenotype = %dropped.phenotype,
+                unknown = ?dropped.unknown,
+                over_budget = ?dropped.over_budget,
+                "phenotype preheat entries dropped"
+            );
+        }
         let approver = ScheduledApprover::new(task.safety_ceiling);
         // Snapshot the matrix for this turn (#702); see the interactive path above.
         let permission_matrix = self.state.permission_matrix();

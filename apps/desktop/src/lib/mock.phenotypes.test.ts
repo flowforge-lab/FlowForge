@@ -52,6 +52,7 @@ describe("MockIpc updatePhenotype (#530)", () => {
         skills: [],
         mcpServers: [],
         egress: "open",
+        preheat: [],
       }),
     ).rejects.toThrow(/immutable/);
   });
@@ -65,6 +66,7 @@ describe("MockIpc updatePhenotype (#530)", () => {
         provider: "ghost-conn",
         mcpServers: [],
         egress: "open",
+        preheat: [],
       }),
     ).rejects.toThrow(/unknown connection/);
   });
@@ -78,6 +80,7 @@ describe("MockIpc updatePhenotype (#530)", () => {
       model: "gpt-4o",
       mcpServers: [],
       egress: "open",
+      preheat: [],
     });
     expect(saved).toMatchObject({ name: "data-science", provider: "openai" });
     const names = (await ipc.listPhenotypes()).map((p) => p.name);
@@ -94,6 +97,7 @@ describe("MockIpc updatePhenotype (#530)", () => {
       model: "qwen2.5",
       mcpServers: [],
       egress: "open",
+      preheat: [],
     });
     const rust = (await ipc.listPhenotypes()).find((p) => p.name === "rust");
     expect(rust).toMatchObject({ provider: "ollama", model: "qwen2.5" });
@@ -114,6 +118,7 @@ describe("MockIpc updatePhenotype (#530)", () => {
       persona: "You are a meticulous Rust engineer.",
       mcpServers: [],
       egress: "open",
+      preheat: [],
     });
     expect((await ipc.getPhenotype()).skills).toEqual(["write-tests"]);
     expect(events[events.length - 1]).toEqual(["write-tests"]);
@@ -128,6 +133,7 @@ describe("MockIpc updatePhenotype (#530)", () => {
       skills: ["write-tests"],
       mcpServers: [],
       egress: "open",
+      preheat: [],
     });
     expect(events).toHaveLength(0);
   });

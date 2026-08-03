@@ -2159,6 +2159,79 @@ impl AppState {
         }
     }
 
+    /// Admit the active phenotype's `preheat` tools for `session_id` before the turn
+    /// starts (#1179 3B).
+    ///
+    /// Must run before `ff-agent` reads the unlocked set, or the names land outside
+    /// the stable prompt region and cost a re-prefill instead of saving the
+    /// `tool_search` round-trip they exist to skip. Mirrors
+    /// [`align_session_mcp`](Self::align_session_mcp): per-turn, idempotent
+    /// (`preheat` is set union), best-effort.
+    ///
+    /// Returns what was dropped so the caller can surface it; a silent drop would
+    /// make a typo'd phenotype indistinguishable from one that declared nothing.
+    pub fn align_session_preheat(
+        &self,
+        session_id: &str,
+        registry: &ToolRegistry,
+    ) -> Option<ff_core::events::PhenotypePreheatDroppedEvent> {
+        let pheno = self.session_phenotype(session_id);
+        if pheno.preheat.is_empty() {
+            return None;
+        }
+        // Takes the caller's registry rather than building its own: both call sites
+        // construct one immediately after, and a second build would re-walk the tool
+        // set for nothing.
+        // Only *deferred* tools can be preheated: a resident tool is already in the
+        // block, so "preheating" it would spend budget for nothing and is reported
+        // as unknown rather than silently accepted.
+        let deferred = registry.deferred_tool_names();
+        let plan = ff_tools::resolve_preheat(&pheno.preheat, |name| {
+            if !deferred.contains(name) {
+                return None;
+            }
+            let one = std::iter::once(name.to_string()).collect();
+            // `scope: None` yields the *full* parameter schema, which
+            // `scoped_parameters` can only ever shrink. That makes this an upper
+            // bound on resident cost, so the budget errs toward admitting less --
+            // never toward letting a preheat list overrun it.
+            let schemas = registry.openai_tools_named(&one, None);
+            schemas
+                .first()
+                .and_then(|s| serde_json::to_string(s).ok())
+                .map(|s| s.len())
+        });
+        self.tool_search.preheat(session_id, plan.admit.clone());
+        let (mut unknown, mut over_budget) = (Vec::new(), Vec::new());
+        for r in &plan.rejected {
+            match r {
+                ff_tools::PreheatRejection::Unknown { name } => unknown.push(name.clone()),
+                ff_tools::PreheatRejection::OverBudget { name, .. } => {
+                    over_budget.push(name.clone())
+                }
+            }
+        }
+        tracing::debug!(
+            session_id,
+            phenotype = %pheno.name,
+            admitted = plan.admit.len(),
+            bytes = plan.bytes,
+            unknown = unknown.len(),
+            over_budget = over_budget.len(),
+            "preheat resolved"
+        );
+        if unknown.is_empty() && over_budget.is_empty() {
+            return None;
+        }
+        Some(ff_core::events::PhenotypePreheatDroppedEvent {
+            phenotype: pheno.name,
+            session_id: session_id.to_string(),
+            unknown,
+            over_budget,
+            admitted_bytes: u32::try_from(plan.bytes).unwrap_or(u32::MAX),
+        })
+    }
+
     /// Release `session_id`'s references to per-workspace MCP instances, evicting any
     /// whose ref-list empties (RFC 0018 §4.3). Called on session close/delete so a
     /// per-workspace codegraph is reaped once no live session references its path.
@@ -2582,7 +2655,10 @@ impl AppState {
         let Some(handle) = self.mcp_handle() else {
             return Vec::new();
         };
-        let admitted = self.tool_search.admitted(session_id);
+        // Union, so a preheated MCP tool's server guidance is injected too: the
+        // model holding a tool whose usage instructions were withheld is the
+        // failure #1173 exists to prevent (#1179 3B).
+        let admitted = self.tool_search.unlocked(session_id);
         // Servers with at least one standing (non-deferred) tool are reachable
         // without admission. Same snapshot the bridge builds the registry from, so
         // this cannot disagree with what the model actually sees.

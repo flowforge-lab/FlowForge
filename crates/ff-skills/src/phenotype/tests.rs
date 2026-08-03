@@ -132,6 +132,7 @@ fn pheno(name: &str) -> Phenotype {
             defer: None,
         }],
         egress: ff_core::Egress::Open,
+        preheat: Vec::new(),
     }
 }
 
@@ -157,6 +158,7 @@ fn save_omits_name_and_none_fields() {
         provider: None,
         mcp_servers: Vec::new(),
         egress: ff_core::Egress::Open,
+        preheat: Vec::new(),
     };
     save_phenotype(dir.path(), &bare).unwrap();
     let body = fs::read_to_string(dir.path().join("bare.toml")).unwrap();
@@ -184,6 +186,7 @@ fn save_round_trips_local_only_egress() {
         provider: None,
         mcp_servers: Vec::new(),
         egress: ff_core::Egress::LocalOnly,
+        preheat: Vec::new(),
     };
     save_phenotype(dir.path(), &enclave).unwrap();
     let body = fs::read_to_string(dir.path().join("enclave.toml")).unwrap();

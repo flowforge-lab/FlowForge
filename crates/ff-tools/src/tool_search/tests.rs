@@ -1016,3 +1016,148 @@ async fn switching_models_reconsults_the_file() {
          corpus: the read-once guard was not reset by the model switch"
     );
 }
+
+// ---------------------------------------------------------------------------
+// #1179 3B: preheat resolution and the byte budget.
+//
+// The invariant these defend is that Phase 3 cannot undo Phase 2. Phase 2 earned
+// a 16.8% reduction in the resident block by deferring tools; preheat is how that
+// saving gets spent back, so the ceiling has to be enforced by a test rather than
+// by whoever edits the constant next.
+
+fn sizes(pairs: &[(&str, usize)]) -> impl Fn(&str) -> Option<usize> + use<> {
+    let m: std::collections::HashMap<String, usize> =
+        pairs.iter().map(|(n, b)| (n.to_string(), *b)).collect();
+    move |name: &str| m.get(name).copied()
+}
+
+fn decl(v: &[&str]) -> Vec<String> {
+    v.iter().map(|s| s.to_string()).collect()
+}
+
+#[test]
+fn an_empty_list_contributes_nothing() {
+    let plan = resolve_preheat(&[], sizes(&[("a", 10)]));
+    assert_eq!(plan, PreheatPlan::default());
+}
+
+#[test]
+fn a_fitting_list_is_admitted_whole() {
+    let plan = resolve_preheat(&decl(&["a", "b"]), sizes(&[("a", 100), ("b", 200)]));
+    assert_eq!(plan.admit, decl(&["a", "b"]));
+    assert_eq!(plan.bytes, 300);
+    assert!(plan.rejected.is_empty());
+}
+
+#[test]
+fn the_total_never_exceeds_the_budget() {
+    // The Phase-2 invariant. Ten tools that would each fit alone must not be
+    // admitted together past the ceiling.
+    let each = MAX_PREHEAT_BYTES / 3;
+    let names = decl(&["a", "b", "c", "d", "e", "f", "g", "h", "i", "j"]);
+    let table: Vec<(&str, usize)> = ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j"]
+        .iter()
+        .map(|n| (*n, each))
+        .collect();
+    let plan = resolve_preheat(&names, sizes(&table));
+    assert!(
+        plan.bytes <= MAX_PREHEAT_BYTES,
+        "preheat spent {} bytes against a {MAX_PREHEAT_BYTES} budget -- Phase 3 \
+         must not be able to give back what Phase 2 saved",
+        plan.bytes
+    );
+    assert_eq!(plan.admit.len(), 3, "only three of ten fit");
+    assert_eq!(plan.rejected.len(), 7);
+}
+
+#[test]
+fn truncation_follows_declaration_order_not_size() {
+    // `big` is declared first and must survive; sorting by size would drop it and
+    // silently override the author's stated priority.
+    let plan = resolve_preheat(
+        &decl(&["big", "small"]),
+        sizes(&[("big", MAX_PREHEAT_BYTES), ("small", 10)]),
+    );
+    assert_eq!(plan.admit, decl(&["big"]), "first declared wins the budget");
+    assert_eq!(
+        plan.rejected,
+        vec![PreheatRejection::OverBudget {
+            name: "small".into(),
+            bytes: 10
+        }]
+    );
+}
+
+#[test]
+fn an_overrunning_entry_does_not_stop_later_ones_fitting() {
+    // `huge` cannot fit, but `tiny` after it still can. Halting on first overrun
+    // would make the result depend on order in a way the author cannot see.
+    let plan = resolve_preheat(
+        &decl(&["huge", "tiny"]),
+        sizes(&[("huge", MAX_PREHEAT_BYTES + 1), ("tiny", 5)]),
+    );
+    assert_eq!(plan.admit, decl(&["tiny"]));
+    assert_eq!(plan.bytes, 5);
+    assert_eq!(plan.rejected.len(), 1);
+}
+
+#[test]
+fn an_unknown_name_soft_fails_and_is_reported() {
+    let plan = resolve_preheat(&decl(&["ghost", "real"]), sizes(&[("real", 50)]));
+    assert_eq!(
+        plan.admit,
+        decl(&["real"]),
+        "one bad name must not discard the whole list"
+    );
+    assert_eq!(
+        plan.rejected,
+        vec![PreheatRejection::Unknown {
+            name: "ghost".into()
+        }],
+        "a typo must be reported, not silently equivalent to declaring nothing"
+    );
+}
+
+#[test]
+fn duplicates_are_charged_once() {
+    let plan = resolve_preheat(&decl(&["a", "a", "a"]), sizes(&[("a", 100)]));
+    assert_eq!(plan.admit, decl(&["a"]));
+    assert_eq!(plan.bytes, 100, "the same tool listed twice is one tool");
+}
+
+#[test]
+fn preheated_is_visible_through_unlocked_but_not_admitted() {
+    let state = ToolSearchState::default();
+    state.admit("s1", ["found".to_string()]);
+    state.preheat("s1", ["declared".to_string()]);
+    assert!(
+        !state.admitted("s1").contains("declared"),
+        "provenance must stay separable, or `preheated_used` is uncomputable"
+    );
+    assert!(state.preheated("s1").contains("declared"));
+    let all = state.unlocked("s1");
+    assert!(
+        all.contains("found") && all.contains("declared"),
+        "reachability is the union: a caller asking `unlocked` must never miss a \
+         preheated tool"
+    );
+    assert!(!state.is_empty("s1"));
+}
+
+#[test]
+fn preheat_alone_makes_a_session_non_empty() {
+    // `is_empty` must agree with `unlocked`; if it only consulted `admitted`, a
+    // preheat-only session would look untouched and its schemas would be skipped.
+    let state = ToolSearchState::default();
+    state.preheat("s1", ["declared".to_string()]);
+    assert!(!state.is_empty("s1"));
+    assert!(state.is_empty("other-session"));
+}
+
+#[test]
+fn preheat_is_idempotent() {
+    let state = ToolSearchState::default();
+    state.preheat("s1", ["a".to_string()]);
+    state.preheat("s1", ["a".to_string()]);
+    assert_eq!(state.preheated("s1").len(), 1);
+}

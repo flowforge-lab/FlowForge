@@ -55,6 +55,7 @@ pub fn default_phenotype() -> Phenotype {
         provider: None,
         mcp_servers: Vec::new(),
         egress: ff_core::Egress::Open,
+        preheat: Vec::new(),
     }
 }
 
@@ -78,6 +79,11 @@ struct PhenotypeFile {
     mcp_servers: Vec<McpServerConfig>,
     #[serde(default)]
     egress: ff_core::Egress,
+    /// #1179 3B. Must be mirrored here as well as on `Phenotype`: this struct is
+    /// `deny_unknown_fields`, so omitting it would make a valid `preheat = [...]`
+    /// a hard parse error rather than an ignored key.
+    #[serde(default)]
+    preheat: Vec<String>,
 }
 
 impl PhenotypeFile {
@@ -91,6 +97,7 @@ impl PhenotypeFile {
             provider: self.provider,
             mcp_servers: self.mcp_servers,
             egress: self.egress,
+            preheat: self.preheat,
         }
     }
 }
