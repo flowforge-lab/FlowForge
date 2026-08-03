@@ -19,60 +19,19 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { ChatView } from "@/components/chat-view";
 import { useChatStore } from "@/store/chat";
 import { useFindStore } from "@/store/find";
+import {
+  installResizeObserverStub,
+  installSyncRaf,
+  mockGeometry,
+} from "@/test/chat-scroll-harness";
 import type { Message } from "@/bindings";
 
 const SID = "s1";
 
-let observers: ResizeObserverStub[] = [];
-class ResizeObserverStub {
-  cb: ResizeObserverCallback;
-  live = true;
-  constructor(cb: ResizeObserverCallback) {
-    this.cb = cb;
-    observers.push(this);
-  }
-  observe() {}
-  unobserve() {}
-  disconnect() {
-    this.live = false;
-  }
-}
-(globalThis as { ResizeObserver?: unknown }).ResizeObserver =
-  ResizeObserverStub;
-
 // The pin is coalesced through requestAnimationFrame; run it synchronously so
 // the scrollTop write lands inside the act() that triggered it.
-(globalThis as { requestAnimationFrame?: unknown }).requestAnimationFrame = (
-  cb: FrameRequestCallback,
-) => {
-  cb(0);
-  return 0;
-};
-(globalThis as { cancelAnimationFrame?: unknown }).cancelAnimationFrame =
-  () => {};
-
-function mockGeometry(
-  el: HTMLElement,
-  scrollHeight: number,
-  clientHeight: number,
-) {
-  let top = 0;
-  Object.defineProperty(el, "scrollHeight", {
-    configurable: true,
-    get: () => scrollHeight,
-  });
-  Object.defineProperty(el, "clientHeight", {
-    configurable: true,
-    get: () => clientHeight,
-  });
-  Object.defineProperty(el, "scrollTop", {
-    configurable: true,
-    get: () => top,
-    set: (v: number) => {
-      top = v;
-    },
-  });
-}
+const ro = installResizeObserverStub();
+installSyncRaf();
 
 function msgs(n: number): Message[] {
   const out: Message[] = [];
@@ -99,7 +58,7 @@ function scrollEl(container: HTMLElement) {
 }
 
 beforeEach(() => {
-  observers = [];
+  ro.reset();
   useChatStore.setState({
     activeSessionId: SID,
     messagesBySession: {},
@@ -130,11 +89,8 @@ describe("ChatView relaunch scroll (#866)", () => {
 
     // The observer must exist for this mount (streaming follow depends on it)
     // and the view must land at the tail once layout settles.
-    expect(observers.some((o) => o.live)).toBe(true);
-    act(() => {
-      for (const o of observers)
-        if (o.live) o.cb([], o as unknown as ResizeObserver);
-    });
+    expect(ro.observers().some((o) => o.live)).toBe(true);
+    ro.fire();
     expect(el.scrollTop).toBe(5000);
   });
 

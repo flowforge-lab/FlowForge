@@ -24,60 +24,19 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ChatView } from "@/components/chat-view";
 import { useChatStore } from "@/store/chat";
 import { useFindStore } from "@/store/find";
+import {
+  installResizeObserverStub,
+  installSyncRaf,
+  mockGeometry,
+} from "@/test/chat-scroll-harness";
 import type { Message } from "@/bindings";
 
 const SID = "s1";
 
-let observers: ResizeObserverStub[] = [];
-class ResizeObserverStub {
-  cb: ResizeObserverCallback;
-  live = true;
-  constructor(cb: ResizeObserverCallback) {
-    this.cb = cb;
-    observers.push(this);
-  }
-  observe() {}
-  unobserve() {}
-  disconnect() {
-    this.live = false;
-  }
-}
-(globalThis as { ResizeObserver?: unknown }).ResizeObserver =
-  ResizeObserverStub;
-
 // The pin is coalesced through requestAnimationFrame; run it synchronously so
 // a fired observer callback commits its scrollTop write within the same act().
-(globalThis as { requestAnimationFrame?: unknown }).requestAnimationFrame = (
-  cb: FrameRequestCallback,
-) => {
-  cb(0);
-  return 0;
-};
-(globalThis as { cancelAnimationFrame?: unknown }).cancelAnimationFrame =
-  () => {};
-
-function mockGeometry(
-  el: HTMLElement,
-  scrollHeight: number,
-  clientHeight: number,
-) {
-  let top = 0;
-  Object.defineProperty(el, "scrollHeight", {
-    configurable: true,
-    get: () => scrollHeight,
-  });
-  Object.defineProperty(el, "clientHeight", {
-    configurable: true,
-    get: () => clientHeight,
-  });
-  Object.defineProperty(el, "scrollTop", {
-    configurable: true,
-    get: () => top,
-    set: (v: number) => {
-      top = v;
-    },
-  });
-}
+const ro = installResizeObserverStub();
+installSyncRaf();
 
 function shortCachedMessages(): Message[] {
   return [
@@ -126,15 +85,10 @@ function renderChat() {
   ) as HTMLDivElement;
 }
 
-function fireObserver() {
-  act(() => {
-    for (const o of observers)
-      if (o.live) o.cb([], o as unknown as ResizeObserver);
-  });
-}
+const fireObserver = () => ro.fire();
 
 beforeEach(() => {
-  observers = [];
+  ro.reset();
 });
 afterEach(() => {
   useChatStore.setState({ messagesBySession: {}, toolStepsByMessage: {} });

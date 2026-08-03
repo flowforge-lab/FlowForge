@@ -21,6 +21,11 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { ChatView } from "@/components/chat-view";
 import { useChatStore } from "@/store/chat";
+import {
+  installResizeObserverStub,
+  installSyncRaf,
+  mockGeometry,
+} from "@/test/chat-scroll-harness";
 import type { Message } from "@/bindings";
 
 const SID = "s1";
@@ -47,71 +52,17 @@ function seed(count: number) {
   });
 }
 
-// --- autoscroll harness, mirroring chat-view.autoscroll.test.tsx -------------
+// --- autoscroll harness, shared with the other scroll suites -----------------
 // The virtualizer mounts ResizeObservers of its own (viewport rect + per-row
-// measurement), and firing those with the empty entry list this stub passes
-// would exercise library internals rather than the pin. Each observer records
-// what it observes so a test can fire only ChatView's own content observer —
-// the one whose post-layout settle drives `shouldPinToTail`.
-let observers: ResizeObserverStub[] = [];
-class ResizeObserverStub {
-  cb: ResizeObserverCallback;
-  targets: Element[] = [];
-  live = true;
-  constructor(cb: ResizeObserverCallback) {
-    this.cb = cb;
-    observers.push(this);
-  }
-  observe(el: Element) {
-    this.targets.push(el);
-  }
-  unobserve() {}
-  disconnect() {
-    this.live = false;
-  }
-}
-(globalThis as { ResizeObserver?: unknown }).ResizeObserver =
-  ResizeObserverStub;
-
-// The pin coalesces through requestAnimationFrame; run it synchronously so the
-// scrollTop write lands inside the same act().
-(globalThis as { requestAnimationFrame?: unknown }).requestAnimationFrame = (
-  cb: FrameRequestCallback,
-) => {
-  cb(0);
-  return 0;
-};
-(globalThis as { cancelAnimationFrame?: unknown }).cancelAnimationFrame =
-  () => {};
-
-function mockGeometry(el: HTMLElement, scrollHeight: number, client: number) {
-  let top = 0;
-  Object.defineProperty(el, "scrollHeight", {
-    configurable: true,
-    get: () => scrollHeight,
-  });
-  Object.defineProperty(el, "clientHeight", {
-    configurable: true,
-    get: () => client,
-  });
-  Object.defineProperty(el, "scrollTop", {
-    configurable: true,
-    get: () => top,
-    set: (v: number) => {
-      top = v;
-    },
-  });
-}
+// measurement), and firing those with the empty entry list the stub passes
+// would exercise library internals rather than the pin. The stub records what
+// each observer observes, so `fire(el)` drives only ChatView's own content
+// observer — the one whose post-layout settle drives `shouldPinToTail`.
+const ro = installResizeObserverStub();
+installSyncRaf();
 
 /** Fire only the observer watching `el` (ChatView's content observer). */
-function fireObserverFor(el: Element) {
-  act(() => {
-    for (const o of observers) {
-      if (o.live && o.targets.includes(el))
-        o.cb([], o as unknown as ResizeObserver);
-    }
-  });
-}
+const fireObserverFor = (el: Element) => ro.fire(el);
 
 function renderRows(count: number): number {
   seed(count);
@@ -120,7 +71,7 @@ function renderRows(count: number): number {
 }
 
 beforeEach(() => {
-  observers = [];
+  ro.reset();
 });
 afterEach(() => {
   useChatStore.setState({ messagesBySession: {}, toolStepsByMessage: {} });
