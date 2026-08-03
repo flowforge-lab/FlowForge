@@ -16,11 +16,12 @@
 //     via `handleScroll`, so the ResizeObserver settle that re-pins every other
 //     scroll path is gated off for this one and it stays where it landed.
 //
-// The harness reproduces (1) by deriving `scrollHeight` from the spacer's live
-// inline height rather than a constant — so the bottom genuinely moves as rows
-// measure, exactly as it does in the app. Rows measure 1000px here (virtual-core
-// falls back to `offsetHeight`, which `vitest.setup.ts` stubs) against the 140px
-// estimate, which is the same direction of error as production.
+// The harness (`test/chat-scroll-harness.ts`) reproduces (1) by deriving
+// `scrollHeight` from the spacer's live inline height rather than a constant —
+// so the bottom genuinely moves as rows measure, exactly as it does in the app.
+// Rows measure 1000px here (virtual-core falls back to `offsetHeight`, which
+// `vitest.setup.ts` stubs) against the 140px estimate, which is the same
+// direction of error as production.
 //
 // Mutation bar (the reviewer's): put `el.scrollTo({ top: el.scrollHeight })`
 // back and the test below goes red — it lands 1000px short of where it must be,
@@ -31,6 +32,11 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { ChatView } from "@/components/chat-view";
 import { useChatStore } from "@/store/chat";
+import {
+  VIEWPORT_H,
+  installQueuedRaf,
+  makeScrollable,
+} from "@/test/chat-scroll-harness";
 import type { Message } from "@/bindings";
 
 const SID = "s1";
@@ -38,33 +44,9 @@ const SID = "s1";
 // single under-estimated jump cannot accidentally arrive.
 const TOTAL = 400;
 const LAST_ID = `m${TOTAL - 1}`;
-const VIEWPORT_H = 1000; // matches the stub in vitest.setup.ts
 
-// Frames are queued rather than run synchronously: `scrollToIndex` schedules a
-// rAF reconcile loop that reschedules itself until the target offset stops
-// moving, so a synchronous rAF would recurse into it instead of stepping it.
-let frames: FrameRequestCallback[] = [];
-(globalThis as { requestAnimationFrame?: unknown }).requestAnimationFrame = (
-  cb: FrameRequestCallback,
-) => {
-  frames.push(cb);
-  return frames.length;
-};
-(globalThis as { cancelAnimationFrame?: unknown }).cancelAnimationFrame =
-  () => {};
-
-/** Run queued frames until the queue drains or the budget runs out. The budget
- *  is generous because the reconcile loop needs one pass per correction. */
-async function flushFrames(budget = 60) {
-  for (let i = 0; i < budget; i++) {
-    const queued = frames;
-    frames = [];
-    if (queued.length === 0) return;
-    await act(async () => {
-      for (const cb of queued) cb(i);
-    });
-  }
-}
+const raf = installQueuedRaf();
+const flushFrames = raf.flushFrames;
 
 function seed() {
   const messages: Message[] = [];
@@ -88,63 +70,22 @@ function seed() {
   });
 }
 
-/**
- * Give the scroller real behaviour, with `scrollHeight` read from the spacer's
- * live height. That is the crux of this suite: a constant `scrollHeight` would
- * make the naive implementation look correct, because the bug is precisely that
- * the bottom moves as rows measure.
- */
-function makeScrollable(el: HTMLElement) {
-  let top = 0;
-  const spacerHeight = () => {
-    const spacer = el.querySelector<HTMLElement>("[style*='height']");
-    return spacer ? parseFloat(spacer.style.height) || 0 : 0;
-  };
-  Object.defineProperty(el, "scrollHeight", {
-    configurable: true,
-    get: spacerHeight,
-  });
-  Object.defineProperty(el, "clientHeight", {
-    configurable: true,
-    get: () => VIEWPORT_H,
-  });
-  Object.defineProperty(el, "scrollTop", {
-    configurable: true,
-    get: () => top,
-    set: (v: number) => {
-      top = Math.max(0, Math.min(v, Math.max(0, spacerHeight() - VIEWPORT_H)));
-      el.dispatchEvent(new Event("scroll"));
-    },
-  });
-  // `behavior: "smooth"` is stepped rather than instant, because the steps are
-  // load-bearing for this bug: a real smooth scroll fires `scroll` at every
-  // intermediate offset, and `handleScroll` reads each one as "not at the
-  // bottom" and detaches the pin. An instant stub would hide cause (2) entirely
-  // and let the naive implementation look like it arrives.
-  (el as unknown as { scrollTo: (o: ScrollToOptions) => void }).scrollTo = (
-    o,
-  ) => {
-    if (typeof o?.top !== "number") return;
-    const from = top;
-    const to = o.top;
-    if (o.behavior === "smooth") {
-      for (let step = 1; step < 4; step++) {
-        el.scrollTop = from + ((to - from) * step) / 4;
-      }
-    }
-    el.scrollTop = to;
-  };
-}
-
 async function renderScrolledToTop() {
   const view = render(<ChatView sessionId={SID} />);
   const scrollEl = view.container.querySelector(
     '[data-testid="chat-scroll"]',
   ) as HTMLDivElement;
   makeScrollable(scrollEl);
-  await flushFrames();
   // Park at the top and let the scroll handler detach the pin, which is what
   // puts the arrow on screen in the first place.
+  //
+  // This has to happen *before* the session-open pin's frames run. Since #1165
+  // that pin converges to the true tail like the arrow does, so flushing first
+  // would measure every tail row and leave `scrollHeight` honest — and the
+  // whole subject of this suite is what the arrow does against a spacer that is
+  // still mostly estimates. Detaching first is also the only state in which the
+  // arrow appears at all: a user who scrolled up while the session was still
+  // opening.
   await act(async () => {
     scrollEl.scrollTop = 0;
   });
@@ -158,7 +99,7 @@ const mounted = (c: HTMLElement, id: string) =>
   c.querySelector(`[data-message-id="${id}"]`) !== null;
 
 beforeEach(() => {
-  frames = [];
+  raf.reset();
   seed();
 });
 afterEach(() => {
