@@ -25,6 +25,8 @@ mod bash;
 mod compaction;
 mod diagnostics;
 mod edit;
+#[cfg(any(test, feature = "test-fixtures"))]
+pub mod fixtures;
 mod git;
 mod github;
 mod glob;

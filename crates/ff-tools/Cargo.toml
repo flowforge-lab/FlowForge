@@ -5,6 +5,11 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+# Tool stubs for other crates' tests (#1107). Off by default so they never reach
+# a production build; the desktop enables it as a dev-dependency only.
+test-fixtures = []
+
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
