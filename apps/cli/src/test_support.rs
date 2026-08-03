@@ -105,10 +105,109 @@ impl TestEnv {
         self.flowforge_dir.join("provider.json")
     }
 
+    /// Path `serve` reads its `[slack]` transport config from (#1060 T5).
+    pub(crate) fn transports_path(&self) -> PathBuf {
+        self.flowforge_dir.join("transports.toml")
+    }
+
     /// Persist a registry at the env's `registry_path()` using the same
     /// atomic-rename primitive the production code uses.
     pub(crate) fn write_registry(&self, reg: &ProviderRegistry) {
         let json = serde_json::to_string_pretty(reg).expect("serialize");
         crate::registry::write_atomic(&self.registry_path(), &json).expect("atomic write");
+    }
+
+    /// Persist a `transports.toml` at the env's [`Self::transports_path`].
+    pub(crate) fn write_transports(&self, toml: &str) {
+        std::fs::create_dir_all(&self.flowforge_dir).expect("create flowforge dir");
+        std::fs::write(self.transports_path(), toml).expect("write transports.toml");
+    }
+}
+
+/// Run `f` with the Slack token vars removed, restoring the previous values
+/// afterwards even on panic.
+///
+/// Mutating the environment is process-global, which is why this is funnelled
+/// through one helper instead of open-coded per test: `scripts/test.sh` runs
+/// nextest, whose process-per-test scheduler keeps these tests isolated from
+/// each other, but doctests share a process — so the restore is what keeps
+/// this honest rather than the scheduler.
+pub(crate) fn with_env_unset<T>(f: impl FnOnce() -> T) -> T {
+    with_env_set(&[], f)
+}
+
+/// RAII form of [`with_env_unset`] for `async` callers, which cannot run their
+/// body inside a closure. Restores the previous environment on drop.
+#[must_use = "the environment is restored when this guard drops, so dropping it \
+              immediately makes the call a no-op"]
+pub(crate) struct EnvGuard {
+    saved: Vec<(&'static str, Option<String>)>,
+}
+
+impl EnvGuard {
+    pub(crate) fn unset() -> Self {
+        let saved = managed_snapshot();
+        // SAFETY: restored in `Drop`. See the note on `with_env_set`.
+        unsafe {
+            for (key, _) in &saved {
+                std::env::remove_var(key);
+            }
+        }
+        Self { saved }
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        // SAFETY: mirrors the mutation performed in `unset`.
+        unsafe {
+            for (key, value) in &self.saved {
+                match value {
+                    Some(v) => std::env::set_var(key, v),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+}
+
+fn managed_snapshot() -> Vec<(&'static str, Option<String>)> {
+    const MANAGED: [&str; 2] = [crate::serve::APP_TOKEN_VAR, crate::serve::BOT_TOKEN_VAR];
+    MANAGED
+        .iter()
+        .map(|k| (*k, std::env::var(k).ok()))
+        .collect()
+}
+
+/// Run `f` with `vars` set (and any Slack token var *not* listed removed),
+/// restoring the previous environment afterwards even on panic.
+pub(crate) fn with_env_set<T>(vars: &[(&str, &str)], f: impl FnOnce() -> T) -> T {
+    let saved = managed_snapshot();
+
+    // SAFETY: single-threaded mutation of this process's environment, restored
+    // below. See the module note above on why isolation is not relied upon.
+    unsafe {
+        for (key, _) in &saved {
+            std::env::remove_var(key);
+        }
+        for (key, value) in vars {
+            std::env::set_var(key, value);
+        }
+    }
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+
+    unsafe {
+        for (key, value) in saved {
+            match value {
+                Some(v) => std::env::set_var(key, v),
+                None => std::env::remove_var(key),
+            }
+        }
+    }
+
+    match result {
+        Ok(value) => value,
+        Err(payload) => std::panic::resume_unwind(payload),
     }
 }

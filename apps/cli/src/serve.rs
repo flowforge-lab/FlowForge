@@ -38,17 +38,20 @@ pub struct ServeArgs {
     pub mode: ModeArg,
 
     /// Slack user IDs allowed to drive the session, comma-separated
-    /// (e.g. `--allow-user U123,U456`).
+    /// (e.g. `--allow-user U123,U456`). Overrides `allowed_users` under
+    /// `[slack]` in `transports.toml`.
     ///
-    /// Required, and required for a reason: the transport fails closed — an empty
-    /// allowlist rejects *every* sender (`transport.rs:186`), so defaulting it to
-    /// empty would start a bot that acks messages and silently answers nobody.
-    /// Making it mandatory turns that into an argument error at startup.
-    #[arg(long, value_delimiter = ',', required = true)]
+    /// Not a clap `required`, because the file is an equally valid source — but
+    /// it still cannot be skipped in *both* places: the transport fails closed,
+    /// and an empty allowlist rejects *every* sender (`transport.rs:186`), so a
+    /// bot configured with neither acks messages and silently answers nobody.
+    /// [`serve`] rejects that combination at startup rather than letting it boot.
+    #[arg(long, value_delimiter = ',')]
     pub allow_user: Vec<String>,
 }
 
-/// The two Slack tokens, read from the environment.
+/// The two Slack tokens, resolved from `transports.toml` with the environment
+/// as an override.
 ///
 /// Split out from [`serve`] so the resolution rule and its failure message can be
 /// asserted without a Slack connection.
@@ -59,22 +62,99 @@ pub struct SlackTokens {
 }
 
 impl SlackTokens {
-    /// Read both tokens from the environment, treating an empty var as absent —
-    /// the same rule `host.rs` applies to provider keys.
-    pub fn from_env() -> Result<Self, String> {
+    /// Resolve both tokens from `transports.toml`, with the environment as an
+    /// override (#1060 scope bullet 2).
+    ///
+    /// The file is the documented source; the env vars stay because a container
+    /// or CI deployment must be able to supply a credential without baking it
+    /// into a file on disk. This is the same layering `host.rs` uses for the
+    /// provider config, where the per-connection value wins and the env var is
+    /// the global override.
+    ///
+    /// An empty value is treated as absent from *either* source: an empty
+    /// string in a checked-in file is a half-finished edit, not a credential,
+    /// and silently booting with it would fail later at the Slack handshake
+    /// with a far less obvious error.
+    /// Resolve from an already-parsed `[slack]` section.
+    ///
+    /// Takes the section rather than reading the file itself so [`serve`] does
+    /// not parse `transports.toml` twice — it needs `allowed_users` from the
+    /// same read.
+    pub fn from_parts(slack: &SlackConfig) -> Result<Self, String> {
         Ok(Self {
-            app_token: require_var(APP_TOKEN_VAR)?,
-            bot_token: require_var(BOT_TOKEN_VAR)?,
+            app_token: resolve_token(APP_TOKEN_VAR, "app_token", slack.app_token.clone())?,
+            bot_token: resolve_token(BOT_TOKEN_VAR, "bot_token", slack.bot_token.clone())?,
         })
     }
 }
 
-fn require_var(name: &str) -> Result<String, String> {
-    std::env::var(name)
+/// The `[slack]` section of `transports.toml`. Unknown keys are rejected so a
+/// typo in a credential key surfaces as an error rather than as a silently
+/// missing token.
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SlackConfig {
+    pub app_token: Option<String>,
+    pub bot_token: Option<String>,
+    /// Slack user IDs allowed to drive the session. `--allow-user` overrides
+    /// this; the transport fails closed when the result is empty.
+    #[serde(default)]
+    pub allowed_users: Vec<String>,
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TransportsConfig {
+    pub slack: Option<SlackConfig>,
+}
+
+impl TransportsConfig {
+    /// Read and parse `transports.toml`, treating an absent file as an empty
+    /// config — the env-var-only deployment is legitimate, so a missing file is
+    /// not itself an error. A *malformed* file is, since silently ignoring it
+    /// would present as "token not set" and send the reader to the wrong place.
+    pub fn read() -> Result<Self, String> {
+        let Some(path) = transports_path() else {
+            return Ok(Self::default());
+        };
+        match std::fs::read_to_string(&path) {
+            Ok(raw) => toml::from_str(&raw)
+                .map_err(|e| format!("{} is not valid TOML: {e}", path.display())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(e) => Err(format!("cannot read {}: {e}", path.display())),
+        }
+    }
+}
+
+/// Path to `transports.toml`, resolved through the same `config_dir()`
+/// indirection `host.rs:177` uses so the `TestEnv` override applies here too.
+fn transports_path() -> Option<std::path::PathBuf> {
+    let config_dir = {
+        #[cfg(test)]
+        {
+            crate::test_support::config_dir_override().or_else(dirs::config_dir)
+        }
+        #[cfg(not(test))]
+        {
+            dirs::config_dir()
+        }
+    }?;
+    // The override is the *config dir*, not its `flowforge/` subdir, so the
+    // subdir is appended here exactly as `registry_path()` does.
+    Some(config_dir.join("flowforge").join("transports.toml"))
+}
+
+fn resolve_token(var: &str, key: &str, from_file: Option<String>) -> Result<String, String> {
+    std::env::var(var)
         .ok()
+        .or(from_file)
+        .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty())
         .ok_or_else(|| {
-            format!("{name} is not set; a Slack app-level and bot token are both required")
+            format!(
+                "no Slack {key}: set `{key}` under [slack] in transports.toml, \
+                 or export {var}"
+            )
         })
 }
 
@@ -158,12 +238,30 @@ pub async fn run(args: ServeArgs) -> std::process::ExitCode {
 /// The fallible core of [`run`], kept separate so assembly failures are
 /// assertable without a process exit.
 async fn serve(args: ServeArgs) -> Result<(), String> {
-    let tokens = SlackTokens::from_env()?;
+    let config = TransportsConfig::read()?;
+    let slack = config.slack.unwrap_or_default();
+    let tokens = SlackTokens::from_parts(&slack)?;
     let channel = ChannelId::new(TRANSPORT_NAME, &args.channel);
     let mode: ff_core::Mode = args.mode.into();
 
+    // `--allow-user` wins; the file supplies the default. Either way the
+    // transport fails closed on an empty result, so an operator who configures
+    // neither is refused rather than exposed.
+    let allowed_users = if args.allow_user.is_empty() {
+        slack.allowed_users.clone()
+    } else {
+        args.allow_user.clone()
+    };
+    if allowed_users.is_empty() {
+        return Err(format!(
+            "no allowed users: pass --allow-user U123,U456 or set `allowed_users` \
+             under [slack] in transports.toml. The transport fails closed, so \
+             booting with an empty allowlist would ack every message and answer \
+             nobody."
+        ));
+    }
     let mut transport = SlackTransport::new(&tokens.app_token, &tokens.bot_token)
-        .with_allowed_user_ids(args.allow_user.clone());
+        .with_allowed_user_ids(allowed_users);
 
     // The approver can only be built from a `Connected`, so this cannot be
     // reordered without a compile error.

@@ -1948,9 +1948,11 @@ dependencies = [
  "futures-util",
  "keyring",
  "security-framework 3.7.0",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",
+ "toml 0.8.2",
  "uuid",
  "wiremock",
 ]
