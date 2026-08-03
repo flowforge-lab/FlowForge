@@ -3541,3 +3541,42 @@ fn title_generation_failure_does_not_log_the_provider_body() {
         );
     }
 }
+
+// ---- Advertised schema well-formedness (#1191) ----
+
+#[test]
+fn every_desktop_tool_advertises_an_object_schema() {
+    // `skills` shipped `parameters()` as a bare `{}`, so strict providers 400'd the
+    // whole request the moment it was in the block: measured, 1 of 32 advertised
+    // tools was malformed, and it was the entry point to skills. Anthropic and
+    // Bedrock masked it via their own normalizer, so the failure was
+    // provider-dependent -- which is why no per-provider test caught it.
+    //
+    // Asserted against the real desktop registry rather than `with_defaults()`:
+    // `skills` is registered only here, so the ff-tools-level test cannot see it.
+    let state = AppState::new();
+    let registry = state.build_tool_registry(std::path::Path::new("."));
+    let offenders: Vec<String> = registry
+        .openai_tools()
+        .iter()
+        .filter_map(|entry| {
+            let f = &entry["function"];
+            let params = &f["parameters"];
+            let ok = params.get("type").and_then(serde_json::Value::as_str) == Some("object")
+                && params
+                    .get("properties")
+                    .is_some_and(serde_json::Value::is_object);
+            (!ok).then(|| {
+                format!(
+                    "{}: {}",
+                    f["name"].as_str().unwrap_or("?"),
+                    serde_json::to_string(params).unwrap_or_default()
+                )
+            })
+        })
+        .collect();
+    assert!(
+        offenders.is_empty(),
+        "every advertised tool must declare an object schema; offenders: {offenders:?}"
+    );
+}
