@@ -16,7 +16,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use ff_agent::{ApprovalOutcome, Approver};
+use ff_agent::{ApprovalOutcome, Approver, DenyReason};
 use ff_core::permission::ArgMatcher;
 use ff_core::{Mode, PermissionCell, PermissionMatrix, PermissionRule, RuleEffect, Safety};
 use ff_transport::ChannelId;
@@ -527,8 +527,12 @@ async fn a_scoped_deny_rule_vetoes_without_prompting() {
         .await;
 
     assert!(
-        matches!(decision, ApprovalOutcome::Denied(_)),
-        "a scoped Deny rule must veto"
+        matches!(
+            decision,
+            ApprovalOutcome::Denied(DenyReason::ScopedRule { ref rule })
+                if rule == "bash (command prefix 'rm -rf')"
+        ),
+        "a scoped Deny rule must veto and name the matched rule"
     );
 }
 

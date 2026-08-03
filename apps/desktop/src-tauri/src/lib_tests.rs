@@ -3,9 +3,9 @@ use super::{
     compare_build, emit_agent_event, git_branch, goal_gate_for, install_guard, is_app_ready,
     list_directory_in, list_local_branches, matrix_gate, panic_message, publish_app_ready,
     read_file_in, resolve_workspace_dir, run_sidecar_turn, should_warmup, switch_branch,
-    BootFinalize, TurnMetrics, UpdateStatus, VersionDirection, APP_READY,
+    BootFinalize, TurnMetrics, UiApprover, UpdateStatus, VersionDirection, APP_READY,
 };
-use ff_agent::{AgentEvent, GateDecision};
+use ff_agent::{AgentEvent, ApprovalOutcome, Approver, DenyReason, GateDecision};
 use ff_core::events::TurnDoneEvent;
 use ff_core::{pre_prompt_decision, Mode, PrePromptDecision, ProviderKind};
 use ff_tools::Safety;
@@ -1059,5 +1059,55 @@ fn pre_prompt_plan_write_denied_despite_allowlist() {
             PrePromptDecision::Deny(ff_core::DenyReason::Mode { .. })
         ),
         "Plan x Write = Deny must override the allowlist"
+    );
+}
+
+// #1187: the desktop approver must thread matching_deny_rule into
+// pre_prompt_decision so the denial names the rule, not just the mode.
+#[tokio::test]
+async fn ui_approver_scoped_deny_names_the_matched_rule() {
+    use ff_core::permission::ArgMatcher;
+    use ff_core::{PermissionMatrix, PermissionRule, RuleEffect};
+
+    let mut matrix = PermissionMatrix::default();
+    matrix.rules = vec![PermissionRule {
+        effect: RuleEffect::Deny,
+        tool: "bash".into(),
+        matcher: ArgMatcher::CommandPrefix {
+            prefix: "rm -rf".into(),
+        },
+    }];
+
+    let state = Arc::new(AppState::new());
+    state.set_permission_matrix_for_test(matrix);
+
+    let app = tauri::test::mock_builder()
+        .build(tauri::test::mock_context(tauri::test::noop_assets()))
+        .expect("mock app builds");
+
+    let approver = UiApprover {
+        app: app.handle().clone(),
+        state: state.clone(),
+        session_id: "s1".into(),
+        mode: Mode::Auto,
+    };
+
+    let decision = approver
+        .approve(
+            "m1",
+            "c1",
+            "bash",
+            Safety::Write,
+            &serde_json::json!({ "command": "rm -rf /tmp/x" }),
+        )
+        .await;
+
+    assert!(
+        matches!(
+            decision,
+            ApprovalOutcome::Denied(DenyReason::ScopedRule { ref rule })
+                if rule == "bash (command prefix 'rm -rf')"
+        ),
+        "wiring must thread the matched rule name into DenyReason::ScopedRule, not Mode"
     );
 }

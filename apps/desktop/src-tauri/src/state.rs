@@ -3472,6 +3472,11 @@ impl AppState {
         view
     }
 
+    #[cfg(test)]
+    pub fn set_permission_matrix_for_test(&self, matrix: ff_core::PermissionMatrix) {
+        *self.permission_matrix.lock().unwrap() = matrix;
+    }
+
     /// Resolve the mode a turn for `session_id` runs as (#265): an explicit per-pane
     /// binding, else the global [`default_mode`](Self::default_mode). Mirrors
     /// [`session_phenotype`](Self::session_phenotype).
