@@ -207,8 +207,8 @@ fn matrix_gate(cell: PermissionCell) -> Option<bool> {
 /// Routes write/dangerous tool calls through a UI confirmation. Read-only calls
 /// never reach this approver — the agent loop short-circuits them.
 /// Whether the active autonomy mode auto-approves a call of this safety without a
-struct UiApprover {
-    app: tauri::AppHandle,
+struct UiApprover<R: tauri::Runtime> {
+    app: tauri::AppHandle<R>,
     state: Arc<AppState>,
     session_id: String,
     /// The session's resolved autonomy mode for this turn (#265).
@@ -216,7 +216,7 @@ struct UiApprover {
 }
 
 #[async_trait]
-impl Approver for UiApprover {
+impl<R: tauri::Runtime> Approver for UiApprover<R> {
     async fn approve(
         &self,
         message_id: &str,
