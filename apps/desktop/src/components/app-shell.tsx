@@ -212,7 +212,10 @@ function usePaneInit() {
   useEffect(() => {
     if (root || !hasSessions) return;
     const { sessions, activeSessionId } = useChatStore.getState();
-    usePanesStore.getState().init(
+    // Async since #1134 (the persisted tree comes from durable storage). `root`
+    // stays null across the read, so this effect can re-fire mid-flight; `init`
+    // collapses the repeat onto the first call.
+    void usePanesStore.getState().init(
       sessions.map((x) => x.id),
       activeSessionId,
     );

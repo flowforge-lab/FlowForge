@@ -59,7 +59,13 @@ export function SessionPane({
 
   // Per-pane file browser (#944): open state + divider width live in the
   // file-panel store, keyed by this pane's session so panes stay independent.
-  const filesOpen = useFilePanelStore((s) => s.openSessions.has(sessionId));
+  // The store hydrates asynchronously (#1134), so `openSessions` is empty for a
+  // tick after mount — hold the panel until it lands rather than painting the
+  // chat full-width and snapping the panel in, and so `FilePanel`'s mount-time
+  // `syncSession` sees the restored expanded dirs instead of none.
+  const filesOpen = useFilePanelStore(
+    (s) => s.hasHydrated && s.openSessions.has(sessionId),
+  );
   const toggleFiles = useFilePanelStore((s) => s.toggleFiles);
   const panelWidth = useFilePanelStore((s) => s.panelWidth);
   const setPanelWidth = useFilePanelStore((s) => s.setPanelWidth);

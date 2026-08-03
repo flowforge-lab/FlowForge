@@ -7,12 +7,18 @@
 // tree|viewer divider widths are single global values shared by every pane.
 //
 // Only *view* state (open sessions, per-session expanded dirs / selected file /
-// markdown toggle, and the two widths) is persisted to localStorage — the
-// directory listings and file bodies are transient caches, re-fetched from the
-// backend on demand, so large file contents never get serialized on every
-// mutation.
+// markdown toggle, and the two widths) is persisted — the directory listings and
+// file bodies are transient caches, re-fetched from the backend on demand, so
+// large file contents never get serialized on every mutation.
+//
+// Stored through `durableStorage` (#1134) — a WKWebView doesn't reliably flush
+// localStorage before the process exits, so a panel opened or a tree expanded
+// late in a session could otherwise come back closed. The on-disk shape is
+// unchanged, so an existing `ff-file-panel` value is adopted as-is; see
+// lib/durable-json.ts. That read is async, hence `hasHydrated` below.
 
 import { create } from "zustand";
+import { readDurable, writeDurable } from "@/lib/durable-json";
 import { ipc } from "@/lib/ipc";
 import type { DirEntry, FileContent } from "@/bindings";
 
@@ -88,60 +94,49 @@ interface Hydrated {
   bySession: Record<string, SessionFileState>;
 }
 
-function loadPersisted(): Hydrated {
-  const fallback: Hydrated = {
-    openSessions: new Set(),
-    panelWidth: DEFAULT_PANEL_WIDTH,
-    treeWidth: DEFAULT_TREE_WIDTH,
-    bySession: {},
-  };
-  try {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    if (!raw) return fallback;
-    const p = JSON.parse(raw) as Partial<Persisted>;
-    const bySession: Record<string, SessionFileState> = {};
-    const view = p.view ?? {};
-    for (const [id, v] of Object.entries(view)) {
-      bySession[id] = {
-        ...emptySlice(),
-        expanded: new Set(Array.isArray(v.expanded) ? v.expanded : []),
-        selectedPath: v.selectedPath ?? null,
-        markdownRaw: Boolean(v.markdownRaw),
-      };
-    }
-    return {
-      openSessions: new Set(
-        Array.isArray(p.openSessions) ? p.openSessions : [],
-      ),
-      panelWidth: clampPanelWidth(p.panelWidth ?? DEFAULT_PANEL_WIDTH),
-      treeWidth: clampTreeWidth(p.treeWidth ?? DEFAULT_TREE_WIDTH),
-      bySession,
+const FALLBACK: Hydrated = {
+  openSessions: new Set(),
+  panelWidth: DEFAULT_PANEL_WIDTH,
+  treeWidth: DEFAULT_TREE_WIDTH,
+  bySession: {},
+};
+
+function parsePersisted(raw: unknown): Hydrated {
+  const p = (raw ?? {}) as Partial<Persisted>;
+  const bySession: Record<string, SessionFileState> = {};
+  const view = p.view ?? {};
+  for (const [id, v] of Object.entries(view)) {
+    bySession[id] = {
+      ...emptySlice(),
+      expanded: new Set(Array.isArray(v.expanded) ? v.expanded : []),
+      selectedPath: v.selectedPath ?? null,
+      markdownRaw: Boolean(v.markdownRaw),
     };
-  } catch {
-    return fallback;
   }
+  return {
+    openSessions: new Set(Array.isArray(p.openSessions) ? p.openSessions : []),
+    panelWidth: clampPanelWidth(p.panelWidth ?? DEFAULT_PANEL_WIDTH),
+    treeWidth: clampTreeWidth(p.treeWidth ?? DEFAULT_TREE_WIDTH),
+    bySession,
+  };
 }
 
 function persist(h: Hydrated): void {
-  try {
-    const view: Record<string, PersistedSession> = {};
-    for (const [id, s] of Object.entries(h.bySession)) {
-      view[id] = {
-        expanded: [...s.expanded],
-        selectedPath: s.selectedPath,
-        markdownRaw: s.markdownRaw,
-      };
-    }
-    const p: Persisted = {
-      openSessions: [...h.openSessions],
-      panelWidth: h.panelWidth,
-      treeWidth: h.treeWidth,
-      view,
+  const view: Record<string, PersistedSession> = {};
+  for (const [id, s] of Object.entries(h.bySession)) {
+    view[id] = {
+      expanded: [...s.expanded],
+      selectedPath: s.selectedPath,
+      markdownRaw: s.markdownRaw,
     };
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(p));
-  } catch {
-    // Quota / private mode — non-fatal; the panel just won't survive reload.
   }
+  const p: Persisted = {
+    openSessions: [...h.openSessions],
+    panelWidth: h.panelWidth,
+    treeWidth: h.treeWidth,
+    view,
+  };
+  writeDurable(STORAGE_KEY, p);
 }
 
 interface FilePanelState {
@@ -153,6 +148,12 @@ interface FilePanelState {
   panelWidth: number;
   /** Tree|viewer divider width (px), shared across panes. */
   treeWidth: number;
+  /** False until the (always-async) durable read has landed. `session-pane.tsx`
+   *  gates the panel on it: `openSessions.has(id)` decides whether a pane shows
+   *  the panel at all, and `syncSession` re-fetches the persisted expanded dirs
+   *  on mount — both would otherwise run against empty defaults, flashing the
+   *  chat full-width and dropping the restored tree. Runtime-only. */
+  hasHydrated: boolean;
 
   /** Open the Files panel for `sessionId` (palette / ⌘⇧E / header entry point). */
   openFiles: (sessionId: string) => void;
@@ -175,10 +176,18 @@ interface FilePanelState {
   setPanelWidth: (px: number) => void;
   /** Commit the tree|viewer divider width. */
   setTreeWidth: (px: number) => void;
+  /** Adopt the persisted view state. Fired once on module load; exported on the
+   *  store so tests can re-run it after seeding storage. */
+  hydrate: () => Promise<void>;
 }
 
 export const useFilePanelStore = create<FilePanelState>((set, get) => {
-  const save = () => persist(get());
+  const save = () => {
+    // Before hydration the state is still defaults; writing them would clobber
+    // the open panels and expanded trees the user actually left behind.
+    if (!get().hasHydrated) return;
+    persist(get());
+  };
 
   /** Return a shallow-cloned `bySession` guaranteeing a slice for `id`, plus the
    *  slice itself. Callers mutate the returned map and `set` it. */
@@ -202,7 +211,8 @@ export const useFilePanelStore = create<FilePanelState>((set, get) => {
   };
 
   return {
-    ...loadPersisted(),
+    ...FALLBACK,
+    hasHydrated: false,
 
     openFiles: (sessionId) => {
       if (get().openSessions.has(sessionId)) return;
@@ -312,8 +322,25 @@ export const useFilePanelStore = create<FilePanelState>((set, get) => {
       set({ treeWidth: clampTreeWidth(px) });
       save();
     },
+
+    hydrate: async () => {
+      const stored = await readDurable(STORAGE_KEY, parsePersisted, FALLBACK);
+      // Panels opened while the read was in flight are newer than what's on
+      // disk, so they survive the merge rather than being closed under the user.
+      // `bySession` slices already in memory win for the same reason (they hold
+      // live listing caches the persisted copy doesn't have).
+      set((s) => ({
+        openSessions: new Set([...stored.openSessions, ...s.openSessions]),
+        panelWidth: stored.panelWidth,
+        treeWidth: stored.treeWidth,
+        bySession: { ...stored.bySession, ...s.bySession },
+        hasHydrated: true,
+      }));
+    },
   };
 });
+
+void useFilePanelStore.getState().hydrate();
 
 function errMsg(e: unknown): string {
   return e instanceof Error ? e.message : String(e);

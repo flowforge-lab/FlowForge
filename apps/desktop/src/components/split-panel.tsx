@@ -117,9 +117,9 @@ export function SplitPanel() {
 
   // Drag-to-resize: the panel is flush to the window's right edge, so its width
   // is simply the distance from the cursor to that edge. During the drag the
-  // width is applied imperatively (no React render, no localStorage write per
-  // mousemove — persisting would re-serialize content.text 60+×/sec); the store
-  // is committed + persisted exactly once on mouseup.
+  // width is applied imperatively (no React render, no storage write per
+  // mousemove — persisting would re-serialize content.text 60+×/sec, now over
+  // IPC); the store is committed + persisted exactly once on mouseup.
   function startResize(e: React.MouseEvent) {
     e.preventDefault();
     const panel = e.currentTarget.parentElement as HTMLElement | null;

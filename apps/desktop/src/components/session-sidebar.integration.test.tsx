@@ -154,7 +154,7 @@ describe("SessionSidebar integration (#185)", () => {
 
   it("the + button swaps a new blank session into the focused pane (#671 item 1)", async () => {
     usePanesStore.setState({ root: null, focusedPaneId: null });
-    usePanesStore.getState().init(["s1", "s2"], "s1");
+    await usePanesStore.getState().init(["s1", "s2"], "s1");
     expect(usePanesStore.getState().leafCount()).toBe(1);
 
     const focusedPane = usePanesStore.getState().focusedPaneId as string;
@@ -177,7 +177,7 @@ describe("SessionSidebar integration (#185)", () => {
 
   it("the + button falls back to an in-pane swap at MAX_PANES (#245 2a)", async () => {
     usePanesStore.setState({ root: null, focusedPaneId: null });
-    usePanesStore.getState().init(["s1"], "s1");
+    await usePanesStore.getState().init(["s1"], "s1");
     for (let i = 2; i <= MAX_PANES; i++) {
       const target = usePanesStore.getState().focusedPaneId as string;
       usePanesStore.getState().splitRight(target, `s${i}`);
@@ -361,7 +361,7 @@ describe("SessionSidebar integration (#185)", () => {
     });
     useChatStore.getState().setSessionTitle(src.id, "Refactor auth");
     usePanesStore.setState({ root: null, focusedPaneId: null });
-    usePanesStore.getState().init([src.id], src.id);
+    await usePanesStore.getState().init([src.id], src.id);
     const focusedPane = usePanesStore.getState().focusedPaneId as string;
 
     const user = userEvent.setup();
@@ -395,7 +395,7 @@ describe("SessionSidebar integration (#185)", () => {
       activeSessionId: src.id,
     });
     usePanesStore.setState({ root: null, focusedPaneId: null });
-    usePanesStore.getState().init([src.id], src.id);
+    await usePanesStore.getState().init([src.id], src.id);
 
     const user = userEvent.setup();
     rtlRender(<SessionSidebar />);

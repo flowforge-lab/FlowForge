@@ -41,8 +41,8 @@ beforeEach(() => {
 });
 
 describe("panes store (#148)", () => {
-  it("init seeds a single focused leaf on the active session", () => {
-    usePanesStore.getState().init(["s1"], "s1");
+  it("init seeds a single focused leaf on the active session", async () => {
+    await usePanesStore.getState().init(["s1"], "s1");
     const r = root();
     expect(r.type).toBe("leaf");
     expect(leaves(r)).toHaveLength(1);
@@ -50,14 +50,14 @@ describe("panes store (#148)", () => {
     expect(focused()).toBe(leaves(r)[0].id);
   });
 
-  it("init with no live sessions leaves an empty tree", () => {
-    usePanesStore.getState().init([], null);
+  it("init with no live sessions leaves an empty tree", async () => {
+    await usePanesStore.getState().init([], null);
     expect(usePanesStore.getState().root).toBeNull();
     expect(usePanesStore.getState().focusedPaneId).toBeNull();
   });
 
-  it("splitRight adds a vertical split with the new leaf focused and active", () => {
-    usePanesStore.getState().init(["s1"], "s1");
+  it("splitRight adds a vertical split with the new leaf focused and active", async () => {
+    await usePanesStore.getState().init(["s1"], "s1");
     const leafId = leaves(root())[0].id;
     usePanesStore.getState().splitRight(leafId, "s2");
 
@@ -72,14 +72,14 @@ describe("panes store (#148)", () => {
     expect(useChatStore.getState().activeSessionId).toBe("s2");
   });
 
-  it("splitDown uses a horizontal split", () => {
-    usePanesStore.getState().init(["s1"], "s1");
+  it("splitDown uses a horizontal split", async () => {
+    await usePanesStore.getState().init(["s1"], "s1");
     usePanesStore.getState().splitDown(leaves(root())[0].id, "s2");
     expect((root() as SplitNode).dir).toBe("horizontal");
   });
 
-  it("same-axis splits build one flat N-way row, not a nested tree (#985)", () => {
-    usePanesStore.getState().init(["s1"], "s1");
+  it("same-axis splits build one flat N-way row, not a nested tree (#985)", async () => {
+    await usePanesStore.getState().init(["s1"], "s1");
     usePanesStore.getState().splitRight(leaves(root())[0].id, "s2");
     usePanesStore.getState().splitRight(leaves(root())[0].id, "s3");
 
@@ -92,8 +92,8 @@ describe("panes store (#148)", () => {
     expect(r.ratios.reduce((a, b) => a + b, 0)).toBeCloseTo(1);
   });
 
-  it("a new split appears adjacent to the invoked pane (#985)", () => {
-    usePanesStore.getState().init(["s1"], "s1");
+  it("a new split appears adjacent to the invoked pane (#985)", async () => {
+    await usePanesStore.getState().init(["s1"], "s1");
     // Build a 3-column row: [s1, s2, s3].
     usePanesStore.getState().splitRight(leaves(root())[0].id, "s2");
     usePanesStore.getState().splitRight(leaves(root())[0].id, "s3");
@@ -111,8 +111,8 @@ describe("panes store (#148)", () => {
     ]);
   });
 
-  it("cross-axis split nests inside the row (#985)", () => {
-    usePanesStore.getState().init(["s1"], "s1");
+  it("cross-axis split nests inside the row (#985)", async () => {
+    await usePanesStore.getState().init(["s1"], "s1");
     usePanesStore.getState().splitRight(leaves(root())[0].id, "s2");
     const first = leaves(root())[0].id;
     // Split the first column DOWN — the other axis — so it nests.
@@ -127,7 +127,7 @@ describe("panes store (#148)", () => {
     expect(leaves(nested).map((l) => l.sessionId)).toEqual(["s1", "s3"]);
   });
 
-  it("migrates a legacy binary layout and flattens same-dir nesting on load (#985)", () => {
+  it("migrates a legacy binary layout and flattens same-dir nesting on load (#985)", async () => {
     // Hand-write a pre-#985 left-nested binary tree to localStorage:
     // split(split(P1,P2),P3), all vertical.
     const legacy = {
@@ -150,7 +150,7 @@ describe("panes store (#148)", () => {
     };
     localStorage.setItem("ff-panes", JSON.stringify(legacy));
 
-    usePanesStore.getState().init(["s1", "s2", "s3"], "s1");
+    await usePanesStore.getState().init(["s1", "s2", "s3"], "s1");
 
     const r = root() as SplitNode;
     expect(r.type).toBe("split");
@@ -164,7 +164,7 @@ describe("panes store (#148)", () => {
 
   it("splitNew opens a fresh blank session in a focused right split (#245 2a)", async () => {
     const src = await ipc.createSession();
-    usePanesStore.getState().init([src.id], src.id);
+    await usePanesStore.getState().init([src.id], src.id);
     const leafId = leaves(root())[0].id;
 
     await usePanesStore.getState().splitNew(leafId, "vertical");
@@ -178,8 +178,8 @@ describe("panes store (#148)", () => {
     expect((root() as SplitNode).dir).toBe("vertical");
   });
 
-  it("does not split beyond MAX_PANES", () => {
-    usePanesStore.getState().init(["s1"], "s1");
+  it("does not split beyond MAX_PANES", async () => {
+    await usePanesStore.getState().init(["s1"], "s1");
     for (let i = 2; i <= MAX_PANES; i++) {
       const target = leaves(root())[0].id;
       usePanesStore.getState().splitRight(target, `s${i}`);
@@ -191,8 +191,8 @@ describe("panes store (#148)", () => {
     expect(JSON.stringify(root())).toBe(before);
   });
 
-  it("closePane collapses the parent split into the surviving sibling", () => {
-    usePanesStore.getState().init(["s1"], "s1");
+  it("closePane collapses the parent split into the surviving sibling", async () => {
+    await usePanesStore.getState().init(["s1"], "s1");
     const first = leaves(root())[0].id;
     usePanesStore.getState().splitRight(first, "s2");
     const newLeaf = leaves(root()).find((l) => l.sessionId === "s2")!;
@@ -204,8 +204,8 @@ describe("panes store (#148)", () => {
     expect(leaves(r)[0].sessionId).toBe("s1");
   });
 
-  it("closePane refocuses a survivor and syncs the active session", () => {
-    usePanesStore.getState().init(["s1"], "s1");
+  it("closePane refocuses a survivor and syncs the active session", async () => {
+    await usePanesStore.getState().init(["s1"], "s1");
     const first = leaves(root())[0].id;
     usePanesStore.getState().splitRight(first, "s2");
     const newLeaf = leaves(root()).find((l) => l.sessionId === "s2")!;
@@ -215,20 +215,20 @@ describe("panes store (#148)", () => {
     expect(useChatStore.getState().activeSessionId).toBe("s1");
   });
 
-  it("closePane is a no-op on the last pane", () => {
-    usePanesStore.getState().init(["s1"], "s1");
+  it("closePane is a no-op on the last pane", async () => {
+    await usePanesStore.getState().init(["s1"], "s1");
     const only = leaves(root())[0].id;
     usePanesStore.getState().closePane(only);
     expect(usePanesStore.getState().leafCount()).toBe(1);
     expect(root().type).toBe("leaf");
   });
 
-  it("closePane re-flattens a same-dir split exposed by a collapse (#985 review)", () => {
+  it("closePane re-flattens a same-dir split exposed by a collapse (#985 review)", async () => {
     // Build: root V:[L1, H:[V:[L2,L4], L3]] — closing L3 collapses the H node
     // into its sole surviving child V:[L2,L4], which then sits directly under
     // the root V split: a same-dir nesting that must be flattened immediately,
     // not left until the next reload.
-    usePanesStore.getState().init(["s1"], "s1");
+    await usePanesStore.getState().init(["s1"], "s1");
     usePanesStore.getState().splitRight(leaves(root())[0].id, "s2"); // root V:[s1,s2]
     const l2 = leaves(root()).find((l) => l.sessionId === "s2")!;
     usePanesStore.getState().splitDown(l2.id, "s3"); // s2 -> H:[s2,s3]
@@ -252,8 +252,8 @@ describe("panes store (#148)", () => {
     expect(r.ratios.reduce((a, b) => a + b, 0)).toBeCloseTo(1);
   });
 
-  it("setRatios normalizes a split's ratios to sum to 1", () => {
-    usePanesStore.getState().init(["s1"], "s1");
+  it("setRatios normalizes a split's ratios to sum to 1", async () => {
+    await usePanesStore.getState().init(["s1"], "s1");
     usePanesStore.getState().splitRight(leaves(root())[0].id, "s2");
     const splitId = (root() as SplitNode).id;
 
@@ -272,8 +272,8 @@ describe("panes store (#148)", () => {
     expect((root() as SplitNode).ratios).toEqual([0.5, 0.5]);
   });
 
-  it("focusPane sets focus and syncs the active session", () => {
-    usePanesStore.getState().init(["s1"], "s1");
+  it("focusPane sets focus and syncs the active session", async () => {
+    await usePanesStore.getState().init(["s1"], "s1");
     const first = leaves(root())[0].id;
     usePanesStore.getState().splitRight(first, "s2");
     useChatStore.setState({ activeSessionId: "s2" });
@@ -283,8 +283,8 @@ describe("panes store (#148)", () => {
     expect(useChatStore.getState().activeSessionId).toBe("s1");
   });
 
-  it("setPaneSession swaps a leaf's session and focuses it", () => {
-    usePanesStore.getState().init(["s1"], "s1");
+  it("setPaneSession swaps a leaf's session and focuses it", async () => {
+    await usePanesStore.getState().init(["s1"], "s1");
     const first = leaves(root())[0].id;
     usePanesStore.getState().setPaneSession(first, "s9");
     expect(leaves(root())[0].sessionId).toBe("s9");
@@ -292,8 +292,8 @@ describe("panes store (#148)", () => {
     expect(useChatStore.getState().activeSessionId).toBe("s9");
   });
 
-  it("toggleCollapse flips the leaf's collapsed flag", () => {
-    usePanesStore.getState().init(["s1"], "s1");
+  it("toggleCollapse flips the leaf's collapsed flag", async () => {
+    await usePanesStore.getState().init(["s1"], "s1");
     const first = leaves(root())[0].id;
     usePanesStore.getState().toggleCollapse(first);
     expect(leaves(root())[0].collapsed).toBe(true);
@@ -301,14 +301,14 @@ describe("panes store (#148)", () => {
     expect(leaves(root())[0].collapsed).toBe(false);
   });
 
-  it("init drops persisted leaves whose session no longer exists", () => {
+  it("init drops persisted leaves whose session no longer exists", async () => {
     // Build + persist a 2-pane layout, then reload with s2 gone.
-    usePanesStore.getState().init(["s1"], "s1");
+    await usePanesStore.getState().init(["s1"], "s1");
     usePanesStore.getState().splitRight(leaves(root())[0].id, "s2");
     expect(usePanesStore.getState().leafCount()).toBe(2);
 
     usePanesStore.setState({ root: null, focusedPaneId: null });
-    usePanesStore.getState().init(["s1"], "s1");
+    await usePanesStore.getState().init(["s1"], "s1");
 
     const r = root();
     expect(leaves(r)).toHaveLength(1);
@@ -316,20 +316,20 @@ describe("panes store (#148)", () => {
     expect(focused()).toBe(leaves(r)[0].id);
   });
 
-  it("init syncs the chat active session to the restored focused pane", () => {
-    usePanesStore.getState().init(["s1"], "s1");
+  it("init syncs the chat active session to the restored focused pane", async () => {
+    await usePanesStore.getState().init(["s1"], "s1");
     usePanesStore.getState().splitRight(leaves(root())[0].id, "s2");
     // s2's pane is focused after the split; persisted to the memory storage.
 
     usePanesStore.setState({ root: null, focusedPaneId: null });
     useChatStore.setState({ activeSessionId: "unrelated" });
-    usePanesStore.getState().init(["s1", "s2"], "s1");
+    await usePanesStore.getState().init(["s1", "s2"], "s1");
 
     const focusedLeaf = leaves(root()).find((l) => l.id === focused())!;
     expect(useChatStore.getState().activeSessionId).toBe(focusedLeaf.sessionId);
   });
 
-  it("clampRatio guards against non-finite input", () => {
+  it("clampRatio guards against non-finite input", async () => {
     expect(clampRatio(Number.NaN)).toBe(0.5);
     expect(clampRatio(2)).toBeCloseTo(1 - MIN_RATIO);
   });
