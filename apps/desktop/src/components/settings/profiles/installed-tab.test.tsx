@@ -64,7 +64,13 @@ describe("InstalledTab default star", () => {
   it("stars Codon when it is installed (and not the built-in default)", () => {
     seed([
       phenotypeToProfile(
-        { name: "default", skills: [], mcpServers: [], egress: "open" },
+        {
+          name: "default",
+          skills: [],
+          mcpServers: [],
+          egress: "open",
+          preheat: [],
+        },
         0,
       ),
       phenotypeToProfile(
@@ -73,6 +79,7 @@ describe("InstalledTab default star", () => {
           skills: ["codegraph"],
           mcpServers: [],
           egress: "open",
+          preheat: [],
         },
         1,
       ),
@@ -85,11 +92,23 @@ describe("InstalledTab default star", () => {
   it("stars the built-in default when Codon is absent", () => {
     seed([
       phenotypeToProfile(
-        { name: "default", skills: [], mcpServers: [], egress: "open" },
+        {
+          name: "default",
+          skills: [],
+          mcpServers: [],
+          egress: "open",
+          preheat: [],
+        },
         0,
       ),
       phenotypeToProfile(
-        { name: "rust", skills: [], mcpServers: [], egress: "open" },
+        {
+          name: "rust",
+          skills: [],
+          mcpServers: [],
+          egress: "open",
+          preheat: [],
+        },
         1,
       ),
     ]);

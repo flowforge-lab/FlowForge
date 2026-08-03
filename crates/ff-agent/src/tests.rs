@@ -6576,7 +6576,14 @@ fn context_breakdown_splits_system_tools_and_messages() {
         msg(Role::Assistant, &"z".repeat(16), Some(&"r".repeat(4))),
     ];
 
-    let b = context_breakdown(Some(&system), &tool_schemas, &messages, 42, (None, None));
+    let b = context_breakdown(
+        Some(&system),
+        &tool_schemas,
+        &messages,
+        42,
+        (None, None),
+        PreheatAttribution::default(),
+    );
 
     // Buckets use the same tokenx-rs estimator as ProxyTokenEstimator::assess.
     assert!(
@@ -6609,7 +6616,14 @@ fn context_breakdown_splits_system_tools_and_messages() {
 
 #[test]
 fn context_breakdown_handles_absent_system_prompt() {
-    let b = context_breakdown(None, &[], &[], 0, (None, None));
+    let b = context_breakdown(
+        None,
+        &[],
+        &[],
+        0,
+        (None, None),
+        PreheatAttribution::default(),
+    );
     assert_eq!(b.system_tokens, 0);
     assert_eq!(b.tool_tokens, 0);
     assert_eq!(b.tool_specs, 0);
@@ -7456,4 +7470,191 @@ async fn run_turn_advertises_only_the_actions_the_mode_permits() {
             );
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// #1179 3A: preheat attribution.
+//
+// These exist to make a bad preheat list falsifiable. The load-bearing assertion
+// is that `preheated_used` is an intersection with the tools actually called: if
+// it were ever derived from the preheated set alone it would report a perfect hit
+// rate forever, and the instrument would be worse than absent -- it would
+// actively argue for keeping a preheat list that costs resident bytes and earns
+// nothing.
+
+fn schema(name: &str) -> serde_json::Value {
+    serde_json::json!({
+        "type": "function",
+        "function": {"name": name, "description": "x".repeat(200)}
+    })
+}
+
+fn names(v: &[&str]) -> std::collections::HashSet<String> {
+    v.iter().map(|s| s.to_string()).collect()
+}
+
+#[test]
+fn nothing_preheated_reports_none_not_zero() {
+    let a = preheat_attribution(&names(&[]), &names(&["a"]), &[schema("a")]);
+    assert_eq!(a, PreheatAttribution::default());
+    assert!(
+        a.count.is_none(),
+        "absent must be distinguishable from a declared list that resolved to \
+         nothing -- the latter is a config bug worth seeing"
+    );
+}
+
+#[test]
+fn preheated_used_counts_only_tools_actually_called() {
+    let schemas = [schema("a"), schema("b"), schema("c"), schema("d")];
+    let a = preheat_attribution(
+        &names(&["a", "b", "c"]),
+        // one preheated tool called, plus one that was never preheated
+        &names(&["a", "d"]),
+        &schemas,
+    );
+    assert_eq!(a.count, Some(3));
+    assert_eq!(
+        a.used,
+        Some(1),
+        "only `a` was both preheated and called; `d` was called but not \
+         preheated, and must not inflate the hit count"
+    );
+}
+
+#[test]
+fn preheated_used_can_report_a_total_miss() {
+    let a = preheat_attribution(
+        &names(&["a", "b"]),
+        &names(&["z"]),
+        &[schema("a"), schema("b")],
+    );
+    assert_eq!(a.count, Some(2));
+    assert_eq!(
+        a.used,
+        Some(0),
+        "a preheat list nothing touched must be visible as zero, which is the \
+         whole reason this field exists"
+    );
+}
+
+#[test]
+fn a_tool_called_repeatedly_counts_once() {
+    // `call_counts` keys are (name, args), so the same tool with different args
+    // appears twice; the derived called set must collapse them.
+    let mut call_counts: std::collections::HashMap<(String, String), usize> =
+        std::collections::HashMap::new();
+    call_counts.insert(("a".into(), "{\"x\":1}".into()), 1);
+    call_counts.insert(("a".into(), "{\"x\":2}".into()), 1);
+    let called: std::collections::HashSet<String> =
+        call_counts.keys().map(|(n, _)| n.clone()).collect();
+    let a = preheat_attribution(&names(&["a"]), &called, &[schema("a")]);
+    assert_eq!(
+        a.used,
+        Some(1),
+        "one tool that earned its bytes, not two hits"
+    );
+}
+
+#[test]
+fn preheated_bytes_measures_bytes_not_count() {
+    let schemas = [schema("a"), schema("b")];
+    let one = preheat_attribution(&names(&["a"]), &names(&[]), &schemas);
+    let two = preheat_attribution(&names(&["a", "b"]), &names(&[]), &schemas);
+    let one_bytes = one.bytes.unwrap();
+    let two_bytes = two.bytes.unwrap();
+    assert!(
+        one_bytes > 100,
+        "a real schema is hundreds of bytes, not a small integer; got {one_bytes}"
+    );
+    assert!(
+        two_bytes > one_bytes,
+        "two schemas must cost more bytes than one ({two_bytes} vs {one_bytes})"
+    );
+    assert_ne!(one_bytes, 1, "bytes must not collapse to a tool count");
+}
+
+#[test]
+fn a_preheated_name_that_was_never_advertised_costs_nothing() {
+    // A typo'd or registry-unknown name contributes no resident bytes. Charging
+    // for it would disguise a dead declaration as a paid-for one.
+    let a = preheat_attribution(&names(&["ghost"]), &names(&[]), &[schema("a")]);
+    assert_eq!(a.count, Some(0), "it was never advertised");
+    assert_eq!(a.bytes, Some(0), "so it cost no bytes");
+    assert_eq!(a.used, Some(0));
+}
+
+#[test]
+fn breakdown_carries_the_attribution_through() {
+    let schemas = vec![schema("a"), schema("b")];
+    let b = context_breakdown(
+        None,
+        &schemas,
+        &[],
+        0,
+        (None, None),
+        preheat_attribution(&names(&["a"]), &names(&["a"]), &schemas),
+    );
+    assert_eq!(b.tool_specs, 2);
+    assert_eq!(b.preheated_count, Some(1));
+    assert_eq!(b.preheated_used, Some(1));
+    assert!(b.preheated_bytes.is_some_and(|n| n > 0));
+}
+
+#[test]
+fn breakdown_omits_attribution_when_nothing_preheated() {
+    let b = context_breakdown(
+        None,
+        &[],
+        &[],
+        0,
+        (None, None),
+        PreheatAttribution::default(),
+    );
+    assert_eq!(b.preheated_count, None);
+    assert_eq!(b.preheated_used, None);
+    assert_eq!(b.preheated_bytes, None);
+}
+
+/// #1179 3B: a preheated deferred tool must be advertised on turn 1.
+///
+/// This is the mutation with no failure signal without a test: preheating *after*
+/// the turn's unlocked-set read still works -- the tool becomes callable, nothing
+/// errors -- it just arrives as a mid-turn append, invalidating the cached prefix
+/// and costing a full re-prefill. That is strictly worse than the `tool_search`
+/// round-trip preheat exists to avoid, and behaviourally identical, so only an
+/// assertion on the turn-1 advertised set can catch it.
+///
+/// Sibling of `deferred_tools_are_withheld_until_searched_for`: same withholding,
+/// reached by declaration instead of by search.
+#[test]
+fn a_preheated_deferred_tool_is_advertised_on_turn_one() {
+    let mut reg = ToolRegistry::with_defaults();
+    reg.register(deferred_stub("mcp_thing", Safety::ReadOnly, false));
+    let matrix = PermissionMatrix::default();
+
+    let state = ff_tools::ToolSearchState::default();
+    state.preheat("s1", ["mcp_thing".to_string()]);
+    // The union read `run_turn` performs before it builds the turn's schemas.
+    let unlocked = state.unlocked("s1");
+    assert!(
+        state.admitted("s1").is_empty(),
+        "nothing was searched for -- this must come from the preheat set alone"
+    );
+
+    let with = advertised_tools(
+        Mode::Act,
+        Egress::Open,
+        &matrix,
+        None,
+        &reg,
+        Some(&unlocked),
+    )
+    .expect("an explicit unlocked set materialises the advertised set");
+    assert!(
+        with.contains("mcp_thing"),
+        "a preheated tool was not advertised on turn 1, so it could only arrive as \
+         a mid-turn append -- invalidating the cached prefix instead of saving a \
+         round-trip"
+    );
 }

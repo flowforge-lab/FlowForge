@@ -393,6 +393,7 @@ fn test_phenotype(
         provider: None,
         mcp_servers: Vec::new(),
         egress: ff_core::Egress::Open,
+        preheat: Vec::new(),
     }
 }
 

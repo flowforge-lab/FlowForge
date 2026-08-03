@@ -170,6 +170,18 @@ fn build_bag(name: &str, description: &str, schema_keywords: &str) -> (HashMap<S
 #[derive(Debug, Default)]
 pub struct ToolSearchState {
     admitted: Mutex<HashMap<String, HashSet<String>>>,
+    /// Tools admitted up front by declaration rather than by search (#1179 3A).
+    ///
+    /// A second set rather than a flag folded into `admitted` because the whole
+    /// point is provenance: a tool the model *found* proves the search earned its
+    /// keep, while a tool a phenotype *declared* is a bet whose payoff has to be
+    /// measured separately. Merging them makes `preheated_used` uncomputable, and
+    /// that number is the only thing standing between a preheat list and an
+    /// unfalsifiable guess.
+    ///
+    /// Callers that ask "is this tool reachable" must consult both; see
+    /// [`Self::unlocked`].
+    preheated: Mutex<HashMap<String, HashSet<String>>>,
     /// Corpus vectors for semantic recall, cached across turns.
     ///
     /// This lives on the shared state rather than on `ToolSearchTool` because
@@ -218,6 +230,32 @@ impl ToolSearchState {
             .unwrap_or_default()
     }
 
+    /// Tools preheated for `session_id` by declaration (#1179 3A).
+    ///
+    /// Deliberately a parallel reader rather than a wider return type on
+    /// [`Self::admitted`]: `ff-agent`'s per-iteration guard compares
+    /// `unlocked.len() > appended.len()`, so changing that signature would drag a
+    /// hot-path check and the MCP guidance gate into a telemetry change.
+    pub fn preheated(&self, session_id: &str) -> HashSet<String> {
+        self.preheated
+            .lock()
+            .map(|m| m.get(session_id).cloned().unwrap_or_default())
+            .unwrap_or_default()
+    }
+
+    /// Every tool `session_id` can call, whatever admitted it.
+    ///
+    /// Reachability has exactly one answer, so it gets exactly one accessor. The
+    /// alternative — each call site unioning the two sets itself — is how the two
+    /// provenances drift apart, and a caller that forgets the union does not fail
+    /// loudly: it silently hides a preheated tool (or its server's guidance) from
+    /// the model while every test still passes.
+    pub fn unlocked(&self, session_id: &str) -> HashSet<String> {
+        let mut all = self.admitted(session_id);
+        all.extend(self.preheated(session_id));
+        all
+    }
+
     /// Re-admit `names` for `session_id`. Idempotent.
     pub fn admit(&self, session_id: &str, names: impl IntoIterator<Item = String>) {
         if let Ok(mut m) = self.admitted.lock() {
@@ -225,13 +263,28 @@ impl ToolSearchState {
         }
     }
 
+    /// Preheat `names` for `session_id`. Idempotent.
+    ///
+    /// Must be called before the first turn builds the tool schemas, or the names
+    /// land outside the stable prompt prefix and quietly cost a re-prefill instead
+    /// of saving a round-trip (#1179 3B).
+    pub fn preheat(&self, session_id: &str, names: impl IntoIterator<Item = String>) {
+        if let Ok(mut m) = self.preheated.lock() {
+            m.entry(session_id.to_string()).or_default().extend(names);
+        }
+    }
+
     /// Whether `session_id` has unlocked anything yet. Lets the caller skip
     /// rebuilding the schema list when nothing has changed.
     pub fn is_empty(&self, session_id: &str) -> bool {
-        self.admitted
-            .lock()
-            .map(|m| m.get(session_id).is_none_or(HashSet::is_empty))
-            .unwrap_or(true)
+        // Checks both provenances without materialising either set: this answers
+        // the same question as `unlocked()` and must not disagree with it.
+        let empty_in = |m: &Mutex<HashMap<String, HashSet<String>>>| {
+            m.lock()
+                .map(|m| m.get(session_id).is_none_or(HashSet::is_empty))
+                .unwrap_or(true)
+        };
+        empty_in(&self.admitted) && empty_in(&self.preheated)
     }
 }
 
@@ -857,6 +910,85 @@ impl Tool for ToolSearchTool {
         }
         ToolOutcome::ok(out)
     }
+}
+
+/// Total resident bytes a phenotype's `preheat` list may spend (#1179 3B).
+///
+/// Deliberately well inside the 16.8% of the resident block Phase 2 (RFC 0024)
+/// won by deferring tools: preheating is how that saving gets spent back, so the
+/// ceiling has to make "Phase 3 cannot undo Phase 2" a checkable invariant rather
+/// than a hope. 2500 B is ~12% of a Plan-mode block.
+///
+/// Bytes rather than a tool count because specs differ by more than an order of
+/// magnitude -- codegraph's single tool is 1726 B, `glob` a few hundred -- so a
+/// count of 5 could mean 2% or 40% of the prompt.
+pub const MAX_PREHEAT_BYTES: usize = 2500;
+
+/// One rejected entry from a `preheat` list, for the caller to surface (#1179 3B).
+///
+/// A rejection must never be silent. A phenotype with a typo'd tool name would
+/// otherwise be indistinguishable from one with no preheat at all: same prompt,
+/// same behaviour, no signal, and the author concludes the feature does nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PreheatRejection {
+    /// No tool by that name is registered, or it is not deferred (already
+    /// resident, so preheating it is a no-op the author should know about).
+    Unknown { name: String },
+    /// Dropped because the list had already spent the byte budget.
+    OverBudget { name: String, bytes: usize },
+}
+
+/// What a `preheat` list resolves to once names and the byte budget are applied.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PreheatPlan {
+    /// Names to admit, in declaration order, that fit the budget.
+    pub admit: Vec<String>,
+    /// Bytes the admitted names cost.
+    pub bytes: usize,
+    /// Everything dropped, and why.
+    pub rejected: Vec<PreheatRejection>,
+}
+
+/// Resolve a phenotype's `preheat` list against what is actually registered.
+///
+/// `spec_bytes` returns the resident cost of one tool by name, or `None` if that
+/// tool cannot be preheated. Injected rather than taking a registry so the budget
+/// arithmetic is testable without standing up the tool set.
+///
+/// Truncation walks the list in declaration order and stops spending when the
+/// budget is exhausted, rather than dropping the largest spec: declaration order
+/// is the author's stated priority, and a phenotype that names its most important
+/// tool first should not lose it because it happens to be the biggest.
+///
+/// A name that overruns the budget is rejected but does **not** stop the walk -- a
+/// later, smaller entry can still fit. Stopping early would make the outcome
+/// depend on list order in a way the author cannot see.
+pub fn resolve_preheat(
+    declared: &[String],
+    spec_bytes: impl Fn(&str) -> Option<usize>,
+) -> PreheatPlan {
+    let mut plan = PreheatPlan::default();
+    let mut seen: HashSet<&str> = HashSet::new();
+    for name in declared {
+        if !seen.insert(name.as_str()) {
+            continue;
+        }
+        let Some(bytes) = spec_bytes(name) else {
+            plan.rejected
+                .push(PreheatRejection::Unknown { name: name.clone() });
+            continue;
+        };
+        if plan.bytes + bytes > MAX_PREHEAT_BYTES {
+            plan.rejected.push(PreheatRejection::OverBudget {
+                name: name.clone(),
+                bytes,
+            });
+            continue;
+        }
+        plan.bytes += bytes;
+        plan.admit.push(name.clone());
+    }
+    plan
 }
 
 mod cache;

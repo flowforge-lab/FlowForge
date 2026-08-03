@@ -9,6 +9,7 @@ import { useSkillsStore } from "@/store/skills";
 import { useMcpStore } from "@/store/mcp";
 import { useMemoryStore } from "@/store/memory";
 import { usePhenoMcpNoticeStore } from "@/store/pheno-mcp-notice";
+import { usePreheatNoticeStore } from "@/store/preheat-notice";
 import { useScheduledStore } from "@/store/scheduled";
 import { useUpdateStore } from "@/store/update";
 import { useSessionWorkspaceStore } from "@/store/session-workspace";
@@ -92,6 +93,14 @@ export function startIpcEvents(): void {
   // never blocks; this is informational.
   void ipc.onPhenotypeMcpUnavailable((e) => {
     usePhenoMcpNoticeStore.getState().show(e);
+  });
+  // A just-activated phenotype declares preheat tools that could not all be admitted
+  // (#1179) — unknown names, or the byte budget ran out. Surface it as a non-blocking
+  // toast: the turn proceeds and the dropped tools remain reachable via `tool_search`,
+  // so this is informational, but silence would leave a misconfigured phenotype
+  // looking like it worked.
+  void ipc.onPhenotypePreheatDropped((e) => {
+    usePreheatNoticeStore.getState().show(e);
   });
   // A scheduled task fired (#543): cache the run's session for the ↗ jump and
   // optimistically stamp Last; the snapshot below is the source of truth. The fire

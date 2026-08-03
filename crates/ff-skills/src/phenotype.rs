@@ -55,6 +55,7 @@ pub fn default_phenotype() -> Phenotype {
         provider: None,
         mcp_servers: Vec::new(),
         egress: ff_core::Egress::Open,
+        preheat: Vec::new(),
     }
 }
 
@@ -78,6 +79,11 @@ struct PhenotypeFile {
     mcp_servers: Vec<McpServerConfig>,
     #[serde(default)]
     egress: ff_core::Egress,
+    /// #1179 3B. Must be mirrored here as well as on `Phenotype`: this struct is
+    /// `deny_unknown_fields`, so omitting it would make a valid `preheat = [...]`
+    /// a hard parse error rather than an ignored key.
+    #[serde(default)]
+    preheat: Vec<String>,
 }
 
 impl PhenotypeFile {
@@ -91,6 +97,7 @@ impl PhenotypeFile {
             provider: self.provider,
             mcp_servers: self.mcp_servers,
             egress: self.egress,
+            preheat: self.preheat,
         }
     }
 }
@@ -166,6 +173,12 @@ struct PhenotypeOut {
     /// path dropped it before this fix).
     #[serde(skip_serializing_if = "ff_core::Egress::is_open")]
     egress: ff_core::Egress,
+    /// Tool names to preheat into the resident block (#1179). Omitted when empty so
+    /// files for the common no-preheat case stay minimal. Same trap as `egress`
+    /// above: the read path carried this from the start, and without it here,
+    /// editing+saving a phenotype silently erased its preheat list.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    preheat: Vec<String>,
 }
 
 /// Whether `name` is safe to use as a single-segment file stem. Rejects empty
@@ -201,6 +214,7 @@ pub fn save_phenotype(root: &Path, pheno: &Phenotype) -> Result<(), PhenotypeErr
         provider: pheno.provider.clone(),
         mcp_servers: pheno.mcp_servers.clone(),
         egress: pheno.egress,
+        preheat: pheno.preheat.clone(),
     };
     let body = toml::to_string_pretty(&out).map_err(|source| PhenotypeError::Serialize {
         name: pheno.name.clone(),

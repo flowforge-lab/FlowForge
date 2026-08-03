@@ -48,6 +48,7 @@ describe("PhenotypeDetail (#530)", () => {
       skills: [],
       mcpServers: [],
       egress: "open",
+      preheat: [],
     });
     render(<PhenotypeDetail phenotypeId="default" />);
 
@@ -66,6 +67,7 @@ describe("PhenotypeDetail (#530)", () => {
       skills: ["create-pr"],
       mcpServers: [],
       egress: "open",
+      preheat: [],
     });
     render(<PhenotypeDetail phenotypeId="reviewer" />);
 

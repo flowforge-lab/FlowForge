@@ -139,6 +139,31 @@ pub struct ContextBreakdown {
     pub tool_tokens: u32,
     /// Number of tool specs advertised this turn.
     pub tool_specs: u32,
+    /// #1179 3A: how many of this turn's advertised specs were admitted up front
+    /// by declaration rather than found by `tool_search`. The size of the bet --
+    /// on its own it says nothing about whether the bet paid, which is why it is
+    /// never reported without `preheated_used`. `None` when nothing was preheated,
+    /// distinct from `Some(0)`, which would mean a preheat list resolved to
+    /// nothing (every name unknown).
+    #[serde(default)]
+    #[ts(optional)]
+    pub preheated_count: Option<u32>,
+    /// #1179 3A: how many preheated tools the model actually called this turn.
+    /// The number that makes a bad preheat list falsifiable: well below
+    /// `preheated_count` means the resident block is carrying schemas nobody
+    /// wants -- exactly what Phase 2 (RFC 0024) spent 16.8% of the prompt to
+    /// avoid. Must be an intersection with the called set; deriving it from
+    /// `preheated_count` would leave it unable to ever report a miss.
+    #[serde(default)]
+    #[ts(optional)]
+    pub preheated_used: Option<u32>,
+    /// #1179 3A: bytes of advertised schema the preheat added. Bytes rather than a
+    /// tool count because specs differ by more than an order of magnitude
+    /// (codegraph's single tool is 1726 B, `glob` a few hundred), so a count
+    /// cannot be checked against a prompt budget.
+    #[serde(default)]
+    #[ts(optional)]
+    pub preheated_bytes: Option<u32>,
     /// Estimated tokens of the **verbatim** persisted message transcript
     /// (user/assistant/tool) — the store, before any compaction. Formerly
     /// `messageTokens`; renamed to distinguish from `wireTokens` (#997).
@@ -457,6 +482,31 @@ pub struct McpStatusChangedEvent {
 pub struct PhenotypeMcpUnavailableEvent {
     pub phenotype: String,
     pub servers: Vec<String>,
+}
+
+/// Backend -> frontend notice that entries in an active phenotype's `preheat` list
+/// were dropped (#1179 3B) -- an unknown/non-deferrable tool name, or a name that
+/// did not fit [`MAX_PREHEAT_BYTES`](ff_tools::MAX_PREHEAT_BYTES).
+///
+/// Exists because the alternative is indistinguishable from success: a phenotype
+/// with a typo'd tool name preheats nothing, behaves exactly like one with no
+/// preheat list, and gives its author no reason to look. Non-fatal -- the tool is
+/// still reachable the ordinary way, via `tool_search`.
+///
+/// Emitted only when something was actually dropped, so the frontend can toast
+/// unconditionally on receipt.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "../../../apps/desktop/src/bindings/")]
+pub struct PhenotypePreheatDroppedEvent {
+    pub phenotype: String,
+    pub session_id: String,
+    /// Names no registered deferred tool matched.
+    pub unknown: Vec<String>,
+    /// Names dropped for exceeding the byte budget, in declaration order.
+    pub over_budget: Vec<String>,
+    /// Bytes the surviving entries cost, for comparison against the budget.
+    pub admitted_bytes: u32,
 }
 
 /// Backend -> frontend telemetry: a skill became active for a turn (M3.5, RFC 0001

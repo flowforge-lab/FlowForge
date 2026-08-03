@@ -64,7 +64,8 @@ pub use registry::{
 pub use sink::{OutputSink, OutputStream};
 pub use test_runner::TestRunnerTool;
 pub use tool_search::{
-    ToolSearchIndex, ToolSearchState, ToolSearchTool, MAX_HITS as TOOL_SEARCH_MAX_HITS,
+    resolve_preheat, PreheatPlan, PreheatRejection, ToolSearchIndex, ToolSearchState,
+    ToolSearchTool, MAX_HITS as TOOL_SEARCH_MAX_HITS, MAX_PREHEAT_BYTES,
 };
 pub use url_safety::SsrfPolicy;
 pub use web_search::{

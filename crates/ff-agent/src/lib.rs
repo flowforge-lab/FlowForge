@@ -881,6 +881,7 @@ fn context_breakdown(
     messages: &[Message],
     wire_tokens: u32,
     mid_near: (Option<u32>, Option<u32>),
+    preheat: PreheatAttribution,
 ) -> ContextBreakdown {
     // NOTE: summing two independent count_tokens calls may differ from
     // count_tokens(full()) by ±1 token at the split boundary (the tokenizer
@@ -911,6 +912,93 @@ fn context_breakdown(
         message_count: messages.len() as u32,
         mid_tokens: mid_near.0,
         near_tokens: mid_near.1,
+        preheated_count: preheat.count,
+        preheated_used: preheat.used,
+        preheated_bytes: preheat.bytes,
+    }
+}
+
+/// [`preheat_attribution`] for a live turn (#1179 3A).
+///
+/// Derives the called set from `call_counts`' keys rather than tracking a second
+/// collection: that map already records every `(tool, args)` the turn issued, so a
+/// parallel set would be one more thing to keep in sync for no new information.
+fn turn_preheat_attribution(
+    tools: &ToolContext<'_>,
+    session_id: &str,
+    call_counts: &HashMap<(String, String), usize>,
+    tool_schemas: &[serde_json::Value],
+) -> PreheatAttribution {
+    let Some(search) = tools.tool_search else {
+        return PreheatAttribution::default();
+    };
+    let preheated = search.preheated(session_id);
+    if preheated.is_empty() {
+        return PreheatAttribution::default();
+    }
+    let called: std::collections::HashSet<String> =
+        call_counts.keys().map(|(name, _)| name.clone()).collect();
+    preheat_attribution(&preheated, &called, tool_schemas)
+}
+
+/// The tool name inside one advertised OpenAI-shape schema.
+///
+/// Mirrors the shape built in `ff-tools`' registry (`{"type":"function",
+/// "function":{"name":...}}`); returns `None` rather than panicking so a schema
+/// from a future provider shape is skipped in telemetry instead of taking the
+/// turn down.
+fn schema_tool_name(schema: &serde_json::Value) -> Option<&str> {
+    schema["function"]["name"].as_str()
+}
+
+/// Preheat attribution for one turn's [`ContextBreakdown`] (#1179 3A).
+///
+/// All three are `None` when nothing was preheated, which is deliberately distinct
+/// from `Some(0)`: the latter means a preheat list was declared and resolved to
+/// nothing, and that is a configuration bug worth seeing rather than silence.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct PreheatAttribution {
+    count: Option<u32>,
+    used: Option<u32>,
+    bytes: Option<u32>,
+}
+
+/// Attribute the preheated tools in this turn's advertised schemas.
+///
+/// `called` carries every tool the model invoked this turn, so `used` is a true
+/// intersection. Deriving it from `preheated` alone would make it structurally
+/// incapable of reporting a miss -- the one thing the number exists to do.
+///
+/// `bytes` measures only the preheated schemas, re-serialised the same way
+/// [`context_breakdown`] measures `tool_tokens`, so the two are comparable: it
+/// answers "how much of the resident block did the bet cost".
+fn preheat_attribution(
+    preheated: &std::collections::HashSet<String>,
+    called: &std::collections::HashSet<String>,
+    tool_schemas: &[serde_json::Value],
+) -> PreheatAttribution {
+    if preheated.is_empty() {
+        return PreheatAttribution::default();
+    }
+    // Only schemas actually advertised count: a preheated name the registry never
+    // resolved costs no resident bytes, and charging for it would hide the fact
+    // that the declaration was dead.
+    let advertised: Vec<&serde_json::Value> = tool_schemas
+        .iter()
+        .filter(|s| schema_tool_name(s).is_some_and(|n| preheated.contains(n)))
+        .collect();
+    // Sum the schemas individually rather than serialising the vector: an empty
+    // vector renders as `[]`, which would report two bytes of cost for a preheat
+    // list that advertised nothing -- disguising a dead declaration as a paid one.
+    let bytes = advertised
+        .iter()
+        .filter_map(|s| serde_json::to_string(s).ok())
+        .map(|s| s.len() as u32)
+        .sum();
+    PreheatAttribution {
+        count: Some(advertised.len() as u32),
+        used: Some(preheated.intersection(called).count() as u32),
+        bytes: Some(bytes),
     }
 }
 
@@ -1194,9 +1282,16 @@ pub async fn run_turn(
     let allow_subagent = tools.depth < tools.max_depth;
     // RFC 0024: tools this session has already unlocked. Read once up front; the
     // turn loop re-reads it after a `tool_search` call to append the new definitions.
+    //
+    // `unlocked` rather than `admitted` so #1179 3B's preheated names are here too.
+    // This single read is what puts them in the *stable region*: `advertised` below
+    // and `appended` at the end of this block both derive from it, so the two
+    // cannot disagree about what was resident before the first turn. Preheating
+    // after this point would instead look like a mid-turn unlock and cost a
+    // re-prefill -- the exact opposite of the round-trip it is meant to save.
     let admitted = tools
         .tool_search
-        .map(|s| s.admitted(session_id))
+        .map(|s| s.unlocked(session_id))
         .unwrap_or_default();
     let advertised = advertised_tools(
         tools.mode,
@@ -2212,6 +2307,7 @@ pub async fn run_turn(
                     &final_msgs,
                     prefill_estimates.last().copied().unwrap_or(0),
                     wire_split,
+                    turn_preheat_attribution(tools, session_id, &call_counts, &tool_schemas),
                 )),
                 usage: Some(TurnUsage {
                     input_tokens: input_tokens_total,
@@ -2627,7 +2723,11 @@ pub async fn run_turn(
         // whole array — is what keeps the cached prompt prefix byte-identical; see
         // `openai_tools_named`.
         if let Some(search) = tools.tool_search {
-            let unlocked = search.admitted(session_id);
+            // `unlocked`, not `admitted`: `appended` was seeded from the union
+            // (preheat included), so comparing against the search-only set would
+            // make this guard permanently false once anything is preheated -- and
+            // tools found mid-turn would silently stop being appended (#1179 3B).
+            let unlocked = search.unlocked(session_id);
             // Cheap guard: on the overwhelmingly common iteration nothing was
             // searched for, so skip recomputing the advertise pipeline entirely.
             if unlocked.len() > appended.len() {
@@ -2724,6 +2824,7 @@ pub async fn run_turn(
             &final_msgs,
             wire_tokens,
             wire_split,
+            turn_preheat_attribution(tools, session_id, &call_counts, &tool_schemas),
         )),
         usage: Some(TurnUsage {
             input_tokens: input_tokens_total,

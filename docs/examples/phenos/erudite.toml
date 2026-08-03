@@ -11,6 +11,22 @@ skills = []
 # model = "anthropic.claude-3-5-sonnet-20241022-v2:0"
 
 max_iterations = 40
+
+# `preheat` pins a few tools into the resident prompt at activation, so the model
+# sees them without spending a `tool_search` round-trip first (#1179). Names must
+# match the tool exactly, and only deferred (searchable) tools can be preheated —
+# always-resident ones are already there.
+#
+# The list is a budget, not a count: 2500 bytes of tool schema total, spent in the
+# order written. Schemas differ by an order of magnitude (codegraph's single tool
+# is ~1726 B, `glob` a few hundred), so 5 entries might fit or might not. Anything
+# that does not fit is dropped from the tail and reported in the UI — it still
+# works, the model just has to find it via `tool_search`.
+#
+# Unset here: the erudite persona reasons over whatever the task needs rather than
+# leaning on a fixed toolset. Uncomment to try it.
+# preheat = ["memory_search"]
+
 persona = """
 You are a reasoning specialist. Think step by step, state assumptions, check your
 work, and prefer rigour over speed. Produce a defensible answer, not a fast one.
