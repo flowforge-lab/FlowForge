@@ -253,13 +253,15 @@ async fn serve(args: ServeArgs) -> Result<(), String> {
         args.allow_user.clone()
     };
     if allowed_users.is_empty() {
-        return Err(format!(
+        return Err(
             "no allowed users: pass --allow-user U123,U456 or set `allowed_users` \
              under [slack] in transports.toml. The transport fails closed, so \
              booting with an empty allowlist would ack every message and answer \
              nobody."
-        ));
+                .to_string(),
+        );
     }
+    let allowlist_size = allowed_users.len();
     let mut transport = SlackTransport::new(&tokens.app_token, &tokens.bot_token)
         .with_allowed_user_ids(allowed_users);
 
@@ -277,9 +279,23 @@ async fn serve(args: ServeArgs) -> Result<(), String> {
 
     eprintln!(
         "serving Slack channel {} in {mode:?} mode for {} allowlisted user(s)",
-        args.channel,
-        args.allow_user.len()
+        args.channel, allowlist_size
     );
+
+    // Ctrl-C stops the loop gracefully: the handle closes the inbound side, so an
+    // in-flight turn finishes and `run` then returns on its own. `ctrl_c()` is
+    // portable across Unix and Windows, matching `main.rs:589`.
+    //
+    // A second Ctrl-C is left to the default handler on purpose — if the first
+    // one is waiting on a wedged turn, the operator needs a way out that does not
+    // depend on this process behaving.
+    let shutdown = transport.shutdown_handle();
+    tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            eprintln!("shutting down: finishing the current turn, then stopping");
+            shutdown.shutdown();
+        }
+    });
 
     router.run(&mut transport, &approver).await;
     Ok(())

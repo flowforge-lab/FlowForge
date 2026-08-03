@@ -25,7 +25,7 @@ use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 
 use ff_transport::{ChannelId, InboundMessage, Notification};
-use ff_transport::{MessageTransport, ResponseStream};
+use ff_transport::{MessageTransport, ResponseStream, ShutdownHandle};
 
 use crate::api::SlackApi;
 use crate::envelope::{parse_envelope, SlackEnvelope, SlackInteraction};
@@ -66,6 +66,9 @@ pub struct SlackTransport {
     interaction_rx: Option<mpsc::Receiver<SlackInteraction>>,
     /// Shared writer handle. `None` until connect.
     writer: Option<WriterHandle>,
+    /// Set by `shutdown_handle`; `recv` stops accepting new messages when this
+    /// fires. `None` when no host asked for a shutdown lever.
+    shutdown: Option<std::sync::Arc<tokio::sync::Notify>>,
 }
 
 impl SlackTransport {
@@ -80,6 +83,7 @@ impl SlackTransport {
             inbound_rx: None,
             interaction_rx: None,
             writer: None,
+            shutdown: None,
         }
     }
 
@@ -225,6 +229,20 @@ impl SlackTransport {
             }
         });
     }
+    /// Attach an inbound channel directly, standing in for what `connect`
+    /// installs after the WebSocket handshake.
+    ///
+    /// Test-only, so the receiver stays private in production: the ordering
+    /// hazard `Connected` guards against (approver built before connect) depends
+    /// on nothing outside this module being able to install one.
+    #[cfg(test)]
+    pub(crate) fn with_inbound_for_test(
+        mut self,
+        rx: tokio::sync::mpsc::Receiver<InboundMessage>,
+    ) -> Self {
+        self.inbound_rx = Some(rx);
+        self
+    }
 }
 
 #[async_trait]
@@ -268,9 +286,23 @@ impl MessageTransport for SlackTransport {
 
     async fn recv(&mut self) -> Option<InboundMessage> {
         // `None` (not connected) also means "closed" to the Router — a clean stop.
-        match self.inbound_rx.as_mut() {
-            Some(rx) => rx.recv().await,
-            None => None,
+        let rx = self.inbound_rx.as_mut()?;
+
+        match &self.shutdown {
+            Some(notify) => {
+                let notify = notify.clone();
+                tokio::select! {
+                    // `biased` is load-bearing, not a micro-optimisation: it makes
+                    // a ready message win over a pending shutdown deterministically,
+                    // so a request Slack already acked is never discarded because
+                    // Ctrl-C arrived while it sat in the buffer. Without it `select!`
+                    // picks randomly and the drop is intermittent.
+                    biased;
+                    msg = rx.recv() => msg,
+                    () = notify.notified() => None,
+                }
+            }
+            None => rx.recv().await,
         }
     }
 
@@ -285,6 +317,12 @@ impl MessageTransport for SlackTransport {
             channel.platform_id.clone(),
             writer,
         ))
+    }
+
+    fn shutdown_handle(&mut self) -> ShutdownHandle {
+        let (handle, notify) = ShutdownHandle::new();
+        self.shutdown = Some(notify);
+        handle
     }
 
     fn notify(&self, _channel: &ChannelId, _notification: Notification) {

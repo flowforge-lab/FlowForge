@@ -602,3 +602,87 @@ mod reader {
         );
     }
 }
+
+/// Graceful shutdown on the Slack path (#1060 scope bullet 4).
+///
+/// The Mock transport covers the router-side contract; these cover *this*
+/// implementation of it, which is where the ordering subtlety lives: a shutdown
+/// must not jump the queue ahead of messages Slack already delivered.
+mod shutdown {
+    use ff_transport::{MessageTransport, ShutdownHandle};
+    use tokio::sync::mpsc;
+
+    use crate::transport::SlackTransport;
+    use ff_transport::{ChannelId, InboundMessage};
+
+    fn msg(text: &str) -> InboundMessage {
+        InboundMessage {
+            channel: ChannelId::new("slack", "C1"),
+            sender_id: "U1".into(),
+            text: text.into(),
+            timestamp: 0,
+        }
+    }
+
+    /// A transport wired to an inbound channel, as `connect` leaves it.
+    fn connected() -> (SlackTransport, mpsc::Sender<InboundMessage>, ShutdownHandle) {
+        let (tx, rx) = mpsc::channel::<InboundMessage>(8);
+        let mut transport = SlackTransport::new("xapp-t", "xoxb-t").with_inbound_for_test(rx);
+        let handle = transport.shutdown_handle();
+        (transport, tx, handle)
+    }
+
+    #[tokio::test]
+    async fn a_shutdown_signal_ends_the_receive_loop() {
+        let (mut transport, _tx, handle) = connected();
+
+        handle.shutdown();
+
+        assert!(
+            transport.recv().await.is_none(),
+            "after shutdown `recv` must report closed so `Router::run` returns"
+        );
+    }
+
+    /// The `biased` select plus the leading `try_recv` exist for this case: a
+    /// message Slack already acked must not be dropped because Ctrl-C arrived
+    /// while it sat in the buffer. Losing it would mean the user's request was
+    /// acknowledged and then silently discarded.
+    #[tokio::test]
+    async fn buffered_messages_are_delivered_before_the_shutdown_takes_effect() {
+        let (mut transport, tx, handle) = connected();
+
+        tx.send(msg("first")).await.unwrap();
+        tx.send(msg("second")).await.unwrap();
+        handle.shutdown();
+
+        assert_eq!(
+            transport.recv().await.map(|m| m.text),
+            Some("first".to_string()),
+            "a buffered message must win over a pending shutdown"
+        );
+        assert_eq!(
+            transport.recv().await.map(|m| m.text),
+            Some("second".to_string()),
+            "the whole buffer must drain, not just the first entry"
+        );
+        assert!(
+            transport.recv().await.is_none(),
+            "once drained, the shutdown takes effect"
+        );
+    }
+
+    /// Without a handle the transport must behave exactly as before, so a host
+    /// that never asks for one is unaffected.
+    #[tokio::test]
+    async fn without_a_handle_recv_still_blocks_on_the_channel() {
+        let (tx, rx) = mpsc::channel::<InboundMessage>(8);
+        let mut transport = SlackTransport::new("xapp-t", "xoxb-t").with_inbound_for_test(rx);
+
+        tx.send(msg("only")).await.unwrap();
+        assert_eq!(
+            transport.recv().await.map(|m| m.text),
+            Some("only".to_string())
+        );
+    }
+}

@@ -1,6 +1,7 @@
 use crate::approver::MessagingApprover;
 use crate::channel_map::ChannelMap;
 use crate::router::{Router, RouterConfig};
+use crate::transport::MessageTransport;
 use crate::types::{ChannelId, InboundMessage};
 use ff_agent::{ApprovalOutcome, Approver};
 use ff_core::{Egress, Mode};
@@ -259,5 +260,102 @@ fn turn_failure_kind_keeps_the_diagnostic_signal() {
         kind(LlmError::Transport("x".into())),
         kind(LlmError::Decode("x".into())),
         "local failure modes must stay distinct"
+    );
+}
+
+// ── graceful shutdown (#1060 scope bullet 4, acceptance 3) ───────────────────
+
+/// `Router::run` returns when the transport is shut down, rather than having to
+/// be aborted.
+///
+/// This is the lever `flowforge serve` needs for Ctrl-C: `recv()` already
+/// documents `None` as "closed — a clean stop" (`transport.rs:32`), but nothing
+/// could *cause* it from outside, so the only way to stop a running host was to
+/// drop the future mid-turn. `shutdown()` closes the inbound side, so the
+/// in-flight turn finishes and the loop then exits on its own.
+#[tokio::test]
+async fn shutdown_makes_run_return_without_being_aborted() {
+    let dir = TempDir::new().unwrap();
+    let config = RouterConfig {
+        mode: Mode::Act,
+        egress: Egress::default(),
+        workspace: dir.path().to_path_buf(),
+        ..Default::default()
+    };
+    let store = Arc::new(SessionStore::new());
+    let registry = Arc::new(ToolRegistry::with_defaults());
+    let provider = Arc::new(DangerousToolThenText {
+        calls: AtomicUsize::new(0),
+    });
+    let mut router = Router::new(config, ChannelMap::new(), store, registry, provider);
+
+    let mut transport = crate::MockTransport::new("mock");
+    let handle = transport.shutdown_handle();
+
+    let approver = RecordingApprover {
+        consulted: Arc::new(AtomicBool::new(false)),
+        decision: false,
+    };
+
+    handle.shutdown();
+
+    // No `tokio::time::timeout` wrapper: a timeout that *passes* on expiry would
+    // make a broken shutdown look green. Letting it hang is the louder failure,
+    // and it is bounded — `.config/nextest.toml` terminates a stalled test after
+    // two 60s slow-timeout strikes (#1072), the same mechanism the intentionally
+    // stalling `ff-llm` tests rely on.
+    router.run(&mut transport, &approver).await;
+}
+
+/// Shutting down must not discard a turn that is already in flight — that is the
+/// difference between "graceful" and `select!`-style abort, which would cut a
+/// reply off halfway and leave the user staring at a partial message.
+#[tokio::test]
+async fn shutdown_lets_an_in_flight_message_finish() {
+    let dir = TempDir::new().unwrap();
+    let config = RouterConfig {
+        mode: Mode::Act,
+        egress: Egress::default(),
+        workspace: dir.path().to_path_buf(),
+        ..Default::default()
+    };
+    let store = Arc::new(SessionStore::new());
+    let registry = Arc::new(ToolRegistry::with_defaults());
+    let provider = Arc::new(DangerousToolThenText {
+        calls: AtomicUsize::new(0),
+    });
+    let mut router = Router::new(config, ChannelMap::new(), store, registry, provider);
+
+    let mut transport = crate::MockTransport::new("mock");
+    let tx = transport.sender();
+    let handle = transport.shutdown_handle();
+
+    tx.send(InboundMessage {
+        channel: ChannelId::new("mock", "ch1"),
+        sender_id: "u1".into(),
+        text: "do it".into(),
+        timestamp: 0,
+    })
+    .unwrap();
+    // Release the test's own sender: the channel closes only when *every*
+    // sender is gone, so holding this clone would keep `recv()` waiting
+    // forever and the assertion below would never be reached.
+    drop(tx);
+
+    let consulted = Arc::new(AtomicBool::new(false));
+    let approver = RecordingApprover {
+        consulted: consulted.clone(),
+        decision: false,
+    };
+
+    // Queued before the loop starts, so the message is already buffered when the
+    // channel closes: a receiver drains what was sent before it sees the close.
+    handle.shutdown();
+    router.run(&mut transport, &approver).await;
+
+    assert!(
+        consulted.load(Ordering::SeqCst),
+        "the buffered message must still be processed; shutdown closes the inbound \
+         side, it does not discard what was already accepted"
     );
 }
