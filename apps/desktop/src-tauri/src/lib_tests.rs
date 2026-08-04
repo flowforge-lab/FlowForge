@@ -1,9 +1,10 @@
 use super::state::AppState;
 use super::{
-    compare_build, emit_agent_event, git_branch, goal_gate_for, install_guard, is_app_ready,
-    list_directory_in, list_local_branches, matrix_gate, panic_message, publish_app_ready,
-    read_file_in, resolve_workspace_dir, run_sidecar_turn, should_warmup, switch_branch,
-    BootFinalize, TurnMetrics, UiApprover, UpdateStatus, VersionDirection, APP_READY,
+    bounded_block_on, compare_build, emit_agent_event, git_branch, goal_gate_for, install_guard,
+    is_app_ready, list_directory_in, list_local_branches, matrix_gate, mcp_quit_path,
+    panic_message, publish_app_ready, read_file_in, resolve_workspace_dir, run_sidecar_turn,
+    should_warmup, switch_branch, BootFinalize, TurnMetrics, UiApprover, UpdateStatus,
+    VersionDirection, APP_READY, MCP_SHUTDOWN_BUDGET,
 };
 use ff_agent::{AgentEvent, ApprovalOutcome, Approver, DenyReason, GateDecision};
 use ff_core::events::TurnDoneEvent;
@@ -1109,5 +1110,103 @@ async fn ui_approver_scoped_deny_names_the_matched_rule() {
                 if rule == "bash (command prefix 'rm -rf')"
         ),
         "wiring must thread the matched rule name into DenyReason::ScopedRule, not Mode"
+    );
+}
+
+// The teardown used to hang off `ExitRequested` only. `Exit` is the event every quit path
+// ends on — `LoopDestroyed` — and the only one guaranteed when a quit destroys no window,
+// which is why `tauri-plugin-store` uses it for its own on-exit save. Live measurement
+// (#1195) showed ⌘Q on tauri 2.11.2 / Darwin 25.5 emitting `ExitRequested` first, so this
+// arm is the belt to that braces, not the sole cover the issue assumed it was.
+//
+// `RunEvent::ExitRequested` cannot be asserted here — the variant is `#[non_exhaustive]`
+// and carries a private `ExitRequestApi`, so a test cannot construct one. Its arm is
+// covered by the live quit checks recorded on the PR, not from unit tests.
+#[test]
+fn mcp_quit_path_covers_the_loop_destroyed_exit() {
+    assert_eq!(
+        mcp_quit_path(&tauri::RunEvent::Exit),
+        Some("Exit"),
+        "RunEvent::Exit terminates every quit path; without this arm a quit that destroys \
+         no window tears down no MCP children"
+    );
+}
+
+// The predicate must stay a predicate: `Exit`/`ExitRequested` and nothing else. A version
+// widened to "always Some" would `block_on` a teardown on every loop event — this pins
+// the two ordinary events that run constantly while the app is alive.
+#[test]
+fn mcp_quit_path_ignores_ordinary_loop_events() {
+    assert_eq!(mcp_quit_path(&tauri::RunEvent::Ready), None);
+    assert_eq!(mcp_quit_path(&tauri::RunEvent::MainEventsCleared), None);
+}
+
+// `RunEvent::Exit` cannot be prevented and tao offers no `applicationShouldTerminate`, so
+// this bound is the only thing between one wedged MCP server and a quit that never
+// finishes — the handler this replaces awaited `stop_all()` with no cap at all. A future
+// that never completes stands in for that server.
+#[test]
+fn bounded_block_on_returns_when_the_future_wedges() {
+    let budget = std::time::Duration::from_millis(100);
+    let started = std::time::Instant::now();
+    let completed = bounded_block_on(std::future::pending::<()>(), budget);
+    let elapsed = started.elapsed();
+
+    assert!(!completed, "a wedged teardown must report incompletion");
+    assert!(
+        elapsed < std::time::Duration::from_secs(1),
+        "quit must not wait past the budget; waited {elapsed:?}"
+    );
+}
+
+// The healthy path: a teardown that finishes is reported as finished and is not delayed
+// to the budget. Guards against a bound that swallows the result or always waits it out.
+#[test]
+fn bounded_block_on_reports_completion() {
+    let started = std::time::Instant::now();
+    assert!(
+        bounded_block_on(std::future::ready(()), MCP_SHUTDOWN_BUDGET),
+        "a teardown that completes must report completion"
+    );
+    assert!(
+        started.elapsed() < MCP_SHUTDOWN_BUDGET,
+        "a completed teardown must return immediately, not sit out the budget"
+    );
+}
+
+// The close button depends on a granted permission, and nothing else fails loudly if it
+// is missing (found while verifying #1195). Since #1188 registered a `tauri://close-requested`
+// listener, Tauri calls `api.prevent_close()` on EVERY X click
+// (`tauri/src/manager/window.rs:171`) and the only thing that can then close the window is
+// the JS wrapper's `await this.destroy()` (`@tauri-apps/api/window.js`). `destroy` is not
+// in `core:window`'s default permission set, so without an explicit grant that call is
+// denied, the promise rejects inside Tauri's own listener, and the window silently refuses
+// to close while ⌘Q — which skips window events — still quits. Losing this line makes the
+// app unclosable by its own close button, so pin it here rather than trusting review.
+#[test]
+fn capability_grants_window_destroy_so_the_close_button_works() {
+    let caps: serde_json::Value =
+        serde_json::from_str(include_str!("../capabilities/default.json"))
+            .expect("capabilities/default.json parses");
+    let granted = caps["permissions"]
+        .as_array()
+        .expect("permissions is an array")
+        .iter()
+        .any(|p| p.as_str() == Some("core:window:allow-destroy"));
+    assert!(
+        granted,
+        "capabilities/default.json must grant `core:window:allow-destroy`: the close-requested \
+         listener makes Tauri prevent every close, and only the JS `destroy()` can complete it"
+    );
+}
+
+// The budget wraps `ff_mcp`'s per-server `SHUTDOWN_TIMEOUT` (2s), so it has to exceed it
+// — at or below, a healthy graceful close gets clipped and children are killed rather
+// than shut down. The two constants live in different crates; this catches a drift.
+#[test]
+fn mcp_shutdown_budget_exceeds_the_per_server_close_timeout() {
+    assert!(
+        MCP_SHUTDOWN_BUDGET > std::time::Duration::from_secs(2),
+        "budget {MCP_SHUTDOWN_BUDGET:?} must leave room for ff-mcp's 2s per-server close"
     );
 }

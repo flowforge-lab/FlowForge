@@ -4144,6 +4144,69 @@ impl<R: tauri::Runtime> BootFinalize for tauri::AppHandle<R> {
     }
 }
 
+/// Outer bound on the MCP teardown at quit (#1195). The previous handler awaited
+/// `stop_all()` unbounded, so one wedged MCP server could hold a quit open indefinitely.
+///
+/// Must stay comfortably above `ff_mcp`'s per-server `SHUTDOWN_TIMEOUT` (2s), which
+/// already bounds each graceful `client.shutdown()` — this budget covers the actor
+/// round-trip *around* those closes, so setting it at or below 2s would clip a
+/// perfectly healthy shutdown. It exists because the per-server bound is not enough
+/// on its own: the supervisor actor can be busy elsewhere and never reach the stop.
+const MCP_SHUTDOWN_BUDGET: Duration = Duration::from_secs(3);
+
+/// The name of the quit path `event` represents, or `None` if it isn't one.
+///
+/// Returns a label rather than a bool so the teardown can say *which* path it ran on. That
+/// label is not decoration: #1195 was filed on a static trace claiming ⌘Q reaches only
+/// `RunEvent::Exit`, and it took this log line to establish that on tauri 2.11.2 / Darwin
+/// 25.5 ⌘Q in fact emits `ExitRequested` first and then `Exit`. AppKit's termination
+/// destroys the window, which trips `tauri-runtime-wry`'s last-window-`Destroyed` branch —
+/// the very `ExitRequested` source the issue lists — before `LoopDestroyed` maps to `Exit`.
+/// Keep it: quit-path behaviour here is version-dependent and not reliably derivable by
+/// reading the vendored sources.
+///
+/// Both arms are handled because neither event alone is guaranteed:
+///
+/// - `ExitRequested` is emitted from `Message::RequestExit` (an explicit `app.exit()`) and
+///   from the last-window-`Destroyed` branch. A quit that destroys no window — or a tao
+///   version that skips `Destroyed` on termination, which is what #1195 predicted — never
+///   produces it.
+/// - `Exit` comes from `LoopDestroyed` and is the last thing the loop emits on every path.
+///   It is what `tauri-plugin-store` hangs its own on-exit save off, and it cannot be
+///   prevented (tao exposes no `applicationShouldTerminate`), so the work behind it must be
+///   bounded — hence `MCP_SHUTDOWN_BUDGET`.
+///
+/// Firing on both is idempotent, and measured to be: `Cmd::StopAll` makes the supervisor
+/// actor return, so the second `stop_all()` finds the command channel closed and returns
+/// at once (observed ~6ms apart, both reporting completion) rather than tearing down twice.
+fn mcp_quit_path(event: &tauri::RunEvent) -> Option<&'static str> {
+    match event {
+        tauri::RunEvent::Exit => Some("Exit"),
+        tauri::RunEvent::ExitRequested { .. } => Some("ExitRequested"),
+        _ => None,
+    }
+}
+
+/// Block the calling thread on `fut`, giving up after `budget`. Returns whether it
+/// completed.
+///
+/// The quit paths call this from the event-loop callback, which is not itself inside a
+/// runtime — `tauri::async_runtime::block_on` enters the shared one, so the timer works.
+/// Generic over the future so the budget can be tested against a wedged future without
+/// standing up a real supervisor.
+fn bounded_block_on<F: std::future::Future<Output = ()>>(fut: F, budget: Duration) -> bool {
+    let completed =
+        tauri::async_runtime::block_on(async move { tokio::time::timeout(budget, fut).await })
+            .is_ok();
+    if !completed {
+        tracing::warn!(
+            budget_secs = budget.as_secs(),
+            "mcp teardown timed out at exit; abandoning it to let the quit proceed"
+        );
+    }
+    completed
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // Boot-trace origin (#599 item 0): the earliest FlowForge-controlled point.
@@ -4485,13 +4548,16 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building tauri application");
     app.run(|app, event| {
-        if let tauri::RunEvent::ExitRequested { .. } = event {
-            // Stop every MCP child cleanly while the runtime is still alive — drop
-            // alone reaps the child via `process_wrap`, but its background task needs
-            // a live Tokio runtime, which exits with the app (RFC 0003 §5).
+        // Stop every MCP child cleanly while the runtime is still alive — drop alone
+        // reaps the child via `process_wrap`, but its background task needs a live Tokio
+        // runtime, which exits with the app (RFC 0003 §5). Which events qualify, and why
+        // the wait is bounded, live in `mcp_quit_path` / `bounded_block_on` so both are
+        // covered by tests; keep this dispatch a thin call to them.
+        if let Some(quit_path) = mcp_quit_path(&event) {
             if let Some(state) = app.try_state::<Arc<AppState>>() {
                 if let Some(handle) = state.mcp_handle() {
-                    tauri::async_runtime::block_on(handle.stop_all());
+                    let completed = bounded_block_on(handle.stop_all(), MCP_SHUTDOWN_BUDGET);
+                    tracing::info!(quit_path, completed, "mcp teardown at quit");
                 }
             }
         }
