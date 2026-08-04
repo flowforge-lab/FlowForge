@@ -1,5 +1,16 @@
 //! Tracing subscriber installation (#1118).
 //!
+//! Extracted from the desktop crate to a shared crate in #1060, because the CLI
+//! had the identical problem this module was written to solve: `flowforge serve`
+//! installed no subscriber, so `RUST_LOG` did nothing and every `info!`/`warn!`
+//! on the Slack path was discarded — including "router started" and the
+//! allowlist-rejection warning. A running `serve` and a hung one were
+//! indistinguishable from its output, which cost a full round of wrong theories
+//! during the #1060 Slack acceptance run before anyone thought to check whether
+//! a subscriber existed at all. The fix belongs in one place: both binaries now
+//! call [`init`], and the env-var contract (`FF_LOG`, `FF_LOG_STDERR`) is the
+//! same wherever you meet it.
+//!
 //! The workspace is thoroughly instrumented with `tracing` macros — the
 //! observer wake path alone emits "observer wake spawning turn", "observer
 //! event deferred (turn in flight)", and "start_observer_pump called twice;

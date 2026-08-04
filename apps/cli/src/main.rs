@@ -198,6 +198,12 @@ enum SessionsCommand {
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    // Install the tracing subscriber before anything else runs, so startup
+    // failures are recorded too. Held for the whole of `main`: the guard flushes
+    // the non-blocking writer on drop, and binding it to `_` instead would drop
+    // it here and silently discard every buffered line (#1060).
+    let _log_guard = flowforge_log_dir().and_then(|dir| ff_logging::init(&dir));
+
     let cli = Cli::parse();
     match cli.command.unwrap_or(Command::Chat {
         json: false,
@@ -340,6 +346,16 @@ fn approval_mode(yes: bool, deny: bool) -> ApprovalMode {
         (false, true) => ApprovalMode::Deny,
         _ => ApprovalMode::Prompt,
     }
+}
+
+/// `<config dir>/flowforge` — where [`ff_logging::init`] writes the rolling log.
+///
+/// Deliberately the same directory the CLI already uses for `sessions.db` and
+/// `transports.toml` (`host::config_dir`), so `flowforge` and the desktop app
+/// write their logs to one place rather than two: when a Slack turn misbehaves,
+/// the `serve` log sits next to the session DB that recorded the turn.
+fn flowforge_log_dir() -> Option<std::path::PathBuf> {
+    dirs::config_dir().map(|d| d.join("flowforge"))
 }
 
 /// Resolved per-turn inputs derived from the `run` flags. Mirrors what the

@@ -57,6 +57,7 @@ ff-observer = { path = "crates/ff-observer" }
 ff-workflow = { path = "crates/ff-workflow" }
 ff-transport = { path = "crates/ff-transport" }
 ff-transport-slack = { path = "crates/ff-transport-slack" }
+ff-logging = { path = "crates/ff-logging" }
 
 lru = "0.12"
 minijinja = { version = "2", default-features = false, features = ["builtins", "std_collections", "macros", "adjacent_loop_items", "serde"] }

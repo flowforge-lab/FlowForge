@@ -23,6 +23,7 @@ ff-skills = { workspace = true }
 ff-tools = { workspace = true }
 ff-transport = { workspace = true }
 ff-transport-slack = { workspace = true }
+ff-logging = { workspace = true }
 
 clap = { workspace = true }
 tokio = { workspace = true }

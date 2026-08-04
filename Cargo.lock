@@ -1938,6 +1938,7 @@ dependencies = [
  "ff-agent",
  "ff-core",
  "ff-llm",
+ "ff-logging",
  "ff-memory",
  "ff-scheduled",
  "ff-session",
@@ -1999,6 +2000,15 @@ dependencies = [
  "tracing",
  "wiremock",
  "zip",
+]
+
+[[package]]
+name = "ff-logging"
+version = "1.0.0"
+dependencies = [
+ "tracing",
+ "tracing-appender",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -2257,6 +2267,7 @@ dependencies = [
  "ff-agent",
  "ff-core",
  "ff-llm",
+ "ff-logging",
  "ff-mcp",
  "ff-memory",
  "ff-observer",
@@ -2285,7 +2296,6 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
- "tracing-appender",
  "tracing-subscriber",
  "url",
  "uuid",
