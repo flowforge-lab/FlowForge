@@ -47,13 +47,39 @@ const FALLBACK: Persisted = {
   content: null,
 };
 
+/**
+ * Accept a persisted payload only if it is a `SplitContent` this build still
+ * knows how to render; anything else loads as "nothing open".
+ *
+ * This is not defensive dressing. The blob outlives the code that wrote it: a
+ * user who opened the workspace file browser before #944 moved it out of this
+ * union still has `{ kind: "files" }` stored, and the `switch` in
+ * split-panel.tsx has no case for it. TypeScript cannot help here — the union
+ * describes what this build writes, not what a months-old profile holds — so
+ * the boundary has to be checked at runtime, once, on the way in.
+ *
+ * Without it the panel handed that object to React as a child, React threw, and
+ * because `SplitPanel` renders above the pane tree the error boundary replaced
+ * the whole window. `open` is persisted, so it recurred on every launch.
+ */
+function parseContent(value: unknown): SplitContent | null {
+  if (!value || typeof value !== "object") return null;
+  const c = value as { kind?: unknown; lang?: unknown; text?: unknown };
+  if (typeof c.text !== "string") return null;
+  if (c.kind === "text") return value as SplitContent;
+  if (c.kind === "code" && typeof c.lang === "string") {
+    return value as SplitContent;
+  }
+  return null;
+}
+
 function parsePersisted(raw: unknown): Persisted {
   const p = (raw ?? {}) as Partial<Persisted>;
   return {
     open: Boolean(p.open),
     width: clampSplitWidth(p.width ?? DEFAULT_WIDTH),
     wrap: p.wrap ?? true,
-    content: p.content ?? null,
+    content: parseContent(p.content),
   };
 }
 
