@@ -158,10 +158,29 @@ allowlist.
 
 ## Troubleshooting
 
+Turn logging on first. `serve` writes to `<config dir>/flowforge/logs/` (macOS:
+`~/Library/Application Support/flowforge/logs/`, next to `sessions.db`), and
+`FF_LOG_STDERR=1` mirrors it to the terminal:
+
+```bash
+FF_LOG=info,ff_transport_slack=debug FF_LOG_STDERR=1 \
+  flowforge serve --channel C0123456789
+```
+
+The filter variable is **`FF_LOG`**, not `RUST_LOG`. A healthy start logs
+`router started`; Ctrl-C logs `router stopped`. If you see neither, you are
+running a build from before #1060 — the CLI installed no subscriber then, and
+every log line was silently discarded.
+
 | Symptom | Likely cause |
 | --- | --- |
 | `invalid_auth` on startup | App token is not `xapp-`, lacks `connections:write`, or an exported `SLACK_APP_TOKEN` is shadowing the file |
-| Starts, but messages do nothing | Bot not invited to the channel; or missing `channels:history` / `message.channels`; or sender not in `allowed_users` (check for the `warn!`) |
+| Starts, but messages do nothing | **Most likely: Event Subscriptions has no bot events.** Enabling Socket Mode does *not* subscribe you — add `message.channels` (public) / `message.groups` (private) under *Subscribe to bot events*, then reinstall. Note the `channels:history` scope appearing in your token's scope list does **not** mean the subscription exists; they are separate settings. Otherwise: bot not invited, or sender not in `allowed_users` (logged at `warn!`) |
 | `not_in_channel` on reply | `/invite @your-app` not done |
 | Replies work, approvals hang | Interactivity not enabled |
 | Refuses to start, complains about the allowlist | `allowed_users` empty in both file and flag — this is the intended fail-closed behaviour |
+
+To confirm Slack is delivering events at all, independently of `serve`: a
+message posted while nothing is connected produces no event, and Slack delivers
+a given event to only **one** open Socket Mode connection — so stop `serve`
+before testing with a separate client, or the two will compete for frames.
