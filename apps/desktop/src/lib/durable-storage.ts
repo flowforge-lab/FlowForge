@@ -114,6 +114,63 @@ function resetStore(): void {
   storePromise = null;
 }
 
+// ---------------------------------------------------------------------------
+// In-flight write tracking (#1184)
+// ---------------------------------------------------------------------------
+
+/** Writes issued but not yet settled.
+ *
+ *  Nobody holds these promises at the call sites: `writeDurable` is
+ *  fire-and-forget by design, and zustand's `persist` middleware discards
+ *  `setItem`'s result too. Awaiting per call would push `await` through every
+ *  store action and then every caller, for a write no action is waiting on —
+ *  backpressure is the wrong shape. Keeping the handles here instead lets
+ *  teardown wait for the bytes once, at the one moment it matters (#1184). */
+const inFlight = new Set<Promise<void>>();
+
+/** Hard cap on a drain. A hung `save()` must never be able to keep the window
+ *  open: `onCloseRequested` awaits this before destroying, so an unbounded wait
+ *  here would turn a storage stall into an app the user cannot close. Losing the
+ *  write is the lesser failure, and it is the one we already have today. */
+const FLUSH_TIMEOUT_MS = 2000;
+
+function track(op: Promise<void>): Promise<void> {
+  inFlight.add(op);
+  void op.finally(() => inFlight.delete(op));
+  return op;
+}
+
+/** Resolve once every write issued so far has settled — the drain teardown
+ *  awaits (see `durable-flush.ts`).
+ *
+ *  Loops rather than awaiting one batch: `getItem`'s legacy-localStorage
+ *  adoption writes too, so a settling drain can enqueue more work, and stopping
+ *  after one pass would walk away from it.
+ *
+ *  Never rejects. `setItem`/`removeItem` swallow and log their own IO errors, so
+ *  the tracked promises don't reject either; a timeout is logged and treated as
+ *  done. */
+export async function flushDurableWrites(
+  timeoutMs: number = FLUSH_TIMEOUT_MS,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (inFlight.size > 0) {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) {
+      console.error(
+        `[durableStorage] flush timed out with ${inFlight.size} write(s) still in flight`,
+      );
+      return;
+    }
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const expired = new Promise<void>((resolve) => {
+      timer = setTimeout(resolve, remaining);
+    });
+    await Promise.race([Promise.allSettled([...inFlight]), expired]);
+    clearTimeout(timer);
+  }
+}
+
 export const durableStorage: StateStorage = {
   async getItem(name) {
     if (!inTauri()) return localStorage.getItem(name);
@@ -172,50 +229,61 @@ export const durableStorage: StateStorage = {
     return legacy;
   },
 
-  async setItem(name, value) {
-    if (!inTauri()) {
-      localStorage.setItem(name, value);
-      return;
-    }
-    if (degraded.has(name)) {
-      console.error(
-        `[durableStorage] setItem("${name}") suppressed: this key's read failed, ` +
-          `so writing now would overwrite the on-disk value with defaults`,
-      );
-      return;
-    }
-    try {
-      const store = await getStore();
-      await store.set(name, value);
-      await store.save();
-    } catch (err) {
-      console.error(`[durableStorage] setItem("${name}") failed`, err);
-      resetStore();
-    }
+  // setItem/removeItem hand their work to the private functions below and
+  // register the promise, so a write is drainable at teardown even though no
+  // call site holds it (#1184).
+  setItem(name, value) {
+    return track(writeItem(name, value));
   },
 
-  async removeItem(name) {
-    if (!inTauri()) {
-      localStorage.removeItem(name);
-      return;
-    }
-    if (degraded.has(name)) {
-      console.error(
-        `[durableStorage] removeItem("${name}") suppressed: this key's read failed, ` +
-          `so the on-disk value is left intact`,
-      );
-      return;
-    }
-    try {
-      const store = await getStore();
-      await store.delete(name);
-      await store.save();
-    } catch (err) {
-      console.error(`[durableStorage] removeItem("${name}") failed`, err);
-      resetStore();
-    }
+  removeItem(name) {
+    return track(deleteItem(name));
   },
 };
+
+async function writeItem(name: string, value: string): Promise<void> {
+  if (!inTauri()) {
+    localStorage.setItem(name, value);
+    return;
+  }
+  if (degraded.has(name)) {
+    console.error(
+      `[durableStorage] setItem("${name}") suppressed: this key's read failed, ` +
+        `so writing now would overwrite the on-disk value with defaults`,
+    );
+    return;
+  }
+  try {
+    const store = await getStore();
+    await store.set(name, value);
+    await store.save();
+  } catch (err) {
+    console.error(`[durableStorage] setItem("${name}") failed`, err);
+    resetStore();
+  }
+}
+
+async function deleteItem(name: string): Promise<void> {
+  if (!inTauri()) {
+    localStorage.removeItem(name);
+    return;
+  }
+  if (degraded.has(name)) {
+    console.error(
+      `[durableStorage] removeItem("${name}") suppressed: this key's read failed, ` +
+        `so the on-disk value is left intact`,
+    );
+    return;
+  }
+  try {
+    const store = await getStore();
+    await store.delete(name);
+    await store.save();
+  } catch (err) {
+    console.error(`[durableStorage] removeItem("${name}") failed`, err);
+    resetStore();
+  }
+}
 
 async function readOnce(name: string): Promise<string | undefined> {
   const store = await getStore();

@@ -40,8 +40,12 @@ export async function readDurable<T>(
   }
 }
 
-/** Write `value` under `key`, fire-and-forget. Callers are UI actions with
- *  nothing to do about a failure; `durableStorage` logs its own IO errors. */
+/** Write `value` under `key` without waiting for it. Callers are UI actions with
+ *  nothing to do about a failure; `durableStorage` logs its own IO errors.
+ *
+ *  Not *dropped*, though: `durableStorage.setItem` registers the promise so
+ *  window teardown can drain it (#1184). Actions stay synchronous — the wait
+ *  happens once, at close, instead of in every caller. */
 export function writeDurable(key: string, value: unknown): void {
   try {
     void durableStorage.setItem(key, JSON.stringify(value));

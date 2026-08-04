@@ -62,6 +62,10 @@ beforeEach(() => {
   // `failReadsFor`), so put the plain one back explicitly.
   get.mockImplementation(async (key: string) => backing.get(key));
   save.mockClear();
+  // Same reason as `get` above: the drain tests gate `save` on a promise they
+  // control, and `mockClear` would leave that gate in place for every test
+  // after them.
+  save.mockImplementation(async () => {});
   deleteKey.mockClear();
   load.mockClear();
   // The module memoizes one store instance at module scope (mirrors the real
@@ -246,6 +250,114 @@ describe("durableStorage inside Tauri", () => {
     errorSpy.mockRestore();
   });
 });
+
+// #1184: writes are issued fire-and-forget (`writeDurable` discards the promise,
+// and so does zustand's `persist`), so the interval between an action returning
+// and its write settling is a loss window if the app goes away inside it.
+// `flushDurableWrites` is what window teardown awaits to close that window.
+describe("flushDurableWrites (#1184)", () => {
+  it("waits for a write that no call site awaited", async () => {
+    setTauri(true);
+    const { durableStorage, flushDurableWrites } =
+      await import("@/lib/durable-storage");
+
+    const release = gateSave();
+    // Issued exactly the way `writeDurable` issues it: the promise is dropped.
+    void durableStorage.setItem("ff-panes", "LAYOUT");
+    await settle();
+
+    let drained = false;
+    const flush = flushDurableWrites().then(() => {
+      drained = true;
+    });
+    await settle();
+
+    // The assertion that fails if the write isn't tracked: with nothing
+    // registered, the drain has nothing to wait on and resolves immediately —
+    // "a drain that no mutation can detect is not a fix".
+    expect(drained).toBe(false);
+    expect(save).toHaveBeenCalled();
+
+    release();
+    await flush;
+    expect(drained).toBe(true);
+  });
+
+  it("resolves promptly when nothing is in flight", async () => {
+    setTauri(true);
+    const { durableStorage, flushDurableWrites } =
+      await import("@/lib/durable-storage");
+
+    await durableStorage.setItem("ff-panes", "LAYOUT");
+    await flushDurableWrites();
+    expect(backing.get("ff-panes")).toBe("LAYOUT");
+  });
+
+  it("also waits for a write issued while the drain is running", async () => {
+    setTauri(true);
+    const { durableStorage, flushDurableWrites } =
+      await import("@/lib/durable-storage");
+
+    const releaseFirst = gateSave();
+    void durableStorage.setItem("ff-panes", "FIRST");
+    await settle();
+
+    let drained = false;
+    const flush = flushDurableWrites().then(() => {
+      drained = true;
+    });
+    await settle();
+
+    // A second write lands mid-drain — `getItem`'s legacy-adoption path can do
+    // this for real. Draining one batch and stopping would walk away from it.
+    const releaseSecond = gateSave();
+    void durableStorage.setItem("ff-split", "SECOND");
+    releaseFirst();
+    await settle();
+    expect(drained).toBe(false);
+
+    releaseSecond();
+    await flush;
+    expect(drained).toBe(true);
+    expect(backing.get("ff-split")).toBe("SECOND");
+  });
+
+  it("gives up rather than blocking the close forever", async () => {
+    setTauri(true);
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const { durableStorage, flushDurableWrites } =
+      await import("@/lib/durable-storage");
+
+    // A save that never settles. `onCloseRequested` awaits this drain before
+    // destroying the window, so an unbounded wait would leave the user with an
+    // app they cannot close — strictly worse than losing the write.
+    gateSave();
+    void durableStorage.setItem("ff-panes", "LAYOUT");
+    await settle();
+
+    await flushDurableWrites(10);
+    expect(errorSpy).toHaveBeenCalledWith(
+      expect.stringContaining("flush timed out"),
+    );
+    errorSpy.mockRestore();
+  });
+});
+
+/** Hold `save()` open until the returned function is called, so a test can
+ *  observe the interval where a write is issued but not yet durable. */
+function gateSave(): () => void {
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  save.mockImplementation(async () => {
+    await gate;
+  });
+  return release;
+}
+
+/** Let every already-queued microtask and macrotask run. */
+const settle = () => new Promise((resolve) => setTimeout(resolve, 0));
 
 /** Make every read of `key` throw (the schema stamp and other keys keep working,
  *  so tests exercise one bad key rather than a dead store). Returns a function
