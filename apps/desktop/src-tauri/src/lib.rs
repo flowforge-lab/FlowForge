@@ -4,7 +4,6 @@
 
 mod dev_update_watcher;
 mod git_watch;
-mod logging;
 mod optimize;
 mod secrets;
 mod state;
@@ -4159,7 +4158,7 @@ pub fn run() {
     // `FF_LOG=off` opts out entirely. The guard must outlive the app, so it's
     // bound for the whole of `run()`: dropping it flushes and stops the writer
     // thread.
-    let _log_guard = state::flowforge_config_dir().and_then(|dir| logging::init(&dir));
+    let _log_guard = state::flowforge_config_dir().and_then(|dir| ff_logging::init(&dir));
     // Paint-first boot (#599): `AppState::new()` and the supervisor / watcher /
     // reaper / scheduler wiring are deferred to a background hydrate task (spawned
     // from `setup` below) so the window is created and painted FIRST — the FE

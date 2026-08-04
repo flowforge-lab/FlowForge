@@ -26,14 +26,73 @@ pub fn load_provider() -> (Box<dyn Provider>, String) {
 }
 
 fn load_provider_config() -> ProviderConfig {
-    provider_config_path()
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
+    let Some(path) = provider_config_path() else {
+        tracing::warn!(
+            "no config dir; falling back to the default provider ({})",
+            default_provider_desc()
+        );
+        return ProviderConfig::default();
+    };
+
+    // Each failure below is reported separately, and none of them is silent. The
+    // default provider is local candle-vllm on port 8000, so when this fell
+    // through unnoticed every `serve` turn failed with a bare "transport error:
+    // error sending request for url (http://localhost:8000/v1/chat/completions)"
+    // — a symptom that names a port the user never chose and does not hint that a
+    // config file is missing. Diagnosing it from the outside cost a full session
+    // (#1060); the fix is to say so at the point the fallback happens.
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            tracing::warn!(
+                path = %path.display(),
+                default = %default_provider_desc(),
+                "no provider config; falling back to the default provider. \
+                 Run `flowforge config` to choose one",
+            );
+            return ProviderConfig::default();
+        }
+        Err(e) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %e,
+                default = %default_provider_desc(),
+                "provider config unreadable; falling back to the default provider",
+            );
+            return ProviderConfig::default();
+        }
+    };
+
+    match serde_json::from_str(&raw) {
+        Ok(config) => config,
+        Err(e) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %e,
+                default = %default_provider_desc(),
+                "provider config malformed; falling back to the default provider",
+            );
+            ProviderConfig::default()
+        }
+    }
 }
 
 fn provider_config_path() -> Option<PathBuf> {
-    dirs::config_dir().map(|d| d.join("flowforge").join("provider.json"))
+    // Via `config_dir()`, not `dirs::config_dir()` directly, so this resolves to
+    // the same directory as `session_db_path` / `channel_map_path` and honors the
+    // test override — without which the fallback warnings below are unassertable.
+    config_dir().map(|d| d.join("flowforge").join("provider.json"))
+}
+
+/// Describes the fallback provider as `slug @ base-url`, e.g.
+/// `candle-vllm @ http://localhost:8000/v1`.
+///
+/// The URL is the point of this: the failure it explains surfaces as a request
+/// error naming a port, so the warning has to name the same port to be
+/// recognisable as its cause.
+fn default_provider_desc() -> String {
+    let config = ProviderConfig::default();
+    format!("{} @ {}", config.kind.slug(), config.resolved_base_url())
 }
 
 fn build_provider(config: &ProviderConfig) -> Box<dyn Provider> {
@@ -161,6 +220,13 @@ fn api_key_from_env(var: &str) -> Option<String> {
 /// resolves in `apps/desktop/src-tauri/src/state.rs`.
 pub fn session_db_path() -> Option<PathBuf> {
     config_dir().map(|d| d.join("flowforge").join("sessions.db"))
+}
+
+/// Resolved path of the transport channel→session map (#1060). Shares
+/// [`config_dir`] with [`session_db_path`] so the test override redirects it too
+/// — otherwise `serve` tests would write into the real `~/.config/flowforge`.
+pub fn channel_map_path() -> Option<PathBuf> {
+    config_dir().map(|d| d.join("flowforge").join("channel-map.json"))
 }
 
 /// Resolved config dir: the test override (a thread-local set by

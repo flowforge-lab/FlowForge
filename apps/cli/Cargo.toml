@@ -21,6 +21,10 @@ ff-memory = { workspace = true }
 ff-session = { workspace = true }
 ff-skills = { workspace = true }
 ff-tools = { workspace = true }
+ff-transport = { workspace = true }
+ff-transport-slack = { workspace = true }
+ff-logging = { workspace = true }
+tracing = { workspace = true }
 
 clap = { workspace = true }
 tokio = { workspace = true }
@@ -28,6 +32,8 @@ anyhow = { workspace = true }
 async-trait = { workspace = true }
 futures-util = { workspace = true }
 serde_json = { workspace = true }
+serde = { workspace = true }
+toml = { workspace = true }
 dirs = { workspace = true }
 # OS keychain backends, per-target like the desktop (#724). The CLI is its own
 # binary and has no shared keychain crate, so each platform links the backend

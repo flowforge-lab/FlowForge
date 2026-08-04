@@ -14,7 +14,7 @@ mod types;
 pub use approver::MessagingApprover;
 pub use channel_map::ChannelMap;
 pub use router::{Router, RouterConfig};
-pub use transport::{MessageTransport, ResponseStream};
+pub use transport::{MessageTransport, ResponseStream, ShutdownHandle};
 pub use types::{ChannelId, InboundMessage, Notification};
 
 #[cfg(test)]

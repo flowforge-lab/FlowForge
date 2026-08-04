@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use tokio::sync::mpsc;
 
-use crate::transport::{MessageTransport, ResponseStream};
+use crate::transport::{MessageTransport, ResponseStream, ShutdownHandle};
 use crate::types::{ChannelId, InboundMessage, Notification};
 
 /// Collected response chunks for a single response stream.
@@ -18,7 +18,7 @@ pub struct ResponseRecord {
 pub struct MockTransport {
     name: String,
     rx: mpsc::UnboundedReceiver<InboundMessage>,
-    tx: mpsc::UnboundedSender<InboundMessage>,
+    tx: Option<mpsc::UnboundedSender<InboundMessage>>,
     responses: Arc<Mutex<Vec<ResponseRecord>>>,
     notifications: Arc<Mutex<Vec<(ChannelId, Notification)>>>,
 }
@@ -29,15 +29,20 @@ impl MockTransport {
         Self {
             name: name.into(),
             rx,
-            tx,
+            tx: Some(tx),
             responses: Arc::new(Mutex::new(Vec::new())),
             notifications: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
     /// Get a sender handle to inject inbound messages.
+    ///
+    /// # Panics
+    /// If called after shutdown, when the transport has released its sender.
     pub fn sender(&self) -> mpsc::UnboundedSender<InboundMessage> {
-        self.tx.clone()
+        self.tx
+            .clone()
+            .expect("sender() after shutdown: the transport has released its sender")
     }
 
     /// Get all collected response records.
@@ -83,6 +88,24 @@ impl MessageTransport for MockTransport {
             .lock()
             .unwrap()
             .push((channel.clone(), notification));
+    }
+
+    /// Closes the inbound channel on signal by releasing the sender the mock
+    /// holds for injection. Anything already queued is still delivered — an
+    /// `UnboundedReceiver` drains its buffer before reporting the close — so this
+    /// exercises the same "finish in-flight work, then stop" path Slack uses.
+    fn shutdown_handle(&mut self) -> ShutdownHandle {
+        let (handle, notify) = ShutdownHandle::new();
+        let Some(tx) = self.tx.take() else {
+            return handle;
+        };
+        // Keep the sender alive inside the task so the channel stays open until
+        // the signal arrives, then drop it.
+        tokio::spawn(async move {
+            notify.notified().await;
+            drop(tx);
+        });
+        handle
     }
 }
 
