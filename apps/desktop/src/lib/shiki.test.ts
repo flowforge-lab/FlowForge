@@ -38,6 +38,20 @@ const tokenCount = (root: unknown): number => {
   return n;
 };
 
+const styleOf = (root: unknown): string[] => {
+  const out: string[] = [];
+  const walk = (node: unknown) => {
+    const el = node as {
+      properties?: { style?: string };
+      children?: unknown[];
+    };
+    if (el.properties?.style) out.push(el.properties.style);
+    (el.children ?? []).forEach(walk);
+  };
+  walk(root);
+  return out;
+};
+
 describe("highlight (#1169)", () => {
   it("highlights a known language", async () => {
     const root = await highlight("const x = 1;", "ts");
@@ -67,5 +81,23 @@ describe("highlight (#1169)", () => {
     const a = await highlight("const z = 3;", "ts");
     const b = await highlight("const z = 3;", "ts");
     expect(b).toBe(a);
+  });
+
+  it("treats `ansi` as a colouring language, not as plain text", async () => {
+    // `resolveLang` returns PLAIN_LANGS members as themselves rather than
+    // folding them to "text", and for `ansi` that distinction is user-visible:
+    // Shiki consumes the escape sequences and colours them. Fold it to "text"
+    // and the escapes survive into the rendered text as literal `ESC[31m`
+    // noise — which is what terminal output pasted into the transcript looks
+    // like when this regresses.
+    const src = "\u001b[31mred\u001b[0m plain";
+
+    const ansi = await highlight(src, "ansi");
+    expect(textOf(ansi)).toBe("red plain");
+    expect(styleOf(ansi)).toContain("color:var(--shiki-ansi-red)");
+
+    const plain = await highlight(src, "text");
+    expect(textOf(plain)).toBe(src);
+    expect(styleOf(plain)).toHaveLength(0);
   });
 });
