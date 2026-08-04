@@ -3580,3 +3580,111 @@ fn every_desktop_tool_advertises_an_object_schema() {
         "every advertised tool must declare an object schema; offenders: {offenders:?}"
     );
 }
+
+/// Live end-to-end check that the tool block this app advertises is structurally
+/// accepted by a real OpenAI-compatible gateway and that the model can actually
+/// invoke the no-argument `skills` tool through it.
+///
+/// **Scope, measured rather than assumed.** SiliconFlow validates the *outer*
+/// tool envelope but not the inner JSON Schema: dropping `type: "function"`
+/// yields `400 code 20015`, while the exact #1191 defect (`parameters: {}`)
+/// returns **200**. Verified by reverting both fix layers -- this test still
+/// passed three times, while `every_desktop_tool_advertises_an_object_schema`
+/// caught it immediately with `offenders: ["skills: {}"]`.
+///
+/// So this test does **not** guard #1191; the offline test does. What it adds is
+/// that the block we send is well-formed on the wire and end-to-end usable --
+/// coverage no offline test provides, since neither can tell whether a real
+/// gateway accepts the envelope or whether a model can call a no-arg tool.
+///
+/// `#[ignore]` because it needs a network round trip and a credential. It fails
+/// hard rather than soft-skipping when the credential is absent (mirroring the
+/// sidecar tests in `lib_tests.rs`), so an unusable run reports a missing key
+/// instead of passing vacuously. Rate limiting (`50609`) is a flake source, not
+/// a defect signal -- another reason this stays out of the default suite.
+///
+/// Credential resolution follows the `~/.config/flowforge/<name>` convention
+/// already used by `ff_tools::github`. The key is never logged: assertions
+/// report only provider errors, which do not echo it.
+#[tokio::test]
+#[ignore = "live network + SiliconFlow credential; run with `--ignored`"]
+async fn advertised_tool_block_is_usable_on_a_live_openai_compatible_gateway() {
+    use ff_llm::{ChatMessage, ChatRequest, OpenAiProvider, Provider};
+    use futures_util::StreamExt;
+
+    let key = std::env::var("SILICONFLOW_API_KEY")
+        .ok()
+        .map(|k| k.trim().to_string())
+        .filter(|k| !k.is_empty())
+        .or_else(|| {
+            let home = std::env::var_os("HOME")?;
+            std::fs::read_to_string(std::path::Path::new(&home).join(".config/flowforge/sf_apikey"))
+                .ok()
+                .map(|c| c.trim().to_string())
+                .filter(|c| !c.is_empty())
+        })
+        .expect(
+            "no credential: set SILICONFLOW_API_KEY or write ~/.config/flowforge/sf_apikey \
+             (this test is #[ignore]d precisely because it needs one)",
+        );
+
+    let state = AppState::new();
+    let tools = state
+        .build_tool_registry(std::path::Path::new("."))
+        .openai_tools();
+
+    // Without `skills` in the block there is no regression surface to test.
+    assert!(
+        tools.iter().any(|t| t["function"]["name"] == "skills"),
+        "`skills` must be in the advertised block or this test proves nothing"
+    );
+
+    let provider = OpenAiProvider::new("https://api.siliconflow.com/v1", Some(key))
+        .with_kind(ff_core::ProviderKind::SiliconFlow);
+
+    let req = ChatRequest {
+        model: "deepseek-ai/DeepSeek-V4-Flash-0731".to_string(),
+        messages: vec![ChatMessage {
+            role: "user".to_string(),
+            content: Some("What skills do I have installed? Use your tools.".to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+            attachments: Vec::new(),
+            reasoning: None,
+        }],
+        tools,
+        max_tokens: Some(512),
+        ..Default::default()
+    };
+
+    let mut stream = provider
+        .chat_stream(req)
+        .await
+        .expect("gateway rejected the advertised tool block (see the note above on what this does and does not prove)");
+
+    let mut saw_skills_call = false;
+    let mut errors = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        match chunk {
+            Ok(c) => {
+                if c.tool_calls
+                    .iter()
+                    .any(|t| t.name.as_deref() == Some("skills"))
+                {
+                    saw_skills_call = true;
+                }
+            }
+            Err(e) => errors.push(e.to_string()),
+        }
+    }
+
+    assert!(
+        errors.is_empty(),
+        "gateway streamed an error for the advertised tool block: {errors:?}"
+    );
+    assert!(
+        saw_skills_call,
+        "model never invoked `skills`: schema accepted but unusable"
+    );
+}

@@ -589,36 +589,6 @@ pub fn action_scope_for_mode(
 /// Unknown names in `actions` are ignored rather than rejected: the caller derives
 /// them from mode/egress policy, and a policy naming an action a tool no longer has
 /// should not break the turn.
-/// Coerce a tool's declared schema into a well-formed JSON Schema object (#1191).
-///
-/// A tool that takes no arguments is tempting to declare as `{}`, and `skills` did.
-/// Strict providers reject that outright — `"schema must be a JSON Schema of 'type:
-/// \"object\"', got 'type: null'"` fails the *whole* request, not just that tool —
-/// while Anthropic and Bedrock never see it, because their own
-/// `normalize_object_schema` repairs it on the way out. One registry was therefore
-/// fine on one provider and unusable on another.
-///
-/// Coercing here, where every provider-agnostic schema is produced, rather than in
-/// each provider: adding it to `openai.rs` and `ollama.rs` would leave two call
-/// sites to keep in sync and every future provider wrong by default. The existing
-/// Anthropic/Bedrock normalizers stay as harmless idempotent second passes.
-///
-/// A schema that already declares `type` is returned **untouched**, so the
-/// byte-identical guarantee `pruned_schema_is_byte_stable_across_calls` asserts is
-/// unaffected for every already-correct tool.
-fn object_schema(params: Value) -> Value {
-    match params {
-        Value::Object(map) if !map.contains_key("type") => {
-            let mut m = map;
-            m.insert("type".into(), Value::String("object".into()));
-            m.entry("properties")
-                .or_insert_with(|| Value::Object(serde_json::Map::new()));
-            Value::Object(m)
-        }
-        other => other,
-    }
-}
-
 pub fn scoped_parameters(tool: &dyn Tool, actions: Option<&BTreeSet<String>>) -> Value {
     let full = object_schema(tool.parameters());
     let (Some(actions), Some(declared)) = (actions, tool.action_params()) else {
@@ -652,6 +622,36 @@ pub fn scoped_parameters(tool: &dyn Tool, actions: Option<&BTreeSet<String>>) ->
         e.retain(|v| v.as_str().is_some_and(|s| kept.contains(s)));
     }
     out
+}
+
+/// Coerce a tool's declared schema into a well-formed JSON Schema object (#1191).
+///
+/// A tool that takes no arguments is tempting to declare as `{}`, and `skills` did.
+/// Strict providers reject that outright — `"schema must be a JSON Schema of 'type:
+/// \"object\"', got 'type: null'"` fails the *whole* request, not just that tool —
+/// while Anthropic and Bedrock never see it, because their own
+/// `normalize_object_schema` repairs it on the way out. One registry was therefore
+/// fine on one provider and unusable on another.
+///
+/// Coercing here, where every provider-agnostic schema is produced, rather than in
+/// each provider: adding it to `openai.rs` and `ollama.rs` would leave two call
+/// sites to keep in sync and every future provider wrong by default. The existing
+/// Anthropic/Bedrock normalizers stay as harmless idempotent second passes.
+///
+/// A schema that already declares `type` is returned **untouched**, so the
+/// byte-identical guarantee `pruned_schema_is_byte_stable_across_calls` asserts is
+/// unaffected for every already-correct tool.
+fn object_schema(params: Value) -> Value {
+    match params {
+        Value::Object(map) if !map.contains_key("type") => {
+            let mut m = map;
+            m.insert("type".into(), Value::String("object".into()));
+            m.entry("properties")
+                .or_insert_with(|| Value::Object(serde_json::Map::new()));
+            Value::Object(m)
+        }
+        other => other,
+    }
 }
 
 /// Assert that `tool`'s [`Tool::action_params`] declaration is coherent with its
@@ -1152,12 +1152,18 @@ mod tests {
 
     #[test]
     fn coercion_leaves_a_well_formed_schema_untouched() {
-        // The 31 already-correct tools must be byte-identical on the wire: a
-        // normalizer that rewrites valid schemas would break #947's append-only
-        // guarantee just as surely as a missing one breaks strict providers.
+        // Already-correct schemas must be byte-identical on the wire: a normalizer
+        // that rewrites valid schemas would break #947's append-only guarantee
+        // just as surely as a missing one breaks strict providers.
+        //
+        // Every tool in `with_defaults()` (17), not a hand-picked sample -- the
+        // sample cannot notice a tool whose schema the coercion starts touching.
+        // The desktop-only tools (`skills` and siblings) are covered by
+        // `every_desktop_tool_advertises_an_object_schema`, which sees a registry
+        // this one structurally cannot.
         let reg = ToolRegistry::with_defaults();
-        for tool_name in ["grep", "bash", "view"] {
-            let tool = reg.get(tool_name).expect("registered");
+        for tool in reg.iter_tools() {
+            let tool_name = tool.name();
             let raw = serde_json::to_string(&tool.parameters()).unwrap();
             let advertised = serde_json::to_string(&scoped_parameters(tool, None)).unwrap();
             assert_eq!(
