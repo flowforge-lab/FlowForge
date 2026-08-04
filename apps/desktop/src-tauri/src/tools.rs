@@ -163,7 +163,12 @@ impl Tool for SkillsTool {
     }
 
     fn parameters(&self) -> Value {
-        serde_json::json!({})
+        // Explicit object schema even though there are no arguments (#1191): a bare
+        // `{}` is what strict providers reject as `type: null`, 400ing the entire
+        // request. `scoped_parameters` now coerces this as a safety net, but the
+        // declaration is fixed at the source too -- the net exists for the *next*
+        // no-arg tool, not as licence for this one to stay wrong.
+        serde_json::json!({ "type": "object", "properties": {} })
     }
 
     fn safety(&self, _args: &Value) -> Safety {

@@ -590,7 +590,7 @@ pub fn action_scope_for_mode(
 /// them from mode/egress policy, and a policy naming an action a tool no longer has
 /// should not break the turn.
 pub fn scoped_parameters(tool: &dyn Tool, actions: Option<&BTreeSet<String>>) -> Value {
-    let full = tool.parameters();
+    let full = object_schema(tool.parameters());
     let (Some(actions), Some(declared)) = (actions, tool.action_params()) else {
         return full;
     };
@@ -622,6 +622,36 @@ pub fn scoped_parameters(tool: &dyn Tool, actions: Option<&BTreeSet<String>>) ->
         e.retain(|v| v.as_str().is_some_and(|s| kept.contains(s)));
     }
     out
+}
+
+/// Coerce a tool's declared schema into a well-formed JSON Schema object (#1191).
+///
+/// A tool that takes no arguments is tempting to declare as `{}`, and `skills` did.
+/// Strict providers reject that outright — `"schema must be a JSON Schema of 'type:
+/// \"object\"', got 'type: null'"` fails the *whole* request, not just that tool —
+/// while Anthropic and Bedrock never see it, because their own
+/// `normalize_object_schema` repairs it on the way out. One registry was therefore
+/// fine on one provider and unusable on another.
+///
+/// Coercing here, where every provider-agnostic schema is produced, rather than in
+/// each provider: adding it to `openai.rs` and `ollama.rs` would leave two call
+/// sites to keep in sync and every future provider wrong by default. The existing
+/// Anthropic/Bedrock normalizers stay as harmless idempotent second passes.
+///
+/// A schema that already declares `type` is returned **untouched**, so the
+/// byte-identical guarantee `pruned_schema_is_byte_stable_across_calls` asserts is
+/// unaffected for every already-correct tool.
+fn object_schema(params: Value) -> Value {
+    match params {
+        Value::Object(map) if !map.contains_key("type") => {
+            let mut m = map;
+            m.insert("type".into(), Value::String("object".into()));
+            m.entry("properties")
+                .or_insert_with(|| Value::Object(serde_json::Map::new()));
+            Value::Object(m)
+        }
+        other => other,
+    }
 }
 
 /// Assert that `tool`'s [`Tool::action_params`] declaration is coherent with its
@@ -1049,6 +1079,138 @@ mod tests {
             actions.len(),
             2,
             "the enum must narrow to the scoped actions"
+        );
+    }
+
+    // ---- Schema well-formedness at the advertising boundary (#1191) ----
+    //
+    // `skills` shipped with `parameters()` returning a bare `{}`, which strict
+    // providers reject outright: "schema must be a JSON Schema of type object, got
+    // type: null" 400s the whole request, not just that tool. Anthropic and Bedrock
+    // never saw it -- they run `normalize_object_schema` -- while the OpenAI and
+    // Ollama paths take schemas verbatim from `scoped_parameters`, so the same
+    // registry was fine on one provider and unusable on another.
+
+    struct BareSchemaTool;
+
+    #[async_trait]
+    impl Tool for BareSchemaTool {
+        fn name(&self) -> &str {
+            "bare"
+        }
+        fn description(&self) -> &str {
+            "Declares an empty schema, as `skills` did."
+        }
+        fn parameters(&self) -> Value {
+            serde_json::json!({})
+        }
+        async fn run(&self, _args: Value, _root: &Path) -> ToolOutcome {
+            ToolOutcome::ok("ran")
+        }
+    }
+
+    #[test]
+    fn every_advertised_tool_declares_an_object_schema() {
+        // The invariant no per-tool unit test can hold: the bug was one tool
+        // disagreeing with the other 31, which is only visible in aggregate.
+        let reg = ToolRegistry::with_defaults();
+        let offenders: Vec<String> = reg
+            .openai_tools()
+            .iter()
+            .filter_map(|entry| {
+                let f = &entry["function"];
+                let params = &f["parameters"];
+                let ok = params.get("type").and_then(Value::as_str) == Some("object")
+                    && params.get("properties").is_some_and(Value::is_object);
+                (!ok).then(|| {
+                    format!(
+                        "{}: {}",
+                        f["name"].as_str().unwrap_or("?"),
+                        serde_json::to_string(params).unwrap_or_default()
+                    )
+                })
+            })
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "every advertised schema must be an object schema; offenders: {offenders:?}"
+        );
+    }
+
+    #[test]
+    fn scoped_parameters_coerces_a_schema_that_omits_type() {
+        // The class fix: normalizing where schemas are produced means a future
+        // no-arg tool cannot reintroduce this, and cannot reintroduce it invisibly
+        // on providers whose own normalizer would have masked it.
+        let params = scoped_parameters(&BareSchemaTool, None);
+        assert_eq!(params["type"], "object");
+        assert!(
+            params["properties"].is_object(),
+            "a coerced schema needs a properties object, got {params}"
+        );
+    }
+
+    #[test]
+    fn coercion_leaves_a_well_formed_schema_untouched() {
+        // Already-correct schemas must be byte-identical on the wire: a normalizer
+        // that rewrites valid schemas would break #947's append-only guarantee
+        // just as surely as a missing one breaks strict providers.
+        //
+        // Every tool in `with_defaults()` (17), not a hand-picked sample -- the
+        // sample cannot notice a tool whose schema the coercion starts touching.
+        // The desktop-only tools (`skills` and siblings) are covered by
+        // `every_desktop_tool_advertises_an_object_schema`, which sees a registry
+        // this one structurally cannot.
+        let reg = ToolRegistry::with_defaults();
+        for tool in reg.iter_tools() {
+            let tool_name = tool.name();
+            let raw = serde_json::to_string(&tool.parameters()).unwrap();
+            let advertised = serde_json::to_string(&scoped_parameters(tool, None)).unwrap();
+            assert_eq!(
+                raw, advertised,
+                "{tool_name}'s schema already declares an object; coercion must not touch it"
+            );
+        }
+    }
+
+    struct NonObjectSchemaTool;
+
+    #[async_trait]
+    impl Tool for NonObjectSchemaTool {
+        fn name(&self) -> &str {
+            "nonobject"
+        }
+        fn description(&self) -> &str {
+            "Declares a non-object schema."
+        }
+        fn parameters(&self) -> Value {
+            serde_json::json!({ "type": "string" })
+        }
+        async fn run(&self, _args: Value, _root: &Path) -> ToolOutcome {
+            ToolOutcome::ok("ran")
+        }
+    }
+
+    #[test]
+    fn coercion_never_overwrites_a_declared_type() {
+        // Only *absence* of `type` is repaired. Rewriting a declared one would make
+        // the normalizer an opinion about schemas rather than a repair for a missing
+        // key, and would silently reshape any tool that legitimately declares
+        // something else.
+        //
+        // Needed because the obvious guard is untestable against real tools: every
+        // built-in already declares both `type` and `properties`, so a mutation that
+        // drops the `!contains_key("type")` condition produces a byte-identical
+        // result for all of them and survives. Found by mutation, then pinned with a
+        // schema whose type is not `object`.
+        let params = scoped_parameters(&NonObjectSchemaTool, None);
+        assert_eq!(
+            params["type"], "string",
+            "a declared type must survive coercion untouched, got {params}"
+        );
+        assert!(
+            params.get("properties").is_none(),
+            "coercion must not graft properties onto a schema it did not repair"
         );
     }
 
