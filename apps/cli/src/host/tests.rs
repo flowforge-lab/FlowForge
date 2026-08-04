@@ -162,3 +162,70 @@ fn channel_map_sits_beside_the_session_db() {
     );
     assert_eq!(map.file_name().unwrap(), "channel-map.json");
 }
+
+/// #1060: a missing `provider.json` must not resolve silently.
+///
+/// The default is local candle-vllm on port 8000, so a silent fallback made every
+/// `serve` turn fail with `error sending request for url
+/// (http://localhost:8000/v1/chat/completions)` — an error naming a port the user
+/// never chose, with nothing connecting it to an absent config file.
+#[test]
+fn missing_provider_config_falls_back_to_the_default() {
+    let env = crate::test_support::TestEnv::new();
+    assert!(
+        !env.legacy_path().exists(),
+        "precondition: no provider.json in the test env"
+    );
+
+    let config = super::load_provider_config();
+
+    assert_eq!(config.kind, ProviderKind::default());
+    assert_eq!(
+        super::provider_config_path().unwrap(),
+        env.legacy_path(),
+        "must read the overridden dir, not the real ~/.config"
+    );
+}
+
+/// A malformed file falls back rather than panicking — and is distinguished from
+/// the missing-file case, since the remedies differ (fix the file vs create it).
+#[test]
+fn malformed_provider_config_falls_back_to_the_default() {
+    let env = crate::test_support::TestEnv::new();
+    fs::write(env.legacy_path(), "{ not json").unwrap();
+
+    let config = super::load_provider_config();
+
+    assert_eq!(config.kind, ProviderKind::default());
+}
+
+/// The complement, and the one that stops the warnings becoming noise: a valid
+/// config is honored and must NOT hit any fallback path.
+#[test]
+fn valid_provider_config_is_honored() {
+    let env = crate::test_support::TestEnv::new();
+    fs::write(
+        env.legacy_path(),
+        r#"{"kind":"ollama","model":"qwen3.6:35b-a3b","hasKey":false}"#,
+    )
+    .unwrap();
+
+    let config = super::load_provider_config();
+
+    assert_eq!(config.kind, ProviderKind::Ollama);
+    assert_eq!(config.model, "qwen3.6:35b-a3b");
+    assert_ne!(
+        config.kind,
+        ProviderKind::default(),
+        "guards the test itself: a default-kind fixture could not detect a fallback"
+    );
+}
+
+/// The fallback description must name the port that appears in the resulting
+/// request error, which is the only string tying symptom to cause.
+#[test]
+fn default_provider_desc_names_the_url_from_the_error() {
+    let desc = super::default_provider_desc();
+    assert!(desc.contains("localhost:8000"), "got {desc}");
+    assert!(desc.contains("candle-vllm"), "got {desc}");
+}
