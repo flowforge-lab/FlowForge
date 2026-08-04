@@ -1,19 +1,28 @@
-import { memo, type ReactNode } from "react";
+import {
+  createContext,
+  memo,
+  useContext,
+  useEffect,
+  useState,
+  type ReactNode,
+} from "react";
 import { isValidElement } from "react";
+import { Fragment, jsx, jsxs } from "react/jsx-runtime";
+import type { Root } from "hast";
+import { toJsxRuntime } from "hast-util-to-jsx-runtime";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
-import rehypeHighlight from "rehype-highlight";
 import rehypeKatex from "rehype-katex";
 import { Check, Copy, PanelRight } from "@/components/ui/icon";
 import { remarkBackslashMath } from "@/lib/remark-backslash-math";
 import { splitBlocks } from "@/lib/markdown-blocks";
-import { cn } from "@/lib/utils";
+import { getCachedHighlight, highlight } from "@/lib/shiki";
 import { useCopied } from "@/lib/use-copied";
 import { openExternalUrl } from "@/lib/about";
 import { useSplitStore } from "@/store/split";
 
-// Flatten React children (including the nested <span> tree rehype-highlight
+// Flatten React children (including the nested <span> tree a highlighter
 // produces) back into plain text — used as the source for the copy button.
 function childrenToText(children: ReactNode): string {
   if (children == null || typeof children === "boolean") return "";
@@ -27,6 +36,68 @@ function childrenToText(children: ReactNode): string {
     );
   }
   return "";
+}
+
+// True while the surrounding message is still streaming. Highlighting is the
+// heaviest part of rendering a code block, and while streaming the open block's
+// text grows every frame, so highlighting it per frame would be O(n^2) (#104).
+// Before #1169 that was enforced by leaving `rehype-highlight` off the
+// streaming pipelines; now that highlighting lives in the component rather than
+// the rehype pipeline, this context carries the same signal — which also lets
+// all three prose instances share one `COMPONENTS` map instead of forking it.
+const StreamingContext = createContext(false);
+
+// Syntax-highlighted `<code>` — the single highlighting entry point for the
+// whole app. Grammars load lazily (see lib/shiki.ts), so this renders the plain
+// text first and swaps in the highlighted tree when the grammar resolves. That
+// swap is deliberately a lossless in-place recolour with no spinner or
+// skeleton: same text, same font, same metrics, so nothing reflows. A cached
+// block (`getCachedHighlight`) skips the plain phase entirely, which is what
+// keeps the virtualized transcript (#1143) from re-flashing on every scroll.
+function ShikiCodeInner({ code, lang }: { code: string; lang: string }) {
+  const [hast, setHast] = useState<Root | null>(() =>
+    getCachedHighlight(code, lang),
+  );
+
+  useEffect(() => {
+    if (hast) return;
+    let alive = true;
+    void highlight(code, lang).then((result) => {
+      if (alive) setHast(result);
+    });
+    return () => {
+      alive = false;
+    };
+  }, [code, lang, hast]);
+
+  if (!hast) return <code className="shiki">{code}</code>;
+
+  // hast -> React elements rather than dangerouslySetInnerHTML: model output
+  // must never become markup (the same reason there is no rehype-raw below),
+  // and a real React tree keeps `childrenToText` working for the copy button.
+  return toJsxRuntime(hast, { Fragment, jsx, jsxs });
+}
+
+// Keyed on the exact code + language so a changed block starts from a fresh
+// `useState` seed (a cache hit, when there is one) instead of briefly showing
+// the previous block's highlighting. Remounting is cheap precisely because the
+// seed comes from the cache.
+const ShikiCode = memo(function ShikiCode({
+  code,
+  lang,
+}: {
+  code: string;
+  lang: string;
+}) {
+  return <ShikiCodeInner key={`${lang}\0${code}`} code={code} lang={lang} />;
+});
+
+// The body of a fenced block inside a message: highlighted once the turn has
+// settled, plain while it is still streaming.
+function CodeBody({ code, lang }: { code: string; lang: string }) {
+  const streaming = useContext(StreamingContext);
+  if (streaming) return <code className="shiki">{code}</code>;
+  return <ShikiCode code={code} lang={lang} />;
 }
 
 function CopyButton({ value }: { value: string }) {
@@ -72,7 +143,7 @@ function OpenInSplitButton({
 }
 
 // A fenced code block: language label + copy button over the highlighted code.
-// `children` is the already-highlighted <code> subtree; `raw` is its plain text.
+// `children` is the <code> subtree; `raw` is its plain text.
 function CodeBlock({
   language,
   raw,
@@ -126,11 +197,12 @@ const COMPONENTS = {
       );
     }
 
+    const language = match?.[1] ?? "text";
+    const raw = text.replace(/\n$/, "");
+
     return (
-      <CodeBlock language={match?.[1] ?? "text"} raw={text.replace(/\n$/, "")}>
-        <code className={cn("hljs", className)} {...props}>
-          {children}
-        </code>
+      <CodeBlock language={language} raw={raw}>
+        <CodeBody code={raw} lang={language} />
       </CodeBlock>
     );
   },
@@ -184,10 +256,10 @@ const KATEX: [typeof rehypeKatex, { throwOnError: boolean }] = [
 ];
 const KATEX_PLUGINS = [KATEX];
 
-// One markdown block, rendered through the same (highlight-free) pipeline as
-// the streaming path. Memoized so a closed block — whose text never changes
-// again once closed — is parsed exactly once, no matter how many more frames
-// the surrounding message keeps streaming.
+// One markdown block, rendered through the same pipeline as every other prose
+// instance. Memoized so a closed block — whose text never changes again once
+// closed — is parsed exactly once, no matter how many more frames the
+// surrounding message keeps streaming.
 const MarkdownBlock = memo(function MarkdownBlock({ text }: { text: string }) {
   return (
     <ReactMarkdown
@@ -203,12 +275,14 @@ const MarkdownBlock = memo(function MarkdownBlock({ text }: { text: string }) {
 // Renders assistant Markdown. `react-markdown` escapes raw HTML by default (no
 // rehype-raw here) and sanitizes URLs, so model output can't inject markup.
 //
-// `rehype-highlight` (highlight.js) is the heaviest part of the pipeline and runs
-// over the whole document on every render. While `streaming`, `content` grows by a
-// token each render, so highlighting there is O(n^2) and stalls the UI thread on
-// long replies (#104). We drop the highlight pass during streaming — markdown
-// structure still renders live — and run the full pipeline once when the turn
-// finishes (`streaming` flips to false), which highlights the final text.
+// Syntax highlighting is the heaviest part of rendering a message. While
+// `streaming`, `content` grows by a token each render, so highlighting every
+// frame is O(n^2) and stalls the UI thread on long replies (#104). We suppress
+// it during streaming — markdown structure still renders live — and highlight
+// once the turn finishes (`streaming` flips to false). Since #1169 that
+// suppression is carried by `StreamingContext` rather than by omitting a rehype
+// plugin, so all three prose instances below now run the *same* plugin list and
+// can no longer drift into rendering the same message two different ways.
 //
 // On top of that, while streaming we split `content` into closed blocks (won't
 // change again) and one open tail block (still growing) (#844). Each closed
@@ -218,10 +292,10 @@ const MarkdownBlock = memo(function MarkdownBlock({ text }: { text: string }) {
 // instead of the whole message. Once the turn finishes, `streaming` flips to
 // false and the full content re-parses once, unsplit, with highlighting.
 //
-// KaTeX, unlike highlighting, does run while streaming (#1102): it is cheap next
-// to highlight.js, only touches the math nodes, and leaving it off would render
-// formulas as code blocks mid-stream and then swap them for typeset math when
-// the turn settles — exactly the inconsistency #844's equivalence test guards.
+// KaTeX, unlike highlighting, does run while streaming (#1102): it is cheap,
+// only touches the math nodes, and leaving it off would render formulas as code
+// blocks mid-stream and then swap them for typeset math when the turn settles —
+// exactly the inconsistency #844's equivalence test guards.
 function MarkdownImpl({
   content,
   streaming = false,
@@ -232,18 +306,20 @@ function MarkdownImpl({
   if (streaming) {
     const { closed, open } = splitBlocks(content);
     return (
-      <div className="ff-prose">
-        {closed.map((block, i) => (
-          <MarkdownBlock key={i} text={block} />
-        ))}
-        <ReactMarkdown
-          remarkPlugins={REMARK_PLUGINS}
-          rehypePlugins={KATEX_PLUGINS}
-          components={COMPONENTS}
-        >
-          {open}
-        </ReactMarkdown>
-      </div>
+      <StreamingContext.Provider value={true}>
+        <div className="ff-prose">
+          {closed.map((block, i) => (
+            <MarkdownBlock key={i} text={block} />
+          ))}
+          <ReactMarkdown
+            remarkPlugins={REMARK_PLUGINS}
+            rehypePlugins={KATEX_PLUGINS}
+            components={COMPONENTS}
+          >
+            {open}
+          </ReactMarkdown>
+        </div>
+      </StreamingContext.Provider>
     );
   }
 
@@ -251,7 +327,7 @@ function MarkdownImpl({
     <div className="ff-prose">
       <ReactMarkdown
         remarkPlugins={REMARK_PLUGINS}
-        rehypePlugins={[...KATEX_PLUGINS, rehypeHighlight]}
+        rehypePlugins={KATEX_PLUGINS}
         components={COMPONENTS}
       >
         {content}
@@ -262,48 +338,14 @@ function MarkdownImpl({
 
 export const Markdown = memo(MarkdownImpl);
 
-// Smallest backtick fence that can safely wrap `text` — longer than any run of
-// backticks inside it, so code containing ``` won't break out of the block.
-function safeFence(text: string): string {
-  const longest = (text.match(/`+/g) ?? []).reduce(
-    (m, run) => Math.max(m, run.length),
-    0,
-  );
-  return "`".repeat(Math.max(3, longest + 1));
-}
-
-const HIGHLIGHT_COMPONENTS = {
-  // Flattened: the caller supplies its own <pre>, so we emit just the <code>.
-  pre: ({ children }: { children?: ReactNode }) => <>{children}</>,
-  code: ({
-    className,
-    children,
-    ...props
-  }: {
-    className?: string;
-    children?: ReactNode;
-  }) => (
-    <code className={cn("hljs", className)} {...props}>
-      {children}
-    </code>
-  ),
-};
-
-// Syntax-highlights a raw code string, reusing #7's rehype-highlight pipeline
-// and the shared `.hljs` theme in index.css. Returns the bare highlighted
-// <code> (no <pre>) so callers control wrapping/scroll. Used by the split panel.
-// No remark plugins here: the document is nothing but one fence, so gfm and the
-// math plugins would have nothing outside it to act on.
+// Syntax-highlights a raw code string. Returns the bare highlighted <code> (no
+// <pre>) so callers control wrapping/scroll — used by the split panel, notebook
+// cell output, and the file viewer. Before #1169 this wrapped `text` in a
+// synthetic markdown fence and ran it back through react-markdown just to reach
+// the highlighter; now it hands the string straight to Shiki, so no fence
+// escaping is needed and the text can never be re-interpreted as markdown.
 function HighlightedCodeImpl({ lang, text }: { lang: string; text: string }) {
-  const fence = safeFence(text);
-  return (
-    <ReactMarkdown
-      rehypePlugins={[rehypeHighlight]}
-      components={HIGHLIGHT_COMPONENTS}
-    >
-      {`${fence}${lang}\n${text}\n${fence}`}
-    </ReactMarkdown>
-  );
+  return <ShikiCode code={text.replace(/\n$/, "")} lang={lang} />;
 }
 
 export const HighlightedCode = memo(HighlightedCodeImpl);

@@ -5,7 +5,9 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::Stdio;
+use std::sync::mpsc;
 use std::sync::OnceLock;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -198,23 +200,64 @@ fn resolve_token() -> Option<String> {
         .clone()
 }
 
+/// How long we will wait for `gh auth token` before giving up. Token
+/// resolution runs on the async tool path, so a wedged `gh` must never be able
+/// to stall a turn; five seconds is far beyond the ~50ms a healthy `gh` takes.
+const GH_AUTH_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Ask `gh auth token` for the active credential. Returns `None` if `gh` is
-/// not installed, not authenticated, or returns an error.
+/// not installed, not authenticated, returns an error, or does not answer
+/// within [`GH_AUTH_TIMEOUT`].
+///
+/// This does not use `Command::output()`, which waits for the stdout pipe to
+/// reach EOF rather than for the child to exit. `gh` forks a background update
+/// notifier that inherits that pipe and can outlive the command, so on Windows
+/// the read blocks indefinitely even though `gh` itself is long gone — that is
+/// what timed out CI's `ff-tools` run at 120s. The notifier is disabled below
+/// *and* the read is bounded, because "no unbounded wait on a child process"
+/// should hold whatever `gh` decides to spawn next.
 fn gh_auth_token() -> Option<String> {
-    let out = std::process::Command::new("gh")
+    let mut child = std::process::Command::new("gh")
         .args(["auth", "token"])
         .env("PATH", ff_core::augmented_path())
+        // The update notifier is the known pipe-holder; the prompt disable
+        // keeps a misconfigured `gh` from blocking on a TTY that isn't there.
+        .env("GH_NO_UPDATE_NOTIFIER", "1")
+        .env("GH_PROMPT_DISABLED", "1")
+        .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
-        .output()
+        .spawn()
         .ok()?;
-    if out.status.success() {
-        let tok = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        if !tok.is_empty() {
-            return Some(tok);
+
+    // Read on a worker thread. If something really is holding the pipe open,
+    // that thread parks forever — but the caller walks away on the deadline
+    // instead of parking with it.
+    let mut stdout = child.stdout.take()?;
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = String::new();
+        let read = std::io::Read::read_to_string(&mut stdout, &mut buf);
+        let _ = tx.send(read.ok().map(|_| buf));
+    });
+
+    let stdout = match rx.recv_timeout(GH_AUTH_TIMEOUT) {
+        Ok(Some(buf)) => buf,
+        // Read error, or the sender vanished.
+        Ok(None) | Err(mpsc::RecvTimeoutError::Disconnected) => return None,
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
         }
+    };
+
+    // stdout hit EOF, so the child has closed it and this cannot block long.
+    if !child.wait().ok()?.success() {
+        return None;
     }
-    None
+    let tok = stdout.trim();
+    (!tok.is_empty()).then(|| tok.to_string())
 }
 
 /// Build a `gh` command with token and working directory set.

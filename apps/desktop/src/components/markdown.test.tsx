@@ -8,12 +8,30 @@
 // fully delivered — streaming must never leave the user with a different
 // final rendering than before this change.
 
-import { cleanup, fireEvent, render } from "@testing-library/react";
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  waitFor,
+} from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { Markdown } from "@/components/markdown";
 
 afterEach(() => cleanup());
+
+// A token Shiki has coloured, i.e. proof that highlighting has actually run.
+const TOKEN_SPAN = 'span[style*="--shiki-token-"]';
+
+/** Let every pending microtask and macrotask drain, inside `act` so React has
+ *  flushed any state update they produced. Unlike `waitFor`, this does not stop
+ *  at the first success — which is what a "never happens" assertion needs. */
+async function flushAsync(): Promise<void> {
+  await act(async () => {
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  });
+}
 
 // Simulates feeding `content` to the streaming renderer token-by-token in
 // `chunkSize`-character increments, mirroring how `applyToken` grows the
@@ -95,21 +113,68 @@ describe("Markdown streaming vs final equivalence (#844)", () => {
     expect(blockTexts(streamed)).toEqual(blockTexts(final));
   });
 
-  it("only applies syntax-highlight spans once settled, never while streaming", () => {
+  it("only applies syntax-highlight spans once settled, never while streaming", async () => {
     const content = "```ts\nconst x = 1;\n```";
 
-    // rehype-highlight injects nested `hljs-*` spans for syntax tokens; the
-    // outer `<code class="hljs">` wrapper is applied unconditionally by
-    // COMPONENTS, so the token spans are the actual highlighting signal.
-    const { container: streaming } = render(
-      <Markdown content={content} streaming />,
-    );
-    expect(streaming.querySelector('span[class*="hljs-"]')).toBeNull();
-
+    // Shiki colours each token with an inline `var(--shiki-token-*)`; the outer
+    // `<code class="shiki">` wrapper is emitted either way, so the coloured
+    // token spans are the actual highlighting signal.
+    //
+    // Ordering here is load-bearing, and the reason is worth spelling out: an
+    // assertion that the streaming render has no token spans is *vacuous* if it
+    // runs before highlighting could have happened at all. Grammars arrive via
+    // `await import("shiki")`, so the first paint is unhighlighted whether or
+    // not `CodeBody`'s streaming guard exists — and `waitFor` cannot rescue it,
+    // because `waitFor` returns the moment its callback first succeeds, which
+    // for a negative is immediately. Both forms pass with the guard deleted.
+    //
+    // So: settle the final render FIRST. That is a positive condition `waitFor`
+    // can legitimately synchronise on, and reaching it proves the grammar is
+    // loaded and the result is in `lib/shiki.ts`'s cache under this exact
+    // (lang, code) key.
     const { container: final } = render(
       <Markdown content={content} streaming={false} />,
     );
-    expect(final.querySelector('span[class*="hljs-"]')).not.toBeNull();
+    // Plain text first — the highlighted tree replaces it in place, so the
+    // text must already be correct before the swap (no spinner, no reflow).
+    expect(final.textContent).toContain("const x = 1;");
+    await waitFor(() => {
+      expect(final.querySelector(TOKEN_SPAN)).not.toBeNull();
+    });
+    expect(final.textContent).toContain("const x = 1;");
+
+    // Now a streaming render of the same block, against that warm cache.
+    // `ShikiCodeInner` seeds its state from `getCachedHighlight`, so without the
+    // guard this would paint highlighted on its very first frame — no awaiting
+    // required, and no timing to get wrong. The assertion is synchronous
+    // precisely so it cannot pass by looking too early.
+    const { container: streaming } = render(
+      <Markdown content={content} streaming />,
+    );
+    expect(streaming.querySelector(TOKEN_SPAN)).toBeNull();
+    expect(streaming.textContent).toContain("const x = 1;");
+
+    // And it must still be unhighlighted after the render has had every chance
+    // to settle — this catches a guard that merely defers rather than suppresses.
+    await flushAsync();
+    expect(streaming.querySelector(TOKEN_SPAN)).toBeNull();
+  });
+
+  // The transcript is virtualized (#1143), so a block unmounts and remounts as
+  // the user scrolls past it. lib/shiki.ts caches the highlighted tree so the
+  // remount paints highlighted on the first frame instead of flashing plain
+  // text — assert that synchronously, with no await.
+  it("re-renders an already-highlighted block without a plain-text flash", async () => {
+    const content = "```ts\nconst cached = 42;\n```";
+
+    const first = render(<Markdown content={content} />);
+    await waitFor(() => {
+      expect(first.container.querySelector(TOKEN_SPAN)).not.toBeNull();
+    });
+    cleanup();
+
+    const { container } = render(<Markdown content={content} />);
+    expect(container.querySelector(TOKEN_SPAN)).not.toBeNull();
   });
 });
 
