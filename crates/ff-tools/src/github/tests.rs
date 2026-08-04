@@ -2,12 +2,26 @@ use super::*;
 use serde_json::json;
 
 #[test]
-fn resolve_token_does_not_panic() {
+fn resolve_token_does_not_panic_and_returns_promptly() {
     // resolve_token() is cached in a OnceLock, so we can only test the
     // first-call behavior once per process. On a dev machine with `gh`
     // authenticated it returns Some; on CI (no gh auth) it returns None.
     // Either outcome is valid — we verify it doesn't panic.
+    //
+    // It must also come back *bounded*. `gh auth token` used to be read with
+    // `Command::output()`, which waits on the stdout pipe rather than on the
+    // child: `gh`'s background update notifier inherits that pipe and outlives
+    // the command, so on Windows the read never returned and this test hit
+    // nextest's 120s cap. `gh_auth_token` now caps the wait at
+    // GH_AUTH_TIMEOUT (5s); the generous bound here exists so that if that cap
+    // is ever removed, this fails with a clear message instead of hanging.
+    let started = std::time::Instant::now();
     let _ = resolve_token();
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < std::time::Duration::from_secs(30),
+        "resolve_token() took {elapsed:?} — the `gh auth token` wait is unbounded again"
+    );
 }
 
 #[test]

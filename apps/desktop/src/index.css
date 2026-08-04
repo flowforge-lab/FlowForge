@@ -446,115 +446,62 @@ body {
 .ff-code pre {
   margin: 0;
 }
-.ff-code .hljs {
+.ff-code .shiki {
   display: block;
   font-family: var(--font-code);
   color: var(--foreground);
   background: transparent;
 }
 
-/* highlight.js token palette — teal-leaning to match the FlowForge accent.
-   Light values are the default; dark surfaces lift them for contrast. */
-.hljs-comment,
-.hljs-quote {
-  color: oklch(0.55 0.02 200);
-  font-style: italic;
-}
-.hljs-keyword,
-.hljs-selector-tag,
-.hljs-literal,
-.hljs-section,
-.hljs-link {
-  color: oklch(0.48 0.13 250);
-}
-.hljs-string,
-.hljs-regexp,
-.hljs-addition,
-.hljs-attribute {
-  color: oklch(0.5 0.12 150);
-}
-.hljs-number,
-.hljs-built_in,
-.hljs-type,
-.hljs-class .hljs-title,
-.hljs-params {
-  color: oklch(0.52 0.12 50);
-}
-.hljs-title,
-.hljs-name,
-.hljs-selector-id,
-.hljs-selector-class {
-  color: oklch(0.5 0.14 200);
-}
-.hljs-attr,
-.hljs-variable,
-.hljs-template-variable {
-  color: oklch(0.48 0.06 215);
-}
-.hljs-tag {
-  color: oklch(0.5 0.13 200);
-}
-.hljs-symbol,
-.hljs-bullet {
-  color: oklch(0.52 0.12 330);
-}
-.hljs-meta {
-  color: oklch(0.55 0.02 200);
-}
-.hljs-deletion {
-  color: var(--destructive);
-}
-.hljs-emphasis {
-  font-style: italic;
-}
-.hljs-strong {
-  font-weight: 600;
+/* Shiki token palette (#1169) — teal-leaning to match the FlowForge accent,
+   carried over from the highlight.js palette this replaced.
+
+   Shiki's CSS-variables theme emits `color: var(--shiki-token-*)` inline on
+   every token, so the two themes are a plain `.dark` cascade: flipping the
+   class recolours already-rendered code with no re-highlight and no JS theme
+   subscription. Defined at :root (not scoped to .ff-code) because the split
+   panel, notebook output, and file viewer render highlighted code of their
+   own, each with their own surrounding <pre> styles. */
+:root {
+  --shiki-foreground: var(--foreground);
+  --shiki-background: transparent;
+  --shiki-token-comment: oklch(0.55 0.02 200);
+  --shiki-token-keyword: oklch(0.48 0.13 250);
+  --shiki-token-string: oklch(0.5 0.12 150);
+  --shiki-token-string-expression: oklch(0.5 0.12 150);
+  --shiki-token-constant: oklch(0.52 0.12 50);
+  --shiki-token-function: oklch(0.5 0.14 200);
+  --shiki-token-parameter: oklch(0.48 0.06 215);
+  --shiki-token-link: oklch(0.48 0.13 250);
+  --shiki-token-punctuation: color-mix(
+    in oklab,
+    var(--foreground) 65%,
+    transparent
+  );
+  --shiki-token-inserted: oklch(0.5 0.12 150);
+  --shiki-token-deleted: var(--destructive);
+  --shiki-token-changed: oklch(0.52 0.12 330);
 }
 
-.dark .hljs-comment,
-.dark .hljs-quote {
-  color: oklch(0.62 0.02 200);
+/* Dark surfaces lift the same hues for contrast. */
+.dark {
+  --shiki-token-comment: oklch(0.62 0.02 200);
+  --shiki-token-keyword: oklch(0.78 0.1 255);
+  --shiki-token-string: oklch(0.8 0.12 150);
+  --shiki-token-string-expression: oklch(0.8 0.12 150);
+  --shiki-token-constant: oklch(0.83 0.1 65);
+  --shiki-token-function: oklch(0.82 0.11 195);
+  --shiki-token-parameter: oklch(0.84 0.05 200);
+  --shiki-token-link: oklch(0.78 0.1 255);
+  --shiki-token-inserted: oklch(0.8 0.12 150);
+  --shiki-token-changed: oklch(0.78 0.1 330);
 }
-.dark .hljs-keyword,
-.dark .hljs-selector-tag,
-.dark .hljs-literal,
-.dark .hljs-section,
-.dark .hljs-link {
-  color: oklch(0.78 0.1 255);
-}
-.dark .hljs-string,
-.dark .hljs-regexp,
-.dark .hljs-addition,
-.dark .hljs-attribute {
-  color: oklch(0.8 0.12 150);
-}
-.dark .hljs-number,
-.dark .hljs-built_in,
-.dark .hljs-type,
-.dark .hljs-class .hljs-title,
-.dark .hljs-params {
-  color: oklch(0.83 0.1 65);
-}
-.dark .hljs-title,
-.dark .hljs-name,
-.dark .hljs-selector-id,
-.dark .hljs-selector-class {
-  color: oklch(0.82 0.11 195);
-}
-.dark .hljs-attr,
-.dark .hljs-variable,
-.dark .hljs-template-variable {
-  color: oklch(0.84 0.05 200);
-}
-.dark .hljs-tag {
-  color: oklch(0.8 0.11 195);
-}
-.dark .hljs-symbol,
-.dark .hljs-bullet {
-  color: oklch(0.78 0.1 330);
-}
-.dark .hljs-meta {
-  color: oklch(0.62 0.02 200);
+
+/* Italic comments, as the highlight.js palette had. Shiki tags tokens only by
+   inline colour — there is no per-token class to hook — so this matches on the
+   variable name it wrote into the style attribute. */
+.shiki span[style*="--shiki-token-comment"] {
+  font-style: italic;
 }
 
 /* --- Shared Markdown editor (components/ui/markdown-editor.tsx, #952) --- */
