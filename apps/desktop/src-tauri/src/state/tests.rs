@@ -3688,3 +3688,150 @@ async fn advertised_tool_block_is_usable_on_a_live_openai_compatible_gateway() {
         "model never invoked `skills`: schema accepted but unusable"
     );
 }
+
+// ---- Preheat seeding (#1107, closing the #1179 acceptance gap) ----
+//
+// `align_session_preheat` shipped in #1186 with no coverage, and a test against a
+// default registry would have been worthless: measured, no built-in tool
+// overrides `Tool::defer`, so `ToolRegistry::new().deferred_tool_names()` is
+// empty and every preheat name is rejected as unknown. These inject deferred
+// stubs so the gate has candidates to admit.
+
+fn pheno_with_preheat(preheat: Vec<String>) -> Phenotype {
+    Phenotype {
+        name: "preheater".into(),
+        skills: vec![],
+        model: None,
+        persona: None,
+        max_iterations: None,
+        provider: None,
+        mcp_servers: Vec::new(),
+        egress: ff_core::Egress::Open,
+        preheat,
+    }
+}
+
+fn registry_with_deferred(names: &[&str]) -> ToolRegistry {
+    let mut registry = ToolRegistry::new();
+    for n in names {
+        registry.register(Box::new(ff_tools::fixtures::DeferredStub::new(*n)));
+    }
+    registry
+}
+
+#[test]
+fn declared_preheat_names_are_seeded_into_the_session() {
+    let state = AppState::new();
+    let registry = registry_with_deferred(&["alpha", "beta"]);
+    state.apply_phenotype(pheno_with_preheat(vec!["alpha".into(), "beta".into()]));
+
+    let dropped = state.align_session_preheat("s1", &registry);
+
+    assert!(
+        dropped.is_none(),
+        "known deferred names must not be dropped"
+    );
+    let unlocked = state.tool_search.unlocked("s1");
+    assert!(
+        unlocked.contains("alpha") && unlocked.contains("beta"),
+        "declared preheat must reach the unlocked set, got {unlocked:?}"
+    );
+}
+
+#[test]
+fn unknown_preheat_names_soft_fail_and_are_reported() {
+    // A typo must not fail the turn -- it reports, so a misconfigured phenotype
+    // is visible rather than silently preheating nothing.
+    let state = AppState::new();
+    let registry = registry_with_deferred(&["alpha"]);
+    state.apply_phenotype(pheno_with_preheat(vec![
+        "alpha".into(),
+        "nosuchtool".into(),
+    ]));
+
+    let dropped = state
+        .align_session_preheat("s1", &registry)
+        .expect("an unknown name must be reported");
+
+    assert!(
+        dropped.unknown.contains(&"nosuchtool".to_string()),
+        "the unknown name must be named, got {:?}",
+        dropped.unknown
+    );
+    assert!(
+        state.tool_search.unlocked("s1").contains("alpha"),
+        "a bad name must not cost the good ones their preheat"
+    );
+}
+
+#[test]
+fn preheat_over_budget_truncates_in_declaration_order() {
+    // Declaration order is the tie-break: the phenotype author's first choice
+    // survives, so truncation is predictable rather than arbitrary.
+    let state = AppState::new();
+    let mut registry = ToolRegistry::new();
+    for n in ["first", "second"] {
+        registry.register(Box::new(ff_tools::fixtures::DeferredStub::with_spec_bytes(
+            n, 2000,
+        )));
+    }
+    state.apply_phenotype(pheno_with_preheat(vec!["first".into(), "second".into()]));
+
+    let dropped = state
+        .align_session_preheat("s1", &registry)
+        .expect("exceeding the budget must be reported");
+
+    assert!(
+        dropped.over_budget.contains(&"second".to_string()),
+        "the later declaration must be the one dropped, got {:?}",
+        dropped.over_budget
+    );
+    let unlocked = state.tool_search.unlocked("s1");
+    assert!(
+        unlocked.contains("first"),
+        "the first declaration must survive"
+    );
+    assert!(
+        !unlocked.contains("second"),
+        "the over-budget name must not be seeded"
+    );
+}
+
+#[test]
+fn resident_tools_cannot_be_preheated() {
+    // The deferred gate is the point of the feature: a resident tool is already in
+    // the block, so "preheating" it would spend budget advertising what is already
+    // advertised. Found by mutation -- removing the gate left the other three
+    // tests green.
+    //
+    // The stub must be *registered and resident*, not merely absent: an absent
+    // name is rejected for being absent, which proves nothing about the gate. My
+    // first attempt used "glob" against `ToolRegistry::new()`, which is an empty
+    // registry (measured: 0 tools) -- so it asserted on an absent name and did not
+    // catch the mutation either.
+    let state = AppState::new();
+    let mut registry = ToolRegistry::new();
+    registry.register(Box::new(ff_tools::fixtures::ResidentStub::new("resident")));
+    registry.register(Box::new(ff_tools::fixtures::DeferredStub::new(
+        "deferrable",
+    )));
+    assert!(
+        registry.get("resident").is_some() && !registry.deferred_tool_names().contains("resident"),
+        "fixture precondition: the stub must be present and not deferred"
+    );
+    state.apply_phenotype(pheno_with_preheat(vec!["resident".into()]));
+
+    let dropped = state
+        .align_session_preheat("s1", &registry)
+        .expect("a resident name must be reported, not accepted");
+
+    assert!(
+        dropped.unknown.contains(&"resident".to_string()),
+        "a registered-but-resident tool must be rejected, got {:?}",
+        dropped.unknown
+    );
+    assert!(
+        !state.tool_search.unlocked("s1").contains("resident"),
+        "a resident tool must never be seeded as preheat"
+    );
+}

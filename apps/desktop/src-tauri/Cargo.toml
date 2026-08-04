@@ -74,3 +74,8 @@ wiremock = { workspace = true }
 # sidecar parity integration test. Only active under `cargo test` — never in
 # production builds. See RFC 0004 §5.
 tauri = { version = "2", features = ["test"] }
+# Enable `ff-tools`' `test-fixtures` module for a deferred-tool stub (#1107).
+# No built-in tool overrides `Tool::defer`, so `deferred_tool_names()` on a
+# default registry is empty and a preheat test against one asserts nothing.
+# Only active under `cargo test` — never in production builds.
+ff-tools = { workspace = true, features = ["test-fixtures"] }

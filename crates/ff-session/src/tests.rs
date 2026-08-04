@@ -383,7 +383,7 @@ fn migration_v3_to_v4_preserves_messages_and_adds_reasoning() {
         .unwrap()
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 12);
+    assert_eq!(version, 13);
 }
 
 #[test]
@@ -504,7 +504,7 @@ fn migration_v4_to_v5_preserves_messages_and_creates_table() {
         .unwrap()
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 12);
+    assert_eq!(version, 13);
 }
 
 #[test]
@@ -555,7 +555,7 @@ fn migration_v5_to_v6_preserves_session_and_adds_model() {
         .unwrap()
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 12);
+    assert_eq!(version, 13);
 }
 
 #[test]
@@ -934,7 +934,7 @@ fn migration_v6_to_v7_preserves_session_and_adds_mcp_servers() {
         .unwrap()
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 12);
+    assert_eq!(version, 13);
 }
 
 #[test]
@@ -996,7 +996,7 @@ fn migration_v7_to_v9_preserves_messages_and_adds_stop_reason() {
         .unwrap()
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 12);
+    assert_eq!(version, 13);
 }
 
 #[test]
@@ -1158,7 +1158,7 @@ fn migration_is_idempotent_across_reopens() {
         .unwrap()
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 12);
+    assert_eq!(version, 13);
 }
 
 #[test]
@@ -1718,7 +1718,7 @@ fn pre_existing_v11_database_upgrades_to_lineage() {
     let version: i64 = conn
         .query_row("SELECT * FROM pragma_user_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 12);
+    assert_eq!(version, 13);
 
     let store = SessionStore {
         conn: Mutex::new(conn),
@@ -1732,4 +1732,185 @@ fn pre_existing_v11_database_upgrades_to_lineage() {
     let forked = store.fork_session("old").unwrap();
     assert_eq!(forked.parent_session_id.as_deref(), Some("old"));
     assert_eq!(forked.fork_point_seq, Some(0));
+}
+
+#[test]
+fn put_and_get_turn_preheat_round_trip() {
+    // The cross-boundary hop Phase 3's suite did not cover (#1107): three
+    // counters in, the same three out. `preheat` was silently erased on a
+    // TOML round-trip in #1186 for want of exactly this assertion.
+    let store = SessionStore::new();
+    let s = store.create_session(None);
+    let m = store.add_message(&s.id, Role::Assistant, "answered".into());
+    store.put_turn_preheat(&s.id, &m.id, 3, 1, 742);
+    assert_eq!(
+        store.turn_preheat(&m.id),
+        Some(TurnPreheat {
+            preheated_count: 3,
+            preheated_used: 1,
+            preheated_bytes: 742,
+        })
+    );
+    assert!(store.turn_preheat("no-such-message").is_none());
+}
+
+#[test]
+fn put_turn_preheat_skips_turns_that_preheated_nothing() {
+    // Most turns declare no preheat. Writing a zero row for each would make the
+    // table mostly noise and inflate any later hit-rate denominator with turns
+    // that never made a bet.
+    let store = SessionStore::new();
+    let s = store.create_session(None);
+    let m = store.add_message(&s.id, Role::Assistant, "answered".into());
+    store.put_turn_preheat(&s.id, &m.id, 0, 0, 0);
+    assert!(
+        store.turn_preheat(&m.id).is_none(),
+        "a turn that preheated nothing must not occupy a row"
+    );
+}
+
+#[test]
+fn turn_preheat_cascades_on_session_delete() {
+    let store = SessionStore::new();
+    let s = store.create_session(None);
+    let m = store.add_message(&s.id, Role::Assistant, "answered".into());
+    store.put_turn_preheat(&s.id, &m.id, 2, 2, 100);
+    assert!(store.turn_preheat(&m.id).is_some());
+    assert!(store.delete_session(&s.id));
+    assert!(
+        store.turn_preheat(&m.id).is_none(),
+        "deleting a session must cascade-drop its preheat attribution"
+    );
+}
+
+#[test]
+fn migration_v12_to_v13_preserves_messages_and_adds_turn_preheat() {
+    // A real v12 database must gain the table on open without losing rows. Built
+    // by the live migration then rolled back to 12 (drop the v13 table, reset the
+    // pragma) rather than hand-written CREATEs: a hand-written v12 schema silently
+    // omits every column v4-v12 added, since stamping user_version=12 makes the
+    // migration skip the ALTERs that would have added them.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("sessions.db");
+    let sid = {
+        let store = SessionStore::open(&path).unwrap();
+        let s = store.create_session(None);
+        store.add_message(&s.id, Role::Assistant, "legacy".into());
+        let conn = store.conn.lock().unwrap();
+        conn.execute_batch("DROP TABLE turn_preheat;").unwrap();
+        conn.pragma_update(None, "user_version", 12).unwrap();
+        s.id
+    };
+
+    let store = SessionStore::open(&path).unwrap();
+    let msgs = store.get_messages(&sid);
+    assert_eq!(msgs.len(), 1, "v12 rows must survive the upgrade");
+    assert_eq!(msgs[0].content, "legacy");
+    assert!(
+        store.turn_preheat(&msgs[0].id).is_none(),
+        "a turn predating the migration has no attribution"
+    );
+
+    store.put_turn_preheat(&sid, &msgs[0].id, 2, 1, 50);
+    assert!(
+        store.turn_preheat(&msgs[0].id).is_some(),
+        "the upgraded database must accept attribution"
+    );
+
+    let version: i64 = store
+        .conn
+        .lock()
+        .unwrap()
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(version, 13);
+}
+
+// ---- Tool co-invocation rollup (#1107) ----
+//
+// The co-invocation signal RFC 0024 Layer 3 needs was already being persisted:
+// `messages.tool_calls` holds one JSON array per assistant row, and a row is one
+// concurrent batch. That makes "invoked together" a fact already on disk rather
+// than a window length someone has to invent. This is the read side only -- no
+// prior, no decay, no task type.
+
+fn batch(store: &SessionStore, session_id: &str, names: &[&str]) {
+    let m = store.add_message(session_id, Role::Assistant, String::new());
+    let calls = names
+        .iter()
+        .enumerate()
+        .map(|(i, n)| ToolCall {
+            id: format!("call_{i}"),
+            name: (*n).to_string(),
+            arguments: "{}".into(),
+        })
+        .collect();
+    store.attach_tool_calls(&m.id, session_id, calls);
+}
+
+#[test]
+fn co_invocation_counts_pairs_within_a_batch() {
+    let store = SessionStore::new();
+    let s = store.create_session(None);
+    batch(&store, &s.id, &["grep", "view"]);
+    batch(&store, &s.id, &["grep", "view"]);
+    batch(&store, &s.id, &["grep", "glob"]);
+
+    let pairs = store.tool_co_invocations();
+    assert_eq!(pairs.get(&("grep".into(), "view".into())), Some(&2));
+    assert_eq!(pairs.get(&("glob".into(), "grep".into())), Some(&1));
+    assert_eq!(
+        pairs.get(&("view".into(), "grep".into())),
+        None,
+        "a pair must be keyed one way only, or every count is doubled"
+    );
+}
+
+#[test]
+fn a_lone_tool_call_is_not_a_co_invocation() {
+    // Sequential single calls are the common case; counting them as co-invocation
+    // would make every tool look correlated with whatever ran next.
+    let store = SessionStore::new();
+    let s = store.create_session(None);
+    batch(&store, &s.id, &["grep"]);
+    batch(&store, &s.id, &["view"]);
+
+    assert!(
+        store.tool_co_invocations().is_empty(),
+        "one call per batch is not co-invocation"
+    );
+}
+
+#[test]
+fn co_invocation_ignores_a_tool_paired_with_itself() {
+    // A batch may call the same tool twice (two greps, different patterns). That
+    // is not evidence two *different* tools belong together.
+    let store = SessionStore::new();
+    let s = store.create_session(None);
+    batch(&store, &s.id, &["grep", "grep", "view"]);
+
+    let pairs = store.tool_co_invocations();
+    assert_eq!(pairs.get(&("grep".into(), "grep".into())), None);
+    assert_eq!(
+        pairs.get(&("grep".into(), "view".into())),
+        Some(&1),
+        "a duplicated tool must still pair once with its batch-mates"
+    );
+}
+
+#[test]
+fn co_invocation_aggregates_across_sessions() {
+    let store = SessionStore::new();
+    let a = store.create_session(None);
+    let b = store.create_session(None);
+    batch(&store, &a.id, &["grep", "view"]);
+    batch(&store, &b.id, &["grep", "view"]);
+
+    assert_eq!(
+        store
+            .tool_co_invocations()
+            .get(&("grep".into(), "view".into())),
+        Some(&2),
+        "the prior is cross-session; per-session counts would be too sparse to use"
+    );
 }

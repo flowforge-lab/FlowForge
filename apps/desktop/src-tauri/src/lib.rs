@@ -3862,6 +3862,23 @@ fn emit_agent_event<R: tauri::Runtime>(
             budget_tokens,
             ..
         } => {
+            // #1107: persist the preheat attribution before the event carries the
+            // breakdown away. The counters ride `turn:done`, which the UI
+            // overwrites next turn, so without this row nothing can say whether
+            // the 2500 B preheat budget earned its keep beyond the current turn.
+            // Best-effort, mirroring the observer-intent hop above: losing a row
+            // costs analysis fidelity, never the turn.
+            if let Some(pre) = breakdown.as_ref() {
+                if let Some(state) = app.try_state::<Arc<AppState>>() {
+                    state.store.put_turn_preheat(
+                        session_id,
+                        &message_id,
+                        pre.preheated_count.unwrap_or(0) as usize,
+                        pre.preheated_used.unwrap_or(0) as usize,
+                        pre.preheated_bytes.unwrap_or(0) as usize,
+                    );
+                }
+            }
             let _ = app.emit(
                 "turn:done",
                 TurnDoneEvent {
