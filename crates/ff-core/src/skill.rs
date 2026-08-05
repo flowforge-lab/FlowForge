@@ -15,6 +15,12 @@ use ts_rs::TS;
 
 use crate::McpServerConfig;
 
+/// The search corpora a phenotype gets when it does not name any (#552 / #1011 2b).
+///
+/// The pre-#1012 baseline — web search only. See [`Phenotype::search_sources`] for why
+/// this is neither "every registered source" nor "none".
+pub const DEFAULT_SEARCH_SOURCES: &[&str] = &["web"];
+
 /// The `SKILL.md` frontmatter. Collection fields default to empty so a minimal
 /// manifest (just `name` + `description` + `version`) deserializes cleanly.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
@@ -132,6 +138,26 @@ pub struct Phenotype {
     /// Empty contributes nothing, identical to today.
     #[serde(default)]
     pub preheat: Vec<String>,
+    /// Which search corpora this phenotype may query (#552 / #1011 2b). Source ids
+    /// ([`SearchSource::id`]), not tool names: `["web", "pubmed"]`.
+    ///
+    /// Scoping is by source rather than by tool name for the same reason [`Self::egress`]
+    /// is a policy rather than a name list — the registry asks each tool which corpus it
+    /// queries, so adding a source needs no change to this struct or the agent loop.
+    ///
+    /// `None` (the field omitted) means the **pre-#1012 baseline**: web search only.
+    /// That is deliberately not "every registered source" — PubMed is registered
+    /// globally today, so inheriting the live set would keep advertising `pubmed_search`
+    /// to every phenotype and #1012's exclusivity criterion could never be met. It is
+    /// also not "no search at all", which would silently strip web search from every
+    /// existing phenotype. Omitting the field therefore leaves behaviour exactly as it
+    /// was before source scoping existed.
+    ///
+    /// An empty `Some(vec![])` *does* mean no search — an explicit, deliberate opt-out,
+    /// distinguishable from the omission above.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub search_sources: Option<Vec<String>>,
 }
 
 #[cfg(test)]

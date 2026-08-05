@@ -786,6 +786,10 @@ impl Tool for SearchTool {
         self.source.tool_name()
     }
 
+    fn search_source_id(&self) -> Option<&str> {
+        Some(self.source.id())
+    }
+
     fn description(&self) -> &str {
         self.source.description()
     }

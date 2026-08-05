@@ -2044,10 +2044,10 @@ impl AppState {
             self.search_config.clone(),
             std::sync::Arc::new(KeychainSearchKeys),
         )));
-        // #1012: PubMed biomedical search (keyless). Registered globally for now;
-        // persona-scoping it to Erudite is tracked separately (search_sources / 2b),
-        // since per-persona tool gating doesn't exist yet. #1021: email injected from
-        // search config when set.
+        // #1012: PubMed biomedical search (keyless). Registered unconditionally -- the
+        // registry carries every source and `advertised_tools` scopes them per phenotype
+        // via `search_sources` (#1011 2b), so registration stays independent of which
+        // persona is active. #1021: email injected from search config when set.
         reg.register(Box::new(ff_tools::SearchTool::new(std::sync::Arc::new(
             ff_tools::PubMedSource::with_user_info(std::sync::Arc::new(ConfigUserInfo {
                 config: self.search_config.clone(),

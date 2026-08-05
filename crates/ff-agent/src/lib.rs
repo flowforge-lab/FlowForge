@@ -556,6 +556,18 @@ pub struct ToolContext<'a> {
     ///
     /// `None` = no deferral; every registered tool is advertised as before.
     pub tool_search: Option<&'a ToolSearchState>,
+    /// Search corpora the active phenotype may query (#552 / #1011 2b). Source ids
+    /// (`["web", "pubmed"]`), forwarded from [`ff_core::Phenotype::search_sources`].
+    ///
+    /// Distinct from [`allowed`](Self::allowed): that is a per-delegation narrowing
+    /// supplied by the caller of `agent`, whereas this is a standing property of the
+    /// phenotype. Sub-agents therefore **inherit** it, the way [`egress`](Self::egress)
+    /// is inherited — a delegated child of a biomedical persona must not silently
+    /// regain the corpora its parent was scoped away from.
+    ///
+    /// `None` = the pre-#1012 baseline, not "every source": see
+    /// [`ff_core::Phenotype::search_sources`].
+    pub search_sources: Option<Vec<String>>,
 }
 
 impl<'a> ToolContext<'a> {
@@ -584,6 +596,7 @@ impl<'a> ToolContext<'a> {
             compaction_cache: None,
             near_budget_tokens: None,
             tool_search: None,
+            search_sources: None,
         }
     }
 }
@@ -1030,6 +1043,7 @@ fn advertised_tools(
     matrix: &PermissionMatrix,
     allowed: Option<&std::collections::HashSet<String>>,
     registry: &ToolRegistry,
+    search_sources: Option<&[String]>,
     admitted: Option<&std::collections::HashSet<String>>,
 ) -> Option<std::collections::HashSet<String>> {
     // Mode pass: in Act/Auto all tools are visible (`allowed` may be None = all);
@@ -1065,6 +1079,48 @@ fn advertised_tools(
             // LocalOnly set is exactly the local tools.
             None => local,
         })
+    };
+
+    // Search-source pass (#552 / #1011 2b): drop every search tool, then re-admit only
+    // the corpora this phenotype named. Composes with the passes above by intersection,
+    // never union -- the same discipline the deferral pass documents below. A union here
+    // would let `search_sources` re-widen past Plan mode or a LocalOnly egress, turning
+    // a scoping knob into a capability-escalation bypass.
+    //
+    // `None` means the pre-#1012 baseline rather than "everything": see
+    // `Phenotype::search_sources`.
+    let permitted = {
+        let scoped: Vec<String> = match search_sources {
+            Some(ids) => ids.to_vec(),
+            None => ff_core::DEFAULT_SEARCH_SOURCES
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect(),
+        };
+        let all_search = registry.search_tool_names();
+        // Nothing to scope: keep the set untouched so a registry with no search tools
+        // stays byte-identical to pre-#1011.
+        if all_search.is_empty() {
+            permitted
+        } else {
+            let keep = registry.search_tool_names_for(&scoped);
+            match permitted {
+                Some(set) => Some(
+                    set.into_iter()
+                        .filter(|n| !all_search.contains(n) || keep.contains(n))
+                        .collect(),
+                ),
+                // Act/Auto + Open: the whole registry is visible, so materialise it and
+                // subtract the out-of-scope search tools.
+                None => Some(
+                    registry
+                        .iter_tools()
+                        .map(|t| t.name().to_string())
+                        .filter(|n| !all_search.contains(n) || keep.contains(n))
+                        .collect(),
+                ),
+            }
+        }
     };
 
     deferral_pass(registry, permitted, admitted)
@@ -1299,6 +1355,7 @@ pub async fn run_turn(
         tools.matrix,
         tools.allowed.as_ref(),
         tools.registry,
+        tools.search_sources.as_deref(),
         Some(&admitted),
     );
     // RFC 0024 Phase 2B (#1162): narrow each dispatch tool's schema to the actions
@@ -2493,13 +2550,21 @@ pub async fn run_turn(
                                 }
                             }
                         } else if !permitted {
-                            // Distinguish the two reasons a tool can be hidden so the model
+                            // Distinguish the reasons a tool can be hidden so the model
                             // gets an actionable result instead of a silent failure.
                             ff_tools::ToolOutcome::error(if tools.mode.is_plan() {
                                 format!(
                                 "tool `{}` is not available in Plan mode (read-only tools only)",
                                 call.name
                             )
+                            } else if tools.registry.search_tool_names().contains(&call.name) {
+                                // #552 / #1011 2b: a search tool the phenotype was not
+                                // granted. Without this branch it would misreport as a
+                                // sub-agent restriction even at the top level.
+                                format!(
+                                    "tool `{}` searches a corpus this phenotype is not scoped to",
+                                    call.name
+                                )
                             } else {
                                 format!("tool `{}` is not permitted for this sub-agent", call.name)
                             })
@@ -2740,6 +2805,7 @@ pub async fn run_turn(
                     tools.matrix,
                     tools.allowed.as_ref(),
                     tools.registry,
+                    tools.search_sources.as_deref(),
                     Some(&unlocked),
                 );
                 let fresh: std::collections::HashSet<String> = unlocked
@@ -2911,6 +2977,10 @@ async fn run_subagent(
         // set. Its `allowed` list still narrows the result, so a search can never
         // widen a delegation beyond what the parent granted.
         tool_search: parent.tool_search,
+        // Inherited, like `egress`: search scoping is a standing property of the
+        // phenotype, not a per-delegation grant. A child of a corpus-scoped persona must
+        // not regain the sources its parent was scoped away from.
+        search_sources: parent.search_sources.clone(),
     };
 
     // Child events are swallowed: the parent receives only the summary, never the

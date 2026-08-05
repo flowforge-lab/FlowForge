@@ -133,6 +133,7 @@ fn pheno(name: &str) -> Phenotype {
         }],
         egress: ff_core::Egress::Open,
         preheat: Vec::new(),
+        search_sources: Some(vec!["web".into(), "pubmed".into()]),
     }
 }
 
@@ -159,6 +160,7 @@ fn save_omits_name_and_none_fields() {
         mcp_servers: Vec::new(),
         egress: ff_core::Egress::Open,
         preheat: Vec::new(),
+        search_sources: None,
     };
     save_phenotype(dir.path(), &bare).unwrap();
     let body = fs::read_to_string(dir.path().join("bare.toml")).unwrap();
@@ -187,6 +189,7 @@ fn save_round_trips_preheat() {
         mcp_servers: Vec::new(),
         egress: ff_core::Egress::Open,
         preheat: vec!["memory_search".into(), "web_fetch".into()],
+        search_sources: None,
     };
     save_phenotype(dir.path(), &warm).unwrap();
     let body = fs::read_to_string(dir.path().join("warm.toml")).unwrap();
@@ -218,6 +221,7 @@ fn save_omits_empty_preheat() {
         mcp_servers: Vec::new(),
         egress: ff_core::Egress::Open,
         preheat: Vec::new(),
+        search_sources: None,
     };
     save_phenotype(dir.path(), &cold).unwrap();
     let body = fs::read_to_string(dir.path().join("cold.toml")).unwrap();
@@ -243,6 +247,7 @@ fn save_round_trips_local_only_egress() {
         mcp_servers: Vec::new(),
         egress: ff_core::Egress::LocalOnly,
         preheat: Vec::new(),
+        search_sources: None,
     };
     save_phenotype(dir.path(), &enclave).unwrap();
     let body = fs::read_to_string(dir.path().join("enclave.toml")).unwrap();
@@ -304,4 +309,117 @@ fn save_creates_missing_root_dir() {
     let root = dir.path().join("phenos");
     save_phenotype(&root, &pheno("rust")).unwrap();
     assert!(root.join("rust.toml").exists());
+}
+
+#[test]
+fn save_round_trips_search_sources() {
+    // Third instance of the `PhenotypeOut` trap that `preheat` and `egress` above were
+    // written for: that struct is a hand-written serialisation mirror, so a field added
+    // to `Phenotype` compiles cleanly here while being silently dropped on save. Caught
+    // exactly this way while implementing #1011 2b.
+    let dir = tempfile::tempdir().unwrap();
+    let scholar = Phenotype {
+        name: "scholar".into(),
+        skills: Vec::new(),
+        model: None,
+        persona: None,
+        max_iterations: None,
+        provider: None,
+        mcp_servers: Vec::new(),
+        egress: ff_core::Egress::Open,
+        preheat: Vec::new(),
+        search_sources: Some(vec!["web".into(), "pubmed".into()]),
+    };
+    save_phenotype(dir.path(), &scholar).unwrap();
+    let body = fs::read_to_string(dir.path().join("scholar.toml")).unwrap();
+    assert!(
+        body.contains("search_sources"),
+        "a scoped source list must be written: {body:?}"
+    );
+    let (map, errs) = load_phenotypes(dir.path());
+    assert!(errs.is_empty(), "{errs:?}");
+    assert_eq!(
+        map.get("scholar")
+            .expect("scholar phenotype")
+            .search_sources
+            .as_deref(),
+        Some(["web".to_string(), "pubmed".to_string()].as_slice()),
+        "search_sources must survive the save->load round-trip"
+    );
+}
+
+#[test]
+fn omitted_search_sources_stays_omitted_and_empty_survives() {
+    // `None` (baseline) and `Some(vec![])` (deliberate no-search) are different states,
+    // so neither may collapse into the other across a save->load cycle.
+    let dir = tempfile::tempdir().unwrap();
+    let mut base = pheno("baseline");
+    base.search_sources = None;
+    save_phenotype(dir.path(), &base).unwrap();
+    let body = fs::read_to_string(dir.path().join("baseline.toml")).unwrap();
+    assert!(
+        !body.contains("search_sources"),
+        "an omitted scope must not be written as an explicit list: {body:?}"
+    );
+
+    let mut off = pheno("nosearch");
+    off.search_sources = Some(Vec::new());
+    save_phenotype(dir.path(), &off).unwrap();
+
+    let (map, errs) = load_phenotypes(dir.path());
+    assert!(errs.is_empty(), "{errs:?}");
+    assert_eq!(
+        map.get("baseline").unwrap().search_sources,
+        None,
+        "omitted must load back as the baseline, not as an empty list"
+    );
+    assert_eq!(
+        map.get("nosearch").unwrap().search_sources,
+        Some(Vec::new()),
+        "an explicit opt-out must survive an edit"
+    );
+}
+
+#[test]
+fn shipped_example_phenotypes_load_cleanly() {
+    // The desktop `include_str!`s these and seeds them to disk on first run
+    // (`state.rs:1164-1166`), and `PhenotypeFile` is `deny_unknown_fields` -- so a key
+    // that this loader does not know is not a cosmetic docs error, it is a hard parse
+    // failure on a real user's first launch. Nothing else parses the shipped files back.
+    let dir = tempfile::tempdir().unwrap();
+    let examples = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../docs/examples/phenos")
+        .canonicalize()
+        .expect("shipped example phenotypes directory");
+    let mut copied = 0;
+    for entry in fs::read_dir(&examples).unwrap() {
+        let p = entry.unwrap().path();
+        if p.extension().is_some_and(|e| e == "toml") {
+            fs::copy(&p, dir.path().join(p.file_name().unwrap())).unwrap();
+            copied += 1;
+        }
+    }
+    assert!(copied >= 3, "expected the shipped examples, found {copied}");
+
+    let (map, errs) = load_phenotypes(dir.path());
+    assert!(errs.is_empty(), "shipped examples must parse: {errs:?}");
+    assert_eq!(map.len(), copied);
+
+    // Erudite is the reason `search_sources` exists (#1012): it is the persona granted
+    // the biomedical corpus.
+    let erudite = map.get("erudite").expect("erudite is shipped");
+    assert_eq!(
+        erudite.search_sources.as_deref(),
+        Some(["web".to_string(), "pubmed".to_string()].as_slice()),
+        "the shipped Erudite phenotype must grant PubMed"
+    );
+    // And the others must stay on the baseline, or #1012's exclusivity is undone.
+    for (name, p) in &map {
+        if name != "erudite" {
+            assert_eq!(
+                p.search_sources, None,
+                "{name} must stay on the baseline scope"
+            );
+        }
+    }
 }

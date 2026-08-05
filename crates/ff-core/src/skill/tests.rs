@@ -73,10 +73,14 @@ fn phenotype_round_trips() {
         mcp_servers: Vec::new(),
         egress: crate::Egress::Open,
         preheat: Vec::new(),
+        search_sources: None,
     };
     let json = serde_json::to_string(&p).unwrap();
     assert_eq!(p, serde_json::from_str(&json).unwrap());
     assert!(!json.contains("persona"));
+    // Omitted, like `persona` above -- an absent field must stay absent on the wire so
+    // it keeps meaning "baseline" rather than serialising as an explicit `null`.
+    assert!(!json.contains("searchSources"));
 }
 
 #[test]
