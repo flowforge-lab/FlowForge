@@ -75,6 +75,9 @@ Fall back to shell only when the tool genuinely cannot do it:
   format:check && pnpm build`. `format:check` is a CI step — run it, not just a
   self-chosen subset. Node/pnpm here are managed by mise
   (`~/.local/share/mise/shims`), not homebrew.
+- **Repo-wide** (from the root): `pnpm check:control-chars`. Rejects control
+  characters in tracked source — a stray one makes git treat the file as binary
+  and hides the change from review entirely (#1185). Runs in CI, takes ~0.2s.
 
 ## PR discipline
 

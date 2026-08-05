@@ -17,8 +17,6 @@
     "lint:fix": "eslint . --fix",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
-    "//check:control-chars": "Repo-wide, not just apps/desktop: a stray control byte makes git treat the file as binary, hiding the change from review (#1185). Lives here so it sits alongside the other pre-push checks.",
-    "check:control-chars": "python3 ../../scripts/check-control-chars.py --self-test && python3 ../../scripts/check-control-chars.py",
     "test": "vitest run",
     "test:watch": "vitest"
   },

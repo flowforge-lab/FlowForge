@@ -1,5 +1,7 @@
 {
 	"scripts": {
+		"//check:control-chars": "Repo-wide (Rust, TS, docs, workflows), so it lives at the root rather than under apps/desktop: a stray control byte makes git treat the file as binary and hides the change from review (#1185).",
+		"check:control-chars": "python3 scripts/check-control-chars.py --self-test && python3 scripts/check-control-chars.py",
 		"dev:mock": "pnpm -C apps/desktop run dev:mock"
 	},
 	"devDependencies": {
