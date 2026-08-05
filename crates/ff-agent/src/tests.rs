@@ -7996,3 +7996,347 @@ async fn subagent_inherits_a_scope_narrower_than_the_registry() {
     );
     assert!(child.contains(&"web_search".to_string()), "{child:?}");
 }
+
+// -- #1211: the stall detector keys on the result, not just on the call ----------
+
+/// A verifier whose result is scripted per call, so a test decides whether repeating
+/// the identical `(tool, args)` pair looks like progress or like a stall. Models an
+/// idempotent checker (`diagnostics`, `test_runner`, `cargo fmt --check`) whose
+/// arguments never vary — that invariance is what made #1211 misfire.
+struct ScriptedVerifier {
+    results: Vec<&'static str>,
+    calls: Arc<AtomicUsize>,
+}
+#[async_trait]
+impl ff_tools::Tool for ScriptedVerifier {
+    fn name(&self) -> &str {
+        "verify"
+    }
+    fn description(&self) -> &str {
+        "re-runs a check"
+    }
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({ "type": "object", "properties": {} })
+    }
+    fn safety(&self, _args: &serde_json::Value) -> Safety {
+        Safety::ReadOnly
+    }
+    async fn run(&self, _args: serde_json::Value, _root: &Path) -> ff_tools::ToolOutcome {
+        let n = self.calls.fetch_add(1, Ordering::SeqCst);
+        // Saturate on the last entry: a turn that outlives the script keeps getting a
+        // byte-identical result, which is itself the stall condition.
+        ff_tools::ToolOutcome::ok(self.results[n.min(self.results.len() - 1)])
+    }
+}
+
+/// A second read-only tool with a frozen result, used only to break adjacency.
+struct FrozenOther;
+#[async_trait]
+impl ff_tools::Tool for FrozenOther {
+    fn name(&self) -> &str {
+        "other"
+    }
+    fn description(&self) -> &str {
+        "unrelated"
+    }
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({ "type": "object", "properties": {} })
+    }
+    fn safety(&self, _args: &serde_json::Value) -> Safety {
+        Safety::ReadOnly
+    }
+    async fn run(&self, _args: serde_json::Value, _root: &Path) -> ff_tools::ToolOutcome {
+        ff_tools::ToolOutcome::ok("unchanged")
+    }
+}
+
+/// Emits one tool call per turn, cycling through `names`. With a single name the
+/// calls are consecutive; with two they alternate, so no two are ever adjacent.
+struct CyclingProvider {
+    names: Vec<&'static str>,
+    calls: Arc<AtomicUsize>,
+}
+#[async_trait]
+impl Provider for CyclingProvider {
+    async fn chat_stream(&self, _req: ChatRequest) -> Result<ChunkStream, LlmError> {
+        let n = self.calls.fetch_add(1, Ordering::SeqCst);
+        let name = self.names[n % self.names.len()];
+        Ok(Box::pin(futures_util::stream::iter(vec![Ok(Chunk {
+            tool_calls: vec![ToolCallDelta {
+                index: 0,
+                id: Some(format!("call_{n}")),
+                name: Some(name.to_string()),
+                arguments: "{}".into(),
+            }],
+            ..Default::default()
+        })])))
+    }
+}
+
+/// A genuine `Safety::Write` tool for scenario E: it really mutates the workspace
+/// (appending to a scratch file) so the write tier is exercised end to end, but the
+/// bytes it writes are ones `verify` does not report on — so the verifier's result
+/// stays byte-identical. That combination is the whole point of E: a write happened,
+/// yet nothing the model can observe changed.
+struct AppendingPatch {
+    writes: Arc<AtomicUsize>,
+}
+#[async_trait]
+impl ff_tools::Tool for AppendingPatch {
+    fn name(&self) -> &str {
+        "patch"
+    }
+    fn description(&self) -> &str {
+        "append a line to scratch.txt"
+    }
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({ "type": "object", "properties": {} })
+    }
+    fn safety(&self, _args: &serde_json::Value) -> Safety {
+        Safety::Write
+    }
+    async fn run(&self, _args: serde_json::Value, root: &Path) -> ff_tools::ToolOutcome {
+        let n = self.writes.fetch_add(1, Ordering::SeqCst);
+        let path = root.join("scratch.txt");
+        let mut existing = std::fs::read_to_string(&path).unwrap_or_default();
+        existing.push_str(&format!("patch attempt {n}\n"));
+        std::fs::write(&path, existing).expect("scratch write must succeed");
+        ff_tools::ToolOutcome::ok("patched")
+    }
+}
+
+/// Scenario C from #1211: the identical call back to back, but a different result
+/// each time — an idempotent verifier driven in the ordinary edit-then-recheck
+/// rhythm. Must NOT be a stall. Before #1211 the tally was cumulative and broke the
+/// turn on the fifth call even though all five results differed.
+///
+/// This is the regression the real trace hit: five `diagnostics` calls returning
+/// 468 -> 332 -> 125 -> 22 -> 485 bytes of compile errors.
+#[tokio::test]
+async fn changing_results_are_not_a_stall_even_when_the_calls_are_consecutive() {
+    let store = SessionStore::new();
+    let s = store.create_session(None);
+    store.add_message(&s.id, Role::User, "go".into());
+    let mut registry = ToolRegistry::new();
+    let tool_calls = Arc::new(AtomicUsize::new(0));
+    registry.register(Box::new(ScriptedVerifier {
+        results: vec!["errors: 5", "errors: 3", "errors: 1", "clean", "errors: 2"],
+        calls: tool_calls.clone(),
+    }));
+    let root = std::env::current_dir().unwrap();
+    let approve = AlwaysApprove;
+    let calls = Arc::new(AtomicUsize::new(0));
+
+    // Exactly as many iterations as scripted results: `ScriptedVerifier` saturates on
+    // its last entry, so a larger cap would add byte-identical repeats that stall the
+    // turn on their own and mask what this test is about. Five calls is also >=
+    // REPEAT_BREAK_AT, so the old cumulative tally did break here.
+    let tools = ToolContext::new(&registry, &root, &approve, 5, &TEST_MATRIX);
+    let msg = run_turn(
+        &CyclingProvider {
+            names: vec!["verify"],
+            calls: calls.clone(),
+        },
+        &store,
+        &tools,
+        &s.id,
+        "mock",
+        None,
+        false,
+        ReasoningVisibility::All,
+        CancelToken::new(),
+        |_| {},
+    )
+    .await
+    .unwrap();
+
+    assert_ne!(
+        msg.content,
+        StopReason::Stall.marker(),
+        "a repeat whose result changes every time is progress, not a stall"
+    );
+    // And it really did repeat past the old break threshold, so the test would have
+    // failed before the fix rather than passing vacuously.
+    assert!(
+        tool_calls.load(Ordering::SeqCst) >= REPEAT_BREAK_AT,
+        "expected >= {REPEAT_BREAK_AT} verifier calls, got {}",
+        tool_calls.load(Ordering::SeqCst)
+    );
+}
+
+/// Scenario D from #1211: two tools alternating, so no two `verify` calls are
+/// adjacent, and every result is frozen. That is a real stall and must still break.
+/// This is the case an adjacency-only reset would have let spin to the cap, which is
+/// why the fix keys on the result instead.
+#[tokio::test]
+async fn frozen_results_still_stall_when_another_tool_is_interleaved() {
+    let store = SessionStore::new();
+    let s = store.create_session(None);
+    store.add_message(&s.id, Role::User, "go".into());
+    let mut registry = ToolRegistry::new();
+    let tool_calls = Arc::new(AtomicUsize::new(0));
+    registry.register(Box::new(ScriptedVerifier {
+        results: vec!["errors: 5"], // saturates -> byte-identical forever
+        calls: tool_calls.clone(),
+    }));
+    registry.register(Box::new(FrozenOther));
+    let root = std::env::current_dir().unwrap();
+    let approve = AlwaysApprove;
+    let calls = Arc::new(AtomicUsize::new(0));
+
+    // Generous cap so the guard, not the cap, is what stops the turn.
+    let tools = ToolContext::new(&registry, &root, &approve, 40, &TEST_MATRIX);
+    let msg = run_turn(
+        &CyclingProvider {
+            names: vec!["verify", "other"],
+            calls: calls.clone(),
+        },
+        &store,
+        &tools,
+        &s.id,
+        "mock",
+        None,
+        false,
+        ReasoningVisibility::All,
+        CancelToken::new(),
+        |_| {},
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        msg.content,
+        StopReason::Stall.marker(),
+        "interleaving another tool must not hide a stall when both results are frozen"
+    );
+}
+
+/// Scenario E from #1211: a write-tier call lands between the checks but the check's
+/// result is byte-identical — the patch fixed nothing. This is why "a write happened"
+/// is deliberately not treated as progress; only a changed result is.
+///
+/// The interleaved tool is a real `Safety::Write` tool that genuinely mutates the
+/// workspace, and the test asserts it ran. An earlier version of this test used the
+/// read-only `FrozenOther`, which made it a rename of the scenario-D test and left
+/// E's actual property — *a write is not progress* — unexercised.
+#[tokio::test]
+async fn a_write_between_identical_results_is_not_progress() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = SessionStore::new();
+    let s = store.create_session(None);
+    store.add_message(&s.id, Role::User, "go".into());
+    let mut registry = ToolRegistry::new();
+    let tool_calls = Arc::new(AtomicUsize::new(0));
+    let writes = Arc::new(AtomicUsize::new(0));
+    registry.register(Box::new(ScriptedVerifier {
+        results: vec!["errors: 5"], // the patch changed nothing
+        calls: tool_calls.clone(),
+    }));
+    registry.register(Box::new(AppendingPatch {
+        writes: writes.clone(),
+    }));
+    let root = dir.path().to_path_buf();
+    let approve = AlwaysApprove;
+    let calls = Arc::new(AtomicUsize::new(0));
+
+    let tools = ToolContext::new(&registry, &root, &approve, 40, &TEST_MATRIX);
+    let msg = run_turn(
+        &CyclingProvider {
+            names: vec!["verify", "patch"],
+            calls: calls.clone(),
+        },
+        &store,
+        &tools,
+        &s.id,
+        "mock",
+        None,
+        false,
+        ReasoningVisibility::All,
+        CancelToken::new(),
+        |_| {},
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        msg.content,
+        StopReason::Stall.marker(),
+        "a mutation that does not change the check's result is not progress"
+    );
+    // The write tier really executed — without this the test would pass even if the
+    // interleaved tool were read-only, which is exactly how it originally regressed.
+    assert!(
+        writes.load(Ordering::SeqCst) > 0,
+        "the write-tier tool must actually have run for this to be scenario E"
+    );
+    let scratch = std::fs::read_to_string(dir.path().join("scratch.txt"))
+        .expect("the write must have hit the filesystem");
+    assert!(
+        scratch.contains("patch attempt 0"),
+        "the mutation must be observable on disk, got {scratch:?}"
+    );
+}
+
+/// The hash has to be taken from what the model actually sees, not from the raw
+/// `outcome.content` (#1211). A result over `TOOL_RESULT_MAX_BYTES` is truncated to
+/// head+tail, so two oversized results differing only in the discarded middle reach
+/// the model byte-identical — the model cannot tell them apart, so they must count as
+/// a stall. Hashing the raw content instead would see two distinct values and reset
+/// the run forever, turning the guard off for any tool with a large result.
+#[tokio::test]
+async fn oversized_results_hash_on_what_the_model_sees_not_the_raw_content() {
+    let store = SessionStore::new();
+    let s = store.create_session(None);
+    store.add_message(&s.id, Role::User, "go".into());
+    let mut registry = ToolRegistry::new();
+    let tool_calls = Arc::new(AtomicUsize::new(0));
+    // Head and tail are identical and each over the 4 KiB half-budget; only the
+    // middle -- the part truncation drops -- differs between calls.
+    let head = "H".repeat(6 * 1024);
+    let tail = "T".repeat(6 * 1024);
+    let bodies: Vec<&'static str> = vec![
+        Box::leak(format!("{head}MIDDLE-ONE{tail}").into_boxed_str()),
+        Box::leak(format!("{head}MIDDLE-TWO{tail}").into_boxed_str()),
+        Box::leak(format!("{head}MIDDLE-THREE{tail}").into_boxed_str()),
+        Box::leak(format!("{head}MIDDLE-FOUR{tail}").into_boxed_str()),
+        Box::leak(format!("{head}MIDDLE-FIVE{tail}").into_boxed_str()),
+    ];
+    registry.register(Box::new(ScriptedVerifier {
+        results: bodies,
+        calls: tool_calls.clone(),
+    }));
+    let root = std::env::current_dir().unwrap();
+    let approve = AlwaysApprove;
+    let calls = Arc::new(AtomicUsize::new(0));
+
+    // Exactly as many iterations as there are scripted results. `ScriptedVerifier`
+    // saturates on its last entry, and a longer cap would let those saturated repeats
+    // stall the turn on their own -- making this pass for a reason that has nothing to
+    // do with the hash under test. Verified: with a cap of 40 this test passes even
+    // when the hash is taken from the raw content.
+    let tools = ToolContext::new(&registry, &root, &approve, 5, &TEST_MATRIX);
+    let msg = run_turn(
+        &CyclingProvider {
+            names: vec!["verify"],
+            calls: calls.clone(),
+        },
+        &store,
+        &tools,
+        &s.id,
+        "mock",
+        None,
+        false,
+        ReasoningVisibility::All,
+        CancelToken::new(),
+        |_| {},
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        msg.content,
+        StopReason::Stall.marker(),
+        "results the model receives byte-identical must stall even though the raw \
+         contents differ"
+    );
+}
