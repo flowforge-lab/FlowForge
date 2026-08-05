@@ -238,7 +238,8 @@ fn default_provider_desc_names_the_url_from_the_error() {
 
 /// Regression: a provider selected in the GUI (active in provider-registry.json)
 /// must take effect in `load_provider()`. Write a registry with `ollama` active
-/// and verify the returned provider kind matches.
+/// and a *differing* legacy `provider.json`, then verify the (registry) model
+/// wins — proving registry beats legacy, which is the entire point of #1199.
 #[test]
 fn registry_active_connection_wins() {
     let env = crate::test_support::TestEnv::new();
@@ -270,6 +271,15 @@ fn registry_active_connection_wins() {
         schema_version: 0,
     };
     env.write_registry(&registry);
+    // A legacy provider.json is present *and* differs. If the registry
+    // is preferred (the fix for #1199) the model below is qwen3.6:35b-a3b;
+    // if legacy is preferred the model is LEGACY-MUST-NOT-WIN. Either way
+    // the assertion fails on the wrong answer, not a silent fallback.
+    fs::write(
+        env.legacy_path(),
+        r#"{"kind":"ollama","model":"LEGACY-MUST-NOT-WIN","hasKey":false}"#,
+    )
+    .unwrap();
 
     let (_provider, model) = load_provider();
 

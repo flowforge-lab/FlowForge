@@ -146,9 +146,11 @@ fn build_provider(config: &ProviderConfig) -> Box<dyn Provider> {
                 .with_kind(config.kind),
         ),
         ProviderKind::Bedrock => Box::new(build_bedrock_provider(config, documents)),
-        // The CLI has no keychain, so a hosted OpenAI key comes from the
+        // Legacy `provider.json` carries no connection id, so there is nothing
+        // to look up in the keychain: a hosted OpenAI key comes from the
         // OPENAI_API_KEY env var (absent or empty => keyless, for OpenAI-compatible
-        // local gateways that need none).
+        // local gateways that need none). The registry path resolves the keyring
+        // in `build_provider_from_connection`.
         ProviderKind::OpenAi => Box::new(
             OpenAiProvider::new(base_url, api_key_from_env("OPENAI_API_KEY"))
                 .with_documents(documents)
@@ -158,9 +160,11 @@ fn build_provider(config: &ProviderConfig) -> Box<dyn Provider> {
                 // correctly when the phenotype is `egress = local-only`.
                 .with_kind(config.kind),
         ),
-        // SiliconFlow is OpenAI-compatible. The CLI has no keychain, so the bearer
-        // key comes from SILICONFLOW_API_KEY (empty/unset = anonymous, which the
-        // hosted endpoint will reject -- the same env-var pattern as Bedrock above).
+        // SiliconFlow is OpenAI-compatible. Same as the OpenAI arm: the legacy
+        // `provider.json` path carries no connection id to look up in the
+        // keychain, so the bearer key comes from SILICONFLOW_API_KEY (empty/unset
+        // = anonymous, which the hosted endpoint will reject -- the same env-var
+        // pattern as the legacy Bedrock path above).
         ProviderKind::SiliconFlow => {
             let key = std::env::var("SILICONFLOW_API_KEY")
                 .ok()
@@ -311,9 +315,11 @@ fn api_key_from_env_or_keyring(conn: &ProviderConnection, env_var: &str) -> Opti
 /// call — without `with_reasoning_effort`, per-step thinking is invisible through
 /// `flowforge run` (same bug surface as desktop #426 acceptance).
 fn build_bedrock_provider(config: &ProviderConfig, documents: bool) -> BedrockProvider {
-    // The CLI has no keychain or connection registry, so Bedrock here uses the
-    // standard AWS credential chain: a bearer token from AWS_BEARER_TOKEN_BEDROCK
-    // when set, otherwise a named profile (AWS_PROFILE, default "default").
+    // Legacy `provider.json` carries no connection id, so there is nothing to
+    // look up in the keychain: Bedrock here uses the standard AWS credential
+    // chain — a bearer token from AWS_BEARER_TOKEN_BEDROCK when set, otherwise
+    // a named profile (AWS_PROFILE, default "default"). The registry path
+    // resolves the keyring in `build_provider_from_connection`.
     let region = std::env::var("AWS_REGION")
         .or_else(|_| std::env::var("AWS_DEFAULT_REGION"))
         .unwrap_or_else(|_| "us-east-1".to_string());
