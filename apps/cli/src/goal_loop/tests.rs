@@ -78,3 +78,43 @@ fn goal_continue_nudge_does_not_inline_the_objective() {
         "nudge must be a static string, not an objective-interpolating format"
     );
 }
+
+/// The CLI had two divergent copies of `build_registry_with_memory` — `main.rs`'s
+/// (used by `run`/`chat`/`serve`) and `goal_loop.rs`'s — and they drifted: goal mode
+/// was missing PubMed search and all three memory tools, while `run` was missing
+/// `goal_complete`. Divergence here is invisible at compile time and shows up only as
+/// "why can't the agent recall anything in goal mode", so pin the two toolsets as
+/// equal rather than trusting that a future edit touches both copies (#1207).
+///
+/// With the copies merged there is no longer a second function to compare against, so
+/// the guard is now on the *contents* of the single seam: it asserts the union that the
+/// merge produced. Comparing the seam to itself would pass unconditionally and pin
+/// nothing — the union is what a future edit could silently shrink.
+#[tokio::test]
+async fn the_shared_registry_seam_carries_every_previously_forked_tool() {
+    let (registry, _memory, index) = crate::build_registry_with_memory().await;
+
+    // `goal_complete` was present only in goal mode's copy; `pubmed_search` only in
+    // `main.rs`'s. Every CLI path must now see both.
+    for tool in ["goal_complete", "pubmed_search", "web_search"] {
+        assert!(
+            registry.get(tool).is_some(),
+            "the shared registry seam is missing `{tool}`; before #1207 the CLI had two \
+             divergent copies and each was missing some of these"
+        );
+    }
+
+    // The memory trio is registered only when the FTS5 index opens, so it is asserted
+    // against that condition rather than unconditionally — an unconditional assert would
+    // fail in a sandbox with no writable memory root, which is a harness artefact and not
+    // the fork this test guards.
+    if index.is_some() {
+        for tool in ["memory_search", "memory_get", "memory_write"] {
+            assert!(
+                registry.get(tool).is_some(),
+                "the index opened, so `{tool}` must be registered; goal mode's old \
+                 registry copy omitted the memory trio entirely"
+            );
+        }
+    }
+}

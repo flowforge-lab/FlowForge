@@ -11,6 +11,7 @@ mod goal;
 mod goal_loop;
 mod host;
 mod json_events;
+mod mcp_host;
 mod memory;
 mod registry;
 mod secrets;
@@ -468,10 +469,69 @@ impl ff_tools::SearchKeyProvider for KeychainSearchKeys {
     }
 }
 
-/// Shared durable-memory setup (RFC 0006). Builds the store + FTS5 index, does a
-/// full reindex from disk, and registers the three memory tools. Best-effort: an
-/// index failure leaves the ambient block working but skips the recall tools.
-fn build_registry_with_memory() -> (
+/// The CLI's single tool-registry seam, shared by `run`, `chat`, `serve`, and `goal`.
+///
+/// Includes the durable-memory setup (RFC 0006): builds the store + FTS5 index, does a
+/// full reindex from disk, and registers the three memory tools. Best-effort — an index
+/// failure leaves the ambient block working but skips the recall tools.
+///
+/// There used to be a second copy in `goal_loop.rs`, and the two drifted: goal mode
+/// silently lacked PubMed search and all three memory tools, while `run` lacked
+/// `goal_complete`. Nothing caught it, because a missing tool is not a type error —
+/// it just makes the agent quietly less capable on one path. Keep this the only
+/// construction site; `goal_and_run_registries_expose_the_same_toolset` pins it (#1207).
+pub(crate) async fn build_registry_with_memory() -> (
+    ff_tools::ToolRegistry,
+    std::sync::Arc<ff_memory::Memory>,
+    Option<std::sync::Arc<dyn ff_memory::MemoryIndex>>,
+) {
+    // No MCP host is stood up on this path at all. Delegating to
+    // `build_registry_with_mcp` and dropping its guard here would be worse than
+    // useless: the servers would be killed the moment this function returned, leaving
+    // the caller advertising MCP tools whose transports are already dead.
+    build_base_registry()
+}
+
+/// As [`build_registry_with_memory`], but also returns the MCP server guidance that
+/// belongs with the bridged tools (#1173). Callers that build a system prompt want this
+/// one: handing a model an MCP tool while withholding its server's usage instructions is
+/// the exact failure that guidance injection exists to prevent.
+pub(crate) async fn build_registry_with_mcp() -> (
+    ff_tools::ToolRegistry,
+    std::sync::Arc<ff_memory::Memory>,
+    Option<std::sync::Arc<dyn ff_memory::MemoryIndex>>,
+    Vec<ff_agent::McpGuidance>,
+    Option<mcp_host::McpTeardown>,
+) {
+    let (mut registry, memory_store, memory_index) = build_base_registry();
+    // MCP servers from `~/.flowforge/mcp.json` — the same file the desktop watches
+    // (#1207). Fail-soft: no config, or an unreachable server, leaves the rest of the
+    // toolset untouched. Deferred servers are skipped with a warning; see `mcp_host`.
+    // The guard is returned to the caller rather than dropped here: dropping it at the end
+    // of this function would stop every server before the first tool call.
+    let (mcp_guidance, mcp_teardown) = match mcp_host::init() {
+        Some((handle, awaited)) => {
+            mcp_host::bridge_into(&handle, &mut registry, &host::workspace_root(), awaited).await;
+            let guidance = mcp_host::guidance(&handle);
+            (guidance, Some(mcp_host::McpTeardown::new(handle)))
+        }
+        None => (Vec::new(), None),
+    };
+    (
+        registry,
+        memory_store,
+        memory_index,
+        mcp_guidance,
+        mcp_teardown,
+    )
+}
+
+/// Every non-MCP tool the CLI registers, plus the durable-memory store and index.
+///
+/// The single construction site both registry seams delegate to, so the MCP and
+/// non-MCP paths cannot drift apart in what they register — the drift that made
+/// goal mode quietly lose PubMed and the memory tools in the first place.
+fn build_base_registry() -> (
     ff_tools::ToolRegistry,
     std::sync::Arc<ff_memory::Memory>,
     Option<std::sync::Arc<dyn ff_memory::MemoryIndex>>,
@@ -485,6 +545,10 @@ fn build_registry_with_memory() -> (
     registry.register(Box::new(ff_tools::SearchTool::new(std::sync::Arc::new(
         ff_tools::PubMedSource::new(),
     ))));
+    // Goal-mode completion signal (RFC 0020 S7, #716): a ReadOnly tool the agent calls
+    // when the objective is met. Registered on every path — harmless outside goal mode,
+    // and its absence is what made the two registry copies diverge.
+    registry.register(Box::new(ff_tools::GoalCompleteTool));
     let (memory_store, memory_index) = build_memory_store();
     if let Some(index) = &memory_index {
         registry.register(Box::new(ff_tools::memory::MemorySearchTool::new(
@@ -509,7 +573,7 @@ fn build_registry_with_memory() -> (
 /// and the ambient block degrades to unfiltered). Shared by
 /// [`build_registry_with_memory`] and the `ff memory` subcommands (#1081) so
 /// there is exactly one store+index construction seam in the CLI.
-fn build_memory_store() -> (
+pub(crate) fn build_memory_store() -> (
     std::sync::Arc<ff_memory::Memory>,
     Option<std::sync::Arc<dyn ff_memory::MemoryIndex>>,
 ) {
@@ -540,7 +604,10 @@ async fn run(
     let skills = host::load_skills();
     let workspace = host::workspace_root();
     let store = std::sync::Arc::new(host::build_session_store(ephemeral));
-    let (mut registry, memory_store, memory_index) = build_registry_with_memory();
+    // `_mcp_teardown` must stay bound for the whole function: dropping it stops every MCP
+    // server, so an `_`-discard here would kill them before the first tool call.
+    let (mut registry, memory_store, memory_index, mcp_guidance, _mcp_teardown) =
+        build_registry_with_mcp().await;
     registry.register(Box::new(ff_tools::CompactionRetrieveTool::new(
         store.clone(),
     )));
@@ -591,7 +658,7 @@ async fn run(
         extra_instructions: None,
         goal: None,
         mode,
-        mcp_guidance: &[],
+        mcp_guidance: &mcp_guidance,
     });
 
     let matrix = PermissionMatrix::default();
@@ -692,7 +759,13 @@ async fn chat(
     let skills = host::load_skills();
     let workspace = host::workspace_root();
     let store = std::sync::Arc::new(host::build_session_store(ephemeral));
-    let (mut registry, memory_store, memory_index) = build_registry_with_memory();
+    // Deliberately the non-MCP builder: `chat` never applies a phenotype's `egress`
+    // (it has no `--pheno` flag at all), and a bridged MCP tool defaults to
+    // `reaches_network = true`, stripped only by a `LocalOnly` egress. Handing `chat` MCP
+    // tools before that gate exists would be a security regression, not a feature, so the
+    // wiring belongs with the phenotype plumbing in #1208 — which owns flipping this one
+    // call site to `build_registry_with_mcp()`.
+    let (mut registry, memory_store, memory_index) = build_registry_with_memory().await;
     registry.register(Box::new(ff_tools::CompactionRetrieveTool::new(
         store.clone(),
     )));
@@ -740,6 +813,8 @@ async fn chat(
         &session_id,
         json,
         mode,
+        // Empty until #1208 puts `chat` on the MCP seam; see the registry comment above.
+        &[],
         stdin.lock(),
     )
     .await
@@ -759,6 +834,7 @@ async fn chat_repl(
     session_id: &str,
     json: bool,
     mode: Mode,
+    mcp_guidance: &[ff_agent::McpGuidance],
     mut input: impl BufRead,
 ) -> ExitCode {
     if !json {
@@ -812,7 +888,7 @@ async fn chat_repl(
             extra_instructions: None,
             goal: None,
             mode,
-            mcp_guidance: &[],
+            mcp_guidance,
         });
 
         let cancel = CancelToken::new();

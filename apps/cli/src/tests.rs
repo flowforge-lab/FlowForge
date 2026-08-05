@@ -259,6 +259,7 @@ async fn chat_multi_turn_context_persists() {
         &session.id,
         false,
         ff_core::Mode::Auto,
+        &[],
         input,
     )
     .await;
@@ -324,6 +325,7 @@ async fn chat_exits_cleanly_on_eof() {
         &session.id,
         false,
         ff_core::Mode::Auto,
+        &[],
         Cursor::new(b""),
     )
     .await;
@@ -362,6 +364,7 @@ async fn chat_exits_cleanly_on_exit_command() {
             &session.id,
             false,
             ff_core::Mode::Auto,
+            &[],
             Cursor::new(cmd.as_bytes()),
         )
         .await;
@@ -520,12 +523,89 @@ fn pheno_rust_full_acceptance() {
     assert_eq!(active, vec!["cargo-check", "clippy", "extra"]);
 }
 
-#[test]
-fn cli_registry_includes_web_search() {
-    let (registry, _memory, _index) = build_registry_with_memory();
+#[tokio::test]
+async fn cli_registry_includes_web_search() {
+    let (registry, _memory, _index) = build_registry_with_memory().await;
     assert!(
         registry.get("web_search").is_some(),
         "web_search must be registered in the CLI tool registry (#241)"
+    );
+}
+
+/// The two registry seams must register the same non-MCP toolset (#1207).
+///
+/// Regression guard for the drift that lost goal mode PubMed and the memory tools:
+/// both seams now delegate to one `build_base_registry`, and this fails the moment
+/// either grows a tool the other lacks.
+#[tokio::test]
+async fn both_registry_seams_register_the_same_base_toolset() {
+    let (plain, _m, _i) = build_registry_with_memory().await;
+    let (with_mcp, _m2, _i2, _g, _teardown) = super::build_registry_with_mcp().await;
+
+    let base: Vec<String> = plain.iter_tools().map(|t| t.name().to_string()).collect();
+    let mcp_names: Vec<String> = with_mcp
+        .iter_tools()
+        .map(|t| t.name().to_string())
+        .collect();
+    for name in &base {
+        assert!(
+            mcp_names.iter().any(|n| n == name),
+            "`{name}` is registered by build_registry_with_memory but missing from \
+             build_registry_with_mcp — the two seams have drifted (#1207)"
+        );
+    }
+    // The MCP seam may add bridged `mcp__*` tools, but must add nothing else.
+    for name in &mcp_names {
+        assert!(
+            base.contains(name) || name.starts_with("mcp__"),
+            "build_registry_with_mcp registers `{name}`, which the plain seam lacks and \
+             which is not an MCP-bridged tool — move it into build_base_registry (#1207)"
+        );
+    }
+}
+
+/// The non-MCP seam must not stand up an MCP host at all (#1207).
+///
+/// It once delegated to the MCP seam and dropped the teardown guard on return, which
+/// killed every server the instant the function exited — so any bridged tool it
+/// advertised had a dead transport behind it.
+///
+/// Pinned at the source level, not by inspecting a built registry: whether any
+/// `mcp__*` tool appears at runtime depends on the developer's `~/.flowforge/mcp.json`,
+/// and CI has none — so a runtime assertion passes vacuously there and on any machine
+/// whose servers are all `defer`red. This reads the one line that actually encodes the
+/// decision, following the `include_str!` capability pin in the desktop crate.
+#[test]
+fn plain_registry_seam_does_not_stand_up_an_mcp_host() {
+    let src = include_str!("main.rs");
+    let body = src
+        .split_once("pub(crate) async fn build_registry_with_memory()")
+        .expect("build_registry_with_memory is defined in main.rs")
+        .1;
+    let body = body
+        .split_once("\nfn ")
+        .map(|(b, _)| b)
+        .unwrap_or(body)
+        .split_once("\npub(crate) ")
+        .map(|(b, _)| b)
+        .unwrap_or(body);
+    // Comments must be stripped before matching: the function's own comment explains why
+    // it must not call `build_registry_with_mcp`, and would satisfy the check by itself.
+    let body: String = body
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        !body.contains("build_registry_with_mcp"),
+        "build_registry_with_memory must not call build_registry_with_mcp: its teardown \
+         guard would drop on return and stop every MCP server, leaving the caller with \
+         dead bridged tools. Delegate to build_base_registry instead (#1207)."
+    );
+    assert!(
+        body.contains("build_base_registry"),
+        "build_registry_with_memory must delegate to build_base_registry so the two \
+         registry seams cannot drift in what they register (#1207)."
     );
 }
 
@@ -807,6 +887,7 @@ async fn chat_persists_across_reopen_and_resume() {
             &session_id,
             false,
             ff_core::Mode::Auto,
+            &[],
             Cursor::new(b"first question\nexit\n"),
         )
         .await;
@@ -852,6 +933,7 @@ async fn chat_persists_across_reopen_and_resume() {
         &session_id, // resume the same session
         false,
         ff_core::Mode::Auto,
+        &[],
         Cursor::new(b"second question\nexit\n"),
     )
     .await;

@@ -275,7 +275,9 @@ async fn serve(args: ServeArgs) -> Result<(), String> {
         PermissionMatrix::default(),
     )?;
 
-    let mut router = build_router(mode);
+    // The teardown guard is held for the whole serve loop: dropping it earlier would
+    // stop the MCP servers out from under in-flight turns (#1207).
+    let (mut router, _mcp_teardown) = build_router(mode).await;
 
     eprintln!(
         "serving Slack channel {} in {mode:?} mode for {} allowlisted user(s)",
@@ -315,12 +317,13 @@ fn channel_map() -> ChannelMap {
 /// Assemble the [`Router`] from the same seams the other headless entry points
 /// use, so `serve` cannot drift from `flowforge run` on provider, tools or
 /// session storage.
-fn build_router(mode: ff_core::Mode) -> Router {
+async fn build_router(mode: ff_core::Mode) -> (Router, Option<crate::mcp_host::McpTeardown>) {
     let (provider, model) = host::load_provider();
     let store = host::build_session_store(false);
-    let (registry, _memory, _keys) = crate::build_registry_with_memory();
+    let (registry, _memory, _keys, _guidance, mcp_teardown) =
+        crate::build_registry_with_mcp().await;
 
-    Router::new(
+    let router = Router::new(
         RouterConfig {
             mode,
             workspace: host::workspace_root(),
@@ -331,7 +334,8 @@ fn build_router(mode: ff_core::Mode) -> Router {
         Arc::new(store),
         Arc::new(registry),
         Arc::from(provider),
-    )
+    );
+    (router, mcp_teardown)
 }
 
 #[cfg(test)]

@@ -117,7 +117,7 @@ async fn goal_start(
         }
     });
 
-    let iter = CliGoalIteration::with_cancel(Some(cancel));
+    let iter = CliGoalIteration::with_cancel(Some(cancel)).await;
 
     eprintln!("Starting goal: {}", objective);
     eprintln!("Session: {}", session_id);
@@ -226,7 +226,7 @@ async fn goal_resume(session: String) -> ExitCode {
         }
     });
 
-    let iter = CliGoalIteration::with_cancel(Some(cancel));
+    let iter = CliGoalIteration::with_cancel(Some(cancel)).await;
 
     eprintln!("Resuming goal: {}", goal.objective);
 

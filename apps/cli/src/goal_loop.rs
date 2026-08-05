@@ -25,18 +25,25 @@ pub struct CliGoalIteration {
     default_model: String,
     session_store: std::sync::Arc<SessionStore>,
     registry: ff_tools::ToolRegistry,
+    /// Usage instructions for the MCP servers whose tools are in `registry` (#1173).
+    mcp_guidance: Vec<ff_agent::McpGuidance>,
+    /// Stops the MCP servers when this iteration is dropped. Held here so the servers
+    /// outlive every turn that routes through `registry`, and are reaped even on the
+    /// error paths (#1207).
+    _mcp_teardown: Option<crate::mcp_host::McpTeardown>,
     workspace: PathBuf,
     cancel_token: Option<CancelToken>,
     goal_store: GoalStore,
 }
 
 impl CliGoalIteration {
-    pub fn with_cancel(cancel_token: Option<CancelToken>) -> Self {
+    pub async fn with_cancel(cancel_token: Option<CancelToken>) -> Self {
         let (provider, default_model) = host::load_provider();
         let workspace = host::workspace_root();
         let store = std::sync::Arc::new(SessionStore::new());
 
-        let (mut registry, _memory_store, _memory_index) = build_registry_with_memory();
+        let (mut registry, _memory_store, _memory_index, mcp_guidance, mcp_teardown) =
+            crate::build_registry_with_mcp().await;
         registry.register(Box::new(ff_tools::CompactionRetrieveTool::new(
             store.clone(),
         )));
@@ -46,6 +53,8 @@ impl CliGoalIteration {
             default_model,
             session_store: store,
             registry,
+            mcp_guidance,
+            _mcp_teardown: mcp_teardown,
             workspace,
             cancel_token,
             goal_store: GoalStore::new(ff_core::goal_store_dir()),
@@ -138,7 +147,7 @@ impl GoalIteration for CliGoalIteration {
         );
         let user_ctx = UserContext::now().with_working_dir(tool_ctx.root.display().to_string());
 
-        let (memory_store, memory_index) = build_memory_store_for_iteration();
+        let (memory_store, memory_index) = crate::build_memory_store();
         let (memory, _ambient_keys) = match memory_index {
             Some(idx) => memory_store.ambient_block_filtered_keyed(idx.as_ref()),
             None => (memory_store.ambient_block(), Vec::new()),
@@ -153,7 +162,7 @@ impl GoalIteration for CliGoalIteration {
             extra_instructions: None,
             goal: Some(goal),
             mode: Mode::Auto,
-            mcp_guidance: &[],
+            mcp_guidance: &self.mcp_guidance,
         });
 
         let cancel = self.cancel_token.clone().unwrap_or_default();
@@ -240,48 +249,6 @@ impl GoalIteration for CliGoalIteration {
     fn now_ms(&self) -> i64 {
         Local::now().timestamp_millis()
     }
-}
-
-pub fn build_registry_with_memory() -> (
-    ff_tools::ToolRegistry,
-    std::sync::Arc<ff_memory::Memory>,
-    Option<std::sync::Arc<dyn ff_memory::MemoryIndex>>,
-) {
-    let mut registry = ff_tools::ToolRegistry::with_defaults();
-    registry.register(Box::new(ff_tools::WebSearchTool::with_keys(
-        std::sync::Arc::new(std::sync::Mutex::new(crate::load_search_config())),
-        std::sync::Arc::new(crate::KeychainSearchKeys),
-    )));
-    // Goal-mode completion signal (RFC 0020 S7, #716): a ReadOnly tool the agent
-    // calls when the objective is met. Always registered so a goal can complete.
-    registry.register(Box::new(ff_tools::GoalCompleteTool));
-
-    let memory_store = std::sync::Arc::new(ff_memory::Memory::with_default_root(
-        ff_memory::MemoryConfig::default(),
-    ));
-    let mut memory_index: Option<std::sync::Arc<dyn ff_memory::MemoryIndex>> = None;
-    if let Ok(index) = ff_memory::Fts5Index::open(memory_store.index_path()) {
-        let index: std::sync::Arc<dyn ff_memory::MemoryIndex> = std::sync::Arc::new(index);
-        let _ = ff_memory::MemoryIndex::reindex(index.as_ref(), &memory_store.all_chunks());
-        memory_index = Some(index);
-    }
-    (registry, memory_store, memory_index)
-}
-
-fn build_memory_store_for_iteration() -> (
-    std::sync::Arc<ff_memory::Memory>,
-    Option<std::sync::Arc<dyn ff_memory::MemoryIndex>>,
-) {
-    let memory_store = std::sync::Arc::new(ff_memory::Memory::with_default_root(
-        ff_memory::MemoryConfig::default(),
-    ));
-    let mut memory_index: Option<std::sync::Arc<dyn ff_memory::MemoryIndex>> = None;
-    if let Ok(index) = ff_memory::Fts5Index::open(memory_store.index_path()) {
-        let index: std::sync::Arc<dyn ff_memory::MemoryIndex> = std::sync::Arc::new(index);
-        let _ = ff_memory::MemoryIndex::reindex(index.as_ref(), &memory_store.all_chunks());
-        memory_index = Some(index);
-    }
-    (memory_store, memory_index)
 }
 
 #[cfg(test)]

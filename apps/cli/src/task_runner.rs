@@ -14,17 +14,21 @@ pub struct CliTaskRunner {
     default_model: String,
     session_store: Arc<ff_session::SessionStore>,
     registry: ff_tools::ToolRegistry,
+    /// Usage instructions for the MCP servers whose tools are in `registry` (#1173).
+    mcp_guidance: Vec<ff_agent::McpGuidance>,
+    /// Stops the MCP servers when this runner is dropped; see `CliGoalIteration` (#1207).
+    _mcp_teardown: Option<crate::mcp_host::McpTeardown>,
     workspace: std::path::PathBuf,
 }
 
 impl CliTaskRunner {
-    pub fn new() -> Self {
+    pub async fn new() -> Self {
         let (provider, default_model) = host::load_provider();
         let workspace = host::workspace_root();
         let store = Arc::new(ff_session::SessionStore::new());
 
-        let (mut registry, _memory_store, _memory_index) =
-            crate::goal_loop::build_registry_with_memory();
+        let (mut registry, _memory_store, _memory_index, mcp_guidance, mcp_teardown) =
+            crate::build_registry_with_mcp().await;
         registry.register(Box::new(ff_tools::CompactionRetrieveTool::new(
             store.clone(),
         )));
@@ -34,6 +38,8 @@ impl CliTaskRunner {
             default_model,
             session_store: store,
             registry,
+            mcp_guidance,
+            _mcp_teardown: mcp_teardown,
             workspace,
         }
     }
@@ -82,7 +88,7 @@ impl TaskRunner for CliTaskRunner {
             extra_instructions: None,
             goal: None,
             mode: ff_core::Mode::Auto,
-            mcp_guidance: &[],
+            mcp_guidance: &self.mcp_guidance,
         });
 
         let cancel = CancelToken::new();
