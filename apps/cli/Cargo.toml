@@ -18,6 +18,7 @@ ff-scheduled = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
 ff-memory = { workspace = true }
+ff-mcp = { workspace = true }
 ff-session = { workspace = true }
 ff-skills = { workspace = true }
 ff-tools = { workspace = true }

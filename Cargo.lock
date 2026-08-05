@@ -1939,6 +1939,7 @@ dependencies = [
  "ff-core",
  "ff-llm",
  "ff-logging",
+ "ff-mcp",
  "ff-memory",
  "ff-scheduled",
  "ff-session",

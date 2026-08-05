@@ -56,7 +56,7 @@ pub async fn run(command: TaskCommand) -> ExitCode {
             ceiling,
         } => task_add(&store, name, cron, prompt, ceiling).await,
         TaskCommand::Run { id } => {
-            let runner = crate::task_runner::CliTaskRunner::new();
+            let runner = crate::task_runner::CliTaskRunner::new().await;
             task_run(&store, id, &runner).await
         }
         TaskCommand::Pause { id } => task_pause(&store, id),
