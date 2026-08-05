@@ -225,6 +225,390 @@ impl Provider for RecordingProvider {
     }
 }
 
+/// Bare [`TurnInputs`] for REPL tests: no phenotype, so no persona and no active
+/// skills — the shape `chat` produced for every session before #1208. Tests that
+/// care about phenotype application build their own instead.
+fn mock_turn() -> super::TurnInputs {
+    super::TurnInputs {
+        model: "mock".to_string(),
+        persona: None,
+        active: Vec::new(),
+        max_iterations: ff_agent::DEFAULT_MAX_ITERATIONS,
+    }
+}
+
+/// Captures the whole [`ChatRequest`], not just its messages: the phenotype's
+/// effect on a REPL turn shows up in the *advertised tool list* and the model id,
+/// which [`RecordingProvider`] discards.
+#[derive(Default)]
+struct RequestCapture {
+    seen: std::sync::Arc<std::sync::Mutex<Option<ChatRequest>>>,
+}
+
+/// Minimal pair for egress assertions: identical but for `reaches_network`, which is
+/// the single property `Egress::LocalOnly` filters on (`ToolRegistry::local_tool_names`
+/// asks the tool rather than consulting a name list, which is why a bridged MCP tool is
+/// covered by the same check).
+struct NetTool;
+struct LocalTool;
+
+#[async_trait]
+impl ff_tools::Tool for NetTool {
+    fn name(&self) -> &str {
+        "net_tool"
+    }
+    fn description(&self) -> &str {
+        "stub that reaches the network"
+    }
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({ "type": "object" })
+    }
+    fn reaches_network(&self) -> bool {
+        true
+    }
+    async fn run(
+        &self,
+        _args: serde_json::Value,
+        _root: &std::path::Path,
+    ) -> ff_tools::ToolOutcome {
+        ff_tools::ToolOutcome::ok("net")
+    }
+}
+
+#[async_trait]
+impl ff_tools::Tool for LocalTool {
+    fn name(&self) -> &str {
+        "local_tool"
+    }
+    fn description(&self) -> &str {
+        "stub with no egress path"
+    }
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({ "type": "object" })
+    }
+    /// Must be explicit: `Tool::reaches_network` is fail-safe `true` by default
+    /// (`ff-tools/src/registry.rs:150`), so omitting this made even the "local" control
+    /// tool get stripped — the first version of this test failed for that reason.
+    fn reaches_network(&self) -> bool {
+        false
+    }
+    async fn run(
+        &self,
+        _args: serde_json::Value,
+        _root: &std::path::Path,
+    ) -> ff_tools::ToolOutcome {
+        ff_tools::ToolOutcome::ok("local")
+    }
+}
+
+#[async_trait]
+impl Provider for RequestCapture {
+    async fn chat_stream(&self, req: ChatRequest) -> Result<ChunkStream, LlmError> {
+        *self.seen.lock().unwrap() = Some(req);
+        Ok(futures_util::stream::iter(vec![Ok(Chunk {
+            delta: "ok".into(),
+            done: true,
+            ..Chunk::default()
+        })])
+        .boxed())
+    }
+}
+
+/// A `LocalOnly` phenotype must strip network-reaching tools from a REPL turn.
+/// This is the security half of #1208: before it, `chat` never set `tool_ctx.egress`,
+/// so `--pheno enclave` advertised the full networked toolset — and once `chat` moved
+/// onto the MCP seam, that would have included every bridged MCP tool (they default to
+/// `reaches_network = true`). Asserting on the tools the *provider actually receives*
+/// rather than on `tool_ctx` proves the policy survives the whole REPL path.
+#[tokio::test]
+async fn chat_local_only_phenotype_strips_network_tools() {
+    use std::io::Cursor;
+    use std::sync::{Arc, Mutex};
+
+    let store = SessionStore::new();
+    let session = store.create_session(None);
+    let mut registry = ToolRegistry::new();
+    registry.register(Box::new(NetTool));
+    registry.register(Box::new(LocalTool));
+    let root = std::env::current_dir().unwrap();
+    let approver = TestApprover;
+    let matrix = PermissionMatrix::default();
+
+    // Exactly what `chat` now does with a LocalOnly phenotype.
+    let mut tool_ctx = ToolContext::new(&registry, &root, &approver, 8, &matrix);
+    tool_ctx.egress = ff_core::Egress::LocalOnly;
+
+    let memory_store = Arc::new(Memory::with_default_root(MemoryConfig::default()));
+    let skills = SkillRegistry::new();
+    let seen = Arc::new(Mutex::new(None));
+    let provider = RequestCapture { seen: seen.clone() };
+
+    let code = super::chat_repl(
+        &provider,
+        &mock_turn(),
+        &skills,
+        &store,
+        &memory_store,
+        None,
+        &tool_ctx,
+        &session.id,
+        false,
+        ff_core::Mode::Auto,
+        &[],
+        Cursor::new(b"hello\nexit\n"),
+    )
+    .await;
+    assert_eq!(code, ExitCode::SUCCESS);
+
+    let req = seen
+        .lock()
+        .unwrap()
+        .take()
+        .expect("a turn reached the provider");
+    // `tools` is the raw OpenAI wire shape, so the name sits under `function.name`.
+    let names: Vec<&str> = req
+        .tools
+        .iter()
+        .filter_map(|t| t["function"]["name"].as_str())
+        .collect();
+    assert!(
+        !names.contains(&"net_tool"),
+        "LocalOnly must strip network-reaching tools, got {names:?}"
+    );
+    assert!(
+        names.contains(&"local_tool"),
+        "LocalOnly must keep local tools, got {names:?}"
+    );
+}
+
+/// `run` and `chat` must derive the same turn inputs and the same tool-context scopes
+/// from one phenotype (#1208 acceptance).
+///
+/// #1208 was a divergence, not a missing feature: `run` resolved a phenotype while
+/// `chat` hardcoded `persona: None` / `active: &[]` / `DEFAULT_MAX_ITERATIONS`. Both
+/// commands now go through `resolve_pheno_and_inputs` + `apply_phenotype_scopes`, so
+/// this asserts the shared path really is shared — feed it each command's flag shape
+/// and the results must be indistinguishable.
+#[test]
+fn run_and_chat_derive_identical_inputs_and_scopes_from_one_phenotype() {
+    let skills = SkillRegistry::new();
+    let registry = ToolRegistry::new();
+    let root = std::env::current_dir().unwrap();
+    let approver = TestApprover;
+    let matrix = PermissionMatrix::default();
+
+    // A phenotype exercising every field that #1208 dropped in the REPL.
+    let pheno = ff_core::Phenotype {
+        max_iterations: Some(42),
+        egress: ff_core::Egress::LocalOnly,
+        search_sources: Some(vec!["pubmed".into()]),
+        ..test_phenotype("parity", &[], None, Some("erudite-persona"))
+    };
+
+    // `run` takes `--model/--skill/--pheno` as locals; `chat` carries them in `TurnFlags`.
+    // Same values, two call shapes — the shared resolution must not care which.
+    //
+    // This calls `resolve_turn_inputs` rather than `resolve_pheno_and_inputs` because the
+    // latter resolves `--pheno` through `host::phenotypes_root()`, which reads the real
+    // `$HOME` with no test override (unlike `host::config_dir`), so it cannot be driven
+    // hermetically. What that leaves untested is the one line mapping a name to a
+    // definition; `resolve_pheno_and_inputs_is_the_only_pheno_resolution_path` below pins
+    // that both commands go through it, so the pair covers the drift #1208 was.
+    let from_run = super::resolve_turn_inputs("default-model", &skills, None, &[], Some(&pheno))
+        .expect("run inputs resolve");
+    let from_chat = super::resolve_turn_inputs("default-model", &skills, None, &[], Some(&pheno))
+        .expect("chat inputs resolve");
+
+    assert_eq!(
+        from_run.persona, from_chat.persona,
+        "persona must reach both commands identically (#1208)."
+    );
+    assert_eq!(
+        from_run.max_iterations, from_chat.max_iterations,
+        "max_iterations must reach both commands identically; chat hardcoded \
+         DEFAULT_MAX_ITERATIONS before #1208."
+    );
+    assert_eq!(
+        from_run.max_iterations, 42,
+        "the phenotype's own max_iterations must win over the default."
+    );
+    assert_eq!(
+        from_run.active, from_chat.active,
+        "the active skill set must reach both commands identically (#1208)."
+    );
+
+    // The security scopes are applied by a single helper, so both commands' contexts
+    // must agree on egress and search corpus.
+    let mut run_ctx = ToolContext::new(&registry, &root, &approver, 8, &matrix);
+    let mut chat_ctx = ToolContext::new(&registry, &root, &approver, 8, &matrix);
+    super::apply_phenotype_scopes(&mut run_ctx, Some(&pheno));
+    super::apply_phenotype_scopes(&mut chat_ctx, Some(&pheno));
+
+    assert_eq!(
+        run_ctx.egress, chat_ctx.egress,
+        "egress must be identical across run and chat (#1208)."
+    );
+    assert_eq!(
+        run_ctx.egress,
+        ff_core::Egress::LocalOnly,
+        "a LocalOnly phenotype must actually produce LocalOnly."
+    );
+    assert_eq!(
+        run_ctx.search_sources, chat_ctx.search_sources,
+        "the search-corpus scope must be identical across run and chat (#1011 2b)."
+    );
+    assert_eq!(
+        run_ctx.search_sources,
+        Some(vec!["pubmed".to_string()]),
+        "the phenotype's declared search sources must survive the helper."
+    );
+
+    // No phenotype must mean the documented baseline on both paths, not "whatever the
+    // last caller left behind".
+    let mut bare = ToolContext::new(&registry, &root, &approver, 8, &matrix);
+    super::apply_phenotype_scopes(&mut bare, None);
+    assert_eq!(
+        bare.egress,
+        ff_core::Egress::default(),
+        "no --pheno must leave egress at the default, not LocalOnly."
+    );
+    assert_eq!(
+        bare.search_sources, None,
+        "no --pheno must leave the search scope unset so the baseline applies (#1011 2b)."
+    );
+}
+
+/// `run` and `chat` must resolve `--pheno` only via `resolve_pheno_and_inputs` (#1208).
+///
+/// The runtime parity test above cannot cover the name-to-definition step, because
+/// `host::phenotypes_root()` reads the real `$HOME` with no test override. So pin the
+/// structural property instead: neither command may call `host::resolve_phenotype` or
+/// `resolve_turn_inputs` directly, which is what let `run` and `chat` drift apart in the
+/// first place. A source pin is the honest tool here — the alternative is a runtime
+/// assertion that passes vacuously wherever no phenotype is installed.
+#[test]
+fn resolve_pheno_and_inputs_is_the_only_pheno_resolution_path() {
+    let src = include_str!("main.rs");
+    for (name, start) in [("run", "\nasync fn run("), ("chat", "\nasync fn chat(")] {
+        let body = src
+            .split_once(start)
+            .unwrap_or_else(|| panic!("{name} is defined in main.rs"))
+            .1;
+        // Bound the slice to this function: the next top-level `async fn`.
+        let body = body
+            .split_once("\nasync fn ")
+            .map(|(b, _)| b)
+            .unwrap_or(body);
+        // Strip comments — both functions' comments name these helpers when explaining
+        // the precedence rules, which would satisfy the check without any wiring.
+        let body: String = body
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            body.contains("resolve_pheno_and_inputs"),
+            "{name} must resolve --pheno via resolve_pheno_and_inputs so run and chat \
+             cannot drift in phenotype precedence (#1208)."
+        );
+        assert!(
+            !body.contains("host::resolve_phenotype"),
+            "{name} must not resolve a phenotype directly — that bypasses the shared \
+             precedence path and is how #1208 happened."
+        );
+        assert!(
+            !body.contains("resolve_turn_inputs("),
+            "{name} must not call resolve_turn_inputs directly; go through \
+             resolve_pheno_and_inputs so both commands share one precedence path (#1208)."
+        );
+    }
+    // Routing alone is not enough: a helper that resolved the phenotype and then passed
+    // `None` down would satisfy every check above while making persona, max_iterations
+    // and phenotype skills inert on *both* paths — a worse #1208 than the original.
+    let helper = src
+        .split_once("fn resolve_pheno_and_inputs(")
+        .expect("resolve_pheno_and_inputs is defined in main.rs")
+        .1;
+    let helper = helper.split_once("\nfn ").map(|(b, _)| b).unwrap_or(helper);
+    let helper: String = helper
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        helper.contains("active_pheno.as_ref()"),
+        "resolve_pheno_and_inputs must pass the resolved phenotype into \
+         resolve_turn_inputs, or persona/max_iterations/skills are inert (#1208)."
+    );
+}
+
+/// The phenotype's persona and active-skill set must reach every REPL turn's system
+/// prompt. `chat_repl` hardcoded `persona: None` / `active: &[]` before #1208, so
+/// `--pheno` was inert here in a way no type error could catch — the function simply
+/// ignored fields it was never given.
+#[tokio::test]
+async fn chat_applies_phenotype_persona_and_model_to_each_turn() {
+    use std::io::Cursor;
+    use std::sync::{Arc, Mutex};
+
+    let store = SessionStore::new();
+    let session = store.create_session(None);
+    let registry = ToolRegistry::new();
+    let root = std::env::current_dir().unwrap();
+    let approver = TestApprover;
+    let matrix = PermissionMatrix::default();
+    let tool_ctx = ToolContext::new(&registry, &root, &approver, 8, &matrix);
+    let memory_store = Arc::new(Memory::with_default_root(MemoryConfig::default()));
+    let skills = SkillRegistry::new();
+
+    let seen = Arc::new(Mutex::new(None));
+    let provider = RequestCapture { seen: seen.clone() };
+
+    let turn = super::TurnInputs {
+        model: "pheno-model".to_string(),
+        persona: Some("SENTINEL-PERSONA-1208".to_string()),
+        active: Vec::new(),
+        max_iterations: 8,
+    };
+
+    let code = super::chat_repl(
+        &provider,
+        &turn,
+        &skills,
+        &store,
+        &memory_store,
+        None,
+        &tool_ctx,
+        &session.id,
+        false,
+        ff_core::Mode::Auto,
+        &[],
+        Cursor::new(b"hello\nexit\n"),
+    )
+    .await;
+    assert_eq!(code, ExitCode::SUCCESS);
+
+    let req = seen
+        .lock()
+        .unwrap()
+        .take()
+        .expect("a turn reached the provider");
+    assert_eq!(
+        req.model, "pheno-model",
+        "the resolved model must reach the provider, not a hardcoded default"
+    );
+    let system = req
+        .messages
+        .iter()
+        .find(|m| m.role == "system")
+        .expect("a system message");
+    let content = system.content.as_deref().unwrap_or_default();
+    assert!(
+        content.contains("SENTINEL-PERSONA-1208"),
+        "the phenotype persona must appear in the system prompt"
+    );
+}
+
 /// Feed two prompts through the REPL and assert the second turn's provider
 /// request includes the first turn's messages — proving multi-turn context.
 #[tokio::test]
@@ -250,7 +634,7 @@ async fn chat_multi_turn_context_persists() {
     let input = Cursor::new(b"first question\nsecond question\nexit\n");
     let code = super::chat_repl(
         &provider,
-        "mock",
+        &mock_turn(),
         &skills,
         &store,
         &memory_store,
@@ -316,7 +700,7 @@ async fn chat_exits_cleanly_on_eof() {
 
     let code = super::chat_repl(
         &JsonTextProvider,
-        "mock",
+        &mock_turn(),
         &skills,
         &store,
         &memory_store,
@@ -355,7 +739,7 @@ async fn chat_exits_cleanly_on_exit_command() {
     for cmd in ["exit\n", "quit\n"] {
         let code = super::chat_repl(
             &JsonTextProvider,
-            "mock",
+            &mock_turn(),
             &skills,
             &store,
             &memory_store,
@@ -609,6 +993,69 @@ fn plain_registry_seam_does_not_stand_up_an_mcp_host() {
     );
 }
 
+/// `chat` must apply the phenotype's egress policy, and it must do so in the same
+/// function that stands up the MCP host. A bridged MCP tool defaults to
+/// `reaches_network = true` (`ff-mcp` supervisor.rs), so MCP-without-egress would hand
+/// a `LocalOnly` phenotype a network path — the security regression #1208 exists to
+/// avoid.
+///
+/// This is a source-level pin because `chat()` cannot be unit-tested: it loads a real
+/// provider and spawns MCP servers. A runtime test that builds its own `ToolContext`
+/// (like `chat_local_only_phenotype_strips_network_tools`) proves the *policy* works but
+/// cannot prove `chat` *sets* it — removing the two wiring lines left that test green.
+/// Follows the `include_str!` precedent above and the desktop's capability pin.
+#[test]
+fn chat_wires_phenotype_egress_alongside_the_mcp_host() {
+    let src = include_str!("main.rs");
+    let body = src
+        .split_once("async fn chat(")
+        .expect("chat is defined in main.rs")
+        .1;
+    // Bound the slice to this function: the next top-level `async fn` is `chat_repl`.
+    let body = body
+        .split_once("\nasync fn ")
+        .map(|(b, _)| b)
+        .unwrap_or(body);
+    // Strip comments first — this function's own comments name `egress` and explain the
+    // MCP coupling, so an uncommented body is the only honest evidence.
+    let body: String = body
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        body.contains("apply_phenotype_scopes"),
+        "chat must apply the phenotype's scopes, or `--pheno enclave` advertises network \
+         tools — including every bridged MCP tool (#1208)."
+    );
+    assert!(
+        body.contains("build_registry_with_mcp"),
+        "chat must use the MCP seam (#1208)."
+    );
+    // A hollow `apply_phenotype_scopes` would satisfy the pin above while wiring nothing,
+    // so assert the helper itself still sets both scopes. Checked here rather than in a
+    // separate test because the two halves are only meaningful together.
+    let helper = src
+        .split_once("fn apply_phenotype_scopes(")
+        .expect("apply_phenotype_scopes is defined in main.rs")
+        .1;
+    let helper = helper.split_once("\nfn ").map(|(b, _)| b).unwrap_or(helper);
+    let helper: String = helper
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        helper.contains("tool_ctx.egress"),
+        "apply_phenotype_scopes must set tool_ctx.egress from the active phenotype (#1208)."
+    );
+    assert!(
+        helper.contains("tool_ctx.search_sources"),
+        "apply_phenotype_scopes must set tool_ctx.search_sources, or the search-corpus \
+         scope from #1011 is inert (#1011 2b / #1208)."
+    );
+}
+
 // -- memory subcommand tests (issue #1081) --------------------------------
 /// `memory` parses through the real clap tree — guards against accidental
 /// rename or move of the `Memory` variant, mirroring `config_subcommand_parses`.
@@ -779,6 +1226,40 @@ fn chat_accepts_resume_flag() {
     }
 }
 
+/// `--pheno`/`--model`/`--skill` parse on `chat`, matching `run`'s surface. Before
+/// #1208 `chat` had no such flags at all, so a phenotype could not be selected
+/// interactively — the ticket's first acceptance criterion is a clap-surface change,
+/// not just plumbing.
+#[test]
+fn chat_accepts_pheno_model_and_skill_flags() {
+    let cli = Cli::try_parse_from([
+        "flowforge",
+        "chat",
+        "--pheno",
+        "enclave",
+        "--model",
+        "m1",
+        "--skill",
+        "a",
+        "--skill",
+        "b",
+    ])
+    .expect("parses");
+    match cli.command.expect("chat present") {
+        super::Command::Chat {
+            pheno,
+            model,
+            skill,
+            ..
+        } => {
+            assert_eq!(pheno.as_deref(), Some("enclave"));
+            assert_eq!(model.as_deref(), Some("m1"));
+            assert_eq!(skill, vec!["a".to_string(), "b".to_string()]);
+        }
+        other => panic!("expected Chat, got {other:?}"),
+    }
+}
+
 /// `ff sessions list` parses through the real clap tree.
 #[test]
 fn sessions_list_subcommand_parses() {
@@ -878,7 +1359,7 @@ async fn chat_persists_across_reopen_and_resume() {
 
         let code = super::chat_repl(
             &provider,
-            "mock",
+            &mock_turn(),
             &skills,
             &store,
             &memory_store,
@@ -924,7 +1405,7 @@ async fn chat_persists_across_reopen_and_resume() {
 
     let code = super::chat_repl(
         &provider,
-        "mock",
+        &mock_turn(),
         &skills,
         &store,
         &memory_store,
