@@ -27,6 +27,16 @@ max_iterations = 40
 # leaning on a fixed toolset. Uncomment to try it.
 # preheat = ["memory_search"]
 
+# `search_sources` scopes which search corpora this phenotype may query (#552/#1011).
+# Values are source *ids* -- "web", "pubmed" -- not tool names; the tool
+# (`web_search`, `pubmed_search`) follows from the source. Adding a new source needs
+# no change to FlowForge itself, only a line here.
+#
+# Erudite is the biomedical/analytical persona, so it gets PubMed on top of the web.
+# Omit the field entirely and you get the baseline (web only); an explicit empty list
+# `[]` means no search at all, which is a different, deliberate thing.
+search_sources = ["web", "pubmed"]
+
 persona = """
 You are a reasoning specialist. Think step by step, state assumptions, check your
 work, and prefer rigour over speed. Produce a defensible answer, not a fast one.

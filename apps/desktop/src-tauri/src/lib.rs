@@ -1639,6 +1639,7 @@ fn spawn_assistant_turn(
         );
         tool_ctx.mode = mode;
         tool_ctx.egress = state.session_phenotype(&session_id).egress;
+        tool_ctx.search_sources = state.session_phenotype(&session_id).search_sources.clone();
         tool_ctx.abstractive = crate::state::abstractive_config_from_env();
         tool_ctx.compaction_model = state.compaction_model(&conn_id);
         tool_ctx.compaction_budget = state.compaction_budget(&conn_id);
@@ -2173,6 +2174,7 @@ impl GoalIteration for GoalLoopIteration {
         );
         tool_ctx.mode = mode;
         tool_ctx.egress = pheno.egress;
+        tool_ctx.search_sources = pheno.search_sources.clone();
         tool_ctx.abstractive = crate::state::abstractive_config_from_env();
         tool_ctx.tool_search = Some(self.state.tool_search());
 
@@ -2531,6 +2533,7 @@ impl ff_scheduled::TaskRunner for DesktopTaskRunner {
         );
         tool_ctx.mode = mode;
         tool_ctx.egress = pheno.egress;
+        tool_ctx.search_sources = pheno.search_sources.clone();
         tool_ctx.abstractive = crate::state::abstractive_config_from_env();
         tool_ctx.compaction_model = self.state.compaction_model(&selection.connection);
         tool_ctx.compaction_budget = self.state.compaction_budget(&selection.connection);

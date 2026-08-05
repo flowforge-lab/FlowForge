@@ -159,6 +159,19 @@ pub trait Tool: Send + Sync {
     fn dedupe_key(&self, _args: &Value) -> Option<String> {
         None
     }
+    /// Which search **corpus** this tool queries, if it is a search tool (#552 / #1011).
+    ///
+    /// Returns the [`SearchSource::id`](crate::web_search::SearchSource::id) of the
+    /// backing source (`"web"`, `"pubmed"`, …). Used by the advertised-toolset filter
+    /// to scope search corpora per phenotype, the same way [`Self::reaches_network`]
+    /// scopes egress: the registry asks each tool what it is rather than consulting a
+    /// hardcoded name list, so adding a source needs no change here or in the agent
+    /// loop.
+    ///
+    /// **Default is `None`** — a non-search tool is never affected by search scoping.
+    fn search_source_id(&self) -> Option<&str> {
+        None
+    }
     /// Whether this tool is *deferred*: discoverable via `tool_search` but kept out
     /// of the standing `tools` block (RFC 0024 Layer 1).
     ///
@@ -420,6 +433,38 @@ impl ToolRegistry {
         self.tools
             .values()
             .filter(|t| !t.reaches_network())
+            .map(|t| t.name().to_string())
+            .collect()
+    }
+
+    /// Names of every registered **search** tool ([`Tool::search_source_id`] is
+    /// `Some`), regardless of which corpus it queries (#552 / #1011).
+    ///
+    /// The subtrahend of the search-scoping filter: the advertised set drops every
+    /// search tool, then re-admits only those whose source id the phenotype named.
+    /// Derived by asking each tool, so a newly registered source is scoped correctly
+    /// with no change here.
+    pub fn search_tool_names(&self) -> HashSet<String> {
+        self.tools
+            .values()
+            .filter(|t| t.search_source_id().is_some())
+            .map(|t| t.name().to_string())
+            .collect()
+    }
+
+    /// Names of the search tools whose corpus is one of `ids` (#552 / #1011).
+    ///
+    /// The counterpart to [`Self::search_tool_names`]: what a phenotype's
+    /// `search_sources` list resolves to. An unknown id contributes nothing rather
+    /// than erroring — a phenotype naming a source this build does not carry loses
+    /// that corpus, it does not lose the whole toolset.
+    pub fn search_tool_names_for(&self, ids: &[String]) -> HashSet<String> {
+        self.tools
+            .values()
+            .filter(|t| {
+                t.search_source_id()
+                    .is_some_and(|id| ids.iter().any(|want| want == id))
+            })
             .map(|t| t.name().to_string())
             .collect()
     }

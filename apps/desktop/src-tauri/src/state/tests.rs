@@ -503,6 +503,7 @@ fn fake_resolve(name: &str) -> Option<Phenotype> {
             mcp_servers: Vec::new(),
             egress: ff_core::Egress::Open,
             preheat: Vec::new(),
+            search_sources: None,
         }),
         _ => None,
     }
@@ -577,6 +578,7 @@ fn update_phenotype_rejects_unknown_provider() {
         mcp_servers: Vec::new(),
         egress: ff_core::Egress::Open,
         preheat: Vec::new(),
+        search_sources: None,
     };
     let err = state.update_phenotype(pheno).unwrap_err();
     assert!(err.contains("unknown connection"), "{err}");
@@ -597,6 +599,7 @@ fn apply_phenotype_records_overrides_and_drops_unknown_skills() {
         mcp_servers: Vec::new(),
         egress: ff_core::Egress::Open,
         preheat: Vec::new(),
+        search_sources: None,
     };
     state.apply_phenotype(pheno);
     assert!(state.active_skills().is_empty());
@@ -738,6 +741,7 @@ fn apply_phenotype_returns_resolved_active_skills() {
         mcp_servers: Vec::new(),
         egress: ff_core::Egress::Open,
         preheat: Vec::new(),
+        search_sources: None,
     });
     // Unknown skills are dropped; the returned set mirrors the active set so the
     // caller can warn about MCP requirements without re-resolving.
@@ -763,6 +767,7 @@ fn apply_default_clears_overrides() {
         mcp_servers: Vec::new(),
         egress: ff_core::Egress::Open,
         preheat: Vec::new(),
+        search_sources: None,
     });
     state.apply_phenotype(default_phenotype());
     assert!(state.active_model_override().is_none());
@@ -784,6 +789,7 @@ fn unbound_session_inherits_global_active_phenotype() {
         mcp_servers: Vec::new(),
         egress: ff_core::Egress::Open,
         preheat: Vec::new(),
+        search_sources: None,
     });
     let s = state.store.create_session(None);
     let resolved = state.session_phenotype(&s.id);
@@ -822,6 +828,7 @@ fn session_bound_to_unknown_phenotype_falls_back_to_global() {
         mcp_servers: Vec::new(),
         egress: ff_core::Egress::Open,
         preheat: Vec::new(),
+        search_sources: None,
     });
     let s = state.store.create_session(None);
     // Inject a dangling binding directly through the store (the validated
@@ -861,6 +868,7 @@ fn phenotype_model_override_without_provider_rides_active_connection() {
         mcp_servers: Vec::new(),
         egress: ff_core::Egress::Open,
         preheat: Vec::new(),
+        search_sources: None,
     });
     let s = state.store.create_session(None);
     let sel = state.resolve_model_selection(&s.id);
@@ -883,6 +891,7 @@ fn phenotype_provider_binding_routes_to_that_connections_model() {
         mcp_servers: Vec::new(),
         egress: ff_core::Egress::Open,
         preheat: Vec::new(),
+        search_sources: None,
     });
     let s = state.store.create_session(None);
     let sel = state.resolve_model_selection(&s.id);
@@ -905,6 +914,7 @@ fn phenotype_provider_and_model_are_both_honored() {
         mcp_servers: Vec::new(),
         egress: ff_core::Egress::Open,
         preheat: Vec::new(),
+        search_sources: None,
     });
     let s = state.store.create_session(None);
     let sel = state.resolve_model_selection(&s.id);
@@ -927,6 +937,7 @@ fn session_model_override_wins_over_phenotype() {
         mcp_servers: Vec::new(),
         egress: ff_core::Egress::Open,
         preheat: Vec::new(),
+        search_sources: None,
     });
     let s = state.store.create_session(None);
     // ...is overridden by an explicit session pin to the active connection.
@@ -990,6 +1001,7 @@ fn resolved_caps_fail_closed_when_connection_missing() {
         mcp_servers: Vec::new(),
         egress: ff_core::Egress::Open,
         preheat: Vec::new(),
+        search_sources: None,
     });
     let s = state.store.create_session(None);
     let sel = state.resolve_model_selection(&s.id);
@@ -1030,6 +1042,7 @@ fn clearing_session_model_falls_back_to_phenotype() {
         mcp_servers: Vec::new(),
         egress: ff_core::Egress::Open,
         preheat: Vec::new(),
+        search_sources: None,
     });
     let s = state.store.create_session(None);
     state
@@ -1074,6 +1087,7 @@ fn pheno_with_mcp(name: &str, servers: Vec<McpServerConfig>) -> Phenotype {
         mcp_servers: servers,
         egress: ff_core::Egress::Open,
         preheat: Vec::new(),
+        search_sources: None,
     }
 }
 
@@ -3708,6 +3722,7 @@ fn pheno_with_preheat(preheat: Vec<String>) -> Phenotype {
         mcp_servers: Vec::new(),
         egress: ff_core::Egress::Open,
         preheat,
+        search_sources: None,
     }
 }
 

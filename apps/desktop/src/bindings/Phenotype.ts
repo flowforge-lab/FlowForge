@@ -66,4 +66,24 @@ egress: Egress,
  *
  * Empty contributes nothing, identical to today.
  */
-preheat: Array<string>, };
+preheat: Array<string>, 
+/**
+ * Which search corpora this phenotype may query (#552 / #1011 2b). Source ids
+ * ([`SearchSource::id`]), not tool names: `["web", "pubmed"]`.
+ *
+ * Scoping is by source rather than by tool name for the same reason [`Self::egress`]
+ * is a policy rather than a name list — the registry asks each tool which corpus it
+ * queries, so adding a source needs no change to this struct or the agent loop.
+ *
+ * `None` (the field omitted) means the **pre-#1012 baseline**: web search only.
+ * That is deliberately not "every registered source" — PubMed is registered
+ * globally today, so inheriting the live set would keep advertising `pubmed_search`
+ * to every phenotype and #1012's exclusivity criterion could never be met. It is
+ * also not "no search at all", which would silently strip web search from every
+ * existing phenotype. Omitting the field therefore leaves behaviour exactly as it
+ * was before source scoping existed.
+ *
+ * An empty `Some(vec![])` *does* mean no search — an explicit, deliberate opt-out,
+ * distinguishable from the omission above.
+ */
+searchSources?: Array<string>, };

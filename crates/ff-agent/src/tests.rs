@@ -285,7 +285,7 @@ fn plan_mode_advertises_read_capable_and_sensitive_tools() {
     // invocation of the visible tools.
     let reg = ToolRegistry::with_defaults();
     let matrix = PermissionMatrix::default();
-    let advertised = advertised_tools(Mode::Plan, Egress::Open, &matrix, None, &reg, None)
+    let advertised = advertised_tools(Mode::Plan, Egress::Open, &matrix, None, &reg, None, None)
         .expect("Plan restricts");
     for name in [
         "view",
@@ -317,7 +317,7 @@ fn plan_mode_hides_sensitive_tools_when_the_matrix_denies_sensitive() {
     let reg = ToolRegistry::with_defaults();
     let mut matrix = PermissionMatrix::default();
     matrix.set_cell(Mode::Plan, Safety::Sensitive, PermissionCell::Deny);
-    let advertised = advertised_tools(Mode::Plan, Egress::Open, &matrix, None, &reg, None)
+    let advertised = advertised_tools(Mode::Plan, Egress::Open, &matrix, None, &reg, None, None)
         .expect("Plan restricts");
     assert!(advertised.contains("bash"));
     assert!(advertised.contains("github"));
@@ -343,6 +343,7 @@ fn plan_mode_intersects_with_subagent_allowlist() {
         Some(&allowed),
         &reg,
         None,
+        None,
     )
     .unwrap();
     assert_eq!(advertised, ["view".to_string()].into_iter().collect());
@@ -353,11 +354,11 @@ fn act_and_auto_pass_the_allowlist_through_unchanged() {
     let reg = ToolRegistry::with_defaults();
     let matrix = PermissionMatrix::default();
     assert_eq!(
-        advertised_tools(Mode::Act, Egress::Open, &matrix, None, &reg, None),
+        advertised_tools(Mode::Act, Egress::Open, &matrix, None, &reg, None, None),
         None
     );
     assert_eq!(
-        advertised_tools(Mode::Auto, Egress::Open, &matrix, None, &reg, None),
+        advertised_tools(Mode::Auto, Egress::Open, &matrix, None, &reg, None, None),
         None
     );
     let allowed: std::collections::HashSet<String> =
@@ -369,6 +370,7 @@ fn act_and_auto_pass_the_allowlist_through_unchanged() {
             &matrix,
             Some(&allowed),
             &reg,
+            None,
             None
         ),
         Some(allowed)
@@ -381,8 +383,16 @@ fn local_only_egress_strips_network_tools_in_act() {
     // reduced to the local-only set — network tools are stripped.
     let reg = ToolRegistry::with_defaults();
     let matrix = PermissionMatrix::default();
-    let advertised = advertised_tools(Mode::Act, Egress::LocalOnly, &matrix, None, &reg, None)
-        .expect("LocalOnly restricts even in Act");
+    let advertised = advertised_tools(
+        Mode::Act,
+        Egress::LocalOnly,
+        &matrix,
+        None,
+        &reg,
+        None,
+        None,
+    )
+    .expect("LocalOnly restricts even in Act");
     for name in ["view", "edit", "grep", "diagnostics", "agent"] {
         assert!(
             advertised.contains(name),
@@ -403,8 +413,16 @@ fn local_only_composes_with_plan_mode() {
     // is dropped by the Plan pass; `web_fetch` (read-shaped but network) by egress.
     let reg = ToolRegistry::with_defaults();
     let matrix = PermissionMatrix::default();
-    let advertised =
-        advertised_tools(Mode::Plan, Egress::LocalOnly, &matrix, None, &reg, None).unwrap();
+    let advertised = advertised_tools(
+        Mode::Plan,
+        Egress::LocalOnly,
+        &matrix,
+        None,
+        &reg,
+        None,
+        None,
+    )
+    .unwrap();
     assert!(advertised.contains("view"));
     assert!(advertised.contains("grep"));
     assert!(!advertised.contains("edit"), "Plan drops the mutating edit");
@@ -434,6 +452,7 @@ fn local_only_composes_with_subagent_allowlist() {
         Some(&allowed),
         &reg,
         None,
+        None,
     )
     .unwrap();
     assert_eq!(advertised, ["view".to_string()].into_iter().collect());
@@ -445,7 +464,7 @@ fn open_egress_is_byte_identical_to_pre_rfc() {
     let reg = ToolRegistry::with_defaults();
     let matrix = PermissionMatrix::default();
     assert_eq!(
-        advertised_tools(Mode::Act, Egress::Open, &matrix, None, &reg, None),
+        advertised_tools(Mode::Act, Egress::Open, &matrix, None, &reg, None, None),
         None
     );
 }
@@ -539,6 +558,7 @@ async fn plan_mode_hard_blocks_dispatch_of_a_hidden_tool() {
         compaction_cache: None,
         near_budget_tokens: None,
         tool_search: None,
+        search_sources: None,
     };
 
     run_turn(
@@ -3830,6 +3850,7 @@ async fn subagent_depth_guard_refuses_nested_spawn() {
         compaction_cache: None,
         near_budget_tokens: None,
         tool_search: None,
+        search_sources: None,
     };
 
     run_turn(
@@ -3893,6 +3914,7 @@ async fn subagent_allowlist_blocks_disallowed_tool() {
         compaction_cache: None,
         near_budget_tokens: None,
         tool_search: None,
+        search_sources: None,
     };
 
     run_turn(
@@ -7116,7 +7138,7 @@ fn deferred_tools_are_withheld_until_searched_for() {
     reg.register(deferred_stub("mcp_thing", Safety::ReadOnly, false));
     let matrix = PermissionMatrix::default();
 
-    let without = advertised_tools(Mode::Act, Egress::Open, &matrix, None, &reg, None)
+    let without = advertised_tools(Mode::Act, Egress::Open, &matrix, None, &reg, None, None)
         .expect("deferral materialises the set");
     assert!(
         !without.contains("mcp_thing"),
@@ -7130,6 +7152,7 @@ fn deferred_tools_are_withheld_until_searched_for() {
         &matrix,
         None,
         &reg,
+        None,
         Some(&admitted(&["mcp_thing"])),
     )
     .expect("still an explicit set");
@@ -7146,7 +7169,7 @@ fn a_registry_with_nothing_deferred_is_byte_identical_to_before() {
     let reg = ToolRegistry::with_defaults();
     let matrix = PermissionMatrix::default();
     assert!(
-        advertised_tools(Mode::Act, Egress::Open, &matrix, None, &reg, None).is_none(),
+        advertised_tools(Mode::Act, Egress::Open, &matrix, None, &reg, None, None).is_none(),
         "no deferred tools => unchanged 'everything is visible' contract"
     );
 }
@@ -7166,6 +7189,7 @@ fn searched_for_tool_still_cannot_escape_plan_mode() {
         &matrix,
         None,
         &reg,
+        None,
         Some(&admitted(&["mcp_deploy"])),
     )
     .expect("Plan restricts");
@@ -7188,6 +7212,7 @@ fn searched_for_tool_still_cannot_escape_local_only_egress() {
         &matrix,
         None,
         &reg,
+        None,
         Some(&admitted(&["mcp_remote"])),
     )
     .expect("LocalOnly restricts");
@@ -7212,6 +7237,7 @@ fn searched_for_tool_still_cannot_escape_a_subagent_allowlist() {
         &matrix,
         Some(&allowed),
         &reg,
+        None,
         Some(&admitted(&["mcp_thing"])),
     )
     .expect("an explicit allowlist");
@@ -7233,6 +7259,7 @@ fn admitting_an_unknown_name_is_harmless() {
         &matrix,
         None,
         &reg,
+        None,
         Some(&admitted(&["no_such_tool"])),
     )
     .expect("explicit set");
@@ -7249,7 +7276,8 @@ fn appended_schemas_leave_the_stable_prefix_byte_identical() {
     reg.register(deferred_stub("aaa_sorts_first", Safety::ReadOnly, false));
     let matrix = PermissionMatrix::default();
 
-    let stable_set = advertised_tools(Mode::Act, Egress::Open, &matrix, None, &reg, None).unwrap();
+    let stable_set =
+        advertised_tools(Mode::Act, Egress::Open, &matrix, None, &reg, None, None).unwrap();
     let stable = reg.openai_tools_for(Some(&stable_set), true, None);
 
     // The stub's name sorts before every built-in, so a naive re-sort would put it at
@@ -7298,7 +7326,7 @@ fn appending_is_deterministic_within_a_batch() {
 fn plan_mode_does_not_advertise_actions_it_would_refuse() {
     let reg = ToolRegistry::with_defaults();
     let matrix = PermissionMatrix::default();
-    let advertised = advertised_tools(Mode::Plan, Egress::Open, &matrix, None, &reg, None)
+    let advertised = advertised_tools(Mode::Plan, Egress::Open, &matrix, None, &reg, None, None)
         .expect("Plan restricts");
     let scope = ff_tools::action_scope_for_mode(&reg, Mode::Plan, &matrix);
     let schemas = reg.openai_tools_for(Some(&advertised), false, Some(&scope));
@@ -7412,6 +7440,7 @@ async fn run_turn_advertises_only_the_actions_the_mode_permits() {
             compaction_cache: None,
             near_budget_tokens: None,
             tool_search: None,
+            search_sources: None,
         };
         (ctx, seen.clone())
     };
@@ -7648,6 +7677,7 @@ fn a_preheated_deferred_tool_is_advertised_on_turn_one() {
         &matrix,
         None,
         &reg,
+        None,
         Some(&unlocked),
     )
     .expect("an explicit unlocked set materialises the advertised set");
@@ -7657,4 +7687,312 @@ fn a_preheated_deferred_tool_is_advertised_on_turn_one() {
          a mid-turn append -- invalidating the cached prefix instead of saving a \
          round-trip"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Search-source scoping (#552 / #1011 2b, closing #1012's exclusivity criterion)
+// ---------------------------------------------------------------------------
+
+/// A registry with both search corpora registered, mirroring what the desktop and CLI
+/// hosts build. `ToolRegistry::with_defaults` deliberately carries neither, so a test
+/// that wants to exercise scoping has to register them explicitly.
+fn reg_with_both_search_sources() -> ToolRegistry {
+    let mut reg = ToolRegistry::with_defaults();
+    reg.register(Box::new(ff_tools::WebSearchTool::new(std::sync::Arc::new(
+        std::sync::Mutex::new(ff_core::SearchConfig::default()),
+    ))));
+    reg.register(Box::new(ff_tools::SearchTool::new(std::sync::Arc::new(
+        ff_tools::PubMedSource::new(),
+    ))));
+    reg
+}
+
+#[test]
+fn erudite_scoped_phenotype_advertises_pubmed_and_web() {
+    // #1012's headline criterion: the Erudite persona gets PubMed.
+    let reg = reg_with_both_search_sources();
+    let matrix = PermissionMatrix::default();
+    let scope = vec!["web".to_string(), "pubmed".to_string()];
+    let advertised = advertised_tools(
+        Mode::Act,
+        Egress::Open,
+        &matrix,
+        None,
+        &reg,
+        Some(&scope),
+        None,
+    )
+    .expect("search scoping materialises an explicit set");
+    assert!(advertised.contains("pubmed_search"));
+    assert!(advertised.contains("web_search"));
+}
+
+#[test]
+fn unscoped_phenotype_advertises_web_but_not_pubmed() {
+    // The other half of #1012, and the reason `None` is the pre-#1012 baseline rather
+    // than "every registered source": PubMed is registered unconditionally by the host,
+    // so inheriting the live registry would advertise `pubmed_search` to every persona
+    // and this criterion could never be met. Web search must survive -- treating `None`
+    // as "no search" would silently strip it from every existing phenotype.
+    let reg = reg_with_both_search_sources();
+    let matrix = PermissionMatrix::default();
+    let advertised = advertised_tools(Mode::Act, Egress::Open, &matrix, None, &reg, None, None)
+        .expect("scoping materialises an explicit set even from the full registry");
+    assert!(
+        advertised.contains("web_search"),
+        "baseline must keep web search"
+    );
+    assert!(
+        !advertised.contains("pubmed_search"),
+        "a persona that did not ask for PubMed must not see it"
+    );
+    // Scoping must not disturb anything that isn't a search tool.
+    for name in ["view", "grep", "bash", "web_fetch"] {
+        assert!(advertised.contains(name), "{name} should be untouched");
+    }
+}
+
+#[test]
+fn explicit_empty_scope_removes_all_search_but_keeps_the_rest() {
+    // `Some(vec![])` is the deliberate opt-out, distinguishable from the omitted field.
+    let reg = reg_with_both_search_sources();
+    let matrix = PermissionMatrix::default();
+    let none: Vec<String> = Vec::new();
+    let advertised = advertised_tools(
+        Mode::Act,
+        Egress::Open,
+        &matrix,
+        None,
+        &reg,
+        Some(&none),
+        None,
+    )
+    .expect("explicit set");
+    assert!(!advertised.contains("web_search"));
+    assert!(!advertised.contains("pubmed_search"));
+    assert!(advertised.contains("view"));
+}
+
+#[test]
+fn unknown_source_id_costs_only_that_corpus() {
+    // Fail-soft: a phenotype naming a source this build does not carry loses that
+    // corpus, not its whole toolset.
+    let reg = reg_with_both_search_sources();
+    let matrix = PermissionMatrix::default();
+    let scope = vec!["web".to_string(), "arxiv".to_string()];
+    let advertised = advertised_tools(
+        Mode::Act,
+        Egress::Open,
+        &matrix,
+        None,
+        &reg,
+        Some(&scope),
+        None,
+    )
+    .expect("explicit set");
+    assert!(advertised.contains("web_search"));
+    assert!(!advertised.contains("pubmed_search"));
+    assert!(advertised.contains("view"));
+}
+
+#[test]
+fn search_scope_cannot_widen_past_local_only_egress() {
+    // Composition is by intersection, never union. A LocalOnly phenotype (enclave)
+    // strips network-capable tools; naming a corpus must not re-admit one. Union here
+    // would turn a scoping knob into a privacy-policy bypass.
+    let reg = reg_with_both_search_sources();
+    let matrix = PermissionMatrix::default();
+    let scope = vec!["web".to_string(), "pubmed".to_string()];
+    let advertised = advertised_tools(
+        Mode::Act,
+        Egress::LocalOnly,
+        &matrix,
+        None,
+        &reg,
+        Some(&scope),
+        None,
+    )
+    .expect("LocalOnly restricts");
+    assert!(!advertised.contains("web_search"));
+    assert!(!advertised.contains("pubmed_search"));
+}
+
+#[test]
+fn search_scope_cannot_widen_past_a_subagent_allowlist() {
+    // Same intersection discipline against `allowed`: a delegated child scoped to
+    // `view` alone must not gain a search tool because its phenotype names the corpus.
+    let reg = reg_with_both_search_sources();
+    let matrix = PermissionMatrix::default();
+    let allowed: std::collections::HashSet<String> = ["view".to_string()].into_iter().collect();
+    let scope = vec!["web".to_string(), "pubmed".to_string()];
+    let advertised = advertised_tools(
+        Mode::Act,
+        Egress::Open,
+        &matrix,
+        Some(&allowed),
+        &reg,
+        Some(&scope),
+        None,
+    )
+    .expect("allowlist restricts");
+    assert_eq!(
+        advertised, allowed,
+        "search scoping must not re-widen a delegation allowlist"
+    );
+}
+
+#[test]
+fn registry_without_search_tools_is_unaffected_by_scoping() {
+    // The 20-odd pre-existing call sites pass `None` against `with_defaults()`, which
+    // carries no search tool. Pin that this stays byte-identical to pre-#1011 -- an
+    // early return rather than a materialised full registry.
+    let reg = ToolRegistry::with_defaults();
+    let matrix = PermissionMatrix::default();
+    assert!(
+        reg.search_tool_names().is_empty(),
+        "with_defaults must not carry search tools, or this test proves nothing"
+    );
+    let advertised = advertised_tools(Mode::Act, Egress::Open, &matrix, None, &reg, None, None);
+    assert!(
+        advertised.is_none(),
+        "no search tools to scope means the whole-registry `None` must survive"
+    );
+}
+
+/// Parent delegates, then the child takes a turn. Records the tool names advertised on
+/// each request so a test can assert what the *child* was offered -- the child's session
+/// is ephemeral and deleted, so its own messages cannot be inspected afterwards
+/// (#552 / #1011 2b).
+struct AgentThenChildSearches {
+    calls: AtomicUsize,
+    advertised_per_turn: std::sync::Mutex<Vec<Vec<String>>>,
+}
+
+#[async_trait]
+impl Provider for AgentThenChildSearches {
+    async fn chat_stream(&self, req: ChatRequest) -> Result<ChunkStream, LlmError> {
+        self.advertised_per_turn.lock().unwrap().push(
+            req.tools
+                .iter()
+                .filter_map(|t| {
+                    t.get("function")
+                        .and_then(|f| f.get("name"))
+                        .and_then(|n| n.as_str())
+                        .map(str::to_string)
+                })
+                .collect(),
+        );
+        let n = self.calls.fetch_add(1, Ordering::SeqCst);
+        let chunks = match n {
+            // Parent delegates.
+            0 => vec![Ok(Chunk {
+                tool_calls: vec![ToolCallDelta {
+                    index: 0,
+                    id: Some("agent_1".into()),
+                    name: Some("agent".into()),
+                    arguments: r#"{"task":"look up a paper"}"#.into(),
+                }],
+                done: true,
+                ..Chunk::default()
+            })],
+            // Child reaches for a corpus its parent was not granted.
+            1 => vec![Ok(Chunk {
+                tool_calls: vec![ToolCallDelta {
+                    index: 0,
+                    id: Some("pm_1".into()),
+                    name: Some("pubmed_search".into()),
+                    arguments: r#"{"query":"crispr"}"#.into(),
+                }],
+                done: true,
+                ..Chunk::default()
+            })],
+            // Child summarises whatever it got back.
+            2 => vec![Ok(Chunk {
+                delta: "child: done".into(),
+                done: true,
+                ..Chunk::default()
+            })],
+            _ => vec![Ok(Chunk {
+                delta: "parent: done".into(),
+                done: true,
+                ..Chunk::default()
+            })],
+        };
+        Ok(futures_util::stream::iter(chunks).boxed())
+    }
+}
+
+/// Run one delegation with `parent_scope` and return the tool names advertised to the
+/// **child** on its own turn. Factored out so inheritance can be probed in both
+/// directions: a scope wider than the baseline and one narrower than it.
+async fn child_advertised_under_parent_scope(parent_scope: Option<Vec<String>>) -> Vec<String> {
+    let dir = tempfile::tempdir().unwrap();
+    let store = SessionStore::new();
+    let s = store.create_session(None);
+    store.add_message(&s.id, Role::User, "delegate a search".into());
+    let registry = reg_with_both_search_sources();
+    let root = dir.path().to_path_buf();
+    let approve = AlwaysApprove;
+    let matrix = PermissionMatrix::default();
+    let provider = AgentThenChildSearches {
+        calls: AtomicUsize::new(0),
+        advertised_per_turn: std::sync::Mutex::new(Vec::new()),
+    };
+
+    let mut parent = ToolContext::new(&registry, &root, &approve, 8, &matrix);
+    parent.search_sources = parent_scope;
+
+    run_turn(
+        &provider,
+        &store,
+        &parent,
+        &s.id,
+        "mock",
+        None,
+        false,
+        ReasoningVisibility::All,
+        CancelToken::new(),
+        |_| {},
+    )
+    .await
+    .unwrap();
+
+    let turns = provider.advertised_per_turn.lock().unwrap().clone();
+    assert!(
+        turns.len() >= 2,
+        "the child must have taken a turn: {turns:?}"
+    );
+    // Turn 0 is the parent's, turn 1 is the child's.
+    turns[1].clone()
+}
+
+#[tokio::test]
+async fn subagent_inherits_a_scope_wider_than_the_baseline() {
+    // Scoping is a standing phenotype property, like egress -- not a per-delegation
+    // grant. Probed with a scope *wider* than the baseline: if the child silently fell
+    // back to the default instead of inheriting, PubMed would vanish. Asserting only the
+    // narrowing direction cannot detect that, since the baseline excludes PubMed too.
+    //
+    // Driven end-to-end rather than by inspecting the child context, because `child_ctx`
+    // is built inline inside `run_subagent`, and asserted on the advertised set rather
+    // than the child's messages, because the child session is deleted after delegation.
+    let child =
+        child_advertised_under_parent_scope(Some(vec!["web".into(), "pubmed".into()])).await;
+    assert!(
+        child.contains(&"pubmed_search".to_string()),
+        "the child must inherit the parent's extra corpus, not fall back to the baseline: {child:?}"
+    );
+    assert!(child.contains(&"web_search".to_string()), "{child:?}");
+}
+
+#[tokio::test]
+async fn subagent_inherits_a_scope_narrower_than_the_registry() {
+    // The other direction: a child must not regain a corpus its parent was scoped away
+    // from, even though the registry carries it.
+    let child = child_advertised_under_parent_scope(Some(vec!["web".into()])).await;
+    assert!(
+        !child.contains(&"pubmed_search".to_string()),
+        "a delegated child must not regain a corpus its parent lost: {child:?}"
+    );
+    assert!(child.contains(&"web_search".to_string()), "{child:?}");
 }

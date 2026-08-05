@@ -56,6 +56,7 @@ pub fn default_phenotype() -> Phenotype {
         mcp_servers: Vec::new(),
         egress: ff_core::Egress::Open,
         preheat: Vec::new(),
+        search_sources: None,
     }
 }
 
@@ -84,6 +85,11 @@ struct PhenotypeFile {
     /// a hard parse error rather than an ignored key.
     #[serde(default)]
     preheat: Vec<String>,
+    /// #552 / #1011 2b. Mirrored here for the same `deny_unknown_fields` reason as
+    /// `preheat` above. Absent stays `None` -- the baseline -- rather than becoming
+    /// an empty list, which would mean "no search at all".
+    #[serde(default)]
+    search_sources: Option<Vec<String>>,
 }
 
 impl PhenotypeFile {
@@ -98,6 +104,7 @@ impl PhenotypeFile {
             mcp_servers: self.mcp_servers,
             egress: self.egress,
             preheat: self.preheat,
+            search_sources: self.search_sources,
         }
     }
 }
@@ -179,6 +186,15 @@ struct PhenotypeOut {
     /// editing+saving a phenotype silently erased its preheat list.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     preheat: Vec<String>,
+    /// Search corpora this phenotype may query (#552 / #1011 2b). Omitted when `None`
+    /// so files for the baseline case stay minimal -- and so absence keeps meaning
+    /// "baseline" rather than round-tripping into an explicit list. The third instance
+    /// of the `egress`/`preheat` trap above: this struct is a hand-written mirror, so a
+    /// field added to `Phenotype` compiles fine here while being silently dropped on
+    /// save. An explicit `Some(vec![])` is preserved, since "no search at all" is a
+    /// deliberate choice that must survive an edit.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    search_sources: Option<Vec<String>>,
 }
 
 /// Whether `name` is safe to use as a single-segment file stem. Rejects empty
@@ -215,6 +231,7 @@ pub fn save_phenotype(root: &Path, pheno: &Phenotype) -> Result<(), PhenotypeErr
         mcp_servers: pheno.mcp_servers.clone(),
         egress: pheno.egress,
         preheat: pheno.preheat.clone(),
+        search_sources: pheno.search_sources.clone(),
     };
     let body = toml::to_string_pretty(&out).map_err(|source| PhenotypeError::Serialize {
         name: pheno.name.clone(),
