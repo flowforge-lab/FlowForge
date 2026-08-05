@@ -121,6 +121,17 @@ enum Command {
         /// Auto-deny write and dangerous tool calls without prompting.
         #[arg(long, conflicts_with = "yes")]
         deny: bool,
+        /// Override the provider's default model for the session.
+        #[arg(long, value_name = "ID")]
+        model: Option<String>,
+        /// Activate a skill's body for the session (repeatable). Unknown names error.
+        #[arg(long, value_name = "NAME")]
+        skill: Vec<String>,
+        /// Load a phenotype's active skills, model, persona, egress policy, and
+        /// search-corpus scope (see `~/.flowforge/phenos`). Applies to every turn
+        /// of the session (#1208).
+        #[arg(long, value_name = "NAME")]
+        pheno: Option<String>,
         /// Approval mode: `auto` auto-approves writes, `act` prompts every write,
         /// `plan` also hides write/dangerous tools. Dangerous calls always prompt.
         #[arg(long, value_enum, default_value = "auto")]
@@ -210,6 +221,9 @@ async fn main() -> ExitCode {
         json: false,
         yes: false,
         deny: false,
+        model: None,
+        skill: Vec::new(),
+        pheno: None,
         mode: ModeArg::Auto,
         ephemeral: false,
         resume: None,
@@ -241,6 +255,9 @@ async fn main() -> ExitCode {
             json,
             yes,
             deny,
+            model,
+            skill,
+            pheno,
             mode,
             ephemeral,
             resume,
@@ -251,6 +268,11 @@ async fn main() -> ExitCode {
                 mode.into(),
                 ephemeral,
                 resume,
+                TurnFlags {
+                    model,
+                    skill,
+                    pheno,
+                },
             )
             .await
         }
@@ -435,6 +457,60 @@ fn resolve_turn_inputs(
     })
 }
 
+/// Resolve `--pheno` to a phenotype and then to per-turn inputs, in one step.
+///
+/// `run` and `chat` both need the identical pair, and #1208 was caused precisely by
+/// them drifting apart: `run` resolved a phenotype while `chat` hardcoded
+/// `persona: None` / `active: &[]`, so every phenotype was silently inert in the
+/// REPL. Keeping one resolution path makes that class of drift structurally
+/// impossible rather than something a test has to notice.
+///
+/// Returns `Err(message)` for an unknown phenotype or skill so each caller can keep
+/// its own exit-code handling; the message is already user-facing.
+fn resolve_pheno_and_inputs(
+    default_model: &str,
+    skills: &ff_skills::SkillRegistry,
+    model_flag: Option<&str>,
+    skill_flags: &[String],
+    pheno_flag: Option<&str>,
+) -> Result<(Option<ff_core::Phenotype>, TurnInputs), String> {
+    let active_pheno = match pheno_flag {
+        Some(name) => match host::resolve_phenotype(name) {
+            Some(p) => Some(p),
+            None => return Err(format!("unknown phenotype: {name}")),
+        },
+        None => None,
+    };
+    let inputs = resolve_turn_inputs(
+        default_model,
+        skills,
+        model_flag,
+        skill_flags,
+        active_pheno.as_ref(),
+    )?;
+    Ok((active_pheno, inputs))
+}
+
+/// Apply a phenotype's security scopes to a `ToolContext`.
+///
+/// These two assignments are what make a `LocalOnly` phenotype such as `enclave`
+/// actually local: `ToolContext::egress` gates both the advertised tool set and
+/// dispatch, and a bridged MCP tool defaults to `reaches_network = true`
+/// (`ff-mcp` supervisor.rs), so a command that stands up an MCP host without
+/// setting egress hands `enclave` a network path. That was the #1208 regression.
+///
+/// Kept as one named function so the pair cannot be applied by one caller and
+/// forgotten by another — the drift that #1208 was.
+fn apply_phenotype_scopes(
+    tool_ctx: &mut ToolContext<'_>,
+    active_pheno: Option<&ff_core::Phenotype>,
+) {
+    // RFC 0013: egress policy (Open when no --pheno).
+    tool_ctx.egress = active_pheno.map(|p| p.egress).unwrap_or_default();
+    // #552 / #1011 2b: search-corpus scope (baseline when no --pheno).
+    tool_ctx.search_sources = active_pheno.and_then(|p| p.search_sources.clone());
+}
+
 /// Loads persisted web-search settings from `~/.config/flowforge/search.json` (the
 /// same file the desktop Settings pane writes). Falls back to the default
 /// (SearXNG, no endpoint) when the file is missing or unparseable; with no
@@ -469,11 +545,13 @@ impl ff_tools::SearchKeyProvider for KeychainSearchKeys {
     }
 }
 
-/// The non-MCP tool-registry seam. In production only `chat` uses it: `run`, `goal`,
-/// `task`, and `serve` moved to [`build_registry_with_mcp`] (#1207), and `chat` stays
-/// here until #1208 gives it a `--pheno` flag, because phenotype-scoped egress is what
-/// strips network-reaching tools — advertising MCP tools before that gate exists would
-/// hand `enclave` a way out.
+/// The non-MCP tool-registry seam. **Test-only since #1208**: every production command
+/// (`run`, `goal`, `task`, `serve`, and now `chat`) uses [`build_registry_with_mcp`].
+///
+/// Kept rather than deleted because three #1207 regression guards are built on it —
+/// they assert the MCP seam registers exactly the same local toolset as this one, which
+/// is what catches a tool being added to one path and not the other. Delete this and
+/// the drift it was written to catch becomes invisible again.
 ///
 /// Includes the durable-memory setup (RFC 0006): builds the store + FTS5 index, does a
 /// full reindex from disk, and registers the three memory tools. Best-effort — an index
@@ -483,8 +561,10 @@ impl ff_tools::SearchKeyProvider for KeychainSearchKeys {
 /// silently lacked PubMed search and all three memory tools, while `run` lacked
 /// `goal_complete`. Nothing caught it, because a missing tool is not a type error —
 /// it just makes the agent quietly less capable on one path. Both seams therefore share
-/// [`build_base_registry`] as their only construction site;
-/// `goal_and_run_registries_expose_the_same_toolset` pins it (#1207).
+/// [`build_base_registry`] as their only construction site — this one only to keep the
+/// comparison honest, since it no longer serves a production command;
+/// `both_registry_seams_register_the_same_base_toolset` pins it (#1207).
+#[cfg(test)]
 pub(crate) async fn build_registry_with_memory() -> (
     ff_tools::ToolRegistry,
     std::sync::Arc<ff_memory::Memory>,
@@ -625,24 +705,14 @@ async fn run(
     // its active phenotype each turn: a phenotype seeds the active skills, persona,
     // and a model candidate; `--model` is the most specific override; `--skill`
     // adds validated skills on top. Unknown --pheno/--skill names fail cleanly.
-    let active_pheno = match pheno.as_deref() {
-        Some(name) => match host::resolve_phenotype(name) {
-            Some(p) => Some(p),
-            None => {
-                eprintln!("error: unknown phenotype: {name}");
-                return ExitCode::FAILURE;
-            }
-        },
-        None => None,
-    };
-    let inputs = match resolve_turn_inputs(
+    let (active_pheno, inputs) = match resolve_pheno_and_inputs(
         &default_model,
         &skills,
         model.as_deref(),
         &skill,
-        active_pheno.as_ref(),
+        pheno.as_deref(),
     ) {
-        Ok(inputs) => inputs,
+        Ok(pair) => pair,
         Err(msg) => {
             eprintln!("error: {msg}");
             return ExitCode::FAILURE;
@@ -675,10 +745,7 @@ async fn run(
         &matrix,
     );
     tool_ctx.mode = mode;
-    // RFC 0013: apply the active phenotype's egress policy (Open when no --pheno).
-    tool_ctx.egress = active_pheno.as_ref().map(|p| p.egress).unwrap_or_default();
-    // #552 / #1011 2b: and its search-corpus scope (baseline when no --pheno).
-    tool_ctx.search_sources = active_pheno.as_ref().and_then(|p| p.search_sources.clone());
+    apply_phenotype_scopes(&mut tool_ctx, active_pheno.as_ref());
 
     let cancel = CancelToken::new();
     // Ctrl-C cancels the turn cooperatively. `ctrl_c()` is portable across Unix and
@@ -753,27 +820,59 @@ async fn run(
 /// persists for `ff sessions list` / `ff chat --resume`. When `resume` is
 /// `Some(id)`, reopens that session instead of creating a new one — errors if
 /// the id is unknown.
+///
+/// `--model`/`--skill`/`--pheno` resolve exactly as they do for `run`, via the shared
+/// [`resolve_turn_inputs`]. The phenotype is resolved once and applies to every turn of
+/// the session: unlike `run`, there is no per-turn re-resolution, because a REPL has no
+/// point at which the user could pass new flags (#1208).
+/// The `--model`/`--skill`/`--pheno` trio, grouped so adding a fourth turn-shaping flag
+/// does not push another parameter through [`chat`]'s signature. `run` takes them
+/// positionally because its parameter list predates this; new surfaces should use this.
+struct TurnFlags {
+    model: Option<String>,
+    skill: Vec<String>,
+    pheno: Option<String>,
+}
+
 async fn chat(
     json: bool,
     approval_mode: ApprovalMode,
     mode: Mode,
     ephemeral: bool,
     resume: Option<String>,
+    flags: TurnFlags,
 ) -> ExitCode {
-    let (provider, model) = host::load_provider();
+    let (provider, default_model) = host::load_provider();
     let skills = host::load_skills();
     let workspace = host::workspace_root();
     let store = std::sync::Arc::new(host::build_session_store(ephemeral));
-    // Deliberately the non-MCP builder: `chat` never applies a phenotype's `egress`
-    // (it has no `--pheno` flag at all), and a bridged MCP tool defaults to
-    // `reaches_network = true`, stripped only by a `LocalOnly` egress. Handing `chat` MCP
-    // tools before that gate exists would be a security regression, not a feature, so the
-    // wiring belongs with the phenotype plumbing in #1208 — which owns flipping this one
-    // call site to `build_registry_with_mcp()`.
-    let (mut registry, memory_store, memory_index) = build_registry_with_memory().await;
+    // MCP is safe here only because the phenotype's `egress` is applied below: a bridged
+    // tool defaults to `reaches_network = true` (`ff-mcp` supervisor.rs), so a `LocalOnly`
+    // phenotype must be able to strip it. Egress wiring and this call site landed together
+    // in #1208 for exactly that reason — do not separate them.
+    //
+    // `_mcp_teardown` must stay bound for the whole function: dropping it stops every MCP
+    // server, so an `_`-discard here would kill them before the first turn.
+    let (mut registry, memory_store, memory_index, mcp_guidance, _mcp_teardown) =
+        build_registry_with_mcp().await;
     registry.register(Box::new(ff_tools::CompactionRetrieveTool::new(
         store.clone(),
     )));
+    // Resolved once for the whole session (see the note above), otherwise identical to
+    // `run`'s handling — same helper, same precedence, same failure messages.
+    let (active_pheno, turn) = match resolve_pheno_and_inputs(
+        &default_model,
+        &skills,
+        flags.model.as_deref(),
+        &flags.skill,
+        flags.pheno.as_deref(),
+    ) {
+        Ok(pair) => pair,
+        Err(msg) => {
+            eprintln!("error: {msg}");
+            return ExitCode::FAILURE;
+        }
+    };
     let approver = CliApprover::new(approval_mode, mode);
     // Resume an existing session or create a new one. A bogus resume id is a
     // hard error (don't silently start a fresh session — the user asked for a
@@ -801,15 +900,17 @@ async fn chat(
         &registry,
         &workspace,
         &approver,
-        ff_agent::DEFAULT_MAX_ITERATIONS,
+        turn.max_iterations,
         &matrix,
     );
     tool_ctx.mode = mode;
+    // This is what makes the MCP seam above safe for a `LocalOnly` phenotype.
+    apply_phenotype_scopes(&mut tool_ctx, active_pheno.as_ref());
 
     let stdin = std::io::stdin();
     chat_repl(
         provider.as_ref(),
-        &model,
+        &turn,
         &skills,
         &store,
         &memory_store,
@@ -818,8 +919,7 @@ async fn chat(
         &session_id,
         json,
         mode,
-        // Empty until #1208 puts `chat` on the MCP seam; see the registry comment above.
-        &[],
+        &mcp_guidance,
         stdin.lock(),
     )
     .await
@@ -827,10 +927,15 @@ async fn chat(
 
 /// Core REPL loop with injectable input for testability. Reads lines from `input`,
 /// dispatches each to [`run_turn`], and loops until EOF, `exit`, or `quit`.
+///
+/// Takes the resolved [`TurnInputs`] rather than a bare model id so the phenotype's
+/// persona and active-skill set reach every turn's system prompt. Before #1208 this
+/// function hardcoded `persona: None` / `active: &[]`, which made `--pheno` inert in
+/// `chat` in a way no type error could catch.
 #[allow(clippy::too_many_arguments)]
 async fn chat_repl(
     provider: &dyn ff_llm::Provider,
-    model: &str,
+    turn: &TurnInputs,
     skills: &ff_skills::SkillRegistry,
     store: &ff_session::SessionStore,
     memory_store: &std::sync::Arc<ff_memory::Memory>,
@@ -885,9 +990,9 @@ async fn chat_repl(
             None => (memory_store.ambient_block(), Vec::new()),
         };
         let system_prompt = ff_agent::build_system_prompt(&ff_agent::SystemPromptInputs {
-            persona: None,
+            persona: turn.persona.as_deref(),
             skills,
-            active: &[],
+            active: &turn.active,
             user: &user_ctx,
             memory: memory.as_deref(),
             extra_instructions: None,
@@ -910,7 +1015,7 @@ async fn chat_repl(
                 store,
                 tool_ctx,
                 session_id,
-                model,
+                &turn.model,
                 Some(&system_prompt),
                 true,
                 ReasoningVisibility::All,
@@ -924,7 +1029,7 @@ async fn chat_repl(
                 store,
                 tool_ctx,
                 session_id,
-                model,
+                &turn.model,
                 Some(&system_prompt),
                 true,
                 ReasoningVisibility::All,
