@@ -6,9 +6,26 @@
 
 @custom-variant dark (&:is(.dark *));
 
-@theme inline {
+/* Font tokens the user can change at runtime, so they must NOT be inlined
+   (#1196). `applyFont` swaps `--font-sans` on `<html>` (`lib/fonts.ts`), and the
+   pre-paint script in `index.html` sets it before first frame — both are useless
+   unless something reads the variable. Under `@theme inline`, Tailwind compiles
+   `font-sans` to the literal value ("Geist Variable, sans-serif") instead of
+   `var(--font-sans)`, which silently severed that chain: `html { @apply font-sans }`
+   and every `font-sans` class were hardcoded to Geist, so the picker changed
+   nothing. A plain `@theme` emits `font-family: var(--font-sans)`, restoring it.
+   `--font-heading` lives here too because its value is `var(--font-sans)`; left
+   behind under `inline` it resolved at build time and was dropped from the output
+   entirely. */
+@theme {
   --font-heading: var(--font-sans);
   --font-sans: "Geist Variable", sans-serif;
+}
+
+@theme inline {
+  /* Not user-configurable and read directly as `var(--font-code)`, which works
+     under `inline` (the keyword only changes how utilities compile, not whether
+     the variable is emitted) — so this one stays put. */
   --font-code:
     ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
   --color-sidebar-ring: var(--sidebar-ring);

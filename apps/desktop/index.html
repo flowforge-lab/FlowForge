@@ -14,9 +14,13 @@
         height: 100%;
         background: #141414;
         color: #a3a3a3;
-        font:
-          14px/1.4 system-ui,
-          sans-serif;
+        /* Unlayered, so this outranks index.css's `@layer base` — a literal family
+           here silently overrides the user's font for all body text (#1196). Keep it
+           on the token, and use longhands: the `font:` shorthand resets family too.
+           The script below sets `--font-sans` pre-paint, so this is FOUC-free. */
+        font-size: 14px;
+        line-height: 1.4;
+        font-family: var(--font-sans, system-ui, sans-serif);
       }
       #root:empty {
         display: flex;

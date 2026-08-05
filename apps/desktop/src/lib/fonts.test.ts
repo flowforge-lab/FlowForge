@@ -69,6 +69,10 @@ describe("applyFont", () => {
   });
 });
 
+// The consumption half of this chain — that the CSS actually reads `--font-sans` — is
+// guarded in `src/index.css.test.ts`, which is where #1196 escaped: every test in this
+// file passed while the picker did nothing.
+
 describe("font scale", () => {
   afterEach(() => {
     document.documentElement.style.removeProperty("font-size");
