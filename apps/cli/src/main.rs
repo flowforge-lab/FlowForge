@@ -469,7 +469,11 @@ impl ff_tools::SearchKeyProvider for KeychainSearchKeys {
     }
 }
 
-/// The CLI's single tool-registry seam, shared by `run`, `chat`, `serve`, and `goal`.
+/// The non-MCP tool-registry seam. In production only `chat` uses it: `run`, `goal`,
+/// `task`, and `serve` moved to [`build_registry_with_mcp`] (#1207), and `chat` stays
+/// here until #1208 gives it a `--pheno` flag, because phenotype-scoped egress is what
+/// strips network-reaching tools — advertising MCP tools before that gate exists would
+/// hand `enclave` a way out.
 ///
 /// Includes the durable-memory setup (RFC 0006): builds the store + FTS5 index, does a
 /// full reindex from disk, and registers the three memory tools. Best-effort — an index
@@ -478,8 +482,9 @@ impl ff_tools::SearchKeyProvider for KeychainSearchKeys {
 /// There used to be a second copy in `goal_loop.rs`, and the two drifted: goal mode
 /// silently lacked PubMed search and all three memory tools, while `run` lacked
 /// `goal_complete`. Nothing caught it, because a missing tool is not a type error —
-/// it just makes the agent quietly less capable on one path. Keep this the only
-/// construction site; `goal_and_run_registries_expose_the_same_toolset` pins it (#1207).
+/// it just makes the agent quietly less capable on one path. Both seams therefore share
+/// [`build_base_registry`] as their only construction site;
+/// `goal_and_run_registries_expose_the_same_toolset` pins it (#1207).
 pub(crate) async fn build_registry_with_memory() -> (
     ff_tools::ToolRegistry,
     std::sync::Arc<ff_memory::Memory>,

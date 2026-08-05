@@ -170,7 +170,7 @@ pub fn init() -> Option<(SupervisorHandle, usize)> {
     Some((handle, awaited))
 }
 
-/// Bridge this session's MCP tools into `registry`, returning the number registered.
+/// Bridge this session's MCP tools into `registry`.
 ///
 /// **Deferred servers are skipped.** `defer` is `Option<bool>` where `None` means
 /// deferred (`ff-mcp/src/config.rs:51`), so *unconfigured servers default to deferred*.
@@ -188,7 +188,7 @@ pub async fn bridge_into(
     registry: &mut ff_tools::ToolRegistry,
     session_root: &Path,
     expected_servers: usize,
-) -> usize {
+) {
     let still_starting = await_startup(handle, expected_servers).await;
     if !still_starting.is_empty() {
         tracing::warn!(
@@ -198,7 +198,10 @@ pub async fn bridge_into(
              missing from this run"
         );
     }
-    partition_and_register(ff_mcp::build_bridged_tools(handle, session_root), registry)
+    // The count is deliberately dropped: it is already logged by `partition_and_register`,
+    // and bridging is fail-soft, so no caller can act on it. Tests assert it on
+    // `partition_and_register` directly.
+    let _ = partition_and_register(ff_mcp::build_bridged_tools(handle, session_root), registry);
 }
 
 /// The policy half of [`bridge_into`], split out so it can be tested without a live
