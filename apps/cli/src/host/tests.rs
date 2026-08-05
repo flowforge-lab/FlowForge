@@ -1,4 +1,8 @@
-use super::{channel_map_path, resolve_phenotype_in, session_db_path};
+use super::{channel_map_path, load_provider, resolve_phenotype_in, session_db_path};
+use ff_core::{
+    ProviderConfig, ProviderConnection, ProviderKind, ProviderRegistry, ReasoningEffort, SecretKind,
+};
+use ff_llm::{ChatMessage, ChatRequest, Provider};
 use ff_skills::DEFAULT_PHENOTYPE;
 use std::fs;
 
@@ -60,8 +64,6 @@ fn api_key_from_env_unset_is_none() {
     );
 }
 
-use ff_core::{ProviderConfig, ProviderKind, ReasoningEffort};
-use ff_llm::{ChatMessage, ChatRequest, Provider};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -228,4 +230,173 @@ fn default_provider_desc_names_the_url_from_the_error() {
     let desc = super::default_provider_desc();
     assert!(desc.contains("localhost:8000"), "got {desc}");
     assert!(desc.contains("candle-vllm"), "got {desc}");
+}
+
+// ---------------------------------------------------------------------------
+// Registry-active-connection tests (#1199)
+// ---------------------------------------------------------------------------
+
+/// Regression: a provider selected in the GUI (active in provider-registry.json)
+/// must take effect in `load_provider()`. Write a registry with `ollama` active
+/// and a *differing* legacy `provider.json`, then verify the (registry) model
+/// wins — proving registry beats legacy, which is the entire point of #1199.
+#[test]
+fn registry_active_connection_wins() {
+    let env = crate::test_support::TestEnv::new();
+    let conn = ProviderConnection {
+        id: "ollama".into(),
+        kind: ProviderKind::Ollama,
+        display_name: "Ollama".into(),
+        vendor: None,
+        base_url: None,
+        model: "qwen3.6:35b-a3b".into(),
+        has_key: false,
+        secret_missing: false,
+        thinking: true,
+        reasoning_effort: ReasoningEffort::Medium,
+        reasoning_visibility: Default::default(),
+        warmup_enabled: true,
+        num_ctx: None,
+        region: None,
+        auth_mode: None,
+        aws_profile: None,
+        access_key_id: None,
+        compaction_model: None,
+        compaction_budget: None,
+        near_budget: None,
+    };
+    let registry = ProviderRegistry {
+        active: "ollama".into(),
+        connections: vec![conn],
+        schema_version: 0,
+    };
+    env.write_registry(&registry);
+    // A legacy provider.json is present *and* differs. If the registry
+    // is preferred (the fix for #1199) the model below is qwen3.6:35b-a3b;
+    // if legacy is preferred the model is LEGACY-MUST-NOT-WIN. Either way
+    // the assertion fails on the wrong answer, not a silent fallback.
+    fs::write(
+        env.legacy_path(),
+        r#"{"kind":"ollama","model":"LEGACY-MUST-NOT-WIN","hasKey":false}"#,
+    )
+    .unwrap();
+
+    let (_provider, model) = load_provider();
+
+    assert_eq!(model, "qwen3.6:35b-a3b");
+}
+
+/// A dangling active pointer (registry exists but no connection matches)
+/// falls through to the legacy `provider.json` when present, not to the
+/// default — preserving the pre-registry install behaviour.
+#[test]
+fn registry_dangling_active_falls_back_to_legacy() {
+    let env = crate::test_support::TestEnv::new();
+    // Registry exists but active points at a connection not in the list.
+    let registry = ProviderRegistry {
+        active: "nonexistent".into(),
+        connections: vec![],
+        schema_version: 0,
+    };
+    env.write_registry(&registry);
+    // Legacy file exists with a different provider.
+    fs::write(
+        env.legacy_path(),
+        r#"{"kind":"ollama","model":"qwen3.6:35b-a3b","hasKey":false}"#,
+    )
+    .unwrap();
+
+    let (_provider, model) = load_provider();
+
+    // Should fall through to legacy, not default.
+    assert_eq!(model, "qwen3.6:35b-a3b");
+}
+
+/// When neither registry nor legacy file exists, `load_provider()` falls back
+/// to the built-in default (candle-vllm) — the same behaviour as before the
+/// registry adoption, preserving fresh-install experience.
+#[test]
+fn load_provider_falls_back_to_default_when_nothing_present() {
+    let env = crate::test_support::TestEnv::new();
+    assert!(!env.registry_path().exists(), "no registry file");
+    assert!(!env.legacy_path().exists(), "no legacy file");
+
+    let (_provider, model) = load_provider();
+
+    assert_eq!(model, ProviderConfig::default().model);
+}
+
+// ---------------------------------------------------------------------------
+// api_key_from_env_or_keyring tests (#1199)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn api_key_from_env_or_keyring_env_var_wins() {
+    let var = "FF_TEST_KEY_OVERRIDE";
+    std::env::set_var(var, "sk-from-env");
+    let conn = ProviderConnection {
+        id: "test-conn".into(),
+        kind: ProviderKind::OpenAi,
+        ..connection_defaults()
+    };
+    // Set a key in the keyring — should be shadowed by the env var.
+    crate::secrets::set("test-conn", SecretKind::ApiKey, "sk-from-keyring").expect("set keyring");
+
+    let result = super::api_key_from_env_or_keyring(&conn, var);
+
+    assert_eq!(result.as_deref(), Some("sk-from-env"));
+    std::env::remove_var(var);
+}
+
+#[test]
+fn api_key_from_env_or_keyring_falls_back_to_keyring() {
+    let conn = ProviderConnection {
+        id: "test-conn-fallback".into(),
+        kind: ProviderKind::OpenAi,
+        ..connection_defaults()
+    };
+    crate::secrets::set("test-conn-fallback", SecretKind::ApiKey, "sk-from-keyring")
+        .expect("set keyring");
+
+    let result = super::api_key_from_env_or_keyring(&conn, "FF_TEST_KEY_NOT_SET");
+
+    assert_eq!(result.as_deref(), Some("sk-from-keyring"));
+}
+
+#[test]
+fn api_key_from_env_or_keyring_returns_none_when_both_absent() {
+    let conn = ProviderConnection {
+        id: "test-conn-none".into(),
+        kind: ProviderKind::OpenAi,
+        ..connection_defaults()
+    };
+
+    let result = super::api_key_from_env_or_keyring(&conn, "FF_TEST_KEY_NEVER_SET");
+
+    assert!(result.is_none());
+}
+
+fn connection_defaults() -> ProviderConnection {
+    ProviderConnection {
+        id: String::new(),
+        kind: ProviderKind::CandleVllm,
+        display_name: String::new(),
+        vendor: None,
+        base_url: None,
+        model: String::new(),
+        has_key: false,
+        secret_missing: false,
+        thinking: false,
+        reasoning_effort: ReasoningEffort::default(),
+        reasoning_visibility: Default::default(),
+        warmup_enabled: true,
+        num_ctx: None,
+        region: None,
+        auth_mode: None,
+        aws_profile: None,
+        access_key_id: None,
+        compaction_model: None,
+        compaction_budget: None,
+        near_budget: None,
+    }
 }

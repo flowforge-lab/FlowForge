@@ -5,21 +5,34 @@
 
 use std::path::PathBuf;
 
-use ff_core::{model_supports_documents, ProviderConfig, ProviderKind};
+use ff_core::{
+    model_supports_documents, BedrockAuth, ProviderConfig, ProviderConnection, ProviderKind,
+    SecretKind,
+};
 use ff_llm::{
     ollama_num_ctx_from_env, reasoning_control, wire_dialect, BedrockCreds, BedrockProvider,
     OllamaProvider, OpenAiProvider, Provider,
 };
 use ff_skills::SkillRegistry;
 
-/// The provider + default model, honoring the same `~/.config/flowforge/provider.json`
-/// the desktop app persists, so a provider chosen in the GUI is respected here.
-/// Falls back to the default (local candle-vllm) when absent or unreadable.
-// TODO(#724 follow-up): adopt `provider-registry.json` (loaded via
-// `crate::registry::load_registry`) so the chat/run arms see the same
-// connections the new `flowforge config` subcommand edits. Kept on the
-// legacy singleton for now to keep the chat surface unchanged.
+/// The provider + default model used by every headless entry point
+/// (`serve` / `run` / `chat` / `goal-loop` / `task-runner`).
+///
+/// Resolution order:
+///   1. [`crate::registry::load_registry`] — the `provider-registry.json` the
+///      desktop and `flowforge config` write. The active connection's kind,
+///      model, and keyring-stored credentials are used.
+///   2. Legacy `provider.json` — honoured when no registry exists, so a
+///      pre-registry install does not silently switch providers.
+///   3. Built-in default (local [`ProviderKind::CandleVllm`] on port 8000) —
+///      with a warning naming the fallback, so the user knows why requests
+///      hit a port they never configured (#1060).
 pub fn load_provider() -> (Box<dyn Provider>, String) {
+    let registry = crate::registry::load_registry();
+    if let Some(conn) = registry.active_connection() {
+        let model = conn.model.clone();
+        return (build_provider_from_connection(conn), model);
+    }
     let config = load_provider_config();
     let model = config.model.clone();
     (build_provider(&config), model)
@@ -133,9 +146,11 @@ fn build_provider(config: &ProviderConfig) -> Box<dyn Provider> {
                 .with_kind(config.kind),
         ),
         ProviderKind::Bedrock => Box::new(build_bedrock_provider(config, documents)),
-        // The CLI has no keychain, so a hosted OpenAI key comes from the
+        // Legacy `provider.json` carries no connection id, so there is nothing
+        // to look up in the keychain: a hosted OpenAI key comes from the
         // OPENAI_API_KEY env var (absent or empty => keyless, for OpenAI-compatible
-        // local gateways that need none).
+        // local gateways that need none). The registry path resolves the keyring
+        // in `build_provider_from_connection`.
         ProviderKind::OpenAi => Box::new(
             OpenAiProvider::new(base_url, api_key_from_env("OPENAI_API_KEY"))
                 .with_documents(documents)
@@ -145,9 +160,11 @@ fn build_provider(config: &ProviderConfig) -> Box<dyn Provider> {
                 // correctly when the phenotype is `egress = local-only`.
                 .with_kind(config.kind),
         ),
-        // SiliconFlow is OpenAI-compatible. The CLI has no keychain, so the bearer
-        // key comes from SILICONFLOW_API_KEY (empty/unset = anonymous, which the
-        // hosted endpoint will reject -- the same env-var pattern as Bedrock above).
+        // SiliconFlow is OpenAI-compatible. Same as the OpenAI arm: the legacy
+        // `provider.json` path carries no connection id to look up in the
+        // keychain, so the bearer key comes from SILICONFLOW_API_KEY (empty/unset
+        // = anonymous, which the hosted endpoint will reject -- the same env-var
+        // pattern as the legacy Bedrock path above).
         ProviderKind::SiliconFlow => {
             let key = std::env::var("SILICONFLOW_API_KEY")
                 .ok()
@@ -180,14 +197,129 @@ fn build_provider(config: &ProviderConfig) -> Box<dyn Provider> {
     }
 }
 
+/// Build a provider from a [`ProviderConnection`], mirroring the desktop's
+/// `build_provider` in `state.rs`. Resolves API keys from the OS keychain
+/// (`crate::secrets::get`), with the legacy env-var override taking precedence
+/// so existing CI/scripted invocations keep working.
+fn build_provider_from_connection(conn: &ProviderConnection) -> Box<dyn Provider> {
+    let base_url = conn.resolved_base_url().to_string();
+    let dialect = wire_dialect(conn.kind, &conn.model);
+    let reasoning = reasoning_control(conn.kind, &conn.model, conn.reasoning_effort);
+    let documents = model_supports_documents(conn.kind, &conn.model);
+    match conn.kind {
+        ProviderKind::CandleVllm => Box::new(
+            OpenAiProvider::new(base_url, None)
+                .with_documents(documents)
+                .with_dialect(dialect)
+                .with_kind(conn.kind),
+        ),
+        ProviderKind::Ollama => Box::new(
+            OllamaProvider::new(base_url)
+                .with_documents(documents)
+                .with_num_ctx(conn.num_ctx.map(u64::from).or_else(ollama_num_ctx_from_env))
+                .with_kind(conn.kind),
+        ),
+        ProviderKind::Bedrock => {
+            let region = conn
+                .region
+                .clone()
+                .unwrap_or_else(|| "us-east-1".to_string());
+            let id = conn.id.as_str();
+            let mode = match conn.auth_mode.unwrap_or(BedrockAuth::Auto) {
+                BedrockAuth::Auto => resolve_bedrock_auth(conn),
+                other => other,
+            };
+            let creds = match mode {
+                BedrockAuth::Auto => unreachable!("Auto resolved above"),
+                BedrockAuth::Profile => BedrockCreds::Profile {
+                    name: conn
+                        .aws_profile
+                        .clone()
+                        .unwrap_or_else(|| "default".to_string()),
+                },
+                BedrockAuth::IamKeys => BedrockCreds::IamKeys {
+                    access_key_id: conn.access_key_id.clone().unwrap_or_default(),
+                    secret_access_key: crate::secrets::get(id, SecretKind::SecretAccessKey)
+                        .unwrap_or_default(),
+                    session_token: crate::secrets::get(id, SecretKind::SessionToken),
+                },
+                BedrockAuth::ApiKey => BedrockCreds::ApiKey {
+                    token: crate::secrets::get(id, SecretKind::ApiKey).unwrap_or_default(),
+                },
+            };
+            Box::new(
+                BedrockProvider::new(region, creds)
+                    .with_documents(documents)
+                    .with_reasoning_effort(conn.reasoning_effort)
+                    .with_kind(conn.kind),
+            )
+        }
+        ProviderKind::OpenAi => Box::new(
+            OpenAiProvider::new(
+                base_url,
+                api_key_from_env_or_keyring(conn, "OPENAI_API_KEY"),
+            )
+            .with_documents(documents)
+            .with_dialect(dialect)
+            .with_reasoning_control(reasoning)
+            .with_kind(conn.kind),
+        ),
+        ProviderKind::SiliconFlow => Box::new(
+            OpenAiProvider::new(
+                base_url,
+                api_key_from_env_or_keyring(conn, "SILICONFLOW_API_KEY"),
+            )
+            .with_documents(documents)
+            .with_dialect(dialect)
+            .with_reasoning_control(reasoning)
+            .with_kind(conn.kind),
+        ),
+        ProviderKind::OpenRouter => Box::new(
+            OpenAiProvider::new(
+                base_url,
+                api_key_from_env_or_keyring(conn, "OPENROUTER_API_KEY"),
+            )
+            .with_documents(documents)
+            .with_dialect(dialect)
+            .with_reasoning_control(reasoning)
+            .with_kind(conn.kind),
+        ),
+    }
+}
+
+/// Resolve the concrete [`BedrockAuth`] mode for a connection by reading live
+/// keychain presence. Mirrors the desktop's `resolve_bedrock_auth` in
+/// `state.rs`. A profile counts only when its name is non-empty; IAM keys count
+/// only when both the access key id and the secret access key are present.
+fn resolve_bedrock_auth(conn: &ProviderConnection) -> BedrockAuth {
+    let id = conn.id.as_str();
+    BedrockAuth::resolve_auto(
+        crate::secrets::get(id, SecretKind::ApiKey).is_some(),
+        conn.aws_profile.as_deref().is_some_and(|p| !p.is_empty()),
+        conn.access_key_id.is_some()
+            && crate::secrets::get(id, SecretKind::SecretAccessKey).is_some(),
+    )
+}
+
+/// Resolve an API key for `conn`: the named env var wins when set and non-empty,
+/// otherwise fall back to the OS keychain. Preserves every existing CI/scripted
+/// invocation that sets `OPENAI_API_KEY` / `SILICONFLOW_API_KEY` /
+/// `OPENROUTER_API_KEY`, while making a provider selected in the GUI effective
+/// via the shared keyring.
+fn api_key_from_env_or_keyring(conn: &ProviderConnection, env_var: &str) -> Option<String> {
+    api_key_from_env(env_var).or_else(|| crate::secrets::get(&conn.id, SecretKind::ApiKey))
+}
+
 /// Build a Bedrock provider from `config`, mirroring the desktop's `build_provider`.
 /// Extracted so the reasoning-effort dial (#394) is assertable without a live Bedrock
 /// call — without `with_reasoning_effort`, per-step thinking is invisible through
 /// `flowforge run` (same bug surface as desktop #426 acceptance).
 fn build_bedrock_provider(config: &ProviderConfig, documents: bool) -> BedrockProvider {
-    // The CLI has no keychain or connection registry, so Bedrock here uses the
-    // standard AWS credential chain: a bearer token from AWS_BEARER_TOKEN_BEDROCK
-    // when set, otherwise a named profile (AWS_PROFILE, default "default").
+    // Legacy `provider.json` carries no connection id, so there is nothing to
+    // look up in the keychain: Bedrock here uses the standard AWS credential
+    // chain — a bearer token from AWS_BEARER_TOKEN_BEDROCK when set, otherwise
+    // a named profile (AWS_PROFILE, default "default"). The registry path
+    // resolves the keyring in `build_provider_from_connection`.
     let region = std::env::var("AWS_REGION")
         .or_else(|_| std::env::var("AWS_DEFAULT_REGION"))
         .unwrap_or_else(|_| "us-east-1".to_string());
