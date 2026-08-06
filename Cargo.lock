@@ -1904,6 +1904,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "ff-acp-types"
+version = "1.0.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "ff-agent"
 version = "1.0.0"
 dependencies = [
