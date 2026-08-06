@@ -8340,3 +8340,59 @@ async fn oversized_results_hash_on_what_the_model_sees_not_the_raw_content() {
          contents differ"
     );
 }
+
+/// A refusal message is what the model actually reads, so two different reasons must
+/// not produce the same sentence.
+///
+/// `DenyReason::Cancelled` exists precisely so a turn cancelled with an approval still
+/// pending is not reported as a user refusal (#1215 — the ACP boundary answers pending
+/// `session/request_permission` calls with `cancelled`). Without this test the variant
+/// could be given `User`'s wording and become a silent no-op: it would still compile,
+/// still round-trip, and still tell the model it was declined.
+#[test]
+fn each_denial_reason_reads_differently_to_the_model() {
+    use ff_core::{DenyReason, Mode, Safety};
+
+    let reasons = [
+        DenyReason::Mode {
+            mode: Mode::Plan,
+            safety: Safety::Write,
+        },
+        DenyReason::User,
+        DenyReason::ScopedRule {
+            rule: "no-network".to_string(),
+        },
+        DenyReason::NoInteractiveTerminal,
+        DenyReason::Cancelled,
+    ];
+
+    let messages: Vec<String> = reasons
+        .iter()
+        .map(|r| crate::denial_message("patch", r))
+        .collect();
+
+    for (i, a) in messages.iter().enumerate() {
+        assert!(
+            a.contains("patch"),
+            "message {i} does not name the tool: {a}"
+        );
+        for (j, b) in messages.iter().enumerate().skip(i + 1) {
+            assert_ne!(
+                a, b,
+                "reasons {i} and {j} produce identical text, so the model cannot tell \
+                 them apart: {a}"
+            );
+        }
+    }
+
+    // The load-bearing distinction: a cancelled turn is not a refusal.
+    let cancelled = crate::denial_message("patch", &DenyReason::Cancelled);
+    assert!(
+        !cancelled.contains("denied"),
+        "a cancelled turn must not be reported as denied: {cancelled}"
+    );
+    assert!(
+        cancelled.contains("cancelled"),
+        "the message should say what actually happened: {cancelled}"
+    );
+}
