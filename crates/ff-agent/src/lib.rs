@@ -166,12 +166,15 @@ async fn cancellable_backoff(cancel: &CancelToken, ms: u64) {
 }
 
 /// After a model emits the identical `(tool, arguments)` call this many times in a
-/// turn, inject a corrective nudge -- a context-rot stall where the model repeats a
-/// call without using its result (#244 R2).
+/// row *and gets the identical result back each time*, inject a corrective nudge --
+/// a context-rot stall where the model repeats a call without using its result
+/// (#244 R2). A changed result resets the run to 1 (#1211): the repeat is then how
+/// an idempotent verifier is supposed to be used, not a loop.
 const REPEAT_NUDGE_AT: usize = 3;
 
-/// If the identical call persists to this many repeats despite the nudge, break the
-/// turn with a clear notice rather than spinning to the iteration cap.
+/// If the identical call *with an unchanging result* persists to this many repeats
+/// despite the nudge, break the turn with a clear notice rather than spinning to the
+/// iteration cap.
 const REPEAT_BREAK_AT: usize = 5;
 
 /// Once a session is over the context-pressure threshold, re-run the memory flush
@@ -936,10 +939,13 @@ fn context_breakdown(
 /// Derives the called set from `call_counts`' keys rather than tracking a second
 /// collection: that map already records every `(tool, args)` the turn issued, so a
 /// parallel set would be one more thing to keep in sync for no new information.
+///
+/// Only the keys are read, which is why #1211 could widen the value to
+/// `(count, result_hash)` without touching this.
 fn turn_preheat_attribution(
     tools: &ToolContext<'_>,
     session_id: &str,
-    call_counts: &HashMap<(String, String), usize>,
+    call_counts: &HashMap<(String, String), (usize, u64)>,
     tool_schemas: &[serde_json::Value],
 ) -> PreheatAttribution {
     let Some(search) = tools.tool_search else {
@@ -1405,7 +1411,9 @@ pub async fn run_turn(
     // calls across the turn; `repeat_nudge` carries a tool name to warn about on the
     // next request; `stop_reason` ends the turn with a clear notice when a stall
     // persists past the nudge.
-    let mut call_counts: HashMap<(String, String), usize> = HashMap::new();
+    // (tool, args) -> (consecutive identical-result repeats, hash of that result).
+    // The hash is what makes a repeat distinguishable from a stall (#1211).
+    let mut call_counts: HashMap<(String, String), (usize, u64)> = HashMap::new();
     let mut repeat_nudge: Option<String> = None;
     let mut stop_reason: Option<StopReason> = None;
     // Per-turn semantic read-dedupe (#458 RC5): read key (e.g. a file path) -> the
@@ -2743,6 +2751,11 @@ pub async fn run_turn(
             } else {
                 (outcome.content.clone(), None)
             };
+            // Hash what the model actually sees, not `outcome.content`: redaction
+            // (above) and extractive compaction both rewrite it, and hashing the raw
+            // value would let two results the model cannot tell apart look distinct
+            // (or vice versa). Taken here because `stored` is moved on the next line.
+            let stored_hash = content_hash(&stored);
             let result_msg = store.add_tool_result_message(session_id, call.id.clone(), stored);
             if let Some((key, original)) = original {
                 store.put_compaction_original(session_id, &result_msg.id, &key, &original);
@@ -2760,14 +2773,32 @@ pub async fn run_turn(
             if call.name == COMPACTION_RETRIEVE_TOOL {
                 retrieve_calls += 1;
             }
-            // Count identical calls to catch a no-progress stall (#244 R2).
-            let count = call_counts
+            // Count identical calls to catch a no-progress stall (#244 R2), but only
+            // while the call keeps producing the *same* result (#1211). An identical
+            // call whose result changed is progress by the only definition available
+            // here -- the model learned something new -- so the run resets to 1.
+            //
+            // Without the reset this counted cumulatively across a whole turn, so an
+            // idempotent verifier (`diagnostics`, `test_runner`, `cargo fmt --check`)
+            // whose arguments never vary hit the break in the ordinary
+            // edit-then-recheck loop: five calls returning five different compile-error
+            // sets, with eight patches interleaved, read as a stall.
+            //
+            // A write between the calls is deliberately NOT treated as progress: if a
+            // patch lands and the next check returns byte-identical errors, the model
+            // is stuck and the break is correct.
+            let entry = call_counts
                 .entry((call.name.clone(), call.arguments.clone()))
-                .or_insert(0);
-            *count += 1;
-            if *count >= REPEAT_BREAK_AT {
+                .or_insert((0, stored_hash));
+            if entry.1 == stored_hash {
+                entry.0 += 1;
+            } else {
+                *entry = (1, stored_hash);
+            }
+            let count = entry.0;
+            if count >= REPEAT_BREAK_AT {
                 stop_reason = Some(StopReason::Stall);
-            } else if *count >= REPEAT_NUDGE_AT {
+            } else if count >= REPEAT_NUDGE_AT {
                 // Keep nudging through the recovery window (#244 R2 follow-up): re-arm on
                 // every repeat from the nudge threshold up to the break, so a model that
                 // ignores the first reminder still gets one before we break the turn.
