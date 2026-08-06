@@ -72,7 +72,10 @@ pub fn outcome_to_approval(outcome: &wire::RequestPermissionOutcome) -> Approval
     match outcome {
         wire::RequestPermissionOutcome::Cancelled => ApprovalOutcome::Denied(DenyReason::Cancelled),
         wire::RequestPermissionOutcome::Selected(selected) => {
-            match selected.option_id.to_string().as_str() {
+            // Borrow the newtype's `Arc<str>` rather than allocating a `String` per
+            // answer. Keeping the comparison on `&str` also keeps the ids type-checked
+            // at the boundary instead of degenerating into stringly-typed matching.
+            match &*selected.option_id.0 {
                 ALLOW_ONCE | ALLOW_ALWAYS => ApprovalOutcome::Allowed,
                 _ => ApprovalOutcome::Denied(DenyReason::User),
             }
@@ -155,6 +158,35 @@ mod tests {
             ApprovalOutcome::Denied(DenyReason::User),
             "unknown answers must fail closed"
         );
+    }
+
+    /// Option ids are matched **exactly**, not by prefix or substring.
+    ///
+    /// A permissive match would be a privilege escalation: a client sending
+    /// `allow-later`, or a future spec adding an id in the `allow-*` family we do not
+    /// understand, would be read as consent. Every case below shares a prefix or
+    /// substring with a real id, so a `starts_with("allow")`-style match passes the test
+    /// above while failing this one — which is exactly how this test earned its place: a
+    /// mutation to prefix matching survived the suite until it existed.
+    #[test]
+    fn option_ids_are_matched_exactly_not_by_prefix() {
+        for near_miss in [
+            "allow",          // prefix of both allow ids
+            "allow-later",    // shares the `allow-` family
+            "allow-once-ish", // extends a real id
+            "allow_once",     // underscore, not hyphen
+            "Allow-Once",     // wrong case
+            "reject",         // prefix of the reject id
+        ] {
+            let outcome = round_trip(&wire::RequestPermissionOutcome::Selected(
+                wire::SelectedPermissionOutcome::new(near_miss),
+            ));
+            assert_eq!(
+                outcome_to_approval(&outcome),
+                ApprovalOutcome::Denied(DenyReason::User),
+                "{near_miss:?} is not an id we offered and must not be read as consent"
+            );
+        }
     }
 
     #[test]

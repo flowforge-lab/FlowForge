@@ -16,14 +16,17 @@ const ALL: [Mode; 3] = [Mode::Plan, Mode::Act, Mode::Auto];
 
 /// The ACP id for a mode.
 ///
-/// Derived from `Mode`'s serde form (`rename_all = "camelCase"`), so this stays in
-/// lockstep with the `--mode` flag and the TypeScript bindings instead of becoming a
-/// second, silently diverging vocabulary.
-pub fn mode_id(mode: Mode) -> String {
-    serde_json::to_value(mode)
-        .ok()
-        .and_then(|v| v.as_str().map(str::to_owned))
-        .expect("Mode serialises to a JSON string")
+/// Must equal `Mode`'s own serde form (`rename_all = "camelCase"`) so the ACP surface
+/// cannot drift from the `--mode` flag and the TypeScript bindings. That equivalence is
+/// enforced by [`tests::ids_match_modes_own_serde_form`] rather than by routing every
+/// lookup through `serde_json` — the test is what prevents a second vocabulary, so the
+/// implementation can stay allocation-free.
+pub fn mode_id(mode: Mode) -> &'static str {
+    match mode {
+        Mode::Plan => "plan",
+        Mode::Act => "act",
+        Mode::Auto => "auto",
+    }
 }
 
 /// Resolve an ACP mode id back to a [`Mode`].

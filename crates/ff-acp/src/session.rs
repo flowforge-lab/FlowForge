@@ -14,6 +14,18 @@ use std::sync::{Arc, Mutex};
 ///
 /// Mirrors the desktop's proven `register_cancel` / `take_cancel_if` pattern, kept here
 /// so an ACP host does not have to reinvent it.
+///
+/// # Why poisoning is recovered rather than propagated
+///
+/// An ACP host is a long-lived process, so a panic in one turn must not make *every*
+/// later `session/cancel` panic — that turns one failed turn into an unusable host, and
+/// cancellation is exactly the path a user reaches for when something has gone wrong.
+///
+/// Recovery is sound here because the map holds only `CancelToken`s (`Arc<AtomicBool>`
+/// flags with no cross-entry invariant), so a panic mid-operation cannot leave the
+/// contents inconsistent — there is no broken state for poisoning to protect us from.
+/// Follows the same `unwrap_or_else(|p| p.into_inner())` pattern as
+/// `ff-observer`'s watcher lock.
 #[derive(Default)]
 pub struct SessionRegistry {
     inner: Mutex<HashMap<Arc<str>, CancelToken>>,
@@ -24,15 +36,16 @@ impl SessionRegistry {
         Self::default()
     }
 
+    fn entries(&self) -> std::sync::MutexGuard<'_, HashMap<Arc<str>, CancelToken>> {
+        self.inner.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
     /// Associate a session with the token for its current turn.
     ///
     /// Re-registering an id replaces the previous token, which is what a second
     /// `session/prompt` on the same session should do.
     pub fn register(&self, session: &wire::SessionId, token: CancelToken) {
-        self.inner
-            .lock()
-            .expect("session registry mutex")
-            .insert(Arc::clone(&session.0), token);
+        self.entries().insert(Arc::clone(&session.0), token);
     }
 
     /// Cancel a session's in-flight turn.
@@ -41,12 +54,7 @@ impl SessionRegistry {
     /// erroring: a notification has no response channel, and a late `session/cancel`
     /// arriving after a turn has finished is legal per spec, not a fault.
     pub fn cancel(&self, session: &wire::SessionId) -> bool {
-        match self
-            .inner
-            .lock()
-            .expect("session registry mutex")
-            .get(&session.0)
-        {
+        match self.entries().get(&session.0) {
             Some(token) => {
                 token.cancel();
                 true
@@ -58,15 +66,12 @@ impl SessionRegistry {
     /// Forget a session once its turn is done, so the map does not grow without bound
     /// in a long-lived host process.
     pub fn remove(&self, session: &wire::SessionId) {
-        self.inner
-            .lock()
-            .expect("session registry mutex")
-            .remove(&session.0);
+        self.entries().remove(&session.0);
     }
 
     /// Number of tracked sessions. Test/observability aid.
     pub fn len(&self) -> usize {
-        self.inner.lock().expect("session registry mutex").len()
+        self.entries().len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -132,5 +137,34 @@ mod tests {
         assert_eq!(reg.len(), 1);
         reg.remove(&id("sess"));
         assert!(reg.is_empty());
+    }
+
+    /// A panic while the lock is held must not disable cancellation for the rest of the
+    /// host's life. Without poison recovery every later `session/cancel` would panic,
+    /// escalating one bad turn into an unusable process — and cancellation is precisely
+    /// what a user reaches for when a turn has gone wrong.
+    #[test]
+    fn a_poisoned_lock_still_cancels() {
+        use std::panic::{catch_unwind, AssertUnwindSafe};
+
+        let reg = SessionRegistry::new();
+        let token = CancelToken::new();
+        reg.register(&id("sess"), token.clone());
+
+        // Poison the mutex: panic while holding the guard.
+        let poisoned = catch_unwind(AssertUnwindSafe(|| {
+            let _guard = reg.inner.lock().unwrap();
+            panic!("simulated panic while holding the registry lock");
+        }));
+        assert!(poisoned.is_err(), "the test must actually panic");
+        assert!(
+            reg.inner.is_poisoned(),
+            "the mutex must actually be poisoned, or this test proves nothing"
+        );
+
+        // The registry keeps working, and the entry survived.
+        assert_eq!(reg.len(), 1);
+        assert!(reg.cancel(&id("sess")));
+        assert!(token.is_cancelled());
     }
 }
