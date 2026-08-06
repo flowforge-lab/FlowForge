@@ -234,7 +234,10 @@ pnpm tauri build            # requires TAURI_SIGNING_PRIVATE_KEY (see below)
 > *"A public key has been found, but no private key… set `TAURI_SIGNING_PRIVATE_KEY`"*
 > unless that release secret is in your env. For everyday local builds use
 > **`pnpm build:local`** (passes `--config src-tauri/tauri.no-updater-sign.conf.json`,
-> the same overlay `dev-install.sh` uses) — it produces a runnable bundle with no key.
+> one of the overlays `dev-install.sh` uses) — it produces a runnable bundle with no key.
+> Note `build:local` layers *only* that overlay, so it bakes the production updater
+> pubkey; `dev-install.sh` additionally layers your dev pubkey, which is what lets a
+> D1 update install onto it (§8.3).
 > A file-path `--config` is used instead of an inline JSON string so the command is
 > shell-quoting-safe on Windows (`cmd.exe`/PowerShell don't strip single quotes the
 > way bash does).
@@ -297,7 +300,10 @@ directory, **not** the app bundle, so it survives every reinstall and update for
 
 ### 8.2 D2 — direct reinstall (the daily loop)
 
-The everyday loop: build locally and replace the installed app. No updater, no server.
+The everyday loop: build locally and replace the installed app. No update feed, no server.
+(The updater plugin still ships — only artifact *creation* is off — and the build is
+built against your dev pubkey so a D1 update can install onto it. The GitHub endpoint
+is left intact, so ordinary update checks still work.)
 
 ```bash
 ./scripts/dev-install.sh
