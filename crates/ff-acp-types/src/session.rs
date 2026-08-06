@@ -8,6 +8,15 @@ use serde::{Deserialize, Serialize};
 use crate::rpc::Meta;
 use crate::tool::{ToolCallId, ToolCallLocation, ToolCallStatus, ToolCallUpdate, ToolKind};
 
+// The ACP wire IDs (`SessionId`, `ToolCallId`, `TerminalId`, `PermissionOptionId`,
+// ...) are modeled as type aliases over `String`, not newtypes. A newtype would
+// catch a `ToolCallId` passed where a `SessionId` is expected at compile time,
+// which matters for the #1203 permission-mapping layer. We keep aliases so the
+// wire layer stays maximally plain and conversions are zero-cost everywhere; if
+// a consumer proves type confusion is a real risk, promote the aliases to
+// `pub struct X(pub String)` — the change is mechanical and this crate is the
+// only place that needs editing.
+
 /// A unique session identifier.
 pub type SessionId = String;
 

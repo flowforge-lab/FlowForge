@@ -5,11 +5,14 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::permission::{PermissionOption, RequestPermissionOutcome};
 use crate::rpc::Meta;
 use crate::session::SessionId;
 use crate::tool::TerminalId;
-use crate::tool::ToolCallUpdate;
+
+/// `session/request_permission` payloads live in [`crate::permission`]; the
+/// request is agent→client, so it is re-exported here alongside the other
+/// agent→client method payloads.
+pub use crate::permission::{RequestPermissionRequest, RequestPermissionResponse};
 
 // ---------------------------------------------------------------------------
 // fs/read_text_file
@@ -57,30 +60,6 @@ pub struct WriteTextFileRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WriteTextFileResponse {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub _meta: Option<Meta>,
-}
-
-// ---------------------------------------------------------------------------
-// session/request_permission
-// ---------------------------------------------------------------------------
-
-/// Request: `session/request_permission`
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RequestPermissionRequest {
-    pub session_id: SessionId,
-    pub tool_call: ToolCallUpdate,
-    pub options: Vec<PermissionOption>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub _meta: Option<Meta>,
-}
-
-/// Response: `session/request_permission`
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RequestPermissionResponse {
-    pub outcome: RequestPermissionOutcome,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub _meta: Option<Meta>,
 }
