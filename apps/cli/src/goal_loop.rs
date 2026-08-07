@@ -133,6 +133,8 @@ impl GoalIteration for CliGoalIteration {
             None => GOAL_CONTINUE_NUDGE.to_string(),
         };
         self.session_store
+            .ensure_session(&goal.session_id, Some(goal.objective.clone()));
+        self.session_store
             .add_message(&goal.session_id, Role::User, prompt);
 
         let matrix = PermissionMatrix::default();
