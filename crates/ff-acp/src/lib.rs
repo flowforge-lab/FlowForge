@@ -38,3 +38,21 @@ pub mod advertise;
 pub mod mode;
 pub mod permission;
 pub mod session;
+
+#[cfg(test)]
+mod protocol_pin {
+    //! Structural guard for the v1 pin (spec #1215, criterion 2).
+    //!
+    //! The doc comment above states the *intent* — never enable `unstable_protocol_v2`.
+    //! This makes that intent enforceable: `ProtocolVersion::LATEST` exists **only**
+    //! while the feature is off (the schema crate withdraws it under
+    //! `unstable_protocol_v2` to force an explicit choice). So the moment anyone turns
+    //! the feature on, this stops compiling — the "future feature-flag addition trips
+    //! it" the spec asked for, caught at build time rather than runtime.
+    use agent_client_protocol::schema::ProtocolVersion;
+
+    #[test]
+    fn ff_acp_speaks_acp_v1() {
+        assert_eq!(ProtocolVersion::LATEST, ProtocolVersion::V1);
+    }
+}

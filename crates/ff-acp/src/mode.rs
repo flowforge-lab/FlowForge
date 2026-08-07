@@ -31,12 +31,20 @@ pub fn mode_id(mode: Mode) -> &'static str {
 
 /// Resolve an ACP mode id back to a [`Mode`].
 ///
+/// Takes the typed [`wire::SessionModeId`] rather than a bare `&str` so callers cannot
+/// pass a mode id where some other protocol string was meant — the same newtype
+/// discipline `session.rs` keeps for [`wire::SessionId`].
+///
 /// Returns `None` for anything unrecognised. This is deliberately *not* a fallback to
 /// [`Mode::Plan`]: silently coercing an unknown id would leave us and the client
 /// disagreeing about what mode the session is in, and "safe-looking" is not the same
-/// as safe when the disagreement is invisible.
-pub fn mode_from_id(id: &str) -> Option<Mode> {
-    ALL.into_iter().find(|m| mode_id(*m) == id)
+/// as safe when the disagreement is invisible. `Option` (rather than the spec's
+/// `Result<_, wire::Error>`) is faithful while there is no server: only the #1201
+/// request handler can turn a miss into a JSON-RPC error with a real request id, so
+/// minting a `wire::Error` here would fabricate one. #1201 lifts this to `Result` at
+/// the call site.
+pub fn mode_from_id(id: &wire::SessionModeId) -> Option<Mode> {
+    ALL.into_iter().find(|m| mode_id(*m) == &*id.0)
 }
 
 fn name(mode: Mode) -> &'static str {
@@ -97,7 +105,7 @@ mod tests {
         for m in json["availableModes"].as_array().unwrap() {
             let id = m["id"].as_str().unwrap();
             assert!(
-                mode_from_id(id).is_some(),
+                mode_from_id(&wire::SessionModeId::new(id)).is_some(),
                 "advertised id {id:?} does not resolve back to a Mode"
             );
         }
@@ -114,10 +122,10 @@ mod tests {
 
     #[test]
     fn unknown_ids_do_not_fall_back() {
-        assert_eq!(mode_from_id("yolo"), None);
-        assert_eq!(mode_from_id(""), None);
+        assert_eq!(mode_from_id(&wire::SessionModeId::new("yolo")), None);
+        assert_eq!(mode_from_id(&wire::SessionModeId::new("")), None);
         // Case matters: the protocol id is exact, not normalised.
-        assert_eq!(mode_from_id("Plan"), None);
+        assert_eq!(mode_from_id(&wire::SessionModeId::new("Plan")), None);
     }
 
     #[test]
