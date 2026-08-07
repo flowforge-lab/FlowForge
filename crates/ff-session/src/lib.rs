@@ -241,6 +241,26 @@ impl SessionStore {
         session
     }
 
+    /// Ensure a session row exists for a caller-owned id, creating it if absent.
+    ///
+    /// Unlike [`create_session`](Self::create_session), which mints its own id, this
+    /// takes the id the caller already owns and is idempotent — a second call is a
+    /// no-op. Goal mode needs both properties: the goal's id lives in a separate
+    /// on-disk store, and the message DB (`SessionStore::new()`) is in-memory and
+    /// rebuilt every process, so the row must be (re)established for that id at the
+    /// start of every run — including a resume — before the first message write, or
+    /// the `messages.session_id` foreign key is violated (#1221).
+    pub fn ensure_session(&self, session_id: &str, goal: Option<String>) -> Session {
+        if let Some(existing) = self.get_session(session_id) {
+            return existing;
+        }
+        let mut session = new_session(goal);
+        session.id = session_id.to_string();
+        let conn = self.conn.lock().unwrap();
+        insert_session(&conn, &session);
+        session
+    }
+
     /// Create a session **without persisting it** (#671 item 2a). The bare `＋` in
     /// the desktop app makes an in-memory draft that stays off disk — and out of
     /// [`list_sessions`](Self::list_sessions) — until its first message (or first

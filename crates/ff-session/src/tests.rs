@@ -1914,3 +1914,70 @@ fn co_invocation_aggregates_across_sessions() {
         "the prior is cross-session; per-session counts would be too sparse to use"
     );
 }
+
+// --- ensure_session: the id-accepting, idempotent insert goal mode relies on (#1221) ---
+
+#[test]
+fn ensure_session_lets_a_caller_owned_id_take_messages() {
+    // Goal mode owns the id (it lives in a separate on-disk goal store) and the
+    // message DB is a fresh in-memory store, so the row must be created for *that*
+    // id before the first write, or the messages FK is violated.
+    let store = SessionStore::new();
+    let id = "11111111-1111-4111-8111-111111111111";
+
+    store.ensure_session(id, Some("say hi".into()));
+    // The write that used to panic with FOREIGN KEY constraint failed.
+    store.add_message(id, Role::User, "say hi".into());
+
+    let s = store
+        .get_session(id)
+        .expect("row exists for the caller's id");
+    assert_eq!(s.id, id, "the row keeps the id the caller supplied");
+    assert_eq!(store.get_messages(id).len(), 1);
+}
+
+#[test]
+fn ensure_session_is_idempotent_and_preserves_the_first_row() {
+    // Resume runs in a new process with an empty in-memory store, so ensure_session
+    // is called again for an id that (within one process) may already exist. A second
+    // call must not error, duplicate, or clobber the existing row's messages.
+    let store = SessionStore::new();
+    let id = "22222222-2222-4222-8222-222222222222";
+
+    store.ensure_session(id, Some("first".into()));
+    store.add_message(id, Role::User, "first".into());
+    let returned = store.ensure_session(id, Some("second".into()));
+
+    assert_eq!(returned.id, id);
+    assert_eq!(
+        store.list_sessions().len(),
+        1,
+        "a second ensure_session must not create a duplicate row"
+    );
+    assert_eq!(
+        store.get_messages(id).len(),
+        1,
+        "the pre-existing message must survive a re-ensure"
+    );
+}
+
+#[test]
+fn add_message_without_a_session_row_is_the_bug_ensure_session_prevents() {
+    // Documents the exact failure #1221 hit: writing a message for an id that has no
+    // sessions row violates the messages FK. This is the panic goal mode used to take
+    // on every run; ensure_session (asserted above) is what makes it not happen. If a
+    // future change makes this write succeed silently, that is itself a regression in
+    // the FK, and this test should be revisited deliberately.
+    let store = SessionStore::new();
+    let orphan = "33333333-3333-4333-8333-333333333333";
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        store.add_message(orphan, Role::User, "no row for me".into());
+    }));
+
+    assert!(
+        result.is_err(),
+        "writing a message for an id with no session row must fail (messages FK); \
+         goal mode avoids this by calling ensure_session first"
+    );
+}
