@@ -26,6 +26,13 @@ pub struct InboundMessage {
     pub text: String,
     pub sender_id: String,
     pub timestamp: i64,
+    /// Opaque, transport-specific anchor for replying in the same conversation
+    /// thread as this message. Slack sets it to the thread the reply should land
+    /// in (`thread_ts` if the message is already threaded, else the message's own
+    /// `ts` so the reply opens a thread on it). Transports without threading
+    /// (CLI, mock) leave it `None`, and a transport that ignores it still behaves
+    /// exactly as before.
+    pub reply_thread: Option<String>,
 }
 
 /// Notifications the router can push to a transport (non-response events).

@@ -110,6 +110,10 @@ struct EventInner {
     text: Option<String>,
     channel: Option<String>,
     ts: Option<String>,
+    /// Set when the triggering message is itself inside a thread. Replies anchor
+    /// to this when present, else to `ts` (opening a thread on the message). #1098.
+    #[serde(default)]
+    thread_ts: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -219,16 +223,19 @@ fn parse_events_api(outer: Outer) -> Result<SlackEnvelope, ParseError> {
         ));
     }
 
-    // NOTE: `event.thread_ts` is intentionally not captured here. Threading a
-    // reply back to its parent needs a thread slot on `InboundMessage` (an
-    // `ff-transport` core change) plus a routing decision — a same-channel
-    // threaded reply must not collapse into the channel's root session. That
-    // is a T3 concern (#1058); T2 parses the flat message only.
+    // Anchor a reply to the triggering message's thread (#1098). If the message is
+    // already threaded, reply into that same thread (`thread_ts`); otherwise anchor
+    // to the message's own `ts`, which opens a thread hanging off it. The session
+    // key stays `channel` alone (see `Router::resolve_session`), so a threaded reply
+    // does not collapse into — or split off from — the channel's session; the anchor
+    // only steers where the reply is posted, never which conversation it belongs to.
+    let reply_thread = Some(event.thread_ts.unwrap_or_else(|| ts.clone()));
     let message = InboundMessage {
         channel: ChannelId::new("slack", channel),
         text,
         sender_id,
         timestamp: parse_slack_ts(&ts),
+        reply_thread,
     };
     Ok(SlackEnvelope::Message {
         envelope_id: id,

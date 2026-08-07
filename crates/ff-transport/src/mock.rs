@@ -70,7 +70,11 @@ impl MessageTransport for MockTransport {
         self.rx.recv().await
     }
 
-    fn begin_response(&self, _channel: &ChannelId) -> Box<dyn ResponseStream> {
+    fn begin_response(
+        &self,
+        _channel: &ChannelId,
+        _reply_thread: Option<&str>,
+    ) -> Box<dyn ResponseStream> {
         let record = ResponseRecord::default();
         let idx = {
             let mut responses = self.responses.lock().unwrap();

@@ -30,6 +30,10 @@ pub enum OutboundOp {
     /// Post a new message (a first reply, or an overflow continuation part).
     Post {
         channel: String,
+        /// Thread to post into (#1098). `Some` for a Slack-triggered reply so every
+        /// part lands in the triggering message's thread; `None` posts to the
+        /// channel root. All parts of one reply carry the same anchor.
+        thread_ts: Option<String>,
         text: String,
         /// The writer sends the `ts` Slack assigned back through this channel so
         /// the posting response stream can edit the message in place next flush
@@ -106,10 +110,14 @@ where
                 }
                 OutboundOp::Post {
                     channel,
+                    thread_ts,
                     text,
                     ts_tx,
                 } => {
-                    if let Ok(ts) = api.post_message(&channel, &text).await {
+                    if let Ok(ts) = api
+                        .post_message(&channel, thread_ts.as_deref(), &text)
+                        .await
+                    {
                         // Report the assigned `ts` back to the posting stream. A
                         // send error means the stream is gone (nothing to edit);
                         // ignore it.

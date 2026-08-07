@@ -157,6 +157,43 @@ fn user_message_maps_to_inbound_message() {
             assert_eq!(message.text, "deploy the thing");
             // "1548261231.000200" → whole-second part.
             assert_eq!(message.timestamp, 1548261231);
+            // No `thread_ts` on the event → reply anchors to the message's own
+            // `ts`, opening a thread on it (#1098).
+            assert_eq!(message.reply_thread.as_deref(), Some("1548261231.000200"));
+        }
+        other => panic!("expected Message, got {other:?}"),
+    }
+}
+
+const THREADED_USER_MESSAGE: &str = r#"{
+  "envelope_id": "abc-envelope-thread",
+  "type": "events_api",
+  "accepts_response_payload": false,
+  "payload": {
+    "type": "event_callback",
+    "event": {
+      "type": "message",
+      "channel": "C01234567",
+      "user": "U99999999",
+      "text": "and again",
+      "ts": "1548261300.000500",
+      "thread_ts": "1548261231.000200"
+    }
+  }
+}"#;
+
+#[test]
+fn threaded_message_anchors_reply_to_the_existing_thread() {
+    // The trigger is already inside a thread → reply into that same thread
+    // (`thread_ts`), not the message's own `ts` (#1098).
+    match parse_envelope(THREADED_USER_MESSAGE).unwrap() {
+        SlackEnvelope::Message { message, .. } => {
+            assert_eq!(message.reply_thread.as_deref(), Some("1548261231.000200"));
+            assert_ne!(
+                message.reply_thread.as_deref(),
+                Some("1548261300.000500"),
+                "must anchor to the thread root, not this message's own ts"
+            );
         }
         other => panic!("expected Message, got {other:?}"),
     }
