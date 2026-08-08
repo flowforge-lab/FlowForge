@@ -9,6 +9,7 @@ fn stop_reason_wire_round_trips_every_variant() {
         StopReason::ToolLimit,
         StopReason::Stall,
         StopReason::EmptyResponse,
+        StopReason::MalformedToolCall,
         StopReason::Interrupted,
     ] {
         assert_eq!(
