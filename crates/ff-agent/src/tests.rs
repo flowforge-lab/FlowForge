@@ -5269,6 +5269,87 @@ async fn leaked_tool_call_exhausts_to_malformed_stop() {
     assert!(!last.content.contains("<invoke"));
 }
 
+/// Streams a leaked tool call in a `done` chunk (so it lands in `acc`), then
+/// cancels the shared token as the loop drains the trailing usage frame -- a
+/// user pressing Stop after raw XML has already spewed. The held token is the
+/// same one passed to `run_turn`.
+struct LeakThenCancel {
+    cancel: CancelToken,
+}
+#[async_trait]
+impl Provider for LeakThenCancel {
+    async fn chat_stream(&self, _req: ChatRequest) -> Result<ChunkStream, LlmError> {
+        let cancel = self.cancel.clone();
+        // First item carries the leak and `done: true` (appended to `acc` before
+        // the loop drains the trailing frame). The second poll flips the cancel
+        // and yields the trailing usage frame -- so cancellation is observed
+        // *after* the leak is already in `acc`, exactly the Blocker-2 path.
+        let first = Some(Ok(Chunk {
+            delta: "on it\n<invoke name=\"bash\">\n<parameter name=\"command\">ls</parameter>\n</invoke>"
+                .into(),
+            done: true,
+            ..Chunk::default()
+        }));
+        let stream = futures_util::stream::unfold((0u8, first), move |(n, first)| {
+            let cancel = cancel.clone();
+            async move {
+                match n {
+                    0 => first.map(|item| (item, (1, None))),
+                    1 => {
+                        cancel.cancel();
+                        Some((Ok(Chunk::default()), (2, None)))
+                    }
+                    _ => None,
+                }
+            }
+        });
+        Ok(stream.boxed())
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn user_cancel_during_a_leak_is_not_relabelled_malformed() {
+    let store = SessionStore::new();
+    let s = store.create_session(None);
+    store.add_message(&s.id, Role::User, "go".into());
+    let registry = ToolRegistry::new();
+    let root = std::env::current_dir().unwrap();
+    let approve = AlwaysApprove;
+    let cancel = CancelToken::new();
+
+    let msg = run_turn(
+        &LeakThenCancel {
+            cancel: cancel.clone(),
+        },
+        &store,
+        &ctx(&registry, &root, &approve),
+        &s.id,
+        "mock",
+        None,
+        false,
+        ReasoningVisibility::All,
+        cancel,
+        |_| {},
+    )
+    .await
+    .unwrap();
+
+    // A deliberate Stop wins: with the leak already in `acc`, the guard must
+    // still decline to fire, so the turn is never relabelled MalformedToolCall
+    // and the marker never clobbers the (cancelled) partial text -- matching
+    // every other cancel path.
+    assert_ne!(
+        msg.stop_reason,
+        Some(StopReason::MalformedToolCall),
+        "a user Stop must not be recorded as a malformed tool call"
+    );
+    assert_ne!(
+        msg.content,
+        StopReason::MalformedToolCall.marker(),
+        "the marker must not clobber the partial text on cancel"
+    );
+}
+
 #[tokio::test]
 async fn repeat_nudge_persists_through_the_recovery_window() {
     let store = SessionStore::new();

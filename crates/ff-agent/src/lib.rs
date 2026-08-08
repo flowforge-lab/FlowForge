@@ -717,7 +717,11 @@ fn role_str(role: Role) -> &'static str {
 /// `<parameter` (with the attribute name) -- so an incidental `<invoke>` word
 /// in prose does not trip detection. Detection and stripping both ignore fenced
 /// code blocks so a legitimate example of the syntax inside ``` ``` ``` survives
-/// (same constraint as #1102).
+/// (same constraint as #1102). Inline-backtick spans are deliberately *not*
+/// exempt: an unfenced `<parameter …>` in prose is rare, and treating a
+/// one-liner as safe would give a real leak a trivial way to slip through; the
+/// cost of a false positive is bounded (a few wasted retries, then a clean
+/// MalformedToolCall finalize), so the marker stays conservative.
 const LEAK_MARKERS: [&str; 2] = ["<invoke name=", "<parameter"];
 
 /// Tag fragments removed when a leak has been confirmed. Broader than
@@ -754,6 +758,13 @@ fn outside_code_fences(text: &str) -> impl Iterator<Item = &str> {
 /// model and re-triggering the imitation cascade. Only strips once a leak is
 /// confirmed by [`contains_leaked_tool_call`], so prose that merely mentions a
 /// closing tag in passing is left alone.
+///
+/// Works line-at-a-time and rejoins with `\n`: this is a coarse neutralizer,
+/// not a precise excision. It runs only on the replayed copy fed to the model
+/// (never on what is persisted or shown), so normalizing a trailing newline /
+/// CRLF, or dropping a whole line that happens to wrap a tag mid-sentence, is
+/// acceptable -- the goal is that the model never re-reads the tool-call syntax,
+/// not that the surrounding prose survives byte-for-byte.
 fn strip_leaked_tool_call(text: &str) -> String {
     if !contains_leaked_tool_call(text) {
         return text.to_string();
@@ -2442,11 +2453,15 @@ pub async fn run_turn(
         // normal answer -- replace the body with the reason's marker and record
         // the structured stop on the row too, so the `Done` event and the
         // persisted `Message.stop_reason` agree (the invariant #658 relies on).
-        if calls.is_empty() && contains_leaked_tool_call(&acc) {
-            if stop_reason.is_none() {
-                stop_reason = Some(StopReason::MalformedToolCall);
-            }
-            let reason = stop_reason.unwrap_or(StopReason::MalformedToolCall);
+        //
+        // A user Stop takes precedence: when the turn was cancelled mid-leak the
+        // partial text is kept as-is and the cancel is resolved downstream, so a
+        // deliberate Stop is never relabelled MalformedToolCall (matching the
+        // `!cancel.is_cancelled()` guard on both retry arms above, and the
+        // "a user cancel wins over any in-loop reason" rule the post-loop
+        // resolver documents).
+        if calls.is_empty() && contains_leaked_tool_call(&acc) && !cancel.is_cancelled() {
+            let reason = *stop_reason.get_or_insert(StopReason::MalformedToolCall);
             store.set_message_stop_reason(&message_id, session_id, reason);
             acc = reason.marker().to_string();
         }
