@@ -42,6 +42,7 @@ base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
 dirs = "5"
 rmcp = "1.7"
+agent-client-protocol = "2"
 
 ff-core = { path = "crates/ff-core" }
 ff-agent = { path = "crates/ff-agent" }
@@ -58,6 +59,7 @@ ff-workflow = { path = "crates/ff-workflow" }
 ff-transport = { path = "crates/ff-transport" }
 ff-transport-slack = { path = "crates/ff-transport-slack" }
 ff-logging = { path = "crates/ff-logging" }
+ff-acp = { path = "crates/ff-acp" }
 
 lru = "0.12"
 minijinja = { version = "2", default-features = false, features = ["builtins", "std_collections", "macros", "adjacent_loop_items", "serde"] }

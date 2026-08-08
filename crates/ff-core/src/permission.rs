@@ -543,6 +543,17 @@ pub enum DenyReason {
     /// Also used for unattended contexts (scheduled fires, messaging transports)
     /// where there is simply no approval surface.
     NoInteractiveTerminal,
+    /// The turn was cancelled while an `Ask` prompt was still pending, so the
+    /// approval was never answered.
+    ///
+    /// Deliberately distinct from [`DenyReason::User`]: nobody declined anything.
+    /// Attributing a cancelled turn to the user would record a decision that never
+    /// happened, and the model would be told it was refused rather than interrupted.
+    ///
+    /// Introduced for the ACP boundary (#1215): the protocol requires a client to
+    /// answer every pending `session/request_permission` with `cancelled` when it
+    /// sends `session/cancel`, and that answer needs somewhere faithful to land.
+    Cancelled,
 }
 
 /// The synchronous, pre-prompt decision for a tool call (#828 Part C, #829 review).

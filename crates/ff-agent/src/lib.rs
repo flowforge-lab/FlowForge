@@ -152,6 +152,32 @@ fn is_rate_limited(error: &LlmError) -> bool {
     matches!(error, LlmError::RateLimited { .. })
 }
 
+/// The message handed back to the model when a tool call is refused.
+///
+/// Extracted from `run_turn` so each reason's wording is directly testable: the model
+/// acts on this text, so two different reasons collapsing to the same sentence is a
+/// real defect rather than a cosmetic one. `Cancelled` in particular must not read as a
+/// refusal — nobody declined anything.
+pub(crate) fn denial_message(tool_name: &str, reason: &DenyReason) -> String {
+    match reason {
+        DenyReason::Mode { mode, safety } => format!(
+            "call to `{tool_name}` was denied: {mode:?} mode does not allow {safety:?} tools. Switch to Act mode to run this."
+        ),
+        DenyReason::User => {
+            format!("call to `{tool_name}` was denied: user declined the approval prompt.")
+        }
+        DenyReason::ScopedRule { rule } => {
+            format!("call to `{tool_name}` was denied by scoped permission rule: {rule}.")
+        }
+        DenyReason::NoInteractiveTerminal => {
+            format!("call to `{tool_name}` was denied: no interactive approval surface available.")
+        }
+        DenyReason::Cancelled => format!(
+            "call to `{tool_name}` was not run: the turn was cancelled before the approval was answered."
+        ),
+    }
+}
+
 /// Sleep `ms`, but wake early (and often) if the turn is cancelled, so a retry
 /// backoff never holds a cancelled turn open. `CancelToken` is a bare flag with no
 /// future to await, so we poll it in small steps.
@@ -2650,27 +2676,9 @@ pub async fn run_turn(
                                         }
                                     }
                                 }
-                                ApprovalOutcome::Denied(reason) => {
-                                    let msg = match reason {
-                                        DenyReason::Mode { mode, safety } => format!(
-                                            "call to `{}` was denied: {:?} mode does not allow {:?} tools. Switch to Act mode to run this.",
-                                            call.name, mode, safety
-                                        ),
-                                        DenyReason::User => format!(
-                                            "call to `{}` was denied: user declined the approval prompt.",
-                                            call.name
-                                        ),
-                                        DenyReason::ScopedRule { rule } => format!(
-                                            "call to `{}` was denied by scoped permission rule: {}.",
-                                            call.name, rule
-                                        ),
-                                        DenyReason::NoInteractiveTerminal => format!(
-                                            "call to `{}` was denied: no interactive approval surface available.",
-                                            call.name
-                                        ),
-                                    };
-                                    ff_tools::ToolOutcome::error(msg)
-                                }
+                                ApprovalOutcome::Denied(reason) => ff_tools::ToolOutcome::error(
+                                    denial_message(&call.name, &reason),
+                                ),
                             }
                         }
                     }
