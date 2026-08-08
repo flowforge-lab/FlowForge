@@ -306,7 +306,11 @@ impl MessageTransport for SlackTransport {
         }
     }
 
-    fn begin_response(&self, channel: &ChannelId) -> Box<dyn ResponseStream> {
+    fn begin_response(
+        &self,
+        channel: &ChannelId,
+        reply_thread: Option<&str>,
+    ) -> Box<dyn ResponseStream> {
         // If called before connect (shouldn't happen in the Router flow), fall
         // back to a stream over a closed writer so chunks are harmlessly dropped.
         let writer = self
@@ -315,6 +319,7 @@ impl MessageTransport for SlackTransport {
             .unwrap_or_else(crate::writer::WriterHandle::disconnected);
         Box::new(SlackResponseStream::new(
             channel.platform_id.clone(),
+            reply_thread.map(str::to_owned),
             writer,
         ))
     }

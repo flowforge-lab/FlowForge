@@ -81,11 +81,20 @@ pub trait MessageTransport: Send + Sync {
     /// Open a response stream for the given channel. The router writes assistant
     /// output into this stream; the transport delivers it to the platform.
     ///
+    /// `reply_thread` is the triggering message's [`InboundMessage::reply_thread`]
+    /// anchor: a transport that supports threading (Slack) posts the reply into it,
+    /// so answers land in the thread they were asked in (#1098). Transports without
+    /// threading ignore it and reply exactly as before.
+    ///
     /// Takes `&self` (not `&mut self`) so the router can hold a transport reference
     /// across an async turn without exclusive borrowing. Transports that need
     /// mutable state (e.g. Slack `chat.update` with a message handle) should use
     /// interior mutability (`Arc<Mutex<...>>`) in the returned `ResponseStream`.
-    fn begin_response(&self, channel: &ChannelId) -> Box<dyn ResponseStream>;
+    fn begin_response(
+        &self,
+        channel: &ChannelId,
+        reply_thread: Option<&str>,
+    ) -> Box<dyn ResponseStream>;
 
     /// Push a non-response notification (typing indicator, tool call label, etc.).
     fn notify(&self, channel: &ChannelId, notification: Notification);

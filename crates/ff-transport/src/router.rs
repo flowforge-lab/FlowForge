@@ -121,8 +121,10 @@ impl Router {
             // Notify transport that we're starting.
             transport.notify(&channel, Notification::TurnStarted);
 
-            // Open a response stream.
-            let stream = transport.begin_response(&channel);
+            // Open a response stream, anchored to the triggering message's thread
+            // so the reply lands where it was asked (#1098); `resolve_session` keys
+            // on `channel` alone, so this steers delivery only, not session identity.
+            let stream = transport.begin_response(&channel, msg.reply_thread.as_deref());
 
             // Build tool context with mode + egress from config (#2 fix).
             // The approver is injected via `run` (#1056) so interactive

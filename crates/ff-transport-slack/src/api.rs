@@ -65,9 +65,19 @@ impl SlackApi {
         self
     }
 
-    /// Post a new message to `channel`; returns its `ts` on success.
-    pub async fn post_message(&self, channel: &str, text: &str) -> Result<String, ApiError> {
-        let body = serde_json::json!({ "channel": channel, "text": text });
+    /// Post a new message to `channel`; returns its `ts` on success. When
+    /// `thread_ts` is `Some`, the message is posted into that thread (#1098);
+    /// when `None`, it posts to the channel root.
+    pub async fn post_message(
+        &self,
+        channel: &str,
+        thread_ts: Option<&str>,
+        text: &str,
+    ) -> Result<String, ApiError> {
+        let mut body = serde_json::json!({ "channel": channel, "text": text });
+        if let Some(thread_ts) = thread_ts {
+            body["thread_ts"] = serde_json::Value::String(thread_ts.to_owned());
+        }
         let resp = self.call("chat.postMessage", &body).await?;
         resp.ts.ok_or(ApiError::Malformed("ts"))
     }

@@ -167,6 +167,7 @@ async fn run_consults_the_injected_approver() {
         sender_id: "u1".into(),
         text: "do it".into(),
         timestamp: 0,
+        reply_thread: None,
     })
     .unwrap();
 
@@ -335,6 +336,7 @@ async fn shutdown_lets_an_in_flight_message_finish() {
         sender_id: "u1".into(),
         text: "do it".into(),
         timestamp: 0,
+        reply_thread: None,
     })
     .unwrap();
     // Release the test's own sender: the channel closes only when *every*

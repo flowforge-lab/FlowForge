@@ -34,6 +34,7 @@ enum SentOp {
     },
     Post {
         channel: String,
+        thread_ts: Option<String>,
         text: String,
         ts: String,
     },
@@ -56,6 +57,7 @@ fn auto_answer_writer() -> (WriterHandle, mpsc::Receiver<SentOp>) {
                 OutboundOp::Ack { envelope_id } => SentOp::Ack { envelope_id },
                 OutboundOp::Post {
                     channel,
+                    thread_ts,
                     text,
                     ts_tx,
                 } => {
@@ -64,7 +66,12 @@ fn auto_answer_writer() -> (WriterHandle, mpsc::Receiver<SentOp>) {
                     // Mirror the real writer: report the assigned ts back so the
                     // stream records it. Ignore send errors (stream gone).
                     let _ = ts_tx.send(ts.clone());
-                    SentOp::Post { channel, text, ts }
+                    SentOp::Post {
+                        channel,
+                        thread_ts,
+                        text,
+                        ts,
+                    }
                 }
                 OutboundOp::Update { channel, ts, text } => SentOp::Update { channel, ts, text },
             };
@@ -104,7 +111,7 @@ async fn recv_at_least(rx: &mut mpsc::Receiver<SentOp>, n: usize) -> Vec<SentOp>
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn short_reply_posts_one_message() {
     let (writer, mut rx) = auto_answer_writer();
-    let stream = SlackResponseStream::new("C123", writer);
+    let stream = SlackResponseStream::new("C123", None, writer);
 
     stream.chunk("hello world").await;
     stream.finish().await;
@@ -125,7 +132,7 @@ async fn short_reply_posts_one_message() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reply_over_limit_splits_into_parts() {
     let (writer, mut rx) = auto_answer_writer();
-    let stream = SlackResponseStream::new("C1", writer);
+    let stream = SlackResponseStream::new("C1", None, writer);
 
     // 3000 + 500 chars → two parts (first exactly at the limit, second the rest).
     let body = "x".repeat(SLACK_TEXT_LIMIT + 500);
@@ -150,9 +157,107 @@ async fn reply_over_limit_splits_into_parts() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn every_overflow_part_carries_the_same_thread_anchor() {
+    // A reply split across parts must post every part into the same thread as the
+    // trigger, not just the first (#1098, AC 2).
+    let (writer, mut rx) = auto_answer_writer();
+    let stream = SlackResponseStream::new("C1", Some("111.222".to_string()), writer);
+
+    let body = "x".repeat(SLACK_TEXT_LIMIT + 500);
+    stream.chunk(&body).await;
+    stream.finish().await;
+
+    let ops = recv_at_least(&mut rx, 2).await;
+    let posts: Vec<&SentOp> = ops
+        .iter()
+        .filter(|o| matches!(o, SentOp::Post { .. }))
+        .collect();
+    assert_eq!(posts.len(), 2, "expected 2 continuation parts, got {ops:?}");
+    for op in &posts {
+        if let SentOp::Post { thread_ts, .. } = op {
+            assert_eq!(
+                thread_ts.as_deref(),
+                Some("111.222"),
+                "every part must anchor to the trigger's thread"
+            );
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn no_anchor_posts_to_the_channel_root() {
+    // A transport with no thread anchor (or a non-Slack caller) posts to the
+    // channel root exactly as before — threading is additive, not mandatory.
+    let (writer, mut rx) = auto_answer_writer();
+    let stream = SlackResponseStream::new("C1", None, writer);
+
+    stream.chunk("hi").await;
+    stream.finish().await;
+
+    let ops = recv_at_least(&mut rx, 1).await;
+    let post = ops
+        .iter()
+        .find(|o| matches!(o, SentOp::Post { .. }))
+        .expect("one post");
+    if let SentOp::Post { thread_ts, .. } = post {
+        assert_eq!(thread_ts.as_deref(), None, "no anchor → channel root");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn post_message_sends_thread_ts_to_slack() {
+    // AC 1: chat.postMessage carries thread_ts so the reply lands in the thread.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat.postMessage"))
+        .and(body_string_contains("\"thread_ts\":\"1548261231.000200\""))
+        .and(body_string_contains("threaded reply"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({ "ok": true, "ts": "999.001" })),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let api = SlackApi::new("xoxb-test").with_base(server.uri());
+    let ts = api
+        .post_message("C9", Some("1548261231.000200"), "threaded reply")
+        .await
+        .expect("post ok");
+    assert_eq!(ts, "999.001");
+    // `.expect(1)` on drop verifies the thread_ts-bearing body was sent exactly once.
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn post_message_without_thread_ts_omits_the_field() {
+    // The un-threaded path must not send a thread_ts key at all (not "null", not
+    // empty) — Slack treats a present-but-empty thread_ts as an error.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat.postMessage"))
+        .and(move |req: &wiremock::Request| {
+            let v: serde_json::Value = serde_json::from_slice(&req.body).unwrap_or_default();
+            v.get("thread_ts").is_none()
+        })
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({ "ok": true, "ts": "999.002" })),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let api = SlackApi::new("xoxb-test").with_base(server.uri());
+    api.post_message("C9", None, "plain reply")
+        .await
+        .expect("post ok");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn multibyte_split_never_breaks_a_char() {
     let (writer, mut rx) = auto_answer_writer();
-    let stream = SlackResponseStream::new("C1", writer);
+    let stream = SlackResponseStream::new("C1", None, writer);
 
     // '€' is 3 bytes; a body of them forces a split that must land on a char
     // boundary or `String` construction would panic.
@@ -177,7 +282,7 @@ async fn rapid_chunks_coalesce_then_finish_flushes() {
     // With time paused, successive `chunk`s inside the throttle window must
     // coalesce to a single edit; `finish` then forces the final body out.
     let (writer, mut rx) = auto_answer_writer();
-    let stream = SlackResponseStream::new("C1", writer);
+    let stream = SlackResponseStream::new("C1", None, writer);
 
     // First chunk flushes immediately (no prior flush) → one Post(part 0). The
     // double answers its ts, so the stream now knows to edit rather than re-post.
@@ -220,7 +325,7 @@ async fn rapid_chunks_coalesce_then_finish_flushes() {
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn edit_after_throttle_window_flushes() {
     let (writer, mut rx) = auto_answer_writer();
-    let stream = SlackResponseStream::new("C1", writer);
+    let stream = SlackResponseStream::new("C1", None, writer);
 
     stream.chunk("first").await; // immediate post
     let first = recv_at_least(&mut rx, 1).await;
@@ -275,7 +380,7 @@ async fn web_api_round_trip_post_and_update() {
     let api = SlackApi::new("xoxb-test").with_base(server.uri());
 
     let ts = api
-        .post_message("C9", "streamed reply")
+        .post_message("C9", None, "streamed reply")
         .await
         .expect("post ok");
     assert_eq!(ts, "333.001");
@@ -298,7 +403,7 @@ async fn web_api_surfaces_slack_error() {
         .await;
 
     let api = SlackApi::new("xoxb-test").with_base(server.uri());
-    let err = api.post_message("CBAD", "hi").await.unwrap_err();
+    let err = api.post_message("CBAD", None, "hi").await.unwrap_err();
     assert!(
         err.to_string().contains("channel_not_found"),
         "error should surface Slack's reason: {err}"
@@ -349,7 +454,7 @@ async fn end_to_end_post_then_edit_through_real_writer() {
     // Real writer over a no-op socket sink; real API at the mock server.
     let api = SlackApi::new("xoxb-test").with_base(server.uri());
     let writer = crate::writer::spawn_writer(drain::<Message>(), api);
-    let stream = SlackResponseStream::new("C1", writer);
+    let stream = SlackResponseStream::new("C1", None, writer);
 
     // First flush → postMessage; the writer reports the ts back and the stream
     // records it (flush awaits that before returning).
@@ -621,6 +726,7 @@ mod shutdown {
             sender_id: "U1".into(),
             text: text.into(),
             timestamp: 0,
+            reply_thread: None,
         }
     }
 

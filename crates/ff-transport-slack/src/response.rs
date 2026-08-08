@@ -32,9 +32,6 @@
 //!   lock, but the post/edit awaits happen after the lock is dropped; truly
 //!   concurrent callers on the *same* stream could therefore interleave a
 //!   post-vs-edit. That does not arise on the single sequential Router path.
-//! - **`thread_ts` not wired.** Replies post to the channel, not into the
-//!   triggering message's thread. Threading needs `thread_ts` to flow from the
-//!   inbound envelope (T2) through to `chat.postMessage`; tracked as #1098.
 //! - **No client-side rate limiting.** Slack's ~1 msg/sec-per-channel (burst)
 //!   guidance is not enforced here; the [`EDIT_THROTTLE`] coalescing bounds edit
 //!   churn but does not cap posts. Global rate limiting is deferred to Phase 2.
@@ -80,15 +77,25 @@ struct State {
 /// A response stream bound to one Slack channel, backed by the shared writer.
 pub struct SlackResponseStream {
     channel: String,
+    /// Thread anchor for every post in this reply (#1098). `None` when the trigger
+    /// had no thread (non-Slack callers, or a pre-connect fallback), leaving posts
+    /// un-threaded exactly as before.
+    thread_ts: Option<String>,
     writer: WriterHandle,
     state: Mutex<State>,
 }
 
 impl SlackResponseStream {
-    /// Open a stream for `channel`, sending through the shared `writer`.
-    pub fn new(channel: impl Into<String>, writer: WriterHandle) -> Self {
+    /// Open a stream for `channel`, posting into `thread_ts` if set, through the
+    /// shared `writer`.
+    pub fn new(
+        channel: impl Into<String>,
+        thread_ts: Option<String>,
+        writer: WriterHandle,
+    ) -> Self {
         Self {
             channel: channel.into(),
+            thread_ts,
             writer,
             state: Mutex::new(State {
                 pending: None,
@@ -192,6 +199,7 @@ impl SlackResponseStream {
                     self.writer
                         .send(OutboundOp::Post {
                             channel: self.channel.clone(),
+                            thread_ts: self.thread_ts.clone(),
                             text,
                             ts_tx,
                         })
