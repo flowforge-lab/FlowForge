@@ -712,6 +712,69 @@ fn role_str(role: Role) -> &'static str {
     }
 }
 
+/// Markers that positively identify a tool call written as literal text rather
+/// than a structured tool-use block (#1113). Kept narrow -- `<invoke name=` /
+/// `<parameter` (with the attribute name) -- so an incidental `<invoke>` word
+/// in prose does not trip detection. Detection and stripping both ignore fenced
+/// code blocks so a legitimate example of the syntax inside ``` ``` ``` survives
+/// (same constraint as #1102).
+const LEAK_MARKERS: [&str; 2] = ["<invoke name=", "<parameter"];
+
+/// Tag fragments removed when a leak has been confirmed. Broader than
+/// [`LEAK_MARKERS`] so the whole disguised block -- opening and closing tags,
+/// with or without the `antml:` namespace -- is neutralized, not just the two
+/// lines that triggered detection.
+const LEAK_TAG_FRAGMENTS: [&str; 4] = ["<invoke", "</invoke", "<parameter", "</parameter"];
+
+/// True when `text` contains a leaked tool-call marker outside any fenced code
+/// block. #1113.
+fn contains_leaked_tool_call(text: &str) -> bool {
+    outside_code_fences(text).any(|seg| LEAK_MARKERS.iter().any(|m| seg.contains(m)))
+}
+
+/// Yields the slices of `text` that lie *outside* ``` fenced code blocks. A
+/// fence is a line whose trimmed start is ```` ``` ````; content between an
+/// opening and closing fence (and the fence lines themselves) is skipped. An
+/// unterminated fence swallows the rest of the input, matching how a Markdown
+/// renderer treats it.
+fn outside_code_fences(text: &str) -> impl Iterator<Item = &str> {
+    let mut in_fence = false;
+    text.lines().filter(move |line| {
+        if line.trim_start().starts_with("```") {
+            in_fence = !in_fence;
+            return false;
+        }
+        !in_fence
+    })
+}
+
+/// Removes the lines of a leaked tool-call block from assistant content,
+/// leaving fenced code blocks (and their contents) untouched. #1113. Used on
+/// replay in [`to_chat`] so an already-persisted leak stops being re-fed to the
+/// model and re-triggering the imitation cascade. Only strips once a leak is
+/// confirmed by [`contains_leaked_tool_call`], so prose that merely mentions a
+/// closing tag in passing is left alone.
+fn strip_leaked_tool_call(text: &str) -> String {
+    if !contains_leaked_tool_call(text) {
+        return text.to_string();
+    }
+    let mut in_fence = false;
+    let kept: Vec<&str> = text
+        .lines()
+        .filter(|line| {
+            if line.trim_start().starts_with("```") {
+                in_fence = !in_fence;
+                return true;
+            }
+            if in_fence {
+                return true;
+            }
+            !LEAK_TAG_FRAGMENTS.iter().any(|m| line.contains(m))
+        })
+        .collect();
+    kept.join("\n")
+}
+
 pub(crate) fn to_chat(messages: &[Message]) -> Vec<ChatMessage> {
     let mut chat: Vec<ChatMessage> = messages
         .iter()
@@ -732,6 +795,10 @@ pub(crate) fn to_chat(messages: &[Message]) -> Vec<ChatMessage> {
             // An assistant message that only carries tool calls sends `content: null`.
             let content = if m.content.is_empty() && tool_calls.is_some() {
                 None
+            } else if m.role == Role::Assistant {
+                // Neutralize any leaked tool-call XML before replay (#1113) so a
+                // persisted leak stops being re-fed to the model and cascading.
+                Some(strip_leaked_tool_call(&m.content))
             } else {
                 Some(m.content.clone())
             };
@@ -2326,6 +2393,23 @@ pub async fn run_turn(
                     row_guard.finalize();
                     return Err(e.into());
                 }
+                // A clean stream whose text is a tool call written as literal
+                // `<invoke>`/`<parameter>` markup (#1113) is not a real answer
+                // either -- persisting it poisons history and cascades. Retry
+                // (bounded, same backoff) to give the model a chance to re-emit
+                // a structured tool-use block; if it keeps leaking, the
+                // post-loop guard converts it to a MalformedToolCall stop.
+                None if calls.is_empty()
+                    && contains_leaked_tool_call(&acc)
+                    && !cancel.is_cancelled()
+                    && attempt < MAX_PROVIDER_ATTEMPTS =>
+                {
+                    cancellable_backoff(&cancel, RETRY_BACKOFF_BASE_MS << (attempt - 1)).await;
+                    if cancel.is_cancelled() {
+                        break;
+                    }
+                    continue;
+                }
                 // A clean stream that produced neither text nor a tool call is a provider
                 // anomaly, not a real final answer (#244 R7). Retry (bounded, same backoff
                 // as a transient error) rather than emitting a silent empty bubble; a
@@ -2352,6 +2436,19 @@ pub async fn run_turn(
         if !reasoning_acc.trim().is_empty() {
             let reasoning = truncate_reasoning(&reasoning_acc);
             store.set_message_reasoning(&message_id, session_id, &reasoning);
+        }
+        // Bounded retries did not shake loose a structured tool-use block: the
+        // text is still a disguised tool call (#1113). Never persist it as a
+        // normal answer -- replace the body with the reason's marker and record
+        // the structured stop on the row too, so the `Done` event and the
+        // persisted `Message.stop_reason` agree (the invariant #658 relies on).
+        if calls.is_empty() && contains_leaked_tool_call(&acc) {
+            if stop_reason.is_none() {
+                stop_reason = Some(StopReason::MalformedToolCall);
+            }
+            let reason = stop_reason.unwrap_or(StopReason::MalformedToolCall);
+            store.set_message_stop_reason(&message_id, session_id, reason);
+            acc = reason.marker().to_string();
         }
         let final_text = acc.clone();
         let finalized = store.set_message_content(&message_id, session_id, acc);
@@ -2381,7 +2478,9 @@ pub async fn run_turn(
             on_event(AgentEvent::Done {
                 message_id: message_id.clone(),
                 final_message: Some(final_text),
-                stop_reason: None,
+                // Normally `None` for a real answer; carries MalformedToolCall
+                // when the leak guard replaced the body with its marker (#1113).
+                stop_reason,
                 turns: Some(turn_count),
                 token_count,
                 prefill_estimates: Some(prefill_estimates.clone()),

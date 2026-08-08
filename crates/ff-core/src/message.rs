@@ -29,6 +29,11 @@ pub enum StopReason {
     Stall,
     /// The model returned an empty response even after the bounded retries.
     EmptyResponse,
+    /// The model wrote a tool call as literal `<invoke>`/`<parameter>` text
+    /// instead of a structured tool-use block, and still did so after the
+    /// bounded retries (#1113). The disguised text is never persisted as a
+    /// normal answer; the row carries this reason's marker instead.
+    MalformedToolCall,
     /// The turn's future was dropped mid-stream (app shutdown, panic, task
     /// cancellation) before it could finalize. Backfilled by the agent's
     /// `AssistantRowGuard` Drop path and the orphaned-row sweep.
@@ -44,6 +49,7 @@ impl StopReason {
             StopReason::ToolLimit => "[stopped: reached tool-call limit]",
             StopReason::Stall => "[stopped: repeated a tool call without making progress]",
             StopReason::EmptyResponse => "[stopped: the model returned an empty response]",
+            StopReason::MalformedToolCall => "[stopped: the model emitted a tool call as text]",
             StopReason::Interrupted => "[stopped: interrupted]",
         }
     }
@@ -56,6 +62,7 @@ impl StopReason {
             StopReason::ToolLimit => "toolLimit",
             StopReason::Stall => "stall",
             StopReason::EmptyResponse => "emptyResponse",
+            StopReason::MalformedToolCall => "malformedToolCall",
             StopReason::Interrupted => "interrupted",
         }
     }
@@ -68,6 +75,7 @@ impl StopReason {
             "toolLimit" => Some(StopReason::ToolLimit),
             "stall" => Some(StopReason::Stall),
             "emptyResponse" => Some(StopReason::EmptyResponse),
+            "malformedToolCall" => Some(StopReason::MalformedToolCall),
             "interrupted" => Some(StopReason::Interrupted),
             _ => None,
         }

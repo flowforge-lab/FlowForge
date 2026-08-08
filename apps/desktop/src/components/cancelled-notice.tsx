@@ -34,6 +34,14 @@ function fromStopReason(stopReason: WireStopReason): {
         label: "the model returned an empty response",
         reason: "capped",
       };
+    case "malformedToolCall":
+      // The model wrote a tool call as literal text instead of a structured
+      // tool-use block, and kept doing so through the bounded retries (#1113).
+      // Resumes like a cap so the user can nudge it to try again.
+      return {
+        label: "the model emitted a tool call as text",
+        reason: "capped",
+      };
     case "interrupted":
       // The turn's future was dropped mid-stream (app shutdown / hard kill) — not
       // a user Stop, so it resumes like a cap ("capped" affordance). Same resume

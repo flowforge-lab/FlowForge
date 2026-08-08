@@ -95,6 +95,115 @@ fn to_chat_caps_reasoning_replay_to_last_n_tool_turns() {
     assert_eq!(out[2].reasoning.as_deref(), Some("newest"));
 }
 
+// ---- #1113: leaked tool-call XML detection, stripping, and egress sanitize ----
+
+#[test]
+fn contains_leaked_tool_call_fires_on_prose_xml() {
+    // The three-field fingerprint's first field: bare tool-call markup in prose.
+    assert!(contains_leaked_tool_call(
+        "Sure, let me run that.\n<invoke name=\"bash\">\n<parameter name=\"command\">ls</parameter>\n</invoke>"
+    ));
+    // The `antml:`-namespaced form leaks the same way.
+    assert!(contains_leaked_tool_call(
+        "count\n<parameter name=\"key\">abc</parameter>"
+    ));
+}
+
+#[test]
+fn contains_leaked_tool_call_ignores_code_fence_and_plain_prose() {
+    // A legitimate example of the syntax inside a fenced block is not a leak (#1102).
+    let fenced = "Here is how a call looks:\n```xml\n<invoke name=\"bash\">\n<parameter name=\"command\">ls</parameter>\n</invoke>\n```\nThat's the shape.";
+    assert!(!contains_leaked_tool_call(fenced));
+    // Prose that merely mentions the word invoke is not a leak (marker is narrow).
+    assert!(!contains_leaked_tool_call(
+        "I will invoke the parameter sweep next."
+    ));
+}
+
+#[test]
+fn strip_leaked_tool_call_removes_the_disguised_block() {
+    let leaked = "Here you go.\n<invoke name=\"bash\">\n<parameter name=\"command\">ls</parameter>\n</invoke>\nDone.";
+    let cleaned = strip_leaked_tool_call(leaked);
+    assert!(!cleaned.contains("<invoke"));
+    assert!(!cleaned.contains("</invoke"));
+    assert!(!cleaned.contains("<parameter"));
+    assert!(!cleaned.contains("</parameter"));
+    assert!(cleaned.contains("Here you go."));
+    assert!(cleaned.contains("Done."));
+}
+
+#[test]
+fn strip_leaked_tool_call_is_a_noop_without_a_leak() {
+    let clean = "Just a normal answer with no tool call.";
+    assert_eq!(strip_leaked_tool_call(clean), clean);
+}
+
+#[test]
+fn to_chat_strips_leaked_tool_call_from_assistant_content() {
+    let msg = plain(
+        "m1",
+        Role::Assistant,
+        "On it.\n<invoke name=\"bash\">\n<parameter name=\"command\">ls</parameter>\n</invoke>",
+    );
+    let out = to_chat(std::slice::from_ref(&msg));
+    let content = out[0].content.as_deref().unwrap_or_default();
+    assert!(
+        !content.contains("<invoke"),
+        "leaked XML must be stripped on replay"
+    );
+    assert!(!content.contains("<parameter"));
+    assert!(content.contains("On it."));
+}
+
+#[test]
+fn to_chat_preserves_tool_call_xml_inside_a_code_fence() {
+    // Negative test (#1102 constraint): a fenced example must survive replay verbatim.
+    let body = "How a call is shaped:\n```xml\n<invoke name=\"bash\">\n<parameter name=\"command\">ls</parameter>\n</invoke>\n```";
+    let msg = plain("m1", Role::Assistant, body);
+    let out = to_chat(std::slice::from_ref(&msg));
+    let content = out[0].content.as_deref().unwrap_or_default();
+    assert!(
+        content.contains("<invoke name=\"bash\">"),
+        "code-fenced example must be untouched"
+    );
+    assert!(content.contains("<parameter name=\"command\">"));
+}
+
+#[test]
+fn to_chat_leaves_leaked_xml_in_user_content_untouched() {
+    // Only assistant content is sanitized; a user pasting the syntax is left alone.
+    let msg = plain(
+        "m1",
+        Role::User,
+        "why did this print <invoke name=\"bash\"> ?",
+    );
+    let out = to_chat(std::slice::from_ref(&msg));
+    let content = out[0].content.as_deref().unwrap_or_default();
+    assert!(content.contains("<invoke name=\"bash\">"));
+}
+
+#[test]
+fn to_chat_strips_real_leak_but_keeps_a_fenced_example_in_the_same_message() {
+    // When a message has BOTH a real leak (prose) AND a legitimate fenced
+    // example, detection fires (real leak present) so the strip filter runs --
+    // and its own fence-awareness must still spare the fenced example. This is
+    // what pins the strip layer's fence guard, distinct from the detector's.
+    let body = "Running it now.\n<invoke name=\"bash\">\n<parameter name=\"command\">ls</parameter>\n</invoke>\nFor reference the shape is:\n```xml\n<invoke name=\"bash\">\n<parameter name=\"command\">pwd</parameter>\n</invoke>\n```";
+    let msg = plain("m1", Role::Assistant, body);
+    let out = to_chat(std::slice::from_ref(&msg));
+    let content = out[0].content.as_deref().unwrap_or_default();
+    // The fenced example survives...
+    assert!(content.contains("```xml"), "fence must survive");
+    assert!(content.contains("pwd"), "fenced example body must survive");
+    // ...but exactly one `<invoke` (the fenced one) remains -- the prose leak is gone.
+    assert_eq!(
+        content.matches("<invoke").count(),
+        1,
+        "prose leak stripped, fenced kept"
+    );
+    assert!(content.contains("Running it now."));
+}
+
 // ---- #1067: to_chat self-heals a message interposed between tool_use/tool_result ----
 
 fn asst_tool_calls(id: &str, call_ids: &[&str]) -> ff_core::Message {
@@ -5048,6 +5157,116 @@ async fn empty_response_exhausts_to_notice() {
         "got: {}",
         msg.content
     );
+}
+
+// ---- #1113: a leaked tool call in the text stream retries, then stops distinctly ----
+
+/// Streams a tool call as literal `<invoke>` text for the first `leaks` calls,
+/// then a real text turn -- mirrors the leak-then-recover shape of #1113.
+struct LeakThenText {
+    leaks: usize,
+    calls: Arc<AtomicUsize>,
+}
+#[async_trait]
+impl Provider for LeakThenText {
+    async fn chat_stream(&self, _req: ChatRequest) -> Result<ChunkStream, LlmError> {
+        let n = self.calls.fetch_add(1, Ordering::SeqCst);
+        let delta = if n < self.leaks {
+            "on it\n<invoke name=\"bash\">\n<parameter name=\"command\">ls</parameter>\n</invoke>"
+        } else {
+            "recovered"
+        };
+        Ok(futures_util::stream::iter(vec![Ok(Chunk {
+            delta: delta.into(),
+            done: true,
+            ..Chunk::default()
+        })])
+        .boxed())
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn leaked_tool_call_retries_then_recovers() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let provider = LeakThenText {
+        leaks: 1,
+        calls: calls.clone(),
+    };
+    let (res, errored) = run_text_turn(&provider).await;
+    let msg = res.unwrap();
+    assert_eq!(msg.content, "recovered");
+    assert!(
+        !msg.content.contains("<invoke"),
+        "leaked XML must not persist"
+    );
+    assert_eq!(msg.stop_reason, None, "a recovered turn is a normal answer");
+    assert!(!errored, "a leak that recovers should not surface an error");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "one leaked response retried, then success"
+    );
+}
+
+/// Always streams a tool call as literal text -- a persistent leak.
+struct AlwaysLeaks {
+    calls: Arc<AtomicUsize>,
+}
+#[async_trait]
+impl Provider for AlwaysLeaks {
+    async fn chat_stream(&self, _req: ChatRequest) -> Result<ChunkStream, LlmError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(futures_util::stream::iter(vec![Ok(Chunk {
+            delta: "sure\n<invoke name=\"bash\">\n<parameter name=\"command\">ls</parameter>\n</invoke>"
+                .into(),
+            done: true,
+            ..Chunk::default()
+        })])
+        .boxed())
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn leaked_tool_call_exhausts_to_malformed_stop() {
+    let store = SessionStore::new();
+    let s = store.create_session(None);
+    store.add_message(&s.id, Role::User, "go".into());
+    let registry = ToolRegistry::new();
+    let root = std::env::current_dir().unwrap();
+    let approve = AlwaysApprove;
+    let calls = Arc::new(AtomicUsize::new(0));
+
+    let msg = run_turn(
+        &AlwaysLeaks {
+            calls: calls.clone(),
+        },
+        &store,
+        &ctx(&registry, &root, &approve),
+        &s.id,
+        "mock",
+        None,
+        false,
+        ReasoningVisibility::All,
+        CancelToken::new(),
+        |_| {},
+    )
+    .await
+    .unwrap();
+
+    // Bounded by the provider-attempt cap, not an infinite spin.
+    assert_eq!(calls.load(Ordering::SeqCst), MAX_PROVIDER_ATTEMPTS);
+    // The disguised text never survives as a normal answer: the body is the
+    // reason's marker and the row carries the distinct stop reason, so the
+    // three-field fingerprint (XML content + NULL tool_calls + NULL stop_reason)
+    // can no longer occur.
+    assert!(!msg.content.contains("<invoke"), "got: {}", msg.content);
+    assert_eq!(msg.content, StopReason::MalformedToolCall.marker());
+    assert_eq!(msg.stop_reason, Some(StopReason::MalformedToolCall));
+    // The persisted row agrees with what run_turn returned.
+    let persisted = store.get_messages(&s.id);
+    let last = persisted.last().unwrap();
+    assert_eq!(last.stop_reason, Some(StopReason::MalformedToolCall));
+    assert!(!last.content.contains("<invoke"));
 }
 
 #[tokio::test]
