@@ -105,7 +105,7 @@ pub struct InboundMessage {
 #[derive(Clone, Hash, Eq, PartialEq)]
 pub struct ChannelId {
     pub transport: String,       // "slack", "discord", etc.
-    pub platform_id: String,     // Slack: channel+thread_ts; Discord: thread_id; etc.
+    pub platform_id: String,     // Slack: channel; Discord: thread_id; etc.
 }
 ```
 
@@ -113,10 +113,17 @@ pub struct ChannelId {
 
 | Platform | Session boundary | New session trigger |
 |----------|-----------------|---------------------|
-| Slack | Thread (`channel` + `thread_ts`) | New top-level mention; or `/ff new` |
+| Slack | Channel (`channel`) | New top-level mention; or `/ff new` |
 | Discord | Thread (or DM channel) | New thread; or `/ff new` |
 | WhatsApp | Chat (phone number pairing) | `/new` command message |
 | WeCom | Chat (userId or groupChat thread) | `/new` or 新对话 |
+
+> **Slack threading is reply routing, not a session boundary.** A Slack channel
+> maps to exactly one session regardless of how many threads it contains.
+> Replies thread into the triggering message via `thread_ts`, carried on
+> `InboundMessage.reply_thread` and passed to `Transport::begin_response`; it is
+> deliberately *not* part of the session key. Folding `thread_ts` into identity
+> would spawn a new session per thread and lose conversation context (see #1098).
 
 A `ChannelId -> session_id` mapping is persisted in a lightweight store
 (`~/.config/flowforge/transports/channel_map.json`).
