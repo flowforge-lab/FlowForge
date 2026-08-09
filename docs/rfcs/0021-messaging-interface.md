@@ -113,7 +113,7 @@ pub struct ChannelId {
 
 | Platform | Session boundary | New session trigger |
 |----------|-----------------|---------------------|
-| Slack | Channel (`channel`) | New top-level mention; or `/ff new` |
+| Slack | Channel (`channel`) | First mention in a new channel; or `/ff new` |
 | Discord | Thread (or DM channel) | New thread; or `/ff new` |
 | WhatsApp | Chat (phone number pairing) | `/new` command message |
 | WeCom | Chat (userId or groupChat thread) | `/new` or 新对话 |
