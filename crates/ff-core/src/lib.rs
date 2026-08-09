@@ -53,6 +53,6 @@ pub use scheduled::{
     TaskKind,
 };
 pub use search::{SearchBackend, SearchConfig, SearchSecretPresence};
-pub use session::{auto_title, Session, SessionStatus, SessionWorkspace};
+pub use session::{auto_title, ConfluenceSource, Session, SessionStatus, SessionWorkspace};
 pub use skill::{Phenotype, Skill, SkillInfo, SkillManifest, DEFAULT_SEARCH_SOURCES};
 pub use spawn_env::{augment_path, augmented_path, extra_path_dirs};

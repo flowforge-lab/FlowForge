@@ -15,8 +15,8 @@ use std::path::Path;
 use std::sync::Mutex;
 
 use ff_core::{
-    auto_title, Attachment, Format, McpServerConfig, Message, Mode, ModelSelection, Role, Session,
-    SessionStatus, StopReason, ToolCall,
+    auto_title, Attachment, ConfluenceSource, Format, McpServerConfig, Message, Mode,
+    ModelSelection, Role, Session, SessionStatus, StopReason, ToolCall,
 };
 use rusqlite::{params, Connection, OptionalExtension};
 
@@ -52,6 +52,7 @@ fn new_session(goal: Option<String>) -> Session {
         mcp_servers: None,
         parent_session_id: None,
         fork_point_seq: None,
+        confluence_sources: None,
     }
 }
 
@@ -61,8 +62,8 @@ fn insert_session(conn: &Connection, session: &Session) {
     let inserted = conn.execute(
         "INSERT INTO sessions
              (id, goal, title, summary, status, created_at, updated_at, phenotype, mode, workspace, model, mcp_servers,
-              parent_session_id, fork_point_seq)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+              parent_session_id, fork_point_seq, confluence_sources)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
         params![
             session.id,
             session.goal,
@@ -81,6 +82,10 @@ fn insert_session(conn: &Connection, session: &Session) {
                 .and_then(|m| serde_json::to_string(m).ok()),
             session.parent_session_id,
             session.fork_point_seq,
+            session
+                .confluence_sources
+                .as_ref()
+                .and_then(|s| serde_json::to_string(s).ok()),
         ],
     );
     if let Err(error) = &inserted {
@@ -171,6 +176,34 @@ pub struct TurnPreheat {
     pub preheated_used: usize,
     pub preheated_bytes: usize,
 }
+
+/// Why a [`SessionStore::confluence_sessions`] request was refused (#1229,
+/// RFC 0023 §4/§5). A deleted ancestor is deliberately *not* an error: it
+/// degrades to an independent tail (see [`lineage_root`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfluenceError {
+    /// Fewer than two sessions were given; there is nothing to conflue.
+    TooFew,
+    /// A requested session id does not exist.
+    SessionNotFound(String),
+    /// Two inputs provably belong to different fork trees (distinct genuine
+    /// lineage roots). Cross-lineage merge is a non-goal of V1 (RFC 0023 §9).
+    CrossTree,
+}
+
+impl std::fmt::Display for ConfluenceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TooFew => write!(f, "confluence needs at least two sessions"),
+            Self::SessionNotFound(id) => write!(f, "session not found: {id}"),
+            Self::CrossTree => {
+                write!(f, "cannot conflue sessions from different fork trees")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ConfluenceError {}
 
 pub struct SessionStore {
     conn: Mutex<Connection>,
@@ -292,7 +325,7 @@ impl SessionStore {
         let mut stmt = conn
             .prepare(
                 "SELECT id, goal, title, summary, status, created_at, updated_at, phenotype, mode, workspace, model, mcp_servers,
-                        parent_session_id, fork_point_seq
+                        parent_session_id, fork_point_seq, confluence_sources
                  FROM sessions
                  ORDER BY updated_at DESC",
             )
@@ -1118,7 +1151,7 @@ impl SessionStore {
         let source = conn
             .query_row(
                 "SELECT id, goal, title, summary, status, created_at, updated_at, phenotype, mode, workspace, model, mcp_servers,
-                        parent_session_id, fork_point_seq
+                        parent_session_id, fork_point_seq, confluence_sources
                  FROM sessions WHERE id = ?1",
                 params![session_id],
                 row_to_session,
@@ -1150,6 +1183,8 @@ impl SessionStore {
             parent_session_id: Some(source.id.clone()),
             // Not known until the transcript is copied below.
             fork_point_seq: None,
+            // A fork is a lineage branch, not a confluence.
+            confluence_sources: None,
         };
         let tx = match conn.unchecked_transaction() {
             Ok(tx) => tx,
@@ -1253,13 +1288,175 @@ impl SessionStore {
         Some(forked)
     }
 
+    /// Concatenate several same-lineage sessions into one new session (#1229,
+    /// RFC 0023 §4/§5 -- CA3 pattern completion, V1). The inputs must share a
+    /// fork tree; their transcripts are appended whole, in fork order, never
+    /// interleaved. The shared prefix is left duplicated -- V1 tolerates the
+    /// redundancy (de-duplication is V2, RFC 0023 §7). The new session records
+    /// structured provenance ([`Session::confluence_sources`]); it inherits no
+    /// phenotype here (that is a follow-up ticket).
+    ///
+    /// # Errors
+    /// - [`ConfluenceError::TooFew`] for fewer than two inputs.
+    /// - [`ConfluenceError::SessionNotFound`] if an input does not exist.
+    /// - [`ConfluenceError::CrossTree`] if two inputs provably belong to
+    ///   different fork trees. A mismatch that could be explained by a deleted
+    ///   ancestor is *not* rejected: such an orphan degrades to an independent
+    ///   tail and is concatenated anyway (RFC 0023 §4).
+    pub fn confluence_sessions(&self, session_ids: &[&str]) -> Result<Session, ConfluenceError> {
+        if session_ids.len() < 2 {
+            return Err(ConfluenceError::TooFew);
+        }
+        let conn = self.conn.lock().unwrap();
+
+        // Resolve each input's lineage root. `genuine` is true only when the
+        // chain reaches a session that was never forked; an orphan (ancestor
+        // deleted, so `parent_session_id` is NULL but `fork_point_seq` is set)
+        // is its own non-genuine root -- its tree can no longer be proven.
+        let mut created_at: Vec<(usize, i64)> = Vec::with_capacity(session_ids.len());
+        let mut genuine_roots: std::collections::BTreeSet<String> =
+            std::collections::BTreeSet::new();
+        for (i, id) in session_ids.iter().enumerate() {
+            let (root, genuine) = lineage_root(&conn, id)
+                .ok_or_else(|| ConfluenceError::SessionNotFound((*id).to_string()))?;
+            if genuine {
+                genuine_roots.insert(root);
+            }
+            let ts: i64 = conn
+                .query_row(
+                    "SELECT created_at FROM sessions WHERE id = ?1",
+                    params![id],
+                    |r| r.get(0),
+                )
+                .expect("created_at for confluence source");
+            created_at.push((i, ts));
+        }
+
+        // Only well-rooted inputs can prove tree membership; two distinct
+        // genuine roots is a provable cross-tree selection. Orphans never
+        // trigger this -- they degrade to independent tails (RFC 0023 §4).
+        if genuine_roots.len() > 1 {
+            return Err(ConfluenceError::CrossTree);
+        }
+
+        // Fork order = branch creation time. Segments are appended whole in this
+        // order; message `seq` never interleaves them (RFC 0023 §5.2). Ties
+        // break on the caller's given order for determinism.
+        created_at.sort_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)));
+        let ordered: Vec<&str> = created_at.iter().map(|(i, _)| session_ids[*i]).collect();
+
+        let confluence = new_session(None);
+        let tx = match conn.unchecked_transaction() {
+            Ok(tx) => tx,
+            Err(error) => {
+                tracing::error!(%error, "session write failed");
+                panic!("start confluence transaction: {error}");
+            }
+        };
+        insert_session(&tx, &confluence);
+
+        let mut sources: Vec<ConfluenceSource> = Vec::with_capacity(ordered.len());
+        let mut seq: i64 = 0;
+        for source_id in &ordered {
+            let mut stmt = tx
+                .prepare(
+                    "SELECT role, content, tool_calls, tool_call_id, attachments, reasoning, stop_reason, author_name, created_at
+                     FROM messages WHERE session_id = ?1
+                     ORDER BY seq",
+                )
+                .expect("prepare confluence source messages");
+            let rows = stmt
+                .query_map(params![source_id], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, Option<String>>(6)?,
+                        row.get::<_, Option<String>>(7)?,
+                        row.get::<_, i64>(8)?,
+                    ))
+                })
+                .expect("query confluence source messages");
+
+            let mut message_count: i64 = 0;
+            for row in rows {
+                let (
+                    role,
+                    content,
+                    tool_calls,
+                    tool_call_id,
+                    attachments,
+                    reasoning,
+                    stop_reason,
+                    author_name,
+                    ts,
+                ) = row.expect("read confluence source message");
+                let inserted = tx.execute(
+                    "INSERT INTO messages
+                         (id, session_id, seq, role, content, tool_calls, tool_call_id, attachments, reasoning, stop_reason, author_name, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                    params![
+                        new_id(),
+                        confluence.id,
+                        seq,
+                        role,
+                        content,
+                        tool_calls,
+                        tool_call_id,
+                        attachments,
+                        reasoning,
+                        stop_reason,
+                        author_name,
+                        ts,
+                    ],
+                );
+                if let Err(error) = &inserted {
+                    tracing::error!(%error, "session write failed");
+                }
+                inserted.expect("clone confluence message");
+                seq += 1;
+                message_count += 1;
+            }
+            drop(stmt);
+            sources.push(ConfluenceSource {
+                session_id: Some((*source_id).to_string()),
+                message_count,
+            });
+        }
+
+        // Persist provenance last, once the segment lengths are known -- mirrors
+        // how `fork_session` records `fork_point_seq` from the rows it copied.
+        let sources_json = serde_json::to_string(&sources).expect("serialize confluence sources");
+        let updated = tx.execute(
+            "UPDATE sessions SET confluence_sources = ?1 WHERE id = ?2",
+            params![sources_json, confluence.id],
+        );
+        if let Err(error) = &updated {
+            tracing::error!(%error, "session write failed");
+        }
+        updated.expect("record confluence provenance");
+
+        let committed = tx.commit();
+        if let Err(error) = &committed {
+            tracing::error!(%error, "session write failed");
+        }
+        committed.expect("commit confluence session");
+
+        let mut result = confluence;
+        result.confluence_sources = Some(sources);
+        Ok(result)
+    }
+
     /// Fetch a single session by id, or `None` if it does not exist.
     pub fn get_session(&self, session_id: &str) -> Option<Session> {
         let conn = self.conn.lock().unwrap();
         let persisted = conn
             .query_row(
                 "SELECT id, goal, title, summary, status, created_at, updated_at, phenotype, mode, workspace, model, mcp_servers,
-                        parent_session_id, fork_point_seq
+                        parent_session_id, fork_point_seq, confluence_sources
                  FROM sessions WHERE id = ?1",
                 params![session_id],
                 row_to_session,
@@ -1615,7 +1812,46 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
         )?;
         conn.pragma_update(None, "user_version", 13)?;
     }
+    if version < 14 {
+        // #1229 (RFC 0023 §4/§5): confluence provenance. A session produced by
+        // concatenating same-lineage sessions records its source segments here
+        // as JSON (`Vec<ConfluenceSource>`), mirroring how `mcp_servers` stores
+        // structured data in a single column. NULL on every non-confluence
+        // session -- which is every pre-existing row -- so an ALTER suffices and
+        // old databases keep behaving exactly as before.
+        conn.execute_batch("ALTER TABLE sessions ADD COLUMN confluence_sources TEXT;")?;
+        conn.pragma_update(None, "user_version", 14)?;
+    }
     Ok(())
+}
+
+/// Walk a session's `parent_session_id` chain to its lineage root, returning
+/// `(root_id, genuine)`. `genuine` is true when the chain terminates at a
+/// session that was never forked (both lineage columns NULL). A chain that ends
+/// at an *orphan* -- `parent_session_id` NULL but `fork_point_seq` set, i.e. the
+/// real ancestor was deleted (#1074 `ON DELETE SET NULL`) -- returns that orphan
+/// as a non-genuine root: its tree membership can no longer be proven, so
+/// confluence treats it as an independent tail rather than rejecting it
+/// (RFC 0023 §4). Returns `None` if the starting session does not exist.
+fn lineage_root(conn: &Connection, session_id: &str) -> Option<(String, bool)> {
+    let mut current = session_id.to_string();
+    loop {
+        let (parent, fork_point): (Option<String>, Option<i64>) = conn
+            .query_row(
+                "SELECT parent_session_id, fork_point_seq FROM sessions WHERE id = ?1",
+                params![current],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .ok()
+            .flatten()?;
+        match parent {
+            Some(p) => current = p,
+            // No parent: a genuine root has no fork point; an orphan (ancestor
+            // deleted) kept its fork point and cannot prove its tree.
+            None => return Some((current, fork_point.is_none())),
+        }
+    }
 }
 
 fn row_to_session(row: &rusqlite::Row) -> rusqlite::Result<Session> {
@@ -1623,6 +1859,7 @@ fn row_to_session(row: &rusqlite::Row) -> rusqlite::Result<Session> {
     let mode: Option<String> = row.get("mode")?;
     let model: Option<String> = row.get("model")?;
     let mcp_servers: Option<String> = row.get("mcp_servers")?;
+    let confluence_sources: Option<String> = row.get("confluence_sources")?;
     Ok(Session {
         id: row.get("id")?,
         goal: row.get("goal")?,
@@ -1638,6 +1875,7 @@ fn row_to_session(row: &rusqlite::Row) -> rusqlite::Result<Session> {
         mcp_servers: mcp_servers.and_then(|s| serde_json::from_str(&s).ok()),
         parent_session_id: row.get("parent_session_id")?,
         fork_point_seq: row.get("fork_point_seq")?,
+        confluence_sources: confluence_sources.and_then(|s| serde_json::from_str(&s).ok()),
     })
 }
 
