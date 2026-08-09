@@ -33,7 +33,7 @@ pub use memory::{MemoryChunkStat, MemoryFileInfo, MemoryFileKind, MemoryOverview
 pub use message::{
     Attachment, AttachmentKind, AttachmentSource, Message, Role, StopReason, ToolCall,
 };
-pub use mode::Mode;
+pub use mode::{Mode, MODE_SWITCH_MARKER_PREFIX};
 pub use model_specs::{
     bundled_rules, context_window_in, parse_specs, supports_vision_in, ModelSpec, ModelSpecs,
     DEFAULT_CONTEXT_WINDOW_TOKENS,

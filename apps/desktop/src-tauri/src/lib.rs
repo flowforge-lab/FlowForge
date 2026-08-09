@@ -3293,7 +3293,10 @@ fn set_session_mode(state: State<'_, Arc<AppState>>, session_id: String, mode: O
         // mode changed between the assistant's prior response and the next user
         // message (#848). A user-role marker stays in the conversation and breaks
         // the model's self-consistency anchoring to its own prior "I'm in Plan" text.
-        let marker = format!("[system: Mode switched to {label}]");
+        let marker = format!(
+            "{} Mode switched to {label}]",
+            ff_core::MODE_SWITCH_MARKER_PREFIX
+        );
         // But if a turn is IN FLIGHT, appending now would land the marker between
         // an assistant `tool_use` and its not-yet-persisted `tool_result`,
         // wedging the session with an Anthropic 422 (#1066). Defer it: it is

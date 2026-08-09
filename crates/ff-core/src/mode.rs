@@ -7,6 +7,21 @@
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
+/// Prefix of the transcript marker persisted when the user switches mode
+/// mid-session (e.g. `[system: Mode switched to Auto...]`). The marker is stored
+/// as a [`Role::User`](crate::Role) message so it stays in-position for every
+/// provider (Bedrock/Anthropic would otherwise lift a `Role::System` message out
+/// of sequence, losing the temporal signal — #848). OpenAI-compatible and Ollama
+/// wire translators promote a `user` message carrying this prefix back to
+/// `role: "system"` in-position, restoring the true system-notification semantics
+/// for backends that serialize system messages where they sit (#850).
+///
+/// Single source of truth shared by the producer (the desktop `set_session_mode`
+/// command) and the wire consumers, so the discriminator cannot drift. Matched
+/// with `starts_with`, never `contains`: a user turn that merely mentions the
+/// text mid-sentence must stay a user turn.
+pub const MODE_SWITCH_MARKER_PREFIX: &str = "[system:";
+
 /// How much autonomy the agent has before it touches the world. The per-tier
 /// approval outcome is set by the permission matrix (RFC 0019 §3); the summaries
 /// below describe its default cells.

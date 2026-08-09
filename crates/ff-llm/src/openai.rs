@@ -335,6 +335,7 @@ fn message_to_wire(msg: &ChatMessage, dialect: WireDialect) -> serde_json::Value
     let mut value = serde_json::to_value(msg).unwrap_or_else(|_| serde_json::json!({}));
     if let Some(obj) = value.as_object_mut() {
         obj.remove("attachments");
+        crate::promote_mode_switch_marker(msg, obj);
     }
     let image_uris: Vec<String> = msg
         .attachments

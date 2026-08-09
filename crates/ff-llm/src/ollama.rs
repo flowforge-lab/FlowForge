@@ -478,6 +478,7 @@ fn ollama_messages(messages: &[ChatMessage]) -> Result<serde_json::Value, LlmErr
         // key here and stays byte-identical. Then emit image attachments as Ollama's
         // `images: [base64, ...]` sibling field, leaving `content` a plain string.
         obj.remove("attachments");
+        crate::promote_mode_switch_marker(src, obj);
         let images: Vec<String> = src
             .attachments
             .iter()

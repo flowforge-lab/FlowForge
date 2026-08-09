@@ -247,6 +247,39 @@ fn text_only_message_keeps_plain_string_content() {
 }
 
 #[test]
+fn mode_switch_marker_promoted_to_system_in_position() {
+    // The marker is stored Role::User (#848) but OpenAI serializes system
+    // messages in-position, so it wants the true role: "system" shape (#850).
+    let marker = format!(
+        "{} Mode switched to Auto. Writes auto-approved]",
+        ff_core::MODE_SWITCH_MARKER_PREFIX
+    );
+    let v = message_to_wire(&ChatMessage::text("user", &marker), WireDialect::default());
+    assert_eq!(v["role"], "system", "user marker is promoted to system");
+    assert_eq!(v["content"], marker, "content is untouched");
+}
+
+#[test]
+fn ordinary_user_message_role_untouched() {
+    let v = message_to_wire(
+        &ChatMessage::text("user", "just a turn"),
+        WireDialect::default(),
+    );
+    assert_eq!(v["role"], "user");
+}
+
+#[test]
+fn user_message_only_mentioning_marker_mid_text_stays_user() {
+    // starts_with, not contains: a turn that merely quotes the prefix is a real
+    // user turn and must not be promoted.
+    let v = message_to_wire(
+        &ChatMessage::text("user", "what does [system: ...] mean?"),
+        WireDialect::default(),
+    );
+    assert_eq!(v["role"], "user", "mid-text mention must not be promoted");
+}
+
+#[test]
 fn image_only_message_omits_text_block() {
     let msg = ChatMessage::multimodal(
         "user",
