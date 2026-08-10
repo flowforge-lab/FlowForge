@@ -1,0 +1,373 @@
+//! The client-side ACP caller: spawn an external ACP agent over stdio and drive
+//! the client→agent half of the protocol (`initialize`, `session/new`,
+//! `session/prompt`, `session/cancel`, `session/set_mode`).
+//!
+//! This is the structural sibling of `ff-mcp`'s [`McpClient`](ff_mcp::McpClient),
+//! built against the official [`agent_client_protocol`] SDK the way `McpClient`
+//! is built against `rmcp`. It owns **no JSON-RPC framing of its own** — the
+//! SDK's [`AcpAgent`] provides the spawn + process-group reap-on-drop (so
+//! `npx → node` / `uvx → python` wrapper orphans don't survive, the #1197
+//! lesson) and a bounded protocol-vs-child-exit shutdown. What lives here is
+//! the FlowForge-typed surface over that, and the [`content::inbound`] mapping
+//! that turns the agent's `session/update` stream into [`AgentEvent`]s the host
+//! already renders.
+//!
+//! # Actor shape
+//!
+//! The SDK's [`Client::connect_with`] owns the connection for its closure's
+//! lifetime, so the client *is* an actor: [`AcpClient`] is a cheap
+//! [`mpsc::Sender`] of [`Cmd`]s plus a [`JoinHandle`]; the connection task
+//! drives commands inside the `connect_with` closure. A [`Cmd::Stop`] returns
+//! the closure, `connect_with` resolves, and `AcpAgent`'s [`ChildGuard`] reaps
+//! the process group on drop — bounded by [`SHUTDOWN_TIMEOUT`] so a wedged
+//! agent cannot hang FlowForge's quit (AC 2/3, mirroring `ff-mcp`'s
+//! `stop_all`/`SHUTDOWN_TIMEOUT`).
+//!
+//! [`ChildGuard`]: agent_client_protocol::acp_agent
+//! [`Client::connect_with`]: agent_client_protocol::Client::connect_with
+
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
+
+use agent_client_protocol::{
+    self as acp, util::MatchDispatch, AcpAgent, ActiveSession, Agent, Client, ConnectionTo,
+    Dispatch, SessionMessage,
+};
+use ff_agent::AgentEvent;
+use ff_core::Mode;
+use tokio::sync::{mpsc, oneshot};
+use tokio::task::JoinHandle;
+
+use crate::{content, mode, wire};
+
+/// How long a clean shutdown may take before we abort the connection task and
+/// let `AcpAgent`'s `ChildGuard` reap the process group. Bounds app-exit latency
+/// so one wedged agent cannot hang the quit — mirrors `ff-mcp`'s 2s per-server
+/// `SHUTDOWN_TIMEOUT`, with headroom over the SDK's internal 1s grace.
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Errors from the ACP client.
+#[derive(Debug, thiserror::Error)]
+pub enum AcpError {
+    /// A JSON-RPC / protocol error from the agent or the SDK transport.
+    #[error(transparent)]
+    Protocol(#[from] acp::Error),
+    /// The connection task exited before answering a command (agent crashed or
+    /// was shut down). The command's reply channel is dropped, surfacing this.
+    #[error("agent connection task exited before responding")]
+    ActorGone,
+    /// [`AcpClient::shutdown`] exceeded [`SHUTDOWN_TIMEOUT`]; the task was
+    /// aborted and the child left to `ChildGuard`'s drop-reap.
+    #[error("agent shutdown timed out after {0:?}")]
+    ShutdownTimeout(Duration),
+}
+
+/// A live connection to one external ACP agent.
+///
+/// Cheap to clone-share the command channel (it's an `mpsc::Sender`); the
+/// connection task owns the child. Drop is *not* the teardown path — call
+/// [`shutdown`](Self::shutdown) so the bound is observed; `Drop` here only
+/// signals `Stop` and detaches (mirroring the lesson recorded on #1197: do
+/// not rely on drop-reaping as the only teardown path).
+pub struct AcpClient {
+    cmd_tx: mpsc::Sender<Cmd>,
+    join: Option<JoinHandle<Result<(), AcpError>>>,
+}
+
+enum Cmd {
+    NewSession {
+        cwd: PathBuf,
+        reply: oneshot::Sender<Result<wire::SessionId, AcpError>>,
+    },
+    Prompt {
+        session_id: wire::SessionId,
+        prompt: String,
+        updates: mpsc::UnboundedSender<content::Inbound>,
+    },
+    Cancel {
+        session_id: wire::SessionId,
+    },
+    SetMode {
+        session_id: wire::SessionId,
+        mode: Mode,
+        reply: oneshot::Sender<Result<(), AcpError>>,
+    },
+    Stop,
+}
+
+impl AcpClient {
+    /// Spawn the agent described by `config` and complete the `initialize`
+    /// handshake, returning a handle that drives the rest of the protocol.
+    ///
+    /// # Env isolation (gap, recorded)
+    ///
+    /// `AcpAgent` inherits the host environment and applies `config.env` on
+    /// top, unlike `ff-mcp`'s `env_clear()` + allowlist (RFC 0003 §9.2). Env
+    /// isolation is **not** an #1202 acceptance criterion; the first cut uses
+    /// `AcpAgent` as-is. A fast-follow either uses `AcpAgent::spawn_process()`
+    /// with an env-cleared `Command` + the SDK's `Lines` transport + a
+    /// replicated `ChildGuard`, or upstreams an `env_clear` option.
+    pub async fn connect(config: acp::AcpAgentConfig) -> Result<Self, AcpError> {
+        let agent = AcpAgent::new(config);
+        let (cmd_tx, cmd_rx) = mpsc::channel(16);
+        let join = tokio::spawn(async move {
+            Client
+                .builder()
+                .name("flowforge")
+                .connect_with(agent, async move |cx| {
+                    // The SDK does not auto-initialize; the closure owns the
+                    // handshake (see the crate's quick-start example).
+                    cx.send_request_to(
+                        Agent,
+                        wire::InitializeRequest::new(acp::schema::ProtocolVersion::V1),
+                    )
+                    .block_task()
+                    .await?;
+                    drive(cx, cmd_rx).await
+                })
+                .await
+                .map_err(AcpError::from)
+        });
+        Ok(Self {
+            cmd_tx,
+            join: Some(join),
+        })
+    }
+
+    /// Create a new session rooted at `cwd`. Returns the session id to use with
+    /// [`prompt`](Self::prompt)/[`cancel`](Self::cancel)/[`set_mode`](Self::set_mode).
+    pub async fn session_new(&self, cwd: PathBuf) -> Result<wire::SessionId, AcpError> {
+        let (reply, rx) = oneshot::channel();
+        self.send(Cmd::NewSession { cwd, reply }).await?;
+        rx.await.map_err(|_| AcpError::ActorGone)?
+    }
+
+    /// Send a prompt and return a stream of [`content::Inbound`] updates ending
+    /// in a terminal `AgentEvent::Done` carrying the mapped `stopReason`. The
+    /// stream closes when the turn ends, the caller drops it, or the agent dies.
+    pub async fn prompt(
+        &self,
+        session_id: wire::SessionId,
+        prompt: String,
+    ) -> Result<mpsc::UnboundedReceiver<content::Inbound>, AcpError> {
+        let (updates_tx, updates_rx) = mpsc::unbounded_channel();
+        self.send(Cmd::Prompt {
+            session_id,
+            prompt,
+            updates: updates_tx,
+        })
+        .await?;
+        Ok(updates_rx)
+    }
+
+    /// Send a `session/cancel` notification. The in-flight prompt's response
+    /// arrives with `stopReason = cancelled`, ending the stream (AC 4).
+    pub async fn cancel(&self, session_id: wire::SessionId) -> Result<(), AcpError> {
+        self.send(Cmd::Cancel { session_id }).await
+    }
+
+    /// Send a `session/set_mode` request. Best-effort: a failure is returned
+    /// to the caller but does not tear down the connection.
+    pub async fn set_mode(&self, session_id: wire::SessionId, mode: Mode) -> Result<(), AcpError> {
+        let (reply, rx) = oneshot::channel();
+        self.send(Cmd::SetMode {
+            session_id,
+            mode,
+            reply,
+        })
+        .await?;
+        rx.await.map_err(|_| AcpError::ActorGone)?
+    }
+    /// Stop the agent and await its exit, bounded by [`SHUTDOWN_TIMEOUT`]. On
+    /// timeout the task is aborted and the child is left to `ChildGuard`'s
+    /// drop-reap (which kills the whole process group synchronously, so it
+    /// survives a Tokio runtime that has already wound down — better than
+    /// `rmcp`'s `tokio::spawn`-based cleanup).
+    pub async fn shutdown(mut self) -> Result<(), AcpError> {
+        let _ = self.cmd_tx.send(Cmd::Stop).await;
+        let Some(mut join) = self.join.take() else {
+            return Ok(());
+        };
+        tokio::select! {
+            // Prefer a clean join to the timeout.
+            biased;
+            r = &mut join => match r {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(e)) => Err(e),
+                Err(_panic) => Err(AcpError::ActorGone),
+            },
+            _ = tokio::time::sleep(SHUTDOWN_TIMEOUT) => {
+                // Aborting the task drops the `connect_with` future, whose
+                // teardown drops `AcpAgent` and its `ChildGuard` — which kills
+                // the whole process group synchronously, surviving a runtime
+                // that is already winding down (AC 3).
+                join.abort();
+                Err(AcpError::ShutdownTimeout(SHUTDOWN_TIMEOUT))
+            }
+        }
+    }
+
+    async fn send(&self, cmd: Cmd) -> Result<(), AcpError> {
+        self.cmd_tx.send(cmd).await.map_err(|_| AcpError::ActorGone)
+    }
+}
+
+impl Drop for AcpClient {
+    fn drop(&mut self) {
+        // Drop is not the teardown path (see #1197): fire-and-forget `Stop`
+        // and detach the task so `ChildGuard` reaps on the connection's own
+        // drop. Callers that need a bound must use `shutdown`.
+        let _ = self.cmd_tx.try_send(Cmd::Stop);
+        if let Some(join) = self.join.take() {
+            join.abort();
+        }
+    }
+}
+
+/// The connection task's command loop. Runs inside the `connect_with` closure,
+/// so every error here is a connection-level error (the closure returning
+/// propagates to `connect_with`'s result and reaps the child).
+async fn drive(cx: ConnectionTo<Agent>, mut cmd_rx: mpsc::Receiver<Cmd>) -> Result<(), acp::Error> {
+    let mut sessions: HashMap<Arc<str>, ActiveSessionHandle> = HashMap::new();
+    while let Some(cmd) = cmd_rx.recv().await {
+        match cmd {
+            Cmd::NewSession { cwd, reply } => {
+                let result = cx.build_session(&cwd).block_task().start_session().await;
+                match result {
+                    Ok(session) => {
+                        let id = session.session_id().clone();
+                        sessions.insert(Arc::clone(&id.0), ActiveSessionHandle(session));
+                        let _ = reply.send(Ok(id));
+                    }
+                    Err(e) => {
+                        let _ = reply.send(Err(AcpError::from(e)));
+                    }
+                }
+            }
+            Cmd::Prompt {
+                session_id,
+                prompt,
+                updates,
+            } => {
+                if let Some(session) = sessions.get_mut(&session_id.0) {
+                    drive_prompt(&mut session.0, &prompt, updates).await;
+                }
+                // Unknown session: `updates` is dropped, so the caller's stream
+                // closes empty — a loud failure rather than a hang.
+            }
+            Cmd::Cancel { session_id } => {
+                cx.send_notification_to(Agent, wire::CancelNotification::new(session_id))?;
+            }
+            Cmd::SetMode {
+                session_id,
+                mode,
+                reply,
+            } => {
+                let req = wire::SetSessionModeRequest::new(
+                    session_id,
+                    wire::SessionModeId::new(mode::mode_id(mode)),
+                );
+                let outcome = cx
+                    .send_request_to(Agent, req)
+                    .block_task()
+                    .await
+                    .map(|_| ())
+                    .map_err(AcpError::from);
+                let _ = reply.send(outcome);
+            }
+            Cmd::Stop => return Ok(()),
+        }
+    }
+    Ok(())
+}
+
+/// A `session/update` stream's [`AgentEvent`]s flow through this wrapper so
+/// the `Link` type parameter stays in one place.
+struct ActiveSessionHandle(ActiveSession<'static, Agent>);
+
+/// Drive one prompt to completion: send it, then drain `session/update`
+/// notifications through [`content::inbound`] until the `StopReason` arrives.
+async fn drive_prompt(
+    session: &mut ActiveSession<'static, Agent>,
+    prompt: &str,
+    updates: mpsc::UnboundedSender<content::Inbound>,
+) {
+    if session.send_prompt(prompt).is_err() {
+        return; // caller's stream closes (sender dropped)
+    }
+    // ACP leaves `messageId` optional on a chunk and absent on a `ToolCall`;
+    // `AgentEvent` keys every event on one. Use the session id as the stable
+    // fallback so every surfaced event is correlatable to its session.
+    let fallback = session.session_id().0.to_string();
+    loop {
+        match session.read_update().await {
+            Ok(SessionMessage::SessionMessage(dispatch)) => {
+                if let Some(update) = extract_update(dispatch).await {
+                    let inbound = content::inbound(&update, &fallback);
+                    if updates.send(inbound).is_err() {
+                        return; // caller dropped the stream
+                    }
+                }
+            }
+            Ok(SessionMessage::StopReason(stop)) => {
+                let internal = content::inbound_stop_reason(stop);
+                let _ = updates.send(content::Inbound::Agent(done_event(
+                    fallback.clone(),
+                    internal,
+                )));
+                return;
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "agent stream read failed; ending prompt");
+                return;
+            }
+            // `SessionMessage` is `#[non_exhaustive]`; a future variant has no
+            // FlowForge surface yet. End the stream rather than spin on it —
+            // the host sees a closed channel instead of a silent hang.
+            Ok(_) => {
+                tracing::debug!("ignoring unknown SessionMessage variant; ending prompt");
+                return;
+            }
+        }
+    }
+}
+
+/// Extract the `SessionUpdate` from a `Dispatch` carrying a `session/update`
+/// notification. Non-notification dispatches yield `None`.
+async fn extract_update(dispatch: Dispatch) -> Option<wire::SessionUpdate> {
+    let mut update: Option<wire::SessionUpdate> = None;
+    MatchDispatch::new(dispatch)
+        .if_notification(async |notif: wire::SessionNotification| {
+            update = Some(notif.update);
+            Ok(())
+        })
+        .await
+        .otherwise_ignore()
+        .ok()?;
+    update
+}
+
+/// Minimal `AgentEvent::Done` — only `message_id` and `stop_reason` are
+/// meaningful from an external agent's turn; the perf/counters are absent.
+fn done_event(message_id: String, stop_reason: Option<ff_core::StopReason>) -> AgentEvent {
+    AgentEvent::Done {
+        message_id,
+        final_message: None,
+        stop_reason,
+        turns: None,
+        token_count: None,
+        prefill_estimates: None,
+        prompt_latency_ms: None,
+        tier2_ms: None,
+        tier1_fires: None,
+        tier2_fires: None,
+        retrieve_calls: None,
+        cache_hit_tokens: None,
+        cache_miss_tokens: None,
+        breakdown: None,
+        usage: None,
+        budget_tokens: None,
+    }
+}

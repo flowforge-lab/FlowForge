@@ -11,6 +11,10 @@ ff-core.workspace = true
 ff-agent.workspace = true
 ff-tools.workspace = true
 serde_json.workspace = true
+tokio = { workspace = true, features = ["rt", "sync", "time", "process"] }
+thiserror.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
 async-trait.workspace = true
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "sync", "time", "process"] }
