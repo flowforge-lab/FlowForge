@@ -107,6 +107,38 @@ pub(crate) fn build_ollama_http_client() -> reqwest::Client {
         .clone()
 }
 
+/// Promote a mode-switch marker message from `role: "user"` to `role: "system"`
+/// on the wire, in-position.
+///
+/// The marker is persisted as [`Role::User`](ff_core::Role) so it stays in
+/// sequence for Bedrock/Anthropic, which lift `Role::System` messages out of the
+/// conversation into a flat system parameter and would lose the temporal signal
+/// that the mode changed *here* (#848). Providers that serialize system messages
+/// where they sit — OpenAI-compatible and Ollama — instead want the true
+/// `role: "system"` shape, so they call this on each serialized message to
+/// restore it without touching the store (#850).
+///
+/// Only the `role` key is rewritten; content and position are untouched. Gated on
+/// `role == "user"` plus a [`MODE_SWITCH_MARKER_PREFIX`](ff_core::MODE_SWITCH_MARKER_PREFIX)
+/// `starts_with` — a user turn that merely mentions the text mid-sentence stays a
+/// user turn.
+pub(crate) fn promote_mode_switch_marker(
+    msg: &ChatMessage,
+    obj: &mut serde_json::Map<String, serde_json::Value>,
+) {
+    if msg.role == "user"
+        && msg
+            .content
+            .as_deref()
+            .is_some_and(|c| c.starts_with(ff_core::MODE_SWITCH_MARKER_PREFIX))
+    {
+        obj.insert(
+            "role".into(),
+            serde_json::Value::String("system".to_string()),
+        );
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: String,

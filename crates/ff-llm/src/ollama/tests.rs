@@ -134,6 +134,36 @@ fn outbound_messages_without_tool_calls_are_unchanged() {
 }
 
 #[test]
+fn outbound_promotes_mode_switch_marker_to_system_in_position() {
+    // Stored Role::User (#848); Ollama serializes system messages in-position,
+    // so the marker wants the true role: "system" shape (#850).
+    let marker = format!(
+        "{} Mode switched to Auto. Writes auto-approved]",
+        ff_core::MODE_SWITCH_MARKER_PREFIX
+    );
+    let msgs = vec![
+        ChatMessage::text("assistant", "I'm in Plan mode."),
+        ChatMessage::text("user", &marker),
+        ChatMessage::text("user", "go"),
+    ];
+    let out = ollama_messages(&msgs).unwrap();
+    assert_eq!(out[0]["role"], "assistant");
+    assert_eq!(out[1]["role"], "system", "marker promoted in-position");
+    assert_eq!(out[1]["content"], marker, "content untouched");
+    assert_eq!(out[2]["role"], "user", "trailing user turn untouched");
+}
+
+#[test]
+fn outbound_user_message_mentioning_marker_mid_text_stays_user() {
+    let msgs = vec![ChatMessage::text("user", "explain [system: ...] to me")];
+    let out = ollama_messages(&msgs).unwrap();
+    assert_eq!(
+        out[0]["role"], "user",
+        "mid-text mention must not be promoted"
+    );
+}
+
+#[test]
 fn outbound_converts_every_call_in_a_multi_call_message() {
     let msg = ChatMessage {
         role: "assistant".into(),
