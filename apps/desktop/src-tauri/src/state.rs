@@ -2112,6 +2112,10 @@ impl AppState {
         // agent calls when the objective is met. Always registered so a goal can
         // complete regardless of which session drives it; a no-op outside a loop.
         reg.register(Box::new(ff_tools::GoalCompleteTool));
+        // Bookkeeping counterpart (#1225): records evidence-first steps into the
+        // goal's durable ledger. Registered on the same unconditional path as
+        // `goal_complete` so the two hosts cannot diverge.
+        reg.register(Box::new(ff_tools::GoalStepTool));
         // Bridge MCP tools from the instances this session resolves to (M4.3): every
         // global instance plus the workspace instances rooted at `session_root` (RFC
         // 0018 §4.6). Routing is by instance key, so a concurrent turn on another

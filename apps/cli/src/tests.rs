@@ -948,6 +948,35 @@ async fn both_registry_seams_register_the_same_base_toolset() {
     }
 }
 
+/// Both goal-mode tools must actually be registered, by name (#1225).
+///
+/// `both_registry_seams_register_the_same_base_toolset` is a *relative* check: both
+/// seams delegate to one `build_base_registry`, so a tool missing from that single
+/// site is missing from both and the comparison still passes. That is exactly how
+/// `goal_step` shipped unregistered while a comment above `goal_complete` claimed it
+/// was registered "alongside" it — the loop parses `goal_step` off the event stream
+/// and the CLI loop tests synthesise those events, so nothing failed. This asserts
+/// the absolute presence the relative check cannot see.
+#[tokio::test]
+async fn goal_mode_tools_are_registered_by_name() {
+    let (registry, _m, _i) = build_registry_with_memory().await;
+    let names: Vec<String> = registry
+        .iter_tools()
+        .map(|t| t.name().to_string())
+        .collect();
+    for expected in [
+        ff_tools::GOAL_COMPLETE_TOOL_NAME,
+        ff_tools::GOAL_STEP_TOOL_NAME,
+    ] {
+        assert!(
+            names.iter().any(|n| n == expected),
+            "`{expected}` must be registered in the CLI tool registry (#1225): the agent \
+             cannot call a tool that is not advertised, however much the goal loop is \
+             prepared to parse it. Registered: {names:?}"
+        );
+    }
+}
+
 /// The non-MCP seam must not stand up an MCP host at all (#1207).
 ///
 /// It once delegated to the MCP seam and dropped the teardown guard on return, which

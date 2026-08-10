@@ -43,7 +43,10 @@ pub use compaction_extractive::{
     ContentKind, DigestResult, ExtractiveCompactor, GradedBands, ReversibleCache,
     COMPACTION_MARKER_PREFIX, DIGEST_LEVEL, MAX_COMPACTION_LEVEL,
 };
-pub use goal_loop::{drive_goal, GateDecision, GoalIteration, IterationOutcome, LoopStop};
+pub use goal_loop::{
+    drive_goal, parse_ledger_step, GateDecision, GoalIteration, IterationOutcome, LedgerStep,
+    LoopStop, TurnLedger,
+};
 pub use message_salience::MessageSalience;
 pub use system_prompt::{
     build_flush_prompt, build_system_prompt, fit_mcp_guidance, server_guidance_is_reachable,

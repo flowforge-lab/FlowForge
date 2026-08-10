@@ -24,8 +24,10 @@
 use std::panic::AssertUnwindSafe;
 
 use async_trait::async_trait;
-use ff_core::{Goal, GoalStatus};
+use ff_core::{Goal, GoalLedgerEntry, GoalStatus, StepStatus, Verdict};
 use futures_util::FutureExt;
+
+use crate::AgentEvent;
 
 /// Why a single loop pass stopped, returned by [`drive_goal`]. The loop persists
 /// the goal before returning, so the caller only needs this to decide what to
@@ -78,6 +80,28 @@ pub struct IterationOutcome {
     /// checkpoints, so the steer is applied exactly once and not re-persisted on
     /// the next boundary (#753 review nit 1).
     pub steer_consumed: bool,
+    /// Ledger steps the agent recorded this turn via `goal_step` (#1225), in call
+    /// order. The host collects them from the event stream — a tool's `run` gets
+    /// no `Goal` handle, so it can only signal — and the loop commits them at the
+    /// iteration boundary so they persist with the goal.
+    pub ledger_steps: Vec<LedgerStep>,
+}
+
+/// One `goal_step` call observed on the event stream, normalised into the fields
+/// the loop commits to `Goal.ledger`.
+///
+/// Only `claim` and `verdict` reach the model today: `system_prompt.rs` renders
+/// exactly those two per entry. `evidence` is captured and persisted but **not**
+/// surfaced back — a deliberate, documented gap (#1225) kept so the write path
+/// could land minimally; rendering it is a follow-up. Do not assume the agent
+/// can see evidence it recorded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LedgerStep {
+    /// Id of an existing entry to update in place; `None` appends a new entry.
+    pub id: Option<String>,
+    pub claim: String,
+    pub verdict: Option<Verdict>,
+    pub evidence: Vec<String>,
 }
 
 /// One iteration of the goal loop, abstracted so the loop mechanics are testable
@@ -102,6 +126,205 @@ pub trait GoalIteration: Send + Sync {
 
     /// Current wall-clock in epoch-ms, injected so tests are deterministic.
     fn now_ms(&self) -> i64;
+}
+
+/// Normalise a `goal_step` tool call's arguments into a [`LedgerStep`].
+///
+/// Lives here rather than in either host so the CLI and desktop cannot drift into
+/// two different readings of the same tool call. Returns `None` when `claim` is
+/// absent or blank — [`GoalStepTool`](ff_tools::GoalStepTool) already rejects
+/// that, so this only guards a malformed call reaching the observer.
+///
+/// An unrecognised `verdict` becomes `None` (step still open) rather than an
+/// error: the tool validates the vocabulary at the call site, and silently
+/// downgrading here is safer than inventing a verdict the agent did not give.
+pub fn parse_ledger_step(args: &serde_json::Value) -> Option<LedgerStep> {
+    let claim = args.get("claim")?.as_str()?.trim();
+    if claim.is_empty() {
+        return None;
+    }
+    let verdict = args
+        .get("verdict")
+        .and_then(|v| v.as_str())
+        .and_then(|v| match v {
+            "match" => Some(Verdict::Match),
+            "drift" => Some(Verdict::Drift),
+            "unverifiable" => Some(Verdict::Unverifiable),
+            _ => None,
+        });
+    let evidence = args
+        .get("evidence")
+        .and_then(|v| v.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|i| i.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    Some(LedgerStep {
+        id: args
+            .get("id")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .filter(|s| !s.is_empty()),
+        claim: claim.to_string(),
+        verdict,
+        evidence,
+    })
+}
+
+/// Per-turn collector for the `goal_step` / `goal_complete` signals a running
+/// turn emits as [`AgentEvent`]s. A tool's `run` gets no `Goal` handle, so the
+/// only channel is the event stream: feed every event through [`observe`] and
+/// the collector runs the started→pending→finished→commit state machine, then
+/// hands back the committed steps at the turn boundary.
+///
+/// Both hosts (CLI and desktop) drove an identical state machine inline,
+/// differing only in locking (#1226); this is the shared owner so the two
+/// cannot drift. Desktop wraps it in a single `Mutex` rather than scattering a
+/// lock across four match arms.
+///
+/// [`observe`]: TurnLedger::observe
+#[derive(Debug, Default)]
+pub struct TurnLedger {
+    /// Call id of the in-flight `goal_complete`, set on its `Started` event and
+    /// promoted to `completed` when that same call finishes successfully.
+    gc_call_id: Option<String>,
+    completed: bool,
+    /// `goal_step` calls parsed at `Started` but not yet resolved, keyed by call
+    /// id. A step is committed only when its call finishes successfully.
+    pending: std::collections::HashMap<String, LedgerStep>,
+    steps: Vec<LedgerStep>,
+}
+
+impl TurnLedger {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Route one agent event through the state machine.
+    pub fn observe(&mut self, event: &AgentEvent) {
+        match event {
+            AgentEvent::ToolCallStarted { call_id, name, .. }
+                if name == ff_tools::GOAL_COMPLETE_TOOL_NAME =>
+            {
+                self.gc_call_id = Some(call_id.clone());
+            }
+            // A tool's `run` gets no `Goal` handle, so `goal_step` can only signal:
+            // parse its args here and commit at the iteration boundary (#1225).
+            AgentEvent::ToolCallStarted {
+                call_id,
+                name,
+                args,
+                ..
+            } if name == ff_tools::GOAL_STEP_TOOL_NAME => {
+                if let Some(step) = parse_ledger_step(args) {
+                    self.pending.insert(call_id.clone(), step);
+                }
+            }
+            AgentEvent::ToolCallFinished {
+                call_id,
+                success: true,
+                ..
+            } if self.gc_call_id.as_deref() == Some(call_id.as_str()) => {
+                self.completed = true;
+            }
+            // Only a successful call is recorded: a rejected or failed `goal_step`
+            // must not leave a claim in the ledger.
+            AgentEvent::ToolCallFinished {
+                call_id, success, ..
+            } if self.pending.contains_key(call_id.as_str()) => {
+                // Drop the pending step either way: on failure it must not survive to be
+                // committed by a later call's event, and it can never be finished twice.
+                if let Some(step) = self.pending.remove(call_id.as_str()) {
+                    if *success {
+                        self.steps.push(step);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Whether a `goal_complete` call finished successfully this turn.
+    pub fn completed(&self) -> bool {
+        self.completed
+    }
+
+    /// The steps committed this turn, in observation order. Consumes the
+    /// collector — a turn's ledger is read exactly once, at its boundary.
+    pub fn into_steps(self) -> Vec<LedgerStep> {
+        self.steps
+    }
+}
+
+/// Commit the `goal_step` calls observed during one turn into `Goal.ledger`.
+///
+/// An entry carrying an `id` that matches an existing step updates it in place;
+/// anything else appends. A verdict implies the step's status: `Match` closes it,
+/// while `Drift` and `Unverifiable` leave it `Active` so a later iteration can
+/// see there is unfinished business — a step that could not be checked is never
+/// quietly treated as done (`StepStatus`/`Verdict` docs, #74).
+fn commit_ledger_steps(goal: &mut Goal, steps: &[LedgerStep], now_ms: i64) {
+    for step in steps {
+        let status = match step.verdict {
+            Some(Verdict::Match) => StepStatus::Done,
+            Some(_) => StepStatus::Active,
+            None => StepStatus::Active,
+        };
+        // `update_entry` reports whether the id existed; an unknown id falls
+        // through to an append so a step is never silently dropped.
+        let updated = step.id.as_deref().is_some_and(|id| {
+            goal.update_entry(id, now_ms, |e| {
+                e.claim = step.claim.clone();
+                e.verdict = step.verdict;
+                e.evidence = step.evidence.clone();
+                e.status = status;
+            })
+        });
+        if !updated {
+            // `append_entry` does not mint ids, and an entry with an empty id could
+            // never be updated in place afterwards. Derive a stable one from the
+            // step's position, then bump past any id already in the ledger: a step
+            // that explicitly passed e.g. `step-2` before a positional mint reaches
+            // the same number would otherwise collide and make the two entries
+            // un-addressable (#1226).
+            let id = step
+                .id
+                .clone()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| mint_step_id(goal));
+            goal.append_entry(
+                GoalLedgerEntry {
+                    id,
+                    status,
+                    claim: step.claim.clone(),
+                    action: None,
+                    evidence: step.evidence.clone(),
+                    verdict: step.verdict,
+                    next: None,
+                    created_ms: now_ms,
+                    updated_ms: now_ms,
+                },
+                now_ms,
+            );
+        }
+    }
+}
+
+/// Mint a positional `step-N` id that is not already used by an entry in the
+/// ledger. The base is `len + 1` (the natural next slot); it advances past any
+/// collision with an id an earlier step supplied explicitly (#1226).
+fn mint_step_id(goal: &Goal) -> String {
+    let mut n = goal.ledger.len() + 1;
+    loop {
+        let candidate = format!("step-{n}");
+        if !goal.ledger.iter().any(|e| e.id == candidate) {
+            return candidate;
+        }
+        n += 1;
+    }
 }
 
 /// Drive the self-continue loop for `goal` until a terminal condition, mutating
@@ -174,6 +397,12 @@ pub async fn drive_goal<I: GoalIteration>(goal: &mut Goal, iter: &I) -> LoopStop
         if outcome.steer_consumed {
             goal.pending_steer = None;
         }
+
+        // Commit ledger steps recorded this turn BEFORE the checkpoint, so they
+        // persist in the same save as the spend they were produced by. A panicked
+        // turn yields the default outcome (no steps), so nothing is invented for a
+        // turn that did not report.
+        commit_ledger_steps(goal, &outcome.ledger_steps, iter.now_ms());
 
         // (5) Close the boundary: accrue spend + bump the iteration, then persist.
         // Even a cancelled turn spent (billed) tokens, so accruing them is honest;
