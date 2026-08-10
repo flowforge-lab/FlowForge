@@ -90,6 +90,36 @@ pub struct Session {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional, type = "number")]
     pub fork_point_seq: Option<i64>,
+    /// Provenance for a session produced by confluence (#1229, RFC 0023 §4/§5):
+    /// the source sessions whose transcripts were concatenated, in the order
+    /// they were appended, each with how many messages it contributed. `None`
+    /// for every ordinary session. Because segments are appended whole and never
+    /// interleaved, these counts partition this session's transcript into
+    /// contiguous spans, so any message maps back to its origin session by
+    /// position — structured provenance, never `<session_id>` tags in content.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub confluence_sources: Option<Vec<ConfluenceSource>>,
+}
+
+/// One source segment of a confluence session (#1229, RFC 0023 §4/§5): a
+/// session that was concatenated into it, and the number of messages it
+/// contributed. Ordered within [`Session::confluence_sources`] by append order.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "../../../apps/desktop/src/bindings/")]
+pub struct ConfluenceSource {
+    /// The session this segment was copied from. Always `Some` when a confluence
+    /// is created: V1 requires every source to exist (a missing one aborts with
+    /// `SessionNotFound`). `None` is reserved for a source deleted *after* the
+    /// confluence — the segment stays, its exact origin is simply lost.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub session_id: Option<String>,
+    /// How many messages this source contributed, i.e. the length of its
+    /// contiguous span in the confluence transcript.
+    #[ts(type = "number")]
+    pub message_count: i64,
 }
 
 /// A session's working directory as surfaced to the frontend selector (#200,

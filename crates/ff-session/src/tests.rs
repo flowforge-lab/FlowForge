@@ -383,7 +383,7 @@ fn migration_v3_to_v4_preserves_messages_and_adds_reasoning() {
         .unwrap()
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 13);
+    assert_eq!(version, 14);
 }
 
 #[test]
@@ -504,7 +504,7 @@ fn migration_v4_to_v5_preserves_messages_and_creates_table() {
         .unwrap()
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 13);
+    assert_eq!(version, 14);
 }
 
 #[test]
@@ -555,7 +555,7 @@ fn migration_v5_to_v6_preserves_session_and_adds_model() {
         .unwrap()
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 13);
+    assert_eq!(version, 14);
 }
 
 #[test]
@@ -934,7 +934,7 @@ fn migration_v6_to_v7_preserves_session_and_adds_mcp_servers() {
         .unwrap()
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 13);
+    assert_eq!(version, 14);
 }
 
 #[test]
@@ -996,7 +996,7 @@ fn migration_v7_to_v9_preserves_messages_and_adds_stop_reason() {
         .unwrap()
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 13);
+    assert_eq!(version, 14);
 }
 
 #[test]
@@ -1158,7 +1158,7 @@ fn migration_is_idempotent_across_reopens() {
         .unwrap()
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 13);
+    assert_eq!(version, 14);
 }
 
 #[test]
@@ -1703,7 +1703,8 @@ fn pre_existing_v11_database_upgrades_to_lineage() {
     conn.execute_batch(
         "DROP INDEX idx_sessions_parent;
          ALTER TABLE sessions DROP COLUMN parent_session_id;
-         ALTER TABLE sessions DROP COLUMN fork_point_seq;",
+         ALTER TABLE sessions DROP COLUMN fork_point_seq;
+         ALTER TABLE sessions DROP COLUMN confluence_sources;",
     )
     .unwrap();
     conn.pragma_update(None, "user_version", 11).unwrap();
@@ -1718,7 +1719,7 @@ fn pre_existing_v11_database_upgrades_to_lineage() {
     let version: i64 = conn
         .query_row("SELECT * FROM pragma_user_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 13);
+    assert_eq!(version, 14);
 
     let store = SessionStore {
         conn: Mutex::new(conn),
@@ -1798,6 +1799,8 @@ fn migration_v12_to_v13_preserves_messages_and_adds_turn_preheat() {
         store.add_message(&s.id, Role::Assistant, "legacy".into());
         let conn = store.conn.lock().unwrap();
         conn.execute_batch("DROP TABLE turn_preheat;").unwrap();
+        conn.execute_batch("ALTER TABLE sessions DROP COLUMN confluence_sources;")
+            .unwrap();
         conn.pragma_update(None, "user_version", 12).unwrap();
         s.id
     };
@@ -1823,7 +1826,7 @@ fn migration_v12_to_v13_preserves_messages_and_adds_turn_preheat() {
         .unwrap()
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(version, 13);
+    assert_eq!(version, 14);
 }
 
 // ---- Tool co-invocation rollup (#1107) ----
@@ -1980,4 +1983,194 @@ fn add_message_without_a_session_row_is_the_bug_ensure_session_prevents() {
         "writing a message for an id with no session row must fail (messages FK); \
          goal mode avoids this by calling ensure_session first"
     );
+}
+
+// ---- #1229 confluence core (RFC 0023 §4/§5, V1) ----
+
+/// Force a session's `created_at` so fork order is deterministic in tests
+/// (`now_ms()` can collide within a single fast test).
+fn set_created_at(store: &SessionStore, session_id: &str, ts: i64) {
+    let conn = store.conn.lock().unwrap();
+    conn.execute(
+        "UPDATE sessions SET created_at = ?1 WHERE id = ?2",
+        params![ts, session_id],
+    )
+    .unwrap();
+}
+
+fn confluence_contents(store: &SessionStore, session_id: &str) -> Vec<String> {
+    store
+        .get_messages(session_id)
+        .into_iter()
+        .map(|m| m.content)
+        .collect()
+}
+
+#[test]
+fn confluence_concatenates_same_lineage_tails_whole_and_in_fork_order() {
+    let store = SessionStore::new();
+    let root = store.create_session(None);
+    store.add_message(&root.id, Role::User, "shared".into());
+
+    let a = store.fork_session(&root.id).unwrap();
+    set_created_at(&store, &a.id, 100);
+    store.add_message(&a.id, Role::User, "a1".into());
+    store.add_message(&a.id, Role::User, "a2".into());
+
+    let b = store.fork_session(&root.id).unwrap();
+    set_created_at(&store, &b.id, 200);
+    store.add_message(&b.id, Role::User, "b1".into());
+
+    let conf = store.confluence_sessions(&[&b.id, &a.id]).unwrap();
+
+    // Fork order is branch-creation time (a before b), regardless of the order
+    // the caller passed them in. Each tail's shared prefix is kept (V1 does not
+    // de-dup, RFC 0023 §7), segments whole.
+    assert_eq!(
+        confluence_contents(&store, &conf.id),
+        vec!["shared", "a1", "a2", "shared", "b1"]
+    );
+}
+
+#[test]
+fn confluence_rejects_fewer_than_two() {
+    let store = SessionStore::new();
+    let s = store.create_session(None);
+    assert_eq!(
+        store.confluence_sessions(&[&s.id]),
+        Err(ConfluenceError::TooFew)
+    );
+    assert_eq!(store.confluence_sessions(&[]), Err(ConfluenceError::TooFew));
+}
+
+#[test]
+fn confluence_rejects_a_missing_session() {
+    let store = SessionStore::new();
+    let a = store.create_session(None);
+    let b = store.fork_session(&a.id).unwrap();
+    let err = store
+        .confluence_sessions(&[&a.id, &b.id, "ghost"])
+        .unwrap_err();
+    assert_eq!(err, ConfluenceError::SessionNotFound("ghost".to_string()));
+}
+
+#[test]
+fn confluence_rejects_cross_tree_selection() {
+    let store = SessionStore::new();
+    // Two independent trees: each root was never forked from the other.
+    let tree1 = store.create_session(None);
+    let f1 = store.fork_session(&tree1.id).unwrap();
+    let tree2 = store.create_session(None);
+    let f2 = store.fork_session(&tree2.id).unwrap();
+
+    assert_eq!(
+        store.confluence_sessions(&[&f1.id, &f2.id]),
+        Err(ConfluenceError::CrossTree)
+    );
+    // Two roots directly is just as cross-tree.
+    assert_eq!(
+        store.confluence_sessions(&[&tree1.id, &tree2.id]),
+        Err(ConfluenceError::CrossTree)
+    );
+}
+
+#[test]
+fn confluence_records_structured_provenance_partitioning_the_transcript() {
+    let store = SessionStore::new();
+    let root = store.create_session(None);
+    store.add_message(&root.id, Role::User, "shared".into());
+    let a = store.fork_session(&root.id).unwrap();
+    set_created_at(&store, &a.id, 100);
+    store.add_message(&a.id, Role::User, "a1".into());
+    let b = store.fork_session(&root.id).unwrap();
+    set_created_at(&store, &b.id, 200);
+    store.add_message(&b.id, Role::User, "b1".into());
+    store.add_message(&b.id, Role::User, "b2".into());
+
+    let conf = store.confluence_sessions(&[&a.id, &b.id]).unwrap();
+
+    // Provenance is structured and survives a reload (JSON column), never inline
+    // tags in message content. Counts partition the transcript into contiguous
+    // spans in fork order: a = [shared,a1] (2), b = [shared,b1,b2] (3).
+    let reloaded = store.get_session(&conf.id).unwrap();
+    let sources = reloaded.confluence_sources.expect("provenance persisted");
+    assert_eq!(sources.len(), 2);
+    assert_eq!(sources[0].session_id.as_deref(), Some(a.id.as_str()));
+    assert_eq!(sources[0].message_count, 2);
+    assert_eq!(sources[1].session_id.as_deref(), Some(b.id.as_str()));
+    assert_eq!(sources[1].message_count, 3);
+    assert_eq!(
+        sources.iter().map(|s| s.message_count).sum::<i64>(),
+        store.get_messages(&conf.id).len() as i64
+    );
+}
+
+#[test]
+fn confluence_keeps_segments_whole_never_interleaving_by_timestamp() {
+    let store = SessionStore::new();
+    let root = store.create_session(None);
+    let early = store.fork_session(&root.id).unwrap();
+    set_created_at(&store, &early.id, 100); // forked first
+    let late = store.fork_session(&root.id).unwrap();
+    set_created_at(&store, &late.id, 200); // forked second
+
+    // The later-forked branch's messages carry EARLIER wall-clock timestamps.
+    // A timestamp merge would interleave them; whole-segment concat must not.
+    store.add_message(&early.id, Role::User, "early-branch-msg".into());
+    {
+        let conn = store.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE messages SET created_at = 999 WHERE session_id = ?1",
+            params![early.id],
+        )
+        .unwrap();
+    }
+    store.add_message(&late.id, Role::User, "late-branch-msg".into());
+    {
+        let conn = store.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE messages SET created_at = 1 WHERE session_id = ?1",
+            params![late.id],
+        )
+        .unwrap();
+    }
+
+    let conf = store.confluence_sessions(&[&early.id, &late.id]).unwrap();
+    // Fork order wins: early branch's whole segment first, then late's. If the
+    // implementation sorted by message timestamp this would be reversed.
+    assert_eq!(
+        confluence_contents(&store, &conf.id),
+        vec!["early-branch-msg", "late-branch-msg"]
+    );
+}
+
+#[test]
+fn confluence_degrades_gracefully_when_an_ancestor_was_deleted() {
+    let store = SessionStore::new();
+    let root = store.create_session(None);
+    store.add_message(&root.id, Role::User, "shared".into());
+    let a = store.fork_session(&root.id).unwrap();
+    set_created_at(&store, &a.id, 100);
+    store.add_message(&a.id, Role::User, "a1".into());
+    let b = store.fork_session(&root.id).unwrap();
+    set_created_at(&store, &b.id, 200);
+    store.add_message(&b.id, Role::User, "b1".into());
+
+    // Delete the common ancestor (#1074 ON DELETE SET NULL nulls parent links).
+    assert!(store.delete_session(&root.id));
+    let a_orphan = store.get_session(&a.id).unwrap();
+    assert_eq!(a_orphan.parent_session_id, None);
+    assert!(
+        a_orphan.fork_point_seq.is_some(),
+        "orphan keeps its fork point"
+    );
+
+    // Their shared tree can no longer be proven, but confluence still produces a
+    // session (independent-tail fallback), transcripts intact (RFC 0023 §4).
+    let conf = store.confluence_sessions(&[&a.id, &b.id]).unwrap();
+    assert_eq!(
+        confluence_contents(&store, &conf.id),
+        vec!["shared", "a1", "shared", "b1"]
+    );
+    assert_eq!(conf.confluence_sources.unwrap().len(), 2);
 }
