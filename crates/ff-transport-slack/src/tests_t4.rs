@@ -489,6 +489,7 @@ fn deny_rm_rf() -> Vec<PermissionRule> {
         matcher: ArgMatcher::CommandPrefix {
             prefix: "rm -rf".into(),
         },
+        guide: None,
     }]
 }
 
@@ -546,6 +547,7 @@ async fn a_scoped_allow_rule_auto_approves_without_prompting() {
         matcher: ArgMatcher::CommandPrefix {
             prefix: "cargo test".into(),
         },
+        guide: None,
     }];
     assert_eq!(
         matrix.effective_cell("bash", Mode::Auto, Safety::Sensitive),

@@ -71,6 +71,44 @@ impl PermissionCell {
 pub enum RuleEffect {
     Allow,
     Deny,
+    /// Does not participate in the authorization decision at all: the call is
+    /// authorized exactly as if this rule were absent. A match instead appends
+    /// the rule's `guide` text to the annotated call's persisted tool-result
+    /// message, so the advice reaches the model in the same request as the
+    /// outcome it annotates (#1235).
+    ///
+    /// This is a third, *orthogonal* effect rather than an annotation on
+    /// `Allow` because `effect` is mandatory: hanging guidance off `Allow`
+    /// would make a "just remind me" rule silently auto-approve the tool (a
+    /// security regression), and hanging it off `Deny` would make the text
+    /// dead, since the call never runs.
+    Guide,
+}
+
+/// Where a matched [`GuideHit`] came from.
+///
+/// Only [`Self::Rule`] exists today. The enum is here because phenotype-level
+/// guides are the agreed next step and their agreed semantics are *override*,
+/// which requires comparing layers — and layers must be nameable. A bare
+/// `Vec<String>` would discard provenance and force a breaking refactor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GuideSource {
+    /// A scoped permission rule (#712) with `effect: guide`.
+    Rule,
+}
+
+/// One corrective to inject for a tool call, and where it came from.
+///
+/// `source` is **write-only today** (#1237 finding 5): `collect_guides` sets it,
+/// but the sole consumer immediately drops it (`.map(|hit| hit.text)`). It is
+/// retained deliberately as the seam for phenotype-level guides, whose agreed
+/// *override* semantics require comparing layers by provenance — see
+/// [`GuideSource`]. Until that lands, treat `source` as reserved, not load-bearing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GuideHit {
+    pub text: String,
+    pub source: GuideSource,
 }
 
 /// How a rule matches the resolved argument of a tool call.
@@ -81,6 +119,12 @@ pub enum ArgMatcher {
     PathGlob { pattern: String },
     /// Token-aware prefix on the bash command. `brazil-build` matches
     /// `brazil-build test` but NOT `brazil-build-evil`.
+    ///
+    /// Prefix-matches the command *head* only: `rm ...` chained behind another
+    /// command (`true && rm -rf x`, `x; rm -rf y`) is not matched (#1237
+    /// finding 7). This is acceptable for `guide` (a missed corrective only
+    /// forgoes advice; it grants nothing) but a `deny` rule that must be
+    /// airtight should use `CommandRegex` instead.
     CommandPrefix { prefix: String },
     /// Regex match on the full bash command string.
     CommandRegex { pattern: String },
@@ -188,6 +232,11 @@ pub struct PermissionRule {
     pub effect: RuleEffect,
     pub tool: String,
     pub matcher: ArgMatcher,
+    /// The corrective to inject when this rule matches, for
+    /// `effect: guide` (#1235). `#[serde(default)]` keeps existing
+    /// configs — which have no such field — loading cleanly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guide: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -382,6 +431,10 @@ impl PermissionMatrix {
                     }
                     saw_allow = true;
                 }
+                // Guide never participates in authorization (#1235 AC2): the
+                // outcome must be bit-identical to this rule being absent.
+                // Collected separately by `collect_guides`.
+                RuleEffect::Guide => continue,
             }
         }
 
@@ -394,6 +447,41 @@ impl PermissionMatrix {
         }
 
         None
+    }
+
+    /// Collect every `effect: guide` rule matching this call (#1235).
+    ///
+    /// Aggregating, not first-match: every matching guide contributes, since
+    /// each carries independent advice and none supersedes another. Mirrors how
+    /// `evaluate_rules` accumulates `Allow`. The caller deduplicates by text and
+    /// concatenates the survivors into a single carrier appended to the tool
+    /// result, so N matching rules with identical text yield one line, not N.
+    ///
+    /// Mode-independent by design. A guide changes no authorization, so there
+    /// is no Plan-mode carve-out like the one `Allow` needs — advice is as
+    /// useful when planning as when acting.
+    ///
+    /// A rule with a malformed matcher or no `guide` text is skipped: unlike a
+    /// malformed deny (which fails closed), an unusable guide has nothing to
+    /// fail closed *to*, and injecting empty text would spend tokens saying
+    /// nothing.
+    pub fn collect_guides(&self, tool: &str, resolved_arg: Option<&str>) -> Vec<GuideHit> {
+        let Some(resolved) = resolved_arg else {
+            return Vec::new();
+        };
+
+        self.rules
+            .iter()
+            .filter(|r| r.tool == tool && r.effect == RuleEffect::Guide)
+            .filter(|r| r.matcher.is_valid() && r.matcher.matches(resolved))
+            .filter_map(|r| {
+                let text = r.guide.as_deref()?.trim();
+                (!text.is_empty()).then(|| GuideHit {
+                    text: text.to_string(),
+                    source: GuideSource::Rule,
+                })
+            })
+            .collect()
     }
 
     /// Return the first matching deny rule for a tool/argument pair (#1176).
@@ -412,23 +500,45 @@ impl PermissionMatrix {
         })
     }
 
-    /// Validate every rule's matcher pattern, returning `(index, error)` for
-    /// each malformed one. Call at load time and surface the errors (#768
-    /// review nit 2) rather than letting a typo silently disable a backstop.
+    /// Validate every rule, returning `(index, error)` for each problem. Call at
+    /// load time and surface the errors (#768 review nit 2) rather than letting a
+    /// typo silently disable a backstop. Covers two failure modes: a malformed
+    /// matcher pattern, and (#1237 finding 3) an `effect: guide` rule whose
+    /// `guide` text is missing or blank — which `collect_guides` silently skips,
+    /// so the rule would otherwise produce neither a corrective nor an error.
     pub fn validate_rules(&self) -> Vec<(usize, String)> {
-        self.rules
-            .iter()
-            .enumerate()
-            .filter_map(|(i, rule)| match &rule.matcher {
-                ArgMatcher::PathGlob { pattern } => globset::Glob::new(pattern)
-                    .err()
-                    .map(|e| (i, format!("invalid path_glob `{pattern}`: {e}"))),
-                ArgMatcher::CommandRegex { pattern } => regex::Regex::new(pattern)
-                    .err()
-                    .map(|e| (i, format!("invalid command_regex `{pattern}`: {e}"))),
-                ArgMatcher::CommandPrefix { .. } => None,
-            })
-            .collect()
+        let mut errors = Vec::new();
+        for (i, rule) in self.rules.iter().enumerate() {
+            match &rule.matcher {
+                ArgMatcher::PathGlob { pattern } => {
+                    if let Err(e) = globset::Glob::new(pattern) {
+                        errors.push((i, format!("invalid path_glob `{pattern}`: {e}")));
+                    }
+                }
+                ArgMatcher::CommandRegex { pattern } => {
+                    if let Err(e) = regex::Regex::new(pattern) {
+                        errors.push((i, format!("invalid command_regex `{pattern}`: {e}")));
+                    }
+                }
+                ArgMatcher::CommandPrefix { .. } => {}
+            }
+            if rule.effect == RuleEffect::Guide
+                && rule
+                    .guide
+                    .as_deref()
+                    .map(str::trim)
+                    .unwrap_or("")
+                    .is_empty()
+            {
+                errors.push((
+                    i,
+                    "effect `guide` requires non-empty `guide` text; \
+                     this rule would match but produce no corrective"
+                        .to_string(),
+                ));
+            }
+        }
+        errors
     }
     /// Flatten the matrix into a self-describing list (Mode × Safety → cell), the
     /// shape the Control panel consumes so the FE never depends on the private

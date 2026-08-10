@@ -1077,6 +1077,7 @@ async fn ui_approver_scoped_deny_names_the_matched_rule() {
         matcher: ArgMatcher::CommandPrefix {
             prefix: "rm -rf".into(),
         },
+        guide: None,
     }];
 
     let state = Arc::new(AppState::new());
