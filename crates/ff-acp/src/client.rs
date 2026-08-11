@@ -101,6 +101,11 @@ impl AcpClient {
     /// Spawn the agent described by `config` and complete the `initialize`
     /// handshake, returning a handle that drives the rest of the protocol.
     ///
+    /// Awaits the `initialize` handshake before returning so the caller knows
+    /// immediately whether the agent connected and the protocol version agreed.
+    /// If the handshake fails, the spawned task is aborted and the child is
+    /// left to `ChildGuard`'s drop-reap.
+    ///
     /// # Env isolation (gap, recorded)
     ///
     /// `AcpAgent` inherits the host environment and applies `config.env` on
@@ -112,6 +117,7 @@ impl AcpClient {
     pub async fn connect(config: acp::AcpAgentConfig) -> Result<Self, AcpError> {
         let agent = AcpAgent::new(config);
         let (cmd_tx, cmd_rx) = mpsc::channel(16);
+        let (handshake_tx, handshake_rx) = oneshot::channel::<()>();
         let join = tokio::spawn(async move {
             Client
                 .builder()
@@ -125,11 +131,16 @@ impl AcpClient {
                     )
                     .block_task()
                     .await?;
+                    let _ = handshake_tx.send(());
                     drive(cx, cmd_rx).await
                 })
                 .await
                 .map_err(AcpError::from)
         });
+        // Wait for the initialize handshake to complete before returning.
+        // If the handshake never arrives (join panicked, child failed to
+        // spawn, transport errored), the oneshot error surfaces as ActorGone.
+        handshake_rx.await.map_err(|_| AcpError::ActorGone)?;
         Ok(Self {
             cmd_tx,
             join: Some(join),
@@ -288,7 +299,9 @@ async fn drive(cx: ConnectionTo<Agent>, mut cmd_rx: mpsc::Receiver<Cmd>) -> Resu
 struct ActiveSessionHandle(ActiveSession<'static, Agent>);
 
 /// Drive one prompt to completion: send it, then drain `session/update`
-/// notifications through [`content::inbound`] until the `StopReason` arrives.
+/// notifications through [`content::inbound`] and respond to agent→client
+/// requests (fs/*, terminal/*, request_permission) with stub errors so the
+/// agent's turn completes instead of hanging.
 async fn drive_prompt(
     session: &mut ActiveSession<'static, Agent>,
     prompt: &str,
@@ -304,12 +317,7 @@ async fn drive_prompt(
     loop {
         match session.read_update().await {
             Ok(SessionMessage::SessionMessage(dispatch)) => {
-                if let Some(update) = extract_update(dispatch).await {
-                    let inbound = content::inbound(&update, &fallback);
-                    if updates.send(inbound).is_err() {
-                        return; // caller dropped the stream
-                    }
-                }
+                handle_session_message(dispatch, &fallback, &updates).await;
             }
             Ok(SessionMessage::StopReason(stop)) => {
                 let internal = content::inbound_stop_reason(stop);
@@ -334,19 +342,60 @@ async fn drive_prompt(
     }
 }
 
-/// Extract the `SessionUpdate` from a `Dispatch` carrying a `session/update`
-/// notification. Non-notification dispatches yield `None`.
-async fn extract_update(dispatch: Dispatch) -> Option<wire::SessionUpdate> {
-    let mut update: Option<wire::SessionUpdate> = None;
-    MatchDispatch::new(dispatch)
-        .if_notification(async |notif: wire::SessionNotification| {
-            update = Some(notif.update);
-            Ok(())
-        })
-        .await
-        .otherwise_ignore()
-        .ok()?;
-    update
+/// Handle one inbound `Dispatch` from the agent during a prompt turn:
+///
+/// - `session/update` notifications → extract the update and forward to the stream.
+/// - `session/request_permission` → respond `cancelled` so the agent resumes.
+/// - Any other request → respond with a JSON-RPC error (`method not implemented`).
+/// - Unknown notifications → ignored (no response needed).
+/// - Responses → ignored (they belong to our requests, not the agent's).
+async fn handle_session_message(
+    dispatch: Dispatch,
+    fallback: &str,
+    updates: &mpsc::UnboundedSender<content::Inbound>,
+) {
+    let _ =
+        MatchDispatch::new(dispatch)
+            // session/update notification → extract and forward.
+            .if_notification(async |notif: wire::SessionNotification| {
+                let inbound = content::inbound(&notif.update, fallback);
+                let _ = updates.send(inbound);
+                Ok(())
+            })
+            .await
+            // session/request_permission → respond cancelled.
+            .if_request(
+                async |_req: wire::RequestPermissionRequest,
+                       responder: agent_client_protocol::Responder<
+                    wire::RequestPermissionResponse,
+                >| {
+                    responder.respond(wire::RequestPermissionResponse::new(
+                        wire::RequestPermissionOutcome::Cancelled,
+                    ))?;
+                    Ok(())
+                },
+            )
+            .await
+            // Everything else: respond with error so the agent doesn't hang.
+            .otherwise(|dispatch: Dispatch| async move {
+                match dispatch {
+                    Dispatch::Request(untyped, responder) => {
+                        let method = untyped.method().to_string();
+                        let err = agent_client_protocol::util::internal_error(format!(
+                            "{method} not implemented by this host"
+                        ));
+                        let _ = responder.respond_with_error(err);
+                    }
+                    Dispatch::Notification(_) => {
+                        // Unknown notification — ignore.
+                    }
+                    Dispatch::Response(_, _) => {
+                        // Response to one of our requests — ignore.
+                    }
+                }
+                Ok(())
+            })
+            .await;
 }
 
 /// Minimal `AgentEvent::Done` — only `message_id` and `stop_reason` are

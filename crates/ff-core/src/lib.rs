@@ -15,6 +15,7 @@ mod mode;
 mod model_specs;
 pub mod permission;
 mod provider;
+mod reconcile;
 mod scheduled;
 mod search;
 mod session;
@@ -48,6 +49,7 @@ pub use provider::{
     ContextWindowSource, ModelSelection, ProviderConfig, ProviderConnection, ProviderKind,
     ProviderRegistry, ReasoningEffort, ReasoningVisibility, ResolvedModel, SecretKind,
 };
+pub use reconcile::{reconcile, ReconcilableConfig, ReconcileAction};
 pub use scheduled::{
     BuiltinAction, CreateScheduledTaskInput, RunRecord, RunStatus, SafetyCeiling, ScheduledTask,
     TaskKind,
