@@ -99,25 +99,36 @@ async fn cancel_stops_the_prompt_stream() {
         .await
         .expect("session/prompt");
 
-    // Cancel the current turn. Since the mock agent does not support cancellation
-    // (session/cancel is a notification that the agent may ignore), this test
-    // verifies that cancel does not error and the stream eventually closes.
+    // Cancel the turn. Even though the mock agent ignores session/cancel (it
+    // keeps streaming and replies end_turn), the host must end the stream with
+    // a Cancelled Done immediately rather than waiting for the agent's
+    // StopReason (AC 4, review blocker #1234).
     client.cancel(session_id).await.expect("session/cancel");
 
-    // The stream should end (either with Done or by the channel closing).
-    let mut stream_ended = false;
-    while let Some(inbound) = tokio::time::timeout(Duration::from_secs(5), rx.recv())
-        .await
-        .expect("timeout waiting for stream event")
-    {
-        if let ff_acp::content::Inbound::Agent(event) = inbound {
-            if matches!(event, ff_agent::AgentEvent::Done { .. }) {
-                stream_ended = true;
-                break;
-            }
+    // The stream should end promptly with Done carrying Cancelled.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut found_cancelled = false;
+    while std::time::Instant::now() < deadline {
+        let inbound = match tokio::time::timeout(Duration::from_millis(500), rx.recv()).await {
+            Ok(Some(inbound)) => inbound,
+            Ok(None) | Err(_) => break,
+        };
+        if let ff_acp::content::Inbound::Agent(ff_agent::AgentEvent::Done { stop_reason, .. }) =
+            inbound
+        {
+            assert_eq!(
+                stop_reason,
+                Some(ff_core::StopReason::Cancelled),
+                "cancel must end the stream with a Cancelled stop reason"
+            );
+            found_cancelled = true;
+            break;
         }
     }
-    assert!(stream_ended, "stream should end with Done after cancel");
+    assert!(
+        found_cancelled,
+        "stream should end with Done(cancelled) after cancel"
+    );
     client.shutdown().await.expect("shutdown");
 }
 

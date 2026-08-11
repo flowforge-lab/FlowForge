@@ -240,58 +240,113 @@ impl Drop for AcpClient {
 /// The connection task's command loop. Runs inside the `connect_with` closure,
 /// so every error here is a connection-level error (the closure returning
 /// propagates to `connect_with`'s result and reaps the child).
+///
+/// Command dispatch uses `tokio::select!` so that `Cmd::Cancel` is serviced
+/// **during** a prompt rather than queueing until the prompt finishes — the
+/// review finding for AC 4 (#1234). The prompt loop runs in a spawned task
+/// and sends the `ActiveSession` back when it completes; the main loop reaps
+/// it via `reaped_rx`.
 async fn drive(cx: ConnectionTo<Agent>, mut cmd_rx: mpsc::Receiver<Cmd>) -> Result<(), acp::Error> {
     let mut sessions: HashMap<Arc<str>, ActiveSessionHandle> = HashMap::new();
-    while let Some(cmd) = cmd_rx.recv().await {
-        match cmd {
-            Cmd::NewSession { cwd, reply } => {
-                let result = cx.build_session(&cwd).block_task().start_session().await;
-                match result {
-                    Ok(session) => {
-                        let id = session.session_id().clone();
-                        sessions.insert(Arc::clone(&id.0), ActiveSessionHandle(session));
-                        let _ = reply.send(Ok(id));
+    // Per-session cancel signals for in-flight prompts. The `Cmd::Cancel`
+    // handler sends the `session/cancel` notification fires the oneshot
+    // sender; the prompt task races the oneshot receiver against
+    // `session.read_update()` and ends the stream early.
+    let mut prompt_cancels: HashMap<Arc<str>, oneshot::Sender<()>> = HashMap::new();
+    let (reaped_tx, mut reaped_rx) = tokio::sync::mpsc::unbounded_channel::<ReapedSession>();
+
+    loop {
+        tokio::select! {
+            Some(cmd) = cmd_rx.recv() => {
+                match cmd {
+                    Cmd::NewSession { cwd, reply } => {
+                        let result = cx.build_session(&cwd).block_task().start_session().await;
+                        match result {
+                            Ok(session) => {
+                                let id = session.session_id().clone();
+                                sessions.insert(Arc::clone(&id.0), ActiveSessionHandle(session));
+                                let _ = reply.send(Ok(id));
+                            }
+                            Err(e) => {
+                                let _ = reply.send(Err(AcpError::from(e)));
+                            }
+                        }
                     }
-                    Err(e) => {
-                        let _ = reply.send(Err(AcpError::from(e)));
+                    Cmd::Prompt {
+                        session_id,
+                        prompt,
+                        updates,
+                    } => {
+                        if let Some(handle) = sessions.remove(&session_id.0) {
+                            let (cancel_tx, cancel_rx) = oneshot::channel();
+                            prompt_cancels.insert(session_id.0.clone(), cancel_tx);
+                            let reaped_tx = reaped_tx.clone();
+                            let sid = session_id.0.clone();
+                            let prompt = prompt.clone();
+                            tokio::spawn(async move {
+                                let session = drive_prompt(
+                                    handle.0, &prompt, updates, cancel_rx,
+                                ).await;
+                                let _ = reaped_tx.send(ReapedSession {
+                                    session_id: sid,
+                                    handle: ActiveSessionHandle(session),
+                                });
+                            });
+                        }
+                        // Unknown session: `updates` is dropped, so the caller's
+                        // stream closes empty — a loud failure rather than a hang.
                     }
+                    Cmd::Cancel { session_id } => {
+                        // Send the protocol notification to the agent immediately.
+                        // This works even during a prompt because `cx` is a
+                        // separate clone of the connection (BLOCKER 1 fix).
+                        cx.send_notification_to(
+                            Agent,
+                            wire::CancelNotification::new(session_id.clone()),
+                        )?;
+                        // Signal the in-flight prompt task to end the host's
+                        // stream with a Cancelled Done immediately, without
+                        // waiting for the agent's acknowledgement.
+                        if let Some(cancel_tx) = prompt_cancels.remove(&session_id.0) {
+                            let _ = cancel_tx.send(());
+                        }
+                    }
+                    Cmd::SetMode {
+                        session_id,
+                        mode,
+                        reply,
+                    } => {
+                        let req = wire::SetSessionModeRequest::new(
+                            session_id,
+                            wire::SessionModeId::new(mode::mode_id(mode)),
+                        );
+                        let outcome = cx
+                            .send_request_to(Agent, req)
+                            .block_task()
+                            .await
+                            .map(|_| ())
+                            .map_err(AcpError::from);
+                        let _ = reply.send(outcome);
+                    }
+                    Cmd::Stop => return Ok(()),
                 }
             }
-            Cmd::Prompt {
-                session_id,
-                prompt,
-                updates,
-            } => {
-                if let Some(session) = sessions.get_mut(&session_id.0) {
-                    drive_prompt(&mut session.0, &prompt, updates).await;
-                }
-                // Unknown session: `updates` is dropped, so the caller's stream
-                // closes empty — a loud failure rather than a hang.
+            // Reap completed prompt tasks and return the session to the map.
+            Some(reaped) = reaped_rx.recv() => {
+                prompt_cancels.remove(&reaped.session_id);
+                sessions.insert(reaped.session_id, reaped.handle);
             }
-            Cmd::Cancel { session_id } => {
-                cx.send_notification_to(Agent, wire::CancelNotification::new(session_id))?;
-            }
-            Cmd::SetMode {
-                session_id,
-                mode,
-                reply,
-            } => {
-                let req = wire::SetSessionModeRequest::new(
-                    session_id,
-                    wire::SessionModeId::new(mode::mode_id(mode)),
-                );
-                let outcome = cx
-                    .send_request_to(Agent, req)
-                    .block_task()
-                    .await
-                    .map(|_| ())
-                    .map_err(AcpError::from);
-                let _ = reply.send(outcome);
-            }
-            Cmd::Stop => return Ok(()),
+            else => break,
         }
     }
     Ok(())
+}
+
+/// A session returned by a completed prompt task, ready to be re-inserted
+/// into the session map so the next prompt on the same session reuses it.
+struct ReapedSession {
+    session_id: Arc<str>,
+    handle: ActiveSessionHandle,
 }
 
 /// A `session/update` stream's [`AgentEvent`]s flow through this wrapper so
@@ -302,41 +357,63 @@ struct ActiveSessionHandle(ActiveSession<'static, Agent>);
 /// notifications through [`content::inbound`] and respond to agent→client
 /// requests (fs/*, terminal/*, request_permission) with stub errors so the
 /// agent's turn completes instead of hanging.
+///
+/// Accepts a `cancel_rx` [`oneshot::Receiver`] that the main loop fires when
+/// `Cmd::Cancel` arrives, so the host stream ends with a `Cancelled` Done
+/// without blocking on the agent (BLOCKER 1 fix).
 async fn drive_prompt(
-    session: &mut ActiveSession<'static, Agent>,
+    session: ActiveSession<'static, Agent>,
     prompt: &str,
     updates: mpsc::UnboundedSender<content::Inbound>,
-) {
+    mut cancel_rx: oneshot::Receiver<()>,
+) -> ActiveSession<'static, Agent> {
+    let mut session = session;
     if session.send_prompt(prompt).is_err() {
-        return; // caller's stream closes (sender dropped)
+        return session; // caller's stream closes (sender dropped)
     }
     // ACP leaves `messageId` optional on a chunk and absent on a `ToolCall`;
     // `AgentEvent` keys every event on one. Use the session id as the stable
     // fallback so every surfaced event is correlatable to its session.
     let fallback = session.session_id().0.to_string();
     loop {
-        match session.read_update().await {
-            Ok(SessionMessage::SessionMessage(dispatch)) => {
-                handle_session_message(dispatch, &fallback, &updates).await;
-            }
-            Ok(SessionMessage::StopReason(stop)) => {
-                let internal = content::inbound_stop_reason(stop);
+        tokio::select! {
+            biased;
+            // When cancel fires, end the host stream with a Cancelled Done
+            // without waiting for the agent's StopReason. The protocol
+            // notification was already sent by the `Cmd::Cancel` handler.
+            _ = &mut cancel_rx => {
                 let _ = updates.send(content::Inbound::Agent(done_event(
-                    fallback.clone(),
-                    internal,
+                    fallback,
+                    Some(ff_core::StopReason::Cancelled),
                 )));
-                return;
+                return session;
             }
-            Err(e) => {
-                tracing::warn!(error = %e, "agent stream read failed; ending prompt");
-                return;
-            }
-            // `SessionMessage` is `#[non_exhaustive]`; a future variant has no
-            // FlowForge surface yet. End the stream rather than spin on it —
-            // the host sees a closed channel instead of a silent hang.
-            Ok(_) => {
-                tracing::debug!("ignoring unknown SessionMessage variant; ending prompt");
-                return;
+            msg = session.read_update() => {
+                match msg {
+                    Ok(SessionMessage::SessionMessage(dispatch)) => {
+                        handle_session_message(dispatch, &fallback, &updates).await;
+                    }
+                    Ok(SessionMessage::StopReason(stop)) => {
+                        let internal = content::inbound_stop_reason(stop);
+                        let _ = updates.send(content::Inbound::Agent(done_event(
+                            fallback,
+                            internal,
+                        )));
+                        return session;
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "agent stream read failed; ending prompt");
+                        return session;
+                    }
+                    // `SessionMessage` is `#[non_exhaustive]`; a future variant
+                    // has no FlowForge surface yet. End the stream rather than
+                    // spin on it — the host sees a closed channel instead of a
+                    // silent hang.
+                    Ok(_) => {
+                        tracing::debug!("ignoring unknown SessionMessage variant; ending prompt");
+                        return session;
+                    }
+                }
             }
         }
     }
