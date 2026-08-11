@@ -125,18 +125,24 @@ async fn await_startup(handle: &SupervisorHandle, expected: usize) -> Vec<String
 /// are enabled *and* non-deferred. The count is needed because an empty status snapshot
 /// cannot distinguish "no servers" from "the supervisor has not reconciled yet".
 pub fn init() -> Option<(SupervisorHandle, usize)> {
-    let path = match ff_mcp::config_path() {
-        Some(p) => p,
-        None => {
-            tracing::warn!("no home directory; MCP host disabled");
-            return None;
-        }
-    };
+    init_at(ff_mcp::config_path()?.as_path())
+}
+
+/// Path-injectable core of [`init`], mirroring the desktop's `init_mcp_at` seam
+/// (`apps/desktop/src-tauri/src/state.rs`). Production resolves the path via
+/// [`ff_mcp::config_path`] and delegates here; tests point it at a temp `mcp.json`, which
+/// is the only way a runtime assertion about bridged tools can discriminate — against the
+/// real `~/.flowforge/mcp.json` a test would be vacuous in CI (no such file, no tools).
+///
+/// A missing config at `path` still fails soft: the caller handed us a *file to watch*,
+/// not proof it exists, so a nonexistent path disables MCP rather than erroring. Only the
+/// home-directory resolution in [`init`] is skipped — the caller owns that decision.
+pub fn init_at(path: &Path) -> Option<(SupervisorHandle, usize)> {
     if !path.exists() {
         tracing::debug!(path = %path.display(), "no MCP config; MCP host disabled");
         return None;
     }
-    let (watcher, shared, change_rx) = match McpConfigWatcher::spawn(path.clone()) {
+    let (watcher, shared, change_rx) = match McpConfigWatcher::spawn(path.to_path_buf()) {
         Ok(t) => t,
         Err(e) => {
             tracing::warn!(

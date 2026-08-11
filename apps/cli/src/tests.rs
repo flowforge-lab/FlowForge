@@ -1,4 +1,6 @@
+use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::{Arc, Mutex};
 
 use super::json_events;
 use super::{approval_mode, build_registry_with_memory, resolve_turn_inputs, Cli};
@@ -1053,6 +1055,196 @@ fn chat_wires_phenotype_egress_alongside_the_mcp_host() {
         helper.contains("tool_ctx.search_sources"),
         "apply_phenotype_scopes must set tool_ctx.search_sources, or the search-corpus \
          scope from #1011 is inert (#1011 2b / #1208)."
+    );
+}
+
+/// Path to the `mcp_echo` test-server binary, derived from the running test
+/// executable's own location rather than a literal `target/<profile>/mcp_echo`.
+/// Tests of this crate run with `current_exe()` inside
+/// `<target>/<profile>/deps/`, so the sibling `<target>/<profile>/mcp_echo` is
+/// always two levels up — correct in debug and release alike, and under any
+/// `-p <crate>`/target-dir combination. (`env!("CARGO_BIN_EXE_mcp_echo")` is
+/// not an option here: Cargo only defines those vars for integration tests of
+/// the crate that owns the bin, and `mcp_echo` lives under `ff-mcp`, which is a
+/// dependency — Cargo does not build a dependency's bins for `-p ff-cli`.)
+fn mcp_echo_bin() -> PathBuf {
+    let deps = std::env::current_exe()
+        .expect("test binary path is available")
+        .parent()
+        .expect("test binary lives under target/<profile>/deps/")
+        .to_path_buf();
+    deps.parent()
+        .expect("deps dir lives under target/<profile>/")
+        .join("mcp_echo")
+}
+
+/// Proves discriminating power: a real bridged MCP tool is advertised under Open
+/// egress and stripped under LocalOnly. The paired positive case is load-bearing:
+/// without it, a supervisor that returns `None` (vacuous) still passes the negative
+/// — which is this issue's own bug: #1214's precursor tests were green in CI because
+/// no MCP config existed, so no tool was ever registered and the "stripped" assertion
+/// passed regardless of whether stripping worked.
+///
+/// Goes through `apply_phenotype_scopes`, the shared helper `chat` and `run` both
+/// call. Removing the `tool_ctx.egress =` assignment from that function **must** make
+/// the LocalOnly case fail: `tool_ctx.egress` would stay at the default (`Open`), and
+/// the MCP tool would appear in the provider's advertised set.
+#[tokio::test]
+async fn real_bridged_mcp_tool_is_filtered_by_local_only_egress() {
+    let echo_bin = mcp_echo_bin();
+    assert!(
+        echo_bin.exists(),
+        "mcp_echo binary not found at {echo_bin:?} — build it once with \
+         `cargo build -p ff-mcp --bin mcp_echo` (or run TMPDIR=/tmp ./scripts/test.sh)"
+    );
+
+    // Temp mcp.json pointing at the echo server with defer: false so the CLI's
+    // bridge registers its tool rather than skipping it (deferred → skipped).
+    let dir = tempfile::tempdir().unwrap();
+    let mcp_dir = dir.path().join(".flowforge");
+    std::fs::create_dir_all(&mcp_dir).unwrap();
+    let mcp_json = mcp_dir.join("mcp.json");
+    let config = serde_json::json!({
+        "mcpServers": {
+            "echo": {
+                "command": echo_bin.to_string_lossy(),
+                "defer": false,
+            }
+        }
+    });
+    std::fs::write(&mcp_json, serde_json::to_string_pretty(&config).unwrap()).unwrap();
+
+    // Stand up the real supervisor via the injectable seam.
+    let (handle, awaited) = crate::mcp_host::init_at(&mcp_json)
+        .expect("init_at with a valid mcp.json must return Some");
+
+    // Bridge into a ToolRegistry alongside a known-local control tool.
+    let mut registry = ToolRegistry::new();
+    registry.register(Box::new(LocalTool));
+    crate::mcp_host::bridge_into(&handle, &mut registry, dir.path(), awaited).await;
+
+    // Keep the guard alive: dropping it kills every server.
+    let _teardown = crate::mcp_host::McpTeardown::new(handle.clone());
+
+    // --- Positive: the bridged tool IS registered (advertised under Open) ---
+    let names: Vec<String> = registry
+        .iter_tools()
+        .map(|t| t.name().to_string())
+        .collect();
+    assert!(
+        names.contains(&"mcp__echo__echo".to_string()),
+        "mcp__echo__echo must be registered (positive case); got: {names:?}"
+    );
+
+    // --- Negative: the bridged tool is NOT local (stripped under LocalOnly) ---
+    assert!(
+        !registry.local_tool_names().contains("mcp__echo__echo"),
+        "mcp__echo__echo must be excluded from local_tool_names (reaches_network=true)"
+    );
+
+    // --- Wire-level: drive run_turn with a LocalOnly phenotype ---
+    let root = std::env::current_dir().unwrap();
+    let approver = TestApprover;
+    let matrix = PermissionMatrix::default();
+
+    let pheno_local = Phenotype {
+        name: "enclave".into(),
+        skills: vec![],
+        model: None,
+        provider: None,
+        persona: None,
+        max_iterations: None,
+        mcp_servers: vec![],
+        egress: ff_core::Egress::LocalOnly,
+        preheat: vec![],
+        search_sources: None,
+    };
+
+    let mut local_ctx = ToolContext::new(&registry, &root, &approver, 8, &matrix);
+    super::apply_phenotype_scopes(&mut local_ctx, Some(&pheno_local));
+
+    let store_local = SessionStore::new();
+    let session_local = store_local.create_session(None);
+    store_local.add_message(&session_local.id, Role::User, "list tools".into());
+
+    let seen_local = Arc::new(Mutex::new(None));
+    let local_provider = RequestCapture {
+        seen: seen_local.clone(),
+    };
+
+    let _ = run_turn(
+        &local_provider,
+        &store_local,
+        &local_ctx,
+        &session_local.id,
+        "mock",
+        None,
+        false,
+        ReasoningVisibility::WrapUp,
+        CancelToken::new(),
+        |_| {},
+    )
+    .await;
+
+    let req_local = seen_local
+        .lock()
+        .unwrap()
+        .take()
+        .expect("a turn reached the provider under LocalOnly");
+    let local_names: Vec<&str> = req_local
+        .tools
+        .iter()
+        .filter_map(|t| t["function"]["name"].as_str())
+        .collect();
+    assert!(
+        !local_names.contains(&"mcp__echo__echo"),
+        "LocalOnly must strip mcp__echo__echo; got: {local_names:?}"
+    );
+    assert!(
+        local_names.contains(&"local_tool"),
+        "LocalOnly must keep local_tool; got: {local_names:?}"
+    );
+
+    // --- Wire-level: drive run_turn with Open egress (no phenotype) ---
+    let mut open_ctx = ToolContext::new(&registry, &root, &approver, 8, &matrix);
+    super::apply_phenotype_scopes(&mut open_ctx, None);
+
+    let store_open = SessionStore::new();
+    let session_open = store_open.create_session(None);
+    store_open.add_message(&session_open.id, Role::User, "list tools".into());
+
+    let seen_open = Arc::new(Mutex::new(None));
+    let open_provider = RequestCapture {
+        seen: seen_open.clone(),
+    };
+
+    let _ = run_turn(
+        &open_provider,
+        &store_open,
+        &open_ctx,
+        &session_open.id,
+        "mock",
+        None,
+        false,
+        ReasoningVisibility::WrapUp,
+        CancelToken::new(),
+        |_| {},
+    )
+    .await;
+
+    let req_open = seen_open
+        .lock()
+        .unwrap()
+        .take()
+        .expect("a turn reached the provider under Open");
+    let open_names: Vec<&str> = req_open
+        .tools
+        .iter()
+        .filter_map(|t| t["function"]["name"].as_str())
+        .collect();
+    assert!(
+        open_names.contains(&"mcp__echo__echo"),
+        "Open egress must advertise mcp__echo__echo; got: {open_names:?}"
     );
 }
 
