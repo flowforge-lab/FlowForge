@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 
@@ -1058,20 +1058,24 @@ fn chat_wires_phenotype_egress_alongside_the_mcp_host() {
     );
 }
 
-/// Path to the `mcp_echo` test server binary, located relative to the workspace
-/// target directory. In a workspace build the binary is always a sibling of the
-/// test runner in the target dir; `env!("CARGO_BIN_EXE_mcp_echo")` would only be
-/// available from the `ff-mcp` crate itself, so this navigates from manifest to
-/// workspace root instead.
+/// Path to the `mcp_echo` test-server binary, derived from the running test
+/// executable's own location rather than a literal `target/<profile>/mcp_echo`.
+/// Tests of this crate run with `current_exe()` inside
+/// `<target>/<profile>/deps/`, so the sibling `<target>/<profile>/mcp_echo` is
+/// always two levels up — correct in debug and release alike, and under any
+/// `-p <crate>`/target-dir combination. (`env!("CARGO_BIN_EXE_mcp_echo")` is
+/// not an option here: Cargo only defines those vars for integration tests of
+/// the crate that owns the bin, and `mcp_echo` lives under `ff-mcp`, which is a
+/// dependency — Cargo does not build a dependency's bins for `-p ff-cli`.)
 fn mcp_echo_bin() -> PathBuf {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+    let deps = std::env::current_exe()
+        .expect("test binary path is available")
         .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
+        .expect("test binary lives under target/<profile>/deps/")
         .to_path_buf();
-    let profile = option_env!("PROFILE").unwrap_or("debug");
-    root.join("target").join(profile).join("mcp_echo")
+    deps.parent()
+        .expect("deps dir lives under target/<profile>/")
+        .join("mcp_echo")
 }
 
 /// Proves discriminating power: a real bridged MCP tool is advertised under Open
@@ -1090,7 +1094,8 @@ async fn real_bridged_mcp_tool_is_filtered_by_local_only_egress() {
     let echo_bin = mcp_echo_bin();
     assert!(
         echo_bin.exists(),
-        "mcp_echo binary not found at {echo_bin:?} — build ff-mcp --bins first"
+        "mcp_echo binary not found at {echo_bin:?} — build it once with \
+         `cargo build -p ff-mcp --bin mcp_echo` (or run TMPDIR=/tmp ./scripts/test.sh)"
     );
 
     // Temp mcp.json pointing at the echo server with defer: false so the CLI's
