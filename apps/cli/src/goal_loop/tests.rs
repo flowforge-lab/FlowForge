@@ -12,7 +12,7 @@ fn iteration_state_detects_goal_complete_from_events() {
         name: ff_tools::GOAL_COMPLETE_TOOL_NAME.into(),
         args: serde_json::json!({}),
     });
-    assert!(!state.completed);
+    assert!(!state.ledger.completed());
 
     state.handle_event(&AgentEvent::ToolCallFinished {
         message_id: "m1".into(),
@@ -21,7 +21,7 @@ fn iteration_state_detects_goal_complete_from_events() {
         result: "done".into(),
         observer_intent: None,
     });
-    assert!(state.completed);
+    assert!(state.ledger.completed());
 }
 
 #[test]
@@ -117,4 +117,31 @@ async fn the_shared_registry_seam_carries_every_previously_forked_tool() {
             );
         }
     }
+}
+
+/// The observation state machine now lives in `ff_agent::TurnLedger` and is
+/// unit-tested there (#1226). The CLI's remaining responsibility is *routing*:
+/// `handle_event` must forward tool-call events to the shared ledger rather than
+/// swallow them. Pin that seam with one collected step; the detailed
+/// commit/discard/interleave behaviour is ff-agent's to guard.
+#[test]
+fn handle_event_routes_goal_steps_to_the_shared_ledger() {
+    let mut state = IterationState::new();
+    state.handle_event(&AgentEvent::ToolCallStarted {
+        message_id: "m1".into(),
+        call_id: "c1".into(),
+        name: ff_tools::GOAL_STEP_TOOL_NAME.into(),
+        args: serde_json::json!({ "claim": "ran the suite", "verdict": "match" }),
+    });
+    state.handle_event(&AgentEvent::ToolCallFinished {
+        message_id: "m1".into(),
+        call_id: "c1".into(),
+        success: true,
+        result: String::new(),
+        observer_intent: None,
+    });
+
+    let steps = state.ledger.into_steps();
+    assert_eq!(steps.len(), 1);
+    assert_eq!(steps[0].claim, "ran the suite");
 }

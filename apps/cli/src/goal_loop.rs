@@ -67,18 +67,18 @@ impl CliGoalIteration {
 /// the session store.
 struct IterationState {
     tokens: u64,
-    completed: bool,
-    gc_call_id: Option<String>,
     cancelled: bool,
+    /// Goal-signal collection (`goal_complete` / `goal_step`), shared with the
+    /// desktop host so the two cannot drift (#1226).
+    ledger: ff_agent::TurnLedger,
 }
 
 impl IterationState {
     fn new() -> Self {
         Self {
             tokens: 0,
-            completed: false,
-            gc_call_id: None,
             cancelled: false,
+            ledger: ff_agent::TurnLedger::new(),
         }
     }
 
@@ -90,22 +90,10 @@ impl IterationState {
             } => {
                 self.tokens = *t as u64;
             }
-            AgentEvent::ToolCallStarted { call_id, name, .. }
-                if name == ff_tools::GOAL_COMPLETE_TOOL_NAME =>
-            {
-                self.gc_call_id = Some(call_id.clone());
-            }
-            AgentEvent::ToolCallFinished {
-                call_id,
-                success: true,
-                ..
-            } if self.gc_call_id.as_deref() == Some(call_id.as_str()) => {
-                self.completed = true;
-            }
             AgentEvent::Error { message } if message.contains("cancelled") => {
                 self.cancelled = true;
             }
-            _ => {}
+            _ => self.ledger.observe(event),
         }
     }
 }
@@ -224,9 +212,10 @@ impl GoalIteration for CliGoalIteration {
 
         let mut outcome = IterationOutcome {
             wall_ms: elapsed,
-            goal_complete: state.completed,
+            goal_complete: state.ledger.completed(),
             tokens: state.tokens,
             steer_consumed,
+            ledger_steps: state.ledger.into_steps(),
             ..Default::default()
         };
 

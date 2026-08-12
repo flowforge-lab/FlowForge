@@ -2211,17 +2211,16 @@ impl GoalIteration for GoalLoopIteration {
         let thinking = self.state.provider_config().thinking;
         let reasoning_visibility = self.state.provider_config().reasoning_visibility;
 
-        // Capture per-turn tokens (from `AgentEvent::Done`) and whether the agent
-        // called `goal_complete` (from `AgentEvent::ToolCallFinished`) directly in
-        // the event closure, so the loop gets both without re-reading the store.
+        // Capture per-turn tokens (from `AgentEvent::Done`) directly in the event
+        // closure, so the loop gets them without re-reading the store.
         let tokens = Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        // `ToolCallFinished` carries only the call_id, so remember the call_id of
-        // a started `goal_complete` and confirm it on a successful finish.
-        let gc_call_id = Arc::new(std::sync::Mutex::new(Option::<String>::None));
+        // Goal-signal collection (`goal_complete` / `goal_step`) runs the same
+        // state machine as the CLI host, shared via `TurnLedger` so the two cannot
+        // drift (#1226). One `Mutex` replaces the four it used to scatter across
+        // match arms.
+        let ledger = Arc::new(std::sync::Mutex::new(ff_agent::TurnLedger::new()));
         let tokens_ev = tokens.clone();
-        let completed_ev = completed.clone();
-        let gc_call_ev = gc_call_id.clone();
+        let ledger_ev = ledger.clone();
         let app_ev = self.app.clone();
         let sid_ev = sid.clone();
         let turn_start = std::time::Instant::now();
@@ -2244,19 +2243,7 @@ impl GoalIteration for GoalLoopIteration {
                     } => {
                         tokens_ev.store(*t as u64, std::sync::atomic::Ordering::SeqCst);
                     }
-                    ff_agent::AgentEvent::ToolCallStarted { call_id, name, .. }
-                        if name == ff_tools::GOAL_COMPLETE_TOOL_NAME =>
-                    {
-                        *gc_call_ev.lock().unwrap() = Some(call_id.clone());
-                    }
-                    ff_agent::AgentEvent::ToolCallFinished {
-                        call_id,
-                        success: true,
-                        ..
-                    } if gc_call_ev.lock().unwrap().as_deref() == Some(call_id.as_str()) => {
-                        completed_ev.store(true, std::sync::atomic::Ordering::SeqCst);
-                    }
-                    _ => {}
+                    _ => ledger_ev.lock().unwrap().observe(&event),
                 }
                 emit_agent_event(&app_ev, &sid_ev, event);
             },
@@ -2291,13 +2278,19 @@ impl GoalIteration for GoalLoopIteration {
             Ok(Ok(_)) => (false, false),
         };
 
+        // Consume the shared ledger once, at the turn boundary. `mem::take` leaves
+        // a fresh empty ledger behind so this does not depend on the event closure
+        // (the other Arc holder) already being dropped.
+        let ledger = std::mem::take(&mut *ledger.lock().unwrap());
+        let goal_complete = ledger.completed();
         IterationOutcome {
             tokens: tokens.load(std::sync::atomic::Ordering::SeqCst),
             wall_ms: turn_start.elapsed().as_millis() as i64,
-            goal_complete: completed.load(std::sync::atomic::Ordering::SeqCst),
+            goal_complete,
             cancelled,
             failed,
             steer_consumed,
+            ledger_steps: ledger.into_steps(),
         }
     }
 

@@ -634,6 +634,10 @@ fn build_base_registry() -> (
     // when the objective is met. Registered on every path — harmless outside goal mode,
     // and its absence is what made the two registry copies diverge.
     registry.register(Box::new(ff_tools::GoalCompleteTool));
+    // Bookkeeping counterpart: lets the agent record evidence-first steps into the
+    // goal's durable ledger (#1225). Registered alongside `goal_complete` for the
+    // same reason — divergent registries are how these go missing.
+    registry.register(Box::new(ff_tools::GoalStepTool));
     let (memory_store, memory_index) = build_memory_store();
     if let Some(index) = &memory_index {
         registry.register(Box::new(ff_tools::memory::MemorySearchTool::new(

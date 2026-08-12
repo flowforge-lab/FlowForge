@@ -1017,6 +1017,21 @@ mod tests {
     }
 
     #[test]
+    fn goal_step_stays_local_under_localonly_phenotype() {
+        // #1226 blocker: goal_step is a purely local ledger write. If it forgot to
+        // override the fail-safe `reaches_network()` default, local_tool_names()
+        // would drop it and the agent would lose the tool in an enclave. Register
+        // it exactly as the hosts do and assert it survives the local filter.
+        let mut reg = ToolRegistry::with_defaults();
+        reg.register(Box::new(crate::goal_step::GoalStepTool));
+        assert!(
+            reg.local_tool_names()
+                .contains(crate::goal_step::GOAL_STEP_TOOL_NAME),
+            "goal_step must be available under the LocalOnly phenotype"
+        );
+    }
+
+    #[test]
     fn reaches_network_default_is_fail_safe_true() {
         // A tool that doesn't override reaches_network is treated as network-capable.
         assert!(crate::bash::BashTool.reaches_network());
