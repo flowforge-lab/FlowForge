@@ -128,6 +128,37 @@ It is split into its own blocking sub-issue.
 
 1. **Selection constraint.** Confluence accepts ≥2 sessions that belong to the
    same fork tree (share a root). Reject cross-tree selections in V1.
+   **Orphaned forks are eligible, not rejected — but a plain root is not:** the
+   discriminator is `fork_point_seq`, not `parent_session_id` alone. A `NULL`
+   `parent_session_id` covers two populations that must be treated differently:
+
+   - **`parent_session_id` NULL, `fork_point_seq` NOT NULL** — a session
+     that provably *was* forked and then had its ancestor deleted. `ON DELETE SET
+     NULL` clears only `parent_session_id`; `fork_point_seq` carries no foreign
+     key, so it survives the delete and remains as evidence of the lost lineage.
+     Such a session has *unknown* rather than *provably-different* lineage, so a
+     set of these is accepted and falls through to §6's independent-tails
+     degradation.
+   - **`parent_session_id` NULL, `fork_point_seq` NULL** — a *lineage
+     root*. Both columns describe how a session *was created*, not whether
+     anything was forked *from* it, so this bucket holds two populations that
+     the candidate row cannot tell apart: a session nobody ever forked (or
+     pre-#1074 history that predates lineage tracking), and the **trunk of a
+     fork tree** — the session whose children each carry
+     `parent_session_id = <trunk>`. A root's eligibility is therefore decided by
+     its **inbound** `parent_session_id` edges, not by its own columns: a root
+     with ≥1 descendant is the root of a non-empty tree and is eligible together
+     with those descendants (their LCA *is* the trunk, §1); only a root with no
+     descendants — nothing references it — carries no lineage evidence and is
+     rejected, since admitting a set of those would silently drop the
+     same-lineage constraint. The evidence is the reverse lookup the backend
+     already indexes (`idx_sessions_parent`); the frontend cue computes the same
+     edge client-side from the `listSessions` result (§8).
+
+   Otherwise reject only when two sessions can be shown to sit under different
+   roots. This backend check is **authoritative**; the frontend cue (§8) is
+   advisory — it exists to avoid a silent rejection, and where the two disagree
+   the backend decides.
 2. **Order.** Sort the divergent tails by fork time; concatenate whole segments,
    per-segment order preserved. Never interleave.
 3. **De-dup deferred.** V1 tolerates the repeated shared prefix (the "triple-P"
@@ -140,7 +171,22 @@ It is split into its own blocking sub-issue.
    runtime behavior.
 5. **Optional reversible summary.** Large confluences default to one pass of the
    existing reversible summarizer (RFC 0016/0022); small ones skip it. This is a
-   *threshold*, not a naked on/off toggle.
+   *threshold*, not a naked on/off toggle. **Decided:** the threshold is a
+   fraction of the bound phenotype's context window, measured with the existing
+   token estimator (never a message count — one tool result can dwarf many
+   turns), defaulting to **0.5 (50%)**. The fraction is evaluated **once, at
+   confluence creation time**, against the window of the phenotype bound then
+   (item 4); a later user phenotype override does not retroactively re-run the
+   decision. Below it the transcript is kept verbatim (consistent with V1
+   tolerating the redundant prefix, §7/§9); at or above it one reversible pass
+   runs. Anchoring to a window *fraction* self-adjusts across models; because the
+   pass is reversible this only decides *when compression starts*, never what is
+   discarded. Implemented as a single named constant (e.g.
+   `CONFLUENCE_SUMMARY_THRESHOLD_FRAC = 0.5`) so it is easy to retune. This is a
+   *different* fraction of the *same* window as compaction's
+   `CONTEXT_BUDGET_SAFETY = 0.8`: the confluence summary pass is meant to fire
+   *before* the compaction budget, so any retune must preserve the ordering
+   `CONFLUENCE_SUMMARY_THRESHOLD_FRAC < CONTEXT_BUDGET_SAFETY`.
 
 ## 6. Deletion & degradation semantics
 
@@ -149,8 +195,12 @@ It is split into its own blocking sub-issue.
 - `messages` cascade-deletes only their own session's rows (`ON DELETE
   CASCADE`). Deleting a parent leaves every child's transcript intact.
 - With `ON DELETE SET NULL`, deleting a parent nulls the child's
-  `parent_session_id`: the child becomes a lineage "orphan root" — usable,
-  forkable, but no longer precisely locatable within the old tree.
+  `parent_session_id` **but leaves `fork_point_seq` intact** (that column has no
+  foreign key): the child becomes a lineage *orphan* — usable, forkable, but no
+  longer precisely locatable within the old tree. The surviving `fork_point_seq`
+  is what distinguishes such an orphan (`fork_point_seq IS NOT NULL`) from a
+  plain never-forked root (`fork_point_seq IS NULL`); only the former is
+  confluence-eligible per §5.1.
 - Confluence still works with a deleted ancestor; it merely loses the ability to
   locate P exactly and falls back to treating the branches as independent tails.
   Deleting an ancestor is rare; graceful degradation, not a hard error.
@@ -182,7 +232,15 @@ visual form is open (§10), not whether they exist.
   merged single-fork-exit work, #1069) — extended with a multi-select gesture
   gated on same-lineage eligibility (§5.1). Ineligible (cross-lineage) sessions
   are non-selectable, which is *how* the same-lineage constraint becomes visible
-  rather than a silent backend rejection.
+  rather than a silent backend rejection. A session with *unknown* lineage
+  (a null-parent orphan whose `fork_point_seq` survives, §6) stays selectable —
+  the backend makes the final call (§5.1) and the cue never greys out a session
+  the backend would in fact accept. A lineage root (both columns NULL — never
+  forked, the trunk of a fork tree, or pre-#1074 history) is judged by its
+  **inbound** `parent_session_id` edges, computed client-side from the same
+  `listSessions` array: a root with ≥1 descendant is the trunk of a non-empty
+  tree and stays selectable with its descendants, while only a root with no
+  descendants is greyed out, matching the backend's reject.
 - **Trigger + mental model.** Confluence must not read as `git merge`. The
   trigger affordance and its confirmation copy state plainly that confluence
   **projects a new derived session and leaves the parents untouched** (§1). This
@@ -190,9 +248,16 @@ visual form is open (§10), not whether they exist.
   source sessions to be consumed/rewritten.
 - **Lineage visibility.** The same-lineage constraint (§5.1) is meaningless to a
   user who can't see the fork tree — they won't know which sessions are eligible
-  to conflue. V1 must expose lineage enough to make eligibility legible; the
-  richer fork-tree visualization is the open question in §10, but *some*
-  eligibility cue is V1, not deferred.
+  to conflue. V1 must expose lineage enough to make eligibility legible.
+  **Decided:** V1 ships the *lightweight eligibility cue*, not a full fork-tree
+  visualization. Concretely, during the multi-select gesture same-lineage
+  sessions (and unknown-lineage orphans, §8) are selectable while sessions that
+  are provably cross-lineage — or lineage roots with no descendants — are greyed
+  out (§8 Selection), so the constraint is legible through what can be selected,
+  with **no new visualization component**. A richer fork-tree / DAG view is
+  explicitly *not* V1 (its own future ticket, once browsing lineage topology is
+  a real need); it
+  is not required to decide whether two sessions can conflue.
 - **Visible V1 consequence (the redundant prefix).** Because V1 appends without
   de-dup (§7, §9), the confluence transcript contains the shared prefix P once
   per branch — the user will *see* the repetition in the transcript, not just
@@ -216,9 +281,15 @@ left to implementation tickets under the epic (#1073) and refined in §10.
 
 ## 10. Open questions
 
-- Edited-shared-prefix divergence detection (§7) — heuristic vs. exact.
-- How the confluence UI visualizes the fork tree (§8 makes lineage *visibility*
-  V1; the richer tree visualization — full graph vs. a lightweight eligibility
-  cue — is the open part). RFC 0006 local-first: lineage should be user-visible,
-  not a hidden SQLite edge.
-- Post-confluence summary threshold defaults (§5.5).
+- Edited-shared-prefix divergence detection (§7) — heuristic vs. exact. (V2.)
+
+**Resolved:**
+
+- ~~How the confluence UI visualizes the fork tree.~~ **Decided (§8):** V1 ships
+  the lightweight eligibility cue — same-lineage sessions and unknown-lineage
+  orphans selectable, provably cross-lineage sessions and lineage roots with no
+  descendants greyed out; a full fork-tree visualization is a future ticket, not
+  V1.
+- ~~Post-confluence summary threshold defaults (§5.5).~~ **Decided (§5.5):**
+  0.5 × the bound phenotype's context window, measured with the token estimator;
+  a single retunable constant.
