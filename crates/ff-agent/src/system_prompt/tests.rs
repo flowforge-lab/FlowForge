@@ -627,6 +627,127 @@ fn goal_block_caps_ledger_to_last_five() {
 }
 
 #[test]
+fn goal_block_renders_evidence_under_each_entry() {
+    // #1242: evidence pointers are persisted per ledger entry but must also be
+    // rendered back into the volatile prompt, indented beneath the entry's
+    // claim/verdict line, so the next iteration can see what a verdict rested on.
+    use ff_core::{GoalLedgerEntry, StepStatus};
+
+    let mut goal = active_goal();
+    goal.ledger.push(GoalLedgerEntry {
+        id: "step-ev".into(),
+        status: StepStatus::Done,
+        claim: "Ran the failing test".into(),
+        action: None,
+        evidence: vec![
+            "cargo nextest -p ff-agent: 3 passed".into(),
+            "src/goal_loop.rs:104".into(),
+        ],
+        verdict: Some(ff_core::Verdict::Match),
+        next: None,
+        created_ms: 0,
+        updated_ms: 0,
+    });
+
+    let reg = SkillRegistry::new();
+    let out = build_full(
+        None,
+        &reg,
+        &[],
+        &ctx(),
+        None,
+        None,
+        Some(&goal),
+        Mode::default(),
+    );
+
+    assert!(
+        out.contains("cargo nextest -p ff-agent: 3 passed"),
+        "first evidence pointer must render: {out}"
+    );
+    assert!(
+        out.contains("src/goal_loop.rs:104"),
+        "second evidence pointer must render: {out}"
+    );
+    // Evidence must be indented beneath its claim, not flattened into the list.
+    assert!(
+        out.contains("  - cargo nextest -p ff-agent: 3 passed"),
+        "evidence must render as an indented sub-item: {out}"
+    );
+}
+
+#[test]
+fn goal_block_bounds_evidence_per_entry() {
+    // #1242: evidence is model-authored and unbounded, so rendering it raw would
+    // defeat the last-5 ledger cap. Cap at MAX_LEDGER_EVIDENCE_ITEMS items, each
+    // truncated to MAX_LEDGER_EVIDENCE_CHARS chars with a marker.
+    use ff_core::{GoalLedgerEntry, StepStatus};
+
+    let long = "x".repeat(500);
+    let mut goal = active_goal();
+    goal.ledger.push(GoalLedgerEntry {
+        id: "step-many".into(),
+        status: StepStatus::Done,
+        claim: "Captured a lot".into(),
+        action: None,
+        evidence: vec![
+            long.clone(),
+            "kept-2".into(),
+            "kept-3".into(),
+            "dropped-4".into(),
+            "dropped-5".into(),
+        ],
+        verdict: Some(ff_core::Verdict::Match),
+        next: None,
+        created_ms: 0,
+        updated_ms: 0,
+    });
+
+    let reg = SkillRegistry::new();
+    let out = build_full(
+        None,
+        &reg,
+        &[],
+        &ctx(),
+        None,
+        None,
+        Some(&goal),
+        Mode::default(),
+    );
+
+    // Only the first 3 items survive; items 4 and 5 are dropped.
+    assert!(out.contains("kept-2") && out.contains("kept-3"), "{out}");
+    assert!(
+        !out.contains("dropped-4") && !out.contains("dropped-5"),
+        "evidence past the per-entry item cap leaked: {out}"
+    );
+    // The over-long item is clipped with the truncation marker, so the full
+    // 500-char body never reaches the prompt.
+    assert!(
+        !out.contains(&long),
+        "over-long evidence rendered untruncated: {out}"
+    );
+    assert!(
+        out.contains("[...]"),
+        "truncated evidence must carry the marker: {out}"
+    );
+}
+
+#[test]
+fn truncate_evidence_clips_on_char_boundary_without_panicking() {
+    // Multi-byte content must clip on a char boundary, never mid-codepoint
+    // (which would panic on the string slice).
+    let multibyte = "日本語".repeat(200); // 600 chars, 1800 bytes
+    let out = truncate_evidence(&multibyte);
+    assert!(out.ends_with(EVIDENCE_TRUNCATION_MARKER), "{out}");
+    let body = out.strip_suffix(EVIDENCE_TRUNCATION_MARKER).unwrap();
+    assert_eq!(body.chars().count(), MAX_LEDGER_EVIDENCE_CHARS);
+
+    // A short pointer is returned whole, with no marker.
+    assert_eq!(truncate_evidence("  short  "), "short");
+}
+
+#[test]
 fn goal_block_present_when_active() {
     let reg = SkillRegistry::new();
     let goal = active_goal();
@@ -964,6 +1085,8 @@ const GOLDEN: &str = concat!(
 ",
     "- Add cache_messages field [done]
 ",
+    "  - cargo check passed
+",
     "- Wire breakpoints in anthropic.rs [pending]
 ",
     "
@@ -1093,7 +1216,8 @@ fn golden_volatile_goal_without_memory() {
          ## Active goal (iteration 3 of 25)\n\
          Objective: Ship the prefix cache PR\n\
          Progress so far:\n\
-         - Add cache_messages field [done]\n\
+         - Add cache_messages field [done]\n  \
+         - cargo check passed\n\
          - Wire breakpoints in anthropic.rs [pending]\n\
          \n\
          Continue toward the objective. If it is fully met, call `goal_complete`.\n State your reasoning before each action.\n",

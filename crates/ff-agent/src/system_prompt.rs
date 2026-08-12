@@ -32,6 +32,31 @@ pub const MAX_MCP_INSTRUCTIONS_BYTES: usize = 8 * 1024;
 /// per-server cap would already be ~6700 tokens of stable prefix.
 pub const MAX_MCP_INSTRUCTIONS_TOTAL_BYTES: usize = 16 * 1024;
 
+/// Per-entry cap on how many `evidence` pointers a ledger entry renders back
+/// into the volatile prompt, and the per-item char budget. Evidence strings are
+/// model-authored and unbounded (the `goal_step` schema invites "command
+/// output"), so rendering them raw would defeat the last-5 ledger cap that
+/// keeps the volatile tail bounded. Worst case (5 entries x 3 x 200 chars) is
+/// ~850 tokens.
+const MAX_LEDGER_EVIDENCE_ITEMS: usize = 3;
+const MAX_LEDGER_EVIDENCE_CHARS: usize = 200;
+
+/// Marker appended when an evidence pointer is truncated, so the model can tell
+/// a clipped pointer from a complete one (same rationale as
+/// [`MCP_TRUNCATION_MARKER`]).
+const EVIDENCE_TRUNCATION_MARKER: &str = " [...]";
+
+/// Truncate one evidence pointer to [`MAX_LEDGER_EVIDENCE_CHARS`] on a char
+/// boundary, appending [`EVIDENCE_TRUNCATION_MARKER`] when clipped. Counts
+/// chars, not bytes, so the cap is stable regardless of multi-byte content.
+fn truncate_evidence(s: &str) -> String {
+    let s = s.trim();
+    match s.char_indices().nth(MAX_LEDGER_EVIDENCE_CHARS) {
+        None => s.to_string(),
+        Some((byte_end, _)) => format!("{}{EVIDENCE_TRUNCATION_MARKER}", &s[..byte_end]),
+    }
+}
+
 const MCP_TRUNCATION_MARKER: &str =
     "\n[... truncated: server guidance exceeded the injection budget]";
 
@@ -414,6 +439,12 @@ pub fn build_system_prompt(inputs: &SystemPromptInputs<'_>) -> SystemPrompt {
                         .map(|e| LedgerEntry {
                             claim: e.claim.as_str(),
                             verdict: verdict_label(e.verdict.as_ref()),
+                            evidence: e
+                                .evidence
+                                .iter()
+                                .take(MAX_LEDGER_EVIDENCE_ITEMS)
+                                .map(|ev| truncate_evidence(ev))
+                                .collect(),
                         })
                         .collect()
                 },
@@ -513,6 +544,7 @@ struct GoalCtx<'a> {
 struct LedgerEntry<'a> {
     claim: &'a str,
     verdict: &'a str,
+    evidence: Vec<String>,
 }
 
 /// Per-mode behavioural steer appended to the prompt (RFC 0011, RFC 0019 §3).
