@@ -6,13 +6,18 @@ use crate::types::{ChannelId, InboundMessage, Notification};
 /// implementation delivers chunks to the end platform (e.g. editing a Slack
 /// message, streaming to a WebSocket).
 #[async_trait]
-pub trait ResponseStream: Send {
+pub trait ResponseStream: Send + Sync {
     /// Append a text chunk to the ongoing response.
     ///
-    /// **Current behavior:** The router buffers all token deltas during a turn and
-    /// delivers them as a single chunk after the turn completes. Transports should
-    /// not assume per-token granularity; a future streaming-flush cadence (timer /
-    /// N-char threshold) may provide finer delivery.
+    /// The argument is the **full text so far**, superseding any earlier chunk —
+    /// the Router flushes the accumulated buffer, and [`SlackResponseStream`]
+    /// treats each `chunk` as the authoritative current body. Transports throttle
+    /// and coalesce as they like (Slack edits at most every ~500ms and skips
+    /// unchanged bodies), so a caller may re-deliver freely.
+    ///
+    /// `+ Sync` is required because the Router hands the stream to a background
+    /// flusher task for mid-turn streaming edits (RFC 0021 §5.1): `chunk` takes
+    /// `&self`, so a stream shared across an await point must be `Sync`.
     async fn chunk(&self, text: &str);
     /// Signal that the response is complete.
     async fn finish(&self);

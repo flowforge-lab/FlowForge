@@ -264,16 +264,22 @@ async fn serve(args: ServeArgs) -> Result<(), String> {
     let allowlist_size = allowed_users.len();
     let mut transport = SlackTransport::new(&tokens.app_token, &tokens.bot_token)
         .with_allowed_user_ids(allowed_users);
+    #[cfg(test)]
+    if let Some(base) = test_seams::api_base() {
+        transport = transport.with_api_base(base);
+    }
 
     // The approver can only be built from a `Connected`, so this cannot be
     // reordered without a compile error.
     let mut connected = Connected::open(&mut transport).await?;
-    let approver = connected.approver(
-        SlackApi::new(&tokens.bot_token),
-        channel,
-        mode,
-        PermissionMatrix::default(),
-    )?;
+    let api = SlackApi::new(&tokens.bot_token);
+    #[cfg(test)]
+    let api = if let Some(base) = test_seams::api_base() {
+        api.with_base(base)
+    } else {
+        api
+    };
+    let approver = connected.approver(api, channel, mode, PermissionMatrix::default())?;
 
     // The teardown guard is held for the whole serve loop: dropping it earlier would
     // stop the MCP servers out from under in-flight turns (#1207).
@@ -318,11 +324,41 @@ fn channel_map() -> ChannelMap {
 /// use, so `serve` cannot drift from `flowforge run` on provider, tools or
 /// session storage.
 async fn build_router(mode: ff_core::Mode) -> (Router, Option<crate::mcp_host::McpTeardown>) {
+    #[cfg(test)]
+    if let Some((provider, model, registry)) = test_seams::take_host() {
+        return assemble_router(
+            mode,
+            provider,
+            model,
+            registry,
+            Arc::new(host::build_session_store(false)),
+            None,
+        );
+    }
     let (provider, model) = host::load_provider();
     let store = host::build_session_store(false);
     let (registry, _memory, _keys, _guidance, mcp_teardown) =
         crate::build_registry_with_mcp().await;
+    assemble_router(
+        mode,
+        Arc::from(provider),
+        model,
+        Arc::new(registry),
+        Arc::new(store),
+        mcp_teardown,
+    )
+}
 
+/// The shared `Router::new` invocation, split out so the `cfg(test)` seam can
+/// inject provider + registry without duplicating the wiring.
+fn assemble_router(
+    mode: ff_core::Mode,
+    provider: Arc<dyn ff_llm::Provider>,
+    model: String,
+    registry: Arc<ff_tools::ToolRegistry>,
+    store: Arc<ff_session::SessionStore>,
+    mcp_teardown: Option<crate::mcp_host::McpTeardown>,
+) -> (Router, Option<crate::mcp_host::McpTeardown>) {
     let router = Router::new(
         RouterConfig {
             mode,
@@ -331,12 +367,59 @@ async fn build_router(mode: ff_core::Mode) -> (Router, Option<crate::mcp_host::M
             ..RouterConfig::default()
         },
         channel_map(),
-        Arc::new(store),
-        Arc::new(registry),
-        Arc::from(provider),
+        store,
+        registry,
+        provider,
     );
     (router, mcp_teardown)
 }
 
 #[cfg(test)]
+mod test_seams {
+    //! Test-only knobs (T6, #1061) for booting `serve` against a mock Slack and
+    //! a scripted model. Each booted test sets its own seam and the assembly
+    //! below consumes it; there is no production path onto these.
+    //!
+    //! `nextest` isolates each test in its own process, so a shared static is
+    //! safe here — the "serialise the tests" concern that motivated
+    //! `test_support::MEM_STORE_LOCK` does not arise.
+
+    use std::sync::{Arc, Mutex};
+
+    use ff_llm::Provider;
+    use ff_tools::ToolRegistry;
+
+    /// Web API + `apps.connections.open` base for the Slack transport/approver
+    /// to dial (the mock's HTTP server).
+    static API_BASE: Mutex<Option<String>> = Mutex::new(None);
+
+    /// The provider + model + registry the Router would otherwise build from the
+    /// real provider registry / `~/.flowforge` MCP config.
+    type HostSeam = (Arc<dyn Provider>, String, Arc<ToolRegistry>);
+    static HOST: Mutex<Option<HostSeam>> = Mutex::new(None);
+
+    pub(crate) fn set_api_base(base: impl Into<String>) {
+        *API_BASE.lock().unwrap() = Some(base.into());
+    }
+
+    pub(crate) fn api_base() -> Option<String> {
+        API_BASE.lock().unwrap().clone()
+    }
+
+    pub(crate) fn set_host(
+        provider: Arc<dyn Provider>,
+        model: impl Into<String>,
+        registry: Arc<ToolRegistry>,
+    ) {
+        *HOST.lock().unwrap() = Some((provider, model.into(), registry));
+    }
+
+    pub(crate) fn take_host() -> Option<(Arc<dyn Provider>, String, Arc<ToolRegistry>)> {
+        HOST.lock().unwrap().take()
+    }
+}
+
+#[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_t6;
