@@ -380,9 +380,12 @@ mod test_seams {
     //! a scripted model. Each booted test sets its own seam and the assembly
     //! below consumes it; there is no production path onto these.
     //!
-    //! `nextest` isolates each test in its own process, so a shared static is
-    //! safe here — the "serialise the tests" concern that motivated
-    //! `test_support::MEM_STORE_LOCK` does not arise.
+    //! The seam values are process-global statics, so tests that set them must
+    //! serialise on the `T6_LOCK` in `tests_t6.rs` — plain `cargo test` keeps
+    //! tests in one process and interleaves their threads, so a second test's
+    //! `set_api_base` would clobber a sibling's mid-flight request. Under nextest
+    //! (process-per-test) the lock is a no-op, but it guarantees the same
+    //! correctness under any runner.
 
     use std::sync::{Arc, Mutex};
 

@@ -20,6 +20,8 @@
 //! `multi_thread` would launch the task on a worker thread and the override
 //! would be lost, causing `serve` to read the real `~/.config/flowforge/`.
 
+#![allow(clippy::await_holding_lock)]
+
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -37,6 +39,28 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 use super::ServeArgs;
 use crate::test_support::TestEnv;
 use crate::ModeArg;
+
+// ── Serialisation ────────────────────────────────────────────────────────────
+
+/// Serializes the booted tests.
+///
+/// The `serve` seams (`crate::serve::test_seams`) are process-global `static`s:
+/// `API_BASE` and `HOST`. Each test sets them for its own mock, so under a
+/// runner that keeps the tests in one process and interleaves their threads —
+/// plain `cargo test`, unlike nextest's process-per-test — one test's
+/// `set_api_base(mock_url)` clobbers a sibling's, and the second `serve` dials
+/// the wrong mock and times out at the WS handshake (#1240 review).
+///
+/// Same shape as `test_support::MEM_STORE_LOCK`: a `Mutex<()>` guard taken by
+/// every test that shares process-global state. The `unwrap_or_else` recovers
+/// from a poisoned lock (a panic in one test must not fail its siblings).
+static T6_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn t6_lock() -> std::sync::MutexGuard<'static, ()> {
+    T6_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 // ── Slack envelope builders ──────────────────────────────────────────────────
 
@@ -446,6 +470,7 @@ fn prompt_button_value(prompt: &serde_json::Value, action_id: &str) -> Option<St
 
 #[tokio::test]
 async fn serve_boots_against_mock_and_shuts_down_cleanly() {
+    let _lock = t6_lock();
     let mut mock = MockSlack::start().await;
     let _env = TestEnv::new();
     _env.write_transports(SLACK_TOML);
@@ -464,6 +489,7 @@ async fn serve_boots_against_mock_and_shuts_down_cleanly() {
 
 #[tokio::test]
 async fn user_message_round_trips_inbound_to_streamed_reply() {
+    let _lock = t6_lock();
     let mut mock = MockSlack::start().await;
     let _env = TestEnv::new();
     _env.write_transports(SLACK_TOML);
@@ -504,6 +530,7 @@ async fn user_message_round_trips_inbound_to_streamed_reply() {
 
 #[tokio::test]
 async fn sensitive_call_posts_buttons_and_approve_proceeds() {
+    let _lock = t6_lock();
     let mut mock = MockSlack::start().await;
     let _env = TestEnv::new();
     _env.write_transports(SLACK_TOML);
@@ -568,6 +595,7 @@ async fn sensitive_call_posts_buttons_and_approve_proceeds() {
 
 #[tokio::test]
 async fn sensitive_call_posts_buttons_and_deny_blocks() {
+    let _lock = t6_lock();
     let mut mock = MockSlack::start().await;
     let _env = TestEnv::new();
     _env.write_transports(SLACK_TOML);
@@ -603,7 +631,14 @@ async fn sensitive_call_posts_buttons_and_deny_blocks() {
     mock.send_frame(interaction_frame("env-d2", "C9", "U1", "ff_deny", &token))
         .await;
 
-    // The prompt is retired with a "denied by" epilogue.
+    // The prompt is retired with a "denied by" epilogue — this proves the
+    // approver was consulted and returned Denied. Whether the *tool* actually
+    // ran is a unit-level assertion: `tests_t4::a_deny_click_resolves_false`
+    // proves the approver returns `Denied` on a deny click, and
+    // `ff_agent::run_turn` treats a `Denied` approval as a tool error without
+    // dispatching the tool. At the transport layer the distinction is invisible
+    // (the scripted provider emits the same reply either way), so the two
+    // layers together cover the end-to-end behaviour.
     mock.wait_for_update(|b| b["text"].as_str().is_some_and(|t| t.contains("denied by")))
         .await;
 
@@ -621,6 +656,7 @@ async fn sensitive_call_posts_buttons_and_deny_blocks() {
 
 #[tokio::test]
 async fn streaming_edits_are_visible_in_the_mock() {
+    let _lock = t6_lock();
     let mut mock = MockSlack::start().await;
     let _env = TestEnv::new();
     _env.write_transports(SLACK_TOML);
@@ -674,6 +710,7 @@ async fn streaming_edits_are_visible_in_the_mock() {
 
 #[tokio::test]
 async fn publish_shaped_call_is_denied_without_buttons() {
+    let _lock = t6_lock();
     let mut mock = MockSlack::start().await;
     let _env = TestEnv::new();
     _env.write_transports(SLACK_TOML);
