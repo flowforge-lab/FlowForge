@@ -196,6 +196,38 @@ visible to someone who independently knows the upstream landscape. Making the
 search an explicit, stated step turns catching it from luck into a checklist
 item.
 
+### Match the change to the problem
+
+*"Simple is better than complex"* and *"never > right now"* above warn against
+premature abstraction. This tenet names the other half of the same instinct:
+over-**defense**. The failure mode is not a missing feature but a surplus one —
+code written against a problem that does not exist yet, or a danger that cannot
+happen.
+
+> **Bias toward the smallest diff that solves the current problem, and trust
+> the guarantees you already hold.**
+
+Concretely, when adding code, prefer *not* to when:
+
+| Temptation | Instead |
+|------|------|
+| A config knob, extension point, or feature "for later" | Solve today's problem (YAGNI). Change only what must change; clean up only what this change introduced. |
+| Re-validating, in an inner function, an invariant the boundary or the type system already guarantees | Validate **once, at the boundary** — user input, external responses, file paths (path `jail`, tool safety tier; see `CONTRIBUTING.md`). Boundary validation is mandatory; interior re-checking is noise. |
+| A plausible-looking fallback for a branch that cannot occur | Assert the impossibility (`unreachable!`, `debug_assert!`) so the day the assumption breaks is loud, not hidden. |
+| An abstraction (helper, trait, wrapper) at its first use | Inline it; extract on the *second* real caller, not in anticipation of one. |
+| Extra code to paper over a design you were unsure about | Surface the trade-off in the PR — state the assumption or the two viable designs you saw. |
+
+This does **not** license swallowing errors: *"Errors should never pass
+silently — unless explicitly silenced"* still binds. Dropping an `Err` needs a
+stated reason in code (`let _ = …; // why`), exactly as the koans above require;
+the point here is to not *manufacture* defensive machinery the problem never
+asked for.
+
+**Why this needs to be written down:** like "Find it before you write it", this
+defect is invisible at review time — surplus code compiles, passes, and reads as
+diligence. Only someone asking *"what problem does this line solve?"* catches
+it. Naming the bias makes "delete it" a legitimate review outcome.
+
 ---
 
 ## How These Apply in Review
@@ -205,7 +237,8 @@ Every pull request — human or agent authored — is checked against this chart
 - [ ] **Pillar 1** — Does it preserve user flow? No new step between thought and action?
 - [ ] **Pillar 2** — Was any performance-relevant change measured (before/after)?
 - [ ] **Pillar 3** — Does it keep data/workflows portable in *and* out?
-- [ ] **Pillar 4** — Does it pass fmt/clippy/lint, handle errors explicitly, and
+- [ ] **Pillar 4** — Does it pass fmt/clippy/lint, handle errors explicitly,
+      match the change to the problem (no surplus abstraction or defense), and
       stay easy to explain?
 
 When pillars conflict, apply the numbered priority (1 > 2 > 3 > 4). When the
