@@ -170,6 +170,32 @@ Namespaces are one honking great idea -- let's do more of those!
 **The test:** *"Could I explain this implementation in three sentences to a new
 contributor?"* If not, it is probably a bad idea.
 
+### Find it before you write it
+
+*"Simple is better than complex"* above says to extend an existing pattern
+rather than invent an abstraction. That covers reuse **inside** this codebase.
+This tenet adds the other direction, because the expensive mistakes have come
+from writing by hand something that already existed:
+
+> Before hand-writing a type, a parser, a client, or a mechanism, establish that
+> it does not already exist — upstream (a crate, a code generator, a protocol's
+> own reference implementation) **or in this repo under a different name**. Say
+> in the PR description what you searched for and what you found.
+
+The precedent is concrete, not hypothetical:
+
+| Case | Cost |
+|------|------|
+| #1200 hand-wrote ~117 types a generator already produced | reverted wholesale by #1216 — a full implement/review/revert cycle |
+| `guide` (#1235) was designed as a fourth permission state | shrank from three tickets to one, with zero frontend churn, once the existing request-only injection carrier was found already in production |
+
+**Why this needs to be written down rather than left to reviewers:** this class
+of waste is invisible at review time. The code compiles, it is tested, it is
+well-formed — the defect is that it should not exist at all, which is only
+visible to someone who independently knows the upstream landscape. Making the
+search an explicit, stated step turns catching it from luck into a checklist
+item.
+
 ---
 
 ## How These Apply in Review

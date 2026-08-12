@@ -206,6 +206,49 @@ const REPEAT_NUDGE_AT: usize = 3;
 /// iteration cap.
 const REPEAT_BREAK_AT: usize = 5;
 
+/// Build a **request-only** corrective message: it goes onto the wire for this
+/// one request and is never persisted to the store.
+///
+/// The role is `"user"`, not `"system"`, and that is measured rather than
+/// chosen (#1235 AC1). With a corrective delivered mid-conversation at temp=0,
+/// three runs per arm on SiliconFlow:
+///
+/// | model | control | `role:"user"` | `role:"system"` |
+/// |---|---|---|---|
+/// | Qwen3-8B, DeepSeek-V3.2, GLM-4.5-Air | ignores | obeys | obeys |
+/// | `openai/gpt-oss-20b`, `openai/gpt-oss-120b` | ignores | obeys | **ignores** |
+///
+/// OpenAI-lineage models read a mid-conversation `system` message as
+/// *configuration* rather than as an *event*, so it loses the temporal force a
+/// corrective needs — silently, on exactly the models where a stall matters.
+/// The control column confirms causality: with no corrective, every model
+/// takes the un-nudged path.
+///
+/// Every mid-conversation corrective must go through here so the role stays in
+/// one place; the leading system prompt is unaffected and stays `"system"`.
+///
+/// Two properties worth stating (#1237 finding 6). (a) Consecutive synthetic
+/// `role:"user"` messages can stack in one request — the wrap-up nudge and the
+/// stall nudge both flow through here — and providers handle repeated same-role
+/// messages inconsistently; keep the set small. (b) Scoped-rule guides
+/// deliberately do *not* use this carrier: they ride on the annotated call's
+/// tool result (`role:"tool"`, see the finalization loop in `run_turn`), so
+/// guide text stays distinguishable from real user input. Were a guide ever
+/// routed through here it would reach the model indistinguishable from a user
+/// turn — fine for config-authored text, but a property to re-check before any
+/// less-trusted source becomes a guide producer.
+fn corrective_message(content: String) -> ChatMessage {
+    ChatMessage {
+        role: "user".to_string(),
+        content: Some(content),
+        tool_calls: None,
+        tool_call_id: None,
+        name: None,
+        attachments: Vec::new(),
+        reasoning: None,
+    }
+}
+
 /// Once a session is over the context-pressure threshold, re-run the memory flush
 /// again only after the transcript has grown by this many messages, so a long
 /// over-budget conversation flushes periodically rather than every single turn
@@ -2031,36 +2074,18 @@ pub async fn run_turn(
                      prepare to give your final answer soon."
                 )
             };
-            messages.push(ChatMessage {
-                role: "system".to_string(),
-                content: Some(content),
-                tool_calls: None,
-                tool_call_id: None,
-                name: None,
-
-                attachments: Vec::new(),
-                reasoning: None,
-            });
+            messages.push(corrective_message(content));
         }
 
         // Corrective nudge for a detected repeated-call stall (#244 R2). Request-only,
         // like the wrap-up nudge above.
         if let Some(tool) = repeat_nudge.take() {
-            messages.push(ChatMessage {
-                role: "system".to_string(),
-                content: Some(format!(
-                    "You have called `{tool}` with identical arguments {REPEAT_NUDGE_AT} times \
-                     without making progress. Do not repeat that call -- read the result you \
-                     already have, try a different approach or different arguments, or give \
-                     your final answer now."
-                )),
-                tool_calls: None,
-                tool_call_id: None,
-                name: None,
-
-                attachments: Vec::new(),
-                reasoning: None,
-            });
+            messages.push(corrective_message(format!(
+                "You have called `{tool}` with identical arguments {REPEAT_NUDGE_AT} times \
+                 without making progress. Do not repeat that call -- read the result you \
+                 already have, try a different approach or different arguments, or give \
+                 your final answer now."
+            )));
         }
 
         // Reserve the assistant message id up front so the frontend can route tokens.
@@ -2867,7 +2892,7 @@ pub async fn run_turn(
             if is_secret_ask {
                 outcome.content = SECRET_ANSWER_PLACEHOLDER.to_string();
             }
-            let (stored, original) = if outcome.content.len() > TOOL_RESULT_MAX_BYTES
+            let (mut stored, original) = if outcome.content.len() > TOOL_RESULT_MAX_BYTES
                 && call.name != COMPACTION_RETRIEVE_TOOL
             {
                 let compacted = compaction_extractive::ExtractiveCompactor::default()
@@ -2876,21 +2901,67 @@ pub async fn run_turn(
             } else {
                 (outcome.content.clone(), None)
             };
+            // Scoped-rule guides (#1235): non-blocking correctives attached to
+            // *this* call's result, so the advice reaches the model in the same
+            // request as the outcome it annotates rather than a request too late.
+            // A guide changes no authorization, so this runs for every call
+            // regardless of success/permit/dedupe. Deduped by text: several rules
+            // matching one call must not repeat identical advice.
+            //
+            // Attached AFTER oversize compaction, not before (#1237 re-review
+            // finding 1): appending to `outcome.content` first fed the guide
+            // through `compress_one` + truncation, so a result over the byte cap
+            // evicted its own real output tail (error summary, failing assertion,
+            // exit diagnostics) to make room for the guide, and a guide longer
+            // than the kept-tail budget was itself beheaded. Attaching to the
+            // already-compacted `stored` keeps the guide out of the compactor's
+            // input entirely -- so both the output and the full guide survive --
+            // and out of `compaction_originals` (it is not part of the original).
+            let guide_text = {
+                let args = serde_json::from_str::<serde_json::Value>(&call.arguments)
+                    .unwrap_or(serde_json::Value::Null);
+                let resolved = ff_core::resolve_tool_arg(&call.name, &args);
+                let mut seen: Vec<String> = Vec::new();
+                for hit in tools.matrix.collect_guides(&call.name, resolved.as_deref()) {
+                    if !seen.contains(&hit.text) {
+                        seen.push(hit.text);
+                    }
+                }
+                seen.join("\n\n")
+            };
+            if !guide_text.is_empty() {
+                stored = if stored.is_empty() {
+                    guide_text.clone()
+                } else {
+                    format!("{stored}\n\n{guide_text}")
+                };
+            }
             // Hash what the model actually sees, not `outcome.content`: redaction
-            // (above) and extractive compaction both rewrite it, and hashing the raw
-            // value would let two results the model cannot tell apart look distinct
-            // (or vice versa). Taken here because `stored` is moved on the next line.
+            // (above), extractive compaction, and the appended guide all rewrite
+            // it, and hashing the raw value would let two results the model cannot
+            // tell apart look distinct (or vice versa). Taken here because `stored`
+            // is moved on the next line.
             let stored_hash = content_hash(&stored);
             let result_msg = store.add_tool_result_message(session_id, call.id.clone(), stored);
             if let Some((key, original)) = original {
                 store.put_compaction_original(session_id, &result_msg.id, &key, &original);
             }
             backfill.fulfilled(&call.id);
+            // The UI event carries the guide too (attached to the uncompacted
+            // output it shows), so the tool-result card the user sees matches the
+            // advice the model received.
+            let event_result = if guide_text.is_empty() {
+                std::mem::take(&mut outcome.content)
+            } else if outcome.content.is_empty() {
+                guide_text
+            } else {
+                format!("{}\n\n{}", outcome.content, guide_text)
+            };
             on_event(AgentEvent::ToolCallFinished {
                 message_id: message_id.clone(),
                 call_id: call.id.clone(),
                 success: outcome.success,
-                result: outcome.content,
+                result: event_result,
                 observer_intent: outcome.observer_intent.take(),
             });
 

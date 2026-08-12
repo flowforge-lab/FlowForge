@@ -4068,9 +4068,12 @@ struct RecordingToolLooper {
 #[async_trait]
 impl Provider for RecordingToolLooper {
     async fn chat_stream(&self, req: ChatRequest) -> Result<ChunkStream, LlmError> {
+        // Correctives are request-only `role: "user"` messages (#1235 AC1);
+        // `role: "system"` is measurably ignored by the gpt-oss family
+        // mid-conversation.
         let system_text = |needle: &str| {
             req.messages.iter().any(|m| {
-                m.role == "system" && m.content.as_deref().is_some_and(|c| c.contains(needle))
+                m.role == "user" && m.content.as_deref().is_some_and(|c| c.contains(needle))
             })
         };
         // "tool-call limit" appears in both the soft and hard wrap-up copies
@@ -4926,7 +4929,7 @@ async fn transport_budget_exhaustion_emits_connection_failed() {
 // ----- #244 R2: repeated-call / no-progress guard -----
 
 /// Always emits the identical `bash` tool call, recording per-request whether the
-/// repeat-nudge system message was present -- a model stuck in a no-progress loop.
+/// repeat-nudge corrective message was present -- a model stuck in a no-progress loop.
 struct RepeatProvider {
     calls: Arc<AtomicUsize>,
     saw_nudge: Arc<std::sync::Mutex<Vec<bool>>>,
@@ -4935,7 +4938,7 @@ struct RepeatProvider {
 impl Provider for RepeatProvider {
     async fn chat_stream(&self, req: ChatRequest) -> Result<ChunkStream, LlmError> {
         let saw = req.messages.iter().any(|m| {
-            m.role == "system"
+            m.role == "user"
                 && m.content
                     .as_deref()
                     .is_some_and(|c| c.contains("without making progress"))
@@ -8694,5 +8697,415 @@ fn each_denial_reason_reads_differently_to_the_model() {
     assert!(
         cancelled.contains("cancelled"),
         "the message should say what actually happened: {cancelled}"
+    );
+}
+
+// ----- `guide`: request-only correctives from scoped rules (#1235) -----
+
+/// Calls `bash` once, then finishes. Records, for each request, the `role` and
+/// text of every message so a test can assert what the model actually saw.
+struct GuideProbe {
+    calls: Arc<AtomicUsize>,
+    seen: Arc<std::sync::Mutex<Vec<(String, String)>>>,
+}
+
+#[async_trait]
+impl Provider for GuideProbe {
+    async fn chat_stream(&self, req: ChatRequest) -> Result<ChunkStream, LlmError> {
+        {
+            let mut seen = self.seen.lock().unwrap();
+            for m in &req.messages {
+                seen.push((m.role.clone(), m.content.clone().unwrap_or_default()));
+            }
+        }
+        let n = self.calls.fetch_add(1, Ordering::SeqCst);
+        let chunks = if n == 0 {
+            vec![Ok(Chunk {
+                tool_calls: vec![ToolCallDelta {
+                    index: 0,
+                    id: Some("call_0".into()),
+                    name: Some("bash".into()),
+                    arguments: r#"{"command":"rm -rf ./dist"}"#.into(),
+                }],
+                done: true,
+                ..Chunk::default()
+            })]
+        } else {
+            vec![Ok(Chunk {
+                delta: "done".into(),
+                done: true,
+                ..Chunk::default()
+            })]
+        };
+        Ok(futures_util::stream::iter(chunks).boxed())
+    }
+}
+
+fn guide_matrix(rules: Vec<(&str, &str, &str)>) -> PermissionMatrix {
+    let mut m = PermissionMatrix::default();
+    for (tool, prefix, text) in rules {
+        m.rules.push(ff_core::PermissionRule {
+            effect: ff_core::RuleEffect::Guide,
+            tool: tool.into(),
+            matcher: ff_core::permission::ArgMatcher::CommandPrefix {
+                prefix: prefix.into(),
+            },
+            guide: Some(text.into()),
+        });
+    }
+    m
+}
+
+async fn run_with_guides(
+    matrix: &PermissionMatrix,
+    approve: &dyn Approver,
+) -> (Vec<(String, String)>, SessionStore, String) {
+    let store = SessionStore::new();
+    let s = store.create_session(None);
+    store.add_message(&s.id, Role::User, "go".into());
+    let registry = ToolRegistry::new();
+    let root = std::env::current_dir().unwrap();
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let tools = ToolContext::new(&registry, &root, approve, 8, matrix);
+
+    run_turn(
+        &GuideProbe {
+            calls: Arc::new(AtomicUsize::new(0)),
+            seen: seen.clone(),
+        },
+        &store,
+        &tools,
+        &s.id,
+        "mock",
+        None,
+        false,
+        ReasoningVisibility::All,
+        CancelToken::new(),
+        |_| {},
+    )
+    .await
+    .unwrap();
+
+    let out = seen.lock().unwrap().clone();
+    let sid = s.id.clone();
+    (out, store, sid)
+}
+
+/// AC1 (#1235, revised per #1237 finding 1): the corrective reaches the model
+/// attached to *its own call's tool result*, in the same request as that
+/// outcome — not queued into a separate `role:user` message a request later.
+/// The tool result carries `role:"tool"` on the wire.
+#[tokio::test]
+async fn a_matching_guide_rides_on_its_calls_tool_result() {
+    let matrix = guide_matrix(vec![("bash", "rm -rf", "use trash-cli instead")]);
+    let (seen, _store, _sid) = run_with_guides(&matrix, &AlwaysApprove).await;
+
+    let hit = seen
+        .iter()
+        .find(|(_, text)| text.contains("use trash-cli instead"));
+    let (role, _) = hit.expect("the guide text should have reached the provider");
+    assert_eq!(
+        role, "tool",
+        "the guide must be attached to the annotated call's tool result (#1237 finding 1), \
+         not queued as a separate corrective message"
+    );
+}
+
+/// #1237 finding 1: the guide must reach the model in the *same request* as the
+/// tool result it annotates, not a request too late. `GuideProbe` sends exactly
+/// two requests: request 0 has only the user turn (no tool result yet), request
+/// 1 carries the `bash` result. The guide must appear in request 1, never 0.
+#[tokio::test]
+async fn a_guide_arrives_with_the_outcome_it_annotates_not_a_request_later() {
+    let matrix = guide_matrix(vec![("bash", "rm -rf", "use trash-cli instead")]);
+    let store = SessionStore::new();
+    let s = store.create_session(None);
+    store.add_message(&s.id, Role::User, "go".into());
+    let registry = ToolRegistry::new();
+    let root = std::env::current_dir().unwrap();
+    // Per-request snapshots so we can assert *which* request carried the guide.
+    type RequestLog = Arc<std::sync::Mutex<Vec<Vec<(String, String)>>>>;
+    let requests: RequestLog = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let tools = ToolContext::new(&registry, &root, &AlwaysApprove, 8, &matrix);
+
+    struct PerRequestProbe {
+        calls: Arc<AtomicUsize>,
+        requests: RequestLog,
+    }
+    #[async_trait]
+    impl Provider for PerRequestProbe {
+        async fn chat_stream(&self, req: ChatRequest) -> Result<ChunkStream, LlmError> {
+            self.requests.lock().unwrap().push(
+                req.messages
+                    .iter()
+                    .map(|m| (m.role.clone(), m.content.clone().unwrap_or_default()))
+                    .collect(),
+            );
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            let chunks = if n == 0 {
+                vec![Ok(Chunk {
+                    tool_calls: vec![ToolCallDelta {
+                        index: 0,
+                        id: Some("call_0".into()),
+                        name: Some("bash".into()),
+                        arguments: r#"{"command":"rm -rf ./dist"}"#.into(),
+                    }],
+                    done: true,
+                    ..Chunk::default()
+                })]
+            } else {
+                vec![Ok(Chunk {
+                    delta: "done".into(),
+                    done: true,
+                    ..Chunk::default()
+                })]
+            };
+            Ok(futures_util::stream::iter(chunks).boxed())
+        }
+    }
+
+    run_turn(
+        &PerRequestProbe {
+            calls: Arc::new(AtomicUsize::new(0)),
+            requests: requests.clone(),
+        },
+        &store,
+        &tools,
+        &s.id,
+        "mock",
+        None,
+        false,
+        ReasoningVisibility::All,
+        CancelToken::new(),
+        |_| {},
+    )
+    .await
+    .unwrap();
+
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 2, "expected exactly two requests");
+    assert!(
+        !requests[0]
+            .iter()
+            .any(|(_, t)| t.contains("use trash-cli instead")),
+        "the guide must not precede the call it annotates (request 0 has no tool result yet)"
+    );
+    assert!(
+        requests[1]
+            .iter()
+            .any(|(r, t)| r == "tool" && t.contains("use trash-cli instead")),
+        "the guide must arrive on the tool result in the same request as its outcome"
+    );
+}
+
+/// AC3: every matching guide is attached, not just the first.
+#[tokio::test]
+async fn all_matching_guides_are_attached() {
+    let matrix = guide_matrix(vec![
+        ("bash", "rm", "first advice"),
+        ("bash", "rm -rf", "second advice"),
+    ]);
+    let (seen, _store, _sid) = run_with_guides(&matrix, &AlwaysApprove).await;
+
+    for needle in ["first advice", "second advice"] {
+        assert!(
+            seen.iter().any(|(r, t)| r == "tool" && t.contains(needle)),
+            "every matching guide must be attached; missing: {needle}"
+        );
+    }
+}
+
+/// #1237 finding 4: identical advice from several matching rules must attach
+/// once, not once per rule.
+#[tokio::test]
+async fn duplicate_guide_text_is_attached_once() {
+    let matrix = guide_matrix(vec![
+        ("bash", "rm", "use trash-cli instead"),
+        ("bash", "rm -rf", "use trash-cli instead"),
+    ]);
+    let (seen, _store, _sid) = run_with_guides(&matrix, &AlwaysApprove).await;
+
+    let occurrences = seen
+        .iter()
+        .filter(|(r, t)| r == "tool" && t.contains("use trash-cli instead"))
+        .flat_map(|(_, t)| t.matches("use trash-cli instead"))
+        .count();
+    assert_eq!(
+        occurrences, 1,
+        "duplicate guide text must be deduped to a single attachment"
+    );
+}
+
+/// Attach-to-result means the guide *is* persisted, on the tool-result message
+/// (deliberate per #1237 — the advice belongs with the call it annotates). It
+/// lands on exactly one message: a distinct call gets a distinct result, so the
+/// text is stored once, not accumulated across messages. Being persisted, that
+/// one message *is* replayed into every subsequent request the transcript still
+/// carries it in (until cold-tail compaction reaches it), so the guide text is a
+/// standing context cost — the point of attaching it here is delivery timing and
+/// provenance, not one-shot delivery.
+#[tokio::test]
+async fn a_guide_is_persisted_on_its_tool_result_message() {
+    let matrix = guide_matrix(vec![("bash", "rm -rf", "use trash-cli instead")]);
+    let (_seen, store, sid) = run_with_guides(&matrix, &AlwaysApprove).await;
+
+    let carriers: Vec<Message> = store
+        .get_messages(&sid)
+        .into_iter()
+        .filter(|m| m.content.contains("use trash-cli instead"))
+        .collect();
+    assert_eq!(
+        carriers.len(),
+        1,
+        "the guide must land on exactly one persisted message"
+    );
+    assert_eq!(
+        carriers[0].role,
+        Role::Tool,
+        "the guide must ride on the annotated call's tool-result message"
+    );
+}
+
+/// #1237 re-review finding 1 (regression): a guide attaches *after* oversize
+/// compaction, so a result over `TOOL_RESULT_MAX_BYTES` keeps its real output
+/// tail AND the full guide. Before the fix the guide was appended to
+/// `outcome.content` first and then fed through the compactor, which evicted the
+/// output tail to make room and beheaded any guide longer than the kept tail.
+struct BigOutputProbe {
+    calls: Arc<AtomicUsize>,
+    command: String,
+}
+
+#[async_trait]
+impl Provider for BigOutputProbe {
+    async fn chat_stream(&self, _req: ChatRequest) -> Result<ChunkStream, LlmError> {
+        let n = self.calls.fetch_add(1, Ordering::SeqCst);
+        let chunks = if n == 0 {
+            vec![Ok(Chunk {
+                tool_calls: vec![ToolCallDelta {
+                    index: 0,
+                    id: Some("call_0".into()),
+                    name: Some("bash".into()),
+                    arguments: format!(r#"{{"command":{}}}"#, serde_json::json!(self.command)),
+                }],
+                done: true,
+                ..Chunk::default()
+            })]
+        } else {
+            vec![Ok(Chunk {
+                delta: "done".into(),
+                done: true,
+                ..Chunk::default()
+            })]
+        };
+        Ok(futures_util::stream::iter(chunks).boxed())
+    }
+}
+
+#[tokio::test]
+async fn a_guide_survives_oversized_result_compaction() {
+    // Starts with the `rm -rf` prefix so the guide matches, deletes nothing
+    // (the path does not exist), then emits well over TOOL_RESULT_MAX_BYTES of
+    // output with a distinct head and tail marker so we can prove the tail is
+    // not evicted.
+    let command = "rm -rf ./nonexistent-ffguide-xyz 2>/dev/null; echo HEAD_MARKER; seq 1 6000; \
+         echo TAIL_MARKER"
+        .to_string();
+    let guide = "LINE1 of a long guide\nLINE2\nLINE3\nLINE4\nLINE5 last line of guide";
+    let matrix = guide_matrix(vec![("bash", "rm -rf", guide)]);
+
+    let store = SessionStore::new();
+    let s = store.create_session(None);
+    store.add_message(&s.id, Role::User, "go".into());
+    let registry = ToolRegistry::with_defaults();
+    let root = std::env::current_dir().unwrap();
+    let tools = ToolContext::new(&registry, &root, &AlwaysApprove, 8, &matrix);
+
+    run_turn(
+        &BigOutputProbe {
+            calls: Arc::new(AtomicUsize::new(0)),
+            command,
+        },
+        &store,
+        &tools,
+        &s.id,
+        "mock",
+        None,
+        false,
+        ReasoningVisibility::All,
+        CancelToken::new(),
+        |_| {},
+    )
+    .await
+    .unwrap();
+
+    let tool_msg = store
+        .get_messages(&s.id)
+        .into_iter()
+        .find(|m| m.role == Role::Tool)
+        .expect("the bash call must persist a tool-result message");
+    let content = tool_msg.content;
+
+    assert!(
+        content.len() < TOOL_RESULT_MAX_BYTES * 2,
+        "the result must have been compacted, not stored whole ({} bytes)",
+        content.len()
+    );
+    assert!(
+        content.contains("TAIL_MARKER"),
+        "the real output tail must survive compaction, not be evicted by the guide:\n{content}"
+    );
+    for line in guide.lines() {
+        assert!(
+            content.contains(line),
+            "the full guide must survive — line {line:?} was beheaded by compaction:\n{content}"
+        );
+    }
+}
+
+/// A guide that does not match must inject nothing — otherwise advice leaks
+/// onto unrelated calls and burns tokens.
+#[tokio::test]
+async fn a_non_matching_guide_injects_nothing() {
+    let matrix = guide_matrix(vec![("bash", "git push", "never surfaces")]);
+    let (seen, _store, _sid) = run_with_guides(&matrix, &AlwaysApprove).await;
+
+    assert!(
+        !seen.iter().any(|(_, t)| t.contains("never surfaces")),
+        "a non-matching guide must not be injected"
+    );
+}
+
+/// AC5, the property that keeps `guide` from collapsing into `Ask`: an approver
+/// that panics if consulted. A guide must never prompt, round-trip, or wait —
+/// if it ever did, it would be `Ask` with extra steps.
+struct NeverAsk;
+
+#[async_trait]
+impl Approver for NeverAsk {
+    async fn approve(
+        &self,
+        _m: &str,
+        _c: &str,
+        _n: &str,
+        _s: Safety,
+        _a: &serde_json::Value,
+    ) -> ApprovalOutcome {
+        ApprovalOutcome::Allowed
+    }
+    async fn ask(&self, _m: &str, _c: &str, _a: &serde_json::Value) -> Option<String> {
+        panic!("a guide must never ask the user anything (#1235 AC5)");
+    }
+}
+
+#[tokio::test]
+async fn a_guide_never_consults_the_user() {
+    let matrix = guide_matrix(vec![("bash", "rm -rf", "use trash-cli instead")]);
+    let (seen, _store, _sid) = run_with_guides(&matrix, &NeverAsk).await;
+
+    assert!(
+        seen.iter()
+            .any(|(r, t)| r == "tool" && t.contains("use trash-cli instead")),
+        "the guide must be delivered without any user interaction"
     );
 }

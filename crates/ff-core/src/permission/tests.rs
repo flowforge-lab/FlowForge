@@ -227,6 +227,17 @@ fn rule(effect: RuleEffect, tool: &str, matcher: ArgMatcher) -> PermissionRule {
         effect,
         tool: tool.into(),
         matcher,
+        guide: None,
+    }
+}
+
+/// A `effect: guide` rule carrying `text` (#1235).
+fn guide_rule(tool: &str, matcher: ArgMatcher, text: &str) -> PermissionRule {
+    PermissionRule {
+        effect: RuleEffect::Guide,
+        tool: tool.into(),
+        matcher,
+        guide: Some(text.into()),
     }
 }
 
@@ -563,6 +574,48 @@ fn validate_rules_reports_clean_ruleset() {
     assert!(m.validate_rules().is_empty());
 }
 
+/// #1237 finding 3: a `guide` rule with missing or blank text matches but
+/// produces no corrective — `validate_rules` must surface it, not swallow it.
+#[test]
+fn validate_rules_flags_blank_guide_text() {
+    for text in ["", "   ", "\t\n"] {
+        let mut m = PermissionMatrix::default();
+        m.rules.push(guide_rule(
+            "bash",
+            ArgMatcher::CommandPrefix {
+                prefix: "rm".into(),
+            },
+            text,
+        ));
+        let errors = m.validate_rules();
+        assert_eq!(
+            errors.len(),
+            1,
+            "blank guide text {text:?} must produce exactly one diagnostic"
+        );
+        assert_eq!(errors[0].0, 0, "diagnostic must point at the rule index");
+        assert!(
+            errors[0].1.contains("guide"),
+            "diagnostic must name the guide effect: {}",
+            errors[0].1
+        );
+    }
+}
+
+/// A guide rule carrying real text is valid — the check must not false-positive.
+#[test]
+fn validate_rules_accepts_guide_with_text() {
+    let mut m = PermissionMatrix::default();
+    m.rules.push(guide_rule(
+        "bash",
+        ArgMatcher::CommandPrefix {
+            prefix: "rm".into(),
+        },
+        "use trash-cli instead",
+    ));
+    assert!(m.validate_rules().is_empty());
+}
+
 // #827/#828 Part C: pre_prompt_decision encodes the canonical gate order.
 // A regression that reorders allowlist-first is caught here directly.
 #[test]
@@ -739,4 +792,219 @@ fn resolve_tool_arg_reads_each_tools_real_key() {
 
     // An unknown tool is not an error, just unscoped.
     assert_eq!(resolve_tool_arg("nope", &json!({"path": "x"})), None);
+}
+
+// -- `guide`: orthogonal rule annotation (#1235) ---------------------------
+
+/// AC2, the load-bearing property: a guide rule must leave authorization
+/// **bit-identical** to that rule being absent. If a guide could grant
+/// approval, "just remind me about `rm -rf`" would silently auto-approve
+/// `bash` — a security regression, and the exact reason `Guide` is its own
+/// effect rather than an annotation on `Allow`.
+#[test]
+fn a_guide_rule_does_not_change_authorization() {
+    let matcher = || ArgMatcher::CommandPrefix {
+        prefix: "rm -rf".into(),
+    };
+
+    for mode in [Mode::Auto, Mode::Plan, Mode::Act] {
+        let bare = PermissionMatrix::default();
+        let mut guided = PermissionMatrix::default();
+        guided
+            .rules
+            .push(guide_rule("bash", matcher(), "use trash-cli"));
+
+        assert_eq!(
+            guided.evaluate_rules("bash", Some("rm -rf ./dist"), mode),
+            bare.evaluate_rules("bash", Some("rm -rf ./dist"), mode),
+            "a guide rule must not alter the rule verdict in {mode:?}"
+        );
+        let decide = |m: &PermissionMatrix| {
+            pre_prompt_decision(
+                m.cell(mode, Safety::Dangerous),
+                false,
+                m.evaluate_rules("bash", Some("rm -rf ./dist"), mode),
+                Safety::Dangerous,
+                mode,
+                None,
+            )
+        };
+        assert_eq!(
+            decide(&guided),
+            decide(&bare),
+            "a guide rule must not alter the pre-prompt decision in {mode:?}"
+        );
+    }
+}
+
+/// A guide must never strip a tool from the advertised set the way `Deny`
+/// does (AC6). `is_deny()` is what `registry.rs` filters on, so this pins the
+/// property at its source.
+#[test]
+fn a_guide_rule_is_neither_allow_nor_deny() {
+    assert!(!RuleEffect::Guide.eq(&RuleEffect::Allow));
+    assert!(!RuleEffect::Guide.eq(&RuleEffect::Deny));
+}
+
+#[test]
+fn a_matching_guide_is_collected_with_its_source() {
+    let mut m = PermissionMatrix::default();
+    m.rules.push(guide_rule(
+        "bash",
+        ArgMatcher::CommandPrefix {
+            prefix: "rm -rf".into(),
+        },
+        "use trash-cli instead",
+    ));
+
+    let hits = m.collect_guides("bash", Some("rm -rf ./dist"));
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].text, "use trash-cli instead");
+    assert_eq!(hits[0].source, GuideSource::Rule);
+}
+
+#[test]
+fn a_non_matching_guide_is_not_collected() {
+    let mut m = PermissionMatrix::default();
+    m.rules.push(guide_rule(
+        "bash",
+        ArgMatcher::CommandPrefix {
+            prefix: "rm -rf".into(),
+        },
+        "use trash-cli instead",
+    ));
+
+    assert!(m.collect_guides("bash", Some("ls -la")).is_empty());
+    // Right argument, wrong tool.
+    assert!(m.collect_guides("edit", Some("rm -rf ./dist")).is_empty());
+}
+
+/// AC3: guides aggregate. Each carries independent advice, so a second match
+/// must not overwrite the first — the failure mode a first-match `find` would
+/// have introduced.
+#[test]
+fn every_matching_guide_is_collected_not_just_the_first() {
+    let mut m = PermissionMatrix::default();
+    m.rules.push(guide_rule(
+        "bash",
+        ArgMatcher::CommandPrefix {
+            prefix: "rm".into(),
+        },
+        "first advice",
+    ));
+    m.rules.push(guide_rule(
+        "bash",
+        ArgMatcher::CommandPrefix {
+            prefix: "rm -rf".into(),
+        },
+        "second advice",
+    ));
+
+    let texts: Vec<_> = m
+        .collect_guides("bash", Some("rm -rf ./dist"))
+        .into_iter()
+        .map(|h| h.text)
+        .collect();
+    assert_eq!(texts, vec!["first advice", "second advice"]);
+}
+
+/// A guide with no text, or only whitespace, is skipped rather than injected:
+/// unlike a malformed deny there is nothing to fail closed to, and empty text
+/// would spend tokens saying nothing.
+#[test]
+fn a_guide_without_usable_text_is_skipped() {
+    let matcher = || ArgMatcher::CommandPrefix {
+        prefix: "rm".into(),
+    };
+    let mut m = PermissionMatrix::default();
+    m.rules.push(PermissionRule {
+        effect: RuleEffect::Guide,
+        tool: "bash".into(),
+        matcher: matcher(),
+        guide: None,
+    });
+    m.rules.push(guide_rule("bash", matcher(), "   "));
+
+    assert!(m.collect_guides("bash", Some("rm -rf ./dist")).is_empty());
+}
+
+/// An `Allow`/`Deny` rule is not a guide even if it somehow carries text, so
+/// the two axes cannot leak into each other.
+#[test]
+fn non_guide_effects_are_never_collected_as_guides() {
+    let matcher = || ArgMatcher::CommandPrefix {
+        prefix: "rm".into(),
+    };
+    let mut m = PermissionMatrix::default();
+    for effect in [RuleEffect::Allow, RuleEffect::Deny] {
+        m.rules.push(PermissionRule {
+            effect,
+            tool: "bash".into(),
+            matcher: matcher(),
+            guide: Some("should never surface".into()),
+        });
+    }
+
+    assert!(m.collect_guides("bash", Some("rm -rf ./dist")).is_empty());
+}
+
+/// AC8: configs written before `guide` existed must keep loading, and a rule
+/// without the field must not serialize one back.
+#[test]
+fn existing_rule_configs_without_a_guide_field_still_load() {
+    let json =
+        r#"{"effect":"deny","tool":"bash","matcher":{"type":"command_prefix","prefix":"rm -rf"}}"#;
+    let r: PermissionRule = serde_json::from_str(json).unwrap();
+    assert_eq!(r.effect, RuleEffect::Deny);
+    assert_eq!(r.guide, None);
+
+    let round = serde_json::to_string(&r).unwrap();
+    assert!(
+        !round.contains("guide"),
+        "an absent guide must stay absent on the wire: {round}"
+    );
+}
+
+#[test]
+fn a_guide_rule_round_trips_through_serde() {
+    let json = r#"{"effect":"guide","tool":"bash","matcher":{"type":"command_prefix","prefix":"rm -rf"},"guide":"use trash-cli"}"#;
+    let r: PermissionRule = serde_json::from_str(json).unwrap();
+    assert_eq!(r.effect, RuleEffect::Guide);
+    assert_eq!(r.guide.as_deref(), Some("use trash-cli"));
+
+    let back: PermissionRule = serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
+    assert_eq!(back, r);
+}
+
+/// AC6: a guide must never change whether a tool is advertised. `registry.rs`
+/// filters the advertised set on `effective_cell(..).is_deny()`, which consults
+/// `overrides` and the matrix but never `rules` — so this holds structurally,
+/// and this test pins it against a refactor that starts folding rules in.
+#[test]
+fn a_guide_rule_does_not_affect_tool_advertisement() {
+    let bare = PermissionMatrix::default();
+    let mut guided = PermissionMatrix::default();
+    guided.rules.push(guide_rule(
+        "bash",
+        ArgMatcher::CommandPrefix {
+            prefix: "rm -rf".into(),
+        },
+        "use trash-cli",
+    ));
+
+    for mode in [Mode::Auto, Mode::Plan, Mode::Act] {
+        for safety in [
+            Safety::ReadOnly,
+            Safety::Write,
+            Safety::Sensitive,
+            Safety::Dangerous,
+            Safety::Publish,
+        ] {
+            assert_eq!(
+                guided.effective_cell("bash", mode, safety),
+                bare.effective_cell("bash", mode, safety),
+                "a guide must not change the advertised cell in {mode:?}/{safety:?}"
+            );
+        }
+    }
 }
