@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
   ChevronLeft,
+  Moon,
   Pencil,
   Pin,
   RotateCcw,
@@ -163,16 +164,33 @@ function FileRow({ file }: { file: MemoryFileRef }) {
 function ChunkRow({
   chunk,
   busy,
+  decayEnabled,
   onReset,
+  onSleep,
   onPin,
 }: {
   chunk: MemoryChunkStat;
   busy: boolean;
+  /** When decay is off nothing is ever dormant, so Sleep has nothing to act on. */
+  decayEnabled: boolean;
   onReset: () => void;
+  onSleep: () => void;
   onPin: (pinned: boolean) => void;
 }) {
   const pct = weightPercent(chunk.weight);
   const title = chunk.heading ?? chunk.relPath;
+  // Sleep is the mirror of Wake (#1239), with two extra gates. Pinned: the
+  // backend would accept the write, but a pin overrides weight on read, so the
+  // row would not budge — disable and say why rather than no-op silently.
+  // Decay off: dormancy is switched off wholesale, so nothing would change.
+  const sleepBlocked = chunk.pinned || !decayEnabled || chunk.weight <= 0;
+  const sleepTitle = chunk.pinned
+    ? "Unpin first to let this chunk sleep"
+    : !decayEnabled
+      ? "Usage decay is disabled — no chunk goes dormant"
+      : chunk.weight <= 0
+        ? "Already asleep — wake it to bring it back"
+        : "Sleep — force dormant now";
   return (
     <div className="rounded-md border border-border bg-muted/40 px-2.5 py-2">
       <div className="flex items-center gap-2">
@@ -238,6 +256,16 @@ function ChunkRow({
           <RotateCcw />
           Wake
         </Button>
+        <Button
+          size="xs"
+          variant="ghost"
+          disabled={busy || sleepBlocked}
+          onClick={onSleep}
+          title={sleepTitle}
+        >
+          <Moon />
+          Sleep
+        </Button>
       </div>
     </div>
   );
@@ -262,6 +290,7 @@ export function MemorySection() {
   const chunks = useMemoryStore((s) => s.chunks);
   const chunkBusy = useMemoryStore((s) => s.chunkBusy);
   const resetChunk = useMemoryStore((s) => s.resetChunk);
+  const sleepChunk = useMemoryStore((s) => s.sleepChunk);
   const setPinned = useMemoryStore((s) => s.setPinned);
   const query = useMemoryStore((s) => s.query);
   const loading = useMemoryStore((s) => s.loading);
@@ -730,7 +759,9 @@ export function MemorySection() {
                       key={chunk.chunkKey}
                       chunk={chunk}
                       busy={chunkBusy[chunk.chunkKey] ?? false}
+                      decayEnabled={overview?.decayEnabled ?? true}
                       onReset={() => void resetChunk(chunk.chunkKey)}
+                      onSleep={() => void sleepChunk(chunk.chunkKey)}
                       onPin={(pinned) => void setPinned(chunk.chunkKey, pinned)}
                     />
                   ))}

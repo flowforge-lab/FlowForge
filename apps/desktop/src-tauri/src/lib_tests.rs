@@ -1211,3 +1211,52 @@ fn mcp_shutdown_budget_exceeds_the_per_server_close_timeout() {
         "budget {MCP_SHUTDOWN_BUDGET:?} must leave room for ff-mcp's 2s per-server close"
     );
 }
+
+// A `#[tauri::command]` that is never listed in `generate_handler!` compiles
+// cleanly and fails only at runtime, when the FE's `invoke` rejects with "command
+// not found" — the exact failure mode #1239's `sleep_memory_chunk` would have hit.
+// Parse this crate's own source and require every command to be wired, so the
+// omission is a red test instead of a dead button.
+#[test]
+fn every_tauri_command_is_registered_in_the_invoke_handler() {
+    let src = include_str!("lib.rs");
+
+    // The command list: from `generate_handler![` to its closing `])`.
+    let start = src
+        .find("tauri::generate_handler![")
+        .expect("lib.rs has an invoke_handler");
+    let rest = &src[start..];
+    let end = rest.find("])").expect("handler list is closed");
+    let registered: Vec<&str> = rest[..end]
+        .lines()
+        .skip(1)
+        .map(|l| l.trim().trim_end_matches(','))
+        .filter(|l| !l.is_empty() && !l.starts_with("//"))
+        .collect();
+
+    // Every `#[tauri::command]` attribute is followed by the `fn <name>` it
+    // annotates (possibly after `async`/other attributes).
+    let mut missing = Vec::new();
+    for (i, _) in src.match_indices("#[tauri::command]") {
+        let name = src[i..]
+            .lines()
+            .find_map(|l| l.trim().split_once("fn ").map(|(_, rest)| rest))
+            .and_then(|rest| rest.split(['(', '<']).next())
+            .expect("a #[tauri::command] annotates a fn");
+        if !registered.contains(&name) {
+            missing.push(name);
+        }
+    }
+
+    assert!(
+        missing.is_empty(),
+        "these #[tauri::command] fns are not in generate_handler![] and would fail \
+         at runtime with \"command not found\": {missing:?}"
+    );
+    // Guard the parser itself: a regression that finds zero commands would make
+    // the assertion above vacuous.
+    assert!(
+        registered.contains(&"sleep_memory_chunk"),
+        "expected the parsed list to contain a known command"
+    );
+}

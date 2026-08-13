@@ -296,6 +296,10 @@ export interface FfIpc {
   listMemoryChunks(): Promise<MemoryChunkStat[]>;
   /** Reset (wake) a chunk: weight back to 1.0, stamp last-accessed now. */
   resetMemoryChunk(chunkKey: string): Promise<void>;
+  /** Sleep a chunk: weight to 0, so it goes dormant now instead of decaying
+   *  there over days (#1239). Inverse of reset; the chunk stays searchable.
+   *  A pinned chunk still reads 1.0, so the UI disables this for pinned rows. */
+  sleepMemoryChunk(chunkKey: string): Promise<void>;
   /** Pin/unpin a chunk: pinned holds weight at 1.0 and is never dormant. */
   setMemoryChunkPinned(chunkKey: string, pinned: boolean): Promise<void>;
 
@@ -773,6 +777,8 @@ class TauriIpc implements FfIpc {
   listMemoryChunks = () => this.invoke<MemoryChunkStat[]>("list_memory_chunks");
   resetMemoryChunk = (chunkKey: string) =>
     this.invoke<void>("reset_memory_chunk", { chunkKey });
+  sleepMemoryChunk = (chunkKey: string) =>
+    this.invoke<void>("sleep_memory_chunk", { chunkKey });
   setMemoryChunkPinned = (chunkKey: string, pinned: boolean) =>
     this.invoke<void>("set_memory_chunk_pinned", { chunkKey, pinned });
   listSessions = () => this.invoke<Session[]>("list_sessions");

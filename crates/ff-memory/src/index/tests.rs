@@ -744,6 +744,96 @@ fn reset_restores_weight_and_creates_row_if_absent() {
     assert_eq!(last, DAY_MS_I, "reset stamps last_accessed");
 }
 
+/// Sleep is the inverse of wake (#1239). Asserted through the `dormant` flag
+/// rather than the stored weight: dormancy is the behaviour users get (skipped
+/// from ambient injection), and it is what a 0.0<->1.0 swap in the SQL must flip.
+#[test]
+fn sleep_forces_dormancy_and_wake_round_trips_it_back() {
+    let idx = Fts5Index::open_in_memory()
+        .unwrap()
+        .with_decay(enabled_decay());
+    let cs = chunks("## H\nalpha body", "MEMORY.md");
+    idx.reindex(&cs).unwrap();
+    let key = chunk_key(&cs[0]);
+    let dormant_at = |now: i64| {
+        idx.chunk_stats_snapshot(std::slice::from_ref(&key), now)
+            .unwrap()
+            .get(&key)
+            .map(|s| s.dormant)
+    };
+
+    // A freshly recalled chunk is live, not dormant.
+    idx.reinforce_at(&scored(&cs), 0).unwrap();
+    assert_eq!(dormant_at(0), Some(false), "recalled chunk starts live");
+
+    // Sleep drops it below the threshold immediately -- no waiting out decay.
+    idx.sleep_chunk_at(&key, 1_000).unwrap();
+    assert_eq!(dormant_at(1_000), Some(true), "sleep forces dormancy now");
+
+    // Fully reversible: wake restores it.
+    idx.reset_chunk_at(&key, 2_000).unwrap();
+    assert_eq!(dormant_at(2_000), Some(false), "wake round-trips it back");
+}
+
+#[test]
+fn sleep_creates_the_row_and_preserves_access_count_and_pin() {
+    let idx = Fts5Index::open_in_memory()
+        .unwrap()
+        .with_decay(enabled_decay());
+    let cs = chunks("## H\nalpha body", "MEMORY.md");
+    idx.reindex(&cs).unwrap();
+    let key = chunk_key(&cs[0]);
+
+    // Never recalled => no row. Sleep must create it at weight 0, stamping the
+    // fresh row's timestamp so it is not a fabricated epoch-0.
+    assert!(read_stat(&idx, &key).is_none());
+    idx.sleep_chunk_at(&key, 5_000).unwrap();
+    assert_eq!(read_stat(&idx, &key), Some((0.0, 5_000, 0)));
+
+    // On an existing row, sleep preserves access_count AND last_accessed --
+    // sleeping is a curation act, not an access, so "idle for N days" stays true.
+    idx.reset_chunk_at(&key, 6_000).unwrap();
+    idx.reinforce_at(&scored(&cs), 7_000).unwrap(); // access_count -> 1
+    let (_, last_before, count_before) = read_stat(&idx, &key).unwrap();
+    idx.sleep_chunk_at(&key, 9_999_999).unwrap();
+    let (w, last, count) = read_stat(&idx, &key).unwrap();
+    assert_eq!(w, 0.0, "sleep zeroes the weight");
+    assert_eq!(last, last_before, "sleep does not stamp last_accessed");
+    assert_eq!(count, count_before, "sleep preserves access_count");
+}
+
+/// The backend stays honest: sleep writes weight 0 even for a pinned chunk, but
+/// the pin overrides at read time, so it is not dormant until unpinned. The UI
+/// disables the control; this pins the semantics underneath it.
+#[test]
+fn sleeping_a_pinned_chunk_writes_weight_but_pin_still_wins() {
+    let idx = Fts5Index::open_in_memory()
+        .unwrap()
+        .with_decay(enabled_decay());
+    let cs = chunks("## H\nalpha body", "MEMORY.md");
+    idx.reindex(&cs).unwrap();
+    let key = chunk_key(&cs[0]);
+
+    idx.set_chunk_pinned_at(&key, true, 1_000).unwrap();
+    idx.sleep_chunk_at(&key, 2_000).unwrap();
+
+    assert_eq!(read_stat(&idx, &key).unwrap().0, 0.0, "stored weight is 0");
+    assert_eq!(read_pinned(&idx, &key), Some(true), "pin survives sleep");
+    let snap = idx
+        .chunk_stats_snapshot(std::slice::from_ref(&key), 2_000)
+        .unwrap();
+    let s = snap.get(&key).unwrap();
+    assert_eq!(s.weight, 1.0, "pin overrides the slept weight on read");
+    assert!(!s.dormant, "a pinned chunk is never dormant");
+
+    // Unpinning reveals the slept weight -- the write was real all along.
+    idx.set_chunk_pinned_at(&key, false, 3_000).unwrap();
+    let snap = idx
+        .chunk_stats_snapshot(std::slice::from_ref(&key), 3_000)
+        .unwrap();
+    assert!(snap.get(&key).unwrap().dormant, "dormant once unpinned");
+}
+
 #[test]
 fn set_pinned_round_trips_and_creates_row_if_absent() {
     let idx = Fts5Index::open_in_memory()

@@ -129,6 +129,35 @@ describe("memory store (SET.8, #131)", () => {
     ).toBeUndefined();
   });
 
+  it("sleepChunk marks a chunk dormant", async () => {
+    await useMemoryStore.getState().load();
+    // The mock is a shared singleton, so pick defensively rather than assuming
+    // an earlier test left the seeded live chunk alone.
+    const live = useMemoryStore
+      .getState()
+      .chunks.find((c) => !c.dormant && !c.pinned);
+    expect(live).toBeTruthy();
+
+    await useMemoryStore.getState().sleepChunk(live!.chunkKey);
+
+    const after = useMemoryStore
+      .getState()
+      .chunks.find((c) => c.chunkKey === live!.chunkKey);
+    expect(after?.dormant).toBe(true);
+    expect(after?.weight).toBe(0);
+    // Sleeping is curation, not an access — the idle age must not be reset.
+    expect(after?.lastAccessedMs).toBe(live!.lastAccessedMs);
+    expect(useMemoryStore.getState().chunkBusy[live!.chunkKey]).toBeUndefined();
+
+    // Round-trips: waking it restores the chunk (the inverse-of-Wake contract).
+    await useMemoryStore.getState().resetChunk(live!.chunkKey);
+    const woken = useMemoryStore
+      .getState()
+      .chunks.find((c) => c.chunkKey === live!.chunkKey);
+    expect(woken?.dormant).toBe(false);
+    expect(woken?.weight).toBe(1);
+  });
+
   it("setPinned round-trips and a pinned chunk is never dormant", async () => {
     await useMemoryStore.getState().load();
     // Pick any unpinned chunk — the mock is a shared singleton, so an earlier

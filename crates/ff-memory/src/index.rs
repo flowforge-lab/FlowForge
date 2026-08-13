@@ -128,6 +128,26 @@ pub trait MemoryIndex: Send + Sync {
     fn reset_chunk(&self, _key: &str) -> Result<()> {
         Ok(())
     }
+    /// Sleep a chunk: force `weight` to `0.0` — below any sane
+    /// `dormant_threshold` — so it is skipped from ambient injection right away,
+    /// without waiting out disuse-decay (#1239). The exact inverse of
+    /// [`reset_chunk`](Self::reset_chunk), and equally reversible: waking it or
+    /// a search recall reinforces the weight back up. Never deletes anything and
+    /// never touches Markdown; the chunk stays fully searchable.
+    ///
+    /// Honest about pins rather than clever: this writes weight `0.0` even for a
+    /// pinned chunk, but a pin overrides weight at read time
+    /// ([`chunk_stats_snapshot`](Self::chunk_stats_snapshot)), so the chunk keeps
+    /// reading `1.0` and never-dormant until it is unpinned. Callers that want
+    /// sleeping to be visible must unpin first — the UI disables the control.
+    ///
+    /// Dormancy is also gated on `decay.enabled`: with decay off nothing is ever
+    /// dormant, so this records the weight but changes no behaviour.
+    ///
+    /// The default is a no-op so backends without a stats table need no change.
+    fn sleep_chunk(&self, _key: &str) -> Result<()> {
+        Ok(())
+    }
     /// Set a chunk's `pinned` flag, creating the row if absent. A pinned chunk
     /// reads effective weight `1.0` (decay skipped) and is never dormant (#293).
     /// The default is a no-op so backends without a stats table need no change.
@@ -402,6 +422,29 @@ impl Fts5Index {
         Ok(())
     }
 
+    /// Time-injectable core of [`sleep_chunk`](MemoryIndex::sleep_chunk) (#1239).
+    /// Forces `weight` to `0.0`, creating the row if absent. `access_count` and
+    /// `pinned` are preserved on an existing row; a fresh row starts at count `0`,
+    /// unpinned.
+    ///
+    /// Unlike [`reset_chunk_at`](Self::reset_chunk_at), an existing row keeps its
+    /// stored `last_accessed` — sleeping is a curation act, not an access, so the
+    /// Salience panel should keep showing how long it has really been idle. Only
+    /// a fresh row takes `now_ms`, and only so a never-recalled chunk does not
+    /// fabricate an epoch-0 timestamp (same reasoning as
+    /// [`set_chunk_pinned_at`](Self::set_chunk_pinned_at)). The timestamp does not
+    /// affect decay either way: `0.0 * factor^days` is `0.0`.
+    pub(crate) fn sleep_chunk_at(&self, key: &str, now_ms: i64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO chunk_stats (chunk_key, weight, last_accessed, access_count, pinned)
+             VALUES (?1, 0.0, ?2, 0, 0)
+             ON CONFLICT(chunk_key) DO UPDATE SET weight = 0.0",
+            params![key, now_ms],
+        )?;
+        Ok(())
+    }
+
     /// Time-injectable core of
     /// [`set_chunk_pinned`](MemoryIndex::set_chunk_pinned) (#293). Sets the
     /// `pinned` flag, creating the row if absent. A new row starts at weight
@@ -637,6 +680,10 @@ impl MemoryIndex for Fts5Index {
         self.reset_chunk_at(key, Utc::now().timestamp_millis())
     }
 
+    fn sleep_chunk(&self, key: &str) -> Result<()> {
+        self.sleep_chunk_at(key, Utc::now().timestamp_millis())
+    }
+
     fn set_chunk_pinned(&self, key: &str, pinned: bool) -> Result<()> {
         self.set_chunk_pinned_at(key, pinned, Utc::now().timestamp_millis())
     }
@@ -757,6 +804,10 @@ impl<E: Embedder> MemoryIndex for HybridIndex<E> {
 
     fn reset_chunk(&self, key: &str) -> Result<()> {
         self.inner.reset_chunk(key)
+    }
+
+    fn sleep_chunk(&self, key: &str) -> Result<()> {
+        self.inner.sleep_chunk(key)
     }
 
     fn set_chunk_pinned(&self, key: &str, pinned: bool) -> Result<()> {
