@@ -23,7 +23,7 @@ export interface MemoryState {
   journalBodies: Record<string, string>;
   /** Per-chunk salience stats for the Salience surface (M6.2, #293). */
   chunks: MemoryChunkStat[];
-  /** chunkKeys with an in-flight reset/pin mutation, for per-row busy state. */
+  /** chunkKeys with an in-flight reset/sleep/pin mutation, for per-row busy state. */
   chunkBusy: Record<string, boolean>;
   /** True while a curated-stratum write is in flight (disables Save). */
   writeBusy: boolean;
@@ -43,6 +43,9 @@ export interface MemoryState {
   resetSearch: () => void;
   /** Reset (wake) a chunk: weight back to 1.0; re-pulls the authoritative stats. */
   resetChunk: (chunkKey: string) => Promise<void>;
+  /** Sleep a chunk: weight to 0, forcing dormancy now (#1239). Inverse of
+   *  `resetChunk`; no-op in effect on a pinned chunk (pin wins on read). */
+  sleepChunk: (chunkKey: string) => Promise<void>;
   /** Pin/unpin a chunk: pinned holds weight at 1.0 and is never dormant. */
   setPinned: (chunkKey: string, pinned: boolean) => Promise<void>;
   /** Replace one curated stratum's body, then re-pull the snapshot (#868).
@@ -124,7 +127,7 @@ export const useMemoryStore = create<MemoryState>((set, get) => ({
   setQuery: (query) => set({ query }),
   resetSearch: () => set({ query: "" }),
 
-  // Reset/pin never edit Markdown — they only change `chunk_stats`, so we re-pull
+  // Reset/sleep/pin never edit Markdown — they only change `chunk_stats`, so we re-pull
   // the backend-authoritative snapshot rather than patching `weight`/`dormant`
   // locally (the FE never re-derives those). Mirrors store/mcp.ts's IPC-then-
   // reconcile pattern; per-row `chunkBusy` disables the controls while in flight.
@@ -138,6 +141,24 @@ export const useMemoryStore = create<MemoryState>((set, get) => ({
     }));
     try {
       await ipc.resetMemoryChunk(chunkKey);
+      const chunks = await ipc.listMemoryChunks();
+      set((s) => ({ chunks, chunkBusy: clearBusy(s.chunkBusy, chunkKey) }));
+    } catch (e) {
+      set((s) => ({
+        error: e instanceof Error ? e.message : String(e),
+        chunkBusy: clearBusy(s.chunkBusy, chunkKey),
+      }));
+    }
+  },
+
+  sleepChunk: async (chunkKey) => {
+    if (get().chunkBusy[chunkKey]) return;
+    set((s) => ({
+      chunkBusy: { ...s.chunkBusy, [chunkKey]: true },
+      error: null,
+    }));
+    try {
+      await ipc.sleepMemoryChunk(chunkKey);
       const chunks = await ipc.listMemoryChunks();
       set((s) => ({ chunks, chunkBusy: clearBusy(s.chunkBusy, chunkKey) }));
     } catch (e) {

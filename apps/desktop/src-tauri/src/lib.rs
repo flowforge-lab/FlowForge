@@ -1131,6 +1131,7 @@ fn memory_overview(state: State<'_, Arc<AppState>>) -> MemoryOverview {
         file_count: files.len() as i64,
         total_bytes,
         root_path: mem.root().display().to_string(),
+        decay_enabled: mem.config().decay.enabled,
     }
 }
 
@@ -1244,6 +1245,18 @@ fn reset_memory_chunk(state: State<'_, Arc<AppState>>, chunk_key: String) -> Res
     state
         .index()
         .reset_chunk(&chunk_key)
+        .map_err(|e| e.to_string())
+}
+
+/// Sleep a chunk: force its weight to `0.0` so it goes dormant immediately and
+/// is skipped from ambient injection, instead of waiting out disuse-decay
+/// (#1239). The inverse of [`reset_memory_chunk`], and just as reversible — the
+/// chunk stays searchable and is never deleted. Never edits Markdown.
+#[tauri::command]
+fn sleep_memory_chunk(state: State<'_, Arc<AppState>>, chunk_key: String) -> Result<(), String> {
+    state
+        .index()
+        .sleep_chunk(&chunk_key)
         .map_err(|e| e.to_string())
 }
 
@@ -4477,6 +4490,7 @@ pub fn run() {
             read_file,
             list_memory_chunks,
             reset_memory_chunk,
+            sleep_memory_chunk,
             set_memory_chunk_pinned,
             send_message,
             edit_message,

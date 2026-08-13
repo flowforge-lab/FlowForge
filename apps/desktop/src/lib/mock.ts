@@ -2117,6 +2117,7 @@ Shipping the Settings redesign — currently the Memory browser (SET.8).
       fileCount: this.memoryFiles.length,
       totalBytes: this.memoryFiles.reduce((sum, f) => sum + f.sizeBytes, 0),
       rootPath: "/mock/memory",
+      decayEnabled: true,
     };
   }
 
@@ -2181,6 +2182,18 @@ Shipping the Settings redesign — currently the Memory browser (SET.8).
       c.weight = 1.0;
       c.dormant = false;
       c.lastAccessedMs = Date.now();
+    }
+  }
+
+  // Inverse of reset (#1239). Mirrors the backend's read semantics: a pinned
+  // chunk's weight is overridden to 1.0 on read, so sleeping one changes nothing
+  // visible — the mock declines rather than faking a dormant pinned row. Unlike
+  // reset, `lastAccessedMs` is left alone: sleeping is curation, not an access.
+  async sleepMemoryChunk(chunkKey: string): Promise<void> {
+    const c = this.memoryChunks.find((m) => m.chunkKey === chunkKey);
+    if (c && !c.pinned) {
+      c.weight = 0;
+      c.dormant = true;
     }
   }
 

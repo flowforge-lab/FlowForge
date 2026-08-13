@@ -104,6 +104,13 @@ const chunk = (over: Partial<MemoryChunkStat>): MemoryChunkStat => ({
   ...over,
 });
 
+/** The row's Sleep control (#1239) — matched by label, like the Wake lookups. */
+function sleepButton(): HTMLButtonElement | undefined {
+  return [...container.querySelectorAll("button")].find((b) =>
+    b.textContent?.includes("Sleep"),
+  );
+}
+
 /** Seed loaded state with chunks so the Salience section renders (one file keeps
  *  the `loading && files.length === 0` gate from hiding the content). */
 function seedChunks(chunks: MemoryChunkStat[]) {
@@ -270,6 +277,56 @@ describe("MemorySection — Salience surface (M6.2, #293)", () => {
     );
     // Rendered but disabled (weight >= 1) — the user can't wake a full chunk.
     expect((wake as HTMLButtonElement | undefined)?.disabled).toBe(true);
+  });
+
+  it("fires sleep through the store (#1239)", () => {
+    const spy = vi
+      .spyOn(useMemoryStore.getState(), "sleepChunk")
+      .mockResolvedValue();
+    seedChunks([chunk({ chunkKey: "warm", heading: "Identity", weight: 0.9 })]);
+    render(<MemorySection />);
+
+    click(sleepButton());
+    expect(spy).toHaveBeenCalledWith("warm");
+  });
+
+  it("disables sleep for a pinned chunk (the pin would override it)", () => {
+    seedChunks([
+      chunk({ chunkKey: "kept", heading: "Identity", weight: 1, pinned: true }),
+    ]);
+    render(<MemorySection />);
+
+    const sleep = sleepButton();
+    expect(sleep?.disabled).toBe(true);
+    expect(sleep?.title).toContain("Unpin first");
+  });
+
+  it("disables sleep when usage decay is off (nothing goes dormant)", () => {
+    seedChunks([chunk({ chunkKey: "warm", heading: "Identity", weight: 0.9 })]);
+    useMemoryStore.setState({
+      overview: {
+        enabled: true,
+        fileCount: 1,
+        totalBytes: 1,
+        rootPath: "/mem",
+        decayEnabled: false,
+      },
+    });
+    render(<MemorySection />);
+
+    const sleep = sleepButton();
+    expect(sleep?.disabled).toBe(true);
+    expect(sleep?.title).toContain("decay is disabled");
+  });
+
+  it("disables sleep for an already-slept chunk (nothing to sleep)", () => {
+    seedChunks([
+      chunk({ chunkKey: "cold", heading: "Focus", weight: 0, dormant: true }),
+    ]);
+    render(<MemorySection />);
+    const sleep = sleepButton();
+    expect(sleep?.disabled).toBe(true);
+    expect(sleep?.title).toContain("Already asleep");
   });
 
   it("shows the empty state when there are no chunks", () => {

@@ -76,6 +76,13 @@ pub struct MemoryOverview {
     pub total_bytes: i64,
     /// Absolute path to the memory root directory.
     pub root_path: String,
+    /// Whether usage decay is active (RFC 0007 §5 `decay.enabled`). When `false`,
+    /// stats are still recorded but `weight` never decays and **no chunk is ever
+    /// dormant**, so the Salience controls that exist to move a chunk across the
+    /// dormancy threshold — Sleep in particular (#1239) — have nothing to act on.
+    /// Surfaced so the panel can disable them and say why, instead of offering a
+    /// button that silently does nothing.
+    pub decay_enabled: bool,
 }
 
 /// Per-chunk salience stats for the Settings "Salience" surface (Issue #293,
