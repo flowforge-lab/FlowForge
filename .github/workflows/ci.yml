@@ -48,6 +48,13 @@ jobs:
       - name: cargo nextest
         run: cargo nextest run --workspace
 
+      # ts-rs re-emits apps/desktop/src/bindings/ during the test run above, so
+      # a diff here means a #[derive(TS)] type changed without the generated TS
+      # being regenerated and committed (#1238). Fix by re-running the tests and
+      # committing the result — never by hand-editing the binding.
+      - name: bindings up to date
+        run: git diff --exit-code -- apps/desktop/src/bindings/
+
       - name: cargo doctests
         run: cargo test --workspace --doc
 

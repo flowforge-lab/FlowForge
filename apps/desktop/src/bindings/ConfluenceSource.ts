@@ -7,8 +7,10 @@
  */
 export type ConfluenceSource = { 
 /**
- * The session this segment was copied from. `None` if that source has since
- * been deleted — the segment stays, its exact origin is simply lost.
+ * The session this segment was copied from. Always `Some` when a confluence
+ * is created: V1 requires every source to exist (a missing one aborts with
+ * `SessionNotFound`). `None` is reserved for a source deleted *after* the
+ * confluence — the segment stays, its exact origin is simply lost.
  */
 sessionId?: string, 
 /**
