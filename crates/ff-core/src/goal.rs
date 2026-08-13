@@ -64,6 +64,16 @@ pub struct Goal {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub pending_steer: Option<String>,
+    /// A shell command the loop runs to *verify* a claimed completion before it
+    /// accepts `goal_complete` (RFC 0020 §5.1, #684 D3). `None` keeps the pre-D3
+    /// behaviour — a `goal_complete` is trusted as-is — so non-code goals (a
+    /// research write-up) are unaffected. When set, the loop runs it on a
+    /// completion signal: a green exit accepts `Completed`; a non-zero exit
+    /// rejects the claim, records a `Drift` ledger entry carrying the command's
+    /// output as evidence, and lets the loop keep iterating.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub verify_cmd: Option<String>,
     #[serde(default)]
     #[ts(type = "number")]
     pub created_ms: i64,
@@ -225,6 +235,7 @@ impl Goal {
             spent: GoalSpend::default(),
             ledger: Vec::new(),
             pending_steer: None,
+            verify_cmd: None,
             created_ms: now_ms,
             updated_ms: now_ms,
         }

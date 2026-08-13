@@ -44,17 +44,25 @@ const MAX_LEDGER_EVIDENCE_CHARS: usize = 200;
 /// Marker appended when an evidence pointer is truncated, so the model can tell
 /// a clipped pointer from a complete one (same rationale as
 /// [`MCP_TRUNCATION_MARKER`]).
-const EVIDENCE_TRUNCATION_MARKER: &str = " [...]";
+pub(crate) const EVIDENCE_TRUNCATION_MARKER: &str = " [...]";
 
-/// Truncate one evidence pointer to [`MAX_LEDGER_EVIDENCE_CHARS`] on a char
-/// boundary, appending [`EVIDENCE_TRUNCATION_MARKER`] when clipped. Counts
-/// chars, not bytes, so the cap is stable regardless of multi-byte content.
-fn truncate_evidence(s: &str) -> String {
+/// Clip `s` to at most `max_chars` characters on a UTF-8 char boundary,
+/// appending [`EVIDENCE_TRUNCATION_MARKER`] when it was clipped. Counts chars,
+/// not bytes, so the cap is stable regardless of multi-byte content. The input
+/// is trimmed first. Shared by the ledger-evidence renderer (#1242) and the
+/// verify-command output bound (#684 D3) so the two cannot drift apart.
+pub(crate) fn clip_evidence_chars(s: &str, max_chars: usize) -> String {
     let s = s.trim();
-    match s.char_indices().nth(MAX_LEDGER_EVIDENCE_CHARS) {
+    match s.char_indices().nth(max_chars) {
         None => s.to_string(),
         Some((byte_end, _)) => format!("{}{EVIDENCE_TRUNCATION_MARKER}", &s[..byte_end]),
     }
+}
+
+/// Truncate one evidence pointer to [`MAX_LEDGER_EVIDENCE_CHARS`] on a char
+/// boundary, appending [`EVIDENCE_TRUNCATION_MARKER`] when clipped.
+fn truncate_evidence(s: &str) -> String {
+    clip_evidence_chars(s, MAX_LEDGER_EVIDENCE_CHARS)
 }
 
 const MCP_TRUNCATION_MARKER: &str =

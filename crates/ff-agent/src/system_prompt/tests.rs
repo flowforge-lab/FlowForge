@@ -559,6 +559,7 @@ fn active_goal() -> Goal {
             },
         ],
         pending_steer: None,
+        verify_cmd: None,
         created_ms: 0,
         updated_ms: 0,
     }

@@ -92,6 +92,14 @@ pub struct Goal {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub pending_steer: Option<String>,
+    /// Shell command the loop runs to *verify* a claimed completion before
+    /// accepting it (§5.1, #684 D3). `None` trusts the claim (pre-D3, and the
+    /// path for non-code goals); when set, a green exit accepts `Completed` and
+    /// a red exit records a `Drift` ledger entry (evidence = the output) and
+    /// keeps the loop iterating.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub verify_cmd: Option<String>,
     #[ts(type = "number")]
     pub created_ms: i64,
     #[ts(type = "number")]
@@ -194,15 +202,24 @@ prerequisite to *ship*, though not to *build* the loop (§9).
               goal_set
                  │
                  ▼
-     ┌───────► Active ──── goal_complete ───────► Completed
-     │           │
- goal_resume     ├── stop condition (budget) ───► Exhausted
-     │           │
-     │           ├── unrecoverable error ───────► Failed
-     │           │
-     │           └── goal_pause / Ask cell hit ─► Paused
+     ┌───────► Active ─ goal_complete ─► verify_cmd? ─ pass/none ─► Completed
+     │         ▲   │                          │
+     │         │   │                          └─ fail ─► record Drift entry
+     │         └───┘  (stay Active, retry with the failure as evidence)
+     │             │
+ goal_resume       ├── stop condition (budget) ───► Exhausted
+     │             │
+     │             ├── unrecoverable error ───────► Failed
+     │             │
+     │             └── goal_pause / Ask cell hit ─► Paused
      └───────────────────────────────────────────┘
 ```
+
+`goal_complete` no longer transitions straight to `Completed` (#684 D3): if the
+goal has a `verify_cmd`, the loop runs it first. It completes only when verify
+passes (or no command is wired); a failing command records a `Drift` ledger entry
+carrying the command output as evidence and leaves the goal `Active`, so the next
+iteration retries against the concrete failure rather than accepting the claim.
 
 ### 5.2 Iteration boundary
 
@@ -250,6 +267,17 @@ re-renders without polling — same pattern as `scheduled:changed` / `session:ti
 `goal_complete` is dual-surface: an IPC command **and** an agent tool (ReadOnly
 safety — it only writes goal state, no side effect), so the model can declare the
 objective met from inside the loop.
+
+**Verified completion (#684 D3).** A `goal_complete` is a *claim*, not proof. If
+the goal carries a `verify_cmd`, the loop runs it on the completion signal and
+only accepts `Completed` on a green exit; a red exit records a `Drift` ledger
+entry whose evidence is the command's output — folded back into the next
+iteration's prompt by the §8 renderer — and keeps the loop iterating until the
+claim verifies or the budget exhausts (so an unproven claim ends `Exhausted`,
+never a silent success). `verify_cmd = None` keeps the pre-D3 "trust the claim"
+behaviour, which is the path for goals with nothing to run (a research write-up).
+The verifier is a shell command run in the session's working directory, shared by
+both hosts so CLI and desktop cannot diverge on what "verified" means.
 
 ## 8. System-prompt injection
 

@@ -14,6 +14,19 @@ fn active_goal(max_iterations: u32) -> Goal {
     g
 }
 
+/// How a [`StubIter`] answers `verify()` (#684 D3), so a test can drive each
+/// branch of the completion gate deterministically.
+#[derive(Clone)]
+enum VerifyPlan {
+    /// No `verify_cmd` wired — the default; keeps pre-D3 "trust the claim".
+    Skip,
+    /// Fail (reject the claim) while the verify-call count is `< n`, then pass.
+    /// Models an agent that fixes the failure and re-signals completion.
+    FailUntil(u32),
+    /// Always fail — the claim is never proven.
+    AlwaysFail,
+}
+
 /// A stub iteration: completes on the Nth turn, spends fixed tokens/turn, and
 /// optionally gates or panics. `now` advances by a fixed step per call so
 /// `updated_ms` moves deterministically. Records every save so a test can
@@ -26,6 +39,10 @@ struct StubIter {
     fail_on: Option<u32>,
     cancel_on: Option<u32>,
     steer_on: Option<u32>,
+    /// How `verify()` answers a completion signal (#684 D3).
+    verify_plan: VerifyPlan,
+    /// Number of `verify()` calls, so a test can prove the gate ran (or did not).
+    verify_calls: AtomicU32,
     /// Ledger steps this stub reports per turn, keyed by 1-based turn number.
     steps_on: Vec<(u32, LedgerStep)>,
     calls: AtomicU32,
@@ -51,20 +68,42 @@ impl StubIter {
             fail_on: None,
             cancel_on: None,
             steer_on: None,
+            verify_plan: VerifyPlan::Skip,
+            verify_calls: AtomicU32::new(0),
             steps_on: Vec::new(),
             calls: AtomicU32::new(0),
             now: AtomicU32::new(0),
             saves: Mutex::new(Vec::new()),
         }
     }
+    fn with_verify(mut self, plan: VerifyPlan) -> Self {
+        self.verify_plan = plan;
+        self
+    }
     fn call_count(&self) -> u32 {
         self.calls.load(Ordering::SeqCst)
+    }
+    fn verify_count(&self) -> u32 {
+        self.verify_calls.load(Ordering::SeqCst)
     }
 }
 #[async_trait]
 impl GoalIteration for StubIter {
     fn gate(&self, _goal: &Goal) -> GateDecision {
         self.gate
+    }
+    async fn verify(&self, _goal: &Goal) -> VerifyOutcome {
+        let n = self.verify_calls.fetch_add(1, Ordering::SeqCst) + 1;
+        match self.verify_plan {
+            VerifyPlan::Skip => VerifyOutcome::Skipped,
+            VerifyPlan::AlwaysFail => VerifyOutcome::Failed {
+                output: format!("verify failed (call {n})"),
+            },
+            VerifyPlan::FailUntil(k) if n < k => VerifyOutcome::Failed {
+                output: format!("verify failed (call {n})"),
+            },
+            VerifyPlan::FailUntil(_) => VerifyOutcome::Passed,
+        }
     }
     async fn run_once(&self, _goal: &Goal) -> IterationOutcome {
         let n = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
@@ -714,4 +753,197 @@ fn committing_a_no_id_step_after_an_explicit_collision_stays_addressable() {
     assert_eq!(ids.len(), 2);
     assert_ne!(ids[0], ids[1], "ids must be unique and addressable");
     assert!(ids.contains(&"step-2".to_string()));
+}
+
+// ---- #684 D3: verify-loop gate on a claimed completion ----
+
+#[tokio::test]
+async fn verify_pass_accepts_completion() {
+    // Completes on turn 1; verify() passes → the claim is accepted as Completed.
+    let mut g = active_goal(25);
+    let iter = StubIter::completing(1, 100).with_verify(VerifyPlan::FailUntil(1));
+
+    let stop = drive_goal(&mut g, &iter).await;
+
+    assert_eq!(stop, LoopStop::Completed);
+    assert_eq!(g.status, GoalStatus::Completed);
+    assert_eq!(
+        iter.verify_count(),
+        1,
+        "verify ran exactly once on the claim"
+    );
+    assert_eq!(g.iteration, 1, "no extra iterations after a green verify");
+    assert!(
+        g.ledger.iter().all(|e| e.verdict != Some(Verdict::Drift)),
+        "a passing verify records no Drift entry"
+    );
+}
+
+#[tokio::test]
+async fn verify_skip_preserves_pre_d3_trust() {
+    // No verify_cmd wired (VerifyPlan::Skip) — the loop trusts the claim exactly
+    // as it did before D3, so a completion on turn 2 finishes immediately.
+    let mut g = active_goal(25);
+    let iter = StubIter::completing(2, 100); // defaults to VerifyPlan::Skip
+
+    let stop = drive_goal(&mut g, &iter).await;
+
+    assert_eq!(stop, LoopStop::Completed);
+    assert_eq!(g.status, GoalStatus::Completed);
+    assert_eq!(iter.verify_count(), 1, "verify is still consulted");
+    assert!(
+        g.ledger.iter().all(|e| e.verdict != Some(Verdict::Drift)),
+        "Skipped never records a Drift rejection"
+    );
+}
+
+#[tokio::test]
+async fn verify_fail_rejects_claim_and_keeps_iterating_until_green() {
+    // The agent signals complete every turn from turn 1, but verify fails on the
+    // first two calls and passes on the third: the loop must reject the first two
+    // claims, record Drift each time, keep iterating, and only finish when green.
+    let mut g = active_goal(25);
+    let iter = StubIter::completing(1, 100).with_verify(VerifyPlan::FailUntil(3));
+
+    let stop = drive_goal(&mut g, &iter).await;
+
+    assert_eq!(stop, LoopStop::Completed);
+    assert_eq!(g.status, GoalStatus::Completed);
+    assert_eq!(iter.verify_count(), 3, "verified on each claim until green");
+    assert_eq!(g.iteration, 3, "two rejections forced two more turns");
+    let drifts: Vec<_> = g
+        .ledger
+        .iter()
+        .filter(|e| e.verdict == Some(Verdict::Drift))
+        .collect();
+    assert_eq!(drifts.len(), 2, "one Drift entry per rejected claim");
+    assert!(
+        drifts[0]
+            .evidence
+            .iter()
+            .any(|s| s.contains("verify failed")),
+        "the rejection carries the verify output as evidence for the next turn"
+    );
+    // The rejection entry follows the evidence-first ledger model (#74): its
+    // claim names the assertion under test (the agent's goal_complete signal),
+    // and a Drift verdict leaves the step Active — not a terminal Blocked — so a
+    // later iteration retries. Mirrors the canonical verdict->status mapping.
+    assert_eq!(
+        drifts[0].claim, "goal_complete: the objective is met",
+        "the claim names the completion assertion the verify rejected"
+    );
+    assert_eq!(
+        drifts[0].status,
+        StepStatus::Active,
+        "Drift leaves the goal Active for a retry, matching the verdict->status mapping"
+    );
+}
+
+#[tokio::test]
+async fn verify_fail_until_budget_exhausts_ends_not_completed() {
+    // Completion is claimed every turn but verify never passes: the loop must
+    // never report Completed — it exhausts the budget instead (no silent success).
+    let mut g = active_goal(2);
+    let iter = StubIter::completing(1, 50).with_verify(VerifyPlan::AlwaysFail);
+
+    let stop = drive_goal(&mut g, &iter).await;
+
+    assert_eq!(stop, LoopStop::Exhausted);
+    assert_eq!(g.status, GoalStatus::Exhausted);
+    assert_ne!(
+        g.status,
+        GoalStatus::Completed,
+        "an unproven claim is never Completed"
+    );
+    assert_eq!(iter.verify_count(), 2, "verify ran on every claimed turn");
+    assert!(
+        g.ledger.iter().any(|e| e.verdict == Some(Verdict::Drift)),
+        "rejections are recorded as Drift"
+    );
+}
+
+// ---- #684 D3: the shared verify-command runner ----
+
+#[tokio::test]
+async fn run_verify_command_skips_when_no_cmd() {
+    let g = active_goal(10); // no verify_cmd
+    let out = run_verify_command(&g, std::path::Path::new(".")).await;
+    assert_eq!(out, VerifyOutcome::Skipped);
+}
+
+#[tokio::test]
+async fn run_verify_command_skips_on_blank_cmd() {
+    let mut g = active_goal(10);
+    g.verify_cmd = Some("   ".to_string());
+    let out = run_verify_command(&g, std::path::Path::new(".")).await;
+    assert_eq!(
+        out,
+        VerifyOutcome::Skipped,
+        "a whitespace-only cmd is not a real verifier"
+    );
+}
+
+#[cfg(not(windows))]
+#[tokio::test]
+async fn run_verify_command_passes_on_zero_exit() {
+    let mut g = active_goal(10);
+    g.verify_cmd = Some("true".to_string());
+    let out = run_verify_command(&g, std::path::Path::new(".")).await;
+    assert_eq!(out, VerifyOutcome::Passed);
+}
+
+#[cfg(not(windows))]
+#[tokio::test]
+async fn run_verify_command_fails_on_nonzero_exit_with_output() {
+    let mut g = active_goal(10);
+    g.verify_cmd = Some("echo boom >&2; exit 1".to_string());
+    let out = run_verify_command(&g, std::path::Path::new(".")).await;
+    match out {
+        VerifyOutcome::Failed { output } => {
+            assert!(output.contains("boom"), "stderr is captured: {output}");
+            assert!(
+                output.contains("status 1"),
+                "exit code is reported: {output}"
+            );
+        }
+        other => panic!("expected Failed, got {other:?}"),
+    }
+}
+
+#[cfg(not(windows))]
+#[tokio::test]
+async fn run_verify_command_fails_when_command_cannot_run() {
+    // A spawn that starts but exits non-zero because the program is missing:
+    // `sh -c` yields 127. A verifier we could not run has NOT proven completion.
+    let mut g = active_goal(10);
+    g.verify_cmd = Some("this-binary-does-not-exist-xyz".to_string());
+    let out = run_verify_command(&g, std::path::Path::new(".")).await;
+    assert!(matches!(out, VerifyOutcome::Failed { .. }));
+}
+
+#[test]
+fn bound_verify_output_clips_on_char_boundary_with_marker() {
+    let long = "é".repeat(5000); // 2 bytes each, well over the 4000-char cap
+    let bounded = bound_verify_output(&long);
+    assert!(
+        bounded.ends_with(" [...]"),
+        "clipped output carries the marker"
+    );
+    let body = bounded.trim_end_matches(" [...]");
+    assert_eq!(
+        body.chars().count(),
+        4000,
+        "clipped to the char cap, not bytes"
+    );
+    // Must be valid UTF-8 (slicing on a byte index would panic / corrupt).
+    assert!(body.chars().all(|c| c == 'é'));
+}
+
+#[test]
+fn bound_verify_output_leaves_short_output_untouched() {
+    assert_eq!(
+        bound_verify_output("  ok  "),
+        "ok",
+        "trims but does not mark short output"
+    );
 }
