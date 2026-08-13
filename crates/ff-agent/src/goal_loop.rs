@@ -90,11 +90,10 @@ pub struct IterationOutcome {
 /// One `goal_step` call observed on the event stream, normalised into the fields
 /// the loop commits to `Goal.ledger`.
 ///
-/// Only `claim` and `verdict` reach the model today: `system_prompt.rs` renders
-/// exactly those two per entry. `evidence` is captured and persisted but **not**
-/// surfaced back — a deliberate, documented gap (#1225) kept so the write path
-/// could land minimally; rendering it is a follow-up. Do not assume the agent
-/// can see evidence it recorded.
+/// `claim`, `verdict`, and `evidence` all reach the model: `system_prompt.rs`
+/// renders each entry's claim and verdict, plus a bounded number of `evidence`
+/// pointers (capped per entry and truncated per item) beneath it, for the last
+/// few entries (#1242).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LedgerStep {
     /// Id of an existing entry to update in place; `None` appends a new entry.
