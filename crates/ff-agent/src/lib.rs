@@ -28,6 +28,7 @@ mod compaction_cache;
 mod compaction_extractive;
 mod goal_loop;
 mod message_salience;
+mod orchestrator;
 mod system_prompt;
 pub use compaction::{
     flush_due, CompactionContext, CompactionOutcome, CompactionStrategy, ContextPressure,
@@ -48,6 +49,7 @@ pub use goal_loop::{
     LoopStop, TurnLedger,
 };
 pub use message_salience::MessageSalience;
+pub use orchestrator::run_session_turn;
 pub use system_prompt::{
     build_flush_prompt, build_system_prompt, fit_mcp_guidance, server_guidance_is_reachable,
     McpGuidance, SystemPrompt, SystemPromptInputs, TimeOfDay, UserContext,

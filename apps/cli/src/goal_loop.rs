@@ -4,8 +4,8 @@ use std::path::PathBuf;
 use async_trait::async_trait;
 use chrono::Local;
 use ff_agent::{
-    run_turn, AgentEvent, CancelToken, GateDecision, GoalIteration, IterationOutcome, ToolContext,
-    UserContext,
+    run_session_turn, AgentEvent, CancelToken, GateDecision, GoalIteration, IterationOutcome,
+    ToolContext, UserContext,
 };
 use ff_core::{Goal, GoalStore, Mode, PermissionMatrix, ReasoningVisibility, Role};
 use ff_llm::Provider;
@@ -143,7 +143,7 @@ impl GoalIteration for CliGoalIteration {
             None => (memory_store.ambient_block(), Vec::new()),
         };
 
-        let system_prompt = ff_agent::build_system_prompt(&ff_agent::SystemPromptInputs {
+        let system_prompt_inputs = ff_agent::SystemPromptInputs {
             persona: None,
             skills: &load_skills(),
             active: &[],
@@ -153,18 +153,18 @@ impl GoalIteration for CliGoalIteration {
             goal: Some(goal),
             mode: Mode::Auto,
             mcp_guidance: &self.mcp_guidance,
-        });
+        };
 
         let cancel = self.cancel_token.clone().unwrap_or_default();
 
         let mut state = IterationState::new();
-        let result = run_turn(
+        let result = run_session_turn(
             self.provider.as_ref(),
             &self.session_store,
             &tool_ctx,
             &goal.session_id,
             &self.default_model,
-            Some(&system_prompt),
+            &system_prompt_inputs,
             true,
             ReasoningVisibility::All,
             cancel,

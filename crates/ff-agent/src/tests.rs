@@ -9109,3 +9109,111 @@ async fn a_guide_never_consults_the_user() {
         "the guide must be delivered without any user interaction"
     );
 }
+
+/// #1248: `run_session_turn` must be exactly `build_system_prompt` + `run_turn`.
+/// The strongest equivalence proof is the wire: both paths must send a
+/// byte-identical system prompt to the provider. A capturing provider records
+/// the concatenated system-role content of the first request; we compare the
+/// orchestrator's against the manual pairing this ticket collapses, and against
+/// `build_system_prompt`'s own output.
+#[tokio::test]
+async fn run_session_turn_injects_the_same_system_prompt_as_manual_pairing() {
+    use ff_skills::SkillRegistry;
+    use std::sync::Mutex;
+
+    struct CaptureSystem {
+        seen: Arc<Mutex<Vec<String>>>,
+    }
+    #[async_trait]
+    impl Provider for CaptureSystem {
+        async fn chat_stream(&self, req: ChatRequest) -> Result<ChunkStream, LlmError> {
+            // run_turn splits the system prompt into stable + volatile messages;
+            // concatenate every system-role message to reconstruct the whole.
+            let system: String = req
+                .messages
+                .iter()
+                .filter(|m| m.role == "system")
+                .filter_map(|m| m.content.clone())
+                .collect();
+            self.seen.lock().unwrap().push(system);
+            Ok(futures_util::stream::iter(vec![Ok(Chunk {
+                delta: "ok".into(),
+                done: true,
+                ..Chunk::default()
+            })])
+            .boxed())
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let skills = SkillRegistry::default();
+    let user = UserContext::now();
+    let inputs = SystemPromptInputs::new(&skills, &[], &user, Mode::Auto);
+    let expected = build_system_prompt(&inputs);
+
+    let registry = ToolRegistry::new();
+    let approve = AlwaysApprove;
+
+    // Path A: run_session_turn.
+    let seen_a = Arc::new(Mutex::new(Vec::new()));
+    let provider_a = CaptureSystem {
+        seen: seen_a.clone(),
+    };
+    let store_a = SessionStore::new();
+    let s_a = store_a.create_session(None);
+    store_a.add_message(&s_a.id, Role::User, "hi".into());
+    let tools_a = ctx(&registry, dir.path(), &approve);
+    run_session_turn(
+        &provider_a,
+        &store_a,
+        &tools_a,
+        &s_a.id,
+        "m",
+        &inputs,
+        false,
+        ReasoningVisibility::All,
+        CancelToken::new(),
+        |_| {},
+    )
+    .await
+    .unwrap();
+
+    // Path B: the manual pairing this ticket collapses.
+    let seen_b = Arc::new(Mutex::new(Vec::new()));
+    let provider_b = CaptureSystem {
+        seen: seen_b.clone(),
+    };
+    let store_b = SessionStore::new();
+    let s_b = store_b.create_session(None);
+    store_b.add_message(&s_b.id, Role::User, "hi".into());
+    let tools_b = ctx(&registry, dir.path(), &approve);
+    let manual_prompt = build_system_prompt(&inputs);
+    run_turn(
+        &provider_b,
+        &store_b,
+        &tools_b,
+        &s_b.id,
+        "m",
+        Some(&manual_prompt),
+        false,
+        ReasoningVisibility::All,
+        CancelToken::new(),
+        |_| {},
+    )
+    .await
+    .unwrap();
+
+    let captured_a = seen_a.lock().unwrap().first().cloned().unwrap();
+    let captured_b = seen_b.lock().unwrap().first().cloned().unwrap();
+
+    assert_eq!(
+        captured_a, captured_b,
+        "run_session_turn and the manual build_system_prompt+run_turn pairing must \
+         send a byte-identical system prompt"
+    );
+    let whole = expected.full();
+    assert_eq!(
+        captured_a, whole,
+        "the injected system prompt must equal build_system_prompt's own output"
+    );
+}

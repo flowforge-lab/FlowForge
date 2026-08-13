@@ -11,8 +11,8 @@ mod tools;
 
 use async_trait::async_trait;
 use ff_agent::{
-    drive_goal, run_turn, AgentEvent, ApprovalOutcome, Approver, CancelToken, DenyReason,
-    GateDecision, GoalIteration, IterationOutcome, ToolContext,
+    drive_goal, AgentEvent, ApprovalOutcome, Approver, CancelToken, DenyReason, GateDecision,
+    GoalIteration, IterationOutcome, ToolContext,
 };
 use ff_core::events::{
     ApprovalSafety, ConnectionFailedEvent, EgressMismatchEvent, EvolveCostEstimate,
@@ -1686,7 +1686,7 @@ fn spawn_assistant_turn(
         } else {
             (None, vec![])
         };
-        let system_prompt = ff_agent::build_system_prompt(&ff_agent::SystemPromptInputs {
+        let system_prompt_inputs = ff_agent::SystemPromptInputs {
             persona: persona.as_deref(),
             skills: &skills,
             active: &active,
@@ -1696,7 +1696,7 @@ fn spawn_assistant_turn(
             goal: None,
             mode,
             mcp_guidance: &mcp_guidance,
-        });
+        };
 
         // Telemetry (RFC 0001 §8): one SkillActivated per active skill, plus a
         // wall-clock start and a per-turn metrics accumulator the event closure
@@ -1725,13 +1725,13 @@ fn spawn_assistant_turn(
 
         let thinking = state.provider_config().thinking;
         let reasoning_visibility = state.provider_config().reasoning_visibility;
-        let result = run_turn(
+        let result = ff_agent::run_session_turn(
             provider.as_ref(),
             state.store.as_ref(),
             &tool_ctx,
             &sid,
             &model,
-            Some(&system_prompt),
+            &system_prompt_inputs,
             thinking,
             reasoning_visibility,
             cancel,
@@ -2204,7 +2204,7 @@ impl GoalIteration for GoalLoopIteration {
         } else {
             (None, vec![])
         };
-        let system_prompt = ff_agent::build_system_prompt(&ff_agent::SystemPromptInputs {
+        let system_prompt_inputs = ff_agent::SystemPromptInputs {
             persona: persona.as_deref(),
             skills: &skills,
             active: &active,
@@ -2214,7 +2214,7 @@ impl GoalIteration for GoalLoopIteration {
             goal: Some(goal),
             mode,
             mcp_guidance: &mcp_guidance,
-        });
+        };
 
         provider.set_context_budget(self.state.served_window(&sid).await.window);
 
@@ -2238,13 +2238,13 @@ impl GoalIteration for GoalLoopIteration {
         let sid_ev = sid.clone();
         let turn_start = std::time::Instant::now();
 
-        let turn = run_turn(
+        let turn = ff_agent::run_session_turn(
             provider.as_ref(),
             self.state.store.as_ref(),
             &tool_ctx,
             &sid,
             &model,
-            Some(&system_prompt),
+            &system_prompt_inputs,
             thinking,
             reasoning_visibility,
             cancel.clone(),
@@ -2560,7 +2560,7 @@ impl ff_scheduled::TaskRunner for DesktopTaskRunner {
         } else {
             (None, vec![])
         };
-        let system_prompt = ff_agent::build_system_prompt(&ff_agent::SystemPromptInputs {
+        let system_prompt_inputs = ff_agent::SystemPromptInputs {
             persona: pheno.persona.as_deref(),
             skills: &skills,
             active: &active,
@@ -2570,7 +2570,7 @@ impl ff_scheduled::TaskRunner for DesktopTaskRunner {
             goal: None,
             mode,
             mcp_guidance: &mcp_guidance,
-        });
+        };
 
         // Prime the compaction budget against the served context window (#612),
         // mirroring the interactive `send_message` path; Ollama uses the cached
@@ -2582,13 +2582,13 @@ impl ff_scheduled::TaskRunner for DesktopTaskRunner {
         let reasoning_visibility = self.state.provider_config().reasoning_visibility;
         let app = self.app.clone();
         let sid_for_events = sid.clone();
-        let turn = run_turn(
+        let turn = ff_agent::run_session_turn(
             provider.as_ref(),
             self.state.store.as_ref(),
             &tool_ctx,
             &sid,
             &model,
-            Some(&system_prompt),
+            &system_prompt_inputs,
             thinking,
             reasoning_visibility,
             cancel.clone(),
