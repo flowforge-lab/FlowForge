@@ -1,5 +1,7 @@
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use ff_agent::{run_turn, AgentEvent, Approver, CancelToken, SystemPrompt, ToolContext};
 use ff_core::ReasoningVisibility;
@@ -12,6 +14,16 @@ use tracing::{debug, info, warn};
 use crate::channel_map::ChannelMap;
 use crate::transport::MessageTransport;
 use crate::types::{ChannelId, Notification};
+
+/// How often the per-turn flusher copies the accumulated token buffer to the
+/// response stream while the model is still generating.
+///
+/// This is intentionally *coarser* than the transport's own throttle (Slack's
+/// `EDIT_THROTTLE` is 500ms): the flusher only decides *when to offer* the
+/// latest text, and the stream coalesces what lands inside its window and skips
+/// unchanged bodies. Per-token delivery would be O(n²) in clones for a long
+/// turn; one copy every cadence is the cheap middle ground.
+const STREAM_FLUSH_INTERVAL: Duration = Duration::from_millis(250);
 
 /// A coarse label for a failed turn, safe to record without being asked.
 ///
@@ -139,6 +151,57 @@ impl Router {
             tools.mode = self.config.mode;
             tools.egress = self.config.egress;
 
+            // The sync callback cannot await (deadlock starves the provider
+            // stream), so token deltas accumulate in a shared buffer while a
+            // background flusher task copies it to the response stream on a
+            // cadence — RFC 0021 §5.1 streaming edits, not a single end-of-turn
+            // post. The flusher owns the stream, so it also owns the guaranteed
+            // final flush + `finish`, and is joined before the loop continues.
+            let token_buf = Arc::new(Mutex::new(String::new()));
+            let turn_done = Arc::new(AtomicBool::new(false));
+            let flusher_buf = Arc::clone(&token_buf);
+            let flusher_done = Arc::clone(&turn_done);
+            let flusher = tokio::spawn(async move {
+                let mut interval = tokio::time::interval(STREAM_FLUSH_INTERVAL);
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    interval.tick().await;
+                    let text = flusher_buf.lock().unwrap().clone();
+                    if !text.is_empty() {
+                        stream.chunk(&text).await;
+                    }
+                    if flusher_done.load(Ordering::SeqCst) {
+                        break;
+                    }
+                }
+                // One final copy of the complete buffer, then finish. Without
+                // it, the last tokens (appended after the flusher's final tick)
+                // would be dropped: `finish` only flushes whatever the stream
+                // last saw.
+                let text = flusher_buf.lock().unwrap().clone();
+                if !text.is_empty() {
+                    stream.chunk(&text).await;
+                }
+                stream.finish().await;
+            });
+
+            // If *this* turn's future is dropped instead of run to completion
+            // (a test timing out mid-turn, a host aborting), the flusher task
+            // above would otherwise leak and spin on its interval forever.
+            // Bind its lifetime to this scope, and disarm the abort before the
+            // cooperative join below takes over.
+            struct AbortOnDrop {
+                handle: tokio::task::AbortHandle,
+            }
+            impl Drop for AbortOnDrop {
+                fn drop(&mut self) {
+                    self.handle.abort();
+                }
+            }
+            let _flusher_guard = AbortOnDrop {
+                handle: flusher.abort_handle(),
+            };
+
             let cancel = CancelToken::new();
             // NOTE: volatile tail (cwd, time, ambient context) is not populated
             // here — matches CLI one-shot behavior. Long-lived messaging sessions
@@ -150,11 +213,9 @@ impl Router {
             });
             let system_prompt_ref = system_prompt.as_ref();
 
-            // Buffer token deltas in the sync callback, flush async after the
-            // turn completes. This avoids `Handle::block_on` inside the closure
-            // which deadlocks on current_thread runtimes and starves workers on
-            // multi_thread runtimes (#1 fix).
-            let mut token_buf = String::new();
+            // Buffer token deltas in the sync callback; the flusher task above is
+            // what actually streams them to the transport.
+            let token_cb = Arc::clone(&token_buf);
 
             // Run the agent turn.
             let result = run_turn(
@@ -169,7 +230,7 @@ impl Router {
                 cancel,
                 |event| match &event {
                     AgentEvent::Token { delta, .. } => {
-                        token_buf.push_str(delta);
+                        token_cb.lock().unwrap().push_str(delta);
                     }
                     AgentEvent::ToolCallStarted { name, .. } => {
                         transport.notify(&channel, Notification::ToolCall { name: name.clone() });
@@ -182,11 +243,12 @@ impl Router {
             )
             .await;
 
-            // Flush buffered tokens to the response stream.
-            if !token_buf.is_empty() {
-                stream.chunk(&token_buf).await;
-            }
-            stream.finish().await;
+            // Stop the flusher and wait for it to drain + finish the stream.
+            turn_done.store(true, Ordering::SeqCst);
+            // Disarm: `forget`, not `drop` — dropping the guard would abort the
+            // flusher, which is exactly what the normal join path must not do.
+            std::mem::forget(_flusher_guard);
+            flusher.await.expect("stream flusher task panicked");
             transport.notify(&channel, Notification::TurnFinished);
 
             match result {

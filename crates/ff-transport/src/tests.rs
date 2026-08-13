@@ -11,6 +11,7 @@ use ff_tools::{Safety, ToolRegistry};
 use futures_util::StreamExt;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use tempfile::TempDir;
 
 // ── MessagingApprover ────────────────────────────────────────────────────────
@@ -360,4 +361,109 @@ async fn shutdown_lets_an_in_flight_message_finish() {
         "the buffered message must still be processed; shutdown closes the inbound \
          side, it does not discard what was already accepted"
     );
+}
+
+// ── mid-turn streaming (#912 T6 AC4, RFC 0021 §5.1) ──────────────────────────
+
+/// Emits three text deltas roughly `PACED_STEP` apart. With the Router's
+/// per-turn flusher (`STREAM_FLUSH_INTERVAL`, 250ms) this is slow enough that an
+/// intermediate body is always flushed between tokens, so `MockResponseStream`
+/// records the accumulating text — not just one end-of-turn post.
+const PACED_DELTAS: [&str; 3] = ["alpha ", "beta ", "gamma"];
+const PACED_STEP: Duration = Duration::from_millis(350);
+
+struct PacedTextProvider;
+
+#[async_trait::async_trait]
+impl Provider for PacedTextProvider {
+    async fn chat_stream(&self, _req: ChatRequest) -> Result<ChunkStream, LlmError> {
+        Ok(futures_util::stream::unfold(0usize, |i| async move {
+            if i >= PACED_DELTAS.len() {
+                return None;
+            }
+            tokio::time::sleep(PACED_STEP).await;
+            let chunk = Chunk {
+                delta: PACED_DELTAS[i].to_string(),
+                ..Default::default()
+            };
+            Some((Ok(chunk), i + 1))
+        })
+        .boxed())
+    }
+}
+
+/// The acceptance that made mid-turn streaming a router responsibility rather
+/// than a dead end: before this change the Router buffered every delta and
+/// called `chunk` exactly once after `run_turn`, so the *transport's* 500ms edit
+/// throttle could never observe anything to throttle. One message must now open
+/// a stream whose recorded chunks are the full text so far, monotonically
+/// growing, ending at the complete reply.
+#[tokio::test]
+async fn stream_flusher_edits_accumulate_during_the_turn() {
+    let dir = TempDir::new().unwrap();
+    let config = RouterConfig {
+        mode: Mode::Act,
+        workspace: dir.path().to_path_buf(),
+        ..Default::default()
+    };
+    let store = Arc::new(SessionStore::new());
+    let registry = Arc::new(ToolRegistry::with_defaults());
+    let mut router = Router::new(
+        config,
+        ChannelMap::new(),
+        store,
+        registry,
+        Arc::new(PacedTextProvider),
+    );
+
+    let mut transport = crate::MockTransport::new("mock");
+    let tx = transport.sender();
+    let handle = transport.shutdown_handle();
+    tx.send(InboundMessage {
+        channel: ChannelId::new("mock", "ch1"),
+        sender_id: "u1".into(),
+        text: "go".into(),
+        timestamp: 0,
+        reply_thread: None,
+    })
+    .unwrap();
+    // Release the test's sender clone; `handle.shutdown()` then lets the mock
+    // drop its internal sender, so the inbound channel closes once the buffered
+    // message is drained and `Router::run` returns on its own.
+    drop(tx);
+    handle.shutdown();
+
+    let approver = crate::approver::MessagingApprover::new(Mode::Act);
+    router.run(&mut transport, &approver).await;
+
+    let responses = transport.responses();
+    assert_eq!(
+        responses.len(),
+        1,
+        "one turn must open exactly one response"
+    );
+    let rec = &responses[0];
+    assert!(rec.finished, "the stream must be finished");
+    let chunks = &rec.chunks;
+
+    let full: String = PACED_DELTAS.concat();
+    assert_eq!(
+        chunks.last().map(String::as_str),
+        Some(full.as_str()),
+        "the final chunk must be the complete reply"
+    );
+    assert!(
+        chunks.len() >= 2,
+        "the turn must stream at least one intermediate edit, got {chunks:?}"
+    );
+    assert!(
+        chunks[0].len() < full.len(),
+        "the first chunk must be a strict prefix, i.e. a real intermediate edit: {chunks:?}"
+    );
+    for pair in chunks.windows(2) {
+        assert!(
+            pair[1].starts_with(&pair[0]),
+            "each chunk supersedes the previous one: {chunks:?}"
+        );
+    }
 }

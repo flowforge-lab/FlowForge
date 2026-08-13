@@ -53,3 +53,5 @@ keyring = { version = "3", features = ["sync-secret-service", "crypto-rust"] }
 [dev-dependencies]
 tempfile = { workspace = true }
 wiremock = { workspace = true }
+# Server side of the Socket Mode handshake, for the booted mock Slack (#1061 T6).
+tokio-tungstenite = { workspace = true }
