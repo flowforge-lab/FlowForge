@@ -27,7 +27,7 @@ use std::io::{BufRead, Write};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use ff_agent::{run_turn, AgentEvent, CancelToken, ToolContext, UserContext};
+use ff_agent::{run_session_turn, AgentEvent, CancelToken, ToolContext, UserContext};
 use ff_core::{Mode, PermissionMatrix, ReasoningVisibility, Role};
 
 use crate::approver::{ApprovalMode, CliApprover};
@@ -728,7 +728,7 @@ async fn run(
         Some(idx) => memory_store.ambient_block_filtered_keyed(idx.as_ref()),
         None => (memory_store.ambient_block(), Vec::new()),
     };
-    let system_prompt = ff_agent::build_system_prompt(&ff_agent::SystemPromptInputs {
+    let system_prompt_inputs = ff_agent::SystemPromptInputs {
         persona: inputs.persona.as_deref(),
         skills: &skills,
         active: &inputs.active,
@@ -738,7 +738,7 @@ async fn run(
         goal: None,
         mode,
         mcp_guidance: &mcp_guidance,
-    });
+    };
 
     let matrix = PermissionMatrix::default();
     let mut tool_ctx = ToolContext::new(
@@ -763,13 +763,13 @@ async fn run(
     });
 
     let result = if json {
-        run_turn(
+        run_session_turn(
             provider.as_ref(),
             &store,
             &tool_ctx,
             &session.id,
             &inputs.model,
-            Some(&system_prompt),
+            &system_prompt_inputs,
             true,
             ReasoningVisibility::All,
             cancel,
@@ -779,13 +779,13 @@ async fn run(
         )
         .await
     } else {
-        run_turn(
+        run_session_turn(
             provider.as_ref(),
             &store,
             &tool_ctx,
             &session.id,
             &inputs.model,
-            Some(&system_prompt),
+            &system_prompt_inputs,
             true,
             ReasoningVisibility::All,
             cancel,
@@ -993,7 +993,7 @@ async fn chat_repl(
             Some(idx) => memory_store.ambient_block_filtered_keyed(idx.as_ref()),
             None => (memory_store.ambient_block(), Vec::new()),
         };
-        let system_prompt = ff_agent::build_system_prompt(&ff_agent::SystemPromptInputs {
+        let system_prompt_inputs = ff_agent::SystemPromptInputs {
             persona: turn.persona.as_deref(),
             skills,
             active: &turn.active,
@@ -1003,7 +1003,7 @@ async fn chat_repl(
             goal: None,
             mode,
             mcp_guidance,
-        });
+        };
 
         let cancel = CancelToken::new();
         let cancel_signal = cancel.clone();
@@ -1014,13 +1014,13 @@ async fn chat_repl(
         });
 
         let result = if json {
-            run_turn(
+            run_session_turn(
                 provider,
                 store,
                 tool_ctx,
                 session_id,
                 &turn.model,
-                Some(&system_prompt),
+                &system_prompt_inputs,
                 true,
                 ReasoningVisibility::All,
                 cancel,
@@ -1028,13 +1028,13 @@ async fn chat_repl(
             )
             .await
         } else {
-            run_turn(
+            run_session_turn(
                 provider,
                 store,
                 tool_ctx,
                 session_id,
                 &turn.model,
-                Some(&system_prompt),
+                &system_prompt_inputs,
                 true,
                 ReasoningVisibility::All,
                 cancel,

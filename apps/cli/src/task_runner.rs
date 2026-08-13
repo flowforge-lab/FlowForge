@@ -2,7 +2,7 @@ use std::io::Write;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use ff_agent::{run_turn, AgentEvent, CancelToken, ToolContext, UserContext};
+use ff_agent::{run_session_turn, AgentEvent, CancelToken, ToolContext, UserContext};
 use ff_core::{PermissionMatrix, ReasoningVisibility, Role, RunStatus, ScheduledTask};
 use ff_llm::Provider;
 use ff_scheduled::{RunOutcome, TaskRunner};
@@ -79,7 +79,7 @@ impl TaskRunner for CliTaskRunner {
             None => (memory_store.ambient_block(), Vec::new()),
         };
 
-        let system_prompt = ff_agent::build_system_prompt(&ff_agent::SystemPromptInputs {
+        let system_prompt_inputs = ff_agent::SystemPromptInputs {
             persona: None,
             skills: &host::load_skills(),
             active: &[],
@@ -89,17 +89,17 @@ impl TaskRunner for CliTaskRunner {
             goal: None,
             mode: ff_core::Mode::Auto,
             mcp_guidance: &self.mcp_guidance,
-        });
+        };
 
         let cancel = CancelToken::new();
 
-        let result = run_turn(
+        let result = run_session_turn(
             self.provider.as_ref(),
             &self.session_store,
             &tool_ctx,
             &session.id,
             &self.default_model,
-            Some(&system_prompt),
+            &system_prompt_inputs,
             true,
             ReasoningVisibility::All,
             cancel,
