@@ -79,6 +79,14 @@ Fall back to shell only when the tool genuinely cannot do it:
   characters in tracked source — a stray one makes git treat the file as binary
   and hides the change from review entirely (#1185). Runs in CI, takes ~0.2s.
 
+## Anti-over-engineering
+
+Match the change to the problem: the smallest diff that solves it, trusting the
+type-system and framework guarantees you already have. The principle and its
+precedents live in `PRINCIPLES.md` Pillar 4 ("Match the change to the problem"),
+alongside "Find it before you write it" — this is a philosophy tenet, not a
+local-environment trap, so it is stated there rather than duplicated here.
+
 ## PR discipline
 
 - **Rebase onto latest `main` before enabling auto-merge / squash-merge.**
