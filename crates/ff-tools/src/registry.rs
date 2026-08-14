@@ -1372,12 +1372,63 @@ mod tests {
             );
         }
 
-        // git is all-read, so every action survives and no entry is emitted at all —
-        // an unpruned tool must not pay a pruning code path.
-        assert!(
-            !scope.contains_key("git"),
-            "git's four actions are all ReadOnly; it needs no scope entry"
-        );
+        // git is now mixed-safety (#1254): its reads survive Plan but the writes
+        // (branch, commit) are Plan×Write=Deny, so it gets a scope entry keeping
+        // only the reads.
+        let git = scope
+            .get("git")
+            .expect("git is scoped in Plan (writes pruned)");
+        for kept in ["status", "diff", "log", "show"] {
+            assert!(git.contains(kept), "Plan must keep the git read {kept:?}");
+        }
+        for dropped in ["branch", "commit"] {
+            assert!(
+                !git.contains(dropped),
+                "Plan refuses git {dropped:?} when called, so it must not be advertised"
+            );
+        }
+    }
+
+    #[test]
+    fn git_write_actions_are_gated_at_call_time() {
+        // Finding 2 (#1258 review): the advertisement-pruning tests above check
+        // what the model *sees*; this checks the actual control — the per-call
+        // gate the executor consults. It must DENY git's writes in Plan and ALLOW
+        // them in Act/Auto, keyed on the same safety() the runtime passes.
+        let reg = ToolRegistry::with_defaults();
+        let matrix = PermissionMatrix::default();
+        let git = reg
+            .iter_tools()
+            .find(|t| t.name() == "git")
+            .expect("git tool registered");
+
+        for write in ["branch", "commit"] {
+            let args = serde_json::json!({ "action": write });
+            let safety = git.safety(&args);
+            assert_eq!(safety, Safety::Write, "{write} must be Write");
+            assert!(
+                matrix.effective_cell("git", Mode::Plan, safety).is_deny(),
+                "Plan must DENY the git write {write:?} at call time"
+            );
+            assert!(
+                !matrix.effective_cell("git", Mode::Act, safety).is_deny(),
+                "Act must allow the git write {write:?}"
+            );
+            assert!(
+                !matrix.effective_cell("git", Mode::Auto, safety).is_deny(),
+                "Auto must allow the git write {write:?} (matrix Write col = Allow)"
+            );
+        }
+
+        // Reads stay allowed everywhere, including Plan.
+        for read in ["status", "diff", "log", "show"] {
+            let safety = git.safety(&serde_json::json!({ "action": read }));
+            assert_eq!(safety, Safety::ReadOnly);
+            assert!(
+                !matrix.effective_cell("git", Mode::Plan, safety).is_deny(),
+                "Plan must allow the git read {read:?}"
+            );
+        }
     }
 
     #[test]
@@ -1446,10 +1497,13 @@ mod tests {
              ({full} -> {pruned} B)"
         );
 
-        // Three of the four are scoped in Plan; git is all-ReadOnly so it keeps
-        // everything and must not appear.
+        // All four dispatch tools are scoped in Plan: github, git (#1254 — its
+        // branch/commit writes are pruned, reads kept), and the two supervisors.
         let mut scoped: Vec<&str> = scope.keys().map(String::as_str).collect();
         scoped.sort_unstable();
-        assert_eq!(scoped, ["github", "notebook_runner", "process_manager"]);
+        assert_eq!(
+            scoped,
+            ["git", "github", "notebook_runner", "process_manager"]
+        );
     }
 }

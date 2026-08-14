@@ -1,20 +1,33 @@
-//! Structured read-only git queries (#855). Exposes `status`, `diff`, `log`,
-//! and `show` as structured, token-efficient results. All actions are ReadOnly,
-//! so this tool is available in Plan mode.
+//! Structured git tool (#855). Exposes the read queries `status`, `diff`, `log`,
+//! and `show` as structured, token-efficient results, plus the local-write
+//! actions `branch` and `commit` (#1254). Safety is per-action: the reads are
+//! ReadOnly (available in Plan mode); the writes are Write. `min_safety` stays
+//! ReadOnly so the tool is still advertised in Plan — the write actions are then
+//! refused at invocation time by the Plan×Write=Deny gate, exactly as the github
+//! tool handles its mutating actions.
 
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use serde_json::Value;
 use tokio::process::Command;
+use tokio::time::timeout;
 
+use crate::jail::resolve_in_root;
 use crate::registry::{Safety, Tool, ToolOutcome};
 
 /// Max lines of unified diff output before truncation.
 const MAX_DIFF_LINES: usize = 500;
 /// Default number of log entries.
 const DEFAULT_LOG_LIMIT: u32 = 10;
+/// Wall-clock budget for a mutating git command (#1258 review, finding 4).
+/// `commit` runs user-controlled `pre-commit`/`commit-msg` hooks and can invoke
+/// gpg-agent pinentry; a blocking hook or a tty-less pinentry would otherwise
+/// hang the tool forever. `GIT_TERMINAL_PROMPT=0` stops git's own prompts but
+/// neither of those. 30s is generous for a local commit yet bounds a hang.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Validate a user-supplied revision before it is handed to git. A revision is
 /// never a legitimate option, so reject anything that could be parsed as one:
@@ -53,10 +66,13 @@ impl Tool for GitTool {
     }
 
     fn description(&self) -> &str {
-        "Read-only git queries with structured output. Actions: status (branch + \
-         staged/modified/untracked), diff (stat or unified with line cap), log \
-         (structured commits), show (single commit). All read-only — available in \
-         Plan mode. For mutations (commit, push, rebase) use bash or github tool."
+        "Read/write git tool with structured output. Read actions: status \
+         (branch + staged/modified/untracked), diff (stat or unified with line \
+         cap), log (structured commits), show (single commit) — all ReadOnly, \
+         available in Plan mode. Write actions: branch (create + switch to a new \
+         branch), commit (stage all changes — or only an explicit `paths` set — \
+         and commit) — Write, gated outside \
+         Plan. For push/rebase use the github tool or bash."
     }
 
     fn parameters(&self) -> Value {
@@ -65,8 +81,8 @@ impl Tool for GitTool {
             "properties": {
                 "action": {
                     "type": "string",
-                    "description": "The query to run.",
-                    "enum": ["status", "diff", "log", "show"]
+                    "description": "The git action to run.",
+                    "enum": ["status", "diff", "log", "show", "branch", "commit"]
                 },
                 "stat": {
                     "type": "boolean",
@@ -87,6 +103,19 @@ impl Tool for GitTool {
                 "n": {
                     "type": "integer",
                     "description": "For log: max number of entries (default 10, max 50)."
+                },
+                "name": {
+                    "type": "string",
+                    "description": "For branch: the new branch name to create and switch to. Fails if it already exists."
+                },
+                "message": {
+                    "type": "string",
+                    "description": "For commit: the commit message. Without 'paths', stages all changes (tracked and untracked) before committing."
+                },
+                "paths": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "For commit (optional): stage only these paths instead of all changes. Omit to stage the entire working tree."
                 }
             },
             "required": ["action"]
@@ -108,17 +137,31 @@ impl Tool for GitTool {
             ("diff", &["ref", "staged", "stat", "path"][..]),
             ("log", &["n", "path"][..]),
             ("show", &["ref"][..]),
+            ("branch", &["name"][..]),
+            ("commit", &["message", "paths"][..]),
         ]))
     }
 
-    fn safety(&self, _args: &Value) -> Safety {
-        Safety::ReadOnly
+    /// Per-action safety (#1254). A **read whitelist**: only the four known read
+    /// actions are ReadOnly; everything else — the writes, and any future or
+    /// unrecognized action — is Write. This fails *closed*, matching the github
+    /// and bash tools (a misclassified action is over-gated, never under-gated).
+    /// `every_action_has_intentional_safety` pins the whitelist to the action set
+    /// so a new read added without updating it is caught (over-gated, but loudly).
+    fn safety(&self, args: &Value) -> Safety {
+        match args.get("action").and_then(|a| a.as_str()) {
+            Some("status" | "diff" | "log" | "show") => Safety::ReadOnly,
+            _ => Safety::Write,
+        }
     }
 
     fn max_safety(&self) -> Safety {
-        Safety::ReadOnly
+        Safety::Write
     }
 
+    /// Stays ReadOnly even though writes exist: this is what keeps the tool
+    /// advertised in Plan mode (advertising keys on `min_safety == ReadOnly`).
+    /// The write actions are then refused at call time by Plan×Write=Deny.
     fn min_safety(&self) -> Safety {
         Safety::ReadOnly
     }
@@ -134,6 +177,8 @@ impl Tool for GitTool {
             "diff" => git_diff(&args, root).await,
             "log" => git_log(&args, root).await,
             "show" => git_show(&args, root).await,
+            "branch" => git_branch(&args, root).await,
+            "commit" => git_commit(&args, root).await,
             _ => ToolOutcome::error(format!("unknown action: {action}")),
         }
     }
@@ -429,6 +474,92 @@ async fn git_show(args: &Value, root: &Path) -> ToolOutcome {
     ToolOutcome::ok(result)
 }
 
+// ─── branch ──────────────────────────────────────────────────────────────────
+
+async fn git_branch(args: &Value, root: &Path) -> ToolOutcome {
+    let name = match args.get("name").and_then(|v| v.as_str()) {
+        Some(n) if !n.trim().is_empty() => n.trim(),
+        _ => return ToolOutcome::error("branch requires a non-empty 'name'"),
+    };
+    // `switch -c` creates and switches in one step, failing if the branch already
+    // exists (unlike `switch -C`, which would silently reset it).
+    match run_git_write(root, &["switch", "-c", name]).await {
+        Ok(_) => ToolOutcome::ok(format!("Created and switched to branch '{name}'.")),
+        Err(e) => e,
+    }
+}
+
+// ─── commit ──────────────────────────────────────────────────────────────────
+
+async fn git_commit(args: &Value, root: &Path) -> ToolOutcome {
+    let message = match args.get("message").and_then(|v| v.as_str()) {
+        Some(m) if !m.trim().is_empty() => m.trim(),
+        _ => return ToolOutcome::error("commit requires a non-empty 'message'"),
+    };
+
+    // Staging is explicit-or-all (#1255 B): `paths` stages exactly those entries;
+    // omitting it falls back to `add -A` (stage the whole working tree). The
+    // explicit form lets a caller avoid sweeping in unrelated WIP.
+    let paths: Vec<String> = args
+        .get("paths")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|p| p.as_str())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let stage_result = if paths.is_empty() {
+        run_git_write(root, &["add", "-A"]).await
+    } else {
+        // Jail every entry to `root` (CONTRIBUTING §3): commit is a Write that
+        // Auto allows without a prompt, so a `../` traversal must not stage/commit
+        // outside the workspace when `root` is a repo subdirectory. resolve_in_root
+        // returns an absolute, canonical in-root path, safe to pass to `git add`.
+        let mut resolved = Vec::with_capacity(paths.len());
+        for p in &paths {
+            match resolve_in_root(root, p) {
+                Ok(abs) => resolved.push(abs.to_string_lossy().into_owned()),
+                Err(e) => return ToolOutcome::error(e),
+            }
+        }
+        let mut add_args = vec!["add", "--"];
+        add_args.extend(resolved.iter().map(String::as_str));
+        run_git_write(root, &add_args).await
+    };
+    if let Err(e) = stage_result {
+        return e;
+    }
+
+    // Report exactly what was staged so the user/model can see the commit's scope
+    // (addresses the "add -A silently sweeps unrelated changes" concern).
+    let staged = match run_git_write(root, &["diff", "--cached", "--name-only"]).await {
+        Ok(out) => out.lines().map(str::to_string).collect::<Vec<_>>(),
+        Err(e) => return e,
+    };
+    if staged.is_empty() {
+        return ToolOutcome::error(
+            "nothing to commit: no changes staged (working tree clean or paths matched nothing)",
+        );
+    }
+
+    match run_git_write(root, &["commit", "-m", message]).await {
+        Ok(out) => {
+            let summary = out.lines().next().unwrap_or("").trim();
+            let files = staged.join("\n  ");
+            let header = if summary.is_empty() {
+                format!("Committed {} file(s):", staged.len())
+            } else {
+                format!("Committed {} file(s) — {summary}", staged.len())
+            };
+            ToolOutcome::ok(format!("{header}\n  {files}"))
+        }
+        Err(e) => e,
+    }
+}
+
 // ─── helpers ─────────────────────────────────────────────────────────────────
 
 async fn run_git(root: &Path, args: &[&str]) -> Result<String, ToolOutcome> {
@@ -467,6 +598,51 @@ async fn run_git(root: &Path, args: &[&str]) -> Result<String, ToolOutcome> {
             )));
         }
         return Ok(String::from_utf8_lossy(&output.stdout).to_string());
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+/// Strict variant of `run_git` for mutating commands (#1254): any non-zero exit
+/// is a real failure. `run_git` deliberately tolerates non-zero exits with output
+/// (e.g. `git diff` signalling changes) — correct for reads, but for a write a
+/// non-zero exit means the mutation did not happen and must surface as an error.
+async fn run_git_write(root: &Path, args: &[&str]) -> Result<String, ToolOutcome> {
+    let child = Command::new("git")
+        .args(args)
+        .current_dir(root)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("LC_ALL", "C")
+        // If the timeout fires, the child future is dropped; kill_on_drop then
+        // reaps the hung process (blocking hook / pinentry) instead of leaking it.
+        .kill_on_drop(true)
+        .output();
+
+    let output = match timeout(WRITE_TIMEOUT, child).await {
+        Ok(Ok(o)) => o,
+        Ok(Err(e)) => return Err(ToolOutcome::error(format!("failed to run git: {e}"))),
+        Err(_) => {
+            return Err(ToolOutcome::error(format!(
+                "git {} timed out after {}s — a pre-commit/commit-msg hook or gpg \
+                 pinentry may be blocking. Resolve the hook or disable signing and retry.",
+                args.first().unwrap_or(&""),
+                WRITE_TIMEOUT.as_secs()
+            )));
+        }
+    };
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let detail = if stderr.trim().is_empty() {
+            stdout.trim()
+        } else {
+            stderr.trim()
+        };
+        return Err(ToolOutcome::error(format!(
+            "git {} failed: {detail}",
+            args.first().unwrap_or(&"")
+        )));
     }
 
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
@@ -531,26 +707,70 @@ mod tests {
     }
 
     #[test]
-    fn safety_always_readonly() {
+    fn safety_is_per_action() {
         let tool = GitTool;
-        assert_eq!(
-            tool.safety(&serde_json::json!({"action": "status"})),
-            Safety::ReadOnly
-        );
-        assert_eq!(
-            tool.safety(&serde_json::json!({"action": "diff"})),
-            Safety::ReadOnly
-        );
-        assert_eq!(
-            tool.safety(&serde_json::json!({"action": "log"})),
-            Safety::ReadOnly
-        );
-        assert_eq!(
-            tool.safety(&serde_json::json!({"action": "show"})),
-            Safety::ReadOnly
-        );
-        assert_eq!(tool.max_safety(), Safety::ReadOnly);
+        for read in ["status", "diff", "log", "show"] {
+            assert_eq!(
+                tool.safety(&serde_json::json!({ "action": read })),
+                Safety::ReadOnly,
+                "{read} should be ReadOnly"
+            );
+        }
+        for write in ["branch", "commit"] {
+            assert_eq!(
+                tool.safety(&serde_json::json!({ "action": write })),
+                Safety::Write,
+                "{write} should be Write"
+            );
+        }
+        // max rises to Write (the tool can mutate), but min stays ReadOnly so the
+        // tool is still advertised in Plan — writes are refused at call time.
+        assert_eq!(tool.max_safety(), Safety::Write);
         assert_eq!(tool.min_safety(), Safety::ReadOnly);
+        // Fail closed: an unrecognized/absent action is Write, not ReadOnly, so a
+        // future action can never accidentally slip through as auto-approved.
+        assert_eq!(
+            tool.safety(&serde_json::json!({ "action": "push" })),
+            Safety::Write,
+            "unknown action must fail closed to Write"
+        );
+        assert_eq!(
+            tool.safety(&serde_json::json!({})),
+            Safety::Write,
+            "missing action must fail closed to Write"
+        );
+    }
+
+    #[test]
+    fn every_action_has_intentional_safety() {
+        // Binds the safety() read-whitelist to the advertised action *enum* itself
+        // (not a hardcoded copy): every action the schema offers must be classified,
+        // and the writes must be Write. Add an action to the enum without teaching
+        // safety() about it and this fails — a read would be over-gated as Write
+        // (loud), which is the drift the test exists to catch.
+        let tool = GitTool;
+        let writes = ["branch", "commit"];
+        let schema = tool.parameters();
+        let actions = schema["properties"]["action"]["enum"]
+            .as_array()
+            .expect("action enum present in schema");
+        assert!(
+            !actions.is_empty(),
+            "schema must advertise at least one action"
+        );
+        for action in actions {
+            let action = action.as_str().expect("action enum entries are strings");
+            let got = tool.safety(&serde_json::json!({ "action": action }));
+            let want = if writes.contains(&action) {
+                Safety::Write
+            } else {
+                Safety::ReadOnly
+            };
+            assert_eq!(
+                got, want,
+                "{action} classified as {got:?}, expected {want:?}"
+            );
+        }
     }
 
     #[test]
@@ -645,6 +865,151 @@ mod tests {
         let args = serde_json::json!({"action": "diff", "stat": true});
         let result = git_diff(&args, repo.path()).await;
         assert!(result.success, "git diff --stat failed: {}", result.content);
+    }
+
+    #[tokio::test]
+    async fn integration_branch_creates_and_switches() {
+        let repo = init_temp_repo();
+        let args = serde_json::json!({"action": "branch", "name": "feature/x"});
+        let result = git_branch(&args, repo.path()).await;
+        assert!(result.success, "git branch failed: {}", result.content);
+        // HEAD is now on the new branch.
+        let head = git_status(repo.path()).await;
+        assert!(
+            head.content.contains("feature/x"),
+            "expected HEAD on feature/x, got: {}",
+            head.content
+        );
+    }
+
+    #[tokio::test]
+    async fn integration_branch_rejects_existing() {
+        let repo = init_temp_repo();
+        let args = serde_json::json!({"action": "branch", "name": "dup"});
+        assert!(git_branch(&args, repo.path()).await.success);
+        // `switch -c dup` fails when `dup` already exists, regardless of the
+        // branch currently checked out — so a repeat create is a clean rejection.
+        let second = git_branch(&args, repo.path()).await;
+        assert!(!second.success, "creating an existing branch should fail");
+    }
+
+    #[tokio::test]
+    async fn integration_branch_requires_name() {
+        let repo = init_temp_repo();
+        let result = git_branch(&serde_json::json!({"action": "branch"}), repo.path()).await;
+        assert!(!result.success);
+        assert!(result.content.contains("name"));
+    }
+
+    #[tokio::test]
+    async fn integration_commit_stages_all_changes() {
+        let repo = init_temp_repo();
+        // A tracked edit + a brand-new untracked file: `add -A` must stage both.
+        std::fs::write(repo.path().join("README.md"), "hello world\n").unwrap();
+        std::fs::write(repo.path().join("new.txt"), "fresh\n").unwrap();
+        let args = serde_json::json!({"action": "commit", "message": "capture work"});
+        let result = git_commit(&args, repo.path()).await;
+        assert!(result.success, "git commit failed: {}", result.content);
+        // The outcome names exactly what was staged (both files).
+        assert!(
+            result.content.contains("README.md") && result.content.contains("new.txt"),
+            "commit outcome should list both staged files, got: {}",
+            result.content
+        );
+        // The new commit exists at HEAD with our message (direct, not a negation).
+        let log = git_log(&serde_json::json!({"action": "log", "n": 1}), repo.path()).await;
+        assert!(log.success);
+        assert!(
+            log.content.contains("capture work"),
+            "HEAD commit should carry the message, got: {}",
+            log.content
+        );
+    }
+
+    #[tokio::test]
+    async fn integration_commit_paths_stages_only_listed() {
+        let repo = init_temp_repo();
+        std::fs::write(repo.path().join("wanted.txt"), "in\n").unwrap();
+        std::fs::write(repo.path().join("unrelated.txt"), "out\n").unwrap();
+        let args = serde_json::json!({
+            "action": "commit",
+            "message": "scoped",
+            "paths": ["wanted.txt"],
+        });
+        let result = git_commit(&args, repo.path()).await;
+        assert!(result.success, "scoped commit failed: {}", result.content);
+        assert!(
+            result.content.contains("wanted.txt") && !result.content.contains("unrelated.txt"),
+            "only wanted.txt should be staged/reported, got: {}",
+            result.content
+        );
+        // unrelated.txt is still untracked (was never staged).
+        let status = git_status(repo.path()).await;
+        assert!(
+            status.content.contains("unrelated.txt"),
+            "unrelated.txt should remain uncommitted, got: {}",
+            status.content
+        );
+    }
+
+    #[tokio::test]
+    async fn integration_commit_rejects_empty_stage() {
+        let repo = init_temp_repo();
+        // Clean tree: nothing to stage, so commit must error rather than run git.
+        let result = git_commit(
+            &serde_json::json!({"action": "commit", "message": "noop"}),
+            repo.path(),
+        )
+        .await;
+        assert!(!result.success);
+        assert!(result.content.contains("nothing to commit"));
+    }
+
+    #[tokio::test]
+    async fn integration_commit_paths_rejects_jail_escape() {
+        // CONTRIBUTING §3 jail-escape test. `root` is a subdirectory of the repo;
+        // a `../` path points at a real file inside the repo but *outside* root.
+        // The jail must reject it before anything is staged or committed.
+        let repo = init_temp_repo();
+        std::fs::write(repo.path().join("secret.txt"), "outside\n").unwrap();
+        let sub = repo.path().join("workspace");
+        std::fs::create_dir(&sub).unwrap();
+        std::fs::write(sub.join("mine.txt"), "inside\n").unwrap();
+
+        let result = git_commit(
+            &serde_json::json!({
+                "action": "commit",
+                "message": "escape",
+                "paths": ["../secret.txt"],
+            }),
+            &sub,
+        )
+        .await;
+        assert!(
+            !result.success,
+            "a ../ path must be rejected, got: {}",
+            result.content
+        );
+        assert!(
+            result.content.contains("outside the workspace root"),
+            "error should name the jail violation, got: {}",
+            result.content
+        );
+        // And nothing was committed: HEAD is still the fixture's initial commit.
+        let log = git_log(&serde_json::json!({"action": "log", "n": 5}), &sub).await;
+        assert!(
+            !log.content.contains("escape"),
+            "the rejected commit must not exist, got: {}",
+            log.content
+        );
+    }
+
+    #[tokio::test]
+    async fn integration_commit_requires_message() {
+        let repo = init_temp_repo();
+        let result = git_commit(&serde_json::json!({"action": "commit"}), repo.path()).await;
+        assert!(!result.success);
+        assert!(result.content.contains("message"));
     }
 
     #[tokio::test]
@@ -744,6 +1109,9 @@ mod tests {
             // git_log reads `n` via a multi-line .get() at :313-317.
             ("log", "n"),
             ("log", "path"),
+            // git_branch reads `name`; git_commit reads `message` (#1254).
+            ("branch", "name"),
+            ("commit", "message"),
         ];
         for (action, param) in required {
             let params = declared
