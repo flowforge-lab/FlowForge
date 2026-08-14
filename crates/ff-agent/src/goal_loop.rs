@@ -103,6 +103,77 @@ pub struct LedgerStep {
     pub evidence: Vec<String>,
 }
 
+/// The result of running a goal's `verify_cmd` against a claimed completion
+/// (#684 D3). Distinct from a `run_once` turn: verification is a mechanical,
+/// deterministic gate the loop applies to a `goal_complete` signal, so the
+/// agent's self-declared "done" becomes *proven* done before the loop accepts
+/// it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VerifyOutcome {
+    /// The command exited zero — the completion claim is proven; accept it.
+    Passed,
+    /// The command exited non-zero — the claim is rejected. Carries the
+    /// captured command output verbatim; the loop bounds it via
+    /// [`bound_verify_output`] when it builds the `Drift` ledger entry, then
+    /// feeds that back into the next iteration as evidence.
+    Failed { output: String },
+    /// No verification ran (the goal has no `verify_cmd`, or the host does not
+    /// wire it) — the loop falls back to trusting the claim, as it did pre-D3.
+    Skipped,
+}
+
+/// Run a goal's `verify_cmd` in `workspace` and map the result to a
+/// [`VerifyOutcome`] (#684 D3). Shared by both hosts (CLI + desktop) so the
+/// two cannot drift into different readings of "verified": the command runs
+/// via the platform shell with stdout+stderr merged, a zero exit is
+/// [`VerifyOutcome::Passed`], any non-zero exit (or a spawn failure — a
+/// verifier we could not even run has NOT proven completion) is
+/// [`VerifyOutcome::Failed`] carrying the combined output. A goal with no
+/// `verify_cmd` yields [`VerifyOutcome::Skipped`] without spawning anything.
+pub async fn run_verify_command(goal: &Goal, workspace: &std::path::Path) -> VerifyOutcome {
+    let Some(cmd) = goal.verify_cmd.as_deref().filter(|c| !c.trim().is_empty()) else {
+        return VerifyOutcome::Skipped;
+    };
+
+    #[cfg(windows)]
+    let mut command = {
+        let mut c = tokio::process::Command::new("cmd");
+        c.arg("/C").arg(cmd);
+        c
+    };
+    #[cfg(not(windows))]
+    let mut command = {
+        let mut c = tokio::process::Command::new("sh");
+        c.arg("-c").arg(cmd);
+        c
+    };
+    command.current_dir(workspace);
+
+    match command.output().await {
+        Ok(out) if out.status.success() => VerifyOutcome::Passed,
+        Ok(out) => {
+            let mut combined = String::from_utf8_lossy(&out.stdout).into_owned();
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            if !stderr.trim().is_empty() {
+                if !combined.trim().is_empty() {
+                    combined.push('\n');
+                }
+                combined.push_str(&stderr);
+            }
+            let code = out
+                .status
+                .code()
+                .map_or_else(|| "signal".to_string(), |c| c.to_string());
+            VerifyOutcome::Failed {
+                output: format!("`{cmd}` exited with status {code}:\n{combined}"),
+            }
+        }
+        Err(e) => VerifyOutcome::Failed {
+            output: format!("verify command `{cmd}` could not be run: {e}"),
+        },
+    }
+}
+
 /// One iteration of the goal loop, abstracted so the loop mechanics are testable
 /// without Tauri / a real provider (mirrors `ff-scheduled::TaskRunner`). The
 /// desktop host implements this over `spawn_assistant_turn` / `run_turn`;
@@ -116,6 +187,17 @@ pub trait GoalIteration: Send + Sync {
 
     /// Drive one agent turn toward the objective and report what it consumed.
     async fn run_once(&self, goal: &Goal) -> IterationOutcome;
+
+    /// Verify a claimed completion before the loop accepts it (#684 D3). Called
+    /// only on a `goal_complete` signal, and only when the goal carries a
+    /// `verify_cmd`. The host runs the command and maps its exit status to a
+    /// [`VerifyOutcome`]; the loop — not the host — decides what a failure does
+    /// (record a `Drift` entry and keep iterating). The default returns
+    /// [`VerifyOutcome::Skipped`] so a host that has not wired verification, or a
+    /// goal with no `verify_cmd`, keeps the pre-D3 "trust the claim" behaviour.
+    async fn verify(&self, _goal: &Goal) -> VerifyOutcome {
+        VerifyOutcome::Skipped
+    }
 
     /// Persist the goal at an iteration boundary (post-checkpoint / on stop).
     /// Best-effort: the host logs a failed persist but the loop does not abort —
@@ -312,6 +394,46 @@ fn commit_ledger_steps(goal: &mut Goal, steps: &[LedgerStep], now_ms: i64) {
     }
 }
 
+/// Build the `Drift` ledger entry recorded when a `verify_cmd` rejects a
+/// `goal_complete` claim (#684 D3).
+///
+/// The `claim` is the assertion being tested — the agent's own `goal_complete`
+/// signal that the objective is met — so the ledger reads "claimed complete →
+/// evidence → Drift", the same evidence-first shape as a `goal_step` (#74). The
+/// verdict is [`Verdict::Drift`]: the verify output contradicts that claim. The
+/// status is therefore [`StepStatus::Active`], matching the canonical
+/// verdict→status mapping in [`commit_ledger_steps`] (`Drift` leaves the goal
+/// with unfinished business) rather than a terminal `Blocked`.
+///
+/// The command's output is carried as evidence so #1242's renderer folds it into
+/// the next iteration's prompt, giving the agent the concrete failure to fix. It
+/// is bounded here (durable JSON should not hold a whole test log; the renderer
+/// bounds it again per-item). `created_ms`/`updated_ms` are left `0` because
+/// [`Goal::append_entry`] stamps both from the loop's clock at the call site.
+fn verify_failure_entry(goal: &Goal, output: &str) -> GoalLedgerEntry {
+    GoalLedgerEntry {
+        id: mint_step_id(goal),
+        claim: "goal_complete: the objective is met".to_string(),
+        status: StepStatus::Active,
+        action: None,
+        evidence: vec![bound_verify_output(output)],
+        verdict: Some(Verdict::Drift),
+        next: None,
+        created_ms: 0,
+        updated_ms: 0,
+    }
+}
+
+/// Cap a verify command's captured output before it is stored as ledger
+/// evidence, on a UTF-8 char boundary, appending a marker when clipped. Delegates
+/// to [`crate::system_prompt::clip_evidence_chars`] so the durable-file bound and
+/// #1242's prompt-render bound share one implementation and one marker; only the
+/// budget differs (a verify log may be far larger than a rendered pointer).
+fn bound_verify_output(output: &str) -> String {
+    const MAX_VERIFY_OUTPUT_CHARS: usize = 4000;
+    crate::system_prompt::clip_evidence_chars(output, MAX_VERIFY_OUTPUT_CHARS)
+}
+
 /// Mint a positional `step-N` id that is not already used by an entry in the
 /// ledger. The base is `len + 1` (the natural next slot); it advances past any
 /// collision with an id an earlier step supplied explicitly (#1226).
@@ -414,10 +536,30 @@ pub async fn drive_goal<I: GoalIteration>(goal: &mut Goal, iter: &I) -> LoopStop
         // and only an unrecoverable error FAILS it. Cancel takes precedence over
         // `failed` because an interrupted turn often also surfaces as an error.
         if outcome.goal_complete {
-            goal.status = GoalStatus::Completed;
-            goal.updated_ms = iter.now_ms();
-            iter.save(goal);
-            return LoopStop::Completed;
+            // #684 D3: a `goal_complete` is a *claim*, not proof. When the goal
+            // carries a `verify_cmd`, run it and only accept `Completed` on a
+            // green result. A red result rejects the claim, records a `Drift`
+            // ledger entry whose evidence is the command's output — which
+            // #1242's renderer folds back into the next iteration's prompt — and
+            // falls through so the loop keeps working. `Skipped` (no verify_cmd,
+            // or an unwired host) keeps the pre-D3 "trust the claim" behaviour.
+            match iter.verify(goal).await {
+                VerifyOutcome::Passed | VerifyOutcome::Skipped => {
+                    goal.status = GoalStatus::Completed;
+                    goal.updated_ms = iter.now_ms();
+                    iter.save(goal);
+                    return LoopStop::Completed;
+                }
+                VerifyOutcome::Failed { output } => {
+                    goal.append_entry(verify_failure_entry(goal, &output), iter.now_ms());
+                    // Persist the rejection + checkpoint, then fall through: the
+                    // next pass re-checks budget (a now-exhausted goal ends as
+                    // `Exhausted`, not a silent success) and gives the agent the
+                    // failure output to act on.
+                    iter.save(goal);
+                    continue;
+                }
+            }
         }
         if outcome.cancelled {
             goal.status = GoalStatus::Paused;

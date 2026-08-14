@@ -87,6 +87,7 @@ async fn goal_start(
                 spent: ff_core::GoalSpend::default(),
                 ledger: Vec::new(),
                 pending_steer: None,
+                verify_cmd: None,
                 created_ms: now,
                 updated_ms: now,
             }

@@ -12,7 +12,7 @@ mod tools;
 use async_trait::async_trait;
 use ff_agent::{
     drive_goal, AgentEvent, ApprovalOutcome, Approver, CancelToken, DenyReason, GateDecision,
-    GoalIteration, IterationOutcome, ToolContext,
+    GoalIteration, IterationOutcome, ToolContext, VerifyOutcome,
 };
 use ff_core::events::{
     ApprovalSafety, ConnectionFailedEvent, EgressMismatchEvent, EvolveCostEstimate,
@@ -2122,6 +2122,14 @@ impl GoalIteration for GoalLoopIteration {
         // matrix edit takes effect on the next boundary (#702/#742).
         let mode = self.state.session_mode(&self.session_id);
         goal_gate_for(mode, &self.state.permission_matrix())
+    }
+
+    async fn verify(&self, goal: &Goal) -> VerifyOutcome {
+        // #684 D3: run the goal's verify_cmd against the session's working
+        // directory so a `goal_complete` claim is proven (green) before the loop
+        // accepts it. Uses the shared runner so desktop + CLI cannot diverge.
+        let workspace = self.state.session_root(&self.session_id);
+        ff_agent::run_verify_command(goal, &workspace).await
     }
 
     async fn run_once(&self, goal: &Goal) -> IterationOutcome {

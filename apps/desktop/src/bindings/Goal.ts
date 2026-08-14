@@ -35,4 +35,14 @@ ledger: Array<GoalLedgerEntry>,
  * consumed. Distinct from a normal turn — it refines the objective without
  * racing the loop.
  */
-pendingSteer?: string, createdMs: number, updatedMs: number, };
+pendingSteer?: string, 
+/**
+ * A shell command the loop runs to *verify* a claimed completion before it
+ * accepts `goal_complete` (RFC 0020 §5.1, #684 D3). `None` keeps the pre-D3
+ * behaviour — a `goal_complete` is trusted as-is — so non-code goals (a
+ * research write-up) are unaffected. When set, the loop runs it on a
+ * completion signal: a green exit accepts `Completed`; a non-zero exit
+ * rejects the claim, records a `Drift` ledger entry carrying the command's
+ * output as evidence, and lets the loop keep iterating.
+ */
+verifyCmd?: string, createdMs: number, updatedMs: number, };

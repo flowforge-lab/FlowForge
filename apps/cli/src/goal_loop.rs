@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use chrono::Local;
 use ff_agent::{
     run_session_turn, AgentEvent, CancelToken, GateDecision, GoalIteration, IterationOutcome,
-    ToolContext, UserContext,
+    ToolContext, UserContext, VerifyOutcome,
 };
 use ff_core::{Goal, GoalStore, Mode, PermissionMatrix, ReasoningVisibility, Role};
 use ff_llm::Provider;
@@ -102,6 +102,10 @@ impl IterationState {
 impl GoalIteration for CliGoalIteration {
     fn gate(&self, _goal: &Goal) -> GateDecision {
         GateDecision::Proceed
+    }
+
+    async fn verify(&self, goal: &Goal) -> VerifyOutcome {
+        ff_agent::run_verify_command(goal, &self.workspace).await
     }
 
     async fn run_once(&self, goal: &Goal) -> IterationOutcome {
