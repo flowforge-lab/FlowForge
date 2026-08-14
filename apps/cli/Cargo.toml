@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 ff-core = { workspace = true }
+ff-acp = { workspace = true }
 ff-agent = { workspace = true }
 ff-llm = { workspace = true }
 ff-scheduled = { workspace = true }

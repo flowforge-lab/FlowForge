@@ -5,6 +5,7 @@
 //! Tier-1 platforms: macOS + Linux. Windows is best-effort via WSL (the `bash` tool
 //! assumes a POSIX shell).
 
+mod acp;
 mod approver;
 mod config;
 mod goal;
@@ -185,6 +186,9 @@ enum Command {
     /// Serve a Slack channel: routes messages into agent turns and asks for
     /// approval over Block Kit buttons (#1060).
     Serve(serve::ServeArgs),
+    /// Serve FlowForge as an ACP agent over stdio, so an ACP client (e.g. Zed)
+    /// can drive it (#1201).
+    Acp,
     /// Manage scheduled tasks (#1082).
     Task {
         #[command(subcommand)]
@@ -287,6 +291,7 @@ async fn main() -> ExitCode {
         Command::Memory { command } => memory::run(command).await,
         Command::Goal(args) => goal::run(args).await,
         Command::Serve(args) => serve::run(args).await,
+        Command::Acp => acp::run().await,
         Command::Task { command } => task::run(command).await,
     }
 }

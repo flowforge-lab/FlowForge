@@ -10,6 +10,9 @@ agent-client-protocol.workspace = true
 ff-core.workspace = true
 ff-agent.workspace = true
 ff-tools.workspace = true
+ff-llm.workspace = true
+ff-session.workspace = true
+async-trait.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 tokio = { workspace = true, features = ["rt", "sync", "time", "process", "io-util", "macros"] }
@@ -18,4 +21,6 @@ tracing.workspace = true
 
 [dev-dependencies]
 async-trait.workspace = true
+ff-skills.workspace = true
+futures-util.workspace = true
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "sync", "time", "process"] }

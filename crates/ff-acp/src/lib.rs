@@ -35,6 +35,7 @@
 pub use agent_client_protocol::schema::v1 as wire;
 
 pub mod advertise;
+pub mod agent;
 pub mod client;
 pub mod config;
 pub mod content;
