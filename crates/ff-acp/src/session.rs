@@ -7,6 +7,7 @@
 
 use crate::wire;
 use ff_agent::CancelToken;
+use ff_core::Mode;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -21,14 +22,25 @@ use std::sync::{Arc, Mutex};
 /// later `session/cancel` panic — that turns one failed turn into an unusable host, and
 /// cancellation is exactly the path a user reaches for when something has gone wrong.
 ///
-/// Recovery is sound here because the map holds only `CancelToken`s (`Arc<AtomicBool>`
-/// flags with no cross-entry invariant), so a panic mid-operation cannot leave the
-/// contents inconsistent — there is no broken state for poisoning to protect us from.
-/// Follows the same `unwrap_or_else(|p| p.into_inner())` pattern as
-/// `ff-observer`'s watcher lock.
+/// Recovery is sound here because the maps hold only `CancelToken`s (`Arc<AtomicBool>`
+/// flags) and `Copy` [`Mode`] values, neither of which carries a cross-entry invariant,
+/// so a panic mid-operation cannot leave the contents inconsistent — there is no broken
+/// state for poisoning to protect us from. Follows the same
+/// `unwrap_or_else(|p| p.into_inner())` pattern as `ff-observer`'s watcher lock.
+///
+/// # Two maps, two lifecycles
+///
+/// The cancel-token map is **per-turn**: a token is registered when a `session/prompt`
+/// begins and removed when it ends. The mode map is **per-session**: it is seeded at
+/// `session/new`, updated by `session/set_mode`, read by every subsequent turn, and must
+/// therefore survive turn cleanup. Keeping them separate is what lets a turn's [`remove`]
+/// clear its token without forgetting the session's mode.
+///
+/// [`remove`]: SessionRegistry::remove
 #[derive(Default)]
 pub struct SessionRegistry {
     inner: Mutex<HashMap<Arc<str>, CancelToken>>,
+    modes: Mutex<HashMap<Arc<str>, Mode>>,
 }
 
 impl SessionRegistry {
@@ -38,6 +50,10 @@ impl SessionRegistry {
 
     fn entries(&self) -> std::sync::MutexGuard<'_, HashMap<Arc<str>, CancelToken>> {
         self.inner.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    fn mode_entries(&self) -> std::sync::MutexGuard<'_, HashMap<Arc<str>, Mode>> {
+        self.modes.lock().unwrap_or_else(|p| p.into_inner())
     }
 
     /// Associate a session with the token for its current turn.
@@ -63,10 +79,32 @@ impl SessionRegistry {
         }
     }
 
-    /// Forget a session once its turn is done, so the map does not grow without bound
-    /// in a long-lived host process.
+    /// Forget a session's cancel token once its turn is done, so the token map does not
+    /// grow without bound in a long-lived host process.
+    ///
+    /// This is **per-turn** cleanup and deliberately leaves the session's mode intact —
+    /// the session outlives any single turn, and a later `session/prompt` reuses its mode.
     pub fn remove(&self, session: &wire::SessionId) {
         self.entries().remove(&session.0);
+    }
+
+    /// Record the mode a session should run in, replacing any previous value.
+    ///
+    /// Called at `session/new` (seeding the default) and on every `session/set_mode`.
+    pub fn set_mode(&self, session: &wire::SessionId, mode: Mode) {
+        self.mode_entries().insert(Arc::clone(&session.0), mode);
+    }
+
+    /// The mode a session is currently in, or [`Mode::default`] for an unknown session.
+    ///
+    /// Falling back to the default (rather than erroring) keeps a `session/prompt` that
+    /// races ahead of its `session/new` bookkeeping safe — it runs in the same mode a
+    /// fresh session would.
+    pub fn mode(&self, session: &wire::SessionId) -> Mode {
+        self.mode_entries()
+            .get(&session.0)
+            .copied()
+            .unwrap_or_default()
     }
 
     /// Number of tracked sessions. Test/observability aid.
