@@ -762,7 +762,7 @@ fn github_action_params_match_the_dispatch_code_exactly() {
         (
             "pr_create",
             &[
-                "title", "body", "base", "head", "label", "assignee", "reviewer",
+                "title", "body", "base", "head", "label", "assignee", "reviewer", "draft",
             ],
         ),
         ("pr_list", &["author", "label", "limit"]),

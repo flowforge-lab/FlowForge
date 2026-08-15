@@ -41,6 +41,7 @@ impl Tool for GithubTool {
                 "body": { "type": "string", "description": "Body text for a PR/issue or a review/comment (pr_create, issue_create, issue_edit, pr_review, pr_comment, issue_comment, pr_review_inline). Required for pr_review / pr_review_inline when event is COMMENT or REQUEST_CHANGES (GitHub 422s a bodiless one); optional for APPROVE. Markdown supported." },
                 "base": { "type": "string", "description": "Base branch for PR (pr_create). Defaults to 'main'." },
                 "head": { "type": "string", "description": "Head branch for PR (pr_create). Defaults to current branch." },
+                "draft": { "type": "boolean", "description": "Open the PR as a draft (pr_create). Defaults to false." },
                 "number": { "type": "integer", "description": "PR or issue number (pr_view, pr_reviews, pr_review_comments, pr_merge, pr_checks, pr_review, pr_comment, pr_request_review, pr_review_inline, issue_view, issue_edit, issue_comment)." },
                 "event": { "type": "string", "enum": ["APPROVE", "REQUEST_CHANGES", "COMMENT"], "description": "Review verdict for pr_review / pr_review_inline. Note: APPROVE and REQUEST_CHANGES are rejected on your own PR (422) — use COMMENT for a self-review." },
                 "comments": { "type": "array", "description": "Inline review comments for pr_review_inline. Each anchors to a diff line.", "items": { "type": "object", "properties": { "path": { "type": "string", "description": "File path (repo-relative)." }, "line": { "type": "integer", "description": "Line number in the file's diff." }, "side": { "type": "string", "enum": ["LEFT", "RIGHT"], "description": "Diff side. Defaults to RIGHT." }, "start_line": { "type": "integer", "description": "Start line for a multi-line comment (optional)." }, "body": { "type": "string", "description": "Comment text." } }, "required": ["path", "line", "body"] } },
@@ -74,7 +75,7 @@ impl Tool for GithubTool {
             (
                 "pr_create",
                 &[
-                    "title", "body", "base", "head", "label", "assignee", "reviewer",
+                    "title", "body", "base", "head", "label", "assignee", "reviewer", "draft",
                 ][..],
             ),
             ("pr_list", &["author", "label", "limit"][..]),
@@ -311,6 +312,11 @@ async fn pr_create(args: &Value, root: &Path) -> ToolOutcome {
 
     if let Some(head) = args.get("head").and_then(|v| v.as_str()) {
         cmd.args(["--head", head]);
+    }
+    // `--draft` is PR-only: `gh issue create` has no draft flag, so it is applied
+    // here rather than in the shared create_flag_args (which issue_create reuses).
+    if args.get("draft").and_then(|v| v.as_bool()).unwrap_or(false) {
+        cmd.arg("--draft");
     }
     cmd.args(create_flag_args(args, true));
 
