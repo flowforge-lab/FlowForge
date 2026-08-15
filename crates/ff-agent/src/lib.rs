@@ -5,6 +5,18 @@
 //! tool calls, execute each (subject to an approval policy), append the results, and
 //! loop. The loop is capped by [`ToolContext::max_iterations`] so a misbehaving model
 //! cannot spin forever.
+//!
+//! # Crate contract
+//! - **Owns:** the multi-step turn loop, tool-call orchestration under the
+//!   approval policy, retries, compaction, and goal mode. Core types:
+//!   [`AgentEvent`], [`ToolContext`], [`Approver`], [`CancelToken`].
+//! - **Does NOT own:** the tool implementations (`ff-tools`), the provider wire
+//!   protocols (`ff-llm`), or persistence (`ff-session`) — it wires them together.
+//!   The host supplies the concrete `Approver`.
+//! - **Depends on:** `ff-core`, `ff-llm`, `ff-memory`, `ff-session`, `ff-skills`,
+//!   `ff-tools` — the workspace convergence point.
+//! - **Depended on by:** `ff-cli`, `flowforge-desktop`, `ff-scheduled`,
+//!   `ff-transport`, `ff-acp`.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;

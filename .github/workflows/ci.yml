@@ -58,6 +58,12 @@ jobs:
       - name: cargo doctests
         run: cargo test --workspace --doc
 
+      # The dependency-direction block in ARCHITECTURE.md is generated from
+      # cargo metadata; a diff means a crate's ff-* deps changed without the doc
+      # being regenerated (#1268). Fix with `scripts/gen-arch-graph.sh --write`.
+      - name: architecture graph up to date
+        run: scripts/gen-arch-graph.sh --check
+
   windows-check:
     name: Windows (compile check + test)
     runs-on: windows-latest

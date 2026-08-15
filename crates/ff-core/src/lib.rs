@@ -2,6 +2,15 @@
 //!
 //! These types ARE the IPC contract. Changing one is a breaking change for the frontend —
 //! regenerate bindings (`cargo test`) and update the mock in the same PR.
+//!
+//! # Crate contract
+//! - **Owns:** the domain vocabulary shared across every `ff-*` crate and the
+//!   Tauri/TypeScript boundary. Core types: [`Message`], [`Session`], [`Skill`],
+//!   [`ReasoningEffort`].
+//! - **Does NOT own:** business logic — this is data types only. Behaviour lives
+//!   in the crates that consume these types.
+//! - **Depends on:** no other `ff-*` crate (it is the workspace root).
+//! - **Depended on by:** effectively all of them — see `ARCHITECTURE.md`.
 
 mod egress;
 pub mod events;
