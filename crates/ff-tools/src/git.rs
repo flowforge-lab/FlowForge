@@ -15,7 +15,7 @@ use serde_json::Value;
 use tokio::process::Command;
 use tokio::time::timeout;
 
-use crate::jail::resolve_in_root;
+use crate::jail::resolve_pathspec_in_root;
 use crate::registry::{Safety, Tool, ToolOutcome};
 
 /// Max lines of unified diff output before truncation.
@@ -291,6 +291,17 @@ async fn git_diff(args: &Value, root: &Path) -> ToolOutcome {
     let path = args.get("path").and_then(|v| v.as_str());
     let git_ref = args.get("ref").and_then(|v| v.as_str());
 
+    // Jail `path` per CONTRIBUTING §3: this is a read-only action, but `root`
+    // may be a repo subdirectory, and an unjailed `../` would still disclose
+    // history/diff content outside the workspace (#1260).
+    let resolved_path = match path {
+        Some(p) => match resolve_pathspec_in_root(root, p) {
+            Ok(r) => Some(r.to_string_lossy().into_owned()),
+            Err(e) => return ToolOutcome::error(e),
+        },
+        None => None,
+    };
+
     let mut cmd_args: Vec<&str> = vec!["diff"];
 
     if staged {
@@ -313,7 +324,7 @@ async fn git_diff(args: &Value, root: &Path) -> ToolOutcome {
 
     cmd_args.push("--");
 
-    if let Some(p) = path {
+    if let Some(p) = &resolved_path {
         cmd_args.push(p);
     }
 
@@ -381,11 +392,22 @@ async fn git_log(args: &Value, root: &Path) -> ToolOutcome {
         .min(50) as u32;
     let path = args.get("path").and_then(|v| v.as_str());
 
+    // Jail `path` per CONTRIBUTING §3 (#1260). `resolve_pathspec_in_root`
+    // permits a path whose parent no longer exists, so `git log -- <deleted
+    // path>` — a legitimate history query — keeps working.
+    let resolved_path = match path {
+        Some(p) => match resolve_pathspec_in_root(root, p) {
+            Ok(r) => Some(r.to_string_lossy().into_owned()),
+            Err(e) => return ToolOutcome::error(e),
+        },
+        None => None,
+    };
+
     let n_str = format!("-{n}");
     let fmt_arg = "--format=%H%x00%s%x00%aN%x00%aI";
     let mut cmd_args: Vec<&str> = vec!["log", &n_str, fmt_arg];
 
-    if let Some(p) = path {
+    if let Some(p) = &resolved_path {
         cmd_args.push("--");
         cmd_args.push(p);
     }
@@ -530,11 +552,14 @@ pub(crate) async fn git_commit(args: &Value, root: &Path) -> ToolOutcome {
     } else {
         // Jail every entry to `root` (CONTRIBUTING §3): commit is a Write that
         // Auto allows without a prompt, so a `../` traversal must not stage/commit
-        // outside the workspace when `root` is a repo subdirectory. resolve_in_root
-        // returns an absolute, canonical in-root path, safe to pass to `git add`.
+        // outside the workspace when `root` is a repo subdirectory.
+        // resolve_pathspec_in_root returns an absolute, canonical in-root path,
+        // safe to pass to `git add`, and — unlike a plain resolve_in_root —
+        // still resolves a path whose parent directory was already deleted
+        // (staging that deletion by its explicit path; #1260).
         let mut resolved = Vec::with_capacity(paths.len());
         for p in &paths {
-            match resolve_in_root(root, p) {
+            match resolve_pathspec_in_root(root, p) {
                 Ok(abs) => resolved.push(abs.to_string_lossy().into_owned()),
                 Err(e) => return ToolOutcome::error(e),
             }
@@ -1016,6 +1041,132 @@ mod tests {
             "the rejected commit must not exist, got: {}",
             log.content
         );
+    }
+
+    #[tokio::test]
+    async fn integration_commit_paths_allows_deleted_directory_path() {
+        // #1260: staging a deletion by its explicit nested path must work even
+        // after the containing directory is gone — not just by passing the
+        // directory itself (the workaround the issue was filed to remove).
+        let repo = init_temp_repo();
+        std::fs::create_dir(repo.path().join("olddir")).unwrap();
+        std::fs::write(repo.path().join("olddir/a.txt"), "x\n").unwrap();
+        let add = git_commit(
+            &serde_json::json!({"message": "add", "paths": ["olddir/a.txt"]}),
+            repo.path(),
+        )
+        .await;
+        assert!(add.success, "{}", add.content);
+
+        std::fs::remove_dir_all(repo.path().join("olddir")).unwrap();
+        let remove = git_commit(
+            &serde_json::json!({"message": "remove", "paths": ["olddir/a.txt"]}),
+            repo.path(),
+        )
+        .await;
+        assert!(
+            remove.success,
+            "committing a deletion by its explicit (now-nonexistent) path should \
+             succeed, got: {}",
+            remove.content
+        );
+    }
+
+    #[tokio::test]
+    async fn integration_diff_path_rejects_jail_escape() {
+        // CONTRIBUTING §3 jail-escape test for the read side (#1260): `diff`'s
+        // `path` must be jailed to `root`, not passed straight to git.
+        let repo = init_temp_repo();
+        std::fs::write(repo.path().join("secret.txt"), "outside\n").unwrap();
+        let sub = repo.path().join("workspace");
+        std::fs::create_dir(&sub).unwrap();
+
+        let result = git_diff(
+            &serde_json::json!({"action": "diff", "path": "../secret.txt"}),
+            &sub,
+        )
+        .await;
+        assert!(
+            !result.success,
+            "a ../ path must be rejected, got: {}",
+            result.content
+        );
+        assert!(
+            result.content.contains("outside the workspace root"),
+            "error should name the jail violation, got: {}",
+            result.content
+        );
+    }
+
+    #[tokio::test]
+    async fn integration_log_path_rejects_jail_escape() {
+        let repo = init_temp_repo();
+        let sub = repo.path().join("workspace");
+        std::fs::create_dir(&sub).unwrap();
+
+        let result = git_log(
+            &serde_json::json!({"action": "log", "path": "../README.md"}),
+            &sub,
+        )
+        .await;
+        assert!(
+            !result.success,
+            "a ../ path must be rejected, got: {}",
+            result.content
+        );
+        assert!(
+            result.content.contains("outside the workspace root"),
+            "error should name the jail violation, got: {}",
+            result.content
+        );
+    }
+
+    #[tokio::test]
+    async fn integration_log_path_finds_deleted_file_history() {
+        // Regression guard (#1260): `git log -- <path>` for a file that has
+        // since been deleted is a legitimate query and must keep working
+        // through the jail, not just for still-existing files.
+        let repo = init_temp_repo();
+        std::fs::create_dir(repo.path().join("gone")).unwrap();
+        std::fs::write(repo.path().join("gone/file.txt"), "x\n").unwrap();
+        git_commit(
+            &serde_json::json!({"message": "add gone/file.txt", "paths": ["gone/file.txt"]}),
+            repo.path(),
+        )
+        .await;
+        std::fs::remove_file(repo.path().join("gone/file.txt")).unwrap();
+        git_commit(
+            &serde_json::json!({"message": "remove gone/file.txt", "paths": ["gone/file.txt"]}),
+            repo.path(),
+        )
+        .await;
+
+        let result = git_log(
+            &serde_json::json!({"action": "log", "path": "gone/file.txt", "n": 5}),
+            repo.path(),
+        )
+        .await;
+        assert!(result.success, "{}", result.content);
+        assert!(
+            result.content.contains("add gone/file.txt")
+                && result.content.contains("remove gone/file.txt"),
+            "history for a deleted path should still be found, got: {}",
+            result.content
+        );
+    }
+
+    #[tokio::test]
+    async fn integration_diff_path_rejects_colon_magic() {
+        // Documents the #1260 design decision: colon-magic pathspecs are
+        // rejected outright rather than parsed.
+        let repo = init_temp_repo();
+        let result = git_diff(
+            &serde_json::json!({"action": "diff", "path": ":(exclude)README.md"}),
+            repo.path(),
+        )
+        .await;
+        assert!(!result.success);
+        assert!(result.content.contains("magic"), "{}", result.content);
     }
 
     #[tokio::test]
