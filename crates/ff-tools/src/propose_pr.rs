@@ -86,20 +86,32 @@ impl Tool for ProposePrTool {
     }
 
     async fn run(&self, args: Value, root: &Path) -> ToolOutcome {
-        // Step 1: branch. git_branch reads `name`.
-        let branch = match args.get("branch").and_then(|v| v.as_str()) {
-            Some(b) if !b.trim().is_empty() => b.trim().to_string(),
-            _ => return ToolOutcome::error("propose_pr requires a non-empty 'branch'"),
+        // Validate every required arg up front, before any git command runs, so a
+        // missing/blank field cannot leave a half-applied state — e.g. a branch
+        // created and pushed to origin that then fails at pr_create and cannot be
+        // retried because step 1 would collide with the existing branch (#1262
+        // review). All three are trimmed and must be non-empty.
+        let branch = match required_arg(&args, "branch") {
+            Ok(v) => v,
+            Err(e) => return e,
         };
+        let message = match required_arg(&args, "message") {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
+        let title = match required_arg(&args, "title") {
+            Ok(v) => v,
+            Err(e) => return e,
+        };
+
+        // Step 1: branch. git_branch reads `name`.
         let branch_out = git_branch(&json!({ "name": branch }), root).await;
         if !branch_out.success {
             return step_failure("branch", &branch_out.content);
         }
 
         // Step 2: commit. git_commit reads `message` and optional `paths`.
-        let mut commit_args = json!({
-            "message": args.get("message").cloned().unwrap_or(Value::Null),
-        });
+        let mut commit_args = json!({ "message": message });
         if let Some(paths) = args.get("paths") {
             commit_args["paths"] = paths.clone();
         }
@@ -117,7 +129,7 @@ impl Tool for ProposePrTool {
 
         // Step 4: draft PR. head is the branch we just pushed.
         let pr_args = json!({
-            "title": args.get("title").cloned().unwrap_or(Value::Null),
+            "title": title,
             "body": args.get("body").cloned().unwrap_or_else(|| Value::String(String::new())),
             "base": args.get("base").cloned().unwrap_or_else(|| Value::String("main".to_string())),
             "head": branch,
@@ -142,6 +154,18 @@ impl Tool for ProposePrTool {
 /// half-finished proposal is diagnosable rather than silently swallowed.
 fn step_failure(step: &str, detail: &str) -> ToolOutcome {
     ToolOutcome::error(format!("propose_pr failed at step '{step}': {detail}"))
+}
+
+/// Extract a required string arg, trimmed. Returns the trimmed value, or a
+/// ready-to-return error `ToolOutcome` when the key is absent, not a string, or
+/// blank after trimming — so `run` can reject bad input before any git command.
+fn required_arg(args: &Value, key: &str) -> Result<String, ToolOutcome> {
+    match args.get(key).and_then(|v| v.as_str()) {
+        Some(s) if !s.trim().is_empty() => Ok(s.trim().to_string()),
+        _ => Err(ToolOutcome::error(format!(
+            "propose_pr requires a non-empty '{key}'"
+        ))),
+    }
 }
 
 #[cfg(test)]
@@ -198,22 +222,52 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stops_at_commit_when_message_missing() {
-        // Branch succeeds (real git), then commit fails on the missing message.
-        // The report must name the commit step, and the branch must exist —
-        // proving the orchestration reached step 2 and stopped there.
+    async fn missing_message_is_rejected_before_any_git_runs() {
+        // #1262 review: message is now validated up front, so a missing one is
+        // rejected before step 1 — no branch created, nothing pushed.
         let repo = init_temp_repo();
+        let before = current_branch(repo.path());
         std::fs::write(repo.path().join("new.txt"), "x\n").unwrap();
         let out = ProposePrTool
             .run(json!({ "branch": "feat/x", "title": "t" }), repo.path())
             .await;
         assert!(!out.success);
-        assert!(
-            out.content.contains("step 'commit'"),
-            "should stop at commit, got: {}",
-            out.content
-        );
-        assert_eq!(current_branch(repo.path()), "feat/x");
+        assert!(out.content.contains("'message'"), "got: {}", out.content);
+        assert_eq!(current_branch(repo.path()), before, "no branch created");
+    }
+
+    #[tokio::test]
+    async fn missing_title_is_rejected_before_any_git_runs() {
+        // The blocker the review found: without up-front validation, a missing
+        // title reaches step 4 only after branch+commit+push, leaving a pushed
+        // branch that cannot be retried. It must be rejected before any git runs.
+        let repo = init_temp_repo();
+        let before = current_branch(repo.path());
+        std::fs::write(repo.path().join("new.txt"), "x\n").unwrap();
+        let out = ProposePrTool
+            .run(json!({ "branch": "feat/x", "message": "m" }), repo.path())
+            .await;
+        assert!(!out.success);
+        assert!(out.content.contains("'title'"), "got: {}", out.content);
+        assert_eq!(current_branch(repo.path()), before, "no branch created");
+    }
+
+    #[tokio::test]
+    async fn blank_title_is_rejected_before_any_git_runs() {
+        // A whitespace-only title passes pr_create's presence-only check but is
+        // garbage input; trim-then-reject at the façade catches it before git.
+        let repo = init_temp_repo();
+        let before = current_branch(repo.path());
+        std::fs::write(repo.path().join("new.txt"), "x\n").unwrap();
+        let out = ProposePrTool
+            .run(
+                json!({ "branch": "feat/x", "message": "m", "title": "   " }),
+                repo.path(),
+            )
+            .await;
+        assert!(!out.success);
+        assert!(out.content.contains("'title'"), "got: {}", out.content);
+        assert_eq!(current_branch(repo.path()), before, "no branch created");
     }
 
     #[tokio::test]

@@ -500,16 +500,30 @@ pub(crate) async fn git_commit(args: &Value, root: &Path) -> ToolOutcome {
     // Staging is explicit-or-all (#1255 B): `paths` stages exactly those entries;
     // omitting it falls back to `add -A` (stage the whole working tree). The
     // explicit form lets a caller avoid sweeping in unrelated WIP.
-    let paths: Vec<String> = args
-        .get("paths")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|p| p.as_str())
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default();
+    //
+    // Validate each entry rather than silently dropping bad ones (#1262 review):
+    // a non-string element or a blank path is a caller mistake — dropping it would
+    // stage a different set than asked (e.g. `["a", 123, "b"]` → `["a", "b"]`) with
+    // no signal, so reject it explicitly.
+    let paths: Vec<String> = match args.get("paths") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::Array(arr)) => {
+            let mut out = Vec::with_capacity(arr.len());
+            for p in arr {
+                match p.as_str() {
+                    Some(s) if !s.trim().is_empty() => out.push(s.trim().to_string()),
+                    Some(_) => {
+                        return ToolOutcome::error("git commit 'paths' entries must be non-empty");
+                    }
+                    None => {
+                        return ToolOutcome::error("git commit 'paths' entries must be strings");
+                    }
+                }
+            }
+            out
+        }
+        Some(_) => return ToolOutcome::error("git commit 'paths' must be an array of strings"),
+    };
 
     let stage_result = if paths.is_empty() {
         run_git_write(root, &["add", "-A"]).await
@@ -1010,6 +1024,42 @@ mod tests {
         let result = git_commit(&serde_json::json!({"action": "commit"}), repo.path()).await;
         assert!(!result.success);
         assert!(result.content.contains("message"));
+    }
+
+    #[tokio::test]
+    async fn integration_commit_paths_rejects_non_string_entry() {
+        // #1262 review: a non-string paths entry must be rejected, not silently
+        // dropped — dropping it would stage a different set than the caller asked.
+        let repo = init_temp_repo();
+        std::fs::write(repo.path().join("a.txt"), "x\n").unwrap();
+        let result = git_commit(
+            &serde_json::json!({"message": "m", "paths": ["a.txt", 123]}),
+            repo.path(),
+        )
+        .await;
+        assert!(!result.success);
+        assert!(
+            result.content.contains("must be strings"),
+            "got: {}",
+            result.content
+        );
+    }
+
+    #[tokio::test]
+    async fn integration_commit_paths_rejects_blank_entry() {
+        let repo = init_temp_repo();
+        std::fs::write(repo.path().join("a.txt"), "x\n").unwrap();
+        let result = git_commit(
+            &serde_json::json!({"message": "m", "paths": ["a.txt", "   "]}),
+            repo.path(),
+        )
+        .await;
+        assert!(!result.success);
+        assert!(
+            result.content.contains("must be non-empty"),
+            "got: {}",
+            result.content
+        );
     }
 
     #[tokio::test]

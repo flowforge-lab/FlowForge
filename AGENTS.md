@@ -15,7 +15,9 @@ the fallback, not the default.
   pr_review_comments, pr_checks, pr_create, pr_merge, pr_review, pr_comment,
   pr_request_review, issue_view, issue_list, issue_create, issue_edit,
   issue_comment, push). Not `bash gh ...`.
-- **Git queries → the `git` tool** (status, diff, log, show). Not `bash git ...`.
+- **Git queries + mutations → the `git` tool** (status, diff, log, show, branch,
+  commit). Not `bash git ...`. Whole branch→commit→push→draft-PR flow →
+  `propose_pr`.
 - **Reading code → `codegraph_explore`** before grep/glob/read (run `tool_search`
   first — like `test_runner` it is not in the default set). It is the only tool
   codegraph advertises: upstream deliberately unlists the narrower ones
@@ -35,8 +37,9 @@ Fall back to shell only when the tool genuinely cannot do it:
   reads the working tree.
 - GitHub operations the native actions do not cover: fetching a specific comment
   id, timeline events, closed-PR search, `gh issue close`.
-- Git mutations: commit / rebase and their combinations. (A plain push is
-  `github push`.)
+- Git mutations the `git` tool does not cover: rebase, and commit/branch in
+  combinations it cannot express. (A plain push is `github push`; a new branch
+  and a commit are `git branch` / `git commit`.)
 - Compound pipelines, e.g. `TMPDIR=/tmp ./scripts/test.sh`.
 
 ## Local-environment traps
