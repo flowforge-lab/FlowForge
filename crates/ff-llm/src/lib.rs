@@ -113,10 +113,15 @@ pub(crate) fn build_ollama_http_client() -> reqwest::Client {
 /// The marker is persisted as [`Role::User`](ff_core::Role) so it stays in
 /// sequence for Bedrock/Anthropic, which lift `Role::System` messages out of the
 /// conversation into a flat system parameter and would lose the temporal signal
-/// that the mode changed *here* (#848). Providers that serialize system messages
-/// where they sit — OpenAI-compatible and Ollama — instead want the true
-/// `role: "system"` shape, so they call this on each serialized message to
+/// that the mode changed *here* (#848). The OpenAI-compatible wire serializes
+/// system messages where they sit and tolerates them mid-array, so it wants the
+/// true `role: "system"` shape and calls this on each serialized message to
 /// restore it without touching the store (#850).
+///
+/// Ollama does **not** call this: some models' chat templates (observed on
+/// qwen3.8:27b) require every system message to be at the start of the array and
+/// 500 on a mid-conversation one, so the marker stays in its persisted
+/// `role: "user"` form there (#1263).
 ///
 /// Only the `role` key is rewritten; content and position are untouched. Gated on
 /// `role == "user"` plus a [`MODE_SWITCH_MARKER_PREFIX`](ff_core::MODE_SWITCH_MARKER_PREFIX)

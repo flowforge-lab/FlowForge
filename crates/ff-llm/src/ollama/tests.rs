@@ -134,23 +134,34 @@ fn outbound_messages_without_tool_calls_are_unchanged() {
 }
 
 #[test]
-fn outbound_promotes_mode_switch_marker_to_system_in_position() {
-    // Stored Role::User (#848); Ollama serializes system messages in-position,
-    // so the marker wants the true role: "system" shape (#850).
+fn outbound_keeps_mode_switch_marker_as_user_in_position() {
+    // #1263: some models' chat templates (observed on qwen3.8:27b) require every
+    // system message to be at the start of the array and 500 ("system message
+    // must be at the beginning") when one lands mid-conversation. So the
+    // mode-switch marker must NOT be promoted to role: "system"; it stays in its
+    // persisted role: "user" form, in-position, with the [system:] text prefix
+    // intact.
     let marker = format!(
         "{} Mode switched to Auto. Writes auto-approved]",
         ff_core::MODE_SWITCH_MARKER_PREFIX
     );
     let msgs = vec![
+        ChatMessage::text("system", "You are a coding assistant."),
         ChatMessage::text("assistant", "I'm in Plan mode."),
         ChatMessage::text("user", &marker),
         ChatMessage::text("user", "go"),
     ];
     let out = ollama_messages(&msgs).unwrap();
-    assert_eq!(out[0]["role"], "assistant");
-    assert_eq!(out[1]["role"], "system", "marker promoted in-position");
-    assert_eq!(out[1]["content"], marker, "content untouched");
-    assert_eq!(out[2]["role"], "user", "trailing user turn untouched");
+    let arr = out.as_array().unwrap();
+    assert_eq!(out[0]["role"], "system", "leading system stays system");
+    assert_eq!(out[2]["role"], "user", "marker kept as user, not promoted");
+    assert_eq!(out[2]["content"], marker, "content untouched");
+    assert_eq!(out[3]["role"], "user", "trailing user turn untouched");
+    // The core invariant: no system message anywhere except the leading one.
+    assert!(
+        arr.iter().skip(1).all(|m| m["role"] != "system"),
+        "no role:system may appear after index 0 (rejected as mid-array system)"
+    );
 }
 
 #[test]
@@ -161,6 +172,47 @@ fn outbound_user_message_mentioning_marker_mid_text_stays_user() {
         out[0]["role"], "user",
         "mid-text mention must not be promoted"
     );
+}
+
+#[test]
+fn outbound_folds_leading_system_run_into_one() {
+    // #1263: the agent emits the system prompt as two system messages — a
+    // cache-stable prefix and a volatile tail (#933 A.1). Some models' chat
+    // templates (observed on qwen3.8:27b) 500 the moment a second system message
+    // appears, even at index 1. They must be folded into a single leading system
+    // message so all system content is at the front.
+    let msgs = vec![
+        ChatMessage::text("system", "STABLE: you are a coding assistant."),
+        ChatMessage::text("system", "VOLATILE: date 2026-08-15, cwd /x."),
+        ChatMessage::text("user", "hi"),
+    ];
+    let out = ollama_messages(&msgs).unwrap();
+    let arr = out.as_array().unwrap();
+    assert_eq!(arr.len(), 2, "two system messages fold into one");
+    assert_eq!(out[0]["role"], "system");
+    assert_eq!(
+        out[0]["content"],
+        "STABLE: you are a coding assistant.\n\nVOLATILE: date 2026-08-15, cwd /x.",
+        "contents joined by a blank line, in order"
+    );
+    assert_eq!(out[1]["role"], "user", "conversation follows unchanged");
+    assert!(
+        arr.iter().skip(1).all(|m| m["role"] != "system"),
+        "no role:system may appear after index 0"
+    );
+}
+
+#[test]
+fn outbound_single_leading_system_is_untouched() {
+    let msgs = vec![
+        ChatMessage::text("system", "you are a coding assistant."),
+        ChatMessage::text("user", "hi"),
+    ];
+    let out = ollama_messages(&msgs).unwrap();
+    assert_eq!(out.as_array().unwrap().len(), 2);
+    assert_eq!(out[0]["role"], "system");
+    assert_eq!(out[0]["content"], "you are a coding assistant.");
+    assert_eq!(out[1]["role"], "user");
 }
 
 #[test]

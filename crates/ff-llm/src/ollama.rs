@@ -478,7 +478,14 @@ fn ollama_messages(messages: &[ChatMessage]) -> Result<serde_json::Value, LlmErr
         // key here and stays byte-identical. Then emit image attachments as Ollama's
         // `images: [base64, ...]` sibling field, leaving `content` a plain string.
         obj.remove("attachments");
-        crate::promote_mode_switch_marker(src, obj);
+        // Do NOT promote the mode-switch marker to `role: "system"` here (#1263).
+        // Some models' chat templates (observed on qwen3.8:27b) require every
+        // system message to be at the start of the array and reject the whole
+        // request ("system message must be at the beginning", HTTP 500) when one
+        // lands mid-conversation. Rather than branch per model, we keep one wire
+        // shape: the marker stays in its persisted `role: "user"` form. Its
+        // `[system:]` text prefix is preserved as compensation — a local instruct
+        // model reads that fine — and it keeps the marker in time-order.
         let images: Vec<String> = src
             .attachments
             .iter()
@@ -513,7 +520,47 @@ fn ollama_messages(messages: &[ChatMessage]) -> Result<serde_json::Value, LlmErr
             }
         }
     }
+    fold_leading_system_messages(arr);
     Ok(value)
+}
+
+/// Merge a leading run of `role: "system"` messages into a single one (#1263).
+///
+/// The agent emits the system prompt as two separate `system` messages — a
+/// cache-stable prefix and a volatile tail — so providers can place a KV-cache
+/// breakpoint between them (#933 A.1). OpenAI tolerates that and Anthropic lifts
+/// system messages into a top-level parameter, but some models' chat templates
+/// (observed on `qwen3.8:27b`) require every `system` message to be at the very
+/// beginning and reject the whole request ("system message must be at the
+/// beginning", HTTP 500) the moment a second one appears — even when it sits at
+/// index 1, right after the first.
+///
+/// Folding the leading run into one message (contents joined by a blank line)
+/// keeps all system content at the front. Only the leading run is folded: a
+/// `system` message that appears later is a different bug the caller must not
+/// produce, and collapsing it here would silently reorder the wire.
+fn fold_leading_system_messages(arr: &mut Vec<serde_json::Value>) {
+    let run = arr
+        .iter()
+        .take_while(|m| m.get("role").and_then(|r| r.as_str()) == Some("system"))
+        .count();
+    if run < 2 {
+        return;
+    }
+    let merged = arr
+        .iter()
+        .take(run)
+        .map(|m| {
+            m.get("content")
+                .and_then(|c| c.as_str())
+                .unwrap_or_default()
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    arr.drain(1..run);
+    if let Some(obj) = arr[0].as_object_mut() {
+        obj.insert("content".into(), serde_json::Value::String(merged));
+    }
 }
 
 #[async_trait]
