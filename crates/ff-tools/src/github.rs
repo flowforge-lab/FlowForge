@@ -297,7 +297,7 @@ async fn run_gh(mut cmd: Command) -> Result<String, String> {
 // Actions
 // ---------------------------------------------------------------------------
 
-async fn pr_create(args: &Value, root: &Path) -> ToolOutcome {
+pub(crate) async fn pr_create(args: &Value, root: &Path) -> ToolOutcome {
     let title = match args.get("title").and_then(|v| v.as_str()) {
         Some(t) => t,
         None => return ToolOutcome::error("pr_create requires 'title'"),
@@ -1232,7 +1232,7 @@ fn author_login(c: &Value) -> Option<&str> {
         .and_then(|l| l.as_str())
 }
 
-async fn push(args: &Value, root: &Path) -> ToolOutcome {
+pub(crate) async fn push(args: &Value, root: &Path) -> ToolOutcome {
     let force = args.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
 
     // Use git directly for push (gh doesn't have a push command).
