@@ -292,6 +292,7 @@ impl ToolRegistry {
         r.register(Box::new(crate::test_runner::TestRunnerTool::new()));
         r.register(Box::new(crate::git::GitTool));
         r.register(Box::new(crate::github::GithubTool));
+        r.register(Box::new(crate::propose_pr::ProposePrTool));
         r.register(Box::new(crate::agent_tool::AgentTool));
         r
     }
@@ -820,7 +821,7 @@ mod tests {
     fn advertises_default_schemas() {
         let reg = ToolRegistry::with_defaults();
         let tools = reg.openai_tools();
-        assert_eq!(tools.len(), 17);
+        assert_eq!(tools.len(), 18);
         let names: Vec<_> = tools
             .iter()
             .map(|t| t["function"]["name"].as_str().unwrap())
@@ -840,6 +841,7 @@ mod tests {
             "ask_user",
             "agent",
             "git",
+            "propose_pr",
         ] {
             assert!(names.contains(&expected), "missing tool: {expected}");
         }
@@ -865,7 +867,7 @@ mod tests {
             .map(|t| t["function"]["name"].as_str().unwrap())
             .collect();
         assert!(!names.contains(&"agent"));
-        assert_eq!(no_subagent.len(), 16);
+        assert_eq!(no_subagent.len(), 17);
     }
 
     // #947: the serialized tool order must be stable and name-sorted. The

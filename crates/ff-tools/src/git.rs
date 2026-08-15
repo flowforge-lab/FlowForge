@@ -476,7 +476,7 @@ async fn git_show(args: &Value, root: &Path) -> ToolOutcome {
 
 // ─── branch ──────────────────────────────────────────────────────────────────
 
-async fn git_branch(args: &Value, root: &Path) -> ToolOutcome {
+pub(crate) async fn git_branch(args: &Value, root: &Path) -> ToolOutcome {
     let name = match args.get("name").and_then(|v| v.as_str()) {
         Some(n) if !n.trim().is_empty() => n.trim(),
         _ => return ToolOutcome::error("branch requires a non-empty 'name'"),
@@ -491,7 +491,7 @@ async fn git_branch(args: &Value, root: &Path) -> ToolOutcome {
 
 // ─── commit ──────────────────────────────────────────────────────────────────
 
-async fn git_commit(args: &Value, root: &Path) -> ToolOutcome {
+pub(crate) async fn git_commit(args: &Value, root: &Path) -> ToolOutcome {
     let message = match args.get("message").and_then(|v| v.as_str()) {
         Some(m) if !m.trim().is_empty() => m.trim(),
         _ => return ToolOutcome::error("commit requires a non-empty 'message'"),

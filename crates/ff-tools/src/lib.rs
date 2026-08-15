@@ -38,6 +38,7 @@ mod jail;
 pub mod memory;
 pub mod notebook;
 pub mod process;
+mod propose_pr;
 mod python;
 mod registry;
 mod shell;
