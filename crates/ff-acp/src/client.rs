@@ -36,7 +36,7 @@ use agent_client_protocol::{
     Dispatch, SessionMessage,
 };
 use ff_agent::AgentEvent;
-use ff_core::{Mode, PermissionCell, PermissionMatrix};
+use ff_core::{Mode, PermissionMatrix};
 use ff_tools::{Safety, ToolRegistry};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -557,8 +557,8 @@ async fn handle_session_message(
             .await;
 }
 
-/// Handle `fs/read_text_file`: gate through the permission matrix, then execute
-/// the native `view` tool.
+/// Handle `fs/read_text_file`: enforce the permission cell, then execute
+/// the native `view` tool when allowed.
 async fn respond_fs_read(
     req: wire::ReadTextFileRequest,
     responder: agent_client_protocol::Responder<wire::ReadTextFileResponse>,
@@ -575,13 +575,8 @@ async fn respond_fs_read(
     let args = serde_json::json!({"path": req.path});
     let cell =
         advertise::inbound_permission_cell(projection, &args, &gate.registry, &gate.matrix, mode);
-    match cell {
-        Some(PermissionCell::Deny) => {
-            responder.respond_with_error(agent_client_protocol::util::internal_error(
-                "fs/read_text_file denied by permission matrix",
-            ))
-        }
-        _ => {
+    match advertise::enforce_inbound(cell) {
+        advertise::InboundDecision::Execute => {
             let outcome = gate.registry.run("view", args, &gate.root).await;
             if outcome.success {
                 responder.respond(wire::ReadTextFileResponse::new(outcome.content))
@@ -591,11 +586,16 @@ async fn respond_fs_read(
                 ))
             }
         }
+        advertise::InboundDecision::Refuse => {
+            responder.respond_with_error(agent_client_protocol::util::internal_error(
+                "fs/read_text_file refused by permission matrix",
+            ))
+        }
     }
 }
 
-/// Handle `fs/write_text_file`: gate through the permission matrix, then execute
-/// the native `write` tool.
+/// Handle `fs/write_text_file`: enforce the permission cell, then execute
+/// the native `write` tool when allowed.
 async fn respond_fs_write(
     req: wire::WriteTextFileRequest,
     responder: agent_client_protocol::Responder<wire::WriteTextFileResponse>,
@@ -612,13 +612,8 @@ async fn respond_fs_write(
     let args = serde_json::json!({"path": req.path, "content": req.content});
     let cell =
         advertise::inbound_permission_cell(projection, &args, &gate.registry, &gate.matrix, mode);
-    match cell {
-        Some(PermissionCell::Deny) => {
-            responder.respond_with_error(agent_client_protocol::util::internal_error(
-                "fs/write_text_file denied by permission matrix",
-            ))
-        }
-        _ => {
+    match advertise::enforce_inbound(cell) {
+        advertise::InboundDecision::Execute => {
             let outcome = gate.registry.run("write", args, &gate.root).await;
             if outcome.success {
                 responder.respond(wire::WriteTextFileResponse::new())
@@ -627,6 +622,11 @@ async fn respond_fs_write(
                     outcome.content,
                 ))
             }
+        }
+        advertise::InboundDecision::Refuse => {
+            responder.respond_with_error(agent_client_protocol::util::internal_error(
+                "fs/write_text_file refused by permission matrix",
+            ))
         }
     }
 }
@@ -659,10 +659,10 @@ async fn respond_request_permission(
         .registry
         .get(tool_name)
         .map(|t| t.safety(&serde_json::json!({})))
-        .unwrap_or(Safety::Write);
+        .unwrap_or(Safety::Dangerous);
     let cell = gate.matrix.effective_cell(tool_name, mode, safety);
-    match cell {
-        PermissionCell::Allow => {
+    match advertise::enforce_inbound(Some(cell)) {
+        advertise::InboundDecision::Execute => {
             // Auto-approve: select the first offered option (allow-once or
             // allow-always). The agent's options are the right vocabulary.
             let id = req
@@ -674,20 +674,13 @@ async fn respond_request_permission(
                 wire::RequestPermissionOutcome::Selected(wire::SelectedPermissionOutcome::new(id)),
             ))
         }
-        PermissionCell::Ask => {
-            // Ask cells need user approval; no approval UI is wired in the
-            // client actor yet. Fail-closed: cancelled.
-            responder.respond(wire::RequestPermissionResponse::new(
-                wire::RequestPermissionOutcome::Cancelled,
-            ))
-        }
-        PermissionCell::Deny => responder.respond(wire::RequestPermissionResponse::new(
-            wire::RequestPermissionOutcome::Cancelled,
-        )),
+        advertise::InboundDecision::Refuse => responder.respond(
+            wire::RequestPermissionResponse::new(wire::RequestPermissionOutcome::Cancelled),
+        ),
     }
 }
 
-/// Handle `terminal/create`: gate through the permission matrix, then refuse
+/// Handle `terminal/create`: enforce the permission cell, then refuse
 /// (no terminal executor wired yet).
 async fn respond_terminal_create(
     req: wire::CreateTerminalRequest,
@@ -706,10 +699,13 @@ async fn respond_terminal_create(
             &gate.matrix,
             mode,
         );
-        if cell == Some(PermissionCell::Deny) {
-            return responder.respond_with_error(agent_client_protocol::util::internal_error(
-                "terminal/create denied by permission matrix",
-            ));
+        match advertise::enforce_inbound(cell) {
+            advertise::InboundDecision::Execute => {}
+            advertise::InboundDecision::Refuse => {
+                return responder.respond_with_error(agent_client_protocol::util::internal_error(
+                    "terminal/create refused by permission matrix",
+                ));
+            }
         }
     }
     responder.respond_with_error(agent_client_protocol::util::internal_error(

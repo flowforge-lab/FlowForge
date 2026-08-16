@@ -133,10 +133,37 @@ pub fn inbound_permission_cell(
             let safety = registry
                 .get(name)
                 .map(|tool| tool.safety(args))
-                .unwrap_or(Safety::Write);
+                .unwrap_or(Safety::Dangerous);
             Some(matrix.effective_cell(name, mode, safety))
         }
         InboundProjection::Protocol => None,
+    }
+}
+
+/// The outcome of enforcing a permission cell for an inbound request.
+///
+/// Used by all four inbound entry points (`fs/read_text_file`,
+/// `fs/write_text_file`, `terminal/create`, `session/request_permission`)
+/// so `Ask` is handled consistently — no approval UI is wired on the
+/// client side yet, so `Ask` and `Deny` both refuse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InboundDecision {
+    /// The call is allowed to proceed (cell was `Allow` or `Protocol`).
+    Execute,
+    /// The call is refused.
+    Refuse,
+}
+
+/// Enforce a permission cell for an inbound request.
+///
+/// - [`PermissionCell::Allow`] → [`InboundDecision::Execute`]
+/// - [`PermissionCell::Ask`] → [`InboundDecision::Refuse`] (no approval UI)
+/// - [`PermissionCell::Deny`] → [`InboundDecision::Refuse`]
+/// - [`None`] (protocol op) → [`InboundDecision::Execute`] (no tool gate)
+pub fn enforce_inbound(cell: Option<PermissionCell>) -> InboundDecision {
+    match cell {
+        Some(PermissionCell::Allow) | None => InboundDecision::Execute,
+        Some(PermissionCell::Ask) | Some(PermissionCell::Deny) => InboundDecision::Refuse,
     }
 }
 
@@ -483,7 +510,7 @@ mod tests {
         );
         // A projection naming a tool the registry does not carry fails closed,
         // not open: an unknown tool name resolves through the conservative
-        // default tier (`Safety::Write`), which is Deny in Plan — never a
+        // default tier (`Safety::Dangerous`), which is Deny in Plan — never a
         // silent Allow that would let the effect through regardless.
         let projection = InboundProjection::Tool {
             name: "no_such_tool",
@@ -498,6 +525,72 @@ mod tests {
             ),
             Some(PermissionCell::Deny),
             "a missing tool must fail closed in Plan, never resolve to a silent Allow"
+        );
+    }
+
+    #[test]
+    fn enforce_inbound_refuses_ask_in_every_inbound_entry_point() {
+        let mut reg = ToolRegistry::new();
+        reg.register(Box::new(StubTool::fixed("write", Safety::Write)));
+        reg.register(Box::new(StubTool::fixed("view", Safety::ReadOnly)));
+        reg.register(Box::new(StubTool::fixed("bash", Safety::Dangerous)));
+        let mut matrix = PermissionMatrix::default();
+        // Override all three tools that the inbound projections map to:
+        // the matrix cell alone for each mode×safety combo may already be
+        // Allow/Ask/Deny, but a per-tool override to Ask is unambiguous.
+        for tool in ["write", "view", "bash"] {
+            matrix.set_override(tool, PermissionCell::Ask);
+        }
+
+        // fs/read_text_file → view: Ask cell → Refuse.
+        let projection = acp_method_to_native("fs/read_text_file").unwrap();
+        for mode in [Mode::Plan, Mode::Act, Mode::Auto] {
+            let cell =
+                inbound_permission_cell(projection, &serde_json::json!({}), &reg, &matrix, mode);
+            assert_eq!(
+                enforce_inbound(cell),
+                InboundDecision::Refuse,
+                "an Ask-cell fs/read_text_file must be refused in {mode:?}"
+            );
+        }
+
+        // fs/write_text_file → write: Ask cell → Refuse.
+        let projection = acp_method_to_native("fs/write_text_file").unwrap();
+        for mode in [Mode::Plan, Mode::Act, Mode::Auto] {
+            let cell =
+                inbound_permission_cell(projection, &serde_json::json!({}), &reg, &matrix, mode);
+            assert_eq!(
+                enforce_inbound(cell),
+                InboundDecision::Refuse,
+                "an Ask-cell fs/write_text_file must be refused in {mode:?}"
+            );
+        }
+
+        // terminal/create → bash: Ask cell → Refuse.
+        let projection = acp_method_to_native("terminal/create").unwrap();
+        for mode in [Mode::Plan, Mode::Act, Mode::Auto] {
+            let cell = inbound_permission_cell(
+                projection,
+                &serde_json::json!({"command": "ls"}),
+                &reg,
+                &matrix,
+                mode,
+            );
+            assert_eq!(
+                enforce_inbound(cell),
+                InboundDecision::Refuse,
+                "an Ask-cell terminal/create must be refused in {mode:?}"
+            );
+        }
+
+        // Protocol ops (terminal/output, etc.) have no cell → Execute.
+        let projection = acp_method_to_native("terminal/output").unwrap();
+        let cell =
+            inbound_permission_cell(projection, &serde_json::json!({}), &reg, &matrix, Mode::Act);
+        assert_eq!(
+            enforce_inbound(cell),
+            InboundDecision::Execute,
+            "a protocol op must always be allowed through (no tool gate)"
         );
     }
 }
