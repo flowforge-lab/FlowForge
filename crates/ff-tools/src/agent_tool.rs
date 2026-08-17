@@ -62,7 +62,11 @@ impl Tool for AgentTool {
                     "items": { "type": "string" },
                     "description": "Optional allowlist of tool names the sub-agent may \
                                     use (e.g. [\"view\", \"grep\", \"glob\"] for a \
-                                    read-only audit). Omit to inherit the full toolset."
+                                    read-only audit). Omit to inherit the full toolset. \
+                                    Naming a deferred capability here (e.g. an MCP-bridged \
+                                    tool) also seeds it into the child's advertised set, \
+                                    sparing it a `tool_search` round-trip to discover a \
+                                    tool its task obviously needs."
                 },
                 "max_iterations": {
                     "type": "integer",
@@ -110,6 +114,26 @@ mod tests {
         assert_eq!(params["required"][0], "task");
         assert_eq!(params["properties"]["task"]["type"], "string");
         assert_eq!(params["properties"]["tools"]["type"], "array");
+    }
+
+    #[test]
+    fn tools_param_hints_preloading_a_deferred_capability() {
+        // #1273: spawning with an explicit `tools` allowlist that names a
+        // deferred (e.g. MCP-bridged) tool now seeds it into the child's
+        // advertised set (#1272), sparing the child a `tool_search` discovery
+        // round-trip. The schema should point the orchestrator at that lever.
+        let desc = AgentTool.parameters()["properties"]["tools"]["description"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            desc.contains("tool_search"),
+            "tools param must reference the discovery round-trip it saves: {desc}"
+        );
+        assert!(
+            desc.to_lowercase().contains("deferred") || desc.to_lowercase().contains("mcp"),
+            "tools param must mention naming a deferred/MCP capability up front: {desc}"
+        );
     }
 
     #[tokio::test]
