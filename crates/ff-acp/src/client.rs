@@ -36,11 +36,12 @@ use agent_client_protocol::{
     Dispatch, SessionMessage,
 };
 use ff_agent::AgentEvent;
-use ff_core::Mode;
+use ff_core::{Mode, PermissionMatrix};
+use ff_tools::{Safety, ToolRegistry};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
-use crate::{content, mode, wire};
+use crate::{advertise, content, mode, wire};
 
 /// How long a clean shutdown may take before we abort the connection task and
 /// let `AcpAgent`'s `ChildGuard` reap the process group. Bounds app-exit latency
@@ -62,6 +63,21 @@ pub enum AcpError {
     /// aborted and the child left to `ChildGuard`'s drop-reap.
     #[error("agent shutdown timed out after {0:?}")]
     ShutdownTimeout(Duration),
+}
+
+/// Resources the inbound handler needs to gate agent→client requests through
+/// the permission matrix (ticket #1204).
+///
+/// When present on an [`AcpClient`], the connection task resolves `fs/*` and
+/// `session/request_permission` requests through the **same** native tool
+/// identity and [`PermissionMatrix::effective_cell`] that native calls use,
+/// so ACP-originated and native tool effects cannot drift. Without it the
+/// inbound methods return an error (fail-closed).
+#[derive(Clone)]
+pub struct InboundGate {
+    pub registry: Arc<ToolRegistry>,
+    pub matrix: Arc<PermissionMatrix>,
+    pub root: PathBuf,
 }
 
 /// A live connection to one external ACP agent.
@@ -106,6 +122,9 @@ impl AcpClient {
     /// If the handshake fails, the spawned task is aborted and the child is
     /// left to `ChildGuard`'s drop-reap.
     ///
+    /// Without a [`gate`](Self::connect_with_gate), inbound `fs/*` and
+    /// `session/request_permission` requests return an error (fail-closed).
+    ///
     /// # Env isolation (gap, recorded)
     ///
     /// `AcpAgent` inherits the host environment and applies `config.env` on
@@ -115,6 +134,19 @@ impl AcpClient {
     /// with an env-cleared `Command` + the SDK's `Lines` transport + a
     /// replicated `ChildGuard`, or upstreams an `env_clear` option.
     pub async fn connect(config: acp::AcpAgentConfig) -> Result<Self, AcpError> {
+        Self::connect_with_gate(config, None).await
+    }
+
+    /// Like [`connect`](Self::connect) but with an [`InboundGate`] so the
+    /// connection task can resolve `fs/*` and `session/request_permission`
+    /// requests through the permission matrix.
+    ///
+    /// When `gate` is `None`, inbound agent→client requests return an error
+    /// (fail-closed) — the same behaviour as [`connect`](Self::connect).
+    pub async fn connect_with_gate(
+        config: acp::AcpAgentConfig,
+        gate: Option<Arc<InboundGate>>,
+    ) -> Result<Self, AcpError> {
         let agent = AcpAgent::new(config);
         let (cmd_tx, cmd_rx) = mpsc::channel(16);
         let (handshake_tx, handshake_rx) = oneshot::channel::<()>();
@@ -132,7 +164,7 @@ impl AcpClient {
                     .block_task()
                     .await?;
                     let _ = handshake_tx.send(());
-                    drive(cx, cmd_rx).await
+                    drive(cx, cmd_rx, gate).await
                 })
                 .await
                 .map_err(AcpError::from)
@@ -246,8 +278,15 @@ impl Drop for AcpClient {
 /// review finding for AC 4 (#1234). The prompt loop runs in a spawned task
 /// and sends the `ActiveSession` back when it completes; the main loop reaps
 /// it via `reaped_rx`.
-async fn drive(cx: ConnectionTo<Agent>, mut cmd_rx: mpsc::Receiver<Cmd>) -> Result<(), acp::Error> {
+async fn drive(
+    cx: ConnectionTo<Agent>,
+    mut cmd_rx: mpsc::Receiver<Cmd>,
+    gate: Option<Arc<InboundGate>>,
+) -> Result<(), acp::Error> {
     let mut sessions: HashMap<Arc<str>, ActiveSessionHandle> = HashMap::new();
+    // Per-session mode, tracked so inbound fs/* and request_permission
+    // requests resolve through the correct matrix cell (#1204).
+    let mut session_modes: HashMap<Arc<str>, Mode> = HashMap::new();
     // Per-session cancel signals for in-flight prompts. The `Cmd::Cancel`
     // handler sends the `session/cancel` notification fires the oneshot
     // sender; the prompt task races the oneshot receiver against
@@ -265,6 +304,7 @@ async fn drive(cx: ConnectionTo<Agent>, mut cmd_rx: mpsc::Receiver<Cmd>) -> Resu
                             Ok(session) => {
                                 let id = session.session_id().clone();
                                 sessions.insert(Arc::clone(&id.0), ActiveSessionHandle(session));
+                                session_modes.insert(id.0.clone(), Mode::default());
                                 let _ = reply.send(Ok(id));
                             }
                             Err(e) => {
@@ -282,10 +322,11 @@ async fn drive(cx: ConnectionTo<Agent>, mut cmd_rx: mpsc::Receiver<Cmd>) -> Resu
                             prompt_cancels.insert(session_id.0.clone(), cancel_tx);
                             let reaped_tx = reaped_tx.clone();
                             let sid = session_id.0.clone();
-                            let prompt = prompt.clone();
+                            let mode = *session_modes.get(&sid).unwrap_or(&Mode::default());
+                            let gate = gate.clone();
                             tokio::spawn(async move {
                                 let session = drive_prompt(
-                                    handle.0, &prompt, updates, cancel_rx,
+                                    handle.0, &prompt, updates, cancel_rx, gate, mode,
                                 ).await;
                                 let _ = reaped_tx.send(ReapedSession {
                                     session_id: sid,
@@ -316,6 +357,7 @@ async fn drive(cx: ConnectionTo<Agent>, mut cmd_rx: mpsc::Receiver<Cmd>) -> Resu
                         mode,
                         reply,
                     } => {
+                        session_modes.insert(session_id.0.clone(), mode);
                         let req = wire::SetSessionModeRequest::new(
                             session_id,
                             wire::SessionModeId::new(mode::mode_id(mode)),
@@ -355,8 +397,8 @@ struct ActiveSessionHandle(ActiveSession<'static, Agent>);
 
 /// Drive one prompt to completion: send it, then drain `session/update`
 /// notifications through [`content::inbound`] and respond to agent→client
-/// requests (fs/*, terminal/*, request_permission) with stub errors so the
-/// agent's turn completes instead of hanging.
+/// requests (fs/*, terminal/*, request_permission) — gated through the
+/// permission matrix when an [`InboundGate`] is present.
 ///
 /// Accepts a `cancel_rx` [`oneshot::Receiver`] that the main loop fires when
 /// `Cmd::Cancel` arrives, so the host stream ends with a `Cancelled` Done
@@ -366,6 +408,8 @@ async fn drive_prompt(
     prompt: &str,
     updates: mpsc::UnboundedSender<content::Inbound>,
     mut cancel_rx: oneshot::Receiver<()>,
+    gate: Option<Arc<InboundGate>>,
+    mode: Mode,
 ) -> ActiveSession<'static, Agent> {
     let mut session = session;
     if session.send_prompt(prompt).is_err() {
@@ -391,7 +435,7 @@ async fn drive_prompt(
             msg = session.read_update() => {
                 match msg {
                     Ok(SessionMessage::SessionMessage(dispatch)) => {
-                        handle_session_message(dispatch, &fallback, &updates).await;
+                        handle_session_message(dispatch, &fallback, &updates, &gate, mode).await;
                     }
                     Ok(SessionMessage::StopReason(stop)) => {
                         let internal = content::inbound_stop_reason(stop);
@@ -422,7 +466,15 @@ async fn drive_prompt(
 /// Handle one inbound `Dispatch` from the agent during a prompt turn:
 ///
 /// - `session/update` notifications → extract the update and forward to the stream.
-/// - `session/request_permission` → respond `cancelled` so the agent resumes.
+/// - `fs/read_text_file` → gate through the permission matrix, then execute the
+///   native `view` tool.
+/// - `fs/write_text_file` → gate through the permission matrix, then execute the
+///   native `write` tool.
+/// - `session/request_permission` → gate the tool call name through the permission
+///   matrix and respond accordingly (allow, deny, or cancelled).
+/// - `terminal/*` → gate through the permission matrix at `terminal/create`; the
+///   management methods (`terminal/output`, `release`, `kill`, `wait_for_exit`)
+///   are protocol ops with no tool identity, so they return an informative error.
 /// - Any other request → respond with a JSON-RPC error (`method not implemented`).
 /// - Unknown notifications → ignored (no response needed).
 /// - Responses → ignored (they belong to our requests, not the agent's).
@@ -430,6 +482,8 @@ async fn handle_session_message(
     dispatch: Dispatch,
     fallback: &str,
     updates: &mpsc::UnboundedSender<content::Inbound>,
+    gate: &Option<Arc<InboundGate>>,
+    mode: Mode,
 ) {
     let _ =
         MatchDispatch::new(dispatch)
@@ -440,16 +494,44 @@ async fn handle_session_message(
                 Ok(())
             })
             .await
-            // session/request_permission → respond cancelled.
+            // fs/read_text_file → gate via the native `view` tool, then execute.
             .if_request(
-                async |_req: wire::RequestPermissionRequest,
+                async |req: wire::ReadTextFileRequest,
+                       responder: agent_client_protocol::Responder<
+                    wire::ReadTextFileResponse,
+                >| {
+                    respond_fs_read(req, responder, gate, mode).await
+                },
+            )
+            .await
+            // fs/write_text_file → gate via the native `write` tool, then execute.
+            .if_request(
+                async |req: wire::WriteTextFileRequest,
+                       responder: agent_client_protocol::Responder<
+                    wire::WriteTextFileResponse,
+                >| {
+                    respond_fs_write(req, responder, gate, mode).await
+                },
+            )
+            .await
+            // session/request_permission → gate via the permission matrix.
+            .if_request(
+                async |req: wire::RequestPermissionRequest,
                        responder: agent_client_protocol::Responder<
                     wire::RequestPermissionResponse,
                 >| {
-                    responder.respond(wire::RequestPermissionResponse::new(
-                        wire::RequestPermissionOutcome::Cancelled,
-                    ))?;
-                    Ok(())
+                    respond_request_permission(req, responder, gate, mode).await
+                },
+            )
+            .await
+            // terminal/create → gate via the native `bash` tool, then refuse
+            // (no terminal executor wired yet).
+            .if_request(
+                async |req: wire::CreateTerminalRequest,
+                       responder: agent_client_protocol::Responder<
+                    wire::CreateTerminalResponse,
+                >| {
+                    respond_terminal_create(req, responder, gate, mode).await
                 },
             )
             .await
@@ -473,6 +555,162 @@ async fn handle_session_message(
                 Ok(())
             })
             .await;
+}
+
+/// Handle `fs/read_text_file`: enforce the permission cell, then execute
+/// the native `view` tool when allowed.
+async fn respond_fs_read(
+    req: wire::ReadTextFileRequest,
+    responder: agent_client_protocol::Responder<wire::ReadTextFileResponse>,
+    gate: &Option<Arc<InboundGate>>,
+    mode: Mode,
+) -> Result<(), agent_client_protocol::Error> {
+    let Some(gate) = gate else {
+        return responder.respond_with_error(agent_client_protocol::util::internal_error(
+            "fs/read_text_file: no permission gate configured",
+        ));
+    };
+    let projection = advertise::acp_method_to_native("fs/read_text_file")
+        .map_err(|_| agent_client_protocol::util::internal_error("unmapped method"))?;
+    let args = serde_json::json!({"path": req.path});
+    let cell =
+        advertise::inbound_permission_cell(projection, &args, &gate.registry, &gate.matrix, mode);
+    match advertise::enforce_inbound(cell) {
+        advertise::InboundDecision::Execute => {
+            let outcome = gate.registry.run("view", args, &gate.root).await;
+            if outcome.success {
+                responder.respond(wire::ReadTextFileResponse::new(outcome.content))
+            } else {
+                responder.respond_with_error(agent_client_protocol::util::internal_error(
+                    outcome.content,
+                ))
+            }
+        }
+        advertise::InboundDecision::Refuse => {
+            responder.respond_with_error(agent_client_protocol::util::internal_error(
+                "fs/read_text_file refused by permission matrix",
+            ))
+        }
+    }
+}
+
+/// Handle `fs/write_text_file`: enforce the permission cell, then execute
+/// the native `write` tool when allowed.
+async fn respond_fs_write(
+    req: wire::WriteTextFileRequest,
+    responder: agent_client_protocol::Responder<wire::WriteTextFileResponse>,
+    gate: &Option<Arc<InboundGate>>,
+    mode: Mode,
+) -> Result<(), agent_client_protocol::Error> {
+    let Some(gate) = gate else {
+        return responder.respond_with_error(agent_client_protocol::util::internal_error(
+            "fs/write_text_file: no permission gate configured",
+        ));
+    };
+    let projection = advertise::acp_method_to_native("fs/write_text_file")
+        .map_err(|_| agent_client_protocol::util::internal_error("unmapped method"))?;
+    let args = serde_json::json!({"path": req.path, "content": req.content});
+    let cell =
+        advertise::inbound_permission_cell(projection, &args, &gate.registry, &gate.matrix, mode);
+    match advertise::enforce_inbound(cell) {
+        advertise::InboundDecision::Execute => {
+            let outcome = gate.registry.run("write", args, &gate.root).await;
+            if outcome.success {
+                responder.respond(wire::WriteTextFileResponse::new())
+            } else {
+                responder.respond_with_error(agent_client_protocol::util::internal_error(
+                    outcome.content,
+                ))
+            }
+        }
+        advertise::InboundDecision::Refuse => {
+            responder.respond_with_error(agent_client_protocol::util::internal_error(
+                "fs/write_text_file refused by permission matrix",
+            ))
+        }
+    }
+}
+
+/// Handle `session/request_permission`: gate the tool call name through the
+/// permission matrix.
+async fn respond_request_permission(
+    req: wire::RequestPermissionRequest,
+    responder: agent_client_protocol::Responder<wire::RequestPermissionResponse>,
+    gate: &Option<Arc<InboundGate>>,
+    mode: Mode,
+) -> Result<(), agent_client_protocol::Error> {
+    let Some(gate) = gate else {
+        return responder.respond(wire::RequestPermissionResponse::new(
+            wire::RequestPermissionOutcome::Cancelled,
+        ));
+    };
+    // Extract the tool name from the request. The ACP tool call's `title`
+    // carries the tool name (set by the agent in its `session/update`).
+    let tool_name = match req.tool_call.fields.title.as_deref() {
+        Some(name) => name,
+        None => {
+            return responder.respond(wire::RequestPermissionResponse::new(
+                wire::RequestPermissionOutcome::Cancelled,
+            ));
+        }
+    };
+    // Resolve the safety tier via the native tool (identical path).
+    let safety = gate
+        .registry
+        .get(tool_name)
+        .map(|t| t.safety(&serde_json::json!({})))
+        .unwrap_or(Safety::Dangerous);
+    let cell = gate.matrix.effective_cell(tool_name, mode, safety);
+    match advertise::enforce_inbound(Some(cell)) {
+        advertise::InboundDecision::Execute => {
+            // Auto-approve: select the first offered option (allow-once or
+            // allow-always). The agent's options are the right vocabulary.
+            let id = req
+                .options
+                .first()
+                .map(|opt| opt.option_id.clone())
+                .unwrap_or_else(|| wire::PermissionOptionId::new("allow-once"));
+            responder.respond(wire::RequestPermissionResponse::new(
+                wire::RequestPermissionOutcome::Selected(wire::SelectedPermissionOutcome::new(id)),
+            ))
+        }
+        advertise::InboundDecision::Refuse => responder.respond(
+            wire::RequestPermissionResponse::new(wire::RequestPermissionOutcome::Cancelled),
+        ),
+    }
+}
+
+/// Handle `terminal/create`: enforce the permission cell, then refuse
+/// (no terminal executor wired yet).
+async fn respond_terminal_create(
+    req: wire::CreateTerminalRequest,
+    responder: agent_client_protocol::Responder<wire::CreateTerminalResponse>,
+    gate: &Option<Arc<InboundGate>>,
+    mode: Mode,
+) -> Result<(), agent_client_protocol::Error> {
+    if let Some(gate) = gate {
+        let projection = advertise::acp_method_to_native("terminal/create")
+            .map_err(|_| agent_client_protocol::util::internal_error("unmapped method"))?;
+        let args = serde_json::json!({"command": &req.command, "args": &req.args});
+        let cell = advertise::inbound_permission_cell(
+            projection,
+            &args,
+            &gate.registry,
+            &gate.matrix,
+            mode,
+        );
+        match advertise::enforce_inbound(cell) {
+            advertise::InboundDecision::Execute => {}
+            advertise::InboundDecision::Refuse => {
+                return responder.respond_with_error(agent_client_protocol::util::internal_error(
+                    "terminal/create refused by permission matrix",
+                ));
+            }
+        }
+    }
+    responder.respond_with_error(agent_client_protocol::util::internal_error(
+        "terminal/create: terminal executor not wired",
+    ))
 }
 
 /// Minimal `AgentEvent::Done` — only `message_id` and `stop_reason` are
