@@ -12,8 +12,9 @@ skills = ["codegraph"]
 # pre-paying its schema up front removes the first-turn `tool_search` round-trip
 # that would otherwise be needed to discover it. The name is the bridged id
 # `mcp__<server>__<tool>` for the [[mcp_servers]] entry below; only deferred
-# (MCP-bridged) tools can be preheated -- built-in tools are always resident, so
-# listing one here is a silent no-op. Kept well within the ~2500 B preheat
+# (MCP-bridged) tools can be preheated -- a built-in (resident) tool, or a
+# mistyped name, is rejected as unknown and reported via `phenotype:preheat-dropped`
+# (#1186), never silently accepted. Kept well within the ~2500 B preheat
 # budget: codegraph's single spec is ~1726 B.
 preheat = ["mcp__codegraph__codegraph_explore"]
 
