@@ -3927,6 +3927,102 @@ async fn subagent_delegates_and_returns_summary() {
     assert_eq!(store.list_sessions().len(), 1);
 }
 
+/// #1271: a deferred tool (e.g. a bridged MCP tool like Obsidian) named in a
+/// sub-agent's `tools` allowlist must be advertised to the child. The child
+/// starts with an empty unlocked set, so without seeding the allowlist into the
+/// child session's admitted set the deferral pass would filter it out even
+/// though the permission pass allowed it.
+///
+/// Call 0 (parent) spawns the child with `tools: ["mcp_thing"]`; call 1 (child)
+/// records whether the deferred tool reached its advertised `req.tools`.
+struct SpawnWithDeferredAllowlist {
+    calls: AtomicUsize,
+    child_saw_deferred: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[async_trait]
+impl Provider for SpawnWithDeferredAllowlist {
+    async fn chat_stream(&self, req: ChatRequest) -> Result<ChunkStream, LlmError> {
+        let n = self.calls.fetch_add(1, Ordering::SeqCst);
+        let chunks = match n {
+            0 => vec![Ok(Chunk {
+                tool_calls: vec![ToolCallDelta {
+                    index: 0,
+                    id: Some("agent_1".into()),
+                    name: Some("agent".into()),
+                    arguments: r#"{"task":"audit","tools":["mcp_thing"]}"#.into(),
+                }],
+                done: true,
+                ..Chunk::default()
+            })],
+            1 => {
+                let advertised = req.tools.iter().any(|t| {
+                    t.get("function")
+                        .and_then(|f| f.get("name"))
+                        .and_then(|v| v.as_str())
+                        == Some("mcp_thing")
+                });
+                self.child_saw_deferred.store(advertised, Ordering::SeqCst);
+                vec![Ok(Chunk {
+                    delta: "child: done".into(),
+                    done: true,
+                    ..Chunk::default()
+                })]
+            }
+            _ => vec![Ok(Chunk {
+                delta: "parent: done".into(),
+                done: true,
+                ..Chunk::default()
+            })],
+        };
+        Ok(futures_util::stream::iter(chunks).boxed())
+    }
+}
+
+#[tokio::test]
+async fn subagent_sees_deferred_tool_named_in_its_allowlist() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = SessionStore::new();
+    let s = store.create_session(None);
+    store.add_message(&s.id, Role::User, "delegate with a deferred tool".into());
+
+    let mut registry = ToolRegistry::with_defaults();
+    registry.register(deferred_stub("mcp_thing", Safety::ReadOnly, false));
+    let root = dir.path().to_path_buf();
+    let approve = AlwaysApprove;
+    let search = ToolSearchState::default();
+
+    let child_saw_deferred = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let provider = SpawnWithDeferredAllowlist {
+        calls: AtomicUsize::new(0),
+        child_saw_deferred: child_saw_deferred.clone(),
+    };
+
+    let mut tctx = ctx(&registry, &root, &approve);
+    tctx.tool_search = Some(&search);
+
+    run_turn(
+        &provider,
+        &store,
+        &tctx,
+        &s.id,
+        "mock",
+        None,
+        false,
+        ReasoningVisibility::All,
+        CancelToken::new(),
+        |_| {},
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        child_saw_deferred.load(Ordering::SeqCst),
+        "a deferred tool granted via the sub-agent `tools` allowlist must be \
+         advertised to the child (#1271)"
+    );
+}
+
 #[tokio::test]
 async fn subagent_depth_guard_refuses_nested_spawn() {
     let dir = tempfile::tempdir().unwrap();

@@ -641,7 +641,10 @@ pub struct ToolContext<'a> {
     /// `allowed` *narrows* the surface to a fixed list (sub-agent delegation),
     /// whereas this *re-widens* it as the model discovers what it needs. Opposite
     /// directions, so conflating them would let a search escape a sub-agent's
-    /// allowlist.
+    /// allowlist. (A sub-agent's explicit allowlist *is* seeded into the child
+    /// session's admitted set at spawn — see `run_subagent` / #1271 — so a
+    /// deferred tool that was explicitly granted is still advertised; the two
+    /// passes stay distinct, the grant just satisfies both.)
     ///
     /// `None` = no deferral; every registered tool is advertised as before.
     pub tool_search: Option<&'a ToolSearchState>,
@@ -3193,6 +3196,17 @@ async fn run_subagent(
 
     let child = store.create_session(Some(task.clone()));
     store.add_message(&child.id, Role::User, task);
+
+    // #1271: an explicit `tools` allowlist is a form of discovery. A deferred tool
+    // (e.g. a bridged MCP tool) is hidden until `tool_search` admits it for the
+    // session, and the child starts with an empty unlocked set — so without this,
+    // naming a deferred tool in the allowlist would put it in `allowed` yet leave
+    // it filtered out by the deferral pass. Seed the grant into the child session's
+    // admitted set so the deferred-visibility pass agrees with the permission pass.
+    // Scoped to the allowlist, this can never widen the delegation beyond the grant.
+    if let (Some(search), Some(names)) = (parent.tool_search, allowed.as_ref()) {
+        search.admit(&child.id, names.iter().cloned());
+    }
 
     let child_ctx = ToolContext {
         registry: parent.registry,
