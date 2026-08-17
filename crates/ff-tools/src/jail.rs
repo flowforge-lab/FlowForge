@@ -116,6 +116,38 @@ pub fn resolve_for_create(root: &Path, candidate: &str) -> Result<PathBuf, Strin
     }
 }
 
+/// Resolve a git pathspec argument (`diff`/`log`'s `path`, `commit`'s `paths`
+/// entries) against `root`. This differs from a plain file-path jail in two
+/// ways git pathspec semantics require:
+///
+/// - **The target need not exist.** `git log -- deleted/file` is a legitimate
+///   query for the history of a path no longer on disk, and `commit` must be
+///   able to stage a deletion by its now-nonexistent path even after its
+///   parent directory is gone too. This delegates to [`resolve_for_create`],
+///   which anchors containment on the deepest *existing* ancestor (rejecting
+///   `..`/symlink escapes in the non-existent tail) instead of requiring the
+///   full path to already exist.
+/// - **Colon-magic prefixes are rejected outright, not parsed.** git
+///   pathspecs support `:(exclude)…`/`:!…`/`:^…` and `:/…` "magic"; the
+///   `:(top)`/`:/` forms explicitly re-anchor the pattern at the
+///   *repository* root rather than `root`, which would reopen the exact
+///   escape this function exists to close. A literal filename can never
+///   start with `:` in git's own CLI either (it requires `./:name` to
+///   disambiguate), so rejecting the whole class costs nothing real and
+///   avoids a bespoke magic-syntax parser as new attack surface. Glob
+///   wildcards (`*`, `?`, `[...]`) are unaffected — they carry no leading
+///   `:` and jail like any other path component, so git still expands them.
+pub fn resolve_pathspec_in_root(root: &Path, pathspec: &str) -> Result<PathBuf, String> {
+    if pathspec.starts_with(':') {
+        return Err(format!(
+            "access denied: pathspec {pathspec:?} uses ':' magic prefix syntax, which is \
+             not supported here (':(top)'/':/' can re-anchor a pattern at the repository \
+             root instead of the workspace root); pass a plain relative path or glob instead"
+        ));
+    }
+    resolve_for_create(root, pathspec)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -220,6 +252,40 @@ mod tests {
         let got = resolve_in_root(root.path(), r"MIXEDCASE.TXT")
             .expect("differently-cased inside-root file must be admitted");
         assert!(got.ends_with("MixedCase.txt"), "{got:?}");
+    }
+
+    #[test]
+    fn pathspec_allows_deleted_nested_path() {
+        // Neither `olddir` nor `olddir/removed.txt` exists on disk — a legitimate
+        // `git log -- olddir/removed.txt` query for a path whose parent is gone.
+        let dir = tempfile::tempdir().unwrap();
+        let got = resolve_pathspec_in_root(dir.path(), "olddir/removed.txt").unwrap();
+        assert!(got.ends_with("olddir/removed.txt") || got.ends_with(r"olddir\removed.txt"));
+    }
+
+    #[test]
+    fn pathspec_rejects_parent_traversal() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = resolve_pathspec_in_root(dir.path(), "../escape.txt").unwrap_err();
+        assert!(err.contains("access denied"), "{err}");
+    }
+
+    #[test]
+    fn pathspec_rejects_colon_magic() {
+        let dir = tempfile::tempdir().unwrap();
+        for bad in [":(exclude)foo", ":!foo", ":^foo", ":/etc/passwd"] {
+            let err = resolve_pathspec_in_root(dir.path(), bad)
+                .expect_err(&format!("{bad} should have been rejected"));
+            assert!(err.contains("magic"), "{bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn pathspec_allows_glob_literal() {
+        let dir = tempfile::tempdir().unwrap();
+        let got = resolve_pathspec_in_root(dir.path(), "src/*.rs").unwrap();
+        let s = got.to_string_lossy();
+        assert!(s.ends_with("*.rs"), "{s}");
     }
 
     #[cfg(windows)]

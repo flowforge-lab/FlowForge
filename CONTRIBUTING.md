@@ -76,6 +76,8 @@ Prefer `ReadOnly` whenever you can prove the tool doesn't mutate state; this giv
 use crate::jail::resolve_in_root; // for existing-file reads
 // or
 use crate::jail::resolve_for_create; // for new files whose parents may not exist yet
+// or
+use crate::jail::resolve_pathspec_in_root; // for git pathspecs (diff/log `path`, commit `paths`)
 ```
 
 These functions canonicalize both sides and reject any path that escapes `root` — including `..` traversal and symlink-anchored escapes. See [jail.rs](crates/ff-tools/src/jail.rs) for the full invariants.
