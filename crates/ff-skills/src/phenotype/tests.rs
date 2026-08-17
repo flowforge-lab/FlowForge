@@ -423,3 +423,27 @@ fn shipped_example_phenotypes_load_cleanly() {
         }
     }
 }
+
+#[test]
+fn shipped_codon_preheats_codegraph() {
+    // Codon is the only shipped phenotype that declares an MCP server, so it is the only
+    // one whose deferred tool can be preheated (RFC 0024 Layer 2, #1107 Phase 4). The name
+    // must match the bridged id `mcp__<server>__<tool>` exactly -- a typo is a silent no-op
+    // that leaves the preheat mechanism firing on nothing (the empty `turn_preheat` this
+    // phase started from). Pin the exact string so a future edit cannot drop or mistype it.
+    let dir = tempfile::tempdir().unwrap();
+    let codon = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../docs/examples/codon/phenos/codon.toml")
+        .canonicalize()
+        .expect("shipped codon phenotype");
+    fs::copy(&codon, dir.path().join("codon.toml")).unwrap();
+
+    let (map, errs) = load_phenotypes(dir.path());
+    assert!(errs.is_empty(), "shipped codon must parse: {errs:?}");
+    let p = map.get("codon").expect("codon is shipped");
+    assert_eq!(
+        p.preheat,
+        vec!["mcp__codegraph__codegraph_explore".to_string()],
+        "codon must preheat codegraph's bridged tool"
+    );
+}
