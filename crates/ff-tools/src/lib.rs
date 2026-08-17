@@ -17,6 +17,15 @@
 //!
 //! [`ask_user`] is interactive: it pauses the turn for user input (#44) rather than
 //! executing, so the agent loop routes it through the host's `Approver::ask`.
+//!
+//! # Crate contract
+//! - **Owns:** the built-in tool set and the registry that advertises it. Core
+//!   types: [`ToolRegistry`], [`AgentTool`].
+//! - **Does NOT own:** the approval *decision* (host-supplied via the `Approver`
+//!   in `ff-agent`) or MCP-bridged tools (`ff-mcp`) — it only classifies each
+//!   tool's [`Safety`] tier and enforces the jail.
+//! - **Depends on:** `ff-core`, `ff-memory`, `ff-session`.
+//! - **Depended on by:** `ff-agent`, `ff-mcp`, `ff-observer`, and the hosts.
 
 mod agent_tool;
 mod apply_patch;

@@ -18,6 +18,10 @@ the fallback, not the default.
 - **Git queries + mutations → the `git` tool** (status, diff, log, show, branch,
   commit). Not `bash git ...`. Whole branch→commit→push→draft-PR flow →
   `propose_pr`.
+- **Which crate does this belong in? → `ARCHITECTURE.md`** (repo root) — the
+  crate-level map: per-crate responsibility, boundaries, core types, and the
+  generated dependency graph. Read it to locate the right crate *before*
+  drilling into symbols with codegraph.
 - **Reading code → `codegraph_explore`** before grep/glob/read (run `tool_search`
   first — like `test_runner` it is not in the default set). It is the only tool
   codegraph advertises: upstream deliberately unlists the narrower ones

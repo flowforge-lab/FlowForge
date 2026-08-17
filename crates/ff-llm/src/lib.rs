@@ -3,6 +3,16 @@
 //! and [`OllamaProvider`] (Ollama-native NDJSON `/api/chat`). [`BedrockProvider`]
 //! (AWS Converse) and [`AnthropicProvider`] (native Messages API) land behind the
 //! same trait.
+//!
+//! # Crate contract
+//! - **Owns:** the provider abstraction and each backend's wire protocol
+//!   (SSE / NDJSON / Converse / Messages), request shaping, and stream parsing.
+//!   Core types: [`Provider`], [`OpenAiProvider`], [`OllamaProvider`],
+//!   [`BedrockProvider`], [`AnthropicProvider`].
+//! - **Does NOT own:** the turn loop or tool orchestration (`ff-agent`) — it
+//!   turns a message list into a model stream and nothing more.
+//! - **Depends on:** `ff-core` only.
+//! - **Depended on by:** `ff-agent`, `ff-acp`, `ff-transport`, and the hosts.
 
 pub mod tokenizer;
 pub use tokenizer::count_tokens;

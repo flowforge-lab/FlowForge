@@ -239,7 +239,10 @@ Every pull request — human or agent authored — is checked against this chart
 - [ ] **Pillar 3** — Does it keep data/workflows portable in *and* out?
 - [ ] **Pillar 4** — Does it pass fmt/clippy/lint, handle errors explicitly,
       match the change to the problem (no surplus abstraction or defense), and
-      stay easy to explain?
+      stay easy to explain? When it changes a crate's responsibility, boundary,
+      or `ff-*` dependencies, are `ARCHITECTURE.md` and the crate's `//!`
+      contract header updated in the same PR? (The dependency graph itself is
+      CI-enforced via `scripts/gen-arch-graph.sh --check`.)
 
 When pillars conflict, apply the numbered priority (1 > 2 > 3 > 4). When the
 priority produces an absurd result, invoke *"practicality beats purity"* and
