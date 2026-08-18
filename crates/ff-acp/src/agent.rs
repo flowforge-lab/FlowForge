@@ -4,7 +4,8 @@
 //! This is the server-side mirror of [`crate::client`]. Where `client` spawns an
 //! external agent and drives the client→agent requests, this module *answers*
 //! those requests: `initialize`, `session/new`, `session/load`, `session/prompt`,
-//! `session/set_mode`, `authenticate`, and the `session/cancel` notification.
+//! `session/set_mode`, `session/delete`, `authenticate`, and the `session/cancel`
+//! notification.
 //!
 //! ## Layering
 //!
@@ -27,6 +28,9 @@
 use std::sync::Arc;
 
 use agent_client_protocol::schema::v1 as wire;
+use agent_client_protocol::schema::v1::{
+    DeleteSessionRequest, DeleteSessionResponse, SessionCapabilities, SessionDeleteCapabilities,
+};
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::{Agent, Client, ConnectionTo, Responder, Result as AcpResult, Stdio};
 use async_trait::async_trait;
@@ -90,7 +94,9 @@ pub async fn connect<H: AcpHost>(
         .on_receive_request(
             async move |_req: wire::InitializeRequest, responder: Responder<_>, _cx| {
                 let resp = wire::InitializeResponse::new(ProtocolVersion::LATEST)
-                    .agent_capabilities(wire::AgentCapabilities::new());
+                    .agent_capabilities(wire::AgentCapabilities::new().session_capabilities(
+                        SessionCapabilities::new().delete(SessionDeleteCapabilities::new()),
+                    ));
                 responder.respond(resp)
             },
             agent_client_protocol::on_receive_request!(),
@@ -134,6 +140,18 @@ pub async fn connect<H: AcpHost>(
                         None => responder
                             .respond_with_error(agent_client_protocol::Error::invalid_params()),
                     }
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let host = Arc::clone(&host);
+                let sessions = Arc::clone(&sessions);
+                async move |req: DeleteSessionRequest, responder: Responder<_>, _cx| {
+                    sessions.delete_session(&req.session_id);
+                    host.store().delete_session(req.session_id.0.as_ref());
+                    responder.respond(DeleteSessionResponse::new())
                 }
             },
             agent_client_protocol::on_receive_request!(),

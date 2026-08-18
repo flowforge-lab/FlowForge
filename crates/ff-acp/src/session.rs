@@ -88,6 +88,23 @@ impl SessionRegistry {
         self.entries().remove(&session.0);
     }
 
+    /// Tear down a session for good on the `session/delete` lifecycle signal.
+    ///
+    /// Drops the session's **per-turn cancel token and its per-session mode together**,
+    /// then cancels any still-in-flight turn. This is the one cleanup point that keeps
+    /// the mode map bounded in a long-lived host process: `session/new` seeds a mode
+    /// entry and every `session/set_mode` replaces it, but nothing else ever removes it.
+    ///
+    /// Returns whether the session was known in either map, so a caller can ignore an
+    /// unknown session without treating it as a fault. Idempotent: deleting an unknown
+    /// or already-deleted session is a no-op.
+    pub fn delete_session(&self, session: &wire::SessionId) -> bool {
+        let had_token = self.cancel(session);
+        let had_mode = self.mode_entries().remove(&session.0).is_some();
+        self.remove(session);
+        had_token || had_mode
+    }
+
     /// Record the mode a session should run in, replacing any previous value.
     ///
     /// Called at `session/new` (seeding the default) and on every `session/set_mode`.
@@ -175,6 +192,72 @@ mod tests {
         assert_eq!(reg.len(), 1);
         reg.remove(&id("sess"));
         assert!(reg.is_empty());
+    }
+
+    #[test]
+    fn delete_drops_token_and_mode_together() {
+        let reg = SessionRegistry::new();
+        let token = CancelToken::new();
+        reg.register(&id("sess"), token.clone());
+        reg.set_mode(&id("sess"), Mode::Act);
+
+        assert!(reg.delete_session(&id("sess")));
+
+        // Both maps are clean: the token is gone and the mode fell back to default.
+        assert!(
+            reg.is_empty(),
+            "the cancel-token map must not retain the id"
+        );
+        assert_eq!(reg.mode(&id("sess")), Mode::default());
+        assert!(
+            !reg.cancel(&id("sess")),
+            "a deleted session cannot cancel an in-flight turn"
+        );
+    }
+
+    #[test]
+    fn delete_cancels_an_in_flight_turn() {
+        let reg = SessionRegistry::new();
+        let token = CancelToken::new();
+        reg.register(&id("sess"), token.clone());
+        reg.set_mode(&id("sess"), Mode::Act);
+
+        assert!(reg.delete_session(&id("sess")));
+        assert!(
+            token.is_cancelled(),
+            "deleting a session with an in-flight turn must cancel that turn"
+        );
+    }
+
+    #[test]
+    fn delete_only_clears_its_own_session() {
+        let reg = SessionRegistry::new();
+        reg.set_mode(&id("keep"), Mode::Act);
+        reg.set_mode(&id("drop"), Mode::Auto);
+
+        assert!(reg.delete_session(&id("drop")));
+        assert_eq!(reg.mode(&id("keep")), Mode::Act);
+        assert_eq!(reg.mode(&id("drop")), Mode::default());
+    }
+
+    #[test]
+    fn delete_unknown_session_is_a_noop() {
+        let reg = SessionRegistry::new();
+        assert!(!reg.delete_session(&id("never_seen")));
+        assert!(reg.is_empty());
+    }
+
+    /// `delete_session` is the per-session counterpart to per-turn [`SessionRegistry::remove`]
+    /// and must still clear the mode when the token map is already empty (e.g. the session
+    /// outlived its last turn).
+    #[test]
+    fn delete_clears_mode_even_without_a_live_turn() {
+        let reg = SessionRegistry::new();
+        reg.set_mode(&id("sess"), Mode::Act);
+        reg.remove(&id("sess"));
+
+        assert!(reg.delete_session(&id("sess")));
+        assert_eq!(reg.mode(&id("sess")), Mode::default());
     }
 
     /// A panic while the lock is held must not disable cancellation for the rest of the

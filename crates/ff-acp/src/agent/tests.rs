@@ -371,3 +371,51 @@ async fn llm_error_reports_end_turn_not_cancelled() {
 
     agent.abort();
 }
+
+// ---- session/delete cleans up the session registry and store ----
+
+#[tokio::test]
+async fn delete_session_removes_session_from_store() {
+    let host = Arc::new(TestHost::new(Behaviour::CallWedgeTool));
+    let host_for_agent = Arc::clone(&host);
+    let (client_chan, agent) = spawn_agent(host_for_agent);
+
+    agent_client_protocol::Client
+        .builder()
+        .connect_with(client_chan, |connection: ConnectionTo<Agent>| async move {
+            let session_id = init_and_new_session(&connection).await?;
+            let id_str = session_id.0.as_ref().to_string();
+
+            assert!(
+                host.store().get_session(&id_str).is_some(),
+                "session must exist in the store after session/new"
+            );
+
+            // Set a non-default mode so the test exercises the mode path.
+            connection
+                .send_request(wire::SetSessionModeRequest::new(
+                    session_id.clone(),
+                    wire::SessionModeId::new("act"),
+                ))
+                .block_task()
+                .await?;
+
+            // Send session/delete.
+            connection
+                .send_request(wire::DeleteSessionRequest::new(session_id.clone()))
+                .block_task()
+                .await?;
+
+            // The session is removed from the store.
+            assert!(
+                host.store().get_session(&id_str).is_none(),
+                "session must be removed from the store after session/delete"
+            );
+
+            Ok(())
+        })
+        .await
+        .expect("client connection");
+
+    agent.abort();
+}
