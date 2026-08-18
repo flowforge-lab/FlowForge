@@ -192,6 +192,14 @@ pub(crate) fn denial_message(tool_name: &str, reason: &DenyReason) -> String {
         DenyReason::Cancelled => format!(
             "call to `{tool_name}` was not run: the turn was cancelled before the approval was answered."
         ),
+        // The "do not retry" clause is load-bearing, not politeness: without it an
+        // autonomous loop re-calls the tool, raises a fresh prompt nobody is there
+        // to answer either, and burns one full timeout per iteration (#1270).
+        DenyReason::Unanswered => format!(
+            "call to `{tool_name}` was not run: the approval request expired with no answer \
+             — nobody was available to respond. Do not retry it; report that this action \
+             could not be performed and continue with what you can do without it."
+        ),
     }
 }
 

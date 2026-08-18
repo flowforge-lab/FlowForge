@@ -414,7 +414,10 @@ impl Approver for SlackApprover {
                     timeout_secs = self.timeout.as_secs(),
                     "no slack approval within the timeout; denying"
                 );
-                ApprovalOutcome::Denied(DenyReason::NoInteractiveTerminal)
+                // Not `NoInteractiveTerminal` (#1270): a prompt *was* posted, so
+                // there was an approval surface — nobody clicked it. Saying
+                // otherwise misreports why the call failed.
+                ApprovalOutcome::Denied(DenyReason::Unanswered)
             }
         }
     }

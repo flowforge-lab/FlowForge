@@ -205,7 +205,6 @@ fn matrix_gate(cell: PermissionCell) -> Option<bool> {
 
 /// Routes write/dangerous tool calls through a UI confirmation. Read-only calls
 /// never reach this approver — the agent loop short-circuits them.
-/// Whether the active autonomy mode auto-approves a call of this safety without a
 struct UiApprover<R: tauri::Runtime> {
     app: tauri::AppHandle<R>,
     state: Arc<AppState>,
@@ -221,6 +220,10 @@ struct UiApprover<R: tauri::Runtime> {
     /// per-call `propose_pr -> Allow` override to the matrix *snapshot* only —
     /// never the shared singleton — so authorisation is scoped to this goal loop.
     allow_propose_pr: bool,
+    /// How long to wait for a human before giving up on a prompt (#1270). Set
+    /// per construction site: generous for a foreground chat turn, short inside
+    /// a goal iteration where nobody may be present at all.
+    approval_timeout: Duration,
 }
 
 #[async_trait]
@@ -308,11 +311,22 @@ impl<R: tauri::Runtime> Approver for UiApprover<R> {
                 safety: approval_safety,
             },
         );
-        // Sender dropped (cancel) -> RecvError -> deny.
-        if rx.await.unwrap_or(false) {
-            ApprovalOutcome::Allowed
-        } else {
-            ApprovalOutcome::Denied(DenyReason::User)
+        match tokio::time::timeout(self.approval_timeout, rx).await {
+            Ok(Ok(true)) => ApprovalOutcome::Allowed,
+            // Explicit deny, or sender dropped (cancel) -> RecvError -> deny.
+            Ok(_) => ApprovalOutcome::Denied(DenyReason::User),
+            // Nobody answered before the deadline (#1270). Distinct from a user
+            // deny: attributing this to the user records a decision that never
+            // happened, and the model should be told it can stop waiting.
+            Err(_elapsed) => {
+                tracing::warn!(
+                    tool = %name,
+                    timeout_secs = self.approval_timeout.as_secs(),
+                    "no approval answer within the timeout; denying as unanswered"
+                );
+                self.state.discard_approval(&self.session_id, call_id);
+                ApprovalOutcome::Denied(DenyReason::Unanswered)
+            }
         }
     }
 
@@ -344,8 +358,16 @@ impl<R: tauri::Runtime> Approver for UiApprover<R> {
                 secret,
             },
         );
-        // Sender dropped (cancel/teardown) -> RecvError -> dismissed (None).
-        rx.await.ok()
+        match tokio::time::timeout(self.approval_timeout, rx).await {
+            // Sender dropped (cancel/teardown) -> RecvError -> dismissed (None).
+            Ok(answered) => answered.ok(),
+            // Unanswered by the deadline resolves the same way a dismissal does:
+            // the loop already renders `None` as "[no answer: question dismissed]".
+            Err(_elapsed) => {
+                self.state.discard_ask(&self.session_id, call_id);
+                None
+            }
+        }
     }
 }
 
@@ -1676,6 +1698,7 @@ fn spawn_assistant_turn(
             mode,
             autonomous: false,
             allow_propose_pr: false,
+            approval_timeout: CHAT_APPROVAL_TIMEOUT,
         };
         // Point the workspace-aware MCP server (codegraph) at this session's workspace
         // before snapshotting tools, so its code graph reflects the active checkout
@@ -2115,6 +2138,35 @@ fn spawn_assistant_turn(
 /// timeout the turn is cancelled and the iteration is recorded as failed.
 const GOAL_ITERATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
 
+/// How long a foreground chat turn waits for a human to answer an approval
+/// prompt (#1270). Generous — the user may legitimately step away mid-turn —
+/// but not infinite, so an abandoned turn eventually releases instead of parking
+/// forever holding its context.
+const CHAT_APPROVAL_TIMEOUT: Duration = Duration::from_secs(1800);
+
+/// The same wait inside a goal iteration, where the whole point of the loop is to
+/// make progress with nobody present, so giving up early is the useful behaviour.
+///
+/// Since #1256, `approve` short-circuits before this ever applies: an `autonomous`
+/// approver turns a `Prompt` into an immediate deny rather than raising a request
+/// nobody can answer. So the live consumer of this constant is [`UiApprover::ask`],
+/// which has no such short-circuit — a goal-loop `ask_user` still raises a real
+/// question, and without a bound it would park the loop exactly as #1270 describes.
+///
+/// MUST stay below [`GOAL_ITERATION_TIMEOUT`]: if the iteration budget expired
+/// first, the turn is recorded as a *failure* rather than the model converging on
+/// a stated dismissal — which is the entire point of the fix.
+const GOAL_APPROVAL_TIMEOUT: Duration = Duration::from_secs(300);
+
+// That ordering is the whole fix, so pin it at compile time rather than trusting
+// the comment: lowering the iteration budget under the approval budget would
+// silently restore the "iteration failed" behaviour this issue set out to remove.
+const _: () = assert!(
+    GOAL_APPROVAL_TIMEOUT.as_secs() < GOAL_ITERATION_TIMEOUT.as_secs(),
+    "GOAL_APPROVAL_TIMEOUT must expire before GOAL_ITERATION_TIMEOUT, or an \
+     unanswered prompt fails the iteration instead of denying the call"
+);
+
 /// The neutral continuation nudge seeded as the user turn when a goal iteration
 /// has no pending steer (#778). It deliberately does NOT repeat the objective:
 /// the system-prompt goal block (#718, `ff_agent::system_prompt`) already carries
@@ -2236,6 +2288,7 @@ impl GoalIteration for GoalLoopIteration {
             mode,
             autonomous: true,
             allow_propose_pr: goal.allow_propose_pr,
+            approval_timeout: GOAL_APPROVAL_TIMEOUT,
         };
         // Snapshot the matrix for this turn (#702); see the other turn paths. An
         // authorised goal (#1256) carries the same per-tool `propose_pr -> Allow`

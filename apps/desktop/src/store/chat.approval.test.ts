@@ -178,3 +178,51 @@ describe("chat store — four-option approval (#229)", () => {
     expect(grepStep?.sessionApproved).toBe(true);
   });
 });
+
+// #1270: the backend now expires an approval nobody answered and denies it. It
+// emits no "prompt is dead" event — the resulting tool:result is what retires
+// the prompt, exactly as a turn-cancel deny already does. That makes this the
+// frontend half of the fix: if `applyToolResult` ever stopped overwriting an
+// awaiting status, an expired prompt would sit there forever accepting clicks
+// that go nowhere.
+describe("chat store — an expired approval prompt is dismissed (#1270)", () => {
+  beforeEach(() => {
+    useChatStore.setState({
+      toolStepsByMessage: {},
+      sessionApprovedBySession: {},
+      alwaysApproved: new Set<string>(),
+    });
+  });
+
+  it("a denial result clears a step still awaiting approval", () => {
+    seedStep();
+    expect(stepOf()?.status).toBe("awaiting-approval");
+
+    useChatStore.getState().applyToolResult({
+      sessionId: SESSION,
+      messageId: MESSAGE,
+      callId: CALL,
+      success: false,
+      result:
+        "call to `edit` was not run: the approval request expired with no answer",
+    });
+
+    expect(stepOf()?.status).toBe("error");
+    expect(stepOf()?.result).toContain("expired with no answer");
+  });
+
+  it("a denial result clears a step still awaiting an ask_user answer", () => {
+    seedStep({ status: "awaiting-answer", question: "still there?" });
+    expect(stepOf()?.status).toBe("awaiting-answer");
+
+    useChatStore.getState().applyToolResult({
+      sessionId: SESSION,
+      messageId: MESSAGE,
+      callId: CALL,
+      success: false,
+      result: "[no answer: question dismissed]",
+    });
+
+    expect(stepOf()?.status).toBe("error");
+  });
+});

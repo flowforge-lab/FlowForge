@@ -664,6 +664,17 @@ pub enum DenyReason {
     /// answer every pending `session/request_permission` with `cancelled` when it
     /// sends `session/cancel`, and that answer needs somewhere faithful to land.
     Cancelled,
+    /// The approval prompt was never answered and its deadline expired.
+    ///
+    /// Deliberately distinct from [`DenyReason::User`] (nobody declined) and from
+    /// [`DenyReason::Cancelled`] (nobody interrupted): the request simply reached
+    /// no one. Named for the state rather than the mechanism so it reads true for
+    /// every approver — a Slack prompt nobody clicked and a desktop dialog nobody
+    /// answered are the same thing.
+    ///
+    /// Introduced for autonomous operation (#1270), where a goal loop can reach an
+    /// `Ask` cell with no human present and would otherwise wait forever.
+    Unanswered,
 }
 
 /// The synchronous, pre-prompt decision for a tool call (#828 Part C, #829 review).
