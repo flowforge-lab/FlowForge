@@ -1,25 +1,34 @@
-//! Goal mode: the self-continue loop skeleton (RFC 0020 §5.2, #716).
+//! Goal mode: the self-continue loop (RFC 0020 §5.2, #716).
 //!
 //! This is the headless driver that turns a durable [`Goal`] into repeated
 //! agent turns until the objective is met, a budget dimension is exhausted, the
 //! user pauses, or a stop condition fires. It deliberately mirrors the
 //! `ff-scheduled` runner design: the loop mechanics (budget accrual,
-//! checkpointing, boundary decisions, gating placeholder) live here behind the
+//! checkpointing, boundary decisions, matrix-backed gating) live here behind the
 //! [`GoalIteration`] trait, so the desktop host supplies an impl that wraps
 //! `spawn_assistant_turn` / `run_turn` while the mechanics are exercised by
 //! stubs in unit tests — no Tauri, no real provider needed.
 //!
-//! ## What this skeleton does NOT do yet (per #716 "Scope (out)")
-//! - **Real permission-matrix gating.** The loop consults a [`GateDecision`]
-//!   supplied by the host through [`GoalIteration::gate`]; #719/#682 will feed it
-//!   the matrix cell. Today the host passes *today's* `mode_auto_approves`
-//!   placeholder — a one-line swap at that single seam.
-//! - **`ask_user` mid-loop pause wiring** (Track F) — the loop already honors a
-//!   [`GateDecision::Pause`] boundary, so wiring Ask later is just returning
-//!   `Pause` from `gate`.
-//! - **Rich ledger verdicts.** The skeleton appends only the minimal boundary
-//!   bookkeeping the host hands back; evidence-first verdict adjudication is a
-//!   separate, larger piece.
+//! ## Feature state
+//! - **Permission-matrix gating (wired).** The loop consults a [`GateDecision`]
+//!   supplied by the host through [`GoalIteration::gate`]. The desktop host
+//!   serves a real decision from `PermissionMatrix.cell(mode, Safety::Sensitive)`
+//!   read live (#719), so a Control-panel matrix edit takes effect on the next
+//!   boundary. This is a *coarse loop pre-flight* gate — it only decides whether
+//!   to spend another unattended iteration on the `Sensitive` tier. Per-tool
+//!   matrix gating (including the Ask *prompt* and `Dangerous`→deny) still runs
+//!   inside the turn via the shared matrix, enforced by the host.
+//! - **`ask_user` mid-loop pause** (Track F) — the loop honors a
+//!   [`GateDecision::Pause`] boundary, and the desktop host already returns
+//!   `Pause` when the active mode's matrix cell for `Sensitive` is `Ask` (e.g.
+//!   Auto). The remaining Track F piece is the interactive boundary *prompt*:
+//!   asking the user a question at the pause and resuming the loop with their
+//!   answer (today a paused goal is surfaced and resumable via `pending_steer`).
+//! - **Ledger steps (wired).** The agent records claim/verdict/evidence entries
+//!   per turn via `goal_step` (#1225); the loop commits them to `Goal.ledger` at
+//!   the iteration boundary, and the prompt renders the recent entries back into
+//!   the next iteration (#1242). A failed `verify_cmd` (`#684 D3`) appends a
+//!   `Drift` entry whose evidence is the command's output.
 
 use std::panic::AssertUnwindSafe;
 
@@ -45,22 +54,25 @@ pub enum LoopStop {
 }
 
 /// The gate decision applied at the top of each iteration (RFC 0020 §5.2). This
-/// is the single seam where #719/#682 will plug the permission matrix; the
-/// skeleton lets the host return today's placeholder verdict.
+/// is the coarse loop-continuation seam: the host returns a real decision from
+/// `PermissionMatrix.cell(mode, Safety::Sensitive)` read live (#719). Per-tool
+/// matrix gating — including the Ask *prompt* and `Dangerous`→deny — still runs
+/// inside the turn via the shared matrix.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GateDecision {
     /// Run this iteration.
     Proceed,
     /// Halt at this boundary and mark the goal `Paused` (resumable). Used for the
-    /// future `ask_user` circuit-breaker join point.
+    /// `ask_user` circuit-breaker join point and for an `Ask` matrix cell.
     Pause,
     /// Halt and mark the goal `Failed` (a policy denial that is not resumable).
     Deny,
 }
 
 /// The result of one agent turn, handed back by [`GoalIteration::run_once`] so
-/// the loop can accrue spend, checkpoint, and detect completion. Kept minimal on
-/// purpose (skeleton): richer ledger evidence is a later piece.
+/// the loop can accrue spend, checkpoint, and detect completion. Carries the
+/// `goal_step` ledger entries the host collected off the event stream (#1225);
+/// the loop commits them to `Goal.ledger` at the iteration boundary.
 #[derive(Debug, Clone, Default)]
 pub struct IterationOutcome {
     /// Tokens consumed by this turn, added to `Goal.spent.tokens`.
@@ -180,9 +192,11 @@ pub async fn run_verify_command(goal: &Goal, workspace: &std::path::Path) -> Ver
 /// persistence at the boundary is the host's job via [`GoalIteration::save`].
 #[async_trait]
 pub trait GoalIteration: Send + Sync {
-    /// Gate the *next* iteration before it runs. #719 swaps this for a matrix
-    /// lookup; the placeholder host returns [`GateDecision::Proceed`] whenever
-    /// today's mode would auto-approve.
+    /// Gate the *next* iteration before it runs. The host returns a real
+    /// decision from the permission matrix: `PermissionMatrix.cell(mode,
+    /// Safety::Sensitive)` → [`GateDecision`] (#719), read live so a matrix edit
+    /// takes effect on the next boundary. A host that has not wired the matrix
+    /// (e.g. the CLI runner) returns [`GateDecision::Proceed`].
     fn gate(&self, goal: &Goal) -> GateDecision;
 
     /// Drive one agent turn toward the objective and report what it consumed.
