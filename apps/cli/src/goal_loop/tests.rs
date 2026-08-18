@@ -145,3 +145,20 @@ fn handle_event_routes_goal_steps_to_the_shared_ledger() {
     assert_eq!(steps.len(), 1);
     assert_eq!(steps[0].claim, "ran the suite");
 }
+
+// AC6 (#1256): the goal loop must never auto-approve every call via
+// `ApprovalMode::Yes` — that silently consented to Sensitive/Publish work the
+// user never authorised. It now builds a matrix-gated autonomous approver. A
+// source guard so a future edit cannot quietly restore the old wiring.
+#[test]
+fn goal_loop_does_not_impersonate_yes_policy() {
+    let src = include_str!("../goal_loop.rs");
+    assert!(
+        !src.contains("ApprovalMode::Yes"),
+        "goal loop must not construct ApprovalMode::Yes (#1256 AC6)"
+    );
+    assert!(
+        src.contains("CliApprover::autonomous"),
+        "goal loop must build the matrix-gated autonomous approver (#1256)"
+    );
+}

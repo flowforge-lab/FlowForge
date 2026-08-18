@@ -10,6 +10,7 @@ import {
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
 import { Input } from "@/components/ui/input";
+import { Switch } from "@/components/ui/switch";
 import { Textarea } from "@/components/ui/textarea";
 import { useGoalDialogStore } from "@/store/goal-dialog";
 import { useGoalStore } from "@/store/goal";
@@ -33,6 +34,10 @@ function StartGoalDialogBody({ sessionId }: { sessionId: string }) {
   // Left blank => the backend applies its own default (RFC 0020: 40), so the FE
   // never hardcodes a value that could drift from the backend default.
   const [maxIterations, setMaxIterations] = useState("");
+  // Off by default (#1256): an authorised goal may open a draft PR via
+  // `propose_pr` on completion; otherwise it reports the branch/commit/PR it
+  // would open and stops. A Publish-tier grant, so it is an explicit opt-in.
+  const [allowProposePr, setAllowProposePr] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const objectiveRef = useRef<HTMLTextAreaElement>(null);
 
@@ -50,7 +55,7 @@ function StartGoalDialogBody({ sessionId }: { sessionId: string }) {
     if (!canStart) return;
     setSubmitting(true);
     try {
-      await start(sessionId, trimmed, parsedMaxIterations());
+      await start(sessionId, trimmed, parsedMaxIterations(), allowProposePr);
       close();
     } catch {
       // The backend rejected the goal (e.g. a loop is already running for this
@@ -104,6 +109,19 @@ function StartGoalDialogBody({ sessionId }: { sessionId: string }) {
               placeholder="40"
               className="w-24"
               aria-label="Max iterations"
+            />
+          </label>
+          <label className="flex items-center justify-between gap-3 text-[13px] text-muted-foreground">
+            <span>
+              Allow this goal to open a draft PR
+              <span className="block text-[11px] opacity-70">
+                Off: it reports the branch and PR it would open, and stops.
+              </span>
+            </span>
+            <Switch
+              checked={allowProposePr}
+              onCheckedChange={setAllowProposePr}
+              aria-label="Allow this goal to open a draft PR"
             />
           </label>
         </div>

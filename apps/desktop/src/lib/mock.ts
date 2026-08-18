@@ -2649,6 +2649,7 @@ Shipping the Settings redesign — currently the Memory browser (SET.8).
     maxIterations?: number,
     maxTokens?: number,
     maxWallMs?: number,
+    allowProposePr?: boolean,
   ): Promise<Goal> {
     this.flushPending(sessionId);
     const budget: GoalBudget = {
@@ -2656,7 +2657,12 @@ Shipping the Settings redesign — currently the Memory browser (SET.8).
       maxTokens: maxTokens ?? undefined,
       maxWallMs: maxWallMs ?? undefined,
     };
-    return this.startGoal(sessionId, objective, budget);
+    return this.startGoal(
+      sessionId,
+      objective,
+      budget,
+      allowProposePr ?? false,
+    );
   }
 
   async goalStatus(sessionId: string): Promise<Goal | null> {
@@ -2823,6 +2829,7 @@ Shipping the Settings redesign — currently the Memory browser (SET.8).
     sessionId: string,
     objective: string,
     budget?: GoalBudget,
+    allowProposePr = false,
   ): Goal {
     this.stopGoalTimer(sessionId);
     const ts = now();
@@ -2834,6 +2841,7 @@ Shipping the Settings redesign — currently the Memory browser (SET.8).
       budget: budget ?? { maxIterations: GOAL_DEFAULT_MAX_ITERATIONS },
       spent: { tokens: 0, wallMs: 0 },
       ledger: [],
+      allowProposePr,
       createdMs: ts,
       updatedMs: ts,
     };

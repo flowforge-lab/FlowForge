@@ -74,6 +74,16 @@ pub struct Goal {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub verify_cmd: Option<String>,
+    /// Whether this goal may call `propose_pr` — the `Publish`-tier affordance
+    /// that pushes a branch and opens a draft PR (#684 D1, #1256). Off by
+    /// default: the loop implements and verifies autonomously, but the external
+    /// mutation stays an explicit, per-goal grant. When true, the host's
+    /// approver overrides `propose_pr`'s cell to `Allow` for this goal only, and
+    /// the prompt invites the loop to propose once the objective is met; when
+    /// false, `propose_pr` keeps its default `Ask`/deny posture and the prompt
+    /// tells the loop to report the branch/commit/PR it *would* open, and stop.
+    #[serde(default)]
+    pub allow_propose_pr: bool,
     #[serde(default)]
     #[ts(type = "number")]
     pub created_ms: i64,
@@ -236,6 +246,7 @@ impl Goal {
             ledger: Vec::new(),
             pending_steer: None,
             verify_cmd: None,
+            allow_propose_pr: false,
             created_ms: now_ms,
             updated_ms: now_ms,
         }

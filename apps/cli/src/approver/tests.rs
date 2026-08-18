@@ -245,3 +245,73 @@ async fn was_denied_stays_false_when_a_call_is_allowed_by_yes() {
         "was_denied() must stay false when the call is allowed"
     );
 }
+
+// ── Autonomous goal mode (#1256) ─────────────────────────────────────────────
+// The goal loop builds a matrix-gated approver with no interactive fallback.
+// `Allow` cells (incl. a `propose_pr` override) proceed; everything else denies
+// cleanly so the model routes to the report-only branch instead of blocking.
+
+use ff_core::{PermissionCell, PermissionMatrix};
+
+#[tokio::test]
+async fn autonomous_allows_write_via_default_matrix() {
+    let approver = CliApprover::autonomous(Mode::Auto, PermissionMatrix::default());
+    let outcome = approver
+        .approve(
+            "msg",
+            "call",
+            "write",
+            Safety::Write,
+            &serde_json::json!({}),
+        )
+        .await;
+    assert!(
+        matches!(outcome, ApprovalOutcome::Allowed),
+        "Auto/Write is Allow in the default matrix, so goal work proceeds"
+    );
+    assert!(!approver.was_denied());
+}
+
+#[tokio::test]
+async fn autonomous_denies_propose_pr_without_override() {
+    // AC7: an unauthorised goal never reaches the remote — Auto/Publish is `Ask`
+    // in the default matrix, which the autonomous approver collapses to a deny.
+    let approver = CliApprover::autonomous(Mode::Auto, PermissionMatrix::default());
+    let outcome = approver
+        .approve(
+            "msg",
+            "call",
+            "propose_pr",
+            Safety::Publish,
+            &serde_json::json!({}),
+        )
+        .await;
+    assert!(
+        matches!(outcome, ApprovalOutcome::Denied(_)),
+        "propose_pr must be denied when the goal is not authorised, got {outcome:?}"
+    );
+    assert!(approver.was_denied());
+}
+
+#[tokio::test]
+async fn autonomous_allows_propose_pr_with_override() {
+    // AC4: an authorised goal carries a per-tool `propose_pr -> Allow` override,
+    // so the call proceeds without a prompt.
+    let mut matrix = PermissionMatrix::default();
+    matrix.set_override("propose_pr", PermissionCell::Allow);
+    let approver = CliApprover::autonomous(Mode::Auto, matrix);
+    let outcome = approver
+        .approve(
+            "msg",
+            "call",
+            "propose_pr",
+            Safety::Publish,
+            &serde_json::json!({}),
+        )
+        .await;
+    assert!(
+        matches!(outcome, ApprovalOutcome::Allowed),
+        "an authorised goal's propose_pr override must Allow, got {outcome:?}"
+    );
+    assert!(!approver.was_denied());
+}

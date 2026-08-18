@@ -129,9 +129,15 @@ impl GoalIteration for CliGoalIteration {
         self.session_store
             .add_message(&goal.session_id, Role::User, prompt);
 
-        let matrix = PermissionMatrix::default();
-        let approver =
-            crate::approver::CliApprover::new(crate::approver::ApprovalMode::Yes, Mode::Auto);
+        // Goal mode runs autonomously: the permission matrix is the whole gate,
+        // with no interactive `--yes` impersonation (#1256). `goal_matrix` adds
+        // the per-tool `propose_pr -> Allow` override iff the goal is authorised,
+        // so the loop can open a draft PR on completion; every other
+        // Sensitive/Publish call is refused rather than silently auto-approved as
+        // the old always-yes policy did. The shared helper keeps this identical
+        // to the desktop host (#1222 host-divergence lesson).
+        let matrix = ff_agent::goal_matrix(PermissionMatrix::default(), goal.allow_propose_pr);
+        let approver = crate::approver::CliApprover::autonomous(Mode::Auto, matrix.clone());
         let tool_ctx = ToolContext::new(
             &self.registry,
             &self.workspace,
@@ -217,6 +223,7 @@ impl GoalIteration for CliGoalIteration {
         let mut outcome = IterationOutcome {
             wall_ms: elapsed,
             goal_complete: state.ledger.completed(),
+            proposed_pr: state.ledger.proposed_pr(),
             tokens: state.tokens,
             steer_consumed,
             ledger_steps: state.ledger.into_steps(),

@@ -21,6 +21,7 @@ interface GoalState {
     sessionId: string,
     objective: string,
     maxIterations?: number,
+    allowProposePr?: boolean,
   ) => Promise<void>;
   /** Fetch the current snapshot on panel mount, closing the race where a goal
    *  exists before the event listener attached. Best-effort. */
@@ -43,8 +44,15 @@ export const useGoalStore = create<GoalState>((set) => ({
       bySession: { ...s.bySession, [goal.sessionId]: goal },
     })),
 
-  start: async (sessionId, objective, maxIterations) => {
-    const goal = await ipc.goalSet(sessionId, objective, maxIterations);
+  start: async (sessionId, objective, maxIterations, allowProposePr) => {
+    const goal = await ipc.goalSet(
+      sessionId,
+      objective,
+      maxIterations,
+      undefined,
+      undefined,
+      allowProposePr,
+    );
     set((s) => ({ bySession: { ...s.bySession, [sessionId]: goal } }));
   },
 

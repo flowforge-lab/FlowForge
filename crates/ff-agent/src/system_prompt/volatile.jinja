@@ -22,6 +22,9 @@ Objective: {{ goal.objective }}
 
 {% endif -%}
 
-Continue toward the objective. If it is fully met, call `goal_complete`.
- State your reasoning before each action.
+{% if goal.allow_propose_pr -%}
+Continue toward the objective. Once it is fully met and verified, complete the goal and open its draft PR in a single final turn: emit `goal_complete` and `propose_pr` together in the same turn (both tool calls in one response), because the loop stops the moment the goal is marked complete — a `goal_complete` alone ends the run and the PR is never opened. Call `propose_pr` exactly once, only after the objective is met; if it fails, report the failure — do not call it a second time.
+{% else -%}
+Continue toward the objective. If it is fully met, call `goal_complete`. Do not push a branch or open a PR: instead, state the branch name, commit message, and PR body you would propose, and stop.
+{% endif %} State your reasoning before each action.
 {% endif -%}

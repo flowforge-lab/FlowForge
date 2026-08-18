@@ -69,6 +69,10 @@ pub struct IterationOutcome {
     pub wall_ms: i64,
     /// The agent signalled the objective is met this turn (`goal_complete`).
     pub goal_complete: bool,
+    /// A `propose_pr` call finished successfully this turn (#1256). Used only to
+    /// detect an authorised goal that completed *without* opening its PR — the
+    /// silent-drop case finding 3 flagged — so the loop can record it observably.
+    pub proposed_pr: bool,
     /// The user interrupted the turn (Stop button). The loop halts and leaves the
     /// goal **`Paused`** — resumable from the last checkpoint — not `Failed`.
     /// Takes precedence over `failed` (a cancel often also surfaces as an error).
@@ -174,6 +178,33 @@ pub async fn run_verify_command(goal: &Goal, workspace: &std::path::Path) -> Ver
     }
 }
 
+/// Build the permission matrix that gates a goal-loop iteration (#1256). Shared
+/// by both hosts (CLI + desktop) so the authorisation wiring cannot drift — the
+/// #1222 host-divergence lesson, and the single place a test can pin the
+/// `Goal.allow_propose_pr` → override mapping so deleting it fails.
+///
+/// Starts from `base` (the host's live matrix snapshot) and, when `authorised`,
+/// adds a per-tool `propose_pr -> Allow` override so the loop can open a draft
+/// PR on completion. When not authorised it returns `base` unchanged, leaving
+/// `propose_pr` at its default `Ask`/deny posture.
+///
+/// A user's explicit `propose_pr -> Deny` override is never overridden: an
+/// operator who has forbidden the tool outranks a per-goal grant, so the insert
+/// is skipped in that case (the goal is then denied and routes to report-only).
+pub fn goal_matrix(base: ff_core::PermissionMatrix, authorised: bool) -> ff_core::PermissionMatrix {
+    let mut matrix = base;
+    if authorised
+        && matrix.overrides().get(ff_tools::PROPOSE_PR_TOOL_NAME)
+            != Some(&ff_core::PermissionCell::Deny)
+    {
+        matrix.set_override(
+            ff_tools::PROPOSE_PR_TOOL_NAME,
+            ff_core::PermissionCell::Allow,
+        );
+    }
+    matrix
+}
+
 /// One iteration of the goal loop, abstracted so the loop mechanics are testable
 /// without Tauri / a real provider (mirrors `ff-scheduled::TaskRunner`). The
 /// desktop host implements this over `spawn_assistant_turn` / `run_turn`;
@@ -273,6 +304,12 @@ pub struct TurnLedger {
     /// promoted to `completed` when that same call finishes successfully.
     gc_call_id: Option<String>,
     completed: bool,
+    /// Call id of a `propose_pr` invocation seen this turn, pending its result.
+    pp_call_id: Option<String>,
+    /// Whether a `propose_pr` call finished successfully this turn (#1256). Lets
+    /// the loop detect an authorised goal that completed without opening its PR —
+    /// the silent-drop case finding 3 flagged — and record it observably.
+    proposed_pr: bool,
     /// `goal_step` calls parsed at `Started` but not yet resolved, keyed by call
     /// id. A step is committed only when its call finishes successfully.
     pending: std::collections::HashMap<String, LedgerStep>,
@@ -292,6 +329,11 @@ impl TurnLedger {
             {
                 self.gc_call_id = Some(call_id.clone());
             }
+            AgentEvent::ToolCallStarted { call_id, name, .. }
+                if name == ff_tools::PROPOSE_PR_TOOL_NAME =>
+            {
+                self.pp_call_id = Some(call_id.clone());
+            }
             // A tool's `run` gets no `Goal` handle, so `goal_step` can only signal:
             // parse its args here and commit at the iteration boundary (#1225).
             AgentEvent::ToolCallStarted {
@@ -310,6 +352,13 @@ impl TurnLedger {
                 ..
             } if self.gc_call_id.as_deref() == Some(call_id.as_str()) => {
                 self.completed = true;
+            }
+            AgentEvent::ToolCallFinished {
+                call_id,
+                success: true,
+                ..
+            } if self.pp_call_id.as_deref() == Some(call_id.as_str()) => {
+                self.proposed_pr = true;
             }
             // Only a successful call is recorded: a rejected or failed `goal_step`
             // must not leave a claim in the ledger.
@@ -331,6 +380,11 @@ impl TurnLedger {
     /// Whether a `goal_complete` call finished successfully this turn.
     pub fn completed(&self) -> bool {
         self.completed
+    }
+
+    /// Whether a `propose_pr` call finished successfully this turn (#1256).
+    pub fn proposed_pr(&self) -> bool {
+        self.proposed_pr
     }
 
     /// The steps committed this turn, in observation order. Consumes the
@@ -417,6 +471,29 @@ fn verify_failure_entry(goal: &Goal, output: &str) -> GoalLedgerEntry {
         status: StepStatus::Active,
         action: None,
         evidence: vec![bound_verify_output(output)],
+        verdict: Some(Verdict::Drift),
+        next: None,
+        created_ms: 0,
+        updated_ms: 0,
+    }
+}
+
+/// Record an authorised goal that completed without opening its draft PR
+/// (#1256, finding 3). The model marked the objective complete but never ran
+/// `propose_pr`, so the loop ended before the PR could be opened. Surfaced as a
+/// `Drift` entry so the miss is visible on the completed goal.
+fn propose_pr_missing_entry() -> GoalLedgerEntry {
+    GoalLedgerEntry {
+        id: "propose-pr-missing".to_string(),
+        claim: "authorised goal completed without opening its draft PR".to_string(),
+        status: StepStatus::Active,
+        action: None,
+        evidence: vec![
+            "goal_complete succeeded but propose_pr was never called this run; the loop \
+             ended on completion before a PR could be opened. Emit goal_complete and \
+             propose_pr together in one final turn."
+                .to_string(),
+        ],
         verdict: Some(Verdict::Drift),
         next: None,
         created_ms: 0,
@@ -545,6 +622,14 @@ pub async fn drive_goal<I: GoalIteration>(goal: &mut Goal, iter: &I) -> LoopStop
             // or an unwired host) keeps the pre-D3 "trust the claim" behaviour.
             match iter.verify(goal).await {
                 VerifyOutcome::Passed | VerifyOutcome::Skipped => {
+                    // Finding 3 (#1256): an authorised goal that completes without
+                    // opening its PR is a silent drop — the model called
+                    // `goal_complete` alone, ending the run before `propose_pr`.
+                    // Record it observably in the ledger so the miss is visible on
+                    // the completed goal rather than passing unremarked.
+                    if goal.allow_propose_pr && !outcome.proposed_pr {
+                        goal.append_entry(propose_pr_missing_entry(), iter.now_ms());
+                    }
                     goal.status = GoalStatus::Completed;
                     goal.updated_ms = iter.now_ms();
                     iter.save(goal);
