@@ -501,6 +501,41 @@ fn review_scoping_guidance_is_in_the_stable_prefix() {
 }
 
 #[test]
+fn tool_discovery_guidance_is_in_the_stable_prefix() {
+    // #1273: the advertised tool set is deliberately lean -- deferred tools
+    // (e.g. bridged MCP tools) are held out until `tool_search` surfaces them.
+    // Nothing in the prompt told an agent to search when a task needs a
+    // capability it cannot see a tool for, so a sub-agent that inherits this
+    // prompt would silently degrade instead of self-discovering. The nudge must
+    // sit in the cache-stable prefix so every session (top-level and child)
+    // carries it, and near the MCP guidance it complements.
+    let reg = SkillRegistry::new();
+    let out = build_full(None, &reg, &[], &ctx(), None, None, None, Mode::default());
+    let discovery = out
+        .find("## Just-in-time tool discovery")
+        .expect("tool-discovery guidance present");
+    let user = out.find("## User context").unwrap();
+    assert!(
+        discovery < user,
+        "tool-discovery guidance must sit in the stable prefix, before User context: {out}"
+    );
+    // Load-bearing invariants: name the mechanism, and forbid the failure mode
+    // (assuming a capability is unavailable just because no tool is listed).
+    assert!(
+        out.contains("tool_search"),
+        "must name the tool_search mechanism: {out}"
+    );
+    assert!(
+        out.contains("deliberately lean") || out.contains("deliberately small"),
+        "must explain the tool set is intentionally minimal: {out}"
+    );
+    assert!(
+        out.contains("do not assume") || out.contains("Do not assume"),
+        "must forbid assuming a capability is unavailable without searching: {out}"
+    );
+}
+
+#[test]
 fn compaction_guidance_forbids_reproducing_markers() {
     // A weaker model regurgitated [N lines elided] / [compacted; retrieve
     // key=...] placeholders as its answer instead of calling
@@ -997,6 +1032,12 @@ const GOLDEN: &str = concat!(
     "### zulu
 ",
     "Zulu body.
+",
+    "
+",
+    "## Just-in-time tool discovery
+",
+    "Your advertised tool set is deliberately lean: some tools -- including bridged MCP capabilities -- are held back and become reachable only after `tool_search` surfaces them. So when a task needs a capability you cannot see a matching tool for, do not assume it is unavailable -- describe the task to `tool_search` first (natural-language phrases work better than single keywords), then decide. This applies as much to a delegated sub-task as to your own: if the brief you were handed implies a capability, search for it before concluding you lack it.
 ",
     "
 ",
