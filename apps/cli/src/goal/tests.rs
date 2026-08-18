@@ -23,6 +23,7 @@ fn goal_store_roundtrip() {
         ledger: vec![],
         pending_steer: None,
         verify_cmd: None,
+        allow_propose_pr: false,
         created_ms: 1,
         updated_ms: 2,
     };

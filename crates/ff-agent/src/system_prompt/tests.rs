@@ -595,6 +595,7 @@ fn active_goal() -> Goal {
         ],
         pending_steer: None,
         verify_cmd: None,
+        allow_propose_pr: false,
         created_ms: 0,
         updated_ms: 0,
     }
@@ -805,6 +806,71 @@ fn goal_block_present_when_active() {
         "{out}"
     );
     assert!(out.contains("call `goal_complete`"), "{out}");
+}
+
+#[test]
+fn goal_prompt_report_only_when_propose_pr_disallowed() {
+    // AC1: default (allow_propose_pr = false) → the loop is told to describe the
+    // branch/commit/PR it would open and stop; it must NOT be invited to call
+    // `propose_pr`. Guards the prompt-condition mutation (#1256).
+    let reg = SkillRegistry::new();
+    let goal = active_goal();
+    assert!(!goal.allow_propose_pr, "fixture precondition");
+    let out = build_full(
+        None,
+        &reg,
+        &[],
+        &ctx(),
+        None,
+        None,
+        Some(&goal),
+        Mode::default(),
+    );
+    assert!(
+        !out.contains("call `propose_pr`"),
+        "report-only prompt must not invite propose_pr: {out}"
+    );
+    assert!(
+        out.contains(
+            "state the branch name, commit message, and PR body you would propose, and stop"
+        ),
+        "{out}"
+    );
+}
+
+#[test]
+fn goal_prompt_invites_propose_pr_when_allowed() {
+    // AC2: allow_propose_pr = true → the loop is told to call `propose_pr` once,
+    // after `goal_complete`, with the at-most-once constraint spelled out.
+    let reg = SkillRegistry::new();
+    let mut goal = active_goal();
+    goal.allow_propose_pr = true;
+    let out = build_full(
+        None,
+        &reg,
+        &[],
+        &ctx(),
+        None,
+        None,
+        Some(&goal),
+        Mode::default(),
+    );
+    assert!(
+        out.contains("Call `propose_pr` exactly once"),
+        "propose_pr prompt must invite exactly-once call: {out}"
+    );
+    assert!(
+        out.contains("in the same turn"),
+        "prompt must require goal_complete + propose_pr in the same turn: {out}"
+    );
+    assert!(
+        out.contains("if it fails, report the failure"),
+        "at-most-once constraint must be stated: {out}"
+    );
+    assert!(
+        !out.contains("Do not push a branch or open a PR"),
+        "report-only text must not appear when allowed: {out}"
+    );
 }
 
 #[test]
@@ -1137,7 +1203,7 @@ const GOLDEN: &str = concat!(
 ",
     "
 ",
-    "Continue toward the objective. If it is fully met, call `goal_complete`.
+    "Continue toward the objective. If it is fully met, call `goal_complete`. Do not push a branch or open a PR: instead, state the branch name, commit message, and PR body you would propose, and stop.
 ",
     " State your reasoning before each action.
 ",
@@ -1262,7 +1328,7 @@ fn golden_volatile_goal_without_memory() {
          - cargo check passed\n\
          - Wire breakpoints in anthropic.rs [pending]\n\
          \n\
-         Continue toward the objective. If it is fully met, call `goal_complete`.\n State your reasoning before each action.\n",
+         Continue toward the objective. If it is fully met, call `goal_complete`. Do not push a branch or open a PR: instead, state the branch name, commit message, and PR body you would propose, and stop.\n State your reasoning before each action.\n",
         "volatile tail drifted on the memory-absent path; prefix-cache contract broken (#938)",
     );
 }
@@ -1299,7 +1365,7 @@ fn golden_volatile_goal_empty_ledger_with_steer() {
          \n\
          User steer: Steer the empty-ledger path\n\
          \n\
-         Continue toward the objective. If it is fully met, call `goal_complete`.\n State your reasoning before each action.\n",
+         Continue toward the objective. If it is fully met, call `goal_complete`. Do not push a branch or open a PR: instead, state the branch name, commit message, and PR body you would propose, and stop.\n State your reasoning before each action.\n",
         "volatile tail drifted on the empty-ledger path; prefix-cache contract broken (#938)",
     );
 }

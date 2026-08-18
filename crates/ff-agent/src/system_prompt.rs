@@ -457,6 +457,7 @@ pub fn build_system_prompt(inputs: &SystemPromptInputs<'_>) -> SystemPrompt {
                         .collect()
                 },
                 pending_steer: g.pending_steer.as_deref(),
+                allow_propose_pr: g.allow_propose_pr,
             });
 
     let volatile_ctx = VolatileCtx {
@@ -546,6 +547,7 @@ struct GoalCtx<'a> {
     objective: &'a str,
     ledger: Vec<LedgerEntry<'a>>,
     pending_steer: Option<&'a str>,
+    allow_propose_pr: bool,
 }
 
 #[derive(Serialize)]

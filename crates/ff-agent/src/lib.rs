@@ -57,7 +57,7 @@ pub use compaction_extractive::{
     COMPACTION_MARKER_PREFIX, DIGEST_LEVEL, MAX_COMPACTION_LEVEL,
 };
 pub use goal_loop::{
-    drive_goal, parse_ledger_step, run_verify_command, GateDecision, GoalIteration,
+    drive_goal, goal_matrix, parse_ledger_step, run_verify_command, GateDecision, GoalIteration,
     IterationOutcome, LedgerStep, LoopStop, TurnLedger, VerifyOutcome,
 };
 pub use message_salience::MessageSalience;

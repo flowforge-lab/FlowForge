@@ -35,8 +35,32 @@ describe("useGoalStore.start", () => {
 
     await useGoalStore.getState().start("s1", "refactor auth", 12);
 
-    expect(spy).toHaveBeenCalledWith("s1", "refactor auth", 12);
+    expect(spy).toHaveBeenCalledWith(
+      "s1",
+      "refactor auth",
+      12,
+      undefined,
+      undefined,
+      undefined,
+    );
     expect(useGoalStore.getState().bySession.s1).toEqual(returned);
+  });
+
+  it("forwards the propose_pr authorisation flag to goalSet", async () => {
+    const spy = vi
+      .spyOn(ipc, "goalSet")
+      .mockResolvedValue(goal({ sessionId: "s3" }));
+
+    await useGoalStore.getState().start("s3", "ship it", undefined, true);
+
+    expect(spy).toHaveBeenCalledWith(
+      "s3",
+      "ship it",
+      undefined,
+      undefined,
+      undefined,
+      true,
+    );
   });
 
   it("passes undefined max iterations so the backend applies its own default", async () => {
@@ -46,7 +70,14 @@ describe("useGoalStore.start", () => {
 
     await useGoalStore.getState().start("s2", "do the thing", undefined);
 
-    expect(spy).toHaveBeenCalledWith("s2", "do the thing", undefined);
+    expect(spy).toHaveBeenCalledWith(
+      "s2",
+      "do the thing",
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+    );
   });
 
   it("does not upsert when the backend rejects the start", async () => {

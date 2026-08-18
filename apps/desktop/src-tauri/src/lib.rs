@@ -212,6 +212,15 @@ struct UiApprover<R: tauri::Runtime> {
     session_id: String,
     /// The session's resolved autonomy mode for this turn (#265).
     mode: Mode,
+    /// Autonomous goal mode (#1256): there is no user watching the loop, so a
+    /// `Prompt` decision cannot be surfaced as an interactive request — it would
+    /// block indefinitely (#1270). When true, `Prompt` collapses to a clean deny
+    /// that routes the model to the report-only branch.
+    autonomous: bool,
+    /// Goal authorised to open a draft PR on completion (#1256). Applies a
+    /// per-call `propose_pr -> Allow` override to the matrix *snapshot* only —
+    /// never the shared singleton — so authorisation is scoped to this goal loop.
+    allow_propose_pr: bool,
 }
 
 #[async_trait]
@@ -225,8 +234,12 @@ impl<R: tauri::Runtime> Approver for UiApprover<R> {
         args: &serde_json::Value,
     ) -> ApprovalOutcome {
         // Snapshot the matrix once for this call, read live (#702/#742) so a
-        // Control-panel edit takes effect on the next tool invocation.
-        let matrix = self.state.permission_matrix();
+        // Control-panel edit takes effect on the next tool invocation. An
+        // authorised goal (#1256) gets the per-tool `propose_pr -> Allow`
+        // override via the shared `goal_matrix` helper — applied to this local
+        // snapshot only, never the singleton, so authorisation stays scoped to
+        // the goal loop and stays identical to the CLI host.
+        let matrix = ff_agent::goal_matrix(self.state.permission_matrix(), self.allow_propose_pr);
         let cell = matrix.effective_cell(name, self.mode, safety);
         let allowlisted = self.state.allowlist_covers(&self.session_id, name, safety);
         let resolved_arg = resolve_tool_arg(name, args);
@@ -267,6 +280,13 @@ impl<R: tauri::Runtime> Approver for UiApprover<R> {
                 return ApprovalOutcome::Allowed;
             }
             ff_core::PrePromptDecision::Prompt => {}
+        }
+
+        // Autonomous goal loop (#1256): no user to prompt, so a Prompt decision
+        // becomes a clean deny rather than an indefinite block (#1270). The model
+        // reads the refusal and finishes via the report-only branch.
+        if self.autonomous {
+            return ApprovalOutcome::Denied(DenyReason::NoInteractiveTerminal);
         }
 
         let approval_safety = match safety {
@@ -527,6 +547,9 @@ fn set_scheduled_paused_all(
 /// loop (RFC 0020 §5.1). An empty objective is rejected. A pre-existing goal for
 /// the session is overwritten — starting a new objective is a deliberate reset.
 #[tauri::command]
+// Tauri commands take flat named IPC params (not a bundled struct), so the
+// budget dimensions + authorisation flag exceed clippy's arg-count heuristic.
+#[allow(clippy::too_many_arguments)]
 async fn goal_set(
     state: State<'_, Arc<AppState>>,
     app: tauri::AppHandle,
@@ -535,6 +558,7 @@ async fn goal_set(
     max_iterations: Option<u32>,
     max_tokens: Option<u64>,
     max_wall_ms: Option<i64>,
+    allow_propose_pr: Option<bool>,
 ) -> Result<Goal, String> {
     let objective = objective.trim();
     if objective.is_empty() {
@@ -546,12 +570,14 @@ async fn goal_set(
     // its final checkpoint can't clobber the fresh goal we're about to write.
     stop_goal_loop(state.inner(), &session_id).await;
 
-    let mut goal = Goal::new(&session_id, objective, now_ms());
-    if let Some(m) = max_iterations {
-        goal.budget.max_iterations = m;
-    }
-    goal.budget.max_tokens = max_tokens;
-    goal.budget.max_wall_ms = max_wall_ms;
+    let goal = build_goal(
+        &session_id,
+        objective,
+        max_iterations,
+        max_tokens,
+        max_wall_ms,
+        allow_propose_pr,
+    );
     state
         .goals
         .save(&goal)
@@ -559,6 +585,29 @@ async fn goal_set(
     let _ = app.emit("goal:updated", &goal);
     spawn_goal_loop(state.inner().clone(), app, session_id);
     Ok(goal)
+}
+
+/// Build the `Goal` a `goal_set` call persists — the pure mapping from the
+/// command's optional args onto a fresh goal, split out so a test can pin the
+/// authorisation plumbing (`allow_propose_pr`, #1256) end-to-end without
+/// constructing a tauri `State` or spawning the background loop. `objective` is
+/// assumed already trimmed and non-empty by the caller.
+fn build_goal(
+    session_id: &str,
+    objective: &str,
+    max_iterations: Option<u32>,
+    max_tokens: Option<u64>,
+    max_wall_ms: Option<i64>,
+    allow_propose_pr: Option<bool>,
+) -> Goal {
+    let mut goal = Goal::new(session_id, objective, now_ms());
+    if let Some(m) = max_iterations {
+        goal.budget.max_iterations = m;
+    }
+    goal.budget.max_tokens = max_tokens;
+    goal.budget.max_wall_ms = max_wall_ms;
+    goal.allow_propose_pr = allow_propose_pr.unwrap_or(false);
+    goal
 }
 
 /// Snapshot the current goal for a session, or `None` if there is no goal
@@ -1625,6 +1674,8 @@ fn spawn_assistant_turn(
             state: state.clone(),
             session_id: sid.clone(),
             mode,
+            autonomous: false,
+            allow_propose_pr: false,
         };
         // Point the workspace-aware MCP server (codegraph) at this session's workspace
         // before snapshotting tools, so its code graph reflects the active checkout
@@ -2183,9 +2234,15 @@ impl GoalIteration for GoalLoopIteration {
             state: self.state.clone(),
             session_id: sid.clone(),
             mode,
+            autonomous: true,
+            allow_propose_pr: goal.allow_propose_pr,
         };
-        // Snapshot the matrix for this turn (#702); see the other turn paths.
-        let permission_matrix = self.state.permission_matrix();
+        // Snapshot the matrix for this turn (#702); see the other turn paths. An
+        // authorised goal (#1256) carries the same per-tool `propose_pr -> Allow`
+        // override the approver applies, via the shared helper, kept local to
+        // this loop.
+        let permission_matrix =
+            ff_agent::goal_matrix(self.state.permission_matrix(), goal.allow_propose_pr);
         let mut tool_ctx = ff_agent::ToolContext::new(
             &registry,
             &session_root,
@@ -2304,10 +2361,12 @@ impl GoalIteration for GoalLoopIteration {
         // (the other Arc holder) already being dropped.
         let ledger = std::mem::take(&mut *ledger.lock().unwrap());
         let goal_complete = ledger.completed();
+        let proposed_pr = ledger.proposed_pr();
         IterationOutcome {
             tokens: tokens.load(std::sync::atomic::Ordering::SeqCst),
             wall_ms: turn_start.elapsed().as_millis() as i64,
             goal_complete,
+            proposed_pr,
             cancelled,
             failed,
             steer_consumed,

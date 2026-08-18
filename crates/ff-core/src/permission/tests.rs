@@ -1008,3 +1008,29 @@ fn a_guide_rule_does_not_affect_tool_advertisement() {
         }
     }
 }
+
+// #1256 AC3/AC4: goal-mode authorisation rides the per-tool override. By default
+// `propose_pr` under Auto/Publish is `Ask` (bit-identical to today); an
+// authorised goal sets the override to `Allow`, and only that tool is affected.
+#[test]
+fn propose_pr_override_gates_goal_mode() {
+    let mut m = PermissionMatrix::default();
+    assert_eq!(
+        m.effective_cell("propose_pr", Mode::Auto, Safety::Publish),
+        PermissionCell::Ask,
+        "AC3: default posture unchanged"
+    );
+
+    m.set_override("propose_pr", PermissionCell::Allow);
+    assert_eq!(
+        m.effective_cell("propose_pr", Mode::Auto, Safety::Publish),
+        PermissionCell::Allow,
+        "AC4: authorised goal proceeds without a prompt"
+    );
+    // The override is scoped to propose_pr — other Publish tools stay `Ask`.
+    assert_eq!(
+        m.effective_cell("some_other_tool", Mode::Auto, Safety::Publish),
+        PermissionCell::Ask,
+        "override must not widen to unrelated tools"
+    );
+}

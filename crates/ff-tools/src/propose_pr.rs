@@ -26,10 +26,14 @@ use crate::registry::{Safety, Tool, ToolOutcome};
 
 pub struct ProposePrTool;
 
+/// The tool name, exported so the goal-loop authorisation wiring can key its
+/// per-tool override without stringly-typing it at the call site (#1256).
+pub const PROPOSE_PR_TOOL_NAME: &str = "propose_pr";
+
 #[async_trait]
 impl Tool for ProposePrTool {
     fn name(&self) -> &str {
-        "propose_pr"
+        PROPOSE_PR_TOOL_NAME
     }
 
     fn description(&self) -> &str {

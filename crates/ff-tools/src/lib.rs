@@ -66,6 +66,7 @@ pub use agent_tool::{AgentTool, AGENT_TOOL_NAME};
 pub use compaction::{CompactionRetrieveTool, COMPACTION_RETRIEVE_TOOL};
 pub use goal_complete::{GoalCompleteTool, GOAL_COMPLETE_TOOL_NAME};
 pub use goal_step::{GoalStepTool, GOAL_STEP_TOOL_NAME};
+pub use propose_pr::PROPOSE_PR_TOOL_NAME;
 // The workspace path-jail entry point, surfaced to the desktop crate's file
 // commands (#872). Only `resolve_in_root` is re-exported — the module itself
 // stays private so its internals aren't part of the crate's public API.

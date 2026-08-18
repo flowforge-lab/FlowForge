@@ -1,10 +1,10 @@
 use super::state::AppState;
 use super::{
-    bounded_block_on, compare_build, emit_agent_event, git_branch, goal_gate_for, install_guard,
-    is_app_ready, list_directory_in, list_local_branches, matrix_gate, mcp_quit_path,
-    panic_message, publish_app_ready, read_file_in, resolve_workspace_dir, run_sidecar_turn,
-    should_warmup, switch_branch, BootFinalize, TurnMetrics, UiApprover, UpdateStatus,
-    VersionDirection, APP_READY, MCP_SHUTDOWN_BUDGET,
+    bounded_block_on, build_goal, compare_build, emit_agent_event, git_branch, goal_gate_for,
+    install_guard, is_app_ready, list_directory_in, list_local_branches, matrix_gate,
+    mcp_quit_path, panic_message, publish_app_ready, read_file_in, resolve_workspace_dir,
+    run_sidecar_turn, should_warmup, switch_branch, BootFinalize, TurnMetrics, UiApprover,
+    UpdateStatus, VersionDirection, APP_READY, MCP_SHUTDOWN_BUDGET,
 };
 use ff_agent::{AgentEvent, ApprovalOutcome, Approver, DenyReason, GateDecision};
 use ff_core::events::TurnDoneEvent;
@@ -1092,6 +1092,8 @@ async fn ui_approver_scoped_deny_names_the_matched_rule() {
         state: state.clone(),
         session_id: "s1".into(),
         mode: Mode::Auto,
+        autonomous: false,
+        allow_propose_pr: false,
     };
 
     let decision = approver
@@ -1111,6 +1113,112 @@ async fn ui_approver_scoped_deny_names_the_matched_rule() {
                 if rule == "bash (command prefix 'rm -rf')"
         ),
         "wiring must thread the matched rule name into DenyReason::ScopedRule, not Mode"
+    );
+}
+
+// #1256: the goal-loop approver runs autonomously. Without authorisation a
+// `propose_pr` call (Auto x Publish = Ask) must collapse to a clean deny — no
+// interactive prompt to hang on (#1270) — routing the model to report-only.
+#[tokio::test]
+async fn autonomous_ui_approver_denies_propose_pr_without_authorisation() {
+    let state = Arc::new(AppState::new());
+    let app = tauri::test::mock_builder()
+        .build(tauri::test::mock_context(tauri::test::noop_assets()))
+        .expect("mock app builds");
+    let approver = UiApprover {
+        app: app.handle().clone(),
+        state: state.clone(),
+        session_id: "g1".into(),
+        mode: Mode::Auto,
+        autonomous: true,
+        allow_propose_pr: false,
+    };
+
+    let decision = approver
+        .approve(
+            "m",
+            "c",
+            "propose_pr",
+            Safety::Publish,
+            &serde_json::json!({}),
+        )
+        .await;
+
+    assert!(
+        matches!(decision, ApprovalOutcome::Denied(_)),
+        "unauthorised goal must be denied, not prompted, got {decision:?}"
+    );
+}
+
+// #1256 AC4/AC8: an authorised goal carries a per-tool `propose_pr -> Allow`
+// override applied to the local matrix snapshot only, so the call proceeds
+// without a prompt — the same wiring as the CLI host.
+#[tokio::test]
+async fn autonomous_ui_approver_allows_propose_pr_when_authorised() {
+    let state = Arc::new(AppState::new());
+    let app = tauri::test::mock_builder()
+        .build(tauri::test::mock_context(tauri::test::noop_assets()))
+        .expect("mock app builds");
+    let approver = UiApprover {
+        app: app.handle().clone(),
+        state: state.clone(),
+        session_id: "g1".into(),
+        mode: Mode::Auto,
+        autonomous: true,
+        allow_propose_pr: true,
+    };
+
+    let decision = approver
+        .approve(
+            "m",
+            "c",
+            "propose_pr",
+            Safety::Publish,
+            &serde_json::json!({}),
+        )
+        .await;
+
+    assert!(
+        matches!(decision, ApprovalOutcome::Allowed),
+        "authorised goal's propose_pr must Allow, got {decision:?}"
+    );
+    // The override is scoped to the snapshot: the shared singleton is untouched.
+    assert!(
+        state
+            .permission_matrix()
+            .overrides()
+            .get("propose_pr")
+            .is_none(),
+        "authorisation must not leak into the shared matrix singleton"
+    );
+}
+
+// #1256 finding 1: the authorisation must reach the goal end-to-end from the
+// command surface (`goal_set`), not only when a `UiApprover` is hand-built with
+// `allow_propose_pr: true`. `goal_set` maps its args onto the goal via
+// `build_goal`; this pins that mapping so a mutation dropping the field fails —
+// the desktop counterpart to the CLI's `--allow-propose-pr` flag, closing the
+// host-divergence gap (#1222). The FE half (dialog → store → `ipc.goalSet`) is
+// covered by `start-goal-dialog.test.tsx`.
+#[test]
+fn goal_set_carries_propose_pr_authorisation() {
+    let goal = build_goal("s1", "ship the fix", None, None, None, Some(true));
+    assert!(
+        goal.allow_propose_pr,
+        "goal_set must carry the authorisation through onto the goal it persists"
+    );
+}
+
+// Default (omitted / false) must map to report-only — the safe posture.
+#[test]
+fn goal_set_defaults_to_report_only_when_unauthorised() {
+    assert!(
+        !build_goal("s1", "look, don't push", None, None, None, None).allow_propose_pr,
+        "an omitted authorisation defaults to report-only"
+    );
+    assert!(
+        !build_goal("s1", "look, don't push", None, None, None, Some(false)).allow_propose_pr,
+        "an explicit false stays report-only"
     );
 }
 

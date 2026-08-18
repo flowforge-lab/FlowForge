@@ -16,6 +16,11 @@ pub struct GoalArgs {
     /// Max iterations (default 40).
     #[arg(long)]
     pub(crate) max_iterations: Option<u32>,
+    /// Authorise the goal to open a draft PR via `propose_pr` on completion
+    /// (#1256). Off by default: the goal reports the branch/commit/PR it would
+    /// propose and stops.
+    #[arg(long)]
+    pub(crate) allow_propose_pr: bool,
     #[command(subcommand)]
     pub(crate) command: Option<GoalSubCommand>,
 }
@@ -50,7 +55,13 @@ pub async fn run(args: GoalArgs) -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
-            goal_start(objective, args.session, args.max_iterations).await
+            goal_start(
+                objective,
+                args.session,
+                args.max_iterations,
+                args.allow_propose_pr,
+            )
+            .await
         }
         Some(GoalSubCommand::List) => goal_list(),
         Some(GoalSubCommand::Resume { session }) => goal_resume(session).await,
@@ -66,12 +77,26 @@ async fn goal_start(
     objective: String,
     session: Option<String>,
     max_iterations: Option<u32>,
+    allow_propose_pr: bool,
 ) -> ExitCode {
     let session_id = session.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     let store = goal_store();
 
     let mut goal = match store.load(&session_id) {
-        Ok(Some(g)) => g,
+        Ok(Some(g)) => {
+            // Finding 6 (#1256): resuming a stored goal keeps its persisted
+            // authorisation; a `--allow-propose-pr` on the resume command is
+            // ignored rather than silently re-applied. Say so when it would have
+            // changed the posture, so the flag is never dropped without notice.
+            if allow_propose_pr && !g.allow_propose_pr {
+                eprintln!(
+                    "note: --allow-propose-pr is ignored when resuming an existing goal \
+                     (session {session_id}); it keeps the authorisation it was created with. \
+                     Cancel and start a new goal to change it."
+                );
+            }
+            g
+        }
         Ok(None) => {
             let now = chrono::Local::now().timestamp_millis();
             Goal {
@@ -88,6 +113,7 @@ async fn goal_start(
                 ledger: Vec::new(),
                 pending_steer: None,
                 verify_cmd: None,
+                allow_propose_pr,
                 created_ms: now,
                 updated_ms: now,
             }

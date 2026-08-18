@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
 use ff_agent::{ApprovalOutcome, Approver, DenyReason};
-use ff_core::Mode;
+use ff_core::{Mode, PermissionMatrix};
 use ff_tools::Safety;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -35,6 +35,13 @@ pub(crate) enum ApprovalDecision {
 pub struct CliApprover {
     policy: ApprovalMode,
     agent_mode: Mode,
+    /// When set, the approver runs autonomously (goal mode, #1256): the
+    /// permission matrix is the sole gate. `Allow` proceeds; anything else is a
+    /// clean deny, since there is no human on the TTY to prompt. This is how an
+    /// `allow_propose_pr` goal reaches `propose_pr` (a per-tool `Allow` override)
+    /// while every other Sensitive/Publish call is refused rather than silently
+    /// auto-approved as the old `ApprovalMode::Yes` wiring did.
+    matrix: Option<PermissionMatrix>,
     /// Latches `true` the first time a write/dangerous call is denied.
     denied: AtomicBool,
 }
@@ -44,6 +51,20 @@ impl CliApprover {
         Self {
             policy,
             agent_mode,
+            matrix: None,
+            denied: AtomicBool::new(false),
+        }
+    }
+
+    /// Build an autonomous approver for goal mode (#1256): the given permission
+    /// matrix is the sole gate, with no interactive fallback. Callers pass a
+    /// matrix carrying any per-tool overrides (e.g. `propose_pr -> Allow` when
+    /// the goal is authorised to open a draft PR).
+    pub fn autonomous(agent_mode: Mode, matrix: PermissionMatrix) -> Self {
+        Self {
+            policy: ApprovalMode::Deny,
+            agent_mode,
+            matrix: Some(matrix),
             denied: AtomicBool::new(false),
         }
     }
@@ -117,6 +138,40 @@ impl Approver for CliApprover {
         safety: Safety,
         args: &serde_json::Value,
     ) -> ApprovalOutcome {
+        // Autonomous goal mode (#1256): the matrix is the whole gate, evaluated
+        // through the shared canonical order (`pre_prompt_decision`) that the
+        // desktop and Slack approvers use. `Allow` proceeds; `Deny` and `Ask`
+        // both become a clean deny — there is no TTY to prompt, and an
+        // indefinite block would strand the goal loop. The model reads the
+        // refusal and routes to the report-only branch.
+        if let Some(matrix) = &self.matrix {
+            let resolved_arg = ff_core::resolve_tool_arg(name, args);
+            let cell = matrix.effective_cell(name, self.agent_mode, safety);
+            let scoped_effect =
+                matrix.evaluate_rules(name, resolved_arg.as_deref(), self.agent_mode);
+            let scoped_deny_rule_desc = matrix
+                .matching_deny_rule(name, resolved_arg.as_deref())
+                .map(|r| format!("{} ({})", r.tool, r.matcher.description()));
+            let outcome = match ff_core::pre_prompt_decision(
+                cell,
+                false,
+                scoped_effect,
+                safety,
+                self.agent_mode,
+                scoped_deny_rule_desc,
+            ) {
+                ff_core::PrePromptDecision::Allow => ApprovalOutcome::Allowed,
+                ff_core::PrePromptDecision::Deny(reason) => ApprovalOutcome::Denied(reason),
+                ff_core::PrePromptDecision::Prompt => {
+                    ApprovalOutcome::Denied(DenyReason::NoInteractiveTerminal)
+                }
+            };
+            if !matches!(outcome, ApprovalOutcome::Allowed) {
+                self.denied.store(true, Ordering::Relaxed);
+            }
+            return outcome;
+        }
+
         let label = match safety {
             Safety::Write => "write",
             Safety::Sensitive => "sensitive",

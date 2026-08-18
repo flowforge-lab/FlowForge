@@ -62,6 +62,21 @@ fn partial_file_loads_via_serde_defaults() {
     assert_eq!(g.spent.tokens, 0);
     assert!(g.ledger.is_empty());
     assert!(g.pending_steer.is_none());
+    // AC5: a goal file written before #1256 has no `allowProposePr` key; it must
+    // load with the field defaulting to false (propose-PR off unless granted).
+    assert!(!g.allow_propose_pr);
+}
+
+#[test]
+fn allow_propose_pr_round_trips_when_granted() {
+    // AC5/#1256: an authorised goal serialises the grant and reads it back.
+    let mut g = Goal::new("s", "obj", 1);
+    g.allow_propose_pr = true;
+    let json = serde_json::to_string(&g).unwrap();
+    assert!(json.contains(r#""allowProposePr":true"#), "got: {json}");
+    let back: Goal = serde_json::from_str(&json).unwrap();
+    assert!(back.allow_propose_pr);
+    assert_eq!(g, back);
 }
 
 #[test]

@@ -39,6 +39,8 @@ struct StubIter {
     fail_on: Option<u32>,
     cancel_on: Option<u32>,
     steer_on: Option<u32>,
+    /// Turn on which the stub reports a successful `propose_pr` (#1256).
+    propose_pr_on: Option<u32>,
     /// How `verify()` answers a completion signal (#684 D3).
     verify_plan: VerifyPlan,
     /// Number of `verify()` calls, so a test can prove the gate ran (or did not).
@@ -68,6 +70,7 @@ impl StubIter {
             fail_on: None,
             cancel_on: None,
             steer_on: None,
+            propose_pr_on: None,
             verify_plan: VerifyPlan::Skip,
             verify_calls: AtomicU32::new(0),
             steps_on: Vec::new(),
@@ -114,6 +117,7 @@ impl GoalIteration for StubIter {
             tokens: self.tokens_per_turn,
             wall_ms: 10,
             goal_complete: n >= self.complete_on,
+            proposed_pr: self.propose_pr_on == Some(n),
             cancelled: self.cancel_on == Some(n),
             failed: self.fail_on == Some(n),
             steer_consumed: self.steer_on == Some(n),
@@ -151,6 +155,58 @@ async fn loops_until_goal_complete() {
         iter.saves.lock().unwrap().last().unwrap().status,
         GoalStatus::Completed,
         "final persist is the Completed state"
+    );
+}
+
+// #1256 finding 3: an authorised goal that completes without ever calling
+// propose_pr is a silent drop (goal_complete alone ends the loop before the PR
+// opens). The loop must record it observably so the miss is visible.
+#[tokio::test]
+async fn authorised_goal_records_a_drift_when_pr_never_opened() {
+    let mut g = active_goal(25);
+    g.allow_propose_pr = true;
+    let iter = StubIter::completing(1, 100); // propose_pr_on = None
+
+    let stop = drive_goal(&mut g, &iter).await;
+
+    assert_eq!(stop, LoopStop::Completed);
+    let entry = g
+        .ledger
+        .iter()
+        .find(|e| e.id == "propose-pr-missing")
+        .expect("a silent-drop entry is recorded");
+    assert_eq!(entry.verdict, Some(Verdict::Drift));
+}
+
+// The mirror: when the authorised goal does open its PR the same turn, no
+// silent-drop entry is recorded.
+#[tokio::test]
+async fn authorised_goal_that_opens_its_pr_records_no_drift() {
+    let mut g = active_goal(25);
+    g.allow_propose_pr = true;
+    let mut iter = StubIter::completing(1, 100);
+    iter.propose_pr_on = Some(1);
+
+    let stop = drive_goal(&mut g, &iter).await;
+
+    assert_eq!(stop, LoopStop::Completed);
+    assert!(
+        !g.ledger.iter().any(|e| e.id == "propose-pr-missing"),
+        "no silent-drop entry when the PR was opened"
+    );
+}
+
+// An unauthorised goal never gets the entry — it is expected to report-only.
+#[tokio::test]
+async fn unauthorised_goal_records_no_propose_pr_drift() {
+    let mut g = active_goal(25);
+    let iter = StubIter::completing(1, 100);
+
+    drive_goal(&mut g, &iter).await;
+
+    assert!(
+        !g.ledger.iter().any(|e| e.id == "propose-pr-missing"),
+        "an unauthorised goal is report-only, not a silent drop"
     );
 }
 
@@ -945,5 +1001,55 @@ fn bound_verify_output_leaves_short_output_untouched() {
         bound_verify_output("  ok  "),
         "ok",
         "trims but does not mark short output"
+    );
+}
+
+// ── goal_matrix authorisation wiring (#1256, findings 1/2/5) ──────────────────
+// The single shared seam that maps `Goal.allow_propose_pr` to the per-tool
+// `propose_pr -> Allow` override, so a mutation that deletes the override wiring
+// fails here regardless of host.
+use ff_core::{Mode, PermissionCell, PermissionMatrix, Safety};
+
+#[test]
+fn goal_matrix_leaves_propose_pr_gated_when_unauthorised() {
+    let m = goal_matrix(PermissionMatrix::default(), false);
+    assert_eq!(
+        m.effective_cell(ff_tools::PROPOSE_PR_TOOL_NAME, Mode::Auto, Safety::Publish),
+        PermissionCell::Ask,
+        "an unauthorised goal keeps propose_pr at its default Ask/deny posture"
+    );
+    assert!(
+        m.overrides().get(ff_tools::PROPOSE_PR_TOOL_NAME).is_none(),
+        "no override is added when unauthorised"
+    );
+}
+
+#[test]
+fn goal_matrix_allows_propose_pr_when_authorised() {
+    let m = goal_matrix(PermissionMatrix::default(), true);
+    assert_eq!(
+        m.effective_cell(ff_tools::PROPOSE_PR_TOOL_NAME, Mode::Auto, Safety::Publish),
+        PermissionCell::Allow,
+        "an authorised goal overrides propose_pr to Allow"
+    );
+    // Scoped to the one tool — other Publish tools stay gated.
+    assert_eq!(
+        m.effective_cell("some_other_tool", Mode::Auto, Safety::Publish),
+        PermissionCell::Ask,
+        "the override must not widen to unrelated tools"
+    );
+}
+
+#[test]
+fn goal_matrix_never_overrides_an_explicit_user_deny() {
+    // Finding 5: an operator who has forbidden propose_pr outranks a per-goal
+    // grant — the authorisation must not silently re-enable a denied tool.
+    let mut base = PermissionMatrix::default();
+    base.set_override(ff_tools::PROPOSE_PR_TOOL_NAME, PermissionCell::Deny);
+    let m = goal_matrix(base, true);
+    assert_eq!(
+        m.effective_cell(ff_tools::PROPOSE_PR_TOOL_NAME, Mode::Auto, Safety::Publish),
+        PermissionCell::Deny,
+        "an explicit user Deny survives goal authorisation"
     );
 }

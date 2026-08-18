@@ -80,10 +80,41 @@ describe("StartGoalDialog (#816)", () => {
     fireEvent.click(screen.getByRole("button", { name: "Start goal" }));
 
     await waitFor(() =>
-      expect(spy).toHaveBeenCalledWith("s-goal", "refactor auth", 12),
+      expect(spy).toHaveBeenCalledWith(
+        "s-goal",
+        "refactor auth",
+        12,
+        undefined,
+        undefined,
+        false,
+      ),
     );
     await waitFor(() =>
       expect(useGoalDialogStore.getState().sessionId).toBeNull(),
+    );
+  });
+
+  it("authorises propose_pr when the toggle is on", async () => {
+    const spy = vi.spyOn(ipc, "goalSet").mockResolvedValue(fakeGoal());
+    render(<StartGoalDialog />);
+
+    fireEvent.change(screen.getByLabelText("Goal objective"), {
+      target: { value: "ship the fix" },
+    });
+    fireEvent.click(
+      screen.getByLabelText("Allow this goal to open a draft PR"),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Start goal" }));
+
+    await waitFor(() =>
+      expect(spy).toHaveBeenCalledWith(
+        "s-goal",
+        "ship the fix",
+        undefined,
+        undefined,
+        undefined,
+        true,
+      ),
     );
   });
 
@@ -97,7 +128,14 @@ describe("StartGoalDialog (#816)", () => {
     fireEvent.click(screen.getByRole("button", { name: "Start goal" }));
 
     await waitFor(() =>
-      expect(spy).toHaveBeenCalledWith("s-goal", "do the thing", undefined),
+      expect(spy).toHaveBeenCalledWith(
+        "s-goal",
+        "do the thing",
+        undefined,
+        undefined,
+        undefined,
+        false,
+      ),
     );
   });
 

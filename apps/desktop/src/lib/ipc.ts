@@ -528,7 +528,7 @@ export interface FfIpc {
   // session: the loop self-continues each turn toward `objective` until it
   // completes, exhausts its budget, or the user intervenes. These mirror the
   // SHIPPED backend commands (#716/#753) exactly, so signatures are ground truth:
-  //   goal_set(sessionId, objective, maxIterations?, maxTokens?, maxWallMs?) -> Goal
+  //   goal_set(sessionId, objective, maxIterations?, maxTokens?, maxWallMs?, allowProposePr?) -> Goal
   //   goal_status/goal_pause/goal_resume(sessionId) -> Option<Goal>  (== Goal | null)
   //   goal_clear(sessionId) -> ()  and emits `goal:cleared` (bare sessionId)
   // Reuses the generated `Goal` binding (Track B); `bindings/` is untouched. Mocked
@@ -538,14 +538,16 @@ export interface FfIpc {
   // `active` becomes a steer (folded into `pendingSteer`), so it rides `sendMessage`.
   /** Begin (or replace) the session's goal and start the loop. Budget dimensions
    *  are flat optional args (matching `goal_set`); each `undefined` uses the
-   *  backend default (RFC 0020: 40 iterations, tokens/wall unbounded). Resolves the
-   *  new goal. */
+   *  backend default (RFC 0020: 40 iterations, tokens/wall unbounded).
+   *  `allowProposePr` authorises the goal to open a draft PR via `propose_pr` on
+   *  completion (#1256); defaults to false (report-only). Resolves the new goal. */
   goalSet(
     sessionId: string,
     objective: string,
     maxIterations?: number,
     maxTokens?: number,
     maxWallMs?: number,
+    allowProposePr?: boolean,
   ): Promise<Goal>;
   /** Current goal snapshot for the panel to hydrate on mount, or `null` when the
    *  session has no goal. Closes the race where a goal exists before the
@@ -993,6 +995,7 @@ class TauriIpc implements FfIpc {
     maxIterations?: number,
     maxTokens?: number,
     maxWallMs?: number,
+    allowProposePr?: boolean,
   ) =>
     this.invoke<Goal>("goal_set", {
       sessionId,
@@ -1000,6 +1003,7 @@ class TauriIpc implements FfIpc {
       maxIterations,
       maxTokens,
       maxWallMs,
+      allowProposePr,
     });
   goalStatus = (sessionId: string) =>
     this.invoke<Goal | null>("goal_status", { sessionId });
