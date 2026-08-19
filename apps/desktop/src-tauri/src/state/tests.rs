@@ -216,6 +216,38 @@ async fn cancel_pending_denies_via_drop() {
 }
 
 #[tokio::test]
+async fn discard_approval_removes_the_pending_slot() {
+    // #1270: an approver that timed out retires its own slot. Dropping only the
+    // receiver would leave this sender parked until the next cancel.
+    let state = AppState::new();
+    arm(&state, "sess");
+    let _rx = state.register_approval("sess", "call-1");
+    assert!(!state.approvals.lock().unwrap().pending.is_empty());
+
+    state.discard_approval("sess", "call-1");
+    assert!(
+        state.approvals.lock().unwrap().pending.is_empty(),
+        "a discarded approval must not linger in the registry"
+    );
+    // A late click on the now-dead prompt is a harmless no-op.
+    state.resolve_approval("sess", "call-1", true);
+}
+
+#[tokio::test]
+async fn discard_ask_removes_the_pending_slot() {
+    let state = AppState::new();
+    arm(&state, "sess");
+    let _rx = state.register_ask("sess", "q-1");
+    assert!(!state.approvals.lock().unwrap().pending_asks.is_empty());
+
+    state.discard_ask("sess", "q-1");
+    assert!(
+        state.approvals.lock().unwrap().pending_asks.is_empty(),
+        "a discarded question must not linger in the registry"
+    );
+}
+
+#[tokio::test]
 async fn cancel_pending_only_affects_matching_session() {
     let state = AppState::new();
     arm(&state, "sess-a");

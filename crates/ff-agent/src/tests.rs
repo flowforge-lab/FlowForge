@@ -8763,6 +8763,7 @@ fn each_denial_reason_reads_differently_to_the_model() {
         },
         DenyReason::NoInteractiveTerminal,
         DenyReason::Cancelled,
+        DenyReason::Unanswered,
     ];
 
     let messages: Vec<String> = reasons
@@ -8793,6 +8794,19 @@ fn each_denial_reason_reads_differently_to_the_model() {
     assert!(
         cancelled.contains("cancelled"),
         "the message should say what actually happened: {cancelled}"
+    );
+
+    // #1270: same distinction for an expired prompt — nobody declined it either,
+    // and the text must steer the model to converge rather than re-call the tool
+    // into another unanswerable prompt.
+    let unanswered = crate::denial_message("patch", &DenyReason::Unanswered);
+    assert!(
+        !unanswered.contains("denied"),
+        "an unanswered prompt must not be reported as denied: {unanswered}"
+    );
+    assert!(
+        unanswered.contains("Do not retry"),
+        "the message must tell the model not to retry into another timeout: {unanswered}"
     );
 }
 

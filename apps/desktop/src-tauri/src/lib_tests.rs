@@ -4,14 +4,15 @@ use super::{
     install_guard, is_app_ready, list_directory_in, list_local_branches, matrix_gate,
     mcp_quit_path, panic_message, publish_app_ready, read_file_in, resolve_workspace_dir,
     run_sidecar_turn, should_warmup, switch_branch, BootFinalize, TurnMetrics, UiApprover,
-    UpdateStatus, VersionDirection, APP_READY, MCP_SHUTDOWN_BUDGET,
+    UpdateStatus, VersionDirection, APP_READY, CHAT_APPROVAL_TIMEOUT, MCP_SHUTDOWN_BUDGET,
 };
-use ff_agent::{AgentEvent, ApprovalOutcome, Approver, DenyReason, GateDecision};
+use ff_agent::{AgentEvent, ApprovalOutcome, Approver, CancelToken, DenyReason, GateDecision};
 use ff_core::events::TurnDoneEvent;
 use ff_core::{pre_prompt_decision, Mode, PrePromptDecision, ProviderKind};
 use ff_tools::Safety;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 // `APP_READY` is a process-global static, and the boot-state tests below are
 // the only tests in the crate that touch it. Guard them with a mutex so the
@@ -1094,6 +1095,7 @@ async fn ui_approver_scoped_deny_names_the_matched_rule() {
         mode: Mode::Auto,
         autonomous: false,
         allow_propose_pr: false,
+        approval_timeout: CHAT_APPROVAL_TIMEOUT,
     };
 
     let decision = approver
@@ -1132,6 +1134,7 @@ async fn autonomous_ui_approver_denies_propose_pr_without_authorisation() {
         mode: Mode::Auto,
         autonomous: true,
         allow_propose_pr: false,
+        approval_timeout: CHAT_APPROVAL_TIMEOUT,
     };
 
     let decision = approver
@@ -1166,6 +1169,7 @@ async fn autonomous_ui_approver_allows_propose_pr_when_authorised() {
         mode: Mode::Auto,
         autonomous: true,
         allow_propose_pr: true,
+        approval_timeout: CHAT_APPROVAL_TIMEOUT,
     };
 
     let decision = approver
@@ -1366,5 +1370,174 @@ fn every_tauri_command_is_registered_in_the_invoke_handler() {
     assert!(
         registered.contains(&"sleep_memory_chunk"),
         "expected the parsed list to contain a known command"
+    );
+}
+
+// ---- #1270: an unanswered prompt must not park the turn forever ----
+
+/// Build an approver whose prompts expire almost immediately.
+///
+/// The desktop crate has no tokio `test-util`, so these tests use a short real
+/// duration plus an elapsed assertion rather than a paused clock.
+///
+/// `Mode::Auto` + `Safety::Sensitive` is the default matrix's `Ask` cell — the
+/// combination that actually reaches the prompt. `Act` + `Write` would be
+/// auto-allowed and never wait at all.
+fn timed_approver(
+    state: &Arc<AppState>,
+    app: &tauri::App<tauri::test::MockRuntime>,
+    session_id: &str,
+) -> UiApprover<tauri::test::MockRuntime> {
+    UiApprover {
+        app: app.handle().clone(),
+        state: state.clone(),
+        session_id: session_id.into(),
+        mode: Mode::Auto,
+        autonomous: false,
+        allow_propose_pr: false,
+        approval_timeout: Duration::from_millis(50),
+    }
+}
+
+fn mock_app() -> tauri::App<tauri::test::MockRuntime> {
+    tauri::test::mock_builder()
+        .build(tauri::test::mock_context(tauri::test::noop_assets()))
+        .expect("mock app builds")
+}
+
+#[tokio::test]
+async fn ui_approver_unanswered_approval_denies_as_unanswered() {
+    let state = Arc::new(AppState::new());
+    // A live cancel token is what `register_approval`'s TOCTOU guard requires.
+    // Without it registration is refused and the receiver errors instantly, which
+    // would deny as `User` and pass this test for entirely the wrong reason.
+    state.register_cancel("s1", CancelToken::new());
+    let app = mock_app();
+    let approver = timed_approver(&state, &app, "s1");
+
+    let started = std::time::Instant::now();
+    let decision = approver
+        .approve(
+            "m1",
+            "c1",
+            "web_fetch",
+            Safety::Sensitive,
+            &serde_json::json!({}),
+        )
+        .await;
+
+    assert!(
+        matches!(decision, ApprovalOutcome::Denied(DenyReason::Unanswered)),
+        "a prompt nobody answers must deny as Unanswered, not as a user decline: {decision:?}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "the wait must be bounded by approval_timeout, not left to hang"
+    );
+}
+
+#[tokio::test]
+async fn ui_approver_answer_before_timeout_wins() {
+    let state = Arc::new(AppState::new());
+    state.register_cancel("s1", CancelToken::new());
+    let app = mock_app();
+    let approver = timed_approver(&state, &app, "s1");
+
+    let answering = {
+        let state = state.clone();
+        tokio::spawn(async move {
+            // Well inside the 50ms budget.
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            state.resolve_approval("s1", "c1", true);
+        })
+    };
+    let decision = approver
+        .approve(
+            "m1",
+            "c1",
+            "web_fetch",
+            Safety::Sensitive,
+            &serde_json::json!({}),
+        )
+        .await;
+    answering.await.expect("answering task joins");
+
+    assert!(
+        matches!(decision, ApprovalOutcome::Allowed),
+        "an answer that beats the deadline must still decide the call: {decision:?}"
+    );
+}
+
+#[tokio::test]
+async fn ui_approver_cancel_during_wait_still_denies_as_user() {
+    // The ticket requires `cancel_pending_approvals` behaviour to be unchanged:
+    // a user-initiated cancel denies immediately and keeps reading as `User`.
+    let state = Arc::new(AppState::new());
+    state.register_cancel("s1", CancelToken::new());
+    let app = mock_app();
+    // A long timeout, so anything but the cancel resolving this would hang.
+    let approver = UiApprover {
+        app: app.handle().clone(),
+        state: state.clone(),
+        session_id: "s1".into(),
+        mode: Mode::Auto,
+        autonomous: false,
+        allow_propose_pr: false,
+        approval_timeout: Duration::from_secs(300),
+    };
+
+    let cancelling = {
+        let state = state.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            state.cancel_pending_approvals("s1");
+        })
+    };
+    let started = std::time::Instant::now();
+    let decision = approver
+        .approve(
+            "m1",
+            "c1",
+            "web_fetch",
+            Safety::Sensitive,
+            &serde_json::json!({}),
+        )
+        .await;
+    cancelling.await.expect("cancelling task joins");
+
+    assert!(
+        matches!(decision, ApprovalOutcome::Denied(DenyReason::User)),
+        "a cancel must keep denying as User, unchanged by the timeout work: {decision:?}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "cancel must resolve the wait immediately, not wait out the timeout"
+    );
+}
+
+#[tokio::test]
+async fn ui_approver_unanswered_ask_is_dismissed() {
+    let state = Arc::new(AppState::new());
+    state.register_cancel("s1", CancelToken::new());
+    let app = mock_app();
+    let approver = timed_approver(&state, &app, "s1");
+
+    let started = std::time::Instant::now();
+    let answer = approver
+        .ask(
+            "m1",
+            "c1",
+            &serde_json::json!({ "question": "still there?" }),
+        )
+        .await;
+
+    assert!(
+        answer.is_none(),
+        "an unanswered question must resolve as dismissed, which the loop renders \
+         as \"[no answer: question dismissed]\": {answer:?}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "the ask wait must be bounded too"
     );
 }

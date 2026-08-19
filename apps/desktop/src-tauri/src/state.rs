@@ -3556,6 +3556,23 @@ impl AppState {
         }
     }
 
+    /// Drop one pending approval whose awaiting approver has given up (#1270).
+    ///
+    /// `tokio::time::timeout` drops the *receiver*, which leaves this sender parked
+    /// in `pending` until the next `cancel_pending_approvals`. Nothing would ever
+    /// read it, but a long session that times out repeatedly would accumulate dead
+    /// slots, so the approver retires its own entry on expiry.
+    pub fn discard_approval(&self, session_id: &str, call_id: &str) {
+        let key = (session_id.to_string(), call_id.to_string());
+        self.approvals.lock().unwrap().pending.remove(&key);
+    }
+
+    /// The `ask_user` counterpart to [`AppState::discard_approval`].
+    pub fn discard_ask(&self, session_id: &str, call_id: &str) {
+        let key = (session_id.to_string(), call_id.to_string());
+        self.approvals.lock().unwrap().pending_asks.remove(&key);
+    }
+
     /// Drop every pending approval AND pending question for this session — dropping
     /// the sender resolves the awaiting future with `Err`, which the approver
     /// translates to a deny / a dismissed question. Called on turn cancel so neither
