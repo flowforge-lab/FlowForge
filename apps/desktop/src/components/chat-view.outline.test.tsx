@@ -38,7 +38,6 @@ const buildOutlineCalls = () => outlineBuilds;
 
 import { ChatView } from "@/components/chat-view";
 import { useChatStore } from "@/store/chat";
-import { useExperimentalStore } from "@/store/experimental";
 import { useTranscriptScroll } from "@/store/transcript-scroll";
 import {
   installQueuedRaf,
@@ -80,12 +79,6 @@ function seed(messagesBySession: Record<string, Message[]>) {
   });
 }
 
-function setFlag(on: boolean) {
-  useExperimentalStore.setState((s) => ({
-    flags: { ...s.flags, transcriptOutline: on },
-  }));
-}
-
 const outline = (c: HTMLElement) =>
   c.querySelector<HTMLElement>('[data-testid="transcript-outline"]');
 const markerButtons = (c: HTMLElement) =>
@@ -110,25 +103,21 @@ async function renderLong() {
 beforeEach(() => {
   ro.reset();
   raf.reset();
-  setFlag(true);
   seed({ [SID]: msgs(SID, TOTAL) });
 });
 afterEach(() => {
-  setFlag(false);
   useChatStore.setState({ messagesBySession: {}, toolStepsByMessage: {} });
   useTranscriptScroll.setState({ revealers: {} });
 });
 
 describe("transcript outline in ChatView (#1165)", () => {
-  it("is gated by the experimental flag", async () => {
-    setFlag(false);
-    const off = await renderLong();
-    expect(outline(off.container)).toBeNull();
-    off.unmount();
+  // #1283 part A: the outline ships on. The only gate left is the group count,
+  // asserted by the case below — so this one exists to catch a re-gating (an
+  // accidental flag, a settings toggle) rather than to test a branch.
+  it("renders with no opt-in on a session long enough to navigate", async () => {
+    const { container } = await renderLong();
 
-    setFlag(true);
-    const on = await renderLong();
-    expect(outline(on.container)).not.toBeNull();
+    expect(outline(container)).not.toBeNull();
   }, 20_000);
 
   it("stays hidden for a session too short to navigate", async () => {

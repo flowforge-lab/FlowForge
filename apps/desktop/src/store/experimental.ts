@@ -43,9 +43,6 @@ export type FlagId =
   // StepGroup header. Unlike the others it gates a shipped FE behavior, not a
   // future backend.
   | "stepTimelineExport"
-  // FE-only (#1165): gates the clickable scroll outline beside the transcript.
-  // Dogfooded behind a flag first, mirroring how virtualization (#1143) was.
-  | "transcriptOutline"
   // Dev affordance (#567, #749): when ON the updater polls the local
   // `dev-release.sh` feed (localhost:8787) instead of GitHub, enabling the
   // seamless dogfood loop without any env-var setup.
@@ -64,7 +61,6 @@ export const FLAG_IDS: readonly FlagId[] = [
   "backgroundObservers",
   "smartSkillSurfacing",
   "stepTimelineExport",
-  "transcriptOutline",
   "localUpdateChannel",
   "devTools",
 ];
@@ -80,7 +76,6 @@ export const EXPERIMENTAL_DEFAULTS: ExperimentalFlags = {
   backgroundObservers: false,
   smartSkillSurfacing: false,
   stepTimelineExport: false,
-  transcriptOutline: false,
   localUpdateChannel: false,
   devTools: false,
 };

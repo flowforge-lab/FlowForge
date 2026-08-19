@@ -46,6 +46,32 @@ export const OUTLINE_MARKER_PITCH_PX = 7;
 /** Never thin out below this, so a short strip still reads as an outline. */
 const MIN_VISIBLE_MARKERS = 8;
 
+/** How much of a turn the hover flyout shows (#1283). One line at the flyout's
+ *  width; the row truncates with an ellipsis on top of this, so the cap is
+ *  about not carrying whole messages around rather than about layout. */
+export const SNIPPET_MAX_CHARS = 72;
+
+/** What a marker reads as when its representative has no text of its own — an
+ *  assistant turn that ended in a tool call, or a raw tool/system group. Better
+ *  than an empty row, which reads as a rendering bug. */
+const EMPTY_PREVIEW: Record<RenderGroup["kind"], string> = {
+  user: "(empty message)",
+  assistant: "(no text in this turn)",
+  loose: "(tool output)",
+};
+
+/**
+ * One line of a turn, for the flyout: whitespace collapsed (a message is
+ * markdown, so its first line is often a heading or a fence), trimmed, and cut
+ * to `SNIPPET_MAX_CHARS`.
+ */
+export function snippet(content: string, kind: RenderGroup["kind"]): string {
+  const flat = content.replace(/\s+/g, " ").trim();
+  if (!flat) return EMPTY_PREVIEW[kind];
+  if (flat.length <= SNIPPET_MAX_CHARS) return flat;
+  return `${flat.slice(0, SNIPPET_MAX_CHARS - 1).trimEnd()}…`;
+}
+
 export interface OutlineMarker {
   /** Index into `groups` of the marker's representative. */
   index: number;
@@ -59,6 +85,11 @@ export interface OutlineMarker {
   /** Height, as a percentage of the gutter — the share of the session this
    *  marker's bucket covers. */
   heightPct: number;
+  /** One line of the representative turn, for the hover flyout (#1283).
+   *  Computed here rather than in the component so it is built once per marker
+   *  set, under the same `outlineKey` memo that keeps the O(n) walk off the
+   *  per-token render path — not once per hover, per row, per frame. */
+  preview: string;
 }
 
 const EMPTY: OutlineMarker[] = [];
@@ -101,6 +132,7 @@ export function buildOutline(
       kind: groups[index].kind === "user" ? "user" : "assistant",
       startPct: (start / len) * 100,
       heightPct: ((end - start) / len) * 100,
+      preview: snippet(groups[index].message.content, groups[index].kind),
     });
   }
   return markers;

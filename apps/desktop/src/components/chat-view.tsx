@@ -32,14 +32,12 @@ import {
   buildOutline,
   outlineKey,
 } from "@/lib/transcript-outline";
-import type { OutlineMarker } from "@/lib/transcript-outline";
 import { useModelConfigStore, activeConnection } from "@/store/model-config";
 import { downloadStepTimeline } from "@/lib/export-step-timeline";
 import type { Message } from "@/bindings";
 
 const NO_STEPS: ToolStep[] = [];
 const NO_ITEMS: TurnItem[] = [];
-const NO_MARKERS: OutlineMarker[] = [];
 // #866: how long a session switch's forced bottom-pin stays armed, bridging
 // the async gap until loadSession()'s full-history swap-in settles.
 //
@@ -529,9 +527,6 @@ export function ChatView({ sessionId }: { sessionId?: string } = {}) {
   // Dev step-timeline export (#417): the affordance shows only with the flag on; the
   // active model id is stamped into the dump's meta.
   const exportEnabled = useExperimentalStore((s) => s.flags.stepTimelineExport);
-  // Transcript scroll outline (#1165), dogfooded behind a flag first the way
-  // virtualization (#1143) was.
-  const outlineOn = useExperimentalStore((s) => s.flags.transcriptOutline);
   const exportModel = useModelConfigStore(
     (s) => activeConnection(s.registry)?.model ?? null,
   );
@@ -833,8 +828,26 @@ export function ChatView({ sessionId }: { sessionId?: string } = {}) {
   // churn cluster), so the pin is coalesced into a single rAF-scheduled write per
   // frame instead of a synchronous write per fire. The rAF also reads
   // `scrollHeight` at paint time — the freshest post-layout height for that frame.
+  //
+  // The **scroller** is observed as well as the content, because the bottom
+  // moves when either end does and only one of them fires a `scroll` event
+  // (#1283). `session-pane.tsx` hangs four self-hiding per-session panels
+  // (process, observer, notebook kernel, goal) above the transcript and the
+  // per-session `InputBar` below it, all flex siblings of this component, so
+  // switching to a session that has a goal — or a running process, or a
+  // multi-line draft — shortens the transcript column a commit or an IPC round
+  // trip *after* the switch pinned it. That takes the tail off screen without
+  // moving `scrollTop`, so no `scroll` event fires, `pinnedToBottom.current`
+  // stays true, and the content wrapper — whose height did not change — never
+  // fires either. The user was left a panel's height above the newest message
+  // with the pin still nominally armed, which is what "clicking a session in
+  // the sidebar doesn't land on the latest message" actually was.
+  //
+  // It is the same gate as any other settle, so a reader who has scrolled up
+  // is not yanked back when a panel appears, and a pane resize (the other way
+  // this fires) keeps a pinned transcript pinned, which is what it should do.
   useEffect(() => {
-    if (!contentEl) return;
+    if (!contentEl && !scrollEl) return;
     let raf = 0;
     const ro = new ResizeObserver(() => {
       if (raf) return; // a pin is already scheduled for this frame
@@ -844,12 +857,13 @@ export function ChatView({ sessionId }: { sessionId?: string } = {}) {
         pinToTail(true);
       });
     });
-    ro.observe(contentEl);
+    if (contentEl) ro.observe(contentEl);
+    if (scrollEl) ro.observe(scrollEl);
     return () => {
       ro.disconnect();
       if (raf) cancelAnimationFrame(raf);
     };
-  }, [contentEl, pinToTail]);
+  }, [contentEl, scrollEl, pinToTail]);
 
   // A session swap can land on a transcript of the same height (no ResizeObserver
   // fire), so re-arm the pin and jump to the tail explicitly here. `findOn` gates
@@ -918,11 +932,11 @@ export function ChatView({ sessionId }: { sessionId?: string } = {}) {
   // so during the commit that swaps sessions it still holds the *previous*
   // transcript — markers for the session you just navigated away from, and no
   // later key change to correct them.
-  const outlineGroupsKey = outlineOn ? outlineKey(groups) : "";
+  const outlineGroupsKey = outlineKey(groups);
   const outlineMarkers = useMemo(
-    () => (outlineOn ? buildOutline(groups) : NO_MARKERS),
+    () => buildOutline(groups),
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [outlineOn, outlineGroupsKey],
+    [outlineGroupsKey],
   );
 
   const register = useTranscriptScroll((s) => s.register);
@@ -1106,7 +1120,7 @@ export function ChatView({ sessionId }: { sessionId?: string } = {}) {
           that fits in a viewport or two has nothing to navigate. `firstIndex` /
           `lastIndex` are passed as numbers, not `virtualItems`, so the memo
           holds across a streamed token. */}
-      {outlineOn && targetSessionId && groups.length >= OUTLINE_MIN_GROUPS && (
+      {targetSessionId && groups.length >= OUTLINE_MIN_GROUPS && (
         <TranscriptOutline
           sessionId={targetSessionId}
           markers={outlineMarkers}
