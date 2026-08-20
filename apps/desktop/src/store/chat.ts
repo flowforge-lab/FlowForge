@@ -583,6 +583,13 @@ export const useChatStore = create<ChatState>((set, get) => ({
     const { useObserversStore } = await import("@/store/observers");
     useObserversStore.getState().clear(sessionId);
 
+    // Drop the gone session's terminal drawer (#1284). The backend reaps the
+    // shells themselves in `delete_session`; this is the view half, and it also
+    // closes each terminal so a shell is killed even if the backend reap were to
+    // miss it.
+    const { useTerminalStore } = await import("@/store/terminal");
+    useTerminalStore.getState().clearSession(sessionId);
+
     // Never leave the app session-less: recreate + select a fresh blank session.
     if (remaining.length === 0) {
       await get().newSession();

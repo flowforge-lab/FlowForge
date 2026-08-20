@@ -18,6 +18,7 @@ import { usePrefsStore } from "@/store/prefs";
 import { usePanesStore } from "@/store/panes";
 import { useSplitStore } from "@/store/split";
 import { useFilePanelStore } from "@/store/file-panel";
+import { useTerminalStore } from "@/store/terminal";
 import { usePaletteStore } from "@/store/palette";
 import { useAllConversationsSearchStore } from "@/store/all-conversations-search";
 import { useSettingsStore } from "@/store/settings";
@@ -127,6 +128,19 @@ function useGlobalShortcuts() {
         if (sid) {
           e.preventDefault();
           useFilePanelStore.getState().toggleFiles(sid);
+        }
+        return;
+      }
+
+      // ⌘/Ctrl+J: toggle the focused pane's terminal drawer (#1284). Same
+      // per-pane-toggle shape as ⌘⇧E above — the active session mirrors the
+      // focused pane, so this opens a shell where the user is. ⌘J is what VS
+      // Code, Zed, and the JetBrains IDEs use for the same panel.
+      if (mod && e.key.toLowerCase() === "j") {
+        const sid = store.activeSessionId;
+        if (sid) {
+          e.preventDefault();
+          useTerminalStore.getState().toggleDrawer(sid);
         }
         return;
       }

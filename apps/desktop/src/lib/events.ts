@@ -16,6 +16,7 @@ import { useSessionWorkspaceStore } from "@/store/session-workspace";
 import { useGoalStore } from "@/store/goal";
 import { useProcessesStore } from "@/store/processes";
 import { useObserversStore } from "@/store/observers";
+import { useTerminalStore } from "@/store/terminal";
 
 let started = false;
 
@@ -62,6 +63,12 @@ export function startIpcEvents(): void {
   const procs = useProcessesStore.getState();
   void ipc.onProcessOutput(procs.applyProcessOutput);
   void ipc.onProcessExited(procs.applyProcessExited);
+  // An embedded terminal's shell ended (#1284). Marks the tab dead and leaves
+  // its output readable; the drawer's byte stream does NOT come through here
+  // (it is a per-terminal channel), only this one lifecycle signal.
+  void ipc.onTerminalExited((e) =>
+    useTerminalStore.getState().applyExited(e.terminalId),
+  );
   // Observer panel (#1038, epic #954 M2): coarse `observer:changed` (start /
   // stop / fire) → re-list that session's observers. The panel also loads once
   // on mount; this keeps it live thereafter.

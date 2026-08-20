@@ -5,6 +5,7 @@ import {
   Folder,
   Rows2,
   Search,
+  SquareTerminal,
   Upload,
   X,
 } from "@/components/ui/icon";
@@ -14,6 +15,7 @@ import { ChatView } from "@/components/chat-view";
 import { ContextGauge } from "@/components/context-gauge";
 import { FilePanel } from "@/components/file-panel";
 import { FindBar } from "@/components/find-bar";
+import { TerminalDrawer } from "@/components/terminal";
 import { GoalStatusPanel } from "@/components/goal-status-panel";
 import { NotebookStatusPanel } from "@/components/notebook-status-panel";
 import { ObserverPanel } from "@/components/observer-panel";
@@ -27,6 +29,7 @@ import { useComposerStore } from "@/store/composer";
 import { clampPanelWidth, useFilePanelStore } from "@/store/file-panel";
 import { useFindStore } from "@/store/find";
 import { usePanesStore, MAX_PANES } from "@/store/panes";
+import { clampDrawerHeight, useTerminalStore } from "@/store/terminal";
 
 // A single tiling pane (#148): one independent session rendered as a full chat
 // column with its own header controls. The header carries open-new-session-split /
@@ -69,6 +72,17 @@ export function SessionPane({
   const toggleFiles = useFilePanelStore((s) => s.toggleFiles);
   const panelWidth = useFilePanelStore((s) => s.panelWidth);
   const setPanelWidth = useFilePanelStore((s) => s.setPanelWidth);
+
+  // Per-pane terminal drawer (#1284): open state + height live in the terminal
+  // store, keyed by this pane's session so panes get independent shells. Held
+  // until the store hydrates for the same reason as the file panel above — a
+  // restored drawer must not snap in a tick after the transcript has painted.
+  const terminalOpen = useTerminalStore(
+    (s) => s.hasHydrated && s.openSessions.has(sessionId),
+  );
+  const toggleDrawer = useTerminalStore((s) => s.toggleDrawer);
+  const drawerHeight = useTerminalStore((s) => s.drawerHeight);
+  const setDrawerHeight = useTerminalStore((s) => s.setDrawerHeight);
 
   const title = useChatStore((s) => {
     const session = s.sessions.find((x) => x.id === sessionId);
@@ -164,6 +178,32 @@ export function SessionPane({
     window.addEventListener("mouseup", onUp);
   }
 
+  // Drag-to-resize the transcript|terminal divider. Same shape as
+  // `startFilesResize`, rotated: the drawer is flush to the pane's bottom edge,
+  // so its height is the distance from that edge up to the cursor.
+  function startTerminalResize(e: React.MouseEvent) {
+    e.preventDefault();
+    const drawer = e.currentTarget.nextElementSibling as HTMLElement | null;
+    const paneBottom =
+      e.currentTarget.parentElement?.getBoundingClientRect().bottom ?? 0;
+    let latest = drawerHeight;
+    const onMove = (ev: MouseEvent) => {
+      latest = clampDrawerHeight(paneBottom - ev.clientY);
+      if (drawer) drawer.style.height = `${latest}px`;
+    };
+    const onUp = () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+      document.body.style.userSelect = "";
+      document.body.style.cursor = "";
+      setDrawerHeight(latest);
+    };
+    document.body.style.userSelect = "none";
+    document.body.style.cursor = "row-resize";
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+  }
+
   return (
     <div
       onMouseDownCapture={() => {
@@ -200,6 +240,17 @@ export function SessionPane({
             onClick={() => toggleFiles(sessionId)}
           >
             <Folder className="size-3.5" />
+          </Button>
+          {/* Terminal drawer (#1284): an interactive shell rooted at THIS pane's
+              session working directory, so the shell opens where the agent works. */}
+          <Button
+            variant="ghost"
+            size="icon-xs"
+            aria-pressed={terminalOpen}
+            title="Toggle Terminal (⌘J)"
+            onClick={() => toggleDrawer(sessionId)}
+          >
+            <SquareTerminal className="size-3.5" />
           </Button>
           {/* Find in thread (#679): Cmd/Ctrl+F also toggles this. */}
           <Button
@@ -299,6 +350,27 @@ export function SessionPane({
           </>
         )}
       </div>
+
+      {/* Terminal drawer (#1284): the full width of the pane, *below* the
+          chat|files row, so a shell and the file browser can be open at once
+          without fighting for the same space. */}
+      {terminalOpen && (
+        <>
+          {/* Resize handle between the pane body and the drawer. */}
+          <div
+            onMouseDown={startTerminalResize}
+            title="Drag to resize"
+            className="h-1 shrink-0 cursor-row-resize rounded-full transition-colors hover:bg-primary/30"
+          />
+          <section
+            style={{ height: drawerHeight }}
+            className="min-h-0 shrink-0"
+            aria-label="Terminal"
+          >
+            <TerminalDrawer sessionId={sessionId} />
+          </section>
+        </>
+      )}
     </div>
   );
 }

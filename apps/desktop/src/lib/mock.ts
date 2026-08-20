@@ -35,6 +35,7 @@ import type {
   ProcessExitedEvent,
   ObserverInfo,
   ObserverChangedEvent,
+  TerminalExitedEvent,
   ToolResultEvent,
   SkillInfo,
   SkillAggregate,
@@ -90,6 +91,16 @@ import type { PhenotypeMcpUnavailableEvent } from "@/bindings";
 import type { PhenotypePreheatDroppedEvent } from "@/bindings";
 
 type Listener<T> = (e: T) => void;
+
+/** One fake shell behind {@link MockIpc.openTerminal} (#1284). `line` is the
+ *  buffer the toy line editor is filling; it is flushed and interpreted on
+ *  Enter, which is all the statefulness a line-oriented mock shell needs. */
+interface MockTerminal {
+  sessionId: string;
+  cwd: string;
+  onData: (bytes: Uint8Array) => void;
+  line: string;
+}
 
 const uid = () => crypto.randomUUID();
 const now = () => Date.now();
@@ -904,6 +915,10 @@ export class MockIpc implements FfIpc {
   private processOutputListeners = new Set<Listener<ProcessOutputEvent>>();
   private processExitedListeners = new Set<Listener<ProcessExitedEvent>>();
   private observerChangedListeners = new Set<Listener<ObserverChangedEvent>>();
+  private terminalExitedListeners = new Set<Listener<TerminalExitedEvent>>();
+  /** Fake shells for the terminal drawer (#1284), keyed by terminal id. */
+  private terminals = new Map<string, MockTerminal>();
+  private nextTerminalId = 1;
   /** In-memory active observers per session, so the `👁 Observers` panel
    *  round-trips `list_observers` / `stop_observer` under the mock (#1038). */
   private observersBySession = new Map<string, ObserverInfo[]>();
@@ -1095,6 +1110,114 @@ export class MockIpc implements FfIpc {
     this.sessions.set(forked.id, forked);
     this.messages.set(forked.id, clonedMessages);
     return { ...forked };
+  }
+
+  // ---- Embedded terminal (#1284) -------------------------------------------
+  // A toy line-oriented shell, not an emulator: enough for `pnpm dev:mock` and
+  // the component tests to exercise the drawer's real chrome (tabs, resize,
+  // focus, exit) without a PTY. It answers the handful of commands worth
+  // demoing and rejects the rest, exactly as a shell would.
+
+  async openTerminal(
+    sessionId: string,
+    _cols: number,
+    _rows: number,
+    onData: (bytes: Uint8Array) => void,
+  ): Promise<string> {
+    const id = `mock-term-${this.nextTerminalId++}`;
+    const cwd = this.workspaces.get(sessionId) ?? this.defaultWorkspace;
+    const terminal: MockTerminal = { sessionId, cwd, onData, line: "" };
+    this.terminals.set(id, terminal);
+    // A real shell prints its prompt asynchronously, after `terminal_open` has
+    // already resolved. Matching that here is what lets the drawer's
+    // "waiting for the first byte" state be exercised at all.
+    setTimeout(() => this.writeToTerminal(terminal, this.mockPrompt(cwd)), 30);
+    return id;
+  }
+
+  async writeTerminal(terminalId: string, data: string): Promise<void> {
+    const terminal = this.terminals.get(terminalId);
+    if (!terminal) throw new Error(`no such terminal: ${terminalId}`);
+    for (const ch of data) {
+      if (ch === "\r" || ch === "\n") {
+        const line = terminal.line.trim();
+        terminal.line = "";
+        this.writeToTerminal(terminal, "\r\n");
+        if (line === "exit") {
+          this.terminals.delete(terminalId);
+          this.emit(this.terminalExitedListeners, {
+            sessionId: terminal.sessionId,
+            terminalId,
+          });
+          return;
+        }
+        const out = this.runMockCommand(terminal, line);
+        if (out) this.writeToTerminal(terminal, out);
+        this.writeToTerminal(terminal, this.mockPrompt(terminal.cwd));
+      } else if (ch === "\x7f") {
+        // Backspace: erase one cell, the way a shell's line editor does.
+        if (terminal.line.length === 0) continue;
+        terminal.line = terminal.line.slice(0, -1);
+        this.writeToTerminal(terminal, "\b \b");
+      } else {
+        terminal.line += ch;
+        this.writeToTerminal(terminal, ch); // local echo
+      }
+    }
+  }
+
+  async resizeTerminal(
+    _terminalId: string,
+    _cols: number,
+    _rows: number,
+  ): Promise<void> {
+    // Nothing to reflow: the mock shell has no concept of a window size.
+  }
+
+  async closeTerminal(terminalId: string): Promise<void> {
+    const terminal = this.terminals.get(terminalId);
+    if (!terminal) return; // idempotent, like the backend
+    this.terminals.delete(terminalId);
+    // The backend emits this too when its kill lands: the reader sees EOF and
+    // reports the exit even though the frontend already dropped the tab.
+    this.emit(this.terminalExitedListeners, {
+      sessionId: terminal.sessionId,
+      terminalId,
+    });
+  }
+
+  /** `→ <folder> ` — the prompt shape the drawer was designed against. */
+  private mockPrompt(cwd: string): string {
+    const folder = cwd.split("/").filter(Boolean).pop() ?? "/";
+    return `\x1b[32m→\x1b[0m \x1b[36m${folder}\x1b[0m `;
+  }
+
+  private writeToTerminal(terminal: MockTerminal, text: string): void {
+    terminal.onData(new TextEncoder().encode(text));
+  }
+
+  private runMockCommand(terminal: MockTerminal, line: string): string {
+    if (line === "") return "";
+    const [cmd, ...args] = line.split(/\s+/);
+    switch (cmd) {
+      case "pwd":
+        return `${terminal.cwd}\r\n`;
+      case "ls": {
+        const top = new Set(
+          Object.keys(this.mockTree).map((p) => p.split("/")[0]),
+        );
+        return `${[...top].sort().join("  ")}\r\n`;
+      }
+      case "echo":
+        return `${args.join(" ")}\r\n`;
+      case "clear":
+        // Erase display + home the cursor, as a real `clear` does.
+        return "\x1b[2J\x1b[H";
+      case "whoami":
+        return "flowforge\r\n";
+      default:
+        return `mock shell: ${cmd}: command not found\r\n`;
+    }
   }
 
   async getSessionWorkspace(sessionId: string): Promise<SessionWorkspace> {
@@ -1487,6 +1610,9 @@ export class MockIpc implements FfIpc {
   }
   onObserverChanged(cb: Listener<ObserverChangedEvent>): Promise<Unlisten> {
     return this.subscribe(this.observerChangedListeners, cb);
+  }
+  onTerminalExited(cb: Listener<TerminalExitedEvent>): Promise<Unlisten> {
+    return this.subscribe(this.terminalExitedListeners, cb);
   }
 
   // Observer panel (#1038): the in-memory analog of `list_observers` /
