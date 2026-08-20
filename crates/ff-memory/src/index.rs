@@ -905,9 +905,12 @@ fn vec_to_blob(v: &[f32]) -> Vec<u8> {
 /// Inverse of [`vec_to_blob`]; trailing partial bytes (never produced by us) are
 /// ignored.
 fn blob_to_vec(b: &[u8]) -> Vec<f32> {
-    b.chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-        .collect()
+    // `as_chunks` rather than `chunks_exact(4)`: the width is a constant, so
+    // this hands `from_le_bytes` a `&[u8; 4]` directly instead of re-indexing a
+    // slice it cannot prove the length of. `clippy::chunks_exact_to_as_chunks`
+    // (new in the 1.98 toolchain) fires on the old form.
+    let (chunks, _partial) = b.as_chunks::<4>();
+    chunks.iter().copied().map(f32::from_le_bytes).collect()
 }
 
 /// Turn arbitrary user text into a safe FTS5 MATCH expression: each whitespace
