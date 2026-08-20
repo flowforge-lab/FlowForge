@@ -20,6 +20,7 @@ import { Input } from "@/components/ui/input";
 import { Spinner } from "@/components/ui/spinner";
 import { Textarea } from "@/components/ui/textarea";
 import type { ToolStep } from "@/store/chat";
+import type { ProposePrScope } from "@/bindings";
 import { OutputBlock } from "@/components/output-block";
 import { NotebookCellOutput } from "@/components/notebook-cell-output";
 import { isNotebookRunnerStep } from "@/lib/notebook-output";
@@ -39,6 +40,72 @@ function StatusIcon({ status }: { status: ToolStep["status"] }) {
     return <X className="size-3.5 text-destructive" />;
   }
   return <Check className="size-3.5 text-emerald-500" />;
+}
+
+// Scope-at-a-glance for a propose_pr approval gate (#1252): files changed /
+// +insertions −deletions, per-file churn (biggest first, backend-capped), plus
+// any brand-new (untracked) files that staging will sweep in. Shown above the
+// Allow/Deny buttons so the human sees what is about to be pushed without
+// leaving the window; line-level review still happens on the draft PR.
+function ScopeSummary({ summary }: { summary: ProposePrScope }) {
+  const { filesChanged, insertions, deletions, newFiles, perFile } = summary;
+  const nothing =
+    filesChanged === 0 && newFiles === 0 && insertions === 0 && deletions === 0;
+  return (
+    <div className="flex flex-col gap-y-0.5 font-mono text-foreground/90">
+      <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5">
+        {nothing ? (
+          <span className="text-muted-foreground">no changes to push</span>
+        ) : (
+          <>
+            {/* Suppress the "0 files changed" clause for an all-new-file push
+                (finding 4): show it only when there is a tracked change, or when
+                there is nothing else to say. */}
+            {(filesChanged > 0 || newFiles === 0) && (
+              <span>
+                {filesChanged} file{filesChanged === 1 ? "" : "s"} changed
+              </span>
+            )}
+            {insertions > 0 && (
+              <span className="text-emerald-500">+{insertions}</span>
+            )}
+            {deletions > 0 && (
+              <span className="text-destructive">−{deletions}</span>
+            )}
+            {newFiles > 0 && (
+              <span className="text-muted-foreground">
+                {newFiles} new file{newFiles === 1 ? "" : "s"}
+              </span>
+            )}
+          </>
+        )}
+      </div>
+      {perFile.length > 0 && (
+        <ul className="flex flex-col gap-y-0.5 pl-2 text-xs text-muted-foreground">
+          {perFile.map((f) => (
+            <li key={f.path} className="flex items-center gap-x-2">
+              {/* Truncate from the left so the filename — the identifying end of
+                  the path — stays legible when it overflows. */}
+              <span className="truncate text-left" dir="rtl">
+                {f.path}
+              </span>
+              {f.insertions > 0 && (
+                <span className="text-emerald-500">+{f.insertions}</span>
+              )}
+              {f.deletions > 0 && (
+                <span className="text-destructive">−{f.deletions}</span>
+              )}
+            </li>
+          ))}
+          {filesChanged > perFile.length && (
+            <li className="text-muted-foreground/70">
+              …and {filesChanged - perFile.length} more
+            </li>
+          )}
+        </ul>
+      )}
+    </div>
+  );
 }
 
 // Inline prompt for an `ask_user` step (#44): shows the agent's question and a
@@ -270,6 +337,14 @@ export function ToolStepBlock({
               {args}
             </pre>
           </div>
+          {awaiting && step.scopeSummary && (
+            <div>
+              <div className="mb-0.5 text-[10px] uppercase tracking-wide text-muted-foreground/60">
+                about to push
+              </div>
+              <ScopeSummary summary={step.scopeSummary} />
+            </div>
+          )}
           {awaiting && (
             <div className="space-y-1.5 pt-1">
               <div className="flex flex-wrap items-center gap-2">

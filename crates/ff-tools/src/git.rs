@@ -382,6 +382,165 @@ fn parse_numstat(output: &str) -> String {
     result
 }
 
+/// How many per-file rows [`propose_pr_scope_summary`] keeps, biggest churn
+/// first (#1252 AC2). A cap keeps the approval card scannable on a huge change;
+/// the totals still reflect every file.
+const SCOPE_MAX_FILES: usize = 10;
+
+/// Scope-at-a-glance for a `propose_pr` approval gate (#1252): what is about to
+/// be pushed, computed at approval-emit time (the tool is atomic and gated
+/// before `run()`, so nothing is committed yet).
+///
+/// `propose_pr` branches off `HEAD`, commits, and opens the PR against `base`
+/// (default `main`), so the PR's real contents are `merge-base(base, HEAD)` →
+/// working tree — **not** `HEAD` → working tree. Diffing against `HEAD` alone
+/// would hide work already committed on the current branch but not yet on
+/// `base` (#1282 review, finding 1). We resolve the merge-base best-effort
+/// (`origin/<base>` first, then a local `<base>`, then fall back to `HEAD` for a
+/// fresh clone with no such ref) and diff against it.
+///
+/// When `args` carries a `paths` pathspec, `propose_pr` stages exactly those
+/// entries rather than `add -A`, so the summary is scoped to the same set (both
+/// the tracked diff and the untracked-file probe) so it does not overstate
+/// (#1282 review, finding 2).
+///
+/// Combines the numstat diff (tracked changes) with a count of untracked,
+/// non-ignored files, because an all-new-file proposal has an empty tracked
+/// diff. Best-effort throughout: any git failure (not a repo, no `HEAD`, git
+/// missing, a `paths` entry that escapes `root`) yields `None` rather than
+/// blocking the gate.
+pub async fn propose_pr_scope_summary(
+    args: &Value,
+    root: &Path,
+) -> Option<ff_core::events::ProposePrScope> {
+    // Resolve the pathspec `propose_pr` will stage (mirrors git_commit: explicit
+    // `paths` else whole tree). A malformed entry aborts the summary — the commit
+    // would fail on the same input, so a misleading scope is worse than none.
+    let pathspec: Vec<String> = match args.get("paths") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::Array(arr)) => {
+            let mut out = Vec::with_capacity(arr.len());
+            for p in arr {
+                let s = p.as_str().filter(|s| !s.trim().is_empty())?;
+                let abs = resolve_pathspec_in_root(root, s.trim()).ok()?;
+                out.push(abs.to_string_lossy().into_owned());
+            }
+            out
+        }
+        Some(_) => return None,
+    };
+
+    // The PR opens against `base`; diff against the merge-base with it so
+    // already-committed-but-unpushed work is counted. Fall back progressively.
+    let base = args
+        .get("base")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("main");
+    let diff_ref = merge_base_or_head(root, base).await;
+
+    // `propose_pr` pushes two things with different scoping rules: work already
+    // committed on the branch (`merge-base..HEAD`) goes up in full regardless of
+    // `paths`, while the new commit stages only `paths` from the worktree. A
+    // single pathspec'd diff would wrongly filter the committed-ahead part too
+    // (#1282 review), re-understating the push. So with a pathspec present, diff
+    // the two parts separately — committed-ahead unscoped, uncommitted scoped —
+    // and merge per path. With no pathspec it collapses to one `merge-base..`
+    // worktree diff, exactly as before.
+    let mut totals: BTreeMap<String, (u32, u32)> = BTreeMap::new();
+    if pathspec.is_empty() {
+        let numstat = run_git(root, &["diff", "--numstat", diff_ref.as_str()])
+            .await
+            .ok()?;
+        accumulate_numstat(&numstat, &mut totals);
+    } else {
+        // Committed-ahead: `merge-base..HEAD`, never pathspec-scoped — `paths`
+        // controls what the new commit stages, not what the branch already carries.
+        let committed = run_git(root, &["diff", "--numstat", diff_ref.as_str(), "HEAD"])
+            .await
+            .ok()?;
+        accumulate_numstat(&committed, &mut totals);
+        // Uncommitted: `HEAD..worktree`, scoped to what the new commit will stage.
+        let mut uncommitted_args = vec!["diff", "--numstat", "HEAD", "--"];
+        uncommitted_args.extend(pathspec.iter().map(String::as_str));
+        let uncommitted = run_git(root, &uncommitted_args).await.ok()?;
+        accumulate_numstat(&uncommitted, &mut totals);
+    }
+
+    let files_changed = totals.len() as u32;
+    let insertions: u32 = totals.values().map(|(ins, _)| *ins).sum();
+    let deletions: u32 = totals.values().map(|(_, del)| *del).sum();
+    let mut per_file: Vec<ff_core::events::FileScope> = totals
+        .into_iter()
+        .map(
+            |(path, (insertions, deletions))| ff_core::events::FileScope {
+                path,
+                insertions,
+                deletions,
+            },
+        )
+        .collect();
+
+    // Biggest churn first, then cap — the totals above still reflect every file.
+    per_file.sort_by(|a, b| {
+        (b.insertions + b.deletions)
+            .cmp(&(a.insertions + a.deletions))
+            .then_with(|| a.path.cmp(&b.path))
+    });
+    per_file.truncate(SCOPE_MAX_FILES);
+
+    let mut untracked_args = vec!["ls-files", "--others", "--exclude-standard"];
+    if !pathspec.is_empty() {
+        untracked_args.push("--");
+        untracked_args.extend(pathspec.iter().map(String::as_str));
+    }
+    let untracked = run_git(root, &untracked_args).await.ok()?;
+    let new_files = untracked.lines().filter(|l| !l.trim().is_empty()).count() as u32;
+
+    Some(ff_core::events::ProposePrScope {
+        files_changed,
+        insertions,
+        deletions,
+        new_files,
+        per_file,
+    })
+}
+
+/// Fold `git diff --numstat` output into per-path (insertions, deletions),
+/// summing when a path appears in more than one diff (e.g. committed ahead of
+/// base *and* further edited in the working tree). Binary files report `-\t-`;
+/// they still register the path but contribute no line counts.
+fn accumulate_numstat(numstat: &str, totals: &mut BTreeMap<String, (u32, u32)>) {
+    for line in numstat.lines() {
+        let mut cols = line.split('\t');
+        let added = cols.next().unwrap_or("-");
+        let removed = cols.next().unwrap_or("-");
+        let path = match cols.next() {
+            Some(p) if !p.is_empty() => p,
+            _ => continue,
+        };
+        let entry = totals.entry(path.to_string()).or_insert((0, 0));
+        entry.0 += added.parse::<u32>().unwrap_or(0);
+        entry.1 += removed.parse::<u32>().unwrap_or(0);
+    }
+}
+
+/// Best-effort diff base for the scope summary: the merge-base of `HEAD` with the
+/// PR's base branch (`origin/<base>` preferred, then a local `<base>`), falling
+/// back to `HEAD` when neither ref resolves (fresh clone, detached, no remote).
+async fn merge_base_or_head(root: &Path, base: &str) -> String {
+    for candidate in [format!("origin/{base}"), base.to_string()] {
+        if let Ok(out) = run_git(root, &["merge-base", "HEAD", &candidate]).await {
+            let sha = out.trim();
+            if !sha.is_empty() {
+                return sha.to_string();
+            }
+        }
+    }
+    "HEAD".to_string()
+}
+
 // ─── log ─────────────────────────────────────────────────────────────────────
 
 async fn git_log(args: &Value, root: &Path) -> ToolOutcome {
@@ -904,6 +1063,175 @@ mod tests {
         let args = serde_json::json!({"action": "diff", "stat": true});
         let result = git_diff(&args, repo.path()).await;
         assert!(result.success, "git diff --stat failed: {}", result.content);
+    }
+
+    #[tokio::test]
+    async fn scope_summary_counts_tracked_edits() {
+        let repo = init_temp_repo();
+        // Modify the committed README (+2 lines vs HEAD) and edit nothing else.
+        std::fs::write(repo.path().join("README.md"), "hello\nworld\nagain\n").unwrap();
+        let s = propose_pr_scope_summary(&serde_json::json!({}), repo.path())
+            .await
+            .expect("summary on a repo");
+        assert_eq!(s.files_changed, 1);
+        assert_eq!(s.insertions, 2);
+        assert_eq!(s.deletions, 0);
+        assert_eq!(s.new_files, 0);
+        // AC2: per-file churn, biggest first.
+        assert_eq!(s.per_file.len(), 1);
+        assert_eq!(s.per_file[0].path, "README.md");
+        assert_eq!(s.per_file[0].insertions, 2);
+        assert_eq!(s.per_file[0].deletions, 0);
+    }
+
+    #[tokio::test]
+    async fn scope_summary_counts_untracked_new_files() {
+        let repo = init_temp_repo();
+        // An all-new-file proposal: `git diff --stat HEAD` shows nothing, but
+        // propose_pr's `add -A` would commit these — the summary must surface them.
+        std::fs::write(repo.path().join("a.txt"), "one\n").unwrap();
+        std::fs::write(repo.path().join("b.txt"), "two\n").unwrap();
+        let s = propose_pr_scope_summary(&serde_json::json!({}), repo.path())
+            .await
+            .expect("summary on a repo");
+        assert_eq!(s.files_changed, 0);
+        assert_eq!(s.insertions, 0);
+        assert_eq!(s.deletions, 0);
+        assert_eq!(s.new_files, 2);
+    }
+
+    #[tokio::test]
+    async fn scope_summary_clean_tree_is_all_zero() {
+        let repo = init_temp_repo();
+        let s = propose_pr_scope_summary(&serde_json::json!({}), repo.path())
+            .await
+            .expect("summary on a repo");
+        assert_eq!(
+            (s.files_changed, s.insertions, s.deletions, s.new_files),
+            (0, 0, 0, 0)
+        );
+    }
+
+    #[tokio::test]
+    async fn scope_summary_not_a_repo_is_none() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(
+            propose_pr_scope_summary(&serde_json::json!({}), dir.path())
+                .await
+                .is_none(),
+            "a non-repo directory must yield None, never block the gate"
+        );
+    }
+
+    /// Finding 1 (#1282 review): work already committed on the branch but not on
+    /// `base` must be counted — diffing against HEAD alone would hide it.
+    #[tokio::test]
+    async fn scope_summary_counts_committed_ahead_of_base() {
+        let repo = init_temp_repo();
+        let run = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(repo.path())
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .env("LC_ALL", "C")
+                .output()
+                .expect("git runs");
+            assert!(out.status.success(), "git {} failed", args.join(" "));
+        };
+        // init_temp_repo's default branch is `base`; branch off and commit on it.
+        run(&["branch", "-M", "main"]);
+        run(&["checkout", "--quiet", "-b", "feature"]);
+        std::fs::write(repo.path().join("ahead.txt"), "one\ntwo\nthree\n").unwrap();
+        run(&["add", "ahead.txt"]);
+        run(&["commit", "--quiet", "-m", "committed on feature"]);
+
+        // Nothing is uncommitted; the change lives only in a commit ahead of
+        // `main`. Diffing against HEAD would report an empty scope (the old bug);
+        // diffing against merge-base(main, HEAD) must count it.
+        let s = propose_pr_scope_summary(&serde_json::json!({"base": "main"}), repo.path())
+            .await
+            .expect("summary");
+        assert_eq!(s.files_changed, 1, "committed-ahead file must be counted");
+        assert_eq!(s.insertions, 3);
+        assert_eq!(s.per_file[0].path, "ahead.txt");
+    }
+
+    /// Finding 2 (#1282 review): when `paths` is set, `propose_pr` stages only
+    /// those, so the scope must be limited to them (tracked diff + untracked).
+    #[tokio::test]
+    async fn scope_summary_honours_paths_pathspec() {
+        let repo = init_temp_repo();
+        let run = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(repo.path())
+                .env("LC_ALL", "C")
+                .output()
+                .expect("git runs");
+        };
+        run(&["branch", "-M", "main"]);
+        // Two untracked new files; only one is in the pathspec.
+        std::fs::write(repo.path().join("keep.txt"), "a\n").unwrap();
+        std::fs::write(repo.path().join("skip.txt"), "b\n").unwrap();
+
+        let s = propose_pr_scope_summary(
+            &serde_json::json!({"base": "main", "paths": ["keep.txt"]}),
+            repo.path(),
+        )
+        .await
+        .expect("summary");
+        assert_eq!(s.new_files, 1, "only the path-scoped new file is counted");
+    }
+
+    /// #1282 second review: the interaction of findings 1 and 2. `paths` scopes
+    /// only what the new commit stages — work already committed ahead of base is
+    /// pushed in full regardless. A committed-ahead file OUTSIDE the pathspec
+    /// must still appear in the scope; a single pathspec'd diff would drop it and
+    /// understate the push.
+    #[tokio::test]
+    async fn scope_summary_paths_still_counts_committed_ahead_outside_pathspec() {
+        let repo = init_temp_repo();
+        let run = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(repo.path())
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .env("LC_ALL", "C")
+                .output()
+                .expect("git runs");
+            assert!(out.status.success(), "git {} failed", args.join(" "));
+        };
+        run(&["branch", "-M", "main"]);
+        run(&["checkout", "--quiet", "-b", "feature"]);
+        // Committed ahead of `main`, and NOT in the pathspec below.
+        std::fs::write(repo.path().join("ahead.txt"), "one\ntwo\nthree\n").unwrap();
+        run(&["add", "ahead.txt"]);
+        run(&["commit", "--quiet", "-m", "committed on feature"]);
+        // A tracked file the new commit would stage: modified but not committed,
+        // and the only entry in `paths`.
+        std::fs::write(repo.path().join("staged.txt"), "s\n").unwrap();
+        run(&["add", "staged.txt"]);
+        run(&["commit", "--quiet", "-m", "add staged.txt"]);
+        std::fs::write(repo.path().join("staged.txt"), "s\nchanged\n").unwrap();
+
+        let s = propose_pr_scope_summary(
+            &serde_json::json!({"base": "main", "paths": ["staged.txt"]}),
+            repo.path(),
+        )
+        .await
+        .expect("summary");
+
+        assert_eq!(
+            s.files_changed, 2,
+            "committed-ahead file must count even though it is outside `paths`"
+        );
+        assert_eq!(
+            s.insertions, 5,
+            "ahead.txt=3 + staged.txt committed=1 + staged.txt uncommitted=1"
+        );
+        let paths: Vec<&str> = s.per_file.iter().map(|f| f.path.as_str()).collect();
+        assert!(paths.contains(&"ahead.txt"), "got {paths:?}");
+        assert!(paths.contains(&"staged.txt"), "got {paths:?}");
     }
 
     #[tokio::test]

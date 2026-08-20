@@ -31,6 +31,8 @@ export type { ToolResultEvent } from "./ToolResultEvent";
 export type { ToolOutputChunkEvent } from "./ToolOutputChunkEvent";
 export type { ProcessOutputEvent } from "./ProcessOutputEvent";
 export type { ProcessExitedEvent } from "./ProcessExitedEvent";
+export type { FileScope } from "./FileScope";
+export type { ProposePrScope } from "./ProposePrScope";
 export type { ObserverInfo } from "./ObserverInfo";
 export type { ObserverKind } from "./ObserverKind";
 export type { ObserverChangedEvent } from "./ObserverChangedEvent";
