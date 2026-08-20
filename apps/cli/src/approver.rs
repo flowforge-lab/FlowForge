@@ -182,6 +182,30 @@ impl Approver for CliApprover {
         eprintln!("\n[approval] {name} ({label})");
         let pretty = serde_json::to_string_pretty(args).unwrap_or_else(|_| args.to_string());
         eprintln!("{pretty}");
+        // #1252: show what a propose_pr push is about to carry, in parity with the
+        // desktop gate. Best-effort against the CLI's workspace root.
+        if name == ff_tools::PROPOSE_PR_TOOL_NAME {
+            if let Some(s) =
+                ff_tools::propose_pr_scope_summary(args, &crate::host::workspace_root()).await
+            {
+                // Suppress the "N files changed" clause for an all-new-file push
+                // (finding 4): "0 files changed, 2 new files" reads as a bug.
+                let mut parts = Vec::new();
+                if s.files_changed > 0 || s.new_files == 0 {
+                    parts.push(format!(
+                        "{} file(s) changed, +{} -{}",
+                        s.files_changed, s.insertions, s.deletions
+                    ));
+                }
+                if s.new_files > 0 {
+                    parts.push(format!("{} new file(s)", s.new_files));
+                }
+                eprintln!("[approval] about to push: {}", parts.join(", "));
+                for f in &s.per_file {
+                    eprintln!("[approval]   {} +{} -{}", f.path, f.insertions, f.deletions);
+                }
+            }
+        }
 
         let outcome = match Self::decide(self.agent_mode, self.policy, Self::input_mode(), safety) {
             ApprovalDecision::Allow => {

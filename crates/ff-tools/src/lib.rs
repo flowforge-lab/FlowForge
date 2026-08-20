@@ -64,6 +64,7 @@ mod write;
 
 pub use agent_tool::{AgentTool, AGENT_TOOL_NAME};
 pub use compaction::{CompactionRetrieveTool, COMPACTION_RETRIEVE_TOOL};
+pub use git::propose_pr_scope_summary;
 pub use goal_complete::{GoalCompleteTool, GOAL_COMPLETE_TOOL_NAME};
 pub use goal_step::{GoalStepTool, GOAL_STEP_TOOL_NAME};
 pub use propose_pr::PROPOSE_PR_TOOL_NAME;

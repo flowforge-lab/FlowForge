@@ -67,6 +67,52 @@ pub struct ToolApprovalRequestEvent {
     pub args: serde_json::Value,
     /// Trust level — read-only calls never require approval.
     pub safety: ApprovalSafety,
+    /// Scope-at-a-glance for a `propose_pr` gate (#1252): the files/lines about to
+    /// be pushed, computed by the host at approval-emit time. `None` for every
+    /// other tool, and best-effort — a git failure yields `None` rather than
+    /// blocking the gate. The line-level review still happens on the draft PR;
+    /// this is only so the human sees *what's about to be pushed* without leaving
+    /// the window.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub scope_summary: Option<ProposePrScope>,
+}
+
+/// The `git diff --stat`-style scope shown on a `propose_pr` approval gate
+/// (#1252). `propose_pr` commits with `add -A`, so untracked files are counted
+/// separately (`git diff --stat HEAD` alone would undercount an all-new-file
+/// proposal to an empty scope).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "../../../apps/desktop/src/bindings/")]
+pub struct ProposePrScope {
+    /// Tracked files with staged/working-tree changes vs `HEAD`.
+    pub files_changed: u32,
+    /// Total lines added across those files.
+    pub insertions: u32,
+    /// Total lines removed across those files.
+    pub deletions: u32,
+    /// Untracked, non-ignored files that `add -A` will bring into the commit
+    /// (invisible to `git diff --stat HEAD`).
+    pub new_files: u32,
+    /// Per-file churn (#1252 AC2), capped and ordered by descending churn so the
+    /// card shows the biggest touches first. Binary files report `+0 −0` (git
+    /// numstat emits `-` for them). Untracked new files are not listed here —
+    /// they are only counted in [`Self::new_files`].
+    pub per_file: Vec<FileScope>,
+}
+
+/// One row of [`ProposePrScope::per_file`] — a single file's line churn (#1252).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "../../../apps/desktop/src/bindings/")]
+pub struct FileScope {
+    /// Repo-relative path as git reports it.
+    pub path: String,
+    /// Lines added in this file.
+    pub insertions: u32,
+    /// Lines removed in this file.
+    pub deletions: u32,
 }
 
 /// Backend -> frontend request to put a clarifying question to the user (the

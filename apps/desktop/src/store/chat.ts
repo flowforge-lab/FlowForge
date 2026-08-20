@@ -12,6 +12,7 @@ import { notify } from "@/lib/notify";
 import type {
   Attachment,
   ApprovalSafety,
+  ProposePrScope,
   ContextBreakdown,
   Message,
   Session,
@@ -43,6 +44,10 @@ export interface ToolStep {
     | "error";
   /** Set when status is "awaiting-approval" — the call's trust level. */
   safety?: ApprovalSafety;
+  /** Set on a `propose_pr` approval gate (#1252) — the scope about to be pushed
+   *  (files changed / +N −M / new files), shown so the human sees what they are
+   *  approving without leaving the window. Absent for every other tool. */
+  scopeSummary?: ProposePrScope | null;
   /** Set when status is "awaiting-answer" — the `ask_user` question (#44). */
   question?: string;
   /** Set when status is "awaiting-answer" — the model requested a secret (#562):
@@ -1235,7 +1240,12 @@ export const useChatStore = create<ChatState>((set, get) => ({
           ...s.toolStepsByMessage,
           [e.messageId]: steps.map((step) =>
             step.callId === e.callId
-              ? { ...step, status: "awaiting-approval", safety: e.safety }
+              ? {
+                  ...step,
+                  status: "awaiting-approval",
+                  safety: e.safety,
+                  scopeSummary: e.scopeSummary,
+                }
               : step,
           ),
         },

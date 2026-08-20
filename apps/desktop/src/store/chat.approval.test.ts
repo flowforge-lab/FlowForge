@@ -226,3 +226,65 @@ describe("chat store — an expired approval prompt is dismissed (#1270)", () =>
     expect(stepOf()?.status).toBe("error");
   });
 });
+
+describe("chat store — propose_pr scope summary threading (#1252)", () => {
+  beforeEach(() => {
+    useChatStore.setState({
+      toolStepsByMessage: {},
+      sessionApprovedBySession: {},
+      alwaysApproved: new Set<string>(),
+    });
+  });
+
+  it("applyApprovalRequest carries scopeSummary onto the awaiting step", () => {
+    useChatStore.setState({
+      toolStepsByMessage: {
+        [MESSAGE]: [
+          { callId: CALL, tool: "propose_pr", args: {}, status: "running" },
+        ],
+      },
+    });
+    useChatStore.getState().applyApprovalRequest({
+      sessionId: SESSION,
+      messageId: MESSAGE,
+      callId: CALL,
+      tool: "propose_pr",
+      args: {},
+      safety: "publish",
+      scopeSummary: {
+        filesChanged: 2,
+        insertions: 10,
+        deletions: 3,
+        newFiles: 1,
+        perFile: [{ path: "a.ts", insertions: 10, deletions: 3 }],
+      },
+    });
+    expect(stepOf()?.status).toBe("awaiting-approval");
+    expect(stepOf()?.scopeSummary).toEqual({
+      filesChanged: 2,
+      insertions: 10,
+      deletions: 3,
+      newFiles: 1,
+      perFile: [{ path: "a.ts", insertions: 10, deletions: 3 }],
+    });
+  });
+
+  it("leaves scopeSummary undefined for a non-propose_pr gate", () => {
+    useChatStore.setState({
+      toolStepsByMessage: {
+        [MESSAGE]: [
+          { callId: CALL, tool: "edit", args: {}, status: "running" },
+        ],
+      },
+    });
+    useChatStore.getState().applyApprovalRequest({
+      sessionId: SESSION,
+      messageId: MESSAGE,
+      callId: CALL,
+      tool: "edit",
+      args: {},
+      safety: "write",
+    });
+    expect(stepOf()?.scopeSummary).toBeUndefined();
+  });
+});

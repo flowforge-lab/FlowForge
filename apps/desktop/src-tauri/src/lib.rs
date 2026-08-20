@@ -300,6 +300,16 @@ impl<R: tauri::Runtime> Approver for UiApprover<R> {
             Safety::ReadOnly => return ApprovalOutcome::Allowed,
         };
         let rx = self.state.register_approval(&self.session_id, call_id);
+        // #1252: decorate a propose_pr gate with what is about to be pushed.
+        // Computed here (the tool is atomic and gated before run(), so nothing is
+        // committed yet) against the session's working dir. Best-effort — a git
+        // failure leaves it None and never blocks the gate.
+        let scope_summary = if name == ff_tools::PROPOSE_PR_TOOL_NAME {
+            let workspace = self.state.session_root(&self.session_id);
+            ff_tools::propose_pr_scope_summary(args, &workspace).await
+        } else {
+            None
+        };
         let _ = self.app.emit(
             "tool:approval-request",
             ToolApprovalRequestEvent {
@@ -309,6 +319,7 @@ impl<R: tauri::Runtime> Approver for UiApprover<R> {
                 tool: name.to_string(),
                 args: args.clone(),
                 safety: approval_safety,
+                scope_summary,
             },
         );
         match tokio::time::timeout(self.approval_timeout, rx).await {

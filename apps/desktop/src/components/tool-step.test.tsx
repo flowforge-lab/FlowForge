@@ -279,3 +279,101 @@ describe("ToolStepBlock — output (#331)", () => {
     );
   });
 });
+
+describe("ToolStepBlock — propose_pr scope summary (#1252)", () => {
+  const proposeStep: ToolStep = {
+    callId: "c9",
+    tool: "propose_pr",
+    args: { branch: "feat/x", title: "T" },
+    status: "awaiting-approval",
+    safety: "publish",
+    scopeSummary: {
+      filesChanged: 3,
+      insertions: 42,
+      deletions: 7,
+      newFiles: 2,
+      perFile: [
+        { path: "src/big.rs", insertions: 30, deletions: 5 },
+        { path: "src/small.rs", insertions: 12, deletions: 2 },
+      ],
+    },
+  };
+
+  it("shows files changed / +N −M / new files at the gate", () => {
+    render(
+      <ToolStepBlock
+        step={proposeStep}
+        onRespond={vi.fn()}
+        onApproveSession={vi.fn()}
+        onApproveAlways={vi.fn()}
+      />,
+    );
+    const text = container.textContent ?? "";
+    expect(text).toContain("about to push");
+    expect(text).toContain("3 files changed");
+    expect(text).toContain("+42");
+    expect(text).toContain("−7");
+    expect(text).toContain("2 new files");
+    // AC2: per-file churn rows.
+    expect(text).toContain("src/big.rs");
+    expect(text).toContain("src/small.rs");
+    // #1282 review: the capped list names how many rows it elided.
+    expect(text).toContain("and 1 more");
+  });
+
+  it("suppresses the 'files changed' clause for an all-new-file push (#1282 finding 4)", () => {
+    render(
+      <ToolStepBlock
+        step={{
+          ...proposeStep,
+          scopeSummary: {
+            filesChanged: 0,
+            insertions: 0,
+            deletions: 0,
+            newFiles: 2,
+            perFile: [],
+          },
+        }}
+        onRespond={vi.fn()}
+        onApproveSession={vi.fn()}
+        onApproveAlways={vi.fn()}
+      />,
+    );
+    const text = container.textContent ?? "";
+    expect(text).toContain("2 new files");
+    expect(text).not.toContain("0 files changed");
+  });
+
+  it("renders 'no changes to push' for an empty scope", () => {
+    render(
+      <ToolStepBlock
+        step={{
+          ...proposeStep,
+          scopeSummary: {
+            filesChanged: 0,
+            insertions: 0,
+            deletions: 0,
+            newFiles: 0,
+            perFile: [],
+          },
+        }}
+        onRespond={vi.fn()}
+        onApproveSession={vi.fn()}
+        onApproveAlways={vi.fn()}
+      />,
+    );
+    expect(container.textContent ?? "").toContain("no changes to push");
+  });
+
+  it("omits the scope block when there is no summary", () => {
+    render(
+      <ToolStepBlock
+        step={{ ...proposeStep, scopeSummary: undefined }}
+        onRespond={vi.fn()}
+        onApproveSession={vi.fn()}
+        onApproveAlways={vi.fn()}
+      />,
+    );
+    expect(container.textContent ?? "").not.toContain("about to push");
+  });
+});
