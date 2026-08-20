@@ -22,6 +22,11 @@ tauri-plugin-fs = "2"
 tauri-plugin-shell = "2"
 
 tauri-plugin-updater = "2"
+# Pseudo-terminal for the embedded terminal drawer (#1284). WezTerm's PTY crate:
+# the stable cross-platform primitive (ConPTY on Windows) that `tauri-plugin-pty`
+# itself wraps -- we own the four `terminal_*` commands instead, so that pre-1.0
+# plugin's churn and its single-global-terminal model stay out of our path.
+portable-pty = "0.9"
 # Direction-aware update checks (#1034). Already in the lock via the updater plugin;
 # the plugin keeps its `semver::Version` import private, so we depend on it directly.
 semver = "1"

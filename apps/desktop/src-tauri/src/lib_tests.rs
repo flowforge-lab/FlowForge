@@ -1,4 +1,5 @@
 use super::state::AppState;
+use super::terminal::{resolve_shell, Terminals};
 use super::{
     bounded_block_on, build_goal, compare_build, emit_agent_event, git_branch, goal_gate_for,
     install_guard, is_app_ready, list_directory_in, list_local_branches, matrix_gate,
@@ -1540,4 +1541,224 @@ async fn ui_approver_unanswered_ask_is_dismissed() {
         started.elapsed() < Duration::from_secs(1),
         "the ask wait must be bounded too"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Embedded terminal (#1284)
+//
+// These exercise `Terminals` directly rather than the four `terminal_*`
+// commands: the commands are thin wrappers whose only extra work is reading
+// `session_root` and pumping the reader onto a channel, and a real Tauri
+// `State`/`Channel` cannot be constructed here. What matters -- a shell that
+// actually spawns *in the session's cwd*, and one that is actually dead when we
+// say it is -- is all in `Terminals`.
+// ---------------------------------------------------------------------------
+
+/// Read from `reader` until `needle` shows up or the budget runs out. A shell
+/// emits its prompt, echoes the input, and prints the answer in an unpredictable
+/// number of reads, so nothing here may assume one read == one line.
+fn read_until(
+    reader: &mut Box<dyn std::io::Read + Send>,
+    needle: &str,
+    budget: Duration,
+) -> String {
+    let deadline = std::time::Instant::now() + budget;
+    let mut seen = String::new();
+    let mut buf = [0u8; 1024];
+    while std::time::Instant::now() < deadline {
+        match reader.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                seen.push_str(&String::from_utf8_lossy(&buf[..n]));
+                if seen.contains(needle) {
+                    return seen;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    seen
+}
+
+/// A shell that prints its cwd and exits, without sourcing any user rc file --
+/// an interactive `zsh` would otherwise splash a prompt/theme into the output
+/// and could block on something in the developer's own dotfiles.
+const TEST_SHELL: &str = "/bin/sh";
+
+#[test]
+#[cfg(unix)]
+fn terminal_spawns_in_the_session_working_directory() {
+    // The headline acceptance criterion of #1284: pwd == the session's cwd.
+    let dir = tempfile::tempdir().unwrap();
+    // Compare against the canonical path: on macOS a temp dir is under the
+    // `/private` symlink, so the shell's `pwd` never equals the raw `TempDir`.
+    let cwd = std::fs::canonicalize(dir.path()).unwrap();
+    let terminals = Terminals::default();
+
+    let (id, mut reader) = terminals
+        .open("s1", &cwd, 80, 24, TEST_SHELL)
+        .expect("shell must spawn");
+    terminals.write(&id, b"pwd\n").unwrap();
+    let out = read_until(
+        &mut reader,
+        &cwd.display().to_string(),
+        Duration::from_secs(5),
+    );
+
+    assert!(
+        out.contains(&cwd.display().to_string()),
+        "the shell's pwd must be the session's working directory; got: {out:?}"
+    );
+    terminals.close(&id);
+}
+
+#[test]
+#[cfg(unix)]
+fn closing_one_terminal_leaves_its_siblings_alive() {
+    // The multi-tab criterion, and the bug the single-global-PtyPair reference
+    // implementations have: closing tab A must not touch tab B.
+    let dir = tempfile::tempdir().unwrap();
+    let terminals = Terminals::default();
+    let (a, _reader_a) = terminals
+        .open("s1", dir.path(), 80, 24, TEST_SHELL)
+        .unwrap();
+    let (b, mut reader_b) = terminals
+        .open("s1", dir.path(), 80, 24, TEST_SHELL)
+        .unwrap();
+
+    assert!(terminals.close(&a), "closing a live terminal reports true");
+    assert_eq!(terminals.len(), 1, "only the closed terminal is forgotten");
+
+    terminals.write(&b, b"echo alive\n").unwrap();
+    let out = read_until(&mut reader_b, "alive", Duration::from_secs(5));
+    assert!(
+        out.contains("alive"),
+        "the surviving terminal must still respond; got: {out:?}"
+    );
+    terminals.close(&b);
+    assert_eq!(terminals.len(), 0);
+}
+
+#[test]
+#[cfg(unix)]
+fn closing_a_terminal_kills_its_shell() {
+    // No orphaned processes: the PTY must be closed, which the reader observes
+    // as EOF. A shell left running would keep the read blocking until the
+    // budget expires and return output instead of nothing.
+    let dir = tempfile::tempdir().unwrap();
+    let terminals = Terminals::default();
+    let (id, mut reader) = terminals
+        .open("s1", dir.path(), 80, 24, TEST_SHELL)
+        .unwrap();
+
+    terminals.close(&id);
+
+    let mut buf = [0u8; 256];
+    // Drain whatever the shell managed to emit before the kill, then require EOF.
+    loop {
+        match reader.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => continue,
+        }
+    }
+    assert_eq!(
+        terminals.len(),
+        0,
+        "a closed terminal leaves no entry behind"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn deleting_a_session_reaps_only_its_own_terminals() {
+    let dir = tempfile::tempdir().unwrap();
+    let terminals = Terminals::default();
+    let (_a, _ra) = terminals
+        .open("doomed", dir.path(), 80, 24, TEST_SHELL)
+        .unwrap();
+    let (_b, _rb) = terminals
+        .open("doomed", dir.path(), 80, 24, TEST_SHELL)
+        .unwrap();
+    let (keep, _rk) = terminals
+        .open("other", dir.path(), 80, 24, TEST_SHELL)
+        .unwrap();
+
+    assert_eq!(terminals.reap_session("doomed"), 2);
+    assert_eq!(terminals.len(), 1, "another session's terminal survives");
+    assert!(
+        terminals.write(&keep, b"\n").is_ok(),
+        "the surviving terminal is still usable"
+    );
+    terminals.close(&keep);
+}
+
+#[test]
+fn unknown_terminal_id_is_an_error_not_a_panic() {
+    // The frontend races `terminal:exited` against its own writes, so a stale id
+    // must come back as a rejected promise -- never take the app down.
+    let terminals = Terminals::default();
+    assert!(terminals.write("nope", b"x").is_err());
+    assert!(terminals.resize("nope", 80, 24).is_err());
+    assert!(
+        !terminals.close("nope"),
+        "closing an already-gone terminal is a no-op, not an error"
+    );
+}
+
+#[test]
+fn resolve_shell_prefers_the_users_own_shell() {
+    let never = |_: &str| -> Option<std::path::PathBuf> { panic!("must not look up PATH") };
+    assert_eq!(
+        resolve_shell(Some("/usr/local/bin/fish".to_string()), never),
+        "/usr/local/bin/fish"
+    );
+}
+
+#[test]
+fn resolve_shell_falls_back_when_shell_is_unset_or_blank() {
+    let found = |name: &str| Some(std::path::PathBuf::from(format!("/usr/bin/{name}")));
+    let expected = if cfg!(windows) {
+        "/usr/bin/pwsh.exe"
+    } else {
+        "/usr/bin/zsh"
+    };
+    assert_eq!(resolve_shell(None, found), expected);
+    // An empty `$SHELL` is as good as unset -- it is not a runnable program.
+    assert_eq!(resolve_shell(Some("  ".to_string()), found), expected);
+}
+
+#[test]
+fn resolve_shell_ignores_a_posix_shell_on_windows() {
+    // #1286 review: Git-for-Windows exports `SHELL=/usr/bin/bash` into
+    // environments that have no such program, and ConPTY cannot spawn it — so on
+    // Windows a POSIX-looking `$SHELL` is skipped in favour of a shell that
+    // exists. Everywhere else that same value is exactly what the user asked for.
+    let found = |name: &str| Some(std::path::PathBuf::from(format!("/usr/bin/{name}")));
+    let resolved = resolve_shell(Some("/usr/bin/bash".to_string()), found);
+    if cfg!(windows) {
+        assert_eq!(resolved, "/usr/bin/pwsh.exe");
+    } else {
+        assert_eq!(resolved, "/usr/bin/bash");
+    }
+}
+
+#[test]
+#[cfg(windows)]
+fn resolve_shell_still_honours_a_windows_shaped_shell() {
+    let never = |_: &str| -> Option<std::path::PathBuf> { panic!("must not look up PATH") };
+    assert_eq!(
+        resolve_shell(
+            Some(r"C:\Program Files\Git\bin\bash.exe".to_string()),
+            never
+        ),
+        r"C:\Program Files\Git\bin\bash.exe"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn resolve_shell_last_resort_is_sh() {
+    // Nothing on PATH: still hand back something that exists on every unix,
+    // rather than failing to open a terminal at all.
+    assert_eq!(resolve_shell(None, |_| None), "/bin/sh");
 }

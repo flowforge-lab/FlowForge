@@ -7,8 +7,10 @@ mod git_watch;
 mod optimize;
 mod secrets;
 mod state;
+mod terminal;
 mod tools;
 
+use crate::terminal::{terminal_close, terminal_open, terminal_resize, terminal_write, Terminals};
 use async_trait::async_trait;
 use ff_agent::{
     drive_goal, AgentEvent, ApprovalOutcome, Approver, CancelToken, DenyReason, GateDecision,
@@ -474,7 +476,11 @@ fn rename_session(state: State<'_, Arc<AppState>>, session_id: String, title: St
 /// Permanently remove a session and its transcript. Cancels any in-flight turn and
 /// pending approvals first, so a stream cannot write back to a deleted session.
 #[tauri::command]
-fn delete_session(state: State<'_, Arc<AppState>>, session_id: String) {
+fn delete_session(
+    state: State<'_, Arc<AppState>>,
+    terminals: State<'_, Terminals>,
+    session_id: String,
+) {
     if let Some(token) = state.take_cancel(&session_id) {
         token.cancel();
     }
@@ -484,6 +490,13 @@ fn delete_session(state: State<'_, Arc<AppState>>, session_id: String) {
     state.store.delete_session(&session_id);
     state.reap_session_processes(&session_id);
     state.reap_session_kernels(&session_id);
+    // Kill this session's embedded terminals (#1284). Synchronous, unlike the
+    // reaps around it: killing a PTY child is a signal, not an await, so there
+    // is no runtime to enter from this off-reactor sync command.
+    let reaped = terminals.reap_session(&session_id);
+    if reaped > 0 {
+        tracing::info!(session_id = %session_id, reaped, "reaped session terminals");
+    }
     // Stop and reap session-scoped background observers (#891 Phase 1).
     // Same fire-and-forget, off-reactor pattern as the reaps above.
     state.reap_session_observers(&session_id);
@@ -4373,6 +4386,10 @@ pub fn run() {
     // `is_app_ready` flag. This is a reordering, not new logic: the same work runs,
     // just off the synchronous pre-window path.
     let app = tauri::Builder::default()
+        // The open PTYs (#1284). Managed here rather than with `AppState` (which
+        // only lands after the async boot) because it has no initialization to
+        // wait on -- it starts empty and fills the first time a drawer opens.
+        .manage(terminal::Terminals::default())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
@@ -4619,6 +4636,10 @@ pub fn run() {
             write_curated_memory,
             list_directory,
             read_file,
+            terminal_open,
+            terminal_write,
+            terminal_resize,
+            terminal_close,
             list_memory_chunks,
             reset_memory_chunk,
             sleep_memory_chunk,
