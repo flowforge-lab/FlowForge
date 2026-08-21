@@ -29,6 +29,16 @@ describe("keyboardReferenceGroups", () => {
     );
   });
 
+  it("carries a newly registered shortcut into Settings → Keyboard (#1290)", () => {
+    // The Settings section derives from `SHORTCUTS`, so adding a binding there
+    // is supposed to be the whole change. This is the assertion that says so.
+    const nav = keyboardReferenceGroups("enter").find(
+      (g) => g.group === "Navigation",
+    );
+
+    expect(nav?.items.map((i) => i.label)).toContain("Message navigator");
+  });
+
   it("reflects the send-message binding in the Send message / New line rows", () => {
     const enterRows = keyboardReferenceGroups("enter")[0].items;
     expect(enterRows.find((i) => i.label === "Send message")!.keys).toEqual([

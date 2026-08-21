@@ -23,6 +23,22 @@ describe("groupedShortcuts", () => {
     expect(groupedShortcuts(only).map((g) => g.group)).toEqual(["Session"]);
   });
 
+  it("gives every shortcut its own key combination", () => {
+    // The registry is documentation, but a duplicate here means two bindings
+    // are fighting over one chord in `useGlobalShortcuts` — which resolves by
+    // branch order, silently, and only for whichever one is listed first. This
+    // is what guards a new binding (⌘⇧O, #1290) against the next one.
+    const combos = SHORTCUTS.map((s) => s.keys.join("+"));
+
+    expect(new Set(combos).size).toBe(combos.length);
+  });
+
+  it("lists the message navigator under Navigation (#1290)", () => {
+    const nav = groupedShortcuts().find((g) => g.group === "Navigation");
+
+    expect(nav?.items.map((s) => s.label)).toContain("Message navigator");
+  });
+
   it("surfaces a newly added shortcut with no other change", () => {
     const extended: Shortcut[] = [
       ...SHORTCUTS,

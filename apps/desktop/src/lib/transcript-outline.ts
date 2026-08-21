@@ -16,6 +16,7 @@
 // estimate from content length, or persisted measurements). That is its own
 // piece of work and deliberately does not gate this one.
 
+import type { Message } from "@/bindings";
 import type { RenderGroup } from "@/lib/turn-groups";
 
 /** Ceiling on rendered markers. A 9000-message session folds to thousands of
@@ -27,6 +28,16 @@ export const OUTLINE_MAX_MARKERS = 200;
 /** Below this the outline is noise: a session that fits in a viewport or two
  *  has nothing to navigate, and a strip of three dots is just clutter. */
 export const OUTLINE_MIN_GROUPS = 12;
+
+/** How far back from the tail, in raw messages, before the navigator (#1290) is
+ *  worth offering. Scrolling within the last few messages is reading, not
+ *  navigating, and a pill that appears there is chrome the reader didn't ask
+ *  for — the whole point of replacing the always-on strip. */
+export const NAVIGATOR_MIN_SCROLLBACK = 5;
+
+/** Row pitch of the navigator popup's list, in px — the popup's answer to
+ *  `OUTLINE_MARKER_PITCH_PX`. Kept in sync with the row's `h-5`. */
+export const NAVIGATOR_ROW_PX = 20;
 
 /**
  * Vertical space each rendered marker gets, in px — its height plus the gap to
@@ -151,16 +162,18 @@ export function buildOutline(
  * `heightPx <= 0` means "not measured yet" (first paint, or jsdom, which has no
  * layout) — return everything and let the next frame thin it, rather than
  * guessing a height and rendering the wrong count.
+ *
+ * `pitchPx` is a parameter rather than a second function because the navigator
+ * popup (#1290) thins the same markers against 20px rows instead of 2px marks;
+ * the maths is identical and only the unit of "what fits" differs.
  */
 export function visibleMarkers(
   markers: readonly OutlineMarker[],
   heightPx: number,
+  pitchPx: number = OUTLINE_MARKER_PITCH_PX,
 ): readonly OutlineMarker[] {
   if (heightPx <= 0 || markers.length === 0) return markers;
-  const budget = Math.max(
-    MIN_VISIBLE_MARKERS,
-    Math.floor(heightPx / OUTLINE_MARKER_PITCH_PX),
-  );
+  const budget = Math.max(MIN_VISIBLE_MARKERS, Math.floor(heightPx / pitchPx));
   if (markers.length <= budget) return markers;
   const step = Math.ceil(markers.length / budget);
   return markers.filter((_, i) => i % step === 0);
@@ -190,4 +203,72 @@ export function outlineKey(groups: readonly RenderGroup[]): string {
   const len = groups.length;
   if (len === 0) return "0";
   return `${len}:${groups[0].message.id}:${groups[len - 1].message.id}`;
+}
+
+/**
+ * The 1-based ordinal of the **last raw message each group covers** — the
+ * counter's numerator (#1290), one entry per group.
+ *
+ * The navigator counts raw messages, not groups, because "how far down am I"
+ * is a question about the transcript the user scrolled, and `groups` is a
+ * folded view of it: `foldTurns` drops mode-switch markers and swallows a
+ * turn's tool/system followers, so a group count answers a different question
+ * than the one the pill appears to be answering.
+ *
+ * Exclusive-end is the load-bearing choice, not a detail. The obvious mapping —
+ * "where does this group's own message sit in `messages`" — is wrong at the
+ * tail: an assistant group's `message` is the turn's *final assistant* message,
+ * with its tool results folded in *after* it, so a turn ending in eight tool
+ * calls would report ordinal `total - 8` while the viewport is resting at the
+ * very bottom. That is a scrollback of 8 at rest, i.e. the pill fading in over
+ * state 1 on the most common shape of a verification transcript. Defining the
+ * ordinal as the start of the *next* group instead makes
+ * `ordinals.at(-1) === messages.length` true by construction, so "at the tail ⇒
+ * scrollback 0" is exact rather than approximate.
+ *
+ * One forward walk, no `Map`: group representatives appear in `messages` in
+ * strictly increasing order, so a single cursor finds them all. A
+ * representative that isn't in `messages` (it shouldn't happen — groups are
+ * derived from them) clamps to the previous value, keeping the array monotonic
+ * instead of throwing on the render path.
+ */
+export function messageOrdinals(
+  groups: readonly RenderGroup[],
+  messages: readonly Message[],
+): number[] {
+  const len = groups.length;
+  if (len === 0) return [];
+
+  // `starts[i]` = index in `messages` of group i's representative.
+  const starts: number[] = new Array(len);
+  let cursor = 0;
+  for (let i = 0; i < len; i++) {
+    const id = groups[i].message.id;
+    let found = -1;
+    for (let j = cursor; j < messages.length; j++) {
+      if (messages[j].id === id) {
+        found = j;
+        break;
+      }
+    }
+    if (found < 0) {
+      // Unknown id: don't rewind the cursor and don't go backwards.
+      starts[i] = i === 0 ? 0 : starts[i - 1];
+      continue;
+    }
+    starts[i] = found;
+    cursor = found + 1;
+  }
+
+  const ordinals: number[] = new Array(len);
+  for (let i = 0; i < len - 1; i++) {
+    // The next group starts where this one's span ends, so that index is also
+    // this group's count of messages-so-far.
+    ordinals[i] = Math.max(starts[i + 1], i === 0 ? 1 : ordinals[i - 1]);
+  }
+  ordinals[len - 1] = Math.max(
+    messages.length,
+    len > 1 ? ordinals[len - 2] : 1,
+  );
+  return ordinals;
 }

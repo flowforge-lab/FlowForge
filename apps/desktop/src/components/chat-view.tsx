@@ -26,10 +26,11 @@ import { foldTurns, lastTurnStart, segmentTurn } from "@/lib/turn-groups";
 import type { RenderGroup, TurnItem } from "@/lib/turn-groups";
 import { useExperimentalStore } from "@/store/experimental";
 import { useTranscriptScroll } from "@/store/transcript-scroll";
-import { TranscriptOutline } from "@/components/transcript-outline";
+import { MessageNavigator } from "@/components/message-navigator";
 import {
   OUTLINE_MIN_GROUPS,
   buildOutline,
+  messageOrdinals,
   outlineKey,
 } from "@/lib/transcript-outline";
 import { useModelConfigStore, activeConnection } from "@/store/model-config";
@@ -76,6 +77,11 @@ const ROW_ESTIMATE_PX = 140;
 // this constant is what the node-count invariant in
 // `chat-view.virtualization.test.tsx` is really asserting about.
 const OVERSCAN = 6;
+// How long the navigator pill lingers after the last scroll event (#1290).
+// Matches the linger the old outline's position counter used, which read right
+// in the live pass: long enough that a pause mid-flick doesn't blink it away,
+// short enough that it is gone by the time you resume reading.
+const NAVIGATOR_IDLE_MS = 1000;
 // The content wrapper's `py-4` bottom padding, which lives *outside* the
 // virtualizer's spacer and therefore outside its coordinate space. Told to the
 // virtualizer as `scrollPaddingEnd` so an `align: "end"` scroll targets the
@@ -646,6 +652,36 @@ export function ChatView({ sessionId }: { sessionId?: string } = {}) {
   // Render-state mirror of `pinnedToBottom` so the floating "Jump to latest" button
   // (#206) shows only while scrolled up. Toggles at the same 40px threshold.
   const [atBottom, setAtBottom] = useState(true);
+  // Navigator inputs (#1290): the group index of the lowest row on screen, and
+  // whether the transcript is being scrolled right now. Both are written by
+  // `handleScroll` below.
+  const [lowestIndex, setLowestIndex] = useState(0);
+  const [scrolling, setScrolling] = useState(false);
+  const idleTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // True while a pin is still travelling to the tail. Every write the pin makes
+  // echoes back as a `scroll` event, and reading those as *the user scrolling*
+  // is how the navigator ends up flashing over a transcript nobody touched:
+  // opening a session pins from `scrollTop = 0`, and the reconcile loop walks
+  // the viewport down in a dozen steps that each report a position hundreds of
+  // messages back.
+  //
+  // Cleared by the first scroll that moves *up*, not by arrival or a timer.
+  // Neither of those works: the number of echoes is a function of how far the
+  // pin has to travel (`scrollToEnd` re-scrolls once per frame as rows
+  // measure), and "is it at the tail yet" flickers true while it travels,
+  // because each newly measured row grows the spacer under it. What a pin never
+  // does is move the viewport backwards — so an upward scroll is proof the user
+  // has the wheel, and it is also the only direction that can put the navigator
+  // in scope.
+  const pinInFlight = useRef(false);
+  /** Last scroll offset `handleScroll` saw, for that direction test. */
+  const lastScrollTop = useRef(0);
+  useEffect(
+    () => () => {
+      if (idleTimer.current) clearTimeout(idleTimer.current);
+    },
+    [],
+  );
   // Bridges the async gap between the session-switch effect's pin to the cached
   // tail and loadSession()'s later swap-in of the full history
   // (chat.ts:457-490). During that gap, the browser's default CSS scroll
@@ -807,6 +843,7 @@ export function ChatView({ sessionId }: { sessionId?: string } = {}) {
     (authoritative: boolean) => {
       const el = scrollElRef.current;
       if (!el || !shouldPinToTail(authoritative)) return;
+      pinInFlight.current = true; // its echoes aren't user scrolling (#1290)
       virtualizer.scrollToEnd();
       el.scrollTop = el.scrollHeight;
     },
@@ -939,6 +976,19 @@ export function ChatView({ sessionId }: { sessionId?: string } = {}) {
     [outlineGroupsKey],
   );
 
+  // The navigator counts raw messages, not groups (#1290), so it needs the
+  // group→message ordinal map alongside the markers. Same memo discipline, with
+  // `msgs.length` added to the key: a tool result landing mid-turn changes the
+  // message count without changing the group count or the tail group's id, and
+  // it moves every ordinal after it. A streamed token changes none of the
+  // three, so this walk stays off the per-token path exactly like the markers.
+  const ordinalsKey = `${outlineGroupsKey}:${msgs.length}`;
+  const ordinals = useMemo(
+    () => messageOrdinals(groups, msgs),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [ordinalsKey],
+  );
+
   const register = useTranscriptScroll((s) => s.register);
   useEffect(() => {
     if (!targetSessionId) return;
@@ -981,6 +1031,36 @@ export function ChatView({ sessionId }: { sessionId?: string } = {}) {
     const pinned = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
     pinnedToBottom.current = pinned;
     setAtBottom(pinned);
+
+    // Where the *fold* is, not where the window ends: `virtualItems` carries
+    // OVERSCAN rows past the bottom edge, and at ROW_ESTIMATE_PX that is most
+    // of a screenful of error in a counter that claims to say where you are.
+    // The old outline could ignore this because it only drew a thumb's edge.
+    const bottom = virtualizer.getVirtualItemForOffset(
+      el.scrollTop + el.clientHeight - 1,
+    );
+    if (bottom) setLowestIndex(bottom.index);
+
+    // Scroll *activity*, which is what the navigator pill appears on. Derived
+    // from real scroll events rather than from the windowed range changing:
+    // rows are tall, so a whole screen of scrolling can happen inside one
+    // message without the window moving at all — and conversely the pin, the
+    // streaming autoscroll and the #866 swap-in all move the window while the
+    // user is sitting still. React bails out on an identical setState, so a
+    // scroll burst costs two writes total.
+    const movedUp = el.scrollTop < lastScrollTop.current;
+    lastScrollTop.current = el.scrollTop;
+    if (pinInFlight.current && !movedUp) {
+      // Still the pin's own echoes.
+    } else {
+      pinInFlight.current = false;
+      setScrolling(true);
+      if (idleTimer.current) clearTimeout(idleTimer.current);
+      idleTimer.current = setTimeout(
+        () => setScrolling(false),
+        NAVIGATOR_IDLE_MS,
+      );
+    }
   }
 
   // Scroll to the newest content and re-arm sticky autoscroll (#206).
@@ -1014,6 +1094,9 @@ export function ChatView({ sessionId }: { sessionId?: string } = {}) {
     // empty-list fallback folded in — the same convergence `pinToTail` relies
     // on, and this comment is the long-form version of why both need it.
     virtualizer.scrollToEnd({ behavior: "smooth" });
+    // Same as a pin: the flight down is this component's doing, not the user's,
+    // so it must not raise the navigator on its way past (#1290).
+    pinInFlight.current = true;
     pinnedToBottom.current = true;
     setAtBottom(true);
   }
@@ -1116,17 +1199,19 @@ export function ChatView({ sessionId }: { sessionId?: string } = {}) {
         </div>
       </div>
 
-      {/* The scroll outline (#1165). Below the minimum it is clutter: a session
-          that fits in a viewport or two has nothing to navigate. `firstIndex` /
-          `lastIndex` are passed as numbers, not `virtualItems`, so the memo
-          holds across a streamed token. */}
+      {/* The message navigator (#1290, replacing the #1165 strip). Below the
+          minimum it is clutter: a session that fits in a viewport or two has
+          nothing to navigate. `lowestIndex` is passed as a number, not
+          `virtualItems`, so the memo holds across a streamed token. */}
       {targetSessionId && groups.length >= OUTLINE_MIN_GROUPS && (
-        <TranscriptOutline
+        <MessageNavigator
           sessionId={targetSessionId}
           markers={outlineMarkers}
-          total={groups.length}
-          firstIndex={virtualItems[0]?.index ?? 0}
-          lastIndex={virtualItems[virtualItems.length - 1]?.index ?? 0}
+          ordinals={ordinals}
+          totalMessages={msgs.length}
+          lowestIndex={lowestIndex}
+          scrolling={scrolling}
+          atBottom={atBottom}
         />
       )}
 

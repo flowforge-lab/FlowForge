@@ -19,6 +19,7 @@ import { usePanesStore } from "@/store/panes";
 import { useSplitStore } from "@/store/split";
 import { useFilePanelStore } from "@/store/file-panel";
 import { useTerminalStore } from "@/store/terminal";
+import { useMessageNavigator } from "@/store/message-navigator";
 import { usePaletteStore } from "@/store/palette";
 import { useAllConversationsSearchStore } from "@/store/all-conversations-search";
 import { useSettingsStore } from "@/store/settings";
@@ -145,6 +146,21 @@ function useGlobalShortcuts() {
         return;
       }
 
+      // ⌘/Ctrl+⇧+O: open the focused pane's transcript message navigator
+      // (#1290). Deliberately next to ⌘⇧E — it is the same "toggle this pane's
+      // thing" shape, and keeping both Shift bindings together is what keeps
+      // the disambiguation from ⌘O (Auto mode, below) obvious. Opening from
+      // the keyboard bypasses the scrollback threshold: a user who asked for
+      // the list by name should get it, even sitting at the tail.
+      if (mod && e.shiftKey && e.key.toLowerCase() === "o") {
+        const sid = store.activeSessionId;
+        if (sid) {
+          e.preventDefault();
+          useMessageNavigator.getState().toggleNavigator(sid);
+        }
+        return;
+      }
+
       if (mod && e.key.toLowerCase() === "n") {
         e.preventDefault();
         // New session lands in the focused pane (keeps the layout; the pane just
@@ -199,6 +215,17 @@ function useGlobalShortcuts() {
         return;
       }
       if (e.key === "Escape") {
+        // The open navigator owns Esc, like every other overlay in this
+        // function. Not defensive: its popup is portalled outside the React
+        // root, so without this branch closing it would *also* fall through and
+        // close the split panel or cancel the user's running turn. Radix fires
+        // its own `onEscapeKeyDown` too; `closeNavigator` is idempotent.
+        const sid = store.activeSessionId;
+        if (sid && useMessageNavigator.getState().openSessions.has(sid)) {
+          e.preventDefault();
+          useMessageNavigator.getState().closeNavigator(sid);
+          return;
+        }
         // Esc closes the split panel first; only if it's already closed does
         // Esc fall through to cancelling the active turn.
         const split = useSplitStore.getState();

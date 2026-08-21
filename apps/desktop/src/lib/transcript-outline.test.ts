@@ -7,15 +7,19 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  NAVIGATOR_ROW_PX,
   OUTLINE_MARKER_PITCH_PX,
   OUTLINE_MAX_MARKERS,
   SNIPPET_MAX_CHARS,
   buildOutline,
+  messageOrdinals,
   outlineKey,
   snippet,
   visibleMarkers,
 } from "@/lib/transcript-outline";
+import { foldTurns } from "@/lib/turn-groups";
 import type { RenderGroup } from "@/lib/turn-groups";
+import type { Message } from "@/bindings";
 
 /** Minimal groups — `buildOutline` reads `kind`, `message.id` and (for the
  *  #1283 flyout snippet) `message.content`. */
@@ -232,5 +236,115 @@ describe("snippet (#1283)", () => {
 
     expect(markers.every((m) => m.preview.length > 0)).toBe(true);
     expect(markers[0].preview).toBe("user turn 0");
+  });
+});
+
+describe("messageOrdinals (#1290)", () => {
+  /** A message list `foldTurns` really folds, so the group/message skew under
+   *  test is the production one and not a fixture's idea of it. */
+  function transcript(): Message[] {
+    const m = (
+      id: string,
+      role: Message["role"],
+      content: string,
+      extra: Partial<Message> = {},
+    ) =>
+      ({
+        id,
+        sessionId: "s1",
+        role,
+        content,
+        createdAt: 1,
+        ...extra,
+      }) as Message;
+    return [
+      m("u1", "user", "first question"),
+      m("a1", "assistant", "first answer"),
+      // A mode-switch marker: dropped entirely by `foldTurns`, but it still
+      // occupies an ordinal, because the denominator is raw messages.
+      m("sw", "user", "[system: mode switched to Act]"),
+      m("u2", "user", "second question"),
+      m("a2", "assistant", "working on it"),
+      // The shape the exclusive-end rule exists for: the turn's *last*
+      // assistant message, then its tool results, all folded into one group.
+      m("t1", "tool", "tool result 1", { toolCallId: "c1" }),
+      m("t2", "tool", "tool result 2", { toolCallId: "c2" }),
+      m("t3", "tool", "tool result 3", { toolCallId: "c3" }),
+    ];
+  }
+
+  it("ends at the raw message count, however many tool results trail the last turn", () => {
+    const messages = transcript();
+    const folded = foldTurns(messages, {}, {});
+
+    const ordinals = messageOrdinals(folded, messages);
+
+    // The property the pill's "nothing at rest" state rests on: at the tail the
+    // scrollback is exactly 0. Mapping a group to its own message's index
+    // instead would land on `a2` here and report three messages of scrollback
+    // while pinned to the bottom — the pill fading in over state 1.
+    expect(ordinals).toHaveLength(folded.length);
+    expect(ordinals[ordinals.length - 1]).toBe(messages.length);
+  });
+
+  it("counts the messages a group covers, not the groups before it", () => {
+    const messages = transcript();
+    const folded = foldTurns(messages, {}, {});
+
+    const ordinals = messageOrdinals(folded, messages);
+
+    // Fewer groups than messages, or this proves nothing about the units.
+    expect(folded.length).toBeLessThan(messages.length);
+    expect(ordinals).not.toEqual(folded.map((_, i) => i + 1));
+  });
+
+  it("never goes backwards", () => {
+    const messages = transcript();
+    const ordinals = messageOrdinals(foldTurns(messages, {}, {}), messages);
+
+    for (let i = 1; i < ordinals.length; i++) {
+      expect(ordinals[i]).toBeGreaterThanOrEqual(ordinals[i - 1]);
+    }
+  });
+
+  it("survives a group whose message is no longer in the transcript", () => {
+    // An edit or truncate between building the markers and reading them: the
+    // walk must not throw on the render path, and must stay monotonic.
+    const messages = transcript();
+    const folded = foldTurns(messages, {}, {});
+
+    const ordinals = messageOrdinals(folded, messages.slice(0, 2));
+
+    expect(ordinals).toHaveLength(folded.length);
+    for (let i = 1; i < ordinals.length; i++) {
+      expect(ordinals[i]).toBeGreaterThanOrEqual(ordinals[i - 1]);
+    }
+  });
+
+  it("is empty for an empty transcript", () => {
+    expect(messageOrdinals([], [])).toEqual([]);
+    expect(messageOrdinals(alternating(3), [])).toHaveLength(3);
+  });
+});
+
+describe("visibleMarkers pitch (#1290)", () => {
+  it("thins against the pitch it is given, not the strip's", () => {
+    const all = buildOutline(alternating(4000));
+    const height = 400;
+
+    const marks = visibleMarkers(all, height);
+    const popupRows = visibleMarkers(all, height, NAVIGATOR_ROW_PX);
+
+    // 20px rows fit far fewer than 7px marks in the same 400px.
+    expect(popupRows.length).toBeLessThan(marks.length);
+    expect(popupRows.length).toBeLessThanOrEqual(height / NAVIGATOR_ROW_PX);
+  });
+
+  it("defaults to the strip's pitch when none is given", () => {
+    const all = buildOutline(alternating(4000));
+
+    expect(visibleMarkers(all, 400)).toEqual(
+      visibleMarkers(all, 400, OUTLINE_MARKER_PITCH_PX),
+    );
   });
 });
