@@ -72,7 +72,19 @@ export function installResizeObserverStub(): ResizeObserverHarness {
         for (const o of installedObservers) {
           if (!o.live) continue;
           if (el && !o.targets.includes(el)) continue;
-          o.cb([], o as unknown as ResizeObserver);
+          // One entry per observed target, as a real observer delivers. An
+          // empty array would be a lie the callbacks can read: the outline's
+          // strip observer (#1165) sizes itself from `entry.contentRect`, and a
+          // stub that fires with nothing makes every unrelated scroll suite
+          // throw as soon as the outline renders in it.
+          const entries = o.targets.map(
+            (t) =>
+              ({
+                target: t,
+                contentRect: t.getBoundingClientRect(),
+              }) as ResizeObserverEntry,
+          );
+          o.cb(entries, o as unknown as ResizeObserver);
         }
       });
     },
@@ -171,6 +183,13 @@ export function installQueuedRaf(): QueuedRafHarness {
   };
 }
 
+/** What `makeScrollable` hands back, for suites that need to change the
+ *  viewport after the fact. */
+export interface ScrollableHarness {
+  /** Resize the viewport (clientHeight) without touching the content. */
+  setViewportHeight: (h: number) => void;
+}
+
 // --- container geometry -----------------------------------------------------
 
 /**
@@ -220,8 +239,12 @@ export function mockGeometry(
  * `handleScroll` and virtual-core's own cached offset both learn about a scroll
  * only that way, and the reconcile loop cannot converge without it.
  */
-export function makeScrollable(el: HTMLElement, viewportH = VIEWPORT_H): void {
+export function makeScrollable(
+  el: HTMLElement,
+  viewportH = VIEWPORT_H,
+): ScrollableHarness {
   let top = 0;
+  let height = viewportH;
   const spacerHeight = () => {
     const spacer = el.querySelector<HTMLElement>("[style*='height']");
     return spacer ? parseFloat(spacer.style.height) || 0 : 0;
@@ -232,13 +255,13 @@ export function makeScrollable(el: HTMLElement, viewportH = VIEWPORT_H): void {
   });
   Object.defineProperty(el, "clientHeight", {
     configurable: true,
-    get: () => viewportH,
+    get: () => height,
   });
   Object.defineProperty(el, "scrollTop", {
     configurable: true,
     get: () => top,
     set: (v: number) => {
-      top = Math.max(0, Math.min(v, Math.max(0, spacerHeight() - viewportH)));
+      top = Math.max(0, Math.min(v, Math.max(0, spacerHeight() - height)));
       el.dispatchEvent(new Event("scroll"));
     },
   });
@@ -259,5 +282,23 @@ export function makeScrollable(el: HTMLElement, viewportH = VIEWPORT_H): void {
       }
     }
     el.scrollTop = to;
+  };
+  return {
+    // A viewport-height change with the content untouched — what per-session
+    // chrome (the goal / observer / kernel / process panels and the input bar,
+    // all siblings of ChatView in `session-pane.tsx`) does to the transcript
+    // when it appears or grows.
+    //
+    // No `scroll` event unless the offset actually moves, which is the browser's
+    // rule and the load-bearing half here: shrinking the viewport pulls the
+    // bottom *away* from a pinned reader without moving `scrollTop`, so nothing
+    // tells the component it is no longer at the tail. A stub that fired
+    // unconditionally would instead detach the pin and hide the defect behind a
+    // second one.
+    setViewportHeight: (h: number) => {
+      height = h;
+      const max = Math.max(0, spacerHeight() - height);
+      if (top > max) el.scrollTop = max;
+    },
   };
 }

@@ -9,19 +9,22 @@ import { describe, expect, it } from "vitest";
 import {
   OUTLINE_MARKER_PITCH_PX,
   OUTLINE_MAX_MARKERS,
+  SNIPPET_MAX_CHARS,
   buildOutline,
   outlineKey,
+  snippet,
   visibleMarkers,
 } from "@/lib/transcript-outline";
 import type { RenderGroup } from "@/lib/turn-groups";
 
-/** Minimal groups — `buildOutline` only reads `kind` and `message.id`. */
+/** Minimal groups — `buildOutline` reads `kind`, `message.id` and (for the
+ *  #1283 flyout snippet) `message.content`. */
 function groups(kinds: ("user" | "assistant")[]): RenderGroup[] {
   return kinds.map(
     (kind, i) =>
       ({
         kind,
-        message: { id: `m${i}` },
+        message: { id: `m${i}`, content: `${kind} turn ${i}` },
         ...(kind === "assistant"
           ? { items: [], steps: [], reasoning: "", durationMs: null }
           : {}),
@@ -189,5 +192,45 @@ describe("outlineKey (#1165)", () => {
 
     expect(outlineKey(after)).toBe(outlineKey(before));
     expect(after).not.toBe(before);
+  });
+});
+
+describe("snippet (#1283)", () => {
+  it("flattens a markdown message to one line", () => {
+    expect(snippet("## Heading\n\nthen   the  body", "assistant")).toBe(
+      "## Heading then the body",
+    );
+  });
+
+  it("truncates at the cap", () => {
+    const out = snippet("a".repeat(SNIPPET_MAX_CHARS * 2), "user");
+
+    expect(out).toHaveLength(SNIPPET_MAX_CHARS);
+    expect(out.endsWith("a…")).toBe(true);
+  });
+
+  it("does not leave a space stranded before the ellipsis", () => {
+    const out = snippet(`${"a".repeat(SNIPPET_MAX_CHARS - 2)} tail`, "user");
+
+    expect(out.endsWith("a…")).toBe(true);
+  });
+
+  it("leaves a message that already fits exactly as it is", () => {
+    expect(snippet("short enough", "user")).toBe("short enough");
+  });
+
+  // An assistant turn that ended in a tool call has no text of its own, and an
+  // empty row reads as a rendering bug rather than as a turn.
+  it("names the kind when the turn has no text", () => {
+    expect(snippet("", "assistant")).toBe("(no text in this turn)");
+    expect(snippet("   \n ", "loose")).toBe("(tool output)");
+    expect(snippet("", "user")).toBe("(empty message)");
+  });
+
+  it("is carried on every built marker", () => {
+    const markers = buildOutline(alternating(40));
+
+    expect(markers.every((m) => m.preview.length > 0)).toBe(true);
+    expect(markers[0].preview).toBe("user turn 0");
   });
 });
