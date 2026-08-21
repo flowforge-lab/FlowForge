@@ -11,7 +11,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use ff_memory::MemoryIndex;
+use ff_memory::{chunk_key, MemoryIndex};
 use ff_session::SessionStore;
 use serde_json::Value;
 
@@ -21,13 +21,17 @@ use crate::registry::{Safety, Tool, ToolOutcome};
 /// call without a magic string (mirrors `AGENT_TOOL_NAME`).
 pub const COMPACTION_RETRIEVE_TOOL: &str = "compaction_retrieve";
 
+/// How many top chunks to map from the retrieved content text (B2).
+const TOP_K_MAPPING: usize = 10;
+
 /// Retrieve the verbatim original of a previously-compacted tool result.
 pub struct CompactionRetrieveTool {
     store: Arc<SessionStore>,
     /// On-disk memory index. A successful retrieve is a strong use-time
     /// reinforcement signal (RFC 0022 §4.3) that would otherwise evaporate with
-    /// the session; we persist a cross-session count here. `None` in contexts
-    /// wired without a memory store, in which case recording is skipped.
+    /// the session; we persist a cross-session count here and map the retrieved
+    /// content to related chunks. `None` in contexts wired without a memory
+    /// store, in which case recording and mapping are skipped.
     index: Option<Arc<dyn MemoryIndex>>,
 }
 
@@ -38,8 +42,9 @@ impl CompactionRetrieveTool {
     }
 
     /// Attach the memory index so a successful retrieve records a durable,
-    /// cross-session reinforcement signal (RFC 0022 §4.3). Builder so existing
-    /// call sites keep compiling; omit it and recording is a no-op.
+    /// cross-session reinforcement signal (RFC 0022 §4.3) and maps the
+    /// retrieved content to related chunks. Builder so existing call sites
+    /// keep compiling; omit it and recording is a no-op.
     #[must_use]
     pub fn with_index(mut self, index: Arc<dyn MemoryIndex>) -> Self {
         self.index = Some(index);
@@ -96,6 +101,18 @@ impl Tool for CompactionRetrieveTool {
                 // mutates the transcript/prompt cache, so `safety` stays ReadOnly.
                 if let Some(index) = &self.index {
                     let _ = index.record_retrieve(key);
+                    // Map the retrieved content to related chunks via FTS5
+                    // text overlap (B2). The mapping is used by memory_search
+                    // to boost the ranking of related chunks.
+                    if let Ok(hits) = index.search(&content, TOP_K_MAPPING) {
+                        let mappings: Vec<(String, f32)> = hits
+                            .iter()
+                            .map(|s| (chunk_key(&s.chunk), s.score))
+                            .collect();
+                        if !mappings.is_empty() {
+                            let _ = index.map_retrieve_to_chunks(key, &mappings);
+                        }
+                    }
                 }
                 ToolOutcome::ok(content)
             }
@@ -201,5 +218,62 @@ mod tests {
             .await;
         assert!(out.success);
         assert_eq!(out.content, "the full original");
+    }
+
+    #[tokio::test]
+    async fn successful_retrieve_creates_content_chunk_mapping() {
+        let store = Arc::new(SessionStore::new());
+        let s = store.create_session(None);
+        let m = store.add_tool_result_message(&s.id, "call-1".into(), "compressed".into());
+        // The retrieved content mentions "rust" so it should match the indexed chunk.
+        store.put_compaction_original(&s.id, &m.id, "key1", "rust is a systems language");
+
+        let index: Arc<dyn ff_memory::MemoryIndex> =
+            Arc::new(ff_memory::Fts5Index::open_in_memory().unwrap());
+        // Seed a chunk about rust.
+        let md = "## Rust\nrust is a systems language";
+        let cs = ff_memory::chunk_markdown(
+            md,
+            ff_memory::MemorySource::Curated,
+            std::path::Path::new("MEMORY.md"),
+        );
+        index.reindex(&cs).unwrap();
+
+        let rust_key = ff_memory::chunk_key(&cs[0]);
+        let tool = CompactionRetrieveTool::new(store).with_index(index.clone());
+
+        let out = tool
+            .run(serde_json::json!({ "key": "key1" }), Path::new("."))
+            .await;
+        assert!(out.success);
+
+        // The retrieve should have created a mapping: key1 → rust chunk.
+        let hits = index
+            .chunk_retrieve_hits(std::slice::from_ref(&rust_key))
+            .unwrap();
+        assert_eq!(
+            hits.get(&rust_key).copied(),
+            Some(1),
+            "a mapping must exist for the related chunk"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_retrieve_creates_no_mapping() {
+        let store = Arc::new(SessionStore::new());
+        let index: Arc<dyn ff_memory::MemoryIndex> =
+            Arc::new(ff_memory::Fts5Index::open_in_memory().unwrap());
+        let tool = CompactionRetrieveTool::new(store).with_index(index.clone());
+
+        let out = tool
+            .run(serde_json::json!({ "key": "nope" }), Path::new("."))
+            .await;
+        assert!(!out.success);
+
+        // No mapping should exist for the failed key.
+        let hits = index
+            .chunk_retrieve_hits(&["chunk:nope".to_string()])
+            .unwrap();
+        assert!(hits.is_empty(), "no mapping for a failed retrieve");
     }
 }

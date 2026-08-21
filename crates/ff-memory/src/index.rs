@@ -25,6 +25,15 @@ use crate::{DecayConfig, MemoryChunk, MemorySource};
 /// decay days (RFC 0007 §2).
 const ONE_DAY_MS: f32 = 86_400_000.0;
 
+/// Fraction of the max score used as the retrieve-based boost ceiling (B2).
+/// At `SATURATION_HITS` retrieves the additive term reaches its maximum:
+/// `RETRIEVE_FRACTION * max_score`. Below saturation the boost follows a
+/// sub-linear curve: `√(hits / SATURATION_HITS)`.
+const RETRIEVE_FRACTION: f32 = 0.1;
+/// Number of retrieves at which the boost saturates.
+/// `√(SATURATION_HITS / SATURATION_HITS) = 1.0`.
+const SATURATION_HITS: f32 = 10.0;
+
 /// A search hit: the chunk plus a relevance score (higher = more relevant; it is
 /// the negated BM25 distance, so callers can sort descending intuitively).
 #[derive(Debug, Clone, PartialEq)]
@@ -97,20 +106,33 @@ pub trait MemoryIndex: Send + Sync {
     }
     /// Record that a compacted tool result was pulled back verbatim via
     /// `compaction_retrieve` (RFC 0022 §4.3): a strong, use-time reinforcement
-    /// signal that today evaporates with the session. Aggregates a cross-session
-    /// count per content key in the `retrieve_stats` table. This is an
-    /// attribution *instrument* — it persists the signal but does not yet feed
-    /// ranking (that consumption is a follow-up, and needs a retrieve-key →
-    /// chunk mapping that does not exist today). The default is a no-op so
-    /// backends without a stats table need no change; [`Fts5Index`] overrides it.
+    /// signal. Aggregates a cross-session count per content key in the
+    /// `retrieve_stats` table. The default is a no-op so backends without a
+    /// stats table need no change; [`Fts5Index`] overrides it.
     fn record_retrieve(&self, _content_key: &str) -> Result<()> {
         Ok(())
     }
     /// Cross-session count of how many times `content_key` was pulled back via
-    /// `compaction_retrieve`. `0` when never retrieved. Backs tests and the
-    /// future ranking consumer; the default is `0` for stats-less backends.
+    /// `compaction_retrieve`. `0` when never retrieved. The default is `0` for
+    /// stats-less backends.
     fn retrieve_count(&self, _content_key: &str) -> Result<u64> {
         Ok(0)
+    }
+    /// Store that `content_key` maps to `chunk_keys` (found by FTS5 text
+    /// overlap at retrieve time). The default is a no-op so backends without a
+    /// stats table need no change; [`Fts5Index`] overrides it.
+    fn map_retrieve_to_chunks(
+        &self,
+        _content_key: &str,
+        _mappings: &[(String, f32)],
+    ) -> Result<()> {
+        Ok(())
+    }
+    /// Summed `retrieve_stats.count` per `chunk_key` across all content keys
+    /// that map to it. Absent keys are omitted (caller treats as zero boost).
+    /// The default is empty for stats-less backends.
+    fn chunk_retrieve_hits(&self, _chunk_keys: &[String]) -> Result<HashMap<String, u64>> {
+        Ok(HashMap::new())
     }
     /// Read-time effective (decayed) usage stats for `keys`, computed against
     /// `now_ms` without persisting (RFC 0007 §3). Keys with no `chunk_stats`
@@ -236,6 +258,13 @@ impl Fts5Index {
                  content_key TEXT PRIMARY KEY,
                  count       INTEGER NOT NULL DEFAULT 0,
                  last_ms     INTEGER NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS content_chunk_map (
+                 content_key TEXT NOT NULL,
+                 chunk_key   TEXT NOT NULL,
+                 similarity  REAL NOT NULL DEFAULT 1.0,
+                 last_mapped INTEGER NOT NULL,
+                 PRIMARY KEY (content_key, chunk_key)
              );",
         )?;
         Self::ensure_embedding_column(&conn)?;
@@ -444,6 +473,31 @@ impl Fts5Index {
         Ok(())
     }
 
+    /// Time-injectable core of [`map_retrieve_to_chunks`](MemoryIndex::map_retrieve_to_chunks).
+    /// Upserts mapping rows in `content_chunk_map` (B2).
+    pub(crate) fn map_retrieve_to_chunks_at(
+        &self,
+        content_key: &str,
+        mappings: &[(String, f32)],
+        now_ms: i64,
+    ) -> Result<()> {
+        if mappings.is_empty() {
+            return Ok(());
+        }
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "INSERT INTO content_chunk_map (content_key, chunk_key, similarity, last_mapped)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(content_key, chunk_key) DO UPDATE SET
+                 similarity = ?3, last_mapped = ?4",
+        )?;
+        for (chunk_key, similarity) in mappings {
+            stmt.execute(params![content_key, chunk_key, *similarity as f64, now_ms])?;
+        }
+        Ok(())
+    }
+
+    /// Time-injectable core of [`reset_chunk`](MemoryIndex::reset_chunk) (#293).
     /// Restores `weight` to `1.0` and stamps `last_accessed = now_ms`, creating
     /// the row if absent (a never-recalled chunk has no row). `access_count` and
     /// `pinned` are preserved on an existing row; a fresh row starts at count `0`,
@@ -514,6 +568,7 @@ impl MemoryIndex for Fts5Index {
         let keys: Vec<String> = chunks.iter().map(chunk_key).collect();
         if keys.is_empty() {
             tx.execute("DELETE FROM chunk_stats", [])?;
+            tx.execute("DELETE FROM content_chunk_map", [])?;
         } else {
             tx.execute("CREATE TEMP TABLE valid_keys (k TEXT PRIMARY KEY)", [])?;
             {
@@ -524,6 +579,10 @@ impl MemoryIndex for Fts5Index {
             }
             tx.execute(
                 "DELETE FROM chunk_stats WHERE chunk_key NOT IN (SELECT k FROM valid_keys)",
+                [],
+            )?;
+            tx.execute(
+                "DELETE FROM content_chunk_map WHERE chunk_key NOT IN (SELECT k FROM valid_keys)",
                 [],
             )?;
             tx.execute("DROP TABLE valid_keys", [])?;
@@ -607,11 +666,23 @@ impl MemoryIndex for Fts5Index {
         // to M5.
         if !out.is_empty() {
             let keys: Vec<String> = out.iter().map(|s| chunk_key(&s.chunk)).collect();
-            let stats = self.effective_stats(&keys, Utc::now().timestamp_millis())?;
+            let now_ms = Utc::now().timestamp_millis();
+            let stats = self.effective_stats(&keys, now_ms)?;
             for (s, key) in out.iter_mut().zip(&keys) {
                 if let Some(es) = stats.get(key) {
                     s.weight = es.weight;
                     s.last_accessed_ms = Some(es.last_accessed_ms);
+                }
+            }
+            // Retrieve-based score boost (B2): bump the score of chunks that
+            // are mapped from repeatedly-retrieved content keys.
+            let max_score = out.iter().map(|s| s.score).fold(0.0_f32, f32::max);
+            if max_score > 0.0 {
+                let retrieve_hits = self.chunk_retrieve_hits(&keys)?;
+                for (s, key) in out.iter_mut().zip(&keys) {
+                    if let Some(&hits) = retrieve_hits.get(key) {
+                        s.score += RETRIEVE_FRACTION * max_score * retrieve_boost_factor(hits);
+                    }
                 }
             }
         }
@@ -640,6 +711,42 @@ impl MemoryIndex for Fts5Index {
             )
             .optional()?;
         Ok(count.unwrap_or(0).max(0) as u64)
+    }
+
+    fn map_retrieve_to_chunks(&self, content_key: &str, mappings: &[(String, f32)]) -> Result<()> {
+        self.map_retrieve_to_chunks_at(content_key, mappings, Utc::now().timestamp_millis())
+    }
+
+    fn chunk_retrieve_hits(&self, chunk_keys: &[String]) -> Result<HashMap<String, u64>> {
+        if chunk_keys.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let conn = self.conn.lock().unwrap();
+        let placeholders: Vec<String> = (0..chunk_keys.len())
+            .map(|i| format!("?{}", i + 1))
+            .collect();
+        let sql = format!(
+            "SELECT cm.chunk_key, SUM(rs.count)
+             FROM content_chunk_map cm
+             JOIN retrieve_stats rs USING (content_key)
+             WHERE cm.chunk_key IN ({})
+             GROUP BY cm.chunk_key",
+            placeholders.join(", ")
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let params: Vec<&dyn rusqlite::types::ToSql> = chunk_keys
+            .iter()
+            .map(|k| k as &dyn rusqlite::types::ToSql)
+            .collect();
+        let mut out = HashMap::new();
+        let rows = stmt.query_map(params.as_slice(), |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        for row in rows {
+            let (key, count) = row?;
+            out.insert(key, count.max(0) as u64);
+        }
+        Ok(out)
     }
 
     fn effective_stats(
@@ -756,6 +863,13 @@ fn reinforced_weight(weight: f32, gain: f32) -> f32 {
     (weight + gain * (1.0 - weight)).min(1.0)
 }
 
+/// Retrieve-based score boost (B2). Returns an additive term in `[0, 1]`
+/// that when multiplied by `max_score * RETRIEVE_FRACTION` gives the boost.
+/// Saturates at `√(1.0) = 1.0` when `hits >= SATURATION_HITS`.
+fn retrieve_boost_factor(hits: u64) -> f32 {
+    (hits as f32 / SATURATION_HITS).sqrt().min(1.0)
+}
+
 fn source_to_str(source: &MemorySource) -> String {
     match source {
         MemorySource::Curated => "curated".to_string(),
@@ -847,6 +961,14 @@ impl<E: Embedder> MemoryIndex for HybridIndex<E> {
         self.inner.retrieve_count(content_key)
     }
 
+    fn map_retrieve_to_chunks(&self, content_key: &str, mappings: &[(String, f32)]) -> Result<()> {
+        self.inner.map_retrieve_to_chunks(content_key, mappings)
+    }
+
+    fn chunk_retrieve_hits(&self, chunk_keys: &[String]) -> Result<HashMap<String, u64>> {
+        self.inner.chunk_retrieve_hits(chunk_keys)
+    }
+
     fn effective_stats(
         &self,
         keys: &[String],
@@ -924,7 +1046,7 @@ impl<E: Embedder> MemoryIndex for HybridIndex<E> {
             .collect();
         fused.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
-        Ok(fused
+        let mut results: Vec<ScoredChunk> = fused
             .into_iter()
             .take(k)
             .map(|(i, score)| ScoredChunk {
@@ -935,7 +1057,26 @@ impl<E: Embedder> MemoryIndex for HybridIndex<E> {
                 weight: bm25[i].weight,
                 last_accessed_ms: bm25[i].last_accessed_ms,
             })
-            .collect())
+            .collect();
+
+        // Retrieve-based score boost (B2): same proportional boost as Fts5Index.
+        let max_score = results.iter().map(|s| s.score).fold(0.0_f32, f32::max);
+        if max_score > 0.0 {
+            let keys: Vec<String> = results.iter().map(|s| chunk_key(&s.chunk)).collect();
+            let retrieve_hits = self.chunk_retrieve_hits(&keys)?;
+            for (s, key) in results.iter_mut().zip(&keys) {
+                if let Some(&hits) = retrieve_hits.get(key) {
+                    s.score += RETRIEVE_FRACTION * max_score * retrieve_boost_factor(hits);
+                }
+            }
+            results.sort_by(|a, b| {
+                b.score
+                    .partial_cmp(&a.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+        }
+
+        Ok(results)
     }
 }
 
