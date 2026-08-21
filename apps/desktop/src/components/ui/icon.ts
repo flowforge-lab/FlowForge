@@ -83,6 +83,7 @@ export {
   Square,
   SquareArrowOutUpRight,
   SquareCheck,
+  SquareTerminal,
   Star,
   Sun,
   Target,

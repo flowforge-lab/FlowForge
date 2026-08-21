@@ -47,6 +47,7 @@ import type {
   ToolOutputChunkEvent,
   ProcessOutputEvent,
   ProcessExitedEvent,
+  TerminalExitedEvent,
   ObserverInfo,
   ObserverChangedEvent,
   ToolResultEvent,
@@ -139,6 +140,29 @@ export interface FfIpc {
     path: string,
     maxBytes?: number,
   ): Promise<FileContent>;
+  /** Open an interactive shell for the terminal drawer (#1284), rooted at this
+   *  session's working directory. Resolves to the terminal id the other three
+   *  `*Terminal` calls address.
+   *
+   *  `onData` receives raw PTY bytes as they arrive — feed them straight to
+   *  xterm, which owns UTF-8 decoding (a multi-byte character can straddle two
+   *  chunks, so this layer must never decode them itself). Under Tauri this is a
+   *  `Channel`, not an event: terminal output is the high-throughput case Tauri's
+   *  docs steer away from the event system. */
+  openTerminal(
+    sessionId: string,
+    cols: number,
+    rows: number,
+    onData: (bytes: Uint8Array) => void,
+  ): Promise<string>;
+  /** Send keystrokes to a terminal's shell — whatever xterm's `onData` produced. */
+  writeTerminal(terminalId: string, data: string): Promise<void>;
+  /** Tell a shell its window resized, so it re-wraps and full-screen programs
+   *  redraw. Driven by the drawer's `ResizeObserver` → `fit()`. */
+  resizeTerminal(terminalId: string, cols: number, rows: number): Promise<void>;
+  /** Kill a terminal's shell. Idempotent backend-side: closing one that already
+   *  exited on its own resolves rather than rejecting. */
+  closeTerminal(terminalId: string): Promise<void>;
   /** Persists the user message and starts the assistant turn. Returns the user message id. */
   sendMessage(
     sessionId: string,
@@ -625,6 +649,11 @@ export interface FfIpc {
   /** A session's active observer set changed — one started, stopped, or fired
    *  (#1038). Coarse: the handler re-runs `listObservers(sessionId)`. */
   onObserverChanged(cb: (e: ObserverChangedEvent) => void): Promise<Unlisten>;
+  /** An embedded terminal's shell exited (#1284) — `exit`, a crash, or our own
+   *  kill. One per terminal for its whole life, which is why this is an event
+   *  while the byte stream is a channel. An id the drawer no longer knows is
+   *  expected (closing a tab kills the shell) and ignored. */
+  onTerminalExited(cb: (e: TerminalExitedEvent) => void): Promise<Unlisten>;
   onApprovalRequest(
     cb: (e: ToolApprovalRequestEvent) => void,
   ): Promise<Unlisten>;
@@ -804,6 +833,33 @@ class TauriIpc implements FfIpc {
     this.invoke<DirEntry[]>("list_directory", { sessionId, path });
   readFile = (sessionId: string, path: string, maxBytes?: number) =>
     this.invoke<FileContent>("read_file", { sessionId, path, maxBytes });
+  // The one `Channel` in the app (#1284). Everything else streams over the event
+  // system, but Tauri's own docs say that system is "not designed for low latency
+  // or high throughput" and point at channels for streams — and a terminal is the
+  // throughput case (a build log, `cat` on a big file). The backend sends raw
+  // bytes, which arrive here as an `ArrayBuffer` rather than a JSON number array.
+  openTerminal = async (
+    sessionId: string,
+    cols: number,
+    rows: number,
+    onData: (bytes: Uint8Array) => void,
+  ) => {
+    const { Channel, invoke } = await import("@tauri-apps/api/core");
+    const channel = new Channel<ArrayBuffer>();
+    channel.onmessage = (message) => onData(new Uint8Array(message));
+    return invoke<string>("terminal_open", {
+      sessionId,
+      cols,
+      rows,
+      onOutput: channel,
+    });
+  };
+  writeTerminal = (terminalId: string, data: string) =>
+    this.invoke<void>("terminal_write", { terminalId, data });
+  resizeTerminal = (terminalId: string, cols: number, rows: number) =>
+    this.invoke<void>("terminal_resize", { terminalId, cols, rows });
+  closeTerminal = (terminalId: string) =>
+    this.invoke<void>("terminal_close", { terminalId });
   sendMessage = (
     sessionId: string,
     content: string,
@@ -1055,6 +1111,8 @@ class TauriIpc implements FfIpc {
     this.listen<ProcessExitedEvent>("process:exited", cb);
   onObserverChanged = (cb: (e: ObserverChangedEvent) => void) =>
     this.listen<ObserverChangedEvent>("observer:changed", cb);
+  onTerminalExited = (cb: (e: TerminalExitedEvent) => void) =>
+    this.listen<TerminalExitedEvent>("terminal:exited", cb);
   onApprovalRequest = (cb: (e: ToolApprovalRequestEvent) => void) =>
     this.listen<ToolApprovalRequestEvent>("tool:approval-request", cb);
   onAskRequest = (cb: (e: ToolAskRequestEvent) => void) =>
