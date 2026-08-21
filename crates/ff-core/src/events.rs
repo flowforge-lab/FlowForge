@@ -671,6 +671,25 @@ pub struct ProcessExitedEvent {
     pub status: String,
 }
 
+/// An embedded terminal's shell exited (#1284) -- the user typed `exit`, the
+/// shell crashed, or we killed it because its tab/pane/session went away.
+/// Emitted once, when the PTY reader sees EOF.
+///
+/// This is an `app.emit` event where the terminal's *output* is a
+/// `tauri::ipc::Channel` (see `terminal.rs`): one message per terminal for its
+/// whole life is exactly the low-frequency signal the event system is for,
+/// whereas the byte stream is not. `terminal_id` is the id `terminal_open`
+/// returned; the frontend marks that tab dead. An id the frontend no longer
+/// knows is expected -- closing a tab kills the shell, so a `terminal:exited`
+/// races the close it caused -- and is ignored.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export, export_to = "../../../apps/desktop/src/bindings/")]
+pub struct TerminalExitedEvent {
+    pub session_id: String,
+    pub terminal_id: String,
+}
+
 /// The set of active observers for a session changed (#1038, epic #954 M2):
 /// one started, was stopped, or fired. Coarse by design -- the frontend
 /// re-runs `list_observers(sessionId)` on receipt rather than diffing. A
