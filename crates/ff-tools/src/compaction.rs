@@ -11,6 +11,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use ff_memory::MemoryIndex;
 use ff_session::SessionStore;
 use serde_json::Value;
 
@@ -23,12 +24,26 @@ pub const COMPACTION_RETRIEVE_TOOL: &str = "compaction_retrieve";
 /// Retrieve the verbatim original of a previously-compacted tool result.
 pub struct CompactionRetrieveTool {
     store: Arc<SessionStore>,
+    /// On-disk memory index. A successful retrieve is a strong use-time
+    /// reinforcement signal (RFC 0022 §4.3) that would otherwise evaporate with
+    /// the session; we persist a cross-session count here. `None` in contexts
+    /// wired without a memory store, in which case recording is skipped.
+    index: Option<Arc<dyn MemoryIndex>>,
 }
 
 impl CompactionRetrieveTool {
     #[must_use]
     pub fn new(store: Arc<SessionStore>) -> Self {
-        Self { store }
+        Self { store, index: None }
+    }
+
+    /// Attach the memory index so a successful retrieve records a durable,
+    /// cross-session reinforcement signal (RFC 0022 §4.3). Builder so existing
+    /// call sites keep compiling; omit it and recording is a no-op.
+    #[must_use]
+    pub fn with_index(mut self, index: Arc<dyn MemoryIndex>) -> Self {
+        self.index = Some(index);
+        self
     }
 }
 
@@ -74,7 +89,16 @@ impl Tool for CompactionRetrieveTool {
             return ToolOutcome::error("missing required argument: key (a string)");
         };
         match self.store.compaction_original(key) {
-            Some(content) => ToolOutcome::ok(content),
+            Some(content) => {
+                // A successful retrieve is a strong use-time reinforcement signal
+                // (RFC 0022 §4.3). Persist a cross-session count in the derived
+                // on-disk index. Best-effort and off the in-context path: it never
+                // mutates the transcript/prompt cache, so `safety` stays ReadOnly.
+                if let Some(index) = &self.index {
+                    let _ = index.record_retrieve(key);
+                }
+                ToolOutcome::ok(content)
+            }
             None => ToolOutcome::error(format!(
                 "no compacted original found for key `{key}` (it may never have been \
                  compacted, or its session was deleted)"
@@ -123,5 +147,59 @@ mod tests {
         let out = tool.run(serde_json::json!({}), Path::new(".")).await;
         assert!(!out.success);
         assert!(out.content.contains("missing required argument"));
+    }
+
+    #[tokio::test]
+    async fn successful_retrieve_records_a_durable_signal() {
+        let store = Arc::new(SessionStore::new());
+        let s = store.create_session(None);
+        let m = store.add_tool_result_message(&s.id, "call-1".into(), "compressed".into());
+        store.put_compaction_original(&s.id, &m.id, "deadbeef", "the full original");
+
+        let index: Arc<dyn ff_memory::MemoryIndex> =
+            Arc::new(ff_memory::Fts5Index::open_in_memory().unwrap());
+        let tool = CompactionRetrieveTool::new(store).with_index(index.clone());
+
+        // Two successful retrieves of the same key accumulate a cross-session count.
+        for _ in 0..2 {
+            let out = tool
+                .run(serde_json::json!({ "key": "deadbeef" }), Path::new("."))
+                .await;
+            assert!(out.success);
+        }
+        assert_eq!(index.retrieve_count("deadbeef").unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn failed_retrieve_records_nothing() {
+        let store = Arc::new(SessionStore::new());
+        let index: Arc<dyn ff_memory::MemoryIndex> =
+            Arc::new(ff_memory::Fts5Index::open_in_memory().unwrap());
+        let tool = CompactionRetrieveTool::new(store).with_index(index.clone());
+
+        let out = tool
+            .run(serde_json::json!({ "key": "nope" }), Path::new("."))
+            .await;
+        assert!(!out.success);
+        assert_eq!(
+            index.retrieve_count("nope").unwrap(),
+            0,
+            "a miss is not a use signal"
+        );
+    }
+
+    #[tokio::test]
+    async fn retrieve_without_index_is_a_noop_not_a_panic() {
+        let store = Arc::new(SessionStore::new());
+        let s = store.create_session(None);
+        let m = store.add_tool_result_message(&s.id, "call-1".into(), "compressed".into());
+        store.put_compaction_original(&s.id, &m.id, "deadbeef", "the full original");
+
+        let tool = CompactionRetrieveTool::new(store);
+        let out = tool
+            .run(serde_json::json!({ "key": "deadbeef" }), Path::new("."))
+            .await;
+        assert!(out.success);
+        assert_eq!(out.content, "the full original");
     }
 }

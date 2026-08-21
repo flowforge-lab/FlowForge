@@ -702,9 +702,13 @@ async fn run(
     // server, so an `_`-discard here would kill them before the first tool call.
     let (mut registry, memory_store, memory_index, mcp_guidance, _mcp_teardown) =
         build_registry_with_mcp().await;
-    registry.register(Box::new(ff_tools::CompactionRetrieveTool::new(
-        store.clone(),
-    )));
+    registry.register(Box::new({
+        let tool = ff_tools::CompactionRetrieveTool::new(store.clone());
+        match &memory_index {
+            Some(index) => tool.with_index(index.clone()),
+            None => tool,
+        }
+    }));
     let approver = CliApprover::new(approval_mode, mode);
 
     let session = store.create_session(None);
@@ -864,9 +868,13 @@ async fn chat(
     // server, so an `_`-discard here would kill them before the first turn.
     let (mut registry, memory_store, memory_index, mcp_guidance, _mcp_teardown) =
         build_registry_with_mcp().await;
-    registry.register(Box::new(ff_tools::CompactionRetrieveTool::new(
-        store.clone(),
-    )));
+    registry.register(Box::new({
+        let tool = ff_tools::CompactionRetrieveTool::new(store.clone());
+        match &memory_index {
+            Some(index) => tool.with_index(index.clone()),
+            None => tool,
+        }
+    }));
     // Resolved once for the whole session (see the note above), otherwise identical to
     // `run`'s handling — same helper, same precedence, same failure messages.
     let (active_pheno, turn) = match resolve_pheno_and_inputs(

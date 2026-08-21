@@ -95,6 +95,23 @@ pub trait MemoryIndex: Send + Sync {
     fn reinforce_ambient(&self, _keys: &[String]) -> Result<()> {
         Ok(())
     }
+    /// Record that a compacted tool result was pulled back verbatim via
+    /// `compaction_retrieve` (RFC 0022 §4.3): a strong, use-time reinforcement
+    /// signal that today evaporates with the session. Aggregates a cross-session
+    /// count per content key in the `retrieve_stats` table. This is an
+    /// attribution *instrument* — it persists the signal but does not yet feed
+    /// ranking (that consumption is a follow-up, and needs a retrieve-key →
+    /// chunk mapping that does not exist today). The default is a no-op so
+    /// backends without a stats table need no change; [`Fts5Index`] overrides it.
+    fn record_retrieve(&self, _content_key: &str) -> Result<()> {
+        Ok(())
+    }
+    /// Cross-session count of how many times `content_key` was pulled back via
+    /// `compaction_retrieve`. `0` when never retrieved. Backs tests and the
+    /// future ranking consumer; the default is `0` for stats-less backends.
+    fn retrieve_count(&self, _content_key: &str) -> Result<u64> {
+        Ok(0)
+    }
     /// Read-time effective (decayed) usage stats for `keys`, computed against
     /// `now_ms` without persisting (RFC 0007 §3). Keys with no `chunk_stats`
     /// row — and *all* keys when decay is disabled — are omitted from the map;
@@ -214,6 +231,11 @@ impl Fts5Index {
                  last_accessed INTEGER NOT NULL,
                  access_count  INTEGER NOT NULL DEFAULT 0,
                  pinned        INTEGER NOT NULL DEFAULT 0
+             );
+             CREATE TABLE IF NOT EXISTS retrieve_stats (
+                 content_key TEXT PRIMARY KEY,
+                 count       INTEGER NOT NULL DEFAULT 0,
+                 last_ms     INTEGER NOT NULL
              );",
         )?;
         Self::ensure_embedding_column(&conn)?;
@@ -406,7 +428,22 @@ impl Fts5Index {
         Ok(())
     }
 
-    /// Time-injectable core of [`reset_chunk`](MemoryIndex::reset_chunk) (#293).
+    /// Time-injectable core of [`record_retrieve`](MemoryIndex::record_retrieve).
+    /// Upserts a per-content-key row in `retrieve_stats`, incrementing the
+    /// cross-session count and stamping `last_ms`. Decay-independent: a retrieve
+    /// is a factual use event, always recorded (unlike ambient reinforcement,
+    /// which is gated on the decay config).
+    pub(crate) fn record_retrieve_at(&self, content_key: &str, now_ms: i64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO retrieve_stats (content_key, count, last_ms)
+             VALUES (?1, 1, ?2)
+             ON CONFLICT(content_key) DO UPDATE SET count = count + 1, last_ms = ?2",
+            params![content_key, now_ms],
+        )?;
+        Ok(())
+    }
+
     /// Restores `weight` to `1.0` and stamps `last_accessed = now_ms`, creating
     /// the row if absent (a never-recalled chunk has no row). `access_count` and
     /// `pinned` are preserved on an existing row; a fresh row starts at count `0`,
@@ -587,6 +624,22 @@ impl MemoryIndex for Fts5Index {
 
     fn reinforce_ambient(&self, keys: &[String]) -> Result<()> {
         self.reinforce_ambient_at(keys, Utc::now().timestamp_millis())
+    }
+
+    fn record_retrieve(&self, content_key: &str) -> Result<()> {
+        self.record_retrieve_at(content_key, Utc::now().timestamp_millis())
+    }
+
+    fn retrieve_count(&self, content_key: &str) -> Result<u64> {
+        let conn = self.conn.lock().unwrap();
+        let count: Option<i64> = conn
+            .query_row(
+                "SELECT count FROM retrieve_stats WHERE content_key = ?1",
+                params![content_key],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(count.unwrap_or(0).max(0) as u64)
     }
 
     fn effective_stats(
@@ -784,6 +837,14 @@ impl<E: Embedder> MemoryIndex for HybridIndex<E> {
 
     fn reinforce_ambient(&self, keys: &[String]) -> Result<()> {
         self.inner.reinforce_ambient(keys)
+    }
+
+    fn record_retrieve(&self, content_key: &str) -> Result<()> {
+        self.inner.record_retrieve(content_key)
+    }
+
+    fn retrieve_count(&self, content_key: &str) -> Result<u64> {
+        self.inner.retrieve_count(content_key)
     }
 
     fn effective_stats(

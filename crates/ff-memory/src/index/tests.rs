@@ -883,3 +883,74 @@ fn ensure_pinned_column_upgrades_a_columnless_db() {
     idx.set_chunk_pinned_at("old:key", true, 1_000).unwrap();
     assert_eq!(read_pinned(&idx, "old:key"), Some(true));
 }
+
+// --- retrieve_stats: compaction_retrieve as a durable use signal (#1291) ---
+
+#[test]
+fn record_retrieve_counts_are_zero_until_recorded() {
+    let idx = Fts5Index::open_in_memory().unwrap();
+    assert_eq!(idx.retrieve_count("abc123").unwrap(), 0);
+}
+
+#[test]
+fn record_retrieve_accumulates_per_key() {
+    let idx = Fts5Index::open_in_memory().unwrap();
+    idx.record_retrieve_at("abc123", 100).unwrap();
+    idx.record_retrieve_at("abc123", 200).unwrap();
+    idx.record_retrieve_at("other", 250).unwrap();
+
+    assert_eq!(idx.retrieve_count("abc123").unwrap(), 2);
+    assert_eq!(idx.retrieve_count("other").unwrap(), 1);
+    assert_eq!(idx.retrieve_count("never").unwrap(), 0);
+}
+
+#[test]
+fn record_retrieve_stamps_last_ms() {
+    let idx = Fts5Index::open_in_memory().unwrap();
+    idx.record_retrieve_at("k", 100).unwrap();
+    idx.record_retrieve_at("k", 999).unwrap();
+    let last: i64 = {
+        let conn = idx.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT last_ms FROM retrieve_stats WHERE content_key = ?1",
+            rusqlite::params!["k"],
+            |row| row.get(0),
+        )
+        .unwrap()
+    };
+    assert_eq!(last, 999, "last_ms tracks the most recent retrieve");
+}
+
+#[test]
+fn record_retrieve_persists_across_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("index.db");
+    {
+        let idx = Fts5Index::open(&db).unwrap();
+        idx.record_retrieve_at("k", 1).unwrap();
+        idx.record_retrieve_at("k", 2).unwrap();
+    }
+    // A fresh open models a later session: the count must survive, not reset.
+    let idx = Fts5Index::open(&db).unwrap();
+    assert_eq!(idx.retrieve_count("k").unwrap(), 2);
+    idx.record_retrieve_at("k", 3).unwrap();
+    assert_eq!(idx.retrieve_count("k").unwrap(), 3);
+}
+
+#[test]
+fn hybrid_index_delegates_retrieve_recording() {
+    let hybrid = HybridIndex::new(Fts5Index::open_in_memory().unwrap(), NoopEmbedder);
+    hybrid.record_retrieve("k").unwrap();
+    hybrid.record_retrieve("k").unwrap();
+    assert_eq!(hybrid.retrieve_count("k").unwrap(), 2);
+}
+
+#[test]
+fn record_retrieve_is_independent_of_decay_config() {
+    // Unlike ambient reinforcement (gated on the decay config), a retrieve is a
+    // factual use event and is always recorded — verified here against the
+    // default config, whatever its decay state.
+    let idx = Fts5Index::open_in_memory().unwrap();
+    idx.record_retrieve_at("k", 1).unwrap();
+    assert_eq!(idx.retrieve_count("k").unwrap(), 1);
+}

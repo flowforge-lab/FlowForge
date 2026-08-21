@@ -2105,9 +2105,12 @@ impl AppState {
         )));
         // Reversible tool-result compaction retrieve (M7.1a, RFC 0016 Tier 1).
         // Shares the live session store so it can read originals stashed at ingest.
-        reg.register(Box::new(ff_tools::CompactionRetrieveTool::new(
-            self.store.clone(),
-        )));
+        // Also carries the memory index so a successful retrieve records a durable,
+        // cross-session reinforcement signal (RFC 0022 §4.3, #1291).
+        reg.register(Box::new(
+            ff_tools::CompactionRetrieveTool::new(self.store.clone())
+                .with_index(self.memory_index.clone()),
+        ));
         // Goal-mode completion signal (RFC 0020 §7, #716): a ReadOnly tool the
         // agent calls when the objective is met. Always registered so a goal can
         // complete regardless of which session drives it; a no-op outside a loop.

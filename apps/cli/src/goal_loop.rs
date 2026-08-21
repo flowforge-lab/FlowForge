@@ -42,11 +42,15 @@ impl CliGoalIteration {
         let workspace = host::workspace_root();
         let store = std::sync::Arc::new(SessionStore::new());
 
-        let (mut registry, _memory_store, _memory_index, mcp_guidance, mcp_teardown) =
+        let (mut registry, _memory_store, memory_index, mcp_guidance, mcp_teardown) =
             crate::build_registry_with_mcp().await;
-        registry.register(Box::new(ff_tools::CompactionRetrieveTool::new(
-            store.clone(),
-        )));
+        registry.register(Box::new({
+            let tool = ff_tools::CompactionRetrieveTool::new(store.clone());
+            match &memory_index {
+                Some(index) => tool.with_index(index.clone()),
+                None => tool,
+            }
+        }));
 
         Self {
             provider,
