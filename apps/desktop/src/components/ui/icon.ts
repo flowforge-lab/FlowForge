@@ -49,6 +49,7 @@ export {
   Info,
   Keyboard,
   Layers,
+  ListTree,
   Loader2,
   Lock,
   MessageCircleQuestion,

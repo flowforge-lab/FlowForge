@@ -37,6 +37,11 @@ export const SHORTCUTS: Shortcut[] = [
   },
   {
     group: "Navigation",
+    keys: ["Mod", "Shift", "O"],
+    label: "Message navigator",
+  },
+  {
+    group: "Navigation",
     keys: ["Esc"],
     label: "Close panel / overlay, or stop the turn",
   },
