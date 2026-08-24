@@ -1,5 +1,5 @@
-import { useEffect } from "react";
-import { Check, ChevronDown, Cpu } from "@/components/ui/icon";
+import { useEffect, useId, useMemo, useRef, useState } from "react";
+import { Check, ChevronDown, Cpu, Search } from "@/components/ui/icon";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
@@ -15,6 +15,7 @@ import {
   DropdownMenuSubContent,
   DropdownMenuSeparator,
 } from "@/components/ui/dropdown-menu";
+import { filterModels, FILTER_THRESHOLD } from "@/lib/model-filter";
 import { useModelConfigStore, isLocalKind } from "@/store/model-config";
 import { useProfilesStore } from "@/store/profiles";
 import { useSessionModelStore } from "@/store/session-model";
@@ -192,35 +193,18 @@ export function ModelChip({ sessionId }: { sessionId: string }) {
                   />
                   <span className="min-w-0 truncate">{c.displayName}</span>
                 </DropdownMenuSubTrigger>
-                <DropdownMenuSubContent className="max-h-72 max-w-64 overflow-y-auto">
-                  {models === undefined ? (
-                    <DropdownMenuItem disabled>Loading…</DropdownMenuItem>
-                  ) : models.length === 0 ? (
-                    <DropdownMenuItem disabled>No models</DropdownMenuItem>
-                  ) : (
-                    models.map((m) => (
-                      <DropdownMenuItem
-                        key={m}
-                        onSelect={() =>
-                          void setSelection(sessionId, {
-                            connection: c.id,
-                            model: m,
-                          })
-                        }
-                      >
-                        <Check
-                          className={cn(
-                            c.id === resolved?.connection &&
-                              m === resolved?.model
-                              ? "opacity-100"
-                              : "opacity-0",
-                          )}
-                        />
-                        <span className="min-w-0 truncate">{m}</span>
-                      </DropdownMenuItem>
-                    ))
-                  )}
-                </DropdownMenuSubContent>
+                <ModelList
+                  models={models}
+                  selectedModel={
+                    c.id === resolved?.connection ? resolved.model : null
+                  }
+                  onPick={(m) =>
+                    void setSelection(sessionId, {
+                      connection: c.id,
+                      model: m,
+                    })
+                  }
+                />
               </DropdownMenuSub>
             );
           })
@@ -237,5 +221,234 @@ export function ModelChip({ sessionId }: { sessionId: string }) {
         </DropdownMenuItem>
       </DropdownMenuContent>
     </DropdownMenu>
+  );
+}
+
+/**
+ * One provider's models, with a search box (#1301).
+ *
+ * Lives inside that connection's submenu, so the filter is scoped to the
+ * provider the user is pointing at — a search across every provider at once
+ * would flatten the connection → models shape the picker is built on.
+ *
+ * Rows are plain options rather than `DropdownMenuItem`s, and the box owns the
+ * keyboard. That is not a style choice: a Radix menu implements type-to-select
+ * and roving focus on its content, so an input nested in one has its keystrokes
+ * read as menu typeahead and its arrows steal focus onto items. Every keydown
+ * that means something here is handled and stopped before the menu sees it.
+ */
+function ModelList({
+  models,
+  selectedModel,
+  onPick,
+}: {
+  models: string[] | undefined;
+  selectedModel: string | null;
+  onPick: (model: string) => void;
+}) {
+  const [query, setQuery] = useState("");
+  const [selected, setSelected] = useState(0);
+  const inputRef = useRef<HTMLInputElement>(null);
+  const listRef = useRef<HTMLDivElement>(null);
+  // Ids for the combobox wiring below. Per instance (`useId`), because several
+  // providers' lists can be mounted at once and `aria-activedescendant` has to
+  // resolve to a row in *this* list.
+  const listId = useId();
+  const optionId = (i: number) => `${listId}-option-${i}`;
+
+  const results = useMemo(
+    () => filterModels(query, models ?? []),
+    [query, models],
+  );
+
+  // Clamp at read time rather than storing — results shrink as the user types,
+  // and a stale `selected` must not need a reset effect to stay in range
+  // (mirrors `palette.tsx`).
+  const activeIndex = results.length
+    ? Math.min(selected, results.length - 1)
+    : 0;
+
+  // Filtering a handful of models costs a step and saves nothing, so the box
+  // only appears once a catalog is big enough to be a problem.
+  const showFilter = (models?.length ?? 0) >= FILTER_THRESHOLD;
+
+  // Take focus when the submenu opens. Radix leaves focus on the *trigger item*
+  // for a hover-opened submenu, and a keystroke landing there is read as menu
+  // typeahead — which jumps to another provider and collapses this submenu, so
+  // "hover, then type" silently fails. The box has to claim focus, twice over:
+  // once when it mounts, and again when the pointer arrives, because moving the
+  // mouse across the trigger on the way in re-focuses that item.
+  useEffect(() => {
+    if (!showFilter) return;
+    const id = requestAnimationFrame(() => inputRef.current?.focus());
+    return () => cancelAnimationFrame(id);
+  }, [showFilter]);
+
+  const focusInput = () => inputRef.current?.focus();
+
+  // Keep the highlighted row visible during arrow navigation.
+  useEffect(() => {
+    listRef.current
+      ?.querySelector(`[data-index="${activeIndex}"]`)
+      ?.scrollIntoView({ block: "nearest" });
+  }, [activeIndex]);
+
+  // First Escape clears a non-empty query; only a second one closes the menu.
+  //
+  // This has to go through Radix's own hook rather than `stopPropagation` in
+  // the keydown handler: its dismiss layer listens on `document` in the
+  // *capture* phase, so it runs before any React handler and the whole menu
+  // closed on the first Escape.
+  function onEscapeKeyDown(e: KeyboardEvent): void {
+    if (!query) return;
+    e.preventDefault();
+    setQuery("");
+    setSelected(0);
+  }
+
+  function onKeyDown(e: React.KeyboardEvent): void {
+    if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+      // Stopped, or Radix moves focus to a menu item and the next character
+      // typed goes to the menu's typeahead instead of the box.
+      e.preventDefault();
+      e.stopPropagation();
+      const step = e.key === "ArrowDown" ? 1 : -1;
+      setSelected(
+        results.length
+          ? (activeIndex + step + results.length) % results.length
+          : 0,
+      );
+    } else if (e.key === "Enter") {
+      e.preventDefault();
+      e.stopPropagation();
+      const hit = results[activeIndex];
+      if (hit) onPick(hit);
+    } else if (e.key.length === 1) {
+      // A printable character: keep it in the box. Unstopped, the menu reads it
+      // as typeahead and jumps the highlight to a matching item.
+      e.stopPropagation();
+    }
+  }
+
+  // A provider with only a handful of models keeps the list it always had: real
+  // `DropdownMenuItem`s, which Radix makes arrow-navigable and Enter-selectable
+  // for free. The searchable list below gives that up deliberately — its rows
+  // are options driven by the search box — and with no box to drive them, the
+  // trade would leave a small list unreachable by keyboard. Most providers list
+  // fewer than `FILTER_THRESHOLD` models, so that would be a regression on the
+  // common path, not an edge case (#1302 review).
+  if (!showFilter) {
+    return (
+      <DropdownMenuSubContent className="max-h-72 max-w-64 overflow-y-auto">
+        {models === undefined ? (
+          <DropdownMenuItem disabled>Loading…</DropdownMenuItem>
+        ) : models.length === 0 ? (
+          <DropdownMenuItem disabled>No models</DropdownMenuItem>
+        ) : (
+          models.map((model) => (
+            <DropdownMenuItem key={model} onSelect={() => onPick(model)}>
+              <Check
+                className={cn(
+                  model === selectedModel ? "opacity-100" : "opacity-0",
+                )}
+              />
+              <span className="min-w-0 truncate">{model}</span>
+            </DropdownMenuItem>
+          ))
+        )}
+      </DropdownMenuSubContent>
+    );
+  }
+
+  return (
+    <DropdownMenuSubContent
+      onEscapeKeyDown={onEscapeKeyDown}
+      onPointerEnter={focusInput}
+      className="flex w-72 flex-col p-0"
+    >
+      <div className="flex items-center gap-2 border-b px-2.5">
+        <Search className="size-3.5 shrink-0 text-muted-foreground" />
+        <input
+          ref={inputRef}
+          value={query}
+          onChange={(e) => {
+            setQuery(e.target.value);
+            setSelected(0); // typing always re-highlights the top result
+          }}
+          onKeyDown={onKeyDown}
+          placeholder="Search models…"
+          aria-label="Search models"
+          // Combobox wiring (#1302 review): the rows are plain options driven
+          // from here, so without this a screen reader never hears which one the
+          // arrow keys moved to.
+          role="combobox"
+          aria-expanded
+          aria-controls={listId}
+          aria-autocomplete="list"
+          aria-activedescendant={
+            results.length ? optionId(activeIndex) : undefined
+          }
+          spellCheck={false}
+          autoComplete="off"
+          className="h-9 min-w-0 flex-1 bg-transparent text-[13px] text-foreground outline-none placeholder:text-muted-foreground/50"
+        />
+        {/* What the filter did, so a short list reads as "filtered" rather
+              than "that is all there is". */}
+        <span className="shrink-0 text-[11px] text-muted-foreground/70">
+          {query.trim()
+            ? `${results.length} of ${models?.length ?? 0}`
+            : (models?.length ?? 0)}
+        </span>
+      </div>
+
+      <div
+        ref={listRef}
+        id={listId}
+        role="listbox"
+        aria-label="Models"
+        onKeyDown={onKeyDown}
+        className="max-h-72 overflow-y-auto p-1"
+      >
+        {models === undefined ? (
+          <p className="px-2 py-3 text-[13px] text-muted-foreground">
+            Loading…
+          </p>
+        ) : results.length === 0 ? (
+          <p className="px-2 py-6 text-center text-[13px] text-muted-foreground/70">
+            {query.trim() ? `No models match “${query.trim()}”` : "No models"}
+          </p>
+        ) : (
+          results.map((model, i) => {
+            const active = i === activeIndex;
+            return (
+              <div
+                key={model}
+                id={optionId(i)}
+                data-index={i}
+                role="option"
+                aria-selected={active}
+                title={model}
+                onMouseMove={() => setSelected((cur) => (cur === i ? cur : i))}
+                onClick={() => onPick(model)}
+                className={cn(
+                  "flex cursor-pointer items-center gap-2 rounded-md px-2 py-1.5 text-[13px] select-none",
+                  active
+                    ? "bg-accent text-accent-foreground"
+                    : "text-foreground/90",
+                )}
+              >
+                <Check
+                  className={cn(
+                    "size-3.5 shrink-0",
+                    model === selectedModel ? "opacity-100" : "opacity-0",
+                  )}
+                />
+                <span className="min-w-0 flex-1 truncate">{model}</span>
+              </div>
+            );
+          })
+        )}
+      </div>
+    </DropdownMenuSubContent>
   );
 }
