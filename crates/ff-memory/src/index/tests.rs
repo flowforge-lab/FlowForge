@@ -954,3 +954,239 @@ fn record_retrieve_is_independent_of_decay_config() {
     idx.record_retrieve_at("k", 1).unwrap();
     assert_eq!(idx.retrieve_count("k").unwrap(), 1);
 }
+
+// --- content_chunk_map: retrieve-key → chunk mapping (#1296) ---
+
+#[test]
+fn map_retrieve_to_chunks_stores_mappings() {
+    let idx = Fts5Index::open_in_memory().unwrap();
+    let mappings = vec![
+        ("chunk:aaa".to_string(), 0.8),
+        ("chunk:bbb".to_string(), 0.5),
+    ];
+    idx.map_retrieve_to_chunks_at("deadbeef", &mappings, 1000)
+        .unwrap();
+
+    // Rows exist and similarity is stored.
+    let conn = idx.conn.lock().unwrap();
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM content_chunk_map WHERE content_key = ?1",
+            params!["deadbeef"],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 2);
+}
+
+#[test]
+fn chunk_retrieve_hits_returns_summed_counts() {
+    let idx = Fts5Index::open_in_memory().unwrap();
+
+    // Record retrieves for two content keys.
+    idx.record_retrieve_at("key_a", 100).unwrap();
+    idx.record_retrieve_at("key_a", 200).unwrap();
+    idx.record_retrieve_at("key_b", 300).unwrap();
+
+    // Map both content keys to chunk "chunk:xyz".
+    idx.map_retrieve_to_chunks_at("key_a", &[("chunk:xyz".to_string(), 0.9)], 100)
+        .unwrap();
+    idx.map_retrieve_to_chunks_at("key_b", &[("chunk:xyz".to_string(), 0.7)], 200)
+        .unwrap();
+
+    let hits = idx.chunk_retrieve_hits(&["chunk:xyz".to_string()]).unwrap();
+    assert_eq!(hits.get("chunk:xyz").copied(), Some(3)); // 2 + 1
+}
+
+#[test]
+fn chunk_retrieve_hits_omits_unknown_keys() {
+    let idx = Fts5Index::open_in_memory().unwrap();
+    let hits = idx
+        .chunk_retrieve_hits(&["chunk:never".to_string()])
+        .unwrap();
+    assert!(hits.is_empty());
+}
+
+#[test]
+fn chunk_retrieve_hits_persists_across_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("index.db");
+    {
+        let idx = Fts5Index::open(&db).unwrap();
+        idx.record_retrieve_at("k", 1).unwrap();
+        idx.map_retrieve_to_chunks_at("k", &[("chunk:persist".to_string(), 0.5)], 1)
+            .unwrap();
+    }
+    let idx = Fts5Index::open(&db).unwrap();
+    let hits = idx
+        .chunk_retrieve_hits(&["chunk:persist".to_string()])
+        .unwrap();
+    assert_eq!(hits.get("chunk:persist").copied(), Some(1));
+}
+
+#[test]
+fn empty_mappings_are_a_noop() {
+    let idx = Fts5Index::open_in_memory().unwrap();
+    idx.map_retrieve_to_chunks_at("k", &[], 100).unwrap();
+    let conn = idx.conn.lock().unwrap();
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM content_chunk_map", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(count, 0);
+}
+
+#[test]
+fn retrieve_boost_raises_rank_of_mapped_chunk() {
+    let decay = DecayConfig {
+        enabled: false,
+        ..DecayConfig::default()
+    };
+    let idx = Fts5Index::open_in_memory().unwrap().with_decay(decay);
+
+    // Two chunks: one mentioning "rust" (the mapped one), one mentioning "python".
+    let md = "## Rust\nI like rust\n\n## Python\nI like python";
+    let cs = chunks(md, "MEMORY.md");
+    idx.reindex(&cs).unwrap();
+
+    // Record a retrieve and map it to the rust chunk.
+    let rust_key = chunk_key(&cs[0]);
+    idx.record_retrieve_at("content_key_x", 100).unwrap();
+    idx.record_retrieve_at("content_key_x", 200).unwrap();
+    idx.map_retrieve_to_chunks_at("content_key_x", &[(rust_key.clone(), 0.9)], 100)
+        .unwrap();
+
+    // Search for "rust" — both chunks could match, but the rust chunk should
+    // rank higher due to the retrieve boost.
+    let hits = idx.search("rust", 5).unwrap();
+    assert!(!hits.is_empty());
+    assert_eq!(
+        chunk_key(&hits[0].chunk),
+        rust_key,
+        "the mapped chunk must rank first"
+    );
+}
+
+#[test]
+fn retrieve_boost_is_proportional_to_count() {
+    let decay = DecayConfig {
+        enabled: false,
+        ..DecayConfig::default()
+    };
+    let idx = Fts5Index::open_in_memory().unwrap().with_decay(decay);
+
+    let md = "## A\ncommon topic\n\n## B\ncommon topic";
+    let cs = chunks(md, "MEMORY.md");
+    idx.reindex(&cs).unwrap();
+
+    let key_a = chunk_key(&cs[0]);
+    let key_b = chunk_key(&cs[1]);
+
+    // Map key_a with 1 retrieve, key_b with 5 retrieves.
+    idx.record_retrieve_at("k_a", 100).unwrap();
+    idx.record_retrieve_at("k_b", 100).unwrap();
+    idx.record_retrieve_at("k_b", 200).unwrap();
+    idx.record_retrieve_at("k_b", 300).unwrap();
+    idx.record_retrieve_at("k_b", 400).unwrap();
+    idx.record_retrieve_at("k_b", 500).unwrap();
+    idx.map_retrieve_to_chunks_at("k_a", &[(key_a.clone(), 0.9)], 100)
+        .unwrap();
+    idx.map_retrieve_to_chunks_at("k_b", &[(key_b.clone(), 0.9)], 100)
+        .unwrap();
+
+    // Both chunks match identically — the one with more retrieves gets a
+    // higher score so must rank first.
+    let hits = idx.search("common topic", 5).unwrap();
+    assert_eq!(hits.len(), 2);
+    // The scores may be equal in BM25; the retrieve boost breaks the tie
+    // in favor of the chunk with 5 retrieves.
+    let score_a = hits
+        .iter()
+        .find(|s| chunk_key(&s.chunk) == key_a)
+        .map(|s| s.score)
+        .unwrap();
+    let score_b = hits
+        .iter()
+        .find(|s| chunk_key(&s.chunk) == key_b)
+        .map(|s| s.score)
+        .unwrap();
+    assert!(
+        score_b > score_a,
+        "chunk with 5 retrieves ({score_b}) must have a higher score than chunk with 1 retrieve ({score_a})"
+    );
+}
+
+#[test]
+fn retrieve_boost_works_in_hybrid_mode() {
+    let idx = Fts5Index::open_in_memory().unwrap();
+    let hybrid = HybridIndex::new(
+        idx,
+        FakeEmbedder {
+            query: vec![1.0, 0.0, 0.0],
+        },
+    );
+
+    let md = "## Rust\nrust language\n\n## Python\npython language";
+    let cs = chunks(md, "MEMORY.md");
+    hybrid.reindex(&cs).unwrap();
+
+    let rust_key = chunk_key(&cs[0]);
+    let python_key = chunk_key(&cs[1]);
+
+    // Map both content keys with different retrieve counts.
+    hybrid.record_retrieve("k_rust").unwrap();
+    hybrid.record_retrieve("k_rust").unwrap();
+    hybrid.record_retrieve("k_rust").unwrap();
+    hybrid.record_retrieve("k_python").unwrap();
+    hybrid
+        .map_retrieve_to_chunks("k_rust", &[(rust_key.clone(), 0.9)])
+        .unwrap();
+    hybrid
+        .map_retrieve_to_chunks("k_python", &[(python_key.clone(), 0.9)])
+        .unwrap();
+
+    // Search for "language" — the rust chunk has 3 retrieves vs python's 1.
+    let hits = hybrid.search("language", 5).unwrap();
+    assert!(!hits.is_empty());
+    assert_eq!(
+        chunk_key(&hits[0].chunk),
+        rust_key,
+        "chunk with 3 retrieves must rank higher"
+    );
+}
+
+#[test]
+fn no_retrieve_mapping_means_no_boost() {
+    let idx = Fts5Index::open_in_memory().unwrap();
+    let md = "## H\nsome content";
+    let cs = chunks(md, "MEMORY.md");
+    idx.reindex(&cs).unwrap();
+    let hits = idx.search("content", 5).unwrap();
+    assert_eq!(hits.len(), 1);
+}
+
+#[test]
+fn retrieve_boost_factor_saturates_at_saturation_hits() {
+    // At SATURATION_HITS (10) the factor must be 1.0; at 5 it must be >0.7.
+    let f10 = super::retrieve_boost_factor(10);
+    assert!(
+        (f10 - 1.0).abs() < 1e-6,
+        "expected 1.0 at saturation (10 hits), got {f10}"
+    );
+    let f5 = super::retrieve_boost_factor(5);
+    let expected_5 = (5.0_f32 / 10.0).sqrt();
+    assert!(
+        (f5 - expected_5).abs() < 1e-6,
+        "expected {expected_5} at 5 hits, got {f5}"
+    );
+    // Beyond saturation it stays at 1.0.
+    let f100 = super::retrieve_boost_factor(100);
+    assert!(
+        (f100 - 1.0).abs() < 1e-6,
+        "expected 1.0 beyond saturation, got {f100}"
+    );
+    // Zero retrieves yields zero boost.
+    let f0 = super::retrieve_boost_factor(0);
+    assert!((f0 - 0.0).abs() < 1e-6, "expected 0.0 at 0 hits, got {f0}");
+}
