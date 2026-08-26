@@ -164,6 +164,11 @@ pub struct ChunkStatsSalience {
     /// `chunk_key` → lazily-decayed, pin-aware effective weight at pass time.
     /// Absent key ⇒ treated as `1.0`.
     weights: HashMap<String, f32>,
+    /// `chunk_key`s whose `suppress_promotion` flag is set (#1292 block A). A
+    /// `Daily` chunk in this set scores `0.0` — a failed session/goal outcome
+    /// keeps its touched chunks out of curated until a later success clears the
+    /// flag. Curated (demote-side) scoring is unaffected.
+    suppressed: HashSet<String>,
     /// Delegate for `Daily` (promote-side) scoring.
     daily: RecencyFrequencySalience,
 }
@@ -173,8 +178,15 @@ impl ChunkStatsSalience {
     /// be present; absent ⇒ `1.0`). See [`Memory::chunk_stats_salience`] for the
     /// production constructor that gathers the snapshot from a live index.
     pub fn new(weights: HashMap<String, f32>) -> Self {
+        Self::with_suppressed(weights, HashSet::new())
+    }
+
+    /// Build with an explicit set of promotion-suppressed `chunk_key`s (#1292
+    /// block A). [`new`](Self::new) is this with an empty set.
+    pub fn with_suppressed(weights: HashMap<String, f32>, suppressed: HashSet<String>) -> Self {
         Self {
             weights,
+            suppressed,
             daily: RecencyFrequencySalience::default(),
         }
     }
@@ -185,8 +197,15 @@ impl Salience<MemoryChunk> for ChunkStatsSalience {
         match &chunk.source {
             // Demote side: rank by real, decayed usage weight.
             MemorySource::Curated => *self.weights.get(&chunk_key(chunk)).unwrap_or(&1.0),
-            // Promote side: unchanged recency × frequency.
-            MemorySource::Daily { .. } => self.daily.score(chunk, occurrences),
+            // Promote side: unchanged recency × frequency, unless a failed
+            // outcome suppressed this chunk — then it must not be promoted.
+            MemorySource::Daily { .. } => {
+                if self.suppressed.contains(&chunk_key(chunk)) {
+                    0.0
+                } else {
+                    self.daily.score(chunk, occurrences)
+                }
+            }
         }
     }
 }

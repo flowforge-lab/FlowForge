@@ -13,7 +13,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use chrono::Utc;
 use ff_memory::{
-    chunk_markdown, Memory, MemoryIndex, MemorySource, ScoredChunk, Stratum, WriteTarget,
+    chunk_key, chunk_markdown, Memory, MemoryIndex, MemorySource, ScoredChunk, Stratum, WriteTarget,
 };
 use serde_json::Value;
 
@@ -276,11 +276,27 @@ impl Tool for MemoryGetTool {
 pub struct MemoryWriteTool {
     memory: Arc<Memory>,
     index: Arc<dyn MemoryIndex>,
+    /// Optional session-scoped log of the Daily `chunk_key`s this session wrote.
+    /// When wired (goal mode), the termination hook drains it and settles the
+    /// keys against the session's verdict (#1292). `None` keeps the historic
+    /// fire-and-forget behaviour for one-shot / non-goal runs.
+    touched: Option<ff_memory::TouchLog>,
 }
 
 impl MemoryWriteTool {
     pub fn new(memory: Arc<Memory>, index: Arc<dyn MemoryIndex>) -> Self {
-        Self { memory, index }
+        Self {
+            memory,
+            index,
+            touched: None,
+        }
+    }
+
+    /// Attach a shared [`TouchLog`](ff_memory::TouchLog) so writes register the
+    /// Daily chunks they produce for later outcome settlement.
+    pub fn with_touch_log(mut self, touched: ff_memory::TouchLog) -> Self {
+        self.touched = Some(touched);
+        self
     }
 }
 
@@ -386,6 +402,16 @@ impl Tool for MemoryWriteTool {
         };
         let full = self.memory.get(&path, None, None);
         let chunks = chunk_markdown(&full, source, &path);
+
+        // Register the Daily chunks this write produced so a later outcome
+        // settlement can reinforce or suppress them by verdict (#1292). Only
+        // Daily chunks are promotion candidates, so only they are worth
+        // touching; curated writes are skipped. No-op when no log is wired.
+        if matches!(target, WriteTarget::Daily) {
+            if let Some(touched) = &self.touched {
+                touched.extend(chunks.iter().map(chunk_key));
+            }
+        }
 
         // The hybrid index may make a blocking embedding HTTP call inside
         // `reindex_path`; run it off the async worker (mirrors `memory_search`)
@@ -630,6 +656,63 @@ mod tests {
             .await;
         assert!(read.success);
         assert!(read.content.contains("donor join key"), "{}", read.content);
+    }
+
+    #[tokio::test]
+    async fn daily_write_registers_touched_chunks_in_log() {
+        let (_dir, memory, index) = setup();
+        let log = ff_memory::TouchLog::new();
+        let write = MemoryWriteTool::new(memory.clone(), index.clone()).with_touch_log(log.clone());
+
+        let out = write
+            .run(
+                serde_json::json!({
+                    "text": "## Observation\nthe dishwasher still has standing water",
+                    "target": "daily"
+                }),
+                Path::new("."),
+            )
+            .await;
+        assert!(out.success, "{}", out.content);
+        assert!(
+            !log.is_empty(),
+            "a daily write should register its chunk_key(s)"
+        );
+    }
+
+    #[tokio::test]
+    async fn curated_write_does_not_touch_log() {
+        let (_dir, memory, index) = setup();
+        let log = ff_memory::TouchLog::new();
+        let write = MemoryWriteTool::new(memory.clone(), index.clone()).with_touch_log(log.clone());
+
+        let out = write
+            .run(
+                serde_json::json!({
+                    "text": "## Stable fact\nTony owns FlowForge front to back.",
+                    "target": "curated"
+                }),
+                Path::new("."),
+            )
+            .await;
+        assert!(out.success, "{}", out.content);
+        assert!(
+            log.is_empty(),
+            "curated writes are not promotion candidates, so nothing is touched"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_without_touch_log_still_succeeds() {
+        let (_dir, memory, index) = setup();
+        let write = MemoryWriteTool::new(memory.clone(), index.clone());
+        let out = write
+            .run(
+                serde_json::json!({ "text": "## Note\nno log wired", "target": "daily" }),
+                Path::new("."),
+            )
+            .await;
+        assert!(out.success, "{}", out.content);
     }
 
     #[tokio::test]

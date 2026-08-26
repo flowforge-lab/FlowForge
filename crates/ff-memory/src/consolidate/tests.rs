@@ -484,3 +484,46 @@ fn demote_with_mechanical_salience_evicts_array_first_not_dormant() {
         "mechanical salience evicts the array-first chunk A, got:\n{curated}"
     );
 }
+
+// --- Promotion suppression (#1292 block A) -----------------------------------
+
+#[test]
+fn suppressed_daily_chunk_scores_zero() {
+    // A fresh daily chunk normally scores high; suppression must force it to 0
+    // so promotion skips it, without touching the unsuppressed sibling.
+    let today = chrono::Local::now().date_naive();
+    let suppressed = make_chunk(MemorySource::Daily { date: today }, Some("H"), "dead end");
+    let live = make_chunk(MemorySource::Daily { date: today }, Some("H"), "good lead");
+
+    let mut flagged = HashSet::new();
+    flagged.insert(chunk_key(&suppressed));
+    let s = ChunkStatsSalience::with_suppressed(HashMap::new(), flagged);
+
+    assert_eq!(
+        s.score(&suppressed, 3),
+        0.0,
+        "suppressed daily must score 0"
+    );
+    assert!(
+        s.score(&live, 3) > 0.5,
+        "unsuppressed daily keeps its recency×frequency score"
+    );
+}
+
+#[test]
+fn suppression_does_not_affect_curated_demotion() {
+    // Suppression is a promote-side gate; a curated chunk with the same key must
+    // still score by its weight (demote side), never forced to 0.
+    let c = make_chunk(MemorySource::Curated, Some("H"), "curated fact");
+    let mut flagged = HashSet::new();
+    flagged.insert(chunk_key(&c));
+    let mut weights = HashMap::new();
+    weights.insert(chunk_key(&c), 0.8);
+    let s = ChunkStatsSalience::with_suppressed(weights, flagged);
+
+    assert_eq!(
+        s.score(&c, 1),
+        0.8,
+        "curated (demote) scoring ignores the promote-side suppress flag"
+    );
+}

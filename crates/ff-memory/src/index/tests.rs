@@ -1190,3 +1190,134 @@ fn retrieve_boost_factor_saturates_at_saturation_hits() {
     let f0 = super::retrieve_boost_factor(0);
     assert!((f0 - 0.0).abs() < 1e-6, "expected 0.0 at 0 hits, got {f0}");
 }
+
+// --- Outcome-gated reinforcement (#1292 block A) ------------------------------
+
+fn read_suppress(idx: &Fts5Index, key: &str) -> Option<bool> {
+    let conn = idx.conn.lock().unwrap();
+    conn.query_row(
+        "SELECT suppress_promotion FROM chunk_stats WHERE chunk_key = ?1",
+        params![key],
+        |r| r.get::<_, i64>(0),
+    )
+    .optional()
+    .unwrap()
+    .map(|s| s != 0)
+}
+
+#[test]
+fn set_suppress_promotion_upserts_and_toggles() {
+    let idx = Fts5Index::open_in_memory().unwrap();
+    let cs = chunks("## H\nalpha body", "MEMORY.md");
+    idx.reindex(&cs).unwrap();
+    let key = chunk_key(&cs[0]);
+
+    // No row yet.
+    assert_eq!(read_suppress(&idx, &key), None);
+
+    // Set creates the row (weight defaults to 1.0).
+    idx.set_suppress_promotion(&key, true).unwrap();
+    assert_eq!(read_suppress(&idx, &key), Some(true));
+    assert_eq!(read_stat(&idx, &key).unwrap().0, 1.0);
+
+    // Clear toggles it back without deleting the row.
+    idx.set_suppress_promotion(&key, false).unwrap();
+    assert_eq!(read_suppress(&idx, &key), Some(false));
+}
+
+#[test]
+fn suppressed_promotion_keys_lists_only_flagged() {
+    let idx = Fts5Index::open_in_memory().unwrap();
+    let cs = chunks("## A\nalpha\n\n## B\nbeta\n\n## C\ngamma", "MEMORY.md");
+    idx.reindex(&cs).unwrap();
+    idx.set_suppress_promotion(&chunk_key(&cs[0]), true)
+        .unwrap();
+    idx.set_suppress_promotion(&chunk_key(&cs[2]), true)
+        .unwrap();
+
+    let flagged = idx.suppressed_promotion_keys().unwrap();
+    assert_eq!(flagged.len(), 2);
+    assert!(flagged.contains(&chunk_key(&cs[0])));
+    assert!(flagged.contains(&chunk_key(&cs[2])));
+    assert!(!flagged.contains(&chunk_key(&cs[1])));
+}
+
+#[test]
+fn reinforce_outcome_clears_suppress_and_bumps_weight() {
+    let idx = Fts5Index::open_in_memory()
+        .unwrap()
+        .with_decay(enabled_decay());
+    let cs = chunks("## H\nalpha body", "MEMORY.md");
+    idx.reindex(&cs).unwrap();
+    let key = chunk_key(&cs[0]);
+
+    // A prior failure suppressed and let it decay from an old recall.
+    idx.reinforce_at(&scored(&cs), 0).unwrap(); // weight 1.0 @ t=0
+    idx.set_suppress_promotion(&key, true).unwrap();
+
+    let later = DAY_MS_I * 100;
+    idx.reinforce_outcome_at(std::slice::from_ref(&key), later)
+        .unwrap();
+
+    // Suppression lifted.
+    assert_eq!(read_suppress(&idx, &key), Some(false));
+    // Weight got the recall-strength bump above pure decay.
+    let decayed = decayed_weight(1.0, 0, later, 0.98);
+    let (w, last, _) = read_stat(&idx, &key).unwrap();
+    assert!(w > decayed, "success reinforcement must bump above decay");
+    assert_eq!(last, later);
+}
+
+#[test]
+fn reinforce_outcome_skips_never_recalled_chunk() {
+    let idx = Fts5Index::open_in_memory()
+        .unwrap()
+        .with_decay(enabled_decay());
+    let cs = chunks("## H\nalpha body", "MEMORY.md");
+    idx.reindex(&cs).unwrap();
+    let key = chunk_key(&cs[0]);
+
+    // No chunk_stats row exists (never recalled/ambient-touched).
+    idx.reinforce_outcome_at(std::slice::from_ref(&key), 1000)
+        .unwrap();
+
+    // Still no row — a success does not fabricate one.
+    assert_eq!(read_stat(&idx, &key), None);
+}
+
+#[test]
+fn reinforce_outcome_clears_suppress_even_with_decay_disabled() {
+    // Decay off: weight must not move, but a stale failure's flag must still lift.
+    let idx = Fts5Index::open_in_memory()
+        .unwrap()
+        .with_decay(disabled_decay());
+    let cs = chunks("## H\nalpha body", "MEMORY.md");
+    idx.reindex(&cs).unwrap();
+    let key = chunk_key(&cs[0]);
+    idx.reinforce_at(&scored(&cs), 0).unwrap();
+    idx.set_suppress_promotion(&key, true).unwrap();
+    let before = read_stat(&idx, &key).unwrap().0;
+
+    idx.reinforce_outcome_at(std::slice::from_ref(&key), 5000)
+        .unwrap();
+
+    assert_eq!(read_suppress(&idx, &key), Some(false));
+    assert_eq!(
+        read_stat(&idx, &key).unwrap().0,
+        before,
+        "weight frozen with decay off"
+    );
+}
+
+#[test]
+fn suppress_promotion_survives_reopen_migration() {
+    // A pre-existing chunk_stats table without the column must gain it.
+    let idx = Fts5Index::open_in_memory().unwrap();
+    let cs = chunks("## H\nalpha body", "MEMORY.md");
+    idx.reindex(&cs).unwrap();
+    // ensure_suppress_promotion_column is idempotent — running twice is a no-op.
+    Fts5Index::ensure_suppress_promotion_column(&idx.conn.lock().unwrap()).unwrap();
+    let key = chunk_key(&cs[0]);
+    idx.set_suppress_promotion(&key, true).unwrap();
+    assert_eq!(read_suppress(&idx, &key), Some(true));
+}
