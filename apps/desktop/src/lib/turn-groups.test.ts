@@ -510,9 +510,20 @@ describe("segmentTurn (#619)", () => {
 describe("isSubstantiveProse (#687)", () => {
   it("treats very short prose as a thought regardless of content", () => {
     expect(isSubstantiveProse("Let me check the helper.")).toBe(false); // 24ch
-    expect(isSubstantiveProse("The fix: `hasMore` should reflect it.")).toBe(
-      false, // <SHORT even though it has formatting
-    );
+    expect(isSubstantiveProse("Alright, moving on.")).toBe(false); // short, no signal
+  });
+
+  it("surfaces short prose with a conclusion signal (#818)", () => {
+    // Bold text = always a finding, regardless of length.
+    expect(isSubstantiveProse("**Cannot simply delete.**")).toBe(true);
+    // Declarative starters surface short conclusions.
+    expect(isSubstantiveProse("Found the bug: X was null.")).toBe(true);
+    expect(isSubstantiveProse("The fix is a one-line role check.")).toBe(true);
+    expect(isSubstantiveProse("Both CRs submitted.")).toBe(true);
+    expect(isSubstantiveProse("Created PR #814.")).toBe(true);
+    expect(isSubstantiveProse("Cannot delete — role is active.")).toBe(true);
+    // But operational noise stays folded even if short.
+    expect(isSubstantiveProse("Let me check the fix.")).toBe(false);
   });
 
   it("treats an operational-prefixed medium chunk as a thought", () => {
