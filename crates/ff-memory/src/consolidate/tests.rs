@@ -488,6 +488,32 @@ fn demote_with_mechanical_salience_evicts_array_first_not_dormant() {
 // --- Promotion suppression (#1292 block A) -----------------------------------
 
 #[test]
+fn suppression_follows_content_across_daily_dates() {
+    // #1292 F3: a fact flagged on one day must stay suppressed when it recurs
+    // under a later daily date. The keys differ (date-prefixed), but the content
+    // identity — the granularity the promote loop dedups on — is the same.
+    let old_day: chrono::NaiveDate = "2026-08-20".parse().unwrap();
+    let new_day: chrono::NaiveDate = "2026-08-31".parse().unwrap();
+    let flagged_old = make_chunk(MemorySource::Daily { date: old_day }, Some("H"), "dead end");
+    let recur_new = make_chunk(MemorySource::Daily { date: new_day }, Some("H"), "dead end");
+    assert_ne!(
+        chunk_key(&flagged_old),
+        chunk_key(&recur_new),
+        "different dates -> different chunk_key"
+    );
+
+    let mut flagged = HashSet::new();
+    flagged.insert(chunk_key(&flagged_old));
+    let s = ChunkStatsSalience::with_suppressed(HashMap::new(), flagged);
+
+    assert_eq!(
+        s.score(&recur_new, 3),
+        0.0,
+        "the same fact under a newer date is still recognised as suppressed"
+    );
+}
+
+#[test]
 fn suppressed_daily_chunk_scores_zero() {
     // A fresh daily chunk normally scores high; suppression must force it to 0
     // so promotion skips it, without touching the unsuppressed sibling.

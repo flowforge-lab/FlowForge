@@ -1053,3 +1053,16 @@ fn goal_matrix_never_overrides_an_explicit_user_deny() {
         "an explicit user Deny survives goal authorisation"
     );
 }
+
+#[test]
+fn loop_stop_verdict_maps_every_arm() {
+    // #1292 review F5: the terminal-state -> Verdict mapping is shared by the CLI
+    // and desktop goal drivers, so both surfaces settle memory identically. A
+    // completed goal reinforces, an exhausted/failed goal suppresses, a paused
+    // (resumable) goal leaves memory untouched.
+    use ff_memory::Verdict;
+    assert_eq!(LoopStop::Completed.verdict(), Verdict::Success);
+    assert_eq!(LoopStop::Exhausted.verdict(), Verdict::Undecided);
+    assert_eq!(LoopStop::Failed.verdict(), Verdict::Failure);
+    assert_eq!(LoopStop::Paused.verdict(), Verdict::Undecided);
+}

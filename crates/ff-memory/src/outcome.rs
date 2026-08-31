@@ -8,8 +8,10 @@
 //! module's concern**, and that is the whole design:
 //!
 //! - **Block A (now):** the session/goal termination hook calls [`settle`]
-//!   directly — the CLI goal loop maps its [`LoopStop`], the desktop turn
-//!   handler maps its session status.
+//!   directly — both the CLI (`ff goal`) and desktop goal loops drive their loop
+//!   to a terminal `LoopStop`, map it to a [`Verdict`] via the shared
+//!   `LoopStop::verdict` (in `ff-agent`), and settle the [`TouchLog`] the run's
+//!   `memory_write` calls filled.
 //! - **Block C (later, RFC 0022):** the `ff-signals` aggregator, on ingesting a
 //!   `Signal::Outcome`, calls the *same* [`settle`] — the transport becomes the
 //!   signal bus, but this consumer and its tests do not change.
@@ -18,7 +20,7 @@
 //! without writing throwaway code: block C reroutes the caller, not the logic.
 //!
 //! [`settle`]: MemoryOutcomeSink::settle
-//! [`LoopStop`]: (ff-agent)
+//! [`TouchLog`]: crate::TouchLog
 
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
@@ -49,9 +51,12 @@ impl TouchLog {
 
     /// Record a touched `chunk_key`. Idempotent within a session.
     pub fn record(&self, key: impl Into<String>) {
-        if let Ok(mut set) = self.keys.lock() {
-            set.insert(key.into());
-        }
+        // A mutex is poisoned only if a holder panicked; the set itself is intact,
+        // so recover it rather than silently dropping the touch.
+        self.keys
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key.into());
     }
 
     /// Record several touched `chunk_key`s at once.
@@ -60,23 +65,27 @@ impl TouchLog {
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
-        if let Ok(mut set) = self.keys.lock() {
-            set.extend(keys.into_iter().map(Into::into));
-        }
+        self.keys
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .extend(keys.into_iter().map(Into::into));
     }
 
     /// Take the accumulated keys, leaving the log empty. Called once at
     /// settlement so a re-run of the hook cannot double-apply.
     pub fn drain(&self) -> Vec<String> {
-        match self.keys.lock() {
-            Ok(mut set) => set.drain().collect(),
-            Err(_) => Vec::new(),
-        }
+        // Recover from a poisoned lock: dropping the whole touch set here would
+        // make settlement a silent no-op with no signal that anything was lost.
+        self.keys
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain()
+            .collect()
     }
 
     /// Number of distinct keys recorded so far (mainly for tests/telemetry).
     pub fn len(&self) -> usize {
-        self.keys.lock().map(|s| s.len()).unwrap_or(0)
+        self.keys.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
 
     /// Whether no keys have been recorded.
@@ -254,6 +263,35 @@ mod tests {
         assert_eq!(consumer.drain(), vec!["daily:2026-08-26:xyz".to_string()]);
         // Drain through one handle empties the other.
         assert!(producer.is_empty());
+    }
+
+    #[test]
+    fn drain_recovers_keys_after_a_poisoned_lock() {
+        // #1292 review F6: a poisoned mutex (a holder panicked) must not make
+        // settlement a silent no-op that drops every touched key. The set itself
+        // is intact, so record/drain recover it via `into_inner`.
+        let log = TouchLog::new();
+        log.record("daily:2026-08-31:abc");
+
+        let clone = log.clone();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = clone.keys.lock().unwrap();
+            panic!("poison the mutex while holding the guard");
+        }));
+
+        // The lock is now poisoned; the previously recorded key must survive, and
+        // a further record must still land.
+        log.record("daily:2026-08-31:def");
+        let mut drained = log.drain();
+        drained.sort();
+        assert_eq!(
+            drained,
+            vec![
+                "daily:2026-08-31:abc".to_string(),
+                "daily:2026-08-31:def".to_string()
+            ],
+            "a poisoned lock must not lose recorded keys"
+        );
     }
 
     /// The issue's acceptance criterion: two sessions write an identical-content

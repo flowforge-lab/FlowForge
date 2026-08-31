@@ -208,6 +208,11 @@ pub trait MemoryIndex: Send + Sync {
     /// failure is rehabilitated the moment a later success reuses it. Keyed by
     /// [`chunk_key`], like [`reinforce_ambient`](Self::reinforce_ambient).
     ///
+    /// Upserts: a chunk written *this* run has no stats row yet (a write only
+    /// populates `chunks`), and those freshly-written keys are exactly what a
+    /// goal's touch log collects, so the row is created at the recall baseline
+    /// and takes the gain rather than the signal being silently dropped.
+    ///
     /// The default is a no-op so backends without a stats table need no change.
     fn reinforce_outcome(&self, _keys: &[String]) -> Result<()> {
         Ok(())
@@ -630,14 +635,16 @@ impl Fts5Index {
     }
 
     /// Time-injectable core of
-    /// [`reinforce_outcome`](MemoryIndex::reinforce_outcome). Applies the recall
+    /// [`reinforce_outcome`](MemoryIndex::reinforce_outcome). Applies the
     /// `reinforce_gain` (a success is a strong endorsement, stronger than an
-    /// ambient touch) to each existing chunk and clears its `suppress_promotion`
-    /// flag. Like [`reinforce_ambient_at`](Self::reinforce_ambient_at), a
-    /// never-recalled chunk (no row) is skipped — a success does not start the
-    /// age clock for a chunk the session never actually surfaced. Clearing
-    /// suppression is unconditional on decay config: an earlier failure's flag
-    /// must lift even when decay is disabled.
+    /// ambient touch) to each touched chunk and clears its `suppress_promotion`
+    /// flag. Upserts, creating a row when absent: the touched keys are the ones a
+    /// session *wrote* this run, which have no `chunk_stats` row yet (a fresh
+    /// write only populates `chunks`), so an UPDATE-only path would silently drop
+    /// the success signal for exactly those keys. A newly created row starts at
+    /// the recall baseline and takes the gain, so a written-then-succeeded chunk
+    /// is reinforced above baseline. Clearing suppression is unconditional on
+    /// decay config: an earlier failure's flag must lift even when decay is off.
     pub(crate) fn reinforce_outcome_at(&self, keys: &[String], now_ms: i64) -> Result<()> {
         if keys.is_empty() {
             return Ok(());
@@ -649,10 +656,11 @@ impl Fts5Index {
                 "SELECT weight, last_accessed, access_count
                  FROM chunk_stats WHERE chunk_key = ?1",
             )?;
-            let mut up = tx.prepare(
-                "UPDATE chunk_stats
-                 SET weight = ?2, last_accessed = ?3, access_count = ?4, suppress_promotion = 0
-                 WHERE chunk_key = ?1",
+            let mut ups = tx.prepare(
+                "INSERT INTO chunk_stats (chunk_key, weight, last_accessed, access_count, suppress_promotion)
+                 VALUES (?1, ?2, ?3, ?4, 0)
+                 ON CONFLICT(chunk_key) DO UPDATE
+                 SET weight = ?2, last_accessed = ?3, access_count = ?4, suppress_promotion = 0",
             )?;
             for key in keys {
                 let existing: Option<(f64, i64, i64)> = sel
@@ -660,20 +668,21 @@ impl Fts5Index {
                         Ok((row.get(0)?, row.get(1)?, row.get(2)?))
                     })
                     .optional()?;
-                if let Some((w, last, c)) = existing {
-                    // Success reinforcement rides decay like a recall when decay is
-                    // enabled; with decay off the weight stays put but the suppress
-                    // flag still clears.
-                    let new_w = if self.decay.enabled {
-                        reinforced_weight(
-                            decayed_weight(w as f32, last, now_ms, self.decay.factor),
-                            self.decay.reinforce_gain,
-                        )
-                    } else {
-                        w as f32
-                    };
-                    up.execute(params![key, new_w as f64, now_ms, c + 1])?;
-                }
+                let (raw_w, count) = match existing {
+                    Some((w, _last, c)) => (w as f32, c + 1),
+                    None => (1.0, 1),
+                };
+                // With decay off the weight is frozen (a first-touch row is
+                // created at baseline); with decay on we lazily decay the stored
+                // weight to `now_ms` and then apply the success gain.
+                let new_w = if self.decay.enabled {
+                    let last = existing.map(|(_, l, _)| l).unwrap_or(now_ms);
+                    let decayed = decayed_weight(raw_w, last, now_ms, self.decay.factor);
+                    reinforced_weight(decayed, self.decay.reinforce_gain)
+                } else {
+                    raw_w
+                };
+                ups.execute(params![key, new_w as f64, now_ms, count])?;
             }
         }
         tx.commit()?;

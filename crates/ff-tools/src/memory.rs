@@ -7,6 +7,7 @@
 //! approval gate prompts before the model edits durable memory). All three no-op
 //! gracefully when memory is disabled so a turn never fails on a recall call.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -385,6 +386,29 @@ impl Tool for MemoryWriteTool {
             }
         };
 
+        // Snapshot the Daily file's existing chunk keys before the write, so we
+        // can touch only the chunk(s) this write actually produces — not every
+        // fact already in today's file (#1292 review F4). The path is
+        // date-derived and stable across the append. Skipped unless a touch log
+        // is wired and we're writing Daily (only Daily chunks are promotion
+        // candidates).
+        let pre_keys: Option<HashSet<String>> =
+            if matches!(target, WriteTarget::Daily) && self.touched.is_some() {
+                let dpath = self.memory.daily_path(chrono::Local::now().date_naive());
+                let before = self.memory.get(&dpath, None, None);
+                let src = MemorySource::Daily {
+                    date: chrono::Local::now().date_naive(),
+                };
+                Some(
+                    chunk_markdown(&before, src, &dpath)
+                        .iter()
+                        .map(chunk_key)
+                        .collect(),
+                )
+            } else {
+                None
+            };
+
         let write_result = match stratum {
             Some(st) => self.memory.write_curated_stratum(text, st),
             None => self.memory.write(text, target),
@@ -403,13 +427,13 @@ impl Tool for MemoryWriteTool {
         let full = self.memory.get(&path, None, None);
         let chunks = chunk_markdown(&full, source, &path);
 
-        // Register the Daily chunks this write produced so a later outcome
-        // settlement can reinforce or suppress them by verdict (#1292). Only
-        // Daily chunks are promotion candidates, so only they are worth
-        // touching; curated writes are skipped. No-op when no log is wired.
-        if matches!(target, WriteTarget::Daily) {
+        // Register only the Daily chunks this write *added* (post-write set minus
+        // the pre-write snapshot), so a later outcome settlement reinforces or
+        // suppresses exactly what this write introduced — not co-located facts it
+        // merely sat beside (#1292 review F4). No-op when no log is wired.
+        if let Some(pre) = &pre_keys {
             if let Some(touched) = &self.touched {
-                touched.extend(chunks.iter().map(chunk_key));
+                touched.extend(chunks.iter().map(chunk_key).filter(|k| !pre.contains(k)));
             }
         }
 
@@ -677,6 +701,97 @@ mod tests {
         assert!(
             !log.is_empty(),
             "a daily write should register its chunk_key(s)"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_then_settle_success_creates_stats_row() {
+        // #1292 review F1: a chunk written *this* run has no `chunk_stats` row
+        // yet, and those freshly-written keys are exactly what the touch log
+        // collects. An UPDATE-only reinforce would silently drop the success
+        // signal; the upsert must create the row. No row is pre-seeded here — the
+        // gap the original unit test masked by seeding one.
+        let (_dir, memory, index) = setup();
+        let log = ff_memory::TouchLog::new();
+        let write = MemoryWriteTool::new(memory.clone(), index.clone()).with_touch_log(log.clone());
+
+        let out = write
+            .run(
+                serde_json::json!({ "text": "Prefer nextest over cargo test for the full run." }),
+                Path::new("."),
+            )
+            .await;
+        assert!(out.success, "{}", out.content);
+
+        let touched = log.drain();
+        assert_eq!(touched.len(), 1, "one chunk written -> one touched key");
+
+        // Before settle there is no stats row for the written key.
+        let before = index
+            .chunk_stats_snapshot(&touched, chrono::Utc::now().timestamp_millis())
+            .unwrap();
+        assert!(
+            before.is_empty(),
+            "a fresh write only populates `chunks`, never `chunk_stats`"
+        );
+
+        ff_memory::MemoryOutcomeSink::new(index.as_ref())
+            .settle(ff_memory::Verdict::Success, &touched)
+            .unwrap();
+
+        // After settle the success reinforcement created the row and stamped it.
+        let after = index
+            .chunk_stats_snapshot(&touched, chrono::Utc::now().timestamp_millis())
+            .unwrap();
+        let snap = after
+            .get(&touched[0])
+            .expect("success reinforcement must create the stats row for the touched key");
+        assert!(
+            snap.access_count >= 1,
+            "reinforcement stamps an access on the newly created row"
+        );
+    }
+
+    #[tokio::test]
+    async fn second_daily_write_touches_only_the_new_chunk() {
+        // #1292 review F4: a Daily write rebuilds the whole file, so chunking the
+        // rebuilt file would register every fact already in it. Only the chunk
+        // this write *added* should be touched, so settlement reinforces exactly
+        // what this write introduced.
+        let (_dir, memory, index) = setup();
+
+        // First write establishes an existing chunk under its own heading.
+        let first = ff_memory::TouchLog::new();
+        MemoryWriteTool::new(memory.clone(), index.clone())
+            .with_touch_log(first.clone())
+            .run(
+                serde_json::json!({ "text": "## First\nAn earlier note." }),
+                Path::new("."),
+            )
+            .await;
+        let first_keys = first.drain();
+        assert_eq!(first_keys.len(), 1);
+
+        // Second write into the same daily file must touch only its own chunk.
+        let second = ff_memory::TouchLog::new();
+        let out = MemoryWriteTool::new(memory.clone(), index.clone())
+            .with_touch_log(second.clone())
+            .run(
+                serde_json::json!({ "text": "## Second\nA later note." }),
+                Path::new("."),
+            )
+            .await;
+        assert!(out.success, "{}", out.content);
+
+        let second_keys = second.drain();
+        assert_eq!(
+            second_keys.len(),
+            1,
+            "only the chunk this write added is touched, not the whole file"
+        );
+        assert!(
+            !second_keys.iter().any(|k| first_keys.contains(k)),
+            "the pre-existing chunk must not be re-touched by a later write"
         );
     }
 

@@ -53,6 +53,25 @@ pub enum LoopStop {
     Failed,
 }
 
+impl LoopStop {
+    /// Map the terminal loop state to a memory-outcome [`Verdict`](ff_memory::Verdict)
+    /// (#1292): a completed goal reinforces the memory it touched; a *failed*
+    /// goal (a stop condition or unrecoverable error) suppresses its promotion;
+    /// and both a *paused* (resumable) goal and an *exhausted* one (ran out of
+    /// budget) leave memory untouched. Exhaustion is deliberately `Undecided`,
+    /// not `Failure`: a budget-capped run may have made real progress, so burying
+    /// every note it wrote would be wrong — absence of a verdict is the honest
+    /// signal. Shared by every goal driver (CLI and desktop) so the two surfaces
+    /// cannot drift.
+    pub fn verdict(self) -> ff_memory::Verdict {
+        match self {
+            LoopStop::Completed => ff_memory::Verdict::Success,
+            LoopStop::Failed => ff_memory::Verdict::Failure,
+            LoopStop::Exhausted | LoopStop::Paused => ff_memory::Verdict::Undecided,
+        }
+    }
+}
+
 /// The gate decision applied at the top of each iteration (RFC 0020 §5.2). This
 /// is the coarse loop-continuation seam: the host returns a real decision from
 /// `PermissionMatrix.cell(mode, Safety::Sensitive)` read live (#719). Per-tool

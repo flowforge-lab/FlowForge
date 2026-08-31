@@ -1269,7 +1269,11 @@ fn reinforce_outcome_clears_suppress_and_bumps_weight() {
 }
 
 #[test]
-fn reinforce_outcome_skips_never_recalled_chunk() {
+fn reinforce_outcome_creates_row_for_freshly_written_chunk() {
+    // #1292 review F1: a chunk written this run has no chunk_stats row yet (a
+    // write only populates `chunks`), and those keys are exactly what the touch
+    // log collects. Success reinforcement must upsert — create the row and start
+    // its clock — not silently skip it.
     let idx = Fts5Index::open_in_memory()
         .unwrap()
         .with_decay(enabled_decay());
@@ -1278,11 +1282,19 @@ fn reinforce_outcome_skips_never_recalled_chunk() {
     let key = chunk_key(&cs[0]);
 
     // No chunk_stats row exists (never recalled/ambient-touched).
+    assert_eq!(read_stat(&idx, &key), None);
+
     idx.reinforce_outcome_at(std::slice::from_ref(&key), 1000)
         .unwrap();
 
-    // Still no row — a success does not fabricate one.
-    assert_eq!(read_stat(&idx, &key), None);
+    // The success created the row at baseline and stamped the access time.
+    let (w, last, count) = read_stat(&idx, &key).expect("row must be created");
+    assert_eq!(last, 1000);
+    assert_eq!(count, 1);
+    assert!(
+        (w - 1.0).abs() < 1e-6,
+        "fresh chunk starts at baseline weight"
+    );
 }
 
 #[test]

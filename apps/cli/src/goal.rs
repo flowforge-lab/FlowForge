@@ -10,11 +10,7 @@ use crate::goal_loop::CliGoalIteration;
 /// completed goals reinforce the memory they touched, exhausted/failed goals
 /// suppress its promotion, and a paused goal leaves memory untouched.
 fn loop_stop_verdict(result: &LoopStop) -> ff_memory::Verdict {
-    match result {
-        LoopStop::Completed => ff_memory::Verdict::Success,
-        LoopStop::Exhausted | LoopStop::Failed => ff_memory::Verdict::Failure,
-        LoopStop::Paused => ff_memory::Verdict::Undecided,
-    }
+    result.verdict()
 }
 
 #[derive(Debug, Args)]
