@@ -34,6 +34,13 @@ pub struct CliGoalIteration {
     workspace: PathBuf,
     cancel_token: Option<CancelToken>,
     goal_store: GoalStore,
+    /// Shared record of Daily `chunk_key`s written during the goal, drained at
+    /// termination and settled against the goal's verdict (#1292). Empty/absent
+    /// when memory is disabled.
+    touched: ff_memory::TouchLog,
+    /// The persisted memory index, kept so the termination hook can apply the
+    /// outcome-gated reinforcement. `None` when memory is disabled.
+    memory_index: Option<std::sync::Arc<dyn ff_memory::MemoryIndex>>,
 }
 
 impl CliGoalIteration {
@@ -42,7 +49,7 @@ impl CliGoalIteration {
         let workspace = host::workspace_root();
         let store = std::sync::Arc::new(SessionStore::new());
 
-        let (mut registry, _memory_store, memory_index, mcp_guidance, mcp_teardown) =
+        let (mut registry, memory_store, memory_index, mcp_guidance, mcp_teardown) =
             crate::build_registry_with_mcp().await;
         registry.register(Box::new({
             let tool = ff_tools::CompactionRetrieveTool::new(store.clone());
@@ -51,6 +58,18 @@ impl CliGoalIteration {
                 None => tool,
             }
         }));
+
+        // Wire outcome-gated reinforcement (#1292): the `memory_write` tool
+        // records the Daily chunks it writes into a shared `TouchLog`, which the
+        // termination hook drains and settles against the goal's verdict. Only
+        // done in goal mode, where a verdict (Completed/Failed) actually exists.
+        let touched = ff_memory::TouchLog::new();
+        if let Some(index) = &memory_index {
+            registry.register(Box::new(
+                ff_tools::memory::MemoryWriteTool::new(memory_store.clone(), index.clone())
+                    .with_touch_log(touched.clone()),
+            ));
+        }
 
         Self {
             provider,
@@ -62,6 +81,29 @@ impl CliGoalIteration {
             workspace,
             cancel_token,
             goal_store: GoalStore::new(ff_core::goal_store_dir()),
+            touched,
+            memory_index,
+        }
+    }
+
+    /// Settle the goal's outcome against the memory the session touched (#1292).
+    ///
+    /// Drains the [`TouchLog`](ff_memory::TouchLog) of Daily `chunk_key`s the
+    /// session wrote and applies `verdict` to them via [`MemoryOutcomeSink`]:
+    /// a `Success` reinforces (and clears any suppression), a `Failure`
+    /// suppresses promotion, and an `Undecided` (e.g. a paused goal) is a no-op.
+    /// Best-effort: memory disabled or an index error leaves retention untouched.
+    pub fn settle_outcome(&self, verdict: ff_memory::Verdict) {
+        let Some(index) = &self.memory_index else {
+            return;
+        };
+        let touched = self.touched.drain();
+        if touched.is_empty() {
+            return;
+        }
+        let sink = ff_memory::MemoryOutcomeSink::new(index.as_ref());
+        if let Err(e) = sink.settle(verdict, &touched) {
+            eprintln!("warning: outcome-gated reinforcement failed: {e}");
         }
     }
 }

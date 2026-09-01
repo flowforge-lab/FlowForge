@@ -8,14 +8,14 @@
 //! `chunks_fts` virtual table indexes only `text`, kept in sync by triggers.
 //! Search joins the BM25 hit back to its row.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use chrono::{NaiveDate, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
 
-use crate::consolidate::chunk_key;
+use crate::consolidate::{chunk_key, content_key_of};
 use crate::embed::Embedder;
 
 use crate::error::Result;
@@ -161,6 +161,14 @@ pub trait MemoryIndex: Send + Sync {
     ) -> Result<HashMap<String, ChunkStatSnapshot>> {
         Ok(HashMap::new())
     }
+    /// The set of `chunk_key`s whose `suppress_promotion` flag is set (#1292
+    /// block A). The consolidation pass reads this to keep a failed session's
+    /// touched chunks out of curated (see
+    /// [`ChunkStatsSalience`](crate::consolidate::ChunkStatsSalience)). The
+    /// default is empty so backends without a stats table need no change.
+    fn suppressed_promotion_keys(&self) -> Result<HashSet<String>> {
+        Ok(HashSet::new())
+    }
     /// Reset (wake) a chunk: restore `weight` to `1.0` and stamp `last_accessed`
     /// to now, creating the row if absent (RFC 0007 §7). The default is a no-op
     /// so backends without a stats table need no change.
@@ -191,6 +199,34 @@ pub trait MemoryIndex: Send + Sync {
     /// reads effective weight `1.0` (decay skipped) and is never dormant (#293).
     /// The default is a no-op so backends without a stats table need no change.
     fn set_chunk_pinned(&self, _key: &str, _pinned: bool) -> Result<()> {
+        Ok(())
+    }
+    /// Reinforce chunks a *successful* session/goal touched (#1292 block A,
+    /// outcome-gated reinforcement). A success verdict promotes the goal-relevant
+    /// chunks the session leaned on — the same weight bump a recall gives — and
+    /// clears any `suppress_promotion` flag, so a chunk buried by an earlier
+    /// failure is rehabilitated the moment a later success reuses it. Keyed by
+    /// [`chunk_key`], like [`reinforce_ambient`](Self::reinforce_ambient).
+    ///
+    /// Upserts: a chunk written *this* run has no stats row yet (a write only
+    /// populates `chunks`), and those freshly-written keys are exactly what a
+    /// goal's touch log collects, so the row is created at the recall baseline
+    /// and takes the gain rather than the signal being silently dropped.
+    ///
+    /// The default is a no-op so backends without a stats table need no change.
+    fn reinforce_outcome(&self, _keys: &[String]) -> Result<()> {
+        Ok(())
+    }
+    /// Set a chunk's `suppress_promotion` flag, creating the row if absent
+    /// (#1292 block A). A suppressed chunk is scored `0.0` by
+    /// [`ChunkStatsSalience`](crate::consolidate::ChunkStatsSalience), so the
+    /// consolidation pass never promotes it out of Daily into Curated. Used to
+    /// gate promotion on a *failed* session/goal outcome without deleting the
+    /// chunk (a later success clears the flag via
+    /// [`reinforce_outcome`](Self::reinforce_outcome)).
+    ///
+    /// The default is a no-op so backends without a stats table need no change.
+    fn set_suppress_promotion(&self, _key: &str, _suppress: bool) -> Result<()> {
         Ok(())
     }
 }
@@ -252,7 +288,8 @@ impl Fts5Index {
                  weight        REAL    NOT NULL DEFAULT 1.0,
                  last_accessed INTEGER NOT NULL,
                  access_count  INTEGER NOT NULL DEFAULT 0,
-                 pinned        INTEGER NOT NULL DEFAULT 0
+                 pinned        INTEGER NOT NULL DEFAULT 0,
+                 suppress_promotion INTEGER NOT NULL DEFAULT 0
              );
              CREATE TABLE IF NOT EXISTS retrieve_stats (
                  content_key TEXT PRIMARY KEY,
@@ -269,6 +306,7 @@ impl Fts5Index {
         )?;
         Self::ensure_embedding_column(&conn)?;
         Self::ensure_pinned_column(&conn)?;
+        Self::ensure_suppress_promotion_column(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
             decay: DecayConfig::default(),
@@ -317,6 +355,29 @@ impl Fts5Index {
         if !has_pinned {
             conn.execute(
                 "ALTER TABLE chunk_stats ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0",
+                [],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Back-fill the `suppress_promotion` column on `chunk_stats` tables created
+    /// before outcome-gated reinforcement (#1292 block A). Mirror of
+    /// [`ensure_pinned_column`]: the `CREATE TABLE IF NOT EXISTS` above is a no-op
+    /// against a pre-existing table, so an old on-disk index would lack the
+    /// column and every suppress write would fail. A suppressed chunk is scored
+    /// zero by [`ChunkStatsSalience`](crate::consolidate::ChunkStatsSalience) so
+    /// promotion (block D) skips it.
+    fn ensure_suppress_promotion_column(conn: &Connection) -> Result<()> {
+        let has_col = conn
+            .prepare("PRAGMA table_info(chunk_stats)")?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<std::result::Result<Vec<String>, _>>()?
+            .iter()
+            .any(|name| name == "suppress_promotion");
+        if !has_col {
+            conn.execute(
+                "ALTER TABLE chunk_stats ADD COLUMN suppress_promotion INTEGER NOT NULL DEFAULT 0",
                 [],
             )?;
         }
@@ -550,6 +611,117 @@ impl Fts5Index {
              ON CONFLICT(chunk_key) DO UPDATE SET pinned = ?3",
             params![key, now_ms, pinned as i64],
         )?;
+        Ok(())
+    }
+
+    /// Time-injectable core of
+    /// [`set_suppress_promotion`](MemoryIndex::set_suppress_promotion). Upserts
+    /// the flag, creating a full-weight row if absent (mirrors
+    /// [`set_chunk_pinned_at`](Self::set_chunk_pinned_at)).
+    pub(crate) fn set_suppress_promotion_at(
+        &self,
+        key: &str,
+        suppress: bool,
+        now_ms: i64,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO chunk_stats (chunk_key, weight, last_accessed, access_count, suppress_promotion)
+             VALUES (?1, 1.0, ?2, 0, ?3)
+             ON CONFLICT(chunk_key) DO UPDATE SET suppress_promotion = ?3",
+            params![key, now_ms, suppress as i64],
+        )?;
+        Ok(())
+    }
+
+    /// Time-injectable core of
+    /// [`reinforce_outcome`](MemoryIndex::reinforce_outcome). A success has two
+    /// effects, both keyed to keep it symmetric with how suppression is applied
+    /// and read:
+    ///
+    /// 1. **Clears `suppress_promotion` by content identity.** Suppression is
+    ///    matched by content key (a fact flagged on one day stays suppressed
+    ///    when it recurs under a later daily date), so the lift must use the
+    ///    same identity — every flagged row sharing a touched key's content key
+    ///    is cleared, not just the exact `chunk_key` (#1304 F1). This is
+    ///    unconditional on decay config: an earlier failure's flag must lift
+    ///    even when decay is off.
+    /// 2. **Reinforces weight on rows that already exist.** The weight model
+    ///    caps at the recall baseline (`1.0`), so a freshly written chunk (which
+    ///    has no `chunk_stats` row yet) cannot be pushed *above* baseline by a
+    ///    success — creating a row would only start a decay clock and leave it
+    ///    worse off than an untracked sibling (#1304 F2). For those chunks
+    ///    "success" simply means "not suppressed", delivered by effect 1. Only
+    ///    already-tracked chunks (previously recalled) take the `reinforce_gain`.
+    pub(crate) fn reinforce_outcome_at(&self, keys: &[String], now_ms: i64) -> Result<()> {
+        if keys.is_empty() {
+            return Ok(());
+        }
+        // Promotion suppression is matched by content identity (a fact flagged
+        // on one day stays suppressed under a later daily date), so a success
+        // must lift the flag by the same identity — clearing only the exact
+        // `chunk_key` would leave an earlier day's failure row buried forever
+        // (#1304 F1). Reduce the touched keys to their content keys and clear
+        // every flagged row that shares one.
+        let touched_content: HashSet<&str> = keys.iter().map(|k| content_key_of(k)).collect();
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        {
+            let flagged: Vec<String> = {
+                let mut sel =
+                    tx.prepare("SELECT chunk_key FROM chunk_stats WHERE suppress_promotion != 0")?;
+                let rows = sel.query_map([], |row| row.get::<_, String>(0))?;
+                rows.filter_map(|r| r.ok())
+                    .filter(|ck| touched_content.contains(content_key_of(ck)))
+                    .collect()
+            };
+            {
+                let mut clr = tx.prepare(
+                    "UPDATE chunk_stats SET suppress_promotion = 0 WHERE chunk_key = ?1",
+                )?;
+                for ck in &flagged {
+                    clr.execute(params![ck])?;
+                }
+            }
+
+            // Weight reinforcement applies only to rows that already exist. A
+            // freshly written chunk has no `chunk_stats` row, and the weight
+            // model caps at the recall baseline (`1.0`), so creating a row here
+            // could not raise the weight — it would only start a decay clock and
+            // leave a written-then-succeeded chunk *worse off* than an untracked
+            // sibling (#1304 F2). For such chunks, "success" means "not
+            // suppressed", which the clear above already delivers.
+            let mut sel = tx.prepare(
+                "SELECT weight, last_accessed, access_count
+                 FROM chunk_stats WHERE chunk_key = ?1",
+            )?;
+            let mut upd = tx.prepare(
+                "UPDATE chunk_stats
+                 SET weight = ?2, last_accessed = ?3, access_count = ?4
+                 WHERE chunk_key = ?1",
+            )?;
+            for key in keys {
+                let existing: Option<(f64, i64, i64)> = sel
+                    .query_row(params![key], |row| {
+                        Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                    })
+                    .optional()?;
+                let Some((w, last, c)) = existing else {
+                    continue;
+                };
+                let (raw_w, count) = (w as f32, c + 1);
+                // With decay off the stored weight is frozen; with decay on we
+                // lazily decay it to `now_ms` before applying the success gain.
+                let new_w = if self.decay.enabled {
+                    let decayed = decayed_weight(raw_w, last, now_ms, self.decay.factor);
+                    reinforced_weight(decayed, self.decay.reinforce_gain)
+                } else {
+                    raw_w
+                };
+                upd.execute(params![key, new_w as f64, now_ms, count])?;
+            }
+        }
+        tx.commit()?;
         Ok(())
     }
 }
@@ -836,6 +1008,16 @@ impl MemoryIndex for Fts5Index {
         Ok(out)
     }
 
+    fn suppressed_promotion_keys(&self) -> Result<HashSet<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt =
+            conn.prepare("SELECT chunk_key FROM chunk_stats WHERE suppress_promotion != 0")?;
+        let keys = stmt
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<HashSet<String>, _>>()?;
+        Ok(keys)
+    }
+
     fn reset_chunk(&self, key: &str) -> Result<()> {
         self.reset_chunk_at(key, Utc::now().timestamp_millis())
     }
@@ -846,6 +1028,14 @@ impl MemoryIndex for Fts5Index {
 
     fn set_chunk_pinned(&self, key: &str, pinned: bool) -> Result<()> {
         self.set_chunk_pinned_at(key, pinned, Utc::now().timestamp_millis())
+    }
+
+    fn reinforce_outcome(&self, keys: &[String]) -> Result<()> {
+        self.reinforce_outcome_at(keys, Utc::now().timestamp_millis())
+    }
+
+    fn set_suppress_promotion(&self, key: &str, suppress: bool) -> Result<()> {
+        self.set_suppress_promotion_at(key, suppress, Utc::now().timestamp_millis())
     }
 }
 
@@ -985,6 +1175,10 @@ impl<E: Embedder> MemoryIndex for HybridIndex<E> {
         self.inner.chunk_stats_snapshot(keys, now_ms)
     }
 
+    fn suppressed_promotion_keys(&self) -> Result<HashSet<String>> {
+        self.inner.suppressed_promotion_keys()
+    }
+
     fn reset_chunk(&self, key: &str) -> Result<()> {
         self.inner.reset_chunk(key)
     }
@@ -995,6 +1189,14 @@ impl<E: Embedder> MemoryIndex for HybridIndex<E> {
 
     fn set_chunk_pinned(&self, key: &str, pinned: bool) -> Result<()> {
         self.inner.set_chunk_pinned(key, pinned)
+    }
+
+    fn reinforce_outcome(&self, keys: &[String]) -> Result<()> {
+        self.inner.reinforce_outcome(keys)
+    }
+
+    fn set_suppress_promotion(&self, key: &str, suppress: bool) -> Result<()> {
+        self.inner.set_suppress_promotion(key, suppress)
     }
 
     fn search(&self, query: &str, k: usize) -> Result<Vec<ScoredChunk>> {

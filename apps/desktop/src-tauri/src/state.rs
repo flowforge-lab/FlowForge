@@ -2039,6 +2039,18 @@ impl AppState {
     /// running servers (RFC 0003 §6). Snapshotted per turn so a hot-reload mid-turn
     /// never races an in-flight tool call — same discipline as skill snapshots.
     pub fn build_tool_registry(&self, session_root: &Path) -> ToolRegistry {
+        self.build_tool_registry_with_touch_log(session_root, None)
+    }
+
+    /// Build the registry, optionally wiring a [`TouchLog`](ff_memory::TouchLog)
+    /// into `memory_write` so a goal loop can settle the memory it touched
+    /// against the run's verdict (#1292). Chat turns pass `None`; only the goal
+    /// loop reinforces/suppresses on outcome.
+    pub fn build_tool_registry_with_touch_log(
+        &self,
+        session_root: &Path,
+        touch_log: Option<ff_memory::TouchLog>,
+    ) -> ToolRegistry {
         let mut reg = ToolRegistry::with_defaults();
         reg.register(Box::new(ff_tools::WebSearchTool::with_keys(
             self.search_config.clone(),
@@ -2072,10 +2084,12 @@ impl AppState {
             self.memory_index.clone(),
         )));
         reg.register(Box::new(MemoryGetTool::new(self.memory.clone())));
-        reg.register(Box::new(MemoryWriteTool::new(
-            self.memory.clone(),
-            self.memory_index.clone(),
-        )));
+        let memory_write = MemoryWriteTool::new(self.memory.clone(), self.memory_index.clone());
+        let memory_write = match &touch_log {
+            Some(log) => memory_write.with_touch_log(log.clone()),
+            None => memory_write,
+        };
+        reg.register(Box::new(memory_write));
         // Background-process control (#218). App-global supervisor injected here so
         // a process started in one turn survives into later turns.
         reg.register(Box::new(ProcessManagerTool::new(

@@ -23,6 +23,7 @@ mod embed;
 mod error;
 pub mod flush;
 pub mod index;
+pub mod outcome;
 pub mod watch;
 
 pub use consolidate::{
@@ -32,6 +33,7 @@ pub use embed::{Embedder, NoopEmbedder, OpenAiEmbedder, INTERACTIVE_EMBED_TIMEOU
 pub use error::{MemoryError, Result};
 pub use flush::{FlushLedger, FlushRecord};
 pub use index::{ChunkStatSnapshot, Fts5Index, HybridIndex, MemoryIndex, ScoredChunk};
+pub use outcome::{MemoryOutcomeSink, TouchLog, Verdict};
 
 use std::path::{Path, PathBuf};
 
@@ -753,15 +755,22 @@ impl Memory {
     /// [`ChunkStatsSalience`] reads an absent key as full weight `1.0` (RFC 0007
     /// §3: never-recalled ⇒ not dormant).
     pub fn chunk_stats_salience(&self, index: &dyn MemoryIndex, now_ms: i64) -> ChunkStatsSalience {
+        // Promotion-suppressed keys gate the Daily (promote) side, so they apply
+        // even when curated is empty (nothing to demote, but Daily chunks may
+        // still be up for promotion). #1292 block A.
+        let suppressed = index.suppressed_promotion_keys().unwrap_or_default();
         let raw = read_lenient(&self.curated_path());
         if raw.trim().is_empty() {
-            return ChunkStatsSalience::new(std::collections::HashMap::new());
+            return ChunkStatsSalience::with_suppressed(
+                std::collections::HashMap::new(),
+                suppressed,
+            );
         }
         let chunks = chunk_markdown(&raw, MemorySource::Curated, &self.curated_path());
         let keys: Vec<String> = chunks.iter().map(chunk_key).collect();
         let stats = index.effective_stats(&keys, now_ms).unwrap_or_default();
         let weights = stats.into_iter().map(|(k, s)| (k, s.weight)).collect();
-        ChunkStatsSalience::new(weights)
+        ChunkStatsSalience::with_suppressed(weights, suppressed)
     }
 
     fn curated_filter(

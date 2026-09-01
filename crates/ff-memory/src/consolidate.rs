@@ -62,6 +62,23 @@ fn content_key(chunk: &MemoryChunk) -> String {
 
     format!("{heading_path}:{text_hash}")
 }
+/// The source-agnostic content portion of a [`chunk_key`]. A `chunk_key` is
+/// `"{source_tag}:{content_key}"`, so stripping the tag yields the same value
+/// [`content_key`] would produce for that chunk. Used by promotion suppression
+/// (#1292 F3) so a fact flagged on one day stays suppressed even when it recurs
+/// under a later daily date (a different `chunk_key`, identical content).
+pub(crate) fn content_key_of(chunk_key: &str) -> &str {
+    if let Some(rest) = chunk_key.strip_prefix("daily:") {
+        // `rest` is `YYYY-MM-DD:{content_key}`; drop the fixed 10-char date and
+        // its trailing colon.
+        rest.get(11..).unwrap_or(rest)
+    } else if let Some(rest) = chunk_key.strip_prefix("curated:") {
+        rest
+    } else {
+        chunk_key
+    }
+}
+
 /// Normalize text for hashing: trim each line, collapse runs of whitespace,
 /// strip trailing newlines. This makes the key resilient to formatting drift
 /// while still changing when the semantic content changes.
@@ -164,6 +181,11 @@ pub struct ChunkStatsSalience {
     /// `chunk_key` → lazily-decayed, pin-aware effective weight at pass time.
     /// Absent key ⇒ treated as `1.0`.
     weights: HashMap<String, f32>,
+    /// `chunk_key`s whose `suppress_promotion` flag is set (#1292 block A). A
+    /// `Daily` chunk in this set scores `0.0` — a failed session/goal outcome
+    /// keeps its touched chunks out of curated until a later success clears the
+    /// flag. Curated (demote-side) scoring is unaffected.
+    suppressed: HashSet<String>,
     /// Delegate for `Daily` (promote-side) scoring.
     daily: RecencyFrequencySalience,
 }
@@ -173,8 +195,25 @@ impl ChunkStatsSalience {
     /// be present; absent ⇒ `1.0`). See [`Memory::chunk_stats_salience`] for the
     /// production constructor that gathers the snapshot from a live index.
     pub fn new(weights: HashMap<String, f32>) -> Self {
+        Self::with_suppressed(weights, HashSet::new())
+    }
+
+    /// Build with an explicit set of promotion-suppressed `chunk_key`s (#1292
+    /// block A). [`new`](Self::new) is this with an empty set.
+    ///
+    /// The keys are stored reduced to their [`content_key_of`] identity, so
+    /// suppression follows the *fact*, not the daily date it was flagged under
+    /// (#1292 F3): a fact buried by a failed run stays buried even when it recurs
+    /// under a later date — matching the `content_key` granularity the promote
+    /// loop already dedups on.
+    pub fn with_suppressed(weights: HashMap<String, f32>, suppressed: HashSet<String>) -> Self {
+        let suppressed = suppressed
+            .iter()
+            .map(|k| content_key_of(k).to_string())
+            .collect();
         Self {
             weights,
+            suppressed,
             daily: RecencyFrequencySalience::default(),
         }
     }
@@ -185,8 +224,17 @@ impl Salience<MemoryChunk> for ChunkStatsSalience {
         match &chunk.source {
             // Demote side: rank by real, decayed usage weight.
             MemorySource::Curated => *self.weights.get(&chunk_key(chunk)).unwrap_or(&1.0),
-            // Promote side: unchanged recency × frequency.
-            MemorySource::Daily { .. } => self.daily.score(chunk, occurrences),
+            // Promote side: unchanged recency × frequency, unless a failed
+            // outcome suppressed this fact — then it must not be promoted.
+            // Matched by content identity so an identical note under a newer
+            // daily date is still recognised as the suppressed fact (#1292 F3).
+            MemorySource::Daily { .. } => {
+                if self.suppressed.contains(content_key_of(&chunk_key(chunk))) {
+                    0.0
+                } else {
+                    self.daily.score(chunk, occurrences)
+                }
+            }
         }
     }
 }

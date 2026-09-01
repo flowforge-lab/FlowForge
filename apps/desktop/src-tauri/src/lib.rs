@@ -2215,6 +2215,9 @@ struct GoalLoopIteration {
     state: Arc<AppState>,
     app: tauri::AppHandle,
     session_id: String,
+    /// Daily `chunk_key`s the loop's `memory_write` calls touched, settled
+    /// against the run's verdict when the loop ends (#1292).
+    touch_log: ff_memory::TouchLog,
 }
 
 /// Coarse per-iteration goal gate (#719): decide whether to spend another
@@ -2298,7 +2301,9 @@ impl GoalIteration for GoalLoopIteration {
         let session_root = self.state.session_root(&sid);
         self.state.align_session_mcp(&sid, &session_root).await;
         self.state.align_git_watcher(&session_root);
-        let registry = self.state.build_tool_registry(&session_root);
+        let registry = self
+            .state
+            .build_tool_registry_with_touch_log(&session_root, Some(self.touch_log.clone()));
         // #1179 3B: before the agent reads the unlocked set, so declared tools land
         // in the stable prompt region rather than looking like a mid-turn unlock.
         if let Some(dropped) = self.state.align_session_preheat(&sid, &registry) {
@@ -2526,12 +2531,26 @@ fn spawn_goal_loop(state: Arc<AppState>, app: tauri::AppHandle, session_id: Stri
         if goal.status != GoalStatus::Active {
             return;
         }
+        let touch_log = ff_memory::TouchLog::default();
         let iter = GoalLoopIteration {
             state: state.clone(),
             app: app.clone(),
             session_id: session_id.clone(),
+            touch_log: touch_log.clone(),
         };
         let stop = drive_goal(&mut goal, &iter).await;
+        // Settle the memory the loop touched against its verdict (#1292): a
+        // completed goal reinforces those Daily chunks, an exhausted/failed one
+        // suppresses their promotion, a paused one leaves them untouched. Mirrors
+        // the CLI goal loop so both surfaces reinforce identically.
+        let touched = touch_log.drain();
+        if !touched.is_empty() {
+            let index = state.index();
+            let sink = ff_memory::MemoryOutcomeSink::new(index.as_ref());
+            if let Err(e) = sink.settle(stop.verdict(), &touched) {
+                tracing::warn!(error = %e, session = %session_id, "outcome-gated reinforcement failed");
+            }
+        }
         tracing::info!(session = %session_id, ?stop, "goal loop finished");
     });
 }

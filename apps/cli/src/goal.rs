@@ -153,6 +153,8 @@ async fn goal_start(
 
     handle.abort();
 
+    iter.settle_outcome(result.verdict());
+
     match result {
         LoopStop::Completed => {
             println!("\nGoal completed: {}", objective);
@@ -260,6 +262,8 @@ async fn goal_resume(session: String) -> ExitCode {
     let result = drive_goal(&mut goal, &iter).await;
 
     handle.abort();
+
+    iter.settle_outcome(result.verdict());
 
     match result {
         LoopStop::Completed => {

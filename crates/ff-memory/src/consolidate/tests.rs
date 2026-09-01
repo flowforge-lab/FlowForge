@@ -484,3 +484,72 @@ fn demote_with_mechanical_salience_evicts_array_first_not_dormant() {
         "mechanical salience evicts the array-first chunk A, got:\n{curated}"
     );
 }
+
+// --- Promotion suppression (#1292 block A) -----------------------------------
+
+#[test]
+fn suppression_follows_content_across_daily_dates() {
+    // #1292 F3: a fact flagged on one day must stay suppressed when it recurs
+    // under a later daily date. The keys differ (date-prefixed), but the content
+    // identity — the granularity the promote loop dedups on — is the same.
+    let old_day: chrono::NaiveDate = "2026-08-20".parse().unwrap();
+    let new_day: chrono::NaiveDate = "2026-08-31".parse().unwrap();
+    let flagged_old = make_chunk(MemorySource::Daily { date: old_day }, Some("H"), "dead end");
+    let recur_new = make_chunk(MemorySource::Daily { date: new_day }, Some("H"), "dead end");
+    assert_ne!(
+        chunk_key(&flagged_old),
+        chunk_key(&recur_new),
+        "different dates -> different chunk_key"
+    );
+
+    let mut flagged = HashSet::new();
+    flagged.insert(chunk_key(&flagged_old));
+    let s = ChunkStatsSalience::with_suppressed(HashMap::new(), flagged);
+
+    assert_eq!(
+        s.score(&recur_new, 3),
+        0.0,
+        "the same fact under a newer date is still recognised as suppressed"
+    );
+}
+
+#[test]
+fn suppressed_daily_chunk_scores_zero() {
+    // A fresh daily chunk normally scores high; suppression must force it to 0
+    // so promotion skips it, without touching the unsuppressed sibling.
+    let today = chrono::Local::now().date_naive();
+    let suppressed = make_chunk(MemorySource::Daily { date: today }, Some("H"), "dead end");
+    let live = make_chunk(MemorySource::Daily { date: today }, Some("H"), "good lead");
+
+    let mut flagged = HashSet::new();
+    flagged.insert(chunk_key(&suppressed));
+    let s = ChunkStatsSalience::with_suppressed(HashMap::new(), flagged);
+
+    assert_eq!(
+        s.score(&suppressed, 3),
+        0.0,
+        "suppressed daily must score 0"
+    );
+    assert!(
+        s.score(&live, 3) > 0.5,
+        "unsuppressed daily keeps its recency×frequency score"
+    );
+}
+
+#[test]
+fn suppression_does_not_affect_curated_demotion() {
+    // Suppression is a promote-side gate; a curated chunk with the same key must
+    // still score by its weight (demote side), never forced to 0.
+    let c = make_chunk(MemorySource::Curated, Some("H"), "curated fact");
+    let mut flagged = HashSet::new();
+    flagged.insert(chunk_key(&c));
+    let mut weights = HashMap::new();
+    weights.insert(chunk_key(&c), 0.8);
+    let s = ChunkStatsSalience::with_suppressed(weights, flagged);
+
+    assert_eq!(
+        s.score(&c, 1),
+        0.8,
+        "curated (demote) scoring ignores the promote-side suppress flag"
+    );
+}
