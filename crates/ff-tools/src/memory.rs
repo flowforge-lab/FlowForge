@@ -705,12 +705,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn write_then_settle_success_creates_stats_row() {
-        // #1292 review F1: a chunk written *this* run has no `chunk_stats` row
-        // yet, and those freshly-written keys are exactly what the touch log
-        // collects. An UPDATE-only reinforce would silently drop the success
-        // signal; the upsert must create the row. No row is pre-seeded here — the
-        // gap the original unit test masked by seeding one.
+    async fn write_then_settle_success_leaves_no_stats_row() {
+        // #1304 F2: a chunk written *this* run has no `chunk_stats` row, and the
+        // weight model caps at the recall baseline (1.0) — so a success cannot
+        // lift it above baseline. Creating a row would only start a decay clock
+        // and leave the chunk worse off than an untracked sibling. Success on a
+        // freshly written chunk must NOT create a row; "not suppressed" is the
+        // whole effect. This also pins the end-to-end wiring: the goal-mode
+        // `MemoryWriteTool` fills the touch log, and `settle` consumes it.
         let (_dir, memory, index) = setup();
         let log = ff_memory::TouchLog::new();
         let write = MemoryWriteTool::new(memory.clone(), index.clone()).with_touch_log(log.clone());
@@ -739,16 +741,15 @@ mod tests {
             .settle(ff_memory::Verdict::Success, &touched)
             .unwrap();
 
-        // After settle the success reinforcement created the row and stamped it.
+        // Still no row: a fresh written-then-succeeded chunk is left at the
+        // untracked default (effective weight 1.0, never dormant), not saddled
+        // with a decay clock that would penalise it later.
         let after = index
             .chunk_stats_snapshot(&touched, chrono::Utc::now().timestamp_millis())
             .unwrap();
-        let snap = after
-            .get(&touched[0])
-            .expect("success reinforcement must create the stats row for the touched key");
         assert!(
-            snap.access_count >= 1,
-            "reinforcement stamps an access on the newly created row"
+            after.is_empty(),
+            "success on a freshly written chunk must not create a decaying row"
         );
     }
 

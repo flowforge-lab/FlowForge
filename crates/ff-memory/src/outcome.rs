@@ -142,6 +142,13 @@ impl<'a> MemoryOutcomeSink<'a> {
     /// Empty `touched` is a no-op regardless of verdict — a session that
     /// surfaced no memory has nothing to reinforce or suppress.
     ///
+    /// Suppression is matched and cleared by *content* identity (see
+    /// [`reinforce_outcome`]), so when a `Success` and a `Failure` touch the
+    /// same content — whether in one pass or across sessions — the outcome that
+    /// settles **last** wins: a later `Success` rehabilitates content an earlier
+    /// `Failure` suppressed, and a later `Failure` re-suppresses it. There is no
+    /// per-pass merge; settlement is applied in call order.
+    ///
     /// [`reinforce_outcome`]: MemoryIndex::reinforce_outcome
     /// [`set_suppress_promotion`]: MemoryIndex::set_suppress_promotion
     pub fn settle(&self, verdict: Verdict, touched: &[String]) -> Result<()> {
@@ -294,42 +301,45 @@ mod tests {
         );
     }
 
-    /// The issue's acceptance criterion: two sessions write an identical-content
-    /// Daily chunk; one goal completes, the other fails. The failed session's
-    /// chunk is suppressed from promotion while the completed one is not — so
-    /// their promotion salience diverges even though the content is identical.
+    /// The issue's acceptance scenario, corrected for content-keyed suppression
+    /// (#1304 F1): two sessions touch an identical-content Daily chunk under
+    /// different daily dates. Because suppression identity is the content key,
+    /// not the dated `chunk_key`, they are the *same* promotion identity — so
+    /// the verdicts cannot "diverge"; instead the last-settled outcome wins.
+    /// A `Failure` after a `Success` suppresses; a later `Success` rehabilitates.
     #[test]
-    fn identical_daily_chunk_diverges_by_verdict() {
+    fn identical_daily_content_resolves_by_last_verdict() {
         let idx = Fts5Index::open_in_memory().unwrap();
         let md = "## Note\nremember this fact";
 
-        // Two "sessions" write the same content on different days, so the
-        // `chunk_key`s differ by date but the `content_key` (heading + text
-        // hash) is identical — the promotion-relevant identity.
         let d1: chrono::NaiveDate = "2026-08-26".parse().unwrap();
         let d2: chrono::NaiveDate = "2026-08-27".parse().unwrap();
-        let win = chunk_markdown(md, MemorySource::Daily { date: d1 }, Path::new("x"));
-        let lose = chunk_markdown(md, MemorySource::Daily { date: d2 }, Path::new("x"));
+        let earlier = chunk_markdown(md, MemorySource::Daily { date: d1 }, Path::new("x"));
+        let later = chunk_markdown(md, MemorySource::Daily { date: d2 }, Path::new("x"));
+        let earlier_keys: Vec<String> = earlier.iter().map(chunk_key).collect();
+        let later_keys: Vec<String> = later.iter().map(chunk_key).collect();
 
-        let win_keys: Vec<String> = win.iter().map(chunk_key).collect();
-        let lose_keys: Vec<String> = lose.iter().map(chunk_key).collect();
-
+        // Success then Failure on the same content -> Failure (last) wins: the
+        // content is suppressed.
         MemoryOutcomeSink::new(&idx)
-            .settle(Verdict::Success, &win_keys)
+            .settle(Verdict::Success, &earlier_keys)
             .unwrap();
         MemoryOutcomeSink::new(&idx)
-            .settle(Verdict::Failure, &lose_keys)
+            .settle(Verdict::Failure, &later_keys)
             .unwrap();
+        assert!(
+            !idx.suppressed_promotion_keys().unwrap().is_empty(),
+            "a Failure settling last suppresses the shared content"
+        );
 
-        let flagged = idx.suppressed_promotion_keys().unwrap();
-        for k in &lose_keys {
-            assert!(flagged.contains(k), "failed session's chunk is suppressed");
-        }
-        for k in &win_keys {
-            assert!(
-                !flagged.contains(k),
-                "completed session's chunk is not suppressed"
-            );
-        }
+        // A subsequent Success on the same content rehabilitates it, clearing
+        // the earlier-dated flag by content identity.
+        MemoryOutcomeSink::new(&idx)
+            .settle(Verdict::Success, &later_keys)
+            .unwrap();
+        assert!(
+            idx.suppressed_promotion_keys().unwrap().is_empty(),
+            "a later Success rehabilitates content an earlier Failure suppressed"
+        );
     }
 }

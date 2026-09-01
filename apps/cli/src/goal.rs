@@ -6,13 +6,6 @@ use ff_core::{Goal, GoalStatus, GoalStore};
 
 use crate::goal_loop::CliGoalIteration;
 
-/// Map the terminal loop state to a memory outcome verdict (#1292):
-/// completed goals reinforce the memory they touched, exhausted/failed goals
-/// suppress its promotion, and a paused goal leaves memory untouched.
-fn loop_stop_verdict(result: &LoopStop) -> ff_memory::Verdict {
-    result.verdict()
-}
-
 #[derive(Debug, Args)]
 pub struct GoalArgs {
     /// The objective to achieve (required when no subcommand is given).
@@ -160,7 +153,7 @@ async fn goal_start(
 
     handle.abort();
 
-    iter.settle_outcome(loop_stop_verdict(&result));
+    iter.settle_outcome(result.verdict());
 
     match result {
         LoopStop::Completed => {
@@ -270,7 +263,7 @@ async fn goal_resume(session: String) -> ExitCode {
 
     handle.abort();
 
-    iter.settle_outcome(loop_stop_verdict(&result));
+    iter.settle_outcome(result.verdict());
 
     match result {
         LoopStop::Completed => {

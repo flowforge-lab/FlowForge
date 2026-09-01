@@ -15,7 +15,7 @@ use std::sync::Mutex;
 use chrono::{NaiveDate, Utc};
 use rusqlite::{params, Connection, OptionalExtension};
 
-use crate::consolidate::chunk_key;
+use crate::consolidate::{chunk_key, content_key_of};
 use crate::embed::Embedder;
 
 use crate::error::Result;
@@ -635,32 +635,70 @@ impl Fts5Index {
     }
 
     /// Time-injectable core of
-    /// [`reinforce_outcome`](MemoryIndex::reinforce_outcome). Applies the
-    /// `reinforce_gain` (a success is a strong endorsement, stronger than an
-    /// ambient touch) to each touched chunk and clears its `suppress_promotion`
-    /// flag. Upserts, creating a row when absent: the touched keys are the ones a
-    /// session *wrote* this run, which have no `chunk_stats` row yet (a fresh
-    /// write only populates `chunks`), so an UPDATE-only path would silently drop
-    /// the success signal for exactly those keys. A newly created row starts at
-    /// the recall baseline and takes the gain, so a written-then-succeeded chunk
-    /// is reinforced above baseline. Clearing suppression is unconditional on
-    /// decay config: an earlier failure's flag must lift even when decay is off.
+    /// [`reinforce_outcome`](MemoryIndex::reinforce_outcome). A success has two
+    /// effects, both keyed to keep it symmetric with how suppression is applied
+    /// and read:
+    ///
+    /// 1. **Clears `suppress_promotion` by content identity.** Suppression is
+    ///    matched by content key (a fact flagged on one day stays suppressed
+    ///    when it recurs under a later daily date), so the lift must use the
+    ///    same identity — every flagged row sharing a touched key's content key
+    ///    is cleared, not just the exact `chunk_key` (#1304 F1). This is
+    ///    unconditional on decay config: an earlier failure's flag must lift
+    ///    even when decay is off.
+    /// 2. **Reinforces weight on rows that already exist.** The weight model
+    ///    caps at the recall baseline (`1.0`), so a freshly written chunk (which
+    ///    has no `chunk_stats` row yet) cannot be pushed *above* baseline by a
+    ///    success — creating a row would only start a decay clock and leave it
+    ///    worse off than an untracked sibling (#1304 F2). For those chunks
+    ///    "success" simply means "not suppressed", delivered by effect 1. Only
+    ///    already-tracked chunks (previously recalled) take the `reinforce_gain`.
     pub(crate) fn reinforce_outcome_at(&self, keys: &[String], now_ms: i64) -> Result<()> {
         if keys.is_empty() {
             return Ok(());
         }
+        // Promotion suppression is matched by content identity (a fact flagged
+        // on one day stays suppressed under a later daily date), so a success
+        // must lift the flag by the same identity — clearing only the exact
+        // `chunk_key` would leave an earlier day's failure row buried forever
+        // (#1304 F1). Reduce the touched keys to their content keys and clear
+        // every flagged row that shares one.
+        let touched_content: HashSet<&str> = keys.iter().map(|k| content_key_of(k)).collect();
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
         {
+            let flagged: Vec<String> = {
+                let mut sel =
+                    tx.prepare("SELECT chunk_key FROM chunk_stats WHERE suppress_promotion != 0")?;
+                let rows = sel.query_map([], |row| row.get::<_, String>(0))?;
+                rows.filter_map(|r| r.ok())
+                    .filter(|ck| touched_content.contains(content_key_of(ck)))
+                    .collect()
+            };
+            {
+                let mut clr = tx.prepare(
+                    "UPDATE chunk_stats SET suppress_promotion = 0 WHERE chunk_key = ?1",
+                )?;
+                for ck in &flagged {
+                    clr.execute(params![ck])?;
+                }
+            }
+
+            // Weight reinforcement applies only to rows that already exist. A
+            // freshly written chunk has no `chunk_stats` row, and the weight
+            // model caps at the recall baseline (`1.0`), so creating a row here
+            // could not raise the weight — it would only start a decay clock and
+            // leave a written-then-succeeded chunk *worse off* than an untracked
+            // sibling (#1304 F2). For such chunks, "success" means "not
+            // suppressed", which the clear above already delivers.
             let mut sel = tx.prepare(
                 "SELECT weight, last_accessed, access_count
                  FROM chunk_stats WHERE chunk_key = ?1",
             )?;
-            let mut ups = tx.prepare(
-                "INSERT INTO chunk_stats (chunk_key, weight, last_accessed, access_count, suppress_promotion)
-                 VALUES (?1, ?2, ?3, ?4, 0)
-                 ON CONFLICT(chunk_key) DO UPDATE
-                 SET weight = ?2, last_accessed = ?3, access_count = ?4, suppress_promotion = 0",
+            let mut upd = tx.prepare(
+                "UPDATE chunk_stats
+                 SET weight = ?2, last_accessed = ?3, access_count = ?4
+                 WHERE chunk_key = ?1",
             )?;
             for key in keys {
                 let existing: Option<(f64, i64, i64)> = sel
@@ -668,21 +706,19 @@ impl Fts5Index {
                         Ok((row.get(0)?, row.get(1)?, row.get(2)?))
                     })
                     .optional()?;
-                let (raw_w, count) = match existing {
-                    Some((w, _last, c)) => (w as f32, c + 1),
-                    None => (1.0, 1),
+                let Some((w, last, c)) = existing else {
+                    continue;
                 };
-                // With decay off the weight is frozen (a first-touch row is
-                // created at baseline); with decay on we lazily decay the stored
-                // weight to `now_ms` and then apply the success gain.
+                let (raw_w, count) = (w as f32, c + 1);
+                // With decay off the stored weight is frozen; with decay on we
+                // lazily decay it to `now_ms` before applying the success gain.
                 let new_w = if self.decay.enabled {
-                    let last = existing.map(|(_, l, _)| l).unwrap_or(now_ms);
                     let decayed = decayed_weight(raw_w, last, now_ms, self.decay.factor);
                     reinforced_weight(decayed, self.decay.reinforce_gain)
                 } else {
                     raw_w
                 };
-                ups.execute(params![key, new_w as f64, now_ms, count])?;
+                upd.execute(params![key, new_w as f64, now_ms, count])?;
             }
         }
         tx.commit()?;

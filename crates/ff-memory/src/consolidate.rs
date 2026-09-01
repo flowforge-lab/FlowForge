@@ -67,7 +67,7 @@ fn content_key(chunk: &MemoryChunk) -> String {
 /// [`content_key`] would produce for that chunk. Used by promotion suppression
 /// (#1292 F3) so a fact flagged on one day stays suppressed even when it recurs
 /// under a later daily date (a different `chunk_key`, identical content).
-fn content_key_of(chunk_key: &str) -> &str {
+pub(crate) fn content_key_of(chunk_key: &str) -> &str {
     if let Some(rest) = chunk_key.strip_prefix("daily:") {
         // `rest` is `YYYY-MM-DD:{content_key}`; drop the fixed 10-char date and
         // its trailing colon.

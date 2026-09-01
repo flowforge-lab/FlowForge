@@ -1269,11 +1269,12 @@ fn reinforce_outcome_clears_suppress_and_bumps_weight() {
 }
 
 #[test]
-fn reinforce_outcome_creates_row_for_freshly_written_chunk() {
-    // #1292 review F1: a chunk written this run has no chunk_stats row yet (a
-    // write only populates `chunks`), and those keys are exactly what the touch
-    // log collects. Success reinforcement must upsert — create the row and start
-    // its clock — not silently skip it.
+fn reinforce_outcome_leaves_freshly_written_chunk_untracked() {
+    // #1304 F2: a chunk written this run has no chunk_stats row yet, and the
+    // weight model caps at the recall baseline (1.0) — so a success cannot lift
+    // it *above* baseline. Creating a row here would only start a decay clock
+    // and leave the chunk worse off than an untracked sibling. Success on a
+    // fresh write must NOT create a row; "not suppressed" is the whole effect.
     let idx = Fts5Index::open_in_memory()
         .unwrap()
         .with_decay(enabled_decay());
@@ -1287,13 +1288,55 @@ fn reinforce_outcome_creates_row_for_freshly_written_chunk() {
     idx.reinforce_outcome_at(std::slice::from_ref(&key), 1000)
         .unwrap();
 
-    // The success created the row at baseline and stamped the access time.
-    let (w, last, count) = read_stat(&idx, &key).expect("row must be created");
-    assert_eq!(last, 1000);
-    assert_eq!(count, 1);
+    // Still no row: the chunk is left at the untracked default (effective
+    // weight 1.0, never dormant), not saddled with a fresh decay clock.
+    assert_eq!(
+        read_stat(&idx, &key),
+        None,
+        "success on a freshly written chunk must not create a decaying row"
+    );
+}
+
+#[test]
+fn reinforce_outcome_rehabilitates_across_daily_dates() {
+    // #1304 F1: suppression is matched by content identity (a fact flagged on
+    // one day stays suppressed when it recurs under a later daily date). A
+    // success must lift the flag by the same identity — clearing only the exact
+    // chunk_key would leave the earlier day's failure row buried forever.
+    let idx = Fts5Index::open_in_memory().unwrap();
+
+    // Same content, two different daily dates -> different chunk_keys, same
+    // content key.
+    let day1 = chunk_markdown(
+        "## Note\nremember this fact",
+        MemorySource::Daily {
+            date: NaiveDate::from_ymd_opt(2026, 8, 26).unwrap(),
+        },
+        Path::new("daily/2026-08-26.md"),
+    );
+    let day2 = chunk_markdown(
+        "## Note\nremember this fact",
+        MemorySource::Daily {
+            date: NaiveDate::from_ymd_opt(2026, 8, 27).unwrap(),
+        },
+        Path::new("daily/2026-08-27.md"),
+    );
+    let key1 = chunk_key(&day1[0]);
+    let key2 = chunk_key(&day2[0]);
+    assert_ne!(key1, key2, "different daily dates -> different chunk_keys");
+
+    // Day 1: a failure suppresses the fact.
+    idx.reindex(&day1).unwrap();
+    idx.set_suppress_promotion(&key1, true).unwrap();
+    assert_eq!(read_suppress(&idx, &key1), Some(true));
+
+    // Day 2: the same fact is written and its session succeeds. Settling the
+    // day-2 key must rehabilitate the day-1 flag, since they share content.
+    idx.reinforce_outcome_at(std::slice::from_ref(&key2), 1000)
+        .unwrap();
     assert!(
-        (w - 1.0).abs() < 1e-6,
-        "fresh chunk starts at baseline weight"
+        idx.suppressed_promotion_keys().unwrap().is_empty(),
+        "a later success rehabilitates the same content suppressed earlier"
     );
 }
 
