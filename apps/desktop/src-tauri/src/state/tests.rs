@@ -3882,3 +3882,78 @@ fn resident_tools_cannot_be_preheated() {
         "a resident tool must never be seeded as preheat"
     );
 }
+
+// ---- Per-session touch logs (#1308 / Phase 2) ----
+
+// Two accesses for the same session must hand out clones of one shared handle,
+// so a turn's `memory_write` and the settlement hook (#1310) always see the same
+// buffer — the whole reason the log is an `Arc`-backed `TouchLog`.
+#[test]
+fn session_touch_log_is_created_on_first_access_and_shared() {
+    let state = AppState::new();
+    let first = state.session_touch_log("sess-a");
+    let second = state.session_touch_log("sess-a");
+
+    first.record("daily:2026-08-26:abc");
+    assert_eq!(
+        second.len(),
+        1,
+        "two accesses of one session share the same touch log"
+    );
+
+    let mut drained = second.drain();
+    drained.sort();
+    assert_eq!(drained, vec!["daily:2026-08-26:abc".to_string()]);
+}
+
+// `drain_session_touch_log` is the settlement hook (#1310): it both drains and
+// removes the entry, so a re-drain yields nothing and no per-session entry
+// lingers after settlement. Draining a session that never wrote is a no-op.
+#[test]
+fn drain_session_touch_log_drains_once_and_removes() {
+    let state = AppState::new();
+    state
+        .session_touch_log("sess-a")
+        .record("daily:2026-08-26:abc");
+    state
+        .session_touch_log("sess-a")
+        .record("daily:2026-08-26:def");
+
+    let mut drained = state.drain_session_touch_log("sess-a");
+    drained.sort();
+    assert_eq!(
+        drained,
+        vec![
+            "daily:2026-08-26:abc".to_string(),
+            "daily:2026-08-26:def".to_string(),
+        ]
+    );
+
+    // Drain-once: a second drain sees nothing, and crucially records made across
+    // the drain boundary land in a fresh buffer (caller owns `session_touch_log`
+    // handles, so the map removal cannot orphan a still-open log's keys).
+    assert!(
+        state.drain_session_touch_log("sess-a").is_empty(),
+        "a settled session must drain once and not double-apply"
+    );
+}
+
+// The isolation the issue calls out: one failed session's writes must never leak
+// into another session's log (and thus another session's outcome).
+#[test]
+fn session_touch_logs_are_isolated_per_session() {
+    let state = AppState::new();
+    state
+        .session_touch_log("sess-a")
+        .record("daily:2026-08-26:aaa");
+    state
+        .session_touch_log("sess-b")
+        .record("daily:2026-08-26:bbb");
+
+    let mut a = state.drain_session_touch_log("sess-a");
+    let mut b = state.drain_session_touch_log("sess-b");
+    a.sort();
+    b.sort();
+    assert_eq!(a, vec!["daily:2026-08-26:aaa".to_string()]);
+    assert_eq!(b, vec!["daily:2026-08-26:bbb".to_string()]);
+}

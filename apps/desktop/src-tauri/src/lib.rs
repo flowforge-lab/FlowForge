@@ -1735,7 +1735,11 @@ fn spawn_assistant_turn(
         // listener (PR #581) patches into the composer chip.
         state.align_git_watcher(&session_root);
         // Snapshot built-in + MCP-bridged tools for this turn (RFC 0003 §6).
-        let registry = state.build_tool_registry(&session_root);
+        // #1308 / Phase 2: the session's shared TouchLog is wired into
+        // `memory_write` so its Daily writes register, for later outcome
+        // settlement (#1310).
+        let registry = state
+            .build_tool_registry_with_touch_log(&session_root, Some(state.session_touch_log(&sid)));
         // Snapshot the advertised-tools matrix for this turn (#702) so the model
         // sees a stable tool list. The approval gate reads the matrix live (see
         // `UiApprover::approve`), so Control-panel edits still take effect on the
@@ -2215,9 +2219,6 @@ struct GoalLoopIteration {
     state: Arc<AppState>,
     app: tauri::AppHandle,
     session_id: String,
-    /// Daily `chunk_key`s the loop's `memory_write` calls touched, settled
-    /// against the run's verdict when the loop ends (#1292).
-    touch_log: ff_memory::TouchLog,
 }
 
 /// Coarse per-iteration goal gate (#719): decide whether to spend another
@@ -2301,9 +2302,10 @@ impl GoalIteration for GoalLoopIteration {
         let session_root = self.state.session_root(&sid);
         self.state.align_session_mcp(&sid, &session_root).await;
         self.state.align_git_watcher(&session_root);
-        let registry = self
-            .state
-            .build_tool_registry_with_touch_log(&session_root, Some(self.touch_log.clone()));
+        let registry = self.state.build_tool_registry_with_touch_log(
+            &session_root,
+            Some(self.state.session_touch_log(&sid)),
+        );
         // #1179 3B: before the agent reads the unlocked set, so declared tools land
         // in the stable prompt region rather than looking like a mid-turn unlock.
         if let Some(dropped) = self.state.align_session_preheat(&sid, &registry) {
@@ -2531,18 +2533,19 @@ fn spawn_goal_loop(state: Arc<AppState>, app: tauri::AppHandle, session_id: Stri
         if goal.status != GoalStatus::Active {
             return;
         }
-        let touch_log = ff_memory::TouchLog::default();
+        let touch_log = state.session_touch_log(&session_id);
         let iter = GoalLoopIteration {
             state: state.clone(),
             app: app.clone(),
             session_id: session_id.clone(),
-            touch_log: touch_log.clone(),
         };
         let stop = drive_goal(&mut goal, &iter).await;
         // Settle the memory the loop touched against its verdict (#1292): a
         // completed goal reinforces those Daily chunks, an exhausted/failed one
         // suppresses their promotion, a paused one leaves them untouched. Mirrors
-        // the CLI goal loop so both surfaces reinforce identically.
+        // the CLI goal loop so both surfaces reinforce identically. The log is the
+        // session's shared one (#1308), so a later `close_session` (#1310) still
+        // sees this goal session's Daily writes after settlement.
         let touched = touch_log.drain();
         if !touched.is_empty() {
             let index = state.index();
@@ -2681,7 +2684,13 @@ impl ff_scheduled::TaskRunner for DesktopTaskRunner {
         // Keep the git HEAD watcher aimed at the active checkout here too (#561), so
         // a scheduled-task turn that switches branches live-updates the FE chip.
         self.state.align_git_watcher(&session_root);
-        let registry = self.state.build_tool_registry(&session_root);
+        // #1308 / Phase 2: wire the scheduled session's shared TouchLog into
+        // `memory_write` so its Daily writes register, consistent with the other
+        // desktop turn paths.
+        let registry = self.state.build_tool_registry_with_touch_log(
+            &session_root,
+            Some(self.state.session_touch_log(&sid)),
+        );
         // #1179 3B; see the interactive path. A scheduled turn has no UI to toast,
         // so the drop notice is warn-only there.
         if let Some(dropped) = self.state.align_session_preheat(&sid, &registry) {
