@@ -1554,6 +1554,13 @@ pub struct AppState {
     /// non-adjacent pair). Keyed by session; drained and persisted once the turn
     /// settles so the marker lands after the completed tool batch.
     deferred_mode_markers: Mutex<HashMap<String, Vec<String>>>,
+    /// session_id -> shared [`ff_memory::TouchLog`] of the Daily `chunk_key`s a
+    /// session's `memory_write` calls touched (#1308 / Phase 2). Created on first
+    /// access; drained-and-removed by the settlement hook (e.g. `close_session`,
+    /// #1310) so a failed session never pollutes another session's outcome. Only
+    /// Daily writes register (curated writes are skipped by `MemoryWriteTool`),
+    /// matching the goal-loop semantics the sessions now share.
+    session_touch_logs: Mutex<HashMap<String, ff_memory::TouchLog>>,
 }
 
 /// How long a probed served window stays fresh before the next resolve re-probes.
@@ -1717,6 +1724,7 @@ impl AppState {
             served_window_cache: Mutex::new(HashMap::new()),
             compaction_cache: CompactionCache::new(),
             deferred_mode_markers: Mutex::new(HashMap::new()),
+            session_touch_logs: Mutex::new(HashMap::new()),
         };
         // Restore the persisted phenotype so its active skills survive a restart.
         // With no persisted choice, prefer the out-of-box `codon` default (#298),
@@ -2018,6 +2026,34 @@ impl AppState {
         self.memory_index.clone()
     }
 
+    /// The shared session-scoped [`ff_memory::TouchLog`] for `session_id`, created
+    /// on first access (#1308 / Phase 2). It is a cheap `Arc`-backed handle, so
+    /// every turn host wires the same log into its `memory_write` and a session's
+    /// Daily writes accumulate across turns until the settlement hook drains it.
+    pub fn session_touch_log(&self, session_id: &str) -> ff_memory::TouchLog {
+        self.session_touch_logs
+            .lock()
+            .unwrap()
+            .entry(session_id.to_string())
+            .or_default()
+            .clone()
+    }
+
+    /// Drain and remove `session_id`'s [`ff_memory::TouchLog`], returning the Daily
+    /// `chunk_key`s its sessions touched. Drain-once: a second call yields nothing
+    /// and the map entry is dropped, so no per-session entry lingers after settlement.
+    ///
+    /// The settlement hook — [`close_session`](crate::close_session) (#1310) calls
+    /// this to feed the keys into an `OutcomeSignal`. Not yet wired here: #1308 ships
+    /// the per-session touch log and wiring; settlement is the next-phase consumer.
+    #[allow(dead_code)] // consumed by #1310 (outcome settlement hook)
+    pub fn drain_session_touch_log(&self, session_id: &str) -> Vec<String> {
+        let Some(log) = self.session_touch_logs.lock().unwrap().remove(session_id) else {
+            return Vec::new();
+        };
+        log.drain()
+    }
+
     /// The directory installed skills live in.
     pub fn skills_root(&self) -> PathBuf {
         skills_root()
@@ -2038,6 +2074,13 @@ impl AppState {
     /// Build the per-turn tool registry: built-in tools + MCP-bridged tools from
     /// running servers (RFC 0003 §6). Snapshotted per turn so a hot-reload mid-turn
     /// never races an in-flight tool call — same discipline as skill snapshots.
+    ///
+    /// Builds with no `TouchLog` wired (`None`), matching `build_tool_registry_at`'s
+    /// contract. Every production turn path now routes through
+    /// [`build_tool_registry_with_touch_log`](Self::build_tool_registry_with_touch_log)
+    /// with the session's shared log (#1308); this no-log form is kept as the
+    /// documented fallback and is exercised by the registry-contract tests.
+    #[allow(dead_code)] // default registry, exercised by state/tests.rs
     pub fn build_tool_registry(&self, session_root: &Path) -> ToolRegistry {
         self.build_tool_registry_with_touch_log(session_root, None)
     }
