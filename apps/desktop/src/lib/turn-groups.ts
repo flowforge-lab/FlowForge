@@ -276,15 +276,21 @@ export type TurnSegment =
 export const HAS_FORMATTING = /`[^`]+`|\*\*[^*]+\*\*|^\s*[-*]\s|\n\n/m;
 export const OPERATIONAL_START =
   /^(let me|now |wait|i'll|i need|let's|hmm|ok[, ]|actually|first|next |then |so |checking|looking|running|trying|verifying)/i;
-/** Below this, prose is always a thought. */
+/** A finding, verdict, or outcome — surface regardless of length (#818). Bold
+ *  text is the strongest signal: agents bold discoveries, never operational noise.
+ *  Declarative starters ("Found", "The fix", "Cannot") catch short conclusions. */
+export const CONCLUSION_SIGNAL =
+  /\*\*[^*]+\*\*|^(Found |The (?:fix|issue|bug|root cause|problem)|Cannot |Both |Created |Merged|Result:|Done[.!: ])/im;
+/** Below this, prose is always a thought (unless CONCLUSION_SIGNAL matches). */
 export const SHORT = 120;
 /** At/above this, unformatted prose is still substantive. */
 export const LONG = 350;
 
 /** Whether an intermediate-prose chunk is substantive (→ top-level block) vs a
- *  short/operational "thought" (→ folded inside the step group). See #687. */
+ *  short/operational "thought" (→ folded inside the step group). See #687, #818. */
 export function isSubstantiveProse(text: string): boolean {
   const t = text.trim();
+  if (CONCLUSION_SIGNAL.test(t)) return true; // finding/verdict = always surface (#818)
   if (t.length < SHORT) return false; // very short = always thought
   if (OPERATIONAL_START.test(t)) return false; // "Let me check…" = thought even if longish
   if (HAS_FORMATTING.test(t)) return true; // has formatting = substantive
