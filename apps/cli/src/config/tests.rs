@@ -182,7 +182,7 @@ fn clear_resets_has_key_when_no_other_secrets_remain() {
     env.write_registry(&ProviderRegistry::default());
 
     let set_args = parse_set(&["flowforge", "set", "bedrock", "api-key", "sk-test"]);
-    run_set(&set_args, Some("sk-test"));
+    let _ = run_set(&set_args, Some("sk-test"));
     let clear_args = parse_set(&["flowforge", "set", "bedrock", "api-key", "--clear"]);
     let code = run_set(&clear_args, None);
     assert_eq!(code, ExitCode::SUCCESS);

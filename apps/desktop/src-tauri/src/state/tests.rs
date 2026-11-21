@@ -3601,7 +3601,7 @@ fn every_desktop_tool_advertises_an_object_schema() {
     // Asserted against the real desktop registry rather than `with_defaults()`:
     // `skills` is registered only here, so the ff-tools-level test cannot see it.
     let state = AppState::new();
-    let registry = state.build_tool_registry(std::path::Path::new("."));
+    let registry = state.build_tool_registry_with_touch_log(std::path::Path::new("."), None);
     let offenders: Vec<String> = registry
         .openai_tools()
         .iter()
@@ -3676,7 +3676,7 @@ async fn advertised_tool_block_is_usable_on_a_live_openai_compatible_gateway() {
 
     let state = AppState::new();
     let tools = state
-        .build_tool_registry(std::path::Path::new("."))
+        .build_tool_registry_with_touch_log(std::path::Path::new("."), None)
         .openai_tools();
 
     // Without `skills` in the block there is no regression surface to test.
@@ -3956,4 +3956,35 @@ fn session_touch_logs_are_isolated_per_session() {
     b.sort();
     assert_eq!(a, vec!["daily:2026-08-26:aaa".to_string()]);
     assert_eq!(b, vec!["daily:2026-08-26:bbb".to_string()]);
+}
+
+// `forget_session_touch_log` is the delete_session reap (#1319 item 3): dropping a
+// session must not leak its log entry, and a reused session id must not inherit
+// stale keys. Unlike drain, it discards the touches without settling.
+#[test]
+fn forget_session_touch_log_drops_the_entry_without_draining() {
+    let state = AppState::new();
+    state
+        .session_touch_log("sess-a")
+        .record("daily:2026-08-26:abc");
+
+    state.forget_session_touch_log("sess-a");
+    // The map entry is gone: a fresh access starts empty (no stale keys), and a
+    // subsequent drain finds nothing.
+    assert!(
+        state.session_touch_log("sess-a").is_empty(),
+        "a forgotten log must not retain stale keys for a reused session id"
+    );
+    assert!(state.drain_session_touch_log("sess-a").is_empty());
+
+    // Forgetting a session that never recorded a touch is a no-op, and never
+    // disturbs other sessions.
+    state
+        .session_touch_log("sess-b")
+        .record("daily:2026-08-26:bbb");
+    state.forget_session_touch_log("nope");
+    assert_eq!(
+        state.drain_session_touch_log("sess-b"),
+        vec!["daily:2026-08-26:bbb".to_string()]
+    );
 }

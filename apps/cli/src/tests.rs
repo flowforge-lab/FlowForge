@@ -1721,7 +1721,7 @@ fn fork_increments_to_fork_2() {
     store.add_message(&s.id, Role::User, "msg".into());
 
     // First fork → (Fork 1)
-    super::fork_session_cmd(&s.id);
+    let _ = super::fork_session_cmd(&s.id);
     // Second fork from the same source → (Fork 2)
     let code = super::fork_session_cmd(&s.id);
     assert_eq!(code, ExitCode::SUCCESS);
