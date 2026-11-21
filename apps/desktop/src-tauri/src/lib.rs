@@ -488,6 +488,10 @@ fn delete_session(
     state.clear_session_approvals(&session_id);
     state.compaction_cache.invalidate(&session_id);
     state.store.delete_session(&session_id);
+    // Drop the session's touch log (#1308) so a deleted session leaks no map entry
+    // and a reused session id cannot inherit stale keys. Not settled — the user
+    // is discarding the session, not recording an outcome (#1319 item 3).
+    state.forget_session_touch_log(&session_id);
     state.reap_session_processes(&session_id);
     state.reap_session_kernels(&session_id);
     // Kill this session's embedded terminals (#1284). Synchronous, unlike the
@@ -2219,6 +2223,14 @@ struct GoalLoopIteration {
     state: Arc<AppState>,
     app: tauri::AppHandle,
     session_id: String,
+    /// The loop's own [`ff_memory::TouchLog`] of Daily `chunk_key`s its
+    /// `memory_write` calls wrote, settled against the run's verdict when the
+    /// loop ends (#1292). **Scoped to the goal loop**: it is deliberately *not*
+    /// the session's shared log (#1308), so settlement applies the goal's verdict
+    /// only to keys this loop wrote — never to keys a concurrent interactive or
+    /// scheduled turn wrote into the shared session log while the loop ran.
+    /// The shared session log is the `close_session` (#1310) consumer's.
+    touch_log: ff_memory::TouchLog,
 }
 
 /// Coarse per-iteration goal gate (#719): decide whether to spend another
@@ -2302,10 +2314,12 @@ impl GoalIteration for GoalLoopIteration {
         let session_root = self.state.session_root(&sid);
         self.state.align_session_mcp(&sid, &session_root).await;
         self.state.align_git_watcher(&session_root);
-        let registry = self.state.build_tool_registry_with_touch_log(
-            &session_root,
-            Some(self.state.session_touch_log(&sid)),
-        );
+        // The loop's `memory_write` records into the loop's own TouchLog, not the
+        // session's shared one (#1308), so goal settlement stays scoped to what
+        // the loop wrote (#1319 review item 1).
+        let registry = self
+            .state
+            .build_tool_registry_with_touch_log(&session_root, Some(self.touch_log.clone()));
         // #1179 3B: before the agent reads the unlocked set, so declared tools land
         // in the stable prompt region rather than looking like a mid-turn unlock.
         if let Some(dropped) = self.state.align_session_preheat(&sid, &registry) {
@@ -2533,19 +2547,24 @@ fn spawn_goal_loop(state: Arc<AppState>, app: tauri::AppHandle, session_id: Stri
         if goal.status != GoalStatus::Active {
             return;
         }
-        let touch_log = state.session_touch_log(&session_id);
+        // The loop owns its TouchLog (scoped, not the session's shared one): every
+        // iteration wires it into `memory_write`, and settlement below drains and
+        // settles *only* the keys this loop wrote — never keys a concurrent
+        // interactive/scheduled turn wrote into the session log (#1319 item 1).
+        let touch_log = ff_memory::TouchLog::default();
         let iter = GoalLoopIteration {
             state: state.clone(),
             app: app.clone(),
             session_id: session_id.clone(),
+            touch_log: touch_log.clone(),
         };
         let stop = drive_goal(&mut goal, &iter).await;
         // Settle the memory the loop touched against its verdict (#1292): a
         // completed goal reinforces those Daily chunks, an exhausted/failed one
         // suppresses their promotion, a paused one leaves them untouched. Mirrors
-        // the CLI goal loop so both surfaces reinforce identically. The log is the
-        // session's shared one (#1308), so a later `close_session` (#1310) still
-        // sees this goal session's Daily writes after settlement.
+        // the CLI goal loop so both surfaces reinforce identically. Settlement
+        // stays here for now; #1310 will move the verdict mapping + sink wiring
+        // to the `close_session` hook, which drains the *shared* session log.
         let touched = touch_log.drain();
         if !touched.is_empty() {
             let index = state.index();

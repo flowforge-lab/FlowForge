@@ -2054,6 +2054,14 @@ impl AppState {
         log.drain()
     }
 
+    /// Drop `session_id`'s [`ff_memory::TouchLog`] without settling it (#1319 item
+    /// 3). Called from `delete_session` so a deleted session leaks no per-session
+    /// entry, and a reused session id cannot inherit stale keys. A no-op when the
+    /// session never recorded a touch.
+    pub fn forget_session_touch_log(&self, session_id: &str) {
+        self.session_touch_logs.lock().unwrap().remove(session_id);
+    }
+
     /// The directory installed skills live in.
     pub fn skills_root(&self) -> PathBuf {
         skills_root()
@@ -2075,20 +2083,12 @@ impl AppState {
     /// running servers (RFC 0003 §6). Snapshotted per turn so a hot-reload mid-turn
     /// never races an in-flight tool call — same discipline as skill snapshots.
     ///
-    /// Builds with no `TouchLog` wired (`None`), matching `build_tool_registry_at`'s
-    /// contract. Every production turn path now routes through
-    /// [`build_tool_registry_with_touch_log`](Self::build_tool_registry_with_touch_log)
-    /// with the session's shared log (#1308); this no-log form is kept as the
-    /// documented fallback and is exercised by the registry-contract tests.
-    #[allow(dead_code)] // default registry, exercised by state/tests.rs
-    pub fn build_tool_registry(&self, session_root: &Path) -> ToolRegistry {
-        self.build_tool_registry_with_touch_log(session_root, None)
-    }
-
-    /// Build the registry, optionally wiring a [`TouchLog`](ff_memory::TouchLog)
-    /// into `memory_write` so a goal loop can settle the memory it touched
-    /// against the run's verdict (#1292). Chat turns pass `None`; only the goal
-    /// loop reinforces/suppresses on outcome.
+    /// `touch_log` is wired into `memory_write` when `Some` so the session's Daily
+    /// writes register for outcome settlement (#1308). Every production turn path
+    /// passes the caller's `TouchLog` (assistant/scheduled use the session's shared
+    /// log; the goal loop uses its own scoped log); `None` yields the historic
+    /// no-log behaviour (writes recorded but never settled) and is used only by
+    /// tests.
     pub fn build_tool_registry_with_touch_log(
         &self,
         session_root: &Path,
