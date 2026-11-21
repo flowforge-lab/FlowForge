@@ -773,8 +773,19 @@ async fn run_git(root: &Path, args: &[&str]) -> Result<String, ToolOutcome> {
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let stdout = String::from_utf8_lossy(&output.stdout);
-        // Some failures are informational (e.g. empty log = not an error)
-        if stderr.contains("not a git repository") {
+        // Some failures are informational (e.g. empty log = not an error).
+        //
+        // A missing/`not a git repository` repo reads as an unsalvageable error, not
+        // the lenient "non-zero but with useful output" paths below. A `.git` that
+        // is a *file* pointing at a non-existent gitdir — e.g. a leftover worktree
+        // or a broken submodule — surfaces as `gitfile does not point to a valid
+        // repository` on git >= 2.x across POSIX and Windows, which is the same
+        // "this is not a usable repository" condition. Without `LC_ALL=C` this
+        // wording (and the not-a-repo one) would drift with the host locale, but
+        // `run_git` pins the C locale, so these stable substrings are exact.
+        let not_a_repo = stderr.contains("not a git repository")
+            || stderr.contains("does not point to a valid repository");
+        if not_a_repo {
             return Err(ToolOutcome::error(
                 "Not a git repository (or any parent up to mount point).".to_string(),
             ));
@@ -1544,13 +1555,45 @@ mod tests {
     #[tokio::test]
     async fn not_a_repo_returns_error() {
         let tmp = tempfile::tempdir().unwrap();
-        // When TMPDIR is inside a git repo (e.g. a workspace sub-directory),
-        // `git` walks up and finds the parent `.git`, causing this test to
-        // falsely pass. A `.git` file pointing to a non-existent repo blocks
-        // the walk-up without making the tempdir a valid repository.
+        // The test must hold when the tempdir happens to live inside a git
+        // working tree (the dev-machine env trap: `TMPDIR` under a workspace):
+        // a bare empty dir would let `git` walk up and find the parent's `.git`,
+        // falsely passing. A `.git` *file* pointing at a non-existent gitdir
+        // blocks that walk-up without making the tempdir a valid repository.
+        //
+        // On git >= 2.x (POSIX and Windows, C-locale pinned by `run_git`) the
+        // broken pointer surfaces as `fatal: gitfile does not point to a valid
+        // repository`, which `run_git` now classifies as a not-a-repo error
+        // (previously it fell through to the lenient non-zero-with-output branch
+        // and reported success — the failure this test caught on macOS/Windows).
         std::fs::write(tmp.path().join(".git"), "gitdir: /nonexistent/.git\n").unwrap();
         let result = git_status(tmp.path()).await;
-        assert!(!result.success);
+        assert!(
+            !result.success,
+            "a dir whose only .git is a dangling pointer is not a repo; got: {}",
+            result.content
+        );
+        assert!(
+            result.content.contains("not a git repository")
+                || result.content.contains("Not a git repository"),
+            "unexpected error: {}",
+            result.content
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_dir_is_not_a_repo_returns_error() {
+        // The genuine not-a-repo case: a directory with no `.git` anywhere in the
+        // walk-up. `git status` exits non-zero with the plain "not a git
+        // repository" message, which `run_git` must surface as an error — not the
+        // lenient empty-stdout success path.
+        let tmp = tempfile::tempdir().unwrap();
+        let result = git_status(tmp.path()).await;
+        assert!(
+            !result.success,
+            "an empty dir must not be a repo; got: {}",
+            result.content
+        );
         assert!(
             result.content.contains("not a git repository")
                 || result.content.contains("Not a git repository"),
