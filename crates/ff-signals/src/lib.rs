@@ -12,15 +12,20 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 
+use ff_memory::{MemoryIndex, MemoryOutcomeSink, Verdict};
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
 pub use ff_core::events::{IntentionSignal, OutcomeSignal, SkillActivated, SkillCompleted};
+pub use ff_core::SessionStatus;
 
-/// A signal emitted by FlowForge. The intention/outcome variants feed NeuroForge;
-/// the skill-telemetry variants feed [`SignalStore`]. Non-exhaustive in spirit: new
-/// variants (e.g. an M4 autonomous-trigger signal) extend this without replacing it.
+/// A signal emitted by FlowForge. The intention variant feeds NeuroForge; the
+/// outcome variant feeds NeuroForge *and* (when the store is wired) memory
+/// settlement; the skill-telemetry variants feed [`SignalStore`]. Non-exhaustive
+/// in spirit: new variants (e.g. an M4 autonomous-trigger signal) extend this
+/// without replacing it.
 #[derive(Debug, Clone)]
 pub enum Signal {
     Intention(IntentionSignal),
@@ -79,16 +84,54 @@ impl SkillAggregate {
 /// Per-skill aggregates, optionally persisted to a JSON file. Best-effort I/O: a
 /// load failure starts empty and a save failure is logged-and-ignored, mirroring the
 /// app's other config persistence — telemetry must never break a turn.
-#[derive(Debug, Default)]
+///
+/// In addition to folding skill telemetry, the store can be wired to a
+/// [`MemoryIndex`] via [`with_memory_index`]; when it is, an ingested
+/// `Signal::Outcome` settles the session's touched chunks through
+/// [`MemoryOutcomeSink`] (RFC 0022 block C, #1305 Phase 2).
+///
+/// [`with_memory_index`]: SignalStore::with_memory_index
+#[derive(Default)]
 pub struct SignalStore {
     aggregates: HashMap<String, SkillAggregate>,
     path: Option<PathBuf>,
+    memory_index: Option<Arc<dyn MemoryIndex>>,
+}
+
+impl std::fmt::Debug for SignalStore {
+    /// [`dyn MemoryIndex`](MemoryIndex) is not `Debug`, so the index is reported
+    /// only as present/absent.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SignalStore")
+            .field("aggregates", &self.aggregates)
+            .field("path", &self.path)
+            .field(
+                "memory_index",
+                &if self.memory_index.is_some() {
+                    "Some(_)"
+                } else {
+                    "None"
+                },
+            )
+            .finish()
+    }
 }
 
 impl SignalStore {
     /// An in-memory store with no persistence (tests, or a host with no home dir).
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Wire the store to a [`MemoryIndex`] so that an ingested `Signal::Outcome`
+    /// settles the session's touched chunks (RFC 0022 block C). See
+    /// [`ingest`](Self::ingest). Hosts that own a memory index during the
+    /// outbound leg should call this on construction; hosts without one (or with
+    /// memory settlement routed elsewhere) simply omit it and outcome signals are
+    /// ignored, exactly as before.
+    pub fn with_memory_index(mut self, index: Arc<dyn MemoryIndex>) -> Self {
+        self.memory_index = Some(index);
+        self
     }
 
     /// Load aggregates from `path` (best-effort) and remember it for subsequent
@@ -101,16 +144,47 @@ impl SignalStore {
         Self {
             aggregates,
             path: Some(path),
+            memory_index: None,
         }
     }
 
     /// Route a [`Signal`] into the store. Skill-telemetry variants update aggregates;
-    /// intention/outcome variants are NeuroForge's concern and ignored here.
+    /// intention/outcome variants are NeuroForge's concern except that, when a
+    /// [`MemoryIndex`] is wired via [`with_memory_index`], a `Signal::Outcome`
+    /// settles the session's touched chunks (RFC 0022 block C, #1305 Phase 2) — a
+    /// `Done` reinforces them, an `Abandoned` suppresses their promotion, and an
+    /// `Active` is undecided (no-op). Best-effort: a settlement failure is logged
+    /// and the store's telemetry is unaffected.
+    ///
+    /// [`with_memory_index`]: SignalStore::with_memory_index
     pub fn ingest(&mut self, signal: &Signal) {
         match signal {
             Signal::SkillActivated(ev) => self.record_activated(&ev.skill),
             Signal::SkillCompleted(ev) => self.record_completed(ev),
-            Signal::Intention(_) | Signal::Outcome(_) => {}
+            Signal::Intention(_) => {}
+            Signal::Outcome(ev) => self.settle_outcome(ev),
+        }
+    }
+
+    /// Map a session outcome to its memory verdict and settle the session's
+    /// touched chunks via [`MemoryOutcomeSink`]. A no-op when no index is wired
+    /// (or when [`with_memory_index`] is called with `None`-equivalent state).
+    ///
+    /// [`with_memory_index`]: SignalStore::with_memory_index
+    fn settle_outcome(&self, ev: &OutcomeSignal) {
+        let Some(index) = &self.memory_index else {
+            return;
+        };
+        let verdict = match ev.status {
+            SessionStatus::Done => Verdict::Success,
+            SessionStatus::Abandoned => Verdict::Failure,
+            SessionStatus::Active => Verdict::Undecided,
+        };
+        let sink = MemoryOutcomeSink::new(index.as_ref());
+        if let Err(e) = sink.settle(verdict, &ev.touched) {
+            // Settlement must never break the signal pipeline — telemetry keeps
+            // flowing and the failure is visible on stderr.
+            eprintln!("ff-signals: failed to settle outcome memory: {e}");
         }
     }
 

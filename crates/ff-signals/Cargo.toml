@@ -7,6 +7,7 @@ repository.workspace = true
 
 [dependencies]
 ff-core = { workspace = true }
+ff-memory = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 ts-rs = { workspace = true, features = ["serde-json-impl"] }
