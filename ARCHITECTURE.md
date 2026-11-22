@@ -39,7 +39,7 @@ tool/agent core, and finally the host/transport edges.
 | **ff-session** | Session and message persistence backed by SQLite, mirroring `ff-memory`'s `FlushLedger`. Core: `SessionStore`, `SearchHit`, `TurnPreheat`. | — |
 | **ff-memory** | Durable local-first user memory as plain user-owned Markdown under `~/.flowforge/memory/`, with embeddings, strata, and decay (RFC 0006). Core: `Memory`, `MemoryChunk`, `EmbeddingProvider`. | Not an opaque DB — memory is Markdown the user owns. |
 | **ff-skills** | Skill discovery, manifest parsing, and filesystem hot-reload from `~/.flowforge/skills/<name>/SKILL.md` into a registry (M3). Core: `SkillRegistry`, `SkillManifest`, `Skill`. | — |
-| **ff-signals** | Signal bus folding per-turn skill telemetry into rolling per-skill aggregates, persisted for NeuroForge (RFC 0001 §8). Core: `Signal`, `SignalStore`, `SkillAggregate`. | — |
+| **ff-signals** | Signal bus folding per-turn skill telemetry into rolling per-skill aggregates, persisted for NeuroForge (RFC 0001 §8); when wired, an ingested `Signal::Outcome` settles touched chunks in `ff-memory` (RFC 0022 block C). Core: `Signal`, `SignalStore`, `SkillAggregate`. | None — telemetry/settlement must never break a turn (best-effort). Depends on `ff-core`, `ff-memory`. |
 | **ff-logging** | Shared `tracing-subscriber` install, extracted so CLI and desktop share one setup (#1118, #1060). | Installs the subscriber only — no app logic. |
 | **ff-workflow** | Placeholder DAG executor for multi-agent orchestration (M7). | Not yet implemented — explicit placeholder deferred to a later milestone. |
 
@@ -89,7 +89,7 @@ ff-memory            -> (no ff-* deps — leaf/root)
 ff-observer          -> ff-core ff-tools
 ff-scheduled         -> ff-agent ff-core ff-tools
 ff-session           -> ff-core
-ff-signals           -> ff-core
+ff-signals           -> ff-core ff-memory
 ff-skills            -> ff-core
 ff-tools             -> ff-core ff-memory ff-session
 ff-transport         -> ff-agent ff-core ff-llm ff-session ff-tools

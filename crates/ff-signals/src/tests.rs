@@ -85,3 +85,71 @@ fn missing_file_starts_empty() {
     let store = SignalStore::load(dir.path().join("does_not_exist.json"));
     assert!(store.all().is_empty());
 }
+
+#[test]
+fn outcome_settles_touched_chunks_when_index_is_wired() {
+    let index = ff_memory::Fts5Index::open_in_memory().unwrap();
+    let index: std::sync::Arc<dyn ff_memory::MemoryIndex> = std::sync::Arc::new(index);
+    let mut store = SignalStore::new().with_memory_index(index.clone());
+    // The snapshot call only needs a `now_ms` for dormancy math; the assertion
+    // here is purely about which keys got a stats row, so any instant works.
+    let now = 0;
+
+    // Abandoned → Failure: the touched chunk's promotion is suppressed.
+    store.ingest(&Signal::Outcome(OutcomeSignal {
+        session_id: "s1".to_string(),
+        status: SessionStatus::Abandoned,
+        touched: vec!["daily/2026-11-22.md#0".to_string()],
+    }));
+    assert!(
+        index
+            .suppressed_promotion_keys()
+            .unwrap()
+            .contains("daily/2026-11-22.md#0"),
+        "an Abandoned outcome must suppress promotion of the touched chunk"
+    );
+
+    // A later Done → Success rehabilitates it (clears suppression).
+    store.ingest(&Signal::Outcome(OutcomeSignal {
+        session_id: "s2".to_string(),
+        status: SessionStatus::Done,
+        touched: vec!["daily/2026-11-22.md#0".to_string()],
+    }));
+    assert!(
+        !index
+            .suppressed_promotion_keys()
+            .unwrap()
+            .contains("daily/2026-11-22.md#0"),
+        "a Done outcome must lift suppression of the touched chunk"
+    );
+
+    // Active → Undecided: memory left untouched.
+    store.ingest(&Signal::Outcome(OutcomeSignal {
+        session_id: "s3".to_string(),
+        status: SessionStatus::Active,
+        touched: vec!["daily/2026-11-22.md#1".to_string()],
+    }));
+    let snapshot = index
+        .chunk_stats_snapshot(&["daily/2026-11-22.md#1".to_string()], now)
+        .unwrap();
+    assert!(
+        snapshot.is_empty()
+            && !index
+                .suppressed_promotion_keys()
+                .unwrap()
+                .contains("daily/2026-11-22.md#1"),
+        "an Active outcome must not touch memory at all"
+    );
+}
+
+#[test]
+fn outcome_is_ignored_without_a_wired_index() {
+    let mut store = SignalStore::new();
+    store.ingest(&Signal::Outcome(OutcomeSignal {
+        session_id: "s1".to_string(),
+        status: SessionStatus::Abandoned,
+        touched: vec!["daily/2026-11-22.md#0".to_string()],
+    }));
+    // No panic; nothing observable to assert beyond reaching here unchanged.
+    assert!(store.all().is_empty());
+}

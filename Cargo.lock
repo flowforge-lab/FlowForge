@@ -2213,6 +2213,7 @@ name = "ff-signals"
 version = "1.1.0"
 dependencies = [
  "ff-core",
+ "ff-memory",
  "serde",
  "serde_json",
  "tempfile",
