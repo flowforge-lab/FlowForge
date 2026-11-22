@@ -1087,24 +1087,39 @@ fn chat_wires_phenotype_egress_alongside_the_mcp_host() {
     );
 }
 
-/// Path to the `mcp_echo` test-server binary, derived from the running test
-/// executable's own location rather than a literal `target/<profile>/mcp_echo`.
-/// Tests of this crate run with `current_exe()` inside
-/// `<target>/<profile>/deps/`, so the sibling `<target>/<profile>/mcp_echo` is
-/// always two levels up — correct in debug and release alike, and under any
-/// `-p <crate>`/target-dir combination. (`env!("CARGO_BIN_EXE_mcp_echo")` is
-/// not an option here: Cargo only defines those vars for integration tests of
-/// the crate that owns the bin, and `mcp_echo` lives under `ff-mcp`, which is a
-/// dependency — Cargo does not build a dependency's bins for `-p ff-cli`.)
+/// Path to the `mcp_echo` test-server binary. `mcp_echo` is the `ff-mcp` bin,
+/// built by Cargo into `target/<profile>/mcp_echo` because `ff-mcp`'s own
+/// integration tests reference `env!("CARGO_BIN_EXE_mcp_echo")`. (`env!` is not
+/// an option here: Cargo only defines those vars for integration tests of the
+/// crate that owns the bin, and `mcp_echo` lives under `ff-mcp`, a dependency —
+/// so Cargo never wires `CARGO_BIN_EXE_mcp_echo` into `ff-cli`.)
+///
+/// The running test binary's `current_exe()` sits somewhere under that same
+/// `target/<profile>/` tree, but the exact depth differs by Cargo version: on
+/// most it lives in `target/<profile>/deps/` (making `mcp_echo` a stable
+/// two-levels-up sibling), while on others this crate's bin unit tests are
+/// placed under `target/<profile>/build/ff-cli/<hash>/out/`. Rather than assume
+/// one layout, walk up from `current_exe()` until we find a `mcp_echo` direct
+/// child — the profile root — so resolution is correct in debug and release and
+/// under any target-dir/layout combination.
 fn mcp_echo_bin() -> PathBuf {
-    let deps = std::env::current_exe()
+    let exe_dir = std::env::current_exe()
         .expect("test binary path is available")
         .parent()
-        .expect("test binary lives under target/<profile>/deps/")
+        .expect("test binary has a parent directory")
         .to_path_buf();
-    deps.parent()
-        .expect("deps dir lives under target/<profile>/")
-        .join("mcp_echo")
+    let mut dir = exe_dir.clone();
+    loop {
+        let candidate = dir.join("mcp_echo");
+        if candidate.is_file() {
+            return candidate;
+        }
+        match dir.parent() {
+            Some(parent) => dir = parent.to_path_buf(),
+            None => break,
+        }
+    }
+    exe_dir.join("mcp_echo")
 }
 
 /// Proves discriminating power: a real bridged MCP tool is advertised under Open
