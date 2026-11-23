@@ -19,11 +19,12 @@ use ff_agent::{
 use ff_core::events::{
     ApprovalSafety, ConnectionFailedEvent, EgressMismatchEvent, EvolveCostEstimate,
     IntentionSignal, McpStatusChangedEvent, MemoryFlushedEvent, ObserverChangedEvent,
-    OutputStreamKind, PhenotypeMcpUnavailableEvent, ProcessExitedEvent, ProcessOutputEvent,
-    ReasoningEvent, ReconnectingEvent, SessionTitleUpdatedEvent, SkillActivated, SkillCompleted,
-    SkillEvolveApprovalRequestEvent, SkillInstallApprovalRequestEvent, SkillsChangedEvent,
-    TokenEvent, ToolApprovalRequestEvent, ToolAskRequestEvent, ToolCallEvent, ToolOutputChunkEvent,
-    ToolResultEvent, TurnDoneEvent, TurnErrorEvent, TurnStatsEvent, UpdateProgressEvent,
+    OutcomeSignal, OutputStreamKind, PhenotypeMcpUnavailableEvent, ProcessExitedEvent,
+    ProcessOutputEvent, ReasoningEvent, ReconnectingEvent, SessionTitleUpdatedEvent,
+    SkillActivated, SkillCompleted, SkillEvolveApprovalRequestEvent,
+    SkillInstallApprovalRequestEvent, SkillsChangedEvent, TokenEvent, ToolApprovalRequestEvent,
+    ToolAskRequestEvent, ToolCallEvent, ToolOutputChunkEvent, ToolResultEvent, TurnDoneEvent,
+    TurnErrorEvent, TurnStatsEvent, UpdateProgressEvent,
 };
 use ff_core::{
     pre_prompt_decision, resolve_tool_arg, Attachment, BedrockAuth, CreateScheduledTaskInput,
@@ -31,7 +32,8 @@ use ff_core::{
     MemoryFileInfo, MemoryFileKind, MemoryOverview, Message, Mode, ModelSelection, PermissionCell,
     PermissionMatrixView, Phenotype, ProviderConfig, ProviderConnection, ProviderKind,
     ProviderRegistry, ResolvedModel, Role, RunRecord, RunStatus, ScheduledTask, SearchConfig,
-    SecretKind, Session, SessionWorkspace, Skill, SkillInfo, SkillManifest, TaskKind,
+    SecretKind, Session, SessionStatus, SessionWorkspace, Skill, SkillInfo, SkillManifest,
+    TaskKind,
 };
 use ff_observer::{ObserverEvent, ObserverInfo};
 use ff_scheduled::ScheduledApprover;
@@ -514,6 +516,42 @@ fn delete_session(
     tauri::async_runtime::spawn(async move {
         state_for_mcp.release_session_mcp(&sid).await;
     });
+}
+
+/// Settle a session's outcome (#1310): the production writer for
+/// `SessionStatus::{Done, Abandoned}` (sessions otherwise stay `Active` forever).
+/// Flips the persisted status, drains the session's shared touch log, and routes
+/// the `OutcomeSignal` through the unified signal pipeline — `.into()` the
+/// `SignalStore` → `MemoryOutcomeSink::settle` — plus a `signal:outcome` event for
+/// frontend transparency. `abandoned` distinguishes a session discarded as a dead
+/// end (suppresses promotion of its touched chunks) from one closed as `Done`
+/// (reinforces them). Distinct from `delete_session`, which is a hard discard that
+/// deliberately does not settle (#1319 item 3).
+#[tauri::command]
+fn close_session(
+    state: State<'_, Arc<AppState>>,
+    app: tauri::AppHandle,
+    session_id: String,
+    abandoned: bool,
+) {
+    let status = if abandoned {
+        SessionStatus::Abandoned
+    } else {
+        SessionStatus::Done
+    };
+    // 1. Persist the session's terminal status.
+    state.store.set_status(&session_id, status);
+    // 2. Drain the session's shared touch log (drain-once; a re-close yields nothing).
+    let touched = state.drain_session_touch_log(&session_id);
+    // 3. Build the outcome signal and settle it through the signal pipeline.
+    let signal = OutcomeSignal {
+        session_id: session_id.clone(),
+        status,
+        touched,
+    };
+    // 4. Emit for frontend transparency, then 5. record (→ SignalStore → MemoryOutcomeSink).
+    let _ = app.emit("signal:outcome", signal.clone());
+    state.record_outcome(&signal);
 }
 
 /// All scheduled tasks, newest first, with derived cadence label / next run
@@ -2484,6 +2522,26 @@ impl GoalIteration for GoalLoopIteration {
     }
 }
 
+/// Map a goal loop's outcome verdict (#1292/#1310) onto a `SessionStatus` so the
+/// loop can settle its scoped TouchLog through the unified signal pipeline
+/// (`record_outcome` → `SignalStore::ingest` → `settle_outcome`).
+///
+/// This is the *inverse* of `SignalStore::settle_outcome`'s own status→verdict
+/// mapping, chosen so routing through it reproduces the shared behavior exactly:
+/// a `Success` verdict (completed) settles as `Done` → reinforces touched chunks,
+/// a `Failure` verdict (failed/abandoned) settles as `Abandoned` → suppresses
+/// their promotion, and an `Undecided` verdict (exhausted or paused) settles as
+/// `Active` → no-op. Extracted as a pure free fn so the mapping is unit-testable
+/// without a Tauri `State` (the whole point of `LoopStop::verdict()` being shared
+/// is that both surfaces — CLI and desktop — stay in lockstep).
+fn goal_verdict_status(verdict: ff_memory::Verdict) -> SessionStatus {
+    match verdict {
+        ff_memory::Verdict::Success => SessionStatus::Done,
+        ff_memory::Verdict::Failure => SessionStatus::Abandoned,
+        ff_memory::Verdict::Undecided => SessionStatus::Active,
+    }
+}
+
 /// Stop a running goal loop for a session and wait (bounded) for it to fully
 /// exit before returning (#753 review blocker 2). Cancels the in-flight turn so
 /// `drive_goal` breaks at its next boundary, then polls the single-flight slot
@@ -2559,20 +2617,26 @@ fn spawn_goal_loop(state: Arc<AppState>, app: tauri::AppHandle, session_id: Stri
             touch_log: touch_log.clone(),
         };
         let stop = drive_goal(&mut goal, &iter).await;
-        // Settle the memory the loop touched against its verdict (#1292): a
-        // completed goal reinforces those Daily chunks, an exhausted/failed one
-        // suppresses their promotion, a paused one leaves them untouched. Mirrors
-        // the CLI goal loop so both surfaces reinforce identically. Settlement
-        // stays here for now; #1310 will move the verdict mapping + sink wiring
-        // to the `close_session` hook, which drains the *shared* session log.
+        // #1310: converge the goal loop onto the *unified* signal pipeline, replacing
+        // Phase 1's direct `MemoryOutcomeSink` call. Reuse `LoopStop::verdict()` —
+        // shared with the CLI so both surfaces reinforce identically — map it to a
+        // session outcome, drain the goal's scoped TouchLog (never the shared session
+        // log, per #1319 item 1), and settle through `record_outcome` →
+        // `SignalStore::ingest` → `MemoryOutcomeSink`. A completed goal (`Done`)
+        // reinforces the Daily chunks it touched; a failed one (`Abandoned`)
+        // suppresses their promotion; an exhausted or paused one (`Active`) is
+        // undecided — left untouched (absence of a verdict is the honest signal for a
+        // budget-capped run that may have made real progress). An empty `touched`
+        // makes `settle_outcome` a no-op, matching the old guard.
+        let status = goal_verdict_status(stop.verdict());
         let touched = touch_log.drain();
-        if !touched.is_empty() {
-            let index = state.index();
-            let sink = ff_memory::MemoryOutcomeSink::new(index.as_ref());
-            if let Err(e) = sink.settle(stop.verdict(), &touched) {
-                tracing::warn!(error = %e, session = %session_id, "outcome-gated reinforcement failed");
-            }
-        }
+        let signal = OutcomeSignal {
+            session_id: session_id.clone(),
+            status,
+            touched,
+        };
+        let _ = app.emit("signal:outcome", signal.clone());
+        state.record_outcome(&signal);
         tracing::info!(session = %session_id, ?stop, "goal loop finished");
     });
 }
@@ -4656,6 +4720,7 @@ pub fn run() {
             export_session,
             rename_session,
             delete_session,
+            close_session,
             fork_session,
             list_scheduled_tasks,
             create_scheduled_task,
