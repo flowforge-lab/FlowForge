@@ -2,10 +2,11 @@ use super::state::AppState;
 use super::terminal::{resolve_shell, Terminals};
 use super::{
     bounded_block_on, build_goal, compare_build, emit_agent_event, git_branch, goal_gate_for,
-    install_guard, is_app_ready, list_directory_in, list_local_branches, matrix_gate,
-    mcp_quit_path, panic_message, publish_app_ready, read_file_in, resolve_workspace_dir,
-    run_sidecar_turn, should_warmup, switch_branch, BootFinalize, TurnMetrics, UiApprover,
-    UpdateStatus, VersionDirection, APP_READY, CHAT_APPROVAL_TIMEOUT, MCP_SHUTDOWN_BUDGET,
+    goal_verdict_status, install_guard, is_app_ready, list_directory_in, list_local_branches,
+    matrix_gate, mcp_quit_path, panic_message, publish_app_ready, read_file_in,
+    resolve_workspace_dir, run_sidecar_turn, should_warmup, switch_branch, BootFinalize,
+    TurnMetrics, UiApprover, UpdateStatus, VersionDirection, APP_READY, CHAT_APPROVAL_TIMEOUT,
+    MCP_SHUTDOWN_BUDGET,
 };
 use ff_agent::{AgentEvent, ApprovalOutcome, Approver, CancelToken, DenyReason, GateDecision};
 use ff_core::events::TurnDoneEvent;
@@ -1224,6 +1225,33 @@ fn goal_set_defaults_to_report_only_when_unauthorised() {
     assert!(
         !build_goal("s1", "look, don't push", None, None, None, Some(false)).allow_propose_pr,
         "an explicit false stays report-only"
+    );
+}
+
+// #1310: the desktop goal loop settles its scoped TouchLog through the unified
+// signal pipeline (`goal_verdict_status` → `OutcomeSignal` → `record_outcome` →
+// `SignalStore::settle_outcome`). That final step maps `SessionStatus` back to a
+// `Verdict`, so this is the *inverse* of it — pinning it keeps the two directions
+// from drifting: `Success` (completed) settles as `Done` → reinforces, `Failure`
+// (failed/abandoned) settles as `Abandoned` → suppresses promotion, and
+// `Undecided` (exhausted/paused) settles as `Active` → untouched. Mirrors the
+// CLI's use of the shared `LoopStop::verdict()`, so both surfaces stay in lockstep.
+#[test]
+fn goal_verdict_status_maps_every_verdict_to_its_session_outcome() {
+    assert_eq!(
+        goal_verdict_status(ff_memory::Verdict::Success),
+        ff_core::SessionStatus::Done,
+        "a completed goal must settle as Done (reinforces touched chunks)"
+    );
+    assert_eq!(
+        goal_verdict_status(ff_memory::Verdict::Failure),
+        ff_core::SessionStatus::Abandoned,
+        "a failed goal must settle as Abandoned (suppresses touched chunks)"
+    );
+    assert_eq!(
+        goal_verdict_status(ff_memory::Verdict::Undecided),
+        ff_core::SessionStatus::Active,
+        "an exhausted/paused goal settles as Active (memory untouched)"
     );
 }
 

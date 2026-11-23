@@ -109,6 +109,14 @@ export interface FfIpc {
   /** Permanently remove a session and its transcript. Destructive; pairs with the
    *  sidebar Delete action. Distinct from the FE-only reversible dismiss (#170). */
   deleteSession(sessionId: string): Promise<void>;
+  /** Settle a session's outcome (#1310): the production writer for
+   *  `SessionStatus::{Done, Abandoned}`. Marks the session's status and routes its
+   *  touched memory chunks through the signal pipeline — an `abandoned: false`
+   *  close (`Done`) reinforces them, an `abandoned: true` close suppresses their
+   *  promotion. Distinct from the hard `deleteSession`, which discards without
+   *  settling. Lifecycle call-sites (pane close, navigation-away, app quit) are a
+   *  follow-up; this is the backend + IPC contract. */
+  closeSession(sessionId: string, abandoned: boolean): Promise<void>;
   /** The working directory a session's tools run in (slice 3b, #200) with its
    *  git branch when the cwd is a repo (#211). Returns the session's chosen
    *  workspace, or the global default when unset. */
@@ -821,6 +829,8 @@ class TauriIpc implements FfIpc {
     this.invoke<void>("rename_session", { sessionId, title });
   deleteSession = (sessionId: string) =>
     this.invoke<void>("delete_session", { sessionId });
+  closeSession = (sessionId: string, abandoned: boolean) =>
+    this.invoke<void>("close_session", { sessionId, abandoned });
   getSessionWorkspace = (sessionId: string) =>
     this.invoke<SessionWorkspace>("get_session_workspace", { sessionId });
   setSessionWorkspace = (sessionId: string, path: string) =>

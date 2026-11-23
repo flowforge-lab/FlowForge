@@ -1359,6 +1359,21 @@ export class MockIpc implements FfIpc {
     this.goals.delete(sessionId);
   }
 
+  // #1310: settle a session's outcome — flip its status to `done`/`abandoned` and
+  // (on the real backend) route its touched memory chunks through the signal
+  // pipeline. The mock has no touch log, so the memory settlement is a no-op; the
+  // status flip mirrors the persisted `SessionStatus` so callers can observe it.
+  async closeSession(sessionId: string, abandoned: boolean): Promise<void> {
+    // A pending draft may have been flushed by the caller; make sure we find the
+    // live entry either way.
+    this.flushPending(sessionId);
+    const session = this.sessions.get(sessionId);
+    if (session) {
+      session.status = abandoned ? "abandoned" : "done";
+      session.updatedAt = now();
+    }
+  }
+
   async getMessages(sessionId: string, limit?: number): Promise<Message[]> {
     const msgs = this.messages.get(sessionId) ?? [];
     if (limit != null && msgs.length > limit) {

@@ -31,7 +31,7 @@ use ff_memory::{
 use ff_observer::{ObserverEvent, ObserverSupervisor, ObserverTool};
 use ff_scheduled::ScheduledStore;
 use ff_session::SessionStore;
-use ff_signals::{SignalStore, SkillAggregate, SkillCompleted};
+use ff_signals::{OutcomeSignal, Signal, SignalStore, SkillAggregate, SkillCompleted};
 use ff_skills::{
     default_phenotype, load_phenotypes, save_phenotype, SharedRegistry, SkillRegistry,
     SkillWatcher, DEFAULT_PHENOTYPE,
@@ -1696,7 +1696,11 @@ impl AppState {
             active_phenotype: Mutex::new(default_phenotype()),
             default_mode: Mutex::new(load_default_mode()),
             permission_matrix: Mutex::new(load_permission_matrix()),
-            signals: Mutex::new(load_signals()),
+            // #1310: wire the shared memory index into the signal store at init so a
+            // `Signal::Outcome` ingested via `record_outcome` settles the session's
+            // touched chunks through `MemoryOutcomeSink` (the goal-loop convergence
+            // and `close_session` both route through this same pipeline).
+            signals: Mutex::new(load_signals(memory_index.clone())),
             _mcp_watcher: Mutex::new(None),
             _git_watcher: Mutex::new(None),
             mcp: Mutex::new(None),
@@ -3326,6 +3330,17 @@ impl AppState {
         SignalStore::persist_payload(payload);
     }
 
+    /// Ingest an outcome signal into the shared `SignalStore` (#1310). With the
+    /// memory index wired at init, this settles the signal's touched chunks through
+    /// `MemoryOutcomeSink` — the single pipeline shared by the `close_session`
+    /// hook and the goal-loop convergence, replacing Phase 1's direct-sink call.
+    pub fn record_outcome(&self, signal: &OutcomeSignal) {
+        self.signals
+            .lock()
+            .unwrap()
+            .ingest(&Signal::Outcome(signal.clone()));
+    }
+
     /// Add a skill to the active set. Errors if no installed skill has this name
     /// so the UI/agent can't activate a phantom. Idempotent for an already-active
     /// skill.
@@ -3791,12 +3806,15 @@ fn signals_path() -> Option<PathBuf> {
 }
 
 /// Load the persisted telemetry aggregates, or an in-memory-only store when there is
-/// no home dir. Best-effort: a missing/corrupt file starts empty.
-fn load_signals() -> SignalStore {
-    match signals_path() {
+/// no home dir, then wire the shared memory index into it (#1310) so an ingested
+/// `Signal::Outcome` settles the session's touched chunks. Best-effort: a
+/// missing/corrupt file starts empty.
+fn load_signals(index: Arc<dyn MemoryIndex>) -> SignalStore {
+    let store = match signals_path() {
         Some(path) => SignalStore::load(path),
         None => SignalStore::new(),
-    }
+    };
+    store.with_memory_index(index)
 }
 
 /// Start the skill watcher, falling back to a one-shot load (no hot-reload) if the
