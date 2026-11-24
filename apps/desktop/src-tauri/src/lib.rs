@@ -518,15 +518,40 @@ fn delete_session(
     });
 }
 
+/// Route a settled outcome through the unified signal pipeline (#1310): emit
+/// `signal:outcome` for frontend transparency, then hand the signal to
+/// [`AppState::record_outcome`], which `SignalStore` ingests into
+/// `MemoryOutcomeSink::settle`. This is the shared tail of every production writer
+/// — `close_session` and the goal loop both feed it — drawn out so the two
+/// surfaces cannot drift on the (previously duplicated) glue. Callers drain their
+/// own touch source first (session's shared log vs. the goal's scoped log) and
+/// pass the resulting `touched` keys in.
+fn settle_session_outcome(
+    state: &Arc<AppState>,
+    app: &tauri::AppHandle,
+    session_id: String,
+    status: SessionStatus,
+    touched: Vec<String>,
+) {
+    let signal = OutcomeSignal {
+        session_id,
+        status,
+        touched,
+    };
+    let _ = app.emit("signal:outcome", signal.clone());
+    state.record_outcome(&signal);
+}
+
 /// Settle a session's outcome (#1310): the production writer for
 /// `SessionStatus::{Done, Abandoned}` (sessions otherwise stay `Active` forever).
 /// Flips the persisted status, drains the session's shared touch log, and routes
 /// the `OutcomeSignal` through the unified signal pipeline — `.into()` the
-/// `SignalStore` → `MemoryOutcomeSink::settle` — plus a `signal:outcome` event for
-/// frontend transparency. `abandoned` distinguishes a session discarded as a dead
-/// end (suppresses promotion of its touched chunks) from one closed as `Done`
-/// (reinforces them). Distinct from `delete_session`, which is a hard discard that
-/// deliberately does not settle (#1319 item 3).
+/// `SignalStore` → `MemoryOutcomeSink::settle` via [`settle_session_outcome`] —
+/// plus a `signal:outcome` event for frontend transparency. `abandoned`
+/// distinguishes a session discarded as a dead end (suppresses promotion of its
+/// touched chunks) from one closed as `Done` (reinforces them). Distinct from
+/// `delete_session`, which is a hard discard that deliberately does not settle
+/// (#1319 item 3).
 #[tauri::command]
 fn close_session(
     state: State<'_, Arc<AppState>>,
@@ -541,17 +566,10 @@ fn close_session(
     };
     // 1. Persist the session's terminal status.
     state.store.set_status(&session_id, status);
-    // 2. Drain the session's shared touch log (drain-once; a re-close yields nothing).
+    // 2. Drain the session's shared touch log (drain-once; a re-close yields nothing),
+    //    then route it through the unified signal pipeline.
     let touched = state.drain_session_touch_log(&session_id);
-    // 3. Build the outcome signal and settle it through the signal pipeline.
-    let signal = OutcomeSignal {
-        session_id: session_id.clone(),
-        status,
-        touched,
-    };
-    // 4. Emit for frontend transparency, then 5. record (→ SignalStore → MemoryOutcomeSink).
-    let _ = app.emit("signal:outcome", signal.clone());
-    state.record_outcome(&signal);
+    settle_session_outcome(state.inner(), &app, session_id, status, touched);
 }
 
 /// All scheduled tasks, newest first, with derived cadence label / next run
@@ -2630,13 +2648,7 @@ fn spawn_goal_loop(state: Arc<AppState>, app: tauri::AppHandle, session_id: Stri
         // makes `settle_outcome` a no-op, matching the old guard.
         let status = goal_verdict_status(stop.verdict());
         let touched = touch_log.drain();
-        let signal = OutcomeSignal {
-            session_id: session_id.clone(),
-            status,
-            touched,
-        };
-        let _ = app.emit("signal:outcome", signal.clone());
-        state.record_outcome(&signal);
+        settle_session_outcome(&state, &app, session_id.clone(), status, touched);
         tracing::info!(session = %session_id, ?stop, "goal loop finished");
     });
 }
