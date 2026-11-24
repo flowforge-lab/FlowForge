@@ -2047,10 +2047,10 @@ impl AppState {
     /// `chunk_key`s its sessions touched. Drain-once: a second call yields nothing
     /// and the map entry is dropped, so no per-session entry lingers after settlement.
     ///
-    /// The settlement hook — [`close_session`](crate::close_session) (#1310) calls
-    /// this to feed the keys into an `OutcomeSignal`. Not yet wired here: #1308 ships
-    /// the per-session touch log and wiring; settlement is the next-phase consumer.
-    #[allow(dead_code)] // consumed by #1310 (outcome settlement hook)
+    /// Consumed by [`close_session`](crate::close_session) (#1310) to feed the
+    /// session's shared touched keys into an `OutcomeSignal`, which the signal
+    /// pipeline then settles. (The goal loop drains its *own scoped* log instead,
+    /// never this one — see [`forget_session_touch_log`](Self::forget_session_touch_log).)
     pub fn drain_session_touch_log(&self, session_id: &str) -> Vec<String> {
         let Some(log) = self.session_touch_logs.lock().unwrap().remove(session_id) else {
             return Vec::new();
